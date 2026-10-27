@@ -557,8 +557,8 @@ pub(crate) fn not_asked_again_note(request_parts: &[String]) -> String {
         (_, Some("await log")) => {
             "an `await log` with no `since=` waits from the moment it was armed, and the record \
              it waits for may have been written during the update — read `status` (its \
-             `log_seq=` and `log_ep=`) or `log`, then wait again with `since=<log_seq> \
-             ep=<log_ep>`"
+             `log_seq=`, `log_ep=` and `log_base=`) or `log`, then wait again with \
+             `since=<log_seq> ep=<log_ep> base=<log_base>`"
                 .to_owned()
         }
         (_, Some(_)) => {
@@ -658,7 +658,7 @@ fn resume_request_with(
     let mut out: Vec<String> = Vec::new();
     let mut block = seen.block;
     let mut turn = seen.turn;
-    let (mut log_seq, mut log_ep) = (None, None);
+    let (mut log_seq, mut log_ep, mut log_base) = (None, None, None);
     let anchor = |v: &str| v.parse::<u64>().ok();
     for token in request.split_whitespace() {
         if token.starts_with("since=") {
@@ -678,6 +678,10 @@ fn resume_request_with(
         }
         if let Some(v) = token.strip_prefix("log-ep=") {
             log_ep = v.parse::<u32>().ok();
+            continue;
+        }
+        if let Some(v) = token.strip_prefix("log-base=") {
+            log_base = Some(v.parse::<u32>().ok());
             continue;
         }
         if !token.starts_with('@') {
@@ -712,6 +716,9 @@ fn resume_request_with(
         }
         if let (Some(seq), Some(ep)) = (seen.log_seq.or(log_seq), seen.log_ep.or(log_ep)) {
             out.push(format!("since-log={seq} log-ep={ep}"));
+            if let Some(Some(base)) = log_base.map(|own| seen.log_base.or(own)) {
+                out.push(format!("log-base={base}"));
+            }
         }
     }
     let mut line = out.join(" ");
@@ -757,6 +764,9 @@ pub(crate) struct EventAnchors {
     pub(crate) log_seq: Option<u64>,
     /// … and the epoch that seq is read in (the `sub` line's `log_ep=`, a `GAP`'s `ep=`).
     pub(crate) log_ep: Option<u32>,
+    /// … and the log it is of (the `sub` line's `log_base=`, a `GAP`'s `base=`): a resume names
+    /// it (`log-base=`) only where the request named one.
+    pub(crate) log_base: Option<u32>,
 }
 
 fn targets_everything(request: &str) -> bool {
@@ -917,6 +927,7 @@ impl FrameTracker {
                 ) {
                     self.anchors.log_seq = Some(seq);
                     self.anchors.log_ep = Some(ep);
+                    self.anchors.log_base = value("log_base").and_then(|v| v.parse().ok());
                 }
             }
             ["LOG", _, seq, ..] => {
@@ -931,6 +942,7 @@ impl FrameTracker {
                 ) {
                     self.anchors.log_seq = Some(seq);
                     self.anchors.log_ep = Some(ep);
+                    self.anchors.log_base = value("base").and_then(|v| v.parse().ok());
                 }
             }
             ["EVENT", "*", "bye", "quit"] => self.quit = true,

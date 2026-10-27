@@ -28,6 +28,30 @@ pub fn safe(text: &str, cap: usize) -> String {
     aterm_codec::tty::one_line(text, cap)
 }
 
+/// `words` filled into lines of at most `width` columns, each indented `indent` spaces (a word
+/// longer than a line stands alone on its own), joined by newlines with none after the last.
+#[must_use]
+pub fn fill(words: &[String], indent: usize, width: usize) -> String {
+    let pad = " ".repeat(indent);
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for w in words {
+        if !line.is_empty() && line.len() + 1 + w.len() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if line.is_empty() {
+            line.push_str(&pad);
+        } else {
+            line.push(' ');
+        }
+        line.push_str(w);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

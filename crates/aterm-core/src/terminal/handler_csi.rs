@@ -161,6 +161,10 @@ impl TerminalHandler<'_> {
                     if self.modes.alternate_screen {
                         self.holder_fence.note_alt_cleared();
                     } else {
+                        if from_home {
+                            self.transient.primary_clears =
+                                self.transient.primary_clears.wrapping_add(1);
+                        }
                         let top = self.grid.visible_to_absolute(0);
                         super::note_full_clear(top, from_home, self.shell);
                         self.holder_fence.note_full_clear(top, self.grid);
@@ -363,8 +367,8 @@ impl TerminalHandler<'_> {
                 self.handle_xtwinops(cap, params);
             }
 
-            CsiHandler::DecModeSet => self.handle_dec_mode(params, true),
-            CsiHandler::DecModeReset => self.handle_dec_mode(params, false),
+            CsiHandler::DecModeSet => self.handle_dec_mode(cap, params, true),
+            CsiHandler::DecModeReset => self.handle_dec_mode(cap, params, false),
             CsiHandler::SelectiveEraseDisplay => {
                 self.cursor_state().handle_selective_erase_display(params);
             }
@@ -407,7 +411,7 @@ impl TerminalHandler<'_> {
             CsiHandler::Xtsmgraphics => self.handle_xtsmgraphics(cap, params),
             CsiHandler::DecDsr => self.handle_decdsr(cap, params),
             CsiHandler::Xtsave => self.handle_xtsave(params),
-            CsiHandler::Xtrestore => self.handle_xtrestore(params),
+            CsiHandler::Xtrestore => self.handle_xtrestore(cap, params),
             CsiHandler::Decst8c => {
                 if params.first().copied() == Some(5) {
                     self.grid.reset_tab_stops();

@@ -325,13 +325,19 @@ fn on_thread<T: Send + 'static>(
     }
 }
 
-/// Whether this user's build cache is on the volume mounted at `mount`: a pass over it frees
-/// nothing on any other volume, so a short scratch image or external disk is not reclaimed for.
+/// Whether this user's build cache, or the root it moved from, is on the volume mounted at
+/// `mount`: a pass over it frees nothing on any other volume, so a short scratch image or
+/// external disk is not reclaimed for.
 fn cache_on(mount: &Path) -> bool {
-    aterm_types::dirs::home_dir()
-        .map(|h| crate::build_cache::cache_root(&h))
+    aterm_types::dirs::home_dir().is_some_and(|h| {
+        [
+            crate::build_cache::cache_root(&h),
+            crate::build_cache::moved_from(&h),
+        ]
+        .iter()
         .filter(|c| c.is_dir())
-        .is_some_and(|c| Live.read(Some(&c)).volume.is_some_and(|v| v.mount == mount))
+        .any(|c| Live.read(Some(c)).volume.is_some_and(|v| v.mount == mount))
+    })
 }
 
 /// Inside aterm (`ATERM_SESSION_ID` names this session), ask the window's disk watch for `bytes`
@@ -432,8 +438,14 @@ fn pct_encode(text: &str) -> String {
 fn largest_on(mount: &Path, own: &[PathBuf], stopped: Stopped<'_>) -> Vec<(PathBuf, u64)> {
     let on = |p: &Path| Live.read(Some(p)).volume.is_some_and(|v| v.mount == mount);
     let mut found: Vec<PathBuf> = own.iter().filter(|d| on(d)).cloned().collect();
-    let cache = aterm_types::dirs::home_dir().map(|h| crate::build_cache::cache_root(&h));
-    if let Some(cache) = cache.filter(|c| c.is_dir() && on(c)) {
+    let home = aterm_types::dirs::home_dir();
+    let caches = home.iter().flat_map(|h| {
+        [
+            crate::build_cache::cache_root(h),
+            crate::build_cache::moved_from(h),
+        ]
+    });
+    for cache in caches.filter(|c| c.is_dir() && on(c)) {
         found.extend(
             crate::build_cache::workspaces(&cache)
                 .iter()

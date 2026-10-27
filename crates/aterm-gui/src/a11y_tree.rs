@@ -357,12 +357,12 @@ pub(crate) enum HarnessChip {
     Mode,
     /// Top-rule harness on/off switch.
     Switch,
-    /// `on` button for an off harness switch.
-    SwitchOn,
     /// Passive status title beside the chips.
     Title,
     /// The harness banner's link over Claude Code's update notice (`claude_card::NOTICE`).
     Link,
+    /// The top rule's ⬆️ of a newer CLI build: a press asks for the move now.
+    Upgrade,
 }
 
 impl HarnessChip {
@@ -382,9 +382,9 @@ impl HarnessChip {
             Self::Switch => 9,
             Self::Title => 10,
             Self::Context => 11,
-            Self::SwitchOn => 12,
-            Self::Account => 13,
-            Self::Link => 14,
+            Self::Account => 12,
+            Self::Link => 13,
+            Self::Upgrade => 14,
         }
     }
 
@@ -402,9 +402,9 @@ impl HarnessChip {
             9 => Self::Switch,
             10 => Self::Title,
             11 => Self::Context,
-            12 => Self::SwitchOn,
-            13 => Self::Account,
-            14 => Self::Link,
+            12 => Self::Account,
+            13 => Self::Link,
+            14 => Self::Upgrade,
             _ => return None,
         })
     }
@@ -440,9 +440,9 @@ impl HarnessChip {
             | Self::Team
             | Self::Mode
             | Self::Switch
-            | Self::SwitchOn
             | Self::Title
-            | Self::Link => None,
+            | Self::Link
+            | Self::Upgrade => None,
         }
     }
 }
@@ -677,7 +677,7 @@ pub(crate) struct StatsMeter {
 /// Stats deck resource meters and per-core meters.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StatsGroup {
-    /// "Stats deck, last 10 minutes".
+    /// "Stats deck, newest first".
     pub(crate) name: &'static str,
     /// One meter a resource, in row order.
     pub(crate) meters: Vec<StatsMeter>,
@@ -2163,7 +2163,7 @@ mod tests {
         };
         let stats = GridStats {
             group: StatsGroup {
-                name: "Stats deck, last 10 minutes",
+                name: "Stats deck, newest first",
                 meters: vec![meter("CPU", Some(98.0)), meter("Tokens", None)],
                 cores_name: "2 CPU cores".into(),
                 cores: vec![
@@ -2187,7 +2187,7 @@ mod tests {
         let update = grid_tree(&snap, Some(GEOM), &frame);
         let group = node(&update, NodeId(STATS_BASE));
         assert_eq!(group.role(), Role::Group);
-        assert_eq!(group.label(), Some("Stats deck, last 10 minutes"));
+        assert_eq!(group.label(), Some("Stats deck, newest first"));
         let kids = group.children();
         assert_eq!(kids.len(), 3, "two meters and the cores");
         let cpu = node(&update, kids[0]);
@@ -2726,9 +2726,9 @@ mod tests {
             HarnessChip::Switch,
             HarnessChip::Title,
             HarnessChip::Context,
-            HarnessChip::SwitchOn,
             HarnessChip::Account,
             HarnessChip::Link,
+            HarnessChip::Upgrade,
         ];
         let mut ids = std::collections::HashSet::new();
         for session in [0, 1, 7] {
@@ -2759,16 +2759,12 @@ mod tests {
         let chips = [
             at(HarnessChip::Mode, "Permission mode: plan.", 2),
             at(
-                HarnessChip::SwitchOn,
-                "on: turn the Claude Code harness on",
-                20,
-            ),
-            at(
                 HarnessChip::Title,
                 "Permission mode: click for bypass or auto",
                 8,
             ),
             at(HarnessChip::Link, "https://alab.systems", 28),
+            at(HarnessChip::Upgrade, "Update Claude Code to 2.1.310", 34),
         ];
         let update = grid_tree(
             &snap,

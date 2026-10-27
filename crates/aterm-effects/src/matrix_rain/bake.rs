@@ -81,6 +81,7 @@ impl RainBaker {
     }
 
     /// Bake up to [`MAX_RAIN_BAKES_PER_TICK`] pending tiles, returning whether any tile was baked.
+    #[inline]
     pub fn bake_tiles(&mut self, rom: &RomMaster) -> bool {
         if self.complete() {
             return false;
@@ -104,6 +105,7 @@ impl RainBaker {
     }
 
     /// Re-bake the tiles selected by `mask` and advance `version` to match a full rebuild.
+    #[inline]
     pub fn rebake_tiles(&mut self, rom: &RomMaster, mask: u64) -> bool {
         if !self.can_rebake() || mask == 0 {
             return false;
@@ -143,6 +145,7 @@ impl RainBaker {
     }
 
     /// Box-filter `tile`'s 24×48 master into a `(cell_w, cell_h)` art with integer area weighting.
+    #[inline]
     fn bake_tile(&mut self, rom: &RomMaster, tile: usize) {
         let (cw, ch) = (usize::from(self.cell_w), usize::from(self.cell_h));
         if cw == 0 || ch == 0 || tile >= self.tiles.len() {

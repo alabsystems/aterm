@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# A two-pane split: typing in the right pane, then the focus moves to the left pane and typing
+# goes on there.
+
+grid 16 100
+style rainbow kitty
+hz 60
+panes 2
+focus-pane 1
+
+at 0 pty "\e[9;1H$ "
+at 700 key e
+at 702 pty "e"
+at 800 key c
+at 802 pty "c"
+at 900 key h
+at 902 pty "h"
+at 1000 key o
+at 1002 pty "o"
+at 1100 key space
+at 1102 pty " "
+at 1200 key t
+at 1202 pty "t"
+at 1300 key h
+at 1302 pty "h"
+at 1400 key e
+at 1402 pty "e"
+at 1500 key space
+at 1502 pty " "
+at 1600 key r
+at 1602 pty "r"
+at 1700 key i
+at 1702 pty "i"
+at 1800 key g
+at 1802 pty "g"
+at 1900 key h
+at 1902 pty "h"
+at 2000 key t
+at 2002 pty "t"
+at 2100 key space
+at 2102 pty " "
+at 2200 key p
+at 2202 pty "p"
+at 2300 key a
+at 2302 pty "a"
+at 2400 key n
+at 2402 pty "n"
+at 2500 key e
+at 2502 pty "e"
+run 2900
+
+focus-pane 0
+
+at 2900 pty "\e[9;1H$ "
+at 3300 key e
+at 3302 pty "e"
+at 3400 key c
+at 3402 pty "c"
+at 3500 key h
+at 3502 pty "h"
+at 3600 key o
+at 3602 pty "o"
+at 3700 key space
+at 3702 pty " "
+at 3800 key t
+at 3802 pty "t"
+at 3900 key h
+at 3902 pty "h"
+at 4000 key e
+at 4002 pty "e"
+at 4100 key n
+at 4102 pty "n"
+at 4200 key space
+at 4202 pty " "
+at 4300 key t
+at 4302 pty "t"
+at 4400 key h
+at 4402 pty "h"
+at 4500 key e
+at 4502 pty "e"
+at 4600 key space
+at 4602 pty " "
+at 4700 key l
+at 4702 pty "l"
+at 4800 key e
+at 4802 pty "e"
+at 4900 key f
+at 4902 pty "f"
+at 5000 key t
+at 5002 pty "t"
+at 5100 key space
+at 5102 pty " "
+at 5200 key o
+at 5202 pty "o"
+at 5300 key n
+at 5302 pty "n"
+at 5400 key e
+at 5402 pty "e"
+run 7000

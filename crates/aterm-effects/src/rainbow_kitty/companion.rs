@@ -234,6 +234,7 @@ pub struct SeatQuery {
 
 /// The seat rule (§6.5 layer 13).
 #[must_use]
+#[inline]
 pub fn placement<F>(caret: (u16, u16), query: &SeatQuery, ink: F) -> Seat
 where
     F: Fn(u16, u16) -> Option<bool>,
@@ -570,11 +571,15 @@ impl PetOnGlass {
 /// The share of a cell the pet tile's transparent border takes at each side (`kitty_pet`'s `INK_PAD`): no fur stands there.
 const SHADE_BORDER_CELLS: f32 = 0.30;
 
-/// The pet's body as the sky draws around it: a star whose centre lies on the
-/// body is not drawn, so the cat flies in front of the sky. The pet ticks after
-/// the sky emits, so the shade is the body's last box joined with that box
-/// carried on by its last frame's move (the box it is about to be drawn at),
-/// each shaved of the tile's transparent border at the sides.
+/// The pet's body as the sky draws around it: a star whose arm at its peak
+/// reaches the body is not drawn, so the cat flies in front of the sky. The pet
+/// ticks after the sky emits, so the shade is the body's last box joined with
+/// that box carried on by its last frame's move (the box it is about to be
+/// drawn at), each shaved of the tile's transparent border at the sides. Keyed
+/// on the star's centre alone, a star beside the head laid its arms across
+/// the paper cat's eye (looks8 K8); keyed on its peak reach, as a word icon
+/// keeps the sky off ([`KeepOut::covers`]), the answer holds for the star's
+/// life while it stands still, and no star blinks on a twinkling arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PetShade {
     /// The last two drawn boxes, `(x0, x1, y0, y1)` in window pixels, newest first.
@@ -601,18 +606,32 @@ impl PetShade {
     /// The body box noted last (`None`: off glass, or never noted), window pixels.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
+    #[inline]
     pub const fn body(&self) -> Option<(i32, i32, i32, i32)> {
         self.boxes[0]
     }
 
-    /// Whether a star centred at `(x, y)` (window pixels) lies on the body.
+    /// Whether a star centred at `(x, y)` (window pixels) whose arm reaches
+    /// `reach` px round its centre at its peak touches the body.
+    #[inline]
     #[must_use]
-    pub const fn hides(&self, (x, y): (i32, i32), cell_w: usize) -> bool {
+    pub const fn hides(&self, (x, y): (i32, i32), reach: i32, cell_w: usize) -> bool {
+        #[inline]
+        const fn meets(
+            x: i32,
+            y: i32,
+            r: i32,
+            border: i32,
+            (x0, x1, y0, y1): (i32, i32, i32, i32),
+        ) -> bool {
+            x + r >= x0 + border && x - r < x1 - border && y + r >= y0 && y - r < y1
+        }
         let Some(last) = self.boxes[0] else {
             return false;
         };
+        let r = if reach > 0 { reach } else { 0 };
         let border = (SHADE_BORDER_CELLS * cell_w as f32).round() as i32;
-        if x >= last.0 + border && x < last.1 - border && y >= last.2 && y < last.3 {
+        if meets(x, y, r, border, last) {
             return true;
         }
         let Some(prev) = self.boxes[1] else {
@@ -622,8 +641,13 @@ impl PetShade {
         if dx == 0 && dy == 0 {
             return false;
         }
-        let (x0, x1, y0, y1) = (last.0 + dx, last.1 + dx, last.2 + dy, last.3 + dy);
-        x >= x0 + border && x < x1 - border && y >= y0 && y < y1
+        meets(
+            x,
+            y,
+            r,
+            border,
+            (last.0 + dx, last.1 + dx, last.2 + dy, last.3 + dy),
+        )
     }
 }
 
@@ -645,6 +669,17 @@ pub struct KeepOut {
     /// How far past its last letter a row's span reaches for a light kept
     /// clear of the letter guard's reach, px ([`Self::past`]).
     past: i32,
+    /// The filled cells' runs alone, lettered or not: a ground that does
+    /// not read as the page (a selection, a powerline segment;
+    /// [`Self::fills`]).
+    filled: Vec<(i32, i32, i32, i32)>,
+    /// The cells of the rows whose glyphs the host named whose ink may
+    /// reach under the baseline: a descender, a wide or non-ASCII glyph, a
+    /// letter the probe did not name ([`Self::foot_share`]).
+    feet: Vec<(i32, i32, i32, i32)>,
+    /// Those rows' boxes: a row among them has its feet known
+    /// ([`Self::knows_feet`]).
+    soles: Vec<(i32, i32, i32, i32)>,
 }
 
 impl Default for KeepOut {
@@ -662,6 +697,9 @@ impl Clone for KeepOut {
             cells: self.cells.clone(),
             rows: self.rows.clone(),
             past: self.past,
+            filled: self.filled.clone(),
+            feet: self.feet.clone(),
+            soles: self.soles.clone(),
         }
     }
 
@@ -671,6 +709,22 @@ impl Clone for KeepOut {
         self.cells.clone_from(&source.cells);
         self.rows.clone_from(&source.rows);
         self.past = source.past;
+        self.filled.clone_from(&source.filled);
+        self.feet.clone_from(&source.feet);
+        self.soles.clone_from(&source.soles);
+    }
+}
+
+/// Push each box of `from` with a positive width and height onto `to`.
+#[inline]
+fn push_real(to: &mut Vec<(i32, i32, i32, i32)>, from: &[(i32, i32, i32, i32)]) {
+    let mut i = 0;
+    while i < from.len() {
+        let b = from[i];
+        if b.0 < b.1 && b.2 < b.3 {
+            to.push(b);
+        }
+        i += 1;
     }
 }
 
@@ -681,6 +735,9 @@ impl KeepOut {
         cells: Vec::new(),
         rows: Vec::new(),
         past: 0,
+        filled: Vec::new(),
+        feet: Vec::new(),
+        soles: Vec::new(),
     };
     /// This frame's boxes, window pixels, all of them lettered or filled
     /// cells ([`Self::set_split`] with no icon).
@@ -712,6 +769,98 @@ impl KeepOut {
         self.boxes.extend_from_slice(&self.cells);
     }
 
+    /// This frame's filled cells' runs, window pixels ([`Self::fills`]).
+    #[inline]
+    pub fn set_filled(&mut self, filled: impl IntoIterator<Item = (i32, i32, i32, i32)>) {
+        self.filled.clear();
+        for b in filled {
+            if b.0 < b.1 && b.2 < b.3 {
+                self.filled.push(b);
+            }
+        }
+    }
+
+    /// This frame's feet and the rows they were read on, window pixels
+    /// ([`Self::feet`], [`Self::soles`]).
+    #[inline]
+    pub fn set_feet(
+        &mut self,
+        feet: impl IntoIterator<Item = (i32, i32, i32, i32)>,
+        soles: impl IntoIterator<Item = (i32, i32, i32, i32)>,
+    ) {
+        self.feet.clear();
+        for b in feet {
+            if b.0 < b.1 && b.2 < b.3 {
+                self.feet.push(b);
+            }
+        }
+        self.soles.clear();
+        for b in soles {
+            if b.0 < b.1 && b.2 < b.3 {
+                self.soles.push(b);
+            }
+        }
+    }
+
+    /// Whether the glyphs of the row spanning `y0..y1` were named, so its
+    /// feet are known ([`Self::foot_share`]).
+    #[inline]
+    #[must_use]
+    pub const fn knows_feet(&self, (y0, y1): (i32, i32)) -> bool {
+        let soles = self.soles.as_slice();
+        let mut i = 0;
+        while i < soles.len() {
+            let b = soles[i];
+            i += 1;
+            if b.2 <= y0 && y1 <= b.3 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The share of its light a stroke at window `(x, y)` keeps beside the
+    /// feet of its row: none within `clear` px of a foot's cell, easing in
+    /// to whole over the next `ease` px.
+    #[inline]
+    #[must_use]
+    pub const fn foot_share(&self, (x, y): (f32, f32), clear: f32, ease: f32) -> f32 {
+        let mut share = 1.0f32;
+        let feet = self.feet.as_slice();
+        let inv_ease = 1.0 / ease.max(1.0);
+        let mut i = 0;
+        while i < feet.len() {
+            let (x0, x1, y0, y1) = feet[i];
+            i += 1;
+            if y < y0 as f32 || y >= y1 as f32 {
+                continue;
+            }
+            let d = (x0 as f32 - x).max(x - x1 as f32) - clear;
+            if d <= 0.0 {
+                return 0.0;
+            }
+            let k = (d * inv_ease).min(1.0);
+            share = share.min(k * k * (3.0 - 2.0 * k));
+        }
+        share
+    }
+
+    /// Whether a filled cell's box meets the span `(x0, x1) × (y0, y1)`.
+    #[inline]
+    #[must_use]
+    pub const fn fills(&self, (x0, x1): (i32, i32), (y0, y1): (i32, i32)) -> bool {
+        let filled = self.filled.as_slice();
+        let mut i = 0;
+        while i < filled.len() {
+            let b = filled[i];
+            i += 1;
+            if b.0 < x1 && x0 < b.1 && b.2 < y1 && y0 < b.3 {
+                return true;
+            }
+        }
+        false
+    }
+
     #[inline]
     pub(crate) fn set_split_slices(
         &mut self,
@@ -739,6 +888,26 @@ impl KeepOut {
             i += 1;
         }
         self.boxes.extend_from_slice(&self.cells);
+    }
+
+    /// [`Self::set_filled`] from a slice.
+    #[inline]
+    pub(crate) fn set_filled_slice(&mut self, filled: &[(i32, i32, i32, i32)]) {
+        self.filled.clear();
+        push_real(&mut self.filled, filled);
+    }
+
+    /// [`Self::set_feet`] from slices.
+    #[inline]
+    pub(crate) fn set_feet_slices(
+        &mut self,
+        feet: &[(i32, i32, i32, i32)],
+        soles: &[(i32, i32, i32, i32)],
+    ) {
+        self.feet.clear();
+        push_real(&mut self.feet, feet);
+        self.soles.clear();
+        push_real(&mut self.soles, soles);
     }
 
     /// This frame's lettered rows' spans, window pixels: each row's first
@@ -1525,6 +1694,43 @@ mod tests {
             (r != 7 || c != 8).then_some(false)
         });
         assert_ne!(mixed.row, 7, "a single unknowable cell in the span yields");
+    }
+
+    /// A STAR WHOSE ARM REACHES THE PET'S BODY IS NOT DRAWN ON IT (looks8 K8):
+    /// a star beside the head whose centre misses the body, its arms across
+    /// the paper cat's eye, is shaded at its peak reach, and one whose reach
+    /// stops short of the fur is drawn. The shaved transparent border holds:
+    /// a reach into the tile's margin alone touches no fur. Negative
+    /// control: keyed on the centre alone (no reach), the star beside the
+    /// head is drawn.
+    #[test]
+    fn a_star_whose_arm_reaches_the_pet_is_shaded_whole() {
+        let cw = 14usize;
+        let border = (SHADE_BORDER_CELLS * cw as f32).round() as i32;
+        let body = (900, 960, 88, 118);
+        let mut shade = PetShade::EMPTY;
+        shade.note(Some(body));
+        let beside_eye = (body.0 + border - 3, 95);
+        assert!(
+            shade.hides(beside_eye, 4, cw),
+            "an arm across the eye is shaded"
+        );
+        assert!(
+            !shade.hides(beside_eye, 2, cw),
+            "a reach into the tile's margin alone touches no fur"
+        );
+        assert!(
+            !shade.hides((body.0 + border - 8, 95), 4, cw),
+            "a star clear of the fur stays"
+        );
+        assert!(
+            !shade.hides(beside_eye, 0, cw),
+            "control: keyed on its centre, the star on the eye is drawn"
+        );
+        assert!(
+            shade.hides((930, 100), 0, cw),
+            "a centre on the body is shaded"
+        );
     }
 
     /// A mark that reaches a box is kept off it and one beside it is not; a body under a box

@@ -1653,8 +1653,8 @@ pub(crate) struct TrailAudio {
     revives_left: u8,
     #[cfg(target_os = "macos")]
     worker: Option<std::thread::JoinHandle<()>>,
-    /// Test-only cue tap: `Some` makes this host report itself live.
-    #[cfg(test)]
+    /// The tests' and `crate::trail_rig`'s cue tap: `Some` makes this host report itself live.
+    #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
     capture: Option<Vec<(SoundEvent, EventMeta)>>,
 }
 
@@ -1678,7 +1678,7 @@ impl TrailAudio {
                 busy: Arc::new(AtomicU64::new(0)),
                 revives_left: WEDGE_REVIVES,
                 worker: None,
-                #[cfg(test)]
+                #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
                 capture: None,
             };
             if !active {
@@ -1720,22 +1720,22 @@ impl TrailAudio {
         {
             let _ = active;
             Self {
-                #[cfg(test)]
+                #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
                 capture: None,
             }
         }
     }
 
     /// A test host that reports live and records every cue (the `capture` field).
-    #[cfg(test)]
+    #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
     pub(crate) fn capturing_for_test() -> Self {
         let mut host = Self::new(false);
         host.capture = Some(Vec::new());
         host
     }
 
-    /// Take the cues recorded since the last call (test-only).
-    #[cfg(test)]
+    /// Take the cues recorded since the last call (the tests and `crate::trail_rig`).
+    #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
     pub(crate) fn take_captured_for_test(&mut self) -> Vec<SoundEvent> {
         self.take_captured_with_meta_for_test()
             .into_iter()
@@ -1744,7 +1744,7 @@ impl TrailAudio {
     }
 
     /// [`Self::take_captured_for_test`] with each cue's side-car.
-    #[cfg(test)]
+    #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
     pub(crate) fn take_captured_with_meta_for_test(&mut self) -> Vec<(SoundEvent, EventMeta)> {
         self.capture
             .as_mut()
@@ -1780,7 +1780,7 @@ impl TrailAudio {
 
     /// [`Self::push`] with the side-car (host input-clock stamp and glyph class).
     pub(crate) fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) {
-        #[cfg(test)]
+        #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
         if let Some(captured) = self.capture.as_mut() {
             captured.push((ev, meta));
             return;
@@ -1813,7 +1813,7 @@ impl TrailAudio {
 
     /// Whether cues pushed here can ever reach a device.
     pub const fn is_live(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
         if self.capture.is_some() {
             return true;
         }
@@ -1839,7 +1839,7 @@ impl TrailAudio {
 
     /// Wedged: ingress is open ([`Self::is_live`] is `true`) but the worker has been stuck.
     pub(crate) fn wedged_for(&self) -> Option<Duration> {
-        #[cfg(test)]
+        #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
         if self.capture.is_some() {
             return None;
         }
@@ -1858,7 +1858,7 @@ impl TrailAudio {
 
     /// The host's state for a status row.
     pub(crate) fn host_state(&self) -> HostState {
-        #[cfg(test)]
+        #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
         if self.capture.is_some() {
             return HostState::Running;
         }

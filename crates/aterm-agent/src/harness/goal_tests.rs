@@ -297,4 +297,31 @@ fn muse_code_store_names_only_an_active_goal() {
         Some("keep across empty schema mismatch"),
         "failed schema read keeps last known goal"
     );
+
+    // An active rollback `-journal` (`Unread::Writing`) must not freeze the `[db, db-wal]` stamp:
+    // once `-journal` is removed without touching `db` or `-wal`, the next `StoreGoal::read`
+    // immediately observes the committed goal.
+    let journaled_db = store_db(
+        &dir,
+        "journaled-goals.db",
+        MUSE_SCHEMA,
+        &format!(
+            "INSERT INTO goals (session_id,goal_id,revision,objective,status,percent_complete,created_at_ms,updated_at_ms) \
+             VALUES ('{a}','g1','r1','visible once rollback journal clears','active',60,1,2);"
+        ),
+    );
+    let journal_path = dir.join("journaled-goals.db-journal");
+    std::fs::write(&journal_path, b"in-flight rollback journal").expect("write journal");
+    let mut after_write = StoreGoal::default();
+    assert_eq!(
+        after_write.read(Store::Muse, &journaled_db, a),
+        None,
+        "in-flight rollback journal defers initial read"
+    );
+    std::fs::remove_file(&journal_path).expect("remove journal");
+    assert_eq!(
+        after_write.read(Store::Muse, &journaled_db, a),
+        Some("visible once rollback journal clears"),
+        "clearing -journal without modifying db/-wal retries instead of freezing a stale stamp"
+    );
 }

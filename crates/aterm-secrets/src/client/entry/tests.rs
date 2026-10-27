@@ -106,6 +106,211 @@ fn authenticated_reads_are_local_redacted_and_bound_to_one_entry() {
 }
 
 #[test]
+fn reserved_entries_are_authenticated_without_becoming_secret_files() {
+    let f = Fixture::new();
+    f.publish(|doc| {
+        doc.set_entry(
+            &Audience::Everyone,
+            "aterm-fleet-code",
+            b"inert-reserved-code",
+        )
+        .unwrap()
+    });
+    let expected = config(&f.paths).unwrap().unwrap();
+    let entry = read_reserved_entry(&f.paths, &expected, "aterm-fleet-code")
+        .unwrap()
+        .expect("signed reserved entry");
+    assert_eq!(entry.value().as_slice(), b"inert-reserved-code");
+    assert!(!f.paths.home.join(".secrets/aterm-fleet-code").exists());
+    assert!(read_reserved_entry(&f.paths, &expected, "token").is_err());
+    assert!(read_verified_entry(&f.paths, &expected, "aterm-fleet-code").is_err());
+}
+
+#[test]
+fn an_update_removes_the_fleet_code_file_an_older_build_wrote_at_the_same_version() {
+    let f = Fixture::new();
+    f.publish(|doc| {
+        doc.set_entry(
+            &Audience::Everyone,
+            "aterm-fleet-code",
+            b"inert-reserved-code",
+        )
+        .unwrap()
+    });
+    // What a build that did not reserve the name left: the file, and its manifest record.
+    let path = f.paths.home.join(".secrets/aterm-fleet-code");
+    fsx::write_atomic(&path, b"inert-reserved-code", 0o600).unwrap();
+    let mut state = load_state(&f.paths).unwrap();
+    let seq = state.seq;
+    state.manifest.files.insert(
+        "aterm-fleet-code".into(),
+        materialize::digest_hex(b"inert-reserved-code"),
+    );
+    save_state(&f.paths, &state).unwrap();
+    match sync(&f.paths, None).unwrap() {
+        SyncOutcome::Applied {
+            seq: applied,
+            report,
+        } => {
+            assert_eq!(applied, seq, "no new version was published");
+            assert_eq!(report.removed, ["aterm-fleet-code"], "{report:?}");
+            assert!(report.failed.is_empty(), "{report:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!path.exists());
+    assert!(
+        !load_state(&f.paths)
+            .unwrap()
+            .manifest
+            .files
+            .contains_key("aterm-fleet-code")
+    );
+    assert!(matches!(
+        sync(&f.paths, None).unwrap(),
+        SyncOutcome::Unchanged { .. }
+    ));
+    let expected = config(&f.paths).unwrap().unwrap();
+    let entry = read_reserved_entry(&f.paths, &expected, "aterm-fleet-code")
+        .unwrap()
+        .expect("the vault still holds the code");
+    assert_eq!(entry.value().as_slice(), b"inert-reserved-code");
+}
+
+/// Holds a file immutable (`chflags uchg`, as its owner can), so no unlink of it succeeds until
+/// this drops, unwinding included.
+#[cfg(target_os = "macos")]
+struct Immutable(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Immutable {
+    fn set(path: &Path) -> Self {
+        assert!(Self::chflags("uchg", path), "{}", path.display());
+        Self(path.to_path_buf())
+    }
+
+    fn chflags(flags: &str, path: &Path) -> bool {
+        aterm_uds::spawnfd::command("/usr/bin/chflags")
+            .arg(flags)
+            .arg(path)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Immutable {
+    fn drop(&mut self) {
+        Self::chflags("nouchg", &self.0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_fleet_code_file_whose_removal_fails_keeps_no_read_back_and_goes_on_a_later_pass() {
+    let f = Fixture::new();
+    f.publish(|doc| {
+        doc.set_entry(
+            &Audience::Everyone,
+            "aterm-fleet-code",
+            b"inert-reserved-code",
+        )
+        .unwrap()
+    });
+    let path = f.paths.home.join(".secrets/aterm-fleet-code");
+    fsx::write_atomic(&path, b"inert-reserved-code", 0o600).unwrap();
+    set_state(&f.paths, |s| {
+        s.manifest.files.insert(
+            "aterm-fleet-code".into(),
+            materialize::digest_hex(b"inert-reserved-code"),
+        );
+    });
+    let immutable = Immutable::set(&path);
+    let stuck = sync(&f.paths, None);
+    drop(immutable);
+    match stuck.unwrap() {
+        SyncOutcome::Applied { report, .. } => {
+            let failed: Vec<&str> = report.failed.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(failed, ["aterm-fleet-code"], "{report:?}");
+            assert!(report.removed.is_empty(), "{report:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(path.exists(), "the removal failed");
+    let state = load_state(&f.paths).unwrap();
+    assert!(
+        !state.failed,
+        "every entry the vault holds is in place: no read of the applied copy is kept back"
+    );
+    assert!(
+        state.manifest.files.contains_key("aterm-fleet-code"),
+        "kept, so the next pass tries again"
+    );
+    let expected = config(&f.paths).unwrap().unwrap();
+    let code = fleet::reserved_code(&f.paths, &expected).unwrap();
+    assert_eq!(
+        code.as_ref().map(SecretBytes::as_slice),
+        Some(b"inert-reserved-code".as_slice())
+    );
+    match sync(&f.paths, None).unwrap() {
+        SyncOutcome::Applied { report, .. } => {
+            assert_eq!(report.removed, ["aterm-fleet-code"], "{report:?}");
+            assert!(report.failed.is_empty(), "{report:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_fleet_code_read_before_the_apply_finished_says_so_rather_than_none() {
+    let f = Fixture::new();
+    let expected = config(&f.paths).unwrap().unwrap();
+    assert!(
+        fleet::reserved_code(&f.paths, &expected).unwrap().is_none(),
+        "the vault publishes none"
+    );
+    f.publish(|doc| {
+        doc.set_entry(
+            &Audience::Everyone,
+            "aterm-fleet-code",
+            b"inert-reserved-code",
+        )
+        .unwrap()
+    });
+    let held = load_state(&f.paths).unwrap();
+    for (fault, said) in [
+        ("failed", "did not finish"),
+        ("pending", "did not finish"),
+        ("busy", "applying on this machine now"),
+    ] {
+        let guard = match fault {
+            "failed" => {
+                set_state(&f.paths, |s| s.failed = true);
+                None
+            }
+            "pending" => {
+                set_state(&f.paths, |s| {
+                    s.pending
+                        .insert("other".into(), materialize::digest_hex(b"pending"));
+                });
+                None
+            }
+            "busy" => Some(StateLock::take(&f.paths).unwrap()),
+            _ => unreachable!(),
+        };
+        let read = fleet::reserved_code(&f.paths, &expected);
+        drop(guard);
+        match read {
+            Err(error) => assert!(error.to_string().contains(said), "{fault}: {error}"),
+            Ok(code) => panic!("{fault}: read as {:?}", code.map(|_| "a code")),
+        }
+        save_state(&f.paths, &held).unwrap();
+    }
+    assert!(fleet::reserved_code(&f.paths, &expected).unwrap().is_some());
+}
+
+#[test]
 fn local_if_absent_files_are_not_promoted_to_authenticated_entries() {
     let f = Fixture::new();
     let name = "local-value";

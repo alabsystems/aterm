@@ -979,7 +979,11 @@ fn cleanup_record(path: &Path, text: &str) -> Option<Record> {
 
 /// A complete admitted snapshot, or unknown. Never build partial competing claims.
 fn read_records(dir: &Path) -> std::io::Result<Vec<(PathBuf, Record)>> {
-    let entries = std::fs::read_dir(dir)?;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(why) => return Err(why),
+    };
     let mut records = Vec::new();
     for entry in entries {
         let path = entry?.path();

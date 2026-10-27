@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for window landing-hold display ([`HeldGlass`], [`hold_words`], [`App::shown_hold`]).
+//! Tests for window landing-hold display ([`HeldGlass`], [`hold_words`], [`App::shown_hold`]),
+//! and for the stop and the outage wait beside it ([`App::shown_stop`], [`App::shown_wait`]).
 
 use std::sync::Arc;
 
@@ -328,6 +329,7 @@ fn row(
 ) -> HarnessSessionRow {
     HarnessSessionRow {
         stopped: None,
+        waiting: None,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),
@@ -1134,4 +1136,87 @@ fn a_stopped_cruise_says_the_stop_in_place_of_its_promise() {
         off[..4].iter().all(|s| !s.contains(STOPPED_TYPING)),
         "Off types nothing, so no stop is said: {off:#?}"
     );
+}
+
+/// An outage wait (§14.17.5.2) is said by Settings ▸ Harness's state line and `status waiting=`
+/// only: the chip's title and description, the hover, the worker's tip, the needs and the
+/// Messages stay as they were, and the wait's end or the supervisor's release takes it down.
+#[test]
+fn an_outage_wait_is_said_on_the_state_line_and_in_status_alone() {
+    use crate::autopilot::AutopilotView;
+    use crate::harness_glass::{Stamp, wall_today};
+    use aterm_agent::supervise::Outage;
+    let sep = crate::native_ui::FACT_SEPARATOR;
+    let next = SINCE_S + 600;
+    let (mut app, sid, _host) = desk("cruise");
+    let quiet = |app: &App| {
+        (
+            app.messages.live_rows().count(),
+            app.messages.digest().revision,
+            app.presence.slot(0).and_then(|slot| slot.need.clone()),
+            status(app, "needs"),
+            app.chip_glass(0),
+        )
+    };
+    let before = stop_surfaces(&mut app, AutopilotView::Cruise);
+    let was = quiet(&app);
+    assert!(
+        before.iter().all(|s| !s.contains("waiting:")),
+        "CONTROL: {before:#?}"
+    );
+    assert_eq!(status(&app, "waiting"), "-", "CONTROL: no wait");
+    let tell = |app: &mut App, wall, tries| {
+        app.apply_harness_fact(
+            &sid,
+            crate::HarnessFact::Waiting(Some(crate::OutageWait {
+                wall,
+                tries,
+                at_unix: next,
+            })),
+        );
+    };
+    tell(&mut app, Outage::Overload, true);
+    let after = stop_surfaces(&mut app, AutopilotView::Cruise);
+    let at = Stamp::at_or_utc(next).ahead_words(Some(wall_today().1));
+    assert!(
+        after[2].starts_with(&format!("waiting: API overload{sep}next try {at}")),
+        "the state line leads with it: {}",
+        after[2]
+    );
+    assert_eq!(status(&app, "waiting"), "overload");
+    assert_eq!(
+        [&after[0], &after[1], &after[3], &after[4]],
+        [&before[0], &before[1], &before[3], &before[4]],
+        "no chip title, description, hover or tip says it"
+    );
+    assert_eq!(quiet(&app), was, "no Messages row, no need, no chip glass");
+    tell(&mut app, Outage::Connection, false);
+    let down = stop_surfaces(&mut app, AutopilotView::Cruise);
+    assert!(
+        down[2].starts_with("waiting: connection error") && !down[2].contains("next try"),
+        "measured down, no try: {}",
+        down[2]
+    );
+    assert_eq!(status(&app, "waiting"), "connection");
+    app.apply_harness_fact(&sid, crate::HarnessFact::Waiting(None));
+    let ended = stop_surfaces(&mut app, AutopilotView::Cruise);
+    assert_eq!(ended, before, "its end takes it down");
+    assert_eq!(status(&app, "waiting"), "-");
+    tell(&mut app, Outage::ApiError, true);
+    assert_eq!(status(&app, "waiting"), "api-error", "CONTROL: told again");
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    assert!(crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl
+    ));
+    assert_eq!(
+        status(&app, "waiting"),
+        "-",
+        "a session this window no longer supervises waits on nothing it says"
+    );
+    app.harness_screen_moved();
+    let released = stop_surfaces(&mut app, AutopilotView::Cruise);
+    assert!(!released[2].contains("waiting:"), "{}", released[2]);
 }

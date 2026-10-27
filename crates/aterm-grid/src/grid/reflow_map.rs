@@ -264,6 +264,42 @@ pub(super) fn chunk_cells_to_rows(
         cell_offset = actual_end;
         first = false;
     }
+    open_rows_past_a_full_end(new_cols, new_pages, new_rows, points);
+}
+
+/// A point past the end of a line whose last row is full (`opens_row`) would land on a column
+/// past that row; clamped, it would sit on the row's last glyph. Give it a blank continuation row
+/// instead, at its distance from where that row starts (clamped to the row), as a rewrap carries
+/// the live cursor's own cell (`cursor_row_copy_len`).
+fn open_rows_past_a_full_end(
+    new_cols: u16,
+    new_pages: &mut PageStore,
+    new_rows: &mut Vec<Row>,
+    points: &mut [TrackedPoint],
+) {
+    let Some(last) = new_rows.len().checked_sub(1) else {
+        return;
+    };
+    if new_rows[last].len() < new_cols {
+        return;
+    }
+    let mut opened = false;
+    for point in points.iter_mut().filter(|point| point.opens_row) {
+        if let Some((row, col)) = point.at
+            && row == last
+            && col >= new_cols
+        {
+            if !opened {
+                // SAFETY: The row is appended to `new_rows` and returned with the same
+                // `new_pages` owner in the enclosing reflow result.
+                let mut row = unsafe { Row::new(new_cols, new_pages) };
+                row.set_wrapped(true);
+                new_rows.push(row);
+                opened = true;
+            }
+            point.at = Some((last + 1, (col - new_cols).min(new_cols - 1)));
+        }
+    }
 }
 
 /// Cursor logical offset and destination `(row, col)` tracked across line chunking.
@@ -272,6 +308,9 @@ pub(super) struct TrackedPoint {
     pub(super) offset: Option<usize>,
     pub(super) at: Option<(usize, u16)>,
     pub(super) keeps_gap: bool,
+    /// A point that keeps its gap past a line whose last row is full gets a continuation row of
+    /// its own rather than a column clamped onto that row's last glyph.
+    pub(super) opens_row: bool,
 }
 
 #[cfg(test)]
@@ -410,6 +449,7 @@ mod tests {
             offset,
             at: None,
             keeps_gap: false,
+            opens_row: false,
         });
         chunk_cells_to_rows(
             cells,

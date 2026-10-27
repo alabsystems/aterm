@@ -503,6 +503,16 @@ fn inet_diag_remote_peer(family: u8, dst: &[u8]) -> bool {
 /// Returns `Some(true)` once `NLMSG_DONE` is seen, `Some(false)` when more datagrams follow, and
 /// `None` on `NLMSG_ERROR` or malformed framing.
 pub fn parse_inet_diag_rtts(buf: &[u8], rtts: &mut Vec<f32>) -> Option<bool> {
+    parse_inet_diag_rtts_seq(buf, None, rtts)
+}
+
+/// Like [`parse_inet_diag_rtts`], filtering messages to `expected_seq` when `Some` so a stale frame
+/// from another dump sequence never injects readings or terminates the active dump early.
+pub fn parse_inet_diag_rtts_seq(
+    buf: &[u8],
+    expected_seq: Option<u32>,
+    rtts: &mut Vec<f32>,
+) -> Option<bool> {
     let mut off = 0usize;
     while off + NLMSG_HDRLEN <= buf.len() {
         let nlmsg_len = u32::from_ne_bytes(buf.get(off..off + 4)?.try_into().ok()?) as usize;
@@ -510,46 +520,49 @@ pub fn parse_inet_diag_rtts(buf: &[u8], rtts: &mut Vec<f32>) -> Option<bool> {
             return None;
         }
         let nlmsg_type = u16::from_ne_bytes(buf.get(off + 4..off + 6)?.try_into().ok()?);
-        let msg = &buf[off + NLMSG_HDRLEN..off + nlmsg_len];
-        match nlmsg_type {
-            NLMSG_NOOP => {}
-            NLMSG_DONE => return Some(true),
-            NLMSG_ERROR => return None,
-            SOCK_DIAG_BY_FAMILY if msg.len() >= INET_DIAG_MSG_LEN => {
-                let family = msg[0];
-                let state = msg[1];
-                let dst = &msg[INET_DIAG_DST_AT..INET_DIAG_DST_AT + 16];
-                if state == LINUX_TCP_ESTABLISHED && inet_diag_remote_peer(family, dst) {
-                    let mut attrs = &msg[INET_DIAG_MSG_LEN..];
-                    while attrs.len() >= NLA_HDRLEN {
-                        let nla_len =
-                            u16::from_ne_bytes(attrs.get(0..2)?.try_into().ok()?) as usize;
-                        if nla_len < NLA_HDRLEN || nla_len > attrs.len() {
-                            break;
-                        }
-                        let nla_type =
-                            u16::from_ne_bytes(attrs.get(2..4)?.try_into().ok()?) & NLA_TYPE_MASK;
-                        if nla_type == INET_DIAG_INFO_ATTR {
-                            let info = &attrs[NLA_HDRLEN..nla_len];
-                            if let Some(raw) = info.get(TCPI_RTT_AT..TCPI_RTT_AT + 4) {
-                                let rtt_us = u32::from_ne_bytes(raw.try_into().ok()?);
-                                if rtt_us > 0 {
-                                    let ms = (rtt_us as f32) / 1_000.0;
-                                    if ms.is_finite() && ms > 0.0 {
-                                        rtts.push(ms);
+        let nlmsg_seq = u32::from_ne_bytes(buf.get(off + 8..off + 12)?.try_into().ok()?);
+        if expected_seq.is_none_or(|want| nlmsg_seq == want) {
+            let msg = &buf[off + NLMSG_HDRLEN..off + nlmsg_len];
+            match nlmsg_type {
+                NLMSG_NOOP => {}
+                NLMSG_DONE => return Some(true),
+                NLMSG_ERROR => return None,
+                SOCK_DIAG_BY_FAMILY if msg.len() >= INET_DIAG_MSG_LEN => {
+                    let family = msg[0];
+                    let state = msg[1];
+                    let dst = &msg[INET_DIAG_DST_AT..INET_DIAG_DST_AT + 16];
+                    if state == LINUX_TCP_ESTABLISHED && inet_diag_remote_peer(family, dst) {
+                        let mut attrs = &msg[INET_DIAG_MSG_LEN..];
+                        while attrs.len() >= NLA_HDRLEN {
+                            let nla_len =
+                                u16::from_ne_bytes(attrs.get(0..2)?.try_into().ok()?) as usize;
+                            if nla_len < NLA_HDRLEN || nla_len > attrs.len() {
+                                break;
+                            }
+                            let nla_type = u16::from_ne_bytes(attrs.get(2..4)?.try_into().ok()?)
+                                & NLA_TYPE_MASK;
+                            if nla_type == INET_DIAG_INFO_ATTR {
+                                let info = &attrs[NLA_HDRLEN..nla_len];
+                                if let Some(raw) = info.get(TCPI_RTT_AT..TCPI_RTT_AT + 4) {
+                                    let rtt_us = u32::from_ne_bytes(raw.try_into().ok()?);
+                                    if rtt_us > 0 {
+                                        let ms = (rtt_us as f32) / 1_000.0;
+                                        if ms.is_finite() && ms > 0.0 {
+                                            rtts.push(ms);
+                                        }
                                     }
                                 }
                             }
+                            let step = nla_len.next_multiple_of(4);
+                            if step >= attrs.len() {
+                                break;
+                            }
+                            attrs = &attrs[step..];
                         }
-                        let step = nla_len.next_multiple_of(4);
-                        if step >= attrs.len() {
-                            break;
-                        }
-                        attrs = &attrs[step..];
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
         let step = nlmsg_len.next_multiple_of(4);
         if off.saturating_add(step) <= off {
@@ -580,22 +593,24 @@ pub fn tcp_srtt_ms() -> Option<f32> {
     const NLM_F_REQUEST: u16 = 0x01;
     const NLM_F_DUMP: u16 = 0x300;
     const REQ_LEN: usize = NLMSG_HDRLEN + 56;
-    // SAFETY: Plain integer flags; non-blocking + close-on-exec datagram netlink socket owned by `OwnedFd`.
-    let raw = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            libc::NETLINK_SOCK_DIAG,
-        )
-    };
-    if raw < 0 {
-        return None;
-    }
-    // SAFETY: `raw` is a freshly created file descriptor >= 0.
-    let sock = unsafe { OwnedFd::from_raw_fd(raw) };
     let mut rtts = Vec::new();
     let mut recv_buf = [0u8; 32 * 1024];
     for (seq, family) in [(1u32, LINUX_AF_INET), (2u32, LINUX_AF_INET6)] {
+        // Open an isolated socket per address family so a >64-datagram IPv4 dump never leaves
+        // `cb_running` (`EBUSY`) or unread frames queued ahead of IPv6.
+        // SAFETY: Plain integer flags; non-blocking + close-on-exec datagram netlink socket owned by `OwnedFd`.
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                libc::NETLINK_SOCK_DIAG,
+            )
+        };
+        if raw < 0 {
+            continue;
+        }
+        // SAFETY: `raw` is a freshly created file descriptor >= 0.
+        let sock = unsafe { OwnedFd::from_raw_fd(raw) };
         let mut req = [0u8; REQ_LEN];
         req[0..4].copy_from_slice(&(REQ_LEN as u32).to_ne_bytes());
         req[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
@@ -630,7 +645,7 @@ pub fn tcp_srtt_ms() -> Option<f32> {
             if n == 0 {
                 break;
             }
-            match parse_inet_diag_rtts(&recv_buf[..n as usize], &mut rtts) {
+            match parse_inet_diag_rtts_seq(&recv_buf[..n as usize], Some(seq), &mut rtts) {
                 Some(true) | None => break,
                 Some(false) => {}
             }
@@ -1523,6 +1538,7 @@ impl Root {
             };
             let start = u64::try_from(u128::from(stat.start) * 1_000_000_000 / u128::from(hz)).ok();
             procs.push(ProcessReading {
+                scheduling: None,
                 pid,
                 start,
                 ppid: stat.ppid,

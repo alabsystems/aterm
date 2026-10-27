@@ -3,8 +3,11 @@
 
 //! Trace file round-trip, tamper refusal, and replay verification tests.
 
+use std::time::Duration;
+
 use aterm_aos::Digest;
 use aterm_aos::log::{EventLog, LogFault, Tail};
+use aterm_aos::registry::Judged;
 use aterm_aos::replay::empty_chain;
 use aterm_aos::wire::WireFault;
 use aterm_time::Instant;
@@ -13,8 +16,9 @@ use super::test_fixtures::{
     BUILD, Glow, LANE, attached, attached_for_lane, burst, cfg, draw, geom, hosted, ms, run_lane,
 };
 use super::{
-    EventCounts, MOMENTUM_HOST_MAX_EVENTS, MOMENTUM_TRACE_MAX_BYTES, MomentumCode, MomentumEvent,
-    MomentumHost, MomentumSchema, MomentumTrace, Sched, TRACE_FILE_MAGIC, TraceFault,
+    EventCounts, HOT_HAS_WAKE, MOMENTUM_HOST_MAX_EVENTS, MOMENTUM_TRACE_MAX_BYTES, MomentumCode,
+    MomentumEvent, MomentumHost, MomentumSchema, MomentumTrace, Sched, Segment, TRACE_FILE_MAGIC,
+    TraceFault,
 };
 
 fn typed(t0: Instant) -> MomentumHost {
@@ -313,4 +317,113 @@ fn the_largest_trace_a_window_exports_fits_twice_under_the_check_bound() {
         "a full host epoch is {bytes} bytes"
     );
     assert!(full.check(t0, BUILD).is_ok(), "a full host epoch checks");
+}
+
+#[test]
+fn a_full_window_of_light_page_4095_quad_frames_checks_and_judges() {
+    let t0 = Instant::now();
+    let g = crate::cursor_glow::Geom {
+        cw: 8,
+        ch: 200,
+        rows: 8,
+        cols: 80,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 640,
+        win_h: 1600,
+        head: 0,
+    };
+    let c = super::MomentumGlowConfig {
+        radius_cells: 4.0,
+        ..cfg(false)
+    };
+    let mut host = attached(t0, MomentumCode::Shipped);
+    for k in 0..96u64 {
+        host.key(t0 + ms(k), super::test_fixtures::TAU);
+    }
+    let hot_start = t0 + ms(100);
+    let mut out = Vec::new();
+    let mut under = Vec::new();
+    let _ = host.tick(Some((4, 40)), hot_start, g, &c, &mut out, &mut under);
+    assert_eq!(
+        out.len() + under.len(),
+        4095,
+        "fixture: a hot light-page frame hits the 4095-quad cap"
+    );
+    let mut f = 1u64;
+    while host.aos_status().log_len < MOMENTUM_HOST_MAX_EVENTS {
+        out.clear();
+        under.clear();
+        let _ = host.tick(
+            Some((4, 40)),
+            hot_start + Duration::from_micros(50 * f),
+            g,
+            &c,
+            &mut out,
+            &mut under,
+        );
+        f += 1;
+    }
+    assert_eq!(out.len() + under.len(), 4095, "still at the 4095-quad cap");
+    let trace = host.aos_trace().expect("exports");
+    let checked = trace.check(t0, BUILD).expect("checks");
+    assert!(checked.verdict.passed(), "{:?}", checked.verdict);
+    assert_eq!(trace.replay(t0, BUILD).expect("replays"), checked.replay);
+
+    let _ = host.tick(
+        Some((4, 40)),
+        hot_start + Duration::from_micros(50 * f),
+        g,
+        &c,
+        &mut out,
+        &mut under,
+    );
+    let mut retired: Vec<_> = host
+        .aos_take_retired()
+        .into_iter()
+        .map(Segment::judge)
+        .collect();
+    assert_eq!(retired.len(), 1);
+    let seg = retired.pop().unwrap();
+    assert_eq!(seg.judged, Judged::Pass);
+    assert_eq!((seg.from, seg.to), (0, MOMENTUM_HOST_MAX_EVENTS as u64));
+
+    let mut demo = attached(t0, MomentumCode::DemoStrandedSettle);
+    let mut demo_seen = Vec::new();
+    let (last, cell) = burst(&mut demo, t0, 24, &c, &mut demo_seen);
+    let parked = run_lane(&mut demo, last, LANE, cell, &c, &mut demo_seen);
+    assert!(
+        parked.stranded,
+        "fixture: the demo fault strands on light page"
+    );
+    let mut after = parked.at;
+    while demo.aos_retired_waiting() == 0 {
+        after += Duration::from_micros(50);
+        out.clear();
+        under.clear();
+        let _ = demo.tick(Some(cell), after, g, &c, &mut out, &mut under);
+    }
+    let demo_seg = demo
+        .aos_take_retired()
+        .into_iter()
+        .next()
+        .expect("retired")
+        .judge();
+    let Judged::Fail {
+        law: HOT_HAS_WAKE,
+        cursor: seg_cursor,
+    } = demo_seg.judged
+    else {
+        panic!("expected HotHasWake failure, got {:?}", demo_seg.judged);
+    };
+    let fault = demo_seg.fault.expect("fault trace exported");
+    let fault_checked = fault.check(t0, BUILD).expect("fault trace checks");
+    assert!(matches!(
+        fault_checked.verdict,
+        aterm_aos::contract::Verdict::Fail {
+            cursor,
+            law: HOT_HAS_WAKE,
+            ..
+        } if cursor == seg_cursor
+    ));
 }

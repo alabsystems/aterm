@@ -1,0 +1,16 @@
+reach-tall-doubled-2026-10-27 — five frames of one kept `plane` paint take, VERBATIM.
+
+Binary:   a release aterm of origin/main 21e989291d with a throwaway patch, never committed:
+          body_profile's `up_ch: TALL_UP_CH * 2.0` and `up_ch: UNDERLINE_UP_CH * 2.0`
+          (crates/aterm-effects/src/rainbow_kitty/ribbon.rs), run from its build path,
+          sha256 a9748e9e39c13524e1b2d2d1c0dafe711359a47c46f0d4de32603fae4ed510d3.
+Take:     benches/paint.rs row the_tall_body_stands_within_its_reach_above_the_typed_row,
+          ATERM_PAINT_KEEP=1, scratch /tmp/atpaint-55672_9b50bfb118d265da_1, 2026-10-27 06:52
+          (load 16.9 on 10 cores), cell 7x14, 67 frames, typed row bottom edge y=142, frame
+          584x350 (take.txt).
+Probe:    measure row: paint::the_tall_body_stands_within_its_reach_above_the_typed_row FAIL
+          ... reach=tall reach_frames=23 reach_px=21 reach_min_px=20 reach_max_px=22
+          reach_bounds_pct=55:100 cell_h=14 row_bottom=142 starved=No verdict=Fail
+Frames:   shot_0000 (the differencing baseline), shot_0033, shot_0036, shot_0037, shot_0040
+          (bound frames before the flying cat arrives at shot_0043).
+Measured: band_top over each is 22, 22, 20 and 20 px above y=142 (1.43 to 1.57 of a cell).

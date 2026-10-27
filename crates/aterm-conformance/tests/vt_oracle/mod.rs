@@ -8,6 +8,7 @@ mod corpus;
 mod engines;
 mod exclusions;
 mod generator;
+mod resizes;
 
 use caps::Caps;
 use corpus::{CORPUS, Case};
@@ -253,6 +254,10 @@ fn the_subset_check_sees_what_a_dropped_token_rebuilds() {
         newline_mode: false,
         charsets: false,
         lr_margins: false,
+        width_resize: false,
+        wide_glyphs: false,
+        sgr_attrs: false,
+        truecolour: false,
     };
     let program = |kinds: &[Kind]| Program {
         cols: 4,
@@ -312,6 +317,25 @@ fn the_subset_check_sees_what_a_dropped_token_rebuilds() {
     assert!(program(&[Kind::Reset, enter, Kind::Restore]).in_subset(wide));
     assert!(!program(&[Kind::Reset, enter, Kind::Restore]).in_subset(ris));
     assert!(program(&[Kind::Reset, enter, Kind::Save, leave, enter, Kind::Restore]).in_subset(ris));
+    // A resize between a save and its restore keeps the restore out (aterm and the fold carry a
+    // slot through a resize differently); a save after the resize lets it back in.
+    let resizes = Caps {
+        width_resize: true,
+        ..wide
+    };
+    let resize = Kind::Resize { cols: 7 };
+    assert!(
+        !program(&[resize]).in_subset(wide),
+        "no resize without the cap"
+    );
+    assert!(program(&[Kind::Save, Kind::Restore, resize]).in_subset(resizes));
+    assert!(!program(&[Kind::Save, resize, Kind::Restore]).in_subset(resizes));
+    assert!(program(&[resize, Kind::Save, Kind::Restore]).in_subset(resizes));
+    assert!(
+        !program(&[enter, resize, leave]).in_subset(resizes),
+        "?1049l restores the slot"
+    );
+    assert!(program(&[enter, leave, resize]).in_subset(resizes));
 }
 
 /// The comparison is not vacuous: it sees a one-glyph difference, a cursor
@@ -340,10 +364,68 @@ fn the_comparison_sees_text_cursor_colour_and_visibility() {
         base.first_difference(&snap(b"ab\x1b[?25l")).is_some(),
         "visibility"
     );
+    for attr in ["3", "5", "8", "9", "38;2;1;2;3", "48:2::1:2:3"] {
+        assert!(
+            base.first_difference(&snap(format!("\x1b[{attr}mab").as_bytes()))
+                .is_some(),
+            "SGR {attr}"
+        );
+    }
     let mut a = Astream::new(6, 2);
     a.feed(b"ab");
     assert!(
         a.snap().first_difference(&base).is_none(),
         "and the two agree on it"
+    );
+    // Which half of a wide glyph a cell holds is compared too, apart from its text.
+    let wide = snap("\u{4e2d}".as_bytes());
+    let mut torn = wide.clone();
+    torn.cells[1].ink.half = engines::Half::Narrow;
+    assert!(
+        wide.first_difference(&torn).is_some(),
+        "a wide glyph's half"
+    );
+    let mut a = Astream::new(6, 2);
+    a.feed("\u{4e2d}".as_bytes());
+    assert!(
+        a.snap().first_difference(&wide).is_none(),
+        "and the two agree on a wide glyph"
+    );
+}
+
+/// The fold measures every code point as aterm's write path does: the columns a lone glyph
+/// takes from the start of a line (`astream_term::char_display_width`, from aterm's cursor),
+/// for every scalar value but the C0 and C1 controls. The fold's zero-width and wide tables are
+/// aterm's, so neither can move without the other.
+#[test]
+fn the_fold_measures_every_code_point_as_aterm_does() {
+    let mut t = aterm_core::terminal::Terminal::new(1, 8);
+    let mut differ = Vec::new();
+    let mut by_width = [0u32; 3];
+    let mut bytes = String::new();
+    for c in (' '..=char::MAX).filter(|c| !c.is_control()) {
+        bytes.clear();
+        bytes.push_str("\r\x1b[2K");
+        bytes.push(c);
+        t.process(bytes.as_bytes());
+        let aterm = t.cursor().col;
+        let fold = astream_term::char_display_width(c);
+        if u16::from(fold) != aterm {
+            differ.push(format!("U+{:04X} fold {fold} aterm {aterm}", u32::from(c)));
+        }
+        if let Some(n) = by_width.get_mut(usize::from(fold)) {
+            *n += 1;
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} code points measured apart, first {:?}",
+        differ.len(),
+        &differ[..differ.len().min(20)]
+    );
+    // Not vacuous: the scalars span every width, the wide ones by the hundred thousand.
+    assert!(
+        by_width[0] > 2_000 && by_width[1] > 100_000 && by_width[2] > 100_000,
+        "widths 0, 1, 2: {by_width:?}"
     );
 }

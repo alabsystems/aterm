@@ -135,6 +135,7 @@ impl Companions {
     }
 
     /// Feed a classified key press to the tone, sing-along, and summon detectors.
+    #[inline]
     pub fn note_typed_press(&mut self, press: TypedPress<'_>, feed: PressFeed<'_>) -> TypedHit {
         let PressFeed {
             session,
@@ -145,7 +146,7 @@ impl Companions {
         } = feed;
         press.feed(
             &mut self.tone_tracker,
-            |tone| tone.note_break(),
+            ToneTracker::note_break,
             |tone| tone.note_backspace(session),
             |tone, c| tone.note_char(now, session, c, tone_active),
         );
@@ -161,7 +162,7 @@ impl Companions {
         let mut fired = TypedHit::NONE;
         press.feed(
             &mut self.kitty_summon,
-            |summon| summon.note_break(),
+            TypedKittySummon::note_break,
             |summon| summon.note_backspace(session),
             |summon, c| {
                 if let Some((lexicon, opts)) = words {

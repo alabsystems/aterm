@@ -50,6 +50,19 @@ pub type io_registry_entry_t = io_object_t;
 pub type io_service_t = io_object_t;
 pub type IOOptionBits = u32;
 
+/// `mach/processor_info.h`: selectors and layout for online processor slots.
+pub const PROCESSOR_BASIC_INFO: i32 = 1;
+pub const PROCESSOR_BASIC_INFO_COUNT: u32 = 5;
+
+#[repr(C)]
+pub struct processor_basic_info_data_t {
+    pub cpu_type: i32,
+    pub cpu_subtype: i32,
+    pub running: boolean_t,
+    pub slot_num: i32,
+    pub is_main: boolean_t,
+}
+
 /// `CFString.h`.
 pub const kCFStringEncodingUTF8: CFStringEncoding = 0x0800_0100;
 /// `CFNumber.h`: every number is read out as a 64-bit signed integer.
@@ -60,6 +73,8 @@ pub(crate) const MAIN_PORT_DEFAULT: mach_port_t = 0;
 
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
+    /// Public IOPMLib.h; a +1 dictionary on success, released by its caller.
+    pub fn IOPMCopyCPUPowerStatus(status: *mut CFDictionaryRef) -> kern_return_t;
     /// A +1 `CFMutableDictionaryRef`, consumed by `IOServiceGetMatchingService`.
     pub fn IOServiceMatching(name: *const c_char) -> CFMutableDictionaryRef;
     /// Consumes `matching`; the service it answers is the caller's (+1).

@@ -744,6 +744,7 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
     }
     if let Some(home) = roots.home.as_deref() {
         w.build_cache(&atpkg::build_cache::cache_root(home));
+        w.build_cache(&atpkg::build_cache::moved_from(home));
     }
     if let Some(tmp) = &roots.claude_tmp {
         w.claude_scratch(tmp);
@@ -1948,11 +1949,19 @@ pub fn scan_says_unused(
     Ok(())
 }
 
-/// Scans all processes of this UID for open references under `dirs`.
+/// Scans all processes of this UID for open references under `dirs`. A debug build in an
+/// aterm-lab jail that names its mark reads the jail's processes alone
+/// ([`aterm_uds::holders::lab_jail_pids`]): the owner's, outside it, cannot be read from inside.
 pub fn scan_processes(
     dirs: &[PathBuf],
     skip: &[u32],
 ) -> std::io::Result<aterm_uds::holders::PathScan> {
+    #[cfg(all(debug_assertions, target_vendor = "apple"))]
+    let mut scan = match aterm_uds::holders::lab_jail_pids() {
+        Some(pids) => aterm_uds::holders::scan_path_users_of(&pids?, dirs, skip)?,
+        None => aterm_uds::holders::scan_path_users(dirs, skip)?,
+    };
+    #[cfg(not(all(debug_assertions, target_vendor = "apple")))]
     let mut scan = aterm_uds::holders::scan_path_users(dirs, skip)?;
     let me = std::process::id();
     if skip.contains(&me) {

@@ -4,7 +4,8 @@
 //! The pure vocabulary of the astream message bus: the wire [`Frame`] codec,
 //! the [`Subject`] / [`Filter`] address grammar, the single canonical
 //! [`assign_partition`] function, [`Offset`] arithmetic, the Chandy-Lamport
-//! [`CausalCut`] frontier lattice, the fabric receipts ([`V1Receipt`], [`FabricReceipt`]), and the
+//! [`CausalCut`] frontier lattice, the fabric receipts ([`V1Receipt`], [`FabricReceipt`]), a
+//! log's [`LogIdentity`] and [`Lineage`], and the
 //! [`steps`] record — astream's generic dense, versioned, CRC-framed opaque
 //! record — with its torn-tail-or-fault classifier.
 //!
@@ -34,6 +35,7 @@ mod twins;
 pub mod cut;
 pub mod frame;
 pub mod hash;
+pub mod logid;
 pub mod offset;
 pub mod partition;
 pub mod receipt;
@@ -53,6 +55,7 @@ pub use hash::{
     fnv1a_64_mul_prime, fnv1a_64_state_matches, fnv1a_64_update, CRC32_IEEE_POLY, FNV1A_64_INIT,
     FNV1A_64_PRIME,
 };
+pub use logid::{Lineage, LogIdentity};
 pub use offset::{offset_advance_monotone, offset_precedes_or_eq, Offset};
 pub use partition::{
     assign_partition, partition_in_bounds, partition_modulus_clamp, time_bucket, PartitionKey,

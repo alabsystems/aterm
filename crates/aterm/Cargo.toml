@@ -34,7 +34,7 @@ path = "src/windowed.rs"
 [dependencies]
 # The four faces of the one command, all libraries:
 aterm-cli = { path = "../aterm-cli" }     # the SESSION (PTY passthrough) + parser/diag/manual
-aterm-gui = { path = "../aterm-gui" }     # the WINDOW (winit/wgpu) + headless engine
+aterm-gui = { path = "../aterm-gui" }     # the WINDOW (aterm-window/aterm-gpu) + headless engine
 aterm-ctl = { path = "../aterm-ctl" }     # `aterm ctl`  — control-socket client
 # `aterm ctl cast drift` computed client-side (an older server, or saved files): the replay audit
 # is aterm-control's, the code the server runs, handed to the dependency-free aterm-ctl as a plain
@@ -47,6 +47,8 @@ agh = { path = "../agh" }               # `aterm agh`  — the GitHub client
 # `--json` in the one report schema. Both already in the graph through atpkg.
 aterm-converge = { workspace = true }
 aterm-json = { workspace = true }
+# Fixed native CPU-policy collector dispatch, before GUI initialization.
+aterm-sysprobe = { workspace = true }
 # The Full Disk Access probe's child, `aterm __tcc-open` (`consent::run_open_probe_verb`);
 # already in the graph through aterm-gui.
 aterm-containment = { workspace = true }
@@ -62,9 +64,8 @@ aterm-types = { workspace = true }
 aterm-agent = { path = "../aterm-agent" } # `aterm fleet` / `aterm drive`
 # `aterm keeper start|stop|status|serve` — the PTY keeper (opt-in).
 aterm-keeper = { path = "../aterm-keeper" }
-# `aterm caffeine` — the menu-bar keep-awake mug. Compiles everywhere: its
-# AppKit half is `cfg(target_os = "macos")` and the verb refuses by name elsewhere.
-aterm-caffeine = { workspace = true }
+# `aterm acaffiene` — the menu-bar keep-awake mug, started by every ordinary window.
+aterm-acaffiene = { workspace = true }
 # `aterm link` (the fabric bridge) is in the unix-only table below.
 # The headless update lane: `aterm update status|check` and the session-mode background
 # check/stage loop.
@@ -104,14 +105,12 @@ aterm-db = { workspace = true }
 aterm-codec = { workspace = true }
 aterm-digest = { workspace = true }
 
-# `aterm machines` — a lab of Macs managed from this one over SSH
-# (docs/DESIGN-machines-2026-10-16.md). MACOS ONLY: it drives macOS's own tools
-# (`defaults`, `scutil`, `launchctl`, `dns-sd`, Apple's `ssh-keygen`), so the
-# other cells never build it, and `machines_unavailable` in src/main.rs answers
-# the verb there by name.
-[target.'cfg(target_os = "macos")'.dependencies]
+# `aterm init` (crates/aterm-machines' `init`): on a Mac the workstation too; elsewhere the
+# base layer, the vault and the repositories. `aterm machines` itself stays macOS-only
+# (`machines_unavailable` in src/main.rs).
 aterm-machines = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
 # The transparent session's cancellable first-run countdown owns the tty before
 # its shell starts, and restores its termios before handing it to the session.
 libc = { workspace = true }
@@ -164,9 +163,9 @@ aterm-slog = { workspace = true }
 # its killed instances left (`spare_fifo::sweep_dead`). Already in the graph through
 # aterm-gui.
 aterm-shell-integration = { workspace = true }
-# The spare suite reads whether a spare's shell waits in the kernel (its run state).
-# Already in the graph through aterm-gui.
-aterm-sysprobe = { workspace = true }
+# The Rewind R3 suite decodes a pane trace another process exported. Already in the graph
+# through aterm-gui.
+aterm-aos-pane = { workspace = true }
 
 # The fabric worlds (`tests/fabric_world`): an in-process guarded broker and the
 # caps minted for it.
@@ -207,6 +206,18 @@ path = "tests/fabric_bench/main.rs"
 [[bench]]
 name = "fabric_bench"
 path = "benches/fabric_bench.rs"
+harness = false
+
+# Pure helpers shared with the restore measurement; no live measurement entry.
+[[test]]
+name = "restore_bench"
+path = "tests/restore_bench/main.rs"
+
+# A crashed window's tabs back, end to end, for N sessions: `verify perf restore-e2e`
+# explicitly runs this bench alone with a required RESTORE_BENCH specification.
+[[bench]]
+name = "restore_bench"
+path = "benches/restore_bench.rs"
 harness = false
 
 # Alone: raises this process's descriptor limit.

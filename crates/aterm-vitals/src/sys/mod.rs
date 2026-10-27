@@ -5,6 +5,7 @@
 
 pub mod delta;
 pub mod disk;
+pub mod hardware;
 pub mod jobs_view;
 pub mod json;
 pub mod predicate;
@@ -23,6 +24,11 @@ use crate::model::Snapshot;
 
 /// Closed set of unavailable words a figure may carry.
 pub const UNAVAILABLE_WORDS: &[&str] = &[
+    "unavailable:",
+    "unsupported:",
+    "refused:",
+    "unread_format:",
+    "not_sampled:",
     "unsupported",
     "needs_privilege:",
     "not_enabled:",
@@ -33,6 +39,7 @@ pub const UNAVAILABLE_WORDS: &[&str] = &[
     "asleep",
     "truncated",
     "not_sampled",
+    "no_counter_delta",
     "hung",
     "protected",
     "remote",
@@ -42,6 +49,7 @@ pub const UNAVAILABLE_WORDS: &[&str] = &[
     "too_broad",
     "walking",
     "unread_format",
+    "os_error:",
 ];
 
 /// Whether `word` is one of [`UNAVAILABLE_WORDS`] (a qualified one with a non-empty qualifier).
@@ -97,6 +105,8 @@ impl Freshness {
 /// What is read once about the machine.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Machine {
+    /// This running instance's executable, for diagnostics when PATH names an older copy.
+    pub executable: Option<String>,
     /// The CPU's brand (`Apple M5`).
     pub cpu: Option<String>,
     /// The OS and version (`macOS 27.0.1`).
@@ -363,6 +373,7 @@ mod tests {
             "refused",
             "warming",
             "not_sampled",
+            "no_counter_delta",
             "lane_off:ioreport",
             "needs_privilege:root",
             "not_enabled:sys.snapshot_files",

@@ -90,6 +90,8 @@ pub(crate) mod tests {
 
     const SHELL: &str = crate::os_path!("sh");
 
+    const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// A child parked between `fork` and `exec`, holding a copy of every descriptor this
     /// process had open: the state a sibling test's `pre_exec` spawn puts this process in for
     /// milliseconds at a time, made deterministic.
@@ -100,15 +102,14 @@ pub(crate) mod tests {
 
     impl Parked {
         /// Fork a child and return once it is parked. The child writes one byte, then waits
-        /// for one, under a 10 s timeout on the shared socket, so even a dead parent cannot
-        /// strand it in `pre_exec`.
+        /// for one, under the hang detector on the shared socket, so even a dead parent cannot
+        /// strand it in `pre_exec`. A child never let go fails its spawn instead of its exec,
+        /// which would close its copies under a probe still to come and pass it unheld.
         pub(crate) fn park() -> Self {
             use std::os::fd::AsRawFd as _;
             use std::os::unix::process::CommandExt as _;
             let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
-            theirs
-                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                .expect("timeout");
+            theirs.set_read_timeout(Some(HANG)).expect("timeout");
             let theirs_fd = theirs.as_raw_fd();
             let spawner = std::thread::spawn(move || {
                 let mut cmd = std::process::Command::new(SHELL);
@@ -118,13 +119,16 @@ pub(crate) mod tests {
                     .stderr(std::process::Stdio::null());
                 // SAFETY: runs in the forked child before `exec` and calls only the
                 // async-signal-safe `write(2)` and `read(2)`, on a descriptor the parent keeps open
-                // (`theirs`, alive until `status` returns).
+                // (`theirs`, alive until `status` returns); its error is a raw code, no allocation.
                 unsafe {
                     cmd.pre_exec(move || {
                         let mut byte = 0u8;
                         write(theirs_fd, (&raw const byte).cast(), 1);
-                        read(theirs_fd, (&raw mut byte).cast(), 1);
-                        Ok(())
+                        if read(theirs_fd, (&raw mut byte).cast(), 1) == 1 {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT))
+                        }
                     });
                 }
                 let status = cmd.status();
@@ -151,7 +155,8 @@ pub(crate) mod tests {
                 Ok(status) => status,
                 Err(e) => panic!(
                     "spawning `{SHELL} -c 'exit 0'` for the parked child failed: {e} \
-                     (the child forks and parks before its exec, so this is the exec)"
+                     (the child forks and parks before its exec, so this is the exec, or a \
+                     park the test held past the hang detector)"
                 ),
             }
         }

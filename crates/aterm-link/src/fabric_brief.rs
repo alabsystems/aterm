@@ -100,42 +100,71 @@ impl BriefOpts {
 
 /// One session as the brief holds it: its spaces' views, newest last.
 #[derive(Default)]
-struct Session {
-    spaces: BTreeMap<u32, BusSpace>,
+pub(crate) struct Session {
+    pub(crate) spaces: BTreeMap<u32, BusSpace>,
     presence: Option<String>,
     /// The incarnation its presence row was written under (`inc=`).
     presence_inc: Option<u64>,
     newest_off: u64,
 }
 
-/// What the read of the bus came to.
+/// What the read of the bus came to: each session's spaces and presence, and each node's
+/// presence. `aterm fabric brief` reads one, and `aterm link notify --on need` keeps one as
+/// it follows the bus ([`Read::following`]).
 #[derive(Default)]
-struct Read {
+pub(crate) struct Read {
     head: u64,
     from: u64,
     scanned: u64,
     pages: u64,
-    opaque: u64,
-    sessions: BTreeMap<(String, String), Session>,
+    pub(crate) opaque: u64,
+    pub(crate) sessions: BTreeMap<(String, String), Session>,
     nodes_gone: Vec<String>,
     /// Each live node's incarnation, from its own presence row.
     node_inc: BTreeMap<String, u64>,
+    /// When each node in [`Self::node_inc`] or [`Self::nodes_gone`] was last heard from: the
+    /// count of node rows read when its own row was ([`Self::node_rows`]).
+    node_heard: BTreeMap<String, u64>,
+    /// The node rows read so far.
+    node_rows: u64,
+    /// At [`SESSIONS_MAX`] sessions (or nodes), forget the one heard from least recently
+    /// instead of refusing the next: a follower's bound, where a one-shot brief asks to be
+    /// narrowed. A session was heard at its newest `ev` record, a node at its newest row.
+    evicts: bool,
 }
 
 impl Read {
+    /// The read a follower keeps ([`Self::evicts`]).
+    pub(crate) fn following() -> Read {
+        Read {
+            evicts: true,
+            ..Read::default()
+        }
+    }
+
     /// A retained session, shared by the roster and the record fold.
     fn session_mut(&mut self, node: &str, sid: &str) -> io::Result<&mut Session> {
         let key = (node.to_string(), sid.to_string());
         if !self.sessions.contains_key(&key) && self.sessions.len() >= SESSIONS_MAX {
-            return Err(io::Error::other(format!(
-                "fabric brief exceeds {SESSIONS_MAX} sessions; narrow it with @<sid>[@<node>]"
-            )));
+            if !self.evicts {
+                return Err(io::Error::other(format!(
+                    "fabric brief exceeds {SESSIONS_MAX} sessions; narrow it with @<sid>[@<node>]"
+                )));
+            }
+            let stalest = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, s)| s.newest_off)
+                .map(|(k, _)| k.clone());
+            if let Some(stalest) = stalest {
+                self.sessions.remove(&stalest);
+            }
         }
         Ok(self.sessions.entry(key).or_default())
     }
 
     /// One roster row, as the last-value walk delivers it.
-    fn presence(&mut self, node: &str, sid: &str, body: &[u8]) -> io::Result<()> {
+    pub(crate) fn presence(&mut self, node: &str, sid: &str, body: &[u8]) -> io::Result<()> {
         if sid == "node" {
             let gone = state_of(body).as_deref() == Some("gone");
             let inc = inc_of(body);
@@ -143,12 +172,27 @@ impl Read {
                 let known =
                     self.node_inc.contains_key(node) || self.nodes_gone.iter().any(|n| n == node);
                 if !known && self.node_inc.len() + self.nodes_gone.len() >= SESSIONS_MAX {
-                    return Err(io::Error::other(format!(
-                        "fabric brief exceeds {SESSIONS_MAX} nodes; narrow it with @<sid>@<node>"
-                    )));
+                    if !self.evicts {
+                        return Err(io::Error::other(format!(
+                            "fabric brief exceeds {SESSIONS_MAX} nodes; narrow it with \
+                             @<sid>@<node>"
+                        )));
+                    }
+                    let stalest = self
+                        .node_heard
+                        .iter()
+                        .min_by_key(|(_, at)| **at)
+                        .map(|(n, _)| n.clone());
+                    if let Some(stalest) = stalest {
+                        self.node_inc.remove(&stalest);
+                        self.nodes_gone.retain(|n| *n != stalest);
+                        self.node_heard.remove(&stalest);
+                    }
                 }
                 self.node_inc.remove(node);
                 self.nodes_gone.retain(|n| n != node);
+                self.node_rows += 1;
+                self.node_heard.insert(node.to_string(), self.node_rows);
                 if gone {
                     self.nodes_gone.push(node.to_string());
                 } else if let Some(inc) = inc {
@@ -164,7 +208,7 @@ impl Read {
     }
 
     /// One `ev` record into its `(node, sid, ep)` view.
-    fn ingest(
+    pub(crate) fn ingest(
         &mut self,
         fleet: &str,
         want: Option<&str>,
@@ -193,7 +237,7 @@ impl Read {
 }
 
 /// The `(node, sid)` of `/f/<F>/pub/<node>/<sid>/<leaf>`.
-fn owner<'a>(fleet: &str, subject: &'a str, leaf: &str) -> Option<(&'a str, &'a str)> {
+pub(crate) fn owner<'a>(fleet: &str, subject: &'a str, leaf: &str) -> Option<(&'a str, &'a str)> {
     let rest = subject.strip_prefix("/f/")?.strip_prefix(fleet)?;
     let mut it = rest.strip_prefix("/pub/")?.split('/');
     let (node, sid, l) = (it.next()?, it.next()?, it.next()?);
@@ -277,19 +321,48 @@ const fn line_tokens(line: &str) -> usize {
 
 /// Why a session's fold is partial, beyond where it was seeded: its close
 /// never reached the bus although its node or its own presence says it is
-/// gone (the words are [`Gone`]'s, which the Overview reads too).
+/// gone (the words are [`Gone`]'s, which the Overview reads too): what
+/// [`gone_settled`] says, or a node that relaunched since the session's
+/// presence said it was live.
 fn gone_without_close(r: &Read, node: &str, s: &Session) -> Option<Gone> {
+    gone_settled(r, node, s).or_else(|| {
+        let earlier = match (s.presence_inc, r.node_inc.get(node)) {
+            (Some(mine), Some(now)) => mine < *now,
+            _ => false,
+        };
+        (s.presence.as_deref() == Some("live") && earlier).then_some(Gone::NodeGone)
+    })
+}
+
+/// The half of [`gone_without_close`] that no later row of the session undoes
+/// on its own: the node's own row says it is gone, or the session's presence
+/// says it exited. A relaunch is left out: a bridge's attach writes its node's
+/// row under the new incarnation before it republishes its sessions' rows, so
+/// for that moment every session it carries reads as gone (a brief judges one
+/// read; a follower that judged it would clear and page again every standing
+/// need at each reattach).
+pub(crate) fn gone_settled(r: &Read, node: &str, s: &Session) -> Option<Gone> {
     if r.nodes_gone.iter().any(|n| n == node) {
         return Some(Gone::NodeGone);
     }
-    if s.presence.as_deref() == Some("exited") {
-        return Some(Gone::NoClose);
-    }
-    let earlier = match (s.presence_inc, r.node_inc.get(node)) {
-        (Some(mine), Some(now)) => mine < *now,
-        _ => false,
-    };
-    (s.presence.as_deref() == Some("live") && earlier).then_some(Gone::NodeGone)
+    (s.presence.as_deref() == Some("exited")).then_some(Gone::NoClose)
+}
+
+/// Whether the node's own row says it is gone ([`gone_settled`]).
+pub(crate) fn node_gone(r: &Read, node: &str) -> bool {
+    r.nodes_gone.iter().any(|n| n == node)
+}
+
+/// A session's newest seq space folded as the brief shows it: its epoch, the
+/// space, the fold and where the fold started ([`BusSpace::fold_seeded`]). The
+/// brief's lines and `--json` objects read it, and so does `aterm link notify
+/// --on need` (its need is [`aterm_slog::SessionState::top_observed_need`]).
+pub(crate) fn newest_fold(
+    s: &Session,
+) -> Option<(u32, &BusSpace, aterm_slog::Fold, aterm_slog::bus::Seed)> {
+    let (ep, space) = s.spaces.iter().next_back()?;
+    let (fold, seed) = space.fold_seeded();
+    Some((*ep, space, fold, seed))
 }
 
 /// One session the read holds, by its `(node, sid)`.
@@ -336,10 +409,9 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
     let (mut lines, mut used, mut partial, mut folded) = (Vec::new(), 0usize, 0usize, 0usize);
     let (mut dup, mut reordered, mut foreign) = (0u64, 0u64, 0u64);
     for (i, ((node, sid), s)) in shown.iter().enumerate() {
-        let Some((ep, space)) = s.spaces.iter().next_back() else {
+        let Some((ep, space, fold, seed)) = newest_fold(s) else {
             continue;
         };
-        let (fold, seed) = space.fold_seeded();
         let st = fold.state();
         let why = partial_why(r, node, s, seed, st.closed.is_some());
         let from = if r.from == 0 || space.holds_start() {
@@ -427,6 +499,15 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
 /// The open path's level words, run first ([`aterm_slog::SessionState::open`]).
 const OPEN_LEVELS: [&str; 3] = ["run", "turn", "step"];
 
+/// The keys of each `sessions` object `aterm fabric brief --json` writes, in its order: the one
+/// list [`session_json`] writes (its values are an array of this list's length, so a key and
+/// its value come together or the build fails) and `aterm fabric --help` prints
+/// ([`crate::fabric::usage`]).
+pub const SESSION_KEYS: [&str; 12] = [
+    "node", "sid", "this", "ep", "need", "detail", "open", "mail_in", "mail_out", "last_seq",
+    "age_s", "partial",
+];
+
 /// One session's object of the machine form (a closed schema of ids, closed
 /// words and counts), from its newest space's fold at `now_ms`, and whether
 /// that fold is partial.
@@ -438,8 +519,7 @@ fn session_json(
     this: Option<&str>,
 ) -> Option<(J, bool)> {
     let (node, sid) = key;
-    let (ep, space) = s.spaces.iter().next_back()?;
-    let (fold, seed) = space.fold_seeded();
+    let (ep, _, fold, seed) = newest_fold(s)?;
     let st = fold.state();
     let why = partial_why(r, node, s, seed, st.closed.is_some());
     let need = st.top_observed_need();
@@ -454,20 +534,21 @@ fn session_json(
         .collect();
     let age_s = (st.last_t > 0).then(|| now_ms.saturating_sub(st.last_t) / 1000);
     let partial = !why.is_empty();
-    let obj = J::Obj(vec![
-        ("node", J::s(&safe(node, 48))),
-        ("sid", J::s(&safe(sid, 48))),
-        ("this", J::Bool(this == Some(node.as_str()))),
-        ("ep", J::Num(u64::from(*ep))),
-        ("need", J::opt_s(need.map(|n| n.word))),
-        ("detail", J::opt_s(need.and_then(|n| n.detail.as_deref()))),
-        ("open", J::Arr(open)),
-        ("mail_in", J::Num(u64::from(st.totals.mail_in))),
-        ("mail_out", J::Num(u64::from(st.totals.mail_out))),
-        ("last_seq", J::Num(st.as_of)),
-        ("age_s", J::opt_n(age_s)),
-        ("partial", J::Arr(why.into_iter().map(J::s).collect())),
-    ]);
+    let values: [J; SESSION_KEYS.len()] = [
+        J::s(&safe(node, 48)),
+        J::s(&safe(sid, 48)),
+        J::Bool(this == Some(node.as_str())),
+        J::Num(u64::from(ep)),
+        J::opt_s(need.map(|n| n.word)),
+        J::opt_s(need.and_then(|n| n.detail.as_deref())),
+        J::Arr(open),
+        J::Num(u64::from(st.totals.mail_in)),
+        J::Num(u64::from(st.totals.mail_out)),
+        J::Num(st.as_of),
+        J::opt_n(age_s),
+        J::Arr(why.into_iter().map(J::s).collect()),
+    ];
+    let obj = J::Obj(SESSION_KEYS.into_iter().zip(values).collect());
     Some((obj, partial))
 }
 

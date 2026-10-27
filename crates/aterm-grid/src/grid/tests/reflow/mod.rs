@@ -8,6 +8,7 @@ mod core;
 mod cost_bound;
 mod cursor_invariants;
 mod decdwl;
+mod next_write;
 mod performance;
 mod protected_cells;
 mod regressions;

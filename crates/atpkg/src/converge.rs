@@ -98,6 +98,8 @@ ids! {
     ROSTER_FLOOR = "base.pkg.roster-floor";
     /// Whether the accepted index is the newest.
     INDEX_HEAD = "base.pkg.index-head";
+    /// A newer index refused as a successor of the accepted one ([`crate::succession`]).
+    INDEX_SUCCESSION = "base.pkg.index-succession";
     /// Who watches the vendor heads.
     VENDOR_WATCH = "base.pkg.vendor-watch";
     /// rustup.

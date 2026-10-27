@@ -1822,6 +1822,40 @@ fn trial_arm_failure_keeps_verified_stage_ready_and_unswapped() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A trial whose sentinel's folder flush fails after the rename is no trial: prepare_trial
+/// fails, and leaves neither the sentinel armed nor the trial identity, so the next apply
+/// is not refused for a trial of a build that was never installed. With the arm's record
+/// left in place, the sentinel stayed armed for build 6 with no identity, and the next
+/// applies were refused as "still unconfirmed" until the wedged-trial escape booked an
+/// apply failure.
+#[test]
+fn a_trial_arm_whose_folder_flush_fails_leaves_nothing_armed() {
+    use aterm_durable::seam::{EIO, FailingDirs};
+    let (s, root) = temp_staging();
+    write_ready(&s, 6);
+    make_app(&s.staged_app, "VERIFIED-NEW");
+    let ready = Ready::read(&s.ready).unwrap();
+    let installed = root.join("Applications/aterm.app");
+    make_app(&installed, "OLD");
+    let failed = {
+        let _eio = FailingDirs::with(EIO);
+        prepare_trial(&s, &ready, &installed)
+    };
+    assert!(failed.is_err());
+    assert_eq!(boot_sentinel(&s).read_state(), None, "no trial is armed");
+    assert!(
+        crate::manifest::FailedMark::read(&s.trial()).is_none(),
+        "and no trial identity is left"
+    );
+    assert!(s.ready.exists());
+    assert_eq!(read_id(&installed), "OLD");
+    assert!(
+        settle_trials_under_apply_lock(&s, &installed, 5, None).is_ok(),
+        "the next apply waits on no trial"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn make_app(dir: &Path, id: &str) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("id"), id).unwrap();
@@ -2034,6 +2068,44 @@ fn the_boot_lanes_arm_swap_and_unswap_take_the_install_tier() {
         "another device: the trial identity keeps its own same-device guard \
          (`FailedMark::record_required`); every other step is durable"
     );
+}
+
+#[test]
+fn a_landed_swap_reports_a_directory_failure_once_per_distinct_parent() {
+    use aterm_durable::seam::FailingDirs;
+    for separate_parents in [false, true] {
+        let (_staging, root) = temp_staging();
+        let installed = root.join("Applications/aterm.app");
+        let fixed = if separate_parents {
+            root.join("incoming/aterm.app")
+        } else {
+            rollback_path(&installed)
+        };
+        make_app(&installed, "OLD");
+        make_app(&fixed, "NEW");
+        let prepared = copied_candidate(&fixed);
+        let warnings = || {
+            crate::log_capture::take()
+                .into_iter()
+                .filter(|(level, _)| *level == aterm_log::Level::Warn)
+                .count()
+        };
+        let _ = crate::log_capture::take();
+        {
+            let _failure = FailingDirs::with(libc::EIO);
+            swap_fixed_candidate(&prepared, &installed, Flush::Ordered).unwrap();
+        }
+        assert_eq!(read_id(&installed), "NEW");
+        assert_eq!(read_id(&fixed), "OLD");
+        assert_eq!(warnings(), if separate_parents { 2 } else { 1 });
+        {
+            let _refused = FailingDirs::with(libc::ENOTSUP);
+            swap_fixed_candidate(&prepared, &installed, Flush::Ordered).unwrap();
+        }
+        assert_eq!(read_id(&installed), "OLD");
+        assert_eq!(read_id(&fixed), "NEW");
+        assert_eq!(warnings(), 0);
+    }
 }
 
 /// A swap whose receipt could not be written is rolled back with [`install_flush`]'s

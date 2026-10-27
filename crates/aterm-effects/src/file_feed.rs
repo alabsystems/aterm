@@ -54,6 +54,7 @@ impl Drop for OpenProbeGuard {
 /// Install a test-only counter at the platform `open` seam for `path`.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
+#[inline]
 #[must_use]
 pub fn probe_open_attempts(path: &Path) -> OpenProbeGuard {
     assert!(
@@ -116,6 +117,7 @@ fn not_regular() -> io::Error {
 /// Open `path` once and prove the handle is a regular file. `O_NONBLOCK` keeps a writerless
 /// FIFO from parking `open`; `O_NOFOLLOW` refuses a final-component link.
 #[cfg(unix)]
+#[inline]
 fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -134,6 +136,7 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
 /// Windows' reparse-point flag stands in for `O_NOFOLLOW`; the attribute is checked on the
 /// opened handle before any byte is read.
 #[cfg(windows)]
+#[inline]
 fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
@@ -158,6 +161,7 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
 /// Portable fallback. Targets without a non-blocking filesystem-open flag use
 /// a no-link precheck and still verify the opened handle before reading.
 #[cfg(not(any(unix, windows)))]
+#[inline]
 fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
     if !std::fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(not_regular());
@@ -185,6 +189,7 @@ fn check_observed_size(observed_len: u64, max_bytes: usize) -> io::Result<usize>
 }
 
 /// Read a same-handle regular file into a byte vector bounded by `max_bytes`.
+#[inline]
 pub fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
     let (file, observed_len) = open_regular(path)?;
     let reserve_len = check_observed_size(observed_len, max_bytes)?;
@@ -204,6 +209,7 @@ pub fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> io::Result<Ve
 }
 
 /// Read a bounded visual-feed file and require complete UTF-8.
+#[inline]
 pub fn read_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Result<String> {
     match String::from_utf8(read_bounded_regular_file(path, max_bytes)?) {
         Ok(s) => Ok(s),
@@ -240,6 +246,7 @@ fn invalid_utf8() -> io::Error {
 }
 
 /// Hash an admitted UTF-8 feed without allocating its contents.
+#[inline]
 pub fn fingerprint_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Result<u64> {
     let (mut file, observed_len) = open_regular(path)?;
     let _ = check_observed_size(observed_len, max_bytes)?;

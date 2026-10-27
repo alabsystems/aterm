@@ -15,7 +15,9 @@ use crate::{App, WindowId};
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SessionFacts {
     /// The facts the person hid here by a click: per session, in memory only, never persisted.
-    pub(crate) off: FactMask,
+    /// `None` where they never chose: the program's starting mask applies
+    /// ([`default_mask_for`]), however this entry came to exist.
+    pub(crate) off: Option<FactMask>,
     /// The one slash press in flight for the session (`crate::claude_slash`).
     pub(crate) press: Option<crate::claude_slash::SlashPress>,
     /// How the last press ended, until its words' showing ends.
@@ -47,6 +49,28 @@ fn without(mask: FactMask, shown: FactMask) -> FactMask {
         .into_iter()
         .filter(|kind| shown.has(*kind))
         .fold(mask, |mask, kind| mask.with(kind, false))
+}
+
+/// The facts a session starts with hidden before the person chooses: Muse's own
+/// composer status line prints its model, effort and working folder, so a Muse
+/// session's rule starts with those three off (their stubs keep the restore click);
+/// every other program's line does not, so nothing starts hidden.
+#[must_use]
+pub(crate) fn default_mask_for(program: Option<aterm_phase::Program>) -> FactMask {
+    match program {
+        Some(aterm_phase::Program::Muse) => FactMask::MODEL
+            .union(FactMask::EFFORT)
+            .union(FactMask::PATH),
+        Some(
+            aterm_phase::Program::Claude
+            | aterm_phase::Program::Codex
+            | aterm_phase::Program::Agy
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
+            | aterm_phase::Program::Generic,
+        )
+        | None => FactMask::default(),
+    }
 }
 
 /// The facts a click on `fact` hides, or shows again where it is a stub: the next mask after `off`.
@@ -140,6 +164,15 @@ pub(crate) fn fact_title(facts: &FooterFacts, cwd: Option<&Path>, fact: Fact) ->
             (whole, "click: graph".to_owned())
         }
         Fact::Account => {
+            if let Some(progress) = facts.account_progress_view() {
+                return (
+                    format!(
+                        "{} · click: accounts",
+                        aterm_agent::harness::footer::account_progress_text(&progress, false)
+                    ),
+                    "click: accounts".into(),
+                );
+            }
             let mut parts: Vec<&str> = Vec::new();
             if let Some(sub) = facts.subscription.as_ref() {
                 if let Some(email) = sub.email.as_deref() {
@@ -314,6 +347,15 @@ pub(crate) fn fact_spoken_of(
             )
         }
         Fact::Account => {
+            if let Some(progress) = facts.account_progress_view() {
+                return (
+                    format!(
+                        "Account: {}",
+                        aterm_agent::harness::footer::account_progress_text(&progress, false)
+                    ),
+                    "Activate for account recovery details.".into(),
+                );
+            }
             let mut parts: Vec<&str> = Vec::new();
             let weekly = facts.subscription.as_ref().and_then(|sub| {
                 sub.weekly
@@ -355,12 +397,49 @@ pub(crate) fn fact_spoken_of(
 }
 
 impl App {
-    /// The facts the person hid in `session` ([`SessionFacts::off`]).
+    /// The facts the person hid in `session` ([`SessionFacts::off`]). Where they never
+    /// chose, a Muse session starts with the model, effort and path hidden: Muse's own
+    /// composer status line already prints the three, so the rule showing them again is
+    /// pure repetition. The off stubs stay, one click from restoring each fact, and any
+    /// choice the person makes replaces this starting point whole.
+    ///
+    /// Callers already holding the session's timeline lock must use
+    /// [`Self::fact_mask_known`] with the program that lock gives them: this reads the
+    /// program under that same lock where no choice is stored yet.
     #[must_use]
     pub(crate) fn fact_mask(&self, session: u64) -> FactMask {
-        self.claude_facts
-            .get(&session)
-            .map_or_else(FactMask::default, |f| f.off)
+        if let Some(off) = self.chosen_mask(session) {
+            return off;
+        }
+        default_mask_for(self.session_program(session))
+    }
+
+    /// The mask the person chose in `session`, where they chose one.
+    fn chosen_mask(&self, session: u64) -> Option<FactMask> {
+        self.claude_facts.get(&session).and_then(|f| f.off)
+    }
+
+    /// [`Self::fact_mask`] where the caller already knows `session`'s program (it holds
+    /// the timeline lock): no lock is taken here.
+    #[must_use]
+    pub(crate) fn fact_mask_known(
+        &self,
+        session: u64,
+        program: Option<aterm_phase::Program>,
+    ) -> FactMask {
+        self.chosen_mask(session)
+            .unwrap_or_else(|| default_mask_for(program))
+    }
+
+    fn session_program(&self, session: u64) -> Option<aterm_phase::Program> {
+        self.pool.get(session).and_then(|entry| {
+            let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline
+                .agent()
+                .program
+                .as_deref()
+                .and_then(aterm_phase::program_of)
+        })
     }
 
     /// WHAT A CLICK ON `session`'s `fact` DOES.
@@ -418,11 +497,14 @@ impl App {
     }
 
     /// Hide `session`'s facts in `off` and show the rest, in every window that shows it.
+    /// The choice is kept even where it only restates the starting mask: from here it is
+    /// the person's, not the program's.
     pub(crate) fn set_fact_mask(&mut self, session: u64, off: FactMask) {
-        if self.fact_mask(session) == off {
+        let before = self.fact_mask(session);
+        self.claude_facts.entry(session).or_default().off = Some(off);
+        if before == off {
             return;
         }
-        self.claude_facts.entry(session).or_default().off = off;
         self.refresh_fact_readings(session);
         self.refresh_fact_menu(session);
         self.redraw_claude_footer(session);
@@ -441,7 +523,14 @@ impl App {
         let mut facts = timeline
             .claude_footer()?
             .filled_from(timeline.claude_card());
-        facts.off = self.fact_mask(session);
+        facts.off = self.fact_mask_known(
+            session,
+            timeline
+                .agent()
+                .program
+                .as_deref()
+                .and_then(aterm_phase::program_of),
+        );
         let cwd = timeline.claude_side().and_then(|side| side.cwd.clone());
         Some((facts, cwd))
     }

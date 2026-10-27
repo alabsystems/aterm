@@ -2018,9 +2018,7 @@ struct Block {
 
 fn bottom_block(rows: &[String]) -> Option<Block> {
     use crate::phase::is_rule;
-    let last = rows
-        .iter()
-        .rposition(|r| !crate::text::trim(r).is_empty())?;
+    let last = live_bottom(rows)?;
     let mut end = last;
     if option_row(&rows[end], ARROW).is_none()
         && !pointer_row(&rows[end], ARROW)
@@ -2048,6 +2046,25 @@ fn bottom_block(rows: &[String]) -> Option<Block> {
         end,
         last,
     })
+}
+
+/// The last row a footerless box drawn at the live bottom can end on: the last row drawn, but
+/// where no composer is drawn and that row is the program's own activity status row with a blank
+/// row above it, the last row drawn above the blank. Claude Code 2.1.308 leaves its API-retry
+/// row (`✻ Waiting for API response · will retry in 2m 40s · check your network`, its countdown
+/// frozen) standing under the `Session paused` dialog that replaced its composer (measured
+/// 2026-10-26); a composer drawn means the box is no longer the program's bottom, so the row
+/// counts there.
+fn live_bottom(rows: &[String]) -> Option<usize> {
+    let drawn = |r: &String| !crate::text::trim(r).is_empty();
+    let last = rows.iter().rposition(drawn)?;
+    if !crate::phase::is_activity_row(&rows[last]) || crate::phase::composer_frame(rows).is_some() {
+        return Some(last);
+    }
+    match last.checked_sub(1) {
+        Some(above) if !drawn(&rows[above]) => rows[..above].iter().rposition(drawn).or(Some(last)),
+        _ => Some(last),
+    }
 }
 
 fn is_key_hint_row(row: &str) -> bool {
@@ -4033,6 +4050,8 @@ pub mod fixtures {
     pub const SETUP_REMOTE_CONTROL: &str =
         include_str!("fixtures/claude-2.1.282-setup-remote-control.txt");
     pub const SESSION_PAUSED: &str = include_str!("fixtures/claude-2.1.282-session-paused.txt");
+    pub const SESSION_PAUSED_RETRY_ROW: &str =
+        include_str!("fixtures/claude-2.1.308-session-paused-retry-row-measured.txt");
     pub const MCP_SERVER_ONE: &str = include_str!("fixtures/claude-2.1.301-mcp-server-one.txt");
     pub const AUTO_MODE_SETUP: &str = include_str!("fixtures/claude-2.1.310-auto-mode-setup.txt");
     pub const AUTO_MODE_SETUP_60COL: &str =
@@ -8020,6 +8039,43 @@ mod tests {
                 "{title}"
             );
         }
+    }
+
+    /// Claude Code 2.1.308 leaves its API-retry row standing under the `Session paused` dialog
+    /// that replaced its composer (measured 2026-10-26, a window tab that stood there for hours,
+    /// read as no box): the dialog is read over it, and the session's phase is the box's. The
+    /// same rows under a composer, or with a said row in the retry row's place, read no box.
+    #[test]
+    fn a_footerless_box_is_read_over_the_retry_row_it_left_standing() {
+        let r = screen(SESSION_PAUSED_RETRY_ROW);
+        let retry = r.iter().rposition(|x| !x.trim().is_empty()).unwrap();
+        assert!(
+            r[retry].contains("Waiting for API response"),
+            "{}",
+            r[retry]
+        );
+        let p = parse_prompt_v2(&r).expect("the box");
+        assert_eq!(p.title, "Session paused");
+        assert_eq!(p.select, Select::Digits);
+        let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Switch to Opus 4.8", "Edit prompt and retry with Opus 5.5"]
+        );
+        assert_eq!(p.focused().map(|o| o.row), Some(p.options[0].row));
+        assert_eq!(p.span.1, retry - 2, "the box ends on its last option");
+        assert_eq!(prompt_box_first_row(&r), Some(p.span.0));
+        let reading = crate::reader::read(Some("claude"), &r, None);
+        assert_eq!(reading.phase, crate::phase::Phase::Prompt);
+        assert!(reading.phase_authoritative);
+
+        let mut scrolled = r.clone();
+        scrolled.push(String::new());
+        scrolled.extend(composer("  ? for shortcuts"));
+        assert_eq!(parse_prompt_v2(&scrolled), None, "+ composer");
+        let mut went_on = r.clone();
+        went_on[retry] = "⏺ Done.".to_string();
+        assert_eq!(parse_prompt_v2(&went_on), None, "a said row in its place");
     }
 
     #[test]

@@ -22,8 +22,8 @@ use crate::spectrum::{
 
 use super::companion::KeepOut;
 use super::ribbon::{
-    BED_INK_LUT_LEN, SLABS_PER_CELL, WALK_FAST_CELLS, WALK_LAY_RATE, hot_edge_ink, paper_caret_ink,
-    paper_ink, paper_mark_ink, paper_train_ink, walk_pace, walk_t,
+    BED_INK_LUT_LEN, PAPER_TRAIN_SKIP, SLABS_PER_CELL, WALK_FAST_CELLS, WALK_LAY_RATE,
+    hot_edge_ink, paper_caret_ink, paper_ink, paper_mark_ink, paper_train_ink, walk_pace, walk_t,
 };
 use super::stardust::{
     FAN_RISE_MAX_CH, FanSow, GlyphProbe, ShedSow, Stardust, hash01, mix32, push_halo_quads,
@@ -964,6 +964,7 @@ const JET_UNIT_DIR: [(f32, f32); JET_N_PER_SIDE] = {
     dirs
 };
 
+#[inline]
 #[must_use]
 const fn mint_burst(seed: u32, at: Instant, cells: f32) -> Burst {
     let n = burst_n(cells);
@@ -1341,6 +1342,11 @@ pub struct Meteors {
     /// M2's).
     #[cfg(test)]
     pub(crate) warm_stops_plain: bool,
+    /// Whether tests blend a paper train across its bend's skip between
+    /// stations, as it was (looks8 round 2's K10b negative control,
+    /// [`step_over_train_skip`]).
+    #[cfg(test)]
+    pub(crate) train_skip_blended: bool,
     /// Whether tests lay a train across a lettered row's letters (the
     /// strike-through's negative control).
     #[cfg(test)]
@@ -1369,6 +1375,7 @@ impl Default for Meteors {
 
 impl Meteors {
     /// An empty pool, with every resident buffer reserved to its published depth.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1386,6 +1393,8 @@ impl Meteors {
             dims_dark_trains: false,
             #[cfg(test)]
             warm_stops_plain: false,
+            #[cfg(test)]
+            train_skip_blended: false,
             #[cfg(test)]
             trains_over_text: false,
             #[cfg(test)]
@@ -1411,6 +1420,7 @@ impl Meteors {
     }
 
     /// Ingest one engine event.
+    #[inline]
     pub fn on_event(&mut self, ev: &Event, at: Instant, ctx: &Ctx<'_>) -> Option<Spawn> {
         match *ev {
             Event::Move {
@@ -1434,6 +1444,7 @@ impl Meteors {
     }
 
     /// Draw the meteors and their landings, first in the emit order.
+    #[inline]
     pub fn emit(&mut self, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         self.reduced = ctx.cfg.reduced_motion;
         let now = ctx.now;
@@ -1458,6 +1469,10 @@ impl Meteors {
         #[cfg(test)]
         let warm = !self.warm_stops_plain;
         #[cfg(not(test))]
+        let stepped = true;
+        #[cfg(test)]
+        let stepped = !self.train_skip_blended;
+        #[cfg(not(test))]
         let (behind, fold, skirts, peel_coma) = (true, true, true, false);
         #[cfg(test)]
         let (behind, fold, skirts, peel_coma) = (
@@ -1480,7 +1495,15 @@ impl Meteors {
             let m = &mut live[mi];
             mi += 1;
             if let Some(f) = Flight::of(m, ctx) {
-                draw_train(&mut verts, m, &f, ctx, frame, (square, clean, warm), train);
+                draw_train(
+                    &mut verts,
+                    m,
+                    &f,
+                    ctx,
+                    frame,
+                    (square, clean, warm, stepped),
+                    train,
+                );
                 // A dark peel (a Return's or the program's, which rings no
                 // landing) is one tapering train: its head's coma, seven
                 // lights orbiting it apart, read as floating dabs beside
@@ -1533,6 +1556,7 @@ impl Meteors {
     }
 
     /// Stage one bar fan at the caret for the sky and, on a ring bar, a landing.
+    #[inline]
     pub fn party(&mut self, at: Instant, n: u8, ring: bool, ctx: &Ctx<'_>) {
         let (x, y) = ctx.geom.cell_center(ctx.caret.0, ctx.caret.1);
         if !on_glass(ctx.geom, x, y) {
@@ -1670,6 +1694,7 @@ impl Meteors {
     }
 
     /// The cadence law: the next instant a meteor changes what is on glass, `None` at rest.
+    #[inline]
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {
         if self.live.is_empty() && self.landings.is_empty() {
@@ -1719,6 +1744,7 @@ impl Meteors {
     }
 
     /// Translate live geometry by a scroll.
+    #[inline]
     pub fn translate_scroll(&mut self, rows: u16, cell_h: u16) {
         if rows == 0 {
             return;
@@ -1758,6 +1784,7 @@ impl Meteors {
     }
 
     /// [`Meteors::translate_scroll`]'s row-band twin.
+    #[inline]
     pub fn translate_band(
         &mut self,
         top: u16,
@@ -1804,6 +1831,7 @@ impl Meteors {
         self.hand_floor = None;
     }
 
+    #[inline]
     fn on_move(
         &mut self,
         from: (u16, u16),
@@ -2066,6 +2094,8 @@ const DARK_TAPER_THREAD_PX: f32 = 2.0;
 /// over the paper is a tint of ochre, tan and khaki (looks7 M2: `c79b58`
 /// where the stick's thread faded out); a tint of its own hue at full value
 /// reads a pale gold.
+#[inline]
+#[must_use]
 const fn paper_thread_ink(ink: u32, fade: f32) -> u32 {
     if fade >= 1.0 {
         return ink;
@@ -2286,6 +2316,7 @@ impl<'a> Behind<'a> {
 
     /// The rows `z0..z1` of a light over columns `x0..x1` and rows
     /// `y0..y1` that a lettered row's band touches, its eased edges and all.
+    #[inline]
     const fn zone(self, (x0, x1): (i32, i32), (y0, y1): (i32, i32)) -> Option<(i32, i32)> {
         let rows = self.keep.rows();
         if !self.on || rows.is_empty() {
@@ -2296,17 +2327,17 @@ impl<'a> Behind<'a> {
         let pad = self.pad.ceil() as i32;
         let past = self.past.ceil() as i32;
         let pad_reach = pad + reach;
+        let min_x = x0 - past - pad;
+        let max_x = x1 + pad;
+        let min_y = y0 - pad_reach;
+        let max_y = y1 + pad_reach;
         let (band0, band1) = self.band;
         let mut zone: Option<(i32, i32)> = None;
         let mut idx = 0;
         while idx < rows.len() {
             let (rx0, rx1, ry0, ry1) = rows[idx];
             idx += 1;
-            if x1 <= rx0 - pad
-                || x0 >= rx1 + past + pad
-                || y1 <= ry0 - pad_reach
-                || y0 >= ry1 + pad_reach
-            {
+            if max_x <= rx0 || min_x >= rx1 || max_y <= ry0 || min_y >= ry1 {
                 continue;
             }
             let ch = (ry1 - ry0) as f32;
@@ -2328,6 +2359,7 @@ impl<'a> Behind<'a> {
     /// station centred clear of a band can still reach into it: each quad's
     /// rows in a band's reach are laid a pixel row at a time at the light
     /// [`Self::at`] leaves them (none inside, eased at the edges).
+    #[inline]
     fn cut_quads(self, quads: &mut Vec<GlowQuad>, from: usize) {
         if !self.on || self.keep.rows().is_empty() || from >= quads.len() {
             return;
@@ -2402,6 +2434,7 @@ impl<'a> Behind<'a> {
     /// the cut leaves lit but of no colour is the dark piece the quad's cut
     /// lays, laid into `quads` as that piece: it draws nothing, and every
     /// count of the stream counts it as the legacy one does.
+    #[inline]
     fn cut_ramps(self, (quads, ramps): (&mut Vec<GlowQuad>, &mut GlowRamps), from: RampMark) {
         #[inline]
         const fn scale_end(e: GlowEnd, cov: u8, s: f32) -> GlowEnd {
@@ -2464,6 +2497,7 @@ impl<'a> Behind<'a> {
 
     /// [`Self::cut_quads`] for the head's lights: a halo's rect splits
     /// losslessly, its falloff held by its centre and radii.
+    #[inline]
     fn cut_halos(self, halos: &mut Vec<RainHalo>, from: usize) {
         if !self.on || self.keep.rows().is_empty() || from >= halos.len() {
             return;
@@ -2551,6 +2585,7 @@ const DARK_TRAIN_TEXT_PAD_PX: f32 =
 const HEAD_FOLD_MS: f32 = 50.0;
 
 impl Flight {
+    #[inline]
     fn of(m: &Meteor, ctx: &Ctx<'_>) -> Option<Self> {
         let (dx, dy) = m.delta();
         let l = crate::color_math::hypot_f32(dx, dy);
@@ -2714,14 +2749,22 @@ fn draw_train(
     f: &Flight,
     ctx: &Ctx<'_>,
     frame: &mut Frame<'_>,
-    (square, clean, warm): (bool, bool, bool),
+    (square, clean, warm, stepped): (bool, bool, bool, bool),
     text: Behind<'_>,
 ) {
     let clip = ctx.geom.beam_clip();
     let step = f.step();
     let light = !ctx.cfg.dark_theme;
 
-    build_stations(verts, m, f, ctx, Layer::Colour, (square, clean, warm), text);
+    build_stations(
+        verts,
+        m,
+        f,
+        ctx,
+        Layer::Colour,
+        (square, clean, warm, stepped),
+        text,
+    );
     let blend = if light {
         GlowBlend::Over
     } else {
@@ -2740,7 +2783,15 @@ fn draw_train(
     if light {
         return;
     }
-    build_stations(verts, m, f, ctx, Layer::White, (square, clean, warm), text);
+    build_stations(
+        verts,
+        m,
+        f,
+        ctx,
+        Layer::White,
+        (square, clean, warm, stepped),
+        text,
+    );
     rasterize(
         &mut frame.out_sink(),
         clip,
@@ -2780,13 +2831,14 @@ fn rasterize(
     text.cut_ramps(out.stream(), ramps_from);
 }
 
+#[inline]
 fn build_stations(
     verts: &mut Vec<RibbonVertex>,
     m: &Meteor,
     f: &Flight,
     ctx: &Ctx<'_>,
     layer: Layer,
-    (square, clean, warm): (bool, bool, bool),
+    (square, clean, warm, stepped): (bool, bool, bool, bool),
     text: Behind<'_>,
 ) {
     verts.clear();
@@ -3069,7 +3121,7 @@ fn build_stations(
             Axis::Horizontal => (px, py),
             Axis::Vertical => (py, px),
         };
-        verts.push(RibbonVertex {
+        let vertex = RibbonVertex {
             x: major,
             spine,
             up: half,
@@ -3080,10 +3132,67 @@ fn build_stations(
             cov,
             lift: 0.0,
             lift_span: 0.0,
-        });
+        };
+        if stepped && light && rail > 0.0 && warm && matches!(layer, Layer::Colour) {
+            step_over_train_skip(verts, &vertex);
+        }
+        verts.push(vertex);
     }
 }
 
+/// Before `next` joins a paper train's `verts`, a step over the hues its
+/// bend leaves out ([`PAPER_TRAIN_SKIP`]): where the last station lies on
+/// the gold side of the skip and `next` on the green side, or the reverse,
+/// two stations at their midpoint, the last's colour then `next`'s, so the
+/// stick turns from gold to green at a hard edge. Blended between the two
+/// stations, the gallery's `enter-bottom` Return read olive for three
+/// columns at each turn of its stick on paper (looks8 round 2's K10b).
+#[inline]
+fn step_over_train_skip(verts: &mut Vec<RibbonVertex>, next: &RibbonVertex) {
+    #[inline]
+    const fn side(rgb: u32) -> u8 {
+        let (gold, green) = PAPER_TRAIN_SKIP;
+        let (h, s, _) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
+        if s < 0.3 {
+            0
+        } else if h <= gold + 1.0 {
+            1
+        } else if h >= green - 1.0 && h < 180.0 {
+            2
+        } else {
+            0
+        }
+    }
+    let Some(&last) = verts.last() else {
+        return;
+    };
+    if last.color == next.color {
+        return;
+    }
+    let (a, b) = (side(last.color), side(next.color));
+    if a == 0 || b == 0 || a == b {
+        return;
+    }
+    let mid = RibbonVertex {
+        x: 0.5 * (last.x + next.x),
+        spine: 0.5 * (last.spine + next.spine),
+        up: 0.5 * (last.up + next.up),
+        dn: 0.5 * (last.dn + next.dn),
+        core_up: 0.5 * (last.core_up + next.core_up),
+        core_dn: 0.5 * (last.core_dn + next.core_dn),
+        color: last.color,
+        cov: 0.5 * (last.cov + next.cov),
+        lift: 0.0,
+        lift_span: 0.0,
+    };
+    verts.push(mid);
+    verts.push(RibbonVertex {
+        color: next.color,
+        ..mid
+    });
+}
+
+#[inline]
 fn draw_head(
     m: &Meteor,
     f: &Flight,
@@ -3234,6 +3343,7 @@ const fn flash_scale(after_ms: f32) -> f32 {
     1.0 + over * (1.0 - smoothstep01(v))
 }
 
+#[inline]
 fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     // On paper the pin would land on the caret's block itself, its arms
     // reading as a strike-through and a tick; the landing's flash marks it.
@@ -3299,6 +3409,7 @@ fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     );
 }
 
+#[inline]
 fn draw_flash(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     if !l.flash {
         return;
@@ -3423,6 +3534,7 @@ const fn landing_ink_at(
     }
 }
 
+#[inline]
 #[allow(clippy::too_many_arguments)]
 fn burst_lance(
     frame: &mut Frame<'_>,
@@ -3503,6 +3615,7 @@ fn burst_lance(
     }
 }
 
+#[inline]
 #[allow(clippy::too_many_arguments)]
 fn burst_jet(
     frame: &mut Frame<'_>,
@@ -3605,6 +3718,7 @@ fn burst_jet(
     }
 }
 
+#[inline]
 fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     let Some(b) = l.burst else {
         return;
@@ -3616,7 +3730,10 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     } else {
         let u = clamp01(ms_since(b.at, ctx.now) / b.ms);
         let u_spend = clamp01((u - RING_COV_HOLD_U) * (1.0 / (1.0 - RING_COV_HOLD_U)));
-        (1.0 - (1.0 - u).powi(RING_R_EXP), spend(u_spend))
+        const _: () = assert!(RING_R_EXP == 4);
+        let om = 1.0 - u;
+        let om2 = om * om;
+        (1.0 - om2 * om2, spend(u_spend))
     };
     let cov = RING_COV_SHARE * TRANSIENT_STAR_COV_CEIL * alpha * clamp01(ctx.cfg.intensity);
     if cov < 1.0 || grow <= 0.0 {
@@ -3698,6 +3815,7 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     }
 }
 
+#[inline]
 #[must_use]
 const fn mint_spark(seed: u32, k: usize, ch: f32) -> Spark {
     let s = mix32(seed ^ (k as u32).wrapping_mul(0x27D4_EB2F) ^ 0x5AA5_5AA5);
@@ -3759,6 +3877,7 @@ const fn spark_at_with_gravity(
 /// The most quads one spark's star may spend.
 pub const SPARK_STAR_QUAD_CAP: usize = 24;
 
+#[inline]
 fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usize) {
     if l.sparks == 0 || ctx.cfg.reduced_motion {
         return;
@@ -3837,6 +3956,7 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
     }
 }
 
+#[inline]
 fn shed(m: &mut Meteor, f: &Flight, ctx: &Ctx<'_>, sown: &mut Vec<Sow>) {
     let n = usize::from(shed_n(m.cells)).min(8);
     let mask = ((1_u16 << n) - 1) as u8;
@@ -3894,6 +4014,7 @@ const fn spark_room(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -
     Some((m.x1 - geom.cell_center(row, col).0).max(0.0))
 }
 
+#[inline]
 fn mint_landing(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> Landing {
     let at = m.arrival();
     let ch = ctx.geom.ch as f32;
@@ -4113,6 +4234,9 @@ const _: () = {
         "§6.5: the white layer is the short one"
     );
 };
+
+#[cfg(any(test, debug_assertions))]
+mod state_words;
 
 #[cfg(test)]
 mod tests {
@@ -6407,6 +6531,65 @@ mod tests {
         }
     }
 
+    /// On a dark page the sparks are haloed stars: a 48-cell jump (landed ten
+    /// cells in so the leftward half is on the glass) throws at least sixty
+    /// sparks, and at `T + 150` at least fifty chromatic halos are on the
+    /// frame and at least forty sparks stand ≥ 5 px on both axes (replaces
+    /// the pruned `the_sparks_are_haloed_stars_twice_the_bold_round_s_count`;
+    /// 60, 64 and 60 at Prism Glass P0.11).
+    #[test]
+    fn the_dark_sparks_are_haloed_stars_twice_the_bold_round_s_count() {
+        let cfg = config();
+        let g = geom();
+        let ch = g.ch as f32;
+        let t0 = Instant::now();
+        let mut m = Meteors::new();
+        let ctx = ctx_at(t0, &cfg, (5, 10), 0.25);
+        let spawn = m.on_event(&mv((5, 58), (5, 10)), t0, &ctx).expect("fly");
+        let arrival = t0 + spawn.t_flight;
+        let mut sc = Scratch::default();
+        sc.emit(&mut m, &ctx_at(arrival, &cfg, (5, 10), 0.25));
+        let l = m.landings[0];
+        assert!(
+            usize::from(l.sparks) >= 60,
+            "a 48-cell landing throws {} sparks, not twice the bold round's thirty",
+            l.sparks
+        );
+        sc.emit(&mut m, &ctx_at(arrival + ms(150), &cfg, (5, 10), 0.25));
+        let halos = sc.halos.iter().filter(|h| is_chromatic(h.color)).count();
+        assert!(
+            halos >= 50,
+            "{halos} chromatic halos at T + 150: the sparks have none"
+        );
+        let cell_sized = |q: &GlowQuad| usize::from(q.w) == g.cw && usize::from(q.h) == g.ch;
+        let mut big = 0_usize;
+        for spark in l.spark.iter().take(usize::from(l.sparks)) {
+            let Some(((dx, dy), _)) = spark_at(*spark, 150.0, ch) else {
+                continue;
+            };
+            let (px, py) = ((l.x + dx).round() as i32, (l.y + dy).round() as i32);
+            let (mut x_lo, mut x_hi, mut y_lo, mut y_hi) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+            for q in sc.out.iter().filter(|q| {
+                is_chromatic(q.color)
+                    && !cell_sized(q)
+                    && (i32::from(q.x) + i32::from(q.w) / 2 - px).abs() <= 4
+                    && (i32::from(q.y) + i32::from(q.h) / 2 - py).abs() <= 4
+            }) {
+                x_lo = x_lo.min(i32::from(q.x));
+                x_hi = x_hi.max(i32::from(q.x) + i32::from(q.w));
+                y_lo = y_lo.min(i32::from(q.y));
+                y_hi = y_hi.max(i32::from(q.y) + i32::from(q.h));
+            }
+            if x_hi - x_lo >= 5 && y_hi - y_lo >= 5 {
+                big += 1;
+            }
+        }
+        assert!(
+            big >= 40,
+            "only {big} sparks stand ≥ 5 × 5 px at T + 150: points, not stars"
+        );
+    }
+
     #[test]
     fn a_party_landing_is_a_fan_off_the_glass_inside_315_ms() {
         let t0 = Instant::now();
@@ -7097,10 +7280,12 @@ mod tests {
     /// (`c79b58`). Along the gallery's Return the stick is one run
     /// of lit pixels whose width rises to one peak and falls from it (a
     /// pixel of anti-aliasing aside), and no column's core (its most
-    /// saturated pixel) reads tan or khaki, nor olive but where the walk
-    /// crosses from gold to green, in a few columns. Negative controls: the span held a cell past the
-    /// letters cuts the stick in two; the fades laid as dims read tan; the
-    /// caret's bend walks through the olives.
+    /// saturated pixel) reads tan or khaki, nor olive but in the one column
+    /// where the walk steps from gold to green (looks8 round 2's K10b: it
+    /// read olive for three). Negative controls: the span held a cell past
+    /// the letters cuts the stick in two; the fades laid as dims read tan;
+    /// the caret's bend walks through the olives; blended across the
+    /// bend's skip, the turn reads olive for columns.
     #[test]
     fn a_paper_return_lays_one_clean_stick() {
         let mut cfg = config();
@@ -7110,7 +7295,11 @@ mod tests {
         let page = cfg.theme_bg;
         // (most runs, worst pinch px, tan cores, widest olive crossing in
         // columns) over the flight.
-        let stick = |past_cell: bool, dims: bool, plain: bool| -> (usize, usize, usize, usize) {
+        let stick = |past_cell: bool,
+                     dims: bool,
+                     plain: bool,
+                     blended: bool|
+         -> (usize, usize, usize, usize) {
             let (mut runs, mut pinch, mut tan, mut olive) = (0usize, 0usize, 0usize, 0usize);
             for after in [20u64, 35, 60, 90, 120, 156] {
                 let g = gallery_geom();
@@ -7122,6 +7311,7 @@ mod tests {
                 let mut m = Meteors::new();
                 m.dims_dark_trains = dims;
                 m.warm_stops_plain = plain;
+                m.train_skip_blended = blended;
                 let (ox, oy, cw, ch) = (12, 2, 14, 26);
                 let reach = i32::from(past_cell);
                 m.keep_out.set_rows([
@@ -7192,25 +7382,31 @@ mod tests {
             }
             (runs, pinch, tan, olive)
         };
-        let (runs, pinch, tan, olive) = stick(false, false, false);
+        let (runs, pinch, tan, olive) = stick(false, false, false, false);
         assert_eq!(runs, 1, "the paper Return's stick falls into {runs} runs");
         assert_eq!(pinch, 0, "the stick pinches by {pinch} px and widens again");
         assert_eq!(tan, 0, "{tan} columns of the stick read tan at their core");
         assert!(
-            olive <= 4,
+            olive <= 1,
             "the stick reads olive across {olive} columns in a row"
         );
-        let (cut, ..) = stick(true, false, false);
+        let (_, _, _, blended) = stick(false, false, false, true);
+        assert!(
+            blended >= olive + 2,
+            "control: blended across the bend's skip the stick reads olive across only \
+             {blended} columns ({olive})"
+        );
+        let (cut, ..) = stick(true, false, false, false);
         assert!(
             cut >= 2,
             "control: held a cell past the letters the stick is one run"
         );
-        let (_, _, dim_tan, _) = stick(false, true, false);
+        let (_, _, dim_tan, _) = stick(false, true, false, false);
         assert!(
             dim_tan >= 10,
             "control: its fades laid as dims read tan in only {dim_tan} columns"
         );
-        let (_, _, _, bent) = stick(false, false, true);
+        let (_, _, _, bent) = stick(false, false, true, false);
         assert!(
             bent >= olive + 2,
             "control: the caret's bend reads olive across only {bent} columns ({olive})"

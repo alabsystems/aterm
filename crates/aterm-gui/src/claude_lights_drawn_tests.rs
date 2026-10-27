@@ -393,13 +393,16 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
     let switch = |program, face, session| crate::claude_lights::BorderSwitch {
         frame_row: 7,
         term_row: 7,
-        cols: 100..130,
-        switch: 101..120,
-        button: Some(121..127),
+        cols: 100..106,
         session,
         face,
-        tier: 0,
         program,
+        label: None,
+        arrow: None,
+        paint: crate::claude_footer::SwitchPaint::bare(
+            face,
+            Some(aterm_phase::CliHarness::ClaudeCode),
+        ),
     };
     let read = |drew: &[crate::claude_lights::BorderSwitch], covered: Option<usize>| {
         let mut lights = WindowLights::default();

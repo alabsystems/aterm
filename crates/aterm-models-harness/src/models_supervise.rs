@@ -745,11 +745,12 @@ pub fn supervisor_land_model() -> Model {
             var hlegs = 0;
             var same = 0;
             var typed_same = 0;
+            var withheld = 0;
 
             action Instruction when (
-                pending == 0 && walled == 0 && asked == 0 && typed == 0 && backoff == 0 &&
-                landed == 0 && left == 0 && other == 0 && quiet == 0 && held == 0 &&
-                (same <= 1 || Buggy == 3)
+                pending == 0 && walled == 0 && asked == 0 && typed == 0 &&
+                (if Buggy == 4 { backoff } else { 0 }) == 0 && landed == 0 && left == 0 &&
+                other == 0 && quiet == 0 && held == 0 && (same <= 1 || Buggy == 3)
             ) {
                 typed_same = if same == 2 { 1 } else { typed_same };
                 typed = 1;
@@ -791,8 +792,10 @@ pub fn supervisor_land_model() -> Model {
             }
             action BackoffDue when (
                 pending == 0 && walled == 0 && backoff == 1 && landed == 0 && left == 0 &&
-                other == 0 && (same <= 1 || Buggy == 3)
+                other == 0 && (same <= 1 || Buggy == 3) &&
+                (typed == 1 || asked == 1 || Buggy == 4)
             ) {
+                withheld = if typed == 0 && asked == 0 { 1 } else { withheld };
                 backoff = 0;
             }
             action YieldWork when (pending > 0) {
@@ -1188,6 +1191,7 @@ pub fn supervisor_land_model() -> Model {
             invariant NeverTypeIntoALandedTask: typed_landed == 0;
             invariant AWallIsNeverLeftOnALandedTask: walled == 0 || landed == 0;
             invariant ANoWorkReplyGetsOneMoreActAtMost: typed_same == 0;
+            invariant TheInstructionWaitsNoBackOff: withheld == 0;
             invariant TheHostIsToldTheTasksFace:
                 (other == 1 && told == 0) ||
                 (other == 0 && left == 1 && told == 2) ||
@@ -2129,165 +2133,119 @@ pub fn supervisor_decline_keys_model() -> Model {
     }
 }
 
-/// Formal model for bounded retries on transient network/API walls.
+/// Formal model for the wait at an outage wall (v6 §14.17.5.2, slice 12b): an overload, a server
+/// error or a connection the agent cannot act on is waited out, never typed into. A connection the
+/// host measures down types nothing; its edge up, measured after the last try, resumes once; else
+/// a blind try comes at each rung of a ladder doubling from `First` to `Cap`, the gap counted from
+/// the wall's start or its last try. Every act is the one line (aterm-agent's `cleared_text`), and
+/// the line says how the clearing is known: *has cleared* only for an edge up measured since the
+/// last try, *may have cleared* for a blind try. That the line is all that is typed, never a
+/// retry's words, is the conformance walk's to hold: the model has no words but the line's.
+///
+/// `kind`: 0 no wall, 1 a connection the host measures, 2 an overload or a server error (never
+/// measured). `reach`, at a connection wall: 0 unknown, 1 down, 2 up since the last try, 3 up
+/// before it. `gap` is the decider's rung, `rung` the ladder's own.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn supervisor_network_wall_model() -> Model {
+pub fn supervisor_outage_wait_model() -> Model {
     aterm_spec::ty_model! {
-        SupervisorNetworkWall {
+        SupervisorOutageWait {
             const Buggy = 0;
-            const Carry = 0;
-            const Rung1 = 1;
-            const Rung2 = 2;
-            const Hold = 3;
-            const AtOnce = 2;
-            const Futile = 3;
-            var net = 1;
-            var verdict = 0;
-            var wall = 0;
-            var cause = 0;
+            const First = 1;
+            const Cap = 4;
+            var kind = 0;
+            var reach = 0;
+            var turn = 0;
             var waited = 0;
-            var tries = 0;
-            var ups = 0;
-            var quick = 0;
-            var dacts = 0;
-            var dticks = 0;
-            var mu = 0;
-            var mc = 0;
-            var att = 0;
-            var up = 0;
-            var typed_same = 0;
+            var gap = 1;
+            var rung = 1;
+            var resumes = 0;
+            var typed_down = 0;
+            var early = 0;
+            var misworded = 0;
 
-            action NetFails when (net == 1) {
-                net = 0;
-            }
-            action NetReturns when (net == 0) {
-                net = 1;
-            }
-
-            action MeasureDown when (net == 0 && (verdict == 0 || verdict == 2)) {
-                verdict = 1;
-            }
-            action MeasureUp when (net == 1 && (verdict == 0 || verdict == 1)) {
-                verdict = 2;
-                up = 1;
-            }
-            action MeasureLost when (verdict == 1 || verdict == 2) {
-                verdict = 0;
-            }
-            action MeasureLies when (net == 0 && (verdict == 0 || verdict == 1)) {
-                verdict = 2;
-                up = 1;
-            }
-            action MeasureWrongDown when (net == 1 && (verdict == 0 || verdict == 2)) {
-                verdict = 1;
-            }
-
-            action Unreachable when (wall == 0 && net == 0) {
-                wall = 1;
-                cause = 0;
+            action ConnectionMeets when (kind == 0 && turn == 0) {
+                kind = 1;
                 waited = 0;
             }
-            action CutOff when (wall == 0) {
-                wall = 1;
-                cause = 1;
+            action OverloadMeets when (kind == 0 && turn == 0) {
+                kind = 2;
                 waited = 0;
             }
 
-            action Tick when (wall == 1 && waited <= Hold - 1) {
+            action MeasureDown when (kind == 1 && turn == 0 && (reach == 0 || reach > 1)) {
+                reach = 1;
+            }
+            action EdgeUp when (kind == 1 && turn == 0 && reach <= 1) {
+                reach = 2;
+                resumes = 0;
+            }
+            action MeasureLost when (kind == 1 && turn == 0 && reach > 0) {
+                reach = 0;
+            }
+
+            action Tick when (kind > 0 && turn == 0 && waited <= gap - 1) {
                 waited = waited + 1;
-                dticks = if dticks <= Hold + Hold - 1 { dticks + 1 } else { dticks };
             }
 
-            action Act when (
-                wall == 1 &&
-                (Buggy == 2 || (up == 1 && verdict == 2) ||
-                    (cause == 0 && (mu <= 1 || (mu <= Futile - 1 && att <= Futile - 1))) ||
-                    (cause == 1 && (mc <= 1 || (mc <= Futile - 1 && att <= Futile - 1)))) && (
-                    Buggy == 1 ||
-                    (cause == 0 && verdict == 2 &&
-                        (ups == 0 || (ups == 1 && Rung1 <= waited) || (ups == 2 && Rung2 <= waited))) ||
-                    (verdict == 1 && Hold <= waited) ||
-                    (cause == 0 && verdict == 0 &&
-                        ((tries == 0 && Rung1 <= waited) || (1 <= tries && Rung2 <= waited))) ||
-                    (cause == 1 && (verdict == 0 || verdict == 2) &&
-                        (tries == 0 || (tries == 1 && Rung1 <= waited) ||
-                            (tries == 2 && Rung2 <= waited)))
-                )
+            action ResumeMeasured when (
+                kind == 1 && turn == 0 && (reach == 2 || (Buggy == 4 && reach == 3))
             ) {
-                typed_same = if (up == 0 || verdict <= 1) && (
-                    (cause == 0 && 2 <= mu && (Futile <= mu || Futile <= att)) ||
-                    (cause == 1 && 2 <= mc && (Futile <= mc || Futile <= att))
-                ) {
-                    1
+                resumes = if resumes <= 1 { resumes + 1 } else { resumes };
+                misworded = if reach == 2 { misworded } else { 1 };
+                gap = if Buggy == 2 {
+                    gap
+                } else if gap + gap <= Cap || (Buggy == 3 && gap <= Cap) {
+                    gap + gap
                 } else {
-                    typed_same
+                    Cap
                 };
-                att = if att <= Futile - 1 { att + 1 } else { att };
-                dacts = if verdict == 1 && dacts <= 1 { dacts + 1 } else { dacts };
-                quick = if waited == 0 && quick <= AtOnce { quick + 1 } else { quick };
-                ups = if cause == 0 && verdict == 2 && ups <= 1 { ups + 1 } else { ups };
-                tries = if tries <= 1 { tries + 1 } else { tries };
-                wall = 2;
-                waited = if Carry == 1 { waited } else { 0 };
+                rung = if rung + rung <= Cap { rung + rung } else { Cap };
+                waited = 0;
+                turn = 1;
+            }
+            action TryBlind when (
+                kind > 0 && turn == 0 && gap <= waited &&
+                (kind == 2 || reach == 0 || reach == 3 || Buggy == 1)
+            ) {
+                typed_down = if kind == 1 && reach == 1 { 1 } else { typed_down };
+                early = if waited <= rung - 1 { 1 } else { early };
+                misworded = if kind == 1 && reach == 2 { 1 } else { misworded };
+                gap = if Buggy == 2 {
+                    gap
+                } else if gap + gap <= Cap || (Buggy == 3 && gap <= Cap) {
+                    gap + gap
+                } else {
+                    Cap
+                };
+                rung = if rung + rung <= Cap { rung + rung } else { Cap };
+                waited = 0;
+                turn = 1;
             }
 
-            action MetUnreachable when (wall == 2 && net == 0) {
-                wall = 1;
-                cause = 0;
-                mu = if mu <= Futile - 1 { mu + 1 } else { mu };
-                up = 0;
+            action MetAgain when (turn == 1) {
+                turn = 0;
+                waited = 0;
+                reach = if reach == 2 { 3 } else { reach };
             }
-            action MetCutOff when (wall == 2) {
-                wall = 1;
-                cause = 1;
-                mc = if mc <= Futile - 1 { mc + 1 } else { mc };
-                up = 0;
-            }
-            action WorkedThenUnreachable when (wall == 2 && net == 0) {
-                wall = 1;
-                cause = 0;
-                tries = 0;
-                ups = 0;
-                quick = 0;
-                dacts = 0;
-                dticks = 0;
-                mu = 0;
-                mc = 0;
-                att = 0;
-                up = 0;
-            }
-            action WorkedThenCutOff when (wall == 2) {
-                wall = 1;
-                cause = 1;
-                tries = 0;
-                ups = 0;
-                quick = 0;
-                dacts = 0;
-                dticks = 0;
-                mu = 0;
-                mc = 0;
-                att = 0;
-                up = 0;
-            }
-            action Taken when (wall == 2 && net == 1) {
-                wall = 0;
-                cause = 0;
-                tries = 0;
-                ups = 0;
-                quick = 0;
-                dacts = 0;
-                dticks = 0;
-                mu = 0;
-                mc = 0;
-                att = 0;
-                up = 0;
+            action Works when (turn == 1) {
+                turn = 0;
+                kind = 0;
+                waited = 0;
+                gap = First;
+                rung = First;
+                reach = if reach == 2 { 3 } else { reach };
             }
 
-            invariant AMeasuredOutageIsTypedIntoAtMostOnceAHold:
-                dacts == 0 || (dacts == 1 && Hold <= dticks) || Hold + Hold <= dticks;
-            invariant AtMostTwoActsAtOncePerEpisode: quick <= AtOnce;
-            invariant AWallGetsItsTriesAndNoMore: typed_same == 0;
+            invariant NothingTypedWhileMeasuredDown: typed_down == 0;
+            invariant NoTryBeforeItsRung: early == 0;
+            invariant OneResumePerMeasuredClearing: resumes <= 1;
+            invariant TheGapStaysUnderItsCap: gap <= Cap;
+            invariant TheLineSaysHowItCleared: misworded == 0;
+            bound GapBox: gap <= Cap + Cap;
+            bound WaitedBox: waited <= Cap + Cap;
+            bound RungBox: rung <= Cap;
+            bound ResumesBox: resumes <= 2;
         }
     }
 }
@@ -2789,6 +2747,74 @@ pub fn supervisor_usage_wall_liveness() -> Liveness {
             "MemoryLost",
             "OlderLeftPlacedTomorrow",
         ],
+    }
+}
+
+/// Formal model for the resume past a system message (v6 §14.17.5, slice 12a): a condition (a
+/// usage limit, a lost login) ends the agent's turn, not the agent. Nothing is typed while it
+/// stands or over a person at the keyboard, and once it clears one line names it, once: never
+/// Cruise's or Land's prompt, which wait for the agent's own turn end, save Land's instruction
+/// while it is still owed (`instructed == 0`), the one prompt then.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_condition_resume_model() -> Model {
+    aterm_spec::ty_model! {
+        SupervisorConditionResume {
+            const Buggy = 0;
+            var standing = 0;
+            var owed = 0;
+            var person = 0;
+            var working = 1;
+            var resumes = 0;
+            var into_standing = 0;
+            var over_person = 0;
+            var mode_prompt = 0;
+            var instructed = 0;
+
+            action ConditionMeets when (standing == 0 && working == 1) {
+                standing = 1;
+                working = 0;
+                owed = 0;
+                resumes = 0;
+            }
+            action Clears when (standing == 1 && working == 0) {
+                standing = 0;
+                owed = 1;
+                resumes = 0;
+            }
+            action PersonTypes when (person == 0) {
+                person = 1;
+            }
+            action GraceLapses when (person == 1) {
+                person = 0;
+            }
+            action Resume when (
+                working == 0 &&
+                ((owed == 1 && standing == 0) || (Buggy == 4 && standing == 1)) &&
+                (person == 0 || Buggy == 2) &&
+                (resumes == 0 || Buggy == 3)
+            ) {
+                into_standing = if standing == 1 { 1 } else { into_standing };
+                over_person = if person == 1 { 1 } else { over_person };
+                mode_prompt = if Buggy == 1 && instructed == 1 { 1 } else { mode_prompt };
+                instructed = 1;
+                resumes = if resumes <= 1 { resumes + 1 } else { resumes };
+                owed = if Buggy == 3 { owed } else { 0 };
+                working = 1;
+            }
+            action TurnEnds when (standing == 0 && working == 1) {
+                working = 0;
+            }
+            action ModePrompt when (standing == 0 && working == 0 && owed == 0 && person == 0) {
+                working = 1;
+                instructed = 1;
+            }
+
+            invariant NothingIntoAStandingCondition: into_standing == 0;
+            invariant NeverTypedOverThePerson: over_person == 0;
+            invariant OneResumePerClearing: resumes <= 1;
+            invariant TheResumeIsTheClearedLine: mode_prompt == 0;
+        }
     }
 }
 

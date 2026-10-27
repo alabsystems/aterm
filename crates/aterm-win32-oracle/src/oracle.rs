@@ -258,8 +258,8 @@ fn expected_imports(model: &Model, triple: &str, hand_written: usize) -> usize {
 }
 /// The `link!` imports aterm-win32's hand-written files declare (the DXGI
 /// slice's `CreateDXGIFactory1`, Direct3D 11's `D3D11CreateDevice` and
-/// DirectComposition's `DCompositionCreateDevice`): none of them is in the
-/// generated model.
+/// DirectComposition's `DCompositionCreateDevice`; UI Automation's are
+/// generated): none of them is in the generated model.
 pub fn hand_written_imports(krate: &Path) -> Result<usize> {
     let mut count = 0;
     for file in crate::model::HAND_WRITTEN {
@@ -683,6 +683,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("src/dcomp.rs"), "").unwrap();
+        std::fs::write(dir.path().join("src/uia.rs"), "").unwrap();
         assert_eq!(hand_written_imports(dir.path()).unwrap(), 3);
         std::fs::remove_file(dir.path().join("src/com.rs")).unwrap();
         assert!(hand_written_imports(dir.path()).is_err());

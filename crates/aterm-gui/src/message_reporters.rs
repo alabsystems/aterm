@@ -2047,6 +2047,31 @@ pub(crate) fn rewind_failed(why: &str) -> Message {
     .no_excerpt()
 }
 
+/// Builds the message when View > Export Pane History… writes nothing, saying `why`.
+pub(crate) fn pane_history_export_failed(why: &str) -> Message {
+    gesture_failure(
+        tags::SESSION,
+        Severity::Warn,
+        "Couldn't export this pane's history",
+        why,
+        Then::step("Choose View > Export Pane History… again"),
+    )
+    .no_excerpt()
+}
+
+/// Builds the message when View > Export Pane History… has no save panel to ask where.
+pub(crate) fn pane_history_export_has_no_panel() -> Message {
+    gesture_failure(
+        tags::SESSION,
+        Severity::Warn,
+        "Couldn't export this pane's history",
+        "this needs a save panel, which aterm has only on macOS; `aterm ctl rewind export` \
+         writes the file under the state directory's rewind/ folder",
+        Then::step("Run `aterm ctl rewind export` in this pane"),
+    )
+    .no_excerpt()
+}
+
 /// Builds the error message when session restore stops after failing to create a window.
 pub(crate) fn restore_stopped_early() -> Message {
     gesture_failure(
@@ -4291,6 +4316,202 @@ pub(crate) fn program_check_stuck(workers: u64, limit: Option<u64>) -> Message {
     .key(PROGRAM_CHECK_STUCK_KEY)
 }
 
+/// The prefix of the alerts that ask for the password a service's restart takes, one key per
+/// episode ([`service_memory_alert_key`]).
+pub(crate) const SERVICE_MEMORY_KEY: &str = "system.service-memory";
+
+/// The alert's key for the episode `episode` ([`aterm_vitals::services::Service::episode`]):
+/// its process, so a dismissal holds for that process however often aterm relaunches, and a
+/// new process in its place asks anew.
+pub(crate) fn service_memory_alert_key(episode: &str) -> String {
+    format!("{SERVICE_MEMORY_KEY}.{episode}")
+}
+
+/// The digest entry's key for the episode `episode` of the service whose process is `name`.
+pub(crate) fn service_memory_entry_key(name: &str, episode: &str) -> String {
+    aterm_messages::need::Fingerprint::new(
+        Family::ServiceMemory.stem(),
+        aterm_vitals::sys::exe_word(name),
+        episode,
+    )
+    .as_str()
+    .to_owned()
+}
+
+/// The digest entries a pass of `told` keeps open without telling them: each service followed
+/// but not told (in this process's life the hold is not met again yet, or it is within the
+/// margin under the bar) and each whose footprint did not read. An entry under none of these
+/// and none told is an episode that ended.
+pub(crate) fn service_memory_kept(told: &aterm_vitals::services::Told) -> Vec<String> {
+    told.services
+        .iter()
+        .filter(|s| !s.told())
+        .map(|s| service_memory_entry_key(&s.service.name, &s.service.episode()))
+        .chain(
+            told.unread
+                .iter()
+                .map(|m| service_memory_entry_key(&m.name, &m.episode())),
+        )
+        .collect()
+}
+
+/// A service's name as a person reads it: its process's name, or `a service`.
+fn service_name(s: &aterm_vitals::services::Seen) -> &str {
+    match aterm_vitals::sys::exe_word(&s.service.name) {
+        "-" => "a service",
+        name => name,
+    }
+}
+
+/// The step for `restart`: its press, which opens a tab that asks for the password once, for
+/// an account that can take it (`admin` not known to be no); else the Mac's restart, in words.
+fn restart_press(restart: &aterm_vitals::services::Restart, admin: Option<bool>) -> Then {
+    if admin == Some(false) {
+        return Then::step("Restart the Mac once your work is saved").or_short("Restart the Mac");
+    }
+    let step = format!("Restart {}", restart.name);
+    Mover::restart_service(restart.name).map_or_else(
+        || {
+            Then::step(format!(
+                "Run `aterm init --only {}` in a terminal",
+                restart.init
+            ))
+        },
+        |mover| Then::press(mover, &step),
+    )
+}
+
+/// What `s` holds against the bar, held how long, for a details line.
+fn service_held(s: &aterm_vitals::services::Seen, total: u64) -> String {
+    use aterm_vitals::words::mem;
+    format!(
+        "macOS's {} holds {} of this Mac's {}, past the {} any service needs, for at least \
+         {} min. A fresh one holds a few MiB.",
+        service_name(s),
+        mem(s.service.footprint),
+        mem(total),
+        mem(aterm_vitals::services::large_bar(total)),
+        aterm_vitals::services::HOLD_MS / 60_000
+    )
+}
+
+/// The details line for an account that cannot take the restart's password.
+const NOT_ADMIN_LINE: &str = "This account is not an administrator of this Mac, so it cannot \
+                              restart the service itself; an administrator can, and a restart \
+                              of the Mac frees the memory too.";
+
+/// The digest entry for one of macOS's services held past its bar ([`crate::services_watch`]):
+/// its restart's press where aterm knows one and the account can take its password (`admin`),
+/// else the Mac's restart.
+pub(crate) fn service_memory_entry(
+    s: &aterm_vitals::services::Seen,
+    total: u64,
+    admin: Option<bool>,
+) -> Entry {
+    use aterm_vitals::services::Size;
+    use aterm_vitals::words::mem;
+    let name = service_name(s);
+    let (why, then) = match s.restart {
+        Some(restart) if admin == Some(false) => (
+            Why::OnlyYou(Reason::new(format!(
+                "{name} frees its memory only when an administrator restarts it"
+            ))),
+            restart_press(restart, admin),
+        ),
+        Some(restart) => (
+            Why::OnlyYou(Reason::new(format!(
+                "{name} gives its memory back only when restarted as root"
+            ))),
+            restart_press(restart, admin),
+        ),
+        None => (
+            Why::OnlyYou(Reason::new(format!(
+                "aterm knows no safe restart for {name}, and only macOS frees what it holds"
+            ))),
+            Then::step("Restart the Mac once your work is saved").or_short("Restart the Mac"),
+        ),
+    };
+    let mut entry = Entry::new(
+        Family::ServiceMemory,
+        aterm_vitals::sys::exe_word(&s.service.name),
+        &s.service.episode(),
+        &format!("{name} holds {}", mem(s.service.footprint)),
+        why,
+        then,
+    )
+    .severity(if s.size == Size::Huge {
+        Severity::Warn
+    } else {
+        Severity::Info
+    })
+    .more(service_held(s, total));
+    match s.restart {
+        Some(_) if admin == Some(false) => entry = entry.more(NOT_ADMIN_LINE),
+        Some(restart) => {
+            entry = entry.more(format!(
+                "The restart asks for your password once, and {}.",
+                restart.cost
+            ));
+        }
+        None => {}
+    }
+    entry.log_line(format!(
+        "service-memory service={name} pid={} fp_bytes={} size={}",
+        s.service.pid,
+        s.service.footprint,
+        s.size.word()
+    ))
+}
+
+/// The on-screen alert while one of macOS's services that aterm can restart holds past the huge
+/// bar ([`aterm_vitals::services::huge_bar`]) and the Mac's memory is under pressure: the Mac
+/// swaps toward a stop, and one restart, which takes the person's password, ends it. For an
+/// account that cannot take that password (`admin`), the step is the Mac's restart, in words.
+/// Its words change only with the figure, never with the pressure, so a restatement while
+/// the pressure comes and goes says nothing new.
+pub(crate) fn service_memory_alert(
+    s: &aterm_vitals::services::Seen,
+    restart: &aterm_vitals::services::Restart,
+    total: u64,
+    admin: Option<bool>,
+) -> Message {
+    let name = service_name(s);
+    let why = StandingWhy::OnlyYou(Reason::new(if admin == Some(false) {
+        format!("{name} frees its memory only when an administrator restarts it")
+    } else {
+        format!(
+            "{name} gives its memory back only when restarted as root, which takes your password"
+        )
+    }));
+    let then = restart_press(restart, admin);
+    let cause_words = Why::from(why.clone()).words();
+    let mut msg = Message::new(
+        tags::SYSTEM,
+        Severity::Error,
+        format!(
+            "{name} holds {}",
+            aterm_vitals::words::mem(s.service.footprint)
+        ),
+    )
+    .line(then.words())
+    .line(cause_words)
+    .line(service_held(s, total))
+    .line("It was raised while the Mac's memory was under pressure.");
+    msg = if admin == Some(false) {
+        msg.line(NOT_ADMIN_LINE)
+    } else {
+        msg.line(format!(
+            "The press opens a tab that asks for your password once, and {}.",
+            restart.cost
+        ))
+        .action(Intent::RestartService {
+            service: restart.name.to_owned(),
+        })
+    };
+    msg.now(Ask::standing(why, then))
+        .key(&service_memory_alert_key(&s.service.episode()))
+}
+
 pub(crate) const DISK_SETTINGS_KEY: &str = "disk.settings";
 
 const NOTES_MORE: &str = " more, and aterm harness disk prints each";
@@ -6037,6 +6258,26 @@ pub(crate) fn agent_upgrade_word_refused(
         })
     } else {
         msg
+    }
+}
+
+/// Why an owner's upgrade word was refused, short enough for the top rule's label slot
+/// (`press it again`, `a newer build: 2.1.311`, `its restart is already under way`).
+pub(crate) fn agent_upgrade_refused_words(why: &str) -> String {
+    if why.starts_with("busy:") {
+        "press it again".to_string()
+    } else if let Some(now_to) = why.strip_prefix("stale:") {
+        format!(
+            "a newer build: {}",
+            atpkg::progress::sanitize_for_tty(now_to, 32)
+        )
+    } else if aterm_agent::harness::upgrade_drive::refused_stopped(why).is_some() {
+        "the upgrade stopped before the press reached it".to_string()
+    } else {
+        refusal_words(why).map_or_else(
+            || atpkg::progress::sanitize_for_tty(why, 60),
+            str::to_string,
+        )
     }
 }
 

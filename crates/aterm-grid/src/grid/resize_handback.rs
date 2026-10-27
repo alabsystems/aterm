@@ -1068,6 +1068,227 @@ impl Grid {
         };
         self.set_handback(edge);
     }
+
+    /// Capture the full owed hand-back state (pushed rows, cut seams, window skew and resize law included) for an in-process replay keyframe.
+    #[must_use]
+    pub fn capture_handback_carry(&self) -> GridHandbackCarry {
+        GridHandbackCarry {
+            edge: self.handback_owed(true),
+            skew: self.window_skew(),
+            resize_law: self.storage.resize_law,
+        }
+    }
+
+    /// Install an in-process replay keyframe's [`GridHandbackCarry`] onto this restored grid when its retained history still holds every owed pushed row.
+    pub fn apply_handback_carry(&mut self, carry: GridHandbackCarry) {
+        self.storage.resize_law = carry.resize_law;
+        if usize::from(carry.edge.pushed_rows()) <= self.storage.scrollback_lines() {
+            self.set_handback(carry.edge);
+            self.keep_skew(carry.edge.top(), carry.skew);
+        } else {
+            self.set_handback(carry.edge.without_pushes());
+        }
+    }
+}
+
+/// Canonical wire parts of a [`GridHandbackCarry`] for versioned state serialization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CanonicalHandbackCarry {
+    /// Edge variant tag (`0 = None`, `1 = Trimmed`, `2 = Revealed`).
+    pub edge_kind: u8,
+    /// Trimmed blank rows or revealed history lines.
+    pub rows: u16,
+    /// Rows demoted after trims or blank rows appended after reveals.
+    pub above: u16,
+    /// Bottom rows pushed into history (`Trimmed` only).
+    pub pushed: u16,
+    /// Blank gap left under the cursor by bottom pushes (`Trimmed` with `pushed > 0` only).
+    pub seam_gap: u16,
+    /// Whether bottom pushes cut the screen's new top row (`Trimmed` with `pushed > 0` only).
+    pub seam_top: bool,
+    /// Whether bottom pushes cut the first pushed row (`Trimmed` with `pushed > 0` only).
+    pub seam_bottom: bool,
+    /// Column skew of the owed window's top row.
+    pub skew: u16,
+    /// Resize law tag (`0 = Undo`, `1 = HandBack`, `2 = PushedRows`, `3 = Rewrap`).
+    pub resize_law: u8,
+}
+
+/// The in-process resize hand-back state a replay keyframe carries past a checkpoint's `(handback_rows, handback_above)`: the full owed [`Edge`] (pushed rows and their cut seams included), the owed window's column [`HandBack::skew`], and the active [`ResizeLaw`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GridHandbackCarry {
+    edge: Edge,
+    skew: u16,
+    resize_law: ResizeLaw,
+}
+
+impl GridHandbackCarry {
+    /// Derive the baseline carry a restored checkpoint's `(handback_rows, handback_above)` seeds under `resize_law`.
+    #[must_use]
+    pub const fn from_cursor(rows: i32, above: u16, resize_law: ResizeLaw) -> Self {
+        let abs = rows.unsigned_abs();
+        let bounded = if abs > u16::MAX as u32 {
+            u16::MAX
+        } else {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "explicitly clamped to u16::MAX above"
+            )]
+            {
+                abs as u16
+            }
+        };
+        let edge = if rows >= 0 {
+            Edge::trimmed(bounded, above, 0)
+        } else {
+            Edge::revealed(bounded, above)
+        };
+        Self {
+            edge,
+            skew: 0,
+            resize_law,
+        }
+    }
+
+    /// Drop owed pushed rows when `max_history` retained scrollback lines cannot hold all of them, matching [`Grid::apply_handback_carry`].
+    #[must_use]
+    pub const fn bounded(self, max_history: usize) -> Self {
+        if (self.edge.pushed_rows() as usize) <= max_history {
+            self
+        } else {
+            Self {
+                edge: self.edge.without_pushes(),
+                skew: 0,
+                resize_law: self.resize_law,
+            }
+        }
+    }
+
+    /// Decompose into canonical wire parts for versioned state serialization.
+    #[must_use]
+    pub const fn to_canonical(self) -> CanonicalHandbackCarry {
+        let resize_law = match self.resize_law {
+            ResizeLaw::Undo => 0,
+            ResizeLaw::HandBack => 1,
+            ResizeLaw::PushedRows => 2,
+            ResizeLaw::Rewrap => 3,
+        };
+        match self.edge {
+            Edge::None => CanonicalHandbackCarry {
+                edge_kind: 0,
+                rows: 0,
+                above: 0,
+                pushed: 0,
+                seam_gap: 0,
+                seam_top: false,
+                seam_bottom: false,
+                skew: self.skew,
+                resize_law,
+            },
+            Edge::Trimmed {
+                rows,
+                above,
+                pushed,
+                seams,
+            } => {
+                let effective = if pushed > 0 {
+                    seams
+                } else {
+                    Seams {
+                        gap: 0,
+                        top: false,
+                        bottom: false,
+                    }
+                };
+                CanonicalHandbackCarry {
+                    edge_kind: 1,
+                    rows,
+                    above,
+                    pushed,
+                    seam_gap: effective.gap,
+                    seam_top: effective.top,
+                    seam_bottom: effective.bottom,
+                    skew: self.skew,
+                    resize_law,
+                }
+            }
+            Edge::Revealed { rows, above } => CanonicalHandbackCarry {
+                edge_kind: 2,
+                rows,
+                above,
+                pushed: 0,
+                seam_gap: 0,
+                seam_top: false,
+                seam_bottom: false,
+                skew: self.skew,
+                resize_law,
+            },
+        }
+    }
+
+    /// Reconstruct from canonical wire parts, returning `None` on non-canonical or unknown tags.
+    #[must_use]
+    pub const fn from_canonical(raw: CanonicalHandbackCarry) -> Option<Self> {
+        let resize_law = match raw.resize_law {
+            0 => ResizeLaw::Undo,
+            1 => ResizeLaw::HandBack,
+            2 => ResizeLaw::PushedRows,
+            3 => ResizeLaw::Rewrap,
+            _ => return None,
+        };
+        let edge = match raw.edge_kind {
+            0 => {
+                if raw.rows != 0
+                    || raw.above != 0
+                    || raw.pushed != 0
+                    || raw.seam_gap != 0
+                    || raw.seam_top
+                    || raw.seam_bottom
+                {
+                    return None;
+                }
+                Edge::None
+            }
+            1 => {
+                if raw.rows == 0 && raw.above == 0 && raw.pushed == 0 {
+                    return None;
+                }
+                if raw.pushed == 0 && (raw.seam_gap != 0 || raw.seam_top || raw.seam_bottom) {
+                    return None;
+                }
+                Edge::Trimmed {
+                    rows: raw.rows,
+                    above: raw.above,
+                    pushed: raw.pushed,
+                    seams: Seams {
+                        gap: raw.seam_gap,
+                        top: raw.seam_top,
+                        bottom: raw.seam_bottom,
+                    },
+                }
+            }
+            2 => {
+                if raw.rows == 0
+                    || raw.pushed != 0
+                    || raw.seam_gap != 0
+                    || raw.seam_top
+                    || raw.seam_bottom
+                {
+                    return None;
+                }
+                Edge::Revealed {
+                    rows: raw.rows,
+                    above: raw.above,
+                }
+            }
+            _ => return None,
+        };
+        Some(Self {
+            edge,
+            skew: raw.skew,
+            resize_law,
+        })
+    }
 }
 
 #[cfg(test)]

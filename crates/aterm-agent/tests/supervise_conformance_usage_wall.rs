@@ -10,8 +10,8 @@ use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::limit::{ResetSpec, place_reset, within_a_session_window};
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
-    FIRED_EARLY, RULE_CONTINUE, RULE_LIMIT_RESUME, TurnEndAction, TurnEndReading, TurnEndState,
-    TurnEndTiming, decide_turn_end,
+    Cleared, Clearing, FIRED_EARLY, RULE_CONTINUE, RULE_LIMIT_RESUME, TurnEndAction,
+    TurnEndReading, TurnEndState, TurnEndTiming, cleared_text, decide_turn_end,
 };
 use aterm_agent::supervise::tap_clock::{TapClock, TapWindow, UsageWindow, timed};
 use aterm_models_harness::supervisor_usage_wall_model;
@@ -526,7 +526,12 @@ fn expected(m: &Model, st: &State) -> Verdict {
 fn verdict(a: &TurnEndAction, now: Instant) -> Verdict {
     match a {
         TurnEndAction::Type { text, rule_id } if *rule_id == RULE_LIMIT_RESUME => {
-            assert_eq!(*text, SupervisorConfig::default().continue_text);
+            assert!(
+                [Clearing::Measured, Clearing::Blind]
+                    .iter()
+                    .any(|&how| *text == cleared_text(Cleared::UsageLimit, how)),
+                "the resume is the one cleared line: {text}"
+            );
             Verdict::Act
         }
         TurnEndAction::Type { rule_id, .. } => Verdict::Typed(rule_id),

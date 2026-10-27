@@ -334,8 +334,6 @@ fn run(
     }
     let outcome = match enc.submit() {
         SubmittedFrame::Metal(submitted) => submitted.wait_outcome(),
-        #[cfg(multi_arm)]
-        _ => unreachable!("a Metal encoder commits a Metal frame"),
     };
     if outcome != super::loss::CbOutcome::Completed {
         return Err(format!("the probe's command buffer ended {outcome:?}"));

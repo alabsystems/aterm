@@ -91,6 +91,43 @@ pub(crate) fn binary_path(header: &str) -> Option<&str> {
 /// The words a test prints when the machine refused it, not the tree.
 pub use aterm_uds::host::COULD_NOT_RUN as COULD_NOT_RUN_SENTINEL;
 
+/// Whether `log` carries [`crate::findings::CEILING_KILL`], plain or ANSI-coloured.
+#[must_use]
+pub(crate) fn has_ceiling_kill(log: &str) -> bool {
+    if log.contains('\x1b') {
+        return strip_ansi(log).contains(crate::findings::CEILING_KILL);
+    }
+    log.contains(crate::findings::CEILING_KILL)
+}
+
+/// libtest's opening count line (`running <n> test` or `running <n> tests`).
+fn libtest_banner(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("running ") else {
+        return false;
+    };
+    let Some(n) = rest
+        .strip_suffix(" test")
+        .or_else(|| rest.strip_suffix(" tests"))
+    else {
+        return false;
+    };
+    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// cargo's `--no-fail-fast` summary header (`error: <n> target(s) failed:`).
+fn cargo_summary_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("error: ") else {
+        return false;
+    };
+    let Some(n) = rest
+        .strip_suffix(" target failed:")
+        .or_else(|| rest.strip_suffix(" targets failed:"))
+    else {
+        return false;
+    };
+    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// The failed tests in a failed `targo test` child's log, when every failure carries [`COULD_NOT_RUN_SENTINEL`].
 #[must_use]
 pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
@@ -101,6 +138,7 @@ pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
     let mut listed: Vec<&str> = Vec::new();
     let mut current: Option<usize> = None;
     let mut in_list = false;
+    let mut open_libtest = false;
     let (mut results, mut binaries) = (0usize, 0usize);
     for line in log.lines() {
         if let Some(name) = line
@@ -127,8 +165,21 @@ pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
             }
             in_list = false;
         }
-        if current.is_none() && abnormal_exit(line) {
+        if current.is_none()
+            && (abnormal_exit(line)
+                || compile_failure_line(line)
+                || line.contains(crate::findings::CEILING_KILL))
+        {
             return None;
+        }
+        if current.is_none() && header(line).is_some() && open_libtest {
+            return None;
+        }
+        if current.is_none() && libtest_banner(line) {
+            open_libtest = true;
+        }
+        if current.is_none() && line.starts_with("test result: ") {
+            open_libtest = false;
         }
         if line.starts_with("test result: FAILED.") {
             results += 1;
@@ -148,7 +199,8 @@ pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
     let mut named: Vec<&str> = blocks.iter().map(|(name, _)| *name).collect();
     named.sort_unstable();
     listed.sort_unstable();
-    (!blocks.is_empty()
+    (!open_libtest
+        && !blocks.is_empty()
         && blocks.iter().all(|(_, refused)| *refused)
         && listed == named
         && binaries > 0
@@ -252,6 +304,7 @@ pub fn failed_tests(log: &str) -> Option<Vec<FailedTest>> {
     let mut current: Option<usize> = None;
     let mut in_list = false;
     let mut closing = false;
+    let mut open_libtest = false;
     let (mut results, mut binaries) = (0usize, 0usize);
     for line in log.lines() {
         if let Some(name) = line
@@ -294,11 +347,24 @@ pub fn failed_tests(log: &str) -> Option<Vec<FailedTest>> {
         if current.is_some() && (line.starts_with("test result: ") || rerun_spec(line).is_some()) {
             return None;
         }
-        if current.is_none() && abnormal_exit(line) {
+        if current.is_none()
+            && (abnormal_exit(line)
+                || compile_failure_line(line)
+                || line.contains(crate::findings::CEILING_KILL))
+        {
             return None;
+        }
+        if current.is_none() && header(line).is_some() && open_libtest {
+            return None;
+        }
+        if current.is_none() && libtest_banner(line) {
+            open_libtest = true;
         }
         if line.starts_with("test result: ") {
             closing = false;
+            if current.is_none() {
+                open_libtest = false;
+            }
         }
         if line.starts_with("test result: FAILED.") {
             results += 1;
@@ -334,12 +400,153 @@ pub fn failed_tests(log: &str) -> Option<Vec<FailedTest>> {
     let mut named: Vec<&str> = done.iter().map(|t| t.name.as_str()).collect();
     named.sort_unstable();
     listed.sort_unstable();
-    (pending.is_empty()
+    (!open_libtest
+        && pending.is_empty()
         && !done.is_empty()
         && listed == named
         && binaries > 0
         && results == binaries)
         .then_some(done)
+}
+
+/// Whether `line` is a top-level compiler/cargo build failure line.
+fn compile_failure_line(line: &str) -> bool {
+    line.starts_with("error[")
+        || line.starts_with("error: could not compile ")
+        || line.starts_with("error: failed to compile ")
+        || line.starts_with("error: build failed")
+}
+
+/// Whether `line` starts a cargo build/check step or top-level compile failure outside a binary's
+/// test run.
+fn cargo_build_or_compile_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("Compiling ")
+        || trimmed.starts_with("Checking ")
+        || trimmed.starts_with("Documenting ")
+        || compile_failure_line(line)
+}
+
+/// Whether `chunk` carries a compiler/cargo build failure line.
+fn has_compile_failure(chunk: &[&str]) -> bool {
+    chunk.iter().copied().any(compile_failure_line)
+}
+
+/// Whether a failed child's log attributes every failure to `sentence` (`ENOSPC`): never on a
+/// ceiling kill, and in a `targo test` log any binary section that completed cleanly (`test result:
+/// ok.`, a skipped doctest pass, or a `harness = false` binary that finished with exit 0) is
+/// ignored so simulated full-disk output from a passing test never masks a later crash, timeout,
+/// test failure, or compile error.
+#[must_use]
+pub(crate) fn out_of_disk(log: &str, sentence: &str) -> bool {
+    if log.contains('\x1b') {
+        return out_of_disk(&strip_ansi(log), sentence);
+    }
+    if log.contains(crate::findings::CEILING_KILL) {
+        return false;
+    }
+    if let Some(failed) = failed_tests(log)
+        && !failed.is_empty()
+    {
+        return failed.iter().all(|test| test.block.contains(sentence));
+    }
+    let mut lead: Vec<&str> = Vec::new();
+    let mut sections: Vec<Vec<&str>> = Vec::new();
+    let mut in_block = false;
+    for line in log.lines() {
+        if line
+            .strip_prefix("---- ")
+            .and_then(|r| r.strip_suffix(" stdout ----"))
+            .is_some()
+        {
+            in_block = true;
+        } else if line == "failures:"
+            || line.starts_with("test result: ")
+            || rerun_spec(line).is_some()
+            || abnormal_exit(line)
+        {
+            in_block = false;
+        }
+        if !in_block && header(line).is_some() {
+            sections.push(vec![line]);
+        } else if let Some(cur) = sections.last_mut() {
+            cur.push(line);
+        } else {
+            lead.push(line);
+        }
+    }
+    if sections.is_empty() {
+        return log.contains(sentence);
+    }
+    let mut outside_chunks: Vec<Vec<&str>> = Vec::new();
+    if !lead.is_empty() {
+        outside_chunks.push(lead);
+    }
+    let total_sections = sections.len();
+    let mut non_passing = 0usize;
+    for (idx, section) in sections.into_iter().enumerate() {
+        let pass_end = section
+            .iter()
+            .rposition(|l| {
+                l.starts_with("test result: ok.") || l.starts_with("aterm-verify: no doctest in ")
+            })
+            .filter(|&end| {
+                !section[end + 1..].iter().any(|l| {
+                    l.starts_with("test result: FAILED.")
+                        || rerun_spec(l).is_some()
+                        || abnormal_exit(l)
+                        || libtest_banner(l)
+                })
+            });
+        if let Some(end) = pass_end {
+            if end + 1 < section.len() {
+                outside_chunks.push(section[end + 1..].to_vec());
+            }
+            continue;
+        }
+        let no_failure_trailer = !section.iter().any(|l| {
+            libtest_banner(l)
+                || l.starts_with("test result: ")
+                || rerun_spec(l).is_some()
+                || abnormal_exit(l)
+        });
+        let tail_start = section.iter().enumerate().skip(1).find_map(|(i, l)| {
+            (cargo_summary_line(l) || cargo_build_or_compile_line(l)).then_some(i)
+        });
+        if no_failure_trailer && (idx + 1 < total_sections || tail_start.is_some()) {
+            if let Some(start) = tail_start {
+                outside_chunks.push(section[start..].to_vec());
+            }
+            continue;
+        }
+        non_passing += 1;
+        let joined = section.join("\n");
+        match failed_tests(&joined) {
+            Some(failed) if !failed.is_empty() => {
+                if !failed.iter().all(|test| test.block.contains(sentence)) {
+                    return false;
+                }
+            }
+            _ => {
+                if !joined.contains(sentence) {
+                    return false;
+                }
+            }
+        }
+    }
+    for chunk in &outside_chunks {
+        if has_compile_failure(chunk) && !chunk.iter().any(|line| line.contains(sentence)) {
+            return false;
+        }
+    }
+    if non_passing > 0 {
+        true
+    } else {
+        outside_chunks
+            .iter()
+            .flatten()
+            .any(|line| line.contains(sentence))
+    }
 }
 
 #[cfg(test)]
@@ -462,6 +669,72 @@ mod tests {
             .environment_failure()
             .is_some(),
             "a build that died of it"
+        );
+        let killed = "     Running unittests src/lib.rs (target/debug/deps/shell-abc)\n\n\
+                      running 133 tests\ntest tests::one ... ok\n\
+                      error: test failed, to rerun pass `-p aterm-shell-integration --lib`\n\n\
+                      Caused by:\n  process didn't exit successfully: `shell-abc` (killed by a signal)\n";
+        assert_eq!(
+            run(format!("{simulated}{killed}")).environment_failure(),
+            None,
+            "a passing binary's simulated full disk never hides a later signal death"
+        );
+        let timed_out = format!(
+            "{simulated}     Running unittests src/lib.rs (target/debug/deps/shell-abc)\n\n\
+             running 133 tests\n{} — child killed after 10800.0s of work, over the 10800.0s \
+             ceiling (--timeout <seconds|off>)\n  child: shell-abc\n",
+            crate::findings::CEILING_KILL
+        );
+        assert_eq!(
+            run(timed_out).environment_failure(),
+            None,
+            "a ceiling kill is always a finding, never out-of-disk"
+        );
+        let crashed_enospc = format!(
+            "     Running tests/io.rs (target/debug/deps/io-abc)\n\nrunning 1 test\n\
+             fatal write error: {}\nerror: test failed, to rerun pass `-p x --test io`\n\n\
+             Caused by:\n  process didn't exit successfully: `io-abc` (signal: 6, SIGABRT)\n",
+            crate::exec::ENOSPC_SENTENCE
+        );
+        assert!(
+            run(format!("{simulated}{crashed_enospc}"))
+                .environment_failure()
+                .is_some_and(|why| why.contains("ran out of disk")),
+            "a binary that genuinely aborted on ENOSPC still reports out-of-disk"
+        );
+        assert_eq!(
+            run(format!("{simulated}{red}{crashed_enospc}")).environment_failure(),
+            None,
+            "a plain test failure beside an ENOSPC crash stays a finding"
+        );
+        assert_eq!(
+            run(format!(
+                "{simulated}   Compiling y v0.1.0\nerror[E0308]: mismatched types\n"
+            ))
+            .environment_failure(),
+            None,
+            "a later compile error after a passing simulated-ENOSPC binary stays a finding"
+        );
+        assert!(
+            run(format!(
+                "{simulated}   Compiling y v0.1.0\nerror: failed to write target/y: {}\n",
+                crate::exec::ENOSPC_SENTENCE
+            ))
+            .environment_failure()
+            .is_some_and(|why| why.contains("ran out of disk")),
+            "a later compile error that itself hit ENOSPC reports out-of-disk"
+        );
+        let custom_ok = "     Running tests/custom.rs (target/debug/deps/custom-abc)\n";
+        assert!(
+            run(format!("{custom_ok}{crashed_enospc}"))
+                .environment_failure()
+                .is_some_and(|why| why.contains("ran out of disk")),
+            "a passing harness=false binary before an ENOSPC crash still reports out-of-disk"
+        );
+        assert_eq!(
+            run(format!("{simulated}{custom_ok}")).environment_failure(),
+            None,
+            "an unfinished harness=false binary after a passing simulated-ENOSPC binary stays a finding"
         );
     }
 
@@ -606,6 +879,20 @@ mod tests {
             (
                 "a binary that died without a result",
                 format!("{refusal}{crash}"),
+            ),
+            (
+                "a binary cut off mid-run with no cargo trailer",
+                format!(
+                    "{refusal}     Running unittests src/lib.rs (target/debug/deps/shell-1)\n\n\
+                     running 133 tests\ntest tests::one ... ok\n"
+                ),
+            ),
+            (
+                "a ceiling kill after a refusal",
+                format!(
+                    "{refusal}{} — child killed after 10800.0s of work\n",
+                    crate::findings::CEILING_KILL
+                ),
             ),
             (
                 "a listed failure with no block",
@@ -763,5 +1050,51 @@ mod tests {
         );
         let got = failed_tests(&oracle).expect("accounted for");
         assert!(got[0].block.contains("case_07"), "{:?}", got[0].block);
+    }
+
+    #[test]
+    fn out_of_disk_never_masks_trailing_compile_errors_after_custom_or_enospc_binaries() {
+        let sentence = "No space left on device";
+        let custom_then_compile = "\
+     Running tests/custom_harness.rs (target/debug/deps/custom-1)\n\
+simulated fault injection: No space left on device (os error 28)\n\
+   Compiling broken v0.1.0 (/Users//example/aterm/crates/broken)\n\
+error[E0425]: cannot find value `missing` in this scope\n\
+error: could not compile `broken` (test \"broken\") due to 1 previous error\n";
+        assert!(
+            !out_of_disk(custom_then_compile, sentence),
+            "passing custom-harness simulated ENOSPC must not mask a later compile error"
+        );
+
+        let enospc_then_pass_then_compile = format!(
+            "{}     Running unittests src/lib.rs (target/debug/deps/link-1)\n\n\
+             running 1 test\ntest ok_one ... ok\n\ntest result: ok. 1 passed; 0 failed; \
+             0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n\
+                Documenting broken v0.1.0 (/Users//example/aterm/crates/broken)\n\
+             error[E0425]: cannot find value `missing` in this scope\n\
+             error: could not compile `broken` (doc) due to 1 previous error\n",
+            failed_binary(
+                "writer",
+                &[(
+                    "disk_full",
+                    "thread 'disk_full' panicked:\nNo space left on device"
+                )],
+            ),
+        );
+        assert!(
+            !out_of_disk(&enospc_then_pass_then_compile, sentence),
+            "trailing non-ENOSPC compile failure must not be hidden behind an earlier ENOSPC binary"
+        );
+
+        let custom_enospc_fail = "\
+     Running tests/custom_harness.rs (target/debug/deps/custom-1)\n\
+fatal: No space left on device (os error 28)\n\
+error: test failed, to rerun pass `-p x --test custom_harness`\n\n\
+Caused by:\n\
+  process didn't exit successfully: `custom-1` (exit status: 1)\n";
+        assert!(
+            out_of_disk(custom_enospc_fail, sentence),
+            "genuinely failing custom-harness binary reporting ENOSPC still classifies as out_of_disk"
+        );
     }
 }

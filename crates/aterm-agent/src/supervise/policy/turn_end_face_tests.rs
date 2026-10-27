@@ -176,8 +176,8 @@ fn someone_elses_live_turn_opens_the_face_and_the_policys_own_does_not() {
     assert!(!st.other_turn(), "the point ends it");
     assert_eq!(st.face(), TaskFace::Open);
 
-    let mut st = TurnEndState::default();
-    st.face_start();
+    // The person's own exchange is theirs under Land; Cruise carries it, so it never shows
+    // `theirs` there (owner ruling 2026-10-26).
     let greeting = TurnEndReading {
         person: Some(Duration::from_secs(8)),
         ..idle(
@@ -185,10 +185,16 @@ fn someone_elses_live_turn_opens_the_face_and_the_policys_own_does_not() {
             Some(Duration::from_secs(5)),
         )
     };
-    at(&mut st, &greeting, t0());
+    let mut st = TurnEndState::default();
+    st.face_start();
+    at(&mut st, &land(greeting.clone()), t0());
     assert_eq!(st.face_moved(), Some(TaskFace::Theirs));
     st.took();
     assert_eq!(st.face_moved(), Some(TaskFace::Open));
+    let mut st = TurnEndState::default();
+    st.face_start();
+    at(&mut st, &greeting, t0());
+    assert_ne!(st.face(), TaskFace::Theirs);
 
     let (mut st, now) = landed();
     st.host_typed(now + MIN, HostTurn::Notice);

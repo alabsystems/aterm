@@ -401,6 +401,12 @@ pub enum Intent {
         /// The asking machine's key (`age1…`).
         recipient: String,
     },
+    /// Restart one of macOS's own services that holds far too much memory, in a tab that asks
+    /// for the administrator's password once (`aterm_vitals::services::RESTARTS`).
+    RestartService {
+        /// The service's name (`fseventsd`), which the host checks against the restarts it knows.
+        service: String,
+    },
 }
 
 const SHOW_TAB: [&str; 10] = [
@@ -465,6 +471,7 @@ impl Intent {
             Self::EndRecovered => "End sessions",
             Self::ReviewVaultSync => "System State",
             Self::ApproveJoin { .. } => "Approve",
+            Self::RestartService { .. } => "Restart",
         }
     }
 
@@ -501,6 +508,7 @@ impl Intent {
             Self::EndRecovered => "End",
             Self::ReviewVaultSync => "System",
             Self::ApproveJoin { .. } => "Approve",
+            Self::RestartService { .. } => "Restart",
         }
     }
 
@@ -555,6 +563,7 @@ impl Intent {
                     ..
                 }
                 | Self::EndRecovered
+                | Self::RestartService { .. }
         )
     }
 
@@ -616,6 +625,9 @@ impl Intent {
             Self::ReviewVaultSync => "review-vault-sync".to_string(),
             Self::ApproveJoin { recipient } => {
                 format!("approve-join:{}", escape_payload(recipient))
+            }
+            Self::RestartService { service } => {
+                format!("restart-service:{}", escape_payload(service))
             }
         }
     }
@@ -689,6 +701,10 @@ impl Intent {
                     && recipient.bytes().all(|b| b.is_ascii_alphanumeric()))
                 .then_some(Self::ApproveJoin { recipient })
             }
+            "restart-service" => {
+                let service = unescape_payload(payload);
+                service_name(&service).then_some(Self::RestartService { service })
+            }
             "agent-upgrade" => {
                 let (word, rest) = payload.split_once(':')?;
                 let (to, tab) = rest.split_once(':')?;
@@ -703,6 +719,16 @@ impl Intent {
             _ => None,
         }
     }
+}
+
+/// Whether `name` can be a service's name an [`Intent::RestartService`] carries: a process's
+/// short name (`p_comm`, at most 16 bytes) of letters, digits, `.`, `_` and `-`.
+#[must_use]
+pub fn service_name(name: &str) -> bool {
+    (1..=16).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn escape_field(s: &str) -> String {
@@ -780,6 +806,9 @@ pub(crate) fn every_intent() -> Vec<Intent> {
         Intent::ReviewVaultSync,
         Intent::ApproveJoin {
             recipient: "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3290gq".into(),
+        },
+        Intent::RestartService {
+            service: "fseventsd".into(),
         },
         Intent::StopPaste { session: 3 },
         Intent::ShowTab { tab: 2, window: 7 },
@@ -1855,9 +1884,18 @@ mod tests {
             "show-session:1:1:",
             "show-session:1:1",
             "show-session:65536:1:s-x",
+            "restart-service:",
+            "restart-service:a b",
+            "restart-service:../x",
+            "restart-service:seventeen-letters",
         ] {
             assert_eq!(Intent::decode(junk), None, "{junk:?}");
         }
+        let restart = Intent::RestartService {
+            service: "fseventsd".into(),
+        };
+        assert_eq!(restart.encode(), "restart-service:fseventsd");
+        assert!(restart.is_consequential() && !restart.ends_with_row() && !restart.is_snooze());
         assert_eq!(
             Intent::decode("open-config-editor:-"),
             Some(Intent::OpenConfigEditor { line: None })

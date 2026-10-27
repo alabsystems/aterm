@@ -15,6 +15,7 @@ use crate::explain::{
     WhySubject, account_of, bare_subject,
 };
 use crate::model::{Snapshot, Throttle};
+use crate::services::{Restart, RowOver};
 use crate::words;
 
 /// Maximum byte length of a `sys why` text reply (including its header) when `top=` is unset.
@@ -23,6 +24,9 @@ pub const REPLY_MAX: usize = 2048;
 fn resolve(q: &SysQuery, snap: Option<&Snapshot>) -> Bare {
     match (q.subject, snap) {
         (Some(subject), _) => Bare::Subject(subject),
+        (None, Some(s)) if crate::scheduling::idle_performance(s).is_some() => {
+            Bare::Subject(WhySubject::Cpu)
+        }
         (None, Some(s)) => bare_subject(s),
         (None, None) => Bare::Subject(WhySubject::Cpu),
     }
@@ -143,18 +147,22 @@ impl<'a> Reading<'a> {
                 .s
                 .cpu
                 .as_ref()
-                .map(|c| (f64::from(c.busy.raw) * 1000.0).round() as i64),
+                .and_then(|c| c.current_busy())
+                .map(|busy| (f64::from(busy) * 1000.0).round() as i64),
         }
     }
 
     fn busy_words(&self) -> String {
         let (Some(cpu), Some(busy)) = (self.s.cpu.as_ref(), self.busy_mc()) else {
-            return "cores measuring (the first sample has no interval)".into();
+            return if self.s.cpu.is_some() {
+                "core utilization unavailable (counters did not advance)".into()
+            } else {
+                "cores measuring (the first sample has no interval)".into()
+            };
         };
         let motion = cpu
-            .busy
-            .motion(words::CORES_GATE)
-            .word()
+            .current_busy()
+            .and_then(|_| cpu.busy.motion(words::CORES_GATE).word())
             .map(|w| format!(", {w}"))
             .unwrap_or_default();
         format!(
@@ -189,6 +197,19 @@ impl<'a> Reading<'a> {
     }
 
     fn headline(&self, subject: WhySubject) -> String {
+        if subject == WhySubject::Mem
+            && let Some(top) = self
+                .a
+                .services
+                .first()
+                .filter(|o| o.size == crate::services::Size::Huge)
+        {
+            return format!(
+                "macOS's {} holds {}",
+                service_word(top),
+                words::mem(top.footprint)
+            );
+        }
         let Some((id, context)) = self.a.headline else {
             return match (subject, self.a.facts.is_some(), self.split_missing()) {
                 (WhySubject::Cpu, false, "warming") => "causes not read yet",
@@ -547,9 +568,38 @@ impl<'a> Reading<'a> {
         line(key, t)
     }
 
+    /// One `cause id=service-memory` line per service past the large bar: its name, user,
+    /// footprint and size for every caller (a system account's, never a person's), its pid and
+    /// coalition for the owner's.
+    fn service_lines(&self) -> Vec<Line> {
+        self.a
+            .services
+            .iter()
+            .map(|o| {
+                let mut t = format!(
+                    "cause id=service-memory exe={} uid={} fp_bytes={} size={} restart={}",
+                    service_word(o),
+                    rec(o.lead.uid, "not_sampled"),
+                    o.footprint,
+                    o.size.word(),
+                    o.restart.map_or("none", |r| r.name)
+                );
+                if self.ctx.owner_class {
+                    t.push_str(&format!(" pid={} coalition={}", o.lead.pid, o.coalition));
+                }
+                t.push_str(" sure=held src=kernel");
+                line(format!("cause service-memory {}", o.coalition), t)
+            })
+            .collect()
+    }
+
     fn pass_word(&self, subject: WhySubject) -> Option<&'static str> {
         let motion = match subject {
-            WhySubject::Cpu => self.s.cpu.as_ref()?.busy.motion(words::CORES_GATE),
+            WhySubject::Cpu => {
+                let cpu = self.s.cpu.as_ref()?;
+                cpu.current_busy()?;
+                cpu.busy.motion(words::CORES_GATE)
+            }
             WhySubject::Mem => self
                 .s
                 .global
@@ -561,7 +611,15 @@ impl<'a> Reading<'a> {
 
     fn pass_json(&self, subject: WhySubject) -> Jv {
         self.pass_word(subject)
-            .map_or_else(|| Jv::why("warming"), Jv::s)
+            .map_or_else(|| Jv::why(self.pass_unavailable(subject)), Jv::s)
+    }
+
+    fn pass_unavailable(&self, subject: WhySubject) -> &'static str {
+        if subject == WhySubject::Cpu && self.s.cpu.is_some() {
+            "no_counter_delta"
+        } else {
+            "warming"
+        }
     }
 
     fn tail(&self, subject: WhySubject) -> Vec<Line> {
@@ -569,12 +627,23 @@ impl<'a> Reading<'a> {
             "pass",
             format!(
                 "pass trend={} src=kernel",
-                self.pass_word(subject)
-                    .map_or_else(|| unavailable("warming"), str::to_owned)
+                self.pass_word(subject).map_or_else(
+                    || unavailable(self.pass_unavailable(subject)),
+                    str::to_owned
+                )
             ),
         )];
         if self.a.nothing_needed {
             out.push(line("do none", "do class=none may=agent destructive=0"));
+        }
+        if let Some(r) = restart_offered(&self.a) {
+            out.push(line(
+                "do restart",
+                format!(
+                    "do class=restart service={} may=person destructive=1",
+                    r.name
+                ),
+            ));
         }
         for (what, why) in &self.a.cannot {
             out.push(line(
@@ -696,7 +765,11 @@ pub fn why_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>
         head.push(Reading::owners_line(&ranked));
     }
     let mut tail: Vec<Line> = w.causes().map(|c| w.cause_line(c)).collect();
+    tail.extend(w.service_lines());
     tail.extend(w.tail(subject));
+    if subject == WhySubject::Cpu && crate::scheduling::idle_performance(s).is_some() {
+        tail.push(line("scheduling-observation", "scheduling runnable-wait-with-idle-performance cause=unproven; inspect sys cores and sys procs for worker policy, measured intervals and the active diagnostic executable"));
+    }
     let mut rows = Rows::of(&w, &ranked, q.top);
     loop {
         let body = rows.lines(&w, subject);
@@ -726,6 +799,19 @@ pub fn why_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>
             return;
         }
     }
+}
+
+/// A service's name as a reply prints it: its image's basename, or `-`.
+fn service_word(o: &RowOver) -> &str {
+    exe_word(o.lead.exe.as_deref().unwrap_or("-"))
+}
+
+/// The restart a reply offers ([`Account::restart`]): the largest service's whose restart is
+/// due (past the huge bar while memory is under pressure) and not put off by the person. It is
+/// destructive (`destructive=1`): the restarted service discards what it kept (fseventsd the
+/// volume's change history, which Time Machine and Spotlight then rebuild by a scan).
+const fn restart_offered(a: &Account) -> Option<&'static Restart> {
+    a.restart
 }
 
 fn fact(fact: &str, key: &str, value: Jv, src: &str) -> Jv {
@@ -785,8 +871,10 @@ impl Reading<'_> {
             WhySubject::Cpu => Jv::obj([
                 (
                     "cpu_mc",
-                    self.busy_mc()
-                        .map_or_else(|| Jv::why("warming"), |mc| Jv::u(nonneg(mc))),
+                    self.busy_mc().map_or_else(
+                        || Jv::why(self.pass_unavailable(subject)),
+                        |mc| Jv::u(nonneg(mc)),
+                    ),
                 ),
                 (
                     "capacity_mc",
@@ -947,6 +1035,36 @@ impl Reading<'_> {
         ])
     }
 
+    /// [`Self::service_lines`] as JSON causes.
+    fn service_json(&self) -> Vec<Jv> {
+        self.a
+            .services
+            .iter()
+            .map(|o| {
+                let mut o_json = Jv::obj([
+                    ("cause", Jv::s("service-memory")),
+                    ("sure", Jv::s("held")),
+                    ("exe", Jv::s(service_word(o))),
+                    ("size", Jv::s(o.size.word())),
+                ]);
+                if let Some(r) = o.restart {
+                    o_json.set("restart", Jv::s(r.name));
+                }
+                if self.ctx.owner_class {
+                    o_json.set("pid", Jv::u(u64::from(o.lead.pid)));
+                    o_json.set("coalition", Jv::u(o.coalition));
+                }
+                let mut evidence =
+                    vec![fact("footprint", "fp_bytes", Jv::u(o.footprint), "kernel")];
+                if let Some(uid) = o.lead.uid {
+                    evidence.push(fact("user", "uid", Jv::u(u64::from(uid)), "kernel"));
+                }
+                o_json.set("evidence", Jv::Arr(evidence));
+                o_json
+            })
+            .collect()
+    }
+
     fn cause_json(&self, c: &Shown) -> Jv {
         let cause = &c.cause;
         let mut o = Jv::obj([("cause", Jv::s(cause.id.word())), ("sure", Jv::s("held"))]);
@@ -1097,7 +1215,12 @@ pub fn why_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, o: &mut Jv) {
     }
     o.set(
         "causes",
-        Jv::Arr(w.causes().map(|c| w.cause_json(c)).collect()),
+        Jv::Arr(
+            w.causes()
+                .map(|c| w.cause_json(c))
+                .chain(w.service_json())
+                .collect(),
+        ),
     );
     o.set(
         "pass",
@@ -1105,15 +1228,26 @@ pub fn why_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, o: &mut Jv) {
     );
     o.set(
         "do",
-        Jv::Arr(if w.a.nothing_needed {
-            vec![Jv::obj([
-                ("class", Jv::s("none")),
-                ("may", Jv::s("agent")),
-                ("destructive", Jv::Int(0)),
-            ])]
-        } else {
-            Vec::new()
-        }),
+        Jv::Arr(
+            w.a.nothing_needed
+                .then(|| {
+                    Jv::obj([
+                        ("class", Jv::s("none")),
+                        ("may", Jv::s("agent")),
+                        ("destructive", Jv::Int(0)),
+                    ])
+                })
+                .into_iter()
+                .chain(restart_offered(&w.a).map(|r| {
+                    Jv::obj([
+                        ("class", Jv::s("restart")),
+                        ("service", Jv::s(r.name)),
+                        ("may", Jv::s("person")),
+                        ("destructive", Jv::Int(1)),
+                    ])
+                }))
+                .collect(),
+        ),
     );
     o.set(
         "cannot",

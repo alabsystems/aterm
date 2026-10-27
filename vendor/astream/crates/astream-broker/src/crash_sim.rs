@@ -2460,9 +2460,10 @@ fn the_outcome_unknown_resend_after_a_poison_lands_exactly_once() {
         (3, "/o/b", b"machine chatter after it"),
     ];
     let c = Controls::default();
-    // Room for every image of every epoch prefix: 2^13 subsets of Relaxed's 13 volatile
-    // blocks, each with and without the size change, is 2^14.
-    const IMAGES: usize = 1 << 15;
+    // Room for every image of every epoch prefix: 2^15 subsets of Relaxed's 15 volatile
+    // blocks (including each record's 9-byte `bt` trailer), each with and without the
+    // size change, is 2^16.
+    const IMAGES: usize = 1 << 17;
     let mut rng = Rng(0x0D0B_1E5E);
     for tier in [ORDERED, Durability::Relaxed] {
         let sim = Sim::with(Device::new(16));

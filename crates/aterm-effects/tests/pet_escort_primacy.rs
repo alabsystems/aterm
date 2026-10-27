@@ -2,7 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The escort is the pet's default life: ordinary typing matches a twin brain with
-//! `set_console_presentable(false)`.
+//! `set_console_presentable(false)` that hears the same keys (the hand's keys are the
+//! host's fact, not the console layer's: the first key springs both cats ahead of the
+//! writing, `PetBrain::first_keys_spring`).
 
 use std::time::{Duration, Instant};
 
@@ -142,6 +144,7 @@ fn plain_typing_is_the_pet_with_no_console_layer() {
         live.term.process(&ch);
         bare.term.process(&ch);
         live.brain.note_console_input(now, PetInputKind::Text);
+        bare.brain.note_console_input(now, PetInputKind::Text);
         for _ in 0..13 {
             now += Duration::from_millis(16);
             let a = live.tick(now);

@@ -16,11 +16,11 @@
 //! perf` runs every floor lane. The ARENA lanes ([`arena`]) open real
 //! windows and take minutes; they run only when named, and what they measure
 //! has no floor, so they report MEASURED, never a pass. The MEASURED lanes
-//! ([`fabric`], [`aos`]) are headless but just as unjudgeable — their numbers
-//! are a disk's fsync, or a shared desk's scheduler, before they are aterm's —
-//! so they too run only when named and report MEASURED (fabric writing a
-//! ledger entry under `docs/measured/fabric/`, aos a summary, and its JSON with
-//! `--json-out`).
+//! ([`fabric`], [`restore_e2e`], [`aos`]) are headless but just as unjudgeable —
+//! their numbers are a disk's fsync, or a shared desk's scheduler, before they
+//! are aterm's — so they too run only when named and report MEASURED (fabric
+//! writing a ledger entry under `docs/measured/fabric/`, restore-e2e one under
+//! `docs/measured/restore/`, aos a summary, and its JSON with `--json-out`).
 //!
 //! `--no-windows` (the house switch for an agent sharing the owner's desktop)
 //! turns every lane that opens a window into a named skip and runs the rest.
@@ -38,10 +38,14 @@ use aterm_capacity::Machine as _;
 mod aos;
 #[cfg(unix)]
 pub(crate) mod arena;
+#[cfg(unix)]
+mod bench_build;
 mod driver;
 #[cfg(unix)]
 mod fabric;
 mod floors;
+#[cfg(unix)]
+mod restore_e2e;
 #[cfg(unix)]
 mod stats;
 mod trend;
@@ -101,6 +105,8 @@ pub(crate) enum Lane {
     Resize,
     Zstd,
     Effects,
+    TrailDarkComposer,
+    TrailLightComposer,
     Wasm,
     Start,
     Compare,
@@ -108,6 +114,7 @@ pub(crate) enum Lane {
     Scroll,
     Vte,
     Fabric,
+    RestoreE2e,
     Aos,
 }
 
@@ -124,7 +131,7 @@ pub(crate) enum Kind {
 }
 
 impl Lane {
-    pub(crate) const ALL: [Lane; 17] = [
+    pub(crate) const ALL: [Lane; 20] = [
         Lane::Throughput,
         Lane::Pathological,
         Lane::ScrollScrub,
@@ -134,6 +141,8 @@ impl Lane {
         Lane::Resize,
         Lane::Zstd,
         Lane::Effects,
+        Lane::TrailDarkComposer,
+        Lane::TrailLightComposer,
         Lane::Wasm,
         Lane::Start,
         Lane::Compare,
@@ -141,6 +150,7 @@ impl Lane {
         Lane::Scroll,
         Lane::Vte,
         Lane::Fabric,
+        Lane::RestoreE2e,
         Lane::Aos,
     ];
 
@@ -155,6 +165,8 @@ impl Lane {
             Lane::Resize => "resize",
             Lane::Zstd => "zstd",
             Lane::Effects => "effects",
+            Lane::TrailDarkComposer => "trail-dark-composer",
+            Lane::TrailLightComposer => "trail-light-composer",
             Lane::Wasm => "wasm",
             Lane::Start => "start",
             Lane::Compare => "compare",
@@ -162,6 +174,7 @@ impl Lane {
             Lane::Scroll => "scroll",
             Lane::Vte => "vte",
             Lane::Fabric => "fabric",
+            Lane::RestoreE2e => "restore-e2e",
             Lane::Aos => "aos",
         }
     }
@@ -177,9 +190,11 @@ impl Lane {
             | Lane::Resize
             | Lane::Zstd
             | Lane::Effects
+            | Lane::TrailDarkComposer
+            | Lane::TrailLightComposer
             | Lane::Wasm => Kind::Floor,
             Lane::Start | Lane::Compare | Lane::Cat | Lane::Scroll | Lane::Vte => Kind::Arena,
-            Lane::Fabric | Lane::Aos => Kind::Measured,
+            Lane::Fabric | Lane::RestoreE2e | Lane::Aos => Kind::Measured,
         }
     }
 
@@ -208,6 +223,14 @@ impl Lane {
                 "harness card, cursor glow and inline-scroll frames: emission, CPU raster, GPU \
                  encode and GPU time, and the pass-economy ablation"
             }
+            Lane::TrailDarkComposer => {
+                "the cursor trail typed to a 117-cell line in Claude Code's composer, on the dark \
+                 ground (Default): emission, CPU raster, GPU encode and GPU time"
+            }
+            Lane::TrailLightComposer => {
+                "trail-dark-composer's scene on Default Light, the trail's light (paper) arm: \
+                 emission, CPU raster, GPU encode and GPU time"
+            }
             Lane::Wasm => {
                 "the shipped wasm modules in the pinned chrome-headless-shell, plus their \
                  module-size ceilings"
@@ -220,6 +243,13 @@ impl Lane {
             Lane::Fabric => {
                 "fabric post->deliver latency, burst throughput, request/reply ping-pong, attach \
                  time and records per message over a real broker, bridge and headless aterm"
+            }
+            Lane::RestoreE2e => {
+                "a crashed window's tabs back for 1, 8 and 32 sessions: this build's keeper, a \
+                 headless instance SIGKILLed by its own pid, its successor's spawn to the keeper's \
+                 HELLO answered, the one-after-another admission of the offers, every recovered \
+                 session placed and its history imported, and the first ctl request served past \
+                 the recovery-count fence, per arm (clean, copy, lookalike)"
             }
             Lane::Aos => {
                 "the momentum glow hosted under Aos on one recorded typing story: per-call cost \
@@ -240,9 +270,9 @@ impl Lane {
             | Lane::CrashRestore
             | Lane::Resize
             | Lane::Zstd => "targo (release build of aterm-bench)",
-            Lane::Effects => {
+            Lane::Effects | Lane::TrailDarkComposer | Lane::TrailLightComposer => {
                 "targo (release build of aterm-bench with dev-seams), a GPU (its GPU keys need \
-                 Metal, or wgpu with timestamp queries)"
+                 Metal's clock)"
             }
             Lane::Wasm => {
                 "chrome-headless-shell (verify provision), rustup stable + \
@@ -263,6 +293,10 @@ impl Lane {
             }
             Lane::Fabric => {
                 "unix, targo (builds aterm and its fabric_bench bench: test, or opt-test with \
+                 --profile opt)"
+            }
+            Lane::RestoreE2e => {
+                "macOS, targo (builds aterm and its restore_bench bench: test, or opt-test with \
                  --profile opt)"
             }
             Lane::Aos => {
@@ -397,7 +431,14 @@ struct OptSpec {
 }
 
 const START_LANES: &[Lane] = &[Lane::Start, Lane::Compare];
-const JSON_LANES: &[Lane] = &[Lane::Start, Lane::Compare, Lane::Fabric, Lane::Aos];
+const JSON_LANES: &[Lane] = &[
+    Lane::Start,
+    Lane::Compare,
+    Lane::Fabric,
+    Lane::RestoreE2e,
+    Lane::Aos,
+];
+const BUILT_LANES: &[Lane] = &[Lane::Fabric, Lane::RestoreE2e];
 const GHOSTTY_LANES: &[Lane] = &[Lane::Cat, Lane::Vte];
 const BENCH_BOX_LANES: &[Lane] = &[Lane::Cat, Lane::Scroll, Lane::Vte];
 
@@ -530,7 +571,7 @@ const OPTIONS: &[OptSpec] = &[
     },
     OptSpec {
         flag: "--scenario",
-        value: Some("all|messaging|pingpong|attach|handoff"),
+        value: Some("all|messaging|pingpong|attach|handoff|ask"),
         lanes: &[Lane::Fabric],
         help: "measure only this fabric scenario (default all)",
     },
@@ -565,6 +606,13 @@ const OPTIONS: &[OptSpec] = &[
         help: "bridge restarts measured per session count (default 3)",
     },
     OptSpec {
+        flag: "--attach-backlog",
+        value: Some("N"),
+        lanes: &[Lane::Fabric],
+        help: "records filled behind every attach session's refill watermark, after each one's \
+               note is seen, with a paced publisher timing the writer's stall (default 0: none)",
+    },
+    OptSpec {
         flag: "--durability",
         value: Some("TIER,..."),
         lanes: &[Lane::Fabric],
@@ -596,7 +644,22 @@ const OPTIONS: &[OptSpec] = &[
         flag: "--bystanders",
         value: Some("N"),
         lanes: &[Lane::Fabric],
-        help: "idle sessions spawned beside the messaging and ping-pong worlds' two (default 0)",
+        help: "idle sessions spawned beside the messaging, ping-pong and ask worlds' talking \
+               sessions (default 0)",
+    },
+    OptSpec {
+        flag: "--asks",
+        value: Some("N"),
+        lanes: &[Lane::Fabric],
+        help: "posts per leg of the ask scenario: each kind's idle releases, the busy ones, the \
+               receipts and the person-lane asks without a pager and with one (default 100)",
+    },
+    OptSpec {
+        flag: "--mix-every",
+        value: Some("N"),
+        lanes: &[Lane::Fabric],
+        help: "the ask scenario's escalated mix: one person-lane post before every Nth ordinary \
+               message (default 10)",
     },
     OptSpec {
         flag: "--horizon-ms",
@@ -608,15 +671,48 @@ const OPTIONS: &[OptSpec] = &[
     OptSpec {
         flag: "--passes",
         value: Some("N"),
-        lanes: &[Lane::Fabric],
+        lanes: BUILT_LANES,
         help: "run the arm list N times, forward then backward: A B B A (default 1)",
     },
     OptSpec {
         flag: "--profile",
         value: Some("dev|opt"),
-        lanes: &[Lane::Fabric],
+        lanes: BUILT_LANES,
         help: "the build measured: dev (default) or opt (cargo profile opt-test: opt-level 3, \
                debug assertions on)",
+    },
+    OptSpec {
+        flag: "--sessions",
+        value: Some("N,N,..."),
+        lanes: &[Lane::RestoreE2e],
+        help: "rising session counts one crash takes down (default 1,8,32)",
+    },
+    OptSpec {
+        flag: "--rounds",
+        value: Some("N"),
+        lanes: &[Lane::RestoreE2e],
+        help: "crashes and recoveries per session count (default 3)",
+    },
+    OptSpec {
+        flag: "--lines",
+        value: Some("N"),
+        lanes: &[Lane::RestoreE2e],
+        help: "history lines each session prints before the crash (default 5000)",
+    },
+    OptSpec {
+        flag: "--arm",
+        value: Some("clean|copy|lookalike,..."),
+        lanes: &[Lane::RestoreE2e],
+        help: "the arms, one run and one ledger entry each (default all three): clean (what \
+               ships), copy (each region restored from a heap copy) and lookalike (that copy with \
+               the look-alike tail planted); the seam's own copy and plant are off the readings",
+    },
+    OptSpec {
+        flag: "--lookalike-kib",
+        value: Some("N"),
+        lanes: &[Lane::RestoreE2e],
+        help: "the lookalike arm's look-alikes past each ring's commit, in KiB, stopping at the \
+               ring's lap (default 6912)",
     },
     OptSpec {
         flag: "--no-windows",
@@ -776,8 +872,8 @@ fn list() -> String {
             }
             Kind::Measured => {
                 "MEASURED lanes (only when named; headless, real processes, minutes; measured, \
-                 not judged: fabric writes a docs/measured/fabric entry, aos prints a summary, \
-                 and JSON with --json-out)\n"
+                 not judged: fabric writes a docs/measured/fabric entry, restore-e2e a \
+                 docs/measured/restore entry, aos prints a summary, and JSON with --json-out)\n"
             }
         });
         for lane in Lane::ALL.into_iter().filter(|l| l.kind() == kind) {
@@ -813,11 +909,24 @@ fn options_for(
 
 /// Each lane family's own options, parsed — before any lane runs, so a bad
 /// value is a usage error (exit 2) and never a lane that failed after a build.
+/// A measured lane's parser runs only when its lane is named: `--json-out`,
+/// `--profile` and `--passes` are shared, and one lane's rules for them never
+/// refuse the other's run.
 #[cfg(unix)]
-fn lane_args(cli: &Cli) -> Result<(arena::Args, fabric::Args), String> {
+fn lane_args(cli: &Cli) -> Result<(arena::Args, fabric::Args, restore_e2e::Args), String> {
+    let named = |lane: Lane| cli.lanes.contains(&lane);
     Ok((
         arena::Args::from_options(&options_for(&cli.options, |l| l.kind() == Kind::Arena))?,
-        fabric::Args::from_options(&options_for(&cli.options, |l| l == Lane::Fabric))?,
+        if named(Lane::Fabric) {
+            fabric::Args::from_options(&options_for(&cli.options, |l| l == Lane::Fabric))?
+        } else {
+            fabric::Args::default()
+        },
+        if named(Lane::RestoreE2e) {
+            restore_e2e::Args::from_options(&options_for(&cli.options, |l| l == Lane::RestoreE2e))?
+        } else {
+            restore_e2e::Args::default()
+        },
     ))
 }
 
@@ -854,7 +963,7 @@ fn main(args: &[String]) -> ExitCode {
         }
     };
     #[cfg(unix)]
-    let (arena_args, fabric_args) = match lane_args(&cli) {
+    let (arena_args, fabric_args, restore_args) = match lane_args(&cli) {
         Ok(a) => a,
         Err(why) => {
             eprintln!("verify perf: {why}\n\n{}", usage());
@@ -901,7 +1010,9 @@ fn main(args: &[String]) -> ExitCode {
             Lane::CrashRestore => floors::gate_crash_restore(record),
             Lane::Resize => floors::gate_resize(record),
             Lane::Zstd => floors::gate_keyed(&floors::ZSTD_LANE, record),
-            Lane::Effects => floors::gate_effects(record),
+            Lane::Effects => floors::gate_effects(&floors::EFFECTS, record),
+            Lane::TrailDarkComposer => floors::gate_effects(&floors::TRAIL_DARK_COMPOSER, record),
+            Lane::TrailLightComposer => floors::gate_effects(&floors::TRAIL_LIGHT_COMPOSER, record),
             Lane::Wasm => wasm::gate_wasm(record),
             #[cfg(unix)]
             Lane::Start => arena::start::run(&arena_args),
@@ -924,6 +1035,13 @@ fn main(args: &[String]) -> ExitCode {
             Lane::Fabric => LaneRun::skip(
                 "the fabric bridge is unix-only (aterm-link)",
                 "run it on macOS or Linux",
+            ),
+            #[cfg(unix)]
+            Lane::RestoreE2e => restore_e2e::run(&restore_args),
+            #[cfg(not(unix))]
+            Lane::RestoreE2e => LaneRun::skip(
+                "the crash-restore journal's live lane is macOS-only",
+                "run it on a Mac",
             ),
             #[cfg(unix)]
             Lane::Aos => aos::run(cli.options.get("--json-out").map(Path::new)),
@@ -1102,6 +1220,8 @@ mod tests {
                 Lane::Resize,
                 Lane::Zstd,
                 Lane::Effects,
+                Lane::TrailDarkComposer,
+                Lane::TrailLightComposer,
                 Lane::Wasm
             ]
         );
@@ -1215,7 +1335,7 @@ mod tests {
              --attach-rounds 2 --durability relaxed --json-out /tmp/f.json --no-windows --admit now",
         ))
         .expect("parses");
-        let (_, fabric_args) = lane_args(&cli).expect("both parsers take it");
+        let (_, fabric_args, _) = lane_args(&cli).expect("both parsers take it");
         assert_eq!(fabric_args.scenario.word(), "pingpong");
         assert_eq!(fabric_args.burst, Some(200));
         assert_eq!(fabric_args.pingpong, Some(30));
@@ -1243,8 +1363,28 @@ mod tests {
             assert!(lane_args(&cli).is_err(), "{line}");
         }
         let cli = parse(&args("fabric --profile opt --no-windows")).expect("parses");
-        let (_, fabric_args) = lane_args(&cli).expect("parses");
+        let (_, fabric_args, _) = lane_args(&cli).expect("parses");
         assert_eq!(fabric_args.profile.name(), "opt");
+        let cli = parse(&args(
+            "restore-e2e --sessions 2,4 --arm copy --json-out /tmp/r.json --profile opt \
+             --no-windows",
+        ))
+        .expect("parses");
+        let (_, _, restore_args) = lane_args(&cli).expect("the restore parser takes it");
+        assert_eq!(restore_args.sessions, Some(vec![2, 4]));
+        assert_eq!(restore_args.profile.name(), "opt");
+        assert_eq!(restore_args.plan().len(), 1);
+        for line in [
+            "restore-e2e --sessions 4,2",
+            "restore-e2e --json-out /tmp/r.json",
+        ] {
+            let cli = parse(&args(line)).expect(line);
+            assert!(lane_args(&cli).is_err(), "{line}");
+        }
+        assert!(
+            parse(&args("fabric --sessions 4")).is_err(),
+            "restore-e2e's alone"
+        );
         let why = parse(&args("start --profile opt")).unwrap_err();
         assert!(why.contains("--profile") && why.contains("fabric"), "{why}");
     }

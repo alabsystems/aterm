@@ -43,12 +43,15 @@ pub const RECLAIM_GONE_UNDER_PRESSURE: Duration = Duration::from_secs(10 * 60);
 /// Any build directory goes once unwritten this long, whatever its workspace's state: it is a cache, and a month on the compiler has usually moved and cargo would rebuild anyway.
 pub const RECLAIM_IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+/// A build directory under the root the cache moved from ([`moved_from`]) goes whole once unwritten this long with no build holding its locks ([`reclaim_moved`]), and the root once empty. No build of this version writes there, so nothing is moved into the new root: cargo keeps absolute paths in a build directory (build scripts' output, dep-info), so a moved one would rebuild anyway, and new builds make the new root before a pass runs. Only a shim laid before the move, or a checkout's verify built from older code, still builds there; it holds cargo's locks while it does, and an hour quiet means it has stopped, at worst costing that checkout one fresh build in whichever root its code names.
+pub const MOVED_AFTER: Duration = Duration::from_secs(60 * 60);
+
 /// The shim's half, rendered ahead of a `targo`/`targo-tippy` shim's `exec` on macOS:
 /// shell builtins only.
 const SH_BLOCK: &str = r#"# aterm: build intermediates out of Spotlight
 __atb_t=
-__atb_c=${HOME-}/Library/Caches/aterm/cargo-build.noindex
-__atb= __atb_k= __atb_e= __atb_T= __atb_tf= __atb_tn= __atb_D= __atb_al= __atb_ab=
+__atb_c=${HOME-}/Library/Caches/aterm/.ubd/cargo-build.noindex
+__atb= __atb_k= __atb_e= __atb_T= __atb_tf= __atb_tn= __atb_D= __atb_al= __atb_ab= __atb_q= __atb_v=
 case ${HOME-} in /?*) case ${PWD-} in "$HOME"/*) __atb=1 ;; esac ;; esac
 case ${HOME-} in *[\'[:cntrl:]]*) __atb= ;; esac
 case ${HOME-}${PWD-} in *[{}]*) __atb= ;; esac
@@ -122,6 +125,18 @@ if [ -n "$__atb" ]; then
     *) [ -n "$__atb_u" ] && __atb_k=1 __atb_al=1 || __atb= ;;
   esac
 fi
+# aterm: a test run's scratch out of fseventsd's stream, in $TMPDIR's .ubd folder once one is this user's
+case $__atb_v in
+  test | t | bench)
+    case ${TMPDIR-} in
+      */.ubd/* | */.ubd) ;;
+      /?*)
+        __atb_q=${TMPDIR%/}/.ubd
+        if [ -d "$__atb_q" ] && [ ! -h "$__atb_q" ] && [ -O "$__atb_q" ]; then TMPDIR=$__atb_q/; export TMPDIR; fi
+        ;;
+    esac
+    ;;
+esac
 if [ -n "$__atb" ]; then
   __atb_d=$PWD
   while [ -n "$__atb" ]; do
@@ -186,6 +201,7 @@ pub fn with_build_dir_here(args: &[String], tool: Tool) -> Option<Vec<String>> {
         tool,
         &Machine {
             home: home.as_deref(),
+            root: None,
             cwd: cwd.as_deref(),
             env: &|name| std::env::var_os(name),
             read: &read_config,
@@ -195,16 +211,21 @@ pub fn with_build_dir_here(args: &[String], tool: Tool) -> Option<Vec<String>> {
 }
 
 /// [`with_build_dir`] on this process's machine for a nested `targo` it starts at `cwd`, a
-/// checkout it names: what the shim hands a build typed there (Trust's `$CARGO` is the store's
-/// `targo` itself, past the shim); `None` off macOS.
+/// checkout it names: what the shim on `$PATH` hands a build typed there, in the cache root that
+/// shim names ([`shim_root`]; Trust's `$CARGO` is the store's `targo` itself, past the shim);
+/// `None` off macOS.
 #[must_use]
 pub fn with_build_dir_from(args: &[String], tool: Tool, cwd: &Path) -> Option<Vec<String>> {
     if !cfg!(target_os = "macos") {
         return None;
     }
     let home = aterm_types::dirs::home_dir();
+    let root = home
+        .as_deref()
+        .map(|home| shim_root(home, &std::env::var_os("PATH").unwrap_or_default()));
     let m = Machine {
         home: home.as_deref(),
+        root: root.as_deref(),
         cwd: None,
         env: &|name| std::env::var_os(name),
         read: &read_config,
@@ -266,6 +287,8 @@ pub enum Unused {
     Gone { idle: Duration, after: Duration },
     /// Nothing wrote it for `idle`, [`RECLAIM_IDLE`] or more: it goes whatever its workspace's state, which was not looked at — it may still be there.
     Idle { idle: Duration },
+    /// It is under the root the cache moved from ([`moved_from`]), which no build of this version writes, and nothing wrote it for `idle`, at least `after` ([`MOVED_AFTER`]): it goes whatever its workspace's state.
+    Moved { idle: Duration, after: Duration },
     /// What an earlier pass renamed aside and did not finish removing.
     Unfinished,
     /// A completed pinned tool of the tooling cache nothing ran for `idle`, at least `after` ([`RECLAIM_IDLE`]).
@@ -305,11 +328,40 @@ pub fn reclaim_watched(
             now,
             gone_after,
             placing,
+            moved: false,
             compiler_store: compiler_store(home),
             record,
             removed: &mut removed,
         };
         sweep.walk(root, 0);
+    }
+    removed
+}
+
+/// THE ROOT THE CACHE MOVED FROM, emptied ([`MOVED_AFTER`]): each build directory under `root` that nothing wrote for [`MOVED_AFTER`] goes whole, its locks held as [`reclaim_watched`] holds them ([`Unused::Moved`]), whatever its workspace's state; nothing is pruned in part, and a build directory a build holds or wrote within the hour stays for a later pass. The root itself goes once nothing is left in it and it is as quiet, or this pass emptied it. `record` is asked before each removal.
+pub fn reclaim_moved(
+    root: &Path,
+    now: SystemTime,
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+) -> Vec<(PathBuf, Unused)> {
+    let mut removed = Vec::new();
+    if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
+        let quiet = last_written(root).is_some_and(|t| age(now, t) >= MOVED_AFTER);
+        let mut sweep = Sweep {
+            root,
+            home: None,
+            now,
+            gone_after: MOVED_AFTER,
+            placing: None,
+            moved: true,
+            compiler_store: None,
+            record,
+            removed: &mut removed,
+        };
+        let any = sweep.walk(root, 0);
+        if quiet || any {
+            let _ = std::fs::remove_dir(root);
+        }
     }
     removed
 }
@@ -323,6 +375,8 @@ struct Sweep<'a> {
     gone_after: Duration,
     /// What places a workspace nested in a removed checkout ([`checkout::gone_placed`]).
     placing: Option<&'a checkout::Placing>,
+    /// `root` is the one the cache moved from ([`reclaim_moved`]): each build directory goes whole once [`MOVED_AFTER`] quiet, or stays whole.
+    moved: bool,
     /// Independently admitted actual store; unknown keeps compiler-classified units.
     compiler_store: Option<PathBuf>,
     /// Asked before each removal, its locks held: `false` keeps it.
@@ -463,10 +517,19 @@ impl Sweep<'_> {
         for child in children {
             let name = child.file_name().unwrap_or_default();
             if name == LEAF {
-                let Some((held, why)) = workspace_of(root, dir)
-                    .and_then(|ws| unused(&ws, &child, home, now, self.gone_after, self.placing))
-                else {
-                    any |= self.prune(dir, &child);
+                let judged = if self.moved {
+                    unused(&child, &|seen| moved(seen, now))
+                } else {
+                    workspace_of(root, dir).and_then(|ws| {
+                        unused(&child, &|seen| {
+                            whole(&ws, seen, home, now, self.gone_after, self.placing)
+                        })
+                    })
+                };
+                let Some((held, why)) = judged else {
+                    if !self.moved {
+                        any |= self.prune(dir, &child);
+                    }
                     continue;
                 };
                 if !(self.record)(&child, why) {
@@ -513,22 +576,28 @@ fn workspace_of(root: &Path, dir: &Path) -> Option<PathBuf> {
     Some(Path::new("/").join(rel))
 }
 
-/// `leaf`'s build locks, held, and why it goes ([`Unused`]), when nobody builds into
-/// `leaf`, `workspace`'s build directory, any more: idle long enough, no build holding a
-/// lock, and nothing written since it was first looked at.
+/// `leaf`'s build locks, held, and why it goes ([`Unused`]), when nobody builds into the
+/// build directory `leaf` any more: `judge` says why it goes from what [`look`] sees (idle
+/// long enough), no build holds a lock, and nothing was written since it was first looked at.
 fn unused(
-    workspace: &Path,
     leaf: &Path,
-    home: Option<&Path>,
-    now: SystemTime,
-    gone_after: Duration,
-    placing: Option<&checkout::Placing>,
+    judge: &dyn Fn(&Seen) -> Option<Unused>,
 ) -> Option<(Vec<crate::lock::Flock>, Unused)> {
     let seen = look(leaf)?;
-    let why = whole(workspace, &seen, home, now, gone_after, placing)?;
+    let why = judge(&seen)?;
     let held = hold(&seen.locks)?;
     let again = look(leaf)?;
     (again.newest == seen.newest && again.locks == seen.locks).then_some((held, why))
+}
+
+/// Why a build directory under the root the cache moved from, as [`look`] `seen` it, goes
+/// whole: nothing wrote it for [`MOVED_AFTER`].
+fn moved(seen: &Seen, now: SystemTime) -> Option<Unused> {
+    let idle = age(now, seen.newest);
+    (idle >= MOVED_AFTER).then_some(Unused::Moved {
+        idle,
+        after: MOVED_AFTER,
+    })
 }
 
 /// Why the build directory of `workspace`, as [`look`] `seen` it, goes whole: idle at least
@@ -568,6 +637,63 @@ fn hold(locks: &[PathBuf]) -> Option<Vec<crate::lock::Flock>> {
             crate::lock::Flock::try_lock(std::fs::File::open(lock).ok()?).ok()
         })
         .collect()
+}
+
+/// How deep [`remove_unbuilt`] looks for cargo's locks: a cells lane builds
+/// `<cell>/<triple>/<profile>` under its target directory.
+const UNBUILT_DEPTH: usize = 5;
+
+/// A cargo target or build directory `dir` that a tool of this repository no longer builds in,
+/// removed whole once no build holds any of its cargo locks ([`CARGO_LOCKS`], up to
+/// [`UNBUILT_DEPTH`] folders down, never through a link): every lock taken without waiting and
+/// looked for again, then `dir` renamed aside to `<dir>.removing` and removed under them.
+/// Builds resolving the original path after its rename get a fresh directory.
+/// A folder an earlier call left aside is removed first. `Ok(false)`: `dir` is no directory, or a
+/// build holds a lock (or one is no regular file, or one came meanwhile), and it stays.
+///
+/// # Errors
+/// A directory scan, an entry's metadata, the rename or a removal failed.
+pub fn remove_unbuilt(dir: &Path) -> std::io::Result<bool> {
+    let mut aside = dir.as_os_str().to_owned();
+    aside.push(".removing");
+    let aside = PathBuf::from(aside);
+    if std::fs::symlink_metadata(&aside).is_ok_and(|m| m.is_dir()) {
+        std::fs::remove_dir_all(&aside)?;
+    }
+    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        return Ok(false);
+    }
+    let locks = locks_under(dir)?;
+    let Some(held) = hold(&locks) else {
+        return Ok(false);
+    };
+    if locks_under(dir)? != locks {
+        return Ok(false);
+    }
+    std::fs::rename(dir, &aside)?;
+    std::fs::remove_dir_all(&aside)?;
+    drop(held);
+    Ok(true)
+}
+
+/// Cargo's locks under `dir` to [`UNBUILT_DEPTH`] folders down, sorted; no link is followed.
+fn locks_under(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut locks = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), 0)];
+    while let Some((at, depth)) = stack.pop() {
+        for entry in std::fs::read_dir(&at)? {
+            let entry = entry?;
+            if CARGO_LOCKS.iter().any(|lock| entry.file_name() == *lock) {
+                // Keep every lock pathname for `hold` to judge, including directories and
+                // links: a nonregular lock must retain the tree rather than disappear here.
+                locks.push(entry.path());
+            } else if entry.file_type()?.is_dir() && depth < UNBUILT_DEPTH {
+                stack.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    locks.sort();
+    Ok(locks)
 }
 
 /// The profiles of a build directory: the folders holding its cargo `locks`.
@@ -694,7 +820,7 @@ fn compiler_store(_: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
-/// [`reclaim_watched`] over this user's cache, now, then [`tooling::reclaim`] over its tooling cache, `record` asked before each removal; nothing off macOS or without a home.
+/// [`reclaim_watched`] over this user's cache, now, then [`reclaim_moved`] over the root it moved from and [`tooling::reclaim`] over its tooling cache, `record` asked before each removal; nothing off macOS or without a home.
 pub fn reclaim_home_watched(
     gone_after: Duration,
     placing: Option<&checkout::Placing>,
@@ -713,6 +839,7 @@ pub fn reclaim_home_watched(
             placing,
             record,
         );
+        removed.extend(reclaim_moved(&moved_from(&home), now, record));
         removed.extend(tooling::reclaim(&tooling::root(&home), now, record));
         removed
     })
@@ -749,13 +876,32 @@ pub fn plan(
     let mut planned = Vec::new();
     if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
         let store = compiler_store(home);
-        let pass = (root, home, now, gone_after, placing, store.as_deref());
+        let pass = (
+            root,
+            home,
+            now,
+            gone_after,
+            placing,
+            store.as_deref(),
+            false,
+        );
         plan_walk(pass, root, 0, &mut planned);
     }
     planned
 }
 
-/// [`plan`] for this user's cache now, with the day's window ([`reclaim_home`]'s), then [`tooling::plan`] for its tooling cache; nothing off macOS or without a home.
+/// [`reclaim_moved`]'s decisions over the root the cache moved from, `root`, at `now`, read and never acted on.
+#[must_use]
+pub fn plan_moved(root: &Path, now: SystemTime) -> Vec<Planned> {
+    let mut planned = Vec::new();
+    if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
+        let pass = (root, None, now, MOVED_AFTER, None, None, true);
+        plan_walk(pass, root, 0, &mut planned);
+    }
+    planned
+}
+
+/// [`plan`] for this user's cache now, with the day's window ([`reclaim_home`]'s), then [`plan_moved`] for the root it moved from and [`tooling::plan`] for its tooling cache; nothing off macOS or without a home.
 #[must_use]
 pub fn plan_home() -> Vec<Planned> {
     if !cfg!(target_os = "macos") {
@@ -764,12 +910,14 @@ pub fn plan_home() -> Vec<Planned> {
     aterm_types::dirs::home_dir().map_or_else(Vec::new, |home| {
         let now = SystemTime::now();
         let mut planned = plan(&cache_root(&home), Some(&home), now, RECLAIM_GONE, None);
+        planned.extend(plan_moved(&moved_from(&home), now));
         planned.extend(tooling::plan(&tooling::root(&home), now));
         planned
     })
 }
 
-/// What one [`plan`] judges by: its `root`, `home`, `now`, `gone_after` and `placing`.
+/// What one [`plan`] judges by: its `root`, `home`, `now`, `gone_after`, `placing`, the
+/// compiler store, and whether `root` is the one the cache moved from ([`plan_moved`]).
 type PlanPass<'a> = (
     &'a Path,
     Option<&'a Path>,
@@ -777,11 +925,12 @@ type PlanPass<'a> = (
     Duration,
     Option<&'a checkout::Placing>,
     Option<&'a Path>,
+    bool,
 );
 
 /// [`plan`]'s walk of the mirror folder `dir`, as [`Sweep::walk`] walks it.
 fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Planned>) {
-    let (root, home, now, gone_after, placing, store) = pass;
+    let (root, home, now, gone_after, placing, store, was_moved) = pass;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -798,8 +947,12 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
                 continue;
             };
             let held = hold(&seen.locks).is_none();
-            let goes = workspace_of(root, dir)
-                .and_then(|ws| whole(&ws, &seen, home, now, gone_after, placing));
+            let goes = if was_moved {
+                moved(&seen, now)
+            } else {
+                workspace_of(root, dir)
+                    .and_then(|ws| whole(&ws, &seen, home, now, gone_after, placing))
+            };
             if let Some(why) = goes {
                 planned.push(Planned {
                     path: child.clone(),
@@ -807,6 +960,9 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
                     paths: vec![child],
                     held,
                 });
+                continue;
+            }
+            if was_moved {
                 continue;
             }
             let survey = stale::survey(&stale::Disk, &child, &profiles_of(&seen.locks), store);

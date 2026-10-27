@@ -178,6 +178,16 @@ pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), Stri
         "-o",
         &partial_s,
     ];
+    // Brew passes --silent whenever stdout is not a tty, which
+    // suppresses the progress bar there (scripts see clean output);
+    // errors still surface via --show-error.
+    {
+        use std::io::IsTerminal as _;
+        if !std::io::stdout().is_terminal() {
+            args.push("--silent");
+        }
+        args.push("--show-error");
+    }
     args.extend(proto_args(url));
     let header_cfg;
     if !headers.is_empty() {
@@ -636,11 +646,17 @@ where
     }
     let copied = copy_mounted_tree(&mount_path, dir).map_err(DmgError::Payload);
     let detached = guard.helper(DmgStep::Detach);
+    // A volume another process holds for a moment (a system scanner reading the payload just
+    // copied, more often on a loaded Mac) refuses the plain detach busy. The forced detach in
+    // `finish` then takes it down, and only one it does not confirm leaves anything behind.
+    let busy = detached
+        .as_ref()
+        .is_ok_and(|out| out.status.code() == Some(libc::EBUSY));
     let detached = detached.is_ok_and(|out| out.status.success());
     if detached {
         guard.needs_detach = false;
     }
-    let result = copied.and(if detached {
+    let result = copied.and(if detached || busy {
         Ok(())
     } else {
         Err(DmgError::Detach)
@@ -869,6 +885,8 @@ mod tests {
             "backstop-unknown",
             "backstop-refused",
             "detach-refused",
+            "detach-busy",
+            "busy-backstop-refused",
             "attach-panic",
         ] {
             std::fs::write(&original, b"owned image bytes").unwrap();
@@ -914,8 +932,11 @@ mod tests {
                 {
                     return Err(aterm_uds::deadline::RunError::TimedOut);
                 }
+                if !forced && matches!(scenario, "detach-busy" | "busy-backstop-refused") {
+                    return Ok(answer(libc::EBUSY));
+                }
                 Ok(answer(i32::from(
-                    (forced && scenario == "backstop-refused")
+                    (forced && matches!(scenario, "backstop-refused" | "busy-backstop-refused"))
                         || (!forced && scenario == "detach-refused"),
                 )))
             };
@@ -941,6 +962,17 @@ mod tests {
                         assert!(matches!(result, Err(DmgError::Detach)));
                         assert_eq!(calls, ["attach", "detach", "force"]);
                     }
+                    "detach-busy" => {
+                        result.expect("a busy volume the forced detach took down");
+                        assert_eq!(calls, ["attach", "detach", "force"]);
+                    }
+                    "busy-backstop-refused" => {
+                        assert!(
+                            matches!(result, Err(DmgError::Uncertain(_))),
+                            "a busy volume the forced detach left attached"
+                        );
+                        assert_eq!(calls, ["attach", "detach", "force"]);
+                    }
                     _ => {
                         assert!(matches!(result, Err(DmgError::Uncertain(_))));
                         assert_eq!(
@@ -963,6 +995,7 @@ mod tests {
                     | "detach-unknown"
                     | "backstop-unknown"
                     | "backstop-refused"
+                    | "busy-backstop-refused"
                     | "attach-panic"
             );
             assert_eq!(root.exists(), retained, "{scenario}");
@@ -974,7 +1007,10 @@ mod tests {
                 assert!(root.join("mount").is_dir());
                 std::fs::remove_dir_all(&root).unwrap();
             }
-            if matches!(scenario, "copied" | "detach-refused" | "detach-unknown") {
+            if matches!(
+                scenario,
+                "copied" | "detach-refused" | "detach-busy" | "detach-unknown"
+            ) {
                 assert_eq!(
                     std::fs::read(out.join("Demo.app/Contents/tool")).unwrap(),
                     b"payload"
@@ -1006,6 +1042,53 @@ mod tests {
         extract_dmg(&tmp.path().join("demo.dmg"), &out).unwrap();
         assert_eq!(
             std::fs::read(out.join("Demo.app/Contents/MacOS/demo")).unwrap(),
+            b"bin"
+        );
+        // A process holding the volume at the plain detach (a system scanner, on a loaded Mac)
+        // makes hdiutil refuse it busy: the forced detach takes it down and the payload stands.
+        let busy = tmp.path().join("busy");
+        let root = aterm_tempfile::tempdir().unwrap();
+        let point = root.path().join("mount");
+        let (mut held, mut refused) = (None, None);
+        let staged = extract_dmg_with(
+            &tmp.path().join("demo.dmg"),
+            &busy,
+            root,
+            |cmd: &mut aterm_uds::spawnfd::Command, within| {
+                let args: Vec<_> = cmd.get_args().map(std::ffi::OsStr::to_os_string).collect();
+                let plain = args[0] == "detach" && !args.iter().any(|arg| arg == "-force");
+                if plain {
+                    let point = std::path::PathBuf::from(args.last().unwrap());
+                    let file = point.join("Demo.app/Contents/MacOS/demo");
+                    held = Some(std::fs::File::open(file).unwrap());
+                }
+                let out = run_dmg_helper(cmd, within);
+                if plain {
+                    refused = out.as_ref().ok().and_then(|out| out.status.code());
+                }
+                out
+            },
+        );
+        drop(held);
+        let left = point.exists();
+        if left {
+            // Still attached: taken down before the verdict, so a failing run leaves no volume.
+            let mut force = aterm_uds::spawnfd::command("/usr/bin/hdiutil");
+            force
+                .args(["detach", "-force", "-quiet"])
+                .arg(&point)
+                .stdin(aterm_uds::spawnfd::Stdio::null());
+            let _ = run_dmg_helper(&mut force, DMG_DETACH_LIMIT);
+            let _ = std::fs::remove_dir_all(point.parent().unwrap());
+        }
+        assert_eq!(refused, Some(libc::EBUSY), "the held volume refused busy");
+        staged.unwrap();
+        assert!(
+            !left,
+            "the forced detach took the busy volume down and its folder went"
+        );
+        assert_eq!(
+            std::fs::read(busy.join("Demo.app/Contents/MacOS/demo")).unwrap(),
             b"bin"
         );
         std::fs::write(tmp.path().join("junk.dmg"), b"not an image").unwrap();

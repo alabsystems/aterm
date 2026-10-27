@@ -94,6 +94,7 @@ pub const fn unit_at(cols: &[char], col: u16) -> Unit {
 
 type ShiftCell = (u16, Option<Unit>, bool);
 
+#[inline]
 const fn find_shift(
     cells: &[ShiftCell],
     cols: &[char],
@@ -141,6 +142,7 @@ const fn find_shift(
     None
 }
 
+#[inline]
 const fn shift_block(
     cells: &[ShiftCell],
     cols: &[char],
@@ -357,6 +359,56 @@ impl Seen {
     const fn arrivals(&self) -> u8 {
         self.clear & !self.twin & ALL_OFFSETS
     }
+
+    #[inline]
+    fn find(seen: &[Self], row: u16, col: u16, born: Instant) -> Option<usize> {
+        let mut l = 0usize;
+        let mut r = seen.len();
+        while l < r {
+            let mid = (l + r) >> 1;
+            let s = &seen[mid];
+            if (s.row, s.col, s.born) < (row, col, born) {
+                l = mid + 1;
+            } else if (s.row, s.col, s.born) > (row, col, born) {
+                r = mid;
+            } else {
+                return Some(mid);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn insert_point(seen: &[Self], row: u16, col: u16, born: Instant) -> usize {
+        let mut l = 0usize;
+        let mut r = seen.len();
+        while l < r {
+            let mid = (l + r) >> 1;
+            let s = &seen[mid];
+            if (s.row, s.col, s.born) < (row, col, born) {
+                l = mid + 1;
+            } else {
+                r = mid;
+            }
+        }
+        l
+    }
+
+    #[inline]
+    const fn first_at_cell(seen: &[Self], row: u16, col: u16) -> usize {
+        let mut l = 0usize;
+        let mut r = seen.len();
+        while l < r {
+            let mid = (l + r) >> 1;
+            let s = &seen[mid];
+            if s.row < row || (s.row == row && s.col < col) {
+                l = mid + 1;
+            } else {
+                r = mid;
+            }
+        }
+        l
+    }
 }
 
 const ALL_OFFSETS: u8 = 0x0F;
@@ -396,6 +448,26 @@ struct RestoreRun {
     stamp: Option<Instant>,
     exact: bool,
     returned_ink: bool,
+}
+
+impl RestoreRun {
+    #[inline]
+    fn find(runs: &[Self], cohort: u32, stamp: Option<Instant>) -> Option<usize> {
+        let mut l = 0usize;
+        let mut r = runs.len();
+        while l < r {
+            let mid = (l + r) >> 1;
+            let run = &runs[mid];
+            if (run.cohort, run.stamp) < (cohort, stamp) {
+                l = mid + 1;
+            } else if (run.cohort, run.stamp) > (cohort, stamp) {
+                r = mid;
+            } else {
+                return Some(mid);
+            }
+        }
+        None
+    }
 }
 
 /// The witness: the sorted `(row, col, born)` list of cells seen holding a glyph.
@@ -570,6 +642,7 @@ impl Witness {
     }
 
     /// [`Witness::follow_runs`], except that a sole arriving glyph is evidence for the exact short held park whose source row the host is judging.
+    #[inline]
     pub(crate) fn follow_runs_with_short_park(
         &mut self,
         cells: &[Cell],
@@ -646,6 +719,7 @@ impl Witness {
     }
 
     /// THE HAND'S OWN LINE, judged on the hand's typed records.
+    #[inline]
     pub(crate) fn follow_hand(
         &mut self,
         cells: &[Cell],
@@ -697,6 +771,7 @@ impl Witness {
             .0
     }
 
+    #[inline]
     fn judge_follow(
         &mut self,
         cells: &[Cell],
@@ -782,6 +857,26 @@ impl Witness {
             let Some(there) = row_sample_at(rows, target) else {
                 continue;
             };
+            #[inline]
+            const fn armed_at(
+                follow_armed: &[(u16, Unit, bool, u8)],
+                col: u16,
+            ) -> Option<(u16, Unit, bool, u8)> {
+                let mut l = 0usize;
+                let mut r = follow_armed.len();
+                while l < r {
+                    let mid = (l + r) >> 1;
+                    let c = follow_armed[mid].0;
+                    if c < col {
+                        l = mid + 1;
+                    } else if c > col {
+                        r = mid;
+                    } else {
+                        return Some(follow_armed[mid]);
+                    }
+                }
+                None
+            }
             let v = Self::follow_verdict(&self.follow_armed, there.cols, k, relaid);
             let bit = 1u8 << k;
             let counted = armed.saturating_sub(v.neutral + v.relaid);
@@ -792,10 +887,9 @@ impl Witness {
                     SoleArrival::ShortPark => v.relaid >= 3,
                     SoleArrival::Hand { glyph, to } => {
                         target == to
-                            && if let Ok(i) =
-                                self.follow_armed.binary_search_by_key(&glyph, |a| a.0)
+                            && if let Some((col, unit, _, arrivals)) =
+                                armed_at(&self.follow_armed, glyph)
                             {
-                                let (col, unit, _, arrivals) = self.follow_armed[i];
                                 arrivals & bit != 0 && unit_at(there.cols, col) == unit
                             } else {
                                 false
@@ -839,16 +933,6 @@ impl Witness {
                     i += 1;
                 }
                 false
-            }
-            #[inline]
-            fn armed_at(
-                follow_armed: &[(u16, Unit, bool, u8)],
-                col: u16,
-            ) -> Option<(u16, Unit, bool, u8)> {
-                match follow_armed.binary_search_by_key(&col, |a| a.0) {
-                    Ok(i) => Some(follow_armed[i]),
-                    Err(_) => None,
-                }
             }
             let mut beyond_hi = false;
             let mut idx_hi = self.follow_armed.len();
@@ -908,6 +992,7 @@ impl Witness {
         (None, if evidence { gone } else { 0 })
     }
 
+    #[inline]
     const fn follow_verdict(
         armed: &[(u16, Unit, bool, u8)],
         there: &[char],
@@ -973,6 +1058,7 @@ impl Witness {
         v
     }
 
+    #[inline]
     const fn relaid_suffix(armed: &[(u16, Unit, bool, u8)], own: &[char]) -> usize {
         let mut first = None;
         let mut idx = 0;
@@ -1014,6 +1100,7 @@ impl Witness {
     }
 
     /// The shift pass: the band follows its text along the row.
+    #[inline]
     pub fn shift_runs(
         &mut self,
         cells: &[Cell],
@@ -1127,6 +1214,7 @@ impl Witness {
     }
 
     /// The records follow their cells along the row ([`Witness::shift_runs`] → `Ribbon::shift_run`).
+    #[inline]
     pub fn shift_cells(&mut self, moved: &mut [(u16, u16, Instant)], dc: i16) {
         if moved.is_empty() || dc == 0 {
             return;
@@ -1171,6 +1259,7 @@ impl Witness {
     }
 
     /// The records follow their cells ([`Witness::follow_runs`] → `Ribbon::translate_run`).
+    #[inline]
     pub fn translate_cells(&mut self, moved: &mut [(u16, u16, Instant)], dr: i16) {
         if moved.is_empty() || dr == 0 {
             return;
@@ -1225,6 +1314,7 @@ impl Witness {
     }
 
     /// Forget everything (a reset: the cells are gone with the coordinate space).
+    #[inline]
     pub fn clear(&mut self) {
         self.seen.clear();
         self.retired_runs.clear();
@@ -1259,6 +1349,7 @@ impl Witness {
     }
 
     /// A scroll moved every cell up by `rows` (`Ribbon::translate_scroll`).
+    #[inline]
     pub fn translate(&mut self, rows: u16, bottom: u16) {
         if rows == 0 {
             return;
@@ -1308,6 +1399,7 @@ impl Witness {
     }
 
     /// A row band moved (`Ribbon::translate_band`, the [`crate::cursor_glow::band_row`] law).
+    #[inline]
     pub fn translate_band(&mut self, top: u16, bottom: u16, delta: i16) {
         if delta == 0 || top > bottom {
             return;
@@ -1353,9 +1445,7 @@ impl Witness {
 
     #[inline]
     fn find(&self, row: u16, col: u16, born: Instant) -> Option<usize> {
-        self.seen
-            .binary_search_by(|s| (s.row, s.col, s.born).cmp(&(row, col, born)))
-            .ok()
+        Seen::find(&self.seen, row, col, born)
     }
 
     #[inline]
@@ -1373,12 +1463,12 @@ impl Witness {
         let _ = self.insert(cell, Unit::BLANK, true);
     }
 
+    #[inline]
     fn insert(&mut self, cell: &Cell, unit: Unit, released: bool) -> Option<usize> {
         if self.seen.len() >= WITNESS_CAP {
             return None;
         }
-        let key = (cell.row, cell.col, cell.born);
-        let at = self.seen.partition_point(|s| (s.row, s.col, s.born) < key);
+        let at = Seen::insert_point(&self.seen, cell.row, cell.col, cell.born);
         self.seen.insert(
             at,
             Seen {
@@ -1421,6 +1511,7 @@ impl Witness {
     }
 
     /// The walk: every resident, non-leaving cell is read against this frame's samples.
+    #[inline]
     pub fn walk(
         &mut self,
         cells: &[Cell],
@@ -1785,6 +1876,7 @@ impl Witness {
             .is_ok()
     }
 
+    #[inline]
     fn landed_goes_with_its_run(
         &mut self,
         cells: &[Cell],
@@ -1813,6 +1905,7 @@ impl Witness {
         }
     }
 
+    #[inline]
     fn retired_far_side_clear(
         &self,
         cells: &[Cell],
@@ -1857,6 +1950,7 @@ impl Witness {
         }
     }
 
+    #[inline]
     fn find_deferred_runs(&mut self, cells: &[Cell], rows: &[RowSample<'_>], withheld: &[u16]) {
         self.blind_changed.clear();
         self.deferred_runs.clear();
@@ -1938,6 +2032,7 @@ impl Witness {
         }
     }
 
+    #[inline]
     fn shape_verdicts(
         &mut self,
         cells: &[Cell],
@@ -2058,6 +2153,7 @@ impl Witness {
         }
     }
 
+    #[inline]
     fn released_span_takes(
         &self,
         cells: &[Cell],
@@ -2120,6 +2216,7 @@ impl Witness {
         slice.split_at(end).0.split_at(lo).1
     }
 
+    #[inline]
     fn find_standing_runs(&mut self, cells: &[Cell], retire: &[(u16, u16, Instant)]) {
         self.standing_runs.clear();
         self.retired_cells.clear();
@@ -2161,6 +2258,7 @@ impl Witness {
     }
 
     /// The sampled glyph is the exact identity held by a released cell.
+    #[inline]
     pub(super) fn released_cell_matches(&self, cell: &Cell, cols: &[char]) -> bool {
         if let Some(index) = self.find(cell.row, cell.col, cell.born) {
             let seen = self.seen[index];
@@ -2171,6 +2269,7 @@ impl Witness {
     }
 
     /// Releases whose original cells and glyphs are back, as sorted `(cohort, stamp)`.
+    #[inline]
     pub(super) fn restored_runs(
         &mut self,
         cells: &[Cell],
@@ -2229,9 +2328,7 @@ impl Witness {
         while cj < cells.len() {
             let cell = &cells[cj];
             cj += 1;
-            let Ok(i) = self
-                .restore_runs
-                .binary_search_by_key(&(cell.cohort, cell.released_at), |r| (r.cohort, r.stamp))
+            let Some(i) = RestoreRun::find(&self.restore_runs, cell.cohort, cell.released_at)
             else {
                 continue;
             };
@@ -2260,9 +2357,7 @@ impl Witness {
                             && run.row == cell.row
                             && standing
                     } else {
-                        let start = self
-                            .seen
-                            .partition_point(|s| (s.row, s.col) < (cell.row, cell.col));
+                        let start = Seen::first_at_cell(&self.seen, cell.row, cell.col);
                         let mut any_rel = false;
                         let mut k = start;
                         while k < self.seen.len() {
@@ -2295,6 +2390,7 @@ impl Witness {
     }
 
     /// Clear release custody once the ribbon accepted restoration.
+    #[inline]
     pub(super) fn restored(&mut self, cohorts: &[u32], cells: &[Cell]) {
         if cohorts.is_empty() {
             return;
@@ -2332,6 +2428,7 @@ impl Witness {
         }
     }
 
+    #[inline]
     const fn moved(run: &[Blanked], rows: &[RowSample<'_>]) -> bool {
         let mut lead_count = 0;
         let mut i = 0;
@@ -2384,6 +2481,9 @@ impl Witness {
         false
     }
 }
+
+#[cfg(any(test, debug_assertions))]
+mod state_words;
 
 #[cfg(test)]
 mod tests {

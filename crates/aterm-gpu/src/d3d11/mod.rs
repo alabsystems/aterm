@@ -3,11 +3,10 @@
 
 //! The first-party Direct3D 11 backend: Windows's renderer
 //! (docs/AUDIT-third-party-2026-10-15.md GW.5 + WB.4), beside `metal` on macOS
-//! and `gl` on Linux and in the browser. wgpu's DX12 backend stays as the
-//! test oracle every D3D11 frame is byte-compared against on the same adapter
-//! (`--features wgpu-oracle`), the way the Metal and GL arms' oracles work,
-//! and as the frames it drew on WARP before the flip
-//! (`oracle/warp-frames.tsv`).
+//! and `gl` on Linux and in the browser. Its frames are held to the CPU
+//! renderer's twins of them and compared with the ones wgpu's DX12 backend
+//! drew on WARP before GW.6 removed wgpu (`frame_record_tests`,
+//! `oracle/warp-frames.tsv`).
 //!
 //! Every call goes through aterm-win32's hand-written COM slices
 //! (`aterm_win32::d3d11`, `dxgi`, `dcomp`), which its oracle holds slot by
@@ -19,7 +18,7 @@
 //!   (`d3dcompiler_47.dll`, loaded from System32) and the device-removed
 //!   latch.
 //! * [`resources`]: textures with their views, buffers and samplers.
-//! * [`shaders`]: the HLSL twins of the WGSL, `shaders/<library>.hlsl`.
+//! * [`shaders`]: the HLSL twins, `shaders/<library>.hlsl`, written from the WGSL wgpu drew with.
 //! * [`pipelines`]: shaders, input layouts and fixed-function state from the
 //!   pipeline table.
 //! * [`encoder`]: the frame and pass verbs the device layer forwards to.
@@ -44,10 +43,6 @@ pub(crate) mod encoder;
 pub(crate) mod pipelines;
 pub(crate) mod resources;
 pub(crate) mod shaders;
-#[cfg_attr(
-    all(wgpu_arm, not(test)),
-    expect(dead_code, reason = "a build carrying wgpu attaches windows on wgpu")
-)]
 pub(crate) mod surface;
 
 /// A headless device for a D3D11 test; a machine without a Direct3D 11

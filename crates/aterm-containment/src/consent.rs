@@ -3413,40 +3413,12 @@ pub fn probe_devtool(gate: ProbeGate, subject: &str) -> DevToolProbe {
 /// The system TCC database.
 pub const SYSTEM_TCC_DB: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
 
-/// The reader, named absolutely.
-pub const SQLITE_TOOL: &str = aterm_uds::os_path!("sqlite3");
+const DEVTOOL_SERVICE: &str = "kTCCServiceDeveloperTool";
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const DEVTOOL_DB_QUERY: &str = "SELECT hex(client), client_type, auth_value, last_modified \
-                                FROM access WHERE service = 'kTCCServiceDeveloperTool' \
-                                ORDER BY rowid;";
+const MAX_TCC_MODIFIED_S: i64 = 1_000_000_000_000_000_000;
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const DEVTOOL_DB_OPTIONS: [&str; 11] = [
-    "-init",
-    "/dev/null",
-    "-readonly",
-    "-safe",
-    "-nofollow",
-    "-batch",
-    "-bail",
-    "-noheader",
-    "-list",
-    "-separator",
-    "|",
-];
-
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn devtool_db_args(target: &str) -> Vec<&str> {
-    DEVTOOL_DB_OPTIONS
-        .iter()
-        .copied()
-        .chain([target, DEVTOOL_DB_QUERY])
-        .collect()
-}
-
-#[cfg(target_os = "macos")]
-const DEVTOOL_DB_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(any(target_os = "macos", test))]
+const DEVTOOL_DB_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What the Developer Tools list holds for the subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -3484,17 +3456,17 @@ pub enum DevToolListLabel {
     Read,
     /// `open` answered `EPERM`.
     NoFullDiskAccess,
-    /// `open` failed with another errno.
+    /// `open` failed with another errno, or the database disappeared before the read.
     OpenFailed,
-    /// `sqlite3` exited non-zero or by a signal.
+    /// The database snapshot or `access` schema could not be read.
     ToolFailed,
-    /// `sqlite3` answered in a shape this classifier does not recognise.
+    /// The `access` rows answered in a shape this classifier does not recognise.
     FormatUnrecognized,
-    /// `sqlite3` did not finish within its ceiling.
+    /// The read did not finish within its ceiling.
     TimedOut,
-    /// `sqlite3` could not be started.
+    /// A helper process could not be started.
     SpawnFailed,
-    /// Its output was over the cap or not UTF-8, or its exit could not be read.
+    /// An answer was over the cap or unreadable.
     OutputUnreadable,
     /// Refused: `[privacy] enabled` or `[privacy] check` is off.
     RefusedDisabled,
@@ -3587,68 +3559,59 @@ pub const fn unsupported_devtool_list() -> DevToolList {
     DevToolList::refused(DevToolListLabel::UnsupportedPlatform)
 }
 
-fn devtool_db_row(line: &str) -> Option<(String, u32, u32, i64)> {
-    let mut fields = line.split('|');
-    let (hex, kind, auth, modified) = (
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-    );
-    if fields.next().is_some() || hex.len() % 2 != 0 {
-        return None;
-    }
-    let decimal = |text: &str| {
-        (!text.is_empty() && text.len() <= 18 && text.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| text.parse::<i64>().ok())
-            .flatten()
-    };
-    let nibble = |b: u8| match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    };
-    let bytes = hex
-        .as_bytes()
-        .chunks(2)
-        .map(|pair| Some(nibble(pair[0])? << 4 | nibble(pair[1])?))
-        .collect::<Option<Vec<u8>>>()?;
-    Some((
-        String::from_utf8_lossy(&bytes).into_owned(),
-        u32::try_from(decimal(kind)?).ok()?,
-        u32::try_from(decimal(auth)?).ok()?,
-        decimal(modified)?,
-    ))
+struct AccessColumns {
+    service: usize,
+    client: usize,
+    client_type: usize,
+    auth_value: usize,
+    last_modified: usize,
 }
 
-/// Classify one `sqlite3` run for `subject`.
-#[must_use]
-pub fn classify_devtool_db(run: &ToolRun, subject: &str) -> DevToolList {
-    let stdout = match run {
-        ToolRun::Exited {
-            code: Some(0),
-            stdout,
-            ..
-        } => stdout,
-        ToolRun::Exited { .. } => return DevToolList::refused(DevToolListLabel::ToolFailed),
-        ToolRun::Absent | ToolRun::SpawnFailed => {
-            return DevToolList::refused(DevToolListLabel::SpawnFailed);
-        }
-        ToolRun::TimedOut => return DevToolList::refused(DevToolListLabel::TimedOut),
-        ToolRun::Unreadable => return DevToolList::refused(DevToolListLabel::OutputUnreadable),
+fn access_columns(schema: &aterm_uds::sqlite_read::TableSchema) -> Option<AccessColumns> {
+    Some(AccessColumns {
+        service: schema.column_index("service")?,
+        client: schema.column_index("client")?,
+        client_type: schema.column_index("client_type")?,
+        auth_value: schema.column_index("auth_value")?,
+        last_modified: schema.column_index("last_modified")?,
+    })
+}
+
+fn decode_devtool_row(
+    cols: &AccessColumns,
+    row: &[aterm_uds::sqlite_read::SqlValue],
+) -> Option<(String, u32, u32, i64)> {
+    use aterm_uds::sqlite_read::SqlValue;
+    let client = match row.get(cols.client)? {
+        SqlValue::Text(s) => s.clone(),
+        SqlValue::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+        SqlValue::Null | SqlValue::Int(_) | SqlValue::Float(_) => return None,
     };
+    let kind = u32::try_from(row.get(cols.client_type)?.as_int()?).ok()?;
+    let auth = u32::try_from(row.get(cols.auth_value)?.as_int()?).ok()?;
+    let modified = row
+        .get(cols.last_modified)?
+        .as_int()
+        .filter(|&m| (0..MAX_TCC_MODIFIED_S).contains(&m))?;
+    Some((client, kind, auth, modified))
+}
+
+fn classify_devtool_rows(
+    scanned: &[Option<(String, u32, u32, i64)>],
+    subject: &str,
+) -> DevToolList {
     let unrecognized = DevToolList::refused(DevToolListLabel::FormatUnrecognized);
     let mut ours: Option<(u32, i64)> = None;
     let mut rows: u32 = 0;
-    for line in stdout.lines() {
-        let Some((client, kind, auth, modified)) = devtool_db_row(line) else {
+    for entry in scanned {
+        let Some((client, kind, auth, modified)) = entry else {
             return unrecognized;
         };
         rows = rows.saturating_add(1);
-        if kind != 0 || client != subject {
+        if *kind != 0 || client != subject {
             continue;
         }
-        if ours.replace((auth, modified)).is_some() {
+        if ours.replace((*auth, *modified)).is_some() {
             return unrecognized;
         }
     }
@@ -3673,25 +3636,51 @@ pub fn classify_devtool_db(run: &ToolRun, subject: &str) -> DevToolList {
     }
 }
 
+/// Classify an in-memory SQLite `TCC.db` snapshot (`main` and optional `wal`) for `subject`.
+///
+/// Returns `None` when the snapshot is not a readable SQLite 3 database or lacks the `access`
+/// table's Developer Tools columns.
+#[must_use]
+pub fn classify_devtool_db_bytes(
+    main: &[u8],
+    wal: Option<&[u8]>,
+    subject: &str,
+) -> Option<DevToolList> {
+    let scanned = aterm_uds::sqlite_read::scan_table_with(
+        main,
+        wal,
+        "access",
+        access_columns,
+        |cols, row| {
+            if row.get(cols.service)?.as_str() != Some(DEVTOOL_SERVICE) {
+                return None;
+            }
+            Some(decode_devtool_row(cols, row))
+        },
+    )?;
+    Some(classify_devtool_rows(&scanned, subject))
+}
+
 #[cfg(any(target_os = "macos", test))]
 const DEVTOOL_DB_READS: usize = 3;
 
 #[cfg(any(target_os = "macos", test))]
 const DEVTOOL_DB_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// The list probe with the executable, the database (production: [`SYSTEM_TCC_DB`]).
+/// The list probe with the executable, the database (production: [`SYSTEM_TCC_DB`]), and the
+/// in-memory snapshot classifier.
 #[cfg(any(target_os = "macos", test))]
-pub fn probe_devtool_list_with<O, S>(
+pub fn probe_devtool_list_with<O, F>(
     gate: ProbeGate,
     exe: Option<&Path>,
     subject: &str,
     db: &Path,
     open_db: O,
-    spawn: S,
+    inspect: F,
 ) -> DevToolList
 where
     O: FnOnce(&Path) -> ProbeOutcome,
-    S: FnMut(&str, &[&str]) -> ToolRun,
+    F: FnMut(&[u8], Option<&[u8]>) -> Option<DevToolList>,
 {
     if !gate.permits() {
         return DevToolList::refused(DevToolListLabel::RefusedDisabled);
@@ -3706,7 +3695,7 @@ where
         return DevToolList::refused(DevToolListLabel::RefusedNoSubject);
     }
     match open_db(db) {
-        ProbeOutcome::Ok => read_devtool_db(db, subject, spawn),
+        ProbeOutcome::Ok => read_devtool_db(db, inspect),
         ProbeOutcome::Errno(ERRNO_EPERM) => {
             DevToolList::refused(DevToolListLabel::NoFullDiskAccess)
         }
@@ -3715,19 +3704,17 @@ where
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn read_devtool_db<S>(db: &Path, subject: &str, mut spawn: S) -> DevToolList
+fn read_devtool_db<F>(db: &Path, mut inspect: F) -> DevToolList
 where
-    S: FnMut(&str, &[&str]) -> ToolRun,
+    F: FnMut(&[u8], Option<&[u8]>) -> Option<DevToolList>,
 {
-    use aterm_uds::foreign_db::{Unread, read};
+    use aterm_uds::foreign_db::{Unread, read_bytes};
     for attempt in 0..DEVTOOL_DB_READS {
         if attempt > 0 {
             std::thread::sleep(DEVTOOL_DB_PAUSE);
         }
-        match read(db, |target| {
-            Some(spawn(SQLITE_TOOL, &devtool_db_args(target)))
-        }) {
-            Ok(run) => return classify_devtool_db(&run, subject),
+        match read_bytes(db, DEVTOOL_DB_MAX_BYTES, &mut inspect) {
+            Ok(list) => return list,
             Err(Unread::Changed | Unread::Writing) => {}
             Err(Unread::Missing) => return DevToolList::refused(DevToolListLabel::OpenFailed),
             Err(Unread::Failed) => break,
@@ -3748,10 +3735,7 @@ pub fn probe_devtool_list(gate: ProbeGate, subject: &str) -> DevToolList {
             subject,
             Path::new(SYSTEM_TCC_DB),
             |db| open_probe_in_child(exe.as_deref(), db),
-            |program, args| {
-                let args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
-                run_bounded_exit(program, &args, DEVTOOL_DB_CEILING, TOOL_OUTPUT_MAX_BYTES)
-            },
+            |main, wal| classify_devtool_db_bytes(main, wal, subject),
         )
     }
     #[cfg(not(target_os = "macos"))]
@@ -9339,17 +9323,157 @@ mod tests {
         assert!(args.contains(&"ndjson".to_string()), "the escaped framing");
     }
 
-    fn db_row(client: &str, kind: u32, auth: u32, modified: i64) -> String {
-        let hex: String = client.bytes().map(|b| format!("{b:02X}")).collect();
-        format!("{hex}|{kind}|{auth}|{modified}")
+    const TCC_ACCESS_DDL: &str = "CREATE TABLE access (service TEXT NOT NULL, \
+        client TEXT NOT NULL, client_type INTEGER NOT NULL, auth_value INTEGER NOT NULL, \
+        csreq BLOB, last_modified INTEGER NOT NULL DEFAULT 0)";
+
+    fn push_sqlite_uvarint(out: &mut Vec<u8>, mut v: u64) {
+        let mut rev = [0u8; 9];
+        let mut len = 0usize;
+        rev[0] = (v & 0x7f) as u8;
+        len += 1;
+        v >>= 7;
+        while v > 0 {
+            rev[len] = 0x80 | ((v & 0x7f) as u8);
+            len += 1;
+            v >>= 7;
+        }
+        for i in (0..len).rev() {
+            out.push(rev[i]);
+        }
     }
 
-    fn db_of(rows: &[String]) -> ToolRun {
-        let mut stdout = rows.join("\n");
-        if !rows.is_empty() {
-            stdout.push('\n');
+    fn encode_sqlite_record(cols: &[aterm_uds::sqlite_read::SqlValue]) -> Vec<u8> {
+        use aterm_uds::sqlite_read::SqlValue;
+        let mut serials = Vec::new();
+        let mut body = Vec::new();
+        for col in cols {
+            match col {
+                SqlValue::Null => push_sqlite_uvarint(&mut serials, 0),
+                SqlValue::Int(n) => {
+                    push_sqlite_uvarint(&mut serials, 6);
+                    body.extend_from_slice(&n.to_be_bytes());
+                }
+                SqlValue::Float(f) => {
+                    push_sqlite_uvarint(&mut serials, 7);
+                    body.extend_from_slice(&f.to_bits().to_be_bytes());
+                }
+                SqlValue::Blob(b) => {
+                    push_sqlite_uvarint(&mut serials, (b.len() as u64) * 2 + 12);
+                    body.extend_from_slice(b);
+                }
+                SqlValue::Text(s) => {
+                    push_sqlite_uvarint(&mut serials, (s.len() as u64) * 2 + 13);
+                    body.extend_from_slice(s.as_bytes());
+                }
+            }
         }
-        exited(Some(0), &stdout, "")
+        let mut hdr_len = Vec::new();
+        let mut total_hdr = (serials.len() + 1) as u64;
+        loop {
+            hdr_len.clear();
+            push_sqlite_uvarint(&mut hdr_len, total_hdr);
+            let actual = (hdr_len.len() + serials.len()) as u64;
+            if actual == total_hdr {
+                break;
+            }
+            total_hdr = actual;
+        }
+        let mut out = hdr_len;
+        out.extend_from_slice(&serials);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn encode_leaf_cell(rowid: u64, record: &[u8]) -> Vec<u8> {
+        let mut cell = Vec::new();
+        push_sqlite_uvarint(&mut cell, record.len() as u64);
+        push_sqlite_uvarint(&mut cell, rowid);
+        cell.extend_from_slice(record);
+        cell
+    }
+
+    fn sqlite_db_with_table(
+        table_name: &str,
+        ddl: &str,
+        rows: &[Vec<aterm_uds::sqlite_read::SqlValue>],
+    ) -> Vec<u8> {
+        use aterm_uds::sqlite_read::SqlValue;
+        let mut db = vec![0u8; 8192];
+        db[..16].copy_from_slice(b"SQLite format 3\0");
+        db[16..18].copy_from_slice(&4096u16.to_be_bytes());
+        db[18] = 1;
+        db[19] = 1;
+        db[28..32].copy_from_slice(&2u32.to_be_bytes());
+        db[56..60].copy_from_slice(&1u32.to_be_bytes());
+
+        let schema_rec = encode_sqlite_record(&[
+            SqlValue::Text("table".to_owned()),
+            SqlValue::Text(table_name.to_owned()),
+            SqlValue::Text(table_name.to_owned()),
+            SqlValue::Int(2),
+            SqlValue::Text(ddl.to_owned()),
+        ]);
+        let schema_cell = encode_leaf_cell(1, &schema_rec);
+        let schema_off = 4096 - schema_cell.len();
+        db[100] = 0x0d;
+        db[103..105].copy_from_slice(&1u16.to_be_bytes());
+        db[105..107].copy_from_slice(&u16::try_from(schema_off).unwrap().to_be_bytes());
+        db[108..110].copy_from_slice(&u16::try_from(schema_off).unwrap().to_be_bytes());
+        db[schema_off..4096].copy_from_slice(&schema_cell);
+
+        let page2 = &mut db[4096..8192];
+        page2[0] = 0x0d;
+        page2[3..5].copy_from_slice(&u16::try_from(rows.len()).unwrap().to_be_bytes());
+        let mut cursor = 4096usize;
+        for (idx, row) in rows.iter().enumerate() {
+            let cell = encode_leaf_cell((idx + 1) as u64, &encode_sqlite_record(row));
+            cursor -= cell.len();
+            assert!(cursor >= 8 + rows.len() * 2, "page 2 cell room");
+            page2[cursor..cursor + cell.len()].copy_from_slice(&cell);
+            let ptr = 8 + idx * 2;
+            page2[ptr..ptr + 2].copy_from_slice(&u16::try_from(cursor).unwrap().to_be_bytes());
+        }
+        page2[5..7].copy_from_slice(&u16::try_from(cursor).unwrap().to_be_bytes());
+        db
+    }
+
+    fn db_row_values(
+        service: &str,
+        client: aterm_uds::sqlite_read::SqlValue,
+        kind: aterm_uds::sqlite_read::SqlValue,
+        auth: aterm_uds::sqlite_read::SqlValue,
+        modified: aterm_uds::sqlite_read::SqlValue,
+    ) -> Vec<aterm_uds::sqlite_read::SqlValue> {
+        use aterm_uds::sqlite_read::SqlValue;
+        vec![
+            SqlValue::Text(service.to_owned()),
+            client,
+            kind,
+            auth,
+            SqlValue::Null,
+            modified,
+        ]
+    }
+
+    fn db_row(
+        client: &str,
+        kind: u32,
+        auth: u32,
+        modified: i64,
+    ) -> Vec<aterm_uds::sqlite_read::SqlValue> {
+        use aterm_uds::sqlite_read::SqlValue;
+        db_row_values(
+            DEVTOOL_SERVICE,
+            SqlValue::Text(client.to_owned()),
+            SqlValue::Int(i64::from(kind)),
+            SqlValue::Int(i64::from(auth)),
+            SqlValue::Int(modified),
+        )
+    }
+
+    fn db_of(rows: &[Vec<aterm_uds::sqlite_read::SqlValue>]) -> Vec<u8> {
+        sqlite_db_with_table("access", TCC_ACCESS_DDL, rows)
     }
 
     fn listed(listing: DevToolListing, modified_at_s: Option<i64>) -> DevToolList {
@@ -9367,21 +9491,33 @@ mod tests {
 
     #[test]
     fn the_list_classifier_reads_only_the_subjects_bundle_row() {
+        use aterm_uds::sqlite_read::SqlValue;
         let unrecognized = DevToolList::refused(DevToolListLabel::FormatUnrecognized);
-        let before = "636F6D2E6170706C652E5465726D696E616C|0|0|1781819370\n";
-        let after = "636F6D2E6170706C652E5465726D696E616C|0|2|1792020639\n\
-                     636F6D2E617465726D2E617465726D|0|2|1792020637\n";
+        let before = db_of(&[
+            db_row("com.apple.Terminal", 0, 0, 1_781_819_370),
+            db_row_values(
+                "kTCCServiceAccessibility",
+                SqlValue::Text(ATERM.to_owned()),
+                SqlValue::Int(0),
+                SqlValue::Int(2),
+                SqlValue::Int(999),
+            ),
+        ]);
+        let after = db_of(&[
+            db_row("com.apple.Terminal", 0, 2, 1_792_020_639),
+            db_row(ATERM, 0, 2, 1_792_020_637),
+        ]);
         assert_eq!(
-            classify_devtool_db(&exited(Some(0), before, ""), ATERM),
-            listed(DevToolListing::Absent, None)
+            classify_devtool_db_bytes(&before, None, ATERM),
+            Some(listed(DevToolListing::Absent, None))
         );
         assert_eq!(
-            classify_devtool_db(&exited(Some(0), after, ""), ATERM),
-            listed_of(DevToolListing::On, Some(1_792_020_637), 2)
+            classify_devtool_db_bytes(&after, None, ATERM),
+            Some(listed_of(DevToolListing::On, Some(1_792_020_637), 2))
         );
         assert_eq!(
-            classify_devtool_db(&exited(Some(0), before, ""), "com.apple.Terminal"),
-            listed(DevToolListing::Off, Some(1_781_819_370))
+            classify_devtool_db_bytes(&before, None, "com.apple.Terminal"),
+            Some(listed(DevToolListing::Off, Some(1_781_819_370)))
         );
         for (name, rows, want) in [
             (
@@ -9398,6 +9534,17 @@ mod tests {
                 "switched off",
                 vec![db_row(ATERM, 0, 0, 6)],
                 listed(DevToolListing::Off, Some(6)),
+            ),
+            (
+                "blob client bytes decode lossily as UTF-8",
+                vec![db_row_values(
+                    DEVTOOL_SERVICE,
+                    SqlValue::Blob(ATERM.as_bytes().to_vec()),
+                    SqlValue::Int(0),
+                    SqlValue::Int(2),
+                    SqlValue::Int(11),
+                )],
+                listed(DevToolListing::On, Some(11)),
             ),
             (
                 "another app's row",
@@ -9441,51 +9588,133 @@ mod tests {
             ),
             ("unknown", vec![db_row(ATERM, 0, 1, 1)], unrecognized),
         ] {
-            assert_eq!(classify_devtool_db(&db_of(&rows), ATERM), want, "{name}");
+            assert_eq!(
+                classify_devtool_db_bytes(&db_of(&rows), None, ATERM),
+                Some(want),
+                "{name}"
+            );
         }
         let ours = db_row(ATERM, 0, 2, 1);
-        for bad in [
-            "com.aterm.aterm|0|2|1",
-            "636f6d2e617465726d2e617465726d|0|2|1",
-            "636F6D2E617465726D2E617465726D7|0|2|1",
-            "636F6D2E617465726D2E617465726D|0|2",
-            "636F6D2E617465726D2E617465726D|0|2|1|x",
-            "636F6D2E617465726D2E617465726D|0|2|",
-            "636F6D2E617465726D2E617465726D|-1|2|1",
-            "636F6D2E617465726D2E617465726D|0|+2|1",
-            "636F6D2E617465726D2E617465726D|0|2|1.5",
-            "636F6D2E617465726D2E617465726D|0|99999999999999999999|1",
-            "Error: in prepare, no such table: access",
-            "",
-            "612e62|0|2|1",
-            "612E62|0|2|1|x",
-            "612E62|+0|2|1",
-            "612E62|4294967296|2|1",
-            "612E62|0|2|1000000000000000000",
-        ] {
-            assert_eq!(
-                classify_devtool_db(&exited(Some(0), &format!("{ours}\n{bad}\n"), ""), ATERM),
-                unrecognized,
-                "{bad:?}"
-            );
-        }
-        for (run, label) in [
+        for (why, bad) in [
             (
-                exited(Some(1), "", "Error: unable to open database"),
-                DevToolListLabel::ToolFailed,
+                "null client",
+                db_row_values(
+                    DEVTOOL_SERVICE,
+                    SqlValue::Null,
+                    SqlValue::Int(0),
+                    SqlValue::Int(2),
+                    SqlValue::Int(1),
+                ),
             ),
-            (exited(None, &ours, ""), DevToolListLabel::ToolFailed),
-            (ToolRun::Absent, DevToolListLabel::SpawnFailed),
-            (ToolRun::SpawnFailed, DevToolListLabel::SpawnFailed),
-            (ToolRun::TimedOut, DevToolListLabel::TimedOut),
-            (ToolRun::Unreadable, DevToolListLabel::OutputUnreadable),
+            (
+                "integer client",
+                db_row_values(
+                    DEVTOOL_SERVICE,
+                    SqlValue::Int(7),
+                    SqlValue::Int(0),
+                    SqlValue::Int(2),
+                    SqlValue::Int(1),
+                ),
+            ),
+            (
+                "negative client_type",
+                db_row_values(
+                    DEVTOOL_SERVICE,
+                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Int(-1),
+                    SqlValue::Int(2),
+                    SqlValue::Int(1),
+                ),
+            ),
+            (
+                "client_type overflow",
+                db_row_values(
+                    DEVTOOL_SERVICE,
+                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Int(4_294_967_296),
+                    SqlValue::Int(2),
+                    SqlValue::Int(1),
+                ),
+            ),
+            (
+                "negative auth_value",
+                db_row_values(
+                    DEVTOOL_SERVICE,
+                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Int(0),
+                    SqlValue::Int(-2),
+                    SqlValue::Int(1),
+                ),
+            ),
+            (
+                "auth_value overflow",
+                db_row_values(
+                    DEVTOOL_SERVICE,
+                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Int(0),
+                    SqlValue::Int(4_294_967_296),
+                    SqlValue::Int(1),
+                ),
+            ),
+            (
+                "float last_modified",
+                db_row_values(
+                    DEVTOOL_SERVICE,
+                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Int(0),
+                    SqlValue::Int(2),
+                    SqlValue::Float(1.5),
+                ),
+            ),
+            (
+                "negative last_modified",
+                db_row_values(
+                    DEVTOOL_SERVICE,
+                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Int(0),
+                    SqlValue::Int(2),
+                    SqlValue::Int(-1),
+                ),
+            ),
+            (
+                "last_modified >= 10^18",
+                db_row_values(
+                    DEVTOOL_SERVICE,
+                    SqlValue::Text("a.b".to_owned()),
+                    SqlValue::Int(0),
+                    SqlValue::Int(2),
+                    SqlValue::Int(1_000_000_000_000_000_000),
+                ),
+            ),
         ] {
+            let mixed = db_of(&[ours.clone(), bad]);
             assert_eq!(
-                classify_devtool_db(&run, ATERM),
-                DevToolList::refused(label),
-                "{run:?}"
+                classify_devtool_db_bytes(&mixed, None, ATERM),
+                Some(unrecognized),
+                "{why}"
             );
         }
+        assert_eq!(
+            classify_devtool_db_bytes(b"not sqlite", None, ATERM),
+            None,
+            "corrupt header"
+        );
+        let no_access = sqlite_db_with_table("other", "CREATE TABLE other (id INTEGER)", &[]);
+        assert_eq!(
+            classify_devtool_db_bytes(&no_access, None, ATERM),
+            None,
+            "missing table access"
+        );
+        let missing_col = sqlite_db_with_table(
+            "access",
+            "CREATE TABLE access (service TEXT, client TEXT, client_type INTEGER, auth_value INTEGER)",
+            &[],
+        );
+        assert_eq!(
+            classify_devtool_db_bytes(&missing_col, None, ATERM),
+            None,
+            "missing last_modified column"
+        );
     }
 
     #[test]
@@ -9493,19 +9722,20 @@ mod tests {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
         let tcc = Path::new(SYSTEM_TCC_DB);
         let never_open = |_: &Path| -> ProbeOutcome { panic!("a refusal opens nothing") };
-        let never_spawn =
-            |_: &str, _: &[&str]| -> ToolRun { panic!("a refusal must spawn nothing") };
+        let never_inspect = |_: &[u8], _: Option<&[u8]>| -> Option<DevToolList> {
+            panic!("a refusal must inspect nothing")
+        };
         let off = ProbeGate {
             enabled: true,
             check: false,
         };
         let refused = |label| DevToolList::refused(label);
         assert_eq!(
-            probe_devtool_list_with(off, Some(&bundled), ATERM, tcc, never_open, never_spawn),
+            probe_devtool_list_with(off, Some(&bundled), ATERM, tcc, never_open, never_inspect),
             refused(DevToolListLabel::RefusedDisabled)
         );
         assert_eq!(
-            probe_devtool_list_with(ProbeGate::on(), None, ATERM, tcc, never_open, never_spawn),
+            probe_devtool_list_with(ProbeGate::on(), None, ATERM, tcc, never_open, never_inspect),
             refused(DevToolListLabel::RefusedNoExe)
         );
         assert_eq!(
@@ -9517,7 +9747,7 @@ mod tests {
                 ATERM,
                 tcc,
                 never_open,
-                never_spawn
+                never_inspect
             ),
             refused(DevToolListLabel::RefusedOutOfBundle)
         );
@@ -9528,7 +9758,7 @@ mod tests {
                 "com.aterm.aterm|0|2",
                 tcc,
                 never_open,
-                never_spawn
+                never_inspect
             ),
             refused(DevToolListLabel::RefusedNoSubject)
         );
@@ -9544,7 +9774,7 @@ mod tests {
                     ATERM,
                     tcc,
                     |_| ProbeOutcome::Errno(errno),
-                    never_spawn
+                    never_inspect
                 ),
                 refused(label),
                 "errno {errno}"
@@ -9553,14 +9783,14 @@ mod tests {
     }
 
     #[test]
-    fn the_list_probe_opens_once_and_spawns_only_the_sqlite_argv() {
+    fn the_list_probe_opens_once_and_reads_in_process_without_spawning() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
         let subject = "com.example.subject";
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("TCC.db");
-        std::fs::write(&db, b"SQLite format 3\0").expect("db");
+        std::fs::write(&db, db_of(&[db_row(subject, 0, 0, 7)])).expect("db");
         let mut opened: Vec<PathBuf> = Vec::new();
-        let mut seen: Vec<(String, Vec<String>)> = Vec::new();
+        let mut reads = 0usize;
         let got = probe_devtool_list_with(
             ProbeGate::on(),
             Some(&bundled),
@@ -9570,56 +9800,72 @@ mod tests {
                 opened.push(db.to_path_buf());
                 ProbeOutcome::Ok
             },
-            |program, args| {
-                seen.push((
-                    program.to_string(),
-                    args.iter().map(|a| (*a).to_string()).collect(),
-                ));
-                db_of(&[db_row(subject, 0, 0, 7)])
+            |main, wal| {
+                reads += 1;
+                assert!(wal.is_none(), "no -wal beside a plain db");
+                classify_devtool_db_bytes(main, wal, subject)
             },
         );
         assert_eq!(got, listed(DevToolListing::Off, Some(7)));
         assert_eq!(opened, vec![db.clone()]);
+        assert_eq!(reads, 1, "one in-memory snapshot read");
         assert_eq!(
             SYSTEM_TCC_DB,
             "/Library/Application Support/com.apple.TCC/TCC.db"
         );
-        assert_eq!(seen.len(), 1, "exactly one run");
-        let (program, args) = &seen[0];
-        assert_eq!(program, "/usr/bin/sqlite3");
-        let target = aterm_uds::foreign_db::immutable_uri(&db);
-        assert!(target.ends_with("/TCC.db?immutable=1"), "{target}");
-        let expected: Vec<String> = devtool_db_args(&target)
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        assert_eq!(args, &expected);
-        for flag in ["-readonly", "-safe", "-nofollow", "-bail"] {
-            assert!(args.iter().any(|a| a == flag), "{flag}");
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::io::{BufRead as _, Write as _};
+            let wal_db = std::fs::canonicalize(dir.path())
+                .expect("canonical")
+                .join("TCC-wal.db");
+            let mut holder = aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+                .arg(&wal_db)
+                .stdin(aterm_uds::spawnfd::Stdio::piped())
+                .stdout(aterm_uds::spawnfd::Stdio::piped())
+                .spawn()
+                .expect("sqlite3 holder");
+            let mut stdin = holder.stdin.take().expect("stdin");
+            writeln!(
+                stdin,
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; {TCC_ACCESS_DDL}; \
+                 INSERT INTO access VALUES ('kTCCServiceDeveloperTool', '{subject}', 0, 2, NULL, 42); \
+                 SELECT 'wal-ready';"
+            )
+            .expect("write wal");
+            stdin.flush().expect("flush wal");
+            let mut lines = std::io::BufReader::new(holder.stdout.take().expect("stdout")).lines();
+            while let Some(Ok(line)) = lines.next() {
+                if line == "wal-ready" {
+                    break;
+                }
+            }
+            let mut saw_wal = false;
+            let wal_got = probe_devtool_list_with(
+                ProbeGate::on(),
+                Some(&bundled),
+                subject,
+                &wal_db,
+                |_| ProbeOutcome::Ok,
+                |main, wal| {
+                    saw_wal = wal.is_some();
+                    classify_devtool_db_bytes(main, wal, subject)
+                },
+            );
+            let _ = holder.kill();
+            let _ = holder.wait();
+            assert!(saw_wal, "uncheckpointed -wal bytes read in memory");
+            assert_eq!(wal_got, listed(DevToolListing::On, Some(42)));
         }
-        assert_eq!(
-            args.iter().position(|a| a == "-init").map(|i| &args[i + 1]),
-            Some(&"/dev/null".to_string()),
-            "no ~/.sqliterc"
-        );
-        assert!(
-            args.iter().all(|a| !a.contains("example")),
-            "the subject never reaches an argv: {args:?}"
-        );
-        assert!(
-            DEVTOOL_DB_QUERY.contains("hex(client)")
-                && DEVTOOL_DB_QUERY.contains("'kTCCServiceDeveloperTool'")
-                && DEVTOOL_DB_QUERY.starts_with("SELECT "),
-            "a read of the Developer Tools rows only"
-        );
     }
 
     #[test]
     fn a_list_read_that_meets_a_write_is_read_again() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("TCC.db");
-        std::fs::write(&db, b"SQLite format 3\0").expect("db");
         let subject = "com.example.subject";
+        std::fs::write(&db, db_of(&[db_row(subject, 0, 2, 9)])).expect("db");
         let write = || {
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
@@ -9628,10 +9874,10 @@ mod tests {
             std::io::Write::write_all(&mut f, b"x").expect("write");
         };
         let mut runs = 0;
-        let got = read_devtool_db(&db, subject, |_, _| {
+        let got = read_devtool_db(&db, |_, _| {
             runs += 1;
             write();
-            db_of(&[db_row(subject, 0, 2, 9)])
+            Some(listed(DevToolListing::On, Some(9)))
         });
         assert_eq!(got, DevToolList::refused(DevToolListLabel::ToolFailed));
         assert_eq!(
@@ -9639,12 +9885,12 @@ mod tests {
             "read again while each read met a write"
         );
         let mut runs = 0;
-        let got = read_devtool_db(&db, subject, |_, _| {
+        let got = read_devtool_db(&db, |_, _| {
             runs += 1;
             if runs == 1 {
                 write();
             }
-            db_of(&[db_row(subject, 0, 2, 9)])
+            Some(listed(DevToolListing::On, Some(9)))
         });
         assert_eq!(got, listed(DevToolListing::On, Some(9)));
         assert_eq!(runs, 2);
@@ -9659,7 +9905,7 @@ mod tests {
             .join("TCC.db");
         let subject = "com.example.subject";
         let sqlite = |sql: &str| {
-            aterm_uds::spawnfd::command(SQLITE_TOOL)
+            aterm_uds::spawnfd::command("/usr/bin/sqlite3")
                 .arg(&db)
                 .arg(sql)
                 .output()
@@ -9690,11 +9936,7 @@ mod tests {
                     subject,
                     &db,
                     |_| ProbeOutcome::Ok,
-                    |program, args| {
-                        let args: Vec<&std::ffi::OsStr> =
-                            args.iter().map(std::ffi::OsStr::new).collect();
-                        run_bounded_exit(program, &args, DEVTOOL_DB_CEILING, TOOL_OUTPUT_MAX_BYTES)
-                    },
+                    |main, wal| classify_devtool_db_bytes(main, wal, subject),
                 )
             },
             || sqlite(switch_on),
@@ -9710,11 +9952,15 @@ mod tests {
         assert_eq!(read, listed(DevToolListing::Off, Some(7)));
         let wrote = sqlite(switch_on);
         assert!(wrote.status.success(), "{wrote:?}");
-        let after = sqlite(
-            "SELECT auth_value, last_modified FROM access \
-             WHERE service = 'kTCCServiceDeveloperTool';",
+        let after = probe_devtool_list_with(
+            ProbeGate::on(),
+            Some(&bundled),
+            subject,
+            &db,
+            |_| ProbeOutcome::Ok,
+            |main, wal| classify_devtool_db_bytes(main, wal, subject),
         );
-        assert_eq!(String::from_utf8_lossy(&after.stdout), "2|8\n");
+        assert_eq!(after, listed(DevToolListing::On, Some(8)));
     }
 
     #[test]

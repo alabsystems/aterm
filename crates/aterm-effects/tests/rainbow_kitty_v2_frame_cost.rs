@@ -6,6 +6,7 @@
 use std::time::{Duration, Instant};
 
 use crate::alloc_count::{SIZE_SLOTS, allocations_during, assert_counter_is_per_thread};
+use crate::common::Ground;
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, SoundCue, band_pos};
 use aterm_effects::rainbow_kitty::{
     CaretSeam, Config, Dir, Engine, Event, Frame, Licence, TypedClass, witness::WITNESS_ROWS,
@@ -39,9 +40,15 @@ fn geometry() -> Geom {
     }
 }
 
-/// Shipped-default dark rainbow kitty configuration.
-fn glow_config() -> GlowConfig {
-    GlowConfig {
+/// The grounds every scenario runs on: the shipped default's dark one, and
+/// Default Light (main's paper arm).
+pub(crate) fn grounds() -> [Ground; 2] {
+    [Ground::TOKYO, Ground::scheme("Default Light")]
+}
+
+/// Shipped-default rainbow kitty configuration on `ground`.
+fn glow_config(ground: Ground) -> GlowConfig {
+    ground.lay(GlowConfig {
         classic_mono: false,
         ribbon_tall: true,
         ribbon_flat: false,
@@ -60,7 +67,7 @@ fn glow_config() -> GlowConfig {
         ring: true,
         beam: false,
         head_dx: 0.5,
-    }
+    })
 }
 
 /// The row every scenario types on.
@@ -423,7 +430,7 @@ struct V2 {
 }
 
 impl V2 {
-    fn new() -> Self {
+    fn new(ground: Ground) -> Self {
         let geom = geometry();
         let mut eng = Engine::new();
         eng.set_engaged(true);
@@ -433,7 +440,7 @@ impl V2 {
         }
         Self {
             eng,
-            cfg: Config::from_glow(&glow_config(), false),
+            cfg: Config::from_glow(&glow_config(ground), false),
             geom,
             blank,
             under: Vec::with_capacity(MAX_QUADS),
@@ -591,10 +598,10 @@ struct Host {
 const WITHHOLD_EVERY: u64 = 8;
 
 impl Host {
-    fn seam() -> Self {
+    fn seam(ground: Ground) -> Self {
         Self {
             glow: CursorGlow::default(),
-            cfg: glow_config(),
+            cfg: glow_config(ground),
             geom: geometry(),
             quads: Vec::with_capacity(MAX_QUADS),
             laid: [Vec::with_capacity(MAX_QUADS), Vec::with_capacity(MAX_QUADS)],
@@ -933,11 +940,11 @@ fn measure(d: &mut dyn Driver, sc: &Scenario) -> Report {
     rep
 }
 
-/// Warms and measures engine `tag` (`"v2"` or `"v2s"`) on scenario `sc`.
-pub(crate) fn measure_cell(tag: &str, sc: &Scenario) -> Report {
+/// Warms and measures engine `tag` (`"v2"` or `"v2s"`) on scenario `sc` on `ground`.
+pub(crate) fn measure_cell(tag: &str, sc: &Scenario, ground: Ground) -> Report {
     match tag {
-        "v2" => measure(&mut V2::new(), sc),
-        _ => measure(&mut Host::seam(), sc),
+        "v2" => measure(&mut V2::new(ground), sc),
+        _ => measure(&mut Host::seam(ground), sc),
     }
 }
 
@@ -964,10 +971,11 @@ pub(crate) fn print_row(engine: &str, sc: &Scenario, r: &Report) {
     );
 }
 
-pub(crate) fn print_header(mode: &str) {
+pub(crate) fn print_header(mode: &str, ground: Ground) {
     println!();
     println!(
-        "rainbow kitty v2 frame cost — {mode} — {HZ} Hz tick, geometry 18×40 px, 190×26 cells"
+        "rainbow kitty v2 frame cost — {mode} — {HZ} Hz tick, geometry 18×40 px, 190×26 cells, on {}",
+        ground.name
     );
     println!(
         "| {:<44} | eng | p50µs | p90µs |  maxµs | fpµs | quads max (mean; under / out, out px max)                  | hal | all | warm-up allocs / pass |",
@@ -1010,7 +1018,8 @@ fn print_allocs(sc: &Scenario, r: &Report) {
     }
 }
 
-/// Verify zero steady/idle allocations, idle-to-zero within [`IDLE_CEILING_MS`], and stream caps.
+/// Verify zero steady/idle allocations, idle-to-zero within [`IDLE_CEILING_MS`], and stream caps,
+/// on every ground ([`grounds`]).
 #[test]
 fn rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero() {
     use crate::common::par_map;
@@ -1021,109 +1030,117 @@ fn rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero() {
     } else {
         "release build"
     };
-    print_header(mode);
+    let grounds = grounds();
     let scs = scenarios();
-    let cells: Vec<(usize, &str)> = (0..scs.len())
-        .flat_map(|i| ["v2", "v2s"].map(|tag| (i, tag)))
-        .filter(|&(_, tag)| engine_selected(tag))
+    let cells: Vec<(usize, usize, &str)> = (0..grounds.len())
+        .flat_map(|g| (0..scs.len()).flat_map(move |i| ["v2", "v2s"].map(|tag| (g, i, tag))))
+        .filter(|&(_, _, tag)| engine_selected(tag))
         .collect();
-    let measured = par_map(&cells, |&(i, tag)| measure_cell(tag, &scs[i]));
-    let mut reports: Vec<(Report, Report)> = scs.iter().map(|_| Default::default()).collect();
-    for (&(i, tag), report) in cells.iter().zip(measured) {
+    let measured = par_map(&cells, |&(g, i, tag)| {
+        measure_cell(tag, &scs[i], grounds[g])
+    });
+    let mut reports: Vec<Vec<(Report, Report)>> = grounds
+        .iter()
+        .map(|_| scs.iter().map(|_| Default::default()).collect())
+        .collect();
+    for (&(g, i, tag), report) in cells.iter().zip(measured) {
         match tag {
-            "v2" => reports[i].0 = report,
-            _ => reports[i].1 = report,
+            "v2" => reports[g][i].0 = report,
+            _ => reports[g][i].1 = report,
         }
     }
+    assert!(
+        grounds[0].dark() && !grounds[1].dark(),
+        "premise: the gate runs a dark ground and a light one"
+    );
     let mut reds: Vec<String> = Vec::new();
-    for (sc, (r2, rs)) in scs.iter().zip(&reports) {
-        if engine_selected("v2") {
-            print_row("v2 ", sc, r2);
-        }
-        if engine_selected("v2s") {
-            print_row("v2s", sc, rs);
-        }
-        if engine_selected("v2") {
-            print_idle(sc, r2);
-        }
-        print_allocs(sc, r2);
-        if !engine_selected("v2") {
-            continue;
-        }
+    for (ground, reports) in grounds.iter().zip(&reports) {
+        print_header(mode, *ground);
+        for (sc, (r2, rs)) in scs.iter().zip(reports) {
+            let at = format!("{} on {}", sc.name, ground.name);
+            if engine_selected("v2") {
+                print_row("v2 ", sc, r2);
+            }
+            if engine_selected("v2s") {
+                print_row("v2s", sc, rs);
+            }
+            if engine_selected("v2") {
+                print_idle(sc, r2);
+            }
+            print_allocs(sc, r2);
+            if !engine_selected("v2") {
+                continue;
+            }
 
-        if r2.live_ticks == 0 {
-            reds.push(format!(
-                "[{}] v2 fixture never drew (fp == 0 on every measured tick)",
-                sc.name
-            ));
-        }
-        if r2.allocs > 0 {
-            reds.push(format!(
-                "[{}] v2 allocated {} time(s) across the measured steady ticks (first ticks: {:?})",
-                sc.name,
-                r2.allocs,
-                r2.alloc_ticks
-                    .iter()
-                    .map(|(t, n, _, _)| (*t, *n))
-                    .collect::<Vec<_>>()
-            ));
-        }
-        if r2.idle_allocs > 0 {
-            reds.push(format!(
-                "[{}] v2 allocated {} time(s) while idling out",
-                sc.name, r2.idle_allocs
-            ));
-        }
-        if engine_selected("v2s") && rs.witness_feeds == 0 {
-            reds.push(format!(
-                "[{}] the seam fed the CONTENT WITNESS nothing: this gate prices \
-                 none of `observe_ribbon_row` / `Engine::witness_rows`",
-                sc.name
-            ));
-        }
-        if engine_selected("v2s") && rs.withheld_frames == 0 {
-            reds.push(format!(
-                "[{}] the seam withheld no row the witness asked for: this gate \
-                 prices no frame of `Witness::find_deferred_runs`",
-                sc.name
-            ));
-        }
-        if rs.allocs + rs.idle_allocs > 0 {
-            reds.push(format!(
-                "[{}] v2 THROUGH THE SEAM allocated {} time(s) on steady ticks (first: {:?})",
-                sc.name,
-                rs.allocs + rs.idle_allocs,
-                rs.alloc_ticks
-                    .iter()
-                    .map(|(t, n, sizes, _)| (*t, *n, sizes[0]))
-                    .collect::<Vec<_>>()
-            ));
-        }
-        if r2.warmup_allocs.last().copied().unwrap_or(1) != 0 {
-            reds.push(format!(
-                "[{}] v2 never reached a pass with zero allocations in {WARMUP_PASSES_MAX} warm-up passes: {:?}",
-                sc.name, r2.warmup_allocs
-            ));
-        }
-        match r2.idle.zero {
-            Some(ms) if ms <= IDLE_CEILING_MS => {}
-            Some(ms) => reds.push(format!("[{}] v2 reached idle-zero only at {ms} ms after the last key", sc.name)),
-            None => reds.push(format!(
-                "[{}] v2 never reached idle-zero within {IDLE_CEILING_MS} ms (stars {}, cells {}, meteors {}, fp {}, cadence {}, deadline {})",
-                sc.name,
-                fmt_ms(r2.idle.stars),
-                fmt_ms(r2.idle.cells),
-                fmt_ms(r2.idle.meteors),
-                fmt_ms(r2.idle.fp),
-                fmt_ms(r2.idle.cadence),
-                fmt_ms(r2.idle.deadline),
-            )),
-        }
-        if r2.idle.zero.is_some() && !r2.idle.wrote_nothing_after {
-            reds.push(format!(
-                "[{}] v2 wrote geometry on the tick after idle-zero",
-                sc.name
-            ));
+            if r2.live_ticks == 0 {
+                reds.push(format!(
+                    "[{at}] v2 fixture never drew (fp == 0 on every measured tick)"
+                ));
+            }
+            if r2.allocs > 0 {
+                reds.push(format!(
+                    "[{at}] v2 allocated {} time(s) across the measured steady ticks (first ticks: {:?})",
+                    r2.allocs,
+                    r2.alloc_ticks
+                        .iter()
+                        .map(|(t, n, _, _)| (*t, *n))
+                        .collect::<Vec<_>>()
+                ));
+            }
+            if r2.idle_allocs > 0 {
+                reds.push(format!(
+                    "[{at}] v2 allocated {} time(s) while idling out",
+                    r2.idle_allocs
+                ));
+            }
+            if engine_selected("v2s") && rs.witness_feeds == 0 {
+                reds.push(format!(
+                    "[{at}] the seam fed the CONTENT WITNESS nothing: this gate prices \
+                     none of `observe_ribbon_row` / `Engine::witness_rows`"
+                ));
+            }
+            if engine_selected("v2s") && rs.withheld_frames == 0 {
+                reds.push(format!(
+                    "[{at}] the seam withheld no row the witness asked for: this gate \
+                     prices no frame of `Witness::find_deferred_runs`"
+                ));
+            }
+            if rs.allocs + rs.idle_allocs > 0 {
+                reds.push(format!(
+                    "[{at}] v2 THROUGH THE SEAM allocated {} time(s) on steady ticks (first: {:?})",
+                    rs.allocs + rs.idle_allocs,
+                    rs.alloc_ticks
+                        .iter()
+                        .map(|(t, n, sizes, _)| (*t, *n, sizes[0]))
+                        .collect::<Vec<_>>()
+                ));
+            }
+            if r2.warmup_allocs.last().copied().unwrap_or(1) != 0 {
+                reds.push(format!(
+                    "[{at}] v2 never reached a pass with zero allocations in {WARMUP_PASSES_MAX} warm-up passes: {:?}",
+                    r2.warmup_allocs
+                ));
+            }
+            match r2.idle.zero {
+                Some(ms) if ms <= IDLE_CEILING_MS => {}
+                Some(ms) => reds.push(format!(
+                    "[{at}] v2 reached idle-zero only at {ms} ms after the last key"
+                )),
+                None => reds.push(format!(
+                    "[{at}] v2 never reached idle-zero within {IDLE_CEILING_MS} ms (stars {}, cells {}, meteors {}, fp {}, cadence {}, deadline {})",
+                    fmt_ms(r2.idle.stars),
+                    fmt_ms(r2.idle.cells),
+                    fmt_ms(r2.idle.meteors),
+                    fmt_ms(r2.idle.fp),
+                    fmt_ms(r2.idle.cadence),
+                    fmt_ms(r2.idle.deadline),
+                )),
+            }
+            if r2.idle.zero.is_some() && !r2.idle.wrote_nothing_after {
+                reds.push(format!(
+                    "[{at}] v2 wrote geometry on the tick after idle-zero"
+                ));
+            }
         }
     }
     assert!(

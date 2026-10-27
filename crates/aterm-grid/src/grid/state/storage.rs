@@ -510,7 +510,8 @@ impl GridStorage {
         col.min(self.max_col_for_row(row))
     }
 
-    /// Apply new viewport dimensions and clamp cursor-owned state to fit.
+    /// Apply new viewport dimensions and clamp cursor-owned state to fit; the resize then places
+    /// the cursor's next write and its pending wrap (`Grid::place_next_write`).
     pub(crate) fn resize_viewport_state(&mut self, new_rows: u16, new_cols: u16) {
         if new_cols != self.cols {
             // Only grow tab_stops, never shrink, preserving custom stops beyond
@@ -536,7 +537,6 @@ impl GridStorage {
 
         self.reset_scroll_region();
         self.reset_horizontal_margins();
-        self.clear_pending_wrap();
     }
 
     /// Get the current scroll region.

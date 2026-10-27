@@ -2700,7 +2700,9 @@ impl MessageCenter {
         filed_at.saturating_add(resurface.backed_off(n)) > stamp.unix_ms
     }
 
-    fn quiet_standing(&self, key: &str, stamp: WallStamp) -> Option<MessageId> {
+    /// The record under `key` that last ended, where a person filed it (folded, dismissed or
+    /// answered) at or before `stamp` (give or take [`FILING_SKEW_MS`]), and when.
+    fn last_filing(&self, key: &str, stamp: WallStamp) -> Option<(MessageId, u64)> {
         let last = self
             .log
             .records()
@@ -2710,13 +2712,36 @@ impl MessageCenter {
             last.retired(),
             Some(Retired::Folded | Retired::Dismissed | Retired::Answered { .. })
         );
-        let span = u64::try_from(crate::need::STANDING_QUIET.as_millis()).unwrap_or(u64::MAX);
         let filed_at = last.retired_unix_ms?;
-        if filed_at > stamp.unix_ms.saturating_add(FILING_SKEW_MS) {
-            return None;
+        (filed && filed_at <= stamp.unix_ms.saturating_add(FILING_SKEW_MS))
+            .then_some((last.id, filed_at))
+    }
+
+    fn quiet_standing(&self, key: &str, stamp: WallStamp) -> Option<MessageId> {
+        let (id, filed_at) = self.last_filing(key, stamp)?;
+        let span = u64::try_from(crate::need::STANDING_QUIET.as_millis()).unwrap_or(u64::MAX);
+        (filed_at.saturating_add(span) > stamp.unix_ms).then_some(id)
+    }
+
+    /// Whether a person filed the standing row under `key` (folded, dismissed or answered it),
+    /// however long ago, and nothing is live under it nor withdrew that filing since: a
+    /// reporter whose key names one episode of its cause holds the row back for the whole
+    /// episode by this, across relaunches ([`Self::end_filed_standing`] ends it).
+    #[must_use]
+    pub fn filed_standing(&self, key: &str, stamp: WallStamp) -> bool {
+        self.index_by_key(key).is_none() && self.last_filing(key, stamp).is_some()
+    }
+
+    /// The episode `key` names ended: the filing [`Self::filed_standing`] reads is withdrawn,
+    /// however old, so a new episode under the same key may ask again.
+    pub fn end_filed_standing(&mut self, key: &str, wall: WallStamp, now: Instant) -> bool {
+        if self.index_by_key(key).is_some() {
+            return false;
         }
-        let until = filed_at.saturating_add(span);
-        (filed && until > stamp.unix_ms).then_some(last.id)
+        let Some((read, _)) = self.last_filing(key, wall) else {
+            return false;
+        };
+        self.log.withdraw_read(read, wall.unix_ms, now)
     }
 
     fn file_digest_at(&mut self, i: usize, how: Retired, unix_ms: u64, now: Instant) {

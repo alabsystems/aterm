@@ -161,17 +161,17 @@ pub(crate) fn pty_resize_policy(master: i32) -> aterm_core::grid::ResizePolicy {
 }
 
 fn retire_torn_cursor_fx(window: &mut WindowState) {
-    window.fx.resight_torn(std::time::Instant::now());
+    window.fx.resight_torn(crate::metrics::host_now());
     retire_torn_cursor_fx_host(window);
 }
 
 fn regrid_torn_cursor_fx(window: &mut WindowState) {
-    window.fx.regrid_torn(std::time::Instant::now());
+    window.fx.regrid_torn(crate::metrics::host_now());
     retire_torn_cursor_fx_host(window);
 }
 
 fn retire_torn_cursor_fx_with(window: &mut WindowState, band: TornBand) {
-    window.fx.retire_torn(band, std::time::Instant::now());
+    window.fx.retire_torn(band, crate::metrics::host_now());
     retire_torn_cursor_fx_host(window);
 }
 
@@ -185,7 +185,7 @@ pub(crate) fn sync_cursor_effect_coordinate_space(
     // baseline and re-baselines the pet's probes on the new stream.
     if !window
         .fx
-        .fence_owner((terminal_id, alternate_screen), std::time::Instant::now())
+        .fence_owner((terminal_id, alternate_screen), crate::metrics::host_now())
     {
         return false;
     }
@@ -236,7 +236,7 @@ pub(crate) fn sync_cursor_effect_scroll(
     window: &mut WindowState,
     current: ContentScrollState,
 ) -> CursorEffectScrollChange {
-    window.fx.sync_scroll(current, std::time::Instant::now())
+    window.fx.sync_scroll(current, crate::metrics::host_now())
 }
 
 #[cfg(test)]
@@ -880,14 +880,20 @@ fn pending_native_leaf_damage(
         project = "aterm_gui::app_render::native_damage_tests::project_native_preview_font_convergence"
     )
 )]
+/// Raster `scene` into `cache`, patching the retained raster where its damage allows.
+/// `holes_before` is [`crate::tray_raster::chrome_text_holes`] from before the scene compiled: a
+/// full raster that added none (every char of its chrome text measured and drawn with a face)
+/// keeps the faces as they stand once it painted, so a face its own previews parsed while it
+/// painted (a terminal sample's fallback glyph, on a host whose fallback faces load on demand)
+/// does not draw it a second time.
 fn retain_native_leaf_raster(
     cache: &mut crate::LeafRenderCache,
     scene: crate::app_native::NativeLeafScene,
-    width: u32,
-    height: u32,
+    (width, height): (u32, u32),
     scale: f32,
     chrome: crate::chrome_band::ChromePalette,
     terminal_theme: Theme,
+    holes_before: u64,
 ) {
     let effective_damage = cache
         .native
@@ -987,6 +993,11 @@ fn retain_native_leaf_raster(
             regional_rasters,
             raster_fingerprint_once: std::sync::OnceLock::new(),
         });
+        if crate::tray_raster::chrome_text_holes() == holes_before
+            && let Some(raster) = cache.native.as_mut()
+        {
+            raster.stamp.coverage_epoch = crate::tray_raster::chrome_coverage_epoch();
+        }
     }
     cache.native_damage = None;
 }
@@ -1182,6 +1193,7 @@ pub(crate) fn pet_console_exclusions(
     find_open: bool,
     chrome: &[aterm_effects::pet_world::PetRect],
     menu: &[aterm_effects::pet_world::PetRect],
+    blanked: &[aterm_effects::pet_world::PetRect],
 ) -> PetExclusions {
     use aterm_effects::pet_world::PetRect;
     let mut ink = [PetRect::default(); PET_INK_SLOTS];
@@ -1224,12 +1236,24 @@ pub(crate) fn pet_console_exclusions(
             fold_into(&mut rects, &mut count, PET_EXCLUSIONS, rect);
         }
     }
+    let mut blank = [PetRect::default(); PET_BLANKED_SLOTS];
+    let mut blanks = 0;
+    if input.display_offset == 0 {
+        // Past the slots a tail is left out (its hidden letters read as ink), never folded: a
+        // hull of two blanks could take in letters the person sees.
+        for &rect in blanked.iter().filter(|r| r.valid()).take(PET_BLANKED_SLOTS) {
+            blank[blanks] = rect;
+            blanks += 1;
+        }
+    }
     PetExclusions {
         rects,
         overlays,
         count,
         ink,
         typed,
+        blank,
+        blanks,
         painted_over: None,
     }
 }
@@ -1263,6 +1287,10 @@ pub(crate) struct PetExclusions {
     count: usize,
     ink: [aterm_effects::pet_world::PetRect; PET_INK_SLOTS],
     typed: usize,
+    /// The glass the host's chrome blanks over the program's cells
+    /// (`crate::pet_chrome::PetChrome::held_blanked`).
+    blank: [aterm_effects::pet_world::PetRect; PET_BLANKED_SLOTS],
+    blanks: usize,
     /// The content sequence of the frame the host's chrome was painted over
     /// (`crate::pet_chrome::PetChrome::held_painted_over`).
     painted_over: Option<u64>,
@@ -1293,12 +1321,18 @@ impl PetExclusions {
         &self.ink[..self.typed]
     }
 
-    /// All three, as the pet's world observes them.
+    /// The glass the host's chrome blanks over the program's letters.
+    pub(crate) fn blanked(&self) -> &[aterm_effects::pet_world::PetRect] {
+        &self.blank[..self.blanks]
+    }
+
+    /// All four, as the pet's world observes them.
     pub(crate) fn reserve(&self) -> aterm_effects::pet_world::PetReserve<'_> {
         aterm_effects::pet_world::PetReserve {
             protected: self.chrome(),
             overlays: self.overlays(),
             ink: self.ink(),
+            blanked: self.blanked(),
             painted_over: self.painted_over,
         }
     }
@@ -1310,6 +1344,10 @@ pub(crate) const PET_EXCLUSIONS: usize = 16;
 const PET_OVERLAY_SLOTS: usize = 3;
 
 const PET_INK_SLOTS: usize = 2;
+
+/// The blanked spans [`pet_console_exclusions`] keeps: a rewritten mode row's tail and the row its
+/// effort hint wrapped to, with room to spare.
+const PET_BLANKED_SLOTS: usize = 4;
 
 #[cfg(test)]
 mod pet_console_observation_tests {
@@ -1326,7 +1364,7 @@ mod pet_console_observation_tests {
         let chrome = [PetRect::new(15.0, 30.0, 1.0, 5.0)];
         let menu = [PetRect::new(10.0, 50.0, 2.0, 6.0)];
         let exclusions =
-            pet_console_exclusions(&input, true, Some((7, 3, 9, 12)), true, &chrome, &menu);
+            pet_console_exclusions(&input, true, Some((7, 3, 9, 12)), true, &chrome, &menu, &[]);
         assert_eq!(exclusions.ink().len(), 2, "the preedit row and the guesses");
         assert_eq!(
             exclusions.overlays().len(),
@@ -1367,20 +1405,81 @@ mod pet_console_observation_tests {
                 "protected at ({row},{col})"
             );
         }
-        let none = pet_console_exclusions(&input, false, None, false, &[], &[]);
-        assert!(none.overlays().is_empty() && none.chrome().is_empty() && none.ink().is_empty());
+        let none = pet_console_exclusions(&input, false, None, false, &[], &[], &[]);
+        assert!(
+            none.overlays().is_empty()
+                && none.chrome().is_empty()
+                && none.ink().is_empty()
+                && none.blanked().is_empty()
+        );
 
         let mut term = Terminal::new(10, 40);
         term.process("line\r\n".repeat(15).as_bytes());
         term.scroll_display(3);
         let input = term.cell_frame(10, 40);
         assert_ne!(input.display_offset, 0);
-        let history = pet_console_exclusions(&input, true, Some((3, 4, 4, 5)), false, &[], &[]);
+        let blank = [PetRect::new(2.0, 0.0, 1.0, 10.0)];
+        let history =
+            pet_console_exclusions(&input, true, Some((3, 4, 4, 5)), false, &[], &[], &blank);
         assert!(
             history.overlays().is_empty()
                 && history.chrome().is_empty()
                 && history.ink().is_empty()
+                && history.blanked().is_empty()
         );
+    }
+
+    /// THE GLASS THE HOST BLANKS IS THE BLANK THE PERSON SEES: the program's letters under a
+    /// blanked span ([`aterm_effects::pet_world::PetReserve::blanked`], the tail of Claude Code's
+    /// mode row the footer rewrites) are no ink to the pet, while its letters past the span and
+    /// the host's words over the row's start ([`aterm_effects::pet_world::PetReserve::protected`])
+    /// stay what they were.
+    #[test]
+    fn blanked_glass_reads_as_the_blank_the_person_sees() {
+        let mut term = Terminal::new(20, 80);
+        let letters = "x".repeat(70);
+        term.process(format!("\x1b]11;#000000\x07\x1b[16;1H{letters}\x1b[3;1H").as_bytes());
+        let input = term.cell_frame(20, 80);
+        let facts = PetWorldFacts::read(&term, 7);
+        let words = [PetRect::new(15.0, 0.0, 1.0, 17.0)];
+        let blank = [PetRect::new(15.0, 17.0, 1.0, 43.0)];
+        let seen = |blanked: &[PetRect]| {
+            let exclusions =
+                pet_console_exclusions(&input, false, None, false, &words, &[], blanked);
+            assert_eq!(exclusions.blanked(), blanked);
+            let mut world = PetWorld::default();
+            assert!(world.observe_with_reserve(
+                &input,
+                &facts,
+                PetPane::full(&input),
+                exclusions.reserve(),
+            ));
+            world
+        };
+        let (world, unblanked) = (seen(&blank), seen(&[]));
+        let tail = PetRect::new(15.0, 30.0, 1.0, 6.0);
+        assert!(world.clear(tail, 0.0), "the blanked tail is free glass");
+        assert!(
+            !unblanked.clear(tail, 0.0) && unblanked.under_text_clear(tail, 0.0),
+            "CONTROL: unblanked, the letters there are ink"
+        );
+        for (what, cell) in [
+            ("the host's words", PetRect::new(15.0, 10.0, 1.0, 1.0)),
+            (
+                "the program's letters past the blank",
+                PetRect::new(15.0, 65.0, 1.0, 1.0),
+            ),
+        ] {
+            assert_eq!(
+                (world.clear(cell, 0.0), world.under_text_clear(cell, 0.0)),
+                (
+                    unblanked.clear(cell, 0.0),
+                    unblanked.under_text_clear(cell, 0.0)
+                ),
+                "{what} read as they did"
+            );
+            assert!(!world.clear(cell, 0.0), "{what} are not free glass");
+        }
     }
 }
 
@@ -9256,6 +9355,7 @@ impl App {
             .map_or(Some(crate::native_app::DamageRegion::All), |cache| {
                 pending_native_leaf_damage(cache, stamp, width, height)
             });
+        let holes_before = crate::tray_raster::chrome_text_holes();
         let compiled = if damage.is_some() {
             match self.compiled_native_ui_for(id, instance, view, viewport) {
                 Ok(compiled) => Some(compiled),
@@ -9280,11 +9380,11 @@ impl App {
                     damage,
                     compiled,
                 },
-                width,
-                height,
+                (width, height),
                 scale,
                 page,
                 terminal_theme,
+                holes_before,
             );
             true
         } else {
@@ -9296,6 +9396,8 @@ impl App {
             }
             return false;
         };
+        // What the raster holds: the faces it painted with, where its paint parsed one.
+        let stamp = base_raster.stamp;
         let compiled = &base_raster.compiled;
         let fp = {
             use std::hash::{Hash, Hasher};
@@ -9963,7 +10065,6 @@ impl App {
                         abandoned = true;
                         break;
                     };
-                    stamp.hash(&mut native_fp);
                     let Some(mut cache) = self.windows.get_mut(&id).map(|window| {
                         window
                             .leaf_render_cache
@@ -9976,6 +10077,7 @@ impl App {
                     if let Some(damage) =
                         pending_native_leaf_damage(&cache, stamp, leaf_width, leaf_height)
                     {
+                        let holes_before = crate::tray_raster::chrome_text_holes();
                         let Ok(scene) = self.build_native_leaf_scene(
                             id,
                             native.instance,
@@ -9994,14 +10096,17 @@ impl App {
                         retain_native_leaf_raster(
                             &mut cache,
                             scene,
-                            leaf_width,
-                            leaf_height,
+                            (leaf_width, leaf_height),
                             scale,
                             self.chrome_palette(ChromeSurface::NativePage),
                             self.theme,
+                            holes_before,
                         );
                         any_leaf_rasterized = true;
                     }
+                    // What the raster holds: the faces it painted with, where its paint parsed one.
+                    let stamp = cache.native.as_ref().map_or(stamp, |raster| raster.stamp);
+                    stamp.hash(&mut native_fp);
                     let x = (leaf.rect.origin.x * cw as f32).round().max(0.0) as u32;
                     let y = (leaf.rect.origin.y * ch as f32).round().max(0.0) as u32;
                     if let Some(raster) = cache.native.as_mut() {
@@ -10427,7 +10532,7 @@ impl App {
         let acquire_wait_ns = self.last_acquire_wait_ns(id);
         self.reveal_successfully_presented_window(id);
         let app_frame_interval = self.frame_interval;
-        let presented_at = Instant::now();
+        let presented_at = crate::metrics::host_now();
         let present = self.windows.get_mut(&id).map(|state| {
             let present = acknowledge_successful_present(
                 state,
@@ -10601,8 +10706,11 @@ impl App {
             }
         }
 
+        // A present at a pinned clock's instant feeds no wall-clock cost to the latch: the
+        // dump's `cost` events are its presents' costs (`crate::trail_rig::TrailRig::present_cost`).
         if let Some(present) = present
             && !present.offscreen
+            && !crate::metrics::host_clock_pinned()
             && self.note_present_cost(render_ns, present.frame_interval, frame_started)
         {
             aterm_log::info!(
@@ -11011,6 +11119,43 @@ impl App {
         self.redraw_window_with_layout(id, None, Some(frame_started));
     }
 
+    /// One live present of `id` at `now` onto its scripted CPU surface, as the event loop's
+    /// redraw draws a frame (the single-pane redraw through `cursor_frame_for_present`, a split's
+    /// composed one): the glass's size and `0x00RRGGBB` pixels after it, or `None` when a
+    /// synchronized update held the frame. `lab trail-diff`'s dump ([`crate::trail_rig`]).
+    ///
+    /// # Errors
+    /// When the window presents onto no scripted CPU surface.
+    #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
+    pub(crate) fn presented_frame_at(
+        &mut self,
+        id: WindowId,
+        now: Instant,
+    ) -> Result<Option<crate::present::scripted::Glass>, String> {
+        let commits = |app: &Self| match app.windows.get(&id).and_then(|ws| ws.present.as_ref()) {
+            Some(PresentTarget::Cpu { surface }) => surface.scripted().map(|s| s.commits()),
+            _ => None,
+        };
+        let before = commits(self).ok_or("the window presents onto no scripted CPU surface")?;
+        self.redraw_window_with_layout(id, None, Some(now));
+        let held = self
+            .windows
+            .get(&id)
+            .is_some_and(|ws| ws.sync_holding_gauge.is_held_for_test());
+        if held && commits(self) == Some(before) {
+            return Ok(None);
+        }
+        let Some(PresentTarget::Cpu { surface }) =
+            self.windows.get(&id).and_then(|ws| ws.present.as_ref())
+        else {
+            return Err("the present dropped its scripted CPU surface".into());
+        };
+        let glass = surface
+            .scripted()
+            .ok_or("the present dropped its scripted CPU surface")?;
+        Ok(Some((glass.size(), glass.glass().to_vec())))
+    }
+
     /// Redraw from a canonical visible-leaf layout the caller resolved in this same synchronous main-thread turn.
     pub(crate) fn redraw_window_from_layout(
         &mut self,
@@ -11066,7 +11211,7 @@ impl App {
         match ws0.present.as_ref() {
             Some(PresentTarget::Gpu { .. }) if self.backend.is_gpu() && window.is_some() => {}
             Some(PresentTarget::Cpu { .. }) if !self.backend.is_gpu() && window.is_some() => {}
-            #[cfg(test)]
+            #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
             Some(PresentTarget::Cpu { surface })
                 if !self.backend.is_gpu() && surface.scripted().is_some() => {}
             Some(PresentTarget::Virtual { .. }) if self.backend.is_gpu() => {}
@@ -11617,6 +11762,7 @@ impl App {
                     ws.search.is_some(),
                     ws.pet_chrome.held(),
                     ws.pet_chrome.held_overlays(),
+                    ws.pet_chrome.held_blanked(),
                 )
                 .painted_over(ws.pet_chrome.held_painted_over());
                 // Refilled above by a damage-consuming fill (a chrome-row
@@ -15212,6 +15358,7 @@ impl App {
                 ws.search.is_some(),
                 ws.pet_chrome.held(),
                 ws.pet_chrome.held_overlays(),
+                ws.pet_chrome.held_blanked(),
             )
             .painted_over(ws.pet_chrome.held_painted_over());
             // Refilled this frame by a damage-consuming fill; one that
@@ -17726,7 +17873,7 @@ impl App {
             return false;
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.fx.cursor_mut().glow.curtain(std::time::Instant::now());
+            ws.fx.cursor_mut().glow.curtain(crate::metrics::host_now());
             ws.fx.cursor_mut().trail.reset();
             ws.rows = rows;
             ws.cols = cols;

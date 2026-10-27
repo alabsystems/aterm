@@ -148,4 +148,16 @@ impl Ctl {
         self.send(line);
         self.ok("key enter");
     }
+
+    /// Type `line` and its Enter into session `sid`, in one `@<sid> feed-bin` frame.
+    pub fn type_line_to(&mut self, sid: &str, line: &str) {
+        let reply = self
+            .client
+            .request_frame(&format!("@{sid} feed-bin"), format!("{line}\r").as_bytes())
+            .unwrap_or_else(|e| panic!("@{sid} feed-bin {line:?}: no reply ({e})"));
+        assert!(
+            reply.starts_with("OK"),
+            "@{sid} feed-bin {line:?} answered {reply:?}"
+        );
+    }
 }

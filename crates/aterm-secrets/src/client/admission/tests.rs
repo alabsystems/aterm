@@ -35,7 +35,7 @@ impl Lab {
         )
         .unwrap();
         let paths = Paths::for_home(&root.path().join("m1"));
-        create(
+        test_create_with_password(
             &paths,
             &format!("http://{}/v1/alab", server.addr),
             None,
@@ -176,13 +176,9 @@ fn check(lab: &Lab, admin: &Admin, host: &str, foreign: bool) -> bool {
     let approved = admin
         .auto_approve_commons_member(&journal, host, pending.verify(&answer).unwrap())
         .is_ok();
-    if foreign
-        || admin
-            .commons_admission(host)
-            .is_some_and(|e| e.method == Method::Open)
-    {
-        // Without the provenance/genesis gate this otherwise valid authority,
-        // audience, candidate and possession would produce a certificate.
+    if foreign {
+        // Without the genesis gate this otherwise valid authority, audience,
+        // candidate and possession would produce a certificate.
         let (mut pending, challenge) =
             Pending::issue(&request, trust.network, trust.authority).unwrap();
         let answer = request.answer(&lab.peer, &[25; 32], &challenge).unwrap();
@@ -209,7 +205,7 @@ pub(crate) fn admission_transition(state: &ModelState, action: &str) -> ModelSta
         }
         "OpenClosed" => {
             lab.queue(true, true);
-            (3, 1)
+            (3, 2)
         }
         "Removed" | "Readded" => {
             lab.add(true, true);
@@ -311,10 +307,9 @@ pub(crate) fn admission_transition(state: &ModelState, action: &str) -> ModelSta
     let mut admin = admin_open(&lab.paths).unwrap();
     if matches!(action, "Password" | "OpenClosed") {
         let shared = matches!(admin.doc.commons_audience(), Some(Audience::Hosts(hosts)) if hosts.iter().any(|host| host == "m2"));
-        assert_eq!(
+        assert!(
             shared,
-            action == "Password",
-            "only qualified approval automatically shares the control descriptor"
+            "{action}: an approval shares the control descriptor in its own publication"
         );
         let mut doc = admin.doc.clone();
         share(&mut doc, &["m1", "m2"]);
@@ -333,9 +328,7 @@ pub(crate) fn admission_transition(state: &ModelState, action: &str) -> ModelSta
         admin.doc.add_machine("m2", &lab.peer_key()).unwrap();
         share(&mut admin.doc, &["m1", "m2"]);
     }
-    let evidence = admin
-        .commons_admission(host)
-        .map_or(0, |e| if e.method.qualifies() { 2 } else { 1 });
+    let evidence = admin.commons_admission(host).map_or(0, |_| 2);
     assert_eq!(evidence, expected_evidence);
     let allowed = check(&lab, &admin, host, action == "ForeignRoot");
     let mut next = state.clone();
@@ -363,9 +356,9 @@ fn admission_matches_real_approval_publication_and_certificate_paths() {
         );
     }
     let mut mutant = admission_transition(&initial, "OpenClosed");
-    mutant.insert("allowed", 1);
+    mutant.insert("allowed", 0);
     assert!(!model.successors("OpenClosed", &initial).contains(&mutant));
-    assert!(!model.check_invariant("EvidenceRequired", &mutant));
+    assert!(!model.check_invariant("QualifiedWorks", &mutant));
 }
 
 #[test]

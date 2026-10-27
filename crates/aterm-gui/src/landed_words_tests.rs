@@ -712,6 +712,10 @@ fn the_hover_asks_no_redraw_past_a_settings_tab_ahead_of_its_own() {
     });
     tell(&mut app, &sid, Some(TaskFace::Open));
     app.redraw_window(wid);
+    // Where the strip is aterm's own pixels (Linux, Windows) the chrome fonts install after the
+    // first present, so it is not kept waiting, and ask the window holding the Settings page for
+    // the frame that draws with them.
+    app.redraw_window(wid);
     assert!(
         app.windows[&wid]
             .last_present

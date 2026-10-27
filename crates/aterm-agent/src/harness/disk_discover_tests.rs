@@ -1187,6 +1187,67 @@ fn the_largest_hogs_are_what_no_row_frees_biggest_first() {
     );
 }
 
+/// A hog says how long ago anything in it was built: the newest write into any of its profiles,
+/// across every build directory it stands for, so 160 GiB a finished session left reads apart
+/// from a build writing now; a hog no profile dates says nothing of it.
+#[test]
+fn a_hog_says_when_it_was_last_built() {
+    const NOW: i64 = 1_000_000;
+    const HOUR: i64 = 3_600;
+    let profile = |dir: &str, ago: i64| crate::harness::disk::target::Profile {
+        path: PathBuf::from(dir).join("release"),
+        last_used: Some(NOW - ago),
+        incremental: false,
+        in_use: None,
+        bytes: 0,
+        bytes_partial: false,
+    };
+    let td =
+        |path: &str, profiles: Vec<crate::harness::disk::target::Profile>, gib: u64| TargetDir {
+            path: PathBuf::from(path),
+            marker: Some("CACHEDIR.TAG".to_owned()),
+            holds_source: None,
+            walk_cut_short: None,
+            profiles,
+            device: Some(1),
+            volume: None,
+            probed_recent: false,
+            origin: Origin::Bootstrap {
+                repo: PathBuf::from("/h/trust"),
+                slim: true,
+            },
+            owned: Owned::NotOwned,
+            total: Some((gib * GIB, false)),
+            foreign: None,
+            idle: None,
+        };
+    let mut s = Survey::new(NOW);
+    s.home = Some(PathBuf::from("/h"));
+    let rustc = "/h/trust/build/aarch64/stage1-rustc";
+    let tools = "/h/trust/build/aarch64/bootstrap-tools";
+    s.targets = vec![
+        td(rustc, vec![profile(rustc, 3 * 24 * HOUR)], 36),
+        td(tools, vec![profile(tools, 10 * HOUR + 59)], 41),
+    ];
+    let rep = report(&s, Config::default());
+    assert_eq!(rep.hogs[0].built_s_ago, Some(10 * HOUR + 59), "the newest");
+    let line = rep.hogs[0].line(rep.home.as_deref());
+    assert!(
+        line.starts_with("$HOME/trust/build 77.0 GiB, last built 10h ago (x.py bootstrap"),
+        "{line}"
+    );
+    assert!(
+        rep.to_json().contains("\"built_s_ago\":36059"),
+        "{}",
+        rep.to_json()
+    );
+    s.targets = vec![td(rustc, Vec::new(), 36)];
+    let rep = report(&s, Config::default());
+    assert_eq!(rep.hogs[0].built_s_ago, None);
+    let line = rep.hogs[0].line(rep.home.as_deref());
+    assert!(!line.contains("last built"), "{line}");
+}
+
 #[test]
 fn the_hogs_a_tick_hands_the_window_name_what_the_pass_left() {
     use crate::harness::cli::{DiskLook, DiskTick, disk_tick};
@@ -1915,8 +1976,9 @@ fn other_apps_data_is_never_entered_from_any_root() {
         symlink(&wt_in_container, &wt_link).unwrap();
         std::fs::write(wt_meta.join("gitdir"), format!("{}\n", wt_link.display())).unwrap();
         let hidden_cache_parent = home.join("Library/Containers/com.other.App/Data/build-cache");
-        let hidden_cache = hidden_cache_parent.join("cargo-build.noindex");
-        lay_target(&hidden_cache.join("fixture/.cargo-build"));
+        for cache in [".ubd/cargo-build.noindex", "cargo-build.noindex"] {
+            lay_target(&hidden_cache_parent.join(cache).join("fixture/.cargo-build"));
+        }
         symlink(&hidden_cache_parent, home.join("Library/Caches/aterm")).unwrap();
     }
 

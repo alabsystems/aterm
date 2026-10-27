@@ -222,13 +222,13 @@ fn accepted_over(
 
 /// The display a run drives.
 #[derive(Clone, Debug)]
-struct Display {
-    primary: Monitor,
-    second: Monitor,
+pub(crate) struct Display {
+    pub(crate) primary: Monitor,
+    pub(crate) second: Monitor,
 }
 
 /// Run [`desk::HELPER`] with `args` in the runner's desktop, windowless.
-fn desk(up: &Up, args: &[&str]) -> Result<String, String> {
+pub(crate) fn desk(up: &Up, args: &[&str]) -> Result<String, String> {
     let out = run_on_desktop(
         up,
         &task_name("desk"),
@@ -258,7 +258,10 @@ fn monitors(up: &Up) -> Result<Vec<Monitor>, String> {
 }
 
 /// Wait (a hang detector) until `probe` holds: its value, or what it last saw.
-fn within<T>(what: &str, mut probe: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+pub(crate) fn within<T>(
+    what: &str,
+    mut probe: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
     let t0 = Instant::now();
     loop {
         match probe() {
@@ -275,7 +278,7 @@ fn within<T>(what: &str, mut probe: impl FnMut() -> Result<T, String>) -> Result
 }
 
 /// Put the display as the run wants it.
-fn set_display(up: &Up) -> Result<Display, String> {
+pub(crate) fn set_display(up: &Up) -> Result<Display, String> {
     let all = monitors(up)?;
     let virtio = all
         .iter()
@@ -315,7 +318,7 @@ fn set_display(up: &Up) -> Result<Display, String> {
     }
 }
 
-fn display_detail(d: &Display) -> String {
+pub(crate) fn display_detail(d: &Display) -> String {
     let (p, s) = (&d.primary, &d.second);
     format!(
         "{} {}x{} primary at (0,0), {} dpi, scaling steps {}; {} {}x{} at ({},{}), {} dpi",
@@ -351,7 +354,7 @@ fn chord(l: &Layout, keys: &[&str]) -> Result<(), String> {
 }
 
 /// Type `text` on the USB keyboard, key by key.
-fn type_text(l: &Layout, text: &str) -> Result<(), String> {
+pub(crate) fn type_text(l: &Layout, text: &str) -> Result<(), String> {
     for c in text.chars() {
         let keys = desk::qcodes(c).ok_or_else(|| format!("no US key types {c:?}"))?;
         qmp(l, desk::key_command(&keys, 30))?;
@@ -361,7 +364,7 @@ fn type_text(l: &Layout, text: &str) -> Result<(), String> {
 }
 
 /// Click the tablet's left button at `(x, y)` on the primary monitor.
-fn click(l: &Layout, d: &Display, (x, y): (i32, i32)) -> Result<(), String> {
+pub(crate) fn click(l: &Layout, d: &Display, (x, y): (i32, i32)) -> Result<(), String> {
     let r = d.primary.rect;
     qmp(
         l,
@@ -427,16 +430,16 @@ fn shot(l: &Layout, path: &Path, device: Option<&str>) -> String {
     }
 }
 
-struct Session<'a> {
+pub(crate) struct Session<'a> {
     up: &'a Up,
     arch: Arch,
-    dir: String,
+    pub(crate) dir: String,
     task: String,
-    pid: u32,
+    pub(crate) pid: u32,
 }
 
 /// The config a `--cpu` run's instance takes.
-fn cpu_config() -> String {
+pub(crate) fn cpu_config() -> String {
     format!(
         "cursor_blink = false\ncursor_trail = false\n{}{}",
         crate::instance::CONFIG_OFF,
@@ -447,6 +450,23 @@ fn cpu_config() -> String {
 impl<'a> Session<'a> {
     /// Starts instance `n` of `arch` in the runner's desktop and waits for `ready`.
     fn launch(up: &'a Up, arch: Arch, n: u32, cpu: bool) -> Result<Session<'a>, String> {
+        let config = if cpu {
+            cpu_config()
+        } else {
+            crate::instance::CONFIG_OFF.to_string()
+        };
+        Session::launch_with(up, arch, n, &config, cpu)
+    }
+
+    /// Starts instance `n` of `arch` with `config` (and `--cpu` when `cpu`) in the runner's
+    /// desktop and waits for `ready`.
+    pub(crate) fn launch_with(
+        up: &'a Up,
+        arch: Arch,
+        n: u32,
+        config: &str,
+        cpu: bool,
+    ) -> Result<Session<'a>, String> {
         let dir = instance_dir(arch, n);
         let task = task_name(&format!("window-{}-{n}", arch.name()));
         let cleared = up.ssh.run(&format!(
@@ -458,11 +478,6 @@ impl<'a> Session<'a> {
                 cleared.tail(3)
             ));
         }
-        let config = if cpu {
-            cpu_config()
-        } else {
-            crate::instance::CONFIG_OFF.to_string()
-        };
         let config =
             aterm_codec::base64::encode(config.as_bytes()).map_err(|e| format!("base64: {e:?}"))?;
         let bin = bin_dir(arch);
@@ -515,12 +530,12 @@ impl<'a> Session<'a> {
     }
 
     /// `aterm-ctl` (over SSH, as the runner) to this instance.
-    fn ctl(&self, words: &[&str]) -> Result<String, String> {
+    pub(crate) fn ctl(&self, words: &[&str]) -> Result<String, String> {
         self.ask(words, true)
     }
 
     /// Wait (up to a minute) until a visible row holds `text` as written ([`literal`]).
-    fn await_text(&self, text: &str) -> Result<String, String> {
+    pub(crate) fn await_text(&self, text: &str) -> Result<String, String> {
         self.ctl(&["await", "match", &literal(text), "timeout=60000"])
     }
 
@@ -547,7 +562,7 @@ impl<'a> Session<'a> {
     }
 
     /// Its window of class [`ATERM_CLASS`].
-    fn window(&self) -> Result<Window, String> {
+    pub(crate) fn window(&self) -> Result<Window, String> {
         let text = desk(self.up, &["windows", &self.pid.to_string()])?;
         desk::parse_windows(&text)
             .into_iter()
@@ -566,7 +581,7 @@ impl<'a> Session<'a> {
         Dims::parse(&r).ok_or_else(|| format!("`dims` answered {r:?}"))
     }
 
-    fn stderr(&self) -> String {
+    pub(crate) fn stderr(&self) -> String {
         self.up
             .ssh
             .run(&format!("type {}\\stderr.log", self.dir))
@@ -574,7 +589,7 @@ impl<'a> Session<'a> {
     }
 
     /// Its exit status, once the helper wrote it.
-    fn exit(&self) -> Option<i32> {
+    pub(crate) fn exit(&self) -> Option<i32> {
         let out = self.up.ssh.run(&format!("type {}\\exit", self.dir));
         if out.ok() {
             out.text.trim().parse().ok()
@@ -584,7 +599,7 @@ impl<'a> Session<'a> {
     }
 
     /// Its task stopped and gone, and aterm-gui with it.
-    fn end(&self) {
+    pub(crate) fn end(&self) {
         let _ = self.up.admin.ps(&guest::desktop_stop(&self.task));
         if self.pid != 0 && self.exit().is_none() {
             let _ = self
@@ -1852,22 +1867,7 @@ pub fn cmd_window(args: &[String]) -> Res {
         up.release().map_err(Fail::die)?;
         return Err(not_run(format!("the checkout did not copy: {e}")));
     }
-    let helper = up.layout.run().join("desk.ps1");
-    let put = std::fs::write(&helper, desk::HELPER)
-        .map_err(|e| e.to_string())
-        .and_then(|()| {
-            let made = up
-                .ssh
-                .run(&format!("if not exist {d} mkdir {d}", d = desk::DESK));
-            let put = up.ssh.put(&helper, &desk::HELPER_PATH.replace('\\', "/"));
-            if made.ok() && put.ok() {
-                Ok(())
-            } else {
-                Err(format!("{} {}", made.tail(2), put.tail(2)))
-            }
-        });
-    let _ = std::fs::remove_file(&helper);
-    if let Err(e) = put {
+    if let Err(e) = put_helper(&up) {
         up.release().map_err(Fail::die)?;
         return Err(not_run(format!("the desk helper did not copy: {e}")));
     }
@@ -1914,6 +1914,26 @@ pub fn cmd_window(args: &[String]) -> Res {
         path.display()
     );
     windows::released(i32::from(failed > 0), cleanup)
+}
+
+/// Copy [`desk::HELPER`] to [`desk::HELPER_PATH`] in the guest.
+pub(crate) fn put_helper(up: &Up) -> Result<(), String> {
+    let helper = up.layout.run().join("desk.ps1");
+    let put = std::fs::write(&helper, desk::HELPER)
+        .map_err(|e| e.to_string())
+        .and_then(|()| {
+            let made = up
+                .ssh
+                .run(&format!("if not exist {d} mkdir {d}", d = desk::DESK));
+            let put = up.ssh.put(&helper, &desk::HELPER_PATH.replace('\\', "/"));
+            if made.ok() && put.ok() {
+                Ok(())
+            } else {
+                Err(format!("{} {}", made.tail(2), put.tail(2)))
+            }
+        });
+    let _ = std::fs::remove_file(&helper);
+    put
 }
 
 /// `text` as an `await match` pattern that matches it as written: `await match` takes a regular

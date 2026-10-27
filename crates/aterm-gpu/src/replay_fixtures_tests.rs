@@ -4,9 +4,8 @@
 //! The frames every arm differential draws: the replay fixtures (one per
 //! frame-plan family, each with the streams it claims), the image plane, the
 //! fx engine's layers, the heat-shimmer scene and the cursor frame, with the
-//! present helper and the byte comparison they share. The GL arm's
-//! differentials against wgpu (`gl_replay_tests`) and the Windows record of
-//! wgpu-dx12's frames on WARP (`warp_record_tests`) draw these same inputs.
+//! present helper and the byte comparison they share. Every arm's frame
+//! record (`frame_record_tests`) draws these inputs.
 
 use super::*;
 
@@ -291,8 +290,11 @@ pub(crate) fn fixtures(
     out
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) const COLOUR_FACE: &str = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
+
+#[cfg(target_os = "macos")]
+pub(crate) const COLOUR_FACE: &str = "/System/Library/Fonts/Apple Color Emoji.ttc";
 
 #[cfg(windows)]
 pub(crate) const COLOUR_FACE: &str = r"C:\Windows\Fonts\seguiemj.ttf";
@@ -510,7 +512,7 @@ pub(crate) fn fx_fixture(gpu: &GpuRenderer) -> (&'static str, RenderInput, Vec<S
     )
 }
 
-#[cfg(any(gl_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 pub(crate) fn assert_frames_identical(name: &str, expected: &Frame, actual: &Frame) {
     if let Some(why) = frames_differ(name, expected, actual) {
         panic!("{why}");
@@ -519,7 +521,7 @@ pub(crate) fn assert_frames_identical(name: &str, expected: &Frame, actual: &Fra
 
 /// `None` when every pixel is equal, else the finding: how many texels
 /// differ, the largest byte delta and the first differing texel.
-#[cfg(any(gl_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 pub(crate) fn frames_differ(name: &str, expected: &Frame, actual: &Frame) -> Option<String> {
     assert_eq!(
         (expected.width, expected.height),
@@ -545,10 +547,9 @@ pub(crate) fn frames_differ(name: &str, expected: &Frame, actual: &Frame) -> Opt
     }
     let (i, pe, pa) = first.expect("pixels differ, so a texel differs");
     Some(format!(
-        "{name}: THE ARM'S FRAME IS NOT BYTE-IDENTICAL TO THE wgpu ORACLE'S: {diffs} of {} \
-         texels differ, max byte delta {max_delta}; first at ({},{}): wgpu {pe:02x?} != arm \
-         {pa:02x?}. Measure the cause (twin, blend, view, clear, sampler, copy); never loosen \
-         the comparison.",
+        "{name}: THE FRAMES ARE NOT BYTE-IDENTICAL: {diffs} of {} texels differ, max byte \
+         delta {max_delta}; first at ({},{}): expected {pe:02x?} != actual {pa:02x?}. Measure \
+         the cause (twin, blend, view, clear, sampler, copy); never loosen the comparison.",
         e.len(),
         i % expected.width,
         i / expected.width,

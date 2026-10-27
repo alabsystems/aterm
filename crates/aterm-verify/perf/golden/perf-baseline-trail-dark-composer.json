@@ -1,0 +1,8 @@
+{
+  "_comment": "aterm TRAIL-DARK-COMPOSER baseline (docs/design/PRISM-GLASS.md §15.1 P0.12): the effects harness's composer scene, Rainbow Kitty typed at 10 keys a second to a 117-cell line in Claude Code's composer (its prompt between two rules) on Default's dark ground: the GPU time as a reference full-repaint frame's p50 over the scene's (composer_gpu_rel), and the CPU work of the producer, the CPU raster and the GPU encode as frames per 10^9 instructions retired (_per_ginsn). BIGGER-IS-BETTER. Re-record with targo --unverified verify perf --record trail-dark-composer.",
+  "composer_gpu_rel": 1.956,
+  "composer_emit_per_ginsn": 20.400,
+  "composer_raster_per_ginsn": 380.779,
+  "composer_encode_per_ginsn": 894.086,
+  "pass_ratio": 0.450
+}

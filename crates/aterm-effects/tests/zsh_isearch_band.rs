@@ -1761,6 +1761,37 @@ fn ordinary_typing_keeps_its_row_and_a_classified_boundary_restores_it() {
     }
 }
 
+/// The host's word that the composer takes typed text again (an agent's vim mode back in
+/// INSERT) settles the parked row with no navigation move; without it the next key stays dark.
+#[test]
+fn a_composer_inserting_again_settles_its_parked_row() {
+    for settled in [false, true] {
+        let mut h = Host::new(24, 100, APP);
+        let row = plain_prompt(&mut h);
+        h.glow.clear_typed(h.now);
+        h.feed(b"\x1b[1B\rstatus\x1b[A\x1b[4G");
+        h.hint(b"a");
+        h.feed(b"a");
+        assert!(
+            live_cols(&h, row).is_empty(),
+            "unowned parked row is ambiguous"
+        );
+        assert!(h.glow.caret_row_parked());
+        if settled {
+            h.glow.note_composer_inserting();
+            assert!(!h.glow.caret_row_parked());
+        }
+        h.hint(b"b");
+        h.feed(b"b");
+        assert_eq!(
+            live_cols(&h, row).contains(&4),
+            settled,
+            "settled={settled}: {}",
+            h.report("key after the word")
+        );
+    }
+}
+
 /// A licensed insert's echo establishes the hand's row.
 #[test]
 fn a_licensed_insert_takes_the_hand_s_row() {

@@ -54,6 +54,7 @@ impl Log {
         let q = mark_quota(self.effective_limits());
         let n = self.ring.len();
         let frozen = self.read_fence().unwrap_or(0);
+        let journaled = self.journaled();
         let (mut count, mut bytes) = (0usize, 0usize);
         let (mut first, mut rest) = (Vec::new(), Vec::new());
         for (i, e) in self.ring.iter().enumerate() {
@@ -65,7 +66,7 @@ impl Log {
             if i + 1 == n || e.rec.seq <= frozen {
                 continue;
             }
-            match self.journaled {
+            match journaled {
                 Some(j) if e.rec.seq > j => rest.push(i),
                 _ => first.push(i),
             }

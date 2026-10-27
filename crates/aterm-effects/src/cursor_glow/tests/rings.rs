@@ -1169,3 +1169,228 @@ fn a_chosen_colour_lands_as_itself_on_dark() {
         );
     }
 }
+
+/// THE DARK RING SHOWS AS A RING OR NOT AT ALL (looks8 round 3): on the dark page the landing
+/// ring's rim runs on under the letters at a fifth of its light ([`RIM_UNDER_LETTERS`]), so
+/// what reads of it is the part that keeps its whole light. After an Enter at the bottom row
+/// (the trail gallery's `enter-bottom`) the letters of the line above take its top, the `$`
+/// its left and the grid's bottom its lower half: what kept its whole light was a short arc
+/// in the blank cells right of the caret, read as a stray `)` at the Enter and a `|` at
+/// `e120` under Phaser, Lumen, Comet, Sparkle and Laser on Solarized Dark and dark. Through
+/// its life the rim there keeps less than [`RIM_SHOWN_SHARE`] of its laid pixels whole and is
+/// not drawn (its veil marks the landing); a jump to the top of a cleared page keeps most of
+/// its rim whole and draws it. Negative control: the rim drawn however little of it is whole
+/// ([`CursorGlow::set_dark_rim_fragments`]) lays its arc at the bottom row, every whole pixel
+/// of it in the blank cells beside the caret.
+#[test]
+fn the_dark_ring_shows_as_a_ring_or_not_at_all() {
+    use aterm_core::terminal::RenderCell;
+    // The trail gallery's grid: 72 by 14 cells of 14 by 26 px.
+    let g = Geom {
+        cw: 14,
+        ch: 26,
+        rows: 14,
+        cols: 72,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 1008,
+        win_h: 364,
+        head: 0,
+    };
+    // The Enter's landing, as the trail gallery's replay lands it: a jump's harder impact.
+    let (life, scale) = (0.24, 2.0);
+    let page = |lines: &[(usize, &str)]| {
+        let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+        for &(row, text) in lines {
+            for (col, ch) in text.chars().enumerate() {
+                cells[row][col].ch = ch;
+            }
+        }
+        cells
+    };
+    let bottom = page(&[
+        (9, "39"),
+        (10, "40"),
+        (11, "$ echo the quick brown fox"),
+        (12, "the quick brown fox"),
+        (13, "$ "),
+    ]);
+    let cleared = page(&[(0, "$ ")]);
+    let born = Instant::now();
+    let rim =
+        |style: GlowStyle, cells: &[Vec<RenderCell>], caret: (u16, u16), ms: u64, frag: bool| {
+            let c = cfg(style, true);
+            let mut glow = CursorGlow::default();
+            glow.set_dark_rim_fragments(frag);
+            let now = born + Duration::from_millis(ms);
+            let centre = g.cell_center(caret.0, caret.1);
+            glow.ring = Some(Ring {
+                cx: centre.0,
+                cy: centre.1,
+                born,
+                life,
+                scale,
+                caret: Some(caret),
+            });
+            glow.observe_frame_text(Some(caret), cells, now);
+            assert!(
+                glow.frame_text_letters() > 0,
+                "fixture: the frame's text is read"
+            );
+            let mut out = Vec::new();
+            let _ = glow.tick(Some(caret), now, &c, g, &mut out);
+            let (radius, width) = rim_at(g, ms, life, scale);
+            glow.under_quads()
+                .iter()
+                .filter(|q| q.color != 0 && q.h == 1)
+                .filter(|q| {
+                    let y = f32::from(q.y) + 0.5;
+                    let (x0, x1) = (f32::from(q.x), f32::from(q.x) + f32::from(q.w));
+                    let dx = (centre.0 - x1).max(x0 - centre.0).max(0.0);
+                    let d = dx.hypot(y - centre.1);
+                    d >= radius - width - 2.0 && d <= radius + 2.0
+                })
+                .copied()
+                .collect::<Vec<_>>()
+        };
+    for style in [
+        GlowStyle::Phaser,
+        GlowStyle::Lumen,
+        GlowStyle::Comet,
+        GlowStyle::Sparkle,
+        GlowStyle::Laser,
+    ] {
+        for ms in [0u64, 40, 80, 120, 160, 200] {
+            let drawn = rim(style, &bottom, (13, 2), ms, false);
+            assert!(
+                drawn.is_empty(),
+                "{style:?} at {ms} ms: the rim after an Enter at the bottom row is drawn: \
+                 {drawn:?}"
+            );
+            let open = rim(style, &cleared, (0, 2), ms, false);
+            assert!(
+                open.len() > 8,
+                "{style:?} at {ms} ms: the rim of a jump to a cleared page's top is not drawn"
+            );
+            let frag = rim(style, &bottom, (13, 2), ms, true);
+            assert!(
+                !frag.is_empty(),
+                "control: {style:?} at {ms} ms: the rim drawn whatever its share lays nothing"
+            );
+        }
+    }
+}
+
+/// THE DARK RING, ONCE HIDDEN, STAYS HIDDEN ([`RIM_SHOWN_SHARE`]): the all-or-nothing verdict
+/// on the dark landing ring's rim is latched for the ring's life. Judged afresh each frame, a
+/// rim whose whole share hovered at the bar as it spread over the letters vanished for a frame
+/// and came back (the review of looks8 round 3: `#######.#######.` over 16 ms frames for every
+/// ring style, the caret between two lettered lines, a dip every 128 ms). Stepped every 16 ms
+/// through its life, each ring style's rim goes from shown to hidden at most once and never
+/// back. Negative control: the same ring judged afresh each frame (a new glow a frame) comes
+/// back after a hidden frame.
+#[test]
+fn the_dark_ring_once_hidden_stays_hidden() {
+    use aterm_core::terminal::RenderCell;
+    let g = Geom {
+        cw: 14,
+        ch: 26,
+        rows: 14,
+        cols: 72,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 1008,
+        win_h: 364,
+        head: 0,
+    };
+    let (life, scale) = (0.24, 2.0);
+    let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+    for (row, text) in [
+        (4, "   brown  -p README.md  $ README.md"),
+        (6, "the  }  quick main()"),
+        (7, "   fox  echo x  {  src  fn fn  the"),
+    ] {
+        for (col, ch) in text.chars().enumerate() {
+            cells[row][col].ch = ch;
+        }
+    }
+    let caret = (5u16, 21u16);
+    let centre = g.cell_center(caret.0, caret.1);
+    let born = Instant::now();
+    let ring = Ring {
+        cx: centre.0,
+        cy: centre.1,
+        born,
+        life,
+        scale,
+        caret: Some(caret),
+    };
+    let rim_px = |glow: &mut CursorGlow, c: &GlowConfig, ms: u64| {
+        let now = born + Duration::from_millis(ms);
+        glow.observe_frame_text(Some(caret), &cells, now);
+        let mut out = Vec::new();
+        let _ = glow.tick(Some(caret), now, c, g, &mut out);
+        let (radius, width) = rim_at(g, ms, life, scale);
+        glow.under_quads()
+            .iter()
+            .filter(|q| q.color != 0 && q.h == 1)
+            .filter(|q| {
+                let y = f32::from(q.y) + 0.5;
+                let (x0, x1) = (f32::from(q.x), f32::from(q.x) + f32::from(q.w));
+                let dx = (centre.0 - x1).max(x0 - centre.0).max(0.0);
+                let d = dx.hypot(y - centre.1);
+                d >= radius - width - 2.0 && d <= radius + 2.0
+            })
+            .count()
+    };
+    let mut afresh_flickers = 0;
+    for style in [
+        GlowStyle::Phaser,
+        GlowStyle::Lumen,
+        GlowStyle::Comet,
+        GlowStyle::Sparkle,
+        GlowStyle::Laser,
+    ] {
+        let c = cfg(style, true);
+        let mut glow = CursorGlow {
+            ring: Some(ring),
+            ..Default::default()
+        };
+        let held: String = (0..=15u64)
+            .map(|f| {
+                if rim_px(&mut glow, &c, f * 16) > 0 {
+                    '#'
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        assert!(
+            held.starts_with('#'),
+            "fixture: {style:?}'s rim is drawn at the landing: {held}"
+        );
+        assert!(
+            !held.trim_start_matches('#').contains('#'),
+            "{style:?}: the rim came back after a hidden frame: {held}"
+        );
+        let afresh: String = (0..=15u64)
+            .map(|f| {
+                let mut glow = CursorGlow {
+                    ring: Some(ring),
+                    ..Default::default()
+                };
+                if rim_px(&mut glow, &c, f * 16) > 0 {
+                    '#'
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        afresh_flickers += usize::from(afresh.trim_start_matches('#').contains('#'));
+    }
+    assert!(
+        afresh_flickers > 0,
+        "negative control: judged afresh each frame, no ring style's rim came back after a \
+         hidden frame"
+    );
+}

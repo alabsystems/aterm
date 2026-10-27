@@ -97,6 +97,23 @@ fn claude_json(run: &Run) -> Result<J, Fail> {
     J::parse(&text).map_err(|e| Fail::die(format!("the scratch .claude.json: {e}")))
 }
 
+/// Set `key` in the scratch `.claude.json` to `value`, or remove it when `value` is null.
+/// # Errors
+/// The file is unreadable, not JSON, or not written.
+pub(crate) fn set_claude_json(run: &Run, key: &str, value: J) -> Result<(), Fail> {
+    let mut j = claude_json(run)?;
+    if matches!(value, J::Null) {
+        j.remove(key);
+    } else {
+        j.set(key, value);
+    }
+    atomic_write(
+        &run.w.join("home/.claude/.claude.json"),
+        j.dump(PRETTY).as_bytes(),
+    )
+    .map_err(|e| Fail::die(e.to_string()))
+}
+
 /// `claude-json [tag] [KEY ...]`: inspect keys in the scratch `.claude.json`.
 pub fn cmd_claude_json(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
@@ -109,17 +126,7 @@ pub fn cmd_claude_json(args: &[String]) -> Res {
         } else {
             J::parse(text).map_err(|e| Fail::die(format!("claude-json --set: {e}")))?
         };
-        let mut j = claude_json(&run)?;
-        if matches!(value, J::Null) {
-            j.remove(key);
-        } else {
-            j.set(key, value);
-        }
-        atomic_write(
-            &run.w.join("home/.claude/.claude.json"),
-            j.dump(PRETTY).as_bytes(),
-        )
-        .map_err(|e| Fail::die(e.to_string()))?;
+        set_claude_json(&run, key, value)?;
         println!("{key} set in the scratch .claude.json");
         return Ok(0);
     }

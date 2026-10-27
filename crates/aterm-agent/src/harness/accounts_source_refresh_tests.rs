@@ -70,9 +70,13 @@ fn records(desk: &Desk) -> Vec<Option<Vec<u8>>> {
     .collect()
 }
 
+/// [`REDISCOVER_EVERY`] passes: for the source's last attempt and the last failed sync's alike.
 fn expire(rediscovery: &Mutex<Rediscovery>) {
-    rediscovery.lock().unwrap().key_attempt.as_mut().unwrap().at =
-        Instant::now() - REDISCOVER_EVERY;
+    let mut held = rediscovery.lock().unwrap();
+    held.key_attempt.as_mut().unwrap().at = Instant::now() - REDISCOVER_EVERY;
+    if let Some(failed) = held.failed.as_mut() {
+        failed.at = Instant::now() - REDISCOVER_EVERY;
+    }
 }
 
 /// A disappearing source must report failure through setup and window upkeep while retaining

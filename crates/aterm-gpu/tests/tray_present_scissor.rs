@@ -4,8 +4,6 @@
 //! Tray card compositing over scissored presents.
 
 use aterm_core::terminal::Terminal;
-#[cfg(wgpu_arm)]
-use aterm_gpu::TrayScrim;
 use aterm_gpu::video_tap::{CaptureOpts, DEFAULT_BUDGET, VideoTake};
 use aterm_gpu::{GpuRenderer, TrayQuad, WindowGpu};
 use aterm_render::{GlowQuad, RenderInput, Theme, premul_rgb};
@@ -198,79 +196,5 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
             .iter()
             .zip(covered_plain.frames[0].rgba.iter())
             .position(|(x, y)| x != y)
-    );
-}
-
-#[cfg(wgpu_arm)]
-#[test]
-fn a_tray_scrim_presents_as_the_frame_sized_card_it_replaces() {
-    let mut gpu = common::wgpu_oracle(18.0, Theme::default());
-    let (rows, cols) = (6usize, 20usize);
-    let (a, _b) = two_frames(rows, cols);
-    let (cw, ch) = gpu.cell_size();
-    let (fw, fh) = gpu.frame_size(rows, cols);
-    let (fw, fh) = (fw as u32, fh as u32);
-    let smoke = [0, 0, 0, 0x4D];
-    let card_px = [220, 30, 180, 255];
-    let (pw, ph) = ((cw * 4) as u32, (ch * 2) as u32);
-    let (dx, dy, top) = (cw as u32, (ch * 2) as u32, ch as u32);
-    let small = card(pw, ph, card_px);
-    let scrimmed = TrayQuad {
-        rgba: &small,
-        pw,
-        ph,
-        dx,
-        dy,
-        scrim: Some(TrayScrim { rgba: smoke, top }),
-    };
-    let mut full = Vec::with_capacity((fw * fh * 4) as usize);
-    for y in 0..fh {
-        for x in 0..fw {
-            let on_card = (dx..dx + pw).contains(&x) && (dy..dy + ph).contains(&y);
-            full.extend_from_slice(&if on_card {
-                card_px
-            } else if y >= top {
-                smoke
-            } else {
-                [0; 4]
-            });
-        }
-    }
-    let baked = TrayQuad {
-        rgba: &full,
-        pw: fw,
-        ph: fh,
-        dx: 0,
-        dy: 0,
-        scrim: None,
-    };
-
-    let layered = harvest(
-        &mut gpu,
-        fw,
-        fh,
-        &[(&a, Some(scrimmed)), (&a, Some(scrimmed)), (&a, None)],
-    );
-    let reference = harvest(&mut gpu, fw, fh, &[(&a, Some(baked))]);
-    let never = harvest(&mut gpu, fw, fh, &[(&a, None)]);
-    let first_diff = |x: &[u8], y: &[u8]| x.iter().zip(y).position(|(p, q)| p != q);
-    assert!(
-        layered.frames[0].rgba != never.frames[0].rgba,
-        "negative control: the scrim must reach the presented frame"
-    );
-    assert_eq!(
-        first_diff(&layered.frames[0].rgba, &reference.frames[0].rgba),
-        None,
-        "the scrim layer presents as the baked frame-sized card"
-    );
-    assert_eq!(
-        first_diff(&layered.frames[1].rgba, &reference.frames[0].rgba),
-        None,
-        "a steady scrim does not deepen frame over frame"
-    );
-    assert_eq!(
-        first_diff(&layered.frames[2].rgba, &never.frames[0].rgba),
-        None,
-        "closing the scrim leaves no smoke behind"
     );
 }

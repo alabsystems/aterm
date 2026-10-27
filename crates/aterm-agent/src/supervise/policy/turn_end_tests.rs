@@ -176,8 +176,21 @@ fn restarts(a: &TurnEndAction, want: &Restart, rule: &str) -> bool {
 }
 
 fn typed(rule: &'static str) -> TurnEndAction {
+    let text = match rule {
+        RULE_LIMIT_RESUME => cleared_text(Cleared::UsageLimit, Clearing::Measured).to_string(),
+        RULE_CONSENT => cleared_text(Cleared::Credits, Clearing::Measured).to_string(),
+        _ => continuation_text(&cfg(), None),
+    };
     TurnEndAction::Type {
-        text: continuation_text(&cfg(), None),
+        text,
+        rule_id: rule,
+    }
+}
+
+/// A limit's resume tried blind, on a back-off where the limit named no reset ([`Clearing::Blind`]).
+fn blind(rule: &'static str) -> TurnEndAction {
+    TurnEndAction::Type {
+        text: cleared_text(Cleared::UsageLimit, Clearing::Blind).to_string(),
         rule_id: rule,
     }
 }
@@ -192,6 +205,26 @@ fn retried(rule: &'static str, cause: ApiCause, r: &TurnEndReading) -> TurnEndAc
     TurnEndAction::Type {
         text: wall_retry_text(rule, kind, r.program),
         rule_id: rule,
+    }
+}
+
+/// An outage wall's one line ([`RULE_OUTAGE_RESUME`], [`cleared_text`]).
+fn resumed(outage: Outage, clearing: Clearing) -> TurnEndAction {
+    TurnEndAction::Type {
+        text: cleared_text(Cleared::Outage(outage), clearing).to_string(),
+        rule_id: RULE_OUTAGE_RESUME,
+    }
+}
+
+/// An outage wall's wait until `until` ([`outage_wait`]), a blind try at its end where `tries`.
+fn outage_waits(a: &TurnEndAction, until: Instant, outage: Outage, tries: bool) -> bool {
+    *a == TurnEndAction::WaitUntil {
+        until,
+        why: format!("waiting: {}", outage.words()),
+        wait: WaitKind::Outage {
+            wall: outage,
+            tries,
+        },
     }
 }
 
@@ -644,7 +677,7 @@ fn nothing_is_typed_under_a_box_a_survey_a_draft_or_a_non_agent_screen() {
 }
 
 #[test]
-fn an_api_error_is_retried_on_the_ladder_and_retries_off_escalate() {
+fn an_api_error_is_tried_blind_on_the_outage_ladder_and_retries_off_escalate() {
     let t = t0();
     let mut st = TurnEndState::default();
     let r = walled(
@@ -656,14 +689,18 @@ fn an_api_error_is_retried_on_the_ladder_and_retries_off_escalate() {
         "API Error: 400 bad request",
         Some(3 * MIN),
     );
-    assert!(waits_until(&at(&mut st, &r, t), t + MIN));
+    let first = at(&mut st, &r, t);
+    assert!(
+        outage_waits(&first, t + 2 * MIN, Outage::ApiError, true),
+        "{first:?}"
+    );
     let same = TurnEndReading {
         worked: None,
         ..r.clone()
     };
     assert_eq!(
-        at(&mut st, &same, t + MIN),
-        retried(RULE_API_RETRY, ApiCause::Server, &same)
+        at(&mut st, &same, t + 2 * MIN),
+        resumed(Outage::ApiError, Clearing::Blind)
     );
     let mut off = cfg();
     off.retry_api_errors = false;
@@ -952,7 +989,8 @@ fn a_sleep_is_time_on_the_policys_pauses_and_resets_and_not_on_the_workers_clock
     let t = t0();
     let night = Duration::from_secs(8 * 3600);
     let hour_rung = TurnEndTiming {
-        retry_backoff: vec![60 * MIN],
+        outage_first: 60 * MIN,
+        outage_cap: 60 * MIN,
         ..TurnEndTiming::default()
     };
     let r = walled(
@@ -972,7 +1010,7 @@ fn a_sleep_is_time_on_the_policys_pauses_and_resets_and_not_on_the_workers_clock
         }
         let a = at(&mut st, &same, t + 10 * MIN);
         if slept {
-            assert_eq!(a, retried(RULE_API_RETRY, ApiCause::Server, &same));
+            assert_eq!(a, resumed(Outage::Overload, Clearing::Blind));
         } else {
             assert!(waits_until(&a, t + 60 * MIN), "{a:?}");
         }
@@ -1023,7 +1061,8 @@ fn a_sleep_never_reopens_the_hot_loop_breakers() {
     ]);
     let mut r = read_screen(&rows, Some(4 * Duration::from_secs(1)));
     let mut st = TurnEndState::new(TurnEndTiming {
-        retry_backoff: vec![Duration::ZERO],
+        outage_first: Duration::ZERO,
+        outage_cap: Duration::ZERO,
         ..TurnEndTiming::default()
     });
     let mut now = t;
@@ -1043,10 +1082,13 @@ fn a_sleep_never_reopens_the_hot_loop_breakers() {
         r.worked = None;
     }
     assert!(tripped, "the breaker trips");
-    assert_eq!(st.wall_acts_of(RULE_API_RETRY, now).0, WALL_ACTS_PER_WINDOW);
+    assert_eq!(
+        st.wall_acts_of(RULE_OUTAGE_RESUME, now).0,
+        WALL_ACTS_PER_WINDOW
+    );
     st.slept(8 * 60 * MIN);
     assert_eq!(
-        st.wall_acts_of(RULE_API_RETRY, now).0,
+        st.wall_acts_of(RULE_OUTAGE_RESUME, now).0,
         WALL_ACTS_PER_WINDOW,
         "a sleep or a clock step does not empty the breaker's hour"
     );
@@ -1431,12 +1473,14 @@ fn a_limits_end_types_no_keep_going_into_a_done_report() {
                     ));
                 }
             }
+            // A record that left the task to a person holds no Cruise session (owner ruling
+            // 2026-10-26): the done report is checked as any other.
             let left = TurnEndReading {
                 left_record: true,
                 ..point(done)
             };
             let a = ended(begin, &left, &cfg());
-            if a != TurnEndAction::Nothing {
+            if a != checked() {
                 wrong.push(format!("{name}, fired row {fired_row}, left: {a:?}"));
             }
         }
@@ -1595,9 +1639,11 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
                 wrong.push(format!("fired row {fired_row}, {reply:?}: {a:?}"));
             }
         }
+        // A record that left the task to a person holds no Cruise session (owner ruling
+        // 2026-10-26): the done report is checked as any other.
         let rows = replied_after_the_reset(done, fired_row);
         let (a, _) = ended(&armed, &wall(AUTO_CONTINUE_ARMED), &rows, true);
-        if a != TurnEndAction::Nothing {
+        if a != checked() {
             wrong.push(format!("fired row {fired_row}, left: {a:?}"));
         }
     }
@@ -2412,7 +2458,11 @@ fn a_limits_end_under_land_gets_lands_own_act_and_under_off_nothing() {
         }
         now += MIN;
     }
-    assert_eq!(retry, resumed(LAND_NUDGE), "the wall's retry");
+    assert_eq!(
+        retry,
+        typed(RULE_LIMIT_RESUME),
+        "the wall's retry, once Land's instruction was given: one line"
+    );
     now += 3 * MIN;
     at(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now);
     let a = decide_turn_end(&st, &land(idle(DEFENSE, None)), &cfg(), now + 60 * MIN);
@@ -4034,13 +4084,7 @@ fn a_cloud_gateway_sign_in_types_login_once_never_a_retry() {
     let mut st = TurnEndState::default();
     let a = act(&mut st, &r, t);
     assert!(
-        matches!(
-            &a,
-            TurnEndAction::WaitUntil {
-                wait: WaitKind::Retry,
-                ..
-            }
-        ),
+        outage_waits(&a, t + 2 * MIN, Outage::ApiError, true),
         "{a:?}"
     );
 }
@@ -4129,37 +4173,27 @@ fn agys_failed_turns_are_answered_by_their_wall() {
         ),
         "{a:?}"
     );
-    for (text, words) in [
-        (lab::ERROR_500, "an API error (500)"),
-        (lab::ERROR_503, "an API error (overloaded)"),
+    for (text, outage) in [
+        (lab::ERROR_500, Outage::ApiError),
+        (lab::ERROR_503, Outage::Overload),
     ] {
         let r = reading_of(&screen(text));
         let mut st = TurnEndState::default();
         let first = at(&mut st, &r, t);
-        assert!(
-            matches!(
-                first,
-                TurnEndAction::WaitUntil {
-                    wait: WaitKind::Retry,
-                    ..
-                }
-            ),
-            "{first:?}"
+        assert!(outage_waits(&first, t + 2 * MIN, outage, true), "{first:?}");
+        let tried = at(&mut st, &r, t + 2 * MIN);
+        assert_eq!(
+            tried,
+            resumed(outage, Clearing::Blind),
+            "the try's one line"
         );
-        match at(&mut st, &r, t + MIN) {
-            TurnEndAction::Type { text, rule_id } => {
-                assert_eq!(rule_id, RULE_API_RETRY);
-                assert!(
-                    text.starts_with(&format!("Antigravity CLI reported {words}.")),
-                    "{text}"
-                );
-                assert!(
-                    !text.contains("Error 5"),
-                    "never the screen's words: {text}"
-                );
-            }
-            other => panic!("expected the retry, got {other:?}"),
-        }
+        let TurnEndAction::Type { text, .. } = &tried else {
+            unreachable!()
+        };
+        assert!(
+            !text.contains("Error 5"),
+            "never the screen's words: {text}"
+        );
     }
 
     let mut replied = screen(lab::ERROR_500);
@@ -4332,15 +4366,10 @@ fn an_api_refusal_of_agys_request_is_escalated_never_typed_at() {
         ("agy's 504", agy_point(lab::ERROR_504)),
         ("Claude Code's 403", claude),
     ] {
+        let a = at(&mut TurnEndState::default(), &r, t);
         assert!(
-            matches!(
-                at(&mut TurnEndState::default(), &r, t),
-                TurnEndAction::WaitUntil {
-                    wait: WaitKind::Retry,
-                    ..
-                }
-            ),
-            "{what}: the retry ladder"
+            outage_waits(&a, t + 2 * MIN, Outage::ApiError, true),
+            "{what}: the outage ladder: {a:?}"
         );
     }
 }
@@ -6338,10 +6367,13 @@ fn a_done_check_answered_with_progress_is_continued() {
 
 #[test]
 fn a_persons_exchange_a_loop_left_stays_theirs_in_a_new_loop_and_a_relaunch() {
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
+    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let now = t0();
-    for (said, without) in [
-        ("Hi! What would you like me to work on?", RULE_DONE_CHECK),
-        ("Hello! How can I help?", RULE_ANSWER),
+    for said in [
+        "Hi! What would you like me to work on?",
+        "Hello! How can I help?",
     ] {
         let mut st = TurnEndState::default();
         let theirs = TurnEndReading {
@@ -6373,7 +6405,7 @@ fn a_persons_exchange_a_loop_left_stays_theirs_in_a_new_loop_and_a_relaunch() {
         }
         let mut fresh = TurnEndState::default();
         let (a, _) = past_backoff(&mut fresh, &first(false), later);
-        assert_eq!(a.rule_id(), Some(without), "no open row: {said}: {a:?}");
+        assert!(a.rule_id().is_some(), "no open row: {said}: {a:?}");
         let mut fresh = TurnEndState::default();
         let pending = TurnEndReading {
             pending_input: true,
@@ -6395,15 +6427,17 @@ fn a_persons_exchange_a_loop_left_stays_theirs_in_a_new_loop_and_a_relaunch() {
             idle("Added the flag and ran the suite.", Some(4 * MIN)),
         );
         let (a, _) = past_backoff(&mut st, &next, later);
-        assert_eq!(a, typed(RULE_CONTINUE), "the next turn: {said}");
+        assert!(a.rule_id().is_some(), "the next turn: {said}: {a:?}");
     }
 }
 
+/// A person's own exchange `said`, left to them at `now` under Land (Cruise carries it: owner
+/// ruling 2026-10-26).
 fn fresh_left(said: &str, now: Instant) -> TurnEndState {
     let mut st = TurnEndState::default();
     let theirs = TurnEndReading {
         person: Some(Duration::from_secs(8)),
-        ..idle(said, Some(Duration::from_secs(5)))
+        ..land(idle(said, Some(Duration::from_secs(5))))
     };
     assert_eq!(at(&mut st, &theirs, now), TurnEndAction::Nothing);
     assert!(st.left_to_person());
@@ -6413,8 +6447,13 @@ fn fresh_left(said: &str, now: Instant) -> TurnEndState {
 /// 2026-10-24 under cruise: the person's message was answered with a question to them, the
 /// harness then upgraded Claude Code and typed its restore notice ("Nothing else is asked."),
 /// and the 15 s reply to that notice was still read as the person's exchange: nothing was typed.
+/// Cruise leaves no exchange now (owner ruling 2026-10-26); Land still does, and the host's turn
+/// after it is the host's.
 #[test]
 fn the_hosts_turn_after_a_persons_exchange_is_the_hosts() {
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
+    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let asked = "Should I go ahead on the new account? Or tell me how much quota to spend.";
     let quick = Duration::from_secs(15);
     let replies = [
@@ -6432,14 +6471,10 @@ fn the_hosts_turn_after_a_persons_exchange_is_the_hosts() {
             now += quick;
             let a = at(&mut st, &idle(reply, Some(quick)), now);
             assert!(!st.left_to_person(), "{host:?}: {reply}");
-            if i == 0 {
-                assert_eq!(a, typed(RULE_CONTINUE), "{host:?}: {reply}");
-            } else {
-                assert!(
-                    matches!(a, TurnEndAction::Type { .. }),
-                    "{host:?}: {reply}: {a:?}"
-                );
-            }
+            assert!(
+                matches!(a, TurnEndAction::Type { .. }),
+                "{host:?} {i}: {reply}: {a:?}"
+            );
         }
     }
     // CONTROL: the same short reply to the person's own next message stays theirs.
@@ -6457,7 +6492,13 @@ fn the_hosts_turn_after_a_persons_exchange_is_the_hosts() {
 }
 
 #[test]
-fn a_persons_own_exchange_is_left_to_them_whatever_it_says() {
+fn a_persons_own_exchange_is_left_to_them_whatever_it_says_under_land() {
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
+    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
+    let walled = |kind: WallKind, message: &str, worked: Option<Duration>| {
+        land(walled(kind, message, worked))
+    };
     let now = t0();
     let quick = Some(Duration::from_secs(5));
     let theirs = |said: &str| TurnEndReading {
@@ -6559,10 +6600,19 @@ fn a_check_in_on_a_carried_task_stays_on_the_ladder() {
         person: Some(Duration::from_secs(8)),
         ..idle("You're welcome!", quick)
     };
+    let mut left = st.clone();
     at(&mut st, &thanks, now);
-    assert!(st.left_to_person());
+    assert!(
+        !st.left_to_person(),
+        "Cruise carries the person's own exchange"
+    );
+    at(&mut left, &land(thanks), now);
+    assert!(left.left_to_person(), "Land leaves it to them");
     let mut fresh = TurnEndState::default();
     at(&mut fresh, &check_in, now);
+    assert!(!fresh.left_to_person());
+    let mut fresh = TurnEndState::default();
+    at(&mut fresh, &land(check_in), now);
     assert!(fresh.left_to_person());
     let mut st = TurnEndState::default();
     at(&mut st, &idle("Waiting on the build.", Some(10 * MIN)), now);
@@ -6575,7 +6625,10 @@ fn a_check_in_on_a_carried_task_stays_on_the_ladder() {
 }
 
 #[test]
-fn a_carry_ends_where_the_task_passes_to_a_person() {
+fn a_carry_ends_where_the_task_passes_to_a_person_under_land() {
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
+    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let quick = Some(Duration::from_secs(5));
     let theirs = |said: &str, worked: Option<Duration>| TurnEndReading {
         person: Some(worked.unwrap_or_default() + Duration::from_secs(3)),
@@ -6634,9 +6687,10 @@ fn a_turn_read_running_before_the_loop_is_a_persons_only_by_a_key_inside_it() {
         let mut st = TurnEndState::default();
         st.seed_acts(acts, now);
         st.seed_ran_turn(ran, point, now);
+        // Land's: Cruise leaves no exchange (owner ruling 2026-10-26).
         let r = TurnEndReading {
             person: Some(key),
-            ..idle("Keep the token: it survives a restart.", worked)
+            ..land(idle("Keep the token: it survives a restart.", worked))
         };
         at(&mut st, &r, now);
         assert_eq!(
@@ -6649,6 +6703,12 @@ fn a_turn_read_running_before_the_loop_is_a_persons_only_by_a_key_inside_it() {
 
 #[test]
 fn a_persons_exchange_on_a_wall_gets_its_retry_and_stays_theirs() {
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
+    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
+    let walled = |kind: WallKind, message: &str, worked: Option<Duration>| {
+        land(walled(kind, message, worked))
+    };
     let mut now = t0();
     let mut st = TurnEndState::default();
     let quick = Some(Duration::from_secs(5));
@@ -6690,6 +6750,12 @@ fn a_persons_exchange_on_a_wall_gets_its_retry_and_stays_theirs() {
 
 #[test]
 fn a_persons_exchange_at_a_wall_stays_theirs_in_a_new_loop() {
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
+    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
+    let walled = |kind: WallKind, message: &str, worked: Option<Duration>| {
+        land(walled(kind, message, worked))
+    };
     let quick = Some(Duration::from_secs(5));
     let mut st = TurnEndState::default();
     let r = TurnEndReading {
@@ -6705,9 +6771,9 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_a_new_loop() {
     };
     at(&mut st, &r, t0());
     assert!(!st.exchange_at_wall(), "CONTROL: real work");
-    for (greeting, otherwise) in [
-        ("Hello! How can I help?", RULE_ANSWER),
-        ("Hi! What would you like me to work on?", RULE_DONE_CHECK),
+    for greeting in [
+        "Hello! How can I help?",
+        "Hi! What would you like me to work on?",
     ] {
         for row in [true, false] {
             let mut st = TurnEndState::default();
@@ -6718,7 +6784,11 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_a_new_loop() {
                 ..walled(WallKind::Overloaded, "529", None)
             };
             let (a, t) = until_acted(&mut st, &first, t0());
-            assert_eq!(a.rule_id(), Some(RULE_API_RETRY), "{greeting} {row}: {a:?}");
+            assert_eq!(
+                a.rule_id(),
+                Some(RULE_OUTAGE_RESUME),
+                "{greeting} {row}: {a:?}"
+            );
             let answered = idle(greeting, quick);
             let (b, t) = past_backoff(&mut st, &answered, t + 2 * MIN);
             let later = TurnEndReading {
@@ -6731,7 +6801,7 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_a_new_loop() {
                 assert_eq!(c, TurnEndAction::Nothing, "{greeting}");
                 assert!(st.left_to_person(), "{greeting}");
             } else {
-                assert_eq!(b.rule_id(), Some(otherwise), "CONTROL {greeting}: {b:?}");
+                assert!(b.rule_id().is_some(), "CONTROL {greeting}: {b:?}");
                 assert!(!st.left_to_person(), "CONTROL {greeting}");
             }
         }
@@ -7485,26 +7555,19 @@ fn a_retrys_wall_whose_notice_left_holds_its_rung() {
     };
     let looked = idle("Suites are running.", None);
     let mut st = TurnEndState::default();
-    assert!(waits_until(&at(&mut st, &server, t), t + MIN));
-    act(&mut st, &again(&server), t + MIN);
+    assert!(waits_until(&at(&mut st, &server, t), t + 2 * MIN));
+    act(&mut st, &again(&server), t + 2 * MIN);
     let met = t + 4 * MIN;
-    assert!(waits_until(&at(&mut st, &back, met), met + 5 * MIN));
+    assert!(waits_until(&at(&mut st, &back, met), met + 4 * MIN));
     let a = at(&mut st, &looked, met + 2 * MIN);
-    assert!(waits_until(&a, met + 5 * MIN), "the rung held: {a:?}");
     assert!(
-        matches!(
-            &a,
-            TurnEndAction::WaitUntil {
-                wait: WaitKind::Retry,
-                ..
-            }
-        ),
-        "{a:?}"
+        outage_waits(&a, met + 4 * MIN, Outage::ApiError, true),
+        "the rung held: {a:?}"
     );
     assert_eq!(
-        act(&mut st, &looked, met + 5 * MIN),
-        retried(RULE_API_RETRY, ApiCause::Server, &server),
-        "the wall's own retry at its rung"
+        act(&mut st, &looked, met + 4 * MIN),
+        resumed(Outage::ApiError, Clearing::Blind),
+        "the wall's own try at its rung"
     );
     let down = api_wall(
         ApiCause::Unreachable,
@@ -7513,12 +7576,22 @@ fn a_retrys_wall_whose_notice_left_holds_its_rung() {
         Reach::Down { since: t },
     );
     let mut st = TurnEndState::default();
-    assert!(waits_until(&at(&mut st, &down, t), t + 15 * MIN));
+    let cap = TurnEndTiming::default().outage_cap;
+    assert!(outage_waits(
+        &at(&mut st, &down, t),
+        t + cap,
+        Outage::Connection,
+        false
+    ));
     let gone = TurnEndReading {
         reach: Reach::Down { since: t },
         ..looked.clone()
     };
-    assert!(waits_until(&at(&mut st, &gone, t + 3 * MIN), t + 15 * MIN));
+    let a = at(&mut st, &gone, t + 3 * MIN);
+    assert!(
+        outage_waits(&a, t + cap, Outage::Connection, false),
+        "{a:?}"
+    );
     let mut st = TurnEndState::default();
     at(&mut st, &server, t);
     let worked = idle("Fixed the parser.", Some(3 * MIN));
@@ -7565,38 +7638,49 @@ fn a_retrys_wall_whose_notice_left_holds_its_rung() {
 }
 
 #[test]
-fn a_certificate_or_proxy_refusal_is_retried_never_asked() {
+fn a_certificate_or_proxy_refusal_is_waited_out_never_asked() {
     let cert = "API Error: Unable to connect to API: Self-signed certificate detected";
     let t = t0();
     let mut st = TurnEndState::default();
     let r = api_wall(ApiCause::Config, cert, Some(MIN), Reach::Unknown);
-    assert!(waits_until(&at(&mut st, &r, t), t + MIN));
+    let a = at(&mut st, &r, t);
+    assert!(
+        outage_waits(&a, t + 2 * MIN, Outage::Connection, true),
+        "{a:?}"
+    );
     assert_eq!(
-        act(&mut st, &again(&r), t + MIN),
-        retried(RULE_API_RETRY, ApiCause::Config, &r)
+        act(&mut st, &again(&r), t + 2 * MIN),
+        resumed(Outage::Connection, Clearing::Blind)
     );
     let mut st = TurnEndState::default();
     let up = api_wall(ApiCause::Config, cert, Some(MIN), Reach::Up { since: t });
-    assert!(waits_until(&at(&mut st, &up, t), t + MIN), "no act at once");
-    let tried = act(&mut st, &again(&up), t + MIN);
-    assert_eq!(tried, retried(RULE_API_RETRY, ApiCause::Config, &up));
-    let TurnEndAction::Type { text, .. } = &tried else {
-        unreachable!()
-    };
-    assert!(!text.contains("reachable"), "{text}");
-    let met = t + 2 * MIN;
+    assert!(
+        waits_until(&at(&mut st, &up, t), t + 2 * MIN),
+        "an up measured before the wall is no clearing of it: no act at once"
+    );
+    let tried = act(&mut st, &again(&up), t + 2 * MIN);
+    assert_eq!(tried, resumed(Outage::Connection, Clearing::Blind));
+    let met = t + 3 * MIN;
     let again_up = api_wall(ApiCause::Config, cert, Some(MIN), Reach::Up { since: t });
-    assert!(waits_until(&at(&mut st, &again_up, met), met + 2 * MIN));
+    assert!(waits_until(&at(&mut st, &again_up, met), met + 4 * MIN));
     let mut st = TurnEndState::default();
-    let back = api_wall(
+    let down = api_wall(
         ApiCause::Unreachable,
         ENOTFOUND,
         Some(MIN),
-        Reach::Up { since: t },
+        Reach::Down { since: t },
     );
+    assert!(matches!(
+        act(&mut st, &down, t),
+        TurnEndAction::WaitUntil { .. }
+    ));
+    let back = TurnEndReading {
+        reach: Reach::Up { since: t + MIN },
+        ..again(&down)
+    };
     assert_eq!(
-        act(&mut st, &back, t),
-        retried(RULE_API_BACK, ApiCause::Unreachable, &back)
+        act(&mut st, &back, t + MIN),
+        resumed(Outage::Connection, Clearing::Measured)
     );
     let mut off = cfg();
     off.retry_api_errors = false;
@@ -7606,6 +7690,435 @@ fn a_certificate_or_proxy_refusal_is_retried_never_asked() {
         &decide_turn_end(&st, &r, &off, t),
         "retry_api_errors is off"
     ));
+}
+
+/// AN OUTAGE IS A SILENT WAIT (v6 §14.17.5.2): an overload that meets each try at once is tried
+/// blind on its doubling ladder, two minutes from the wall and twice as long after each try's own
+/// wall to the hour's cap, nothing typed between, and many identical answers hold nothing.
+#[test]
+fn a_sustained_overload_is_tried_blind_on_its_doubling_ladder_and_never_held() {
+    let t = t0();
+    let wall = walled(
+        WallKind::Overloaded,
+        "API Error: 529 Overloaded.",
+        Some(3 * MIN),
+    );
+    let answered = TurnEndReading {
+        worked: Some(Duration::from_secs(4)),
+        ..wall.clone()
+    };
+    let mut st = TurnEndState::default();
+    let (mut met, mut r) = (t, wall.clone());
+    let mut gaps = Vec::new();
+    for _ in 0..8 {
+        let mut now = met;
+        let (tried, at_rung) = loop {
+            let a = act(&mut st, &r, now);
+            r = again(&r);
+            match a {
+                TurnEndAction::WaitUntil {
+                    until,
+                    wait:
+                        WaitKind::Outage {
+                            wall: Outage::Overload,
+                            tries: true,
+                        },
+                    ..
+                } if now < until => now = (now + MIN).min(until),
+                a => break (a, now),
+            }
+        };
+        assert_eq!(
+            tried,
+            resumed(Outage::Overload, Clearing::Blind),
+            "{gaps:?}"
+        );
+        gaps.push((at_rung - met).as_secs() / 60);
+        met = at_rung + Duration::from_secs(5);
+        r = answered.clone();
+    }
+    assert_eq!(gaps, [2, 4, 8, 16, 32, 60, 60, 60]);
+    assert_eq!(st.held_by(), None, "{:?}", st.replies());
+    assert!(!st.repeats(&again(&wall)));
+    // CONTROL: a wall the agent can act on keeps its typed retry and its hold. A refused request
+    // answered the same way at each try is held once its tries are spent, well before eight.
+    let refused = api_wall(
+        ApiCause::Request,
+        "API Error: 400 due to tool use concurrency issues.",
+        Some(3 * MIN),
+        Reach::Unknown,
+    );
+    let answered = TurnEndReading {
+        worked: Some(Duration::from_secs(4)),
+        ..refused.clone()
+    };
+    let mut st = TurnEndState::default();
+    let (mut now, mut r, mut typed) = (t, refused.clone(), 0);
+    let last = loop {
+        match act(&mut st, &r, now) {
+            TurnEndAction::WaitUntil { until, .. } if now < until => {
+                now = until;
+                r = again(&r);
+            }
+            TurnEndAction::Type {
+                rule_id: RULE_API_RETRY,
+                ..
+            } if typed < 8 => {
+                typed += 1;
+                now += Duration::from_secs(5);
+                r = answered.clone();
+            }
+            a => break a,
+        }
+    };
+    assert_eq!(last, TurnEndAction::Nothing, "held after {typed} tries");
+    assert!(typed < 8, "{typed} tries");
+    assert_eq!(
+        st.held_by(),
+        Some(crate::harness::acts::HeldBy::SameReply),
+        "{:?}",
+        st.replies()
+    );
+}
+
+/// A CONNECTION ERROR MEASURED DOWN TYPES NOTHING (v6 §14.17.5.2): for as long as the host reads
+/// the route down, however long, and the edge up measured after the wall resumes it once. A
+/// second read of that up, no new clearing since, is the wall met again while the route is up:
+/// tried blind on the ladder, never resumed as measured again.
+#[test]
+fn a_connection_measured_down_types_nothing_for_hours_and_resumes_once_on_its_edge_up() {
+    let t = t0();
+    let down = api_wall(
+        ApiCause::Unreachable,
+        ENOTFOUND,
+        Some(3 * MIN),
+        Reach::Down { since: t },
+    );
+    let cap = TurnEndTiming::default().outage_cap;
+    let mut st = TurnEndState::default();
+    let (mut now, mut r) = (t, down.clone());
+    let mut deadlines = std::collections::BTreeSet::new();
+    while now < t + 5 * 60 * MIN {
+        let a = act(&mut st, &r, now);
+        match a {
+            TurnEndAction::WaitUntil {
+                until,
+                wait:
+                    WaitKind::Outage {
+                        wall: Outage::Connection,
+                        tries: false,
+                    },
+                ..
+            } if now < until && until <= now + cap => {
+                deadlines.insert(until);
+            }
+            other => panic!("typed into a route measured down: {other:?}"),
+        }
+        r = again(&down);
+        now += 7 * MIN;
+    }
+    assert_eq!(deadlines.len(), 5, "one deadline an hour: {deadlines:?}");
+    let up = TurnEndReading {
+        reach: Reach::Up { since: now - MIN },
+        ..again(&down)
+    };
+    assert_eq!(
+        act(&mut st, &up, now),
+        resumed(Outage::Connection, Clearing::Measured)
+    );
+    let mut measured = 0;
+    let mut later = now + Duration::from_secs(10);
+    while later < now + 60 * MIN {
+        let a = act(&mut st, &up, later);
+        if let TurnEndAction::Type { text, .. } = &a {
+            assert_eq!(
+                a,
+                resumed(Outage::Connection, Clearing::Blind),
+                "only blind tries after the one resume: {text}"
+            );
+        }
+        measured += usize::from(a == resumed(Outage::Connection, Clearing::Measured));
+        later += MIN;
+    }
+    assert_eq!(measured, 0, "one resume per measured clearing");
+    // A new edge up, measured after the last try, is a new clearing.
+    let dropped = TurnEndReading {
+        reach: Reach::Down { since: later },
+        ..again(&down)
+    };
+    act(&mut st, &dropped, later);
+    let back = TurnEndReading {
+        reach: Reach::Up { since: later + MIN },
+        ..again(&down)
+    };
+    assert_eq!(
+        act(&mut st, &back, later + 2 * MIN),
+        resumed(Outage::Connection, Clearing::Measured)
+    );
+}
+
+/// UNDER LAND, the outage's resume before Land's instruction was given is the instruction (12a's
+/// rule), under the outage's rule; once it was given, the try is the outage's own line. A landed
+/// Land session rests: nothing is typed at its outage.
+#[test]
+fn an_outage_under_land_resumes_with_lands_instruction_until_it_was_given() {
+    let t = t0();
+    let wall = land(walled(
+        WallKind::Overloaded,
+        "API Error: 529 Overloaded.",
+        Some(3 * MIN),
+    ));
+    let mut st = TurnEndState::default();
+    assert!(waits_until(&at(&mut st, &wall, t), t + 2 * MIN));
+    assert_eq!(
+        act(&mut st, &again(&wall), t + 2 * MIN),
+        TurnEndAction::Type {
+            text: LAND.to_string(),
+            rule_id: RULE_OUTAGE_RESUME,
+        }
+    );
+    let met = t + 3 * MIN;
+    let answered = TurnEndReading {
+        worked: Some(Duration::from_secs(4)),
+        ..wall.clone()
+    };
+    assert!(waits_until(&at(&mut st, &answered, met), met + 4 * MIN));
+    assert_eq!(
+        act(&mut st, &again(&wall), met + 4 * MIN),
+        resumed(Outage::Overload, Clearing::Blind)
+    );
+    let (mut st, now) = landed_at(t);
+    for later in [Duration::ZERO, 2 * MIN, 3 * 60 * MIN] {
+        assert_eq!(
+            at(&mut st, &again(&wall), now + later),
+            TurnEndAction::Nothing,
+            "landed: {later:?}"
+        );
+    }
+}
+
+/// THE WALLS THE AGENT CAN ACT ON KEEP THEIR ACTS (v6 §14.17.5.2): a refused request, an over-long
+/// reply and a one-off cut are no outage, and each types its own words under its own rule as
+/// before; so does a cut while the route reads up or unknown. A cut the host measures down is the
+/// connection's outage.
+#[test]
+fn a_refused_request_an_overlong_reply_and_a_one_off_cut_keep_their_acts() {
+    const OVERLONG: &str = "API Error: Claude's response exceeded the 32000 output token maximum.";
+    const SLEEP: &str = "API Error: Your computer went to sleep mid-response.";
+    const REFUSED: &str = "API Error: 400 due to tool use concurrency issues.";
+    let t = t0();
+    for (cause, message, rule, at_once) in [
+        (ApiCause::Request, REFUSED, RULE_API_RETRY, false),
+        (ApiCause::Overlong, OVERLONG, RULE_API_CUTOFF, true),
+        (ApiCause::CutOff, SLEEP, RULE_API_CUTOFF, true),
+    ] {
+        for reach in [Reach::Unknown, Reach::Up { since: t }] {
+            let r = api_wall(cause, message, Some(3 * MIN), reach);
+            let kind = r.wall.expect("a wall");
+            assert_eq!(outage_of(kind, false, Program::Claude), None, "{cause:?}");
+            let mut st = TurnEndState::default();
+            let first = act(&mut st, &r, t);
+            let a = if at_once {
+                first
+            } else {
+                assert!(waits_until(&first, t + MIN), "{cause:?}: {first:?}");
+                act(&mut st, &again(&r), t + MIN)
+            };
+            assert_eq!(a, retried(rule, cause, &r), "{cause:?} {reach:?}");
+        }
+    }
+    let down = api_wall(
+        ApiCause::CutOff,
+        SLEEP,
+        Some(3 * MIN),
+        Reach::Down { since: t },
+    );
+    let mut st = TurnEndState::default();
+    let a = at(&mut st, &down, t);
+    assert!(
+        outage_waits(
+            &a,
+            t + TurnEndTiming::default().outage_cap,
+            Outage::Connection,
+            false
+        ),
+        "{a:?}"
+    );
+    // The cut measured down stays the connection's outage once the route reads up: its edge up
+    // after the wall resumes it once with the measured line, never the one-off cut's words.
+    let edge = TurnEndReading {
+        reach: Reach::Up { since: t + 5 * MIN },
+        ..again(&down)
+    };
+    assert_eq!(
+        act(&mut st, &edge, t + 5 * MIN),
+        resumed(Outage::Connection, Clearing::Measured)
+    );
+    // CONTROL: once the agent works again, a cut with the route up is a one-off cut again.
+    let worked = idle("Wired the parser in.", Some(12 * MIN));
+    at(&mut st, &worked, t + 20 * MIN);
+    let cut = api_wall(
+        ApiCause::CutOff,
+        SLEEP,
+        Some(12 * MIN),
+        Reach::Up { since: t + 5 * MIN },
+    );
+    assert_eq!(
+        act(&mut st, &cut, t + 40 * MIN),
+        retried(RULE_API_CUTOFF, ApiCause::CutOff, &cut)
+    );
+}
+
+/// A CUT MEASURED DOWN STAYS THE CONNECTION'S OUTAGE IN THE LOOP THAT FOLLOWS (v6 §14.17.5.2): the
+/// track a loop hands on ([`TurnEndState::retry_track`], [`TurnEndState::seed_retry`]) keeps that
+/// the wall was read while the route was measured down, so the route's edge up resumes it there as
+/// in the loop that read it, with the measured line, never the one-off cut's words.
+#[test]
+fn a_cut_measured_down_stays_the_connections_outage_in_the_loop_that_follows() {
+    const SLEEP: &str = "API Error: Your computer went to sleep mid-response.";
+    let t = t0();
+    let down = api_wall(
+        ApiCause::CutOff,
+        SLEEP,
+        Some(3 * MIN),
+        Reach::Down { since: t },
+    );
+    let mut first = TurnEndState::default();
+    let a = at(&mut first, &down, t);
+    assert!(
+        matches!(a, TurnEndAction::WaitUntil { .. }),
+        "the cut measured down waits: {a:?}"
+    );
+    let handoff = t + 4 * MIN;
+    let (kind, attempts, ups, since, measured) = first.retry_track().expect("the cut's track");
+    assert!(measured, "the track keeps the measure");
+    let mut next = TurnEndState::default();
+    next.seed_retry(
+        kind,
+        attempts,
+        ups,
+        handoff - since,
+        false,
+        measured,
+        handoff,
+    );
+    let edge = TurnEndReading {
+        reach: Reach::Up { since: t + 5 * MIN },
+        ..again(&down)
+    };
+    let own = act(&mut first, &edge, t + 5 * MIN);
+    assert_eq!(own, resumed(Outage::Connection, Clearing::Measured));
+    assert_eq!(
+        act(&mut next, &edge, t + 5 * MIN),
+        own,
+        "the loop that follows resumes it as the loop that read it"
+    );
+}
+
+/// A PERSON'S OWN TURN OF WORK ENDS AN OUTAGE'S LADDER (v6 §14.17.5.2: the ladder ends when the
+/// agent works again), as a try's answered work does: a new outage wall at that turn's end is tried
+/// two minutes from its own wall, never at once on the old ladder's rung.
+#[test]
+fn a_persons_own_turn_of_work_at_an_outage_starts_its_ladder_anew() {
+    let t = t0();
+    let wall = walled(
+        WallKind::Overloaded,
+        "API Error: 529 Overloaded.",
+        Some(3 * MIN),
+    );
+    let answered = TurnEndReading {
+        worked: Some(Duration::from_secs(4)),
+        ..wall.clone()
+    };
+    let mut st = TurnEndState::default();
+    let (mut met, mut r) = (t, wall.clone());
+    for gap in [2, 4, 8] {
+        let a = act(&mut st, &r, met);
+        assert!(
+            outage_waits(&a, met + gap * MIN, Outage::Overload, true),
+            "{gap}: {a:?}"
+        );
+        assert_eq!(
+            act(&mut st, &again(&wall), met + gap * MIN),
+            resumed(Outage::Overload, Clearing::Blind)
+        );
+        met += gap * MIN + Duration::from_secs(5);
+        r = answered.clone();
+    }
+    let a = act(&mut st, &r, met);
+    assert!(
+        outage_waits(&a, met + 16 * MIN, Outage::Overload, true),
+        "{a:?}"
+    );
+    // A person types; the API comes back inside Claude Code's own retries, and the agent works
+    // twenty minutes with tools in that one turn, then meets a new 529.
+    let now = met + 21 * MIN;
+    let theirs = TurnEndReading {
+        person: Some(20 * MIN),
+        worked: Some(20 * MIN),
+        ran_tools: true,
+        ..wall.clone()
+    };
+    let a = act(&mut st, &theirs, now);
+    assert!(
+        outage_waits(&a, now + 2 * MIN, Outage::Overload, true),
+        "the person's turn of work starts the ladder anew: {a:?}"
+    );
+}
+
+/// LAND'S INSTRUCTION TYPED AS AN OUTAGE'S RESUME BEGINS LAND'S HOLD AT ITS OWN ROW (v6
+/// §14.17.5.2): the loop that typed it stamps the hold where the books a later loop seeds from
+/// begin it ([`crate::supervise::approvals::land_episode_in`]), so `landing since` reads the same
+/// before and after a handoff. A later try's row moves it no more.
+#[test]
+fn lands_instruction_typed_as_an_outages_resume_begins_the_hold_at_its_row() {
+    use crate::supervise::approvals::{Outcome, Row, act_reason, land_episode_in};
+    const STAMP: i64 = 1_790_000_000_000;
+    let sid = Some("@s-9");
+    let t = t0();
+    let wall = land(walled(
+        WallKind::Overloaded,
+        "API Error: 529 Overloaded.",
+        Some(3 * MIN),
+    ));
+    let mut st = TurnEndState::default();
+    at(&mut st, &wall, t);
+    assert_eq!(
+        act(&mut st, &again(&wall), t + 2 * MIN),
+        TurnEndAction::Type {
+            text: LAND.to_string(),
+            rule_id: RULE_OUTAGE_RESUME,
+        }
+    );
+    st.ledgered(RULE_OUTAGE_RESUME, STAMP);
+    let why = act_reason(None);
+    let row = Row {
+        rule_id: RULE_OUTAGE_RESUME,
+        outcome: Outcome::Typed,
+        command: LAND,
+        reason: &why,
+        box_seq: 1,
+    }
+    .to_json(STAMP, sid);
+    let books = land_episode_in(&format!("{row}\n"), sid).expect("the books' episode");
+    assert_eq!(books.hold.since_ms, Some(STAMP));
+    assert_eq!(
+        st.land_held().map(|h| h.since_ms),
+        Some(books.hold.since_ms),
+        "the loop's hold is the books'"
+    );
+    let met = t + 3 * MIN;
+    let answered = TurnEndReading {
+        worked: Some(Duration::from_secs(4)),
+        ..wall.clone()
+    };
+    at(&mut st, &answered, met);
+    assert_eq!(
+        act(&mut st, &again(&wall), met + 4 * MIN),
+        resumed(Outage::Overload, Clearing::Blind)
+    );
+    st.ledgered(RULE_OUTAGE_RESUME, STAMP + 240_000);
+    assert_eq!(st.land_held().map(|h| h.since_ms), Some(Some(STAMP)));
 }
 
 #[test]
@@ -7781,29 +8294,27 @@ fn a_refused_request_backs_off_slowly_and_is_the_owners_after_three_tries() {
         worked: Some(Duration::from_secs(2)),
         ..server.clone()
     };
+    // CONTROL: a server error is an outage. Its tries climb the doubling ladder, each answered
+    // the same, and nothing holds it or tells the owner.
     let mut st = TurnEndState::default();
     let mut now = t;
     let mut waits = Vec::new();
-    for i in 0..=FUTILE_AFTER_TRIES {
+    for i in 0..=FUTILE_AFTER_TRIES + 3 {
         let shown = if i == 0 { &server } else { &server_back };
         match at(&mut st, shown, now) {
             TurnEndAction::WaitUntil { until, .. } => {
                 waits.push((until - now).as_secs() / 60);
-                act(&mut st, &again(&server), until);
+                assert_eq!(exception_for(&st, shown, &cfg(), now), None, "try {i}");
+                assert_eq!(
+                    act(&mut st, &again(&server), until),
+                    resumed(Outage::ApiError, Clearing::Blind)
+                );
                 now = until + 3 * MIN;
             }
-            // The same answer to each of the ladder's tries holds it after them.
-            TurnEndAction::Nothing if i == FUTILE_AFTER_TRIES => {}
             other => panic!("{other:?}"),
         }
     }
-    assert_eq!(waits, [1, 5, 15]);
-    assert_eq!(
-        exception_for(&st, &server_back, &cfg(), now),
-        Some(super::super::exception::Exception::repeats(
-            crate::harness::acts::HeldBy::SameReply
-        ))
-    );
+    assert_eq!(waits, [2, 4, 8, 16, 32, 60, 60]);
     let off = SupervisorConfig {
         retry_api_errors: false,
         ..cfg()
@@ -8051,7 +8562,14 @@ fn a_walls_act_never_types_the_screens_words() {
                         (first.clone(), now + 3 * MIN)
                     };
                 }
-                assert!(acts > 0, "{case}: no act at all");
+                // A connection error measured down for all six hours is waited out in silence.
+                if matches!(reach, Reach::Down { .. })
+                    && outage_of(kind, true, program) == Some(Outage::Connection)
+                {
+                    assert_eq!(acts, 0, "{case}: typed into a route measured down");
+                } else {
+                    assert!(acts > 0, "{case}: no act at all");
+                }
             }
         }
     }
@@ -8096,11 +8614,66 @@ fn only_the_short_streaks_back_off_is_a_pause() {
     );
 }
 
+/// PICKING LAND ACTS AT ONCE (v6 §14.10): the instruction waits no back-off; the nudges, Land's
+/// answer and Cruise wait theirs.
 #[test]
-fn only_a_retrys_wait_is_the_next_try() {
-    let wait = |a: &TurnEndAction| match a {
-        TurnEndAction::WaitUntil { why, wait, .. } => (why.clone(), *wait == WaitKind::Retry),
+fn lands_instruction_waits_no_back_off_and_the_rest_wait_theirs() {
+    let t = t0();
+    let timing = TurnEndTiming::default();
+    let point = |st: &mut TurnEndState, r: &TurnEndReading, now: Instant, short: u32| {
+        st.observe(r, now);
+        st.seed_short(short);
+        match decide_turn_end(st, r, &cfg(), now) {
+            TurnEndAction::WaitUntil { until, wait, .. } => Err((until, wait)),
+            a => Ok(a),
+        }
+    };
+    let backoff = |now: Instant, short: u8| {
+        let wait = timing.short_wait_at(u32::from(short)).expect("a back-off");
+        Err((now + wait, WaitKind::BackOff { short }))
+    };
+    let short = idle("Renamed the helper.", None);
+    assert_eq!(
+        point(&mut TurnEndState::default(), &land(short.clone()), t, 3),
+        Ok(land_instruction()),
+        "Land, its instruction untyped"
+    );
+    let mut st = TurnEndState::default();
+    assert_eq!(
+        act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t),
+        land_instruction()
+    );
+    let then = t + 3 * MIN;
+    assert_eq!(
+        point(&mut st, &land(idle("Renamed it.", Some(3 * MIN))), then, 2),
+        backoff(then, 2),
+        "the nudge, its instruction typed"
+    );
+    assert_eq!(
+        point(&mut TurnEndState::default(), &short, t, 3),
+        backoff(t, 3),
+        "the same point under Cruise"
+    );
+    let asks = idle("Should I merge the lexer first?", None);
+    assert_eq!(
+        point(&mut TurnEndState::default(), &land(asks), t, 3),
+        backoff(t, 3),
+        "Land's answer, its instruction untyped"
+    );
+}
+
+#[test]
+fn only_an_api_walls_wait_is_the_next_try() {
+    let kind_of = |a: &TurnEndAction| match a {
+        TurnEndAction::WaitUntil { why, wait, .. } => (why.clone(), *wait),
         other => panic!("a wait: {other:?}"),
+    };
+    let wait = |a: &TurnEndAction| {
+        let (why, kind) = kind_of(a);
+        (
+            why,
+            matches!(kind, WaitKind::Retry | WaitKind::Outage { .. }),
+        )
     };
     let t = t0();
     let unreachable = WallKind::ApiError {
@@ -8118,22 +8691,43 @@ fn only_a_retrys_wait_is_the_next_try() {
         retryable: true,
         cause: ApiCause::Server,
     };
-    for (name, kind, reach, worked) in [
-        ("unreachable", unreachable, Reach::Unknown, Some(3 * MIN)),
+    let outage = |wall: Outage, tries: bool| WaitKind::Outage { wall, tries };
+    for (name, kind, reach, worked, told) in [
         (
-            "down hold",
+            "unreachable",
+            unreachable,
+            Reach::Unknown,
+            Some(3 * MIN),
+            outage(Outage::Connection, true),
+        ),
+        (
+            "measured down",
             unreachable,
             Reach::Down { since: t },
             Some(3 * MIN),
+            outage(Outage::Connection, false),
         ),
-        ("server", server, Reach::Unknown, Some(3 * MIN)),
+        (
+            "server",
+            server,
+            Reach::Unknown,
+            Some(3 * MIN),
+            outage(Outage::ApiError, true),
+        ),
         (
             "overloaded",
             WallKind::Overloaded,
             Reach::Unknown,
             Some(3 * MIN),
+            outage(Outage::Overload, true),
         ),
-        ("cut off, met again", cut, Reach::Unknown, Some(MIN)),
+        (
+            "cut off, met again",
+            cut,
+            Reach::Unknown,
+            Some(MIN),
+            WaitKind::Retry,
+        ),
     ] {
         let mut st = TurnEndState::default();
         let r = TurnEndReading {
@@ -8152,21 +8746,9 @@ fn only_a_retrys_wait_is_the_next_try() {
                 t + Duration::from_secs(1),
             );
         }
-        let (w, retry) = wait(&a);
-        assert!(retry, "{name}: {w}");
+        let (w, kind) = kind_of(&a);
+        assert_eq!(kind, told, "{name}: {w}");
     }
-    let up = api_wall(
-        ApiCause::Unreachable,
-        ENOTFOUND,
-        Some(3 * MIN),
-        Reach::Up { since: t },
-    );
-    let mut st = TurnEndState::default();
-    let back = act(&mut st, &up, t);
-    assert_eq!(back.rule_id(), Some(RULE_API_BACK), "{back:?}");
-    let (w, retry) = wait(&at(&mut st, &up, t + 3 * MIN));
-    assert!(w.contains("back but met again"), "{w}");
-    assert!(retry, "{w}");
     let mut st = TurnEndState::default();
     let r = walled(unreachable, "API Error", Some(3 * MIN));
     st.observe(&r, t);
@@ -8176,7 +8758,7 @@ fn only_a_retrys_wait_is_the_next_try() {
             worked: None,
             ..r.clone()
         },
-        t + MIN,
+        t + 2 * MIN,
     );
     assert!(matches!(typed, TurnEndAction::Type { .. }), "{typed:?}");
     let check = at(
@@ -8185,7 +8767,7 @@ fn only_a_retrys_wait_is_the_next_try() {
             worked: None,
             ..r.clone()
         },
-        t + MIN + Duration::from_secs(1),
+        t + 2 * MIN + Duration::from_secs(1),
     );
     let (w, retry) = wait(&check);
     assert!(w.contains("the worker to take"), "{w}");
@@ -8427,7 +9009,7 @@ fn a_wall_no_reset_ends_is_retried_on_the_entitlement_ladder() {
             );
             now += wait * MIN;
             let a = at_under(&mut st, &r, now, &cfg);
-            assert_eq!(a, typed(RULE_LIMIT_RESUME), "{kind:?}");
+            assert_eq!(a, blind(RULE_LIMIT_RESUME), "{kind:?}");
             st.acted(&a, &r, now);
             r.worked = Some(Duration::from_secs(4));
             r.wall_message = format!("You're out of usage credits · add funds{word}");
@@ -8497,7 +9079,7 @@ fn a_long_answer_at_a_read_wall_is_no_work_whether_or_not_its_reader_reads_tool_
             };
             now = until;
             let a = at(&mut st, &r, now);
-            assert_eq!(a, typed(RULE_LIMIT_RESUME), "{program:?}");
+            assert_eq!(a, blind(RULE_LIMIT_RESUME), "{program:?}");
             st.acted(&a, &r, now);
             st.took();
             now += MIN_WORK;
@@ -8549,7 +9131,7 @@ fn held_limit() -> (TurnEndState, TurnEndReading, Instant) {
         };
         now = until;
         let a = at(&mut st, &r, now);
-        assert_eq!(a, typed(RULE_LIMIT_RESUME));
+        assert_eq!(a, blind(RULE_LIMIT_RESUME));
         st.acted(&a, &r, now);
         st.took();
         now += MIN_WORK;
@@ -8766,7 +9348,7 @@ fn a_loop_that_follows_keeps_the_entitlement_ladders_rung() {
                 other => panic!("{kind:?}: {other:?}"),
             };
             let a = at_under(&mut st, &r, now, &cfg);
-            assert_eq!(a, typed(RULE_LIMIT_RESUME), "{kind:?}");
+            assert_eq!(a, blind(RULE_LIMIT_RESUME), "{kind:?}");
             st.acted(&a, &r, now);
             tries.push((now, st.limit_try().expect("the limit's try")));
             r.worked = Some(Duration::from_secs(4));
@@ -8794,7 +9376,7 @@ fn a_loop_that_follows_keeps_the_entitlement_ladders_rung() {
                 "{kind:?}, {ago:?} after the try: {a:?}"
             );
             let a = at_under(&mut next, &r, last + 360 * MIN, &cfg);
-            assert_eq!(a, typed(RULE_LIMIT_RESUME), "{kind:?}, {ago:?}");
+            assert_eq!(a, blind(RULE_LIMIT_RESUME), "{kind:?}, {ago:?}");
             next.acted(&a, &r, last + 360 * MIN);
             assert_eq!(next.limit_try().map(|l| l.attempts), Some(3), "{kind:?}");
         }
@@ -8837,7 +9419,7 @@ fn a_met_try_older_than_its_next_rung_is_owed_at_the_followers_first_point() {
                 other => panic!("{kind:?}: {other:?}"),
             };
             let a = at_under(&mut st, &r, now, &cfg);
-            assert_eq!(a, typed(RULE_LIMIT_RESUME), "{kind:?}");
+            assert_eq!(a, blind(RULE_LIMIT_RESUME), "{kind:?}");
             st.acted(&a, &r, now);
             tries.push((now, st.limit_try().expect("the limit's try")));
             // Each try answered in its own words, a turn read once, at the point it ended.
@@ -8859,7 +9441,7 @@ fn a_met_try_older_than_its_next_rung_is_owed_at_the_followers_first_point() {
         let mut next = TurnEndState::default();
         next.seed_met_attempt(361 * MIN, limit, attach);
         let a = at_under(&mut next, &r, attach, &cfg);
-        assert_eq!(a, typed(RULE_LIMIT_RESUME), "{kind:?}: the owed third try");
+        assert_eq!(a, blind(RULE_LIMIT_RESUME), "{kind:?}: the owed third try");
         next.acted(&a, &r, attach);
         assert_eq!(next.limit_try().map(|l| l.attempts), Some(3), "{kind:?}");
         let mut answered = r.clone();
@@ -8881,7 +9463,7 @@ fn a_met_try_older_than_its_next_rung_is_owed_at_the_followers_first_point() {
     next.seed_met_attempt(40 * MIN, limit, attach);
     assert_eq!(
         at_under(&mut next, &r, attach, &cfg),
-        typed(RULE_LIMIT_RESUME)
+        blind(RULE_LIMIT_RESUME)
     );
     assert!(attach >= watched[2].0);
     let mut unread = TurnEndState::default();
@@ -8931,8 +9513,8 @@ fn a_try_no_loop_read_is_taken_up_met_where_its_answer_is_dated() {
         None,
         "once"
     );
-    assert_eq!(at_under(&mut st, &r, t, &cfg), typed(RULE_LIMIT_RESUME));
-    st.acted(&typed(RULE_LIMIT_RESUME), &r, t);
+    assert_eq!(at_under(&mut st, &r, t, &cfg), blind(RULE_LIMIT_RESUME));
+    st.acted(&blind(RULE_LIMIT_RESUME), &r, t);
     assert_eq!(st.limit_try().map(|l| l.attempts), Some(3));
     for (wall, dated) in [
         (Some(WallKind::Spend), None),
@@ -8982,7 +9564,7 @@ fn a_wall_that_goes_on_by_itself_is_tried_on_no_entitlement_ladder() {
                     other => panic!("{kind:?}: {other:?}"),
                 };
                 let a = at_under(&mut st, &r, now, &cfg);
-                assert_eq!(a, typed(RULE_LIMIT_RESUME), "{kind:?} {by_itself}");
+                assert_eq!(a, blind(RULE_LIMIT_RESUME), "{kind:?} {by_itself}");
                 st.acted(&a, &r, now);
                 tries.push((now, st.limit_try().expect("the limit's try")));
                 r.worked = Some(Duration::from_secs(4));
@@ -9241,7 +9823,8 @@ fn acts_per_hour(
 #[test]
 fn a_hot_loop_of_one_wall_rule_is_held_to_twelve_an_hour() {
     let timing = TurnEndTiming {
-        retry_backoff: vec![Duration::ZERO],
+        outage_first: Duration::ZERO,
+        outage_cap: Duration::ZERO,
         ..TurnEndTiming::default()
     };
     let rows = shell_frame(&[
@@ -9252,7 +9835,7 @@ fn a_hot_loop_of_one_wall_rule_is_held_to_twelve_an_hour() {
     let mut r = read_screen(&rows, Some(4 * Duration::from_secs(1)));
     assert_eq!(r.wall.map(|w| w.name()), Some("overloaded"));
     let mut st = TurnEndState::new(timing);
-    let per_hour = acts_per_hour(&mut st, &mut r, RULE_API_RETRY, 3, 4, 5);
+    let per_hour = acts_per_hour(&mut st, &mut r, RULE_OUTAGE_RESUME, 3, 4, 5);
     assert!(
         per_hour.iter().all(|&n| n <= WALL_ACTS_PER_WINDOW),
         "{per_hour:?}"
@@ -9268,10 +9851,11 @@ fn a_hot_loop_of_one_wall_rule_is_held_to_twelve_an_hour() {
     ]);
     let mut r = read_screen(&net, Some(4 * Duration::from_secs(1)));
     let mut st = TurnEndState::new(TurnEndTiming {
-        net_backoff: vec![Duration::from_secs(300)],
+        outage_first: Duration::from_secs(300),
+        outage_cap: Duration::from_secs(300),
         ..TurnEndTiming::default()
     });
-    let per_hour = acts_per_hour(&mut st, &mut r, RULE_API_RETRY, 3, 4, 5);
+    let per_hour = acts_per_hour(&mut st, &mut r, RULE_OUTAGE_RESUME, 3, 4, 5);
     assert!(
         per_hour.iter().all(|&n| n <= WALL_ACTS_PER_WINDOW),
         "{per_hour:?}"
@@ -9748,7 +10332,7 @@ fn a_landing_taken_on_from_the_record_types_nothing_until_someone_else_types() {
     assert!(!st.seed_task_done());
     assert!(!st.task_done());
     let retry = decide_turn_end(&st, &wall, &cfg(), t + 60 * MIN);
-    assert_eq!(retry.rule_id(), Some(RULE_API_RETRY), "{retry:?}");
+    assert_eq!(retry.rule_id(), Some(RULE_OUTAGE_RESUME), "{retry:?}");
     let mut st = TurnEndState::default();
     assert_eq!(
         act(&mut st, &land(idle("Stage 1 landed.", Some(5 * MIN))), t),
@@ -12888,15 +13472,17 @@ fn the_probes_gate_is_true_at_a_plain_idle_point_and_false_with_any_condition_fl
     assert_eq!(tracked.wall_attempts(WallKind::UsageSession), Some(0));
     assert!(!gate(&tracked, &again, &cfg()), "a wall track");
     assert_eq!(word(&tracked, &again, &cfg()), Some("wall"));
+    // A task done by the person's own exchange, which only Land leaves to them (owner ruling
+    // 2026-10-26).
     let mut done = TurnEndState::default();
     done.observe(
-        &TurnEndReading {
+        &land(TurnEndReading {
             person: Some(Duration::from_secs(8)),
             ..idle(
                 "Hi! What would you like me to work on?",
                 Some(Duration::from_secs(5)),
             )
-        },
+        }),
         t,
     );
     assert!(done.task_done());
@@ -13883,6 +14469,14 @@ fn land_types_the_instruction_then_nudges_without_bound() {
     {
         now += 3 * MIN;
         let r = land(idle(reply, Some(3 * MIN)));
+        let paced = matches!(
+            at(&mut st.clone(), &r, now),
+            TurnEndAction::WaitUntil {
+                wait: WaitKind::BackOff { .. },
+                ..
+            }
+        );
+        assert_eq!(paced, says_done(Some(reply)), "{n}: {reply}: the ladder");
         let (a, then) = past_backoff(&mut st, &r, now);
         assert_eq!(a.rule_id(), Some(RULE_LAND_NUDGE), "{n}: {reply}: {a:?}");
         st.acted(&a, &r, then);
@@ -14500,16 +15094,17 @@ fn a_turn_of_someone_elses_keeps_the_land_episode() {
 
 #[test]
 fn a_done_report_under_land_gets_the_instruction_not_the_check() {
+    let quick = Some(Duration::from_secs(4));
     for said in ["All done.", "All done. What's next?"] {
         let mut now = t0();
         let mut st = TurnEndState::default();
-        st.observe(&land(idle(said, Some(3 * MIN))), now);
+        st.observe(&land(idle(said, quick)), now);
         assert_eq!(st.done_reports(), 1, "{said}");
-        now += st.short_wait().unwrap_or_default();
+        assert!(st.short_wait().is_some(), "{said}: a back-off stands");
         assert_eq!(
             act(&mut st, &land(idle(said, None)), now),
             land_instruction(),
-            "{said}"
+            "{said}: at once (v6 §14.10)"
         );
         now += MIN;
         let r = land(idle("DONE", Some(Duration::from_secs(4))));
@@ -14524,8 +15119,13 @@ fn a_done_report_under_land_gets_the_instruction_not_the_check() {
         );
         assert!(st.task_done() && st.landed(), "{said}");
         let mut st = TurnEndState::default();
-        st.observe(&idle(said, Some(3 * MIN)), t0());
-        let later = t0() + st.short_wait().unwrap_or_default();
+        let t = t0();
+        st.observe(&idle(said, quick), t);
+        let later = t + st.short_wait().unwrap_or_default();
+        assert!(
+            waits_until(&decide_turn_end(&st, &idle(said, None), &cfg(), t), later),
+            "{said}: Cruise's check waits its back-off"
+        );
         assert_eq!(act(&mut st, &idle(said, None), later), checked(), "{said}");
     }
 }
@@ -14656,7 +15256,7 @@ fn leaving_land_forgets_the_episode_and_a_landed_task_goes_on_under_cruise() {
 #[test]
 fn leaving_land_for_an_off_park_types_the_instruction_again() {
     let progress = "Committing the parser now; the lexer is next.";
-    let run = |park: bool| {
+    let run = |park: bool, said: &str, worked: Duration| {
         let mut now = t0();
         let mut st = TurnEndState::default();
         act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
@@ -14666,10 +15266,21 @@ fn leaving_land_for_an_off_park_types_the_instruction_again() {
             assert_eq!(st.land_episode(), (false, 0));
         }
         now += 3 * MIN;
-        act(&mut st, &land(idle(progress, Some(3 * MIN))), now)
+        act(&mut st, &land(idle(said, Some(worked))), now)
     };
-    assert_eq!(run(true), land_instruction());
-    assert_eq!(run(false), land_nudged());
+    assert_eq!(run(true, progress, 3 * MIN), land_instruction());
+    assert_eq!(run(false, progress, 3 * MIN), land_nudged());
+    // A quick done claim's back-off: the instruction the park owes again waits none of it, the
+    // nudge waits it (v6 §14.10).
+    let quick = Duration::from_secs(4);
+    assert_eq!(run(true, "All done.", quick), land_instruction());
+    assert!(matches!(
+        run(false, "All done.", quick),
+        TurnEndAction::WaitUntil {
+            wait: WaitKind::BackOff { short: 1 },
+            ..
+        }
+    ));
     let mut now = t0();
     let mut st = TurnEndState::default();
     act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
@@ -14686,7 +15297,7 @@ fn leaving_land_for_an_off_park_types_the_instruction_again() {
 }
 
 #[test]
-fn a_persons_own_exchange_is_theirs_under_every_autopilot() {
+fn a_persons_own_exchange_is_theirs_under_land_and_off() {
     let now = t0();
     let quick = Some(Duration::from_secs(5));
     let said = "Hi! What would you like me to work on?";
@@ -14694,7 +15305,7 @@ fn a_persons_own_exchange_is_theirs_under_every_autopilot() {
         person: Some(Duration::from_secs(8)),
         ..idle(said, quick)
     };
-    for mode in Autopilot::ALL {
+    for mode in [Autopilot::Land, Autopilot::Off] {
         let mut st = TurnEndState::default();
         assert_eq!(
             at(&mut st, &under(mode, theirs.clone()), now),
@@ -14719,12 +15330,103 @@ fn a_persons_own_exchange_is_theirs_under_every_autopilot() {
         assert!(!st.left_to_person(), "{mode:?}");
         let a = decide_turn_end(&st, &under(mode, idle(said, quick)), &cfg(), now + 60 * MIN);
         let want = match mode {
-            Autopilot::Cruise => checked(),
             Autopilot::Land => land_instruction(),
-            Autopilot::Off => TurnEndAction::Nothing,
+            Autopilot::Cruise | Autopilot::Off => TurnEndAction::Nothing,
         };
         assert_eq!(a, want, "{mode:?}");
     }
+}
+
+/// CRUISE NEVER PARKS AT A REPLY TO THE PERSON'S OWN MESSAGE (owner ruling 2026-10-26): the
+/// person's own exchange (their message, answered within 10 minutes) is theirs under Land and Off
+/// alone; under Cruise it is a turn end like any other, whatever the reply says (a greeting, a
+/// question to them, a done report, a `NEEDS YOU:` line, an answer at length), held only while
+/// their hands are on the keys and carried once they are off. NEGATIVE CONTROL: with
+/// `TurnEndState::observe`'s exchange taken under Cruise again (`autopilot != Cruise` dropped from
+/// its `(None, Some(d))` arm, or `cruise_takes_exchange` out), Cruise leaves the reply and the
+/// test fails.
+#[test]
+fn cruise_never_parks_at_a_reply_to_the_persons_own_message() {
+    let now = t0();
+    let quick = Some(Duration::from_secs(5));
+    for said in [
+        "Hi! What would you like me to work on?",
+        "Hello!",
+        "Fixed it; the suite is green.\nATERM-TASK-DONE",
+        "All done: the change is committed and pushed, and every suite passes.",
+        "The fix is in.\nNEEDS YOU: the release credential to sign 0.145.0",
+        "Keep the token: it costs nothing and survives a restart.",
+    ] {
+        let theirs = TurnEndReading {
+            person: Some(Duration::from_secs(8)),
+            ..idle(said, quick)
+        };
+        let mut st = TurnEndState::default();
+        let a = at(&mut st, &theirs, now);
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why == "a person is typing"),
+            "their hands hold it: {said}: {a:?}"
+        );
+        assert!(!st.left_to_person() && !st.task_done(), "{said}");
+        for later in [2 * MIN, 60 * MIN, 24 * 60 * MIN] {
+            let quiet = TurnEndReading {
+                person: Some(later),
+                ..theirs.clone()
+            };
+            let a = decide_turn_end(&st, &quiet, &cfg(), now + later);
+            assert!(
+                matches!(a, TurnEndAction::Type { .. }),
+                "carried at +{later:?}: {said}: {a:?}"
+            );
+        }
+        // The same reply under Land and Off stays theirs.
+        for mode in [Autopilot::Land, Autopilot::Off] {
+            let mut st = TurnEndState::default();
+            assert_eq!(
+                at(&mut st, &under(mode, theirs.clone()), now),
+                TurnEndAction::Nothing,
+                "{mode:?}: {said}"
+            );
+            let quiet = under(
+                mode,
+                TurnEndReading {
+                    person: Some(60 * MIN),
+                    ..theirs.clone()
+                },
+            );
+            assert_eq!(
+                decide_turn_end(&st, &quiet, &cfg(), now + 60 * MIN),
+                TurnEndAction::Nothing,
+                "{mode:?}: {said}"
+            );
+        }
+    }
+    // An exchange a Land run left is carried once the session is Cruise again, and an earlier
+    // loop's record that left it holds no Cruise session either.
+    let left = TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        ..idle("Hello!", quick)
+    };
+    let mut st = TurnEndState::default();
+    at(&mut st, &land(left.clone()), now);
+    assert!(st.left_to_person());
+    let back = TurnEndReading {
+        person: Some(30 * MIN),
+        worked: None,
+        ..left.clone()
+    };
+    at(&mut st, &back, now + 30 * MIN);
+    assert!(!st.left_to_person(), "Cruise again: carried");
+    let a = decide_turn_end(&st, &back, &cfg(), now + 90 * MIN);
+    assert!(matches!(a, TurnEndAction::Type { .. }), "{a:?}");
+    let recorded_left = TurnEndReading {
+        left_record: true,
+        ..recorded(Some(false), idle("Hello!", None))
+    };
+    let mut fresh = TurnEndState::default();
+    let (a, _) = past_backoff(&mut fresh, &recorded_left, now);
+    assert!(!fresh.left_to_person(), "{a:?}");
+    assert!(matches!(a, TurnEndAction::Type { .. }), "{a:?}");
 }
 
 #[test]
@@ -14817,11 +15519,16 @@ fn an_off_park_ends_the_carry_so_a_persons_greeting_after_it_is_theirs() {
             let a = decide_turn_end(&st, &r, &cfg(), now + 10 * MIN);
             (st.left_to_person(), a)
         };
-        assert_eq!(run(true), (true, TurnEndAction::Nothing), "{mode:?}");
         let want = match mode {
             Autopilot::Land => land_nudged(),
             _ => typed(RULE_CONTINUE),
         };
+        // Cruise carries the person's own exchange (owner ruling 2026-10-26); Land leaves it.
+        let parked = match mode {
+            Autopilot::Land => (true, TurnEndAction::Nothing),
+            _ => (false, typed(RULE_CONTINUE)),
+        };
+        assert_eq!(run(true), parked, "{mode:?}");
         assert_eq!(run(false), (false, want), "{mode:?}");
     }
 }
@@ -14926,12 +15633,17 @@ fn a_loop_started_as_off_lifted_keeps_the_carry_for_the_turn_it_attached_to() {
     at(&mut st, &idle("Waiting for your word.", None), now);
     assert!(!st.left_to_person());
     st.took();
+    // The person's own exchange after it: Land leaves it to them, Cruise carries it (owner ruling
+    // 2026-10-26).
     let hello = TurnEndReading {
         person: Some(Duration::from_secs(5)),
         ..idle("Hello!", Some(Duration::from_secs(5)))
     };
-    at(&mut st, &hello, now + 10 * MIN);
+    let mut carried = st.clone();
+    at(&mut st, &land(hello.clone()), now + 10 * MIN);
     assert!(st.left_to_person());
+    at(&mut carried, &hello, now + 10 * MIN);
+    assert!(!carried.left_to_person());
 }
 
 #[test]
@@ -15063,6 +15775,9 @@ fn a_wall_split_job_is_landed_and_a_split_exchange_is_left_under_land() {
         };
         let a = act(&mut st, &retry, now + 10 * MIN);
         assert!(a.rule_id().is_some_and(is_wall_retry), "{a:?}");
+        let TurnEndAction::Type { text: resume, .. } = a else {
+            panic!("the resume typed: {a:?}")
+        };
         let answered = now + 10 * MIN + after;
         at(
             &mut st,
@@ -15075,15 +15790,25 @@ fn a_wall_split_job_is_landed_and_a_split_exchange_is_left_under_land() {
             &cfg(),
             answered + 60 * MIN,
         );
-        (st.left_to_person(), st.landed(), st.land_episode(), a)
+        (
+            st.left_to_person(),
+            st.landed(),
+            st.land_episode(),
+            a,
+            resume,
+        )
     };
+    // At the wall the turn is still the person's own exchange, so its resume is the outage's
+    // line, never Land's instruction over their request. A job the wall split then goes on with
+    // Land's instruction at the agent's own turn end, and an exchange is left to the person.
+    let line = cleared_text(Cleared::Outage(Outage::Overload), Clearing::Blind).to_string();
     assert_eq!(
         run(6 * MIN, 6 * MIN),
-        (false, false, (false, 0), land_instruction())
+        (false, false, (false, 0), land_instruction(), line.clone())
     );
     assert_eq!(
         run(3 * MIN, 3 * MIN),
-        (true, false, (false, 0), TurnEndAction::Nothing)
+        (true, false, (false, 0), TurnEndAction::Nothing, line)
     );
 }
 
@@ -15133,11 +15858,12 @@ fn after_an_off_park_a_persons_turn_is_judged_by_the_exchange_bound() {
                 decide_turn_end(&st, &r, &cfg(), now + 10 * MIN),
             )
         };
-        assert_eq!(
-            run(true, 8 * MIN),
-            (true, TurnEndAction::Nothing),
-            "{mode:?}"
-        );
+        // Cruise carries the person's own exchange (owner ruling 2026-10-26); Land leaves it.
+        let parked = match mode {
+            Autopilot::Land => (true, TurnEndAction::Nothing),
+            _ => (false, typed(RULE_CONTINUE)),
+        };
+        assert_eq!(run(true, 8 * MIN), parked, "{mode:?}");
         let (on_the_ladder, after_the_park) = match mode {
             Autopilot::Land => (land_nudged(), land_instruction()),
             _ => (typed(RULE_CONTINUE), typed(RULE_CONTINUE)),
@@ -15170,29 +15896,38 @@ fn a_lifted_loops_kept_carry_holds_inside_the_exchange_bound() {
         decide_turn_end(&st, &later, &cfg(), now + 60 * MIN),
         typed(RULE_CONTINUE)
     );
-    let after_an_unseen_first_point = |worked: Duration| {
+    let after_an_unseen_first_point = |mode: Autopilot, worked: Duration| {
         let mut st = TurnEndState::default();
         st.seed_acts(&[4 * MIN], now);
         st.start_lifted_off();
-        at(&mut st, &idle("Waiting for your word.", None), now);
+        at(
+            &mut st,
+            &under(mode, idle("Waiting for your word.", None)),
+            now,
+        );
         assert!(!st.left_to_person());
         st.took();
         let theirs = TurnEndReading {
             person: Some(worked + Duration::from_secs(8)),
             ..idle(said, Some(worked))
         };
-        st.observe(&theirs, now + 30 * MIN);
+        st.observe(&under(mode, theirs), now + 30 * MIN);
         (
             st.left_to_person(),
-            decide_turn_end(&st, &later, &cfg(), now + 90 * MIN),
+            decide_turn_end(&st, &under(mode, later.clone()), &cfg(), now + 90 * MIN),
         )
     };
+    // Land leaves the person's own exchange to them; Cruise carries it (owner ruling 2026-10-26).
     assert_eq!(
-        after_an_unseen_first_point(minutes),
+        after_an_unseen_first_point(Autopilot::Land, minutes),
         (true, TurnEndAction::Nothing)
     );
     assert_eq!(
-        after_an_unseen_first_point(JOB),
+        after_an_unseen_first_point(Autopilot::Cruise, minutes),
+        (false, typed(RULE_CONTINUE))
+    );
+    assert_eq!(
+        after_an_unseen_first_point(Autopilot::Cruise, JOB),
         (false, typed(RULE_CONTINUE))
     );
 }
@@ -15200,12 +15935,14 @@ fn a_lifted_loops_kept_carry_holds_inside_the_exchange_bound() {
 #[test]
 fn a_persons_exchange_on_a_wall_keeps_its_work_across_an_off_park() {
     let now = t0();
+    // Land's: Cruise leaves no exchange to a person (owner ruling 2026-10-26).
+    let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let run = |before: Duration, after: Duration, park: bool| {
         let mut st = TurnEndState::default();
-        let r = TurnEndReading {
+        let r = land(TurnEndReading {
             person: Some(before),
             ..walled(WallKind::Overloaded, "529", Some(before))
-        };
+        });
         at(&mut st, &r, now);
         let retry = TurnEndReading {
             person: None,
@@ -15227,11 +15964,8 @@ fn a_persons_exchange_on_a_wall_keeps_its_work_across_an_off_park() {
         (st.left_to_person(), a)
     };
     for park in [true, false] {
-        assert_eq!(
-            run(6 * MIN, 6 * MIN, park),
-            (false, typed(RULE_CONTINUE)),
-            "park {park}"
-        );
+        let (left, a) = run(6 * MIN, 6 * MIN, park);
+        assert!(!left && a.rule_id().is_some(), "park {park}: {a:?}");
         assert_eq!(
             run(3 * MIN, 3 * MIN, park),
             (true, TurnEndAction::Nothing),
@@ -15284,20 +16018,34 @@ fn a_persons_exchange_retried_on_a_wall_and_unseen_after_an_off_park_is_never_le
         };
         let (left, first, later) = run(true);
         assert!(!left, "{mode:?}");
-        assert!(
-            matches!(first, TurnEndAction::WaitUntil { .. }),
-            "{mode:?}: backed off first: {first:?}"
-        );
         let want = match mode {
             Autopilot::Land => land_instruction(),
             _ => typed(RULE_CONTINUE),
         };
+        // Land's instruction waits no back-off (v6 §14.10); Cruise, which never takes the turn
+        // for the person's (owner ruling 2026-10-26), backs off first or types at once.
+        if mode == Autopilot::Land {
+            assert_eq!(first, want, "{mode:?}: at once");
+        } else {
+            assert!(
+                matches!(first, TurnEndAction::WaitUntil { .. }) || first == want,
+                "{mode:?}: backed off first: {first:?}"
+            );
+        }
         assert_eq!(later, want, "{mode:?}");
-        assert_eq!(
-            run(false),
-            (true, TurnEndAction::Nothing, TurnEndAction::Nothing),
-            "{mode:?}"
-        );
+        let (left, _, later) = run(false);
+        if mode == Autopilot::Land {
+            assert!(
+                left && later == TurnEndAction::Nothing,
+                "{mode:?}: {later:?}"
+            );
+        } else {
+            // Cruise carries the person's own exchange (owner ruling 2026-10-26).
+            assert!(
+                !left && later == typed(RULE_CONTINUE),
+                "{mode:?}: {later:?}"
+            );
+        }
     }
 }
 
@@ -16260,6 +17008,12 @@ fn a_superseded_logins_held_follow_is_waited_for_and_asks_nothing() {
 
 #[test]
 fn a_wall_splits_a_job_in_a_new_loop_too() {
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
+    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
+    let walled = |kind: WallKind, message: &str, worked: Option<Duration>| {
+        land(walled(kind, message, worked))
+    };
     let s = Duration::from_secs;
     for (before, after, carried, job) in [
         (8 * MIN, 9 * MIN, true, true),
@@ -16303,11 +17057,11 @@ fn a_wall_splits_a_job_in_a_new_loop_too() {
             ..walled(WallKind::Overloaded, "529", None)
         };
         let (a, t) = until_acted(&mut st, &first, t0());
-        assert_eq!(a.rule_id(), Some(RULE_API_RETRY), "{name}: {a:?}");
+        assert_eq!(a.rule_id(), Some(RULE_OUTAGE_RESUME), "{name}: {a:?}");
         let (b, _) = past_backoff(&mut st, &idle("Stage 2 of 5 done.", Some(after)), t + after);
         assert_eq!(st.left_to_person(), !job, "{name}: new loop: {b:?}");
         if job {
-            assert_eq!(b.rule_id(), Some(RULE_CONTINUE), "{name}: {b:?}");
+            assert!(b.rule_id().is_some(), "{name}: {b:?}");
         } else {
             assert_eq!(b, TurnEndAction::Nothing, "{name}: {b:?}");
         }
@@ -16348,10 +17102,13 @@ fn a_wall_inside_the_restarts_check_keeps_the_check_it_cut() {
 
 #[test]
 fn a_loop_started_as_off_lifted_leaves_a_first_point_an_earlier_loop_left() {
+    // THE PERSON'S OWN EXCHANGE IS LAND'S TO LEAVE: Cruise carries it (owner ruling 2026-10-26,
+    // `cruise_never_parks_at_a_reply_to_the_persons_own_message`).
+    let idle = |said: &str, worked: Option<Duration>| land(idle(said, worked));
     let later = t0() + 10 * MIN;
-    for (said, without) in [
-        ("Hi! What would you like me to work on?", RULE_DONE_CHECK),
-        ("Hello! How can I help?", RULE_ANSWER),
+    for said in [
+        "Hi! What would you like me to work on?",
+        "Hello! How can I help?",
     ] {
         let first = |left: bool| TurnEndReading {
             left_record: left,
@@ -16371,7 +17128,7 @@ fn a_loop_started_as_off_lifted_leaves_a_first_point_an_earlier_loop_left() {
         assert_eq!(a, TurnEndAction::Nothing, "a day on: {said}");
         let mut st = lifted();
         let (a, _) = past_backoff(&mut st, &first(false), later);
-        assert_eq!(a.rule_id(), Some(without), "no row: {said}: {a:?}");
+        assert!(a.rule_id().is_some(), "no row: {said}: {a:?}");
         assert!(!st.left_to_person(), "no row: {said}");
     }
 }
@@ -16570,7 +17327,7 @@ fn a_seeded_check_a_529_cut_is_typed_again_after_the_compaction() {
             now = until;
             a = at(&mut st, &overloaded, now);
         }
-        assert_eq!(a.rule_id(), Some(RULE_API_RETRY), "{case}: {a:?}");
+        assert_eq!(a.rule_id(), Some(RULE_OUTAGE_RESUME), "{case}: {a:?}");
         st.acted(&a, &overloaded, now);
         now += 4 * MIN;
         let compact = act(&mut st, &context, now);
@@ -16683,8 +17440,12 @@ fn the_programs_own_long_turn_that_ran_no_tool_counts_as_an_acts_answer_does() {
     let wall = TurnEndReading {
         ran_tools: false,
         ..walled(
-            WallKind::Overloaded,
-            "Overloaded · try again soon",
+            WallKind::ApiError {
+                code: Some(400),
+                retryable: false,
+                cause: ApiCause::Request,
+            },
+            "API Error: 400 due to tool use concurrency issues.",
             Some(4 * MIN),
         )
     };
@@ -16693,6 +17454,21 @@ fn the_programs_own_long_turn_that_ran_no_tool_counts_as_an_acts_answer_does() {
         3,
         "{:?}",
         after(&wall).replies()
+    );
+    // An outage wall's is no answer at all: the run stands where it was (v6 §14.17.5.2).
+    let outage = TurnEndReading {
+        ran_tools: false,
+        ..walled(
+            WallKind::Overloaded,
+            "Overloaded · try again soon",
+            Some(4 * MIN),
+        )
+    };
+    assert_eq!(
+        after(&outage).replies().run,
+        2,
+        "{:?}",
+        after(&outage).replies()
     );
 }
 
@@ -17102,22 +17878,30 @@ fn the_exchange_a_lost_login_swallowed_is_the_persons_through_its_sign_in() {
     let answered = format!(
         "{walled}❯ /login\n  ⎿  Login successful\n\n❯ is this all merged into main?\n\n⏺ Yes: everything is on main, nothing is left on a branch.\n\n✻ Worked for 9s · done 5:04 PM\n\n{composer}"
     );
-    let read = |text: &str, worked: Option<Duration>, person: Duration| {
+    let read = |mode: Autopilot, text: &str, worked: Option<Duration>, person: Duration| {
         let rows: Vec<String> = text.lines().map(str::to_string).collect();
         let r = aterm_phase::read(Some("claude"), &rows, Some(2));
         TurnEndReading {
             person: Some(person),
+            autopilot: mode,
             ..TurnEndReading::of(&r, &rows, false, worked, None, None)
         }
     };
     let t = t0();
     let secs = Duration::from_secs;
-    for aterm_presses in [true, false] {
+    // Land leaves the owner's exchange to them; Cruise carries it (owner ruling 2026-10-26).
+    for (mode, aterm_presses) in [
+        (Autopilot::Land, true),
+        (Autopilot::Land, false),
+        (Autopilot::Cruise, true),
+        (Autopilot::Cruise, false),
+    ] {
         let mut st = TurnEndState::default();
         let point = format!("{worked}{composer}");
-        st.observe(&read(&point, Some(secs(240)), secs(600)), t);
+        st.observe(&read(mode, &point, Some(secs(240)), secs(600)), t);
         let at_wall = t + secs(10);
         let wall = read(
+            mode,
             &format!("{walled}{composer}"),
             None,
             Duration::from_millis(200),
@@ -17132,18 +17916,18 @@ fn the_exchange_a_lost_login_swallowed_is_the_persons_through_its_sign_in() {
         let a = decide_turn_end(&st, &wall, &cfg(), quiet);
         assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
         st.acted(&a, &wall, quiet);
-        let h = read(&handoff, None, secs(20));
+        let h = read(mode, &handoff, None, secs(20));
         assert_eq!(at(&mut st, &h, quiet + secs(5)), TurnEndAction::Nothing);
         let done_at = quiet + secs(90);
         if aterm_presses {
-            let ok = read(&success, None, secs(100));
+            let ok = read(mode, &success, None, secs(100));
             let a = at(&mut st, &ok, done_at);
             assert!(matches!(a, TurnEndAction::Confirm { .. }), "{a:?}");
             st.acted(&a, &ok, done_at);
         }
         let key_at = if aterm_presses { at_wall } else { done_at };
         let mut now = done_at + secs(10);
-        let back = |now: Instant| read(&answered, Some(secs(9)), now - key_at);
+        let back = |now: Instant| read(mode, &answered, Some(secs(9)), now - key_at);
         let mut decided = at(&mut st, &back(now), now);
         for _ in 0..8 {
             let TurnEndAction::WaitUntil { until, .. } = decided else {
@@ -17152,9 +17936,15 @@ fn the_exchange_a_lost_login_swallowed_is_the_persons_through_its_sign_in() {
             now = until + secs(1);
             decided = decide_turn_end(&st, &back(now), &cfg(), now);
         }
+        let carried = matches!(decided, TurnEndAction::Type { .. });
         assert!(
-            matches!(decided, TurnEndAction::Nothing),
-            "the owner's exchange, delivered (aterm pressed: {aterm_presses}): {decided:?}"
+            if mode == Autopilot::Cruise {
+                carried
+            } else {
+                decided == TurnEndAction::Nothing
+            },
+            "{mode:?}: the owner's exchange, delivered (aterm pressed: {aterm_presses}): \
+             {decided:?}"
         );
     }
 }
@@ -17275,7 +18065,7 @@ fn a_login_another_tab_signs_in_is_waited_on_and_delivered_again_once() {
     let a = at(&mut st, &back, now);
     assert!(
         matches!(&a, TurnEndAction::Type { rule_id, text }
-            if *rule_id == RULE_LOGIN_BACK && text.starts_with(&login_back_text(back.program))),
+            if *rule_id == RULE_LOGIN_BACK && text.starts_with(&login_back_text())),
         "{a:?}"
     );
     assert_eq!(exception_for(&st, &back, &cfg(), now), None);
@@ -18248,7 +19038,7 @@ fn a_wall_only_usage_credits_lift_is_not_continued_under_the_key_off() {
         bucket("Fable 5.1 requires usage credits"),
     ] {
         assert!(waits_until(&decided(&r, &on, t), t + 30 * MIN));
-        assert_eq!(decided(&r, &on, t + 30 * MIN), typed(RULE_LIMIT_RESUME));
+        assert_eq!(decided(&r, &on, t + 30 * MIN), blind(RULE_LIMIT_RESUME));
     }
     let mut named = spend("You're out of extra usage · resets 4pm");
     named.reset_at = Some(t + 90 * MIN);
@@ -18558,8 +19348,6 @@ fn every_wall_act_ends_on_the_needs_you_sentence() {
             let text = wall_retry_text(rule, WallKind::Overloaded, program);
             assert!(ends(&text), "{program:?} {rule} overloaded: {text}");
         }
-        let text = login_back_text(program);
-        assert!(ends(&text), "{program:?} login back: {text}");
     }
     let before = "Claude Code reported an API error (overloaded). Carry on from where you \
                   stopped; if the result of your last step is missing, check whether it ran \
@@ -18600,7 +19388,7 @@ fn an_older_builds_end_row_ends_the_carry_and_seeds_no_end() {
 }
 
 #[test]
-fn login_back_at_a_usage_limit_resumes_at_once_instead_of_leaving_to_person() {
+fn login_back_at_a_usage_limit_resumes_past_the_persons_grace_never_left_to_them() {
     let t = t0();
     let reset = t + 6 * 24 * 60 * MIN;
     let mut limit = walled(
@@ -18634,7 +19422,18 @@ fn login_back_at_a_usage_limit_resumes_at_once_instead_of_leaving_to_person() {
     assert_eq!(after_memory.wall, None, "login_back drops remembered wall");
 
     let a = at(&mut st, &signed_in, t + Duration::from_secs(30));
-    assert_eq!(a, typed(RULE_LIMIT_RESUME));
+    assert!(
+        matches!(a, TurnEndAction::WaitUntil { .. }),
+        "nothing typed over the person who signed in: {a:?}"
+    );
+    assert!(!st.task_done(), "must not latch left-to-person");
+    signed_in.person = Some(Duration::from_secs(5) + 3 * MIN);
+    let a = at(&mut st, &signed_in, t + Duration::from_secs(30) + 3 * MIN);
+    assert_eq!(
+        a,
+        typed(RULE_LIMIT_RESUME),
+        "the one line, once their grace lapsed"
+    );
     assert!(!st.task_done(), "must not latch left-to-person");
 }
 
@@ -18657,6 +19456,12 @@ fn a_sign_in_at_a_usage_limit_is_no_switch_until_the_worker_works_past_it() {
         signed_in.person = Some(Duration::from_secs(5));
         signed_in.login_back = true;
         let a = act(&mut st, &signed_in, t + Duration::from_secs(30));
+        assert!(
+            matches!(a, TurnEndAction::WaitUntil { .. }),
+            "{served}: the person who signed in holds the resume: {a:?}"
+        );
+        signed_in.person = Some(Duration::from_secs(5) + 3 * MIN);
+        let a = act(&mut st, &signed_in, t + Duration::from_secs(30) + 3 * MIN);
         assert_eq!(a, typed(RULE_LIMIT_RESUME), "{served}");
         assert!(
             !st.take_login_returned(),
@@ -18674,7 +19479,7 @@ fn a_sign_in_at_a_usage_limit_is_no_switch_until_the_worker_works_past_it() {
         }
         let mut met = limit.clone();
         met.worked = Some(Duration::from_secs(2));
-        let _ = act(&mut st, &met, t + MIN);
+        let _ = act(&mut st, &met, t + 4 * MIN);
         assert!(!st.take_login_returned(), "the limit met again: no switch");
         let _ = act(&mut st, &done, reset + 10 * MIN);
         assert!(st.limit_ended(), "the limit's track ended");
@@ -18854,7 +19659,7 @@ fn the_record_keeps_a_landing_only_over_a_clean_repository() {
 }
 
 #[test]
-fn a_walls_continuation_under_land_types_lands_own_words() {
+fn a_walls_continuation_under_land_is_the_cleared_line_once_the_instruction_was_given() {
     let limit_at = |mode: Autopilot, worked: Option<Duration>, reset: Instant| {
         let mut limit = under(
             mode,
@@ -18883,11 +19688,8 @@ fn a_walls_continuation_under_land_types_lands_own_words() {
     let a = act(&mut st, &limit, reset + 10 * MIN);
     assert_eq!(
         a,
-        TurnEndAction::Type {
-            text: LAND_NUDGE.to_string(),
-            rule_id: RULE_LIMIT_RESUME,
-        },
-        "the limit's resume under Land"
+        typed(RULE_LIMIT_RESUME),
+        "the limit's resume under Land: one line, no Land prompt again"
     );
     assert!(!says_cruise(&a), "{a:?}");
     assert_eq!(
@@ -18935,15 +19737,17 @@ fn a_walls_continuation_under_land_types_lands_own_words() {
     signed_in.person = Some(Duration::from_secs(5));
     signed_in.login_back = true;
     let a = at(&mut st, &signed_in, t + 14 * MIN);
+    assert!(
+        matches!(a, TurnEndAction::WaitUntil { .. }),
+        "the person who signed in holds the resume: {a:?}"
+    );
+    signed_in.person = Some(Duration::from_secs(5) + 3 * MIN);
+    let a = at(&mut st, &signed_in, t + 17 * MIN);
     assert_eq!(
         a,
-        TurnEndAction::Type {
-            text: LAND_NUDGE.to_string(),
-            rule_id: RULE_LIMIT_RESUME,
-        },
-        "the resume `/login` lets go under Land"
+        typed(RULE_LIMIT_RESUME),
+        "the resume `/login` lets go under Land, once the person's grace lapsed"
     );
-    assert!(!says_cruise(&a), "{a:?}");
     let mut st = TurnEndState::default();
     act(&mut st, &idle("Stage 1 landed.", Some(3 * MIN)), t);
     let limit = limit_at(Autopilot::Cruise, Some(5 * MIN), reset);
@@ -18952,13 +19756,13 @@ fn a_walls_continuation_under_land_types_lands_own_words() {
     assert_eq!(
         a,
         typed(RULE_LIMIT_RESUME),
-        "CONTROL: Cruise's continuation"
+        "Cruise's resume: the same line"
     );
-    assert!(says_cruise(&a), "CONTROL: {a:?}");
+    assert!(!says_cruise(&a), "and no Cruise prompt either: {a:?}");
 }
 
 #[test]
-fn a_consent_under_land_types_lands_own_words() {
+fn a_consent_under_land_types_the_credits_line_and_the_landing_stands() {
     let t = t0();
     let credits = SupervisorConfig {
         usage_credits: true,
@@ -18974,19 +19778,16 @@ fn a_consent_under_land_types_lands_own_words() {
     let a = at_under(&mut st, &first, t, &credits);
     assert_eq!(a, land_instruction());
     st.acted(&a, &first, t);
-    let a = at_under(&mut st, &land(consent.clone()), t + 4 * MIN, &credits);
-    assert_eq!(
-        a,
-        TurnEndAction::Type {
-            text: LAND_NUDGE.to_string(),
-            rule_id: RULE_CONSENT,
-        }
-    );
+    let walled = land(consent.clone());
+    let a = at_under(&mut st, &walled, t + 4 * MIN, &credits);
+    assert_eq!(a, typed(RULE_CONSENT), "one line, no Land prompt again");
+    st.acted(&a, &walled, t + 4 * MIN);
+    assert!(st.landing, "the landing Land's instruction began stands");
     let mut st = TurnEndState::default();
-    assert_eq!(
-        at_under(&mut st, &consent, t, &credits),
-        typed(RULE_CONSENT)
-    );
+    let a = at_under(&mut st, &consent, t, &credits);
+    assert_eq!(a, typed(RULE_CONSENT));
+    st.acted(&a, &consent, t);
+    assert!(!st.landing, "control: under Cruise nothing lands");
 }
 
 #[test]
@@ -19341,6 +20142,18 @@ fn a_turn_no_read_saw_run_since_the_last_point_is_judged_where_it_shows_once() {
             (2, judged),
             "{program:?}"
         );
+        // The person's own exchange: Land leaves it to them, Cruise carries it (owner ruling
+        // 2026-10-26).
+        let mut st = start();
+        let a = at(
+            &mut st,
+            &land(TurnEndReading {
+                person: Some(secs(3)),
+                ..theirs.clone()
+            }),
+            t + secs(10),
+        );
+        assert!(st.left_to_person(), "{program:?}: {a:?} {st:?}");
         let mut st = start();
         let a = at(
             &mut st,
@@ -19350,7 +20163,7 @@ fn a_turn_no_read_saw_run_since_the_last_point_is_judged_where_it_shows_once() {
             },
             t + secs(10),
         );
-        assert!(st.left_to_person(), "{program:?}: {a:?} {st:?}");
+        assert!(!st.left_to_person(), "{program:?}: {a:?} {st:?}");
         let same = |r: TurnEndReading| {
             let mut st = start();
             let before = st.point_number();

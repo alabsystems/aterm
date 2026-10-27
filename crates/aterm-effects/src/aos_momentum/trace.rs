@@ -9,7 +9,7 @@ use aterm_aos::checkpoint::{Checkpoint, CheckpointFault, RestoreRefusal};
 use aterm_aos::contract::{Contract, Verdict};
 use aterm_aos::effects::NoEffects;
 use aterm_aos::log::{EventLog, IdentityMismatch, LogFault, Tail};
-use aterm_aos::replay::{Run, replay};
+use aterm_aos::replay::{FoldedRun, replay_fold};
 use aterm_aos::task::StepRefusal;
 use aterm_aos::wire::{Dec, Enc, WireFault};
 use aterm_aos::{Digest, TaskIdentity};
@@ -17,7 +17,7 @@ use aterm_time::Instant;
 
 use super::{
     MOMENTUM_HOST_MAX_EVENTS, MOMENTUM_MAX_EVENTS, MomentumCode, MomentumEvent, MomentumSchema,
-    NoStrandedLight, PrebuiltMomentum, momentum_identity,
+    MomentumState, NoStrandedLight, PrebuiltMomentum, momentum_identity,
 };
 
 /// The bytes that open a momentum trace file.
@@ -152,6 +152,7 @@ pub enum TraceFault {
 
 impl TraceFault {
     /// The refusal as one word (`identity`, `magic`, `state`, …).
+    #[inline]
     #[must_use]
     pub const fn word(&self) -> &'static str {
         match self {
@@ -230,6 +231,7 @@ impl std::error::Error for TraceFault {}
 
 impl MomentumTrace {
     /// The trace as one file.
+    #[inline]
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::with_capacity(
@@ -252,6 +254,7 @@ impl MomentumTrace {
     /// The trace a file holds.
     /// # Errors
     /// [`TraceFault::Magic`], [`TraceFault::Format`], [`TraceFault::Seal`] or [`TraceFault::Wire`].
+    #[inline]
     pub fn decode(bytes: &[u8]) -> Result<MomentumTrace, TraceFault> {
         let magic = bytes
             .get(..TRACE_FILE_MAGIC.len())
@@ -300,11 +303,13 @@ impl MomentumTrace {
     /// # Errors
     /// [`TraceFault::Checkpoint`], [`TraceFault::Log`], or [`TraceFault::Tail`] for a torn or
     /// unsealed log.
+    #[inline]
     pub fn read(&self, epoch: Instant) -> Result<ReadTrace, TraceFault> {
         self.read_at_most(epoch, MOMENTUM_MAX_EVENTS)
     }
 
     /// [`Self::read`] refusing, before it decodes an event, a log of more than `max_events` inputs.
+    #[inline]
     fn read_at_most(&self, epoch: Instant, max_events: usize) -> Result<ReadTrace, TraceFault> {
         let schema = MomentumSchema::new(epoch);
         let checkpoint = Checkpoint::decode(&self.checkpoint).map_err(TraceFault::Checkpoint)?;
@@ -329,13 +334,16 @@ impl MomentumTrace {
     }
 
     /// The first artifact where the trace's identity differs from the shipped code's identity in `build`, or `None` when it is the identity of a code this build carries.
+    #[inline]
     #[must_use]
     pub fn identity_mismatch(&self, build: &str) -> Option<IdentityMismatch> {
         let ours = |c: MomentumCode| momentum_identity(&PrebuiltMomentum::new(c, build));
-        for &c in MomentumCode::ALL {
-            if ours(c) == self.identity {
+        let mut i = 0;
+        while i < MomentumCode::ALL.len() {
+            if ours(MomentumCode::ALL[i]) == self.identity {
                 return None;
             }
+            i += 1;
         }
         Some(
             IdentityMismatch::first(&self.identity, &ours(MomentumCode::Shipped))
@@ -346,12 +354,26 @@ impl MomentumTrace {
     /// Refuses a trace whose identity this build does not run ([`TraceFault::Identity`]) or whose log holds more inputs than one host log epoch ([`MOMENTUM_HOST_MAX_EVENTS`]), then replays it as [`Self::replay`] does and judges the run by the identity's contract.
     /// # Errors
     /// [`TraceFault::Identity`], [`TraceFault::Log`] for a log past one host epoch, then any of [`Self::replay`]'s.
+    #[inline]
     pub fn check(&self, epoch: Instant, build: &str) -> Result<TraceCheck, TraceFault> {
         if let Some(m) = self.identity_mismatch(build) {
             return Err(TraceFault::Identity(m));
         }
-        let (read, replay, run) = self.replayed(epoch, build, MOMENTUM_HOST_MAX_EVENTS)?;
-        let verdict = NoStrandedLight::new().judge(&read.schema, read.log.inputs(), &run);
+        let (replay, verdict) = self.replayed_with(
+            epoch,
+            build,
+            MOMENTUM_HOST_MAX_EVENTS,
+            |read, code, start, first| {
+                NoStrandedLight::new().replay_judged(
+                    &read.schema,
+                    code,
+                    start,
+                    read.log.inputs(),
+                    first,
+                    &mut NoEffects,
+                )
+            },
+        )?;
         Ok(TraceCheck { replay, verdict })
     }
 
@@ -361,29 +383,58 @@ impl MomentumTrace {
     /// Any of [`Self::read`]'s, then [`TraceFault::Broken`], [`TraceFault::UnknownCode`],
     /// [`TraceFault::Restore`], [`TraceFault::Refused`], [`TraceFault::State`] or
     /// [`TraceFault::Chain`], in that order.
+    #[inline]
     pub fn replay(&self, epoch: Instant, build: &str) -> Result<TraceReplay, TraceFault> {
-        self.replayed(epoch, build, MOMENTUM_MAX_EVENTS)
-            .map(|(_, replay, _)| replay)
+        let (replay, ()) = self.replayed_with(
+            epoch,
+            build,
+            MOMENTUM_MAX_EVENTS,
+            |read, code, start, first| {
+                (
+                    replay_fold(
+                        &read.schema,
+                        code,
+                        start,
+                        read.log.inputs(),
+                        first,
+                        &mut NoEffects,
+                        |_, _, _, _| {},
+                    ),
+                    (),
+                )
+            },
+        )?;
+        Ok(replay)
     }
 
-    /// [`Self::replay`] of a log of at most `max_events` inputs, with the trace it read and the run.
-    fn replayed(
+    /// [`Self::replay`] of a log of at most `max_events` inputs, folding observations through `run_fn`.
+    #[inline]
+    fn replayed_with<T>(
         &self,
         epoch: Instant,
         build: &str,
         max_events: usize,
-    ) -> Result<(ReadTrace, TraceReplay, Run<MomentumSchema>), TraceFault> {
+        run_fn: impl FnOnce(
+            &ReadTrace,
+            &PrebuiltMomentum,
+            MomentumState,
+            u64,
+        ) -> (FoldedRun<MomentumSchema>, T),
+    ) -> Result<(TraceReplay, T), TraceFault> {
         let read = self.read_at_most(epoch, max_events)?;
         if let Some(why) = read.log.broken() {
             return Err(TraceFault::Broken { why });
         }
         let mut found = None;
-        for &c in MomentumCode::ALL {
+        let mut ci = 0;
+        while ci < MomentumCode::ALL.len() {
+            let c = MomentumCode::ALL[ci];
             let p = PrebuiltMomentum::new(c, build);
             if p.id == self.identity.code {
                 found = Some((c, p));
                 break;
             }
+            ci += 1;
         }
         let Some((named, code)) = found else {
             return Err(TraceFault::UnknownCode {
@@ -396,14 +447,7 @@ impl MomentumTrace {
             .restore(&read.schema, &self.identity)
             .map_err(TraceFault::Restore)?;
         let first_cursor = read.log.header().first_cursor;
-        let run = replay(
-            &read.schema,
-            &code,
-            start,
-            read.log.inputs(),
-            first_cursor,
-            &mut NoEffects,
-        );
+        let (run, extra) = run_fn(&read, &code, start, first_cursor);
         if let Some((cursor, refusal)) = &run.refused {
             return Err(TraceFault::Refused {
                 cursor: *cursor,
@@ -431,6 +475,6 @@ impl MomentumTrace {
             state_digest: run.state_digest,
             observation_chain: run.observation_chain,
         };
-        Ok((read, replay, run))
+        Ok((replay, extra))
     }
 }

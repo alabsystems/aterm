@@ -170,6 +170,7 @@ impl Stratum {
     ];
 
     /// Its name in a report.
+    #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -184,6 +185,7 @@ impl Stratum {
 }
 
 /// The stratum seed `seed` generates: `Stratum::ALL[seed mod 6]`.
+#[inline]
 #[must_use]
 pub const fn stratum_of(seed: u64) -> Stratum {
     match seed % 6 {
@@ -209,6 +211,7 @@ struct Look {
 }
 
 impl Look {
+    #[inline]
     const fn at(&self, row: u16, col: u16) -> Presentation {
         let cfg = MomentumGlowConfig {
             enabled: true,
@@ -227,6 +230,7 @@ impl Look {
     }
 }
 
+#[inline]
 const fn advance(row: u16, col: u16) -> (u16, u16) {
     let col = col + 1;
     if col >= COLS - 1 {
@@ -236,27 +240,29 @@ const fn advance(row: u16, col: u16) -> (u16, u16) {
     }
 }
 
-fn boundaries(after: u64, window: u64, f: u64) -> impl Iterator<Item = u64> {
+#[inline]
+const fn boundary_range(after: u64, window: u64, f: u64) -> (u64, u64) {
     let first = (after / f).saturating_add(1);
     let last = after.saturating_add(window) / f;
-    (first..=last).map(move |k| k.saturating_mul(f))
+    (first, last)
 }
 
 /// The scenario generator v1 draws for `seed` from its fixed tables (design §10.3).
 /// # Errors
 /// A [`ScenarioFault`] if admission refuses what the tables make; none does (`corpus_tests`).
+#[inline]
 pub fn scenario(seed: u64) -> Result<Scenario, ScenarioFault> {
     let mut r = SplitMix::new(seed);
     let stratum = stratum_of(seed);
     let f = pick(&mut r, &FRAME_INTERVALS_NS);
-    let t_ix = usize::try_from(r.below(3)).unwrap_or(0);
+    let t_ix = r.below(3) as usize;
     let (tau, tau_ns, park_ns) = (TAUS_S[t_ix], TAUS_NS[t_ix], PARK_AFTER_NS[t_ix]);
     let intensity = pick(&mut r, &INTENSITIES);
     let dark = r.below(2) == 0 && stratum != Stratum::MovingHue;
     let block = r.below(2) == 0;
     let bursts = 1 + r.below(4);
-    let mut row = u16::try_from(r.below(u64::from(ROWS))).unwrap_or(0);
-    let mut col = 4 + u16::try_from(r.below(40)).unwrap_or(0);
+    let mut row = r.below(u64::from(ROWS)) as u16;
+    let mut col = 4 + r.below(40) as u16;
     let mut t = r.below(1_000_000) * 1_000;
     let mut look = Look {
         dark,
@@ -272,12 +278,14 @@ pub fn scenario(seed: u64) -> Result<Scenario, ScenarioFault> {
     let mut inputs = Vec::new();
     let mut last_key = t;
     let mut config_step = 0usize;
-    for burst in 0..bursts {
+    let mut burst = 0;
+    while burst < bursts {
         let keys = 4 + r.below(21);
         let rate = 2 + r.below(15);
         let gap = 1_000_000_000 / rate;
         let cool = pick(&mut r, &COOLS);
-        for k in 0..keys {
+        let mut k = 0;
+        while k < keys {
             let at = t + k * gap;
             inputs.push((at, Exo::Key { tau_bits }));
             (row, col) = advance(row, col);
@@ -293,25 +301,35 @@ pub fn scenario(seed: u64) -> Result<Scenario, ScenarioFault> {
             }
             inputs.push((at, Exo::Present(look.at(row, col))));
             last_key = at;
+            k += 1;
         }
         if burst + 1 < bursts {
             t = last_key + cool.unwrap_or(park_ns);
         }
+        burst += 1;
     }
     match stratum {
         Stratum::MovingHue => {
             let window = pick(&mut r, &HUE_WINDOWS_NS);
-            for (i, at) in boundaries(last_key, window, f).enumerate() {
+            let (mut k, last) = boundary_range(last_key, window, f);
+            let mut i = 0usize;
+            while k <= last {
+                let at = k.saturating_mul(f);
                 look.hue = HUES[(i + 1) % HUES.len()];
                 inputs.push((at, Exo::Present(look.at(row, col))));
+                i += 1;
+                k += 1;
             }
         }
         Stratum::IntensityRamp => {
             let window = pick(&mut r, &RAMP_WINDOWS_NS);
-            for at in boundaries(last_key, window, f) {
+            let (mut k, last) = boundary_range(last_key, window, f);
+            while k <= last {
+                let at = k.saturating_mul(f);
                 let frac = (at - last_key) as f32 / window as f32;
                 look.intensity = intensity * (1.0 - 0.5 * frac);
                 inputs.push((at, Exo::Present(look.at(row, col))));
+                k += 1;
             }
         }
         Stratum::ResetInCoolDown => {
@@ -448,15 +466,17 @@ pub struct Corpus {
 }
 
 /// The golden trace's digest: `Digest::of(GOLDEN_TRACE_DOMAIN, [the file's bytes])`.
+#[inline]
 #[must_use]
 pub fn golden_trace_digest() -> Digest {
     Digest::of(GOLDEN_TRACE_DOMAIN, &[GOLDEN_TRACE])
 }
 
 /// One lane item's part of the corpus digest: its kind tag, seed, split and scenario encoding.
+#[inline]
 #[must_use]
 pub fn item_part(kind: ItemKind, split: CorpusSplit, encoding: &[u8]) -> Vec<u8> {
-    let mut e = Enc::new();
+    let mut e = Enc::with_capacity(18 + encoding.len());
     e.u8(kind.tag());
     e.u64(kind.seed());
     e.u8(split.tag());
@@ -465,14 +485,17 @@ pub fn item_part(kind: ItemKind, split: CorpusSplit, encoding: &[u8]) -> Vec<u8>
 }
 
 /// Corpus digest over the generator version, golden-trace digest, and lane items' [`item_part`]s.
+#[inline]
 #[must_use]
 pub fn corpus_digest(golden: &Digest, parts: &[Vec<u8>]) -> Digest {
     let version = GENERATOR_VERSION.to_le_bytes();
     let mut all: Vec<&[u8]> = Vec::with_capacity(parts.len() + 2);
     all.push(&version);
     all.push(&golden.0);
-    for part in parts {
-        all.push(part.as_slice());
+    let mut pi = 0;
+    while pi < parts.len() {
+        all.push(parts[pi].as_slice());
+        pi += 1;
     }
     Digest::of(CORPUS_DOMAIN, &all)
 }
@@ -481,6 +504,7 @@ impl Corpus {
     /// The corpus: train (the golden trace, then seeds 1–16), then held out.
     /// # Errors
     /// The first scenario admission refuses; none does (`corpus_tests`).
+    #[inline]
     pub fn generate() -> Result<Corpus, ScenarioFault> {
         let generated = |seed: u64, split| -> Result<Item, ScenarioFault> {
             Ok(Item {
@@ -503,8 +527,10 @@ impl Corpus {
             split: CorpusSplit::Train,
             body: ItemBody::Trace(GOLDEN_TRACE),
         });
-        for seed in TRAIN_SEEDS {
-            items.push(generated(seed, CorpusSplit::Train)?);
+        let mut si = 0;
+        while si < TRAIN_SEEDS.len() {
+            items.push(generated(TRAIN_SEEDS[si], CorpusSplit::Train)?);
+            si += 1;
         }
         let s0 = s0();
         s0.validate()?;
@@ -514,24 +540,31 @@ impl Corpus {
             split: CorpusSplit::HeldOut,
             body: ItemBody::Lane(s0),
         });
-        for seed in HELD_OUT_SEEDS {
-            items.push(generated(seed, CorpusSplit::HeldOut)?);
+        let mut si = 0;
+        while si < HELD_OUT_SEEDS.len() {
+            items.push(generated(HELD_OUT_SEEDS[si], CorpusSplit::HeldOut)?);
+            si += 1;
         }
         let digest = corpus_digest(&golden_trace_digest(), &Self::parts_of(&items));
         Ok(Corpus { items, digest })
     }
 
+    #[inline]
     fn parts_of(items: &[Item]) -> Vec<Vec<u8>> {
         let mut out = Vec::with_capacity(items.len());
-        for i in items {
+        let mut ii = 0;
+        while ii < items.len() {
+            let i = &items[ii];
             if let Some(s) = i.scenario() {
                 out.push(item_part(i.kind, i.split, &s.encode()));
             }
+            ii += 1;
         }
         out
     }
 
     /// The lane items' digest parts, in corpus order.
+    #[inline]
     #[must_use]
     pub fn parts(&self) -> Vec<Vec<u8>> {
         Self::parts_of(&self.items)
@@ -545,6 +578,7 @@ impl Corpus {
     }
 
     /// The items of `split`, in order.
+    #[inline]
     pub fn split(&self, split: CorpusSplit) -> impl Iterator<Item = &Item> {
         self.items.iter().filter(move |i| i.split == split)
     }

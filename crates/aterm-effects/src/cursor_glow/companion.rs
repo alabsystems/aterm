@@ -178,6 +178,8 @@ impl CursorGlow {
         let ft = &self.frame_text;
         let mut rows = std::mem::take(&mut self.keep_rows_scratch);
         rows.clear();
+        let mut filled = std::mem::take(&mut self.keep_filled_scratch);
+        filled.clear();
         let mut last_ground: Option<(u32, bool)> = None;
         let mut i = 0;
         while i < ft.rows.len() {
@@ -192,15 +194,15 @@ impl CursorGlow {
                 None => &[],
             };
             let mut run: Option<i32> = None;
+            let mut fill_run: Option<i32> = None;
             let mut span: Option<(i32, i32)> = None;
             let mut idx = 0;
             while idx < row_pairs.len() {
                 let pair = row_pairs[idx];
                 let col = ft.col0 + idx as i32;
                 idx += 1;
-                let held = match pair {
-                    Some((Some(_), _)) => true,
-                    Some((None, ground)) => {
+                let fill = match pair {
+                    Some((_, ground)) => {
                         let g = ground & 0x00FF_FFFF;
                         if g == page {
                             false
@@ -217,6 +219,7 @@ impl CursorGlow {
                     }
                     None => false,
                 };
+                let held = fill || matches!(pair, Some((Some(_), _)));
                 match (held, run) {
                     (true, None) => run = Some(col),
                     (false, Some(c0)) => {
@@ -229,14 +232,25 @@ impl CursorGlow {
                     }
                     _ => {}
                 }
+                match (fill, fill_run) {
+                    (true, None) => fill_run = Some(col),
+                    (false, Some(c0)) => {
+                        filled.push((ox + c0 * cw, ox + col * cw, y0, y0 + ch));
+                        fill_run = None;
+                    }
+                    _ => {}
+                }
             }
+            let end = ft.col0 + row_pairs.len() as i32;
             if let Some(c0) = run {
-                let col = ft.col0 + row_pairs.len() as i32;
-                boxes.push((ox + c0 * cw, ox + col * cw, y0, y0 + ch));
+                boxes.push((ox + c0 * cw, ox + end * cw, y0, y0 + ch));
                 span = Some(match span {
-                    Some((a, _)) => (a, col),
-                    None => (c0, col),
+                    Some((a, _)) => (a, end),
+                    None => (c0, end),
                 });
+            }
+            if let Some(c0) = fill_run {
+                filled.push((ox + c0 * cw, ox + end * cw, y0, y0 + ch));
             }
             // For a dark train the span reaches a cell past the row's last
             // letter, where its caret stood when it was typed: a Return's
@@ -248,10 +262,97 @@ impl CursorGlow {
             }
             i += 1;
         }
-        self.v2
-            .note_keep_out_slices(&self.word_icons, (ox, oy), &boxes, &rows, cw);
+        let mut feet = std::mem::take(&mut self.keep_feet_scratch);
+        let mut soles = [None; 2];
+        self.foot_boxes(geom, &mut feet, &mut soles);
+        let (mut sole_boxes, mut n) = ([(0, 0, 0, 0); 2], 0);
+        let mut k = 0;
+        while k < soles.len() {
+            if let Some(sole) = soles[k] {
+                sole_boxes[n] = sole;
+                n += 1;
+            }
+            k += 1;
+        }
+        self.v2.note_keep_out_slices(
+            &self.word_icons,
+            (ox, oy),
+            &boxes,
+            (&rows, cw),
+            &filled,
+            (&feet, &sole_boxes[..n]),
+        );
+        self.keep_feet_scratch = feet;
         self.keep_out_scratch = boxes;
         self.keep_rows_scratch = rows;
+        self.keep_filled_scratch = filled;
+    }
+
+    /// The feet of the rows whose glyphs the host named (the caret's row
+    /// and the row before it, probed), window pixels: each run of cells
+    /// whose ink may reach under the baseline (a descender, a wide or
+    /// non-ASCII glyph, a letter the probe did not name) into `feet`, and
+    /// each such row's box into `soles` ([`rk::companion::KeepOut::foot_share`]).
+    fn foot_boxes(
+        &self,
+        geom: Geom,
+        feet: &mut Vec<(i32, i32, i32, i32)>,
+        soles: &mut [Option<(i32, i32, i32, i32)>; 2],
+    ) {
+        feet.clear();
+        let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
+        let (cw, ch) = (geom.cw as i32, geom.ch as i32);
+        let cols = geom.cols as i32;
+        let probed = [
+            (self.row_cur_meta, self.row_cur.as_slice()),
+            (self.row_prev_meta, self.row_prev.as_slice()),
+        ];
+        let mut k = 0;
+        while k < probed.len() {
+            let (meta, chars) = probed[k];
+            let cur_k = k;
+            k += 1;
+            let Some(m) = meta else {
+                continue;
+            };
+            let row = i32::from(m.row);
+            let y0 = oy + row * ch;
+            let sole = (ox, ox + cols * cw, y0, y0 + ch);
+            if soles[0] == Some(sole) || soles[1] == Some(sole) {
+                continue;
+            }
+            soles[cur_k] = Some(sole);
+            let mut run: Option<i32> = None;
+            let mut col = 0;
+            while col <= cols {
+                let foot = col < cols
+                    && match self.frame_text.pair(row, col) {
+                        Some((None, _)) => false,
+                        _ => {
+                            let c = col as usize;
+                            match chars.get(c) {
+                                Some(' ') => false,
+                                Some(&g) => {
+                                    g == '\0'
+                                        || chars.get(c + 1) == Some(&'\0')
+                                        || !g.is_ascii()
+                                        || super::emit::is_descender_glyph(g)
+                                }
+                                None => true,
+                            }
+                        }
+                    };
+                match (foot, run) {
+                    (true, None) => run = Some(col),
+                    (false, Some(c0)) => {
+                        feet.push((ox + c0 * cw, ox + col * cw, y0, y0 + ch));
+                        run = None;
+                    }
+                    _ => {}
+                }
+                col += 1;
+            }
+        }
     }
 
     /// Mint [`CompanionImpulse::Delight`] and buffer the earned m1 hero at `(row, col)`.

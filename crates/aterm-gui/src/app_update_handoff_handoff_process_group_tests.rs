@@ -871,29 +871,32 @@ fn candidate_in_own_group(
 
 #[test]
 fn a_stopped_candidate_is_not_gone() {
-    let (candidate, mut handle, mut cleanup) =
-        candidate_in_own_group("kill -STOP $$; exec sleep 30");
+    let (candidate, mut handle, mut cleanup) = sleeping_candidate();
     let pid = libc::pid_t::try_from(candidate.pid).expect("bounded pid");
-    let stopped_by = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    loop {
-        // SAFETY: zeroed siginfo_t for waitid with WNOWAIT.
+    // The test stops it, so the stop waits on no run of the candidate's own (a script's
+    // `kill -STOP $$` stops it only once it has been scheduled through its exec and its shell).
+    // SAFETY: SIGSTOP to this test's own unreaped child.
+    let sent = unsafe { libc::kill(pid, libc::SIGSTOP) };
+    assert_eq!(sent, 0, "stop our own child");
+    let id = libc::id_t::try_from(pid).expect("positive pid");
+    let reported = |options: libc::c_int| {
+        // SAFETY: zeroed siginfo_t for waitid with WNOWAIT, which leaves the child waitable.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                libc::id_t::try_from(pid).expect("positive pid"),
-                &mut info,
-                libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
+        let rc = unsafe { libc::waitid(libc::P_PID, id, &mut info, options | libc::WNOWAIT) };
         assert_eq!(rc, 0, "our own child");
-        if info.si_code == libc::CLD_STOPPED {
-            break;
+        info
+    };
+    let stopped_by = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while reported(libc::WSTOPPED | libc::WNOHANG).si_code != libc::CLD_STOPPED {
+        if std::time::Instant::now() >= stopped_by {
+            let ended = reported(libc::WEXITED | libc::WNOHANG);
+            // SAFETY: a waitid report of a child fills the SIGCHLD arm.
+            let status = unsafe { ended.si_status() };
+            panic!(
+                "the candidate stops (ended: code {} status {status})",
+                ended.si_code
+            );
         }
-        assert!(
-            std::time::Instant::now() < stopped_by,
-            "the candidate stops"
-        );
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     assert!(!handle.candidate_gone(candidate), "stopped is not gone");

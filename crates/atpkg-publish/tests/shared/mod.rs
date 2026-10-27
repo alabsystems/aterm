@@ -3,6 +3,7 @@
 
 //! The shared types' own tests.
 
+mod git_history;
 mod pins;
 mod quad;
 mod triple;

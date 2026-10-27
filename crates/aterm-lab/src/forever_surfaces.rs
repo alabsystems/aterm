@@ -913,7 +913,7 @@ fn rows_in<'a>(menu: &'a str, section: &str) -> Vec<&'a str> {
 }
 
 /// A [`Window::page`] entry's `field=` line.
-fn page_field<'a>(page: &'a str, field: &str) -> Option<&'a str> {
+pub(super) fn page_field<'a>(page: &'a str, field: &str) -> Option<&'a str> {
     page.lines()
         .find_map(|l| l.strip_prefix(field)?.strip_prefix('='))
 }
@@ -982,9 +982,15 @@ pub fn front_of(chains: &[Chain]) -> Option<usize> {
 
 /// Whether chain `c` stands HELD at the end of the run (§12.3's Land hold, `land_held=`): a
 /// measured chain under Land that neither lands nor ends, so its hold stands through END.
+/// same-land's does not: in a run that reads the window, its person types into the held tab
+/// ([`held::person_due`]), which lifts the hold and leaves the tab theirs. HL judges its hold.
 #[must_use]
 pub fn holds_at_end(c: Chain) -> bool {
-    Chain::ALL.contains(&c) && !c.lands() && !ENDING.contains(&c) && c.autopilot() == "land"
+    Chain::ALL.contains(&c)
+        && !c.lands()
+        && !ENDING.contains(&c)
+        && c.autopilot() == "land"
+        && c != Chain::SameLand
 }
 
 /// The chains whose chip's title is read and judged ([`title_words`]): the measured pass's and
@@ -1051,6 +1057,11 @@ pub const WANTS: &[Want] = &[
         under: Under::First(&[]),
         name: "every chip face its Autopilot's, a tab behind drawn=- why=not-drawn",
         judge: chip_faces,
+    },
+    Want {
+        under: Under::FirstOf(&[Chain::SwitchHeld]),
+        name: "switched to Land, its state line still leads with the stop",
+        judge: super::switch::held_line,
     },
     Want {
         under: Under::FirstOf(&TITLED),
@@ -1277,6 +1288,16 @@ pub const WANTS: &[Want] = &[
         name: stopped::WANT,
         judge: stopped::first,
     },
+    Want {
+        under: Under::Scenario(Scenario::O1),
+        name: super::outage::STATE_LINE_WANT,
+        judge: super::outage::state_line,
+    },
+    Want {
+        under: Under::Scenario(Scenario::O2),
+        name: super::outage::STATE_LINE_WANT,
+        judge: super::outage::state_line,
+    },
 ];
 
 /// Folds applicable [`WANTS`] assertions into scenario `s`'s record verdict `v`.
@@ -1307,7 +1328,7 @@ pub fn with_window(s: Scenario, seen: &Seen, cx: &Ctx<'_>, v: Verdict) -> Verdic
 }
 
 /// `a` and `b` (named `name`) as one: the worse word, both reasons.
-fn compose(a: Verdict, name: &str, b: Verdict) -> Verdict {
+pub(super) fn compose(a: Verdict, name: &str, b: Verdict) -> Verdict {
     let why = format!("{}; {name}: {} ({})", a.why(), b.word(), b.why());
     match (&a, &b) {
         (Verdict::Fail(_), _) | (_, Verdict::Fail(_)) => Verdict::Fail(why),

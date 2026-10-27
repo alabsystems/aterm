@@ -36,6 +36,7 @@ impl std::error::Error for LastViewError {}
 struct Retired {
     subject: String,
     removed: Arc<BrokerRecord>,
+    bt_ms: Option<u64>,
     offset: u64,
 }
 
@@ -102,6 +103,7 @@ pub struct LastView {
     after: String,
     seen: BTreeSet<String>,
     pub(crate) overlay: BTreeMap<String, Arc<BrokerRecord>>,
+    pub(crate) overlay_bt: BTreeMap<String, u64>,
 }
 
 impl LastView {
@@ -142,6 +144,9 @@ impl LastView {
                 && self.seen.insert(retired.subject.clone())
                 && retired.removed.seq.0 < self.visible
             {
+                if let Some(bt) = retired.bt_ms {
+                    self.overlay_bt.insert(retired.subject.clone(), bt);
+                }
                 self.overlay
                     .insert(retired.subject.clone(), retired.removed.clone());
             }
@@ -223,6 +228,7 @@ impl RetireHistory {
             after: String::new(),
             seen: BTreeSet::new(),
             overlay: BTreeMap::new(),
+            overlay_bt: BTreeMap::new(),
         })
     }
 
@@ -234,11 +240,23 @@ impl RetireHistory {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn append(&mut self, subject: String, removed: Arc<BrokerRecord>, offset: u64) {
+        self.append_with_bt(subject, removed, None, offset);
+    }
+
+    pub(crate) fn append_with_bt(
+        &mut self,
+        subject: String,
+        removed: Arc<BrokerRecord>,
+        bt_ms: Option<u64>,
+        offset: u64,
+    ) {
         let next = Link::empty();
         let retired = Retired {
             subject: subject.clone(),
             removed,
+            bt_ms,
             offset,
         };
         // The tail is filled exactly once by the log's sole locked promoter.

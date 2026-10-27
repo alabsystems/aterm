@@ -38,8 +38,14 @@ use crate::transport::{self, Channel};
 /// Whether the helper keeps each connection object until its `Release` or its session's
 /// close, rather than dropping it once its descriptor is passed (§5.1). V2 measured that a
 /// passed descriptor stays live after the object is dropped (`docs/measured/vz-v2-2026-10-23.md`),
-/// so the helper drops it; the held mode stays, behind this switch, for the measure.
-pub const HOLD_CONNS: bool = false;
+/// but only while nothing else on the machine passes descriptors. A descriptor whose only
+/// reference is in flight can be flushed by the kernel's unix-socket collector running in
+/// another thread: the lab receives it and reads EOF at once, so its command ends "closed
+/// before its Exit" with the agent still running it. V5 measured that in 68 of 20000 passes
+/// under churn on Darwin 27.0.0, and in none of 20000 with the sender's descriptor held
+/// (§15 V5). So the helper holds each object, as §5.1's fallback says, and the lab sends
+/// `Release`.
+pub const HOLD_CONNS: bool = true;
 
 /// How long a `Stop` from `down` waits for the guest to power off before the hard stop.
 pub const STOP_GRACE: Duration = SPAN;
@@ -329,6 +335,13 @@ impl<M: Machine> Core<M> {
         &self.machine
     }
 
+    /// Why the stop under way runs, for the lifecycle conformance's projection.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn stopping_why(&self) -> Option<&str> {
+        self.stopping.as_ref().map(Stopping::why)
+    }
+
     /// Take `input`, which arrived at `now`.
     pub fn handle(&mut self, input: Input, now: Duration) -> Flow {
         match input {
@@ -413,7 +426,7 @@ impl<M: Machine> Core<M> {
                 self.stop_request(sid, Duration::from_millis(grace_ms), now)
             }
             Request::Detach => self.close(sid, now),
-            Request::Attach(attach) => self.attach(sid, attach),
+            Request::Attach(attach) => self.attach_session(sid, attach),
             _ if !attached => {
                 self.reply(
                     sid,
@@ -423,7 +436,7 @@ impl<M: Machine> Core<M> {
                 Flow::Go
             }
             Request::Boot(plan) => self.boot(sid, *plan, now),
-            Request::Connect { port } => self.connect(sid, port),
+            Request::Connect { port } => self.connect_port(sid, port),
             Request::Release { id } => {
                 if self.held.get(&id).is_some_and(|(owner, _)| *owner == sid) {
                     self.held.remove(&id);
@@ -446,12 +459,31 @@ impl<M: Machine> Core<M> {
                 self.reply(sid, &reply, None);
                 Flow::Go
             }
-            Request::Keep(keep) => {
-                self.keep = keep;
-                self.reply(sid, &Reply::Done, None);
-                Flow::Go
-            }
+            Request::Keep(keep) => self.keep_request(sid, keep),
         }
+    }
+
+    /// A session's `Keep`: set or clear `keep` (§5.1).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "KeepSet",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "KeepClear",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    fn keep_request(&mut self, sid: u64, keep: bool) -> Flow {
+        self.keep = keep;
+        self.reply(sid, &Reply::Done, None);
+        Flow::Go
     }
 
     /// The agent the running VM has or will have: the guest's, once it said hello, else the
@@ -465,7 +497,31 @@ impl<M: Machine> Core<M> {
             .flatten()
     }
 
-    fn attach(&mut self, sid: u64, a: Attach) -> Flow {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Attach",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "AttachKeep",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "AttachRefused",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    fn attach_session(&mut self, sid: u64, a: Attach) -> Flow {
         let refusal = if a.proto != PROTO {
             Some(format!(
                 "this helper speaks protocol {PROTO}; the session's checkout speaks {}",
@@ -538,6 +594,30 @@ impl<M: Machine> Core<M> {
         Flow::Go
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "BootRefused",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "StartFails",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "StoppedWithError",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     fn fail(&mut self, error: String) {
         self.phase = Phase::Failed;
         note!("{error}");
@@ -547,6 +627,22 @@ impl<M: Machine> Core<M> {
         });
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Boot",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "BootRefused",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     fn boot(&mut self, sid: u64, plan: Plan, now: Duration) -> Flow {
         match self.phase {
             Phase::Absent => {}
@@ -641,8 +737,23 @@ impl<M: Machine> Core<M> {
         }
     }
 
-    fn connect(&mut self, sid: u64, port: u32) -> Flow {
-        if !self.running() {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "ExecBegin",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    fn connect_port(&mut self, sid: u64, port: u32) -> Flow {
+        // A command runs on a `Ready` VM only (§6, §12): the lab connects once it heard the
+        // `Ready`, and a `Connect` before it is refused, so nothing is in flight on a VM that
+        // is still booting.
+        let open = self.phase == Phase::Ready;
+        #[cfg(any(test, debug_assertions))]
+        let open =
+            open || (crate::fault::armed(crate::fault::Fault::ConnectBooting) && self.running());
+        if !open {
             self.reply(
                 sid,
                 &Reply::Error(format!("the VM is {}: no connection", self.phase.name())),
@@ -673,6 +784,14 @@ impl<M: Machine> Core<M> {
         Flow::Go
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Stop",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     fn stop_request(&mut self, sid: u64, grace: Duration, now: Duration) -> Flow {
         // The session hears `Stopping` now and again every TICK until the helper exits, so
         // its no-progress detector reads a helper at work, never a hung one.
@@ -697,18 +816,37 @@ impl<M: Machine> Core<M> {
         Flow::Go
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Detach",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     fn close(&mut self, sid: u64, now: Duration) -> Flow {
         if self.sessions.remove(&sid).is_none() {
             return Flow::Go;
         }
         // No connection object outlives its session.
         self.held.retain(|_, (owner, _)| *owner != sid);
+        #[cfg(any(test, debug_assertions))]
+        if crate::fault::armed(crate::fault::Fault::HardOnClose)
+            && self.attached() > 0
+            && self.running()
+        {
+            return self.hard_stop(now, "a session closed".into());
+        }
         self.settle(now)
     }
 
     /// The release rule (§5.1).
     fn settle(&mut self, now: Duration) -> Flow {
         if self.attached() > 0 {
+            return Flow::Go;
+        }
+        #[cfg(any(test, debug_assertions))]
+        if crate::fault::armed(crate::fault::Fault::KeepRunning) && self.running() {
             return Flow::Go;
         }
         match self.phase {
@@ -779,6 +917,14 @@ impl<M: Machine> Core<M> {
     }
 
     /// A detector fired: every session hears `why` now, and the VM stops hard.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Detect",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     fn fire(&mut self, now: Duration, why: String) -> Flow {
         self.lost(&why);
         self.hard_stop(now, why)
@@ -829,6 +975,22 @@ impl<M: Machine> Core<M> {
         }
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Stopped",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "StoppedWithError",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     fn stopped(&mut self, error: Option<String>) -> Flow {
         let why = match (&error, &self.stopping) {
             (Some(e), _) => format!("the guest stopped with an error: {e}"),
@@ -886,9 +1048,15 @@ impl<M: Machine> Core<M> {
         let dial = self.next_dial;
         self.next_dial += 1;
         let inputs = self.inputs.clone();
+        // The planted `ReadyBeforeHello` reader also takes a `Ready` first. A fault is armed on
+        // the core's thread, so it is read here, for the reader's.
+        #[cfg(any(test, debug_assertions))]
+        let unchecked = crate::fault::armed(crate::fault::Fault::ReadyBeforeHello);
+        #[cfg(not(any(test, debug_assertions)))]
+        let unchecked = false;
         let spawned = std::thread::Builder::new()
             .name(format!("vz-watch-{dial}"))
-            .spawn(move || read_dial(dial, reader, &key, &inputs));
+            .spawn(move || read_dial(dial, reader, &key, unchecked, &inputs));
         if let Err(e) = spawned {
             note!("the watch reader: {e}");
             return;
@@ -919,7 +1087,12 @@ impl<M: Machine> Core<M> {
             // A dial already closed: nothing of it is believed.
             return Flow::Go;
         };
-        if self.watch_taken || !matches!(frame, Frame::Hello(_)) {
+        let first_ok = matches!(frame, Frame::Hello(_));
+        #[cfg(any(test, debug_assertions))]
+        let first_ok = first_ok
+            || (crate::fault::armed(crate::fault::Fault::ReadyBeforeHello)
+                && matches!(frame, Frame::Ready(_)));
+        if self.watch_taken || !first_ok {
             return Flow::Go;
         }
         self.watch_taken = true;
@@ -948,28 +1121,7 @@ impl<M: Machine> Core<M> {
                 self.jobs = jobs;
                 Flow::Go
             }
-            Frame::Ready(ready) => {
-                let Some(hello) = self.hello.clone() else {
-                    note!("a Ready before the agent's hello: ignored");
-                    return Flow::Go;
-                };
-                if let Some(w) = &mut self.watch {
-                    w.ready(now);
-                }
-                self.phase = Phase::Ready;
-                note!(
-                    "ready: {}{}",
-                    ready.state,
-                    if ready.failed_units.is_empty() {
-                        String::new()
-                    } else {
-                        format!(", failed: {}", ready.failed_units.join(" "))
-                    }
-                );
-                self.failed_units = ready.failed_units;
-                self.broadcast(&Reply::Ready(hello));
-                Flow::Go
-            }
+            Frame::Ready(ready) => self.ready(ready, now),
             Frame::Beat { .. } => {
                 if let Some(w) = &mut self.watch {
                     w.beat(now);
@@ -986,6 +1138,22 @@ impl<M: Machine> Core<M> {
         }
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Hello",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "HelloWrong",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     fn hello(&mut self, h: Hello, now: Duration) -> Flow {
         let got = crate::hex(&h.agent_sha256);
         let want = self
@@ -1040,6 +1208,50 @@ impl<M: Machine> Core<M> {
         Flow::Go
     }
 
+    /// The agent's `Ready`: the VM is `Ready` once the agent said hello, never before.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Ready",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    fn ready(&mut self, ready: wire::Ready, now: Duration) -> Flow {
+        let hello = match self.hello.clone() {
+            Some(hello) => hello,
+            #[cfg(any(test, debug_assertions))]
+            None if crate::fault::armed(crate::fault::Fault::ReadyBeforeHello) => Hello {
+                proto: wire::PROTO,
+                key: [0; crate::key::LEN],
+                agent_sha256: [0; 32],
+                boot_id: String::new(),
+                kernel: String::new(),
+                uptime_ms: 0,
+            },
+            None => {
+                note!("a Ready before the agent's hello: ignored");
+                return Flow::Go;
+            }
+        };
+        if let Some(w) = &mut self.watch {
+            w.ready(now);
+        }
+        self.phase = Phase::Ready;
+        note!(
+            "ready: {}{}",
+            ready.state,
+            if ready.failed_units.is_empty() {
+                String::new()
+            } else {
+                format!(", failed: {}", ready.failed_units.join(" "))
+            }
+        );
+        self.failed_units = ready.failed_units;
+        self.broadcast(&Reply::Ready(hello));
+        Flow::Go
+    }
+
     /// What the boot waits on, for the sessions' no-progress detectors.
     fn boot_note(&self) -> String {
         if self.hello.is_none() {
@@ -1069,6 +1281,38 @@ impl<M: Machine> Core<M> {
         format!("start jobs: {jobs}")
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Quiet",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "GraceOut",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "HardTimeout",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Detect",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     fn tick(&mut self, now: Duration) -> Flow {
         let silent: Vec<u64> = self
             .dials
@@ -1111,6 +1355,10 @@ impl<M: Machine> Core<M> {
                 return Flow::Go;
             }
             Some(Stopping::Hard { since, .. }) => {
+                #[cfg(any(test, debug_assertions))]
+                if crate::fault::armed(crate::fault::Fault::HardStopForever) {
+                    return Flow::Go;
+                }
                 if now.saturating_sub(*since) >= SPAN {
                     return Flow::Exit(format!(
                         "the hard stop did not finish within {} s; the helper exits, which ends \
@@ -1186,7 +1434,6 @@ impl<M: Machine> Core<M> {
     }
 }
 
-/// Read one session's requests into `inputs` until it closes.
 /// Whether `frame`, a dial's first, is a `Hello` carrying `key`: that hello with its key
 /// zeroed, or why not.
 ///
@@ -1215,24 +1462,29 @@ pub fn keyed_hello(frame: Frame, key: &Key) -> Result<Hello, String> {
 }
 
 /// A watch dial's reader: its first frame must be a keyed hello ([`keyed_hello`]), or the
-/// dial is refused and nothing of it is posted; then every frame, until it ends.
-fn read_dial(dial: u64, mut reader: UnixStream, key: &Key, inputs: &Sender<Input>) {
+/// dial is refused and nothing of it is posted; then every frame, until it ends. With
+/// `unchecked` (the planted `ReadyBeforeHello` defect only) a `Ready` first is posted too.
+fn read_dial(
+    dial: u64,
+    mut reader: UnixStream,
+    key: &Key,
+    unchecked: bool,
+    inputs: &Sender<Input>,
+) {
     let first = match wire::read_frame(&mut reader) {
-        Ok(Some(frame)) => keyed_hello(frame, key),
+        Ok(Some(frame @ Frame::Ready(_))) if unchecked => Ok(frame),
+        Ok(Some(frame)) => keyed_hello(frame, key).map(Frame::Hello),
         Ok(None) => Err("it closed before any hello".into()),
         Err(e) => Err(format!("its first frame: {e}")),
     };
-    let hello = match first {
-        Ok(hello) => hello,
+    let first = match first {
+        Ok(frame) => frame,
         Err(why) => {
             let _ = inputs.send(Input::WatchRefused(dial, why));
             return;
         }
     };
-    if inputs
-        .send(Input::Watch(dial, Frame::Hello(hello)))
-        .is_err()
-    {
+    if inputs.send(Input::Watch(dial, first)).is_err() {
         return;
     }
     loop {
@@ -1257,6 +1509,7 @@ fn read_dial(dial: u64, mut reader: UnixStream, key: &Key, inputs: &Sender<Input
     }
 }
 
+/// Read one session's requests into `inputs` until it closes.
 fn read_session(sid: u64, stream: UnixStream, inputs: &Sender<Input>) {
     let mut channel = Channel::new(stream);
     loop {
@@ -1382,6 +1635,22 @@ pub struct Held {
 ///
 /// # Errors
 /// The lock is held, or a run file could not be made.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "vz_lifecycle",
+        action = "Start",
+        project = "conformance_lifecycle::project"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "vz_lifecycle",
+        action = "SecondRefused",
+        project = "conformance_lifecycle::project"
+    )
+)]
 pub fn take(paths: &Paths, ident: &Ident, pids: &dyn Pids) -> Result<Held, String> {
     let socket = paths.checked_socket()?;
     let run = paths.run_dir();
@@ -1392,6 +1661,10 @@ pub fn take(paths: &Paths, ident: &Ident, pids: &dyn Pids) -> Result<Held, Strin
     }
     let lock = match DiskLock::try_take(&lock_path) {
         Ok(Some(lock)) => lock,
+        #[cfg(any(test, debug_assertions))]
+        Ok(None) if crate::fault::armed(crate::fault::Fault::NoFlock) => {
+            DiskLock::unheld(&lock_path).map_err(|e| format!("{}: {e}", lock_path.display()))?
+        }
         Ok(None) => {
             let holder = match crate::record::holder(paths, pids) {
                 Holder::Live(r) => format!(

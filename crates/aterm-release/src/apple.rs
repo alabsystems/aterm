@@ -8,6 +8,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use aterm_update_core::pins;
 
@@ -1917,12 +1918,26 @@ fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+/// A local helper may wait for keychain access; unattended provisioning must still finish.
+const COMMAND_WAIT: Duration = Duration::from_secs(60);
+
 /// Run a command for its exit status, capturing stderr for the error message.
 fn run(program: &str, args: &[&str]) -> Result<(), String> {
-    let out = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| format!("{program}: {e}"))?;
+    run_command(
+        aterm_uds::spawnfd::command(program).args(args),
+        COMMAND_WAIT,
+    )
+}
+
+fn run_command(command: &mut aterm_uds::spawnfd::Command, within: Duration) -> Result<(), String> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let out = aterm_uds::deadline::output_within(command, within).map_err(|error| match error {
+        aterm_uds::deadline::RunError::TimedOut => format!(
+            "{program}: did not finish within {} s; requested termination and waited for the owned command",
+            within.as_secs()
+        ),
+        error => format!("{program}: {error}"),
+    })?;
     if out.status.success() {
         return Ok(());
     }
@@ -1957,6 +1972,93 @@ fn capture(program: &str, args: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const COMMAND_CHILD: &str = "ATERM_APPLE_COMMAND_TEST_CHILD";
+    const COMMAND_READY: &str = "ATERM_APPLE_COMMAND_TEST_READY";
+
+    fn command_child(mode: &str) -> aterm_uds::spawnfd::Command {
+        let mut command =
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("this test executable"));
+        command
+            .args([
+                "--exact",
+                "apple::tests::signing_command_child",
+                "--nocapture",
+            ])
+            .env(COMMAND_CHILD, mode);
+        command
+    }
+
+    #[test]
+    fn signing_command_child() {
+        let Some(mode) = std::env::var_os(COMMAND_CHILD) else {
+            return;
+        };
+        let mut input = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut input)
+            .expect("closed stdin");
+        assert!(
+            input.is_empty(),
+            "provisioning must not consume terminal input"
+        );
+        match mode.to_str().expect("test mode") {
+            "ok" => {
+                println!("ordinary command output");
+                eprintln!("ordinary command diagnostic");
+            }
+            "fail" => {
+                eprintln!("fixture signing failure\nmore detail");
+                std::process::exit(7);
+            }
+            "block" => {
+                let ready = std::env::var_os(COMMAND_READY).expect("readiness path");
+                std::fs::write(ready, std::process::id().to_string()).expect("ready");
+                loop {
+                    std::thread::park();
+                }
+            }
+            _ => panic!("unknown fixture mode"),
+        }
+    }
+
+    #[test]
+    fn local_command_success_and_failure_keep_their_exit_meaning() {
+        assert!(run_command(&mut command_child("ok"), COMMAND_WAIT).is_ok());
+        assert_eq!(
+            run_command(&mut command_child("fail"), COMMAND_WAIT),
+            Err("fixture signing failure".to_string())
+        );
+        let absent = aterm_tempfile::tempdir().expect("tempdir");
+        let error = run_command(
+            &mut aterm_uds::spawnfd::command(absent.path().join("absent")),
+            COMMAND_WAIT,
+        )
+        .expect_err("spawn failure");
+        assert!(error.contains("could not start"), "{error}");
+        assert!(!error.contains("requested termination"), "{error}");
+    }
+
+    #[test]
+    fn a_signing_command_that_never_answers_is_stopped_and_reaped() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let ready = dir.path().join("ready");
+        let error = run_command(
+            command_child("block").env(COMMAND_READY, &ready),
+            COMMAND_WAIT,
+        )
+        .expect_err("the blocked signing command must not pass");
+        assert!(error.contains("did not finish within 60 s"), "{error}");
+        let pid = std::fs::read_to_string(&ready)
+            .expect("the child reached its blocking body")
+            .parse::<i32>()
+            .expect("the child's pid");
+        assert_eq!(
+            aterm_uds::process::process_presence(pid),
+            aterm_uds::process::ProcessPresence::Absent,
+            "the deadline must reap the child, not leave it as a zombie"
+        );
+    }
 
     /// A read-only look names provision, with the operator's folder, as the step when it can
     /// make the on-disk certificate an identity; a refused certificate (named), no current one,

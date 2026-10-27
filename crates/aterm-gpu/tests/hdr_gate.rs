@@ -7,7 +7,7 @@ use aterm_gpu::{
     hdr_present_plan, hdr_screen_upgrade_decision, hdr_screen_upgrade_wants_f16,
     hdr_swapchain_wants_f16,
 };
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 use {
     crate::common,
     aterm_core::terminal::Terminal,
@@ -65,7 +65,7 @@ fn hdr_gate_exhaustive_attach_present_chain() {
 }
 
 /// A tiny glow-bearing frame.
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 fn glow_input(cpu_cell: (usize, usize), rows: usize, cols: usize) -> RenderInput {
     let (cw, ch) = cpu_cell;
     let mut t = Terminal::new(rows as u16, cols as u16);
@@ -89,32 +89,26 @@ fn glow_input(cpu_cell: (usize, usize), rows: usize, cols: usize) -> RenderInput
     input
 }
 
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 fn gpu(px: f32) -> GpuRenderer {
-    // Windows: the EDR present is the D3D11 arm's, the one a window's f16
-    // swap chain shows; elsewhere the wgpu present stand-ins.
-    #[cfg(d3d11_arm)]
-    let mut g = {
-        let mut g = common::gpu(px, aterm_render::Theme::default());
-        g.arm_d3d11();
-        // A renderer that could not mint the arm would judge the wgpu oracle.
-        let mut t = Terminal::new(2, 4);
-        let _ = g.render_input(&mut WindowGpu::new(), &t.cell_frame(2, 4), None);
-        assert!(
-            g.last_frame_on_d3d11(),
-            "hdr_gate: the renderer draws on the D3D11 arm"
-        );
-        g
-    };
-    #[cfg(not(d3d11_arm))]
-    let mut g = common::wgpu_oracle(px, aterm_render::Theme::default());
+    // The EDR present is the D3D11 arm's, the one a window's f16 swap chain
+    // shows.
+    let mut g = common::gpu(px, aterm_render::Theme::default());
+    g.arm_d3d11();
+    // A renderer that could not mint the arm would judge no arm's present.
+    let mut t = Terminal::new(2, 4);
+    let _ = g.render_input(&mut WindowGpu::new(), &t.cell_frame(2, 4), None);
+    assert!(
+        g.last_frame_on_d3d11(),
+        "hdr_gate: the renderer draws on the D3D11 arm"
+    );
     g.set_bloom(false);
     g.set_shimmer(false);
     g
 }
 
 #[test]
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 fn gpu_hdr_blit_grid_clamped_and_linear() {
     let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);
@@ -147,7 +141,7 @@ fn gpu_hdr_blit_grid_clamped_and_linear() {
 }
 
 #[test]
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
     let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);
@@ -214,7 +208,7 @@ fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
 }
 
 #[test]
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 fn gpu_hdr_aurora_bounded_by_edr_and_nonvacuous() {
     let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);
@@ -256,7 +250,7 @@ fn gpu_hdr_aurora_bounded_by_edr_and_nonvacuous() {
 }
 
 #[test]
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 fn gpu_hdr_off_never_boosts() {
     let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(false);
@@ -274,7 +268,7 @@ fn gpu_hdr_off_never_boosts() {
 }
 
 /// One rainbow-kitty palette mark as the crown sees it.
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 struct Mark {
     name: &'static str,
     rgb: u32,
@@ -284,7 +278,7 @@ struct Mark {
 }
 
 /// Palette of five white cores and adjacent coloured marks.
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 const PALETTE: &[Mark] = &[
     Mark {
         name: "meteor nucleus core",
@@ -373,7 +367,7 @@ const PALETTE: &[Mark] = &[
 ];
 
 /// CPU twin of `HDR_GLOW_SHADER::white_part` and its 3x boost cap.
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 fn white_boost(premul: [f32; 3]) -> f32 {
     let w = premul[0].min(premul[1]).min(premul[2]);
     let t = ((w - 0.35) / (0.60 - 0.35)).clamp(0.0, 1.0);
@@ -381,7 +375,7 @@ fn white_boost(premul: [f32; 3]) -> f32 {
 }
 
 /// The premultiplied channels one [`Mark`] hands the crown.
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 fn mark_channels(m: &Mark) -> [f32; 3] {
     let p = premul_rgb(m.rgb, m.cov);
     [
@@ -392,7 +386,7 @@ fn mark_channels(m: &Mark) -> [f32; 3] {
 }
 
 /// Frame carrying [`PALETTE`] laid out left to right from `(row 1, col 1)`.
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 fn palette_input(
     cpu_cell: (usize, usize),
     rows: usize,
@@ -423,7 +417,7 @@ fn palette_input(
 }
 
 #[test]
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 fn only_the_whitest_cores_exceed_reference_white() {
     let mut gpu = gpu(18.0);
     gpu.set_hdr_glow(true);

@@ -8,6 +8,7 @@ const HOUR: i64 = 3600;
 const DAY: i64 = 86_400;
 
 fn observe(store: &Store, usage: bool) -> Recorded {
+    let (_directory, captured) = usage_fixture(store, &Roster::own());
     let who = ProcessLogin {
         login: None,
         default_home: true,
@@ -16,7 +17,7 @@ fn observe(store: &Store, usage: bool) -> Recorded {
     if usage {
         record_usage(
             store,
-            &Roster::own(),
+            &captured,
             "session",
             &who,
             &UsageSaid {
@@ -30,7 +31,7 @@ fn observe(store: &Store, usage: bool) -> Recorded {
     } else {
         record_wall(
             store,
-            &Roster::own(),
+            &captured,
             "session",
             &who,
             &crate::harness::upgrade::StandingWall {
@@ -105,18 +106,42 @@ fn interrupted_notification_recovers_before_the_next_state_edit() {
 }
 
 fn commit(store: &Store, operation: i64) -> Recorded {
-    if operation < 3 {
-        return observe(store, operation == 2);
-    }
+    // This model checks the state-only publication primitive, independently of
+    // the usage admission that now also reads login authority.
+    let mut changed = false;
     match store.transact_within(&[], NOW, &mut None, |state| {
-        if state.pinned {
-            return Ok(Vec::new());
-        }
-        state.pinned = true;
-        Ok(vec![Event::new(NOW, Kind::Use, "main")])
+        let before = state.clone();
+        let events = match operation {
+            1 => note_wall(state, "main", "seven_day", Some(NOW + HOUR), NOW, NOW)
+                .into_iter()
+                .map(|event| event.with_sid("session"))
+                .collect(),
+            2 => account_mut(state, "main")
+                .and_then(|account| {
+                    note_in_use(
+                        account,
+                        "main",
+                        CreditsRead { until: None },
+                        NOW,
+                        NOW.div_euclid(DAY),
+                        NOW,
+                    )
+                })
+                .into_iter()
+                .map(|event| event.with_sid("session"))
+                .collect(),
+            3 if !state.pinned => {
+                state.pinned = true;
+                vec![Event::new(NOW, Kind::Use, "main")]
+            }
+            3 => Vec::new(),
+            _ => unreachable!(),
+        };
+        changed = *state != before;
+        Ok(events)
     }) {
         Err(why) => Recorded::Refused(why),
-        Ok(events) if events.is_empty() => Recorded::Unchanged,
+        Ok(events) if events.is_empty() && !changed => Recorded::Unchanged,
         Ok(events) => Recorded::Usage {
             account: "main".into(),
             events: events.len(),

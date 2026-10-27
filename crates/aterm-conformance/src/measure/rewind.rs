@@ -63,6 +63,8 @@ pub struct RewindReport {
     pub starvation: Option<Starvation>,
     /// The verdict with the take's standing ([`dispose`]).
     pub disposition: Disposition,
+    /// The session's replay checks at the end ([`super::instance::replay_checks`]).
+    pub checks: String,
 }
 
 impl std::fmt::Display for RewindReport {
@@ -71,7 +73,7 @@ impl std::fmt::Display for RewindReport {
             RewindScene::Steps { max_p99_us, .. } => write!(
                 f,
                 "REWIND steps={} booked={} p99_us={} max_p99_us={max_p99_us} chain_bytes={} \
-                 keyframes={} states={} verdict={:?} starved={:?} reason=\"{}\" disposition={:?}",
+                 keyframes={} states={} verdict={:?} starved={:?} reason=\"{}\" disposition={:?} {}",
                 self.steps,
                 self.booked,
                 self.p99_us,
@@ -83,12 +85,13 @@ impl std::fmt::Display for RewindReport {
                 self.starvation
                     .as_ref()
                     .map_or_else(|| "no reading".to_string(), ToString::to_string),
-                self.disposition
+                self.disposition,
+                self.checks
             ),
             RewindScene::Idle { window } => write!(
                 f,
                 "REWIND idle_ms={} rewind_wakes={} frames={} timer_wakes={} wakes_by_variant={} \
-                 chain_bytes={} keyframes={} states={} verdict={:?}",
+                 chain_bytes={} keyframes={} states={} verdict={:?} {}",
                 window.as_millis(),
                 self.done_wakes,
                 self.frames,
@@ -97,7 +100,8 @@ impl std::fmt::Display for RewindReport {
                 self.row.chain_bytes,
                 self.keyframes,
                 self.states,
-                self.verdict
+                self.verdict,
+                self.checks
             ),
         }
     }
@@ -262,6 +266,7 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
         verdict: ShapeVerdict::Fail,
         starvation: None,
         disposition: Disposition::Fail,
+        checks: String::new(),
     };
     match row.scene {
         RewindScene::Steps { steps, max_p99_us } => {
@@ -317,6 +322,7 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
         }
     }
     let _ = ctl.ok(&["rewind", "close"]);
+    report.checks = super::instance::replay_checks(ctl);
     report.verdict = judge(row, &report);
     report.disposition = dispose(row, &report);
     Ok(report)
@@ -356,6 +362,7 @@ mod tests {
             verdict: ShapeVerdict::Fail,
             starvation: None,
             disposition: Disposition::Fail,
+            checks: String::new(),
         }
     }
 

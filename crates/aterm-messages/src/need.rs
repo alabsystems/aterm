@@ -305,6 +305,17 @@ impl Mover {
         Self(Intent::NewWindow)
     }
 
+    /// Restart one of macOS's own services (`fseventsd`) in a tab that asks for the
+    /// administrator's password; `None` for a name no service has ([`crate::model::service_name`]).
+    #[must_use]
+    pub fn restart_service(service: &str) -> Option<Self> {
+        crate::model::service_name(service).then(|| {
+            Self(Intent::RestartService {
+                service: service.to_string(),
+            })
+        })
+    }
+
     /// Open the web page where the fix is made (`notice later … url=`).
     #[must_use]
     pub(crate) fn open_link(url: &str) -> Option<Self> {

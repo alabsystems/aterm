@@ -624,6 +624,7 @@ pub const VENDORS: &[VendorSpec] = &[
             "auth",
             "login",
             "logout",
+            "usage",
             "init",
         ],
         live_upgrade: true,

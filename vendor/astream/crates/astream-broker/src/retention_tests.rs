@@ -18,6 +18,8 @@
 use super::*;
 use crate::brecord::GroupCommit;
 use astream_wire::Offset;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 const EV: &str = "/f/F/pub/n1/s1/ev";
 const MAIL: &str = "/f/F/in/n1/from/a";
@@ -87,6 +89,7 @@ impl V {
             base: 0,
             ceiling: self.records.len() as u64,
             records: &self.records,
+            record_bts: &[],
             stamps: &self.stamps,
             groups: &self.groups,
             held: &self.held,
@@ -300,6 +303,7 @@ fn the_planning_says_what_the_tightest_class_has_left() {
             Held {
                 rec: rec(off, MAIL, b"body"),
                 at_ms: 0,
+                bt_ms: None,
             },
         );
     }
@@ -376,6 +380,7 @@ fn a_class_past_its_bytes_gives_up_at_least_a_quarter_of_them() {
             Held {
                 rec: rec(off, MAIL, b"body"),
                 at_ms: 0,
+                bt_ms: None,
             },
         );
     }
@@ -443,6 +448,7 @@ fn a_held_class_gives_up_its_oldest_by_age_and_by_bytes() {
             Held {
                 rec: rec(off, MAIL, b"body"),
                 at_ms: at,
+                bt_ms: None,
             },
         );
     }

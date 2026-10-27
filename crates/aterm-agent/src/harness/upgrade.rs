@@ -364,6 +364,7 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("-d", Arity::Optional, Fate::Keep),
     ("--debug", Arity::Optional, Fate::Keep),
     ("--debug-file", Arity::One, Fate::Keep),
+    ("--desktop", Arity::None, Fate::Refuse),
     ("--disable-slash-commands", Arity::None, Fate::Keep),
     ("--disallowedTools", Arity::Many, Fate::Keep),
     ("--disallowed-tools", Arity::Many, Fate::Keep),
@@ -429,11 +430,16 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--worktree", Arity::Optional, Fate::Refuse),
 ];
 
-fn flag(name: &str) -> Option<(Arity, Fate)> {
+fn flag_entry(name: &str) -> Option<(&'static str, Arity, Fate)> {
     FLAGS
         .iter()
         .find(|(n, _, _)| *n == name)
-        .map(|(_, a, f)| (*a, *f))
+        .map(|(n, a, f)| (*n, *a, *f))
+}
+
+#[cfg(test)]
+fn flag(name: &str) -> Option<(Arity, Fate)> {
+    flag_entry(name).map(|(_, a, f)| (a, f))
 }
 
 fn maybe_option(tok: &str) -> bool {
@@ -444,7 +450,7 @@ fn maybe_option(tok: &str) -> bool {
 pub fn rewrite_argv(argv: &[String], session_id: &str) -> Result<Vec<String>, ArgvRefusal> {
     let mut out: Vec<String> = carried(argv)?
         .into_iter()
-        .flat_map(|(_, tokens)| tokens.iter().cloned())
+        .flat_map(|(_, tokens)| tokens)
         .collect();
     out.push("--resume".to_string());
     out.push(session_id.to_string());
@@ -466,19 +472,19 @@ pub(crate) fn permission_argv(argv: &[String]) -> Vec<String> {
             flags
                 .into_iter()
                 .filter(|(name, _)| PERMISSION_FLAGS.contains(name))
-                .flat_map(|(_, tokens)| tokens.iter().cloned()),
+                .flat_map(|(_, tokens)| tokens),
         );
     }
     out
 }
 
-fn carried(argv: &[String]) -> Result<Vec<(&str, &[String])>, ArgvRefusal> {
+fn carried(argv: &[String]) -> Result<Vec<(&str, Vec<String>)>, ArgvRefusal> {
     let mut out = Vec::new();
     for (name, fate, tokens) in parsed(argv) {
         match fate {
             None => return Err(ArgvRefusal::UnknownFlag(name.to_string())),
             Some(Fate::Refuse) => return Err(ArgvRefusal::NotResumable(name.to_string())),
-            Some(Fate::Keep) if name == "--settings" && tap_tokens(tokens) => {}
+            Some(Fate::Keep) if name == "--settings" && tap_tokens(&tokens) => {}
             Some(Fate::Keep) => out.push((name, tokens)),
             Some(Fate::Drop) => {}
         }
@@ -501,7 +507,7 @@ pub(super) fn carried_names(argv: &[String]) -> Result<Vec<&str>, ArgvRefusal> {
 
 /// Each option of an argv as [`parsed`] reads it: its name, its fate where a table knows it, and
 /// its tokens (the name and the values it took).
-type Options<'a> = Vec<(&'a str, Option<Fate>, &'a [String])>;
+type Options<'a> = Vec<(&'a str, Option<Fate>, Vec<String>)>;
 
 fn parsed(argv: &[String]) -> Options<'_> {
     walked(argv).0
@@ -512,6 +518,32 @@ fn parsed(argv: &[String]) -> Options<'_> {
 #[must_use]
 pub(super) fn first_operand(argv: &[String]) -> Option<&str> {
     walked(argv).1
+}
+
+fn take_values(argv: &[String], i: &mut usize, arity: Arity) {
+    match arity {
+        Arity::None => {}
+        Arity::One => {
+            if *i < argv.len() {
+                *i += 1;
+            }
+        }
+        Arity::Optional => {
+            if *i < argv.len() && !maybe_option(&argv[*i]) {
+                *i += 1;
+            }
+        }
+        Arity::Many => {
+            // The first value is required, so Claude's parser takes it
+            // whatever it looks like (`--add-dir -c`).
+            if *i < argv.len() {
+                *i += 1;
+            }
+            while *i < argv.len() && !maybe_option(&argv[*i]) {
+                *i += 1;
+            }
+        }
+    }
 }
 
 /// [`parsed`]'s options, and the first operand it stepped over ([`first_operand`]).
@@ -529,39 +561,56 @@ fn walked(argv: &[String]) -> (Options<'_>, Option<&str>) {
             i += 1;
             continue;
         }
-        let (name, inline) = match tok.split_once('=') {
-            Some((n, _)) if n.starts_with("--") => (n, true),
-            _ => (tok.as_str(), false),
-        };
-        let known = flag(name);
-        let start = i;
-        i += 1;
-        if !inline {
-            match known.map_or(Arity::None, |(arity, _)| arity) {
-                Arity::None => {}
-                Arity::One => {
-                    if i < argv.len() {
-                        i += 1;
-                    }
-                }
-                Arity::Optional => {
-                    if i < argv.len() && !maybe_option(&argv[i]) {
-                        i += 1;
-                    }
-                }
-                Arity::Many => {
-                    // The first value is required, so Claude's parser takes it
-                    // whatever it looks like (`--add-dir -c`).
-                    if i < argv.len() {
-                        i += 1;
-                    }
-                    while i < argv.len() && !maybe_option(&argv[i]) {
-                        i += 1;
-                    }
-                }
+        if tok.starts_with("--") {
+            let (raw_name, inline) = match tok.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (tok.as_str(), false),
+            };
+            let known = flag_entry(raw_name);
+            let name = known.map_or(raw_name, |(n, _, _)| n);
+            let start = i;
+            i += 1;
+            if !inline && let Some((_, arity, _)) = known {
+                take_values(argv, &mut i, arity);
             }
+            out.push((
+                name,
+                known.map(|(_, _, fate)| fate),
+                argv[start..i].to_vec(),
+            ));
+            continue;
         }
-        out.push((name, known.map(|(_, fate)| fate), &argv[start..i]));
+        // Commander bundles short switches (`-cp`) and attaches the last,
+        // value-taking short option's value (`-cnName`, `-crID`).
+        let cluster = &tok[1..];
+        let mut next = i + 1;
+        let mut unknown = false;
+        for (off, c) in cluster.char_indices() {
+            let candidate = format!("-{c}");
+            let Some((name, arity, fate)) = flag_entry(&candidate) else {
+                unknown = true;
+                break;
+            };
+            if arity == Arity::None {
+                out.push((name, Some(fate), vec![candidate]));
+                continue;
+            }
+            let rest = &cluster[off + c.len_utf8()..];
+            if !rest.is_empty() {
+                out.push((name, Some(fate), vec![format!("-{c}{rest}")]));
+            } else {
+                let start = next;
+                take_values(argv, &mut next, arity);
+                let mut tokens = vec![candidate];
+                tokens.extend(argv[start..next].iter().cloned());
+                out.push((name, Some(fate), tokens));
+            }
+            break;
+        }
+        if unknown {
+            out.push((tok.as_str(), None, vec![tok.clone()]));
+        }
+        i = next;
     }
     (out, operand)
 }
@@ -584,7 +633,7 @@ pub fn launch_model(argv: &[String]) -> Option<String> {
         .into_iter()
         .rev()
         .find(|(name, _)| *name == "--model")?;
-    match tokens {
+    match tokens.as_slice() {
         [one] => one.split_once('=').map(|(_, v)| v.to_string()),
         [_, value] => Some(value.clone()),
         _ => None,
@@ -599,7 +648,10 @@ pub fn launch_resume(argv: &[String]) -> Option<Option<String>> {
     for (name, _, tokens) in parsed(argv) {
         match name {
             "--resume" | "-r" => {
-                let id = match tokens {
+                let id = match tokens.as_slice() {
+                    [one] if name == "-r" => one
+                        .strip_prefix("-r")
+                        .map(|v| v.strip_prefix('=').unwrap_or(v).to_string()),
                     [one] => one.split_once('=').map(|(_, v)| v.to_string()),
                     [_, value] => Some(value.clone()),
                     _ => None,
@@ -914,21 +966,14 @@ fn relaunch_line_exact(
             return Err("a control character in the line".to_string());
         }
     }
-    let mut line = String::from(" ");
-    if let Some(hook) = heal {
+    let heal = heal.map_or_else(String::new, |hook| {
         let h = quote(dialect, &hook.to_string_lossy());
         match dialect {
-            Dialect::Zsh => {
-                let _ = write!(line, ". {h}; rehash; ");
-            }
-            Dialect::Bash => {
-                let _ = write!(line, ". {h}; hash -r; ");
-            }
-            Dialect::Fish => {
-                let _ = write!(line, "source {h}; ");
-            }
+            Dialect::Zsh => format!(". {h}; rehash; "),
+            Dialect::Bash => format!(". {h}; hash -r; "),
+            Dialect::Fish => format!("source {h}; "),
         }
-    }
+    });
     let mut cmd = quote(dialect, &exe_s);
     for a in args {
         cmd.push(' ');
@@ -956,17 +1001,36 @@ fn relaunch_line_exact(
             let _ = write!(vars, "{name}={} ", quote(dialect, value));
         }
     }
+    line_of(tty, dialect, &heal, cd, &vars, &cmd)
+}
+
+/// Why a fish relaunch line cannot run the agent in another directory than its shell's: fish has
+/// no subshell to `cd` in without moving the person's own shell.
+const FISH_CD: &str = "fish: the agent's directory differs from the shell's";
+
+/// The relaunch line made of its parts ([`relaunch_line_exact`]): `heal` (the hook's sourcing,
+/// empty for none), `vars` (each `NAME=value ` the command runs with) and `cmd` (the quoted
+/// command), run in `cd` when one is given.
+fn line_of(
+    tty: LineDiscipline,
+    dialect: Dialect,
+    heal: &str,
+    cd: Option<&str>,
+    vars: &str,
+    cmd: &str,
+) -> Result<String, String> {
+    let mut line = format!(" {heal}");
     match cd {
         None if dialect == Dialect::Fish && !vars.is_empty() => {
             let _ = write!(line, "env {vars}{cmd}");
         }
         None => {
-            line.push_str(&vars);
-            line.push_str(&cmd);
+            line.push_str(vars);
+            line.push_str(cmd);
         }
         Some(dir) => match dialect {
             Dialect::Zsh | Dialect::Bash => {
-                if dialect == Dialect::Bash && heal.is_none() {
+                if dialect == Dialect::Bash && heal.is_empty() {
                     line.push_str(BASH_LINE_OPENS);
                 }
                 let _ = write!(
@@ -975,9 +1039,7 @@ fn relaunch_line_exact(
                     quote(dialect, dir)
                 );
             }
-            Dialect::Fish => {
-                return Err("fish: the agent's directory differs from the shell's".to_string());
-            }
+            Dialect::Fish => return Err(FISH_CD.to_string()),
         },
     }
     let max = tty.max_line();
@@ -988,6 +1050,125 @@ fn relaunch_line_exact(
         ));
     }
     Ok(line)
+}
+
+/// `line`, a relaunch line these builders made with no `cd` ([`relaunch_line_env`]), as they make
+/// it with `cd` `dir` (the same subshell, `exec` and quoting, [`quote`]), so it runs the agent in
+/// `dir` wherever its shell stands; a line that carries a `cd` of its own comes back as it is.
+///
+/// # Errors
+///
+/// A `dir` with a control character in it, a fish line (which never changes directory), a line
+/// these builders do not make, or one the `cd` makes too long for the terminal.
+pub fn with_cd(dialect: Dialect, line: &str, dir: &str) -> Result<String, String> {
+    with_cd_on(LineDiscipline::HOST, dialect, line, dir)
+}
+
+fn with_cd_on(
+    tty: LineDiscipline,
+    dialect: Dialect,
+    line: &str,
+    dir: &str,
+) -> Result<String, String> {
+    if dir
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        return Err("a control character in the line".to_string());
+    }
+    if dialect == Dialect::Fish {
+        return Err(FISH_CD.to_string());
+    }
+    let parts = LineParts::of(dialect, line)
+        .ok_or_else(|| "not a relaunch line aterm makes".to_string())?;
+    if parts.cd {
+        return Ok(line.to_string());
+    }
+    line_of(tty, dialect, parts.heal, Some(dir), parts.vars, parts.cmd)
+}
+
+/// The parts [`line_of`] made a zsh or bash relaunch line from ([`with_cd`]).
+struct LineParts<'a> {
+    heal: &'a str,
+    /// Whether the line runs its command in a `cd` of its own (its other parts are then empty).
+    cd: bool,
+    vars: &'a str,
+    cmd: &'a str,
+}
+
+impl<'a> LineParts<'a> {
+    /// The parts of `line` under `dialect`'s quoting; `None`: not a zsh or bash line [`line_of`]
+    /// makes.
+    fn of(dialect: Dialect, line: &'a str) -> Option<Self> {
+        let rest = line.strip_prefix(' ')?;
+        let heal = match rest.strip_prefix(". ") {
+            Some(sourced) => {
+                let hook = quoted_len(sourced)?;
+                let then = match dialect {
+                    Dialect::Zsh => "; rehash; ",
+                    Dialect::Bash => "; hash -r; ",
+                    Dialect::Fish => return None,
+                };
+                sourced.get(hook..)?.starts_with(then).then_some(())?;
+                ". ".len() + hook + then.len()
+            }
+            None => 0,
+        };
+        let (heal, body) = rest.split_at(heal);
+        if body.starts_with("( cd -- ") || body.starts_with(BASH_LINE_OPENS) {
+            return Some(Self {
+                heal,
+                cd: true,
+                vars: "",
+                cmd: "",
+            });
+        }
+        let mut vars = 0;
+        while let Some(var) = body.get(vars..).and_then(var_len) {
+            vars += var;
+        }
+        let (vars, cmd) = body.split_at(vars);
+        cmd.starts_with('\'').then_some(Self {
+            heal,
+            cd: false,
+            vars,
+            cmd,
+        })
+    }
+}
+
+/// The length of the zsh or bash word [`quote`] made at the head of `s` (`'…'` runs joined by
+/// `\'`), if one is there.
+fn quoted_len(s: &str) -> Option<usize> {
+    let mut at = 0;
+    loop {
+        let run = s.get(at..)?.strip_prefix('\'')?;
+        at += 1 + run.find('\'')? + 1;
+        if s.get(at..)?.starts_with("\\''") {
+            at += 2;
+        } else {
+            return Some(at);
+        }
+    }
+}
+
+/// The length of the `NAME=value ` [`relaunch_line_exact`] exports at the head of `s`, if one is
+/// there.
+fn var_len(s: &str) -> Option<usize> {
+    let name = s
+        .bytes()
+        .take_while(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+        .count();
+    let value = s.get(name..)?.strip_prefix('=').filter(|_| name > 0)?;
+    let len = if value.starts_with('\'') {
+        quoted_len(value)?
+    } else {
+        value
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'-'))
+            .count()
+    };
+    (len > 0 && value.get(len..)?.starts_with(' ')).then_some(name + 1 + len + 1)
 }
 
 /// Prefixes a relaunch `line` with a one-use shell-integration rekey read from `path`.
@@ -1697,9 +1878,16 @@ impl FinishedScan {
             return;
         }
         let notice = row.get("message").is_some_and(is_announcement);
+        // A RESUME PAST A CONDITION ([`turn_end::cleared_text`], or a wall's plain retry the
+        // ledger names) delivers the prompt the condition cut again, as the vendor's own
+        // continuation does: its answer is that prompt's.
         let retry = std::mem::take(&mut self.cut)
             && matches!(asked, Asked::Nobody)
-            && (supervisors_plain(row, &self.ours) || vendor_continues(row));
+            && (supervisors_plain(row, &self.ours)
+                || vendor_continues(row)
+                || first_text(row)
+                    .map(typed_words)
+                    .is_some_and(turn_end::is_cleared_line));
         (self.said, self.notice) = (false, notice);
         if retry {
             self.command = false;

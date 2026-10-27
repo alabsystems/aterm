@@ -171,15 +171,6 @@ pub fn clock_words(at_unix_ms: u64, offset_s: i64) -> String {
 /// A day header's words for local day `day` read on local day `today` ([`local_day`]).
 #[must_use]
 pub fn day_heading(today: i64, day: i64, short: bool) -> String {
-    const WEEKDAYS: [&str; 7] = [
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-        "Sunday",
-    ];
     const MONTHS: [&str; 12] = [
         "January",
         "February",
@@ -194,7 +185,7 @@ pub fn day_heading(today: i64, day: i64, short: bool) -> String {
         "November",
         "December",
     ];
-    let weekday = WEEKDAYS[usize::try_from((day + 3).rem_euclid(7)).unwrap_or(0)];
+    let weekday = weekday(day);
     match today.saturating_sub(day) {
         i64::MIN..=0 => "Today".to_string(),
         1 => "Yesterday".to_string(),
@@ -215,6 +206,47 @@ pub fn day_heading(today: i64, day: i64, short: bool) -> String {
             }
         }
     }
+}
+
+/// The name of local day `day`'s weekday ([`local_day`]).
+fn weekday(day: i64) -> &'static str {
+    const WEEKDAYS: [&str; 7] = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ];
+    WEEKDAYS[usize::try_from((day + 3).rem_euclid(7)).unwrap_or(0)]
+}
+
+/// The words a past local day `day` may take, read on local day `today`, where no header names
+/// it, longest first: a header's short words ([`day_heading`]), then fewer that still tell the
+/// day where a narrow column would wrap those: a day of the last week's weekday, short ("Yesterday"
+/// or "Thursday", then "Sat" or "Thu"); an older one's date ("Sun, 18 Oct", then "18 Oct"),
+/// and a past year's its month ("Wed, 31 Dec 2025", "31 Dec 2025", then "Dec 2025").
+#[must_use]
+pub fn day_forms(today: i64, day: i64) -> Vec<String> {
+    let heading = day_heading(today, day, true);
+    let mut forms = vec![heading.clone()];
+    match today.saturating_sub(day) {
+        i64::MIN..=0 => {}
+        1..=6 => forms.push(weekday(day).chars().take(3).collect()),
+        _ => {
+            if let Some((_, date)) = heading.split_once(", ") {
+                forms.push(date.to_string());
+                let mut words = date.split(' ');
+                if let (Some(_), Some(month), Some(year)) =
+                    (words.next(), words.next(), words.next())
+                {
+                    forms.push(format!("{month} {year}"));
+                }
+            }
+        }
+    }
+    forms
 }
 
 /// `YYYY-MM-DD` in UTC.
@@ -541,6 +573,11 @@ mod tests {
         assert_eq!(short(3), "Thursday");
         assert_eq!(short(9), "Fri, 18 Sep");
         assert_eq!(short(270), "Wed, 31 Dec 2025");
+        let forms = |ago: i64| day_forms(today, today - ago);
+        assert_eq!(forms(1), ["Yesterday", "Sat"]);
+        assert_eq!(forms(3), ["Thursday", "Thu"]);
+        assert_eq!(forms(9), ["Fri, 18 Sep", "18 Sep"]);
+        assert_eq!(forms(270), ["Wed, 31 Dec 2025", "31 Dec 2025", "Dec 2025"]);
         assert_eq!(clock_words(noon, 0), "12:00 PM");
         assert_eq!(clock_words(noon, -12 * 3600 - 60), "11:59 PM");
         assert_eq!(clock_words(noon + 9 * 60_000, 9 * 3600), "9:09 PM");

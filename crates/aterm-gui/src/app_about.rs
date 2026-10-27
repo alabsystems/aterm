@@ -447,9 +447,11 @@ mod tests {
             let mut app = App::headless_for_test();
             let wid = WindowId(0);
             {
+                // As tall as 40 rows of macOS's 12 px cells, where the details outgrow it:
+                // Linux's 15 px and Windows's 17 px cells make 40 rows a window they fit in.
                 let window = app.windows.get_mut(&wid).unwrap();
                 window.cols = 140;
-                window.rows = 40;
+                window.rows = (40.0 * 12.0 / crate::FONT_PX).round() as u16;
             }
             assert!(app.open_about_tab());
             let (instance, view) = app.active_native_view(wid).unwrap();

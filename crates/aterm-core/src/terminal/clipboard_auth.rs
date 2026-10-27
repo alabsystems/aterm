@@ -35,7 +35,7 @@ pub(super) struct ClipboardQueryCapability {
 }
 
 /// Host-side authorization state for OSC 52 clipboard access.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ClipboardAuth {
     write_authorized: bool,
     query_authorized: bool,

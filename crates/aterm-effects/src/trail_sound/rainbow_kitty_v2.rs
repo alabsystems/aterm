@@ -1201,6 +1201,7 @@ impl MelodyV2 {
         at.saturating_sub(mark) <= VERDICT_LIT_MS
     }
 
+    #[inline]
     const fn on_typed(
         &mut self,
         at: u32,
@@ -1475,6 +1476,7 @@ impl MelodyV2 {
         }
     }
 
+    #[inline]
     const fn derive(&mut self, rank: u8, gap: u32, first: bool, word_head: bool) -> i32 {
         let from = self.text.walk as i32;
 
@@ -1607,6 +1609,7 @@ impl MelodyV2 {
         self.repeat_run >= AUTOREPEAT_RUN || gap <= AUTOREPEAT_FLOOR_MS
     }
 
+    #[inline]
     const fn on_space(&mut self, at: u32) -> bool {
         const _: () = assert!(CHORD_LOOP.len().is_power_of_two());
         const CHORD_MASK: u8 = CHORD_LOOP.len() as u8 - 1;
@@ -1644,6 +1647,7 @@ impl MelodyV2 {
         head
     }
 
+    #[inline]
     const fn on_enter(&mut self, at: u32) -> (bool, bool, bool) {
         let full = self.keys_since_enter >= ENTER_PICKUP_MIN_KEYS;
         let closed = matches!(self.pending_mark(), MARK_PERIOD | MARK_BANG);
@@ -1674,6 +1678,7 @@ impl MelodyV2 {
         }
     }
 
+    #[inline]
     const fn on_jump(&mut self, at: u32) -> Option<bool> {
         let in_run = match self.cascade_at {
             Some(c) => at.saturating_sub(c) < CASCADE_RUN_MS,
@@ -1711,6 +1716,7 @@ impl MelodyV2 {
         }
     }
 
+    #[inline]
     const fn run_theme_step(&mut self) -> i8 {
         let start = SONG_FORM[self.run_phrase as usize] as usize;
         let end = SONG_FORM[(self.run_phrase + 1) as usize] as usize;
@@ -2420,6 +2426,7 @@ impl TrailSynth {
     }
 
     /// The v2 admission path (§16 row 9), reached only from [`TrailSynth::push_meta`]'s top-of-function branch, never by a v1 event.
+    #[inline]
     pub(super) const fn push_v2(&mut self, ev: SoundEvent, meta: EventMeta) {
         // The verdict forks first, above the trail preamble, none of which
         // applies: the bus is already latched by the keyed Enter, the sky's
@@ -2562,6 +2569,7 @@ const SECRET_TAU_S: f32 = 0.069;
 const ERASE_MUTE_S: f32 = 0.040;
 
 impl TrailSynth {
+    #[inline]
     const fn v2_typed(&mut self, ev: &SoundEvent, meta: EventMeta, at: u32) {
         self.v2_hand_back_key(at);
         let sing = self.sing > 0.0;
@@ -2846,6 +2854,7 @@ impl TrailSynth {
         }
     }
 
+    #[inline]
     const fn v2_air_cloud(
         &mut self,
         deg: i32,
@@ -2870,6 +2879,7 @@ impl TrailSynth {
         }
     }
 
+    #[inline]
     const fn v2_space(&mut self, ev: &SoundEvent, at: u32) {
         self.v2.ring = None;
         self.v2.graft = None;
@@ -2912,6 +2922,7 @@ impl TrailSynth {
         }
     }
 
+    #[inline]
     const fn v2_shift(&mut self, ev: &SoundEvent) {
         const _: () = assert!(TING_PICK.len() == super::SHIFT_ROTATION.len());
         self.v2_damp(self.v2.lift, LANE_FADE_STEAL_S);
@@ -2923,6 +2934,7 @@ impl TrailSynth {
         self.v2.lift = self.v2_spawn(ting(f), ev.gain * KEY_TINE_TRIM * TING_LEVEL, pan);
     }
 
+    #[inline]
     const fn v2_secret(&mut self, ev: &SoundEvent) {
         let f = penta(TINE_BASE_HZ, SECRET_DEG + (self.song_key as i32));
         self.v2_damp_same_pitch(LANE_TUNE, f);
@@ -2930,6 +2942,7 @@ impl TrailSynth {
         self.v2_spawn(voice, ev.gain * KEY_TINE_TRIM, 0.0);
     }
 
+    #[inline]
     const fn v2_nav_tick(&mut self, ev: &SoundEvent) {
         let deg = (self.v2.text.walk as i32) + (self.song_key as i32);
         let f = penta(TINE_BASE_HZ, deg);
@@ -2958,6 +2971,7 @@ impl TrailSynth {
         roof_hz(cps, true, ev.heat, arc, Touch::Step)
     }
 
+    #[inline]
     const fn v2_cascade(&mut self, ev: &SoundEvent, at: u32) {
         self.v2_hand_back_key(at);
         let Some(head) = self.v2.on_jump(at) else {
@@ -3001,6 +3015,7 @@ impl TrailSynth {
         }
     }
 
+    #[inline]
     const fn v2_strum(&mut self, ev: &SoundEvent) {
         self.v2.ring = None;
         self.v2.graft = None;
@@ -3022,6 +3037,7 @@ impl TrailSynth {
         }
     }
 
+    #[inline]
     const fn v2_enter(&mut self, ev: &SoundEvent, at: u32, cells: u16) {
         self.v2.ring = None;
         self.v2.graft = None;
@@ -3120,6 +3136,7 @@ impl TrailSynth {
         );
     }
 
+    #[inline]
     const fn v2_verdict(&mut self, ev: &SoundEvent, at: u32, failed: bool, ice: bool) {
         let tau = tau_v_s(self.v2.ioi_ms * 0.001);
         let roof = self.v2_lit_roof(ev);
@@ -3197,6 +3214,7 @@ impl TrailSynth {
         self.v2_spawn_decoration(voice, gain * TINK_LEVEL, pan)
     }
 
+    #[inline]
     const fn v2_glint_deg_at(
         &mut self,
         ev: &SoundEvent,
@@ -3231,6 +3249,7 @@ impl TrailSynth {
 }
 
 impl TrailSynth {
+    #[inline]
     const fn v2_meteor_arm(&mut self, ev: &SoundEvent, meta: EventMeta, dir: i8) {
         let pan = meta.pan_from;
         let mut tick = met_tick();
@@ -3243,6 +3262,7 @@ impl TrailSynth {
         self.v2_spawn(core, ev.gain * KEY_TINE_TRIM * MET_ARM_CORE_LEVEL, pan);
     }
 
+    #[inline]
     const fn v2_core_voice(&self, dir: i8, t: f32) -> Voice {
         let lo = fold_into(
             penta(
@@ -3282,6 +3302,7 @@ impl TrailSynth {
         }
     }
 
+    #[inline]
     const fn v2_release_arm(&mut self) {
         let mut i = 0;
         while i < self.voices.len() {
@@ -3295,6 +3316,7 @@ impl TrailSynth {
         }
     }
 
+    #[inline]
     const fn v2_claim_arm(&mut self, ev: &SoundEvent, dir: i8, t: f32) -> Option<u32> {
         let target = self.v2_core_voice(dir, t);
         let vel = self.v2_velocity(VEL_DB_MOTION);
@@ -3342,6 +3364,7 @@ impl TrailSynth {
         claimed
     }
 
+    #[inline]
     const fn v2_meteor(
         &mut self,
         ev: &SoundEvent,
@@ -3493,6 +3516,7 @@ impl RainbowKittyV2Palette {
 
 impl TrailSynth {
     /// One stereo sample `(mid, side)` of the sky pad, behind the music box's palette bed.
+    #[inline]
     pub(super) const fn bed_rainbow_sky(&mut self, dt: f32, lvl: f32) -> (f32, f32) {
         const _: () = assert!(
             BED_PARTIALS[0] == 1
@@ -7933,20 +7957,6 @@ for it up front.\n\
 
     #[test]
     fn the_sky_pad_tracks_the_chord_and_key_without_low_frequency_hum() {
-        fn lp_series(samples: &[f32], fc: f32) -> Vec<f32> {
-            let k = 1.0 - (-core::f32::consts::TAU * fc / SR).exp();
-            let mut s = [0.0f32; 4];
-            samples
-                .iter()
-                .map(|&x| {
-                    s[0] += k * (x - s[0]);
-                    s[1] += k * (s[0] - s[1]);
-                    s[2] += k * (s[1] - s[2]);
-                    s[3] += k * (s[2] - s[3]);
-                    s[3]
-                })
-                .collect()
-        }
         fn rms_db(xs: &[f32]) -> f32 {
             if xs.is_empty() {
                 return -120.0;
@@ -7960,62 +7970,70 @@ for it up front.\n\
         }
 
         let text = "first, fix the aterm typing sound, there is a low frequency humming.";
-        for bed in [false, true] {
-            let mut s = synth();
-            let mut buf = [0.0f32; 1024];
-            let mut active_mono = Vec::new();
-            let mut at_ms = 1_000u32;
-            for (idx, ch) in text.chars().enumerate() {
-                let kind = if ch == ' ' {
-                    SoundKind::Space
-                } else {
-                    SoundKind::Typed
-                };
-                s.push_meta(
-                    SoundEvent {
-                        bed,
-                        hue: ((idx as f32) * 0.07).fract(),
-                        tone: Tone::Frustrated,
-                        ..event(kind, 0.0, ch.is_uppercase())
-                    },
-                    EventMeta {
-                        at_ms,
-                        glyph_class: crate::trail_sound::typed_glyph_class(Some(ch)),
-                        rank: crate::trail_sound::typed_glyph_rank(Some(ch)),
-                        ..EventMeta::default()
-                    },
-                );
-                for _ in 0..7 {
-                    s.render(&mut buf);
-                    for &[l, r] in buf.as_chunks::<2>().0 {
-                        active_mono.push(0.5 * (l + r));
+        for sr in [44_100.0f32, SR, 96_000.0] {
+            for bed in [false, true] {
+                let mut s = TrailSynth::new(sr, SEED);
+                let mut buf = [0.0f32; 1024];
+                let mut active_mono = Vec::new();
+                let mut at_ms = 1_000u32;
+                let blocks_per_key = ((0.075 * sr / 512.0).round() as usize).max(1);
+                for (idx, ch) in text.chars().enumerate() {
+                    let kind = if ch == ' ' {
+                        SoundKind::Space
+                    } else {
+                        SoundKind::Typed
+                    };
+                    s.push_meta(
+                        SoundEvent {
+                            bed,
+                            hue: ((idx as f32) * 0.07).fract(),
+                            tone: Tone::Frustrated,
+                            ..event(kind, 0.0, ch.is_uppercase())
+                        },
+                        EventMeta {
+                            at_ms,
+                            glyph_class: crate::trail_sound::typed_glyph_class(Some(ch)),
+                            rank: crate::trail_sound::typed_glyph_rank(Some(ch)),
+                            ..EventMeta::default()
+                        },
+                    );
+                    for _ in 0..blocks_per_key {
+                        s.render(&mut buf);
+                        for &[l, r] in buf.as_chunks::<2>().0 {
+                            active_mono.push(0.5 * (l + r));
+                        }
                     }
+                    at_ms += 75;
                 }
-                at_ms += 75;
-            }
-            let total_db = rms_db(&active_mono);
-            let sub200_db = rms_db(&lp_series(&active_mono, 200.0));
-            assert!(
-                sub200_db < -62.0 && total_db - sub200_db > 24.0,
-                "bed={bed}: sub-200 Hz hum ({sub200_db:.1} dB) must stay deep below signal ({total_db:.1} dB)"
-            );
-            if !bed {
-                // Default bed=false: after 350 ms for the final tine to ring out, tail is quiet.
-                for _ in 0..45 {
-                    s.render(&mut buf);
-                }
+                let k_lp = 1.0 - (-core::f32::consts::TAU * 200.0 / sr).exp();
+                let mut st = [0.0f32; 4];
+                let low: Vec<f32> = active_mono
+                    .iter()
+                    .map(|&x| {
+                        st[0] += k_lp * (x - st[0]);
+                        st[1] += k_lp * (st[0] - st[1]);
+                        st[2] += k_lp * (st[1] - st[2]);
+                        st[3] += k_lp * (st[2] - st[3]);
+                        st[3]
+                    })
+                    .collect();
+                let total_db = rms_db(&active_mono);
+                let sub200_db = rms_db(&low);
                 assert!(
-                    s.is_quiet(),
-                    "bed=false parks the synth as soon as notes end"
+                    sub200_db < -62.0 && total_db - sub200_db > 24.0,
+                    "sr={sr} bed={bed}: sub-200 Hz hum ({sub200_db:.1} dB) must stay deep below signal ({total_db:.1} dB)"
                 );
-            } else {
-                // Opt-in bed=true: settles to exact silence within 2.5 s (no multi-second lingering drone).
-                for _ in 0..235 {
+                let settle_blocks = if !bed {
+                    ((0.48 * sr / 512.0).ceil() as usize).max(45)
+                } else {
+                    ((2.50 * sr / 512.0).ceil() as usize).max(235)
+                };
+                for _ in 0..settle_blocks {
                     s.render(&mut buf);
                 }
                 assert!(
                     s.is_quiet(),
-                    "bed=true settles cleanly without lingering drone"
+                    "sr={sr} bed={bed}: settles cleanly to exact silence"
                 );
             }
         }

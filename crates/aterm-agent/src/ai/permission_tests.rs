@@ -266,6 +266,114 @@ fn unknown_launch_grammar_and_implicit_defaults_prove_no_permission() {
     );
 }
 
+/// A CLAUDE CODE THAT ATERM RELAUNCHED KEEPS ITS LEVEL: the relaunch line adds the usage tap's
+/// `--settings`, and before this every review it asked for read the asker as unknown (seen
+/// 2026-10-26 on a `--dangerously-skip-permissions` session the live upgrade had moved: its argv
+/// is the first case, byte for byte). Any other `--settings` may set permissions, so it still
+/// proves nothing.
+#[cfg(unix)]
+#[test]
+fn the_usage_taps_settings_keep_a_relaunched_claudes_level() {
+    let tap = r#"{"statusLine":{"type":"command","command":"/Applications/aterm.app/Contents/MacOS/aterm harness tap","refreshInterval":10}}"#;
+    assert_eq!(
+        crate::harness::tap::settings_value(Path::new(
+            "/Applications/aterm.app/Contents/MacOS/aterm"
+        ))
+        .as_deref(),
+        Some(tap),
+        "the value a relaunch types"
+    );
+    let relaunched = [
+        "--dangerously-skip-permissions",
+        "--settings",
+        tap,
+        "--resume",
+        "65ef503b-62b3-44e1-9e3c-7f76b56c0008",
+    ];
+    assert_eq!(
+        level_of("claude", &argv(&relaunched), None),
+        Some(Level::Yolo)
+    );
+    let attached = format!("--settings={tap}");
+    assert_eq!(
+        level_of(
+            "claude",
+            &argv(&["--permission-mode", "plan", &attached]),
+            None
+        ),
+        Some(Level::Plan)
+    );
+    let planned = r#"{"permissions":{"defaultMode":"plan"}}"#;
+    let restricting = format!("--settings={planned}");
+    for words in [
+        vec!["--dangerously-skip-permissions", "--settings", planned],
+        vec![
+            "--dangerously-skip-permissions",
+            "--settings",
+            "/tmp/settings.json",
+        ],
+        vec!["--dangerously-skip-permissions", "--settings"],
+        // Claude Code's `--resume [value]` leaves a next word that starts with `-` to be the
+        // next flag, and these settings load.
+        vec!["--dangerously-skip-permissions", "--resume", &restricting],
+        vec![
+            "--dangerously-skip-permissions",
+            "--resume",
+            "--settings",
+            planned,
+        ],
+    ] {
+        assert_eq!(level_of("claude", &argv(&words), None), None, "{words:?}");
+    }
+    for words in [
+        vec!["--dangerously-skip-permissions", "--resume"],
+        vec!["--resume", "--dangerously-skip-permissions"],
+        vec!["--dangerously-skip-permissions", "--resume=x"],
+    ] {
+        assert_eq!(
+            level_of("claude", &argv(&words), None),
+            Some(Level::Yolo),
+            "{words:?}"
+        );
+    }
+}
+
+/// A RELAUNCH OUT OF BYPASS KEEPS ITS MODE: a `--dangerously-skip-permissions` session cycled
+/// into another mode resumes as `--allow-dangerously-skip-permissions --permission-mode <mode>`
+/// (`relaunch::with_permission_mode`), and that mode is its level; the allow flag alone names
+/// none.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_out_of_bypass_reads_as_its_mode() {
+    let tap = crate::harness::tap::settings_value(Path::new(
+        "/Applications/aterm.app/Contents/MacOS/aterm",
+    ))
+    .expect("an admissible path");
+    let launch = argv(&["--dangerously-skip-permissions", "--resume", "s"]);
+    for (mode, want) in [
+        ("auto", Level::Edits),
+        ("acceptEdits", Level::Edits),
+        ("plan", Level::Plan),
+    ] {
+        let flags = crate::harness::relaunch::with_permission_mode(launch.clone(), Some(mode));
+        let flags = crate::harness::relaunch::with_tap(flags, &tap);
+        assert_eq!(
+            flags.first().map(String::as_str),
+            Some("--allow-dangerously-skip-permissions"),
+            "{flags:?}"
+        );
+        assert_eq!(level_of("claude", &flags, None), Some(want), "{flags:?}");
+    }
+    assert_eq!(
+        level_of(
+            "claude",
+            &argv(&["--allow-dangerously-skip-permissions", "--resume", "s"]),
+            None
+        ),
+        None
+    );
+}
+
 #[test]
 fn an_incomplete_walk_and_an_unresolved_runtime_are_unknown() {
     struct MissingFirst;

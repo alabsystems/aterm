@@ -193,6 +193,7 @@ impl SpecTable {
 
     /// Exact shared-setting consumers in this compiled table, after any Toy Pack overlay.
     #[must_use]
+    #[inline]
     pub fn consumer_capabilities(&self) -> SpecConsumerCapabilities {
         let mut capabilities = SpecConsumerCapabilities::default();
         for id in self.overrides.values() {
@@ -232,6 +233,7 @@ impl SpecTable {
         self.specs.get(usize::from(id))
     }
 
+    #[inline]
     fn intern_spec(&mut self, spec: WordEffectSpec) -> Option<SpecId> {
         if spec == WordEffectSpec::default() {
             return None;
@@ -252,6 +254,7 @@ impl SpecTable {
         }
     }
 
+    #[inline]
     fn insert_custom_with_id(&mut self, word: &str, id: SpecId) {
         if is_no_space_surface(word) {
             // CJK path: the scanner hashes the RAW compound.
@@ -275,6 +278,7 @@ impl SpecTable {
     }
 
     /// Register one custom spec for `word` (all surface-hash variants).
+    #[inline]
     pub fn insert_custom(&mut self, word: &str, spec: WordEffectSpec) {
         let word = word.trim();
         if word.is_empty() {
@@ -287,6 +291,7 @@ impl SpecTable {
     }
 
     /// Overlay another table onto this one.
+    #[inline]
     pub fn overlay(&mut self, other: SpecTable) {
         let mut remap = Vec::with_capacity(other.specs.len());
         let specs = other.specs.as_slice();
@@ -434,58 +439,107 @@ const fn parse_colorway(s: &str) -> Colorway {
     }
 }
 
+#[inline]
+const fn eq_ascii_case(bytes: &[u8], lower: &[u8]) -> bool {
+    if bytes.len() != lower.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].to_ascii_lowercase() != lower[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[inline]
+const fn resolve_burst_kind(raw_kind: &str) -> BurstKind {
+    let kind = crate::cursor_glow::spellings::trim_whitespace_bytes(raw_kind);
+    if eq_ascii_case(kind, b"sparkle") {
+        BurstKind::Sparkle
+    } else if eq_ascii_case(kind, b"nova") {
+        BurstKind::Nova
+    } else if eq_ascii_case(kind, b"supernova")
+        || eq_ascii_case(kind, b"super_nova")
+        || eq_ascii_case(kind, b"super-nova")
+    {
+        BurstKind::SuperNova
+    } else if eq_ascii_case(kind, b"glow") {
+        BurstKind::Glow
+    } else {
+        // "starburst" and anything unknown: the gentlest burst.
+        BurstKind::Starburst
+    }
+}
+
+#[inline]
+const fn resolve_ink(raw: &RawInk) -> InkSpec {
+    let (colorway, sweep_once) = match raw {
+        RawInk::Shorthand(s) => (parse_colorway(s.as_str()), true),
+        RawInk::Table {
+            colorway,
+            sweep_once,
+        } => (
+            parse_colorway(colorway.as_str()),
+            match sweep_once {
+                Some(v) => *v,
+                None => true,
+            },
+        ),
+    };
+    InkSpec {
+        colorway,
+        sweep_once,
+    }
+}
+
+#[inline]
+const fn resolve_burst(raw: &RawBurst) -> BurstSpec {
+    let chance = match raw.chance {
+        Some(c) if c < 100 => c as u8,
+        _ => 100,
+    };
+    BurstSpec {
+        kind: resolve_burst_kind(raw.kind.as_str()),
+        chance_pct: chance,
+    }
+}
+
+#[inline]
+const fn resolve_graphic(_: &RawGraphic) -> GraphicSpec {
+    GraphicSpec {
+        collection: Collection::Cats,
+        dwell_ms: (2200, 3598),
+    }
+}
+
 impl RawCustomEntry {
     /// Resolve the raw entry into a [`WordEffectSpec`] (fail-open decoding); an entry with no axes gives the all-`None` spec, which [`SpecTable::insert_custom`] skips.
     #[must_use]
-    pub fn to_spec(&self) -> WordEffectSpec {
-        let ink = self.ink.as_ref().map(|raw| {
-            let (colorway, sweep_once) = match raw {
-                RawInk::Shorthand(s) => (parse_colorway(s), true),
-                RawInk::Table {
-                    colorway,
-                    sweep_once,
-                } => (parse_colorway(colorway), sweep_once.unwrap_or(true)),
-            };
-            InkSpec {
-                colorway,
-                sweep_once,
-            }
-        });
-        let burst = self.burst.as_ref().map(|raw| {
-            let kind = raw.kind.trim();
-            BurstSpec {
-                kind: if kind.eq_ignore_ascii_case("sparkle") {
-                    BurstKind::Sparkle
-                } else if kind.eq_ignore_ascii_case("nova") {
-                    BurstKind::Nova
-                } else if kind.eq_ignore_ascii_case("supernova")
-                    || kind.eq_ignore_ascii_case("super_nova")
-                    || kind.eq_ignore_ascii_case("super-nova")
-                {
-                    BurstKind::SuperNova
-                } else if kind.eq_ignore_ascii_case("glow") {
-                    BurstKind::Glow
-                } else {
-                    // "starburst" and anything unknown: the gentlest burst.
-                    BurstKind::Starburst
-                },
-                chance_pct: raw.chance.unwrap_or(100).min(100) as u8,
-            }
-        });
-        let graphic = self.graphic.as_ref().map(|_| GraphicSpec {
-            collection: Collection::Cats,
-            dwell_ms: (2200, 3598),
-        });
+    #[inline]
+    pub const fn to_spec(&self) -> WordEffectSpec {
         WordEffectSpec {
-            graphic,
-            ink,
-            burst,
+            graphic: match &self.graphic {
+                Some(g) => Some(resolve_graphic(g)),
+                None => None,
+            },
+            ink: match &self.ink {
+                Some(i) => Some(resolve_ink(i)),
+                None => None,
+            },
+            burst: match &self.burst {
+                Some(b) => Some(resolve_burst(b)),
+                None => None,
+            },
         }
     }
 }
 
 /// Build the [`SpecTable`] and the synthesized emphasis-class lexicon fragment for a set of custom entries.
 #[must_use]
+#[inline]
 pub fn build_custom(entries: &[RawCustomEntry]) -> (SpecTable, String) {
     let mut table = SpecTable::default();
     let mut spaced: Vec<&str> = Vec::new();
@@ -531,6 +585,7 @@ pub fn build_custom(entries: &[RawCustomEntry]) -> (SpecTable, String) {
 /// Append one scanner-ready emphasis entry. Inline customs keep their
 /// control-character-dropping behaviour; strict Toy Packs reject such surfaces
 /// before reaching this.
+#[inline]
 fn push_lexicon_entry(out: &mut String, lang: &str, forms: &[&str], is_cjk: bool) {
     if forms.is_empty() {
         return;
@@ -555,6 +610,7 @@ fn push_lexicon_entry(out: &mut String, lang: &str, forms: &[&str], is_cjk: bool
     out.push_str("]\n");
 }
 
+#[inline]
 fn push_toml_basic_string_body(out: &mut String, value: &str) {
     for c in value.chars() {
         match c {
@@ -567,6 +623,7 @@ fn push_toml_basic_string_body(out: &mut String, value: &str) {
 }
 
 /// Parse the standalone `[[sparkle_words.custom]]` TOML fragment (the web `set_sparkle_custom_specs` payload, the same fragment the native config carries).
+#[inline]
 pub fn parse_custom_toml(fragment: &str) -> Result<Vec<RawCustomEntry>, String> {
     #[derive(serde::Deserialize, Default)]
     #[serde(default)]
@@ -665,6 +722,7 @@ pub struct ToyPackError {
 }
 
 impl ToyPackError {
+    #[inline]
     fn one(message: impl Into<String>) -> Self {
         Self {
             diagnostics: vec![message.into()],
@@ -767,6 +825,7 @@ struct RawToyPackGraphic {
 }
 
 /// Parse and compile one Toy Pack manifest (cold path): source bytes are capped before TOML parsing, every collection, string and timing is validated, and the result is the same O(1) form-hash dispatch table inline customs use.
+#[inline]
 pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackError> {
     if source.len() > MAX_TOY_PACK_BYTES {
         return Err(ToyPackError::one(format!(
@@ -802,8 +861,10 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
     let mut dispatch_hashes = std::collections::BTreeMap::<u64, String>::new();
     let mut scanner_surfaces = Vec::<(String, &str, u64)>::new();
     let mut word_count = 0usize;
-    for toy in &raw.toy {
-        word_count = word_count.saturating_add(toy.words.len());
+    let mut ti = 0;
+    while ti < raw.toy.len() {
+        word_count = word_count.saturating_add(raw.toy[ti].words.len());
+        ti += 1;
     }
     if word_count > MAX_WORDS_PER_PACK {
         diagnostics.push(format!(
@@ -811,7 +872,10 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
         ));
     }
 
-    for (index, toy) in raw.toy.iter().take(MAX_TOYS_PER_PACK).enumerate() {
+    let toy_limit = raw.toy.len().min(MAX_TOYS_PER_PACK);
+    let mut index = 0;
+    while index < toy_limit {
+        let toy = &raw.toy[index];
         let context = format!("toy[{index}] ({:?})", toy.id);
         if !valid_id(&toy.id, MAX_TOY_ID_BYTES, false) {
             diagnostics.push(format!(
@@ -843,8 +907,12 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
         };
         let mut spaced = Vec::new();
         let mut cjk = Vec::new();
-        for (word_index, word) in toy.words.iter().take(MAX_WORDS_PER_TOY).enumerate() {
-            let label = format!("{context}.words[{word_index}]");
+        let word_limit = toy.words.len().min(MAX_WORDS_PER_TOY);
+        let mut word_index = 0;
+        while word_index < word_limit {
+            let word = &toy.words[word_index];
+            word_index += 1;
+            let label = format!("{context}.words[{}]", word_index - 1);
             if !validate_toy_word(word, &label, &mut diagnostics) {
                 continue;
             }
@@ -857,16 +925,19 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
                 hashes[0] = form_hash(word);
                 (key, 1usize)
             } else {
+                const SUFFIXES: [&str; 4] = ["'s", "\u{2019}s", "'", "\u{2019}"];
                 let mut base = fold(word);
                 let base_len = base.len();
                 let mut key = String::with_capacity(5 + base_len);
                 key.push_str("word:");
                 key.push_str(&base);
                 hashes[0] = form_hash(&base);
-                for (i, suffix) in ["'s", "\u{2019}s", "'", "\u{2019}"].into_iter().enumerate() {
+                let mut si = 0;
+                while si < SUFFIXES.len() {
                     base.truncate(base_len);
-                    base.push_str(suffix);
-                    hashes[i + 1] = form_hash(&base);
+                    base.push_str(SUFFIXES[si]);
+                    hashes[si + 1] = form_hash(&base);
+                    si += 1;
                 }
                 (key, 5usize)
             };
@@ -878,20 +949,33 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
                 ));
                 continue;
             }
-            if let Some(previous) = hashes.iter().find_map(|hash| dispatch_hashes.get(hash)) {
+            let mut collided = None;
+            let mut hi = 0;
+            while hi < hashes.len() {
+                if let Some(prev) = dispatch_hashes.get(&hashes[hi]) {
+                    collided = Some(prev);
+                    break;
+                }
+                hi += 1;
+            }
+            if let Some(previous) = collided {
                 diagnostics.push(format!(
                     "{label}: dispatch key collides with {previous} (including possessive variants); dispatch order must not decide behavior"
                 ));
                 continue;
             }
-            for &hash in hashes {
-                dispatch_hashes.insert(hash, label.clone());
+            let mut hi = 0;
+            while hi < hashes.len() {
+                dispatch_hashes.insert(hashes[hi], label.clone());
+                hi += 1;
             }
             if let Some(id) = spec_id
                 && has_override_key
             {
-                for &hash in hashes {
-                    table.overrides.insert(hash, id);
+                let mut hi = 0;
+                while hi < hashes.len() {
+                    table.overrides.insert(hashes[hi], id);
+                    hi += 1;
                 }
             }
             scanner_surfaces.push((label, word.as_str(), hashes[0]));
@@ -903,17 +987,21 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
         }
         push_lexicon_entry(&mut lexicon_toml, &toy.lang, &spaced, false);
         push_lexicon_entry(&mut lexicon_toml, &toy.lang, &cjk, true);
+        index += 1;
     }
 
     if diagnostics.is_empty() {
         match aterm_lexicon::Lexicon::with_languages_and_override(&["all"], Some(&lexicon_toml)) {
             Ok(lexicon) => {
-                diagnostics.extend(
-                    lexicon
-                        .conflicts()
-                        .iter()
-                        .map(|conflict| format!("word surface rejected by scanner: {conflict}")),
-                );
+                let conflicts = lexicon.conflicts();
+                let mut ci = 0;
+                while ci < conflicts.len() {
+                    diagnostics.push(format!(
+                        "word surface rejected by scanner: {}",
+                        conflicts[ci]
+                    ));
+                    ci += 1;
+                }
                 let options = aterm_lexicon::ScanOptions {
                     allow_bare_cat: true,
                     cjk_single_char: true,
@@ -922,7 +1010,10 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
                 let mut scanner_chars = Vec::new();
                 let mut scanner_hits = Vec::new();
                 let mut scanner_scratch = aterm_lexicon::ScanScratch::default();
-                for (label, surface, expected_hash) in scanner_surfaces {
+                let mut si = 0;
+                while si < scanner_surfaces.len() {
+                    let (ref label, surface, expected_hash) = scanner_surfaces[si];
+                    si += 1;
                     lexicon.scan_into_with_scratch(
                         surface,
                         &options,
@@ -931,9 +1022,19 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
                         &mut scanner_scratch,
                     );
                     let expected_end = scanner_chars.len();
-                    let reaches_dispatch = scanner_hits.iter().any(|hit| {
-                        hit.start == 0 && hit.end == expected_end && hit.form_hash == expected_hash
-                    });
+                    let mut reaches_dispatch = false;
+                    let mut hi = 0;
+                    while hi < scanner_hits.len() {
+                        let hit = &scanner_hits[hi];
+                        if hit.start == 0
+                            && hit.end == expected_end
+                            && hit.form_hash == expected_hash
+                        {
+                            reaches_dispatch = true;
+                            break;
+                        }
+                        hi += 1;
+                    }
                     if !reaches_dispatch {
                         diagnostics.push(format!(
                             "{label}: {surface:?} does not produce a whole-surface scanner match"
@@ -966,6 +1067,7 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
     })
 }
 
+#[inline]
 fn validate_pack_metadata(raw: &RawToyPackMetadata, diagnostics: &mut Vec<String>) {
     if !valid_id(&raw.id, MAX_PACK_ID_BYTES, true) {
         diagnostics.push(format!(
@@ -986,20 +1088,19 @@ fn validate_pack_metadata(raw: &RawToyPackMetadata, diagnostics: &mut Vec<String
             raw.authors.len()
         ));
     }
-    for (index, author) in raw.authors.iter().take(MAX_PACK_AUTHORS).enumerate() {
+    let author_limit = raw.authors.len().min(MAX_PACK_AUTHORS);
+    let mut index = 0;
+    while index < author_limit {
         validate_text(
             &format!("pack.authors[{index}]"),
-            author,
+            &raw.authors[index],
             MAX_AUTHOR_BYTES,
             diagnostics,
         );
+        index += 1;
     }
     validate_text("pack.license", &raw.license, MAX_LICENSE_BYTES, diagnostics);
-    if !raw
-        .license
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '+' | '(' | ')' | ' '))
-    {
+    if !valid_spdx_license(&raw.license) {
         diagnostics.push(
             "pack.license: use an ASCII SPDX expression (for example Apache-2.0 or CC0-1.0)"
                 .to_string(),
@@ -1015,6 +1116,21 @@ fn validate_pack_metadata(raw: &RawToyPackMetadata, diagnostics: &mut Vec<String
     }
 }
 
+#[inline]
+const fn valid_spdx_license(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'+' | b'(' | b')' | b' ')) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[inline]
 fn validate_text(label: &str, value: &str, max: usize, diagnostics: &mut Vec<String>) {
     if value.trim().is_empty()
         || value.trim() != value
@@ -1027,6 +1143,7 @@ fn validate_text(label: &str, value: &str, max: usize, diagnostics: &mut Vec<Str
     }
 }
 
+#[inline]
 const fn valid_id(value: &str, max: usize, namespaced: bool) -> bool {
     let bytes = value.as_bytes();
     let len = bytes.len();
@@ -1058,6 +1175,7 @@ const fn valid_id(value: &str, max: usize, namespaced: bool) -> bool {
     !namespaced || has_dot
 }
 
+#[inline]
 const fn valid_lang(value: &str) -> bool {
     let bytes = value.as_bytes();
     let len = bytes.len();
@@ -1087,6 +1205,7 @@ const fn valid_lang(value: &str) -> bool {
     true
 }
 
+#[inline]
 fn validate_toy_word(word: &str, label: &str, diagnostics: &mut Vec<String>) -> bool {
     let mut valid = true;
     if word.is_empty() || word.trim() != word {
@@ -1106,7 +1225,10 @@ fn validate_toy_word(word: &str, label: &str, diagnostics: &mut Vec<String>) -> 
         diagnostics.push(format!("{label}: control characters are not allowed"));
         valid = false;
     }
-    if is_no_space_surface(word) && word.chars().count() == 1 {
+    if is_no_space_surface(word) && {
+        let mut chars = word.chars();
+        chars.next().is_some() && chars.next().is_none()
+    } {
         diagnostics.push(format!(
             "{label}: single-character no-space words require a host scan opt-in; \
              strict packs must use a compound of at least two characters"
@@ -1116,6 +1238,7 @@ fn validate_toy_word(word: &str, label: &str, diagnostics: &mut Vec<String>) -> 
     valid
 }
 
+#[inline]
 fn compile_toy_spec(
     toy: &RawToy,
     context: &str,
@@ -1151,6 +1274,7 @@ fn compile_toy_spec(
     }
 }
 
+#[inline]
 fn compile_toy_ink(raw: &RawToyPackInk, context: &str, diagnostics: &mut Vec<String>) -> InkSpec {
     let label = format!("{context}.ink");
     let colorway = match raw.kind.as_str() {
@@ -1285,6 +1409,7 @@ fn compile_toy_ink(raw: &RawToyPackInk, context: &str, diagnostics: &mut Vec<Str
     }
 }
 
+#[inline]
 fn compile_toy_burst(
     raw: &RawToyPackBurst,
     context: &str,
@@ -1314,6 +1439,7 @@ fn compile_toy_burst(
     }
 }
 
+#[inline]
 fn compile_toy_graphic(
     raw: &RawToyPackGraphic,
     context: &str,
@@ -1338,6 +1464,7 @@ fn compile_toy_graphic(
     }
 }
 
+#[inline]
 fn forbid<T>(
     value: &Option<T>,
     label: &str,
@@ -1351,6 +1478,7 @@ fn forbid<T>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn bounded_f32(
     value: Option<f32>,
     default: f32,
@@ -1373,6 +1501,7 @@ fn bounded_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn bounded_u32(
     value: Option<u32>,
     default: u32,
@@ -1392,6 +1521,7 @@ fn bounded_u32(
     }
 }
 
+#[inline]
 fn strict_pack_hex(value: &str, label: &str, index: usize, diagnostics: &mut Vec<String>) -> u32 {
     if let [b'#', rest @ ..] = value.as_bytes()
         && let Some(val) = parse_hex_6(rest)

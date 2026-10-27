@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use aterm_agent::harness::repo_work::RepoWork;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, DONE_CHECK, RULE_API_RETRY, RULE_CONTINUE, RULE_DONE_CHECK, TurnEndAction,
+    Composer, DONE_CHECK, RULE_API_CUTOFF, RULE_CONTINUE, RULE_DONE_CHECK, TurnEndAction,
     TurnEndReading, TurnEndState, WaitKind, decide_turn_end, done_check_words, is_answer_rule,
     open_work_suffix, own_repo_work_suffix,
 };
@@ -19,6 +19,18 @@ use aterm_phase::wall::WallKind;
 use aterm_spec::derive::Model;
 
 type State = BTreeMap<&'static str, i64>;
+
+/// The wall the model's wall stands for: a reply past its output token maximum, a wall that keeps
+/// its own act (`api-cutoff@v1`, once at once, then on the retry ladder) and its tries; an overload
+/// is an outage, waited out ([`supervise_conformance_outage_wait`](crate::supervise_conformance_outage_wait)).
+const OVERLONG: WallKind = WallKind::ApiError {
+    code: None,
+    retryable: true,
+    cause: aterm_phase::ApiCause::Overlong,
+};
+const OVERLONG_MESSAGE: &str = "API Error: Claude's response exceeded the 32000 output token \
+                                maximum. To configure this behavior, set the \
+                                CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.";
 
 /// Real work, long enough that no turn is short for its length; it runs tools (a tool row on the
 /// screen, which at a wall is what tells work from the program's own retries).
@@ -59,8 +71,8 @@ fn finding() -> RepoWork {
 }
 
 /// An authoritative idle point under Cruise whose turn worked `worked`,
-/// ending on `said` after [`crate::common::earlier`]'s `earlier` — or on a `529 Overloaded`
-/// wall; `over_shell`, the BUSY screen of a turn that ended while a shell it
+/// ending on `said` after [`crate::common::earlier`]'s `earlier` — or on an over-long
+/// reply's wall ([`OVERLONG`]); `over_shell`, the BUSY screen of a turn that ended while a shell it
 /// left runs on; `dirty`, the host's probe finds the session's repository
 /// holds work no remote main has ([`finding`]).
 fn point(
@@ -74,9 +86,9 @@ fn point(
         phase: if over_shell { Phase::Busy } else { Phase::Idle },
         authoritative: true,
         survey: false,
-        wall: walled.then_some(WallKind::Overloaded),
+        wall: walled.then_some(OVERLONG),
         wall_message: if walled {
-            "API Error: 529 Overloaded.".to_string()
+            OVERLONG_MESSAGE.to_string()
         } else {
             String::new()
         },
@@ -164,7 +176,7 @@ fn verdict(a: &TurnEndAction) -> Verdict {
             Verdict::Check
         }
         TurnEndAction::Type { rule_id, .. } if is_answer_rule(rule_id) => Verdict::Answer,
-        TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_API_RETRY => Verdict::WallAct,
+        TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_API_CUTOFF => Verdict::WallAct,
         TurnEndAction::WaitUntil {
             why,
             wait: WaitKind::BackOff { .. },
@@ -553,4 +565,10 @@ fn tier1_the_buggy_model_is_refuted_by_the_real_decider() {
     let (_, real) = walk(&m, &["OtherTurnClaimBg", "BackgroundEnds"], base);
     assert!(!real.st.task_done());
     assert_eq!(verdict(&real.clone().decide()), Verdict::Check);
+}
+
+/// The words this bind hands the decider read as the over-long reply the model's wall stands for.
+#[test]
+fn the_walls_words_read_as_an_over_long_reply() {
+    assert_eq!(aterm_phase::classify_wall(OVERLONG_MESSAGE), Some(OVERLONG));
 }

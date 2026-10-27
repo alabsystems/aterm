@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# The trail at cursor_trail_intensity 0.5.
+
+grid 16 80
+style rainbow kitty
+hz 60
+intensity 0.5
+
+at 0 pty "\e[9;1H$ "
+at 700 key e
+at 702 pty "e"
+at 800 key c
+at 802 pty "c"
+at 900 key h
+at 902 pty "h"
+at 1000 key o
+at 1002 pty "o"
+at 1100 key space
+at 1102 pty " "
+at 1200 key t
+at 1202 pty "t"
+at 1300 key h
+at 1302 pty "h"
+at 1400 key e
+at 1402 pty "e"
+at 1500 key space
+at 1502 pty " "
+at 1600 key b
+at 1602 pty "b"
+at 1700 key a
+at 1702 pty "a"
+at 1800 key n
+at 1802 pty "n"
+at 1900 key d
+at 1902 pty "d"
+at 2000 key space
+at 2002 pty " "
+at 2100 key a
+at 2102 pty "a"
+at 2200 key t
+at 2202 pty "t"
+at 2300 key space
+at 2302 pty " "
+at 2400 key h
+at 2402 pty "h"
+at 2500 key a
+at 2502 pty "a"
+at 2600 key l
+at 2602 pty "l"
+at 2700 key f
+at 2702 pty "f"
+at 2800 key space
+at 2802 pty " "
+at 2900 key i
+at 2902 pty "i"
+at 3000 key n
+at 3002 pty "n"
+at 3100 key t
+at 3102 pty "t"
+at 3200 key e
+at 3202 pty "e"
+at 3300 key n
+at 3302 pty "n"
+at 3400 key s
+at 3402 pty "s"
+at 3500 key i
+at 3502 pty "i"
+at 3600 key t
+at 3602 pty "t"
+at 3700 key y
+at 3702 pty "y"
+run 5300

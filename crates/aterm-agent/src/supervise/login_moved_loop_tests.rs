@@ -521,7 +521,7 @@ fn a_served_turn_that_ends_the_limit_reads_no_profile_after() {
     let (r, _) = decide(&mut s, weekly_wall(), &opts);
     assert!(s.turn_end.waits_on_named_reset());
     let resume = TurnEndAction::Type {
-        text: "keep going".to_string(),
+        text: CLEARED.to_string(),
         rule_id: RULE_LIMIT_RESUME,
     };
     s.turn_end.acted(&resume, &r, Instant::now());

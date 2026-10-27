@@ -75,6 +75,7 @@ fn scan_paired(frames: &[Frame], rows: Vec<StatusRow>) -> ScanReport {
         statuses: Some(rows),
         index: None,
         driven_ms: None,
+        typed_row: None,
     };
     scan_frames(&names, frames.iter().cloned().map(Ok), &ctx).expect("the take scans")
 }
@@ -1462,6 +1463,7 @@ fn recorded_take(band_frames: &[usize]) -> ScanReport {
             ticks: vec![],
         }),
         driven_ms: Some((0, 96)),
+        typed_row: None,
     };
     scan_frames(&names, frames.into_iter().map(Ok), &ctx).expect("scans")
 }
@@ -1502,6 +1504,7 @@ fn a_take_scans_from_png_files_through_the_one_decoder() {
         statuses: None,
         index: None,
         driven_ms: None,
+        typed_row: None,
     };
     let r = scan_dir(dir.path(), &ctx).expect("scans");
     assert_eq!(r.frames, 3);
@@ -1521,6 +1524,7 @@ fn a_take_with_mismatched_rows_or_sizes_is_refused() {
         statuses: Some(vec![StatusRow::new("trail spawns=0")]),
         index: None,
         driven_ms: None,
+        typed_row: None,
     };
     let frames = [frame(4, 4, &[]), frame(4, 4, &[])];
     assert!(matches!(
@@ -1915,5 +1919,319 @@ fn the_composed_fused_take_is_not_charged() {
                 .any(|n| matches!(n, FrameNote::RibbonUnlit { .. })),
             "frame {i}"
         );
+    }
+}
+
+fn springing_pet() -> Fixture {
+    Fixture::load(
+        "springing-pet-2026-10-27",
+        &[
+            "shot_0000",
+            "shot_0001",
+            "shot_0002",
+            "shot_0003",
+            "shot_0004",
+        ],
+    )
+}
+
+/// The fixture's five frames with the spring's hop (2) and descent (3) mid-take, where the strict
+/// floor applies: the isolating frames are 0 and 5-7.
+const SPRING_ORDER: [usize; 8] = [0, 1, 2, 3, 4, 4, 4, 4];
+
+#[test]
+fn the_first_keys_spring_is_located_on_the_mid_take_frames_it_is_claimed_on() {
+    let r = springing_pet().scan(&SPRING_ORDER, str::to_string);
+    assert_eq!(
+        (
+            r.pet_claimed,
+            r.pet_missing,
+            r.companion_frames,
+            r.pet_final_run
+        ),
+        (8, 0, 8, 8)
+    );
+    for (i, pose, shape) in [
+        (2, "pet_hop", Shape::new(273, 28, 17)),
+        (3, "pet_leap_descend", Shape::new(264, 28, 16)),
+    ] {
+        let f = &r.per_frame[i];
+        assert_eq!(f.companion, shape, "frame {i}");
+        assert!(
+            f.notes.contains(&FrameNote::RestingPoseWitness {
+                pose: Some(pose.into())
+            }),
+            "frame {i}: {:?}",
+            f.notes
+        );
+    }
+    assert_eq!(r.per_frame[1].companion, Shape::new(404, 36, 22));
+    assert_eq!(r.per_frame[4].companion, Shape::new(305, 33, 19));
+}
+
+#[test]
+fn the_spring_s_pose_claim_is_load_bearing() {
+    let fx = springing_pet();
+    let tall = fx.scan(&SPRING_ORDER, |row| {
+        row.replace("pet_pose=pet_hop", "pet_pose=pet_sit")
+            .replace("pet_pose=pet_leap_descend", "pet_pose=pet_sit")
+    });
+    assert_eq!(tall.pet_missing, 2);
+    assert_eq!(tall.per_frame[2].companion, Shape::NONE);
+    for pose in [
+        Some("pet_leap_rise"),
+        Some("pet_land"),
+        Some("pet_sit"),
+        None,
+    ] {
+        for (name, frame_no) in [("shot_0002", 2), ("shot_0003", 3)] {
+            assert_eq!(
+                fx.located(name, frame_no, 8, pose, Some(7)),
+                Shape::NONE,
+                "{name} {pose:?}"
+            );
+        }
+    }
+    assert_eq!(
+        fx.located("shot_0002", 2, 8, Some("pet_hop"), None),
+        Shape::NONE
+    );
+}
+
+/// The typed row of the reach tests: row 4 of 7x14 cells on a 210x112 frame, its bottom edge at
+/// y = 70.
+const REACH_ROW: TypedRow = TypedRow {
+    bottom: 70,
+    frame_w: 210,
+    frame_h: 112,
+};
+/// A faint tint of the backdrop: a band's top lays this little light.
+const FAINT: Rgb = [19, 20, 25];
+
+/// A band 20 cells wide (x 20..160) standing `up` px above the row's bottom edge, with its rail
+/// three px under it.
+fn band(up: usize) -> Vec<(usize, usize, Rgb)> {
+    let mut px = block(20, REACH_ROW.bottom - up, 140, up, FAINT);
+    px.extend(block(20, REACH_ROW.bottom, 140, 3, LIT));
+    px
+}
+
+fn reach_of(base: &Frame, colored: &[(usize, usize, Rgb)], exclude: &[PixelBox]) -> Option<usize> {
+    let mut frame = base.clone();
+    for &(x, y, rgb) in colored {
+        frame.paint(x, y, rgb);
+    }
+    dynamic_metrics_over(base, &frame, CELL, exclude, Some(REACH_ROW)).band_reach
+}
+
+fn reach_ground() -> Frame {
+    ground_frame(REACH_ROW.frame_w, REACH_ROW.frame_h, GROUND, &[])
+}
+
+#[test]
+fn the_band_top_is_the_body_s_faint_reach_above_the_typed_row() {
+    let ground = reach_ground();
+    assert_eq!(reach_of(&ground, &band(10), &[]), Some(10));
+    assert_eq!(reach_of(&ground, &band(5), &[]), Some(5), "half the body");
+    assert_eq!(
+        reach_of(&ground, &band(28), &[]),
+        Some(28),
+        "twice the body"
+    );
+    assert_eq!(
+        reach_of(&ground, &band(3 * CELL.h + 4), &[]),
+        Some(3 * CELL.h),
+        "the window ends three cells up"
+    );
+}
+
+#[test]
+fn the_head_s_light_and_a_ragged_top_do_not_raise_the_band() {
+    let ground = reach_ground();
+    let mut head = band(10);
+    head.extend(block(100, 30, 60, 30, LIT));
+    assert_eq!(
+        reach_of(&ground, &head, &[]),
+        Some(10),
+        "the head's light is not the body's"
+    );
+    let mut ragged = band(10);
+    ragged.extend(block(20, 57, 104, 3, FAINT));
+    assert_eq!(
+        reach_of(&ground, &ragged, &[]),
+        Some(10),
+        "rows tinted under three quarters of the band's width are above it"
+    );
+    let mut tall = band(10);
+    tall.extend(block(20, 57, 105, 3, FAINT));
+    assert_eq!(
+        reach_of(&ground, &tall, &[]),
+        Some(13),
+        "three quarters is the band's"
+    );
+    let mut gapped = band(10);
+    gapped.extend(block(20, 40, 140, 10, FAINT));
+    assert_eq!(
+        reach_of(&ground, &gapped, &[]),
+        Some(10),
+        "a wide row above an untinted one is not the band's"
+    );
+}
+
+#[test]
+fn only_paint_on_the_backdrop_outside_the_companion_tints() {
+    let sprite: Vec<(usize, usize, Rgb)> = block(20, 40, 140, 20, [200, 200, 200]);
+    let base = ground_frame(REACH_ROW.frame_w, REACH_ROW.frame_h, GROUND, &sprite);
+    let mut gone = band(10);
+    gone.extend(block(20, 40, 140, 20, GROUND));
+    assert_eq!(
+        reach_of(&base, &gone, &[]),
+        Some(10),
+        "the baseline's own content leaving is not paint"
+    );
+    let ground = reach_ground();
+    let mut coat = band(10);
+    coat.extend(block(20, 30, 140, 30, LIT));
+    assert_eq!(
+        reach_of(&ground, &coat, &[]),
+        Some(40),
+        "unexcluded, the coat reads as body"
+    );
+    assert_eq!(
+        reach_of(&ground, &coat, &[PixelBox::new(20, 30, 159, 59)]),
+        Some(10),
+        "the companion's box is excluded"
+    );
+}
+
+#[test]
+fn a_young_band_or_a_lost_row_reads_nothing_and_a_bare_row_reads_zero() {
+    let ground = reach_ground();
+    let young = block(20, 60, REACH_MIN_CELLS * CELL.w - 1, 13, FAINT);
+    assert_eq!(
+        reach_of(&ground, &young, &[]),
+        None,
+        "narrower than REACH_MIN_CELLS"
+    );
+    let grown = block(20, 60, REACH_MIN_CELLS * CELL.w, 13, FAINT);
+    assert_eq!(reach_of(&ground, &grown, &[]), Some(10));
+    assert_eq!(
+        reach_of(&ground, &block(20, REACH_ROW.bottom, 140, 3, LIT), &[]),
+        Some(0),
+        "a rail with no body over it stands nothing above the row"
+    );
+    let tinted: BTreeSet<usize> = (0..REACH_ROW.frame_w * REACH_ROW.frame_h).collect();
+    let high = TypedRow {
+        bottom: 2 * CELL.h,
+        ..REACH_ROW
+    };
+    assert_eq!(
+        band_top(REACH_ROW.frame_w, &tinted, high, CELL),
+        None,
+        "the window is off the frame"
+    );
+    let low = TypedRow {
+        bottom: REACH_ROW.frame_h,
+        ..REACH_ROW
+    };
+    assert_eq!(
+        band_top(REACH_ROW.frame_w, &tinted, low, CELL),
+        None,
+        "no room under the edge"
+    );
+}
+
+#[test]
+fn a_take_s_reach_is_the_median_of_its_bound_frames() {
+    let ground = reach_ground();
+    let paint = |colored: &[(usize, usize, Rgb)]| {
+        let mut f = ground.clone();
+        for &(x, y, rgb) in colored {
+            f.paint(x, y, rgb);
+        }
+        f
+    };
+    let mut frames = vec![ground.clone(), paint(&band(30))];
+    frames.extend([9, 11, 10, 12, 10].map(|up| paint(&band(up))));
+    frames.extend([paint(&band(30)), paint(&band(31)), paint(&band(32))]);
+    let mut rows = claiming_rows(frames.len(), false, None);
+    rows[1] = StatusRow::new(
+        rows[1]
+            .0
+            .replace("ribbon_hue_bands=8", "ribbon_hue_bands=3"),
+    );
+    let names: Vec<String> = (0..frames.len())
+        .map(|n| format!("shot_{n:04}.png"))
+        .collect();
+    let ctx = TakeContext {
+        cell: CELL,
+        statuses: Some(rows),
+        index: None,
+        driven_ms: None,
+        typed_row: Some(REACH_ROW),
+    };
+    let r = scan_frames(&names, frames.iter().cloned().map(Ok), &ctx).expect("the take scans");
+    assert_eq!(
+        (r.reach_frames, r.reach_px, r.reach_min_px, r.reach_max_px),
+        (5, Some(10), Some(9), Some(12)),
+        "an unclaimed frame and the exhale past the driven window are not measured"
+    );
+    assert_eq!(r.typed_row, Some(REACH_ROW));
+    let wrong = TakeContext {
+        typed_row: Some(TypedRow {
+            frame_w: 211,
+            ..REACH_ROW
+        }),
+        ..ctx
+    };
+    assert!(matches!(
+        scan_frames(&names, frames.into_iter().map(Ok), &wrong),
+        Err(ScanError::TypedRowFrame { .. })
+    ));
+}
+
+/// The typed row of the kept plane takes (cell 7x14; each fixture's PROVENANCE.txt): the shipped
+/// tall body and test builds with its reach halved and doubled.
+const PLANE_TAKE: TypedRow = TypedRow {
+    bottom: 142,
+    frame_w: 584,
+    frame_h: 350,
+};
+
+fn plane_reaches(dir: &str, shots: &[&str]) -> Vec<Option<usize>> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/paint")
+        .join(dir);
+    let load = |n: &str| Frame::load(&root.join(format!("{n}.png"))).expect("fixture frame");
+    let base = load("shot_0000");
+    shots
+        .iter()
+        .map(|n| dynamic_metrics_over(&base, &load(n), CELL, &[], Some(PLANE_TAKE)).band_reach)
+        .collect()
+}
+
+#[test]
+fn kept_plane_takes_read_the_shipped_tall_body_inside_its_bounds_and_the_red_builds_outside() {
+    use crate::measure::paint::Reach;
+    let shipped = plane_reaches(
+        "reach-tall-shipped-2026-10-27",
+        &["shot_0033", "shot_0036", "shot_0037", "shot_0040"],
+    );
+    assert_eq!(shipped, [Some(10), Some(10), Some(11), Some(11)]);
+    let halved = plane_reaches(
+        "reach-tall-halved-2026-10-27",
+        &["shot_0033", "shot_0036", "shot_0039", "shot_0042"],
+    );
+    assert_eq!(halved, [Some(6), Some(6), Some(5), Some(5)]);
+    let doubled = plane_reaches(
+        "reach-tall-doubled-2026-10-27",
+        &["shot_0033", "shot_0036", "shot_0037", "shot_0040"],
+    );
+    assert_eq!(doubled, [Some(22), Some(22), Some(20), Some(20)]);
+    for px in shipped.into_iter().flatten() {
+        assert!(Reach::Tall.holds(px, CELL.h), "shipped {px} px");
+    }
+    for px in halved.into_iter().chain(doubled).flatten() {
+        assert!(!Reach::Tall.holds(px, CELL.h), "red build {px} px");
     }
 }

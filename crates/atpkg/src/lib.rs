@@ -111,6 +111,8 @@ pub(crate) mod openpgp;
 pub mod ops;
 /// `packages.log` beside `aterm.log`.
 pub mod packages_log;
+/// LAN peer units: a toolset archive taken from a LAN peer that holds it, racing the release host.
+pub mod peers;
 /// A waiting pending stub wakes when the package pass replaces a `bin/` shim.
 mod pending_wake;
 pub mod pin;
@@ -142,6 +144,7 @@ pub mod state;
 pub mod status;
 pub mod store;
 pub mod stub;
+pub mod succession;
 pub mod sysroot;
 /// The read-only USTAR/PAX/GNU bundle parser the extractor drives.
 pub mod tarread;

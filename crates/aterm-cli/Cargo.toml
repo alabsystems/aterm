@@ -27,6 +27,9 @@ aterm-types = { workspace = true }
 aterm-theme-pack = { workspace = true }
 # `aterm help rust` calls `atpkg::toolchain` discovery rather than restating it.
 atpkg = { workspace = true }
+# `aterm doctor`'s `services:` row: whether plain targo's cache root sits in a quiet folder
+# (`aterm_tempfile::is_quiet`); the tests' scratch directories too.
+aterm-tempfile = { workspace = true }
 # `aterm help agh`: the manual is generated from agh's verb and exit tables.
 agh = { workspace = true }
 # `aterm doctor`'s rows are converge items (docs/DESIGN-init-system-2026-10-20.md S5);
@@ -44,8 +47,13 @@ aterm-lexicon = { workspace = true }
 aterm-ctl = { path = "../aterm-ctl" }
 # Offline `messages.log` reader for `aterm exceptions` and `aterm doctor`.
 aterm-messages = { workspace = true }
-# `aterm_uds::spawnfd::command` child-process builder.
+# `aterm_uds::spawnfd::command` child-process builder, and the unprivileged read of macOS's
+# own services' footprints (`services`) that `aterm doctor`'s `services:` row reports.
 aterm-uds = { workspace = true }
+# The bar past which a service holds too much memory, the restarts aterm knows, and the byte
+# words the `services:` row prints (`services`, `words::mem`). A pure model crate with no
+# dependencies.
+aterm-vitals = { workspace = true }
 # `aterm.toml` parser for `aterm doctor` and `show-config`.
 aterm-toml = { workspace = true }
 # `aterm help sys` reads THIS machine at the moment of the call (its OS and CPU
@@ -70,13 +78,18 @@ amacs-term = { workspace = true }
 libc = { workspace = true }
 # `aterm_link::fabric::doctor_summary` probe for `aterm doctor`.
 aterm-link = { path = "../aterm-link" }
-
-# The Mac setup doctor's typed, per-key preference backups reuse the machine
-# provisioning library's plist codec.
-[target.'cfg(target_os = "macos")'.dependencies]
+# `aterm help init` reads `aterm init --help`'s page; on a Mac the setup doctor's typed,
+# per-key preference backups also reuse the machine provisioning library's plist codec.
 aterm-machines = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
 aterm-secrets = { workspace = true }
 aterm-digest = { workspace = true }
+# The setup run's ledger stamps each stage's begin with this boot (`kern.bootsessionuuid`):
+# astream's reader, which aterm-durable and aterm-link already link into this binary.
+astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
+# The setup ledger's and kept record's anchors to their model (`aterm-models-setup`).
+aterm-spec-anchor = { workspace = true }
 
 [lints]
 workspace = true
@@ -85,7 +98,6 @@ workspace = true
 # `plain_durable_flushes_in_tests!`: the doctor's journal tests make thousands of
 # durable flushes, which this test binary takes as plain `fsync(2)`s.
 aterm-durable = { workspace = true }
-aterm-tempfile = { workspace = true }
 # The tests' scratch-directory stamp (the workspace's one epoch-clock read).
 aterm-time = { workspace = true }
 # `aterm_spec::host::could_not_run`: a test this host cannot run (as root, no
@@ -93,3 +105,5 @@ aterm-time = { workspace = true }
 # `wait::past_text_busy`: the shim tests exec files they just wrote while sibling
 # test threads fork (Linux's ETXTBSY).
 aterm-spec = { workspace = true }
+# The setup ledger's model, which its conformance test holds the ledger to.
+aterm-models-setup = { workspace = true }

@@ -1,0 +1,15 @@
+reach-tall-shipped-2026-10-27 — five frames of one kept `plane` paint take, VERBATIM.
+
+Binary:   a release aterm of origin/main 21e989291d (the shipped tall body), built with
+          `targo --unverified build -p aterm --release` and run from its build path,
+          sha256 6d869f9f5ec2eb26e8dfa6c11cac849edff1f73953f19fb41c89111ee22aebfa.
+Take:     benches/paint.rs row the_tall_body_stands_within_its_reach_above_the_typed_row
+          (scene plane, style flying, image burst, unpinned and focused), ATERM_PAINT_KEEP=1,
+          scratch /tmp/atpaint-84711_29070b940b4cf5df_1, 2026-10-27, cell 7x14, 67 frames,
+          typed row bottom edge y=142, frame 584x350 (take.txt).
+Probe:    PAINT scene=plane style=flying ... reach=tall reach_frames=35 reach_px=11
+          reach_min_px=10 reach_max_px=12 reach_bounds_pct=55:100 cell_h=14 ... verdict=Pass
+          (an earlier revision of the measure, skipping bands under 12 cells, not 18).
+Frames:   shot_0000 (the differencing baseline), shot_0033, shot_0036, shot_0037, shot_0040
+          (bound frames before the flying cat arrives at shot_0041).
+Measured: band_top over each is 10, 10, 11 and 11 px above y=142 (0.71 to 0.79 of a cell).

@@ -2914,6 +2914,7 @@ fn transact_writes_a_changed_lease_and_skips_while_another_holds_the_lock() {
 
 fn hog(path: &str, gib: u64, serves: Option<&str>) -> Hog {
     Hog {
+        built_s_ago: None,
         path: PathBuf::from(path),
         bytes: gib * GIB,
         bytes_partial: false,

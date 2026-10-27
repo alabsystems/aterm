@@ -21,9 +21,6 @@ pub const ECHO: &str = "GONE-42";
 /// Message logged by `aterm-gui` when its display connection ends.
 pub const SAID: &str = "display connection ended";
 
-/// Message logged when a wgpu scoped surface configure catches a rejection.
-pub const SCOPED: &str = "configure was rejected";
-
 /// Rust's exit status for a panic that unwound out of `main`.
 const PANIC_EXIT: i32 = 101;
 
@@ -103,21 +100,14 @@ pub struct Evidence {
     pub unread: Option<String>,
 }
 
-/// Returns whether the row requires [`SCOPED`] in stderr.
-#[must_use]
-pub fn scope_held(wgpu_oracle: bool, display: Display, end: End) -> bool {
-    wgpu_oracle && end == End::MidResize && display.protocol() == "Wayland"
-}
-
 /// Evaluates `e` for a run ending with `end`.
 ///
 /// # Errors
 /// aterm-gui did not exit, panicked or was killed; for a dead display, it
-/// exited 0, never said why, or (`scoped`) never reached the scoped
-/// configure; for a person's quit, it exited nonzero or said its display
+/// exited 0 or never said why; for a person's quit, it exited nonzero or said its display
 /// connection ended; either way, it left no saved layout naming the folder,
 /// or left a crash journal.
-pub fn judge(e: &Evidence, end: End, scoped: bool) -> Result<String, String> {
+pub fn judge(e: &Evidence, end: End) -> Result<String, String> {
     let Some(status) = e.status.as_deref().map(str::trim) else {
         return Err(format!(
             "aterm-gui was still running a minute after {}",
@@ -163,20 +153,7 @@ pub fn judge(e: &Evidence, end: End, scoped: bool) -> Result<String, String> {
                 crate::util::one_line(&tail(&e.stderr, 3), 300)
             ));
         };
-        let said = format!("\"{}\"", crate::util::one_line(said.trim(), 200));
-        if !scoped {
-            said
-        } else if let Some(caught) = e.stderr.lines().find(|l| l.contains(SCOPED)) {
-            format!(
-                "{said} after \"{}\"",
-                crate::util::one_line(caught.trim(), 200)
-            )
-        } else {
-            return Err(format!(
-                "the resize never reached the scoped surface configure: no line says a \
-                 configure was rejected ({SCOPED:?}), so this row did not test the scope"
-            ));
-        }
+        format!("\"{}\"", crate::util::one_line(said.trim(), 200))
     };
     let Some(session) = e.session.as_deref() else {
         return Err(format!(
@@ -217,10 +194,8 @@ pub(crate) fn drive(
     gui: &Gui<'_>,
     display: Display,
     end: End,
-    wgpu_oracle: bool,
     results: &Path,
 ) -> (Verdict, String) {
-    let scoped = scope_held(wgpu_oracle, display, end);
     if let Err(e) = gui.prepare() {
         return (Verdict::NotRun, format!("scratch world: {e}"));
     }
@@ -245,7 +220,7 @@ pub(crate) fn drive(
     }
     let result = run(gui, display, end, &folder, &stderr, &status);
     gui.stop();
-    let why = match result.and_then(|evidence| judge(&evidence, end, scoped)) {
+    let why = match result.and_then(|evidence| judge(&evidence, end)) {
         Ok(detail) => return (Verdict::Pass, detail),
         Err(why) => why,
     };
@@ -399,10 +374,10 @@ mod tests {
     #[test]
     fn an_orderly_end_passes() {
         for end in [End::AtRest, End::MidResize, End::MidCapture] {
-            let detail = judge(&orderly(), end, false).expect("passes");
+            let detail = judge(&orderly(), end).expect("passes");
             assert!(detail.starts_with("exit 69;"), "{detail}");
         }
-        let detail = judge(&quit(), End::Quit, false).expect("passes");
+        let detail = judge(&quit(), End::Quit).expect("passes");
         assert!(detail.starts_with("exit 0;"), "{detail}");
     }
 
@@ -410,7 +385,7 @@ mod tests {
     /// end can fall short of orderly, fail.
     #[test]
     fn a_panic_a_kill_a_silent_or_unsaved_end_fails() {
-        let judge = |e: &Evidence| judge(e, End::AtRest, false);
+        let judge = |e: &Evidence| judge(e, End::AtRest);
         let panicked = Evidence {
             status: Some("101".into()),
             stderr: "thread 'main' panicked at wgpu-29.0.3/src/backend/wgpu_core.rs:\n\
@@ -477,7 +452,7 @@ mod tests {
     /// exited with any other error, or lost the layout fails.
     #[test]
     fn a_quit_that_is_not_the_persons_fails() {
-        let judge = |e: &Evidence| judge(e, End::Quit, false);
+        let judge = |e: &Evidence| judge(e, End::Quit);
         let as_logout = Evidence {
             stderr: "aterm-gui: the display connection ended (os error at x11/mod.rs:350: X \
                      error: BadWindow); quitting as a logout would, exit status 69\n"
@@ -507,34 +482,6 @@ mod tests {
         assert!(judge(&hung).unwrap_err().contains("person's quit"));
     }
 
-    /// Under the wgpu oracle weston's mid-resize death passes only once the
-    /// resize reached the scoped configure and its rejection was said; the
-    /// rows at rest, X11's and the GL arm's ask nothing of it.
-    #[test]
-    fn the_oracle_s_mid_resize_row_needs_the_scoped_configure() {
-        assert!(scope_held(true, Display::Weston, End::MidResize));
-        assert!(scope_held(true, Display::Mutter, End::MidResize));
-        assert!(!scope_held(true, Display::Xvfb, End::MidResize));
-        assert!(!scope_held(true, Display::Weston, End::AtRest));
-        assert!(!scope_held(true, Display::Weston, End::Quit));
-        assert!(!scope_held(false, Display::Weston, End::MidResize));
-        let missed = judge(&orderly(), End::MidResize, true).unwrap_err();
-        assert!(missed.contains("never reached the scoped"), "{missed}");
-        let caught = Evidence {
-            stderr: format!(
-                "aterm-gui: GPU device lost (the resize configure was rejected: Validation \
-                 Error In Surface::configure Surface does not support the adapter's queue \
-                 family) — downgrading to the CPU renderer so windows keep rendering\n{}",
-                orderly().stderr
-            ),
-            ..orderly()
-        };
-        let detail = judge(&caught, End::MidResize, true).expect("passes");
-        assert!(detail.contains("downgrading"), "{detail}");
-        assert!(judge(&orderly(), End::MidResize, false).is_ok());
-        assert!(judge(&orderly(), End::AtRest, false).is_ok());
-    }
-
     /// The capture's row is X11's alone: a Wayland client asks the
     /// compositor nothing for its position.
     #[test]
@@ -551,7 +498,7 @@ mod tests {
             unread: Some("24 bytes".into()),
             ..orderly()
         };
-        let detail = judge(&held, End::MidCapture, false).expect("passes");
+        let detail = judge(&held, End::MidCapture).expect("passes");
         assert!(
             detail.ends_with("the server held 24 bytes unread at its kill"),
             "{detail}"
@@ -566,7 +513,7 @@ mod tests {
             ..held
         };
         assert!(
-            judge(&panicked, End::MidCapture, false)
+            judge(&panicked, End::MidCapture)
                 .unwrap_err()
                 .contains("panicked")
         );

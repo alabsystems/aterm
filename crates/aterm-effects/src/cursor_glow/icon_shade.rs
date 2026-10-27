@@ -60,6 +60,7 @@ impl CursorGlow {
     /// The word pass's icons, its under-text sprites in grid pixels: the
     /// next frame's keep-out ([`Self::note_word_icons`]), each its visible
     /// box, and this frame's shade, which cuts each by its art's drawn rows.
+    #[inline]
     pub fn note_word_icon_sprites<'a>(
         &mut self,
         sprites: impl IntoIterator<Item = &'a FreeSprite>,
@@ -142,6 +143,7 @@ impl CursorGlow {
     /// are cut in place: the rows an icon reaches as the quads they stand
     /// for would be, the rest kept as ramps. Each word pass's icons shade
     /// once. Returns whether anything was lifted.
+    #[inline]
     pub fn shade_word_icons(
         &mut self,
         (over, under, halos, patches): (
@@ -210,6 +212,7 @@ impl CursorGlow {
 /// pixels, `origin` the grid's in the window), light by light: a light goes
 /// when it lies in the star's box and is one the star painted
 /// ([`rk::stardust::SkyMark::lights`]). Returns whether any went.
+#[inline]
 fn lift_stars(
     (marks, keys): (&[rk::stardust::SkyMark], &[u64]),
     icons: &[PxBox],
@@ -218,10 +221,6 @@ fn lift_stars(
 ) -> bool {
     if marks.is_empty() || icons.is_empty() {
         return false;
-    }
-    #[inline]
-    const fn inside(b: PxBox, rect: PxBox) -> bool {
-        b.0 >= rect.0 && b.1 <= rect.1 && b.2 >= rect.2 && b.3 <= rect.3
     }
     let mut lifted = false;
     let mut mi = 0;
@@ -250,25 +249,54 @@ fn lift_stars(
             continue;
         }
         let rect = mark.rect;
-        let star_quad = |q: &GlowQuad| {
-            inside(quad_box(q), rect) && own.contains(&rk::stardust::sky_quad_key(q))
-        };
         let (nq, nu, nh) = (over.0.len(), under.0.len(), halos.len());
         // A star's lights are quads of their own, never a ramp's rows.
         if nq > 0 {
-            over.1.retain_quads(over.0, |q| !star_quad(q));
+            over.1.retain_quads(over.0, |q| !is_star_quad(q, rect, own));
         }
         if nu > 0 {
-            under.1.retain_quads(under.0, |q| !star_quad(q));
+            under
+                .1
+                .retain_quads(under.0, |q| !is_star_quad(q, rect, own));
         }
         if nh > 0 {
-            halos.retain(|h| {
-                !(inside(halo_box(h), rect) && own.contains(&rk::stardust::sky_halo_key(h)))
-            });
+            halos.retain(|h| !is_star_halo(h, rect, own));
         }
         lifted |= over.0.len() != nq || under.0.len() != nu || halos.len() != nh;
     }
     lifted
+}
+
+#[inline]
+const fn has_light_key(own: &[u64], key: u64) -> bool {
+    let mut i = 0;
+    while i < own.len() {
+        if own[i] == key {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[inline]
+const fn is_star_quad(q: &GlowQuad, rect: PxBox, own: &[u64]) -> bool {
+    let b = quad_box(q);
+    b.0 >= rect.0
+        && b.1 <= rect.1
+        && b.2 >= rect.2
+        && b.3 <= rect.3
+        && has_light_key(own, rk::stardust::sky_quad_key(q))
+}
+
+#[inline]
+const fn is_star_halo(h: &RainHalo, rect: PxBox, own: &[u64]) -> bool {
+    let b = halo_box(h);
+    b.0 >= rect.0
+        && b.1 <= rect.1
+        && b.2 >= rect.2
+        && b.3 <= rect.3
+        && has_light_key(own, rk::stardust::sky_halo_key(h))
 }
 
 #[inline]
@@ -308,12 +336,14 @@ const fn stamp_texel(l: i32, art: i32, dest: i32, flip: bool) -> i32 {
 /// [`ICON_ALPHA_EDGE`] opaque (an Index8 texel: any ink), each pixel's the
 /// texel the stamp shows there ([`stamp_texel`] over the whole art's box,
 /// `origin` the grid's in the window). With no art, the box.
+#[inline]
 fn drawn_rows(icon: PxBox, src: Option<&IconSrc>, origin: (i32, i32), out: &mut Vec<PxBox>) {
     drawn_rows_by(icon, src, origin, out, (stamp_texel, ICON_ALPHA_EDGE));
 }
 
 /// [`drawn_rows`], each pixel's texel read by `texel` and counted drawn
 /// from `edge` alpha up.
+#[inline]
 fn drawn_rows_by(
     icon: PxBox,
     src: Option<&IconSrc>,
@@ -335,6 +365,7 @@ fn drawn_rows_by(
     );
 }
 
+#[inline]
 fn drawn_rows_ref(
     icon: PxBox,
     src: Option<(&FxArt, PxBox, bool)>,
@@ -423,6 +454,7 @@ fn drawn_rows_ref(
 /// a chin's sloping edge (texels a quarter to a half opaque, five pixels
 /// past the row's opaque span) lay outside the veil and lit specks between
 /// the letters (looks7 round 2). An empty art yields `clip` whole.
+#[inline]
 pub(super) fn sprite_rows(
     sprite: &FreeSprite,
     clip: PxBox,
@@ -443,6 +475,7 @@ pub(super) fn sprite_rows(
 /// The pieces of `rect` outside `bands` (top to bottom, disjoint rows) into
 /// `out`, or `false` (and `out` untouched) when no band reaches it: in a
 /// band's rows the parts left and right of its span, elsewhere whole slices.
+#[inline]
 fn cut_rect(rect: PxBox, bands: &[PxBox], out: &mut Vec<PxBox>) -> bool {
     let (x0, x1, y0, y1) = rect;
     if x0 >= x1

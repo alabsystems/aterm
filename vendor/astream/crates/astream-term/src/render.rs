@@ -61,12 +61,26 @@ pub fn rasterize(screen: &Screen) -> Image {
     for r in 0..rows {
         for c in 0..cols {
             let cell = screen.cell(r, c).copied().unwrap_or(Cell::BLANK);
-            let mut fg = color_rgb(cell.fg, [192, 192, 192]); // default fg: light grey
-            let mut bg = color_rgb(cell.bg, [0, 0, 0]); // default bg: black
+            let mut fg = match cell.fg_rgb {
+                Some((r8, g8, b8)) => [r8, g8, b8],
+                None => color_rgb(cell.fg, [192, 192, 192]), // default fg: light grey
+            };
+            let mut bg = match cell.bg_rgb {
+                Some((r8, g8, b8)) => [r8, g8, b8],
+                None => color_rgb(cell.bg, [0, 0, 0]), // default bg: black
+            };
             if cell.attrs & attr::REVERSE != 0 {
                 std::mem::swap(&mut fg, &mut bg);
             }
-            let inked = cell.ch != ' ';
+            let inked = if cell.width == 0 && c > 0 {
+                let lead = screen
+                    .cell(r, c.saturating_sub(1))
+                    .copied()
+                    .unwrap_or(Cell::BLANK);
+                lead.ch != ' ' || lead.combining_len != 0
+            } else {
+                cell.ch != ' ' || cell.combining_len != 0
+            };
             let px = if inked { fg } else { bg };
             rgb.extend_from_slice(&px);
         }

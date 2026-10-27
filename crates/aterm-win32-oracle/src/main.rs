@@ -37,8 +37,9 @@ gen writes crates/aterm-win32, crates/aterm-windows-sys's feature list and the w
 conformance and recorder crates from the pinned registry source and Cargo's consumer/feature
 graph; check regenerates into scratch and reports DRIFT, never writing; record rewrites
 win32-oracle/recorded.json from the host's answers, then runs gen; oracle compiles the
-conformance crate (the closure against windows-sys 0.61.2, the hand-written COM and DXGI
-against windows 0.62.2), compares the facade's import tables with upstream's and requires
+conformance crate (the closure against windows-sys 0.61.2, the hand-written COM, DXGI,
+Direct3D 11, DirectComposition and UI Automation against windows 0.62.2), compares the
+facade's import tables with upstream's and requires
 every planted fault to be caught, on both Windows triples; oracle-052 holds
 crates/aterm-windows-sys-052 to registry windows-sys 0.52.0. The reference workspaces have no
 [patch] table. The driver, graph and host recorder use Trust; oracle and oracle-052 are a STOCK
@@ -101,9 +102,6 @@ fn find_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 fn upstream() -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("WINDOWS_SYS_SRC") {
-        return Ok(p.into());
-    }
     let home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
@@ -126,29 +124,53 @@ fn upstream() -> Result<PathBuf> {
         .next()
         .ok_or("no cached windows-sys 0.61.2; use --upstream".into())
 }
-/// Populate `$CARGO_HOME/registry/src/…/windows-sys-0.61.2` via `win32-oracle/Cargo.toml`.
-fn fetch_reference(root: &Path) -> Result<()> {
-    let manifest = root.join("win32-oracle/Cargo.toml");
+/// The reference workspace whose lock pins windows-sys 0.61.2.
+const REFERENCE: &str = "win32-oracle/Cargo.toml";
+/// Make the locked graph of the reference workspace at `rel` (from `root`)
+/// answer offline, as the [`oracle::FROZEN`] builds need: `targo fetch
+/// --locked` it only when an offline resolution fails. An unpacked source is
+/// no proof, since a cache prune (aterm's own disk pass counts
+/// `~/.cargo/registry` as downloadable again) can take the index entries and
+/// keep `registry/src`. A failed fetch's error leads with cargo's own `error`
+/// line, the one line of it `verify cells` reports.
+fn answerable(root: &Path, rel: &str) -> Result<()> {
+    let manifest = root.join(rel);
     let manifest = manifest.to_str().ok_or("checkout path is not UTF-8")?;
+    let targo = which("targo")?;
+    let probe = [
+        "metadata",
+        "--format-version",
+        "1",
+        "--locked",
+        "--offline",
+        "--manifest-path",
+        manifest,
+    ];
+    if run(&targo, &probe, root, None).is_ok() {
+        return Ok(());
+    }
     run(
-        &which("targo")?,
+        &targo,
         &["fetch", "--locked", "--manifest-path", manifest],
         root,
         None,
     )
     .map(drop)
-}
-/// Locate `rustup` on `PATH`, `$CARGO_HOME/bin`, or `~/.cargo/bin`.
-fn rustup() -> Result<PathBuf> {
-    which("rustup").or_else(|missing| {
-        std::env::var_os("CARGO_HOME")
-            .map(PathBuf::from)
-            .into_iter()
-            .chain(std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
-            .map(|home| home.join("bin/rustup"))
-            .find(|p| p.is_file())
-            .ok_or(missing)
+    .map_err(|fetch| {
+        let cause = fetch
+            .lines()
+            .find(|l| l.starts_with("error"))
+            .unwrap_or("cargo printed no error line");
+        format!(
+            "{rel} does not resolve offline, and `targo fetch --locked` failed: {cause}\n{fetch}"
+        )
     })
+}
+/// The rustup the `rustup` row of `aterm_uds::host::TOOLS` resolves.
+fn rustup() -> Result<PathBuf> {
+    aterm_uds::host::tool("rustup")
+        .locate()
+        .map_err(|absent| absent.to_string())
 }
 fn tools(root: &Path, stock: Option<&str>) -> Result<Tools> {
     for name in [
@@ -515,17 +537,25 @@ fn start() -> Result<u8> {
         .map_err(|e| e.to_string())?;
     let target = target.or_else(|| std::env::var_os("ORACLE_TARGET_DIR").map(PathBuf::from));
     if verb == "oracle-052" {
+        answerable(&root, &format!("{}/Cargo.toml", facade052::WORKSPACE))?;
         let tools = tools(&root, Some(stock.as_str()))?;
         let target =
             target.unwrap_or_else(|| root.join(facade052::WORKSPACE).join("target.noindex"));
         return facade052::gate(&root, &tools, &target);
+    }
+    let up = up.or_else(|| std::env::var_os("WINDOWS_SYS_SRC").map(PathBuf::from));
+    // oracle and record build win32-oracle/ frozen. gen and check only read
+    // the registry copy its lock pins, so they resolve it only when none is
+    // unpacked, and run offline from one a prune left.
+    if verb == "oracle" || verb == "record" {
+        answerable(&root, REFERENCE)?;
     }
     let up = match up {
         Some(p) => p,
         None => match upstream() {
             Ok(p) => p,
             Err(_) => {
-                fetch_reference(&root)?;
+                answerable(&root, REFERENCE)?;
                 upstream()?
             }
         },

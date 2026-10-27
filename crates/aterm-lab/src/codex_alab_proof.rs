@@ -139,7 +139,7 @@ struct Opening {
 /// The legs whose scenes `autopilot-captures` shows ([`Proof::open_leg`]): `land` (landing, then
 /// its nudges), `reland` (a clean defense: landed), `off` (Autopilot Off on its first turn),
 /// `needs` (a `NEEDS YOU:` need) and `continue` (Cruise). The model answers each by its name
-/// ([`model::answer`]).
+/// ([`model::answerer`]).
 const OPENINGS: [(&str, Opening); 5] = [
     (
         "land",
@@ -3447,7 +3447,8 @@ fn start(
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let log = Arc::clone(&api_log);
-        std::thread::spawn(move || codex_rig::serve(listener, log, Arc::new(model::answer)));
+        let answer = model::answerer();
+        std::thread::spawn(move || codex_rig::serve(listener, log, answer));
         std::fs::write(
             s.join("zdot/.zshrc"),
             format!(

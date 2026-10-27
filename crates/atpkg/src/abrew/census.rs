@@ -34,7 +34,7 @@ impl Tally {
         let alone = usize::from(refusals.len() == 1);
         let reasons: BTreeSet<String> = refusals
             .into_iter()
-            .map(|(InstallError::Failed(why) | InstallError::Unsupported(why))| masked(&why, name))
+            .map(|e| masked(&e.message(), name))
             .collect();
         for why in reasons {
             let (all, sole) = self.refusals.entry(why).or_default();

@@ -16,6 +16,7 @@ mod builder;
 mod callback_setters;
 mod callbacks;
 mod checkpoint;
+mod checkpoint_canon;
 mod checkpoint_holder;
 mod checkpoint_output;
 #[cfg(feature = "serde")]
@@ -51,10 +52,12 @@ mod holder_fence;
 /// Tier-1 conformance of the holder fence to `HolderFence`.
 #[cfg(test)]
 mod holder_fence_conformance;
+mod host_journal;
 pub(crate) mod host_traits;
 pub(crate) mod hyperlink_auth;
 mod image_reflow;
 mod keyboard_mode;
+mod kitty_auth;
 mod kitty_floating;
 /// Kitty graphics protocol (APC `G`) command parser.
 pub mod kitty_graphics;
@@ -64,6 +67,7 @@ mod mode_mirror;
 pub mod mouse;
 #[cfg(not(test))]
 mod mouse;
+mod notify_auth;
 mod observe;
 mod policy_bridge;
 mod policy_gates;
@@ -121,7 +125,7 @@ pub use alt_archive::{
     AltArchiveCarry, AltArchiveDiffer, AltArchiveFence, AltArchiveGap, AltArchiveGapKind,
     AltArchiveImport, AltArchiveQuery, AltArchiveRead, alt_archive_row_charge,
 };
-pub use aterm_parser::{CarryRefusal, ParserCarry};
+pub use aterm_parser::{CarryRefusal, HookedDcsCarry, ParserCarry};
 pub use aterm_types::XtermKeyboardState;
 pub(crate) use aterm_types::charset::CharacterSetState;
 pub use aterm_types::{ColorPalette, Rgb};
@@ -133,7 +137,12 @@ pub use builder::{TIERED_RING_CAP_DEFAULT, TerminalBuilder};
 #[cfg(feature = "serde")]
 pub use checkpoint::{CHECKPOINT_META_REQUIRED_KEYS, CheckpointMeta};
 pub use checkpoint::{
-    GridCursorRepr, ShellIntegrationNonce, ShellIntegrationPosture, StyleRepr, TerminalCheckpoint,
+    DcsQueryCarry, DcsQueryKind, GridCursorRepr, PaneStepCarry, ReplayCarry, ShellIntegrationNonce,
+    ShellIntegrationPosture, StyleRepr, TerminalCheckpoint,
+};
+pub use checkpoint_canon::{
+    CHECKPOINT_CANON_VERSION, CONFIG_CANON_VERSION, CanonFault, PANE_CARRY_CANON_VERSION,
+    POLICY_CANON_VERSION, are_canonical_hyperlink_schemes, policy_canonical, policy_from_canonical,
 };
 pub use checkpoint_holder::{
     HolderAnchorRepr, HolderMarkRepr, HolderRepr, HolderSealRepr, HolderSpanRepr,
@@ -154,6 +163,7 @@ pub use frame_watchers::FrameWatchers;
 pub use holder_fence::{
     CutKind, HolderAdoption, HolderCut, HolderFence, HolderView, MAX_HOLDER_MARKS, MAX_HOLDER_SPANS,
 };
+pub use host_journal::{HOST_JOURNAL_CAP, HostOp, HostReport};
 pub use mode_mirror::ModeMirror;
 pub use observe::{
     FRAME_HANG, Frame, GONE_SETTLE, RowMatch, RowRange, RowVerdict, Satisfaction, SurfaceSource,

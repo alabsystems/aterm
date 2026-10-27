@@ -190,7 +190,12 @@ impl Rig {
                 let mut session = crate::stub_session(self.id);
                 Arc::get_mut(&mut session.ctx).expect("one ctx").witness =
                     Arc::clone(&link.witness);
-                wire_spare_taint(&session.term, &link);
+                wire_spare_taint(
+                    &session.term,
+                    &link,
+                    crate::spawn::HostReach::Platform,
+                    false,
+                );
                 self.app.on_spare_spawned(SpareSpawned {
                     id: self.id,
                     session: Ok(session),

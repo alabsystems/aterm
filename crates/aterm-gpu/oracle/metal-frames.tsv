@@ -1,0 +1,148 @@
+# The macOS renderer's frames, drawn by wgpu 29.0.3's Metal backend (the
+# `wgpu-oracle` build's arm, the differential the first-party Metal arm was
+# held to until GW.6; docs/AUDIT-third-party-2026-10-15.md) on this Mac's
+# GPU, with the system's monospace face and Apple Color Emoji, on macOS
+# 27.0.1 (26A434), before wgpu left the workspace (recorded on the
+# devendor/gw6 branch, 2026-10-26). One block per architecture and adapter.
+# The first 102 rows are the readbacks, presents and window layer; the
+# video take, the EDR presents, the blit rows and the crown rows were added
+# from wgpu the same day (devendor/gw6-rec): `edr/*` is wgpu's EDR present,
+# which Metal's production present into an `Rgba16Float` drawable must
+# equal, and `blit/*` and `crown/*` are wgpu's present blit and crown rows,
+# which the Metal rows run standalone (`metal::blit`) must equal. Every row
+# was drawn by wgpu; a stated re-record names the rows it redrew and their
+# drawer here. src/frame_record_tests.rs compares these rows as a signal on
+# the adapter they name (its `frame-record` lines are these rows, and
+# `frame-record: moved:` names a frame drawn otherwise); since
+# ORACLE-ADAPTER (2026-10-26) the verdict is each frame's CPU twin, decided
+# on any adapter, and a moved row fails nothing. Columns: arch, adapter, frame, WxH, SHA-256 of the bytes
+# (RGBA8 for a readback, present, layer or take; the destination's texels
+# for a blit or crown row; each half-float as an f32, little-endian, for an
+# EDR present).
+aarch64	Apple M4 Pro	text_cursor/readback/0	264x126	4641f159cb6d1ca8134e431ff29a221881d9e2c819f6f9ddac01053eabb44e0e
+aarch64	Apple M4 Pro	text_cursor/readback/1	264x126	4641f159cb6d1ca8134e431ff29a221881d9e2c819f6f9ddac01053eabb44e0e
+aarch64	Apple M4 Pro	text_cursor/readback/2	264x126	4641f159cb6d1ca8134e431ff29a221881d9e2c819f6f9ddac01053eabb44e0e
+aarch64	Apple M4 Pro	colour_emoji/readback/0	264x126	87dcbc45b4208cb7e1e875a504bd4f72f86c562223edabfd2e69eb9a3fd29ee9
+aarch64	Apple M4 Pro	colour_emoji/readback/1	264x126	87dcbc45b4208cb7e1e875a504bd4f72f86c562223edabfd2e69eb9a3fd29ee9
+aarch64	Apple M4 Pro	colour_emoji/readback/2	264x126	87dcbc45b4208cb7e1e875a504bd4f72f86c562223edabfd2e69eb9a3fd29ee9
+aarch64	Apple M4 Pro	wallpaper/readback/0	264x126	6aae56be1f1e58cfcce02b7753de7c32316d24d517412b5dd57ac8b54e13ddcf
+aarch64	Apple M4 Pro	wallpaper/readback/1	264x126	6aae56be1f1e58cfcce02b7753de7c32316d24d517412b5dd57ac8b54e13ddcf
+aarch64	Apple M4 Pro	wallpaper/readback/2	264x126	6aae56be1f1e58cfcce02b7753de7c32316d24d517412b5dd57ac8b54e13ddcf
+aarch64	Apple M4 Pro	glow_halo/readback/0	264x126	e0bdcaf64a9bb34ff99e2c25956080934e9db6de7c60ef44dd899ec6a9b83cd7
+aarch64	Apple M4 Pro	glow_halo/readback/1	264x126	e0bdcaf64a9bb34ff99e2c25956080934e9db6de7c60ef44dd899ec6a9b83cd7
+aarch64	Apple M4 Pro	glow_halo/readback/2	264x126	e0bdcaf64a9bb34ff99e2c25956080934e9db6de7c60ef44dd899ec6a9b83cd7
+aarch64	Apple M4 Pro	rain/readback/0	264x126	7370a16b364addee2d793e24c6f78ec9736bb6f109697b9ef441b427ff173b26
+aarch64	Apple M4 Pro	rain/readback/1	264x126	7370a16b364addee2d793e24c6f78ec9736bb6f109697b9ef441b427ff173b26
+aarch64	Apple M4 Pro	rain/readback/2	264x126	7370a16b364addee2d793e24c6f78ec9736bb6f109697b9ef441b427ff173b26
+aarch64	Apple M4 Pro	fire/readback/0	264x126	678b10d8d7ff7c92bfd330d93b54fa48bb5a41e8170bacd26f288d9c833cf1c8
+aarch64	Apple M4 Pro	fire/readback/1	264x126	678b10d8d7ff7c92bfd330d93b54fa48bb5a41e8170bacd26f288d9c833cf1c8
+aarch64	Apple M4 Pro	fire/readback/2	264x126	678b10d8d7ff7c92bfd330d93b54fa48bb5a41e8170bacd26f288d9c833cf1c8
+aarch64	Apple M4 Pro	sprites/readback/0	264x126	4a1fe24ef437789b5fd0ec868ec920138bcf635f5e1bb0086e62c85d86cb7144
+aarch64	Apple M4 Pro	sprites/readback/1	264x126	4a1fe24ef437789b5fd0ec868ec920138bcf635f5e1bb0086e62c85d86cb7144
+aarch64	Apple M4 Pro	sprites/readback/2	264x126	4a1fe24ef437789b5fd0ec868ec920138bcf635f5e1bb0086e62c85d86cb7144
+aarch64	Apple M4 Pro	scroll/readback/0	264x126	239d3ef50f6350c8c3c6c640327bbce08f5220f4c2b2948f11e57e9a6dc2f743
+aarch64	Apple M4 Pro	scroll/readback/1	264x126	239d3ef50f6350c8c3c6c640327bbce08f5220f4c2b2948f11e57e9a6dc2f743
+aarch64	Apple M4 Pro	scroll/readback/2	264x126	239d3ef50f6350c8c3c6c640327bbce08f5220f4c2b2948f11e57e9a6dc2f743
+aarch64	Apple M4 Pro	scroll_down/readback/0	264x126	ba7f596b488ae1f7a994eec25d8e46435cde54380e98e7241b7ff7513b185004
+aarch64	Apple M4 Pro	scroll_down/readback/1	264x126	ba7f596b488ae1f7a994eec25d8e46435cde54380e98e7241b7ff7513b185004
+aarch64	Apple M4 Pro	scroll_down/readback/2	264x126	ba7f596b488ae1f7a994eec25d8e46435cde54380e98e7241b7ff7513b185004
+aarch64	Apple M4 Pro	images/readback/0	264x126	7cbe4cef23ca362356aa76e30a9286af32076bf41c0667d66569643611a66b23
+aarch64	Apple M4 Pro	images/readback/1	264x126	7cbe4cef23ca362356aa76e30a9286af32076bf41c0667d66569643611a66b23
+aarch64	Apple M4 Pro	images/readback/2	264x126	7cbe4cef23ca362356aa76e30a9286af32076bf41c0667d66569643611a66b23
+aarch64	Apple M4 Pro	fx/readback/0	264x126	8be42524d0a130f26dfd47a502b9db940ec1a1bd6e134d559f60fb6d90b38e1f
+aarch64	Apple M4 Pro	fx/readback/1	264x126	8be42524d0a130f26dfd47a502b9db940ec1a1bd6e134d559f60fb6d90b38e1f
+aarch64	Apple M4 Pro	fx/readback/2	264x126	8be42524d0a130f26dfd47a502b9db940ec1a1bd6e134d559f60fb6d90b38e1f
+aarch64	Apple M4 Pro	cursor_blend/readback/0	264x126	122c5e1956dac8c6d6a87a57c3bdfbdb5bb60b0860a20850b77788645287ded9
+aarch64	Apple M4 Pro	heat/layered/0	264x126	3bde1421f2f27b479ef8bb6775368b7d537f4e9c4ff3ea63c69b72327fcb8b85
+aarch64	Apple M4 Pro	heat/layered/1	264x126	3bde1421f2f27b479ef8bb6775368b7d537f4e9c4ff3ea63c69b72327fcb8b85
+aarch64	Apple M4 Pro	heat/layered/2	264x126	3bde1421f2f27b479ef8bb6775368b7d537f4e9c4ff3ea63c69b72327fcb8b85
+aarch64	Apple M4 Pro	heat/readback	264x126	aaab3ed353cc6f58290deded1f2935996547fa89a1c5b9bd1c4577919b8ebf3c
+aarch64	Apple M4 Pro	text_cursor/present/0	264x126	4641f159cb6d1ca8134e431ff29a221881d9e2c819f6f9ddac01053eabb44e0e
+aarch64	Apple M4 Pro	text_cursor/present/1	264x126	00058cd41e5c61faae0182b5d096d44f51aaa15619b3f1fd04471c1c92f0ec31
+aarch64	Apple M4 Pro	text_cursor/present/2	264x126	e773944b4c8ad7f8050474c21b93c57ca85b52404f1ed383d73d74b476be661f
+aarch64	Apple M4 Pro	text_cursor/present/changed	264x126	9c25ebfe9bbe29da101a45f7f0a9c24f0fef229e3892bf2e9ce38d99f99fbc20
+aarch64	Apple M4 Pro	text_cursor/present/cropped	275x72	40c8da39f867756302368bf76f5e6a25b3722a105c0c16c5fc13eedc1fa10572
+aarch64	Apple M4 Pro	colour_emoji/present/0	264x126	87dcbc45b4208cb7e1e875a504bd4f72f86c562223edabfd2e69eb9a3fd29ee9
+aarch64	Apple M4 Pro	colour_emoji/present/1	264x126	94964587b0d8371e176edb9312ed32270b4dcda0839ce3b2e9f5632bab9563f1
+aarch64	Apple M4 Pro	colour_emoji/present/2	264x126	1d2a13669b6176803b5874918c1055cb2d4f5f9391671612a008797a30b664d0
+aarch64	Apple M4 Pro	colour_emoji/present/changed	264x126	014b175723c11064745fd422a051643a89e831a50d3b654014075f5ef8cd6a6a
+aarch64	Apple M4 Pro	colour_emoji/present/cropped	275x72	41d334ea91e361af89f73b88769e39a86ac3a5fe0e9d9864a0c53414e61c321f
+aarch64	Apple M4 Pro	wallpaper/present/0	264x126	6aae56be1f1e58cfcce02b7753de7c32316d24d517412b5dd57ac8b54e13ddcf
+aarch64	Apple M4 Pro	wallpaper/present/1	264x126	8588afc66376d4f171b21c24a987a32d6770b9c2a04f9b3ca94625e544fcb6e3
+aarch64	Apple M4 Pro	wallpaper/present/2	264x126	e5546b567f059772d272d5e0abe09e522950037af3cead866e1ee12fac1923ca
+aarch64	Apple M4 Pro	wallpaper/present/changed	264x126	2494614dbc30c4485775fcce2b54f5ffbe5369e4cffbc6013f19f9867abbd592
+aarch64	Apple M4 Pro	wallpaper/present/cropped	275x72	f8509aa2b5c76f03b96f4e727455912ee8600bd0cd10236e9ddc05c6e86dafb4
+aarch64	Apple M4 Pro	glow_halo/present/0	264x126	6587bd75ddc0a8e8dcda279b1cb8e5e2c7c39ebb2fb2bba3a70dbd406b8926ba
+aarch64	Apple M4 Pro	glow_halo/present/1	264x126	567232cedb7c219ea1225671e7a9a96d2c6a855498b3ccd14783c93e20547b49
+aarch64	Apple M4 Pro	glow_halo/present/2	264x126	dbfe46ee4621907871e06320b8a3ce4a300168dc3947b7b59c191cb571b97114
+aarch64	Apple M4 Pro	glow_halo/present/changed	264x126	d1a7fc332726b6986f28182d58d21a21a273e2c5a7ed4375620469ff05f54880
+aarch64	Apple M4 Pro	glow_halo/present/cropped	275x72	da72254f140be2691aadbaa923d186edb292ee64a915015f85f8275fd1199c78
+aarch64	Apple M4 Pro	rain/present/0	264x126	7370a16b364addee2d793e24c6f78ec9736bb6f109697b9ef441b427ff173b26
+aarch64	Apple M4 Pro	rain/present/1	264x126	85fd6b6f6b9365ebec2061672d0374ea4131793dc8b38546b4dd2ad5037cba91
+aarch64	Apple M4 Pro	rain/present/2	264x126	3742e7770aa2aa00ec01e74a49f01ee37d8d547852ef4b38f7d044d165190350
+aarch64	Apple M4 Pro	rain/present/changed	264x126	540fc4b1032259f53190a70755c2bb1a42692d0316cb7eb41a32c46e8126a7e9
+aarch64	Apple M4 Pro	rain/present/cropped	275x72	76d76b5831e00af5eb7c646d08b6171a6563d9a6ced85d1cab92b9b5da5477ca
+aarch64	Apple M4 Pro	fire/present/0	264x126	678b10d8d7ff7c92bfd330d93b54fa48bb5a41e8170bacd26f288d9c833cf1c8
+aarch64	Apple M4 Pro	fire/present/1	264x126	e5428ee7b809ffd41f739d74e657c7ab94c6e2707c6df3499d41f04eeb32587a
+aarch64	Apple M4 Pro	fire/present/2	264x126	3de9facaf2c0da8a33e60a1d8f4da478dea1ee575bf310a75f6afae15873f873
+aarch64	Apple M4 Pro	fire/present/changed	264x126	3cf3b1b27a6bd80b7984a97d615f8f648e98ed36400fed0dd350678557bdedad
+aarch64	Apple M4 Pro	fire/present/cropped	275x72	9cbeae3e0298227662e8cbdbd0efc4f16cc89bdc71296b6a6d015196e60af518
+aarch64	Apple M4 Pro	sprites/present/0	264x126	4a1fe24ef437789b5fd0ec868ec920138bcf635f5e1bb0086e62c85d86cb7144
+aarch64	Apple M4 Pro	sprites/present/1	264x126	66b0c030194e6c9394277e2a81bb3cee501ae1f0932941a8d8665e04a5c62c69
+aarch64	Apple M4 Pro	sprites/present/2	264x126	0c6f9882f32c504b2a7a24772e8c93b7594f6780095e37ea99e851f11ab8890c
+aarch64	Apple M4 Pro	sprites/present/changed	264x126	050b68306c0436fd0b404fcae049acab31823e68195fc2c7e1c0a5b47d5abde9
+aarch64	Apple M4 Pro	sprites/present/cropped	275x72	40c8da39f867756302368bf76f5e6a25b3722a105c0c16c5fc13eedc1fa10572
+aarch64	Apple M4 Pro	scroll/present/0	264x126	239d3ef50f6350c8c3c6c640327bbce08f5220f4c2b2948f11e57e9a6dc2f743
+aarch64	Apple M4 Pro	scroll/present/1	264x126	e695a4cca3e2b36fede5d7ea4eccb4706ab8bea22ff12827f7cdc66b1aab3a4c
+aarch64	Apple M4 Pro	scroll/present/2	264x126	caf486ad3c6597214db3e174e7fbf1085e28b8b5124370d9ca84b31aeb8f6ac2
+aarch64	Apple M4 Pro	scroll/present/changed	264x126	12ba5ad54392d46dd70b71ec99c4e027f40bc5d57f897ca2017f01e9e963e7bb
+aarch64	Apple M4 Pro	scroll/present/cropped	275x72	3bbe2d81989f8cb563a876e745fcaeaa76bd556b7aab7e7fff7969788635bac0
+aarch64	Apple M4 Pro	scroll_down/present/0	264x126	ba7f596b488ae1f7a994eec25d8e46435cde54380e98e7241b7ff7513b185004
+aarch64	Apple M4 Pro	scroll_down/present/1	264x126	22878697dda64b05d42e76ee51a936412f75241e543df00aa89121675503c079
+aarch64	Apple M4 Pro	scroll_down/present/2	264x126	a21c6556001704dcbf12a4c6847864387d723c7715d5b3b18f91bfcdd2c0c30a
+aarch64	Apple M4 Pro	scroll_down/present/changed	264x126	2c5738c40de65c9f7704beac9d23238c742b13965f6d2eeed98af8ad6ed1d6cc
+aarch64	Apple M4 Pro	scroll_down/present/cropped	275x72	e1ad834c43c44d5795ad9920887600f092c9d2f179b27425d95c6c654ebe05ca
+aarch64	Apple M4 Pro	images/present/0	264x126	7cbe4cef23ca362356aa76e30a9286af32076bf41c0667d66569643611a66b23
+aarch64	Apple M4 Pro	images/present/1	264x126	dc7835bcd442a81a250ec9bc8135dece4059c59d315315b62fd8c936a8fb425d
+aarch64	Apple M4 Pro	images/present/2	264x126	08b35155477d58f5a4af146c817f84207fa730572be05f90446364600311122b
+aarch64	Apple M4 Pro	images/present/changed	264x126	7cbe4cef23ca362356aa76e30a9286af32076bf41c0667d66569643611a66b23
+aarch64	Apple M4 Pro	images/present/cropped	275x72	3839988bcecae6fc2bbc3afacc898922b7ce67fe06d49961b2444de61720fde0
+aarch64	Apple M4 Pro	fx/present/0	264x126	8be42524d0a130f26dfd47a502b9db940ec1a1bd6e134d559f60fb6d90b38e1f
+aarch64	Apple M4 Pro	fx/present/1	264x126	1ce5e6740eac6c6cd22de41fe51862a1ac7cbfa8b0ca75ca0044d175120119e3
+aarch64	Apple M4 Pro	fx/present/2	264x126	c49e4d73c0f914b72420e2739dd004f0649d3126c80c52998a64839351a7c102
+aarch64	Apple M4 Pro	fx/present/changed	264x126	3477608b9a99743ca9a2f7433a2521e10c93ae73d1961c6aa414e85bb3bd424b
+aarch64	Apple M4 Pro	fx/present/cropped	275x72	0f44932ee96fc2c9d98dde98b80f6bd1e78840256bd12b9fa2403333b1f8f866
+aarch64	Apple M4 Pro	heat/present/0	264x126	03c5e77c69b597384239ab72572cc4fd0efc62d381317b69a07aad2374c8cd0a
+aarch64	Apple M4 Pro	heat/present/1	264x126	38ccb385f95200dae15e379a934f7a46821e120e818e4bcbc65500a9d8fa498f
+aarch64	Apple M4 Pro	heat/present/2	264x126	1bd219378504d52d34a1394a1e00a1a908ed92d3c82230766a6c8f8e47e9f283
+aarch64	Apple M4 Pro	heat/present/changed	264x126	bd92a91fc2bb9d883b7ff06f1d7a78406feaa38e1ae2b45c2fece173defd740f
+aarch64	Apple M4 Pro	heat/present/cropped	275x72	a1ba142210ef67850ae2cc170f6270453957f79a63c9351909f53e1f2be21bc5
+aarch64	Apple M4 Pro	window/opaque/readback	264x126	87dae35f182fff91fdecae1c121460ba5019f837b46d4f6e79b37b8948425d86
+aarch64	Apple M4 Pro	window/translucent/readback	264x126	9bd20846de2ed766cb65b7b12f0b7207b3544fae830559edd80c8751e70d78e3
+aarch64	Apple M4 Pro	window/opaque/layer	273x133	3f8af62584ac3172cfce247bca5ff0dd98e5e9924470de8b8d03d4ed061e9ae2
+aarch64	Apple M4 Pro	window/translucent/layer	273x133	6658d5c46fdb65e1a117484cad4dcfb9ad71a356dec39ffdd829ec0aa1f5a806
+aarch64	Apple M4 Pro	video/take/0	264x126	4641f159cb6d1ca8134e431ff29a221881d9e2c819f6f9ddac01053eabb44e0e
+aarch64	Apple M4 Pro	video/take/1	264x126	239d3ef50f6350c8c3c6c640327bbce08f5220f4c2b2948f11e57e9a6dc2f743
+aarch64	Apple M4 Pro	video/take/2	264x126	8661ab253ac3520df82535aa820cf7ec029aa57ebd641d78763efb3df5909f34
+aarch64	Apple M4 Pro	edr/plain	176x84	9d4c1afec96831af9832f268f31bdf084a0ad79fd5c73e7af16a22cdab7a14c9
+aarch64	Apple M4 Pro	edr/crown	176x84	0863900f4458a7c87080167219de21c88e3f1c1818b6f6915920f93d1771be2e
+aarch64	Apple M4 Pro	edr/banded	183x91	7e78df6004a5f7bac1e606a0d90d15c866b5da1970ff11eb23aeae94637e80db
+aarch64	Apple M4 Pro	blit/source/opaque	264x126	bf0f7c6ced1080eda9018d6c106ace318434a30c6fc103fa2bfe2106011d7688
+aarch64	Apple M4 Pro	blit/source/glass	264x126	1504529ec015f6892f41d301533406b89eb1598a17f7d9614b43b66267207a2f
+aarch64	Apple M4 Pro	blit/source/chrome	264x126	bf0f7c6ced1080eda9018d6c106ace318434a30c6fc103fa2bfe2106011d7688
+aarch64	Apple M4 Pro	blit/source/strip	264x126	bf0f7c6ced1080eda9018d6c106ace318434a30c6fc103fa2bfe2106011d7688
+aarch64	Apple M4 Pro	blit/exact	264x126	bf0f7c6ced1080eda9018d6c106ace318434a30c6fc103fa2bfe2106011d7688
+aarch64	Apple M4 Pro	blit/exact-invert	264x126	bd8150d2e47446e193da8f998e2c2f0682ec8029ff010b2f30a9ad154f1d0ae0
+aarch64	Apple M4 Pro	blit/bands	301x149	9e10ba49a1dc9a1c3a68f1a2fa561fb45cbd5d97112175df1f7fa6906a030d85
+aarch64	Apple M4 Pro	blit/cropped-overlay	301x149	ad981dad32877969d9a590eb07b70b1a41d3dc7e6537191f09fe0470334c133e
+aarch64	Apple M4 Pro	blit/cropped-overlay-bgra	301x149	5bbb115f429f83987abbcae55ad416ae850d51b668f95dbb23754c5eaf3945d9
+aarch64	Apple M4 Pro	blit/encode-srgb	264x126	b34b21355fe518148c91375532e0bea461d200d8b392274b3d4e7b1f31ed1dfd
+aarch64	Apple M4 Pro	blit/glass-bands	301x149	5114101f9ab510dbc45c69e93e81f7873e27a3e791ec7d2c49777b909bac0997
+aarch64	Apple M4 Pro	blit/glass-premultiplied	301x149	7ecf6ca6d9a5781d87c8ce7ac3462238ccccefab1167e4c714b11c0192445917
+aarch64	Apple M4 Pro	blit/edr-clamp	264x126	f1c2eb3f15870ff66cb7a5b9c2f9bc57af18efabc0ca7adb84d26ef81b51a778
+aarch64	Apple M4 Pro	blit/chrome-bands	301x149	6819730ba769f82f4618f1dd0fbdeca2849ae468026669c8b2c103e4644b28c2
+aarch64	Apple M4 Pro	blit/chrome-invert	301x149	3d6623be1688e060b657b19745c79de68d69941125e565465946f669ecce2187
+aarch64	Apple M4 Pro	blit/chrome-below-strip	301x149	d51bd8ccef39dfd9ba76886f69308f8464bf19dd81d8431c6f28cfe2ef0bcae7
+aarch64	Apple M4 Pro	blit/edr-scrgb-bands	301x149	c01437acfd25efc11e84e1569653a3f843273b5abbd0cda08c5d433d0d3badb5
+aarch64	Apple M4 Pro	crown/hdr	20x14	4724d5d3457923487620bae689a7130314f93974fe3b7c218b8590e8de3ed32d
+aarch64	Apple M4 Pro	crown/sdr	20x14	e903ba05ea6f0404818f9a86502c0ada37c488b360d8d5cfb0a8819f231b2283

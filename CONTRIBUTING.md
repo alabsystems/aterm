@@ -46,7 +46,10 @@ What to run before a pull request:
 * `targo --unverified test --locked -p <crate>` for every crate you touched.
   A fresh clone is green once `targo --unverified verify provision` has run:
   it places the tools the checkout pins (fish, pwsh, binaryen, on a Mac bash
-  5.3 built from GNU's source, the browsers, rustup stable's targets). A test that needs a tool this machine still lacks
+  5.3 built from GNU's source, the browsers, rustup itself and stable's
+  targets, writing nothing in `~/.cargo`; until it runs, a rustup on your
+  `PATH`, Homebrew's included, is the fallback). A test that needs a tool
+  this machine still lacks
   ends COULD NOT RUN and names what provides it. After `verify provision`,
   with ALab's default set and the Command Line Tools installed, the only
   COULD NOT RUN left are for a tool aterm provides no copy of yet (zstd,

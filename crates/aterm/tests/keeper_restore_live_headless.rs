@@ -3,28 +3,18 @@
 
 //! THE EXACT SCREEN AFTER A CRASH, on real processes (the crash-restore plan §7.3's live lane).
 
-#![allow(
-    clippy::disallowed_types,
-    reason = "test code: a stand-in child may inherit descriptors"
-)]
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use aterm_update::recovery_ledger::{KeeperAtLaunch, Row, ledger_path, read_rows};
 
+use crate::keeper_world::{
+    GAP, HANG, Proc, Start, World, admitted, await_keeper, await_start, boot, keeper, keeper_code,
+    keeper_reached, ledger_dir, world,
+};
+use crate::launch_isolation;
 use crate::live_ctl::{Ctl, fields};
-use crate::{child_output, headless_boot, launch_isolation};
-
-/// A wait for something that must happen is a hang detector (AGENTS.md).
-const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
-/// How long macOS may hold the first exec of a new program: the bound on the keeper showing
-/// it runs from its fresh copy of its code ([`keeper_ran`]).
-const FIRST_EXEC_HANG: Duration = aterm_uds::deadline::FIRST_EXEC_HANG;
-/// How often a wait on a status line asks again.
-const GAP: Duration = Duration::from_millis(50);
 
 /// The window's journal off: the negative control's seam (`keeper_link::journal_refusal`).
 const NO_JOURNAL_SEAM: &str = "ATERM_DEBUG_NO_CRASH_JOURNAL";
@@ -32,306 +22,6 @@ const NO_JOURNAL_SEAM: &str = "ATERM_DEBUG_NO_CRASH_JOURNAL";
 /// The window's keyframes held after the first, so a crash leaves a tail to replay
 /// (`crash_restore::HOLD_KEYFRAMES_SEAM`).
 const HOLD_KEYFRAMES_SEAM: &str = "ATERM_DEBUG_CRASH_JOURNAL_HOLD_KEYFRAMES";
-
-/// The recovery census's seam (`recovery_census::LEDGER_SEAM`): every instance writes the
-/// row the installed app's cold start would into the world's own ledger, so the test reads
-/// the `keeper=` and `restored=` words the soak judges (`aterm_update::restore_soak`).
-const LEDGER_SEAM: &str = "ATERM_DEBUG_RECOVERY_LEDGER";
-
-/// One scratch world the keeper and both instances share: one `$HOME`, one config with
-/// the keeper on, one `$XDG_RUNTIME_DIR` (where the keeper's socket lives, `/tmp` being no
-/// private `$TMPDIR`), in a directory made for it ([`world`]); removed on drop, after the
-/// keeper and every instance (declared after it, so dropped first), past the hung-up shell's
-/// last history write, unless it holds a copy of the keeper's code that never showed it ran
-/// ([`unrun_copies`]).
-struct World(PathBuf);
-
-impl Drop for World {
-    fn drop(&mut self) {
-        let unrun = unrun_copies(&self.0);
-        if unrun.is_empty() {
-            headless_boot::remove_world(&self.0);
-        } else {
-            eprintln!(
-                "KEPT {}: the keeper's copy {unrun:?} never showed it ran, so macOS may still be \
-                 assessing its first exec; remove it once no process runs from it",
-                self.0.display()
-            );
-        }
-    }
-}
-
-/// Where the world's keepers keep the copies of their code they run from.
-fn keeper_code(root: &Path) -> PathBuf {
-    aterm_keeper::code::code_dir_in(&root.join("home"))
-}
-
-/// The copies of the keeper's code in the world that never showed they ran (no
-/// [`aterm_keeper::code::RAN`] mark): macOS may still be assessing the first exec of one, and
-/// a file unlinked mid-assessment can strand every exec waiting on macOS's program check, so
-/// it stays until a child showed it ran from it (AGENTS.md), however old its exec stamp is.
-/// A half-made `.partial` copy was never run, and an entry no keeper named is no copy.
-fn unrun_copies(root: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(keeper_code(root))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            !name.ends_with(".partial") && aterm_keeper::code::owner_of(&name).is_some()
-        })
-        .map(|entry| entry.path())
-        .filter(|copy| !copy.join(aterm_keeper::code::RAN).exists())
-        .collect()
-}
-
-/// One child process, SIGKILLed and reaped on drop.
-struct Proc {
-    child: Child,
-    _lifeline: Option<aterm_uds::lifeline::Lifeline>,
-}
-
-impl Drop for Proc {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// A new world in a directory made for it (`/tmp/atkr-<tag>-…`), never one an earlier run
-/// kept ([`World`]) and never removed to make room.
-fn world(tag: &str) -> World {
-    let made = aterm_tempfile::Builder::new()
-        .prefix(&format!("atkr-{tag}-"))
-        .tempdir_in("/tmp");
-    let world = match made {
-        Ok(dir) => World(dir.keep()),
-        Err(e) => aterm_spec::host::could_not_run(format!("no scratch world in /tmp ({e})")),
-    };
-    let root = &world.0;
-    if !launch_isolation::sock_fits(&root.join("run/aterm/keeper-dev-00000000.sock"))
-        || launch_isolation::prepare(root).is_err()
-    {
-        aterm_spec::host::could_not_run("no scratch world with a socket path short enough");
-    }
-    let config = root.join("cfg/aterm/aterm.toml");
-    let mut text = std::fs::read_to_string(&config).expect("the scratch config");
-    text.push_str("[keeper]\nenabled = true\n");
-    std::fs::write(&config, text).expect("turn the keeper on");
-    world
-}
-
-/// `aterm keeper <args…>` in the world's environment, read to its end.
-fn keeper_cli(root: &Path, args: &[&str]) -> String {
-    let mut cmd = Command::new(launch_isolation::aterm_executable());
-    launch_isolation::apply(&mut cmd, root);
-    cmd.arg("keeper")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = cmd.spawn().expect("spawn aterm keeper");
-    let out = child_output::wait_and_read(child, std::time::Instant::now() + HANG * 2)
-        .unwrap_or_else(|| panic!("aterm keeper {args:?} did not exit in time"));
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
-/// The keeper's `status` text, `key=value` words across its lines.
-fn keeper_status(root: &Path) -> String {
-    keeper_cli(root, &["status"])
-}
-
-/// Wait until the keeper's status holds `word`.
-#[track_caller]
-fn await_keeper(root: &Path, word: &str) {
-    let mut last = String::new();
-    let seen = aterm_spec::wait::within(HANG, GAP, || {
-        last = keeper_status(root);
-        last.split_whitespace().any(|w| w == word).then_some(())
-    });
-    assert!(
-        seen.is_some(),
-        "the keeper never said `{word}`; its status:\n{last}"
-    );
-}
-
-/// This build's keeper, in the foreground (`serve --no-relaunch`: no window is brought
-/// back, the next launch recovers). It runs again from a fresh copy of its code
-/// (`aterm_keeper::code`), a new program whose first exec macOS holds for as long as its
-/// queue of new programs makes it (over a minute behind a build's), so the one-minute wait for
-/// its answer starts once it showed it runs ([`await_start`]).
-fn keeper(root: &Path) -> Proc {
-    let log = root.join("keeper.log");
-    let file = std::fs::File::create(&log).expect("the keeper's log");
-    let mut cmd = Command::new(launch_isolation::aterm_executable());
-    launch_isolation::apply(&mut cmd, root);
-    cmd.args(["keeper", "serve", "--no-relaunch"])
-        .stdin(Stdio::null())
-        .stdout(file.try_clone().expect("log"))
-        .stderr(file);
-    let child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => aterm_spec::host::could_not_run(format!("cannot launch the keeper ({e})")),
-    };
-    let mut keeper = Proc {
-        child,
-        _lifeline: None,
-    };
-    let pid = keeper.child.id();
-    let started = await_start(root, pid, HANG, FIRST_EXEC_HANG, &mut || {
-        !matches!(keeper.child.try_wait(), Ok(None))
-    });
-    match started {
-        Start::Ran | Start::Ended => {}
-        Start::NoCopy => {
-            aterm_uds::deadline::require_trust_service();
-            panic!(
-                "the keeper (pid {pid}) made no copy of its code to run from in {HANG:?}: no \
-                 exec stamp in one, nothing in its log"
-            );
-        }
-        Start::NotRun => {
-            let held = aterm_uds::process::at_program_check(i32::try_from(pid).unwrap_or(0));
-            if let Some(words) = aterm_uds::deadline::held_words(pid, FIRST_EXEC_HANG, held) {
-                aterm_spec::host::could_not_run(words);
-            }
-            panic!(
-                "the keeper (pid {pid}) never showed it runs: no mark in its copy of its code, \
-                 nothing in its log"
-            );
-        }
-    }
-    if let Ok(Some(status)) = keeper.child.try_wait() {
-        panic!(
-            "the keeper exited ({status}) before it answered; its log:\n{}",
-            headless_boot::log_tail(&log)
-        );
-    }
-    let mut last = String::new();
-    let answered = aterm_spec::wait::within(HANG, GAP, || {
-        last = keeper_status(root);
-        last.lines()
-            .any(|l| l.starts_with("masters="))
-            .then_some(())
-    });
-    assert!(
-        answered.is_some(),
-        "the keeper never answered; its status:\n{last}\nits log:\n{}",
-        headless_boot::log_tail(&log)
-    );
-    keeper
-}
-
-/// How far a keeper's start got ([`await_start`]).
-#[derive(Debug, PartialEq, Eq)]
-enum Start {
-    /// It showed it runs.
-    Ran,
-    /// It exited.
-    Ended,
-    /// No copy of its code was stamped for its exec, nor did it write a line.
-    NoCopy,
-    /// Its copy was stamped for its exec and never showed it runs.
-    NotRun,
-}
-
-/// Wait for keeper `pid` to show it runs, `ended` saying whether it exited, in two waits. First
-/// up to `copy_hang` for its copy's exec stamp ([`aterm_uds::deadline::EXEC_STAMP`], written
-/// just before it runs again from the copy): the work before is its own, its first exec (this
-/// build's) warmed by [`launch_isolation::apply`]. Then up to `run_hang` for the copy's mark
-/// ([`aterm_keeper::code::RAN`]): that wait is macOS's first-exec check of the copy. A line
-/// in its log answers either wait ([`keeper_reached`]).
-fn await_start(
-    root: &Path,
-    pid: u32,
-    copy_hang: Duration,
-    run_hang: Duration,
-    ended: &mut dyn FnMut() -> bool,
-) -> Start {
-    let mut wait = |hang, mark| {
-        aterm_spec::wait::within(hang, GAP, || {
-            if ended() {
-                Some(Start::Ended)
-            } else {
-                keeper_reached(root, pid, mark).then_some(Start::Ran)
-            }
-        })
-    };
-    match wait(copy_hang, aterm_uds::deadline::EXEC_STAMP) {
-        None => Start::NoCopy,
-        Some(Start::Ran) => wait(run_hang, aterm_keeper::code::RAN).unwrap_or(Start::NotRun),
-        Some(other) => other,
-    }
-}
-
-/// Whether keeper `pid`'s copy of its code in the world ([`keeper_code`], `<pid>-<start>`,
-/// never a half-made `.partial` one) holds the file `mark`, or the keeper wrote to its log,
-/// which before it runs from its copy it does only where its start went another way: it
-/// exits, serves from this build, or could not stamp its copy (a world made for it holds no
-/// earlier keeper's copy for its sweep to speak of).
-fn keeper_reached(root: &Path, pid: u32, mark: &str) -> bool {
-    let said = std::fs::metadata(root.join("keeper.log")).is_ok_and(|meta| meta.len() > 0);
-    said || std::fs::read_dir(keeper_code(root))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .any(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            !name.ends_with(".partial")
-                && aterm_keeper::code::owner_of(&name).is_some_and(|(owner, _)| owner == pid)
-                && entry.path().join(mark).exists()
-        })
-}
-
-/// One headless instance on its own socket in the world, hearing no system's memory pressure
-/// ([`launch_isolation::SYSTEM_PRESSURE`]), with each debug seam in `seams` set to its value.
-fn boot(root: &Path, tag: &str, seams: &[(&str, &str)]) -> (Proc, String) {
-    let sock = root.join(format!("run/aterm/{tag}.sock"));
-    let log_path = root.join(format!("{tag}.log"));
-    let (out, err) = match std::fs::File::create(&log_path).and_then(|f| Ok((f.try_clone()?, f))) {
-        Ok(pair) => pair,
-        Err(e) => aterm_spec::host::could_not_run(format!("cannot open the instance log ({e})")),
-    };
-    let mut cmd = Command::new(launch_isolation::aterm_executable());
-    launch_isolation::apply(&mut cmd, root);
-    cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .arg("--control-sock")
-        .arg(&sock)
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err);
-    for (seam, value) in seams {
-        cmd.env(seam, value);
-    }
-    let ledger = ledger_dir(root);
-    if let Err(e) = std::fs::create_dir_all(&ledger) {
-        aterm_spec::host::could_not_run(format!("cannot make the census's folder ({e})"));
-    }
-    cmd.env(LEDGER_SEAM, &ledger);
-    let lifeline = launch_isolation::lifeline(&mut cmd, root);
-    let mut ready = headless_boot::arm_ready(&mut cmd, root);
-    let child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => aterm_spec::host::could_not_run(format!("cannot launch aterm --headless ({e})")),
-    };
-    let mut instance = Proc {
-        child,
-        _lifeline: Some(lifeline),
-    };
-    headless_boot::await_ready(
-        &mut instance,
-        |p| &mut p.child,
-        &mut ready,
-        &log_path,
-        |_| true,
-    );
-    (instance, sock.to_string_lossy().into_owned())
-}
-
-/// The world's recovery ledger folder, every instance's census row in it.
-fn ledger_dir(root: &Path) -> PathBuf {
-    root.join("ledger")
-}
 
 /// The census row instance `pid`'s cold start wrote (its census thread's, awaited under the
 /// hang detector).
@@ -489,25 +179,6 @@ fn crash_and_recover(root: &Path, a: Proc, seams: &[(&str, &str)]) -> (Proc, Ctl
     let (b, sock) = boot(root, &tag, seams);
     let ctl = admitted(&sock);
     (b, ctl)
-}
-
-/// What every request to a recovered instance answers while an old journal the keeper
-/// may still offer has no accepted successor (`keeper_link::RecoveryCountAdmission`):
-/// the instance serves nothing and closes the connection until the keeper confirms it
-/// read each adopted session's new journal (its SYNC answer behind the COMPANION).
-const FENCED: &str = "ERR recovery-count-custody unconfirmed";
-
-/// A connection to the instance at `sock` once its recovery-count fence has lifted
-/// ([`FENCED`]): a must-happen wait, each refused connection dropped and a new one asked.
-#[track_caller]
-fn admitted(sock: &str) -> Ctl {
-    let mut last = String::new();
-    let ctl = aterm_spec::wait::within(HANG, GAP, || {
-        let mut ctl = Ctl::connect(sock);
-        last = ctl.line("status");
-        (last != FENCED).then_some(ctl)
-    });
-    ctl.unwrap_or_else(|| panic!("the recovery-count fence never lifted: {last}"))
 }
 
 #[test]
@@ -721,6 +392,102 @@ fn a_crashed_window_s_turns_are_still_in_history() {
         next >= floor,
         "B's turn ids go on past the floor: {next} < {floor}"
     );
+}
+
+/// The keeper link's worker and the META pump idle an hour (`keeper_link::QUIET_SEAM`), so only
+/// a queued op or the keeper's own frame wakes the worker.
+const QUIET_SEAM: &str = "ATERM_DEBUG_KEEPER_QUIET_MS";
+const AN_HOUR_MS: &str = "3600000";
+
+/// A's sessions in the keeper's custody, each journaling into a region the keeper holds:
+/// session 0 and `more` spawned beside it, each read to its prompt and its journal live.
+fn sessions_in_custody(root: &Path, ctl: &mut Ctl, more: usize) -> Vec<String> {
+    for _ in 0..more {
+        let reply = ctl.ok("spawn");
+        assert!(
+            reply.split_whitespace().any(|t| t.starts_with("s-")),
+            "`spawn` names its sid: {reply}"
+        );
+    }
+    let sids = sids(ctl);
+    assert_eq!(
+        sids.len(),
+        more + 1,
+        "A runs {} sessions: {sids:?}",
+        more + 1
+    );
+    for sid in &sids {
+        await_status_of(ctl, sid, "journal", "live");
+    }
+    await_keeper(root, &format!("claimed={}", sids.len()));
+    await_keeper(root, &format!("journals={}", sids.len()));
+    sids
+}
+
+/// Every session's sid, from `sessions`.
+fn sids(ctl: &mut Ctl) -> Vec<String> {
+    let (_, rows) = ctl.counted("sessions");
+    rows.iter()
+        .filter(|row| row.starts_with(|c: char| c.is_ascii_digit()))
+        .filter_map(|row| row.split_whitespace().nth(1).map(str::to_string))
+        .collect()
+}
+
+/// Wait until session `sid`'s `status` has `key=value`.
+#[track_caller]
+fn await_status_of(ctl: &mut Ctl, sid: &str, key: &str, value: &str) {
+    let mut last = String::new();
+    let seen = aterm_spec::wait::within(HANG, GAP, || {
+        last = ctl.line(&format!("@{sid} status"));
+        (fields(&last).get(key) == Some(&value)).then_some(())
+    });
+    assert!(seen.is_some(), "{sid}: `{key}={value}` never held: {last}");
+}
+
+/// K1 integration coverage: a recovered instance is served after the keeper's SYNC behind
+/// the adopted session's new journal. The link's idle wait and META pump period are an hour;
+/// this checks successful recovery with periodic work quiet, not every earlier worker schedule.
+#[test]
+fn a_recovered_window_is_served_once_its_keeper_answers_with_its_link_quiet() {
+    let world = world("q");
+    let root = world.0.clone();
+    let _keeper = keeper(&root);
+    let (a, sock) = boot(&root, "a", &[]);
+    let mut ctl = Ctl::connect(&sock);
+    sessions_in_custody(&root, &mut ctl, 0);
+    drop(ctl);
+    let (_b, mut ctl) = crash_and_recover(&root, a, &[(QUIET_SEAM, AN_HOUR_MS)]);
+    await_status(&mut ctl, "restore", "exact");
+}
+
+/// A plain headless instance (no desk seam) that recovers more than one keeper session places
+/// every one, so its fence lifts: it has no glass to wait for before its restore pass.
+#[test]
+fn a_plain_headless_instance_places_every_session_it_recovers() {
+    let world = world("two");
+    let root = world.0.clone();
+    let _keeper = keeper(&root);
+    let (a, sock) = boot(&root, "a", &[]);
+    let mut ctl = Ctl::connect(&sock);
+    let mut a_sids = sessions_in_custody(&root, &mut ctl, 2);
+    a_sids.sort_unstable();
+    assert!(a_sids.windows(2).all(|pair| pair[0] != pair[1]));
+    drop(ctl);
+    let mut a = a;
+    let pid = a.child.id();
+    a.child.kill().expect("SIGKILL A");
+    let status = a.child.wait().expect("reap A");
+    assert!(!status.success(), "A died by its signal: {status:?}");
+    drop(a);
+    await_keeper(&root, &format!("orphaned={}", a_sids.len()));
+    let (_b, sock) = boot(&root, &format!("after-{pid}"), &[]);
+    let mut ctl = admitted(&sock);
+    let mut b_sids = sids(&mut ctl);
+    b_sids.sort_unstable();
+    assert_eq!(b_sids, a_sids, "B placed every session A left: {b_sids:?}");
+    for sid in &a_sids {
+        await_status_of(&mut ctl, sid, "restore", "exact");
+    }
 }
 
 /// NEGATIVE CONTROL: A's journal off by the seam, so the keeper is told A's session has

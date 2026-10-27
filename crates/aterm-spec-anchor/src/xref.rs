@@ -14,7 +14,8 @@ pub struct RefinementAnchor {
     pub action: &'static str,
     /// The annotated Rust fn (path/name), e.g. `"TerminalHandler::show_cursor"`.
     pub rust_method: &'static str,
-    /// Source location `file:line` (proc-macro `file!()`/`line!()`).
+    /// Source location `file:line` (`file!()`/`line!()`): the line of the fn's first anchor
+    /// attribute, for every anchor stacked on it, under either form of the attributes.
     pub location: &'static str,
     /// The projection fn path (the `project=` arg, which `#[refines]` requires): what Tier-1 reads the real state through.
     pub project: &'static str,

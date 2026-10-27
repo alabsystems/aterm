@@ -51,6 +51,12 @@ pub enum AliasRoute {
     /// because `$EDITOR` names one executable, which `git` and the rest run with the file and no
     /// room for a verb.
     Amacs,
+    /// `git`, `cc`, `clang`, `make`, `python3`, … (`aterm_types::clt_shim::SHIM_TOOLS`): a shim
+    /// symlink the new-Mac setup lays ahead of `/usr/bin` while Apple's Command Line Tools are
+    /// installing, so a shell that runs the tool is told it is on its way rather than raising
+    /// macOS's install dialog (`crate::clt_shim`, System State design §6.3). It runs before the
+    /// session fork, like the askpass helpers: there is no room for a verb.
+    CommandLineToolsShim,
     /// The front door itself: `aterm`, `aterm-cli` (forced to a session), a renamed copy, and the
     /// window alias running the hidden open probe (`__tcc-open`).
     FrontDoor,
@@ -78,6 +84,9 @@ pub fn alias_route(argv0: &str, first: &str) -> AliasRoute {
             Some(verb) if verb.is_windowing() => AliasRoute::AliasWindowVerb,
             _ => AliasRoute::AliasWindow,
         },
+        // A shim symlink (`git`, `cc`, …) the new-Mac setup laid while the Command Line Tools
+        // install: the one `aterm` binary, run under the tool's own name.
+        name if aterm_types::clt_shim::is_shim_tool(name) => AliasRoute::CommandLineToolsShim,
         _ => AliasRoute::FrontDoor,
     }
 }

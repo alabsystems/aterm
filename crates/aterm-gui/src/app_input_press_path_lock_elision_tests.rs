@@ -106,6 +106,44 @@ fn glow_geom() -> crate::cursor_glow::Geom {
     }
 }
 
+/// A person's pointer gesture on the grid.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum Gesture {
+    Click,
+    /// A left press dragged along row 2 and released, as when selecting a path to copy it.
+    Drag,
+    Wheel,
+}
+
+/// Drive `gesture` over window row 2 through the real pointer handlers.
+#[cfg(unix)]
+fn pointer_gesture(app: &mut App, wid: WindowId, gesture: Gesture) {
+    use aterm_window::event::{MouseButton, MouseScrollDelta};
+
+    let to = |app: &mut App, col: u16| {
+        let (cw, ch) = app.win_cell_size(wid);
+        let strip = f64::from(app.tab_strip_rows) * ch as f64;
+        let x = app.win_pad(wid) as f64 + cw as f64 * (f64::from(col) + 0.5);
+        let y = (app.win_pad_top(wid) + app.win_head(wid)) as f64 + strip + ch as f64 * 2.5;
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(app.windows[&wid].last_mouse_cell, (2, col));
+    };
+    to(app, 3);
+    match gesture {
+        Gesture::Click | Gesture::Drag => {
+            app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+            if matches!(gesture, Gesture::Drag) {
+                for col in 4..=9 {
+                    to(app, col);
+                }
+            }
+            app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        }
+        Gesture::Wheel => app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, -1.0)),
+    }
+}
+
 /// An observing App under Rainbow Kitty with its glow settled at the origin.
 #[cfg(unix)]
 fn rainbow_app() -> (App, i32, crate::cursor_glow::GlowConfig) {
@@ -553,10 +591,20 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
         ModifierEdge(ModifiersState),
         /// A control verb: `serve_session_verb`'s fence (`control_fence`), then the
         /// event the verb's arm delivers through the seam (`key`'s `parse_key`,
-        /// `ctrl`'s `parse_ctrl`, `paste`'s `paste_event`).
+        /// `ctrl`'s `parse_ctrl`, `mouse`'s `parse_mouse`, `paste`'s `paste_event`).
         Control(&'static str, &'static str),
         /// The menu's Paste: its fence, then the clipboard's delivery.
         MenuPaste,
+        /// The menu's fence for a command that sends the program nothing (Copy,
+        /// Select All), then the command.
+        Menu(crate::menu::MenuAction),
+        /// A click on the native tab bar's chip for the tab already in front.
+        ActiveTabChip,
+        /// A click on the window's presence pill.
+        Pill,
+        /// A pointer gesture through the real handlers; `true` puts a mouse-tracking
+        /// app (DEC 1003 with SGR reports) in front first.
+        Pointer(Gesture, bool),
     }
     enum Line {
         Shell,
@@ -604,6 +652,12 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
             true,
         ),
         ("menu Paste", Via::MenuPaste, true),
+        ("menu Copy", Via::Menu(crate::menu::MenuAction::Copy), true),
+        (
+            "menu Select All",
+            Via::Menu(crate::menu::MenuAction::SelectAll),
+            true,
+        ),
         ("Enter, alternate screen", Via::Enter(Line::AltScreen), true),
         ("Enter, a command running", Via::Enter(Line::Running), true),
         ("ctl key left", Via::Control("key", "left"), true),
@@ -616,12 +670,53 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
             true,
         ),
         ("ctl paste", Via::Control("paste", "hello"), true),
+        ("click", Via::Pointer(Gesture::Click, false), true),
+        ("drag", Via::Pointer(Gesture::Drag, false), true),
+        ("wheel", Via::Pointer(Gesture::Wheel, false), true),
+        (
+            "click, tracking app",
+            Via::Pointer(Gesture::Click, true),
+            true,
+        ),
+        (
+            "drag, tracking app",
+            Via::Pointer(Gesture::Drag, true),
+            true,
+        ),
+        (
+            "wheel, tracking app",
+            Via::Pointer(Gesture::Wheel, true),
+            true,
+        ),
+        (
+            "ctl mouse press",
+            Via::Control("mouse", "press left 2 3"),
+            true,
+        ),
+        (
+            "ctl mouse drag",
+            Via::Control("mouse", "move left 2 5"),
+            true,
+        ),
+        (
+            "ctl mouse wheel",
+            Via::Control("mouse", "wheelup left 2 3"),
+            true,
+        ),
+        ("active tab chip", Via::ActiveTabChip, true),
+        ("pill", Via::Pill, true),
         ("Ctrl-R", ctrl('r'), false),
         ("Escape", seam(NamedKey::Escape), false),
         ("Enter, a shell prompt", Via::Enter(Line::Shell), false),
         ("ctl key esc", Via::Control("key", "esc"), false),
     ];
     if super::HARDCODED_SUPER_CHORDS {
+        let cmd_c = WinitKey::Character(SmolStr::new("c"));
+        cases.push((
+            "physical ⌘C",
+            Via::Winit(KeyCode::KeyC, cmd_c, ModifiersState::SUPER),
+            true,
+        ));
         let cmd_v = WinitKey::Character(SmolStr::new("v"));
         cases.push((
             "physical ⌘V",
@@ -739,6 +834,7 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
                 let ev = match verb {
                     "key" => crate::control::parse_key(body),
                     "ctrl" => crate::control::parse_ctrl(body),
+                    "mouse" => crate::control::parse_mouse(body).ok(),
                     _ => Some(crate::control::paste_event(body)),
                 }
                 .expect("a well-formed body");
@@ -751,6 +847,34 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
             Via::MenuPaste => {
                 app.fence_menu_action(crate::menu::MenuAction::Paste);
                 app.paste_clipboard();
+            }
+            Via::Menu(action) => {
+                app.fence_menu_action(action);
+                if action == crate::menu::MenuAction::Copy {
+                    let _ = app.copy_selection();
+                } else {
+                    app.select_all_in(wid);
+                }
+            }
+            Via::ActiveTabChip => {
+                let tab = app.windows[&wid].tab_set.active_id().expect("a tab");
+                assert!(
+                    app.apply_native_tab_command(
+                        wid,
+                        crate::app_tabs::NativeTabCommand::Select(tab)
+                    )
+                );
+            }
+            Via::Pill => {
+                let session = app.front_terminal(wid).expect("terminal").session;
+                app.on_pill_wake(wid, session, crate::presence::PillHit::Go);
+            }
+            Via::Pointer(gesture, tracking) => {
+                if tracking {
+                    let term = app.front_terminal(wid).expect("terminal").term.clone();
+                    term_lock(&term).process(b"\x1b[?1003h\x1b[?1006h");
+                }
+                pointer_gesture(&mut app, wid, gesture);
             }
         }
         let _ = drain(pipe);
@@ -776,6 +900,434 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
         "the status tick's verdict where the press kept the hand on its row \
          wrongly (label, verdict): {wrong:?}"
     );
+}
+
+/// A drag across a path in a mouse-tracking app (Claude Code's transcript) keeps
+/// the composer's keys lit, and so does copying the selection after it. The app
+/// repaints its selection highlight above the caret and draws the caret back; had
+/// the drag or the copy drawn the generic boundary (the negative control,
+/// `clear_move_license`), that repaint would park the caret's row and every later
+/// key typed on it would be refused `program-row`.
+#[cfg(unix)]
+#[test]
+fn a_drag_into_a_tracking_app_keeps_the_composer_s_keys_lit() {
+    use std::time::Instant;
+
+    use aterm_effects::cursor_glow::AdmissionRecord;
+
+    use crate::cursor_glow::CursorGlow;
+
+    #[derive(Debug)]
+    enum Between {
+        Pointer(Gesture),
+        /// A drag, then the menu's Copy (⌘C on macOS).
+        DragThenMenuCopy,
+        /// A drag, then ⌘C as `on_key` reads it.
+        DragThenPhysicalCopy,
+        GenericBoundary,
+    }
+    let geom = glow_geom();
+    let mut cases = vec![
+        Between::Pointer(Gesture::Drag),
+        Between::Pointer(Gesture::Click),
+        Between::Pointer(Gesture::Wheel),
+        Between::DragThenMenuCopy,
+        Between::GenericBoundary,
+    ];
+    if super::HARDCODED_SUPER_CHORDS {
+        cases.push(Between::DragThenPhysicalCopy);
+    }
+    for between in cases {
+        let (mut app, pipe) = app_observing_pty();
+        let wid = WindowId(0);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let cfg = app.glow_config();
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        term_lock(&term).process(b"\x1b[?1003h\x1b[?1006h");
+        let mut out = Vec::new();
+        let mut seq = 0u64;
+        // One frame: the app's last print ended at `print`; its caret is drawn at `caret`.
+        let mut frame =
+            |app: &mut App, print: Option<(u16, u16, char)>, caret: (u16, u16), at: Instant| {
+                let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+                if let Some((row, end, glyph)) = print {
+                    seq += 1;
+                    glow.observe_print_anchor_glyph(Some((row, end, seq)), Some(glyph));
+                }
+                glow.observe_caret_drawn(true);
+                glow.tick(Some(caret), at, &cfg, geom, &mut out);
+            };
+        let key = |app: &mut App, c: char| {
+            assert_eq!(
+                app.input(
+                    wid,
+                    InputEvent::Key {
+                        key: Key::Character(c),
+                        mods: Modifiers::empty(),
+                        base_layout: None,
+                        layout_text: None,
+                        event_type: KeyEventType::Press,
+                    },
+                    Source::Human,
+                ),
+                crate::input::InputOutcome::Ok
+            );
+        };
+        frame(&mut app, None, (0, 0), Instant::now());
+        key(&mut app, 'h');
+        frame(&mut app, Some((0, 1, 'h')), (0, 1), Instant::now());
+        match between {
+            Between::Pointer(gesture) => pointer_gesture(&mut app, wid, gesture),
+            Between::DragThenMenuCopy | Between::DragThenPhysicalCopy => {
+                pointer_gesture(&mut app, wid, Gesture::Drag);
+            }
+            Between::GenericBoundary => app.clear_move_license(wid),
+        }
+        // The app's selection highlight over the path two rows down, the caret drawn back.
+        frame(&mut app, Some((2, 10, 's')), (0, 1), Instant::now());
+        match between {
+            Between::DragThenMenuCopy => {
+                app.fence_menu_action(crate::menu::MenuAction::Copy);
+                let _ = app.copy_selection();
+            }
+            Between::DragThenPhysicalCopy => {
+                use aterm_window::keyboard::{
+                    Key as WinitKey, KeyLocation, ModifiersState, SmolStr,
+                };
+
+                app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SUPER;
+                app.on_key(
+                    wid,
+                    aterm_window::event::KeyEvent::synthetic_for_test(
+                        PhysicalKey::Code(KeyCode::KeyC),
+                        WinitKey::Character(SmolStr::new("c")),
+                        Some(SmolStr::new("c")),
+                        KeyLocation::Standard,
+                        ElementState::Pressed,
+                        false,
+                    ),
+                );
+                app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
+            }
+            Between::Pointer(_) | Between::GenericBoundary => {}
+        }
+        // A quiet frame: the app's last print is still the highlight off the caret's row.
+        frame(&mut app, None, (0, 1), Instant::now());
+        let mut verdicts = Vec::new();
+        for (i, c) in ['x', 'y', 'z'].into_iter().enumerate() {
+            let col = 2 + i as u16;
+            key(&mut app, c);
+            frame(&mut app, Some((0, col, c)), (0, col), Instant::now());
+            verdicts.push(
+                app.windows[&wid]
+                    .fx
+                    .cursor()
+                    .glow
+                    .admission_log()
+                    .find(|r| r.origin == (0, col - 1) && r.target == (0, col))
+                    .map(|r| (r.reason, r.licence)),
+            );
+        }
+        let _ = drain(pipe);
+        match between {
+            Between::GenericBoundary => {
+                assert!(
+                    verdicts
+                        .iter()
+                        .all(|v| v
+                            .is_some_and(|(reason, _)| reason == CursorGlow::DECLINE_PROGRAM_ROW)),
+                    "negative control: the generic boundary parks the composer's row: {verdicts:?}"
+                )
+            }
+            lit => {
+                assert!(
+                    verdicts
+                        .iter()
+                        .all(|v| v
+                            .is_some_and(|(_, licence)| licence != AdmissionRecord::LICENCE_NONE)),
+                    "{lit:?}: every key typed after it lights its echo: {verdicts:?}"
+                )
+            }
+        }
+    }
+}
+
+/// Escape, Ctrl-C or a scrollback jump in an agent's composer (Claude Code's
+/// fullscreen prompt) keeps the composer's keys lit, by hand or through the control
+/// socket. The agent repaints another row after it (Claude's "Esc again to clear"
+/// footer) and draws the caret back; a generic boundary would let that repaint park
+/// the composer's row and refuse every later key typed on it `program-row`, which is
+/// what a shell in front and an editor the agent handed the terminal to still get: the
+/// negative controls. In Claude's vim INSERT the boundary still doubts the row: an Escape
+/// enters NORMAL, whose keys are motions and stay dark, and a key typed while `-- INSERT --`
+/// shows (again after `i`, or still after another boundary) settles the row and lights.
+#[cfg(unix)]
+#[test]
+fn an_escape_or_ctrl_c_in_an_agent_s_composer_keeps_its_keys_lit() {
+    use std::time::Instant;
+
+    use aterm_effects::cursor_glow::AdmissionRecord;
+    use aterm_types::keyboard::NamedKey;
+    use aterm_window::keyboard::{Key as WinitKey, KeyLocation, NamedKey as WNamed, SmolStr};
+
+    use crate::cursor_glow::CursorGlow;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Front {
+        Agent,
+        /// Claude with vim's `-- INSERT --` indicator under its composer.
+        VimInsert,
+        Shell,
+        HandedToAnEditor,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum Boundary {
+        /// Escape as `on_key` reads it.
+        PhysicalEscape,
+        /// Ctrl-C as `on_key` reads it.
+        PhysicalCtrlC,
+        /// A control `key esc`: the fence it records, then its press through the seam.
+        ControlKeyEsc,
+        /// A control verb's recorded hand-off, applied by `reconcile_licence`.
+        OwedFence,
+        /// A scrollback jump to the live screen.
+        ScrollView,
+    }
+    const AGENT: i32 = i32::MAX - 2;
+    const SHELL: i32 = i32::MAX - 1;
+    let geom = glow_geom();
+    let fronts = [
+        Front::Agent,
+        Front::VimInsert,
+        Front::Shell,
+        Front::HandedToAnEditor,
+    ];
+    let boundaries = [
+        Boundary::PhysicalEscape,
+        Boundary::PhysicalCtrlC,
+        Boundary::ControlKeyEsc,
+        Boundary::OwedFence,
+        Boundary::ScrollView,
+    ];
+    for (front, boundary) in fronts
+        .into_iter()
+        .flat_map(|front| boundaries.map(|boundary| (front, boundary)))
+    {
+        let (mut app, pipe) = app_observing_pty();
+        let wid = WindowId(0);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let cfg = app.glow_config();
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        // Claude's fullscreen composer frame and the footer under it, its caret in the composer.
+        let rule = "─".repeat(60);
+        const INSERT_FOOTER: &str = "-- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)";
+        const PLAIN_FOOTER: &str = "⏵⏵ auto mode on (shift+tab to cycle)";
+        let footer = match front {
+            Front::VimInsert => INSERT_FOOTER,
+            Front::Agent | Front::Shell | Front::HandedToAnEditor => PLAIN_FOOTER,
+        };
+        let escapes = matches!(boundary, Boundary::PhysicalEscape | Boundary::ControlKeyEsc);
+        term_lock(&term).process(
+            format!(
+                "\x1b[?1049h\x1b[?1003h\x1b[?1006h\x1b[6;1H{rule}\x1b[7;1H❯ \x1b[8;1H{rule}\
+                 \x1b[9;1H  {footer}\x1b[7;3H"
+            )
+            .as_bytes(),
+        );
+        let (group, program) = match front {
+            Front::Agent | Front::VimInsert | Front::HandedToAnEditor => (AGENT, "claude"),
+            Front::Shell => (SHELL, "zsh"),
+        };
+        let session = app.front_terminal(wid).expect("terminal").session;
+        app.session_factory.fg_probe = |master| master;
+        app.session_factory.handed_terminal = match front {
+            Front::HandedToAnEditor => |_| true,
+            Front::Agent | Front::VimInsert | Front::Shell => |_| false,
+        };
+        app.pool.sessions.get_mut(&session).unwrap().session.master = group;
+        {
+            let ctx = app.pool.get(session).unwrap().ctx.clone();
+            let mut timeline = ctx.timeline.lock().unwrap();
+            timeline.note_foreground_group(group);
+            timeline.set_program(group, Some(program.into()));
+        }
+        assert_eq!(
+            app.front_agent_composer(wid),
+            matches!(front, Front::Agent | Front::VimInsert),
+            "{front:?}"
+        );
+        assert_eq!(
+            app.boundary_keeps_hand(wid),
+            front == Front::Agent,
+            "{front:?}"
+        );
+        let mut out = Vec::new();
+        let mut seq = 0u64;
+        // One frame: the app's last print ended at `print`; its caret is drawn at `caret`.
+        let mut frame =
+            |app: &mut App, print: Option<(u16, u16, char)>, caret: (u16, u16), at: Instant| {
+                let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+                if let Some((row, end, glyph)) = print {
+                    seq += 1;
+                    glow.observe_print_anchor_glyph(Some((row, end, seq)), Some(glyph));
+                }
+                glow.observe_caret_drawn(true);
+                glow.tick(Some(caret), at, &cfg, geom, &mut out);
+            };
+        let key = |app: &mut App, c: char| {
+            assert_eq!(
+                app.input(
+                    wid,
+                    InputEvent::Key {
+                        key: Key::Character(c),
+                        mods: Modifiers::empty(),
+                        base_layout: None,
+                        layout_text: None,
+                        event_type: KeyEventType::Press,
+                    },
+                    Source::Human,
+                ),
+                crate::input::InputOutcome::Ok
+            );
+        };
+        let physical = |app: &mut App, code: KeyCode, logical: WinitKey, mods: ModifiersState| {
+            app.windows.get_mut(&wid).unwrap().mods = mods;
+            app.on_key(
+                wid,
+                aterm_window::event::KeyEvent::synthetic_for_test(
+                    PhysicalKey::Code(code),
+                    logical,
+                    None,
+                    KeyLocation::Standard,
+                    ElementState::Pressed,
+                    false,
+                ),
+            );
+            app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
+        };
+        frame(&mut app, None, (0, 0), Instant::now());
+        key(&mut app, 'h');
+        frame(&mut app, Some((0, 1, 'h')), (0, 1), Instant::now());
+        match boundary {
+            Boundary::PhysicalEscape => physical(
+                &mut app,
+                KeyCode::Escape,
+                WinitKey::Named(WNamed::Escape),
+                ModifiersState::empty(),
+            ),
+            Boundary::PhysicalCtrlC => physical(
+                &mut app,
+                KeyCode::KeyC,
+                WinitKey::Character(SmolStr::new("c")),
+                ModifiersState::CONTROL,
+            ),
+            Boundary::ControlKeyEsc => {
+                if let Some(keep_hand) = crate::control::control_fence(
+                    aterm_types::control_verbs::input_of("key"),
+                    "key",
+                    "esc",
+                    false,
+                ) {
+                    app.pool.get(session).unwrap().ctx.licence.fence(keep_hand);
+                }
+                let esc = crate::control::parse_key("esc").expect("a named key");
+                assert!(matches!(
+                    esc,
+                    InputEvent::Key {
+                        key: Key::Named(NamedKey::Escape),
+                        ..
+                    }
+                ));
+                assert_eq!(
+                    app.input(wid, esc, Source::Controller),
+                    crate::input::InputOutcome::Ok
+                );
+            }
+            Boundary::OwedFence => {
+                app.pool.get(session).unwrap().ctx.licence.fence(false);
+                app.reconcile_licence(wid);
+            }
+            Boundary::ScrollView => {
+                let _ = app.input(
+                    wid,
+                    InputEvent::ScrollView(crate::input::ScrollIntent::Bottom),
+                    Source::Human,
+                );
+            }
+        }
+        if front == Front::VimInsert && escapes {
+            // Claude's Escape enters NORMAL: the INSERT indicator leaves the footer.
+            term_lock(&term)
+                .process(format!("\x1b[9;1H\x1b[2K  {PLAIN_FOOTER}\x1b[7;3H").as_bytes());
+        }
+        // The agent's footer hint two rows down, the caret drawn back on the composer.
+        frame(&mut app, Some((2, 10, 's')), (0, 1), Instant::now());
+        // A quiet frame: the app's last print is still the footer, off the caret's row.
+        frame(&mut app, None, (0, 1), Instant::now());
+        type Frame<'f> = dyn FnMut(&mut App, Option<(u16, u16, char)>, (u16, u16), Instant) + 'f;
+        let type_at = |app: &mut App, frame: &mut Frame<'_>, glyphs: &[char], col0: u16| {
+            let mut verdicts = Vec::new();
+            for (i, &c) in glyphs.iter().enumerate() {
+                let col = col0 + i as u16;
+                key(app, c);
+                frame(app, Some((0, col, c)), (0, col), Instant::now());
+                verdicts.push(
+                    app.windows[&wid]
+                        .fx
+                        .cursor()
+                        .glow
+                        .admission_log()
+                        .find(|r| r.origin == (0, col - 1) && r.target == (0, col))
+                        .map(|r| (r.reason, r.licence)),
+                );
+            }
+            verdicts
+        };
+        let lit = |verdicts: &[Option<(&str, &str)>]| {
+            verdicts
+                .iter()
+                .all(|v| v.is_some_and(|(_, licence)| licence != AdmissionRecord::LICENCE_NONE))
+        };
+        let dark = |verdicts: &[Option<(&str, &str)>]| {
+            verdicts
+                .iter()
+                .all(|v| v.is_some_and(|(reason, _)| reason == CursorGlow::DECLINE_PROGRAM_ROW))
+        };
+        let verdicts = type_at(&mut app, &mut frame, &['x', 'y', 'z'], 2);
+        match front {
+            Front::Agent => assert!(
+                lit(&verdicts),
+                "{boundary:?} in Claude's composer: every key typed after it lights its echo: \
+                 {verdicts:?}"
+            ),
+            Front::VimInsert if !escapes => assert!(
+                lit(&verdicts),
+                "{boundary:?} leaves vim in INSERT: the keys typed after it settle the row and \
+                 light: {verdicts:?}"
+            ),
+            Front::VimInsert | Front::Shell | Front::HandedToAnEditor => assert!(
+                dark(&verdicts),
+                "negative control, {boundary:?} with {front:?} in front: the generic boundary \
+                 parks the caret's row: {verdicts:?}"
+            ),
+        }
+        if front == Front::VimInsert && escapes {
+            // `i` returns to INSERT: Claude echoes nothing for it and puts the indicator back.
+            key(&mut app, 'i');
+            term_lock(&term)
+                .process(format!("\x1b[9;1H\x1b[2K  {INSERT_FOOTER}\x1b[7;3H").as_bytes());
+            frame(&mut app, Some((2, 12, 'T')), (0, 4), Instant::now());
+            frame(&mut app, None, (0, 4), Instant::now());
+            let verdicts = type_at(&mut app, &mut frame, &['p', 'q'], 5);
+            assert!(
+                lit(&verdicts),
+                "{boundary:?}, then `i`: the keys typed in INSERT again light: {verdicts:?}"
+            );
+        }
+        let _ = drain(pipe);
+    }
 }
 
 /// The insert arm is Rainbow Kitty's alone: a bare Tab and a bare ⌃V arm
@@ -1291,7 +1843,7 @@ fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
 #[test]
 fn a_bare_modifier_or_lock_key_is_inert() {
     use aterm_window::keyboard::NamedKey as WNamed;
-    fn park(app: &mut App, wid: WindowId, deadline: std::time::Instant) {
+    fn park(app: &mut App, wid: WindowId, deadline: std::time::Instant) -> std::time::Instant {
         let ws = app.windows.get_mut(&wid).expect("window");
         ws.blink_phase = false;
         ws.next_blink = Some(deadline);
@@ -1299,13 +1851,13 @@ fn a_bare_modifier_or_lock_key_is_inert() {
         let now = std::time::Instant::now();
         ws.fx.cursor_mut().glow.note_motion(now);
         ws.fx.cursor_mut().trail.note_navigation(now);
+        now
     }
-    fn licensed(app: &App, wid: WindowId) -> (bool, bool) {
+    fn licensed(app: &App, wid: WindowId, at: std::time::Instant) -> (bool, bool) {
         let cursor = app.windows[&wid].fx.cursor();
-        let now = std::time::Instant::now();
         (
-            cursor.glow.move_licensed(now),
-            cursor.trail.move_licensed(now),
+            cursor.glow.move_licensed(at),
+            cursor.trail.move_licensed(at),
         )
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1313,7 +1865,7 @@ fn a_bare_modifier_or_lock_key_is_inert() {
     let wid = WindowId(0);
     let term = scrolled_back_with_a_selection(&mut app, wid);
     let offset_before = term_lock(&term).grid().display_offset();
-    let assert_inert = |app: &App, what: &str| {
+    let assert_inert = |app: &App, parked: std::time::Instant, what: &str| {
         let ws = &app.windows[&wid];
         assert!(!ws.blink_phase, "{what} must not snap the cursor solid");
         assert_eq!(
@@ -1323,7 +1875,7 @@ fn a_bare_modifier_or_lock_key_is_inert() {
         );
         assert_eq!(ws.scroll_frac_px, 7, "{what} must not cancel the glide");
         assert_eq!(
-            licensed(app, wid),
+            licensed(app, wid, parked),
             (true, true),
             "{what} must not revoke the word move's licence"
         );
@@ -1351,14 +1903,14 @@ fn a_bare_modifier_or_lock_key_is_inert() {
         (WNamed::Fn, KeyCode::Fn),
         (WNamed::FnLock, KeyCode::AltRight),
     ] {
-        park(&mut app, wid, deadline);
+        let parked = park(&mut app, wid, deadline);
         app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
         app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::ALT);
         app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::empty());
-        assert_inert(&app, &format!("bare {named:?}"));
+        assert_inert(&app, parked, &format!("bare {named:?}"));
     }
 
-    park(&mut app, wid, deadline);
+    let parked = park(&mut app, wid, deadline);
     let _ = app.input(
         wid,
         InputEvent::Key {
@@ -1370,7 +1922,7 @@ fn a_bare_modifier_or_lock_key_is_inert() {
         },
         Source::Human,
     );
-    assert_inert(&app, "a seam-routed bare Shift");
+    assert_inert(&app, parked, "a seam-routed bare Shift");
 
     park(&mut app, wid, deadline);
     let _ = app.input(
@@ -1393,9 +1945,13 @@ fn a_bare_modifier_or_lock_key_is_inert() {
         (WNamed::Escape, KeyCode::Escape),
         (WNamed::Backspace, KeyCode::Backspace),
     ] {
-        park(&mut app, wid, deadline);
+        let parked = park(&mut app, wid, deadline);
         app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
-        assert_eq!(licensed(&app, wid), (false, false), "{named:?} revokes it");
+        assert_eq!(
+            licensed(&app, wid, parked),
+            (false, false),
+            "{named:?} revokes it"
+        );
     }
 
     let _ = scrolled_back_with_a_selection(&mut app, wid);

@@ -28,6 +28,7 @@ pub(crate) fn make_chatgpt_jwt(email: Option<&str>, plan: &str, exp: i64) -> Str
         "https://api.openai.com/auth": {
             "chatgpt_plan_type": plan,
             "chatgpt_account_id": "acct_native_test",
+            "chatgpt_user_id": "user_native_test",
         }
     });
     if let Some(email) = email
@@ -47,7 +48,7 @@ struct RecordedHttp {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<RecordedHttp> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     let header_end = loop {
@@ -110,7 +111,7 @@ fn raw_get_loopback(url: &str) -> (u16, String) {
     let rest = url.strip_prefix("http://").expect("http url");
     let (host_port, path_and_query) = rest.split_once('/').expect("path");
     let mut stream = TcpStream::connect(host_port).expect("connect callback");
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN));
     let req =
         format!("GET /{path_and_query} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).expect("write callback");
@@ -150,8 +151,7 @@ pub(crate) fn mock_login_in_home(
 
     let server = std::thread::spawn(move || {
         let _ = listener.set_nonblocking(true);
-        let until = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < until {
+        while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let _ = stream.set_nonblocking(false);
@@ -304,6 +304,14 @@ fn native_pkce_login_verifies_s256_writes_private_auth_json_and_reads_account() 
     );
     let auth_path = home.join("auth.json");
     assert!(auth_path.is_file(), "auth.json written directly");
+    let saved = load_stored_auth(&home).unwrap();
+    assert!(
+        saved.doc["tokens"]
+            .get("login_owner_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty()),
+        "each completed native login needs an owner ID"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -353,6 +361,265 @@ fn native_pkce_login_verifies_s256_writes_private_auth_json_and_reads_account() 
         read_account_email(&explicit_auth).as_deref(),
         Some("codex-two@example.com")
     );
+}
+
+fn login_case(case: i64) -> [(&'static str, i64); 6] {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let original = json!({"auth_mode":"chatgpt", "marker":"keep-on-refusal", "tokens":{
+        "access_token":"keep-original", "refresh_token":"keep-refresh",
+        "login_owner_id":"previous-owner",
+        "oauth_provenance":{"issuer":"https://old.example", "client_id":"old-client"}
+    }});
+    write_auth_doc(tmp.path(), &original).unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let issuer = format!("http://127.0.0.1:{port}/tenant");
+    let endpoints = Endpoints {
+        issuer: match case {
+            10 => DEFAULT_ISSUER.to_owned(),
+            11 => format!("{issuer}///"),
+            12 => format!("{issuer}?query"),
+            _ => issuer.clone(),
+        },
+        token_url: if case == 21 {
+            "http://192.0.2.1/oauth/token".to_owned()
+        } else {
+            format!("{issuer}/oauth/token")
+        },
+        callback_ports: vec![],
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server_seen = Arc::clone(&seen);
+    let server_issuer = issuer.clone();
+    let server = std::thread::spawn(move || {
+        for round in 0..if case == 17 { 2 } else { 1 } {
+            let (mut stream, _) = listener.accept().unwrap();
+            let Some(request) = read_http_request(&mut stream) else {
+                break;
+            };
+            let jwt = |user: Option<&str>| {
+                make_jwt(&json!({
+                    "iss":if case == 13 {"https://untrusted.example"} else {server_issuer.as_str()},
+                    "jti":round, "email":"owner@example.test",
+                    "https://api.openai.com/auth":{"chatgpt_user_id":user, "chatgpt_account_id":"workspace-one"}
+                }))
+            };
+            let id_token = if case == 22 {
+                make_jwt(&Value::Null)
+            } else if case == 2 || case == 14 {
+                "invalid".to_owned()
+            } else {
+                jwt(if case == 4 || case == 5 {
+                    None
+                } else {
+                    Some("user-a")
+                })
+            };
+            let access_token = if case == 23 {
+                make_jwt(&json!([]))
+            } else if case == 2 || case == 15 {
+                "invalid".to_owned()
+            } else {
+                jwt(if case == 1 {
+                    Some("user-b")
+                } else if case == 3 || case == 5 {
+                    None
+                } else {
+                    Some("user-a")
+                })
+            };
+            let mut payload = json!({
+                "id_token":id_token, "access_token":access_token, "refresh_token":"new-refresh"
+            });
+            if case == 6 {
+                payload.as_object_mut().unwrap().remove("id_token");
+            }
+            if case == 7 {
+                payload.as_object_mut().unwrap().remove("access_token");
+            }
+            if case == 8 {
+                payload.as_object_mut().unwrap().remove("refresh_token");
+            }
+            if case == 16 {
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("login_owner_id".into(), json!("forged-owner"));
+                payload.as_object_mut().unwrap().insert(
+                    "oauth_provenance".into(),
+                    json!({"issuer":"https://forged.example", "client_id":"forged-client"}),
+                );
+            }
+            server_seen.lock().unwrap().push(request);
+            send_http_json(
+                &mut stream,
+                if case == 9 {
+                    "400 Bad Request"
+                } else {
+                    "200 OK"
+                },
+                &payload,
+            );
+        }
+    });
+    let before = std::fs::read(tmp.path().join(AUTH_FILE)).unwrap();
+    let wait = if case == 20 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(60)
+    };
+    let exchange = || CodeExchange {
+        home: tmp.path(),
+        endpoints: &endpoints,
+        redirect_uri: "http://127.0.0.1/callback",
+        code: "code",
+        code_verifier: "verifier",
+        wait,
+        now: 1_790_000_000,
+    };
+    let perform = || {
+        exchange_code_and_persist(
+            tmp.path(),
+            &endpoints,
+            "http://127.0.0.1/callback",
+            "code",
+            "verifier",
+            wait,
+            1_790_000_000,
+        )
+    };
+    let mut result = if case == 18 {
+        exchange().persist(Some(""))
+    } else if case == 19 {
+        exchange().persist(None)
+    } else {
+        perform()
+    };
+    let first = result.as_ref().and_then(|_| load_stored_auth(tmp.path()));
+    if case == 17 {
+        result = perform();
+    }
+    let _ = TcpStream::connect(("127.0.0.1", port));
+    server.join().unwrap();
+    let after = result.as_ref().and_then(|_| load_stored_auth(tmp.path()));
+    let owner = |stored: &StoredAuth| {
+        stored.doc["tokens"]
+            .get("login_owner_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let mut fresh = after.as_ref().is_none_or(|stored| {
+        owner(stored).is_some_and(|owner| {
+            owner != "previous-owner"
+                && owner != "forged-owner"
+                && owner.len() == 43
+                && base64url_decode(&owner).is_some_and(|b| b.len() == 32)
+        })
+    });
+    if case == 17 {
+        let (first, after) = (first.as_ref().unwrap(), after.as_ref().unwrap());
+        fresh &= owner(first) != owner(after)
+            && first.access_token != after.access_token
+            && first.account_id == after.account_id
+            && updated_disk_auth(first, after.clone()).is_none();
+    }
+    let bound = after.as_ref().is_none_or(|stored| {
+        if case == 10 || case == 12 {
+            stored.doc["tokens"].get("oauth_provenance").is_none()
+        } else {
+            stored.doc["tokens"].get("oauth_provenance")
+                == Some(&json!({
+                    "issuer":endpoints.issuer, "client_id":CLIENT_ID
+                }))
+                && refresh_authority(stored, "invalid fallback").is_some_and(|authority| {
+                    authority.token_url == endpoints.token_url && authority.client_id == CLIENT_ID
+                })
+        }
+    });
+    let kept = result.is_some() || std::fs::read(tmp.path().join(AUTH_FILE)).unwrap() == before;
+    let seen = seen.lock().unwrap();
+    for request in seen.iter() {
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/tenant/oauth/token");
+        let form = parse_query_params(&request.body);
+        assert!(form.contains(&("client_id".into(), CLIENT_ID.into())));
+    }
+    assert_eq!(
+        seen.len(),
+        if (18..=21).contains(&case) {
+            0
+        } else if case == 17 {
+            2
+        } else {
+            1
+        }
+    );
+    [
+        ("phase", 1),
+        ("result", i64::from(result.is_some())),
+        ("posted", i64::from(!seen.is_empty())),
+        ("kept", i64::from(kept)),
+        ("fresh", i64::from(fresh)),
+        ("bound", i64::from(bound)),
+    ]
+}
+
+pub(crate) fn login_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    match action {
+        "AnotherCase" => {
+            next.insert("case", state["case"] + 1);
+        }
+        "Exchange" => {
+            for (key, value) in login_case(state["case"]) {
+                next.insert(key, value);
+            }
+        }
+        _ => unreachable!(),
+    }
+    next
+}
+
+#[test]
+fn codex_login_publication_conforms_and_rejects_conflicting_token_users() {
+    super::codex_login_publication_environment();
+    let model = aterm_models_harness::codex_login_publication_model();
+    assert_eq!(model.mutant_dials(), (1..=6).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 48);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = login_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
+    let good = login_transition(&model.init_state(), "Exchange");
+    let mut refused_case = model.init_state();
+    refused_case.insert("case", 1);
+    let refused = login_transition(&refused_case, "Exchange");
+    for (key, value, law) in [
+        ("result", 0, "Admission"),
+        ("posted", 0, "RequestBoundary"),
+        ("kept", 0, "PreserveRejected"),
+        ("fresh", 0, "FreshOwner"),
+        ("bound", 0, "Provenance"),
+    ] {
+        let mut bad = if law == "PreserveRejected" {
+            refused.clone()
+        } else {
+            good.clone()
+        };
+        bad.insert(key, value);
+        assert!(!model.check_invariant(law, &bad));
+    }
 }
 
 #[test]
@@ -408,7 +675,7 @@ fn off_pin_issuer_state_mismatch_provider_error_and_refusal_are_enforced() {
             .expect("host_port");
         {
             let mut rebind = TcpStream::connect(host_port).expect("connect rebind");
-            let _ = rebind.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = rebind.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN));
             let mut payload =
                 format!("GET /auth/callback?code=forged&state={state} HTTP/1.1\r\nX-Pad: ")
                     .into_bytes();
@@ -422,13 +689,19 @@ fn off_pin_issuer_state_mismatch_provider_error_and_refusal_are_enforced() {
         let (bad_status, _) =
             raw_get_loopback(&format!("{redirect}?code=forged&state=wrong_state_value"));
         assert_eq!(bad_status, 400);
+        let (dup_state_status, _) =
+            raw_get_loopback(&format!("{redirect}?code=forged&state={state}&state=extra"));
+        assert_eq!(dup_state_status, 400);
+        let (bad_hex_status, _) =
+            raw_get_loopback(&format!("{redirect}?code=bad%ZZ&state={state}"));
+        assert_eq!(bad_hex_status, 400);
         bad_state_finished = (handoff.finished)();
 
         let (err_status, _) =
             raw_get_loopback(&format!("{redirect}?error=access_denied&state={state}"));
         assert_eq!(err_status, 200);
         let start = Instant::now();
-        while !(handoff.finished)() && start.elapsed() < Duration::from_secs(5) {
+        while !(handoff.finished)() && start.elapsed() < aterm_spec::wait::MUST_HAPPEN {
             std::thread::sleep(Duration::from_millis(5));
         }
         matching_err_finished = (handoff.finished)();
@@ -582,6 +855,11 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
     assert_eq!(
         usage_url_from_base("https://codex.enterprise.example"),
         "https://codex.enterprise.example/api/codex/usage"
+    );
+    assert_eq!(
+        usage_url_from_base("https://chatgpt.com.enterprise.example"),
+        "https://chatgpt.com.enterprise.example/api/codex/usage",
+        "lookalike suffix host must not be rewritten as chatgpt.com"
     );
 
     let backend_payload = json!({
@@ -973,21 +1251,37 @@ fn concurrent_disk_rotation_reloads_before_refresh_and_cleartext_remote_endpoint
     assert!(!is_allowed_auth_endpoint(
         "http://evil.example/backend-api/wham/usage"
     ));
+    assert!(!is_allowed_auth_endpoint(
+        "https://chatgpt.com/backend-api?evil=1/wham/usage"
+    ));
+    assert!(!is_allowed_auth_endpoint(
+        "https://chatgpt.com/backend-api#frag/wham/usage"
+    ));
+    assert!(!is_allowed_auth_endpoint(
+        "https://chatgpt.com\\@evil.example/wham/usage"
+    ));
 
     let slot_dir = tmp.path().join("slot");
     let user_home = tmp.path().join("user-home");
     std::fs::create_dir_all(&slot_dir).expect("slot_dir");
     std::fs::create_dir_all(user_home.join(".codex")).expect("user .codex");
-    std::fs::write(
-        slot_dir.join("config.toml"),
-        "chatgpt_base_url = \"http://evil.example/backend-api\"\n",
-    )
-    .expect("bad config");
-    assert_eq!(
-        resolve_usage_url(&slot_dir.join("auth.json"), &user_home),
-        "https://chatgpt.com/backend-api/wham/usage",
-        "cleartext non-loopback chatgpt_base_url must fall back to HTTPS default"
-    );
+    for bad_base in [
+        "http://evil.example/backend-api",
+        "https://chatgpt.com/backend-api?evil=1",
+        "https://chatgpt.com/backend-api#frag",
+        "https://chatgpt.com:99999/backend-api",
+    ] {
+        std::fs::write(
+            slot_dir.join("config.toml"),
+            format!("chatgpt_base_url = {bad_base:?}\n"),
+        )
+        .expect("bad config");
+        assert_eq!(
+            resolve_usage_url(&slot_dir.join("auth.json"), &user_home),
+            "https://chatgpt.com/backend-api/wham/usage",
+            "rejected chatgpt_base_url {bad_base:?} must fall back to HTTPS default"
+        );
+    }
     std::fs::write(
         slot_dir.join("config.toml"),
         "chatgpt_base_url = \"https://codex.enterprise.example\"\n",
@@ -1130,6 +1424,922 @@ fn concurrent_disk_rotation_reloads_before_refresh_and_cleartext_remote_endpoint
     );
 }
 
+fn refresh_case(case: i64, early: bool) -> [(&'static str, i64); 6] {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("login");
+    let initial = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 3600);
+    let rotated = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 7200);
+    let response = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 5400);
+    let mut initial_doc = json!({
+        "auth_mode":"chatgpt", "tokens":{
+            "id_token":initial, "access_token":initial,
+            "refresh_token":"initial-refresh", "account_id":"acct_native_test"
+        }
+    });
+    if case == 7 {
+        let tokens = initial_doc
+            .as_object_mut()
+            .unwrap()
+            .get_mut("tokens")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        tokens.remove("account_id");
+        tokens.remove("id_token");
+        tokens.insert("access_token".into(), json!("initial-opaque-token"));
+    }
+    write_auth_doc(&home, &initial_doc).unwrap();
+    let initial_bytes = std::fs::read(home.join(AUTH_FILE)).unwrap();
+    let before = load_stored_auth(&home).unwrap();
+    let mut concurrent = initial_doc.clone();
+    match case {
+        0 | 4 | 5 => {}
+        1 | 2 | 7 => {
+            concurrent = json!({
+                "auth_mode":"chatgpt", "tokens":{
+                    "id_token":rotated, "access_token":rotated,
+                    "refresh_token":"concurrent-refresh",
+                    "account_id":if case == 2 {"another-account"} else {"acct_native_test"}
+                }, "concurrent_metadata":"retained"
+            });
+        }
+        3 => {
+            concurrent = json!({"auth_mode":"chatgpt", "tokens":{
+                "access_token":"concurrent-opaque-token", "refresh_token":"concurrent-refresh"
+            }});
+        }
+        6 => {
+            concurrent
+                .as_object_mut()
+                .unwrap()
+                .insert("concurrent_metadata".into(), json!("retained"));
+        }
+        8 => {
+            concurrent
+                .as_object_mut()
+                .unwrap()
+                .get_mut("tokens")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("refresh_token".into(), json!("concurrent-refresh"));
+        }
+        _ => unreachable!(),
+    }
+    let mutate = move |home: &Path| {
+        match case {
+            0 => {}
+            4 => std::fs::rename(home.join(AUTH_FILE), home.join("retained-auth.json")).unwrap(),
+            5 => {
+                std::fs::write(home.join(AUTH_FILE), b"unreadable authentication document").unwrap()
+            }
+            _ => write_auth_doc(home, &concurrent).unwrap(),
+        }
+        std::fs::read(home.join(AUTH_FILE)).ok()
+    };
+    let early_kept = early.then(|| mutate(&home));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_home = home.clone();
+    let response_for_server = response.clone();
+    let posted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_posted = Arc::clone(&posted);
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let Some(request) = read_http_request(&mut stream) else {
+            // A refused pre-request observation sends no HTTP. The caller's
+            // empty connection wakes this listener without a timing assertion.
+            return early_kept.unwrap();
+        };
+        server_posted.store(true, Ordering::SeqCst);
+        assert_eq!(
+            (request.method.as_str(), request.target.as_str()),
+            ("POST", "/oauth/token")
+        );
+        let kept = if early {
+            early_kept.unwrap()
+        } else {
+            mutate(&server_home)
+        };
+        send_http_json(
+            &mut stream,
+            "200 OK",
+            &json!({
+                "id_token":response_for_server, "access_token":response_for_server,
+                "refresh_token":"response-refresh"
+            }),
+        );
+        kept
+    });
+    let result = refresh_stored_auth(
+        &home,
+        &before,
+        &format!("http://127.0.0.1:{port}/oauth/token"),
+        Duration::from_secs(60),
+        now,
+    );
+    let _ = TcpStream::connect(("127.0.0.1", port));
+    let kept = server.join().unwrap();
+    let after = std::fs::read(home.join(AUTH_FILE)).ok();
+    let current = load_stored_auth(&home);
+    let wrote = current.as_ref().is_some_and(|a| a.access_token == response);
+    let preserved = if case == 0 {
+        true
+    } else if case == 6 {
+        current
+            .as_ref()
+            .is_some_and(|a| a.doc["concurrent_metadata"] == json!("retained"))
+    } else {
+        after == kept
+    };
+    if case == 4 {
+        assert_eq!(
+            std::fs::read(home.join("retained-auth.json")).unwrap(),
+            initial_bytes
+        );
+    }
+    [
+        ("phase", 1),
+        ("wrote", i64::from(wrote)),
+        ("returned", i64::from(result.is_some())),
+        (
+            "reused",
+            i64::from(
+                result
+                    .as_ref()
+                    .is_some_and(|a| a.refresh_token.as_deref() == Some("concurrent-refresh")),
+            ),
+        ),
+        ("kept", i64::from(preserved)),
+        ("posted", i64::from(posted.load(Ordering::SeqCst))),
+    ]
+}
+
+pub(crate) fn refresh_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    match action {
+        "AnotherCase" => {
+            next.insert("case", state["case"] + 1);
+        }
+        "BeforeRequest" => {
+            next.insert("early", 1);
+        }
+        "Refresh" => {
+            for (key, value) in refresh_case(state["case"], state["early"] == 1) {
+                next.insert(key, value);
+            }
+        }
+        _ => unreachable!(),
+    }
+    next
+}
+
+#[test]
+fn a_refresh_response_cannot_replace_a_login_changed_during_the_request() {
+    super::codex_refresh_publication_environment();
+    let model = aterm_models_harness::codex_refresh_publication_model();
+    assert_eq!(model.mutant_dials(), (1..=7).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 36);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = refresh_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
+    let mut rotated = model.init_state();
+    rotated.insert("case", 1);
+    let mut bad = refresh_transition(&rotated, "Refresh");
+    bad.insert("wrote", 1);
+    assert!(!model.check_invariant("ReuseKnownRotation", &bad));
+    bad.insert("kept", 0);
+    assert!(!model.check_invariant("PreserveObserved", &bad));
+}
+
+#[test]
+fn separately_bounded_responses_retain_large_tokens_across_fresh_file_reads() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let initial_id = make_chatgpt_jwt(Some("owner@example.test"), "pro", 1_900_000_000);
+    let large_id = make_jwt(&json!({
+        "email":"owner@example.test", "exp":1_900_000_000,
+        "https://api.openai.com/auth":{
+            "chatgpt_account_id":"acct_native_test", "chatgpt_user_id":"user_native_test"
+        },
+        "padding":"x".repeat(170_000)
+    }));
+    let large_refresh = "r".repeat(200_000);
+    let large_access = "a".repeat(200_000);
+    let metadata = json!({"notes":"m".repeat(100_000),"keep":[1,2,3]});
+    write_auth_doc(
+        tmp.path(),
+        &json!({
+            "auth_mode":"chatgpt", "metadata":metadata, "tokens":{
+                "id_token":initial_id, "access_token":initial_id,
+                "refresh_token":"initial-refresh", "account_id":"acct_native_test"
+            }
+        }),
+    )
+    .unwrap();
+    let responses = [
+        json!({"id_token":large_id, "access_token":"first-access", "refresh_token":"first-refresh"}),
+        json!({"access_token":"second-access", "refresh_token":large_refresh}),
+        json!({"access_token":large_access}),
+        json!({"access_token":"last-access"}),
+    ];
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let mut sent = Vec::new();
+        for response in responses {
+            assert!(aterm_json::to_vec(&response).unwrap().len() <= MESSAGE_MAX);
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream).unwrap();
+            let body: Value = aterm_json::from_str(&request.body).unwrap();
+            sent.push(body["refresh_token"].as_str().unwrap().to_owned());
+            send_http_json(&mut stream, "200 OK", &response);
+        }
+        sent
+    });
+    for round in 0..4 {
+        let before = load_stored_auth(tmp.path()).expect("fresh bounded file read");
+        let refreshed = refresh_stored_auth(
+            tmp.path(),
+            &before,
+            &format!("http://127.0.0.1:{port}/oauth/token"),
+            Duration::from_secs(60),
+            1_790_000_000 + round,
+        )
+        .expect("refresh from the saved replacement");
+        let reloaded = load_stored_auth(tmp.path()).expect("reload published auth");
+        assert_eq!(refreshed.doc, reloaded.doc);
+        assert_eq!(reloaded.doc["metadata"], metadata);
+        assert_eq!(reloaded.id_token.as_deref(), Some(large_id.as_str()));
+        if round >= 1 {
+            assert_eq!(
+                reloaded.refresh_token.as_deref(),
+                Some(large_refresh.as_str())
+            );
+        }
+        if round == 2 {
+            assert_eq!(reloaded.access_token, large_access);
+            let bytes = std::fs::read(tmp.path().join(AUTH_FILE)).unwrap();
+            assert!(bytes.len() > 2 * MESSAGE_MAX);
+            assert!(bytes.len() < AUTH_FILE_MAX);
+        }
+    }
+    assert_eq!(
+        server.join().unwrap(),
+        [
+            "initial-refresh",
+            "first-refresh",
+            &large_refresh,
+            &large_refresh
+        ]
+    );
+}
+
+fn result_case(case: i64) -> [(&'static str, i64); 6] {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let now = 1_790_000_000;
+    let jwt = |user: &str, nonce: &str| {
+        make_jwt(&json!({
+            "jti":nonce, "email":"owner@example.test", "https://api.openai.com/auth":{
+                "chatgpt_user_id":user,"chatgpt_account_id":"workspace-a"
+            }
+        }))
+    };
+    let old = jwt("user-a", "old");
+    let refreshed = jwt("user-a", "refreshed");
+    let mut initial = json!({"auth_mode":"chatgpt", "metadata":"original", "tokens":{
+        "id_token":old, "access_token":old, "refresh_token":"old-refresh",
+        "account_id":"workspace-a", "login_owner_id":"login-a"
+    }});
+    if case == 10 {
+        initial
+            .as_object_mut()
+            .unwrap()
+            .insert("padding".into(), json!("x".repeat(100_000)));
+    }
+    write_auth_doc(tmp.path(), &initial).unwrap();
+    let prior = load_stored_auth(tmp.path()).unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_http_request(&mut stream).unwrap();
+        send_http_json(
+            &mut stream,
+            "200 OK",
+            &json!({
+                "id_token":refreshed, "access_token":if case == 10 {"x".repeat(200_000)} else {refreshed},
+                "refresh_token":"refreshed"
+            }),
+        );
+    });
+    let published = RefCell::new(None);
+    let later = RefCell::new(std::fs::read(tmp.path().join(AUTH_FILE)).ok());
+    let written = std::cell::Cell::new(false);
+    let result = refresh_stored_auth_with_publish(
+        tmp.path(),
+        &prior,
+        &format!("http://127.0.0.1:{port}/oauth/token"),
+        Duration::from_secs(60),
+        now,
+        |home, doc| {
+            if case == 9 {
+                return Err(std::io::Error::other("injected publication failure"));
+            }
+            write_auth_doc(home, doc)?;
+            written.set(true);
+            let expected = load_stored_auth(home);
+            if case == 10 {
+                let bytes = std::fs::read(home.join(AUTH_FILE)).unwrap();
+                assert!(bytes.len() > MESSAGE_MAX);
+                assert!(
+                    expected.is_some(),
+                    "a successfully published refresh must survive a bounded reload"
+                );
+            }
+            published.replace(expected);
+            let mut changed = doc.clone();
+            match case {
+                1 | 2 => {
+                    let changed_jwt = jwt(if case == 2 { "user-b" } else { "user-a" }, "later");
+                    let tokens = changed
+                        .as_object_mut()
+                        .unwrap()
+                        .get_mut("tokens")
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap();
+                    tokens.insert("id_token".into(), json!(changed_jwt));
+                    tokens.insert("access_token".into(), json!(changed_jwt));
+                    tokens.insert("refresh_token".into(), json!("later-refresh"));
+                }
+                3 => {
+                    changed
+                        .as_object_mut()
+                        .unwrap()
+                        .get_mut("tokens")
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("account_id".into(), json!("workspace-b"));
+                }
+                4 => {
+                    changed
+                        .as_object_mut()
+                        .unwrap()
+                        .get_mut("tokens")
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("login_owner_id".into(), json!("login-b"));
+                }
+                5 => {
+                    std::fs::write(home.join(AUTH_FILE), b"malformed credentials").unwrap();
+                }
+                6 => {
+                    std::fs::remove_file(home.join(AUTH_FILE)).unwrap();
+                }
+                7 => {
+                    changed
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("metadata".into(), json!("later"));
+                }
+                8 => {
+                    changed
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("auth_mode".into(), json!("api-key"));
+                }
+                _ => {}
+            }
+            if matches!(case, 1..=4 | 7 | 8) {
+                write_auth_doc(home, &changed).unwrap();
+            }
+            later.replace(std::fs::read(home.join(AUTH_FILE)).ok());
+            Ok(())
+        },
+    );
+    server.join().unwrap();
+    let bound = result.as_ref().is_none_or(|result| {
+        published
+            .borrow()
+            .as_ref()
+            .is_some_and(|expected: &StoredAuth| {
+                result.doc == expected.doc
+                    && result.id_token == expected.id_token
+                    && result.access_token == expected.access_token
+                    && result.refresh_token == expected.refresh_token
+                    && result.account_id == expected.account_id
+                    && result.last_refresh_secs == expected.last_refresh_secs
+            })
+    });
+    let kept = std::fs::read(tmp.path().join(AUTH_FILE)).ok() == *later.borrow();
+    [
+        ("phase", 1),
+        ("written", i64::from(written.get())),
+        ("result", i64::from(result.is_some())),
+        ("bound", i64::from(bound)),
+        ("kept", i64::from(kept)),
+        ("case", case),
+    ]
+}
+
+pub(crate) fn result_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    match action {
+        "AnotherCase" => {
+            next.insert("case", state["case"] + 1);
+        }
+        "Refresh" => {
+            for (key, value) in result_case(state["case"]) {
+                next.insert(key, value);
+            }
+        }
+        _ => unreachable!(),
+    }
+    next
+}
+
+#[test]
+fn refreshed_result_is_the_published_snapshot_not_a_later_login() {
+    super::codex_refresh_result_environment();
+    let model = aterm_models_harness::codex_refresh_result_model();
+    assert_eq!(model.mutant_dials(), (1..=5).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 22);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = result_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
+    let good = result_transition(&model.init_state(), "Refresh");
+    for (key, value, law) in [
+        ("written", 0, "Publication"),
+        ("result", 0, "Result"),
+        ("bound", 0, "Snapshot"),
+        ("kept", 0, "KeepLater"),
+    ] {
+        let mut bad = good.clone();
+        bad.insert(key, value);
+        assert!(!model.check_invariant(law, &bad));
+    }
+}
+
+fn identity_case(case: i64) -> [(&'static str, i64); 5] {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("identity");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let jwt = |user: Option<&str>, workspace: &str, nonce: &str| {
+        make_jwt(&json!({
+            "jti":nonce, "email":"owner@example.test", "https://api.openai.com/auth":{
+                "chatgpt_account_id":workspace, "chatgpt_user_id":user
+            }
+        }))
+    };
+    let user = if case == 11 || case == 13 {
+        None
+    } else {
+        Some("user-a")
+    };
+    let initial_jwt = jwt(user, "derived-workspace", "original");
+    let mut initial = json!({"auth_mode":"chatgpt", "marker":"keep", "tokens":{
+        "id_token":initial_jwt, "access_token":initial_jwt, "refresh_token":"original-refresh"
+    }});
+    {
+        let tokens = initial
+            .as_object_mut()
+            .unwrap()
+            .get_mut("tokens")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        if case != 1 {
+            tokens.insert("account_id".into(), json!("explicit-workspace"));
+        }
+        if [0, 4, 5, 15, 16, 17].contains(&case) {
+            tokens.insert("login_owner_id".into(), json!("login-a"));
+            tokens.insert(
+                "oauth_provenance".into(),
+                json!({
+                    "issuer":if case == 0 {format!("http://127.0.0.1:{port}")}
+                        else {DEFAULT_ISSUER.to_owned()}, "client_id":CLIENT_ID
+                }),
+            );
+        }
+        if case == 14 {
+            tokens.insert(
+                "access_token".into(),
+                json!(jwt(Some("user-b"), "derived-workspace", "conflict")),
+            );
+        }
+    }
+    write_auth_doc(&home, &initial).unwrap();
+    let before = load_stored_auth(&home).unwrap();
+    let is_reload = matches!(case, 2..=7 | 13 | 15..=17);
+    let (observed, result, posted, kept) = if is_reload {
+        let mut changed = initial.clone();
+        let tokens = changed
+            .as_object_mut()
+            .unwrap()
+            .get_mut("tokens")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        let rotated = jwt(
+            if case == 3 {
+                Some("user-b")
+            } else if case == 6 {
+                None
+            } else {
+                Some("user-a")
+            },
+            "derived-workspace",
+            "rotated",
+        );
+        tokens.insert("access_token".into(), json!(rotated));
+        tokens.insert("id_token".into(), json!(rotated));
+        match case {
+            4 => {
+                tokens.insert("login_owner_id".into(), json!("login-b"));
+            }
+            5 => {
+                tokens.insert(
+                    "oauth_provenance".into(),
+                    json!({"issuer":"https://another.example", "client_id":CLIENT_ID}),
+                );
+            }
+            7 => {
+                tokens.insert(
+                    "id_token".into(),
+                    json!(jwt(Some("user-b"), "derived-workspace", "mismatch")),
+                );
+            }
+            15 => {
+                let legacy = make_jwt(&json!({"jti":"legacy", "https://api.openai.com/auth":{
+                    "chatgpt_account_id":"derived-workspace", "chatgpt_user_id":null, "user_id":"user-a"
+                }}));
+                tokens.insert("id_token".into(), json!(legacy));
+                tokens.insert("access_token".into(), json!(legacy));
+            }
+            16 => {
+                tokens.remove("login_owner_id");
+            }
+            17 => {
+                tokens.remove("oauth_provenance");
+            }
+            _ => {}
+        }
+        write_auth_doc(&home, &changed).unwrap();
+        let evidence = std::fs::read(home.join(AUTH_FILE)).unwrap();
+        let observed = reload_updated_disk_auth(&home, &before);
+        let result = if observed.is_some() { 2 } else { 0 };
+        let kept = std::fs::read(home.join(AUTH_FILE)).unwrap() == evidence;
+        (observed, result, false, kept)
+    } else {
+        let new_user = if case == 8 {
+            Some("user-b")
+        } else if case == 12 {
+            None
+        } else {
+            Some("user-a")
+        };
+        let mut response = json!({
+            "id_token":jwt(new_user, "new-default-workspace", "new-id"),
+            "access_token":jwt(if case == 9 || case == 10 {Some("user-b")} else {new_user},
+                "new-default-workspace", "new-access"),
+            "refresh_token":"refreshed"
+        });
+        if case == 1 || case == 9 {
+            response.as_object_mut().unwrap().remove("id_token");
+        }
+        let posted = Arc::new(AtomicBool::new(false));
+        let server_posted = Arc::clone(&posted);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let Some(request) = read_http_request(&mut stream) else {
+                return;
+            };
+            server_posted.store(true, Ordering::SeqCst);
+            assert_eq!(request.target, "/oauth/token");
+            send_http_json(&mut stream, "200 OK", &response);
+        });
+        let evidence = std::fs::read(home.join(AUTH_FILE)).unwrap();
+        let observed = refresh_stored_auth(
+            &home,
+            &before,
+            &format!("http://127.0.0.1:{port}/oauth/token"),
+            Duration::from_secs(60),
+            now,
+        );
+        let _ = TcpStream::connect(("127.0.0.1", port));
+        server.join().unwrap();
+        let result = i64::from(observed.is_some());
+        let kept = if observed.is_some() {
+            let after = load_stored_auth(&home).unwrap();
+            after.doc["marker"] == json!("keep")
+                && (case != 1 || (before.id_token.is_some() && after.id_token == before.id_token))
+                && ["login_owner_id", "oauth_provenance"]
+                    .iter()
+                    .all(|field| after.doc["tokens"].get(field) == before.doc["tokens"].get(field))
+        } else {
+            std::fs::read(home.join(AUTH_FILE)).unwrap() == evidence
+        };
+        (observed, result, posted.load(Ordering::SeqCst), kept)
+    };
+    let scoped = observed
+        .as_ref()
+        .is_none_or(|after| after.account_id == before.account_id);
+    [
+        ("phase", 1),
+        ("result", result),
+        ("scoped", i64::from(scoped)),
+        ("kept", i64::from(kept)),
+        ("posted", i64::from(posted)),
+    ]
+}
+
+pub(crate) fn identity_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    match action {
+        "AnotherCase" => {
+            next.insert("case", state["case"] + 1);
+        }
+        "Observe" => {
+            for (key, value) in identity_case(state["case"]) {
+                next.insert(key, value);
+            }
+        }
+        _ => unreachable!(),
+    }
+    next
+}
+
+#[test]
+fn codex_refresh_identity_conforms_and_preserves_workspace_and_login() {
+    super::codex_refresh_identity_environment();
+    let model = aterm_models_harness::codex_refresh_identity_model();
+    assert_eq!(model.mutant_dials(), (1..=6).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 36);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = identity_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
+    let good = identity_transition(&model.init_state(), "Observe");
+    for (key, value, law) in [
+        ("scoped", 0, "WorkspaceRetained"),
+        ("kept", 0, "EvidenceRetained"),
+        ("result", 0, "Decision"),
+        ("posted", 0, "RequestBoundary"),
+    ] {
+        let mut bad = good.clone();
+        bad.insert(key, value);
+        assert!(!model.check_invariant(law, &bad));
+    }
+}
+
+fn authority_case(case: i64) -> [(&'static str, i64); 6] {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let issuer = format!("http://127.0.0.1:{port}/tenant");
+    let jwt = if case == 16 {
+        make_jwt(&json!({"iss":"https://untrusted.example", "aud":"forged-client"}))
+    } else {
+        make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 7200)
+    };
+    let mut initial = json!({"auth_mode":"chatgpt", "marker":"keep", "tokens":{
+        "id_token":jwt, "access_token":jwt, "refresh_token":"original-refresh",
+        "oauth_provenance":{"issuer":issuer, "client_id":"tenant-client"}
+    }});
+    let tokens = initial
+        .as_object_mut()
+        .unwrap()
+        .get_mut("tokens")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    let record = match case {
+        0 | 16 => None,
+        1 | 22 | 29 => Some(json!({"issuer":issuer, "client_id":"tenant-client"})),
+        2 => Some(json!({"issuer":format!("{issuer}///"), "client_id":"tenant-client"})),
+        3 => Some(Value::Null),
+        4 => Some(json!("invalid")),
+        5 => Some(json!({"client_id":"tenant-client"})),
+        6 => Some(json!({"issuer":issuer})),
+        7 => Some(json!({"issuer":"", "client_id":"tenant-client"})),
+        8 => Some(json!({"issuer":issuer, "client_id":"   "})),
+        9 => Some(json!({"issuer":"http://192.0.2.1", "client_id":"tenant-client"})),
+        10 => Some(
+            json!({"issuer":format!("http://user@127.0.0.1:{port}"), "client_id":"tenant-client"}),
+        ),
+        11 => Some(json!({"issuer":format!("{issuer}?query"), "client_id":"tenant-client"})),
+        12 => Some(json!({"issuer":format!("{issuer}#fragment"), "client_id":"tenant-client"})),
+        13 => Some(json!({"issuer":format!("{issuer}\\path"), "client_id":"tenant-client"})),
+        14 => Some(json!({"issuer":format!("{issuer} path"), "client_id":"tenant-client"})),
+        15 => Some(json!({"issuer":"http://127.0.0.1:invalid", "client_id":"tenant-client"})),
+        17 => Some(json!({"issuer":issuer, "client_id":"tenant-client", "future":"retained"})),
+        18 => Some(json!({"issuer":42, "client_id":"tenant-client"})),
+        19 => Some(json!({"issuer":issuer, "client_id":false})),
+        20 => Some(json!({"issuer":issuer, "client_id":"tenant\nclient"})),
+        21 => {
+            Some(json!({"issuer":format!("http://127.0.0.1:{port}/"), "client_id":"tenant-client"}))
+        }
+        23 => Some(json!({"issuer":"https://", "client_id":"tenant-client"})),
+        24 => Some(json!({"issuer":"https:///", "client_id":"tenant-client"})),
+        25 => Some(json!({"issuer":"http://127.0.0.1.evil.test", "client_id":"tenant-client"})),
+        26 => Some(json!({"issuer":"http://[::1", "client_id":"tenant-client"})),
+        27 => Some(json!({"issuer":"http://localhost.evil.test", "client_id":"tenant-client"})),
+        28 => Some(json!({"issuer":"http://2130706433", "client_id":"tenant-client"})),
+        30 => Some(
+            json!({"issuer":format!("HTTP://127.0.0.1:{port}/tenant"), "client_id":"tenant-client"}),
+        ),
+        _ => unreachable!(),
+    };
+    if let Some(record) = record {
+        tokens.insert("oauth_provenance".into(), record);
+    } else {
+        tokens.remove("oauth_provenance");
+    }
+    write_auth_doc(tmp.path(), &initial).unwrap();
+    let before = load_stored_auth(tmp.path()).unwrap();
+    let evidence = Arc::new(Mutex::new(
+        std::fs::read(tmp.path().join(AUTH_FILE)).unwrap(),
+    ));
+    let server_evidence = Arc::clone(&evidence);
+    let server_home = tmp.path().to_path_buf();
+    let mut concurrent = initial.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_http_request(&mut stream)?;
+        if case == 29 {
+            concurrent
+                .as_object_mut()
+                .unwrap()
+                .get_mut("tokens")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(
+                    "oauth_provenance".into(),
+                    json!({"issuer":"https://changed.example", "client_id":"changed-client"}),
+                );
+            write_auth_doc(&server_home, &concurrent).unwrap();
+            *server_evidence.lock().unwrap() = std::fs::read(server_home.join(AUTH_FILE)).unwrap();
+        }
+        send_http_json(
+            &mut stream,
+            "200 OK",
+            &json!({
+                "id_token":jwt, "access_token":jwt, "refresh_token":"rotated-refresh"
+            }),
+        );
+        Some(request)
+    });
+    let fallback = if case == 22 {
+        "invalid fallback".to_owned()
+    } else {
+        format!("http://127.0.0.1:{port}/fallback")
+    };
+    let result = refresh_stored_auth(tmp.path(), &before, &fallback, Duration::from_secs(60), now);
+    let _ = TcpStream::connect(("127.0.0.1", port));
+    let request = server.join().unwrap();
+    let target = request.as_ref().is_none_or(|request| {
+        request.target
+            == if case == 0 || case == 16 {
+                "/fallback"
+            } else if case == 21 {
+                "/oauth/token"
+            } else {
+                "/tenant/oauth/token"
+            }
+    });
+    let client = request.as_ref().is_none_or(|request| {
+        let body: Value = aterm_json::from_str(&request.body).unwrap();
+        body["client_id"]
+            == json!(if case == 0 || case == 16 {
+                CLIENT_ID
+            } else {
+                "tenant-client"
+            })
+            && body["refresh_token"] == json!("original-refresh")
+    });
+    let kept = if let Some(after) = &result {
+        after.doc["marker"] == initial["marker"]
+            && after.doc["tokens"].get("oauth_provenance")
+                == initial["tokens"].get("oauth_provenance")
+    } else {
+        std::fs::read(tmp.path().join(AUTH_FILE)).unwrap() == *evidence.lock().unwrap()
+    };
+    [
+        ("phase", 1),
+        ("result", i64::from(result.is_some())),
+        ("posted", i64::from(request.is_some())),
+        ("target", i64::from(target)),
+        ("client", i64::from(client)),
+        ("kept", i64::from(kept)),
+    ]
+}
+
+pub(crate) fn authority_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    match action {
+        "AnotherCase" => {
+            next.insert("case", state["case"] + 1);
+        }
+        "Refresh" => {
+            for (key, value) in authority_case(state["case"]) {
+                next.insert(key, value);
+            }
+        }
+        _ => unreachable!(),
+    }
+    next
+}
+
+#[test]
+fn codex_refresh_uses_the_recorded_oauth_authority() {
+    super::codex_refresh_authority_environment();
+    let model = aterm_models_harness::codex_refresh_authority_model();
+    assert_eq!(model.mutant_dials(), (1..=6).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 62);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = authority_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
+    let good = authority_transition(&model.init_state(), "Refresh");
+    for (key, value, law) in [
+        ("result", 0, "Admission"),
+        ("posted", 0, "RequestBoundary"),
+        ("target", 0, "TargetAuthority"),
+        ("client", 0, "ClientBinding"),
+        ("kept", 0, "PreserveEvidence"),
+    ] {
+        let mut bad = good.clone();
+        bad.insert(key, value);
+        assert!(!model.check_invariant(law, &bad));
+    }
+    for (url, accepted) in [
+        ("https://auth.openai.com", true),
+        ("https://tenant.example/base", true),
+        ("http://[::1]:1234", true),
+        ("http://LOCALHOST:1234", true),
+        ("http://[::2]:1234", false),
+        ("https://user:pass@tenant.example", false),
+    ] {
+        assert_eq!(refresh_endpoint(url).is_some(), accepted, "{url}");
+    }
+    assert!(is_loopback_endpoint("HTTP://127.0.0.1:1234"));
+    assert!(is_loopback_endpoint("http://LOCALHOST:1234"));
+    assert!(!is_loopback_endpoint("http://localhost.evil.test:1234"));
+}
+
 #[test]
 fn auth_reads_are_bounded_regular_non_symlink_files_and_expired_or_portless_login_exits_early() {
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
@@ -1148,17 +2358,19 @@ fn auth_reads_are_bounded_regular_non_symlink_files_and_expired_or_portless_logi
     let mut exact = base;
     exact.extend(std::iter::repeat_n(
         ' ',
-        MESSAGE_MAX.checked_sub(exact.len()).expect("fits in bound"),
+        AUTH_FILE_MAX
+            .checked_sub(exact.len())
+            .expect("fits in bound"),
     ));
-    assert_eq!(exact.len(), MESSAGE_MAX);
-    std::fs::write(&auth_path, &exact).expect("write exact MESSAGE_MAX");
+    assert_eq!(exact.len(), AUTH_FILE_MAX);
+    std::fs::write(&auth_path, &exact).expect("write exact AUTH_FILE_MAX");
     assert_eq!(
         read_account_email(&home).as_deref(),
         Some("bounded@example.com")
     );
 
     exact.push(' ');
-    std::fs::write(&auth_path, &exact).expect("write MESSAGE_MAX + 1");
+    std::fs::write(&auth_path, &exact).expect("write AUTH_FILE_MAX + 1");
     assert!(read_account_in_home(&home).is_none());
 
     std::fs::write(&auth_path, [0xff, 0xfe]).expect("write invalid utf8");
@@ -1262,6 +2474,29 @@ fn auth_reads_are_bounded_regular_non_symlink_files_and_expired_or_portless_logi
     assert_eq!(off_pin.host.as_deref(), Some("evil.example"));
 
     let mut approver = &seen;
+    let off_pin_token = login_with(
+        &home,
+        &Endpoints {
+            issuer: DEFAULT_ISSUER.to_owned(),
+            token_url: "https://unpinned-token.example/oauth/token".to_owned(),
+            callback_ports: vec![0],
+        },
+        &mut approver,
+        HOSTS,
+        None,
+        Instant::now() + Duration::from_secs(30),
+    );
+    assert_eq!(off_pin_token.outcome, Outcome::OffPin);
+    assert_eq!(
+        off_pin_token.host.as_deref(),
+        Some("unpinned-token.example")
+    );
+    assert!(
+        seen.handed.borrow().is_empty(),
+        "unpinned token_url must be refused before opening the browser"
+    );
+
+    let mut approver = &seen;
     let portless = login_with(
         &home,
         &Endpoints {
@@ -1272,7 +2507,7 @@ fn auth_reads_are_bounded_regular_non_symlink_files_and_expired_or_portless_logi
         &mut approver,
         HOSTS,
         None,
-        Instant::now() + Duration::from_secs(30),
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
     );
     assert!(
         matches!(

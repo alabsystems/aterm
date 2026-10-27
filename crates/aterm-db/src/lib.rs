@@ -29,11 +29,15 @@ pub mod machines;
 #[cfg(unix)]
 pub mod network;
 #[cfg(unix)]
+pub mod network_state;
+#[cfg(unix)]
 pub mod replica;
 #[cfg(unix)]
 pub mod resources;
 #[cfg(unix)]
 pub mod runtime;
+#[cfg(unix)]
+pub mod service_state;
 #[cfg(unix)]
 pub mod table;
 

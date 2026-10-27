@@ -34,13 +34,14 @@ use std::sync::{Mutex, PoisonError};
 use astream_effects::EffectRecord;
 
 use crate::client::{Github, GithubBuilder, Meter};
-use crate::config::{self, Dirs};
+use crate::config::{self, Dirs, Validated};
 use crate::download::DigestCheck;
 use crate::error::{Error, IdentityRef, Replay, Result, Sub};
 use crate::fx::Fx;
 use crate::fx::tape::TapeHeader;
 #[cfg(any(test, debug_assertions))]
 use crate::identity::MapEnv;
+use crate::identity::vault::{self, Adoption};
 use crate::identity::{EnvSource, ProcessEnv};
 use crate::model::Sha256Digest;
 use crate::page::{Consistency, End};
@@ -76,6 +77,8 @@ pub fn main_entry(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
 /// Parse and run one command line in `ctx`; the exit code.
 pub fn run(args: &[String], ctx: &mut Ctx) -> u8 {
     ctx.github = None;
+    ctx.adoption = None;
+    ctx.anonymous = false;
     match args::parse(args) {
         Err(ParseError { verb, error }) => out::fail(ctx, &verb, &error),
         Ok(Parsed::Bare) => out::write_stdout(ctx, help::brief().as_bytes(), 0),
@@ -139,9 +142,13 @@ fn run_verb(
         return out::fail(ctx, &name, &e);
     }
     ctx.timeout = inv.global.timeout;
+    ctx.anonymous = inv.global.anonymous;
     let t0 = ctx.fx.mono();
     let (exit, replay_failed) = match (verb.run)(ctx, inv) {
         Ok(mut outcome) => {
+            if let Answer::FailedWith { error, .. } = &mut outcome.answer {
+                ctx.vault_next(error);
+            }
             outcome.receipt.elapsed_ms = match (t0, ctx.fx.mono()) {
                 (Ok(t0), Ok(t1)) => {
                     u64::try_from(t1.saturating_sub(t0).as_millis()).unwrap_or(u64::MAX)
@@ -150,7 +157,8 @@ fn run_verb(
             };
             (out::emit(ctx, outcome, &opts), false)
         }
-        Err(e) => {
+        Err(mut e) => {
+            ctx.vault_next(&mut e);
             let replay_failed = matches!(e.sub, Sub::Replay(_));
             let e = out::with_verb_help(e, &name);
             (out::fail(ctx, &name, &e), replay_failed)
@@ -196,6 +204,12 @@ pub struct Ctx {
     /// `--timeout`, which `run` sets before the verb runs.
     pub timeout: Option<std::time::Duration>,
     github: Option<Github>,
+    /// What vault adoption found for this command line, once the client was built with no
+    /// agh.toml (design §6.10).
+    adoption: Option<Adoption>,
+    /// `--anonymous`, which `run` sets before the verb runs: adoption then asks GitHub nothing,
+    /// because learning a login sends the token.
+    anonymous: bool,
 }
 
 /// stdout through the door: each write is written whole and flushed.
@@ -260,6 +274,8 @@ impl Ctx {
             retry: RetryPolicy::STANDARD,
             timeout: None,
             github: None,
+            adoption: None,
+            anonymous: false,
         }
     }
 
@@ -290,6 +306,8 @@ impl Ctx {
             retry: RetryPolicy::NONE,
             timeout: None,
             github: None,
+            adoption: None,
+            anonymous: false,
         };
         (ctx, captured)
     }
@@ -319,17 +337,99 @@ impl Ctx {
         self
     }
 
-    /// The client, built on first use and kept for the rest of the command line.
+    /// The client, built on first use and kept for the rest of the command line. It routes by
+    /// agh.toml; with none, or one that says `vault = true`, by the vault's tokens too
+    /// (`vault::adopt`), whose note lines, for a vault token found and not routed, go to
+    /// stderr. Each adopted profile sends the very token adoption judged (`Github::pin`). The
+    /// requests adoption sent count in the client's meter.
     /// # Errors
-    /// `config::load`'s refusal: the CLI fails closed on an invalid agh.toml.
+    /// `config::load`'s refusal: the CLI fails closed on an invalid agh.toml; then adoption's
+    /// refusal (`vault::Adoption::router`).
     pub fn github(&mut self) -> Result<Github> {
+        self.github_noting(true)
+    }
+
+    /// `github`, writing adoption's note lines only when `noting`.
+    fn github_noting(&mut self, noting: bool) -> Result<Github> {
         if let Some(gh) = &self.github {
             return Ok(gh.clone());
         }
-        let router = match &self.dirs {
-            Some(dirs) => config::load(dirs)?.map_or_else(Router::empty, Router::from_validated),
-            None => Router::empty(),
+        let explicit = match &self.dirs {
+            Some(dirs) => config::load(dirs)?,
+            None => None,
         };
+        let base = self.client(Router::empty());
+        let joins = explicit.as_ref().is_none_or(Validated::joins_vault);
+        let adopted = match self.dirs.clone() {
+            Some(dirs) if joins => self.adopted(&base, &dirs, noting)?,
+            _ => None,
+        };
+        let router = match (adopted, explicit) {
+            (Some(router), _) => router,
+            (None, Some(validated)) => Router::from_validated(validated),
+            (None, None) => Router::empty(),
+        };
+        let gh = base.with_router(router);
+        if let Some(adoption) = &self.adoption {
+            gh.absorb(adoption.spent());
+            for cred in adoption.pinned() {
+                gh.pin(cred.clone());
+            }
+        }
+        self.github = Some(gh.clone());
+        Ok(gh)
+    }
+
+    /// What vault adoption found, adopting first when the client is not built yet, with no note
+    /// on stderr (its caller reports it): `None` when an agh.toml routes alone, or when there is
+    /// no config directory.
+    pub(crate) fn adoption(&mut self) -> Option<&Adoption> {
+        if self.github.is_none() && self.adoption.is_none() {
+            // A refusal is the adoption's own, which it carries for the caller to report.
+            let _ = self.github_noting(false);
+        }
+        self.adoption.as_ref()
+    }
+
+    /// The router adoption gives (`None` when it does not apply), its note lines written to
+    /// stderr when `noting` and the call is not `--anonymous`. Under `--anonymous` it is the
+    /// record's alone (`vault::view`): a call that sends no token sends none to learn a login
+    /// either, and one it leaves out changes nothing.
+    fn adopted(&mut self, base: &Github, dirs: &Dirs, noting: bool) -> Result<Option<Router>> {
+        let found = if self.anonymous {
+            vault::view(dirs, base.env())
+        } else {
+            vault::adopt(base, dirs)
+        };
+        let Some(adoption) = found else {
+            return Ok(None);
+        };
+        if noting && !self.anonymous {
+            for line in adoption.note(&dirs.home) {
+                out::note(self, &line);
+            }
+        }
+        let router = adoption.router();
+        self.adoption = Some(adoption);
+        router.map(Some)
+    }
+
+    /// `error`'s next step made the vault's, when the call routed by adoption's rows and its
+    /// own step names a row or a file adoption has none of (`Adoption::next_for`).
+    fn vault_next(&self, error: &mut Error) {
+        if let Some(next) = self.adoption.as_ref().and_then(|a| a.next_for(error)) {
+            error.next = next;
+        }
+    }
+
+    /// The client over no rows, never adopting: `agh auth add` binds its new profile's
+    /// login on it, so provisioning works whatever adoption found.
+    pub(crate) fn provisioning_client(&self) -> Github {
+        self.client(Router::empty())
+    }
+
+    /// The client this context configures, over `router`.
+    fn client(&self, router: Router) -> Github {
         let rate_book = self
             .dirs
             .as_ref()
@@ -346,9 +446,7 @@ impl Ctx {
         if let Some(transport) = &self.transport {
             builder = builder.transport(transport.clone());
         }
-        let gh = builder.build();
-        self.github = Some(gh.clone());
-        Ok(gh)
+        builder.build()
     }
 }
 

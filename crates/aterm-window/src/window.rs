@@ -598,7 +598,7 @@ impl Window {
 
 // LOCAL PATCH (aterm): the X11, Wayland or Win32 handles through first-party
 // `aterm_types::native_window::HasNativeWindow`, so the GL and D3D11 arms and aterm-gui's CPU
-// presenters reach them without `raw-window-handle` (`rwh_06` is opt-in and wraps this answer).
+// presenters reach them without `raw-window-handle` (upstream's `rwh_06` impls are cut).
 // SAFETY: the display is the event loop's connection, which every window holds a reference to
 // (X11's `Arc<XConnection>`, Wayland's `Arc<Connection>`), so it stays open while `self` lives;
 // Win32 has none. The X11 window is destroyed, the `wl_surface` released and the `HWND`
@@ -616,28 +616,6 @@ unsafe impl aterm_types::native_window::HasNativeWindow for Window {
         {
             self.window.native_window()
         }
-    }
-}
-
-#[cfg(feature = "rwh_06")]
-impl rwh_06::HasWindowHandle for Window {
-    fn window_handle(&self) -> Result<rwh_06::WindowHandle<'_>, rwh_06::HandleError> {
-        let raw = self.window.raw_window_handle_rwh_06()?;
-
-        // SAFETY: The window handle will never be deallocated while the window is alive, and the
-        // main thread safety requirements are upheld internally by each platform.
-        Ok(unsafe { rwh_06::WindowHandle::borrow_raw(raw) })
-    }
-}
-
-#[cfg(feature = "rwh_06")]
-impl rwh_06::HasDisplayHandle for Window {
-    fn display_handle(&self) -> Result<rwh_06::DisplayHandle<'_>, rwh_06::HandleError> {
-        let raw = self.window.raw_display_handle_rwh_06()?;
-
-        // SAFETY: The window handle will never be deallocated while the window is alive,
-        // and the main thread safety requirements are upheld internally by each platform.
-        Ok(unsafe { rwh_06::DisplayHandle::borrow_raw(raw) })
     }
 }
 

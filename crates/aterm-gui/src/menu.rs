@@ -252,10 +252,16 @@ pub(crate) enum MenuAction {
     DeckSizeFolded,
     /// View ▸ Stats Lens (⌘I).
     ToggleStatsLens,
+    /// Open the peer and shared-state close-up, including while resource bars are hidden.
+    NetworkState,
     /// View ▸ Rewind Pane (⇧⌘R): freeze the focused pane on its recorded past, or return it to live.
     RewindPane,
     /// View ▸ Export Pane History…: the focused pane's kept history as an asciicast file a save panel names.
     ExportPaneHistory,
+    /// View ▸ Forget Pane History: drop the focused pane's kept history (`App::forget_front_history`).
+    ForgetPaneHistory,
+    /// View ▸ Forget All History: drop every pane's kept history (`App::forget_all_history`).
+    ForgetAllHistory,
     /// Open Settings at the Packages route.
     Packages,
     /// Open Settings at the Messages route.
@@ -391,8 +397,11 @@ impl MenuAction {
             MenuAction::StatsBarsSill => 85,
             MenuAction::StatsBarsOff => 86,
             MenuAction::ToggleStatsLens => 87,
+            MenuAction::NetworkState => 95,
             MenuAction::RewindPane => 93,
             MenuAction::ExportPaneHistory => 94,
+            MenuAction::ForgetPaneHistory => 96,
+            MenuAction::ForgetAllHistory => 97,
             MenuAction::DeckSizeAuto => 88,
             MenuAction::DeckSizeFull => 89,
             MenuAction::DeckSizeFolded => 90,
@@ -476,6 +485,7 @@ impl MenuAction {
             85 => MenuAction::StatsBarsSill,
             86 => MenuAction::StatsBarsOff,
             87 => MenuAction::ToggleStatsLens,
+            95 => MenuAction::NetworkState,
             88 => MenuAction::DeckSizeAuto,
             89 => MenuAction::DeckSizeFull,
             90 => MenuAction::DeckSizeFolded,
@@ -483,6 +493,8 @@ impl MenuAction {
             92 => MenuAction::SystemState,
             93 => MenuAction::RewindPane,
             94 => MenuAction::ExportPaneHistory,
+            96 => MenuAction::ForgetPaneHistory,
+            97 => MenuAction::ForgetAllHistory,
             _ => return None,
         })
     }
@@ -546,6 +558,7 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             | MenuAction::ClearTabTheme
             | MenuAction::RewindPane
             | MenuAction::ExportPaneHistory
+            | MenuAction::ForgetPaneHistory
     )
 }
 
@@ -779,7 +792,9 @@ pub(crate) fn native_item_tip(action: MenuAction) -> Option<String> {
         MenuAction::SummarizeFleet => agents_live()
             .summarize_block
             .map(|why| format!("{} {why}", action.help())),
-        MenuAction::RewindPane | MenuAction::ExportPaneHistory if !menu_live().can_rewind => {
+        MenuAction::RewindPane | MenuAction::ExportPaneHistory | MenuAction::ForgetPaneHistory
+            if !menu_live().can_rewind =>
+        {
             Some(crate::rewind::REWIND_OFF_TIP.to_string())
         }
         _ => None,
@@ -974,7 +989,9 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
         MenuAction::NextTab | MenuAction::PrevTab => live.multi_tab,
         MenuAction::ReopenClosedTab => live.can_reopen_closed_tab,
         MenuAction::ReopenClosedView => live.can_reopen_closed_view,
-        MenuAction::RewindPane | MenuAction::ExportPaneHistory => live.can_rewind,
+        MenuAction::RewindPane | MenuAction::ExportPaneHistory | MenuAction::ForgetPaneHistory => {
+            live.can_rewind
+        }
         _ => true,
     };
     precondition
@@ -1031,6 +1048,7 @@ impl MenuAction {
             MenuAction::Overview
             | MenuAction::HarnessLog
             | MenuAction::ReadThisMac
+            | MenuAction::NetworkState
             | MenuAction::ReadFleet
             | MenuAction::SummarizeFleet
             | MenuAction::FleetMachines
@@ -1046,6 +1064,7 @@ impl MenuAction {
                 ConfigWrite
             }
             MenuAction::ToggleStatsLens | MenuAction::ExportPaneHistory => PersonOnly,
+            MenuAction::ForgetAllHistory => OwnerOnly,
             MenuAction::ChooseTheme => ConfigWrite,
             MenuAction::About
             | MenuAction::Version
@@ -1080,6 +1099,7 @@ impl MenuAction {
             | MenuAction::ChooseTabTheme
             | MenuAction::ClearTabTheme
             | MenuAction::RewindPane
+            | MenuAction::ForgetPaneHistory
             | MenuAction::Minimize
             | MenuAction::Zoom
             | MenuAction::NextTab
@@ -1100,8 +1120,11 @@ impl MenuAction {
             | MenuAction::DeckSizeFull
             | MenuAction::DeckSizeFolded
             | MenuAction::ToggleStatsLens
+            | MenuAction::NetworkState
             | MenuAction::RewindPane
-            | MenuAction::ExportPaneHistory => false,
+            | MenuAction::ExportPaneHistory
+            | MenuAction::ForgetPaneHistory
+            | MenuAction::ForgetAllHistory => false,
             MenuAction::About
             | MenuAction::SoftwareUpdate
             | MenuAction::Version
@@ -1318,12 +1341,21 @@ impl MenuAction {
                 "Open the stats bars' close-up, or close it: arrows move between instruments \
                  and bars, Escape closes."
             }
+            MenuAction::NetworkState => {
+                "Show known aterm machines, observed reachability and shared account and secret access."
+            }
             MenuAction::RewindPane => {
                 "Show this pane's recent past, read-only: Left and Right step through it, Esc \
                  returns to live."
             }
             MenuAction::ExportPaneHistory => {
                 "Save this pane's kept screen history as an asciicast file, where you choose."
+            }
+            MenuAction::ForgetPaneHistory => {
+                "Drop this pane's kept screen history; it keeps recording from now."
+            }
+            MenuAction::ForgetAllHistory => {
+                "Drop the kept screen history of every pane; each keeps recording from now."
             }
             MenuAction::Help => "Open the aterm guide.",
         }
@@ -1413,8 +1445,11 @@ impl MenuAction {
             "DeckSizeFull" => Some(MenuAction::DeckSizeFull),
             "DeckSizeFolded" => Some(MenuAction::DeckSizeFolded),
             "ToggleStatsLens" => Some(MenuAction::ToggleStatsLens),
+            "NetworkState" => Some(MenuAction::NetworkState),
             "RewindPane" => Some(MenuAction::RewindPane),
             "ExportPaneHistory" => Some(MenuAction::ExportPaneHistory),
+            "ForgetPaneHistory" => Some(MenuAction::ForgetPaneHistory),
+            "ForgetAllHistory" => Some(MenuAction::ForgetAllHistory),
             "ResetTerminal" => Some(MenuAction::ResetTerminal),
             "ChooseTabTheme" => Some(MenuAction::ChooseTabTheme),
             "ClearTabTheme" => Some(MenuAction::ClearTabTheme),
@@ -1817,6 +1852,12 @@ const VIEW_MENU: &[MenuEntry] = &[
         key: "i",
         mods: MenuMods::Command,
     },
+    Item {
+        label: "Network State",
+        action: MenuAction::NetworkState,
+        key: "",
+        mods: MenuMods::None,
+    },
     Separator,
     Item {
         label: "Rewind Pane",
@@ -1827,6 +1868,18 @@ const VIEW_MENU: &[MenuEntry] = &[
     Item {
         label: "Export Pane History\u{2026}",
         action: MenuAction::ExportPaneHistory,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Forget Pane History",
+        action: MenuAction::ForgetPaneHistory,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Forget All History",
+        action: MenuAction::ForgetAllHistory,
         key: "",
         mods: MenuMods::None,
     },
@@ -3955,10 +4008,19 @@ mod tests {
         assert_eq!(menu_live(), idle, "every bit round-trips");
         assert!(!native_menu_action_enabled(MenuAction::Save));
         assert!(!native_menu_action_enabled(MenuAction::RewindPane));
+        assert!(!native_menu_action_enabled(MenuAction::ForgetPaneHistory));
+        assert!(
+            native_menu_action_enabled(MenuAction::ForgetAllHistory),
+            "Forget All History needs no front pane that records"
+        );
         assert_eq!(
             native_item_tip(MenuAction::RewindPane).as_deref(),
             Some(crate::rewind::REWIND_OFF_TIP),
             "a pane that keeps no history says what turns Rewind on"
+        );
+        assert_eq!(
+            native_item_tip(MenuAction::ForgetPaneHistory).as_deref(),
+            Some(crate::rewind::REWIND_OFF_TIP)
         );
         set_menu_live(MenuLive {
             can_rewind: true,
@@ -3966,6 +4028,16 @@ mod tests {
         });
         assert!(menu_live().can_rewind, "the Rewind bit round-trips");
         assert_eq!(native_item_tip(MenuAction::RewindPane), None);
+        assert!(native_menu_action_enabled(MenuAction::ForgetPaneHistory));
+        assert_eq!(
+            MenuAction::ForgetPaneHistory.invoke_authority(),
+            super::InvokeAuthority::WriteInput
+        );
+        assert_eq!(
+            MenuAction::ForgetAllHistory.invoke_authority(),
+            super::InvokeAuthority::OwnerOnly,
+            "one session's scope never drops every pane's history"
+        );
         set_menu_live(MenuLive {
             can_save: true,
             ..idle

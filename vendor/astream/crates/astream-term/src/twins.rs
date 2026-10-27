@@ -103,6 +103,61 @@ pub const fn screen_clamp_dim(dim: u64, max_dim: u64) -> u64 {
     }
 }
 
+/// `program_rule_cap_clamp` as `program_predict_island.rs` defines it in Clean:
+/// `if count < cap then count else cap`.
+#[must_use]
+pub const fn program_rule_cap_clamp(count: u64, cap: u64) -> u64 {
+    if count < cap {
+        count
+    } else {
+        cap
+    }
+}
+
+/// `color_clamp_channel` as `color_island.rs` defines it in Clean:
+/// `if val < max_val then val else max_val`.
+#[must_use]
+pub const fn color_clamp_channel(val: u64, max_val: u64) -> u64 {
+    if val < max_val {
+        val
+    } else {
+        max_val
+    }
+}
+
+/// `combining_cap_clamp` as `color_island.rs` defines it in Clean:
+/// `if len < cap then len else cap`.
+#[must_use]
+pub const fn combining_cap_clamp(len: u64, cap: u64) -> u64 {
+    if len < cap {
+        len
+    } else {
+        cap
+    }
+}
+
+/// `wide_cell_width_clamp` as `wide_island.rs` defines it in Clean:
+/// `if width < max_width then width else max_width`.
+#[must_use]
+pub const fn wide_cell_width_clamp(width: u64, max_width: u64) -> u64 {
+    if width < max_width {
+        width
+    } else {
+        max_width
+    }
+}
+
+/// `wide_spacer_col_clamp` as `wide_island.rs` defines it in Clean:
+/// `if next_col < line_end then next_col else line_end`.
+#[must_use]
+pub const fn wide_spacer_col_clamp(next_col: u64, line_end: u64) -> u64 {
+    if next_col < line_end {
+        next_col
+    } else {
+        line_end
+    }
+}
+
 #[cfg(test)]
 #[path = "../../astream-wire/twin_answers.rs"]
 mod twin_answers;
@@ -177,6 +232,31 @@ mod tests {
             want
         );
         assert_eq!(answers(|[a, b]| super::screen_clamp_dim(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::program_predict::program_rule_cap_clamp(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::program_rule_cap_clamp(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::screen::color_clamp_channel(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::color_clamp_channel(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::screen::combining_cap_clamp(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::combining_cap_clamp(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::screen::wide_cell_width_clamp(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::wide_cell_width_clamp(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::screen::wide_spacer_col_clamp(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::wide_spacer_col_clamp(a, b)), want);
     }
 
     // Not vacuous: `echo_watermark_monotone` with its branches swapped answers otherwise.

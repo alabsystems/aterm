@@ -104,22 +104,17 @@ pub struct Boot {
     lower: bool,
 }
 
-/// Whether this host's kernel spells its boot id lower-case: Linux's and
-/// Android's `/proc/sys/kernel/random/boot_id` do, macOS's
-/// `kern.bootsessionuuid` does not.
-const KERNEL_SPELLS_LOWER: bool = cfg!(any(target_os = "linux", target_os = "android"));
-
 impl Boot {
     /// This host's boot, `id` as `astream_sys::boot_session` read it, spelled as this host's kernel spells it.
     #[must_use]
     pub const fn kernel(id: [u8; 16]) -> Self {
         Self {
             id,
-            lower: KERNEL_SPELLS_LOWER,
+            lower: astream_sys::KERNEL_SPELLS_BOOT_ID_LOWER,
         }
     }
 
-    /// The boot a row's or a tape's `text` names, by astream's reader of the kernel's boot id text (`astream_sys::parse_boot_id`), its case kept (lower-case if any hex letter is): the UUID in either case.
+    /// The boot a row's or a tape's `text` names, by astream's reader of the kernel's boot id text (`astream_sys::parse_boot_id`), its case kept (lower-case if any hex letter is): 32 hex digits in either case, every hyphen dropped wherever it falls (the kernel's UUID form among them).
     #[must_use]
     pub fn of(text: &str) -> Option<Self> {
         let id = astream_sys::parse_boot_id(text.as_bytes())?;
@@ -133,19 +128,10 @@ impl Boot {
         self.id
     }
 
-    /// The text a row or a tape writes: the UUID's 32 hex digits hyphenated 8-4-4-4-12, the kernel's own form, in the case this boot was read in.
+    /// The text a row or a tape writes: astream's text of the id (`astream_sys::boot_id_text`, the UUID's 32 hex digits hyphenated 8-4-4-4-12, the kernel's own form), in the case this boot was read in.
     #[must_use]
     pub fn text(&self) -> String {
-        let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = self.id;
-        let upper = format!(
-            "{a:02X}{b:02X}{c:02X}{d:02X}-{e:02X}{f:02X}-{g:02X}{h:02X}-{i:02X}{j:02X}-\
-             {k:02X}{l:02X}{m:02X}{n:02X}{o:02X}{p:02X}"
-        );
-        if self.lower {
-            upper.to_ascii_lowercase()
-        } else {
-            upper
-        }
+        astream_sys::boot_id_text(self.id, self.lower)
     }
 }
 

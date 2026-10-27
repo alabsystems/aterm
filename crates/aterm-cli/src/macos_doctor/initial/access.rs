@@ -103,9 +103,20 @@ fn hear_answer(heard: &Mutex<Option<(LanAnswer, u64)>>, answer: LanAnswer, kept:
 /// lets a step outrank an older answer kept from an earlier launch. Any other step says nothing of
 /// it.
 pub(super) fn local_network_step(outcome: AccessOutcome) {
-    if let Some(answer) = step_answer(outcome) {
-        lan_answered(answer);
+    let Some(answer) = step_answer(outcome) else {
+        return;
+    };
+    // A fresh Local Network grant (the switch was not known on before) drops any discovery record
+    // formed before it, so the next look re-probes under the grant
+    // (`docs/DESIGN-init-on-by-default-2026-10-25.md` §8.2). A step that only confirms a grant
+    // already heard keeps the record, so the 24 h cache is not wiped on every launch.
+    if answer == LanAnswer::Reached
+        && last_answer() != Some(LanAnswer::Reached)
+        && let Ok(paths) = aterm_secrets::client::Paths::live()
+    {
+        aterm_secrets::heard::forget(&paths);
     }
+    lan_answered(answer);
 }
 
 /// The answer an access step for Local Network gives ([`local_network_step`]).

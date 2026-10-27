@@ -131,9 +131,9 @@ const HI_ROWS: [&str; 3] = [
 const HI_LONG_PATH: &str =
     "/private/tmp/at.dFeo/proj/a-working-directory-whose-name-runs-on-past-the-trail";
 
-const LINE_CRUISE: &str = "enhanced by aterm harness v0.1 \u{b7} autopilot \u{221e} cruise";
-const LINE_LAND: &str = "enhanced by aterm harness v0.1 \u{b7} autopilot \u{2913} land";
-const LINE_OFF: &str = "enhanced by aterm harness v0.1 \u{b7} autopilot \u{25cb} off";
+const LINE_CRUISE: &str = "enhanced by alab claude harness v0.4 \u{b7} autopilot \u{221e} cruise";
+const LINE_LAND: &str = "enhanced by alab claude harness v0.4 \u{b7} autopilot \u{2913} land";
+const LINE_OFF: &str = "enhanced by alab claude harness v0.4 \u{b7} autopilot \u{25cb} off";
 
 fn line_of(palette: CardPalette) -> &'static str {
     match palette {

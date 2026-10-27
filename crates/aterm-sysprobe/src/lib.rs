@@ -18,6 +18,8 @@ use std::time::Instant;
 
 pub mod caps;
 pub mod coalitions;
+pub mod cpu_hardware;
+pub mod cpu_policy;
 pub mod identity;
 pub mod iflist;
 #[cfg(target_os = "macos")]
@@ -193,7 +195,7 @@ pub fn errors_quiet() -> bool {
     }
 }
 
-/// The executable of process `pid`, read from the OS: `None` where it cannot be read (the process is gone, not ours, or the platform has no reader here). macOS asks `proc_pidpath`, Linux resolves `/proc/<pid>/exe`.
+/// The executable of process `pid`, read from the OS: `None` where it cannot be read (the process is gone, not ours, or the platform has no reader here). macOS asks `proc_pidpath`, Linux resolves `/proc/<pid>/exe`, Windows asks `QueryFullProcessImageNameW`.
 #[must_use]
 pub fn process_path(pid: u32) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
@@ -206,7 +208,11 @@ pub fn process_path(pid: u32) -> Option<std::path::PathBuf> {
             .ok()
             .filter(|p| p.is_absolute())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        win_paths::process_path(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = pid;
         None

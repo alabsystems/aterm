@@ -684,7 +684,7 @@ fn the_coverage_modes_pick_their_chains() {
         [LandP, Cap, LandQ].map(Chain::orchestrated),
         [Some(ORCHESTRATED), Some(RESUMED), None]
     );
-    assert_eq!(Chain::every().len(), 40);
+    assert_eq!(Chain::every().len(), 47);
     assert!(
         Chain::every()
             .iter()
@@ -810,7 +810,7 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
             .into_iter()
             .filter(|c| surfaces::holds_at_end(*c))
             .collect::<Vec<_>>(),
-        [LandB, LandC, LandD, LandF, LandG, LandH, LandI, SameLand]
+        [LandB, LandC, LandD, LandF, LandG, LandH, LandI]
     );
     assert_eq!(
         Chain::every()
@@ -819,7 +819,7 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
             .collect::<Vec<_>>(),
         [
             LandB, LandC, LandD, LandE, LandF, LandG, LandH, LandI, Cruise, SameLand, SameCruise,
-            WroteC
+            WroteC, SwitchHeld
         ]
     );
     assert!(SameLand.repo() == Repo::Untracked && SameCruise.repo() == Repo::Clean);
@@ -1279,14 +1279,12 @@ fn needs_nudge() -> String {
     format!("{LAND_NUDGE} {NEEDS_ACK}")
 }
 
+/// LandA landed: Land's instruction at its first point (typed at once, v6 §14.10: no back-off
+/// before it), the need raised, a nudge, the need cleared, the landing.
 fn landed_a() -> Seen {
     Seen {
         journal: vec![
-            j(5_000, "EVENT idle seq=1 Implemented the parser"),
-            j(
-                5_100,
-                "WAITING seq=1 until=x 1 short turn(s) in a row: 2 min back-off",
-            ),
+            j(124_800, "EVENT idle seq=1 Implemented the parser"),
             j(
                 125_000,
                 "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land: land",
@@ -1312,7 +1310,7 @@ fn landed_a() -> Seen {
             ),
         ],
         ledger: vec![
-            point(5_000, 1),
+            point(124_800, 1),
             typed(125_000, "land@v1", LAND),
             point(130_000, 2),
             typed(370_000, "land-nudge@v1", &needs_nudge()),
@@ -1418,7 +1416,7 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
     assert_eq!(l5(&s), ("L5", "UNOBSERVED"));
     let mut s = landed_a();
     s.meta.pop();
-    s.journal.remove(7);
+    s.journal.remove(6);
     assert_eq!(l5(&s), ("L5", "FAIL"));
     let mut s = landed_a();
     s.task
@@ -1494,6 +1492,7 @@ fn nudged(suffix: &str) -> Seen {
             ),
         ],
         ledger: vec![
+            point(124_800, 1),
             typed(125_000, "land@v1", LAND),
             typed(370_000, "land-nudge@v1", &format!("{LAND_NUDGE} {suffix}")),
         ],
@@ -1642,7 +1641,7 @@ fn land_d_passes_unlanded_with_the_need_raised_and_carried_on() {
         [("L6", "UNOBSERVED")]
     );
     let mut silent = tall();
-    silent.ledger[1].command = LAND_NUDGE.to_string();
+    silent.ledger[2].command = LAND_NUDGE.to_string();
     assert_eq!(verdicts(Chain::LandD, &silent, "muse"), [("L6", "FAIL")]);
 }
 
@@ -1921,36 +1920,29 @@ fn instant_landed() -> Seen {
         journal: vec![
             j(900, "EVENT idle seq=1 Implemented the parser"),
             j(
-                1_000,
-                "WAITING seq=1 until=x 1 short turn(s) in a row: 2 min back-off",
-            ),
-            j(
-                121_000,
+                1_100,
                 "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land: land",
             ),
-            j(122_000, "EVENT idle seq=2 Nothing left: the parser"),
+            j(2_100, "EVENT idle seq=2 Nothing left: the parser"),
             j(
-                122_000,
+                2_100,
                 "DONE seq=2 rule=land@v1 the worker defended that nothing is left",
             ),
         ],
         ledger: vec![
             point(900, 1),
-            typed(121_000, "land@v1", LAND),
-            point(122_000, 2),
-            task_done(122_000),
+            typed(1_100, "land@v1", LAND),
+            point(2_100, 2),
+            task_done(2_100),
         ],
-        status: vec![
-            status(500, "open", "land"),
-            status(123_000, "landed", "land"),
-        ],
-        status_reads: vec![T0 + 500, T0 + 123_000],
+        status: vec![status(500, "open", "land"), status(3_100, "landed", "land")],
+        status_reads: vec![T0 + 500, T0 + 3_100],
         meta: vec![no_meta(500)],
         task: vec![j(500, "OK task -")],
         reply_ms: None,
         asked_ms: None,
         ask_refused_ms: None,
-        end_ms: T0 + 122_000 + 5 * 60_000 + 5_000,
+        end_ms: T0 + 2_100 + 5 * 60_000 + 5_000,
         cover: Cover::default(),
         window: surfaces::Window::default(),
         stub: Some(StubSeen {
@@ -1991,13 +1983,13 @@ fn p4_land_passes_only_where_every_instant_reply_is_judged_once() {
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("never judged"), "{why}");
     let mut again = instant_landed();
-    again.journal.truncate(3);
+    again.journal.truncate(2);
     again.journal.push(j(
-        151_000,
+        31_100,
         "WAITING seq=1 until=x the worker to take the land@v1 act",
     ));
     again.journal.push(j(
-        391_000,
+        271_100,
         "CONTINUED seq=2 rule=land@v1 [aterm harness] Autopilot is Land: land",
     ));
     let (w, why) = p4l(&again);
@@ -2006,7 +1998,7 @@ fn p4_land_passes_only_where_every_instant_reply_is_judged_once() {
     let mut late = instant_landed();
     for (t, l) in &mut late.journal {
         if l.starts_with("EVENT idle seq=2") || l.starts_with("DONE ") {
-            *t = T0 + 151_500;
+            *t = T0 + 31_600;
         }
     }
     let (w, why) = p4l(&late);
@@ -2014,9 +2006,9 @@ fn p4_land_passes_only_where_every_instant_reply_is_judged_once() {
     assert!(why.contains("take window"), "{why}");
     let mut doubled = instant_landed();
     doubled.journal.insert(
-        3,
+        2,
         j(
-            121_500,
+            1_600,
             "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land: land",
         ),
     );
@@ -2030,7 +2022,7 @@ fn p4_land_passes_only_where_every_instant_reply_is_judged_once() {
     ));
     assert_eq!(p4l(&after).0, "FAIL");
     let mut short = instant_landed();
-    short.end_ms = T0 + 200_000;
+    short.end_ms = T0 + 80_000;
     assert_eq!(p4l(&short).0, "UNOBSERVED");
 }
 
@@ -2698,17 +2690,25 @@ fn forever_window_under_the_restore_seam_is_a_usage_error_not_could_not_run() {
 /// mode does: `angles`' sixth check would come past +79 min on the shipped ladder. NEGATIVE
 /// CONTROL: `cruise`, whose same reply is held by its second answer, keeps the shipped ladder.
 #[test]
-fn the_ladder_and_angles_modes_alone_run_the_ladder_at_an_eighth() {
-    for (mode, scaled) in [
-        (Mode::Ladder, true),
-        (Mode::Angles, true),
-        (Mode::Cruise, false),
-        (Mode::Cover, false),
+fn the_ladder_and_angles_modes_alone_run_the_ladder_at_an_eighth_and_the_outages_at_three() {
+    for (mode, env) in [
+        (Mode::Ladder, Some(ladder_env())),
+        (Mode::Angles, Some(ladder_env())),
+        (Mode::OutageLand, Some(outage::env())),
+        (Mode::OutageCruise, Some(outage::env())),
+        (Mode::Cruise, None),
+        (Mode::Cover, None),
     ] {
         let u =
             lab_opts(crate::lab::UpOpts::default(), mode, false, (false, false)).expect("headless");
-        assert_eq!(u.instance_env.contains(&ladder_env()), scaled, "{mode:?}");
+        let seam = u
+            .instance_env
+            .split_whitespace()
+            .find(|w| w.starts_with(turn_end::LADDER_SCALE_SEAM))
+            .map(str::to_string);
+        assert_eq!(seam, env, "{mode:?}");
     }
+    assert!(crate::lab::instance_env(&outage::env()).is_ok());
 }
 
 #[test]
@@ -2827,12 +2827,12 @@ fn land_w_passes_only_where_the_wrote_replies_are_read() {
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("not the reply opening"), "{why}");
     s.journal
-        .insert(2, j(60_000, &format!("EVENT idle seq=7 {W_WORK}")));
+        .insert(0, j(60_000, &format!("EVENT idle seq=7 {W_WORK}")));
     let (w, why) = l14(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("not the reply opening"), "{why}");
     let mut s = pass.clone();
-    s.journal.remove(3);
+    s.journal.remove(2);
     s.meta.truncate(1);
     s.status.remove(1);
     assert_eq!(l14(&s).0, "FAIL");
@@ -3528,46 +3528,47 @@ fn wall_passes_on_nothing_typed_into_it_gone_on_past_it_and_landed() {
 
 #[test]
 fn an_act_before_the_due_its_back_off_named_fails_every_scenario_of_its_chain() {
+    // The nudge after the second point's 4-minute back-off (due +370.0 s), moved: Land's
+    // instruction waits no back-off.
     let moved = |t: i64| {
         let mut s = landed_a();
-        s.journal[2].0 = T0 + t;
-        s.ledger[1].ts = T0 + t;
+        s.journal[5].0 = T0 + t;
+        s.ledger[3].ts = T0 + t;
         s
     };
     assert_eq!(
-        verdicts(Chain::LandA, &moved(123_100), "agy"),
+        verdicts(Chain::LandA, &moved(368_100), "agy"),
         [("L1", "PASS"), ("L3", "PASS"), ("L5", "PASS")]
     );
-    let early = moved(122_900);
+    let early = moved(367_900);
     assert_eq!(
         verdicts(Chain::LandA, &early, "agy"),
         [("L1", "FAIL"), ("L3", "FAIL"), ("L5", "FAIL")]
     );
     let (_, why) = one(Chain::LandA, &early, "agy", Scenario::L1);
     assert!(
-        why.contains("+122.9 s land@v1 typed 2.1 s BEFORE the due"),
+        why.contains("+367.9 s land-nudge@v1 typed 2.1 s BEFORE the due"),
         "{why}"
     );
     assert!(why.contains("its own judge: PASS"), "{why}");
     assert_eq!(
-        verdicts(Chain::LandA, &moved(60_000), "agy")[0],
+        verdicts(Chain::LandA, &moved(250_000), "agy")[0],
         ("L1", "FAIL")
     );
-    let mut s = landed_a();
-    s.journal[6].0 = T0 + 190_000;
-    s.ledger[3].ts = T0 + 190_000;
-    let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L3);
+    let (w, why) = one(Chain::LandA, &moved(190_000), "agy", Scenario::L3);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("land-nudge@v1 typed"), "{why}");
-    let mut s = moved(60_000);
+    let mut s = moved(250_000);
     s.journal
-        .insert(2, j(59_000, "EVENT idle seq=9 another turn ended"));
-    assert_eq!(verdicts(Chain::LandA, &s, "agy")[0], ("L1", "PASS"));
-    let mut s = moved(60_000);
-    s.journal[1].1 = "WAITING seq=1 until=x the worker to take the land@v1 act".into();
-    assert_eq!(verdicts(Chain::LandA, &s, "agy")[0], ("L1", "PASS"));
+        .insert(5, j(249_000, "EVENT idle seq=9 another turn ended"));
+    let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L1);
+    assert_eq!(w, "PASS", "{why}");
+    let mut s = moved(250_000);
+    s.journal[4].1 = "WAITING seq=2 until=x the person at the keyboard".into();
+    let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L1);
+    assert_eq!(w, "PASS", "{why}");
     let mut s = landed_a();
-    s.journal[1].1 = "WAITING seq=1 until=soon 1 short turn(s) in a row: 2 min back-off".into();
+    s.journal[4].1 = "WAITING seq=2 until=soon 2 short turn(s) in a row: 4 min back-off".into();
     let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L1);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("names no due that reads"), "{why}");
@@ -4822,11 +4823,7 @@ fn seen_land_j(label: &str) -> Seen {
     };
     Seen {
         journal: vec![
-            j(5_000, "EVENT idle seq=1 Implemented the parser"),
-            j(
-                5_100,
-                "WAITING seq=1 until=x 1 short turn(s) in a row: 2 min back-off",
-            ),
+            j(124_800, "EVENT idle seq=1 Implemented the parser"),
             j(
                 125_000,
                 "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land:",
@@ -4838,7 +4835,7 @@ fn seen_land_j(label: &str) -> Seen {
             ),
         ],
         ledger: vec![
-            point(5_000, 1),
+            point(124_800, 1),
             typed(125_000, "land@v1", LAND),
             task_done(165_000),
         ],
@@ -4993,8 +4990,8 @@ fn land_j_and_land_k_fail_a_wrong_window_read() {
     s.window.strip[1] = j(100_000, "index=2 selected=0 states=-");
     assert_eq!(l17(&s).0, "FAIL");
     let mut s = seen_land_j("land-j");
+    s.journal[2].0 = T0 + 140_000;
     s.journal[3].0 = T0 + 140_000;
-    s.journal[4].0 = T0 + 140_000;
     let (w, why) = l16(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("under the 30 s floor"), "{why}");
@@ -6656,6 +6653,9 @@ fn claude_codes_notice_is_gone_once_cancelled_and_scrolled_away() {
 
 #[path = "forever_walls_tests.rs"]
 mod walls;
+
+#[path = "forever_outage_tests.rs"]
+mod outage_tests;
 
 #[test]
 fn the_hide_waits_on_the_walls_wait_either_side_of_its_point() {

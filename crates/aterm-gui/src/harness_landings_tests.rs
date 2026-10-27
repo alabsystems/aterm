@@ -13,6 +13,7 @@ use aterm_agent::harness::stats::Tally;
 fn listed(local_id: u64, view: AutopilotView, task: Option<TaskFace>) -> HarnessSession {
     HarnessSession {
         stopped: None,
+        waiting: None,
         local_id,
         sid: format!("s-{local_id}"),
         title: format!("work {local_id}"),

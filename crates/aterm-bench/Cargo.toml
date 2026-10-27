@@ -22,6 +22,8 @@ aterm-restore = { workspace = true }
 aterm-effects = { workspace = true }
 aterm-gpu = { workspace = true }
 aterm-render = { workspace = true }
+# ...and its `--light` ground, Default Light, from the shipped theme registry.
+aterm-types = { workspace = true }
 # The effects harness declares its thread user-interactive, the QoS the app's render thread has.
 aterm-pty = { workspace = true }
 # ...and reads the thread's CPU clock and the process's instructions retired (the effects lane's
@@ -42,9 +44,6 @@ aterm-objc = { workspace = true }
 # for its `--release` run (a debug build has the seams anyway). No dependency's manifest turns it
 # on.
 dev-seams = ["aterm-gpu/dev-seams", "aterm-effects/dev-seams"]
-# On macOS, the effects harness's `--wgpu` record: the wgpu arm (the Windows and BSD presenter
-# and its timestamp-query clock) beside Metal. The lane never names it.
-wgpu-oracle = ["aterm-gpu/wgpu-oracle"]
 # Aos M5a's measured child `examples/aos_gpu.rs` (design §12.9); int-bag-mlp is named too, as
 # aterm-gpu's edge to aterm-effects (which `compute` turns it on through) is macOS-only.
 aos-gpu = ["aterm-gpu/compute", "aterm-effects/int-bag-mlp"]

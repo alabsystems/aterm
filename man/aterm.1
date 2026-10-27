@@ -51,7 +51,8 @@ or
 .B \-\-headless
 it is the
 .IR window :
-a GPU terminal (Metal on macOS, wgpu elsewhere, with a CPU fallback) or,
+a GPU terminal (Metal on macOS, OpenGL on Linux, Direct3D 11 on Windows,
+with a CPU fallback) or,
 headless, the same engine, PTYs and control socket with no window.
 .B aterm ctl
 drives the window through that socket.
@@ -310,10 +311,10 @@ moves a live Claude Code onto a newer build.
 The PTY keeper (macOS, opt\-in with
 .BR "[keeper] enabled = true" ).
 .TP
-.B aterm caffeine \fR[\fIcmd\fR]
-The menu\-bar keep\-awake mug (macOS): a click keeps this Mac awake, a right
-click picks 1, 8 or 24 hours or forever, Enable at Startup, or Quit.
-Commands:
+.B aterm acaffiene \fR[\fIcmd\fR]
+The menu\-bar keep\-awake mug (macOS), started by every ordinary aterm window.
+A click keeps this Mac awake, a right click picks 1, 8 or 24 hours or forever,
+Enable at Startup, or Quit. Commands:
 .BR start ,
 .BR on " [\fIspan\fR],"
 .BR off ,
@@ -321,7 +322,7 @@ Commands:
 .BR startup " [\fBon\fR|\fBoff\fR],"
 .BR quit ;
 see
-.BR "aterm help caffeine" .
+.BR "aterm help acaffiene" .
 .TP
 .BR "aterm new\-tab" ", " "aterm new\-window" ", " "aterm split\-pane"
 Open a tab, window or split

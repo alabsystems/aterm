@@ -2,18 +2,22 @@
 // Copyright 2026 Andrew Yates
 
 //! Cold-build sub-phase timing for the `backend_finalize` startup phase.
+//!
+//! The legs and ledgers were wgpu's build's; since GW.6 removed wgpu
+//! (docs/AUDIT-third-party-2026-10-15.md) the renderer records only
+//! `FontThread`, `FontJoin`, `PipeUniformAtlas`, `PipeTail` and `PipeTotal`,
+//! and every other slot, the cell-pipeline split and the effect-build ledger
+//! read 0.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aterm_time::Duration;
-#[cfg(wgpu_arm)]
-use aterm_time::Instant;
 
 /// Exclusive legs of one cold GPU-renderer build, in execution order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Leg {
-    /// `wgpu::Instance::new` — backend enumeration and driver load.
+    /// Instance creation: backend enumeration and driver load (wgpu's).
     GpuInstance = 0,
     /// `request_adapter` + `get_info`.
     GpuAdapter = 1,
@@ -77,30 +81,6 @@ pub fn record(leg: Leg, elapsed: Duration) {
     );
 }
 
-/// Time `build` as `leg` and return its value. The scoped form of [`record`].
-#[cfg(wgpu_arm)]
-pub(crate) fn timed<T>(leg: Leg, build: impl FnOnce() -> T) -> T {
-    let started = Instant::now();
-    let built = build();
-    record(leg, started.elapsed());
-    built
-}
-
-/// Records the elapsed time since `since` for cell pipeline `index` and returns `Instant::now()`.
-#[cfg(wgpu_arm)]
-pub(crate) fn split_cell_pipeline(index: usize, since: Instant) -> Instant {
-    let now = Instant::now();
-    if let Some(slot) = CELL_PIPELINE_NS.get(index) {
-        let _ = slot.compare_exchange(
-            0,
-            slot_ns(now.duration_since(since)),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-    }
-    now
-}
-
 /// Reads the nanosecond duration recorded for `leg` (`0` if unset).
 #[inline]
 pub fn leg_ns(leg: Leg) -> u64 {
@@ -116,16 +96,6 @@ pub fn cell_pipeline_ns() -> [u64; CELL_PIPELINE_COUNT] {
 static EFFECT_BUILDS: AtomicU64 = AtomicU64::new(0);
 static EFFECT_BUILD_NS: AtomicU64 = AtomicU64::new(0);
 static EFFECT_BUILT_MASK: AtomicU64 = AtomicU64::new(0);
-
-/// Book one demand-built effect pipeline (slot `index`) into the ledger.
-#[cfg(wgpu_arm)]
-pub(crate) fn record_effect_build(index: usize, elapsed: Duration) {
-    EFFECT_BUILDS.fetch_add(1, Ordering::Relaxed);
-    EFFECT_BUILD_NS.fetch_add(slot_ns(elapsed), Ordering::Relaxed);
-    if index < u64::BITS as usize {
-        EFFECT_BUILT_MASK.fetch_or(1u64 << index, Ordering::Relaxed);
-    }
-}
 
 /// Returns `(count, nanoseconds, slot_bitmask)` of demand-built effect pipelines.
 #[inline]

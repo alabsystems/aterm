@@ -29,7 +29,7 @@
 #    src/dpi.rs, the part of dpi 0.1.2 aterm uses; `window::CursorIcon` is src/cursor_icon.rs,
 #    the six icons aterm sets and the eight edge-resize icons a client-decorated Wayland
 #    header's frame edges set; build.rs prints the five live cfgs itself (no `cfg_aliases`).
-#  - `rwh_06` is not a default feature; see the note on `default`.
+#  - No `rwh_06` feature and no `raw-window-handle` row; see the note on `default`.
 #  - The Wayland backend draws no client-side frame (no `wayland-csd-adwaita` feature, no
 #    `sctk-adwaita` row): where the compositor grants no server-side decorations the
 #    application draws its header (aterm-gui's chrome band) and reads the negotiated mode from
@@ -75,7 +75,6 @@ license = "Apache-2.0 AND MIT"
 repository = "https://github.com/rust-windowing/winit"
 
 [package.metadata.docs.rs]
-features = ["rwh_06"]
 targets = [
     "i686-pc-windows-msvc",
     "x86_64-pc-windows-msvc",
@@ -89,20 +88,18 @@ rustdoc-args = [
 ]
 
 [features]
-# LOCAL PATCH (aterm) (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6): `rwh_06` is
-# not a default. On macOS a window hands over its content view through first-party
+# LOCAL PATCH (aterm) (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6 and RWH-LOCK):
+# no `rwh_06` feature. On macOS a window hands over its content view through first-party
 # `aterm_objc::HasNsView`, which the Metal presenter and aterm-gui's chrome read, and an X11,
 # Wayland or Win32 window hands over its handles through first-party
 # `aterm_types::native_window::HasNativeWindow`, which the GL and D3D11 arms and the CPU
-# presenters read, so raw-window-handle is in no cell's graph; the opt-in `rwh_06` handles
-# there wrap the same answer. The targets that still present through wgpu (the BSDs, which have
-# no cell and no CPU presenter: aterm-gui's `present::CpuSurface` is macOS, Linux and Windows
-# only) turn it on: aterm-gui's dependency row for them.
+# presenters read. The opt-in `rwh_06` handles wrapped the same answer and had no caller once
+# the BSDs, which turned them on to present through wgpu, stopped building at GW.6; they went
+# with the `raw-window-handle` row, which left Cargo.lock.
 default = [
     "x11",
     "wayland",
 ]
-rwh_06 = ["dep:rwh_06"]
 # LOCAL PATCH (aterm) (docs/AUDIT-third-party-2026-10-15.md, LW.7): the Wayland
 # backend speaks to the compositor through first-party `aterm-wayland` (its protocol tables, a
 # runtime over libwayland-client opened at run time, and its registry, output, seat, selection
@@ -137,12 +134,6 @@ path = "tests/recorded_answers.rs"
 # FIRST-PARTY and path-only; aterm-gui already links it in every cell this crate compiles in.
 [dependencies.aterm-types]
 path = "../aterm-types"
-
-[dependencies.rwh_06]
-version = "0.6"
-features = ["std"]
-optional = true
-package = "raw-window-handle"
 
 [dependencies.tracing]
 version = "0.1.40"

@@ -36,15 +36,7 @@ impl Rng {
 
 fn arms(theme: Theme) -> Vec<(&'static str, Renderer, aterm_gpu::GpuRenderer)> {
     let (cpu, gpu) = common::backends(18.0, theme);
-    #[allow(unused_mut, reason = "the oracle build adds an arm")]
-    let mut out = vec![("native", cpu, gpu)];
-    #[cfg(all(wgpu_arm, any(target_os = "macos", target_os = "linux", windows)))]
-    {
-        let (cpu, mut gpu) = common::backends(18.0, theme);
-        common::disarm_for_oracle(&mut gpu);
-        out.push(("wgpu-oracle", cpu, gpu));
-    }
-    out
+    vec![("native", cpu, gpu)]
 }
 
 fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer) {
@@ -66,8 +58,6 @@ fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer) {
         arm == "native",
         "{arm}: the frame's arm"
     );
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    let _ = (arm, gpu);
 }
 
 fn base_terminal() -> Terminal {
@@ -1406,34 +1396,6 @@ fn bloom_fx_layers_feed_the_gpu_bloom() {
     }
 }
 
-/// The crown (the present's HDR aurora boost over the bloom source) reads a
-/// `bloom` layer on a frame with no aurora: on a 2.0× EDR panel the fx-only
-/// frame emits above reference white, and the same layer without `bloom`
-/// does not (the control).
-#[cfg(wgpu_arm)]
-#[test]
-fn an_fx_only_bloom_frame_takes_the_crown() {
-    let mut gpu = common::wgpu_oracle(18.0, Theme::default());
-    gpu.set_bloom(false);
-    gpu.set_shimmer(false);
-    gpu.set_hdr_glow(true);
-    let mut t = base_terminal();
-    let mut over_white = |bloom: bool| {
-        let mut l = blooming_layer();
-        l.bloom = bloom;
-        let input = input_with(&mut t, vec![l], Vec::new());
-        let mut win = aterm_gpu::WindowGpu::new();
-        win.set_edr_max(2.0);
-        let (px, _, _) = gpu.present_hdr_for_test(&mut win, &input, true);
-        px.iter()
-            .enumerate()
-            .filter(|&(i, &v)| i % 4 != 3 && v > 1.0)
-            .count()
-    };
-    assert!(over_white(true) > 0, "the bloom layer takes the crown");
-    assert_eq!(over_white(false), 0, "control: a plain layer does not");
-}
-
 #[test]
 fn an_over_budget_frame_draws_the_same_arts_on_the_gpu() {
     use aterm_core::render::{FX_ART_MAX_SIDE, FX_FRAME_ART_TEXELS};
@@ -1594,7 +1556,7 @@ fn a_frame_whose_fx_fails_closed_counts_no_fx() {
 
 /// The scrollbar's rounded bars are byte-exact on every arm: the body rectangle and the two
 /// antialiased caps of one Index8 art a `(width, radius)`, each cap clipped to its own rows,
-/// land the CPU's bytes on the native arm and the wgpu oracle, opaque and translucent, at every
+/// land the CPU's bytes on the native arm, opaque and translucent, at every
 /// width the chrome draws and on and across row bands.
 #[test]
 fn rounded_bars_are_byte_exact_on_the_gpu() {
@@ -1655,4 +1617,160 @@ fn rounded_bars_are_byte_exact_on_the_gpu() {
             );
         }
     }
+}
+
+/// The ⬆️'s ring keys a frame draws: every hue, for `cell` on `theme`'s ground.
+fn ring_keys(theme: Theme, cell: (u16, u16)) -> Vec<aterm_effects::up_ring::RingKey> {
+    use aterm_effects::harness_card::CardPalette;
+    use aterm_effects::up_ring::{RingHue, RingKey};
+    let (ground, fg) = (theme.bg & 0x00FF_FFFF, theme.fg & 0x00FF_FFFF);
+    [
+        RingHue::Arc(CardPalette::Cruise),
+        RingHue::Arc(CardPalette::Land),
+        RingHue::Arc(CardPalette::Off),
+        RingHue::Accent(0x003B_8EEA),
+        RingHue::Neutral,
+    ]
+    .into_iter()
+    .map(|hue| RingKey {
+        cell,
+        ground,
+        fg,
+        rule: 0x005A_5A5A,
+        hue,
+    })
+    .collect()
+}
+
+/// The ring layer for `key` at grid cell `(row, col)` ([`aterm_effects::up_ring`]).
+fn ring_layer(id: u64, key: &aterm_effects::up_ring::RingKey, (row, col): (i32, i32)) -> FxLayer {
+    let (cw, ch) = (i32::from(key.cell.0), i32::from(key.cell.1));
+    aterm_effects::up_ring::layer(
+        id,
+        aterm_effects::up_ring::content(key),
+        (col * cw, row * ch),
+        PxRect::EVERYWHERE,
+    )
+}
+
+/// THE ⬆️'S RING IS BYTE-EXACT ON THE GPU: every ring key (every hue), drawn under the glyphs in
+/// Rgba8Premul at 1x and at 2x, on a dark and a light theme, paints the same bytes on the GPU as
+/// on the CPU.
+#[test]
+fn the_up_ring_is_byte_exact_on_the_gpu() {
+    let light = Theme {
+        fg: 0x002B_2D33,
+        bg: 0x00F6_F7F9,
+        cursor: 0x0033_3333,
+        selection: 0x00B0_C4DE,
+    };
+    for theme in [Theme::default(), light] {
+        for scale in [1.0f32, 2.0] {
+            let (mut cpu, mut gpu) = common::backends(18.0 * scale, theme);
+            let mut win = aterm_gpu::WindowGpu::new();
+            let mut t = base_terminal();
+            let (cw, ch) = cpu.cell_size();
+            let cell = (
+                u16::try_from(cw).expect("a cell"),
+                u16::try_from(ch).expect("a cell"),
+            );
+            let keys = ring_keys(theme, cell);
+            let layers: Vec<FxLayer> = keys
+                .iter()
+                .enumerate()
+                .map(|(k, key)| {
+                    let row = 2 * k as i32;
+                    ring_layer(100 + k as u64, key, (row, (k as i32 % 2) * 12))
+                })
+                .collect();
+            let input = input_with(&mut t, layers, Vec::new());
+            let (c, g) = (
+                cpu.render_input(&input),
+                gpu.render_input(&mut win, &input, None),
+            );
+            let base = t.cell_frame(ROWS, COLS);
+            assert_ne!(
+                c.pixels,
+                cpu.render_input(&base).pixels,
+                "{scale}x: the rings paint"
+            );
+            let delta = max_channel_delta(&c.pixels, &g.pixels);
+            common::assert_byte_exact(
+                "the_up_ring_is_byte_exact_on_the_gpu",
+                &format!("{scale}x"),
+                &gpu,
+                delta,
+                format_args!("{scale}x: {keys:?} (got {delta})"),
+            );
+        }
+    }
+}
+
+/// THE CPU DRAWS THE ⬆️'S RING'S BYTES: through `aterm_render::Renderer`, the ring's opaque rim
+/// texel lands as its ink over the cell, its wash lands between the ground and the ink, and its
+/// clear corner leaves the ground. CONTROL: with no layer the wash's pixel is the ground.
+#[test]
+fn the_cpu_draws_the_up_rings_bytes() {
+    use aterm_effects::harness_card::CardPalette;
+    use aterm_effects::up_ring::{RingHue, RingKey, raster, ring_ink};
+    let theme = Theme::default();
+    let mut cpu = common::cpu(18.0, theme);
+    let (cw, ch) = cpu.cell_size();
+    let key = RingKey {
+        cell: (
+            u16::try_from(cw).expect("a cell"),
+            u16::try_from(ch).expect("a cell"),
+        ),
+        ground: theme.bg & 0x00FF_FFFF,
+        fg: theme.fg & 0x00FF_FFFF,
+        rule: 0x005A_5A5A,
+        hue: RingHue::Arc(CardPalette::Cruise),
+    };
+    let (w, h, bytes) = raster(&key);
+    let texel = |x: usize, y: usize| {
+        let at = (y * usize::from(w) + x) * 4;
+        [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]
+    };
+    let mut t = Terminal::new(ROWS as u16, COLS as u16);
+    t.process(b"\x1b[?25l");
+    let base = cpu.render_input(&t.cell_frame(ROWS, COLS));
+    let input = input_with(&mut t, vec![ring_layer(7, &key, (1, 2))], Vec::new());
+    let drawn = cpu.render_input(&input);
+    let fw = drawn.width;
+    let (x0, y0) = (cpu.pad() + 2 * cw, cpu.grid_top() + ch);
+    let at = |x: usize, y: usize| drawn.pixels[(y0 + y) * fw + x0 + x];
+    let ground_at = |x: usize, y: usize| base.pixels[(y0 + y) * fw + x0 + x] & 0x00FF_FFFF;
+    let rgb = |p: [u8; 4]| (u32::from(p[0]) << 16) | (u32::from(p[1]) << 8) | u32::from(p[2]);
+    let ink = ring_ink(&key);
+    // The rim's top row over the ring's middle: the ink alone, opaque.
+    let rx = usize::from(w) / 2;
+    let ry = (0..usize::from(h))
+        .find(|&y| texel(rx, y)[3] > 0)
+        .expect("the ring's top");
+    assert_eq!(
+        (texel(rx, ry)[3], rgb(texel(rx, ry))),
+        (255, ink),
+        "the rim's texel is its ink"
+    );
+    assert_eq!(at(rx, ry) & 0x00FF_FFFF, ink, "the rim lands as its ink");
+    let mid = (rx, usize::from(h) / 2);
+    let wash = texel(mid.0, mid.1);
+    assert!(wash[3] > 0 && wash[3] < 255, "the wash is faint: {wash:?}");
+    let ground = ground_at(mid.0, mid.1);
+    let landed = at(mid.0, mid.1) & 0x00FF_FFFF;
+    assert!(
+        landed != ground && landed != ink,
+        "the wash lands between the ground and the ink: {landed:06x}"
+    );
+    assert_eq!(texel(0, 0)[3], 0, "the corner is clear");
+    assert_eq!(
+        at(0, 0) & 0x00FF_FFFF,
+        ground_at(0, 0),
+        "the clear corner leaves the ground"
+    );
+    assert_eq!(
+        ground,
+        theme.bg & 0x00FF_FFFF,
+        "CONTROL: with no layer the wash's pixel is the ground"
+    );
 }

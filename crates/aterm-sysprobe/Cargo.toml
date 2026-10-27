@@ -6,7 +6,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's in-process readers of another process (working directory, executable, process-group footprint; on Windows its command line and environment block), of the machine (per-core CPU ticks and the cluster layout, memory by page class, commit, swap, pressure, throttling, cgroup capacity, the GPU's device-wide use, every network interface's counters, the process table's ceilings and counts, the load average, every resource coalition's CPU, disk and footprint counters, a process's code-signing identity and the boot, sleep and wake times on macOS, and what this OS can report at all), of its volumes (the mount table, one volume's free space, one file's identity) and of its build slots (Trust's `build-slot` flock files, read without a lock), on macOS, Linux and Windows, and the one rule that places a path under a directory across Windows' spellings. Every platform cfg of those readers lives here; it holds no timer and no thread."
+description = "aterm's in-process readers of another process (working directory, executable, process-group footprint; on Windows its command line and environment block), of the machine (per-core CPU ticks and the cluster layout, memory by page class, commit, swap, pressure, throttling, cgroup capacity, the GPU's device-wide use, every network interface's counters, the process table's ceilings and counts, the load average, every resource coalition's CPU, disk and footprint counters, a process's code-signing identity and the boot, sleep and wake times on macOS, and what this OS can report at all), of its volumes (the mount table, one volume's free space, one file's identity) and of its build slots (Trust's `build-slot` flock files, read without a lock), on macOS, Linux and Windows, and the one rule that places a path under a directory across Windows' spellings. Every platform cfg of those readers lives here. Ordinary readers hold no timer or thread; the fixed CPU-policy collector role owns its deadline and parent-pipe monitors."
 
 # The macOS arm: libproc, `sysctlbyname`, Mach host and processor statistics
 # and `statfs` (declared in the first-party `libc`, each with its oracle row),
@@ -48,7 +48,7 @@ aterm-json = { workspace = true }
 # time with its three entry points read into a table (`src/nvml.rs`), so a
 # machine without the driver runs the same binary. Workspace crate, libc
 # only.
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 aterm-dl = { workspace = true }
 
 # Scratch directories removed on drop: the Linux readers' fixture roots

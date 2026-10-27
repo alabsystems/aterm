@@ -41,8 +41,13 @@ pub const ORIGINATOR: &str = "codex_cli_rs";
 /// Registered loopback ports for Codex's OAuth redirect URI (`1455` primary, `1457` fallback).
 pub const LOOPBACK_PORTS: [u16; 2] = [1455, 1457];
 
-/// Maximum HTTP response body read from OAuth token or usage endpoints.
+/// Maximum OAuth or usage HTTP response body, in bytes.
 pub const MESSAGE_MAX: usize = 256 * 1024;
+
+/// Maximum credential file read size, in bytes. A document can retain tokens
+/// from several separately bounded responses alongside independent metadata.
+/// This bounds reads without rejecting a publication after token rotation.
+const AUTH_FILE_MAX: usize = 2 * 1024 * 1024;
 
 /// Maximum loopback HTTP callback request head read from the local browser redirect.
 const CALLBACK_REQ_MAX: usize = 16 * 1024;
@@ -109,6 +114,7 @@ struct JwtClaims {
     email: Option<String>,
     plan: Option<String>,
     account_id: Option<String>,
+    user_id: Option<String>,
     exp: Option<i64>,
 }
 
@@ -140,6 +146,7 @@ fn parse_jwt_claims(token: &str) -> Option<JwtClaims> {
     }
     let decoded = base64url_decode(payload)?;
     let claims: Value = aterm_json::from_slice(&decoded).ok()?;
+    let claims = claims.as_object()?;
     let email = claims
         .get("email")
         .and_then(Value::as_str)
@@ -164,6 +171,16 @@ fn parse_jwt_claims(token: &str) -> Option<JwtClaims> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+    let user_id = auth_ns
+        .and_then(|a| {
+            ["chatgpt_user_id", "user_id"].iter().find_map(|key| {
+                a.get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+        })
+        .map(str::to_owned);
     let exp = claims.get("exp").and_then(|v| {
         v.as_i64().or_else(|| {
             v.as_f64()
@@ -175,8 +192,26 @@ fn parse_jwt_claims(token: &str) -> Option<JwtClaims> {
         email,
         plan,
         account_id,
+        user_id,
         exp,
     })
+}
+
+#[derive(PartialEq, Eq)]
+enum TokenUser {
+    Unknown,
+    Known(String),
+    Conflicting,
+}
+
+fn token_user(id_token: Option<&str>, access_token: &str) -> TokenUser {
+    let id_user = id_token.and_then(parse_jwt_claims).and_then(|c| c.user_id);
+    let access_user = parse_jwt_claims(access_token).and_then(|c| c.user_id);
+    match (id_user, access_user) {
+        (Some(a), Some(b)) if a != b => TokenUser::Conflicting,
+        (Some(user), _) | (_, Some(user)) => TokenUser::Known(user),
+        _ => TokenUser::Unknown,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -223,7 +258,7 @@ fn read_auth_file_bounded(home: &Path) -> Option<String> {
     if !file.metadata().ok()?.is_file() {
         return None;
     }
-    let limit = MESSAGE_MAX as u64;
+    let limit = AUTH_FILE_MAX as u64;
     let mut bytes = Vec::new();
     file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
@@ -237,6 +272,10 @@ fn read_auth_file_bounded(home: &Path) -> Option<String> {
 fn load_stored_auth(home: &Path) -> Option<StoredAuth> {
     let text = read_auth_file_bounded(home)?;
     let doc: Value = aterm_json::from_str(&text).ok()?;
+    stored_auth_from_doc(doc)
+}
+
+fn stored_auth_from_doc(doc: Value) -> Option<StoredAuth> {
     if let Some(mode) = doc.get("auth_mode").and_then(Value::as_str)
         && mode != "chatgpt"
         && mode != "chatgptAuthTokens"
@@ -339,46 +378,16 @@ pub fn read_account_email(home: &Path) -> Option<String> {
     read_account_in_home(home)?.email
 }
 
-fn endpoint_authority(url: &str) -> Option<(&str, &str)> {
-    let (scheme, rest) = url
-        .strip_prefix("https://")
-        .map(|r| ("https", r))
-        .or_else(|| url.strip_prefix("http://").map(|r| ("http", r)))?;
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty()
-        || authority.contains('@')
-        || authority.bytes().any(|b| b <= 0x20 || b >= 0x7f)
-    {
-        return None;
-    }
-    Some((scheme, authority))
-}
-
-fn is_loopback_authority(authority: &str) -> bool {
-    if let Some(rest) = authority.strip_prefix("[::1]") {
-        return rest.is_empty()
-            || rest
-                .strip_prefix(':')
-                .and_then(|p| p.parse::<u16>().ok())
-                .is_some();
-    }
-    let (host, port) = match authority.split_once(':') {
-        Some((h, p)) => (h, Some(p)),
-        None => (authority, None),
-    };
-    if !(host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost")) {
-        return false;
-    }
-    port.is_none_or(|p| p.parse::<u16>().is_ok())
-}
-
 fn is_loopback_endpoint(url: &str) -> bool {
-    endpoint_authority(url).is_some_and(|(_, auth)| is_loopback_authority(auth))
+    aterm_http::Uri::parse(url).is_some_and(|uri| is_loopback_host(uri.host()))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1") || host.eq_ignore_ascii_case("localhost")
 }
 
 fn is_allowed_auth_endpoint(url: &str) -> bool {
-    endpoint_authority(url)
-        .is_some_and(|(scheme, auth)| scheme == "https" || is_loopback_authority(auth))
+    refresh_endpoint(url).is_some()
 }
 
 fn http_client(url: &str, timeout: Duration) -> Client {
@@ -411,27 +420,239 @@ fn needs_proactive_refresh(stored: &StoredAuth, now: i64) -> bool {
 /// `CODEX_AUTH_PATH`) rotated the stored access token since `prior` was read, avoiding replay of a
 /// single-use OAuth refresh token.
 fn reload_updated_disk_auth(home: &Path, prior: &StoredAuth) -> Option<StoredAuth> {
-    let disk = load_stored_auth(home)?;
-    let same_account = match (prior.account_id.as_deref(), disk.account_id.as_deref()) {
-        (Some(a), Some(b)) => a == b,
-        _ => true,
-    };
-    (same_account && disk.access_token != prior.access_token).then_some(disk)
+    updated_disk_auth(prior, load_stored_auth(home)?)
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "CodexRefreshIdentity",
+        action = "Observe",
+        project = "aterm_agent::harness::codex_app_login::tests::identity_transition"
+    )
+)]
+fn updated_disk_auth(prior: &StoredAuth, disk: StoredAuth) -> Option<StoredAuth> {
+    let same_account = prior
+        .account_id
+        .as_ref()
+        .zip(disk.account_id.as_ref())
+        .is_some_and(|(a, b)| a == b);
+    let same_user = matches!(
+        (token_user(prior.id_token.as_deref(), &prior.access_token),
+            token_user(disk.id_token.as_deref(), &disk.access_token)),
+        (TokenUser::Known(a), TokenUser::Known(b)) if a == b
+    );
+    let same_login = ["login_owner_id", "oauth_provenance"]
+        .iter()
+        .all(|field| prior.doc["tokens"].get(field) == disk.doc["tokens"].get(field));
+    (same_account
+        && same_user
+        && same_login
+        && !disk.access_token.trim().is_empty()
+        && disk.access_token != prior.access_token)
+        .then_some(disk)
+}
+
+/// The `CodexRefreshIdentity` environment selector, named where the whole-source
+/// closure can collect it: the conformance fixture choosing its token-identity and
+/// workspace case is not a production observation step.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "CodexRefreshIdentity",
+        action = "AnotherCase",
+        reason = "The conformance fixture selects which token identity and workspace snapshot the observation must judge; updated_disk_auth does not choose its caller's credentials. codex_refresh_identity_conforms_and_preserves_workspace_and_login exercises every case."
+    )
+)]
+#[doc(hidden)]
+pub fn codex_refresh_identity_environment() {}
+
+/// The `CodexRefreshAuthority` environment selector, named where the whole-source
+/// closure can collect it: the conformance fixture choosing its recorded-authority
+/// case is not a production refresh step.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "CodexRefreshAuthority",
+        action = "AnotherCase",
+        reason = "The conformance fixture selects which recorded OAuth authority or legacy fallback the refresh must honour; refresh_stored_auth does not choose its stored provenance. codex_refresh_uses_the_recorded_oauth_authority exercises every case."
+    )
+)]
+#[doc(hidden)]
+pub fn codex_refresh_authority_environment() {}
+
+/// The `CodexLoginPublication` environment selector, named where the whole-source
+/// closure can collect it: the conformance fixture choosing its token-response,
+/// transport and entropy case is not a production exchange step.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "CodexLoginPublication",
+        action = "AnotherCase",
+        reason = "The conformance fixture selects which token response, transport and entropy the exchange must judge; CodeExchange::persist does not choose its token endpoint's answers. codex_login_publication_conforms_and_rejects_conflicting_token_users exercises every case."
+    )
+)]
+#[doc(hidden)]
+pub fn codex_login_publication_environment() {}
+
+/// The `CodexRefreshResult` environment selector, visible to the whole-source
+/// closure: choosing a later file edit or a failed publication is a fixture step.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "CodexRefreshResult",
+        action = "AnotherCase",
+        reason = "The conformance fixture selects the independent post-publication file edit or writer failure; refresh_stored_auth_with_publish does not choose another writer's changes. refreshed_result_is_the_published_snapshot_not_a_later_login exercises every case."
+    )
+)]
+#[doc(hidden)]
+pub fn codex_refresh_result_environment() {}
+
+fn same_authentication(prior: &StoredAuth, disk: &StoredAuth) -> bool {
+    prior.doc.get("auth_mode") == disk.doc.get("auth_mode")
+        && prior.doc.get("tokens") == disk.doc.get("tokens")
+}
+
+/// The `CodexRefreshPublication` environment selectors, named where the whole-source
+/// closure can collect them: the conformance fixture choosing its case and boundary
+/// is not a production refresh step.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "CodexRefreshPublication",
+        action = "AnotherCase",
+        reason = "The conformance fixture selects which concurrent credential edit the refresh must survive; refresh_stored_auth does not choose its caller's edit. a_refresh_response_cannot_replace_a_login_changed_during_the_request exercises every case."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "CodexRefreshPublication",
+        action = "BeforeRequest",
+        reason = "The conformance fixture selects whether the independent edit lands before the HTTP request or before its response is published; this selector is not a production refresh step. a_refresh_response_cannot_replace_a_login_changed_during_the_request exercises both boundaries."
+    )
+)]
+#[doc(hidden)]
+pub fn codex_refresh_publication_environment() {}
+
+struct RefreshAuthority {
+    token_url: String,
+    client_id: String,
+}
+
+fn refresh_endpoint(url: &str) -> Option<aterm_http::Uri> {
+    if url
+        .bytes()
+        .any(|b| b <= 0x20 || b >= 0x7f || matches!(b, b'\\' | b'?' | b'#'))
+    {
+        return None;
+    }
+    let uri = aterm_http::Uri::parse(url)?;
+    (uri.scheme() == aterm_http::Scheme::Https || is_loopback_host(uri.host())).then_some(uri)
+}
+
+/// Recorded authority wins over the legacy fallback. An invalid present record
+/// is not a legacy login, and JWT claims never supply refresh authority.
+fn refresh_authority(stored: &StoredAuth, fallback_token_url: &str) -> Option<RefreshAuthority> {
+    let Some(record) = stored.doc["tokens"].get("oauth_provenance") else {
+        refresh_endpoint(fallback_token_url)?;
+        return Some(RefreshAuthority {
+            token_url: fallback_token_url.to_owned(),
+            client_id: CLIENT_ID.to_owned(),
+        });
+    };
+    let issuer = record.get("issuer")?.as_str()?;
+    let client_id = record.get("client_id")?.as_str()?;
+    if client_id.is_empty()
+        || client_id.trim() != client_id
+        || client_id.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let issuer_uri = refresh_endpoint(issuer)?;
+    let token_url = format!("{}/oauth/token", issuer.trim_end_matches('/'));
+    let target = refresh_endpoint(&token_url)?;
+    if target.scheme() != issuer_uri.scheme()
+        || target.host() != issuer_uri.host()
+        || target.port() != issuer_uri.port()
+    {
+        return None;
+    }
+    Some(RefreshAuthority {
+        token_url,
+        client_id: client_id.to_owned(),
+    })
+}
+
+/// Observe the credential again before the request and publication. A token
+/// rotation already visible at either boundary wins over this refresh. This is
+/// not an atomic compare-and-swap with other programs' later file replacements.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "CodexRefreshPublication",
+        action = "Refresh",
+        project = "aterm_agent::harness::codex_app_login::tests::refresh_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "CodexRefreshIdentity",
+        action = "Observe",
+        project = "aterm_agent::harness::codex_app_login::tests::identity_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "CodexRefreshAuthority",
+        action = "Refresh",
+        project = "aterm_agent::harness::codex_app_login::tests::authority_transition"
+    )
+)]
 fn refresh_stored_auth(
     home: &Path,
     stored: &StoredAuth,
-    token_url: &str,
+    fallback_token_url: &str,
     wait: Duration,
     now: i64,
 ) -> Option<StoredAuth> {
-    if wait.is_zero() || !is_allowed_auth_endpoint(token_url) {
+    refresh_stored_auth_with_publish(home, stored, fallback_token_url, wait, now, write_auth_doc)
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "CodexRefreshResult",
+        action = "Refresh",
+        project = "aterm_agent::harness::codex_app_login::tests::result_transition"
+    )
+)]
+fn refresh_stored_auth_with_publish(
+    home: &Path,
+    stored: &StoredAuth,
+    fallback_token_url: &str,
+    wait: Duration,
+    now: i64,
+    publish: impl FnOnce(&Path, &Value) -> std::io::Result<()>,
+) -> Option<StoredAuth> {
+    if wait.is_zero() {
         return None;
     }
+    let prior_user = token_user(stored.id_token.as_deref(), &stored.access_token);
+    if prior_user == TokenUser::Conflicting {
+        return None;
+    }
+    let before_request = load_stored_auth(home)?;
+    if !same_authentication(stored, &before_request) {
+        return updated_disk_auth(stored, before_request);
+    }
+    let authority = refresh_authority(stored, fallback_token_url)?;
+    let token_url = &authority.token_url;
     let refresh_token = stored.refresh_token.as_deref()?;
     let body = aterm_json::to_string(&json!({
-        "client_id": CLIENT_ID,
+        "client_id": authority.client_id,
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     }))
@@ -454,25 +675,38 @@ fn refresh_stored_auth(
         .get("access_token")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())?;
-    let mut doc = stored.doc.clone();
+    let new_id = payload
+        .get("id_token")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let after_user = token_user(new_id.or(stored.id_token.as_deref()), new_access);
+    match (&prior_user, &after_user) {
+        (_, TokenUser::Conflicting) => return None,
+        (TokenUser::Known(a), TokenUser::Known(b)) if a != b => return None,
+        _ => {}
+    }
+    let current = load_stored_auth(home)?;
+    if !same_authentication(stored, &current) {
+        return updated_disk_auth(stored, current);
+    }
+    // Preserve independent metadata changes without discarding the response's
+    // rotated refresh token when the complete authentication record is unchanged.
+    let mut doc = current.doc;
     {
         let tokens_obj = doc.as_object_mut()?.get_mut("tokens")?.as_object_mut()?;
         tokens_obj.insert(
             "access_token".to_owned(),
             Value::String(new_access.to_owned()),
         );
-        let new_id = payload
-            .get("id_token")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty());
         if let Some(new_id) = new_id {
             tokens_obj.insert("id_token".to_owned(), Value::String(new_id.to_owned()));
         }
-        if let Some(acc_id) = new_id
-            .and_then(parse_jwt_claims)
-            .and_then(|c| c.account_id)
-            .or_else(|| parse_jwt_claims(new_access).and_then(|c| c.account_id))
-        {
+        if let Some(acc_id) = stored.account_id.clone().or_else(|| {
+            new_id
+                .and_then(parse_jwt_claims)
+                .and_then(|c| c.account_id)
+                .or_else(|| parse_jwt_claims(new_access).and_then(|c| c.account_id))
+        }) {
             tokens_obj.insert("account_id".to_owned(), Value::String(acc_id));
         }
         if let Some(new_refresh) = payload
@@ -490,8 +724,11 @@ fn refresh_stored_auth(
         let stamp = aterm_types::rfc3339::format_rfc3339(u64::try_from(now.max(0)).unwrap_or(0));
         root.insert("last_refresh".to_owned(), Value::String(stamp));
     }
-    write_auth_doc(home, &doc).ok()?;
-    load_stored_auth(home)
+    let candidate = stored_auth_from_doc(doc)?;
+    publish(home, &candidate.doc).ok()?;
+    // The completed write owns this result. A later file replacement belongs
+    // to another operation and must not change this refresh's identity.
+    Some(candidate)
 }
 
 fn read_configured_base_url(config_path: &Path) -> Option<String> {
@@ -520,11 +757,17 @@ pub fn resolve_usage_url(home: &Path, user_home: &Path) -> String {
         .unwrap_or_else(|| usage_url_from_base(DEFAULT_CHATGPT_BASE_URL))
 }
 
+fn has_origin_host_prefix(url: &str, origin: &str) -> bool {
+    url.strip_prefix(origin)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', ':']))
+}
+
 /// Normalizes `base_url` using Codex's backend rules and appends `/wham/usage` or `/api/codex/usage`.
 #[must_use]
 pub fn usage_url_from_base(base_url: &str) -> String {
     let mut base = base_url.trim().trim_end_matches('/').to_owned();
-    if (base.starts_with("https://chatgpt.com") || base.starts_with("https://chat.openai.com"))
+    if (has_origin_host_prefix(&base, "https://chatgpt.com")
+        || has_origin_host_prefix(&base, "https://chat.openai.com"))
         && !base.contains("/backend-api")
     {
         base.push_str("/backend-api");
@@ -716,13 +959,14 @@ fn get_usage_once(usage_url: &str, stored: &StoredAuth, wait: Duration) -> Optio
     Some((resp.status(), resp.body().to_vec()))
 }
 
-/// Reads `<home>/auth.json`, refreshes its OAuth token against `token_url` when near/past expiry
-/// or rejected with `401`, fetches `usage_url`, and returns [`Usage`] at `now`.
+/// Reads `<home>/auth.json`, refreshes its OAuth token when near/past expiry or rejected with
+/// `401`, fetches `usage_url`, and returns [`Usage`] at `now`. Recorded OAuth provenance selects
+/// the refresh issuer and client; `fallback_token_url` applies only to older records without it.
 #[must_use]
 pub fn read_usage_with(
     home: &Path,
     usage_url: &str,
-    token_url: &str,
+    fallback_token_url: &str,
     wait: Duration,
     now: i64,
 ) -> Option<Usage> {
@@ -736,7 +980,9 @@ pub fn read_usage_with(
         }
         if needs_proactive_refresh(&stored, now) {
             let left = deadline.saturating_duration_since(Instant::now());
-            if let Some(refreshed) = refresh_stored_auth(home, &stored, token_url, left, now) {
+            if let Some(refreshed) =
+                refresh_stored_auth(home, &stored, fallback_token_url, left, now)
+            {
                 stored = refreshed;
             }
         }
@@ -752,7 +998,7 @@ pub fn read_usage_with(
     }
     if status == 401 && stored.refresh_token.is_some() {
         let left = deadline.saturating_duration_since(Instant::now());
-        let refreshed = refresh_stored_auth(home, &stored, token_url, left, now)?;
+        let refreshed = refresh_stored_auth(home, &stored, fallback_token_url, left, now)?;
         let left = deadline.saturating_duration_since(Instant::now());
         (status, body) = get_usage_once(usage_url, &refreshed, left)?;
     }
@@ -823,6 +1069,7 @@ fn percent_decode_query(input: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+#[cfg(test)]
 fn parse_query_params(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
@@ -832,6 +1079,33 @@ fn parse_query_params(query: &str) -> Vec<(String, String)> {
             Some((percent_decode_query(raw_k)?, percent_decode_query(raw_v)?))
         })
         .collect()
+}
+
+fn parse_strict_query_params(query: &str) -> Option<Vec<(String, String)>> {
+    query
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (raw_k, raw_v) = part.split_once('=').unwrap_or((part, ""));
+            Some((percent_decode_query(raw_k)?, percent_decode_query(raw_v)?))
+        })
+        .collect()
+}
+
+fn unique_query_param<'a>(
+    params: &'a [(String, String)],
+    key: &str,
+) -> Result<Option<&'a str>, ()> {
+    let mut found = None;
+    for (k, v) in params {
+        if k == key {
+            if found.is_some() {
+                return Err(());
+            }
+            found = Some(v.as_str());
+        }
+    }
+    Ok(found)
 }
 
 fn encode_form(pairs: &[(&str, &str)]) -> String {
@@ -1080,17 +1354,21 @@ fn serve_callback_loop(
                     write_http_reply(&mut stream, "404 Not Found", "text/plain", "Not Found");
                     continue;
                 }
-                let params = parse_query_params(query);
-                let param = |key: &str| {
-                    params
-                        .iter()
-                        .find(|(k, _)| k == key)
-                        .map(|(_, v)| v.as_str())
+                let Some(params) = parse_strict_query_params(query) else {
+                    write_http_reply(
+                        &mut stream,
+                        "400 Bad Request",
+                        "text/plain",
+                        "Invalid callback query",
+                    );
+                    continue;
                 };
-                let state_ok = param("state").is_some_and(|st| {
-                    st == expected_state
-                        || st.strip_suffix(":life_sciences") == Some(expected_state.as_str())
-                });
+                let state_ok = matches!(
+                    unique_query_param(&params, "state"),
+                    Ok(Some(st))
+                        if st == expected_state
+                            || st.strip_suffix(":life_sciences") == Some(expected_state.as_str())
+                );
                 if !state_ok {
                     write_http_reply(
                         &mut stream,
@@ -1100,7 +1378,21 @@ fn serve_callback_loop(
                     );
                     continue;
                 }
-                if param("error").is_some_and(|e| !e.is_empty()) {
+                let (Ok(err_param), Ok(code_param)) = (
+                    unique_query_param(&params, "error"),
+                    unique_query_param(&params, "code"),
+                ) else {
+                    write_http_reply(
+                        &mut stream,
+                        "400 Bad Request",
+                        "text/plain",
+                        "Duplicate callback parameter",
+                    );
+                    done.store(true, Ordering::SeqCst);
+                    let _ = tx.send(CallbackOutcome::Failed);
+                    return;
+                };
+                if err_param.is_some_and(|e| !e.is_empty()) {
                     write_http_reply(
                         &mut stream,
                         "200 OK",
@@ -1111,7 +1403,7 @@ fn serve_callback_loop(
                     let _ = tx.send(CallbackOutcome::Failed);
                     return;
                 }
-                let Some(code) = param("code").filter(|c| !c.is_empty()) else {
+                let Some(code) = code_param.filter(|c| !c.is_empty()) else {
                     write_http_reply(
                         &mut stream,
                         "400 Bad Request",
@@ -1156,75 +1448,133 @@ fn serve_callback_loop(
 
 fn exchange_code_and_persist(
     home: &Path,
-    token_url: &str,
+    endpoints: &Endpoints,
     redirect_uri: &str,
     code: &str,
     code_verifier: &str,
     wait: Duration,
     now: i64,
 ) -> Option<Option<String>> {
-    if wait.is_zero() || !is_allowed_auth_endpoint(token_url) {
-        return None;
+    let mut entropy = [0u8; 32];
+    let owner = SystemRandom::new()
+        .fill(&mut entropy)
+        .ok()
+        .and_then(|()| base64url_encode(&entropy));
+    CodeExchange {
+        home,
+        endpoints,
+        redirect_uri,
+        code,
+        code_verifier,
+        wait,
+        now,
     }
-    let form = encode_form(&[
-        ("grant_type", "authorization_code"),
-        ("client_id", CLIENT_ID),
-        ("code", code),
-        ("redirect_uri", redirect_uri),
-        ("code_verifier", code_verifier),
-    ]);
-    let resp = http_client(token_url, wait)
-        .request(Method::Post, token_url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .header("User-Agent", "codex-cli")
-        .header("originator", ORIGINATOR)
-        .limit(MESSAGE_MAX)
-        .backstop(wait)
-        .send(form.as_bytes())
-        .ok()?;
-    if resp.status() != 200 {
-        return None;
+    .persist(owner.as_deref())
+}
+
+struct CodeExchange<'a> {
+    home: &'a Path,
+    endpoints: &'a Endpoints,
+    redirect_uri: &'a str,
+    code: &'a str,
+    code_verifier: &'a str,
+    wait: Duration,
+    now: i64,
+}
+
+impl CodeExchange<'_> {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "CodexLoginPublication",
+            action = "Exchange",
+            project = "aterm_agent::harness::codex_app_login::tests::login_transition"
+        )
+    )]
+    fn persist(self, owner: Option<&str>) -> Option<Option<String>> {
+        let Self {
+            home,
+            endpoints,
+            redirect_uri,
+            code,
+            code_verifier,
+            wait,
+            now,
+        } = self;
+        let owner = owner.filter(|owner| !owner.is_empty())?;
+        let token_url = &endpoints.token_url;
+        if wait.is_zero() || !is_allowed_auth_endpoint(token_url) {
+            return None;
+        }
+        let form = encode_form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", CLIENT_ID),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", code_verifier),
+        ]);
+        let resp = http_client(token_url, wait)
+            .request(Method::Post, token_url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .header("User-Agent", "codex-cli")
+            .header("originator", ORIGINATOR)
+            .limit(MESSAGE_MAX)
+            .backstop(wait)
+            .send(form.as_bytes())
+            .ok()?;
+        if resp.status() != 200 {
+            return None;
+        }
+        let payload: Value = aterm_json::from_slice(resp.body()).ok()?;
+        let id_token = payload
+            .get("id_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())?;
+        let access_token = payload
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())?;
+        let refresh_token = payload
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let id_claims = parse_jwt_claims(id_token)?;
+        let access_claims = parse_jwt_claims(access_token)?;
+        if token_user(Some(id_token), access_token) == TokenUser::Conflicting {
+            return None;
+        }
+        let account_id = id_claims.account_id.or(access_claims.account_id);
+        let email = id_claims.email.or(access_claims.email);
+        // Only bind an issuer that actually names this token exchange. Explicit
+        // transport overrides retain legacy absent provenance, never a false issuer.
+        let provenance = refresh_endpoint(&endpoints.issuer)
+            .filter(|_| {
+                format!("{}/oauth/token", endpoints.issuer.trim_end_matches('/')) == *token_url
+            })
+            .map(|_| json!({"issuer":endpoints.issuer, "client_id":CLIENT_ID}));
+        let stamp = aterm_types::rfc3339::format_rfc3339(u64::try_from(now.max(0)).unwrap_or(0));
+        let mut doc = json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": Value::Null,
+            "tokens": {
+                "id_token": id_token,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "account_id": account_id,
+                "login_owner_id": owner,
+            },
+            "last_refresh": stamp,
+        });
+        if let Some(provenance) = provenance {
+            doc.as_object_mut()?
+                .get_mut("tokens")?
+                .as_object_mut()?
+                .insert("oauth_provenance".into(), provenance);
+        }
+        write_auth_doc(home, &doc).ok()?;
+        Some(email)
     }
-    let payload: Value = aterm_json::from_slice(resp.body()).ok()?;
-    let id_token = payload
-        .get("id_token")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())?;
-    let access_token = payload
-        .get("access_token")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())?;
-    let refresh_token = payload
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let id_claims = parse_jwt_claims(id_token);
-    let access_claims = parse_jwt_claims(access_token);
-    if id_claims.is_none() && access_claims.is_none() {
-        return None;
-    }
-    let account_id = id_claims
-        .as_ref()
-        .and_then(|c| c.account_id.clone())
-        .or_else(|| access_claims.as_ref().and_then(|c| c.account_id.clone()));
-    let email = id_claims
-        .and_then(|c| c.email)
-        .or_else(|| access_claims.and_then(|c| c.email));
-    let stamp = aterm_types::rfc3339::format_rfc3339(u64::try_from(now.max(0)).unwrap_or(0));
-    let doc = json!({
-        "auth_mode": "chatgpt",
-        "OPENAI_API_KEY": Value::Null,
-        "tokens": {
-            "id_token": id_token,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "account_id": account_id,
-        },
-        "last_refresh": stamp,
-    });
-    write_auth_doc(home, &doc).ok()?;
-    Some(email)
 }
 
 /// Runs Codex's native loopback PKCE browser sign-in against `endpoints`, writing `<home>/auth.json`
@@ -1278,6 +1628,12 @@ pub fn login_with(
         return Drove {
             outcome: Outcome::OffPin,
             host,
+        };
+    }
+    if !is_loopback_endpoint(&endpoints.token_url) && !pinned(&endpoints.token_url, hosts) {
+        return Drove {
+            outcome: Outcome::OffPin,
+            host: https_host(&endpoints.token_url),
         };
     }
     if Instant::now() >= deadline {
@@ -1411,7 +1767,7 @@ pub fn login_with(
     let now = crate::supervise::limit::unix_now();
     match exchange_code_and_persist(
         home,
-        &endpoints.token_url,
+        endpoints,
         &redirect_uri,
         &code,
         &code_verifier,

@@ -153,15 +153,45 @@ pub fn level_of(id: &str, argv: &[String], _claude_default: Option<&str>) -> Opt
                     no_shell = true;
                     None
                 }
-                ("claude", "-p" | "--print" | "--no-session-persistence", None)
-                | ("codex", "--skip-git-repo-check" | "--ephemeral", None) => None,
+                // `--allow-dangerously-skip-permissions` only lets the session cycle into
+                // bypass later, as a relaunch out of it keeps it (`relaunch::with_permission_mode`).
                 (
                     "claude",
-                    "--append-system-prompt"
-                    | "--system-prompt"
-                    | "--resume"
-                    | "--model"
-                    | "--output-format",
+                    "-p"
+                    | "--print"
+                    | "--no-session-persistence"
+                    | "--allow-dangerously-skip-permissions",
+                    None,
+                )
+                | ("codex", "--skip-git-repo-check" | "--ephemeral", None) => None,
+                // Claude Code's `--resume [value]`: its value is optional, and a next word that
+                // starts with `-` is the next flag.
+                ("claude", "--resume", _) => {
+                    if attached.is_none()
+                        && argv.get(i + 1).is_some_and(|next| !next.starts_with('-'))
+                    {
+                        i += 1;
+                    }
+                    None
+                }
+                // aterm's own usage tap, which a relaunch adds, sets a statusLine and nothing
+                // else; any other settings may set permissions.
+                ("claude", "--settings", _) => {
+                    let value = match attached {
+                        Some(v) => v,
+                        None => {
+                            i += 1;
+                            argv.get(i)?.as_str()
+                        }
+                    };
+                    if !crate::harness::tap::is_ours(value) {
+                        return None;
+                    }
+                    None
+                }
+                (
+                    "claude",
+                    "--append-system-prompt" | "--system-prompt" | "--model" | "--output-format",
                     _,
                 )
                 | ("codex", "--model" | "-m" | "--color" | "--cd" | "-C", _)

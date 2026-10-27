@@ -5,8 +5,12 @@
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
-//! Formal models for `agh` route wall policy.
+//! Formal models for `agh`: route wall policy, ensure-once and the git grant.
 
+mod models_ensure_once;
+mod models_git_grant;
 mod models_route_wall;
 
+pub use models_ensure_once::*;
+pub use models_git_grant::*;
 pub use models_route_wall::*;

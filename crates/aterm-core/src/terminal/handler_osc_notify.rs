@@ -33,11 +33,9 @@ impl TerminalHandler<'_> {
         if message.is_empty() {
             return;
         }
-        if self.notifications.callback.is_none() || !self.notifications.admits(self.program_state) {
-            return;
-        }
-        if let Some(ref mut callback) = self.notifications.callback {
-            callback(&message);
+        let sinks = &mut self.notifications.sinks;
+        if let Some(cap) = sinks.try_mint(self.modes.allow_notifications, self.program_state) {
+            sinks.notify(cap, &message);
         }
     }
 
@@ -110,12 +108,11 @@ impl TerminalHandler<'_> {
         }
 
         if done {
-            if entry.has_content()
-                && self.notifications.advanced_callback.is_some()
-                && self.notifications.admits(self.program_state)
-            {
-                if let Some(ref mut callback) = self.notifications.advanced_callback {
-                    callback(entry);
+            if entry.has_content() {
+                let sinks = &mut self.notifications.sinks;
+                let allowed = self.modes.allow_notifications;
+                if let Some(cap) = sinks.try_mint_advanced(allowed, self.program_state) {
+                    sinks.notify_advanced(cap, entry);
                 }
             }
         } else if self.notifications.pending.len() < MAX_PENDING_NOTIFICATIONS {
@@ -151,13 +148,11 @@ impl TerminalHandler<'_> {
             body,
             urgency: NotificationUrgency::Normal,
         };
-        if self.notifications.advanced_callback.is_none()
-            || !self.notifications.admits(self.program_state)
+        let sinks = &mut self.notifications.sinks;
+        if let Some(cap) =
+            sinks.try_mint_advanced(self.modes.allow_notifications, self.program_state)
         {
-            return;
-        }
-        if let Some(ref mut callback) = self.notifications.advanced_callback {
-            callback(notification);
+            sinks.notify_advanced(cap, notification);
         }
     }
 }

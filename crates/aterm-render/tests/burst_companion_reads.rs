@@ -152,6 +152,7 @@ impl Replay {
             protected: &[],
             overlays: &[],
             ink: &[],
+            blanked: &[],
             painted_over: None,
         };
         self.owner
@@ -281,17 +282,26 @@ impl Replay {
     }
 }
 
+/// Every letter the burst's companion lies on reads at the bar, the body knocked out of the
+/// letters' ink. Judged on the companion's paths and on its old ones
+/// (`CompanionOwner::set_pet_old_paths`): since looks8 round 3 its paths keep it off the
+/// burst's letters nearly throughout, so the old ones, which lie under them for a good part
+/// of the replay, are what give the knock-out letters to judge. Negative control: the
+/// knock-out off, the body under the letters takes one under the bar.
 #[test]
 fn every_letter_the_burst_s_companion_lies_on_reads_at_the_bar() {
-    for (name, ink, page) in [
-        ("dark", 0x00D0_D0D0u32, 0x0011_1318u32),
-        ("light", 0x001F_2328, 0x00FF_FFFF),
+    for (name, ink, page, old) in [
+        ("dark", 0x00D0_D0D0u32, 0x0011_1318u32, false),
+        ("light", 0x001F_2328, 0x00FF_FFFF, false),
+        ("dark, old paths", 0x00D0_D0D0u32, 0x0011_1318u32, true),
+        ("light, old paths", 0x001F_2328, 0x00FF_FFFF, true),
     ] {
         let mut r = Replay::new(ink, page);
+        r.owner.set_pet_old_paths(old);
         let (judged, last) = r.burst(4_600);
         let under: Vec<&Judged> = judged.iter().filter(|j| j.under).collect();
         assert!(
-            under.len() > 50,
+            !old || under.len() > 50,
             "{name}: the companion must lie under the letters for a good part of the replay \
              ({} frames), or the replay judges nothing",
             under.len()
@@ -320,7 +330,11 @@ fn every_letter_the_burst_s_companion_lies_on_reads_at_the_bar() {
             );
         }
 
+        if !old {
+            continue;
+        }
         let mut off = Replay::new(ink, page);
+        off.owner.set_pet_old_paths(true);
         off.rend.set_knock_out(false);
         let (judged, _) = off.burst(4_600);
         let worst = judged

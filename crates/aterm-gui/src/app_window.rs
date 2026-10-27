@@ -40,6 +40,23 @@ const INITIAL_FRAME_SETTLE_WINDOW: std::time::Duration = std::time::Duration::fr
 #[cfg(target_os = "linux")]
 const INITIAL_FRAME_SETTLE_MAX_CORRECTIONS: u8 = 3;
 
+#[cfg(test)]
+thread_local! {
+    /// The instant a test holds the initial-frame settle's clock at on this thread.
+    static SETTLE_NOW_FOR_TEST: std::cell::Cell<Option<Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Now, as the initial-frame settle reads it: its expiry and its veto's park.
+#[cfg(any(target_os = "linux", test))]
+fn settle_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = SETTLE_NOW_FOR_TEST.with(std::cell::Cell::get) {
+        return now;
+    }
+    Instant::now()
+}
+
 #[must_use]
 fn cascade_top_left_pts(
     anchor: (f64, f64),
@@ -682,8 +699,7 @@ impl App {
             // that binds a row before then builds it. A headless instance warms
             // nothing: test suites start many at once, and their concurrent
             // reads and rewrites of the one Metal shader cache killed one by
-            // SIGBUS (an FS pagein error in MTLCompilerFSCache). The wgpu arm
-            // would build on this thread, so it warms only on that config apply.
+            // SIGBUS (an FS pagein error in MTLCompilerFSCache).
             #[cfg(target_os = "macos")]
             if !self.headless && self.config.warms_effect_pipelines() {
                 g.warm_effect_pipelines();
@@ -1533,7 +1549,7 @@ impl App {
         else {
             return false;
         };
-        if Instant::now() > settle.deadline || settle.corrections == 0 {
+        if settle_now() > settle.deadline || settle.corrections == 0 {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.initial_frame_settle = None;
             }
@@ -1622,7 +1638,7 @@ impl App {
             self.sync_surface_to_window(wid);
             self.on_resize(wid, applied);
         } else {
-            let fallback = (Instant::now() + Self::SETTLE_VETO_FALLBACK).min(settle_deadline);
+            let fallback = (settle_now() + Self::SETTLE_VETO_FALLBACK).min(settle_deadline);
             ws.pending_resize = Some(vetoed);
             ws.next_resize_settle = Some(fallback);
         }
@@ -2529,7 +2545,8 @@ impl App {
     pub(crate) fn apply_title(&mut self, id: WindowId, window: &Window, title: &str) {
         #[cfg(windows)]
         self.sync_taskbar_progress(id);
-        self.publish_active_terminal_title(id, title);
+        let title = self.publish_active_terminal_title(id, title);
+        let title: &str = &title;
         let mut scratch = std::mem::take(&mut self.window_title_scratch);
         let focused_session = self.window_title_identity(id, title, &mut scratch);
         self.chrome_labels.present_into(
@@ -2636,7 +2653,30 @@ impl App {
             .or_else(|| self.windows.contains_key(&stamped).then_some(stamped))
     }
 
-    fn publish_active_terminal_title(&mut self, id: WindowId, title: &str) {
+    /// Write window `id`'s title to its focused session's store handle and return it: `shown`, the shown engine's, or the live engine's while that pane is rewound, since the handle holds the live session's title.
+    pub(crate) fn publish_active_terminal_title<'a>(
+        &mut self,
+        id: WindowId,
+        shown: &'a str,
+    ) -> std::borrow::Cow<'a, str> {
+        let title = self
+            .live_title_while_rewound(id)
+            .map_or(std::borrow::Cow::Borrowed(shown), std::borrow::Cow::Owned);
+        self.publish_terminal_title(id, &title);
+        title
+    }
+
+    /// While window `id`'s focused pane is rewound, its live engine's title (the store's cached one while another thread holds that engine).
+    fn live_title_while_rewound(&self, id: WindowId) -> Option<String> {
+        let session = self.rewound_front(id)?;
+        let live = self.pool.get(session)?.live_term();
+        Some(match crate::term_try_lock(live) {
+            Some(term) => term.title_arc().to_string(),
+            None => self.windows.get(&id)?.store_title.1.clone(),
+        })
+    }
+
+    fn publish_terminal_title(&mut self, id: WindowId, title: &str) {
         if self.active_native_view(id).is_some() {
             return;
         }
@@ -4280,8 +4320,12 @@ mod tests {
             "negative control: the park is longer than the ordinary throttle"
         );
 
+        // A settle ending short of the fallback, on a clock held still so its 20 ms cannot lapse
+        // before the echo comes: the echo's park is the settle's own deadline.
+        let now = Instant::now();
+        SETTLE_NOW_FOR_TEST.with(|clock| clock.set(Some(now)));
         let intended = arm_settle(&mut app, 24, 80, 3);
-        let deadline = Instant::now() + std::time::Duration::from_millis(20);
+        let deadline = now + std::time::Duration::from_millis(20);
         app.windows
             .get_mut(&wid)
             .and_then(|ws| ws.initial_frame_settle.as_mut())
@@ -4289,6 +4333,7 @@ mod tests {
             .deadline = deadline;
         app.apply_window_resized_grid(wid, intended);
         app.apply_window_resized_grid(wid, echo);
+        SETTLE_NOW_FOR_TEST.with(|clock| clock.set(None));
         assert_eq!(
             app.windows.get(&wid).expect("window 0").next_resize_settle,
             Some(deadline),

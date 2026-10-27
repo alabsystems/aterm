@@ -192,8 +192,11 @@ impl TrickFlash {
     #[inline]
     pub(crate) fn retain_panes(&mut self, keep: impl Fn(u64) -> bool) {
         let mut w = 0usize;
-        for r in 0..usize::from(self.base_y_len) {
+        let len = usize::from(self.base_y_len);
+        let mut r = 0usize;
+        while r < len {
             let entry = self.base_y[r];
+            r += 1;
             let keep_entry = match entry.0 {
                 None => true,
                 Some(pane) => keep(pane),
@@ -261,6 +264,7 @@ impl TrickFlash {
             project = "conformance_trick_flash::project"
         )
     )]
+    #[inline]
     pub(crate) fn note(
         &mut self,
         now: Instant,
@@ -376,6 +380,7 @@ impl TrickFlash {
             project = "conformance_trick_flash::project"
         )
     )]
+    #[inline]
     pub(crate) fn on_rescan(
         &mut self,
         scope: Option<u64>,
@@ -448,6 +453,7 @@ impl TrickFlash {
     }
 
     /// The tick half: merge this frame's flash cells into `ink`.
+    #[inline]
     pub(crate) fn emit(
         &mut self,
         scope: Option<u64>,
@@ -482,7 +488,8 @@ impl TrickFlash {
         let time_deg = t as f32 * DEG_PER_MS;
         let mut search_from = 0usize;
         let has_tint = tint > 0.0;
-        for i in 0..n {
+        let mut i = 0;
+        while i < n {
             let target = if has_tint {
                 let hue = hue0 + i as f32 * span_per_step + time_deg;
                 hsv2rgb(hue, loc.sat, loc.val)
@@ -490,11 +497,13 @@ impl TrickFlash {
                 0
             };
             let col = loc.cols[i];
+            let fg_i = loc.fg[i];
+            i += 1;
             let cell = if !matches!(ink.last(), Some(c) if (c.row, c.col) >= (loc.row, col)) {
                 let cell = InkCell {
                     row: loc.row,
                     col,
-                    color: u32_to_rgb3(mix_rgb(rgb3_to_u32(loc.fg[i]), target, tint)),
+                    color: u32_to_rgb3(mix_rgb(rgb3_to_u32(fg_i), target, tint)),
                 };
                 ink.push(cell);
                 search_from = ink.len();
@@ -504,7 +513,7 @@ impl TrickFlash {
                 let lookup = match ink.get(search_from) {
                     Some(c) if (c.row, c.col) == key => Ok(0),
                     Some(c) if (c.row, c.col) > key => Err(0),
-                    _ => ink[search_from..].binary_search_by_key(&key, |c| (c.row, c.col)),
+                    _ => find_ink_cell(&ink[search_from..], key),
                 };
                 match lookup {
                     Ok(rel) => {
@@ -520,7 +529,7 @@ impl TrickFlash {
                         let cell = InkCell {
                             row: loc.row,
                             col,
-                            color: u32_to_rgb3(mix_rgb(rgb3_to_u32(loc.fg[i]), target, tint)),
+                            color: u32_to_rgb3(mix_rgb(rgb3_to_u32(fg_i), target, tint)),
                         };
                         ink.insert(j, cell);
                         cell
@@ -749,6 +758,7 @@ struct Hit {
     anchor: Anchor,
 }
 
+#[inline]
 fn find_in_row(
     cells: &[RenderCell],
     seq: &[char],
@@ -762,16 +772,22 @@ fn find_in_row(
     let (caret_plus_back, caret_plus_two_back) = (caret + back, caret + two_back);
     let three_plus_two_back = 3 + two_back;
     let reach = i64::from(TYPED_EDIT_REACH_COLS) + two_back + 2;
-    let max_start = match usize::try_from(caret + reach) {
-        Ok(m) => m.saturating_add(1).min(cells.len()),
-        Err(_) => 0,
+    let max_start = if caret + reach >= 0 {
+        ((caret + reach) as usize)
+            .saturating_add(1)
+            .min(cells.len())
+    } else {
+        0
     };
     let mut best: Option<Hit> = None;
-    for start in 0..max_start {
-        if cells[start].wide || cells[start].ch != first {
+    let mut start = 0;
+    while start < max_start {
+        let cur_start = start;
+        start += 1;
+        if cells[cur_start].wide || cells[cur_start].ch != first {
             continue;
         }
-        let mut prev = start;
+        let mut prev = cur_start;
         let mut word_before = false;
         while prev > 0 {
             prev -= 1;
@@ -784,23 +800,22 @@ fn find_in_row(
             continue;
         }
         let mut cols = [0u16; MAX_CHARS];
-        let mut at = start;
+        let mut at = cur_start;
         let mut matched = true;
-        for k in 0..seq.len() {
+        let mut k = 0;
+        while k < seq.len() {
             let want = seq[k];
             while at < cells.len() && cells[at].wide {
                 at += 1;
             }
-            if at < cells.len()
-                && cells[at].ch == want
-                && let Ok(col) = u16::try_from(at)
-            {
-                cols[k] = col;
+            if at < cells.len() && at <= u16::MAX as usize && cells[at].ch == want {
+                cols[k] = at as u16;
             } else {
                 matched = false;
                 break;
             }
             at += 1;
+            k += 1;
         }
         if !matched {
             continue;
@@ -811,7 +826,7 @@ fn find_in_row(
         if at < cells.len() && is_word_char(cells[at].ch) {
             continue;
         }
-        let (start, end) = (start as i64, at as i64 - 1);
+        let (start, end) = (cur_start as i64, at as i64 - 1);
         let end_1 = end + 1;
         if caret < start - reach || caret > end_1 + reach {
             continue;
@@ -878,6 +893,24 @@ fn find_word(
     }
 }
 
+#[inline]
+const fn find_ink_cell(slice: &[InkCell], (row, col): (u16, u16)) -> Result<usize, usize> {
+    let mut lo = 0usize;
+    let mut hi = slice.len();
+    while lo < hi {
+        let mid = lo + ((hi - lo) >> 1);
+        let c = &slice[mid];
+        if c.row < row || (c.row == row && c.col < col) {
+            lo = mid + 1;
+        } else if c.row > row || c.col > col {
+            hi = mid;
+        } else {
+            return Ok(mid);
+        }
+    }
+    Err(lo)
+}
+
 /// `row − (base_y_now − base_y_then)`: where a live row stands after the scroll
 /// the snapshot reports.
 #[inline]
@@ -894,6 +927,7 @@ const fn scrolled(row: u16, then: Option<i64>, now: Option<i64>) -> (i64, i64) {
     clippy::too_many_arguments,
     reason = "on_rescan's list minus the gate it already applied; the slot, the clock, both carets, the geometry and the row source are each read once"
 )]
+#[inline]
 fn locate(
     slot: &Slot,
     now: Instant,
@@ -906,9 +940,8 @@ fn locate(
 ) -> Option<Located> {
     let (expected, delta) = scrolled(slot.caret.0, slot.base_y, base_y_now);
     let mut found = None;
-    if let Ok(row) = usize::try_from(expected)
-        && row < rows
-    {
+    if expected >= 0 && (expected as usize) < rows {
+        let row = expected as usize;
         load_row(row, row_buf);
         let cursor_col = if usize::from(cursor.0) == row {
             Some(cursor.1)
@@ -918,7 +951,10 @@ fn locate(
         found = find_word(slot, row_buf, cursor_col, false).map(|hit| (row, hit));
         let left_behind = cursor.0 != slot.caret.0 || cursor.1 < slot.caret.1;
         if found.is_none() && delta == 0 && left_behind {
-            for above in (row.saturating_sub(SEARCH_UP_ROWS)..row).rev() {
+            let min_above = row.saturating_sub(SEARCH_UP_ROWS);
+            let mut above = row;
+            while above > min_above {
+                above -= 1;
                 load_row(above, row_buf);
                 if let Some(hit) = find_word(slot, row_buf, None, true) {
                     found = Some((above, hit));
@@ -928,9 +964,12 @@ fn locate(
         }
     }
     let (row, (hit, mirrored)) = found?;
+    if row > u16::MAX as usize {
+        return None;
+    }
     let mut loc = Located {
         since: now.max(slot.at),
-        row: u16::try_from(row).ok()?,
+        row: row as u16,
         base_y: base_y_now,
         grid_cols,
         mirrored,
@@ -945,6 +984,7 @@ fn locate(
     Some(loc)
 }
 
+#[inline]
 fn follow(
     slot: &Slot,
     mut loc: Located,
@@ -957,23 +997,26 @@ fn follow(
     if loc.grid_cols != grid_cols {
         return None;
     }
-    let (row, _) = scrolled(loc.row, loc.base_y, base_y_now);
-    let Ok(row) = usize::try_from(row) else {
+    let (row_i64, _) = scrolled(loc.row, loc.base_y, base_y_now);
+    if row_i64 < 0 {
         return None;
-    };
-    if row >= rows {
+    }
+    let row = row_i64 as usize;
+    if row >= rows || row > u16::MAX as usize {
         return None;
     }
     load_row(row, row_buf);
     let n = usize::from(slot.len);
-    for i in 0..n {
+    let mut i = 0;
+    while i < n {
         let want = slot.chars[if loc.mirrored { n - 1 - i } else { i }];
         let col_idx = usize::from(loc.cols[i]);
         if col_idx >= row_buf.len() || row_buf[col_idx].wide || row_buf[col_idx].ch != want {
             return None;
         }
+        i += 1;
     }
-    loc.row = u16::try_from(row).ok()?;
+    loc.row = row as u16;
     loc.base_y = base_y_now;
     if capture(&mut loc, n, row_buf) {
         Some(loc)
@@ -1016,6 +1059,9 @@ const fn capture(loc: &mut Located, n: usize, cells: &[RenderCell]) -> bool {
     loc.strength = legible_strength(rgb3_to_u32(first.fg), bg, loc.sat, loc.val);
     loc.strength > 0.0
 }
+
+#[cfg(any(test, debug_assertions))]
+mod state_words;
 
 #[cfg(test)]
 mod tests {

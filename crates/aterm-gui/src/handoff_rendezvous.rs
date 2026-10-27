@@ -972,7 +972,7 @@ impl Rendezvous {
             if abort() {
                 return Err(RendezvousError::Cancelled);
             }
-            let now = Instant::now();
+            let now = io_now();
             if now >= deadline {
                 return Err(RendezvousError::Deadline);
             }
@@ -2851,14 +2851,46 @@ mod tests {
             .write_all(&claim_frame(&"f".repeat(CLAIM_HEX_LEN)))
             .and_then(|()| (&stream).flush())
             .expect("the dialer presents a wrong secret");
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let dialer = stream.as_raw_fd();
+        // The attempt's clock reaches its deadline once the gate has refused and hung up on
+        // the dialer, so the wait ends after the refusal however slowly this thread runs.
+        set_io_clock_for_test(Some(Box::new(move || {
+            if hung_up_on(dialer) {
+                deadline
+            } else {
+                Instant::now()
+            }
+        })));
         let refused = rendezvous.accept_claim(
             Some(own_pid()),
             &crate::handoff_rendezvous::DialerCode::this_process(),
-            Instant::now() + Duration::from_millis(400),
+            deadline,
             &|| false,
         );
-        assert_eq!(refused.err(), Some(RendezvousError::Claim));
+        set_io_clock_for_test(None);
+        assert_eq!(
+            refused.err(),
+            Some(RendezvousError::Claim),
+            "the wait that outlives a refusal ends naming it"
+        );
         drop(stream);
+    }
+
+    /// Whether the rendezvous closed its end of `dialer`'s connection: a peek reads end of file.
+    fn hung_up_on(dialer: std::os::fd::RawFd) -> bool {
+        let mut byte = 0u8;
+        // SAFETY: `dialer` is an open socket the caller owns, the peek writes at most the one
+        // byte `byte` holds, and `MSG_DONTWAIT` keeps it from blocking.
+        let peeked = unsafe {
+            libc::recv(
+                dialer,
+                (&raw mut byte).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        peeked == 0
     }
 
     #[test]

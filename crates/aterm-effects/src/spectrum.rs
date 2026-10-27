@@ -229,20 +229,24 @@ pub fn generate_spectrum_table() -> SpectrumTable {
 pub(crate) fn spectrum_table_at_cap(cap: f64) -> SpectrumTable {
     const LEGS: usize = SPECTRUM_STOPS - 1;
     let mut bounds = [0.0f64; LEGS + 1];
-    for (i, b) in bounds.iter_mut().enumerate() {
-        *b = (i * SPECTRUM_STRIDE) as f64;
+    let mut bi = 0;
+    while bi < bounds.len() {
+        bounds[bi] = (bi * SPECTRUM_STRIDE) as f64;
+        bi += 1;
     }
 
     let mut walk: Vec<Vec<(f64, [f64; 3])>> = Vec::with_capacity(LEGS);
     let mut totals = [0.0f64; 3];
-    for leg in 0..LEGS {
+    let mut leg = 0;
+    while leg < LEGS {
         let (a, b) = (bounds[leg], bounds[leg + 1]);
         let steps = ((b - a) * SPECTRUM_PACE_FINE as f64) as usize;
         let mut cum = Vec::with_capacity(steps + 1);
         let mut acc = [0.0f64; 3];
         let mut prev = spectrum_path(a);
         cum.push((a, acc));
-        for i in 1..=steps {
+        let mut i = 1;
+        while i <= steps {
             let x = a + (b - a) * i as f64 / steps as f64;
             let cur = spectrum_path(x);
             let (pl, cl) = (spectrum_oklab(prev), spectrum_oklab(cur));
@@ -258,11 +262,13 @@ pub(crate) fn spectrum_table_at_cap(cap: f64) -> SpectrumTable {
                 .max((prev[2] - cur[2]).abs());
             cum.push((x, acc));
             prev = cur;
+            i += 1;
         }
-        for (t, a) in totals.iter_mut().zip(acc) {
-            *t += a;
-        }
+        totals[0] += acc[0];
+        totals[1] += acc[1];
+        totals[2] += acc[2];
         walk.push(cum);
+        leg += 1;
     }
     let cost = |c: [f64; 3]| {
         (1.0 - SPECTRUM_PACE_BYTE_SHARE)
@@ -273,13 +279,21 @@ pub(crate) fn spectrum_table_at_cap(cap: f64) -> SpectrumTable {
 
     let mut budget = [0usize; LEGS];
     let mut want = [0.0f64; LEGS];
-    let legcost: Vec<f64> = (0..LEGS)
-        .map(|l| cost(walk[l].last().expect("a leg has samples").1))
-        .collect();
-    let free: f64 = legcost.iter().sum();
+    let mut legcost = [0.0f64; LEGS];
+    let mut free = 0.0f64;
+    let mut leg = 0;
+    while leg < LEGS {
+        let samples = &walk[leg];
+        let c = cost(samples[samples.len() - 1].1);
+        legcost[leg] = c;
+        free += c;
+        leg += 1;
+    }
     let purse = SPECTRUM_LUT_LEN - 1;
-    for leg in 0..LEGS {
+    let mut leg = 0;
+    while leg < LEGS {
         want[leg] = legcost[leg] / free * purse as f64;
+        leg += 1;
     }
 
     let ceiling = (cap * purse as f64).floor();
@@ -287,35 +301,51 @@ pub(crate) fn spectrum_table_at_cap(cap: f64) -> SpectrumTable {
     if capped {
         let surplus = want[SPECTRUM_CROSSING_SEG] - ceiling;
         want[SPECTRUM_CROSSING_SEG] = ceiling;
-        let rest: f64 = (0..LEGS)
-            .filter(|&l| l != SPECTRUM_CROSSING_SEG)
-            .map(|l| legcost[l])
-            .sum();
-        for (leg, w) in want.iter_mut().enumerate() {
+        let mut rest = 0.0f64;
+        let mut leg = 0;
+        while leg < LEGS {
             if leg != SPECTRUM_CROSSING_SEG {
-                *w += surplus * legcost[leg] / rest;
+                rest += legcost[leg];
             }
+            leg += 1;
+        }
+        let mut leg = 0;
+        while leg < LEGS {
+            if leg != SPECTRUM_CROSSING_SEG {
+                want[leg] += surplus * legcost[leg] / rest;
+            }
+            leg += 1;
         }
     }
 
-    for leg in 0..LEGS {
-        budget[leg] = want[leg].floor() as usize;
+    let mut budget_sum = 0usize;
+    let mut order = [0usize; LEGS];
+    let mut order_len = 0usize;
+    let mut leg = 0;
+    while leg < LEGS {
+        let b = want[leg].floor() as usize;
+        budget[leg] = b;
+        budget_sum += b;
+        if !(capped && leg == SPECTRUM_CROSSING_SEG) {
+            order[order_len] = leg;
+            order_len += 1;
+        }
+        leg += 1;
     }
-    let mut order: Vec<usize> = (0..LEGS)
-        .filter(|&l| !(capped && l == SPECTRUM_CROSSING_SEG))
-        .collect();
-    order.sort_by(|&a, &b| {
+    order[..order_len].sort_by(|&a, &b| {
         (want[b] - budget[b] as f64)
             .partial_cmp(&(want[a] - budget[a] as f64))
             .expect("the pace is finite")
     });
-    let mut short = SPECTRUM_LUT_LEN - 1 - budget.iter().sum::<usize>();
-    for &leg in &order {
+    let mut short = SPECTRUM_LUT_LEN - 1 - budget_sum;
+    let mut oi = 0;
+    while oi < order_len {
         if short == 0 {
             break;
         }
-        budget[leg] += 1;
+        budget[order[oi]] += 1;
         short -= 1;
+        oi += 1;
     }
     assert_eq!(short, 0, "the pace could not spend the table");
 
@@ -323,24 +353,32 @@ pub(crate) fn spectrum_table_at_cap(cap: f64) -> SpectrumTable {
     let mut path_at = [0.0f32; SPECTRUM_LUT_LEN];
     let mut anchor_at = [0usize; SPECTRUM_STOPS];
     let mut idx = 0usize;
-    for leg in 0..LEGS {
+    let mut leg = 0;
+    while leg < LEGS {
         let start = bounds[leg];
         if (start as usize).is_multiple_of(SPECTRUM_STRIDE) && (start as usize) < SPECTRUM_LUT_LEN {
             anchor_at[start as usize / SPECTRUM_STRIDE] = idx;
         }
-        let total = cost(walk[leg].last().expect("a leg has samples").1);
-        for j in 0..budget[leg] {
-            let x = spectrum_pace_at(&walk[leg], &cost, total * j as f64 / budget[leg] as f64);
+        let samples = &walk[leg];
+        let total = cost(samples[samples.len() - 1].1);
+        let mut j = 0;
+        while j < budget[leg] {
+            let x = spectrum_pace_at(samples, &cost, total * j as f64 / budget[leg] as f64);
             lut[idx + j] = spectrum_path_byte(x);
             path_at[idx + j] = x as f32;
+            j += 1;
         }
         idx += budget[leg];
+        leg += 1;
     }
     anchor_at[SPECTRUM_STOPS - 1] = SPECTRUM_LUT_LEN - 1;
     path_at[SPECTRUM_LUT_LEN - 1] = (SPECTRUM_LUT_LEN - 1) as f32;
-    for (i, &at) in anchor_at.iter().enumerate() {
-        lut[at] = SPECTRUM_ANCHORS[i];
-        path_at[at] = (i * SPECTRUM_STRIDE) as f32;
+    let mut ai = 0;
+    while ai < anchor_at.len() {
+        let at = anchor_at[ai];
+        lut[at] = SPECTRUM_ANCHORS[ai];
+        path_at[at] = (ai * SPECTRUM_STRIDE) as f32;
+        ai += 1;
     }
     SpectrumTable {
         lut,

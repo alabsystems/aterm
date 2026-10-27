@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Hand-written modules under `aterm-win32/src/` harvested alongside consumers.
-pub const HAND_WRITTEN: [&str; 4] = ["com.rs", "d3d11.rs", "dcomp.rs", "dxgi.rs"];
+pub const HAND_WRITTEN: [&str; 5] = ["com.rs", "d3d11.rs", "dcomp.rs", "dxgi.rs", "uia.rs"];
 const CRATE: &str = "aterm-win32";
 
 pub struct Model {

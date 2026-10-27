@@ -67,7 +67,44 @@ pub const VENDOR_PROFILES_DIR: &str = "vendor-browsers";
 
 /// A label as [`MailboxConfig::contested_labels`] keeps it.
 fn contest_key(label: &str) -> String {
-    label.trim().to_ascii_lowercase().replace('_', "-")
+    label.trim().to_ascii_lowercase().replace(['.', '_'], "-")
+}
+
+fn credential_key(key: &str) -> String {
+    if key.contains('@') {
+        key.trim().to_ascii_lowercase()
+    } else {
+        contest_key(key)
+    }
+}
+
+/// Underscore aliases are a legacy label convention, never an email-address rewrite.
+fn legacy_credential_keys(key: &str) -> Vec<String> {
+    let mut keys = vec![key.to_owned()];
+    if !key.contains('@') {
+        let dashed = key.replace('_', "-");
+        if dashed != key {
+            keys.push(dashed);
+        }
+    }
+    keys
+}
+
+/// Lower-priority sources cannot reintroduce another spelling of a winning label.
+fn merge_credentials(values: &mut BTreeMap<String, String>, other: BTreeMap<String, String>) {
+    let occupied: BTreeSet<_> = values.keys().map(|key| credential_key(key)).collect();
+    values.extend(
+        other
+            .into_iter()
+            .filter(|(key, _)| !occupied.contains(&credential_key(key))),
+    );
+}
+
+fn insert_credential(values: &mut BTreeMap<String, String>, key: String, value: String) {
+    let identity = credential_key(&key);
+    if !values.keys().any(|key| credential_key(key) == identity) {
+        values.insert(key, value);
+    }
 }
 
 /// Configuration for fetching incoming OAuth verification emails (magic links or 6-digit OTPs).
@@ -107,7 +144,7 @@ pub struct MailboxConfig {
     /// Where set, the earliest a mail may be dated (unix seconds): a vendor sign-in's start, so
     /// a code mailed before it is never taken ([`MailFilter`]).
     pub since: Option<i64>,
-    /// Labels (lowercased, `_` read as `-`) that rows of two pools, or a pool and a fleet, give
+    /// Labels (lowercased, `.` and `_` read as `-`) that rows of two pools, or a pool and a fleet, give
     /// to different emails: their `<label>` secrets are Claude Code's own rows' alone, and
     /// [`MailboxConfig::alias_label_to_email`] maps them onto no other pool's email.
     pub contested_labels: BTreeSet<String>,
@@ -161,40 +198,48 @@ impl MailboxConfig {
     /// label before falling back to `password` or `"*"`).
     #[must_use]
     pub fn password_for(&self, target_email: Option<&str>) -> Option<String> {
-        for key in candidate_lookup_keys(target_email) {
-            if let Some(p) = self.passwords.get(&key) {
-                return Some(p.clone());
-            }
-        }
-        self.password
-            .clone()
-            .or_else(|| self.passwords.get("*").cloned())
+        self.credential_for(&self.passwords, self.password.as_ref(), target_email)
     }
 
     /// Look up the second-stage mailbox password for `target_email`.
     #[must_use]
     pub fn mailbox_password_for(&self, target_email: Option<&str>) -> Option<String> {
-        for key in candidate_lookup_keys(target_email) {
-            if let Some(p) = self.mailbox_passwords.get(&key) {
-                return Some(p.clone());
-            }
-        }
-        self.mailbox_password
-            .clone()
-            .or_else(|| self.mailbox_passwords.get("*").cloned())
+        self.credential_for(
+            &self.mailbox_passwords,
+            self.mailbox_password.as_ref(),
+            target_email,
+        )
     }
 
     /// Look up the Base32 TOTP secret for `target_email`.
     #[must_use]
     pub fn totp_secret_for(&self, target_email: Option<&str>) -> Option<String> {
-        for key in candidate_lookup_keys(target_email) {
-            if let Some(s) = self.totp_secrets.get(&key) {
-                return Some(s.clone());
-            }
-        }
-        self.totp_secret
-            .clone()
-            .or_else(|| self.totp_secrets.get("*").cloned())
+        self.credential_for(&self.totp_secrets, self.totp_secret.as_ref(), target_email)
+    }
+
+    /// A contested label cannot reenter through email-derived lookup candidates. Explicit
+    /// email bindings and intentionally unscoped defaults retain their usual precedence.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountMailboxSelection",
+            action = "Lookup",
+            project = "aterm_agent::harness::headless_oauth::vendor_tests::mailbox_selection_transition"
+        )
+    )]
+    fn credential_for(
+        &self,
+        values: &BTreeMap<String, String>,
+        default: Option<&String>,
+        target_email: Option<&str>,
+    ) -> Option<String> {
+        candidate_lookup_keys(target_email)
+            .iter()
+            .filter(|key| key.contains('@') || !self.contested_labels.contains(&contest_key(key)))
+            .find_map(|key| values.get(key))
+            .or(default)
+            .or_else(|| values.get("*"))
+            .cloned()
     }
 
     /// Look up the mailbox login username for `target_email` (preferring an explicit `user`,
@@ -239,10 +284,11 @@ impl MailboxConfig {
             return;
         };
         let label_key = lbl.to_ascii_lowercase();
-        let underscored_key = label_key.replace('-', "_");
-        let dashed_key = label_key.replace('_', "-");
+        let underscored_key = label_key.replace(['.', '-'], "_");
+        let dashed_key = contest_key(&label_key);
+        let dotted_key = label_key.replace(['_', '-'], ".");
         let email_key = em.to_ascii_lowercase();
-        for key in [&label_key, &underscored_key, &dashed_key] {
+        for key in [&label_key, &underscored_key, &dashed_key, &dotted_key] {
             if let Some(pw) = self.passwords.get(key).cloned() {
                 self.passwords.entry(email_key.clone()).or_insert(pw);
             }
@@ -408,15 +454,9 @@ impl MailboxConfig {
         if self.totp_secret.is_none() {
             self.totp_secret = other.totp_secret;
         }
-        for (k, v) in other.passwords {
-            self.passwords.entry(k).or_insert(v);
-        }
-        for (k, v) in other.mailbox_passwords {
-            self.mailbox_passwords.entry(k).or_insert(v);
-        }
-        for (k, v) in other.totp_secrets {
-            self.totp_secrets.entry(k).or_insert(v);
-        }
+        merge_credentials(&mut self.passwords, other.passwords);
+        merge_credentials(&mut self.mailbox_passwords, other.mailbox_passwords);
+        merge_credentials(&mut self.totp_secrets, other.totp_secrets);
         if self.seen_file.is_none() {
             self.seen_file = other.seen_file;
         }
@@ -432,6 +472,13 @@ impl MailboxConfig {
     /// Parse a [`MailboxConfig`] from a TOML string or a single-line secret.
     #[must_use]
     pub fn from_toml_str(text: &str, home: Option<&Path>) -> Option<Self> {
+        let mut cfg = Self::parse_toml(text, home)?;
+        cfg.alias_totp_credentials();
+        Some(cfg)
+    }
+
+    /// Keep parsed keys explicit until source precedence and conflicts are known.
+    fn parse_toml(text: &str, home: Option<&Path>) -> Option<Self> {
         let Ok(doc) = aterm_toml::from_str::<aterm_toml::Table>(text) else {
             return parse_single_line_mailbox_secret(text);
         };
@@ -606,7 +653,7 @@ impl MailboxConfig {
                 .map(str::to_ascii_lowercase);
             if let Some(s) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
                 if let Some(key) = base_key {
-                    let keys = [key.clone(), key.replace('_', "-")];
+                    let keys = legacy_credential_keys(&key);
                     if parse_otpauth_uri(s).is_some() {
                         for k in keys {
                             cfg.totp_secrets.entry(k).or_insert_with(|| s.to_owned());
@@ -620,11 +667,7 @@ impl MailboxConfig {
             } else if let Some(sub) = v.as_table() {
                 let mut keys = Vec::new();
                 if let Some(k) = base_key {
-                    let dashed = k.replace('_', "-");
-                    keys.push(k);
-                    if !keys.contains(&dashed) {
-                        keys.push(dashed);
-                    }
+                    keys.extend(legacy_credential_keys(&k));
                 }
                 for field in ["email", "user", "username", "label", "name", "id"] {
                     if let Some(val) = get_str_in(sub, &[field]) {
@@ -740,7 +783,7 @@ impl MailboxConfig {
                     .filter(|a| !a.is_empty())
                 {
                     if let Some(secret) = read_secret_file(s) {
-                        for key in [acct.to_owned(), acct.replace('_', "-")] {
+                        for key in legacy_credential_keys(acct) {
                             cfg.mailbox_passwords
                                 .entry(key)
                                 .or_insert_with(|| secret.clone());
@@ -758,7 +801,7 @@ impl MailboxConfig {
                     .filter(|a| !a.is_empty())
                 {
                     if let Some(secret) = read_secret_file(s) {
-                        for key in [acct.to_owned(), acct.replace('_', "-")] {
+                        for key in legacy_credential_keys(acct) {
                             cfg.passwords.entry(key).or_insert_with(|| secret.clone());
                         }
                     }
@@ -776,7 +819,7 @@ impl MailboxConfig {
                     .filter(|a| !a.is_empty())
                 {
                     if let Some(secret) = read_secret_file(s) {
-                        for key in [acct.to_owned(), acct.replace('_', "-")] {
+                        for key in legacy_credential_keys(acct) {
                             cfg.totp_secrets
                                 .entry(key)
                                 .or_insert_with(|| secret.clone());
@@ -791,7 +834,7 @@ impl MailboxConfig {
                     .or_else(|| lower_k.strip_suffix("-second-password"))
                     .filter(|a| !a.is_empty())
                 {
-                    for key in [acct.to_owned(), acct.replace('_', "-")] {
+                    for key in legacy_credential_keys(acct) {
                         cfg.mailbox_passwords
                             .entry(key)
                             .or_insert_with(|| s.to_owned());
@@ -807,7 +850,7 @@ impl MailboxConfig {
                     .or_else(|| lower_k.strip_suffix("-pass"))
                     .filter(|a| !a.is_empty())
                 {
-                    for key in [acct.to_owned(), acct.replace('_', "-")] {
+                    for key in legacy_credential_keys(acct) {
                         cfg.passwords.entry(key).or_insert_with(|| s.to_owned());
                     }
                     continue;
@@ -823,7 +866,7 @@ impl MailboxConfig {
                     .or_else(|| lower_k.strip_suffix("-2fa"))
                     .filter(|a| !a.is_empty())
                 {
-                    for key in [acct.to_owned(), acct.replace('_', "-")] {
+                    for key in legacy_credential_keys(acct) {
                         cfg.totp_secrets.entry(key).or_insert_with(|| s.to_owned());
                     }
                     continue;
@@ -861,7 +904,12 @@ impl MailboxConfig {
                 parse_account_entry(&mut cfg, Some(k), v);
             }
         }
-        let derived_totp_emails: Vec<(String, String, String)> = cfg
+        (cfg != Self::default()).then_some(cfg)
+    }
+
+    /// Derive aliases only from the winning values, after all sources are merged.
+    fn alias_totp_credentials(&mut self) {
+        let derived_totp_emails: Vec<(String, String, String)> = self
             .totp_secrets
             .iter()
             .filter_map(|(k, v)| {
@@ -870,22 +918,67 @@ impl MailboxConfig {
             })
             .collect();
         for (k, email, totp_val) in derived_totp_emails {
-            cfg.totp_secrets.entry(email.clone()).or_insert(totp_val);
-            cfg.alias_label_to_email(Some(&k), Some(&email));
+            self.totp_secrets.entry(email.clone()).or_insert(totp_val);
+            self.alias_label_to_email(Some(&k), Some(&email));
         }
-        if let Some(totp) = cfg.totp_secret.clone()
+        if let Some(totp) = self.totp_secret.clone()
             && let Some(params) = parse_otpauth_uri(&totp)
             && let Some(email) = params.account_email
         {
-            cfg.totp_secrets.entry(email.clone()).or_insert(totp);
-            if cfg.user.is_none() {
-                cfg.user = Some(email);
+            self.totp_secrets.entry(email.clone()).or_insert(totp);
+            if self.user.is_none() {
+                self.user = Some(email);
             }
         }
-
-        (cfg != Self::default()).then_some(cfg)
     }
 }
+
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+/// Supply one bounded credential configuration before the modeled lookup.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountMailboxSelection",
+        action = "AnotherCase",
+        reason = "The native conformance test supplies each bounded local credential configuration before Lookup."
+    )
+)]
+pub fn mailbox_selection_environment() {}
+
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+/// Supply bounded source precedence and explicit-email fixtures before alias resolution.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountMailboxPrecedence",
+        action = "AnotherSource",
+        reason = "The native projection selects store configuration or an explicit override."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountMailboxPrecedence",
+        action = "AnotherCase",
+        reason = "The native projection supplies explicit-email credentials in either source or only label credentials."
+    )
+)]
+pub fn mailbox_precedence_environment() {}
+
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+/// Supply one bounded explicit-email source before mailbox scope resolution.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountMailboxScope",
+        action = "AnotherSource",
+        reason = "The native projection supplies each local explicit-email configuration format."
+    )
+)]
+pub fn mailbox_scope_environment() {}
 
 /// Whether a `~/.secrets` name is a fleet roster, the accounts sheet or a CLI's roster
 /// (`ai-accounts.csv`, `ai-accounts-<cli>.toml`): fleet data, never a mailbox fragment, whatever
@@ -1012,6 +1105,7 @@ fn candidate_lookup_keys(target_email: Option<&str>) -> Vec<String> {
             if let Some(lbl) = &derived_full {
                 push_unique(lbl.clone());
                 push_unique(lbl.replace('-', "_"));
+                push_unique(lbl.replace('-', "."));
             }
         }
         if let Some(base_em) = &base_email {
@@ -1026,6 +1120,7 @@ fn candidate_lookup_keys(target_email: Option<&str>) -> Vec<String> {
         if let Some(lbl) = derived_full {
             push_unique(lbl.clone());
             push_unique(lbl.replace('-', "_"));
+            push_unique(lbl.replace('-', "."));
         }
     } else {
         push_unique(lower.replace(['.', '_'], "-"));
@@ -1055,12 +1150,8 @@ fn parse_single_line_mailbox_secret(text: &str) -> Option<MailboxConfig> {
         if trimmed.starts_with('[') {
             return None;
         }
-        if let Some(params) = parse_otpauth_uri(trimmed) {
+        if parse_otpauth_uri(trimmed).is_some() {
             cfg.totp_secret.get_or_insert_with(|| trimmed.to_owned());
-            if let Some(email) = params.account_email {
-                cfg.totp_secrets.insert(email.clone(), trimmed.to_owned());
-                cfg.user.get_or_insert(email);
-            }
             continue;
         }
         if trimmed.starts_with("imap://") || trimmed.starts_with("imaps://") {
@@ -1085,9 +1176,6 @@ fn parse_single_line_mailbox_secret(text: &str) -> Option<MailboxConfig> {
         }
         return None;
     }
-    if let (Some(u), Some(pw)) = (cfg.user.clone(), cfg.password.clone()) {
-        cfg.passwords.entry(u).or_insert(pw);
-    }
     (cfg != MailboxConfig::default()).then_some(cfg)
 }
 
@@ -1097,61 +1185,99 @@ fn read_single_line_secret_file(path: &Path) -> Option<String> {
     (!trimmed.is_empty() && !trimmed.contains(['\r', '\n'])).then(|| trimmed.to_owned())
 }
 
-/// The labels that rows of different pools (Claude Code's roster, each other CLI's, and each
-/// one's fleet file under `home`'s `~/.secrets`) give to different emails
-/// ([`MailboxConfig::contested_labels`]).
-fn contested_labels(
+/// One configured association, captured once for both conflict detection and aliasing.
+struct MailboxAlias {
+    own: bool,
+    label: String,
+    email: String,
+}
+
+fn mailbox_aliases(
     home: Option<&Path>,
     claude_rosters: &[PathBuf],
     cli_rosters: &[(super::accounts::Cli, PathBuf)],
-) -> BTreeSet<String> {
-    let mut emails: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut note = |label: &str, email: Option<&str>| {
+    claude_fleets: &[PathBuf],
+) -> Vec<MailboxAlias> {
+    let mut aliases = Vec::new();
+    let mut note = |own: bool, label: &str, email: Option<&str>| {
         if let Some(email) = email.map(str::trim).filter(|e| !e.is_empty()) {
-            emails
-                .entry(contest_key(label))
-                .or_default()
-                .insert(email.to_ascii_lowercase());
+            aliases.push(MailboxAlias {
+                own,
+                label: label.to_owned(),
+                email: email.to_owned(),
+            });
         }
     };
     for path in claude_rosters.iter().filter(|p| p.is_file()) {
         if let Ok(roster) = super::accounts::Roster::load(path) {
             for row in &roster.rows {
-                note(&row.label, row.email.as_deref());
+                note(true, &row.label, row.email.as_deref());
             }
         }
     }
     for (cli, path) in cli_rosters.iter().filter(|(_, p)| p.is_file()) {
         if let Ok(roster) = super::accounts::Roster::load_for(*cli, path) {
             for row in &roster.rows {
-                note(&row.label, row.email.as_deref());
+                note(false, &row.label, row.email.as_deref());
+            }
+        }
+    }
+    for path in claude_fleets {
+        if let Ok(Some(text)) = super::accounts::read_bounded(path, 256 * 1024)
+            && let Ok(fleet) = super::accounts_sync::FleetRoster::from_toml(&text, "fleet")
+        {
+            for acct in &fleet.accounts {
+                note(true, &acct.label, Some(&acct.email));
             }
         }
     }
     if let Some(h) = home {
-        let fleet = h
-            .join(".secrets")
-            .join(super::accounts_sync::FLEET_ROSTER_FILE);
-        if let Ok(Some(text)) = super::accounts::read_bounded(&fleet, 256 * 1024)
-            && let Ok(fleet) = super::accounts_sync::FleetRoster::from_toml(&text, "fleet")
+        let csv = super::accounts::read_bounded(&h.join(".secrets/ai-accounts.csv"), 512 * 1024)
+            .ok()
+            .flatten();
+        if let Some(text) = csv.as_deref()
+            && let Ok(fleet) = super::accounts_sync::parse_accounting_csv(text, "csv")
         {
             for acct in &fleet.accounts {
-                note(&acct.label, Some(&acct.email));
+                note(true, &acct.label, Some(&acct.email));
             }
         }
         for cli in super::accounts_sync::OTHER_CLIS {
             let path = h
                 .join(".secrets")
                 .join(super::accounts_sync::cli_fleet_file(cli));
-            if let Ok(Some(text)) = super::accounts::read_bounded(&path, 256 * 1024)
-                && let Ok(fleet) =
-                    super::accounts_sync::FleetRoster::from_toml_for(cli, &text, "fleet")
-            {
+            let fleet = if path.is_file() {
+                super::accounts::read_bounded(&path, 256 * 1024)
+                    .ok()
+                    .flatten()
+                    .and_then(|text| {
+                        super::accounts_sync::FleetRoster::from_toml_for(cli, &text, "fleet").ok()
+                    })
+            } else {
+                csv.as_deref()
+                    .filter(|text| super::accounts_sync::csv_names_column(cli, text))
+                    .and_then(|text| {
+                        super::accounts_sync::parse_accounting_csv_for(cli, text, "csv").ok()
+                    })
+                    .map(|fleet| fleet.roster)
+            };
+            if let Some(fleet) = fleet {
                 for acct in &fleet.accounts {
-                    note(&acct.label, Some(&acct.email));
+                    note(false, &acct.label, Some(&acct.email));
                 }
             }
         }
+    }
+    aliases
+}
+
+fn contested_labels(aliases: &[MailboxAlias]) -> BTreeSet<String> {
+    let mut emails: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for alias in aliases {
+        emails
+            .entry(contest_key(&alias.label))
+            .or_default()
+            .insert(alias.email.to_ascii_lowercase());
     }
     emails
         .into_iter()
@@ -1165,6 +1291,18 @@ fn discover_mailbox_config_files_raw(
     store_dir: Option<&Path>,
     config_path: Option<&Path>,
 ) -> MailboxConfig {
+    let (mut cfg, aliases) = discover_mailbox_config_sources(home, store_dir, config_path);
+    apply_mailbox_aliases(&mut cfg, &aliases);
+    cfg
+}
+
+/// Capture source configuration and associations together; callers apply roster aliases
+/// after merging any overrides so conflict checks and aliasing share the same observations.
+fn discover_mailbox_config_sources(
+    home: Option<&Path>,
+    store_dir: Option<&Path>,
+    config_path: Option<&Path>,
+) -> (MailboxConfig, Vec<MailboxAlias>) {
     let mut cfg = MailboxConfig::default();
     let mut toml_candidates = Vec::new();
     if let Some(store) = store_dir {
@@ -1215,10 +1353,17 @@ fn discover_mailbox_config_files_raw(
         }
         toml_candidates.push(cfg_file.to_path_buf());
     }
+    let aliases = mailbox_aliases(
+        home,
+        &roster_candidates,
+        &cli_roster_candidates,
+        &fleet_roster_candidates,
+    );
+    cfg.contested_labels = contested_labels(&aliases);
     for path in toml_candidates {
         if path.is_file()
             && let Ok(text) = std::fs::read_to_string(&path)
-            && let Some(parsed) = MailboxConfig::from_toml_str(&text, home)
+            && let Some(parsed) = MailboxConfig::parse_toml(&text, home)
         {
             cfg.merge_from(parsed);
         }
@@ -1271,13 +1416,6 @@ fn discover_mailbox_config_files_raw(
                 if cfg.totp_secret.is_none()
                     && let Some(secret) = read_single_line_secret_file(&secrets_dir.join(name))
                 {
-                    if let Some(params) = parse_otpauth_uri(&secret)
-                        && let Some(email) = params.account_email
-                    {
-                        cfg.totp_secrets
-                            .entry(email)
-                            .or_insert_with(|| secret.clone());
-                    }
                     cfg.totp_secret = Some(secret);
                 }
             }
@@ -1319,8 +1457,6 @@ fn discover_mailbox_config_files_raw(
                     ) {
                         continue;
                     }
-                    let acct_keys =
-                        |acct: &str| -> [String; 2] { [acct.to_owned(), acct.replace('_', "-")] };
                     if let Some(acct) = lower
                         .strip_suffix("_mailbox_password")
                         .or_else(|| lower.strip_suffix("-mailbox-password"))
@@ -1329,10 +1465,8 @@ fn discover_mailbox_config_files_raw(
                         .filter(|a| !a.is_empty())
                     {
                         if let Some(secret) = read_single_line_secret_file(&entry.path()) {
-                            for key in acct_keys(acct) {
-                                cfg.mailbox_passwords
-                                    .entry(key)
-                                    .or_insert_with(|| secret.clone());
+                            for key in legacy_credential_keys(acct) {
+                                insert_credential(&mut cfg.mailbox_passwords, key, secret.clone());
                             }
                         }
                     } else if let Some(acct) = lower
@@ -1344,8 +1478,8 @@ fn discover_mailbox_config_files_raw(
                         .filter(|a| !a.is_empty())
                     {
                         if let Some(secret) = read_single_line_secret_file(&entry.path()) {
-                            for key in acct_keys(acct) {
-                                cfg.passwords.entry(key).or_insert_with(|| secret.clone());
+                            for key in legacy_credential_keys(acct) {
+                                insert_credential(&mut cfg.passwords, key, secret.clone());
                             }
                         }
                     } else if let Some(acct) = lower
@@ -1361,17 +1495,8 @@ fn discover_mailbox_config_files_raw(
                         .filter(|a| !a.is_empty())
                         && let Some(secret) = read_single_line_secret_file(&entry.path())
                     {
-                        if let Some(params) = parse_otpauth_uri(&secret)
-                            && let Some(email) = params.account_email
-                        {
-                            cfg.totp_secrets
-                                .entry(email)
-                                .or_insert_with(|| secret.clone());
-                        }
-                        for key in acct_keys(acct) {
-                            cfg.totp_secrets
-                                .entry(key)
-                                .or_insert_with(|| secret.clone());
+                        for key in legacy_credential_keys(acct) {
+                            insert_credential(&mut cfg.totp_secrets, key, secret.clone());
                         }
                     } else if !lower.starts_with('.')
                         && !is_fleet_roster_name(&lower)
@@ -1387,17 +1512,23 @@ fn discover_mailbox_config_files_raw(
                             .or_else(|| lower.strip_suffix(".env"))
                             .or_else(|| lower.strip_suffix(".conf"))
                             .unwrap_or(&lower);
-                        let derived = derive_account_label_from_email(&format!("{stem}@proton.me"));
+                        // An email-named file is scoped to that address. Only a label-like
+                        // filename may supply a derived machine label.
+                        let derived = if stem.contains('@') {
+                            None
+                        } else {
+                            derive_account_label_from_email(&format!("{stem}@proton.me"))
+                        };
                         if (is_machine_account_label(stem)
                             || stem.contains('@')
                             || derived.is_some())
                             && let Ok(Some(raw_text)) =
                                 super::accounts::read_bounded(&entry.path(), 4096)
-                            && let Some(parsed) = MailboxConfig::from_toml_str(&raw_text, home)
+                            && let Some(parsed) = MailboxConfig::parse_toml(&raw_text, home)
                         {
-                            let mut target_keys = acct_keys(stem).to_vec();
+                            let mut target_keys = legacy_credential_keys(stem);
                             if let Some(d) = derived.as_deref() {
-                                for k in acct_keys(d) {
+                                for k in legacy_credential_keys(d) {
                                     if !target_keys.contains(&k) {
                                         target_keys.push(k);
                                     }
@@ -1405,30 +1536,26 @@ fn discover_mailbox_config_files_raw(
                             }
                             for key in &target_keys {
                                 if let Some(pw) = parsed.password.as_ref() {
-                                    cfg.passwords
-                                        .entry(key.clone())
-                                        .or_insert_with(|| pw.clone());
+                                    insert_credential(&mut cfg.passwords, key.clone(), pw.clone());
                                 }
                                 if let Some(mpw) = parsed.mailbox_password.as_ref() {
-                                    cfg.mailbox_passwords
-                                        .entry(key.clone())
-                                        .or_insert_with(|| mpw.clone());
+                                    insert_credential(
+                                        &mut cfg.mailbox_passwords,
+                                        key.clone(),
+                                        mpw.clone(),
+                                    );
                                 }
                                 if let Some(totp) = parsed.totp_secret.as_ref() {
-                                    cfg.totp_secrets
-                                        .entry(key.clone())
-                                        .or_insert_with(|| totp.clone());
+                                    insert_credential(
+                                        &mut cfg.totp_secrets,
+                                        key.clone(),
+                                        totp.clone(),
+                                    );
                                 }
                             }
-                            for (k, pw) in parsed.passwords {
-                                cfg.passwords.entry(k).or_insert(pw);
-                            }
-                            for (k, mpw) in parsed.mailbox_passwords {
-                                cfg.mailbox_passwords.entry(k).or_insert(mpw);
-                            }
-                            for (em, totp) in parsed.totp_secrets {
-                                cfg.totp_secrets.entry(em).or_insert(totp);
-                            }
+                            merge_credentials(&mut cfg.passwords, parsed.passwords);
+                            merge_credentials(&mut cfg.mailbox_passwords, parsed.mailbox_passwords);
+                            merge_credentials(&mut cfg.totp_secrets, parsed.totp_secrets);
                             if cfg.webmail_url.is_none() {
                                 cfg.webmail_url = parsed.webmail_url;
                             }
@@ -1447,90 +1574,6 @@ fn discover_mailbox_config_files_raw(
                         }
                     }
                 }
-            }
-        }
-    }
-    let totp_email_aliases: Vec<(String, String)> = cfg
-        .totp_secrets
-        .iter()
-        .filter_map(|(k, v)| {
-            let email = parse_otpauth_uri(v)?.account_email?;
-            Some((k.clone(), email))
-        })
-        .collect();
-    for (k, email) in totp_email_aliases {
-        cfg.alias_label_to_email(Some(&k), Some(&email));
-    }
-    cfg.contested_labels = contested_labels(home, &roster_candidates, &cli_roster_candidates);
-    for roster_path in roster_candidates {
-        if roster_path.is_file()
-            && let Ok(roster) = super::accounts::Roster::load(&roster_path)
-        {
-            for row in &roster.rows {
-                cfg.alias_own_label_to_email(Some(&row.label), row.email.as_deref());
-            }
-        }
-    }
-    for (cli, roster_path) in cli_roster_candidates {
-        if roster_path.is_file()
-            && let Ok(roster) = super::accounts::Roster::load_for(cli, &roster_path)
-        {
-            for row in &roster.rows {
-                cfg.alias_label_to_email(Some(&row.label), row.email.as_deref());
-            }
-        }
-    }
-    for fleet_path in fleet_roster_candidates {
-        if fleet_path.is_file()
-            && let Ok(Some(text)) = super::accounts::read_bounded(&fleet_path, 256 * 1024)
-            && let Ok(fleet) = super::accounts_sync::FleetRoster::from_toml(&text, "fleet")
-        {
-            for acct in &fleet.accounts {
-                cfg.alias_own_label_to_email(Some(&acct.label), Some(&acct.email));
-            }
-        }
-    }
-    if let Some(h) = home {
-        let csv_path = h.join(".secrets/ai-accounts.csv");
-        let csv_text = csv_path
-            .is_file()
-            .then(|| {
-                super::accounts::read_bounded(&csv_path, 512 * 1024)
-                    .ok()
-                    .flatten()
-            })
-            .flatten();
-        if let Some(csv_text) = csv_text.as_deref()
-            && let Ok(fleet) = super::accounts_sync::parse_accounting_csv(csv_text, "csv")
-        {
-            for acct in &fleet.accounts {
-                cfg.alias_own_label_to_email(Some(&acct.label), Some(&acct.email));
-            }
-        }
-        // Every other pool's fleet rows name their labels' emails too: its own file in
-        // `~/.secrets`, else its column of the sheet (`accounts_sync::load_cli_fleet`).
-        for cli in super::accounts_sync::OTHER_CLIS {
-            let fleet_path = h
-                .join(".secrets")
-                .join(super::accounts_sync::cli_fleet_file(cli));
-            let fleet = if fleet_path.is_file() {
-                super::accounts::read_bounded(&fleet_path, 256 * 1024)
-                    .ok()
-                    .flatten()
-                    .and_then(|text| {
-                        super::accounts_sync::FleetRoster::from_toml_for(cli, &text, "fleet").ok()
-                    })
-            } else {
-                csv_text
-                    .as_deref()
-                    .filter(|text| super::accounts_sync::csv_names_column(cli, text))
-                    .and_then(|text| {
-                        super::accounts_sync::parse_accounting_csv_for(cli, text, "csv").ok()
-                    })
-                    .map(|fleet| fleet.roster)
-            };
-            for acct in fleet.iter().flat_map(|fleet| &fleet.accounts) {
-                cfg.alias_label_to_email(Some(&acct.label), Some(&acct.email));
             }
         }
     }
@@ -1555,7 +1598,34 @@ fn discover_mailbox_config_files_raw(
             .map(|s| s.join("mailbox.seen"))
             .or_else(|| cfg.dir.as_deref().map(default_seen_file_for_path));
     }
-    cfg
+    (cfg, aliases)
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountMailboxPrecedence",
+        action = "Resolve",
+        project = "aterm_agent::harness::headless_oauth::mailbox_tests::precedence_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountMailboxScope",
+        action = "Resolve",
+        project = "aterm_agent::harness::headless_oauth::mailbox_tests::scope_transition"
+    )
+)]
+fn apply_mailbox_aliases(cfg: &mut MailboxConfig, aliases: &[MailboxAlias]) {
+    cfg.alias_totp_credentials();
+    for alias in aliases {
+        if alias.own {
+            cfg.alias_own_label_to_email(Some(&alias.label), Some(&alias.email));
+        } else {
+            cfg.alias_label_to_email(Some(&alias.label), Some(&alias.email));
+        }
+    }
 }
 
 fn default_seen_file_for_path(path: &Path) -> PathBuf {
@@ -1582,8 +1652,15 @@ pub fn discover_mailbox_config_files(
 
 /// Interpret an explicit mailbox override without changing local path bytes.
 #[must_use]
-pub(super) fn mailbox_config_from_override(value: &OsStr, home: Option<&Path>) -> MailboxConfig {
-    let mut cfg = MailboxConfig::default();
+pub(super) fn mailbox_config_from_override(
+    value: &OsStr,
+    home: Option<&Path>,
+    contested: &BTreeSet<String>,
+) -> MailboxConfig {
+    let mut cfg = MailboxConfig {
+        contested_labels: contested.clone(),
+        ..MailboxConfig::default()
+    };
     if value.is_empty() {
         return cfg;
     }
@@ -1607,7 +1684,7 @@ pub(super) fn mailbox_config_from_override(value: &OsStr, home: Option<&Path>) -
         .and_then(OsStr::to_str)
         .is_some_and(|ext| ext.trim_end() == "toml")
         && let Ok(text) = std::fs::read_to_string(&path)
-        && let Some(parsed) = MailboxConfig::from_toml_str(&text, home)
+        && let Some(parsed) = MailboxConfig::parse_toml(&text, home)
     {
         cfg.merge_from(parsed);
     } else {
@@ -1623,17 +1700,33 @@ pub fn discover_mailbox_config(
     home: Option<&Path>,
     store_dir: Option<&Path>,
 ) -> Option<MailboxConfig> {
+    discover_mailbox_config_with_env(home, store_dir, |name| std::env::var_os(name))
+}
+
+fn discover_mailbox_config_with_env(
+    home: Option<&Path>,
+    store_dir: Option<&Path>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<MailboxConfig> {
+    let xdg_config = env("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(|v| PathBuf::from(v).join("aterm/aterm.toml"));
+    let (files, aliases) = discover_mailbox_config_sources(home, store_dir, xdg_config.as_deref());
     let mut cfg = MailboxConfig::default();
 
     let non_empty_env = |name: &str| -> Option<String> {
-        std::env::var(name)
-            .ok()
+        env(name)
+            .and_then(|value| value.into_string().ok())
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty())
     };
 
-    if let Some(value) = std::env::var_os(MAILBOX_ENV) {
-        cfg.merge_from(mailbox_config_from_override(&value, home));
+    if let Some(value) = env(MAILBOX_ENV) {
+        cfg.merge_from(mailbox_config_from_override(
+            &value,
+            home,
+            &files.contested_labels,
+        ));
     }
     if let Some(url) = non_empty_env(MAILBOX_URL_ENV) {
         if url.starts_with("imap://") || url.starts_with("imaps://") {
@@ -1662,12 +1755,11 @@ pub fn discover_mailbox_config(
         cfg.password = Some(p);
     }
     if let Some(totp) = non_empty_env(TOTP_SECRET_ENV) {
+        // An environment-provided login name has priority over file-provided defaults.
+        // Only the secret's email-key alias waits until after source merging.
         if let Some(params) = parse_otpauth_uri(&totp)
             && let Some(email) = params.account_email
         {
-            cfg.totp_secrets
-                .entry(email.clone())
-                .or_insert_with(|| totp.clone());
             cfg.user.get_or_insert(email);
         }
         cfg.totp_secret = Some(totp);
@@ -1676,14 +1768,8 @@ pub fn discover_mailbox_config(
         cfg.bearer_token = Some(tok);
     }
 
-    let xdg_config = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(|v| PathBuf::from(v).join("aterm/aterm.toml"));
-    cfg.merge_from(discover_mailbox_config_files_raw(
-        home,
-        store_dir,
-        xdg_config.as_deref(),
-    ));
+    cfg.merge_from(files);
+    apply_mailbox_aliases(&mut cfg, &aliases);
 
     if cfg.seen_file.is_none() {
         cfg.seen_file = store_dir
@@ -7252,6 +7338,10 @@ impl super::login_drive::Approver for VendorApprover {
 #[cfg(test)]
 #[path = "headless_vendor_tests.rs"]
 pub(super) mod vendor_tests;
+
+#[cfg(test)]
+#[path = "headless_mailbox_tests.rs"]
+mod mailbox_tests;
 
 #[cfg(test)]
 mod uri_authority_tests {

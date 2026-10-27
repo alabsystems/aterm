@@ -4,6 +4,8 @@
 // src/tables/name.rs, and modified by the aterm project in 2026. See
 // ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
+pub(crate) mod aat;
+pub(crate) mod ankr;
 pub mod cbdt;
 pub mod cblc;
 mod cff;
@@ -12,11 +14,13 @@ pub mod colr;
 pub mod cpal;
 pub mod gdef;
 pub mod glyf;
+pub mod gpos;
 pub mod gsub;
 pub mod head;
 pub mod hhea;
 pub mod hmtx;
 pub mod kern;
+pub(crate) mod kerx;
 pub mod loca;
 pub mod maxp;
 pub mod name;

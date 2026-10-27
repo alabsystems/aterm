@@ -39,7 +39,7 @@ mod vendor_files;
 pub use anchors::{ANCHORS, anchor, anchor_text};
 pub use autocompact::{Offer, OfferFocus};
 pub use harness_version::{
-    CliHarness, HarnessVersion, cli_harness_of, harness_version_of, harness_version_str_of,
+    CliHarness, HarnessVersion, SHARED_LANE, cli_version_core, cli_version_later,
 };
 pub use login::{
     LoginAtWall, LoginMethod, LoginScreen, Picker as LoginPicker, login_at_wall, login_interrupted,

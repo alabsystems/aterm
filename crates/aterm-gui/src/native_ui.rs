@@ -2173,11 +2173,13 @@ pub(crate) fn editor_shell_metrics(
 /// and the toolbar's buttons may give way whole under a ticket's header row. A completion list
 /// the person asked for stays, and where it would leave the file fewer than
 /// [`EDITOR_DOCUMENT_FLOOR_ROWS`] (80x24 at 2x showed the one row being completed) it takes only
-/// the room the file can spare: its rows close up to the help line's height and its padding to
-/// the dense toolbar's, then the toolbar's last row gives way to it while it is open, and last a
-/// ticket's header row (every button and both of the header's parts are keys and commands by
-/// name, and all of them are back when the list closes). Where even that leaves the file short,
-/// the most rows it can have.
+/// the room the file can spare: it packs tighter ([`ListPacking`]: its padding to the dense
+/// toolbar's, then its rows to the help line's height), then the toolbar's last row gives way to
+/// it while it is open, and last a ticket's header row (every button and both of the header's
+/// parts are keys and commands by name, and all of them are back when the list closes). Under
+/// each chrome the list packs only as tight as the file needs, so where the toolbar has given way
+/// its rows stand at their own height again wherever that leaves the file its floor. It takes the
+/// first of those steps that leaves the file the most rows it can have, up to its floor.
 pub(crate) fn editor_shell_metrics_at_scale(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
@@ -2187,7 +2189,14 @@ pub(crate) fn editor_shell_metrics_at_scale(
     let palette = palette.into();
     let text_scale = editor_text_scale(text_scale);
     let layout = |palette: EditorPalette, cap: usize| {
-        editor_shell_layout(viewport, palette, toolbar, text_scale, cap, false)
+        editor_shell_layout(
+            viewport,
+            palette,
+            toolbar,
+            text_scale,
+            cap,
+            ListPacking::Own,
+        )
     };
     let rows = |metrics: &EditorShellMetrics| {
         whole_editor_rows(&text_viewport_geometry_at_scale(
@@ -2224,41 +2233,71 @@ pub(crate) fn editor_shell_metrics_at_scale(
             layout(EditorPalette::None, EDITOR_TOOLBAR_MAX_ROWS),
         ),
         EditorPalette::Rows { .. } => {
-            let dense = |toolbar: EditorToolbar, cap: usize| {
-                editor_shell_layout(viewport, palette, toolbar, text_scale, cap, true)
-            };
-            let closed_up = dense(toolbar, kept.command_row_cap);
-            if rows(&closed_up) >= EDITOR_DOCUMENT_FLOOR_ROWS {
-                return closed_up;
+            // What the list may take, cheapest first: under the chrome that stands it packs
+            // tighter; then the toolbar's buttons give way and it packs from its own height
+            // again; then an `edit` ticket's header row (it left the file one row under M-x at
+            // 80x24 and 2x), the same way. At 80x24 and 1.25x the toolbar's giving way leaves
+            // the file its floor beside rows at their own height; at 2x closed-up rows leave it
+            // the most it can have there, three.
+            let mut chromes = vec![(toolbar, kept.command_row_cap)];
+            if kept.command_row_cap > 0 {
+                chromes.push((toolbar, 0));
             }
-            // The toolbar's buttons, then an `edit` ticket's header row, which left the file one
-            // row under M-x at 80x24 and 2x.
-            let without_buttons = dense(toolbar, 0);
-            if !toolbar.edit_header || rows(&without_buttons) >= EDITOR_DOCUMENT_FLOOR_ROWS {
-                return without_buttons;
-            }
-            dense(
-                EditorToolbar {
+            if toolbar.edit_header {
+                let headless = EditorToolbar {
                     edit_header: false,
                     ..toolbar
-                },
-                0,
-            )
+                };
+                chromes.push((headless, 0));
+            }
+            // The first step, the list at its own height under the chrome that stands, is `kept`.
+            let steps = chromes
+                .into_iter()
+                .flat_map(|chrome| ListPacking::LEAST_FIRST.map(move |packing| (chrome, packing)))
+                .skip(1);
+            let mut best = (rows(&kept), kept);
+            for ((toolbar, cap), packing) in steps {
+                if best.0 >= EDITOR_DOCUMENT_FLOOR_ROWS {
+                    break;
+                }
+                let metrics =
+                    editor_shell_layout(viewport, palette, toolbar, text_scale, cap, packing);
+                let file_rows = rows(&metrics);
+                if file_rows > best.0 {
+                    best = (file_rows, metrics);
+                }
+            }
+            best.1
         }
     }
 }
 
+/// How tightly an open completion list packs itself over the file, least first: the editor
+/// takes the least that leaves the file its floor ([`editor_shell_metrics_at_scale`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListPacking {
+    /// Its rows at their own height, inside its own padding.
+    Own,
+    /// Its rows at their own height, inside the dense toolbar's padding.
+    TightPadding,
+    /// Its rows closed up to the help line's height, inside the dense toolbar's padding.
+    ClosedUp,
+}
+
+impl ListPacking {
+    const LEAST_FIRST: [ListPacking; 3] = [Self::Own, Self::TightPadding, Self::ClosedUp];
+}
+
 /// The editor's chrome laid out whole, its toolbar in at most `command_row_cap` rows (none at 0,
-/// where no `edit` ticket's header row stands either) and a listed palette's rows `dense` (the
-/// help line's height, inside the dense toolbar's padding); [`editor_shell_metrics_at_scale`]
-/// chooses both.
+/// where no `edit` ticket's header row stands either) and a listed palette packed by `packing`;
+/// [`editor_shell_metrics_at_scale`] chooses both.
 fn editor_shell_layout(
     viewport: LogicalRect,
     palette: EditorPalette,
     toolbar: EditorToolbar,
     text_scale: f32,
     command_row_cap: usize,
-    dense: bool,
+    packing: ListPacking,
 ) -> EditorShellMetrics {
     let (palette_candidates, wanted_help_rows) = match palette {
         EditorPalette::Rows {
@@ -2271,10 +2310,10 @@ fn editor_shell_layout(
     let chrome_scale = text_scale.min(1.35);
     let dense_commands = viewport.width < 390.0 * text_scale.min(1.4);
     let (outer_padding, palette_padding) = editor_shell_paddings(viewport, text_scale);
-    let palette_padding = if dense {
-        palette_padding.min(4.0 * chrome_scale)
-    } else {
+    let palette_padding = if packing == ListPacking::Own {
         palette_padding
+    } else {
+        palette_padding.min(4.0 * chrome_scale)
     };
     let command_gap = if dense_commands {
         4.0 * chrome_scale
@@ -2307,7 +2346,7 @@ fn editor_shell_layout(
     // palette.
     let palette_gaps = usize::from(command_rows > 0) + 1;
     let help_row_height = (28.0 * text_scale).clamp(28.0, 40.0);
-    let palette_row_height = if dense {
+    let palette_row_height = if packing == ListPacking::ClosedUp {
         help_row_height
     } else {
         (34.0 * text_scale).clamp(34.0, 48.0)
@@ -3066,12 +3105,13 @@ fn ink_marks(
                     LogicalRect::new(x + lead, baseline - body, width(trimmed), body),
                 )
             }
-            DrawPrim::Line { .. } | DrawPrim::Dot { .. } | DrawPrim::Ring { .. } => {
-                match prim_ink(prim) {
-                    Some(rect) => (None, rect),
-                    None => continue,
-                }
-            }
+            DrawPrim::Line { .. }
+            | DrawPrim::Dot { .. }
+            | DrawPrim::Ring { .. }
+            | DrawPrim::Arc { .. } => match prim_ink(prim) {
+                Some(rect) => (None, rect),
+                None => continue,
+            },
             DrawPrim::BandIcon { x, y, size, .. } => (None, LogicalRect::new(*x, *y, *size, *size)),
             DrawPrim::Image {
                 x,
@@ -3140,6 +3180,17 @@ fn prim_ink(prim: &crate::widget::DrawPrim) -> Option<LogicalRect> {
             2.0 * r_outer,
             2.0 * r_outer,
         )),
+        DrawPrim::Arc {
+            cx, cy, r, width, ..
+        } => {
+            let reach = r + width * 0.5;
+            Some(LogicalRect::new(
+                cx - reach,
+                cy - reach,
+                2.0 * reach,
+                2.0 * reach,
+            ))
+        }
         _ => None,
     }
 }
@@ -4878,12 +4929,9 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
             ))
         }
         UiContent::Switch(control) if control.style == StyleRef::Quiet => None,
+        UiContent::Switch(control) if !switch_word_shown(node.rect, control) => None,
         UiContent::Switch(control) => {
-            let text = if matches!(control.value, SemanticValue::Bool(true)) {
-                "On"
-            } else {
-                "Off"
-            };
+            let text = switch_word(control);
             let size = native_type_px(TypeStep::Secondary).get();
             let track_w = SWITCH_TRACK_WIDTH.min((node.rect.width - 8.0).max(0.0));
             let text_x = node.rect.x + SWITCH_WORD_LEAD;
@@ -5954,11 +6002,11 @@ fn paint_compiled_node(
             let enabled = control.state.enabled;
             if FLUENT_SWITCH {
                 paint_fluent_switch(prims, rect, control.state, on, roles);
-                if plain {
+                if plain || !switch_word_shown(rect, control) {
                     return;
                 }
                 let size = native_type_px(TypeStep::Secondary);
-                let word = if on { "On" } else { "Off" };
+                let word = switch_word(control);
                 let width = crate::tray_raster::ui_text_width_for(TextFace::Ui, word, size.get());
                 let right = rect.right() - 8.0 - FLUENT_TRACK.0 - 12.0;
                 prims.push(text_prim(
@@ -6012,13 +6060,13 @@ fn paint_compiled_node(
                 ),
             });
             let size = native_type_px(TypeStep::Secondary);
-            if plain {
+            if plain || !switch_word_shown(rect, control) {
                 return;
             }
             prims.push(text_prim(
                 rect.x + 10.0,
                 row_baseline(rect.y, rect.height, size.get()),
-                if on { "On" } else { "Off" }.to_string(),
+                switch_word(control).to_string(),
                 size,
                 TextWeight::Regular,
                 TextFace::Ui,
@@ -8223,6 +8271,30 @@ const SWITCH_TRACK_WIDTH: f32 = 42.0;
 const SWITCH_WORD_LEAD: f32 = 10.0;
 const SWITCH_WORD_GAP: f32 = 12.0;
 
+/// The word a switch shows beside its track.
+fn switch_word(control: &Control<SwitchSpec>) -> &'static str {
+    if matches!(control.value, SemanticValue::Bool(true)) {
+        "On"
+    } else {
+        "Off"
+    }
+}
+
+/// Whether a switch `rect` shows its On or Off word: one narrower than [`switch_least_width`],
+/// in a column with no more room (Noto Sans's "On" at 1.5× text in a 96pt column), draws its
+/// track alone, its state still in the track and its value, never a word run into the track.
+fn switch_word_shown(rect: LogicalRect, control: &Control<SwitchSpec>) -> bool {
+    let room = if FLUENT_SWITCH {
+        rect.right() - 8.0 - FLUENT_TRACK.0 - 12.0 - (rect.x + 10.0)
+    } else {
+        let track_w = SWITCH_TRACK_WIDTH.min((rect.width - 8.0).max(0.0));
+        rect.right() - track_w - SWITCH_WORD_GAP - (rect.x + SWITCH_WORD_LEAD)
+    };
+    let size = native_type_px(TypeStep::Secondary).get();
+    crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, switch_word(control), size)
+        <= room + 0.5
+}
+
 /// The least width of a switch that shows its On or Off word.
 pub(crate) fn switch_least_width() -> f32 {
     let size = native_type_px(TypeStep::Secondary).get();
@@ -8454,7 +8526,9 @@ pub(crate) enum CompileError {
     VisibleLabelNotInName(UiKey),
 }
 
-/// `visual`'s lines joined as `name` writes each break's two halves.
+/// `visual`'s lines joined as `name` writes each break's two halves. A break's hyphen goes where
+/// the name has the word without it (`Infor-` / `mation`), the middle piece of a word broken
+/// twice included (`IN-` / `FORMA-` / `TION`).
 pub(crate) fn joined_as_named(visual: &str, name: &str) -> String {
     let name = name.to_lowercase();
     let mut out = String::new();
@@ -8473,9 +8547,12 @@ pub(crate) fn joined_as_named(visual: &str, name: &str) -> String {
             .next()
             .unwrap_or_default()
             .to_lowercase();
+        // The middle piece of a word broken twice ends in its own break's hyphen ("forma-"),
+        // which the name does not have.
+        let piece = first.strip_suffix('-').unwrap_or(&first);
         let unhyphenated = last
             .strip_suffix('-')
-            .is_some_and(|stem| name.contains(&format!("{stem}{first}")));
+            .is_some_and(|stem| name.contains(&format!("{stem}{piece}")));
         if unhyphenated {
             out.pop();
         } else if name.contains(&format!("{last}{FACT_SEPARATOR}{first}"))
@@ -8739,8 +8816,13 @@ impl Compiler {
             let self_named = matches!(content, UiContent::Button(_)) && !list.segmented;
             let sliver = visible.height + CLIP_EDGE_EPSILON < LIST_PEEK_MIN.min(rect.height);
             let nameless = !self_named && list.row_named == Some(false);
+            // A CONTROL TALLER THAN ITS LIST'S ROOM IS DRAWN AS FAR AS IT SHOWS, AND LIVE: no
+            // screen holds it whole, so drawn only whole it was drawn on none, its screen blank
+            // (a three-line button 130pt tall at 2x in a 98pt window); the screens step down it.
+            let taller = rect.height > list.room.height + CLIP_EDGE_EPSILON;
             if sliver
                 || (cut_edges.any()
+                    && !taller
                     && (nameless || cuts_own_words(&key, &content, rect, cut_edges)))
             {
                 if projection.action.is_some() && projection.state.is_none_or(|state| state.enabled)
@@ -10269,6 +10351,84 @@ pub(crate) mod tests {
         failures
     }
 
+    /// A SWITCH TOO NARROW FOR ITS WORD DRAWS ITS TRACK ALONE ([`switch_word_shown`]): at
+    /// [`switch_least_width`] it paints its On or Off word whole; narrower than its word (a 96pt
+    /// column at 1.5× text in Noto Sans), it paints no word to run into its track and audits no
+    /// text, its state still its value. NEGATIVE CONTROL: the least width paints the word.
+    #[test]
+    fn a_switch_too_narrow_for_its_word_draws_its_track_alone() {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let compile = |width: f32, on: bool| {
+            UiTree::new(
+                UiNode::new(
+                    "app",
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+                )
+                .layout(Layout::column())
+                .children(vec![
+                    UiNode::new(
+                        "switch",
+                        UiContent::Switch(
+                            Control::new(
+                                SwitchSpec {
+                                    label: "Automatic updates".to_string(),
+                                    description: None,
+                                },
+                                ActionId::new("switch"),
+                            )
+                            .value(SemanticValue::Bool(on)),
+                        ),
+                    )
+                    .layout(
+                        Layout::default()
+                            .width(Length::Fixed(width))
+                            .height(Length::Fixed(32.0)),
+                    ),
+                ]),
+            )
+            .compile(LogicalRect::new(0.0, 0.0, 240.0, 64.0))
+            .expect("compiles")
+        };
+        let least = switch_least_width();
+        for on in [false, true] {
+            let word = if on { "On" } else { "Off" };
+            let painted = |compiled: &CompiledUi| {
+                compiled
+                    .tray(aterm_render::Theme::default(), 14.0)
+                    .prims
+                    .into_iter()
+                    .any(
+                        |prim| matches!(prim, crate::widget::DrawPrim::Text { s, .. } if s == word),
+                    )
+            };
+            let key = UiKey::new("switch");
+            let roomy = compile(least, on);
+            assert!(painted(&roomy), "{word} at the least width {least}");
+            assert!(
+                roomy.fit_failures().is_empty(),
+                "{:?}",
+                roomy.fit_failures()
+            );
+            let word_width =
+                crate::tray_raster::ui_text_width(word, native_type_px(TypeStep::Secondary).get());
+            let narrow = compile(
+                SWITCH_WORD_LEAD + SWITCH_WORD_GAP + SWITCH_TRACK_WIDTH + word_width / 2.0,
+                on,
+            );
+            assert!(!painted(&narrow), "no {word} run into the track");
+            assert!(narrow.text_fit_audit_line(&key).is_none());
+            assert!(
+                narrow.fit_failures().is_empty(),
+                "{:?}",
+                narrow.fit_failures()
+            );
+            assert_eq!(
+                narrow.semantic(&key).map(|node| node.value.clone()),
+                Some(SemanticValue::Bool(on))
+            );
+        }
+    }
+
     #[test]
     fn paint_audit_reports_marks_painted_over_each_other() {
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
@@ -11310,6 +11470,26 @@ pub(crate) mod tests {
             plain
                 .iter()
                 .all(|(_, fill)| *fill != crate::widget::rgba(background, 255))
+        );
+    }
+
+    /// A WORD BROKEN TWICE JOINS AS ITS NAME WRITES IT ([`joined_as_named`]): "BUILD
+    /// INFORMATION" set in Noto Sans (Linux's face) at 2× text in a 164pt About paints "BUILD IN-" /
+    /// "FORMA-" / "TION", and joins to its name's words as a word broken once does. NEGATIVE
+    /// CONTROL: a word's own hyphen at a break stays ("a follow-" / "up").
+    #[test]
+    fn a_word_broken_twice_joins_as_its_name_writes_it() {
+        assert_eq!(
+            joined_as_named("BUILD IN-\nFORMA-\nTION", "Build information"),
+            "BUILD INFORMATION"
+        );
+        assert_eq!(
+            joined_as_named("Infor-\nmation", "Information"),
+            "Information"
+        );
+        assert_eq!(
+            joined_as_named("a follow-\nup", "a follow-up"),
+            "a follow-up"
         );
     }
 
@@ -12494,6 +12674,130 @@ pub(crate) mod tests {
             .rows
             .len(),
             "and the whole toolbar"
+        );
+    }
+
+    /// AN OPEN COMPLETION LIST PACKS ONLY AS TIGHT AS THE FILE NEEDS (audit r22 SM2): once the
+    /// toolbar had given way to an open list, the list kept its closed-up rows (the help line's
+    /// height, 40pt at 2x instead of 48) even where its own rows left the file its floor: at
+    /// 80x24 and 1.25x, rows of 35pt where 42.5 left aterm.toml the same rows. Now under each
+    /// chrome the list tightens its padding, then closes its rows up, only where that buys the
+    /// file a row short of its floor, and the toolbar and a ticket's header row give way only
+    /// where every packing under them leaves the file short. Over the standard windows, text
+    /// scales, toolbars, list lengths and help heights, and every height of an 80- and a
+    /// 102-column window.
+    #[test]
+    fn an_open_completion_list_packs_only_as_tight_as_the_file_needs() {
+        let mut windows = vec![
+            (584.0, 348.0),
+            (640.0, 400.0),
+            (738.0, 418.0),
+            (900.0, 600.0),
+            (1_200.0, 800.0),
+        ];
+        for height in (300..=620).step_by(3) {
+            windows.extend([(584.0, height as f32), (738.0, height as f32)]);
+        }
+        let toolbars = [
+            EditorToolbar::default(),
+            EditorToolbar {
+                problem_navigation: true,
+                reload: true,
+                edit_header: false,
+            },
+            EditorToolbar {
+                edit_header: true,
+                ..EditorToolbar::default()
+            },
+        ];
+        let (mut own_rows_after_the_toolbar, mut closed_up_after_the_toolbar) = (0, 0);
+        for scale in [0.85_f32, 1.0, 1.25, 1.5, 1.75, 2.0] {
+            let text_scale = editor_text_scale(scale);
+            for (width, height) in windows.iter().copied() {
+                let viewport = LogicalRect::new(0.0, 0.0, width, height);
+                let rows = |m: &EditorShellMetrics| {
+                    whole_editor_rows(&text_viewport_geometry_at_scale(
+                        editor_rect_in(viewport, m),
+                        text_scale,
+                        1,
+                    ))
+                };
+                for toolbar in toolbars {
+                    for candidates in [1, 8] {
+                        for help_rows in 1..=3 {
+                            let palette = EditorPalette::Rows {
+                                candidates,
+                                help_rows,
+                            };
+                            let chosen =
+                                editor_shell_metrics_at_scale(viewport, palette, toolbar, scale);
+                            let at = |toolbar: EditorToolbar, cap: usize, packing: ListPacking| {
+                                editor_shell_layout(
+                                    viewport, palette, toolbar, text_scale, cap, packing,
+                                )
+                            };
+                            let file = rows(&chosen);
+                            let wanted = file.min(EDITOR_DOCUMENT_FLOOR_ROWS);
+                            let context = format!(
+                                "{width}x{height} at {scale}x, {toolbar:?}, {candidates} listed, \
+                                 {help_rows} help rows: {file} rows of the file under {chosen:?}"
+                            );
+                            let header = toolbar.edit_header && chosen.command_rows > 0;
+                            let standing = EditorToolbar {
+                                edit_header: header,
+                                ..toolbar
+                            };
+                            let looser = |packing: ListPacking| {
+                                rows(&at(standing, chosen.command_row_cap, packing))
+                            };
+                            let own = at(standing, chosen.command_row_cap, ListPacking::Own);
+                            if chosen.palette_row_height < own.palette_row_height {
+                                let n = looser(ListPacking::TightPadding);
+                                assert!(n < wanted, "{context}: its own rows leave it {n}");
+                            } else if chosen.palette_padding < own.palette_padding {
+                                let n = looser(ListPacking::Own);
+                                assert!(n < wanted, "{context}: its own padding leaves it {n}");
+                            }
+                            let buttons_gone = chosen.command_row_cap == 0 && !toolbar.edit_header;
+                            if buttons_gone {
+                                let n = rows(&at(toolbar, 1, ListPacking::ClosedUp));
+                                assert!(n < wanted, "{context}: one toolbar row leaves it {n}");
+                                if chosen.palette_row_height < own.palette_row_height {
+                                    closed_up_after_the_toolbar += 1;
+                                } else {
+                                    own_rows_after_the_toolbar += 1;
+                                }
+                            }
+                            if toolbar.edit_header && !header {
+                                let n = rows(&at(toolbar, 0, ListPacking::ClosedUp));
+                                assert!(n < wanted, "{context}: the header row leaves it {n}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            own_rows_after_the_toolbar > 0 && closed_up_after_the_toolbar > 0,
+            "the sweep reaches lists at their own height and closed up where the toolbar gave \
+             way: {own_rows_after_the_toolbar}, {closed_up_after_the_toolbar}"
+        );
+        let small = LogicalRect::new(0.0, 0.0, 584.0, 348.0);
+        let listed = EditorPalette::Rows {
+            candidates: 8,
+            help_rows: 1,
+        };
+        let shell = editor_shell_metrics_at_scale(small, listed, EditorToolbar::default(), 1.25);
+        assert_eq!(
+            (shell.command_rows, shell.palette_row_height),
+            (0, 34.0 * 1.25),
+            "80x24 at 1.25x: the toolbar gives way, the rows stand at their own height"
+        );
+        let shell = editor_shell_metrics_at_scale(small, listed, EditorToolbar::default(), 2.0);
+        assert_eq!(
+            (shell.command_rows, shell.palette_row_height),
+            (0, 40.0),
+            "80x24 at 2x: closed up, for the file's rows"
         );
     }
 

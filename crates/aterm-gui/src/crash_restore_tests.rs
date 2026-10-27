@@ -644,6 +644,7 @@ pub(super) mod seam {
     std::thread_local! {
         static PANIC: Cell<bool> = const { Cell::new(false) };
         static FENCED: Cell<Option<bool>> = const { Cell::new(None) };
+        static LOOKALIKE: Cell<Option<usize>> = const { Cell::new(None) };
     }
 
     /// Note whether the screen reader's fence is up here, and panic when armed.
@@ -662,6 +663,16 @@ pub(super) mod seam {
     /// What the last [`replay_reached`] on this thread saw, taken.
     pub(super) fn fenced() -> Option<bool> {
         FENCED.with(Cell::take)
+    }
+
+    /// The look-alike seam's plant this thread armed, in KiB (`crash_restore::lookalike_kib`).
+    pub(crate) fn lookalike_kib() -> Option<usize> {
+        LOOKALIKE.with(Cell::get)
+    }
+
+    /// Arm the look-alike seam on this thread with a plant of `kib` KiB, or disarm it.
+    pub(super) fn arm_lookalike(kib: Option<usize>) {
+        LOOKALIKE.with(|l| l.set(kib));
     }
 }
 
@@ -1684,6 +1695,160 @@ fn a_lost_chunk_is_a_counted_gap_never_other_lines() {
     let got = history_rows(&adopted);
     assert_eq!(got.len() as u64, carried);
     assert!(live.ends_with(&got), "the carried lines are the live ones");
+}
+
+/// The look-alike arms' copy ([`lookalike_copy_of`]): at 0 KiB it is the region byte for byte
+/// and restores what the region does; above 0 the newest chunk is lost to the plant and every
+/// older one kept. Negative control: the region itself is left as it was.
+#[test]
+fn the_lookalike_seam_restores_a_planted_copy_and_never_writes_the_region() {
+    use crate::metrics::RestoreExperiment;
+    let rig = Rig::new(8, 40);
+    for batch in 0..40 {
+        let mut bytes = String::new();
+        for i in 0..100 {
+            bytes.push_str(&format!("line {}\r\n", batch * 100 + i));
+        }
+        rig.slice(bytes.as_bytes());
+    }
+    rig.export();
+    rig.quiet();
+    let cell_px = crate::term_lock(&rig.term).host_cell_pixel_size();
+    let ring = |region: &aterm_restore::VecStore| match aterm_restore::recover(
+        region,
+        RecoverPolicy {
+            tail: true,
+            config_fp: config_fp(config_hash(None), cell_px),
+            scratch_nonce: [0xA5; 32],
+        },
+        |rows, cols| scratch_engine(rows, cols, None, cell_px),
+    ) {
+        Recovery::Restored(restored) => (restored.ring.fault, restored.ring.chunks.len()),
+        Recovery::Meta(why) => panic!("expected a screen: {why:?}"),
+    };
+    let region = rig.journal.snapshot();
+    let bytes_of = |store: &aterm_restore::VecStore| {
+        use aterm_restore::RegionView as _;
+        let mut bytes = vec![0u8; store.len()];
+        store.read(0, &mut bytes).expect("the copy reads");
+        bytes
+    };
+    let before = bytes_of(&region);
+    let (fault, chunks) = ring(&region);
+    assert!(
+        fault.is_none() && chunks >= 3,
+        "premise: a clean run of chunks"
+    );
+    let mut outcomes = Vec::new();
+    let copy =
+        lookalike_copy_measured(&region, 0, |outcome| outcomes.push(outcome)).expect("a copy");
+    assert_eq!(
+        ring(&copy),
+        (None, chunks),
+        "the copy alone restores the same"
+    );
+    let planted =
+        lookalike_copy_measured(&region, 64, |outcome| outcomes.push(outcome)).expect("a copy");
+    let (fault, kept) = ring(&planted);
+    assert!(fault.is_some(), "the plant ends the ring's walk");
+    assert_eq!(kept, chunks - 1, "only the newest chunk is lost");
+    assert!(bytes_of(&region) == before, "the region is never written");
+    assert_eq!(
+        outcomes,
+        [RestoreExperiment::Copy, RestoreExperiment::Lookalike]
+    );
+    let empty = aterm_restore::VecStore::new(aterm_restore::RegionView::len(&region));
+    let before = bytes_of(&empty);
+    assert!(lookalike_copy_measured(&empty, 64, |outcome| outcomes.push(outcome)).is_none());
+    assert_eq!(outcomes.last(), Some(&RestoreExperiment::Refused));
+    assert_eq!(bytes_of(&empty), before);
+}
+
+#[test]
+fn an_unreadable_experimental_copy_is_observed_as_a_refusal() {
+    use crate::metrics::RestoreExperiment;
+    use aterm_restore::{RegionView, StoreError};
+
+    struct Unreadable;
+    impl RegionView for Unreadable {
+        fn len(&self) -> usize {
+            8
+        }
+        fn read(&self, at: usize, out: &mut [u8]) -> Result<(), StoreError> {
+            Err(StoreError::OutOfBounds { at, len: out.len() })
+        }
+        fn load_u64_acquire(&self, at: usize) -> Result<u64, StoreError> {
+            Err(StoreError::OutOfBounds { at, len: 8 })
+        }
+    }
+    for kib in [0, 64] {
+        let mut outcomes = Vec::new();
+        assert!(
+            lookalike_copy_measured(&Unreadable, kib, |outcome| outcomes.push(outcome)).is_none()
+        );
+        assert_eq!(outcomes, [RestoreExperiment::Refused]);
+    }
+}
+
+/// The look-alike arms reach the restore of an offered region (`restore_offered`, the path the
+/// keeper's boot recovery takes): armed with a plant, the restore runs over the planted copy and
+/// loses history the clean restore keeps, and the seam counts the copy and the plant; armed at
+/// 0 KiB it restores from the copy alone, as the region does, and counts the copy. Negative
+/// controls: unarmed, the restore loses nothing and the seam counts nothing, before and after
+/// the planted restore (the region is never written).
+#[test]
+fn the_lookalike_seam_reaches_the_offered_region_s_restore() {
+    let rig = Rig::new(8, 40);
+    for batch in 0..40 {
+        let mut bytes = String::new();
+        for i in 0..100 {
+            bytes.push_str(&format!("line {}\r\n", batch * 100 + i));
+        }
+        rig.slice(bytes.as_bytes());
+    }
+    rig.export();
+    rig.quiet();
+    let restore = |kib: Option<usize>| {
+        seam::arm_lookalike(kib);
+        let before = crate::metrics::keeper_seam();
+        let restored = rig.restore(0).expect("a screen");
+        let seam = crate::metrics::keeper_seam().since(before);
+        seam::arm_lookalike(None);
+        (restored, (seam.copies, seam.plants))
+    };
+    let (clean, seam) = restore(None);
+    assert_eq!(seam, (0, 0), "unarmed, the seam makes no copy");
+    assert_eq!(
+        (clean.report.rung, clean.report.history_lost),
+        (Rung::Exact, 0),
+        "premise: the region restores exactly with its history: {:?}",
+        clean.report
+    );
+    let (copy, seam) = restore(Some(0));
+    assert_eq!(seam, (1, 0), "a copy, nothing planted");
+    assert_eq!(
+        (copy.report.rung, copy.report.history_lost),
+        (Rung::Exact, 0),
+        "the copy alone restores as the region does: {:?}",
+        copy.report
+    );
+    assert_eq!(
+        visible(&adopted(&copy.checkpoint)),
+        visible(&adopted(&clean.checkpoint))
+    );
+    let (planted, seam) = restore(Some(64));
+    assert_eq!(seam, (1, 1), "a copy, and the plant took in it");
+    assert!(
+        planted.report.history_lost > 0,
+        "the restore ran over the planted copy: {:?}",
+        planted.report
+    );
+    let (again, seam) = restore(None);
+    assert_eq!(
+        (seam, again.report.history_lost),
+        ((0, 0), 0),
+        "the region itself is as it was"
+    );
 }
 
 fn entropic(i: usize) -> String {

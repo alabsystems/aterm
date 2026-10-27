@@ -1,16 +1,17 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Conformance and reference-counting tests for [`Com`] and the DXGI, Direct3D 11 and DirectComposition declarations.
+//! Conformance and reference-counting tests for [`Com`] and the DXGI, Direct3D 11, DirectComposition and UI Automation declarations.
 
 #![allow(non_snake_case)]
 
 use aterm_win32::Win32::Foundation::E_POINTER;
-use aterm_win32::com::{Com, IUnknown_Vtbl, check};
+use aterm_win32::com::{Com, IInspectable_Vtbl, IUnknown_Vtbl, check};
 use aterm_win32::core::{GUID, HRESULT};
 use aterm_win32::d3d11 as X;
 use aterm_win32::dcomp as XD;
 use aterm_win32::dxgi as D;
+use aterm_win32::uia as U;
 use core::cell::Cell;
 use core::ffi::c_void;
 use core::ptr::{self, NonNull};
@@ -111,6 +112,42 @@ const _: () = {
     assert!(offset_of!(XD::IDCompositionVisual_Vtbl, SetContent) == slot(15));
     assert!(size_of::<XD::IDCompositionVisual_Vtbl>() == slot(16));
 
+    // WIN-UIA's provider interfaces, in UIAutomationCore.h's order.
+    assert!(offset_of!(IInspectable_Vtbl, GetIids) == slot(3));
+    assert!(offset_of!(IInspectable_Vtbl, GetTrustLevel) == slot(5));
+    assert!(size_of::<IInspectable_Vtbl>() == slot(6));
+    assert!(offset_of!(U::IRawElementProviderSimple_Vtbl, ProviderOptions) == slot(3));
+    assert!(offset_of!(U::IRawElementProviderSimple_Vtbl, GetPropertyValue) == slot(5));
+    assert!(size_of::<U::IRawElementProviderSimple_Vtbl>() == slot(7));
+    assert!(offset_of!(U::IRawElementProviderFragment_Vtbl, Navigate) == slot(3));
+    assert!(offset_of!(U::IRawElementProviderFragment_Vtbl, BoundingRectangle) == slot(5));
+    assert!(offset_of!(U::IRawElementProviderFragment_Vtbl, FragmentRoot) == slot(8));
+    assert!(size_of::<U::IRawElementProviderFragment_Vtbl>() == slot(9));
+    assert!(offset_of!(U::IRawElementProviderFragmentRoot_Vtbl, GetFocus) == slot(4));
+    assert!(size_of::<U::IRawElementProviderFragmentRoot_Vtbl>() == slot(5));
+    assert!(size_of::<U::IInvokeProvider_Vtbl>() == slot(4));
+    assert!(offset_of!(U::IValueProvider_Vtbl, IsReadOnly) == slot(5));
+    assert!(size_of::<U::IValueProvider_Vtbl>() == slot(6));
+    assert!(offset_of!(U::IRangeValueProvider_Vtbl, Maximum) == slot(6));
+    assert!(offset_of!(U::IRangeValueProvider_Vtbl, SmallChange) == slot(9));
+    assert!(size_of::<U::IRangeValueProvider_Vtbl>() == slot(10));
+    assert!(offset_of!(U::IToggleProvider_Vtbl, ToggleState) == slot(4));
+    assert!(size_of::<U::IToggleProvider_Vtbl>() == slot(5));
+    assert!(offset_of!(U::ISelectionProvider_Vtbl, IsSelectionRequired) == slot(5));
+    assert!(size_of::<U::ISelectionProvider_Vtbl>() == slot(6));
+    assert!(offset_of!(U::ISelectionItemProvider_Vtbl, IsSelected) == slot(6));
+    assert!(size_of::<U::ISelectionItemProvider_Vtbl>() == slot(8));
+    assert!(size_of::<U::IScrollItemProvider_Vtbl>() == slot(4));
+    assert!(offset_of!(U::ITextProvider_Vtbl, RangeFromPoint) == slot(6));
+    assert!(size_of::<U::ITextProvider_Vtbl>() == slot(9));
+    assert!(offset_of!(U::ITextProvider2_Vtbl, GetCaretRange) == slot(10));
+    assert!(size_of::<U::ITextProvider2_Vtbl>() == slot(11));
+    assert!(offset_of!(U::ITextRangeProvider_Vtbl, FindAttribute) == slot(7));
+    assert!(offset_of!(U::ITextRangeProvider_Vtbl, GetText) == slot(12));
+    assert!(offset_of!(U::ITextRangeProvider_Vtbl, AddToSelection) == slot(17));
+    assert!(offset_of!(U::ITextRangeProvider_Vtbl, GetChildren) == slot(20));
+    assert!(size_of::<U::ITextRangeProvider_Vtbl>() == slot(21));
+
     // GW.5's structs, on 64-bit hosts.
     assert!(
         size_of::<D::DXGI_SWAP_CHAIN_DESC1>() == 48 && align_of::<D::DXGI_SWAP_CHAIN_DESC1>() == 4
@@ -194,6 +231,40 @@ fn interface_ids_are_upstreams() {
         !same(&D::IID_IDXGIFactory1, &output6),
         "the comparison can fail"
     );
+}
+
+#[test]
+fn the_ui_automation_interface_ids_are_distinct() {
+    use aterm_win32::com::{IID_IAgileObject, IID_IInspectable, IID_IMarshal, IID_IUnknown};
+    let ids = [
+        IID_IUnknown,
+        IID_IInspectable,
+        IID_IAgileObject,
+        IID_IMarshal,
+        U::IID_IRawElementProviderSimple,
+        U::IID_IRawElementProviderFragment,
+        U::IID_IRawElementProviderFragmentRoot,
+        U::IID_IInvokeProvider,
+        U::IID_IValueProvider,
+        U::IID_IRangeValueProvider,
+        U::IID_IToggleProvider,
+        U::IID_ISelectionProvider,
+        U::IID_ISelectionItemProvider,
+        U::IID_IScrollItemProvider,
+        U::IID_ITextProvider,
+        U::IID_ITextProvider2,
+        U::IID_ITextRangeProvider,
+    ];
+    for (i, a) in ids.iter().enumerate() {
+        for b in &ids[i + 1..] {
+            assert!(!same(a, b), "two interfaces share an IID");
+        }
+    }
+    assert!(aterm_win32::com::same_iid(
+        &ids[4],
+        &U::IID_IRawElementProviderSimple
+    ));
+    assert!(!aterm_win32::com::same_iid(&ids[4], &ids[5]));
 }
 
 #[test]

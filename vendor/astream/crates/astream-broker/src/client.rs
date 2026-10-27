@@ -18,14 +18,16 @@
 
 use crate::logid::{Lineage, LogIdentity};
 use crate::proto::{
-    append_frame, append_publish_frame, append_retire_frame, decode_response, encode_request,
-    foreign_protocol, read_frame, Request, Response, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER,
-    ERR_BAD_SUBJECT, ERR_PROTOCOL, ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RETIRE_REFUSED,
-    ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION, RETAINED_FROM_PREFIX,
-    RETIRE_CHARGED_PREFIX, RETIRE_CUT_PREFIX, RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
+    append_commit_frame, append_frame, append_publish_frame, append_retire_frame,
+    decode_response_with_bt, encode_request, foreign_protocol, read_frame, Request, Response,
+    WireStats, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_PROTOCOL,
+    ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED,
+    LOG_POISONED_PREFIX, PROTO_VERSION, RETAINED_FROM_PREFIX, RETIRE_CHARGED_PREFIX,
+    RETIRE_CUT_PREFIX, RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
 };
 use crate::proto::{Gap, NonceExt, ServedInfo};
-use astream_wire::{Frame, FrameError};
+use astream_wire::frame::decode_frame_header_bytes;
+use astream_wire::{Frame, FrameError, HEADER_SIZE};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
@@ -58,10 +60,19 @@ contract_fn! {
 /// carries.
 pub type Record = (u64, String, Vec<u8>);
 
+/// One record with its monotone broker-stamped wall time (`bt=`, unix ms;
+/// `REQUIREMENTS` R3): `(offset, subject, body, bt_ms)`. `bt_ms` is `None` for records
+/// written before R3 or read from a broker that predates [`Request::BrokerTimes`].
+pub type StampedRecord = (u64, String, Vec<u8>, Option<u64>);
+
 /// The answer to a bounded, NON-TERMINAL read ([`Client::last`], [`Client::fetch`]):
 /// the page of records, then the `(next, head)` its closing `Mark` carried. Also the
 /// shape of [`Client::last_all`]'s whole-face answer, whose mark is its FIRST page's.
 pub type Page = (Vec<Record>, (u64, u64));
+
+/// [`Page`] with each record's broker-stamped wall time (`bt=`, unix ms;
+/// `REQUIREMENTS` R3): `(records, (next, head))`.
+pub type StampedPage = (Vec<StampedRecord>, (u64, u64));
 
 /// A producer's DISTINCT-SUBJECT BUDGET as one broker log counts it: the answer to
 /// [`Client::subject_budget`].
@@ -313,6 +324,16 @@ pub struct Client<S = UnixStream> {
     /// The oldest offset the newest page's `Mark` carried
     /// ([`seen_oldest`](Client::seen_oldest)).
     oldest: Option<u64>,
+    /// Whether this connection asked for gap notices, and the broker took the ask
+    /// ([`gap_notices`](Client::gap_notices)); `None`: not asked.
+    told: Option<bool>,
+    /// Whether this connection asked for broker-stamped wall times (`bt=`, R3) and the
+    /// broker took the ask ([`broker_times`](Client::broker_times)); `None`: not asked.
+    broker_times: Option<bool>,
+    /// The gap notices the pages [`fetch`](Client::fetch) read carried since
+    /// [`take_gaps`](Client::take_gaps) last took them, each with its fetch's filter, in the
+    /// order read.
+    gaps: Vec<(String, Gap)>,
     /// Pipelined publishes written whose acks have not been read
     /// ([`owed_acks`](Client::owed_acks)).
     owed: u64,
@@ -358,6 +379,16 @@ pub struct Client<S = TcpStream> {
     /// The oldest offset the newest page's `Mark` carried
     /// ([`seen_oldest`](Client::seen_oldest)).
     oldest: Option<u64>,
+    /// Whether this connection asked for gap notices, and the broker took the ask
+    /// ([`gap_notices`](Client::gap_notices)); `None`: not asked.
+    told: Option<bool>,
+    /// Whether this connection asked for broker-stamped wall times (`bt=`, R3) and the
+    /// broker took the ask ([`broker_times`](Client::broker_times)); `None`: not asked.
+    broker_times: Option<bool>,
+    /// The gap notices the pages [`fetch`](Client::fetch) read carried since
+    /// [`take_gaps`](Client::take_gaps) last took them, each with its fetch's filter, in the
+    /// order read.
+    gaps: Vec<(String, Gap)>,
     /// Pipelined publishes written whose acks have not been read
     /// ([`owed_acks`](Client::owed_acks)).
     owed: u64,
@@ -656,6 +687,9 @@ impl<S: Read + Write> Client<S> {
             keepalive_unknown: false,
             durable: None,
             oldest: None,
+            told: None,
+            broker_times: None,
+            gaps: Vec::new(),
             owed: 0,
             rx: RecvBuf::default(),
             nowait: Nowait::AsIs,
@@ -807,6 +841,32 @@ impl<S: Read + Write> Client<S> {
         self.ext.supports_gap_notices()
     }
 
+    /// Whether the latest `Hello` answer announced TOLD FETCHES
+    /// ([`REQUEST_TOLD_FETCH`](crate::proto::REQUEST_TOLD_FETCH)): on this broker a fetch on
+    /// a connection that asked for gap notices reads what retention still holds below its
+    /// filter's oldest ([`fetch_told`](Self::fetch_told)), so its `retained-from=` there says
+    /// the filter holds none of it. `false` before any `Hello`, or against a broker that
+    /// predates it: one that tells tails only refuses such a fetch with the rest, whatever
+    /// it still holds below the oldest.
+    pub const fn supports_told_fetch(&self) -> bool {
+        self.ext.supports_told_fetch()
+    }
+
+    /// Whether the latest `Hello` answer announced [`Request::BrokerTimes`]
+    /// (`REQUIREMENTS` R3): this broker stamps `bt=<unix ms>` at append and appends a
+    /// 9-byte `[BT_TAG, bt_ms BE]` trailer to `Delivery` frames on connections that ask
+    /// ([`broker_times`](Self::broker_times)).
+    pub const fn supports_broker_times(&self) -> bool {
+        self.ext.supports_broker_times()
+    }
+
+    /// Whether the latest `Hello` answer announced [`Request::Stats`]
+    /// (`REQUIREMENTS` R5): this broker serves attach-gated operational fleet statistics
+    /// over the wire ([`stats`](Self::stats)).
+    pub const fn supports_stats(&self) -> bool {
+        self.ext.supports_stats()
+    }
+
     /// The log's health as the latest `Hello` answer told it
     /// ([`HelloHealth`](crate::HelloHealth)): whether it is POISONED — it refuses every
     /// write until it is reopened — and why, and the flushes it has issued since it
@@ -827,19 +887,24 @@ impl<S: Read + Write> Client<S> {
         self.durable
     }
 
-    /// The OLDEST offset a read of the newest `Fetch`'s filter can reach, as its `Mark`
-    /// told it (`REQUIREMENTS` R4): the log's base, or for what a hold rule keeps records
-    /// of, the oldest it still holds of them. `None` before any page, after a `Last`
-    /// page (whose `Mark` carries none), or from a broker that predates it.
+    /// The OLDEST offset of the newest `Fetch`'s filter, as its `Mark` told it
+    /// (`REQUIREMENTS` R4): the offset at and above which the filter is complete, every
+    /// record of it retention still wants readable and none given up. The log's base, or
+    /// for what a hold rule keeps records of, the greatest floor of the subjects it
+    /// matches: so not the lowest record a read of it can reach, since of a filter whose
+    /// subjects have different floors some can still hold records below it
+    /// ([`fetch_told`](Self::fetch_told) reads them). `None` before any page, after a
+    /// `Last` page (whose `Mark` carries none), or from a broker that predates it.
     pub const fn seen_oldest(&self) -> Option<u64> {
         self.oldest
     }
 
     /// THE `HEAD`-STYLE QUERY that answers `oldest=` (`REQUIREMENTS` R4): a head query
     /// (`Fetch` with `max = 0`, never refused) on `filter`, and the oldest offset its
-    /// `Mark` says a read of the filter can reach, beside the visible head. `None` for
-    /// the oldest from a broker that predates it. Refused with [`AcksOwed`], sending
-    /// nothing, while pipelined acks are owed, as every `fetch` is.
+    /// `Mark` says the filter is complete from ([`seen_oldest`](Self::seen_oldest)),
+    /// beside the visible head. `None` for the oldest from a broker that predates it.
+    /// Refused with [`AcksOwed`], sending nothing, while pipelined acks are owed, as every
+    /// `fetch` is.
     pub fn oldest(&mut self, filter: &str) -> io::Result<(Option<u64>, u64)> {
         let (_, (_, head)) = self.fetch(0, filter, 0)?;
         Ok((self.oldest, head))
@@ -1147,25 +1212,73 @@ impl<S: Read + Write> Client<S> {
     pub fn send_commit(&mut self, group: &str, upto: u64) -> io::Result<()> {
         self.in_step()?;
         let mut out = Vec::new();
-        append_frame(
-            &mut out,
-            &encode_request(&Request::Commit {
-                group: group.to_string(),
-                upto,
-            }),
-        )?;
+        append_commit_frame(&mut out, group, upto)?;
         self.write_owed(&out)
+    }
+
+    /// PIPELINED BURST (send side): write every publish and commit in `burst` in ONE
+    /// write, in order, without waiting for an ack — what [`send_publish`](Self::send_publish)
+    /// and [`send_commit`](Self::send_commit) do one write each. Each op owes its own
+    /// ack ([`owed_acks`](Self::owed_acks) rises by `burst.len()`), read with
+    /// [`recv_publish_ack`](Self::recv_publish_ack) or
+    /// [`try_recv_publish_ack`](Self::try_recv_publish_ack) in burst order, exactly as
+    /// if they had been sent one by one; a refused op is its [`BrokerRefusal`] where its
+    /// ack would be, and pays it.
+    ///
+    /// ONE BATCH, NOT ONE PER OP. The broker's connection reader hands the writer the
+    /// writes it finds already received whole, behind each other, as one unit, so a burst
+    /// the reader takes in one read lands in one group-commit batch: one flush (on
+    /// Ordered, one barrier) for all of it, where ops written one at a time can each
+    /// meet the writer idle and pay their own (`broker.pipelining`). A burst the reader
+    /// does not take whole in one read (larger than the connection's receive step or the
+    /// socket's buffer, or cut short by the network) is handed over in parts, so its
+    /// ops share batches as the parts allow. The batch is a cost, never a contract: what
+    /// each op did is its own ack's to say. A publish and a commit in one batch that the
+    /// broker rolls back are both refused, as [`send_commit`](Self::send_commit) says of
+    /// writes sent back to back.
+    ///
+    /// All or nothing on THIS side: every frame is built before a byte is written, so a
+    /// burst with an op over the frame cap is refused whole, owes nothing and leaves
+    /// the client in step; a write that failed latches the client out of step, owing
+    /// nothing. An empty burst writes nothing. While the burst's acks are owed every
+    /// request that reads its own reply is refused with [`AcksOwed`], as after any
+    /// pipelined send; keep [`owed_acks`](Self::owed_acks) under
+    /// [`MAX_PIPELINE_WINDOW`](Self::MAX_PIPELINE_WINDOW).
+    pub fn send_pipelined(&mut self, burst: &[Pipelined<'_>]) -> io::Result<()> {
+        self.in_step()?;
+        let mut out = Vec::new();
+        for op in burst {
+            match *op {
+                Pipelined::Publish {
+                    producer_id,
+                    producer_seq,
+                    subject,
+                    body,
+                } => append_publish_frame(&mut out, producer_id, producer_seq, subject, body)?,
+                Pipelined::Commit { group, upto } => append_commit_frame(&mut out, group, upto)?,
+            }
+        }
+        if burst.is_empty() {
+            return Ok(());
+        }
+        self.write_owed_n(&out, burst.len())
     }
 
     /// Write one pipelined request whose ack the caller reads later, and count that ack
     /// as owed — only once the whole frame is written: a failed write latches the
     /// client, and nothing it is owed is read again.
     fn write_owed(&mut self, frame: &[u8]) -> io::Result<()> {
-        if let Err(e) = self.stream.write_all(frame) {
+        self.write_owed_n(frame, 1)
+    }
+
+    /// [`write_owed`](Self::write_owed) for `frames` requests written as one buffer:
+    /// all `frames` acks are owed once the whole buffer is written, none if it is not.
+    fn write_owed_n(&mut self, buf: &[u8], frames: usize) -> io::Result<()> {
+        if let Err(e) = self.stream.write_all(buf) {
             return Err(self.lose(e));
         }
         self.sent_at = Instant::now();
-        self.owed = self.owed.saturating_add(1);
+        self.owed = self.owed.saturating_add(frames as u64);
         Ok(())
     }
 
@@ -1633,14 +1746,44 @@ impl<S: Read + Write> Client<S> {
     /// no deadline and appends no record; on a guarded broker it needs an attached
     /// capability, as `idle_marks` does.
     ///
+    /// It holds for this connection's FETCHES too: a fetch below its filter's oldest, while
+    /// retention still holds records of the filter there, is answered with them, the
+    /// notice ahead of the page, where it would have been refused `retained-from=`
+    /// ([`fetch_told`](Self::fetch_told) asks for it and hands the notice back;
+    /// [`fetch`](Self::fetch) keeps it for [`take_gaps`](Self::take_gaps)).
+    ///
     /// As for `fetch`, no pipelined publish may be awaiting its acknowledgement: while
     /// one is, the request is refused with [`AcksOwed`] and nothing is sent.
     pub fn gap_notices(&mut self) -> io::Result<bool> {
         self.send(&Request::GapNotices)?;
-        match self.read_mark() {
-            Ok(_) => Ok(true),
-            Err(e) if is_refused_error(&e) => Ok(false),
-            Err(e) => Err(e),
+        let took = match self.read_mark() {
+            Ok(_) => true,
+            Err(e) if is_refused_error(&e) => false,
+            Err(e) => return Err(e),
+        };
+        self.told = Some(took);
+        Ok(took)
+    }
+
+    /// Ask for monotone broker-stamped wall times (`bt=<unix ms>`, `REQUIREMENTS` R3) on
+    /// this connection's deliveries (`Fetch`, `Last`, `Subscribe`, `SubscribeGroup`).
+    /// Answered with a `Mark`; against an older broker that predates the verb (`ERR_REFUSED`),
+    /// returns `Ok(false)` and leaves the stream framed.
+    pub fn broker_times(&mut self) -> io::Result<bool> {
+        self.send(&Request::BrokerTimes)?;
+        let took = match self.read_mark() {
+            Ok(_) => true,
+            Err(e) if is_refused_error(&e) => false,
+            Err(e) => return Err(e),
+        };
+        self.broker_times = Some(took);
+        Ok(took)
+    }
+
+    fn ensure_broker_times(&mut self) -> io::Result<bool> {
+        match self.broker_times {
+            Some(took) => Ok(took),
+            None => self.broker_times(),
         }
     }
 
@@ -1652,6 +1795,19 @@ impl<S: Read + Write> Client<S> {
             self.gap_notices()?;
         }
         Ok(())
+    }
+
+    /// Query attach-gated operational fleet statistics for `filter` (`REQUIREMENTS` R5).
+    /// Requires a read grant covering `/f/<F>/>` (or root `/>`) on a guarded broker;
+    /// never returns record bodies.
+    pub fn stats(&mut self, filter: &str) -> io::Result<WireStats> {
+        self.send(&Request::Stats {
+            filter: filter.to_string(),
+        })?;
+        match self.read_response()? {
+            Response::Stats(stats) => Ok(stats),
+            other => Err(self.reply_error(other)),
+        }
     }
 
     /// LAST-VALUE query: the most recent record of every subject matching `filter`
@@ -1708,7 +1864,34 @@ impl<S: Read + Write> Client<S> {
             after: after.to_string(),
             max,
         })?;
-        self.read_page_resumable(max)
+        let read = self.read_page_resumable(max, false)?;
+        Ok((read.page, read.mark, read.resume))
+    }
+
+    /// [`last`](Self::last) with each record's monotone broker-stamped wall time
+    /// (`bt=`, unix ms; `REQUIREMENTS` R3). Negotiates [`broker_times`](Self::broker_times)
+    /// once on this connection before reading.
+    pub fn last_stamped(&mut self, filter: &str, after: &str, max: u32) -> io::Result<StampedPage> {
+        let (page, mark, _) = self.last_page_stamped(filter, after, max)?;
+        Ok((page, mark))
+    }
+
+    /// [`last_page`](Self::last_page) with each record's monotone broker-stamped wall
+    /// time (`bt=`, unix ms; `REQUIREMENTS` R3).
+    pub fn last_page_stamped(
+        &mut self,
+        filter: &str,
+        after: &str,
+        max: u32,
+    ) -> io::Result<(Vec<StampedRecord>, (u64, u64), String)> {
+        self.ensure_broker_times()?;
+        self.send(&Request::Last {
+            filter: filter.to_string(),
+            after: after.to_string(),
+            max,
+        })?;
+        let read = self.read_page_resumable_stamped(max, false)?;
+        Ok((read.page, read.mark, read.resume))
     }
 
     /// WALK A LAST-VALUE FACE: [`last_page`](Self::last_page) repeated on its resume
@@ -1865,6 +2048,43 @@ impl<S: Read + Write> Client<S> {
         )))
     }
 
+    /// [`last_all`](Self::last_all) with each record's monotone broker-stamped wall time
+    /// (`bt=`, unix ms; `REQUIREMENTS` R3).
+    pub fn last_all_stamped(&mut self, filter: &str) -> io::Result<StampedPage> {
+        let mut rows = Vec::new();
+        let mut cursor = String::new();
+        let mut remaining = u32::MAX;
+        let mut first: Option<(u64, u64)> = None;
+        for _ in 0..LAST_WALK_PAGES_MAX {
+            let ask = remaining;
+            let (page, page_mark, resume) = self.last_page_stamped(filter, &cursor, ask)?;
+            let mark = *first.get_or_insert(page_mark);
+            let page_rows = page.len();
+            let mut taken = 0usize;
+            for row in page {
+                if remaining == 0 {
+                    break;
+                }
+                remaining -= 1;
+                taken = taken.saturating_add(1);
+                rows.push(row);
+            }
+            if resume.is_empty() && taken == page_rows && ask > 0 {
+                return Ok((rows, mark));
+            }
+            if remaining == 0 {
+                return Err(io::Error::other(format!(
+                    "the last-value face of {filter} did not end within {} rows",
+                    u32::MAX
+                )));
+            }
+            cursor = resume;
+        }
+        Err(io::Error::other(format!(
+            "the last-value walk of {filter} did not end within {LAST_WALK_PAGES_MAX} pages"
+        )))
+    }
+
     /// BOUNDED READ: at most `max` records matching `filter` with offset >= `from`,
     /// scanning at most the broker's [`FETCH_SCAN_MAX`](crate::broker::FETCH_SCAN_MAX)
     /// records. Returns the page and the `(next, head)` of its closing `Mark`; `next`
@@ -1880,18 +2100,139 @@ impl<S: Read + Write> Client<S> {
     /// holds the precondition itself: while an ack is owed the fetch is refused with
     /// [`AcksOwed`] — never an empty page — and nothing is sent, until
     /// [`recv_publish_ack`](Self::recv_publish_ack) has read them.
+    ///
+    /// BELOW THE OLDEST (`REQUIREMENTS` R4): a fetch below its filter's oldest is refused
+    /// `retained-from=<oldest>` ([`BrokerRefusal::retained_from`]), unless this connection
+    /// asked for gap notices ([`gap_notices`](Self::gap_notices)) and retention still holds
+    /// records of the filter there: then the page reads them, and the notice that came
+    /// ahead of it is kept, with the filter, for [`take_gaps`](Self::take_gaps), as a
+    /// subscription's [`recv`](Subscription::recv) keeps the ones it skips.
+    /// [`fetch_told`](Self::fetch_told) asks, and hands each page's notice back with it.
     pub fn fetch(&mut self, from: u64, filter: &str, max: u32) -> io::Result<Page> {
+        let (page, gap) = self.fetch_page(from, filter, max)?;
+        if let Some(g) = gap {
+            self.gaps.push((filter.to_string(), g));
+        }
+        Ok(page)
+    }
+
+    /// [`fetch`](Self::fetch) for a reader TOLD what retention gave up
+    /// (`REQUIREMENTS-fabric-operations` R4, addendum A9, as a tail is told): it asks for
+    /// gap notices on this connection first, once ([`gap_notices`](Self::gap_notices)),
+    /// and hands back the page with the notice that came ahead of it.
+    ///
+    /// A fetch below its filter's oldest — the offset at and above which the filter is
+    /// complete ([`seen_oldest`](Self::seen_oldest)) — reads from `from` while retention
+    /// still holds records of the filter there: the held records in offset order, then
+    /// the retained ones, with `Some(gap)`, which says every record of the filter in
+    /// `gap.from..gap.to` the page and the pages after it do not deliver was given up, and
+    /// how many where the broker knows. That is how records of a filter whose subjects
+    /// have different floors are read (two reader groups' mail, a hold class beside the
+    /// prefix): the oldest is the greatest floor, and some subjects hold records below it.
+    /// Where the filter holds none there, or the broker predates the notices (an older
+    /// broker refuses the ask as an unknown request, and this reads as `fetch` does), the
+    /// fetch is refused `retained-from=` as [`fetch`](Self::fetch) is.
+    ///
+    /// A BROKER THAT TELLS TAILS BUT NOT FETCHES (one built before told fetches) takes the
+    /// ask and refuses such a fetch `retained-from=` with the rest, so there the refusal does
+    /// not say the filter holds nothing below the oldest. Hello's request set says which a
+    /// broker is ([`supports_told_fetch`](Self::supports_told_fetch), after a `Hello`): a
+    /// reader that must not skip a held record, against one that does not announce it, reads
+    /// filters whose subjects share one floor (one reader group's mail) instead.
+    ///
+    /// Each page's notice is its own read's, a continuation's too: a reader paging on from a
+    /// `next` below `gap.to` is told the rest of the range again, with its own count, while
+    /// the filter still holds records there, and is refused `retained-from=<oldest>` where it
+    /// holds none there, however the page before it ended (its `max`, or the broker's scan
+    /// bound). Such a reader follows the refusal: the records of the filter it skips below
+    /// `gap.to` are ones the notice told it of, and an offset above `gap.to` says those of
+    /// `gap.to..offset` were given up since (a tick between its pages). So the first page's
+    /// notice is the whole range a paged read lost below `gap.to`. Refused with [`AcksOwed`],
+    /// sending nothing, as `fetch` is.
+    pub fn fetch_told(
+        &mut self,
+        from: u64,
+        filter: &str,
+        max: u32,
+    ) -> io::Result<(Page, Option<Gap>)> {
+        if self.told.is_none() {
+            self.gap_notices()?;
+        }
+        self.fetch_page(from, filter, max)
+    }
+
+    /// [`fetch`](Self::fetch) with each record's monotone broker-stamped wall time
+    /// (`bt=`, unix ms; `REQUIREMENTS` R3). Negotiates [`broker_times`](Self::broker_times)
+    /// once on this connection before reading.
+    pub fn fetch_stamped(&mut self, from: u64, filter: &str, max: u32) -> io::Result<StampedPage> {
+        self.ensure_broker_times()?;
+        let (page, gap) = self.fetch_page_stamped(from, filter, max)?;
+        if let Some(g) = gap {
+            self.gaps.push((filter.to_string(), g));
+        }
+        Ok(page)
+    }
+
+    /// [`fetch_told`](Self::fetch_told) with each record's monotone broker-stamped wall
+    /// time (`bt=`, unix ms; `REQUIREMENTS` R3).
+    pub fn fetch_told_stamped(
+        &mut self,
+        from: u64,
+        filter: &str,
+        max: u32,
+    ) -> io::Result<(StampedPage, Option<Gap>)> {
+        if self.told.is_none() {
+            self.gap_notices()?;
+        }
+        self.ensure_broker_times()?;
+        self.fetch_page_stamped(from, filter, max)
+    }
+
+    /// Every gap notice the pages [`fetch`](Self::fetch) read carried since the last call,
+    /// each with the filter its fetch read, in the order read; empty when none came.
+    /// [`fetch_told`](Self::fetch_told) hands each one back instead.
+    ///
+    /// Kept apart, never merged: a notice speaks of its own filter and its own read's range
+    /// only (every record of THAT filter in `from..to` its read did not deliver was given
+    /// up), so two filters' notices, or two fetches' ranges with offsets neither read between
+    /// them, say nothing together that either does not say alone. The counts of two notices
+    /// whose ranges overlap can name the same record (a paged read is told the rest of its
+    /// range again on each page below it), so they are not to be summed. They are kept until
+    /// taken: one per fetch that carried a notice.
+    pub fn take_gaps(&mut self) -> Vec<(String, Gap)> {
+        std::mem::take(&mut self.gaps)
+    }
+
+    /// One `Fetch` and its answer: the page, and the gap notice ahead of it.
+    fn fetch_page(&mut self, from: u64, filter: &str, max: u32) -> io::Result<(Page, Option<Gap>)> {
         self.send(&Request::Fetch {
             from_offset: from,
             filter: filter.to_string(),
             max,
         })?;
-        let (page, mark, _) = self.read_page_resumable(max)?;
-        Ok((page, mark))
+        let read = self.read_page_resumable(max, true)?;
+        Ok(((read.page, read.mark), read.gap))
+    }
+
+    fn fetch_page_stamped(
+        &mut self,
+        from: u64,
+        filter: &str,
+        max: u32,
+    ) -> io::Result<(StampedPage, Option<Gap>)> {
+        self.send(&Request::Fetch {
+            from_offset: from,
+            filter: filter.to_string(),
+            max,
+        })?;
+        let read = self.read_page_resumable_stamped(max, true)?;
+        Ok(((read.page, read.mark), read.gap))
     }
 
     /// Read `Delivery*` then the closing `Mark` of a bounded, non-terminal read,
-    /// keeping the `Mark`'s subject cursor.
+    /// keeping the `Mark`'s subject cursor. Where `told` (a `Fetch`'s answer), one gap
+    /// notice ahead of the first delivery is the page's own; anywhere else a notice is
+    /// out of step.
     ///
     /// The page is buffered before it is returned, so it is bounded by the `max` the
     /// request asked for (the broker never sends more): a peer that keeps sending
@@ -1901,10 +2242,12 @@ impl<S: Read + Write> Client<S> {
     /// flushes pending acks BEFORE the page (they arrive first, in order), so a caller
     /// that owes itself acks must drain them first; [`send`](Self::send) refuses the
     /// request that would have read past them ([`AcksOwed`]).
-    fn read_page_resumable(&mut self, max: u32) -> io::Result<(Vec<Record>, (u64, u64), String)> {
+    fn read_page_resumable(&mut self, max: u32, told: bool) -> io::Result<ReadPage> {
         let mut page = Vec::new();
+        let mut gap = None;
         loop {
             match self.read_response()? {
+                Response::Gap(g) if told && page.is_empty() && gap.is_none() => gap = Some(g),
                 // The rest of that page is still on the stream, unread: out of step.
                 Response::Delivery { .. } if page.len() >= max as usize => {
                     return Err(self.lose(io::Error::new(
@@ -1926,7 +2269,51 @@ impl<S: Read + Write> Client<S> {
                 } => {
                     self.saw_durable(durable);
                     self.oldest = oldest;
-                    return Ok((page, (next, head), resume));
+                    return Ok(ReadPage {
+                        page,
+                        mark: (next, head),
+                        resume,
+                        gap,
+                    });
+                }
+                other => return Err(self.reply_error(other)),
+            }
+        }
+    }
+
+    fn read_page_resumable_stamped(&mut self, max: u32, told: bool) -> io::Result<ReadStampedPage> {
+        let mut page = Vec::new();
+        let mut gap = None;
+        loop {
+            let (resp, bt_ms) = self.read_response_with_bt()?;
+            match resp {
+                Response::Gap(g) if told && page.is_empty() && gap.is_none() => gap = Some(g),
+                Response::Delivery { .. } if page.len() >= max as usize => {
+                    return Err(self.lose(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("broker sent more than the {max} records the page asked for"),
+                    )))
+                }
+                Response::Delivery {
+                    offset,
+                    subject,
+                    body,
+                } => page.push((offset, subject, body, bt_ms)),
+                Response::Mark {
+                    next,
+                    head,
+                    resume,
+                    durable,
+                    oldest,
+                } => {
+                    self.saw_durable(durable);
+                    self.oldest = oldest;
+                    return Ok(ReadStampedPage {
+                        page,
+                        mark: (next, head),
+                        resume,
+                        gap,
+                    });
                 }
                 other => return Err(self.reply_error(other)),
             }
@@ -1954,6 +2341,22 @@ impl<S: Read + Write> Client<S> {
     /// [`owed_acks`](Self::owed_acks) is zero, and subscribes after.
     pub fn subscribe(mut self, from_offset: u64, filter: &str) -> io::Result<Subscription<S>> {
         self.ask_for_tail()?;
+        self.into_subscription(&Request::Subscribe {
+            from_offset,
+            filter: filter.to_string(),
+        })
+    }
+
+    /// [`subscribe`](Self::subscribe) negotiating monotone broker-stamped wall times
+    /// (`bt=`, unix ms; `REQUIREMENTS` R3) on the tail ([`Subscription::recv_stamped`],
+    /// [`Subscription::last_bt_ms`]).
+    pub fn subscribe_stamped(
+        mut self,
+        from_offset: u64,
+        filter: &str,
+    ) -> io::Result<Subscription<S>> {
+        self.ask_for_tail()?;
+        self.ensure_broker_times()?;
         self.into_subscription(&Request::Subscribe {
             from_offset,
             filter: filter.to_string(),
@@ -2017,6 +2420,22 @@ impl<S: Read + Write> Client<S> {
         })
     }
 
+    /// [`subscribe_group`](Self::subscribe_group) negotiating monotone broker-stamped wall
+    /// times (`bt=`, unix ms; `REQUIREMENTS` R3) on the tail ([`Subscription::recv_stamped`],
+    /// [`Subscription::last_bt_ms`]).
+    pub fn subscribe_group_stamped(
+        mut self,
+        group: &str,
+        filter: &str,
+    ) -> io::Result<Subscription<S>> {
+        self.ask_for_tail()?;
+        self.ensure_broker_times()?;
+        self.into_subscription(&Request::SubscribeGroup {
+            group: group.to_string(),
+            filter: filter.to_string(),
+        })
+    }
+
     /// COUNTERFACTUAL fork-delivery: stream the alternate timeline that results from
     /// forking the topic at `fork_at` and swapping that record for
     /// `(replacement_subject, replacement_body)`, filtered by `filter`. The live log
@@ -2068,6 +2487,11 @@ impl<S: Read + Write> Client<S> {
     /// out of [`rx`](Client::rx), and so is any frame read with it; with nothing there
     /// the reply is read straight off the stream, as every reply was before the try.
     fn read_response(&mut self) -> io::Result<Response> {
+        let (resp, _) = self.read_response_with_bt()?;
+        Ok(resp)
+    }
+
+    fn read_response_with_bt(&mut self) -> io::Result<(Response, Option<u64>)> {
         self.in_step()?;
         let frame = if self.rx.is_empty() {
             read_frame(&mut self.stream)
@@ -2075,7 +2499,7 @@ impl<S: Read + Write> Client<S> {
             self.rx.next_frame(&mut self.stream)
         };
         let read = match frame {
-            Ok(Some(p)) => decode_reply(&p),
+            Ok(Some(p)) => decode_reply_with_bt(&p),
             Ok(None) => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "broker closed",
@@ -2178,6 +2602,7 @@ impl<S: Read + Write> Client<S> {
             marked: false,
             durable: self.durable,
             gap: None,
+            last_bt: None,
         })
     }
 }
@@ -2196,6 +2621,22 @@ fn is_not_yet(e: &io::Error) -> bool {
     )
 }
 
+/// A bounded read's answer ([`Client::read_page_resumable`]): its records, the closing
+/// `Mark`'s `(next, head)` and subject cursor, and the gap notice ahead of a `Fetch`'s page.
+struct ReadPage {
+    page: Vec<Record>,
+    mark: (u64, u64),
+    resume: String,
+    gap: Option<Gap>,
+}
+
+struct ReadStampedPage {
+    page: Vec<StampedRecord>,
+    mark: (u64, u64),
+    resume: String,
+    gap: Option<Gap>,
+}
+
 fn is_refused_error(e: &io::Error) -> bool {
     match broker_refusal(e) {
         Some(r) => r.code == ERR_REFUSED,
@@ -2207,6 +2648,11 @@ fn is_refused_error(e: &io::Error) -> bool {
 /// protocol, the [`ProtocolMismatch`] it is. Asked FIRST, so a reply this build cannot
 /// decode for that reason is never reported as a garbled one.
 fn decode_reply(p: &[u8]) -> io::Result<Response> {
+    let (resp, _) = decode_reply_with_bt(p)?;
+    Ok(resp)
+}
+
+fn decode_reply_with_bt(p: &[u8]) -> io::Result<(Response, Option<u64>)> {
     if let Some(broker) = foreign_protocol(p) {
         return Err(ProtocolMismatch {
             broker,
@@ -2214,7 +2660,7 @@ fn decode_reply(p: &[u8]) -> io::Result<Response> {
         }
         .into());
     }
-    match decode_response(p) {
+    match decode_response_with_bt(p) {
         Some(resp) => Ok(resp),
         None => Err(unexpected_response()),
     }
@@ -2297,6 +2743,30 @@ pub fn protocol_mismatch(e: &io::Error) -> Option<&ProtocolMismatch> {
 pub struct AcksOwed {
     /// The acks owed when the request was refused.
     pub owed: u64,
+}
+
+/// One write of a [`Client::send_pipelined`] burst, whose ack the caller reads later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pipelined<'a> {
+    /// What [`Client::send_publish`] writes: `body` to `subject`, deduped by
+    /// `(producer_id, producer_seq)`.
+    Publish {
+        /// The producer the record is deduped under.
+        producer_id: u64,
+        /// Its sequence within that producer.
+        producer_seq: u64,
+        /// Where it is published.
+        subject: &'a str,
+        /// What it carries.
+        body: &'a [u8],
+    },
+    /// What [`Client::send_commit`] writes: consumer `group`'s commit to `upto`.
+    Commit {
+        /// The consumer group.
+        group: &'a str,
+        /// The offset it is committed to.
+        upto: u64,
+    },
 }
 
 impl std::fmt::Display for AcksOwed {
@@ -2445,9 +2915,12 @@ impl BrokerRefusal {
 
     /// Where a read RETENTION refused can start: the `<off>` of an [`ERR_RECORD_REFUSED`]
     /// whose message starts [`RETAINED_FROM_PREFIX`]`<off>` — a `Fetch` below the oldest
-    /// offset its filter can reach (`REQUIREMENTS` R4), whose records below `<off>`
-    /// retention gave up. A fetch from `<off>` reads on. `None` for every other refusal,
-    /// and against a broker that predates it (which clamped such a fetch to its base).
+    /// offset of its filter (`REQUIREMENTS` R4), the offset at and above which the filter
+    /// is complete: of its records below `<off>` retention gave some up, so not all are
+    /// kept. A fetch from `<off>` reads on; one that asked for gap notices
+    /// ([`Client::fetch_told`]) reads what is still held below it. `None` for every other
+    /// refusal, and against a broker that predates it (which clamped such a fetch to its
+    /// base).
     pub fn retained_from(&self) -> Option<u64> {
         if self.code != ERR_RECORD_REFUSED {
             return None;
@@ -2696,6 +3169,9 @@ pub struct Subscription<S = UnixStream> {
     durable: Option<u64>,
     /// The gap notices read since the last [`take_gap`](Subscription::take_gap), as one.
     gap: Option<Gap>,
+    /// Monotone broker-stamped wall time (`bt=`, unix ms; `REQUIREMENTS` R3) carried by
+    /// the most recent `Delivery` read on this stream.
+    last_bt: Option<u64>,
 }
 
 /// A live delivery stream from the broker (Windows twin: TCP default, as above).
@@ -2711,6 +3187,9 @@ pub struct Subscription<S = TcpStream> {
     durable: Option<u64>,
     /// The gap notices read since the last [`take_gap`](Subscription::take_gap), as one.
     gap: Option<Gap>,
+    /// Monotone broker-stamped wall time (`bt=`, unix ms; `REQUIREMENTS` R3) carried by
+    /// the most recent `Delivery` read on this stream.
+    last_bt: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -2818,32 +3297,71 @@ impl PartialEq for Event {
 /// buffer returns to after an oversized frame.
 const READ_CHUNK: usize = 64 * 1024;
 
-/// A subscription's receive buffer: the bytes read off the stream that no `recv` has
-/// returned yet, `buf[start..end]`.
+/// A receive buffer: the bytes read off a stream that no read has returned yet,
+/// `buf[start..end]`. A subscription's replies, and a client's, are read through one;
+/// so are a served connection's requests (`broker.rs`, `serve_conn`).
 ///
 /// Frames are parsed out of this buffer rather than read off the stream with
-/// `read_exact`, for two reasons. A read can TIME OUT part-way through a frame
+/// `read_exact`, for three reasons. A read can TIME OUT part-way through a frame
 /// (`SO_RCVTIMEO`, under [`take`]'s idle window), and `read_exact` drops the bytes it
 /// had already consumed when it does, so the next read would parse a body as a
 /// header; here those bytes simply stay in the buffer and the next `recv` finishes
-/// the frame. And one read takes every queued frame that fits, so a subscriber
-/// catching up on a backlog pays one syscall per buffer rather than two per frame.
+/// the frame. One read takes every queued frame that fits, so a subscriber catching
+/// up on a backlog pays one syscall per buffer rather than two per frame. And a reader
+/// can ask, reading nothing, whether the next frame has already arrived whole
+/// ([`holds_frame`](Self::holds_frame)), which is how the broker hands the writes a
+/// client sent together to its writer together.
 ///
-/// The buffer grows by at most [`READ_CHUNK`] per read — with what the peer has
-/// actually SENT, never with the length a header declares — so a peer that announces
+/// The buffer grows by at most its step per read — [`READ_CHUNK`], or the smaller step
+/// a served connection keeps ([`with_step`](Self::with_step)) — with what the peer has
+/// actually SENT, never with the length a header declares, so a peer that announces
 /// a 16 MiB frame and stalls pins only what it sent.
-#[derive(Default)]
-struct RecvBuf {
+pub(crate) struct RecvBuf {
     buf: Vec<u8>,
     start: usize,
     end: usize,
+    /// How much the buffer grows per read, and what it returns to once empty.
+    step: usize,
+}
+
+impl Default for RecvBuf {
+    fn default() -> RecvBuf {
+        RecvBuf::with_step(READ_CHUNK)
+    }
 }
 
 impl RecvBuf {
+    /// An empty buffer that grows `step` bytes per read (at least one) and gives back
+    /// whatever it grew past one step once it empties.
+    pub(crate) fn with_step(step: usize) -> RecvBuf {
+        RecvBuf {
+            buf: Vec::new(),
+            start: 0,
+            end: 0,
+            step: step.max(1),
+        }
+    }
+
+    /// Whether the buffer already holds the whole of the next frame, judged on its
+    /// header alone and reading nothing: its length is in, and that many payload bytes
+    /// after it. A frame whose header is bad counts as held, since the next
+    /// [`next_frame`](Self::next_frame) answers it at once (with the error), without
+    /// a read.
+    pub(crate) fn holds_frame(&self) -> bool {
+        let held = self.buf.get(self.start..self.end).unwrap_or(&[]);
+        let Some(hdr) = held.first_chunk::<HEADER_SIZE>() else {
+            return false;
+        };
+        match decode_frame_header_bytes(hdr) {
+            Ok((len, _)) => held.len().saturating_sub(HEADER_SIZE) >= len,
+            Err(_) => true,
+        }
+    }
+
     /// The payload of the next frame; `Ok(None)` when the stream closes at a frame
     /// boundary. A timeout keeps the unfinished frame for the next call; any other
     /// error discards it, since the stream cannot be resumed past one.
-    fn next_frame(&mut self, stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+    pub(crate) fn next_frame(&mut self, stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
         loop {
             if let Some(payload) = self.buffered_frame()? {
                 return Ok(Some(payload));
@@ -2866,9 +3384,17 @@ impl RecvBuf {
                 self.end = len;
                 self.start = 0;
                 if self.end == self.buf.len() {
-                    for _ in 0..8 {
-                        self.buf.extend_from_slice(&[0u8; 8192]);
+                    const MAX_RECV_BUF_BYTES: usize =
+                        astream_wire::MAX_PAYLOAD_LEN + HEADER_SIZE + (1024 * 1024);
+                    let grown = self.buf.len().saturating_add(self.step);
+                    if grown > MAX_RECV_BUF_BYTES {
+                        self.reset();
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "receive buffer exceeded frame ceiling",
+                        ));
                     }
+                    self.buf.resize(grown, 0);
                 }
             }
             let Some(dst) = self.buf.get_mut(self.end..) else {
@@ -2890,7 +3416,7 @@ impl RecvBuf {
                     } else {
                         Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
-                            "broker closed mid-frame",
+                            "the peer closed mid-frame",
                         ))
                     };
                 }
@@ -2944,8 +3470,8 @@ impl RecvBuf {
     fn reset(&mut self) {
         self.start = 0;
         self.end = 0;
-        if self.buf.len() > READ_CHUNK {
-            self.buf.truncate(READ_CHUNK);
+        if self.buf.len() > self.step {
+            self.buf.truncate(self.step);
             self.buf.shrink_to_fit();
         }
     }
@@ -2979,6 +3505,13 @@ impl<S: Read + Write> Subscription<S> {
         self.gap.take()
     }
 
+    /// The monotone broker-stamped wall time (`bt=`, unix ms; `REQUIREMENTS` R3) carried
+    /// by the most recent [`Event::Delivery`] read on this subscription (`None` before any
+    /// delivery, or when the subscription did not negotiate [`Client::broker_times`]).
+    pub const fn last_bt_ms(&self) -> Option<u64> {
+        self.last_bt
+    }
+
     /// Block until the next matching delivery; `Ok(None)` if the broker closes.
     /// A `Mark` and a gap notice are SKIPPED (this method's signature is unchanged) —
     /// read [`recv_event`](Self::recv_event) to see them, or
@@ -2997,6 +3530,22 @@ impl<S: Read + Write> Subscription<S> {
         }
     }
 
+    /// [`recv`](Self::recv) returning each record's monotone broker-stamped wall time
+    /// (`bt=`, unix ms; `REQUIREMENTS` R3) alongside `(offset, subject, body)`.
+    pub fn recv_stamped(&mut self) -> io::Result<Option<StampedRecord>> {
+        loop {
+            match self.recv_event()? {
+                None => return Ok(None),
+                Some(Event::Mark { .. } | Event::Gap(_)) => continue,
+                Some(Event::Delivery {
+                    offset,
+                    subject,
+                    body,
+                }) => return Ok(Some((offset, subject, body, self.last_bt))),
+            }
+        }
+    }
+
     /// Block until the next event — a delivery OR a `Mark`; `Ok(None)` if the broker
     /// closes.
     ///
@@ -3011,16 +3560,20 @@ impl<S: Read + Write> Subscription<S> {
         let Some(p) = self.rx.next_frame(&mut self.stream)? else {
             return Ok(None);
         };
-        match decode_reply(&p)? {
+        let (resp, bt_ms) = decode_reply_with_bt(&p)?;
+        match resp {
             Response::Delivery {
                 offset,
                 subject,
                 body,
-            } => Ok(Some(Event::Delivery {
-                offset,
-                subject,
-                body,
-            })),
+            } => {
+                self.last_bt = bt_ms;
+                Ok(Some(Event::Delivery {
+                    offset,
+                    subject,
+                    body,
+                }))
+            }
             Response::Mark {
                 next,
                 head,
@@ -4131,6 +4684,28 @@ mod owed_acks {
                 Box::new(|c| c.last_walk("/o/>", "", 8, |_| Ok(Walk::Continue)).map(drop)),
             ),
             ("last_all", Box::new(|c| c.last_all("/o/>").map(drop))),
+            ("broker_times", Box::new(|c| c.broker_times().map(drop))),
+            ("stats", Box::new(|c| c.stats("/o/>").map(drop))),
+            (
+                "fetch_stamped",
+                Box::new(|c| c.fetch_stamped(0, "/o/>", 8).map(drop)),
+            ),
+            (
+                "fetch_told_stamped",
+                Box::new(|c| c.fetch_told_stamped(0, "/o/>", 8).map(drop)),
+            ),
+            (
+                "last_stamped",
+                Box::new(|c| c.last_stamped("/o/>", "", 8).map(drop)),
+            ),
+            (
+                "last_page_stamped",
+                Box::new(|c| c.last_page_stamped("/o/>", "", 8).map(drop)),
+            ),
+            (
+                "last_all_stamped",
+                Box::new(|c| c.last_all_stamped("/o/>").map(drop)),
+            ),
         ];
         #[cfg(feature = "cap")]
         {
@@ -4173,9 +4748,13 @@ mod owed_acks {
     #[test]
     fn a_subscription_is_refused_while_acks_are_owed() {
         type Subscribe = fn(Client<Recorder>) -> io::Result<super::Subscription<Recorder>>;
-        let verbs: [(&str, Subscribe); 3] = [
+        let verbs: [(&str, Subscribe); 5] = [
             ("subscribe", |c| c.subscribe(0, "/o/>")),
+            ("subscribe_stamped", |c| c.subscribe_stamped(0, "/o/>")),
             ("subscribe_group", |c| c.subscribe_group("g", "/o/>")),
+            ("subscribe_group_stamped", |c| {
+                c.subscribe_group_stamped("g", "/o/>")
+            }),
             ("fork_subscribe", |c| {
                 c.fork_subscribe(0, "/o/a", b"x", "/o/>")
             }),

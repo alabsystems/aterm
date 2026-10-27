@@ -41,6 +41,7 @@ pub(super) struct Hints {
     previous: Option<[u8; 32]>,
     attempt: u64,
     peers: BTreeMap<SocketAddr, Peer>,
+    presence: BTreeMap<[u8; 32], (IpAddr, Instant)>,
     cursor: Option<SocketAddr>,
 }
 impl Hints {
@@ -50,6 +51,7 @@ impl Hints {
             previous: None,
             attempt: 0,
             peers: BTreeMap::new(),
+            presence: BTreeMap::new(),
             cursor: None,
         }
     }
@@ -63,6 +65,45 @@ impl Hints {
         wire.extend_from_slice(&self.own);
         wire.extend_from_slice(&port.to_be_bytes());
         wire
+    }
+    pub(super) fn presence_wire(&self) -> Vec<u8> {
+        let mut wire = b"ACH3".to_vec();
+        wire.extend_from_slice(&self.own);
+        wire
+    }
+    pub(super) fn observe_presence(&mut self, wire: &[u8], source: SocketAddr, now: Instant) {
+        self.presence
+            .retain(|_, (_, seen)| now.saturating_duration_since(*seen) < EXPIRES);
+        if wire.len() != 36 || &wire[..4] != b"ACH3" {
+            return;
+        }
+        let token: [u8; 32] = wire[4..].try_into().unwrap();
+        if token == self.own || self.previous == Some(token) {
+            return;
+        }
+        let IpAddr::V4(ip) = source.ip() else {
+            return;
+        };
+        if ip.octets()[0] == 0 || ip.octets()[0] >= 224 || ip.is_broadcast() {
+            return;
+        }
+        if let Some((address, seen)) = self.presence.get_mut(&token) {
+            if *address == source.ip() {
+                *seen = now;
+            }
+            return;
+        }
+        if self.presence.len() >= MAX_PEERS
+            || self
+                .presence
+                .values()
+                .filter(|(ip, _)| *ip == source.ip())
+                .count()
+                >= PER_IP
+        {
+            return;
+        }
+        self.presence.insert(token, (source.ip(), now));
     }
     fn expire(&mut self, now: Instant) {
         self.peers.retain(|_, p| {
@@ -151,6 +192,17 @@ impl Hints {
     }
     pub(super) fn count(&self) -> usize {
         self.peers.len()
+    }
+    pub(super) fn unverified_count(&self) -> usize {
+        self.peers.values().filter(|peer| !peer.verified).count() + self.presence.len()
+    }
+    pub(super) fn expire_listen_only(&mut self, now: Instant) {
+        self.peers
+            .retain(|_, peer| now.saturating_duration_since(peer.seen) < EXPIRES);
+    }
+    pub(super) fn expire_presence(&mut self, now: Instant) {
+        self.presence
+            .retain(|_, (_, seen)| now.saturating_duration_since(*seen) < EXPIRES);
     }
     pub(super) fn next(&mut self, now: Instant) -> Option<(SocketAddr, Repair)> {
         self.expire(now);

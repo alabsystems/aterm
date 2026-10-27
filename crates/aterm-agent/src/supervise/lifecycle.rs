@@ -188,12 +188,25 @@ impl<C: Ctl> Session<'_, C> {
             if self.stopped() || self.fx.mono() >= deadline {
                 return Ok(());
             }
-            let step = deadline
-                .saturating_duration_since(self.fx.mono())
-                .min(OFF_STEP);
-            match self.wait(&["seq", &seq.to_string()], step)? {
+            let now = self.fx.mono();
+            let step = deadline.saturating_duration_since(now).min(OFF_STEP);
+            let step = self
+                .word_at
+                .map_or(step, |at| step.min(at.saturating_duration_since(now)));
+            let waited = if step.is_zero() {
+                Wait::TimedOut
+            } else {
+                self.park(&["seq", &seq.to_string()], step, true)?
+            };
+            match waited {
+                Wait::Word(word) => {
+                    self.word_moved(seq, word, review);
+                    continue;
+                }
                 Wait::Latched => {
-                    self.wait(&["idle", IDLE_MS], step)?;
+                    if let Wait::Word(word) = self.park(&["idle", IDLE_MS], step, true)? {
+                        self.word_moved(seq, word, review);
+                    }
                     let screen = self.screen()?;
                     match self.reader(&screen.rows).phase(&screen.rows) {
                         Phase::Busy => self.badge_parked = None,
@@ -212,8 +225,12 @@ impl<C: Ctl> Session<'_, C> {
                     ));
                 }
             }
+            if self.word_at.is_some_and(|at| self.fx.mono() < at) {
+                continue;
+            }
             self.autopilot.begin();
             let now = self.autopilot_read(opts)?;
+            self.word_at = None;
             if now != Autopilot::Off {
                 review.note(&format!(
                     "UNPARKED seq={seq} autopilot={} after {} ms",

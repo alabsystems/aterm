@@ -871,23 +871,40 @@ pub struct Hog {
     /// The checkout or workspace whose builds it holds, where its origin says one: a session
     /// working under it is the one to ask to free it ([`ask`]).
     pub serves: Option<PathBuf>,
+    /// Seconds from the newest write into any of its profiles ([`target::Profile::last_used`])
+    /// to the report: a build that stopped hours ago reads apart from one writing now. `None`
+    /// where no profile tells.
+    pub built_s_ago: Option<i64>,
 }
 
 impl Hog {
-    /// The line a person reads: `$HOME/trust/build 94.0 GiB (x.py bootstrap; run scripts/slim_build.py)`.
+    /// The line a person reads: `$HOME/trust/build 94.0 GiB, last built 10h ago (x.py bootstrap;
+    /// run scripts/slim_build.py)`.
     #[must_use]
     pub fn line(&self, home: Option<&Path>) -> String {
-        self.line_at(&display_home(&self.path, home))
+        self.line_at(&display_home(&self.path, home), true)
     }
 
-    /// [`Self::line`] in at most `chars` characters, for a place that clips at the end.
+    /// [`Self::line`] in at most `chars` characters, for a place that clips at the end: the path
+    /// shortens first, then the line drops when it was last built, and only then is its end cut,
+    /// so what frees it is the last thing lost.
     #[must_use]
     pub fn line_within(&self, home: Option<&Path>, chars: usize) -> String {
+        match self.fit(home, chars, true) {
+            (line, true) => line,
+            _ if self.built_s_ago.is_some() => self.fit(home, chars, false).0,
+            (line, false) => line,
+        }
+    }
+
+    /// The line in at most `chars` characters, with when it was last built where `built`, and
+    /// whether it fit with no end cut.
+    fn fit(&self, home: Option<&Path>, chars: usize, built: bool) -> (String, bool) {
         let full: Vec<char> = display_home(&self.path, home).chars().collect();
-        let mut line = self.line_at(&full.iter().collect::<String>());
+        let mut line = self.line_at(&full.iter().collect::<String>(), built);
         let over = line.chars().count().saturating_sub(chars);
         if over == 0 {
-            return line;
+            return (line, true);
         }
         let keep = full.len().saturating_sub(over + 1).max(HOG_PATH_MIN);
         if keep + 1 < full.len() {
@@ -897,20 +914,25 @@ impl Hog {
                 .chain(std::iter::once(&'…'))
                 .chain(&full[full.len() - (keep - head)..])
                 .collect();
-            line = self.line_at(&at);
+            line = self.line_at(&at, built);
         }
         if line.chars().count() > chars {
             line = line.chars().take(chars.saturating_sub(1)).collect();
             line.push('…');
+            return (line, false);
         }
-        line
+        (line, true)
     }
 
-    fn line_at(&self, at: &str) -> String {
+    fn line_at(&self, at: &str, built: bool) -> String {
         format!(
-            "{at} {}{} ({})",
+            "{at} {}{}{} ({})",
             human_bytes(self.bytes),
             if self.bytes_partial { "+" } else { "" },
+            self.built_s_ago
+                .filter(|_| built)
+                .map(|s| format!(", last built {} ago", target::human_age(s)))
+                .unwrap_or_default(),
             shown(&self.why)
         )
     }
@@ -1068,6 +1090,7 @@ impl Report {
                         r.insert("path".to_owned(), Value::from(path_text(&h.path)));
                         r.insert("bytes".to_owned(), Value::from(h.bytes));
                         r.insert("bytes_partial".to_owned(), Value::from(h.bytes_partial));
+                        r.insert("built_s_ago".to_owned(), Value::from(h.built_s_ago));
                         r.insert(
                             "why".to_owned(),
                             Value::from(truncate_bytes(&h.why, ROW_TEXT_CAP).to_owned()),
@@ -1554,9 +1577,14 @@ fn hogs(
             bytes_partial: false,
             why,
             serves: serves_of(&t.origin, &t.path),
+            built_s_ago: None,
         });
         h.bytes = h.bytes.saturating_add(left);
         h.bytes_partial |= partial;
+        if let Some(newest) = t.profiles.iter().filter_map(|p| p.last_used).max() {
+            let ago = survey.now.saturating_sub(newest).max(0);
+            h.built_s_ago = Some(h.built_s_ago.map_or(ago, |held| held.min(ago)));
+        }
     }
     let mut out: Vec<Hog> = by.into_values().collect();
     out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
@@ -2439,6 +2467,13 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
              held its locks",
             span(idle)
         ),
+        Unused::Moved { idle, after } => format!(
+            "it is in the root the cache moved from when it went under .ubd, out of fseventsd's \
+             stream, which no build of this version writes, and nothing wrote it for {} (the \
+             sweep takes one unwritten {}); no build held its locks",
+            span(idle),
+            span(after)
+        ),
         Unused::Unfinished => {
             "an earlier sweep renamed it aside and did not finish removing it".to_owned()
         }
@@ -2473,6 +2508,7 @@ pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
     match why {
         Unused::Gone { .. } => "its workspace is gone".to_owned(),
         Unused::Idle { idle } => format!("unwritten {}", sweep_span(idle)),
+        Unused::Moved { idle, .. } => format!("in the old root, unwritten {}", sweep_span(idle)),
         Unused::Unfinished => "left half-removed by an earlier sweep".to_owned(),
         Unused::Tooling { idle, .. } => format!("a tool unused {}", sweep_span(idle)),
         Unused::GivenUp => "a failed provisioning run's scratch".to_owned(),

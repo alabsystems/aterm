@@ -97,61 +97,41 @@ fn sprites(win: &WindowGpu) -> [&SpriteTex; 1] {
 }
 
 struct Handles {
-    #[cfg(wgpu_arm)]
-    wgpu: [wgpu::BindGroup; 2],
     #[cfg(target_os = "macos")]
     metal: Vec<crate::metal::resources::SealedTexture>,
 }
 
 impl Handles {
-    fn capture(win: &WindowGpu, native: bool) -> Self {
-        let _ = native;
+    fn capture(win: &WindowGpu) -> Self {
         Self {
-            #[cfg(wgpu_arm)]
-            wgpu: {
-                let s = sprites(win);
-                [
-                    s[0].bind.clone(),
-                    win.image_plane.as_ref().unwrap().bind.clone(),
-                ]
-            },
             #[cfg(target_os = "macos")]
-            metal: if native {
-                sprites(win)
-                    .into_iter()
-                    .map(|s| {
-                        s.metal_atlas
-                            .get()
-                            .expect("native sprite upload")
-                            .tex
-                            .metal()
-                            .clone_handle()
-                    })
-                    .chain(std::iter::once(
-                        win.image_plane
-                            .as_ref()
-                            .unwrap()
-                            .metal_atlas
-                            .as_ref()
-                            .expect("native image upload")
-                            .tex
-                            .metal()
-                            .clone_handle(),
-                    ))
-                    .collect()
-            } else {
-                Vec::new()
-            },
+            metal: sprites(win)
+                .into_iter()
+                .map(|s| {
+                    s.metal_atlas
+                        .get()
+                        .expect("native sprite upload")
+                        .tex
+                        .metal()
+                        .clone_handle()
+                })
+                .chain(std::iter::once(
+                    win.image_plane
+                        .as_ref()
+                        .unwrap()
+                        .metal_atlas
+                        .as_ref()
+                        .expect("native image upload")
+                        .tex
+                        .metal()
+                        .clone_handle(),
+                ))
+                .collect(),
         }
     }
 
-    fn assert_retained(&self, win: &WindowGpu, native: bool) {
-        let actual = Self::capture(win, native);
-        #[cfg(wgpu_arm)]
-        assert_eq!(
-            self.wgpu, actual.wgpu,
-            "wgpu must reuse every window-owned atlas"
-        );
+    fn assert_retained(&self, win: &WindowGpu) {
+        let actual = Self::capture(win);
         #[cfg(target_os = "macos")]
         assert_eq!(
             self.metal.iter().map(|t| t.obj().id()).collect::<Vec<_>>(),
@@ -178,13 +158,9 @@ fn observed(model_state: &State, windows: &[WindowGpu; 2]) -> State {
     state
 }
 
-fn run_ownership_replay(native: bool) {
+fn run_ownership_replay() {
     let mut gpu =
         crate::renderer::gpu_renderer_for_test(None, 18.0, aterm_render::Theme::default());
-    #[cfg(target_os = "macos")]
-    if !native {
-        gpu.disarm_metal_for_test();
-    }
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     let mut windows = [WindowGpu::new(), WindowGpu::new()];
@@ -210,10 +186,7 @@ fn run_ownership_replay(native: bool) {
             .try_render_input(&mut windows[idx], &inputs[idx], None)
             .unwrap();
         #[cfg(target_os = "macos")]
-        assert_eq!(
-            gpu.last_frame_arm_metal, native,
-            "exercise the requested backend"
-        );
+        assert!(gpu.last_frame_arm_metal, "exercise the Metal arm");
         let actual = observed(&state, &windows);
         assert_eq!(actual, state);
         assert!(aterm_spec::interp::admits(&model, &prior, &actual).is_some());
@@ -222,8 +195,8 @@ fn run_ownership_replay(native: bool) {
             None => pixels[idx] = Some(frame.pixels),
         }
         match &handles[idx] {
-            Some(first) => first.assert_retained(&windows[idx], native),
-            None => handles[idx] = Some(Handles::capture(&windows[idx], native)),
+            Some(first) => first.assert_retained(&windows[idx]),
+            None => handles[idx] = Some(Handles::capture(&windows[idx])),
         }
     }
     assert_ne!(
@@ -246,10 +219,7 @@ fn run_ownership_replay(native: bool) {
     assert!(model.fire("PaintA2", &mut state));
     assert_eq!(observed(&state, &windows), state);
     assert!(aterm_spec::interp::admits(&model, &prior, &state).is_some());
-    handles[1]
-        .as_ref()
-        .unwrap()
-        .assert_retained(&windows[1], native);
+    handles[1].as_ref().unwrap().assert_retained(&windows[1]);
     drop(handles);
     drop(inputs);
     assert!(
@@ -295,28 +265,19 @@ fn run_ownership_replay(native: bool) {
         assert!(aterm_spec::interp::admits(&model, &prior, &state).is_some());
         assert!(source.upgrade().is_none());
     }
-    #[cfg(target_os = "macos")]
-    if native {
-        let live = gpu.metal_arm.as_mut().unwrap().live_mut();
-        for atlas in [super::DrawAtlas::Wallpaper, super::DrawAtlas::Image] {
-            assert!(
-                live.atlases[atlas as usize].is_none(),
-                "window artwork must not be retained in shared renderer slots"
-            );
-        }
+    let live = gpu.metal_arm.as_mut().unwrap().live_mut();
+    for atlas in [super::DrawAtlas::Wallpaper, super::DrawAtlas::Image] {
+        assert!(
+            live.atlases[atlas as usize].is_none(),
+            "window artwork must not be retained in shared renderer slots"
+        );
     }
-}
-
-#[test]
-#[cfg(wgpu_arm)]
-fn window_atlas_wgpu_reuses_distinct_artwork_and_releases_closed_windows() {
-    run_ownership_replay(false);
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn window_atlas_metal_reuses_distinct_artwork_and_releases_closed_windows() {
-    run_ownership_replay(true);
+    run_ownership_replay();
 }
 
 fn sharing_model() -> Model {
@@ -386,13 +347,9 @@ fn shared_observation(model_state: &State, windows: &[WindowGpu; 2]) -> State {
     state
 }
 
-fn run_sharing_replay(native: bool) {
+fn run_sharing_replay() {
     let mut gpu =
         crate::renderer::gpu_renderer_for_test(None, 18.0, aterm_render::Theme::default());
-    #[cfg(target_os = "macos")]
-    if !native {
-        gpu.disarm_metal_for_test();
-    }
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     let mut windows = [WindowGpu::new(), WindowGpu::new()];
@@ -422,27 +379,17 @@ fn run_sharing_replay(native: bool) {
                 let frame = gpu
                     .try_render_input(&mut windows[owner], &inputs[source], None)
                     .unwrap();
-                #[cfg(target_os = "macos")]
-                assert_eq!(gpu.last_frame_arm_metal, native);
+                assert!(gpu.last_frame_arm_metal);
                 match &pixels[source] {
                     Some(expected) => assert_eq!(&frame.pixels, expected),
                     None => pixels[source] = Some(frame.pixels),
                 }
-                let handles = Handles::capture(&windows[owner], native);
-                #[cfg(wgpu_arm)]
+                let handles = Handles::capture(&windows[owner]);
                 assert!(
-                    handles.wgpu[..1]
+                    handles.metal[..1]
                         .iter()
-                        .all(|bind| *bind == handles.wgpu[0])
+                        .all(|tex| tex.obj().id() == handles.metal[0].obj().id())
                 );
-                #[cfg(target_os = "macos")]
-                if native {
-                    assert!(
-                        handles.metal[..1]
-                            .iter()
-                            .all(|tex| tex.obj().id() == handles.metal[0].obj().id())
-                    );
-                }
                 match first_upload.as_ref() {
                     None => {
                         first_upload = Some(Arc::downgrade(
@@ -452,8 +399,6 @@ fn run_sharing_replay(native: bool) {
                     }
                     Some(upload) if source == 0 && upload.upgrade().is_some() => {
                         let first = first_handles.as_ref().unwrap();
-                        #[cfg(wgpu_arm)]
-                        assert_eq!(first.wgpu[..1], handles.wgpu[..1]);
                         #[cfg(target_os = "macos")]
                         assert_eq!(
                             first
@@ -545,14 +490,8 @@ fn run_sharing_replay(native: bool) {
     assert!(gpu.sprite_textures.recent.is_empty());
 }
 
-#[test]
-#[cfg(wgpu_arm)]
-fn window_atlas_wgpu_shares_sources_and_releases_the_last_owner() {
-    run_sharing_replay(false);
-}
-
 #[cfg(target_os = "macos")]
 #[test]
 fn window_atlas_metal_shares_sources_and_releases_the_last_owner() {
-    run_sharing_replay(true);
+    run_sharing_replay();
 }

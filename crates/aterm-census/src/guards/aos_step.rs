@@ -10,6 +10,7 @@ use super::{Bound, Finding, Rule, Tree, hits};
 
 const AOS_STEP: &[&str] = &[
     "crates/aterm-aos/src/",
+    "crates/aterm-aos-pane/src/",
     "crates/aterm-effects/src/aos_momentum",
     "crates/aterm-effects/src/cursor_momentum",
     "crates/aterm-effects/src/cursor_glow",
@@ -131,12 +132,13 @@ pub(super) const AOS_STEP_CLOCK: Rule = Rule {
     id: "aos-step-clock",
     why: "an Aos task is replayed from a checkpoint over its recorded inputs \
           (docs/DESIGN-aos-hosted-execution-2026-10-21.md, M0-14), so a clock read, a sleep or a \
-          random draw in the step code (crates/aterm-aos/src, and aterm-effects' aos_momentum \
-          and cursor_momentum with the helpers their step calls: cursor_glow, effect_util, \
-          color_math and rainbow_kitty/ribbon) is an input no log holds and a replay answers \
-          it from the real clock or a fresh seed: take the time from the recorded input (a \
-          signed offset from the attach epoch) or from the caller's `now`, draw no randomness, \
-          and key maps deterministically (a `BTreeMap`, never a `RandomState`-keyed map)",
+          random draw in the step code (crates/aterm-aos/src, crates/aterm-aos-pane/src, and \
+          aterm-effects' aos_momentum and cursor_momentum with the helpers their step calls: \
+          cursor_glow, effect_util, color_math and rainbow_kitty/ribbon) is an input no log \
+          holds and a replay answers it from the real clock or a fresh seed: take the time \
+          from the recorded input (a signed offset from the attach epoch) or from the caller's \
+          `now`, draw no randomness, and key maps deterministically (a `BTreeMap`, never a \
+          `RandomState`-keyed map)",
     scope: AOS_STEP,
     check: aos_step_clock,
 };

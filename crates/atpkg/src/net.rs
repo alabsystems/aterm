@@ -641,6 +641,8 @@ pub struct GithubFetcher {
     /// Per-invocation memo of the raw `(pkg-<program>-<build>.toml, .sig)` bytes, keyed by
     /// `(slug, program, build)`.
     manifests: ManifestMemo,
+    /// The LAN peers an archive download races (`[packages] peers`, [`crate::peers::race`]).
+    unit_peers: Vec<String>,
 }
 
 impl GithubFetcher {
@@ -656,7 +658,16 @@ impl GithubFetcher {
             link_down: std::sync::atomic::AtomicBool::new(false),
             walk_cost: Default::default(),
             manifests: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            unit_peers: Vec::new(),
         }
+    }
+
+    /// Race each archive download against `peers`, LAN peers that may hold its unit
+    /// ([`crate::peers::race`]).
+    #[must_use]
+    pub fn with_unit_peers(mut self, peers: Vec<String>) -> Self {
+        self.unit_peers = peers;
+        self
     }
 
     /// Attach the per-program `owner/repo` fetch overrides.
@@ -897,6 +908,30 @@ impl crate::flow::Fetcher for GithubFetcher {
         let slug = self.slug_for(program, repo);
         let url = direct_asset_url(&slug, asset).ok_or_else(|| underivable(&slug, asset))?;
         web_fetch_to(&url, dest, artifact_cap(cap))
+    }
+
+    fn download_unit(
+        &self,
+        program: &str,
+        repo: &str,
+        artifact: &crate::manifest::Artifact,
+        dest: &Path,
+    ) -> Result<(), String> {
+        let slug = self.slug_for(program, repo);
+        let url = direct_asset_url(&slug, &artifact.asset)
+            .ok_or_else(|| underivable(&slug, &artifact.asset))?;
+        let cap = artifact_cap(artifact.size);
+        if self.unit_peers.is_empty() {
+            return web_fetch_to(&url, dest, cap);
+        }
+        refuse_api_host(&url)?;
+        crate::peers::race(
+            &self.unit_peers,
+            &artifact.sha256,
+            artifact.size,
+            dest,
+            |dest, stop| aterm_update_core::download_to_resumable_until(&url, dest, cap, stop),
+        )
     }
 
     fn download_url(&self, url: &str, dest: &Path, cap: u64) -> Result<(), String> {

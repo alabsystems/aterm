@@ -3,6 +3,8 @@
 
 //! Glyph codegen.
 
+use core::fmt::Write;
+
 use aterm_scene::vector::{FIXED_ONE, PathCmd};
 
 const INCLUDED_KINDS: &[&str] = &["head", "special", "accessory"];
@@ -95,12 +97,48 @@ pub fn generate_animal_from_assets(assets: &[(String, String)]) -> Result<String
     Ok(emit_animal_roster(&load_glyphs(assets)?))
 }
 
+#[inline]
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    if ab.len() != bb.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < ab.len() {
+        if ab[i] != bb[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[inline]
+const fn included_kind_rank(kind_str: &str) -> Option<usize> {
+    let mut i = 0;
+    while i < INCLUDED_KINDS.len() {
+        if str_eq(INCLUDED_KINDS[i], kind_str) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 fn load_glyphs(assets: &[(String, String)]) -> Result<Vec<Glyph>, String> {
-    let mut files: Vec<&(String, String)> = assets.iter().collect();
+    let mut files: Vec<&(String, String)> = Vec::with_capacity(assets.len());
+    let mut ai = 0;
+    while ai < assets.len() {
+        files.push(&assets[ai]);
+        ai += 1;
+    }
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut glyphs: Vec<Glyph> = Vec::new();
-    for (name, text) in files {
+    let mut fi = 0;
+    while fi < files.len() {
+        let (name, text) = files[fi];
+        fi += 1;
         let doc: aterm_toml::Value = text.parse().map_err(|e| format!("parse {name}: {e}"))?;
         if let Some(g) = glyph_from_doc(&doc, name)? {
             glyphs.push(g);
@@ -110,8 +148,11 @@ fn load_glyphs(assets: &[(String, String)]) -> Result<Vec<Glyph>, String> {
     glyphs.sort_by(|a, b| a.kind_rank.cmp(&b.kind_rank).then_with(|| a.id.cmp(&b.id)));
 
     let mut seen = std::collections::BTreeSet::new();
-    for g in &glyphs {
-        if !seen.insert(g.variant.clone()) {
+    let mut gi = 0;
+    while gi < glyphs.len() {
+        let g = &glyphs[gi];
+        gi += 1;
+        if !seen.insert(g.variant.as_str()) {
             return Err(format!(
                 "variant-name collision: `{}` derived from id `{}` twice",
                 g.variant, g.id
@@ -122,98 +163,132 @@ fn load_glyphs(assets: &[(String, String)]) -> Result<Vec<Glyph>, String> {
     Ok(glyphs)
 }
 
+#[inline]
+fn anchor_frac(anchor: &aterm_toml::Value, name: &str, key: &str) -> Result<u16, String> {
+    let Some(v) = anchor.get(key) else {
+        return Err(format!("{name}: anchor missing `{key}`"));
+    };
+    Ok(quant_frac(num(v)))
+}
+
 fn glyph_from_doc(doc: &aterm_toml::Value, name: &str) -> Result<Option<Glyph>, String> {
-    if doc.get("excluded").and_then(aterm_toml::Value::as_bool) == Some(true) {
+    if let Some(v) = doc.get("excluded")
+        && v.as_bool() == Some(true)
+    {
         return Ok(None);
     }
-    let id = doc
-        .get("id")
-        .and_then(aterm_toml::Value::as_str)
-        .ok_or_else(|| format!("{name}: missing `id`"))?
-        .to_string();
-    let kind_str = doc
-        .get("kind")
-        .and_then(aterm_toml::Value::as_str)
-        .ok_or_else(|| format!("{name}: missing `kind`"))?;
-    let Some(kind_rank) = INCLUDED_KINDS.iter().position(|k| *k == kind_str) else {
+    let Some(id_val) = doc.get("id") else {
+        return Err(format!("{name}: missing `id`"));
+    };
+    let Some(id_str) = id_val.as_str() else {
+        return Err(format!("{name}: missing `id`"));
+    };
+    let id = id_str.to_string();
+    let Some(kind_val) = doc.get("kind") else {
+        return Err(format!("{name}: missing `kind`"));
+    };
+    let Some(kind_str) = kind_val.as_str() else {
+        return Err(format!("{name}: missing `kind`"));
+    };
+    let Some(kind_rank) = included_kind_rank(kind_str) else {
         return Ok(None);
     };
     reject_unknown_keys(doc, GLYPH_KEYS, name, "glyph")?;
-    let kind = lookup(KIND_VOCAB, kind_str)
-        .ok_or_else(|| format!("{name}: kind `{kind_str}` not in KIND_VOCAB"))?;
+    let Some(kind) = lookup(KIND_VOCAB, kind_str) else {
+        return Err(format!("{name}: kind `{kind_str}` not in KIND_VOCAB"));
+    };
 
-    let vb = doc
-        .get("viewbox")
-        .and_then(aterm_toml::Value::as_array)
-        .filter(|a| a.len() == 2)
-        .ok_or_else(|| format!("{name}: missing `viewbox = [w, h]`"))?;
+    let Some(vb_val) = doc.get("viewbox") else {
+        return Err(format!("{name}: missing `viewbox = [w, h]`"));
+    };
+    let Some(vb) = vb_val.as_array() else {
+        return Err(format!("{name}: missing `viewbox = [w, h]`"));
+    };
+    if vb.len() != 2 {
+        return Err(format!("{name}: missing `viewbox = [w, h]`"));
+    }
     let (vw, vh) = (num(&vb[0]), num(&vb[1]));
     if !vw.is_finite() || !vh.is_finite() || vw <= 0.0 || vh <= 0.0 {
         return Err(format!("{name}: degenerate viewbox [{vw}, {vh}]"));
     }
 
-    let anchor = doc
-        .get("anchor")
-        .ok_or_else(|| format!("{name}: missing `anchor`"))?;
-    reject_unknown_keys(anchor, ANCHOR_KEYS, name, "anchor")?;
-    let anchor_frac = |key: &str| -> Result<u16, String> {
-        let f = anchor
-            .get(key)
-            .map(num)
-            .ok_or_else(|| format!("{name}: anchor missing `{key}`"))?;
-        Ok(quant_frac(f))
+    let Some(anchor) = doc.get("anchor") else {
+        return Err(format!("{name}: missing `anchor`"));
     };
-    let eye_y = anchor_frac("eye_y")?;
-    let center_x = anchor_frac("center_x")?;
-    let word_top = anchor_frac("word_top")?;
+    reject_unknown_keys(anchor, ANCHOR_KEYS, name, "anchor")?;
+    let eye_y = anchor_frac(anchor, name, "eye_y")?;
+    let center_x = anchor_frac(anchor, name, "center_x")?;
+    let word_top = anchor_frac(anchor, name, "word_top")?;
 
     let mut layers = Vec::new();
-    for (li, layer) in doc
-        .get("layer")
-        .and_then(aterm_toml::Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-        .iter()
-        .enumerate()
-    {
-        reject_unknown_keys(layer, LAYER_KEYS, name, &format!("layer {li}"))?;
-        let role_str = layer
-            .get("role")
-            .and_then(aterm_toml::Value::as_str)
-            .ok_or_else(|| format!("{name}: layer {li} missing `role`"))?;
-        let role = lookup(ROLE_VOCAB, role_str)
-            .ok_or_else(|| format!("{name}: layer {li} role `{role_str}` not in ROLE_VOCAB"))?;
-        let recolor_str = layer
-            .get("recolor")
-            .and_then(aterm_toml::Value::as_str)
-            .ok_or_else(|| format!("{name}: layer {li} missing `recolor`"))?;
-        let recolor = lookup(RECOLOR_VOCAB, recolor_str).ok_or_else(|| {
-            format!("{name}: layer {li} recolor `{recolor_str}` not in RECOLOR_VOCAB")
-        })?;
-        let fill = layer
-            .get("ref_fill")
-            .and_then(aterm_toml::Value::as_str)
-            .and_then(parse_hex_rgb)
-            .ok_or_else(|| format!("{name}: layer {li} missing/invalid `ref_fill`"))?;
+    let raw_layers: &[aterm_toml::Value] = match doc.get("layer") {
+        Some(v) => match v.as_array() {
+            Some(arr) => arr.as_slice(),
+            None => &[],
+        },
+        None => &[],
+    };
+    let mut li = 0;
+    while li < raw_layers.len() {
+        let layer = &raw_layers[li];
+        reject_unknown_keys(layer, LAYER_KEYS, name, format_args!("layer {li}"))?;
+        let Some(role_val) = layer.get("role") else {
+            return Err(format!("{name}: layer {li} missing `role`"));
+        };
+        let Some(role_str) = role_val.as_str() else {
+            return Err(format!("{name}: layer {li} missing `role`"));
+        };
+        let Some(role) = lookup(ROLE_VOCAB, role_str) else {
+            return Err(format!(
+                "{name}: layer {li} role `{role_str}` not in ROLE_VOCAB"
+            ));
+        };
+        let Some(recolor_val) = layer.get("recolor") else {
+            return Err(format!("{name}: layer {li} missing `recolor`"));
+        };
+        let Some(recolor_str) = recolor_val.as_str() else {
+            return Err(format!("{name}: layer {li} missing `recolor`"));
+        };
+        let Some(recolor) = lookup(RECOLOR_VOCAB, recolor_str) else {
+            return Err(format!(
+                "{name}: layer {li} recolor `{recolor_str}` not in RECOLOR_VOCAB"
+            ));
+        };
+        let fill = match layer.get("ref_fill") {
+            Some(v) => match v.as_str() {
+                Some(s) => match parse_hex_rgb(s) {
+                    Some(rgb) => rgb,
+                    None => return Err(format!("{name}: layer {li} missing/invalid `ref_fill`")),
+                },
+                None => return Err(format!("{name}: layer {li} missing/invalid `ref_fill`")),
+            },
+            None => return Err(format!("{name}: layer {li} missing/invalid `ref_fill`")),
+        };
 
         let mut paths = Vec::new();
-        for (pi, p) in layer
-            .get("paths")
-            .and_then(aterm_toml::Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-            .iter()
-            .enumerate()
-        {
-            let d = p
-                .as_str()
-                .ok_or_else(|| format!("{name}: layer {li} path {pi} is not a string"))?;
-            let cmds = aterm_scene::vector::parse_path(d)
-                .ok_or_else(|| format!("{name}: layer {li} path {pi} unparseable `d`-string"))?;
+        let raw_paths: &[aterm_toml::Value] = match layer.get("paths") {
+            Some(v) => match v.as_array() {
+                Some(arr) => arr.as_slice(),
+                None => &[],
+            },
+            None => &[],
+        };
+        let mut pi = 0;
+        while pi < raw_paths.len() {
+            let p = &raw_paths[pi];
+            let Some(d) = p.as_str() else {
+                return Err(format!("{name}: layer {li} path {pi} is not a string"));
+            };
+            let Some(cmds) = aterm_scene::vector::parse_path(d) else {
+                return Err(format!(
+                    "{name}: layer {li} path {pi} unparseable `d`-string"
+                ));
+            };
             let segs = quantize_path(&cmds, vw, vh);
             if !segs.is_empty() {
                 paths.push(segs);
             }
+            pi += 1;
         }
         if !paths.is_empty() {
             layers.push(Layer {
@@ -223,6 +298,7 @@ fn glyph_from_doc(doc: &aterm_toml::Value, name: &str) -> Result<Option<Glyph>, 
                 paths,
             });
         }
+        li += 1;
     }
 
     Ok(Some(Glyph {
@@ -242,51 +318,67 @@ fn reject_unknown_keys(
     value: &aterm_toml::Value,
     allowed: &[&str],
     name: &str,
-    scope: &str,
+    scope: impl core::fmt::Display,
 ) -> Result<(), String> {
-    let table = value
-        .as_table()
-        .ok_or_else(|| format!("{name}: {scope} must be a table"))?;
-    if let Some(key) = table.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!(
-            "{name}: unsupported {scope} key `{key}`; cat glyphs are path-only"
-        ));
+    let Some(table) = value.as_table() else {
+        return Err(format!("{name}: {scope} must be a table"));
+    };
+    for key in table.keys() {
+        let ks = key.as_str();
+        let mut ok = false;
+        let mut ai = 0;
+        while ai < allowed.len() {
+            if str_eq(allowed[ai], ks) {
+                ok = true;
+                break;
+            }
+            ai += 1;
+        }
+        if !ok {
+            return Err(format!(
+                "{name}: unsupported {scope} key `{key}`; cat glyphs are path-only"
+            ));
+        }
     }
     Ok(())
 }
 
 fn quantize_path(cmds: &[PathCmd], vw: f32, vh: f32) -> Vec<String> {
-    let qx = |v: f32| quant(v, vw);
-    let qy = |v: f32| quant(v, vh);
-    cmds.iter()
-        .map(|c| match *c {
-            PathCmd::Move(x, y) => format!("PathSeg::Move({},{})", qx(x), qy(y)),
-            PathCmd::Line(x, y) => format!("PathSeg::Line({},{})", qx(x), qy(y)),
+    let mut out = Vec::with_capacity(cmds.len());
+    let mut i = 0;
+    while i < cmds.len() {
+        let seg = match cmds[i] {
+            PathCmd::Move(x, y) => format!("PathSeg::Move({},{})", quant(x, vw), quant(y, vh)),
+            PathCmd::Line(x, y) => format!("PathSeg::Line({},{})", quant(x, vw), quant(y, vh)),
             PathCmd::Cubic(x1, y1, x2, y2, x, y) => format!(
                 "PathSeg::Cubic({},{},{},{},{},{})",
-                qx(x1),
-                qy(y1),
-                qx(x2),
-                qy(y2),
-                qx(x),
-                qy(y)
+                quant(x1, vw),
+                quant(y1, vh),
+                quant(x2, vw),
+                quant(y2, vh),
+                quant(x, vw),
+                quant(y, vh)
             ),
             PathCmd::Close => "PathSeg::Close".to_string(),
-        })
-        .collect()
+        };
+        out.push(seg);
+        i += 1;
+    }
+    out
 }
 
-fn quant(v: f32, extent: f32) -> u16 {
-    let q = (v / extent * f32::from(FIXED_ONE)).round();
-    q.clamp(0.0, f32::from(FIXED_ONE)) as u16
+#[inline]
+const fn quant(v: f32, extent: f32) -> u16 {
+    let q = (v / extent * FIXED_ONE as f32).round();
+    q.clamp(0.0, FIXED_ONE as f32) as u16
 }
 
-fn quant_frac(f: f32) -> u16 {
-    (f * f32::from(FIXED_ONE))
-        .round()
-        .clamp(0.0, f32::from(FIXED_ONE)) as u16
+#[inline]
+const fn quant_frac(f: f32) -> u16 {
+    (f * FIXED_ONE as f32).round().clamp(0.0, FIXED_ONE as f32) as u16
 }
 
+#[inline]
 fn variant_name(id: &str) -> String {
     let mut out = String::with_capacity(id.len());
     let mut cap = true;
@@ -305,40 +397,129 @@ fn variant_name(id: &str) -> String {
     out
 }
 
-fn lookup(vocab: &[(&str, &'static str)], key: &str) -> Option<&'static str> {
-    vocab.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+#[inline]
+const fn lookup(vocab: &[(&str, &'static str)], key: &str) -> Option<&'static str> {
+    let mut i = 0;
+    while i < vocab.len() {
+        if str_eq(vocab[i].0, key) {
+            return Some(vocab[i].1);
+        }
+        i += 1;
+    }
+    None
 }
 
-fn parse_hex_rgb(s: &str) -> Option<u32> {
-    let h = s.strip_prefix('#')?;
-    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+#[inline]
+const fn parse_hex_rgb(s: &str) -> Option<u32> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 7 || bytes[0] != b'#' {
         return None;
     }
-    u32::from_str_radix(h, 16).ok()
+    let mut out = 0u32;
+    let mut i = 1;
+    while i < 7 {
+        let d = match bytes[i] {
+            b'0'..=b'9' => bytes[i] - b'0',
+            b'a'..=b'f' => bytes[i] - b'a' + 10,
+            b'A'..=b'F' => bytes[i] - b'A' + 10,
+            _ => return None,
+        };
+        out = (out << 4) | (d as u32);
+        i += 1;
+    }
+    Some(out)
 }
 
+#[inline]
 fn num(v: &aterm_toml::Value) -> f32 {
-    v.as_float()
-        .map(|f| f as f32)
-        .or_else(|| v.as_integer().map(|i| i as f32))
-        .unwrap_or(0.0)
+    if let Some(f) = v.as_float() {
+        f as f32
+    } else if let Some(i) = v.as_integer() {
+        i as f32
+    } else {
+        0.0
+    }
+}
+
+fn present_roles(glyphs: &[Glyph]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut vi = 0;
+    while vi < ROLE_VOCAB.len() {
+        let v = ROLE_VOCAB[vi].1;
+        vi += 1;
+        let mut found = false;
+        let mut gi = 0;
+        while gi < glyphs.len() && !found {
+            let layers = glyphs[gi].layers.as_slice();
+            gi += 1;
+            let mut li = 0;
+            while li < layers.len() {
+                if str_eq(layers[li].role, v) {
+                    found = true;
+                    break;
+                }
+                li += 1;
+            }
+        }
+        if found {
+            out.push(v);
+        }
+    }
+    out
+}
+
+fn present_recolors(glyphs: &[Glyph]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut vi = 0;
+    while vi < RECOLOR_VOCAB.len() {
+        let v = RECOLOR_VOCAB[vi].1;
+        vi += 1;
+        let mut found = false;
+        let mut gi = 0;
+        while gi < glyphs.len() && !found {
+            let layers = glyphs[gi].layers.as_slice();
+            gi += 1;
+            let mut li = 0;
+            while li < layers.len() {
+                if str_eq(layers[li].recolor, v) {
+                    found = true;
+                    break;
+                }
+                li += 1;
+            }
+        }
+        if found {
+            out.push(v);
+        }
+    }
+    out
+}
+
+fn present_kinds(glyphs: &[Glyph]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut vi = 0;
+    while vi < KIND_VOCAB.len() {
+        let v = KIND_VOCAB[vi].1;
+        vi += 1;
+        let mut gi = 0;
+        while gi < glyphs.len() {
+            if str_eq(glyphs[gi].kind, v) {
+                out.push(v);
+                break;
+            }
+            gi += 1;
+        }
+    }
+    out
 }
 
 fn emit(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(HEADER);
 
-    let used_roles = present(
-        ROLE_VOCAB,
-        glyphs.iter().flat_map(|g| g.layers.iter().map(|l| l.role)),
-    );
-    let used_recolors = present(
-        RECOLOR_VOCAB,
-        glyphs
-            .iter()
-            .flat_map(|g| g.layers.iter().map(|l| l.recolor)),
-    );
-    let used_kinds = present(KIND_VOCAB, glyphs.iter().map(|g| g.kind));
+    let used_roles = present_roles(glyphs);
+    let used_recolors = present_recolors(glyphs);
+    let used_kinds = present_kinds(glyphs);
 
     emit_enum(
         &mut s,
@@ -366,17 +547,21 @@ fn emit(glyphs: &[Glyph]) -> String {
     );
     s.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\n");
     s.push_str("pub enum CatGlyphId {\n");
-    for g in glyphs {
+    let mut gi = 0;
+    while gi < glyphs.len() {
         s.push_str("    ");
-        s.push_str(&g.variant);
+        s.push_str(&glyphs[gi].variant);
         s.push_str(",\n");
+        gi += 1;
     }
     s.push_str("}\n\n");
 
     s.push_str("/// Every glyph id in [`GLYPHS`] order. Pair with `GLYPHS[i].id` for stable string lookup.\n");
     s.push_str("pub const GLYPH_IDS: &[CatGlyphId] = &[\n");
-    for g in glyphs {
-        s.push_str(&format!("    CatGlyphId::{},\n", g.variant));
+    let mut gi = 0;
+    while gi < glyphs.len() {
+        let _ = writeln!(s, "    CatGlyphId::{},", glyphs[gi].variant);
+        gi += 1;
     }
     s.push_str("];\n\n");
 
@@ -387,8 +572,12 @@ fn emit(glyphs: &[Glyph]) -> String {
 
     s.push_str("/// The head variants (the roster the genome's `variant` field indexes, §3).\n");
     s.push_str("pub const HEADS: &[CatGlyphId] = &[\n");
-    for g in glyphs.iter().filter(|g| g.kind == "Head") {
-        s.push_str(&format!("    CatGlyphId::{},\n", g.variant));
+    let mut gi = 0;
+    while gi < glyphs.len() {
+        if str_eq(glyphs[gi].kind, "Head") {
+            let _ = writeln!(s, "    CatGlyphId::{},", glyphs[gi].variant);
+        }
+        gi += 1;
     }
     s.push_str("];\n");
 
@@ -404,10 +593,12 @@ fn emit_pet(glyphs: &[Glyph]) -> String {
     s.push_str("/// genome, so these are animation frames, not roster rows.\n");
     s.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\n");
     s.push_str("pub enum PetGlyphId {\n");
-    for g in glyphs {
+    let mut gi = 0;
+    while gi < glyphs.len() {
         s.push_str("    ");
-        s.push_str(&g.variant);
+        s.push_str(&glyphs[gi].variant);
         s.push_str(",\n");
+        gi += 1;
     }
     s.push_str("}\n\n");
 
@@ -416,8 +607,10 @@ fn emit_pet(glyphs: &[Glyph]) -> String {
     );
     s.push_str("/// string lookup.\n");
     s.push_str("pub const PET_GLYPH_IDS: &[PetGlyphId] = &[\n");
-    for g in glyphs {
-        s.push_str(&format!("    PetGlyphId::{},\n", g.variant));
+    let mut gi = 0;
+    while gi < glyphs.len() {
+        let _ = writeln!(s, "    PetGlyphId::{},", glyphs[gi].variant);
+        gi += 1;
     }
     s.push_str("];\n\n");
 
@@ -438,10 +631,12 @@ fn emit_dog(glyphs: &[Glyph]) -> String {
     s.push_str("/// of these per summon; the kitty log never records them.\n");
     s.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\n");
     s.push_str("pub enum DogGlyphId {\n");
-    for g in glyphs {
+    let mut gi = 0;
+    while gi < glyphs.len() {
         s.push_str("    ");
-        s.push_str(&g.variant);
+        s.push_str(&glyphs[gi].variant);
         s.push_str(",\n");
+        gi += 1;
     }
     s.push_str("}\n\n");
 
@@ -450,8 +645,10 @@ fn emit_dog(glyphs: &[Glyph]) -> String {
     );
     s.push_str("/// string lookup.\n");
     s.push_str("pub const DOG_GLYPH_IDS: &[DogGlyphId] = &[\n");
-    for g in glyphs {
-        s.push_str(&format!("    DogGlyphId::{},\n", g.variant));
+    let mut gi = 0;
+    while gi < glyphs.len() {
+        let _ = writeln!(s, "    DogGlyphId::{},", glyphs[gi].variant);
+        gi += 1;
     }
     s.push_str("];\n\n");
 
@@ -462,8 +659,12 @@ fn emit_dog(glyphs: &[Glyph]) -> String {
 
     s.push_str("/// The breed variants the typed-summon picker draws from, uniformly.\n");
     s.push_str("pub const DOG_HEADS: &[DogGlyphId] = &[\n");
-    for g in glyphs.iter().filter(|g| g.kind == "Head") {
-        s.push_str(&format!("    DogGlyphId::{},\n", g.variant));
+    let mut gi = 0;
+    while gi < glyphs.len() {
+        if str_eq(glyphs[gi].kind, "Head") {
+            let _ = writeln!(s, "    DogGlyphId::{},", glyphs[gi].variant);
+        }
+        gi += 1;
     }
     s.push_str("];\n");
 
@@ -479,10 +680,12 @@ fn emit_animal_roster(glyphs: &[Glyph]) -> String {
     s.push_str("/// `species` key.\n");
     s.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\n");
     s.push_str("pub enum AnimalGlyphId {\n");
-    for g in glyphs {
+    let mut gi = 0;
+    while gi < glyphs.len() {
         s.push_str("    ");
-        s.push_str(&g.variant);
+        s.push_str(&glyphs[gi].variant);
         s.push_str(",\n");
+        gi += 1;
     }
     s.push_str("}\n\n");
 
@@ -491,8 +694,10 @@ fn emit_animal_roster(glyphs: &[Glyph]) -> String {
     );
     s.push_str("/// for stable string lookup.\n");
     s.push_str("pub const ANIMAL_GLYPH_IDS: &[AnimalGlyphId] = &[\n");
-    for g in glyphs {
-        s.push_str(&format!("    AnimalGlyphId::{},\n", g.variant));
+    let mut gi = 0;
+    while gi < glyphs.len() {
+        let _ = writeln!(s, "    AnimalGlyphId::{},", glyphs[gi].variant);
+        gi += 1;
     }
     s.push_str("];\n\n");
 
@@ -515,21 +720,39 @@ fn emit_animal_roster(glyphs: &[Glyph]) -> String {
 }
 
 fn emit_glyph_rows(s: &mut String, glyphs: &[Glyph]) {
-    for g in glyphs {
-        s.push_str(&format!("    // {} ({})\n", g.variant, g.id));
-        s.push_str(&format!(
-            "    GlyphDef {{ id: {:?}, kind: GlyphKind::{}, aspect_x1000: {}, eye_y: {}, center_x: {}, word_top: {}, layers: &[\n",
+    let mut gi = 0;
+    while gi < glyphs.len() {
+        let g = &glyphs[gi];
+        gi += 1;
+        let _ = writeln!(s, "    // {} ({})", g.variant, g.id);
+        let _ = writeln!(
+            s,
+            "    GlyphDef {{ id: {:?}, kind: GlyphKind::{}, aspect_x1000: {}, eye_y: {}, center_x: {}, word_top: {}, layers: &[",
             g.id, g.kind, g.aspect_x1000, g.eye_y, g.center_x, g.word_top
-        ));
-        for l in &g.layers {
-            s.push_str(&format!(
-                "        Layer {{ role: GlyphRole::{}, recolor: Recolor::{}, fill: {:#08X}, paths: &[\n",
+        );
+        let mut li = 0;
+        while li < g.layers.len() {
+            let l = &g.layers[li];
+            li += 1;
+            let _ = writeln!(
+                s,
+                "        Layer {{ role: GlyphRole::{}, recolor: Recolor::{}, fill: {:#08X}, paths: &[",
                 l.role, l.recolor, l.fill
-            ));
-            for path in &l.paths {
+            );
+            let mut pi = 0;
+            while pi < l.paths.len() {
                 s.push_str("            &[");
-                s.push_str(&path.join(","));
+                let segs = l.paths[pi].as_slice();
+                let mut si = 0;
+                while si < segs.len() {
+                    if si > 0 {
+                        s.push(',');
+                    }
+                    s.push_str(&segs[si]);
+                    si += 1;
+                }
                 s.push_str("],\n");
+                pi += 1;
             }
             s.push_str("        ] },\n");
         }
@@ -537,24 +760,14 @@ fn emit_glyph_rows(s: &mut String, glyphs: &[Glyph]) {
     }
 }
 
-fn present<'a>(
-    vocab: &[(&str, &'static str)],
-    used: impl Iterator<Item = &'a str>,
-) -> Vec<&'static str> {
-    let set: std::collections::BTreeSet<&str> = used.collect();
-    vocab
-        .iter()
-        .filter(|(_, v)| set.contains(v))
-        .map(|(_, v)| *v)
-        .collect()
-}
-
 fn emit_enum(s: &mut String, name: &str, doc: &str, variants: &[&str]) {
-    s.push_str(&format!("/// {doc}\n"));
+    let _ = writeln!(s, "/// {doc}");
     s.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\n");
-    s.push_str(&format!("pub enum {name} {{\n"));
-    for v in variants {
-        s.push_str(&format!("    {v},\n"));
+    let _ = writeln!(s, "pub enum {name} {{");
+    let mut vi = 0;
+    while vi < variants.len() {
+        let _ = writeln!(s, "    {},", variants[vi]);
+        vi += 1;
     }
     s.push_str("}\n\n");
 }

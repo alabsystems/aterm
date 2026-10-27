@@ -2363,6 +2363,7 @@ mod tests {
             cache_expires_at: None,
             version: None,
             model: None,
+            ctx_left: None,
             dur_us: 0,
         };
         let mut a = live_account();

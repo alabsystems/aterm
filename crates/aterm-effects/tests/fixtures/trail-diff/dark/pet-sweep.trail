@@ -1,0 +1,169 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# The pet: a shell line typed with the pet on, then the pointer sweeps the caret's row and the two
+# above it, a press lands on the cat at rest and two beside it, the pointer leaves and typing
+# resumes.
+
+grid 16 80
+style rainbow kitty
+pet on 7
+hz 60
+
+at 0 pty "\e[9;1H$ "
+at 700 key m
+at 702 pty "m"
+at 810 key a
+at 812 pty "a"
+at 920 key k
+at 922 pty "k"
+at 1030 key e
+at 1032 pty "e"
+at 1140 key space
+at 1142 pty " "
+at 1250 key t
+at 1252 pty "t"
+at 1360 key h
+at 1362 pty "h"
+at 1470 key e
+at 1472 pty "e"
+at 1580 key space
+at 1582 pty " "
+at 1690 key k
+at 1692 pty "k"
+at 1800 key i
+at 1802 pty "i"
+at 1910 key t
+at 1912 pty "t"
+at 2020 key t
+at 2022 pty "t"
+at 2130 key y
+at 2132 pty "y"
+at 2240 key space
+at 2242 pty " "
+at 2350 key f
+at 2352 pty "f"
+at 2460 key o
+at 2462 pty "o"
+at 2570 key l
+at 2572 pty "l"
+at 2680 key l
+at 2682 pty "l"
+at 2790 key o
+at 2792 pty "o"
+at 2900 key w
+at 2902 pty "w"
+at 3010 key space
+at 3012 pty " "
+at 3120 key t
+at 3122 pty "t"
+at 3230 key h
+at 3232 pty "h"
+at 3340 key e
+at 3342 pty "e"
+at 3450 key space
+at 3452 pty " "
+at 3560 key c
+at 3562 pty "c"
+at 3670 key a
+at 3672 pty "a"
+at 3780 key r
+at 3782 pty "r"
+at 3890 key e
+at 3892 pty "e"
+at 4000 key t
+at 4002 pty "t"
+at 4510 pointer 3 136
+at 4527 pointer 24 136
+at 4544 pointer 45 136
+at 4561 pointer 66 136
+at 4578 pointer 87 136
+at 4595 pointer 108 136
+at 4612 pointer 129 136
+at 4629 pointer 150 136
+at 4646 pointer 171 136
+at 4663 pointer 192 136
+at 4680 pointer 213 136
+at 4697 pointer 234 136
+at 4714 pointer 255 136
+at 4731 pointer 276 136
+at 4748 pointer 297 136
+at 4765 pointer 318 136
+at 4782 pointer 339 136
+at 4799 pointer 360 136
+at 4816 pointer 381 136
+at 4833 pointer 402 136
+at 4850 pointer 423 136
+at 4867 pointer 444 136
+at 4884 pointer 465 136
+at 4901 pointer 486 136
+at 4918 pointer 507 136
+at 4935 pointer 528 136
+at 4952 pointer 549 136
+at 4969 pointer 556 120
+at 4986 pointer 535 120
+at 5003 pointer 514 120
+at 5020 pointer 493 120
+at 5037 pointer 472 120
+at 5054 pointer 451 120
+at 5071 pointer 430 120
+at 5088 pointer 409 120
+at 5105 pointer 388 120
+at 5122 pointer 367 120
+at 5139 pointer 346 120
+at 5156 pointer 325 120
+at 5173 pointer 304 120
+at 5190 pointer 283 120
+at 5207 pointer 262 120
+at 5224 pointer 241 120
+at 5241 pointer 220 120
+at 5258 pointer 199 120
+at 5275 pointer 178 120
+at 5292 pointer 157 120
+at 5309 pointer 136 120
+at 5326 pointer 115 120
+at 5343 pointer 94 120
+at 5360 pointer 73 120
+at 5377 pointer 52 120
+at 5394 pointer 31 120
+at 5411 pointer 10 120
+at 5428 pointer 3 104
+at 5445 pointer 24 104
+at 5462 pointer 45 104
+at 5479 pointer 66 104
+at 5496 pointer 87 104
+at 5513 pointer 108 104
+at 5530 pointer 129 104
+at 5547 pointer 150 104
+at 5564 pointer 171 104
+at 5581 pointer 192 104
+at 5598 pointer 213 104
+at 5615 pointer 234 104
+at 5632 pointer 255 104
+at 5649 pointer 276 104
+at 5666 pointer 297 104
+at 5683 pointer 318 104
+at 5700 pointer 339 104
+at 5717 pointer 360 104
+at 5734 pointer 381 104
+at 5751 pointer 402 104
+at 5768 pointer 423 104
+at 5785 pointer 444 104
+at 5802 pointer 465 104
+at 5819 pointer 486 104
+at 5836 pointer 507 104
+at 5853 pointer 528 104
+at 5870 pointer 549 104
+at 5887 press 288 130
+at 6187 press 330 130
+at 6487 press 240 130
+at 6787 pointer off
+at 6987 key space
+at 6989 pty " "
+at 7097 key n
+at 7099 pty "n"
+at 7207 key o
+at 7209 pty "o"
+at 7317 key w
+at 7319 pty "w"
+run 8927

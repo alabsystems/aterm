@@ -36,6 +36,9 @@ aterm-durable = { workspace = true }
 aterm-http = { workspace = true }
 # source.toml and state.toml, read as a value tree (no derive in this library).
 aterm-toml = { workspace = true }
+# The one rule for a copy of aterm that lasts (`lasting::transient`), which a launchd job may
+# name, shared with atpkg's shims and the window's subscriber mend. std only.
+aterm-toolchain = { workspace = true }
 # Content-addressed causal control records and their strict local journal.
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 aterm-db-core.workspace = true

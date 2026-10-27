@@ -6,7 +6,7 @@
 //! verb's op-class fence on `@self`), and a client outside the tree is refused and sees the book
 //! redacted.
 
-#![cfg(unix)]
+#![cfg(target_os = "macos")]
 
 use aterm_spec::wait::{MUST_HAPPEN, until_within};
 

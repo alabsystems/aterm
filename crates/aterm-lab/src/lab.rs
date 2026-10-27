@@ -71,6 +71,11 @@ pub struct UpOpts {
     /// a volume of its own, which the `down` that removes the scratch detaches
     /// ([`home_image_refused`], [`detach_home_image`]).
     pub home_image: Option<String>,
+    /// `LAB_JAIL_SCAN=1`: the instance's disk scans read the jail's processes alone (the jail's
+    /// mark in [`aterm_uds::holders::JAIL_SEAM`], a debug build's seam): from inside the jail the
+    /// owner's processes cannot be read, and such a scan rules out no path while one stands
+    /// unread, so `aterm harness disk free` frees nothing in a lab without it.
+    pub jail_scan: bool,
 }
 
 impl UpOpts {
@@ -101,6 +106,7 @@ impl UpOpts {
             window: false,
             reroute: set("LAB_REROUTE"),
             home_image: Some(var("LAB_HOME_IMAGE")).filter(|v| !v.is_empty()),
+            jail_scan: set("LAB_JAIL_SCAN"),
         }
     }
 }
@@ -930,6 +936,9 @@ fn lab_vars(run: &Run, user: &str) -> Vec<(String, String)> {
     if run.seam == "1" {
         vars.push(("ATERM_DEBUG_HEADLESS_RESTORE".into(), "1".into()));
     }
+    if run.jail_scan == "1" {
+        vars.push((aterm_uds::holders::JAIL_SEAM.into(), run.mark.clone()));
+    }
     vars.extend(crate::instance::seams());
     vars.extend(crate::clock::vars(run));
     vars
@@ -940,6 +949,7 @@ fn lab_sets(name: &str) -> bool {
     let probe = Run {
         seam: "1".into(),
         clock: "1".into(),
+        jail_scan: "1".into(),
         ..Run::default()
     };
     lab_vars(&probe, "").iter().any(|(k, _)| k == name)
@@ -1270,6 +1280,9 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         ));
     }
     run.mark = crate::jail::new_mark(tag);
+    if o.jail_scan {
+        run.jail_scan = "1".into();
+    }
     let mut spec = crate::jail::Spec::for_lab(
         &run.run.to_string_lossy(),
         &run.claude_bin,
@@ -1420,6 +1433,13 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     };
     put("home/.claude/settings.json", &settings);
     put("home/.claude/.claude.json", &claude_json);
+    if o.reroute {
+        // A reroute lab's `claude` is found by name too, outside the lab's launcher, which sets
+        // `CLAUDE_CONFIG_DIR`: a Claude Code that aterm starts with no starter of its own (the
+        // disk worker's plain `claude`) reads the default `~/.claude.json`, so it is laid as well,
+        // or that Claude Code opens on its first-run onboarding.
+        put("home/.claude.json", &claude_json);
+    }
     put(
         "cfg/aterm/aterm.toml",
         &scratch_aterm_toml(&o.aterm_toml, &o.harness_keys),
@@ -2547,6 +2567,7 @@ mod tests {
             "XDG_RUNTIME_DIR=/x",
             "ATERM_STATE_HOME=/x",
             "ATERM_DEBUG_HEADLESS_RESTORE=1",
+            "ATERM_DEBUG_JAIL_MARK=lab.jail.k1.0123456789abcdef",
             "ATERM_HARNESS_TAPE=0",
             "CLAUDE_CONFIG_DIR=/x",
             "TMP=/x",
@@ -2607,6 +2628,23 @@ mod tests {
         let seam = instance_vars(&recorded("", "1"), "owner").unwrap();
         assert!(seam.contains(&("ATERM_DEBUG_HEADLESS_RESTORE".to_string(), "1".to_string())));
         assert!(!seam.iter().any(|(k, _)| k == "TMPDIR"));
+        assert!(
+            get(aterm_uds::holders::JAIL_SEAM).is_empty(),
+            "no jail scan unless asked"
+        );
+        let scans = Run {
+            mark: "lab.jail.k1.0123456789abcdef".into(),
+            jail_scan: "1".into(),
+            ..recorded("", "0")
+        };
+        let jail = instance_vars(&scans, "owner").unwrap();
+        assert!(
+            jail.contains(&(
+                aterm_uds::holders::JAIL_SEAM.to_string(),
+                "lab.jail.k1.0123456789abcdef".to_string()
+            )),
+            "the jail's mark, to its instance's disk scans: {jail:?}"
+        );
         for edited in [
             "HOME=/elsewhere",
             "ATERM_DEBUG_HEADLESS_RESTORE=1",

@@ -19,6 +19,21 @@ pub(crate) const BYPASS: &str = "  \u{23F5}\u{23F5} bypass permissions on (shift
 /// The last turn's done row, the status row over the composer.
 pub(crate) const DONE: &str = "\u{273B} Baked for 4s \u{b7} done 2:41 PM";
 
+/// The lit switch as a top rule reads it: ` ● on `.
+#[cfg(test)]
+pub(crate) const LIT_SWITCH: &str = " \u{25cf} on ";
+
+/// The off switch: ` ○ off `.
+#[cfg(test)]
+pub(crate) const OFF_SWITCH: &str = " \u{25cb} off ";
+
+/// The harness label's words at its widest for `harness`, its CLI's version left out:
+/// `alab claude harness v0.4`.
+#[cfg(test)]
+pub(crate) fn harness_label(harness: aterm_phase::CliHarness) -> String {
+    format!("alab {} harness v{}", harness.cli(), harness.version_str())
+}
+
 /// What a screen shows under the transcript.
 #[derive(Clone, Copy)]
 pub(crate) struct Live<'a> {
@@ -42,7 +57,17 @@ impl Live<'_> {
 
 /// A Claude Code screen `ROWS` × `COLS` well into a conversation.
 pub(crate) fn screen(live: &Live<'_>) -> Vec<String> {
-    let (rows, cols) = (usize::from(ROWS), usize::from(COLS));
+    screen_dimensions(live, ROWS, COLS)
+}
+
+/// The same recorded composer structure at a gallery's selected terminal dimensions.
+#[cfg(test)]
+pub(crate) fn screen_at(live: &Live<'_>, rows: u16, cols: u16) -> Vec<String> {
+    screen_dimensions(live, rows, cols)
+}
+
+fn screen_dimensions(live: &Live<'_>, rows: u16, cols: u16) -> Vec<String> {
+    let (rows, cols) = (usize::from(rows), usize::from(cols));
     let rule = "\u{2500}".repeat(cols);
     let mut s: Vec<String> = (0..rows - 4 - live.draft.len() - live.under.len())
         .map(|i| match i % 4 {

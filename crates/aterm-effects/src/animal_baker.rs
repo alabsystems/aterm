@@ -82,6 +82,7 @@ impl AnimalBakeKey {
 
 /// Rasterize one species head into a fresh `w × h` [`Tile`] in layer order.
 /// Deterministic, so the LRU is a pure function of its key.
+#[inline]
 #[must_use]
 pub fn bake_species(species: AnimalGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Tile {
     let mut tile = Tile::new(w, h);
@@ -89,6 +90,7 @@ pub fn bake_species(species: AnimalGlyphId, fills: &ResolvedFills, w: u32, h: u3
     tile
 }
 
+#[inline]
 fn paint_species_onto(
     tile: &mut Tile,
     species: AnimalGlyphId,

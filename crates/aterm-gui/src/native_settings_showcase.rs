@@ -718,7 +718,21 @@ impl SettingsViewState {
     pub(super) fn showcase_steps_highlight(&self) -> bool {
         self.showcase_focused_card().is_some()
             || self.showcase_pack_focused()
-            || self.showcase_text_focus() == Some(ShowcaseText::Filter)
+            || self.showcase_filter_drives()
+    }
+
+    /// Whether the keyboard is in the filter where it drives the chooser's highlight: where it
+    /// stands over the chooser's rows, which scroll under it. LISTED WITH THE ROWS (a window too
+    /// short or narrow to pin it), THE FILTER IS ONE STOP OF THE LIST: the arrows and the page
+    /// keys move through the list from it as from any control, and take the keyboard onto the
+    /// screen they show. Driving the highlight from it, they tried theme after theme on rows
+    /// no screen showed, the list kept on the filter (the keyboard's control never leaves view),
+    /// and Page Down never left it (2x in a 178x152 window).
+    pub(super) fn showcase_filter_drives(&self) -> bool {
+        self.showcase_text_focus() == Some(ShowcaseText::Filter)
+            && !self
+                .scroll_plan()
+                .is_some_and(|plan| plan.stop_of(&UiKey::new(SHOWCASE_FILTER)).is_some())
     }
 
     /// Move the chooser highlight to `id`, starting or ending a trial as appropriate.

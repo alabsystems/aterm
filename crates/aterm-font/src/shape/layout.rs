@@ -6,7 +6,7 @@
 // project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! `GSUB` lookup application and per-glyph layout properties.
+//! `GSUB` and `GPOS` lookup application and per-glyph layout properties.
 
 use super::ShapeFace;
 use super::apply::ApplyContext;
@@ -28,10 +28,10 @@ pub(crate) fn substitute_start(face: &ShapeFace, buffer: &mut Buffer) {
 /// Applies the plan's `GSUB` lookups, running each stage's pause after it.
 pub(crate) fn substitute(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) {
     let digest = buffer_digest(buffer);
-    let mut ctx = ApplyContext::new(face, buffer, digest);
-    for (stage_index, stage) in plan.map.stages().iter().enumerate() {
+    let mut ctx = ApplyContext::new(super::map::GSUB, face, buffer, digest);
+    for (stage_index, stage) in plan.map.stages(super::map::GSUB).iter().enumerate() {
         if face.gsub().is_some() {
-            for lookup_map in plan.map.stage_lookups(stage_index) {
+            for lookup_map in plan.map.stage_lookups(super::map::GSUB, stage_index) {
                 let Some(lookup) = face.gsub_lookup(lookup_map.index) else {
                     continue;
                 };
@@ -49,6 +49,51 @@ pub(crate) fn substitute(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer
             pause(plan, face, ctx.buffer);
             ctx.digest = buffer_digest(ctx.buffer);
         }
+    }
+}
+
+/// Applies the plan's `GPOS` lookups in place, running each stage's pause after it.
+pub(crate) fn position(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) {
+    let digest = buffer_digest(buffer);
+    let mut ctx = ApplyContext::new(super::map::GPOS, face, buffer, digest);
+    for (stage_index, stage) in plan.map.stages(super::map::GPOS).iter().enumerate() {
+        if face.gpos().is_some() {
+            for lookup_map in plan.map.stage_lookups(super::map::GPOS, stage_index) {
+                let Some(lookup) = face.gpos_lookup(lookup_map.index) else {
+                    continue;
+                };
+                if lookup.digest.may_have(&ctx.digest) {
+                    ctx.lookup_index = lookup_map.index;
+                    ctx.set_lookup_mask(lookup_map.mask);
+                    ctx.auto_zwj = lookup_map.auto_zwj;
+                    ctx.auto_zwnj = lookup_map.auto_zwnj;
+                    ctx.random = lookup_map.random;
+                    apply_position(&mut ctx, lookup);
+                }
+            }
+        }
+        if let Some(pause) = stage.pause {
+            pause(plan, face, ctx.buffer);
+            ctx.digest = buffer_digest(ctx.buffer);
+        }
+    }
+}
+
+fn apply_position(ctx: &mut ApplyContext, lookup: &super::face::PosLookup) {
+    if ctx.buffer.len == 0 || ctx.lookup_mask() == 0 {
+        return;
+    }
+    ctx.lookup_props = lookup.props;
+    ctx.buffer.idx = 0;
+    while ctx.buffer.idx < ctx.buffer.len && ctx.buffer.successful {
+        let cur = *ctx.buffer.cur(0);
+        if (cur.mask & ctx.lookup_mask()) != 0
+            && ctx.check_glyph_property(&cur, ctx.lookup_props)
+            && super::gpos::apply_lookup(ctx, lookup).is_some()
+        {
+            continue;
+        }
+        ctx.buffer.idx += 1;
     }
 }
 
@@ -168,4 +213,9 @@ pub(crate) const fn is_mark(info: &GlyphInfo) -> bool {
 #[inline]
 pub(crate) const fn substituted(info: &GlyphInfo) -> bool {
     info.glyph_props & glyph_props::SUBSTITUTED != 0
+}
+
+#[inline]
+pub(crate) const fn multiplied(info: &GlyphInfo) -> bool {
+    info.glyph_props & glyph_props::MULTIPLIED != 0
 }

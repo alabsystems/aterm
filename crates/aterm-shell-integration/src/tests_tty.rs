@@ -1424,6 +1424,60 @@ fn an_integrated_bash_reports_the_line_as_typed() {
     }
 }
 
+/// zsh and every bash ([`ShellLanes::bashes`]) report a history designator's line as they run
+/// it, expanded: `!!` as the line before it, `echo !$` with that line's last word, never the
+/// designator as typed. aterm's reader of a reported line does not rely on this (aterm-gui's
+/// `session_status::lead` closes on a designator, since any program may send 633;E); this keeps
+/// the measurement the session log's design cites re-runnable.
+#[cfg(unix)]
+#[test]
+fn an_integrated_shell_reports_a_history_designator_expanded() {
+    let reported = |text: &str| -> Vec<String> {
+        text.split("\x1b]633;E;")
+            .skip(1)
+            .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
+            .collect()
+    };
+    let mut shells = ShellLanes::default();
+    let mut lanes = vec![(ShellType::Zsh, live_pty_zsh())];
+    lanes.extend(
+        shells
+            .bashes()
+            .into_iter()
+            .map(|bash| (ShellType::Bash, bash)),
+    );
+    for (shell, program) in lanes {
+        let fx = LiveFixture::new();
+        let dir = install_script_set(&fx.base).expect("install");
+        for rc in [".zshrc", ".bashrc"] {
+            std::fs::write(fx.home.join(rc), "").expect(rc);
+        }
+        let mut sh = spawn_pty_shell(shell, program, &fx, &dir, &[("ATERM_CHILD", "1")]);
+        let from = sh.len();
+        // Whatever each line's status: a designator the shell ran as typed fails no wait.
+        let mut run = |line: &str| {
+            let typed = sh.type_at_prompt(format!("{line}\r").as_bytes());
+            let done = sh.wait_for_after("\x1b]133;D;", typed);
+            sh.wait_for_after("\x1b]133;A", done)
+        };
+        run("echo one QZP6WORD0");
+        run("!!");
+        let end = run("echo !$");
+        let text = stdout_between(&sh, from, end);
+        assert_eq!(
+            reported(&text),
+            [
+                "echo\\x20one\\x20QZP6WORD0",
+                "echo\\x20one\\x20QZP6WORD0",
+                "echo\\x20QZP6WORD0",
+            ],
+            "{program}: the lines 633;E reported\n{}",
+            sh.transcript()
+        );
+        sh.finish();
+    }
+}
+
 #[cfg(target_os = "macos")]
 const NO_TEMP_FOLDER: &str = "(version 1)(allow default)(deny file-write* \
      (subpath \"/private/tmp\") (subpath \"/private/var/tmp\") (subpath \"/private/var/folders\"))";

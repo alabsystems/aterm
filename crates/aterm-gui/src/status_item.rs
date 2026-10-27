@@ -1336,7 +1336,7 @@ pub(crate) struct PeerRef {
     pub host: Option<String>,
     /// The session there.
     pub sid: String,
-    /// That Mac lets this one drive it (its survey said `drive=1`: its person ran `aterm fleet allow drive --from <this Mac>` there): Take Over and Hand Back on it, over the fleet.
+    /// That Mac lets this one drive it (its survey said `drive=1`: its person ran `aterm fleet allow drive --from <this Mac>` or `--all` there): Take Over and Hand Back on it, over the fleet.
     pub drive: bool,
 }
 
@@ -1907,6 +1907,17 @@ impl Glance {
     )]
     pub(crate) const fn in_fleet(&self) -> bool {
         matches!(self.fleet, FleetLine::InFleet { .. })
+    }
+
+    /// Nag mode's mascot on the bar button ([`NAG_STAGES`]): `None` while nothing nags, else her stage, 1 for one counted need and one more for each further need and each stuck one, so the more is asked of the owner the crazier she screams.
+    #[cfg_attr(
+        all(not(target_os = "macos"), not(test)),
+        expect(dead_code, reason = "the menu-bar status item is macOS's")
+    )]
+    pub(crate) fn nag_stage(&self) -> Option<u8> {
+        let asked = self.need_count();
+        let stage = (asked + self.stuck_count()).min(NAG_STAGES.len());
+        (asked > 0).then(|| u8::try_from(stage).unwrap_or(u8::MAX))
     }
 
     /// The menu-bar button title: `❯N` while N needs stand, else `❯•` while the digest holds entries or a row stands under Done for you (a worker's done, a supervised agent's end nobody has looked at), else `❯`.
@@ -3313,6 +3324,14 @@ pub(crate) fn menu_lines(rows: &[StatusRow], fleet: &[StatusRow]) -> Vec<String>
     lines
 }
 
+/// Nag mode's mascot, the rules lady who nags the owner for a permission or a chore, by stage ([`Glance::nag_stage`]): a tsk and a wagging finger, `NAG!`, head thrown back screaming `NAG NAG!`, and crazed `NAGG NAGG!!!!`.
+pub(crate) const NAG_STAGES: [&[u8]; 4] = [
+    include_bytes!("../assets/brand/nag-1.svg"),
+    include_bytes!("../assets/brand/nag-2.svg"),
+    include_bytes!("../assets/brand/nag-3.svg"),
+    include_bytes!("../assets/brand/nag-4.svg"),
+];
+
 /// The bar button's face — its title, and whether it is drawn red — to set for `glance`, or `None` when the button already shows it.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn button_face_change(
@@ -3354,6 +3373,8 @@ mod macos {
         item: Obj,
         shown_face: RefCell<Option<(String, bool)>>,
         shown_tip: RefCell<Option<String>>,
+        /// The nag stage the button's image shows ([`super::Glance::nag_stage`]), `None` before the first.
+        shown_nag: Cell<Option<Option<u8>>>,
     }
 
     pub(crate) struct StatusIvars {
@@ -3476,9 +3497,11 @@ mod macos {
                 item,
                 shown_face: RefCell::new(None),
                 shown_tip: RefCell::new(None),
+                shown_nag: Cell::new(None),
             })
         })?;
         show_face(&handle, (glance.button_title(), glance.stuck()));
+        show_nag(&handle, glance.nag_stage());
         show_tip(&handle, glance.tooltip());
         Some(handle)
     }
@@ -3490,6 +3513,10 @@ mod macos {
         let change = super::button_face_change(handle.shown_face.borrow().as_ref(), &glance);
         if let Some(face) = change {
             show_face(handle, face);
+        }
+        let nag = glance.nag_stage();
+        if handle.shown_nag.get() != Some(nag) {
+            show_nag(handle, nag);
         }
         let tip = glance.tooltip();
         if handle.shown_tip.borrow().as_deref() != Some(tip.as_str()) {
@@ -3612,6 +3639,90 @@ mod macos {
         });
         if set {
             *handle.shown_face.borrow_mut() = Some(face);
+        }
+    }
+
+    /// The bar button's height for nag mode's mascot, in points: the menu bar's icon size.
+    const NAG_POINTS: f64 = 18.0;
+    /// `NSCell.h` — `NSImageLeft = 2` (`NSCellImagePosition`): the mascot before the title.
+    const NS_IMAGE_LEFT: usize = 2;
+
+    /// Nag mode's mascot from one of [`super::NAG_STAGES`]' SVGs, sized for the bar button, or
+    /// `None` for bytes AppKit cannot read. Called inside an autorelease pool.
+    fn nag_image(svg: &[u8]) -> Option<Obj> {
+        // SAFETY: plain sends on live receivers; NSData and a fresh NSImage are made on any
+        // thread. `+dataWithBytes:length:` is `-(id)(const void *, NSUInteger)` and copies the
+        // bytes into an NSData the caller's pool owns; `+alloc` then `-initWithData:`
+        // (`-(id)(NSData *)`) gives a +1 NSImage, adopted by `Obj`, or nil for bytes it cannot
+        // read; `-setSize:` is `-(void)(NSSize)`.
+        unsafe {
+            let data_with: unsafe extern "C-unwind" fn(
+                Id,
+                Sel,
+                *const std::ffi::c_void,
+                usize,
+            ) -> Id = aterm_objc::checked_msg();
+            let data = data_with(
+                class(c"NSData").as_id(),
+                sel!(dataWithBytes:length:),
+                svg.as_ptr().cast(),
+                svg.len(),
+            );
+            if data.is_null() {
+                return None;
+            }
+            let image = Obj::from_owned(appkit::send_id_id(
+                appkit::alloc(class(c"NSImage")),
+                sel!(initWithData:),
+                data,
+            ))?;
+            appkit::send_v_size(
+                image.id(),
+                sel!(setSize:),
+                aterm_objc::CGSize {
+                    width: NAG_POINTS,
+                    height: NAG_POINTS,
+                },
+            );
+            Some(image)
+        }
+    }
+
+    /// Puts nag mode's mascot at `stage` on the bar button before its title, or takes her off for `None` ([`super::NAG_STAGES`]).
+    fn show_nag(handle: &StatusItemHandle, stage: Option<u8>) {
+        let svg = stage.and_then(|s| super::NAG_STAGES.get(usize::from(s).checked_sub(1)?));
+        let set = autoreleasepool(|_| {
+            // SAFETY: plain AppKit sends on live receivers, on the main thread (both callers
+            // checked `MainThread::new()`). `-setImage:` is `-(void)(NSImage *)`, nil taking the
+            // image off, and the button retains it; `-setImagePosition:` is
+            // `-(void)(NSCellImagePosition)`.
+            unsafe {
+                let button = appkit::send_id(handle.item.id(), sel!(button));
+                if button.is_null() {
+                    return false;
+                }
+                let image = match svg {
+                    Some(bytes) => {
+                        let Some(image) = nag_image(bytes) else {
+                            return false;
+                        };
+                        Some(image)
+                    }
+                    None => None,
+                };
+                let shown = image.as_ref().map_or(Id::NIL, Obj::id);
+                appkit::send_v_id(button, sel!(setImage:), shown);
+                let position = if image.is_some() {
+                    NS_IMAGE_LEFT
+                } else {
+                    crate::appkit::consts::NS_NO_IMAGE
+                };
+                appkit::send_v_usize(button, sel!(setImagePosition:), position);
+                true
+            }
+        });
+        if set {
+            handle.shown_nag.set(Some(stage));
         }
     }
 
@@ -3856,8 +3967,39 @@ mod macos {
     mod tests {
         use aterm_objc::{ClassType, Sel, autoreleasepool, class, class_name, method_types, sel};
 
-        use super::{StatusTarget, new_item};
+        use super::{NAG_POINTS, StatusTarget, nag_image, new_item};
         use crate::appkit;
+
+        #[test]
+        fn every_nag_stage_reads_as_an_icon_for_the_bar() {
+            autoreleasepool(|_| {
+                for (stage, svg) in crate::status_item::NAG_STAGES.iter().enumerate() {
+                    let stage = stage + 1;
+                    let image = nag_image(svg).unwrap_or_else(|| panic!("nag stage {stage} reads"));
+                    // SAFETY: `-size` is `-(NSSize)` and `-representations` `-(NSArray *)` on a
+                    // live NSImage; `-count` is `-(NSUInteger)` on the live array.
+                    unsafe {
+                        assert_eq!(
+                            appkit::send_size(image.id(), sel!(size)),
+                            aterm_objc::CGSize {
+                                width: NAG_POINTS,
+                                height: NAG_POINTS,
+                            },
+                            "nag stage {stage} is sized for the bar"
+                        );
+                        let reps = appkit::send_id(image.id(), sel!(representations));
+                        assert!(
+                            !reps.is_null() && appkit::send_usize(reps, sel!(count)) > 0,
+                            "nag stage {stage} decodes to a drawable picture"
+                        );
+                    }
+                }
+                assert!(
+                    nag_image(b"no picture").is_none(),
+                    "AppKit refuses bytes it cannot read"
+                );
+            });
+        }
 
         #[test]
         fn the_registered_class_is_what_the_runtime_reports() {
@@ -6034,6 +6176,39 @@ mod tests {
             Some(face(&stuck)),
             "the colour alone re-faces it"
         );
+    }
+
+    #[test]
+    fn the_nag_screams_crazier_with_each_need_and_each_stuck_one() {
+        let calm = local_glance(&[row(1, "zsh", None)], &[], 0, None);
+        assert_eq!(calm.nag_stage(), None, "nothing nags");
+        let one = local_glance(&[row(1, "zsh", Some("look"))], &[], 0, None);
+        assert_eq!(one.nag_stage(), Some(1));
+        let two = local_glance(
+            &[row(1, "zsh", Some("look")), row(2, "zsh", Some("and here"))],
+            &[],
+            0,
+            None,
+        );
+        assert_eq!(two.nag_stage(), Some(2));
+        let stuck = local_glance(&[agent_row(1, "w", "wall:auth", 1)], &[], 0, None);
+        assert_eq!(stuck.need_count(), 1, "fixture: one need");
+        assert_eq!(
+            stuck.nag_stage(),
+            Some(2),
+            "a stuck need nags a stage harder"
+        );
+        let many: Vec<_> = (1..=6).map(|id| row(id, "zsh", Some("look"))).collect();
+        let many = local_glance(&many, &[], 0, None);
+        assert_eq!(
+            many.nag_stage(),
+            Some(u8::try_from(NAG_STAGES.len()).unwrap()),
+            "she tops out crazed"
+        );
+        for svg in NAG_STAGES {
+            let svg = std::str::from_utf8(svg).expect("an SVG is text");
+            assert!(svg.contains("<svg ") && svg.trim_end().ends_with("</svg>"));
+        }
     }
 
     /// Two Grok sessions on a sign-in wall while this machine is signed out are one need on

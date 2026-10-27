@@ -222,6 +222,23 @@ impl Directory {
     pub fn snapshot_with_config(&self, session: &Session<'_>, config: &Path) -> Result<Snapshot> {
         self.project(self.discovery_records(session)?, &Policy::read(config)?)
     }
+    /// Observe an already enrolled catalog without falling back to enrollment
+    /// when its claim or journal is absent or incomplete.
+    pub(crate) fn snapshot_existing_with_config(
+        &self,
+        session: &Session<'_>,
+        config: &Path,
+    ) -> Result<Snapshot> {
+        let catalog = Store::open(
+            session,
+            &self.path(self.catalog_scope())?,
+            self.catalog_scope(),
+        )?;
+        self.project(
+            self.discovery_records_from(session, &catalog)?,
+            &Policy::read(config)?,
+        )
+    }
     pub(crate) fn permits(
         &self,
         session: &Session<'_>,
@@ -332,6 +349,13 @@ impl Directory {
     /// exclusion and descriptor-conflict checks still run in `project`.
     fn discovery_records(&self, session: &Session<'_>) -> Result<Vec<crate::table::Record>> {
         let catalog = self.catalog(session)?;
+        self.discovery_records_from(session, &catalog)
+    }
+    fn discovery_records_from(
+        &self,
+        session: &Session<'_>,
+        catalog: &Store,
+    ) -> Result<Vec<crate::table::Record>> {
         let mut records = catalog.catalog(session)?;
         let mut seen: BTreeSet<_> = records.iter().map(|r| r.header().id).collect();
         let (retained, _) = self.retained()?;

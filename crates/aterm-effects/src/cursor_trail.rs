@@ -515,6 +515,7 @@ impl CursorTrail {
     }
 
     /// Advance the trail one frame into `out` and return the cell fingerprint (`0` when idle).
+    #[inline]
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -670,6 +671,7 @@ impl CursorTrail {
             || hint_fresh_dur(self.move_hint, now, Self::MOVE_HINT_FRESH_DUR)
     }
 
+    #[inline]
     fn spawn(
         &mut self,
         pr: u16,
@@ -733,11 +735,15 @@ impl CursorTrail {
             * (1.0 + CHAIN_LIFE_MULT * cfg.warmth.clamp(0.0, 1.0) + (IGNITED_LIFE_MULT - 1.0) * q))
             .max(1.0) as u64;
         let n = self.spawn_path.len() as u32;
-        for (i, (r, c)) in self.spawn_path.iter().copied().enumerate() {
+        let mut i = 0;
+        while i < self.spawn_path.len() {
+            let (r, c) = self.spawn_path[i];
+            let cur_i = i as u32;
+            i += 1;
             if r < 0 || c < 0 {
                 continue;
             }
-            let frac = (i as u32 + 1) * 255 / n; // 1/n .. 1, scaled to 0..=255
+            let frac = (cur_i + 1) * 255 / n; // 1/n .. 1, scaled to 0..=255
             let born_alpha =
                 (tail + (head - tail) * frac / 255).min(READABLE_ALPHA_CAP as u32) as u8;
             self.sparks.push(Spark {

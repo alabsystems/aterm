@@ -49,6 +49,9 @@ pub enum Family {
     FleetUnreadable,
     /// The folders whose direct entry count makes everything that lists them slow.
     HugeDir,
+    /// macOS's own services that hold far more memory than any service needs
+    /// (`vitals.service-memory.<service>`).
+    ServiceMemory,
     /// The fabric bridge's own state dir (`fabric.state.<cause>`).
     FabricState,
     /// Harness occupancy (`harness.occupancy.<subject>.<cause>`).
@@ -81,6 +84,7 @@ impl Family {
             Self::LongHold => "harness.long-hold",
             Self::FleetUnreadable => "fleet.unreadable",
             Self::HugeDir => "vitals.huge-dir",
+            Self::ServiceMemory => "vitals.service-memory",
             Self::FabricState => "fabric.state",
             Self::Occupancy => "harness.occupancy",
             Self::Setup => "setup",
@@ -104,7 +108,8 @@ impl Family {
             | Self::ApiOutage
             | Self::LongHold
             | Self::FleetUnreadable
-            | Self::HugeDir => Mode::Level,
+            | Self::HugeDir
+            | Self::ServiceMemory => Mode::Level,
             Self::Privacy
             | Self::Update
             | Self::UpgradeHost
@@ -122,7 +127,7 @@ impl Family {
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -140,6 +145,7 @@ impl Family {
         Self::LongHold,
         Self::FleetUnreadable,
         Self::HugeDir,
+        Self::ServiceMemory,
         Self::FabricState,
         Self::Occupancy,
         Self::Setup,
@@ -162,7 +168,11 @@ impl Family {
             | Self::LongHold
             | Self::Occupancy => tags::HARNESS,
             Self::Toolchain => tags::TOOLCHAIN,
-            Self::Disk | Self::FleetUnreadable | Self::HugeDir | Self::Setup => tags::SYSTEM,
+            Self::Disk
+            | Self::FleetUnreadable
+            | Self::HugeDir
+            | Self::ServiceMemory
+            | Self::Setup => tags::SYSTEM,
             Self::Render => tags::RENDER,
             Self::Terminal | Self::Removed => tags::CONFIG,
             Self::FabricState => tags::FABRIC,

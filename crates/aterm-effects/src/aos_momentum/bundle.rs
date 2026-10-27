@@ -341,6 +341,7 @@ pub enum BundleField {
 
 impl BundleField {
     /// Its name in a refusal.
+    #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -444,7 +445,7 @@ impl fmt::Display for BundleRefusal {
 impl std::error::Error for BundleRefusal {}
 
 #[inline]
-fn forged(field: BundleField) -> BundleRefusal {
+const fn forged(field: BundleField) -> BundleRefusal {
     BundleRefusal::Forged { field, row: None }
 }
 
@@ -461,6 +462,7 @@ const fn wide(n: usize) -> u64 {
     n as u64
 }
 
+#[inline]
 fn encode_verdict(e: &mut Enc, v: &RowVerdict) {
     match v {
         RowVerdict::NotRun => e.u8(0),
@@ -473,6 +475,7 @@ fn encode_verdict(e: &mut Enc, v: &RowVerdict) {
     }
 }
 
+#[inline]
 fn decode_verdict(d: &mut Dec<'_>, field: &'static str) -> Result<RowVerdict, WireFault> {
     match d.u8(field)? {
         0 => Ok(RowVerdict::NotRun),
@@ -485,12 +488,14 @@ fn decode_verdict(d: &mut Dec<'_>, field: &'static str) -> Result<RowVerdict, Wi
     }
 }
 
+#[inline]
 fn encode_totals(e: &mut Enc, t: &Totals) {
     e.u64(t.ticks);
     e.u64(t.presented);
     e.u64(t.wasted);
 }
 
+#[inline]
 fn decode_totals(d: &mut Dec<'_>, field: &'static str) -> Result<Totals, WireFault> {
     Ok(Totals {
         ticks: d.u64(field)?,
@@ -499,11 +504,13 @@ fn decode_totals(d: &mut Dec<'_>, field: &'static str) -> Result<Totals, WireFau
     })
 }
 
+#[inline]
 fn encode_compared(e: &mut Enc, c: &Compared) {
     encode_totals(e, &c.candidate);
     encode_totals(e, &c.baseline);
 }
 
+#[inline]
 fn decode_compared(d: &mut Dec<'_>, field: &'static str) -> Result<Compared, WireFault> {
     Ok(Compared {
         candidate: decode_totals(d, field)?,
@@ -511,6 +518,7 @@ fn decode_compared(d: &mut Dec<'_>, field: &'static str) -> Result<Compared, Wir
     })
 }
 
+#[inline]
 fn encode_kind(e: &mut Enc, k: ItemKind) {
     e.u8(k.tag());
     e.u64(k.seed());
@@ -521,16 +529,20 @@ fn encode_kind(e: &mut Enc, k: ItemKind) {
     e.opt(stratum, |e, s| e.str(s.name()));
 }
 
+#[inline]
 fn decode_kind(d: &mut Dec<'_>) -> Result<ItemKind, WireFault> {
     const FIELD: &str = "row.kind";
     let tag = d.u8(FIELD)?;
     let seed = d.u64(FIELD)?;
     let stratum = d.opt(FIELD, |d| {
         let name = d.str(FIELD)?;
-        for s in Stratum::ALL {
+        let mut si = 0;
+        while si < Stratum::ALL.len() {
+            let s = Stratum::ALL[si];
             if s.name() == name {
                 return Ok(s);
             }
+            si += 1;
         }
         Err(WireFault::NonCanonical { field: FIELD })
     })?;
@@ -543,6 +555,7 @@ fn decode_kind(d: &mut Dec<'_>) -> Result<ItemKind, WireFault> {
     }
 }
 
+#[inline]
 pub(super) fn encode_row(e: &mut Enc, r: &Row) {
     e.str(&r.item);
     e.u8(r.split.tag());
@@ -558,6 +571,7 @@ pub(super) fn encode_row(e: &mut Enc, r: &Row) {
     e.opt(r.firings, |e, v| e.u64(v));
 }
 
+#[inline]
 pub(super) fn decode_row(d: &mut Dec<'_>) -> Result<Row, WireFault> {
     let item = d.str("row.item")?.to_owned();
     let split = match d.u8("row.split")? {
@@ -586,20 +600,25 @@ pub(super) fn decode_row(d: &mut Dec<'_>) -> Result<Row, WireFault> {
     })
 }
 
+#[inline]
 fn encode_stats(e: &mut Enc, s: &SearchStats) {
     e.u8(s.rounds);
-    for v in [
+    let vals = [
         s.proposed,
         s.oversized,
         s.duplicates,
         s.over_budget,
         s.distinct,
         s.admitted,
-    ] {
-        e.u64(v);
+    ];
+    let mut i = 0;
+    while i < vals.len() {
+        e.u64(vals[i]);
+        i += 1;
     }
 }
 
+#[inline]
 fn decode_stats(d: &mut Dec<'_>) -> Result<SearchStats, WireFault> {
     const FIELD: &str = "selection.stats";
     Ok(SearchStats {
@@ -613,6 +632,7 @@ fn decode_stats(d: &mut Dec<'_>) -> Result<SearchStats, WireFault> {
     })
 }
 
+#[inline]
 fn encode_selection(e: &mut Enc, s: &SelectionPart) {
     e.u8(s.mode.tag());
     encode_stats(e, &s.stats);
@@ -625,6 +645,7 @@ fn encode_selection(e: &mut Enc, s: &SelectionPart) {
     e.i64(s.s0_gain_ppm);
 }
 
+#[inline]
 fn decode_selection(d: &mut Dec<'_>) -> Result<SelectionPart, WireFault> {
     let tag = d.u8("selection.mode")?;
     let mode = Mode::from_tag(tag).ok_or(WireFault::BadTag {
@@ -644,6 +665,7 @@ fn decode_selection(d: &mut Dec<'_>) -> Result<SelectionPart, WireFault> {
     })
 }
 
+#[inline]
 fn encode_publication(e: &mut Enc, p: &Publication) {
     let h = &p.head;
     e.digest(&h.identity);
@@ -666,6 +688,7 @@ fn encode_publication(e: &mut Enc, p: &Publication) {
     e.digest(&p.candidate_state);
 }
 
+#[inline]
 fn decode_publication(d: &mut Dec<'_>) -> Result<Publication, WireFault> {
     const FIELD: &str = "publication";
     Ok(Publication {
@@ -692,17 +715,21 @@ fn decode_publication(d: &mut Dec<'_>) -> Result<Publication, WireFault> {
     })
 }
 
+#[inline]
 fn decode_strs(d: &mut Dec<'_>, field: &'static str) -> Result<Vec<String>, WireFault> {
     let n = d.count(field, MAX_ASSUMPTIONS)?;
     let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
+    let mut i = 0;
+    while i < n {
         out.push(d.str(field)?.to_owned());
+        i += 1;
     }
     Ok(out)
 }
 
 impl UncheckedBundle {
     /// The bundle's bytes, sealed.
+    #[inline]
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::with_capacity(8 * 1024);
@@ -727,22 +754,33 @@ impl UncheckedBundle {
         e.str(&self.build);
         e.str(&self.toolchain);
         e.u64(wide(self.rows.len()));
-        for r in &self.rows {
-            encode_row(&mut e, r);
+        let mut ri = 0;
+        while ri < self.rows.len() {
+            encode_row(&mut e, &self.rows[ri]);
+            ri += 1;
         }
         encode_selection(&mut e, &self.selection);
         e.opt(self.publication.as_ref(), encode_publication);
         e.u64(wide(self.timings.len()));
-        for t in &self.timings {
+        let mut ti = 0;
+        while ti < self.timings.len() {
+            let t = &self.timings[ti];
             e.str(&t.label);
             e.u64(t.measured_ns);
+            ti += 1;
         }
         e.str(&self.grade);
-        for list in [&self.tested_assumptions, &self.plan_assumptions] {
+        let lists = [&self.tested_assumptions, &self.plan_assumptions];
+        let mut li = 0;
+        while li < lists.len() {
+            let list = lists[li];
             e.u64(wide(list.len()));
-            for a in list {
-                e.str(a);
+            let mut ai = 0;
+            while ai < list.len() {
+                e.str(&list[ai]);
+                ai += 1;
             }
+            li += 1;
         }
         let seal = Digest::of(BUNDLE_DOMAIN, &[e.as_bytes()]);
         e.digest(&seal);
@@ -753,6 +791,7 @@ impl UncheckedBundle {
     /// # Errors
     /// [`BundleRefusal::Magic`], [`BundleRefusal::Format`], [`BundleRefusal::Seal`] (checked before
     /// any part is read) or [`BundleRefusal::Wire`].
+    #[inline]
     pub fn decode(bytes: &[u8]) -> Result<UncheckedBundle, BundleRefusal> {
         let magic = bytes
             .get(..BUNDLE_MAGIC.len())
@@ -784,6 +823,7 @@ impl UncheckedBundle {
         Ok(parts)
     }
 
+    #[inline]
     fn decode_parts(d: &mut Dec<'_>) -> Result<UncheckedBundle, WireFault> {
         let policy = d.artifact("bundle.policy")?;
         let base = d.artifact("bundle.base")?;
@@ -808,18 +848,22 @@ impl UncheckedBundle {
         let toolchain = d.str("bundle.toolchain")?.to_owned();
         let n = d.count("bundle.rows", MAX_ROWS)?;
         let mut rows = Vec::with_capacity(n);
-        for _ in 0..n {
+        let mut i = 0;
+        while i < n {
             rows.push(decode_row(d)?);
+            i += 1;
         }
         let selection = decode_selection(d)?;
         let publication = d.opt("bundle.publication", decode_publication)?;
         let n = d.count("bundle.timings", MAX_TIMINGS)?;
         let mut timings = Vec::with_capacity(n);
-        for _ in 0..n {
+        let mut i = 0;
+        while i < n {
             timings.push(Timing {
                 label: d.str("bundle.timing")?.to_owned(),
                 measured_ns: d.u64("bundle.timing")?,
             });
+            i += 1;
         }
         let grade = d.str("bundle.grade")?.to_owned();
         let tested_assumptions = decode_strs(d, "bundle.tested_assumptions")?;
@@ -895,10 +939,13 @@ impl CandidateBundle {
     /// `bytes` decoded and checked against `evaluator`'s pinned policy.
     /// # Errors
     /// Any [`UncheckedBundle::decode`] refusal, then the first [`BundleRefusal::Forged`].
+    #[inline]
     pub fn verify(bytes: &[u8], evaluator: &Evaluator) -> Result<CandidateBundle, BundleRefusal> {
         let b = UncheckedBundle::decode(bytes)?;
         check_identities(&b, evaluator)?;
-        let plan = SchedulePlan::decode(&b.plan).map_err(|_| forged(BundleField::Plan))?;
+        let Ok(plan) = SchedulePlan::decode(&b.plan) else {
+            return Err(forged(BundleField::Plan));
+        };
         if b.candidate != plan.artifact(&b.build) {
             return Err(forged(BundleField::Candidate));
         }
@@ -906,10 +953,12 @@ impl CandidateBundle {
         check_rows(&b, evaluator, plan)?;
         check_selection(&b, evaluator)?;
         check_grid(&b, evaluator, plan)?;
-        for t in &b.timings {
-            if t.label.is_empty() {
+        let mut ti = 0;
+        while ti < b.timings.len() {
+            if b.timings[ti].label.is_empty() {
                 return Err(forged(BundleField::Timings));
             }
+            ti += 1;
         }
         if let Some(p) = &b.publication {
             check_publication(&b, p, evaluator)?;
@@ -950,6 +999,7 @@ impl SelectionProvenance {
     }
 }
 
+#[inline]
 fn check_identities(b: &UncheckedBundle, ev: &Evaluator) -> Result<(), BundleRefusal> {
     if b.policy != *ev.policy().id() {
         return Err(forged(BundleField::Policy));
@@ -981,14 +1031,18 @@ fn check_identities(b: &UncheckedBundle, ev: &Evaluator) -> Result<(), BundleRef
             BundleField::Assumptions,
         ),
     ];
-    for (ok, field) in checks {
+    let mut ci = 0;
+    while ci < checks.len() {
+        let (ok, field) = checks[ci];
         if !ok {
             return Err(forged(field));
         }
+        ci += 1;
     }
     Ok(())
 }
 
+#[inline]
 fn check_proposer(b: &UncheckedBundle) -> Result<(), BundleRefusal> {
     let ok = match b.selection.mode {
         Mode::OnDemand => b.proposer == ProposerId::on_demand() && b.round == 0 && b.index == 0,
@@ -996,13 +1050,10 @@ fn check_proposer(b: &UncheckedBundle) -> Result<(), BundleRefusal> {
         Mode::Distributed => {
             b.round == 0
                 && (b.proposer != GridProposer::new().id()
-                    || match usize::try_from(b.index) {
-                        Ok(i) => match GridProposer::plans().get(i) {
-                            Some(p) => *p == b.plan,
-                            None => false,
-                        },
-                        Err(_) => false,
-                    })
+                    || usize::try_from(b.index)
+                        .ok()
+                        .and_then(GridProposer::plan_at)
+                        .is_some_and(|p| p == b.plan.as_slice()))
         }
     };
     if ok {
@@ -1012,10 +1063,12 @@ fn check_proposer(b: &UncheckedBundle) -> Result<(), BundleRefusal> {
     }
 }
 
+#[inline]
 fn credits_the_grid(b: &UncheckedBundle) -> bool {
     b.selection.mode == Mode::Search && b.proposer == GridProposer::new().id()
 }
 
+#[inline]
 fn check_grid(
     b: &UncheckedBundle,
     ev: &Evaluator,
@@ -1036,22 +1089,28 @@ fn check_grid(
     }
 }
 
+#[inline]
 fn check_rows(
     b: &UncheckedBundle,
     ev: &Evaluator,
     plan: SchedulePlan,
 ) -> Result<(), BundleRefusal> {
     let pins = ev.policy().items();
-    for (k, pin) in pins.iter().enumerate() {
+    let mut k = 0;
+    while k < pins.len() {
+        let pin = &pins[k];
         match b.rows.get(k) {
             Some(r) if r.item == pin.id() && r.split == pin.split() && r.kind == pin.kind() => {}
             _ => return Err(forged_row(BundleField::Row, pin.id())),
         }
+        k += 1;
     }
     if let Some(extra) = b.rows.get(pins.len()) {
         return Err(forged_row(BundleField::Row, &extra.item));
     }
-    for r in &b.rows {
+    let mut ri = 0;
+    while ri < b.rows.len() {
+        let r = &b.rows[ri];
         let field = if !r.run.passed() {
             Some(BundleField::Run)
         } else if !r.stranded_light.passed() {
@@ -1064,14 +1123,18 @@ fn check_rows(
         if let Some(field) = field {
             return Err(forged_row(field, &r.item));
         }
+        ri += 1;
     }
-    for (k, r) in b.rows.iter().enumerate() {
+    let mut k = 0;
+    while k < b.rows.len() {
+        let r = &b.rows[k];
         let Some(again) = ev.row_at(plan, k) else {
             return Err(forged_row(BundleField::Row, &r.item));
         };
         if let Some(field) = row_difference(r, &again) {
             return Err(forged_row(field, &r.item));
         }
+        k += 1;
     }
     Ok(())
 }
@@ -1079,6 +1142,8 @@ fn check_rows(
 /// The first part in which `r` is not the row `again` judged: its item, split or kind
 /// ([`BundleField::Row`]), then its run, both verdicts, lane digest, chain, `T`, `P`, `Z` and
 /// firings.
+#[inline]
+#[must_use]
 pub(super) fn row_difference(r: &Row, again: &Row) -> Option<BundleField> {
     if r.item != again.item || r.split != again.split || r.kind != again.kind {
         Some(BundleField::Row)
@@ -1107,12 +1172,15 @@ pub(super) fn row_difference(r: &Row, again: &Row) -> Option<BundleField> {
 
 /// Whether `r` is a passing row, as [`check_rows`] reads one: its run and `NoStrandedLight`
 /// passed, and lane fidelity did not fail.
+#[inline]
+#[must_use]
 pub(super) const fn row_passes(r: &Row) -> bool {
     r.run.passed()
         && r.stranded_light.passed()
         && !matches!(r.lane_fidelity, RowVerdict::Fail { .. })
 }
 
+#[inline]
 fn check_selection(b: &UncheckedBundle, ev: &Evaluator) -> Result<(), BundleRefusal> {
     let s = &b.selection;
     let st = &s.stats;
@@ -1160,8 +1228,9 @@ fn check_selection(b: &UncheckedBundle, ev: &Evaluator) -> Result<(), BundleRefu
 }
 
 /// Whether `st` are the counts of the grid's one round: every plan proposed is distinct.
-fn grid_counts(st: &SearchStats) -> bool {
-    let plans = wide(GridProposer::plans().len());
+#[inline]
+const fn grid_counts(st: &SearchStats) -> bool {
+    let plans = wide(GridProposer::len());
     st.proposed == plans
         && st.distinct == plans
         && st.oversized == 0
@@ -1171,6 +1240,7 @@ fn grid_counts(st: &SearchStats) -> bool {
 
 /// `a + b`, field by field, saturating.
 #[inline]
+#[must_use]
 pub(super) const fn add(a: Totals, b: Totals) -> Totals {
     Totals {
         ticks: a.ticks.saturating_add(b.ticks),
@@ -1179,17 +1249,21 @@ pub(super) const fn add(a: Totals, b: Totals) -> Totals {
     }
 }
 
+#[inline]
 fn check_publication(
     b: &UncheckedBundle,
     p: &Publication,
     ev: &Evaluator,
 ) -> Result<(), BundleRefusal> {
     let mut how = None;
-    for c in MomentumCode::ALL {
+    let mut ci = 0;
+    while ci < MomentumCode::ALL.len() {
+        let c = MomentumCode::ALL[ci];
         if p.live_code == c.artifact(&b.build) {
-            how = ev.policy().base(Sched::Prebuilt(*c));
+            how = ev.policy().base(Sched::Prebuilt(c));
             break;
         }
+        ci += 1;
     }
     let by_rule = match how {
         Some(Replace::Optimization) => b.selection.useful,

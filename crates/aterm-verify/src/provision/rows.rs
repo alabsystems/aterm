@@ -112,10 +112,11 @@ pub enum Install {
     Cargo,
     /// Browser engine pinned by the browser lane.
     Browser(Engine),
-    /// Pinned `rustup` stable toolchain with cross/wasm32 targets (`STOCK EXCEPTION`).
+    /// rustup-init at its tool row's pin, copied into the cache as `bin/rustup` (rustup-init
+    /// is rustup's multi-call binary, so under that name it is rustup itself) with its `cargo`
+    /// and `rustc` proxies and never run as an installer; then stock stable with the foreign
+    /// cells' and wasm32's std, and the wasm32 pin, in rustup's own home (`STOCK EXCEPTION`).
     Rustup {
-        /// Pinned `rustup` release version.
-        version: &'static str,
         /// `rustup-init` binaries per host.
         init: &'static [Archive],
     },
@@ -148,7 +149,7 @@ impl Row {
         }
     }
 
-    /// Version pinned by its tool row (`None` for browsers and `rustup`).
+    /// Version pinned by its tool row (`None` for browsers).
     #[must_use]
     pub fn version(&self) -> Option<&'static str> {
         self.tool_row().and_then(|t| t.pin).map(|p| p.version)
@@ -204,7 +205,6 @@ pub const ROWS: [Row; 12] = [
         name: "rustup",
         tool: Some("rustup"),
         install: Install::Rustup {
-            version: "1.29.2",
             init: &[
                 Archive {
                     platform: "macos-aarch64",

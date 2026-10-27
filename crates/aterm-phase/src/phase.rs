@@ -9,21 +9,11 @@ use std::fmt;
 use crate::prompt::parse_prompt;
 use crate::wall::{Placement, Wall, WallKind, classify_wall};
 
-/// Major component of the Claude Code (`claude`) harness version, starting at `0.1`.
-pub const HARNESS_VERSION_MAJOR: u16 = 0;
-
-/// Minor component of the Claude Code (`claude`) harness version, starting at `0.1`.
-pub const HARNESS_VERSION_MINOR: u16 = 1;
-
-/// Version of the Claude Code harness, tracked independently per harness starting at `"0.1"`.
-pub const HARNESS_VERSION: &str = "0.1";
-
-/// Structured incremental numeric version of the Claude Code (`claude`) harness.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(
-    HARNESS_VERSION_MAJOR,
-    HARNESS_VERSION_MINOR,
-    HARNESS_VERSION,
-);
+/// The Claude Code (`claude`) harness version, `MAJOR.MINOR` with no third part.
+///
+/// Its minor goes up once per public release window in which its sources changed
+/// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 4, "0.4");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -607,7 +597,7 @@ pub fn is_spinner_row(row: &str) -> bool {
 }
 
 /// A status row naming an activity in progress.
-fn is_activity_row(row: &str) -> bool {
+pub(crate) fn is_activity_row(row: &str) -> bool {
     let t = crate::text::trim_start(row);
     let mut cs = t.chars();
     if !cs.next().is_some_and(is_spinner_glyph) {

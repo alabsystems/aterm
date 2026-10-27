@@ -69,6 +69,7 @@ use crate::logid;
 use crate::store::{
     create_like, flush_file, log_identity, open_regular_sidecar, open_with_options, read_base,
     read_state_base, remove_file_path, rename_path, state_path, sync_parent_dir, write_base,
+    AtRestRef,
 };
 use astream_wire::frame::decode_frame_header_bytes;
 use astream_wire::{Frame, HEADER_SIZE, MAX_PAYLOAD_LEN};
@@ -93,6 +94,19 @@ const INTENT_MAGIC: &[u8; 5] = b"ASCI\x01";
 /// Domain-separating AAD for sealing `<log>.compact` under the log's at-rest key.
 #[cfg(feature = "at-rest")]
 const INTENT_AAD: &[u8] = b"astream-compact-intent-v1";
+#[cfg(feature = "at-rest")]
+const INTENT_BOUND_PREFIX: &[u8; 25] = b"astream-compact-intent-v2";
+
+#[cfg(feature = "at-rest")]
+const fn intent_bound_aad(id: [u8; 16]) -> [u8; 41] {
+    let p = INTENT_BOUND_PREFIX;
+    [
+        p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13],
+        p[14], p[15], p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23], p[24], id[0], id[1],
+        id[2], id[3], id[4], id[5], id[6], id[7], id[8], id[9], id[10], id[11], id[12], id[13],
+        id[14], id[15],
+    ]
+}
 
 /// A durable step of the compaction, in the order it takes them: where the seam can crash
 /// it (see the module docs).
@@ -252,21 +266,44 @@ impl Intent {
 }
 
 #[cfg(feature = "at-rest")]
-fn seal(key: Option<&[u8; 32]>, payload: Vec<u8>) -> Vec<u8> {
+fn seal(key: Option<AtRestRef<'_>>, payload: Vec<u8>) -> Vec<u8> {
     match key {
-        Some(k) => astream_aead::seal(k, INTENT_AAD, &payload),
+        Some(AtRestRef {
+            key: k,
+            seal_id: Some(id),
+        }) => {
+            let aad = intent_bound_aad(id);
+            astream_aead::seal(k, &aad, &payload)
+        }
+        Some(AtRestRef {
+            key: k,
+            seal_id: None,
+        }) => astream_aead::seal(k, INTENT_AAD, &payload),
         None => payload,
     }
 }
 #[cfg(not(feature = "at-rest"))]
-fn seal(_key: Option<&[u8; 32]>, payload: Vec<u8>) -> Vec<u8> {
+fn seal(_key: Option<AtRestRef<'_>>, payload: Vec<u8>) -> Vec<u8> {
     payload
 }
 
 #[cfg(feature = "at-rest")]
-fn unseal(key: Option<&[u8; 32]>, payload: Vec<u8>) -> Option<Vec<u8>> {
+fn unseal(key: Option<AtRestRef<'_>>, payload: Vec<u8>) -> Option<Vec<u8>> {
     match key {
-        Some(k) => match astream_aead::open(k, INTENT_AAD, &payload) {
+        Some(AtRestRef {
+            key: k,
+            seal_id: Some(id),
+        }) => {
+            let aad = intent_bound_aad(id);
+            match astream_aead::open(k, &aad, &payload) {
+                Ok(p) => Some(p),
+                Err(_) => None,
+            }
+        }
+        Some(AtRestRef {
+            key: k,
+            seal_id: None,
+        }) => match astream_aead::open(k, INTENT_AAD, &payload) {
             Ok(p) => Some(p),
             Err(_) => None,
         },
@@ -274,7 +311,7 @@ fn unseal(key: Option<&[u8; 32]>, payload: Vec<u8>) -> Option<Vec<u8>> {
     }
 }
 #[cfg(not(feature = "at-rest"))]
-fn unseal(_key: Option<&[u8; 32]>, payload: Vec<u8>) -> Option<Vec<u8>> {
+fn unseal(_key: Option<AtRestRef<'_>>, payload: Vec<u8>) -> Option<Vec<u8>> {
     Some(payload)
 }
 
@@ -285,7 +322,7 @@ fn unseal(_key: Option<&[u8; 32]>, payload: Vec<u8>) -> Option<Vec<u8>> {
 /// `perms`, the log's own.
 pub(crate) fn write_intent(
     log: &Path,
-    key: Option<&[u8; 32]>,
+    key: Option<AtRestRef<'_>>,
     intent: &Intent,
     perms: &Permissions,
 ) -> io::Result<()> {
@@ -320,7 +357,7 @@ pub(crate) enum Found {
 
 /// Read `<log>.compact` through a bounded, no-follow regular-file handle.
 /// Absence is only the initial lookup; later admission and read failures refuse.
-pub(crate) fn read_intent(log: &Path, key: Option<&[u8; 32]>) -> io::Result<Found> {
+pub(crate) fn read_intent(log: &Path, key: Option<AtRestRef<'_>>) -> io::Result<Found> {
     let path = intent_path(log);
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(m) => m,
@@ -341,7 +378,7 @@ pub(crate) fn read_intent(log: &Path, key: Option<&[u8; 32]>) -> io::Result<Foun
 }
 
 /// Decode an intent file's bytes: exactly one frame, authenticated when keyed.
-pub(crate) fn decode_intent_file(bytes: &[u8], key: Option<&[u8; 32]>) -> Found {
+pub(crate) fn decode_intent_file(bytes: &[u8], key: Option<AtRestRef<'_>>) -> Found {
     let payload = match Frame::decode(bytes) {
         Ok(Some(d)) if d.consumed == bytes.len() => d.frame.payload,
         _ => return Found::Unreadable("not one frame"),
@@ -421,7 +458,7 @@ pub(crate) fn judge(intent: &Intent, first: Option<FrameId>) -> Verdict {
 pub(crate) fn recover(
     log: &Path,
     existing: &[u8],
-    key: Option<&[u8; 32]>,
+    key: Option<AtRestRef<'_>>,
     anti_rollback: bool,
 ) -> io::Result<()> {
     let intent = match read_intent(log, key)? {
@@ -476,7 +513,7 @@ pub(crate) fn recover(
 /// is recovered the same way by the next open.
 fn finish(
     log: &Path,
-    key: Option<&[u8; 32]>,
+    key: Option<AtRestRef<'_>>,
     intent: &Intent,
     anti_rollback: bool,
 ) -> io::Result<()> {
@@ -548,7 +585,7 @@ fn finish(
 #[cfg(feature = "anti-rollback")]
 pub(crate) fn reidentify(
     log: &Path,
-    key: Option<&[u8; 32]>,
+    key: Option<AtRestRef<'_>>,
     intent: &Intent,
     verified: bool,
 ) -> io::Result<bool> {
@@ -577,7 +614,7 @@ pub(crate) fn reidentify(
 #[cfg(not(feature = "anti-rollback"))]
 pub(crate) fn reidentify(
     _log: &Path,
-    _key: Option<&[u8; 32]>,
+    _key: Option<AtRestRef<'_>>,
     _intent: &Intent,
     _verified: bool,
 ) -> io::Result<bool> {

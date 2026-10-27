@@ -198,9 +198,6 @@ const GPU_BACKEND_LABEL: &str = "gpu (gl)";
 /// present (docs/AUDIT-third-party-2026-10-15.md GW.5).
 #[cfg(windows)]
 const GPU_BACKEND_LABEL: &str = "gpu (d3d11)";
-/// Everything else: wgpu's Vulkan backend.
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-const GPU_BACKEND_LABEL: &str = "gpu (vulkan)";
 
 const fn renderer_label(gpu: bool) -> &'static str {
     if gpu { GPU_BACKEND_LABEL } else { "cpu" }

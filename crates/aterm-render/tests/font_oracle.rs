@@ -954,9 +954,32 @@ fn moved_by_coordinates(lines: &[Line], present: &Present) -> usize {
 /// Face tables and nominal glyphs used to classify shaping replay deltas.
 #[derive(Clone, Default)]
 struct ShapingTraits {
-    positions: bool,
+    pair_set_device: bool,
     morx: bool,
     nominal: BTreeMap<char, u32>,
+}
+
+fn has_pair_set_device(face: &aterm_font::Face<'_>) -> bool {
+    let Some(gpos) = face.tables().gpos else {
+        return false;
+    };
+    for i in 0..gpos.lookups.len() {
+        let Some(lookup) = gpos.lookups.get(i) else {
+            continue;
+        };
+        for j in 0..lookup.subtables.len() {
+            if let Some(aterm_font::gpos::PositioningSubtable::Pair(
+                aterm_font::gpos::PairAdjustment::Format1 { sets, .. },
+            )) = lookup
+                .subtables
+                .get::<aterm_font::gpos::PositioningSubtable>(j)
+                && sets.has_device_tables()
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn shaping_traits(bytes: &[u8], index: u32, chars: &BTreeSet<char>) -> ShapingTraits {
@@ -965,7 +988,7 @@ fn shaping_traits(bytes: &[u8], index: u32, chars: &BTreeSet<char>) -> ShapingTr
     };
     let raw = face.raw_face();
     ShapingTraits {
-        positions: face.tables().gpos.is_some() || face.tables().kern.is_some(),
+        pair_set_device: has_pair_set_device(&face),
         morx: raw.table(aterm_font::Tag::from_bytes(b"morx")).is_some(),
         nominal: chars
             .iter()
@@ -997,7 +1020,7 @@ enum ShapingDelta {
     Normalization,
     /// Upstream mirrors by run direction rather than bidi level.
     Mirroring,
-    /// Upstream positions with `GPOS`, `kern`, or fallback mark placement.
+    /// Upstream `ttf-parser` 0.25.1 truncated `PairSet` before its `VariationDevice` tables.
     Positions,
 }
 
@@ -1123,9 +1146,8 @@ fn shaping_delta(line: &Line, now: &str, traits: &ShapingTraits) -> Option<Shapi
     {
         return Some(ShapingDelta::Normalization);
     }
-    let recorded_offsets = line.answer.contains('@');
-    (ids_and_clusters(now) == ids_and_clusters(&line.answer)
-        && (traits.positions || recorded_offsets))
+    let pair_set_var = traits.pair_set_device && line.inst != "-";
+    (ids_and_clusters(now) == ids_and_clusters(&line.answer) && pair_set_var)
         .then_some(ShapingDelta::Positions)
 }
 
@@ -1288,30 +1310,40 @@ fn a_shaping_delta_is_classified_narrowly() {
         ('\u{301}', 40),
         (' ', 3),
     ]);
-    let positioned = ShapingTraits {
-        positions: true,
-        morx: false,
+    let pair_set_var = ShapingTraits {
+        pair_set_device: true,
         nominal: nominal.clone(),
+        ..ShapingTraits::default()
     };
     let plain = ShapingTraits {
         nominal,
         ..ShapingTraits::default()
     };
-    let recorded = line("lig.arrow", "=>", "LTR Zzzz | 7:0:600 8:1:600");
+    let recorded_default = line("lig.arrow", "=>", "LTR Zzzz | 7:0:600 8:1:600");
+    let mut recorded_var = recorded_default.clone();
+    recorded_var.inst = "wght=700.0".to_string();
     assert_eq!(
-        shaping_delta(&recorded, "LTR Zzzz | 7:0:590 8:1:600", &positioned),
+        shaping_delta(&recorded_var, "LTR Zzzz | 7:0:590 8:1:600", &pair_set_var),
         Some(ShapingDelta::Positions)
     );
     assert_eq!(
-        shaping_delta(&recorded, "LTR Zzzz | 7:0:590 8:1:600", &plain),
+        shaping_delta(
+            &recorded_default,
+            "LTR Zzzz | 7:0:590 8:1:600",
+            &pair_set_var
+        ),
         None
     );
     assert_eq!(
-        shaping_delta(&recorded, "LTR Zzzz | 7:0:600 9:1:600", &positioned),
+        shaping_delta(&recorded_var, "LTR Zzzz | 7:0:590 8:1:600", &plain),
         None
     );
     assert_eq!(
-        shaping_delta(&recorded, "RTL Zzzz | 7:0:600 8:1:600", &positioned),
+        shaping_delta(&recorded_var, "LTR Zzzz | 7:0:600 9:1:600", &pair_set_var),
+        None
+    );
+    assert_eq!(
+        shaping_delta(&recorded_var, "RTL Zzzz | 7:0:600 8:1:600", &pair_set_var),
         None
     );
 

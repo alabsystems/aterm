@@ -37,6 +37,13 @@
 //! The lane takes its inputs only from what `verify provision --linux` placed and stamped
 //! for the pin ([`pins::base`], [`pins::kernel_files`]); reading them at a bring-up marks
 //! their rows used, so the tooling cache's idle reclaim keeps them while the lane runs.
+//!
+//! The lifetime is a model (slice V5): `VzLifecycle` (`aterm_models_misc::vz_lifecycle_model`),
+//! whose actions the core, the client, the run files and the layers carry as anchors in test
+//! and debug builds, bound by `tests/conformance_lifecycle.rs`; `fault` holds its negative
+//! controls' planted defects, and `lifecycle` the steps that are the world's or the lab's.
+
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 #[cfg(unix)]
 pub mod agent;
@@ -45,12 +52,16 @@ pub mod client;
 pub mod clone;
 pub mod console;
 pub mod detect;
+#[cfg(any(test, debug_assertions))]
+pub mod fault;
 #[cfg(unix)]
 pub mod helper;
 pub mod kernel;
 #[cfg(unix)]
 pub mod key;
 pub mod layers;
+#[cfg(any(test, debug_assertions))]
+pub mod lifecycle;
 #[cfg(unix)]
 pub mod machine;
 pub mod pins;

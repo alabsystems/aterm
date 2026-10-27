@@ -84,6 +84,8 @@ pub mod grapheme;
 pub mod grid;
 /// VT100/ANSI escape sequence parser (the [`aterm_parser`] crate).
 pub(crate) use aterm_parser as parser;
+/// OSC / escape-sequence security policy engine (re-exported from `aterm-policy`).
+pub use aterm_policy as policy;
 /// Text selection and smart semantic selection (re-exported from `aterm-selection`).
 pub use aterm_selection as selection;
 /// Engine-owned [`render::RenderInput`] snapshot consumed by renderers.

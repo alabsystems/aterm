@@ -13,6 +13,347 @@ use aterm_vitals::jobs::{Consumer, Demand, JobRow, JobsView};
 use aterm_vitals::model::Resource;
 use aterm_vitals::words::{self, Locale, Platform};
 
+fn saved_cpu_anomaly() -> Snapshot {
+    use aterm_vitals::hardware::{Bundle, Frame};
+    let mut hardware = aterm_vitals::hardware::Sample::unavailable("not_sampled");
+    hardware.channels = Ok(vec![aterm_vitals::hardware::Channel {
+        raw_elements: vec![0x00, 0xff, 0x80],
+        name: "P core 0".into(),
+        subgroup: "CPU Core Performance States".into(),
+        unit: "ticks".into(),
+        states: vec![aterm_vitals::hardware::State {
+            name: "IDLE".into(),
+            ticks: 7,
+        }],
+        active: Ok(0.0),
+        active_mhz: Err("no_counter_delta".into()),
+        frequency_source: "not_sampled".into(),
+    }]);
+    Snapshot {
+        at_ns: 90_000_000_000,
+        at_unix_ms: 2_000,
+        cpu_diagnostics: Some(Bundle {
+            version: 1,
+            since_ns: 50_000_000_000,
+            last_ns: 90_000_000_000,
+            resolved_ns: None,
+            frames: vec![Frame {
+                clusters: Vec::new(),
+                busy: vec![Some(0.0), Some(1.0)],
+                kernel_window_ns: Some(1_000_000_000),
+                at_ns: 90_000_000_000,
+                at_unix_ms: 2_000,
+                counters: vec![Ticks {
+                    busy: u64::MAX - 1,
+                    total: u64::MAX,
+                }],
+                hardware: Some(hardware),
+                thermal: None,
+                wait: Some(1.0),
+                workers: Vec::new(),
+            }],
+        }),
+        ..Snapshot::default()
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn cpu_policy_terminal_exit_and_signal_reports_survive_the_actual_saved_codec() {
+    use std::os::unix::process::ExitStatusExt;
+    for raw in [0, 15] {
+        let report = crate::cpu_policy_authorization::terminal_report_for_test(
+            std::process::ExitStatus::from_raw(raw),
+        );
+        let captured = report["observed_unix_ms"].as_i64().unwrap();
+        if raw == 0 {
+            assert_eq!(report["sudo_exit_code"].as_i64(), Some(0));
+            assert!(report.get("sudo_exit_signal").is_none());
+        } else {
+            assert_eq!(report["sudo_exit_signal"].as_i64(), Some(15));
+            assert!(report.get("sudo_exit_code").is_none());
+        }
+        let mut generation = Some((1, 0));
+        let policy = take_cpu_policy_report(&mut generation, report)
+            .expect("terminal report contains no rejected null");
+        let snapshot = Snapshot {
+            at_unix_ms: captured,
+            authorized_cpu_policy: Some(Arc::new(policy)),
+            ..Snapshot::default()
+        };
+        let record = cpu_report_record(&snapshot).unwrap();
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join(CPU_REPORT_FILE);
+        let now = Instant::now();
+        let (mut file, _) = CpuReportFile::open(Some(path.clone()), now, captured + 1);
+        file.keep(&Some(record.clone()), now, true);
+        let restored = CpuReportFile::open(Some(path), now, captured + 1)
+            .1
+            .unwrap();
+        assert_eq!(
+            aterm_json::from_str::<aterm_json::Value>(&restored.to_text()).unwrap(),
+            aterm_json::from_str::<aterm_json::Value>(&record.to_text()).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn cpu_policy_rejected_value_does_not_consume_the_valid_report_revision() {
+    let mut current = Some((1, 0));
+    let good = aterm_json::json!({"schema":1,"operation":"cpu_policy","request_id":1,"revision":2,
+        "state":"observed","observed_unix_ms":1000});
+    let mut bad = good.clone();
+    bad.as_object_mut()
+        .unwrap()
+        .insert("invalid".into(), aterm_json::Value::Null);
+    assert!(take_cpu_policy_report(&mut current, bad).is_none());
+    assert_eq!(current, Some((1, 0)));
+    assert!(take_cpu_policy_report(&mut current, good).is_some());
+    assert_eq!(current, Some((1, 2)));
+}
+
+#[test]
+fn cpu_policy_reversed_completion_cannot_replace_the_current_request_or_drained_report() {
+    let mut current = Some((90, 0));
+    assert!(accept_cpu_policy_generation(&mut current, 90, 1));
+    current = Some((2, 0)); // opaque IDs are equality tokens, not a sortable sequence.
+    assert!(accept_cpu_policy_generation(&mut current, 2, 2));
+    assert!(
+        !accept_cpu_policy_generation(&mut current, 90, 2),
+        "old request arrived after new completion"
+    );
+    assert!(
+        !accept_cpu_policy_generation(&mut current, 2, 1),
+        "old partial arrived after drained update"
+    );
+    assert!(
+        !accept_cpu_policy_generation(&mut current, 2, 2),
+        "duplicate completion"
+    );
+    assert_eq!(current, Some((2, 2)));
+    current = Some((1, 0));
+    assert!(accept_cpu_policy_generation(&mut current, 1, 1));
+    assert!(accept_cpu_policy_generation(&mut current, 1, 2));
+}
+
+#[test]
+fn cpu_policy_denied_or_partial_report_persists_without_restoring_authority() {
+    use aterm_vitals::sys::json::Jv;
+    let policy = convert_cpu_report_value(
+        aterm_json::json!({"schema":1,"operation":"cpu_policy",
+        "observed_unix_ms":1900,"state":"partial_or_failed","collector_exit_observed":true,
+        "capture":{"effective_uid":0,"getter_errors":3}}),
+        0,
+        &mut 200_000,
+    )
+    .unwrap();
+    let mut snap = Snapshot {
+        at_unix_ms: 2000,
+        authorized_cpu_policy: Some(Arc::new(policy.clone())),
+        ..Snapshot::default()
+    };
+    let record =
+        cpu_report_record(&snap).expect("explicit policy collection needs no automatic anomaly");
+    assert_eq!(record.get("kind"), Some(&Jv::s("historical_cpu_policy")));
+    let restored = cpu_report_of(&record.to_text(), 3000).unwrap().unwrap();
+    let mut model = aterm_vitals::Vitals::new();
+    model.restore_cpu_report(Some(restored));
+    let fresh = model.absorb(&Sample {
+        at_ns: 1,
+        at_unix_ms: 3000,
+        ..Sample::default()
+    });
+    assert!(
+        fresh.authorized_cpu_policy.is_none(),
+        "historical authorization is never live authority"
+    );
+    assert!(fresh.cpu_diagnostics.is_none());
+    assert!(fresh.historical_cpu_report.is_some());
+    snap.authorized_cpu_policy = Some(Arc::new(Jv::obj([
+        ("schema", Jv::u(1)),
+        ("operation", Jv::s("cpu_policy")),
+        ("observed_unix_ms", Jv::u(2001)),
+        ("state", Jv::s("observed")),
+    ])));
+    assert!(
+        cpu_report_of(&cpu_report_record(&snap).unwrap().to_text(), 3000).is_none(),
+        "policy window cannot be in capture's future"
+    );
+    let report = aterm_vitals::sys::hardware::current_report_json(&fresh);
+    assert_eq!(
+        report.get("authorized_cpu_policy").unwrap().get("why"),
+        Some(&Jv::s("not_sampled"))
+    );
+}
+
+#[test]
+fn cpu_hardware_report_survives_restart_without_restoring_live_monotonic_state() {
+    let dir = aterm_tempfile::tempdir().expect("scratch state");
+    let path = dir.path().join(CPU_REPORT_FILE);
+    let now = Instant::now();
+    let (mut file, prior) = CpuReportFile::open(Some(path.clone()), now, 3_000);
+    assert!(prior.is_none());
+    let record = cpu_report_record(&saved_cpu_anomaly()).expect("anomaly");
+    file.keep(&Some(record.clone()), now, false);
+    let raw = std::fs::read_to_string(&path).expect("first anomaly checkpoints immediately");
+    assert!(
+        raw.contains("18446744073709551615"),
+        "raw counter stays exact"
+    );
+    assert!(
+        raw.contains("00ff80"),
+        "raw native bytes survive the persisted report"
+    );
+    let restored = CpuReportFile::open(Some(path), now, 3_000)
+        .1
+        .expect("restored report");
+    assert_eq!(
+        aterm_json::from_str::<aterm_json::Value>(&raw).unwrap(),
+        aterm_json::from_str::<aterm_json::Value>(&restored.to_text()).unwrap(),
+    );
+    let mut model = aterm_vitals::Vitals::new();
+    model.restore_cpu_report(Some(restored));
+    let fresh = model.absorb(&Sample {
+        at_ns: 1,
+        at_unix_ms: 3_000,
+        ..Sample::default()
+    });
+    assert!(
+        fresh.cpu_diagnostics.is_none(),
+        "historical clocks never enter the detector"
+    );
+    assert_eq!(fresh.at_ns, 1);
+    let exported = aterm_vitals::sys::hardware::report_json(&fresh);
+    assert!(
+        exported
+            .get("prior_process_capture")
+            .unwrap()
+            .get("origin_build")
+            .is_some()
+    );
+    assert_eq!(
+        exported.get("anomaly").unwrap().get("why"),
+        Some(&aterm_vitals::sys::json::Jv::s("not_sampled"))
+    );
+    let mut next = saved_cpu_anomaly();
+    next.historical_cpu_report = Some(Arc::new(record));
+    let next = cpu_report_record(&next).expect("next current anomaly");
+    assert!(
+        next.get("report")
+            .unwrap()
+            .get("prior_process_capture")
+            .is_none(),
+        "saved reports do not nest"
+    );
+    assert!(
+        cpu_report_record(&fresh).is_none(),
+        "a fresh unknown sample cannot replace saved evidence"
+    );
+}
+
+#[test]
+fn cpu_hardware_report_refuses_future_damaged_unbounded_and_deep_records() {
+    use aterm_vitals::sys::json::Jv;
+    let good = cpu_report_record(&saved_cpu_anomaly()).expect("anomaly");
+    let raw = good.to_text();
+    assert!(cpu_report_of(&raw, 3_000).is_some());
+    assert!(cpu_report_of(&raw, 1_999).is_none(), "future capture");
+    assert!(cpu_report_of("{", 3_000).is_none());
+    let mut bad = good.clone();
+    bad.set("schema", Jv::Int(2));
+    assert!(cpu_report_of(&bad.to_text(), 3_000).is_none());
+    let mut too_many = saved_cpu_anomaly();
+    let frame = too_many.cpu_diagnostics.as_ref().unwrap().frames[0].clone();
+    too_many.cpu_diagnostics.as_mut().unwrap().frames = vec![frame; 9];
+    let oversized_frames = cpu_report_record(&too_many).unwrap();
+    assert!(cpu_report_of(&oversized_frames.to_text(), 3_000).is_none());
+    let mut future_frame = saved_cpu_anomaly();
+    future_frame.cpu_diagnostics.as_mut().unwrap().frames[0].at_unix_ms = 2_001;
+    assert!(cpu_report_of(&cpu_report_record(&future_frame).unwrap().to_text(), 3_000).is_none());
+    let mut deep = Jv::Int(1);
+    for _ in 0..40 {
+        deep = Jv::Arr(vec![deep]);
+    }
+    bad = good.clone();
+    bad.set("extra", deep);
+    assert!(cpu_report_of(&bad.to_text(), 3_000).is_none());
+    let dir = aterm_tempfile::tempdir().expect("scratch state");
+    let path = dir.path().join(CPU_REPORT_FILE);
+    std::fs::write(
+        &path,
+        format!("{raw}{}", " ".repeat(CPU_REPORT_MAX_BYTES as usize)),
+    )
+    .unwrap();
+    assert!(
+        CpuReportFile::open(Some(path.clone()), Instant::now(), 3_000)
+            .1
+            .is_none()
+    );
+    std::fs::write(&path, &raw).unwrap();
+    assert!(
+        CpuReportFile::open(Some(path.clone()), Instant::now(), 3_000)
+            .1
+            .is_some(),
+        "same report inside byte bound"
+    );
+    let now = Instant::now();
+    let (mut file, _) = CpuReportFile::open(Some(path.clone()), now, 3_000);
+    file.keep(
+        &Some(Jv::s("x".repeat(CPU_REPORT_MAX_BYTES as usize))),
+        now,
+        false,
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        raw,
+        "an oversized replacement preserves prior evidence"
+    );
+}
+
+#[test]
+fn cpu_hardware_is_sampled_after_complete_machine_and_process_counters() {
+    fn hardware(
+        _: &mut aterm_sysprobe::cpu_hardware::Probe,
+        sample: &Sample,
+    ) -> aterm_sysprobe::cpu_hardware::Sample {
+        assert_eq!(sample.at_ns, 123);
+        assert_eq!(sample.cores.as_ref().unwrap()[0].total, 456);
+        assert_eq!(sample.procs.is_some(), !sample.machine_only);
+        assert!(
+            sample.hardware.is_none(),
+            "no stale hardware sample is passed forward"
+        );
+        aterm_sysprobe::cpu_hardware::Sample::unavailable("not_sampled")
+    }
+    let mut probe = aterm_sysprobe::cpu_hardware::Probe::default();
+    for machine_only in [false, true] {
+        let mut sample = Sample {
+            at_ns: 123,
+            machine_only,
+            cores: Some(vec![Ticks {
+                busy: 100,
+                total: 456,
+            }]),
+            procs: (!machine_only).then(|| {
+                vec![ProcSample {
+                    pid: 999,
+                    cpu_ns: Some(777),
+                    ..ProcSample::default()
+                }]
+            }),
+            ..Sample::default()
+        };
+        let before = sample.clone();
+        attach_hardware(&mut sample, &mut probe, hardware);
+        assert!(sample.hardware.is_some());
+        sample.hardware = None;
+        assert_eq!(
+            sample, before,
+            "hardware collection changes no captured value or timestamp"
+        );
+    }
+}
+
 #[test]
 #[cfg(unix)]
 fn volume_reads_use_only_complete_local_mount_roots() {
@@ -344,7 +685,7 @@ fn a_busy_reader_keeps_its_pending_messages_and_forgoes_newer_work() {
     };
     let pid_of = |m: Msg| match m {
         Msg::Read(r) | Msg::Facts(r) => r.self_pid,
-        Msg::Pull => 0,
+        Msg::Pull | Msg::CpuPolicy(_) => 0,
     };
     assert!(host.offer(request(1)));
     assert!(
@@ -1371,6 +1712,7 @@ fn watched_board() -> (Shelf, VolumeKey) {
             hogs: 1,
             largest: 212 * GB,
             left: vec![PassHog {
+                built_s_ago: None,
                 path: PathBuf::from("/Users//x/aterm/target"),
                 bytes: 212 * GB,
                 bytes_partial: false,
@@ -4459,6 +4801,15 @@ fn net_probe_seam_and_socket_attribution_reach_the_snapshot() {
 #[test]
 fn proc_sample_forwards_disk_read_and_host_keeps_crash_notes_on_backpressure() {
     let reading = aterm_sysprobe::ProcessReading {
+        scheduling: Some(aterm_sysprobe::procs::Scheduling {
+            nice: Ok(0),
+            application: true,
+            background_internal: false,
+            background_external: true,
+            suppressed: false,
+            role: Ok(0),
+            qos_cpu_ns: Some(Err(13)),
+        }),
         pid: 42,
         ppid: 1,
         cpu_ns: Some(0),
@@ -4475,6 +4826,16 @@ fn proc_sample_forwards_disk_read_and_host_keeps_crash_notes_on_backpressure() {
     let sampled = proc_sample(&reading, Instant::now());
     assert_eq!(sampled.disk_read, Some(8192));
     assert_eq!(sampled.disk_written, Some(2048));
+    let scheduling = sampled
+        .scheduling
+        .expect("scheduling is forwarded without reinterpretation");
+    assert_eq!(scheduling.nice, Ok(0));
+    assert!(scheduling.application);
+    assert!(!scheduling.background_internal);
+    assert!(scheduling.background_external);
+    assert!(!scheduling.suppressed);
+    assert_eq!(scheduling.role, Ok(0));
+    assert_eq!(scheduling.qos_cpu_ns, Some(Err(13)));
 
     let mut host = VitalsHost::default();
     let now_ms = std::time::SystemTime::now()
@@ -4588,7 +4949,7 @@ fn strip_file_persists_one_hour_history_and_marks_abrupt_exit_on_reopen() {
         snap.strip_events
     );
     let slots = snap.resources[Resource::Memory.index()].heat_multi_scale(
-        aterm_vitals::MultiScaleSpec::FULL_HOUR,
+        aterm_vitals::MultiScaleSpec::FULL_6H,
         reopen_ms,
         2_500,
         &snap.time_gaps,
@@ -4599,7 +4960,7 @@ fn strip_file_persists_one_hour_history_and_marks_abrupt_exit_on_reopen() {
             .any(|hs| hs.slot.age_lo_ms >= 60_000 && hs.cell.heat.is_some_and(|h| h > 0.5)),
         "pre-crash memory history must survive StripFile round-trip: {slots:?}"
     );
-    let live_now = slots.last().expect("live_now slot");
+    let live_now = slots.first().expect("live_now slot");
     assert!(live_now.slot.is_live_now);
     assert!(
         live_now.cell.heat.is_some_and(|h| h > 0.3) && live_now.cell.gap.is_none(),
@@ -4615,4 +4976,78 @@ fn strip_file_persists_one_hour_history_and_marks_abrupt_exit_on_reopen() {
     );
     let (_, clean_saved) = StripFile::open(Some(path), now + Duration::from_secs(33));
     assert!(clean_saved.clean_stop);
+}
+
+#[test]
+fn cold_pull_feeds_noted_gaps_and_events_once_and_facts_preserves_them() {
+    struct CountingSource {
+        model: aterm_vitals::Vitals,
+        noted_batches: Vec<(usize, usize)>,
+        step: u64,
+    }
+    impl Source for CountingSource {
+        fn reading(&mut self, req: &Request) -> Snapshot {
+            self.noted_batches
+                .push((req.note_gaps.len(), req.note_events.len()));
+            self.step += 1;
+            self.model.absorb(&Sample {
+                at_ns: self.step * 100_000_000,
+                at_unix_ms: 1_793_000_000_000 + (self.step as i64) * 100,
+                mono_ms: self.step * 100,
+                cadence_ms: req.cadence_ms,
+                note_gaps: req.note_gaps.clone(),
+                note_events: req.note_events.clone(),
+                ..Sample::default()
+            })
+        }
+        fn model(&mut self) -> &mut aterm_vitals::Vitals {
+            &mut self.model
+        }
+    }
+
+    let gap = aterm_vitals::TimeGap {
+        start_ms: 1_792_999_980_000,
+        end_ms: 1_792_999_995_000,
+        kind: GapKind::Crash,
+    };
+    let ev_a = aterm_vitals::StripEvent {
+        at_unix_ms: 1_792_999_980_000,
+        kind: StripEventKind::Restart,
+        label: "restarted".into(),
+    };
+    let ev_b = aterm_vitals::StripEvent {
+        at_unix_ms: 1_792_999_996_000,
+        kind: StripEventKind::PressureSpike,
+        label: "pressure".into(),
+    };
+
+    let mut asked = Asked::default();
+    let mut req = Request {
+        note_gaps: vec![gap],
+        note_events: vec![ev_a.clone()],
+        ..Request::default()
+    };
+    asked.take(
+        Msg::Facts(Box::new(Request {
+            note_events: vec![ev_b.clone()],
+            ..Request::default()
+        })),
+        &mut req,
+    );
+    assert_eq!(req.note_gaps, vec![gap]);
+    assert_eq!(req.note_events, vec![ev_a, ev_b]);
+
+    let mut src = CountingSource {
+        model: aterm_vitals::Vitals::new(),
+        noted_batches: Vec::new(),
+        step: 0,
+    };
+    let snap = pull(&mut src, &mut req, None);
+    assert_eq!(
+        src.noted_batches,
+        vec![(1, 2), (0, 0)],
+        "cold pull must deliver noted gaps/events on the warm pass only, never duplicating on the second pass"
+    );
+    assert_eq!(snap.time_gaps.len(), 1);
+    assert_eq!(snap.strip_events.len(), 2);
 }

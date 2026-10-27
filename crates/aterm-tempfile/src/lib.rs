@@ -209,6 +209,125 @@ where
     f(a, b)
 }
 
+/// THE FOLDER FSEVENTSD DROPS. On macOS 27.0 (26A428) fseventsd hands no client, and keeps in
+/// no history, a file event whose path holds `/.ubd/` within its first 1024 bytes: its
+/// dispatcher returns before it takes its client list when `strnstr(path, "/.ubd/", 1024)`
+/// finds one, a leftover of the retired Ubiquity daemon. That is observed, not documented, so
+/// a later macOS that stops honouring the name loses only the benefit, never a file
+/// (`docs/measured/fseventsd-ubd-2026-10-26.md`). Test scratch was 89% of the file events
+/// fseventsd delivered on a build Mac; under this folder the same test run cost fseventsd a
+/// ninth of the CPU and left nothing in its history. It is no rule of Spotlight's, which still
+/// indexes a dot folder's folders: a `*.noindex` name keeps Spotlight out.
+pub const QUIET: &str = ".ubd";
+
+/// Whether fseventsd drops what is made under `dir`: one of its components is [`QUIET`] (the
+/// whole component; `x.ubd` and `.ubdx` are not).
+#[must_use]
+pub fn is_quiet(dir: &Path) -> bool {
+    dir.components().any(|c| c.as_os_str() == QUIET)
+}
+
+/// `dir`'s [`QUIET`] folder, made when absent, for files kept in a temporary root fseventsd
+/// need not hear of. `dir` itself where it is quiet already, off macOS (nothing else drops
+/// events by path, so the folder would only lengthen paths), or where the folder cannot be
+/// used ([`made_quiet`]).
+#[must_use]
+pub fn quiet_in(dir: &Path) -> PathBuf {
+    match quiet_place(dir, cfg!(target_os = "macos")) {
+        Some(quiet) if made_quiet(dir, &quiet) => quiet,
+        _ => dir.to_path_buf(),
+    }
+}
+
+/// The folder a directory asked for in `dir` goes in when `wanted`: `dir`'s [`QUIET`] folder,
+/// unless `dir` is quiet already; `None` keeps `dir`.
+fn quiet_place(dir: &Path, wanted: bool) -> Option<PathBuf> {
+    (wanted && !is_quiet(dir)).then(|| dir.join(QUIET))
+}
+
+/// `dir` cut at its first [`QUIET`] folder: `T/.ubd/x` is `T`; a `dir` with none is itself.
+/// What is made there reaches fseventsd's clients and its history again.
+#[must_use]
+pub fn outside_quiet(dir: &Path) -> PathBuf {
+    dir.components()
+        .take_while(|c| c.as_os_str() != QUIET)
+        .collect()
+}
+
+/// Where [`TempDir`] makes a directory asked for in `dir`: on macOS, in `dir`'s [`QUIET`]
+/// folder ([`quiet_in`]) when `dir` is a shared temporary root ([`is_shared_root`]); in `dir`
+/// itself otherwise, so a folder the caller chose holds exactly what it was given.
+fn placed(dir: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") && is_shared_root(dir) {
+        quiet_in(dir)
+    } else {
+        dir.to_path_buf()
+    }
+}
+
+/// Whether `dir` is a temporary root other programs write too: the system temporary
+/// directory, as named or as it resolves, or `/tmp`.
+fn is_shared_root(dir: &Path) -> bool {
+    let temp = call0(std::env::temp_dir);
+    dir == temp
+        || dir == Path::new("/tmp")
+        || dir == Path::new("/private/tmp")
+        || (dir.starts_with("/private") && fs::canonicalize(&temp).is_ok_and(|t| t == dir))
+}
+
+/// Whether the [`QUIET`] folder `quiet` of `dir` stands for this user to make directories in,
+/// made when absent: `0700`, or `1777` in a sticky directory every user shares (`/tmp`). One
+/// found is used only while it is a real directory (no link) that this user owns and no one
+/// else may write unless it is sticky, or that root owns, sticky and open to all as `/tmp` is;
+/// another user's in a shared `/tmp` is never used, and `dir` itself serves instead.
+#[cfg(target_os = "macos")]
+#[cfg_attr(trust_verify, trust::skip)]
+fn made_quiet(dir: &Path, quiet: &Path) -> bool {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    let Ok(parent) = fs::metadata(dir) else {
+        return false;
+    };
+    let shared = parent.mode() & 0o1000 != 0;
+    match fs::DirBuilder::new()
+        .mode(if shared { 0o1777 } else { 0o700 })
+        .create(quiet)
+    {
+        // The umask took the bits every user needs to share it; without them it is still
+        // this user's own, which the checks below accept.
+        Ok(()) if shared => {
+            let _ = fs::set_permissions(quiet, fs::Permissions::from_mode(0o1777));
+        }
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(_) => return false,
+    }
+    let Ok(found) = fs::symlink_metadata(quiet) else {
+        return false;
+    };
+    let mode = found.mode();
+    let sticky = mode & 0o1000 != 0;
+    let own = found.uid() == euid() && (mode & 0o022 == 0 || sticky);
+    let like_tmp = found.uid() == 0 && sticky && mode & 0o002 != 0;
+    found.is_dir() && (own || like_tmp)
+}
+
+/// No [`QUIET`] folder off macOS ([`quiet_in`] asks for none there).
+#[cfg(not(target_os = "macos"))]
+const fn made_quiet(_dir: &Path, _quiet: &Path) -> bool {
+    false
+}
+
+/// This process's effective user id.
+#[cfg(target_os = "macos")]
+#[cfg_attr(trust_verify, trust::skip)]
+fn euid() -> u32 {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: `geteuid` takes no argument, touches no memory of this process's and cannot fail.
+    unsafe { geteuid() }
+}
+
 /// A temporary directory, removed with all its contents on drop.
 #[derive(Debug)]
 pub struct TempDir {
@@ -216,23 +335,30 @@ pub struct TempDir {
 }
 
 impl TempDir {
-    /// Create a new temporary directory in the system temp directory.
+    /// Create a new temporary directory in the system temp directory (in its [`QUIET`] folder
+    /// on macOS, [`quiet_in`]).
     /// # Errors
     /// Returns an error if the directory cannot be created.
     pub fn new() -> io::Result<Self> {
         Self::new_in(call0(std::env::temp_dir))
     }
 
-    /// Create a new temporary directory inside `dir`.
+    /// Create a new temporary directory inside `dir`, or inside its [`QUIET`] folder where `dir`
+    /// is a shared temporary root (the system temp directory, `/tmp`) on macOS.
     /// # Errors
     /// Returns an error if the directory cannot be created.
     pub fn new_in(dir: impl AsRef<Path>) -> io::Result<Self> {
         Self::with_prefix_in(".tmp", dir)
     }
 
-    /// Create a new temporary directory with a custom prefix inside `dir`.
+    /// Create a new temporary directory with a custom prefix inside `dir`, or inside its
+    /// [`QUIET`] folder where `dir` is a shared temporary root ([`placed`]).
     fn with_prefix_in(prefix: &str, dir: impl AsRef<Path>) -> io::Result<Self> {
-        let dir = dir.as_ref();
+        Self::made_in(prefix, &placed(dir.as_ref()))
+    }
+
+    /// Create a new temporary directory with a custom prefix in exactly `dir`.
+    fn made_in(prefix: &str, dir: &Path) -> io::Result<Self> {
         for _ in 0..5 {
             let name = unique_name(prefix);
             let mut components = Path::new(&name).components();
@@ -299,6 +425,7 @@ impl AsRef<Path> for TempDir {
 #[derive(Debug, Default)]
 pub struct Builder {
     prefix: Option<String>,
+    heard: bool,
 }
 
 impl Builder {
@@ -306,7 +433,20 @@ impl Builder {
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
-        Self { prefix: None }
+        Self {
+            prefix: None,
+            heard: false,
+        }
+    }
+
+    /// Make the directory outside every [`QUIET`] folder ([`outside_quiet`]), where fseventsd
+    /// hears of what is made in it: for a subject that refuses a path under a dot folder, which
+    /// a quiet folder is, or one that needs the root's own short path.
+    #[inline]
+    #[must_use]
+    pub const fn heard(mut self) -> Self {
+        self.heard = true;
+        self
     }
 
     /// Set the prefix for the temporary name.
@@ -330,19 +470,22 @@ impl Builder {
     /// # Errors
     /// Returns an error if the directory cannot be created.
     pub fn tempdir(&self) -> io::Result<TempDir> {
-        let prefix = self.prefix_str();
-        TempDir::with_prefix_in(prefix, call0(std::env::temp_dir))
+        self.tempdir_in(call0(std::env::temp_dir))
     }
 
-    /// Create a temporary directory inside `dir` using the configured options (e.g. a short `/tmp` for a socket path, or a target-local scratch root).
+    /// Create a temporary directory inside `dir` using the configured options (e.g. a short `/tmp` for a socket path, or a target-local scratch root); a shared temporary root's goes in its [`QUIET`] folder on macOS, five bytes longer, unless the builder is [`Self::heard`], which makes it in `dir` cut at its first quiet folder.
     /// # Errors
     /// Returns an error if the directory cannot be created.
     pub fn tempdir_in(&self, dir: impl AsRef<Path>) -> io::Result<TempDir> {
-        TempDir::with_prefix_in(self.prefix_str(), dir)
+        if self.heard {
+            TempDir::made_in(self.prefix_str(), &outside_quiet(dir.as_ref()))
+        } else {
+            TempDir::with_prefix_in(self.prefix_str(), dir)
+        }
     }
 }
 
-/// Create a temporary directory in the system temp directory.
+/// Create a temporary directory in the system temp directory (in its [`QUIET`] folder on macOS).
 /// # Errors
 /// Returns an error if the directory cannot be created.
 pub fn tempdir() -> io::Result<TempDir> {
@@ -628,6 +771,127 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["a", "b", "c"]);
+    }
+
+    /// THE QUIET FOLDER'S SHAPE: a directory asked for in a shared root goes in that root's
+    /// `.ubd` folder, so its path holds `/.ubd/`, and one asked for in a folder already under
+    /// one goes there as asked (no second `.ubd`). NEGATIVE CONTROL: unwanted (off macOS, or a
+    /// folder the caller chose) it stays in the folder asked for, and a name that only holds
+    /// `.ubd` is no quiet component.
+    #[test]
+    fn a_shared_roots_directories_go_in_its_quiet_folder() {
+        let tmp = Path::new("/tmp");
+        let quiet = quiet_place(tmp, true).expect("a shared root is made quiet");
+        assert_eq!(quiet, Path::new("/tmp/.ubd"));
+        let made = quiet.join("al-sim1_0123456789abcdef_0");
+        assert!(
+            made.to_str().is_some_and(|p| p.contains("/.ubd/")),
+            "{made:?}"
+        );
+        assert!(is_quiet(&quiet) && is_quiet(&made));
+        assert_eq!(quiet_place(&made, true), None, "no second .ubd");
+        assert_eq!(quiet_place(tmp, false), None);
+        for loud in ["/tmp", "/tmp/x.ubd/y", "/tmp/.ubdx/y", "/tmp/ubd/y"] {
+            assert!(!is_quiet(Path::new(loud)), "{loud}");
+        }
+        assert!(is_shared_root(tmp) && is_shared_root(&call0(std::env::temp_dir)));
+        assert!(!is_shared_root(Path::new("/tmp/x")));
+    }
+
+    /// What the tempdirs land in: on macOS the system temp directory's and `/tmp`'s quiet
+    /// folders, `/tmp`'s sticky and open to every user. NEGATIVE CONTROL: a parent the caller
+    /// chose gets its directory directly, and no `.ubd` beside it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tempdirs_in_shared_roots_land_where_fseventsd_drops_their_events() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempdir().expect("tempdir");
+        assert!(is_quiet(dir.path()), "{:?}", dir.path());
+        assert!(dir.path().starts_with(call0(std::env::temp_dir)));
+        let short = Builder::new()
+            .prefix("atq-")
+            .tempdir_in("/tmp")
+            .expect("in /tmp");
+        assert_eq!(short.path().parent(), Some(Path::new("/tmp/.ubd")));
+        let mode = fs::symlink_metadata("/tmp/.ubd").expect("lstat").mode();
+        assert_eq!(mode & 0o1000, 0o1000, "sticky: {mode:o}");
+        let chosen = Path::new("/tmp").join(unique_name("atq-chosen-"));
+        fs::create_dir(&chosen).expect("a parent of the caller's");
+        let inner = TempDir::new_in(&chosen).expect("in the chosen parent");
+        assert_eq!(inner.path().parent(), Some(chosen.as_path()));
+        drop(inner);
+        assert_eq!(fs::read_dir(&chosen).expect("list").count(), 0);
+        fs::remove_dir(&chosen).expect("cleanup");
+    }
+
+    /// A heard directory is made outside every quiet folder: `outside_quiet` cuts a path at its
+    /// first `.ubd` component. NEGATIVE CONTROL: a component that only holds the name
+    /// (`x.ubd`) cuts nothing, and a builder that is not heard places as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_heard_directory_is_made_outside_every_quiet_folder() {
+        assert_eq!(outside_quiet(Path::new("/v/T/.ubd/x/y")), Path::new("/v/T"));
+        assert_eq!(outside_quiet(Path::new("/v/T/.ubd/")), Path::new("/v/T"));
+        assert_eq!(
+            outside_quiet(Path::new("/v/T/x.ubd/y")),
+            Path::new("/v/T/x.ubd/y")
+        );
+        assert_eq!(outside_quiet(Path::new("/v/T")), Path::new("/v/T"));
+        let heard = Builder::new()
+            .prefix("ath-")
+            .heard()
+            .tempdir()
+            .expect("heard");
+        assert!(!is_quiet(heard.path()), "{:?}", heard.path());
+        assert_eq!(
+            heard.path().parent(),
+            Some(outside_quiet(&call0(std::env::temp_dir)).as_path())
+        );
+        let in_tmp = Builder::new()
+            .prefix("ath-")
+            .heard()
+            .tempdir_in("/tmp")
+            .expect("/tmp");
+        assert_eq!(in_tmp.path().parent(), Some(Path::new("/tmp")));
+        let placed = Builder::new()
+            .prefix("ath-")
+            .tempdir_in("/tmp")
+            .expect("/tmp");
+        assert_eq!(
+            is_quiet(placed.path()),
+            cfg!(target_os = "macos"),
+            "{:?}",
+            placed.path()
+        );
+    }
+
+    /// A quiet folder is used only while it is safe to: this user's own and closed, or sticky.
+    /// NEGATIVE CONTROL: a link in its place, or one anyone may write and not sticky, is
+    /// refused, so the root itself serves.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_quiet_folder_is_used_only_while_it_is_safe() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let root = tempdir().expect("root");
+        let quiet = root.path().join(QUIET);
+        assert!(made_quiet(root.path(), &quiet), "made");
+        assert_eq!(fs::metadata(&quiet).expect("stat").mode() & 0o7777, 0o700);
+        assert!(made_quiet(root.path(), &quiet), "found again");
+        let chmod = |mode| fs::set_permissions(&quiet, fs::Permissions::from_mode(mode));
+        chmod(0o777).expect("open it");
+        assert!(!made_quiet(root.path(), &quiet), "open and not sticky");
+        chmod(0o1777).expect("sticky");
+        assert!(made_quiet(root.path(), &quiet), "sticky");
+        fs::remove_dir(&quiet).expect("rmdir");
+        std::os::unix::fs::symlink(root.path(), &quiet).expect("a link in its place");
+        assert!(!made_quiet(root.path(), &quiet), "a link");
+        fs::remove_file(&quiet).expect("unlink");
+        let shared = root.path().join("shared");
+        fs::create_dir(&shared).expect("a shared parent");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).expect("sticky parent");
+        assert!(made_quiet(&shared, &shared.join(QUIET)));
+        let mode = fs::metadata(shared.join(QUIET)).expect("stat").mode();
+        assert_eq!(mode & 0o7777, 0o1777, "{mode:o}");
     }
 
     /// On Windows the OS RNG (BCryptGenRandom) must actually work: two

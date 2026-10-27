@@ -1133,7 +1133,15 @@ pub fn scenarios() -> Vec<Scenario> {
     }
     add("c1-approval".into(), "", none, Plan::CorpusApproval);
     add("c2-question".into(), "", none, Plan::CorpusQuestion);
-    add("c3-wall".into(), "", none, Plan::CorpusWall);
+    add(
+        "c3-wall".into(),
+        "",
+        LabKw {
+            instance_env: crate::autopilot_scenes::INSTANCE_ENV,
+            ..none
+        },
+        Plan::CorpusWall,
+    );
     add("c4-read".into(), "", none, Plan::CorpusRead);
     for scene in crate::autopilot_scenes::Scene::ALL {
         add(
@@ -1156,6 +1164,21 @@ pub fn scenarios() -> Vec<Scenario> {
 }
 
 const WALL_500: &str = r#"{"status": 500, "headers": {"x-should-retry": "false"}, "json": {"type": "error", "error": {"type": "api_error", "message": "Internal server error"}}, "times": 1}"#;
+
+/// What c3-wall waits for after [`WALL_500`]: the outage's one resume, typed at its first rung.
+fn wall_resumed() -> String {
+    format!(
+        "rule={}",
+        aterm_agent::supervise::policy::turn_end::RULE_OUTAGE_RESUME
+    )
+}
+
+/// How long c3-wall waits for [`wall_resumed`]: the outage's first rung at its lab's ladder seam
+/// ([`crate::autopilot_scenes::INSTANCE_ENV`]) and a minute more.
+fn wall_resume_s() -> f64 {
+    let rung = crate::forever::outage::rung_ms(1, crate::forever::LADDER_SCALE);
+    std::time::Duration::from_millis(u64::try_from(rung).unwrap_or(0)).as_secs_f64() + 60.0
+}
 
 pub(crate) fn journaled_after(
     ctx: &mut Ctx,
@@ -2298,8 +2321,8 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
                 crate::verbs::set_custom_mode(&ctx.run, "wall500", &spec)?;
                 ctx.turn("say hello").map(|_| ())
             },
-            "rule=api-retry@v1",
-            120.0,
+            &wall_resumed(),
+            wall_resume_s(),
         )?,
         Plan::CorpusRead => corpus_decision(
             ctx,
@@ -3018,6 +3041,26 @@ mod tests {
         let plain = lab_opts(caller(), "", LabKw::default());
         assert_eq!(plain.instance_env, "TMPDIR=/s");
         assert_eq!(plain.harness_keys, "");
+    }
+
+    /// C3-WALL WAITS FOR THE OUTAGE'S ONE RESUME AT ITS FIRST RUNG (v6 §14.17.5.2): its lab runs
+    /// the ladders at the forever lab's eighth, so the rung is 15 s and the wait a minute past it,
+    /// on `outage-resume@v1` rather than main's typed retry. NEGATIVE CONTROL: c1-approval's lab
+    /// adds no words of its own.
+    #[test]
+    fn c3_wall_waits_for_the_outages_resume_at_its_first_rung() {
+        let listed = |name: &str| {
+            scenarios()
+                .into_iter()
+                .find(|s| s.name == name)
+                .expect("the scenario is listed")
+        };
+        let wall = listed("c3-wall");
+        assert_eq!(wall.kw.instance_env, crate::autopilot_scenes::INSTANCE_ENV);
+        assert_eq!(wall.kw.instance_env, crate::forever::ladder_env());
+        assert_eq!(listed("c1-approval").kw.instance_env, "");
+        assert_eq!(wall_resumed(), "rule=outage-resume@v1");
+        assert!((wall_resume_s() - 75.0).abs() < f64::EPSILON);
     }
 
     /// A RUN THAT ASKS ITS LAB FOR KEYS OR WORDS REFUSES A LAB IT ATTACHES TO, which was made

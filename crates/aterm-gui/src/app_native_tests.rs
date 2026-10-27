@@ -920,17 +920,23 @@ fn a_durable_write_awaiting_reconciliation_answers_with_what_it_wrote() {
                 .to_string()
         )
     );
+    // 16 px: no platform's automatic size, which a write removes instead.
+    assert_ne!(
+        crate::FONT_PX,
+        16.0,
+        "premise: 16 px is written, not removed"
+    );
     assert_eq!(
-        publish_unadmitted(&mut app, crate::prefs::EDIT_FONT_PX, "15.0"),
+        publish_unadmitted(&mut app, crate::prefs::EDIT_FONT_PX, "16.0"),
         Ok(
-            "saved: font_px = 15; reconciliation required: the file changed again before it \
+            "saved: font_px = 16; reconciliation required: the file changed again before it \
             could be read"
                 .to_string()
         )
     );
     let text = app.native_config_service.snapshot().text;
     assert!(
-        !text.contains("window_theme") && text.contains("font_px = 15\n"),
+        !text.contains("window_theme") && text.contains("font_px = 16\n"),
         "{text}"
     );
     let mut app = App::headless_for_test();
@@ -943,8 +949,8 @@ fn a_durable_write_awaiting_reconciliation_answers_with_what_it_wrote() {
         Ok("removed: window_theme; now Auto (default)".to_string())
     );
     assert_eq!(
-        complete_control_field(&mut app, crate::prefs::EDIT_FONT_PX, Some("15.0")),
-        Ok("saved: font_px = 15".to_string())
+        complete_control_field(&mut app, crate::prefs::EDIT_FONT_PX, Some("16.0")),
+        Ok("saved: font_px = 16".to_string())
     );
 }
 
@@ -2198,6 +2204,7 @@ fn regional_damage_rejects_theme_or_font_paint_revision_changes() {
         document_seq: None,
         presentation_revision: 19,
         paint_revision: 23,
+        coverage_epoch: 29,
     };
     let mut current = previous;
     current.generation += 1;
@@ -2206,6 +2213,13 @@ fn regional_damage_rejects_theme_or_font_paint_revision_changes() {
     assert!(
         !current.accepts_regional_damage_from(previous),
         "paint input changes promote reducer-local damage to a full raster"
+    );
+    let mut landed = previous;
+    landed.generation += 1;
+    landed.coverage_epoch += 1;
+    assert!(
+        !landed.accepts_regional_damage_from(previous),
+        "a face landing promotes reducer-local damage to a full raster"
     );
 }
 
@@ -10459,7 +10473,8 @@ fn tab_enters_a_settings_list_whose_screen_shows_no_control() {
 /// then the list's first control, each drawn as the keyboard lands on it. Cancel, which only
 /// the open search draws, closed the search as it took the keyboard: the keyboard was left on
 /// nothing drawn and the next Tab went round to the toolbar past every control of the list
-/// (Terminal at 178x348, with 1x and 2x text).
+/// (Terminal at 178x348, with 1x and 2x text). A toolbar with room for the field itself draws
+/// no Cancel (Linux's wider cells at 26 and 30 columns), and Tab goes straight into the list.
 #[test]
 fn tab_from_the_compact_search_field_goes_on_into_the_list() {
     use crate::native_settings::SettingsRoute;
@@ -10494,9 +10509,19 @@ fn tab_from_the_compact_search_field_goes_on_into_the_list() {
                 }
                 let (_, view) = app.active_native_view(wid).expect("Settings");
                 app.focus_native_control(wid, view, search, true).unwrap();
-                let _ = app.compiled_native_ui(wid).unwrap();
+                let cancel = crate::native_ui::UiKey::new("settings/search-cancel");
+                let tabs = if app
+                    .compiled_native_ui(wid)
+                    .unwrap()
+                    .focus_order
+                    .contains(&cancel)
+                {
+                    2
+                } else {
+                    1
+                };
                 let mut walk = Vec::new();
-                for _ in 0..2 {
+                for _ in 0..tabs {
                     app.move_native_focus(wid, false).unwrap();
                     let compiled = app.compiled_native_ui(wid).unwrap();
                     let focus = app

@@ -10,7 +10,8 @@ use crate::history::{self, Filling, FreeHistory, Rates};
 use crate::peaks::{DailyMax, NET_LEARN_S, PEAK_DAYS, Peaks, PlanDay, PlanWeek, TOKENS_LEARN_S};
 use crate::ring::{
     BUCKET_MS, BucketRing, Cell, GapKind, MultiScaleSpec, NOW_WINDOW_MS, ProgSlot, Reading, Recent,
-    SLOT_GUARD_MS, SLOT_MS, ScaleCell, SlotGrid, TimeGap, columns_of, multi_scale_cells, slots_of,
+    SLOT_GUARD_MS, SLOT_MS, ScaleCell, SlotGrid, Tiers, TimeGap, columns_of, multi_scale_cells,
+    slots_of,
 };
 use crate::trend::{History, Trend, TrendView};
 
@@ -35,6 +36,8 @@ pub struct ClusterSpec {
 /// One process in a sweep.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcSample {
+    /// Darwin scheduling observations from this process's current reading.
+    pub scheduling: Option<crate::scheduling::Scheduling>,
     /// The pid.
     pub pid: u32,
     /// Its kernel start record, compared only within this boot.
@@ -793,6 +796,8 @@ pub struct WeekFact {
 /// One sample of everything, from the host's probe thread.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sample {
+    /// Independent native hardware and power-policy observations.
+    pub hardware: Option<crate::hardware::Sample>,
     /// The host's monotonic clock, ns.
     pub at_ns: u64,
     /// Every logical core's cumulative ticks; `None` where unreadable.
@@ -882,6 +887,16 @@ pub struct Sample {
 pub struct CoreView {
     /// Busy fraction (`0..=1`): raw last interval and smoothed fast average.
     pub load: TrendView,
+    /// This interval had a positive total-counter delta; otherwise `load` is held for drawing.
+    pub measured: bool,
+}
+
+impl CoreView {
+    /// Current utilization, excluding a held drawing value.
+    #[must_use]
+    pub fn current(&self) -> Option<f32> {
+        self.measured.then_some(self.load.raw)
+    }
 }
 
 /// One cluster's cores.
@@ -911,6 +926,24 @@ pub struct CpuView {
 }
 
 impl CpuView {
+    /// Current busy cores, only when every core's counters advanced.
+    #[must_use]
+    pub fn current_busy(&self) -> Option<f32> {
+        (!self.cores.is_empty()).then_some(())?;
+        self.cores.iter().map(CoreView::current).sum()
+    }
+
+    /// Current busy cores in a cluster, only when all of its counters advanced.
+    #[must_use]
+    pub fn current_cluster_busy(&self, cluster: &ClusterView) -> Option<f32> {
+        (!cluster.cores.is_empty()).then_some(())?;
+        cluster
+            .cores
+            .iter()
+            .map(|&i| self.cores.get(i)?.current())
+            .sum()
+    }
+
     /// Logical cores.
     #[must_use]
     pub fn total(&self) -> usize {
@@ -1086,6 +1119,8 @@ impl RowScope {
 /// One process as `sys procs` and the top rows show it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcView {
+    /// Darwin scheduling observations; lifetime QoS counters, not core placement.
+    pub scheduling: Option<crate::scheduling::Scheduling>,
     /// The pid.
     pub pid: u32,
     /// Its parent.
@@ -1517,6 +1552,9 @@ pub struct Series {
     pub capacity: Option<f64>,
     /// One hour of 10 s cells, oldest first; the last is the open bucket [`ResourceView::ring_k`].
     pub ring: Arc<[Cell]>,
+    /// Six hours of ten-minute cells, oldest first; the last is the open one
+    /// [`ResourceView::long_k`].
+    pub long: Arc<[Cell]>,
     /// Its last minute of readings, oldest first ([`ResourceView::heat_slots`]).
     pub recent: Arc<[Reading]>,
     /// Whether this series binds now (its share of capacity is the row's).
@@ -1540,6 +1578,10 @@ pub struct ResourceView {
     pub ring: Arc<[Cell]>,
     /// Bucket index of the last cell in `ring` (Unix seconds `[10 * ring_k, 10 * ring_k + 10)`).
     pub ring_k: i64,
+    /// The six hours of ten-minute cells, oldest first, raw (the deck's 1 h boxes).
+    pub long: Arc<[Cell]>,
+    /// Bucket index of the last cell in `long` (Unix seconds `[600 * long_k, 600 * long_k + 600)`).
+    pub long_k: i64,
     /// The first series' last minute of readings, oldest first ([`Self::heat_slots`]).
     pub recent: Arc<[Reading]>,
     /// Memory's pressure, cell for cell with `ring`: the worst level read in each bucket, `None`
@@ -1653,8 +1695,9 @@ impl ResourceView {
         out
     }
 
-    /// Resample this row's hour ring and last-minute per-sample readings into progressive
-    /// multi-scale [`HeatSlot`]s for `spec` at `now_unix_ms`, preserving `gaps` without smearing.
+    /// Resample this row's hour ring, six hours of ten-minute cells and last-minute per-sample
+    /// readings into progressive multi-scale [`HeatSlot`]s for `spec` at `now_unix_ms`, preserving
+    /// `gaps` without smearing.
     #[must_use]
     pub fn heat_multi_scale(
         &self,
@@ -1674,18 +1717,17 @@ impl ResourceView {
             slot: sc.slot,
         };
         let slots_for = |s: &Series| -> Vec<HeatSlot> {
-            multi_scale_cells(
-                &s.ring,
-                self.ring_k,
-                &s.recent,
-                now_unix_ms,
-                spec,
-                cover_ms,
-                gaps,
-            )
-            .into_iter()
-            .map(|sc| convert(sc, s.capacity))
-            .collect()
+            let tiers = Tiers {
+                ring: &s.ring,
+                ring_k: self.ring_k,
+                long: &s.long,
+                long_k: self.long_k,
+                recent: &s.recent,
+            };
+            multi_scale_cells(tiers, now_unix_ms, spec, cover_ms, gaps)
+                .into_iter()
+                .map(|sc| convert(sc, s.capacity))
+                .collect()
         };
         let mut out = slots_for(&self.first());
         if let Some(second) = self.second.as_ref() {
@@ -1721,6 +1763,7 @@ impl ResourceView {
             now: self.now,
             capacity: self.capacity,
             ring: Arc::clone(&self.ring),
+            long: Arc::clone(&self.long),
             recent: Arc::clone(&self.recent),
             binds: self.second.as_ref().is_none_or(|s| !s.binds),
         }
@@ -1751,6 +1794,7 @@ impl ResourceView {
             basis,
             ring: first.ring,
             ring_k,
+            long: first.long,
             recent: first.recent,
             second: second.map(|s| Series {
                 binds: second_binds,
@@ -1909,6 +1953,16 @@ impl SlotsUnread {
 /// Everything at one moment. Immutable once made; the host shares it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
+    /// Most recent raw kernel core counters, for a bounded diagnostic export.
+    pub cpu_counter_sample: Option<Vec<Ticks>>,
+    /// Latest native hardware sample, with its own time window.
+    pub hardware: Option<crate::hardware::Sample>,
+    /// Bounded raw evidence from a sustained E-busy/P-underused episode.
+    pub cpu_diagnostics: Option<crate::hardware::Bundle>,
+    /// A prior process's saved report, displayed only as historical evidence.
+    pub historical_cpu_report: Option<std::sync::Arc<crate::sys::json::Jv>>,
+    /// Explicitly authorized observations; their own wall-clock window is retained.
+    pub authorized_cpu_policy: Option<std::sync::Arc<crate::sys::json::Jv>>,
     /// When the sample behind it was taken (the host's monotonic clock, ns).
     pub at_ns: u64,
     /// How many samples the model has absorbed (1 for the first).
@@ -1983,6 +2037,14 @@ pub struct Snapshot {
     pub why: Option<Arc<crate::explain::WhyFacts>>,
     /// Whether the coalition lane reads (`Off` once a read misread the layout).
     pub coal_lane: crate::explain::CoalLane,
+    /// macOS's services as read on their own, where a reply needed them and the split by
+    /// coalition did not read them (a `sys why` while no Deck is in view); `None` otherwise
+    /// ([`crate::services::over_in`]).
+    pub services: Option<Arc<crate::services::Reading>>,
+    /// The episodes ([`crate::services::Service::episode`]) whose restart the person put off: the
+    /// window's alert for them was dismissed, folded or answered, so a reply offers no restart
+    /// for them until a new process takes their place.
+    pub services_filed: Vec<String>,
     /// Discontinuous wall-clock intervals (sleep, crash, sampling pauses) in the last hour.
     pub time_gaps: Vec<TimeGap>,
     /// Vertical event markers (crashes, restarts, sleep/wake, pressure spikes) in the last hour.
@@ -2520,6 +2582,9 @@ impl ScopeRings {
 /// The model's running state. One per host instance.
 #[derive(Debug, Default)]
 pub struct Vitals {
+    hardware_recorder: crate::hardware::Recorder,
+    historical_cpu_report: Option<std::sync::Arc<crate::sys::json::Jv>>,
+    authorized_cpu_policy: Option<std::sync::Arc<crate::sys::json::Jv>>,
     rows: Rows,
     seq: u64,
     last_cores_at: Option<u64>,
@@ -2563,9 +2628,11 @@ pub struct Vitals {
 /// cadence, four at the lens's.
 const SLOT_TIMES: usize = 8;
 const STRIP_HISTORY_CAP: usize = 128;
-const STRIP_HORIZON_MS: i64 = 3_600_000;
+/// How far back the strip's gaps and events are kept, ms: the Full deck's six hours.
+const STRIP_HORIZON_MS: i64 = 6 * 3_600_000;
 
-/// Persisted 1-hour strip state across restarts and crashes (`vitals-strip.json`).
+/// Persisted strip state across restarts and crashes (`vitals-strip.json`): an hour of 10 s
+/// buckets and six of ten-minute ones.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SavedStrip {
     /// Wall-clock timestamp (Unix ms) of the newest absorbed sample, or `0` when empty.
@@ -2600,20 +2667,33 @@ impl Vitals {
     /// Record a wall-clock discontinuity (`Sleep`, `Crash`, or `Paused`) on the time-series strip,
     /// merging overlapping spans of the same kind (or upgrading overlapping spans) without bleeding
     /// a crash/sleep label into a merely touching earlier span of another kind.
-    pub fn record_time_gap(&mut self, gap: TimeGap) {
+    pub fn record_time_gap(&mut self, mut gap: TimeGap) {
         if gap.end_ms <= gap.start_ms {
             return;
         }
-        if let Some(existing) = self.time_gaps.iter_mut().find(|g| {
-            g.overlap_ms(gap.start_ms, gap.end_ms) > 0
-                || (g.kind == gap.kind && (g.end_ms == gap.start_ms || gap.end_ms == g.start_ms))
-        }) {
-            existing.start_ms = existing.start_ms.min(gap.start_ms);
-            existing.end_ms = existing.end_ms.max(gap.end_ms);
-            existing.kind = existing.kind.max(gap.kind);
-            return;
+        loop {
+            let before = self.time_gaps.len();
+            self.time_gaps.retain(|g| {
+                let merges = g.overlap_ms(gap.start_ms, gap.end_ms) > 0
+                    || (g.kind == gap.kind
+                        && (g.end_ms == gap.start_ms || gap.end_ms == g.start_ms));
+                if merges {
+                    gap.start_ms = gap.start_ms.min(g.start_ms);
+                    gap.end_ms = gap.end_ms.max(g.end_ms);
+                    gap.kind = gap.kind.max(g.kind);
+                    false
+                } else {
+                    true
+                }
+            });
+            if self.time_gaps.len() == before {
+                break;
+            }
         }
-        self.time_gaps.push_back(gap);
+        let pos = self
+            .time_gaps
+            .partition_point(|g| (g.start_ms, g.end_ms) <= (gap.start_ms, gap.end_ms));
+        self.time_gaps.insert(pos, gap);
         while self.time_gaps.len() > STRIP_HISTORY_CAP {
             self.time_gaps.pop_front();
         }
@@ -2621,7 +2701,8 @@ impl Vitals {
 
     /// Record a vertical event marker (`Crash`, `Restart`, `SleepWake`, `PressureSpike`) on the
     /// multi-scale time-series strip, deduplicating identical adjacent markers and coalescing a
-    /// checkpoint crash estimate with an exact crash-file timestamp inside the same crash gap.
+    /// checkpoint crash estimate with an exact crash-file timestamp (or a delayed post-wake sample
+    /// with the kernel's `waketime` stamp) inside the same discontinuity span.
     pub fn record_strip_event(&mut self, event: StripEvent) {
         if event.kind == StripEventKind::Crash {
             let same_crash_span = |a: i64, b: i64| {
@@ -2643,6 +2724,33 @@ impl Vitals {
                 if existing.label == "aterm crash" && !event.label.is_empty() {
                     existing.label = event.label;
                 }
+                self.strip_events
+                    .make_contiguous()
+                    .sort_by_key(|e| e.at_unix_ms);
+                return;
+            }
+        }
+        if event.kind == StripEventKind::SleepWake {
+            let same_wake_span = |a: i64, b: i64| {
+                (a - b).abs() <= 15_000
+                    || self.time_gaps.iter().any(|g| {
+                        g.kind == GapKind::Sleep
+                            && a >= g.start_ms.saturating_sub(2_000)
+                            && a <= g.end_ms.saturating_add(15_000)
+                            && b >= g.start_ms.saturating_sub(2_000)
+                            && b <= g.end_ms.saturating_add(15_000)
+                    })
+            };
+            if let Some(existing) = self.strip_events.iter_mut().find(|e| {
+                e.kind == StripEventKind::SleepWake
+                    && same_wake_span(e.at_unix_ms, event.at_unix_ms)
+            }) {
+                if event.at_unix_ms < existing.at_unix_ms {
+                    existing.at_unix_ms = event.at_unix_ms;
+                }
+                self.strip_events
+                    .make_contiguous()
+                    .sort_by_key(|e| e.at_unix_ms);
                 return;
             }
         }
@@ -2659,27 +2767,25 @@ impl Vitals {
         if dup {
             return;
         }
-        self.strip_events.push_back(event);
+        let pos = self
+            .strip_events
+            .partition_point(|e| e.at_unix_ms <= event.at_unix_ms);
+        self.strip_events.insert(pos, event);
         while self.strip_events.len() > STRIP_HISTORY_CAP {
             self.strip_events.pop_front();
         }
     }
 
     fn trim_strip_history(&mut self, now_unix_ms: i64) {
+        if now_unix_ms <= 0 {
+            return;
+        }
         let cutoff = now_unix_ms.saturating_sub(STRIP_HORIZON_MS);
-        while self.time_gaps.front().is_some_and(|g| g.end_ms < cutoff) {
-            self.time_gaps.pop_front();
-        }
-        while self
-            .strip_events
-            .front()
-            .is_some_and(|e| e.at_unix_ms < cutoff)
-        {
-            self.strip_events.pop_front();
-        }
+        self.time_gaps.retain(|g| g.end_ms >= cutoff);
+        self.strip_events.retain(|e| e.at_unix_ms >= cutoff);
     }
 
-    /// Snapshot the 1-hour global and `aterm` time-series rings, discontinuities, and event
+    /// Snapshot the global and `aterm` time-series rings, discontinuities, and event
     /// markers for atomic persistence (`clean_stop = true` on graceful probe shutdown).
     #[must_use]
     pub fn saved_strip(&self, clean_stop: bool) -> SavedStrip {
@@ -2704,7 +2810,7 @@ impl Vitals {
         }
     }
 
-    /// Restore 1-hour time-series history persisted by an earlier run up to `now_unix_ms`.
+    /// Restore the time-series history persisted by an earlier run up to `now_unix_ms`.
     ///
     /// When the saved checkpoint came from an unclean exit (`!saved.clean_stop`), automatically
     /// records a [`GapKind::Crash`] discontinuity across `[saved.last_wall_ms, now_unix_ms)` plus
@@ -2758,12 +2864,14 @@ impl Vitals {
                     kind: StripEventKind::Restart,
                     label: "restarted".into(),
                 });
+                self.restored_wall_ms = now_unix_ms;
             } else if now_unix_ms - saved.last_wall_ms >= BUCKET_MS {
                 self.record_time_gap(TimeGap {
                     start_ms: saved.last_wall_ms,
                     end_ms: now_unix_ms,
                     kind: GapKind::Paused,
                 });
+                self.restored_wall_ms = now_unix_ms;
             }
         }
         self.trim_strip_history(now_unix_ms);
@@ -2807,6 +2915,16 @@ impl Vitals {
         self.rows.free = history;
     }
 
+    /// Retain a prior process's diagnostic report for export, never as a live sample.
+    pub fn restore_cpu_report(&mut self, report: Option<crate::sys::json::Jv>) {
+        self.historical_cpu_report = report.map(std::sync::Arc::new);
+    }
+
+    /// Attach a bounded explicit collection without changing counters or anomaly state.
+    pub fn record_cpu_policy(&mut self, report: crate::sys::json::Jv) {
+        self.authorized_cpu_policy = Some(std::sync::Arc::new(report));
+    }
+
     /// How many samples it has absorbed.
     #[must_use]
     pub fn seq(&self) -> u64 {
@@ -2834,35 +2952,44 @@ impl Vitals {
         for ev in &s.note_events {
             self.record_strip_event(ev.clone());
         }
-        if let Some(prev) = self.last_stamp.replace(stamp)
-            && stamp.wall_ms > prev.wall_ms
-            && stamp.mono_ms >= prev.mono_ms
-        {
-            let wall_dt = stamp.wall_ms - prev.wall_ms;
-            let mono_dt = i64::try_from(stamp.mono_ms - prev.mono_ms).unwrap_or(i64::MAX);
-            let skew = wall_dt.saturating_sub(mono_dt);
-            let pause_limit = i64::try_from(
-                GAP_CADENCES * u64::from(prev.cadence_ms.max(stamp.cadence_ms).max(1_000)),
-            )
-            .unwrap_or(i64::MAX);
-            if skew > SLEEP_SKEW_MS {
+        match self.last_stamp.replace(stamp) {
+            Some(prev) if stamp.wall_ms > prev.wall_ms && stamp.mono_ms >= prev.mono_ms => {
+                let wall_dt = stamp.wall_ms - prev.wall_ms;
+                let mono_dt = i64::try_from(stamp.mono_ms - prev.mono_ms).unwrap_or(i64::MAX);
+                let skew = wall_dt.saturating_sub(mono_dt);
+                let pause_limit = i64::try_from(
+                    GAP_CADENCES * u64::from(prev.cadence_ms.max(stamp.cadence_ms).max(1_000)),
+                )
+                .unwrap_or(i64::MAX);
+                if skew > SLEEP_SKEW_MS {
+                    self.record_time_gap(TimeGap {
+                        start_ms: prev.wall_ms,
+                        end_ms: stamp.wall_ms,
+                        kind: GapKind::Sleep,
+                    });
+                    self.record_strip_event(StripEvent {
+                        at_unix_ms: stamp.wall_ms,
+                        kind: StripEventKind::SleepWake,
+                        label: "woke from sleep".into(),
+                    });
+                } else if mono_dt > pause_limit && wall_dt >= BUCKET_MS {
+                    self.record_time_gap(TimeGap {
+                        start_ms: prev.wall_ms,
+                        end_ms: stamp.wall_ms,
+                        kind: GapKind::Paused,
+                    });
+                }
+            }
+            None if self.restored_wall_ms > 0
+                && stamp.wall_ms.saturating_sub(self.restored_wall_ms) >= BUCKET_MS =>
+            {
                 self.record_time_gap(TimeGap {
-                    start_ms: prev.wall_ms,
-                    end_ms: stamp.wall_ms,
-                    kind: GapKind::Sleep,
-                });
-                self.record_strip_event(StripEvent {
-                    at_unix_ms: stamp.wall_ms,
-                    kind: StripEventKind::SleepWake,
-                    label: "woke from sleep".into(),
-                });
-            } else if mono_dt > pause_limit && wall_dt >= BUCKET_MS {
-                self.record_time_gap(TimeGap {
-                    start_ms: prev.wall_ms,
+                    start_ms: self.restored_wall_ms,
                     end_ms: stamp.wall_ms,
                     kind: GapKind::Paused,
                 });
             }
+            _ => {}
         }
         if let Some(tl) = s.timeline.as_ref()
             && let (Some(sleep_ms), Some(wake_ms)) = (tl.sleep_ms, tl.wake_ms)
@@ -3009,7 +3136,8 @@ impl Vitals {
         let busy = cpu
             .as_ref()
             .filter(|_| cores_dt.is_some())
-            .map(|c| f64::from(c.busy.raw));
+            .and_then(CpuView::current_busy)
+            .map(f64::from);
         let figs = pass.figs.as_ref().filter(|_| !s.machine_only);
         let (resources, facts, net) = self.rows.absorb(s, stamp, busy, figs, sweep_dt);
         if let Some((resets, _)) = facts.gpu_resets
@@ -3035,11 +3163,14 @@ impl Vitals {
                 services: services.max(clients - aterm - others),
             });
         }
-        let split = match (cpu.as_ref(), pass.split_parts) {
-            (Some(c), Some((aterm, others, unread))) => {
-                let rest = c.busy.raw - aterm - others;
+        let split = match (
+            cpu.as_ref().and_then(CpuView::current_busy),
+            pass.split_parts,
+        ) {
+            (Some(busy), Some((aterm, others, unread))) => {
+                let rest = busy - aterm - others;
                 Some(Split {
-                    global: c.busy.raw,
+                    global: busy,
                     aterm,
                     others,
                     services: rest.max(0.0),
@@ -3051,6 +3182,11 @@ impl Vitals {
         };
 
         let mut snap = Snapshot {
+            cpu_counter_sample: s.cores.clone(),
+            hardware: s.hardware.clone(),
+            cpu_diagnostics: None,
+            historical_cpu_report: self.historical_cpu_report.clone(),
+            authorized_cpu_policy: self.authorized_cpu_policy.clone(),
             at_ns: s.at_ns,
             seq: self.seq,
             cpu,
@@ -3086,6 +3222,8 @@ impl Vitals {
             events: Vec::new(),
             why: None,
             coal_lane: s.coal_lane,
+            services: None,
+            services_filed: Vec::new(),
             time_gaps: self.time_gaps.iter().copied().collect(),
             strip_events: self.strip_events.iter().cloned().collect(),
         };
@@ -3096,6 +3234,7 @@ impl Vitals {
         snap.why = self.why.absorb(s, &snap, attribution);
         snap.coal_lane = self.why.lane(s);
         snap.events = self.detector.detect(&snap);
+        snap.cpu_diagnostics = self.hardware_recorder.observe(&snap, s.cores.as_deref());
         snap
     }
 
@@ -3125,19 +3264,27 @@ impl Vitals {
         {
             let busy = now.busy.saturating_sub(before.busy);
             let total = now.total.saturating_sub(before.total);
-            let frac = if total == 0 {
-                trend.view().raw
+            let measured = total > 0;
+            if measured {
+                let frac = (busy as f32 / total as f32).clamp(0.0, 1.0);
+                trend.push(frac, dt_s);
+                hist.push_at(Some(frac), at_ns);
+                busy_sum += frac;
             } else {
-                (busy as f32 / total as f32).clamp(0.0, 1.0)
-            };
-            trend.push(frac, dt_s);
-            hist.push_at(Some(frac), at_ns);
-            busy_sum += frac;
-            views.push(CoreView { load: trend.view() });
+                hist.push_at(None, at_ns);
+            }
+            views.push(CoreView {
+                load: trend.view(),
+                measured,
+            });
         }
         self.last_cores = cores.to_vec();
-        self.busy.push(busy_sum, dt_s);
-        self.busy_history.push_at(Some(busy_sum), at_ns);
+        let measured = views.iter().all(|c| c.measured);
+        if measured {
+            self.busy.push(busy_sum, dt_s);
+        }
+        self.busy_history
+            .push_at(measured.then_some(busy_sum), at_ns);
         Some(CpuView {
             clusters: cluster_views(clusters, views.len()),
             cores: views,
@@ -3382,6 +3529,7 @@ impl Vitals {
                 _ => {}
             }
             rows.push(ProcView {
+                scheduling: p.scheduling,
                 pid: p.pid,
                 ppid: p.ppid,
                 pgid: p.pgid,
@@ -3832,6 +3980,7 @@ impl Rows {
                 ring.open_over(),
                 basis,
             );
+            view.long_k = ring.long_k().unwrap_or(0);
             view.state = match res {
                 Gpu => gpu_state,
                 Memory => mem_state,
@@ -3881,7 +4030,7 @@ impl Rows {
         let tcp = s.tcp;
         let aterm_sockets = s.aterm_sockets;
         let tab_sockets = &s.tab_sockets;
-        let srtt = s.tcp_srtt_ms.filter(|x| x.is_finite() && *x >= 0.0);
+        let srtt = s.tcp_srtt_ms.filter(|x| x.is_finite() && *x > 0.0);
         let Some(links) = links else {
             let any_net = tcp.is_some() || srtt.is_some() || aterm_sockets.is_some();
             let state = if tcp.is_some_and(|t| t.established > 0) {
@@ -4117,6 +4266,7 @@ fn series(ring: &BucketRing, now: i64, window_ms: i64, capacity: Option<f64>) ->
         now: ring.now_mean(now, window_ms),
         capacity,
         ring: ring.cells().into(),
+        long: ring.long_cells().into(),
         recent: ring.readings().into(),
         binds: false,
     }
@@ -4907,6 +5057,74 @@ mod tests {
             !others.contains(&neither.as_str()),
             "neither busy nor large"
         );
+    }
+
+    #[test]
+    fn scheduling_zero_total_is_held_drawing_data_not_current_utilization() {
+        for prior_busy in [0, 100] {
+            let mut v = Vitals::new();
+            v.absorb(&sample(10, &[0; 4], Vec::new()));
+            let measured = v.absorb(&sample(11, &[0, 0, prior_busy, prior_busy], Vec::new()));
+            let cpu = measured.cpu.as_ref().unwrap();
+            assert!(cpu.cores.iter().all(|c| c.measured));
+            assert_eq!(cpu.current_busy(), Some(2.0 * prior_busy as f32 / 100.0));
+
+            let mut stopped = sample(12, &[0, 0, prior_busy, prior_busy], Vec::new());
+            stopped.cores.as_mut().unwrap()[2].total = 1100;
+            let mut held = v.absorb(&stopped);
+            held.global.wait = Some(2.0);
+            let cpu = held.cpu.as_ref().unwrap();
+            assert_eq!(cpu.cores[2].load.raw, prior_busy as f32 / 100.0);
+            assert_eq!(cpu.cores[2].current(), None);
+            assert_eq!(cpu.current_busy(), None);
+            assert_eq!(cpu.current_cluster_busy(&cpu.clusters[0]), None);
+            assert_eq!(cpu.current_cluster_busy(&cpu.clusters[1]), Some(0.0));
+            assert_eq!(cpu.core_history[2].last(), Some(&None));
+            assert_eq!(cpu.history.last(), Some(&None));
+            assert!(held.split.is_none());
+            assert!(crate::scheduling::idle_performance(&held).is_none());
+
+            let recovered = v.absorb(&sample(13, &[0, 0, prior_busy, prior_busy], Vec::new()));
+            assert_eq!(recovered.cpu.as_ref().unwrap().current_busy(), Some(0.0));
+        }
+    }
+
+    #[test]
+    fn scheduling_wait_requires_matching_sweep_windows() {
+        let reading = |t_s: u64, busy: &[u64], cpu_ms, run_ns| {
+            let mut s = sample(
+                t_s,
+                busy,
+                vec![ProcSample {
+                    runnable_ns: Some(run_ns),
+                    ..proc(201, 200, cpu_ms, 1, "worker")
+                }],
+            );
+            s.at_unix_ms = T0 + t_s as i64 * 1000;
+            s.mono_ms = t_s * 1000;
+            s.cadence_ms = 1000;
+            s
+        };
+        let mut v = Vitals::new();
+        v.absorb(&reading(10, &[0, 0, 0, 0], 0, 0));
+        let mut hidden = reading(11, &[0, 0, 100, 100], 0, 0);
+        hidden.procs = None;
+        hidden.machine_only = true;
+        v.absorb(&hidden);
+
+        // Historical wait must not be paired with only the latest interval's idle cores.
+        let resumed = v.absorb(&reading(12, &[0, 0, 100, 100], 2000, 6_000_000_000));
+        assert_eq!(resumed.procs_window_ns, Some(2_000_000_000));
+        assert_eq!(resumed.cores_window_ns, Some(1_000_000_000));
+        assert_eq!(resumed.global.wait, Some(2.0));
+        assert_eq!(resumed.cpu.as_ref().unwrap().cores[2].load.raw, 0.0);
+        assert_eq!(resumed.cpu.as_ref().unwrap().cores[3].load.raw, 0.0);
+        assert!(crate::scheduling::idle_performance(&resumed).is_none());
+
+        let aligned = v.absorb(&reading(13, &[0, 0, 100, 100], 2000, 8_000_000_000));
+        assert_eq!(aligned.procs_window_ns, aligned.cores_window_ns);
+        assert_eq!(aligned.global.wait, Some(2.0));
+        assert!(crate::scheduling::idle_performance(&aligned).is_some());
     }
 
     #[test]
@@ -7432,7 +7650,7 @@ mod tests {
         });
         let snap_clean = after_clean.absorb(&post);
         let mem_slots = snap_clean.resources[Resource::Memory.index()].heat_multi_scale(
-            MultiScaleSpec::FULL_HOUR,
+            MultiScaleSpec::FULL_6H,
             snap_clean.at_unix_ms,
             2_500,
             &snap_clean.time_gaps,
@@ -7469,7 +7687,7 @@ mod tests {
             "unclean checkpoint alone must synthesize a Crash marker"
         );
         let cpu_slots = snap_sigkill.resources[Resource::Cpu.index()].heat_multi_scale(
-            MultiScaleSpec::FULL_HOUR,
+            MultiScaleSpec::FULL_6H,
             snap_sigkill.at_unix_ms,
             2_500,
             &snap_sigkill.time_gaps,
@@ -7522,6 +7740,104 @@ mod tests {
             1,
             "Restart markers must deduplicate: {:?}",
             snap_coalesced.strip_events
+        );
+
+        // 3. Delayed post-wake userspace sample + kernel `TimelineSample` wake timestamp coalesce
+        //    into one Sleep gap and one SleepWake marker at the kernel's exact `wake_ms`.
+        let mut sleep_v = Vitals::new();
+        let _ = sleep_v.absorb(&rig(10_000, 1_000_000, 1_000));
+        let mut woke = rig(15_000, 1_906_500, 5_000);
+        woke.timeline = Some(crate::explain::TimelineSample {
+            boot_ms: T0 + 100_000,
+            sleep_ms: Some(T0 + 1_000_400),
+            wake_ms: Some(T0 + 1_900_000),
+            wake_reason: None,
+        });
+        let snap_woke = sleep_v.absorb(&woke);
+        let wakes: Vec<&StripEvent> = snap_woke
+            .strip_events
+            .iter()
+            .filter(|e| e.kind == StripEventKind::SleepWake)
+            .collect();
+        assert_eq!(
+            wakes.len(),
+            1,
+            "skew detector and kernel timeline wake must coalesce into one SleepWake marker: {wakes:?}"
+        );
+        assert_eq!(wakes[0].at_unix_ms, T0 + 1_900_000);
+        let sleep_gaps: Vec<&TimeGap> = snap_woke
+            .time_gaps
+            .iter()
+            .filter(|g| g.kind == GapKind::Sleep)
+            .collect();
+        assert_eq!(sleep_gaps.len(), 1, "{sleep_gaps:?}");
+
+        // 4. Transitive bridging gap merge, chronological ordering, and unsampled startup idle
+        //    after restore (clean restart at +30s followed by first sample at +90s, plus immediate
+        //    dirty checkpoint before first sample preserving prior Paused span):
+        let mut bridged = Vitals::new();
+        bridged.record_time_gap(TimeGap {
+            start_ms: T0 + 40_000,
+            end_ms: T0 + 60_000,
+            kind: GapKind::Paused,
+        });
+        bridged.record_time_gap(TimeGap {
+            start_ms: T0 + 10_000,
+            end_ms: T0 + 30_000,
+            kind: GapKind::Crash,
+        });
+        bridged.record_time_gap(TimeGap {
+            start_ms: T0 + 25_000,
+            end_ms: T0 + 45_000,
+            kind: GapKind::Paused,
+        });
+        assert_eq!(
+            bridged.time_gaps.len(),
+            1,
+            "bridging span must transitively fold both overlapping gaps: {:?}",
+            bridged.time_gaps
+        );
+        assert_eq!(
+            bridged.time_gaps[0],
+            TimeGap {
+                start_ms: T0 + 10_000,
+                end_ms: T0 + 60_000,
+                kind: GapKind::Crash,
+            }
+        );
+
+        let clean_ckpt2 = before.saved_strip(true);
+        let mut run2 = Vitals::new();
+        run2.restore_strip_history(clean_ckpt2, last_ms + 30_000);
+        // Dirty checkpoint before any sample is taken in run2 must advance `last_wall_ms` to
+        // `last_ms + 30_000` so an early SIGKILL in run2 never rewrites run1's clean downtime:
+        let run2_dirty = run2.saved_strip(false);
+        assert_eq!(run2_dirty.last_wall_ms, last_ms + 30_000);
+        let mut run3 = Vitals::new();
+        run3.restore_strip_history(run2_dirty, last_ms + 50_000);
+        assert_eq!(run3.time_gaps.len(), 2, "{:?}", run3.time_gaps);
+        assert_eq!(run3.time_gaps[0].kind, GapKind::Paused);
+        assert_eq!(run3.time_gaps[1].kind, GapKind::Crash);
+
+        // When run2 stays alive and takes its first sample 60s after restore (`last_ms + 90_000`),
+        // the unsampled startup interval merges into the Paused span `[last_ms, last_ms + 90_000)`:
+        let snap_delayed = run2.absorb(&rig(60_000, 690_000, 1_000));
+        assert_eq!(
+            snap_delayed.time_gaps,
+            vec![TimeGap {
+                start_ms: last_ms,
+                end_ms: last_ms + 90_000,
+                kind: GapKind::Paused,
+            }]
+        );
+
+        assert_eq!(
+            crate::words::compact_cpu_brand("13th Gen Intel(R) Core(TM) i9-13900K"),
+            "Core i9-13900K"
+        );
+        assert_eq!(
+            crate::words::compact_cpu_brand("1st Gen Intel(R) Core(TM) Ultra 9 185H"),
+            "Core Ultra 9 185H"
         );
     }
 }

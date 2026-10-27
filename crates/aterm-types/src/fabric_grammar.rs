@@ -134,9 +134,9 @@ mirror_states! {
     Starting => "starting",
     /// Mirroring (`link mirror on`).
     On => "on",
-    /// Stopped, with its `:<reason>` (`pin`, `endpoint`, `refused`).
+    /// Stopped, with its `:<reason>` (a [`MirrorReason`] said in this state).
     Stopped => "stopped",
-    /// The bus holds as much of the mirror as it may (`capped:total`).
+    /// The bus holds as much of the mirror as it may (`capped:total`, [`MirrorReason::Total`]).
     Capped => "capped",
     /// The broker's retention window holds the next take back.
     Budget => "budget",
@@ -156,6 +156,138 @@ impl MirrorState {
             .copied()
             .filter(|s| !matches!(s, Self::Starting | Self::Unserved))
             .find(|s| s.word() == word)
+    }
+
+    /// The line a bridge reports this state with on its control lane, `link mirror <word>`,
+    /// for a state it reports with no reason ([`Self::On`], [`Self::Budget`],
+    /// [`Self::Unretained`]); a stop or a cap goes with its reason ([`MirrorReason::request`]).
+    /// [`Self::Starting`] and [`Self::Unserved`] are the endpoint's own, which
+    /// [`Self::reported`] refuses.
+    #[must_use]
+    pub fn request(self) -> String {
+        format!("link mirror {}", self.word())
+    }
+}
+
+/// Declares [`MirrorReason`] and [`MirrorReason::ALL`] from one variant list, each reason with
+/// the [`MirrorState`] it is said in, so the words a bridge sends after `reason=` are one closed
+/// set beside the states.
+macro_rules! mirror_reasons {
+    ($($(#[$doc:meta])* $variant:ident => $word:literal ($state:ident),)*) => {
+        /// Why a bridge's mirror stopped or capped: the `reason=` of its `link mirror` line and
+        /// the `:<reason>` `fabric status mirror=` prints after the state.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum MirrorReason {
+            $($(#[$doc])* $variant,)*
+        }
+
+        impl MirrorReason {
+            /// Every reason, from the same list as the enum's.
+            pub const ALL: &'static [MirrorReason] = &[$(MirrorReason::$variant,)*];
+
+            /// The reason's word.
+            #[inline]
+            #[must_use]
+            pub const fn word(self) -> &'static str {
+                match self {
+                    $(MirrorReason::$variant => $word,)*
+                }
+            }
+
+            /// The state the reason is said in.
+            #[inline]
+            #[must_use]
+            pub const fn state(self) -> MirrorState {
+                match self {
+                    $(MirrorReason::$variant => MirrorState::$state,)*
+                }
+            }
+        }
+    };
+}
+
+mirror_reasons! {
+    /// The mirror's pinned batch, or its copies, could not be kept or read back.
+    Pin => "pin" (Stopped),
+    /// The endpoint refused a `log-take`, or answered one or a `log-landed` past its grammar.
+    Endpoint => "endpoint" (Stopped),
+    /// The broker refused a mirrored record for good.
+    Refused => "refused" (Stopped),
+    /// A `turns` mirror over a broker that retains nothing reached its lifetime total.
+    Total => "total" (Capped),
+}
+
+impl MirrorReason {
+    /// The line a bridge reports its mirror's stop or cap with, `link mirror <state>
+    /// reason=<word>`.
+    #[must_use]
+    pub fn request(self) -> String {
+        format!("link mirror {} reason={}", self.state().word(), self.word())
+    }
+}
+
+/// Declares [`DeadReason`] and [`DeadReason::ALL`] from one variant list, so every word a post
+/// can be retired undelivered with is one a reader of the words enumerates.
+macro_rules! dead_reasons {
+    ($($(#[$doc:meta])* $variant:ident => $word:literal,)*) => {
+        /// Why an outbound post was retired undelivered: the word the waiting client is told
+        /// (`ERR <word> id=<n>`), the bridge's `outbox sent … off=- reason=<word>`, and the session
+        /// log's `mail-landed … why=<word>`.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum DeadReason {
+            $($(#[$doc])* $variant,)*
+        }
+
+        impl DeadReason {
+            /// Every reason, from the same list as the enum's.
+            pub const ALL: &'static [DeadReason] = &[$(DeadReason::$variant,)*];
+
+            /// The reason's word.
+            #[inline]
+            #[must_use]
+            pub const fn word(self) -> &'static str {
+                match self {
+                    $(DeadReason::$variant => $word,)*
+                }
+            }
+        }
+    };
+}
+
+dead_reasons! {
+    /// The bridge gave no reason (`outbox sent … off=-` alone).
+    Undeliverable => "undeliverable",
+    /// No known principal or live advertised session by that address (`state=exited` too).
+    Unroutable => "unroutable",
+    /// More than one node claims the session id and the address pins none.
+    Ambiguous => "ambiguous",
+    /// The broker refused the publish for good.
+    Refused => "refused",
+    /// The publish would open a subject past this node's producer budget.
+    SubjectBudget => "subject-budget",
+    /// A seamless update could not carry the queued post (aterm's own retirement).
+    NotCarried => "not-carried",
+    /// The bus log the reply's `re=` names was replaced (aterm's own retirement).
+    LogReplaced => "log-replaced",
+}
+
+impl DeadReason {
+    /// Whether aterm itself retired the post, not the bridge.
+    #[inline]
+    #[must_use]
+    pub const fn aterms_own(self) -> bool {
+        matches!(self, Self::NotCarried | Self::LogReplaced)
+    }
+
+    /// The reason a bridge's `reason=<word>` names: one of the bridge's own words, else
+    /// [`Self::Undeliverable`] (a word this build does not know, or one only aterm retires with).
+    #[must_use]
+    pub fn told(word: &str) -> Self {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|r| !r.aterms_own() && r.word() == word)
+            .unwrap_or(Self::Undeliverable)
     }
 }
 
@@ -264,6 +396,55 @@ mod tests {
                 !matches!(state, MirrorState::Starting | MirrorState::Unserved),
                 "{state:?}"
             );
+        }
+    }
+
+    /// A bridge's `reason=` names one of the bridge's reasons; aterm's own two, and any word this
+    /// build does not know, read as the bridge's default.
+    #[test]
+    fn a_bridges_reason_names_its_own_word_and_anything_else_is_undeliverable() {
+        for r in DeadReason::ALL {
+            let told = DeadReason::told(r.word());
+            if r.aterms_own() {
+                assert_eq!(told, DeadReason::Undeliverable, "{r:?} is aterm's own");
+            } else {
+                assert_eq!(told, *r, "{r:?}");
+            }
+        }
+        assert_eq!(
+            DeadReason::ALL
+                .iter()
+                .filter(|r| r.aterms_own())
+                .collect::<Vec<_>>(),
+            [&DeadReason::NotCarried, &DeadReason::LogReplaced]
+        );
+        for other in ["", "caf", "Unroutable", "unroutable ", "expired"] {
+            assert_eq!(
+                DeadReason::told(other),
+                DeadReason::Undeliverable,
+                "{other:?}"
+            );
+        }
+    }
+
+    /// `help post` names every word a post can be retired with, as the waiting client is told it:
+    /// the words are read only from the help's quoted replies (a backticked span that starts
+    /// `ERR ` or carries `reason=`), so a reason the prose uses for something else (`refused to
+    /// edge tokens`) never stands in for one the reply list dropped.
+    #[test]
+    fn help_post_names_every_reason_a_post_is_retired_with() {
+        let help = crate::control_verbs::spec("post")
+            .expect("the post verb")
+            .help_line();
+        let words: std::collections::BTreeSet<&str> = help
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("ERR ") || span.contains("reason="))
+            .flat_map(|span| span.split(|c: char| !c.is_ascii_lowercase() && c != '-'))
+            .collect();
+        for r in DeadReason::ALL {
+            assert!(words.contains(r.word()), "help post names {:?}", r.word());
         }
     }
 

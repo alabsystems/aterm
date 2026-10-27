@@ -13,7 +13,7 @@ use crate::effects::{EffectDivergence, EffectRecord, NoEffects, ShadowPort};
 use crate::evidence::{Witness, WitnessParts};
 use crate::ident::{ArtifactKind, BranchId, Digest, Revision, TaskIdentity};
 use crate::log::{EventLog, IdentityMismatch, LogHeader, RangeFault};
-use crate::replay::{Divergence, Run, replay};
+use crate::replay::{Divergence, FoldedRun};
 use crate::task::{Code, PausedClass, Schema, StepRefusal, state_digest};
 
 /// The live head.
@@ -924,7 +924,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         let none: &[EffectRecord] = &[];
         let (live_verdict, live_observation_chain) = {
             let mut live_port = ShadowPort::new(none);
-            let live_run = replay(
+            let (live_run, live_verdict) = contract.replay_judged(
                 schema,
                 live_code,
                 ancestor.clone(),
@@ -948,17 +948,15 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
                 }));
             }
             live_port.finish().map_err(PublishRefusal::LiveEffects)?;
-            (
-                contract.judge(schema, inputs, &live_run),
-                live_run.observation_chain,
-            )
+            (live_verdict, live_run.observation_chain)
         };
 
         candidate
             .entry(schema, &ancestor)
             .map_err(PublishRefusal::Entry)?;
         let mut cand_port = ShadowPort::new(none);
-        let cand_run = replay(schema, &candidate, ancestor, inputs, from, &mut cand_port);
+        let (cand_run, candidate_verdict) =
+            contract.replay_judged(schema, &candidate, ancestor, inputs, from, &mut cand_port);
         bump(replays);
         if let Some(d) = cand_port.frontier() {
             return Err(PublishRefusal::CandidateEffects(*d));
@@ -970,18 +968,17 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
             .finish()
             .map_err(PublishRefusal::CandidateEffects)?;
 
-        let candidate_verdict = contract.judge(schema, inputs, &cand_run);
         if !candidate_verdict.passed() {
             return Err(PublishRefusal::CandidateFailed(candidate_verdict));
         }
-        let Run {
+        let FoldedRun {
             state: candidate_state,
             state_digest: candidate_state_digest,
             observation_chain: candidate_observation_chain,
-            observations: candidate_observations,
+            observations: _,
+            last_cursor: _,
             refused: _,
         } = cand_run;
-        drop(candidate_observations);
         let trace_digest = rec
             .log
             .trace_digest(schema, from, to)

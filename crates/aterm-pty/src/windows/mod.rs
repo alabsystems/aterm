@@ -51,6 +51,8 @@ struct WinSession {
     exit_code: Mutex<Option<u32>>,
     resize_guard: ResizeGuard,
     input_severed: AtomicBool,
+    /// The last alternate-screen leave client's process ([`start_one_leave`]).
+    leave_client: Mutex<Option<ffi::Handle>>,
     #[cfg(any(test, debug_assertions))]
     input_writes: std::sync::atomic::AtomicU64,
 }
@@ -708,6 +710,7 @@ fn spawn_on_host(req: SpawnRequest<'_>, allow_openconsole: bool) -> io::Result<S
             ResizeGuard::new(Some((size.y, size.x)), host)
         },
         input_severed: AtomicBool::new(false),
+        leave_client: Mutex::new(None),
         #[cfg(any(test, debug_assertions))]
         input_writes: std::sync::atomic::AtomicU64::new(0),
     });
@@ -788,6 +791,7 @@ pub fn adopt_handoff(
         exit_code: Mutex::new(None),
         resize_guard: ResizeGuard::new(None, ConsoleHostKind::Inbox),
         input_severed: AtomicBool::new(false),
+        leave_client: Mutex::new(None),
         #[cfg(any(test, debug_assertions))]
         input_writes: std::sync::atomic::AtomicU64::new(0),
     });
@@ -1405,7 +1409,7 @@ pub fn size(_master: i32) -> Option<(u16, u16)> {
     None
 }
 
-/// Make `master`'s console host LEAVE its alternate screen buffer.
+/// Make `master`'s console host LEAVE its alternate screen buffer. `ResourceBusy` while the session's last leave client still runs: one runs at a time, however often a program re-enters the alternate screen with a prompt on it.
 pub fn resync_alt_screen(master: i32) -> io::Result<()> {
     resync_alt_screen_with(master, None)
 }
@@ -1425,22 +1429,42 @@ fn resync_alt_screen_with(master: i32, carry: Option<((u16, u16), &str)>) -> io:
             "the session's console host repaints over the terminal; nothing to resync",
         ));
     }
-    let Some(mut command) = console_guard::leave_alt_screen_command(carry) else {
+    start_one_leave(&mut s.leave_client.lock_or_recover(), || {
+        let Some(mut command) = console_guard::leave_alt_screen_command(carry) else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no aterm.exe beside this program to run the console host's leave",
+            ));
+        };
+        let signal = s.signal.lock_or_recover();
+        let reference = s.reference.lock_or_recover();
+        if *signal == 0 || *reference == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the session's pseudoconsole is closing",
+            ));
+        }
+        let mut slots = [*signal, *reference, s.conhost];
+        openconsole::start_client(&mut slots, &mut command)
+    })
+}
+
+/// Start a leave client with `start` unless the one in `last` still runs (`ResourceBusy`), keeping the new one's process in `last`.
+fn start_one_leave(
+    last: &mut Option<ffi::Handle>,
+    start: impl FnOnce() -> io::Result<ffi::Handle>,
+) -> io::Result<()> {
+    if let Some(client) = last.as_ref()
+        // SAFETY: the client's process handle, owned by `last`; a zero wait only polls.
+        && unsafe { ffi::WaitForSingleObject(client.raw(), 0) } == ffi::WAIT_TIMEOUT
+    {
         return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "no aterm.exe beside this program to run the console host's leave",
-        ));
-    };
-    let signal = s.signal.lock_or_recover();
-    let reference = s.reference.lock_or_recover();
-    if *signal == 0 || *reference == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "the session's pseudoconsole is closing",
+            io::ErrorKind::ResourceBusy,
+            "the console host's last leave client still runs",
         ));
     }
-    let mut slots = [*signal, *reference, s.conhost];
-    openconsole::start_client(&mut slots, &mut command).map(drop)
+    *last = Some(start()?);
+    Ok(())
 }
 
 /// Which console host serves `master`.
@@ -1742,6 +1766,27 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[test]
+    fn one_leave_client_runs_at_a_time() {
+        let mut client = TestClient::spawn();
+        let mut last = None;
+        start_one_leave(&mut last, || Ok(ffi::Handle::new(client.open())))
+            .expect("the first leave");
+        let busy = start_one_leave(&mut last, || panic!("a second client while the first runs"))
+            .expect_err("held while the first runs");
+        assert_eq!(busy.kind(), io::ErrorKind::ResourceBusy);
+        let _ = client.0.kill();
+        let _ = client.0.wait();
+        assert!(!client.is_alive());
+        let mut started = false;
+        start_one_leave(&mut last, || {
+            started = true;
+            Ok(ffi::Handle::new(0))
+        })
+        .expect("the next leave once the first has exited");
+        assert!(started);
     }
 
     #[test]

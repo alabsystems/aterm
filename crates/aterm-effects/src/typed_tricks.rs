@@ -59,25 +59,39 @@ pub struct CommandsIter<'a> {
     name_first: bool,
 }
 
-impl<'a> Iterator for CommandsIter<'a> {
-    type Item = &'a str;
-
+impl<'a> CommandsIter<'a> {
+    /// Advances the iterator and returns the next command slice (`const`-friendly).
     #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
+    #[must_use]
+    pub const fn next_command(&mut self) -> Option<&'a str> {
         if self.at == 0 {
             return None;
         }
         let cut = self.at.trailing_zeros() as usize;
         self.at &= self.at - 1;
-        let half = if self.name_first {
-            self.word.get(cut..)
-        } else {
-            self.word.get(..cut)
+        let half = match self.word.as_bytes().split_at_checked(cut) {
+            Some((left, right)) => {
+                let bytes = if self.name_first { right } else { left };
+                match std::str::from_utf8(bytes) {
+                    Ok(s) => Some(s),
+                    Err(_) => None,
+                }
+            }
+            None => None,
         };
         Some(match half {
             Some(h) => h,
             None => self.word,
         })
+    }
+}
+
+impl<'a> Iterator for CommandsIter<'a> {
+    type Item = &'a str;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_command()
     }
 }
 
@@ -279,6 +293,7 @@ const fn is_unspaced_script(c: char) -> bool {
 
 const GLUED_NAME_CHARS: usize = 2;
 
+#[inline]
 fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(Trick, Cuts)> {
     if token.is_empty() || token.as_bytes()[0].is_ascii() {
         return None;
@@ -627,6 +642,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
+    #[inline]
     pub const fn rekey(&mut self, session: u64) {
         if matches!(self.session, Some(s) if s == session) {
             return;
@@ -731,6 +747,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
+    #[inline]
     pub fn note_submit(&mut self, now: Instant, lexicon: Option<&TrickLexicon>) -> TrickFeed<'_> {
         let mut out = None;
         let mut pet_only = false;
@@ -784,6 +801,7 @@ impl TrickListener {
     }
 
     /// A backward word-kill (Ctrl+W, Alt+Backspace, Ctrl+Backspace).
+    #[inline]
     pub fn note_word_kill(&mut self) -> TrickFeed<'_> {
         if self.line.poisoned || self.line.line_chars == 0 {
             return TrickFeed::NONE;
@@ -880,6 +898,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
+    #[inline]
     pub fn note_backspace(&mut self) -> TrickFeed<'_> {
         // Poisoned: the count stopped meaning anything. Zero: nothing to take
         // (a held key overshooting an empty line).
@@ -925,6 +944,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
+    #[inline]
     fn step(
         &mut self,
         now: Instant,
@@ -987,6 +1007,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
+    #[inline]
     fn push_token_char(&mut self, c: char) -> Option<Outcome> {
         let mut out = None;
         if self.line.token_chars == 0 {
@@ -1015,6 +1036,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
+    #[inline]
     fn edge(
         &mut self,
         now: Instant,
@@ -1085,6 +1107,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
+    #[inline]
     fn close_token(
         &mut self,
         now: Instant,
@@ -1103,12 +1126,13 @@ impl TrickListener {
                     Some(role) => Some((role, Cuts::WHOLE)),
                     None => {
                         glued(lexicon, word.as_str(), &mut self.scratch).map(|(trick, cuts)| {
-                            let needs_vocative = false;
-                            let role = TrickRole::Trick {
-                                trick,
-                                needs_vocative,
-                            };
-                            (role, cuts)
+                            (
+                                TrickRole::Trick {
+                                    trick,
+                                    needs_vocative: false,
+                                },
+                                cuts,
+                            )
                         })
                     }
                 }
@@ -1225,6 +1249,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
+    #[inline]
     const fn deliver(&mut self, now: Instant, verdict: Verdict, fed: u32) -> Option<Outcome> {
         match verdict {
             Verdict::Fire {

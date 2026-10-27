@@ -107,8 +107,10 @@ const ADD_DEV: [&str; 10] = [
     "--format",
 ];
 
+/// An agent provisions with no terminal on stderr or stdin (owner ruling 2026-10-26): from a
+/// file in place and from a piped stdin alike.
 #[test]
-fn auth_add_without_a_terminal_refuses_and_creates_nothing() {
+fn auth_add_without_a_terminal_provisions() {
     let root = common::scratch("auth-noterm");
     let fake = FakeGithub::start();
     let token = agh_fake::token("noterm");
@@ -119,13 +121,34 @@ fn auth_add_without_a_terminal_refuses_and_creates_nothing() {
         &mut ctx,
         &["auth", "add", "dev", "--stdin", "--tier", "dev"],
     );
-    assert_eq!(exit, 1);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
     assert_eq!(
-        common::error_json(&captured.stderr_text())["kind"],
-        Value::from("refused")
+        common::stdout_json(&captured)["login"],
+        Value::from("fixture-dev-bot")
     );
-    assert!(!dirs(root.path()).config.exists());
-    assert!(fake.seen().is_empty());
+    let dirs = dirs(root.path());
+    assert_eq!(
+        validated(&dirs).profile("dev").map(|p| p.tier),
+        Some(agh::policy::Tier::Dev)
+    );
+
+    let other = agh_fake::token("noterm-file");
+    fake.add_token(&other, "fixture-ext-bot");
+    std::fs::create_dir_all(&dirs.home).expect("home");
+    let file = common::write_token(&dirs.home.join("tok"), "ext.token", &other);
+    let path = file.display().to_string();
+    let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
+    let exit = run(
+        &mut ctx,
+        &["auth", "add", "ext", "--file", &path, "--tier", "external"],
+    );
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    assert_eq!(captured.stderr_text(), "");
+    assert!(
+        validated(&dirs).profile("ext").is_some(),
+        "{}",
+        config_text(&dirs)
+    );
 }
 
 #[test]
@@ -735,13 +758,21 @@ fn auth_remove_drops_every_reference_and_only_its_own_token_file() {
         captured.stderr_text()
     );
 
-    let (ctx, captured) = common::ctx(root.path(), &fake, common::env());
-    let mut ctx = ctx;
+    // No terminal: an agent removes a profile as a person does (owner ruling 2026-10-26).
+    let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
     assert_eq!(
         run(&mut ctx, &["auth", "remove", "release"]),
-        1,
+        0,
         "{}",
         captured.stderr_text()
+    );
+    assert!(
+        parsed(&dirs)
+            .get("profiles")
+            .and_then(|p| p.get("release"))
+            .is_none(),
+        "{}",
+        config_text(&dirs)
     );
 }
 
@@ -1045,9 +1076,10 @@ fn auth_status_reports_a_valid_file() {
     assert_eq!(
         keys,
         [
-            "ambient", "config", "faults", "ok", "platform", "present", "profiles"
+            "ambient", "config", "faults", "ok", "platform", "present", "profiles", "routing"
         ]
     );
+    assert_eq!(report["routing"], Value::from("agh.toml"));
     assert_eq!(report["ok"], Value::from(true));
     assert_eq!(report["present"], Value::from(true));
     assert_eq!(report["platform"], Value::from("unix"));

@@ -95,8 +95,12 @@ impl Row {
             let current_flags = unsafe { self.cells.get_unchecked(col_usize) }.flags();
             let wide_mask = CellFlags::WIDE.union(CellFlags::WIDE_CONTINUATION);
             if (current_flags.bits() & wide_mask.bits()) != 0 {
-                end_half_blanked =
-                    self.fixup_wide_char_overwrite(col_usize, current_flags, cells_len);
+                end_half_blanked = self.fixup_wide_char_overwrite(
+                    col_usize,
+                    current_flags,
+                    cells_len,
+                    Cell::bce_blank(colors),
+                );
             }
         }
 
@@ -118,7 +122,11 @@ impl Row {
         true
     }
 
-    /// Orphan fixup for a single-cell write at `col_usize`.
+    /// Orphan fixup for a single-cell write at `col_usize`: the other half of a wide glyph the
+    /// write lands on becomes `orphan`, the writer's BCE blank (xterm `WriteText` clears the
+    /// `DamagedCurCells` in the current colours, Ghostty's `printCell` clears them to its
+    /// `blankCell`). True when the half after the write was blanked to an empty cell, so the
+    /// row's length may end at the write.
     #[cold]
     #[inline(never)]
     pub(crate) fn fixup_wide_char_overwrite(
@@ -126,13 +134,14 @@ impl Row {
         col_usize: usize,
         current_flags: CellFlags,
         cells_len: usize,
+        orphan: Cell,
     ) -> bool {
         if self.is_cell_wide_continuation(col_usize as u16) {
-            self.cells[col_usize - 1] = Cell::EMPTY;
+            self.cells[col_usize - 1] = orphan;
         }
         if current_flags.contains(CellFlags::WIDE) && col_usize + 1 < cells_len {
-            self.cells[col_usize + 1] = Cell::EMPTY;
-            return true;
+            self.cells[col_usize + 1] = orphan;
+            return orphan.is_empty();
         }
         false
     }
@@ -152,7 +161,7 @@ impl Row {
         let old_len = self.len as usize;
 
         let end_half_blanked = self.flags.contains(RowFlags::HAS_WIDE_CHARS)
-            && self.fixup_wide_chars_in_range(col, count);
+            && self.fixup_wide_chars_in_range(col, count, Cell::bce_blank(template.colors()));
 
         let end = start.saturating_add(usize::from(count)).min(cells_len);
         let actual = end - start;
@@ -166,18 +175,26 @@ impl Row {
         u16_from_usize(actual)
     }
 
-    /// Clear orphaned wide-character halves before writing `start_col..start_col + count`.
+    /// Set the wide-character halves a write over `start_col..start_col + count` orphans to
+    /// `orphan` before the write: the writer's BCE blank for a print, `Cell::EMPTY` for a
+    /// rectangle copy. True when the half after the span was blanked to an empty cell, so the
+    /// row's length may end at the span.
     #[cold]
     #[inline(never)]
-    pub(crate) fn fixup_wide_chars_in_range(&mut self, start_col: u16, count: u16) -> bool {
+    pub(crate) fn fixup_wide_chars_in_range(
+        &mut self,
+        start_col: u16,
+        count: u16,
+        orphan: Cell,
+    ) -> bool {
         if !self.flags.contains(RowFlags::HAS_WIDE_CHARS) {
             return false;
         }
         let halves = self.orphaned_wide_halves(start_col, start_col.saturating_add(count));
         for col in halves.into_iter().flatten() {
-            self.cells[usize::from(col)] = Cell::EMPTY;
+            self.cells[usize::from(col)] = orphan;
         }
-        halves[1].is_some()
+        halves[1].is_some() && orphan.is_empty()
     }
 
     /// Clear wide-character halves outside `start..end` orphaned by overwriting the span.
@@ -248,7 +265,12 @@ impl Row {
 
         let end_half_blanked = (first_flags.contains(CellFlags::WIDE_CONTINUATION)
             || second_flags.contains(CellFlags::WIDE))
-            && self.fixup_wide_char_write(col_usize, second_flags, cells_len);
+            && self.fixup_wide_char_write(
+                col_usize,
+                second_flags,
+                cells_len,
+                Cell::bce_blank(colors),
+            );
 
         let cp = c as u32;
         let char_data = if cp <= Cell::MAX_DIRECT_CODEPOINT {
@@ -312,7 +334,10 @@ impl Row {
         }
     }
 
-    /// Orphan fixup for a wide-char write at `col_usize`.
+    /// Orphan fixup for a wide-char write at `col_usize`: the halves of wide glyphs the write
+    /// cuts into become `orphan`, the writer's BCE blank, as for a narrow write
+    /// ([`Self::fixup_wide_char_overwrite`]). True when the half after the write was blanked to
+    /// an empty cell.
     #[cold]
     #[inline(never)]
     pub(crate) fn fixup_wide_char_write(
@@ -320,13 +345,14 @@ impl Row {
         col_usize: usize,
         second_flags: CellFlags,
         cells_len: usize,
+        orphan: Cell,
     ) -> bool {
         if self.is_cell_wide_continuation(col_usize as u16) {
-            self.cells[col_usize - 1] = Cell::EMPTY;
+            self.cells[col_usize - 1] = orphan;
         }
         if second_flags.contains(CellFlags::WIDE) && col_usize + 2 < cells_len {
-            self.cells[col_usize + 2] = Cell::EMPTY;
-            return true;
+            self.cells[col_usize + 2] = orphan;
+            return orphan.is_empty();
         }
         false
     }

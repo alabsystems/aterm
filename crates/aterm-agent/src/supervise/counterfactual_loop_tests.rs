@@ -324,7 +324,7 @@ fn a_turn_end_the_candidate_decides_otherwise_is_shadowed_and_stops_the_acts() {
         weekly_limited(),
         switched(),
         busy_screen(),
-        answered("keep going"),
+        answered(CLEARED),
     ]);
     m.vanish_after = Some(2);
     m.turn_releases = Some(2);
@@ -350,7 +350,7 @@ fn a_turn_end_the_candidate_decides_otherwise_is_shadowed_and_stops_the_acts() {
         panic!("the continuation is the divergent act: {}", report.render());
     };
     assert!(
-        recorded.words.starts_with("turn ") && recorded.words.ends_with("keep going"),
+        recorded.words.starts_with("turn ") && recorded.words.ends_with(CLEARED),
         "{recorded:?}"
     );
     assert!(

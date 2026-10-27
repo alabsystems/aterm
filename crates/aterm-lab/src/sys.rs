@@ -32,6 +32,21 @@ pub fn kill(pid: i32, sig: i32) -> io::Result<()> {
     }
 }
 
+/// The name of the network interface with index `index` (`if_indextoname`), `None` when no
+/// interface has it.
+#[must_use]
+pub fn interface_name(index: u32) -> Option<String> {
+    let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
+    // SAFETY: `buf` holds IF_NAMESIZE bytes, as if_indextoname(3) writes at most.
+    let named = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
+    if named.is_null() {
+        return None;
+    }
+    // SAFETY: if_indextoname wrote a NUL-terminated name into `buf`.
+    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    Some(name.to_string_lossy().into_owned())
+}
+
 /// Send `sig` to every process in process group `pgid` (> 1).
 pub fn kill_group(pgid: i32, sig: i32) -> io::Result<()> {
     if pgid <= 1 {

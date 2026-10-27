@@ -351,10 +351,15 @@ impl<'t> Workspace<'t> {
             &String::from_utf8_lossy(&out.stderr),
         );
         if outcome.out_of_space() {
+            let verb = args
+                .iter()
+                .map(|a| a.as_ref().to_string_lossy())
+                .find(|a| !a.starts_with('-'))
+                .unwrap_or_default();
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
                 format!(
-                    "the disk filled during the build:\n{}",
+                    "the disk filled during `targo {verb}`:\n{}",
                     tail(&outcome.stderr, 5)
                 ),
             ));
@@ -374,7 +379,8 @@ impl<'t> Workspace<'t> {
     /// Runs `metadata --locked --offline`.
     ///
     /// # Errors
-    /// When targo cannot be started.
+    /// When targo cannot be started, or (`StorageFull`) when its output says
+    /// the disk filled.
     pub fn metadata_locked(&self) -> io::Result<Outcome> {
         self.run(&["metadata", "--locked", "--offline", "--format-version", "1"])
     }
@@ -382,15 +388,27 @@ impl<'t> Workspace<'t> {
     /// `fetch --locked --offline`: the locked dependencies are on this machine.
     ///
     /// # Errors
-    /// When targo cannot be started.
+    /// When targo cannot be started, or (`StorageFull`) when its output says
+    /// the disk filled.
     pub fn fetch_offline(&self) -> io::Result<Outcome> {
         self.run(&["fetch", "--locked", "--offline"])
+    }
+
+    /// `fetch --locked`: download the locked dependencies, at the checksums
+    /// `Cargo.lock` pins.
+    ///
+    /// # Errors
+    /// When targo cannot be started, or (`StorageFull`) when its output says
+    /// the disk filled.
+    pub fn fetch_locked(&self) -> io::Result<Outcome> {
+        self.run(&["fetch", "--locked"])
     }
 
     /// Build the conformance crate.
     ///
     /// # Errors
-    /// When targo cannot be started.
+    /// When targo cannot be started, or (`StorageFull`) when its output says
+    /// the disk filled.
     pub fn build(&self, build: Build) -> io::Result<Outcome> {
         let verb = match build {
             Build::Check => "check",
@@ -414,7 +432,8 @@ impl<'t> Workspace<'t> {
     /// Document one crate as rustdoc JSON and return the output path.
     ///
     /// # Errors
-    /// When targo cannot be started.
+    /// When targo cannot be started, or (`StorageFull`) when its output says
+    /// the disk filled.
     pub fn rustdoc(&self, target: DocTarget) -> io::Result<(Outcome, PathBuf)> {
         let mut args = self.compiling(&[
             "--unverified",

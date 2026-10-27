@@ -56,6 +56,7 @@ fn rust(
     tool: Tool,
 ) -> Vec<String> {
     let m = Machine {
+        root: None,
         home: Some(home),
         cwd: Some(cwd),
         env: &|name| env.get(name).map(OsString::from),
@@ -198,6 +199,97 @@ fn check_tool<'a>(
             want,
             "{shell:?} {tool:?}: {args:?} in {}",
             cwd.display()
+        );
+    }
+}
+
+/// The shim this version lays names the cache root the Rust rule uses, so a build that follows
+/// the shim on `$PATH` ([`shim_root`]) and one that follows the rule agree once it is laid.
+#[test]
+fn the_laid_shim_names_this_versions_cache_root() {
+    let home = Path::new("/Users//u");
+    for name in ["targo", "targo-tippy"] {
+        let block = shim_block(name).expect("a shim");
+        assert_eq!(
+            root_named_by_shim(home, &block),
+            Some(cache_root(home)),
+            "{name}"
+        );
+    }
+}
+
+/// A TEST RUN'S SCRATCH GOES QUIET: under every shell the block hands `targo --unverified test`
+/// (and `t`, `bench`) `$TMPDIR`'s `.ubd` folder once that folder is this user's, so what the
+/// tests make there never reaches fseventsd's clients. NEGATIVE CONTROL: a build, an absent
+/// folder, a link in its place, and a `$TMPDIR` already quiet keep `$TMPDIR` as it was.
+#[cfg(unix)]
+#[test]
+fn a_test_run_gets_the_quiet_tmpdir_once_it_is_this_users() {
+    struct Unlink(PathBuf);
+    impl Drop for Unlink {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let f = Fixture::new("build-cache-tmpdir");
+    let ws = f.dir("home/ws");
+    // The fixture is itself in a quiet folder, which the block takes for quiet already: the
+    // `$TMPDIR` it reads is a name outside one, a link to the fixture's folder.
+    let temp = Unlink(Path::new("/tmp").join(format!("atb-tmpdir-{}", std::process::id())));
+    let _ = std::fs::remove_file(&temp.0);
+    std::os::unix::fs::symlink(f.dir("T"), &temp.0).unwrap();
+    let tmpdir = format!("{}/", temp.0.display());
+    let quiet = temp.0.join(".ubd");
+    let run = |shell: &[&str], args: &[&str], tmpdir: &str| -> String {
+        let out = aterm_uds::spawnfd::command(shell[0])
+            .args(&shell[1..])
+            .arg("-c")
+            .arg(format!("{}printf '%s' \"$TMPDIR\"", block(Tool::Targo)))
+            .arg("sh")
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &f.home)
+            .env("PWD", &ws)
+            .env("TMPDIR", tmpdir)
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{shell:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let test = ["--unverified", "test", "-p", "x"];
+    for shell in shells() {
+        assert_eq!(
+            run(&shell, &test, &tmpdir),
+            tmpdir,
+            "{shell:?}: no folder yet"
+        );
+    }
+    std::os::unix::fs::symlink(&ws, &quiet).unwrap();
+    for shell in shells() {
+        assert_eq!(run(&shell, &test, &tmpdir), tmpdir, "{shell:?}: a link");
+    }
+    std::fs::remove_file(&quiet).unwrap();
+    std::fs::create_dir(&quiet).unwrap();
+    let moved = format!("{}/", quiet.display());
+    for shell in shells() {
+        for args in [
+            &test[..],
+            &["--unverified", "t"],
+            &["--unverified", "bench"],
+        ] {
+            assert_eq!(run(&shell, args, &tmpdir), moved, "{shell:?} {args:?}");
+        }
+        assert_eq!(
+            run(&shell, &["--unverified", "build"], &tmpdir),
+            tmpdir,
+            "{shell:?}"
+        );
+        assert_eq!(
+            run(&shell, &test, &moved),
+            moved,
+            "{shell:?}: quiet already"
         );
     }
 }
@@ -594,6 +686,7 @@ fn a_build_started_at_a_named_folder_gets_that_folders_answer() {
     let bench = strings(&["--unverified", "bench", "--no-run"]);
     let env = HashMap::from([("PWD", typed_in.display().to_string())]);
     let m = Machine {
+        root: None,
         home: Some(&f.home),
         cwd: Some(&typed_in),
         env: &|name| env.get(name).map(OsString::from),
@@ -1211,6 +1304,98 @@ fn age_tree(dir: &Path, ago: Duration) {
         }
     }
     age_by(dir, ago);
+}
+
+/// THE ROOT THE CACHE MOVED FROM EMPTIES ITSELF: under it a build directory an hour quiet goes
+/// whole whatever its workspace's state (a live one's too), one a build holds or wrote within the
+/// hour stays, and the root goes with the last of them; `plan_moved` names what a pass would
+/// take, a held one marked held. NEGATIVE CONTROL: the same live workspace's two-hour-quiet build
+/// directory under the cache root itself stays (only a gone or a month-old one goes there).
+#[cfg(unix)]
+#[test]
+fn the_root_the_cache_moved_from_goes_once_nothing_builds_there() {
+    let f = Fixture::new("build-cache-moved");
+    let old = moved_from(&f.home);
+    let hour = Duration::from_secs(60 * 60);
+    let live = f.dir("home/live");
+    std::fs::write(live.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let quiet = lay(&old, &live, 2 * hour);
+    let fresh = lay(&old, &f.root.join("home/fresh"), Duration::from_secs(60));
+    let busy = lay(&old, &f.root.join("home/busy"), 2 * hour);
+    let lock = busy.join("debug/.cargo-lock");
+    std::fs::write(&lock, b"").unwrap();
+    age_tree(&busy, 2 * hour);
+    let held = crate::lock::Flock::try_lock(std::fs::File::open(&lock).unwrap()).unwrap();
+    let now = SystemTime::now();
+
+    let planned: Vec<(PathBuf, bool)> = plan_moved(&old, now)
+        .into_iter()
+        .map(|p| {
+            assert!(matches!(p.why, Unused::Moved { after, .. } if after == MOVED_AFTER));
+            (p.path, p.held)
+        })
+        .collect();
+    let mut want = vec![(quiet.clone(), false), (busy.clone(), true)];
+    want.sort();
+    assert_eq!(planned, want);
+
+    let went = reclaim_moved(&old, now, &mut |_, _| true);
+    assert_eq!(went.len(), 1, "{went:?}");
+    assert_eq!(went[0].0, quiet);
+    assert!(
+        matches!(went[0].1, Unused::Moved { idle, after } if idle >= 2 * hour && after == MOVED_AFTER)
+    );
+    assert!(!quiet.exists() && fresh.is_dir() && busy.is_dir() && old.is_dir());
+
+    drop(held);
+    let mut went: Vec<PathBuf> = reclaim_moved(&old, now + 2 * hour, &mut |_, _| true)
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
+    went.sort();
+    let mut want = vec![busy, fresh];
+    want.sort();
+    assert_eq!(went, want);
+    assert!(!old.exists(), "the emptied root goes too");
+
+    let root = cache_root(&f.home);
+    let kept = lay(&root, &live, 2 * hour);
+    assert!(reclaim(&root, Some(f.home.as_path()), now).is_empty());
+    assert!(kept.is_dir());
+}
+
+/// A TARGET DIRECTORY NOTHING BUILDS IN GOES WHOLE: verify's old side lane goes once no build
+/// holds a lock in it, a cells lane's deep in its cell and triple included, and nothing is left
+/// beside it. NEGATIVE CONTROL: while a build holds that deep lock it stays, whole.
+#[cfg(unix)]
+#[test]
+fn a_target_nothing_builds_in_goes_whole_and_a_held_one_stays() {
+    let f = Fixture::new("build-cache-unbuilt");
+    let old = f.dir("target/verify/cells.noindex");
+    let deep = old.join("win/x86_64-pc-windows-msvc/debug");
+    std::fs::create_dir_all(deep.join("deps")).unwrap();
+    std::fs::write(deep.join(".cargo-lock"), b"").unwrap();
+    std::fs::write(deep.join("deps/x.rmeta"), b"x").unwrap();
+    let held = crate::lock::Flock::try_lock(std::fs::File::open(deep.join(".cargo-lock")).unwrap())
+        .unwrap();
+    assert!(!remove_unbuilt(&old).unwrap(), "a build holds it");
+    assert!(deep.join("deps/x.rmeta").is_file(), "kept whole");
+    drop(held);
+    let obstruction = deep.join(".cargo-artifact-lock");
+    std::fs::create_dir(&obstruction).unwrap();
+    assert!(!remove_unbuilt(&old).unwrap());
+    assert_eq!(std::fs::read(deep.join("deps/x.rmeta")).unwrap(), b"x");
+    assert!(obstruction.is_dir());
+    std::fs::remove_dir(&obstruction).unwrap();
+    assert!(remove_unbuilt(&old).unwrap());
+    assert!(!old.exists());
+    let listed: Vec<_> = std::fs::read_dir(old.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(listed.is_empty(), "nothing beside it: {listed:?}");
+    assert!(!remove_unbuilt(&old).unwrap(), "gone already");
 }
 
 #[cfg(unix)]

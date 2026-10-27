@@ -18,6 +18,9 @@ use std::{
     time::Duration,
 };
 
+mod policy;
+pub(super) use policy::session_boundary;
+
 #[test]
 fn automatic_batches_recheck_local_policy_and_new_catalog_conflicts() {
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
@@ -270,6 +273,163 @@ fn damaged_table_is_unavailable_and_never_reset_or_acknowledged() -> (i64, i64, 
     )
 }
 
+fn a_damaged_neighbor_does_not_starve_healthy_table_repair() -> [i64; 4] {
+    let records = BATCH * 2 + 3;
+    let mut observed = [1, 1, 1, 0];
+    for case in 0..4 {
+        let sender = case / 2;
+        let receiver = 1 - sender;
+        let initiator = case % 2;
+        let p = Pair::new(false, 0);
+        let other_paths = [
+            p.lab._home.path().join("other-a"),
+            p.lab._home.path().join("other-b"),
+        ];
+        let bootstrap = p.lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let other_scope = Store::create(&session, &other_paths[0]).unwrap().scope();
+        drop(session);
+        let bootstrap = p.lab.bootstrap(1);
+        let session = Session::open(&bootstrap).unwrap();
+        Store::join(&session, &other_paths[1], other_scope).unwrap();
+        drop(session);
+        let tables = [(p.scope, p.paths.clone()), (other_scope, other_paths)];
+        let damaged = usize::from(tables[0].0.digest() > tables[1].0.digest());
+        let healthy = 1 - damaged;
+        let bootstrap = p.lab.bootstrap(sender);
+        let session = Session::open(&bootstrap).unwrap();
+        for (index, (scope, paths)) in tables.iter().enumerate() {
+            let mut store = Store::open(&session, &paths[sender], *scope).unwrap();
+            for _ in 0..if index == healthy { records } else { 1 } {
+                store.commit_catalog(&session, b"offline edit").unwrap();
+            }
+        }
+        let expected: BTreeSet<_> =
+            Store::open(&session, &tables[healthy].1[sender], tables[healthy].0)
+                .unwrap()
+                .inventory(&session)
+                .unwrap()
+                .copied()
+                .collect();
+        assert_eq!(expected.len(), records);
+        drop(session);
+        let broken = &tables[damaged].1[receiver];
+        let original = std::fs::read(broken.join("table.astream")).unwrap();
+        std::fs::remove_file(broken.join("table.checkpoint")).unwrap();
+        let endpoint = |node| {
+            Endpoint::from_bootstrap(&p.lab.bootstrap(node))
+                .unwrap()
+                .unwrap()
+                .with_tables(
+                    p.lab.paths[node].clone(),
+                    tables
+                        .iter()
+                        .map(|(scope, paths)| (*scope, paths[node].clone()))
+                        .collect(),
+                )
+                .unwrap()
+        };
+        let mut a = endpoint(initiator);
+        let mut b = endpoint(1 - initiator);
+        let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+        let mut acknowledged = 0;
+        let mut refused = 0;
+        let mut stored = 0;
+        for turn in 0..6 {
+            if turn == 1 {
+                // Reconstruct both endpoints after a failed table, retaining only
+                // the per-peer repair hints owned by the calling transport.
+                a = endpoint(initiator);
+                b = endpoint(1 - initiator);
+            }
+            p.round(&a, &b, &mut ra, &mut rb);
+            let (offered, received) = if sender == initiator {
+                (ra.application().unwrap(), rb.application().unwrap())
+            } else {
+                (rb.application().unwrap(), ra.application().unwrap())
+            };
+            let selected = if turn % 2 == 0 { damaged } else { healthy };
+            assert_eq!(offered.table, Some(tables[selected].0.digest()));
+            assert_eq!(received.table, offered.table);
+            let authenticated = ra.actor().is_some() && rb.actor().is_some();
+            assert!(authenticated);
+            observed[2] &= i64::from(authenticated);
+            if selected == damaged {
+                observed[3] |= i64::from(offered.sent > 0 || received.received > 0);
+                assert_eq!((offered.sent, received.received), (0, 0));
+                assert_eq!((offered.deferred, received.deferred), (1, 1));
+                refused += 1;
+            } else {
+                let expected = BATCH.min(records - acknowledged);
+                assert_eq!((offered.sent, received.received), (expected, expected));
+                acknowledged += expected;
+            }
+            let bootstrap = p.lab.bootstrap(receiver);
+            let session = Session::open(&bootstrap).unwrap();
+            let store =
+                Store::open(&session, &tables[healthy].1[receiver], tables[healthy].0).unwrap();
+            let retained: BTreeSet<_> = store.inventory(&session).unwrap().copied().collect();
+            assert!(retained.is_subset(&expected));
+            stored = retained.len();
+            assert_eq!(stored, acknowledged);
+            if turn == 5 {
+                assert_eq!(retained, expected);
+            }
+            drop(store);
+            drop(session);
+            assert!(!broken.join("table.checkpoint").exists());
+            assert_eq!(
+                std::fs::read(broken.join("table.astream")).unwrap(),
+                original
+            );
+        }
+        assert_eq!((acknowledged, refused), (records, 3));
+        observed[0] &= i64::from(stored == records);
+        observed[1] &= i64::from(acknowledged == records);
+
+        // A restarted caller may lose its volatile cursors. It visits the damaged
+        // table again, then the already repaired one without duplicating records.
+        let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+        for selected in [damaged, healthy] {
+            p.round(
+                &endpoint(initiator),
+                &endpoint(1 - initiator),
+                &mut ra,
+                &mut rb,
+            );
+            let report = ra.application().unwrap();
+            for report in [report, rb.application().unwrap()] {
+                assert_eq!(report.table, Some(tables[selected].0.digest()));
+                assert_eq!((report.sent, report.received), (0, 0));
+                assert_eq!(report.deferred, usize::from(selected == damaged));
+                if selected == damaged {
+                    observed[3] |= i64::from(report.sent > 0 || report.received > 0);
+                }
+            }
+            let authenticated = ra.actor().is_some() && rb.actor().is_some();
+            assert!(authenticated);
+            observed[2] &= i64::from(authenticated);
+        }
+        let bootstrap = p.lab.bootstrap(receiver);
+        let session = Session::open(&bootstrap).unwrap();
+        let store = Store::open(&session, &tables[healthy].1[receiver], tables[healthy].0).unwrap();
+        assert_eq!(
+            store
+                .inventory(&session)
+                .unwrap()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert!(!broken.join("table.checkpoint").exists());
+        assert_eq!(
+            std::fs::read(broken.join("table.astream")).unwrap(),
+            original
+        );
+    }
+    observed
+}
+
 struct LostAck {
     input: Cursor<Vec<u8>>,
 }
@@ -364,6 +524,17 @@ pub fn repair_transition(
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
+    if action == "DamagedNeighbor" {
+        let [stored, acknowledged, control, neighbor_acknowledged] =
+            a_damaged_neighbor_does_not_starve_healthy_table_repair();
+        let mut next = state.clone();
+        next.insert("scenario", 8);
+        next.insert("stored", stored);
+        next.insert("acknowledged", acknowledged);
+        next.insert("control", control);
+        next.insert("neighbor_acknowledged", neighbor_acknowledged);
+        return next;
+    }
     let (scenario, (stored, acknowledged, control)) = match action {
         "NewMember" | "LostKey" => {
             let p = Pair::new(true, 1);
@@ -415,6 +586,7 @@ pub fn repair_transition(
     next.insert("stored", stored);
     next.insert("acknowledged", acknowledged);
     next.insert("control", control);
+    next.insert("neighbor_acknowledged", 0);
     next
 }
 
@@ -441,6 +613,31 @@ fn real_repair_conforms_and_receipt_without_storage_mutant_is_detected() {
     forged.insert("control", 1);
     assert!(!model.successors("NewMember", &initial).contains(&forged));
     assert!(!model.check_invariant("ReceiptsRequireStorage", &forged));
+    let mut starved = model.successors("DamagedNeighbor", &initial).remove(0);
+    starved.insert("stored", 0);
+    starved.insert("acknowledged", 0);
+    assert!(!model.check_invariant("AvailableRepairPersists", &starved));
+    assert!(
+        !model
+            .successors("DamagedNeighbor", &initial)
+            .contains(&starved)
+    );
+    let mut unacknowledged = model.successors("DamagedNeighbor", &initial).remove(0);
+    unacknowledged.insert("acknowledged", 0);
+    assert!(!model.check_invariant("NeighborRepairAcknowledged", &unacknowledged));
+    assert!(
+        !model
+            .successors("DamagedNeighbor", &initial)
+            .contains(&unacknowledged)
+    );
+    let mut reset = model.successors("DamagedNeighbor", &initial).remove(0);
+    reset.insert("neighbor_acknowledged", 1);
+    assert!(!model.check_invariant("DamagedNeighborIsNotAcknowledged", &reset));
+    assert!(
+        !model
+            .successors("DamagedNeighbor", &initial)
+            .contains(&reset)
+    );
 }
 
 #[test]

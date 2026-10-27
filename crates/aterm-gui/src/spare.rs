@@ -467,8 +467,17 @@ impl std::fmt::Display for FolderFallsBack {
 
 impl std::error::Error for FolderFallsBack {}
 
-/// Install pre-adoption host callbacks on `term` that only taint `link`.
-pub(crate) fn wire_spare_taint(term: &Arc<Mutex<Terminal>>, link: &Arc<SpareLink>) {
+/// Install pre-adoption host callbacks on `term` that only taint `link`. The Kitty medium's goes in
+/// only where [`crate::spawn::kitty_media_admitted`] admits the real one for `reach` and
+/// `allow_kitty_file_transfer` (both of which a spare shares with the session it becomes): without
+/// it, a spare refuses `t=f`/`t=t`/`t=s` as a fresh session does, and the reader's prefetch, which
+/// reads a medium for any installed resolver, reads none.
+pub(crate) fn wire_spare_taint(
+    term: &Arc<Mutex<Terminal>>,
+    link: &Arc<SpareLink>,
+    reach: crate::spawn::HostReach,
+    allow_kitty_file_transfer: bool,
+) {
     use aterm_core::terminal::ClipboardAccess;
     let mut t = crate::term_lock(term);
     t.revoke_clipboard_access(ClipboardAccess::Query);
@@ -483,11 +492,13 @@ pub(crate) fn wire_spare_taint(term: &Arc<Mutex<Terminal>>, link: &Arc<SpareLink
         l.taint(taint::CLIPBOARD);
         None
     });
-    let l = Arc::clone(link);
-    t.set_kitty_file_resolver(move |_, _| {
-        l.taint(taint::KITTY);
-        None
-    });
+    if crate::spawn::kitty_media_admitted(reach, allow_kitty_file_transfer) {
+        let l = Arc::clone(link);
+        t.set_kitty_file_resolver(move |_, _| {
+            l.taint(taint::KITTY);
+            None
+        });
+    }
     #[cfg(target_os = "linux")]
     {
         let l = Arc::clone(link);
@@ -2549,7 +2560,7 @@ fn judge(obs: &Observation, seen: &StartSeen, last_scan: &mut Option<Instant>) -
         obs.started_at,
         seen.at,
         last_scan,
-        true,
+        ScanOf::Sample,
     ) {
         Scan::Clean => Sample::Clean {
             rc_ms: u32::try_from(rc.as_millis()).unwrap_or(u32::MAX),
@@ -2573,6 +2584,15 @@ fn wall_of(at: Instant) -> std::time::SystemTime {
     }
 }
 
+/// The run an escape scan judges, which sets its spacing and where its window ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanOf {
+    /// A visible run: at most one per [`SCAN_EVERY`], its window ending [`SCAN_GRACE`] after the mark, since the person may type from the prompt on.
+    Sample,
+    /// A spare at its hold: unspaced, its window ending at its listing, since nothing but its startup files runs in it before adoption and a verdict after adoption is dropped; a daemon they forked that is born after the grace but listed counts.
+    Verification,
+}
+
 fn rate_limited_scan(
     pid: i32,
     shell_version: Option<i32>,
@@ -2580,32 +2600,31 @@ fn rate_limited_scan(
     run_at: Instant,
     mark_at: Instant,
     last_scan: &mut Option<Instant>,
-    spaced: bool,
+    of: ScanOf,
 ) -> Scan {
-    rate_limited(mark_at, last_scan, spaced, || {
-        escape_scan(
-            pid,
-            shell_version,
-            sid,
-            wall_of(run_at),
-            wall_of(mark_at) + SCAN_GRACE,
-        )
+    rate_limited(mark_at, last_scan, of, |until| {
+        escape_scan(pid, shell_version, sid, wall_of(run_at), until)
     })
 }
 
 fn rate_limited(
     mark_at: Instant,
     last_scan: &mut Option<Instant>,
-    spaced: bool,
-    scan: impl FnOnce() -> Scan,
+    of: ScanOf,
+    scan: impl FnOnce(std::time::SystemTime) -> Scan,
 ) -> Scan {
     crate::qos::sleep_until(mark_at + SCAN_GRACE);
     let now = Instant::now();
-    if spaced && last_scan.is_some_and(|at| now.saturating_duration_since(at) < scan_every()) {
+    if of == ScanOf::Sample
+        && last_scan.is_some_and(|at| now.saturating_duration_since(at) < scan_every())
+    {
         return Scan::RateLimited;
     }
     *last_scan = Some(now);
-    scan()
+    scan(match of {
+        ScanOf::Sample => wall_of(mark_at) + SCAN_GRACE,
+        ScanOf::Verification => std::time::SystemTime::now(),
+    })
 }
 
 fn verify(job: &VerifyJob, last_scan: &mut Option<Instant>, shared: &Shared) -> Verdict {
@@ -2661,7 +2680,7 @@ fn verify(job: &VerifyJob, last_scan: &mut Option<Instant>, shared: &Shared) -> 
         job.run_at,
         seen.at,
         last_scan,
-        false,
+        ScanOf::Verification,
     ) {
         Scan::Clean => Verdict::Ok,
         Scan::Escaped => Verdict::Backoff("escaped"),
@@ -2894,6 +2913,7 @@ impl Wake {
             | Wake::AppNotice { .. }
             | Wake::Notice { .. }
             | Wake::DevToolsHandOverAsked { .. }
+            | Wake::PermissionWalkAsked { .. }
             | Wake::PkgProgress { .. }
             | Wake::PkgPassEnded { .. }
             | Wake::PkgPersonPass(..)
@@ -2935,6 +2955,10 @@ impl Wake {
             Wake::FindPasteReady { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::Askpass(..) => None,
+            #[cfg(target_os = "macos")]
+            Wake::CpuPolicyReport(_)
+            | Wake::CpuPolicyPermit { .. }
+            | Wake::CpuPolicyAction { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::AskpassAnswered { .. } => None,
             #[cfg(target_os = "macos")]
@@ -2978,7 +3002,8 @@ impl Wake {
             Wake::WorkstationSetup(_)
             | Wake::DeveloperToolsInstall(_, _)
             | Wake::InitialSetupStatus { .. }
-            | Wake::InitialSetupApplyResolved => None,
+            | Wake::InitialSetupApplyResolved
+            | Wake::AccountMenuRead(_) => None,
         }
     }
 }
@@ -3420,7 +3445,6 @@ impl App {
         let f = &self.session_factory;
         f.exec_command.is_none()
             && f.integrate
-            && !f.temporal_recording
             && aterm_core::shell_integration::has_spare_hold(crate::spawn::detect_spawn_shell(
                 f.shell_override.as_deref(),
             ))
@@ -4332,6 +4356,11 @@ impl App {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .adopt_spare(now);
+        if self.session_factory.temporal_recording
+            && let Err(why) = crate::spawn::arm_promoted(session, session.id)
+        {
+            aterm_log::warn!("spare {}: Rewind is not recording it: {why}", session.id);
+        }
         crate::keeper_link::register(session, None);
     }
 

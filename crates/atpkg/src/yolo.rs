@@ -767,6 +767,7 @@ mod tests {
             ("muse", argv(&["-c", "approval_mode=\"on-request\""])),
             ("muse", argv(&["resume", "session-id"])),
             ("muse", argv(&["skills", "list"])),
+            ("muse", argv(&["usage"])),
             ("muse", argv(&["auth", "login"])),
             ("muse", argv(&["exec", "--disable-approval", "x"])),
             ("claude", argv(&["update"])),

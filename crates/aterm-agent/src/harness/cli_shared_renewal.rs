@@ -142,6 +142,46 @@ impl Guard<'_> {
         }
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSharedBegin",
+            action = "Current",
+            project = "aterm_agent::harness::cli::tests::shared_renewal_tests::begin_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSharedBegin",
+            action = "Stopped",
+            project = "aterm_agent::harness::cli::tests::shared_renewal_tests::begin_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSharedBegin",
+            action = "ChangedHead",
+            project = "aterm_agent::harness::cli::tests::shared_renewal_tests::begin_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSharedBegin",
+            action = "Unavailable",
+            project = "aterm_agent::harness::cli::tests::shared_renewal_tests::begin_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSharedBegin",
+            action = "Unrelated",
+            project = "aterm_agent::harness::cli::tests::shared_renewal_tests::begin_transition"
+        )
+    )]
     pub(super) fn begin(
         &mut self,
         store: &accounts::Store,
@@ -149,18 +189,40 @@ impl Guard<'_> {
         staging: &str,
         now: i64,
     ) -> Result<accounts::Logins, String> {
+        self.begin_with(store, policy, staging, now, || {})
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountRenewalSnapshot",
+            action = "Begin",
+            project = "aterm_agent::harness::cli::tests::shared_renewal_tests::snapshot_transition"
+        )
+    )]
+    pub(super) fn begin_with(
+        &mut self,
+        store: &accounts::Store,
+        policy: accounts::RenewalPolicy<'_>,
+        staging: &str,
+        now: i64,
+        after_commit: impl FnOnce(),
+    ) -> Result<accounts::Logins, String> {
+        if matches!(self, Self::Shared { grant: None, .. }) {
+            return Err("shared renewal was not checked".to_owned());
+        }
+        // Keep the committed generation through the returned read. A later writer
+        // must not become this attempt's parent while its grant stays unchanged.
+        let held = store
+            .acquire_within(&accounts::LOCK_LADDER)
+            .map_err(|why| why.to_string())?
+            .ok_or_else(|| accounts::LOCK_HELD.to_owned())?;
         match self {
             Self::Local => {
-                store.transact_renewal_within(
-                    &accounts::LOCK_LADDER,
-                    now,
-                    &mut None,
-                    policy,
-                    |_, logins| {
-                        unmanaged(logins, policy.row, None, false)?;
-                        Ok(Vec::new())
-                    },
-                )?;
+                store.transact_renewal_held(&held, now, &mut None, policy, |_, logins| {
+                    unmanaged(logins, policy.row, None, false)?;
+                    Ok(Vec::new())
+                })?;
             }
             Self::Shared {
                 authority,
@@ -171,39 +233,35 @@ impl Guard<'_> {
                 let approved = grant
                     .as_ref()
                     .ok_or_else(|| "shared renewal was not checked".to_owned())?;
-                authority.current(approved, policy.row)?;
                 let mut begun = None;
-                store.transact_renewal_within(
-                    &accounts::LOCK_LADDER,
-                    now,
-                    &mut None,
-                    policy,
-                    |_, logins| {
-                        begun = Some(logins.shared.begin(
-                            shared::Intent {
-                                source: approved.source,
-                                decision: approved.decision,
-                                generation: approved.generation,
-                                configuration: approved.configuration,
-                                request: *request,
-                                label: policy.row.label.clone(),
-                                identity: approved.identity.clone(),
-                                staging: staging.to_owned(),
-                                before_generation:
-                                    logins.get(&policy.row.label).map(|b| b.renewal_generation),
-                                begun_at: now,
-                            },
-                            approved.expected_principal,
-                        )?);
-                        Ok(vec![
-                            accounts::Event::new(now, accounts::Kind::SignIn, &policy.row.label)
-                                .because("shared preparation begun"),
-                        ])
-                    },
-                )?;
+                store.transact_renewal_held(&held, now, &mut None, policy, |_, logins| {
+                    // Check after the account writer wait, before consuming the grant.
+                    authority.current(approved, policy.row)?;
+                    begun = Some(logins.shared.begin(
+                        shared::Intent {
+                            source: approved.source,
+                            decision: approved.decision,
+                            generation: approved.generation,
+                            configuration: approved.configuration,
+                            request: *request,
+                            label: policy.row.label.clone(),
+                            identity: approved.identity.clone(),
+                            staging: staging.to_owned(),
+                            before_generation:
+                                logins.get(&policy.row.label).map(|b| b.renewal_generation),
+                            begun_at: now,
+                        },
+                        approved.expected_principal,
+                    )?);
+                    Ok(vec![
+                        accounts::Event::new(now, accounts::Kind::SignIn, &policy.row.label)
+                            .because("shared preparation begun"),
+                    ])
+                })?;
                 *token = begun;
             }
         }
+        after_commit();
         store.load_logins(now).map(|(logins, _)| logins)
     }
 
@@ -304,6 +362,22 @@ pub(in crate::harness) fn unmanaged(
 
 /// Run exactly one renewal. No fallback or retry re-enters a consumed grant.
 /// The provider's own sign-in may still require a person at the terminal.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedCheckpoint",
+        action = "Fail",
+        project = "aterm_agent::harness::cli::tests::shared_renewal_tests::checkpoint_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedCheckpoint",
+        action = "Supersede",
+        project = "aterm_agent::harness::cli::tests::shared_renewal_tests::checkpoint_transition"
+    )
+)]
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(

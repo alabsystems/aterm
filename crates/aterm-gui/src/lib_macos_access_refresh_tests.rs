@@ -651,7 +651,7 @@ fn a_grant_read_while_the_panel_is_up_is_recorded_once() {
     app.look_for_fda_moment(Instant::now(), quiet);
     app.consent = ConsentState::with_cached_probe_for_test(granted());
     app.tick_devtools_hand_over(now);
-    app.tick_devtools_hand_over(now + Duration::from_secs(1));
+    app.tick_devtools_hand_over(now + crate::devtools_helper::DONE_FOR / 2);
     assert_eq!(
         app.devtools_helper.panel().map(|panel| panel.phase()),
         Some(Phase::Done)
@@ -732,11 +732,14 @@ fn the_owners_open_settings_brings_the_panel() {
     );
 }
 
-/// A session's `aterm ctl devtools hand-over now` never takes the owner's Full Disk
-/// Access panel away (nor, with it, the folder warm-up that follows a Not now).
+/// `aterm ctl devtools hand-over now`, the permission walk with Developer Tools first, never
+/// takes the window's own Full Disk Access panel away (nor, with it, the folder warm-up that
+/// follows a Not now): its page waits for that panel to go, for at most the ten minutes a panel
+/// stays up.
 #[test]
-fn a_control_verbs_now_panel_waits_behind_full_disk_access() {
-    use crate::devtools_helper::{HandOver, Origin, Page, Refusal, test_arms};
+fn a_control_verbs_now_walk_waits_behind_full_disk_access() {
+    use crate::devtools_helper::{Page, test_arms};
+    use crate::permission_walk::{Started, Subject};
     let now = Instant::now();
     let mut app = launched(now);
     app.devtools_helper.note_reading(
@@ -748,13 +751,40 @@ fn a_control_verbs_now_panel_waits_behind_full_disk_access() {
     );
     app.look_for_fda_moment(Instant::now(), quiet);
     assert!(app.fda_panel_up());
+    let asked = Instant::now();
+    let started = app.ask_permission_walk(&[Subject::DeveloperTools], asked);
+    assert!(matches!(started, Started::Walking(_)), "{started:?}");
+    app.drive_permission_walk(asked + crate::permission_walk::GRANT_POLL);
     assert_eq!(
-        app.hand_devtools_to_owner(Origin::Ctl { now: true }),
-        HandOver::Refused(Refusal::Recent)
+        app.devtools_helper.panel().map(|panel| panel.page()),
+        Some(Page::FullDiskAccess)
+    );
+    assert!(app.permission_walk.active(), "its page waits");
+    app.drive_permission_walk(asked + crate::devtools_helper::PANEL_FOR);
+    assert!(
+        !app.permission_walk.active(),
+        "a page held off for ten minutes ends the walk"
     );
     assert_eq!(
         app.devtools_helper.panel().map(|panel| panel.page()),
         Some(Page::FullDiskAccess)
+    );
+
+    // NEGATIVE CONTROL: the owner's own press on the Developer Tools row takes the page at once.
+    let mut pressed = launched(now);
+    pressed.devtools_helper.note_reading(
+        test_arms::reading(
+            aterm_containment::DevToolGrant::NotGranted,
+            test_arms::absent(2),
+        ),
+        now,
+    );
+    pressed.look_for_fda_moment(Instant::now(), quiet);
+    assert!(pressed.fda_panel_up());
+    let _ = pressed.start_permission_walk(&[Subject::DeveloperTools], "a person's press", asked);
+    assert_eq!(
+        pressed.devtools_helper.panel().map(|panel| panel.page()),
+        Some(Page::DeveloperTools)
     );
 }
 

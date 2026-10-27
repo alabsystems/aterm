@@ -59,8 +59,8 @@ pub const DRIVEN_GRACE_US: i64 = 150_000;
 /// A dark run that reaches the driven window's final sampled frame is the authored exhale for its first 0.4 s; only the excess is charged.
 pub const EXHALE_CLOSE_ALLOWANCE_US: i64 = 400_000;
 
-/// The resting sprites the engine authors under the strict floor (the curled sleepers and the gallop's low first frame), witnessed inside their emitted `pet_body` at the compact floor, more than two cells wide, unclipped by the cell on its left, right and top.
-pub const RESTING_POSE_STEMS: [&str; 2] = ["sleep", "run_0"];
+/// The sprites the engine authors under the strict floor (the curled sleepers, the gallop's low first frame, and the hop and descent of the first keys' spring: 17 and 16 px tall at cell height 14), witnessed inside their emitted `pet_body` at the compact floor, more than two cells wide, unclipped by the cell on its left, right and top.
+pub const RESTING_POSE_STEMS: [&str; 4] = ["sleep", "run_0", "hop", "leap_descend"];
 
 /// Saturated changed pixels of one frame: pixel index -> hue in degrees.
 pub type SatMap = BTreeMap<usize, f64>;
@@ -234,6 +234,9 @@ pub struct DynamicMetrics {
     pub band_hues: HueSet,
     /// Ink of objects standing wholly inside the drawn animal's box, refused to `band_ink`.
     pub animal_ink: usize,
+    /// How far the band's measured top stands above the typed row's bottom edge, in px
+    /// ([`band_top`]), on a take that measures it.
+    pub band_reach: Option<usize>,
 }
 
 /// The continuous hue angle of a paint-semantic pixel, else `None`: the colour floor ([`SAT_MIN`], [`SAT_SPREAD`]) and HSV hue in degrees.
@@ -411,6 +414,59 @@ pub fn band_ink_partition(
         }
     }
     (band_ink, band_hues, animal_ink)
+}
+
+/// How many cells above the typed row's bottom edge [`band_top`] looks for the band's top.
+pub const REACH_WINDOW_CELLS: usize = 3;
+/// A pixel row is the band's while at least `REACH_ROW_NUM / REACH_ROW_DEN` of the band's width
+/// is tinted on it: the body behind the head, past the head's own light (its glow and the rising
+/// stars, about six cells wide), which a share this high leaves out.
+pub const REACH_ROW_NUM: usize = 3;
+pub const REACH_ROW_DEN: usize = 4;
+/// The fewest cells wide the band must be at its spine for its top to be read. A younger band is
+/// mostly its head, whose light stands above the body, and its body has not yet risen to its
+/// reach: on the shipped build at 7x14 cells a 9-cell tall band read 1.43 ch and a 12-cell one
+/// 0.86 against 0.71 to 0.79 from 18 cells on, and the underline body read 0.14 to 0.21 ch until
+/// its band was 17 cells wide and 0.36 to 0.43 after.
+pub const REACH_MIN_CELLS: usize = 18;
+
+/// One frame's band top above the typed row, in px above `row.bottom`.
+///
+/// A pixel is *tinted* when it differs from the baseline frame there, the baseline shows the
+/// backdrop there (so the baseline's own content leaving is not paint) and it lies in no box of
+/// `exclude` (the drawn companion). The band's width `W` is the most tinted pixels on one pixel
+/// row from the typed row's last one (`row.bottom - 1`) down to one cell under the edge: its spine
+/// and the rail under it. Walking up from `row.bottom - 1`, every pixel row with at least
+/// `⌈W · REACH_ROW_NUM / REACH_ROW_DEN⌉` tinted pixels is the band's, and the band's top is the
+/// last such row before the first that is not (`0` when the row's last pixel row is not). The
+/// body's faint top tints a pixel wherever it lays any light, so this reads the body's reach,
+/// not where its colour is strong. `None` when `W < REACH_MIN_CELLS · cell.w` or the window is
+/// off the frame.
+#[must_use]
+pub fn band_top(w: usize, tinted: &BTreeSet<usize>, row: TypedRow, cell: Cell) -> Option<usize> {
+    let top = row.bottom.checked_sub(REACH_WINDOW_CELLS * cell.h)?;
+    let below = row.bottom + cell.h;
+    if row.bottom == 0 || below > row.frame_h {
+        return None;
+    }
+    let mut counts = vec![0_usize; below - top];
+    for &p in tinted {
+        let y = p / w;
+        if (top..below).contains(&y) {
+            counts[y - top] += 1;
+        }
+    }
+    let width = counts[row.bottom - 1 - top..].iter().copied().max()?;
+    if width < REACH_MIN_CELLS * cell.w {
+        return None;
+    }
+    let floor = (width * REACH_ROW_NUM).div_ceil(REACH_ROW_DEN);
+    let band_rows = counts[..row.bottom - top]
+        .iter()
+        .rev()
+        .take_while(|&&n| n >= floor)
+        .count();
+    Some(band_rows)
 }
 
 /// Inclusive bounds of a member list, as `(x0, y0, x1, y1)`.
@@ -1409,6 +1465,18 @@ pub fn dynamic_metrics(
     cell: Cell,
     exclude: &[PixelBox],
 ) -> DynamicMetrics {
+    dynamic_metrics_over(base, frame, cell, exclude, None)
+}
+
+/// [`dynamic_metrics`], and the band's reach above `typed_row` when one is given.
+#[must_use]
+pub fn dynamic_metrics_over(
+    base: &Frame,
+    frame: &Frame,
+    cell: Cell,
+    exclude: &[PixelBox],
+    typed_row: Option<TypedRow>,
+) -> DynamicMetrics {
     let (w, h) = (frame.width(), frame.height());
     let mut m = DynamicMetrics::default();
     let mut dynamic = BTreeSet::new();
@@ -1453,6 +1521,20 @@ pub fn dynamic_metrics(
     m.band_ink = band_ink;
     m.band_hues = band_hues;
     m.animal_ink = animal_ink;
+    m.band_reach = typed_row.and_then(|row| {
+        let backdrop = frame_background(base);
+        let as_i = |v: usize| i64::try_from(v).unwrap_or(i64::MAX);
+        let tinted: BTreeSet<usize> = changed
+            .iter()
+            .copied()
+            .filter(|&p| base.pixel(p) == backdrop)
+            .filter(|&p| {
+                let (x, y) = (as_i(p % w), as_i(p / w));
+                !exclude.iter().any(|b| b.contains(x, y, x, y))
+            })
+            .collect();
+        band_top(w, &tinted, row, cell)
+    });
     m
 }
 
@@ -1492,7 +1574,7 @@ impl std::fmt::Display for FrameReport {
             f,
             "{}: dynamic_saturated={} hue_buckets={:?} row_hue_peak={} \
              row_hue_separation={:.1}deg ribbon_component={}/{}x{} ribbon_run={}/{}@{} \
-             band_ink={} animal_ink={} cyan={} companion={}/{}x{}",
+             band_ink={} animal_ink={} band_reach={} cyan={} companion={}/{}x{}",
             self.name,
             m.ink,
             m.hues.buckets(),
@@ -1506,6 +1588,8 @@ impl std::fmt::Display for FrameReport {
             m.ribbon_run.row,
             m.band_ink,
             m.animal_ink,
+            m.band_reach
+                .map_or_else(|| "none".to_string(), |px| px.to_string()),
             m.cyan_pixels,
             self.companion.pixels,
             self.companion.width,
@@ -1561,6 +1645,14 @@ pub struct ScanReport {
     pub companion_fused: usize,
     /// The companion found on frame 0.
     pub base_comp: Shape,
+    /// The typed row a reach was measured above, as the take was handed it.
+    pub typed_row: Option<TypedRow>,
+    /// Bound frames whose band top was measured above the typed row ([`band_top`]).
+    pub reach_frames: usize,
+    /// Their band tops' median, least and greatest height above the row's bottom edge, in px.
+    pub reach_px: Option<usize>,
+    pub reach_min_px: Option<usize>,
+    pub reach_max_px: Option<usize>,
     pub per_frame: Vec<FrameReport>,
 }
 
@@ -1585,6 +1677,11 @@ pub enum ScanError {
         got: (usize, usize),
         want: (usize, usize),
     },
+    /// The frames are not the size `dims` described, so the typed row is not where it said.
+    TypedRowFrame {
+        got: (usize, usize),
+        want: (usize, usize),
+    },
 }
 
 impl std::fmt::Display for ScanError {
@@ -1603,6 +1700,11 @@ impl std::fmt::Display for ScanError {
                 "{name} is {}x{}, frame 0 is {}x{}",
                 got.0, got.1, want.0, want.1
             ),
+            Self::TypedRowFrame { got, want } => write!(
+                f,
+                "the frames are {}x{}, and dims placed the typed row on a {}x{} frame",
+                got.0, got.1, want.0, want.1
+            ),
         }
     }
 }
@@ -1619,6 +1721,18 @@ pub struct TakeContext {
     pub index: Option<RecordingIndex>,
     /// The `video status` bracket around the keystrokes, in milliseconds.
     pub driven_ms: Option<(i64, i64)>,
+    /// The typed row on the frames, when the take measures a body's reach above it.
+    pub typed_row: Option<TypedRow>,
+}
+
+/// The typed row's place on a captured frame, from the subject's own `dims`: its pixel rows are
+/// `bottom - cell.h .. bottom`, and `bottom` is its bottom edge, where a body's spine rests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypedRow {
+    pub bottom: usize,
+    /// The frame size `dims` described; a frame of another size was not drawn on that grid.
+    pub frame_w: usize,
+    pub frame_h: usize,
 }
 
 /// The PNG frames in `dir`, sorted by name.
@@ -1725,8 +1839,22 @@ pub fn scan_frames(
         companion_stack: 0,
         companion_fused: 0,
         base_comp: Shape::NONE,
+        typed_row: ctx.typed_row,
+        reach_frames: 0,
+        reach_px: None,
+        reach_min_px: None,
+        reach_max_px: None,
         per_frame: Vec::with_capacity(n),
     };
+    if let Some(row) = ctx.typed_row
+        && (base.width(), base.height()) != (row.frame_w, row.frame_h)
+    {
+        return Err(ScanError::TypedRowFrame {
+            got: (base.width(), base.height()),
+            want: (row.frame_w, row.frame_h),
+        });
+    }
+    let mut reaches = Vec::new();
     let mut union_hues = HueSet::default();
     let mut cyan_worst: Option<CyanSample> = None;
     let mut rainbow_flags = Vec::with_capacity(n);
@@ -1831,7 +1959,7 @@ pub fn scan_frames(
             // shape and adds no ink.
             prev_metrics.clone()
         } else {
-            dynamic_metrics(&base, &frame, cell, &exclude)
+            dynamic_metrics_over(&base, &frame, cell, &exclude, ctx.typed_row)
         };
         let has_ribbon = ribbon_present(&metrics);
         if frame_no > 0 && !duplicate {
@@ -1875,6 +2003,12 @@ pub fn scan_frames(
                     notes.push(FrameNote::RibbonUnlit {
                         band_ink: metrics.band_ink,
                     });
+                }
+                if frame_no > 0
+                    && !duplicate
+                    && let Some(px) = metrics.band_reach
+                {
+                    reaches.push(px);
                 }
             }
         } else {
@@ -1959,6 +2093,11 @@ pub fn scan_frames(
     } else {
         DrivenWindow::NOT_MEASURED
     };
+    reaches.sort_unstable();
+    r.reach_frames = reaches.len();
+    r.reach_px = reaches.get(reaches.len() / 2).copied();
+    r.reach_min_px = reaches.first().copied();
+    r.reach_max_px = reaches.last().copied();
     r.cat_gap = longest_interior_gap(&cat_visibility);
     r.cat_last_present = cat_visibility.last().copied().unwrap_or(false);
     r.cat_final_run = trailing_true_run(&cat_visibility);

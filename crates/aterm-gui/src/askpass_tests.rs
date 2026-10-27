@@ -131,6 +131,58 @@ fn await_answer_times_out_on_the_injected_clock() {
 }
 
 #[test]
+fn await_answer_observes_ticket_cancellation_while_the_sheet_sender_stays_open() {
+    for cancel_during_wait in [false, true] {
+        let (tx, rx) = channel::<AskpassAnswer>();
+        let base = Instant::now();
+        let ticket = AskpassTicket::new(1, base + Duration::from_secs(300));
+        if !cancel_during_wait {
+            ticket.cancel();
+        }
+        let mut clock_reads = 0;
+        let mut now = || {
+            clock_reads += 1;
+            assert!(
+                clock_reads <= 3,
+                "a cancelled ticket must end the next poll"
+            );
+            if cancel_during_wait && clock_reads == 2 {
+                ticket.cancel();
+            }
+            base
+        };
+        let mut hung = || false;
+        let line = await_answer(&rx, &ticket, Duration::ZERO, &mut hung, &mut now);
+        assert_eq!(line.as_bytes(), b"ERR askpass declined\n");
+        assert!(
+            tx.send(AskpassAnswer::Cancel).is_ok(),
+            "withdrawal must not depend on the sheet dropping its sender"
+        );
+    }
+}
+
+#[test]
+fn a_ticket_cancelled_while_dequeuing_an_answer_does_not_release_a_secret() {
+    let (tx, rx) = channel();
+    tx.send(AskpassAnswer::Secret(aterm_uds::sudo::Secret::from_bytes(
+        b"pw",
+    )))
+    .unwrap();
+    let base = Instant::now();
+    let ticket = AskpassTicket::new(1, base + Duration::from_secs(300));
+    let mut clock_reads = 0;
+    let mut now = || {
+        clock_reads += 1;
+        if clock_reads == 3 {
+            ticket.cancel();
+        }
+        base
+    };
+    let line = await_answer(&rx, &ticket, ASKPASS_TICK, &mut || false, &mut now);
+    assert_eq!(line.as_bytes(), b"ERR askpass declined\n");
+}
+
+#[test]
 fn await_answer_gives_up_when_the_caller_hangs_up() {
     let (_tx, rx) = channel::<AskpassAnswer>();
     let base = Instant::now();

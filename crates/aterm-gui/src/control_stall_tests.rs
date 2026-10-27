@@ -705,6 +705,9 @@ fn without_a_parker_the_lane_writes_and_reads_waiting() {
 fn a_dribbled_handshake_ends_at_its_deadline() {
     let (client, server) = CtlStream::pair().expect("socket pair");
     let dribbler = Dribbler::start(client, b"AUTH ");
+    aterm_spec::wait::until_within(HANG, "the peer to dribble past its head", || {
+        (dribbler.sent() > b"AUTH ".len()).then_some(())
+    });
     let handshake = std::thread::spawn(move || {
         let active: ActiveHandle = Arc::new(Mutex::new(None));
         let denials = control_denials::AuthDenials::new();
@@ -725,10 +728,5 @@ fn a_dribbled_handshake_ends_at_its_deadline() {
     assert!(
         past_deadline,
         "it ended at the deadline, not on a read error"
-    );
-    let sent = dribbler.sent();
-    assert!(
-        sent > b"AUTH ".len(),
-        "the peer really dribbled ({sent} bytes): bytes kept arriving, and the deadline held"
     );
 }

@@ -368,6 +368,7 @@ impl KittyCursorPlacement {
     }
 
     /// The actual animated body rectangle prepared for this frame, including its follower, pose and fold leg.
+    #[inline]
     #[must_use]
     pub const fn drawn_footprint(self) -> Option<CatFootprint> {
         match self.drawn {
@@ -516,6 +517,7 @@ impl DecoConfig {
     }
 }
 
+#[inline]
 const fn class_default_spec(class: Class, cfg: &DecoConfig) -> WordEffectSpec {
     match class {
         Class::Profanity => WordEffectSpec {
@@ -856,6 +858,7 @@ impl AlignScore {
     }
 }
 
+#[inline]
 const fn alignment_edge(
     ep: &Episode,
     candidate: PendingBirth,
@@ -1006,6 +1009,7 @@ struct DoneMarkLru {
 }
 
 impl Default for DoneMarkLru {
+    #[inline]
     fn default() -> Self {
         Self {
             index: KeyedHashMap::default(),
@@ -1033,6 +1037,7 @@ impl DoneMarkLru {
         self.index.contains_key(key)
     }
 
+    #[inline]
     fn clear(&mut self) {
         self.index.clear();
         self.nodes.clear();
@@ -1106,6 +1111,7 @@ impl DoneMarkLru {
         self.insert_with_cap(key, DONE_MARKS_CAP)
     }
 
+    #[inline]
     fn insert_with_cap(&mut self, key: u64, cap: usize) -> DoneMarkMutation {
         if let Some(&idx) = self.index.get(&key) {
             let link_writes = if idx == self.newest {
@@ -1216,6 +1222,7 @@ struct NotePaintCache {
 }
 
 impl NotePaintCache {
+    #[inline]
     fn tile(
         slot: &mut Option<Self>,
         baker: &mut CatBaker,
@@ -1280,6 +1287,7 @@ struct ScanMemo {
 }
 
 impl ScanMemo {
+    #[inline]
     fn clear(&mut self) {
         let keep = self.pool_target();
         Self::recycle(&mut self.spare, &mut self.hot, keep);
@@ -1306,6 +1314,7 @@ impl ScanMemo {
         debug_assert!(gone.is_empty(), "the drain must empty the generation");
     }
 
+    #[inline]
     fn fit(&mut self, rows: usize, inputs_fp: u64) {
         if self.inputs_fp != inputs_fp {
             self.clear();
@@ -1322,6 +1331,7 @@ impl ScanMemo {
         self.touch_len(text).is_some()
     }
 
+    #[inline]
     fn touch_len(&mut self, text: &str) -> Option<usize> {
         #[cfg(test)]
         if self.bypass {
@@ -1361,6 +1371,7 @@ impl ScanMemo {
         }
     }
 
+    #[inline]
     fn remember(&mut self, text: &str, matches: &[Match]) {
         #[cfg(test)]
         if self.bypass {
@@ -1384,6 +1395,7 @@ impl ScanMemo {
         self.install(key, value);
     }
 
+    #[inline]
     fn install(&mut self, key: String, value: Vec<Match>) {
         if self.hot.len() >= self.gen_cap.max(1) {
             let keep = self.pool_target();
@@ -1394,11 +1406,9 @@ impl ScanMemo {
     }
 }
 
+#[inline]
 fn scan_opts_fp(opts: &ScanOptions<'_>) -> u64 {
-    let mut fp = fnv1a_64(&[
-        u8::from(opts.allow_bare_cat),
-        u8::from(opts.cjk_single_char),
-    ]);
+    let mut fp = fnv1a_64(&[opts.allow_bare_cat as u8, opts.cjk_single_char as u8]);
     if let Some(ignore) = opts.ignore {
         let mut set = 0u64;
         for word in ignore {
@@ -1553,6 +1563,7 @@ fn burst_mutex_end(ep: &Episode) -> Option<Instant> {
 }
 
 impl ParkedPane {
+    #[inline]
     fn fresh() -> Self {
         Self {
             away: true,
@@ -1560,6 +1571,7 @@ impl ParkedPane {
         }
     }
 
+    #[inline]
     fn swap(&mut self, wd: &mut WordDecorations) {
         std::mem::swap(&mut self.occ, &mut wd.occ);
         std::mem::swap(&mut self.last_epoch, &mut wd.last_epoch);
@@ -1590,6 +1602,7 @@ impl ParkedPane {
         self.super_end_max = super_end;
     }
 
+    #[inline]
     fn burst_summary(&self) -> (Option<Instant>, Option<Instant>) {
         let (mut any, mut sup) = (None::<Instant>, None::<Instant>);
         for ep in self.persist.values() {
@@ -1606,12 +1619,14 @@ impl ParkedPane {
 }
 
 impl WordDecorations {
+    #[inline]
     fn mark_persist_departure(&mut self, ident: u64, ep: &Episode) {
         if ep.one_shot_started() {
             mark_done(&mut self.done_marks, ident, ep);
         }
     }
 
+    #[inline]
     fn rekey_persist_episode(&mut self, old_ident: u64, new_ident: u64, ep: Episode) -> bool {
         if old_ident != new_ident
             && let Some(start) = ep.nova_start
@@ -1645,6 +1660,7 @@ impl WordDecorations {
         oldest
     }
 
+    #[inline]
     fn insert_persist_bounded(
         &mut self,
         ident: u64,
@@ -1698,6 +1714,7 @@ impl WordDecorations {
         self.with_each_pane(Self::reset_bound);
     }
 
+    #[inline]
     fn reset_bound(&mut self) {
         let marks = &mut self.done_marks;
         for (ident, ep) in &self.persist {
@@ -1708,6 +1725,7 @@ impl WordDecorations {
         self.reset_transient_state();
     }
 
+    #[inline]
     fn park_live_state(&mut self, key: u64) {
         let mut slot = ParkedPane::default();
         slot.swap(self);
@@ -1715,6 +1733,7 @@ impl WordDecorations {
     }
 
     /// Bind `key`'s state into the live fields, recording the pane's grid origin in window pixels (`px_origin`) for the shared flash limiter.
+    #[inline]
     pub fn bind_pane(&mut self, key: u64, px_origin: (i32, i32)) {
         self.pane_px = px_origin;
         match self.bound {
@@ -1741,6 +1760,7 @@ impl WordDecorations {
     }
 
     /// Declare which session the live fields describe on a host that binds no pane (the unsplit renderer and its capture twin).
+    #[inline]
     pub fn set_scan_session(&mut self, session: Option<u64>) {
         let mut live_is_declared = true;
         if let Some(cur) = self.bound
@@ -1805,6 +1825,7 @@ impl WordDecorations {
     }
 
     /// Drop parked state for panes this window no longer shows, and unbind the live state if its pane is gone.
+    #[inline]
     pub fn retain_panes(&mut self, keep: impl Fn(u64) -> bool) {
         self.trick_flash.retain_panes(&keep);
         self.parked.retain(|k, _| keep(*k));
@@ -1826,6 +1847,7 @@ impl WordDecorations {
         }
     }
 
+    #[inline]
     fn with_each_pane(&mut self, mut f: impl FnMut(&mut Self)) {
         if !self.parked.is_empty() {
             let mut parked = std::mem::take(&mut self.parked);
@@ -1840,21 +1862,30 @@ impl WordDecorations {
     }
 
     /// Hard reset (v3 §1.1: master toggle, config reload / lexicon rebuild, web knob setters): clears episodes and `done_marks`, so everything replays.
+    #[inline]
     pub fn hard_reset(&mut self) {
-        self.with_each_pane(|wd| {
-            wd.done_marks.clear();
-            wd.reset_transient_state();
-        });
+        self.with_each_pane(Self::hard_reset_one_pane);
     }
 
     /// Reset only Sparkle Words state, keeping the cursor companion's placement and sprite caches.
+    #[inline]
     pub fn hard_reset_words(&mut self) {
-        self.with_each_pane(|wd| {
-            wd.done_marks.clear();
-            wd.reset_word_transient_state();
-        });
+        self.with_each_pane(Self::hard_reset_words_one_pane);
     }
 
+    #[inline]
+    fn hard_reset_one_pane(&mut self) {
+        self.done_marks.clear();
+        self.reset_transient_state();
+    }
+
+    #[inline]
+    fn hard_reset_words_one_pane(&mut self) {
+        self.done_marks.clear();
+        self.reset_word_transient_state();
+    }
+
+    #[inline]
     fn reset_transient_state(&mut self) {
         self.reset_word_transient_state();
         self.kitty_cursor_placement = KittyCursorPlacementState::default();
@@ -1889,6 +1920,7 @@ impl WordDecorations {
         self.cat_baker_ready = true;
     }
 
+    #[inline]
     fn reset_word_transient_state(&mut self) {
         self.occ.clear();
         self.have_scanned = false;
@@ -1939,6 +1971,7 @@ impl WordDecorations {
     }
 
     /// Resume after [`freeze`](Self::freeze): shifts every stored timestamp (`appeared`, `last_seen`, `nova_start`, `phase_start`, `peek_pause`, limiter slots, `active_until`, the settle deadline, the burst mutex and its hint) forward by the freeze duration, so animations resume where they paused and occluded episodes keep their remaining grace.
+    #[inline]
     pub fn thaw(&mut self, now: Instant) {
         let Some(t0) = self.frozen_at.take() else {
             return;
@@ -1984,6 +2017,7 @@ impl WordDecorations {
         }
     }
 
+    #[inline]
     fn combo_level(&mut self, now: Instant, charge: bool) -> u32 {
         let window = Duration::from_millis(supernova::COMBO_WINDOW_MS);
         self.combo_births
@@ -2036,6 +2070,7 @@ impl WordDecorations {
     }
 
     /// The flying cursor kitty's dest rect for `layout`, from the emitter's own sizing and placement math.
+    #[inline]
     #[must_use]
     pub const fn kitty_cursor_footprint(&self, layout: KittyCursorLayout) -> Option<CatFootprint> {
         let KittyCursorLayout {
@@ -2126,6 +2161,7 @@ impl WordDecorations {
     }
 
     /// Resolve the cursor kitty's logical target and line-fold placement once for this frame.
+    #[inline]
     #[must_use]
     pub fn resolve_kitty_cursor_placement(
         &mut self,
@@ -2246,6 +2282,7 @@ impl WordDecorations {
     }
 
     /// Re-anchor the cursor kitty after the host detects a coordinate-space tear between effect sampling and the presented frame.
+    #[inline]
     pub const fn rebase_kitty_cursor_placement(&mut self) {
         self.kitty_cursor_placement = KittyCursorPlacementState::EMPTY;
     }
@@ -2265,6 +2302,7 @@ impl WordDecorations {
     const PLACE_TAU: f32 = 0.08;
 
     /// Emit the cat flying in front of the cursor, with the `rainbow kitty` ribbon as its wake.
+    #[inline]
     pub fn kitty_cursor(
         &mut self,
         frame: KittyCursorFrame,
@@ -2284,6 +2322,7 @@ impl WordDecorations {
     }
 
     /// Resolve the body's exact draw rectangle before the word pass, without advancing its follower.
+    #[inline]
     #[must_use]
     pub fn prepare_kitty_cursor_placement(
         &mut self,
@@ -2297,6 +2336,7 @@ impl WordDecorations {
         Some(placement)
     }
 
+    #[inline]
     fn kitty_cursor_draw_geometry(
         &self,
         geom: EffectGeom,
@@ -2444,6 +2484,7 @@ impl WordDecorations {
     }
 
     /// Emit one cursor kitty at the placement from [`Self::resolve_kitty_cursor_placement`].
+    #[inline]
     pub fn kitty_cursor_at_placement(
         &mut self,
         frame: KittyCursorFrame,
@@ -2667,6 +2708,7 @@ impl WordDecorations {
     }
 
     /// Emit the full-body pet ([`crate::kitty_pet`]) as one free sprite, at the brain's fractional column with its feet on `(row + 1)·cell_h` (lifted by the arc; squash and stretch about the feet), plus its motes and the breed handoff's departing bodies, each in its own look and held tile.
+    #[inline]
     pub fn pet_cursor(&mut self, frame: PetCursorFrame, free: &mut Vec<FreeSprite>) -> Option<u64> {
         let PetCursorFrame {
             geom,
@@ -2872,6 +2914,7 @@ impl WordDecorations {
         Some(fp)
     }
 
+    #[inline]
     fn hold_departure_tile(
         &mut self,
         id: u32,
@@ -2919,6 +2962,7 @@ impl WordDecorations {
         }
     }
 
+    #[inline]
     fn pet_departure_sprite(
         &mut self,
         d: crate::kitty_pet::PetDepartureSprite,
@@ -2991,6 +3035,7 @@ impl WordDecorations {
     }
 
     /// Draw the departure in `slot` on its own glass (`PetDepartureSprite::own_glass`): a split-pane focus switch's fading half, the old body still in the pane the focus left.
+    #[inline]
     pub fn pet_own_glass(
         &mut self,
         frame: PetCursorFrame,
@@ -3168,30 +3213,33 @@ impl WordDecorations {
         out
     };
 
+    #[inline]
     fn paint_pet_mote(
         tile: &mut aterm_scene::Tile,
         kind: crate::kitty_pet::PetMoteKind,
         bucket: u32,
         side: u16,
     ) {
-        if side == 0 {
-            return;
-        }
-        let s = f32::from(side);
-        let (sin, cos) = Self::PET_MOTE_ROT_SIN_COS[(bucket % Self::PET_MOTE_ROT_BUCKETS) as usize];
-        let rp = move |u: f32, v: f32| -> (f32, f32) {
+        #[inline]
+        const fn rp(u: f32, v: f32, sin: f32, cos: f32) -> (f32, f32) {
             let (du, dv) = (u - 0.5, v - 0.5);
             (0.5 + du * cos - dv * sin, 0.5 + du * sin + dv * cos)
-        };
-        let white = (1.0, 1.0, 1.0);
-        let fit = aterm_scene::PathTransform::fit(u32::from(side), u32::from(side));
-        let mut poly_buf = [aterm_scene::PathCmd::Close; 11];
-        let mut fill_poly = |tile: &mut aterm_scene::Tile, pts: &[(f32, f32)], alpha: f32| {
+        }
+        #[inline]
+        fn fill_poly(
+            tile: &mut aterm_scene::Tile,
+            pts: &[(f32, f32)],
+            alpha: f32,
+            sin: f32,
+            cos: f32,
+            fit: aterm_scene::PathTransform,
+        ) {
+            let mut poly_buf = [aterm_scene::PathCmd::Close; 11];
             debug_assert!(pts.len() < poly_buf.len());
             let mut i = 0;
             while i < pts.len() {
                 let (u, v) = pts[i];
-                let (x, y) = rp(u, v);
+                let (x, y) = rp(u, v, sin, cos);
                 poly_buf[i] = if i == 0 {
                     aterm_scene::PathCmd::Move(x, y)
                 } else {
@@ -3200,8 +3248,21 @@ impl WordDecorations {
                 i += 1;
             }
             poly_buf[pts.len()] = aterm_scene::PathCmd::Close;
-            aterm_scene::fill_path(tile, &[&poly_buf[..=pts.len()]], white, alpha, fit);
-        };
+            aterm_scene::fill_path(
+                tile,
+                &[&poly_buf[..=pts.len()]],
+                (1.0, 1.0, 1.0),
+                alpha,
+                fit,
+            );
+        }
+        if side == 0 {
+            return;
+        }
+        let s = f32::from(side);
+        let (sin, cos) = Self::PET_MOTE_ROT_SIN_COS[(bucket % Self::PET_MOTE_ROT_BUCKETS) as usize];
+        let white = (1.0, 1.0, 1.0);
+        let fit = aterm_scene::PathTransform::fit(u32::from(side), u32::from(side));
         match kind {
             crate::kitty_pet::PetMoteKind::Dust => {
                 const DUST_DISCS: [(f32, f32, f32, f32); 3] = [
@@ -3212,7 +3273,7 @@ impl WordDecorations {
                 let mut i = 0;
                 while i < DUST_DISCS.len() {
                     let (u, v, r, a) = DUST_DISCS[i];
-                    let (x, y) = rp(u, v);
+                    let (x, y) = rp(u, v, sin, cos);
                     tile.disc(x * s, y * s, (r * s).max(1.0), white, a);
                     i += 1;
                 }
@@ -3233,6 +3294,9 @@ impl WordDecorations {
                         (0.20, 0.32),
                     ],
                     0.88,
+                    sin,
+                    cos,
+                    fit,
                 );
             }
             crate::kitty_pet::PetMoteKind::Note => {
@@ -3240,22 +3304,35 @@ impl WordDecorations {
                     tile,
                     &[(0.46, 0.12), (0.58, 0.12), (0.58, 0.72), (0.46, 0.72)],
                     0.88,
+                    sin,
+                    cos,
+                    fit,
                 );
                 fill_poly(
                     tile,
                     &[(0.58, 0.12), (0.82, 0.24), (0.74, 0.44), (0.58, 0.28)],
                     0.88,
+                    sin,
+                    cos,
+                    fit,
                 );
-                let (hx, hy) = rp(0.42, 0.78);
+                let (hx, hy) = rp(0.42, 0.78, sin, cos);
                 tile.disc(hx * s, hy * s, (0.15 * s).max(1.2), white, 0.88);
             }
             crate::kitty_pet::PetMoteKind::Heart => {
-                fill_poly(tile, &[(0.18, 0.46), (0.82, 0.46), (0.50, 0.86)], 0.85);
+                fill_poly(
+                    tile,
+                    &[(0.18, 0.46), (0.82, 0.46), (0.50, 0.86)],
+                    0.85,
+                    sin,
+                    cos,
+                    fit,
+                );
                 const HEART_LOBES: [(f32, f32); 2] = [(0.34, 0.38), (0.66, 0.38)];
                 let mut i = 0;
                 while i < HEART_LOBES.len() {
                     let (u, v) = HEART_LOBES[i];
-                    let (x, y) = rp(u, v);
+                    let (x, y) = rp(u, v, sin, cos);
                     tile.disc(x * s, y * s, (0.19 * s).max(1.2), white, 0.85);
                     i += 1;
                 }
@@ -3267,6 +3344,7 @@ impl WordDecorations {
     const DOG_TRAIL_DEN: i32 = 4;
 
     /// Emit the typed-word dog cameo ([`crate::dog_cameo`]) as one free sprite just behind the cursor cell, centred on its row.
+    #[inline]
     pub fn dog_cameo(&mut self, frame: DogCameoFrame, free: &mut Vec<FreeSprite>) -> Option<u64> {
         let DogCameoFrame {
             geom,
@@ -3368,6 +3446,7 @@ impl WordDecorations {
     }
 
     /// Install one already-resolved immutable source.
+    #[inline]
     pub fn set_kitty_sprite_source(&mut self, source: KittySpriteSource) {
         self.kitty_cursor_placement = KittyCursorPlacementState::default();
         match source {
@@ -3452,6 +3531,7 @@ impl WordDecorations {
     }
 
     /// Record a committed edit keystroke (printable/IME glyph, backspace, line/word kill) in `pane` (`None` from a host that binds no pane).
+    #[inline]
     pub fn note_typed_edit(&mut self, now: Instant, pane: Option<u64>) {
         self.typed_edit = Some(TypedEdit {
             at: now,
@@ -3462,6 +3542,7 @@ impl WordDecorations {
     }
 
     /// Record that `word` was just typed to the pet in `pane` (the [`crate::typed_tricks`] listener fired), so the word flashes rainbow once the rescan finds it.
+    #[inline]
     pub fn note_trick_typed(
         &mut self,
         now: Instant,
@@ -3484,14 +3565,19 @@ impl WordDecorations {
     /// Each feline occurrence's palette key, and whether any occurrence is a profanity: what a host's scan decided, for the pipeline's tests.
     #[cfg(test)]
     pub(crate) fn scan_verdicts(&self) -> (Vec<CatColorKey>, bool) {
-        (
-            self.occ
-                .iter()
-                .filter(|o| o.class == Class::Feline)
-                .map(|o| o.cat_colors)
-                .collect(),
-            self.occ.iter().any(|o| o.class == Class::Profanity),
-        )
+        let mut felines = Vec::new();
+        let mut any_profanity = false;
+        let mut i = 0;
+        while i < self.occ.len() {
+            let o = &self.occ[i];
+            match o.class {
+                Class::Feline => felines.push(o.cat_colors),
+                Class::Profanity => any_profanity = true,
+                _ => {}
+            }
+            i += 1;
+        }
+        (felines, any_profanity)
     }
 
     /// Where the trick flash stands at `now` (pending, live, revoked or idle), for tests, the lifecycle model's conformance and driven validation.
@@ -3501,6 +3587,7 @@ impl WordDecorations {
         self.trick_flash.phase(now)
     }
 
+    #[inline]
     fn caret_of_pane(&self, pane: Option<u64>) -> Option<(u16, u16)> {
         match pane {
             None => self.last_caret,
@@ -3562,6 +3649,7 @@ impl WordDecorations {
         clippy::too_many_arguments,
         reason = "the rescan threads the term, grid geometry (rows/cols), lexicon, config, damage epoch, and clock through one call; a wrapper struct would relocate the list, not simplify it"
     )]
+    #[inline]
     pub fn rescan(
         &mut self,
         term: &Terminal,
@@ -3598,8 +3686,8 @@ impl WordDecorations {
             let mut r = start_row;
             while r < rows {
                 term.render_row_into(r, &mut row_cells);
-                let dec_line = if let Ok(vr) = u16::try_from(r)
-                    && let Some(row) = term.grid().row(vr)
+                let dec_line = if r <= u16::MAX as usize
+                    && let Some(row) = term.grid().row(r as u16)
                 {
                     row.line_size() != aterm_core::grid::LineSize::SingleWidth
                 } else {
@@ -3657,6 +3745,7 @@ impl WordDecorations {
         clippy::too_many_arguments,
         reason = "the rescan threads the snapshot rows, grid geometry (rows/cols), lexicon, config, damage epoch, and clock through one call; a wrapper struct would relocate the list, not simplify it"
     )]
+    #[inline]
     pub fn rescan_from_cells(
         &mut self,
         cells: &[Vec<RenderCell>],
@@ -3678,6 +3767,7 @@ impl WordDecorations {
         clippy::too_many_arguments,
         reason = "the live renderer adds one cursor coordinate to the geometry-aware snapshot contract"
     )]
+    #[inline]
     pub fn rescan_from_cells_with_geom_at_cursor(
         &mut self,
         cells: &[Vec<RenderCell>],
@@ -3710,6 +3800,7 @@ impl WordDecorations {
         clippy::too_many_arguments,
         reason = "shared implementation keeps the compatibility and geometry-aware snapshot paths byte-identical outside palette sampling"
     )]
+    #[inline]
     fn rescan_from_cells_inner(
         &mut self,
         cells: &[Vec<RenderCell>],
@@ -3816,6 +3907,7 @@ impl WordDecorations {
         clippy::too_many_arguments,
         reason = "threads the rescan's geometry, caret, clock, config and row source to the flash; the dense_scan_cutoff shape"
     )]
+    #[inline]
     fn locate_trick_flash(
         &mut self,
         rows: usize,
@@ -3839,6 +3931,7 @@ impl WordDecorations {
         );
     }
 
+    #[inline]
     fn rescan_begin(&mut self) -> Vec<Occurrence> {
         self.seed_ordinals.clear();
         self.rescan_seq = self.rescan_seq.wrapping_add(1);
@@ -3852,6 +3945,7 @@ impl WordDecorations {
         out
     }
 
+    #[inline]
     fn dense_scan_cutoff(
         &mut self,
         rows: usize,
@@ -3950,6 +4044,7 @@ impl WordDecorations {
         cutoff.min(rows.saturating_sub(1))
     }
 
+    #[inline]
     fn rescan_restart(&mut self, out: &mut Vec<Occurrence>, ink_full: &mut bool) {
         self.seed_ordinals.clear();
         self.pending.clear();
@@ -3963,6 +4058,7 @@ impl WordDecorations {
         clippy::too_many_arguments,
         reason = "the per-row scanner threads the row cells + index, the §5.7 flag, lexicon, config, clock, and the rescan's occurrence/ink-latch accumulators through one call; a wrapper struct would relocate the list, not simplify it"
     )]
+    #[inline]
     fn scan_row(
         &mut self,
         r: usize,
@@ -4284,6 +4380,7 @@ impl WordDecorations {
         true
     }
 
+    #[inline]
     fn rescan_end(
         &mut self,
         mut out: Vec<Occurrence>,
@@ -4375,6 +4472,7 @@ impl WordDecorations {
         self.cols = cols as u16;
     }
 
+    #[inline]
     fn align_pending(
         &mut self,
         out: &mut [Occurrence],
@@ -4439,8 +4537,26 @@ impl WordDecorations {
             let group = &group[..group_len];
             self.align_old.clear();
             if unseen_len > 0 {
-                let lo = unseen[..unseen_len].partition_point(|&(f, _)| f < form_id);
-                let hi = unseen[lo..unseen_len].partition_point(|&(f, _)| f == form_id) + lo;
+                #[inline]
+                fn unseen_form_range(unseen: &[(FormId, u64)], form_id: FormId) -> (usize, usize) {
+                    let mut l = 0usize;
+                    let mut r = unseen.len();
+                    while l < r {
+                        let mid = (l + r) >> 1;
+                        if unseen[mid].0 < form_id {
+                            l = mid + 1;
+                        } else {
+                            r = mid;
+                        }
+                    }
+                    let lo = l;
+                    let mut hi = lo;
+                    while hi < unseen.len() && unseen[hi].0 == form_id {
+                        hi += 1;
+                    }
+                    (lo, hi)
+                }
+                let (lo, hi) = unseen_form_range(&unseen[..unseen_len], form_id);
                 let mut ui = lo;
                 while ui < hi {
                     let k = unseen[ui].1;
@@ -4683,6 +4799,7 @@ impl WordDecorations {
         clippy::too_many_arguments,
         reason = "the per-frame tick threads the clock, config, geometry, companion view, selection view, focus gate, and four output scratches through one call; a wrapper struct would relocate the list, not simplify it"
     )]
+    #[inline]
     pub fn tick(
         &mut self,
         now: Instant,
@@ -5223,6 +5340,7 @@ impl WordDecorations {
         fp
     }
 
+    #[inline]
     fn episode_prepass(
         &mut self,
         now: Instant,
@@ -5415,6 +5533,7 @@ impl WordDecorations {
         flags
     }
 
+    #[inline]
     fn stamp_spent_marks(&mut self, now: Instant, reduced_motion: bool) {
         let seq = self.rescan_seq;
         let marks = &mut self.done_marks;
@@ -5442,6 +5561,7 @@ impl WordDecorations {
         }
     }
 
+    #[inline]
     fn prune_ignitions(&mut self, now: Instant) {
         if self.ignitions.is_empty() {
             return;
@@ -5464,11 +5584,20 @@ impl WordDecorations {
                     if !episode.nova_done && episode.nova_start == Some(reservation.start)
             )
         });
-        debug_assert!(
-            self.ignitions.iter().filter(|r| r.pane == scope).count() <= MAX_IGNITION_RESERVATIONS
-        );
+        debug_assert!({
+            let mut count = 0usize;
+            let mut i = 0;
+            while i < self.ignitions.len() {
+                if self.ignitions[i].pane == scope {
+                    count += 1;
+                }
+                i += 1;
+            }
+            count <= MAX_IGNITION_RESERVATIONS
+        });
     }
 
+    #[inline]
     fn super_prepass(
         &mut self,
         now: Instant,
@@ -5604,6 +5733,7 @@ impl WordDecorations {
         until
     }
 
+    #[inline]
     fn nova_prepass(
         &mut self,
         now: Instant,
@@ -5737,6 +5867,7 @@ impl WordDecorations {
     }
 
     /// Whether any occurrence is still inside its animation window (profanity sparkle, a live ink sweep, or a granted, possibly queued, nova window).
+    #[inline]
     #[must_use]
     pub fn is_active(&self, now: Instant) -> bool {
         if let Some(d) = self.active_until
@@ -5775,6 +5906,7 @@ const fn burst_center(occ: &Occurrence, geom: EffectGeom) -> (i32, i32) {
     clippy::too_many_arguments,
     reason = "the prepass's disjoint field borrows, split around its live `&mut persist` entry"
 )]
+#[inline]
 fn grant_burst(
     igns: &mut Vec<IgnitionReservation>,
     scope: Option<u64>,
@@ -5808,6 +5940,7 @@ fn grant_burst(
     true
 }
 
+#[inline]
 fn grant_pane_ignition(
     igns: &mut Vec<IgnitionReservation>,
     pane: Option<u64>,
@@ -5827,6 +5960,7 @@ fn grant_pane_ignition(
     )
 }
 
+#[inline]
 fn grant_ignition(
     igns: &mut Vec<IgnitionReservation>,
     pane: Option<u64>,
@@ -5894,6 +6028,7 @@ fn grant_ignition(
     clippy::too_many_arguments,
     reason = "pure per-occurrence emission over tick-local accumulators, the emit_ink idiom"
 )]
+#[inline]
 fn emit_nova_axis(
     occ: &Occurrence,
     oi: usize,
@@ -6031,6 +6166,7 @@ fn emit_nova_axis(
     clippy::too_many_arguments,
     reason = "pure per-occurrence emission over tick-local accumulators, the emit_ink idiom"
 )]
+#[inline]
 fn emit_super_axis(
     occ: &Occurrence,
     oi: usize,
@@ -6157,6 +6293,7 @@ fn emit_super_axis(
     }
 }
 
+#[inline]
 fn split_super_selection(quads: &mut Vec<GlowQuad>, n0: usize, geom: EffectGeom, sv: &SelView<'_>) {
     let cw = i32::from(geom.cell_w).max(1);
     let cols = i32::from(geom.cols).max(1);
@@ -6229,6 +6366,7 @@ const fn span_dist2(occ: &Occurrence, center: (i32, i32), geom: EffectGeom) -> u
     ((dx as i64) * (dx as i64) + (dy as i64) * (dy as i64)) as u64
 }
 
+#[inline]
 const fn nova_env(occ: &Occurrence, nv: &NovaLive, geom: EffectGeom, cfg: &DecoConfig) -> NovaEnv {
     let advance = (geom.cell_w as i32) * if occ.dec_line { 2 } else { 1 };
     let (core, fringe) = nova::palette(nv.feats.palette);
@@ -6273,6 +6411,7 @@ const INK_FX_NONE: InkFx = InkFx {
     clippy::too_many_arguments,
     reason = "pure per-occurrence resolution over tick-local nova scratch, the emit_ink idiom"
 )]
+#[inline]
 fn ink_fx(
     oi: usize,
     occ: &Occurrence,
@@ -6750,6 +6889,7 @@ struct PeekView {
     clippy::too_many_arguments,
     reason = "pure per-occurrence emission over tick-local accumulators, exactly like emit_ink; a carrier struct would rename the list, not shrink it"
 )]
+#[inline]
 fn emit_cat(
     ctx: &mut CatTick,
     occ: &Occurrence,
@@ -6849,6 +6989,7 @@ fn emit_cat(
     clippy::too_many_arguments,
     reason = "pure per-occurrence emission over tick-local accumulators, exactly like emit_cat"
 )]
+#[inline]
 fn emit_animal(
     ctx: &mut CatTick,
     occ: &Occurrence,
@@ -6900,6 +7041,7 @@ fn emit_animal(
     clippy::too_many_arguments,
     reason = "pure per-occurrence emission over tick-local accumulators, exactly like emit_ink; a carrier struct would rename the list, not shrink it"
 )]
+#[inline]
 fn emit_peek<'a>(
     ctx: &mut CatTick<'a>,
     occ: &Occurrence,
@@ -7078,8 +7220,13 @@ const fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
 const PAPER_GLOW_KEEP: f32 = 0.9;
 
 #[inline]
-const fn paper_glow_scale_lum(fg: u32, lit: u32, lum_bg: f32, amp: f32) -> f32 {
-    let table = crate::color_math::relative_luminance_table();
+const fn paper_glow_scale_lum(
+    table: &crate::color_math::RelativeLuminanceTable,
+    fg: u32,
+    lit: u32,
+    lum_bg: f32,
+    amp: f32,
+) -> f32 {
     let lum_fg = crate::color_math::relative_luminance_with(table, fg);
     if lum_bg <= lum_fg || amp <= 0.0 {
         return 1.0;
@@ -7122,7 +7269,14 @@ const fn paper_glow_scale_lum(fg: u32, lit: u32, lum_bg: f32, amp: f32) -> f32 {
 
 #[cfg(test)]
 const fn paper_glow_scale(fg: u32, lit: u32, bg: u32, amp: f32) -> f32 {
-    paper_glow_scale_lum(fg, lit, relative_luminance(bg), amp)
+    let table = crate::color_math::relative_luminance_table();
+    paper_glow_scale_lum(
+        table,
+        fg,
+        lit,
+        crate::color_math::relative_luminance_with(table, bg),
+        amp,
+    )
 }
 
 /// §4.2 specular lobe at gradient position `u` for sweep center `center`:
@@ -7142,6 +7296,7 @@ const fn spec_lobe(u: f32, center: f32) -> f32 {
     clippy::too_many_arguments,
     reason = "pure per-occurrence emission over tick-local accumulators (fp / active_until) and the resident capture buffers; a carrier struct would rename the list, not shrink it"
 )]
+#[inline]
 fn emit_ink(
     occ: &Occurrence,
     cfg: &DecoConfig,
@@ -7183,7 +7338,8 @@ fn emit_ink(
             let frame_term = frame.wrapping_mul(0x9E37_79B1);
             let cols = &base_cols[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
             let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
-            let lum_bg = relative_luminance(rgb3_to_u32(occ.ink_bg));
+            let table = crate::color_math::relative_luminance_table();
+            let lum_bg = crate::color_math::relative_luminance_with(table, rgb3_to_u32(occ.ink_bg));
             let mut memo: Option<([u8; 3], [u8; 3])> = None;
             let mut i = 0;
             while i < cols.len() {
@@ -7197,7 +7353,7 @@ fn emit_ink(
                         let v = u32_to_rgb3(mix_rgb(
                             fg,
                             lit,
-                            glow * paper_glow_scale_lum(fg, lit, lum_bg, amp),
+                            glow * paper_glow_scale_lum(table, fg, lit, lum_bg, amp),
                         ));
                         memo = Some((fg_rgb, v));
                         v
@@ -7274,11 +7430,13 @@ fn emit_ink(
     } else {
         mid_base
     };
+    let table = crate::color_math::relative_luminance_table();
     let strength = legible_strength(
+        table,
         cfg.ink_strength,
         rgb3_to_u32(base_fg[occ.ink_base]),
         &[mid_raw],
-        relative_luminance(rgb3_to_u32(occ.ink_bg)),
+        crate::color_math::relative_luminance_with(table, rgb3_to_u32(occ.ink_bg)),
     );
     let inv_span = 1.0 / f32::from(occ.end_col.saturating_sub(occ.start_col)).max(1.0);
     let fold_frame = animating || fx.frame_live;
@@ -7337,7 +7495,14 @@ fn emit_ink(
     }
 }
 
-const fn legible_strength(ink_strength: f32, fg_first: u32, samples: &[u32], lum_bg: f32) -> f32 {
+#[inline]
+const fn legible_strength(
+    table: &crate::color_math::RelativeLuminanceTable,
+    ink_strength: f32,
+    fg_first: u32,
+    samples: &[u32],
+    lum_bg: f32,
+) -> f32 {
     #[inline]
     const fn contrast(
         table: &crate::color_math::RelativeLuminanceTable,
@@ -7352,7 +7517,6 @@ const fn legible_strength(ink_strength: f32, fg_first: u32, samples: &[u32], lum
             lum_bg_plus / (la + 0.05)
         }
     }
-    let table = crate::color_math::relative_luminance_table();
     let lum_bg_plus = lum_bg + 0.05;
     let mut strength = ink_strength.clamp(0.0, 1.0);
     let step = strength * 0.125;
@@ -7380,6 +7544,7 @@ const fn legible_strength(ink_strength: f32, fg_first: u32, samples: &[u32], lum
     clippy::too_many_arguments,
     reason = "pure per-occurrence emission over tick-local accumulators, the emit_ink idiom"
 )]
+#[inline]
 fn emit_rainbow_ink(
     occ: &Occurrence,
     cfg: &DecoConfig,
@@ -7393,7 +7558,8 @@ fn emit_rainbow_ink(
     fp: &mut u64,
     active_until: &mut Option<Instant>,
 ) {
-    let lum_bg = relative_luminance(rgb3_to_u32(occ.ink_bg));
+    let table = crate::color_math::relative_luminance_table();
+    let lum_bg = crate::color_math::relative_luminance_with(table, rgb3_to_u32(occ.ink_bg));
     let (sat, val) = if lum_bg > 0.5 {
         (1.0, 0.62)
     } else {
@@ -7425,6 +7591,7 @@ fn emit_rainbow_ink(
         )
     };
     let strength = legible_strength(
+        table,
         cfg.ink_strength,
         rgb3_to_u32(base_fg[occ.ink_base]),
         &guard_hues[..guard_len],
@@ -7493,6 +7660,7 @@ fn emit_rainbow_ink(
     clippy::too_many_arguments,
     reason = "pure tick-local rainbow decoration emitter"
 )]
+#[inline]
 fn emit_rainbow_sparkles(
     occ: &Occurrence,
     cfg: &DecoConfig,
@@ -7598,6 +7766,7 @@ pub(crate) const fn is_ink_char(ch: char) -> bool {
         })
 }
 
+#[inline]
 const fn cat_color_context(cells: &[RenderCell], start: u16, end: u16) -> CatColorKey {
     if cells.is_empty() {
         return CatColorKey::DEFAULT;
@@ -7666,6 +7835,7 @@ const fn cat_color_context(cells: &[RenderCell], start: u16, end: u16) -> CatCol
     clippy::too_many_arguments,
     reason = "the cold sampler receives one resolved occurrence span plus its immutable frame surface"
 )]
+#[inline]
 const fn cat_color_context_footprint(
     cells: &[Vec<RenderCell>],
     geom: EffectGeom,
@@ -7832,6 +8002,7 @@ enum PeekDir {
 
 const CAT_MAX_BAND_OCCUPANCY: f32 = 0.75;
 
+#[inline]
 const fn clear_band_occupancy(
     cells: &[Vec<RenderCell>],
     r0: usize,
@@ -7884,6 +8055,7 @@ const fn clear_band_occupancy(
     Some(occupied as f32 / total as f32)
 }
 
+#[inline]
 const fn band_occupancy(
     cells: &[Vec<RenderCell>],
     r0: usize,
@@ -7981,6 +8153,7 @@ const fn band_occupancy(
     Some(occupied as f32 / sampled as f32)
 }
 
+#[inline]
 const fn cat_peek_plan(
     cells: &[Vec<RenderCell>],
     geom: EffectGeom,
@@ -8209,6 +8382,9 @@ const fn jitter(j: i8, s: u64) -> i8 {
 const fn scale_u8(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
+
+#[cfg(any(test, debug_assertions))]
+mod state_words;
 
 #[cfg(test)]
 mod tests {

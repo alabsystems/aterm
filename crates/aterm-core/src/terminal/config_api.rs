@@ -348,6 +348,23 @@ impl Terminal {
 
         changes
     }
+
+    /// [`Self::apply_config`] for an engine a checkpoint restored: it takes `config`'s colour baseline, default cursor style, mode seeds, budgets and policies, keeps every mode and the history limit the restore installed, and leaves any colour-scheme report the rebase queued for the caller to drain.
+    pub fn apply_config_keeping_modes(&mut self, config: &crate::config::TerminalConfig) {
+        let modes = self.modes;
+        let limit = self.scrollback_line_limit();
+        let _ = self.apply_config(config);
+        self.modes = modes;
+        if self.scrollback_line_limit() != limit {
+            self.set_scrollback_line_limit(limit);
+        }
+        if modes.allow_osc52_query {
+            self.clipboard_auth.authorize_query();
+        } else {
+            self.clipboard_auth.revoke_query();
+        }
+        self.refresh_mode_mirror();
+    }
 }
 
 #[cfg(test)]

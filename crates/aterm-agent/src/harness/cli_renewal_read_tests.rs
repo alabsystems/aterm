@@ -246,6 +246,7 @@ fn due_selection_observes_staging_recovery_without_signing_in_again() {
         std::fs::write(&credential, b"already authenticated fixture").unwrap();
         accounts::write_renewal_checkpoint_for(
             cli,
+            (cli == Cli::Kimi).then_some(crate::ai::connector::Region::Global),
             "main",
             "main@example.test",
             staged.to_str().unwrap(),

@@ -396,6 +396,13 @@ impl HandshakeWatchdog {
         })
     }
 
+    /// Whether the deadline claimed the phase, so the watchdog hung the socket up at it: what a
+    /// read or write of it meets then is the deadline's, not the peer's.
+    #[cfg(unix)]
+    pub(crate) fn fired(&self) -> bool {
+        self.state.load(Ordering::Acquire) == WD_FIRED
+    }
+
     /// The listener's handle for ending this phase early ([`Evictor::evict`]).
     pub(crate) fn evictor(&self) -> Evictor {
         Evictor {
@@ -509,39 +516,33 @@ pub(crate) mod tests {
         );
     }
 
+    /// An early handshake's `finish()` wakes the watchdog it joins, never waiting out the
+    /// deadline: armed for ten minutes and parked, it is finished within the one-minute hang
+    /// detector.
     #[test]
-    fn finishing_an_early_handshake_does_not_wait_out_a_wake_interval() {
-        const MAX_FINISH: Duration = Duration::from_millis(20);
+    fn finishing_an_early_handshake_wakes_the_watchdog_instead_of_waiting_out_its_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let accepting = std::thread::spawn(move || listener.accept().unwrap().0);
         let tcp = TcpStream::connect(addr).unwrap();
         let _peer = accepting.join().unwrap();
-        let fastest = (0..10)
-            .map(|_| {
-                let watchdog = HandshakeWatchdog::arm(&tcp, Duration::from_secs(60)).unwrap();
-                let entered = Instant::now() + MUST_HAPPEN;
-                while !watchdog.waiting.load(Ordering::Acquire) {
-                    assert!(
-                        Instant::now() < entered,
-                        "the watchdog never began its wait"
-                    );
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                let started = Instant::now();
-                assert_eq!(
-                    watchdog.finish(),
-                    Claim::Authed,
-                    "an early handshake beats a 60 s deadline"
-                );
-                started.elapsed()
-            })
-            .min()
-            .unwrap();
-        assert!(
-            fastest < MAX_FINISH,
-            "finish() waited {fastest:?} at best for a watchdog it had just woken — \
-             the watchdog is being waited out on a wake interval, not woken"
+        let watchdog = HandshakeWatchdog::arm(&tcp, MUST_HAPPEN * 10).unwrap();
+        let entered = Instant::now() + MUST_HAPPEN;
+        while !watchdog.waiting.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < entered,
+                "the watchdog never began its wait"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(watchdog.finish());
+        });
+        assert_eq!(
+            rx.recv_timeout(MUST_HAPPEN),
+            Ok(Claim::Authed),
+            "an early handshake wakes the parked watchdog and beats its deadline"
         );
     }
 

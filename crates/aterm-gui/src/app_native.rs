@@ -1256,6 +1256,10 @@ pub(crate) struct NativeUiCompileStamp {
     pub(crate) document_seq: Option<u64>,
     pub(crate) presentation_revision: u64,
     pub(crate) paint_revision: u64,
+    /// The faces chrome text can ink ([`crate::tray_raster::chrome_coverage_epoch`]): a face that
+    /// lands draws again what lacked it. A raster that measured and drew every char with a face
+    /// carries the faces as they stood once it painted (`retain_native_leaf_raster`).
+    pub(crate) coverage_epoch: u64,
 }
 
 impl NativeUiCompileStamp {
@@ -1314,6 +1318,7 @@ impl NativeUiCompileStamp {
             && self.document_seq == previous.document_seq
             && self.presentation_revision == previous.presentation_revision
             && self.paint_revision == previous.paint_revision
+            && self.coverage_epoch == previous.coverage_epoch
     }
 }
 
@@ -2225,8 +2230,6 @@ impl App {
         self.font_weight_dark_nudge.to_bits().hash(&mut paint);
         native_appearance_revision(crate::native_appearance::current_preferences())
             .hash(&mut paint);
-        // The faces chrome text can ink now: a face that lands redraws what lacked it.
-        crate::tray_raster::chrome_coverage_epoch().hash(&mut paint);
         let motion = self.native_view_motion_cx(wid, view);
         native_motion_revision(motion).hash(&mut paint);
         motion.automatic_tab_color.hash(&mut paint);
@@ -2240,6 +2243,8 @@ impl App {
             document_seq,
             presentation_revision,
             paint_revision: paint.finish(),
+            // The faces chrome text can ink now: a face that lands redraws what lacked it.
+            coverage_epoch: crate::tray_raster::chrome_coverage_epoch(),
         })
     }
 
@@ -3841,106 +3846,14 @@ impl App {
             .and_then(|state| state.common().last_focus.clone());
         let key = {
             let compiled = self.current_native_ui(wid)?;
-            let focus_order = &compiled.focus_order;
-            if focus_order.is_empty() {
-                let Some(mut key) = compiled.tab_into_unshown_list(!backwards) else {
-                    return Ok(());
-                };
-                if let Some(current) = current.as_ref()
-                    && let Some(next) = compiled.tab_past_screen(current, &key, !backwards)
-                {
-                    key = next;
-                }
-                return self.focus_native_control(wid, view, key, true).map(|_| ());
-            }
-            let order_of = |key: &crate::native_ui::UiKey| {
-                compiled.semantics.iter().position(|node| &node.key == key)
-            };
-            let list_at = compiled.semantics.iter().position(|node| {
-                node.role == crate::native_ui::SemanticRole::List
-                    && node.key.as_str() != "settings/navigation/list"
-            });
-            let next = current
-                .as_ref()
-                .and_then(|key| focus_order.iter().position(|candidate| candidate == key))
-                .map_or_else(
-                    || {
-                        let resume = current.as_ref().and_then(order_of).and_then(|at| {
-                            if backwards {
-                                focus_order
-                                    .iter()
-                                    .rposition(|key| order_of(key).is_some_and(|p| p < at))
-                            } else {
-                                focus_order
-                                    .iter()
-                                    .position(|key| order_of(key).is_some_and(|p| p > at))
-                            }
-                        });
-                        resume.unwrap_or(if backwards { focus_order.len() - 1 } else { 0 })
-                    },
-                    |index| {
-                        if backwards {
-                            index.checked_sub(1).unwrap_or(focus_order.len() - 1)
-                        } else {
-                            (index + 1) % focus_order.len()
-                        }
-                    },
-                );
-            let next = match self.native_runtime.view_state(view) {
-                Some(crate::native_app::AppViewState::Settings(state)) => state
-                    .tab_past_navigation(
-                        current.as_ref(),
-                        &focus_order[next],
-                        !backwards,
-                        focus_order,
-                    )
-                    .and_then(|target| focus_order.iter().position(|key| *key == target))
-                    .unwrap_or(next),
-                _ => next,
-            };
-            let passes_list = list_at
-                .zip(current.as_ref().and_then(order_of))
-                .is_some_and(|(list, from)| {
-                    order_of(&focus_order[next]).is_none_or(|to| {
-                        let (from, to) = if backwards { (to, from) } else { (from, to) };
-                        if from < to {
-                            from < list && list < to
-                        } else {
-                            list > from || list < to
-                        }
-                    })
-                });
-            // Settings keeps a plan of its list; any other page's list that
-            // holds every row says its stops in the compiled tree
-            // ([`crate::native_ui::CompiledUi::list_stops`]).
             let settings = match self.native_runtime.view_state(view) {
                 Some(crate::native_app::AppViewState::Settings(state)) => Some(&**state),
                 _ => None,
             };
-            let mut key = focus_order[next].clone();
-            if passes_list
-                && let Some(target) = match settings {
-                    Some(state) => state.tab_into_unshown_list(!backwards, focus_order),
-                    None => compiled.tab_into_unshown_list(!backwards),
-                }
-            {
-                key = target;
-            }
-            if let Some(current) = current.as_ref()
-                && let Some(beyond) = match settings {
-                    Some(state) => state.tab_past_screen(current, &key, !backwards, focus_order),
-                    None => compiled.tab_past_screen(current, &key, !backwards),
-                }
-            {
-                key = beyond;
-            }
-            if let Some(state) = settings
-                && let Some(target) =
-                    state.tab_past_options(current.as_ref(), &key, !backwards, focus_order)
-            {
-                key = target;
-            }
-            key
+            native_tab_target(&compiled, settings, current.as_ref(), backwards)
+        };
+        let Some(key) = key else {
+            return Ok(());
         };
         self.focus_native_control(wid, view, key, true).map(|_| ())
     }
@@ -10722,6 +10635,103 @@ pub(crate) fn packages_request_refusal(
          settings are this Mac's \u{2014} `aterm pkg machine apply` in a terminal applies them"
             .to_string()
     })
+}
+
+/// Where Tab (Shift-Tab where `backwards`) takes the keyboard from `current` on the page
+/// `compiled` draws, `settings` the Settings view drawing it, if it is one: the next stop in Tab
+/// order, through a list's every row, not just its screen. `None` where the page has no stop.
+pub(crate) fn native_tab_target(
+    compiled: &crate::native_ui::CompiledUi,
+    settings: Option<&crate::native_settings::SettingsViewState>,
+    current: Option<&crate::native_ui::UiKey>,
+    backwards: bool,
+) -> Option<crate::native_ui::UiKey> {
+    let focus_order = &compiled.focus_order;
+    if focus_order.is_empty() {
+        // A screen that shows no stop: Tab enters the list that holds every row.
+        let mut key = compiled.tab_into_unshown_list(!backwards)?;
+        if let Some(current) = current
+            && let Some(next) = compiled.tab_past_screen(current, &key, !backwards)
+        {
+            key = next;
+        }
+        return Some(key);
+    }
+    let order_of =
+        |key: &crate::native_ui::UiKey| compiled.semantics.iter().position(|node| &node.key == key);
+    let list_at = compiled.semantics.iter().position(|node| {
+        node.role == crate::native_ui::SemanticRole::List
+            && node.key.as_str() != "settings/navigation/list"
+    });
+    let next = current
+        .and_then(|key| focus_order.iter().position(|candidate| candidate == key))
+        .map_or_else(
+            || {
+                let resume = current.and_then(order_of).and_then(|at| {
+                    if backwards {
+                        focus_order
+                            .iter()
+                            .rposition(|key| order_of(key).is_some_and(|p| p < at))
+                    } else {
+                        focus_order
+                            .iter()
+                            .position(|key| order_of(key).is_some_and(|p| p > at))
+                    }
+                });
+                resume.unwrap_or(if backwards { focus_order.len() - 1 } else { 0 })
+            },
+            |index| {
+                if backwards {
+                    index.checked_sub(1).unwrap_or(focus_order.len() - 1)
+                } else {
+                    (index + 1) % focus_order.len()
+                }
+            },
+        );
+    let next = settings
+        .and_then(|state| {
+            state.tab_past_navigation(current, &focus_order[next], !backwards, focus_order)
+        })
+        .and_then(|target| focus_order.iter().position(|key| *key == target))
+        .unwrap_or(next);
+    let passes_list = list_at
+        .zip(current.and_then(order_of))
+        .is_some_and(|(list, from)| {
+            order_of(&focus_order[next]).is_none_or(|to| {
+                let (from, to) = if backwards { (to, from) } else { (from, to) };
+                if from < to {
+                    from < list && list < to
+                } else {
+                    list > from || list < to
+                }
+            })
+        });
+    // Settings keeps a plan of its list; any other page's list that
+    // holds every row says its stops in the compiled tree
+    // ([`crate::native_ui::CompiledUi::list_stops`]).
+    let mut key = focus_order[next].clone();
+    if passes_list
+        && let Some(target) = match settings {
+            Some(state) => state.tab_into_unshown_list(!backwards, focus_order),
+            None => compiled.tab_into_unshown_list(!backwards),
+        }
+    {
+        key = target;
+    }
+    if let Some(current) = current
+        && let Some(beyond) = match settings {
+            Some(state) => state.tab_past_screen(current, &key, !backwards, focus_order),
+            None => compiled.tab_past_screen(current, &key, !backwards),
+        }
+    {
+        key = beyond;
+    }
+    if let Some(state) = settings
+        && let Some(target) = state.tab_past_options(current, &key, !backwards, focus_order)
+    {
+        key = target;
+    }
+    Some(key)
 }
 
 #[cfg(test)]

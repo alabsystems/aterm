@@ -17,13 +17,13 @@ use std::time::{Duration, Instant};
 
 use astream_broker::Record as BrokerRecord;
 use aterm_hash::fnv1a_64;
-use aterm_types::fabric_grammar::{Bye, ANSWER_KINDS};
+use aterm_types::fabric_grammar::{Bye, DeadReason, ANSWER_KINDS};
 
 use crate::body::{via_ok, Body};
 use crate::ctl::{Ctl, Reply, REQUEST_LINE_MAX};
 use crate::fx::{BusCloser, Fx};
 use crate::mailbox::{EventMark, Item, Mailbox, Pushed, ReplayPressure, Source};
-use crate::pipeline::Link;
+use crate::pipeline::{HeldCommit, Link};
 use crate::presence::{Fields, Marked, Mode, Slot};
 use crate::render::trust_of;
 use crate::state::{
@@ -38,7 +38,12 @@ use crate::wait_tally::Recorder;
 mod mirror_run;
 
 /// Maximum time the publisher connection waits for the broker to answer a single request.
+#[cfg(not(test))]
 pub(crate) const ACK_DEADLINE: Duration = Duration::from_secs(5);
+/// The unit tests' broker runs in-process, so a request it answers late is a loaded machine,
+/// not a broker gone silent: their connections wait the hang detector.
+#[cfg(test)]
+pub(crate) const ACK_DEADLINE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 const ACK_DEADLINE_SEAM: &str = "ATERM_LINK_ACK_DEADLINE_MS";
 
@@ -60,6 +65,20 @@ const LINK_MOVE_GAP: Duration = Duration::from_millis(250);
 const LINK_DOWN_RETELL: Duration = Duration::from_secs(30);
 
 const REFILL_FLOOR_SPAN: u64 = 4096;
+
+/// What one record the attach's shared refill read carries and offers to no session costs, in
+/// records the broker scans (`Bridge::refill_node`). Measured on an Apple M5 Max at the
+/// `opt-test` profile, against the broker in the test's own process (2026-10-27, two runs of
+/// five repetitions, at 1-minute loads of 9 and 16): a lane's `Fetch` scanned 7.7-10.7 ns a
+/// record over 200,000 `ev` records, and the shared read carried 100,000 mail records of lanes
+/// it read for no one at 1.48-2.13 us a record, 158-255 records' scan each. A cost off by a
+/// factor of two moves the hand-on by a page or two (256 records carried each).
+const REFILL_ROW_COST: u64 = 192;
+
+/// How far, in records scanned, what the shared refill read carried may pass what it saved
+/// before each session reads on alone (`Bridge::refill_node`): one page's scan, about half a
+/// millisecond at the rate above, or some 340 records carried for no session.
+const REFILL_SPLIT_SLACK: u64 = astream_broker::broker::FETCH_SCAN_MAX as u64;
 
 const ROSTER_REFRESH: Duration = Duration::from_millis(2_000);
 
@@ -206,6 +225,9 @@ fn ghost_sweep() -> Duration {
 }
 
 const SELF_ACK_KEEP: usize = 4096;
+/// The most offsets [`Bridge::claims`] holds: far past what one attach's replay and retries
+/// publish or settle.
+const CLAIMS_KEEP: usize = 4096;
 
 const DEMOTE_UNLESS_ACCEPTED: [&str; 2] = ["task", "control"];
 
@@ -244,6 +266,13 @@ fn seen_watermark(off: Option<u64>, floor: Option<Option<u64>>) -> Option<u64> {
         Some(floor) => floor.and_then(|f| f.checked_sub(1)),
         None => off,
     }
+}
+
+/// Whether `item` came off the bus, not aterm's push lane, so it is no reply a held inbox
+/// commit could ride and sends the commit before it is handled ([`Bridge::hold_inbox_commit`]).
+/// aterm closing the lane is aterm's, and the wind-down lands the commit itself.
+fn off_the_bus(item: &Item) -> bool {
+    !matches!(item, Item::Event(_) | Item::Closed(Source::Aterm))
 }
 
 fn idle_wait(
@@ -714,14 +743,43 @@ fn refusal_is_ack(e: &io::Error) -> bool {
     })
 }
 
-fn read_back_rows(
+/// WHAT ONE READ OF ONE OFFSET FOUND ([`Bridge::read_at`]).
+#[derive(Debug)]
+enum ReadAt {
+    /// The read's page: at most the one record asked for, the first of its filter at or above
+    /// the offset, a record retention holds below the filter's oldest included.
+    Rows(Vec<BrokerRecord>),
+    /// CUT, never absent: the offset lies below the filter's oldest (astream's
+    /// `retained-from=<floor>`, `floor` above the offset), and the told read of a broker that
+    /// tells fetches (`Client::supports_told_fetch`) found no record of the filter there.
+    /// Whatever record of it was there, retention gave up.
+    Cut(u64),
+    /// UNTOLD: the offset lies below the filter's oldest `floor` and the broker does not tell
+    /// fetches (one built before told fetches), so its refusal says nothing of what retention
+    /// still holds there: a record of the filter at the offset may be held, unread.
+    Untold(u64),
+    /// UNASKED: the offset lies below the filter's oldest, and the told read could not be
+    /// made on its connection of its own (its dial, its `Hello`, its log not the link's, its
+    /// read): no answer about the record there. Not judged as the link's: the link stands,
+    /// and each caller says what an unanswered read is to it ([`Bridge::read_at`]).
+    Unasked(io::Error),
+}
+
+/// The plain read of one offset `off`, judged: its rows; or, where astream refused it below
+/// its filter's oldest (`retained-from=<oldest>` with `<oldest>` above `off`), that oldest,
+/// `Err(floor)`: no answer about the record at `off` yet, since retention can still hold it
+/// there ([`Bridge::read_at`] reads it again, told). Every other refusal, the same words under
+/// another code, and an `<oldest>` at `off` stay the errors they are.
+fn plain_read_at(
     page: io::Result<astream_broker::Page>,
     off: u64,
-) -> io::Result<Vec<BrokerRecord>> {
+) -> io::Result<Result<Vec<BrokerRecord>, u64>> {
     match page {
-        Ok((rows, _)) => Ok(rows),
-        Err(e) if transport::retained_past(&e, off).is_some() => Ok(Vec::new()),
-        Err(e) => Err(e),
+        Ok((rows, _)) => Ok(Ok(rows)),
+        Err(e) => match transport::retained_past(&e, off) {
+            Some(floor) => Ok(Err(floor)),
+            None => Err(e),
+        },
     }
 }
 
@@ -767,6 +825,10 @@ const LINK_MIRROR_WAIT_LANE: u32 = 6;
 /// The lane that added `link gap from=<a> to=<b> [records=<n>]` (astream R4's addendum A9).
 const LINK_GAP_LANE: u32 = aterm_types::control_verbs::LINK_GAP_LANE;
 
+/// The lane that added `link gap … sid=<sid> [topic=<t>]` (B12): a give-up the bridge's own read
+/// of one session's lane met ([`Bridge::tell_given_up`]).
+const LINK_GAP_SCOPED_LANE: u32 = aterm_types::control_verbs::LINK_GAP_SCOPED_LANE;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Replaced {
     head: u64,
@@ -805,9 +867,19 @@ struct SeqBlock {
     last: u64,
 }
 
-const PIPELINE_WINDOW: usize = 64;
+/// The most publishes the bridge keeps unacked on its one pipelined connection: a send
+/// at the window settles acks first. astream's Ordered pipeline bench claims run at this
+/// window (`WINDOW=`), which this crate's `astream_fixture_tests` holds them to.
+pub const PIPELINE_WINDOW: usize = 64;
 
-const IDLE_ACK_GRACE: Duration = Duration::from_millis(5);
+/// How long a round parks while an ack is owed before it reads the acks
+/// itself: a park that took nothing in this long settles them (blocking).
+/// Also how long after a round first held the inbox commit for the loop's
+/// next write (critic item B08, `Bridge::hold_inbox_commit`) the loop parks
+/// before it sends that commit alone.
+/// Public for the fabric bench, which counts a release later than this plus
+/// a barrier after its ack as late.
+pub const IDLE_ACK_GRACE: Duration = Duration::from_millis(5);
 
 const INBOX_COMMIT_EVERY: usize = 256;
 
@@ -891,7 +963,7 @@ enum PostNext {
     Ends,
 }
 
-const SUBJECT_BUDGET: &str = "subject-budget";
+const SUBJECT_BUDGET: &str = DeadReason::SubjectBudget.word();
 
 fn past_the_budget(e: &io::Error) -> bool {
     astream_broker::broker_refusal(e).is_some_and(astream_broker::BrokerRefusal::is_subject_bound)
@@ -1040,6 +1112,9 @@ pub struct Bridge {
     in_round: bool,
     inbox_pending: Option<u64>,
     inbox_pending_records: usize,
+    /// Since when a round has held the inbox commit for the loop's next write to carry
+    /// ([`Bridge::hold_inbox_commit`]); `None` while none is held.
+    commit_held: Option<Instant>,
     group_record: Option<u64>,
     locals: BTreeMap<u64, String>,
     per_sid: PerSession,
@@ -1104,6 +1179,33 @@ pub struct Bridge {
     route_on_a_pin_that_reads: bool,
     #[cfg(test)]
     deliver_replay_at_once: bool,
+    /// A read back takes any copy of its publication identity, claimed or not (the rule
+    /// [`Bridge::claims`] keeps switched off, a test's negative control).
+    #[cfg(test)]
+    read_back_past_claims: bool,
+    /// Records the attach's shared refill read carried and offered to no session ([`Bridge::refill_node`]):
+    /// what it cost over a read lane by lane, for a test to bound.
+    #[cfg(test)]
+    refill_carried: u64,
+    /// The attach's shared refill read never hands its sessions to their own lanes for what it
+    /// carries (the rule [`Bridge::refill_node`] keeps switched off, a test's negative control).
+    #[cfg(test)]
+    refill_never_hands_on: bool,
+    /// A session below the node inbox's oldest joins the attach's shared refill read there without
+    /// reading its own lane below it (the rule [`Bridge::refill_together`] keeps switched off, a
+    /// test's negative control).
+    #[cfg(test)]
+    refill_joins_below_the_oldest: bool,
+    /// A move's drop of the mirror's pinned batch that the disk refused is said and the attach
+    /// goes on past it (the rule `Bridge::mirror_forget_log` keeps switched off, a test's
+    /// negative control).
+    #[cfg(test)]
+    attach_past_an_unwritten_drop: bool,
+    /// A test's cut, landing between a deduped answer and its read back, as astream's writer
+    /// runs retention between two requests of a connection: called with the answered offset
+    /// ([`Bridge::publish_reserved`]).
+    #[cfg(test)]
+    cut_after_the_answer: Option<Box<dyn FnMut(u64) + Send>>,
     #[cfg(test)]
     moved_at_start: u64,
     /// The next reclaim's read of the lanes this node writes is refused with this code.
@@ -1117,12 +1219,34 @@ pub struct Bridge {
     acked_appendable: bool,
     unsettled: BTreeMap<u64, u64>,
     awaiting_drain: BTreeMap<u64, (u64, bool)>,
+    /// OFFSETS THIS BRIDGE KNOWS HOLD ONE SEQUENCE'S RECORD, on the log it names (aterm-link B05
+    /// review): each copy the attach's replay or a retry published, or read back and settled, by
+    /// sequence ([`Bridge::claim`]). A read back for another sequence skips them
+    /// ([`Bridge::landed_since`]): the replay of an entry the disk refused to clear publishes a
+    /// sender's earlier post again, above the head of the sender's next post of the same words,
+    /// and taken for that post it would settle it where it never landed. A retry takes its own
+    /// sequence's claim as where it landed ([`Bridge::landed_at_its_pin`]). A first attempt is
+    /// never claimed: a sender's posts go one at a time, so its first attempts land below the
+    /// head of every later post of its. At most [`CLAIMS_KEEP`], the lowest offsets going first.
+    claims: Option<(astream_broker::LogIdentity, BTreeMap<u64, u64>)>,
     unsent: Option<u64>,
     held_senders: BTreeSet<String>,
     collided: Option<(u64, u64)>,
     seq_block: Option<SeqBlock>,
     lanes_opened: BTreeSet<String>,
     deadlines: BTreeMap<u64, Deadline>,
+    /// The deadline table's changes no write of it has taken yet, by the ask's offset, with its
+    /// asker: a deadline noted, or one settled, expired or dropped, that the disk does not hold
+    /// as `deadlines` does (item F4). Empty once a write takes. It stays small while the disk
+    /// refuses: a post held over its own unwritten deadline holds its sender's queue, and an
+    /// answer withheld over its own holds the inbox, so each entry is a deadline the table
+    /// held, or one more per sender.
+    deadlines_unwritten: BTreeMap<u64, String>,
+    /// Asks whose post was left queued because their deadline was not on disk
+    /// ([`Bridge::note_deadline`]): the retry at the post's pin notes the deadline again, and
+    /// one settled meanwhile (its answer delivered, or the sweep's `expired` published, while
+    /// the post was held) is not armed again (F4 review).
+    deadlines_held: BTreeSet<u64>,
     asked: BTreeMap<u64, String>,
     expired: BTreeMap<u64, String>,
     deadline_due: Instant,
@@ -1162,6 +1286,9 @@ struct PerSession {
     watched: BTreeMap<String, u64>,
     presence: BTreeMap<String, Slot>,
     lane_owed: BTreeMap<String, Option<u64>>,
+    /// The highest floor told for each (sid, scope) ([`Bridge::tell_given_up`]): the scope is
+    /// the topic, or empty for the session's mail lane.
+    given_up_told: BTreeMap<(String, String), u64>,
 }
 
 impl PerSession {
@@ -1177,7 +1304,9 @@ impl PerSession {
             watched,
             presence,
             lane_owed,
+            given_up_told,
         } = self;
+        given_up_told.retain(|(sid, _), _| live.contains(sid));
         epochs.retain(|sid, _| live.contains(sid));
         pending_admit.retain(|sid| live.contains(sid));
         topics.retain(|sid, _| live.contains(sid));
@@ -1232,6 +1361,14 @@ fn lane_addr(fleet: &str, writer: &str, lane: &str) -> Option<(String, String)> 
     .then(|| (segs[4].to_string(), segs[5].to_string()))
 }
 
+/// One page [`Bridge::lane_page`] read: the page, what the read found given up below where it
+/// read, and the told page's uncounted gap notice, apart.
+type LanePage = (
+    astream_broker::Page,
+    Option<astream_broker::Gap>,
+    Option<astream_broker::Gap>,
+);
+
 fn say_record(fleet: &str, subject: &str, raw: &[u8]) -> Option<(subject::SayAddr, Body)> {
     let say = subject::parse_say(fleet, subject)?;
     let (body, _raw_tail) = Body::decode(raw);
@@ -1285,6 +1422,7 @@ impl Bridge {
     #[cfg(test)]
     pub(crate) fn simulated(cfg: Config, fx: Fx, ctl: Ctl) -> io::Result<Self> {
         let state = StateDir::open_on(&cfg.state_dir, fx.disk())?;
+        state.adopt_without_the_attach(fx.mutant(crate::sim::world::Mutant::AdoptWithoutTheAttach));
         let caps = read_ring(&cfg.cap_files)?;
         Self::assemble(cfg, fx, state, caps, ctl, None, Attachment::Inherited)
     }
@@ -1337,12 +1475,15 @@ impl Bridge {
             acked_appendable: acked.appendable,
             unsettled: BTreeMap::new(),
             awaiting_drain: BTreeMap::new(),
+            claims: None,
             unsent: None,
             held_senders: BTreeSet::new(),
             collided: None,
             seq_block: None,
             lanes_opened: BTreeSet::new(),
             deadlines: state.deadlines().into_iter().map(|d| (d.off, d)).collect(),
+            deadlines_unwritten: BTreeMap::new(),
+            deadlines_held: BTreeSet::new(),
             asked: state.asked().into_iter().map(|a| (a.off, a.to)).collect(),
             expired: BTreeMap::new(),
             deadline_due: now + roster_refresh(),
@@ -1361,6 +1502,7 @@ impl Bridge {
             in_round: false,
             inbox_pending: None,
             inbox_pending_records: 0,
+            commit_held: None,
             group_record: None,
             locals: BTreeMap::new(),
             per_sid: PerSession::default(),
@@ -1413,6 +1555,18 @@ impl Bridge {
             route_on_a_pin_that_reads: false,
             #[cfg(test)]
             deliver_replay_at_once: false,
+            #[cfg(test)]
+            read_back_past_claims: false,
+            #[cfg(test)]
+            refill_carried: 0,
+            #[cfg(test)]
+            refill_never_hands_on: false,
+            #[cfg(test)]
+            refill_joins_below_the_oldest: false,
+            #[cfg(test)]
+            attach_past_an_unwritten_drop: false,
+            #[cfg(test)]
+            cut_after_the_answer: None,
             #[cfg(test)]
             moved_at_start: 0,
             #[cfg(test)]
@@ -1493,6 +1647,192 @@ impl Bridge {
         let (c, closer) = self.connect()?;
         same_log(self.bus_log, &c)?;
         Ok((c, closer))
+    }
+
+    /// A connection of its own for a read TOLD WHAT RETENTION GAVE UP
+    /// ([`transport::fetch_told_kept`]), on the log the link reads: asking for gap notices
+    /// turns every fetch on a connection into a told one, which the link's own reads, each
+    /// reading on at the floor, are not. It has said `Hello` (the ring's attach says it, and
+    /// with no ring it is said here), so its log is held to the link's and its
+    /// `Client::supports_told_fetch` says whether its broker tells fetches.
+    fn told_reader(&self) -> io::Result<(Conn, BusCloser)> {
+        let (mut c, closer) = self.connect()?;
+        if self.caps.is_empty() {
+            c.log_identity()?;
+        }
+        same_log(
+            self.conn.as_ref().and_then(|conn| conn.seen_log_identity()),
+            &c,
+        )?;
+        Ok((c, closer))
+    }
+
+    /// READ ONE OFFSET `off` OF `filter`: a `Fetch` from it of at most one record, on the
+    /// link. Where astream refuses that read below the filter's oldest (`retained-from=`,
+    /// [`plain_read_at`]), the same read again TOLD what retention gave up
+    /// (`Client::fetch_told`, on a connection of its own: [`Bridge::told_reader`]): the
+    /// oldest is where the filter is complete, and retention can still hold a record of it
+    /// below there (astream's `retention::oldest`: a filter whose subjects have different
+    /// floors, a class made whole from the base by a rules change, the floors folded past
+    /// their bound), which the told read delivers first. So on a broker that tells fetches
+    /// the refusal reads as the record found, or as [`ReadAt::Cut`] where retention holds
+    /// none of the filter at `off`; never as no record there (finding F3 of the B05 landing:
+    /// the dedup read back of [`Bridge::publish_reserved`] took a held record for none and
+    /// sent its post again, and [`Bridge::fetch_record`] answered `retained` for a record
+    /// the broker still holds). On one that does not (`Client::supports_told_fetch`, false
+    /// on a broker built before told fetches, which refuses the told read as it refused the
+    /// plain one) it reads as [`ReadAt::Untold`], and where the told read cannot be made, as
+    /// [`ReadAt::Unasked`].
+    ///
+    /// THE TOLD READ IS NOT THE LINK'S: its connection's dial, its `Hello`, its log and its
+    /// read are its own, and what befalls them is handed back, the link untouched (at the
+    /// broker's connection cap, or out of descriptors, a second dial fails while the link
+    /// stands). Each caller judges it: the dedup read back as its own failed read, the link
+    /// dropped, so the post's fate stays unknown; the read-only ones as no answer yet.
+    ///
+    /// # Errors
+    /// No link (`NotConnected`), and the plain read's other answers, judged as the link's
+    /// reads are, the link dropped.
+    fn read_at(&mut self, off: u64, filter: &str) -> io::Result<ReadAt> {
+        let fx = self.fx.clone();
+        let Some(conn) = self.conn_now() else {
+            return Err(broker_unreachable());
+        };
+        let started = fx.now();
+        let page = plain_read_at(conn.fetch(off, filter, 1), off);
+        let floor = match self.observe(started, page, Some("read"))? {
+            Ok(rows) => return Ok(ReadAt::Rows(rows)),
+            Err(floor) => floor,
+        };
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReadAtWithoutTheHeld)
+        {
+            return Ok(ReadAt::Cut(floor));
+        }
+        let started = fx.now();
+        let told = self.told_reader().and_then(|(mut reader, _closer)| {
+            if !reader.supports_told_fetch() {
+                return Ok(None);
+            }
+            match reader.fetch_told(off, filter, 1) {
+                Ok(((rows, _), _)) => Ok(Some(rows)),
+                Err(e) if transport::retained_past(&e, off).is_some() => Ok(Some(Vec::new())),
+                Err(e) => Err(e),
+            }
+        });
+        self.waits.request(started);
+        Ok(match told {
+            Err(e) => ReadAt::Unasked(e),
+            Ok(None) => ReadAt::Untold(floor),
+            // Below the oldest the told page starts at `off` only with a record retention
+            // holds there: one further up says it holds none of the filter at `off`.
+            Ok(Some(rows)) if rows.first().is_some_and(|(at, _, _)| *at == off) => {
+                ReadAt::Rows(rows)
+            }
+            Ok(Some(_)) => ReadAt::Cut(floor),
+        })
+    }
+
+    /// ONE PAGE OF A SESSION'S LANE `filter` FROM `cursor`, READ ON PAST WHAT RETENTION GAVE UP
+    /// AND NEVER PAST WHAT IT STILL HOLDS: the link's read, which reads on at the floor
+    /// (`transport::fetch_kept`); and where that read met the filter's oldest above `cursor`,
+    /// the page read again from `cursor` TOLD what retention gave up (`Client::fetch_told`, on
+    /// `told`, a connection of its own the first such page dials, [`Bridge::told_reader`], and
+    /// the caller's later pages read on). A lane is one subject per sender and kind, each with
+    /// its own floor, so its oldest is the greatest of them and retention can still hold mail
+    /// of it below there (astream's `retention::oldest`), which the told page delivers first;
+    /// read on at the floor, that mail is skipped and told as given up (the F3 review: a
+    /// refill and a deadline sweep did so).
+    ///
+    /// Handed back with what the read found given up below where it read, joined: the range
+    /// below a floor its told read was refused at (the lane holds none there), and the told
+    /// page's gap notice where it counts records given up (`records` of the lane's in
+    /// `from..to` the page did not deliver). An uncounted notice (astream's ledger counts
+    /// nothing a rules change left uncounted, which is when mail is held below the oldest)
+    /// says only that a record of its range the page did not deliver may be gone, beside the
+    /// mail of the range the page delivers, so it is not joined to what went: aterm marks no
+    /// lane range its ring holds mail of either (aterm-gui-fabric's `note_given_up`), and a
+    /// page that ran out below the oldest with none leaves its next to decide. It is handed
+    /// back apart, the third of the answer, for a caller with no other notice to tell: a topic
+    /// replay ([`Bridge::catch_up_topic_page`], item F4), where no face tells what went.
+    /// Against a broker that does not tell fetches the told read is refused as the plain one
+    /// was and reads on at the floor too, the range below it told as given up, as before told
+    /// fetches.
+    ///
+    /// # Errors
+    /// No link (`NotConnected`), and the link's read's, judged as its reads are, the link
+    /// dropped. The told reader's dial, `Hello`, log and read are its own connection's, not
+    /// judged as the link's: each caller stops its read as at any failed one.
+    fn lane_page(
+        &mut self,
+        told: &mut Option<(Conn, BusCloser)>,
+        cursor: u64,
+        filter: &str,
+        max: u32,
+    ) -> io::Result<LanePage> {
+        if told.is_none() {
+            let fx = self.fx.clone();
+            let Some(conn) = self.conn_now() else {
+                return Err(broker_unreachable());
+            };
+            let started = fx.now();
+            let answer = transport::fetch_kept(conn, cursor, filter, max);
+            let (page, floor) = self.observe(started, answer, Some("read"))?;
+            if floor.is_none() {
+                return Ok((page, None, None));
+            }
+            #[cfg(test)]
+            if let Some(floor) = floor.filter(|_| {
+                self.fx
+                    .mutant(crate::sim::world::Mutant::LaneReadWithoutTheHeld)
+            }) {
+                let below = astream_broker::Gap {
+                    from: cursor,
+                    to: floor,
+                    records: None,
+                };
+                return Ok((page, Some(below), None));
+            }
+            *told = Some(self.told_reader()?);
+        }
+        let Some((reader, _)) = told.as_mut() else {
+            // Dialled just above.
+            return Err(broker_unreachable());
+        };
+        let started = self.fx.now();
+        let (mut at, mut tries, mut gone) = (cursor, 0usize, None::<astream_broker::Gap>);
+        let page = loop {
+            match reader.fetch_told(at, filter, max) {
+                Ok(told_page) => break Ok(told_page),
+                Err(e) => match transport::retained_past(&e, at) {
+                    Some(floor) if tries < transport::KEPT_TRIES => {
+                        // None of the lane is held in `at..floor`: retention gave all of it up.
+                        let below = astream_broker::Gap {
+                            from: at,
+                            to: floor,
+                            records: None,
+                        };
+                        gone = Some(gone.map_or(below, |g| g.and(below)));
+                        tries = tries.saturating_add(1);
+                        at = floor;
+                    }
+                    _ => break Err(e),
+                },
+            }
+        };
+        self.waits.request(started);
+        let (page, notice) = page?;
+        let (notice, uncounted) = match notice {
+            Some(n) if n.records.is_none() => (None, Some(n)),
+            n => (n.filter(|n| n.records.is_some_and(|r| r > 0)), None),
+        };
+        let gone = match (gone, notice) {
+            (Some(g), Some(n)) => Some(g.and(n)),
+            (g, n) => g.or(n),
+        };
+        Ok((page, gone, uncounted))
     }
 
     fn note_broker_retention(&mut self) {
@@ -1733,16 +2073,43 @@ impl Bridge {
         {}
         let producer_id = self.producer_id;
         self.note_remote_lane(subject);
+        let held = self
+            .take_held_commit()
+            .map(|upto| (upto, subject::inbox_group(&self.cfg.fleet, &self.node)));
+        let retry = self.commit_refused;
         let Some(link) = self.conn.as_mut() else {
             return self.conclude(then, Err(broker_unreachable()));
         };
         let started = self.fx.now();
-        let sent = link.send(producer_id, seq, first, subject, body, then, started);
+        let sent = match held {
+            Some((upto, group)) => link
+                .send_after_commit(
+                    HeldCommit {
+                        group: &group,
+                        upto,
+                        tag: Then::Commit { upto, retry },
+                    },
+                    producer_id,
+                    seq,
+                    first,
+                    subject,
+                    body,
+                    then,
+                    started,
+                )
+                .map_err(|(e, commit, then)| (e, Some(commit), then)),
+            None => link
+                .send(producer_id, seq, first, subject, body, then, started)
+                .map_err(|(e, then)| (e, None, then)),
+        };
         if first && self.unsent == Some(seq) {
             self.unsent = None;
         }
-        if let Err((e, then)) = sent {
+        if let Err((e, commit, then)) = sent {
             self.judge(started, Err(&e), None);
+            if let Some(commit) = commit {
+                self.conclude(commit, Err(io::Error::new(e.kind(), e.to_string())));
+            }
             return self.conclude(then, Err(e));
         }
         if !self.in_round && self.ack_batch == 0 {
@@ -2043,6 +2410,10 @@ impl Bridge {
         if !deduped {
             return Ok((off, false, Some(attempt)));
         }
+        #[cfg(test)]
+        if let Some(cut) = self.cut_after_the_answer.as_mut() {
+            cut(off);
+        }
         let legacy = pin.identity.is_none() || (pin.via_key && pin.original.is_none());
         let mut candidates = vec![attempt];
         if let Some(original) = &pin.original {
@@ -2050,19 +2421,35 @@ impl Bridge {
         }
         let mut faces = BTreeSet::new();
         let mut exact_record = false;
+        let (mut cut, mut untold) = (None, None);
         for candidate in &candidates {
             if !faces.insert(candidate.subject.clone()) {
                 continue;
             }
-            let fx = self.fx.clone();
-            let conn = self
-                .conn_now()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no broker"))?;
-            let started = fx.now();
-            let answer = read_back_rows(conn.fetch(off, &candidate.subject, 1), off);
-            let rows = self
-                .observe(started, answer, Some("read"))
-                .map_err(|e| io::Error::new(e.kind(), PublicationReadFailure(e)))?;
+            // The answer named `off` at or above the base (a cut drops the keys below it), so
+            // the read meets the subject's oldest only where retention cut past `off` since:
+            // read again told, it finds the record if retention still holds it there.
+            let rows = match self
+                .read_at(off, &candidate.subject)
+                .map_err(|e| io::Error::new(e.kind(), PublicationReadFailure(e)))?
+            {
+                ReadAt::Rows(rows) => rows,
+                ReadAt::Cut(floor) => {
+                    cut = Some(floor);
+                    Vec::new()
+                }
+                ReadAt::Untold(floor) => {
+                    untold = Some(floor);
+                    Vec::new()
+                }
+                // The read back failed, on the told read's connection: judged as a failed read
+                // of the link's, the link dropped, so the post's fate stays unknown
+                // (`Bridge::fate_unknown`) and nothing is sent until a read decides it.
+                ReadAt::Unasked(e) => {
+                    self.judge(self.fx.now(), Err(&e), Some("read"));
+                    return Err(io::Error::new(e.kind(), PublicationReadFailure(e)));
+                }
+            };
             for (at, face, bytes) in rows {
                 if at != off || face != candidate.subject {
                     continue;
@@ -2080,10 +2467,32 @@ impl Bridge {
         if legacy && self.state.self_acked().contains(&off) {
             return Ok((off, true, None));
         }
-        let reason = if legacy {
-            "legacy reservation has no verifiable original identity (a keyed re-post may differ)"
-        } else {
-            "record is not readable at its original offset and pinned face"
+        // A CUT VERIFIES NOTHING: retention gave up the record the answer named, and its dedup
+        // key with it, so the retry at the pinned sequence appends anew, as every retry past a
+        // cut does where no copy can be read (`Bridge::landed_since`). On an own lane the
+        // record's entry stood until it settled, and such a record is never delivered, so the
+        // copy given up went unread and the one the retry appends is the one a reader is
+        // handed. A record retention still holds is read, not taken for a cut, on a broker that
+        // tells fetches ([`Bridge::read_at`]), so there the retry never puts a second copy
+        // beside one a reader can still be handed. On one that does not (`ReadAt::Untold`) the
+        // refusal decides nothing: the retry is sent as past a cut, and where retention still
+        // holds the record it puts a second copy beside it, which the reason says.
+        let reason = match (legacy, untold, cut) {
+            (true, _, _) => "legacy reservation has no verifiable original identity (a keyed \
+                             re-post may differ)"
+                .to_string(),
+            (false, Some(floor), _) => format!(
+                "its face reads none below @{floor}, and the broker does not tell fetches, so \
+                 retention may still hold the record there; it is sent again at its pinned \
+                 sequence, a second copy where it is held"
+            ),
+            (false, None, Some(floor)) => format!(
+                "retention gave up the record since the answer (its face holds none below \
+                 @{floor}), so it is sent again at its pinned sequence"
+            ),
+            (false, None, None) => {
+                "record is not readable at its original offset and pinned face".to_string()
+            }
         };
         Err(self.unverified_publication(format!(
             "deduped reservation {} at @{off}: {reason}; left queued",
@@ -2211,6 +2620,11 @@ impl Bridge {
                 .mutant(crate::sim::world::Mutant::IgnoreWitnessedWill)
         });
         self.witnessed_dead = witnessed_dead;
+        #[cfg(test)]
+        self.state.adopt_after_attach(
+            self.fx
+                .mutant(crate::sim::world::Mutant::AdoptAfterTheAttach),
+        );
         self.inc = self.state.take_incarnation(bus_inc)?;
         let mut gone = format!(
             "v=1 t={} state={} inc={} fabric=disconnected {}",
@@ -2385,9 +2799,16 @@ impl Bridge {
             }
         }
         self.per_sid.prune_to(&live);
-        let before = self.deadlines.len();
-        self.deadlines.retain(|_, d| live.contains(&d.sid));
-        if self.deadlines.len() != before {
+        let orphaned: Vec<u64> = self
+            .deadlines
+            .iter()
+            .filter(|(_, d)| !live.contains(&d.sid))
+            .map(|(off, _)| *off)
+            .collect();
+        for off in &orphaned {
+            self.drop_deadline(*off);
+        }
+        if !orphaned.is_empty() {
             self.persist_deadlines();
         }
         Ok(fresh)
@@ -2404,6 +2825,17 @@ impl Bridge {
 
     fn refill_pending_admissions(&mut self, publish_presence: bool) -> bool {
         let pending: Vec<String> = self.per_sid.pending_admit.iter().cloned().collect();
+        let live: Vec<String> = pending
+            .iter()
+            .filter(|sid| self.per_sid.epochs.contains_key(*sid))
+            .cloned()
+            .collect();
+        if live.len() > 1 && self.attachment != Attachment::Observer {
+            for sid in pending.iter().filter(|sid| !live.contains(sid)) {
+                self.per_sid.pending_admit.remove(sid);
+            }
+            return self.refill_together(&live, publish_presence);
+        }
         for sid in pending {
             if !self.per_sid.epochs.contains_key(&sid) {
                 self.per_sid.pending_admit.remove(&sid);
@@ -2424,10 +2856,25 @@ impl Bridge {
         if self.attachment == Attachment::Observer {
             return true;
         }
-        let filter = format!("/f/{}/in/{}/{sid}/>", self.cfg.fleet, self.node);
-        let from = match self.state.seen_off(sid) {
+        // FROM `seen` A FLOOR IS A GIVE-UP THE SESSION IS TOLD OF: the lane's records past the
+        // last one it handled went before this refill offered them. A session with no `seen`
+        // (it never ran `inbox seen`) starts at the floor span below, and a floor met there is
+        // said on stderr alone. That is a choice, not a property: with no watermark the bridge
+        // cannot tell the mail the session handled from the mail it did not, and the span's
+        // start is arbitrary, so a report could name mail it acted on long ago. The cost is a
+        // real loss left silent: a session delivered mail it never acked, cut by retention
+        // before this refill, is told nothing of it.
+        let watermark = self.state.seen_off(sid);
+        #[cfg(test)]
+        self.fx.refill_tap(crate::fx::RefillTap::Began {
+            sid,
+            lane: &self.lane_filter(sid),
+            watermark,
+        });
+        let from = match watermark {
             Some(off) => off + 1,
             None => {
+                let filter = self.lane_filter(sid);
                 let fx = self.fx.clone();
                 let Some(conn) = self.conn_now() else {
                     return false;
@@ -2440,52 +2887,427 @@ impl Bridge {
                 head.saturating_sub(REFILL_FLOOR_SPAN)
             }
         };
+        self.refill_lane(sid, from, watermark.is_some(), None) != Lane::Failed
+    }
+
+    /// The `Fetch` filter of one session's inbox lane, `/f/<F>/in/<node>/<sid>/>`.
+    fn lane_filter(&self, sid: &str) -> String {
+        format!("/f/{}/in/{}/{sid}/>", self.cfg.fleet, self.node)
+    }
+
+    /// THE ATTACH'S REFILL OF SEVERAL SESSIONS IN ONE READ (B09). Each session is offered what
+    /// its own refill ([`Self::refill`]) offers, its lane's records from its watermark to the
+    /// head, but the lanes are read together where that costs less: one paged `Fetch` of the
+    /// node's whole inbox, each record routed by its lane to its session and offered only at or
+    /// past that session's start. astream scans every record from a `Fetch`'s `from` to its
+    /// page's end under its log lock, matched or not, so lane by lane an attach scanned the log
+    /// past every watermark once per session: N sessions trailing the head by R records scanned
+    /// N x R (`docs/measured/fabric` B09: 32 sessions 500,000 records behind, +137-171 ms
+    /// before the first live mail). Together it scans R once, but it carries every lane's
+    /// records, those it offers to no session (a lane's below its session's start, a lane it
+    /// reads for no session) skipped, where lane by lane each read carried its own lane's
+    /// only. [`Self::refill_node`] weighs the two as it reads, and hands each session to its own
+    /// lane once what it carried costs more than the scans it saved.
+    ///
+    /// THE SAME RECORDS, FLOORS INCLUDED. The shared read starts at or above the node inbox's
+    /// oldest (where the filter is complete, astream's `retention::oldest`: the greatest floor
+    /// of what it matches, so at or above every lane's), where no record of any lane is
+    /// missing. A start below it is one its own lane's floor or some other lane's newest
+    /// given-up record lies above: once retention gives up read mail, each lane's floor sits
+    /// past its own newest given-up record, so a quiet session's start lies below a busier
+    /// lane's floor. That session reads its own lane up to the node's oldest, as its own read
+    /// would ([`Self::refill_lane`]: below the lane's oldest told what retention gave up, the
+    /// mail it still holds there offered, what it gave up said and, from a watermark, told),
+    /// and joins the shared read there: a page of its lane asking for one record, which the
+    /// broker answers scanning at most a page's `FETCH_SCAN_MAX` records. A floor that rises under
+    /// the shared read (a retention tick between two pages) ends it where it got to, and each
+    /// session not yet done reads on alone from there, meeting its own lane's floor. A session
+    /// whose delivery is owed stops there, as its own refill stops, whatever the others do.
+    /// One session left to read, or a broker whose `Mark` names no oldest: lane by lane.
+    fn refill_together(&mut self, sids: &[String], publish_presence: bool) -> bool {
+        if publish_presence {
+            for sid in sids {
+                self.publish_session_presence(sid, "live");
+            }
+        }
+        let node_filter = subject::inbox_filter(&self.cfg.fleet, &self.node);
+        let (oldest, head) = {
+            let fx = self.fx.clone();
+            let Some(conn) = self.conn_now() else {
+                return false;
+            };
+            let started = fx.now();
+            let answer = conn.oldest(&node_filter);
+            let Ok(read) = self.observe(started, answer, Some("read")) else {
+                return false;
+            };
+            read
+        };
+        #[cfg(test)]
+        let oldest = oldest.filter(|_| {
+            !self
+                .fx
+                .mutant(crate::sim::world::Mutant::RefillWithoutTheFloor)
+        });
+        let mut together: BTreeMap<String, Refilling> = BTreeMap::new();
+        let mut alone: Vec<(String, u64, bool)> = Vec::new();
+        for sid in sids {
+            let watermark = self.state.seen_off(sid);
+            #[cfg(test)]
+            self.fx.refill_tap(crate::fx::RefillTap::Began {
+                sid,
+                lane: &self.lane_filter(sid),
+                watermark,
+            });
+            let after_seen = watermark.is_some();
+            let from = watermark.map_or_else(|| head.saturating_sub(REFILL_FLOOR_SPAN), |w| w + 1);
+            let Some(oldest) = oldest else {
+                alone.push((sid.clone(), from, after_seen));
+                continue;
+            };
+            let mut from = from;
+            if from < oldest {
+                if !self.per_sid.epochs.contains_key(sid) {
+                    #[cfg(test)]
+                    self.fx.refill_tap(crate::fx::RefillTap::Dropped { sid });
+                    self.per_sid.pending_admit.remove(sid);
+                    continue;
+                }
+                #[cfg(test)]
+                self.fx
+                    .refill_tap(crate::fx::RefillTap::BelowTheOldest { sid, oldest });
+                #[cfg(test)]
+                let joins_at_once = self.refill_joins_below_the_oldest
+                    || self
+                        .fx
+                        .mutant(crate::sim::world::Mutant::RefillJoinBelowTheOldest);
+                #[cfg(not(test))]
+                let joins_at_once = false;
+                let read = if joins_at_once {
+                    Lane::To(oldest)
+                } else {
+                    self.refill_lane(sid, from, after_seen, Some(oldest))
+                };
+                match read {
+                    Lane::Failed => return false,
+                    Lane::Done => {
+                        self.per_sid.pending_admit.remove(sid);
+                        continue;
+                    }
+                    Lane::To(at) => from = at,
+                }
+            }
+            together.insert(
+                sid.clone(),
+                Refilling {
+                    from,
+                    after_seen,
+                    stopped: false,
+                },
+            );
+        }
+        if together.len() > 1 {
+            let lowest = together.values().map(|s| s.from).min().unwrap_or(head);
+            #[cfg(test)]
+            let lowest = if self
+                .fx
+                .mutant(crate::sim::world::Mutant::RefillTogetherFromTheHighest)
+            {
+                together.values().map(|s| s.from).max().unwrap_or(lowest)
+            } else {
+                lowest
+            };
+            match self.refill_node(&node_filter, lowest, &mut together) {
+                Together::Read => {}
+                Together::Failed => return false,
+                Together::HandedOn(at) => {
+                    for (sid, s) in std::mem::take(&mut together) {
+                        if s.stopped {
+                            self.per_sid.pending_admit.remove(&sid);
+                        } else {
+                            alone.push((sid, s.from.max(at), s.after_seen));
+                        }
+                    }
+                }
+            }
+            for sid in together.keys() {
+                self.per_sid.pending_admit.remove(sid);
+            }
+        } else {
+            alone.extend(
+                together
+                    .into_iter()
+                    .map(|(sid, s)| (sid, s.from, s.after_seen)),
+            );
+        }
+        for (sid, from, after_seen) in alone {
+            if !self.per_sid.epochs.contains_key(&sid) {
+                #[cfg(test)]
+                self.fx
+                    .refill_tap(crate::fx::RefillTap::Dropped { sid: &sid });
+                self.per_sid.pending_admit.remove(&sid);
+                continue;
+            }
+            if self.refill_lane(&sid, from, after_seen, None) == Lane::Failed {
+                return false;
+            }
+            self.per_sid.pending_admit.remove(&sid);
+        }
+        true
+    }
+
+    /// The shared read of [`Self::refill_together`]: pages of `filter`, the node's inbox, from
+    /// `from`, each record offered to its lane's session in `sessions` at or past that
+    /// session's start, until the head.
+    ///
+    /// WEIGHED AS IT READS. A page costs the broker its scan once, where a read of each lane
+    /// would have scanned it once for each session it reads for; and it carries the records it
+    /// offers to no session (a lane's below its session's start, a lane it reads for no
+    /// session, a session stopped or gone), which lane by lane no read carried, each costing
+    /// about [`REFILL_ROW_COST`] records scanned. Once what it carried passes what it saved by
+    /// [`REFILL_SPLIT_SLACK`], it ends where it got to and each session reads on alone
+    /// (`HandedOn`), checked after each page: so the shared read never costs more than lane by
+    /// lane did by more than the slack and one page of records carried, and over a log of `ev`
+    /// records past the watermarks it reads once for every session.
+    fn refill_node(
+        &mut self,
+        filter: &str,
+        from: u64,
+        sessions: &mut BTreeMap<String, Refilling>,
+    ) -> Together {
+        let lanes = format!("/f/{}/in/{}/", self.cfg.fleet, self.node);
+        #[cfg(test)]
+        self.fx.refill_tap(crate::fx::RefillTap::Together {
+            sessions: sessions.len(),
+        });
+        let scan_max = astream_broker::broker::FETCH_SCAN_MAX as u64;
+        // What the read carried past what it saved, in records scanned.
+        let mut owing: i64 = 0;
         let mut cursor = from;
         loop {
             let page = {
                 let fx = self.fx.clone();
                 let Some(conn) = self.conn_now() else {
-                    return false;
+                    return Together::Failed;
                 };
                 let started = fx.now();
-                let answer = transport::fetch_kept(conn, cursor, &filter, 256);
+                let answer = transport::fetch_kept(conn, cursor, filter, transport::POST_PAGE);
                 match self.observe(started, answer, Some("read")) {
-                    Ok((p, floor)) => {
-                        if let Some(floor) = floor {
+                    Ok((_, Some(floor))) => {
+                        stderr_line!(
+                            "aterm-link: the attach's refill of {} sessions together met the \
+                             broker's retention at @{floor} (from @{cursor}); each reads on alone \
+                             from there",
+                            sessions.values().filter(|s| !s.stopped).count()
+                        );
+                        return Together::HandedOn(cursor);
+                    }
+                    Ok((p, None)) => p,
+                    Err(e) => {
+                        stderr_line!("aterm-link: the attach's refill stopped: {e}");
+                        return Together::Failed;
+                    }
+                }
+            };
+            let (rows, (next, head)) = page;
+            let mut carried: u64 = 0;
+            for (off, subj, body) in rows {
+                let owed_to = subj
+                    .strip_prefix(lanes.as_str())
+                    .and_then(|rest| rest.split_once('/'))
+                    .map(|(sid, _)| sid)
+                    .filter(|sid| {
+                        sessions
+                            .get(*sid)
+                            .is_some_and(|s| !s.stopped && off >= s.from)
+                            && self.per_sid.epochs.contains_key(*sid)
+                    })
+                    .map(str::to_string);
+                let Some(sid) = owed_to else {
+                    carried += 1;
+                    continue;
+                };
+                let delivery = self.deliver_record(off, &subj, &body);
+                #[cfg(test)]
+                self.fx.refill_tap(crate::fx::RefillTap::Offered {
+                    sid: &sid,
+                    off,
+                    owed: delivery == Delivery::Owed,
+                });
+                match delivery {
+                    Delivery::Accounted => {}
+                    Delivery::Unaccounted => return Together::Failed,
+                    Delivery::Owed => {
+                        if let Some(s) = sessions.get_mut(&sid) {
+                            s.stopped = true;
+                        }
+                        #[cfg(test)]
+                        self.fx
+                            .refill_tap(crate::fx::RefillTap::Ended { sid: &sid, head });
+                    }
+                }
+                if self.conn.is_none() {
+                    return Together::Failed;
+                }
+                self.service_urgent();
+            }
+            #[cfg(test)]
+            {
+                self.refill_carried += carried;
+            }
+            if next >= head {
+                #[cfg(test)]
+                for (sid, s) in sessions.iter() {
+                    if s.stopped {
+                        continue;
+                    }
+                    if self.per_sid.epochs.contains_key(sid) {
+                        self.fx
+                            .refill_tap(crate::fx::RefillTap::Ended { sid, head });
+                    } else {
+                        self.fx.refill_tap(crate::fx::RefillTap::Dropped { sid });
+                    }
+                }
+                return Together::Read;
+            }
+            if next <= cursor {
+                stderr_line!("aterm-link: the attach's refill made no progress at {cursor}");
+                return Together::Failed;
+            }
+            let scanned = (next - cursor).min(scan_max);
+            let reading = sessions
+                .iter()
+                .filter(|(sid, s)| {
+                    !s.stopped && s.from < next && self.per_sid.epochs.contains_key(*sid)
+                })
+                .count() as u64;
+            let cost = carried.saturating_mul(REFILL_ROW_COST);
+            let saved = reading.saturating_sub(1).saturating_mul(scanned);
+            owing = owing
+                .saturating_add(i64::try_from(cost).unwrap_or(i64::MAX))
+                .saturating_sub(i64::try_from(saved).unwrap_or(i64::MAX));
+            cursor = next;
+            #[cfg(test)]
+            let hands_on = !self.refill_never_hands_on;
+            #[cfg(not(test))]
+            let hands_on = true;
+            if hands_on && owing > i64::try_from(REFILL_SPLIT_SLACK).unwrap_or(i64::MAX) {
+                stderr_line!(
+                    "aterm-link: the attach's refill of {} sessions together carried more of the \
+                     node's inbox than reading once saved (to @{cursor}); each reads on alone \
+                     from there",
+                    sessions.values().filter(|s| !s.stopped).count()
+                );
+                return Together::HandedOn(cursor);
+            }
+        }
+    }
+
+    /// One session's refill on its own lane from `from`: pages of its lane, each record
+    /// offered, read below its oldest told what retention gave up ([`Bridge::lane_page`]), so
+    /// the mail retention still holds there is offered, never skipped and told as given up, and
+    /// (`after_seen`) what it gave up told; to the head. `until` (the node inbox's oldest,
+    /// [`Self::refill_together`]) ends it there instead: the records at or past it are left for
+    /// the shared read, which the session joins at `until` (`Lane::To`). Below `until` the
+    /// first page asks for one record, so a lane that holds none there carries one record past
+    /// it, not a page.
+    fn refill_lane(&mut self, sid: &str, from: u64, after_seen: bool, until: Option<u64>) -> Lane {
+        let filter = self.lane_filter(sid);
+        let mut cursor = from;
+        let mut max = if until.is_some() {
+            1
+        } else {
+            transport::POST_PAGE
+        };
+        let mut told = None;
+        loop {
+            let page = {
+                #[cfg(test)]
+                let answer = if self
+                    .fx
+                    .mutant(crate::sim::world::Mutant::RefillWithoutTheFloor)
+                {
+                    let fx = self.fx.clone();
+                    let Some(conn) = self.conn_now() else {
+                        return Lane::Failed;
+                    };
+                    let started = fx.now();
+                    let answer = conn
+                        .fetch(cursor, &filter, max)
+                        .map(|page| (page, None, None));
+                    self.observe(started, answer, Some("read"))
+                } else {
+                    self.lane_page(&mut told, cursor, &filter, max)
+                };
+                #[cfg(not(test))]
+                let answer = self.lane_page(&mut told, cursor, &filter, max);
+                match answer {
+                    Ok((p, gone, _)) => {
+                        if let Some(gone) = gone {
                             stderr_line!(
-                                "aterm-link: refill of {sid}: the broker's retention gave up \
-                                 this lane's records below @{floor} (from @{cursor}); reading on \
-                                 from there"
+                                "aterm-link: refill of {sid}: the broker's retention gave up {} \
+                                 of this lane; reading on past them",
+                                transport::gap_lost(&gone)
                             );
+                            if after_seen {
+                                self.tell_given_up(sid, None, gone);
+                            }
+                            #[cfg(test)]
+                            self.fx.refill_tap(crate::fx::RefillTap::Floor {
+                                sid,
+                                floor: gone.to,
+                            });
                         }
                         p
                     }
                     Err(e) => {
                         stderr_line!("aterm-link: refill of {sid} stopped: {e}");
-                        return false;
+                        return Lane::Failed;
                     }
                 }
             };
             let (rows, (next, head)) = page;
             for (off, subj, body) in rows {
-                match self.deliver_record(off, &subj, &body) {
+                if let Some(until) = until.filter(|until| off >= *until) {
+                    return Lane::To(until);
+                }
+                let delivery = self.deliver_record(off, &subj, &body);
+                #[cfg(test)]
+                self.fx.refill_tap(crate::fx::RefillTap::Offered {
+                    sid,
+                    off,
+                    owed: delivery == Delivery::Owed,
+                });
+                match delivery {
                     Delivery::Accounted => {}
-                    Delivery::Unaccounted => return false,
-                    Delivery::Owed => return true,
+                    Delivery::Unaccounted => return Lane::Failed,
+                    Delivery::Owed => {
+                        #[cfg(test)]
+                        self.fx
+                            .refill_tap(crate::fx::RefillTap::Ended { sid, head });
+                        return Lane::Done;
+                    }
                 }
                 if self.conn.is_none() {
-                    return false;
+                    return Lane::Failed;
                 }
                 self.service_urgent();
             }
+            if let Some(until) = until.filter(|until| next >= *until) {
+                return Lane::To(until);
+            }
             if next >= head {
-                return true;
+                #[cfg(test)]
+                self.fx
+                    .refill_tap(crate::fx::RefillTap::Ended { sid, head });
+                return Lane::Done;
             }
             if next <= cursor {
                 stderr_line!("aterm-link: refill of {sid} made no progress at {cursor}");
-                return false;
+                return Lane::Failed;
             }
             cursor = next;
+            max = transport::POST_PAGE;
         }
     }
 
@@ -2550,6 +3372,28 @@ impl Bridge {
     /// commits past it, and a notice told again before one is aterm's to recognise.
     fn on_gap(&mut self, source: Source, g: astream_broker::Gap) {
         let lost = transport::gap_lost(&g);
+        #[cfg(test)]
+        let runs_past = self.fx.mutant(crate::sim::world::Mutant::SayFaceGapUntold);
+        #[cfg(not(test))]
+        let runs_past = false;
+        if source == Source::Say && !runs_past {
+            // NO FOLLOWER IS RUN PAST WHAT RETENTION GAVE UP (item F4). The face's tail was
+            // told `g` went before it read it, which the broadcast filter's notice counts over
+            // every topic, so the face delivers nothing below `g.to`: its drain position moves
+            // there, and every cursor below it is caught up from where it stands, one topic at
+            // a time ([`Bridge::catch_up_topic_page`]), whose told read hands the follower
+            // what retention still holds of its topic and tells it what went (`link gap …
+            // sid= topic=`). Read on at the face, the cursors at its frontier went past the
+            // range with its next record, and nobody was told.
+            stderr_line!(
+                "aterm-link: the broker's retention gave up {lost} below the say subscription; \
+                 each topic it ran past is caught up on its own"
+            );
+            self.say_drained_to = self.say_drained_to.max(g.to);
+            self.say_bus_head = self.say_bus_head.max(g.to);
+            self.replay_topics(false);
+            return;
+        }
         if source != Source::Inbox {
             stderr_line!(
                 "aterm-link: the broker's retention gave up {lost} below the {} subscription; \
@@ -2574,12 +3418,69 @@ impl Bridge {
             "aterm-link: the broker's retention gave up {lost} of this node's unread mail \
              before this bridge read it; every session this node serves is told"
         );
+        #[cfg(test)]
+        if self.fx.mutant(crate::sim::world::Mutant::CommitPastTheGap) {
+            // As if the whole range were gone: the held records in it are not.
+            self.owe_inbox_commit(g.to.saturating_sub(1));
+        }
+        #[cfg(test)]
+        if self.fx.mutant(crate::sim::world::Mutant::TellNoGap) {
+            return;
+        }
         let mut line = format!("link gap from={} to={}", g.from, g.to);
         if let Some(n) = g.records {
             line.push_str(&format!(" records={n}"));
         }
         match self.ctl_request(&line) {
             Ok(reply) if reply.ok() => {}
+            Ok(reply) => stderr_line!(
+                "aterm-link: aterm did not take `{line}`: {}",
+                reply.header()
+            ),
+            Err(e) => stderr_line!("aterm-link: `{line}` failed: {e}"),
+        }
+    }
+
+    /// WHAT THE BRIDGE'S OWN READ FOUND GIVEN UP on one session's lane (B12): its refill from
+    /// the session's `seen` watermark, its deadline sweep, or (`topic`) its replay of a
+    /// broadcast topic to it met retention below where it read: a `Fetch` refused below a floor
+    /// (`retained-from=`), so the lane's records at `from..to`, if any, were given up before
+    /// the session handled them; or, read told ([`Bridge::lane_page`]), a page's gap notice,
+    /// so the records of `from..to` the page did not deliver were, `records` of them where the
+    /// broker counted. The subjects are known here, unlike an inbox gap notice's
+    /// ([`Self::on_gap`]): aterm is told for that session alone (`link gap from=<a> to=<b>
+    /// [records=<n>] sid=<sid> [topic=<t>]`), and it judges whether its ring still holds mail
+    /// of the range. Told once per (session, scope, `to`), a higher `to` telling again; a
+    /// refusal carries no count, so none is said for one.
+    fn tell_given_up(&mut self, sid: &str, topic: Option<&str>, gone: astream_broker::Gap) {
+        let astream_broker::Gap { from, to, records } = gone;
+        if from >= to || records == Some(0) {
+            return;
+        }
+        let key = (sid.to_string(), topic.unwrap_or_default().to_string());
+        if self
+            .per_sid
+            .given_up_told
+            .get(&key)
+            .is_some_and(|told| *told >= to)
+        {
+            return;
+        }
+        if self.attachment != Attachment::Inherited || self.endpoint_lane < LINK_GAP_SCOPED_LANE {
+            return;
+        }
+        let mut line = format!("link gap from={from} to={to}");
+        if let Some(n) = records {
+            line.push_str(&format!(" records={n}"));
+        }
+        line.push_str(&format!(" sid={sid}"));
+        if let Some(t) = topic {
+            line.push_str(&format!(" topic={t}"));
+        }
+        match self.ctl_request(&line) {
+            Ok(reply) if reply.ok() => {
+                self.per_sid.given_up_told.insert(key, to);
+            }
             Ok(reply) => stderr_line!(
                 "aterm-link: aterm did not take `{line}`: {}",
                 reply.header()
@@ -2606,7 +3507,90 @@ impl Bridge {
         }
     }
 
+    /// A ROUND WITH NO INBOX RECORD QUEUED HOLDS THE INBOX COMMIT for the loop's next write
+    /// to carry (critic item B08), instead of sending it alone: the reply a session posts
+    /// the moment a delivery woke it is that write, whether it is queued already or comes
+    /// while the loop parks, and the commit for the delivery it answers goes out in the
+    /// same burst ([`Bridge::take_held_commit`]), so the broker takes both into one batch
+    /// behind one flush where it took two. Whether it is held: only while a commit sent now
+    /// would name something ([`Bridge::inbox_commit_due`]) or a record rides an owed ack, on
+    /// a link that can send it, and only until [`IDLE_ACK_GRACE`] has passed since a round
+    /// first held it; otherwise the caller sends it now ([`Bridge::flush_inbox_commit`]),
+    /// which sends nothing when no commit is due. So a commit a record owed to a session
+    /// stops is never held, and the loop parks its full wait as it did before B08 rather
+    /// than wake every grace to send nothing.
+    ///
+    /// What bounds it: the loop parks no longer than the grace left while it is held, and
+    /// sends it once it has waited that out with nothing taken ([`Bridge::park_and_take`]).
+    /// Only aterm's push lane brings the reply it waits for, so an item off the bus sends it
+    /// before it is handled ([`Bridge::take_one`]); an endpoint line keeps it while it is
+    /// handled, so one that publishes nothing keeps it for as long as it runs, and the next
+    /// settle sends it once the grace is out. A held commit is the owed `inbox_pending`
+    /// itself, so whatever lands the inbox commit (a cursor read, a subscription replaced,
+    /// the wind-down) lands it too.
+    fn hold_inbox_commit(&mut self) -> bool {
+        let owed =
+            self.inbox_commit_due().is_some() || self.conn.as_ref().is_some_and(Link::riding);
+        if !owed || self.conn.is_none() || self.attachment == Attachment::Observer {
+            self.commit_held = None;
+            return false;
+        }
+        let now = self.fx.now();
+        let since = *self.commit_held.get_or_insert(now);
+        if now.saturating_duration_since(since) >= IDLE_ACK_GRACE {
+            self.commit_held = None;
+            return false;
+        }
+        true
+    }
+
+    /// The offset an inbox commit sent now would name: through what is owed, clamped as
+    /// every commit is ([`Bridge::commit_target`]: below the first record still owed to a
+    /// session or left unaccounted). `None` when none is due: no link that may commit,
+    /// nothing owed past the committed cursor, a record owed to a session just past it, or
+    /// an owed commit already covering it. Records still riding an owed ack are not counted:
+    /// what they owe is committed by a later commit.
+    fn inbox_commit_due(&self) -> Option<u64> {
+        if self.conn.is_none() || self.attachment == Attachment::Observer {
+            return None;
+        }
+        let upto = self.inbox_pending?;
+        if upto < self.committed || (upto == self.committed && upto != 0) {
+            return None;
+        }
+        #[cfg(test)]
+        let past_the_floor = self
+            .fx
+            .mutant(crate::sim::world::Mutant::HeldCommitPastTheFloor);
+        #[cfg(not(test))]
+        let past_the_floor = false;
+        let off = if past_the_floor {
+            upto
+        } else {
+            self.commit_target(upto)?
+        };
+        if self
+            .conn
+            .as_ref()
+            .is_some_and(|link| link.owed().any(|then| then.commits_through(off)))
+        {
+            return None;
+        }
+        Some(off)
+    }
+
+    /// The held inbox commit ([`Bridge::hold_inbox_commit`]), taken for the publish about to
+    /// go out to carry: what [`Bridge::inbox_commit_due`] names, or `None` when none is held
+    /// or none is due.
+    fn take_held_commit(&mut self) -> Option<u64> {
+        self.commit_held.take()?;
+        let off = self.inbox_commit_due()?;
+        self.inbox_pending_records = 0;
+        Some(off)
+    }
+
     fn flush_inbox_commit(&mut self) {
+        self.commit_held = None;
         self.inbox_pending_records = 0;
         let waiting = self.fx.now();
         while self.conn.as_ref().is_some_and(Link::riding) && self.settle_one(waiting) {}
@@ -2628,6 +3612,15 @@ impl Bridge {
     }
 
     fn wind_down(&mut self) {
+        #[cfg(test)]
+        if self.commit_held.is_some()
+            && self
+                .fx
+                .mutant(crate::sim::world::Mutant::DropHeldCommitAtWindDown)
+        {
+            self.commit_held = None;
+            self.inbox_pending = None;
+        }
         if self.conn.is_some() {
             self.land_inbox_commit();
             self.settle_acks();
@@ -2941,15 +3934,42 @@ impl Bridge {
             return self.refuse_locally(&addr, &body, off, "via");
         }
         let (kind, demoted, stray) = self.classify_delivery(&addr, &body);
-        let late = body
+        let answers = body
             .re
-            .filter(|_| !stray && ANSWER_KINDS.contains(&kind.as_str()))
-            .is_some_and(|re| {
-                self.settle_deadline_for(&addr.sid, re);
-                self.expired
-                    .get(&re)
-                    .is_some_and(|asker| *asker == addr.sid)
-            });
+            .filter(|_| !stray && ANSWER_KINDS.contains(&kind.as_str()));
+        let expiry = body
+            .re
+            .filter(|_| kind == "expired" && addr.src == self.node);
+        // AN ANSWER, OR THIS NODE'S `expired`, IS DELIVERED ONLY ONCE THE DEADLINE IT SETTLES IS
+        // OFF THE DISK (item F4), as an own record waits for its in-flight entry: a bridge that
+        // dies between the two leaves the next one a deadline that a sweep expires once
+        // retention gave the read record up, an `expired` after the answer or the `expired` the
+        // asker holds.
+        let settled = answers
+            .or(expiry)
+            .is_none_or(|re| self.settle_deadline_for(&addr.sid, re));
+        #[cfg(test)]
+        let settled = settled
+            || self
+                .fx
+                .mutant(crate::sim::world::Mutant::DeliverOverAnUnwrittenSettle);
+        if !settled {
+            if self.link.down_wants_report("error") {
+                stderr_line!(
+                    "aterm-link: @{off} is not delivered while the deadline it settles stands in \
+                     the deadline table (the state dir refused a write); reconnecting to offer it \
+                     again"
+                );
+            }
+            self.link_down("error");
+            self.conn = None;
+            return Delivery::Accounted;
+        }
+        let late = answers.is_some_and(|re| {
+            self.expired
+                .get(&re)
+                .is_some_and(|asker| *asker == addr.sid)
+        });
         self.deliver_line(&DeliverLine {
             addr: &addr,
             body: &body,
@@ -3302,6 +4322,7 @@ impl Bridge {
         let pinned = self.state.receipt_pin(&r.sid, r.rid)?;
         #[cfg(test)]
         let pinned = pinned.filter(|_| !self.fx.mutant(crate::sim::world::Mutant::FreshReceiptSeq));
+        let retry = pinned.is_some();
         let pin = match pinned {
             Some(pin) => pin,
             None => {
@@ -3312,11 +4333,21 @@ impl Bridge {
                     original: None,
                     original_off: None,
                     owner: None,
+                    at: Some(self.bus_high),
                 };
                 self.state.set_receipt_pin(&r.sid, r.rid, &pin)?;
                 pin
             }
         };
+        // A retry at a pin an earlier attempt took, read back first: past a cut astream's
+        // dedup no longer answers the pin with the record that attempt landed.
+        if retry {
+            if let Some(off) = self.landed_at_its_pin(&pin, &subject, &encoded)? {
+                self.claim(off, pin.seq);
+                self.retire_receipt(r, Some(off));
+                return Ok(());
+            }
+        }
         let published = match self.staged_refusal(&r.sid) {
             Some(refused) => Err(refused),
             None => self.publish_journaled(&pin, &subject, &encoded),
@@ -3356,6 +4387,9 @@ impl Bridge {
             }
             answer => answer?,
         };
+        if retry {
+            self.claim(at, pin.seq);
+        }
         if !deduped {
             self.publish_ev_for(
                 Some(&r.sid),
@@ -3449,22 +4483,23 @@ impl Bridge {
             return Err("observer".into());
         }
         let filter = format!("/f/{}/in/{}/{sid}/>", self.cfg.fleet, self.node);
-        let fx = self.fx.clone();
-        let Some(conn) = self.conn_now() else {
-            return Err("unreadable".into());
+        // The session's mail is one subject per sender and kind, each with its own floor, so
+        // the filter's oldest is the greatest of them and the record at `off` can lie below
+        // it, held: a read refused there is read again told before it is answered `retained`
+        // ([`Bridge::read_at`]). On a broker that does not tell fetches the refusal is answered
+        // `retained` with the oldest it named, the record perhaps still held below it, as
+        // before told fetches. A told read that could not be made is no answer about the
+        // record: `unreadable`, the link kept, since a read-only fetch has no fate to keep
+        // unknown.
+        let rows = match self.read_at(off, &filter) {
+            Ok(ReadAt::Rows(rows)) => rows,
+            Ok(ReadAt::Cut(floor) | ReadAt::Untold(floor)) => {
+                return Err(Unfetched::Retained(floor));
+            }
+            Ok(ReadAt::Unasked(_)) | Err(_) => return Err("unreadable".into()),
         };
-        let started = fx.now();
-        let page = conn.fetch(off, &filter, 1);
-        let floor = page
-            .as_ref()
-            .err()
-            .and_then(|e| transport::retained_past(e, off));
-        let answer = read_back_rows(page, off);
-        let rows = self
-            .observe(started, answer, Some("read"))
-            .map_err(|_| "unreadable")?;
         let Some((at, subj, raw)) = rows.into_iter().next() else {
-            return Err(floor.map_or(Unfetched::Why("no-record"), Unfetched::Retained));
+            return Err("no-record".into());
         };
         if at != off {
             return Err("no-record".into());
@@ -3610,6 +4645,7 @@ impl Bridge {
                 subject: face,
                 body: body.to_vec(),
                 log: self.conn.as_ref().and_then(|conn| conn.seen_log_identity()),
+                at: Some(self.bus_high),
             })?;
         }
         let published = match answers {
@@ -3737,8 +4773,45 @@ impl Bridge {
                     }
                 }
             }
+            #[cfg(test)]
+            let read_back = !self
+                .fx
+                .mutant(crate::sim::world::Mutant::ReplayWithoutReadingBack);
+            #[cfg(not(test))]
+            let read_back = true;
+            // An older build's entry names no head, and one journaled on another log is bound by
+            // nothing here: each published again as before.
+            if let Some(from) = self
+                .read_back_from(entry.log, entry.at)
+                .filter(|_| read_back)
+            {
+                match self.landed_since(&entry.subject, &entry.body, from, seq) {
+                    Ok(Some(off)) => {
+                        stderr_line!(
+                            "aterm-link: the in-flight record at sequence {seq} is on the bus \
+                             at @{off}, read back; it is not published again"
+                        );
+                        self.claim(off, seq);
+                        let ours = self.on_own_lane(&entry.subject);
+                        self.land_replayed(seq, off, ours);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        stderr_line!(
+                            "aterm-link: the in-flight record at sequence {seq} could not be \
+                             read back: {e}"
+                        );
+                        return false;
+                    }
+                }
+            }
             match self.publish_claimed(&entry.pin, &entry.subject, &entry.body) {
                 Ok((off, _, actual)) => {
+                    // A keyed pin may land as its key's winner, another identity.
+                    if !entry.pin.via_key {
+                        self.claim(off, seq);
+                    }
                     let ours = actual
                         .as_ref()
                         .is_none_or(|identity| self.on_own_lane(&identity.subject));
@@ -3765,6 +4838,212 @@ impl Bridge {
         true
     }
 
+    /// WHERE A READ BACK OF A RECORD JOURNALED AT HEAD `at` ON LOG `log` STARTS, on the log the
+    /// link reads: `at` on that very log; on one that continues it (a move whose lineage keeps a
+    /// prefix, `LogIdentity::continues`), the lower of `at` and where it continues, since past
+    /// that the offsets name records published since the move, a copy an earlier replay
+    /// published among them, which the entry's head on its own log may lie above (aterm-link
+    /// B05 review: a replay at a head above the new log's put the copy below it, and the next
+    /// replay, missing it, published a second); `None` on another log, or for no head.
+    fn read_back_from(
+        &self,
+        log: Option<astream_broker::LogIdentity>,
+        at: Option<u64>,
+    ) -> Option<u64> {
+        let at = at?;
+        let conn = self.conn.as_ref()?;
+        let (was, now) = (log?, conn.seen_log_identity()?);
+        if was == now {
+            return Some(at);
+        }
+        let fork = now.continues(was, conn.log_lineage()?)?;
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReadBackFromTheJournaledHead)
+        {
+            return Some(at);
+        }
+        Some(at.min(fork))
+    }
+
+    /// `off` holds `seq`'s record: a copy the replay or a retry published there, or read back
+    /// there and settled ([`Bridge::claims`]).
+    fn claim(&mut self, off: u64, seq: u64) {
+        let Some(log) = self.conn.as_ref().and_then(|conn| conn.seen_log_identity()) else {
+            return;
+        };
+        let claims = match &mut self.claims {
+            Some((on, claims)) if *on == log => claims,
+            slot => &mut slot.insert((log, BTreeMap::new())).1,
+        };
+        claims.insert(off, seq);
+        while claims.len() > CLAIMS_KEEP {
+            claims.pop_first();
+        }
+    }
+
+    /// The claims of the log the link reads ([`Bridge::claims`]).
+    fn claims_now(&self) -> Option<&BTreeMap<u64, u64>> {
+        let log = self.conn.as_ref()?.seen_log_identity()?;
+        self.claims
+            .as_ref()
+            .filter(|(on, _)| *on == log)
+            .map(|(_, claims)| claims)
+    }
+
+    /// WHERE A RECORD AN EARLIER ATTEMPT PUBLISHED LANDED, read back before it is published
+    /// again: the offset of a record of `subject` with `body`'s publication identity (its
+    /// body but its `t=`, which a retry encodes anew) at or above `from`, the records retention
+    /// carried below the base included, and not one this bridge knows holds another sequence's
+    /// record ([`Bridge::claims`]), or `None` for none. `from` is the head the bridge knew when
+    /// it made the pin or journaled the entry of sequence `seq` (`PublishPin::at`,
+    /// `InFlight::at`), brought down to where a moved log continues it
+    /// ([`Bridge::read_back_from`]). Below it lies only what landed before the attempt: a
+    /// sender's earlier post of the same words (its posts go one at a time) is never taken for
+    /// this one there. Above it, that earlier post's copy can lie only where the attach's replay
+    /// published it again (an entry the disk refused to clear, whose copy retention gave up):
+    /// a claim of the replay's, skipped here. A copy of it a replay published in an earlier
+    /// process, whose entry is since cleared, is not known: there, before a cut drops its key,
+    /// the later post is published again at its own pin (the replay settles its own entries
+    /// before it clears any, so that later post's own copy is on the bus by then, unless it
+    /// was only reserved and never journaled in flight, and the process stopped in between).
+    ///
+    /// astream's dedup reaches only the records at or above the base its retention leaves: a
+    /// cut drops the keys below it, a carried record's too. So a republish at the entry's
+    /// pinned sequence would append a record a cut passed again; one read back here is
+    /// settled where it is. A record on this node's own lane whose entry stands is never
+    /// delivered, so never read: one retention gave up went unread, by its age or its
+    /// class's bytes, and the republish after a `None` is the one copy a reader is handed.
+    ///
+    /// A read that went on at the floor is read again from where it was refused, TOLD what
+    /// retention gave up ([`transport::fetch_told_kept`], on a connection of its own:
+    /// [`Bridge::told_reader`]): a subject's oldest can lie above a record of it retention
+    /// still holds and the inbox's tail still delivers (astream's `retention::oldest`: where
+    /// its class became whole after a rules change, and the floors folded past their bound;
+    /// the sim's found seed 31508 met a newer record of it given up before an older one, by a
+    /// carried cut planned at no stamp's time, which astream no longer does); a read on at the
+    /// floor misses that record, and the republish would be a second copy (sim item B05).
+    /// Against a broker that does not tell fetches the told read goes on at the floor too.
+    fn landed_since(
+        &mut self,
+        subject: &str,
+        body: &[u8],
+        from: u64,
+        seq: u64,
+    ) -> io::Result<Option<u64>> {
+        let want = publication_identity(subject, body);
+        #[cfg(test)]
+        let tells = !self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReadBackWithoutTheHeld);
+        #[cfg(not(test))]
+        let tells = true;
+        #[cfg(test)]
+        let past_claims = self.read_back_past_claims;
+        #[cfg(not(test))]
+        let past_claims = false;
+        let others: BTreeSet<u64> = self
+            .claims_now()
+            .filter(|_| !past_claims)
+            .map(|claims| {
+                claims
+                    .range(from..)
+                    .filter(|&(_, &by)| by != seq)
+                    .map(|(&off, _)| off)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut told: Option<(Conn, BusCloser)> = None;
+        let mut cursor = from;
+        loop {
+            let started = self.fx.now();
+            let answer = match told.as_mut() {
+                Some((reader, _)) => transport::fetch_told_kept(reader, cursor, subject, 256),
+                None => match self.conn_now() {
+                    Some(conn) => transport::fetch_kept(conn, cursor, subject, 256),
+                    None => return Err(broker_unreachable()),
+                },
+            };
+            let ((rows, (next, head)), floor) = self.observe(started, answer, Some("read"))?;
+            // Below the subject's oldest: read again from the same cursor, told.
+            if floor.is_some() && told.is_none() && tells {
+                told = Some(self.told_reader()?);
+                continue;
+            }
+            if let Some((off, _, _)) = rows.iter().find(|(off, face, bytes)| {
+                face == subject
+                    && !others.contains(off)
+                    && publication_identity(face, bytes) == want
+            }) {
+                return Ok(Some(*off));
+            }
+            if next >= head || next <= cursor {
+                return Ok(None);
+            }
+            cursor = next;
+        }
+    }
+
+    /// WHERE A RETRY AT A PIN AN EARLIER ATTEMPT TOOK LANDED, before it is published again: where
+    /// this bridge knows its sequence's record is ([`Bridge::claims`]: the attach's replay
+    /// settled its entry there, or an earlier retry published it), or else read back
+    /// ([`Bridge::landed_since`]) from the head the pin was made at (`PublishPin::at`, which a
+    /// move brings down to where the new log continues the old, or takes out:
+    /// `StateDir::publication_offset_resets`), or, for a pin whose file holds no head (a
+    /// receipt's), from that of its record in flight while it stands. `None` for none; for a
+    /// pin that names no head and has no record in flight on this log, which is published again
+    /// as before; and for a keyed pin, whose winner may be another identity on another face
+    /// (`publish_reserved` reconciles it).
+    fn landed_at_its_pin(
+        &mut self,
+        pin: &PublishPin,
+        subject: &str,
+        body: &[u8],
+    ) -> io::Result<Option<u64>> {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::RetryWithoutReadingBack)
+        {
+            return Ok(None);
+        }
+        if pin.via_key {
+            return Ok(None);
+        }
+        let known = self.claims_now().and_then(|claims| {
+            claims
+                .iter()
+                .find(|&(_, &seq)| seq == pin.seq)
+                .map(|(&off, _)| off)
+        });
+        if known.is_some() {
+            return Ok(known);
+        }
+        let from = match pin.at {
+            Some(at) => Some(at),
+            None => self
+                .state
+                .in_flight()
+                .ok()
+                .and_then(|entries| {
+                    entries
+                        .into_iter()
+                        .find_map(|(seq, entry)| (seq == pin.seq).then_some(entry))
+                })
+                .and_then(|entry| self.read_back_from(entry.log, entry.at)),
+        };
+        let Some(from) = from else {
+            return Ok(None);
+        };
+        let face = pin
+            .identity
+            .as_ref()
+            .map_or(subject, |identity| identity.subject.as_str())
+            .to_string();
+        self.landed_since(&face, body, from, pin.seq)
+    }
+
     fn arm_deadline_sweep(&mut self, replace: bool, retry_overdue: bool) {
         let now = self.fx.now();
         let earliest = self.deadlines.values().map(|d| d.at).min();
@@ -3783,26 +5062,61 @@ impl Bridge {
         }
     }
 
-    fn note_deadline(&mut self, sid: &str, off: u64, dl: u64, to: Option<String>) {
-        if self.deadlines.contains_key(&off) {
-            return;
-        }
-        let was_empty = self.deadlines.is_empty();
-        self.deadlines.insert(
-            off,
-            Deadline {
+    /// Note the deadline of the ask at `off`, and say whether the table that holds it is on
+    /// disk. A post whose deadline is not stays queued ([`Bridge::post_landed`]): a bridge that
+    /// dies before the table is written leaves the next one no deadline to sweep, and the ask
+    /// never expires (item F4: the sim's world found a refused write of the table lose one
+    /// across a kill). The retry lands at its pin and notes it again, which writes the table
+    /// a refused write left behind.
+    ///
+    /// NOTED ONCE (F4 review): a deadline the held post's first landing noted is not noted
+    /// afresh by its retry. While the post was held its ask may have been settled, its answer
+    /// delivered or the sweep's `expired` published, which took the deadline out of the table;
+    /// armed again at `now + dl`, it would expire an ask whose answer, or whose `expired`, the
+    /// asker holds once retention gave that record up.
+    fn note_deadline(&mut self, sid: &str, off: u64, dl: u64, to: Option<String>) -> bool {
+        let held = self.deadlines_held.remove(&off);
+        if !held && !self.deadlines.contains_key(&off) {
+            let was_empty = self.deadlines.is_empty();
+            self.deadlines.insert(
                 off,
-                sid: sid.to_string(),
-                at: self.fx.wall_ms().saturating_add(dl),
-                dl,
-                to,
-            },
-        );
-        while self.deadlines.len() > DEADLINES_KEEP {
-            self.deadlines.pop_first();
+                Deadline {
+                    off,
+                    sid: sid.to_string(),
+                    at: self.fx.wall_ms().saturating_add(dl),
+                    dl,
+                    to,
+                },
+            );
+            self.deadlines_unwritten.insert(off, sid.to_string());
+            while self.deadlines.len() > DEADLINES_KEEP {
+                if let Some((trimmed, d)) = self.deadlines.pop_first() {
+                    self.deadlines_unwritten.insert(trimmed, d.sid);
+                }
+            }
+            self.arm_deadline_sweep(was_empty, false);
         }
-        self.arm_deadline_sweep(was_empty, false);
-        self.persist_deadlines();
+        let on_disk = self.deadline_on_disk(off);
+        if !on_disk {
+            self.deadlines_held.insert(off);
+            while self.deadlines_held.len() > DEADLINES_KEEP {
+                self.deadlines_held.pop_first();
+            }
+        }
+        on_disk
+    }
+
+    /// Whether the table on disk holds what `deadlines` does at `off`: no change there is
+    /// unwritten, or a write of the table takes now.
+    fn deadline_on_disk(&mut self, off: u64) -> bool {
+        !self.deadlines_unwritten.contains_key(&off) || self.persist_deadlines()
+    }
+
+    /// Take the deadline at `off` out of the table, its removal unwritten until a write takes.
+    fn drop_deadline(&mut self, off: u64) {
+        if let Some(d) = self.deadlines.remove(&off) {
+            self.deadlines_unwritten.insert(off, d.sid);
+        }
     }
 
     fn note_asked(&mut self, off: u64, to: &str) {
@@ -3842,17 +5156,37 @@ impl Bridge {
         {}
     }
 
-    fn settle_deadline_for(&mut self, sid: &str, off: u64) {
+    /// An answer of `sid`'s ask at `off` settles its deadline; and whether the deadline table
+    /// on disk agrees: no deadline of `sid`'s at `off` stands there, written now or before.
+    /// Only that one waits for the disk (F4 review): a record that settles no deadline of
+    /// `sid`'s, or one whose removal is written, is delivered whatever else a refused write left
+    /// unwritten, as before item F4; one whose removal a refused write left unwritten (this
+    /// one, tried before, or the sweep's after its `expired`) waits until a write takes.
+    fn settle_deadline_for(&mut self, sid: &str, off: u64) -> bool {
         if self.deadlines.get(&off).is_some_and(|d| d.sid == sid) {
-            self.deadlines.remove(&off);
-            self.persist_deadlines();
+            self.drop_deadline(off);
         }
+        let unwritten = !self.deadlines.contains_key(&off)
+            && self
+                .deadlines_unwritten
+                .get(&off)
+                .is_some_and(|asker| asker == sid);
+        !unwritten || self.persist_deadlines()
     }
 
-    fn persist_deadlines(&mut self) {
+    /// Write the deadline table, and say whether it is on disk now; a refusal leaves
+    /// [`Bridge::deadlines_unwritten`] for the next write to take.
+    fn persist_deadlines(&mut self) -> bool {
         let list: Vec<Deadline> = self.deadlines.values().cloned().collect();
-        if let Err(e) = self.state.set_deadlines(&list) {
-            stderr_line!("aterm-link: could not persist the deadline table: {e}");
+        match self.state.set_deadlines(&list) {
+            Ok(()) => {
+                self.deadlines_unwritten.clear();
+                true
+            }
+            Err(e) => {
+                stderr_line!("aterm-link: could not persist the deadline table: {e}");
+                false
+            }
         }
     }
 
@@ -3883,7 +5217,7 @@ impl Bridge {
         for d in due {
             // A session that is gone gets no verdict: nobody drains its lane.
             if !self.per_sid.epochs.contains_key(&d.sid) {
-                self.deadlines.remove(&d.off);
+                self.drop_deadline(d.off);
                 changed = true;
                 continue;
             }
@@ -3896,7 +5230,7 @@ impl Bridge {
                     if kind == "expired" {
                         self.remember_expired(d.off, &d.sid);
                     }
-                    self.deadlines.remove(&d.off);
+                    self.drop_deadline(d.off);
                     changed = true;
                 }
                 Ok(None) => {
@@ -3912,7 +5246,7 @@ impl Bridge {
                                 Some(&d.sid),
                                 &format!("expired re={} off={at} dl={}", d.off, d.dl),
                             );
-                            self.deadlines.remove(&d.off);
+                            self.drop_deadline(d.off);
                             changed = true;
                         }
                         Err(e) => {
@@ -3929,23 +5263,61 @@ impl Bridge {
     }
 
     fn settled_on_bus(&mut self, sid: &str, off: u64) -> io::Result<Option<&'static str>> {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::SweepIgnoresAnswers)
+        {
+            return Ok(None);
+        }
         let filter = format!("/f/{}/in/{}/{sid}/>", self.cfg.fleet, self.node);
         let mut cursor = off.saturating_add(1);
+        // Read below the lane's oldest told what retention gave up ([`Bridge::lane_page`]): an
+        // answer it still holds there settles the deadline, never judged gone.
+        let mut told = None;
         loop {
-            let fx = self.fx.clone();
-            let Some(conn) = self.conn_now() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "the broker is unreachable",
-                ));
+            #[cfg(test)]
+            let page = if self
+                .fx
+                .mutant(crate::sim::world::Mutant::SweepWithAPlainFetch)
+            {
+                let fx = self.fx.clone();
+                let Some(conn) = self.conn_now() else {
+                    return Err(broker_unreachable());
+                };
+                let started = fx.now();
+                let answer = conn
+                    .fetch(cursor, &filter, 256)
+                    .map(|page| (page, None, None));
+                self.observe(started, answer, Some("read"))?
+            } else {
+                self.lane_page(&mut told, cursor, &filter, 256)?
             };
-            let started = fx.now();
-            let answer = transport::fetch_kept(conn, cursor, &filter, 256);
-            let ((rows, (next, head)), floor) = self.observe(started, answer, Some("read"))?;
-            if let Some(floor) = floor {
+            #[cfg(not(test))]
+            let page = self.lane_page(&mut told, cursor, &filter, 256)?;
+            let ((rows, (next, head)), gone, _) = page;
+            if let Some(gone) = gone {
                 stderr_line!(
                     "aterm-link: the deadline of @{off} on {sid}'s lane: the broker's retention \
-                     gave up its records below @{floor}; judged on what it keeps"
+                     gave up {} of it; judged on what it keeps",
+                    transport::gap_lost(&gone)
+                );
+                // What the session handled is not news: the range it is told starts past its
+                // `seen` watermark, where the answer it never handled would have been, and a
+                // count over a range cut short counts what it no longer names.
+                let from = self
+                    .state
+                    .seen_off(sid)
+                    .map_or(gone.from, |seen| gone.from.max(seen.saturating_add(1)));
+                let records = gone.records.filter(|_| from == gone.from);
+                self.tell_given_up(
+                    sid,
+                    None,
+                    astream_broker::Gap {
+                        from,
+                        to: gone.to,
+                        records,
+                    },
                 );
             }
             for (_, subj, raw) in rows {
@@ -3956,6 +5328,14 @@ impl Bridge {
                     .find(|k| **k == kind)
                     .copied();
                 let src = subj.split('/').nth(6).unwrap_or("");
+                #[cfg(test)]
+                if kind == "expired"
+                    && self
+                        .fx
+                        .mutant(crate::sim::world::Mutant::ExpireWithoutReadingBack)
+                {
+                    continue;
+                }
                 let from_right = if kind == "expired" {
                     src == self.node
                 } else {
@@ -3997,10 +5377,7 @@ impl Bridge {
 
     fn land_replayed(&mut self, seq: u64, off: u64, ours: bool) {
         #[cfg(test)]
-        let at_once = self.deliver_replay_at_once
-            || self
-                .fx
-                .mutant(crate::sim::world::Mutant::DeliverBeforeTheDrain);
+        let at_once = self.deliver_replay_at_once;
         #[cfg(not(test))]
         let at_once = false;
         if at_once || self.attachment == Attachment::Observer {
@@ -4591,18 +5968,21 @@ impl Bridge {
     ) -> io::Result<(usize, usize)> {
         let keep_below = keep_below.map(|f| f.min(head));
         let kept = |off: u64| keep_below.is_some_and(|f| off < f);
-        let dropped = self
-            .state
-            .forget_log_offsets(head, log, keep_below, lineage)?;
         #[cfg(test)]
         let forget_pin = !self
             .fx
             .mutant(crate::sim::world::Mutant::KeepMirrorPinAcrossMove);
         #[cfg(not(test))]
         let forget_pin = true;
+        // A drop the disk refuses refuses the attach before the witness moves to the new log
+        // (`save_log_witness`), so the next attach meets the move again (`mirror_forget_log`);
+        // first, so that attach forgets nothing twice.
         if forget_pin {
-            self.mirror_forget_log();
+            self.mirror_forget_log()?;
         }
+        let dropped = self
+            .state
+            .forget_log_offsets(head, log, keep_below, lineage)?;
         for (seq, face) in &dropped {
             stderr_line!(
                 "aterm-link: the in-flight record at sequence {seq} on {face} was decided on \
@@ -4617,6 +5997,8 @@ impl Bridge {
         self.acked_entries = acked.entries;
         self.acked_appendable = acked.appendable;
         self.deadlines.retain(|off, _| kept(*off));
+        self.deadlines_unwritten.retain(|off, _| kept(*off));
+        self.deadlines_held.retain(|off| kept(*off));
         self.asked.retain(|off, _| kept(*off));
         self.expired.retain(|off, _| kept(*off));
         let open = before - self.deadlines.len();
@@ -4638,6 +6020,9 @@ impl Bridge {
         for off in self.per_sid.lane_owed.values_mut() {
             *off = off.filter(|o| kept(*o));
         }
+        self.per_sid
+            .given_up_told
+            .retain(|_, floor| keep_below.is_some_and(|f| *floor <= f));
         self.commit_floor = self.commit_floor.filter(|o| kept(*o));
         self.indexed_subjects.clear();
         self.seen_nodes.clear();
@@ -4781,6 +6166,9 @@ impl Bridge {
                 self.replay_topics(false);
             }
             Some("drop") => {
+                self.per_sid
+                    .given_up_told
+                    .remove(&(sid.to_string(), topic.to_string()));
                 let Some(by_topic) = self.per_sid.topics.get_mut(sid) else {
                     return;
                 };
@@ -4890,6 +6278,9 @@ impl Bridge {
             wanted.insert(topic, TopicCursor { next });
         }
         if wanted != have {
+            self.per_sid
+                .given_up_told
+                .retain(|(s, scope), _| s != sid || scope.is_empty() || wanted.contains_key(scope));
             if wanted.is_empty() {
                 self.per_sid.topics.remove(sid);
                 self.per_sid.unhandled.remove(sid);
@@ -4920,20 +6311,71 @@ impl Bridge {
         };
         let filter = subject::say_topic_filter(&self.cfg.fleet, &topic);
         let records = self.say_replay.page;
-        let fx = self.fx.clone();
-        let Some(conn) = self.conn_now() else {
+        // A topic is one subject per sender: under rules that hold its class, each has its own
+        // floor and retention can hold broadcasts below the topic's oldest, read told
+        // ([`Bridge::lane_page`]) rather than skipped and told as given up.
+        #[cfg(test)]
+        let page = if self
+            .fx
+            .mutant(crate::sim::world::Mutant::TopicReplayWithAPlainFetch)
+        {
+            let fx = self.fx.clone();
+            let Some(conn) = self.conn_now() else {
+                return false;
+            };
+            let started = fx.now();
+            let answer = conn
+                .fetch(from, &filter, records)
+                .map(|page| (page, None, None));
+            self.observe(started, answer, Some("read"))
+        } else {
+            self.lane_page(&mut None, from, &filter, records)
+        };
+        #[cfg(not(test))]
+        let page = self.lane_page(&mut None, from, &filter, records);
+        let Ok(((rows, (next, _)), gone, uncounted)) = page else {
             return false;
         };
-        let started = fx.now();
-        let page = transport::fetch_kept(conn, from, &filter, records);
-        let Ok(((rows, (next, _)), floor)) = self.observe(started, page, Some("read")) else {
-            return false;
+        // AN UNCOUNTED NOTICE AHEAD OF THE PAGE, CUT AT THE FIRST BROADCAST IT DELIVERS (item
+        // F4): the told page delivers what retention holds of the topic from `from` in offset
+        // order, so below its first record (or below where it read, with none) the broker holds
+        // nothing of the topic, and what of it lay there went. That much is told, never the
+        // range of a broadcast the page delivers (aterm marks no topic range its ring holds a
+        // broadcast of), and no face tells it otherwise: the broadcast face's own notice only
+        // hands its cursors here ([`Bridge::on_gap`]).
+        #[cfg(test)]
+        let uncounted = uncounted.filter(|_| {
+            !self
+                .fx
+                .mutant(crate::sim::world::Mutant::TopicReplayDropsAnUncountedNotice)
+        });
+        let below_first = uncounted.and_then(|n| {
+            let to = rows.first().map_or(next, |(off, _, _)| *off).min(n.to);
+            (n.from < to).then_some(astream_broker::Gap {
+                from: n.from,
+                to,
+                records: None,
+            })
+        });
+        let gone = match (gone, below_first) {
+            (Some(g), Some(b)) => Some(g.and(b)),
+            (g, b) => g.or(b),
         };
-        if let Some(floor) = floor {
+        if let Some(gone) = gone {
             stderr_line!(
-                "aterm-link: the broadcast topic {topic}: the broker's retention gave up its \
-                 records below @{floor} (from @{from}); replaying from there"
+                "aterm-link: the broadcast topic {topic}: the broker's retention gave up {} of \
+                 it; replaying past them",
+                transport::gap_lost(&gone)
             );
+            #[cfg(test)]
+            let tells = !self
+                .fx
+                .mutant(crate::sim::world::Mutant::TopicReplayTellsNoGap);
+            #[cfg(not(test))]
+            let tells = true;
+            if tells {
+                self.tell_given_up(sid, Some(&topic), gone);
+            }
         }
         for (off, subject, raw) in rows {
             // STRICTLY BELOW THE DRAIN POSITION. A record at or past it is
@@ -5814,7 +7256,7 @@ impl Bridge {
                     .filter(|_| !self.fx.mutant(crate::sim::world::Mutant::FreshSeqOnRetry));
                 if existing_pin.is_none() && keyed.is_none() && !self.budget_allows(&subject, opens)
                 {
-                    self.retire_at_the_door(&post, SUBJECT_BUDGET);
+                    self.retire_at_the_door(&post, DeadReason::SubjectBudget);
                     return true;
                 }
                 let fresh = existing_pin.is_none() && post.key.is_none();
@@ -5852,6 +7294,7 @@ impl Bridge {
                             original: None,
                             original_off: None,
                             owner: Some(post.id),
+                            at: keyed.at,
                         },
                         Some(keyed) => PublishPin {
                             seq: keyed.seq,
@@ -5860,6 +7303,7 @@ impl Bridge {
                             original: keyed.identity,
                             original_off: keyed.original_off,
                             owner: keyed.owner,
+                            at: keyed.at,
                         },
                         None => {
                             let pin = PublishPin {
@@ -5869,6 +7313,7 @@ impl Bridge {
                                 original: None,
                                 original_off: None,
                                 owner: Some(post.id),
+                                at: Some(self.bus_high),
                             };
                             if let Some(key) = post.key.as_deref() {
                                 self.state.set_key_pin(&post.sid, key, &pin)?;
@@ -5894,12 +7339,41 @@ impl Bridge {
                 if fresh && staged.is_none() {
                     return self.send_post(post, pin, subject, encoded);
                 }
+                // A retry at a pin an earlier attempt took, read back first: past a cut
+                // astream's dedup no longer answers the pin with the record that attempt
+                // landed, which a reader can still be handed (carried below the base); the
+                // attach's replay may have landed it so (`Bridge::replay_in_flight`).
+                if staged.is_none() {
+                    match self.landed_at_its_pin(&pin, &subject, &encoded) {
+                        Ok(Some(off)) => {
+                            stderr_line!(
+                                "aterm-link: post {} of {} is on the bus at @{off}, read back; \
+                                 it is not published again",
+                                post.id,
+                                post.sid
+                            );
+                            self.claim(off, pin.seq);
+                            let identity = pin.identity.clone();
+                            let next =
+                                self.post_landed(&post, &subject, &pin, off, false, identity);
+                            return self.follow(&post.sid, next);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let next = self.post_refused(&post, &subject, pin.seq, e);
+                            return self.follow(&post.sid, next);
+                        }
+                    }
+                }
                 let published = match staged {
                     Some(refused) => Err(refused),
                     None => self.publish_journaled(&pin, &subject, &encoded),
                 };
                 let next = match published {
                     Ok((off, deduped, actual)) => {
+                        if !pin.via_key {
+                            self.claim(off, pin.seq);
+                        }
                         self.post_landed(&post, &subject, &pin, off, deduped, actual)
                     }
                     Err(e) => self.post_refused(&post, &subject, pin.seq, e),
@@ -5955,6 +7429,7 @@ impl Bridge {
                 subject: subject.clone(),
                 body: encoded.clone(),
                 log: self.conn.as_ref().and_then(|conn| conn.seen_log_identity()),
+                at: Some(self.bus_high),
             };
             if let Err(e) = self.state.set_in_flight(&entry) {
                 let next = self.post_refused(&post, &subject, pin.seq, e);
@@ -6083,7 +7558,19 @@ impl Bridge {
             .dl
             .filter(|_| appended && WAITING_KINDS.contains(&post.kind.as_str()))
         {
-            self.note_deadline(&post.sid, off, dl, to);
+            let noted = self.note_deadline(&post.sid, off, dl, to);
+            #[cfg(test)]
+            let noted = noted
+                || self
+                    .fx
+                    .mutant(crate::sim::world::Mutant::RetireOverAnUnwrittenDeadline);
+            if !noted {
+                stderr_line!(
+                    "aterm-link: post {}'s deadline could not persist, left queued",
+                    post.id
+                );
+                return PostNext::Holds;
+            }
         }
         let dup = if via_key && deduped && !appended {
             " dup=1"
@@ -6121,11 +7608,11 @@ impl Bridge {
             return PostNext::Ends;
         }
         if refused_for_good(&e) {
-            self.retire_at_the_door(post, "refused");
+            self.retire_at_the_door(post, DeadReason::Refused);
             PostNext::Moves
         } else if past_the_budget(&e) && self.writes_alone(subject) {
             self.indexed_subjects.remove(subject);
-            self.retire_at_the_door(post, SUBJECT_BUDGET);
+            self.retire_at_the_door(post, DeadReason::SubjectBudget);
             PostNext::Moves
         } else if self.conn.is_none() {
             PostNext::Ends
@@ -6134,7 +7621,8 @@ impl Bridge {
         }
     }
 
-    fn retire_at_the_door(&mut self, post: &QueuedPost, why: &str) {
+    fn retire_at_the_door(&mut self, post: &QueuedPost, why: DeadReason) {
+        let why = why.word();
         let retired = self.ctl_request(&format!(
             "outbox sent {} {} off=- reason={why}",
             post.sid, post.id
@@ -7425,6 +8913,11 @@ impl Bridge {
     /// At a stop, the post journal's records written as the files an older build reads
     /// ([`StateDir::hand_posts_to_files`]), for whichever bridge runs next. Whether they were.
     fn hand_posts_to_files(&self) -> bool {
+        #[cfg(test)]
+        self.state.hand_off_without_heads(
+            self.fx
+                .mutant(crate::sim::world::Mutant::HandOffWithoutTheHeads),
+        );
         match self.state.hand_posts_to_files() {
             Ok(0) => true,
             Ok(n) => {
@@ -7790,7 +9283,7 @@ impl Bridge {
     }
 
     fn settle_owed(&mut self) {
-        if !self.mailbox.inbox_queued() {
+        if !self.mailbox.inbox_queued() && !self.hold_inbox_commit() {
             self.flush_inbox_commit();
         }
         if self.mailbox.is_idle() {
@@ -7824,10 +9317,25 @@ impl Bridge {
     }
 
     fn park_and_take(&mut self, wait: Duration) -> bool {
-        let owed = self.conn.as_ref().is_some_and(|link| link.unacked() > 0);
-        let park = if owed { wait.min(IDLE_ACK_GRACE) } else { wait };
+        let acks_owed = self.conn.as_ref().is_some_and(|link| link.unacked() > 0);
+        let now = self.fx.now();
+        let held_left = self
+            .commit_held
+            .map(|since| IDLE_ACK_GRACE.saturating_sub(now.saturating_duration_since(since)));
+        let mut park = if acks_owed {
+            wait.min(IDLE_ACK_GRACE)
+        } else {
+            wait
+        };
+        if let Some(left) = held_left {
+            park = park.min(left);
+        }
+        let owed = acks_owed || held_left.is_some();
         let (go_on, took) = self.take_one(park);
         if go_on && !took && owed {
+            if self.commit_held.is_some() {
+                self.flush_inbox_commit();
+            }
             self.settle_acks();
             self.tally_idle();
         }
@@ -7844,6 +9352,9 @@ impl Bridge {
         if parked.is_some() {
             self.waits.note(crate::wait_tally::Row::Park, parked);
             self.taken_at = self.waits.starts();
+        }
+        if self.commit_held.is_some() && item.as_ref().is_some_and(off_the_bus) {
+            self.flush_inbox_commit();
         }
         let took = item.is_some();
         self.in_round = took;
@@ -7927,6 +9438,12 @@ impl Bridge {
         self.inbox_pending.map(|upto| (upto, self.bus_log))
     }
 
+    /// Whether this bridge holds its inbox commit for its next write
+    /// ([`Bridge::hold_inbox_commit`]).
+    pub(crate) fn holds_inbox_commit(&self) -> bool {
+        self.commit_held.is_some()
+    }
+
     /// Disables broker log-lineage verification on attach for negative-control testing.
     pub(crate) fn simulate_ignore_lineage(&mut self) {
         self.ignore_lineage = true;
@@ -7958,6 +9475,7 @@ fn plain_pin(seq: u64, subject: &str, body: &[u8]) -> PublishPin {
         original: None,
         original_off: None,
         owner: None,
+        at: None,
     }
 }
 
@@ -8124,6 +9642,45 @@ enum Delivery {
     Owed,
 }
 
+/// How the shared read of an attach's refill ended ([`Bridge::refill_node`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Together {
+    /// Every session's records to the head were offered (a session whose delivery was owed
+    /// stopped there).
+    Read,
+    /// The connection to aterm or the broker failed: the sessions stay owed their refill.
+    Failed,
+    /// Every record below this offset was offered, and each session not stopped reads on
+    /// alone from there: the node inbox's oldest rose above the read, or what the read carried
+    /// passed what it saved.
+    HandedOn(u64),
+}
+
+/// One session in the attach's shared refill read ([`Bridge::refill_together`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Refilling {
+    /// Where its records start being offered: past its watermark, at its lane's floor, or
+    /// where its own read below the node inbox's oldest got to.
+    from: u64,
+    /// It refills from a watermark, so a floor its read meets is told.
+    after_seen: bool,
+    /// aterm owes one of its records: it is offered nothing more, as its own refill stops
+    /// there.
+    stopped: bool,
+}
+
+/// How one session's refill of its own lane ended ([`Bridge::refill_lane`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// Its records to the head were offered, or it stopped at one aterm owes.
+    Done,
+    /// It read its lane up to its `until`: every record of the lane below this offset was
+    /// offered or given up (and told), and it reads on from here with the others.
+    To(u64),
+    /// The connection to aterm or the broker failed: the session stays owed its refill.
+    Failed,
+}
+
 struct DeliverLine<'a> {
     addr: &'a subject::InAddr,
     body: &'a Body,
@@ -8265,12 +9822,12 @@ pub enum Route {
 }
 
 impl Route {
-    /// Returns the `reason=` refusal token for [`Self::Unroutable`] or [`Self::Ambiguous`].
+    /// Returns the `reason=` refusal for [`Self::Unroutable`] or [`Self::Ambiguous`].
     #[must_use]
-    pub const fn reason(&self) -> &'static str {
+    pub const fn reason(&self) -> DeadReason {
         match self {
-            Route::Ambiguous => "ambiguous",
-            Route::To(_) | Route::Exact(_) | Route::Unroutable => "unroutable",
+            Route::Ambiguous => DeadReason::Ambiguous,
+            Route::To(_) | Route::Exact(_) | Route::Unroutable => DeadReason::Unroutable,
         }
     }
 }
@@ -8593,7 +10150,8 @@ pub fn parse_drain(frame: &[u8]) -> Drain {
     out
 }
 
-/// Spawns a background thread pumping a broker subscription into `mailbox` for generation `gen`.
+/// Spawns a background thread pumping a broker subscription into `mailbox` for generation `gen`,
+/// each read stamped by the live world's clock (`Fx::os`), the only world this reader runs in.
 pub(crate) fn spawn_reader(
     mut sub: astream_broker::AnySubscription,
     closer: Arc<BusCloser>,
@@ -8602,11 +10160,12 @@ pub(crate) fn spawn_reader(
     mailbox: Arc<Mailbox>,
 ) -> io::Result<()> {
     let generation = mailbox.broker_generation(source);
+    let clock = Fx::os();
     std::thread::Builder::new()
         .name(format!("aterm-link-{source:?}"))
         .spawn(move || loop {
             let read = next_took(&mut sub, &closer, deadline);
-            if !reader_took(read, &mailbox, source, generation, &closer) {
+            if !reader_took(read, &mailbox, source, generation, &closer, clock.now()) {
                 return;
             }
         })
@@ -8652,24 +10211,26 @@ pub(crate) fn next_took(
     }
 }
 
-/// Routes one subscription read result into `mailbox` under incarnation `gen`, returning `true` to continue.
+/// Routes one subscription read result into `mailbox` under incarnation `gen`, read at `at` (the
+/// reader's world's clock, [`Mailbox::push`]), returning `true` to continue.
 pub(crate) fn reader_took(
     read: io::Result<Option<Took>>,
     mailbox: &Mailbox,
     source: Source,
     generation: u64,
     closer: &BusCloser,
+    at: Instant,
 ) -> bool {
     match read {
         Ok(Some(Took::Gap(g))) => {
-            if mailbox.push_gap(source, g, generation) {
+            if mailbox.push_gap(source, g, generation, at) {
                 true
             } else {
                 closer.close();
                 false
             }
         }
-        Ok(Some(Took::Record(rec))) => match mailbox.push(source, rec, generation) {
+        Ok(Some(Took::Record(rec))) => match mailbox.push(source, rec, generation, at) {
             Pushed::Queued => true,
             Pushed::Paused | Pushed::Stale => {
                 closer.close();
@@ -8880,7 +10441,12 @@ mod tests {
         assert_eq!((state["got_a"], state["got_b"]), (4, 4));
 
         let mailbox = Mailbox::default();
-        let _ = mailbox.push(Source::Inbox, (1, "mail".to_string(), Vec::new()), 0);
+        let _ = mailbox.push(
+            Source::Inbox,
+            (1, "mail".to_string(), Vec::new()),
+            0,
+            Instant::now(),
+        );
         let mut queued = model.init_state();
         assert!(model.fire("Control", &mut queued));
         assert!(model.fire("QueuePriority", &mut queued));
@@ -8896,14 +10462,22 @@ mod tests {
             model.action_enabled("FetchB", &queued),
             "the roster yields after one page"
         );
-        assert!(matches!(mailbox.take(Duration::ZERO), Some(Item::Inbox(_))));
+        assert!(matches!(
+            mailbox.take(Duration::ZERO, Instant::now()),
+            Some(Item::Inbox(_))
+        ));
         assert!(model.fire("HandlePriority", &mut queued));
         assert_eq!(
             may_take_replay_page(&mailbox, false, 0),
             model.action_enabled("FetchB", &queued),
             "replay resumes once addressed mail was handled"
         );
-        let _ = mailbox.push(Source::Fleet, (2, "halt".to_string(), Vec::new()), 0);
+        let _ = mailbox.push(
+            Source::Fleet,
+            (2, "halt".to_string(), Vec::new()),
+            0,
+            Instant::now(),
+        );
         assert!(
             !may_take_replay_page(&mailbox, true, 0),
             "even the roster's one-page exception must yield to a halt"
@@ -9491,9 +11065,11 @@ mod tests {
                 watched,
                 presence,
                 lane_owed,
+                given_up_told,
             } = &mut maps;
             for sid in [LIVE, GONE] {
                 let sid = sid.to_string();
+                given_up_told.insert((sid.clone(), String::new()), 1);
                 epochs.insert(sid.clone(), "e".to_string());
                 pending_admit.insert(sid.clone());
                 topics.insert(sid.clone(), BTreeMap::new());
@@ -9518,8 +11094,13 @@ mod tests {
             watched,
             presence,
             lane_owed,
+            given_up_told,
         } = &maps;
-        let keys: [(&str, Vec<&String>); 10] = [
+        let keys: [(&str, Vec<&String>); 11] = [
+            (
+                "given_up_told",
+                given_up_told.keys().map(|(sid, _)| sid).collect(),
+            ),
             ("epochs", epochs.keys().collect()),
             ("pending_admit", pending_admit.iter().collect()),
             ("topics", topics.keys().collect()),
@@ -9622,6 +11203,147 @@ mod tests {
         let drain = parse_drain(ahead);
         assert_eq!((drain.posts.len(), drain.fetches.len()), (1, 1));
         assert!(!drain.more, "no `more` line, a whole listing");
+    }
+
+    /// Rules that keep every record of the lanes in one class and another lane's last value
+    /// only in a second (`first`), or one class for every lane, which reaches both and so is
+    /// whole only from the base (astream's `retention::carried_since`: a last-value class
+    /// carries none of its records): set after a cut under the first, the lanes' oldest lies
+    /// above the mail the cut carried.
+    fn lanes_whole_from_the_base(first: bool) -> astream_broker::Retention {
+        use crate::broker_rules::{EV_FILTER, MAIL_FILTER};
+        use astream_broker::{Retention, Rule};
+        let mut classes = vec![Rule::prefix(EV_FILTER).unwrap()];
+        if first {
+            classes.push(Rule::hold("/f/*/in/*/s-z/>").unwrap().last_only());
+        }
+        classes.push(Rule::hold(MAIL_FILTER).unwrap());
+        Retention::new(classes, Rule::default_keeping_all()).unwrap()
+    }
+
+    /// `lanes_whole_from_the_base` for the broadcast topics, rules no aterm build sets: every
+    /// topic's broadcasts in one class, and (`first`) another sender's last value only in a
+    /// second, so set after a cut under the first, a topic's oldest lies above the broadcasts
+    /// the cut carried.
+    fn topics_whole_from_the_base(first: bool) -> astream_broker::Retention {
+        use crate::broker_rules::EV_FILTER;
+        use astream_broker::{Retention, Rule};
+        let mut classes = vec![Rule::prefix(EV_FILTER).unwrap()];
+        if first {
+            classes.push(Rule::hold("/f/*/pub/n-z/*/say/>").unwrap().last_only());
+        }
+        classes.push(Rule::hold("/f/*/pub/*/*/say/>").unwrap());
+        Retention::new(classes, Rule::default_keeping_all()).unwrap()
+    }
+
+    /// **A FETCH OF A RECORD HELD BELOW ITS LANE'S OLDEST IS ANSWERED WITH THE RECORD**
+    /// (finding F3), on a real broker: a cut carries the session's unread mail below the base,
+    /// and the rules set next take its class whole from the base alone, so the lane's oldest
+    /// lies above the record the broker still holds. The fetch's read is refused there, read
+    /// again told, and answered with the record. CONTROL (`Mutant::ReadAtWithoutTheHeld`, the
+    /// refusal taken for no rows, as before F3): `err=retained` for a record the broker holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_fetch_of_a_record_held_below_its_lanes_oldest_answers_the_record() {
+        const SID: &str = "s-kept";
+        for control in [false, true] {
+            let (lane, mut bridge, _server, broker) =
+                rig_retained_by(&[(1, SID)], Some(lanes_whole_from_the_base(true)));
+            if control {
+                bridge.fx =
+                    crate::fx::Fx::os_without(crate::sim::world::Mutant::ReadAtWithoutTheHeld);
+            }
+            let node = bridge.node.clone();
+            let subject = format!("/f/f/in/{node}/{SID}/{node}/note");
+            let held = bridge
+                .publish_own_off(&subject, b"v=1 t=1 from=s-held text=held")
+                .unwrap();
+            let after = bridge
+                .publish_own_off(&subject, b"v=1 t=1 from=s-held text=after")
+                .unwrap();
+            broker.retain_before_carrying_state(after + 1).unwrap();
+            broker
+                .set_retention(lanes_whole_from_the_base(false))
+                .unwrap();
+            let of_lane = astream_wire::Filter::new(format!("/f/f/in/{node}/{SID}/>")).unwrap();
+            assert!(
+                broker.oldest(&of_lane) > held,
+                "PRECONDITION: the lane's oldest lies above the record the broker holds"
+            );
+            bridge.answer_fetch(SID, held);
+            let head = format!("deliver {SID} fetched={held} ");
+            let answer = lane
+                .deliveries
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|l| l.strip_prefix(&head).map(str::to_string))
+                .unwrap_or_else(|| panic!("no answer for {held}"));
+            if control {
+                assert!(
+                    answer.starts_with("err=retained floor="),
+                    "CONTROL: answered `retained` for the record the broker holds: {answer}"
+                );
+            } else {
+                assert!(
+                    answer.starts_with("from=") && answer.ends_with("text=held"),
+                    "the record held below the oldest: {answer}"
+                );
+            }
+        }
+    }
+
+    /// **A FETCH WHOSE TOLD READ CANNOT BE MADE ANSWERS `unreadable` AND KEEPS THE LINK** (F3
+    /// review), on a real broker: a record held below its lane's oldest, as above, with the
+    /// broker at its connection cap, so the told read's connection of its own is refused while
+    /// the link stands. A read-only fetch keeps no post's fate unknown: it answers
+    /// `err=unreadable` and the link stays up, as a plain refusal leaves it (judged as the
+    /// link's read, the failed dial dropped the link of every session at each `inbox get` of a
+    /// held or cut offset). CONTROL: the cap lifted, the same fetch answers the record.
+    #[cfg(unix)]
+    #[test]
+    fn a_fetch_whose_told_read_cannot_be_dialled_answers_unreadable_and_keeps_the_link() {
+        const SID: &str = "s-kept";
+        for capped in [true, false] {
+            let (lane, mut bridge, _server, broker) =
+                rig_retained_by(&[(1, SID)], Some(lanes_whole_from_the_base(true)));
+            let node = bridge.node.clone();
+            let subject = format!("/f/f/in/{node}/{SID}/{node}/note");
+            let held = bridge
+                .publish_own_off(&subject, b"v=1 t=1 from=s-held text=held")
+                .unwrap();
+            let after = bridge
+                .publish_own_off(&subject, b"v=1 t=1 from=s-held text=after")
+                .unwrap();
+            broker.retain_before_carrying_state(after + 1).unwrap();
+            broker
+                .set_retention(lanes_whole_from_the_base(false))
+                .unwrap();
+            if capped {
+                broker.set_max_conns(1);
+            }
+            bridge.answer_fetch(SID, held);
+            let head = format!("deliver {SID} fetched={held} ");
+            let answer = lane
+                .deliveries
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|l| l.strip_prefix(&head).map(|a| a.trim_end().to_string()))
+                .unwrap_or_else(|| panic!("no answer for {held}"));
+            if capped {
+                assert_eq!(answer, "err=unreadable", "no answer about the record yet");
+            } else {
+                assert!(
+                    answer.ends_with("text=held"),
+                    "CONTROL: the record held below the oldest: {answer}"
+                );
+            }
+            assert!(
+                bridge.conn.is_some() && bridge.link.up,
+                "the link stands (capped: {capped})"
+            );
+        }
     }
 
     #[test]
@@ -9793,7 +11515,7 @@ mod tests {
             Arc::clone(&mailbox),
         )
         .expect("the reader thread");
-        let item = mailbox.take(Duration::from_secs(60));
+        let item = mailbox.take(Duration::from_secs(60), Instant::now());
         assert!(
             matches!(item, Some(Item::Closed(Source::Fleet))),
             "a silent link ends the subscription: {item:?}"
@@ -9814,7 +11536,9 @@ mod tests {
             .expect_err("over the bound");
         note_ctl_loss(&ctl, &mailbox, Some(&err));
         assert!(
-            mailbox.take(Duration::from_millis(0)).is_none(),
+            mailbox
+                .take(Duration::from_millis(0), Instant::now())
+                .is_none(),
             "a refused line must not end the bridge"
         );
         drop(far);
@@ -9826,7 +11550,7 @@ mod tests {
         note_ctl_loss(&ctl, &mailbox, Some(&err));
         assert!(
             matches!(
-                mailbox.take(Duration::from_millis(0)),
+                mailbox.take(Duration::from_millis(0), Instant::now()),
                 Some(Item::Closed(Source::Aterm))
             ),
             "a lost verb lane must reach the loop as Closed(Aterm)"
@@ -10165,8 +11889,17 @@ mod tests {
         assert!(stopped.is_err(), "a debug build stops at the verdict");
     }
 
+    /// **A READ REFUSED BELOW ITS FILTER'S OLDEST IS NO ANSWER YET** ([`plain_read_at`]):
+    /// astream's `retained-from=<oldest>` for an `<oldest>` above `off` hands the floor back,
+    /// for the read to be made again told ([`Bridge::read_at`]), and is never taken for no
+    /// rows (finding F3) nor judged as a record refused on its own terms, which would drop the
+    /// connection for a compaction.
+    ///
+    /// Negative controls: an `<oldest>` at `off` (the record is reachable, so this is no such
+    /// answer), the same words under another code, a record refused on its own terms, and a
+    /// dead socket all stay the errors they are; a page's rows come through as they are.
     #[test]
-    fn a_read_back_that_retention_answered_is_no_rows() {
+    fn a_read_refused_below_its_filters_oldest_hands_its_floor_back() {
         use astream_broker::proto::{ERR_RECORD_REFUSED, ERR_REFUSED, RETAINED_FROM_PREFIX};
         let refusal =
             |code, msg: String| -> io::Error { astream_broker::BrokerRefusal { code, msg }.into() };
@@ -10181,8 +11914,8 @@ mod tests {
             "record",
             "PRECONDITION: judged as it stands, it would drop the connection"
         );
-        assert!(read_back_rows(Err(retained()), 4).unwrap().is_empty());
-        assert!(read_back_rows(Err(retained()), 0).unwrap().is_empty());
+        assert_eq!(plain_read_at(Err(retained()), 4).unwrap(), Err(5));
+        assert_eq!(plain_read_at(Err(retained()), 0).unwrap(), Err(5));
         for (e, off) in [
             (retained(), 5),
             (
@@ -10196,12 +11929,12 @@ mod tests {
             (io::Error::new(io::ErrorKind::BrokenPipe, "x"), 4),
         ] {
             let what = e.to_string();
-            assert!(read_back_rows(Err(e), off).is_err(), "{what} at {off}");
+            assert!(plain_read_at(Err(e), off).is_err(), "{what} at {off}");
         }
         let row: BrokerRecord = (7, "/f/f/x".to_string(), b"b".to_vec());
         assert_eq!(
-            read_back_rows(Ok((vec![row.clone()], (8, 8))), 7).unwrap(),
-            vec![row]
+            plain_read_at(Ok((vec![row.clone()], (8, 8))), 7).unwrap(),
+            Ok(vec![row])
         );
     }
 
@@ -10914,6 +12647,7 @@ mod tests {
             original: None,
             original_off: None,
             owner: None,
+            at: None,
         };
         bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
         bridge.unsent = None;
@@ -11030,6 +12764,7 @@ mod tests {
             original: None,
             original_off: None,
             owner: None,
+            at: None,
         };
         if receipt {
             bridge.state.set_receipt_pin("s-host", 1, &pin).unwrap();
@@ -11189,6 +12924,7 @@ mod tests {
                 subject: face.clone(),
                 body: body.to_vec(),
                 log: None,
+                at: None,
             })
             .unwrap();
         bridge
@@ -11224,6 +12960,7 @@ mod tests {
                 subject: face.clone(),
                 body: body.to_vec(),
                 log: None,
+                at: None,
             })
             .unwrap();
         let (mut reader, _) = bridge.connect().unwrap();
@@ -11465,7 +13202,14 @@ mod tests {
         );
         assert_eq!(
             bridge.state.in_flight().unwrap(),
-            vec![(seq, InFlight { log: None, ..entry })],
+            vec![(
+                seq,
+                InFlight {
+                    log: None,
+                    at: None,
+                    ..entry
+                }
+            )],
             "uncertainty is retained"
         );
 
@@ -11572,6 +13316,7 @@ mod tests {
             subject: subject.clone(),
             body: body.clone(),
             log: Some(broker.log_identity()),
+            at: None,
         };
         bridge.state.set_in_flight(&witnessed).unwrap();
         bridge.close_subscriptions();
@@ -11606,6 +13351,7 @@ mod tests {
                 subject: face.clone(),
                 body: body.to_vec(),
                 log: None,
+                at: None,
             };
             bridge.state.set_in_flight(&entry).unwrap();
             seq
@@ -11674,6 +13420,7 @@ mod tests {
                 subject: face.clone(),
                 body,
                 log: Some(broker.log_identity()),
+                at: None,
             }
             .render();
             bridge.close_subscriptions();
@@ -11911,6 +13658,7 @@ mod tests {
                     subject: face.clone(),
                     body,
                     log: Some(broker.log_identity()),
+                    at: None,
                 })
                 .unwrap();
             bridge.close_subscriptions();
@@ -12132,6 +13880,7 @@ mod tests {
                     subject: face,
                     body,
                     log: Some(broker.log_identity()),
+                    at: None,
                 })
                 .unwrap();
             bridge.close_subscriptions();
@@ -12324,7 +14073,10 @@ mod tests {
         let mut taken = Vec::new();
         let mut resumes = 0;
         while taken.len() < total {
-            match bridge.mailbox.take(aterm_spec::wait::MUST_HAPPEN) {
+            match bridge
+                .mailbox
+                .take(aterm_spec::wait::MUST_HAPPEN, bridge.fx.now())
+            {
                 Some(Item::Inbox((off, _, _))) => taken.push(off),
                 Some(Item::Resume(Source::Inbox, from)) => {
                     resumes += 1;
@@ -12373,7 +14125,7 @@ mod tests {
         );
 
         bridge.service_urgent();
-        let pending = bridge.mailbox.take(Duration::ZERO);
+        let pending = bridge.mailbox.take(Duration::ZERO, bridge.fx.now());
         assert!(
             pending.is_none(),
             "the duty left fleet work for the outer loop: {pending:?}"
@@ -12441,14 +14193,16 @@ mod tests {
             bridge.topic_change("s-a", &mut words.split_whitespace());
             assert!(bridge.sync_say_face());
         };
-        let take_say =
-            |bridge: &mut Bridge| match bridge.mailbox.take(aterm_spec::wait::MUST_HAPPEN) {
-                Some(Item::Say(r)) => {
-                    bridge.on_say_record(&r);
-                    r.0
-                }
-                other => panic!("{other:?}"),
-            };
+        let take_say = |bridge: &mut Bridge| match bridge
+            .mailbox
+            .take(aterm_spec::wait::MUST_HAPPEN, bridge.fx.now())
+        {
+            Some(Item::Say(r)) => {
+                bridge.on_say_record(&r);
+                r.0
+            }
+            other => panic!("{other:?}"),
+        };
 
         assert!(bridge.sync_say_face());
         assert!(
@@ -12479,7 +14233,10 @@ mod tests {
         assert!(!lane.delivery_offsets().contains(&unheard));
         assert!(bridge.conn.is_some() && bridge.link.up);
         assert!(
-            bridge.mailbox.take(Duration::ZERO).is_none(),
+            bridge
+                .mailbox
+                .take(Duration::ZERO, bridge.fx.now())
+                .is_none(),
             "the closed face's reader ended as no closure"
         );
         bridge.close_subscriptions();
@@ -12504,7 +14261,10 @@ mod tests {
         let (off, _) = writer_a
             .publish(77, 65, "/f/f/pub/n-src/s-src/say/t", &body)
             .unwrap();
-        match bridge.mailbox.take(aterm_spec::wait::MUST_HAPPEN) {
+        match bridge
+            .mailbox
+            .take(aterm_spec::wait::MUST_HAPPEN, bridge.fx.now())
+        {
             Some(Item::Say(r)) => {
                 assert_eq!(r.0, off);
                 bridge.on_say_record(&r);
@@ -12536,7 +14296,10 @@ mod tests {
             .publish(78, 1, "/f/f/pub/n-src/s-src/say/t", &body)
             .unwrap();
         assert_eq!(off, head);
-        match bridge.mailbox.take(aterm_spec::wait::MUST_HAPPEN) {
+        match bridge
+            .mailbox
+            .take(aterm_spec::wait::MUST_HAPPEN, bridge.fx.now())
+        {
             Some(Item::Say(r)) => bridge.on_say_record(&r),
             other => panic!("the new log's first broadcast: {other:?}"),
         }
@@ -12548,7 +14311,10 @@ mod tests {
 
     #[cfg(unix)]
     fn fan_in_next_say(bridge: &mut Bridge) -> u64 {
-        match bridge.mailbox.take(aterm_spec::wait::MUST_HAPPEN) {
+        match bridge
+            .mailbox
+            .take(aterm_spec::wait::MUST_HAPPEN, bridge.fx.now())
+        {
             Some(Item::Say(r)) => {
                 bridge.on_say_record(&r);
                 r.0
@@ -12985,6 +14751,7 @@ mod tests {
             original: None,
             original_off: None,
             owner: None,
+            at: None,
         };
         bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
         let (off, deduped, _) = bridge
@@ -13043,6 +14810,7 @@ mod tests {
                 original: None,
                 original_off: None,
                 owner: None,
+                at: None,
             };
             bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
             let mut other_body = intended.clone();
@@ -13100,6 +14868,7 @@ mod tests {
             original: None,
             original_off: None,
             owner: None,
+            at: None,
         };
         bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
         let (off, deduped, actual) = bridge
@@ -13147,8 +14916,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_replayed_record_waits_for_its_posts_retirement_so_a_move_delivers_it_once() {
-        for hold in [true, false] {
-            let case = format!("hold={hold}");
+        // `at`: an entry an older build journaled (published again at its pin) and one this
+        // build journals (read back where it landed, `Bridge::landed_since`).
+        for (hold, at) in [
+            (true, None),
+            (false, None),
+            (true, Some(0)),
+            (false, Some(0)),
+        ] {
+            let case = format!("hold={hold} at={at:?}");
             let sessions = [(1, "s-a"), (2, "s-b")];
             let (lane, mut first) = FakeVerbLane::bridge(&sessions);
             let state = first.state.root().to_path_buf();
@@ -13174,6 +14950,7 @@ mod tests {
                     subject,
                     body: bytes,
                     log: first.conn.as_ref().and_then(|c| c.seen_log_identity()),
+                    at,
                 })
                 .unwrap();
             first.close_subscriptions();
@@ -13219,7 +14996,10 @@ mod tests {
                 .publish(81, 1, &sentinel_face, b"v=1 t=1 text=sentinel")
                 .unwrap();
             loop {
-                match bridge.mailbox.take(aterm_spec::wait::MUST_HAPPEN) {
+                match bridge
+                    .mailbox
+                    .take(aterm_spec::wait::MUST_HAPPEN, bridge.fx.now())
+                {
                     Some(Item::Inbox(rec)) => {
                         let at = rec.0;
                         bridge.on_inbox_record(&rec);
@@ -13258,6 +15038,382 @@ mod tests {
         }
     }
 
+    /// A READ BACK THAT MEETS ITS SUBJECT'S FLOOR READS AGAIN TOLD (sim item B05): the
+    /// entry's record is carried below the base as its subject's last value, and the rules
+    /// set next keep every record of its class, which they take whole from the base alone
+    /// (astream's `retention::carried_since`), so the subject's oldest lies above the record
+    /// the broker still holds. A read on at the floor finds nothing of it (the control:
+    /// `transport::fetch_kept`), the told one finds it, and the attach's replay and the
+    /// drain's retry both settle on it: the note stays on the bus once. Since the F3 review
+    /// the attach's refill reads the recipient's lane told (`Bridge::lane_page`) and so meets
+    /// the held note, whose entry awaits the drain (its listing came before the post's
+    /// retirement): that attach drops the link to offer it again, as one meeting a record
+    /// above the oldest does (`a_replayed_record_waits_for_its_posts_retirement_so_a_move_\
+    /// delivers_it_once`), and the next, the post gone from the queue, releases the entry and
+    /// delivers the note once.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_held_below_its_subjects_oldest_is_read_back_and_not_published_again() {
+        use crate::broker_rules::{EV_FILTER, MAIL_FILTER};
+        use astream_broker::{Retention, Rule};
+        let sessions = [(1, "s-a"), (2, "s-b")];
+        let (lane, mut first) = FakeVerbLane::bridge(&sessions);
+        let state = first.state.root().to_path_buf();
+        let (a, broker, _server) = serve_log(&lane, "held-oldest");
+        broker.set_retention_interval(Duration::from_secs(3600));
+        // First a class that keeps every record of the lanes and one that keeps another
+        // lane's last value only; then one class for every lane, which reaches both and so is
+        // whole only from the base (a last-value class carries none of its records).
+        let rules = |first: bool| {
+            let mut classes = vec![Rule::prefix(EV_FILTER).unwrap()];
+            if first {
+                classes.push(Rule::hold("/f/*/in/*/s-z/>").unwrap().last_only());
+            }
+            classes.push(Rule::hold(MAIL_FILTER).unwrap());
+            Retention::new(classes, Rule::default_keeping_all()).unwrap()
+        };
+        broker.set_retention(rules(true)).unwrap();
+        first.cfg.broker = a.clone();
+        assert!(first.attach_broker(), "the first attach");
+        lane.refuse_retirements(true);
+        let post = "post sid=s-a id=1 to=@s-b kind=note len=4\nonce".to_string();
+        *lane.outbox.lock().unwrap() = Some(post.clone());
+        first.drain_outbox();
+        let pin = first
+            .state
+            .post_pin("s-a", 1)
+            .unwrap()
+            .expect("the post's pin stays with its retirement refused");
+        let face = pin.identity.as_ref().unwrap().subject.clone();
+        let (rows, _) = first.conn_now().unwrap().fetch(0, &face, 1).unwrap();
+        let (on_bus, subject, bytes) = rows.into_iter().next().expect("the note");
+        first
+            .state
+            .set_in_flight(&InFlight {
+                pin: pin.clone(),
+                subject,
+                body: bytes,
+                log: first.conn.as_ref().and_then(|c| c.seen_log_identity()),
+                at: Some(0),
+            })
+            .unwrap();
+        first.close_subscriptions();
+        drop(first);
+
+        let (mut writer, _) = transport::connect(&a, aterm_spec::wait::MUST_HAPPEN).unwrap();
+        for seq in 1..=4 {
+            writer.publish(92, seq, "/f/f/x/padding", b"v=1").unwrap();
+        }
+        let (_, (_, head)) = writer.fetch(0, "/f/>", 0).unwrap();
+        broker.retain_before_carrying_state(head).unwrap();
+        broker.set_retention(rules(false)).unwrap();
+        let of_face = astream_wire::Filter::new(&face).unwrap();
+        assert!(
+            broker.oldest(&of_face) > on_bus,
+            "the subject's oldest lies above the note the broker still holds"
+        );
+        let ((rows, _), floor) = transport::fetch_kept(&mut writer, 0, &face, 8).unwrap();
+        assert!(
+            floor.is_some() && rows.is_empty(),
+            "CONTROL: a read on at the floor finds nothing of the note: {rows:?}"
+        );
+        let (mut told, _) = transport::connect(&a, aterm_spec::wait::MUST_HAPPEN).unwrap();
+        let ((rows, _), _) = transport::fetch_told_kept(&mut told, 0, &face, 8).unwrap();
+        assert_eq!(
+            rows.iter().map(|(off, _, _)| *off).collect::<Vec<_>>(),
+            vec![on_bus],
+            "a told read finds the note held below the oldest"
+        );
+
+        let (second, mut bridge) = FakeVerbLane::bridge_with_state(&sessions, Some(&state));
+        bridge.cfg.broker = a;
+        second.retire_from_outbox();
+        *second.outbox.lock().unwrap() = Some(post);
+        assert!(
+            !bridge.attach_broker(),
+            "the attach's refill meets the held note while its entry awaits the drain"
+        );
+        assert!(
+            second.delivery_offsets().is_empty(),
+            "nothing delivered while the entry stands"
+        );
+        assert!(bridge.attach_broker(), "the next attach on the same log");
+        bridge.drain_outbox();
+        let ((rows, _), _) = transport::fetch_told_kept(&mut told, 0, &face, 8).unwrap();
+        assert_eq!(
+            rows.iter().map(|(off, _, _)| *off).collect::<Vec<_>>(),
+            vec![on_bus],
+            "the note is on the bus once: neither the replay nor the drain's retry published \
+             it again"
+        );
+        assert!(
+            bridge.state.in_flight().unwrap().is_empty(),
+            "the replay settled the entry where its record is"
+        );
+        assert_eq!(
+            second.delivery_offsets(),
+            [on_bus],
+            "the held note delivered once, from below the oldest"
+        );
+        bridge.close_subscriptions();
+    }
+
+    /// **A DEDUP'S READ BACK THAT A CUT MET SINCE THE ANSWER FINDS THE RECORD RETENTION STILL
+    /// HOLDS, AND THE POST IS NOT SENT AGAIN** (finding F3). A retry at a pin whose record
+    /// landed is answered deduped at that offset, which lies at or above the base (a cut drops
+    /// the keys below it); before its read back (`Bridge::cut_after_the_answer`, astream's
+    /// writer running retention between two requests of the connection) a cut carries the
+    /// unread record below the base, and the rules set next take its class whole from the base
+    /// alone, so the subject's oldest lies above the record the broker still holds. The read
+    /// back is refused, read again told, finds the record and verifies it: settled where it is,
+    /// the link kept. CONTROL (`Mutant::ReadAtWithoutTheHeld`, the refusal taken for no rows, as
+    /// before F3): nothing to verify, the post is left queued, and its retry, the key gone with
+    /// the cut, appends a second copy beside the one a reader can still be handed. A third arm
+    /// holds the broker at its connection cap from the cut on (F3 review), so the told read's
+    /// connection of its own is refused: the read back failed, so the link is dropped and the
+    /// post's fate left unknown (`Bridge::fate_unknown`), never taken for a cut.
+    #[cfg(unix)]
+    #[test]
+    fn a_dedup_whose_record_a_cut_carried_below_its_oldest_since_the_answer_is_not_sent_again() {
+        let rules = lanes_whole_from_the_base;
+        for arm in ["told", "control", "capped"] {
+            let (control, capped) = (arm == "control", arm == "capped");
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+            let (a, broker, _server) = serve_log(&lane, "dedup-cut");
+            let broker = Arc::new(broker);
+            broker.set_retention_interval(Duration::from_secs(3600));
+            broker.set_retention(rules(true)).unwrap();
+            bridge.cfg.broker = a.clone();
+            bridge.conn = Some(bridge.connect().unwrap().0.into());
+            if control {
+                bridge.fx =
+                    crate::fx::Fx::os_without(crate::sim::world::Mutant::ReadAtWithoutTheHeld);
+            }
+            let node = bridge.node.clone();
+            let face = format!("/f/f/in/{node}/s-b/{node}/note");
+            let mut body = Body::new(1);
+            body.from = Some("s-a".into());
+            body.text = "once".into();
+            let encoded = body.encode();
+            let identity = publication_identity(&face, &encoded);
+            let pin = PublishPin {
+                seq: bridge.next_seq().unwrap(),
+                via_key: false,
+                identity: Some(identity.clone()),
+                original: None,
+                original_off: None,
+                owner: Some(1),
+                at: None,
+            };
+            let (off, deduped, _) = bridge.publish_reserved(&pin, &face, &encoded).unwrap();
+            assert!(!deduped, "the first attempt lands");
+
+            let (cutter, at, of_face) = (Arc::clone(&broker), a.clone(), face.clone());
+            bridge.cut_after_the_answer = Some(Box::new(move |answered| {
+                assert_eq!(
+                    answered, off,
+                    "the retry is answered at the record's offset"
+                );
+                let (mut writer, _) =
+                    transport::connect(&at, aterm_spec::wait::MUST_HAPPEN).unwrap();
+                for seq in 1..=4 {
+                    writer.publish(92, seq, "/f/f/x/padding", b"v=1").unwrap();
+                }
+                let (_, (_, head)) = writer.fetch(0, "/f/>", 0).unwrap();
+                cutter.retain_before_carrying_state(head).unwrap();
+                cutter.set_retention(rules(false)).unwrap();
+                let of_face = astream_wire::Filter::new(&of_face).unwrap();
+                assert!(
+                    cutter.oldest(&of_face) > off,
+                    "PRECONDITION: the subject's oldest lies above the record the broker holds"
+                );
+                if capped {
+                    cutter.set_max_conns(1);
+                }
+            }));
+            let retried = bridge.publish_reserved(&pin, &face, &encoded);
+            bridge.cut_after_the_answer = None;
+            broker.set_max_conns(astream_broker::broker::MAX_CONNS);
+            let (mut told, _) = transport::connect(&a, aterm_spec::wait::MUST_HAPPEN).unwrap();
+            let copies = |told: &mut Conn| -> Vec<u64> {
+                let ((rows, _), _) = transport::fetch_told_kept(told, 0, &face, 8).unwrap();
+                rows.iter().map(|(off, _, _)| *off).collect()
+            };
+            if capped {
+                let failed = retried.unwrap_err();
+                assert!(
+                    failed
+                        .get_ref()
+                        .is_some_and(|inner| inner.is::<PublicationReadFailure>()),
+                    "the read back failed: {failed}"
+                );
+                assert!(
+                    bridge.conn.is_none() && bridge.fate_unknown(&failed),
+                    "the link dropped, the post's fate unknown: {failed}"
+                );
+                assert_eq!(copies(&mut told), vec![off], "nothing sent again");
+                continue;
+            }
+            if !control {
+                assert_eq!(
+                    retried.unwrap(),
+                    (off, true, Some(identity)),
+                    "the record held below the oldest is read back and verified"
+                );
+                assert!(bridge.conn.is_some(), "the link is kept");
+                assert_eq!(copies(&mut told), vec![off], "the post is on the bus once");
+                continue;
+            }
+            let refused = retried.unwrap_err();
+            assert!(
+                refused.to_string().contains("retention gave up the record"),
+                "CONTROL: nothing to verify, the post left queued: {refused}"
+            );
+            bridge.conn = Some(bridge.connect().unwrap().0.into());
+            let (again, deduped, _) = bridge.publish_reserved(&pin, &face, &encoded).unwrap();
+            assert!(!deduped, "CONTROL: the cut dropped the key");
+            assert_eq!(
+                copies(&mut told),
+                vec![off, again],
+                "CONTROL: the post on the bus twice, both copies a reader can be handed"
+            );
+        }
+    }
+
+    /// **A SENDER'S EARLIER POST OF THE SAME WORDS, PUBLISHED AGAIN BY THE REPLAY ABOVE ITS NEXT
+    /// POST'S HEAD, IS NEVER TAKEN FOR THAT POST** (aterm-link B05 review). `s-a` posts `ok` to
+    /// `s-b` twice. Post 1 lands and is retired, but its record in flight stands (a clear the
+    /// disk refused); post 2 is reserved and journaled at the head past post 1, and the bridge
+    /// stops before it publishes. Retention gives up post 1's unread copy. The next attach's
+    /// replay finds nothing of post 1 and publishes it again, above post 2's head, and claims
+    /// it ([`Bridge::claims`]); post 2's read back skips that copy, finds none of its own, and
+    /// publishes post 2, and the drain's retry settles post 2 where it landed: `s-b` is handed
+    /// `ok` twice, once a post. CONTROL (`read_back_past_claims`): the read back takes post 1's
+    /// copy for post 2, which never reaches the bus.
+    #[cfg(unix)]
+    #[test]
+    fn a_senders_earlier_post_published_again_is_never_taken_for_its_next_post_of_the_same_words() {
+        for control in [false, true] {
+            let sessions = [(1, "s-a"), (2, "s-b")];
+            let (lane, mut first) = FakeVerbLane::bridge(&sessions);
+            let state = first.state.root().to_path_buf();
+            let (a, broker, _server) = serve_log(&lane, "same-words");
+            broker.set_retention_interval(Duration::from_secs(3600));
+            first.cfg.broker = a.clone();
+            assert!(first.attach_broker(), "the first attach");
+            lane.refuse_retirements(true);
+            lane.retire_from_outbox();
+            let post = |id: u64| format!("post sid=s-a id={id} to=@s-b kind=note len=2\nok");
+            *lane.outbox.lock().unwrap() = Some(post(1));
+            first.drain_outbox();
+            let pin = first
+                .state
+                .post_pin("s-a", 1)
+                .unwrap()
+                .expect("post 1's pin stays with its retirement refused");
+            let face = pin.identity.as_ref().unwrap().subject.clone();
+            let (rows, _) = first.conn_now().unwrap().fetch(0, &face, 1).unwrap();
+            let (on_bus, subject, bytes) = rows.into_iter().next().expect("post 1 on the bus");
+            let log = first.conn.as_ref().and_then(|c| c.seen_log_identity());
+            let entry = |pin: &PublishPin, at: u64| InFlight {
+                pin: pin.clone(),
+                subject: subject.clone(),
+                body: bytes.clone(),
+                log,
+                at: Some(at),
+            };
+            first.state.set_in_flight(&entry(&pin, on_bus)).unwrap();
+            lane.refuse_retirements(false);
+            *lane.outbox.lock().unwrap() = Some(post(1));
+            first.drain_outbox();
+            assert_eq!(
+                first.state.post_pin("s-a", 1).unwrap(),
+                None,
+                "post 1 retired"
+            );
+            assert_eq!(
+                first.state.in_flight().unwrap().len(),
+                1,
+                "post 1's entry stands, as a clear the disk refused leaves it"
+            );
+            let next = PublishPin {
+                seq: first.next_seq().unwrap(),
+                owner: Some(2),
+                at: Some(on_bus + 1),
+                ..pin.clone()
+            };
+            first.state.set_post_pin("s-a", 2, &next).unwrap();
+            first
+                .state
+                .set_in_flight(&entry(&next, on_bus + 1))
+                .unwrap();
+            first.close_subscriptions();
+            drop(first);
+
+            broker
+                .set_retention(crate::broker_rules::rules_scaled(1 << 30, 1, 1 << 30))
+                .unwrap();
+            broker.retention_tick_at(broker.now_ms()).unwrap();
+            let (mut told, _) = transport::connect(&a, aterm_spec::wait::MUST_HAPPEN).unwrap();
+            let copies = |told: &mut Conn| -> Vec<u64> {
+                let ((rows, _), _) = transport::fetch_told_kept(told, 0, &face, 8).unwrap();
+                rows.iter().map(|(off, _, _)| *off).collect()
+            };
+            assert_eq!(
+                copies(&mut told),
+                Vec::<u64>::new(),
+                "post 1's copy given up"
+            );
+            broker
+                .set_retention(crate::broker_rules::default_rules())
+                .unwrap();
+
+            let (second, mut bridge) = FakeVerbLane::bridge_with_state(&sessions, Some(&state));
+            bridge.cfg.broker = a;
+            bridge.read_back_past_claims = control;
+            second.retire_from_outbox();
+            *second.outbox.lock().unwrap() = Some(post(2));
+            // The attach meets post 2's record held until its post is retired (or, in the
+            // control, post 1's copy post 2 settled on): the drain retires it.
+            let _ = bridge.attach_broker();
+            bridge.drain_outbox();
+            let on_the_bus = copies(&mut told);
+            let retired: Vec<String> = second
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.starts_with("outbox sent s-a 2 "))
+                .cloned()
+                .collect();
+            assert_eq!(
+                retired.len(),
+                1,
+                "control={control}: post 2 retired: {retired:?}"
+            );
+            if control {
+                assert_eq!(
+                    on_the_bus.len(),
+                    1,
+                    "CONTROL: post 2 settled on post 1's copy, never published: {on_the_bus:?}"
+                );
+                assert!(retired[0].contains(&format!("off={}", on_the_bus[0])));
+            } else {
+                assert_eq!(
+                    on_the_bus.len(),
+                    2,
+                    "post 1 again and post 2, each once: {on_the_bus:?}"
+                );
+                assert!(
+                    retired[0].contains(&format!("off={}", on_the_bus[1])),
+                    "post 2 retired where it landed, not on post 1's copy: {retired:?} \
+                     {on_the_bus:?}"
+                );
+            }
+            bridge.close_subscriptions();
+        }
+    }
+
     #[test]
     fn a_key_winner_republished_on_another_log_does_not_become_a_later_ask() {
         const SID: &str = "s-host";
@@ -13290,6 +15446,7 @@ mod tests {
                 subject: face,
                 body: bytes,
                 log: None,
+                at: None,
             })
             .unwrap();
 
@@ -13310,6 +15467,7 @@ mod tests {
                     original: winner.identity.clone(),
                     original_off: Some(old_off),
                     owner: winner.owner,
+                    at: None,
                 },
             )
             .unwrap();
@@ -13385,6 +15543,7 @@ mod tests {
                     original: None,
                     original_off: None,
                     owner: Some(1),
+                    at: None,
                 };
                 bridge.state.set_key_pin("s-host", "k-first", &key).unwrap();
                 drop(bridge);
@@ -14436,6 +16595,7 @@ mod tests {
                                         b"v=1 t=1 state=on reason=stop".to_vec(),
                                     ),
                                     generation,
+                                    Instant::now(),
                                 );
                                 if closed {
                                     let inbox = mailbox.broker_generation(Source::Inbox);
@@ -15885,6 +18045,7 @@ mod tests {
             original: None,
             original_off: None,
             owner: None,
+            at: None,
         };
         bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
         let (off, deduped, _) = bridge
@@ -16357,6 +18518,7 @@ mod tests {
                 subject,
                 body: body.to_vec(),
                 log: Some(log),
+                at: None,
             })
             .unwrap();
         let files = |root: &std::path::Path| {
@@ -16783,6 +18945,7 @@ mod tests {
                         subject: subject.clone(),
                         body: body.clone(),
                         log: Some(opened.broker.log_identity()),
+                        at: None,
                     })
                     .unwrap();
                 drop(writer);
@@ -17111,7 +19274,9 @@ mod tests {
         let generation = bridge.mailbox.broker_generation(Source::Inbox);
         for rec in records {
             assert_eq!(
-                bridge.mailbox.push(Source::Inbox, rec.clone(), generation),
+                bridge
+                    .mailbox
+                    .push(Source::Inbox, rec.clone(), generation, bridge.fx.now()),
                 Pushed::Queued
             );
         }
@@ -17174,6 +19339,670 @@ mod tests {
             "the kept records, in order"
         );
         assert!(bridge.conn.is_some(), "and the link stays up");
+    }
+
+    /// The `link gap` lines a fake lane was told, trimmed.
+    fn told_gaps(lane: &FakeVerbLane) -> Vec<String> {
+        lane.links()
+            .into_iter()
+            .filter(|l| l.starts_with("link gap "))
+            .map(|l| l.trim_end().to_string())
+            .collect()
+    }
+
+    /// B12 — A REFILL FROM `seen` THAT MEETS RETENTION'S FLOOR TELLS THAT SESSION: four mails on
+    /// the session's lane, its `seen` at the first, the log cut at the third. The refill reads on
+    /// from the floor and says `link gap from=<seen+1> to=<floor> sid=<sid>` before the first
+    /// mail it delivers from there, and a second refill over the same floor says nothing more.
+    /// A session with no `seen` refills from its floor span and, by choice, is told nothing
+    /// (with no watermark the bridge cannot tell what it handled; see `Bridge::refill`), nor is
+    /// an aterm older than the scoped `link gap` lane; both still get the kept mail. NC (run): a
+    /// `tell_given_up` that returns at once fails it.
+    #[cfg(unix)]
+    #[test]
+    fn a_refill_from_seen_below_the_retained_floor_tells_that_session_what_went() {
+        const SID: &str = "s-kept";
+        let run = |seen: bool, endpoint_lane: u32| {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+            bridge.endpoint_lane = endpoint_lane;
+            let (records, _reader, _socket, broker, _server) =
+                burst_rig(&lane, &mut bridge, SID, 4);
+            let offs: Vec<u64> = records.iter().map(|r| r.0).collect();
+            broker
+                .retain_before_carrying_state(offs[2])
+                .expect("the cut");
+            if seen {
+                bridge.state.set_seen_off(SID, offs[0]).unwrap();
+            }
+            let links = Arc::clone(&lane.links);
+            let told_first = Arc::new(std::sync::Mutex::new(None));
+            let at_first = Arc::clone(&told_first);
+            lane.on_first_deliver(move || {
+                let gaps = links.lock().unwrap();
+                let gaps = gaps.iter().filter(|l| l.starts_with("link gap ")).count();
+                *at_first.lock().unwrap() = Some(gaps);
+            });
+            assert!(bridge.refill(SID), "the refill reads on");
+            let first = told_gaps(&lane);
+            assert!(bridge.refill(SID), "and reads on again");
+            assert_eq!(told_gaps(&lane), first, "the same floor is told once");
+            assert_eq!(
+                lane.delivery_offsets()[..2],
+                offs[2..],
+                "the kept mail, from the floor"
+            );
+            let told_first = *told_first.lock().unwrap();
+            (offs, first, told_first)
+        };
+
+        let (offs, told, at_first) = run(true, aterm_types::control_verbs::BRIDGE_LANE);
+        assert_eq!(
+            told,
+            [format!(
+                "link gap from={} to={} sid={SID}",
+                offs[0] + 1,
+                offs[2]
+            )]
+        );
+        assert_eq!(
+            at_first,
+            Some(1),
+            "told before the first mail from the floor"
+        );
+        let (_, told, _) = run(false, aterm_types::control_verbs::BRIDGE_LANE);
+        assert!(told.is_empty(), "no watermark, no report: {told:?}");
+        let (_, told, _) = run(true, LINK_GAP_SCOPED_LANE - 1);
+        assert!(told.is_empty(), "an older aterm is told nothing: {told:?}");
+    }
+
+    /// The rig of the attach's refill together (B09): three admitted sessions owed their
+    /// refill, `A`, `B` and `C`, a broker, and `rounds` rounds of one mail to each in turn,
+    /// with a record no lane holds between rounds. The mails, by session, in offset order.
+    #[cfg(unix)]
+    fn together_rig(
+        rounds: u64,
+    ) -> (
+        FakeVerbLane,
+        Bridge,
+        astream_broker::Broker,
+        astream_broker::BrokerHandle,
+        BTreeMap<&'static str, Vec<u64>>,
+    ) {
+        let order: Vec<Option<&'static str>> = (0..rounds)
+            .flat_map(|_| TOGETHER.map(Some).into_iter().chain([None]))
+            .collect();
+        together_rig_with(None, &order)
+    }
+
+    /// [`together_rig`] over a broker retained by `rules` (set before the first record, as
+    /// aterm sets its own at the open), publishing one mail to each session of `order` in
+    /// turn, `None` a record no lane holds.
+    #[cfg(unix)]
+    fn together_rig_with(
+        rules: Option<astream_broker::Retention>,
+        order: &[Option<&'static str>],
+    ) -> (
+        FakeVerbLane,
+        Bridge,
+        astream_broker::Broker,
+        astream_broker::BrokerHandle,
+        BTreeMap<&'static str, Vec<u64>>,
+    ) {
+        let (lane, mut bridge) =
+            FakeVerbLane::bridge(&[(1, TOGETHER[0]), (2, TOGETHER[1]), (3, TOGETHER[2])]);
+        bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
+        let (socket, broker, server) = serve_log(&lane, "together");
+        if let Some(rules) = rules {
+            broker.set_retention(rules).unwrap();
+        }
+        bridge.cfg.broker = socket;
+        bridge.conn = Some(bridge.connect().unwrap().0.into());
+        assert!(bridge.refresh_sessions().is_ok());
+        assert_eq!(
+            bridge.per_sid.pending_admit.len(),
+            3,
+            "PRECONDITION: every session is owed its refill"
+        );
+        let (mut writer, _) = bridge.connect().unwrap();
+        let body = b"v=1 t=1 from=s-peer text=mail".to_vec();
+        let elsewhere = subject::session_face("f", &bridge.node, "s-else", "ev");
+        let mut mails: BTreeMap<&'static str, Vec<u64>> = BTreeMap::new();
+        for (seq, to) in (1..).zip(order) {
+            match to {
+                Some(sid) => {
+                    let face = format!("/f/f/in/{}/{sid}/n-peer/note", bridge.node);
+                    let (off, _) = writer.publish(91, seq, &face, &body).unwrap();
+                    mails.entry(sid).or_default().push(off);
+                }
+                None => {
+                    writer.publish(91, seq, &elsewhere, b"v=1 t=1").unwrap();
+                }
+            }
+        }
+        (lane, bridge, broker, server, mails)
+    }
+
+    /// [`together_rig_with`] retained by aterm's rules and `rounds` rounds of one mail to each
+    /// session: the inbox group read through the second round, then the `ev` class's bytes cut
+    /// to one (an `ev` publish over its class's bytes waits for a tick, so the rules start
+    /// with room) and one retention tick gives up the read mail (every lane's floor at its
+    /// second round's mail + 1, the node inbox's oldest at `C`'s) and holds the rest below
+    /// the cut.
+    #[cfg(unix)]
+    fn together_rig_cut(
+        rounds: u64,
+    ) -> (
+        FakeVerbLane,
+        Bridge,
+        astream_broker::Broker,
+        astream_broker::BrokerHandle,
+        BTreeMap<&'static str, Vec<u64>>,
+    ) {
+        let order: Vec<Option<&'static str>> = (0..rounds)
+            .flat_map(|_| TOGETHER.map(Some).into_iter().chain([None]))
+            .collect();
+        let roomy = crate::broker_rules::rules_scaled(1 << 30, 1 << 30, 1 << 30);
+        let rig = together_rig_with(Some(roomy), &order);
+        let (_, bridge, broker, _, mails) = &rig;
+        let (mut writer, _) = bridge.connect().unwrap();
+        let group = subject::inbox_group("f", &bridge.node);
+        writer.commit(&group, mails[TOGETHER[2]][1]).unwrap();
+        broker
+            .set_retention(crate::broker_rules::rules_scaled(1, 1 << 30, 1 << 30))
+            .unwrap();
+        broker.retention_tick_at(broker.now_ms()).unwrap();
+        rig
+    }
+
+    const TOGETHER: [&str; 3] = ["s-ta", "s-tb", "s-tc"];
+
+    /// The lane's `deliver <off>` lines, in the order aterm was asked.
+    fn offered(lane: &FakeVerbLane) -> Vec<u64> {
+        lane.transcript()
+            .iter()
+            .filter_map(|l| l.strip_prefix("deliver ")?.parse().ok())
+            .collect()
+    }
+
+    /// B09 — AN ATTACH REFILLS ITS SESSIONS IN ONE READ, EACH FROM ITS OWN WATERMARK: `A` saw
+    /// its first mail, `B` its second, `C` none (its floor span reads from offset 0). One read
+    /// of the node's inbox offers each session its records past its own start, in offset order
+    /// across the sessions, where a refill lane by lane offers `A`'s, then `B`'s, then `C`'s.
+    /// NC (run): `refill_pending_admissions` with its `refill_together` arm cut offers them
+    /// lane by lane and fails the order.
+    #[cfg(unix)]
+    #[test]
+    fn an_attach_refills_its_sessions_in_one_read_each_from_its_own_watermark() {
+        let (lane, mut bridge, _broker, _server, mails) = together_rig(3);
+        let [a, b, c] = TOGETHER;
+        bridge.state.set_seen_off(a, mails[a][0]).unwrap();
+        bridge.state.set_seen_off(b, mails[b][1]).unwrap();
+
+        assert!(bridge.refill_pending_admissions(false));
+        let mut want: Vec<u64> = mails[a][1..]
+            .iter()
+            .chain(&mails[b][2..])
+            .chain(&mails[c])
+            .copied()
+            .collect();
+        want.sort_unstable();
+        assert_eq!(
+            offered(&lane),
+            want,
+            "each session's records past its start, offered once, in offset order"
+        );
+        assert!(bridge.per_sid.pending_admit.is_empty(), "and each is done");
+        assert!(bridge.conn.is_some());
+        assert!(told_gaps(&lane).is_empty(), "no floor, nothing told");
+    }
+
+    /// B09 — A SESSION BELOW THE NODE INBOX'S FLOOR IS TOLD, AS ITS OWN READ TELLS IT, AND
+    /// REFILLED WITH THE REST: the log is cut below the second round. `A`'s watermark is below
+    /// the cut, so `A` is told `link gap from=<seen+1> to=<floor> sid=A`, as its own lane's
+    /// read would tell it, and starts there; `B`'s is above it and is told nothing. The kept
+    /// records go in one read, in offset order.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_below_the_inbox_floor_is_told_and_refilled_with_the_rest() {
+        let (lane, mut bridge, broker, _server, mails) = together_rig(3);
+        let [a, b, c] = TOGETHER;
+        let floor = mails[a][1];
+        broker.retain_before_carrying_state(floor).expect("the cut");
+        bridge.state.set_seen_off(a, mails[a][0]).unwrap();
+        bridge.state.set_seen_off(b, mails[b][1]).unwrap();
+
+        assert!(bridge.refill_pending_admissions(false));
+        assert_eq!(
+            told_gaps(&lane),
+            [format!(
+                "link gap from={} to={floor} sid={a}",
+                mails[a][0] + 1
+            )],
+            "A is told what went below the floor, and only A"
+        );
+        let mut want: Vec<u64> = mails[a][1..]
+            .iter()
+            .chain(&mails[b][2..])
+            .chain(mails[c].iter().filter(|off| **off >= floor))
+            .copied()
+            .collect();
+        want.sort_unstable();
+        assert_eq!(offered(&lane), want, "the kept records, in one read");
+        assert!(bridge.per_sid.pending_admit.is_empty());
+    }
+
+    /// B09 — A SESSION WHOSE DELIVERY IS OWED STOPS THERE, AND THE OTHERS READ ON: aterm owes
+    /// `B` its first mail (an answer with no verdict), so `B` is offered nothing more, as its own
+    /// refill stops; `A` and `C` are offered every record, and every session is done.
+    #[cfg(unix)]
+    #[test]
+    fn an_owed_session_stops_and_the_others_read_on() {
+        let (lane, mut bridge, _broker, _server, mails) = together_rig(3);
+        let [a, b, c] = TOGETHER;
+        lane.answer_deliveries_to(b, SHIPPED_DELIVER_USAGE);
+
+        assert!(bridge.refill_pending_admissions(false));
+        let mut want: Vec<u64> = mails[a]
+            .iter()
+            .chain(&mails[b][..1])
+            .chain(&mails[c])
+            .copied()
+            .collect();
+        want.sort_unstable();
+        assert_eq!(offered(&lane), want, "B is asked once, the others for all");
+        assert!(bridge.per_sid.pending_admit.is_empty());
+    }
+
+    /// B09 — A FLOOR THAT RISES UNDER THE SHARED READ HANDS EACH SESSION TO ITS OWN LANE: more
+    /// than a page of mail, and the log cut past the first page while aterm takes its first
+    /// record. The shared read stops where it got to, and each session reads on alone from
+    /// there, meets its own lane's floor and is told it from the stop, as its own read tells
+    /// it. Every record below the stop and every one the cut kept is offered, and none twice.
+    #[cfg(unix)]
+    #[test]
+    fn a_floor_rising_under_the_shared_read_hands_each_session_to_its_own_lane() {
+        let (lane, mut bridge, broker, _server, mails) = together_rig(120);
+        let [a, b, c] = TOGETHER;
+        bridge.state.set_seen_off(a, mails[a][0]).unwrap();
+        bridge.state.set_seen_off(b, mails[b][0]).unwrap();
+        bridge.state.set_seen_off(c, mails[c][0]).unwrap();
+        let floor = mails[a][110];
+        let cut = std::sync::Arc::new(std::sync::Mutex::new(Some(broker)));
+        let cutter = std::sync::Arc::clone(&cut);
+        lane.on_first_deliver(move || {
+            if let Some(broker) = cutter.lock().unwrap().as_ref() {
+                broker
+                    .retain_before_carrying_state(floor)
+                    .expect("the cut under the read");
+            }
+        });
+
+        assert!(bridge.refill_pending_admissions(false));
+        let offers = offered(&lane);
+        let unique: BTreeSet<u64> = offers.iter().copied().collect();
+        assert_eq!(unique.len(), offers.len(), "none offered twice: {offers:?}");
+        let page_end = offers
+            .iter()
+            .copied()
+            .take_while(|off| *off < floor)
+            .max()
+            .expect("the first page was offered");
+        let mut gaps = told_gaps(&lane);
+        gaps.sort();
+        assert_eq!(
+            gaps,
+            TOGETHER.map(|sid| format!("link gap from={} to={floor} sid={sid}", page_end + 1)),
+            "each session meets its own lane's floor from where the shared read stopped"
+        );
+        assert!(
+            page_end + 1 < floor,
+            "PRECONDITION: the cut is past the stop"
+        );
+        let _ = (b, c);
+        for sid in TOGETHER {
+            for off in &mails[sid][1..] {
+                assert_eq!(
+                    unique.contains(off),
+                    *off <= page_end || *off >= floor,
+                    "{sid} @{off}: below the stop {page_end} or kept past the floor {floor}"
+                );
+            }
+        }
+        assert!(bridge.per_sid.pending_admit.is_empty());
+        drop(cut);
+    }
+
+    /// B09 — A SESSION WHOSE DELIVERY IS OWED STAYS STOPPED WHEN A RISING FLOOR HANDS THE
+    /// OTHERS ON: the shared read of [`a_floor_rising_under_the_shared_read_hands_each_session_to_its_own_lane`]
+    /// with aterm owing `B` its first record. `B` is offered that record and nothing more, as
+    /// its own refill stops there, and is told no floor; `A` and `C` read on alone from the
+    /// stop and are told theirs.
+    #[cfg(unix)]
+    #[test]
+    fn an_owed_session_stays_stopped_when_a_rising_floor_hands_the_others_on() {
+        let (lane, mut bridge, broker, _server, mails) = together_rig(120);
+        let [a, b, c] = TOGETHER;
+        for sid in TOGETHER {
+            bridge.state.set_seen_off(sid, mails[sid][0]).unwrap();
+        }
+        lane.answer_deliveries_to(b, SHIPPED_DELIVER_USAGE);
+        let floor = mails[a][110];
+        let cut = std::sync::Arc::new(std::sync::Mutex::new(Some(broker)));
+        let cutter = std::sync::Arc::clone(&cut);
+        lane.on_first_deliver(move || {
+            if let Some(broker) = cutter.lock().unwrap().as_ref() {
+                broker
+                    .retain_before_carrying_state(floor)
+                    .expect("the cut under the read");
+            }
+        });
+
+        assert!(bridge.refill_pending_admissions(false));
+        let offers = offered(&lane);
+        let to_b: Vec<u64> = offers
+            .iter()
+            .copied()
+            .filter(|off| mails[b].contains(off))
+            .collect();
+        assert_eq!(to_b, [mails[b][1]], "B is offered its owed record only");
+        let gaps = told_gaps(&lane);
+        assert!(
+            gaps.iter().all(|g| !g.ends_with(&format!("sid={b}"))),
+            "B, stopped, meets no floor: {gaps:?}"
+        );
+        for sid in [a, c] {
+            assert!(
+                gaps.iter().any(|g| g.ends_with(&format!("sid={sid}"))),
+                "{sid} reads on and meets its floor: {gaps:?}"
+            );
+            assert!(
+                mails[sid]
+                    .iter()
+                    .filter(|off| **off >= floor)
+                    .all(|off| offers.contains(off)),
+                "{sid} is offered every record the cut kept"
+            );
+        }
+        assert!(bridge.per_sid.pending_admit.is_empty());
+        drop(cut);
+    }
+
+    /// B09 — A SESSION BELOW ANOTHER LANE'S FLOOR JOINS THE SHARED READ AT THE INBOX'S OLDEST:
+    /// three rounds, the inbox group read through the second and retention's tick giving it
+    /// up ([`together_rig_cut`]), so the lanes' floors are their second mails + 1 and the
+    /// node inbox's oldest `C`'s. `A` saw its first mail, `B` and `C` their second. `A` is
+    /// told its lane's give-up (`from=<seen+1> to=<its floor>`), `B` and `C` nothing; `A` and
+    /// `B`, still below the inbox's oldest (`C`'s floor), read their own lanes up to it, find
+    /// nothing there, and the third round goes in one read in offset order, where the refill
+    /// sent each of them alone to the head after `C`'s.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_below_another_lanes_floor_joins_the_shared_read_at_the_inbox_oldest() {
+        let (lane, mut bridge, _broker, _server, mails) = together_rig_cut(3);
+        let [a, b, c] = TOGETHER;
+        bridge.state.set_seen_off(a, mails[a][0]).unwrap();
+        bridge.state.set_seen_off(b, mails[b][1]).unwrap();
+        bridge.state.set_seen_off(c, mails[c][1]).unwrap();
+
+        assert!(bridge.refill_pending_admissions(false));
+        assert_eq!(
+            told_gaps(&lane),
+            [format!(
+                "link gap from={} to={} sid={a}",
+                mails[a][0] + 1,
+                mails[a][1] + 1
+            )],
+            "A is told its lane's give-up, and only A"
+        );
+        assert_eq!(
+            offered(&lane),
+            [mails[a][2], mails[b][2], mails[c][2]],
+            "the third round, in one read"
+        );
+        assert!(bridge.per_sid.pending_admit.is_empty());
+    }
+
+    /// B09 — A LANE'S MAIL HELD BELOW ANOTHER LANE'S FLOOR IS OFFERED BEFORE THE SHARED READ: a
+    /// broker whose rules hold `A`'s mail for a reader group of its own, which never reads it,
+    /// and everyone else's for the node's inbox group, read through the second round and given
+    /// up by a tick. The node inbox's oldest is `C`'s floor, and `A`'s second mail lies below
+    /// it, still held. `A`'s own read up to the oldest offers it, and the third round goes in
+    /// one read. CONTROL (`refill_joins_below_the_oldest`): `A` joins at the oldest without
+    /// reading below it, and its held mail is never offered.
+    #[cfg(unix)]
+    #[test]
+    fn a_lanes_mail_held_below_another_lanes_floor_is_offered_before_the_shared_read() {
+        use crate::broker_rules::{EV_FILTER, MAIL_FILTER, MAIL_READER};
+        use astream_broker::{Retention, Rule};
+        let [a, b, c] = TOGETHER;
+        let rules = |ev: u64| {
+            Retention::new(
+                vec![
+                    Rule::prefix(EV_FILTER).unwrap().max_bytes(ev),
+                    Rule::hold(&format!("/f/*/in/*/{a}/>"))
+                        .unwrap()
+                        .until_read("/f/{2}/cur/{4}/held/ta")
+                        .unwrap(),
+                    Rule::hold(MAIL_FILTER)
+                        .unwrap()
+                        .until_read(MAIL_READER)
+                        .unwrap(),
+                ],
+                Rule::default_keeping_all(),
+            )
+            .unwrap()
+        };
+        let order: Vec<Option<&'static str>> = (0..3)
+            .flat_map(|_| TOGETHER.map(Some).into_iter().chain([None]))
+            .collect();
+        for control in [false, true] {
+            let (lane, mut bridge, broker, _server, mails) =
+                together_rig_with(Some(rules(1 << 30)), &order);
+            let (mut writer, _) = bridge.connect().unwrap();
+            let group = subject::inbox_group("f", &bridge.node);
+            writer.commit(&group, mails[c][1]).unwrap();
+            broker.set_retention(rules(1)).unwrap();
+            broker.retention_tick_at(broker.now_ms()).unwrap();
+            bridge.state.set_seen_off(a, mails[a][0]).unwrap();
+            bridge.state.set_seen_off(b, mails[b][1]).unwrap();
+            bridge.state.set_seen_off(c, mails[c][1]).unwrap();
+            bridge.refill_joins_below_the_oldest = control;
+
+            assert!(bridge.refill_pending_admissions(false));
+            assert!(
+                told_gaps(&lane).is_empty(),
+                "nothing given up past a watermark"
+            );
+            let want: &[u64] = if control {
+                &[mails[a][2], mails[b][2], mails[c][2]]
+            } else {
+                &[mails[a][1], mails[a][2], mails[b][2], mails[c][2]]
+            };
+            assert_eq!(
+                offered(&lane),
+                want,
+                "{}",
+                if control {
+                    "CONTROL: A's held mail is not offered"
+                } else {
+                    "A's held mail, then the third round in one read"
+                }
+            );
+            assert!(bridge.per_sid.pending_admit.is_empty());
+        }
+    }
+
+    /// B09 — SESSIONS BELOW THE INBOX'S OLDEST READ THEIR LANES ONLY UP TO IT: the cut world of
+    /// [`a_session_below_another_lanes_floor_joins_the_shared_read_at_the_inbox_oldest`] with
+    /// 300 more rounds, more than a page of each lane held past the floors. Every kept mail is
+    /// offered once, and the refill ends on the last round's three mails in offset order: the
+    /// sessions below the oldest joined the shared read, where alone each read its lane to the
+    /// head (and the last mails offered were `B`'s).
+    #[cfg(unix)]
+    #[test]
+    fn sessions_below_the_inbox_oldest_read_their_lanes_only_up_to_it() {
+        let (lane, mut bridge, _broker, _server, mails) = together_rig_cut(302);
+        let [a, b, c] = TOGETHER;
+        bridge.state.set_seen_off(a, mails[a][0]).unwrap();
+        bridge.state.set_seen_off(b, mails[b][1]).unwrap();
+        bridge.state.set_seen_off(c, mails[c][1]).unwrap();
+
+        assert!(bridge.refill_pending_admissions(false));
+        let offers = offered(&lane);
+        let unique: BTreeSet<u64> = offers.iter().copied().collect();
+        assert_eq!(unique.len(), offers.len(), "none offered twice");
+        for sid in TOGETHER {
+            assert!(
+                mails[sid][2..].iter().all(|off| unique.contains(off)),
+                "{sid}: every kept mail offered"
+            );
+        }
+        assert_eq!(unique.len(), 3 * 300, "and nothing else");
+        assert_eq!(
+            offers[offers.len() - 3..],
+            [mails[a][301], mails[b][301], mails[c][301]],
+            "the refill ends in one read of every lane"
+        );
+        assert!(bridge.per_sid.pending_admit.is_empty());
+    }
+
+    /// B09 — A SHARED READ THAT CARRIES MORE THAN IT SAVES HANDS EACH SESSION TO ITS OWN LANE:
+    /// `A` saw its one mail, then 1,500 mails each go to `B` and `C`, who saw their last, so
+    /// nobody is owed anything. The shared read from `A`'s start carries `B`'s and `C`'s mail
+    /// below their starts and saves no scan (only `A` reads there); once what it carried costs
+    /// more than [`REFILL_SPLIT_SLACK`] at [`REFILL_ROW_COST`] a record, each session reads on
+    /// alone, so it carries at most that and a page. CONTROL (`refill_never_hands_on`): the
+    /// read carries all 3,000 to the head (lane by lane carried none).
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_read_that_carries_more_than_it_saves_hands_each_session_to_its_own_lane() {
+        const EACH: usize = 1_500;
+        let [a, b, c] = TOGETHER;
+        let order: Vec<Option<&'static str>> = std::iter::once(Some(a))
+            .chain((0..EACH).flat_map(|_| [Some(b), Some(c)]))
+            .collect();
+        let bound = REFILL_SPLIT_SLACK / REFILL_ROW_COST + u64::from(transport::POST_PAGE);
+        for control in [false, true] {
+            let (lane, mut bridge, _broker, _server, mails) = together_rig_with(None, &order);
+            for sid in TOGETHER {
+                let last = *mails[sid].last().unwrap();
+                bridge.state.set_seen_off(sid, last).unwrap();
+            }
+            bridge.refill_never_hands_on = control;
+
+            assert!(bridge.refill_pending_admissions(false));
+            assert!(offered(&lane).is_empty(), "nobody is owed anything");
+            assert!(bridge.per_sid.pending_admit.is_empty());
+            if control {
+                assert_eq!(
+                    bridge.refill_carried,
+                    2 * EACH as u64,
+                    "CONTROL: never handed on, the read carries every mail"
+                );
+            } else {
+                assert!(
+                    bridge.refill_carried <= bound,
+                    "carried {} past the bound {bound}",
+                    bridge.refill_carried
+                );
+            }
+        }
+    }
+
+    /// A broker on `lane` retaining by `lanes_whole_from_the_base(true)`, its ticks left to the
+    /// test, with `bridge` linked to it.
+    #[cfg(unix)]
+    fn held_lane_rig(
+        lane: &FakeVerbLane,
+        bridge: &mut Bridge,
+        name: &str,
+    ) -> (astream_broker::Broker, astream_broker::BrokerHandle) {
+        let (socket, broker, server) = serve_log(lane, name);
+        broker.set_retention_interval(Duration::from_secs(3600));
+        broker
+            .set_retention(lanes_whole_from_the_base(true))
+            .unwrap();
+        bridge.cfg.broker = socket;
+        bridge.conn = Some(bridge.connect().unwrap().0.into());
+        (broker, server)
+    }
+
+    /// A cut carrying `lane`'s records below `before` (its base), and the rules set next taking
+    /// their class whole from the base alone: the lane's oldest then lies above what the broker
+    /// still holds of it.
+    #[cfg(unix)]
+    fn carry_below_the_lanes_oldest(broker: &astream_broker::Broker, lane: &str, before: u64) {
+        broker.retain_before_carrying_state(before).unwrap();
+        broker
+            .set_retention(lanes_whole_from_the_base(false))
+            .unwrap();
+        let of_lane = astream_wire::Filter::new(lane).unwrap();
+        assert!(
+            broker.oldest(&of_lane) >= before,
+            "PRECONDITION: the lane's oldest lies above the records the broker holds"
+        );
+    }
+
+    /// **A REFILL OFFERS THE MAIL RETENTION HOLDS BELOW ITS LANE'S OLDEST** (F3 review), on a
+    /// real broker: a peer's two notes on the session's lane, carried below the base by a cut
+    /// and held there while the rules set next take their class whole from the base alone, so
+    /// the lane's oldest lies above them; a third note lands after. The refill from the
+    /// session's `seen`, below the notes, meets the oldest, reads again told, and offers all
+    /// three in order, telling the session of no give-up, since none of its lane was given up.
+    /// CONTROL (`Mutant::LaneReadWithoutTheHeld`, the read going on at the floor, as before the
+    /// review): only the third is offered, and the session is told `link gap` over the two the
+    /// broker still holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_refill_offers_the_mail_retention_holds_below_its_lanes_oldest() {
+        const SID: &str = "s-kept";
+        for control in [false, true] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+            bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
+            let (broker, _server) = held_lane_rig(&lane, &mut bridge, "refill-held");
+            assert!(bridge.refresh_sessions().is_ok());
+            bridge.per_sid.pending_admit.clear();
+            if control {
+                bridge.fx =
+                    crate::fx::Fx::os_without(crate::sim::world::Mutant::LaneReadWithoutTheHeld);
+            }
+            let node = bridge.node.clone();
+            let face = format!("/f/f/in/{node}/{SID}/n-peer/note");
+            let note = |n: u64| format!("v=1 t=1 from=s-peer text=note-{n}").into_bytes();
+            let (mut writer, _) = bridge.connect().unwrap();
+            let (seen, _) = writer.publish(91, 1, "/f/f/x/padding", b"v=1").unwrap();
+            let (first, _) = writer.publish(92, 1, &face, &note(1)).unwrap();
+            let (second, _) = writer.publish(92, 2, &face, &note(2)).unwrap();
+            carry_below_the_lanes_oldest(&broker, &format!("/f/f/in/{node}/{SID}/>"), second + 1);
+            let (third, _) = writer.publish(92, 3, &face, &note(3)).unwrap();
+            bridge.state.set_seen_off(SID, seen).unwrap();
+
+            assert!(bridge.refill(SID), "the refill reads on");
+            assert!(bridge.conn.is_some(), "and the link stays up");
+            if control {
+                assert_eq!(
+                    lane.delivery_offsets(),
+                    [third],
+                    "CONTROL: the held notes skipped"
+                );
+                assert_eq!(
+                    told_gaps(&lane),
+                    [format!("link gap from={first} to={third} sid={SID}")],
+                    "CONTROL: told a give-up over the notes the broker holds"
+                );
+                continue;
+            }
+            assert_eq!(
+                lane.delivery_offsets(),
+                [first, second, third],
+                "every note, the held ones first, in order"
+            );
+            assert!(
+                told_gaps(&lane).is_empty(),
+                "nothing was given up: {:?}",
+                told_gaps(&lane)
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -17278,6 +20107,344 @@ mod tests {
                 .any(|l| l.starts_with("outbox sent s-a 1 off=")),
             "the post retired: {:?}",
             lane.sent.lock().unwrap()
+        );
+    }
+
+    /// **AN IDLE ROUND'S INBOX COMMIT RIDES THE REPLY, IN ONE WRITE AND ONE BATCH** (critic
+    /// item B08). A delivery owes its commit; the round that finds the mailbox idle holds it
+    /// rather than send it alone, and the reply the woken session posts next carries it: the
+    /// commit and the post go out as one burst, the commit first, and the broker takes both
+    /// into one writer batch. Once their acks are read the group is through the delivery and
+    /// the post is retired.
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_rounds_inbox_commit_rides_the_reply_in_one_write_and_one_batch() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+        let (records, _reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 1);
+        bridge.in_round = true;
+        bridge.on_inbox_record(&records[0]);
+        bridge.in_round = false;
+        assert_eq!(
+            bridge.inbox_pending,
+            Some(records[0].0),
+            "PRECONDITION: the delivery owes its commit"
+        );
+
+        assert!(bridge.mailbox.is_idle());
+        bridge.settle_owed();
+        assert!(
+            bridge.commit_held.is_some(),
+            "the idle round holds the commit"
+        );
+        assert_eq!(
+            bridge.conn.as_ref().map(Link::unacked),
+            Some(0),
+            "nothing went out alone"
+        );
+
+        let node = bridge.node.clone();
+        bridge
+            .indexed_subjects
+            .insert(subject::post_lane("f", &node, "s-b", &node, "note"));
+        *lane.outbox.lock().unwrap() =
+            Some("post sid=s-a id=1 to=@s-b kind=note len=4\npong".to_string());
+        bridge.mailbox.push_event("EVENT 1 post 1".to_string());
+        let batches = broker.stats().writer_batches;
+        assert!(bridge.park_and_take(aterm_spec::wait::MUST_HAPPEN));
+        let owed: Vec<&str> = bridge
+            .conn
+            .as_ref()
+            .expect("the link stands")
+            .owed()
+            .map(|then| match then {
+                Then::Commit { .. } => "commit",
+                Then::Post(_) => "post",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            owed,
+            ["commit", "post"],
+            "the reply carried the held commit"
+        );
+        assert_eq!(bridge.commit_held, None, "taken by the reply");
+
+        bridge.settle_acks();
+        assert_eq!(
+            broker.stats().writer_batches - batches,
+            1,
+            "the commit and the post were one writer batch"
+        );
+        assert_eq!(
+            bridge.committed, records[0].0,
+            "the group is through the delivery"
+        );
+        assert_eq!(bridge.inbox_pending, None);
+        assert!(
+            lane.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("outbox sent s-a 1 off=")),
+            "the post retired: {:?}",
+            lane.sent.lock().unwrap()
+        );
+    }
+
+    /// **A HELD COMMIT RIDES CLAMPED BELOW A RECORD STILL OWED** (critic item B08): with the
+    /// third of three delivered records still owed to its session, the commit the reply
+    /// carries stops just below it, as every inbox commit does ([`Bridge::commit_target`]),
+    /// not at what the bridge owes the group; the group resumes there.
+    ///
+    /// NEGATIVE CONTROL: with the clamp off
+    /// ([`crate::sim::world::Mutant::HeldCommitPastTheFloor`]) the same round commits past the
+    /// owed record. The seeded worlds never reach a record owed to a session (only a lane
+    /// fault leaves one) under a held commit, so this is its control.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_commit_rides_clamped_below_a_record_still_owed() {
+        let (rode, records) = ride_with_a_record_owed(crate::fx::Fx::os());
+        assert_eq!(rode, [records[1].0], "clamped below the owed record");
+        let (rode, records) = ride_with_a_record_owed(crate::fx::Fx::os_without(
+            crate::sim::world::Mutant::HeldCommitPastTheFloor,
+        ));
+        assert_eq!(
+            rode,
+            [records[2].0],
+            "NEGATIVE CONTROL: unclamped, the commit passes the owed record"
+        );
+    }
+
+    /// The round of [`a_held_commit_rides_clamped_below_a_record_still_owed`] on `fx`: what the
+    /// held commit that rode the reply named, and the three records.
+    #[cfg(unix)]
+    fn ride_with_a_record_owed(fx: crate::fx::Fx) -> (Vec<u64>, Vec<BrokerRecord>) {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+        bridge.fx = fx;
+        let (records, _reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 3);
+        bridge.in_round = true;
+        for rec in &records {
+            bridge.on_inbox_record(rec);
+        }
+        bridge.in_round = false;
+        assert_eq!(bridge.inbox_pending, Some(records[2].0), "PRECONDITION");
+        bridge
+            .per_sid
+            .lane_owed
+            .insert("s-b".to_string(), Some(records[2].0));
+        bridge.settle_owed();
+        assert!(bridge.commit_held.is_some(), "PRECONDITION: held");
+
+        let node = bridge.node.clone();
+        bridge
+            .indexed_subjects
+            .insert(subject::post_lane("f", &node, "s-b", &node, "note"));
+        *lane.outbox.lock().unwrap() =
+            Some("post sid=s-a id=1 to=@s-b kind=note len=4\npong".to_string());
+        bridge.mailbox.push_event("EVENT 1 post 1".to_string());
+        assert!(bridge.park_and_take(aterm_spec::wait::MUST_HAPPEN));
+        let rode: Vec<u64> = bridge
+            .conn
+            .as_ref()
+            .expect("the link stands")
+            .owed()
+            .filter_map(|then| match then {
+                Then::Commit { upto, .. } => Some(*upto),
+                _ => None,
+            })
+            .collect();
+        bridge.settle_acks();
+        assert_eq!(
+            Some(bridge.committed),
+            rode.first().copied(),
+            "the broker acked the commit that rode"
+        );
+        (rode, records)
+    }
+
+    /// **THE WIND-DOWN LANDS A HELD INBOX COMMIT** (critic item B08): a commit held for the
+    /// next write when aterm closes the bridge is the owed commit the wind-down lands, so
+    /// the group is through the delivery and the next bridge redelivers nothing.
+    ///
+    /// NEGATIVE CONTROL: with the held commit dropped at the wind-down
+    /// ([`crate::sim::world::Mutant::DropHeldCommitAtWindDown`]) the group stays where it
+    /// was and nothing is left for the next bridge. The seeded worlds' quits always publish
+    /// before aterm closes, and that publish carries the held commit, so this is its control.
+    #[cfg(unix)]
+    #[test]
+    fn the_wind_down_lands_a_held_inbox_commit() {
+        for (fx, lands) in [
+            (crate::fx::Fx::os(), true),
+            (
+                crate::fx::Fx::os_without(crate::sim::world::Mutant::DropHeldCommitAtWindDown),
+                false,
+            ),
+        ] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
+            bridge.fx = fx;
+            let (records, _reader, _socket, _broker, _server) =
+                burst_rig(&lane, &mut bridge, "s-b", 1);
+            let before = bridge.committed;
+            bridge.in_round = true;
+            bridge.on_inbox_record(&records[0]);
+            bridge.in_round = false;
+            bridge.settle_owed();
+            assert!(bridge.commit_held.is_some(), "PRECONDITION: held");
+
+            bridge.wind_down();
+            if lands {
+                assert_eq!(bridge.committed, records[0].0, "landed at the wind-down");
+            } else {
+                assert_eq!(
+                    (bridge.committed, bridge.state.inbox_owed()),
+                    (before, None),
+                    "NEGATIVE CONTROL: dropped, neither landed nor left"
+                );
+            }
+        }
+    }
+
+    /// **A HELD INBOX COMMIT GOES ALONE ONCE ITS GRACE IS OUT** (critic item B08): at the
+    /// park's backstop when nothing came, and at the next settle when what came published
+    /// nothing. Neither waits on a clock here: the hold is dated a grace ago.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_inbox_commit_goes_alone_once_its_grace_is_out() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
+        let (records, _reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 2);
+        let a_grace_ago = |bridge: &Bridge| {
+            bridge
+                .fx
+                .now()
+                .checked_sub(IDLE_ACK_GRACE)
+                .expect("a clock past its first grace")
+        };
+
+        bridge.in_round = true;
+        bridge.on_inbox_record(&records[0]);
+        bridge.in_round = false;
+        bridge.settle_owed();
+        assert!(bridge.commit_held.is_some(), "PRECONDITION: held");
+        bridge.commit_held = Some(a_grace_ago(&bridge));
+        assert!(bridge.park_and_take(aterm_spec::wait::MUST_HAPPEN));
+        assert_eq!(bridge.commit_held, None);
+        assert_eq!(
+            bridge.committed, records[0].0,
+            "the backstop sent it and read its ack"
+        );
+
+        bridge.in_round = true;
+        bridge.on_inbox_record(&records[1]);
+        bridge.in_round = false;
+        bridge.settle_owed();
+        assert!(bridge.commit_held.is_some(), "PRECONDITION: held again");
+        bridge.commit_held = Some(a_grace_ago(&bridge));
+        bridge.settle_owed();
+        assert_eq!(bridge.commit_held, None);
+        assert!(
+            bridge
+                .conn
+                .as_ref()
+                .is_some_and(|link| link.owed().any(Then::is_commit)),
+            "the settle sent it alone"
+        );
+        bridge.settle_acks();
+        assert_eq!(bridge.committed, records[1].0);
+    }
+
+    /// **A COMMIT THAT A RECORD OWED TO A SESSION STOPS IS NOT HELD** (critic item B08
+    /// review): with the first record still owed to a session just past the committed
+    /// cursor (a lane fault leaves one), no inbox commit can go out however long the bridge
+    /// waits, so the idle round holds none and the loop parks its full wait, as it did
+    /// before B08, round after round, instead of waking every grace to send nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_that_a_record_owed_to_a_session_stops_is_not_held() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
+        let (records, _reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 3);
+        bridge.in_round = true;
+        bridge.on_inbox_record(&records[0]);
+        bridge.in_round = false;
+        bridge.flush_inbox_commit();
+        bridge.settle_acks();
+        assert_eq!(bridge.committed, records[0].0, "PRECONDITION: committed");
+
+        bridge.in_round = true;
+        for rec in &records[1..] {
+            bridge.on_inbox_record(rec);
+        }
+        bridge.in_round = false;
+        let owed_off = bridge.committed + 1;
+        bridge
+            .per_sid
+            .lane_owed
+            .insert("s-b".to_string(), Some(owed_off));
+        assert_eq!(bridge.inbox_pending, Some(records[2].0), "PRECONDITION");
+        assert_eq!(
+            bridge.commit_target(records[2].0),
+            None,
+            "PRECONDITION: nothing can be committed"
+        );
+
+        let wait = Duration::from_millis(20);
+        for _ in 0..2 {
+            bridge.settle_owed();
+            assert!(
+                !bridge.holds_inbox_commit(),
+                "nothing it could send is held"
+            );
+            assert!(bridge.park_and_take(wait));
+            assert_eq!(bridge.parked, Some(wait), "the park takes its full wait");
+        }
+        assert_eq!(bridge.committed, records[0].0);
+        assert_eq!(bridge.conn.as_ref().map(Link::unacked), Some(0));
+    }
+
+    /// **AN ITEM OFF THE BUS SENDS A HELD COMMIT BEFORE IT IS HANDLED** (critic item B08
+    /// review): only aterm's push lane brings the reply a held commit waits for, so the next
+    /// inbox record, whose delivery waits on aterm's answer for as long as aterm takes,
+    /// finds the commit for the delivery before it already sent, through that delivery and
+    /// no further: a slow answer does not keep it off the wire.
+    #[cfg(unix)]
+    #[test]
+    fn an_item_off_the_bus_sends_a_held_commit_before_it_is_handled() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
+        let (records, _reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 2);
+        bridge.in_round = true;
+        bridge.on_inbox_record(&records[0]);
+        bridge.in_round = false;
+        bridge.settle_owed();
+        assert!(bridge.holds_inbox_commit(), "PRECONDITION: held");
+
+        queue_inbox(&bridge, &records[1..]);
+        assert!(bridge.park_and_take(aterm_spec::wait::MUST_HAPPEN));
+        assert_eq!(
+            lane.delivery_offsets(),
+            [records[0].0, records[1].0],
+            "PRECONDITION: the second record was taken and delivered"
+        );
+        let commits: Vec<u64> = bridge
+            .conn
+            .as_ref()
+            .expect("the link stands")
+            .owed()
+            .filter_map(|then| match then {
+                Then::Commit { upto, .. } => Some(*upto),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            commits,
+            [records[0].0],
+            "the held commit went out before the next record was handled"
+        );
+        assert!(!bridge.holds_inbox_commit());
+        bridge.settle_acks();
+        assert_eq!(bridge.committed, records[0].0);
+        assert_eq!(
+            bridge.inbox_pending,
+            Some(records[1].0),
+            "the next one is owed"
         );
     }
 
@@ -18416,6 +21583,7 @@ mod tests {
                 b"v=1 t=3 state=on reason=stop".to_vec(),
             ),
             generation,
+            bridge.fx.now(),
         );
         assert!(matches!(pushed, Pushed::Queued));
         bridge.drain_outbox();
@@ -18636,7 +21804,8 @@ mod tests {
         };
         let left = |bridge: &Bridge| {
             let mut left = Vec::new();
-            while let Some(Item::Event(line)) = bridge.mailbox.take(Duration::ZERO) {
+            while let Some(Item::Event(line)) = bridge.mailbox.take(Duration::ZERO, bridge.fx.now())
+            {
                 left.push(line);
             }
             left
@@ -19562,7 +22731,10 @@ mod tests {
         );
 
         let (live, _) = writer.publish(81, 2, &mail, b"v=1 t=2 text=live").unwrap();
-        let rec = match bridge.mailbox.take(aterm_spec::wait::MUST_HAPPEN) {
+        let rec = match bridge
+            .mailbox
+            .take(aterm_spec::wait::MUST_HAPPEN, bridge.fx.now())
+        {
             Some(Item::Inbox(rec)) => rec,
             other => panic!("the observer's lane reader: {other:?}"),
         };
@@ -19821,12 +22993,18 @@ mod tests {
         );
 
         let stale_generation = bridge.mailbox.broker_generation(Source::Inbox);
-        let _ = bridge
-            .mailbox
-            .push(Source::Inbox, live.clone(), stale_generation);
+        let _ = bridge.mailbox.push(
+            Source::Inbox,
+            live.clone(),
+            stale_generation,
+            bridge.fx.now(),
+        );
         bridge.mailbox.reset_broker_sources();
         assert!(
-            bridge.mailbox.take(Duration::ZERO).is_none(),
+            bridge
+                .mailbox
+                .take(Duration::ZERO, bridge.fx.now())
+                .is_none(),
             "the previous subscription's queued copy is gone"
         );
         let (second, _) = bridge.connect().unwrap();
@@ -19910,7 +23088,10 @@ mod tests {
             }
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
-                match bridge.mailbox.take(Duration::from_millis(50)) {
+                match bridge
+                    .mailbox
+                    .take(Duration::from_millis(50), bridge.fx.now())
+                {
                     Some(Item::Event(line)) if line == barrier => return,
                     Some(Item::Event(line)) => bridge.on_event(&line),
                     Some(Item::Closed(source)) => panic!("{source:?} closed mid-test"),
@@ -20596,7 +23777,10 @@ mod tests {
         drop(push);
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            match bridge.mailbox.take(Duration::from_millis(50)) {
+            match bridge
+                .mailbox
+                .take(Duration::from_millis(50), bridge.fx.now())
+            {
                 Some(Item::Closed(Source::Aterm)) => break,
                 Some(_) => {}
                 None => assert!(Instant::now() < deadline, "the lane never closed"),
@@ -20769,6 +23953,418 @@ mod tests {
             "a stray receipt settled a deadline, or the recipient's did not"
         );
         assert!(bridge.deadlines.is_empty(), "{:?}", bridge.deadlines);
+    }
+
+    /// B12 — THE DEADLINE SWEEP TELLS THE ASKER WHAT RETENTION GAVE UP UNDER ITS JUDGEMENT: an
+    /// ask with a deadline, its answer on the asker's lane, then the log cut past the answer. The
+    /// sweep finds no answer in what the broker keeps and records `expired`, and the asker is
+    /// told `link gap from=<ask+1> to=<floor> sid=<asker>`: the expiry was judged over a range
+    /// the broker let go of. An asker whose `seen` is past the floor handled the range, so it is
+    /// told nothing. NC (run): a `tell_given_up` that returns at once fails it.
+    #[cfg(unix)]
+    #[test]
+    fn the_deadline_sweep_tells_the_asker_what_retention_gave_up_under_its_verdict() {
+        const SID: &str = "s-asker";
+        let run = |seen_past_the_answer: bool| {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+            bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
+            let socket = lane.dir.path().join("broker.sock");
+            let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
+            let _server = broker.serve(&socket).unwrap();
+            bridge.cfg.broker = socket.to_string_lossy().into_owned();
+            let (conn, _) = bridge.connect().unwrap();
+            bridge.conn = Some(conn.into());
+            bridge
+                .per_sid
+                .epochs
+                .insert(SID.to_string(), "e".to_string());
+            let node = bridge.node.clone();
+            let (mut peer, _) = bridge.connect().unwrap();
+            let ask_lane = format!("/f/f/in/n-far/s-far/{node}/ask");
+            let (ask, _) = peer
+                .publish(9_100, 1, &ask_lane, b"v=1 t=1 text=q")
+                .unwrap();
+            bridge.note_deadline(SID, ask, 1_000, Some("n-far".to_string()));
+            let mut body = Body::new(1);
+            body.re = Some(ask);
+            let answer_lane = format!("/f/f/in/{node}/{SID}/n-far/answer");
+            let (answer, _) = peer
+                .publish(9_200, 1, &answer_lane, &body.encode())
+                .unwrap();
+            let (after, _) = peer.publish(9_300, 1, "/f/f/x/after", b"v=1").unwrap();
+            assert!(answer < after);
+            broker
+                .retain_before_carrying_state(answer + 1)
+                .expect("the cut");
+            if seen_past_the_answer {
+                bridge.state.set_seen_off(SID, answer).unwrap();
+            }
+
+            bridge.expire_deadlines(true);
+
+            let verdicts = format!("/f/f/in/{node}/{SID}/{node}/expired");
+            let (rows, _) = peer.fetch(answer + 1, &verdicts, 64).unwrap();
+            let expired: Vec<u64> = rows
+                .iter()
+                .filter(|(_, s, _)| *s == verdicts)
+                .filter_map(|(_, _, raw)| Body::decode(raw).0.re)
+                .collect();
+            assert_eq!(expired, [ask], "judged on what the broker keeps");
+            (ask, answer, told_gaps(&lane))
+        };
+
+        let (ask, answer, told) = run(false);
+        assert_eq!(
+            told,
+            [format!(
+                "link gap from={} to={} sid={SID}",
+                ask + 1,
+                answer + 1
+            )]
+        );
+        let (_, _, told) = run(true);
+        assert!(told.is_empty(), "a handled range is not news: {told:?}");
+    }
+
+    /// **THE DEADLINE SWEEP FINDS AN ANSWER HELD BELOW THE ASKER'S OLDEST** (F3 review), on a
+    /// real broker: an ask with a deadline, its answer on the asker's lane, carried below the
+    /// base by a cut and held there while the rules set next take its class whole from the
+    /// base alone, so the lane's oldest lies above it. The sweep meets the oldest, reads again
+    /// told, finds the answer and settles the deadline: no `expired`, and no give-up told.
+    /// CONTROL (`Mutant::LaneReadWithoutTheHeld`, the read going on at the floor, as before the
+    /// review): the answer is skipped, the ask judged `expired`, and the asker told `link gap`
+    /// over the answer the broker still holds.
+    #[cfg(unix)]
+    #[test]
+    fn the_deadline_sweep_finds_an_answer_held_below_the_askers_oldest() {
+        const SID: &str = "s-asker";
+        for control in [false, true] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+            bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
+            let (broker, _server) = held_lane_rig(&lane, &mut bridge, "sweep-held");
+            bridge
+                .per_sid
+                .epochs
+                .insert(SID.to_string(), "e".to_string());
+            if control {
+                bridge.fx =
+                    crate::fx::Fx::os_without(crate::sim::world::Mutant::LaneReadWithoutTheHeld);
+            }
+            let node = bridge.node.clone();
+            let (mut peer, _) = bridge.connect().unwrap();
+            let ask_lane = format!("/f/f/in/n-far/s-far/{node}/ask");
+            let (ask, _) = peer
+                .publish(9_100, 1, &ask_lane, b"v=1 t=1 text=q")
+                .unwrap();
+            bridge.note_deadline(SID, ask, 1_000, Some("n-far".to_string()));
+            let mut body = Body::new(1);
+            body.re = Some(ask);
+            let answer_lane = format!("/f/f/in/{node}/{SID}/n-far/answer");
+            let (answer, _) = peer
+                .publish(9_200, 1, &answer_lane, &body.encode())
+                .unwrap();
+            carry_below_the_lanes_oldest(&broker, &format!("/f/f/in/{node}/{SID}/>"), answer + 1);
+
+            bridge.expire_deadlines(true);
+
+            let verdicts = format!("/f/f/in/{node}/{SID}/{node}/expired");
+            let ((rows, _), _) = transport::fetch_told_kept(&mut peer, 0, &verdicts, 64).unwrap();
+            let expired: Vec<u64> = rows
+                .iter()
+                .filter(|(_, s, _)| *s == verdicts)
+                .filter_map(|(_, _, raw)| Body::decode(raw).0.re)
+                .collect();
+            assert!(bridge.deadlines.is_empty(), "{:?}", bridge.deadlines);
+            if control {
+                assert_eq!(expired, [ask], "CONTROL: the held answer skipped");
+                assert_eq!(
+                    told_gaps(&lane).len(),
+                    1,
+                    "CONTROL: told a give-up over the answer the broker holds: {:?}",
+                    told_gaps(&lane)
+                );
+                continue;
+            }
+            assert!(
+                expired.is_empty(),
+                "the held answer settles it: {expired:?}"
+            );
+            assert!(
+                told_gaps(&lane).is_empty(),
+                "nothing was given up: {:?}",
+                told_gaps(&lane)
+            );
+        }
+    }
+
+    /// **A HELD ASK'S RETRY ARMS NO DEADLINE THE HOLD SAW SETTLED** (F4 review), on a real
+    /// broker: an ask with `dl=` posted while the state dir refuses the deadline table is left
+    /// queued, its deadline in memory (`Bridge::post_landed`). While it is held the disk takes
+    /// writes again and the ask is settled: its answer delivered, or the sweep's `expired`
+    /// published. The retry at its pin retires the post and arms no deadline for the settled
+    /// ask, which a sweep would expire once retention gave the answer, or the `expired`, up:
+    /// an `expired` after the answer the asker was handed, or a second one.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_asks_retry_arms_no_deadline_the_hold_saw_settled() {
+        const SID: &str = "s-host";
+        for answered in [true, false] {
+            let case = if answered { "answered" } else { "expired" };
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+            let (socket, _broker, _server) = serve_log(&lane, "held-ask");
+            bridge.cfg.broker = socket;
+            bridge.conn = Some(bridge.connect().unwrap().0.into());
+            assert!(bridge.refresh_sessions().is_ok());
+            lane.retire_from_outbox();
+            bridge.state.refuse_writes_of(Some("deadlines"));
+            *lane.outbox.lock().unwrap() =
+                Some("post sid=s-host id=1 to=h-a kind=ask dl=60000 len=1\nq".to_string());
+            bridge.drain_outbox();
+            assert!(
+                lane.sent.lock().unwrap().is_empty(),
+                "{case}: held while its deadline is not on disk"
+            );
+            let ask = *bridge
+                .deadlines
+                .keys()
+                .next()
+                .expect("the held ask's deadline, in memory");
+            bridge.state.refuse_writes_of(None);
+            let node = bridge.node.clone();
+            if answered {
+                let mut body = Body::new(1);
+                body.re = Some(ask);
+                body.text = "a".to_string();
+                let subject = format!("/f/f/in/{node}/{SID}/h-a/answer");
+                let (mut peer, _) = bridge.connect().unwrap();
+                let (off, _) = peer.publish(9_200, 1, &subject, &body.encode()).unwrap();
+                bridge.deliver_record(off, &subject, &body.encode());
+                assert!(
+                    lane.delivery_offsets().contains(&off),
+                    "{case}: the answer is delivered"
+                );
+            } else {
+                bridge.expire_deadlines(true);
+                let verdicts = format!("/f/f/in/{node}/{SID}/{node}/expired");
+                let (rows, _) = bridge.connect().unwrap().0.fetch(0, &verdicts, 8).unwrap();
+                assert_eq!(rows.len(), 1, "{case}: the sweep expired the held ask");
+            }
+            assert!(
+                bridge.deadlines.is_empty(),
+                "{case}: settled while its post was held: {:?}",
+                bridge.deadlines
+            );
+
+            bridge.drain_outbox();
+
+            assert!(
+                lane.sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l.starts_with(&format!("outbox sent {SID} 1 off={ask}"))),
+                "{case}: the retry retires the post at its pin: {:?}",
+                lane.sent.lock().unwrap()
+            );
+            assert!(
+                bridge.deadlines.is_empty() && bridge.state.deadlines().is_empty(),
+                "{case}: the retry armed the settled ask's deadline again: {:?}",
+                bridge.deadlines
+            );
+        }
+    }
+
+    /// **AN UNWRITTEN DEADLINE TABLE WITHHOLDS ONLY THE ANSWER WHOSE DEADLINE IT HOLDS** (F4
+    /// review): the state dir refuses the table, so another session's deadline is not on disk.
+    /// An answer to an ask with no deadline is delivered at once and the link stays up, as
+    /// before item F4: no write stands between it and its session. The answer whose own
+    /// deadline's removal the disk refused is withheld, the link dropped to offer it again,
+    /// until a write of the table takes; then it is delivered.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritten_deadline_table_withholds_only_the_answer_whose_deadline_it_holds() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-host"), (2, "s-other")]);
+        let (socket, _broker, _server) = serve_log(&lane, "unwritten");
+        bridge.cfg.broker = socket;
+        bridge.conn = Some(bridge.connect().unwrap().0.into());
+        assert!(bridge.refresh_sessions().is_ok());
+        let node = bridge.node.clone();
+        bridge.state.refuse_writes_of(Some("deadlines"));
+        assert!(
+            !bridge.note_deadline("s-other", 5, 60_000, None),
+            "the table's write is refused"
+        );
+        let answer = |sid: &str, re: u64| {
+            let mut body = Body::new(1);
+            body.re = Some(re);
+            body.text = "a".to_string();
+            (format!("/f/f/in/{node}/{sid}/h-a/answer"), body.encode())
+        };
+
+        let (subject, raw) = answer("s-host", 3);
+        bridge.deliver_record(40, &subject, &raw);
+        assert!(
+            lane.delivery_offsets().contains(&40),
+            "an answer that settles no deadline is delivered"
+        );
+        assert!(bridge.conn.is_some(), "and the link stays up");
+
+        let (subject, raw) = answer("s-other", 5);
+        bridge.deliver_record(41, &subject, &raw);
+        assert!(
+            !lane.delivery_offsets().contains(&41),
+            "withheld while its deadline's removal is not on disk"
+        );
+        assert!(bridge.conn.is_none(), "the link dropped to offer it again");
+
+        bridge.state.refuse_writes_of(None);
+        bridge.conn = Some(bridge.connect().unwrap().0.into());
+        bridge.deliver_record(41, &subject, &raw);
+        assert!(
+            lane.delivery_offsets().contains(&41),
+            "delivered once the table is written"
+        );
+        assert!(bridge.state.deadlines().is_empty());
+    }
+
+    /// B12 — A TOPIC REPLAY THAT MEETS RETENTION'S FLOOR TELLS THE SESSION THE TOPIC'S RANGE: three
+    /// broadcasts on `alpha`, the session's cursor at the first, the log cut at the second. The
+    /// replay delivers from the floor and says `link gap from=<cursor> to=<floor> sid=<sid>
+    /// topic=alpha` once; dropping the topic forgets what was told. NC (run): a
+    /// `tell_given_up` that returns at once fails it.
+    #[cfg(unix)]
+    #[test]
+    fn a_topic_replay_below_the_retained_floor_tells_the_session_the_topics_range() {
+        const SID: &str = "s-late";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+        bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
+        let socket = lane.dir.path().join("broker.sock");
+        let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
+        let _server = broker.serve(&socket).unwrap();
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        let (conn, _) = bridge.connect().unwrap();
+        bridge.conn = Some(conn.into());
+        let (mut god, _) = bridge.connect().unwrap();
+        let note = Body::new(0).encode();
+        let subject = "/f/f/pub/n-x/s-p/say/alpha";
+        let alpha: Vec<u64> = (1..=3)
+            .map(|seq| god.publish(7, seq, subject, &note).unwrap().0)
+            .collect();
+        let drained = alpha[2] + 1;
+        bridge.say_drained_to = drained;
+        bridge.say_bus_head = drained;
+        bridge.per_sid.topics.insert(
+            SID.to_string(),
+            BTreeMap::from([("alpha".to_string(), TopicCursor { next: alpha[0] })]),
+        );
+        broker
+            .retain_before_carrying_state(alpha[1])
+            .expect("the cut");
+
+        assert!(bridge.catch_up_topic_page(SID));
+        assert_eq!(lane.delivery_offsets(), alpha[1..], "from the floor");
+        let told = [format!(
+            "link gap from={} to={} sid={SID} topic=alpha",
+            alpha[0], alpha[1]
+        )];
+        assert_eq!(told_gaps(&lane), told);
+        bridge
+            .per_sid
+            .topics
+            .get_mut(SID)
+            .unwrap()
+            .get_mut("alpha")
+            .unwrap()
+            .next = alpha[0];
+        assert!(bridge.catch_up_topic_page(SID));
+        assert_eq!(told_gaps(&lane), told, "the same floor is told once");
+
+        let key = (SID.to_string(), "alpha".to_string());
+        assert!(bridge.per_sid.given_up_told.contains_key(&key));
+        bridge.topic_change(SID, &mut "drop alpha".split_whitespace());
+        assert!(
+            !bridge.per_sid.given_up_told.contains_key(&key),
+            "a dropped topic forgets what was told of it"
+        );
+    }
+
+    /// **A TOPIC REPLAY OFFERS THE BROADCASTS RETENTION HOLDS BELOW THE TOPIC'S OLDEST** (F3
+    /// review), on a real broker under rules no aterm build sets (`topics_whole_from_the_base`):
+    /// two broadcasts on `alpha`, carried below the base by a cut and held there while the
+    /// rules set next take their class whole from the base alone, and a third after. The replay
+    /// from the session's cursor at the first meets the topic's oldest, reads again told, and
+    /// delivers all three, telling no give-up. CONTROL (`Mutant::LaneReadWithoutTheHeld`, the
+    /// read going on at the floor): only the third, and the session is told `link gap …
+    /// topic=alpha` over the two the broker still holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_topic_replay_offers_the_broadcasts_retention_holds_below_the_topics_oldest() {
+        const SID: &str = "s-late";
+        for control in [false, true] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+            bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
+            let (socket, broker, _server) = serve_log(&lane, "topic-held");
+            broker.set_retention_interval(Duration::from_secs(3600));
+            broker
+                .set_retention(topics_whole_from_the_base(true))
+                .unwrap();
+            bridge.cfg.broker = socket;
+            bridge.conn = Some(bridge.connect().unwrap().0.into());
+            if control {
+                bridge.fx =
+                    crate::fx::Fx::os_without(crate::sim::world::Mutant::LaneReadWithoutTheHeld);
+            }
+            let (mut god, _) = bridge.connect().unwrap();
+            let note = Body::new(0).encode();
+            let subject = "/f/f/pub/n-x/s-p/say/alpha";
+            let (first, _) = god.publish(7, 1, subject, &note).unwrap();
+            let (second, _) = god.publish(7, 2, subject, &note).unwrap();
+            broker.retain_before_carrying_state(second + 1).unwrap();
+            broker
+                .set_retention(topics_whole_from_the_base(false))
+                .unwrap();
+            let of_topic =
+                astream_wire::Filter::new(subject::say_topic_filter("f", "alpha")).unwrap();
+            assert!(
+                broker.oldest(&of_topic) > second,
+                "PRECONDITION: the topic's oldest lies above the broadcasts the broker holds"
+            );
+            let (third, _) = god.publish(7, 3, subject, &note).unwrap();
+            bridge.say_drained_to = third + 1;
+            bridge.say_bus_head = third + 1;
+            bridge.per_sid.topics.insert(
+                SID.to_string(),
+                BTreeMap::from([("alpha".to_string(), TopicCursor { next: first })]),
+            );
+
+            assert!(bridge.catch_up_topic_page(SID));
+            assert!(bridge.conn.is_some(), "the link stays up");
+            if control {
+                assert_eq!(
+                    lane.delivery_offsets(),
+                    [third],
+                    "CONTROL: the held ones skipped"
+                );
+                assert_eq!(
+                    told_gaps(&lane),
+                    [format!(
+                        "link gap from={first} to={third} sid={SID} topic=alpha"
+                    )],
+                    "CONTROL: told a give-up over the broadcasts the broker holds"
+                );
+                continue;
+            }
+            assert_eq!(
+                lane.delivery_offsets(),
+                [first, second, third],
+                "every broadcast, the held ones first"
+            );
+            assert!(
+                told_gaps(&lane).is_empty(),
+                "nothing was given up: {:?}",
+                told_gaps(&lane)
+            );
+        }
     }
 
     #[test]

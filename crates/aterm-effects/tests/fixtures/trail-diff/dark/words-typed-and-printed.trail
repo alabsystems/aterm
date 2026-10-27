@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# Sparkle Words, typed and printed: a feline word and a profanity printed above the prompt (the
+# peeking cat, rainbow ink), then a line typed with both.
+
+grid 16 90
+style rainbow kitty
+hz 60
+words rainbow
+
+at 0 pty "\e[3;1Hthe kitty sat on the keyboard\r\nmerde, the build broke\r\n\e[9;1H$ "
+at 700 key t
+at 702 pty "t"
+at 800 key h
+at 802 pty "h"
+at 900 key e
+at 902 pty "e"
+at 1000 key space
+at 1002 pty " "
+at 1100 key k
+at 1102 pty "k"
+at 1200 key i
+at 1202 pty "i"
+at 1300 key t
+at 1302 pty "t"
+at 1400 key t
+at 1402 pty "t"
+at 1500 key y
+at 1502 pty "y"
+at 1600 key space
+at 1602 pty " "
+at 1700 key b
+at 1702 pty "b"
+at 1800 key r
+at 1802 pty "r"
+at 1900 key o
+at 1902 pty "o"
+at 2000 key k
+at 2002 pty "k"
+at 2100 key e
+at 2102 pty "e"
+at 2200 key space
+at 2202 pty " "
+at 2300 key t
+at 2302 pty "t"
+at 2400 key h
+at 2402 pty "h"
+at 2500 key e
+at 2502 pty "e"
+at 2600 key space
+at 2602 pty " "
+at 2700 key b
+at 2702 pty "b"
+at 2800 key u
+at 2802 pty "u"
+at 2900 key i
+at 2902 pty "i"
+at 3000 key l
+at 3002 pty "l"
+at 3100 key d
+at 3102 pty "d"
+at 3200 key ,
+at 3202 pty ","
+at 3300 key space
+at 3302 pty " "
+at 3400 key f
+at 3402 pty "f"
+at 3500 key u
+at 3502 pty "u"
+at 3600 key c
+at 3602 pty "c"
+at 3700 key k
+at 3702 pty "k"
+run 6800

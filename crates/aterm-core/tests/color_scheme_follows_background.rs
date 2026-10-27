@@ -4,7 +4,7 @@
 //! The colour scheme a program is told (`CSI ? 996 n`, `CSI ? 997 ; Ps n`) follows the background.
 
 use aterm_core::config::{ConfigChange, TerminalConfig};
-use aterm_core::terminal::{ColorSchemeSource, Rgb, Terminal};
+use aterm_core::terminal::{ClockReading, ColorSchemeSource, Rgb, Terminal};
 use aterm_types::Appearance;
 
 const PUSH_DARK: &[u8] = b"\x1b[?997;1n";
@@ -341,4 +341,62 @@ fn a_program_provoked_push_obeys_the_response_policy() {
     assert!(!has_997(&reply(&mut t, OSC11_WHITE)));
     t.apply_config(&light_theme());
     assert_eq!(t.take_response().unwrap_or_default(), PUSH_LIGHT);
+}
+
+/// A push the reply rate limit refused stays owed and goes out at the first later batch
+/// whose clock finds room in the bucket, with no host call. Negative control: a batch at
+/// the same clock reading still finds the bucket spent.
+#[test]
+fn a_push_the_rate_limit_refused_goes_out_once_the_bucket_refills() {
+    let mut t = Terminal::new(8, 40);
+    t.apply_config(&dark_theme());
+    let clock = ClockReading::now();
+    t.process_at(&b"\x1b[6n".repeat(20_000), clock);
+    let spent = t.take_response().unwrap_or_default();
+    assert!(
+        spent.len() < 20_000 * 6,
+        "PRECONDITION: the queries spent the bucket ({} bytes answered)",
+        spent.len()
+    );
+    t.process_at(b"\x1b[?2031h\x1b]11;#ffffff\x07", clock);
+    assert!(
+        !has_997(&t.take_response().unwrap_or_default()),
+        "the spent bucket refuses the push"
+    );
+    t.process_at(b"x", clock);
+    assert!(
+        !has_997(&t.take_response().unwrap_or_default()),
+        "NEG: still spent at the same reading"
+    );
+    let later = ClockReading {
+        monotonic: clock.monotonic + std::time::Duration::from_secs(2),
+        wall_ms: clock.wall_ms,
+    };
+    t.process_at(b"x", later);
+    assert_eq!(t.take_response().unwrap_or_default(), PUSH_LIGHT);
+}
+
+/// A push the policy refused is dropped by a batch that ends with 2031 off, before a host
+/// colour call announces it; one that turns it off and on again keeps it owed, and the same
+/// host call announces it then (the negative control).
+#[test]
+fn turning_2031_off_drops_an_owed_push() {
+    for off_at_batch_end in [true, false] {
+        let mut t = Terminal::new(8, 40);
+        t.apply_config(&dark_theme());
+        t.apply_policy_engine(silencing_policy());
+        assert!(!has_997(&reply(&mut t, b"\x1b[?2031h\x1b]11;#ffffff\x07")));
+        if off_at_batch_end {
+            assert!(reply(&mut t, b"\x1b[?2031l").is_empty());
+            assert!(reply(&mut t, b"\x1b[?2031h").is_empty());
+        } else {
+            assert!(reply(&mut t, b"\x1b[?2031l\x1b[?2031h").is_empty());
+        }
+        t.apply_config(&light_theme());
+        assert_eq!(
+            has_997(&t.take_response().unwrap_or_default()),
+            !off_at_batch_end,
+            "owed only while no batch ended with 2031 off"
+        );
+    }
 }

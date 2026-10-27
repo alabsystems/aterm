@@ -464,3 +464,77 @@ fn a_keep_and_its_revert_within_one_save_land_in_order() {
         Some("Dracula")
     );
 }
+
+/// A SLIDER STEPS ONTO THE AUTOMATIC SIZE AND ON PAST IT: from one under the platform's automatic
+/// font size (12 px on macOS, 15 on Linux), two Right presses while the first still saves write
+/// the removal the automatic size is, then the size past it. Before, the removal in flight showed
+/// the file's old size, so the second press stepped onto the automatic size again and wrote
+/// nothing (Linux's 14 px plus two steps ended at 15). NEGATIVE CONTROL: from one over it, the
+/// steps are two plain writes.
+#[test]
+fn a_slider_steps_onto_the_automatic_size_and_past_it() {
+    let automatic = crate::FONT_PX;
+    for (start, writes) in [
+        (automatic - 1.0, [None, Some(automatic + 1.0)]),
+        (
+            automatic + 1.0,
+            [Some(automatic + 2.0), Some(automatic + 3.0)],
+        ),
+    ] {
+        let mut app = settings_app(&format!("font_px = {start}\n"), SettingsRoute::Home);
+        app.dispatch_native_event(
+            WindowId(0),
+            AppEvent::FocusChanged(Some(UiKey::new("settings/control/font_px"))),
+        )
+        .unwrap();
+        let mut shown = Vec::new();
+        for _ in 0..2 {
+            app.dispatch_native_event(
+                WindowId(0),
+                AppEvent::TextInput(crate::native_app::TextInputEvent::Right { extend: false }),
+            )
+            .unwrap();
+            shown.push(control(&app, "settings/control/font_px").0);
+        }
+        let number = |px: f32| SemanticValue::Number {
+            value: f64::from(px),
+            minimum: 6.0,
+            maximum: 200.0,
+        };
+        let steps = writes.map(|write| number(write.unwrap_or(automatic)));
+        assert_eq!(
+            shown, steps,
+            "from {start}: each press shows the size it writes"
+        );
+        let edits: Vec<Option<String>> = app
+            .native_config_pending
+            .iter()
+            .map(|request| match &request.work {
+                NativeConfigWork::Patch(patch) => patch
+                    .edits
+                    .iter()
+                    .find(|edit| edit.key == crate::prefs::EDIT_FONT_PX)
+                    .and_then(|edit| edit.value.clone()),
+                _ => panic!("from {start}: a font size write"),
+            })
+            .collect();
+        assert_eq!(
+            edits,
+            writes.map(|write| write.map(|px| px.to_string())),
+            "from {start}: both presses are writes"
+        );
+        app.native_config_inflight = false;
+        for _ in 0..2 {
+            let outcome = land_next(&mut app, None);
+            assert!(applied(&outcome), "from {start}: {outcome:?}");
+        }
+        assert_eq!(
+            file(&app),
+            format!(
+                "font_px = {}\n",
+                writes[1].expect("the last step writes a size")
+            ),
+            "from {start}"
+        );
+    }
+}

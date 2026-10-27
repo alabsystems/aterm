@@ -12,7 +12,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aterm_agent::supervise::config::CONTINUE_TEXT;
 use aterm_agent::supervise::policy::needs::NEEDS_HINT;
-use aterm_agent::supervise::policy::turn_end::TurnEndTiming;
+use aterm_agent::supervise::policy::turn_end::{
+    Cleared, Clearing, Outage, TurnEndTiming, cleared_text,
+};
 use aterm_agent::supervise::prompt::fixtures::{
     BOX_BASH_TOUCH, END_529, GOAL_ACTIVE_SUGGESTION, composer, screen,
 };
@@ -863,6 +865,14 @@ fn cruise_submit() -> String {
     format!("SUBMIT:{CONTINUE_TEXT}")
 }
 
+/// A usage limit's resume past its reset: one line, not Cruise's continuation ([`cleared_text`]).
+const RESUME: &str = cleared_text(Cleared::UsageLimit, Clearing::Measured);
+
+/// The worker's submit-log line for [`RESUME`].
+fn resume_submit() -> String {
+    format!("SUBMIT:{RESUME}")
+}
+
 /// Diagnostic summary of the loop's output, journal, submits, keys, events, and raw reads.
 fn evidence(inst: &Instance, out: &str) -> String {
     let reads = std::fs::read_to_string(inst.tmp.join("reads.log")).unwrap_or_default();
@@ -912,18 +922,20 @@ fn the_suggestion_is_typed_over_once_and_the_decision_after_it_is_escalated() {
     );
 }
 
-/// A 529 end is continued once after its backoff with a retry naming the wall.
+/// A 529 end is an outage (v6 §14.17.5.2): waited out to its first rung, then resumed once with
+/// the one blind line naming it.
 #[test]
-fn a_529_end_is_continued_once_after_its_backoff() {
+fn a_529_end_is_resumed_once_on_its_first_rung_with_the_one_line() {
     let inst = boot("r");
     let sid = boot_session(&inst);
     let (_keys, subs, _events) = start_worker(&inst, &sid, "e529");
-    let backoff = Duration::from_secs(1);
+    let rung = Duration::from_secs(1);
     let sup = Supervisor::start(
         &inst,
         &sid,
         TurnEndTiming {
-            retry_backoff: vec![backoff; 3],
+            outage_first: rung,
+            outage_cap: rung,
             ..TurnEndTiming::default()
         },
     );
@@ -935,12 +947,15 @@ fn a_529_end_is_continued_once_after_its_backoff() {
     let ev = evidence(&inst, &out);
     assert_eq!(submitted.len(), 2, "{ev}");
     assert_eq!(submitted[0], "SUBMIT:go", "{ev}");
-    assert!(
-        submitted[1].contains("(overloaded)") && submitted[1] != "SUBMIT:keep going",
-        "the wall named: {:?}\n{ev}",
-        submitted[1]
+    assert_eq!(
+        submitted[1],
+        format!(
+            "SUBMIT:{}",
+            cleared_text(Cleared::Outage(Outage::Overload), Clearing::Blind)
+        ),
+        "the one line naming the outage; {ev}"
     );
-    assert!(out.contains("rule=api-retry@v1 "), "{ev}");
+    assert!(out.contains("rule=outage-resume@v1 "), "{ev}");
 }
 
 /// Standing rules for the narrow-composer test (401 characters with Cruise's continuation).
@@ -1217,18 +1232,15 @@ fn a_weekly_wall_behind_a_shell_is_published_waited_out_and_continued_once() {
     );
     assert_eq!(
         submitted,
-        ["SUBMIT:go".to_string(), cruise_submit()],
+        ["SUBMIT:go".to_string(), resume_submit()],
         "{ev}"
     );
-    assert!(
-        continued_with(&out, "usage-resume@v1", CONTINUE_TEXT),
-        "{ev}"
-    );
+    assert!(continued_with(&out, "usage-resume@v1", RESUME), "{ev}");
 }
 
-/// A weekly wall on a displaced grid (cursor on the row below the prompt) is continued with Cruise's continuation, never a bare Enter.
+/// A weekly wall on a displaced grid (cursor on the row below the prompt) is continued with the resume's one line, never a bare Enter.
 #[test]
-fn a_weekly_wall_on_a_displaced_grid_is_continued_with_keep_going_not_a_bare_enter() {
+fn a_weekly_wall_on_a_displaced_grid_is_continued_with_the_resume_not_a_bare_enter() {
     let inst = boot("g");
     let sid = boot_session(&inst);
     let (_keys, subs, _events) = start_worker(&inst, &sid, "walldisplaced");
@@ -1251,16 +1263,13 @@ fn a_weekly_wall_on_a_displaced_grid_is_continued_with_keep_going_not_a_bare_ent
     let ev = evidence(&inst, &out);
     assert_eq!(
         submitted,
-        ["SUBMIT:go".to_string(), cruise_submit()],
+        ["SUBMIT:go".to_string(), resume_submit()],
         "{ev}"
     );
-    assert!(
-        continued_with(&out, "usage-resume@v1", CONTINUE_TEXT),
-        "{ev}"
-    );
+    assert!(continued_with(&out, "usage-resume@v1", RESUME), "{ev}");
 }
 
-/// A draft left in the composer at the wall is submitted with a bare Enter after the reset, never overwritten with `keep going`.
+/// A draft left in the composer at the wall is submitted with a bare Enter after the reset, never overwritten with `keep going` or the resume.
 #[test]
 fn a_draft_left_at_the_wall_is_submitted_after_the_reset_not_keep_going() {
     let inst = boot("j");
@@ -1289,7 +1298,9 @@ fn a_draft_left_at_the_wall_is_submitted_after_the_reset_not_keep_going() {
         "the draft is submitted as it stands; {ev}"
     );
     assert!(
-        out.contains("rule=usage-resume@v1") && !out.contains("keep going"),
+        out.contains("rule=usage-resume@v1")
+            && !out.contains("keep going")
+            && !out.contains(RESUME),
         "{ev}"
     );
 }
@@ -1316,13 +1327,10 @@ fn a_weekly_wall_scrolled_out_of_view_is_still_continued_at_its_reset() {
     let ev = evidence(&inst, &out);
     assert_eq!(
         submitted,
-        ["SUBMIT:go".to_string(), cruise_submit()],
+        ["SUBMIT:go".to_string(), resume_submit()],
         "{ev}"
     );
-    assert!(
-        continued_with(&out, "usage-resume@v1", CONTINUE_TEXT),
-        "{ev}"
-    );
+    assert!(continued_with(&out, "usage-resume@v1", RESUME), "{ev}");
 }
 
 /// A loop that replaces another at a scrolled wall continues waiting for the recorded reset and submits once.
@@ -1353,7 +1361,7 @@ fn a_loop_that_replaces_another_at_a_scrolled_wall_goes_on_waiting_for_its_reset
     let said_second = second.stop();
     assert_eq!(
         submitted,
-        ["SUBMIT:go".to_string(), cruise_submit()],
+        ["SUBMIT:go".to_string(), resume_submit()],
         "the successor: {}\nthe first said:\n{said_first}",
         evidence(&inst, &said_second)
     );
@@ -1362,7 +1370,7 @@ fn a_loop_that_replaces_another_at_a_scrolled_wall_goes_on_waiting_for_its_reset
         "the first loop typed nothing:\n{said_first}"
     );
     assert!(
-        continued_with(&said_second, "usage-resume@v1", CONTINUE_TEXT),
+        continued_with(&said_second, "usage-resume@v1", RESUME),
         "the successor said:\n{said_second}"
     );
 }

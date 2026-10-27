@@ -156,9 +156,10 @@ fn body_for(
     exe: &str,
     version: &str,
 ) -> String {
+    let format = publish::FENCE_IDENTITY_FORMAT;
     format!(
         "aterm publisher fence for claim {owner}; pid {pid}; nonce 1; sequence 0\n\n\
-         fence-format: 2\n\
+         fence-format: {format}\n\
          fence-pid: {pid}\n\
          fence-pgid: {pgid}\n\
          fence-host: {host}\n\
@@ -177,10 +178,14 @@ fn local_host() -> String {
     LocalProbe.host().expect("this machine has a hostname")
 }
 
-fn local_boot() -> String {
+fn local_boot_id() -> [u8; 16] {
     LocalProbe
         .boot()
         .expect("this machine publishes a boot session")
+}
+
+fn local_boot() -> String {
+    publish::boot_text(local_boot_id())
 }
 
 fn local_exe() -> String {
@@ -209,9 +214,15 @@ fn reaped_pid() -> (u32, u32) {
     (pid, pid)
 }
 
+/// The boot [`FakeProbe::here`] is in, which the fences below spell
+/// `5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B57`; `...4B56` is another boot.
+const BOOT_7: [u8; 16] = [
+    0x5C, 0x4A, 0x2E, 0x1B, 0x7D, 0x3F, 0x4A, 0x6E, 0x9B, 0x8C, 0x0D, 0x1E, 0x2F, 0x3A, 0x4B, 0x57,
+];
+
 struct FakeProbe {
     host: Option<String>,
-    boot: Option<String>,
+    boot: Option<[u8; 16]>,
     pids: HashMap<u32, PidState>,
     /// Process groups this fake can answer for; anything else is `Unknown`, as from a real
     /// probe that could not read the table, and `Unknown` never licenses a reclaim.
@@ -227,7 +238,7 @@ impl FakeProbe {
     fn here() -> Self {
         FakeProbe {
             host: Some("publisher-host".to_string()),
-            boot: Some("boot-session-7".to_string()),
+            boot: Some(BOOT_7),
             pids: HashMap::new(),
             groups: HashMap::new(),
             own_pgid: Some(PROBE_GROUP),
@@ -260,8 +271,8 @@ impl PublisherProbe for FakeProbe {
         self.host.clone()
     }
 
-    fn boot(&self) -> Option<String> {
-        self.boot.clone()
+    fn boot(&self) -> Option<[u8; 16]> {
+        self.boot
     }
 
     fn exe(&self) -> Option<String> {
@@ -287,8 +298,9 @@ impl PublisherProbe for FakeProbe {
     }
 }
 
-const FULL: &str = "fence-format: 2\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n\
-                    fence-boot: boot-session-7\nfence-exe: /opt/aterm/aterm-release\n";
+const FULL: &str = "fence-format: 3\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n\
+                    fence-boot: 5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B57\n\
+                    fence-exe: /opt/aterm/aterm-release\n";
 
 fn identity(extra: &str) -> FenceIdentity {
     FenceIdentity::parse(&format!(
@@ -380,7 +392,8 @@ fn a_child_that_outlived_its_publisher_keeps_the_fence_alive() {
 fn a_truncated_executable_name_is_never_read_as_a_mismatch() {
     let identity = identity(
         "fence-format: 1\nfence-pid: 4242\nfence-host: publisher-host\n\
-         fence-boot: boot-session-7\nfence-exe: /opt/aterm/aterm-release-cutter\n",
+         fence-boot: 5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B57\n\
+         fence-exe: /opt/aterm/aterm-release-cutter\n",
     );
     let probe = FakeProbe::here().with_pid(
         4242,
@@ -412,47 +425,63 @@ fn every_unprovable_shape_refuses_rather_than_guessing() {
         ("no liveness block at all (older binary)", ""),
         (
             "another host",
-            "fence-format: 2\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: some-other-mac\n\
-             fence-boot: boot-session-7\n",
+            "fence-format: 3\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: some-other-mac\n\
+             fence-boot: 5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B57\n",
         ),
         (
             "another boot session",
-            "fence-format: 2\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n\
-             fence-boot: boot-session-6\n",
+            "fence-format: 3\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n\
+             fence-boot: 5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B56\n",
         ),
         (
             "no pid",
-            "fence-format: 2\nfence-pgid: 4200\nfence-host: publisher-host\n\
-             fence-boot: boot-session-7\n",
+            "fence-format: 3\nfence-pgid: 4200\nfence-host: publisher-host\n\
+             fence-boot: 5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B57\n",
         ),
         (
             "no boot session",
-            "fence-format: 2\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n",
+            "fence-format: 3\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n",
         ),
         (
             "a newer format this binary cannot read",
             "fence-format: 99\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n\
-             fence-boot: boot-session-7\n",
+             fence-boot: 5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B57\n",
         ),
         (
             "an unprobeable pid",
-            "fence-format: 2\nfence-pid: 5151\nfence-pgid: 4200\nfence-host: publisher-host\n\
-             fence-boot: boot-session-7\n",
+            "fence-format: 3\nfence-pid: 5151\nfence-pgid: 4200\nfence-host: publisher-host\n\
+             fence-boot: 5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B57\n",
         ),
         (
             "no process group recorded (a format-1 fence)",
             "fence-format: 1\nfence-pid: 4242\nfence-host: publisher-host\n\
-             fence-boot: boot-session-7\nfence-exe: /opt/aterm/aterm-release\n",
+             fence-boot: 5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B57\n\
+             fence-exe: /opt/aterm/aterm-release\n",
         ),
         (
             "a process group the table could not be read for",
-            "fence-format: 2\nfence-pid: 4242\nfence-pgid: 4300\nfence-host: publisher-host\n\
-             fence-boot: boot-session-7\n",
+            "fence-format: 3\nfence-pid: 4242\nfence-pgid: 4300\nfence-host: publisher-host\n\
+             fence-boot: 5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B57\n",
         ),
         (
             "the process group this very process is in",
-            "fence-format: 2\nfence-pid: 4242\nfence-pgid: 9000\nfence-host: publisher-host\n\
+            "fence-format: 3\nfence-pid: 4242\nfence-pgid: 9000\nfence-host: publisher-host\n\
+             fence-boot: 5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B57\n",
+        ),
+        (
+            "a boot session that is not a boot id",
+            "fence-format: 3\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n\
              fence-boot: boot-session-7\n",
+        ),
+        (
+            "a boot id one hex digit short",
+            "fence-format: 3\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n\
+             fence-boot: 5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B5\n",
+        ),
+        (
+            "the all-zero boot id, which names no boot",
+            "fence-format: 3\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n\
+             fence-boot: 00000000-0000-0000-0000-000000000000\n",
         ),
     ] {
         let liveness = publish::fence_liveness(&identity(body), &probe);
@@ -464,8 +493,8 @@ fn every_unprovable_shape_refuses_rather_than_guessing() {
 
     for pid in [0u32, 1] {
         let body = format!(
-            "fence-format: 2\nfence-pid: {pid}\nfence-pgid: 4200\nfence-host: publisher-host\n\
-             fence-boot: boot-session-7\n"
+            "fence-format: 3\nfence-pid: {pid}\nfence-pgid: 4200\nfence-host: publisher-host\n\
+             fence-boot: 5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B57\n"
         );
         assert!(
             matches!(
@@ -495,6 +524,165 @@ fn every_unprovable_shape_refuses_rather_than_guessing() {
             "a machine that cannot identify itself cannot prove a pid is dead"
         );
     }
+}
+
+/// A boot is its 32 hex digits, which `astream_sys::parse_boot_id` reads in either letter
+/// case with every hyphen dropped wherever it falls: the kernel's 8-4-4-4-12 form, none, or
+/// any others. Each spelling of this boot is this boot.
+#[test]
+fn a_boot_is_its_sixteen_bytes_however_its_digits_are_spelled() {
+    let probe = FakeProbe::here()
+        .with_pid(4242, PidState::NotRunning)
+        .with_group(FENCE_GROUP, &[]);
+    for spelled in [
+        "5C4A2E1B-7D3F-4A6E-9B8C-0D1E2F3A4B57",
+        "5c4a2e1b-7d3f-4a6e-9b8c-0d1e2f3a4b57",
+        "5c4A2e1B-7d3F-4a6E-9b8C-0d1E2f3A4b57",
+        "5C4A2E1B7D3F4A6E9B8C0D1E2F3A4B57",
+        "5-C-4-A-2E1B7D3F4A6E9B8C0D1E2F3A4B57",
+        "-5C4A2E1B7D3F4A6E9B8C0D1E2F3A4B57-",
+    ] {
+        let identity = identity(&format!(
+            "fence-format: 3\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n\
+             fence-boot: {spelled}\nfence-exe: /opt/aterm/aterm-release\n"
+        ));
+        let liveness = publish::fence_liveness(&identity, &probe);
+        assert!(
+            matches!(liveness, FenceLiveness::Dead(_)),
+            "{spelled} is this boot, so the absent pid and empty group are proof of death: \
+             {liveness:?}"
+        );
+    }
+}
+
+#[test]
+fn a_boot_stamped_in_a_pre_astream_form_refuses_and_says_so() {
+    let probe = FakeProbe::here()
+        .with_pid(4242, PidState::NotRunning)
+        .with_group(FENCE_GROUP, &[]);
+    // The Linux stamp carries this very boot's id behind its prefix, and still refuses:
+    // only a boot id is compared.
+    for stamp in [
+        "kern.boottime:1",
+        "kern.boottime:1792190170",
+        "linux-boot-id:5c4a2e1b-7d3f-4a6e-9b8c-0d1e2f3a4b57",
+    ] {
+        let identity = identity(&format!(
+            "fence-format: 2\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n\
+             fence-boot: {stamp}\nfence-exe: /opt/aterm/aterm-release\n"
+        ));
+        match publish::fence_liveness(&identity, &probe) {
+            FenceLiveness::Unprovable(detail) => assert!(
+                detail.contains("pre-astream form") && detail.contains(stamp),
+                "the refusal names the stamp and why it cannot be compared: {detail}"
+            ),
+            other => panic!("{stamp} must be UNPROVABLE, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_boot_the_fence_writes_reads_back_as_the_same_bytes() {
+    let mut other = BOOT_7;
+    other[15] ^= 1;
+    for id in [BOOT_7, other, [0xFF; 16]] {
+        let text = publish::boot_text(id);
+        assert_eq!(text.len(), 36, "{text}");
+        assert_eq!(
+            text.match_indices('-')
+                .map(|(at, _)| at)
+                .collect::<Vec<_>>(),
+            [8, 13, 18, 23],
+            "the kernel's 8-4-4-4-12 form: {text}"
+        );
+        assert_eq!(astream_sys::parse_boot_id(text.as_bytes()), Some(id));
+    }
+}
+
+/// The last fence format whose `fence-boot` was a stamp (`kern.boottime:<secs>`,
+/// `linux-boot-id:<id>`) that its readers compare as text.
+const LAST_STAMPED_BOOT_FORMAT: u32 = 2;
+
+/// A cutter built before the boot became its id reads `fence-boot` as a stamp and
+/// compares it as text, so a boot id would read to it as another boot: it would tell the
+/// operator a live publisher "cannot be that publisher any more". The format this binary
+/// writes must be one that cutter refuses as newer than its own, by its own rule.
+#[test]
+fn a_fence_naming_its_boot_by_id_is_a_format_a_stamp_reader_refuses_as_newer() {
+    let fixture = bare_fixture("format-names-boot-id");
+    let git_a = Git::new(&fixture.repo_a);
+    let git_b = Git::new(&fixture.repo_b);
+    this_invocation_publishes();
+    publish::acquire_release_lease(&git_a, &fixture.owner).unwrap();
+    let guard = publish::acquire_publisher_fence(&git_a, &fixture.owner).unwrap();
+    let written = publish::publisher_fence_identity(&git_b, guard.token());
+    publish::release_publisher_fence(&git_a, &guard).unwrap();
+    let boot = written.boot.as_deref().expect("the fence records its boot");
+    assert_eq!(
+        astream_sys::parse_boot_id(boot.as_bytes()),
+        Some(local_boot_id()),
+        "the fence names its boot by the kernel's boot id: {written:?}"
+    );
+    let format = written.format.expect("the fence records its format");
+    assert!(
+        format > LAST_STAMPED_BOOT_FORMAT,
+        "fence-boot holds a boot id, which a format-{LAST_STAMPED_BOOT_FORMAT} reader would \
+         compare as a stamp; the fence declares fence-format {format}, which that reader \
+         does not refuse as newer than its own"
+    );
+    // Every format this binary reads is still read: a stamped fence keeps its precise
+    // pre-astream refusal, never "newer than this binary's".
+    let probe = FakeProbe::here()
+        .with_pid(4242, PidState::NotRunning)
+        .with_group(FENCE_GROUP, &[]);
+    for format in 1..=publish::FENCE_IDENTITY_FORMAT {
+        let identity = identity(&format!(
+            "fence-format: {format}\nfence-pid: 4242\nfence-pgid: 4200\n\
+             fence-host: publisher-host\nfence-boot: kern.boottime:1792190170\n"
+        ));
+        match publish::fence_liveness(&identity, &probe) {
+            FenceLiveness::Unprovable(detail) => assert!(
+                !detail.contains("newer than") && detail.contains("kern.boottime:1792190170"),
+                "fence-format {format}: {detail}"
+            ),
+            other => panic!("fence-format {format} with a stamp must be UNPROVABLE, got {other:?}"),
+        }
+    }
+}
+
+/// A refusal's version note never says a fence predates the format it carries.
+#[test]
+fn the_version_note_names_the_format_that_first_recorded_a_version() {
+    let fence = publish::PublisherFence {
+        token: "1".repeat(40),
+        owner: "2".repeat(40),
+    };
+    let liveness = FenceLiveness::Unprovable("test".to_string());
+    for format in 1..=publish::FENCE_IDENTITY_FORMAT {
+        let identity = identity(&format!(
+            "fence-format: {format}\nfence-pid: 4242\nfence-host: publisher-host\n"
+        ));
+        let refusal =
+            publish::publisher_fence_refusal(&fence, &identity, &liveness, Some("0.87.0"));
+        for older_or_same in 1..=format {
+            assert!(
+                !refusal.contains(&format!("predates fence-format {older_or_same}")),
+                "a fence-format {format} fence does not predate fence-format {older_or_same}: \
+                 {refusal}"
+            );
+        }
+        assert!(
+            refusal.contains("v0.87.0 is THIS invocation's version"),
+            "{refusal}"
+        );
+    }
+    let unrecorded = identity("");
+    let refusal = publish::publisher_fence_refusal(&fence, &unrecorded, &liveness, Some("0.87.0"));
+    assert!(
+        refusal.contains("predates fence-format 1"),
+        "a fence with no liveness block predates the first format, which recorded the version: \
+         {refusal}"
+    );
 }
 
 #[test]
@@ -709,25 +897,55 @@ fn a_fence_from_another_host_refuses_and_is_kept() {
 
 #[test]
 fn a_fence_from_another_boot_session_refuses_and_is_kept() {
-    let fixture = bare_fixture("other-boot");
+    let mut another = local_boot_id();
+    another[15] ^= 1;
+    let refusal = dead_publishers_fence_naming_boot_is_kept(
+        "other-boot",
+        publish::FENCE_IDENTITY_FORMAT,
+        &publish::boot_text(another),
+    );
+    assert!(refusal.contains("UNPROVABLE"), "{refusal}");
+}
+
+#[test]
+fn a_fence_naming_its_boot_in_a_pre_astream_form_refuses_and_is_kept() {
+    let refusal = dead_publishers_fence_naming_boot_is_kept(
+        "pre-astream-boot",
+        LAST_STAMPED_BOOT_FORMAT,
+        "kern.boottime:1",
+    );
+    assert!(
+        refusal.contains("UNPROVABLE") && refusal.contains("pre-astream form (kern.boottime:1)"),
+        "{refusal}"
+    );
+}
+
+/// A fence on this host in fence-format `format`, whose publisher is gone, its boot
+/// recorded as `boot`, is refused by the preflight and kept by a `--resume`; the
+/// preflight's refusal is returned.
+fn dead_publishers_fence_naming_boot_is_kept(name: &str, format: u32, boot: &str) -> String {
+    let fixture = bare_fixture(name);
     let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
     let (dead, dead_group) = reaped_pid();
-    let token = forge_fence(
-        &fixture.repo_a,
+    let body = body_for(
         &fixture.owner,
-        &body_for(
-            &fixture.owner,
-            dead,
-            dead_group,
-            &local_host(),
-            "kern.boottime:1",
-            &local_exe(),
-            "0.87.0",
-        ),
+        dead,
+        dead_group,
+        &local_host(),
+        boot,
+        &local_exe(),
+        "0.87.0",
+    )
+    .replace(
+        &format!("fence-format: {}\n", publish::FENCE_IDENTITY_FORMAT),
+        &format!("fence-format: {format}\n"),
     );
-    publish::preflight_release_lease(&git).unwrap_err();
+    let token = forge_fence(&fixture.repo_a, &fixture.owner, &body);
+    let refusal = publish::preflight_release_lease(&git)
+        .unwrap_err()
+        .to_string();
     assert!(matches!(
         publish::reclaim_dead_publisher_fence(&git, &fixture.owner, &LocalProbe).unwrap(),
         FenceReclaim::Kept { .. }
@@ -736,6 +954,49 @@ fn a_fence_from_another_boot_session_refuses_and_is_kept() {
         publish::publisher_fence(&git).unwrap().unwrap().token,
         token
     );
+    refusal
+}
+
+#[test]
+fn a_fence_naming_this_boot_in_the_other_letter_case_is_reclaimed() {
+    let fixture = bare_fixture("boot-case");
+    let git = Git::new(&fixture.repo_a);
+    this_invocation_publishes();
+    publish::acquire_release_lease(&git, &fixture.owner).unwrap();
+    let ours = local_boot();
+    let swapped: String = ours
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    assert_ne!(
+        swapped, ours,
+        "this boot's id has a hex letter whose case can be swapped"
+    );
+    let (dead, dead_group) = reaped_pid();
+    let stale = forge_fence(
+        &fixture.repo_a,
+        &fixture.owner,
+        &body_for(
+            &fixture.owner,
+            dead,
+            dead_group,
+            &local_host(),
+            &swapped,
+            &local_exe(),
+            "0.87.0",
+        ),
+    );
+    match publish::reclaim_dead_publisher_fence(&git, &fixture.owner, &LocalProbe).unwrap() {
+        FenceReclaim::Reclaimed { token, .. } => assert_eq!(token, stale),
+        other => panic!("{swapped} is this boot ({ours}), so the fence is reclaimed: {other:?}"),
+    }
+    assert_eq!(publish::publisher_fence(&git).unwrap(), None);
 }
 
 #[test]

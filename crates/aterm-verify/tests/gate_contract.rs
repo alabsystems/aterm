@@ -525,6 +525,100 @@ exit 0"#
 }
 
 #[test]
+fn admitted_test_workers_keep_their_share_on_replay_and_serial_fallback() {
+    use std::num::NonZeroU32;
+    for extra in ["", "cfg=''"] {
+        let repo = FakeRepo::new();
+        let bins = [
+            ("fixture", "--test a", "a"),
+            ("fixture", "--test b", "b"),
+            ("fixture", "--test c", "c"),
+            ("fixture", "--test d", "d"),
+        ];
+        with_recording_cargo(&repo, &bins, extra);
+        for (_, _, name) in bins {
+            common::standin_body(
+                &repo.root.join(format!("target/debug/deps/{name}-1")),
+                &format!(
+                    "[ \"$RUST_TEST_THREADS\" = 2 ] && [ \"$CARGO_BUILD_JOBS\" = 6 ] || exit 99\necho RAN-{name}-threads-$RUST_TEST_THREADS-build-$CARGO_BUILD_JOBS\nprintf '\\nrunning 1 test\\ntest {name}::fine ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n\\n'"
+                ),
+            );
+        }
+        let mut ctx = repo.ctx(&[Check::Test], Scope::workspace());
+        ctx.env.build_slot_held = Some("1".into());
+        ctx.env.cargo_build_jobs = Some("6".into());
+        ctx.child_env_add
+            .push(("CARGO_BUILD_JOBS".into(), "6".into()));
+        ctx = ctx
+            .with_test_jobs(NonZeroU32::new(u32::MAX))
+            .with_test_threads(NonZeroU32::new(2));
+        ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+        let spec = plan::plan(&ctx)
+            .into_iter()
+            .find(|s| s.id == StageId::Test)
+            .expect("test stage");
+        let report = stages::run_stage(&ctx, &spec);
+        let block = report.render();
+        assert!(!tally(std::slice::from_ref(&report)).failed(), "{block}");
+        for name in ["a", "b", "c", "d"] {
+            assert!(
+                block.contains(&format!("RAN-{name}-threads-2-build-6")),
+                "{block}"
+            );
+        }
+        if extra.is_empty() {
+            assert!(
+                block.contains("RUST_TEST_THREADS=2 each, 3 at a time"),
+                "{block}"
+            );
+        } else {
+            assert!(block.contains("run by cargo, one at a time"), "{block}");
+        }
+    }
+}
+
+#[test]
+fn invalid_managed_admission_refuses_before_any_stage_or_cli_check() {
+    let repo = FakeRepo::new();
+    let mut ctx = repo.ctx(&[Check::Test], Scope::workspace());
+    ctx.env.build_slot_held = Some("1".into());
+    ctx.env.cargo_build_jobs = None;
+    let (block, code) = run_ctx(&ctx);
+    assert_eq!(code, exit::USAGE, "{block}");
+    assert!(block.contains("no check was run"), "{block}");
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::TestCompile)
+        .expect("compile stage");
+    assert!(
+        stages::run_stage(&ctx, &spec)
+            .render()
+            .contains("no stage was run")
+    );
+    for value in [None, Some("0"), Some("no"), Some("4294967296")] {
+        let mut cmd = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm-verify"));
+        cmd.arg("test")
+            .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .env("BUILD_SLOT_HELD", "1");
+        if let Some(value) = value {
+            cmd.env("CARGO_BUILD_JOBS", value);
+        } else {
+            cmd.env_remove("CARGO_BUILD_JOBS");
+        }
+        let output = aterm_uds::deadline::output_until(
+            &mut cmd,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .expect("CLI refusal");
+        assert_eq!(output.status.code(), Some(exit::USAGE), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no check was run"),
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
 fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     let repo = FakeRepo::new();
     let marks = repo.scratch.join("marks");

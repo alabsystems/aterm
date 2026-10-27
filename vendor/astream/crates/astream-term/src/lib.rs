@@ -46,6 +46,7 @@ pub mod events;
 pub mod ops;
 pub mod perceive;
 pub mod predict;
+pub mod program_predict;
 pub mod record;
 pub mod render;
 pub mod screen;
@@ -65,12 +66,19 @@ pub use predict::{
     echo_admit_causal_watermark, echo_causal_watermark_select, echo_watermark_monotone,
     watermark_advances, Predictor, Verdict,
 };
+pub use program_predict::{
+    is_cursor_relative_ops, program_ops_within_cap, program_rule_cap_clamp, ProgramPredictor,
+    ScreenContext, SpeculativeTerminal, MAX_OPS_PER_RULE, MAX_PROGRAM_RULES, MAX_RULE_INPUT_BYTES,
+};
 pub use record::{record_client_seq_advance, record_tag_paints_screen, Record};
 pub use render::{
     animation, frame_hash, rasterize, render_clamp_end_offset, render_frame_changed, AnimFrame,
     Image,
 };
 pub use screen::{
-    apply_ops, apply_ops_to, dec_special_graphic, emit_ops, fold, screen_clamp_dim,
-    screen_coord_in_bounds, Cell, Charset, Color, Folder, Screen,
+    apply_ops, apply_ops_to, cell_width_is_valid, char_display_width, color_clamp_channel,
+    combining_cap_clamp, combining_len_within_cap, dec_special_graphic, emit_ops, fold,
+    is_combining_mark, is_wide_char, screen_clamp_dim, screen_coord_in_bounds,
+    wide_cell_width_clamp, wide_spacer_col_clamp, Cell, Charset, Color, Folder, Screen,
+    MAX_COMBINING,
 };

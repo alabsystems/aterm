@@ -131,6 +131,40 @@ A tab kept across an aterm update makes macOS check aterm's earlier copy at ever
 starts, listed or not: run builds and tests from a new tab. Such a tab reads
 `attribution=adopted` in `status`, as does every tab a new aterm process took over.
 
+## When one of macOS's services holds the memory
+
+A service of macOS's own can grow far past what it needs and push the Mac into swap. `status`
+carries `service_mem=<-|ok|large|huge>` and `service_mem_top=<name>:<MiB>`: `large` is a
+service past the bar any service needs (a sixteenth of memory, 8 GiB at least: 8 GiB on a
+128 GiB Mac) for ten minutes, `huge` past a quarter (16 GiB at least). Only the installed app's
+window watches, so a lab instance or the dev app reads `-`. `sys why mem` names each service
+past the large bar in a `cause id=service-memory` line whether or not a Deck is in view, and
+`aterm doctor`'s `services:` row says the same. A bare `sys why` turns to memory for a
+service only past the huge bar. aterm detects this early and repairs it. It also keeps its
+own churn out of fseventsd: its build cache, verify's side lanes, release targets and test
+scratch sit in `.ubd` folders, whose file events fseventsd drops before it delivers or keeps
+them (observed on macOS 27.0, documented nowhere), and `targo --unverified test` runs with
+`$TMPDIR/.ubd/` as its `TMPDIR`. Scratch you make by hand belongs under `$TMPDIR/.ubd/` or
+`/tmp/.ubd/` too, except for a test that waits for FSEvents there, which hears nothing; what
+still grows fseventsd is another program's churn.
+
+A `cause id=service-memory` line alone is a fact for later, not a request: the person sees the
+same fact in Messages. Only a reply's `do class=restart service=fseventsd may=person
+destructive=1` line asks for the restart. It appears when fseventsd, the one service aterm
+knows a safe restart for, holds past the huge bar while memory is under pressure (when aterm's
+window raises its alert) and the person has not put that alert off for this fseventsd. Only
+then report `NEEDS YOU: restart fseventsd (aterm init --only init.fseventsd)`; your tool shell
+has no terminal to ask the password in. Never signal another user's process yourself.
+
+`aterm init --only init.fseventsd` asks for the person's password with `sudo -v` (the prompt
+names fseventsd and the cost), then sends SIGTERM to the one process it measured. The restart
+is destructive: the new fseventsd discards the disk's change history, so Time Machine and
+Spotlight scan the disk again, and for about half a minute it refuses apps that start watching
+files. A 152 GB fseventsd took 14.7 s to end, and launchd started the new one within
+milliseconds of that end; the item waits for both and reports a restart in progress rather
+than a failure, and restarts nothing again within five minutes. A plain `aterm init` never
+restarts it; it names the command.
+
 ## Acting on what you read
 
 Processes of other tabs, other aterm instances and other users are shown as data, not yours to

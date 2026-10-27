@@ -122,7 +122,8 @@ impl Rig {
             let px = (w * ws.scale).round() as usize;
             ws.cols = u16::try_from((px - 2 * pad) / cw).expect("a window's columns");
         }
-        ws.metrics.head = crate::stats_deck::deck_px(StatsBars::Deck, form, ws.scale, cell);
+        ws.metrics.head =
+            crate::stats_deck::reserved_deck_px(StatsBars::Deck, form, ws.scale, cell);
     }
 
     fn rest_on_hit(&mut self, pick: impl Fn(&Hit) -> bool) -> Hit {
@@ -364,9 +365,10 @@ fn the_keyboard_lens_takes_its_keys_and_any_other_key_closes_it_and_goes_on() {
     r.named(KeyCode::ArrowLeft, NamedKey::ArrowLeft);
     assert_eq!(
         r.lens(),
-        at(Instrument::Processes, Bar::Global),
+        at(Instrument::NetworkState, Bar::Global),
         "the focus wraps"
     );
+    r.named(KeyCode::ArrowLeft, NamedKey::ArrowLeft);
     r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
     assert_eq!(r.lens(), at(Instrument::Processes, Bar::Aterm));
     r.named(KeyCode::ArrowUp, NamedKey::ArrowUp);
@@ -404,6 +406,11 @@ fn the_keyboard_lens_takes_its_keys_and_any_other_key_closes_it_and_goes_on() {
         "Return pins it"
     );
     r.named(KeyCode::ArrowRight, NamedKey::ArrowRight);
+    assert!(
+        r.lens()
+            .is_some_and(|lens| lens.focus == Instrument::NetworkState)
+    );
+    r.named(KeyCode::ArrowRight, NamedKey::ArrowRight);
     assert_eq!(
         r.lens(),
         Some(Lens {
@@ -439,6 +446,8 @@ fn a_pinned_lens_steps_the_instruments_and_command_c_copies_their_sentence() {
         "and wraps"
     );
     r.named(KeyCode::ArrowLeft, NamedKey::ArrowLeft);
+    assert_eq!(r.lens().map(|l| l.focus), Some(Instrument::NetworkState));
+    r.named(KeyCode::ArrowLeft, NamedKey::ArrowLeft);
     assert_eq!(r.lens().map(|l| l.focus), Some(Instrument::Processes));
 
     r.command(KeyCode::KeyC, "c");
@@ -468,6 +477,39 @@ fn a_pinned_lens_steps_the_instruments_and_command_c_copies_their_sentence() {
     r.named(KeyCode::ArrowRight, NamedKey::ArrowRight);
     assert_eq!(r.lens(), None);
     assert_eq!(r.sent(), "\x1b[C");
+}
+
+#[test]
+fn cpu_hardware_report_copy_and_resample_stay_in_the_existing_lens() {
+    let mut r = rig("sill");
+    let (on, _) = r.instrument(Instrument::Cpu);
+    r.move_to(on);
+    r.click(MouseButton::Left);
+    let expected = super::cpu_diagnostic_report(r.app.vitals.snapshot.as_deref().unwrap());
+    r.chord(
+        ModifiersState::SUPER | ModifiersState::SHIFT,
+        KeyCode::KeyC,
+        "C",
+    );
+    assert_eq!(r.clipboard(), Some(expected));
+    assert!(r.lens().is_some_and(|l| l.focus == Instrument::Cpu));
+    assert!(
+        !r.app.vitals.reader_runs(),
+        "a headless lens has no native reader"
+    );
+    r.command(KeyCode::KeyR, "r");
+    assert!(
+        !r.app.vitals.reader_runs(),
+        "resampling cannot start a second reader"
+    );
+    assert!(r.lens().is_some_and(|l| l.focus == Instrument::Cpu));
+    assert_eq!(r.sent(), "", "diagnostic keys never reach the shell");
+    r.command(KeyCode::KeyC, "c");
+    assert_eq!(
+        r.clipboard(),
+        Some(r.sentence(Instrument::Cpu)),
+        "plain Copy is unchanged"
+    );
 }
 
 #[test]
@@ -578,23 +620,26 @@ fn the_decks_rows_cells_and_state_labels_open_their_lens() {
         "a hover lens's Esc goes on to the program"
     );
 
+    // A scope's own segment of a bar picks it, however small its share: the rig's aterm holds
+    // a sliver of memory, and its segment still takes a target the pointer can rest on.
     r.deck(DeckForm::Folded, Some(1200.0));
-    r.rest_on_hit(|h| h.kind == HitKind::Row(Instrument::Disk, Bar::Tab));
+    let hit = r.rest_on_hit(|h| h.kind == HitKind::Row(Instrument::Memory, Bar::Aterm));
+    assert!(hit.rect.2 >= 6.0, "the aterm segment's target: {hit:?}");
     assert_eq!(
         r.lens(),
         Some(Lens {
-            focus: Instrument::Disk,
-            bar: Bar::Tab,
+            focus: Instrument::Memory,
+            bar: Bar::Aterm,
             how: Opened::Hover,
         }),
-        "a rest on a Folded scope cell"
+        "a rest on a Folded bar's aterm segment"
     );
     r.click(MouseButton::Left);
     assert_eq!(
         r.lens(),
         Some(Lens {
-            focus: Instrument::Disk,
-            bar: Bar::Tab,
+            focus: Instrument::Memory,
+            bar: Bar::Aterm,
             how: Opened::Pinned,
         }),
         "a click pins it"
@@ -638,7 +683,7 @@ fn a_rest_on_the_decks_header_opens_how_to_read() {
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
     let ws = r.app.windows.get_mut(&r.wid).expect("window");
-    let deck = crate::stats_deck::deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
+    let deck = crate::stats_deck::reserved_deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
     ws.metrics.head = deck;
     let (on, _) = r.hit(|h| h.kind == crate::stats_paint::HitKind::Header);
     r.move_to(on);
@@ -660,7 +705,8 @@ fn why_now_reads_the_front_tab_by_every_pane() {
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
     let ws = r.app.windows.get_mut(&r.wid).expect("window");
-    ws.metrics.head = crate::stats_deck::deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
+    ws.metrics.head =
+        crate::stats_deck::reserved_deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
     let other = r.app.split_active_stub_tab(r.wid);
     assert!(
         other > r.session,
@@ -710,7 +756,8 @@ fn a_split_front_tab_reads_every_pane() {
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
     let ws = r.app.windows.get_mut(&r.wid).expect("window");
-    ws.metrics.head = crate::stats_deck::deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
+    ws.metrics.head =
+        crate::stats_deck::reserved_deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
     let other = r.app.split_active_stub_tab(r.wid);
     assert_eq!(
         r.app.deck_tab_panes(r.wid),
@@ -761,15 +808,21 @@ fn the_tree_reads_the_deck_and_its_lens() {
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
     let ws = r.app.windows.get_mut(&r.wid).expect("window");
-    ws.metrics.head = crate::stats_deck::deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
+    ws.metrics.head =
+        crate::stats_deck::reserved_deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
 
     let stats = r.app.stats_a11y(r.wid).expect("the deck is read");
     let group = &stats.group;
-    assert_eq!(group.name, "Stats deck, last 10 minutes");
+    assert_eq!(group.name, "Stats deck, newest first");
     let names: Vec<&str> = group.meters.iter().map(|m| m.name.as_str()).collect();
     assert_eq!(
-        names,
+        &names[..6],
         ["CPU", "GPU", "Memory", "Disk", "Network", "Processes"]
+    );
+    assert_eq!(
+        names.len(),
+        10,
+        "four network and shared-service cells are read too"
     );
     assert_eq!(group.meters[0].words, r.sentence(Instrument::Cpu));
     assert_eq!(group.meters[2].words, r.sentence(Instrument::Memory));
@@ -889,7 +942,7 @@ fn a_reading_keeps_the_lens_shell_and_a_move_of_its_inks_or_width_redraws_it() {
         let (lg, lens, f) = app.lens_frame(wid).expect("the lens is open");
         let laid = super::lay_lens(
             &lg,
-            &app.lens_input(&f),
+            &app.lens_input(&f, wid),
             &lens,
             &super::deck_metrics(),
             true,

@@ -5,8 +5,7 @@ struct VsOut {
     float4 pos [[position]];
 };
 
-// Named `vs_fs` to match the WGSL twin (`renderer.rs::SHIMMER_SHADER`); see
-// `bloom.metal`.
+// Named `vs_fs` as the WGSL twin was; see `bloom.metal`.
 vertex VsOut vs_fs(uint vi [[vertex_id]]) {
     const float2 xy[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
     VsOut o;

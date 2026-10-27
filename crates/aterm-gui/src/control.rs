@@ -4327,14 +4327,13 @@ fn fabric_status_line() -> String {
     };
     #[cfg(not(unix))]
     let (supervised, command) = (false, "- argv=-".to_string());
-    let (reason, rtt, age) = crate::fabric::fabric_link_facts();
+    let (state, reason, rtt, age) = crate::fabric::fabric_link_status();
     let (lane, bridge_build, faults) = crate::fabric::fabric_bridge_facts();
     let n = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
     let mirror = crate::fabric::fabric_mirror_facts();
     format!(
-        "OK state={} supervised={} command={command} reason={reason} rtt_ms={} link_age_ms={} \
-         build={} bridge_lane={} bridge_build={} lane_faults={faults}{mirror}\n",
-        crate::fabric::fabric_state(),
+        "OK state={state} supervised={} command={command} reason={reason} rtt_ms={} \
+         link_age_ms={} build={} bridge_lane={} bridge_build={} lane_faults={faults}{mirror}\n",
         u8::from(supervised),
         n(rtt),
         n(age),
@@ -4703,6 +4702,7 @@ fn dispatch_owner(
         "appnotice" => control_query::cmd_appnotice(proxy, rest),
         "notice" => control_query::cmd_notice(proxy, rest),
         "devtools" => control_query::cmd_devtools(proxy, rest),
+        "permissions" => control_query::cmd_permissions(proxy, rest),
         "person" => control_media::cmd_person(proxy, rest),
         "fabric" => dispatch_fabric_verb(rest, selector, scope, store),
         _ => no_handler(verb),
@@ -7838,7 +7838,7 @@ fn peek_push_peer(stream: &CtlStream) -> std::io::Result<usize> {
 
 const SUBSCRIBE_USAGE: &str = "ERR usage: subscribe [@<sel>[,@<sel>...]|@*] <streams> \
                                [since=<seq>] [since-turn=<id>] [since-block=<id>] \
-                               [since-log=<seq> log-ep=<e>] [every-frame]\n";
+                               [since-log=<seq> log-ep=<e> [log-base=<b>]] [every-frame]\n";
 
 fn subscribe_usage_bytes() -> Vec<u8> {
     format!(
@@ -7894,6 +7894,7 @@ pub(crate) fn run_subscribe_with_peer_probe<W: Write, L: subscribe::PeerLiveness
     let mut since_block: Option<u64> = None;
     let mut since_log: Option<u64> = None;
     let mut log_ep: Option<u32> = None;
+    let mut log_base: Option<u32> = None;
     let mut non_coalesced = false;
     for tok in it {
         let parse_u64 = |v: &str| v.parse::<u64>().ok();
@@ -7906,6 +7907,11 @@ pub(crate) fn run_subscribe_with_peer_probe<W: Write, L: subscribe::PeerLiveness
             match v.parse::<u32>().ok() {
                 Some(n) => log_ep = Some(n),
                 None => return write_err(writer, b"ERR bad log-ep\n"),
+            }
+        } else if let Some(v) = tok.strip_prefix("log-base=") {
+            match v.parse::<u32>().ok() {
+                Some(n) => log_base = Some(n),
+                None => return write_err(writer, b"ERR bad log-base\n"),
             }
         } else if let Some(v) = tok.strip_prefix("since=") {
             match parse_u64(v) {
@@ -7934,9 +7940,16 @@ pub(crate) fn run_subscribe_with_peer_probe<W: Write, L: subscribe::PeerLiveness
         let _ = writer.flush();
         return;
     };
-    let log_since = match (since_log, log_ep) {
-        (None, None) => None,
-        (Some(seq), Some(ep)) => Some(aterm_slog::Cursor::new(ep, seq)),
+    let log_since = match (since_log, log_ep, log_base) {
+        (None, None, None) => None,
+        (Some(seq), Some(ep), None) => Some(aterm_slog::Cursor::new(ep, seq)),
+        (Some(seq), Some(ep), Some(base)) => Some(aterm_slog::Cursor::new(ep, seq).of_log(base)),
+        (None, None, Some(_)) => {
+            return write_err(
+                writer,
+                b"ERR usage: log-base= needs since-log= and log-ep=\n",
+            );
+        }
         _ => {
             return write_err(writer, b"ERR usage: since-log= and log-ep= go together\n");
         }
@@ -8865,6 +8878,15 @@ fn serve_session_verb(
         );
     }
     let host = GuiHost::with_fleet(session, term, Some(proxy), store, ctx);
+
+    // Resolve and authorize the target before routing this owner-only operation.
+    // It shares the panel's operation and must not enter the generic sys reader.
+    if verb == "sys" && rest.split_whitespace().next() == Some("policy") {
+        #[cfg(target_os = "macos")]
+        return crate::cpu_policy_authorization::control(proxy, scope, session, rest);
+        #[cfg(not(target_os = "macos"))]
+        return "ERR CPU policy collection unavailable on this platform\n".into();
+    }
 
     match json_ask(form, verb, rest) {
         JsonAsk::No => {}

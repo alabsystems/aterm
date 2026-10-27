@@ -579,6 +579,7 @@ fn reading(pid: u32, api_ms: u64, five: Option<u32>, seven: Option<u32>) -> Read
         cache_expires_at: None,
         version: None,
         model: None,
+        ctx_left: None,
         dur_us: 0,
     }
 }
@@ -613,6 +614,32 @@ fn a_reading_keeps_the_vendors_tenths_and_its_model() {
     let odd = text.replace("claude-opus-5-5", "not a model; rm -rf");
     let r = Reading::of_stdin(&odd, &vars(), 1_792_050_000).expect("a reading");
     assert_eq!(r.model, None);
+}
+
+/// THE CONTEXT LEFT (Claude Code 2.1.311's status-line payload): `context_window` carries
+/// `remaining_percentage`, Claude Code's own count of the window left, which the file keeps
+/// rounded for the survey; before the first reply it is `null`, and an older file, which never
+/// had it, reads as none.
+#[test]
+fn a_reading_keeps_the_context_left_claude_code_counts() {
+    let text = r#"{"cost":{"total_api_duration_ms":9},"context_window":{"total_input_tokens":
+71000,"context_window_size":200000,"used_percentage":35.4,"remaining_percentage":64.6},
+"rate_limits":{"five_hour":{"used_percentage":7,"resets_at":1792062396}}}"#;
+    let r = Reading::of_stdin(text, &vars(), 1_792_050_000).expect("a reading");
+    assert_eq!(r.ctx_left, Some(65));
+    assert_eq!(Reading::of_json(&r.to_json()).expect("reads back"), r);
+    let fresh = text.replace("64.6}", "null}");
+    let r = Reading::of_stdin(&fresh, &vars(), 1_792_050_000).expect("a reading");
+    assert_eq!(r.ctx_left, None, "no reply yet");
+    let wild = text.replace("64.6}", "164}");
+    let r = Reading::of_stdin(&wild, &vars(), 1_792_050_000).expect("a reading");
+    assert_eq!(r.ctx_left, None, "past 100 is no percent");
+    let old = r#"{"v":1,"at":5,"sid":"s-1","pid":7,"session":null,"login":null,"home":null,
+"api_ms":3,"five_hour":null,"seven_day":null,"cache":{},"version":null}"#;
+    assert_eq!(
+        Reading::of_json(old).expect("an older file reads").ctx_left,
+        None
+    );
 }
 
 /// WHAT A READING SAYS BESIDE THE LAST ADMITTED ([`Fresh::beside`]): the

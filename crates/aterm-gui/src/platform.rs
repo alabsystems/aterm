@@ -50,7 +50,7 @@ pub(crate) trait AppRt {
     #[cfg(windows)]
     fn window_flush_backdrop(&self, _window: &Window) {}
 
-    /// Tag the window's GPU swapchain layer (the CAMetalLayer wgpu attaches at surface creation) with an explicit colour space, so ColorSync interprets the sRGB-encoded bytes instead of stretching them to the panel's P3 primaries.
+    /// Tag the window's GPU swapchain layer (the CAMetalLayer aterm-gpu's Metal arm attaches at surface creation) with an explicit colour space, so ColorSync interprets the sRGB-encoded bytes instead of stretching them to the panel's P3 primaries.
     fn window_set_surface_colorspace(
         &self,
         window: &Window,
@@ -2309,7 +2309,7 @@ mod layer_colorspace {
         }
     }
 
-    /// Find the CAMetalLayer wgpu attached to `view` and set its `colorspace` to the named CG colour space.
+    /// Find the CAMetalLayer aterm-gpu's Metal arm attached to `view` and set its `colorspace` to the named CG colour space.
     #[must_use]
     pub(crate) fn set(window: &Window, cg_name: &str) -> bool {
         let view = ns_view_of(window);

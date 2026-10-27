@@ -16,7 +16,7 @@ const MAX_LEDGER: u64 = 8 * LEDGER_MAX_BYTES;
 pub(in crate::harness) struct SyncTarget<'a> {
     pub path: &'a Path,
     pub before: Option<&'a str>,
-    pub after: &'a str,
+    pub after: Option<&'a str>,
     pub mode: Option<u32>,
 }
 
@@ -132,12 +132,61 @@ fn absolute(path: &Path) -> Result<PathBuf, String> {
     std::path::absolute(path).map_err(|why| why.to_string())
 }
 
+pub(super) fn usage_target(path: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    path.map(|path| {
+        let (path, _) = super::super::cli::roster_target(path)?;
+        let path = absolute(&path)?;
+        let mut ancestor = path.as_path();
+        let mut missing = Vec::new();
+        loop {
+            match std::fs::canonicalize(ancestor) {
+                Ok(mut resolved) => {
+                    for name in missing.into_iter().rev() {
+                        resolved.push(name);
+                    }
+                    return Ok(resolved);
+                }
+                Err(why) if why.kind() == io::ErrorKind::NotFound => {
+                    if std::fs::symlink_metadata(ancestor).is_ok() {
+                        return Err(format!("{}: unresolved usage source", ancestor.display()));
+                    }
+                    missing.push(
+                        ancestor
+                            .file_name()
+                            .ok_or("usage source has no existing ancestor")?
+                            .to_os_string(),
+                    );
+                    ancestor = ancestor
+                        .parent()
+                        .ok_or("usage source has no existing ancestor")?;
+                }
+                Err(why) => return Err(format!("{}: {why}", ancestor.display())),
+            }
+        }
+    })
+    .transpose()
+}
+
 fn durable_ancestry(dir: &Path) -> Result<(), String> {
     for ancestor in absolute(dir)?.ancestors() {
         aterm_durable::durable_dir(ancestor)
             .map_err(|why| format!("{}: {why}", ancestor.display()))?;
     }
     Ok(())
+}
+
+/// A retained absence changes no directory entry. Persist its existing ancestry
+/// without creating the missing configuration directories.
+fn publication_parent(path: &Path, absent: bool) -> &Path {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    if absent {
+        parent
+            .ancestors()
+            .find(|ancestor| ancestor.is_dir())
+            .unwrap_or(parent)
+    } else {
+        parent
+    }
 }
 
 impl Plan {
@@ -147,8 +196,14 @@ impl Plan {
             if self.local_logins {
                 return Err("local login receipt cannot name an external roster".into());
             }
-            let roster =
+            let mut roster =
                 absolute(roster.ok_or("account recovery needs its admitted roster path")?)?;
+            // New usage receipts pin the resolved source, including parent symlinks.
+            // Older receipts retain their original absolute spelling.
+            if roster.to_str() != Some(admitted.as_str()) {
+                roster =
+                    usage_target(Some(&roster))?.ok_or("account recovery lost its roster path")?;
+            }
             if roster.to_str() != Some(admitted.as_str()) {
                 return Err("account sync recovery target differs from the admitted roster".into());
             }
@@ -172,11 +227,11 @@ impl Plan {
 
     fn validate(&self, store: &Store, roster: Option<&Path>) -> Result<(), String> {
         if self.roster_mode.is_some_and(|mode| mode & !0o777 != 0) {
-            return Err("account sync recovery target differs from the admitted roster".into());
+            return Err("account sync receipt has invalid roster permissions".into());
         }
         let mut names = BTreeSet::new();
         for (_, path) in self.paths(store, roster)? {
-            let name = std::fs::canonicalize(&path).unwrap_or(absolute(&path)?);
+            let name = usage_target(Some(&path))?.ok_or("account sync path is missing")?;
             if !names.insert(name) {
                 return Err("account sync files must have distinct destinations".into());
             }
@@ -195,14 +250,10 @@ impl Plan {
         if let Some(text) = &self.logins.after {
             Logins::from_json(text, 0).map_err(|why| why.why().to_owned())?;
         }
-        if self.roster_path.is_some() {
-            Roster::parse_for(
-                store.cli,
-                self.roster
-                    .after
-                    .as_deref()
-                    .ok_or("sync lacks its new roster")?,
-            )?;
+        if self.roster_path.is_some()
+            && let Some(text) = self.roster.after.as_deref()
+        {
+            Roster::parse_for(store.cli, text)?;
         }
         Ok(())
     }
@@ -407,10 +458,62 @@ impl Store {
                 target: Some(SyncTarget {
                     path: &target,
                     before: Some(&text),
-                    after: &text,
+                    after: Some(&text),
                     mode,
                 }),
                 wake,
+            },
+            |state, logins| edit(&raw, state, logins),
+            || Ok(()),
+        )
+    }
+
+    /// Usage also works without configured rows. An absent file is a retained absence
+    /// in the receipt, so a later configuration cannot silently admit old observations.
+    pub(super) fn transact_usage_within(
+        &self,
+        ladder: &[std::time::Duration],
+        captured: &UsageRoster,
+        now: i64,
+        edit: impl FnOnce(&Roster, &mut State, &mut Logins) -> Result<Vec<Event>, String>,
+    ) -> Result<Vec<Event>, String> {
+        let held = self
+            .acquire_within(ladder)
+            .map_err(|why| format!("{}: {why}", self.dir.display()))?
+            .ok_or_else(|| LOCK_HELD.to_owned())?;
+        let target = usage_target(captured.path.as_deref())?;
+        if target != captured.target {
+            return Err("usage roster target changed; nothing recorded".into());
+        }
+        let recovery_target = captured
+            .path
+            .as_deref()
+            .map(super::super::cli::roster_target)
+            .transpose()?
+            .map(|(path, _)| path);
+        self.recover_sync_at(&held, recovery_target.as_deref(), &mut |_| Ok(()))?;
+        let text = target
+            .as_ref()
+            .map(|path| read(path, MAX_ROSTER_BYTES))
+            .transpose()?
+            .flatten();
+        let raw = text
+            .as_deref()
+            .map(|text| Roster::parse_for(self.cli, text))
+            .transpose()?
+            .unwrap_or_default();
+        self.transact_images_held(
+            &held,
+            now,
+            &mut None,
+            Publication {
+                target: target.as_ref().map(|path| SyncTarget {
+                    path,
+                    before: text.as_deref(),
+                    after: text.as_deref(),
+                    mode: None,
+                }),
+                wake: WakeRule::Events,
             },
             |state, logins| edit(&raw, state, logins),
             || Ok(()),
@@ -623,7 +726,10 @@ impl Store {
             }
             // An earlier rename may have succeeded before its directory barrier failed.
             // Matching bytes still need that barrier before the receipt can complete.
-            aterm_durable::durable_dir(path.parent().unwrap_or(Path::new(".")))
+            // A missing roster may also have missing parent directories. Preserve its
+            // absence without creating configuration; persist the nearest existing parent.
+            let barrier = publication_parent(path, image.after.is_none());
+            aterm_durable::durable_dir(barrier)
                 .map_err(|why| format!("{}: {why}", path.display()))?;
             progress(index + 1)?;
         }
@@ -721,7 +827,7 @@ impl Store {
                 .as_ref()
                 .map(|target| Image {
                     before: target.before.map(str::to_owned),
-                    after: Some(target.after.into()),
+                    after: target.after.map(str::to_owned),
                 })
                 .unwrap_or_default(),
             wake: match wake {
@@ -795,7 +901,11 @@ impl Store {
         }
         durable_ancestry(&self.dir)?;
         if let Some(roster) = roster {
-            durable_ancestry(roster.parent().unwrap_or(Path::new(".")))?;
+            let absent = receipt
+                .plan
+                .as_ref()
+                .is_some_and(|plan| plan.roster.after.is_none());
+            durable_ancestry(publication_parent(roster, absent))?;
         }
         self.retain_witness(&self.dir.join(WITNESS))
             .map_err(|why| why.to_string())?;

@@ -29,7 +29,8 @@ pub(super) trait AlabKernel: Kernel {
     /// Every file `pid` holds open through a descriptor, `None` when unreadable.
     fn open_files(&self, pid: u32) -> Option<Vec<PathBuf>>;
     /// The conversation writer's kernel advisory lock, independently of other processes'
-    /// descriptor tables.
+    /// descriptor tables. Codex removes this file on a clean shutdown, so a proven
+    /// absent path is free; an unreadable path remains unknown.
     fn writer_owner(&self, file: &Path) -> aterm_uds::ownerlock::Owner;
     /// Whether `shell`'s group holds its terminal again (`pgid == tpgid`).
     fn shell_has_terminal(&self, shell: u32) -> bool;
@@ -78,7 +79,14 @@ impl AlabKernel for Live {
     }
 
     fn writer_owner(&self, file: &Path) -> aterm_uds::ownerlock::Owner {
-        aterm_uds::ownerlock::probe(file)
+        use aterm_uds::ownerlock::Owner;
+        // Codex drops its writer lock and removes the file while holding its home
+        // coordination lock. A clean exit therefore leaves no file to flock.
+        // lstat keeps dangling links unknown rather than following them to ENOENT.
+        match std::fs::symlink_metadata(file) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Owner::Dead,
+            _ => aterm_uds::ownerlock::probe(file),
+        }
     }
 
     fn shell_has_terminal(&self, shell: u32) -> bool {
@@ -259,6 +267,7 @@ pub(super) fn self_claimed_plan(
         dialect,
         line,
         tap_dropped: None,
+        line_dir: None,
     })
 }
 

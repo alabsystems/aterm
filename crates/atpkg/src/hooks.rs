@@ -1105,6 +1105,15 @@ pub(crate) fn command_link_source(exe: &Path) -> Option<&Path> {
     command_link_check(exe).ok()
 }
 
+/// Whether canonical `exe` is the release `aterm.app`'s where it is installed, which
+/// [`command_link_check`] admits: not a dev or renamed copy, Gatekeeper's temporary copy or a
+/// mounted volume.
+#[cfg(unix)]
+#[must_use]
+pub fn is_installed_release_exe(exe: &Path) -> bool {
+    command_link_check(exe).is_ok()
+}
+
 /// [`command_link_source`] with a user-facing refusal reason when `exe` may not lay links.
 #[cfg(unix)]
 pub(crate) fn command_link_check(exe: &Path) -> Result<&Path, &'static str> {

@@ -856,11 +856,11 @@ fn the_one_loud_hold_is_lands_with_repository_work_in_a_session_no_manager_waits
 }
 
 /// A LAND HOLD AT A SPENT API WALL IS THE WALL'S (limit 3 of §14.0): Land's nudge read the Repo
-/// leg, then a retryable API error answered each of aterm's tries the same until they were spent,
-/// which holds at the wall's reply (`Kept::holds`). That hold is told Later at the wall, and stays
-/// Later once the wall's notice leaves the screen: no band says the agent gave the same reply
-/// twice, and the repository's work is not what stopped it. (The same Land run with no wall is
-/// `Urgency::Now`: the one loud hold above.)
+/// leg, then a cut reply (an API wall that is no outage) answered each of aterm's tries the same
+/// until they were spent, which holds at the wall's reply (`Kept::holds`). That hold is told Later
+/// at the wall, and stays Later once the wall's notice leaves the screen: no band says the agent
+/// gave the same reply twice, and the repository's work is not what stopped it. (The same Land run
+/// with no wall is `Urgency::Now`: the one loud hold above.)
 #[test]
 fn a_spent_api_walls_hold_under_land_with_repository_work_stays_a_fact_for_later() {
     let repo = found(0, 1, 0, 0, 0);
@@ -896,13 +896,14 @@ fn a_spent_api_walls_hold_under_land_with_repository_work_stays_a_fact_for_later
         st.land_held()
     );
     let kind = WallKind::ApiError {
-        code: Some(500),
+        code: None,
         retryable: true,
-        cause: aterm_phase::ApiCause::Server,
+        cause: aterm_phase::ApiCause::CutOff,
     };
     let mut w = on_repo(walled(
         kind,
-        "API Error: 500 Internal server error",
+        "API Error: Your computer went to sleep mid-response. The response above may be \
+         incomplete.",
         Some(Duration::from_secs(4)),
     ));
     let mut retries = Vec::new();
@@ -922,7 +923,7 @@ fn a_spent_api_walls_hold_under_land_with_repository_work_stays_a_fact_for_later
         }
     }
     assert!(
-        !retries.is_empty() && retries.iter().all(|rule| *rule == "api-retry@v1"),
+        !retries.is_empty() && retries.iter().all(|rule| *rule == "api-cutoff@v1"),
         "aterm retried the wall until its tries were spent: {retries:?}"
     );
     assert_eq!(st.held_by(), Some(HeldBy::SameReply));
@@ -1006,13 +1007,11 @@ fn a_switch_to_land_over_a_standing_hold_types_nothing_and_off_then_land_types_l
     );
     st.park_off();
     assert_eq!(st.held_by(), None, "Off's park clears the replies");
-    // The short turns' back-off stands across the park; the act at its end is Land's own.
-    let typed = match act(&mut st, &switched, now + 3 * MIN) {
-        TurnEndAction::WaitUntil { until, .. } => act(&mut st, &switched, until),
-        a => a,
-    };
+    // The short turns' back-off stands across the park, and Land's instruction waits none of it
+    // (v6 §14.10).
+    assert!(st.short_wait().is_some(), "{st:?}");
     assert_eq!(
-        typed,
+        act(&mut st, &switched, now + 3 * MIN),
         land_instruction(),
         "Off, then Land, types Land's act"
     );

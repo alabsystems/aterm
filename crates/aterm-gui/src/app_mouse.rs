@@ -1703,6 +1703,32 @@ impl App {
         x: f64,
         y: f64,
     ) -> (u16, u16) {
+        let (row, col) = self.pixel_to_glass_cell_with(wid, geom, x, y);
+        let col = self
+            .windows
+            .get(&wid)
+            .map_or(col, |ws| ws.claude_footer_undo.grid_col(row, col));
+        (row, col)
+    }
+
+    /// Whether a press at window pixel `(x, y)` lands on a cell the glass's rewrite of a row
+    /// vacated (`claude_footer::FooterUndo::swallows`): it lands on nothing.
+    pub(crate) fn glass_swallows_at(&self, wid: WindowId, x: f64, y: f64) -> bool {
+        let (row, col) = self.pixel_to_glass_cell_with(wid, self.pointer_geometry(wid), x, y);
+        self.windows
+            .get(&wid)
+            .is_some_and(|ws| ws.claude_footer_undo.swallows(row, col))
+    }
+
+    /// The window grid cell under `(x, y)` as the glass shows it, before a rewritten row's
+    /// columns are mapped back to Claude's.
+    fn pixel_to_glass_cell_with(
+        &self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        x: f64,
+        y: f64,
+    ) -> (u16, u16) {
         let (cw, ch) = geom.cell;
         let (rows, cols) = self
             .windows
@@ -1721,10 +1747,6 @@ impl App {
             geom.pad_top,
             geom.head,
         );
-        let col = self
-            .windows
-            .get(&wid)
-            .map_or(col, |ws| ws.claude_footer_undo.grid_col(row, col));
         (row, col)
     }
 
@@ -2524,7 +2546,9 @@ impl App {
         }
     }
 
-    fn pet_press_at(&mut self, wid: WindowId) -> bool {
+    /// A left press at the pointer pets the cat when it lands on it: the stroke is stamped `at`,
+    /// the instant the button went down, which the pet's latch measures against its own clock.
+    fn pet_press_at(&mut self, wid: WindowId, at: Instant) -> bool {
         let Some(ws) = self.windows.get(&wid) else {
             return false;
         };
@@ -2533,10 +2557,7 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;
         };
-        if ws
-            .fx
-            .companion_mut()
-            .press(Instant::now(), (fx as f32, fy as f32))
+        if ws.fx.companion_mut().press(at, (fx as f32, fy as f32))
             != aterm_effects::host::PressOutcome::Pet
         {
             return false;
@@ -2701,7 +2722,7 @@ impl App {
         self.retire_link_target(wid);
         self.clear_claude_light_hover(wid);
         self.scrollbar_pointer_left(wid);
-        self.stats_pointer_left(wid, Instant::now());
+        self.stats_pointer_left(wid, crate::metrics::host_now());
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -3280,7 +3301,7 @@ impl App {
                 || ws.divider_drag.is_some()
                 || ws.strip_drag.is_some()
         }) {
-            self.clear_move_license(wid);
+            self.fence_pointer_license(wid);
         }
         if self.active_native_view(wid).is_none()
             && self.windows.get(&wid).is_some_and(|ws| {
@@ -3342,7 +3363,7 @@ impl App {
             .windows
             .get(&wid)
             .is_some_and(|ws| ws.selecting || ws.held_mouse_button.is_some())
-            && self.stats_pointer_motion(wid, Instant::now())
+            && self.stats_pointer_motion(wid, crate::metrics::host_now())
         {
             if let Some(ws) = self.windows.get_mut(&wid)
                 && (ws.hover_pointer || ws.native_text_cursor)
@@ -3693,19 +3714,21 @@ impl App {
             }
             return false;
         }
-        let term = match self.front_terminal(wid) {
-            Some(terminal) => terminal.term.clone(),
-            None => {
-                // A tab close/switch can retire the front terminal between
-                // repeat ticks. Drop the old level-triggered deadline here or
-                // the event loop keeps re-observing a time in the past.
-                if let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.next_autoscroll = None;
+        let moved = if let Some(session) = self.rewound_front(wid) {
+            self.rewind_scroll(session, lines)
+        } else {
+            let term = match self.front_terminal(wid) {
+                Some(terminal) => terminal.term.clone(),
+                None => {
+                    // A tab close/switch can retire the front terminal between
+                    // repeat ticks. Drop the old level-triggered deadline here or
+                    // the event loop keeps re-observing a time in the past.
+                    if let Some(ws) = self.windows.get_mut(&wid) {
+                        ws.next_autoscroll = None;
+                    }
+                    return false;
                 }
-                return false;
-            }
-        };
-        let moved = {
+            };
             let mut term = term_lock(&term);
             let before = term.grid().display_offset();
             term.scroll_display(lines);
@@ -4245,7 +4268,7 @@ impl App {
     }
 
     /// [`Self::on_mouse_input`] with the button gone down or up at `at`.
-    #[cfg(test)]
+    #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
     pub(crate) fn on_mouse_input_at(
         &mut self,
         wid: WindowId,
@@ -4412,7 +4435,7 @@ impl App {
         button: WinitMouseButton,
         at: Instant,
     ) -> Option<crate::tab_model::ViewId> {
-        self.clear_move_license(wid);
+        self.fence_pointer_license(wid);
         let pressed = state == ElementState::Pressed;
         if button == WinitMouseButton::Left
             && let Some(ws) = self.windows.get_mut(&wid)
@@ -4872,10 +4895,15 @@ impl App {
                 .windows
                 .get(&wid)
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-            if self
-                .claude_glass_at(wid, px, py)
-                .is_some_and(|(_, at)| at != crate::claude_lights::GlassAt::Mark)
-            {
+            if self.glass_swallows_at(wid, px, py) {
+                return None;
+            }
+            if self.claude_glass_at(wid, px, py).is_some_and(|(_, at)| {
+                !matches!(
+                    at,
+                    crate::claude_lights::GlassAt::Mark | crate::claude_lights::GlassAt::Label
+                )
+            }) {
                 #[cfg(windows)]
                 if button == WinitMouseButton::Right
                     && let Some(ws) = self.windows.get_mut(&wid)
@@ -4943,11 +4971,21 @@ impl App {
             let over_strip = self.strip_col_at(wid, px, py).is_some();
             let gesture_on = self.config.right_click_or_default()
                 == crate::app_config::RightClickGesture::CopyPaste;
-            let term = self.route_term(wid, press_route);
+            let rewound = match press_route {
+                PointerRoute::Front => self.rewound_front(wid),
+                PointerRoute::Pane { session, .. } => {
+                    self.pool.is_rewound(session).then_some(session)
+                }
+                PointerRoute::Nowhere => None,
+            };
+            let term = match rewound {
+                Some(session) => self.pool.shown_term(session),
+                None => self.route_term(wid, press_route),
+            };
             let (tracking, selection) = term.as_ref().map_or((false, None), |t| {
                 let tl = term_lock(t);
                 (
-                    tl.mouse_tracking_enabled(),
+                    tl.mouse_tracking_enabled() && rewound.is_none(),
                     tl.selection_to_string().filter(|s| !s.is_empty()),
                 )
             });
@@ -5036,7 +5074,7 @@ impl App {
                 return None;
             }
         }
-        if pressed && button == WinitMouseButton::Left && self.pet_press_at(wid) {
+        if pressed && button == WinitMouseButton::Left && self.pet_press_at(wid, at) {
             return None;
         }
         if pressed && button == WinitMouseButton::Left && self.scrollbar_press(wid) {
@@ -5272,7 +5310,7 @@ impl App {
 
     fn on_mouse_wheel_inner(&mut self, wid: WindowId, delta: MouseScrollDelta) {
         crate::input_hint::arm();
-        self.clear_move_license(wid);
+        self.fence_pointer_license(wid);
         let palette = self.palette_claims_pointer(wid);
         let overview = self.overview_claims_pointer(wid);
         if !(palette || overview) && self.pointer_is_over_pane_header(wid) {
@@ -5470,6 +5508,9 @@ impl App {
 
     /// Snap the viewport back to the live bottom.
     pub(crate) fn snap_to_bottom(&mut self, wid: WindowId) {
+        if self.rewound_front(wid).is_some() {
+            return;
+        }
         let Some(term) = self
             .front_terminal(wid)
             .map(|terminal| terminal.term.clone())

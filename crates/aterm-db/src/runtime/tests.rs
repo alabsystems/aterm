@@ -5,6 +5,36 @@ use super::*;
 use aterm_secrets::fsx;
 
 #[test]
+fn delayed_worker_completion_does_not_refresh_old_authentication() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let handle = crate::network_state::ObservationHandle::default();
+    let mut observer = Observer::open(&root.path().join("config"), handle.clone()).unwrap();
+    let authenticated = Instant::now();
+    let completed = authenticated + Duration::from_secs(60);
+    let at_ms = contact_time(61_000, completed, authenticated);
+    assert_eq!(at_ms, 1000);
+    observer.contact(
+        MachineIdentity {
+            machine_id: [1; 16],
+            incarnation: [2; 16],
+            label: None,
+        },
+        at_ms,
+        authenticated,
+    );
+    observer.observe(Visibility::Active, 0, "ok", 61_000, completed);
+    assert_eq!(
+        handle.snapshot().peers[0].reachability,
+        aterm_types::network_state::Reachability::LastSeen
+    );
+    assert_eq!(
+        contact_time(500, completed, authenticated),
+        0,
+        "invalid wall mapping is unknown, not a fresh timestamp"
+    );
+}
+
+#[test]
 fn missing_configuration_is_default_on_but_never_bootstraps_a_vault() {
     let home = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(home.path());
@@ -19,7 +49,9 @@ fn missing_configuration_is_default_on_but_never_bootstraps_a_vault() {
         receive.recv_timeout(Duration::from_secs(60)).unwrap(),
         Status::Dormant
     );
+    let observation = runtime.network_observation();
     runtime.stop();
+    assert_eq!(observation.snapshot().visibility, Visibility::Unavailable);
     assert!(!paths.dir.exists());
     fsx::write_atomic(&config, b"[commons]\nenabled=false\n", 0o600).unwrap();
     assert!(!enabled(&config).unwrap());

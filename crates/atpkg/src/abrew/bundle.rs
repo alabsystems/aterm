@@ -186,7 +186,13 @@ pub fn parse_brewfile(text: &str) -> (Vec<BrewfileEntry>, Vec<String>) {
 /// Read a Brewfile path (`./Brewfile` by default, as brew's is).
 pub fn read_brewfile(path: Option<&Path>) -> Result<String, String> {
     let p = path.map_or_else(|| std::path::PathBuf::from("Brewfile"), Path::to_path_buf);
-    std::fs::read_to_string(&p).map_err(|e| format!("abrew: cannot read {}: {e}", p.display()))
+    std::fs::read_to_string(&p).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound && path.is_none() {
+            "Error: No Brewfile found".to_string()
+        } else {
+            format!("abrew: cannot read {}: {e}", p.display())
+        }
+    })
 }
 
 #[cfg(test)]

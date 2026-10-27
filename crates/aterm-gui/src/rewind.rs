@@ -8,11 +8,10 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use aterm_aos::publish::Head;
 use aterm_buffer::Ticks;
 use aterm_core::terminal::Terminal;
 
-use crate::rewind_worker::{Changed, Done, FoldToken, Folded, Found, RewindWorker, Show};
+use crate::rewind_worker::{Change, Changed, Done, FoldToken, Folded, Found, RewindWorker, Show};
 use crate::temporal::{Fidelity, RewindInstant, Track};
 use crate::{App, WindowId};
 
@@ -114,6 +113,8 @@ static NEXT_VIEW: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct RewindView {
     /// The replayed past screen every render of the session shows, once the first fold lands.
     pub(crate) shown: Option<Arc<Mutex<Terminal>>>,
+    /// How many rows higher [`Self::shown`] is drawn than its screen was ([`lift_for_band`]): its row `r` is the screen's row `r + lift`.
+    pub(crate) lift: u16,
     /// The shown instant on the recorder's clock.
     pub(crate) at: Ticks,
     /// The shown instant's 1-based place among the recorded instants, and their count.
@@ -141,14 +142,14 @@ pub(crate) struct RewindView {
     pub(crate) instants: Vec<RewindInstant>,
     /// When the main thread took the step whose fold is shown and not yet presented.
     stepped: Option<Instant>,
-    /// The windows whose hosted effects this view paused, and the head each paused at.
-    paused: Vec<(WindowId, Head)>,
     /// The fold in flight, by token.
     folding: Option<(FoldToken, Ask)>,
     /// The newest fold asked for while one was in flight.
     queued: Option<Ask>,
     /// The cell search in flight, by token, and the reply it answers once its instant is shown.
     finding: Option<(FoldToken, Option<Reply>)>,
+    /// The cell the last search landed for and the instant it found, while the view has not moved since: B again looks past that instant's own change.
+    found: Option<((u16, u16), Ticks)>,
     id: u64,
     serial: u64,
     worker: Option<RewindWorker>,
@@ -168,14 +169,15 @@ impl RewindView {
             note: None,
             picked: None,
             scrolled: 0,
+            lift: 0,
             wheel_px: 0.0,
             track: Track::default(),
             instants: Vec::new(),
             stepped: None,
-            paused: Vec::new(),
             folding: None,
             queued: None,
             finding: None,
+            found: None,
             id: NEXT_VIEW.fetch_add(1, Ordering::Relaxed),
             serial: 0,
             worker: None,
@@ -188,6 +190,20 @@ impl RewindView {
             .as_ref()
             .or(self.folding.as_ref().map(|(_, ask)| ask))
             .map_or(self.at, |ask| ask.at)
+    }
+
+    /// Give up the cell search in flight, answering its reply with `why`, and forget the last one's landing: the view moves on from it.
+    fn cancel_finding(&mut self, why: &str) {
+        self.found = None;
+        let Some((token, reply)) = self.finding.take() else {
+            return;
+        };
+        if let Some(worker) = self.worker.as_ref() {
+            worker.cancel_search(token);
+        }
+        if let Some(reply) = reply {
+            let _ = reply.send(Err(why.to_string()));
+        }
     }
 
     /// Answer every reply still waiting on a fold with `why`.
@@ -511,23 +527,49 @@ pub(crate) fn escaped(bytes: &[u8], max: usize) -> String {
 
 /// The band's note for a found change ([`Found`]): where the cell is, how long ago, and the bytes.
 pub(crate) fn changed_note(found: &Found, now: Ticks) -> String {
-    let (row, col) = (found.cell.0 + 1, found.cell.1 + 1);
+    let (row, col) = (u32::from(found.cell.0) + 1, u32::from(found.cell.1) + 1);
     let Some(at) = found.at else {
         return format!("row {row} col {col}: nothing recorded replays");
     };
     let ago = now.0.saturating_sub(at.0) as f64 / 1_000_000.0;
-    if !found.changed {
-        return format!("row {row} col {col} is as at the oldest kept state, {ago:.1} s ago");
+    let own = if found.shown_changed {
+        "; the state B left changed it too"
+    } else {
+        ""
+    };
+    match found.change {
+        Change::No => {
+            return format!(
+                "row {row} col {col} is as at the oldest kept state, {ago:.1} s ago{own}"
+            );
+        }
+        Change::Unknown => {
+            return format!(
+                "row {row} col {col} is as shown back to {ago:.1} s ago; the replay before it \
+                 differs from what was on screen{own}"
+            );
+        }
+        Change::Yes => {}
     }
     let resize = found
         .resize
         .map(|(rows, cols)| format!(", resize to {cols}x{rows}"))
         .unwrap_or_default();
+    let unkept = if found.whole {
+        ""
+    } else {
+        " and output not kept"
+    };
     format!(
-        "row {row} col {col} changed {ago:.1} s ago: {} bytes{resize} \"{}\"",
+        "row {row} col {col} changed {ago:.1} s ago: {} bytes{resize} \"{}\"{unkept}{own}",
         found.bytes.len(),
         escaped(&found.bytes, 48)
     )
+}
+
+/// `yes` or `no`.
+const fn yes_no(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
 }
 
 impl App {
@@ -581,7 +623,7 @@ impl App {
         self.pool.get(session).is_some_and(recording)
     }
 
-    /// Open a tab menu's captured terminal view at the row's instant (`turn_ledger::now_ms`'s clock), refusing a source that left its original window and tab.
+    /// Open a tab menu's captured terminal view at the row's instant (`turn_ledger::now_ms`'s clock, moved onto the recorder's by the sleep since), refusing a source that left its original window and tab.
     pub(crate) fn dispatch_tab_menu_rewind(
         &mut self,
         wid: WindowId,
@@ -596,7 +638,8 @@ impl App {
         self.focus_session_pane(wid, origin.session, origin.view);
         let back_us = crate::turn_ledger::now_ms()
             .saturating_sub(at_ms)
-            .saturating_mul(1000);
+            .saturating_mul(1000)
+            .saturating_add(crate::session_log::slept_since(at_ms));
         let at = self.pool.get(origin.session).map(|s| {
             let now = s
                 .ctx
@@ -611,6 +654,55 @@ impl App {
         };
         if let Err(why) = self.rewind_open(origin.session, Target::At(at), None) {
             self.post_message(crate::message_reporters::rewind_failed(&why));
+        }
+    }
+
+    /// View > Forget Pane History on window `wid`: the focused pane's kept history goes ([`Self::forget_history`]).
+    pub(crate) fn forget_front_history(&mut self, wid: WindowId) {
+        if let Some(session) = self.front_terminal(wid).map(|t| t.session)
+            && let Err(why) = self.forget_history(session)
+        {
+            self.post_message(crate::message_reporters::rewind_failed(&why));
+        }
+    }
+
+    /// Drop the screen history `session` keeps, closing its Rewind view first; it records on from its screen now.
+    pub(crate) fn forget_history(&mut self, session: u64) -> Result<(), String> {
+        if !self.session_records(session) {
+            return Err(NOT_RECORDING.to_string());
+        }
+        self.rewind_close(session);
+        let s = self.pool.get(session).ok_or(NO_SESSION)?;
+        let term = crate::term_lock(&s.term);
+        s.ctx
+            .temporal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .forget_onto(&term);
+        Ok(())
+    }
+
+    /// View > Forget All History: every pane's kept screen history goes; how many panes kept any.
+    pub(crate) fn forget_all_history(&mut self) -> usize {
+        let sessions: Vec<u64> = self
+            .pool
+            .ids()
+            .into_iter()
+            .filter(|&id| self.session_records(id))
+            .collect();
+        sessions
+            .into_iter()
+            .filter(|&id| self.forget_history(id).is_ok())
+            .count()
+    }
+
+    /// Tell the Rewind pool which pane is in front, so it sheds that pane's history last.
+    pub(crate) fn note_rewind_focus(&self) {
+        if let Some(t) = self
+            .frontmost_window
+            .and_then(|wid| self.front_terminal(wid))
+        {
+            crate::temporal::pool().focus(t.session);
         }
     }
 
@@ -713,12 +805,15 @@ impl App {
         let Some((term, _)) = self.front_shown(wid) else {
             return;
         };
-        let (row, col) = self
-            .windows
-            .get(&wid)
-            .map_or((0, 0), |ws| ws.last_mouse_cell);
+        let ((row, col), window_row) = self.windows.get(&wid).map_or(((0, 0), 0), |ws| {
+            (ws.last_mouse_cell, ws.last_mouse_window_cell.0)
+        });
+        if self.rewind_band_covers(wid, session, window_row) {
+            return;
+        }
+        let lift = self.pool.rewind(session).map_or(0, |v| v.lift);
         let offset = crate::term_lock(&term).grid().display_offset();
-        let grid_row = i32::from(row) - i32::try_from(offset).unwrap_or(i32::MAX);
+        let grid_row = i32::from(row) - i32::try_from(offset).unwrap_or(i32::MAX) + i32::from(lift);
         if let Some(view) = self.pool.rewind_mut(session) {
             view.picked = Some((grid_row, col));
         }
@@ -727,14 +822,21 @@ impl App {
     }
 
     /// Scroll the rewound `session`'s past screen `lines` (positive: older), at most [`PAST_SCROLLBACK`] lines back.
-    pub(crate) fn rewind_scroll(&mut self, session: u64, lines: i32) {
-        let Some(term) = self.pool.rewind(session).and_then(|v| v.shown.clone()) else {
-            return;
+    pub(crate) fn rewind_scroll(&mut self, session: u64, lines: i32) -> bool {
+        let Some((term, lift)) = self
+            .pool
+            .rewind(session)
+            .and_then(|v| v.shown.clone().map(|term| (term, v.lift)))
+        else {
+            return false;
         };
         let scrolled = {
             let mut term = crate::term_lock(&term);
             let now = term.grid().display_offset();
-            let room = term.grid().scrollback_lines().min(PAST_SCROLLBACK);
+            let room = term
+                .grid()
+                .scrollback_lines()
+                .min(PAST_SCROLLBACK + usize::from(lift));
             let to = i64::try_from(now)
                 .unwrap_or(i64::MAX)
                 .saturating_add(i64::from(lines))
@@ -743,10 +845,13 @@ impl App {
             term.scroll_display(i32::try_from(delta).unwrap_or(0));
             term.grid().display_offset()
         };
-        if let Some(view) = self.pool.rewind_mut(session) {
-            view.scrolled = scrolled;
-        }
+        let moved = self
+            .pool
+            .rewind_mut(session)
+            .is_some_and(|view| std::mem::replace(&mut view.scrolled, scrolled) != scrolled);
+        self.refresh_rewind_faith(session);
         self.request_redraw_all_windows();
+        moved
     }
 
     /// A wheel or trackpad scroll of `dy` lines (`px` when in pixels, at `cell_h` pixels a line) over the rewound `session`.
@@ -774,6 +879,10 @@ impl App {
         target: Target,
         reply: Option<Reply>,
     ) -> Result<(), String> {
+        if let Some(view) = self.pool.rewind_mut(session) {
+            view.note = None;
+            view.cancel_finding("a later rewind open replaced that cell search");
+        }
         self.rewind_open_with(session, target, reply, String::new())
     }
 
@@ -799,13 +908,15 @@ impl App {
         };
         let idx = place(&instants, target, now)?;
         let live_base = s.ctx.job_feed.bytes();
+        let live = s.live_term().clone();
         if self.pool.rewind(session).is_none() {
-            let mut view = RewindView::new(live_base);
-            view.paused = self.rewind_pause_effects(session);
-            self.pool.set_rewind(session, Some(view));
+            self.settle_live_scroll_motion(session, &live);
+            self.pool
+                .set_rewind(session, Some(RewindView::new(live_base)));
             self.forget_hover();
             self.palette_refresh_live();
         }
+        self.rewind_reconcile_all_effects();
         let ask = Ask {
             at: instants[idx].at,
             state: (idx + 1, instants.len()),
@@ -839,6 +950,7 @@ impl App {
         let idx = step_to(&instants, at, by)?;
         if let Some(view) = self.pool.rewind_mut(session) {
             view.note = None;
+            view.cancel_finding("a step replaced that cell search");
         }
         let ask = Ask {
             at: instants[idx].at,
@@ -873,7 +985,18 @@ impl App {
             }
             (None, None) => return Err("click a cell first, then press B".to_string()),
         };
-        let at = view.at;
+        let (at, skip_own) = (view.at, view.found == Some((cell, view.at)));
+        if let Some(shown) = view.shown.as_ref() {
+            let (rows, cols) = {
+                let term = crate::term_lock(shown);
+                (term.rows(), term.cols())
+            };
+            if cell.0 >= rows || cell.1 >= cols {
+                return Err(format!(
+                    "that cell is off the past screen ({cols}x{rows}); B reads a cell on it"
+                ));
+            }
+        }
         let s = self.pool.get(session).ok_or(NO_SESSION)?;
         let (chains, instants) = {
             let rec = s
@@ -881,12 +1004,23 @@ impl App {
                 .temporal
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            if rec.fidelity_at(at) == Fidelity::Diverged {
+                return Err(
+                    "the shown state's replay differs from what was on screen, so B cannot say \
+                     where its cells changed"
+                        .to_string(),
+                );
+            }
             let instants: Vec<RewindInstant> = rec
                 .rewind_instants()
                 .into_iter()
                 .filter(|i| i.at <= at)
                 .collect();
-            (rec.chain_plans(at), instants)
+            let contradicted = rec.contradicted(&instants);
+            (
+                rec.chain_plans(at),
+                instants.into_iter().zip(contradicted).collect::<Vec<_>>(),
+            )
         };
         if chains.is_empty() || instants.is_empty() {
             return Err("that state no longer replays".to_string());
@@ -905,11 +1039,14 @@ impl App {
             instants,
             at,
             cell,
+            skip_own,
         };
+        const SUPERSEDED: &str = "a newer cell search on this view replaced that one";
         let worker = match (view.worker.take(), proxy) {
             (Some(worker), _) => worker,
             (None, Some(proxy)) => start_worker(proxy)?,
             (None, None) => {
+                view.cancel_finding(SUPERSEDED);
                 view.finding = Some((token, reply));
                 let found = crate::rewind_worker::changed_inline(changed);
                 self.rewind_done(Done::Changed(found));
@@ -919,11 +1056,12 @@ impl App {
         let sent = worker.changed(changed);
         view.worker = Some(worker);
         sent?;
+        view.cancel_finding(SUPERSEDED);
         view.finding = Some((token, reply));
         view.note = Some(format!(
             "finding where row {} col {} last changed\u{2026}",
-            cell.0 + 1,
-            cell.1 + 1
+            u32::from(cell.0) + 1,
+            u32::from(cell.1) + 1
         ));
         self.request_redraw_all_windows();
         Ok(())
@@ -931,12 +1069,20 @@ impl App {
 
     /// Return `session` to live: its view and its worker end, and the hosted effects it paused resume.
     pub(crate) fn rewind_close(&mut self, session: u64) -> bool {
-        let Some(mut view) = self.pool.set_rewind(session, None) else {
+        self.rewind_end(
+            session,
+            "the Rewind view returned to live before that state was shown",
+        )
+    }
+
+    /// [`Self::rewind_close`], each reply still waiting answered with `why`.
+    pub(crate) fn rewind_end(&mut self, session: u64, why: &str) -> bool {
+        let Some(view) = self.pool.set_rewind(session, None) else {
             return false;
         };
-        let paused = std::mem::take(&mut view.paused);
-        view.abandon("the Rewind view returned to live before that state was shown");
-        self.rewind_resume_effects(paused);
+        let left = view.shown.clone();
+        view.abandon(why);
+        self.rewind_reconcile_all_effects();
         if let Some(id) = self
             .messages
             .live_by_key(&read_only_key(session))
@@ -944,55 +1090,71 @@ impl App {
         {
             self.withdraw_message(id);
         }
-        self.rewind_refind(session);
+        if let Some(past) = left {
+            self.rewind_refind(session, &past, false);
+        }
         self.request_redraw_all_windows();
         self.palette_refresh_live();
         true
     }
 
-    /// Pause the running hosted effects of each window whose focused pane is `session`: the windows and the heads they paused at.
-    fn rewind_pause_effects(&mut self, session: u64) -> Vec<(WindowId, Head)> {
+    /// Land every window's glide over `live` (session `session`'s live terminal), and the bounce of a window whose focused pane is that session, so neither moves the live screen or offsets the past frame once the view opens.
+    fn settle_live_scroll_motion(&mut self, session: u64, live: &Arc<Mutex<Terminal>>) {
         let now = Instant::now();
-        let ids: Vec<WindowId> = self
+        let moving: Vec<WindowId> = self
             .windows
-            .keys()
-            .copied()
-            .filter(|wid| {
-                self.front_terminal(*wid)
-                    .is_some_and(|t| t.session == session)
+            .iter()
+            .filter(|(wid, ws)| {
+                ws.scroll_glide
+                    .as_ref()
+                    .is_some_and(|glide| Arc::ptr_eq(&glide.term, live))
+                    || (ws.overscroll.is_some()
+                        && self
+                            .front_terminal(**wid)
+                            .is_some_and(|t| t.session == session))
             })
+            .map(|(wid, _)| *wid)
             .collect();
-        let mut paused = Vec::new();
-        for wid in ids {
-            let Some(ws) = self.windows.get_mut(&wid) else {
-                continue;
-            };
-            let lane = ws.effect_present_interval();
-            let momentum = &mut ws.fx.cursor_mut().momentum;
-            if momentum.aos_attached()
-                && !momentum.aos_paused()
-                && let Ok(head) = momentum.aos_pause(now, lane)
-            {
-                paused.push((wid, head));
-            }
+        for wid in moving {
+            self.settle_scroll_motion_at_target(wid, now);
         }
-        paused
     }
 
-    /// Resume each of `paused` still paused at the head Rewind paused it at; one paused again since (a repair, `aos pause`) is left paused.
-    fn rewind_resume_effects(&mut self, paused: Vec<(WindowId, Head)>) {
-        for (wid, head) in paused {
-            let Some(ws) = self.windows.get_mut(&wid) else {
-                continue;
-            };
-            let momentum = &mut ws.fx.cursor_mut().momentum;
-            if momentum.aos_paused_head() == Some(&head) {
-                let _ = momentum.aos_resume();
-            }
-            if let Some(w) = ws.os_window.as_ref() {
-                w.request_redraw();
-            }
+    /// [`Self::rewind_reconcile_effects`] for every window.
+    pub(crate) fn rewind_reconcile_all_effects(&mut self) {
+        let ids: Vec<WindowId> = self.windows.keys().copied().collect();
+        for wid in ids {
+            self.rewind_reconcile_effects(wid);
         }
+    }
+
+    /// Pause window `wid`'s running hosted effects while its focused pane is rewound and resume them once it is not, keeping the head Rewind paused at so a pause made since (a repair, `aos pause`) is left as it is.
+    pub(crate) fn rewind_reconcile_effects(&mut self, wid: WindowId) {
+        let rewound = self.rewound_front(wid).is_some();
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        let lane = ws.effect_present_interval();
+        let held = ws.rewind_paused.take();
+        let momentum = &mut ws.fx.cursor_mut().momentum;
+        let kept = match (rewound, held) {
+            (true, Some(head)) => Some(head),
+            (true, None) if momentum.aos_attached() && !momentum.aos_paused() => {
+                momentum.aos_pause(Instant::now(), lane).ok()
+            }
+            (true, None) => None,
+            (false, Some(head)) => {
+                if momentum.aos_paused_head() == Some(&head) {
+                    let _ = momentum.aos_resume();
+                }
+                if let Some(w) = ws.os_window.as_ref() {
+                    w.request_redraw();
+                }
+                None
+            }
+            (false, None) => None,
+        };
+        ws.rewind_paused = kept;
     }
 
     /// The band's words for window `wid`'s hosted effects: none attached, none.
@@ -1016,8 +1178,8 @@ impl App {
         }
     }
 
-    /// Re-run each open find whose window's focused pane is `session`, now that it shows another terminal.
-    fn rewind_refind(&mut self, session: u64) {
+    /// Move each open find whose window's focused pane is `session` off `left`, the engine no longer shown (`left_live`: the live one), and re-run it over the one now shown: the live engine gets back the viewport find found it at, `left` loses find's selection, and the find starts over from where the shown engine is.
+    fn rewind_refind(&mut self, session: u64, left: &Arc<Mutex<Terminal>>, left_live: bool) {
         let ids: Vec<WindowId> = self
             .windows
             .iter()
@@ -1029,17 +1191,26 @@ impl App {
             })
             .collect();
         for wid in ids {
+            let origin = self.find_origins.remove(&(session, wid));
+            {
+                let mut left = crate::term_lock(left);
+                if left_live && let Some(origin) = origin {
+                    origin.restore(&mut left);
+                }
+                left.text_selection_mut().clear();
+            }
+            self.search_restart_in(wid);
             self.search_recompute_in(wid);
         }
     }
 
-    /// The faith the recorder now gives `session`'s shown instant, or the last it gave while the recorder is busy; a fold that saw a witness differ may differ whatever the verdicts say, and a frame the fold had to end is unchecked.
+    /// The faith the recorder now gives `session`'s shown instant, or the last it gave while the recorder is busy; a fold that saw a witness differ may differ whatever the verdicts say, and a frame the fold had to end, or past scrollback no witness saw, is unchecked.
     pub(crate) fn rewind_faith(&self, session: u64) -> Option<Faith> {
         let view = self.pool.rewind(session).filter(|v| v.shown.is_some())?;
         if view.differs {
             return Some(Faith::MayDiffer);
         }
-        if view.mid_frame {
+        if view.mid_frame || view.scrolled > 0 {
             return Some(Faith::Unchecked);
         }
         let s = self.pool.get(session)?;
@@ -1061,7 +1232,7 @@ impl App {
         }
     }
 
-    /// The status `rewind status` answers for `session`.
+    /// The status line `session`'s view answers with ([`status_line`]).
     pub(crate) fn rewind_status(&mut self, session: u64) -> Result<String, String> {
         self.refresh_rewind_faith(session);
         let s = self.pool.get(session).ok_or(NO_SESSION)?;
@@ -1070,6 +1241,15 @@ impl App {
             self.pool.rewind(session),
             s.ctx.job_feed.bytes(),
         ))
+    }
+
+    /// Whether `session`'s view has a fold or a search out, or its thread still has verdicts or its fork cache in hand (`rewind status`'s `worker=busy`).
+    pub(crate) fn rewind_busy(&self, session: u64) -> bool {
+        self.pool.rewind(session).is_some_and(|v| {
+            v.folding.is_some()
+                || v.finding.is_some()
+                || v.worker.as_ref().is_some_and(RewindWorker::busy)
+        })
     }
 
     /// The past screen `session`'s view shows, for `rewind text`.
@@ -1110,17 +1290,15 @@ impl App {
             }
             return Ok(());
         }
-        let (plan, judge) = {
+        let (plan, judge, around) = {
             let rec = temporal.lock().unwrap_or_else(PoisonError::into_inner);
             let plan = rec
                 .replay_plan(Some(ask.at))
                 .ok_or("that state no longer replays")?;
             let judge = (rec.fidelity_at(ask.at) == Fidelity::Unwitnessed)
-                .then(|| rec.covering_witness(ask.at))
-                .flatten()
-                .filter(|w| *w > ask.at)
-                .and_then(|w| rec.replay_plan(Some(w)));
-            (plan, judge)
+                .then(|| rec.covering_plan(ask.at))
+                .flatten();
+            (plan, judge, rec.warm_plans(ask.at))
         };
         view.serial = view.serial.wrapping_add(1);
         let token = FoldToken {
@@ -1132,6 +1310,7 @@ impl App {
             token,
             plan,
             judge,
+            around,
             colors,
         };
         let worker = match (view.worker.take(), proxy) {
@@ -1193,11 +1372,13 @@ impl App {
         };
         let note = changed_note(&found, now);
         let suffix = format!(
-            " cell={},{} changed={} bytes={}",
+            " cell={},{} changed={} bytes={} whole={} shown_changed={}",
             found.cell.0,
             found.cell.1,
-            if found.changed { "yes" } else { "no" },
-            found.bytes.len()
+            found.change.wire(),
+            found.bytes.len(),
+            yes_no(found.whole),
+            yes_no(found.shown_changed),
         );
         view.note = Some(note.clone());
         let Some(at) = found.at else {
@@ -1216,6 +1397,7 @@ impl App {
         }
         if let Some(view) = self.pool.rewind_mut(session) {
             view.note = Some(note);
+            view.found = Some((found.cell, at));
         }
         self.request_redraw_all_windows();
     }
@@ -1228,6 +1410,7 @@ impl App {
             term,
             mid_frame,
             differs,
+            folded,
             judged,
         } = folded;
         let Some(s) = self.pool.get(session) else {
@@ -1266,7 +1449,10 @@ impl App {
             return;
         };
         let behind_ms = recorder_now.0.saturating_sub(ask.at.0) / 1000;
-        view.shown = Some(Arc::new(Mutex::new(term)));
+        let mut term = term;
+        view.lift = lift_for_band(&term);
+        term.lift_screen(view.lift);
+        let left = view.shown.replace(Arc::new(Mutex::new(term)));
         view.at = ask.at;
         view.state = ask.state;
         view.differs = differs;
@@ -1286,6 +1472,7 @@ impl App {
         let line = status_line(true, Some(view), live_bytes) + &ask.suffix;
         if let Some(stepped) = ask.stepped {
             crate::metrics::note_rewind_shown(stepped.elapsed());
+            crate::metrics::note_rewind_folded(folded);
         }
         for reply in ask.replies {
             let _ = reply.send(Ok(line.clone()));
@@ -1298,7 +1485,14 @@ impl App {
                 }
             }
         }
-        self.rewind_refind(session);
+        match left {
+            Some(past) => self.rewind_refind(session, &past, false),
+            None => {
+                if let Some(live) = self.pool.get(session).map(|s| s.live_term().clone()) {
+                    self.rewind_refind(session, &live, true);
+                }
+            }
+        }
         self.request_redraw_all_windows();
         self.palette_refresh_live();
     }
@@ -1347,7 +1541,25 @@ fn read_only_key(session: u64) -> String {
 
 const NO_SESSION: &str = "no such session";
 
-const NOT_RECORDING: &str = "this session keeps no screen history; turn on Settings > Terminal > \
+/// How many rows higher to draw `term`'s screen so its last used row (one output wrote, or the shown cursor's) clears the band and the track ([`crate::rewind_band::band_rows`]).
+pub(crate) fn lift_for_band(term: &Terminal) -> u16 {
+    let rows = usize::from(term.rows());
+    let band = crate::rewind_band::band_rows(rows);
+    let cursor = term
+        .cursor_visible()
+        .then(|| usize::from(term.cursor().row));
+    let used = (0..rows).rev().find(|&r| {
+        cursor == Some(r)
+            || u16::try_from(r)
+                .ok()
+                .and_then(|r| term.grid().row_at_screen(r))
+                .is_some_and(|row| !row.is_empty())
+    });
+    let lift = used.map_or(0, |r| (r + 1).saturating_sub(rows.saturating_sub(band)));
+    u16::try_from(lift.min(band)).unwrap_or(0)
+}
+
+pub(crate) const NOT_RECORDING: &str = "this session keeps no screen history; turn on Settings > Terminal > \
                              Rewind and open a new tab";
 
 const NO_VIEW: &str = "no Rewind view is open on this session (rewind open)";

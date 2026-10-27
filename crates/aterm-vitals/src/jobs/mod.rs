@@ -1026,6 +1026,10 @@ pub struct JobRow {
     pub verdict: Verdict,
     /// An agent's call quiet at φ ≥ 8 whose members used under [`NO_PROGRESS_CPU_NS_PER_MIN`].
     pub no_progress: bool,
+    /// A descendant call with current CPU work or progress within [`RUNNING_WINDOW_MS`]
+    /// (leader pid and start).
+    /// This qualifies the local verdict; it neither credits output nor changes resource totals.
+    pub working_descendant: Option<(u32, u64)>,
     /// The suspect episode this verdict belongs to (each says a rank once).
     pub episode: u32,
     /// The exit status, once known.

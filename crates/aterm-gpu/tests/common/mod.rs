@@ -100,37 +100,14 @@ fn gpu_on(font: &str, px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
         .expect("the GPU renderer assembles on an acquired device")
 }
 
-/// Move `g` onto the wgpu oracle arm.
-#[cfg(wgpu_arm)]
-pub fn disarm_for_oracle(g: &mut aterm_gpu::GpuRenderer) {
-    #[cfg(target_os = "macos")]
-    g.disarm_metal_for_oracle();
-    #[cfg(target_os = "linux")]
-    g.disarm_gl_for_oracle();
-    #[cfg(windows)]
-    g.disarm_d3d11_for_oracle();
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    let _ = g;
-}
-
 /// The arms a parity test runs on, each a fresh [`backends`] pair at
-/// `px`/`theme`: the native arm (Metal on macOS, GL on Linux, D3D11 on Windows) and, in the
-/// oracle build, the wgpu oracle.
+/// `px`/`theme`: the native arm (Metal on macOS, GL on Linux, D3D11 on Windows).
 pub fn arms(px: f32, theme: Theme) -> Vec<(&'static str, Renderer, aterm_gpu::GpuRenderer)> {
     let (cpu, gpu) = backends(px, theme);
-    #[allow(unused_mut, reason = "the oracle build adds an arm")]
-    let mut out = vec![("native", cpu, gpu)];
-    #[cfg(all(wgpu_arm, any(target_os = "macos", target_os = "linux", windows)))]
-    {
-        let (cpu, mut gpu) = backends(px, theme);
-        disarm_for_oracle(&mut gpu);
-        out.push(("wgpu-oracle", cpu, gpu));
-    }
-    out
+    vec![("native", cpu, gpu)]
 }
 
-/// That `gpu`'s last frame drew on the arm `arm` names (the oracle is
-/// neither Metal, GL nor D3D11).
+/// That `gpu`'s last frame drew on the arm `arm` names.
 #[track_caller]
 pub fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer) {
     #[cfg(target_os = "macos")]
@@ -151,8 +128,6 @@ pub fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer) {
         arm == "native",
         "{arm}: the frame's arm"
     );
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    let _ = (arm, gpu);
 }
 
 /// End the calling test as could-not-run unless this host ships a colour-emoji face.
@@ -182,14 +157,6 @@ pub fn cpu(px: f32, theme: Theme) -> Renderer {
 /// A GPU renderer at `px`/`theme` on [`FIXTURE_FONT`].
 pub fn gpu(px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
     gpu_on(FIXTURE_FONT, px, theme)
-}
-
-/// [`gpu`] on the wgpu oracle arm ([`disarm_for_oracle`]).
-#[cfg(wgpu_arm)]
-pub fn wgpu_oracle(px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
-    let mut g = gpu(px, theme);
-    disarm_for_oracle(&mut g);
-    g
 }
 
 /// [`backends`], with both renderers built on the font file at `font`.

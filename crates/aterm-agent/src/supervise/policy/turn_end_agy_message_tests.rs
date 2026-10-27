@@ -270,7 +270,15 @@ fn every_act_with(rules_text: &str) -> Vec<(String, String)> {
             ));
         }
     }
-    acts.push(("login-back".to_string(), login_back_text(Program::Agy)));
+    acts.push(("login-back".to_string(), login_back_text()));
+    for cleared in [Cleared::UsageLimit, Cleared::Login, Cleared::Credits] {
+        for clearing in [Clearing::Measured, Clearing::Blind] {
+            acts.push((
+                format!("cleared {cleared:?} {clearing:?}"),
+                cleared_text(cleared, clearing).to_string(),
+            ));
+        }
+    }
     acts.push((
         "upgrade-carry-on".to_string(),
         crate::harness::upgrade::CARRY_ON.to_string(),

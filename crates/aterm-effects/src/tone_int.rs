@@ -93,6 +93,7 @@ pub const fn tanh(x: f64) -> f64 {
 }
 
 /// Derive tone-int's params blob from a tone asset: its i8 tensors verbatim and MULT, b1, b2 and the tanh table by the fixed-point rules of design §12.2, checked by [`int_bag_mlp::check`].
+#[inline]
 pub fn derive(asset: &[u8]) -> Result<Vec<u8>, DeriveError> {
     const fn pow2(n: u32) -> f64 {
         (1u32 << n) as f64
@@ -180,6 +181,7 @@ pub fn derive(asset: &[u8]) -> Result<Vec<u8>, DeriveError> {
 }
 
 /// tone-int v1's params blob, [`derive`] of the shipped [`tone::ASSET`], derived once.
+#[inline]
 pub fn v1() -> Result<&'static [u8], DeriveError> {
     static V1: OnceLock<Result<Vec<u8>, DeriveError>> = OnceLock::new();
     match V1.get_or_init(|| derive(tone::ASSET)) {
@@ -189,6 +191,8 @@ pub fn v1() -> Result<&'static [u8], DeriveError> {
 }
 
 /// tone-int's id: `Digest::of(TONE_INT_DOMAIN, [LAYOUT_VERSION, PROFILE, B, E, H, C, the params bytes])`, each number a little-endian u32.
+#[must_use]
+#[inline]
 pub fn id(p: &ParamsView<'_>) -> Digest {
     let d = p.dims();
     Digest::of(
@@ -206,6 +210,7 @@ pub fn id(p: &ParamsView<'_>) -> Digest {
 }
 
 /// Append `text`'s n-gram buckets to `ids` through the shipped [`tone::for_each_ngram_bucket`], returning how many it emitted.
+#[inline]
 pub fn featurize(text: &str, ids: &mut Vec<u16>) -> usize {
     tone::for_each_ngram_bucket(text, |b| {
         ids.push(u16::try_from(b).unwrap_or(u16::MAX));
@@ -213,11 +218,13 @@ pub fn featurize(text: &str, ids: &mut Vec<u16>) -> usize {
 }
 
 /// Featurize `texts` into a [`Batch`] for `p`, one row per text in order.
+#[inline]
 pub fn pack(p: &ParamsView<'_>, texts: &[&str]) -> Result<Batch, BatchError> {
     pack_into(p, texts, Vec::new(), Vec::new())
 }
 
 /// [`pack`] into the capacity of `offsets` and `ids`, as [`Batch::into_parts`] gives them back.
+#[inline]
 pub fn pack_into(
     p: &ParamsView<'_>,
     texts: &[&str],
@@ -226,6 +233,7 @@ pub fn pack_into(
 ) -> Result<Batch, BatchError> {
     offsets.clear();
     ids.clear();
+    offsets.reserve(texts.len().saturating_add(1));
     offsets.push(0);
     for text in texts {
         featurize(text, &mut ids);
@@ -261,6 +269,8 @@ pub struct Line {
 }
 
 /// The workload: every corpus line then every held-out line, in file order, as [`tone::parse_corpus_line`] reads them.
+#[must_use]
+#[inline]
 pub fn workload() -> Vec<Line> {
     let mut out = Vec::with_capacity(WORKLOAD_LINES);
     for (tsv, held_out) in [(CORPUS_TSV, false), (HOLDOUT_TSV, true)] {
@@ -279,21 +289,31 @@ pub fn workload() -> Vec<Line> {
 }
 
 /// The workload's texts, in order.
+#[must_use]
+#[inline]
 pub fn texts() -> Vec<&'static str> {
-    let lines = workload();
-    let mut out = Vec::with_capacity(lines.len());
-    for l in lines {
-        out.push(l.text);
+    let mut out = Vec::with_capacity(WORKLOAD_LINES);
+    for tsv in [CORPUS_TSV, HOLDOUT_TSV] {
+        for l in tsv.lines() {
+            if let Some((_, _, text)) = tone::parse_corpus_line(l) {
+                out.push(text);
+            }
+        }
     }
     out
 }
 
 /// `Digest::of(WORKLOAD_DOMAIN, [each workload text])`.
+#[must_use]
+#[inline]
 pub fn workload_digest() -> Digest {
-    let texts = texts();
-    let mut parts = Vec::with_capacity(texts.len());
-    for t in &texts {
-        parts.push(t.as_bytes());
+    let mut parts = Vec::with_capacity(WORKLOAD_LINES);
+    for tsv in [CORPUS_TSV, HOLDOUT_TSV] {
+        for l in tsv.lines() {
+            if let Some((_, _, text)) = tone::parse_corpus_line(l) {
+                parts.push(text.as_bytes());
+            }
+        }
     }
     Digest::of(WORKLOAD_DOMAIN, &parts)
 }
@@ -309,6 +329,7 @@ pub const fn class_code(tone: Option<Tone>) -> u8 {
 }
 
 /// ASCII digits to their values, at compile time.
+#[inline]
 const fn digits<const N: usize>(s: &[u8; N]) -> [u8; N] {
     let mut out = [0u8; N];
     let mut i = 0;

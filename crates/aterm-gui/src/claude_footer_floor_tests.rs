@@ -75,13 +75,12 @@ fn tabs(sides: &[Side]) -> Vec<(&'static str, RenderCell)> {
     tabs
 }
 
-/// The marks [`every_fact`] draws: the join twice, before the plan and before the week.
-const MARKS: [char; 10] = [
+/// The marks [`every_fact`] draws: the join before the week.
+const MARKS: [char; 9] = [
     footer::MODEL_MARK,
     footer::PATH_MARK,
     footer::BRANCH_MARK,
     footer::ACCOUNT_MARK,
-    footer::JOIN_MARK,
     footer::JOIN_MARK,
     footer::WALL_MARK,
     footer::CONTEXT_MARK,
@@ -94,7 +93,6 @@ fn every_fact() -> footer::RuleFit {
     footer::RuleFit {
         segments: vec![
             Segment::plain(footer::ACCOUNT_MARK, "me@example.test"),
-            Segment::joined(footer::PLAN_MARK, "max"),
             Segment::joined(footer::WEEKLY_MARK, "40%"),
             Segment::plain(footer::WALL_MARK, format!("5h {} 3pm", footer::RESET_MARK)),
             Segment {
@@ -333,6 +331,8 @@ fn ghost_glyphs(
         len: 60,
         rule,
         voice: None,
+        tail: None,
+        end: 62,
     };
     let mut top = ComposedTop::default();
     compose_top(
@@ -360,6 +360,7 @@ fn ghost_glyphs(
         &mut top,
         None,
         None,
+        &[],
     );
     let (first, end) = top.ghost.expect("the ghost is drawn");
     top.cells

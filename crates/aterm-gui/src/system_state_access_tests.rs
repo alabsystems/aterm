@@ -26,6 +26,10 @@ use crate::{App, InitialSetupPermissionPolicy, SetupStatus};
 mod not_now_retry_tests;
 
 #[cfg(target_os = "macos")]
+#[path = "system_state_access/permission_walk_tests.rs"]
+mod permission_walk_tests;
+
+#[cfg(target_os = "macos")]
 #[path = "system_state_access/current_revision_tests.rs"]
 mod current_revision_tests;
 
@@ -1075,6 +1079,7 @@ fn check_handoff_dialog_slot(page: crate::devtools_helper::Page) {
             crate::devtools_helper::Page::DeveloperTools => {
                 app.open_devtools_page(Origin::Settings, None, true, now)
             }
+            crate::devtools_helper::Page::Accessibility => unreachable!("only the two pages"),
         };
         if opened {
             assert_eq!(answer, HandOver::Opened);
@@ -1111,12 +1116,7 @@ fn check_handoff_dialog_slot(page: crate::devtools_helper::Page) {
         test_arms::opened_notes(),
         test_arms::fda_counts(),
     );
-    for origin in [
-        Origin::Automatic,
-        Origin::SystemStateAct,
-        Origin::Ctl { now: false },
-        Origin::Ctl { now: true },
-    ] {
+    for origin in [Origin::Automatic, Origin::SystemStateAct, Origin::Ctl] {
         let answer = match page {
             crate::devtools_helper::Page::FullDiskAccess => {
                 #[expect(
@@ -1129,6 +1129,7 @@ fn check_handoff_dialog_slot(page: crate::devtools_helper::Page) {
             crate::devtools_helper::Page::DeveloperTools => {
                 app.open_devtools_page(origin, Some(Ok(())), true, now)
             }
+            crate::devtools_helper::Page::Accessibility => unreachable!("only the two pages"),
         };
         assert_eq!(answer, HandOver::Queued, "{origin:?}");
     }
@@ -1154,6 +1155,7 @@ fn check_handoff_dialog_slot(page: crate::devtools_helper::Page) {
         crate::devtools_helper::Page::DeveloperTools => {
             app.open_devtools_page(Origin::Automatic, Some(Ok(())), true, now)
         }
+        crate::devtools_helper::Page::Accessibility => unreachable!("only the two pages"),
     };
     assert_eq!(answer, HandOver::Opened);
     assert!(app.devtools_helper.panel().is_some());
@@ -1178,6 +1180,7 @@ fn check_handoff_dialog_slot(page: crate::devtools_helper::Page) {
         crate::devtools_helper::Page::DeveloperTools => {
             app.open_devtools_page(Origin::Digest, None, true, now)
         }
+        crate::devtools_helper::Page::Accessibility => unreachable!("only the two pages"),
     };
     assert_eq!(
         answer,
@@ -3510,11 +3513,7 @@ fn a_developer_tools_step_a_revision_admits_starts_its_spctl_run_ahead() {
 fn an_ask_the_waiting_developer_tools_step_carried_is_judged_when_the_step_is_refused() {
     use crate::devtools_helper::{HandOver, Origin, test_arms};
     use aterm_containment::DevToolGrant;
-    for ask in [
-        None,
-        Some(Origin::Ctl { now: false }),
-        Some(Origin::SystemStateAct),
-    ] {
+    for ask in [None, Some(Origin::Ctl), Some(Origin::SystemStateAct)] {
         set_front(true);
         let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
         app.access_steps.set_reach(StepsReach {
@@ -3533,9 +3532,9 @@ fn an_ask_the_waiting_developer_tools_step_carried_is_judged_when_the_step_is_re
             app.hand_devtools_to_owner(Origin::Automatic),
             HandOver::Queued
         );
-        if ask == Some(Origin::Ctl { now: false }) {
+        if ask == Some(Origin::Ctl) {
             assert_eq!(
-                app.hand_devtools_to_owner(Origin::Ctl { now: false }),
+                app.hand_devtools_to_owner(Origin::Ctl),
                 HandOver::Queued,
                 "the client is told it waits"
             );
@@ -3627,10 +3626,7 @@ fn an_ask_the_developer_tools_step_carried_waits_with_it_when_it_waits_again() {
             HandOver::Queued
         );
         if ask {
-            assert_eq!(
-                app.hand_devtools_to_owner(Origin::Ctl { now: false }),
-                HandOver::Queued
-            );
+            assert_eq!(app.hand_devtools_to_owner(Origin::Ctl), HandOver::Queued);
         }
         approve(&mut app, 1);
         let opens = test_arms::opens();
@@ -3699,10 +3695,7 @@ fn the_control_verbs_ask_that_rides_the_step_keeps_its_own_quiet_moment() {
             HandOver::Queued
         );
         if ask {
-            assert_eq!(
-                app.hand_devtools_to_owner(Origin::Ctl { now: false }),
-                HandOver::Queued
-            );
+            assert_eq!(app.hand_devtools_to_owner(Origin::Ctl), HandOver::Queued);
         }
         let opens = test_arms::opens();
         for park in 0..3 {
@@ -3730,92 +3723,6 @@ fn the_control_verbs_ask_that_rides_the_step_keeps_its_own_quiet_moment() {
             (test_arms::opens(), app.devtools_helper.queued()),
             (opens + 1 + u32::from(ask && !handed), None),
             "ask {ask}, handed {handed}: the revision's own page, unless it came up already"
-        );
-    }
-}
-
-/// A control verb's `now` answered with no access revision standing leaves the window's own
-/// Developer Tools step waiting for its revision, as a page that comes up then does. The verb's
-/// asker brings that page up itself after the answer, behind its `spctl` run, and writes the
-/// marker only then: the step looks no sooner than ten minutes on, never within the verb's
-/// minute, and a marker written later than that allowed for (a slow asker) holds it on for the
-/// rest of its page's ten minutes rather than spending it as recent. Where the revision came to
-/// have brought the page up already by then, the step is refused as shown at once.
-#[cfg(target_os = "macos")]
-#[test]
-fn a_now_panel_with_no_revision_leaves_the_step_waiting_out_the_verbs_page() {
-    use crate::devtools_helper::{DevToolsHelperArm, HandOver, Lane, Origin, test_arms};
-    use aterm_containment::DevToolGrant;
-    use std::cell::Cell;
-    thread_local! {
-        static RECENT: Cell<bool> = const { Cell::new(false) };
-        static HANDED: Cell<bool> = const { Cell::new(false) };
-    }
-    let mut marking = test_arms::opening();
-    marking.opened_within = |_| RECENT.with(Cell::get).then_some(0);
-    set_front(true);
-    for handed in [false, true] {
-        RECENT.with(|recent| recent.set(false));
-        HANDED.with(|handed| handed.set(false));
-        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
-        app.access_steps.set_reach(StepsReach {
-            handed: |revision, access| {
-                HANDED.with(Cell::get) && (revision, access) == (1, Access::DeveloperTools)
-            },
-            ..app.access_steps.reach
-        });
-        app.consent = reread(aterm_containment::consent::FdaState::Granted);
-        test_arms::stand_in(&mut app, marking);
-        app.devtools_helper = Lane::windowed_for_test(marking, DevToolsHelperArm::inert());
-        app.devtools_helper.note_reading(
-            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
-            Instant::now(),
-        );
-        app.observe_initial_setup_permissions(None);
-        assert_eq!(
-            app.hand_devtools_to_owner(Origin::Automatic),
-            HandOver::Queued
-        );
-        let asked = Instant::now();
-        assert!(matches!(
-            app.hand_devtools_to_owner(Origin::Ctl { now: true }),
-            HandOver::Shown | HandOver::Unshown
-        ));
-        assert_eq!(
-            app.devtools_helper.queued(),
-            Some(Origin::Automatic),
-            "the step waits on for its revision"
-        );
-        approve(&mut app, 1);
-        let opens = test_arms::opens();
-        let mut t = Instant::now();
-        parks(&mut app, &mut t, 3);
-        assert_eq!(
-            (test_arms::opens(), app.devtools_helper.queued()),
-            (opens, Some(Origin::Automatic)),
-            "handed {handed}: within the verb's minute, the asker's page is to come"
-        );
-        // The asker's marker came late: within its ten minutes at the step's look.
-        RECENT.with(|recent| recent.set(true));
-        HANDED.with(|shown| shown.set(handed));
-        let mut t = asked + Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S);
-        parks(&mut app, &mut t, 3);
-        assert_eq!(
-            (test_arms::opens(), app.devtools_helper.queued()),
-            (opens, (!handed).then_some(Origin::Automatic)),
-            "handed {handed}: a wait, not a refusal as recent"
-        );
-        if handed {
-            continue;
-        }
-        // Ten minutes after that look.
-        RECENT.with(|recent| recent.set(false));
-        let mut t = t + Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S);
-        parks(&mut app, &mut t, 3);
-        assert_eq!(
-            (test_arms::opens(), app.devtools_helper.queued()),
-            (opens + 1, None),
-            "the revision's own page"
         );
     }
 }
@@ -4642,8 +4549,9 @@ impl Drop for ReleaseWithdrawingFolder {
     }
 }
 
-/// A real worker is held in its first inert read. Revoking its admission
-/// retires the pass before another folder; a new approval starts a new pass.
+/// A real pass asks its folders together (the launch pass's looks run at once), one of them
+/// held in its inert read. Revoking its admission retires the pass: no look starts after it, the
+/// pass ends once the look in flight returns, and a new approval starts a new pass.
 #[cfg(target_os = "macos")]
 fn check_folder_permission_withdrawal(withdraw: fn(&mut App)) {
     use crate::consent_launch::FdaLaunch;
@@ -4674,11 +4582,20 @@ fn check_folder_permission_withdrawal(withdraw: fn(&mut App)) {
     app.consent_launch
         .note_launch_read(aterm_containment::consent::FdaState::Denied);
     let now = Instant::now();
+    let asked_together = || {
+        let mut asked = [
+            calls.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap(),
+            calls.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap(),
+        ];
+        asked.sort();
+        asked
+    };
     app.launch_warmup_look(now, |_, _| true);
     entered.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
     assert_eq!(
-        calls.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap(),
-        "Documents"
+        asked_together(),
+        ["Documents", "Downloads"],
+        "both looks are asked at once, one still held in its read"
     );
     let gate = app.access_steps.warmup_gate.clone().unwrap();
     let mut cleanup = ReleaseWithdrawingFolder {
@@ -4711,7 +4628,7 @@ fn check_folder_permission_withdrawal(withdraw: fn(&mut App)) {
     app.settle_access_steps(now);
     assert!(
         calls.try_recv().is_err(),
-        "the revoked worker never probes Downloads"
+        "the revoked pass starts no look after its retire"
     );
     assert!(
         !macos_dialog_up(),
@@ -4726,14 +4643,7 @@ fn check_folder_permission_withdrawal(withdraw: fn(&mut App)) {
     approve(&mut app, 1);
     app.settle_access_steps(now);
     app.launch_warmup_look(now, |_, _| true);
-    assert_eq!(
-        calls.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap(),
-        "Documents"
-    );
-    assert_eq!(
-        calls.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap(),
-        "Downloads"
-    );
+    assert_eq!(asked_together(), ["Documents", "Downloads"]);
     let fresh_gate = app.access_steps.warmup_gate.clone().unwrap();
     assert!(fresh_gate.is_open());
     gate.set(true);

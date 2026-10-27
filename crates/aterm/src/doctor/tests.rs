@@ -15,7 +15,7 @@ use aterm_converge::{ItemReport, Outcome, Readiness, Report, ReportMode};
 use atpkg::converge::repair::{self, Ground, Pass};
 use atpkg::store::{Layout, ToolName};
 
-use super::{CONTENDED, Ports, Ran};
+use super::{CONTENDED, PASS_LAYS, Ports, Ran, Wait};
 
 /// A scratch home, prefix and state root under one directory, removed on drop.
 struct Scratch {
@@ -198,9 +198,58 @@ fn run_as(
             not_own_account: not_own,
             develop: None,
             docs: None,
+            wait: None,
         },
     );
     (ran, gathers.into_inner())
+}
+
+/// Doctor as `words` ask over `scratch`, journaled in the account's own shell, its facts
+/// `gathered` and no packages row, with `wait` as the wait behind an install pass holding the
+/// store (a person at the terminal; `None`: nobody there).
+fn run_waiting(
+    scratch: &Scratch,
+    gathered: &dyn Fn() -> Gathered,
+    words: &[&str],
+    wait: Option<&Wait>,
+) -> Ran {
+    run_beside(scratch, gathered, words, wait, &Vec::new)
+}
+
+/// [`run_waiting`] with `packages` reading the packages' rows.
+fn run_beside(
+    scratch: &Scratch,
+    gathered: &dyn Fn() -> Gathered,
+    words: &[&str],
+    wait: Option<&Wait>,
+    packages: &(dyn Fn() -> Vec<ItemReport> + Sync),
+) -> Ran {
+    let ground = scratch.ground();
+    let state = scratch.root.join("state");
+    super::run(
+        &args(words),
+        &Ports {
+            gather: &|_, _| gathered(),
+            ground: Some(&ground),
+            packages,
+            state: Some(&state),
+            not_own_account: None,
+            develop: None,
+            docs: None,
+            wait,
+        },
+    )
+}
+
+/// A wait for the install pass that ends at once with the lock still held, as one whose bound
+/// ran out does.
+fn ran_out(layout: &Layout) -> Result<atpkg::lock::StoreLock, atpkg::lock::StoreLockError> {
+    atpkg::lock::try_lock_store(layout)
+}
+
+/// The facts of a machine whose only fact is a usable shell.
+fn shell_only() -> Gathered {
+    Gathered::of_facts(&[("shell:", Mark::Ok, "/bin/sh (executable)")])
 }
 
 /// The report's line for `label`, and the lines under it.
@@ -394,14 +443,16 @@ fn bare_doctor_restores_a_deleted_shim_and_a_missing_link_and_leaves_an_opted_ou
     );
 }
 
-/// A HELD STORE LOCK makes the repair a note, never exit 75: an install pass holds
-/// `store.lock`, so every item stands aside (the shim stays deleted, nothing is
+/// A WAIT FOR THE INSTALL PASS THAT RAN OUT makes the repair a note, never exit 75: the pass
+/// still holds `store.lock`, so every item stands aside (the shim stays deleted, nothing is
 /// journaled), the `repair:` row is a note saying why, and readiness remains false.
 #[test]
-fn a_held_store_lock_is_a_note_and_nothing_is_repaired() {
+fn a_wait_that_ran_out_is_a_note_and_nothing_is_repaired() {
     let scratch = broken("locked");
     let held = atpkg::lock::try_lock_store(&scratch.layout()).expect("the test holds the lock");
-    let ran = run(&scratch, Mark::Ok, &[], true);
+    let ran_out: &Wait = &ran_out;
+    let run = |words: &[&str]| run_waiting(&scratch, &|| facts(Mark::Ok), words, Some(ran_out));
+    let ran = run(&[]);
     assert_eq!(ran.code, 1, "unresolved work is not ready: {}", ran.text);
     let repairs = rows_of(&ran.text, "repair:");
     assert!(
@@ -421,7 +472,7 @@ fn a_held_store_lock_is_a_note_and_nothing_is_repaired() {
         "{}",
         ran.text
     );
-    let ran = run(&scratch, Mark::Ok, &["--verbose"], true);
+    let ran = run(&["--verbose"]);
     assert_eq!(ran.code, 1, "unresolved work is not ready: {}", ran.text);
     let repair = section(&ran.text, "repair:");
     assert_eq!(mark(&repair), "note", "{repair}");
@@ -442,7 +493,7 @@ fn a_held_store_lock_is_a_note_and_nothing_is_repaired() {
         !scratch.root.join("state/converge").exists(),
         "no journal line for a change nobody made"
     );
-    let json = report(&run(&scratch, Mark::Ok, &["--json"], true));
+    let json = report(&run(&["--json"]));
     assert!(!json.complete);
     let shims = json
         .items
@@ -456,9 +507,224 @@ fn a_held_store_lock_is_a_note_and_nothing_is_repaired() {
     );
 
     drop(held);
-    let ran = run(&scratch, Mark::Ok, &[], true);
+    let ran = run(&[]);
     assert!(!ran.text.contains(CONTENDED), "{}", ran.text);
     assert!(atpkg::platform::resolve_shim(&scratch.shim("ay")).is_some());
+}
+
+/// An install pass (a test thread) that holds `store.lock` once this returns and releases it
+/// once the doctor has handed over to the returned wait, which then takes the lock; with `lays`
+/// the pass lays its own items (the repairs) before it lets go. The caller joins the thread.
+fn a_pass_until_handed(scratch: &Scratch, lays: bool) -> (std::thread::JoinHandle<()>, Box<Wait>) {
+    let (taken, take) = std::sync::mpsc::channel();
+    let (handed, hand) = std::sync::mpsc::channel::<()>();
+    let layout = scratch.layout();
+    let (ground, pass_state) = (scratch.ground(), scratch.root.join("pass-state"));
+    let pass = std::thread::spawn(move || {
+        let held = atpkg::lock::try_lock_store(&layout).expect("the pass takes the lock");
+        taken.send(()).unwrap();
+        // A one-minute hang detector: the doctor hands over to its wait well before.
+        hand.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the doctor waits for the pass");
+        if lays {
+            let mut journal = aterm_converge::FileJournal::under(&pass_state);
+            aterm_converge::run_scoped(
+                &repair::items(&ground),
+                aterm_converge::Mode::Apply,
+                aterm_converge::Scope::REPAIR,
+                &mut journal,
+                &mut |_| {},
+            )
+            .expect("the pass lays its items");
+        }
+        drop(held);
+    });
+    take.recv().unwrap();
+    let wait = move |layout: &Layout| {
+        handed.send(()).unwrap();
+        atpkg::lock::lock_store_waiting(layout, std::time::Duration::from_secs(60), |_| {}, || true)
+    };
+    (pass, Box::new(wait))
+}
+
+/// A PERSON AT THE TERMINAL WAITS FOR THE INSTALL PASS, AND ONE RUN REPAIRS: an install pass
+/// holds `store.lock` and releases it once the doctor has handed over to the wait; the wait
+/// takes the lock, every repair runs and is journaled, and the run exits 0 with nothing left
+/// for a second run. CONTROL: the same machine and pass with the try-lock path (a wait that
+/// ends at once) leaves the shim deleted, its row `Blocked`, and exits 1. Then a pass that lays
+/// the very shim a run waited to restore: once the wait ends, the shim reads as laid (read
+/// afresh, not from the plan read before the wait) and the packages are read again, the
+/// toolset the pass installed reading installed, not as the read before the wait saw it. And
+/// with nothing for the lock to do, the run never waits for the pass: its report comes at once.
+#[test]
+fn a_person_at_the_terminal_waits_for_the_install_pass_and_one_run_repairs() {
+    let scratch = broken("waits");
+    let held = atpkg::lock::try_lock_store(&scratch.layout()).expect("the test holds the lock");
+    let control = run_waiting(&scratch, &shell_only, &["--json"], Some(&ran_out));
+    assert_eq!(control.code, 1, "{}", control.text);
+    let shims = |ran: &Ran| {
+        report(ran)
+            .items
+            .into_iter()
+            .find(|row| row.id == repair::SHIMS)
+            .unwrap()
+    };
+    assert_eq!(shims(&control).outcome, Outcome::Blocked);
+    assert!(std::fs::symlink_metadata(scratch.shim("ay")).is_err());
+    drop(held);
+
+    let (pass, wait) = a_pass_until_handed(&scratch, false);
+    let ran = run_waiting(&scratch, &shell_only, &["--json"], Some(&*wait));
+    pass.join().unwrap();
+    assert_eq!(ran.code, 0, "{}", ran.text);
+    assert!(report(&ran).complete, "{}", ran.text);
+    assert_eq!(shims(&ran).outcome, Outcome::Changed);
+    assert!(atpkg::platform::resolve_shim(&scratch.shim("ay")).is_some());
+    assert!(std::fs::read_link(scratch.link()).is_ok(), "linked");
+    let journal = std::fs::read_to_string(scratch.root.join("state/converge/journal.ndjson"))
+        .expect("the changes are journaled");
+    assert!(journal.contains(repair::SHIMS), "{journal}");
+    let again = run_waiting(&scratch, &shell_only, &[], None);
+    assert_eq!(again.code, 0, "{}", again.text);
+    assert!(
+        rows_of(&again.text, "changed:").is_empty(),
+        "{}",
+        again.text
+    );
+
+    std::fs::remove_file(scratch.shim("ay")).unwrap();
+    let (pass, wait) = a_pass_until_handed(&scratch, true);
+    let reads = std::sync::atomic::AtomicUsize::new(0);
+    let packages = || {
+        let mut toolset = toolset_planned();
+        if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+            toolset.outcome = Outcome::Ok;
+            toolset.from = None;
+            toolset.to = Some("12 program(s) active".to_owned());
+        }
+        vec![toolset]
+    };
+    let after = run_beside(&scratch, &shell_only, &["--json"], Some(&*wait), &packages);
+    pass.join().unwrap();
+    assert_eq!(
+        shims(&after).outcome,
+        Outcome::Ok,
+        "laid by the pass: {}",
+        after.text
+    );
+    let toolset = report(&after)
+        .items
+        .into_iter()
+        .find(|row| row.id == "base.pkg.toolset");
+    assert_eq!(
+        toolset.map(|row| row.outcome),
+        Some(Outcome::Ok),
+        "read again once the pass it waited for ended: {}",
+        after.text
+    );
+    assert_eq!(after.code, 0, "{}", after.text);
+
+    let held = atpkg::lock::try_lock_store(&scratch.layout()).expect("the test holds the lock");
+    let waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = {
+        let waits = Arc::clone(&waits);
+        move |layout: &Layout| {
+            waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            atpkg::lock::try_lock_store(layout)
+        }
+    };
+    let at_once = run_waiting(&scratch, &shell_only, &["--json"], Some(&counted));
+    assert_eq!(
+        waits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing for the lock to do: {}",
+        at_once.text
+    );
+    assert_eq!(at_once.code, 0, "{}", at_once.text);
+    assert!(report(&at_once).complete, "{}", at_once.text);
+    drop(held);
+}
+
+/// The packages' toolset row while no ALab program is installed yet: an essential install row
+/// `aterm pkg doctor` fails on.
+fn toolset_planned() -> ItemReport {
+    let mut row = super::unmeasured(
+        "base.pkg.toolset",
+        "pkg",
+        Some(aterm_converge::Layer::Base),
+        String::new(),
+    );
+    row.title = "the ALab toolset".to_owned();
+    row.outcome = Outcome::Planned;
+    row.why = None;
+    row.from = Some("no ALab programs are installed".to_owned());
+    row.to = Some("the ALab default set, installed".to_owned());
+    row.class = Some(aterm_converge::Class::Install);
+    row.essential = true;
+    row
+}
+
+/// NOBODY AT THE TERMINAL LEAVES THE INSTALL PASS ITS OWN ITEMS: with the pass holding
+/// `store.lock`, each relay and install row reads `NotApplicable` (the running install pass lays
+/// these), the rc row included though it follows the hooks and the packages' toolset row the
+/// pass is installing, nothing of the store is touched (the shim stays deleted), and the run
+/// counts complete and exits 0. The copied command in `~/.local/bin`, which touches nothing of
+/// the store, is moved aside and journaled at once. CONTROL: the same toolset row with the
+/// store free is the step it is, and the run exits 1.
+#[test]
+fn nobody_at_the_terminal_leaves_the_install_pass_its_items_and_exits_0() {
+    let scratch = broken("left");
+    let bin = scratch.home().join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("aterm"), b"#!/bin/sh\nexit 0\n").unwrap();
+    let held = atpkg::lock::try_lock_store(&scratch.layout()).expect("the test holds the lock");
+    let toolset = [toolset_planned()];
+    let toolset = || toolset.to_vec();
+    let ran = run_beside(&scratch, &shell_only, &["--json"], None, &toolset);
+    assert_eq!(ran.code, 0, "{}", ran.text);
+    let json = report(&ran);
+    assert!(json.complete, "{}", ran.text);
+    let row = |id: &str| {
+        json.items
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap_or_else(|| panic!("no {id} in {}", ran.text))
+    };
+    for id in [repair::SHIMS, repair::LINKS, repair::RC, "base.pkg.toolset"] {
+        let row = row(id);
+        assert_eq!(row.outcome, Outcome::NotApplicable, "{row:?}");
+        assert!(
+            row.why
+                .as_deref()
+                .is_some_and(|why| why.ends_with(PASS_LAYS)),
+            "{row:?}"
+        );
+        assert_eq!(row.stood_aside, None, "{row:?}");
+    }
+    assert_eq!(row(repair::COPIED_COMMANDS).outcome, Outcome::Changed);
+    assert!(
+        std::fs::symlink_metadata(bin.join("aterm"))
+            .is_ok_and(|meta| meta.file_type().is_symlink()),
+        "the copy is moved aside and the app linked in its place"
+    );
+    assert!(
+        std::fs::symlink_metadata(scratch.shim("ay")).is_err(),
+        "the store is the pass's"
+    );
+    let journal = std::fs::read_to_string(scratch.root.join("state/converge/journal.ndjson"))
+        .expect("the move is journaled");
+    assert!(journal.contains(repair::COPIED_COMMANDS), "{journal}");
+    assert!(!journal.contains(repair::SHIMS), "{journal}");
+    let brief = run_beside(&scratch, &shell_only, &[], None, &toolset);
+    assert_eq!(brief.code, 0, "{}", brief.text);
+    assert!(rows_of(&brief.text, "repair:").is_empty(), "{}", brief.text);
+    drop(held);
+
+    let control = run_beside(&scratch, &shell_only, &["--json"], None, &toolset);
+    assert_eq!(control.code, 1, "{}", control.text);
+    let json = report(&control);
+    let toolset = json.items.iter().find(|row| row.id == "base.pkg.toolset");
+    assert_eq!(toolset.map(|row| row.outcome), Some(Outcome::Planned));
 }
 
 /// A USABLE SHELL IS NOT A READY MACHINE: failed repairs, manual steps and broken
@@ -596,6 +862,7 @@ fn readiness_distinguishes_confirmed_state_from_plans_manual_steps_and_unknowns(
             not_own_account: None,
             develop: None,
             docs: None,
+            wait: None,
         },
     );
     assert_eq!(note.code, 0, "{}", note.text);
@@ -617,6 +884,7 @@ fn shell_and(scratch: &Scratch, words: &[&str], rows: &[ItemReport]) -> Ran {
             not_own_account: None,
             develop: None,
             docs: None,
+            wait: None,
         },
     )
 }
@@ -632,6 +900,7 @@ fn injected(shell: Mark, words: &[&str], rows: &[ItemReport]) -> Ran {
             not_own_account: None,
             develop: None,
             docs: None,
+            wait: None,
         },
     )
 }
@@ -940,6 +1209,7 @@ fn reads(scratch: &Scratch, words: &[&str]) -> (Ran, Vec<Vec<String>>, usize) {
             not_own_account: None,
             develop: None,
             docs: None,
+            wait: None,
         },
     );
     (ran, gathers.into_inner().unwrap(), packages.into_inner())
@@ -1015,6 +1285,7 @@ fn the_packages_are_read_beside_the_gather() {
                 not_own_account: None,
                 develop: None,
                 docs: None,
+                wait: None,
             },
         );
         let _ = tx.send(ran.code);
@@ -1136,18 +1407,20 @@ fn a_store_lock_that_cannot_be_taken_is_a_warning_and_nothing_is_repaired() {
     assert_eq!(shims.stood_aside, None, "not contention: {shims:?}");
 }
 
-/// INIT'S BASE LAYER AND THE STORE LOCK: held by an install pass, each item stands aside
-/// on the lock (init's 75, "retry when it exits"); not to be taken for another reason (a
-/// directory where `store.lock` goes), each change is held back and nothing stands aside
-/// (init's 1: no retry takes it). Neither changes anything. Free, init holds the lock for
-/// its base items; a plan takes nothing.
+/// INIT'S BASE LAYER AND THE STORE LOCK: held by an install pass, init leaves the pass its own
+/// items when nobody is at the terminal (each `NotApplicable`, exit 0, no second run), waits for
+/// the pass with a person there (the lock taken once the pass lets go), and stands each item
+/// aside only under `--no-wait` (75, "retry when it exits"). A lock not to be taken for another
+/// reason (a directory where `store.lock` goes) holds each change back and nothing stands aside
+/// (init's 1: no retry takes it). None of these changes anything of the store. Free, init holds
+/// the lock for its base items; a plan takes nothing.
 #[cfg(target_os = "macos")]
 #[test]
-fn init_stands_aside_for_an_install_pass_and_fails_on_a_lock_it_cannot_take() {
+fn init_waits_for_an_install_pass_or_leaves_it_its_items_and_fails_on_a_lock_it_cannot_take() {
+    use aterm_machines::init::{BaseLock, apply_status_for_test};
     let scratch = broken("init-lock");
     let ground = scratch.ground();
-    let shims = |base: aterm_machines::init::Base| {
-        assert!(base.held.is_none());
+    let rows = |base: aterm_machines::init::Base| {
         aterm_converge::run_scoped(
             &base.items,
             aterm_converge::Mode::Apply,
@@ -1156,23 +1429,59 @@ fn init_stands_aside_for_an_install_pass_and_fails_on_a_lock_it_cannot_take() {
             &mut |_| {},
         )
         .unwrap()
-        .into_iter()
-        .find(|row| row.id == repair::SHIMS)
-        .unwrap()
+    };
+    let shims = |rows: &[ItemReport]| {
+        rows.iter()
+            .find(|row| row.id == repair::SHIMS)
+            .unwrap()
+            .clone()
     };
     let held = atpkg::lock::try_lock_store(&scratch.layout()).expect("the test holds the lock");
-    let row = shims(super::init_base_over(&ground, true));
+    let base = super::init_base_over(&ground, BaseLock::Wait, None);
+    assert!(base.held.is_none());
+    let left = rows(base);
+    assert_eq!(shims(&left).outcome, Outcome::NotApplicable, "{left:?}");
+    assert_eq!(apply_status_for_test(&left), 0, "{left:?}");
+
+    let base = super::init_base_over(&ground, BaseLock::Try, None);
+    assert!(base.held.is_none());
+    let aside = rows(base);
+    let row = shims(&aside);
     assert_eq!(row.outcome, Outcome::Blocked);
     assert!(
         matches!(row.stood_aside, Some(aterm_converge::StoodAside::Lock(_))),
         "{row:?}"
     );
-    drop(held);
+    assert_eq!(apply_status_for_test(&aside), 75, "{aside:?}");
+
+    let (handed, hand) = std::sync::mpsc::channel::<()>();
+    let pass = std::thread::spawn(move || {
+        // A one-minute hang detector: init hands over to its wait well before.
+        hand.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("init waits for the pass");
+        drop(held);
+    });
+    let wait = move |layout: &Layout| {
+        handed.send(()).unwrap();
+        atpkg::lock::lock_store_waiting(layout, std::time::Duration::from_secs(60), |_| {}, || true)
+    };
+    let base = super::init_base_over(&ground, BaseLock::Wait, Some(&wait));
+    pass.join().unwrap();
+    assert!(base.held.is_some(), "the wait took the lock");
+    assert!(matches!(
+        atpkg::lock::try_lock_store(&scratch.layout()),
+        Err(atpkg::lock::StoreLockError::Contended(_))
+    ));
+    drop(base);
+    assert!(
+        std::fs::symlink_metadata(scratch.shim("ay")).is_err(),
+        "nothing restored"
+    );
 
     let lock = scratch.layout().store_lock();
     std::fs::remove_file(&lock).unwrap();
     std::fs::create_dir(&lock).unwrap();
-    let row = shims(super::init_base_over(&ground, true));
+    let row = shims(&rows(super::init_base_over(&ground, BaseLock::Wait, None)));
     assert_eq!(row.outcome, Outcome::Blocked);
     assert_eq!(row.stood_aside, None, "{row:?}");
     assert!(
@@ -1187,8 +1496,12 @@ fn init_stands_aside_for_an_install_pass_and_fails_on_a_lock_it_cannot_take() {
     );
     std::fs::remove_dir(&lock).unwrap();
 
-    assert!(super::init_base_over(&ground, false).held.is_none());
-    let base = super::init_base_over(&ground, true);
+    assert!(
+        super::init_base_over(&ground, BaseLock::Read, None)
+            .held
+            .is_none()
+    );
+    let base = super::init_base_over(&ground, BaseLock::Wait, None);
     assert!(base.held.is_some());
     assert!(matches!(
         atpkg::lock::try_lock_store(&scratch.layout()),
@@ -1196,6 +1509,29 @@ fn init_stands_aside_for_an_install_pass_and_fails_on_a_lock_it_cannot_take() {
     ));
     drop(base);
     assert!(atpkg::lock::try_lock_store(&scratch.layout()).is_ok());
+
+    // Nothing for the lock to do: a person's init never waits for the pass, and exits 0.
+    let repaired = run_waiting(&scratch, &shell_only, &[], None);
+    assert_eq!(repaired.code, 0, "{}", repaired.text);
+    let held = atpkg::lock::try_lock_store(&scratch.layout()).expect("the test holds the lock");
+    let waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = {
+        let waits = Arc::clone(&waits);
+        move |layout: &Layout| {
+            waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            atpkg::lock::try_lock_store(layout)
+        }
+    };
+    let base = super::init_base_over(&ground, BaseLock::Wait, Some(&counted));
+    assert!(base.held.is_none());
+    let left = rows(base);
+    assert_eq!(
+        waits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "{left:?}"
+    );
+    assert_eq!(apply_status_for_test(&left), 0, "{left:?}");
+    drop(held);
 }
 
 /// The front door hands `aterm doctor` to the composed doctor, and leaves `aterm doctor
@@ -1384,6 +1720,7 @@ fn run_developing(
                 compose: &compose,
             }),
             docs: None,
+            wait: None,
         },
     );
     (ran, gathers.into_inner())
@@ -1922,6 +2259,7 @@ fn bare_doctor_sets_indexed_rust_docs_aside_and_builds_nothing_otherwise() {
                 not_own_account: not_own,
                 develop: None,
                 docs: Some(&repair),
+                wait: None,
             },
         )
     };
@@ -2030,5 +2368,110 @@ fn every_init_line_doctor_prints_is_one_init_takes() {
     assert!(
         aterm_machines::init::refusal(line, &base, &[]).is_some(),
         "{line}"
+    );
+}
+
+/// The stale copy a launch test planted, the Trash and the store it uses, the moves its stand-in
+/// Trash made, and whether the store lock was free at each move.
+static PLANTED: std::sync::Mutex<Option<(PathBuf, PathBuf, Layout)>> = std::sync::Mutex::new(None);
+static TRASHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FREE_AT_MOVE: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+
+/// [`atpkg::copies::prune`] over the planted copy, its census the copy's presence and its Trash a
+/// rename into the scratch Trash, counted.
+fn planted_prune(dry_run: bool) -> atpkg::copies::Pruned {
+    use atpkg::copies::Pruned;
+    let planted = PLANTED.lock().unwrap().clone();
+    let offered: Vec<PathBuf> = planted
+        .iter()
+        .filter(|(copy, ..)| copy.exists())
+        .map(|(copy, ..)| copy.clone())
+        .collect();
+    if dry_run {
+        return Pruned::Found {
+            offered,
+            kept: Vec::new(),
+            complete: true,
+        };
+    }
+    let moved = offered
+        .into_iter()
+        .map(|copy| {
+            let (_, trash, layout) = planted.clone().unwrap();
+            TRASHED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            FREE_AT_MOVE
+                .lock()
+                .unwrap()
+                .push(atpkg::lock::try_lock_store(&layout).is_ok());
+            std::fs::rename(&copy, trash.join(copy.file_name().unwrap())).unwrap();
+            (copy, aterm_containment::consent::Retired::Moved)
+        })
+        .collect();
+    Pruned::Done {
+        moved,
+        kept: Vec::new(),
+    }
+}
+
+/// A LAUNCH MOVES A STALE COPY TO THE TRASH ONCE: from the installed release app, with an install
+/// pass holding the store, the planted copy goes to the Trash in one move, the move is journaled,
+/// and the launch says it in one line (the window's one entry); the next launch finds nothing and
+/// moves nothing. With the store free, a launch moves a copy without taking the store lock, so
+/// the install pass after the seed never waits behind it. CONTROL: the same copy under a dev
+/// build's launch is not looked at at all.
+#[test]
+fn a_launch_moves_a_stale_copy_to_the_trash_once_and_a_dev_build_never() {
+    use std::sync::atomic::Ordering;
+    let scratch = Scratch::new("launch");
+    let copy = scratch.root.join("Applications/aterm-prev-1.app");
+    let trash = scratch.root.join("Trash");
+    std::fs::create_dir_all(copy.join("Contents/MacOS")).unwrap();
+    std::fs::create_dir_all(&trash).unwrap();
+    *PLANTED.lock().unwrap() = Some((copy.clone(), trash.clone(), scratch.layout()));
+    let state = scratch.root.join("state");
+    let launch = |ground: &Arc<Ground>| {
+        let copies = aterm_cli::doctor::StaleCopies::new(planted_prune, None);
+        super::launch_repairs_over(ground, &state, &copies)
+    };
+
+    let mut dev = (*scratch.ground()).clone();
+    dev.exe = Some(scratch.root.join("aterm (dev).app/Contents/MacOS/aterm"));
+    assert!(launch(&Arc::new(dev)).is_empty());
+    assert_eq!(
+        TRASHED.load(Ordering::SeqCst),
+        0,
+        "a dev build moves nothing"
+    );
+    assert!(copy.exists());
+
+    let held = atpkg::lock::try_lock_store(&scratch.layout()).expect("the test holds the lock");
+    let moved = launch(&scratch.ground());
+    assert_eq!(TRASHED.load(Ordering::SeqCst), 1);
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    assert!(
+        moved[0].contains("moved 1 stale copy of aterm to the Trash (recoverable there)"),
+        "{moved:?}"
+    );
+    assert!(!copy.exists() && trash.join("aterm-prev-1.app").exists());
+    let journal = std::fs::read_to_string(state.join("converge/journal.ndjson"))
+        .expect("the move is journaled");
+    assert!(journal.contains(aterm_cli::doctor::COPIES), "{journal}");
+    drop(held);
+
+    assert!(launch(&scratch.ground()).is_empty(), "nothing left to move");
+    assert_eq!(
+        TRASHED.load(Ordering::SeqCst),
+        1,
+        "the second launch moves nothing"
+    );
+
+    std::fs::remove_dir_all(trash.join("aterm-prev-1.app")).unwrap();
+    std::fs::create_dir_all(copy.join("Contents/MacOS")).unwrap();
+    assert_eq!(launch(&scratch.ground()).len(), 1);
+    assert_eq!(TRASHED.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *FREE_AT_MOVE.lock().unwrap(),
+        [false, true],
+        "the store stays free while a launch moves a copy"
     );
 }

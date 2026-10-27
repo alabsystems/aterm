@@ -57,7 +57,9 @@ mod utf8;
 mod utf8_simd;
 
 pub use action::{Action, ActionSink, NullSink};
-pub use carry::{CarryRefusal, HOOKED_STRING_CARRY, OSC_CARRY_CAP, ParserCarry, UTF8_TAIL_MAX};
+pub use carry::{
+    CarryRefusal, HOOKED_STRING_CARRY, HookedDcsCarry, OSC_CARRY_CAP, ParserCarry, UTF8_TAIL_MAX,
+};
 pub use state::State;
 pub use table::{ActionType, TRANSITIONS};
 pub use tmux::TmuxPassthrough;

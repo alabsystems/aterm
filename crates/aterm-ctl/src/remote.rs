@@ -48,6 +48,9 @@ pub struct DriveRefused {
     /// handshake within the deadline: the peer, or this machine's issuer, read for which Mac the
     /// word names: exit 2, as for an instance that accepted and did not serve.
     pub unserved: bool,
+    /// Nothing answered the dial within its deadline, or no route reached the peer (a Mac asleep
+    /// or off its network, an aterm frozen): an `await task` past its baseline asks again.
+    pub silent: bool,
 }
 
 /// Why a drive's dial reaches no Mac a hold was taken on ([`DriveRefused::left`]), with this
@@ -70,6 +73,7 @@ impl DriveRefused {
             again: false,
             left: None,
             unserved: false,
+            silent: false,
         }
     }
 }
@@ -104,8 +108,19 @@ const DRIVE_WITHIN: Duration = Duration::from_secs(28);
 pub(crate) enum Within {
     /// The drive's own: [`DRIVE_WITHIN`], or an `await task` leg's wait and its slack.
     Drive(Duration),
-    /// The caller's `--timeout` (the first), shorter than the drive's own (the second).
-    Timeout(Duration, Duration),
+    /// The caller's `--timeout` (the first), shorter than what the call waits with a longer one,
+    /// or 0 (the second).
+    Timeout(Duration, Longer),
+}
+
+/// What a drive cut by a shorter `--timeout` waits with a longer one, or 0 ([`Within::Timeout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Longer {
+    /// Up to the drive's own deadline, an `await task` leg's where its `timeout=` ends the wait.
+    Drive(Duration),
+    /// An `await task` the `--timeout` ends: as long as a longer one names, and with 0 its whole
+    /// `timeout=`, or with none until the news comes (a minute of asking a silent peer again).
+    Wait(Option<Duration>),
 }
 
 impl Within {
@@ -120,7 +135,9 @@ impl Within {
 /// `--timeout 0`).
 fn drive_within(total: Option<Option<Duration>>) -> Within {
     match total {
-        Some(Some(total)) if total < DRIVE_WITHIN => Within::Timeout(total, DRIVE_WITHIN),
+        Some(Some(total)) if total < DRIVE_WITHIN => {
+            Within::Timeout(total, Longer::Drive(DRIVE_WITHIN))
+        }
         _ => Within::Drive(DRIVE_WITHIN),
     }
 }
@@ -246,13 +263,13 @@ fn left_holding(host: &str, sid: &str, left: &Left, why: &str) -> String {
 }
 
 /// What lifts, on another Mac, a hold this machine (`node`) took there: each ends the grant the
-/// hold stands on, or takes the tab.
+/// hold stands on, or takes the tab. The node is named whole, as a member's `peers rm` takes the
+/// issuer it can no longer read.
 #[must_use]
 pub fn lifts_there(node: &str) -> String {
     format!(
         "that Mac lifts the hold when its person takes the tab (Take Over), runs `aterm fleet \
-         peers rm {}` there, or lowers `aterm fleet allow` there (to content or facts)",
-        node.get(..8).unwrap_or(node)
+         peers rm {node}` there, or lowers `aterm fleet allow` there (to content or facts)"
     )
 }
 
@@ -438,8 +455,8 @@ pub(crate) fn closed(label: &str, request: &str, within: Within, e: io::Error) -
         UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe => (
             format!(
                 "{label} cut the drive connection before it answered (its person took back \
-                 this Mac's grant or lowered its fleet level, its fleet key or listen place \
-                 changed, or its aterm stopped or restarted)"
+                 this Mac's grant, took this Mac out of its books or lowered its fleet level, its \
+                 fleet key or listen place changed, or its aterm stopped or restarted)"
             ),
             "again says which",
         ),
@@ -450,7 +467,7 @@ pub(crate) fn closed(label: &str, request: &str, within: Within, e: io::Error) -
                      busy to answer, or the network between is down)",
                     within.as_secs()
                 ),
-                Within::Timeout(within, own) => {
+                Within::Timeout(within, longer) => {
                     let turn = if verb == "turn" {
                         format!(
                             "a `turn` there answers once it settles or its timeout= runs out, \
@@ -459,11 +476,26 @@ pub(crate) fn closed(label: &str, request: &str, within: Within, e: io::Error) -
                     } else {
                         String::new()
                     };
+                    let longer = match longer {
+                        Longer::Drive(own) => format!(
+                            "a longer --timeout, or 0, waits up to the drive's own {} s",
+                            own.as_secs()
+                        ),
+                        Longer::Wait(Some(whole)) => format!(
+                            "a longer --timeout waits as long as it names, up to the wait's \
+                             timeout= of {} ms, and 0 that whole timeout=",
+                            whole.as_millis()
+                        ),
+                        Longer::Wait(None) => {
+                            "a longer --timeout waits as long as it names, and 0 until the news \
+                             comes, where a peer that answers no leg is asked again for a minute"
+                                .to_owned()
+                        }
+                    };
                     format!(
                         "no answer came from {label} within this call's --timeout of {} s \
-                         ({turn}a longer --timeout, or 0, waits up to the drive's own {} s)",
-                        within.as_secs(),
-                        own.as_secs()
+                         ({turn}{longer})",
+                        within.as_secs()
                     )
                 }
             },

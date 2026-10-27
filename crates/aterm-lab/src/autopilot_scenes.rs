@@ -28,8 +28,9 @@ pub enum Scene {
     /// Land's landing, land-a's L1 and L5: a work reply, `land@v1`; a clean defense in a clean
     /// repository, landed (`DONE … rule=land@v1`). Its conversation is land-c's (whose replies
     /// land-a's are but for L3's `NEEDS YOU:`), in land-a's clean repository: a nudge carries the
-    /// need's acknowledgement, whose words have moved since `b42ae72fc3`, and the corpus's Land
-    /// tapes replay on that tree's policy as well as this one's.
+    /// need's acknowledgement, whose words have moved since `b42ae72fc3`; the corpus's Land tapes
+    /// replayed on that tree's policy until Land's instruction stopped waiting the back-off (v6
+    /// §14.10).
     Landing,
     /// Land's repository hold, land-c's: one untracked file beside a pushed `main`. A clean
     /// defense, a nudge naming the file, the same defense again: held (`kind=stalled`).

@@ -174,7 +174,7 @@ impl Program {
         }
     }
 
-    /// Incremental version of this program's aterm/alab harness, starting at `"0.1"` per harness.
+    /// Incremental version of this program's aterm/alab harness, `"0.4"`, one per harness.
     #[inline]
     #[must_use]
     pub const fn harness_version(self) -> Option<&'static str> {
@@ -244,7 +244,7 @@ pub trait ScreenReader: Sync {
     fn harness_version_num(&self) -> Option<crate::HarnessVersion> {
         self.program().harness_version_num()
     }
-    /// Incremental version of this program's harness (`"0.1"`), or `None` for [`Program::Generic`].
+    /// Incremental version of this program's harness (`"0.4"`), or `None` for [`Program::Generic`].
     fn harness_version(&self) -> Option<&'static str> {
         self.program().harness_version()
     }
@@ -2332,13 +2332,7 @@ mod tests {
     }
 
     #[test]
-    fn each_harness_module_owns_its_own_version_from_0_1() {
-        assert_eq!(crate::phase::HARNESS_VERSION, "0.1");
-        assert_eq!(crate::codex::HARNESS_VERSION, "0.1");
-        assert_eq!(crate::agy::HARNESS_VERSION, "0.1");
-        assert_eq!(crate::grok::HARNESS_VERSION, "0.1");
-        assert_eq!(crate::kimi::HARNESS_VERSION, "0.1");
-        assert_eq!(crate::muse::HARNESS_VERSION, "0.1");
+    fn every_named_program_reads_its_harness_version() {
         for prog in Program::ALL {
             // Every named program's harness has a version; a `[harness.<agent>]` table only
             // where its supervision has keys (Grok Build's and Kimi Code's has none yet).
@@ -2367,14 +2361,6 @@ mod tests {
                 prog.harness_version_num(),
                 "{prog:?}"
             );
-            if prog.harness_table() {
-                assert_eq!(prog.harness_version(), Some("0.1"), "{prog:?}");
-                assert_eq!(
-                    prog.harness_version_num(),
-                    Some(crate::HarnessVersion::INITIAL),
-                    "{prog:?}"
-                );
-            }
         }
         assert_eq!(Program::Generic.harness_version(), None);
         assert_eq!(Program::Generic.harness_version_num(), None);

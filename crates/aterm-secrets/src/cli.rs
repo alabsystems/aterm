@@ -28,13 +28,16 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
   aterm secrets get <name>               print one value to stdout
 admin (a machine in [admins]):
   aterm secrets create <url>|<path> [--import <dir>] [--name <host>]
-        [--no-agent] [--serve]           a new vault with a join password, this machine its
-                                         first admin (--import: each regular file in <dir>
-                                         with a valid entry name goes into [everyone]); for
-                                         a <url>, also install the subscriber where it does
-                                         not run, unless --no-agent, and print the `join`
-                                         line other machines paste; --serve: first set up
-                                         this machine's server on the <url>'s port
+        [--no-agent] [--serve]           a new open vault (at a <url> each machine that asks
+                                         is let in until `password new` or `off` closes it;
+                                         at a <path> an admin approves each key), this
+                                         machine its first admin (--import: each regular
+                                         file in <dir> with a valid entry name goes into
+                                         [everyone]); for a <url>, also install the
+                                         subscriber where it does not run, unless
+                                         --no-agent, and print the `join` line other
+                                         machines paste; --serve: first set up this
+                                         machine's server on the <url>'s port
   aterm secrets edit                     the vault text in $VISUAL or $EDITOR (else vi);
                                          saving publishes it
   aterm secrets set <name> [--for <host|code>...] [--file <path>]
@@ -69,6 +72,10 @@ admin (a machine in [admins]):
                                          a full age key can name a device already removed
   aterm secrets admins add|remove <host|code>   (remove also rotates the vault key)
   aterm secrets rotate-key               sign with a new vault key the current one endorses
+  aterm secrets commons init             initialize Commons on this existing vault, sharing its
+                                         control descriptor with every current vault machine
+                                         and approving each one with no admission record;
+                                         retries finish the same network and never replace a root
 server and services:
   aterm secrets serve [--listen <addr:port>] [--advertise <name> | --no-advertise]
         [--pin <vault>=<key>] [--store <dir>] [--hold <1-60 secs>] [--no-keep-awake]
@@ -188,6 +195,7 @@ enum Command {
         host: String,
     },
     RotateKey,
+    CommonsInit,
     Serve(Vec<String>),
     Agent {
         action: Action,
@@ -323,38 +331,60 @@ enum Advertise {
     Off,
 }
 
+/// What a server's store and its Mac say of the ALab vault ([`alab_role`]).
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlabHere {
+    /// The store holds the ALab vault ([`crate::server::holds_alab`]) and this Mac follows it
+    /// (its pin is of the ALab vault's line): ALab's server.
+    Server,
+    /// The store holds a copy of the ALab vault, but this Mac does not follow it: a copy an ALab
+    /// Mac put back here before servers stopped taking one they did not hold.
+    Copy,
+    /// The store holds no ALab vault.
+    Empty,
+}
+
 /// What `serve` advertises and whether it pins the ALab vault's name to its built-in key, from
-/// its flags and whether its store holds the ALab vault. Both belong to ALab's server only: one
-/// told so (`--advertise alab-secrets`, the way a new ALab server with an empty store starts) or
-/// one whose store holds the ALab vault. Any other server answering `alab-secrets.local` would
-/// take ALab Macs' copies of the vault (a subscriber that finds no vault there puts its own back)
-/// and serve them as ALab's on every network it goes to, where a new Mac then reads as ALab's.
-/// The second value is a line for the log when the ALab name is held back.
+/// its flags and what its store and Mac say of the ALab vault (`here`). Both belong to ALab's
+/// server only: one told so (`--advertise alab-secrets`, the way a new ALab server with an empty
+/// store starts) or one whose store holds the ALab vault on a Mac that follows it. Any other
+/// server answering `alab-secrets.local` would take ALab Macs' copies of the vault (a subscriber
+/// that finds no vault there puts its own back) and serve them as ALab's on every network it
+/// goes to, where a new Mac then reads as ALab's. The second value is a line for the log when
+/// the ALab name is held back.
+#[cfg(any(unix, test))]
 fn alab_role(
     advertise: Advertise,
-    holds_alab: bool,
+    here: AlabHere,
     pins: &mut Vec<(String, [u8; 32])>,
     alab_key: Option<[u8; 32]>,
 ) -> (Option<String>, Option<String>) {
     let alab_name = crate::alab_advertised();
+    let holds_alab = here == AlabHere::Server;
+    let why = match here {
+        AlabHere::Server => "",
+        AlabHere::Copy => {
+            "this store holds a copy of the ALab vault, but this Mac does not follow the ALab vault"
+        }
+        AlabHere::Empty => "that is the ALab vault's name, and this store holds no ALab vault",
+    };
     let (advertised, held_back) = match advertise {
         Advertise::Named(name) => (Some(name), None),
         Advertise::AlabIfHeld if holds_alab => (Some(alab_name.to_string()), None),
         Advertise::AlabIfHeld => (
             None,
             Some(format!(
-                "not advertising {alab_name}.local: that is the ALab vault's name, and this store holds no ALab vault (ALab's server starts with --advertise {alab_name}; another vault's members reach this Mac by its own name, or by a name --advertise gives)"
+                "not advertising {alab_name}.local: {why} (ALab's server starts with --advertise {alab_name}; another vault's members reach this Mac by its own name, or by a name --advertise gives)"
             )),
         ),
         Advertise::Off => (None, None),
     };
     if (holds_alab || advertised.as_deref() == Some(alab_name))
-        && !pins
-            .iter()
-            .any(|(name, _)| name == crate::server::ALAB_VAULT)
+        && !pins.iter().any(|(name, _)| name == crate::ALAB_VAULT)
         && let Some(key) = alab_key
     {
-        pins.push((crate::server::ALAB_VAULT.to_string(), key));
+        pins.push((crate::ALAB_VAULT.to_string(), key));
     }
     (advertised, held_back)
 }
@@ -661,6 +691,13 @@ fn parse(words: &[String]) -> Result<Command, String> {
             no_operands(&flags(rest, &[], &[])?, "rotate-key")?;
             Ok(Command::RotateKey)
         }
+        "commons" => {
+            let f = flags(rest, &[], &[])?;
+            match f.operands.as_slice() {
+                [verb] if verb == "init" => Ok(Command::CommonsInit),
+                _ => Err("commons takes init".into()),
+            }
+        }
         "serve" => {
             let f = flags(rest, SERVE_VALUED, SERVE_SWITCHES)?;
             no_operands(&f, "serve")?;
@@ -743,9 +780,23 @@ mod unix {
     /// (`server::take_from_store`), so the text gives [`KEPT_OUT`]'s steps too.
     const KEPT_OUT_AT_A_PATH: &str = "at a path no server serves, the key you let go comes back only when an admin approves it (aterm secrets approve <age1…> --name <host>): if the machine was lost or compromised, rotate what it could read. If aterm secrets serve serves this file, it serves this version from its next request, and the open vault still lets in any new key that reaches it: if the machine was lost or compromised, close the vault now (aterm secrets password set), let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
 
-    /// What marks a request whose key a `code-only` line names, where requests are listed.
+    /// What marks a request whose key a `code-only` line names, where an open vault's requests
+    /// are listed.
     const CODE_ONLY_MARK: &str =
         "  (code only: a machine let go, or one that asked before the vault opened)";
+
+    /// [`CODE_ONLY_MARK`] on a closed vault, where the line admits and refuses nothing: a
+    /// password or a code still lets that key in.
+    const LET_GO_MARK: &str = "  (a machine let go, or one that asked before the vault opened)";
+
+    /// The mark of a request from a key on a `code-only` line of `doc`.
+    pub(super) fn held_mark(doc: &text::Document) -> &'static str {
+        if doc.open() {
+            CODE_ONLY_MARK
+        } else {
+            LET_GO_MARK
+        }
+    }
 
     /// What opening a vault says of admins on older builds, which cannot read its lines.
     const OLDER_ADMINS: &str =
@@ -871,6 +922,25 @@ mod unix {
                     "rotated the vault key (aterm secrets status shows the new fingerprint)",
                     &done,
                 ))
+            }
+            Command::CommonsInit => {
+                let done = client::admin_commons_init(&paths)?;
+                println!(
+                    "Commons ready: network {} authority {} genesis {}; {} vault machines eligible; {}",
+                    aterm_codec::hex::encode_lower(&done.network),
+                    aterm_codec::hex::encode_lower(&done.authority),
+                    aterm_codec::hex::encode_lower(&done.genesis),
+                    done.eligible,
+                    if done.published {
+                        "foundation published"
+                    } else {
+                        "existing foundation confirmed"
+                    }
+                );
+                if !done.approved.is_empty() {
+                    println!("approved for Commons: {}", done.approved.join(", "));
+                }
+                Ok(ExitCode::SUCCESS)
             }
             Command::Serve(args) => serve(&paths, &args),
             Command::Agent {
@@ -1236,22 +1306,25 @@ mod unix {
     }
 
     /// `join`'s status line for a Mac awaiting approval of `code`, with the [`retype`] hint if any.
-    pub(super) fn waiting_line(host: &str, code: &str, retype: Option<&str>) -> String {
-        let line = format!(
-            "waiting for approval of {host} (code {code}): on an admin Mac run aterm secrets approve {code}"
-        );
+    pub(super) fn waiting_line(
+        host: &str,
+        code: &str,
+        approve: &str,
+        retype: Option<&str>,
+    ) -> String {
+        let line =
+            format!("waiting for approval of {host} (code {code}): on an admin Mac run {approve}");
         match retype {
             Some(retype) => format!("{line}; {retype}"),
             None => line,
         }
     }
 
-    /// `status`'s membership line for a Mac waiting for an admin to approve `code`, with
-    /// [`retype`] for a vault with a join queue.
-    pub(super) fn pending_membership(code: &str, retype: Option<&str>) -> String {
-        let line = format!(
-            "membership: waiting for approval (on an admin Mac: aterm secrets approve {code})"
-        );
+    /// `status`'s membership line for a Mac waiting for an admin to run `approve`
+    /// ([`Status::approve_command`](client::Status::approve_command)), with [`retype`] for a
+    /// vault with a join queue.
+    pub(super) fn pending_membership(approve: &str, retype: Option<&str>) -> String {
+        let line = format!("membership: waiting for approval (on an admin Mac: {approve})");
         match retype {
             Some(retype) => format!("{line}; {retype}"),
             None => line,
@@ -1472,10 +1545,9 @@ mod unix {
         match status.membership {
             Membership::Unconfigured => {}
             Membership::Pending => {
-                let code = status
-                    .machine
-                    .as_ref()
-                    .map_or("?", |(_, code)| code.as_str());
+                let approve = status
+                    .approve_command()
+                    .unwrap_or_else(|| "aterm secrets approve ?".to_owned());
                 let hint = status
                     .config
                     .as_ref()
@@ -1486,7 +1558,7 @@ mod unix {
                             .then_some(config.host.as_str());
                         retype(&config.source, named, false)
                     });
-                println!("{}", pending_membership(code, hint.as_deref()));
+                println!("{}", pending_membership(&approve, hint.as_deref()));
             }
             Membership::In { seq, heard } => {
                 println!("membership: in, seq {seq}, last heard {}", ago(heard));
@@ -1646,7 +1718,11 @@ mod unix {
                 } else {
                     None
                 };
-                println!("{}", waiting_line(host, code, hint.as_deref()));
+                let approve = client::status(paths)
+                    .ok()
+                    .and_then(|status| status.approve_command())
+                    .unwrap_or_else(|| format!("aterm secrets approve {code}"));
+                println!("{}", waiting_line(host, code, &approve, hint.as_deref()));
             }
             JoinOutcome::Plain { names } => {
                 println!(
@@ -1791,7 +1867,7 @@ mod unix {
                 // first source.toml has been installed.
                 if agent && client::creation_pending(paths).unwrap_or(false) {
                     let approver = approver_here(agent, subscriber);
-                    if let Some(words) = approver_words(&approver, Approval::Password) {
+                    if let Some(words) = approver_words(&approver, Approval::Open) {
                         eprintln!("{words}");
                     }
                     if approver.runs() {
@@ -1821,8 +1897,11 @@ mod unix {
                     aterm_uds::process::lan_host_name().as_deref()
                 )
             );
-            if let Some(password) = client::admin_open(paths)
-                .ok()
+            // A retried create finishes the version its first try prepared, which a build before
+            // open vaults made with a join password: say how the finished vault admits.
+            let finished = client::admin_open(paths).ok();
+            if let Some(password) = finished
+                .as_ref()
                 .and_then(|admin| admin.doc.join_password())
             {
                 let mut out = std::io::stdout().lock();
@@ -1830,19 +1909,31 @@ mod unix {
                 let agent = aterm_types::domain::agent_marker(&|key| std::env::var(key).ok());
                 tell_new_password(&mut out, at_terminal, agent, &password)?;
             }
+            let approval = finished
+                .as_ref()
+                .map_or(Some(Approval::Open), |admin| Approval::of(&admin.doc));
             let approver = approver_here(agent, subscriber);
-            let words = approver_words(&approver, Approval::Password);
-            if let Some(words) = &words {
+            if let Some(words) = approval.and_then(|approval| approver_words(&approver, approval)) {
                 eprintln!("{words}");
             }
-            if approver.runs() {
-                println!(
-                    "a joining machine that types the join password is let in by this Mac's subscriber"
-                );
-            } else if words.is_none() {
-                println!(
-                    "a joining machine that types the join password is let in once this Mac's subscriber runs (aterm secrets agent on)"
-                );
+            let by = if approver.runs() {
+                "by this Mac's subscriber"
+            } else {
+                "once this Mac's subscriber runs"
+            };
+            match approval {
+                Some(Approval::Open) => {
+                    println!("the vault is open: every machine that asks to join is let in {by}");
+                    println!(
+                        "to close it: aterm secrets password new (a join password) or password off (approval by code)"
+                    );
+                }
+                Some(Approval::Password) => {
+                    println!("a joining machine that types the join password is let in {by}");
+                }
+                None => println!(
+                    "a joining machine waits for an admin to approve its key: aterm secrets approve <age1…> --name <host>"
+                ),
             }
             syncs = approver.runs();
         } else {
@@ -2460,6 +2551,7 @@ mod unix {
             .as_ref()
             .map(|a| a.doc.code_only())
             .unwrap_or_default();
+        let mark = admin.as_ref().map_or(CODE_ONLY_MARK, |a| held_mark(&a.doc));
         if pending.is_empty() {
             println!("no machines are asking to join");
         }
@@ -2471,7 +2563,7 @@ mod unix {
                 ""
             };
             let held = if code_only.contains(&request.recipient) {
-                CODE_ONLY_MARK
+                mark
             } else {
                 ""
             };
@@ -2504,9 +2596,10 @@ mod unix {
                 ));
             }
             let code_only = doc.code_only();
+            let mark = held_mark(&doc);
             for request in &pending {
                 let held = if code_only.contains(&request.recipient) {
-                    CODE_ONLY_MARK
+                    mark
                 } else {
                     ""
                 };
@@ -2563,6 +2656,8 @@ mod unix {
             recipients.push(recipient);
         }
         let done = client::admin_publish_approved(paths, &admin, &doc, &recipients)?;
+        // Bookkeeping only: the approver records the requests too once it reads this version.
+        let _ = client::record_approved(paths, &pending, &recipients);
         Ok(published(
             &format!("approved {}", approved.join(", ")),
             &done,
@@ -2651,9 +2746,21 @@ mod unix {
             .map_or_else(|| paths.served(), |dir| store_dir(paths, dir));
         let alab_key = crate::b64::decode_padded(crate::ALAB_SIGNER)
             .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok());
+        // A copy alone does not make this ALab's server: its Mac must follow the ALab vault
+        // too, by the vault's line, so a release that retires its key changes nothing here.
+        let follows = client::config(paths).ok().flatten().is_some_and(|config| {
+            config.signer.is_some_and(|signer| {
+                crate::envelope::Retired::compiled().lineage(&signer, &config.followed)
+            })
+        });
+        let here = match (crate::server::holds_alab(&store), follows) {
+            (true, true) => super::AlabHere::Server,
+            (true, false) => super::AlabHere::Copy,
+            (false, _) => super::AlabHere::Empty,
+        };
         let (advertise, held_back) = alab_role(
             settings.advertise.clone(),
-            crate::server::holds_alab(&store),
+            here,
             &mut settings.pins,
             alab_key,
         );
@@ -2899,6 +3006,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_join_line_names_this_mac_as_the_others_reach_it() {
         let signer = "age1signer";
@@ -2922,6 +3030,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn server_on_waits_for_the_vault_it_serves_on_this_mac() {
         let settings = |line: &str| {
@@ -2945,6 +3054,7 @@ mod tests {
 
     /// `server on` returns once the job it started answers: a listener whose server starts
     /// late is waited for. Negative control: an address nothing answers on ends at the hang.
+    #[cfg(unix)]
     #[test]
     fn server_on_returns_once_the_server_answers() {
         let store = aterm_tempfile::tempdir().expect("tempdir");
@@ -3062,6 +3172,23 @@ mod tests {
                 .expect("if-absent");
         }
         doc
+    }
+
+    /// A key let go from a closed vault is marked as one, never as code only: a password or a
+    /// code still lets it in there.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_vault_marks_a_key_let_go_but_never_code_only() {
+        let key = crate::age::Identity::generate()
+            .expect("a key")
+            .recipient()
+            .to_bech32();
+        let mut doc = crate::text::Document::new_vault("m22", &key);
+        assert!(!doc.open(), "CONTROL: a new vault text is closed");
+        assert!(!unix::held_mark(&doc).contains("code only"));
+        assert!(unix::held_mark(&doc).contains("a machine let go"));
+        doc.set_open(true).expect("open");
+        assert!(unix::held_mark(&doc).contains("code only"));
     }
 
     #[cfg(unix)]
@@ -3302,6 +3429,44 @@ mod tests {
         assert_eq!(client::admin_open(&paths).unwrap().seq(), 3);
     }
 
+    /// `approve <code>` records the request it lets in for this Mac's approver, as the notice's
+    /// Approve does, so an approver away while that Mac is in shows no ghost once it is let go.
+    #[cfg(unix)]
+    #[test]
+    fn approving_by_code_records_the_request_for_this_macs_approver() {
+        use crate::client::{self, Paths};
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let server = crate::server::start(
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),
+            &crate::server::Options {
+                listen: "127.0.0.1:0".parse().expect("addr"),
+                store: root.path().join("store"),
+                advertise: None,
+                pins: Vec::new(),
+                hold: std::time::Duration::from_millis(200),
+                keep_awake: false,
+            },
+        )
+        .expect("a loopback server");
+        let paths = Paths::for_home(&root.path().join("m1"));
+        let url = format!("http://{}/v1/team", server.addr);
+        client::create(&paths, &url, None, Some("m1")).expect("create");
+        let recipient = crate::age::Identity::from_secret_bytes([38; 32]).recipient();
+        let code = client::join_code(&recipient);
+        let key = recipient.to_bech32();
+        crate::transport::post_join(&url, &format!("{key} m2 {code}")).expect("queued");
+        assert!(
+            client::approved_recipients(&paths).is_empty(),
+            "CONTROL: nothing recorded yet"
+        );
+        assert_eq!(
+            unix::approve(&paths, &[code], false, None).expect("approved"),
+            std::process::ExitCode::SUCCESS
+        );
+        assert_eq!(client::approved_recipients(&paths), [key]);
+        server.stop();
+    }
+
     #[test]
     fn approve_takes_codes_never_host_names() {
         let code = "abcd-ef23-ghij-k234";
@@ -3339,6 +3504,13 @@ mod tests {
                 name: Some("m9".into()),
             })
         );
+    }
+
+    #[test]
+    fn commons_init_action() {
+        assert_eq!(parse(&words("commons init")), Ok(Command::CommonsInit));
+        assert!(parse(&words("commons")).is_err());
+        assert!(parse(&words("commons replace")).is_err());
     }
 
     #[test]
@@ -3469,7 +3641,7 @@ mod tests {
     }
 
     /// Only ALab's server answers the ALab name or takes another Mac's first version of the ALab
-    /// vault: one told so, or one whose store holds it.
+    /// vault: one told so, or one whose store holds it on a Mac that follows it.
     #[test]
     fn only_alabs_server_advertises_the_alab_name_or_pins_the_alab_vault() {
         let key = [7; 32];
@@ -3479,7 +3651,12 @@ mod tests {
                 .iter()
                 .map(|(name, key)| ((*name).into(), *key))
                 .collect();
-            let (advertised, held_back) = alab_role(advertise, holds, &mut pins, Some(key));
+            let here = if holds {
+                AlabHere::Server
+            } else {
+                AlabHere::Empty
+            };
+            let (advertised, held_back) = alab_role(advertise, here, &mut pins, Some(key));
             let pinned: Vec<&str> = pins.iter().map(|(name, _)| name.as_str()).collect();
             (advertised, held_back.is_some(), pinned.join(","))
         };
@@ -3516,8 +3693,29 @@ mod tests {
                 true,
                 &[("alab", [9; 32]), ("home", [8; 32])]
             ),
-            (Some(alab), false, "alab,home".into())
+            (Some(alab.clone()), false, "alab,home".into())
         );
+        // A copy an ALab Mac put back on a server whose Mac does not follow the ALab vault (one
+        // that took it before servers stopped) neither names nor pins, and says why.
+        let mut pins = Vec::new();
+        let (advertised, held_back) =
+            alab_role(Advertise::AlabIfHeld, AlabHere::Copy, &mut pins, Some(key));
+        assert_eq!(advertised, None);
+        assert!(pins.is_empty());
+        assert!(
+            held_back.is_some_and(|line| line.contains("holds a copy of the ALab vault")),
+            "says why"
+        );
+        // Told so, it is ALab's server whatever its store holds.
+        let mut pins = Vec::new();
+        let (advertised, _) = alab_role(
+            Advertise::Named(alab.clone()),
+            AlabHere::Copy,
+            &mut pins,
+            Some(key),
+        );
+        assert_eq!(advertised, Some(alab));
+        assert_eq!(pins, [("alab".to_string(), key)]);
     }
 
     #[cfg(unix)]
@@ -3649,6 +3847,52 @@ mod tests {
         assert!(parse(&words("admins promote m3")).is_err());
     }
 
+    /// What a waiting Mac names for an admin Mac is an `approve` that lets it in: its code for a
+    /// vault at a URL, whose server queues the request, and its key and name for one at a path,
+    /// which has no queue, so no code there is ever approved.
+    #[cfg(unix)]
+    #[test]
+    fn a_waiting_machine_names_the_approve_its_vault_takes() {
+        use crate::client::{Config, Membership, Status};
+        use crate::transport::Source;
+        let key = crate::age::Recipient([7; 32]);
+        let waiting = |source| Status {
+            config: Some(Config {
+                source,
+                name: "home".into(),
+                signer: Some([3; 32]),
+                followed: Vec::new(),
+                host: "mb".into(),
+            }),
+            machine: Some((key, "abcd-efgh-ijkm-npqr".into())),
+            membership: Membership::Pending,
+            names: Vec::new(),
+        };
+        let by_code = waiting(Source::Url("http://h:7484/v1/home".into()))
+            .approve_command()
+            .expect("a key");
+        assert_eq!(by_code, "aterm secrets approve abcd-efgh-ijkm-npqr");
+        let by_key = waiting(Source::Path("/Users//someone/home.vault".into()))
+            .approve_command()
+            .expect("a key");
+        assert_eq!(
+            by_key,
+            format!("aterm secrets approve {} --name mb", key.to_bech32())
+        );
+        for command in [by_code, by_key] {
+            let args = command
+                .strip_prefix("aterm secrets ")
+                .expect("a secrets verb");
+            assert!(
+                matches!(parse(&words(args)), Ok(Command::Approve { .. })),
+                "{command}"
+            );
+        }
+        let mut keyless = waiting(Source::Url("http://h:7484/v1/home".into()));
+        keyless.machine = None;
+        assert_eq!(keyless.approve_command(), None);
+    }
+
     /// `join`'s last line and `status`'s membership line for a waiting Mac say how a
     /// mistyped join password is fixed, beside what an admin runs.
     #[cfg(unix)]
@@ -3662,9 +3906,10 @@ mod tests {
             hint.contains("mistyped join password is fixed by running aterm secrets join again"),
             "{hint}"
         );
+        let approve = format!("aterm secrets approve {code}");
         for line in [
-            unix::waiting_line("m9", code, Some(&hint)),
-            unix::pending_membership(code, Some(&hint)),
+            unix::waiting_line("m9", code, &approve, Some(&hint)),
+            unix::pending_membership(&approve, Some(&hint)),
         ] {
             assert!(
                 line.contains(&format!("aterm secrets approve {code}")),
@@ -3672,7 +3917,7 @@ mod tests {
             );
             assert!(line.contains(&hint), "{line}");
         }
-        assert!(!unix::waiting_line("m9", code, None).contains("mistyped"));
+        assert!(!unix::waiting_line("m9", code, &approve, None).contains("mistyped"));
         let other = unix::retype(&Source::Url("http://h:1/v1/x".into()), Some("m9"), false)
             .expect("a URL has a join queue");
         assert!(
@@ -4445,10 +4690,16 @@ mod tests {
         )
         .expect("created");
         assert_eq!(installs.get(), 0, "a running subscriber is left be");
-        assert_eq!(approving_here(&admin), Ok(Some(Approval::Password)));
+        assert_eq!(
+            approving_here(&admin),
+            Ok(Some(Approval::Open)),
+            "a new vault is open"
+        );
         let password = |action, subscriber: &unix::Subscriber<'_>| {
             unix::password(&admin, action, true, subscriber).expect("published")
         };
+        password(Password::Off, &played(&unread, &install));
+        assert_eq!(approving_here(&admin), Ok(None), "closed, nothing approves");
         password(Password::Open, &played(&absent, &install));
         assert_eq!(installs.get(), 1, "opening puts the approver in");
         assert_eq!(approving_here(&admin), Ok(Some(Approval::Open)));
@@ -4474,6 +4725,14 @@ mod tests {
         assert_eq!(approving_here(&at_a_path), Ok(None));
         let no_queue =
             || -> crate::Result<crate::service::State> { panic!("a path has no queue to approve") };
+        // A new path vault is open too: close it so opening runs the arm that publishes.
+        unix::password(
+            &at_a_path,
+            Password::Off,
+            true,
+            &played(&no_queue, &install),
+        )
+        .expect("closed");
         unix::password(
             &at_a_path,
             Password::Open,

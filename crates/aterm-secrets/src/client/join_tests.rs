@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A join's fetches and machine key, and the verdict an admin Mac posts on a mistyped join
-//! password, against a server on loopback.
+//! A join's fetches and machine key, the verdict an admin Mac posts on a mistyped join
+//! password, and the subscriber's starts of the converge pass, against a server on loopback.
 
 use super::*;
 use std::cell::RefCell;
@@ -30,7 +30,7 @@ fn serve_holding(store: &Path, hold: Duration) -> crate::server::Running {
 fn team(root: &Path, server: &crate::server::Running) -> (Paths, String, SecretBytes) {
     let admin = Paths::for_home(&root.join("ma"));
     let url = format!("http://{}/v1/team", server.addr);
-    let created = create(&admin, &url, None, Some("ma")).expect("create");
+    let created = test_create_with_password(&admin, &url, None, Some("ma")).expect("create");
     let password = admin_open(&admin)
         .expect("admin opens")
         .doc
@@ -55,6 +55,17 @@ fn options<'a>(
         fetched,
         requested: &|| {},
         say: &|_| {},
+    }
+}
+
+/// Remove the admin Mac's approver record, as on a Mac whose approver never kept one.
+fn forget_record(admin: &Paths) {
+    std::fs::remove_file(admin.answered_file()).expect("CONTROL: the approver kept a record");
+    for path in [admin.answered_queue_file(), admin.answered_approved_file()] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}"),
+        }
     }
 }
 
@@ -592,6 +603,597 @@ fn a_mac_let_go_is_no_mac_asking_to_join_until_it_asks_again() {
         );
         server.stop();
     }
+}
+
+/// An approver that never read a request while its key was in the vault (a new admin Mac's, or
+/// one started on a build before its record of answered requests) takes the request of a key an
+/// open vault let go, still queued, for no ask: the `code-only` line says a version let it go.
+/// Once the Mac asks again and the server moves its request's time, a person is asked.
+#[test]
+fn a_fresh_approver_shows_no_mac_let_go_from_an_open_vault_until_it_asks_again() {
+    static AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn clock() -> u64 {
+        aterm_time::unix_secs().unwrap_or(0) + AHEAD.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = crate::server::start_with_clock(
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),
+        &crate::server::Options {
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            store: root.path().join("store"),
+            advertise: None,
+            pins: Vec::new(),
+            hold: Duration::from_millis(200),
+            keep_awake: false,
+        },
+        clock,
+    )
+    .expect("serving");
+    let admin = Paths::for_home(&root.path().join("ma"));
+    let url = format!("http://{}/v1/team", server.addr);
+    let created = create(&admin, &url, None, Some("ma")).expect("create");
+    let source = format!("{url}#{}", created.signer);
+    let mb = Paths::for_home(&root.path().join("mb"));
+    let asked = join(
+        &mb,
+        &options(&source, JoinPassword::Given(None), None, Duration::ZERO),
+    );
+    assert!(
+        matches!(asked, Ok(JoinOutcome::Pending { .. })),
+        "{asked:?}"
+    );
+    let key = read_identity(&mb)
+        .expect("readable")
+        .expect("a key")
+        .recipient()
+        .to_bech32();
+    approver_pass(&admin, &|_| {}, &mut Approver::default());
+    assert!(
+        matches!(sync(&mb, None).expect("sync"), SyncOutcome::Applied { .. }),
+        "the open vault let it in"
+    );
+    let opened = admin_open(&admin).expect("admin opens");
+    admin_revoke(&admin, &opened, "mb", false).expect("revoked");
+    assert_eq!(
+        admin_open(&admin).expect("admin opens").doc.code_only(),
+        std::slice::from_ref(&key),
+        "CONTROL: the open vault names the key it let go"
+    );
+    let queued = requests_for(&config(&admin).expect("config").expect("one"), None)
+        .expect("listed")
+        .into_iter()
+        .find(|request| request.recipient == key)
+        .expect("CONTROL: the server still lists the request that let it in");
+
+    // An approver with no record of the requests it read while the key was in the vault.
+    forget_record(&admin);
+    let mut fresh = Approver::resumed(&admin);
+    approver_pass(&admin, &|_| {}, &mut fresh);
+    assert_eq!(asking(&admin), [], "the Mac let go asked nothing");
+    approver_pass(&admin, &|_| {}, &mut Approver::resumed(&admin));
+    assert_eq!(asking(&admin), [], "an approver started again knows it too");
+
+    let line = format!("{} {} {}", queued.recipient, queued.host, queued.code);
+    AHEAD.store(
+        crate::server::JOIN_REFRESH_EVERY_SECS + 1,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    transport::post_join(&url, &line).expect("asks again, an hour on");
+    approver_pass(&admin, &|_| {}, &mut fresh);
+    let recorded: Vec<String> = asking(&admin).into_iter().map(|a| a.recipient).collect();
+    assert_eq!(recorded, std::slice::from_ref(&key), "asked again");
+    server.stop();
+}
+
+/// A Mac waiting as an admin opens the vault is held on a `code-only` line for a person to
+/// approve by code, and stays shown across restarts: the approver showed it as the line appeared,
+/// and its record keeps the keys it knew on such lines, so it never takes the request for
+/// answered.
+#[test]
+fn a_mac_held_as_the_vault_opens_stays_shown_after_the_approver_restarts() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let admin = Paths::for_home(&root.path().join("ma"));
+    let url = format!("http://{}/v1/team", server.addr);
+    let created = test_create_with_password(&admin, &url, None, Some("ma")).expect("create");
+    let source = format!("{url}#{}", created.signer);
+    let mb = Paths::for_home(&root.path().join("mb"));
+    let asked = join(
+        &mb,
+        &options(&source, JoinPassword::Given(None), None, Duration::ZERO),
+    );
+    assert!(
+        matches!(asked, Ok(JoinOutcome::Pending { .. })),
+        "{asked:?}"
+    );
+    let key = read_identity(&mb)
+        .expect("readable")
+        .expect("a key")
+        .recipient()
+        .to_bech32();
+    let shown =
+        |admin: &Paths| -> Vec<String> { asking(admin).into_iter().map(|a| a.recipient).collect() };
+    let mut approver = Approver::resumed(&admin);
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert_eq!(
+        shown(&admin),
+        std::slice::from_ref(&key),
+        "no proof: asking"
+    );
+
+    let opened = admin_open(&admin).expect("admin opens");
+    let mut doc = opened.doc.clone();
+    doc.set_open(true).expect("open");
+    admin_publish(&admin, &opened, &doc).expect("published");
+    assert_eq!(
+        admin_open(&admin).expect("admin opens").doc.code_only(),
+        std::slice::from_ref(&key),
+        "CONTROL: opening holds the Mac waiting"
+    );
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert_eq!(shown(&admin), std::slice::from_ref(&key), "held: asking");
+    approver_pass(&admin, &|_| {}, &mut Approver::resumed(&admin));
+    assert_eq!(
+        shown(&admin),
+        std::slice::from_ref(&key),
+        "an approver started again still shows it"
+    );
+    server.stop();
+}
+
+/// An admin Mac whose approver did not read the vault while a Mac came and went (off, asleep, or
+/// no admin then) shows no ghost when it reads the vault again: the key is new on a `code-only`
+/// line to its record, so the request that let the Mac in is taken for answered.
+#[test]
+fn an_approver_away_while_a_mac_came_and_went_shows_no_ghost() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let admin = Paths::for_home(&root.path().join("ma"));
+    let url = format!("http://{}/v1/team", server.addr);
+    let created = create(&admin, &url, None, Some("ma")).expect("create");
+    let source = format!("{url}#{}", created.signer);
+    approver_pass(&admin, &|_| {}, &mut Approver::resumed(&admin));
+    assert!(
+        read_answered(&admin).begun.is_some(),
+        "CONTROL: the approver's record is begun on the vault"
+    );
+
+    // Away: a Mac asks, is let in and is let go, with no pass of this approver.
+    let mb = Paths::for_home(&root.path().join("mb"));
+    let asked = join(
+        &mb,
+        &options(&source, JoinPassword::Given(None), None, Duration::ZERO),
+    );
+    assert!(
+        matches!(asked, Ok(JoinOutcome::Pending { .. })),
+        "{asked:?}"
+    );
+    let key = read_identity(&mb)
+        .expect("readable")
+        .expect("a key")
+        .recipient()
+        .to_bech32();
+    assert_eq!(
+        auto_approve(&admin).expect("approved").approved,
+        ["mb"],
+        "CONTROL: let in"
+    );
+    let opened = admin_open(&admin).expect("admin opens");
+    admin_revoke(&admin, &opened, "mb", false).expect("revoked");
+    assert!(
+        requests_for(&config(&admin).expect("config").expect("one"), None)
+            .expect("listed")
+            .iter()
+            .any(|request| request.recipient == key),
+        "CONTROL: the server still lists the request that let it in"
+    );
+
+    approver_pass(&admin, &|_| {}, &mut Approver::resumed(&admin));
+    assert_eq!(asking(&admin), [], "the Mac let go asked nothing");
+    server.stop();
+}
+
+/// An approver that showed a Mac as asking, then read nothing (asleep, or off the LAN) while
+/// another admin let it in by code and let it go, shows no ghost when it reads the vault again:
+/// what it showed at a version before the one just before says nothing of that Mac now.
+#[test]
+fn an_approver_that_showed_a_mac_then_slept_through_its_stay_shows_no_ghost() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let (admin, source, _password) = team(root.path(), &server);
+    let mb = Paths::for_home(&root.path().join("mb"));
+    let asked = join(
+        &mb,
+        &options(&source, JoinPassword::Given(None), None, Duration::ZERO),
+    );
+    assert!(
+        matches!(asked, Ok(JoinOutcome::Pending { .. })),
+        "{asked:?}"
+    );
+    let key = read_identity(&mb)
+        .expect("readable")
+        .expect("a key")
+        .recipient()
+        .to_bech32();
+    let mut approver = Approver::resumed(&admin);
+    approver_pass(&admin, &|_| {}, &mut approver);
+    let shown: Vec<String> = asking(&admin).into_iter().map(|a| a.recipient).collect();
+    assert_eq!(
+        shown,
+        std::slice::from_ref(&key),
+        "CONTROL: no proof: asking"
+    );
+
+    // Asleep: another admin lets it in by its code and lets it go. That admin records the
+    // request on its own Mac, not on this one.
+    let opened = admin_open(&admin).expect("admin opens");
+    let mut doc = opened.doc.clone();
+    doc.add_machine("mb", &key).expect("added");
+    admin_publish_approved(&admin, &opened, &doc, std::slice::from_ref(&key))
+        .expect("approved by code");
+    assert!(
+        approved_recipients(&admin).is_empty(),
+        "CONTROL: this Mac recorded no approval"
+    );
+    let opened = admin_open(&admin).expect("admin opens");
+    admin_revoke(&admin, &opened, "mb", false).expect("revoked");
+
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert_eq!(asking(&admin), [], "the Mac let go asked nothing");
+    server.stop();
+}
+
+/// A vault with a join password names a Mac it lets go on a `code-only` line too, so an approver
+/// with no record of it shows no ghost, and opening the vault later lets the key in only by its
+/// code. Its person is told of the new password, not of an open vault's line.
+#[test]
+fn a_mac_let_go_from_a_closed_vault_is_named_code_only() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let (admin, source, password) = team(root.path(), &server);
+    let mb = Paths::for_home(&root.path().join("mb"));
+    let asked = join(
+        &mb,
+        &options(
+            &source,
+            JoinPassword::Given(Some(password)),
+            None,
+            Duration::ZERO,
+        ),
+    );
+    assert!(
+        matches!(asked, Ok(JoinOutcome::Pending { .. })),
+        "{asked:?}"
+    );
+    let key = read_identity(&mb)
+        .expect("readable")
+        .expect("a key")
+        .recipient()
+        .to_bech32();
+    approver_pass(&admin, &|_| {}, &mut Approver::resumed(&admin));
+    assert!(
+        admin_open(&admin)
+            .expect("admin opens")
+            .doc
+            .machines()
+            .iter()
+            .any(|machine| machine.recipient == key),
+        "CONTROL: the password let it in"
+    );
+
+    let opened = admin_open(&admin).expect("admin opens");
+    let done = admin_revoke(&admin, &opened, "mb", false)
+        .expect("revoked")
+        .published;
+    assert!(done.password_renewed && !done.kept_out, "{done:?}");
+    let after = admin_open(&admin).expect("admin opens");
+    assert!(!after.doc.open(), "the vault stays closed");
+    assert_eq!(after.doc.code_only(), std::slice::from_ref(&key));
+
+    forget_record(&admin);
+    approver_pass(&admin, &|_| {}, &mut Approver::resumed(&admin));
+    assert_eq!(asking(&admin), [], "the Mac let go asked nothing");
+    server.stop();
+}
+
+/// A Mac let go that asks again with the renewed join password before the approver reads the
+/// version that let it go is held as the request it had standing then, and let in once the
+/// server moves its time, within the hour: never shown as asking, never left out for good.
+#[test]
+fn a_mac_let_go_that_proves_the_renewed_password_is_let_in_within_the_hour() {
+    static AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn clock() -> u64 {
+        aterm_time::unix_secs().unwrap_or(0) + AHEAD.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = crate::server::start_with_clock(
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),
+        &crate::server::Options {
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            store: root.path().join("store"),
+            advertise: None,
+            pins: Vec::new(),
+            hold: Duration::from_millis(200),
+            keep_awake: false,
+        },
+        clock,
+    )
+    .expect("serving");
+    let (admin, source, password) = team(root.path(), &server);
+    let mb = Paths::for_home(&root.path().join("mb"));
+    let asked = join(
+        &mb,
+        &options(
+            &source,
+            JoinPassword::Given(Some(password)),
+            None,
+            Duration::ZERO,
+        ),
+    );
+    assert!(
+        matches!(asked, Ok(JoinOutcome::Pending { .. })),
+        "{asked:?}"
+    );
+    let key = read_identity(&mb)
+        .expect("readable")
+        .expect("a key")
+        .recipient()
+        .to_bech32();
+    let member = |admin: &Paths| {
+        admin_open(admin)
+            .expect("admin opens")
+            .doc
+            .machines()
+            .iter()
+            .any(|machine| machine.recipient == key)
+    };
+    let mut approver = Approver::resumed(&admin);
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert!(member(&admin), "CONTROL: the password let it in");
+
+    // Away: the Mac is let go, and asks again with the password that version made, past the
+    // server's 10 s between a key's changes.
+    let opened = admin_open(&admin).expect("admin opens");
+    admin_revoke(&admin, &opened, "mb", false).expect("revoked");
+    let renewed = admin_open(&admin)
+        .expect("admin opens")
+        .doc
+        .join_password()
+        .expect("the vault keeps a join password");
+    AHEAD.store(11, std::sync::atomic::Ordering::SeqCst);
+    let asked = join(
+        &mb,
+        &options(
+            &source,
+            JoinPassword::Given(Some(renewed)),
+            None,
+            Duration::ZERO,
+        ),
+    );
+    assert!(
+        matches!(asked, Ok(JoinOutcome::Pending { .. })),
+        "{asked:?}"
+    );
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert!(!member(&admin), "held as the request it had standing");
+    assert_eq!(asking(&admin), [], "and not shown");
+
+    let queued = requests_for(&config(&admin).expect("config").expect("one"), None)
+        .expect("listed")
+        .into_iter()
+        .find(|request| request.recipient == key)
+        .expect("CONTROL: the server lists its new request");
+    let line = format!(
+        "{} {} {} proof={}",
+        queued.recipient,
+        queued.host,
+        queued.code,
+        queued.proof.expect("CONTROL: a proof")
+    );
+    AHEAD.store(
+        11 + crate::server::JOIN_REFRESH_EVERY_SECS + 1,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let url = format!("http://{}/v1/team", server.addr);
+    transport::post_join(&url, &line).expect("asks again, an hour on");
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert!(member(&admin), "let in once its time moved");
+    server.stop();
+}
+
+/// A request a Mac joined with stays held once the vault lets the Mac go, even after an admin
+/// sets the password it proved again: a proof says nothing of when it was made.
+#[test]
+fn a_mac_let_go_is_not_let_back_in_when_its_old_password_is_set_again() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let (admin, source, password) = team(root.path(), &server);
+    let mb = Paths::for_home(&root.path().join("mb"));
+    let asked = join(
+        &mb,
+        &options(
+            &source,
+            JoinPassword::Given(Some(password.clone())),
+            None,
+            Duration::ZERO,
+        ),
+    );
+    assert!(
+        matches!(asked, Ok(JoinOutcome::Pending { .. })),
+        "{asked:?}"
+    );
+    let key = read_identity(&mb)
+        .expect("readable")
+        .expect("a key")
+        .recipient()
+        .to_bech32();
+    let member = |admin: &Paths| {
+        admin_open(admin)
+            .expect("admin opens")
+            .doc
+            .machines()
+            .iter()
+            .any(|machine| machine.recipient == key)
+    };
+    let mut approver = Approver::resumed(&admin);
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert!(member(&admin), "CONTROL: the password let it in");
+    let opened = admin_open(&admin).expect("admin opens");
+    admin_revoke(&admin, &opened, "mb", false).expect("revoked");
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert!(!member(&admin), "CONTROL: let go");
+
+    // The team's usual password, set again.
+    let opened = admin_open(&admin).expect("admin opens");
+    let mut doc = opened.doc.clone();
+    doc.set_join_password(Some(password.as_slice()))
+        .expect("the old password");
+    admin_publish(&admin, &opened, &doc).expect("published");
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert!(!member(&admin), "the request it joined with is no ask");
+    assert_eq!(asking(&admin), []);
+    approver_pass(&admin, &|_| {}, &mut Approver::resumed(&admin));
+    assert!(!member(&admin), "nor after a restart");
+    server.stop();
+}
+
+/// A Mac this admin Mac lets in by its code is recorded as it is let in, so an approver that
+/// read no version while it was in (the subscriber off, or stuck) shows no ghost once another
+/// version lets it go, even for a key a `code-only` line named before: it took the request it
+/// let in for answered.
+#[test]
+fn a_mac_let_in_by_code_while_the_approver_was_away_is_no_ghost_once_let_go() {
+    static AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn clock() -> u64 {
+        aterm_time::unix_secs().unwrap_or(0) + AHEAD.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = crate::server::start_with_clock(
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),
+        &crate::server::Options {
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            store: root.path().join("store"),
+            advertise: None,
+            pins: Vec::new(),
+            hold: Duration::from_millis(200),
+            keep_awake: false,
+        },
+        clock,
+    )
+    .expect("serving");
+    let (admin, source, _password) = team(root.path(), &server);
+    let mb = Paths::for_home(&root.path().join("mb"));
+    let asked = join(
+        &mb,
+        &options(&source, JoinPassword::Given(None), None, Duration::ZERO),
+    );
+    assert!(
+        matches!(asked, Ok(JoinOutcome::Pending { .. })),
+        "{asked:?}"
+    );
+    let key = read_identity(&mb)
+        .expect("readable")
+        .expect("a key")
+        .recipient()
+        .to_bech32();
+    let mut approver = Approver::resumed(&admin);
+    approver_pass(&admin, &|_| {}, &mut approver);
+    approve_request(&admin, &key).expect("approved by code");
+    approver_pass(&admin, &|_| {}, &mut approver);
+    let opened = admin_open(&admin).expect("admin opens");
+    admin_revoke(&admin, &opened, "mb", false).expect("revoked");
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert_eq!(asking(&admin), [], "CONTROL: the Mac let go asked nothing");
+
+    // It asks again an hour on, and is shown: its key is on a `code-only` line the approver knew.
+    let queued = requests_for(&config(&admin).expect("config").expect("one"), None)
+        .expect("listed")
+        .into_iter()
+        .find(|request| request.recipient == key)
+        .expect("CONTROL: the server still lists its request");
+    AHEAD.store(
+        crate::server::JOIN_REFRESH_EVERY_SECS + 1,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let url = format!("http://{}/v1/team", server.addr);
+    let line = format!("{} {} {}", queued.recipient, queued.host, queued.code);
+    transport::post_join(&url, &line).expect("asks again, an hour on");
+    approver_pass(&admin, &|_| {}, &mut approver);
+    let shown: Vec<String> = asking(&admin).into_iter().map(|a| a.recipient).collect();
+    assert_eq!(shown, std::slice::from_ref(&key), "CONTROL: asked again");
+
+    // Away: this Mac lets it in by its code, and a version lets it go.
+    approve_request(&admin, &key).expect("approved by code again");
+    assert_eq!(
+        approved_recipients(&admin),
+        std::slice::from_ref(&key),
+        "the record keeps the request let in, not the one the server no longer lists"
+    );
+    let opened = admin_open(&admin).expect("admin opens");
+    admin_revoke(&admin, &opened, "mb", false).expect("revoked again");
+
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert_eq!(asking(&admin), [], "the running approver shows no ghost");
+    approver_pass(&admin, &|_| {}, &mut Approver::resumed(&admin));
+    assert_eq!(asking(&admin), [], "nor does one started again");
+    server.stop();
+}
+
+/// The approver record keeps the requests it answered in `answered`, which a build before its
+/// queue file reads under 64 KiB, and the queue and its `code-only` keys in that file, however
+/// many: a large vault's record still reads whole there. A record of 2026-10-26, with those
+/// lines at the head of `answered`, still reads, and its next write moves them.
+#[test]
+fn an_approver_record_keeps_its_requests_where_a_build_before_reads_them() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let admin = Paths::for_home(&root.path().join("ma"));
+    let seen: std::collections::BTreeSet<String> =
+        (0..4000).map(|n| format!("age1{n:058}")).collect();
+    let answered: std::collections::BTreeSet<Answered> = (0..ANSWERED_MOST as u64)
+        .map(|n| Answered {
+            recipient: format!("age1{n:058}"),
+            host: format!("mac-{n}"),
+            at: 1_790_000_000 + n,
+        })
+        .collect();
+    write_answered(&admin, &answered, Some("team http://x/v1/team"), &seen).expect("written");
+    assert!(
+        fsx::read_private(&admin.answered_file(), 64 << 10)
+            .expect("readable")
+            .is_some(),
+        "a build before reads its requests"
+    );
+    let record = read_answered(&admin);
+    assert_eq!(record.answered, answered);
+    assert_eq!(record.begun.as_deref(), Some("team http://x/v1/team"));
+    assert_eq!(record.seen, seen);
+
+    // A record a build of 2026-10-26 wrote over this one (a rollback): its queue and keys at the
+    // head of `answered`, newer than the queue file left beside it.
+    let key = format!("age1{:058}", 7);
+    let text = format!(
+        "{ANSWERED_BEGUN}team http://y/v1/team\n{ANSWERED_SEEN}{key}\n{key}\t1790000001\tmb\n"
+    );
+    fsx::write_atomic(&admin.answered_file(), text.as_bytes(), 0o600).expect("written");
+    assert!(
+        admin.answered_queue_file().exists(),
+        "CONTROL: the queue file stays"
+    );
+    let record = read_answered(&admin);
+    assert_eq!(record.begun.as_deref(), Some("team http://y/v1/team"));
+    assert_eq!(record.seen, std::collections::BTreeSet::from([key.clone()]));
+    let requests: Vec<&str> = record.answered.iter().map(|a| a.host.as_str()).collect();
+    assert_eq!(requests, ["mb"]);
+    write_answered(
+        &admin,
+        &record.answered,
+        record.begun.as_deref(),
+        &record.seen,
+    )
+    .expect("written");
+    let requests = std::fs::read_to_string(admin.answered_file()).expect("requests");
+    assert!(!requests.contains(ANSWERED_BEGUN), "{requests}");
+    assert_eq!(read_answered(&admin), record);
 }
 
 #[test]
@@ -1214,6 +1816,10 @@ fn a_verdict_kept_before_the_subscribers_long_poll_is_read_before_it() {
                 &mb,
                 &|line| logged.lock().expect("log").push(line.to_owned()),
                 &|| stop.load(Ordering::SeqCst),
+                &Converging {
+                    start: &|_| None,
+                    routes: &crate::server::route_sources,
+                },
             )
         });
         until("the subscriber's long-poll is held", || {
@@ -1392,4 +1998,161 @@ fn an_approver_stretches_the_join_password_once_while_it_stays() {
         "stretched once for three judged listings"
     );
     server.stop();
+}
+
+/// Sets its flag as it drops, a failed check's unwinding included: the subscriber loop that
+/// flag stops ends, so the scope that runs it ends and the failure is reported.
+struct StopsOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopsOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A member's subscriber starts the converge pass's runner once as it starts, none for healthy
+/// rounds that changed nothing on the routes it started on, one for each version it applies,
+/// and one once this Mac's routes moved; the loop's long-polls go on beside each start.
+/// NEGATIVE CONTROL: a loop that starts no runner after an applied version (or none as it
+/// starts) never reaches the count.
+#[test]
+fn the_subscriber_starts_the_converge_pass_as_it_starts_per_applied_version_and_on_moved_routes() {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::AtomicUsize;
+    const HOME: crate::converge::Routes =
+        [Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))), None, None];
+    const AWAY: crate::converge::Routes =
+        [Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9))), None, None];
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    // A long-poll held past HELD ends a round that changed nothing, and the next begins at once.
+    let server = serve_holding(
+        &root.path().join("store"),
+        HELD + Duration::from_millis(100),
+    );
+    let (admin, source, _) = team(root.path(), &server);
+    let mb = Paths::for_home(&root.path().join("mb"));
+    let asked = join(
+        &mb,
+        &options(&source, JoinPassword::Given(None), None, Duration::ZERO),
+    );
+    assert!(
+        matches!(asked, Ok(JoinOutcome::Pending { .. })),
+        "{asked:?}"
+    );
+    let key = read_identity(&mb)
+        .expect("readable")
+        .expect("a key")
+        .recipient()
+        .to_bech32();
+    approve_request(&admin, &key).expect("approves");
+    assert!(matches!(sync(&mb, None), Ok(SyncOutcome::Applied { .. })));
+    let (starts, reads) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let (away, stop) = (AtomicBool::new(false), AtomicBool::new(false));
+    let start = |_: &Path| {
+        starts.fetch_add(1, Ordering::SeqCst);
+        None
+    };
+    let routes = || {
+        reads.fetch_add(1, Ordering::SeqCst);
+        if away.load(Ordering::SeqCst) {
+            AWAY
+        } else {
+            HOME
+        }
+    };
+    let count = || starts.load(Ordering::SeqCst);
+    // A healthy round reads the routes once, after its pass: `n` more reads are `n` rounds.
+    let rounds = |n: usize| {
+        let read = reads.load(Ordering::SeqCst);
+        until("healthy rounds", || {
+            reads.load(Ordering::SeqCst) >= read + n
+        });
+    };
+    std::thread::scope(|scope| {
+        let _stops = StopsOnDrop(&stop);
+        let subscriber = scope.spawn(|| {
+            subscriber_loop_until(
+                &mb,
+                &|_| {},
+                &|| stop.load(Ordering::SeqCst),
+                &Converging {
+                    start: &start,
+                    routes: &routes,
+                },
+            )
+        });
+        until("one start as it starts", || count() == 1);
+        rounds(2);
+        assert_eq!(count(), 1, "none for rounds that changed nothing");
+        let opened = admin_open(&admin).expect("admin opens");
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "token", b"inert-token")
+            .expect("an entry");
+        admin_publish(&admin, &opened, &doc).expect("published");
+        until("one more for the applied version", || count() == 2);
+        away.store(true, Ordering::SeqCst);
+        until("one more once the routes moved", || count() == 3);
+        rounds(2);
+        assert_eq!(count(), 3, "not again on the routes it started on");
+        stop.store(true, Ordering::SeqCst);
+        subscriber
+            .join()
+            .expect("the subscriber ends")
+            .expect("cleanly");
+    });
+    server.stop();
+}
+
+/// A runner that ended while the vault cannot be reached is reaped by the next round, though
+/// every round fails: it is no zombie until a long-poll succeeds again.
+/// NEGATIVE CONTROL: a loop that reaps its runner in healthy rounds alone leaves it a zombie.
+#[cfg(unix)]
+#[test]
+fn a_runner_that_ended_while_the_vault_cannot_be_reached_is_reaped() {
+    use aterm_uds::process::{ProcessPresence, process_presence};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::AtomicI32;
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    // No vault is configured here: every round fails, and naps.
+    let mb = Paths::for_home(&root.path().join("mb"));
+    let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+    let quick = root.path().join("quick");
+    std::fs::write(&quick, format!("#!{}\nexit 0\n", sh.display())).expect("script");
+    std::fs::set_permissions(&quick, std::fs::Permissions::from_mode(0o700)).expect("executable");
+    let pid = AtomicI32::new(0);
+    // The runner is handed to the loop once it exited, and before anything reaped it.
+    let start = |_: &Path| {
+        let child = RefCell::new(crate::converge::start(&quick, "subscriber").expect("a runner"));
+        until("the runner exits", || {
+            child.borrow_mut().exited().expect("its state")
+        });
+        let child = child.into_inner();
+        pid.store(i32::try_from(child.id()).expect("a pid"), Ordering::SeqCst);
+        Some(child)
+    };
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let _stops = StopsOnDrop(&stop);
+        let subscriber = scope.spawn(|| {
+            subscriber_loop_until(
+                &mb,
+                &|_| {},
+                &|| stop.load(Ordering::SeqCst),
+                &Converging {
+                    start: &start,
+                    routes: &crate::server::route_sources,
+                },
+            )
+        });
+        until("the runner started", || pid.load(Ordering::SeqCst) != 0);
+        let pid = pid.load(Ordering::SeqCst);
+        until("the runner that ended is reaped", || {
+            process_presence(pid) == ProcessPresence::Absent
+        });
+        stop.store(true, Ordering::SeqCst);
+        subscriber
+            .join()
+            .expect("the subscriber ends")
+            .expect("cleanly");
+    });
 }

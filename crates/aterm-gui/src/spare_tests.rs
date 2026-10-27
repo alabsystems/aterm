@@ -372,7 +372,11 @@ fn booking_and_promotion_wait_for_every_condition() {
     );
     app.spares.parked_failed = None;
     app.session_factory.temporal_recording = true;
-    assert_eq!(app.spare_book_check(t, &inputs), BookCheck::No("factory"));
+    assert_ne!(
+        app.spare_book_check(t, &inputs),
+        BookCheck::No("factory"),
+        "a recording factory books spares (Rewind R4)"
+    );
     app.session_factory.temporal_recording = false;
 
     let id = app.next_session_id;
@@ -596,7 +600,7 @@ fn the_spawn_fingerprint_moves_with_what_shapes_a_shell_and_not_with_colours() {
     let base = app.session_factory.clone();
     let fp = base.spawn_fingerprint();
     type Change = Box<dyn Fn(&mut crate::spawn::SessionFactory)>;
-    let moved: [(&str, Change); 8] = [
+    let moved: [(&str, Change); 9] = [
         (
             "env_add",
             Box::new(|f| f.env_add.push(("X".into(), "1".into()))),
@@ -622,6 +626,10 @@ fn the_spawn_fingerprint_moves_with_what_shapes_a_shell_and_not_with_colours() {
         (
             "temporal_recording",
             Box::new(|f| f.temporal_recording = !f.temporal_recording),
+        ),
+        (
+            "rewind_budget_bytes",
+            Box::new(|f| f.rewind_budget_bytes += 1),
         ),
     ];
     for (field, change) in moved {
@@ -756,7 +764,7 @@ fn a_spare_host_effect_only_taints_it() {
         None,
     )));
     let (link, seen) = captured_link(4);
-    wire_spare_taint(&term, &link);
+    wire_spare_taint(&term, &link, crate::spawn::HostReach::Platform, true);
     {
         let mut t = crate::term_lock(&term);
         assert!(!t.modes().allow_osc52_query, "the query is revoked");
@@ -774,6 +782,40 @@ fn a_spare_host_effect_only_taints_it() {
         "a clipboard write taints"
     );
     assert!(seen.lock().unwrap().is_empty(), "nothing was delivered");
+}
+
+/// A spare whose sessions may not read Kitty media (the setting is off, or the reach is
+/// refused) installs no medium resolver: its reader's prefetch reads nothing, and a `t=f` query
+/// is refused as a fresh tab refuses it.
+#[test]
+fn a_spare_without_kitty_media_installs_no_resolver() {
+    use crate::spawn::HostReach;
+    for (reach, allow) in [
+        (HostReach::Platform, false),
+        (HostReach::Platform, true),
+        (HostReach::Refused, false),
+        (HostReach::Refused, true),
+    ] {
+        let kitty_media = reach == HostReach::Platform && allow;
+        let term = Arc::new(std::sync::Mutex::new(crate::spawn::new_live_terminal(
+            24, 80, None, None,
+        )));
+        let (link, _seen) = captured_link(4);
+        wire_spare_taint(&term, &link, reach, allow);
+        let mut t = crate::term_lock(&term);
+        assert_eq!(
+            t.kitty_file_resolver_installed(),
+            kitty_media,
+            "{reach:?} allow={allow}"
+        );
+        t.process(b"\x1b_Ga=q,i=1,t=f;L2V0Yy9ob3N0cw==\x1b\\");
+        let reply = String::from_utf8_lossy(&t.take_response().unwrap_or_default()).into_owned();
+        assert_eq!(
+            reply.contains("ENOTSUPPORTED"),
+            !kitty_media,
+            "{reach:?} allow={allow}: {reply:?}"
+        );
+    }
 }
 
 /// Adopting a spare rebases its recording timestamps to the adoption instant.
@@ -2028,19 +2070,61 @@ fn a_scan_lists_after_its_window() {
     let mark = Instant::now();
     let mut last = None;
     let mut listed = None;
-    let first = rate_limited(mark, &mut last, true, || {
+    let first = rate_limited(mark, &mut last, ScanOf::Sample, |_| {
         listed = Some(Instant::now());
         Scan::Unknown
     });
     let listed = listed.expect("the first scan runs");
     let mut again = false;
-    let second = rate_limited(mark, &mut last, true, || {
+    let second = rate_limited(mark, &mut last, ScanOf::Sample, |_| {
         again = true;
         Scan::Unknown
     });
     assert_eq!(first, Scan::Unknown);
     assert!(listed >= mark + SCAN_GRACE, "listed inside the window");
     assert_eq!((second, again), (Scan::RateLimited, false), "rate-limited");
+}
+
+/// A spare's verification counts a daemon born after the grace that its listing holds; a visible run's sample does not.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_verification_counts_a_daemon_born_past_the_grace_and_a_sample_does_not() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let waits = FixtureWaits::new();
+    let (_shell, shell_pid, _, _) = session_shell(dir.path(), &waits);
+    let (mut owned, orphan_pid, adopted) = adopted_orphan(dir.path(), &waits);
+    let ago = std::time::SystemTime::now()
+        .duration_since(born_at(&adopted))
+        .expect("born before now");
+    let mark = Instant::now()
+        .checked_sub(ago + SCAN_GRACE + Duration::from_millis(50))
+        .expect("a mark after boot");
+    let scan = |of| {
+        rate_limited(mark, &mut None, of, |until| {
+            escape_scan_among(
+                shell_pid,
+                FIXTURE_SID,
+                std::time::UNIX_EPOCH,
+                until,
+                |_| Some(vec![shell_pid, orphan_pid]),
+                bsdinfo_uniq,
+            )
+        })
+    };
+    let (verification, sample) = (scan(ScanOf::Verification), scan(ScanOf::Sample));
+    owned
+        .retire_owned_escape_fixture()
+        .expect("retire the orphan");
+    assert_eq!(
+        verification,
+        Scan::Escaped,
+        "born 50 ms past the grace and listed: nothing else runs in a spare at its hold"
+    );
+    assert_eq!(
+        sample,
+        Scan::Clean,
+        "a sample's window ends at the grace: the person may type from the prompt on"
+    );
 }
 
 /// Warm verification scans are not rate-limited by prior scans.

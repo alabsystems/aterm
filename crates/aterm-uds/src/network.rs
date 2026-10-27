@@ -127,6 +127,337 @@ unsafe fn sockaddr_ip(at: *const libc::sockaddr, family: i32) -> Option<IpAddr> 
     }
 }
 
+/// This machine's default IPv4 gateway's hardware (link-layer) address, read from the kernel's
+/// routing and neighbour tables with no packet sent: the route table names the default route's
+/// gateway, and the ARP/NDP table its hardware address. `None` where there is no default route,
+/// where the gateway is not an IPv4 next hop, or where the gateway has no neighbour entry yet.
+/// The hardware address tells one network from another far more sharply than its subnet does:
+/// two routers both numbering a LAN `192.168.1.0/24` have different hardware addresses, so a
+/// fact kept against one does not stand on the other.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[must_use]
+pub fn default_gateway_hw() -> Option<Box<[u8]>> {
+    #[cfg(target_os = "macos")]
+    {
+        let gateway = default_gateway_ipv4(&route_table(NET_RT_DUMP, 0)?)?;
+        gateway_hardware(&route_table(NET_RT_FLAGS, RTF_LLINFO)?, gateway)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let gateway = linux_default_gateway(&std::fs::read_to_string("/proc/net/route").ok()?)?;
+        linux_neighbour_hardware(&std::fs::read_to_string("/proc/net/arp").ok()?, gateway)
+    }
+}
+
+/// `None` on a platform whose kernel neighbour tables this build does not read: the caller keeps
+/// no discovery record there and looks afresh each launch.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[must_use]
+pub fn default_gateway_hw() -> Option<Box<[u8]>> {
+    None
+}
+
+/// `sys/sysctl.h` and `net/route.h` values the first-party `libc` does not carry (it has
+/// `PF_ROUTE`, `AF_INET` and `AF_LINK`), declared here with their headers as the existing
+/// `PF_ROUTE` message-type constants above are.
+#[cfg(target_os = "macos")]
+const CTL_NET: libc::c_int = 4;
+#[cfg(target_os = "macos")]
+const NET_RT_DUMP: libc::c_int = 1;
+#[cfg(target_os = "macos")]
+const NET_RT_FLAGS: libc::c_int = 2;
+#[cfg(target_os = "macos")]
+const RTF_UP: i32 = 0x1;
+#[cfg(target_os = "macos")]
+const RTF_GATEWAY: i32 = 0x2;
+#[cfg(target_os = "macos")]
+const RTF_LLINFO: i32 = 0x400;
+#[cfg(target_os = "macos")]
+const RTA_DST: i32 = 0x1;
+#[cfg(target_os = "macos")]
+const RTA_GATEWAY: i32 = 0x2;
+/// The sockaddr slots a route message's `rtm_addrs` bitmask can name (`RTAX_MAX`, `net/route.h`).
+#[cfg(target_os = "macos")]
+const RTAX_MAX: usize = 8;
+
+/// The fixed head of a `PF_ROUTE` message (`net/route.h` `struct rt_msghdr`), declared here for
+/// its size and the offsets of the two fields [`for_each_route`] reads: the kernel lays a
+/// message's sockaddrs out immediately after it. Plain Rust integer types match the C ABI on
+/// both macOS targets, so `repr(C)` computes the same 92-byte layout the kernel wrote (the same
+/// size the route-change test builds its headers at). The first-party `libc` does not carry the
+/// struct.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[allow(dead_code)] // The fields exist for the ABI layout; the walk reads two by offset.
+struct RtMsghdr {
+    rtm_msglen: u16,
+    rtm_version: u8,
+    rtm_type: u8,
+    rtm_index: u16,
+    rtm_flags: i32,
+    rtm_addrs: i32,
+    rtm_pid: i32,
+    rtm_seq: i32,
+    rtm_errno: i32,
+    rtm_use: i32,
+    rtm_inits: u32,
+    rtm_rmx: [u32; 14],
+}
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<RtMsghdr>() == 92);
+
+/// A `PF_ROUTE` table dumped by `sysctl` with no packet: `which` is `NET_RT_DUMP` (the routing
+/// table) or `NET_RT_FLAGS` (its entries whose flags include `flags`, e.g. `RTF_LLINFO` for the
+/// ARP/NDP cache). `None` on any sysctl failure or an empty table; a table that grew between the
+/// sizing call and the read fails the read, so the caller keeps nothing and looks again.
+#[cfg(target_os = "macos")]
+fn route_table(which: libc::c_int, flags: libc::c_int) -> Option<Vec<u8>> {
+    let mut mib = [CTL_NET, libc::PF_ROUTE, 0, libc::AF_INET, which, flags];
+    let count = mib.len() as libc::c_uint;
+    let mut len = 0usize;
+    // SAFETY: `mib` is six ints; a null buffer asks sysctl only for the size it would write.
+    let sized = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            count,
+            std::ptr::null_mut(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    // SAFETY: `buf` holds `len` bytes; sysctl writes at most `len` and sets `len` to what it wrote.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            count,
+            buf.as_mut_ptr().cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    Some(buf)
+}
+
+/// Call `f(flags, addrs, sockaddrs)` for each message in a `PF_ROUTE` table, walking by
+/// `rtm_msglen`; a truncated or zero-length message ends the walk. The buffer may be unaligned,
+/// so the two header fields the walk needs are read from their byte offsets.
+#[cfg(target_os = "macos")]
+fn for_each_route(table: &[u8], mut f: impl FnMut(i32, i32, &[u8])) {
+    let header = std::mem::size_of::<RtMsghdr>();
+    let flags_at = std::mem::offset_of!(RtMsghdr, rtm_flags);
+    let addrs_at = std::mem::offset_of!(RtMsghdr, rtm_addrs);
+    let mut at = 0;
+    while at + header <= table.len() {
+        let msg = &table[at..];
+        let msglen = usize::from(u16::from_ne_bytes([msg[0], msg[1]]));
+        if msglen < header || at + msglen > table.len() {
+            break;
+        }
+        let read = |offset: usize| i32::from_ne_bytes(msg[offset..offset + 4].try_into().unwrap());
+        f(read(flags_at), read(addrs_at), &msg[header..msglen]);
+        at += msglen;
+    }
+}
+
+/// The `RTA_DST` and `RTA_GATEWAY` sockaddrs of a route message's address block, selected from
+/// the `addrs` bitmask in slot order with each sockaddr padded up to four bytes (`net/route.h`
+/// `ROUNDUP`). A sockaddr whose padded length runs past the block is read for what is there.
+#[cfg(target_os = "macos")]
+fn dst_and_gateway(block: &[u8], addrs: i32) -> (Option<&[u8]>, Option<&[u8]>) {
+    let (mut dst, mut gateway) = (None, None);
+    let mut at = 0;
+    for slot in 0..RTAX_MAX {
+        let bit = 1i32 << slot;
+        if addrs & bit == 0 {
+            continue;
+        }
+        let Some(&sa_len) = block.get(at) else { break };
+        let advance = if sa_len == 0 {
+            4
+        } else {
+            (usize::from(sa_len) + 3) & !3
+        };
+        let sockaddr = &block[at..(at + advance).min(block.len())];
+        match bit {
+            RTA_DST => dst = Some(sockaddr),
+            RTA_GATEWAY => gateway = Some(sockaddr),
+            _ => {}
+        }
+        at += advance;
+    }
+    (dst, gateway)
+}
+
+/// The IPv4 address in a sockaddr whose family is `AF_INET` (a `sockaddr_in`, or the ARP table's
+/// `sockaddr_inarp`, which shares its first eight bytes): the four bytes at offset four. `None`
+/// for another family or a sockaddr too short to hold it.
+#[cfg(target_os = "macos")]
+fn sockaddr_ipv4(sockaddr: Option<&[u8]>) -> Option<Ipv4Addr> {
+    let sockaddr = sockaddr?;
+    if i32::from(*sockaddr.get(1)?) != libc::AF_INET {
+        return None;
+    }
+    let octets: [u8; 4] = sockaddr.get(4..8)?.try_into().ok()?;
+    Some(Ipv4Addr::from(octets))
+}
+
+/// Whether a route message's destination sockaddr is the default route's (`0.0.0.0`): its family
+/// is `AF_INET` or a length-only zero, and its four address bytes (a missing one reads zero) are
+/// all zero. A host or subnet route names some other destination.
+#[cfg(target_os = "macos")]
+fn is_default_destination(dst: Option<&[u8]>) -> bool {
+    let Some(dst) = dst else { return false };
+    let family = i32::from(dst.get(1).copied().unwrap_or(0));
+    if family != libc::AF_INET && family != 0 {
+        return false;
+    }
+    (0..4).all(|i| dst.get(4 + i).copied().unwrap_or(0) == 0)
+}
+
+/// The gateway of this machine's default IPv4 route (`0.0.0.0/0`) in a `NET_RT_DUMP` table: the
+/// first up gateway route to the unspecified destination whose next hop is an IPv4 address.
+/// `None` where none is present (no default route, or a non-IPv4 next hop such as a VPN link).
+#[cfg(target_os = "macos")]
+fn default_gateway_ipv4(table: &[u8]) -> Option<Ipv4Addr> {
+    let mut gateway = None;
+    for_each_route(table, |flags, addrs, block| {
+        if gateway.is_some() || flags & (RTF_GATEWAY | RTF_UP) != RTF_GATEWAY | RTF_UP {
+            return;
+        }
+        let (dst, gw) = dst_and_gateway(block, addrs);
+        if is_default_destination(dst) {
+            gateway = sockaddr_ipv4(gw);
+        }
+    });
+    gateway
+}
+
+/// The hardware address recorded for `gateway` in a `NET_RT_FLAGS`/`RTF_LLINFO` ARP/NDP table:
+/// the entry whose destination is that IPv4 address, its gateway a link-layer `sockaddr_dl`.
+/// `None` where no entry names it yet, or the entry carries no hardware address (incomplete).
+#[cfg(target_os = "macos")]
+fn gateway_hardware(table: &[u8], gateway: Ipv4Addr) -> Option<Box<[u8]>> {
+    let mut hardware = None;
+    for_each_route(table, |_flags, addrs, block| {
+        if hardware.is_some() {
+            return;
+        }
+        let (dst, gw) = dst_and_gateway(block, addrs);
+        if sockaddr_ipv4(dst) == Some(gateway) {
+            hardware = sockaddr_dl_hardware(gw);
+        }
+    });
+    hardware
+}
+
+/// The hardware address in a link-layer `sockaddr_dl` (family `AF_LINK`): `sdl_alen` bytes at
+/// `sdl_data` (offset eight) past the `sdl_nlen`-byte interface name. `None` for another family
+/// or an empty address (an incomplete ARP entry).
+#[cfg(target_os = "macos")]
+fn sockaddr_dl_hardware(sockaddr: Option<&[u8]>) -> Option<Box<[u8]>> {
+    let sockaddr = sockaddr?;
+    if i32::from(*sockaddr.get(1)?) != libc::AF_LINK {
+        return None;
+    }
+    let nlen = usize::from(*sockaddr.get(5)?);
+    let alen = usize::from(*sockaddr.get(6)?);
+    if alen == 0 {
+        return None;
+    }
+    let start = 8 + nlen;
+    Some(Box::from(sockaddr.get(start..start + alen)?))
+}
+
+/// The default IPv4 gateway in `/proc/net/route`: the `Gateway` column (host-order hex of the
+/// little-endian address) of the first row whose `Destination` is `00000000`. `None` where there
+/// is no default route. Only an up gateway route (`RTF_UP | RTF_GATEWAY`, `0x3`) with a `/0` mask
+/// (`00000000` when present) and a non-zero next hop qualifies.
+#[cfg(any(test, target_os = "linux"))]
+fn linux_default_gateway(route: &str) -> Option<Ipv4Addr> {
+    const RTF_UP_GATEWAY: u32 = 0x1 | 0x2;
+    for line in route.lines().skip(1) {
+        let mut column = line.split_whitespace();
+        let (Some(_iface), Some(destination), Some(gateway), Some(flags)) =
+            (column.next(), column.next(), column.next(), column.next())
+        else {
+            continue;
+        };
+        let mask = column.nth(3);
+        let Ok(flags) = u32::from_str_radix(flags, 16) else {
+            continue;
+        };
+        if destination != "00000000"
+            || flags & RTF_UP_GATEWAY != RTF_UP_GATEWAY
+            || mask.is_some_and(|m| m != "00000000")
+        {
+            continue;
+        }
+        let Ok(raw) = u32::from_str_radix(gateway, 16) else {
+            continue;
+        };
+        if raw != 0 {
+            return Some(Ipv4Addr::from(raw.to_le_bytes()));
+        }
+    }
+    None
+}
+
+/// The hardware address recorded for `gateway` in `/proc/net/arp`: the `HW address` column of the
+/// row whose `IP address` is that address, when it is a real address (not all zeroes, which is an
+/// incomplete entry). `None` where no row names it. Rows without `ATF_COM` (`0x2`) are skipped so
+/// a stale or incomplete entry on an inactive interface never shadows a complete entry below it.
+#[cfg(any(test, target_os = "linux"))]
+fn linux_neighbour_hardware(arp: &str, gateway: Ipv4Addr) -> Option<Box<[u8]>> {
+    const ATF_COM: u32 = 0x2;
+    for line in arp.lines().skip(1) {
+        let mut column = line.split_whitespace();
+        // Columns: IP address, HW type, Flags, HW address, Mask, Device.
+        let (Some(ip), Some(_hw_type), Some(flags), Some(hardware)) =
+            (column.next(), column.next(), column.next(), column.next())
+        else {
+            continue;
+        };
+        let Ok(ip) = ip.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        if ip != gateway {
+            continue;
+        }
+        let flags_hex = flags
+            .strip_prefix("0x")
+            .or_else(|| flags.strip_prefix("0X"))
+            .unwrap_or(flags);
+        let Ok(arp_flags) = u32::from_str_radix(flags_hex, 16) else {
+            continue;
+        };
+        if arp_flags & ATF_COM == 0 {
+            continue;
+        }
+        let Some(bytes): Option<Vec<u8>> = hardware
+            .split(':')
+            .map(|byte| u8::from_str_radix(byte, 16).ok())
+            .collect()
+        else {
+            continue;
+        };
+        if !bytes.is_empty() && !bytes.iter().all(|&byte| byte == 0) {
+            return Some(bytes.into_boxed_slice());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +740,149 @@ mod route_change_tests {
             assert!(!names_a_change(&message(kind)), "type {kind:#x}");
         }
         assert!(!names_a_change(&[]));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod gateway_tests {
+    use super::*;
+
+    /// A sockaddr_in carrying `ip`, as a `PF_ROUTE` message stores it.
+    fn sockaddr_in(ip: Ipv4Addr) -> Vec<u8> {
+        let mut sockaddr = vec![0u8; 16];
+        sockaddr[0] = 16;
+        sockaddr[1] = libc::AF_INET as u8;
+        sockaddr[4..8].copy_from_slice(&ip.octets());
+        sockaddr
+    }
+
+    /// A link-layer sockaddr_dl carrying `mac` and no interface name.
+    fn sockaddr_dl(mac: &[u8]) -> Vec<u8> {
+        let mut sockaddr = vec![0u8; 8 + mac.len()];
+        sockaddr[0] = sockaddr.len() as u8;
+        sockaddr[1] = libc::AF_LINK as u8;
+        sockaddr[6] = mac.len() as u8; // sdl_alen; sdl_nlen stays zero
+        sockaddr[8..].copy_from_slice(mac);
+        sockaddr
+    }
+
+    /// One route message: `flags`, the present-sockaddr bitmask, and the sockaddrs each padded
+    /// up to four bytes the way the kernel lays them out after the `rt_msghdr`.
+    fn route_message(flags: i32, addrs: i32, sockaddrs: &[&[u8]]) -> Vec<u8> {
+        let header = std::mem::size_of::<RtMsghdr>();
+        let mut body = Vec::new();
+        for sockaddr in sockaddrs {
+            let sa_len = sockaddr.first().copied().unwrap_or(0);
+            let advance = if sa_len == 0 {
+                4
+            } else {
+                (usize::from(sa_len) + 3) & !3
+            };
+            let mut chunk = sockaddr.to_vec();
+            chunk.resize(advance, 0);
+            body.extend_from_slice(&chunk);
+        }
+        let mut message = vec![0u8; header];
+        let msglen = (header + body.len()) as u16;
+        message[0..2].copy_from_slice(&msglen.to_ne_bytes());
+        let flags_at = std::mem::offset_of!(RtMsghdr, rtm_flags);
+        let addrs_at = std::mem::offset_of!(RtMsghdr, rtm_addrs);
+        message[flags_at..flags_at + 4].copy_from_slice(&flags.to_ne_bytes());
+        message[addrs_at..addrs_at + 4].copy_from_slice(&addrs.to_ne_bytes());
+        message.extend_from_slice(&body);
+        message
+    }
+
+    #[test]
+    fn the_default_route_names_the_gateway_and_a_host_route_does_not() {
+        let gw = Ipv4Addr::new(192, 168, 1, 1);
+        let default = route_message(
+            RTF_UP | RTF_GATEWAY,
+            RTA_DST | RTA_GATEWAY,
+            &[&sockaddr_in(Ipv4Addr::UNSPECIFIED), &sockaddr_in(gw)],
+        );
+        assert_eq!(default_gateway_ipv4(&default), Some(gw));
+        // Negative control: a host route to a non-default destination is not the default route,
+        // so its gateway is never taken for the default gateway.
+        let host = route_message(
+            RTF_UP | RTF_GATEWAY,
+            RTA_DST | RTA_GATEWAY,
+            &[
+                &sockaddr_in(Ipv4Addr::new(10, 0, 0, 5)),
+                &sockaddr_in(Ipv4Addr::new(10, 0, 0, 1)),
+            ],
+        );
+        assert_eq!(default_gateway_ipv4(&host), None);
+        // A table that leads with the host route still finds the default behind it.
+        let mut both = host.clone();
+        both.extend_from_slice(&default);
+        assert_eq!(default_gateway_ipv4(&both), Some(gw));
+    }
+
+    #[test]
+    fn the_arp_table_gives_the_gateways_hardware_address_and_nothing_for_a_stranger() {
+        let gw = Ipv4Addr::new(192, 168, 1, 1);
+        let mac = [0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33];
+        let entry = route_message(
+            0,
+            RTA_DST | RTA_GATEWAY,
+            &[&sockaddr_in(gw), &sockaddr_dl(&mac)],
+        );
+        assert_eq!(
+            gateway_hardware(&entry, gw).as_deref(),
+            Some(mac.as_slice())
+        );
+        // Negative control: no entry names this gateway yet, so the key cannot be formed.
+        assert_eq!(
+            gateway_hardware(&entry, Ipv4Addr::new(192, 168, 1, 254)),
+            None
+        );
+        // An incomplete entry (no hardware address) is no entry.
+        let incomplete = route_message(
+            0,
+            RTA_DST | RTA_GATEWAY,
+            &[&sockaddr_in(gw), &sockaddr_dl(&[])],
+        );
+        assert_eq!(gateway_hardware(&incomplete, gw), None);
+    }
+}
+
+#[cfg(test)]
+mod linux_gateway_tests {
+    use super::*;
+
+    #[test]
+    fn proc_route_and_arp_name_the_default_gateways_hardware_address() {
+        let route = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+             tun0\t00000000\t0108000A\t0003\t0\t0\t50\t00000080\n\
+             en0\t00000000\t00000000\t0001\t0\t0\t90\t00000000\n\
+             en0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\n";
+        assert_eq!(
+            linux_default_gateway(route),
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+        // Negative control: with no default-destination row there is no gateway.
+        let no_default = "Iface\tDestination\tGateway\tFlags\nen0\t0001A8C0\t00000000\t0001\n";
+        assert_eq!(linux_default_gateway(no_default), None);
+
+        let arp = "IP address       HW type     Flags       HW address            Mask     Device\n\
+             192.168.1.1      0x1         0x0         de:ad:be:ef:00:01     *        wlan0\n\
+             192.168.1.1      0x1         0x2         aa:bb:cc:11:22:33     *        en0\n";
+        assert_eq!(
+            linux_neighbour_hardware(arp, Ipv4Addr::new(192, 168, 1, 1)).as_deref(),
+            Some([0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33].as_slice())
+        );
+        // Negative control: a stranger, and an incomplete entry, give nothing.
+        assert_eq!(
+            linux_neighbour_hardware(arp, Ipv4Addr::new(192, 168, 1, 9)),
+            None
+        );
+        let incomplete = "IP address       HW type     Flags       HW address            Mask     Device\n\
+             192.168.1.1      0x1         0x0         00:00:00:00:00:00     *        en0\n\
+             192.168.1.1      0x1         0x0         de:ad:be:ef:00:01     *        en0\n";
+        assert_eq!(
+            linux_neighbour_hardware(incomplete, Ipv4Addr::new(192, 168, 1, 1)),
+            None
+        );
     }
 }

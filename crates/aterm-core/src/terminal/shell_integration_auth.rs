@@ -127,6 +127,58 @@ impl ShellIntegrationAuth {
         }
     }
 
+    /// Snapshot of an awaiting nonce (`awaiting_first_mark`) and any unsettled typed-rekey prior, for [`super::PaneStepCarry`].
+    #[must_use]
+    #[inline]
+    pub(crate) const fn awaiting_carry(
+        &self,
+    ) -> (
+        Option<super::ShellIntegrationNonce>,
+        Option<(Option<super::ShellIntegrationNonce>, bool)>,
+    ) {
+        if !self.awaiting_first_mark {
+            return (None, None);
+        }
+        let awaiting = match self.nonce {
+            Some(n) => Some(super::ShellIntegrationNonce(n)),
+            None => return (None, None),
+        };
+        let prior = match self.typed_prior {
+            Some(p) => Some((
+                match p.nonce {
+                    Some(n) => Some(super::ShellIntegrationNonce(n)),
+                    None => None,
+                },
+                p.awaiting_first_mark,
+            )),
+            None => None,
+        };
+        (awaiting, prior)
+    }
+
+    /// Restore an awaiting nonce and optional typed-rekey prior from [`super::PaneStepCarry`].
+    #[inline]
+    pub(crate) fn apply_awaiting_carry(
+        &mut self,
+        awaiting: Option<super::ShellIntegrationNonce>,
+        prior: Option<(Option<super::ShellIntegrationNonce>, bool)>,
+    ) {
+        if let Some(super::ShellIntegrationNonce(nonce)) = awaiting {
+            self.nonce = Some(nonce);
+            self.awaiting_first_mark = true;
+            self.typed_prior = prior.and_then(|(pn, pa)| {
+                if pn.is_none() && pa {
+                    None
+                } else {
+                    Some(Prior {
+                        nonce: pn.map(|n| n.0),
+                        awaiting_first_mark: pa,
+                    })
+                }
+            });
+        }
+    }
+
     /// OSC 133/633 sequences dropped so far, for host metrics.
     #[must_use]
     #[inline]

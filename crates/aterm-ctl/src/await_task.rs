@@ -257,11 +257,18 @@ enum Leg {
     /// machine's address full, nothing listening at its port (an aterm restarting, its listener
     /// rebinding), or the connection cut before the rows.
     Again(io::Error),
+    /// A leg over a drive nothing answered within its deadline, or no route reached (a Mac asleep
+    /// or off its network, an aterm frozen): asked again as [`Leg::Again`] past the baseline,
+    /// and before it the run's end.
+    Silent(io::Error),
     /// A connect phase that already said why on stderr.
     Code(ExitCode),
-    /// A leg over a drive that ctl's own `--timeout` ran out within: the wait's end, with the rows
-    /// read, or before the baseline this error.
+    /// A leg over a drive that ctl's own `--timeout` ran out within, unserved: the wait's end, with
+    /// the rows read, or before the baseline this error.
     Cut(io::Error),
+    /// ctl's own `--timeout` ran out before a leg over a drive was asked: the wait's end as the
+    /// legs before it left it.
+    Spent(io::Error),
 }
 
 type LegFn = dyn Fn(&str, &str, Duration) -> Leg + Send + Sync;
@@ -307,32 +314,38 @@ fn cut_reserve(flag: Duration) -> Duration {
 /// Backoff before retrying an unserved leg ([`Leg::Again`], [`Legs::again`]).
 const AGAIN_AFTER: Duration = Duration::from_secs(1);
 
-/// The longest a group asks again ([`Leg::Again`], [`Legs::again`]).
+/// The longest a group asks again before its baseline ([`Leg::Again`]); after it, its timeout,
+/// or this where it has none.
 const AGAIN_FOR: Duration = Duration::from_secs(60);
 
 /// One leg over a drive, within its wait and [`DRIVEN_SLACK`], or what is left of ctl's own
-/// `--timeout` (`cut`: when it runs out, and the `--timeout`) where that is shorter; a peer that
-/// took the connection and sent no handshake within it keeps that cause (exit 2).
+/// `--timeout` (`cut`: when it runs out, and the `--timeout`) where that is shorter, which a cut
+/// says a longer one waits out (`longer`: the wait's, where the `--timeout` ends it, else the
+/// leg's own); a peer that took the connection and sent no handshake within it keeps that cause
+/// (exit 2 before the baseline, and past it asked again).
 fn driven_leg(
     drive: crate::FleetDriveFn,
     (host, request): (&str, &str),
     wait: Duration,
-    cut: Option<(Instant, Duration)>,
+    (cut, longer): (Option<(Instant, Duration)>, Option<crate::remote::Longer>),
 ) -> Leg {
-    use crate::remote::Within;
+    use crate::remote::{Longer, Within};
     use io::ErrorKind::{TimedOut, WouldBlock};
     let own = wait + DRIVEN_SLACK;
     let left = cut.map(|(at, flag)| (at.saturating_duration_since(Instant::now()), flag));
     let (within, said) = match left {
-        Some((left, flag)) if left < own => (left, Within::Timeout(flag, own)),
+        Some((left, flag)) if left < own => (
+            left,
+            Within::Timeout(flag, longer.unwrap_or(Longer::Drive(own))),
+        ),
         _ => (own, Within::Drive(own)),
     };
     if within.is_zero() {
-        return Leg::Cut(crate::remote::closed(host, request, said, TimedOut.into()));
+        return Leg::Spent(crate::remote::closed(host, request, said, TimedOut.into()));
     }
     let ends = Instant::now() + within;
     match driven_exchange(drive, (host, request), within, said) {
-        Leg::Failed(e) | Leg::Again(e)
+        Leg::Failed(e) | Leg::Again(e) | Leg::Silent(e)
             if matches!(said, Within::Timeout(..))
                 && !crate::is_unserved(&e)
                 && (Instant::now() >= ends || matches!(e.kind(), WouldBlock | TimedOut)) =>
@@ -352,6 +365,7 @@ fn driven_exchange(
     let mut link = match drive(host, within) {
         Ok(link) => link,
         Err(refused) if refused.again => return Leg::Again(io::Error::other(refused)),
+        Err(refused) if refused.silent => return Leg::Silent(io::Error::other(refused)),
         Err(refused) => return Leg::Failed(io::Error::other(refused)),
     };
     let label = link.label;
@@ -361,7 +375,7 @@ fn driven_exchange(
         return if redial::is_hangup(&e) {
             Leg::Again(e)
         } else {
-            Leg::Failed(crate::remote::closed(&label, request, cut, e))
+            unanswered_or_failed(crate::remote::closed(&label, request, cut, e))
         };
     }
     let leg = read_leg(
@@ -375,8 +389,21 @@ fn driven_exchange(
         },
     );
     match leg {
-        Leg::Failed(e) => Leg::Failed(crate::remote::closed(&label, request, cut, e)),
+        Leg::Failed(e) => unanswered_or_failed(crate::remote::closed(&label, request, cut, e)),
         leg => leg,
+    }
+}
+
+/// A drive connection's failure: [`Leg::Silent`] where its deadline came first, else
+/// [`Leg::Failed`].
+fn unanswered_or_failed(e: io::Error) -> Leg {
+    if matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ) {
+        Leg::Silent(e)
+    } else {
+        Leg::Failed(e)
     }
 }
 
@@ -536,6 +563,12 @@ enum Report {
 enum End {
     Answered(Vec<String>),
     TimedOut(Vec<String>),
+    /// Past the baseline, its peer served no leg from `since` to the timeout (`why`: the last's).
+    Unanswered {
+        rows: Vec<String>,
+        since: Instant,
+        why: io::Error,
+    },
     Failed(io::Error),
     Code(ExitCode),
 }
@@ -581,6 +614,7 @@ fn run_group(
             facts,
             wait,
         );
+        let asked = Instant::now();
         let (answered, latest) = match (legs.send)(&group.sock, &request, wait) {
             Leg::Answered(latest) => (true, latest),
             Leg::TimedOut(latest) => (false, latest),
@@ -596,22 +630,31 @@ fn run_group(
                 continue;
             }
             Leg::Code(code) => return End::Code(code),
-            Leg::Cut(e) => return ran_out(baseline_read, rows, e),
-            Leg::Again(e) => {
+            Leg::Cut(e) => {
+                let since = *unserved_since.get_or_insert(asked);
+                return ran_out(baseline_read, rows, (Some(since), e));
+            }
+            Leg::Spent(e) => return ran_out(baseline_read, rows, (unserved_since, e)),
+            Leg::Silent(e) if !baseline_read => return End::Failed(e),
+            Leg::Again(e) | Leg::Silent(e) => {
                 let now = Instant::now();
-                let since = *unserved_since.get_or_insert(now);
+                let since = *unserved_since.get_or_insert(asked);
                 if until.is_some_and(|until| now >= until) {
-                    return ran_out(baseline_read, rows, e);
+                    return ran_out(baseline_read, rows, (Some(since), e));
                 }
+                // Past the baseline, a wait with a timeout asks until it; one with none, as long
+                // as one before it would.
                 let (after, most) = legs.again;
-                if now.saturating_duration_since(since) >= most {
-                    return End::Failed(e);
+                if (!baseline_read || until.is_none())
+                    && now.saturating_duration_since(since) >= most
+                {
+                    return ran_out(baseline_read, rows, (Some(since), e));
                 }
                 std::thread::sleep(until.map_or(after, |until| {
                     until.saturating_duration_since(now).min(after)
                 }));
                 if until.is_some_and(|until| Instant::now() >= until) {
-                    return ran_out(baseline_read, rows, e);
+                    return ran_out(baseline_read, rows, (Some(since), e));
                 }
                 continue;
             }
@@ -689,18 +732,36 @@ fn run_group(
     }
 }
 
-/// A wait whose deadline ran out at a leg the peer did not answer (`e`): with the rows read, or
-/// before the baseline that leg's cause.
-fn ran_out(baseline_read: bool, rows: Vec<Option<String>>, e: io::Error) -> End {
-    if baseline_read {
-        End::TimedOut(rows.into_iter().flatten().collect())
-    } else {
-        End::Failed(e)
+/// A wait whose deadline ran out at a leg the peer did not answer (`e`): with the rows read, and
+/// since when none was served (`unserved`), or before the baseline that leg's cause.
+fn ran_out(
+    baseline_read: bool,
+    rows: Vec<Option<String>>,
+    (unserved, e): (Option<Instant>, io::Error),
+) -> End {
+    let rows = rows.into_iter().flatten().collect();
+    match unserved {
+        _ if !baseline_read => End::Failed(e),
+        Some(since) => End::Unanswered {
+            rows,
+            since,
+            why: e,
+        },
+        None => End::TimedOut(rows),
     }
 }
 
 enum Waited {
-    Rows { rows: Vec<String>, answered: bool },
+    Rows {
+        rows: Vec<String>,
+        answered: bool,
+    },
+    /// A wait over a drive that ended as [`End::Unanswered`].
+    Unanswered {
+        rows: Vec<String>,
+        since: Instant,
+        why: io::Error,
+    },
     Code(ExitCode),
 }
 
@@ -727,6 +788,7 @@ fn wait_task_groups(
     let mut rows: Vec<Vec<String>> = vec![Vec::new(); count];
     let mut ended = vec![false; count];
     let mut answered = vec![false; count];
+    let mut unanswered = None;
     let done = |answered: &[bool]| match combine {
         Combine::Any => answered.iter().any(|a| *a),
         Combine::All => answered.iter().all(|a| *a),
@@ -742,6 +804,14 @@ fn wait_task_groups(
                         answered[index] = true;
                     }
                     End::TimedOut(latest) => rows[index] = latest,
+                    End::Unanswered {
+                        rows: latest,
+                        since,
+                        why,
+                    } => {
+                        rows[index] = latest;
+                        unanswered = Some((since, why));
+                    }
                     End::Failed(e) => return Err(e),
                     End::Code(code) => return Ok(Waited::Code(code)),
                 }
@@ -751,9 +821,13 @@ fn wait_task_groups(
             }
         }
     }
-    Ok(Waited::Rows {
-        rows: rows.into_iter().flatten().collect(),
-        answered: done(&answered),
+    let rows = rows.into_iter().flatten().collect();
+    Ok(match unanswered {
+        Some((since, why)) if !done(&answered) => Waited::Unanswered { rows, since, why },
+        _ => Waited::Rows {
+            rows,
+            answered: done(&answered),
+        },
     })
 }
 
@@ -788,14 +862,10 @@ pub(crate) fn run_await_task(
         send: Arc::new(socket_leg),
         again: (AGAIN_AFTER, AGAIN_FOR),
     };
-    print_waited(wait_task_groups(
-        groups,
-        request.combine,
-        request.facts,
-        until,
-        follow,
-        &legs,
-    )?)
+    print_waited(
+        wait_task_groups(groups, request.combine, request.facts, until, follow, &legs)?,
+        default,
+    )
 }
 
 /// `await task …` over the fleet ([`crate::remote`], [`DRIVEN_LEG_MAX`], [`DEFAULT_TOTAL`]).
@@ -805,7 +875,7 @@ pub(crate) fn run_driven(
     host: &str,
     drive: crate::FleetDriveFn,
 ) -> io::Result<ExitCode> {
-    print_waited(driven_wait(parts, total, host, drive)?)
+    print_waited(driven_wait(parts, total, host, drive)?, host)
 }
 
 fn driven_wait(
@@ -842,11 +912,12 @@ fn driven_wait(
         (None, None) => Some(DEFAULT_TOTAL),
     };
     // Its last leg asks for a wait that ends inside it, so the rows it reads are the peer's.
-    let until = total.map(|t| start + t).map(|until| {
-        cut.map_or(until, |(_, flag)| {
-            until.min(start + flag.saturating_sub(cut_reserve(flag)))
-        })
-    });
+    let inside = cut.map(|(_, flag)| flag.saturating_sub(cut_reserve(flag)));
+    let until = total.map(|t| start + inside.map_or(t, |inside| t.min(inside)));
+    // A longer `--timeout` waits longer than a leg's own deadline only where it ends the wait.
+    let longer = inside
+        .filter(|&inside| total.is_some_and(|t| inside < t))
+        .map(|_| crate::remote::Longer::Wait(request.timeout));
     let targets = request
         .targets
         .iter()
@@ -860,7 +931,7 @@ fn driven_wait(
     let legs = Legs {
         max: DRIVEN_LEG_MAX,
         send: Arc::new(move |_: &str, request: &str, wait: Duration| {
-            driven_leg(drive, (&host, request), wait, cut)
+            driven_leg(drive, (&host, request), wait, (cut, longer))
         }),
         again: (AGAIN_AFTER, AGAIN_FOR),
     };
@@ -878,9 +949,19 @@ fn driven_wait(
     )
 }
 
-fn print_waited(waited: Waited) -> io::Result<ExitCode> {
-    let (rows, answered) = match waited {
-        Waited::Rows { rows, answered } => (rows, answered),
+/// The rows on stdout, then `OK timeout` (124), or [`unanswered`] at `at` (75, as a blocking
+/// read whose instance went away).
+fn print_waited(waited: Waited, at: &str) -> io::Result<ExitCode> {
+    let (rows, end) = match waited {
+        Waited::Rows {
+            rows,
+            answered: true,
+        } => (rows, None),
+        Waited::Rows { rows, .. } => (rows, Some(("OK timeout".to_owned(), EXIT_TIMEOUT))),
+        Waited::Unanswered { rows, since, why } => (
+            rows,
+            Some((unanswered(at, since, &why), redial::EXIT_REPLACED)),
+        ),
         Waited::Code(code) => return Ok(code),
     };
     let stdout = stdout_handle();
@@ -890,12 +971,23 @@ fn print_waited(waited: Waited) -> io::Result<ExitCode> {
         io::Write::write_all(&mut out, b"\n")?;
     }
     drop(out);
-    if answered {
-        Ok(ExitCode::SUCCESS)
-    } else {
-        stderr_line("OK timeout")?;
-        Ok(ExitCode::from(EXIT_TIMEOUT))
+    match end {
+        None => Ok(ExitCode::SUCCESS),
+        Some((said, code)) => {
+            stderr_line(&said)?;
+            Ok(ExitCode::from(code))
+        }
     }
+}
+
+/// Why a wait over a drive ended with the rows it read before: nothing answered at `at` since
+/// `since`.
+fn unanswered(at: &str, since: Instant, why: &io::Error) -> String {
+    format!(
+        "nothing answered at {at} for the last {:.1} s of this wait ({why}), so the rows are the \
+         last it read there; `aterm ctl survey --host {at}` says whether that Mac answers again",
+        since.elapsed().as_secs_f64()
+    )
 }
 
 #[cfg(test)]
@@ -1216,6 +1308,7 @@ mod tests {
     ) -> (Vec<String>, bool) {
         match wait_task_groups(groups, combine, false, until, &redial::Redial::none(), legs) {
             Ok(Waited::Rows { rows, answered }) => (rows, answered),
+            Ok(Waited::Unanswered { why, .. }) => panic!("unanswered: {why}"),
             Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
             Err(e) => panic!("{e}"),
         }
@@ -1796,6 +1889,7 @@ mod tests {
             Ok(Waited::Rows { rows, answered }) => {
                 assert_eq!((rows, answered), (vec![NEEDS_YOU.to_owned()], false));
             }
+            Ok(Waited::Unanswered { why, .. }) => panic!("unanswered: {why}"),
             Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
             Err(e) => panic!("{e}"),
         }
@@ -1828,5 +1922,271 @@ mod tests {
             refused.to_string().contains("no fleet handshake"),
             "{refused}"
         );
+    }
+
+    const GONE: &str =
+        "nothing listens on 127.0.0.1:7100: no aterm running there, or no [fleet] listen";
+
+    fn gone_after_baseline(baseline: &'static str, most: Duration) -> Legs {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Legs {
+            max: Duration::from_millis(600),
+            again: (Duration::from_millis(5), most),
+            send: Arc::new(move |_: &str, _: &str, _: Duration| {
+                if asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    Leg::TimedOut(rows(&[baseline]))
+                } else {
+                    Leg::Again(io::Error::other(GONE))
+                }
+            }),
+        }
+    }
+
+    #[test]
+    fn a_peer_that_serves_no_leg_past_its_baseline_is_asked_until_the_timeout_and_named() {
+        let working = "@s-a rev=3 state=working agent=busy attention=- result_bytes=0";
+        for most in [Duration::from_millis(20), AGAIN_FOR] {
+            let until = Instant::now() + Duration::from_millis(300);
+            let ended = wait_task_groups(
+                one_group("lab-mini", &["s-a"]),
+                Combine::Any,
+                false,
+                Some(until),
+                &redial::Redial::none(),
+                &gone_after_baseline(working, most),
+            );
+            assert!(Instant::now() >= until, "never before its timeout");
+            match ended {
+                Ok(Waited::Unanswered { rows, why, .. }) => {
+                    assert_eq!(
+                        (rows, why.to_string()),
+                        (vec![working.to_owned()], GONE.into())
+                    );
+                }
+                Ok(Waited::Rows { rows, answered }) => {
+                    panic!("{rows:?} answered={answered}: the cause is dropped")
+                }
+                Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
+                Err(e) => panic!("ended before its timeout: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_wait_with_no_timeout_whose_peer_serves_no_leg_ends_a_minute_on_with_its_rows() {
+        let working = "@s-a rev=3 state=working agent=busy attention=- result_bytes=0";
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let legs = Legs {
+            max: Duration::from_millis(600),
+            again: (Duration::from_millis(1), Duration::from_millis(20)),
+            send: Arc::new(move |_: &str, _: &str, _: Duration| {
+                match asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+                    0 => Leg::TimedOut(rows(&[working])),
+                    // A hang detector: the bound on asking again is 20 asks or so.
+                    10_000.. => Leg::Code(ExitCode::from(99)),
+                    _ => Leg::Again(io::Error::other(GONE)),
+                }
+            }),
+        };
+        let ended = wait_task_groups(
+            one_group("lab-mini", &["s-a"]),
+            Combine::Any,
+            false,
+            None,
+            &redial::Redial::none(),
+            &legs,
+        );
+        match ended {
+            Ok(Waited::Unanswered { rows, why, .. }) => {
+                assert_eq!(
+                    (rows, why.to_string()),
+                    (vec![working.to_owned()], GONE.into())
+                );
+            }
+            Ok(Waited::Rows { rows, answered }) => panic!("{rows:?} answered={answered}"),
+            Ok(Waited::Code(code)) => panic!("asked again without bound: {code:?}"),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    const ASLEEP: &str = "lab-mini did not answer within 9.5s";
+
+    #[test]
+    fn a_driven_wait_whose_peer_went_away_or_fell_silent_ends_at_its_timeout_with_its_rows() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        fn later(
+            dials: &AtomicUsize,
+            (host, within): (&str, Duration),
+            then: fn() -> Result<crate::DriveLink, crate::DriveRefused>,
+        ) -> Result<crate::DriveLink, crate::DriveRefused> {
+            if dials.fetch_add(1, Relaxed) == 0 {
+                peer(host, within)
+            } else {
+                then()
+            }
+        }
+        fn gone(host: &str, within: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
+            static DIALS: AtomicUsize = AtomicUsize::new(0);
+            later(&DIALS, (host, within), || {
+                Err(crate::DriveRefused {
+                    again: true,
+                    ..crate::DriveRefused::once(GONE.to_owned())
+                })
+            })
+        }
+        fn asleep(host: &str, within: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
+            static DIALS: AtomicUsize = AtomicUsize::new(0);
+            later(&DIALS, (host, within), || {
+                Err(crate::DriveRefused {
+                    silent: true,
+                    ..crate::DriveRefused::once(ASLEEP.to_owned())
+                })
+            })
+        }
+        fn frozen(host: &str, within: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
+            static DIALS: AtomicUsize = AtomicUsize::new(0);
+            later(&DIALS, (host, within), || {
+                Ok(crate::DriveLink {
+                    stream: Box::new(Peer {
+                        sent: Vec::new(),
+                        deadline: Instant::now() + HANDSHAKE,
+                        reply: None,
+                    }),
+                    label: "lab-mini".to_owned(),
+                })
+            })
+        }
+        for (drive, cause) in [
+            (gone as crate::FleetDriveFn, GONE),
+            (asleep, ASLEEP),
+            (frozen, "lab-mini did not answer within "),
+        ] {
+            let began = Instant::now();
+            let waited = driven_wait(
+                &parts("await task @s-a1 timeout=1500"),
+                None,
+                "lab-mini",
+                drive,
+            );
+            assert!(
+                began.elapsed() >= Duration::from_millis(1500),
+                "{cause}: never before its timeout"
+            );
+            match waited {
+                Ok(Waited::Unanswered { rows, why, .. }) => {
+                    assert_eq!(rows, [BUSY], "{cause}: the row it read");
+                    assert!(why.to_string().starts_with(cause), "{why}");
+                }
+                Ok(Waited::Rows { rows, answered }) => {
+                    panic!("{cause}: {rows:?} answered={answered}, the cause dropped")
+                }
+                Ok(Waited::Code(code)) => panic!("{cause}: an exit code: {code:?}"),
+                Err(e) => panic!("{cause}: ended before its timeout: {e}"),
+            }
+        }
+        let unanswered = Waited::Unanswered {
+            rows: Vec::new(),
+            since: Instant::now(),
+            why: io::Error::other(GONE),
+        };
+        assert_eq!(
+            print_waited(unanswered, "lab-mini").unwrap(),
+            ExitCode::from(redial::EXIT_REPLACED)
+        );
+    }
+    #[test]
+    fn a_driven_wait_ctls_timeout_cuts_ends_as_unanswered_where_its_peer_froze_past_its_baseline() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        struct Frozen(Instant);
+        impl io::Read for Frozen {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(self.0.saturating_duration_since(Instant::now()));
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+        impl io::Write for Frozen {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        fn freezes(
+            dials: &AtomicUsize,
+            (host, within): (&str, Duration),
+        ) -> Result<crate::DriveLink, crate::DriveRefused> {
+            if dials.fetch_add(1, Relaxed) == 0 {
+                return peer(host, within);
+            }
+            Ok(crate::DriveLink {
+                stream: Box::new(Frozen(Instant::now() + within)),
+                label: "lab-mini".to_owned(),
+            })
+        }
+        fn frozen(host: &str, within: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
+            static DIALS: AtomicUsize = AtomicUsize::new(0);
+            freezes(&DIALS, (host, within))
+        }
+        fn frozen_untimed(
+            host: &str,
+            within: Duration,
+        ) -> Result<crate::DriveLink, crate::DriveRefused> {
+            static DIALS: AtomicUsize = AtomicUsize::new(0);
+            freezes(&DIALS, (host, within))
+        }
+        fn frozen_short(
+            host: &str,
+            within: Duration,
+        ) -> Result<crate::DriveLink, crate::DriveRefused> {
+            static DIALS: AtomicUsize = AtomicUsize::new(0);
+            freezes(&DIALS, (host, within))
+        }
+        for (wait, drive, longer) in [
+            (
+                "await task @s-a1 timeout=60000",
+                frozen as crate::FleetDriveFn,
+                "a longer --timeout waits as long as it names, up to the wait's timeout= of 60000 \
+                 ms, and 0 that whole timeout=",
+            ),
+            (
+                "await task @s-a1",
+                frozen_untimed,
+                "a longer --timeout waits as long as it names, and 0 until the news comes, where a \
+                 peer that answers no leg is asked again for a minute",
+            ),
+            // Its timeout= ran out inside the --timeout: a longer one waits out the leg alone.
+            (
+                "await task @s-a1 timeout=1000",
+                frozen_short,
+                "a longer --timeout, or 0, waits up to the drive's own 8 s",
+            ),
+        ] {
+            let began = Instant::now();
+            let flag = Some(Some(Duration::from_millis(1500)));
+            let waited = driven_wait(&parts(wait), flag, "lab-mini", drive);
+            assert!(
+                began.elapsed() >= Duration::from_millis(1500),
+                "never before its --timeout"
+            );
+            match waited {
+                Ok(Waited::Unanswered { rows, why, .. }) => {
+                    assert_eq!(rows, [BUSY], "the row it read");
+                    assert!(
+                        why.to_string().starts_with(&format!(
+                            "no answer came from lab-mini within this call's --timeout of 1 s \
+                             ({longer})"
+                        )),
+                        "{why}"
+                    );
+                }
+                Ok(Waited::Rows { rows, answered }) => {
+                    panic!("{rows:?} answered={answered}: a frozen peer is said as one that served")
+                }
+                Ok(Waited::Code(code)) => panic!("an exit code: {code:?}"),
+                Err(e) => panic!("ended before its timeout: {e}"),
+            }
+        }
     }
 }

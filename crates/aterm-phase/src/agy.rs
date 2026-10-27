@@ -12,21 +12,11 @@ use crate::text::blank;
 use crate::turn::{CardPlace, LaunchCard};
 use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
-/// Major component of the Antigravity CLI (`agy`) harness version, starting at `0.1`.
-pub const HARNESS_VERSION_MAJOR: u16 = 0;
-
-/// Minor component of the Antigravity CLI (`agy`) harness version, starting at `0.1`.
-pub const HARNESS_VERSION_MINOR: u16 = 1;
-
-/// Version of the Antigravity CLI (`agy`) harness, tracked per harness from `"0.1"`.
-pub const HARNESS_VERSION: &str = "0.1";
-
-/// Structured incremental numeric version of the Antigravity CLI (`agy`) harness.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(
-    HARNESS_VERSION_MAJOR,
-    HARNESS_VERSION_MINOR,
-    HARNESS_VERSION,
-);
+/// The Antigravity CLI (`agy`) harness version, `MAJOR.MINOR` with no third part.
+///
+/// Its minor goes up once per public release window in which its sources changed
+/// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 4, "0.4");
 
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 

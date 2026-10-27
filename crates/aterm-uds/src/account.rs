@@ -106,8 +106,43 @@ pub fn shell_of(uid: u32) -> Option<PathBuf> {
     }
 }
 
+/// The group macOS gives its administrators (`admin`), whose members its `sudo` admits.
+#[cfg(target_os = "macos")]
+pub const ADMIN_GID: u32 = 80;
+
+/// Whether this process's account is one of the Mac's administrators, the accounts `sudo`
+/// admits: its groups (`getgroups`, as its login set them) hold `admin` ([`ADMIN_GID`]). Read
+/// without root; `None` where the groups do not read, and off macOS.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn administrator() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: a count query: a zero size and a null buffer, which the call never writes.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let len = usize::try_from(count).ok().filter(|n| *n > 0)?;
+        let mut groups = vec![0 as libc::gid_t; len];
+        // SAFETY: `groups` is a writable buffer of exactly the `count` entries the call is told.
+        let got = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        let got = usize::try_from(got).ok()?;
+        Some(groups.get(..got)?.contains(&ADMIN_GID))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// This process's groups read on a Mac, so whether its account is an administrator is a
+    /// yes or a no there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn whether_this_account_administers_the_mac_reads() {
+        assert!(super::administrator().is_some());
+    }
+
     #[test]
     fn this_account_has_an_absolute_home() {
         let home = super::home().expect("the account database knows this uid");

@@ -184,6 +184,9 @@ aterm-dirfd = { workspace = true }
 # a new edge in the shipped graph — aterm-gui already links it — and unix-only,
 # as the key file's reader is.
 aterm-net = { workspace = true }
+# The default ALab fleet's join code is read from and published to the signed
+# vault without materializing it as a plaintext secret file.
+aterm-secrets = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }

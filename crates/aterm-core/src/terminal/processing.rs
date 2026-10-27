@@ -9,7 +9,7 @@ use super::Terminal;
 use aterm_types::duration_to_nanos;
 
 /// One reading of the clocks the terminal pipeline depends on.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockReading {
     /// Monotonic instant.
     pub monotonic: aterm_time::Instant,
@@ -106,6 +106,7 @@ impl Terminal {
         let pinned_offset = self.grid.display_offset();
         let lines_before = self.grid.absolute_row_counter();
         let was_alt = self.modes.alternate_screen;
+        self.shell.probe_transitioned = false;
         if pinned_offset > 0 {
             self.grid.pin_viewport_to_live_for_output_batch();
         }
@@ -168,6 +169,14 @@ impl Terminal {
             let ts = &mut self.transient.pipeline_timestamps;
             ts.last_process_bytes = u32::try_from(input.len()).unwrap_or(u32::MAX);
             ts.process_sequence = ts.process_sequence.wrapping_add(1);
+        }
+
+        if std::mem::take(&mut self.shell.probe_transitioned) {
+            self.host_journal.push(super::HostOp::ForegroundJob {
+                active: self.shell.foreground_job,
+                probed: self.shell.probe_job_active,
+                restore_cwd: false,
+            });
         }
 
         self.reconcile_color_scheme_after_output();
@@ -496,6 +505,7 @@ const fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         configured_modes: _,
         content_scroll_state: _,
         resize_journal: _,
+        host_journal: _,
         parser: _,
         text_selection: _,
         mouse_report_memo: _,

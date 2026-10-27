@@ -123,7 +123,7 @@ impl Fixture {
                 accounts::SyncTarget {
                     path: &self.roster,
                     before: None,
-                    after: &self.text,
+                    after: Some(&self.text),
                     mode: None,
                 },
                 |state, logins| {

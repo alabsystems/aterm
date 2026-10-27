@@ -9,6 +9,7 @@ struct TerminalCodex {
     homes: RefCell<Vec<PathBuf>>,
     probes: RefCell<Vec<PathBuf>>,
     mutation: Option<(PathBuf, String, bool)>,
+    credential_fault: Option<bool>,
 }
 impl TerminalCodex {
     fn new(reported: Option<&'static str>) -> Self {
@@ -17,6 +18,7 @@ impl TerminalCodex {
             homes: RefCell::new(Vec::new()),
             probes: RefCell::new(Vec::new()),
             mutation: None,
+            credential_fault: None,
         }
     }
 }
@@ -52,6 +54,13 @@ impl AccountsHost for TerminalCodex {
         if let Some((path, text, true)) = &self.mutation {
             std::fs::write(path, text).unwrap();
         }
+        if let Some(replace_with_directory) = self.credential_fault {
+            let credential = home.join("auth.json");
+            std::fs::rename(&credential, home.join("auth.retained")).unwrap();
+            if replace_with_directory {
+                std::fs::create_dir(credential).unwrap();
+            }
+        }
         self.reported.map(str::to_owned)
     }
     fn vendor_sign_in(
@@ -61,7 +70,13 @@ impl AccountsHost for TerminalCodex {
         self.vendor_login(req).unwrap();
         crate::harness::login_drive::Drove {
             outcome: crate::harness::login_drive::Outcome::SignedIn {
-                email: self.reported.map(str::to_owned),
+                // A missing driver identity makes renewal use the same staging
+                // probe as terminal login, where this fixture injects its fault.
+                email: if self.credential_fault.is_some() {
+                    None
+                } else {
+                    self.reported.map(str::to_owned)
+                },
                 page: false,
             },
             host: None,
@@ -181,6 +196,49 @@ fn terminal_codex_refuses_wrong_or_missing_identity_without_replacing_a_binding(
             bad.homes.borrow()[0].join("auth.json").is_file(),
             "the completed login is retained"
         );
+    }
+}
+
+#[test]
+fn a_credential_lost_during_the_identity_probe_cannot_publish() {
+    for verb in ["login", "renew"] {
+        for prior in [false, true] {
+            for replace_with_directory in [false, true] {
+                let tmp = tmp_dir("codex-lost-credential-publication");
+                let env = env_at(&tmp);
+                assert_eq!(
+                    run_line(
+                        "accounts add account --cli codex --email owner@example.test",
+                        &env
+                    )
+                    .0,
+                    exit(0)
+                );
+                if prior {
+                    let good = TerminalCodex::new(Some("owner@example.test"));
+                    assert_eq!(
+                        command("accounts login account --cli codex", &env, &good).0,
+                        exit(0)
+                    );
+                }
+                let store = env.accounts_store_for(Cli::Codex).unwrap();
+                let before = store.load_logins(env.now).unwrap().0;
+                let mut host = TerminalCodex::new(Some("owner@example.test"));
+                host.credential_fault = Some(replace_with_directory);
+                let (code, out, err) =
+                    command(&format!("accounts {verb} account --cli codex"), &env, &host);
+                assert_eq!(host.probes.borrow().len(), 1);
+                assert_eq!(code, exit(1), "{verb}, prior={prior}: {out}{err}");
+                assert_eq!(store.load_logins(env.now).unwrap().0, before);
+                let staging = host.homes.borrow()[0].clone();
+                assert_eq!(
+                    std::fs::read(staging.join("auth.retained")).unwrap(),
+                    b"isolated fixture login"
+                );
+                assert_eq!(staging.join("auth.json").is_dir(), replace_with_directory);
+                assert!(!staging.join(accounts::RENEWAL_CHECKPOINT_FILE).exists());
+            }
+        }
     }
 }
 
@@ -456,6 +514,7 @@ fn codex_recovery_requires_scoped_identity_and_a_status_check() {
         std::fs::write(staging.join("auth.json"), "isolated fixture login").unwrap();
         accounts::write_renewal_checkpoint_for(
             Cli::Codex,
+            None,
             "account",
             "owner@example.test",
             staging.to_str().unwrap(),
@@ -579,4 +638,230 @@ fn identity_binding_conforms_and_a_fabricated_proof_is_rejected() {
     let mut wrong = identity_transition(&model.init_state(), "Wrong");
     wrong.insert("bound", 1);
     assert!(!model.check_invariant("RefusalCannotBind", &wrong));
+}
+
+struct PublicationHost {
+    credential: PathBuf,
+    retained: PathBuf,
+    fault: i64,
+    clocks: std::cell::Cell<usize>,
+}
+
+impl AccountsHost for PublicationHost {
+    fn stdin_is_terminal(&self) -> bool {
+        true
+    }
+    fn auth_status(&self, _: &str) -> Result<Captured, String> {
+        panic!("publication uses the supplied provider proof")
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _: Option<&str>) -> Result<i32, String> {
+        panic!("publication runs no provider login")
+    }
+    fn now(&self) -> i64 {
+        assert_eq!(self.clocks.replace(self.clocks.get() + 1), 0);
+        if self.fault > 0 {
+            std::fs::rename(&self.credential, &self.retained).unwrap();
+            if self.fault == 2 {
+                std::fs::create_dir(&self.credential).unwrap();
+            }
+        }
+        1_758_412_900
+    }
+}
+
+fn publication_case(provider: i64, prior: bool, fault: i64) -> [(&'static str, i64); 5] {
+    let cli = [Cli::Codex, Cli::Grok, Cli::Kimi][provider as usize];
+    let tmp = tmp_dir("signin-publication-presence");
+    let env = env_at(&tmp);
+    let store = env.accounts_store_for(cli).unwrap();
+    let path = env.accounts_roster_for(cli).unwrap();
+    let row = accounts::Row {
+        label: "account".into(),
+        email: Some("owner@example.test".into()),
+        vendor: accounts::Vendor {
+            region: (cli == Cli::Kimi).then_some(crate::ai::connector::Region::Global),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    std::fs::write(&path, accounts::append_rows_for(cli, "", &[row]).unwrap()).unwrap();
+    if prior {
+        let old = tmp.path().join("prior-login");
+        let credential = old.join(cli.connector().stores[0]);
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(credential, "prior login").unwrap();
+        store
+            .transact_logins(env.now, &mut None, |state, logins| {
+                Ok(accounts::note_renewed(
+                    state,
+                    logins,
+                    "account",
+                    None,
+                    old.to_str().unwrap(),
+                    None,
+                    env.now,
+                ))
+            })
+            .unwrap();
+    }
+    let records = store.read_account_records(Some(&path), env.now).unwrap();
+    let row = records.roster.row("account").unwrap();
+    let plan = sign_in_plan(
+        cli,
+        &store,
+        SignInPolicy {
+            row,
+            logins: &records.logins,
+            roster_path: &path,
+            own_dir: None,
+        },
+        env.now,
+        "login",
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let credential = plan.staging.join(cli.connector().stores[0]);
+    std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+    std::fs::write(&credential, "prepared login").unwrap();
+    let host = PublicationHost {
+        retained: credential.with_extension("retained"),
+        credential,
+        fault,
+        clocks: std::cell::Cell::new(0),
+    };
+    let snapshot = || {
+        [
+            path.clone(),
+            store.state_file(),
+            store.logins_file(),
+            store.ledger_path(),
+            store.state_witness_file(),
+            store.logins_witness_file(),
+            store.dir.join("sync-commit.json"),
+        ]
+        .map(|path| std::fs::read(path).ok())
+    };
+    let before = snapshot();
+    let mut err = Vec::new();
+    let result = bind_signed_in(
+        cli,
+        env.now,
+        &host,
+        &store,
+        (row, &path),
+        None,
+        &plan,
+        accounts::Proof::Status,
+        "login",
+        &mut Vec::new(),
+        &mut err,
+    );
+    assert_eq!(host.clocks.get(), 1);
+    if fault > 0 {
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("the staging login disappeared before publication"),
+            "the refusal must be from the publication check"
+        );
+    }
+    let evidence = if fault == 0 {
+        &host.credential
+    } else {
+        &host.retained
+    };
+    let retained = std::fs::read(evidence).unwrap() == b"prepared login";
+    if fault > 0 {
+        assert_eq!(store.load_logins(env.now).unwrap().0, records.logins);
+    }
+    [
+        ("phase", 1),
+        ("published", i64::from(result == Renewal::Renewed)),
+        ("changed", i64::from(before != snapshot())),
+        (
+            "checkpoint",
+            i64::from(
+                plan.staging
+                    .join(accounts::RENEWAL_CHECKPOINT_FILE)
+                    .is_file(),
+            ),
+        ),
+        ("retained", i64::from(retained)),
+    ]
+}
+
+pub(crate) fn publication_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    match action {
+        "AnotherProvider" => {
+            next.insert("provider", state["provider"] + 1);
+        }
+        "PriorBinding" => {
+            next.insert("prior", 1);
+        }
+        "AnotherFault" => {
+            next.insert("fault", state["fault"] + 1);
+        }
+        "Publish" => {
+            for (key, value) in
+                publication_case(state["provider"], state["prior"] == 1, state["fault"])
+            {
+                next.insert(key, value);
+            }
+        }
+        _ => unreachable!(),
+    }
+    next
+}
+
+#[test]
+fn signin_publication_conforms_and_missing_credentials_cannot_bind() {
+    let model = aterm_models_harness::signin_publication_model();
+    assert_eq!(model.mutant_dials(), (1..=8).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 36);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = publication_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
+    for fault in [0, 1, 2] {
+        let mut state = model.init_state();
+        state.insert("fault", fault);
+        let after = publication_transition(&state, "Publish");
+        let faults = if fault == 0 {
+            [
+                ("published", 0, "ResultPolicy"),
+                ("changed", 0, "CompleteRecord"),
+                ("checkpoint", 0, "CompleteRecord"),
+            ]
+        } else {
+            [
+                ("published", 1, "ResultPolicy"),
+                ("changed", 1, "RefusalPreserves"),
+                ("checkpoint", 1, "RefusalPreserves"),
+            ]
+        };
+        for (field, value, law) in faults
+            .into_iter()
+            .chain([("retained", 0, "EvidenceRetained")])
+        {
+            let mut bad = after.clone();
+            bad.insert(field, value);
+            assert!(!model.check_invariant(law, &bad));
+        }
+    }
 }

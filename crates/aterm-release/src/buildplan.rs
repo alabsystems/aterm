@@ -211,7 +211,6 @@ pub(crate) fn open_release_directory(
     Err("release target privacy requires Unix ownership and mode semantics".into())
 }
 
-const HOMEBREW_RUSTUP_SHIM_DIR: &str = "/opt/homebrew/opt/rustup/bin";
 const RELEASE_SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 fn release_tool_path(tool_dir: &Path) -> Result<OsString, String> {
@@ -232,39 +231,30 @@ fn release_tool_path(tool_dir: &Path) -> Result<OsString, String> {
     Ok(path)
 }
 
-pub(crate) fn release_rustup_shim_dir(home: &std::ffi::OsStr) -> Result<PathBuf, String> {
-    let home = Path::new(home);
-    if !home.is_absolute() {
-        return Err("release HOME must be absolute".into());
-    }
-    resolve_release_rustup_shim_dir(
-        home,
-        Path::new(HOMEBREW_RUSTUP_SHIM_DIR),
-        current_release_uid()?,
-    )
+/// The directory of the rustup the `rustup` row of `aterm_uds::host::TOOLS` resolves (the
+/// stamped copy `verify provision` lays beside its cargo and rustc proxies), held to what a
+/// release build runs from it ([`resolve_release_rustup_shim_dir`]).
+pub(crate) fn release_rustup_shim_dir() -> Result<PathBuf, String> {
+    let rustup = aterm_uds::host::tool("rustup")
+        .locate()
+        .map_err(|absent| absent.to_string())?;
+    release_rustup_shim_dir_of(&rustup)
 }
 
-fn resolve_release_rustup_shim_dir(
-    home: &Path,
-    homebrew_fallback: &Path,
-    expected_uid: u32,
-) -> Result<PathBuf, String> {
-    let standard = home.join(".cargo/bin");
-    match std::fs::symlink_metadata(&standard) {
-        Ok(_) => validate_release_rustup_shim_dir(&standard, expected_uid),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            validate_release_rustup_shim_dir(homebrew_fallback, expected_uid).map_err(|fallback| {
-                format!(
-                    "rustup shim directory is absent at {}; fallback failed: {fallback}",
-                    standard.display()
-                )
-            })
-        }
-        Err(error) => Err(format!(
-            "inspect standard rustup shim directory {}: {error}",
-            standard.display()
-        )),
-    }
+/// [`resolve_release_rustup_shim_dir`] of `rustup` for this process's user.
+pub(crate) fn release_rustup_shim_dir_of(rustup: &Path) -> Result<PathBuf, String> {
+    resolve_release_rustup_shim_dir(rustup, current_release_uid()?)
+}
+
+/// `rustup`'s own directory, canonical, when it is a real directory of `expected_uid`'s that
+/// no group or other may write and its `cargo` and `rustup` are real regular executables of
+/// that user's: no other directory answers.
+fn resolve_release_rustup_shim_dir(rustup: &Path, expected_uid: u32) -> Result<PathBuf, String> {
+    let dir = rustup
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .ok_or_else(|| format!("rustup at {} names no directory", rustup.display()))?;
+    validate_release_rustup_shim_dir(dir, expected_uid)
 }
 
 #[cfg(unix)]
@@ -415,6 +405,7 @@ impl Take {
     pub(crate) fn prepare(repo_root: &Path, commit: &str) -> Result<Self, String> {
         let hold = snapshot::CacheRoot::for_repo(repo_root)?.hold()?;
         let cache = hold.cache();
+        retire_moved_dirs(cache);
         refuse_held_stage(&cache.stage())?;
         let targo = crate::gates::trust_stage2_bin()
             .map_err(|e| e.to_string())?
@@ -497,6 +488,33 @@ impl Take {
 /// The stage's shipped binary's directory: its first exec is stamped there ([`run_with_take`]).
 fn ship_stage(stage: &Path) -> PathBuf {
     stage.join("universal").join("ship")
+}
+
+/// The build's folders where a take of an earlier version laid them, beside `snapshot/`
+/// ([`snapshot::CacheRoot::moved_from`]): removed under this take's hold of the cache, which no
+/// other take of the clone builds through, each said in a line; the stage only once the binary
+/// an earlier build started there showed it ran ([`refuse_held_stage`]'s rule), else it stays for
+/// a later take. What fails to go stays, said, and the take goes on.
+fn retire_moved_dirs(cache: &snapshot::CacheRoot) {
+    for old in cache.moved_from() {
+        if !std::fs::symlink_metadata(&old).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        if old.file_name() == Some(std::ffi::OsStr::new("stage"))
+            && let Err(why) = refuse_held_stage(&old)
+        {
+            println!("    kept {}: {why}", old.display());
+            continue;
+        }
+        match std::fs::remove_dir_all(&old) {
+            Ok(()) => println!(
+                "    removed {}: the build's folders are in {} now, out of fseventsd's stream",
+                old.display(),
+                cache.quiet().display()
+            ),
+            Err(e) => println!("    kept {}: it could not be removed ({e})", old.display()),
+        }
+    }
 }
 
 /// Refuse to clear `stage` while the shipped binary an earlier build started there never
@@ -1088,7 +1106,7 @@ fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Opti
     // note at the file's head).
     let home = std::env::var_os("HOME").ok_or("release build requires HOME")?;
     let compat_shim = if target.is_some() {
-        Some(release_rustup_shim_dir(&home)?)
+        Some(release_rustup_shim_dir()?)
     } else {
         None
     };
@@ -1190,7 +1208,7 @@ fn wait_with_peak(
 fn require_rustup_target(triple: &str) -> Result<(), String> {
     let home = std::env::var_os("HOME").ok_or("compat target probe requires HOME")?;
     let rustup_home = release_rustup_home(&home)?;
-    let shim = release_rustup_shim_dir(&home)?;
+    let shim = release_rustup_shim_dir()?;
     let rustup = shim.join("rustup");
     let out = command(&rustup)
         .env_clear()
@@ -1225,7 +1243,7 @@ fn require_rustup_target(triple: &str) -> Result<(), String> {
 /// No rustup shim, or a stable `rustc` that does not answer `-vV`.
 pub(crate) fn stable_rustc_version() -> Result<String, String> {
     let home = std::env::var_os("HOME").ok_or("the stable compiler probe requires HOME")?;
-    let shim = release_rustup_shim_dir(&home)?;
+    let shim = release_rustup_shim_dir()?;
     let out = checked_output(
         command(shim.join("rustc"))
             .env_clear()
@@ -2532,57 +2550,51 @@ mod tests {
         }
     }
 
+    /// THE COMPAT SLICE RUNS FROM THE ROW'S RUSTUP'S OWN DIRECTORY: the `rustup` row's
+    /// answer (its stamped copy, beside its proxies) is the shim directory, canonical, and
+    /// the build's PATH is it then the system's. No other directory stands in for it.
+    /// NEGATIVE CONTROL: the same directory without its `cargo` is refused, not replaced.
     #[test]
-    fn rustup_shim_resolver_prefers_standard_and_builds_a_closed_path() {
+    fn rustup_shim_resolver_takes_the_rows_rustups_directory_and_builds_a_closed_path() {
         let scratch = PrivateSliceDir::create().unwrap();
-        let home = scratch.0.join("home");
-        let standard = home.join(".cargo/bin");
-        let fallback = scratch.0.join("fallback/bin");
-        create_test_rustup_shims(&standard);
-        create_test_rustup_shims(&fallback);
+        let bin = scratch.0.join("tooling.noindex/rustup-1.29.2/bin");
+        create_test_rustup_shims(&bin);
+        let alias = scratch.0.join("alias");
+        symlink(scratch.0.join("tooling.noindex"), &alias).unwrap();
 
-        let resolved =
-            resolve_release_rustup_shim_dir(&home, &fallback, current_release_uid().unwrap())
-                .unwrap();
-        assert_eq!(resolved, standard.canonicalize().unwrap());
+        let resolved = resolve_release_rustup_shim_dir(
+            &alias.join("rustup-1.29.2/bin/rustup"),
+            current_release_uid().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved, bin.canonicalize().unwrap());
         assert_eq!(
             release_tool_path(&resolved).unwrap(),
             std::ffi::OsString::from(format!("{}:{RELEASE_SYSTEM_PATH}", resolved.display()))
         );
+
+        std::fs::remove_file(bin.join("cargo")).unwrap();
+        let error =
+            resolve_release_rustup_shim_dir(&bin.join("rustup"), current_release_uid().unwrap())
+                .unwrap_err();
+        assert!(error.contains("inspect release cargo shim"), "{error}");
+        let bare = std::path::Path::new("rustup");
+        assert!(
+            resolve_release_rustup_shim_dir(bare, current_release_uid().unwrap())
+                .unwrap_err()
+                .contains("names no directory")
+        );
     }
 
     #[test]
-    fn rustup_shim_resolver_canonicalizes_the_homebrew_fallback() {
+    fn rustup_shim_resolver_refuses_an_unsafe_directory() {
         let scratch = PrivateSliceDir::create().unwrap();
-        let home = scratch.0.join("home");
-        let cellar = scratch.0.join("Cellar/rustup/1.0");
-        let opt = scratch.0.join("opt");
-        std::fs::create_dir(&home).unwrap();
-        std::fs::create_dir(&opt).unwrap();
-        create_test_rustup_shims(&cellar.join("bin"));
-        symlink(&cellar, opt.join("rustup")).unwrap();
-
-        let resolved = resolve_release_rustup_shim_dir(
-            &home,
-            &opt.join("rustup/bin"),
-            current_release_uid().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(resolved, cellar.join("bin").canonicalize().unwrap());
-    }
-
-    #[test]
-    fn rustup_shim_resolver_refuses_an_unsafe_standard_instead_of_falling_back() {
-        let scratch = PrivateSliceDir::create().unwrap();
-        let home = scratch.0.join("home");
-        let standard = home.join(".cargo/bin");
-        let fallback = scratch.0.join("fallback/bin");
-        create_test_rustup_shims(&standard);
-        create_test_rustup_shims(&fallback);
-        std::fs::set_permissions(&standard, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let bin = scratch.0.join("bin");
+        create_test_rustup_shims(&bin);
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o770)).unwrap();
 
         let error =
-            resolve_release_rustup_shim_dir(&home, &fallback, current_release_uid().unwrap())
+            resolve_release_rustup_shim_dir(&bin.join("rustup"), current_release_uid().unwrap())
                 .unwrap_err();
         assert!(error.contains("group/other-writable"), "{error}");
     }
@@ -2590,16 +2602,13 @@ mod tests {
     #[test]
     fn rustup_shim_resolver_requires_owned_real_executables() {
         let scratch = PrivateSliceDir::create().unwrap();
-        let home = scratch.0.join("home");
-        let standard = home.join(".cargo/bin");
-        let fallback = scratch.0.join("fallback/bin");
-        create_test_rustup_shims(&standard);
-        create_test_rustup_shims(&fallback);
-        std::fs::remove_file(standard.join("cargo")).unwrap();
-        symlink("rustup", standard.join("cargo")).unwrap();
+        let bin = scratch.0.join("bin");
+        create_test_rustup_shims(&bin);
+        std::fs::remove_file(bin.join("cargo")).unwrap();
+        symlink("rustup", bin.join("cargo")).unwrap();
 
         let error =
-            resolve_release_rustup_shim_dir(&home, &fallback, current_release_uid().unwrap())
+            resolve_release_rustup_shim_dir(&bin.join("rustup"), current_release_uid().unwrap())
                 .unwrap_err();
         assert!(error.contains("not a real regular file"), "{error}");
     }

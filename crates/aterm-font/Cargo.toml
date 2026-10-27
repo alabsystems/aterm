@@ -29,7 +29,7 @@
 
 [package]
 name = "aterm-font"
-description = "aterm's font reader, shaper and hinter: the sfnt/TTC directory, cmap, glyf/gvar and CFF/CFF2 outlines, metrics and variations (fvar/avar/HVAR/VVAR/MVAR), OS/2, name, kern, COLR/CPAL, sbix and CBDT bitmaps, GSUB/GDEF, a GSUB text shaper and FreeType's automatic hinter. Derived from ttf-parser 0.25.1 (MIT OR Apache-2.0), rustybuzz 0.20.1 (MIT) and skrifa 0.46.2 (MIT OR Apache-2.0)."
+description = "aterm's font reader, shaper and hinter: the sfnt/TTC directory, cmap, glyf/gvar and CFF/CFF2 outlines, metrics and variations (fvar/avar/HVAR/VVAR/MVAR), OS/2, name, kern, COLR/CPAL, sbix and CBDT bitmaps, GSUB/GPOS/GDEF, a GSUB/GPOS text shaper and FreeType's automatic hinter. Derived from ttf-parser 0.25.1 (MIT OR Apache-2.0), rustybuzz 0.20.1 (MIT) and skrifa 0.46.2 (MIT OR Apache-2.0)."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

@@ -189,6 +189,37 @@ pub struct GlowConfig {
     pub classic_mono: bool,
 }
 
+impl GlowConfig {
+    /// A config with every field set, for a test that needs one whole: it changes the fields it
+    /// is about by struct update, so a field a later phase adds gets its value here and no test
+    /// literal has to name every field (the trail-diff closure's tests among them, §15.0.6).
+    #[cfg(test)]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn sample_for_test() -> Self {
+        Self {
+            enabled: true,
+            style: GlowStyle::RainbowKitty,
+            color: 0x0012_3456,
+            accent: 0x0065_4321,
+            duration: Duration::from_millis(260),
+            length: 24,
+            intensity: 0.7,
+            audible: true,
+            radius: 0.6,
+            ring: true,
+            dark_theme: true,
+            theme_fg: 0x00DD_DDDD,
+            theme_bg: 0x0011_1111,
+            beam: true,
+            head_dx: 0.5,
+            ribbon_tall: true,
+            ribbon_flat: false,
+            classic_mono: false,
+        }
+    }
+}
+
 /// Default glow crown radius in cells.
 pub const GLOW_RADIUS_DEFAULT: f32 = 0.6;
 

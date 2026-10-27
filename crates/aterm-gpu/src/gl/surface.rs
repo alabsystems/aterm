@@ -257,13 +257,7 @@ impl GlWindowSurface {
         let (w, h) = (width.max(1), height.max(1));
         let composited = match (native, ws) {
             (NativeWindow::X11 { .. }, WindowSystem::X11 { display, screen }) => {
-                #[cfg(not(wgpu_arm))]
                 let composited = super::glx::composited(display as *mut c_void, screen);
-                #[cfg(wgpu_arm)]
-                let composited = {
-                    let _ = (display, screen);
-                    false
-                };
                 Some(composited)
             }
             _ => None,
@@ -689,13 +683,7 @@ pub(crate) fn readback_wanted_on(dev: &GlDevice) -> bool {
     else {
         return false;
     };
-    #[cfg(not(wgpu_arm))]
     let composited = super::glx::composited(display as *mut c_void, screen);
-    #[cfg(wgpu_arm)]
-    let composited = {
-        let _ = (display, screen);
-        false
-    };
     readback_wanted(glx.server_vendor(), composited, post_override().as_deref())
 }
 

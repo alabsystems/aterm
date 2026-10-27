@@ -126,7 +126,11 @@ impl Replica {
         if bootstrap.trust() != self.trust {
             return Err(Error::new("table repair trust changed"));
         }
+        #[cfg(test)]
+        tests::session_boundary(0);
         let session = Session::open(&bootstrap)?;
+        #[cfg(test)]
+        tests::session_boundary(1);
         if session.actor() != self.actor {
             return Err(Error::new("table repair local identity changed"));
         }
@@ -211,6 +215,14 @@ impl Replica {
             project = "aterm_db::replica::tests::repair_transition"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbTableRepair",
+            action = "DamagedNeighbor",
+            project = "aterm_db::replica::tests::repair_transition"
+        )
+    )]
     pub(crate) fn exchange(
         &self,
         stream: &mut (impl Read + Write),
@@ -256,22 +268,50 @@ impl Round<'_> {
             Store::open(session, path, *scope)
         }
     }
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbRepairPolicy",
+            action = "Attempt",
+            project = "aterm_db::replica::tests::policy::policy_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbRepairPolicy",
+            action = "Retry",
+            project = "aterm_db::replica::tests::policy::policy_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbRepairPolicy",
+            action = "Restore",
+            project = "aterm_db::replica::tests::policy::policy_transition"
+        )
+    )]
     fn local<T>(&self, peer: Actor, run: impl FnOnce(&Session<'_>) -> Result<T>) -> Result<T> {
-        if let Some((directory, config)) = &self.commons {
-            let policy = crate::catalog::policy::Policy::read(config)?;
-            if !policy.enabled
-                || Some(&policy) != self.policy.as_ref()
-                || policy
-                    .excluded
-                    .contains(&directory.catalog_scope().digest())
-            {
-                return Err(Error::new(
-                    "Commons subscription policy changed or disabled",
-                ));
-            }
-        }
         self.replica
             .observe(peer, Some(self.observation), |session| {
+                // Custody and journal replay can take time. Read local policy
+                // after opening the locked session, before admitting this batch.
+                // Config writers need not take that lock: later edits take
+                // effect at the next admission, not retroactively on this one.
+                if let Some((directory, config)) = &self.commons {
+                    let policy = crate::catalog::policy::Policy::read(config)?;
+                    if !policy.enabled
+                        || Some(&policy) != self.policy.as_ref()
+                        || policy
+                            .excluded
+                            .contains(&directory.catalog_scope().digest())
+                    {
+                        return Err(Error::new(
+                            "Commons subscription policy changed or disabled",
+                        ));
+                    }
+                }
                 if let Some((directory, _)) = &self.commons
                     && let Some(id) = self.active_table.get()
                     && !directory.permits(
@@ -789,6 +829,34 @@ fn receive_inventory<const N: usize>(
         _ => Err(Error::new("invalid table inventory state")),
     }
 }
+
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbRepairPolicy",
+        action = "NextPolicy",
+        reason = "The conformance fixture selects one of eight independent config edits before admission; Round::local observes the resulting policy but does not choose the writer's edit. policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected exercises every selection."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbRepairPolicy",
+        action = "Receiving",
+        reason = "The conformance fixture selects an outgoing or incoming batch; the shared Round::local admission does not select its caller's transfer direction. policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected exercises both directions and their retained storage."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbRepairPolicy",
+        action = "AfterOpen",
+        reason = "The conformance fixture selects whether the independent config edit runs before or after Session::open; this selector is not a production admission step. policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected exercises both boundaries, whose hook fires only at its selected boundary."
+    )
+)]
+#[doc(hidden)]
+pub fn db_repair_policy_environment() {}
 
 #[cfg(test)]
 pub(crate) mod tests;

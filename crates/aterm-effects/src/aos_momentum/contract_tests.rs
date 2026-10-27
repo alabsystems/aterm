@@ -5,8 +5,8 @@
 
 use aterm_aos::ArtifactId;
 use aterm_aos::contract::{Contract, Verdict};
-use aterm_aos::effects::EffectPort;
-use aterm_aos::replay::Run;
+use aterm_aos::effects::{EffectPort, NoEffects};
+use aterm_aos::replay::{Run, replay};
 use aterm_aos::task::{Code, EntryRefusal, StepRefusal};
 use aterm_time::Instant;
 
@@ -368,4 +368,175 @@ fn a_stamp_anchored_floor_breaks_wake_no_later_than_clear_when_the_query_lags() 
         "in the lane the stamp is the query's time"
     );
     assert_eq!(judge(&host, &by_mutant), Verdict::Pass);
+}
+
+struct ColdStillLit(PrebuiltMomentum);
+
+impl Code<MomentumSchema> for ColdStillLit {
+    fn id(&self) -> &ArtifactId {
+        self.0.id()
+    }
+
+    fn entry(&self, schema: &MomentumSchema, state: &MomentumState) -> Result<(), EntryRefusal> {
+        self.0.entry(schema, state)
+    }
+
+    fn step(
+        &self,
+        schema: &MomentumSchema,
+        state: &mut MomentumState,
+        input: &MomentumEvent,
+        port: &mut dyn EffectPort,
+    ) -> Result<MomentumObservation, StepRefusal> {
+        let mut obs = self.0.step(schema, state, input, port)?;
+        if let MomentumObservation::Frame { hot: false, fp, .. } = &mut obs {
+            *fp = 0x51;
+        }
+        Ok(obs)
+    }
+}
+
+struct MismatchedKey(PrebuiltMomentum);
+
+impl Code<MomentumSchema> for MismatchedKey {
+    fn id(&self) -> &ArtifactId {
+        self.0.id()
+    }
+
+    fn entry(&self, schema: &MomentumSchema, state: &MomentumState) -> Result<(), EntryRefusal> {
+        self.0.entry(schema, state)
+    }
+
+    fn step(
+        &self,
+        schema: &MomentumSchema,
+        state: &mut MomentumState,
+        input: &MomentumEvent,
+        port: &mut dyn EffectPort,
+    ) -> Result<MomentumObservation, StepRefusal> {
+        if matches!(input, MomentumEvent::Key { .. }) {
+            return Ok(MomentumObservation::WasReset);
+        }
+        self.0.step(schema, state, input, port)
+    }
+}
+
+#[test]
+fn replay_judged_equals_judge_over_run_across_every_law_and_refusal() {
+    let t0 = Instant::now();
+    let contract = NoStrandedLight::new();
+    let assert_same = |schema: &MomentumSchema,
+                       code: &dyn Code<MomentumSchema>,
+                       start: MomentumState,
+                       inputs: &[MomentumEvent],
+                       first: u64|
+     -> Verdict {
+        struct DynCode<'a>(&'a dyn Code<MomentumSchema>);
+        impl Code<MomentumSchema> for DynCode<'_> {
+            fn id(&self) -> &ArtifactId {
+                self.0.id()
+            }
+            fn entry(
+                &self,
+                schema: &MomentumSchema,
+                state: &MomentumState,
+            ) -> Result<(), EntryRefusal> {
+                self.0.entry(schema, state)
+            }
+            fn step(
+                &self,
+                schema: &MomentumSchema,
+                state: &mut MomentumState,
+                input: &MomentumEvent,
+                port: &mut dyn EffectPort,
+            ) -> Result<MomentumObservation, StepRefusal> {
+                self.0.step(schema, state, input, port)
+            }
+        }
+        let wrap = DynCode(code);
+        let full = replay(schema, &wrap, start, inputs, first, &mut NoEffects);
+        let expected_verdict = contract.judge(schema, inputs, &full);
+        let expected_folded = full.into_folded();
+        let (folded, verdict) =
+            contract.replay_judged(schema, &wrap, start, inputs, first, &mut NoEffects);
+        assert_eq!(verdict, expected_verdict);
+        assert_eq!(folded.state_digest, expected_folded.state_digest);
+        assert_eq!(folded.observations, expected_folded.observations);
+        assert_eq!(folded.last_cursor, expected_folded.last_cursor);
+        assert_eq!(folded.observation_chain, expected_folded.observation_chain);
+        assert_eq!(folded.refused, expected_folded.refused);
+        verdict
+    };
+
+    let host = full_cool_down(t0, false);
+    let b = &hosted(&host).boundary;
+    let schema = b.schema();
+    let inputs = b.log().expect("attached").inputs();
+    let start = || {
+        b.checkpoint()
+            .expect("attached")
+            .restore(schema, b.identity())
+            .expect("restores")
+    };
+    let shipped = PrebuiltMomentum::new(MomentumCode::Shipped, BUILD);
+    let demo = PrebuiltMomentum::new(MomentumCode::DemoStrandedSettle, BUILD);
+    assert_eq!(
+        assert_same(schema, &shipped, start(), inputs, 0),
+        Verdict::Pass
+    );
+    assert!(matches!(
+        assert_same(schema, &demo, start(), inputs, 0),
+        Verdict::Fail {
+            law: HOT_HAS_WAKE,
+            ..
+        }
+    ));
+    assert!(matches!(
+        assert_same(schema, &ColdStillLit(shipped.clone()), start(), inputs, 0),
+        Verdict::Fail {
+            law: COLD_TICK_CLEARS,
+            ..
+        }
+    ));
+    assert!(matches!(
+        assert_same(schema, &MismatchedKey(shipped.clone()), start(), inputs, 0),
+        Verdict::Fail {
+            law: RUN_MATCHES_INPUTS,
+            ..
+        }
+    ));
+    assert!(matches!(
+        assert_same(schema, &shipped, start(), inputs, u64::MAX),
+        Verdict::Fail {
+            cursor: u64::MAX,
+            law: RUN_MATCHES_INPUTS,
+            ..
+        }
+    ));
+
+    let winner = gap0();
+    let mutant = StampAnchored {
+        plan: winner,
+        id: winner.artifact(BUILD),
+    };
+    let mut lagged = attached_for_lane(t0, Sched::Plan(winner));
+    let c = cfg(false);
+    let mut seen = Vec::new();
+    let (last, cell) = burst(&mut lagged, t0, 24, &c, &mut seen);
+    let _ = run_lagged(&mut lagged, last, WINDOW_LANE, LATE, LAG, cell, &c);
+    let lb = &hosted(&lagged).boundary;
+    let ls = lb.schema();
+    let li = lb.log().expect("attached").inputs();
+    let lstart = lb
+        .checkpoint()
+        .expect("attached")
+        .restore(ls, lb.identity())
+        .expect("restores");
+    assert!(matches!(
+        assert_same(ls, &mutant, lstart, li, 0),
+        Verdict::Fail {
+            law: WAKE_NO_LATER_THAN_CLEAR,
+            ..
+        }
+    ));
 }

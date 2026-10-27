@@ -562,3 +562,43 @@ fn one_pane_recheck_cannot_clear_a_sibling_hold_gauge() {
         "the second pane's active hold keeps the per-window gauge leased"
     );
 }
+
+/// `App::presented_frame_at`, the trail dump's live present: the glass a present leaves, `None`
+/// while a synchronized update holds the frame, and an error on a window with no scripted
+/// surface.
+#[test]
+fn presented_frame_at_reads_the_glass_and_nothing_under_a_hold() {
+    use crate::scripted_redraw_fixture::{feed, glass, headless, scripted_app};
+    let wid = WindowId(0);
+    let mut app = scripted_app();
+    let t0 = Instant::now();
+    feed(&app, b"$ hello");
+    let lit = app
+        .presented_frame_at(wid, t0)
+        .expect("a scripted surface")
+        .expect("the frame presents");
+    assert_eq!(lit, glass(&mut app), "the glass the present left");
+    assert!(
+        lit.1.iter().any(|&px| px != lit.1[0]),
+        "the text reached glass"
+    );
+    feed(&app, b"\x1b[?2026h world");
+    assert_eq!(
+        app.presented_frame_at(wid, t0 + Duration::from_millis(16)),
+        Ok(None),
+        "a held frame presents nothing"
+    );
+    feed(&app, b"\x1b[?2026l");
+    let released = app
+        .presented_frame_at(wid, t0 + Duration::from_millis(32))
+        .expect("a scripted surface")
+        .expect("the released frame presents");
+    assert_ne!(released, lit, "the held write reached glass");
+    headless(&mut app, |app| {
+        assert!(
+            app.presented_frame_at(wid, t0 + Duration::from_millis(48))
+                .is_err(),
+            "no scripted surface, no frame"
+        );
+    });
+}

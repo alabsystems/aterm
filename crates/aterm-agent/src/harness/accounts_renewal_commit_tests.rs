@@ -78,6 +78,7 @@ fn commit_case(cli: Cli, case: i64) -> [bool; 7] {
         }
         write_renewal_checkpoint_for(
             cli,
+            row.vendor.region,
             "account",
             "owner@example.test",
             staging.to_str().unwrap(),

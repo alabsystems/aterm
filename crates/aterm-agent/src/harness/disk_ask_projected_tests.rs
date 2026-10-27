@@ -409,6 +409,7 @@ fn a_rise_settles_a_projected_episode_only_once_its_crossing_is_gone_or_its_answ
 /// The asked tab's own build cache, 61 GiB, for its checkout `~/aterm`.
 fn own_holder() -> Hog {
     Hog {
+        built_s_ago: None,
         path: "/Users//u/Library/Caches/aterm/cargo-build.noindex/aterm/.cargo-build".into(),
         bytes: 61 * GIB,
         bytes_partial: false,

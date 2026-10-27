@@ -14,6 +14,18 @@ const PURPOSE: &str =
     "agh: aterm's GitHub client, for reads that route each request to the right identity";
 
 const ROUTING: &[&str] = &[
+    "With no agh.toml, agh adopts the vault's tokens, with no command run: the file",
+    "  ~/.secrets/gh_access_token is profile dev, the writer for the owner its own login names and",
+    "  the first reader of every owner, and ~/.secrets/gh_access_token_alabsystems is profile",
+    "  release, the writer for alabsystems. agh learns each login once with GET /user; an",
+    "  agh.toml, even an empty one, routes instead, unless it says vault = true. When both",
+    "  files hold one token or one login, or a file holds the token or login agh recorded for",
+    "  the other, neither routes: aterm secrets sync fixes the vault.",
+    "agh auth add NAME beside the vault: NAME is not dev or release, which the vault's tokens",
+    "  are; its row joins theirs. With no agh.toml, auth add dev or release (or a vault file as",
+    "  --file) writes an agh.toml that routes alone, with no vault = true.",
+    "An agh.toml whose profiles name the vault files predates adoption: agh auth remove each,",
+    "  and the last removal makes it say vault = true, so each rotation is adopted and vouched.",
     "A read walks the owner's read chain in agh.toml, in order: a present profile is used, an",
     "  absent one falls through, an unusable one stops the chain, and anonymous sends nothing.",
     "A writer read (drafts, --include-drafts, --drafts) is exactly the owner's write profile:",

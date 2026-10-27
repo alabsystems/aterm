@@ -286,6 +286,13 @@ pub(crate) struct UpgradeView {
 }
 
 impl UpgradeView {
+    /// What writes the owner's words from here on, as a test fakes it (the ⬆️'s tests, which
+    /// drive a pane over a Unix socket).
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_writer(&mut self, writer: WordWriter) {
+        self.writer = writer;
+    }
+
     fn look_again(&mut self) {
         #[cfg(test)]
         {
@@ -426,10 +433,15 @@ impl App {
             if row.is_none() && self.upgrade_view.kept.contains(h.sid.as_str()) {
                 continue;
             }
-            let note = row.as_ref().and_then(|r| r.pause_note(now));
             let mut timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            // The top rule's ⬆️ reads the row: a move of what it says repaints the footer.
+            let arrow = |t: &crate::session_timeline::SessionTimeline| {
+                t.upgrade().map(crate::claude_footer::TopUp::of)
+            };
+            let was = arrow(&timeline);
             timeline.set_upgrade(row);
-            if timeline.set_upgrade_note(note) {
+            let arrow_moved = arrow(&timeline) != was;
+            if arrow_moved {
                 noted.push(h.local_id);
             }
         }
@@ -1075,6 +1087,15 @@ impl App {
                     ask.tab,
                     ask.word.as_str()
                 );
+                if ask.word == UpgradeWord::Now
+                    && let Some(local) =
+                        self.local_session_of(&aterm_session::SessionId::new(&ask.tab))
+                {
+                    self.show_upgrade_refusal(
+                        local,
+                        &message_reporters::agent_upgrade_refused_words(&why),
+                    );
+                }
                 let shown = self.upgrade_view.row_for(&ask.tab).cloned();
                 let agent = shown.as_ref().map(|r| r.agent).unwrap_or_default();
                 let refused = message_reporters::agent_upgrade_word_refused(

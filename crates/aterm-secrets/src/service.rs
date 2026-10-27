@@ -546,6 +546,7 @@ impl Domain {
     }
 
     /// The other domain.
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     const fn other(self) -> Self {
         match self {
             Domain::Gui => Domain::User,
@@ -697,21 +698,11 @@ pub fn in_build_dir(path: &Path, exists: &dyn Fn(&Path) -> bool) -> bool {
     false
 }
 
-/// Whether `path` is a copy that goes away.
+/// Whether `path` is a copy that goes away: on a disk image, an App Translocation copy, in a
+/// temporary directory or under a cache directory ([`aterm_toolchain::lasting::transient`], the
+/// one rule atpkg's shims and the window's subscriber mend name a program by).
 pub fn transient(path: &Path) -> bool {
-    let text = path.to_string_lossy();
-    let temp = [
-        std::env::temp_dir(),
-        PathBuf::from("/tmp"),
-        PathBuf::from("/var/tmp"),
-    ];
-    text.starts_with("/Volumes/")
-        || text.contains("/AppTranslocation/")
-        || temp
-            .iter()
-            .flat_map(|root| [root.canonicalize().ok(), Some(root.clone())])
-            .flatten()
-            .any(|root| root.parent().is_some() && path.starts_with(&root))
+    aterm_toolchain::lasting::transient(path, &aterm_toolchain::lasting::temp_roots())
 }
 
 /// Executable a job should run for `exe` ([`in_build_dir`], [`transient`]).
@@ -732,10 +723,10 @@ pub fn service_program(exe: &Path, exists: &dyn Fn(&Path) -> bool) -> crate::Res
     }
     if transient(exe) {
         return Err(Error::new(format!(
-            "{} is on a disk image, an App Translocation copy or in a temporary directory, which \
-             goes away, so a job running it would stop starting; run aterm from where it is \
-             installed (move aterm.app to /Applications), or pass --program <the aterm a \
-             lasting job should run>",
+            "{} is on a disk image, an App Translocation copy, in a temporary directory or under \
+             a cache directory, which goes away, so a job running it would stop starting; run \
+             aterm from where it is installed (move aterm.app to /Applications), or pass \
+             --program <the aterm a lasting job should run>",
             exe.display()
         )));
     }
@@ -1389,6 +1380,7 @@ fn install_launchd(
 
 /// The bundle identifier of the app `program` is the main executable of
 /// (`X.app/Contents/MacOS/<program>`, its `Contents/Info.plist`'s `CFBundleIdentifier`).
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn bundle_id_of(program: &Path) -> Option<String> {
     let macos = program.parent()?;
     let contents = macos.parent()?;
@@ -1422,6 +1414,7 @@ fn bundle_id_of(program: &Path) -> Option<String> {
 }
 
 /// The largest `Info.plist` [`bundle_id_of`] reads.
+#[cfg(any(target_os = "macos", all(test, unix)))]
 const INFO_PLIST_MOST: u64 = 256 * 1024;
 
 /// Stop and remove `job`, for this login's own `home` ([`own_home`]).

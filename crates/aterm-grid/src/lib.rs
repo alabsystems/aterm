@@ -33,9 +33,9 @@ pub(crate) mod test_counters;
 pub mod test_counters;
 
 pub use grid::Grid;
-pub use grid::ResizeLaw;
 pub use grid::scroll_convert::{scrollback_text_only, set_scrollback_text_only};
 pub use grid::{AnchorLend, LendReach};
+pub use grid::{CanonicalHandbackCarry, GridHandbackCarry, ResizeLaw};
 pub use grid::{CellDataView, HistoryLines, VisibleRowView};
 pub use grid::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,

@@ -214,7 +214,8 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
             Family::ApiOutage,
             Family::LongHold,
             Family::FleetUnreadable,
-            Family::HugeDir
+            Family::HugeDir,
+            Family::ServiceMemory
         ]
     );
     assert_eq!(Family::Ai.stem(), "ai");

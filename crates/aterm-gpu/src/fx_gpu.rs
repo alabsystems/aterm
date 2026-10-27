@@ -225,19 +225,13 @@ impl FxRampCost {
 /// The arm a frame draws on, as the ramps' route costs were measured
 /// ([`ramp_cost`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RampArm<'a> {
+pub(crate) enum RampArm {
     /// The native Metal arm.
     #[cfg_attr(
         not(any(test, target_os = "macos")),
         expect(dead_code, reason = "only a macOS build arms Metal")
     )]
     Metal,
-    /// The wgpu arm on the named backend (`GpuContext::backend`).
-    #[cfg_attr(
-        not(any(test, wgpu_arm)),
-        expect(dead_code, reason = "only a build with the wgpu arm draws on it")
-    )]
-    Wgpu(&'a str),
     /// The GL arm (Linux and WebGL2).
     #[cfg_attr(
         not(any(test, gl_arm)),
@@ -251,10 +245,6 @@ pub(crate) enum RampArm<'a> {
     )]
     D3d11,
     /// No GPU arm armed.
-    #[cfg_attr(
-        all(wgpu_arm, not(test)),
-        expect(dead_code, reason = "a build with the wgpu arm always has it")
-    )]
     Unarmed,
 }
 
@@ -271,31 +261,16 @@ pub(crate) const METAL_RAMP_COST: FxRampCost = FxRampCost {
     art: 780,
 };
 
-/// The wgpu arm's measured costs on its Metal backend ([`FxRampCost`]), the
-/// macOS oracle, on the same Mac16,8: each lit row 11.9 ± 1.1 ns less in an
-/// fx stream the ramps open than as a glow instance and 13.8 ± 1.2 ns less
-/// beside art; opening the stream fitted at −11.8 ± 8.6 µs, which the runs
-/// cannot tell from nothing and which is held at nothing, so ramps ride it
-/// from one lit row.
-pub(crate) const WGPU_METAL_RAMP_COST: FxRampCost = FxRampCost {
-    open: 0,
-    light: -11_850,
-    art: -13_760,
-};
-
 /// The measured costs of the arm a frame draws on ([`FxRampCost`]), or
 /// `None` where no cost was measured: there the frame draws every ramp as the
 /// glow instances its lit rows stand for, the GPU work a stream with no ramp
 /// draws, so no unmeasured arm can lose to it.
 #[must_use]
 #[inline]
-pub(crate) const fn ramp_cost(arm: RampArm<'_>) -> Option<FxRampCost> {
+pub(crate) const fn ramp_cost(arm: RampArm) -> Option<FxRampCost> {
     match arm {
         RampArm::Metal => Some(METAL_RAMP_COST),
-        RampArm::Wgpu(backend) if matches!(backend.as_bytes(), b"Metal") => {
-            Some(WGPU_METAL_RAMP_COST)
-        }
-        RampArm::Wgpu(_) | RampArm::Gl | RampArm::D3d11 | RampArm::Unarmed => None,
+        RampArm::Gl | RampArm::D3d11 | RampArm::Unarmed => None,
     }
 }
 
@@ -2007,9 +1982,8 @@ mod tests {
     /// glow instances their lit rows spare, both streams' together, pay for
     /// opening it; in an fx stream the frame draws its art in anyway they
     /// ride only where a lit row costs less there than its glow instance,
-    /// which on Metal none does; on the wgpu oracle's Metal backend they ride
-    /// from one lit row; a frame with no lit ramp row opens nothing; and an
-    /// arm no cost was measured on never opens it.
+    /// which on Metal none does; a frame with no lit ramp row opens nothing;
+    /// and an arm no cost was measured on never opens it.
     #[test]
     fn ramps_open_the_fx_stream_only_where_their_lit_rows_pay() {
         let lit = |lit: usize| GlowRamps {
@@ -2045,27 +2019,7 @@ mod tests {
             );
         }
         assert!(!ramps_open_fx(true, [&lit(0), &lit(0)], Some(cheaper)));
-        // The wgpu oracle's Metal backend was measured too: there a lit row
-        // costs less in fx than as its glow instance, beside art or not, so
-        // ramps ride it from one lit row.
-        let oracle = ramp_cost(RampArm::Wgpu("Metal")).expect("the oracle's costs were measured");
-        assert_eq!(oracle, WGPU_METAL_RAMP_COST);
-        for art in [false, true] {
-            assert!(!ramps_open_fx(art, [&lit(0), &lit(0)], Some(oracle)));
-            for (under, add) in [(1, 0), (0, 1), (even, even)] {
-                let streams = [&lit(under), &lit(add)];
-                assert!(ramps_open_fx(art, streams, Some(oracle)), "{under} + {add}");
-            }
-        }
-        for arm in [
-            RampArm::Gl,
-            RampArm::D3d11,
-            RampArm::Unarmed,
-            RampArm::Wgpu("Dx12"),
-            RampArm::Wgpu("Vulkan"),
-            RampArm::Wgpu("Gl"),
-            RampArm::Wgpu("metal"),
-        ] {
+        for arm in [RampArm::Gl, RampArm::D3d11, RampArm::Unarmed] {
             assert_eq!(ramp_cost(arm), None, "{arm:?}: no cost was measured");
             for n in [1, even + 1, 10 * even] {
                 for art in [false, true] {

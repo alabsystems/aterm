@@ -18,7 +18,12 @@ impl TerminalHandler<'_> {
         clippy::too_many_lines,
         reason = "match on ~30 DEC private mode numbers per spec"
     )]
-    pub(super) fn handle_dec_mode(&mut self, params: &[u16], set: bool) {
+    pub(super) fn handle_dec_mode(
+        &mut self,
+        cap: &super::response_capability::ResponseCapability,
+        params: &[u16],
+        set: bool,
+    ) {
         for &param in params {
             match param {
                 1 => {
@@ -98,21 +103,21 @@ impl TerminalHandler<'_> {
                 }
                 47 => {
                     if set {
-                        self.enter_alternate_screen_raw();
+                        self.enter_alternate_screen_raw(cap);
                     } else {
                         self.exit_alternate_screen_raw();
                     }
                 }
                 1047 => {
                     if set {
-                        self.enter_alternate_screen_raw();
+                        self.enter_alternate_screen_raw(cap);
                     } else {
                         self.exit_alternate_screen_1047();
                     }
                 }
                 1049 => {
                     if set {
-                        self.enter_alternate_screen();
+                        self.enter_alternate_screen(cap);
                     } else {
                         let dead = self.take_dead_alt_screen();
                         self.exit_alternate_screen();
@@ -220,12 +225,12 @@ impl TerminalHandler<'_> {
                     if set && !was && self.hold_size_report() {
                         self.transient.size_report_held = true;
                     } else if set && !was {
-                        super::state_accessors::push_in_band_size_report(
-                            self.transient,
+                        let report = super::state_accessors::in_band_size_report(
                             self.grid.rows(),
                             self.grid.cols(),
                             self.iterm2.host_cell_px(),
                         );
+                        self.send_report(cap, report.as_bytes());
                     }
                 }
                 1243 => {
@@ -299,7 +304,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::terminal_modes_conformance::project_modes"
         )
     )]
-    fn enter_alternate_screen_raw(&mut self) {
+    fn enter_alternate_screen_raw(&mut self, cap: &super::response_capability::ResponseCapability) {
         if self.modes.alternate_screen {
             return;
         }
@@ -329,7 +334,7 @@ impl TerminalHandler<'_> {
         self.modes.alternate_screen = true;
         self.note_screen_replaced();
         self.grid.invalidate_host_coordinates_for_swap();
-        self.send_held_size_report();
+        self.send_held_size_report(cap);
     }
 
     /// Point `grid`'s BCE template at the current pen's background. A buffer
@@ -401,6 +406,7 @@ impl TerminalHandler<'_> {
         self.flatten_restored_display_offset();
         self.grid.restore_tab_stops(&tab_stops, tab_suppressed);
         self.modes.alternate_screen = false;
+        self.transient.alt_screen_resync_screen = None;
         self.note_screen_replaced();
         self.grid.invalidate_host_coordinates_for_swap();
         self.holder_fence.note_alt_exit();
@@ -446,7 +452,7 @@ impl TerminalHandler<'_> {
             project = "aterm_core::terminal::project_altscreen"
         )
     )]
-    fn enter_alternate_screen(&mut self) {
+    fn enter_alternate_screen(&mut self, cap: &super::response_capability::ResponseCapability) {
         if self.modes.alternate_screen {
             self.cursor_save.alt = Some(self.snapshot_cursor_state());
             self.grid.set_cursor_template(
@@ -489,7 +495,7 @@ impl TerminalHandler<'_> {
         self.note_screen_replaced();
         self.grid.invalidate_host_coordinates_for_swap();
         self.holder_fence.note_alt_cleared();
-        self.send_held_size_report();
+        self.send_held_size_report(cap);
     }
 
     /// Exit the alternate screen for mode 1049, restoring the saved cursor.
@@ -532,6 +538,7 @@ impl TerminalHandler<'_> {
         let saved = self.cursor_save.main;
         self.restore_cursor_snapshot(saved);
         self.modes.alternate_screen = false;
+        self.transient.alt_screen_resync_screen = None;
         self.note_screen_replaced();
         self.grid.invalidate_host_coordinates_for_swap();
         self.holder_fence.note_alt_exit();
@@ -616,14 +623,14 @@ impl TerminalHandler<'_> {
     /// ([`Self::hold_size_report`]) goes out now, at the size the screen has, while
     /// the mode is still on.
     #[inline]
-    fn send_held_size_report(&mut self) {
+    fn send_held_size_report(&mut self, cap: &super::response_capability::ResponseCapability) {
         if std::mem::take(&mut self.transient.size_report_held) && self.modes.in_band_size_reports {
-            super::state_accessors::push_in_band_size_report(
-                self.transient,
+            let report = super::state_accessors::in_band_size_report(
                 self.grid.rows(),
                 self.grid.cols(),
                 self.iterm2.host_cell_px(),
             );
+            self.send_report(cap, report.as_bytes());
         }
     }
 
@@ -1499,17 +1506,25 @@ mod win32_input_mode_tests {
 
 impl super::Terminal {
     /// Force the primary screen: the host's recovery for an alternate screen a killed app left up.
+    #[inline]
     pub fn leave_alternate_screen(&mut self) -> bool {
+        self.leave_alternate_screen_at(super::ClockReading::now())
+    }
+
+    /// Force the primary screen at a caller-supplied clock reading ([`Self::leave_alternate_screen`]).
+    pub fn leave_alternate_screen_at(&mut self, clock: super::ClockReading) -> bool {
         if !self.modes.alternate_screen {
             return false;
         }
         self.transient.host_leave_alternate_screen = true;
-        self.process(b"");
+        self.process_at(b"", clock);
         debug_assert!(
             !self.modes.alternate_screen,
             "the batch takes the request first thing, and the handler refuses only a \
              screen that is not alternate"
         );
+        self.host_journal
+            .push_at(super::HostOp::LeaveAlternateScreen, clock);
         true
     }
 }
@@ -2213,20 +2228,85 @@ mod in_band_size_tests {
         );
     }
 
+    /// A cell-box storm against a host that does not drain: a host call's report passes no
+    /// rate limit, so the cap alone bounds what is owed, and the storm reaches it.
     #[test]
-    fn mode_2048_toggle_flood_is_capped() {
+    fn a_cell_box_storm_stops_at_the_response_cap() {
         let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?2048h");
+        let _ = term.take_response();
+        let one = b"\x1b[48;24;80;480;880t".len();
+        for _ in 0..70_000 {
+            term.set_cell_pixel_size(10, 20);
+            term.set_cell_pixel_size(11, 20);
+        }
+        let owed = term.take_response().unwrap_or_default().len();
+        let cap = crate::terminal::MAX_RESPONSE_BUFFER_SIZE;
+        assert!(owed <= cap, "{owed} owed past the {cap}-byte cap");
+        assert!(
+            owed > cap - one,
+            "the storm ({} B) reaches the cap: {owed}",
+            140_000 * one
+        );
+    }
+
+    /// A toggle flood draws on the bucket every program reply draws on: at one clock
+    /// reading the flood and the queries after it share one burst.
+    #[test]
+    fn mode_2048_toggle_flood_spends_the_reply_rate_limit() {
+        let mut term = Terminal::new(24, 80);
+        let clock = crate::terminal::ClockReading::now();
         let mut input = Vec::new();
         for _ in 0..200_000 {
             input.extend_from_slice(b"\x1b[?2048l\x1b[?2048h");
         }
-        term.process(&input);
-        let resp = term.take_response().unwrap_or_default();
+        term.process_at(&input, clock);
+        let flood = term.take_response().unwrap_or_default();
+        term.process_at(&b"\x1b[6n".repeat(100), clock);
+        let replies = term.take_response().unwrap_or_default();
+        let burst = crate::terminal::response_rate_limiter::DEFAULT_BURST_BYTES;
+        assert!(!flood.is_empty(), "the flood's first reports go out");
         assert!(
-            resp.len() <= crate::terminal::MAX_RESPONSE_BUFFER_SIZE,
-            "toggle flood must stay within MAX_RESPONSE_BUFFER_SIZE, got {}",
-            resp.len()
+            (flood.len() + replies.len()) as u64 <= burst,
+            "the flood ({}) and the queries after it ({}) share the {burst}-byte burst",
+            flood.len(),
+            replies.len()
         );
+    }
+
+    /// A policy that drops every program reply drops the report the enable provokes,
+    /// while the mode stays on and a host resize still reports.
+    #[test]
+    fn a_policy_that_drops_replies_drops_the_enable_report() {
+        let mut term = Terminal::new(24, 80);
+        term.apply_policy_engine(silencing_policy());
+        term.process(b"\x1b[6n");
+        assert!(
+            term.take_response().is_none(),
+            "PRECONDITION: the policy drops a query reply"
+        );
+        term.process(b"\x1b[?2048h");
+        assert!(
+            term.take_response().is_none(),
+            "the enable report is dropped"
+        );
+        assert!(term.modes().in_band_size_reports, "the mode is on");
+        term.resize(30, 100);
+        assert_eq!(
+            term.take_reports().unwrap_or_default(),
+            b"\x1b[48;30;100;0;0t",
+            "a host resize is not a program reply"
+        );
+    }
+
+    fn silencing_policy() -> aterm_policy::engine::PolicyEngine {
+        use aterm_policy::{OriginTag, Response};
+        aterm_policy::engine::PolicyEngine::new(crate::terminal::policy_bridge::one_rule_policy(
+            "response any",
+            Response::Drop,
+            OriginTag::NetworkUntrusted,
+            Response::Execute,
+        ))
     }
 
     #[test]
@@ -2302,6 +2382,31 @@ mod in_band_size_tests {
             term.process(enter);
             assert!(term.take_response().is_none(), "{enter:?}: sent once");
         }
+    }
+
+    /// The held report is still the enable's reply when the alternate screen releases it.
+    /// Negative control: with no policy the same tab holds the enable and the entry releases it.
+    #[test]
+    fn a_policy_that_drops_replies_drops_the_held_report() {
+        let mut open = console_host_tab();
+        open.process(b"\x1b[?2048h");
+        assert!(open.take_response().is_none(), "PRECONDITION: held");
+        open.process(b"\x1b[?1049h");
+        assert_eq!(
+            open.take_response().unwrap_or_default(),
+            b"\x1b[48;30;100;0;0t",
+            "NEG: no policy releases it"
+        );
+
+        let mut term = console_host_tab();
+        term.apply_policy_engine(silencing_policy());
+        term.process(b"\x1b[?2048h");
+        term.process(b"\x1b[?1049h");
+        assert!(
+            term.take_response().is_none(),
+            "the released report is dropped"
+        );
+        assert!(term.modes().in_band_size_reports, "the mode is on");
     }
 
     #[test]

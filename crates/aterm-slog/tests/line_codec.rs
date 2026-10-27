@@ -15,6 +15,11 @@ use aterm_slog::{
     encode_with_table,
 };
 
+/// Whether `run` is listed in `list` in order and together, wherever later words were appended.
+fn listed_together(list: &[&str], run: &[&str]) -> bool {
+    list.windows(run.len()).any(|w| w == run)
+}
+
 fn rec(op: Op, node: Node, k: Kind, f: Fields) -> Rec {
     Rec {
         seq: 412,
@@ -778,9 +783,8 @@ fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
         Some(Key::Change),
         "6F-5's `change=` follows `closer=`"
     );
-    assert_eq!(
-        &WHY_WORDS[WHY_WORDS.len() - 6..WHY_WORDS.len() - 4],
-        ["mail", "burst"],
+    assert!(
+        listed_together(WHY_WORDS, &["mail", "burst"]),
         "6F-6's two follow"
     );
     for w in ["spawning", "alive", "exited", "closed"] {
@@ -890,13 +894,11 @@ fn phase_6_ring_row_keys_are_appended_at_their_tiers() {
     assert_eq!(at(Key::Net), Some(first + rows.len()), "6F-7's keys follow");
     assert_eq!(CHANGE_WORDS, ["add", "drop"]);
     assert!(Fields::new().word(Key::Change, "rename").is_err(), "closed");
-    assert_eq!(
-        &WHY_WORDS[WHY_WORDS.len() - 4..WHY_WORDS.len() - 2],
-        ["not-carried", "log-replaced"]
-    );
-    assert_eq!(
-        &WHY_WORDS[WHY_WORDS.len() - 2..],
-        ["signin", "install"],
+    assert!(
+        listed_together(
+            WHY_WORDS,
+            &["not-carried", "log-replaced", "signin", "install"]
+        ),
         "a worker launcher's two refusals (task `why=`) follow"
     );
 

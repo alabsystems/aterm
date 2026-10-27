@@ -24,14 +24,14 @@ fn the_immutable_uri_encodes_every_byte_but_the_plain_ones() {
 fn no_database_file_is_no_answer() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
     let db = dir.path().join("x.db");
-    let asked = |_: &str| -> Option<()> { panic!("the reader is never asked") };
-    assert_eq!(read(&db, asked), Err(Unread::Missing));
+    let asked = |_: &[u8], _: Option<&[u8]>| -> Option<()> { panic!("the reader is never asked") };
+    assert_eq!(read_bytes(&db, 1024, asked), Err(Unread::Missing));
     #[cfg(unix)]
     {
         let real = dir.path().join("real.db");
         std::fs::write(&real, b"SQLite format 3\0").expect("real");
         std::os::unix::fs::symlink(&real, &db).expect("link");
-        assert_eq!(read(&db, asked), Err(Unread::Missing), "a link");
+        assert_eq!(read_bytes(&db, 1024, asked), Err(Unread::Missing), "a link");
     }
 }
 
@@ -42,11 +42,15 @@ fn a_journal_beside_the_database_is_a_write_under_way() {
     std::fs::write(&db, b"SQLite format 3\0").expect("db");
     std::fs::write(dir.path().join("x.db-journal"), b"\xd9\xd5\x05\xf9").expect("journal");
     assert_eq!(
-        read(&db, |_| -> Option<()> { panic!("never asked") }),
+        read_bytes(&db, 1024, |_, _| -> Option<()> { panic!("never asked") }),
         Err(Unread::Writing)
     );
     std::fs::write(dir.path().join("x.db-journal"), b"").expect("emptied");
-    assert_eq!(read(&db, |_| Some(7)), Ok(7), "an empty journal");
+    assert_eq!(
+        read_bytes(&db, 1024, |_, _| Some(7)),
+        Ok(7),
+        "an empty journal"
+    );
 }
 
 #[test]
@@ -54,9 +58,9 @@ fn a_file_that_changes_during_the_read_is_no_answer() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
     let db = dir.path().join("x.db");
     std::fs::write(&db, b"SQLite format 3\0").expect("db");
-    assert_eq!(read(&db, |_| Some(1)), Ok(1), "unchanged");
+    assert_eq!(read_bytes(&db, 1024, |_, _| Some(1)), Ok(1), "unchanged");
     let grow = |p: PathBuf| {
-        move |_: &str| {
+        move |_: &[u8], _: Option<&[u8]>| {
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -66,59 +70,30 @@ fn a_file_that_changes_during_the_read_is_no_answer() {
             Some(())
         }
     };
-    assert_eq!(read(&db, grow(db.clone())), Err(Unread::Changed), "the db");
+    assert_eq!(
+        read_bytes(&db, 1024, grow(db.clone())),
+        Err(Unread::Changed),
+        "the db"
+    );
     let wal = dir.path().join("x.db-wal");
-    assert_eq!(read(&db, grow(wal.clone())), Err(Unread::Changed), "a -wal");
+    assert_eq!(
+        read_bytes(&db, 1024, grow(wal.clone())),
+        Err(Unread::Changed),
+        "a -wal"
+    );
     std::fs::remove_file(&wal).expect("no wal");
     let journal = dir.path().join("x.db-journal");
     assert_eq!(
-        read(&db, grow(journal.clone())),
+        read_bytes(&db, 1024, grow(journal.clone())),
         Err(Unread::Writing),
         "a journal"
     );
     std::fs::remove_file(&journal).expect("no journal");
-    assert_eq!(read(&db, |_| None::<()>), Err(Unread::Failed), "no answer");
-}
-
-#[test]
-fn the_reader_gets_the_file_itself_or_a_private_copy() {
-    let dir = aterm_tempfile::tempdir().expect("scratch");
-    let db = dir.path().join("x.db");
-    std::fs::write(&db, b"main").expect("db");
-    assert_eq!(read(&db, |t| Some(t.to_owned())), Ok(immutable_uri(&db)));
-    std::fs::write(dir.path().join("x.db-wal"), b"frames").expect("wal");
-    std::fs::write(dir.path().join("x.db-shm"), b"index").expect("shm");
-    let mut copied = None;
-    let seen = read(&db, |t| {
-        let copy = PathBuf::from(t);
-        let mut shm = copy.as_os_str().to_os_string();
-        shm.push("-shm");
-        copied = Some(copy.clone());
-        Some((
-            std::fs::read(&copy).ok()?,
-            std::fs::read(beside(&copy, "-wal")).ok()?,
-            Path::new(&shm).exists(),
-        ))
-    });
-    assert_eq!(seen, Ok((b"main".to_vec(), b"frames".to_vec(), false)));
-    let copied = copied.expect("asked");
-    assert!(!copied.starts_with(dir.path()), "{copied:?}");
-    assert!(!copied.exists(), "the private copy is gone");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = read(&db, |t| {
-            let private = Path::new(t).parent()?.metadata().ok()?;
-            assert_eq!(private.permissions().mode() & 0o777, 0o700);
-            Some(())
-        });
-    }
-    let mut names: Vec<String> = std::fs::read_dir(dir.path())
-        .expect("list")
-        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    assert_eq!(names, ["x.db", "x.db-shm", "x.db-wal"], "nothing beside it");
+    assert_eq!(
+        read_bytes(&db, 1024, |_, _| None::<()>),
+        Err(Unread::Failed),
+        "no answer"
+    );
 }
 
 #[test]
@@ -147,9 +122,20 @@ fn read_bytes_slurps_main_and_wal_in_memory_without_links_or_copies() {
         "an empty wal is None"
     );
     std::fs::write(&wal, b"wal-bytes").expect("wal");
+    std::fs::write(beside(&db, "-shm"), b"index").expect("shm");
     assert_eq!(
         read_bytes(&db, 1024, |m, w| Some((m.to_vec(), w.map(<[u8]>::to_vec)))),
         Ok((b"main-bytes".to_vec(), Some(b"wal-bytes".to_vec())))
+    );
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("list")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["mem.db", "mem.db-shm", "mem.db-wal"],
+        "nothing beside it"
     );
     let db_mut = db.clone();
     assert_eq!(
@@ -159,6 +145,36 @@ fn read_bytes_slurps_main_and_wal_in_memory_without_links_or_copies() {
         }),
         Err(Unread::Changed)
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::fs::remove_file(&wal).expect("remove wal");
+        let real_wal = dir.path().join("real-wal");
+        std::fs::write(&real_wal, b"linked-wal").expect("real wal");
+        std::os::unix::fs::symlink(&real_wal, &wal).expect("symlink wal");
+        assert_eq!(
+            read_bytes(&db, 1024, |_, _| Some(())),
+            Err(Unread::Failed),
+            "symlinked -wal refused in memory"
+        );
+        std::fs::remove_file(&wal).expect("remove symlink wal");
+
+        let fifo_c = std::ffi::CString::new(wal.as_os_str().as_bytes()).expect("cstr");
+        // SAFETY: `fifo_c` is a valid NUL-terminated path in the test's private tempdir.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let opened = open_no_link(&wal).expect("O_NONBLOCK opens FIFO without blocking");
+        assert!(
+            !opened.metadata().expect("fifo metadata").is_file(),
+            "FIFO is non-regular so TOCTOU swap fails identity check without hanging"
+        );
+        drop(opened);
+        assert_eq!(
+            read_bytes(&db, 1024, |_, _| Some(())),
+            Err(Unread::Failed),
+            "FIFO -wal refused without hanging"
+        );
+        std::fs::remove_file(&wal).expect("remove fifo wal");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -223,6 +239,18 @@ mod live {
         assert!(out.status.success(), "{out:?}");
     }
 
+    fn read_column_v(db: &Path) -> Result<Vec<String>, Unread> {
+        read_bytes(db, 16 << 20, |main, wal| {
+            crate::sqlite_read::scan_table_with(
+                main,
+                wal,
+                "t",
+                |s| s.column_index("v"),
+                |&col, row| Some(row.get(col)?.to_list_field()),
+            )
+        })
+    }
+
     #[test]
     fn a_rollback_database_is_read_with_no_lock() {
         let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -239,11 +267,11 @@ mod live {
                 .is_err_and(|e| e.contains("database is locked")),
             "{control:?}"
         );
-        assert_eq!(read(&db, |t| sqlite(t, sql).ok()), Ok("kept\n".to_owned()));
+        assert_eq!(read_column_v(&db), Ok(vec!["kept".to_owned()]));
     }
 
     #[test]
-    fn a_wal_database_is_read_from_a_private_copy() {
+    fn a_wal_database_is_read_in_memory_with_no_lock_or_copy() {
         use std::io::{BufRead as _, Write as _};
         let dir = aterm_tempfile::tempdir().expect("scratch");
         let db = std::fs::canonicalize(dir.path())
@@ -287,10 +315,7 @@ mod live {
                 .is_err_and(|e| e.contains("database is locked")),
             "{control:?}"
         );
-        assert_eq!(
-            read(&db, |t| sqlite(t, sql).ok()),
-            Ok("in the wal\n".to_owned())
-        );
+        assert_eq!(read_column_v(&db), Ok(vec!["in the wal".to_owned()]));
     }
 
     #[test]

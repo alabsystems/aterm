@@ -40,7 +40,7 @@ fn get_or_try_init_runs_the_closure_exactly_once_under_contention() {
     assert_eq!(
         runs.load(Ordering::SeqCst),
         1,
-        "{} threads ran the initialiser; wgpu-core's ResourcePool would hand out two Arcs for \
+        "{} threads ran the initialiser; a pool keyed on the cell would hand out two Arcs for \
          one key",
         runs.load(Ordering::SeqCst)
     );

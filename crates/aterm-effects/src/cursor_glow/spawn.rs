@@ -52,6 +52,7 @@ impl CursorGlow {
     }
 
     /// The aural twin of this spawn.
+    #[inline]
     pub(super) fn cue_move_sound(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
             pr,
@@ -193,6 +194,7 @@ impl CursorGlow {
     }
 
     /// Fire's one-line rule ([`Self::FLAME_SNUFF_S`], [`Self::SPARK_SNUFF_S`]).
+    #[inline]
     pub(super) fn snuff_off_line(
         &mut self,
         (cr, cc): (u16, u16),
@@ -214,6 +216,7 @@ impl CursorGlow {
     }
 
     /// The flying half of [`Self::snuff_off_line`] ([`Self::SPARK_SNUFF_S`]).
+    #[inline]
     pub(super) fn snuff_sparks_off_line(
         &mut self,
         cr: u16,
@@ -243,6 +246,7 @@ impl CursorGlow {
         clippy::too_many_arguments,
         reason = "the classified move + the shared per-move scalars spawn derives; a single internal call site"
     )]
+    #[inline]
     pub(super) fn spawn_move_light(
         &mut self,
         mv: &MoveCtx,
@@ -448,6 +452,7 @@ impl CursorGlow {
     }
 
     /// Admit one lightning onset at `now`.
+    #[inline]
     pub(super) fn admit_bolt(&mut self, now: Instant, crackle: bool) -> bool {
         #[cfg(test)]
         if self.bolts_unlimited {
@@ -643,7 +648,9 @@ impl CursorGlow {
                 // Idle beam embers scale with residual heat.
                 1 + (self.heat * 4.0) as usize
             } else if comet {
-                1 + (self.heat * 4.0) as usize
+                // Two motes a key from cold: one, most of a slow line's
+                // dust lost to the leading's seats, left the tail bare.
+                2 + (self.heat * 5.0) as usize
             } else if matches!(cfg.style, GlowStyle::Sparkle) {
                 2 + (self.heat * 6.0) as usize
             } else {

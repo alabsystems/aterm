@@ -37,7 +37,7 @@ dirs, a private control socket, a lifeline; ended by its process group, never by
                 60 ms cadence (`targo --unverified build --release -p aterm`, then --aterm target/release/aterm)
   --theme       dark (the default theme), light (\"GitHub Light\") or both (the default)
   --scenario    typing (default), burst, context, steam, enter-bottom, idle10, redraw-stall, fold-rest, cjk, bidi,
-                focus-roundtrip, settings, or all; repeatable
+                split, move-up, focus-roundtrip, settings, or all; repeatable
   --extra       a top-level aterm.toml line for every instance, replacing the base line of its key (the base lines:
                 the style, motion = \"full\", trail_sounds = false, and on light the theme)
   --columns --lines --font-px   the grid (default 72x14 cells of 22 px; settings 110x40 of 16 px)
@@ -94,10 +94,11 @@ impl Theme {
 pub enum Scenario {
     Typing,
     /// A sustained line typed fast and long enough to earn the flying
-    /// kitty's head ([`BURST_TEXT`] a key per [`BURST_KEY_MS`]): `fly` while
-    /// it flies (key [`BURST_FLY_KEY`]), `t0` at the last key, then
-    /// [`BURST_AFTER_MS`] (`t120`, `t470`, and `l3600` to `l4500` as it
-    /// lands).
+    /// kitty's head ([`BURST_TEXT`] a key per [`BURST_KEY_MS`]): the run's
+    /// start ([`BURST_START_KEYS`], `key3` and `key10`), `fly` while it flies
+    /// (key [`BURST_FLY_KEY`]), `t0` at the last key, then [`BURST_AFTER_MS`]
+    /// (`t120`, `t470` as the cat waits at the wall, `l1650` as its hop off
+    /// the line's last letters lands, and `l3600` to `l4500` as it rests).
     Burst,
     Context,
     Steam,
@@ -109,12 +110,21 @@ pub enum Scenario {
     FoldRest,
     Cjk,
     Bidi,
+    /// Two panes, the caret's focused ([`SPLIT_PANES`]): the typing line
+    /// (`mid`, `t0`, `t120`, `t470`), the line killed, then the burst's line
+    /// on the same prompt ([`SPLIT_BURST_FRAMES`]), so the composed frames
+    /// of a split window and the pet's veil inside its pane are photographed.
+    Split,
+    /// A program moves the caret up across lettered rows, as vim's `k` does
+    /// ([`MOVE_UP_ROWS`]): `typed`, then `up` on the frame that first draws
+    /// the move, `u120` and `u470`.
+    MoveUp,
     Settings,
 }
 
 impl Scenario {
     /// Every scenario, in the order `all` runs them.
-    pub const ALL: [Scenario; 12] = [
+    pub const ALL: [Scenario; 14] = [
         Scenario::Typing,
         Scenario::Burst,
         Scenario::Context,
@@ -126,6 +136,8 @@ impl Scenario {
         Scenario::FoldRest,
         Scenario::Cjk,
         Scenario::Bidi,
+        Scenario::Split,
+        Scenario::MoveUp,
         Scenario::Settings,
     ];
 
@@ -143,6 +155,8 @@ impl Scenario {
             Scenario::FoldRest => "fold-rest",
             Scenario::Cjk => "cjk",
             Scenario::Bidi => "bidi",
+            Scenario::Split => "split",
+            Scenario::MoveUp => "move-up",
             Scenario::Settings => "settings",
         }
     }
@@ -380,6 +394,49 @@ if [ -n "${BASH_VERSION:-}" ]; then PS1="\[$on\] aterm \[$off\] "; else PS1="$on
 export PS1
 "#;
 
+/// `move-up`'s page: lettered rows above the prompt, and `./k`, the
+/// program that, a second after its Return, moves the caret up
+/// [`MOVE_UP_ROWS`] rows into them and holds it there, as vim's `k` does.
+/// It writes [`MOVE_UP_MARK`] on its row in the same write as the move, the
+/// mark the gallery awaits (`@UP@` is the move's row count).
+const PAINT_MOVE_UP: &str = r#"printf '\033[2J\033[H'
+printf 'Above: Typography jumps; quick brown gyps (qwerty) _gy|\r\n'
+printf 'fn main() {\r\n'
+printf '    let fox = "the quick brown fox";\r\n'
+printf '    println!("{fox} jumps over the lazy dog");\r\n'
+printf '    // every glyph here must stay legible: pqgyj {braces} [ok]\r\n'
+printf '}\r\n'
+printf '\033[8H'
+cat > ./k <<'K'
+sleep 1
+printf '[vim] NORMAL\033[@UP@A\033[12G'
+sleep 4
+K
+chmod +x ./k
+"#;
+
+/// How many rows `move-up`'s program moves the caret up ([`PAINT_MOVE_UP`]):
+/// from the row under its prompt to `println!`'s, past the comment, the
+/// brace, a blank row and the prompt.
+pub const MOVE_UP_ROWS: u16 = 5;
+
+/// The mark `move-up`'s program writes with its move ([`PAINT_MOVE_UP`]).
+pub const MOVE_UP_MARK: &str = "NORMAL";
+
+/// The `split` scenario's panes: the window split top over bottom (`spawn
+/// split=h`), the focus moved back up to the caret's pane (`pane up`), so
+/// the burst's whole line still fits its row.
+pub const SPLIT_PANES: [&str; 2] = ["split=h", "up"];
+
+/// The `split` scenario's burst frames after its typing frames: `bfly` at
+/// [`BURST_FLY_KEY`], `b0` at the last key, then `b120`, `b470` and `b1650`,
+/// as the cat's hop off the line's last letters lands on its top
+/// ([`SPLIT_BURST_AFTER_MS`]).
+pub const SPLIT_BURST_FRAMES: [&str; 5] = ["bfly", "b0", "b120", "b470", "b1650"];
+
+/// The ms after the last key of `split`'s `b120`, `b470` and `b1650`.
+pub const SPLIT_BURST_AFTER_MS: [u64; 3] = [120, 470, 1650];
+
 const PAINT_STEAM: &str = r"printf '\033[2J\033[3H'
 printf 'Above: Typography jumps; quick brown gyps (qwerty) _gy|\r\n'
 printf 'Above2: The lazy dog jogged by, every glyph legible.\r\n'
@@ -395,6 +452,7 @@ pub fn paint(scenario: Scenario, theme: Theme) -> String {
         Scenario::Context => PAINT_CONTEXT.replace("@SEL@", theme.selection()),
         Scenario::Steam => PAINT_STEAM.to_string(),
         Scenario::EnterBottom => "seq 1 40\n".to_string(),
+        Scenario::MoveUp => PAINT_MOVE_UP.replace("@UP@", &MOVE_UP_ROWS.to_string()),
         _ => "printf '\\033[2J\\033[5H'\n".to_string(),
     };
     format!("{PAINT_HEAD}{body}exec /bin/sh -i\n")
@@ -435,10 +493,26 @@ pub const BURST_KEY_MS: u64 = 50;
 /// frame: past the summon and the cat's fade in, at this pace or slower.
 pub const BURST_FLY_KEY: usize = 56;
 
-/// The `burst` frames after its last key, ms: the flight going on (`t120`,
-/// `t470`), then its landing (`l<ms>`) as the momentum decays to the cat's
+/// The keys (0-based, of [`BURST_TEXT`]) after which `burst` keeps a frame of
+/// its run's start, `key<n>`: the first letters, `ech` and `echo the q`,
+/// typed where a resting companion stood (looks8 round 2 caught the cat's
+/// body on them).
+pub const BURST_START_KEYS: [usize; 2] = [3, 10];
+
+/// A frame label of `burst` after its key `key` ([`BURST_START_KEYS`]).
+#[must_use]
+pub fn burst_start_frame(key: usize) -> String {
+    format!("key{key}")
+}
+
+/// The `burst` frames after its last key, ms: the cat waiting at the wall
+/// for a wrap the hand may still type (`t120`, `t470`), its hop off the
+/// line's last letters at its sit landing over the line (`l1650`, where
+/// looks8 round 2 caught a wrap bound coming down through the line's
+/// letters before r23 K6 kept the cat on the ground for a wrap that never
+/// comes), then its rest (`l<ms>`) as the momentum decays to the cat's
 /// grounding (about 3.9 s from a full run) and its exit fades it out.
-pub const BURST_AFTER_MS: [u64; 6] = [120, 470, 3600, 3900, 4200, 4500];
+pub const BURST_AFTER_MS: [u64; 7] = [120, 470, 1650, 3600, 3900, 4200, 4500];
 
 /// A frame label of `burst` for `ms` after its last key ([`BURST_AFTER_MS`]).
 #[must_use]
@@ -448,6 +522,90 @@ pub fn burst_frame(ms: u64) -> String {
     } else {
         format!("l{ms}")
     }
+}
+
+/// Of a `panes` reply's panes (`pane session=… rect=<row>,<col>,<rows>x<cols>
+/// focused=<bool>`), in reading order (top to bottom, left to right), the
+/// place of the focused one; `None` unless there are two or more, one of
+/// them focused.
+#[must_use]
+pub fn panes_focus(reply: &str) -> Option<usize> {
+    let mut panes: Vec<((u32, u32), bool)> = reply
+        .lines()
+        .filter(|l| l.starts_with("pane "))
+        .filter_map(|l| {
+            let field = |key: &str| {
+                l.split_whitespace()
+                    .find_map(|w| w.strip_prefix(key))
+                    .map(str::to_string)
+            };
+            let rect = field("rect=")?;
+            let mut at = rect.split(',');
+            let row = at.next()?.parse().ok()?;
+            let col = at.next()?.parse().ok()?;
+            Some(((row, col), field("focused=")? == "true"))
+        })
+        .collect();
+    if panes.len() < 2 {
+        return None;
+    }
+    panes.sort_by_key(|&(at, _)| at);
+    panes.iter().position(|&(_, focused)| focused)
+}
+
+/// A window's `dims` reply narrowed to the focused pane of a `panes`
+/// reply: its rows and columns, and its grid origin moved to the pane's
+/// (`head` and `pad` grow by the pane's row and column times the cell), so
+/// `trail-contrast` reads the caret's pane, its caret and its text where
+/// they are drawn; `None` unless the window has two or more panes, one
+/// focused, and the dims name the cell. Judged on the window's grid, a
+/// split's pane header put every row a row low: the caret was read on the
+/// page above it (1.47:1 on dark, `off` included) and the typed line on the
+/// row above its letters (looks8 round 1).
+#[must_use]
+pub fn pane_dims(dims: &str, panes: &str) -> Option<String> {
+    panes_focus(panes)?;
+    let (row, col, rows, cols) = panes
+        .lines()
+        .filter(|l| l.starts_with("pane ") && l.split_whitespace().any(|w| w == "focused=true"))
+        .find_map(|l| {
+            let rect = l.split_whitespace().find_map(|w| w.strip_prefix("rect="))?;
+            let (at, size) = rect.rsplit_once(',')?;
+            let (row, col) = at.split_once(',')?;
+            let (rows, cols) = size.split_once('x')?;
+            Some((
+                row.parse::<i64>().ok()?,
+                col.parse::<i64>().ok()?,
+                rows.parse::<i64>().ok()?,
+                cols.parse::<i64>().ok()?,
+            ))
+        })?;
+    let mut tokens: Vec<String> = dims.split_whitespace().map(str::to_string).collect();
+    if tokens.len() < 5 || tokens[0] != "OK" {
+        return None;
+    }
+    let fact = |key: &str| {
+        tokens[5..]
+            .iter()
+            .find_map(|t| t.strip_prefix(key)?.strip_prefix('=')?.parse::<i64>().ok())
+    };
+    let (cw, ch) = (fact("cell_w")?, fact("cell_h")?);
+    let (pad, head) = (fact("pad")?, fact("head").unwrap_or(0));
+    tokens[1] = rows.to_string();
+    tokens[2] = cols.to_string();
+    let mut has_head = false;
+    for t in &mut tokens[5..] {
+        if t.starts_with("pad=") {
+            *t = format!("pad={}", pad + col * cw);
+        } else if t.starts_with("head=") {
+            *t = format!("head={}", head + row * ch);
+            has_head = true;
+        }
+    }
+    if !has_head {
+        tokens.push(format!("head={}", row * ch));
+    }
+    Some(tokens.join(" "))
 }
 
 /// The `burst` scenario's keys (one per character of [`BURST_TEXT`]).
@@ -1128,15 +1286,18 @@ impl Shot<'_> {
     /// A typed burst, a key per 60 ms (~17 keys/s) unless a frame is slower,
     /// each followed by a frame: key `mid` is kept as `mid`.
     fn burst(&mut self, mid: Option<u64>, keys: &[String]) -> Result<(), Stopped> {
-        self.paced(TYPING_KEY_MS, mid.map(|i| (i, "mid")), keys)
+        match mid {
+            Some(i) => self.paced(TYPING_KEY_MS, &[(i, "mid".to_string())], keys),
+            None => self.paced(TYPING_KEY_MS, &[], keys),
+        }
     }
 
     /// A typed burst, a key per `every` ms unless a frame is slower, each
-    /// followed by a frame: the key `keep.0` is kept as `keep.1`.
+    /// followed by a frame: each key `keep.0` is kept as `keep.1`.
     fn paced(
         &mut self,
         every: u64,
-        keep: Option<(u64, &str)>,
+        keep: &[(u64, String)],
         keys: &[String],
     ) -> Result<(), Stopped> {
         self.mark("burst-start");
@@ -1147,9 +1308,9 @@ impl Shot<'_> {
             }
             self.press(k);
             stop::sleep(Duration::from_millis(every.min(60) / 2))?;
-            match keep {
-                Some((at, frame)) if at == i => self.snap(frame),
-                _ => self.tick(),
+            match keep.iter().find(|(at, _)| *at == i) {
+                Some((_, frame)) => self.snap(frame),
+                None => self.tick(),
             }
         }
         self.mark("burst-end");
@@ -1168,6 +1329,48 @@ impl Shot<'_> {
             self.tick();
         }
         self.snap("t470");
+        Ok(())
+    }
+
+    /// Split the window ([`SPLIT_PANES`]) and give the caret's pane the focus
+    /// back, keeping each reply and the layout (`<name>.panes.txt`); half a
+    /// second of frames lets the new pane's shell come up.
+    fn split(&mut self) -> Result<(), Stopped> {
+        let [how, back] = SPLIT_PANES;
+        for request in [&["spawn", how][..], &["pane", back][..]] {
+            let r = self.inst.ctl(request);
+            if r.code != 0 {
+                self.note(&format!(
+                    "{}: {}",
+                    request.join(" "),
+                    reply_text(&r).trim_end()
+                ));
+                self.fails += 1;
+            }
+        }
+        self.mark("split");
+        self.tick_until(500, Duration::from_millis(60))?;
+        let panes = self.inst.ctl(&["panes"]);
+        self.keep("panes.txt", &panes);
+        if !panes.stdout.lines().any(|l| l.starts_with("pane "))
+            || panes_focus(&panes.stdout) != Some(0)
+        {
+            self.note("the split did not leave the caret's pane, the first, focused");
+            self.fails += 1;
+        }
+        // The frames are judged on the caret's pane: its grid, not the
+        // window's (the window's is kept as `window.dims.txt`).
+        let window = std::fs::read_to_string(self.path("dims.txt")).unwrap_or_default();
+        match pane_dims(&window, &panes.stdout) {
+            Some(pane) => {
+                let _ = std::fs::write(self.path("window.dims.txt"), &window);
+                let _ = std::fs::write(self.path("dims.txt"), format!("{pane}\n"));
+            }
+            None => {
+                self.note("the caret's pane's grid is not known; its frames keep the window's");
+                self.fails += 1;
+            }
+        }
         Ok(())
     }
 
@@ -1215,11 +1418,12 @@ impl Shot<'_> {
                 self.snap("rest");
             }
             Scenario::Burst => {
-                self.paced(
-                    BURST_KEY_MS,
-                    Some((BURST_FLY_KEY as u64, "fly")),
-                    &burst_keys(),
-                )?;
+                let keep: Vec<(u64, String)> = BURST_START_KEYS
+                    .iter()
+                    .map(|&k| (k as u64, burst_start_frame(k)))
+                    .chain([(BURST_FLY_KEY as u64, "fly".to_string())])
+                    .collect();
+                self.paced(BURST_KEY_MS, &keep, &burst_keys())?;
                 self.snap("t0");
                 for ms in BURST_AFTER_MS {
                     self.tick_until(ms, Duration::from_millis(40))?;
@@ -1235,6 +1439,47 @@ impl Shot<'_> {
                 self.burst(Some(mid), &keys)?;
                 self.snap("t0");
                 self.fade()?;
+            }
+            Scenario::Split => {
+                self.split()?;
+                self.burst(Some(12), &word)?;
+                self.snap("t0");
+                self.fade()?;
+                self.press("ctrl+u");
+                self.mark("killed");
+                self.tick_until(800, Duration::from_millis(60))?;
+                let [fly, b0, after @ ..] = SPLIT_BURST_FRAMES;
+                self.paced(
+                    BURST_KEY_MS,
+                    &[(BURST_FLY_KEY as u64, fly.to_string())],
+                    &burst_keys(),
+                )?;
+                self.snap(b0);
+                for (label, ms) in after.into_iter().zip(SPLIT_BURST_AFTER_MS) {
+                    self.tick_until(ms, Duration::from_millis(40))?;
+                    self.snap(label);
+                }
+            }
+            Scenario::MoveUp => {
+                self.burst(None, &keys_of("./k"))?;
+                self.snap("typed");
+                self.press("enter");
+                self.mark("enter");
+                self.tick_until(900, Duration::from_millis(60))?;
+                let moved = self.request(
+                    &["await", "match", MOVE_UP_MARK, "timeout=60000"],
+                    ReplyShape::Line,
+                );
+                if moved.code != 0 {
+                    self.note("the move-up program did not write its mark");
+                    self.fails += 1;
+                }
+                self.mark("up");
+                self.snap("up");
+                self.tick_until(120, Duration::from_millis(40))?;
+                self.snap("u120");
+                self.tick_until(470, Duration::from_millis(60))?;
+                self.snap("u470");
             }
             Scenario::Steam => {
                 self.burst(None, &word)?;

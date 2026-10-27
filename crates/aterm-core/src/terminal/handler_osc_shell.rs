@@ -245,7 +245,7 @@ impl TerminalHandler<'_> {
             self.transient.dead_alt_prompt_at =
                 Some((self.transient.screen_replaced, at.row, at.col));
             self.take_main_pen_for_dead_screen_prompt();
-            if self.transient.alt_screen_resync_screen != screen {
+            if self.transient.alt_screen_resync_screen.is_none() {
                 self.transient.alt_screen_resync_screen = screen;
                 self.transient.alt_screen_resync_requested = true;
             }
@@ -913,6 +913,69 @@ mod prompt_on_alt_screen_tests {
         term.process(b"\x1b[?1049hsecond pager");
         term.process(PROMPT_AFTER_KILL);
         assert!(term.take_alt_screen_resync_request(), "the new screen asks");
+    }
+
+    /// A program re-entering the alternate screen and marking a prompt on each one asks the host
+    /// once per visit: no screen it enters asks again until the alternate screen is left.
+    #[test]
+    fn a_leave_in_flight_holds_the_next_request() {
+        let mut term = stuck_pager();
+        term.set_host_resyncs_alt_screen(true);
+        term.process(PROMPT_AFTER_KILL);
+        assert!(term.take_alt_screen_resync_request(), "one request");
+        for _ in 0..100 {
+            term.process(b"\x1b[?1049h\x1b]133;A\x07");
+        }
+        assert!(term.modes().alternate_screen);
+        assert!(
+            !term.take_alt_screen_resync_request(),
+            "screens entered while the leave is in flight ask nothing"
+        );
+        term.process(b"\x1b[?1049l\x1b[?1049hpager again");
+        term.process(PROMPT_AFTER_KILL);
+        assert!(
+            term.take_alt_screen_resync_request(),
+            "asked again once left"
+        );
+    }
+
+    /// Each `?1049l` ends a visit, the program's own included, so a program that leaves between
+    /// screens asks once per visit; the embedder, not the engine, bounds the host clients.
+    #[test]
+    fn a_program_that_leaves_between_screens_asks_once_per_visit() {
+        let mut term = stuck_pager();
+        term.set_host_resyncs_alt_screen(true);
+        for _ in 0..50 {
+            term.process(b"\x1b[?1049l\x1b[?1049h\x1b]133;A\x07");
+            assert!(term.take_alt_screen_resync_request(), "the visit asks");
+            term.process(b"\x1b[?1049h\x1b]133;A\x07");
+            assert!(
+                !term.take_alt_screen_resync_request(),
+                "the re-entry within it does not"
+            );
+        }
+    }
+
+    /// A request the embedder gives back (its leave client did not start) is asked again by the
+    /// next prompt on the same screen; one it keeps is not.
+    #[test]
+    fn an_abandoned_request_is_asked_again() {
+        for abandon in [true, false] {
+            let mut term = stuck_pager();
+            term.set_host_resyncs_alt_screen(true);
+            term.process(PROMPT_AFTER_KILL);
+            assert!(term.take_alt_screen_resync_request(), "abandon={abandon}");
+            if abandon {
+                term.abandon_alt_screen_resync();
+            }
+            term.process(PROMPT_AFTER_KILL);
+            assert!(term.modes().alternate_screen, "abandon={abandon}");
+            assert_eq!(
+                term.take_alt_screen_resync_request(),
+                abandon,
+                "the next prompt asks again only when the request was given back"
+            );
+        }
     }
 
     #[test]

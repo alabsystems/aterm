@@ -197,7 +197,8 @@ fn exercise(reader: i64, shape: i64, fault: i64) -> [bool; 4] {
                 Err(word)
             }
         }
-        3 => usage_roster(configured, &store, (true, true), a.clock()).map(project),
+        3 => usage_roster(configured, &store, (true, true), a.clock())
+            .map(|read| project(read.roster().clone())),
         4 => match account_roster_or_own(&seat) {
             Some(roster) => Ok(project(roster)),
             None => Err(roster_read(&seat).unwrap_err().recording_word()),
@@ -357,8 +358,10 @@ fn clean_missing_rosters_are_inert_but_malformed_rosters_never_become_defaults()
                 .is_empty()
         );
         assert_eq!(
-            usage_roster(path, &store, (true, false), a.clock()).unwrap(),
-            accounts::Roster::own()
+            usage_roster(path, &store, (true, false), a.clock())
+                .unwrap()
+                .roster(),
+            &accounts::Roster::own()
         );
         assert!(!a.state_root().exists());
     }

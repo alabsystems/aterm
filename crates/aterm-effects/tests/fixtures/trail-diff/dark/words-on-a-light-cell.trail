@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# A dark-theme Sparkle Word on a light cell background (PRISM-GLASS.md §10.3 #5): printed words on
+# a white SGR background, and f-bombs typed on a prompt whose background is light, reaching the
+# supernova, while the theme stays dark.
+
+grid 16 90
+style rainbow kitty
+hz 60
+words rainbow
+
+at 0 pty "\e[3;1H\e[48;2;255;255;255m\e[38;2;20;20;20m the kitty and the shit \e[0m\r\n\e[9;1H\e[48;2;246;247;249m\e[38;2;43;45;51m$ "
+at 700 key f
+at 702 pty "f"
+at 800 key u
+at 802 pty "u"
+at 900 key c
+at 902 pty "c"
+at 1000 key k
+at 1002 pty "k"
+at 1100 key ,
+at 1102 pty ","
+at 1200 key space
+at 1202 pty " "
+at 1300 key f
+at 1302 pty "f"
+at 1400 key u
+at 1402 pty "u"
+at 1500 key c
+at 1502 pty "c"
+at 1600 key k
+at 1602 pty "k"
+at 1700 key ,
+at 1702 pty ","
+at 1800 key space
+at 1802 pty " "
+at 1900 key f
+at 1902 pty "f"
+at 2000 key u
+at 2002 pty "u"
+at 2100 key c
+at 2102 pty "c"
+at 2200 key k
+at 2202 pty "k"
+at 2300 key ,
+at 2302 pty ","
+at 2400 key space
+at 2402 pty " "
+at 2500 key f
+at 2502 pty "f"
+at 2600 key u
+at 2602 pty "u"
+at 2700 key c
+at 2702 pty "c"
+at 2800 key k
+at 2802 pty "k"
+run 6900

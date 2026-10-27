@@ -235,14 +235,17 @@ fn card_drew(app: &App, wid: WindowId) -> bool {
         || !p.decos.is_empty()
 }
 
+/// The card's own layers: not the top rule's lockup mark or the ⬆️'s ring.
 fn card_only(app: &App, wid: WindowId) -> impl Iterator<Item = &FxLayer> {
-    let mark = app
-        .focused_session_id(wid)
-        .map(crate::claude_footer::top_mark_id);
+    let session = app.focused_session_id(wid);
+    let top = [
+        session.map(crate::claude_footer::top_mark_id),
+        session.map(crate::claude_footer::top_ring_id),
+    ];
     painted(app, wid)
         .layers
         .iter()
-        .filter(move |l| Some(l.id) != mark)
+        .filter(move |l| !top.contains(&Some(l.id)))
 }
 
 fn card_layer(app: &App, wid: WindowId, slot: FxSlot) -> Option<FxLayer> {
@@ -523,7 +526,7 @@ fn the_wrapped_card_wears_its_border_kitty_stars_and_line() {
         crate::claude_footer::value_fg(GRAY, blank.fg),
         "the footer's value colour under the ink"
     );
-    let hero = start + 12..start + 17;
+    let hero = start + 12..start + 12 + HERO_WORD.len();
     let word: String = scratch.cells[line_row][hero.clone()]
         .iter()
         .map(|c| c.ch)
@@ -973,7 +976,7 @@ fn a_landing_is_said_on_the_cards_line_under_land_alone() {
         assert_eq!(
             short,
             [
-                &format!("{HERO_WORD} harness \u{b7} {tail}"),
+                &format!("{HERO_WORD} claude harness \u{b7} {tail}"),
                 &format!("{HERO_WORD} \u{b7} {tail}"),
                 &format!("{HERO_WORD} {glyph}"),
             ],
@@ -1124,9 +1127,9 @@ fn the_cards_line_follows_an_armed_timer() {
         });
         let cruise = line_texts_for(rows_kind, AutopilotView::Cruise, LineEnd::Mode);
         let head = format!(
-            "enhanced by {HERO_WORD} harness v{} \u{b7} {}",
-            agent.version_str(),
-            agent.id()
+            "enhanced by {HERO_WORD} {} harness v{}",
+            agent.cli(),
+            agent.version_str()
         );
         if agent == aterm_phase::CliHarness::Agy {
             assert_eq!(cruise[0], head, "{cruise:?}");
@@ -1179,14 +1182,9 @@ fn the_cards_line_follows_an_armed_timer() {
     )
     .expect("aterm's build signature");
     for harness in aterm_phase::CliHarness::ALL {
-        let id = harness.id();
         let ver = harness.version_str();
         let texts = make_line_texts_for(harness, AutopilotView::Cruise, LineEnd::Mode);
-        let head = format!("enhanced by {HERO_WORD} harness v{ver}");
-        let named = match harness {
-            aterm_phase::CliHarness::ClaudeCode => head.clone(),
-            _ => format!("{head} \u{b7} {id}"),
-        };
+        let named = format!("enhanced by {HERO_WORD} {} harness v{ver}", harness.cli());
         assert!(
             texts[0].starts_with(&named),
             "{harness:?}: its own version beside the word harness: {texts:?}"
@@ -1206,7 +1204,7 @@ fn the_cards_line_follows_an_armed_timer() {
     assert_eq!(
         make_line_texts(AutopilotView::Cruise, LineEnd::Mode)[0],
         format!(
-            "enhanced by {HERO_WORD} harness v{} \u{b7} autopilot \u{221e} cruise",
+            "enhanced by {HERO_WORD} claude harness v{} \u{b7} autopilot \u{221e} cruise",
             aterm_phase::CliHarness::ClaudeCode.version_str()
         ),
         "Claude Code's line: its harness's version, then the autopilot"
@@ -1302,7 +1300,7 @@ fn unsupervised_switched_off_another_build_scrolled_back_no_host_or_master_off_d
     let bare = |app: &App, wid: WindowId| {
         let strip = strip_rows(app, wid);
         !card_drew(app, wid)
-            && !glass_text(app, wid, strip + 4, 0..120).contains("aterm harness")
+            && !glass_text(app, wid, strip + 4, 0..120).contains("alab claude harness")
             && !app.windows[&wid]
                 .claude_card
                 .entries
@@ -1411,7 +1409,7 @@ fn off_wears_the_white_card_without_a_claim() {
     let strip = strip_rows(&app, wid);
     let line = glass_text(&app, wid, strip + 4, 0..120);
     assert!(
-        line.contains("enhanced by aterm harness") && line.contains("autopilot \u{25cb} off"),
+        line.contains("enhanced by alab claude harness") && line.contains("autopilot \u{25cb} off"),
         "the line says Off: {line:?}"
     );
     let entry = app.windows[&wid]
@@ -1444,7 +1442,7 @@ fn off_wears_the_white_card_without_a_claim() {
         let strip = strip_rows(&app, wid);
         assert!(!card_drew(&app, wid), "{what}: no light");
         assert!(
-            !glass_text(&app, wid, strip + 4, 0..120).contains("aterm harness"),
+            !glass_text(&app, wid, strip + 4, 0..120).contains("alab claude harness"),
             "{what}: no line"
         );
         host.shutdown_and_join();
@@ -1557,7 +1555,7 @@ fn capture_resplice(tab_strip: u16) {
     assert_eq!(strip, usize::from(tab_strip), "CONTROL: the strip's rows");
     assert_eq!(
         glass_text(&app, wid, strip + 4, 0..120)
-            .matches("aterm harness")
+            .matches("alab claude harness")
             .count(),
         1
     );
@@ -1914,7 +1912,7 @@ fn a_light_theme_card_is_ink() {
         );
         let start = 11 + LINE_LEAD;
         let scratch = &app.windows[&wid].input_scratch;
-        let hero = start + 12..start + 17;
+        let hero = start + 12..start + 12 + HERO_WORD.len();
         assert!(
             scratch.cells[line_row][hero.clone()].iter().all(|c| c.bold),
             "{osc}: bold on light"
@@ -2073,7 +2071,7 @@ fn a_split_pane_decorates_its_own_card_only() {
             .take(pane_cols)
             .map(|c| c.ch)
             .collect::<String>()
-            .contains("aterm harness")),
+            .contains("alab claude harness")),
         "the line, inside the pane"
     );
     host.shutdown_and_join();
@@ -2762,7 +2760,7 @@ fn serious_mode_keeps_a_still_border_only() {
     );
     assert_eq!(app.claude_card_deadline(Instant::now()), None, "still");
     let strip = strip_rows(&app, wid);
-    assert!(glass_text(&app, wid, strip + 4, 0..120).contains("aterm harness"));
+    assert!(glass_text(&app, wid, strip + 4, 0..120).contains("alab claude harness"));
     host.shutdown_and_join();
 }
 
@@ -3231,7 +3229,7 @@ fn tab_status_off_hides_every_card() {
     assert!(!app.windows[&wid].claude_card.any_shown());
     assert_eq!(app.claude_card_deadline(t0), None);
     let strip = strip_rows(&app, wid);
-    assert!(!glass_text(&app, wid, strip + 4, 0..120).contains("aterm harness"));
+    assert!(!glass_text(&app, wid, strip + 4, 0..120).contains("alab claude harness"));
     set_now(None);
     host.shutdown_and_join();
 }
@@ -3941,7 +3939,10 @@ fn costs_the_floor(
         "{what}: the border"
     );
     let line = glass_text(&app.0, wid, strip_rows(&app.0, wid) + 4, 0..120);
-    assert!(line.contains("aterm harness"), "{what}: the line: {line:?}");
+    assert!(
+        line.contains("alab claude harness"),
+        "{what}: the line: {line:?}"
+    );
     for i in WARM..WARM + passes {
         set_now(Some(
             t0 + Duration::from_millis(EPISODE_MS + 200 + 9 * i as u64),
@@ -5357,7 +5358,7 @@ fn the_shimmer_locks_the_flows_steps() {
 }
 
 #[test]
-fn every_rung_of_the_line_names_aterm() {
+fn every_rung_of_the_line_names_alab() {
     let ends = [
         LineEnd::Mode,
         LineEnd::Landed,
@@ -5373,8 +5374,13 @@ fn every_rung_of_the_line_names_aterm() {
                     let short = i + 3 >= texts.len();
                     assert_eq!(!text.starts_with("enhanced by "), short, "{text:?}");
                     let at = if short { 0 } else { 12 };
-                    assert_eq!(hero_cells(text), Some(at..at + 5), "{text:?}");
-                    let word: String = text.chars().skip(usize::from(at)).take(5).collect();
+                    let len = HERO_WORD.len() as u16;
+                    assert_eq!(hero_cells(text), Some(at..at + len), "{text:?}");
+                    let word: String = text
+                        .chars()
+                        .skip(usize::from(at))
+                        .take(HERO_WORD.len())
+                        .collect();
                     assert_eq!(word, HERO_WORD, "{text:?}");
                     rungs += 1;
                 }
@@ -5388,19 +5394,19 @@ fn every_rung_of_the_line_names_aterm() {
     }
     assert!(rungs > 100, "CONTROL: the rungs were walked ({rungs})");
     assert_eq!(
-        hero_cells("enhanced by materm harness"),
+        hero_cells("enhanced by malab claude harness"),
         None,
         "NEGATIVE CONTROL"
     );
     assert_eq!(
-        hero_cells("enhanced by aterms harness"),
+        hero_cells("enhanced by alabs claude harness"),
         None,
         "NEGATIVE CONTROL"
     );
     assert_eq!(hero_cells("no word"), None, "NEGATIVE CONTROL");
     assert_eq!(
-        hero_cells("\u{4E2D} aterm"),
-        Some(3..8),
+        hero_cells("\u{4E2D} alab"),
+        Some(3..7),
         "a wide glyph, two cells"
     );
 }
@@ -6009,7 +6015,7 @@ fn the_vendors_notice_stays_bare_where_the_banner_may_not_go() {
             "{what}: nothing to press"
         );
         assert_eq!(
-            glass_text(&app, wid, strip + WIDE.card + 3, 0..120).contains("aterm harness"),
+            glass_text(&app, wid, strip + WIDE.card + 3, 0..120).contains("alab claude harness"),
             line,
             "{what}: the card's line"
         );
@@ -7031,7 +7037,7 @@ fn a_build_drift_is_one_entry_and_leaves_the_decoration_alone() {
         app.on_claude_footer_changed(session);
         frame(&mut app, wid);
         let strip = strip_rows(&app, wid);
-        let line = glass_text(&app, wid, strip + 4, 0..120).contains("aterm harness");
+        let line = glass_text(&app, wid, strip + 4, 0..120).contains("alab claude harness");
         let entries = app
             .messages
             .digest()

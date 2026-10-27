@@ -66,6 +66,27 @@ impl CharacterSet {
         }
     }
 
+    /// The SCS final byte that designates this set ([`Self::from_final_byte`] maps it back).
+    #[must_use]
+    pub const fn final_byte(self) -> u8 {
+        match self {
+            Self::Ascii => b'B',
+            Self::DecLineDrawing => b'0',
+            Self::DecSupplemental => b'<',
+            Self::UnitedKingdom => b'A',
+            Self::Dutch => b'4',
+            Self::Finnish => b'C',
+            Self::French => b'R',
+            Self::FrenchCanadian => b'Q',
+            Self::German => b'K',
+            Self::Italian => b'Y',
+            Self::NorwegianDanish => b'E',
+            Self::Spanish => b'Z',
+            Self::Swedish => b'H',
+            Self::Swiss => b'=',
+        }
+    }
+
     /// Translate a character using this character set.
     #[inline]
     #[must_use]
@@ -447,6 +468,18 @@ impl CharacterSet96 {
         }
     }
 
+    /// The SCS final byte that designates this set ([`Self::from_final_byte`] maps it back).
+    #[must_use]
+    pub const fn final_byte(self) -> u8 {
+        match self {
+            Self::IsoLatin1Supplemental => b'A',
+            Self::IsoLatin2Supplemental => b'B',
+            Self::IsoLatin5Supplemental => b'M',
+            Self::IsoLatinCyrillic => b'L',
+            Self::IsoLatinGreek => b'F',
+        }
+    }
+
     /// Translate a 96-character set offset (0-95, for positions 0xA0-0xFF) to a codepoint;
     /// U+FFFD for an out-of-range offset.
     #[inline]
@@ -722,6 +755,18 @@ impl CharacterSetState {
         }
     }
 
+    /// The 96-character override designated to G-set `g_set` (only G1-G3 can hold one).
+    #[inline]
+    #[must_use]
+    pub const fn designated_96(&self, g_set: u8) -> Option<CharacterSet96> {
+        match g_set {
+            1 => self.g1_96,
+            2 => self.g2_96,
+            3 => self.g3_96,
+            _ => None,
+        }
+    }
+
     /// Designate a 96-character set to G1-G3; G0 cannot hold one (ISO 2022).
     #[inline]
     pub const fn designate_96(&mut self, g_set: u8, charset: CharacterSet96) {
@@ -738,5 +783,85 @@ impl CharacterSetState {
     #[inline]
     pub const fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// The escape sequences that bring a default state to this one: each designation, the GL and GR shifts and a pending single shift.
+    #[must_use]
+    pub fn restore_ansi(&self) -> String {
+        let mut out = String::new();
+        let sets = [self.g0, self.g1, self.g2, self.g3];
+        let sets_96 = [None, self.g1_96, self.g2_96, self.g3_96];
+        for (g, (set, set_96)) in sets.into_iter().zip(sets_96).enumerate() {
+            if set != CharacterSet::Ascii {
+                out.push('\x1b');
+                out.push(['(', ')', '*', '+'][g]);
+                out.push(char::from(set.final_byte()));
+            }
+            if let Some(set_96) = set_96 {
+                out.push('\x1b');
+                out.push(['-', '-', '.', '/'][g]);
+                out.push(char::from(set_96.final_byte()));
+            }
+        }
+        out.push_str(match self.gl {
+            GlMapping::G0 => "",
+            GlMapping::G1 => "\x0e",
+            GlMapping::G2 => "\x1bn",
+            GlMapping::G3 => "\x1bo",
+        });
+        out.push_str(match self.gr {
+            GrMapping::G1 => "\x1b~",
+            GrMapping::G2 => "",
+            GrMapping::G3 => "\x1b|",
+        });
+        out.push_str(match self.single_shift {
+            SingleShift::None => "",
+            SingleShift::Ss2 => "\x1bN",
+            SingleShift::Ss3 => "\x1bO",
+        });
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_final_byte_designates_its_own_set_and_a_default_state_restores_with_nothing() {
+        for set in [
+            CharacterSet::Ascii,
+            CharacterSet::DecLineDrawing,
+            CharacterSet::DecSupplemental,
+            CharacterSet::UnitedKingdom,
+            CharacterSet::Dutch,
+            CharacterSet::Finnish,
+            CharacterSet::French,
+            CharacterSet::FrenchCanadian,
+            CharacterSet::German,
+            CharacterSet::Italian,
+            CharacterSet::NorwegianDanish,
+            CharacterSet::Spanish,
+            CharacterSet::Swedish,
+            CharacterSet::Swiss,
+        ] {
+            assert_eq!(CharacterSet::from_final_byte(set.final_byte()), Some(set));
+        }
+        for set in [
+            CharacterSet96::IsoLatin1Supplemental,
+            CharacterSet96::IsoLatin2Supplemental,
+            CharacterSet96::IsoLatin5Supplemental,
+            CharacterSet96::IsoLatinCyrillic,
+            CharacterSet96::IsoLatinGreek,
+        ] {
+            assert_eq!(CharacterSet96::from_final_byte(set.final_byte()), Some(set));
+        }
+        assert_eq!(CharacterSetState::new().restore_ansi(), "");
+        let mut state = CharacterSetState::new();
+        state.designate(0, CharacterSet::DecLineDrawing);
+        state.designate_96(2, CharacterSet96::IsoLatinGreek);
+        state.gl = GlMapping::G1;
+        state.gr = GrMapping::G3;
+        assert_eq!(state.restore_ansi(), "\x1b(0\x1b.F\x0e\x1b|");
     }
 }

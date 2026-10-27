@@ -343,6 +343,7 @@ const VEIL_FALLOFF_28: [[f32; VEIL_HALF_W]; 4] = {
 };
 
 /// Emit one supernova frame's additive quads under `budget`.
+#[inline]
 pub fn emit_super(
     t_ms: u64,
     env: &SuperEnv,
@@ -455,9 +456,18 @@ fn bound_additive_overlap(quads: &mut [GlowQuad]) {
     }
 }
 
+#[inline]
 fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
     if quads.is_empty() {
         return 0;
+    }
+    if let [q] = quads {
+        return if q.w > 0 && q.h > 0 {
+            let c = q.color;
+            ((c >> 16) & 0xff).max((c >> 8) & 0xff).max(c & 0xff)
+        } else {
+            0
+        };
     }
     thread_local! {
         static SCRATCH: std::cell::RefCell<(Vec<GlowQuad>, Vec<GlowQuad>)> =
@@ -773,6 +783,7 @@ fn emit_ring_chords(sink: &mut QuadSink<'_>, env: &SuperEnv, r: f32, thick: f32,
 }
 
 /// Emit one supernova frame's `WordDecoration` stream within `cap`.
+#[inline]
 pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>, cap: usize) {
     const INV_CHARGE_END_MS: f32 = 1.0 / CHARGE_END_MS as f32;
     const INV_DETONATION_SPAN_MS: f32 = 1.0 / (DETONATION_END_MS - CHARGE_END_MS) as f32;
@@ -792,11 +803,12 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 break;
             }
             let (x, y) = charge_mote_pos(env, k, p);
-            let hue = env.base_hue + k as f32 * 30.0;
+            let k_f32 = k as f32;
             k += 1;
             if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
                 continue;
             }
+            let hue = env.base_hue + k_f32 * 30.0;
             let (row, col) = (y / ch, x / cw);
             out.push(WordDecoration {
                 row: row as u16,
@@ -1072,6 +1084,7 @@ const fn peak_shade_probe(decos: &[WordDecoration]) -> u32 {
     peak
 }
 
+#[inline]
 const fn peak_shade_quadratic(decos: &[WordDecoration]) -> u32 {
     let mut peak = 0u32;
     let mut i = 0;

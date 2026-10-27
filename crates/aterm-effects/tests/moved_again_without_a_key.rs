@@ -4,7 +4,7 @@
 //! Verifies that cursor-trail bands follow text across repeated moves without intervening
 //! keystrokes.
 
-use crate::trail_host::{Core, Opts, Theme};
+use crate::trail_host::{Core, Opts, Theme, on_every_ground};
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::time::Duration;
 
@@ -86,112 +86,116 @@ fn draw_box(cols: usize, top: usize, text: &str, transcript: usize) -> Vec<u8> {
 
 #[test]
 fn an_inline_box_moved_by_streamed_rows_follows_every_move() {
-    const COLS: usize = 100;
-    let text = "fix the flaky test in the witness";
-    let n = text.chars().count();
-    let mut missed = Vec::new();
-    for moves in [
-        &[1i32, 1][..],
-        &[1, 1, 1],
-        &[-1, -1],
-        &[1, 2],
-        &[2, 1],
-        &[-1, -2],
-        &[1, -1],
-        &[-1, 1],
-        &[2, 2],
-    ] {
-        for gap in [60u64, 150, 300] {
-            let mut h = Host::new(40, COLS);
-            let mut top = 10usize;
-            h.program(&draw_box(COLS, top, "", top));
-            h.idle(100);
-            for (i, ch) in text.chars().enumerate() {
-                let bytes = format!(
-                    "\x1b[?2026h\x1b[?25l\x1b[{};{}H{ch}\x1b[{};{}H\x1b[?25h\x1b[?2026l",
-                    top + 2,
-                    3 + i,
-                    top + 2,
-                    4 + i
-                );
-                h.key(ch, bytes.as_bytes(), 90);
-            }
-            h.idle(100);
-            assert_eq!(
-                h.live((top + 1) as u16).len(),
-                n,
-                "fixture: the band is under the text"
-            );
-            for (k, &dr) in moves.iter().enumerate() {
-                top = (top as i32 + dr) as usize;
-                let (f0, r0) = h.counts();
-                h.program(&draw_box(COLS, top, text, top));
-                h.frame();
-                let (f1, r1) = h.counts();
-                let got = (f1 - f0, r1 - r0, h.live((top + 1) as u16).len());
-                if got != (n as u64, 0, n) {
-                    missed.push((moves.to_vec(), gap, k + 1, got));
+    on_every_ground(|| {
+        const COLS: usize = 100;
+        let text = "fix the flaky test in the witness";
+        let n = text.chars().count();
+        let mut missed = Vec::new();
+        for moves in [
+            &[1i32, 1][..],
+            &[1, 1, 1],
+            &[-1, -1],
+            &[1, 2],
+            &[2, 1],
+            &[-1, -2],
+            &[1, -1],
+            &[-1, 1],
+            &[2, 2],
+        ] {
+            for gap in [60u64, 150, 300] {
+                let mut h = Host::new(40, COLS);
+                let mut top = 10usize;
+                h.program(&draw_box(COLS, top, "", top));
+                h.idle(100);
+                for (i, ch) in text.chars().enumerate() {
+                    let bytes = format!(
+                        "\x1b[?2026h\x1b[?25l\x1b[{};{}H{ch}\x1b[{};{}H\x1b[?25h\x1b[?2026l",
+                        top + 2,
+                        3 + i,
+                        top + 2,
+                        4 + i
+                    );
+                    h.key(ch, bytes.as_bytes(), 90);
                 }
-                h.idle(gap);
+                h.idle(100);
+                assert_eq!(
+                    h.live((top + 1) as u16).len(),
+                    n,
+                    "fixture: the band is under the text"
+                );
+                for (k, &dr) in moves.iter().enumerate() {
+                    top = (top as i32 + dr) as usize;
+                    let (f0, r0) = h.counts();
+                    h.program(&draw_box(COLS, top, text, top));
+                    h.frame();
+                    let (f1, r1) = h.counts();
+                    let got = (f1 - f0, r1 - r0, h.live((top + 1) as u16).len());
+                    if got != (n as u64, 0, n) {
+                        missed.push((moves.to_vec(), gap, k + 1, got));
+                    }
+                    h.idle(gap);
+                }
             }
         }
-    }
-    assert!(
-        missed.is_empty(),
-        "(moves, gap ms, move, (followed, retired, live on the text's row)) that did not \
-         carry all {n} cells: {missed:?}"
-    );
+        assert!(
+            missed.is_empty(),
+            "(moves, gap ms, move, (followed, retired, live on the text's row)) that did not \
+             carry all {n} cells: {missed:?}"
+        );
+    });
 }
 
 #[test]
 fn an_inline_box_at_the_screen_s_bottom_keeps_its_band_under_every_streamed_row() {
-    const ROWS: usize = 40;
-    const COLS: usize = 100;
-    let rule = "\u{2500}".repeat(COLS);
-    let text = "fix the flaky test in the witness";
-    let n = text.chars().count();
-    let mut h = Host::new(ROWS, COLS);
-    let mut s = String::new();
-    for i in 0..(ROWS - 4) {
-        s.push_str(&format!("\u{25cf} transcript row {i}\r\n"));
-    }
-    s.push_str(&format!(
-        "{rule}\r\n\u{276f} \r\n{rule}\r\n  ? for shortcuts\x1b[{};3H",
-        ROWS - 2
-    ));
-    h.program(s.as_bytes());
-    h.idle(100);
-    let text_row = (ROWS - 3) as u16;
-    for (i, ch) in text.chars().enumerate() {
-        let bytes = format!("\x1b[{};{}H{ch}", ROWS - 2, 3 + i);
-        h.key(ch, bytes.as_bytes(), 90);
-    }
-    h.idle(100);
-    assert_eq!(
-        h.live(text_row).len(),
-        n,
-        "fixture: the band is under the text"
-    );
-    for k in 1..=3usize {
-        let (f0, r0) = h.counts();
-        h.program(
-            format!(
-                "\x1b[?2026h\x1b[?25l\x1b[{};1H\u{25cf} streamed row {k}\x1b[K\r\n{rule}\r\n\u{276f} {text}\x1b[K\r\n{rule}\r\n  ? for shortcuts\x1b[K\x1b[{};{}H\x1b[?25h\x1b[?2026l",
-                ROWS - 3,
-                ROWS - 2,
-                3 + n
-            )
-            .as_bytes(),
-        );
-        h.frame();
-        let (f1, r1) = h.counts();
+    on_every_ground(|| {
+        const ROWS: usize = 40;
+        const COLS: usize = 100;
+        let rule = "\u{2500}".repeat(COLS);
+        let text = "fix the flaky test in the witness";
+        let n = text.chars().count();
+        let mut h = Host::new(ROWS, COLS);
+        let mut s = String::new();
+        for i in 0..(ROWS - 4) {
+            s.push_str(&format!("\u{25cf} transcript row {i}\r\n"));
+        }
+        s.push_str(&format!(
+            "{rule}\r\n\u{276f} \r\n{rule}\r\n  ? for shortcuts\x1b[{};3H",
+            ROWS - 2
+        ));
+        h.program(s.as_bytes());
+        h.idle(100);
+        let text_row = (ROWS - 3) as u16;
+        for (i, ch) in text.chars().enumerate() {
+            let bytes = format!("\x1b[{};{}H{ch}", ROWS - 2, 3 + i);
+            h.key(ch, bytes.as_bytes(), 90);
+        }
+        h.idle(100);
         assert_eq!(
-            (f1 - f0, r1 - r0, h.live(text_row).len()),
-            (n as u64, 0, n),
-            "streamed row {k}: the band is back under the text on row {text_row}"
+            h.live(text_row).len(),
+            n,
+            "fixture: the band is under the text"
         );
-        h.idle(150);
-    }
+        for k in 1..=3usize {
+            let (f0, r0) = h.counts();
+            h.program(
+                format!(
+                    "\x1b[?2026h\x1b[?25l\x1b[{};1H\u{25cf} streamed row {k}\x1b[K\r\n{rule}\r\n\u{276f} {text}\x1b[K\r\n{rule}\r\n  ? for shortcuts\x1b[K\x1b[{};{}H\x1b[?25h\x1b[?2026l",
+                    ROWS - 3,
+                    ROWS - 2,
+                    3 + n
+                )
+                .as_bytes(),
+            );
+            h.frame();
+            let (f1, r1) = h.counts();
+            assert_eq!(
+                (f1 - f0, r1 - r0, h.live(text_row).len()),
+                (n as u64, 0, n),
+                "streamed row {k}: the band is back under the text on row {text_row}"
+            );
+            h.idle(150);
+        }
+    });
 }
 
 struct Composer {
@@ -276,95 +280,101 @@ impl Composer {
 
 #[test]
 fn a_far_row_read_dropped_on_one_newline_s_frame_costs_no_later_follow() {
-    let mut c = Composer::new(53, 91);
-    let list = ["- fix the wrap", "- keep the band", "- test it all"];
-    for (k, line) in list.iter().enumerate() {
-        for ch in line.chars() {
-            c.key(ch);
+    on_every_ground(|| {
+        let mut c = Composer::new(53, 91);
+        let list = ["- fix the wrap", "- keep the band", "- test it all"];
+        for (k, line) in list.iter().enumerate() {
+            for ch in line.chars() {
+                c.key(ch);
+            }
+            if k + 1 == list.len() {
+                break;
+            }
+            let caret_row = (c.caret_row1() - 1) as u16;
+            let mut lit: Vec<usize> = (0..c.lines.len())
+                .map(|i| c.h.live(c.line_row(i)).len())
+                .collect();
+            lit.push(c.h.live(caret_row).len());
+            let (f0, r0) = c.h.counts();
+            c.newline();
+            c.h.drop_far_frames = u32::from(k == 0);
+            c.h.frame();
+            c.h.frame();
+            let (f1, r1) = c.h.counts();
+            for (i, before) in lit.iter().enumerate() {
+                let now = c.h.live(c.line_row(i)).len();
+                assert!(
+                    now >= *before,
+                    "newline {}: line {i} (`{}`) had {before} lit cells and has {now} on row {} — \
+                     (followed +{}, retired +{})",
+                    k + 1,
+                    c.lines[i],
+                    c.line_row(i),
+                    f1 - f0,
+                    r1 - r0
+                );
+            }
+            assert_eq!(r1 - r0, 0, "newline {}: nothing retired", k + 1);
         }
-        if k + 1 == list.len() {
-            break;
-        }
-        let caret_row = (c.caret_row1() - 1) as u16;
-        let mut lit: Vec<usize> = (0..c.lines.len())
-            .map(|i| c.h.live(c.line_row(i)).len())
-            .collect();
-        lit.push(c.h.live(caret_row).len());
-        let (f0, r0) = c.h.counts();
-        c.newline();
-        c.h.drop_far_frames = u32::from(k == 0);
-        c.h.frame();
-        c.h.frame();
-        let (f1, r1) = c.h.counts();
-        for (i, before) in lit.iter().enumerate() {
-            let now = c.h.live(c.line_row(i)).len();
-            assert!(
-                now >= *before,
-                "newline {}: line {i} (`{}`) had {before} lit cells and has {now} on row {} — \
-                 (followed +{}, retired +{})",
-                k + 1,
-                c.lines[i],
-                c.line_row(i),
-                f1 - f0,
-                r1 - r0
-            );
-        }
-        assert_eq!(r1 - r0, 0, "newline {}: nothing retired", k + 1);
-    }
+    });
 }
 
 #[test]
 fn a_row_the_host_has_a_slot_for_is_never_withheld() {
-    let mut h = Host::new(24, 80);
-    for row in [3u16, 7, 11] {
-        h.program(format!("\x1b[{};1H$ ", row + 1).as_bytes());
-        h.type_str("abcd");
-    }
-    h.program(b"\x1b[21;1H$ ");
-    h.idle(64);
-    let named = h.named();
-    assert_eq!(
-        named.len(),
-        aterm_effects::rainbow_kitty::witness::WITNESS_ROWS,
-        "fixture: the bands fill their rows: {named:?}"
-    );
-    assert!(
-        !named.contains(&20),
-        "fixture: the caret's row is not one of them: {named:?}"
-    );
-    let (_, r0) = h.counts();
-    h.program(b"\x1b7\x1b[8;3Hwxyz\x1b8");
-    let (_, r1) = h.counts();
-    assert_eq!(
-        r1 - r0,
-        4,
-        "row 7 rewritten in place retires its band on the frame that shows it"
-    );
+    on_every_ground(|| {
+        let mut h = Host::new(24, 80);
+        for row in [3u16, 7, 11] {
+            h.program(format!("\x1b[{};1H$ ", row + 1).as_bytes());
+            h.type_str("abcd");
+        }
+        h.program(b"\x1b[21;1H$ ");
+        h.idle(64);
+        let named = h.named();
+        assert_eq!(
+            named.len(),
+            aterm_effects::rainbow_kitty::witness::WITNESS_ROWS,
+            "fixture: the bands fill their rows: {named:?}"
+        );
+        assert!(
+            !named.contains(&20),
+            "fixture: the caret's row is not one of them: {named:?}"
+        );
+        let (_, r0) = h.counts();
+        h.program(b"\x1b7\x1b[8;3Hwxyz\x1b8");
+        let (_, r1) = h.counts();
+        assert_eq!(
+            r1 - r0,
+            4,
+            "row 7 rewritten in place retires its band on the frame that shows it"
+        );
+    });
 }
 
 #[test]
 fn a_torn_repaint_that_draws_the_new_row_a_frame_before_it_erases_the_old_still_follows() {
-    for (from, to) in [(5u16, 6u16), (20, 19)] {
-        let mut h = Host::new(24, 80);
-        h.term.process(format!("\x1b[{};1H", from + 1).as_bytes());
-        h.frame();
-        h.type_str("hello world");
-        h.idle(200);
-        let want: Vec<u16> = (0..11).collect();
-        assert_eq!(
-            h.live(from),
-            want,
-            "fixture: the band is under `hello world`"
-        );
-        let (f0, r0) = h.counts();
-        h.program(format!("\x1b[{};1Hhello world", to + 1).as_bytes());
-        h.program(format!("\x1b[{};1H\x1b[2K\x1b[{};12H", from + 1, to + 1).as_bytes());
-        h.frame();
-        let (f1, r1) = h.counts();
-        assert_eq!(
-            (f1 - f0, r1 - r0, h.live(to)),
-            (11, 0, want),
-            "row {from} → {to}, torn over two frames: the band follows its text"
-        );
-    }
+    on_every_ground(|| {
+        for (from, to) in [(5u16, 6u16), (20, 19)] {
+            let mut h = Host::new(24, 80);
+            h.term.process(format!("\x1b[{};1H", from + 1).as_bytes());
+            h.frame();
+            h.type_str("hello world");
+            h.idle(200);
+            let want: Vec<u16> = (0..11).collect();
+            assert_eq!(
+                h.live(from),
+                want,
+                "fixture: the band is under `hello world`"
+            );
+            let (f0, r0) = h.counts();
+            h.program(format!("\x1b[{};1Hhello world", to + 1).as_bytes());
+            h.program(format!("\x1b[{};1H\x1b[2K\x1b[{};12H", from + 1, to + 1).as_bytes());
+            h.frame();
+            let (f1, r1) = h.counts();
+            assert_eq!(
+                (f1 - f0, r1 - r0, h.live(to)),
+                (11, 0, want),
+                "row {from} → {to}, torn over two frames: the band follows its text"
+            );
+        }
+    });
 }

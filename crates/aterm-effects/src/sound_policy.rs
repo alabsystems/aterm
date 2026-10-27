@@ -66,6 +66,7 @@ pub const fn voice_gain(voice: Voice, terms: &VoiceTerms) -> Option<f32> {
 }
 
 /// Resolve trail-audio policy from real window focus.
+#[must_use]
 #[inline]
 pub const fn trail_sound_gain(raw_focused: bool, configured: bool, volume: f32) -> Option<f32> {
     if raw_focused && configured && volume > 0.0 {
@@ -76,6 +77,7 @@ pub const fn trail_sound_gain(raw_focused: bool, configured: bool, volume: f32) 
 }
 
 /// Resolve sing-along riff audio.
+#[must_use]
 #[inline]
 pub const fn sing_riff_gain(
     raw_focused: bool,
@@ -96,6 +98,7 @@ pub const fn sing_riff_gain(
 }
 
 /// Whether the person asked for any aurora at all.
+#[must_use]
 #[inline]
 pub const fn user_lit(resolved: &crate::cursor_glow::GlowConfig) -> bool {
     resolved.intensity > 0.0
@@ -201,6 +204,7 @@ pub struct TrailSoundPolicy {
 }
 
 /// Map one drained cue onto its synth event.
+#[must_use]
 #[inline]
 pub const fn trail_sound_event(
     cue: &crate::cursor_glow::SoundCue,
@@ -251,6 +255,7 @@ pub fn drain_trail_sound_cues(
 }
 
 /// Resolve curse-bonk policy.
+#[must_use]
 #[inline]
 pub const fn bonk_sound_gain(
     raw_focused: bool,
@@ -299,6 +304,7 @@ impl Default for CurseDrain {
 /// enabled ones as namespaced [`crate::trail_sound::WordGesture::Bonk`]
 /// gestures; the sparkle-words twin of [`drain_trail_sound_cues`], so a
 /// disabled knob never leaves a backlog.
+#[inline]
 pub fn drain_curse_bonk_cues(
     decos: &mut crate::word_decorations::WordDecorations,
     style: crate::cursor_glow::GlowStyle,

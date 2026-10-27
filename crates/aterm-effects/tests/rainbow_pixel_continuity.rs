@@ -673,6 +673,7 @@ struct DiffComposer {
     use_sync: bool,
     bordered: bool,
     tight_border: bool,
+    margin: usize,
     top_anchored: bool,
     drawn_top: usize,
     drawn_bottom: usize,
@@ -694,6 +695,7 @@ impl DiffComposer {
             use_sync: true,
             bordered: false,
             tight_border: false,
+            margin: 0,
             top_anchored: false,
             drawn_top: rows,
             drawn_bottom: 0,
@@ -701,13 +703,14 @@ impl DiffComposer {
     }
 
     const fn text_col0(&self) -> usize {
-        if self.tight_border {
-            1
-        } else if self.bordered {
-            4
-        } else {
-            3
-        }
+        self.margin
+            + if self.tight_border {
+                1
+            } else if self.bordered {
+                4
+            } else {
+                3
+            }
     }
 
     fn apply_char(&mut self, ch: char) {
@@ -724,13 +727,14 @@ impl DiffComposer {
 
     fn wrap_lines(&self) -> (WrappedRows, (usize, usize)) {
         let col0 = self.text_col0();
-        let right_pad = if self.tight_border {
-            1
-        } else if self.bordered {
-            2
-        } else {
-            1
-        };
+        let right_pad = self.margin
+            + if self.tight_border {
+                1
+            } else if self.bordered {
+                2
+            } else {
+                1
+            };
         let tw = self.cols.saturating_sub(col0 + right_pad).max(4);
         let mut lines: Vec<Vec<char>> = vec![Vec::new()];
         let mut pos: Vec<(usize, usize)> = Vec::with_capacity(self.text.len() + 1);
@@ -782,26 +786,32 @@ impl DiffComposer {
         } else {
             self.base_row.saturating_sub(n + 1)
         };
+        let m = self.margin;
+        let r_edge = self.cols - 1 - m;
         let mut rows_out = Vec::with_capacity(n + 2);
-        let mut top_rule = vec!['\u{2500}'; self.cols];
-        let mut bot_rule = vec!['\u{2500}'; self.cols];
+        let mut top_rule = vec![' '; self.cols];
+        let mut bot_rule = vec![' '; self.cols];
+        for c in m..=r_edge {
+            top_rule[c] = '\u{2500}';
+            bot_rule[c] = '\u{2500}';
+        }
         if self.bordered || self.tight_border {
-            top_rule[0] = '\u{256d}';
-            top_rule[self.cols - 1] = '\u{256e}';
-            bot_rule[0] = '\u{2570}';
-            bot_rule[self.cols - 1] = '\u{256f}';
+            top_rule[m] = '\u{256d}';
+            top_rule[r_edge] = '\u{256e}';
+            bot_rule[m] = '\u{2570}';
+            bot_rule[r_edge] = '\u{256f}';
         }
         rows_out.push((top, top_rule));
         for (idx, l) in lines.iter().enumerate() {
             let mut row = vec![' '; self.cols];
             if self.bordered || self.tight_border {
-                row[0] = '\u{2502}';
-                row[self.cols - 1] = '\u{2502}';
+                row[m] = '\u{2502}';
+                row[r_edge] = '\u{2502}';
                 if self.bordered && idx == 0 {
-                    row[2] = '\u{203a}';
+                    row[m + 2] = '\u{203a}';
                 }
             } else if idx == 0 {
-                row[1] = '\u{276f}';
+                row[m + 1] = '\u{276f}';
             }
             for (k, &c) in l.iter().enumerate() {
                 if col0 + k < self.cols {
@@ -1595,6 +1605,107 @@ fn pixel_continuity_across_backspaces_retypes_glides_and_wraps() {
         );
         if !h2.gaps.is_empty() {
             failures.extend(h2.gaps);
+        }
+
+        // 4c. Coalesced `' '` + word-start (`" w"` / `" wo"`) right at the right margin when the
+        // preceding word stays on the upper row (`!ended_at_space`, `moved_word > 0`), plus
+        // 2-space margin-indented 4-sided box-bordered composers (`"  │ ... │  "`), across both
+        // upward-growing (`top_anchored = false`) and downward-growing (`top_anchored = true`)
+        // layouts and IME count-only wraps:
+        for &(top_anchored, margin, ime) in &[
+            (false, 0usize, false),
+            (true, 0usize, false),
+            (false, 2usize, false),
+            (true, 2usize, false),
+            (true, 2usize, true),
+        ] {
+            let base_row = if top_anchored { 6 } else { 26 };
+            let mut h3 = NativeHarness::new(30, 48, 11, 22, cfg, false);
+            h3.ime_text_mode = ime;
+            h3.feed(b"\x1b[?1049h\x1b[2J\x1b[H");
+            let mut comp3 = DiffComposer::new(30, 48, base_row, true);
+            comp3.bordered = true;
+            comp3.margin = margin;
+            comp3.top_anchored = top_anchored;
+            let c0 = comp3.text_col0() as u16;
+            let tw = 48usize - (comp3.text_col0() + margin + 2);
+            let (b0, (_, init_cc)) = comp3.render_diff(None);
+            let init_cr = if top_anchored {
+                (base_row + 1) as u16
+            } else {
+                (base_row - 1) as u16
+            };
+            let _ = init_cc;
+            h3.feed(&b0);
+            h3.advance_us(16_667, init_cr, None, "margin_box_init");
+
+            // Fill line 0 to exact width `tw` ending in a non-space word (`!ended_at_space`), so
+            // `moved_word > 0`, then coalesce `' '` + `'w'` + `'o'` in one redraw (or per-key on
+            // the IME case to exercise `indented_wrap_landing` on `"  │ ... │  "`):
+            let fill_word = "labor";
+            let pad_len = tw - fill_word.len();
+            let mut line0 = String::with_capacity(tw);
+            while line0.len() + 5 < pad_len {
+                line0.push_str("sync ");
+            }
+            while line0.len() + 1 < pad_len {
+                line0.push('x');
+            }
+            if line0.len() < pad_len {
+                line0.push(' ');
+            }
+            line0.push_str(fill_word);
+            assert_eq!(line0.len(), tw);
+
+            for ch in line0.chars() {
+                h3.key_press(ch);
+                comp3.apply_char(ch);
+                let (bytes, (cr, cc)) = comp3.render_diff(None);
+                h3.feed(&bytes);
+                h3.advance_us(12_000, cr, Some((cc.saturating_sub(1), cc)), "fill_line0");
+            }
+
+            if ime {
+                // IME count-only wrap inside `"  │ ... │  "` (`margin = 2`, `top_anchored = true`):
+                // `'s'` extends `"labor"` -> `"labors"` and wraps onto `pr + 1` with zero HeldPark!
+                let parked_before = h3.fx.cursor().glow.in_flight_tally().park_flushed;
+                for ch in "s next".chars() {
+                    h3.key_press(ch);
+                    comp3.apply_char(ch);
+                    let (bytes, (cr, cc)) = comp3.render_diff(None);
+                    h3.feed(&bytes);
+                    h3.advance_us(
+                        12_000,
+                        cr,
+                        Some((cc.saturating_sub(1).max(c0), cc)),
+                        "ime_margin_box_wrap",
+                    );
+                }
+                assert_eq!(
+                    h3.fx.cursor().glow.in_flight_tally().park_flushed,
+                    parked_before,
+                    "margin-indented 4-sided box wrap must not enter HeldPark"
+                );
+            } else {
+                // Coalesce `' '` + `'w'` + `'o'` in one redraw right after `"labor"` at `tw`:
+                for ch in [' ', 'w', 'o'] {
+                    h3.key_press(ch);
+                    comp3.apply_char(ch);
+                }
+                let (bytes, (cr, cc)) = comp3.render_diff(None);
+                assert_eq!(cc, c0 + 2, "expected 'wo' to land at col0..col0+2");
+                h3.feed(&bytes);
+                let tag = format!("coal_space_word top={top_anchored} margin={margin}");
+                h3.advance_us(12_000, cr, Some((c0, cc)), &tag);
+                assert_eq!(
+                    h3.fx.cursor().glow.in_flight_tally().forgotten,
+                    0,
+                    "{tag}: coalesced space+word wrap must spend, not forget, credits"
+                );
+            }
+            if !h3.gaps.is_empty() {
+                failures.extend(h3.gaps);
+            }
         }
     }
 

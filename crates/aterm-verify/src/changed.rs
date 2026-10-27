@@ -525,7 +525,7 @@ pub fn resolve(root: &Path, tools: &Toolchain, path_env: &OsStr, base: &str) -> 
         &manifests,
         &members,
         &|| read_path_packages(root, tools, path_env, &members),
-        &|c| invert(root, tools, path_env, members.spec(c)),
+        &|c| invert(root, &tools.targo, path_env, members.spec(c)),
         &|p| replan_of(root, path_env, &merge_base, p),
     )
 }
@@ -806,8 +806,8 @@ fn stdout_of(cmd: &mut Command, root: &Path, path_env: &OsStr) -> Option<String>
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn targo_tree(root: &Path, tools: &Toolchain, path_env: &OsStr, args: &[&str]) -> Option<String> {
-    stdout_of(Command::new(&tools.targo).args(args), root, path_env)
+fn targo_tree(root: &Path, targo: &Path, path_env: &OsStr, args: &[&str]) -> Option<String> {
+    stdout_of(Command::new(targo).args(args), root, path_env)
 }
 
 /// Parse `(name, manifest_dir)` entries from `cargo tree` output.
@@ -829,7 +829,7 @@ pub fn parse_graph_entries(text: &str, root_prefix: &str) -> Vec<(String, String
 fn read_members(root: &Path, tools: &Toolchain, path_env: &OsStr) -> Members {
     let Some(out) = targo_tree(
         root,
-        tools,
+        &tools.targo,
         path_env,
         &[
             "tree",
@@ -915,7 +915,7 @@ fn read_path_packages(
 ) -> Option<Vec<(String, String)>> {
     let out = targo_tree(
         root,
-        tools,
+        &tools.targo,
         path_env,
         &[
             "tree",
@@ -939,15 +939,14 @@ fn read_path_packages(
     Some(found)
 }
 
-fn invert(
-    root: &Path,
-    tools: &Toolchain,
-    path_env: &OsStr,
-    crate_name: &str,
-) -> Option<Vec<String>> {
+/// The workspace members that depend on `crate_name`, it among them, over normal, build and dev
+/// edges. A member that links it only for its own tests is one: aterm-models dev-depends on every
+/// crate that anchors a model, so a change to any of them brings its source-spec closure test
+/// into the cone.
+fn invert(root: &Path, targo: &Path, path_env: &OsStr, crate_name: &str) -> Option<Vec<String>> {
     let out = targo_tree(
         root,
-        tools,
+        targo,
         path_env,
         &[
             "tree",
@@ -1484,6 +1483,51 @@ checksum = "aaa"
         );
         let (seeds, crates) = pick(&["docs/PROCESS.md", "tools/install.sh"], &graph(EDGES));
         assert!(seeds.is_empty() && crates.is_empty());
+    }
+
+    /// The graph the cone closes over, read from a real workspace: a member that names a crate
+    /// only among its dev-dependencies (as aterm-models names every anchored crate, for its
+    /// source-spec closure test) depends on it; an unrelated member does not.
+    #[test]
+    fn a_member_that_links_a_crate_only_for_its_tests_depends_on_it() {
+        let made = crate::mktemp_dir("atv-changed-dev-edge").expect("mktemp");
+        let root = std::fs::canonicalize(&made).expect("the fixture's own path");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver='2'\nmembers=['anchored','closure','other']\n",
+        )
+        .expect("workspace manifest");
+        for (name, deps) in [
+            ("anchored", ""),
+            (
+                "closure",
+                "[dev-dependencies]\nanchored={path='../anchored'}\n",
+            ),
+            ("other", ""),
+        ] {
+            let package = root.join(name);
+            std::fs::create_dir_all(package.join("src")).expect("fixture source dir");
+            std::fs::write(package.join("src/lib.rs"), "").expect("empty library");
+            std::fs::write(
+                package.join("Cargo.toml"),
+                format!("[package]\nname='{name}'\nversion='1.0.0'\nedition='2021'\n{deps}"),
+            )
+            .expect("package manifest");
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let found = invert(&root, Path::new(env!("CARGO")), &path, "anchored");
+        let _ = std::fs::remove_dir_all(&made);
+        let found: BTreeSet<String> = found
+            .expect("the inverted graph reads")
+            .into_iter()
+            .collect();
+        assert_eq!(
+            found,
+            ["anchored", "closure"]
+                .map(String::from)
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]

@@ -148,11 +148,11 @@ impl Kind {
     #[must_use]
     pub const fn next_action(self) -> &'static str {
         match self {
-            Kind::Refused => "read why=; fix the config or run it as the person it needs",
+            Kind::Refused => "read why= and next=; agh policy check names every fault of the rows",
             Kind::Usage => "agh help <verb>",
             Kind::CouldNotRun => "retry later, once the cause why= names is gone",
             Kind::Unauthenticated => {
-                "a person provisions or rotates the credential (agh auth status)"
+                "agh auth status names the token and its remedy; agh auth add NAME --file PATH replaces"
             }
             Kind::Forbidden => "a person grants what sub= and accepted= name",
             Kind::NotFound => "the thing does not exist",
@@ -286,6 +286,11 @@ pub enum Forbid {
     Blocked,
     /// Any other 403.
     Other,
+    /// A token that lacks an OAuth scope GitHub named (git's workflow-scope refusal).
+    Scope {
+        /// The scope GitHub named.
+        needed: String,
+    },
 }
 
 impl Forbid {
@@ -300,6 +305,7 @@ impl Forbid {
             Forbid::DraftsUnproven => "forbid.drafts_unproven",
             Forbid::Blocked => "forbid.blocked",
             Forbid::Other => "forbid.other",
+            Forbid::Scope { .. } => "forbid.scope",
         }
     }
 }
@@ -332,6 +338,8 @@ pub enum Replay {
     StreamNotTaped,
     /// Invalid tape format or unsupported header.
     Format,
+    /// A streamed body's sidecar is missing, or its sha256 is not the tape's.
+    StreamDigest,
 }
 
 impl Replay {
@@ -352,6 +360,7 @@ impl Replay {
             Replay::BodyNotTaped => "body_not_taped",
             Replay::StreamNotTaped => "stream_not_taped",
             Replay::Format => "format",
+            Replay::StreamDigest => "stream_digest",
         }
     }
 
@@ -447,6 +456,59 @@ pub enum Sub {
     Policy(RefusalCode),
     /// A replayed run diverged from its tape, or the tape is not one agh can replay.
     Replay(Replay),
+    /// The profile's token is another login's (design §6.1): the binding `GET /user` saw.
+    LoginMismatch {
+        /// The login the profile names.
+        expected: String,
+        /// The login GitHub answered.
+        got: String,
+    },
+    /// A draft with the tag that no open intent of this journal made (design §11.2).
+    ForeignDraft {
+        /// The draft's id.
+        id: u64,
+    },
+    /// The release is immutable: agh refuses asset changes on it locally (design §11.2).
+    Immutable {
+        /// The release's id.
+        id: u64,
+    },
+    /// A guard read found the state other than the write needs (design §7.4, §11.2).
+    GuardFailed {
+        /// What the guard saw, redacted.
+        what: String,
+    },
+    /// The write journal is damaged in the middle (design §6.8).
+    JournalFault {
+        /// The byte offset.
+        at: u64,
+    },
+    /// The write journal is past `JOURNAL_MAX`.
+    JournalFull {
+        /// Its length.
+        len: u64,
+    },
+    /// An open intent stands where a new one would begin (design §10.2: no re-POST, ever).
+    IntentOpen {
+        /// The open intent's id.
+        intent: String,
+    },
+    /// `agh intent retract` of an intent that is not open.
+    NotOpen {
+        /// `settled`, `found` or `retracted`.
+        state: String,
+    },
+    /// A git child exited non-zero (design §6.9).
+    Git {
+        /// Its exit code; `None` when a signal ended it. A run killed at its bound is could_not_run
+        /// `Sub::Local` instead (`fx::child::run`).
+        exit: Option<i32>,
+    },
+    /// A clone's local config rewrites where git goes (design §6.9).
+    GitConfig {
+        /// The key.
+        key: String,
+    },
 }
 
 impl Sub {
@@ -476,6 +538,16 @@ impl Sub {
             Sub::SearchCap => "search_cap",
             Sub::Protocol => "protocol",
             Sub::Local => "local",
+            Sub::LoginMismatch { .. } => "login_mismatch",
+            Sub::ForeignDraft { .. } => "foreign_draft",
+            Sub::Immutable { .. } => "immutable",
+            Sub::GuardFailed { .. } => "guard_failed",
+            Sub::JournalFault { .. } => "journal_fault",
+            Sub::JournalFull { .. } => "journal_full",
+            Sub::IntentOpen { .. } => "intent_open",
+            Sub::NotOpen { .. } => "not_open",
+            Sub::Git { .. } => "git",
+            Sub::GitConfig { .. } => "git_config",
         };
         Some(fixed.to_string())
     }
@@ -784,6 +856,12 @@ impl Error {
             self.why = why();
         }
         self
+    }
+
+    /// A WP0 stub's refusal; WP14 deletes it once nothing calls it.
+    #[must_use]
+    pub fn not_yet(what: &str, package: &str) -> Error {
+        Error::could_not_run(format!("not yet: {what} lands in {package}")).with_sub(Sub::Local)
     }
 
     /// A replay's stop: `Sub::Replay(what)` with `why`.

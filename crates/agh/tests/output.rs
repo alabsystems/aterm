@@ -314,7 +314,8 @@ fn whole_value_nouns_print_whole() {
 #[test]
 fn context_nouns_project_their_own_fields() {
     let identity = json!({
-        "profile": "dev", "tier": "dev", "source": "file", "presence": "present", "why": null,
+        "profile": "dev", "tier": "dev", "source": "file", "from": "vault", "presence": "present",
+        "why": null,
         "fingerprint": "sha256:00", "kind": "classic", "login": "fixture-dev-bot",
         "remedy": null, "extra": 1
     });
@@ -327,6 +328,7 @@ fn context_nouns_project_their_own_fields() {
         keys(&printed[0]),
         [
             "fingerprint",
+            "from",
             "kind",
             "login",
             "presence",

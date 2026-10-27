@@ -24,6 +24,7 @@ pub(super) struct Sink {
 impl Sink {
     /// Push `r` (clipped to `clip` and the box) as a horizontal ramp from `l` at its left edge to
     /// `rt` at its right; split at every row band.
+    #[inline]
     pub(super) fn push(&self, out: &mut Vec<GlowQuad>, clip: Rect, r: Rect, l: Paint, rt: Paint) {
         if l.alpha == 0 && l.color == 0 && rt.color == 0 {
             return;
@@ -38,7 +39,9 @@ impl Sink {
         while y < c.y1 {
             let band = (y - g.oy).div_euclid(g.ch);
             let end = g.band(band + 1).min(c.y1);
-            if let Ok(row) = u16::try_from(g.row_base + band) {
+            let row_i64 = g.row_base + band;
+            if (0..=i64::from(u16::MAX)).contains(&row_i64) {
+                let row = row_i64 as u16;
                 out.push(GlowQuad::gradient(
                     row,
                     c.x0 as u16,
@@ -56,6 +59,7 @@ impl Sink {
     }
 
     /// [`Self::push`] for one flat colour.
+    #[inline]
     pub(super) fn flat(&self, out: &mut Vec<GlowQuad>, clip: Rect, r: Rect, p: Paint) {
         self.push(out, clip, r, p, p);
     }
@@ -68,10 +72,12 @@ pub(super) struct QuadSink<'a> {
 }
 
 impl Ramps for QuadSink<'_> {
+    #[inline]
     fn ramp(&mut self, clip: Rect, r: Rect, l: Paint, rt: Paint) {
         self.sink.push(self.out, clip, r, l, rt);
     }
 
+    #[inline]
     fn side(&mut self, clip: Rect, r: Rect, p: Paint) {
         self.sink.flat(self.out, clip, r, p);
     }
@@ -80,6 +86,7 @@ impl Ramps for QuadSink<'_> {
 /// Lay the flat piece `r`, clipped to `clip`, in `paint`, but where it lies on `on_trail` (a light
 /// frame's trail ink, segment by segment) in `glint`: on the trail one quad a run of segments that
 /// share the piece's rows, off it the piece less every segment ([`lay_cut`]).
+#[inline]
 pub(super) fn lay_toned(
     out: &mut Vec<GlowQuad>,
     sink: &Sink,
@@ -96,9 +103,8 @@ pub(super) fn lay_toned(
     if q.is_empty() {
         return;
     }
-    let lo = on_trail.partition_point(|c| c.x1 <= q.x0);
-    let span = on_trail[lo..].partition_point(|c| c.x0 < q.x1);
-    let on_trail = &on_trail[lo..lo + span];
+    let (lo, hi) = q.x_span(on_trail);
+    let on_trail = &on_trail[lo..hi];
     let Some(last) = on_trail.len().checked_sub(1) else {
         sink.flat(out, clip, q, paint);
         return;
@@ -136,6 +142,7 @@ pub(super) fn lay_toned(
     reason = "output + sink + clip + centre + arm + coverage + glint + colour + the \
               trail's ink + paint: the push_twinkle_star call with its clip, tones and paint"
 )]
+#[inline]
 pub(super) fn lay_star(
     out: &mut Vec<GlowQuad>,
     sink: &Sink,
@@ -151,17 +158,21 @@ pub(super) fn lay_star(
     if cov < 1.0 || arm < 1 {
         return;
     }
-    let tone = |rgb: u32, c: f32| {
+    #[inline]
+    const fn star_tone(rgb: u32, c: f32, added: bool) -> Paint {
         if added {
             light(rgb, c)
         } else {
             ink(rgb, c * 255.0 / STAR_PRINT_FULL)
         }
-    };
-    let paint = |c: f32| (tone(color, c), tone(WHITE, c));
-    let full = paint(cov.floor());
+    }
+    #[inline]
+    const fn star_paint(color: u32, c: f32, added: bool) -> (Paint, Paint) {
+        (star_tone(color, c, added), star_tone(WHITE, c, added))
+    }
+    let full = star_paint(color, cov.floor(), added);
     let mut ended = false;
-    let arm32 = i32::try_from(arm).unwrap_or(i32::MAX);
+    let arm32 = arm.min(i64::from(i32::MAX)) as i32;
     let pieces = star_pieces(arm32, gold);
     let mut pi = 0;
     while pi < pieces.len() {
@@ -169,7 +180,7 @@ pub(super) fn lay_star(
         pi += 1;
         let p = match piece.part {
             StarPart::Body => full,
-            StarPart::Core if added => paint((cov * STAR_CORE_ADD).floor()),
+            StarPart::Core if added => star_paint(color, (cov * STAR_CORE_ADD).floor(), added),
             StarPart::Core => full,
             StarPart::Tip { taper, .. } => {
                 let tip_cov = (cov * taper).floor();
@@ -177,9 +188,9 @@ pub(super) fn lay_star(
                 if ended {
                     continue;
                 }
-                paint(tip_cov)
+                star_paint(color, tip_cov, added)
             }
-            StarPart::Glint if added => paint((cov * STAR_GLINT_COV).floor()),
+            StarPart::Glint if added => star_paint(color, (cov * STAR_GLINT_COV).floor(), added),
             StarPart::Glint => full,
         };
         let r = Rect {
@@ -212,6 +223,7 @@ const fn repeats_run(other: &str, c: usize, end: usize, ch: u8) -> bool {
 }
 
 /// The kitty: its frame's art as opaque source-over rectangles.
+#[inline]
 pub(super) fn kitty_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
     let Some((at, pose)) = cx.kitty else {
         return;
@@ -256,6 +268,7 @@ pub(super) fn kitty_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
 }
 
 /// The rim as quads.
+#[inline]
 pub(super) fn rim_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
     let Some((at, pose)) = cx.kitty else {
         return;
@@ -291,6 +304,7 @@ pub(super) fn rim_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
 }
 
 /// Every quad of `cx`'s frame.
+#[inline]
 pub(super) fn quads(cx: &Emit<'_>, under: &mut Vec<GlowQuad>, over: &mut Vec<GlowQuad>) {
     let sink = Sink { geo: cx.geo };
     cx.border(&mut QuadSink { sink, out: under });
@@ -319,6 +333,7 @@ pub(super) fn quads(cx: &Emit<'_>, under: &mut Vec<GlowQuad>, over: &mut Vec<Glo
 
 impl HarnessCard {
     /// The oracle's frame.
+    #[inline]
     pub(super) fn tick(
         &mut self,
         now: Instant,

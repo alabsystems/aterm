@@ -10,6 +10,8 @@ use std::rc::Rc;
 
 use crate::tarread::EntryType as TarEntryType;
 
+mod ahead;
+mod behind;
 mod zipread;
 
 /// Reason an archive entry was rejected during extraction.
@@ -670,6 +672,8 @@ struct Layer<'a> {
     laid_symlink: bool,
     /// The parent directory the last laid entry needed ([`Layer::ensure_parent`]).
     last_parent: Option<PathBuf>,
+    /// The writers a large file's bytes go to ([`behind`]); none writes every file here.
+    behind: Option<&'a behind::WriteBehind>,
 }
 
 impl<'a> Layer<'a> {
@@ -697,6 +701,7 @@ impl<'a> Layer<'a> {
             tree: fold.then(TreeAccumulator::new),
             laid_symlink: false,
             last_parent: None,
+            behind: None,
         })
     }
 
@@ -823,6 +828,11 @@ impl<'a> Layer<'a> {
             _ => true,
         };
         let mode = safe_mode(mode, false);
+        if replace && let Some(behind) = self.behind {
+            // A path laid once already is laid again: its earlier bytes are all written
+            // before it is reopened.
+            behind.flush().map_err(|(e, at)| io_at(e, "write", &at))?;
+        }
         let opened = if replace {
             crate::platform::open_create_write(&dest, mode)
         } else {
@@ -835,7 +845,7 @@ impl<'a> Layer<'a> {
                 io_at(e, "open", &dest)
             }
         })?;
-        let written = write_capped(
+        let written = write_capped_behind(
             body,
             Sink {
                 file,
@@ -846,6 +856,7 @@ impl<'a> Layer<'a> {
             &self.budget,
             &mut self.copy_buf,
             self.tree.is_some(),
+            self.behind,
         )?;
         if let (Some(tree), Some(rel)) = (self.tree.as_mut(), rel) {
             tree.record_file(rel, written.mode, written.content_sha_hex);
@@ -1011,15 +1022,38 @@ pub(crate) fn extract_tar_zst_tree(
     opts: ExtractOptions,
     checksum: FrameChecksum,
 ) -> Result<TreeAccumulator, ExtractError> {
-    folded(extract_stream(
-        zstd_decoder(archive, checksum)?,
+    extract_tar_zst_tree_from(
+        std::fs::File::open(archive)?,
         dest_root,
         max_total_bytes,
         max_entries,
-        true,
         opts,
-        Trailer::Drained,
-    )?)
+        checksum,
+    )
+}
+
+/// [`extract_tar_zst_tree`] over the archive's bytes as `input` yields them, decoded ahead of
+/// the walk ([`ahead::decoded_ahead`]).
+pub(crate) fn extract_tar_zst_tree_from(
+    input: impl Read + Send,
+    dest_root: &Path,
+    max_total_bytes: u64,
+    max_entries: u64,
+    opts: ExtractOptions,
+    checksum: FrameChecksum,
+) -> Result<TreeAccumulator, ExtractError> {
+    let (walked, _) = ahead::decoded_ahead(zstd_reader(input, checksum), |decoded| {
+        extract_stream(
+            decoded,
+            dest_root,
+            max_total_bytes,
+            max_entries,
+            true,
+            opts,
+            Trailer::Drained,
+        )
+    });
+    folded(walked?)
 }
 
 /// The zstd decoder over `archive` ([`FrameChecksum::Required`]).
@@ -1027,11 +1061,23 @@ fn zstd_decoder(
     archive: &Path,
     checksum: FrameChecksum,
 ) -> io::Result<aterm_zstd::Decoder<io::BufReader<std::fs::File>>> {
-    let decoder = aterm_zstd::Decoder::new(std::fs::File::open(archive)?);
-    Ok(match checksum {
+    Ok(zstd_reader(std::fs::File::open(archive)?, checksum))
+}
+
+/// The bytes the decoder reads from its input at a time.
+const COMPRESSED_READ: usize = 256 * 1024;
+
+/// The zstd decoder over `input` ([`FrameChecksum::Required`]).
+fn zstd_reader<R: Read>(
+    input: R,
+    checksum: FrameChecksum,
+) -> aterm_zstd::Decoder<io::BufReader<R>> {
+    let decoder =
+        aterm_zstd::Decoder::with_buffer(io::BufReader::with_capacity(COMPRESSED_READ, input));
+    match checksum {
         FrameChecksum::IfPresent => decoder,
         FrameChecksum::Required => decoder.require_checksum(),
-    })
+    }
 }
 
 /// Extract a `.tar.gz` archive into `dest_root` and fold its `tree_root`.
@@ -1042,17 +1088,37 @@ pub(crate) fn extract_tar_gz_tree(
     max_entries: u64,
     opts: ExtractOptions,
 ) -> Result<TreeAccumulator, ExtractError> {
-    let file = std::fs::File::open(archive)?;
-    let decoder = aterm_codec::inflate::stream::GzipReader::new(file);
-    folded(extract_stream(
-        decoder,
+    extract_tar_gz_tree_from(
+        std::fs::File::open(archive)?,
         dest_root,
         max_total_bytes,
         max_entries,
-        true,
         opts,
-        Trailer::Unread,
-    )?)
+    )
+}
+
+/// [`extract_tar_gz_tree`] over the archive's bytes as `input` yields them, decoded ahead of
+/// the walk ([`ahead::decoded_ahead`]).
+pub(crate) fn extract_tar_gz_tree_from(
+    input: impl Read + Send,
+    dest_root: &Path,
+    max_total_bytes: u64,
+    max_entries: u64,
+    opts: ExtractOptions,
+) -> Result<TreeAccumulator, ExtractError> {
+    let decoder = aterm_codec::inflate::stream::GzipReader::new(input);
+    let (walked, _) = ahead::decoded_ahead(decoder, |decoded| {
+        extract_stream(
+            decoded,
+            dest_root,
+            max_total_bytes,
+            max_entries,
+            true,
+            opts,
+            Trailer::Unread,
+        )
+    });
+    folded(walked?)
 }
 
 /// Extract an uncompressed `.tar` archive into `dest_root` and fold its `tree_root`.
@@ -1141,6 +1207,41 @@ fn extract_stream(
     opts: ExtractOptions,
     trailer: Trailer,
 ) -> Result<Option<TreeAccumulator>, ExtractError> {
+    let entries = |behind: Option<&behind::WriteBehind>| {
+        extract_entries(
+            decoded,
+            dest_root,
+            max_total_bytes,
+            max_entries,
+            fold,
+            opts,
+            trailer,
+            behind,
+        )
+    };
+    // Only a folding walk knows which paths it laid already ([`Layer::regular`]).
+    if fold {
+        behind::run(entries)
+    } else {
+        entries(None)
+    }
+}
+
+/// [`extract_stream`]'s walk, with `behind` writing large files' bytes when given.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "extract_stream's inputs plus the writers it runs the walk with"
+)]
+fn extract_entries(
+    decoded: impl Read,
+    dest_root: &Path,
+    max_total_bytes: u64,
+    max_entries: u64,
+    fold: bool,
+    opts: ExtractOptions,
+    trailer: Trailer,
+    behind: Option<&behind::WriteBehind>,
+) -> Result<Option<TreeAccumulator>, ExtractError> {
     let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
     let mut layer = Layer::open(
         dest_root,
@@ -1150,6 +1251,7 @@ fn extract_stream(
         opts,
         Rc::clone(&budget),
     )?;
+    layer.behind = behind;
     let mut tar = crate::tarread::Archive::new(CappedReader {
         inner: decoded,
         budget: Rc::clone(&budget),
@@ -1210,6 +1312,9 @@ fn extract_stream(
         io::copy(&mut tar.into_inner(), &mut io::sink()).map_err(map_tar_io)?;
         layer.charge_structure(TAR_ENTRY_STRUCTURAL_BUDGET.saturating_sub(budget.get()))?;
     }
+    if let Some(behind) = behind {
+        behind.flush().map_err(|(e, at)| io_at(e, "write", &at))?;
+    }
     Ok(layer.finish())
 }
 
@@ -1233,20 +1338,37 @@ struct Sink<'p> {
 
 /// Stream `reader` into `sink`'s freshly opened file with `sink.mode` ([`ExtractError::TooLarge`]).
 fn write_capped(
-    mut reader: impl Read,
+    reader: impl Read,
     sink: Sink<'_>,
     remaining: &mut u64,
     budget: &Rc<Cell<u64>>,
     buf: &mut [u8],
     fold: bool,
 ) -> Result<WrittenFile, ExtractError> {
-    let Sink {
-        file: mut f,
-        dest,
-        mode,
-    } = sink;
+    write_capped_behind(reader, sink, remaining, budget, buf, fold, None)
+}
+
+/// [`write_capped`], the bytes past a file's first [`behind::CHUNK`] handed to `behind`'s
+/// writers in pieces at their offsets when it is given: what the file holds is complete once
+/// `behind` is flushed.
+fn write_capped_behind(
+    mut reader: impl Read,
+    sink: Sink<'_>,
+    remaining: &mut u64,
+    budget: &Rc<Cell<u64>>,
+    buf: &mut [u8],
+    fold: bool,
+    behind: Option<&behind::WriteBehind>,
+) -> Result<WrittenFile, ExtractError> {
+    let Sink { file, dest, mode } = sink;
+    let f = std::sync::Arc::new(file);
     let mut hasher = fold.then(crate::tree::BulkSha256::new);
     let mut len: u64 = 0;
+    // The piece being gathered for `behind`, from the offset it starts at. Bytes before the
+    // first CHUNK go through the file's cursor here; every byte from the first piece on goes
+    // at its own offset, so the two never meet.
+    let mut piece: Option<(u64, Vec<u8>)> = None;
+    let mut path: Option<std::sync::Arc<PathBuf>> = None;
     loop {
         let n = reader
             .read(&mut *buf)
@@ -1267,6 +1389,7 @@ fn write_capped(
             return Err(ExtractError::TooLarge(TooLargeReason::ContentCap));
         }
         *remaining = remaining.saturating_sub(n);
+        let before = len;
         len = len.saturating_add(n);
         let chunk = match buf.get(..take) {
             Some(c) => c,
@@ -1275,8 +1398,30 @@ fn write_capped(
         if let Some(hasher) = hasher.as_mut() {
             hasher.update(chunk);
         }
-        f.write_all(chunk).map_err(|e| io_at(e, "write", dest))?;
+        match behind {
+            Some(behind) if before >= behind::CHUNK as u64 => {
+                let (_, gathered) = piece.get_or_insert_with(|| (before, behind.buffer()));
+                gathered.extend_from_slice(chunk);
+                if gathered.len() >= behind::CHUNK
+                    && let Some((at, full)) = piece.take()
+                {
+                    let path = path.get_or_insert_with(|| std::sync::Arc::new(dest.to_path_buf()));
+                    behind
+                        .hand(&f, path, at, full)
+                        .map_err(|(e, failed)| io_at(e, "write", &failed))?;
+                }
+            }
+            _ => (&*f)
+                .write_all(chunk)
+                .map_err(|e| io_at(e, "write", dest))?,
+        }
         crate::progress::extract_tick(n);
+    }
+    if let (Some(behind), Some((at, rest))) = (behind, piece.take()) {
+        let path = path.get_or_insert_with(|| std::sync::Arc::new(dest.to_path_buf()));
+        behind
+            .hand(&f, path, at, rest)
+            .map_err(|(e, failed)| io_at(e, "write", &failed))?;
     }
     crate::platform::set_mode_on(&f, mode).map_err(|e| io_at(e, "set_mode", dest))?;
     match hasher {
@@ -3603,6 +3748,80 @@ mod tests {
             got.unwrap().package_json.len(),
             4096,
             "4 KiB is the bound, not past it"
+        );
+    }
+
+    /// Extract `entries` with the writers holding every piece until the walk first flushes
+    /// ([`super::behind::HOLD_UNTIL_FLUSH`]): a flush the walk skipped would leave a file
+    /// short, or a replaced file with its earlier bytes laid over its later ones.
+    #[cfg(unix)]
+    fn extract_held(
+        label: &str,
+        entries: &[(&str, u8, &str, &[u8], u32)],
+    ) -> (crate::testdir::Dir, PathBuf, TreeAccumulator) {
+        let zst = zstd_bytes(&tar_bytes(entries));
+        let d = dest(label);
+        let out = d.join("out");
+        super::behind::HOLD_UNTIL_FLUSH.with(|hold| hold.set(true));
+        let tree = extract_tar_zst_tree_from(
+            &zst[..],
+            &out,
+            1 << 30,
+            100,
+            ExtractOptions::default(),
+            FrameChecksum::IfPresent,
+        )
+        .unwrap();
+        (d, out, tree)
+    }
+
+    /// WRITE BEHIND: a large file whose bytes past its first piece go to the writers lands
+    /// byte for byte once the walk is done, a hardlink to it included, and folds to the root
+    /// the disk reads back.
+    #[cfg(unix)]
+    #[test]
+    fn a_large_file_written_behind_is_whole_when_the_walk_is_done() {
+        let piece = super::behind::CHUNK;
+        let big: Vec<u8> = (0..3 * piece + 4321).map(|i| (i % 253) as u8).collect();
+        let (_d, out, tree) = extract_held(
+            "behind-whole",
+            &[
+                ("bin/big", b'0', "", &big, 0o755),
+                ("bin/alias", b'1', "bin/big", b"", 0o755),
+                ("lib/small", b'0', "", b"small", 0o644),
+            ],
+        );
+        assert_eq!(std::fs::read(out.join("bin/big")).unwrap(), big);
+        assert_eq!(std::fs::read(out.join("bin/alias")).unwrap(), big);
+        assert_eq!(std::fs::read(out.join("lib/small")).unwrap(), b"small");
+        let modes = tree.declared_modes();
+        assert_eq!(
+            tree.root(),
+            crate::tree::tree_root_declared(&out, &modes).unwrap(),
+            "what was folded is what the disk holds"
+        );
+    }
+
+    /// WRITE BEHIND: a large file laid twice holds its second bytes alone: the first's are
+    /// all written before the path is opened again.
+    #[cfg(unix)]
+    #[test]
+    fn a_large_file_laid_twice_holds_only_its_second_bytes() {
+        let piece = super::behind::CHUNK;
+        let first: Vec<u8> = (0..2 * piece + 7).map(|i| (i % 241) as u8).collect();
+        let second: Vec<u8> = (0..piece + 5).map(|i| (i % 239) as u8).collect();
+        let (_d, out, tree) = extract_held(
+            "behind-twice",
+            &[
+                ("lib/twice", b'0', "", &first, 0o644),
+                ("lib/twice", b'0', "", &second, 0o644),
+            ],
+        );
+        assert_eq!(std::fs::read(out.join("lib/twice")).unwrap(), second);
+        let modes = tree.declared_modes();
+        assert_eq!(
+            tree.root(),
+            crate::tree::tree_root_declared(&out, &modes).unwrap()
         );
     }
 }

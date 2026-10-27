@@ -78,7 +78,9 @@ OPTIONS:
                   past it. An `await task` takes it as one deadline over all
                   its legs (each leg's own is its wait and 8 s), so it ends
                   by it whatever its timeout=, with the rows its last leg
-                  read, whose wait ends up to a second before it (exit 124).
+                  read, whose wait ends up to a second before it (exit 124;
+                  75 where the peer served none of its last legs, the one
+                  this cuts in flight among them, EXIT CODES).
                   A fleet survey (`survey --fleet`, `--host`) takes
                   it the same way: each peer's read (3 s, or survey's own
                   --timeout) is cut to a shorter one. On `subscribe`, an
@@ -112,10 +114,11 @@ EXIT CODES:
          and the request was not sent. Any other cause exits 1, even where
          its refusal also says to try again: nothing listening there or no
          route, a connection refused or hung up, another fleet's secret,
-         a denial. For `ls`/`instances`/`windows`: no socket found
-         answered, or the directory is missing, unreadable or unresolvable
-         (every variable it is read from unset); stderr names each socket's
-         cause and a hint.
+         a denial. An `await task` past its baseline asks a peer that does
+         not answer again instead (75). For `ls`/`instances`/`windows`: no
+         socket found answered, or the directory is missing, unreadable or
+         unresolvable (every variable it is read from unset); stderr names
+         each socket's cause and a hint.
     124  timeout: the client's deadline fired, or the server reported one (a
          `turn` with status=timeout, or `OK timeout` from await/ready/wait);
          for `ls`/`instances`/`windows`, every socket found timed out.
@@ -123,18 +126,25 @@ EXIT CODES:
          `inbox`), a `turn` or a `post` whose instance went away mid-exchange
          (a failed update, a crash, a quit) and nothing replaced it within
          30 s, or before the call's deadline ran out; any other verb cut that
-         way exits 1. A self-update is followed (a --pid call follows only its
-         own process): `subscribe` resumes on the successor, stderr says so,
-         and each target restarts from its current state after a
-         `GAP <local> replaced` line (a single-target stream's block and turn
-         events resume after the last ones relayed); a blocking read is asked
-         once more. Still 75, with a note on what to do: a read anchored in
-         the old process (`await seq|block|consent`, an `await log` with no
-         `since=`, `await inbox|agent since=`, `await edit ticket=`, `inbox
-         get <id>`, `inbox since=`, an `@<n>` selector); a `turn`, whose text
-         may already be typed; a `post`, which may already be queued (re-post
-         only with the same `key=`, or after finding its `post`/`post-landed`
-         rows in `timeline`). Never 0: an update is not \"session over\".
+         way exits 1. With --host, an `await task` whose peer served its
+         baseline and then no leg it asked again (nothing listening there, a
+         hang-up, a busy address, no answer at all: a Mac asleep or off its
+         network, an aterm frozen) until its timeout (its timeout=, or a
+         --timeout that cuts the leg in flight), or for a minute where it
+         has none: its rows print first, and stderr says nothing answered
+         at that peer for how long, and its cause. A self-update is followed
+         (a --pid call follows only its own process): `subscribe` resumes on
+         the successor, stderr says so, and each target restarts from its
+         current state after a `GAP <local> replaced` line (a single-target
+         stream's block and turn events resume after the last ones relayed);
+         a blocking read is asked once more. Still 75, with a note on what to
+         do: a read anchored in the old process (`await seq|block|consent`,
+         an `await log` with no `since=`, `await inbox|agent since=`, `await
+         edit ticket=`, `inbox get <id>`, `inbox since=`, an `@<n>`
+         selector); a `turn`, whose text may already be typed; a `post`,
+         which may already be queued (re-post only with the same `key=`, or
+         after finding its `post`/`post-landed` rows in `timeline`). Never 0:
+         an update is not \"session over\".
 
 OUTPUT:
     To a pipe or a file, stdout carries the server's bytes exactly; on stderr,
@@ -202,9 +212,9 @@ PUSH FRAMES (subscribe):
     and stdout carries these frames (as OUTPUT above), each tagged with a
     <local> channel id, not the sid. A BYTES body may contain newlines: once
     `bytes` is requested, do not parse the stream line by line.
-      sub <local> <sid>[ log_seq=<seq> log_ep=<e>]
-                                 one per target, right after the ack; log_seq=
-                                 and log_ep= only with the `log` stream.
+      sub <local> <sid>[ log_seq=<seq> log_ep=<e> log_base=<b>]
+                                 one per target, right after the ack; log_seq=,
+                                 log_ep= and log_base= only with the `log` stream.
       DELTA <local> seq=<n> screen <nrows>   then <nrows> rows: a screen
                                  snapshot at seq <n> (a skipped seq is
                                  coalescing, not loss).
@@ -241,8 +251,9 @@ PUSH FRAMES (subscribe):
                                  `events-dropped=<n>` or `mail-dropped=<n>`
                                  (the timeline or the inbox ring evicted <n>
                                  this watch had not been shown); `log-lost=<n>
-                                 why=<w> resync_to=<seq> ep=<e>` (log records
-                                 the ring no longer holds); `replaced`
+                                 why=<w> resync_to=<seq> ep=<e> base=<b>` (log
+                                 records the ring no longer holds, or a cursor
+                                 of another log: why=reset); `replaced`
                                  (written by this client when the stream
                                  resumed on a successor: output, mail and
                                  records between the two were not delivered;

@@ -6,11 +6,11 @@
 use std::sync::Arc;
 
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
-use aterm_vitals::model::{
-    DiskLevel, HeatCell, HeatSlot, Resource, ResourceView, ScopeFig, Snapshot, State,
+use aterm_vitals::model::{DiskLevel, HeatSlot, Resource, ResourceView, ScopeFig, Snapshot, State};
+use aterm_vitals::words::{self, InkKind, Locale, Platform};
+use aterm_vitals::{
+    GapKind, MultiScaleSpec, ProgSlot, Strain, StripEvent, StripEventKind, TimeGap,
 };
-use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform, ScopeForms};
-use aterm_vitals::{GapKind, MultiScaleSpec, Strain, StripEvent, StripEventKind, TimeGap};
 
 #[cfg(test)]
 use crate::deck_face::Boxed;
@@ -22,9 +22,10 @@ use crate::stats_live::{self as live, DeckLive, LiveLayer};
 use crate::stats_paint::{Bar, Hit, Instrument, Painter, Rect, StatsMark, WellMark, panel};
 use crate::stats_plan::{
     self as plan, BlockKind, BlockPlan, Cluster, Col, CoresAt, CoresMode, DeckForm, DeckSizePref,
-    FOLD_GAUGE_R, FoldedGauge, FullKind, FullPlan, HeaderPlan, HeaderText, KeyItem, Label, Rows,
-    StateLabel, Strip,
+    FOLD_GAUGE_R, FoldedGauge, FullKind, FullPlan, HeaderPlan, HeaderText, KeyItem, Label, Meter,
+    Rows, StateLabel, Strip,
 };
+use crate::stats_steam as steam;
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
 
@@ -116,6 +117,21 @@ pub(crate) fn deck_px(form: StatsBars, deck: DeckForm, scale: f64, cell_px: usiz
     }
 }
 
+/// The complete reserved deck, including its fixed Network State rows.
+pub(crate) fn reserved_deck_px(
+    form: StatsBars,
+    deck: DeckForm,
+    scale: f64,
+    cell_px: usize,
+) -> usize {
+    deck_px(form, deck, scale, cell_px)
+        + if form.takes_room() {
+            crate::network_deck::height_px(scale)
+        } else {
+            0
+        }
+}
+
 /// An attached window's chrome headroom in device pixels.
 pub(crate) fn chrome_head_px(
     head_pts: f64,
@@ -124,7 +140,7 @@ pub(crate) fn chrome_head_px(
     deck: DeckForm,
     cell_px: usize,
 ) -> usize {
-    band_px(head_pts, scale) + deck_px(form, deck, scale, cell_px)
+    band_px(head_pts, scale) + reserved_deck_px(form, deck, scale, cell_px)
 }
 
 /// The deck a carried window frame was sized under ([`carried_deck`]).
@@ -253,7 +269,7 @@ impl crate::App {
         carried_deck(
             carried_h,
             cell_h,
-            |form| band + deck_px(bars, form, scale, cell_h),
+            |form| band + reserved_deck_px(bars, form, scale, cell_h),
             |head| u32::try_from(bare.saturating_add(head as u64)).unwrap_or(u32::MAX),
         )
     }
@@ -294,7 +310,7 @@ impl crate::App {
             return 0;
         }
         let (_, ch) = self.win_cell_size(wid);
-        match deck_px(form, ws.deck_form, ws.scale, ch) {
+        match reserved_deck_px(form, ws.deck_form, ws.scale, ch) {
             deck if deck > 0 && ws.metrics.head >= deck => deck,
             _ => 0,
         }
@@ -344,6 +360,10 @@ pub(crate) struct DeckGeom {
 
 /// What a stats surface shows.
 pub(crate) struct DeckInput<'a> {
+    /// Host-published immutable observations; absent in resource-only fixtures.
+    pub(crate) network: Option<&'a aterm_types::network_state::NetworkStateSnapshot>,
+    /// Stable machine/service selected in the network close-up.
+    pub(crate) network_target: crate::network_deck::Target,
     /// The latest snapshot, `None` before the first.
     pub(crate) snap: Option<&'a Snapshot>,
     /// The snapshot immediately preceding [`Self::snap`], when available, for smooth value
@@ -384,16 +404,19 @@ const SMALL_PT: f64 = 9.5;
 const TICK_MIN_PX: f32 = 2.0;
 const MARK_EM: f64 = 1.1;
 const STATE_GAP: f64 = 6.0;
+/// The least of the bar a scope that draws a fill takes as a click target, pt
+/// ([`Deck::bar_segments`]).
+const SEGMENT_HIT_MIN: f64 = 6.0;
 const STRIP_SPECS: [MultiScaleSpec; 4] = [
-    MultiScaleSpec::FULL_HOUR,
-    MultiScaleSpec::FOLD_15M,
-    MultiScaleSpec::COMPACT_5M,
+    MultiScaleSpec::FULL_6H,
+    MultiScaleSpec::FOLD_4H,
+    MultiScaleSpec::COMPACT_6M,
     MultiScaleSpec::MINI_1M,
 ];
 /// How far back one reading may speak for the seconds before it that hold none of their own, in
-/// a Folded strip's slots ([`ResourceView::heat_slots`]): three of the background cadence, v2
-/// §5.4's gap rule, so a strip read while aterm was behind other apps keeps its readings and a
-/// longer gap stays unread.
+/// a strip's boxes cut from the last minute's readings ([`ResourceView::heat_multi_scale`]):
+/// three of the background cadence, v2 §5.4's gap rule, so a strip read while aterm was behind
+/// other apps keeps its readings and a longer gap stays unread.
 const SLOT_COVER_MS: i64 = 15_000;
 
 /// The scope bar's segments as shares of the row's capacity (§6), each
@@ -410,6 +433,46 @@ struct BarFill {
     warn_tick: Option<(f32, bool)>,
 }
 
+impl BarFill {
+    /// The machine's, aterm's and this tab's fills in a bar `w` device px long, in whole px for a
+    /// whole `w`: each its scope's share of `w`, at least `least` px while that share is above
+    /// zero, and never narrower than a scope nested inside it; none for a scope with no figure
+    /// (`None`), even where a scope inside it has one.
+    ///
+    /// `apart` is for a bar whose fills nest by length alone, each its whole height (the bar
+    /// under a % figure): there a scope above zero ends `apart` px or more past the fill inside
+    /// it, so some of its own ink shows however close the two round, and even where its share
+    /// equals the one inside it, as the column shows such a scope's rim. No fill passes `w`, and
+    /// where `w` is too short for every such px the fills inside give way. The bar's column,
+    /// whose fills nest in height too, passes `0`.
+    fn widths_px(&self, w: f32, least: f32, apart: f32) -> [f32; 3] {
+        // Innermost first: this tab's, aterm's, the machine's.
+        let scopes = [self.tab, self.aterm, self.global];
+        let (mut ends, mut past) = ([0.0_f32; 3], [0.0_f32; 3]);
+        let mut inner_end = 0.0_f32;
+        for (i, v) in scopes.into_iter().enumerate() {
+            if v.is_none() {
+                continue;
+            }
+            if let Some(s) = v.filter(|v| v.is_finite() && *v > 0.0) {
+                past[i] = apart;
+                ends[i] = (s.clamp(0.0, 1.0) * w).round().max(least);
+            }
+            ends[i] = ends[i].max(inner_end + past[i]);
+            inner_end = ends[i];
+        }
+        // From the outside in: none past `w`, nor past where the fill around it keeps its px.
+        let mut room = w;
+        for i in (0..scopes.len()).rev() {
+            if scopes[i].is_some() {
+                ends[i] = ends[i].min(room).max(0.0);
+                room = ends[i] - past[i];
+            }
+        }
+        [ends[2], ends[1], ends[0]]
+    }
+}
+
 /// A row's state for where Details is absent (rule S) and for the fslim
 /// header (§4.4).
 #[derive(Clone, Debug, PartialEq)]
@@ -417,24 +480,9 @@ struct StateTxt {
     state: State,
     clauses: Vec<Txt>,
     word: Txt,
-    amounts: Vec<Txt>,
     label: String,
     mark: WellMark,
     ink: InkKind,
-}
-
-/// A row's aterm and Tab cells (§6).
-#[derive(Clone, Debug, PartialEq)]
-enum ScopeTxt {
-    /// None drawn (the GPU with no reading).
-    None,
-    /// A cell in each column.
-    Each {
-        aterm: (Vec<Txt>, InkKind),
-        tab: (Vec<Txt>, InkKind),
-    },
-    /// One phrase across both.
-    Span(Vec<Txt>, InkKind),
 }
 
 /// One Details clause (rule D).
@@ -458,18 +506,13 @@ struct RowWords {
     /// The sentence in the strip's place (§6.2, §6.6), or "reading…": its
     /// forms, longest first (rule F).
     strip_text: Option<Vec<Txt>>,
-    /// Multi-scale progressive time-series slots for each of [`STRIP_SPECS`], oldest (widest)
-    /// first and the live `now` slot last.
+    /// Multi-scale progressive time-series slots for each of [`STRIP_SPECS`], newest first: the
+    /// live `now` slot, then each older (and wider) one ([`MultiScaleSpec::slots`]).
     multi_scale: [Vec<HeatSlot>; 4],
-    /// A Folded strip's fine slots for slide lead-in.
-    slots: Vec<HeatCell>,
     bar: Option<BarFill>,
-    /// The amount's forms on each ladder ([`Table::ladder`]): the glance's with Details (`[0]`)
-    /// and without Details (`[1]`), then Det (`[2]`), Cols (`[3]`) and NoCols (`[4]`).
-    amount: [Vec<Txt>; 5],
+    /// The row's figure run at the end of its bar ([`words::glance_run`]), longest first.
+    run: Vec<Txt>,
     state: Option<StateTxt>,
-    /// The aterm and Tab cells: the glance's, then the other tables' ([`Table::said`]).
-    scope: [ScopeTxt; 2],
     /// The Details clauses: the glance's, then the other tables' ([`Table::said`]).
     details: [Vec<ClauseTxt>; 2],
 }
@@ -486,7 +529,6 @@ struct CoreCluster {
 /// Previous snapshot's numeric targets for smooth [`DeckLive::blend`] interpolation.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct DeckPrev {
-    strain: Option<Strain>,
     rows: Vec<(Option<f32>, Option<BarFill>)>,
     cores: Vec<Vec<Option<f32>>>,
 }
@@ -522,11 +564,7 @@ impl DeckPrev {
                     .collect()
             })
             .unwrap_or_default();
-        Self {
-            strain: Some(Strain::of(snap)),
-            rows,
-            cores,
-        }
+        Self { rows, cores }
     }
 }
 
@@ -535,11 +573,12 @@ impl DeckPrev {
 pub(crate) struct DeckWords {
     rows: Vec<RowWords>,
     cores: Vec<CoreCluster>,
-    /// Hardware identity & capacity totals forms (`this Mac · M5 Max · 18c · 128 GiB · 2 TB`, …),
+    /// The processor's name for trailing room on the `Cores` row (`Apple M5 Max`, `M5 Max`),
     /// longest first.
-    machine_forms: Vec<String>,
-    /// Processor & machine totals forms for trailing room on the `Cores` row (`M5 Max · 128 GiB · 2 TB`, …).
     cores_tail_forms: Vec<Txt>,
+    /// The machine's totals for the legend where no run says the rows' maxima
+    /// ([`words::machine_totals`]), longest first.
+    totals: Vec<String>,
     /// Recorded time discontinuities (sleep, crash, pause) within the ring's horizon.
     time_gaps: Vec<TimeGap>,
     /// Discrete event markers (crash, restart, sleep/wake, spike) on the time series.
@@ -595,25 +634,12 @@ impl DeckWords {
                     .collect()
             })
             .unwrap_or_default();
-        let machine_base = input.locale.platform.machine();
-        let raw_totals = words::machine_totals_forms(snap);
-        let machine_forms = raw_totals
-            .iter()
-            .map(|tot| format!("{machine_base} \u{b7} {tot}"))
-            .collect();
         let mut tail_candidates: Vec<String> = Vec::new();
         if let Some(brand) = snap.facts.cpu_brand.as_deref().filter(|b| !b.is_empty()) {
-            let short_brand = brand.strip_prefix("Apple ").unwrap_or(brand);
-            for tot in &raw_totals {
-                if tot.starts_with(short_brand) && !tail_candidates.contains(tot) {
-                    tail_candidates.push(tot.clone());
-                }
-            }
-            if !tail_candidates.iter().any(|s| s == brand) {
-                tail_candidates.push(brand.to_owned());
-            }
-            if short_brand != brand && !tail_candidates.iter().any(|s| s == short_brand) {
-                tail_candidates.push(short_brand.to_owned());
+            tail_candidates.push(brand.to_owned());
+            let short = words::compact_cpu_brand(brand);
+            if short != brand && !short.is_empty() {
+                tail_candidates.push(short);
             }
         }
         let cores_tail_forms = txts(tail_candidates, m);
@@ -623,8 +649,8 @@ impl DeckWords {
         Self {
             rows,
             cores,
-            machine_forms,
             cores_tail_forms,
+            totals: words::machine_totals(snap),
             time_gaps: snap.time_gaps.clone(),
             strip_events: snap.strip_events.clone(),
             prev,
@@ -644,19 +670,17 @@ impl DeckWords {
                 pct: Txt::new(words::pct(None), m),
                 strip_text: Some(vec![Txt::new("reading\u{2026}", m)]),
                 multi_scale: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-                slots: Vec::new(),
                 bar: None,
-                amount: Default::default(),
+                run: Vec::new(),
                 state: None,
-                scope: [ScopeTxt::None, ScopeTxt::None],
                 details: [Vec::new(), Vec::new()],
             })
             .collect();
         Self {
             rows,
             cores: Vec::new(),
-            machine_forms: Vec::new(),
             cores_tail_forms: Vec::new(),
+            totals: Vec::new(),
             time_gaps: Vec::new(),
             strip_events: Vec::new(),
             prev: None,
@@ -686,71 +710,12 @@ impl DeckWords {
 impl RowWords {
     fn new(res: Resource, snap: &Snapshot, panes: &[u64], loc: &Locale, m: &FaceMetrics) -> Self {
         let view = snap.resource(res, panes);
-        let facts = &snap.facts;
-        let forms = |ladder| words::amount_forms(res, &view, facts, ladder, loc);
-        let mut glance_det = words::glance_amount(res, &view, loc);
-        let mut glance_bare = glance_det.clone();
-        let mut det = forms(Ladder::Det);
-        let mut cols = forms(Ladder::Cols);
-        let mut no_cols = forms(Ladder::NoCols);
-        for f in &cols {
-            if !f.contains("freed") && !det.contains(f) {
-                det.push(f.clone());
-            }
-        }
-        if res == Resource::Network && snap.net.is_some() {
-            let det_forms = words::net_amount_det_forms(snap);
-            if !det_forms.is_empty() {
-                let mut g = det_forms.clone();
-                for f in glance_det {
-                    if !g.contains(&f) {
-                        g.push(f);
-                    }
-                }
-                glance_det = g;
-                let mut d = det_forms;
-                for f in det {
-                    if !d.contains(&f) {
-                        d.push(f);
-                    }
-                }
-                det = d;
-            }
-            let net_forms = words::net_summary_forms(snap);
-            if !net_forms.is_empty() {
-                let prepend = |head: &[String], tail: Vec<String>| -> Vec<String> {
-                    let mut v = head.to_vec();
-                    for f in tail {
-                        if !v.contains(&f) {
-                            v.push(f);
-                        }
-                    }
-                    v
-                };
-                glance_bare = prepend(&net_forms, glance_bare);
-                cols = prepend(&net_forms, cols);
-                no_cols = prepend(&net_forms, no_cols);
-            }
-        }
         let strip_text = words::strip_words(res, snap).map(|forms| txts(forms, m));
-        let unread_gpu = res == Resource::Gpu && view.now.is_none();
-        let scope_txt = |forms: Option<ScopeForms>| match forms.filter(|_| !unread_gpu) {
-            None => ScopeTxt::None,
-            Some(ScopeForms::Each { aterm, tab }) => ScopeTxt::Each {
-                aterm: (txts(aterm.forms, m), aterm.ink),
-                tab: (txts(tab.forms, m), tab.ink),
-            },
-            Some(ScopeForms::Span(cell)) => ScopeTxt::Span(txts(cell.forms, m), cell.ink),
-        };
-        let scope = [
-            scope_txt(words::glance_scope(res, &view, loc)),
-            scope_txt(Some(words::scope_forms(res, &view, loc))),
-        ];
+        let run = txts(words::glance_run(res, &view, snap, loc), m);
         let state = words::state(res, snap, loc).map(|st| StateTxt {
             state: st.state,
             clauses: txts(st.clauses, m),
             word: Txt::new(st.word, m),
-            amounts: txts(st.amount_forms, m),
             label: st.label,
             mark: WellMark::of(st.mark),
             ink: st.ink,
@@ -768,7 +733,7 @@ impl RowWords {
                 .collect()
         };
         let details = [
-            clauses(words::glance_details(res, snap, loc)),
+            clauses(words::glance_details(res, snap, panes, loc)),
             clauses(words::details(res, snap, loc)),
         ];
         Self {
@@ -781,27 +746,18 @@ impl RowWords {
             multi_scale: STRIP_SPECS.map(|spec| {
                 view.heat_multi_scale(spec, snap.at_unix_ms, SLOT_COVER_MS, &snap.time_gaps)
             }),
-            slots: view.heat_slots(
-                snap.slot_grid,
-                plan::FOLD_SLOTS_MAX + 1,
-                snap.at_unix_ms,
-                SLOT_COVER_MS,
-            ),
             bar: bar_fill(res, &view, snap, panes),
-            amount: [
-                txts(glance_det, m),
-                txts(glance_bare, m),
-                txts(det, m),
-                txts(cols, m),
-                txts(no_cols, m),
-            ],
+            run,
             state,
-            scope,
             details,
         }
     }
 }
 
+/// The scope bar's fills, 0.144.0's as main draws them (the owner, 2026-10-26: "the bar of "this
+/// Mac, aterm, Tab 1" that's great"): the machine's share now, aterm's and this tab's nested in
+/// it ([`Snapshot::bar_shares`]), the disk's and the network's scopes by their writes and
+/// sockets. Tokens have none.
 fn bar_fill(res: Resource, view: &ResourceView, snap: &Snapshot, panes: &[u64]) -> Option<BarFill> {
     if res == Resource::Tokens {
         return None;
@@ -882,13 +838,49 @@ fn spec_ix(strip: &Strip) -> usize {
         .unwrap_or(0)
 }
 
-/// Whole-pixel slot layout `(slot_idx, x_px, w_px, is_live_now)` for `strip` at `scale`, shifting
-/// the real-time band right by `shift_px` while keeping coarse multi-minute aggregate buckets and
-/// the far-right `now` box anchored to the X-axis ticks.
+/// The slots of `slots`' fine band, a range of [`MultiScaleSpec::slots`]: the boxes of its finest
+/// history period, right of the live box, which a reading's slide or glide moves
+/// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §3.4); `None` with no history box.
+pub(crate) fn fine_band_slots(slots: &[ProgSlot]) -> Option<std::ops::Range<usize>> {
+    let start = slots.iter().position(|slot| !slot.is_live_now)?;
+    let period = |slot: &ProgSlot| slot.age_hi_ms - slot.age_lo_ms;
+    let p = period(&slots[start]);
+    let len = slots[start..]
+        .iter()
+        .take_while(|slot| !slot.is_live_now && period(slot) == p)
+        .count();
+    Some(start..start + len)
+}
+
+/// `strip`'s fine band at `scale` ([`live::FineBand`]): its boxes' pitch, device px, as
+/// [`multi_scale_slot_rects`] lays them before rounding, and their period.
+pub(crate) fn fine_band(strip: &Strip, scale: f64) -> live::FineBand {
+    let slots = strip.spec.slots();
+    let Some(slot) = fine_band_slots(&slots).and_then(|band| slots.get(band.start)) else {
+        return live::FineBand::default();
+    };
+    let s = scale.max(0.5);
+    let px = |v: f64| (v * s + 0.5).floor();
+    let total_w = (px(strip.end()) - px(strip.x)).max(1.0);
+    live::FineBand {
+        box_px: f64::from(slot.x1 - slot.x0) * total_w,
+        period_ms: slot.age_hi_ms - slot.age_lo_ms,
+    }
+}
+
+/// Whole-pixel slot layout `(slot_idx, x_px, w_px, is_live_now)` for `strip` at `scale`, newest
+/// first (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §3): the live `now` box at `strip.x`,
+/// then each older box to its right, the oldest ending at the horizon, `strip.end()`.
+///
+/// `lag_px` displaces the fine band ([`fine_band_slots`]) that many device px left, toward now,
+/// as a reading's slide or glide has yet to carry it right: its newest box then passes under the
+/// live box, and at its old end a box enters that shows the band's own oldest slot, never a
+/// coarser box's. The painter clips the band to the span it stands in at rest, so a box is listed
+/// only while some of it shows there. The live box and the coarser boxes stand at their ticks.
 pub(crate) fn multi_scale_slot_rects(
     strip: &Strip,
     scale: f64,
-    shift_px: f32,
+    lag_px: f32,
 ) -> Vec<(usize, f32, f32, bool)> {
     let s = scale.max(0.5);
     let px = |v: f64| (v * s + 0.5).floor() as f32;
@@ -898,10 +890,7 @@ pub(crate) fn multi_scale_slot_rects(
     let gap_px = px(1.0).max(1.0);
     let slots = strip.spec.slots();
     let n = slots.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let mut base_rects: Vec<(usize, f32, f32, bool)> = Vec::with_capacity(n);
+    let mut rest: Vec<(usize, f32, f32, bool)> = Vec::with_capacity(n + 1);
     for (j, slot) in slots.iter().enumerate() {
         let lx = (x0 + slot.x0 * total_w).round();
         let rx = if j + 1 == n {
@@ -909,48 +898,30 @@ pub(crate) fn multi_scale_slot_rects(
         } else {
             (x0 + slot.x1 * total_w).round() - gap_px
         };
-        let cw = (rx - lx).max(1.0);
-        base_rects.push((j, lx, cw, slot.is_live_now));
+        rest.push((j, lx, (rx - lx).max(1.0), slot.is_live_now));
     }
-    let shift = shift_px.round();
-    if shift == 0.0 {
-        return base_rects;
-    }
-    let slide_max_ms = (i64::from(strip.period_s) * 1_000).max(2_000);
-    let zone_start = slots
-        .iter()
-        .position(|slot| !slot.is_live_now && (slot.age_hi_ms - slot.age_lo_ms) <= slide_max_ms)
-        .unwrap_or(0);
-    let zone_x0 = base_rects.get(zone_start).map_or(x0, |r| r.1);
-    let live_x = base_rects
-        .last()
-        .filter(|r| r.3)
-        .map_or(x1, |r| r.1 - gap_px);
+    let lag = lag_px.round();
+    let Some(band) = fine_band_slots(&slots).filter(|band| lag > 0.0 && !band.is_empty()) else {
+        return rest;
+    };
+    let oldest = band.end - 1;
+    let (band_x0, (_, old_x, old_w, _)) = (rest[band.start].1, rest[oldest]);
+    let band_x1 = old_x + old_w;
+    // At rest the box after the band's oldest starts here: the entering box comes from there.
+    let after = rest.get(band.end).map_or(x1 + gap_px, |r| r.1);
+    let shows = |x: f32, w: f32| x.max(band_x0) + 1.0 <= (x + w).min(band_x1);
     let mut out = Vec::with_capacity(n + 1);
-    for &(j, lx, cw, is_live_now) in &base_rects[..zone_start] {
-        out.push((j, lx, cw, is_live_now));
+    out.extend_from_slice(&rest[..band.start]);
+    out.extend(
+        rest[band.clone()]
+            .iter()
+            .map(|&(j, lx, cw, live)| (j, lx - lag, cw, live))
+            .filter(|&(_, x, w, _)| shows(x, w)),
+    );
+    if shows(after - lag, old_w) {
+        out.push((oldest, after - lag, old_w, false));
     }
-    if shift > 0.0
-        && let Some(&(_, first_x, first_w, false)) = base_rects.get(zone_start)
-    {
-        let lead_x = first_x - first_w - gap_px + shift;
-        let clip_l = lead_x.max(zone_x0);
-        let clip_r = (lead_x + first_w).min(live_x);
-        if clip_r - clip_l >= 1.0 {
-            let lead_idx = zone_start.saturating_sub(1);
-            out.push((lead_idx, clip_l, clip_r - clip_l, false));
-        }
-    }
-    for &(j, lx, cw, is_live_now) in &base_rects[zone_start..] {
-        if is_live_now {
-            out.push((j, lx, cw, true));
-        } else {
-            let sx = lx + shift;
-            if sx + cw > zone_x0 && sx < live_x {
-                out.push((j, sx, cw, false));
-            }
-        }
-    }
+    out.extend_from_slice(&rest[band.end..]);
     out
 }
 
@@ -962,14 +933,6 @@ impl RowWords {
     }
 }
 
-const fn ladder_ix(details: bool, cols: bool) -> usize {
-    match (details, cols) {
-        (true, _) => 0,
-        (false, true) => 1,
-        (false, false) => 2,
-    }
-}
-
 /// One table's columns: the Full plan's, or one Folded block's.
 #[derive(Clone, Copy, Debug)]
 struct Table {
@@ -978,14 +941,15 @@ struct Table {
     well: Col,
     strip: Strip,
     pct: Option<Col>,
-    bar: Option<Col>,
-    amount: Option<Col>,
-    aterm: Option<Col>,
-    tab: Option<Col>,
+    /// The scope bar and the figure run right of the strip.
+    meter: Meter,
+    /// The % column where no bar column fits: each row's bar stands under its figure
+    /// ([`FullPlan::bar_under`], [`BlockPlan::bar_under`]).
+    under: Option<Col>,
     details: Option<Col>,
-    /// Whether the table says the glance (§6.8): Full wide and mid, as the refined sketches drew
-    /// them, at every width, Details or none, and every Folded tier (the form every window draws
-    /// unless Full is chosen). Full narrow and slim say the words before it.
+    /// Whether the table's Details say the glance's clauses (§6.8): Full wide and mid, as the
+    /// refined sketches drew them, and every Folded tier (the form every window draws unless
+    /// Full is chosen). Full narrow and slim say the clauses before it.
     glance: bool,
     /// The well mark's size.
     mark_pt: f64,
@@ -995,9 +959,12 @@ struct Table {
 
 impl Table {
     fn of_full(p: &FullPlan) -> Self {
-        let end = [p.pct, p.bar, p.amount, p.aterm, p.tab, p.details]
+        let end = p
+            .meter
+            .cols()
             .into_iter()
-            .flatten()
+            .chain(p.pct)
+            .chain(p.details)
             .map(Col::end)
             .fold(p.strip.end(), f64::max);
         Self {
@@ -1006,10 +973,8 @@ impl Table {
             well: p.well,
             strip: p.strip,
             pct: p.pct,
-            bar: p.bar,
-            amount: p.amount,
-            aterm: p.aterm,
-            tab: p.tab,
+            meter: p.meter,
+            under: p.bar_under(),
             details: p.details,
             glance: matches!(p.kind, FullKind::Wide | FullKind::Mid),
             mark_pt: match p.kind {
@@ -1027,10 +992,8 @@ impl Table {
             well: b.well,
             strip: b.strip,
             pct: b.pct,
-            bar: b.bar,
-            amount: b.amount,
-            aterm: b.aterm,
-            tab: b.tab,
+            meter: b.meter,
+            under: b.bar_under(),
             details: b.details,
             glance: true,
             mark_pt: match b.kind {
@@ -1047,24 +1010,16 @@ impl Table {
         (top - gap / 2.0, top + self.rows.cell + gap / 2.0)
     }
 
-    /// The row's amount forms this table says ([`RowWords::amount`]).
-    fn ladder(&self) -> usize {
-        if self.glance {
-            usize::from(self.details.is_none())
-        } else {
-            2 + ladder_ix(self.details.is_some(), self.aterm.is_some())
-        }
-    }
-
-    /// The row's scope cells and Details clauses this table says: the glance's or the others'.
+    /// The row's Details clauses this table says: the glance's or the others'.
     const fn said(&self) -> usize {
         if self.glance { 0 } else { 1 }
     }
 }
 
 struct HeadState<'w> {
-    /// The block's name x, where the planner put its label.
-    x: f64,
+    /// The block whose rows it is of: 0 (Full's table, Folded's block A) or 1 (block B), as its
+    /// header label names it ([`Label::State`]).
+    block: u8,
     res: Resource,
     st: &'w StateTxt,
     full: String,
@@ -1108,14 +1063,13 @@ struct Deck<'a> {
     live: DeckLive,
     at_ms: Option<i64>,
     /// The card's rects the live edge moves, device px (`App::splice_stats_deck` re-rasters
-    /// only these), the fastest Full strip's glide, device px a second, and the Folded strips'
-    /// slide, their pitch in device px.
+    /// only these), the fastest fine band of its Full strips (which glide) and of its Folded
+    /// strips (which slide), and how far the dial's tip travels per degree, device px (0 with no
+    /// dial).
     live_rects: Vec<(LiveLayer, Rect)>,
-    glide_px_per_s: f64,
-    slide_pitch_px: f64,
-    /// The strips' column period, s: `None` before the first strip, `Some(0)` when two strips'
-    /// periods differ (their open columns end at different moments, so the glide never holds).
-    glide_period: Option<u32>,
+    glide: live::FineBand,
+    slide: live::FineBand,
+    needle_px_per_deg: f64,
     tab: &'a str,
     machine: &'static str,
     /// Hits by precedence: the first containing the pointer wins.
@@ -1150,9 +1104,9 @@ impl<'a> Deck<'a> {
             live: input.live,
             at_ms: input.snap.map(|snap| snap.at_unix_ms),
             live_rects: Vec::new(),
-            glide_px_per_s: 0.0,
-            slide_pitch_px: 0.0,
-            glide_period: None,
+            glide: live::FineBand::default(),
+            slide: live::FineBand::default(),
+            needle_px_per_deg: 0.0,
             tab: &input.tab_label,
             machine: input.locale.platform.machine(),
             hits_first: Vec::new(),
@@ -1170,6 +1124,15 @@ impl<'a> Deck<'a> {
     fn px_rect(&self, x0: f64, y0: f64, x1: f64, y1: f64) -> Rect {
         let (a, b) = (self.px(x0), self.px(y0));
         (a, b, self.px(x1) - a, self.px(y1) - b)
+    }
+
+    /// What the bars under the % figures of a table's first `n` rows hold, device px: a live
+    /// rect a point past each, which their tween re-rasters ([`Self::under_bar`]).
+    fn under_rect(&self, col: Col, rows: &Rows, n: usize) -> Rect {
+        let last = u32::try_from(n.saturating_sub(1)).unwrap_or(0);
+        let (y0, _) = rows.under(0);
+        let (_, y1) = rows.under(last);
+        self.px_rect(col.x - 1.0, y0 - 1.0, col.end() + 1.0, y1 + 1.0)
     }
 
     fn note(&mut self, kind: BoxKind, r: [f64; 4], text: &str, room: Option<(f64, f64)>) {
@@ -1242,7 +1205,28 @@ impl<'a> Deck<'a> {
             &s,
             room,
         );
-        if self.draw {
+        self.glyphs(x, base, s, pt, bold, ink);
+        w
+    }
+
+    /// A row's % figure, right-aligned in `col`. Its box ends at the baseline: the figure is
+    /// digits, `<`, `%` or `–` ([`words::pct`]), none of which descends, so a bar can stand under
+    /// it (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5).
+    fn figure(&mut self, col: Col, base: f64, t: &Txt, pt: f64, bold: bool, ink: Rgb) {
+        let w = t.w(pt, bold);
+        let x = col.end() - w;
+        self.note(
+            BoxKind::Text,
+            [x, base - ASCENT_EM * pt, col.end(), base],
+            &t.s,
+            Some((col.x, col.end())),
+        );
+        self.glyphs(x, base, t.s.clone(), pt, bold, ink);
+    }
+
+    /// Draws `s` from `x` on `base`, without noting its box.
+    fn glyphs(&mut self, x: f64, base: f64, s: String, pt: f64, bold: bool, ink: Rgb) {
+        if self.draw && !s.is_empty() {
             let px = (pt * self.s) as f32;
             self.p.prims.push(text_prim(
                 self.px(x),
@@ -1254,7 +1238,6 @@ impl<'a> Deck<'a> {
                 rgba(ink, 0xFF),
             ));
         }
-        w
     }
 
     fn mark(&mut self, kind: WellMark, cx: f64, cy: f64, size: f64, ink: Rgb) {
@@ -1323,17 +1306,15 @@ impl<'a> Deck<'a> {
         self.px(strip.cell) < 4.0 || self.px(cell_h) < 4.0
     }
 
-    /// How far `strip`'s open column has run in this frame: 1 (every column in its slot)
-    /// unless a Folded strip slides ([`DeckLive::slide`]) or a Full one glides
-    /// ([`DeckLive::glide_ms`]).
-    fn glide(&self, strip: &Strip) -> f64 {
-        if strip.period_s == plan::FOLD_SLOT_S {
-            return self.live.slide.map_or(1.0, f64::from);
-        }
-        match (self.live.glide_ms, self.at_ms) {
-            (Some(now), Some(at)) => live::open_frac(at, now, strip.period_s),
-            _ => 1.0,
-        }
+    /// How far `strip`'s fine band still lags its slots in this frame, whole device px toward
+    /// now ([`live::lag_px`]): the step of the reading it moves for
+    /// ([`live::FineBand::step_px`]) less what its slide or glide has run of it
+    /// ([`DeckLive::flow`]); 0 with every box in its slot.
+    fn lag(&self, strip: &Strip) -> f32 {
+        self.live.flow.map_or(0.0, |flow| {
+            let step = fine_band(strip, self.s).step_px(flow.opened_ms);
+            live::lag_px(step, flow.ran) as f32
+        })
     }
 
     const fn gap_ink(&self, kind: GapKind) -> Rgb {
@@ -1349,7 +1330,7 @@ impl<'a> Deck<'a> {
             StripEventKind::Crash => self.inks.critical_text,
             StripEventKind::Restart => self.inks.warn_text,
             StripEventKind::SleepWake => self.inks.stuck,
-            StripEventKind::PressureSpike => self.inks.over,
+            StripEventKind::PressureSpike => self.inks.warn_text,
         }
     }
 
@@ -1370,49 +1351,42 @@ impl<'a> Deck<'a> {
             "",
             None,
         );
-        let pitch_px = self.px(strip.pitch);
-        let f = self.glide(strip);
-        let shift_px = ((1.0 - f.clamp(0.0, 1.0)) as f32 * pitch_px).round();
-        let rects = multi_scale_slot_rects(strip, self.s, shift_px);
+        let lag = self.lag(strip);
+        let rects = multi_scale_slot_rects(strip, self.s, lag);
         self.cells += rects.len();
         if !self.draw {
             return;
         }
-        let (x0, x1, y, h) = (
-            self.px(strip.x),
-            self.px(strip.end()),
-            self.px(top),
-            self.px(cell_h),
-        );
-        let gap_px = self.px(1.0).max(1.0);
+        let (y, h) = (self.px(top), self.px(cell_h));
         let radius = if self.s < 2.0 { 0.0 } else { 1.0 };
         let cap = self.cap_px();
         let live_slot = rects.iter().copied().find(|r| r.3);
-        let history_end = live_slot.map_or(x1, |(_, lx, _, _)| (lx - gap_px).max(x0));
-        let slide_max_ms = (i64::from(strip.period_s) * 1_000).max(2_000);
-        let spec_slots = strip.spec.slots();
-        let zone_start = spec_slots
-            .iter()
-            .position(|slot| !slot.is_live_now && (slot.age_hi_ms - slot.age_lo_ms) <= slide_max_ms)
-            .unwrap_or(0);
-        let zone_x0 = spec_slots
-            .get(zone_start)
-            .map_or(x0, |slot| (x0 + slot.x0 * (x1 - x0).max(1.0)).round());
-        let clip = shift_px != 0.0 && history_end > zone_x0;
-        let mut pushed_clip = false;
-        for (ri, &(idx, x, cw, is_live_now)) in rects.iter().enumerate() {
+        // A moving fine band draws inside the span it stands in at rest: its newest box passes
+        // under the live box and the entering one comes out from its old end, so neither the
+        // live box nor a coarser box ever takes a moving box's ink.
+        let band = fine_band_slots(&strip.spec.slots()).unwrap_or(0..0);
+        let clip = (lag != 0.0).then(|| self.fine_band_span(strip)).flatten();
+        let mut clipped = false;
+        for &(idx, x, cw, is_live_now) in &rects {
             if is_live_now {
                 continue;
             }
-            if clip && !pushed_clip && ri >= zone_start {
-                let h_card = self.px(self.h_pt);
-                self.p.prims.push(DrawPrim::ClipPush {
-                    x: zone_x0,
-                    y: 0.0,
-                    w: history_end - zone_x0,
-                    h: h_card,
-                });
-                pushed_clip = true;
+            match clip {
+                Some((cx0, cx1)) if band.contains(&idx) && !clipped => {
+                    let h_card = self.px(self.h_pt);
+                    self.p.prims.push(DrawPrim::ClipPush {
+                        x: cx0,
+                        y: 0.0,
+                        w: cx1 - cx0,
+                        h: h_card,
+                    });
+                    clipped = true;
+                }
+                _ if clipped && !band.contains(&idx) => {
+                    self.p.prims.push(DrawPrim::ClipPop);
+                    clipped = false;
+                }
+                _ => {}
             }
             let slot_data = slots.get(idx).copied().unwrap_or_default();
             if let Some(gap_kind) = slot_data.cell.gap {
@@ -1429,7 +1403,11 @@ impl<'a> Deck<'a> {
             } else {
                 h
             };
-            self.rect((x, y + h - hh, cw, hh), radius, self.heat(step));
+            self.rect(
+                (x, y + h - hh, cw, hh),
+                radius,
+                self.inks.cell_at(v, self.ic),
+            );
             if slot_data.cell.over {
                 let over = self.inks.over;
                 match cap {
@@ -1438,7 +1416,7 @@ impl<'a> Deck<'a> {
                 }
             }
         }
-        if pushed_clip {
+        if clipped {
             self.p.prims.push(DrawPrim::ClipPop);
         }
         if let Some((idx, x, cw, _)) = live_slot {
@@ -1448,43 +1426,19 @@ impl<'a> Deck<'a> {
                 self.hollow_cell((x, y, cw, h), radius, cw < 4.0 || h < 4.0);
                 return;
             };
-            let base_rgb = self.inks.thermal_at(v, self.ic);
+            // The strip cell's own ink for this value (`VitalsInks::cell_at`), at every level.
+            let step = ink::heat_step(v);
+            let cell = self.inks.cell_at(v, self.ic);
             let fill_rgb = if self.live.fresh {
-                base_rgb
+                cell
             } else {
-                ink::mix(self.inks.ground, base_rgb, 0.55)
+                ink::mix(self.inks.ground, cell, 0.55)
             };
             let hh = if self.dwc {
-                ink::dwc_height(h as u32, ink::heat_step(v)) as f32
+                ink::dwc_height(h as u32, step) as f32
             } else {
                 h
             };
-            if self.live.fresh && !self.dwc {
-                let glow_rgb = self.inks.glow_veil(base_rgb, 0.85);
-                let vc = v.clamp(0.0, 1.0);
-                if self.s >= 2.0 {
-                    let a_outer = ((0.11 + 0.22 * vc) * 255.0).round().clamp(1.0, 255.0) as u8;
-                    self.p.prims.push(DrawPrim::Stroke {
-                        x: x - 1.5,
-                        y: y - 1.5,
-                        w: cw + 3.0,
-                        h: h + 3.0,
-                        radius: radius + 2.0,
-                        width: 1.5,
-                        color: rgba(glow_rgb, a_outer),
-                    });
-                }
-                let a_inner = ((0.26 + 0.36 * vc) * 255.0).round().clamp(1.0, 255.0) as u8;
-                self.p.prims.push(DrawPrim::Stroke {
-                    x: x - 0.5,
-                    y: y - 0.5,
-                    w: cw + 1.0,
-                    h: h + 1.0,
-                    radius: radius + 1.0,
-                    width: 1.0,
-                    color: rgba(glow_rgb, a_inner),
-                });
-            }
             self.rect((x, y + h - hh, cw, hh), radius, fill_rgb);
             if slot_data.cell.over {
                 let over = self.inks.over;
@@ -1494,6 +1448,16 @@ impl<'a> Deck<'a> {
                 }
             }
         }
+    }
+
+    /// The device-px span `x0..x1` `strip`'s fine band stands in at rest
+    /// ([`fine_band_slots`]): from its newest box's left edge to its oldest's right edge.
+    fn fine_band_span(&self, strip: &Strip) -> Option<(f32, f32)> {
+        let band = fine_band_slots(&strip.spec.slots())?;
+        let rest = multi_scale_slot_rects(strip, self.s, 0.0);
+        let (_, x0, _, _) = *rest.get(band.start)?;
+        let (_, ox, ow, _) = *rest.get(band.end.checked_sub(1)?)?;
+        (ox + ow > x0).then_some((x0, ox + ow))
     }
 
     fn gap_cell(&mut self, (x, y, w, h): Rect, radius: f32, kind: GapKind) {
@@ -1564,24 +1528,23 @@ impl<'a> Deck<'a> {
         if !self.draw {
             return;
         }
-        // Scale-band gridlines anchor to the X-axis ticks (`shift_px = 0.0`) so coarse horizons
-        // (`-15m`, `-5m`, `-1m`, `-10s`) never drift off their tick marks during glide/slide.
+        // Scale-band gridlines anchor to the X-axis ticks (`lag_px = 0.0`) so band changes (the
+        // live box's edge, `-10s`, `-1m`, `-5m`, `-15m`) never drift off their tick marks during
+        // glide/slide: one in the gap before each band's first box, the live box's band aside.
         let rects = multi_scale_slot_rects(strip, self.s, 0.0);
         let slots = strip.spec.slots();
         let gap_px = self.px(1.0).max(1.0);
         let x0 = self.px(strip.x);
         let spans = Self::strip_spans(y0, y1, holes);
         let grid = self.inks.grid;
-        let mut prev_weight: Option<u16> = None;
+        let mut prev_band: Option<(u16, bool)> = None;
         for &(idx, sx, _, is_live_now) in &rects {
             let Some(slot) = slots.get(idx) else {
                 continue;
             };
-            let boundary = match prev_weight {
-                Some(pw) => pw != slot.weight || is_live_now,
-                None => false,
-            };
-            prev_weight = Some(slot.weight);
+            let band = (slot.weight, is_live_now);
+            let boundary = prev_band.is_some_and(|prev| prev != band);
+            prev_band = Some(band);
             if !boundary {
                 continue;
             }
@@ -1637,8 +1600,12 @@ impl<'a> Deck<'a> {
             ) else {
                 continue;
             };
-            let gx0 = (x0 + f0 * total_w).round().clamp(x0, x1);
-            let gx1 = (x0 + f1 * total_w).round().clamp(x0, x1);
+            // The gap's start is the older end, right of its end (x grows with age).
+            let (gx_old, gx_new) = (
+                (x0 + f0 * total_w).round().clamp(x0, x1),
+                (x0 + f1 * total_w).round().clamp(x0, x1),
+            );
+            let (gx0, gx1) = (gx_new.min(gx_old), gx_new.max(gx_old));
             if gx1 > gx0 {
                 let gink = self.gap_ink(gap.kind);
                 self.rect((gx0, y_axis, gx1 - gx0, 1.0), 0.0, gink);
@@ -1712,7 +1679,10 @@ impl<'a> Deck<'a> {
                             width: lw,
                             on,
                             off,
-                            color: rgba(ev_ink, 0xDF),
+                            // Historical guides stay below the data's contrast.
+                            // The full-strength cap pip still marks the event;
+                            // Increase Contrast retains the stronger guide.
+                            color: rgba(ev_ink, if self.ic { 0xDF } else { 0x70 }),
                         });
                     }
                 }
@@ -1720,21 +1690,27 @@ impl<'a> Deck<'a> {
         }
     }
 
-    /// `strip`'s live edge: its glide's rect, the glowing `now` box's rect, and the now marker at
-    /// its right end, a line from the dot on the header line at `base` down to `last` (the strip
-    /// rows' bottom), the dot beating while readings keep coming, grey and hollow when they stop.
-    fn live_edge(&mut self, strip: &Strip, base: f64, top0: f64, last: f64) {
+    /// `strip`'s live edge: its fine band's rect, the `now` box's rect, and the now
+    /// marker at its left end, between the % column and the live box: a line from the dot on the
+    /// header line at `base` down to `last` (the strip rows' bottom), the dot beating while
+    /// readings keep coming, grey and hollow when they stop. Where the header's state words take
+    /// the strip's header (`dotless`, [`HeaderPlan::dotless`]) the dot yields to them and the
+    /// line starts at the rows' top, `top0`.
+    fn live_edge(&mut self, strip: &Strip, base: f64, top0: f64, last: f64, dotless: bool) {
         let s = self.s;
         let card_h = self.px(self.h_pt);
-        let (sx0, sx1) = (self.px(strip.x) - 3.0, self.px(strip.end()) + 3.0);
-        self.live_rects
-            .push((LiveLayer::Glide, (sx0, 0.0, sx1 - sx0, card_h)));
-        if let Some((_, lx, _, _)) = multi_scale_slot_rects(strip, self.s, 0.0)
+        if let Some((bx0, bx1)) = self.fine_band_span(strip) {
+            let (gx0, gx1) = (bx0 - 1.0, bx1 + 1.0);
+            self.live_rects
+                .push((LiveLayer::Glide, (gx0, 0.0, gx1 - gx0, card_h)));
+        }
+        if let Some((_, lx, lw, _)) = multi_scale_slot_rects(strip, self.s, 0.0)
             .into_iter()
             .find(|r| r.3)
         {
-            let nx0 = (lx - 4.0).max(0.0);
-            let nx1 = self.px(strip.end()) + 4.0;
+            // A device px of slack each side: the box draws no halo past its own rect.
+            let nx0 = (lx - 1.0).max(0.0);
+            let nx1 = lx + lw + 1.0;
             let ny0 = (self.px(top0) - 6.0).max(0.0);
             let ny1 = (self.px(last) + 4.0).min(card_h);
             if nx1 > nx0 && ny1 > ny0 {
@@ -1742,20 +1718,13 @@ impl<'a> Deck<'a> {
                     .push((LiveLayer::NowBox, (nx0, ny0, nx1 - nx0, ny1 - ny0)));
             }
         }
-        let pitch_px = f64::from(self.px(strip.pitch));
+        let band = fine_band(strip, s);
         if strip.period_s == plan::FOLD_SLOT_S {
-            self.slide_pitch_px = self.slide_pitch_px.max(pitch_px);
+            self.slide = self.slide.faster(band);
         } else {
-            self.glide_px_per_s = self
-                .glide_px_per_s
-                .max(pitch_px / f64::from(strip.period_s.max(1)));
-            self.glide_period = Some(match self.glide_period {
-                None => strip.period_s,
-                Some(p) if p == strip.period_s => p,
-                Some(_) => 0,
-            });
+            self.glide = self.glide.faster(band);
         }
-        let x = strip.end() + live::LINE_DX;
+        let x = strip.x - live::LINE_DX;
         let cy = base - live::DOT_RISE;
         let reach = live::DOT_R + live::BEAT_REACH;
         let (rx0, rx1) = (
@@ -1765,12 +1734,14 @@ impl<'a> Deck<'a> {
         self.live_rects
             .push((LiveLayer::Marker, (rx0, 0.0, rx1 - rx0, card_h)));
         let r_pt = live::DOT_R;
-        self.note(
-            BoxKind::Mark,
-            [x - r_pt, cy - r_pt, x + r_pt, cy + r_pt],
-            "now",
-            None,
-        );
+        if !dotless {
+            self.note(
+                BoxKind::Mark,
+                [x - r_pt, cy - r_pt, x + r_pt, cy + r_pt],
+                "now",
+                None,
+            );
+        }
         if !self.draw {
             return;
         }
@@ -1783,7 +1754,11 @@ impl<'a> Deck<'a> {
         let lw = (0.75 * s).round().max(1.0) as f32;
         let (cx, cyp, r) = ((x * s) as f32, (cy * s) as f32, (r_pt * s) as f32);
         let y1 = self.px(last);
-        let y0 = (cyp + r).min(y1);
+        let y0 = if dotless {
+            self.px(top0).min(y1)
+        } else {
+            (cyp + r).min(y1)
+        };
         let lx = (cx - lw / 2.0).round();
         if fresh {
             // Solid words ink: the strongest neutral on the card, so "now" outranks its grey.
@@ -1805,6 +1780,9 @@ impl<'a> Deck<'a> {
                 off: dash,
                 color: rgba(ink, 0xFF),
             });
+        }
+        if dotless {
+            return;
         }
         let clear = [0, 0, 0, 0];
         if !fresh {
@@ -1861,23 +1839,7 @@ impl<'a> Deck<'a> {
         let r = (1.5 * s).round().max(1.0);
         self.rect((x, y, w, h), r, self.inks.track);
         let inset = s.round().max(1.0);
-        let width_of = |v: Option<f32>| -> f32 {
-            match v.filter(|v| v.is_finite() && *v > 0.0) {
-                Some(v) => (v.clamp(0.0, 1.0) * w).round().clamp(inset, w),
-                None => 0.0,
-            }
-        };
-        let tw = width_of(fill.tab);
-        let aw = if fill.aterm.is_some() {
-            width_of(fill.aterm).max(tw)
-        } else {
-            0.0
-        };
-        let gw = if fill.global.is_some() {
-            width_of(fill.global).max(aw).max(tw)
-        } else {
-            0.0
-        };
+        let [gw, aw, tw] = fill.widths_px(w, inset, 0.0);
         let ah = (h - 2.0 * inset).max(3.0).min(h);
         let th_inset = if ah >= 6.0 { inset } else { 1.0 };
         let th = (ah - 2.0 * th_inset).max(1.0).min(ah);
@@ -1921,76 +1883,77 @@ impl<'a> Deck<'a> {
         }
     }
 
-    fn amount(&mut self, col: Col, base: f64, pt: f64, row: &RowWords, t: &Table) {
+    /// A row's figure run at the end of its bar, from `col.x` (`docs/DESIGN-stats-deck-meter-
+    /// 2026-10-26.md` §3): the first of its forms that fits `col` (one that does not fit is left
+    /// out, never cut), and with a `state` its words after it where both fit
+    /// ([`Self::run_state`]), else the header says the state.
+    fn run_cell(&mut self, col: Col, base: f64, pt: f64, run: &[Txt], state: Option<&StateTxt>) {
         let room = Some((col.x, col.end()));
-        let words_ink = self.inks.words;
-        let Some(st) = row.state.as_ref().filter(|_| t.details.is_none()) else {
-            let forms = row.amount.get(t.ladder()).map_or(&[][..], Vec::as_slice);
-            let text = fit(forms, col.w, pt, false, self.m);
-            self.text(col.x, base, text, pt, false, words_ink, room);
-            return;
-        };
-        let madv = MARK_EM * pt;
-        let mark = Some((st.mark, self.mark_ink(st.mark, st.ink)));
-        let ink = self.ink(st.ink);
-        let says: Vec<&Txt> = st.clauses.iter().chain(std::iter::once(&st.word)).collect();
-        // The glance's amount before the state where the table says the glance (`897`, not
-        // `897/16,000`).
-        let amounts = if t.glance {
-            row.amount.first().map_or(&[][..], Vec::as_slice)
-        } else {
-            &st.amounts
-        };
-        for said in &says {
-            for am in amounts {
-                if am.w(pt, false) + STATE_GAP + madv + said.w(pt, true) <= col.w + 0.01 {
-                    let w = self.text(col.x, base, am.s.clone(), pt, false, words_ink, room);
-                    let x = col.x + w + STATE_GAP;
-                    self.marked(x, base, mark, said.s.clone(), pt, true, ink, room);
-                    return;
-                }
-            }
+        let words = self.inks.words;
+        let form = Self::run_form(col.w, pt, run);
+        let mut x = col.x;
+        if let Some(form) = form {
+            x += self.text(col.x, base, form.s.clone(), pt, false, words, room) + STATE_GAP;
         }
-        let text = says
-            .iter()
-            .find(|said| madv + said.w(pt, true) <= col.w + 0.01)
-            .map_or_else(
-                || self.m.fit(&[&st.word.s], col.w - madv, pt, true),
-                |said| said.s.clone(),
-            );
-        if !text.is_empty() {
-            self.marked(col.x, base, mark, text, pt, true, ink, room);
+        if let Some(st) = state
+            && let Some(said) = self.run_state(col.w, pt, run, st)
+        {
+            let mark = Some((st.mark, self.mark_ink(st.mark, st.ink)));
+            let ink = self.ink(st.ink);
+            self.marked(x, base, mark, said.s.clone(), pt, true, ink, room);
         }
     }
 
-    fn scope_cells(&mut self, scope: &ScopeTxt, aterm: Col, tab: Col, base: f64, pt: f64) {
-        match scope {
-            ScopeTxt::None => {}
-            ScopeTxt::Span(forms, ink) => {
-                let room = tab.end() - aterm.x;
-                let text = fit(forms, room, SMALL_PT, false, self.m);
-                let ink = self.ink(*ink);
-                self.text(
-                    aterm.x,
-                    base,
-                    text,
-                    SMALL_PT,
-                    false,
-                    ink,
-                    Some((aterm.x, tab.end())),
-                );
-            }
-            ScopeTxt::Each {
-                aterm: (af, ai),
-                tab: (tf, ti),
-            } => {
-                for (col, forms, ink) in [(aterm, af, ai), (tab, tf, ti)] {
-                    let text = fit(forms, col.w, pt, false, self.m);
-                    let ink = self.ink(*ink);
-                    self.text(col.x, base, text, pt, false, ink, Some((col.x, col.end())));
-                }
-            }
-        }
+    /// The first of a row's `run` forms that fits `w`.
+    fn run_form(w: f64, pt: f64, run: &[Txt]) -> Option<&Txt> {
+        run.iter().find(|f| f.w(pt, false) <= w + 0.01)
+    }
+
+    /// What a run's cell `w` wide says of a row's `st` after its reading ([`Self::run_form`]):
+    /// the state's clause, else its word, where it fits beside the reading. The reading is never
+    /// given up for the state, which the header says where neither fits (`None`).
+    fn run_state<'t>(&self, w: f64, pt: f64, run: &[Txt], st: &'t StateTxt) -> Option<&'t Txt> {
+        let used = Self::run_form(w, pt, run).map_or(0.0, |f| f.w(pt, false) + STATE_GAP);
+        let madv = MARK_EM * pt;
+        st.clauses
+            .iter()
+            .chain(std::iter::once(&st.word))
+            .find(|said| used + madv + said.w(pt, true) <= w + 0.01)
+    }
+
+    /// Whether row `row` of table `t` says its state: in its Details, or after its figure run
+    /// ([`Self::run_state`]); a state no row says stands in the header.
+    fn row_says_state(&self, t: &Table, row: &RowWords) -> bool {
+        let Some(st) = &row.state else {
+            return true;
+        };
+        t.details.is_some()
+            || t.meter.run.is_some_and(|c| {
+                self.run_state(c.w, t.rows.amount_pt, &row.run, st)
+                    .is_some()
+            })
+    }
+
+    /// The bar's segments a click picks a scope by, pt from its left edge: this tab's fill, and
+    /// aterm's past it ([`BarFill::widths_px`], as [`Self::bar`] draws them). A scope that draws
+    /// a fill takes at least [`SEGMENT_HIT_MIN`] of the bar, so a tab using little is still a
+    /// target and not a pixel or two.
+    fn bar_segments(&self, col: Col, fill: &BarFill) -> [(f64, f64, Bar); 2] {
+        let s = self.s as f32;
+        let w = self.px(col.w);
+        let [_, aw, tw] = fill.widths_px(w, s.round().max(1.0), 0.0);
+        let pt = |v: f32| f64::from(v) / self.s;
+        let tab = if tw > 0.0 {
+            pt(tw).max(SEGMENT_HIT_MIN).min(col.w)
+        } else {
+            0.0
+        };
+        let aterm = if aw > 0.0 {
+            pt(aw).max(tab + SEGMENT_HIT_MIN).min(col.w)
+        } else {
+            tab
+        };
+        [(0.0, tab, Bar::Tab), (tab, aterm, Bar::Aterm)]
     }
 
     fn details(&mut self, col: Col, base: f64, clauses: &[ClauseTxt]) {
@@ -2076,6 +2039,51 @@ impl<'a> Deck<'a> {
         }
     }
 
+    /// How tall the bars under a table's % figures are drawn, device px: [`plan::UNDER_H`], or
+    /// as much of it as every row holds between its line's top, [`plan::UNDER_GAP`] below the
+    /// digits' baseline ([`Rows::under`]), and a device px short of the next row's top; a device
+    /// px at least. One height serves every row of the table, so the lines read alike where the
+    /// rows' tops round differently: at 1× in Full narrow and slim, whose 10.5 pt pitch leaves
+    /// half a point past the line (§5's table), the rows on a half point have room for 1 px, and
+    /// every line there is 1 px.
+    fn under_h(&self, rows: &Rows) -> f32 {
+        (0..rows.count)
+            .map(|r| self.px(rows.top(r + 1)) - 1.0 - self.px(rows.under(r).0))
+            .fold(self.px(plan::UNDER_H), f32::min)
+            .max(1.0)
+    }
+
+    /// A row's three-scope bar under its % figure, where no bar column fits
+    /// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5): the % column's width from `y0`
+    /// ([`Rows::under`], [`plan::UNDER_GAP`] below the digits' baseline), `h` device px tall
+    /// ([`Self::under_h`]), the bar's track and nested fills (the machine's, aterm's over it,
+    /// this tab's over that) in the bar's inks, each the line's whole height, so they nest by
+    /// length alone: a scope above zero ends a device px or more past the fill inside it
+    /// ([`BarFill::widths_px`]'s `apart`), or its ink would hide under the inner fill wherever
+    /// the two round alike. Its edges fall on whole device px, a scope above zero keeps one at
+    /// least, and with `h` from [`Self::under_h`] it ends a device px or more short of the next
+    /// row's top, so it never meets that row's cells. It carries the fills alone: no core ticks,
+    /// and no Disk warn line, which stands 1.5 pt past a bar's top and foot and would meet the
+    /// digits and the next row. Notes the rect it draws, and answers it, device px: a click there
+    /// opens the row's lens, as one on the bar's column does.
+    fn under_bar(&mut self, col: Col, y0: f64, h: f32, fill: &BarFill) -> Rect {
+        let (x, y) = (self.px(col.x), self.px(y0));
+        let w = self.px(col.end()) - x;
+        let pt = |v: f32| f64::from(v) / self.s;
+        self.note(BoxKind::Bar, [pt(x), pt(y), pt(x + w), pt(y + h)], "", None);
+        if self.draw {
+            let r = (0.5 * self.s).floor() as f32;
+            let [gw, aw, tw] = fill.widths_px(w, 1.0, 1.0);
+            self.rect((x, y, w, h), r, self.inks.track);
+            for (bw, bar) in [(gw, Bar::Global), (aw, Bar::Aterm), (tw, Bar::Tab)] {
+                if bw > 0.0 {
+                    self.rect((x, y, bw, h), r, self.scope_ink(bar));
+                }
+            }
+        }
+        (x, y, w, h)
+    }
+
     fn row(
         &mut self,
         t: &Table,
@@ -2133,19 +2141,11 @@ impl<'a> Deck<'a> {
                 Some(h) => (self.inks.heat_text[usize::from(ink::heat_step(h))], true),
                 None => (self.inks.words2, false),
             };
-            let w = row.pct.w(rows.name_pt, bold);
-            self.text(
-                col.end() - w,
-                base,
-                row.pct.s.clone(),
-                rows.name_pt,
-                bold,
-                ink,
-                Some((col.x, col.end())),
-            );
+            self.figure(col, base, &row.pct, rows.name_pt, bold, ink);
         }
-        if let (Some(col), Some(fill)) = (t.bar, row.bar.as_ref()) {
-            let blended = match (prev_row.and_then(|p| p.1), blend) {
+        let blended = row
+            .bar
+            .map(|fill| match (prev_row.and_then(|p| p.1), blend) {
                 (Some(pf), Some(b)) => BarFill {
                     global: live::lerp_opt(pf.global, fill.global, Some(b)),
                     aterm: live::lerp_opt(pf.aterm, fill.aterm, Some(b)),
@@ -2153,20 +2153,20 @@ impl<'a> Deck<'a> {
                     ticks: fill.ticks,
                     warn_tick: fill.warn_tick,
                 },
-                _ => *fill,
-            };
-            self.bar(
-                col,
-                top + (rows.cell - rows.bar_h) / 2.0,
-                rows.bar_h,
-                &blended,
-            );
+                _ => fill,
+            });
+        if let (Some(col), Some(fill)) = (t.meter.bar, blended.as_ref()) {
+            self.bar(col, top + (rows.cell - rows.bar_h) / 2.0, rows.bar_h, fill);
         }
-        if let Some(col) = t.amount {
-            self.amount(col, base, rows.amount_pt, row, t);
-        }
-        if let (Some(aterm), Some(tab)) = (t.aterm, t.tab) {
-            self.scope_cells(&row.scope[t.said()], aterm, tab, base, rows.figure_pt);
+        let under = match (t.under, blended.as_ref()) {
+            (Some(col), Some(fill)) => {
+                Some(self.under_bar(col, rows.under(r).0, self.under_h(&rows), fill))
+            }
+            _ => None,
+        };
+        if let Some(col) = t.meter.run {
+            let state = row.state.as_ref().filter(|_| t.details.is_none());
+            self.run_cell(col, base, rows.amount_pt, &row.run, state);
         }
         if let Some(col) = t.details {
             self.details(col, base, &row.details[t.said()]);
@@ -2176,11 +2176,20 @@ impl<'a> Deck<'a> {
         }
         let (y0, y1) = t.band(r);
         let inst = Instrument::of(row.res);
-        if let (Some(aterm), Some(tab)) = (t.aterm, t.tab) {
-            for (col, bar) in [(aterm, Bar::Aterm), (tab, Bar::Tab)] {
-                let rect = self.px_rect(col.x, y0, col.end(), y1);
-                self.hits_first.push(Hit::row(rect, inst, bar));
+        // A click on this tab's or aterm's segment of the bar opens the row's lens on that scope;
+        // the rest of the row opens it on the machine's.
+        if let (Some(col), Some(fill)) = (t.meter.bar, row.bar.as_ref()) {
+            for (x0, x1, bar) in self.bar_segments(col, fill) {
+                if x1 > x0 {
+                    let rect = self.px_rect(col.x + x0, y0, col.x + x1, y1);
+                    self.hits_first.push(Hit::row(rect, inst, bar));
+                }
             }
+        }
+        // The bar under the % reaches past the row's band into the gap before the next row: it is
+        // still this row's, as the bar's column is.
+        if let Some(rect) = under {
+            self.hits_first.push(Hit::row(rect, inst, Bar::Global));
         }
         let rect = self.px_rect(t.name.x, y0, t.end, y1);
         self.hits_rows.push(Hit::row(rect, inst, Bar::Global));
@@ -2209,29 +2218,7 @@ impl<'a> Deck<'a> {
         );
         let radius = if side < 4.0 { 0.0 } else { radius };
         match heat {
-            Some(v) => {
-                let vc = v.clamp(0.0, 1.0);
-                let fill = if vc >= 0.55 {
-                    self.inks.thermal_at(vc, self.ic)
-                } else {
-                    self.heat(ink::heat_step(vc))
-                };
-                if vc >= 0.70 && !self.dwc && side >= 3.0 {
-                    let t = ((vc - 0.70) / 0.30).clamp(0.0, 1.0);
-                    let alpha = ((0.28 + 0.42 * t) * 255.0).round().clamp(1.0, 255.0) as u8;
-                    let glow = self.inks.glow_veil(fill, 0.85);
-                    self.p.prims.push(DrawPrim::Stroke {
-                        x: rect.0 - 0.5,
-                        y: rect.1 - 0.5,
-                        w: side + 1.0,
-                        h: side + 1.0,
-                        radius: radius + 0.5,
-                        width: 1.0,
-                        color: rgba(glow, alpha),
-                    });
-                }
-                self.rect(rect, radius, fill);
-            }
+            Some(v) => self.rect(rect, radius, self.inks.cell_at(v, self.ic)),
             None => self.hollow_cell(rect, radius, side < 4.0),
         }
     }
@@ -2254,27 +2241,31 @@ impl<'a> Deck<'a> {
     }
 
     /// The dial of radius `r` pt at `centre`, its bloom clipped to `slot` (pt, `x0, y0, x1, y1`).
+    /// It draws the reading, or the needle in motion where the live edge carries one
+    /// ([`DeckLive::needle`]); its slot is the live edge's [`LiveLayer::Gauge`] rect. A dial that
+    /// reads hot steams (`crate::stats_steam`) at the live edge's steam clock
+    /// ([`DeckLive::steam`]), and its slot is then a [`LiveLayer::Steam`] rect too.
     fn dial(&mut self, (cx, cy): (f64, f64), r: f64, slot: [f64; 4], words: &DeckWords) {
         self.note(BoxKind::Gauge, [cx - r, cy - r, cx + r, cy + r], "", None);
         let (x, y, w, h) = self.px_rect(slot[0], slot[1], slot[2], slot[3]);
-        self.live_rects.push((LiveLayer::Values, (x, y, w, h)));
+        self.live_rects.push((LiveLayer::Gauge, (x, y, w, h)));
+        self.needle_px_per_deg = self.needle_px_per_deg.max(gauge::tip_px_per_deg(r, self.s));
+        let read = words.strain.as_ref().map_or(Gauge::UNREAD, Gauge::of);
+        // The reading's strength, not the swinging needle's: a frame draws steam exactly where
+        // its layout laid the steam's rect.
+        let steam_k = steam::strength(read.needle);
+        if steam_k > 0.0 {
+            self.live_rects.push((LiveLayer::Steam, (x, y, w, h)));
+        }
         if !self.draw {
             return;
         }
-        let g_curr = words.strain.as_ref().map_or(Gauge::UNREAD, Gauge::of);
-        let g = match (
-            words.prev.as_ref().and_then(|p| p.strain.as_ref()),
-            self.live.blend,
-        ) {
-            (Some(ps), Some(t)) if g_curr.needle.is_some() => {
-                let gp = Gauge::of(ps);
-                Gauge {
-                    needle: live::lerp_opt(gp.needle, g_curr.needle, Some(t)),
-                    soak: live::lerp_opt(Some(gp.soak), Some(g_curr.soak), Some(t))
-                        .unwrap_or(g_curr.soak),
-                }
-            }
-            _ => g_curr,
+        let g = match self.live.needle {
+            Some((deg, soak)) if read.needle.is_some() => Gauge::at_deg(
+                f64::from(deg) / crate::stats_needle::ANGLE_PER_DEG,
+                (f64::from(soak) / crate::stats_needle::SOAK_PER_ONE) as f32,
+            ),
+            _ => read,
         };
         let heat = if self.ic {
             self.inks.heat_ic
@@ -2289,12 +2280,17 @@ impl<'a> Deck<'a> {
             r,
         };
         gauge::draw(g, place, &inks, &mut self.p.prims);
+        if let Some(t_ms) = self.live.steam {
+            steam::draw(
+                steam_k,
+                t_ms,
+                place,
+                steam::ink(&self.inks),
+                &mut self.p.prims,
+            );
+        }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the Cores row's slot, cell geometry, mode, caption size, words and header scope"
-    )]
     fn cores_row(
         &mut self,
         room: Col,
@@ -2303,7 +2299,6 @@ impl<'a> Deck<'a> {
         mode: CoresMode,
         caption_pt: f64,
         words: &DeckWords,
-        global_head: Option<&str>,
     ) {
         let clusters = words.clusters();
         let base = top + cell - 1.0;
@@ -2356,22 +2351,10 @@ impl<'a> Deck<'a> {
             self.note(BoxKind::Core, [x, y0, x + w, bottom], "", None);
             x += w + 8.0;
         }
-        let header_has_totals = global_head.is_some_and(|g| g.contains(" \u{b7} "));
-        let short_chip = words.cores_tail_forms.last().map(|t| t.s.as_str());
-        let header_has_chip = match (global_head, short_chip) {
-            (Some(g), Some(chip)) => !chip.is_empty() && g.contains(chip),
-            _ => false,
-        };
-        if !(header_has_totals && header_has_chip)
-            && let Some((tail, tw)) = words
-                .cores_tail_forms
-                .iter()
-                .filter(|t| !header_has_totals || !t.s.contains(" \u{b7} "))
-                .find_map(|t| {
-                    let tw = self.m.width(&t.s, caption_pt, false);
-                    (x + tw <= room.end()).then_some((t, tw))
-                })
-        {
+        if let Some((tail, tw)) = words.cores_tail_forms.iter().find_map(|t| {
+            let tw = self.m.width(&t.s, caption_pt, false);
+            (x + tw <= room.end()).then_some((t, tw))
+        }) {
             self.text(
                 room.end() - tw,
                 base,
@@ -2428,11 +2411,11 @@ impl<'a> Deck<'a> {
                 Label::Scope(bar) => {
                     self.swatch(label.x, base, bar);
                     let x = label.x + 0.62 * SMALL_PT + 3.0;
-                    self.two_inks(x, base, &label.text, sep);
+                    self.text(x, base, label.text.clone(), SMALL_PT, false, words2, None);
                 }
                 Label::Details => self.two_inks(label.x, base, &label.text, sep),
-                Label::State => {
-                    let Some(st) = states.iter().find(|st| (st.x - label.x).abs() < 0.01) else {
+                Label::State(block) => {
+                    let Some(st) = states.iter().find(|st| st.block == block) else {
                         continue;
                     };
                     let ink = self.ink(st.st.ink);
@@ -2447,7 +2430,12 @@ impl<'a> Deck<'a> {
                         ink,
                         None,
                     );
-                    let rect = self.px_rect(label.x, 0.0, label.x + w, HEADER_HIT_FOLDED);
+                    let hit_h = if base == HEADER_BASE_FULL {
+                        HEADER_HIT_FULL
+                    } else {
+                        HEADER_HIT_FOLDED
+                    };
+                    let rect = self.px_rect(label.x, 0.0, label.x + w, hit_h);
                     self.hits_first
                         .push(Hit::row(rect, Instrument::of(st.res), Bar::Global));
                 }
@@ -2591,18 +2579,24 @@ impl<'a> Deck<'a> {
         let text = HeaderText {
             tab: self.tab,
             machine: self.machine,
-            machine_forms: &words.machine_forms,
             over: words.over_shown(&plan.strip),
+            totals: &words.totals,
         };
+        let t = Table::of_full(&plan);
+        let unsaid: Vec<&RowWords> = words
+            .rows
+            .iter()
+            .filter(|row| !self.row_says_state(&t, row))
+            .collect();
+        let state = block_state(&unsaid, 0);
+        let label = state.as_ref().map(|st| StateLabel {
+            full: &st.full,
+            bare: &st.st.label,
+        });
         let head = self
             .head
             .take()
-            .unwrap_or_else(|| planned_header(|| plan::header_full(&plan, text, self.m)));
-        let global_head = head
-            .labels
-            .iter()
-            .find_map(|l| (l.label == Label::Scope(Bar::Global)).then_some(l.text.as_str()));
-        let t = Table::of_full(&plan);
+            .unwrap_or_else(|| planned_header(|| plan::header_full(&plan, text, label, self.m)));
         let rows = plan.rows;
         let gap = rows.pitch - rows.cell;
         let holes: Vec<(f64, f64)> = words
@@ -2614,6 +2608,7 @@ impl<'a> Deck<'a> {
             .collect();
         let last = rows.top(DECK_RESOURCES.len() as u32 - 1) + rows.cell;
         self.gridlines(&plan.strip, rows.top(0), last, &holes);
+        let mut cores_row_hit = None;
         match plan.cores {
             CoresAt::Block { at, divider } => {
                 self.gauge(at, &rows, words);
@@ -2642,17 +2637,20 @@ impl<'a> Deck<'a> {
                 let mode = plan
                     .cores_mode(&words.clusters(), self.m)
                     .unwrap_or(CoresMode::CountOnly);
-                self.cores_row(room, top, rows.cell, mode, SMALL_PT, words, global_head);
+                self.cores_row(room, top, rows.cell, mode, SMALL_PT, words);
                 if !words.reading {
                     let (y0, y1) = t.band(r);
-                    let rect = self.px_rect(plan.name.x, y0, room.end(), y1);
-                    self.hits_first.push(Hit::cores(rect));
+                    cores_row_hit = Some(self.px_rect(plan.name.x, y0, room.end(), y1));
                 }
             }
         }
-        if let Some(bar) = plan.bar {
+        if let Some(bar) = plan.meter.bar {
             let br = self.px_rect(bar.x - 2.0, rows.top(0) - 2.0, bar.end() + 2.0, last + 2.0);
             self.live_rects.push((LiveLayer::Values, br));
+        }
+        if let Some(col) = plan.bar_under() {
+            let rect = self.under_rect(col, &rows, words.rows.len());
+            self.live_rects.push((LiveLayer::Values, rect));
         }
         for (row, r) in words.rows.iter().zip(0_u32..) {
             let prev_row = words
@@ -2662,6 +2660,10 @@ impl<'a> Deck<'a> {
                 .copied();
             self.row(&t, r, row, prev_row, words.reading);
         }
+        // After the rows: the foot of a bar under the last row's % reaches the Cores row's band.
+        if let Some(rect) = cores_row_hit {
+            self.hits_first.push(Hit::cores(rect));
+        }
         self.strip_axis_and_events(
             &plan.strip,
             HEADER_BASE_FULL,
@@ -2670,9 +2672,10 @@ impl<'a> Deck<'a> {
             &holes,
             words,
         );
-        self.live_edge(&plan.strip, HEADER_BASE_FULL, rows.top(0), last);
+        let dotless = head.dotless == Some(plan.strip.x);
+        self.live_edge(&plan.strip, HEADER_BASE_FULL, rows.top(0), last, dotless);
         let small = self.small_cells(&plan.strip, rows.cell);
-        self.header(&head, HEADER_BASE_FULL, small, &[]);
+        self.header(&head, HEADER_BASE_FULL, small, state.as_slice());
         self.head = Some(head);
         if !words.reading {
             let rect = self.px_rect(0.0, 0.0, self.w_pt, HEADER_HIT_FULL);
@@ -2691,24 +2694,30 @@ impl<'a> Deck<'a> {
             .iter()
             .enumerate()
             .filter_map(|(bi, block)| {
-                let ours: Vec<&RowWords> = words.rows.iter().skip(bi * 4).take(4).collect();
-                block_state(&ours, block.name.x)
+                let t = Table::of_block(block);
+                let unsaid: Vec<&RowWords> = words
+                    .rows
+                    .iter()
+                    .skip(bi * 4)
+                    .take(4)
+                    .filter(|row| !self.row_says_state(&t, row))
+                    .collect();
+                block_state(&unsaid, u8::try_from(bi).unwrap_or(1))
             })
             .collect();
         let text = HeaderText {
             tab: self.tab,
             machine: self.machine,
-            machine_forms: &words.machine_forms,
             over: plan
                 .blocks
                 .first()
                 .is_some_and(|b| words.over_shown(&b.strip)),
+            totals: &words.totals,
         };
         let labels: [Option<StateLabel<'_>>; 2] = [0, 1].map(|bi| {
-            let x = plan.blocks.get(bi).map(|b| b.name.x)?;
             states
                 .iter()
-                .find(|st| (st.x - x).abs() < 0.01)
+                .find(|st| st.block == bi)
                 .map(|st| StateLabel {
                     full: &st.full,
                     bare: &st.st.label,
@@ -2718,10 +2727,6 @@ impl<'a> Deck<'a> {
             .head
             .take()
             .unwrap_or_else(|| planned_header(|| plan::header_folded(&plan, text, labels, self.m)));
-        let global_head = head
-            .labels
-            .iter()
-            .find_map(|l| (l.label == Label::Scope(Bar::Global)).then_some(l.text.as_str()));
         let w = (0.5 * self.s).round().max(1.0) as f32;
         let (y0, y1) = (self.px(4.0), self.px(self.h_pt - 6.0));
         let grid = self.inks.grid;
@@ -2748,9 +2753,13 @@ impl<'a> Deck<'a> {
                 .collect();
             let last = rows.top(ours.len().saturating_sub(1) as u32) + rows.cell;
             self.gridlines(&block.strip, rows.top(0), last, &holes);
-            if let Some(bar) = block.bar {
+            if let Some(bar) = block.meter.bar {
                 let br = self.px_rect(bar.x - 2.0, rows.top(0) - 2.0, bar.end() + 2.0, last + 2.0);
                 self.live_rects.push((LiveLayer::Values, br));
+            }
+            if let Some(col) = block.bar_under() {
+                let rect = self.under_rect(col, &rows, ours.len());
+                self.live_rects.push((LiveLayer::Values, rect));
             }
             for (row, r) in ours.iter().zip(0_u32..) {
                 let row_ix = bi * 4 + r as usize;
@@ -2769,7 +2778,8 @@ impl<'a> Deck<'a> {
                 &holes,
                 words,
             );
-            self.live_edge(&block.strip, HEADER_BASE_FOLDED, rows.top(0), last);
+            let dotless = head.dotless == Some(block.strip.x);
+            self.live_edge(&block.strip, HEADER_BASE_FOLDED, rows.top(0), last, dotless);
             if bi == 1 {
                 let r = 3;
                 let top = rows.top(r);
@@ -2787,15 +2797,7 @@ impl<'a> Deck<'a> {
                 }
                 let mode = block.cores_mode(&clusters, self.m);
                 let caption = block.kind.cores_caption_pt();
-                self.cores_row(
-                    block.cores,
-                    top,
-                    rows.cell,
-                    mode,
-                    caption,
-                    words,
-                    global_head,
-                );
+                self.cores_row(block.cores, top, rows.cell, mode, caption, words);
                 if !words.reading {
                     let (y0, y1) = t.band(r);
                     let rect = self.px_rect(block.name.x, y0, block.at.end(), y1);
@@ -2839,7 +2841,7 @@ impl<'a> Deck<'a> {
     }
 }
 
-fn block_state<'w>(rows: &[&'w RowWords], x: f64) -> Option<HeadState<'w>> {
+fn block_state<'w>(rows: &[&'w RowWords], block: u8) -> Option<HeadState<'w>> {
     let with: Vec<(&RowWords, &StateTxt)> = rows
         .iter()
         .filter_map(|row| row.state.as_ref().map(|st| (*row, st)))
@@ -2854,7 +2856,7 @@ fn block_state<'w>(rows: &[&'w RowWords], x: f64) -> Option<HeadState<'w>> {
     })?;
     let more = with.len() - 1;
     Some(HeadState {
-        x,
+        block,
         res: row.res,
         st,
         full: if more > 0 {
@@ -2870,14 +2872,15 @@ fn block_state<'w>(rows: &[&'w RowWords], x: f64) -> Option<HeadState<'w>> {
 pub(crate) struct LiveOut {
     /// The card's rects the live edge moves, device px, and what moves each.
     pub(crate) rects: Vec<(LiveLayer, Rect)>,
-    /// The fastest Full strip's glide, device px a second (0 with none).
-    pub(crate) glide_px_per_s: f64,
-    /// The Full strips' column period, s: 0 with no Full strip, or when strips' periods differ
-    /// (the glide then never holds at an open column's end, `Flow::Glide`).
-    pub(crate) glide_period_s: u32,
-    /// The Folded strips' pitch, device px: how far each reading that opens a new second slides
-    /// them (`Flow::Slide`); 0 with no Folded strip.
-    pub(crate) slide_pitch_px: f64,
+    /// The fastest fine band of its Full strips, which glide with the wall clock (`Flow::Glide`);
+    /// the default with no Full strip.
+    pub(crate) glide: live::FineBand,
+    /// The fastest fine band of its Folded strips, which slide over the frames after a reading
+    /// that opens a slot (`Flow::Slide`); the default with no Folded strip.
+    pub(crate) slide: live::FineBand,
+    /// How far the dial's tip travels per degree, device px: one device pixel of the needle in
+    /// motion (`stats_needle::View`); 0 with no dial.
+    pub(crate) needle_px_per_deg: f64,
 }
 
 /// What the Deck's layout reads that its live edge never moves: the snapshot's words and the
@@ -2964,16 +2967,38 @@ pub(crate) fn deck_paint_kept(
         note_layout_work(1);
         DeckWords::new(input, &m)
     });
-    let mut deck = Deck::new(g, input, &m, true);
+    let mut resource_geom = *g;
+    let network_height = input.network.map_or(0.0, |_| {
+        crate::network_deck::height_px(f64::from(g.scale)) as f32
+    });
+    resource_geom.h = (g.h - network_height).max(0.0);
+    let mut deck = Deck::new(&resource_geom, input, &m, true);
     deck.head = still.head.take();
     deck.paint(words, input.form);
     still.head = deck.head.take();
-    let hits = deck.hits();
+    let mut hits = deck.hits();
+    if let Some(snapshot) = input.network {
+        let mut network_inks = input.inks;
+        if input.contrast {
+            network_inks.hollow = network_inks.words2;
+            network_inks.machine = network_inks.machine_ic;
+            network_inks.aterm = network_inks.aterm_ic;
+        }
+        let (prims, network_hits) = crate::network_deck::paint_with_inks(
+            g,
+            resource_geom.h,
+            snapshot,
+            &network_inks,
+            input.dwc,
+        );
+        deck.p.prims.extend(prims);
+        hits.extend(network_hits);
+    }
     let out = LiveOut {
         rects: std::mem::take(&mut deck.live_rects),
-        glide_px_per_s: deck.glide_px_per_s,
-        glide_period_s: deck.glide_period.unwrap_or(0),
-        slide_pitch_px: deck.slide_pitch_px,
+        glide: deck.glide,
+        slide: deck.slide,
+        needle_px_per_deg: deck.needle_px_per_deg,
     };
     (deck.p.prims, hits, out)
 }
@@ -3047,8 +3072,11 @@ pub(crate) struct DeckFrame {
     pub(crate) deck: DeckForm,
     /// Increase Contrast.
     pub(crate) contrast: bool,
-    /// The live edge this frame draws ([`crate::App::deck_live`]); still for the sill.
+    /// The live edge this frame draws ([`crate::App::deck_live_now`]); still for the sill.
     pub(crate) live: DeckLive,
+    /// What it draws of the dial's needle ([`crate::stats_live::LiveFacts::needle_at`]), which
+    /// its layout keeps as what the window drew; `None` with no needle and for the sill.
+    pub(crate) needle: Option<crate::stats_needle::Drawn>,
 }
 
 impl crate::App {
@@ -3065,6 +3093,39 @@ impl crate::App {
             .saturating_add(self.win_head(wid))
             .saturating_add(self.win_pad_top(wid))
             .saturating_add(self.win_pad(wid))
+    }
+
+    /// Geometry for the network close-up when the resource deck itself is hidden.
+    pub(crate) fn network_lens_frame(&self, wid: crate::WindowId) -> Option<DeckFrame> {
+        let ws = self.windows.get(&wid)?;
+        let (cw, _) = self.win_cell_size(wid);
+        let pad = self.win_pad(wid);
+        let preferences = crate::native_appearance::current_preferences();
+        let palette = self.chrome_palette(crate::app_render::ChromeSurface::Header);
+        let band = crate::chrome_band::band_colors(palette);
+        let inks = cached_inks(band.bar_bg, band.value, band.accent);
+        Some(DeckFrame {
+            form: StatsBars::Off,
+            plate: None,
+            geom: DeckGeom {
+                w: (ws.cols as usize * cw + 2 * pad) as f32,
+                h: 0.0,
+                pad: pad as f32,
+                scale: ws.scale as f32,
+                font_px: self.win_font_px(wid),
+            },
+            dy: 0,
+            tab_panes: self.deck_tab_panes(wid),
+            tab_label: self.deck_tab(wid).1,
+            tab_count: ws.tab_set.tabs().len(),
+            inks,
+            lens_inks: inks,
+            dwc: preferences.differentiate_without_color,
+            deck: ws.deck_form,
+            contrast: preferences.high_contrast,
+            live: DeckLive::STILL,
+            needle: None,
+        })
     }
 
     pub(crate) fn deck_frame(&self, wid: crate::WindowId) -> Option<DeckFrame> {
@@ -3095,6 +3156,7 @@ impl crate::App {
             StatsBars::Deck => {
                 let rows = self.deck_rows_px(wid)?;
                 let (dy, deck) = (rows.start, rows.len());
+                let (live, needle) = self.deck_live_now(wid);
                 Some(DeckFrame {
                     form,
                     plate: None,
@@ -3114,7 +3176,8 @@ impl crate::App {
                     dwc,
                     deck: ws.deck_form,
                     contrast,
-                    live: self.deck_live(wid),
+                    live,
+                    needle,
                 })
             }
             StatsBars::Sill => {
@@ -3151,6 +3214,7 @@ impl crate::App {
                     deck: ws.deck_form,
                     contrast,
                     live: DeckLive::STILL,
+                    needle: None,
                 })
             }
         }
@@ -3210,6 +3274,11 @@ impl crate::App {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.vitals.snapshot.as_ref().map(|s| s.seq).hash(&mut h);
+        self.network_snapshot.revision.hash(&mut h);
+        self.network_snapshot.network.revision.hash(&mut h);
+        std::mem::discriminant(&self.network_snapshot.network.visibility).hash(&mut h);
+        self.network_snapshot.network.detail.hash(&mut h);
+        self.network_snapshot.services.hash(&mut h);
         self.vitals
             .prev_snapshot
             .as_ref()
@@ -3235,6 +3304,8 @@ impl crate::App {
     /// What frame `f`'s card shows: its inputs and the App's reading.
     pub(crate) fn deck_input(&self, f: &DeckFrame) -> DeckInput<'_> {
         DeckInput {
+            network: (f.form == StatsBars::Deck).then_some(self.network_snapshot.as_ref()),
+            network_target: crate::network_deck::Target::Overview,
             snap: self.vitals.snapshot.as_deref(),
             prev_snap: self.vitals.prev_snapshot.as_deref(),
             tab_panes: f.tab_panes.clone(),
@@ -3286,9 +3357,18 @@ impl crate::App {
                 .set((key, prims_fp(&prims) ^ u64::from(f.dy).rotate_left(40)));
             *ws.stats_hits.borrow_mut() = hits;
             ws.deck_live_drawn.set(Some(f.live.key()));
-            ws.deck_glide
-                .set((out.glide_px_per_s, out.glide_period_s, out.slide_pitch_px));
+            ws.deck_glide.set((out.glide, out.slide));
             *ws.deck_live_rects.borrow_mut() = out.rects;
+            ws.deck_needle_drawn.set(f.needle);
+            // A dial that appears, leaves or changes size draws the reading at once: the needle
+            // rests on its target (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §4.2).
+            if ws.deck_needle_px.replace(out.needle_px_per_deg) != out.needle_px_per_deg
+                && let Some(needle) = self.vitals.needle.get()
+            {
+                self.vitals
+                    .needle
+                    .set(Some(needle.snapped(std::time::Instant::now())));
+            }
         }
         prims
     }
@@ -3341,6 +3421,8 @@ impl crate::App {
                 ws.deck_fold = None;
                 ws.stats_hits.borrow_mut().clear();
                 ws.deck_live_drawn.set(None);
+                ws.deck_needle_px.set(0.0);
+                ws.deck_needle_drawn.set(None);
                 // A card built again is laid out again, so its hits and live edge come back.
                 *ws.deck_laid.borrow_mut() = None;
             }
@@ -3490,12 +3572,16 @@ pub(crate) fn patch_live(
         if x1 <= x0 || y1 <= y0 {
             continue;
         }
-        regions.push(crate::tray_raster::RasterRect {
+        let region = crate::tray_raster::RasterRect {
             x: x0,
             y: y0,
             width: x1 - x0,
             height: y1 - y0,
-        });
+        };
+        // The dial's slot moves with its needle and its steam: raster it once.
+        if !regions.contains(&region) {
+            regions.push(region);
+        }
     }
     let stride = pw as usize * 4;
     if card.rgba.len() != stride * ph as usize {
@@ -3554,7 +3640,7 @@ pub(crate) fn fold_cards(cards: &[&crate::SettingsCard], fp: u64) -> Option<crat
 
 /// The deck's accessibility group's name (Stats Deck v2 §12).
 #[cfg(a11y_tree)]
-const A11Y_TITLE: &str = "Stats deck, last 10 minutes";
+const A11Y_TITLE: &str = "Stats deck, newest first";
 
 /// A share (1 is 100 %) as a meter's value: a whole percent, as the % column
 /// prints it, never past 100 (the over mark and the words carry the
@@ -3631,7 +3717,13 @@ impl crate::App {
     /// The stats deck for `wid`'s accessibility tree, while it shows one.
     #[cfg(a11y_tree)]
     pub(crate) fn stats_a11y(&self, wid: crate::WindowId) -> Option<crate::a11y_tree::GridStats> {
-        let f = self.deck_frame(wid)?;
+        let f = self.deck_frame(wid).or_else(|| {
+            self.windows
+                .get(&wid)
+                .and_then(|ws| ws.stats_lens.open)
+                .filter(|lens| lens.focus == Instrument::NetworkState)
+                .and_then(|_| self.network_lens_frame(wid))
+        })?;
         let loc = Locale {
             platform: Platform::host(),
             utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
@@ -3661,8 +3753,25 @@ impl crate::App {
                     y1: oy as f64 + f64::from(lg.dy) + f64::from(lg.h),
                 }),
             });
+        let mut group = stats_a11y_group(self.vitals.snapshot.as_deref(), &f.tab_panes, &loc);
+        for target in crate::network_deck::targets(&self.network_snapshot) {
+            let words = crate::network_deck::details(&self.network_snapshot, target);
+            let name = words.get(1).map_or_else(
+                || "Network State".to_owned(),
+                |(name, value)| format!("{name}: {value}"),
+            );
+            group.meters.push(crate::a11y_tree::StatsMeter {
+                name,
+                value: None,
+                words: words
+                    .into_iter()
+                    .map(|(name, value)| format!("{name}: {value}"))
+                    .collect::<Vec<_>>()
+                    .join(". "),
+            });
+        }
         Some(crate::a11y_tree::GridStats {
-            group: stats_a11y_group(self.vitals.snapshot.as_deref(), &f.tab_panes, &loc),
+            group,
             bounds: Some(bounds),
             lens,
         })
@@ -3676,6 +3785,23 @@ pub(crate) mod tests {
         ClusterSpec, GpuSample, MemSample, Pressure, ProcSample, Sample, TabRoot, Ticks,
         VolumeSample,
     };
+
+    #[test]
+    fn service_expiry_changes_the_resource_deck_cache_key_without_a_source_revision() {
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("window");
+        let mut snapshot = aterm_types::network_state::NetworkStateSnapshot::default();
+        snapshot.services.secrets.availability =
+            aterm_types::network_state::ServiceAvailability::Cached;
+        snapshot.services.secrets.observed_at_ms = 1000;
+        app.network_snapshot = std::sync::Arc::new(snapshot);
+        let frame = app.network_lens_frame(wid).expect("network frame");
+        let before = app.deck_input_key(&frame);
+        app.network_snapshot =
+            crate::network_deck::fresh_snapshot(app.network_snapshot.clone(), Some(61_001));
+        assert_eq!(app.network_snapshot.revision, 0);
+        assert_ne!(app.deck_input_key(&frame), before);
+    }
 
     /// Gives this test thread's windows the stats bars, as glass gives a
     /// real window ([`stats_drawn_on`]), until the guard drops.
@@ -3772,7 +3898,7 @@ pub(crate) mod tests {
                     assert_eq!(f.geom.h as usize + band, head, "{at}");
                     assert_eq!(
                         f.geom.h as usize,
-                        deck_px(StatsBars::Deck, want, scale, ch),
+                        reserved_deck_px(StatsBars::Deck, want, scale, ch),
                         "{at}"
                     );
                     assert_eq!(app.deck_drawn_px(wid), f.geom.h as usize, "{at}");
@@ -3845,7 +3971,11 @@ pub(crate) mod tests {
                 .stats_deck_size = Some(word.into());
             let head = app.deck_head_px(wid, 28.0, 2.0, frame);
             assert_eq!(form(&app), want, "{at}");
-            assert_eq!(head, 56 + deck_px(StatsBars::Deck, want, 2.0, ch), "{at}");
+            assert_eq!(
+                head,
+                56 + reserved_deck_px(StatsBars::Deck, want, 2.0, ch),
+                "{at}"
+            );
         }
     }
 
@@ -4322,6 +4452,8 @@ pub(crate) mod tests {
 
     pub(crate) fn input(snap: &Snapshot) -> DeckInput<'_> {
         DeckInput {
+            network: None,
+            network_target: crate::network_deck::Target::Overview,
             snap: Some(snap),
             prev_snap: None,
             tab_panes: vec![7],
@@ -4493,7 +4625,7 @@ pub(crate) mod tests {
             .sys
             .get_or_insert_with(Default::default)
             .stats_bars = Some("deck".into());
-        let deck = deck_px(
+        let deck = reserved_deck_px(
             StatsBars::Deck,
             app.windows[&wid].deck_form,
             app.windows[&wid].scale,
@@ -4547,7 +4679,7 @@ pub(crate) mod tests {
             .sys
             .get_or_insert_with(Default::default)
             .stats_bars = Some("deck".into());
-        let deck = deck_px(
+        let deck = reserved_deck_px(
             StatsBars::Deck,
             app.windows[&wid].deck_form,
             app.windows[&wid].scale,
@@ -4645,15 +4777,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// Each scope's head carries its ink as a swatch where the heads have room for one, on the
+    /// face the deck draws.
     #[test]
     fn every_bar_label_carries_its_ink_as_a_key() {
         let snap = snapshot();
         let inks = dark_inks();
+        let m = FaceMetrics::helvetica_neue();
         for (form, w) in [(DeckForm::Full, 2238.0), (DeckForm::Folded, 2238.0)] {
             let mut i = input(&snap);
             i.form = form;
             let g = DeckGeom { w, ..GEOM };
-            let prims = deck_prims(&g, &i);
+            let prims = lay(&g, &i, &DeckWords::new(&i, &m), &m, true).prims;
             for ink in [inks.machine, inks.aterm, inks.tab] {
                 assert!(
                     prims
@@ -4664,6 +4799,114 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// A bar's fills are whole px and nested (the machine's ⊇ aterm's ⊇ this tab's); a scope
+    /// above zero keeps the least it is given however small its share, and a scope with no
+    /// figure draws nothing even where a scope inside it has one. The bar's column nests them in
+    /// height too, so there a scope that rounds to the length of the one inside it still shows
+    /// as a rim; the bar under a % nests them by length alone, so there (`apart`) a scope above
+    /// zero ends a px past the one inside it, and at the bar's end the fills inside give way.
+    #[test]
+    fn a_bars_fills_are_whole_nested_and_never_lose_a_scope() {
+        let fill = |global, aterm, tab| BarFill {
+            global,
+            aterm,
+            tab,
+            ticks: None,
+            warn_tick: None,
+        };
+        let w = 52.0;
+        assert_eq!(
+            fill(Some(0.7), Some(0.4), Some(0.1)).widths_px(w, 1.0, 0.0),
+            [36.0, 21.0, 5.0]
+        );
+        assert_eq!(
+            fill(Some(0.3), Some(0.001), Some(0.0005)).widths_px(w, 1.0, 0.0),
+            [16.0, 1.0, 1.0],
+            "a scope above zero keeps a px"
+        );
+        assert_eq!(
+            fill(Some(0.3), Some(0.001), Some(0.0005)).widths_px(w, 2.0, 0.0),
+            [16.0, 2.0, 2.0]
+        );
+        assert_eq!(
+            fill(Some(0.0), Some(0.0), Some(0.0)).widths_px(w, 1.0, 0.0),
+            [0.0; 3]
+        );
+        assert_eq!(
+            fill(Some(f32::NAN), None, Some(0.2)).widths_px(w, 1.0, 0.0),
+            [10.0, 0.0, 10.0],
+            "the machine's fill covers this tab's; no aterm figure, no aterm fill"
+        );
+        assert_eq!(
+            fill(None, Some(0.2), Some(0.3)).widths_px(w, 1.0, 0.0),
+            [0.0, 16.0, 16.0]
+        );
+        assert_eq!(
+            fill(Some(1.4), None, None).widths_px(w, 1.0, 0.0),
+            [52.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            fill(Some(0.5), None, None).widths_px(0.5, 1.0, 0.0),
+            [0.5, 0.0, 0.0],
+            "the least a scope keeps is never wider than the bar"
+        );
+        // The bar under a %: aterm's 0.605 and this tab's 0.6 both round to 31 of 52 px.
+        assert_eq!(
+            fill(Some(0.7), Some(0.605), Some(0.6)).widths_px(w, 1.0, 0.0),
+            [36.0, 31.0, 31.0],
+            "CONTROL: in the column, aterm's rim shows it"
+        );
+        assert_eq!(
+            fill(Some(0.7), Some(0.605), Some(0.6)).widths_px(w, 1.0, 1.0),
+            [36.0, 32.0, 31.0],
+            "aterm keeps a px past this tab"
+        );
+        assert_eq!(
+            fill(Some(0.61), Some(0.605), Some(0.6)).widths_px(w, 1.0, 1.0),
+            [33.0, 32.0, 31.0],
+            "and the machine a px past aterm"
+        );
+        assert_eq!(
+            fill(Some(0.3), Some(0.001), Some(0.0005)).widths_px(w, 1.0, 1.0),
+            [16.0, 2.0, 1.0]
+        );
+        assert_eq!(
+            fill(Some(1.0), Some(0.995), Some(0.99)).widths_px(w, 1.0, 1.0),
+            [52.0, 51.0, 50.0],
+            "at the bar's end the fills inside give way"
+        );
+        assert_eq!(
+            fill(Some(0.5), Some(0.5), Some(0.5)).widths_px(w, 1.0, 1.0),
+            [28.0, 27.0, 26.0],
+            "a scope whose share equals the one inside it keeps a px of its own"
+        );
+        assert_eq!(
+            fill(Some(0.5), Some(0.5), Some(0.5)).widths_px(w, 1.0, 0.0),
+            [26.0; 3],
+            "CONTROL: the column draws them alike and shows the rims"
+        );
+        assert_eq!(
+            fill(None, Some(0.2), Some(0.3)).widths_px(w, 1.0, 1.0),
+            [0.0, 17.0, 16.0],
+            "aterm's figure under this tab's still covers it, and shows"
+        );
+        assert_eq!(
+            fill(Some(0.0), Some(0.2), Some(0.0)).widths_px(w, 1.0, 1.0),
+            [10.0, 10.0, 0.0],
+            "a scope at zero keeps no px"
+        );
+        assert_eq!(
+            fill(Some(0.4), None, Some(0.399)).widths_px(w, 1.0, 1.0),
+            [22.0, 0.0, 21.0],
+            "with no aterm figure, the machine keeps its px past this tab"
+        );
+        assert_eq!(
+            fill(Some(0.9), Some(0.8), Some(0.7)).widths_px(2.0, 1.0, 1.0),
+            [2.0, 1.0, 0.0],
+            "a bar too short for every px keeps the outer scopes'"
+        );
     }
 
     /// A meter's value is the share as a whole percent up to 100, but a
@@ -4706,7 +4949,7 @@ pub(crate) mod tests {
 
         let calm = scene(Scene::Calm);
         let g = said(&calm);
-        assert_eq!(g.name, "Stats deck, last 10 minutes");
+        assert_eq!(g.name, "Stats deck, newest first");
         let names: Vec<&str> = g.meters.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(
             names,

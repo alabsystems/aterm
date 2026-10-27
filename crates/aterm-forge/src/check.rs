@@ -385,9 +385,9 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
                                      workspace's resolve with every feature, edge and target \
                                      reaches it, so cargo uses the patch, but no cell compiles \
                                      it; what reaches it is a feature, a dev or build edge or a \
-                                     target that no cell's graph takes (aterm-gpu's \
-                                     `wgpu-oracle` lane is one). Not a failure; recorded so a \
-                                     patch that left every shipped graph is visible.",
+                                     target that no cell's graph takes. Not a failure; \
+                                     recorded so a patch that left every shipped graph is \
+                                     visible.",
                                     e.name
                                 );
                             }

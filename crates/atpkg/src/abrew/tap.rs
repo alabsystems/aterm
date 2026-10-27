@@ -179,7 +179,10 @@ pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<(Tap, bool)
             || format!("https://github.com/{user}/homebrew-{repo}.git"),
             str::to_owned,
         );
-        eprintln!("==> Tapping {user}/{repo} ({remote})");
+        eprintln!(
+            "{}",
+            super::tty::ohai_err(&format!("Tapping {user}/{repo} ({remote})"))
+        );
         let parent = path
             .parent()
             .ok_or_else(|| "abrew: tap directory has no parent".to_owned())?;
@@ -214,7 +217,10 @@ pub(super) fn update(prefix: &Prefix, tap: &Tap) -> Result<(), String> {
 }
 
 fn pull(path: &std::path::Path, user: &str, repo: &str) -> Result<(), String> {
-    eprintln!("==> Updating tap {user}/{repo}");
+    eprintln!(
+        "{}",
+        super::tty::ohai_err(&format!("Updating tap {user}/{repo}"))
+    );
     let local = fetch::run_capture(
         aterm_uds::os_path!("git"),
         &["-C", &path.to_string_lossy(), "remote", "get-url", "origin"],

@@ -138,6 +138,7 @@ pub struct RainFrame<'a> {
 
 impl MatrixRain {
     /// Run one frame and return its fingerprint (`0` when nothing was drawn).
+    #[inline]
     pub fn host_frame(
         &mut self,
         f: &RainFrame<'_>,

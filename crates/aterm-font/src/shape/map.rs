@@ -43,14 +43,14 @@ const GLOBAL_BIT_SHIFT: u32 = 31;
 const GLOBAL_BIT_MASK: u32 = 1 << GLOBAL_BIT_SHIFT;
 const FIRST_FEATURE_BIT: u32 = 4;
 
-const GSUB: usize = 0;
-const GPOS: usize = 1;
+pub(crate) const GSUB: usize = 0;
+pub(crate) const GPOS: usize = 1;
 
 #[derive(Clone, Copy, Debug)]
 struct FeatureMap {
     tag: Tag,
     index: [Option<FeatureIndex>; 2],
-    stage: usize,
+    stage: [usize; 2],
     mask: u32,
     one_mask: u32,
     auto_zwnj: bool,
@@ -78,8 +78,8 @@ pub(crate) struct StageMap {
 pub(crate) struct Map {
     global_mask: u32,
     features: Vec<FeatureMap>,
-    lookups: Vec<LookupMap>,
-    stages: Vec<StageMap>,
+    lookups: [Vec<LookupMap>; 2],
+    stages: [Vec<StageMap>; 2],
 }
 
 impl Map {
@@ -97,26 +97,35 @@ impl Map {
     }
 
     #[inline]
+    pub(crate) fn get_mask(&self, tag: Tag) -> u32 {
+        self.feature(tag).map_or(0, |f| f.mask)
+    }
+
+    #[inline]
     pub(crate) fn get_1_mask(&self, tag: Tag) -> u32 {
         self.feature(tag).map_or(0, |f| f.one_mask)
     }
 
     #[inline]
-    pub(crate) const fn stages(&self) -> &[StageMap] {
-        self.stages.as_slice()
+    pub(crate) fn get_feature_index(&self, table: usize, tag: Tag) -> Option<FeatureIndex> {
+        self.feature(tag).and_then(|f| f.index[table])
     }
 
     #[inline]
-    pub(crate) fn stage_lookups(&self, stage: usize) -> &[LookupMap] {
+    pub(crate) const fn stages(&self, table: usize) -> &[StageMap] {
+        self.stages[table].as_slice()
+    }
+
+    #[inline]
+    pub(crate) fn stage_lookups(&self, table: usize, stage: usize) -> &[LookupMap] {
         let start = stage
             .checked_sub(1)
-            .and_then(|prev| self.stages.get(prev))
+            .and_then(|prev| self.stages[table].get(prev))
             .map_or(0, |s| s.last_lookup);
-        let end = self
-            .stages
+        let end = self.stages[table]
             .get(stage)
-            .map_or(self.lookups.len(), |s| s.last_lookup);
-        self.lookups.get(start..end).unwrap_or(&[])
+            .map_or(self.lookups[table].len(), |s| s.last_lookup);
+        self.lookups[table].get(start..end).unwrap_or(&[])
     }
 }
 
@@ -238,6 +247,10 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
         self.chosen_script[GSUB]
     }
 
+    pub(crate) fn chosen_script_gpos(&self) -> Option<Tag> {
+        self.chosen_script[GPOS]
+    }
+
     pub(crate) fn has_feature(&self, tag: Tag) -> bool {
         tables(self.face)
             .iter()
@@ -295,22 +308,24 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
         let (features, required_stage, global_mask) = self.collect_feature_maps(required_tag);
         self.add_gsub_pause(None);
         self.add_pause(GPOS, None);
-        let (lookups, stages) =
-            self.collect_gsub_lookups(&features, required_index[GSUB], required_stage);
+        let (gsub_lookups, gsub_stages) =
+            self.collect_lookups(GSUB, &features, required_index[GSUB], required_stage[GSUB]);
+        let (gpos_lookups, gpos_stages) =
+            self.collect_lookups(GPOS, &features, required_index[GPOS], required_stage[GPOS]);
         Map {
             global_mask,
             features,
-            lookups,
-            stages,
+            lookups: [gsub_lookups, gpos_lookups],
+            stages: [gsub_stages, gpos_stages],
         }
     }
 
     fn collect_feature_maps(
         &mut self,
         required_tag: [Option<Tag>; 2],
-    ) -> (Vec<FeatureMap>, usize, u32) {
+    ) -> (Vec<FeatureMap>, [usize; 2], u32) {
         let mut map_features = Vec::new();
-        let mut required_stage = 0;
+        let mut required_stage = [0; 2];
         let mut global_mask = GLOBAL_BIT_MASK;
         let mut next_bit = FIRST_FEATURE_BIT;
         self.dedup_feature_infos();
@@ -329,8 +344,8 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
             let mut feature_index = [None; 2];
             for (i, table) in layout.iter().enumerate() {
                 let Some(table) = table else { continue };
-                if i == GSUB && required_tag[GSUB] == Some(info.tag) {
-                    required_stage = info.stage[GSUB];
+                if required_tag[i] == Some(info.tag) {
+                    required_stage[i] = info.stage[i];
                 }
                 if let Some(script) = self.script_index[i]
                     && let Some(index) =
@@ -365,7 +380,7 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
             map_features.push(FeatureMap {
                 tag: info.tag,
                 index: feature_index,
-                stage: info.stage[GSUB],
+                stage: info.stage,
                 mask,
                 one_mask: (1u32 << shift) & mask,
                 auto_zwnj: info.flags & F_MANUAL_ZWNJ == 0,
@@ -412,16 +427,17 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
         infos.truncate(j + 1);
     }
 
-    fn collect_gsub_lookups(
+    fn collect_lookups(
         &self,
+        table_index: usize,
         features: &[FeatureMap],
         required_index: Option<FeatureIndex>,
         required_stage: usize,
     ) -> (Vec<LookupMap>, Vec<StageMap>) {
         let mut lookups: Vec<LookupMap> = Vec::new();
         let mut stages = Vec::new();
-        let Some(table) = self.face.face.tables().gsub else {
-            for info in &self.stages[GSUB] {
+        let Some(table) = tables(self.face)[table_index] else {
+            for info in &self.stages[table_index] {
                 stages.push(StageMap {
                     last_lookup: 0,
                     pause: info.pause,
@@ -433,7 +449,7 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
         let variation_index = table.variations.and_then(|v| v.find_index(coords));
         let mut stage_index = 0;
         let mut last_lookup = 0;
-        for stage in 0..self.current_stage[GSUB] {
+        for stage in 0..self.current_stage[table_index] {
             if let Some(index) = required_index
                 && required_stage == stage
             {
@@ -449,8 +465,8 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
                 );
             }
             for feature in features {
-                if let Some(index) = feature.index[GSUB]
-                    && feature.stage == stage
+                if let Some(index) = feature.index[table_index]
+                    && feature.stage[table_index] == stage
                 {
                     add_lookups(
                         &table,
@@ -481,7 +497,7 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
                 lookups.truncate(j + 1);
             }
             last_lookup = lookups.len();
-            if let Some(info) = self.stages[GSUB].get(stage_index)
+            if let Some(info) = self.stages[table_index].get(stage_index)
                 && info.index == stage
             {
                 stages.push(StageMap {

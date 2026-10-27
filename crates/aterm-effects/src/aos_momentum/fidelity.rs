@@ -33,9 +33,9 @@ pub const ORACLE: &str = "a first-party shipped tick (aterm_effects::cursor_mome
      resets and ticks, drawn at t - delta with p's presentation when t - delta > p + f";
 
 #[inline]
-fn fail(cursor: usize, law: &'static str, detail: String) -> Verdict {
+const fn fail(cursor: usize, law: &'static str, detail: String) -> Verdict {
     Verdict::Fail {
-        cursor: u64::try_from(cursor).unwrap_or(u64::MAX),
+        cursor: cursor as u64,
         law,
         detail,
     }
@@ -64,6 +64,7 @@ pub struct LaneFidelity {
 }
 
 impl Default for LaneFidelity {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -80,14 +81,18 @@ impl LaneFidelity {
     }
 
     /// Its artifact, kind Contract, version 1, whose descriptor names the three laws, δ, the event and hang bounds, the lane model and the oracle.
+    #[inline]
     #[must_use]
     pub fn artifact() -> ArtifactId {
-        let mut e = Enc::new();
-        for law in [NO_STEP_SLEPT, CLEARED_BY_END, LANE_SETTLES] {
-            e.str(law);
+        let mut e = Enc::with_capacity(640);
+        let laws = [NO_STEP_SLEPT, CLEARED_BY_END, LANE_SETTLES];
+        let mut li = 0;
+        while li < laws.len() {
+            e.str(laws[li]);
+            li += 1;
         }
         e.duration(PROBE_DELTA);
-        e.u64(u64::try_from(LANE_MAX_EVENTS).unwrap_or(u64::MAX));
+        e.u64(LANE_MAX_EVENTS as u64);
         e.u64(HANG_NS);
         e.str(LANE_MODEL);
         e.str(ORACLE);
@@ -102,12 +107,13 @@ impl LaneFidelity {
     }
 
     /// The verdict on `run`: the first failing law at the tick it fails on (the cursor is the tick's ordinal), or [`Verdict::Pass`].
+    #[inline]
     #[must_use]
     pub fn judge(&self, run: &LaneRun) -> Verdict {
         let scenario = run.scenario();
         let origin = run.origin();
         let f = scenario.frame_interval_ns();
-        let delta = u64::try_from(PROBE_DELTA.as_nanos()).unwrap_or(u64::MAX);
+        let delta = PROBE_DELTA.as_nanos().min(u64::MAX as u128) as u64;
         let inputs = scenario.events();
         let ticks = run.ticks();
         let fault = run.fault();
@@ -128,13 +134,18 @@ impl LaneFidelity {
             );
         }
         let mut g = MomentumGlow::default();
-        let (mut out, mut under) = (Vec::new(), Vec::new());
-        let (mut probe_out, mut probe_under) = (Vec::new(), Vec::new());
-        let (mut drawn, mut probed) = (Enc::new(), Enc::new());
+        let (mut out, mut under) = (Vec::with_capacity(64), Vec::with_capacity(64));
+        let (mut probe_out, mut probe_under) = (Vec::with_capacity(64), Vec::with_capacity(64));
+        let (mut drawn, mut probed) = (Enc::with_capacity(512), Enc::with_capacity(512));
         let mut n = 0usize;
         let mut next_input = 0usize;
         let mut last_inert = true;
-        for (i, call) in run.calls().iter().enumerate() {
+        let calls = run.calls();
+        let mut next_call = 0;
+        while next_call < calls.len() {
+            let i = next_call;
+            let call = &calls[i];
+            next_call += 1;
             let (cur, at, geom, cfg) = match *call {
                 MomentumEvent::Key { at, tau_bits } => {
                     g.on_key(instant(origin, offset(at)), f32::from_bits(tau_bits));

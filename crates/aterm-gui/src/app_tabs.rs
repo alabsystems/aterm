@@ -452,6 +452,9 @@ impl App {
             .pool
             .get(session)
             .and_then(|session| session.handoff_local_id);
+        if self.pool.views(session) == Some(1) {
+            self.rewind_end(session, "the pane Rewind showed closed");
+        }
         let dropped = self.pool.detach(session);
         if dropped {
             self.retire_developer_tools_install(session);
@@ -4152,7 +4155,8 @@ impl App {
         } else {
             None
         };
-        self.clear_tab_surface_move_license(Some(window));
+        // A click on a chip types nothing; a change of front resets the glow on its own.
+        self.fence_pointer_license(window);
         self.settle_rename_edit(window);
         match command {
             NativeTabCommand::Select(_) => self.switch_tab_in(window, index),

@@ -6,7 +6,7 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-pub use amacs::protocol::edit::{AwaitEdit, AwaitKey, EditOk, EditOutcome, EditRequest, Ticket};
+pub use amacs_protocol::edit::{AwaitEdit, AwaitKey, EditOk, EditOutcome, EditRequest, Ticket};
 
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
 

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude footer mode-pill relabelling and glass-column mapping tests
-//! ([`collect_pill_relabel`], [`GlassColumns`]).
+//! Claude Code's mode row rewritten on the glass to its jobs, and the glass-column map back to
+//! Claude's cells ([`collect_mode_row`], [`GlassColumns`]).
 
 use super::*;
 
@@ -186,9 +186,17 @@ fn col_of(row: &str, needle: &str) -> usize {
         .count()
 }
 
+/// What the glass rewrites BYPASS and AUTO to: the job, then the live notice.
+const JOBS: &str = "14 shells \u{B7} /rc active";
+
+/// THE MODE ROW READS CLAUDE'S JOBS ON THE GLASS AND THE GRID KEEPS CLAUDE'S ROW: under the
+/// gate every known mode's row is rewritten to its jobs and the live notice, each cell-copied
+/// in Claude's own style, flush at column 0 and joined by ` · ` in the ink of Claude's own `·`,
+/// blanks after; the pill, its hint and the key hints are gone (the mode is the lights block's).
+/// The grid keeps Claude's row, and undoing the write puts Claude's cells back and drops the map.
 #[test]
-fn the_bypass_pill_reads_yolo_on_on_the_glass_and_the_grid_keeps_claudes_row() {
-    for (mode, label) in [(BYPASS, "YOLO on"), (MANUAL, "YOLO off")] {
+fn the_mode_row_reads_claudes_jobs_and_the_grid_keeps_claudes_row() {
+    for (mode, kept) in [(BYPASS, JOBS), (MANUAL, NOTICE), (AUTO, JOBS)] {
         let (mut app, wid, session, _reader, _host) = app();
         draw(&app, session, mode);
         frame(&mut app, wid);
@@ -199,47 +207,50 @@ fn the_bypass_pill_reads_yolo_on_on_the_glass_and_the_grid_keeps_claudes_row() {
         frame(&mut app, wid);
         let top = glass_of(&app, wid, strip(&app, wid) + 20);
         assert!(
-            top.contains("alab harness"),
+            top.contains("alab claude harness"),
             "the border is aterm's: {top:?}"
         );
-
         let glass = glass_of(&app, wid, row);
-        let tail = &mode[mode.find(" on").unwrap() + 3..];
-        assert!(
-            glass.starts_with(&format!("  {label}{tail}")),
-            "{label}: packed behind the label: {glass:?}"
-        );
-        assert_eq!(
-            col_of(&glass, NOTICE),
-            col_of(&drawn, NOTICE),
-            "the notice stays"
-        );
+        assert_eq!(glass.trim_end(), kept, "{mode:?}");
         let cells = &app.windows[&wid].input_scratch.cells[row];
-        for (k, ch) in label.chars().enumerate() {
+        let mut at = 0;
+        for item in kept.split(" \u{B7} ") {
+            let from = col_of(&drawn, item);
+            let n = item.chars().count();
             assert_eq!(
-                (cells[2 + k].ch, cells[2 + k].fg),
-                (ch, PILL_FG),
-                "{label}: {k}"
+                cells[at..at + n],
+                vendor[from..from + n],
+                "{item}: Claude's cells"
             );
+            at += n;
+            if at < kept.chars().count() {
+                assert_eq!(
+                    (cells[at + 1].ch, cells[at + 1].fg),
+                    ('\u{B7}', DIM_FG),
+                    "{mode:?}: Claude's separator ink"
+                );
+                at += 3;
+            }
         }
-        assert_eq!(
-            cells[2 + label.len() + 1].fg,
-            DIM_FG,
-            "the run keeps its ink"
+        assert!(
+            cells[at..].iter().all(|c| c.ch == ' '),
+            "{mode:?}: blanks after"
         );
         assert_eq!(cells.len(), vendor.len());
         assert_eq!(grid_text(&app, session, 23).trim_end(), drawn.trim_end());
         let ws = app.windows.get_mut(&wid).unwrap();
         assert!(undo(&mut ws.claude_footer_undo, &mut ws.input_scratch));
-        assert_eq!(ws.input_scratch.cells[row], vendor, "{label}: undone");
+        assert_eq!(ws.input_scratch.cells[row], vendor, "{mode:?}: undone");
         assert_eq!(
-            ws.claude_footer_undo.grid_col(23, 12),
-            12,
+            ws.claude_footer_undo.grid_col(23, 0),
+            0,
             "the map went with it"
         );
     }
 }
 
+/// CLAUDE'S INVERSE HIGHLIGHT MOVES WITH ITS ITEM: a kept item Claude highlights keeps its
+/// cells' ground at its new column; a highlight on a dropped item stands the row down.
 #[test]
 fn claudes_inverse_highlight_moves_with_its_item() {
     let shells = "14 shells";
@@ -275,16 +286,11 @@ fn claudes_inverse_highlight_moves_with_its_item() {
             assert_eq!(glass, drawn, "NEGATIVE CONTROL: Claude's row stands");
             continue;
         }
-        assert!(
-            glass.starts_with(&format!("  YOLO on \u{B7} {shells}")),
-            "the relabel holds: {glass:?}"
-        );
-        let moved = col_of(&glass, shells);
-        assert!(moved < at, "CONTROL: packed left ({moved} < {at})");
+        assert!(glass.starts_with(JOBS), "the rewrite holds: {glass:?}");
         let cells = &app.windows[&wid].input_scratch.cells[row];
         for k in 0..shells.len() {
             assert_eq!(
-                cells[moved + k],
+                cells[k],
                 vendor[at + k],
                 "the highlight's cell {k} moved with its text"
             );
@@ -298,8 +304,11 @@ fn claudes_inverse_highlight_moves_with_its_item() {
     }
 }
 
+/// NO REWRITE WHERE THE ROW IS NOT PLAINLY CLAUDE'S OR THE HARNESS IS OFF: the harness off, no
+/// host, the cursor on the row and a selection in the window each leave Claude's row as drawn
+/// and the columns unmapped. CONTROL: auto's row is rewritten like bypass's.
 #[test]
-fn no_relabel_where_the_row_is_not_plainly_claudes_or_the_harness_is_off() {
+fn no_rewrite_where_the_row_is_not_plainly_claudes_or_the_harness_is_off() {
     let vendor_after = |mode: &str, setup: &dyn Fn(&mut App, WindowId, u64)| {
         let (mut app, wid, session, _reader, _host) = app();
         draw(&app, session, mode);
@@ -311,17 +320,17 @@ fn no_relabel_where_the_row_is_not_plainly_claudes_or_the_harness_is_off() {
         (
             glass_of(&app, wid, row),
             grid_text(&app, session, 23),
-            app.windows[&wid].claude_footer_undo.grid_col(23, 12),
+            app.windows[&wid].claude_footer_undo.grid_col(23, 0),
         )
     };
     let none = |_: &mut App, _: WindowId, _: u64| {};
-    let (glass, vendor, col) = vendor_after(AUTO, &none);
+    let (glass, _, col) = vendor_after(AUTO, &none);
+    assert_eq!(glass.trim_end(), JOBS, "CONTROL: auto is rewritten");
     assert_eq!(
-        glass.trim_end(),
-        vendor.trim_end(),
-        "auto mode keeps its pill"
+        usize::from(col),
+        col_of(AUTO, "14 shells"),
+        "CONTROL: and mapped"
     );
-    assert_eq!(col, 12);
     let off = |app: &mut App, _: WindowId, _: u64| {
         app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
             crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
@@ -333,11 +342,11 @@ fn no_relabel_where_the_row_is_not_plainly_claudes_or_the_harness_is_off() {
         vendor.trim_end(),
         "harness off: Claude's row"
     );
-    assert_eq!(col, 12);
+    assert_eq!(col, 0);
     let unhosted = |app: &mut App, _: WindowId, _: u64| app.harness = None;
     let (glass, vendor, col) = vendor_after(BYPASS, &unhosted);
     assert_eq!(glass.trim_end(), vendor.trim_end(), "no host: Claude's row");
-    assert_eq!(col, 12);
+    assert_eq!(col, 0);
     let cursor = |app: &mut App, _: WindowId, session: u64| feed(app, session, b"\x1b[24;40H");
     let (glass, vendor, _) = vendor_after(BYPASS, &cursor);
     assert_eq!(glass.trim_end(), vendor.trim_end(), "the cursor on the row");
@@ -357,47 +366,90 @@ fn no_relabel_where_the_row_is_not_plainly_claudes_or_the_harness_is_off() {
     );
 }
 
+/// A PRESS ON THE REWRITTEN ROW REPORTS CLAUDE'S COLUMN, AND A VACATED CELL TAKES IT: a press on
+/// a kept item reaches Claude at that item's own column; a press, of any button, on a cell the
+/// rewrite vacated reaches nothing (never the pill once under it). CONTROL: unhosted, Claude's
+/// row takes every press at its own column.
 #[test]
-fn a_press_on_the_relabelled_row_reports_claudes_column() {
-    for (mode, relabelled) in [(BYPASS, true), (AUTO, false)] {
+fn a_press_on_the_rewritten_row_reports_claudes_column() {
+    for rewritten in [true, false] {
         let (mut app, wid, session, mut reader, _host) = app();
-        draw(&app, session, mode);
+        if !rewritten {
+            app.harness = None;
+        }
+        draw(&app, session, BYPASS);
         claude(&app, session);
         feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
         frame(&mut app, wid);
         let row = mode_row(&app, wid);
         let glass = glass_of(&app, wid, row);
         let grid = grid_text(&app, session, 23);
-        assert_eq!(glass.starts_with("  YOLO on"), relabelled, "{glass:?}");
-        let mut press = |col: usize| {
+        assert_eq!(glass.starts_with(JOBS), rewritten, "{glass:?}");
+        // Each press reads what reached Claude since the last read, up to `want` bytes (none read
+        // for `want` 0).
+        let mut press = |col: usize, button: MouseButton, want: usize| {
             let (x, y) = px_of(&app, wid, (row, col));
             app.on_cursor_moved(wid, x, y);
-            let _ = pty(&mut reader, 0);
-            app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-            let want = b"\x1b[<0;".len();
-            let got = String::from_utf8(pty(&mut reader, want + 6)).unwrap();
-            app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
-            let _ = pty(&mut reader, 0);
-            got
+            app.on_mouse_input(wid, ElementState::Pressed, button);
+            let got = if want == 0 {
+                Vec::new()
+            } else {
+                pty(&mut reader, want)
+            };
+            app.on_mouse_input(wid, ElementState::Released, button);
+            String::from_utf8(got).unwrap()
         };
-        let shells = col_of(&glass, "14 shells");
-        assert_eq!(
-            press(shells),
-            format!("\x1b[<0;{};24M", col_of(&grid, "14 shells") + 1),
-            "{mode}: the glass's `14 shells` is Claude's"
+        let report = |code: u8, col: usize, end: char| format!("\x1b[<{code};{};24{end}", col + 1);
+        let shells = (
+            col_of(&glass, "14 shells"),
+            report(0, col_of(&grid, "14 shells"), 'M'),
         );
-        let notice = col_of(&glass, NOTICE);
+        let released = |press: &str| press.replace('M', "m");
         assert_eq!(
-            press(notice),
-            format!("\x1b[<0;{};24M", notice + 1),
-            "{mode}: the notice"
+            press(shells.0, MouseButton::Left, shells.1.len()),
+            shells.1,
+            "rewritten={rewritten}: the glass's `14 shells` is Claude's"
         );
+        let notice = report(0, col_of(&grid, NOTICE), 'M');
+        let want = format!("{}{notice}", released(&shells.1));
+        assert_eq!(
+            press(col_of(&glass, NOTICE), MouseButton::Left, want.len()),
+            want,
+            "rewritten={rewritten}: the notice, after the last press's release"
+        );
+        let mut last = released(&notice);
+        let vacated = JOBS.chars().count() + 4;
+        for (button, code) in [(MouseButton::Left, 0), (MouseButton::Middle, 1)] {
+            if rewritten {
+                // Nothing reaches Claude, neither the press nor its release: the next press's
+                // report follows the last release.
+                let _ = press(vacated, button, 0);
+                let want = format!("{last}{}", shells.1);
+                assert_eq!(
+                    press(shells.0, MouseButton::Left, want.len()),
+                    want,
+                    "rewritten: a vacated cell takes the {button:?} press"
+                );
+                last = released(&shells.1);
+            } else {
+                let own = report(code, vacated, 'M');
+                let want = format!("{last}{own}");
+                assert_eq!(
+                    press(vacated, button, want.len()),
+                    want,
+                    "CONTROL: Claude's own cell, {button:?}"
+                );
+                last = released(&own);
+            }
+        }
     }
 }
 
+/// VIM'S INDICATOR LEADS THE REWRITTEN ROW: `-- INSERT --` keeps Claude's cells and ink at
+/// column 0, the jobs after it, each mapped back to Claude's own column.
 #[test]
-fn the_pill_after_vim_inserts_indicator_relabels_at_its_own_column() {
-    for (mode, relabelled) in [(VIM_BYPASS, true), (VIM_AUTO, false)] {
+fn vims_indicator_leads_the_rewritten_row() {
+    for mode in [VIM_BYPASS, VIM_AUTO] {
         let (mut app, wid, session, mut reader, _host) = app();
         draw(&app, session, mode);
         frame(&mut app, wid);
@@ -409,27 +461,15 @@ fn the_pill_after_vim_inserts_indicator_relabels_at_its_own_column() {
         let glass = glass_of(&app, wid, row);
         let grid = grid_text(&app, session, 23);
         assert_eq!(
-            glass.starts_with(&format!("{VIM_LEAD}YOLO on \u{B7} 14 shells")),
-            relabelled,
-            "{glass:?}"
+            glass.trim_end(),
+            format!("-- INSERT -- \u{B7} {JOBS}"),
+            "{mode:?}"
         );
         assert_eq!(grid.trim_end(), read_glass(&vendor).trim_end(), "the grid");
-        if !relabelled {
-            assert_eq!(glass.trim_end(), grid.trim_end(), "CONTROL: Claude's row");
-        }
-        let lead = VIM_LEAD.len();
+        let lead = VIM_LEAD.trim().chars().count();
         let cells = &app.windows[&wid].input_scratch.cells[row];
-        assert_eq!(cells[..lead], vendor[..lead], "the indicator as drawn");
-        assert_eq!(cells[2].fg, DIM_FG, "the indicator's ink");
-        if relabelled {
-            for (k, ch) in "YOLO on".chars().enumerate() {
-                assert_eq!(
-                    (cells[lead + k].ch, cells[lead + k].fg),
-                    (ch, PILL_FG),
-                    "{k}"
-                );
-            }
-        }
+        assert_eq!(cells[..lead], vendor[2..2 + lead], "the indicator as drawn");
+        assert_eq!(cells[0].fg, DIM_FG, "the indicator's ink");
         let mut press = |col: usize, want: &str| {
             let (x, y) = px_of(&app, wid, (row, col));
             app.on_cursor_moved(wid, x, y);
@@ -444,15 +484,116 @@ fn the_pill_after_vim_inserts_indicator_relabels_at_its_own_column() {
         assert_eq!(
             press(col_of(&glass, "14 shells"), &shells),
             shells,
-            "{mode}: the glass's `14 shells` is Claude's"
+            "{mode:?}: the glass's `14 shells` is Claude's"
         );
         let indicator = "\x1b[<0;6;24M";
-        assert_eq!(press(5, indicator), indicator, "{mode}: the indicator");
+        assert_eq!(press(3, indicator), indicator, "{mode:?}: the indicator");
     }
 }
 
+/// THE WRAPPED EFFORT HINT IS BLANKED WITH THE ROW: where Claude's effort hint wrapped to the
+/// row under the mode row, that row is blank on the glass and its cells map to nothing; the grid
+/// keeps both rows, and undoing the write puts them back.
 #[test]
-fn the_relabel_allocates_nothing_once_its_buffers_are_grown() {
+fn the_wrapped_effort_hint_is_blanked_with_the_row() {
+    let (mut app, wid, session, _reader, _host) = app();
+    let rule = "\u{2500}".repeat(COLS);
+    let hint = format!("{:>w$}", "\u{25D0} medium \u{B7} /effort", w = COLS - 2);
+    feed(
+        &app,
+        session,
+        format!(
+            "\x1b[?2004h\x1b[2J\x1b[18;1H\u{25CF} done\x1b[20;1H{rule}\x1b[21;1H\u{276F} \
+             \x1b[22;1H{rule}\x1b[23;1H  \u{23F5}\u{23F5} bypass permissions on \u{B7} 1 shell\
+             \x1b[24;1H{hint}\x1b[21;3H"
+        )
+        .as_bytes(),
+    );
+    frame(&mut app, wid);
+    let (mode, under) = (strip(&app, wid) + 22, strip(&app, wid) + 23);
+    let vendor = [mode, under].map(|r| app.windows[&wid].input_scratch.cells[r].clone());
+    assert!(read_glass(&vendor[1]).contains("/effort"), "CONTROL: drawn");
+    claude(&app, session);
+    frame(&mut app, wid);
+    assert_eq!(glass_of(&app, wid, mode).trim_end(), "1 shell");
+    assert_eq!(glass_of(&app, wid, under).trim(), "", "the hint is blanked");
+    assert!(grid_text(&app, session, 23).contains("/effort"), "the grid");
+    let ws = app.windows.get_mut(&wid).unwrap();
+    assert!(ws.claude_footer_undo.swallows(23, 100), "nothing under it");
+    assert!(undo(&mut ws.claude_footer_undo, &mut ws.input_scratch));
+    assert_eq!(
+        [mode, under].map(|r| ws.input_scratch.cells[r].clone()),
+        vendor,
+        "undone"
+    );
+}
+
+/// THE PET HOLDS THE REWRITE'S WORDS AND STANDS ON THE BLANK AFTER THEM: the resident pet reads
+/// Claude Code's cells, before the glass lays its rewrite over them, so the footer hands it
+/// what the glass shows there. The words the rewrite lays (`1 shell`) are the host's chrome;
+/// the rest of the mode row it blanks, out to the end of Claude's own words, and the row the
+/// effort hint wrapped to are blank glass ([`crate::pet_chrome::PetChrome::held_blanked`]), never
+/// chrome: Claude's letters under them are hidden, and the cat may rest there by the words.
+/// NEGATIVE CONTROL (as run with every write held as painted): the mode row was held from the
+/// words out to Claude's last letter (columns 7 to 35) and the effort row whole, and nothing
+/// was blanked; the pet read Claude's hidden letters as ink and the blank as chrome, and rested
+/// out past them (aterm-effects' `the_cat_rests_by_the_words_the_footer_shows`).
+#[test]
+fn the_pet_holds_the_rewrites_words_and_stands_on_the_blank_after_them() {
+    let (mut app, wid, session, _reader, _host) = app();
+    let rule = "\u{2500}".repeat(COLS);
+    let row = "  \u{23F5}\u{23F5} bypass permissions on \u{B7} 1 shell";
+    let hint = format!("{:>w$}", "\u{25D0} medium \u{B7} /effort", w = COLS - 2);
+    feed(
+        &app,
+        session,
+        format!(
+            "\x1b[?2004h\x1b[2J\x1b[18;1H\u{25CF} done\x1b[20;1H{rule}\x1b[21;1H\u{276F} \
+             \x1b[22;1H{rule}\x1b[23;1H{row}\x1b[24;1H{hint}\x1b[21;3H"
+        )
+        .as_bytes(),
+    );
+    claude(&app, session);
+    frame(&mut app, wid);
+    // The pass's chrome is the pet's once the menu's splice commits it.
+    app.splice_autopilot_menu(wid);
+    let (mode, under) = (strip(&app, wid) + 22, strip(&app, wid) + 23);
+    assert_eq!(glass_of(&app, wid, mode).trim_end(), "1 shell", "fixture");
+    assert_eq!(
+        glass_of(&app, wid, under).trim(),
+        "",
+        "fixture: the hint blanked"
+    );
+    let (words, end, hint_end) = (7, row.chars().count(), COLS - 2);
+    let chrome = &app.windows[&wid].pet_chrome;
+    let held = |row: usize, col: usize| {
+        let (r, c) = (row as f32 + 0.5, col as f32 + 0.5);
+        chrome.held().iter().any(|rect| {
+            rect.row <= r && r < rect.row + rect.rows && rect.col <= c && c < rect.col + rect.cols
+        })
+    };
+    let wrong: Vec<(usize, usize)> = (0..COLS)
+        .map(|c| (22, c))
+        .chain((0..COLS).map(|c| (23, c)))
+        .filter(|&(r, c)| held(r, c) != (r == 22 && c < words))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "the rewrite's words are held, and nothing else on its rows: {wrong:?} (held {:?})",
+        chrome.held()
+    );
+    assert_eq!(
+        chrome.held_blanked(),
+        [
+            aterm_effects::pet_world::PetRect::new(22.0, words as f32, 1.0, (end - words) as f32),
+            aterm_effects::pet_world::PetRect::new(23.0, 0.0, 1.0, hint_end as f32),
+        ],
+        "the blank after the words, out to Claude's last letter, and the hint's row"
+    );
+}
+
+#[test]
+fn the_rewrite_allocates_nothing_once_its_buffers_are_grown() {
     let (mut app, wid, session, _reader, _host) = app();
     draw(&app, session, BYPASS);
     frame(&mut app, wid);
@@ -474,38 +615,32 @@ fn the_relabel_allocates_nothing_once_its_buffers_are_grown() {
     let mut out = Vec::new();
     let mut cells = Vec::new();
     let mut glass = GlassColumns::default();
-    let run =
-        |out: &mut Vec<RelabelWrite>, cells: &mut Vec<RenderCell>, glass: &mut GlassColumns| {
-            out.clear();
-            cells.clear();
-            glass.clear();
-            let relabel = footer::relabel_under(&rows, 22).expect("the pill");
-            collect_pill_relabel(
-                &scratch,
-                &rows,
-                region,
-                relabel,
-                |_| false,
-                blank,
-                out,
-                cells,
-            );
-            for e in out.iter() {
-                glass.push(e.shift);
-            }
-            glass.grid_col(23, 12)
-        };
+    let run = |out: &mut Vec<RowWrite>, cells: &mut Vec<RenderCell>, glass: &mut GlassColumns| {
+        out.clear();
+        cells.clear();
+        glass.clear();
+        let mode = footer::mode_row_rewrite_under(&rows, 22).expect("the row");
+        collect_mode_row(&scratch, &rows, region, mode, |_| false, blank, out, cells);
+        for e in out.iter() {
+            glass.push(e.shift);
+        }
+        glass.grid_col(23, 0)
+    };
     let col = run(&mut out, &mut cells, &mut glass);
-    assert_eq!(out.len(), 1, "the relabel is collected");
-    assert_eq!(col, 12 + 17, "the glass's column 12 is the grid's 29");
+    assert_eq!(out.len(), 1, "the rewrite is collected");
+    let shells = u16::try_from(col_of(BYPASS, "14 shells")).unwrap();
+    assert_eq!(
+        col, shells,
+        "the glass's column 0 is the grid's `14 shells`"
+    );
     let (col, allocations) =
         crate::work_counts::allocations_in(|| run(&mut out, &mut cells, &mut glass));
-    assert_eq!((col, allocations), (29, 0));
+    assert_eq!((col, allocations), (shells, 0));
     let _ = session;
 }
 
 #[test]
-fn a_window_relabels_no_more_pills_than_it_keeps_shifts_for() {
+fn a_window_rewrites_no_more_rows_than_it_keeps_shifts_for() {
     let (mut app, wid, session, _reader, _host) = app();
     draw(&app, session, BYPASS);
     frame(&mut app, wid);
@@ -523,16 +658,16 @@ fn a_window_relabels_no_more_pills_than_it_keeps_shifts_for() {
         rows: 24,
         cols: COLS,
     };
-    let relabel = footer::relabel_under(&rows, 22).expect("the pill");
+    let mode = footer::mode_row_rewrite_under(&rows, 22).expect("the row");
     let mut out = Vec::new();
     let mut cells = Vec::new();
     let taken: Vec<bool> = (0..=GLASS_SHIFTS)
         .map(|_| {
-            collect_pill_relabel(
+            collect_mode_row(
                 &scratch,
                 &rows,
                 region,
-                relabel,
+                mode,
                 |_| false,
                 scratch.implicit_blank,
                 &mut out,
@@ -546,45 +681,45 @@ fn a_window_relabels_no_more_pills_than_it_keeps_shifts_for() {
     }
     assert!(
         taken[..GLASS_SHIFTS].iter().all(|&t| t),
-        "CONTROL: each relabels"
+        "CONTROL: each is rewritten"
     );
     assert!(!taken[GLASS_SHIFTS], "the pane past the cap stays Claude's");
-    assert_eq!(glass.len, out.len(), "every relabel keeps its shift");
+    assert_eq!(glass.len, out.len(), "every rewrite keeps its map");
     let _ = session;
 }
 
 #[test]
-fn the_pill_is_read_with_the_rule_not_every_frame() {
+fn the_mode_row_is_read_with_the_rule_not_every_frame() {
     let (mut app, wid, session, _reader, _host) = app();
     draw(&app, session, BYPASS);
     claude(&app, session);
     frame(&mut app, wid);
     frame(&mut app, wid);
-    let _ = crate::work_counts::take_pill_relabel_reads();
+    let _ = crate::work_counts::take_mode_row_reads();
     for _ in 0..5 {
         frame(&mut app, wid);
     }
     feed(&app, session, b"\x1b[22;3Hx");
     frame(&mut app, wid);
     assert_eq!(
-        crate::work_counts::take_pill_relabel_reads(),
+        crate::work_counts::take_mode_row_reads(),
         0,
         "at rest, and under a keystroke"
     );
-    assert!(glass_of(&app, wid, mode_row(&app, wid)).starts_with("  YOLO on"));
+    assert!(glass_of(&app, wid, mode_row(&app, wid)).starts_with(JOBS));
     draw(&app, session, MANUAL);
     frame(&mut app, wid);
     assert_eq!(
-        crate::work_counts::take_pill_relabel_reads(),
+        crate::work_counts::take_mode_row_reads(),
         1,
         "CONTROL: the mode row changed"
     );
-    assert!(glass_of(&app, wid, mode_row(&app, wid)).starts_with("  YOLO off"));
+    assert!(glass_of(&app, wid, mode_row(&app, wid)).starts_with(NOTICE));
 }
 
 #[test]
-fn a_hosted_off_pane_wears_the_border_and_relabels_with_it() {
-    for (what, enabled, relabelled) in [("hosted off", true, true), ("master off", false, false)] {
+fn a_hosted_off_pane_wears_the_border_and_rewrites_with_it() {
+    for (what, enabled, rewritten) in [("hosted off", true, true), ("master off", false, false)] {
         let (mut app, wid, session, _reader) = bare();
         let host = crate::harness_host::HostHandle::for_supervised_test(
             Vec::new(),
@@ -628,16 +763,12 @@ fn a_hosted_off_pane_wears_the_border_and_relabels_with_it() {
                 app.unhosted_glass(Some(aterm_phase::Program::Claude))
             )
             .is_some(),
-            relabelled,
+            rewritten,
             "{what}: the border"
         );
         let glass = glass_of(&app, wid, mode_row(&app, wid));
-        assert_eq!(
-            glass.starts_with("  YOLO on"),
-            relabelled,
-            "{what}: {glass:?}"
-        );
-        if !relabelled {
+        assert_eq!(glass.starts_with(JOBS), rewritten, "{what}: {glass:?}");
+        if !rewritten {
             assert_eq!(glass.trim_end(), grid_text(&app, session, 23).trim_end());
         }
         if let Some(host) = app.harness.take() {

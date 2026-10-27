@@ -312,7 +312,7 @@ fn share(part: f64, whole: f64) -> Option<f64> {
     (whole > 0.0).then(|| stats::round3(part / whole))
 }
 
-fn ns_ms(ns: u64) -> f64 {
+pub(super) fn ns_ms(ns: u64) -> f64 {
     ns as f64 / 1e6
 }
 
@@ -360,7 +360,7 @@ fn waits_rows(d: &Tally, n: usize) -> Vec<String> {
 const TAIL_1MS: usize = 11;
 const TAIL_8MS: usize = 14;
 
-fn describe(row: TallyRow) -> &'static str {
+pub(super) fn describe(row: TallyRow) -> &'static str {
     match row {
         TallyRow::Request => "broker: requests that read their own reply",
         TallyRow::Ack => "broker: pipelined acks read (publishes', the group commits')",
@@ -630,7 +630,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     );
     let ruler = Ruler::for_world(&w);
     let mut cal_seq = 0;
-    let cal_before = calibrate(&ruler, &w, clock, &mut cal_seq);
+    let cal_before = calibrate(&ruler, &w.node, clock, &mut cal_seq);
     eprintln!(
         "fabric bench: ping-pong, {} round trips ({} warm-up)",
         spec.pingpong, spec.warmup
@@ -641,7 +641,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         await_durable(broker);
         raw
     });
-    let cal_after = calibrate(&ruler, &w, clock, &mut cal_seq);
+    let cal_after = calibrate(&ruler, &w.node, clock, &mut cal_seq);
     let unit = yardstick(&cal_before, &cal_after);
     let recs = stop_and_read(&mut w);
     let group = aterm_link::subject::inbox_group(FLEET, &w.node);

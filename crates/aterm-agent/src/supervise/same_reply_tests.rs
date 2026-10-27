@@ -527,12 +527,10 @@ fn a_tab_already_looping_at_such_a_wall_gets_two_acts_at_most_from_a_loop_with_n
     }
 }
 
+/// The error frame is an outage wall (v6 §14.17.5.2): its answers count for no hold, and its
+/// track, standing behind the wall no reader names once the frame left, keeps its doubling ladder.
 #[test]
-fn a_wall_no_reader_names_behind_an_api_error_frame_is_retried_at_most_once_more_then_held() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
+fn a_wall_no_reader_names_behind_an_api_error_frame_keeps_the_outages_ladder_never_held() {
     for autopilot in [Autopilot::Cruise, Autopilot::Land] {
         let tag = format!("same-reply-api-frame-{autopilot:?}");
         let (dir, ledger) = ledger_at(&tag);
@@ -555,16 +553,24 @@ fn a_wall_no_reader_names_behind_an_api_error_frame_is_retried_at_most_once_more
         let acts: Vec<&str> = out.iter().map(|o| o.act.as_str()).collect();
         assert!(
             acts[0].starts_with("act ")
-                && acts[1..3] == ["wait", "wait"]
-                && acts[3] == "act api-retry@v1",
-            "{tag}: the error frame's retry is the one more act: {out:#?}"
+                && acts[1..]
+                    == [
+                        "wait",
+                        "wait",
+                        "act outage-resume@v1",
+                        "wait",
+                        "wait",
+                        "act outage-resume@v1",
+                    ],
+            "{tag}: the error frame's blind resume at each rung: {out:#?}"
         );
+        // The second rung is 4 min from the frame met again.
         assert_eq!(
-            acts[5..],
-            ["nothing", "nothing"],
-            "{tag}: once settled to the same reply, the retry ladder types nothing: {out:#?}"
+            out[4].until.zip(out[1].until).map(|(b, a)| b - a),
+            Some(3660 + 4 * 60 - (60 + 2 * 60)),
+            "{tag}: {out:#?}"
         );
-        assert!(out[5..].iter().all(|o| o.told == held), "{tag}: {out:#?}");
+        assert!(out.iter().all(|o| o.told.is_none()), "{tag}: {out:#?}");
     }
 }
 
@@ -1981,11 +1987,7 @@ fn claude_ran_suite(_: usize) -> Vec<String> {
 }
 
 #[test]
-fn a_529_first_met_as_a_continuations_answer_keeps_its_three_retries() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
+fn a_529_first_met_as_a_continuations_answer_is_waited_out_on_its_ladder_never_held() {
     let walled = |k: usize| vendor_walled("claude", &vec![None; k], claude_529);
     let reader = aterm_phase::Program::Claude.reader();
     assert_eq!(
@@ -2014,19 +2016,23 @@ fn a_529_first_met_as_a_continuations_answer_keeps_its_three_retries() {
         let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
         let (out, _) = follow(&mut d, &r(&walled(0), 0, Some(600)), (60, 178), walled, 14);
         let _ = std::fs::remove_dir_all(dir);
-        let retries = out.iter().filter(|o| o.act == "act api-retry@v1").count();
+        let tries = out
+            .iter()
+            .filter(|o| o.act == "act outage-resume@v1")
+            .count();
         assert!(
-            out[0].act.starts_with("act ") && out[0].act != "act api-retry@v1",
+            out[0].act.starts_with("act ") && out[0].act != "act outage-resume@v1",
             "{tag}: the continuation first: {out:#?}"
         );
-        assert_eq!(
-            retries, FUTILE_AFTER_TRIES,
-            "{tag}: the continuation's answer is none of the wall's tries: {out:#?}"
-        );
-        let last = &out[out.len() - 3..];
+        // An outage is a wait (v6 §14.17.5.2): a try at each rung of its ladder, the same answer
+        // to each holding nothing and telling nobody.
         assert!(
-            last.iter().all(|o| o.act == "nothing" && o.told == held),
-            "{tag}: held after them: {out:#?}"
+            tries > FUTILE_AFTER_TRIES,
+            "{tag}: the wall's tries go on past three: {out:#?}"
+        );
+        assert!(
+            out.iter().all(|o| o.act != "nothing" && o.told.is_none()),
+            "{tag}: never held: {out:#?}"
         );
 
         let (dir, ledger) = ledger_at(&format!("{tag}-cleared"));
@@ -2043,13 +2049,15 @@ fn a_529_first_met_as_a_continuations_answer_keeps_its_three_retries() {
         let third = out
             .iter()
             .enumerate()
-            .filter(|(_, o)| o.act == "act api-retry@v1")
+            .filter(|(_, o)| o.act == "act outage-resume@v1")
             .nth(2)
             .map(|(k, _)| k)
-            .unwrap_or_else(|| panic!("{tag}: the third retry typed: {out:#?}"));
+            .unwrap_or_else(|| panic!("{tag}: the third try typed: {out:#?}"));
         let next = &out[third + 1];
         assert!(
-            next.act.starts_with("act ") && next.act != "act api-retry@v1" && next.told.is_none(),
+            next.act.starts_with("act ")
+                && next.act != "act outage-resume@v1"
+                && next.told.is_none(),
             "{tag}: the call it ran ends the streak, the next act typed at once: {out:#?}"
         );
     }
@@ -2896,6 +2904,9 @@ fn agy_quota(text: &'static str, delay: fn(usize) -> u64) -> impl Fn(usize) -> V
     }
 }
 
+/// agy's quota per day is a spent allowance, held once its tries are spent however its relative
+/// reset moves; its quota per minute is a server's refusal, an outage waited out on its doubling
+/// ladder and never held (v6 §14.17.5.2).
 #[test]
 fn an_agy_quota_wall_whose_retry_delay_moves_with_each_answer_keeps_its_tries_and_no_more() {
     use aterm_phase::agy::fixtures::lab::{ERROR_429, ERROR_429_PER_MINUTE};
@@ -2921,6 +2932,15 @@ fn an_agy_quota_wall_whose_retry_delay_moves_with_each_answer_keeps_its_tries_an
                 let mut d = Driver::new(&mut m, "agy", &ledger, autopilot, (CAPTURED, 0), false);
                 let (out, answers) = follow(&mut d, &r(&rows(0), 0, Some(600)), (60, 3), &rows, 16);
                 let _ = std::fs::remove_dir_all(dir);
+                if quota == "per-minute" {
+                    assert!(
+                        answers > 1 + FUTILE_AFTER_TRIES
+                            && out[1..].iter().all(|o| o.told.is_none()
+                                && matches!(&o.act[..], "wait" | "act outage-resume@v1")),
+                        "{tag}: waited out on its ladder, never held: {out:#?}"
+                    );
+                    continue;
+                }
                 // The act after the work met the wall, then its tries.
                 assert_eq!(answers, 1 + FUTILE_AFTER_TRIES, "{tag}: {out:#?}");
                 let last = &out[out.len() - 3..];
@@ -2972,9 +2992,10 @@ fn cross_class(answers: usize) -> Vec<String> {
     out
 }
 
+/// The 500 and the 503 are outages, their answers counting for no hold (v6 §14.17.5.2): the
+/// hold stands at the usage walls' answers between them, at the 429's own tries.
 #[test]
-fn read_walls_of_four_classes_by_turns_are_held_past_the_run_and_a_walls_own_tries() {
-    use crate::supervise::policy::turn_end::NO_WORK_ACTS;
+fn read_walls_of_four_classes_by_turns_are_held_at_a_walls_own_tries_past_the_outages_between() {
     let reader = aterm_phase::Program::Muse.reader();
     let kinds: Vec<Option<WallKind>> = (1..5)
         .map(|k| reader.wall(&cross_class(k)).map(|w| w.kind))
@@ -2996,69 +3017,109 @@ fn read_walls_of_four_classes_by_turns_are_held_past_the_run_and_a_walls_own_tri
             30,
         );
         let _ = std::fs::remove_dir_all(dir);
-        assert_eq!(
-            answers,
-            NO_WORK_ACTS + FUTILE_AFTER_TRIES,
-            "{tag}: {out:#?}"
-        );
+        // The 429 answers the second act, then every fourth.
+        assert_eq!(answers, 2 + 4 * (FUTILE_AFTER_TRIES - 1), "{tag}: {out:#?}");
         let last = &out[out.len() - 3..];
         assert!(
             last.iter().all(|o| o.act == "nothing" && o.told.is_some()),
             "{tag}: held, its exception told: {out:#?}"
         );
+        // Every other answer is an outage's.
+        assert_eq!(
+            out.iter()
+                .filter(|o| o.act == "act outage-resume@v1")
+                .count(),
+            answers / 2,
+            "{tag}: each outage between resumed once on its rung: {out:#?}"
+        );
     }
 }
 
+/// A refused request's notice as Claude Code draws it: a wall the agent can act on, its typed
+/// retry and its hold kept (v6 §14.17.5.2).
+fn claude_refused(_: usize) -> Vec<String> {
+    [
+        "⏺ API Error: 400 due to tool use concurrency issues. Run /rewind to recover the \
+         conversation.",
+        "",
+        "✻ Worked for 3m 0s",
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+/// Work scrolled above a wall: a 529 is an outage (v6 §14.17.5.2), waited out on its ladder and
+/// never held, the turn read showing work above it or none; a refused request keeps its tries,
+/// the work before each keeping them going, and is held as refused after them where the whole
+/// turn read shows no call.
 #[test]
-fn work_scrolled_above_a_529_keeps_the_retries_going() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    let cut = |calls: bool| {
+fn work_scrolled_above_a_wall_keeps_its_tries_going_and_a_529_is_never_held() {
+    let held = Some(format!("refused {}", Exception::refused(None, "").why));
+    let cut = |calls: bool, wall: fn(usize) -> Vec<String>| {
         move |k: usize| {
             vendor_walled("claude", &vec![None; k], |j| {
                 let mut v = report_rows(calls);
                 v.push(String::new());
-                v.extend(claude_529(j));
+                v.extend(wall(j));
                 v
             })
         }
     };
     let reader = aterm_phase::Program::Claude.reader();
-    let full = cut(true)(2);
-    assert_eq!(
-        reader.wall(&full[full.len() - 40..]).map(|w| w.kind),
-        Some(WallKind::Overloaded)
-    );
-    for (calls, history) in [(true, true), (true, false), (false, true)] {
-        for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-            let tag = format!("scrolled-529-{calls}-{history}-{autopilot:?}");
-            let rows = cut(calls);
-            let (dir, ledger) = ledger_at(&tag);
-            let mut m = Mock::new(vec![busy_screen()]);
-            let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
-            let (out, _) = follow_r(
-                &mut d,
-                &viewed(&rows(0), history, 0, Some(600)),
-                (60, 550),
-                |k, at, took| viewed(&rows(k), history, at, took),
-                10,
-            );
-            let _ = std::fs::remove_dir_all(dir);
-            if calls {
-                assert!(
-                    out.iter().all(|o| o.act != "nothing" && o.told.is_none()),
-                    "{tag}: the work before each 529 keeps the retries going: {out:#?}"
+    for (wall, kind) in [
+        (claude_529 as fn(usize) -> Vec<String>, WallKind::Overloaded),
+        (
+            claude_refused,
+            WallKind::ApiError {
+                code: Some(400),
+                retryable: false,
+                cause: aterm_phase::ApiCause::Request,
+            },
+        ),
+    ] {
+        let full = cut(true, wall)(2);
+        assert_eq!(
+            reader.wall(&full[full.len() - 40..]).map(|w| w.kind),
+            Some(kind)
+        );
+        let outage = kind == WallKind::Overloaded;
+        for (calls, history) in [(true, true), (true, false), (false, true)] {
+            for autopilot in [Autopilot::Cruise, Autopilot::Land] {
+                let tag = format!("scrolled-{outage}-{calls}-{history}-{autopilot:?}");
+                let rows = cut(calls, wall);
+                let (dir, ledger) = ledger_at(&tag);
+                let mut m = Mock::new(vec![busy_screen()]);
+                let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
+                let (out, answers) = follow_r(
+                    &mut d,
+                    &viewed(&rows(0), history, 0, Some(600)),
+                    (60, 550),
+                    |k, at, took| viewed(&rows(k), history, at, took),
+                    10,
                 );
-            } else {
-                // The control: the whole turn read shows no call, so the 529's tries are its last.
-                assert!(
-                    out[out.len() - 3..]
-                        .iter()
-                        .all(|o| o.act == "nothing" && o.told == held),
-                    "{tag}: {out:#?}"
-                );
+                let _ = std::fs::remove_dir_all(dir);
+                if outage {
+                    assert!(
+                        answers > FUTILE_AFTER_TRIES
+                            && out[1..].iter().all(|o| o.told.is_none()
+                                && matches!(&o.act[..], "wait" | "act outage-resume@v1")),
+                        "{tag}: {out:#?}"
+                    );
+                } else if calls {
+                    assert!(
+                        out.iter().all(|o| o.act != "nothing" && o.told.is_none()),
+                        "{tag}: the work before each refusal keeps the tries going: {out:#?}"
+                    );
+                } else {
+                    // The control: the whole turn read shows no call, so the wall's tries are its
+                    // last.
+                    assert!(
+                        out[out.len() - 3..]
+                            .iter()
+                            .all(|o| o.act == "nothing" && o.told == held),
+                        "{tag}: {out:#?}"
+                    );
+                }
             }
         }
     }
@@ -3632,7 +3693,9 @@ fn a_persons_message_said_again_no_point_saw_busy_is_judged_as_one_in_new_words(
                 _ => "act continue-done-check@v1",
             };
             let acts: Vec<&str> = again.iter().map(|o| o.act.as_str()).collect();
-            if runs == 1 && name != "plain" {
+            // The person's short exchange after the claim is left to them under Land; Cruise
+            // carries it as any reply (owner ruling 2026-10-26).
+            if runs == 1 && name != "plain" && autopilot == Autopilot::Land {
                 assert!(
                     acts[3..].iter().all(|a| *a == "nothing"),
                     "{tag}: the person's short exchange after the claim is left to them: {again:#?}"

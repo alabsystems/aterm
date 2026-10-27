@@ -90,7 +90,17 @@ impl Rig {
         gone: (FgGone, &'static Dead),
         pre: &[u8],
     ) -> Self {
-        Self::attach_with(id, probe, gone, pre, false)
+        Self::attach_with(id, probe, gone, pre, false, 0)
+    }
+
+    /// A rig whose session's own process is `SHELL`, as a spawned session's is: the reader
+    /// knows which group is the shell.
+    fn attach_shell(
+        id: u64,
+        probe: (fn(i32) -> i32, &'static AtomicI32),
+        gone: (FgGone, &'static Dead),
+    ) -> Self {
+        Self::attach_with(id, probe, gone, b"", false, SHELL)
     }
 
     fn attach_recording(
@@ -98,7 +108,7 @@ impl Rig {
         probe: (fn(i32) -> i32, &'static AtomicI32),
         gone: (FgGone, &'static Dead),
     ) -> Self {
-        Self::attach_with(id, probe, gone, b"", true)
+        Self::attach_with(id, probe, gone, b"", true, 0)
     }
 
     fn attach_with(
@@ -107,6 +117,7 @@ impl Rig {
         (gone, dead): (FgGone, &'static Dead),
         pre: &[u8],
         record: bool,
+        pid: i32,
     ) -> Self {
         let mut app = App::headless_for_test();
         app.session_factory.fg_probe = probe;
@@ -116,6 +127,7 @@ impl Rig {
         let (master, slave) = open_raw_pty();
         let mut session = crate::stub_session(id);
         session.master = master;
+        session.pid = pid;
         if !pre.is_empty() {
             session.term.lock().expect("terminal lock").process(pre);
         }
@@ -1899,4 +1911,132 @@ fn foreground_handback_ownership_the_shells_own_mouse_does_not_hide_a_jobs_death
         &model,
         &["ShellArm", "Launch", "Sample", "Arm", "Die", "Reclaim"],
     );
+}
+
+static FG_OWN_RESUMED: AtomicI32 = AtomicI32::new(SHELL);
+fn probe_own_resumed(_master: i32) -> i32 {
+    FG_OWN_RESUMED.load(Ordering::SeqCst)
+}
+static DEAD_OWN_RESUMED: Dead = Mutex::new(Vec::new());
+fn gone_own_resumed(_master: i32, pgid: i32, _role: FgRole) -> bool {
+    is_dead(&DEAD_OWN_RESUMED, pgid)
+}
+
+/// zsh's `fg` of a stopped job that writes nothing while it holds (a bg'd leaderless
+/// pipeline, `foreground_handback_live_headless`): the reader's sample after zsh's
+/// `continued` notice lands before zsh's `tcsetpgrp`, and the job dies before anything else
+/// is read, so every sample reads the shell and no edge is cut. The reader saw the job arm its
+/// mouse, so its death is handed back all the same (`ObservedArmIsHandedBack`), once.
+#[test]
+fn foreground_handback_ownership_a_resumed_job_whose_hold_was_never_sampled_is_handed_back() {
+    let model = foreground_handback_ownership_model();
+    FG_OWN_RESUMED.store(SHELL, Ordering::SeqCst);
+    let mut rig = Rig::attach_shell(
+        103,
+        (probe_own_resumed, &FG_OWN_RESUMED),
+        (gone_own_resumed, &DEAD_OWN_RESUMED),
+    );
+    let mut s = model.init_state();
+    rig.write(ZLE_PROMPT, "the prompt", |t| t.modes().bracketed_paste);
+    check_ownership(&rig, &s, "Init: the prompt");
+
+    rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
+    rig.set_fg(JOB);
+    rig.life = 1;
+    fire(&model, &mut s, &["Launch", "Sample"]);
+    rig.write(b"\x1b[?1003harmed\r\n", "the job's mouse", |t| {
+        t.modes().mouse_mode == aterm_types::mouse::MouseMode::AnyEvent && screen_has(t, "armed")
+    });
+    fire(&model, &mut s, &["Arm"]);
+    check_ownership(&rig, &s, "Arm: sampled as the job's");
+
+    rig.set_fg(SHELL);
+    rig.write(SUSPENDED, "zsh: suspended", |t| {
+        screen_has(t, "zsh: suspended") && t.modes().bracketed_paste
+    });
+    check_ownership(&rig, &s, "the stop edge: a stopped job keeps its mouse");
+    rig.write(
+        b"fg\r\n[1]  + continued  armed\r\n",
+        "zsh's continued notice, read while the shell still holds",
+        |t| screen_has(t, "continued"),
+    );
+    check_ownership(&rig, &s, "fg: the shell's own notice");
+    assert!(rig.restored().is_empty(), "{:?}", rig.restored());
+
+    rig.set_fg(JOB);
+    rig.kill(JOB);
+    rig.life = 2;
+    fire(&model, &mut s, &["Die"]);
+    rig.set_fg(SHELL);
+    rig.write(RECLAIM, "zsh's reclaim output", |t| {
+        screen_has(t, "zsh: killed") && t.modes().bracketed_paste
+    });
+    rig.life = 0;
+    fire(&model, &mut s, &["Reclaim"]);
+    check_ownership(&rig, &s, "Reclaim: the death no edge was sampled for");
+    assert_eq!((s["done"], s["bit"], s["backs"]), (1, 0, 1), "{s:?}");
+    assert_one_handback(&rig, JOB, SHELL);
+}
+
+static FG_OWN_REUSED: AtomicI32 = AtomicI32::new(SHELL);
+fn probe_own_reused(_master: i32) -> i32 {
+    FG_OWN_REUSED.load(Ordering::SeqCst)
+}
+static DEAD_OWN_REUSED: Dead = Mutex::new(Vec::new());
+/// The dead job's leader pid went to a process outside its group: the holder rule's leader probe
+/// (`kill(pid, 0)`) answers, while the bystander rule (`kill(-pgid, 0)`) finds the group empty.
+fn gone_own_reused(_master: i32, pgid: i32, role: FgRole) -> bool {
+    role == FgRole::Bystander && is_dead(&DEAD_OWN_REUSED, pgid)
+}
+
+/// The missed death of [`foreground_handback_ownership_a_resumed_job_whose_hold_was_never_sampled_is_handed_back`]
+/// after the system gave the job's leader pid to another process: the edge was found by the
+/// bystander rule (no member of the group is left), and its handback is judged by the same rule,
+/// so the job's mouse is handed back once rather than the edge being cut again on every batch.
+#[test]
+fn foreground_handback_ownership_a_missed_death_whose_leader_pid_was_reused_is_handed_back() {
+    let model = foreground_handback_ownership_model();
+    FG_OWN_REUSED.store(SHELL, Ordering::SeqCst);
+    let mut rig = Rig::attach_shell(
+        104,
+        (probe_own_reused, &FG_OWN_REUSED),
+        (gone_own_reused, &DEAD_OWN_REUSED),
+    );
+    let mut s = model.init_state();
+    rig.write(ZLE_PROMPT, "the prompt", |t| t.modes().bracketed_paste);
+    rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
+    rig.set_fg(JOB);
+    rig.life = 1;
+    fire(&model, &mut s, &["Launch", "Sample"]);
+    rig.write(b"\x1b[?1003harmed\r\n", "the job's mouse", |t| {
+        t.modes().mouse_mode == aterm_types::mouse::MouseMode::AnyEvent && screen_has(t, "armed")
+    });
+    fire(&model, &mut s, &["Arm"]);
+    check_ownership(&rig, &s, "Arm: sampled as the job's");
+
+    rig.set_fg(SHELL);
+    rig.write(SUSPENDED, "zsh: suspended", |t| {
+        screen_has(t, "zsh: suspended") && t.modes().bracketed_paste
+    });
+    rig.write(
+        b"fg\r\n[1]  + continued  armed\r\n",
+        "zsh's continued notice, read while the shell still holds",
+        |t| screen_has(t, "continued"),
+    );
+    check_ownership(&rig, &s, "fg: the shell's own notice");
+    assert!(rig.restored().is_empty(), "{:?}", rig.restored());
+
+    rig.set_fg(JOB);
+    rig.kill(JOB);
+    rig.life = 2;
+    fire(&model, &mut s, &["Die"]);
+    rig.set_fg(SHELL);
+    rig.write(RECLAIM, "zsh's reclaim output", |t| {
+        screen_has(t, "zsh: killed") && t.modes().bracketed_paste
+    });
+    rig.life = 0;
+    fire(&model, &mut s, &["Reclaim"]);
+    check_ownership(&rig, &s, "Reclaim: the death no edge was sampled for");
+    assert_eq!((s["done"], s["bit"], s["backs"]), (1, 0, 1), "{s:?}");
+    assert_one_handback(&rig, JOB, SHELL);
 }

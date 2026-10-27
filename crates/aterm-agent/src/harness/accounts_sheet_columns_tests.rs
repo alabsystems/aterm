@@ -4,6 +4,55 @@
 use super::*;
 use aterm_spec::interp::State;
 
+#[test]
+fn duplicate_account_rows_cannot_choose_a_machine_by_source_order() {
+    for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
+        let member = csv_columns(cli)[0];
+        let value = if cli == Cli::Kimi { "global" } else { "1" };
+        let rows = [
+            format!("one@example.test,m3,{value}\n"),
+            format!("ONE@example.test,m8,{value}\n"),
+        ];
+        for order in [[0, 1], [1, 0]] {
+            let source = format!(
+                "email,computer,{member}\n{}{}",
+                rows[order[0]], rows[order[1]]
+            );
+            let error = parse_accounting_csv_for(cli, &source, "fixture.csv")
+                .expect_err("conflicting duplicate rows must not choose the first machine");
+            assert!(error.contains("conflicting duplicate"), "{error}");
+            assert!(!error.contains("example.test"), "no address in errors");
+        }
+    }
+}
+
+#[test]
+fn duplicate_held_rows_coalesce_but_do_not_select_a_region_from_an_active_row() {
+    let held = "first@example.test,m3,1\nFIRST@example.test,M3.1,1\n";
+    let parsed = parse_accounting_csv_for(
+        Cli::Kimi,
+        &format!("email,computer,kimi\n{held}"),
+        "fixture.csv",
+    )
+    .unwrap();
+    assert!(parsed.roster.accounts.is_empty());
+    assert_eq!(parsed.held.len(), 1);
+    for rows in [
+        "first@example.test,m3,1\nFIRST@example.test,m3,global\n",
+        "FIRST@example.test,m3,global\nfirst@example.test,m3,1\n",
+    ] {
+        assert!(
+            parse_accounting_csv_for(
+                Cli::Kimi,
+                &format!("email,computer,kimi\n{rows}"),
+                "fixture.csv"
+            )
+            .unwrap_err()
+            .contains("conflicting duplicate")
+        );
+    }
+}
+
 fn source(cli: Cli, action: &str, variant: bool) -> String {
     let member = csv_columns(cli)[0];
     let alias = csv_columns(cli).last().unwrap();
@@ -47,6 +96,45 @@ fn source(cli: Cli, action: &str, variant: bool) -> String {
         "MultiMachine" => {
             format!("email,computer,,claude,{member}\nfirst@example.test,m3,m8,1,{value}\n")
         }
+        "ConflictingRows" => {
+            let (machine, second) = if variant {
+                match cli {
+                    Cli::Claude => ("m3.2", value),
+                    Cli::Codex | Cli::Grok => ("m3", "device"),
+                    Cli::Kimi => ("m3", "mainland-cn"),
+                }
+            } else {
+                ("m8", value)
+            };
+            format!(
+                "email,computer,{member}\nfirst@example.test,m3,{value}\nFIRST@example.test,{machine},{second}\n"
+            )
+        }
+        "EquivalentRows" => {
+            let unused = if cli == Cli::Claude {
+                "codex"
+            } else {
+                "claude"
+            };
+            let extra = if variant {
+                "first@example.test,m8,0,1\n"
+            } else {
+                ""
+            };
+            format!(
+                "email,computer,{member},{unused}\nfirst@example.test,m3,{value},0\nFIRST@example.test,M3.1,{value},1\n{extra}"
+            )
+        }
+        "ExcludedDuplicate" => {
+            let (second, note) = if variant {
+                ("unsupported-membership", "")
+            } else {
+                ("0", "banned")
+            };
+            format!(
+                "email,computer,{member},notes\nfirst@example.test,m3,{value},\nFIRST@example.test,m3,{second},{note}\n"
+            )
+        }
         _ => panic!("unknown sheet scenario"),
     }
 }
@@ -60,6 +148,9 @@ fn project(state: &State, cli: Cli, action: &str, source: &str) -> State {
         "MissingMember" => 5,
         "DuplicateAnchor" => 6,
         "MultiMachine" => 7,
+        "ConflictingRows" => 8,
+        "EquivalentRows" => 9,
+        "ExcludedDuplicate" => 10,
         _ => panic!("unknown sheet scenario"),
     };
     let present = csv_names_column(cli, source);
@@ -83,7 +174,7 @@ fn project(state: &State, cli: Cli, action: &str, source: &str) -> State {
         fleet.cli == cli
             && fleet.held.is_empty()
             && fleet.roster.accounts.len() == 1
-            && fleet.roster.accounts[0].email == "first@example.test"
+            && accounts::email_matches(&fleet.roster.accounts[0].email, "first@example.test")
             && fleet.roster.accounts[0].machines == machines
             && fleet.roster.accounts[0].label == label
             && fleet.roster.accounts[0].class
@@ -108,7 +199,18 @@ pub(crate) fn sheet_transition(state: &State, action: &str) -> State {
             let source = source(cli, action, variant);
             let (first, rest) = source.split_once(',').unwrap();
             let encoded = format!("\u{feff}\"{first}\",{rest}");
-            for source in [&source, &encoded] {
+            let mut sources = vec![source.clone(), encoded];
+            if matches!(
+                action,
+                "ConflictingRows" | "EquivalentRows" | "ExcludedDuplicate"
+            ) {
+                let (header, rows) = source.split_once('\n').unwrap();
+                sources.push(format!(
+                    "{header}\n{}\n",
+                    rows.lines().rev().collect::<Vec<_>>().join("\n")
+                ));
+            }
+            for source in &sources {
                 let next = project(state, cli, action, source);
                 if let Some(agreed) = &agreed {
                     assert_eq!(agreed, &next, "{cli:?} {action} {variant} {source}");
@@ -124,7 +226,7 @@ pub(crate) fn sheet_transition(state: &State, action: &str) -> State {
 #[test]
 fn sheet_columns_conform_and_ambiguity_mutants_are_detected() {
     let model = aterm_models_harness::account_sheet_columns_model();
-    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 11);
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
@@ -141,6 +243,9 @@ fn sheet_columns_conform_and_ambiguity_mutants_are_detected() {
         ("DuplicateEmail", "accepted", 1, "NoAmbiguousSource"),
         ("DuplicateMember", "present", 0, "HeaderPresence"),
         ("MultiMachine", "exact", 0, "ExactMapping"),
+        ("ConflictingRows", "accepted", 1, "NoAmbiguousSource"),
+        ("EquivalentRows", "accepted", 0, "ValidSource"),
+        ("ExcludedDuplicate", "accepted", 1, "NoAmbiguousSource"),
     ] {
         let mut wrong = sheet_transition(&model.init_state(), action);
         wrong.insert(field, value);

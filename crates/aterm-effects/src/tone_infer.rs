@@ -151,7 +151,8 @@ impl ToneTracker {
         if self.buf.len() < 3 {
             return;
         }
-        if let Some(tone) = model.classify_chars_opt(self.buf.iter().copied(), &mut self.scratch) {
+        let (s0, s1) = self.buf.as_slices();
+        if let Some(tone) = model.classify_char_slices_opt([s0, s1], &mut self.scratch) {
             self.tone = tone;
         }
     }

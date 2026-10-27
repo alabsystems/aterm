@@ -13,12 +13,13 @@ use crate::activate::{Aliases, activate_build, install_tombstone_shim, install_t
 use crate::apply::{Group, TxnOutcome, transact_holding};
 use crate::gate::{ApplyDecision, decide};
 use crate::install::StageError;
-use crate::manifest::{Channel, Index, parse_pkg};
+use crate::manifest::{Channel, DigestAlg, Index, parse_pkg};
 use crate::select::{Candidate, select_index};
 use crate::sig::{Anchor, BuildFloor, TrustedIndex};
 use crate::store::{Layout, ToolName};
 
 pub(crate) mod ahead;
+pub(crate) mod arriving;
 
 fn verify_and_stage(
     artifact: &crate::manifest::Artifact,
@@ -26,7 +27,18 @@ fn verify_and_stage(
     build_dir: &Path,
     hooks: &crate::install::StageHooks<'_>,
 ) -> Result<String, StageError> {
-    let staged = crate::install::verify_and_stage(artifact, archive, build_dir, hooks);
+    finished_or_sidecar_gone(
+        build_dir,
+        crate::install::verify_and_stage(artifact, archive, build_dir, hooks),
+    )
+}
+
+/// A stage's answer, the environment sidecar written for it removed when it failed with no
+/// build at `build_dir`.
+fn finished_or_sidecar_gone(
+    build_dir: &Path,
+    staged: Result<String, StageError>,
+) -> Result<String, StageError> {
     if staged.is_err() && !build_dir.exists() {
         crate::shim_env::remove_sidecar(build_dir);
     }
@@ -108,6 +120,18 @@ pub trait Fetcher {
     ) -> Result<(), String> {
         let _ = (program, cap);
         self.download(repo, asset, dest)
+    }
+    /// Download `artifact`'s signed archive for `program` to `dest`: [`Self::download_for`]
+    /// here; the network fetcher also races any LAN peer that holds the unit
+    /// ([`crate::peers::race`]).
+    fn download_unit(
+        &self,
+        program: &str,
+        repo: &str,
+        artifact: &crate::manifest::Artifact,
+        dest: &Path,
+    ) -> Result<(), String> {
+        self.download_for(program, repo, &artifact.asset, dest, artifact.size)
     }
     fn download_url(&self, url: &str, dest: &Path, cap: u64) -> Result<(), String> {
         let _ = (url, dest, cap);
@@ -1198,7 +1222,7 @@ fn fetch_artifact(
     dl: &Path,
 ) -> Result<(), String> {
     match artifact.protocol.as_str() {
-        "github-release" => fetcher.download_for(program, repo, &artifact.asset, dl, artifact.size),
+        "github-release" => fetcher.download_unit(program, repo, artifact, dl),
         "https" => fetcher.download_url(&artifact.url, dl, artifact.size),
         other => {
             let mut m = String::from("protocol ");
@@ -1897,6 +1921,7 @@ fn apply_group_txn_inner(
                         triple,
                         resolved_assets,
                         &mut why,
+                        false,
                     ) else {
                         return (
                             TxnOutcome::Aborted {
@@ -2577,9 +2602,14 @@ fn verify_select_at(
     now_unix: i64,
     live: bool,
 ) -> (Result<TrustedIndex, FlowError>, Option<usize>) {
-    let pass = select_index(anchor, candidates, floor, now_unix);
+    let record = crate::succession::Record::read(layout);
+    let trusted = crate::succession::Record::sources_of(record.as_ref());
+    let pass = select_index(anchor, candidates, floor, trusted, now_unix);
     observe_roster_generation(layout, pass.observed_roster_seq);
     let Some(selected) = pass.selected else {
+        if !pass.refused.is_empty() {
+            note_succession(layout, None, &pass.refused);
+        }
         return (Err(FlowError::NoIndex), None);
     };
     let (index, won) = (selected.index, selected.candidate);
@@ -2587,6 +2617,8 @@ fn verify_select_at(
         return (Err(FlowError::Stale), Some(won));
     }
     if layout.prefix.is_dir() {
+        let sources = crate::succession::Sources::of(&index, index.roster_seq());
+        note_succession(layout, Some(&sources), &pass.refused);
         use crate::vendor_direct::policy::YankLatch;
         let written = if live {
             YankLatch::update_from_index(layout, &index, now_unix)
@@ -2598,6 +2630,32 @@ fn verify_select_at(
         }
     }
     (Ok(index), Some(won))
+}
+
+/// Record the index a selection trusted (`selected`) and the newer ones it refused, and say
+/// each refusal the record did not already hold.
+fn note_succession(
+    layout: &Layout,
+    selected: Option<&crate::succession::Sources>,
+    refused: &[crate::succession::Refusal],
+) {
+    if !layout.prefix.is_dir() {
+        return;
+    }
+    match crate::succession::trust(layout, selected, refused) {
+        Ok(wrote) => {
+            for r in &wrote.new_refusals {
+                eprintln!(
+                    "atpkg: {} — this machine stays on index {} until the channel publishes \
+                     an index that keeps the publisher's pin and repo rules (the release needs \
+                     fixing, not this machine)",
+                    r.sentence(),
+                    r.trusted_build
+                );
+            }
+        }
+        Err(e) => eprintln!("atpkg: the index sources record was not written ({e})"),
+    }
 }
 
 /// Durably record that this client admitted roster generation `seq`.
@@ -3057,6 +3115,7 @@ fn stage_member(
         triple,
         resolved_assets,
         why,
+        true,
     )?;
     stage_fetched(layout, index, program, prior_build, why, fetched)
 }
@@ -3069,9 +3128,13 @@ struct Fetched {
     reloc: Option<String>,
     /// Whether the archive was an earlier attempt's, already matched against its signed digest.
     carried: bool,
+    /// The tree staged while the archive arrived, its bytes matched to the signed digest
+    /// ([`arriving::fetch_staging`]).
+    streamed: Option<crate::install::Streamed>,
 }
 
-/// [`stage_member`]'s first half.
+/// [`stage_member`]'s first half. With `as_it_arrives`, a tar archive is staged while it
+/// downloads ([`arriving::fetch_staging`]).
 #[allow(
     clippy::too_many_arguments,
     reason = "the fetch half of stage_member takes its inputs, minus the prior build only the \
@@ -3086,6 +3149,7 @@ fn fetch_member(
     triple: &str,
     resolved_assets: &mut BTreeMap<String, String>,
     why: &mut String,
+    as_it_arrives: bool,
 ) -> Option<Fetched> {
     let (pinned, repo, pkg) = match verified_pkg_or_miss(fetcher, index, ch, program) {
         Ok(found) => found,
@@ -3144,35 +3208,50 @@ fn fetch_member(
         return None;
     }
     crate::progress::note_build(program, pinned);
-    let ahead = ahead::claim(program, &dl);
-    let carried = ahead.is_none() && carried_archive(&dl, artifact);
-    if ahead.is_none() {
-        if !carried {
-            let _ = std::fs::remove_file(&dl);
+    // The download lane's archive, else an earlier attempt's verified one, else a download of
+    // its own: whether the archive was carried over.
+    let get = |dl: &Path| -> Result<bool, String> {
+        let ahead = ahead::claim(program, dl);
+        let carried = ahead.is_none() && carried_archive(dl, artifact);
+        if ahead.is_none() {
+            if !carried {
+                let _ = std::fs::remove_file(dl);
+            }
+            sweep_foreign_partials(dl);
         }
-        sweep_foreign_partials(&dl);
-    }
-    if carried {
-        println!(
-            "atpkg: {program}: reusing verified archive {} from the last attempt",
-            artifact.asset
-        );
-    } else {
+        if carried {
+            return Ok(true);
+        }
         let inline = ahead.is_none();
         let fetched = ahead.unwrap_or_else(|| {
-            let _download_watch = crate::progress::watch_download(program, &dl, artifact.size);
-            fetch_artifact(fetcher, program, &repo, artifact, &dl)
+            let _download_watch = crate::progress::watch_download(program, dl, artifact.size);
+            fetch_artifact(fetcher, program, &repo, artifact, dl)
         });
         if inline && fetched.is_ok() {
-            ahead::fetched_inline(program, &dl);
+            ahead::fetched_inline(program, dl);
         }
-        if let Err(e) = fetched {
+        fetched.map(|()| false)
+    };
+    let (got, streamed) = if as_it_arrives && arriving::streams(artifact) {
+        arriving::fetch_staging(artifact, &dl, &layout.build_dir(program, pinned), get)
+    } else {
+        (get(&dl), None)
+    };
+    let carried = match got {
+        Ok(carried) => carried,
+        Err(e) => {
             eprintln!("{}", stage_failure_note(program, pinned, &e));
             let _ = std::fs::remove_file(&dl);
             note_fetch_fault();
             *why = format!("the download of {} failed: {e}", artifact.asset);
             return None;
         }
+    };
+    if carried {
+        println!(
+            "atpkg: {program}: reusing verified archive {} from the last attempt",
+            artifact.asset
+        );
     }
     let artifact = artifact.clone();
     Some(Fetched {
@@ -3182,6 +3261,7 @@ fn fetch_member(
         dl,
         reloc,
         carried,
+        streamed,
     })
 }
 
@@ -3200,6 +3280,7 @@ fn stage_fetched(
         dl,
         reloc,
         carried: _,
+        streamed,
     } = fetched;
     let artifact = &artifact;
     crate::progress::note_phase(program, crate::progress::Phase::Verify);
@@ -3215,12 +3296,14 @@ fn stage_fetched(
     }
     let extract_scope = crate::progress::extract_scope(program, artifact.cost.disk_installed);
     let alab_gate = alab_pack_gate(program, &pkg.exposes);
-    let staged = verify_and_stage(
-        artifact,
-        &dl,
-        &build_dir,
-        &stage_hooks(alab_gate.as_deref()),
-    );
+    let hooks = stage_hooks(alab_gate.as_deref());
+    let staged = match streamed {
+        Some(streamed) => finished_or_sidecar_gone(
+            &build_dir,
+            crate::install::finish_streamed(artifact, streamed, &build_dir, &hooks),
+        ),
+        None => verify_and_stage(artifact, &dl, &build_dir, &hooks),
+    };
     drop(extract_scope);
     if let Err(e) = staged {
         record_digest_refusal(&build_dir, artifact, &e);
@@ -3230,6 +3313,9 @@ fn stage_fetched(
         return None;
     }
     crate::store::clear_stage_refusal(&build_dir);
+    if let Some((DigestAlg::Sha256, sha256)) = artifact.digest() {
+        crate::peers::keep(layout, &dl, sha256, &build_dir);
+    }
     let (exposes, refused) = crate::store::split_exposed(&pkg.exposes);
     let _ = crate::store::write_exposes(&build_dir, &exposes);
     let _ = crate::status::record_refused_shims(layout, program, pinned, &refused);

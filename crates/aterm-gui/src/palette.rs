@@ -655,7 +655,9 @@ impl PaletteState {
                             == action.deck_size_pref().unwrap_or_default(),
                     );
                 }
-                MenuAction::RewindPane | MenuAction::ExportPaneHistory => {
+                MenuAction::RewindPane
+                | MenuAction::ExportPaneHistory
+                | MenuAction::ForgetPaneHistory => {
                     row.enabled = live.terminal_front && live.can_rewind;
                 }
                 MenuAction::ToggleStatsLens => {

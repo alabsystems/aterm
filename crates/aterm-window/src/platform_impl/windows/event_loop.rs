@@ -401,13 +401,6 @@ impl ActiveEventLoop {
         Some(monitor)
     }
 
-    #[cfg(feature = "rwh_06")]
-    pub fn raw_display_handle_rwh_06(
-        &self,
-    ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        Ok(rwh_06::RawDisplayHandle::Windows(rwh_06::WindowsDisplayHandle::new()))
-    }
-
     pub(crate) fn set_control_flow(&self, control_flow: ControlFlow) {
         self.runner_shared.set_control_flow(control_flow)
     }

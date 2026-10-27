@@ -3,6 +3,13 @@
 
 //! Unified incremental numeric versioning for every CLI harness (`codex-alab`, `claude`, `agy`,
 //! `grok`, `kimi`, `muse`).
+//!
+//! A harness version is `MAJOR.MINOR`, never a third part. Its minor goes up by one once per
+//! public release window in which the harness's [`CliHarness::sources`] changed, with the window's
+//! first such change, so a dev build already shows the number its release ships; the major stays
+//! `0` until the owner names a `1.0`. `targo --unverified ship check` refuses a release whose
+//! harness sources moved under an unchanged version, and `targo --unverified ship harness-bump`
+//! writes the bumps.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -16,9 +23,6 @@ pub struct HarnessVersion {
 }
 
 impl HarnessVersion {
-    /// Initial harness version (`0.1`) shared as the starting point for every CLI harness.
-    pub const INITIAL: Self = Self::new(0, 1, "0.1");
-
     /// Construct a [`HarnessVersion`] whose `text` is the exact canonical
     /// `"<major>.<minor>"` decimal representation and whose version is at least `0.1`.
     ///
@@ -42,14 +46,14 @@ impl HarnessVersion {
         Self { major, minor, text }
     }
 
-    /// Numeric major version component (`0` in `0.1`).
+    /// Numeric major version component (`0` in `0.4`).
     #[inline]
     #[must_use]
     pub const fn major(self) -> u16 {
         self.major
     }
 
-    /// Numeric minor version component (`1` in `0.1`).
+    /// Numeric minor version component (`4` in `0.4`).
     #[inline]
     #[must_use]
     pub const fn minor(self) -> u16 {
@@ -63,73 +67,16 @@ impl HarnessVersion {
         (self.major, self.minor)
     }
 
-    /// Canonical string slice (`"0.1"`).
+    /// Canonical string slice (`"0.4"`).
     #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         self.text
     }
 
-    /// Monotonic numeric step index (`0.1` -> `1`, `1.0` -> `65536`), preserving
-    /// numeric ordering across the full range of both `u16` components.
-    #[inline]
-    #[must_use]
-    pub const fn step(self) -> u32 {
-        (self.major as u32) * 65_536 + (self.minor as u32)
-    }
-
-    /// Next incremental minor version tuple `(major, minor + 1)`, or `None` when
-    /// the minor component is already `u16::MAX`.
-    #[inline]
-    #[must_use]
-    pub const fn next_minor_tuple(self) -> Option<(u16, u16)> {
-        match self.minor.checked_add(1) {
-            Some(minor) => Some((self.major, minor)),
-            None => None,
-        }
-    }
-
-    /// Next incremental major version tuple `(major + 1, 0)`, or `None` when
-    /// the major component is already `u16::MAX`.
-    #[inline]
-    #[must_use]
-    pub const fn next_major_tuple(self) -> Option<(u16, u16)> {
-        match self.major.checked_add(1) {
-            Some(major) => Some((major, 0)),
-            None => None,
-        }
-    }
-
-    /// Whether `self` is the immediate next minor increment after `prev`.
-    #[inline]
-    #[must_use]
-    pub const fn is_next_minor_of(self, prev: Self) -> bool {
-        match prev.minor.checked_add(1) {
-            Some(minor) => self.major == prev.major && self.minor == minor,
-            None => false,
-        }
-    }
-
-    /// Const numeric comparison of two [`HarnessVersion`] values (`0.10 > 0.2`).
-    #[inline]
-    #[must_use]
-    pub const fn cmp_num(self, other: Self) -> Ordering {
-        if self.major < other.major {
-            Ordering::Less
-        } else if self.major > other.major {
-            Ordering::Greater
-        } else if self.minor < other.minor {
-            Ordering::Less
-        } else if self.minor > other.minor {
-            Ordering::Greater
-        } else {
-            Ordering::Equal
-        }
-    }
-
     /// Parse `"<major>.<minor>"` (or `"v<major>.<minor>"`) into `(major, minor)`. Rejects leading
-    /// zeros on multi-digit components, empty parts, non-digit characters and values over
-    /// `u16::MAX`.
+    /// zeros on multi-digit components, empty parts, a third part, non-digit characters and values
+    /// over `u16::MAX`.
     #[must_use]
     pub const fn parse_major_minor(s: &str) -> Option<(u16, u16)> {
         let bytes = s.as_bytes();
@@ -189,7 +136,7 @@ impl PartialOrd for HarnessVersion {
 impl Ord for HarnessVersion {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        self.cmp_num(*other)
+        self.tuple().cmp(&other.tuple())
     }
 }
 
@@ -216,33 +163,8 @@ pub enum CliHarness {
     Muse,
 }
 
-#[inline]
-const fn next_cli_harness(h: CliHarness) -> Option<CliHarness> {
-    match h {
-        CliHarness::CodexAlab => Some(CliHarness::ClaudeCode),
-        CliHarness::ClaudeCode => Some(CliHarness::Agy),
-        CliHarness::Agy => Some(CliHarness::Grok),
-        CliHarness::Grok => Some(CliHarness::Kimi),
-        CliHarness::Kimi => Some(CliHarness::Muse),
-        CliHarness::Muse => None,
-    }
-}
-
-const _: () = {
-    let mut at = 0;
-    let mut next = Some(CliHarness::ALL[0]);
-    while let Some(h) = next {
-        assert!(
-            at < CliHarness::ALL.len() && h as usize == at && CliHarness::ALL[at] as usize == at
-        );
-        let v = h.version();
-        assert!(v.major() > 0 || v.minor() > 0);
-        assert!(v.step() >= 1);
-        at += 1;
-        next = next_cli_harness(h);
-    }
-    assert!(at == CliHarness::ALL.len());
-};
+/// The harness lane every CLI harness shares: a change under it moves every harness.
+pub const SHARED_LANE: &str = "crates/aterm-agent/src/harness/";
 
 impl CliHarness {
     /// Every CLI harness in declaration order.
@@ -253,15 +175,6 @@ impl CliHarness {
         CliHarness::Grok,
         CliHarness::Kimi,
         CliHarness::Muse,
-    ];
-
-    /// The five primary named CLI harnesses (`codex-alab`, `claude code`, `agy`, `grok`, `kimi`).
-    pub const PRIMARY: [CliHarness; 5] = [
-        CliHarness::CodexAlab,
-        CliHarness::ClaudeCode,
-        CliHarness::Agy,
-        CliHarness::Grok,
-        CliHarness::Kimi,
     ];
 
     /// Canonical harness identifier (`"codex-alab"`, `"claude"`, `"agy"`, …).
@@ -320,25 +233,34 @@ impl CliHarness {
         }
     }
 
-    /// Canonical version string (`"0.1"`) of this CLI harness.
+    /// The repository file whose `HARNESS_VER` line holds [`Self::version`].
+    #[inline]
+    #[must_use]
+    pub const fn version_file(self) -> &'static str {
+        match self {
+            CliHarness::CodexAlab => "crates/aterm-phase/src/codex.rs",
+            CliHarness::ClaudeCode => "crates/aterm-phase/src/phase.rs",
+            CliHarness::Agy => "crates/aterm-phase/src/agy.rs",
+            CliHarness::Grok => "crates/aterm-phase/src/grok.rs",
+            CliHarness::Kimi => "crates/aterm-phase/src/kimi.rs",
+            CliHarness::Muse => "crates/aterm-phase/src/muse.rs",
+        }
+    }
+
+    /// What this harness is made of, as repository paths (a trailing `/` names a directory): its
+    /// screen reader and the lane every harness shares ([`SHARED_LANE`]). A change under any of
+    /// them in a release window moves [`Self::version`]'s minor once.
+    #[inline]
+    #[must_use]
+    pub const fn sources(self) -> [&'static str; 2] {
+        [self.version_file(), SHARED_LANE]
+    }
+
+    /// Canonical version string (`"0.4"`) of this CLI harness.
     #[inline]
     #[must_use]
     pub const fn version_str(self) -> &'static str {
         self.version().as_str()
-    }
-
-    /// Numeric major version of this CLI harness.
-    #[inline]
-    #[must_use]
-    pub const fn major(self) -> u16 {
-        self.version().major()
-    }
-
-    /// Numeric minor version of this CLI harness.
-    #[inline]
-    #[must_use]
-    pub const fn minor(self) -> u16 {
-        self.version().minor()
     }
 
     /// Resolve a CLI name, harness id, or product alias to its [`CliHarness`].
@@ -360,25 +282,43 @@ impl CliHarness {
     }
 }
 
-/// Resolve a CLI name, harness id, or product alias to its [`CliHarness`].
-#[inline]
+/// The running CLI's version as a harness label shows it: `raw` cut at its first `-` or `+`
+/// (`1.4.13-R6996.1` → `1.4.13`, `0.165.0-dev.4+g1a2b3c4d5` → `0.165.0`), without a leading `v`;
+/// `None` where nothing numeric is left.
 #[must_use]
-pub fn cli_harness_of(name: &str) -> Option<CliHarness> {
-    CliHarness::for_name(name)
+pub fn cli_version_core(raw: &str) -> Option<&str> {
+    let raw = raw.trim();
+    let raw = raw.strip_prefix('v').unwrap_or(raw);
+    let core = raw.split(['-', '+']).next().unwrap_or("");
+    (!core.is_empty()
+        && core.starts_with(|c: char| c.is_ascii_digit())
+        && core.chars().all(|c| c.is_ascii_digit() || c == '.'))
+    .then_some(core)
 }
 
-/// Resolve a CLI name, harness id, or product alias to its structured [`HarnessVersion`].
-#[inline]
+/// Whether CLI version `to` is numerically later than `from` (their [`cli_version_core`]s
+/// compared part by part, a missing part reading 0); `false` where either is not a version.
+/// It allocates nothing: a top rule asks it on every frame that draws one.
 #[must_use]
-pub fn harness_version_of(name: &str) -> Option<HarnessVersion> {
-    CliHarness::for_name(name).map(CliHarness::version)
-}
-
-/// Resolve a CLI name, harness id, or product alias to its canonical version string (`"0.1"`).
-#[inline]
-#[must_use]
-pub fn harness_version_str_of(name: &str) -> Option<&'static str> {
-    CliHarness::for_name(name).map(CliHarness::version_str)
+pub fn cli_version_later(to: &str, from: &str) -> bool {
+    let (Some(to), Some(from)) = (cli_version_core(to), cli_version_core(from)) else {
+        return false;
+    };
+    let number = |part: Option<&str>| part.map_or(Some(0), |p| p.parse::<u64>().ok());
+    let (mut a, mut b) = (to.split('.'), from.split('.'));
+    loop {
+        let (x, y) = (a.next(), b.next());
+        if x.is_none() && y.is_none() {
+            return false;
+        }
+        let (Some(x), Some(y)) = (number(x), number(y)) else {
+            return false;
+        };
+        match x.cmp(&y) {
+            Ordering::Equal => {}
+            later => return later == Ordering::Greater,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -386,47 +326,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_and_each_cli_harness_has_consistent_incremental_numeric_version() {
-        let expected_primary = [
-            (CliHarness::CodexAlab, "codex-alab", "codex", (0, 1), "0.1"),
-            (CliHarness::ClaudeCode, "claude", "claude", (0, 1), "0.1"),
-            (CliHarness::Agy, "agy", "agy", (0, 1), "0.1"),
-            (CliHarness::Grok, "grok", "grok", (0, 1), "0.1"),
-            (CliHarness::Kimi, "kimi", "kimi", (0, 1), "0.1"),
-        ];
-        assert_eq!(CliHarness::PRIMARY.len(), expected_primary.len());
-        for (i, &(harness, id, cli, tuple, text)) in expected_primary.iter().enumerate() {
-            assert_eq!(CliHarness::PRIMARY[i], harness);
-            assert_eq!(harness.id(), id);
-            assert_eq!(harness.cli(), cli);
-            let ver = harness.version();
-            assert_eq!(ver, HarnessVersion::INITIAL);
-            assert_eq!(ver.tuple(), tuple);
-            assert_eq!(ver.major(), tuple.0);
-            assert_eq!(ver.minor(), tuple.1);
-            assert_eq!(ver.as_str(), text);
-            assert_eq!(ver.to_string(), text);
-            assert_eq!(ver.step(), 1);
-            assert_eq!(ver.next_minor_tuple(), Some((0, 2)));
-            assert_eq!(ver.next_major_tuple(), Some((1, 0)));
-            assert_eq!(CliHarness::for_name(id), Some(harness));
-            assert_eq!(CliHarness::for_name(cli), Some(harness));
-            assert_eq!(CliHarness::for_name(harness.product()), Some(harness));
-            assert_eq!(harness_version_of(id), Some(ver));
-            assert_eq!(harness_version_str_of(id), Some(text));
-        }
-
-        for (name, harness) in [
-            ("grok build", CliHarness::Grok),
-            (" \tGrOk BuIlD\n", CliHarness::Grok),
-        ] {
-            assert_eq!(CliHarness::for_name(name), Some(harness), "{name:?}");
-        }
-
+    fn every_cli_harness_names_itself_and_reads_its_own_version() {
         for harness in CliHarness::ALL {
             let ver = harness.version();
-            assert_eq!(ver.tuple(), (0, 1), "{harness:?}");
-            assert_eq!(ver.as_str(), "0.1", "{harness:?}");
+            assert!(ver.tuple() >= (0, 1), "{harness:?}");
+            assert_eq!(ver.as_str(), harness.version_str(), "{harness:?}");
+            assert_eq!(
+                ver.as_str(),
+                format!("{}.{}", ver.major(), ver.minor()),
+                "{harness:?}: the text is the numbers"
+            );
             assert_eq!(
                 HarnessVersion::parse_major_minor(ver.as_str()),
                 Some(ver.tuple()),
@@ -435,9 +344,23 @@ mod tests {
             assert_eq!(CliHarness::for_name(harness.id()), Some(harness));
             assert_eq!(CliHarness::for_name(harness.cli()), Some(harness));
             assert_eq!(CliHarness::for_name(harness.product()), Some(harness));
+            let [reader, lane] = harness.sources();
+            assert_eq!(reader, harness.version_file());
+            assert_eq!(lane, SHARED_LANE);
         }
-        assert_eq!(CliHarness::for_name("Grok Build"), Some(CliHarness::Grok));
-        assert_eq!(CliHarness::for_name("Kimi Code"), Some(CliHarness::Kimi));
+        assert_eq!(
+            CliHarness::CodexAlab.cli(),
+            "codex",
+            "never `alab codex-alab harness`"
+        );
+        for (name, harness) in [
+            ("grok build", CliHarness::Grok),
+            (" \tGrOk BuIlD\n", CliHarness::Grok),
+            ("Kimi Code", CliHarness::Kimi),
+            ("codex-cli", CliHarness::CodexAlab),
+        ] {
+            assert_eq!(CliHarness::for_name(name), Some(harness), "{name:?}");
+        }
         for retired in ["gemini", "gemini-cli", "Gemini CLI"] {
             assert_eq!(
                 CliHarness::for_name(retired),
@@ -445,108 +368,60 @@ mod tests {
                 "{retired:?}: agy replaces it"
             );
         }
-        assert_eq!(
-            CliHarness::for_name("codex-cli"),
-            Some(CliHarness::CodexAlab)
-        );
     }
 
     #[test]
-    fn numeric_version_ordering_and_increment_rules_hold() {
+    fn each_version_file_holds_its_one_line() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for harness in CliHarness::ALL {
+            let text = std::fs::read_to_string(dir.join(harness.version_file()))
+                .unwrap_or_else(|e| panic!("{harness:?}: {e}"));
+            let line = format!(
+                concat!(
+                    "pub const HARNESS_VER: crate::HarnessVersion = ",
+                    "crate::HarnessVersion::new({}, {}, \"{}\");"
+                ),
+                harness.version().major(),
+                harness.version().minor(),
+                harness.version_str()
+            );
+            assert_eq!(text.matches(&line).count(), 1, "{harness:?}: {line}");
+        }
+    }
+
+    #[test]
+    fn numeric_version_ordering_holds() {
         let v0_1 = HarnessVersion::new(0, 1, "0.1");
         let v0_2 = HarnessVersion::new(0, 2, "0.2");
         let v0_10 = HarnessVersion::new(0, 10, "0.10");
         let v0_1000 = HarnessVersion::new(0, 1_000, "0.1000");
         let v1_0 = HarnessVersion::new(1, 0, "1.0");
         let max_minor = HarnessVersion::new(0, u16::MAX, "0.65535");
-        let max_all = HarnessVersion::new(u16::MAX, u16::MAX, "65535.65535");
-
-        assert!(v0_2.is_next_minor_of(v0_1));
-        assert!(!v0_10.is_next_minor_of(v0_2));
-        assert!(!max_minor.is_next_minor_of(max_minor));
         assert!(v0_1 < v0_2);
         assert!(v0_2 < v0_10, "numeric ordering, not lexicographic");
         assert!(v0_10 < v0_1000);
         assert!(v0_1000 < v1_0);
-        assert_eq!(v0_1.step(), 1);
-        assert_eq!(v0_2.step(), 2);
-        assert_eq!(v0_10.step(), 10);
-        assert_eq!(v0_1000.step(), 1_000);
-        assert_eq!(v1_0.step(), 65_536);
-        assert_eq!(max_all.step(), u32::MAX);
-        assert_eq!(max_all.next_minor_tuple(), None);
-        assert_eq!(max_all.next_major_tuple(), None);
+        assert!(max_minor < v1_0);
         assert!(std::panic::catch_unwind(|| HarnessVersion::new(0, 1, "v0.1")).is_err());
+        assert!(std::panic::catch_unwind(|| HarnessVersion::new(0, 0, "0.0")).is_err());
+        assert!(std::panic::catch_unwind(|| HarnessVersion::new(0, 2, "0.1")).is_err());
+    }
 
+    #[test]
+    fn parsing_takes_two_parts_and_never_a_third() {
         assert_eq!(HarnessVersion::parse_major_minor("0.1"), Some((0, 1)));
         assert_eq!(HarnessVersion::parse_major_minor("v0.1"), Some((0, 1)));
         assert_eq!(HarnessVersion::parse_major_minor("0.10"), Some((0, 10)));
-        assert_eq!(HarnessVersion::parse_major_minor("0.01"), None);
-        assert_eq!(HarnessVersion::parse_major_minor("00.1"), None);
-        assert_eq!(HarnessVersion::parse_major_minor("0.1.0"), None);
-        assert_eq!(HarnessVersion::parse_major_minor(""), None);
-    }
-
-    #[test]
-    fn a_constructor_rejects_a_prefixed_noncanonical_spelling() {
-        assert_eq!(HarnessVersion::parse_major_minor("v0.1"), Some((0, 1)));
-        assert!(std::panic::catch_unwind(|| HarnessVersion::new(0, 1, "v0.1")).is_err());
-    }
-
-    #[test]
-    fn numeric_steps_distinguish_versions_across_the_old_decimal_boundary() {
-        let minor = HarnessVersion::new(0, 1_000, "0.1000");
-        let major = HarnessVersion::new(1, 0, "1.0");
-        assert_ne!(minor, major);
-        assert_ne!(minor.step(), major.step());
-    }
-
-    #[test]
-    fn numeric_steps_preserve_order_across_the_full_minor_range() {
-        let minor = HarnessVersion::new(0, u16::MAX, "0.65535");
-        let major = HarnessVersion::new(1, 0, "1.0");
-        assert!(minor < major);
-        assert!(minor.step() < major.step());
-    }
-
-    #[test]
-    fn the_terminal_minor_is_not_its_own_successor() {
-        let last = HarnessVersion::new(0, u16::MAX, "0.65535");
-        assert!(!last.is_next_minor_of(last));
-    }
-
-    #[test]
-    fn asking_for_a_minor_after_the_terminal_component_does_not_panic() {
-        let last = HarnessVersion::new(0, u16::MAX, "0.65535");
-        assert!(std::panic::catch_unwind(|| last.next_minor_tuple()).is_ok());
-    }
-
-    #[test]
-    fn asking_for_a_major_after_the_terminal_component_does_not_panic() {
-        let last = HarnessVersion::new(u16::MAX, 0, "65535.0");
-        assert!(std::panic::catch_unwind(|| last.next_major_tuple()).is_ok());
-    }
-
-    #[test]
-    fn checked_increment_queries_exhaust_components_without_wrapping() {
-        const MAX: HarnessVersion = HarnessVersion::new(u16::MAX, u16::MAX, "65535.65535");
-        const MINOR: Option<(u16, u16)> = MAX.next_minor_tuple();
-        const MAJOR: Option<(u16, u16)> = MAX.next_major_tuple();
-        assert_eq!(MINOR, None);
-        assert_eq!(MAJOR, None);
-        assert_eq!(MAX.step(), u32::MAX);
-        let penultimate = HarnessVersion::new(u16::MAX - 1, u16::MAX - 1, "65534.65534");
-        assert_eq!(penultimate.next_minor_tuple(), Some((65_534, 65_535)));
-        assert_eq!(penultimate.next_major_tuple(), Some((65_535, 0)));
-    }
-
-    #[test]
-    fn parsing_rejects_malformed_and_out_of_range_components() {
         assert_eq!(
             HarnessVersion::parse_major_minor("65535.65535"),
             Some((u16::MAX, u16::MAX))
         );
         for invalid in [
+            "0.1.0",
+            "0.4.1",
+            "0.01",
+            "00.1",
+            "",
             "65536.1",
             "1.65536",
             "999999999999999999999.1",
@@ -556,7 +431,6 @@ mod tests {
             "+0.1",
             "0.-1",
             "v",
-            "0.01",
             "0.1+gsource",
             "0.1-dev.1",
         ] {
@@ -566,5 +440,32 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn a_cli_version_is_cut_to_its_numbers() {
+        for (raw, core) in [
+            ("2.1.305", Some("2.1.305")),
+            ("v2.1.310", Some("2.1.310")),
+            ("1.4.13-R6996.1", Some("1.4.13")),
+            ("0.165.0-dev.4+g1a2b3c4d5", Some("0.165.0")),
+            ("0.1.0-dev.3+codex.0.165.0.g1a2b3c4d5", Some("0.1.0")),
+            (" 2.1.305 ", Some("2.1.305")),
+            ("", None),
+            ("?", None),
+            ("latest", None),
+            ("-1", None),
+        ] {
+            assert_eq!(cli_version_core(raw), core, "{raw:?}");
+        }
+        assert!(cli_version_later("2.1.310", "2.1.305"));
+        assert!(cli_version_later("2.1.310", "2.1.31"), "numeric, not text");
+        assert!(cli_version_later("2.2", "2.1.999"));
+        assert!(cli_version_later("1.4.14-R7000.1", "1.4.13-R6996.1"));
+        assert!(!cli_version_later("2.1.305", "2.1.305"));
+        assert!(!cli_version_later("2.1.305", "2.1.310"));
+        assert!(!cli_version_later("2.1.305.0", "2.1.305"));
+        assert!(!cli_version_later("latest", "2.1.305"));
+        assert!(!cli_version_later("2.1.310", ""));
     }
 }

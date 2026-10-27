@@ -39,6 +39,7 @@ pub mod smoke;
 pub mod smoke_stages;
 pub mod soak;
 pub mod stages;
+mod test_workers;
 pub mod testrun;
 /// THE toolchain resolution, shared with atpkg (`aterm help rust`), the libc oracle's gate and the release cutter.
 pub use aterm_toolchain::discovery as toolchain;
@@ -86,6 +87,8 @@ pub struct EnvSnapshot {
     pub ssh_connection: Option<String>,
     /// `CARGO_BUILD_JOBS`, raw.
     pub cargo_build_jobs: Option<OsString>,
+    /// `BUILD_SLOT_HELD`, raw: a managed run must name its admitted CPU share.
+    pub build_slot_held: Option<OsString>,
     /// `RUSTDOC` or `CARGO_BUILD_RUSTDOC`.
     pub rustdoc_override: Option<OsString>,
     /// `CARGO_TARGET_DIR`, absolute.
@@ -111,6 +114,7 @@ impl EnvSnapshot {
             rustup_home: std::env::var_os("RUSTUP_HOME"),
             ssh_connection: std::env::var("SSH_CONNECTION").ok(),
             cargo_build_jobs: std::env::var_os("CARGO_BUILD_JOBS"),
+            build_slot_held: std::env::var_os("BUILD_SLOT_HELD"),
             rustdoc_override: std::env::var_os("RUSTDOC")
                 .or_else(|| std::env::var_os("CARGO_BUILD_RUSTDOC")),
             cargo_target_dir: var_path("CARGO_TARGET_DIR")
@@ -134,10 +138,14 @@ pub const CARGO_LAYOUT_VARS: [&str; 4] = [
     "CARGO_HOME",
 ];
 
-/// The `build.build-dir` value atpkg's `targo` shim uses for `root` (`aterm_toolchain::build_cache::decide`).
+/// The `build.build-dir` value atpkg's `targo` shim on `env`'s `PATH` uses for `root`
+/// (`aterm_toolchain::build_cache::decide`), in the cache root that shim names
+/// (`aterm_toolchain::build_cache::shim_root`): a shim laid before the cache moved under `.ubd`
+/// builds in the old root until an update of aterm lays the new one, and the main lane builds
+/// there with it, so plain `targo` and verify share one build.
 #[must_use]
 pub fn main_build_dir(env: &EnvSnapshot, root: &Path) -> Option<String> {
-    use aterm_toolchain::build_cache::{BuildDir, Machine, Tool, decide, read_config};
+    use aterm_toolchain::build_cache::{BuildDir, Machine, Tool, decide, read_config, shim_root};
     if !cfg!(target_os = "macos") {
         return None;
     }
@@ -147,8 +155,10 @@ pub fn main_build_dir(env: &EnvSnapshot, root: &Path) -> Option<String> {
             .find(|(name, _)| *name == k)
             .map(|(_, v)| v.clone())
     };
+    let cache = shim_root(&env.home, &env.path);
     let machine = Machine {
         home: Some(&env.home),
+        root: Some(&cache),
         cwd: Some(root),
         env: &lookup,
         read: &read_config,
@@ -176,6 +186,7 @@ pub fn fallback_build_dir(env: &EnvSnapshot, root: &Path, target: &Path) -> Opti
         home: Some(&env.home)
             .filter(|h| !h.as_os_str().is_empty())
             .map(PathBuf::as_path),
+        root: None,
         cwd: Some(root),
         env: &lookup,
         read: &read_config,
@@ -304,6 +315,9 @@ pub struct Ctx {
     pub fix: bool,
     /// `--cell`: the forge cells `cells` checks.
     pub cells: Vec<String>,
+    /// The selection pulled `cells` ([`checks::pulls_cells`]): one cell per other OS, each
+    /// checked only where its graph holds a selected crate ([`cells::pulled_cells`]).
+    pub cells_pulled: bool,
     pub scope: Scope,
     pub tools: Toolchain,
     /// PATH for every child.
@@ -319,15 +333,18 @@ pub struct Ctx {
     pub main_build_dir: Option<String>,
     /// What the run's toolchain lease is, for the log ([`hold_toolchain`]).
     pub toolchain_lease: Option<String>,
+    /// HEAD, in full, when the run's selection was read ([`report::moved_checkout`]); unset, the
+    /// run reads it as it begins.
+    pub head_at_start: Option<String>,
     /// The ceiling on one stage child's work, its waits for admission or a lock left out ([`exec::ExecEnv::child_ceiling`]).
     pub child_ceiling: Option<Duration>,
     /// `--no-windows`.
     pub no_windows: bool,
     /// `--app <APP>`.
     pub measure_artifact: Option<MeasureArtifact>,
-    /// `--test-jobs`.
+    /// Requested `--test-jobs` ceiling; [`Self::test_jobs`] applies admission.
     pub test_jobs: u32,
-    /// `--test-threads`, else the caller's own `RUST_TEST_THREADS`.
+    /// Requested `--test-threads`, else the caller's own `RUST_TEST_THREADS` ceiling.
     pub test_threads: Option<u32>,
     /// The program cargo runs in place of test binaries ([`testrun::RECORD_FLAG`]) and rustdoc ([`docdriver`]).
     pub test_recorder: Option<PathBuf>,
@@ -406,13 +423,14 @@ impl Ctx {
             ));
         }
         let pinned_threads = parse_build_jobs(env.rust_test_threads.as_deref());
-        Self {
+        let mut ctx = Self {
             root,
             target_dir,
             checks: checks::DEV.to_vec(),
             release: false,
             fix: false,
             cells: Vec::new(),
+            cells_pulled: false,
             scope,
             tools,
             path_env,
@@ -422,6 +440,7 @@ impl Ctx {
             child_env_add,
             main_build_dir,
             toolchain_lease: None,
+            head_at_start: None,
             child_ceiling: Some(exec::DEFAULT_CHILD_CEILING),
             no_windows: false,
             measure_artifact: None,
@@ -430,7 +449,9 @@ impl Ctx {
             test_recorder: std::env::current_exe().ok(),
             quiet: None,
             runs: None,
-        }
+        };
+        ctx.refresh_test_threads();
+        ctx
     }
 
     /// Keep this run's leftover record ([`runs::Runs`]) and set `ATERM_VERIFY_RUN` on every stage child (W-run).
@@ -439,6 +460,21 @@ impl Ctx {
         self.child_env_add
             .push((runs::VERIFY_RUN_ENV.into(), runs.env_value().into()));
         self.runs = Some(runs);
+        self
+    }
+
+    /// On macOS, every stage child's `TMPDIR` is the temp directory `temp`'s quiet folder
+    /// ([`aterm_tempfile::quiet_in`]), so what the tests and tools write there reaches none of
+    /// fseventsd's clients or its history; nothing changes where `temp` is quiet already or the
+    /// folder cannot be used. A stage's own `TMPDIR` still wins.
+    #[must_use]
+    pub fn with_quiet_tmpdir(mut self, temp: &Path) -> Self {
+        let quiet = aterm_tempfile::quiet_in(temp);
+        if quiet != temp {
+            let mut dir = quiet.into_os_string();
+            dir.push("/");
+            self.child_env_add.push(("TMPDIR".into(), dir));
+        }
         self
     }
 
@@ -474,6 +510,13 @@ impl Ctx {
         self
     }
 
+    /// Whether the selection pulled `cells` ([`Ctx::cells_pulled`]).
+    #[must_use]
+    pub const fn with_cells_pulled(mut self, pulled: bool) -> Self {
+        self.cells_pulled = pulled;
+        self
+    }
+
     /// The cargo the in-process forge walks ask for graphs.
     #[must_use]
     pub fn forge_cargo(&self) -> aterm_forge::resolve::Cargo {
@@ -502,13 +545,38 @@ impl Ctx {
     /// The most test binaries that run at once ([`Ctx::test_jobs`], at least one).
     #[must_use]
     pub fn test_jobs(&self) -> usize {
-        usize::try_from(self.test_jobs.max(1)).unwrap_or(1)
+        usize::try_from(self.test_workers().0).unwrap_or(1)
     }
 
-    /// `--test-threads` (or the caller's `RUST_TEST_THREADS`), or the machine's parallelism, as libtest would pick.
+    /// The requested libtest count, capped together with the binary count by a managed run's CPU share.
     #[must_use]
     pub fn test_threads(&self) -> u32 {
-        self.test_threads.unwrap_or_else(|| self.cores())
+        self.test_workers().1
+    }
+
+    fn test_workers(&self) -> (u32, u32) {
+        // Invalid managed input is refused before any stage runs. A context
+        // inspected before that refusal still cannot advertise an unbounded pool.
+        let share = test_workers::admitted_share(&self.env).unwrap_or(Some(1));
+        test_workers::counts(
+            self.test_jobs,
+            self.test_threads.unwrap_or_else(|| self.cores()),
+            share,
+        )
+    }
+
+    pub(crate) fn test_thread_override(&self) -> Option<u32> {
+        (self.env.build_slot_held.is_some() || self.test_threads.is_some())
+            .then(|| self.test_threads())
+    }
+
+    fn refresh_test_threads(&mut self) {
+        self.child_env_add
+            .retain(|(key, _)| key != "RUST_TEST_THREADS");
+        if let Some(threads) = self.test_thread_override() {
+            self.child_env_add
+                .push(("RUST_TEST_THREADS".into(), threads.to_string().into()));
+        }
     }
 
     /// The recording runner and the doctests' doc driver.
@@ -521,10 +589,11 @@ impl Ctx {
 
     /// `--test-jobs <n>`.
     #[must_use]
-    pub const fn with_test_jobs(mut self, jobs: Option<std::num::NonZeroU32>) -> Self {
+    pub fn with_test_jobs(mut self, jobs: Option<std::num::NonZeroU32>) -> Self {
         if let Some(n) = jobs {
             self.test_jobs = n.get();
         }
+        self.refresh_test_threads();
         self
     }
 
@@ -533,9 +602,8 @@ impl Ctx {
     pub fn with_test_threads(mut self, threads: Option<std::num::NonZeroU32>) -> Self {
         if let Some(n) = threads {
             self.test_threads = Some(n.get());
-            self.child_env_add
-                .push(("RUST_TEST_THREADS".into(), n.get().to_string().into()));
         }
+        self.refresh_test_threads();
         self
     }
 
@@ -564,6 +632,13 @@ impl Ctx {
     #[must_use]
     pub fn with_toolchain_lease(mut self, said: Option<String>) -> Self {
         self.toolchain_lease = said;
+        self
+    }
+
+    /// HEAD when the run's selection was read ([`Ctx::head_at_start`]).
+    #[must_use]
+    pub fn with_head_at_start(mut self, head: Option<String>) -> Self {
+        self.head_at_start = head;
         self
     }
 
@@ -856,14 +931,20 @@ fn staged(
 /// The one header line.
 #[must_use]
 pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
-    let names: Vec<&str> = ctx.checks.iter().map(|c| c.name()).collect();
+    let own: Vec<Check> = ctx
+        .checks
+        .iter()
+        .copied()
+        .filter(|c| !(ctx.cells_pulled && *c == Check::Cells))
+        .collect();
+    let names: Vec<&str> = own.iter().map(|c| c.name()).collect();
     let holds = |p: &str| ctx.scope.includes_crate(p);
     let pulled = checks::pulled(&checks::DEV, holds);
-    let what = if ctx.release {
+    let mut what = if ctx.release {
         "release".to_string()
-    } else if ctx.checks == checks::DEV {
+    } else if own == checks::DEV {
         "dev".to_string()
-    } else if !pulled.is_empty() && ctx.checks == checks::with_pulled(&checks::DEV, false, holds) {
+    } else if !pulled.is_empty() && own == checks::with_pulled(&checks::DEV, false, holds) {
         let (added, by): (Vec<&str>, Vec<&str>) =
             pulled.iter().map(|(c, p)| (c.name(), *p)).unzip();
         format!(
@@ -874,6 +955,9 @@ pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
     } else {
         names.join(" ")
     };
+    if ctx.cells_pulled {
+        what.push_str(" + cells (each other OS's cell that builds a selected crate)");
+    }
     format!("verify: {what} — {}", selection(ctx, cone))
 }
 
@@ -931,8 +1015,17 @@ fn run_with(
     show: &Show<'_>,
     seams: Seams,
 ) -> std::io::Result<i32> {
+    if let Err(why) = test_workers::admitted_share(&ctx.env) {
+        writeln!(out, "verify: {why}; no check was run")?;
+        let _ = writeln!(log, "verify: {why}; no check was run");
+        return Ok(exit::USAGE);
+    }
     let cone = show.cone;
     let started = Instant::now();
+    let head_at_start = ctx
+        .head_at_start
+        .clone()
+        .or_else(|| head_commit(&ctx.root, &ctx.path_env));
     let head = header(ctx, cone);
     writeln!(out, "{head}")?;
     out.flush()?;
@@ -1042,7 +1135,11 @@ fn run_with(
         }
     }
     let seconds = started.elapsed().as_secs_f64();
-    let (line, code) = report::verdict(&results, ctx.release, seconds);
+    let (line, code) = report::moved_checkout(
+        report::verdict(&results, ctx.release, seconds),
+        head_at_start.as_deref(),
+        head_commit(&ctx.root, &ctx.path_env).as_deref(),
+    );
     let _ = writeln!(log, "\n{line}");
     writeln!(out, "{line}")?;
     if let Some(path) = show.log {
@@ -1077,8 +1174,14 @@ fn toolchain_lines(ctx: &Ctx) -> String {
         .iter()
         .any(|(k, _)| k == "CARGO_TARGET_DIR");
     match (&ctx.main_build_dir, pinned) {
+        (Some(value), false) if value.contains(&format!("/{}/", aterm_tempfile::QUIET)) => {
+            s.push_str(&format!(
+                "build cache: the main lane shares plain targo's ({value})\n"
+            ));
+        }
         (Some(value), false) => s.push_str(&format!(
-            "build cache: the main lane shares plain targo's ({value})\n"
+            "build cache: the main lane shares plain targo's ({value}), outside .ubd: the targo \
+             shim on PATH predates the quiet cache, and an aterm update lays the new one\n"
         )),
         (Some(value), true) => s.push_str(&format!(
             "build cache: CARGO_TARGET_DIR={}, intermediates out of Spotlight ({value}; no shim cache here)\n",
@@ -1295,6 +1398,9 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         ));
     }
     let env = EnvSnapshot::capture();
+    if let Err(why) = test_workers::admitted_share(&env) {
+        return stop(exit::USAGE, format!("verify: {why}; no check was run"));
+    }
     let tools = run_toolchain(&env, &root);
     if !tools.have_targo() {
         return could_not_run(tools.missing_targo_label());
@@ -1327,6 +1433,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     }
 
     let path_env = tools.path_with_stage2_first(&env.path);
+    let head_at_start = head_commit(&root, &path_env);
     let (scope, cone) = if !parsed.narrows() || parsed.all {
         (Scope::workspace(), None)
     } else if !parsed.packages.is_empty() {
@@ -1341,18 +1448,27 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         (scope, Some(said))
     };
     let wanted = checks::with_pulled(&parsed.checks, parsed.release, |p| scope.includes_crate(p));
+    let cells_pulled = checks::pulls_cells(&wanted, parsed.release, !scope.selects_nothing());
+    let wanted = if cells_pulled {
+        checks::with(&wanted, Check::Cells)
+    } else {
+        wanted
+    };
     let ctx = Ctx::new_with_tools(root, scope, env, scratch.clone(), tools)
         .with_checks(&wanted)
         .with_release(parsed.release)
         .with_fix(parsed.fix)
         .with_cells(parsed.cells.clone())
+        .with_cells_pulled(cells_pulled)
         .with_no_windows(parsed.no_windows)
         .with_measure_artifact(measure_artifact)
         .with_child_ceiling(parsed.timeout.unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)))
         .with_test_jobs(parsed.test_jobs)
         .with_test_threads(parsed.test_threads)
         .with_quiet(Some(parsed.admit))
-        .with_toolchain_lease(lease_said);
+        .with_toolchain_lease(lease_said)
+        .with_quiet_tmpdir(&std::env::temp_dir())
+        .with_head_at_start(head_at_start);
     let ctx = match runs_dir
         .as_deref()
         .and_then(|dir| runs::Runs::open(&ctx, dir, exec::run))
@@ -1360,6 +1476,10 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         Some(record) => ctx.with_runs(record),
         None => ctx,
     };
+    #[cfg(unix)]
+    for line in plan::retire_old_lanes(&ctx) {
+        eprintln!("verify: {line}");
+    }
     #[cfg(unix)]
     let disk = match disk::admit(&ctx, parsed.admit) {
         Ok(held) => held,
@@ -1661,6 +1781,38 @@ mod tests {
         assert!(has(&threaded, "RUST_TEST_THREADS", "3"));
     }
 
+    /// A run's children get the temp directory's quiet folder as `TMPDIR` on macOS.
+    /// NEGATIVE CONTROL: a temp directory quiet already, and any off macOS, is left as it is.
+    #[test]
+    fn stage_children_get_a_quiet_tmpdir() {
+        let ctx = || {
+            Ctx::new(
+                PathBuf::from("/repo"),
+                Scope::workspace(),
+                EnvSnapshot::default(),
+                PathBuf::from("/tmp"),
+            )
+        };
+        let tmpdir = |c: &Ctx| {
+            c.child_env_add
+                .iter()
+                .find(|(k, _)| k == "TMPDIR")
+                .map(|(_, v)| PathBuf::from(v))
+        };
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        assert_eq!(tmpdir(&ctx().with_quiet_tmpdir(scratch.path())), None);
+        let loud = PathBuf::from("/tmp");
+        let got = tmpdir(&ctx().with_quiet_tmpdir(&loud));
+        if cfg!(target_os = "macos") {
+            let got = got.expect("a quiet TMPDIR");
+            assert_eq!(got, loud.join(".ubd"));
+            assert!(got.as_os_str().to_string_lossy().ends_with("/.ubd/"));
+            assert!(aterm_tempfile::is_quiet(scratch.path()), "{scratch:?}");
+        } else {
+            assert_eq!(got, None);
+        }
+    }
+
     #[test]
     fn the_main_lane_shares_plain_targos_cache_exactly_where_the_shim_would() {
         let tmp = std::fs::canonicalize(mktemp_dir("atv-cache").expect("mktemp")).expect("real");
@@ -1677,7 +1829,7 @@ mod tests {
             assert_eq!(
                 got,
                 Some(format!(
-                    "build.build-dir='{}/Library/Caches/aterm/cargo-build.noindex\
+                    "build.build-dir='{}/Library/Caches/aterm/.ubd/cargo-build.noindex\
                      {{workspace-root}}/.cargo-build'",
                     home.display()
                 ))
@@ -1703,6 +1855,33 @@ mod tests {
                 None,
                 "outside HOME"
             );
+            // A shim laid before the cache moved under .ubd names the old root: the main lane
+            // builds there with it. NEGATIVE CONTROL: this version's shim names the quiet one.
+            let bin = tmp.join("bin");
+            std::fs::create_dir_all(&bin).expect("mkdir");
+            let on_path = EnvSnapshot {
+                path: bin.clone().into_os_string(),
+                ..env.clone()
+            };
+            for (under, quiet) in [
+                (aterm_toolchain::build_cache::MOVED_FROM_UNDER_HOME, false),
+                (aterm_toolchain::build_cache::CACHE_UNDER_HOME, true),
+            ] {
+                std::fs::write(
+                    bin.join("targo"),
+                    format!("#!/bin/sh\n# atpkg shim\n__atb_t=\n__atb_c=${{HOME-}}/{under}\n"),
+                )
+                .expect("a shim");
+                let value = main_build_dir(&on_path, &root).expect("the shim's cache");
+                assert_eq!(
+                    value,
+                    format!(
+                        "build.build-dir='{}/{under}{{workspace-root}}/.cargo-build'",
+                        home.display()
+                    )
+                );
+                assert_eq!(value.contains("/.ubd/"), quiet, "{value}");
+            }
         } else {
             assert_eq!(got, None, "the shim's cache is macOS only");
         }
@@ -1919,5 +2098,114 @@ mod tests {
             "verify: dev + gpu-oracle + wasm-smoke (the selection holds aterm-gpu, aterm-wasm) \
              — the cone"
         );
+        let pulled = |crates: &[&str]| {
+            let scope = Scope::changed(
+                "origin/main",
+                crates.iter().map(|c| c.to_string()).collect(),
+                true,
+            );
+            let holds = |p: &str| scope.includes_crate(p);
+            let checks = checks::with(
+                &checks::with_pulled(&checks::DEV, false, holds),
+                Check::Cells,
+            );
+            let ctx = Ctx::new(
+                PathBuf::from("/repo"),
+                scope.clone(),
+                EnvSnapshot::default(),
+                PathBuf::from("/tmp"),
+            )
+            .with_checks(&checks)
+            .with_cells_pulled(true);
+            header(&ctx, Some("the cone"))
+        };
+        assert_eq!(
+            pulled(&["aterm-gui"]),
+            "verify: dev + cells (each other OS's cell that builds a selected crate) — the cone"
+        );
+        assert_eq!(
+            pulled(&["aterm-gpu"]),
+            "verify: dev + gpu-oracle (the selection holds aterm-gpu) + cells (each other OS's \
+             cell that builds a selected crate) — the cone"
+        );
+    }
+
+    /// A stage that commits in the run's checkout, standing in for another session's
+    /// fast-forward of a shared checkout mid-run.
+    fn committing_stage(ctx: &Ctx, spec: &plan::StageSpec) -> Report {
+        let out = changed::git(&ctx.root, &ctx.path_env)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["commit", "-q", "--allow-empty", "-m", "moved"])
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "commit: {out:?}");
+        let mut r = Report::new(spec.title.clone());
+        r.pass("ran");
+        r
+    }
+
+    fn passing_stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
+        let mut r = Report::new(spec.title.clone());
+        r.pass("ran");
+        r
+    }
+
+    /// A run whose checkout's HEAD moves while its stages run ends COULD NOT RUN, its checks'
+    /// own PASS beside it. Negative control: the same run with HEAD still ends PASS.
+    #[test]
+    fn a_run_whose_checkout_moved_under_its_stages_could_not_run() {
+        let root = mktemp_dir("atv-moved-checkout").expect("mktemp");
+        let path_env = std::env::var_os("PATH").unwrap_or_default();
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        ] {
+            let out = changed::git(&root, &path_env)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        let run = |stage: fn(&Ctx, &plan::StageSpec) -> Report| {
+            let mut ctx = Ctx::new(
+                root.clone(),
+                Scope::crate_only("aterm-verify"),
+                EnvSnapshot::default(),
+                root.join("scratch"),
+            )
+            .with_checks(&[Check::Fmt]);
+            ctx.path_env.clone_from(&path_env);
+            let mut out = Vec::new();
+            let code = run_with(
+                &ctx,
+                &mut out,
+                &mut std::io::sink(),
+                &Show::default(),
+                Seams {
+                    stage,
+                    admit_quiet: LIVE.admit_quiet,
+                },
+            )
+            .expect("the result written");
+            (code, String::from_utf8_lossy(&out).into_owned())
+        };
+
+        let (code, out) = run(passing_stage);
+        assert_eq!(code, exit::PASS, "HEAD never moved: {out}");
+
+        let (code, out) = run(committing_stage);
+        assert_eq!(code, exit::COULD_NOT_RUN, "{out}");
+        assert!(out.contains("the checkout moved from"), "{out}");
+        std::fs::remove_dir_all(&root).ok();
     }
 }

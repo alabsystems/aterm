@@ -477,10 +477,13 @@ pub(super) fn judge_wrote_land<'a>(
     t0: i64,
 ) -> Verdict {
     let before = land.map_or(seen.end_ms, |(t, _)| *t);
+    // The first point's decision: its back-off, else Land's instruction typed at it at once (v6
+    // §14.10).
     let judged = seen
         .journal
         .iter()
-        .find(|(t, l)| *t > t0 && *t < before && backoff_named(l));
+        .find(|(t, l)| *t > t0 && *t < before && backoff_named(l))
+        .or(land);
     let point = judged.and_then(|(tw, wl)| {
         let seq = word(wl, "seq");
         seen.journal.iter().rfind(|(t, l)| {

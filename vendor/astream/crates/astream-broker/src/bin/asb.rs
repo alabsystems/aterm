@@ -238,7 +238,7 @@ use std::time::Duration;
 
 use astream_broker::{
     AnyClient, AnySubscription, Broker, BrokerHandle, BrokerLog, Closer, Durability, Event, Gap,
-    Record, Transport, Walk, MAX_RECORD_PAYLOAD,
+    Record, StampedRecord, Transport, MAX_RECORD_PAYLOAD,
 };
 
 // The ONE capability-file format and reader, `astream_cap::capfile`: what `mint`
@@ -261,20 +261,30 @@ mod capfile;
 
 const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME | --key-file PATH] [--handshake]
                   [--secret-env NAME | --secret-file PATH] [--revocation-file PATH] [--unix SOCKET] [--allow-remote]
+                  [--at-rest-key-env NAME | --at-rest-key-file PATH] [--anti-rollback | --anti-rollback-init]
+                  [--durability strict|ordered|relaxed] [--horizon-ms N] [--health-ms N]
+                  [--retain-file PATH] [--retention-interval-ms N]
+                  [--max-retained-records N] [--max-retained-bytes N]
+       asb serve  [log] --listen <scheme>:<addr>... [--key-env NAME | --key-file PATH]
+                  [--host-key-file PATH --allow-peer-file PATH...] [--allow-plaintext] [--allow-remote]
+                  [--secret-env NAME | --secret-file PATH] [--revocation-file PATH]
+                  [--at-rest-key-env NAME | --at-rest-key-file PATH] [--anti-rollback | --anti-rollback-init]
                   [--durability strict|ordered|relaxed] [--horizon-ms N] [--health-ms N]
                   [--retain-file PATH] [--retention-interval-ms N]
                   [--max-retained-records N] [--max-retained-bytes N]
        asb pub    <endpoint> <subject> [--id N] [--seq M | --seq-file PATH] <transport> <cap>
-       asb sub    <endpoint> <filter> [--from N | --group G] <transport> <cap>
-       asb last   <endpoint> <filter> [--after SUBJECT] [--max N] <transport> <cap>
-       asb fetch  <endpoint> <filter> [--from N] [--max N] <transport> <cap>
+       asb sub    <endpoint> <filter> [--from N | --group G] [--bt] <transport> <cap>
+       asb last   <endpoint> <filter> [--after SUBJECT] [--max N] [--bt] <transport> <cap>
+       asb fetch  <endpoint> <filter> [--from N] [--max N] [--bt] <transport> <cap>
        asb drain  <endpoint> <group> <filter> [--max N] [--idle MS] [--peek] <transport> <cap>
        asb ack    <endpoint> <group> <offset> <subject> handled|refused|deferred [--id N] <transport> <cap>
        asb commit <endpoint> <group> <upto> <transport> <cap>
        asb mint   <grant> --secret-env NAME | --secret-file PATH [--legacy-unbound]
        asb attenuate <child-grant> --cap-file PATH [--secret-env NAME | --secret-file PATH]
-       asb repair <log>
-       asb stats  <log>
+       asb repair <log> [--at-rest-key-env NAME | --at-rest-key-file PATH]
+       asb compact <log> <min_offset> [--at-rest-key-env NAME | --at-rest-key-file PATH]
+       asb stats  <log> [--at-rest-key-env NAME | --at-rest-key-file PATH]
+       asb stats  <endpoint> <filter> <transport> <cap>
   <transport>:                      [--tcp] [--key-env NAME | --key-file PATH] [--handshake]
   <cap>:                            [--cap-file PATH]...   (repeatable; `<grant> <tag-hex>` lines, as `asb mint` prints;
                                     split at the LAST whitespace, so a grant whose filter holds a space reads back)
@@ -283,7 +293,15 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
                                     session); needs asb built with --features handshake
   repair:                           truncate a log at its first CORRUPT record (which `serve` refuses to open,
                                     because the bytes from there may be acked data) and report what was dropped;
-                                    keyless, so a log sealed at rest is refused, never cut (repair it with its key)
+                                    without --at-rest-key-*, a log sealed at rest is refused, never cut
+  --at-rest-key-env / --at-rest-key-file:
+                                    64 hex chars (32-byte key) sealing the log and its sidecars on disk under
+                                    XChaCha20-Poly1305 bound to <log>.seal (needs asb built with --features at-rest;
+                                    serve's --at-rest-key-file must be 0600); a bare --at-rest-key on argv is refused
+  --anti-rollback / --anti-rollback-init:
+                                    serve with --at-rest-key-* at --durability strict: seal a monotonic watermark
+                                    in <log>.hw (--anti-rollback-init creates or adopts it; --anti-rollback refuses
+                                    any log missing <log>.hw or shorter than its watermark; needs --features anti-rollback)
   stats:                            print operational log counters (`base`, `head`, `records`, `bytes`, `subjects`,
                                     `producers`, `wills`, `groups`, `replica`) for `<log>`; for a log a running
                                     broker serves, read them from its health sidecar `<log>.health` (which
@@ -346,8 +364,9 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
   --group G:                        resume from the group's durable committed offset (see `asb commit`)
   --peek:                           drain without committing: the same records are delivered again next time
   --:                               ends flag parsing; every later token is a positional (for one beginning with `-`)
-  sub/drain say on STDERR what retention gave up below the read, before the records after it:
-  `asb: sub|drain: GAP from=<F> to=<T> records=<N|unknown>` (every record of the filter in F..T not delivered is gone)
+  sub/drain/fetch say on STDERR what retention gave up below the read, before the records after it:
+  `asb: <verb>: GAP from=<F> to=<T> records=<N|unknown>` (every record of the filter in F..T not delivered is gone);
+  fetch below its filter's oldest reads what retention still holds there, or is refused retained-from=<off>
   last/fetch/drain print `<offset> <nbytes> <subject>` headers, the SUBJECT running to the end of the line (a
   subject may contain a space, never a newline), then the body's raw bytes and ONE newline; sub omits the
   subject and prints `<offset> <nbytes>`; last/fetch then MARK -- fetch's next is the page cursor (resume with
@@ -709,6 +728,28 @@ fn load_key(src: &KeySource, rule: KeyFile) -> Result<[u8; 32], u8> {
     Ok(key)
 }
 
+/// Read the at-rest encryption key (`--at-rest-key-env` / `--at-rest-key-file`),
+/// decode its 64 hex chars, and scrub the intermediate buffer. `serve` reads its
+/// `--at-rest-key-file` under [`KeyFile::OwnerOnly`] (`0600` or tighter); offline
+/// maintenance verbs (`repair`, `compact`, `stats`) read under [`KeyFile::AsFound`].
+fn load_at_rest_key(src: &KeySource, rule: KeyFile) -> Result<[u8; 32], u8> {
+    let (what, mut raw) = match (src, rule) {
+        (KeySource::File(path), KeyFile::OwnerOnly) => match capfile::read_private_file(path) {
+            Ok(v) => (format!("--at-rest-key-file {path}"), v),
+            Err(e) => return Err(fail_exit(2, &format!("--at-rest-key-file {e}"))),
+        },
+        _ => load_bytes("--at-rest-key", src)?,
+    };
+    let mut key = [0u8; 32];
+    let res = decode_hex(raw.trim_ascii(), &mut key);
+    raw.fill(0);
+    std::hint::black_box(&raw);
+    if let Err(e) = res {
+        return Err(fail_exit(2, &format!("{what}: {e}")));
+    }
+    Ok(key)
+}
+
 fn metadata_str(path: &str) -> io::Result<std::fs::Metadata> {
     std::fs::metadata(path)
 }
@@ -941,6 +982,87 @@ fn serve_handshake(
     ))
 }
 
+#[cfg(feature = "identity")]
+fn serve_identity(
+    broker: &Broker,
+    ep: &str,
+    seed: [u8; 32],
+    peers: Vec<[u8; 32]>,
+) -> Result<io::Result<BrokerHandle>, u8> {
+    let kp = astream_broker::IdentityKeypair::from_seed(seed);
+    Ok(broker.serve_tcp_identity(ep, kp, peers))
+}
+#[cfg(not(feature = "identity"))]
+fn serve_identity(
+    _broker: &Broker,
+    _ep: &str,
+    mut seed: [u8; 32],
+    _peers: Vec<[u8; 32]>,
+) -> Result<io::Result<BrokerHandle>, u8> {
+    seed.fill(0);
+    std::hint::black_box(&seed);
+    Err(fail_exit(
+        2,
+        "--listen identity: requires asb built with `--features identity`",
+    ))
+}
+
+/// Read an owner-only 64-hex Ed25519 host seed (`--host-key-file PATH`) and scrub
+/// the intermediate buffer.
+fn load_host_seed(path: &str) -> Result<[u8; 32], u8> {
+    let mut raw = match capfile::read_private_file(path) {
+        Ok(v) => v,
+        Err(e) => return Err(fail_exit(2, &format!("--host-key-file {e}"))),
+    };
+    let mut seed = [0u8; 32];
+    let res = decode_hex(raw.trim_ascii(), &mut seed);
+    raw.fill(0);
+    std::hint::black_box(&raw);
+    if let Err(e) = res {
+        return Err(fail_exit(2, &format!("--host-key-file {path}: {e}")));
+    }
+    Ok(seed)
+}
+
+/// Read repeatable `--allow-peer-file PATH` files (one 64-hex Ed25519 public key per
+/// non-blank, non-`#` line). At least one peer key must be present across all files.
+fn load_peer_files(paths: &[String]) -> Result<Vec<[u8; 32]>, u8> {
+    let mut peers: Vec<[u8; 32]> = Vec::new();
+    for path in paths {
+        let bytes = match std::fs::read(path) {
+            Ok(v) => v,
+            Err(e) => return Err(fail_exit(2, &format!("--allow-peer-file {path}: {e}"))),
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return Err(fail_exit(
+                2,
+                &format!("--allow-peer-file {path}: file is not valid UTF-8"),
+            ));
+        };
+        let mut line_no = 0usize;
+        for line in text.lines() {
+            line_no = line_no.saturating_add(1);
+            let trimmed = line.trim_ascii();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let mut pk = [0u8; 32];
+            if let Err(e) = decode_hex(trimmed.as_bytes(), &mut pk) {
+                return Err(usage_error(&format!(
+                    "--allow-peer-file {path}:{line_no}: {e}"
+                )));
+            }
+            peers.push(pk);
+        }
+    }
+    if peers.is_empty() {
+        return Err(usage_error(
+            "--allow-peer-file holds no 64-hex Ed25519 peer public keys",
+        ));
+    }
+    Ok(peers)
+}
+
 struct Cli {
     pos: Vec<String>,
     bools: HashSet<String>,
@@ -948,10 +1070,14 @@ struct Cli {
     /// The transport, resolved ONCE per invocation. `drain` opens two connections,
     /// so one resolution serves every connection.
     transport: std::cell::OnceCell<Transport>,
-    /// `--cap-file` is the one REPEATABLE flag: a connection's keyring holds up to
-    /// `MAX_KEYRING` grants, and reading one subtree while committing under another
-    /// is the intended shape.
+    /// `--cap-file` is repeatable: a connection's keyring holds up to `MAX_KEYRING`
+    /// grants, and reading one subtree while committing under another is the intended shape.
     cap_files: Vec<String>,
+    /// `--listen <scheme>:<addr>` is repeatable (`REQUIREMENTS` R2): multiple listeners
+    /// share one broker, log, guard, dedup table, and will table.
+    listens: Vec<String>,
+    /// `--allow-peer-file PATH` is repeatable for `--listen identity:<addr>`.
+    peer_files: Vec<String>,
 }
 
 /// Flags that take a value (`--flag VALUE` or `--flag=VALUE`), given at most once.
@@ -966,6 +1092,9 @@ const VALUE_FLAGS: &[&str] = &[
     "--group",
     "--key-env",
     "--key-file",
+    "--at-rest-key-env",
+    "--at-rest-key-file",
+    "--host-key-file",
     "--secret-env",
     "--secret-file",
     "--revocation-file",
@@ -984,8 +1113,12 @@ const BOOL_FLAGS: &[&str] = &[
     "--tcp",
     "--handshake",
     "--peek",
+    "--bt",
     "--legacy-unbound",
     "--allow-remote",
+    "--allow-plaintext",
+    "--anti-rollback",
+    "--anti-rollback-init",
 ];
 
 /// Flags every network verb accepts: how to reach the broker, and what to attach.
@@ -1002,6 +1135,11 @@ const COMMON_FLAGS: &[&str] = &[
 /// of the command, so a secret must never appear there.
 const ARGV_SECRETS: &[(&str, &str)] = &[
     ("--key", "pass it with --key-env NAME or --key-file PATH"),
+    (
+        "--at-rest-key",
+        "pass it with --at-rest-key-env NAME or --at-rest-key-file PATH",
+    ),
+    ("--host-key", "pass it with --host-key-file PATH"),
     (
         "--secret",
         "pass it with --secret-env NAME or --secret-file PATH",
@@ -1095,6 +1233,8 @@ fn parse() -> Result<Cli, u8> {
     let mut bools: HashSet<String> = HashSet::new();
     let mut kv: HashMap<String, String> = HashMap::new();
     let mut cap_files: Vec<String> = Vec::new();
+    let mut listens: Vec<String> = Vec::new();
+    let mut peer_files: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         // `--` ends flag parsing: every token after it is a positional. Without it a
@@ -1122,7 +1262,11 @@ fn parse() -> Result<Cli, u8> {
                 "{flag} on argv is refused: the value would be visible to every local user via `ps` for the process's lifetime; {remedy}"
             )));
         }
-        if flag == "--cap-file" || VALUE_FLAGS.contains(&flag) {
+        if flag == "--cap-file"
+            || flag == "--listen"
+            || flag == "--allow-peer-file"
+            || VALUE_FLAGS.contains(&flag)
+        {
             let v = match inline {
                 Some(v) => v,
                 None => match it.next() {
@@ -1132,6 +1276,10 @@ fn parse() -> Result<Cli, u8> {
             };
             if flag == "--cap-file" {
                 cap_files.push(v);
+            } else if flag == "--listen" {
+                listens.push(v);
+            } else if flag == "--allow-peer-file" {
+                peer_files.push(v);
             } else if kv.insert(flag.to_string(), v).is_some() {
                 return Err(usage_error(&format!("{flag} given more than once")));
             }
@@ -1154,6 +1302,8 @@ fn parse() -> Result<Cli, u8> {
         kv,
         transport: std::cell::OnceCell::new(),
         cap_files,
+        listens,
+        peer_files,
     })
 }
 
@@ -1190,6 +1340,12 @@ impl Cli {
         }
         if !self.cap_files.is_empty() {
             given.push("--cap-file");
+        }
+        if !self.listens.is_empty() {
+            given.push("--listen");
+        }
+        if !self.peer_files.is_empty() {
+            given.push("--allow-peer-file");
         }
         given.sort_unstable(); // a deterministic message when several are wrong
         let mut rest = given.as_slice();
@@ -1275,6 +1431,22 @@ impl Cli {
         match (self.kv.get("--secret-env"), self.kv.get("--secret-file")) {
             (Some(_), Some(_)) => Err(usage_error(
                 "--secret-env and --secret-file are mutually exclusive",
+            )),
+            (Some(e), None) => Ok(Some(KeySource::Env(e.clone()))),
+            (None, Some(f)) => Ok(Some(KeySource::File(f.clone()))),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// Where the at-rest encryption key comes from (`--at-rest-key-env` / `--at-rest-key-file`),
+    /// if one was given.
+    fn at_rest_key_source(&self) -> Result<Option<KeySource>, u8> {
+        match (
+            self.kv.get("--at-rest-key-env"),
+            self.kv.get("--at-rest-key-file"),
+        ) {
+            (Some(_), Some(_)) => Err(usage_error(
+                "--at-rest-key-env and --at-rest-key-file are mutually exclusive",
             )),
             (Some(e), None) => Ok(Some(KeySource::Env(e.clone()))),
             (None, Some(f)) => Ok(Some(KeySource::File(f.clone()))),
@@ -1383,12 +1555,20 @@ fn stdout_buffered() -> io::BufWriter<io::StdoutLock<'static>> {
     io::BufWriter::new(io::stdout().lock())
 }
 
-fn do_sub(mut sub: AnySubscription) -> io::Result<()> {
+fn do_sub(mut sub: AnySubscription, show_bt: bool) -> io::Result<()> {
     let mut out = stdout_buffered();
     while let Some(event) = sub.recv_event()? {
         match event {
             Event::Delivery { offset, body, .. } => {
-                writeln!(out, "{offset} {}", body.len())?;
+                if show_bt {
+                    let bt = match sub.last_bt_ms() {
+                        Some(ms) => ms.to_string(),
+                        None => "none".to_string(),
+                    };
+                    writeln!(out, "{offset} {} bt={bt}", body.len())?;
+                } else {
+                    writeln!(out, "{offset} {}", body.len())?;
+                }
                 out.write_all(&body)?;
                 out.write_all(b"\n")?;
                 out.flush()?;
@@ -1404,7 +1584,8 @@ fn do_sub(mut sub: AnySubscription) -> io::Result<()> {
 /// one line on STDERR: `asb: <verb>: GAP from=<F> to=<T> records=<N|unknown>`. Every record
 /// of the filter in `F..T` the read is not delivered was given up (`records`: how many,
 /// where the broker knows). Not on stdout, whose framing a consumer parses byte for byte:
-/// `sub` writes it before any record the tail delivers after it, `drain` before the batch.
+/// `sub` writes it before any record the tail delivers after it, `drain` and `fetch` before
+/// the batch or the page.
 fn warn_gap(verb: &str, gap: &Gap) {
     let records = match gap.records {
         Some(n) => n.to_string(),
@@ -1430,9 +1611,43 @@ fn warn_gap(verb: &str, gap: &Gap) {
 /// `<offset>`, read `<nbytes>`, take the SUBJECT as the rest of the line (it can
 /// never contain the newline that ends it), then exactly `<nbytes>` body bytes and
 /// one newline.
-fn print_records(out: &mut impl Write, records: &[Record]) -> io::Result<()> {
+fn format_record_header(offset: u64, nbytes: usize, subject: &str) -> String {
+    format!("{offset} {nbytes} {subject}\n")
+}
+
+#[cfg(test)]
+fn format_records_into(out: &mut Vec<u8>, records: &[Record]) {
     for (offset, subject, body) in records {
-        writeln!(out, "{offset} {} {subject}", body.len())?;
+        let hdr = format_record_header(*offset, body.len(), subject);
+        out.extend_from_slice(hdr.as_bytes());
+        out.extend_from_slice(body);
+        out.push(b'\n');
+    }
+}
+
+fn print_records(
+    out: &mut io::BufWriter<io::StdoutLock<'static>>,
+    records: &[Record],
+) -> io::Result<()> {
+    for (offset, subject, body) in records {
+        let hdr = format_record_header(*offset, body.len(), subject);
+        out.write_all(hdr.as_bytes())?;
+        out.write_all(body)?;
+        out.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn print_records_stamped(
+    out: &mut io::BufWriter<io::StdoutLock<'static>>,
+    records: &[StampedRecord],
+) -> io::Result<()> {
+    for (offset, subject, body, bt_ms) in records {
+        let bt = match bt_ms {
+            Some(ms) => ms.to_string(),
+            None => "none".to_string(),
+        };
+        writeln!(out, "{offset} {} bt={bt} {subject}", body.len())?;
         out.write_all(body)?;
         out.write_all(b"\n")?;
     }
@@ -1510,12 +1725,73 @@ fn last_all(
     max: u32,
 ) -> io::Result<(Vec<Record>, u64, u64)> {
     let mut out: Vec<Record> = Vec::new();
-    // The MARK is the FIRST request's; a `--max 0` head query makes exactly one.
-    let ((next, head), _continue_after) = c.last_walk(filter, after, max, |row| {
-        out.push(row);
-        Ok(Walk::Continue)
-    })?;
-    Ok((out, next, head))
+    let mut cursor = after.to_string();
+    let mut remaining = max;
+    let mut first: Option<(u64, u64)> = None;
+    for _ in 0..astream_broker::LAST_WALK_PAGES_MAX {
+        let ask = remaining;
+        let (page, page_mark, resume) = c.last_page(filter, &cursor, ask)?;
+        let mark = *first.get_or_insert(page_mark);
+        let rows = page.len();
+        let mut taken = 0usize;
+        for row in page {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
+            taken = taken.saturating_add(1);
+            out.push(row);
+        }
+        if resume.is_empty() && taken == rows && ask > 0 {
+            return Ok((out, mark.0, mark.1));
+        }
+        if remaining == 0 {
+            return Ok((out, mark.0, mark.1));
+        }
+        cursor = resume;
+    }
+    Err(io::Error::other(format!(
+        "the last-value walk of {filter} did not end within {} pages",
+        astream_broker::LAST_WALK_PAGES_MAX
+    )))
+}
+
+fn last_all_stamped(
+    c: &mut AnyClient,
+    filter: &str,
+    after: &str,
+    max: u32,
+) -> io::Result<(Vec<StampedRecord>, u64, u64)> {
+    let mut out: Vec<StampedRecord> = Vec::new();
+    let mut cursor = after.to_string();
+    let mut remaining = max;
+    let mut first: Option<(u64, u64)> = None;
+    for _ in 0..astream_broker::LAST_WALK_PAGES_MAX {
+        let ask = remaining;
+        let (page, page_mark, resume) = c.last_page_stamped(filter, &cursor, ask)?;
+        let mark = *first.get_or_insert(page_mark);
+        let rows = page.len();
+        let mut taken = 0usize;
+        for row in page {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
+            taken = taken.saturating_add(1);
+            out.push(row);
+        }
+        if resume.is_empty() && taken == rows && ask > 0 {
+            return Ok((out, mark.0, mark.1));
+        }
+        if remaining == 0 {
+            return Ok((out, mark.0, mark.1));
+        }
+        cursor = resume;
+    }
+    Err(io::Error::other(format!(
+        "the last-value walk of {filter} did not end within {} pages",
+        astream_broker::LAST_WALK_PAGES_MAX
+    )))
 }
 
 /// The broker's SUBSCRIBER-VISIBLE head, asked with `fetch`'s documented head query
@@ -1566,6 +1842,13 @@ fn refuse_past_head(what: &str, value: u64, head: u64) -> Result<(), u8> {
 fn print_page(records: &[Record], next: u64, head: u64) -> io::Result<()> {
     let mut out = stdout_buffered();
     print_records(&mut out, records)?;
+    writeln!(out, "MARK next={next} head={head}")?;
+    out.flush()
+}
+
+fn print_page_stamped(records: &[StampedRecord], next: u64, head: u64) -> io::Result<()> {
+    let mut out = stdout_buffered();
+    print_records_stamped(&mut out, records)?;
     writeln!(out, "MARK next={next} head={head}")?;
     out.flush()
 }
@@ -1746,15 +2029,29 @@ fn lock_seq_file(path: &str) -> io::Result<std::fs::File> {
 /// `store::sync_parent_dir` makes too. Any other error IS reported: a directory that
 /// fails its own fsync has not made the rename durable, and the caller must not publish
 /// under a number that may not have been recorded.
+fn flush_dir_entry(dir: &std::path::Path) -> io::Result<()> {
+    astream_sys::full_sync(&std::fs::File::open(dir)?)
+}
+
 fn sync_parent_dir(path: &str) -> io::Result<()> {
-    sync_parent_dir_by(path, |dir| {
-        astream_sys::full_sync(&std::fs::File::open(dir)?)
-    })
+    let dir = match std::path::Path::new(path).parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    match flush_dir_entry(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if astream_sys::dir_flush_unavailable(&e) => Ok(()),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("--seq-file {path}: fsync of {}: {e}", dir.display()),
+        )),
+    }
 }
 
 /// [`sync_parent_dir`] with the directory's open and full flush (`flush`) handed in, so a
 /// test can make them fail; what that outcome means for the publish is decided here either
 /// way.
+#[cfg(test)]
 fn sync_parent_dir_by(
     path: &str,
     flush: impl FnOnce(&std::path::Path) -> io::Result<()>,
@@ -1935,25 +2232,107 @@ fn horizon_note(served: &astream_broker::ServedInfo) -> String {
     }
 }
 
-/// The broker `serve` runs: at `durability`, and GUARDED when there is a secret (every
-/// attach must then carry a capability minted under it). No escalation table: `asb`
-/// names no record a person would miss, so on the weaker tiers every record rides the
-/// tier's own promise. `serve` refuses a secret in a build without `cap` before it
-/// reads one, so the fallback below never sees `Some`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServeAntiRollback {
+    Off,
+    Verify,
+    Init,
+}
+
+/// Validate `serve`'s `--at-rest-key-*` and `--anti-rollback*` flags before reading any
+/// secret or touching disk.
+fn validate_serve_at_rest(
+    cli: &Cli,
+    durability: Durability,
+) -> Result<(Option<KeySource>, ServeAntiRollback), u8> {
+    let src = cli.at_rest_key_source()?;
+    let verify = cli.has("--anti-rollback");
+    let init = cli.has("--anti-rollback-init");
+    if verify && init {
+        return Err(usage_error(
+            "--anti-rollback and --anti-rollback-init are mutually exclusive",
+        ));
+    }
+    let ar = if verify {
+        ServeAntiRollback::Verify
+    } else if init {
+        ServeAntiRollback::Init
+    } else {
+        ServeAntiRollback::Off
+    };
+    if ar != ServeAntiRollback::Off && src.is_none() {
+        return Err(usage_error(
+            "--anti-rollback/--anti-rollback-init need an at-rest key (--at-rest-key-env NAME or --at-rest-key-file PATH)",
+        ));
+    }
+    if ar != ServeAntiRollback::Off && !matches!(durability, Durability::Strict) {
+        return Err(usage_error(
+            "--anti-rollback/--anti-rollback-init apply to --durability strict alone (the monotonic counter promises that no acked head rolls back)",
+        ));
+    }
+    if src.is_some() && !cfg!(feature = "at-rest") {
+        return Err(fail_exit(
+            2,
+            "serve --at-rest-key-env/--at-rest-key-file requires asb built with `--features at-rest`",
+        ));
+    }
+    if ar != ServeAntiRollback::Off && !cfg!(feature = "anti-rollback") {
+        return Err(fail_exit(
+            2,
+            "serve --anti-rollback/--anti-rollback-init requires asb built with `--features anti-rollback`",
+        ));
+    }
+    Ok((src, ar))
+}
+
+/// The broker `serve` runs: at `durability`, GUARDED when there is a secret (every
+/// attach must then carry a capability minted under it), SEALED AT REST when an
+/// `--at-rest-key-*` was given, and watermark-checked when `--anti-rollback*` was set.
+/// No escalation table: `asb` names no record a person would miss, so on the weaker
+/// tiers every record rides the tier's own promise. `serve` refuses missing features
+/// before reading secrets, so the disabled branches below never receive `Some`.
 ///
 /// `asb serve` keeps the default signal action (it has no signal code, and astream no
 /// libc), so a SIGTERM ends it without the clean close a broker's shutdown runs: after a
 /// reboot, an `ordered` or `relaxed` log `asb serve` served moves its generation once —
 /// the safe direction, and what a reader holding offsets is told by the identity.
-#[cfg(feature = "cap")]
-fn open_broker(log: &str, secret: Option<Vec<u8>>, durability: Durability) -> io::Result<Broker> {
+fn open_broker(
+    log: &str,
+    secret: Option<Vec<u8>>,
+    mut at_rest_key: Option<[u8; 32]>,
+    anti_rollback: ServeAntiRollback,
+    durability: Durability,
+) -> io::Result<Broker> {
+    #[cfg_attr(
+        not(any(feature = "cap", feature = "at-rest", feature = "anti-rollback")),
+        allow(unused_mut)
+    )]
     let mut opts = astream_broker::OpenOptions::new(durability);
-    opts.guard = secret;
+    #[cfg(feature = "cap")]
+    {
+        opts.guard = secret;
+    }
+    #[cfg(not(feature = "cap"))]
+    let _ = secret;
+    #[cfg(feature = "at-rest")]
+    {
+        opts.at_rest_key = at_rest_key;
+    }
+    if let Some(ref mut k) = at_rest_key {
+        k.fill(0);
+        std::hint::black_box(k);
+    }
+    #[cfg(feature = "anti-rollback")]
+    {
+        opts.anti_rollback = match anti_rollback {
+            ServeAntiRollback::Off => astream_broker::AntiRollback::Off,
+            ServeAntiRollback::Verify => astream_broker::AntiRollback::Verify,
+            ServeAntiRollback::Init => astream_broker::AntiRollback::Init,
+        };
+    }
+    #[cfg(not(feature = "anti-rollback"))]
+    let _ = anti_rollback;
     Broker::open_opts(log, opts, || Ok(astream_broker::Prepared::Nothing))
-}
-#[cfg(not(feature = "cap"))]
-fn open_broker(log: &str, _secret: Option<Vec<u8>>, durability: Durability) -> io::Result<Broker> {
-    Broker::open_with(log, durability)
 }
 
 /// A bind refused AFTER the log was opened must not leave the log behind when
@@ -1964,13 +2343,23 @@ fn discard_created_log(log: &str, created_here: bool, broker: Broker) {
     drop(broker);
     if created_here && matches!(metadata_str(log), Ok(m) if m.len() == 0) {
         let _ = remove_file_str(log);
+        let _ = remove_file_str(&format!("{log}.id"));
+        let _ = remove_file_str(&format!("{log}.seal"));
+        let _ = remove_file_str(&format!("{log}.hw"));
     }
 }
 
-/// Open the log — GUARDED when a mint secret was given — translating "someone else
-/// holds this log" into a clear exit 1.
-fn open_log(log: &str, secret: Option<Vec<u8>>, durability: Durability) -> Result<Broker, u8> {
-    match open_broker(log, secret, durability) {
+/// Open the log — GUARDED when a mint secret was given, SEALED AT REST when an
+/// `--at-rest-key-*` was given — translating "someone else holds this log" into a
+/// clear exit 1.
+fn open_log(
+    log: &str,
+    secret: Option<Vec<u8>>,
+    at_rest_key: Option<[u8; 32]>,
+    anti_rollback: ServeAntiRollback,
+    durability: Durability,
+) -> Result<Broker, u8> {
+    match open_broker(log, secret, at_rest_key, anti_rollback, durability) {
         Ok(b) => Ok(b),
         Err(e) => {
             let msg = e.to_string().to_ascii_lowercase();
@@ -2017,8 +2406,27 @@ fn cmd_repair(cli: &Cli) -> Result<(), AsbErr> {
             "--tcp does not apply to repair (it operates on a local log file)",
         )));
     }
-    cli.only("repair", &[])?;
-    let (_log, dropped) = BrokerLog::open_repair(&log, Durability::Strict)?;
+    cli.only("repair", &["--at-rest-key-env", "--at-rest-key-file"])?;
+    let at_rest_src = cli.at_rest_key_source()?;
+    if at_rest_src.is_some() && !cfg!(feature = "at-rest") {
+        return Err(AsbErr::Exit(fail_exit(
+            2,
+            "repair --at-rest-key-env/--at-rest-key-file requires asb built with `--features at-rest`",
+        )));
+    }
+    let (_log, dropped) = match at_rest_src {
+        #[cfg(feature = "at-rest")]
+        Some(src) => {
+            let mut key = load_at_rest_key(&src, KeyFile::AsFound)?;
+            let res = BrokerLog::open_encrypted_repair(&log, Durability::Strict, key);
+            key.fill(0);
+            std::hint::black_box(&mut key);
+            res?
+        }
+        #[cfg(not(feature = "at-rest"))]
+        Some(_) => return Err(AsbErr::Exit(2)),
+        None => BrokerLog::open_repair(&log, Durability::Strict)?,
+    };
     if dropped == 0 {
         Ok(say(&format!("{log}: nothing to repair"))?)
     } else {
@@ -2029,8 +2437,11 @@ fn cmd_repair(cli: &Cli) -> Result<(), AsbErr> {
     }
 }
 
-// Inspect a local log's operational counters (`REQUIREMENTS` R5).
+// Inspect a local log's operational counters or query live wire `Stats` (`REQUIREMENTS` R5).
 fn cmd_stats(cli: &Cli) -> Result<(), AsbErr> {
+    if cli.pos.len() >= 3 {
+        return cmd_stats_wire(cli);
+    }
     let log = cli.at(1, "log")?;
     cli.no_more_than(2)?;
     if cli.has("--tcp") {
@@ -2038,7 +2449,14 @@ fn cmd_stats(cli: &Cli) -> Result<(), AsbErr> {
             "--tcp does not apply to stats (it operates on a local log file)",
         )));
     }
-    cli.only("stats", &[])?;
+    cli.only("stats", &["--at-rest-key-env", "--at-rest-key-file"])?;
+    let at_rest_src = cli.at_rest_key_source()?;
+    if at_rest_src.is_some() && !cfg!(feature = "at-rest") {
+        return Err(AsbErr::Exit(fail_exit(
+            2,
+            "stats --at-rest-key-env/--at-rest-key-file requires asb built with `--features at-rest`",
+        )));
+    }
     if !std::path::Path::new(&log).exists() {
         return Err(AsbErr::Io(io::Error::new(
             io::ErrorKind::NotFound,
@@ -2050,7 +2468,20 @@ fn cmd_stats(cli: &Cli) -> Result<(), AsbErr> {
     // first open after the next reboot move the log's generation for a run that
     // acked nothing. (The open's own fsync makes everything durable first, so a
     // Strict record here hides no loss.)
-    let opened = match BrokerLog::open_with(&log, Durability::Strict) {
+    let open_res = match at_rest_src {
+        #[cfg(feature = "at-rest")]
+        Some(src) => {
+            let mut key = load_at_rest_key(&src, KeyFile::AsFound)?;
+            let res = BrokerLog::open_encrypted_with(&log, Durability::Strict, key);
+            key.fill(0);
+            std::hint::black_box(&mut key);
+            res
+        }
+        #[cfg(not(feature = "at-rest"))]
+        Some(_) => return Err(AsbErr::Exit(2)),
+        None => BrokerLog::open_with(&log, Durability::Strict),
+    };
+    let opened = match open_res {
         Ok(opened) => opened,
         // A LIVE log: the broker serving it holds its lock, so this process cannot
         // open it. Its health sidecar says what it holds instead.
@@ -2070,6 +2501,50 @@ fn cmd_stats(cli: &Cli) -> Result<(), AsbErr> {
         s.group_commits,
         if s.is_replica { "yes" } else { "no" }
     ))?)
+}
+
+fn cmd_stats_wire(cli: &Cli) -> Result<(), AsbErr> {
+    let ep = cli.at(1, "endpoint")?;
+    let filter = cli.at(2, "filter")?;
+    cli.no_more_than(3)?;
+    cli.only_net("stats", &[])?;
+    let caps = cli.caps()?;
+    let (mut c, _) = connect_attached(cli, &ep, &caps)?;
+    let s = c.stats(&filter)?;
+    let mut out = stdout_buffered();
+    writeln!(
+        out,
+        "STATS started_at_ms={} oldest={} head={} pending_wills={} dedup_entries={} disk_segments={} disk_bytes={}",
+        s.started_at_ms,
+        s.oldest,
+        s.head,
+        s.pending_wills,
+        s.dedup_entries,
+        s.disk_segments,
+        s.disk_bytes,
+    )?;
+    for l in &s.listeners {
+        writeln!(out, "LISTENER {l}")?;
+    }
+    for p in &s.producers {
+        let last_bt = match p.last_bt_ms {
+            Some(ms) => ms.to_string(),
+            None => "none".to_string(),
+        };
+        writeln!(
+            out,
+            "PRODUCER principal={} transport={} attached_at_ms={} last_bt_ms={last_bt}",
+            p.principal, p.transport, p.attached_at_ms,
+        )?;
+    }
+    for f in &s.faces {
+        writeln!(
+            out,
+            "FACE prefix={} records={} bytes={}",
+            f.face, f.records, f.bytes,
+        )?;
+    }
+    Ok(out.flush()?)
 }
 
 // `stats` on a log a running broker serves: the snapshot that broker keeps in
@@ -2154,11 +2629,18 @@ fn cmd_compact(cli: &Cli) -> Result<(), AsbErr> {
             "--tcp does not apply to compact (it operates on a local log file)",
         )));
     }
-    cli.only("compact", &[])?;
+    cli.only("compact", &["--at-rest-key-env", "--at-rest-key-file"])?;
+    let at_rest_src = cli.at_rest_key_source()?;
     if !cfg!(feature = "retention") {
         return Err(AsbErr::Exit(fail_exit(
             2,
             "compact requires asb built with `--features retention`",
+        )));
+    }
+    if at_rest_src.is_some() && !cfg!(feature = "at-rest") {
+        return Err(AsbErr::Exit(fail_exit(
+            2,
+            "compact --at-rest-key-env/--at-rest-key-file requires asb built with `--features at-rest`",
         )));
     }
     if !std::path::Path::new(&log).exists() {
@@ -2169,7 +2651,19 @@ fn cmd_compact(cli: &Cli) -> Result<(), AsbErr> {
     }
     #[cfg(feature = "retention")]
     {
-        let mut opened = BrokerLog::open_with(&log, Durability::Strict)?;
+        let mut opened = match at_rest_src {
+            #[cfg(feature = "at-rest")]
+            Some(src) => {
+                let mut key = load_at_rest_key(&src, KeyFile::AsFound)?;
+                let res = BrokerLog::open_encrypted_with(&log, Durability::Strict, key);
+                key.fill(0);
+                std::hint::black_box(&mut key);
+                res?
+            }
+            #[cfg(not(feature = "at-rest"))]
+            Some(_) => return Err(AsbErr::Exit(2)),
+            None => BrokerLog::open_with(&log, Durability::Strict)?,
+        };
         let dropped = opened.retain_before_carrying_state(astream_wire::Offset(min_offset))?;
         let s = opened.stats();
         Ok(say_durable(
@@ -2251,21 +2745,387 @@ fn cmd_attenuate(cli: &Cli) -> Result<(), AsbErr> {
     do_attenuate(secret.as_deref(), parent, &child_grant)
 }
 
+enum ListenSpec {
+    Unix(String),
+    Sealed(String),
+    Handshake(String),
+    Identity(String),
+    Tcp(String),
+}
+
+fn parse_listen_spec(raw: &str) -> Result<ListenSpec, u8> {
+    let Some((scheme, addr)) = raw.split_once(':') else {
+        return Err(usage_error(&format!(
+            "--listen {raw:?}: expected unix:<path>, sealed:<host:port>, handshake:<host:port>, identity:<host:port>, or tcp:<host:port>"
+        )));
+    };
+    if addr.is_empty() {
+        return Err(usage_error(&format!(
+            "--listen {raw:?}: listener address after `{scheme}:` must not be empty"
+        )));
+    }
+    if scheme == "unix" {
+        Ok(ListenSpec::Unix(addr.to_string()))
+    } else if scheme == "sealed" {
+        Ok(ListenSpec::Sealed(addr.to_string()))
+    } else if scheme == "handshake" {
+        Ok(ListenSpec::Handshake(addr.to_string()))
+    } else if scheme == "identity" {
+        Ok(ListenSpec::Identity(addr.to_string()))
+    } else if scheme == "tcp" {
+        Ok(ListenSpec::Tcp(addr.to_string()))
+    } else {
+        Err(usage_error(&format!(
+            "--listen {raw:?}: unknown scheme {scheme:?} (expected unix, sealed, handshake, identity, or tcp)"
+        )))
+    }
+}
+
+fn check_tcp_loopback(ep: &str, allow_remote: bool) -> Result<(), u8> {
+    match is_loopback_endpoint(ep) {
+        Ok(true) => Ok(()),
+        Ok(false) if allow_remote => Ok(()),
+        Ok(false) => Err(usage_error(&format!(
+            "{ep} is not a loopback address, and a broker bound there is reachable from the network: plain --tcp has no boundary at all, and a pre-shared key is one secret every host of the fleet holds — a transport boundary, not a per-host identity (only a --secret-file guard says which node may publish what). Pass --allow-remote to say that is what you mean"
+        ))),
+        Err(e) => Err(usage_error(&format!("{ep}: {e} (a <host>:<port> to bind)"))),
+    }
+}
+
+fn cmd_serve_multi(cli: &Cli) -> Result<(), AsbErr> {
+    if cli.has("--tcp") || cli.has("--handshake") || cli.kv.contains_key("--unix") {
+        return Err(AsbErr::Exit(usage_error(
+            "--listen names each listener's scheme (<scheme>:<addr>); do not combine with --tcp, --handshake, or --unix",
+        )));
+    }
+    cli.no_more_than(2)?;
+    let mut specs: Vec<ListenSpec> = Vec::new();
+    let mut has_unix = false;
+    let mut has_sealed = false;
+    let mut has_handshake = false;
+    let mut has_identity = false;
+    let mut has_tcp_plain = false;
+    let mut unix_paths: Vec<String> = Vec::new();
+    for raw in &cli.listens {
+        let spec = parse_listen_spec(raw)?;
+        match &spec {
+            ListenSpec::Unix(p) => {
+                for seen in &unix_paths {
+                    if seen == p {
+                        return Err(AsbErr::Exit(usage_error(&format!(
+                            "duplicate --listen unix:{p}"
+                        ))));
+                    }
+                }
+                unix_paths.push(p.clone());
+                has_unix = true;
+            }
+            ListenSpec::Sealed(_) => has_sealed = true,
+            ListenSpec::Handshake(_) => has_handshake = true,
+            ListenSpec::Identity(_) => has_identity = true,
+            ListenSpec::Tcp(_) => has_tcp_plain = true,
+        }
+        specs.push(spec);
+    }
+    let log = match cli.pos.get(1) {
+        Some(explicit) => explicit.clone(),
+        None => match specs.first() {
+            Some(ListenSpec::Unix(p)) => format!("{p}.log"),
+            _ => {
+                return Err(AsbErr::Exit(usage_error(
+                    "missing <log> (pass <log> explicitly when the first --listen is not unix:<path>)",
+                )));
+            }
+        },
+    };
+    let health_every = match cli.num("--health-ms")? {
+        None => SERVE_HEALTH_EVERY,
+        Some(0) => {
+            return Err(AsbErr::Exit(usage_error(
+                "--health-ms 0: the health sidecar's period is at least 1 ms",
+            )))
+        }
+        Some(ms) => Duration::from_millis(ms),
+    };
+    let max_retained_records = cli.num("--max-retained-records")?;
+    let max_retained_bytes = cli.num("--max-retained-bytes")?;
+    let retention_interval_ms = cli.num("--retention-interval-ms")?;
+    let retain_file = cli.kv.get("--retain-file").cloned();
+    if (max_retained_records.is_some()
+        || max_retained_bytes.is_some()
+        || retention_interval_ms.is_some()
+        || retain_file.is_some())
+        && !cfg!(feature = "retention")
+    {
+        return Err(AsbErr::Exit(usage_error(
+            "serve --retain-file/--retention-interval-ms/--max-retained-records/--max-retained-bytes requires asb built with the `retention` feature",
+        )));
+    }
+    if retention_interval_ms == Some(0) {
+        return Err(AsbErr::Exit(usage_error(
+            "--retention-interval-ms expects at least 1",
+        )));
+    }
+    #[cfg(feature = "retention")]
+    let retention = match &retain_file {
+        Some(path) => match read_retain_file(path) {
+            Ok(r) => Some(r),
+            Err(e) => return Err(AsbErr::Exit(usage_error(&e))),
+        },
+        None => None,
+    };
+    if has_tcp_plain && !cli.has("--allow-plaintext") {
+        return Err(AsbErr::Exit(usage_error(
+            "refusing --listen tcp:<addr> without --allow-plaintext: plaintext TCP has no transport boundary",
+        )));
+    }
+    if !has_tcp_plain && cli.has("--allow-plaintext") {
+        return Err(AsbErr::Exit(usage_error(
+            "--allow-plaintext applies only to --listen tcp:<addr>",
+        )));
+    }
+    let has_any_tcp = has_sealed || has_handshake || has_identity || has_tcp_plain;
+    let allow_remote = cli.has("--allow-remote");
+    if !has_any_tcp && allow_remote {
+        return Err(AsbErr::Exit(usage_error(
+            "--allow-remote applies to a TCP listener; a Unix socket is never remote",
+        )));
+    }
+    let guard = cli.secret_source()?;
+    if guard.is_some() && !cfg!(feature = "cap") {
+        return Err(AsbErr::Exit(usage_error(
+            "serve --secret-env/--secret-file (a GUARDED broker) requires asb built with `--features cap`",
+        )));
+    }
+    let durability = serve_durability(cli)?;
+    let (at_rest_src, anti_rollback) = validate_serve_at_rest(cli, durability)?;
+    if has_unix && cfg!(not(unix)) {
+        return Err(AsbErr::Exit(fail_exit(
+            2,
+            "Unix-socket endpoints need a unix host",
+        )));
+    }
+    for spec in &specs {
+        match spec {
+            ListenSpec::Unix(_) => {}
+            ListenSpec::Sealed(ep)
+            | ListenSpec::Handshake(ep)
+            | ListenSpec::Identity(ep)
+            | ListenSpec::Tcp(ep) => check_tcp_loopback(ep, allow_remote)?,
+        }
+    }
+    let key_src = cli.key_source()?;
+    if has_sealed || has_handshake {
+        if has_sealed && cfg!(not(feature = "aead")) {
+            return Err(AsbErr::Exit(fail_exit(
+                2,
+                "--listen sealed: requires asb built with `--features aead`",
+            )));
+        }
+        if has_handshake && cfg!(not(feature = "handshake")) {
+            return Err(AsbErr::Exit(fail_exit(
+                2,
+                "--listen handshake: requires asb built with `--features handshake`",
+            )));
+        }
+        if key_src.is_none() {
+            return Err(AsbErr::Exit(usage_error(
+                "--listen sealed:/handshake: needs a key (--key-env NAME or --key-file PATH)",
+            )));
+        }
+    } else if key_src.is_some() {
+        return Err(AsbErr::Exit(usage_error(
+            "--key-env/--key-file apply only to --listen sealed: or --listen handshake:",
+        )));
+    }
+    let host_key_file = cli.kv.get("--host-key-file").cloned();
+    if has_identity {
+        if cfg!(not(feature = "identity")) {
+            return Err(AsbErr::Exit(fail_exit(
+                2,
+                "--listen identity: requires asb built with `--features identity`",
+            )));
+        }
+        if host_key_file.is_none() || cli.peer_files.is_empty() {
+            return Err(AsbErr::Exit(usage_error(
+                "--listen identity: needs --host-key-file PATH and --allow-peer-file PATH",
+            )));
+        }
+    } else if host_key_file.is_some() || !cli.peer_files.is_empty() {
+        return Err(AsbErr::Exit(usage_error(
+            "--host-key-file/--allow-peer-file apply only to --listen identity:<host:port>",
+        )));
+    }
+    let psk = match &key_src {
+        Some(src) => Some(load_key(src, KeyFile::OwnerOnly)?),
+        None => None,
+    };
+    let id_material = match &host_key_file {
+        Some(hk) => Some((load_host_seed(hk)?, load_peer_files(&cli.peer_files)?)),
+        None => None,
+    };
+    let secret = match &guard {
+        Some(src) => Some(load_secret(src)?),
+        None => None,
+    };
+    let mut at_rest_key = match &at_rest_src {
+        Some(src) => Some(load_at_rest_key(src, KeyFile::OwnerOnly)?),
+        None => None,
+    };
+    let guarded = secret.is_some();
+    for sock in &unix_paths {
+        refuse_live_socket(sock)?;
+    }
+    let created_here = !std::path::Path::new(&log).exists();
+    let broker_res = open_log(&log, secret, at_rest_key, anti_rollback, durability);
+    if let Some(ref mut k) = at_rest_key {
+        k.fill(0);
+        std::hint::black_box(k);
+    }
+    let broker = broker_res?;
+    #[cfg(feature = "retention")]
+    {
+        if let Some(max_rec) = max_retained_records {
+            broker.set_max_retained_records(usize::try_from(max_rec).unwrap_or(usize::MAX));
+        }
+        if let Some(max_bytes) = max_retained_bytes {
+            broker.set_max_retained_bytes(usize::try_from(max_bytes).unwrap_or(usize::MAX));
+        }
+        if let Some(ms) = retention_interval_ms {
+            broker.set_retention_interval(std::time::Duration::from_millis(ms));
+        }
+        if let Some(rules) = retention {
+            if let Err(e) = broker.set_retention(rules) {
+                let path = retain_file.as_deref().unwrap_or_default();
+                discard_created_log(&log, created_here, broker);
+                return Err(AsbErr::Exit(fail_exit(
+                    2,
+                    &format!("--retain-file {path}: {e}"),
+                )));
+            }
+        }
+    }
+    if let Some(rev_path) = cli.kv.get("--revocation-file") {
+        if let Err(e) = broker.load_revocation_file(rev_path) {
+            discard_created_log(&log, created_here, broker);
+            return Err(AsbErr::Exit(fail_exit(
+                2,
+                &format!("--revocation-file {rev_path}: {e}"),
+            )));
+        }
+    }
+    let mut handles: Vec<BrokerHandle> = Vec::new();
+    let mut bound_names: Vec<String> = Vec::new();
+    for spec in &specs {
+        let (what, served): (&str, io::Result<BrokerHandle>) = match spec {
+            ListenSpec::Unix(sock) => (sock.as_str(), broker.serve(sock)),
+            ListenSpec::Tcp(ep) => (ep.as_str(), broker.serve_tcp(ep)),
+            ListenSpec::Sealed(ep) => {
+                let Some(key) = psk.as_ref() else {
+                    drop(handles);
+                    discard_created_log(&log, created_here, broker);
+                    return Err(AsbErr::Exit(2));
+                };
+                (ep.as_str(), serve_sealed(&broker, ep, key)?)
+            }
+            ListenSpec::Handshake(ep) => {
+                let Some(key) = psk.as_ref() else {
+                    drop(handles);
+                    discard_created_log(&log, created_here, broker);
+                    return Err(AsbErr::Exit(2));
+                };
+                (ep.as_str(), serve_handshake(&broker, ep, key)?)
+            }
+            ListenSpec::Identity(ep) => {
+                let Some((seed, peers)) = id_material.as_ref() else {
+                    drop(handles);
+                    discard_created_log(&log, created_here, broker);
+                    return Err(AsbErr::Exit(2));
+                };
+                (
+                    ep.as_str(),
+                    serve_identity(&broker, ep, *seed, peers.clone())?,
+                )
+            }
+        };
+        match served {
+            Ok(h) => {
+                let bound = h
+                    .tcp_addr()
+                    .map_or_else(|| what.to_string(), str::to_string);
+                bound_names.push(bound);
+                handles.push(h);
+            }
+            Err(e) => {
+                drop(handles);
+                return Err(AsbErr::Exit(refuse_serve(
+                    &log,
+                    created_here,
+                    what,
+                    &e,
+                    broker,
+                )));
+            }
+        }
+    }
+    if let Err(e) = broker.keep_health(health_every) {
+        warn(&format!(
+            "asb: {log}{}: cannot write the health sidecar ({e}); `asb stats` cannot read \
+             this broker until it can",
+            astream_broker::HEALTH_SUFFIX
+        ));
+    }
+    for b in &bound_names {
+        say(&format!("listening {b}"))?;
+    }
+    warn(&format!(
+        "asb: serving {} — {}",
+        bound_names.join(" and "),
+        if guarded {
+            "GUARDED: an attach must carry a capability minted under the secret"
+        } else {
+            "unguarded: no capability is checked on attach"
+        }
+    ));
+    let served = broker.served_durability();
+    warn(&format!(
+        "asb: durability {} — {}",
+        tier_word(served.requested),
+        if served.served == served.requested {
+            format!("served as asked{}", horizon_note(&served))
+        } else {
+            format!(
+                "served {}: {:?}, never weaker than asked",
+                tier_word(served.served),
+                served.reason
+            )
+        }
+    ));
+    let _keep = handles;
+    let mut parks = 0u64;
+    while parks < u64::MAX {
+        std::thread::park();
+        parks = parks.saturating_add(1);
+    }
+    Ok(())
+}
+
 fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
-    let ep = cli.at(1, "endpoint")?;
-    let log = cli
-        .pos
-        .get(2)
-        .cloned()
-        .unwrap_or_else(|| format!("{ep}.log"));
-    cli.no_more_than(3)?;
     cli.only(
         "serve",
         &[
+            "--listen",
+            "--allow-plaintext",
+            "--host-key-file",
+            "--allow-peer-file",
             "--tcp",
             "--handshake",
             "--key-env",
             "--key-file",
+            "--at-rest-key-env",
+            "--at-rest-key-file",
+            "--anti-rollback",
+            "--anti-rollback-init",
             "--secret-env",
             "--secret-file",
             "--revocation-file",
@@ -2280,6 +3140,26 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
             "--retention-interval-ms",
         ],
     )?;
+    if !cli.listens.is_empty() {
+        return cmd_serve_multi(cli);
+    }
+    if cli.has("--allow-plaintext") {
+        return Err(AsbErr::Exit(usage_error(
+            "--allow-plaintext applies only to --listen tcp:<addr>",
+        )));
+    }
+    if cli.kv.contains_key("--host-key-file") || !cli.peer_files.is_empty() {
+        return Err(AsbErr::Exit(usage_error(
+            "--host-key-file/--allow-peer-file apply only to --listen identity:<host:port>",
+        )));
+    }
+    let ep = cli.at(1, "endpoint")?;
+    let log = cli
+        .pos
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| format!("{ep}.log"));
+    cli.no_more_than(3)?;
     let health_every = match cli.num("--health-ms")? {
         None => SERVE_HEALTH_EVERY,
         Some(0) => {
@@ -2340,6 +3220,7 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
         )));
     }
     let durability = serve_durability(cli)?;
+    let (at_rest_src, anti_rollback) = validate_serve_at_rest(cli, durability)?;
     if tcp {
         match is_loopback_endpoint(&ep) {
             Ok(true) => {}
@@ -2364,6 +3245,10 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
         Some(src) => Some(load_secret(src)?),
         None => None,
     };
+    let mut at_rest_key = match &at_rest_src {
+        Some(src) => Some(load_at_rest_key(src, KeyFile::OwnerOnly)?),
+        None => None,
+    };
     let guarded = secret.is_some();
     if matches!(transport, Transport::Unix) {
         refuse_live_socket(&ep)?;
@@ -2372,7 +3257,12 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
         refuse_live_socket(sock)?;
     }
     let created_here = !std::path::Path::new(&log).exists();
-    let broker = open_log(&log, secret, durability)?;
+    let broker_res = open_log(&log, secret, at_rest_key, anti_rollback, durability);
+    if let Some(ref mut k) = at_rest_key {
+        k.fill(0);
+        std::hint::black_box(k);
+    }
+    let broker = broker_res?;
     #[cfg(feature = "retention")]
     {
         if let Some(max_rec) = max_retained_records {
@@ -2557,9 +3447,10 @@ fn cmd_sub(cli: &Cli) -> Result<(), AsbErr> {
     let ep = cli.at(1, "endpoint")?;
     let filter = cli.at(2, "filter")?;
     cli.no_more_than(3)?;
-    cli.only_net("sub", &["--from", "--group"])?;
+    cli.only_net("sub", &["--from", "--group", "--bt"])?;
     let from = cli.num("--from")?;
     let group = cli.kv.get("--group").cloned();
+    let show_bt = cli.has("--bt");
     if group.is_some() && from.is_some() {
         return Err(AsbErr::Exit(usage_error(
             "--group resumes from the group's committed offset; it cannot be combined with --from",
@@ -2567,11 +3458,13 @@ fn cmd_sub(cli: &Cli) -> Result<(), AsbErr> {
     }
     let caps = cli.caps()?;
     let (c, _) = connect_attached(cli, &ep, &caps)?;
-    let sub = match group {
-        Some(g) => c.subscribe_group(&g, &filter)?,
-        None => c.subscribe(from.unwrap_or(0), &filter)?,
+    let sub = match (group, show_bt) {
+        (Some(g), true) => c.subscribe_group_stamped(&g, &filter)?,
+        (Some(g), false) => c.subscribe_group(&g, &filter)?,
+        (None, true) => c.subscribe_stamped(from.unwrap_or(0), &filter)?,
+        (None, false) => c.subscribe(from.unwrap_or(0), &filter)?,
     };
-    Ok(do_sub(sub)?)
+    Ok(do_sub(sub, show_bt)?)
 }
 
 // RETAINED STATE: the last record of every subject the filter matches.
@@ -2579,35 +3472,54 @@ fn cmd_last(cli: &Cli) -> Result<(), AsbErr> {
     let ep = cli.at(1, "endpoint")?;
     let filter = cli.at(2, "filter")?;
     cli.no_more_than(3)?;
-    cli.only_net("last", &["--after", "--max"])?;
+    cli.only_net("last", &["--after", "--max", "--bt"])?;
     let after = match cli.kv.get("--after") {
         Some(s) => s.as_str(),
         None => "",
     };
     let max = cli.num32("--max")?.unwrap_or(DEFAULT_PAGE);
+    let show_bt = cli.has("--bt");
     let caps = cli.caps()?;
     let (mut c, _) = connect_attached(cli, &ep, &caps)?;
-    // `last_all`, NOT `Client::last`: the latter drops the resume cursor, and a
-    // page the broker's own row/scan bounds cut short would be printed as if it
-    // were the whole answer. What that does NOT buy is one snapshot — see
-    // `last_all`: the MARK is the FIRST request's, and a subject superseded past
-    // a request's pinned head is omitted from its page.
-    let (records, next, head) = last_all(&mut c, &filter, after, max)?;
-    Ok(print_page(&records, next, head)?)
+    if show_bt {
+        let (records, next, head) = last_all_stamped(&mut c, &filter, after, max)?;
+        Ok(print_page_stamped(&records, next, head)?)
+    } else {
+        let (records, next, head) = last_all(&mut c, &filter, after, max)?;
+        Ok(print_page(&records, next, head)?)
+    }
 }
 
-// A BOUNDED READ that does not tail: page through history with --from.
+// A BOUNDED READ that does not tail: page through history with --from. It is TOLD what
+// retention gave up below it (`Client::fetch_told`; REQUIREMENTS R4, addendum A9), as `sub`
+// is: below its filter's oldest it reads the records retention still holds there, the
+// GAP line on stderr ahead of the page, where a fetch that did not ask is refused
+// `retained-from=`. A filter whose subjects have different floors (two nodes' mail) holds
+// such records; one that holds none there is still refused, and the refusal names the
+// offset to read from.
 fn cmd_fetch(cli: &Cli) -> Result<(), AsbErr> {
     let ep = cli.at(1, "endpoint")?;
     let filter = cli.at(2, "filter")?;
     cli.no_more_than(3)?;
-    cli.only_net("fetch", &["--from", "--max"])?;
+    cli.only_net("fetch", &["--from", "--max", "--bt"])?;
     let from = cli.num("--from")?.unwrap_or(0);
     let max = cli.num32("--max")?.unwrap_or(DEFAULT_PAGE);
+    let show_bt = cli.has("--bt");
     let caps = cli.caps()?;
     let (mut c, _) = connect_attached(cli, &ep, &caps)?;
-    let (records, (next, head)) = c.fetch(from, &filter, max)?;
-    Ok(print_page(&records, next, head)?)
+    if show_bt {
+        let ((records, (next, head)), gap) = c.fetch_told_stamped(from, &filter, max)?;
+        if let Some(gap) = gap {
+            warn_gap("fetch", &gap);
+        }
+        Ok(print_page_stamped(&records, next, head)?)
+    } else {
+        let ((records, (next, head)), gap) = c.fetch_told(from, &filter, max)?;
+        if let Some(gap) = gap {
+            warn_gap("fetch", &gap);
+        }
+        Ok(print_page(&records, next, head)?)
+    }
 }
 
 // A BATCH from a durable consumer group, then its commit — the shell face of
@@ -2846,7 +3758,7 @@ fn read_retain_file(path: &str) -> Result<astream_broker::Retention, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{advance_seq_file, decode_hex, print_records, sync_parent_dir_by};
+    use super::{advance_seq_file, decode_hex, format_records_into, sync_parent_dir_by};
 
     /// Removes a test's scratch directory when dropped, so the test leaves nothing
     /// behind whether it passes or panics.
@@ -3098,7 +4010,7 @@ mod tests {
             (8, "/f/F/in/n-a1/next".to_string(), b"ZZ\n\0!".to_vec()),
         ];
         let mut out = Vec::new();
-        print_records(&mut out, &records).unwrap();
+        format_records_into(&mut out, &records);
 
         // Parse exactly as the module doc tells a bridge in another language to.
         let mut rest: &[u8] = &out;

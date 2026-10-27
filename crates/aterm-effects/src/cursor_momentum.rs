@@ -262,6 +262,7 @@ impl MomentumGlow {
 
     /// When the glass next changes.
     #[must_use]
+    #[inline]
     pub fn next_change_deadline(&self, now: Instant, frame_interval: Duration) -> Option<Instant> {
         let floor = now + frame_interval;
         if self.is_active() {
@@ -309,6 +310,7 @@ impl MomentumGlow {
 
     /// One frame for the caret at `cur`: a dark page's halo into `out`, a light page's glow into
     /// `under`.
+    #[inline]
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -412,6 +414,7 @@ impl MomentumGlow {
     }
 }
 
+#[inline]
 fn emit_halo(
     (cr, cc): (u16, u16),
     a: f32,
@@ -441,29 +444,13 @@ fn emit_halo(
         let w2 = 1.0 - v2;
         let fade_y = crate::effect_util::fx_fade_y(geom, y as f32 + half_row_h);
         if w2 > 0.0 && fade_y > 0.0 {
-            const INV_HALO_SEGMENTS: f32 = 1.0 / HALO_SEGMENTS as f32;
             let half = rx * crate::color_math::sqrt_f32(w2);
-            let knot = |k: usize| {
-                let t = k as f32 * INV_HALO_SEGMENTS;
-                let dx = half * t;
-                let (rx_i, lx_i) = ((cx + dx).round() as i32, (cx - dx).round() as i32);
-                let rho2 = v2 + w2 * t * t;
-                let f = (1.0 - rho2).max(0.0);
-                let colour = halo_colour(tint, a, crate::color_math::sqrt_f32(rho2));
-                let end = |x: f32| {
-                    let fade = fade_y * crate::effect_util::fx_fade_x(geom, x);
-                    let cov = (peak * f * f * fade).round().min(HALO_PEAK_COV) as u8;
-                    (
-                        cov,
-                        (if cov == 0 { 0 } else { premul_rgb(colour, cov) }, 0u8),
-                    )
-                };
-                let ((cov_r, right), (cov_l, left)) = (end(cx + dx), end(cx - dx));
-                (rx_i, lx_i, cov_r, right, cov_l, left)
-            };
-            let mut prev = knot(0);
-            for k in 1..=HALO_SEGMENTS {
-                let next = knot(k);
+            let slice = (cx, half, v2, w2, peak, fade_y);
+            let mut prev = halo_knot(0, slice, (tint, a), geom);
+            let mut k = 1;
+            while k <= HALO_SEGMENTS {
+                let next = halo_knot(k, slice, (tint, a), geom);
+                k += 1;
                 let (r0, l1, r_in, right_in, l_in, left_in) = prev;
                 let (r1, l0, r_out, right_out, l_out, left_out) = next;
                 prev = next;
@@ -479,6 +466,43 @@ fn emit_halo(
     }
 }
 
+#[inline(always)]
+const fn halo_end(
+    geom: Geom,
+    x: f32,
+    (peak, f, fade_y): (f32, f32, f32),
+    colour: u32,
+) -> (u8, (u32, u8)) {
+    let fade = fade_y * crate::effect_util::fx_fade_x(geom, x);
+    let cov = (peak * f * f * fade).round().min(HALO_PEAK_COV) as u8;
+    (
+        cov,
+        (if cov == 0 { 0 } else { premul_rgb(colour, cov) }, 0u8),
+    )
+}
+
+#[inline(always)]
+const fn halo_knot(
+    k: usize,
+    (cx, half, v2, w2, peak, fade_y): (f32, f32, f32, f32, f32, f32),
+    (tint, a): (u32, f32),
+    geom: Geom,
+) -> (i32, i32, u8, (u32, u8), u8, (u32, u8)) {
+    const INV_HALO_SEGMENTS: f32 = 1.0 / HALO_SEGMENTS as f32;
+    let t = k as f32 * INV_HALO_SEGMENTS;
+    let dx = half * t;
+    let (rx_i, lx_i) = ((cx + dx).round() as i32, (cx - dx).round() as i32);
+    let rho2 = v2 + w2 * t * t;
+    let f = (1.0 - rho2).max(0.0);
+    let colour = halo_colour(tint, a, crate::color_math::sqrt_f32(rho2));
+    let env = (peak, f, fade_y);
+    let ((cov_r, right), (cov_l, left)) = (
+        halo_end(geom, cx + dx, env, colour),
+        halo_end(geom, cx - dx, env, colour),
+    );
+    (rx_i, lx_i, cov_r, right, cov_l, left)
+}
+
 /// How much of a fire's ember a dark page's typing halo takes ([`warm_halo`]).
 pub const MOMENTUM_FIRE_WARMTH: f32 = 0.8;
 
@@ -487,6 +511,7 @@ pub const MOMENTUM_FIRE_WARMTH: f32 = 0.8;
 pub const MOMENTUM_FIRE_EMBER: u32 = 0x00E0_4A00;
 
 /// Warm a dark page's additive halo (`quads`) toward `hue` by `share`.
+#[inline]
 pub const fn warm_halo(quads: &mut [GlowQuad], hue: u32, share: f32) {
     let share = share.clamp(0.0, 1.0);
     let hue = hue & 0x00FF_FFFF;
@@ -563,6 +588,7 @@ const fn halo_colour(tint: u32, a: f32, rho: f32) -> u32 {
 /// The vivid ink is kept only while the glow, stacked at any of its opacities on any light body
 /// of the spectrum, still leaves the theme's text [`crate::cursor_glow::BODY_CONTRAST_BAR`]; past
 /// that it is mixed back toward the walked ink, which always keeps it.
+#[inline]
 const fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> u32 {
     use crate::cursor_glow::{
         BODY_CONTRAST_BAR, LIGHT_BODY_ALPHA_CAP, light_body_ink, light_floor_at,
@@ -595,16 +621,22 @@ const fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> 
         k += 1;
     }
     #[inline]
-    const fn stacks(bodies: &[u32; 36], fg: u32, ink: u32) -> bool {
+    const fn stacks(
+        table: &crate::color_math::RelativeLuminanceTable,
+        bodies: &[u32; 36],
+        l_fg: f32,
+        ink: u32,
+    ) -> bool {
+        const BAR: f32 = BODY_CONTRAST_BAR + LIGHT_GLOW_STACK_GUARD;
         let mut i = 0;
         while i < 36 {
             let under = bodies[i];
             let mut k = 1;
             while k <= 17 {
                 let alpha = (LIGHT_GLOW_PEAK * k as f32 / 17.0).min(LIGHT_GLOW_PEAK);
-                if crate::color_math::contrast_ratio(fg, lay(under, ink, alpha))
-                    < BODY_CONTRAST_BAR + LIGHT_GLOW_STACK_GUARD
-                {
+                let l_bg =
+                    crate::color_math::relative_luminance_with(table, lay(under, ink, alpha));
+                if (l_fg.max(l_bg) + 0.05) < BAR * (l_fg.min(l_bg) + 0.05) {
                     return false;
                 }
                 k += 1;
@@ -613,7 +645,9 @@ const fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> 
         }
         true
     }
-    if stacks(&bodies, fg, vivid) {
+    let table = crate::color_math::relative_luminance_table();
+    let l_fg = crate::color_math::relative_luminance_with(table, fg);
+    if stacks(table, &bodies, l_fg, vivid) {
         return vivid;
     }
     #[inline]
@@ -630,7 +664,7 @@ const fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> 
     let mut step = 0;
     while step < 10 {
         let mid = 0.5 * (lo + hi);
-        if stacks(&bodies, fg, mix(walked, vivid, mid)) {
+        if stacks(table, &bodies, l_fg, mix(walked, vivid, mid)) {
             lo = mid;
         } else {
             hi = mid;
@@ -658,6 +692,7 @@ const fn light_glow_text_alpha(ink: u32, theme_fg: u32, theme_bg: u32) -> f32 {
 
 const LIGHT_GLOW_INK_BAR: f32 = 7.5;
 
+#[inline]
 fn emit_light_halo(
     (cr, cc): (u16, u16),
     a: f32,
@@ -677,29 +712,41 @@ fn emit_light_halo(
     let on_letters = (text_alpha / peak.max(1.0)).min(1.0);
     let ox = f32::from(geom.origin_x);
     let caret = i32::from(cc);
-    let letters = if let Some((first, end)) = cfg.glyph_span {
+    let (letters, caret_cell) = if let Some((first, end)) = cfg.glyph_span {
         let caret_cell = if cfg.block && caret >= first && caret < end {
             let c0 = ox + caret as f32 * cw;
             Some((c0, c0 + cw))
         } else {
             None
         };
-        Some((ox + first as f32 * cw, ox + end as f32 * cw, caret_cell))
+        (
+            Some((ox + first as f32 * cw, ox + end as f32 * cw)),
+            caret_cell,
+        )
     } else {
-        None
+        (None, None)
     };
-    let share = |x0: f32, x1: f32| match letters {
-        Some((l0, l1, caret_cell)) if x1 > l0 && x0 < l1 => {
-            // A sample whose reach lies inside the covered caret cell alone
-            // keeps the whole glow.
-            if matches!(caret_cell, Some((c0, c1)) if x0 >= c0 && x1 <= c1) {
-                1.0
-            } else {
-                on_letters
+    #[inline]
+    const fn light_halo_share(
+        letters: Option<(f32, f32)>,
+        caret_cell: Option<(f32, f32)>,
+        on_letters: f32,
+        x0: f32,
+        x1: f32,
+    ) -> f32 {
+        match letters {
+            Some((l0, l1)) if x1 > l0 && x0 < l1 => {
+                // A sample whose reach lies inside the covered caret cell alone
+                // keeps the whole glow.
+                if matches!(caret_cell, Some((c0, c1)) if x0 >= c0 && x1 <= c1) {
+                    1.0
+                } else {
+                    on_letters
+                }
             }
+            _ => 1.0,
         }
-        _ => 1.0,
-    };
+    }
     push_ink_ellipse_shaped(
         under,
         geom,
@@ -709,7 +756,7 @@ fn emit_light_halo(
         ink,
         peak,
         budget,
-        share,
+        |x0, x1| light_halo_share(letters, caret_cell, on_letters, x0, x1),
     );
 }
 

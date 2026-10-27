@@ -10,7 +10,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::support::*;
-use aterm_dbus::conn::HANDSHAKE_TIMEOUT;
 use aterm_dbus::{Connection, Error, Message, Value};
 use aterm_uds::CtlStream;
 
@@ -279,15 +278,20 @@ fn listening(
 #[test]
 fn open_within_gives_up_on_a_bus_that_never_answers() {
     let scratch = aterm_tempfile::tempdir().unwrap();
+    // The join's own bound, not the handshake default's: with none of it left the join gives up
+    // before it connects, where the default would have found no bus there.
+    let unbound = scratch.path().join("unbound");
+    let nowhere = aterm_dbus::address::parse(&format!("unix:path={}", unbound.display())).unwrap();
+    let spent = Connection::open_within(&nowhere, Duration::ZERO);
+    assert!(matches!(spent, Err(Error::Timeout)), "{:?}", spent.err());
     let (_silent, addresses) = listening(scratch.path(), "silent");
     let asked = Instant::now();
     let joined = Connection::open_within(&addresses, Duration::from_millis(100));
     let waited = asked.elapsed();
     assert!(matches!(joined, Err(Error::Timeout)), "{:?}", joined.err());
     assert!(
-        waited < HANDSHAKE_TIMEOUT,
-        "the join gave up after {waited:?}, the default's {HANDSHAKE_TIMEOUT:?}, not the 100 ms \
-         it was given"
+        waited < HANG,
+        "the join to a silent bus never gave up: {waited:?}"
     );
 
     let (listener, addresses) = listening(scratch.path(), "answering");

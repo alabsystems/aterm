@@ -93,6 +93,7 @@ pub(super) const fn light_ink_bold(rgb: u32) -> u32 {
     }
     let span = hi - lo;
     let inv_span = if span <= 1e-3 { 0.0 } else { 1.0 / span };
+    #[inline]
     const fn pure(c: f32, lo: f32, inv_span: f32) -> f32 {
         if inv_span == 0.0 {
             1.0
@@ -115,6 +116,7 @@ pub(super) const fn light_ink_bold(rgb: u32) -> u32 {
         (ONE_MINUS_YT_OVER_VMAX / (1.0 - y0)).clamp(0.0, 1.0)
     };
     let v = (YT / (1.0 - s + s * y0)).min(VMAX);
+    #[inline]
     const fn ch(v: f32, s: f32, c: f32) -> u32 {
         ((255.0 * v * (1.0 - s + s * c)) + 0.5).clamp(0.0, 255.0) as u32
     }
@@ -137,6 +139,7 @@ pub(super) const fn light_ink(rgb: u32) -> u32 {
     if k >= 1.0 {
         return rgb;
     }
+    #[inline]
     const fn ch(rgb: u32, k: f32, sh: u32) -> u32 {
         ((((rgb >> sh) & 0xff) as f32 * k) + 0.5) as u32
     }
@@ -1077,8 +1080,8 @@ pub(crate) enum CrescentInk {
 }
 
 /// The reference dark page a light's reading on a tinted page is matched to
-/// ([`page_matched`]).
-const REF_DARK_PAGE: u32 = 0x0011_1318;
+/// ([`page_matched`], [`push_night_ground`]).
+pub(crate) const REF_DARK_PAGE: u32 = 0x0011_1318;
 
 /// The tint (its brightest channel over its darkest) from which a dark page
 /// shifts the hue of a light added to it: a light laid there reads as it

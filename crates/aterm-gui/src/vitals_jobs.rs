@@ -404,7 +404,8 @@ impl JobsBoard {
     /// live agent call of the session's tab ([`background_call_live`]) that reads `no_progress`,
     /// each regardless of the others (unlike [`Self::evidence`]), worst (quiet longest) first, with
     /// its leader's pid for the caller's re-proof, and the view's age; `None` with no view or one
-    /// older than [`JOBS_FRESH`]. Only the copy of the rows runs under the lock.
+    /// older than [`JOBS_FRESH`]. A wrapper with observed work in a descendant call is omitted.
+    /// Only the copy of the rows runs under the lock.
     pub(crate) fn facts(
         &self,
         sid: &str,
@@ -420,7 +421,9 @@ impl JobsBoard {
                 .rows
                 .iter()
                 .filter(|r| posted.sids.get(&r.tab).is_some_and(|s| s == sid))
-                .filter(|r| background_call_live(r) && r.no_progress)
+                .filter(|r| {
+                    background_call_live(r) && r.no_progress && r.working_descendant.is_none()
+                })
                 .map(|r| (r.quiet_ms.unwrap_or(0), r.leader.0, background_call(r)))
                 .collect();
             (now.saturating_duration_since(posted.at), calls)
@@ -1222,6 +1225,43 @@ pub(crate) mod tests {
             board.evidence("s-hung", late),
             BackgroundEvidence::Unknown,
             "a live call that is not at no progress"
+        );
+    }
+
+    #[test]
+    fn a_working_descendant_qualifies_only_its_wrappers_per_call_alert() {
+        let board = JobsBoard::new();
+        let now = Instant::now();
+        let mut wrapper = call_row(4, Consumer::Agent, true, 35, 400, "observer");
+        wrapper.working_descendant = Some((402, 99));
+        let controller = call_row(4, Consumer::Agent, true, 34, 401, "controller");
+        let active = call_row(4, Consumer::Agent, false, 1, 402, "trustc");
+        let unrelated = call_row(9, Consumer::Agent, true, 50, 900, "other-tab");
+        let post = |rows| {
+            board.post(
+                Arc::new(JobsView {
+                    rows,
+                    ..JobsView::default()
+                }),
+                BTreeMap::from([(4, "ours".into()), (9, "other".into())]),
+                now,
+            )
+        };
+        post(vec![
+            wrapper.clone(),
+            controller.clone(),
+            active.clone(),
+            unrelated,
+        ]);
+        assert_eq!(board.evidence("ours", now), BackgroundEvidence::Unknown);
+        let (_, facts) = board.facts("ours", now).expect("fresh");
+        assert_eq!(facts.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(), [401]);
+        wrapper.working_descendant = None;
+        post(vec![wrapper, controller, active]);
+        let (_, facts) = board.facts("ours", now).expect("fresh");
+        assert_eq!(
+            facts.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(),
+            [400, 401]
         );
     }
 

@@ -44,8 +44,14 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
         return Err("aterm init Rust toolchain settings require exactly one local user".into());
     };
     let home = Path::new(&user.home);
+    // This process's `CARGO_HOME`, `RUSTUP_HOME` and `XDG_CONFIG_HOME` are the user's only where
+    // the process runs as that user's login (its `HOME` is theirs): another account's (root's,
+    // for a user init set up) name its own folders, and a test's user is no login of the test
+    // process's (the Linux lane's guest exports its own `CARGO_HOME`).
+    let own = std::env::var_os("HOME").is_some_and(|own| Path::new(&own) == home);
     let set = |name: &str| {
-        std::env::var_os(name)
+        own.then(|| std::env::var_os(name))
+            .flatten()
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
     };
@@ -85,6 +91,13 @@ pub(crate) fn rust_docs_item(ctx: &Ctx) -> Result<Box<dyn Item>, String> {
 /// long instead of each searching the home folder again. Check again searches anew
 /// ([`search_again`]).
 const INVENTORY_AGE: u64 = 5 * 60;
+
+/// What the build cache's `.ubd` folder keeps from macOS's fseventsd: every file event under it
+/// (`aterm_tempfile::QUIET`), which fseventsd otherwise parses, hands to each whole-volume
+/// watcher and keeps in its history. Observed on macOS 27.0, documented nowhere: a macOS that
+/// stops honouring the name loses only that benefit.
+const QUIET_LINE: &str = "cargo-build.noindex sits in .ubd, whose file events fseventsd drops \
+                          before it delivers or keeps them (observed on macOS 27.0)";
 
 /// The Spotlight query for build folders: the `CACHEDIR.TAG` cargo writes at the top of
 /// each build folder, so the answer is a line per build folder (and per other tool's cache
@@ -201,7 +214,8 @@ struct BuildNoindex {
     home: PathBuf,
     /// atpkg's prefix ([`aterm_toolchain::atpkg_prefix`]): its store and rustup views.
     pkg: PathBuf,
-    /// The cargo home this process's environment names (`CARGO_HOME`, else `~/.cargo`),
+    /// The cargo home this process's environment names where it is the user's own login
+    /// (`CARGO_HOME`, else `~/.cargo`),
     /// whose download caches (`registry`, `git`) carry the same cache tag as a build
     /// folder and are none. An app launched from the Dock has launchd's environment, never
     /// the `CARGO_HOME` a shell's startup file sets, so a cargo home is also recognised by
@@ -229,8 +243,11 @@ impl BuildNoindex {
         self.home.join("Library/Caches")
     }
 
+    /// The shared build cache's root ([`aterm_toolchain::build_cache::CACHE_UNDER_HOME`]):
+    /// `.noindex` for Spotlight, in a `.ubd` folder for fseventsd ([`QUIET_LINE`]).
     fn cargo_build_noindex(&self) -> PathBuf {
-        self.home.join("Library/Caches/aterm/cargo-build.noindex")
+        self.home
+            .join(aterm_toolchain::build_cache::CACHE_UNDER_HOME)
     }
 
     fn tooling_noindex(&self) -> PathBuf {
@@ -468,7 +485,9 @@ impl Item for BuildNoindex {
     }
 
     fn title(&self) -> String {
-        "Rust build caches and Trust toolchain sysroots stay in .noindex folders".into()
+        "Rust build caches and Trust toolchain sysroots stay in .noindex folders, the build \
+         cache in a .ubd folder fseventsd drops"
+            .into()
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
@@ -514,6 +533,7 @@ impl Item for BuildNoindex {
                 "cargo-build.noindex and tooling.noindex are .noindex"
             }
             .to_owned();
+            now.push_str(&format!("; {QUIET_LINE}"));
             if !noted.is_empty() {
                 self.reading.set(Some(Reading::KeptOut {
                     projects,
@@ -535,7 +555,7 @@ impl Item for BuildNoindex {
         from.extend(noted);
         Probe::Change {
             from: from.join("; "),
-            to: "cargo-build.noindex and tooling.noindex".to_owned(),
+            to: "cargo-build.noindex in .ubd, and tooling.noindex".to_owned(),
         }
     }
 
@@ -1056,7 +1076,7 @@ mod tests {
     /// with what Spotlight's search for them answers.
     fn with_build_folders(found: &[&str]) -> (Fake, Ran) {
         let sys = Fake::root();
-        for name in ["cargo-build.noindex", "tooling.noindex"] {
+        for name in [".ubd/cargo-build.noindex", "tooling.noindex"] {
             sys.create_dir_all(
                 &Path::new("/Users//alice/Library/Caches/aterm").join(name),
                 0o755,
@@ -1088,7 +1108,7 @@ mod tests {
         sys.create_dir_all(Path::new("/Users//alice/Library/Caches"), 0o755)
             .unwrap();
         if made {
-            for name in ["cargo-build.noindex", "tooling.noindex"] {
+            for name in [".ubd/cargo-build.noindex", "tooling.noindex"] {
                 sys.create_dir_all(
                     &Path::new("/Users//alice/Library/Caches/aterm").join(name),
                     0o755,
@@ -1167,7 +1187,7 @@ mod tests {
         );
         assert_eq!(
             planned[0].to.as_deref(),
-            Some("cargo-build.noindex and tooling.noindex"),
+            Some("cargo-build.noindex in .ubd, and tooling.noindex"),
             "the plan promises only what apply makes"
         );
         let rows = engine::run(&items, Mode::Apply, &sys, &context(), &mut NoJournal);
@@ -1180,7 +1200,7 @@ mod tests {
         moved_nothing(&sys);
         assert!(
             sys.stat(Path::new(
-                "/Users//alice/Library/Caches/aterm/cargo-build.noindex"
+                "/Users//alice/Library/Caches/aterm/.ubd/cargo-build.noindex"
             ))
             .is_ok_and(|s| s.dir)
         );
@@ -1329,7 +1349,7 @@ mod tests {
             assert!(
                 unread
                     .stat(Path::new(
-                        "/Users//alice/Library/Caches/aterm/cargo-build.noindex"
+                        "/Users//alice/Library/Caches/aterm/.ubd/cargo-build.noindex"
                     ))
                     .is_ok_and(|s| s.dir)
             );
@@ -1365,7 +1385,7 @@ mod tests {
             n += 1;
         }
         let mut over = Fake::root();
-        for name in ["cargo-build.noindex", "tooling.noindex"] {
+        for name in [".ubd/cargo-build.noindex", "tooling.noindex"] {
             over.create_dir_all(
                 &Path::new("/Users//alice/Library/Caches/aterm").join(name),
                 0o755,
@@ -1627,7 +1647,10 @@ mod tests {
         pkg.aside("rustup/trust");
         let (row, line) = read(&pkg);
         assert_eq!(row.note, None, "{row:?}");
-        assert_eq!(line, "cargo-build.noindex and tooling.noindex are .noindex");
+        assert_eq!(
+            line,
+            format!("cargo-build.noindex and tooling.noindex are .noindex; {QUIET_LINE}")
+        );
 
         // Nothing plain: kept out, no note.
         std::fs::remove_dir_all(pkg.path().join("store/trust/15600")).unwrap();
@@ -1635,7 +1658,10 @@ mod tests {
         assert_eq!(row.note, None, "{row:?}");
         assert_eq!(
             line,
-            "cargo-build.noindex, tooling.noindex, and the Trust toolchain are .noindex"
+            format!(
+                "cargo-build.noindex, tooling.noindex, and the Trust toolchain are .noindex; \
+                 {QUIET_LINE}"
+            )
         );
     }
 

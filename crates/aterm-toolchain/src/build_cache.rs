@@ -6,8 +6,17 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// The cache root, relative to `$HOME`.
-pub const CACHE_UNDER_HOME: &str = "Library/Caches/aterm/cargo-build.noindex";
+/// The cache root, relative to `$HOME`. Its `*.noindex` name keeps Spotlight out, and the `.ubd`
+/// folder above it (`aterm_tempfile::QUIET`) keeps its file events from fseventsd's clients and
+/// history: a build writes thousands of files here (8,090 file events for one 38-package build,
+/// none under `.ubd`; `docs/measured/fseventsd-ubd-2026-10-26.md`).
+pub const CACHE_UNDER_HOME: &str = "Library/Caches/aterm/.ubd/cargo-build.noindex";
+
+/// Where the cache root was until it moved under `.ubd` (2026-10-26), relative to `$HOME`. No
+/// build of this version writes there. atpkg's trimmer takes what is left: each build directory
+/// whole once no build holds its locks and nothing wrote it for an hour, then the emptied root
+/// (`atpkg::build_cache::MOVED_AFTER`).
+pub const MOVED_FROM_UNDER_HOME: &str = "Library/Caches/aterm/cargo-build.noindex";
 
 /// The last component of every workspace's build directory under the cache.
 pub const LEAF: &str = ".cargo-build";
@@ -30,10 +39,56 @@ pub const BUILD_VERBS: &[&str] = &[
     "clippy", "tippy", "fix", "clean",
 ];
 
-/// `$HOME/Library/Caches/aterm/cargo-build.noindex`.
+/// `$HOME/Library/Caches/aterm/.ubd/cargo-build.noindex` ([`CACHE_UNDER_HOME`]).
 #[must_use]
 pub fn cache_root(home: &Path) -> PathBuf {
     home.join(CACHE_UNDER_HOME)
+}
+
+/// `$HOME/Library/Caches/aterm/cargo-build.noindex`, the root no build writes any more
+/// ([`MOVED_FROM_UNDER_HOME`]).
+#[must_use]
+pub fn moved_from(home: &Path) -> PathBuf {
+    home.join(MOVED_FROM_UNDER_HOME)
+}
+
+/// The line of an atpkg `targo` shim that names its cache root under `$HOME`.
+const SHIM_ROOT_LINE: &str = "__atb_c=${HOME-}/";
+
+/// The cache root an atpkg `targo` shim whose text is `shim` builds in, for `home`: the one its
+/// `__atb_c=${HOME-}/…` line names where that is [`CACHE_UNDER_HOME`] or the root before the
+/// move ([`MOVED_FROM_UNDER_HOME`]); `None` for any other text (no shim, or one naming neither).
+#[must_use]
+pub fn root_named_by_shim(home: &Path, shim: &str) -> Option<PathBuf> {
+    let named = shim
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(SHIM_ROOT_LINE))?;
+    [CACHE_UNDER_HOME, MOVED_FROM_UNDER_HOME]
+        .into_iter()
+        .find(|under| *under == named)
+        .map(|under| home.join(under))
+}
+
+/// The cache root plain `targo` builds in now: the one the first `targo` on `path` names when it
+/// is an atpkg shim ([`root_named_by_shim`]), else [`cache_root`]. A shim laid before the cache
+/// moved under `.ubd` still names [`moved_from`] until an update of aterm lays the new one; a
+/// build of this version that shares plain `targo`'s cache (verify's main lane, a lab's nested
+/// build) follows it there, so the two never keep a copy each of one checkout's build.
+#[must_use]
+pub fn shim_root(home: &Path, path: &std::ffi::OsStr) -> PathBuf {
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("targo"))
+        .find(|shim| shim.is_file())
+        .and_then(|shim| {
+            use std::io::Read as _;
+            let mut head = Vec::new();
+            std::fs::File::open(shim)
+                .and_then(|f| f.take(64 << 10).read_to_end(&mut head))
+                .ok()?;
+            root_named_by_shim(home, std::str::from_utf8(&head).ok()?)
+        })
+        .unwrap_or_else(|| cache_root(home))
 }
 
 /// The build directory Cargo resolves for the workspace at `workspace` (absolute).
@@ -72,6 +127,9 @@ pub enum Tool {
 pub struct Machine<'a> {
     /// `$HOME`.
     pub home: Option<&'a Path>,
+    /// The cache root, where the caller follows plain `targo`'s ([`shim_root`]); `None` is
+    /// [`cache_root`] of [`Self::home`], the one this version's shim names.
+    pub root: Option<&'a Path>,
     /// The working directory, as the kernel names it (no symlinks).
     pub cwd: Option<&'a Path>,
     /// One environment variable.
@@ -129,7 +187,7 @@ pub fn decide(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<BuildDir> 
         .home
         .filter(|h| h.is_absolute() && !h.as_os_str().as_encoded_bytes().ends_with(b"/"))?;
     let cwd = m.cwd?;
-    let root = cache_root(home);
+    let root = m.root.map_or_else(|| cache_root(home), Path::to_path_buf);
     let cache = config_value(&root)?;
     if !cwd.starts_with(home) || cwd == home || cwd.starts_with(&root) || has_brace(cwd) {
         return None;
@@ -472,6 +530,55 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    /// The shared cache sits in a quiet folder fseventsd drops, still named `*.noindex`, and so
+    /// does every build directory under it. NEGATIVE CONTROL: the root it moved from, the same
+    /// name without the folder, is no quiet place.
+    #[test]
+    fn the_cache_root_is_quiet_and_noindex() {
+        let home = Path::new("/Users//u");
+        let root = cache_root(home);
+        assert!(aterm_tempfile::is_quiet(&root), "{root:?}");
+        assert!(in_noindex(&root), "{root:?}");
+        assert_eq!(
+            root.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new(aterm_tempfile::QUIET))
+        );
+        let leaf = build_dir(&root, Path::new("/Users//u/Developer/aterm"));
+        assert!(
+            leaf.to_str().is_some_and(|p| p.contains("/.ubd/")),
+            "{leaf:?}"
+        );
+        let old = moved_from(home);
+        assert!(!aterm_tempfile::is_quiet(&old), "{old:?}");
+        assert_eq!(old.file_name(), root.file_name());
+        assert_ne!(old, root);
+    }
+
+    /// A shim's `__atb_c` line names the root it builds in: this version's quiet one, or the
+    /// one before the move. NEGATIVE CONTROL: any other root, no such line, and no shim on the
+    /// path leave the quiet root.
+    #[test]
+    fn the_root_plain_targo_builds_in_is_the_one_its_shim_names() {
+        let home = Path::new("/Users//u");
+        let shim = |under: &str| {
+            format!("#!/bin/sh\n# atpkg shim\n__atb_t=\n__atb_c=${{HOME-}}/{under}\n")
+        };
+        assert_eq!(
+            root_named_by_shim(home, &shim(MOVED_FROM_UNDER_HOME)),
+            Some(moved_from(home))
+        );
+        assert_eq!(
+            root_named_by_shim(home, &shim(CACHE_UNDER_HOME)),
+            Some(cache_root(home))
+        );
+        assert_eq!(root_named_by_shim(home, &shim("Library/elsewhere")), None);
+        assert_eq!(
+            root_named_by_shim(home, "#!/bin/sh\nexec targo \"$@\"\n"),
+            None
+        );
+        assert_eq!(shim_root(home, std::ffi::OsStr::new("")), cache_root(home));
+    }
+
     #[test]
     fn only_what_cargo_run_says_about_its_child_is_dropped() {
         for name in [
@@ -537,6 +644,7 @@ mod tests {
         let home = native("/h");
         let m = Machine {
             home: Some(Path::new(&home)),
+            root: None,
             cwd: cwd.as_deref().map(Path::new),
             env: &lookup,
             read: &read,

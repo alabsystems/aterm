@@ -21,6 +21,9 @@ mod ctl_accept;
 #[cfg(unix)]
 #[path = "support/headless_boot.rs"]
 mod headless_boot;
+#[cfg(target_os = "macos")]
+#[path = "support/keeper_world.rs"]
+mod keeper_world;
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 #[cfg(unix)]
@@ -66,7 +69,9 @@ mod keeper_restore_live_headless;
 mod lifeline_live_headless;
 #[cfg(unix)]
 mod messages_live_headless;
-#[cfg(unix)]
+// The kernel's proof of a peer reads `kproc`, which only macOS has: elsewhere every peer is
+// refused `not in this session's tree`.
+#[cfg(target_os = "macos")]
 mod occupancy_wakes_live_headless;
 #[cfg(unix)]
 mod person_seam_live_headless;
@@ -83,6 +88,8 @@ mod restore_take_live_headless;
 mod retired_hook_shape;
 #[cfg(unix)]
 mod rewind_live_headless;
+#[cfg(unix)]
+mod rewind_pane_live_headless;
 #[cfg(unix)]
 mod selector_live_headless;
 #[cfg(unix)]

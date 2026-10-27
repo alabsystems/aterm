@@ -2,7 +2,9 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Route-wall Tier-1 conformance tests for `Router::decide` and `hop::rebuild` (`AghRouteWall`).
+//! Route-wall Tier-1 conformance tests for `Router::decide` and `hop::rebuild` (`AghRouteWall`),
+//! over the canonical agh.toml (`Vault = 0`) and over the rows vault adoption derives with no
+//! agh.toml (`Vault = 1`, design §6.10).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -13,7 +15,8 @@ use aterm_spec::interp::{self, State};
 use aterm_spec::xref::{self, StepEvidence};
 
 use super::*;
-use crate::config::{self, Dirs, OwnerRule};
+use crate::config::{self, Dirs, OwnerRule, Validated};
+use crate::identity::vault::{self, Slot};
 use crate::identity::{self, Credential, MapEnv};
 use crate::wire::door::AuthHeader;
 use crate::wire::hop;
@@ -149,6 +152,43 @@ fn world(dev: bool, rel: bool) -> World {
     }
 }
 
+/// The router a call with no agh.toml builds (`vault::view`, as `vault::adopt` does once each
+/// login is recorded): the vault's dev token (login `fixture-dev`, so the dev owner is the
+/// model's tier 0) when `dev`, its release token when `rel`, and a record holding both logins,
+/// as a machine whose tokens were adopted before has.
+fn vault_world(dev: bool, rel: bool) -> World {
+    let root = aterm_tempfile::Builder::new()
+        .prefix("agh-wall-vault-")
+        .tempdir()
+        .expect("a scratch root");
+    let dirs = Dirs::under(root.path());
+    std::fs::create_dir_all(&dirs.home).expect("the home");
+    aterm_uds::private_file::create_private_dir(&dirs.home.join(".secrets"))
+        .expect("the vault directory");
+    let tokens = [
+        (Slot::Dev, "dev", "fixture-dev", dev),
+        (Slot::Release, "release", "fixture-release-bot", rel),
+    ];
+    let mut learned = Vec::new();
+    for (slot, seed, login, present) in tokens {
+        let token = agh_fake::token(seed);
+        if present {
+            setup_file(&slot.path(&dirs.home), format!("{token}\n").as_bytes());
+        }
+        learned.push((slot, identity::fingerprint(token.as_bytes()), login));
+    }
+    let rows: Vec<(Slot, &str, &str)> = learned
+        .iter()
+        .map(|(slot, fingerprint, login)| (*slot, fingerprint.as_str(), *login))
+        .collect();
+    vault::record_for_tests(&dirs, &rows).expect("the record");
+    let adoption = vault::view(&dirs, &MapEnv::new()).expect("no agh.toml: the vault adopts");
+    World {
+        _root: root,
+        router: adoption.router().expect("the adopted rows validate"),
+    }
+}
+
 fn env(amb: bool) -> MapEnv {
     if amb {
         MapEnv::new().with("GH_TOKEN", &agh_fake::token("ambient"))
@@ -223,9 +263,22 @@ fn key(state: &State) -> Key {
 
 #[test]
 fn the_real_router_and_hop_conform_to_the_route_wall() {
+    conform(&agh_route_wall_model(), world);
+}
+
+/// The same wall over vault adoption's rows: no route path of adoption's sends what the laws
+/// forbid, and every mutant's step differs from the adopted router's.
+#[test]
+fn the_adopted_router_conforms_to_the_route_wall() {
+    let model = interp::with_consts(&agh_route_wall_model(), &[("Vault", 1)]);
+    conform(&model, vault_world);
+}
+
+/// `model`'s Decide against `Router::decide` over each world `world` builds, its Hop against
+/// `hop::rebuild`, and its mutants against both.
+fn conform(model: &Model, world: fn(bool, bool) -> World) {
     std::hint::black_box(crate::policy::route_wall_environment as fn());
-    let model = agh_route_wall_model();
-    let states = interp::reachable_states(&model);
+    let states = interp::reachable_states(model);
     let mut ev = StepEvidence::new(MACHINE);
 
     let mut real: BTreeMap<Key, (i64, i64)> = BTreeMap::new();
@@ -234,7 +287,7 @@ fn the_real_router_and_hop_conform_to_the_route_wall() {
         let (dev, rel) = (var(state, "dev") == 1, var(state, "rel") == 1);
         let world = world(dev, rel);
         let amb = env(var(state, "amb") == 1);
-        let expected = successor(&model, state, "Decide").expect("Decide fires in phase 0");
+        let expected = successor(model, state, "Decide").expect("Decide fires in phase 0");
         let mut projected = BTreeSet::new();
         for named in namings(state) {
             let req = request(state, named);
@@ -267,7 +320,7 @@ fn the_real_router_and_hop_conform_to_the_route_wall() {
         .expect("a header for the api origin");
     for state in states.iter().filter(|s| var(s, "phase") > 0) {
         let auth = (var(state, "phase") == 1).then_some(&header);
-        match successor(&model, state, "Hop") {
+        match successor(model, state, "Hop") {
             Some(next) => {
                 let req = get(&endpoints, auth);
                 assert_eq!(hop::project_hop(&req).1, i64::from(auth.is_some()));
@@ -294,7 +347,7 @@ fn the_real_router_and_hop_conform_to_the_route_wall() {
         }
     }
 
-    let buggy = interp::with_buggy(&model, 1);
+    let buggy = interp::with_buggy(model, 1);
     for state in &states {
         for (mutant, law) in MUTANTS {
             for wrong in buggy.successors(mutant, state) {
@@ -372,11 +425,15 @@ fn the_real_router_and_hop_conform_to_the_route_wall() {
 }
 
 fn forged_floor(world: &World) -> Router {
-    let mut validated = world
-        .router
-        .validated
-        .clone()
-        .expect("the world's router has a config");
+    let mut validated = world.router.validated.clone().unwrap_or_else(|| Validated {
+        profiles: BTreeMap::new(),
+        owners: BTreeMap::new(),
+        default_read: vec![ChainStep::Anonymous],
+        targets: BTreeMap::new(),
+        vault: false,
+        origin: config::ConfigOrigin::Text,
+        writers: Vec::new(),
+    });
     validated.owners.insert(
         "alabsystems".to_string(),
         OwnerRule {

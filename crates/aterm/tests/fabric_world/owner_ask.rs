@@ -136,8 +136,12 @@ impl Inst {
         }
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-                .expect("chmod 700");
+            // The state root as the deployment makes it (0700), whatever the umask: Ubuntu's 002
+            // leaves a made folder group-writable.
+            for dir in [root.clone(), root.join("astate")] {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod 700");
+            }
         }
         std::fs::write(root.join("link/node"), format!("{node}\n")).expect("the node id");
         let cap = root.join("node.cap");
@@ -1240,8 +1244,15 @@ fn the_journal_across_a_quit_and_a_kill() {
 
     let dir = a.root.join("astate/logs/session-log");
     assert_eq!(mode_of(&dir), 0o700, "{}", dir.display());
-    let files = journals(&a);
-    assert!(!files.is_empty(), "no journal under {}", dir.display());
+    // The journal's writer coalesces on its own thread, so the node log's `close=turn` can come
+    // before the segment holding the command lands: wait for it (a hang detector).
+    let files = until("a journal holding the shell's command", || {
+        let files = journals(&a);
+        files
+            .iter()
+            .any(|(_, b)| holds(b, "detail=echo"))
+            .then_some(files)
+    });
     for (path, bytes) in &files {
         assert_eq!(mode_of(path), 0o600, "{}", path.display());
         assert!(
@@ -1250,10 +1261,6 @@ fn the_journal_across_a_quit_and_a_kill() {
             path.display()
         );
     }
-    assert!(
-        files.iter().any(|(_, b)| holds(b, "detail=echo")),
-        "the command's first word is kept"
-    );
     let old = cursor(&a, &shell);
     // The relaunch judges this run by its ledger row, which its census lands before the amend.
     until("the first launch's start amended prev_end=none", || {
@@ -2314,8 +2321,8 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
             "CONTROL: the restore store at rest {store:?} holds {n}: {held:?}"
         );
     }
-    // The folder is the state root, which this harness makes (macOS's default deployment hardens
-    // it to 0700 as the per-user control socket directory, `aterm_uds::control_socket_dir`; a
+    // The folder is the state root, which this harness makes 0700 as macOS's default deployment
+    // hardens it (the per-user control socket directory, `aterm_uds::control_socket_dir`; a
     // private `--control-sock` leaves it as made): no one else may write it, and the instance
     // root above it is 0700.
     assert_eq!(mode_of(&state) & 0o022, 0, "{}", state.display());

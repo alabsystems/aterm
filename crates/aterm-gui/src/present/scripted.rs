@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only scripted CPU presenter for headless redraw and retained-buffer tests.
+//! Scripted CPU presenter for headless redraw and retained-buffer tests, and for the live present
+//! `lab trail-diff`'s dump draws a headless window through (`crate::trail_rig`).
 
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -48,6 +49,7 @@ pub(crate) struct ScriptedPresenter {
 
 impl ScriptedPresenter {
     /// Queue the outcome of the next present that reaches this surface.
+    #[cfg(test)]
     pub(crate) fn fail_next(&mut self, outcome: ScriptedOutcome) {
         self.script.push_back(outcome);
     }
@@ -68,6 +70,7 @@ impl ScriptedPresenter {
     }
 
     /// Fill `rows` on glass with white and mark the surface as owing a repaint.
+    #[cfg(test)]
     pub(crate) fn owe_repaint(&mut self, rows: std::ops::Range<usize>) {
         for row in rows {
             let at = row * self.width;
@@ -79,7 +82,7 @@ impl ScriptedPresenter {
     }
 
     /// Clear glass and retained buffer without raising `owed`.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn lose_glass(&mut self) {
         self.glass.fill(0);
         self.back.fill(0);
@@ -95,6 +98,9 @@ impl std::fmt::Display for ScriptedError {
         f.write_str("scripted present failure")
     }
 }
+
+/// The glass a present left on a scripted surface: its size and its `0x00RRGGBB` pixels.
+pub(crate) type Glass = ((usize, usize), Vec<u32>);
 
 /// The test build's CPU surface: the platform presenter or a scripted one.
 pub(crate) enum TestCpuSurface {
@@ -112,6 +118,7 @@ impl TestCpuSurface {
     }
 
     /// Mutable twin of [`Self::scripted`].
+    #[cfg(test)]
     pub(crate) fn scripted_mut(&mut self) -> Option<&mut ScriptedPresenter> {
         match self {
             Self::Scripted(s) => Some(s),

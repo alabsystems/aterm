@@ -13,6 +13,9 @@ use aterm_update_core::linux::{LINUX_BINARY_MAX_BYTES, LinuxTarget};
 use aterm_update_core::{Manifest, sha256_file};
 use serde::{Deserialize, Serialize};
 
+#[path = "pin_release.rs"]
+pub mod from_release;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
     pub schema: u32,
@@ -33,9 +36,11 @@ pub struct Artifact {
 
 /// The static bootstrap verifier a worker built beside the executable
 /// (crates/aterm-bootstrap-verify): the release asset install.sh fetches and holds to the
-/// SHA-256 it pins ([`pin::Pin`]). No signature covers it and the appcast never names it:
-/// install.sh's pin is its trust anchor, so a release without one changes nothing but
-/// leaving install.sh on its embedded verifier for that architecture. It is built by
+/// SHA-256 it pins ([`pin::Pin`]). install.sh's pin is its trust anchor at install time, so a
+/// release without one changes nothing but leaving install.sh on its embedded verifier for
+/// that architecture. The signed appcast carries its name, digest and size
+/// ([`Handoff::stamp`]), which no client reads: they are what binds the pin to the release
+/// signer when it is read back from the public release ([`from_release`]). It is built by
 /// upstream stable, static (the STOCK EXCEPTION, `buildplan::build_static`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifierArtifact {
@@ -119,35 +124,140 @@ impl VerifierArtifact {
     /// The file at `path` is the receipt's: a regular file of its size, this
     /// architecture's static ELF, of its SHA-256.
     pub fn verify_file(&self, path: &Path) -> Result<(), String> {
-        let metadata =
-            fs::symlink_metadata(path).map_err(|e| format!("inspect {}: {e}", path.display()))?;
-        if !metadata.file_type().is_file() || metadata.len() != self.size {
-            return Err(format!(
-                "Linux bootstrap verifier is not a regular file of the claimed size: {}",
-                path.display()
-            ));
+        static_verifier_file(path, target(&self.target)?, self.size, &self.sha256)
+    }
+}
+
+/// The file at `path` is `target`'s static bootstrap verifier of `size` bytes and SHA-256
+/// `sha256`: a regular file of that size, that architecture's ELF naming no program
+/// interpreter, of that digest.
+///
+/// # Errors
+/// Any of those that it is not, or a file it cannot inspect or read.
+pub fn static_verifier_file(
+    path: &Path,
+    target: LinuxTarget,
+    size: u64,
+    sha256: &str,
+) -> Result<(), String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|e| format!("inspect {}: {e}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() != size {
+        return Err(format!(
+            "Linux bootstrap verifier is not a regular file of the claimed size: {}",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(pin::MAX_ASSET + 1).read_to_end(&mut bytes))
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    target.validate_elf_header(bytes.get(..64).unwrap_or(&bytes))?;
+    if !names_no_interpreter(&bytes) {
+        return Err(format!(
+            "Linux bootstrap verifier is not a static executable (it names a program \
+             interpreter): {}",
+            path.display()
+        ));
+    }
+    let mut digest = aterm_digest::Sha256::new();
+    digest.update(&bytes);
+    if aterm_codec::hex::encode_lower(&digest.finalize()) != sha256 {
+        return Err(format!(
+            "Linux bootstrap verifier hash changed: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The verifier fields of `manifest` for `target`: name, SHA-256, size.
+fn verifier_fields(
+    manifest: &Manifest,
+    target: LinuxTarget,
+) -> (Option<&str>, Option<&str>, Option<u64>) {
+    match target {
+        LinuxTarget::X86_64 => (
+            manifest.linux_verifier_x86_64.as_deref(),
+            manifest.linux_verifier_x86_64_sha256.as_deref(),
+            manifest.linux_verifier_x86_64_size,
+        ),
+        LinuxTarget::Aarch64 => (
+            manifest.linux_verifier_aarch64.as_deref(),
+            manifest.linux_verifier_aarch64_sha256.as_deref(),
+            manifest.linux_verifier_aarch64_size,
+        ),
+    }
+}
+
+/// `manifest` with no verifier fields.
+fn without_verifiers(manifest: &mut Manifest) {
+    manifest.linux_verifier_x86_64 = None;
+    manifest.linux_verifier_x86_64_sha256 = None;
+    manifest.linux_verifier_x86_64_size = None;
+    manifest.linux_verifier_aarch64 = None;
+    manifest.linux_verifier_aarch64_sha256 = None;
+    manifest.linux_verifier_aarch64_size = None;
+    manifest.linux_verifier_interface = None;
+}
+
+/// The bootstrap verifiers a signed `manifest` names ([`Handoff::stamp`]), in [`TARGETS`]
+/// order, each a [`pin::Receipt`] of a canonical asset name for the manifest's version, and
+/// the interface they speak; `None` when it names none.
+///
+/// # Errors
+/// An architecture with some of its three fields and not the others, a noncanonical name, a
+/// digest that is not 64 lowercase hex digits, a size install.sh would not download, or
+/// receipts with no interface (or an interface with no receipt).
+pub fn signed_verifiers(manifest: &Manifest) -> Result<Option<(Vec<pin::Receipt>, u32)>, String> {
+    let mut receipts = Vec::new();
+    for target in TARGETS {
+        let arch = target.arch();
+        match verifier_fields(manifest, target) {
+            (None, None, None) => {}
+            (Some(asset), Some(sha256), Some(size)) => {
+                if asset != pin::asset_name(&manifest.version, arch) {
+                    return Err(format!(
+                        "the signed appcast names the {arch} verifier {asset:?}, not v{}'s \
+                         canonical asset",
+                        manifest.version
+                    ));
+                }
+                if !aterm_codec::hex::is_lower(sha256, 64) {
+                    return Err(format!(
+                        "the signed appcast's {arch} verifier digest {sha256:?} is not 64 \
+                         lowercase hex digits"
+                    ));
+                }
+                if !(64..=pin::MAX_ASSET).contains(&size) {
+                    return Err(format!(
+                        "the signed appcast's {arch} verifier is {size} bytes, outside \
+                         64..={}",
+                        pin::MAX_ASSET
+                    ));
+                }
+                receipts.push(pin::Receipt {
+                    arch: arch.to_string(),
+                    asset: asset.to_string(),
+                    sha256: sha256.to_string(),
+                    size,
+                });
+            }
+            _ => {
+                return Err(format!(
+                    "the signed appcast's {arch} verifier is incomplete: its name, sha256 and \
+                     size appear together or not at all"
+                ));
+            }
         }
-        let mut bytes = Vec::new();
-        File::open(path)
-            .and_then(|file| file.take(pin::MAX_ASSET + 1).read_to_end(&mut bytes))
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
-        target(&self.target)?.validate_elf_header(bytes.get(..64).unwrap_or(&bytes))?;
-        if !names_no_interpreter(&bytes) {
-            return Err(format!(
-                "Linux bootstrap verifier is not a static executable (it names a program \
-                 interpreter): {}",
-                path.display()
-            ));
+    }
+    match (receipts.is_empty(), manifest.linux_verifier_interface) {
+        (true, None) => Ok(None),
+        (false, Some(interface)) => Ok(Some((receipts, interface))),
+        (true, Some(_)) => {
+            Err("the signed appcast names a verifier interface but no verifier".into())
         }
-        let mut digest = aterm_digest::Sha256::new();
-        digest.update(&bytes);
-        if aterm_codec::hex::encode_lower(&digest.finalize()) != self.sha256 {
-            return Err(format!(
-                "Linux bootstrap verifier hash changed: {}",
-                path.display()
-            ));
-        }
-        Ok(())
+        (false, None) => Err("the signed appcast names verifiers but no interface".into()),
     }
 }
 
@@ -160,13 +270,29 @@ pub const PIN_RECORD: &str = "aterm-bootstrap-verify-pin.toml";
 /// committed record beside it ([`pin::RECORD`]), the two `pin::check` holds to each other.
 /// The pin it wrote.
 ///
+/// This path trusts the record file itself: the cutting machine's `dist/`, whose receipts
+/// its own sign step froze from the files it uploaded. Nothing here re-reads the release;
+/// from any other checkout, [`from_release::pin_from_release`] reads the public release and
+/// binds the digests to its signer instead.
+///
 /// # Errors
 /// A record of another shape or interface, one this checkout's RELEASES.ledger does not
 /// claim, or an install.sh whose pin it cannot place: nothing is written.
 pub fn pin_verifier(root: &Path, record: &Path) -> Result<Pin, String> {
+    let text = fs::read_to_string(record).map_err(|e| format!("{}: {e}", record.display()))?;
+    write_pin(root, &pin::Record::parse(&text)?)
+}
+
+/// Write `record` into the checkout at `root` as tools/install.sh's pin and the committed
+/// record beside it ([`pin::RECORD`]), once both pass `pin::check`. The pin it wrote.
+///
+/// # Errors
+/// A record this checkout's RELEASES.ledger does not claim, one of another interface, or an
+/// install.sh whose pin it cannot place: nothing is written.
+pub fn write_pin(root: &Path, record: &pin::Record) -> Result<Pin, String> {
     let read =
         |path: &Path| fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()));
-    let record = pin::Record::parse(&read(record)?)?;
+    record.validate()?;
     let ledger = read(&root.join("RELEASES.ledger"))?;
     record.claimed_in(&ledger).map_err(|why| {
         format!(
@@ -492,12 +618,19 @@ impl Worker {
 
 pub const TARGETS: [LinuxTarget; 2] = [LinuxTarget::X86_64, LinuxTarget::Aarch64];
 
+/// The Linux assets `manifest` signs: each executable, then each static verifier.
+///
+/// # Errors
+/// An executable's or a verifier's fields the manifest's readers refuse.
 pub fn manifest_asset_names(manifest: &Manifest) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     for target in TARGETS {
         if let Some(artifact) = manifest.linux_artifact(target)? {
             names.push(artifact.name.to_string());
         }
+    }
+    if let Some((receipts, _)) = signed_verifiers(manifest)? {
+        names.extend(receipts.into_iter().map(|receipt| receipt.asset));
     }
     Ok(names)
 }
@@ -513,6 +646,7 @@ pub fn verify_manifest_handoff(
     expected.linux_aarch64 = None;
     expected.linux_aarch64_sha256 = None;
     expected.linux_aarch64_size = None;
+    without_verifiers(&mut expected);
     if let Some(handoff) = handoff {
         handoff.stamp(&mut expected)?;
     }
@@ -523,6 +657,14 @@ pub fn verify_manifest_handoff(
         {
             return Err("signed Linux fields disagree with the cut's frozen worker handoff".into());
         }
+    }
+    if signed_verifiers(manifest)? != signed_verifiers(&expected)? {
+        return Err(
+            "the signed bootstrap verifier fields disagree with the cut's frozen worker handoff \
+             (a cut whose appcast a cutter from before those fields signed is finished by the \
+             cutter that started it, or abandoned)"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -906,6 +1048,40 @@ impl Handoff {
                     manifest.linux_aarch64_size = Some(artifact.size);
                 }
             }
+        }
+        // The static verifiers go into the same signed bytes: no client reads them, and they
+        // are what `ship pin-verifier --from-release` binds install.sh's pin to.
+        for verifier in &self.verifiers {
+            verifier.validate(
+                &manifest.version,
+                manifest.build_number,
+                manifest
+                    .commit
+                    .as_deref()
+                    .ok_or("Linux manifest requires a source commit")?,
+            )?;
+            let fields = (
+                Some(verifier.asset.clone()),
+                Some(verifier.sha256.clone()),
+                Some(verifier.size),
+            );
+            match target(&verifier.target)? {
+                LinuxTarget::X86_64 => {
+                    (
+                        manifest.linux_verifier_x86_64,
+                        manifest.linux_verifier_x86_64_sha256,
+                        manifest.linux_verifier_x86_64_size,
+                    ) = fields;
+                }
+                LinuxTarget::Aarch64 => {
+                    (
+                        manifest.linux_verifier_aarch64,
+                        manifest.linux_verifier_aarch64_sha256,
+                        manifest.linux_verifier_aarch64_size,
+                    ) = fields;
+                }
+            }
+            manifest.linux_verifier_interface = Some(pin::INTERFACE);
         }
         Ok(())
     }
@@ -1416,7 +1592,7 @@ mod tests {
     }
 
     /// A worker's static verifier joins the cut beside its executable: imported into the
-    /// stage, uploaded with the Linux assets, never in the signed appcast, and printed as
+    /// stage, uploaded with the Linux assets, its receipt signed in the appcast, and printed as
     /// install.sh's pin, which reads back as it was printed. An architecture with none
     /// stays on install.sh's embedded verifier (its digest empty in the pin).
     #[test]
@@ -1441,14 +1617,29 @@ mod tests {
         let mut manifest = manifest();
         handoff.stamp(&mut manifest).unwrap();
         assert_eq!(
-            manifest_asset_names(&manifest).unwrap().len(),
-            2,
-            "the appcast names no verifier"
+            manifest_asset_names(&manifest).unwrap(),
+            [
+                LinuxTarget::X86_64.asset_name("0.100.0"),
+                LinuxTarget::Aarch64.asset_name("0.100.0"),
+                verifier.asset.clone(),
+            ],
+            "the appcast signs the verifier beside the executables"
         );
         let commit = "a".repeat(40);
         let record = handoff
             .record("alabsystems/aterm", "0.100.0", 100, &commit)
             .expect("a verifier was frozen");
+        assert_eq!(
+            signed_verifiers(&manifest).unwrap(),
+            Some((record.verifiers.clone(), pin::INTERFACE)),
+            "the signed receipts are the record's"
+        );
+        let text = crate::manifest_out::emit(&manifest).unwrap();
+        assert_eq!(
+            signed_verifiers(&Manifest::parse(&text).unwrap()).unwrap(),
+            Some((record.verifiers.clone(), pin::INTERFACE)),
+            "and survive the emitted bytes"
+        );
         assert_eq!(record.validate(), Ok(()));
         assert_eq!(pin::Record::parse(&record.to_toml()), Ok(record.clone()));
         assert_eq!(
@@ -1618,10 +1809,102 @@ mod tests {
         let mut manifest = manifest();
         handoff.stamp(&mut manifest).unwrap();
         assert_eq!(manifest_asset_names(&manifest).unwrap().len(), 2);
+        assert_eq!(
+            signed_verifiers(&manifest),
+            Ok(None),
+            "no verifier was frozen"
+        );
         verify_manifest_handoff(&manifest, Some(&handoff)).unwrap();
         assert!(verify_manifest_handoff(&manifest, None).is_err());
         manifest.linux_aarch64_sha256 = Some("f".repeat(64));
         assert!(verify_manifest_handoff(&manifest, Some(&handoff)).is_err());
+    }
+
+    /// The signed verifier fields are held to the frozen handoff like the executables'
+    /// (negative control: a digest, a size or an interface the handoff did not freeze, or a
+    /// receipt it has none for), and a manifest's receipts are read whole or refused.
+    #[test]
+    fn signed_verifier_fields_are_bound_to_the_handoff_and_read_whole() {
+        let source = scratch();
+        let dist = scratch();
+        for t in TARGETS {
+            fixture(source.path(), t);
+            verifier_fixture(source.path(), t, false);
+        }
+        let mut handoff = Handoff::new(source.path(), &[], &[]).unwrap();
+        handoff
+            .import(dist.path(), "0.100.0", 100, &"a".repeat(40))
+            .unwrap();
+        assert_eq!(handoff.verifiers.len(), 2);
+        let mut signed = manifest();
+        handoff.stamp(&mut signed).unwrap();
+        verify_manifest_handoff(&signed, Some(&handoff)).unwrap();
+        let (receipts, interface) = signed_verifiers(&signed).unwrap().unwrap();
+        assert_eq!(interface, pin::INTERFACE);
+        assert_eq!(
+            receipts.iter().map(|r| r.arch.as_str()).collect::<Vec<_>>(),
+            pin::ARCHES
+        );
+        let bent = |f: &dyn Fn(&mut Manifest)| {
+            let mut m = signed.clone();
+            f(&mut m);
+            m
+        };
+        for (why, m) in [
+            (
+                "digest",
+                bent(&|m| m.linux_verifier_x86_64_sha256 = Some("f".repeat(64))),
+            ),
+            (
+                "size",
+                bent(&|m| m.linux_verifier_aarch64_size = Some(4096)),
+            ),
+            (
+                "interface",
+                bent(&|m| m.linux_verifier_interface = Some(pin::INTERFACE + 1)),
+            ),
+        ] {
+            assert!(
+                verify_manifest_handoff(&m, Some(&handoff)).is_err(),
+                "{why}"
+            );
+        }
+        let mut bare = Handoff::new(source.path(), &[], &[]).unwrap();
+        bare.import(dist.path(), "0.100.0", 100, &"a".repeat(40))
+            .unwrap();
+        bare.verifiers.clear();
+        assert!(
+            verify_manifest_handoff(&signed, Some(&bare)).is_err(),
+            "a signed receipt the handoff never froze"
+        );
+        for (why, m) in [
+            ("incomplete", bent(&|m| m.linux_verifier_x86_64_size = None)),
+            (
+                "canonical",
+                bent(&|m| m.linux_verifier_x86_64 = Some(pin::asset_name("0.99.0", "x86_64"))),
+            ),
+            (
+                "lowercase",
+                bent(&|m| m.linux_verifier_aarch64_sha256 = Some("F".repeat(64))),
+            ),
+            (
+                "outside",
+                bent(&|m| m.linux_verifier_aarch64_size = Some(63)),
+            ),
+            (
+                "outside",
+                bent(&|m| m.linux_verifier_aarch64_size = Some(pin::MAX_ASSET + 1)),
+            ),
+            ("no interface", bent(&|m| m.linux_verifier_interface = None)),
+            ("no verifier", {
+                let mut m = manifest();
+                m.linux_verifier_interface = Some(pin::INTERFACE);
+                m
+            }),
+        ] {
+            let said = signed_verifiers(&m).expect_err(why);
+            assert!(said.contains(why), "{why}: {said}");
+        }
     }
 
     #[test]

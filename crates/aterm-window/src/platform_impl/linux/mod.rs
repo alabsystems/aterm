@@ -443,40 +443,6 @@ impl Window {
         x11_or_wayland!(match self; Window(window) => window.native_window())
     }
 
-    /// The opt-in `rwh_06` window handle.
-    #[cfg(feature = "rwh_06")]
-    #[inline]
-    pub fn raw_window_handle_rwh_06(&self) -> Result<rwh_06::RawWindowHandle, rwh_06::HandleError> {
-        use aterm_types::native_window::NativeWindow;
-        Ok(match self.native_window() {
-            NativeWindow::Xlib { window, visual, .. } => {
-                let mut handle = rwh_06::XlibWindowHandle::new(window.into());
-                handle.visual_id = visual.into();
-                handle.into()
-            },
-            NativeWindow::Wayland { surface, .. } => {
-                rwh_06::WaylandWindowHandle::new(surface).into()
-            },
-        })
-    }
-
-    /// The opt-in `rwh_06` display handle, off [`Self::native_window`].
-    #[cfg(feature = "rwh_06")]
-    #[inline]
-    pub fn raw_display_handle_rwh_06(
-        &self,
-    ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        use aterm_types::native_window::NativeWindow;
-        Ok(match self.native_window() {
-            NativeWindow::Xlib { display, screen, .. } => {
-                rwh_06::XlibDisplayHandle::new(Some(display), screen).into()
-            },
-            NativeWindow::Wayland { display, .. } => {
-                rwh_06::WaylandDisplayHandle::new(display).into()
-            },
-        })
-    }
-
     #[inline]
     pub fn set_theme(&self, theme: Option<Theme>) {
         x11_or_wayland!(match self; Window(window) => window.set_theme(theme))
@@ -717,14 +683,6 @@ impl ActiveEventLoop {
             #[cfg(wayland_platform)]
             ActiveEventLoop::Wayland(evlp) => Some(MonitorHandle::Wayland(evlp.primary_monitor()?)),
         }
-    }
-
-    #[cfg(feature = "rwh_06")]
-    #[inline]
-    pub fn raw_display_handle_rwh_06(
-        &self,
-    ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        any_backend!(match self; Self(evlp) => evlp.raw_display_handle_rwh_06())
     }
 
     pub(crate) fn set_control_flow(&self, control_flow: ControlFlow) {

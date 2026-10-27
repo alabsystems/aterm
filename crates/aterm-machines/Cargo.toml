@@ -14,8 +14,15 @@ description = "aterm — `aterm machines`: configure and manage a lab of Macs fr
 aterm-tempfile = { workspace = true }
 # Child processes (spawnfd::command), bounded runs (deadline), this process's euid (peer).
 aterm-uds = { workspace = true }
+# The aterm window's front door: a sign-out's Accessibility ask goes to the window's permission
+# walk when that window is the app macOS holds responsible for the run.
+aterm-ctl = { path = "../aterm-ctl" }
 # A process's start second, any uid's (`kproc`): the run lock's holder check.
 aterm-sysprobe = { workspace = true }
+# The bar past which one of macOS's services holds too much memory, and the restart aterm
+# knows for fseventsd (`services`), which `init.fseventsd` reads; and the byte words its rows
+# print (`words::mem`). A pure model crate with no dependencies.
+aterm-vitals = { workspace = true }
 # The baseline, fleet and envelope documents; comment-preserving edits of fleet.toml.
 aterm-toml = { workspace = true }
 # Reports on the wire and in state/.
@@ -29,8 +36,8 @@ aterm-digest = { workspace = true }
 # hex for digests, base64 for plist <data>.
 aterm-codec = { workspace = true }
 # The calls std lacks: O_NOFOLLOW opens, exclusive renames, poll, termios, signal dispositions,
-# advisory locks. The crate is macOS-only: crates/aterm links it under
-# cfg(target_os = "macos") and answers `aterm machines` elsewhere with a one-line refusal.
+# advisory locks. crates/aterm links the crate on every unix for `aterm init`; `aterm machines`
+# itself runs on macOS alone and answers elsewhere with a one-line refusal.
 libc = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }

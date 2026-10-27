@@ -34,13 +34,17 @@ pub struct CardShape {
 impl CardShape {
     /// `scene`'s shape.
     #[must_use]
+    #[inline]
     pub const fn of(scene: &CardScene) -> (Self, (i32, i32)) {
+        #[inline]
         const fn min_i64(a: i64, b: i64) -> i64 {
             if a < b { a } else { b }
         }
+        #[inline]
         const fn space(v: i32) -> i64 {
             sat_u16(v as i64) as i64
         }
+        #[inline]
         const fn sat_u16(v: i64) -> u16 {
             if v < 0 {
                 0
@@ -157,6 +161,7 @@ pub const fn card_layer_id(card: u64, slot: FxSlot) -> u64 {
 impl CardFrame {
     /// The frame as its two layers (design §4.8).
     #[must_use]
+    #[inline]
     pub fn layers(&self, card: u64, pane: PxRect, grid: (i32, i32)) -> [FxLayer; 2] {
         let mut under = FxLayer::new(
             card_layer_id(card, FxSlot::Under),
@@ -178,16 +183,24 @@ impl CardFrame {
             self.origin.0.checked_sub(grid.0),
             self.origin.1.checked_sub(grid.1),
         ) {
-            over.offset = (x, y);
-            let edge = |e: i32, g: i32| {
+            #[inline]
+            const fn edge(e: i32, g: i32) -> i32 {
                 if e == i32::MIN || e == i32::MAX {
                     e
                 } else {
-                    (i64::from(e) - i64::from(g))
-                        .clamp(i64::from(i32::MIN) + 1, i64::from(i32::MAX) - 1)
-                        as i32
+                    let diff = (e as i64) - (g as i64);
+                    let lo = (i32::MIN as i64) + 1;
+                    let hi = (i32::MAX as i64) - 1;
+                    (if diff < lo {
+                        lo
+                    } else if diff > hi {
+                        hi
+                    } else {
+                        diff
+                    }) as i32
                 }
-            };
+            }
+            over.offset = (x, y);
             over.clip = PxRect::new(
                 edge(pane.x0, grid.0),
                 edge(pane.y0, grid.1),
@@ -297,6 +310,7 @@ impl CardFrames {
     }
 
     /// Fill the ring's next pair with `cx`'s frame and hand it back.
+    #[inline]
     pub(super) fn fill(&mut self, cx: &Emit<'_>) -> (Arc<FxContent>, Arc<FxContent>) {
         let ch = cx.scene.ch;
         if !matches!(self.arts.as_deref(), Some(a) if a.ch == ch) {
@@ -322,6 +336,7 @@ impl CardFrames {
     }
 }
 
+#[inline]
 fn refill(content: &mut Arc<FxContent>, f: impl FnOnce(&mut Vec<FxItem>, &mut Vec<FxInk>)) {
     if Arc::get_mut(content).is_none() {
         *content = Arc::new(content.empty_like());
@@ -345,7 +360,10 @@ const fn fx_ink(p: Paint) -> FxInk {
 /// Validate a producer's dimensions before allocating any texels.
 #[inline]
 fn art_size(w: i64, h: i64) -> Option<(u16, u16, usize)> {
-    fx_art::art_dimensions(usize::try_from(w).ok()?, usize::try_from(h).ok()?)
+    if w < 0 || h < 0 {
+        return None;
+    }
+    fx_art::art_dimensions(w as usize, h as usize)
 }
 
 /// The rim's strip-id art for one frame of the kitty at one pixel size.
@@ -358,19 +376,18 @@ struct RimArt {
 }
 
 impl RimArt {
+    #[inline]
     fn dimensions(frame: &[&str], p: i64, rim: i64) -> Option<(u16, u16, usize)> {
-        if p <= 0 || rim <= 0 {
+        if p <= 0 || rim <= 0 || frame.len() > i64::MAX as usize {
             return None;
         }
         let border = rim.checked_mul(2)?;
         let w = (KITTY_W as i64).checked_mul(p)?.checked_add(border)?;
-        let h = i64::try_from(frame.len())
-            .ok()?
-            .checked_mul(p)?
-            .checked_add(border)?;
+        let h = (frame.len() as i64).checked_mul(p)?.checked_add(border)?;
         art_size(w, h)
     }
 
+    #[inline]
     fn of(frame: &[&str], p: i64, rim: i64) -> Option<Self> {
         #[inline]
         const fn all_zero(slice: &[u8]) -> bool {
@@ -392,10 +409,12 @@ impl RimArt {
         let mut mids = Vec::new();
         let mut ok = true;
         rim_strips(frame, p, rim, |q| {
-            let Ok(k) = u8::try_from(mids.len() + 1) else {
+            let next_id = mids.len() + 1;
+            if next_id > u8::MAX as usize {
                 ok = false;
                 return;
-            };
+            }
+            let k = next_id as u8;
             mids.push((q.x0 + q.x1, q.y0 + q.y1));
             let (rx0, rx1) = ((q.x0 + rim) as usize, (q.x1 + rim) as usize);
             let mut y = q.y0;
@@ -443,6 +462,7 @@ struct StarArt {
 }
 
 impl StarArt {
+    #[inline]
     fn of(arm: i32, gold: bool) -> Option<Self> {
         if arm < 1 {
             return None;
@@ -491,6 +511,7 @@ const fn kitty_slot(art: &KittyArt, pose: KittyPose) -> usize {
 impl CardArts {
     /// The arts for cell height `ch`.
     #[must_use]
+    #[inline]
     pub fn for_cell(ch: u16) -> Option<Arc<Self>> {
         let dimensions = Self::dimensions(ch)?;
         #[cfg(test)]
@@ -499,12 +520,15 @@ impl CardArts {
         }
         static MEMO: Mutex<Vec<(u16, Weak<CardArts>)>> = Mutex::new(Vec::new());
         let mut memo = MEMO.lock().unwrap_or_else(PoisonError::into_inner);
-        for (c, w) in memo.iter() {
+        let mut mi = 0;
+        while mi < memo.len() {
+            let (c, w) = &memo[mi];
             if *c == ch
                 && let Some(live) = w.upgrade()
             {
                 return Some(live);
             }
+            mi += 1;
         }
         memo.retain(|(_, w)| w.strong_count() > 0);
         let arts = Arc::new(Self::build(ch, dimensions));
@@ -513,6 +537,7 @@ impl CardArts {
     }
 
     /// Check all six rim pictures and the largest star before any cache is allocated.
+    #[inline]
     pub(super) fn dimensions(ch: u16) -> Option<(i64, i64, i32)> {
         if ch == 0 {
             return None;
@@ -520,10 +545,16 @@ impl CardArts {
         let p = i64::from(kitty_px(ch));
         let rim = rim_px(p, i64::from(stroke_px(ch)));
         if rim > 0 {
-            for art in [KITTY_SHORT, kitty_tall()] {
-                for pose in [KittyPose::Open, KittyPose::Blink, KittyPose::Flick] {
-                    RimArt::dimensions(art.frame(pose), p, rim)?;
+            let arts = [KITTY_SHORT, kitty_tall()];
+            let poses = [KittyPose::Open, KittyPose::Blink, KittyPose::Flick];
+            let mut ai = 0;
+            while ai < arts.len() {
+                let mut pi = 0;
+                while pi < poses.len() {
+                    RimArt::dimensions(arts[ai].frame(poses[pi]), p, rim)?;
+                    pi += 1;
                 }
+                ai += 1;
             }
         }
         let arm_max = star_arm_px(star_arm(f32::from(ch), STAR_ARM_HERO * STAR_ARM_INK));
@@ -532,6 +563,7 @@ impl CardArts {
         Some((p, rim, arm_max))
     }
 
+    #[inline]
     fn build(ch: u16, (p, rim, arm_max): (i64, i64, i32)) -> Self {
         let arts = [KITTY_SHORT, kitty_tall()];
         let poses = [KittyPose::Open, KittyPose::Blink, KittyPose::Flick];
@@ -540,14 +572,18 @@ impl CardArts {
             fx_art::indexed(frame(i), &KITTY_PALETTE[1..]).expect("the kitty's art is well formed")
         });
         let rim = std::array::from_fn(|i| RimArt::of(frame(i), p, rim));
-        let stars = (1..=arm_max)
-            .map(|arm| [StarArt::of(arm, false), StarArt::of(arm, true)])
-            .collect();
+        let stars_len = if arm_max > 0 { arm_max as usize } else { 0 };
+        let mut stars = Vec::with_capacity(stars_len);
+        let mut arm = 1;
+        while arm <= arm_max {
+            stars.push([StarArt::of(arm, false), StarArt::of(arm, true)]);
+            arm += 1;
+        }
         Self {
             ch,
             kitty,
             rim,
-            stars,
+            stars: stars.into_boxed_slice(),
         }
     }
 
@@ -559,6 +595,7 @@ impl CardArts {
     }
 
     /// Every art.
+    #[inline]
     pub fn arts(&self) -> impl Iterator<Item = &Arc<FxArt>> {
         let kitty = self.kitty.iter();
         let rim = self.rim.iter().flatten().map(|r| &r.art);
@@ -604,6 +641,7 @@ struct UnderItems<'a> {
 }
 
 impl Ramps for UnderItems<'_> {
+    #[inline]
     fn ramp(&mut self, clip: Rect, r: Rect, l: Paint, rt: Paint) {
         self.side = None;
         if l.alpha == 0 && l.color == 0 && rt.color == 0 {
@@ -625,6 +663,7 @@ impl Ramps for UnderItems<'_> {
         }));
     }
 
+    #[inline]
     fn side(&mut self, clip: Rect, r: Rect, p: Paint) {
         let c = r.meet(clip).meet(self.clip);
         if c.is_empty() {
@@ -662,6 +701,7 @@ impl Ramps for UnderItems<'_> {
     }
 }
 
+#[inline]
 fn fill_under(cx: &Emit<'_>, items: &mut Vec<FxItem>, palette: &mut Vec<FxInk>) {
     let mut out = UnderItems {
         clip: cx.geo.clip,
@@ -680,6 +720,7 @@ fn fill_under(cx: &Emit<'_>, items: &mut Vec<FxItem>, palette: &mut Vec<FxInk>) 
     );
 }
 
+#[inline]
 fn fill_over(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Vec<FxInk>) {
     if cx.scene.serious {
         return;
@@ -709,18 +750,23 @@ fn fill_over(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &
     );
 }
 
+#[inline]
 fn kitty(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Vec<FxInk>) {
     let Some((at, pose)) = cx.kitty else {
         return;
     };
     let r = at.rect;
-    let (Ok(dw), Ok(dh)) = (u16::try_from(r.x1 - r.x0), u16::try_from(r.y1 - r.y0)) else {
+    let (rw, rh) = (r.x1 - r.x0, r.y1 - r.y0);
+    if rw < 0 || rw > i64::from(u16::MAX) || rh < 0 || rh > i64::from(u16::MAX) {
         return;
-    };
+    }
+    let (dw, dh) = (rw as u16, rh as u16);
     let inks = KittyInk::new(cx.scene.coat, cx.scene.eye, cx.scene.dark);
     let base = palette.len() as u32;
-    for &c in &KITTY_PALETTE[1..] {
-        palette.push(FxInk::over(inks.of(c).unwrap_or(0), 255));
+    let mut ki = 1;
+    while ki < KITTY_PALETTE.len() {
+        palette.push(FxInk::over(inks.of(KITTY_PALETTE[ki]).unwrap_or(0), 255));
+        ki += 1;
     }
     items.push(FxItem::Sprite(FxSprite {
         x: r.x0 as i32,
@@ -734,6 +780,7 @@ fn kitty(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut 
     }));
 }
 
+#[inline]
 fn rim(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Vec<FxInk>) {
     let Some((at, pose)) = cx.kitty else {
         return;
@@ -744,11 +791,15 @@ fn rim(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Ve
     let r0 = at.rect;
     let centre = ((r0.x0 + r0.x1) as f32 * 0.5, (r0.y0 + r0.y1) as f32 * 0.5);
     let base = palette.len() as u32;
-    for &(mx, my) in &rim.mids {
+    let mut mi = 0;
+    while mi < rim.mids.len() {
+        let (mx, my) = rim.mids[mi];
         let mid = ((2 * r0.x0 + mx) as f32 * 0.5, (2 * r0.y0 + my) as f32 * 0.5);
         palette.push(fx_ink(cx.rim_paint(mid, centre)));
+        mi += 1;
     }
-    let sprite = |clip: Rect| {
+    #[inline]
+    fn rim_sprite(r0: Rect, rim: &RimArt, base: u32, clip: Rect) -> FxItem {
         FxItem::Sprite(FxSprite {
             x: (r0.x0 + rim.origin.0) as i32,
             y: (r0.y0 + rim.origin.1) as i32,
@@ -759,10 +810,13 @@ fn rim(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Ve
             ink: base,
             clip: px_rect(clip),
         })
-    };
+    }
     let clip = cx.geo.inner().meet(cx.geo.clip);
     let hole = cx.rim_hole();
-    for c in &rim.cover {
+    let mut ci = 0;
+    while ci < rim.cover.len() {
+        let c = &rim.cover[ci];
+        ci += 1;
         let part = Rect {
             x0: r0.x0 + c.x0,
             y0: r0.y0 + c.y0,
@@ -773,11 +827,11 @@ fn rim(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Ve
         match hole {
             Some(hole) => {
                 lay_cut(part, 0, 0, &|_| hole, &mut |piece| {
-                    items.push(sprite(piece));
+                    items.push(rim_sprite(r0, rim, base, piece));
                     true
                 });
             }
-            None if !part.is_empty() => items.push(sprite(part)),
+            None if !part.is_empty() => items.push(rim_sprite(r0, rim, base, part)),
             None => {}
         }
     }
@@ -789,6 +843,7 @@ const fn px_rect(r: Rect) -> PxRect {
     PxRect::new(r.x0 as i32, r.y0 as i32, r.x1 as i32, r.y1 as i32)
 }
 
+#[inline]
 fn star(
     items: &mut Vec<FxItem>,
     palette: &mut Vec<FxInk>,
@@ -797,6 +852,25 @@ fn star(
     s: StarCall,
     on_trail: &[Rect],
 ) {
+    #[inline]
+    fn star_sprite(
+        (x, y): (i32, i32),
+        (w, h): (u16, u16),
+        art: &Arc<FxArt>,
+        ink: u32,
+        clip: Rect,
+    ) -> FxItem {
+        FxItem::Sprite(FxSprite {
+            x,
+            y,
+            dw: w,
+            dh: h,
+            flip_x: false,
+            art: Arc::clone(art),
+            ink,
+            clip: px_rect(clip),
+        })
+    }
     let StarCall {
         clip,
         centre: (sx, sy),
@@ -823,8 +897,9 @@ fn star(
     let cov_floor = cov.floor();
     let mut covs = [0.0f32; STAR_PAINTS];
     let mut ended = false;
-    for (id, c) in covs.iter_mut().enumerate() {
-        *c = match id {
+    let mut id = 0;
+    while id < STAR_PAINTS {
+        covs[id] = match id {
             0 => cov_floor,
             1 if added => (cov * STAR_CORE_ADD).floor(),
             1 => cov_floor,
@@ -841,87 +916,124 @@ fn star(
                 if ended { 0.0 } else { tip }
             }
         };
+        id += 1;
     }
-    let sprite = |art: &Arc<FxArt>, ink: u32, clip: Rect| {
-        FxItem::Sprite(FxSprite {
-            x: x as i32,
-            y: y as i32,
-            dw: w,
-            dh: h,
-            flip_x: false,
-            art: Arc::clone(art),
-            ink,
-            clip: px_rect(clip),
-        })
-    };
+    let xy_i32 = (x as i32, y as i32);
+    let wh = (w, h);
     if added {
         let base = palette.len() as u32;
         let mut tones = [0u32; STAR_PAINTS];
-        for (id, tone) in tones.iter_mut().enumerate() {
-            *tone = light(color, covs[id]).color;
+        let mut tid = 0;
+        while tid < STAR_PAINTS {
+            tones[tid] = light(color, covs[tid]).color;
+            tid += 1;
         }
-        for members in p.classes() {
+        let classes = p.classes();
+        let mut ci = 0;
+        while ci < classes.len() {
+            let members = &classes[ci];
             let mut sum = 0u32;
-            for &id in members {
-                sum = add_sat(sum, tones[usize::from(id)]) & 0x00FF_FFFF;
+            let mut mi = 0;
+            while mi < members.len() {
+                sum = add_sat(sum, tones[usize::from(members[mi])]) & 0x00FF_FFFF;
+                mi += 1;
             }
             palette.push(FxInk::add(sum));
+            ci += 1;
         }
-        items.push(sprite(folded, base, b));
+        items.push(star_sprite(xy_i32, wh, folded, base, b));
         return;
     }
     let base = palette.len() as u32;
-    for rgb in [color, WHITE] {
-        for &c in &covs {
-            palette.push(fx_ink(ink(rgb, c * 255.0 / STAR_PRINT_FULL)));
+    let rgbs = [color, WHITE];
+    let mut ri = 0;
+    while ri < rgbs.len() {
+        let rgb = rgbs[ri];
+        let mut ci = 0;
+        while ci < covs.len() {
+            palette.push(fx_ink(ink(rgb, covs[ci] * (255.0 / STAR_PRINT_FULL))));
+            ci += 1;
         }
+        ri += 1;
     }
     tone_rects(b, on_trail, |r, white| {
         let ink = base + if white { STAR_PAINTS as u32 } else { 0 };
-        for layer in p.peeled() {
-            items.push(sprite(layer, ink, r));
+        let peeled = p.peeled();
+        let mut pi = 0;
+        while pi < peeled.len() {
+            items.push(star_sprite(xy_i32, wh, &peeled[pi], ink, r));
+            pi += 1;
         }
     });
 }
 
+#[inline]
 fn tone_rects(b: Rect, covers: &[Rect], mut lay: impl FnMut(Rect, bool)) {
-    let lo = covers.partition_point(|c| c.x1 <= b.x0);
-    let span = covers[lo..].partition_point(|c| c.x0 < b.x1);
-    let mut cols = [(0i64, 0i64, (0i64, 0i64)); 2 * MAX_TRAIL_SEGMENTS as usize + 1];
-    let mut n = 0usize;
-    let mut add = |x0: i64, x1: i64, white: (i64, i64)| {
+    #[inline]
+    const fn add_col_run(
+        cols: &mut [(i64, i64, (i64, i64))],
+        n: &mut usize,
+        x0: i64,
+        x1: i64,
+        white: (i64, i64),
+    ) {
         if x0 >= x1 {
             return;
         }
         let white = if white.0 < white.1 { white } else { (0, 0) };
         let cap = cols.len();
-        if n > 0 && cols[n - 1].1 == x0 && cols[n - 1].2 == white {
-            cols[n - 1].1 = x1;
-        } else if n < cap {
-            cols[n] = (x0, x1, white);
-            n += 1;
+        let cur = *n;
+        if cur > 0
+            && cols[cur - 1].1 == x0
+            && cols[cur - 1].2.0 == white.0
+            && cols[cur - 1].2.1 == white.1
+        {
+            cols[cur - 1].1 = x1;
+        } else if cur < cap {
+            cols[cur] = (x0, x1, white);
+            *n = cur + 1;
         } else {
             debug_assert!(false, "more column runs than a trail has segments");
         }
-    };
+    }
+    let (lo, hi) = b.x_span(covers);
+    let mut cols = [(0i64, 0i64, (0i64, 0i64)); 2 * MAX_TRAIL_SEGMENTS as usize + 1];
+    let mut n = 0usize;
     let mut x = b.x0;
-    for c in &covers[lo..lo + span] {
+    let cover_slice = &covers[lo..hi];
+    let mut ci = 0;
+    while ci < cover_slice.len() {
+        let c = &cover_slice[ci];
+        ci += 1;
         let (cx0, cx1) = (c.x0.max(b.x0), c.x1.min(b.x1));
-        add(x, cx0, (0, 0));
-        add(cx0, cx1, (c.y0.clamp(b.y0, b.y1), c.y1.clamp(b.y0, b.y1)));
+        add_col_run(&mut cols, &mut n, x, cx0, (0, 0));
+        add_col_run(
+            &mut cols,
+            &mut n,
+            cx0,
+            cx1,
+            (c.y0.clamp(b.y0, b.y1), c.y1.clamp(b.y0, b.y1)),
+        );
         x = x.max(cx1);
     }
-    add(x, b.x1, (0, 0));
-    for &(x0, x1, (w0, w1)) in &cols[..n] {
+    add_col_run(&mut cols, &mut n, x, b.x1, (0, 0));
+    let mut ri = 0;
+    while ri < n {
+        let (x0, x1, (w0, w1)) = cols[ri];
+        ri += 1;
         let run = Rect { x0, x1, ..b };
         if w0 >= w1 {
             lay(run, false);
             continue;
         }
-        for (y0, y1, white) in [(b.y0, w0, false), (w0, w1, true), (w1, b.y1, false)] {
+        let parts = [(b.y0, w0, false), (w0, w1, true), (w1, b.y1, false)];
+        let mut pi = 0;
+        while pi < parts.len() {
+            let (y0, y1, white) = parts[pi];
             if y0 < y1 {
                 lay(Rect { y0, y1, ..run }, white);
             }
+            pi += 1;
         }
     }
 }
@@ -934,7 +1046,11 @@ pub(super) fn one_star(
     on_trail: &[Rect],
 ) -> (Vec<FxItem>, Vec<FxInk>) {
     let (mut items, mut palette) = (Vec::new(), Vec::new());
-    let arm = i32::try_from(s.arm).expect("a test arm");
+    assert!(
+        s.arm >= i64::from(i32::MIN) && s.arm <= i64::from(i32::MAX),
+        "a test arm"
+    );
+    let arm = s.arm as i32;
     if let Some(art) = StarArt::of(arm, s.gold) {
         star(&mut items, &mut palette, &art, geo_clip, s, on_trail);
     }

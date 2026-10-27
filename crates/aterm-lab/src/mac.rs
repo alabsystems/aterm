@@ -62,7 +62,40 @@ pub(crate) const GUEST_SHARE: &str = "/Volumes/My Shared Files/lane";
 const GUEST_DIR: &str = "/tmp/aterm-mac-lane";
 
 /// The guest agent's executable, the subject tccd names for what `tart exec` runs.
-const GUEST_AGENT: &str = "/opt/homebrew/bin/tart-guest-agent";
+pub(crate) const GUEST_AGENT: &str = "/opt/homebrew/bin/tart-guest-agent";
+
+/// Where a person base keeps the guest helper (`aterm-lab-guest`), the path its Accessibility and
+/// event-post grants name.
+pub(crate) const PERSON_HELPER: &str = "/usr/local/libexec/aterm-lab-guest";
+
+/// What a prepared base holds besides SIP on ([`prepared_base_with`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Prep {
+    /// Full Disk Access granted to the guest agent.
+    pub fda: bool,
+    /// The Command Line Tools removed and `xcode-select --reset`: a Mac that never had them, so
+    /// `xcode-select -p` fails.
+    pub no_clt: bool,
+    /// The guest helper put at [`PERSON_HELPER`] and granted Accessibility and the event-post
+    /// grant: its file in the share, and the digest the base's name carries (a new helper makes a
+    /// new base).
+    pub person: Option<(String, String)>,
+}
+
+/// The name of the prepared base for `image` and `prep`: [`base_name`], then `-noclt` and
+/// `-person-<digest>` as `prep` asks.
+#[must_use]
+pub(crate) fn prep_name(image: &str, prep: &Prep) -> String {
+    let mut name = base_name(image, prep.fda);
+    if prep.no_clt {
+        name.push_str("-noclt");
+    }
+    if let Some((_, digest)) = &prep.person {
+        name.push_str("-person-");
+        name.push_str(digest);
+    }
+    name
+}
 
 pub const USAGE: &str = "\
 targo --unverified lab mac <verb> — the macOS guest lane: a disposable tart VM (Apple's Virtualization framework)
@@ -661,7 +694,30 @@ pub(crate) fn prepared_base(
     share: &Path,
     between: &mut dyn FnMut() -> Result<(), Fail>,
 ) -> Result<String, Fail> {
-    let base = base_name(image, fda);
+    let prep = Prep {
+        fda,
+        ..Prep::default()
+    };
+    prepared_base_with(tart, image, &prep, run, share, between)
+}
+
+/// [`prepared_base`] for `prep` ([`prep_name`]): the grants written while the image's SIP is off,
+/// then SIP turned on, then the Command Line Tools removed (`no_clt`, held to `xcode-select -p`
+/// failing). A new person base deletes the image's older person bases of the same kind.
+///
+/// # Errors
+/// As [`prepared_base`]; a grant asked of an image with SIP on (NOT RUN); a CLT-less base whose
+/// `xcode-select -p` still answers.
+pub(crate) fn prepared_base_with(
+    tart: &str,
+    image: &str,
+    prep: &Prep,
+    run: &Path,
+    share: &Path,
+    between: &mut dyn FnMut() -> Result<(), Fail>,
+) -> Result<String, Fail> {
+    let fda = prep.fda;
+    let base = prep_name(image, prep);
     if local_vms(tart)?.lines().any(|n| n.trim() == base) {
         println!("mac: cloning the prepared {base}");
         return Ok(base);
@@ -669,28 +725,63 @@ pub(crate) fn prepared_base(
     println!(
         "mac: preparing {base} from {image}, once (tart pulls the image first when this Mac has no copy)"
     );
-    let mut prep = Vm::clone_from(tart, image, run, share, false)?;
-    prep.boot()?;
+    let mut prep_vm = Vm::clone_from(tart, image, run, share, false)?;
+    prep_vm.boot()?;
     between()?;
-    if prep.sh("csrutil status", STEP)?.contains("disabled") {
+    let vm = &mut prep_vm;
+    if vm.sh("csrutil status", STEP)?.contains("disabled") {
         if fda {
-            prep.sh(&fda_grant(), STEP)?;
+            vm.sh(&fda_grant(), STEP)?;
             println!("mac: Full Disk Access granted to the guest agent");
         }
-        prep.sh(SIP_ON, STEP)?;
-    } else if fda {
+        if let Some((helper, _)) = &prep.person {
+            vm.sh(&person_grant(helper), STEP)?;
+            println!(
+                "mac: the guest helper at {PERSON_HELPER} granted Accessibility and event posting"
+            );
+        }
+        vm.sh(SIP_ON, STEP)?;
+    } else if fda || prep.person.is_some() {
         return Err(not_run(
-            "--fda needs an image with SIP off: the grant is written to the TCC database before SIP is turned on",
+            "a grant (--fda, the person) needs an image with SIP off: it is written to the TCC database before SIP is turned on",
         ));
     }
-    if !prep.promote(&base) && !local_vms(tart)?.lines().any(|n| n.trim() == base) {
+    if prep.no_clt {
+        vm.sh(NO_CLT, STEP)?;
+        println!("mac: the Command Line Tools removed (xcode-select -p fails)");
+    }
+    if !vm.promote(&base) && !local_vms(tart)?.lines().any(|n| n.trim() == base) {
         return Err(not_run(format!(
             "tart rename {} {base} did not take",
-            prep.name
+            vm.name
         )));
+    }
+    if prep.person.is_some() {
+        let kind = prep_name(
+            image,
+            &Prep {
+                person: None,
+                ..prep.clone()
+            },
+        );
+        let older = format!("{kind}-person-");
+        for name in local_vms(tart)?.lines().map(str::trim) {
+            if name.starts_with(&older) && name != base {
+                let _ = aterm_uds::spawnfd::command(tart)
+                    .args(["delete", name])
+                    .stdin(Stdio::null())
+                    .status();
+                println!("mac: deleted the older person base {name}");
+            }
+        }
     }
     Ok(base)
 }
+
+/// Remove the Command Line Tools and reset the developer directory, then hold `xcode-select -p`
+/// to failing (an image whose Xcode answers it cannot make a CLT-less base).
+const NO_CLT: &str = "sudo -n rm -rf /Library/Developer/CommandLineTools && sudo -n xcode-select --reset; \
+                      if p=$(xcode-select -p 2>/dev/null); then echo \"xcode-select -p still answers: $p\"; exit 1; fi";
 
 /// Boot `vm` (a clone of the prepared `base`) and hold it to SIP on: a base whose clone booted
 /// with SIP not on is deleted, and the next run makes it again.
@@ -886,6 +977,24 @@ pub(crate) fn desktop_read(vm: &Vm, tccd_log: &str) -> Result<bool, Fail> {
         let _ = read.wait();
     }
     Ok(ended.is_some_and(|status| status.success()))
+}
+
+/// The guest helper copied from the share's `helper` to [`PERSON_HELPER`] and granted, by its
+/// designated requirement, Accessibility (to read a dialog's controls) and event posting (to post
+/// the HID events that press them): rows in the TCC database, written while SIP is off.
+fn person_grant(helper: &str) -> String {
+    format!(
+        "set -e; sudo -n mkdir -p {dir}; sudo -n cp '{GUEST_SHARE}/{helper}' {PERSON_HELPER}; sudo -n chmod 755 {PERSON_HELPER}; \
+         codesign -d -r- {PERSON_HELPER} 2>&1 | sed -n 's/^designated => //p' | csreq -r- -b /tmp/person.csreq; \
+         hex=$(xxd -p /tmp/person.csreq | tr -d '\\n'); \
+         for s in kTCCServiceAccessibility kTCCServicePostEvent; do \
+         sudo -n sqlite3 '/Library/Application Support/com.apple.TCC/TCC.db' \
+         \"INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,flags) \
+         VALUES ('$s','{PERSON_HELPER}',1,2,4,1,X'$hex',0);\"; done",
+        dir = PERSON_HELPER
+            .rsplit_once('/')
+            .map_or("/usr/local/libexec", |(d, _)| d),
+    )
 }
 
 fn fda_grant() -> String {

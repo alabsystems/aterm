@@ -37,7 +37,7 @@ fn resize_resets_cursor_state_after_geometry_change() {
 
     assert!(
         grid.pending_wrap(),
-        "precondition: resize should clear a live deferred wrap"
+        "precondition: the H in the last column leaves a wrap pending"
     );
     assert_eq!(
         grid.scroll_region(),
@@ -51,9 +51,10 @@ fn resize_resets_cursor_state_after_geometry_change() {
 
     grid.resize_with_reflow_mode(3, 4, ReflowMode::Enabled);
 
-    assert!(
-        !grid.pending_wrap(),
-        "resize should clear deferred wrap state"
+    assert_eq!(
+        (grid.cursor_row(), grid.cursor_col(), grid.pending_wrap()),
+        (1, 3, true),
+        "the rewrap ends the line on the H in the new last column, and its wrap stays pending"
     );
     assert!(
         grid.scroll_region().is_full(grid.rows()),

@@ -286,8 +286,9 @@ Scrollback is tiered (RAM, then LZ4; 100,000 lines by default); predictive
 local echo paints ahead of a slow shell; box drawing and Powerline glyphs are
 generated from cell geometry; an idle event loop parks.
 
-Rendering is aterm's own Metal backend on macOS and wgpu elsewhere, with the CPU
-rasterizer as fallback or `--cpu`, held to the same frames by a parity suite.
+Rendering is aterm's own GPU backends (Metal on macOS, OpenGL on Linux, Direct3D
+11 on Windows), with the CPU rasterizer as fallback or `--cpu`, held to the same
+frames by a parity suite.
 Tabs, splits and windows share one process and are restored across relaunch;
 Settings (Cmd-,), Markdown files and an editor open as tabs; Cmd-F searches
 scrollback by regex; Shift-Cmd-P is the command palette; chords are rebindable
@@ -420,7 +421,10 @@ macOS sandbox and fails closed if the wrapper is missing: no network; writes
 only under the temp directories, `/dev` and the shell's history file; no access
 to credential stores or private data directories; no debugger attach; and no
 mach service lookup but user and group queries, so `open`, `osascript`,
-`pbcopy` and the keychain do nothing from inside. A contained window tab gets
+`pbcopy` and the keychain do nothing from inside. launchd, which every process
+reaches without a lookup, refuses a contained program a new job or a change to the
+session's environment, but still restarts, unloads, disables or enables your own
+jobs when it asks, aterm's vault agent included. A contained window tab gets
 no brokered powers (clipboard, Kitty file reads, notifications), whatever the
 `allow_*` keys say. Linux and Windows have no OS sandbox, so there `--sandbox`
 refuses to start and names the gap. `safety` sets resource limits with no OS
@@ -507,8 +511,10 @@ stops that, and `aterm pkg machine` prints the line that turns it back on. On
 Apple silicon the same daily apply installs Rosetta 2 when it is missing, as you
 and with no password (`softwareupdate --install-rosetta`); `[machine] rosetta =
 false` stops that. Once a day that same pass also removes the Rust build-cache
-folders under `~/Library/Caches/aterm/cargo-build.noindex` that nothing builds
-into any more.
+folders under `~/Library/Caches/aterm/.ubd/cargo-build.noindex` that nothing builds
+into any more. The `.ubd` folder keeps those builds, and aterm's test scratch, out
+of macOS's file-change service (fseventsd), which drops the file events of what
+is made under it.
 
 On macOS, builds and tests can stall while macOS checks each new program aterm
 starts before its first run. `aterm doctor`'s `devtools:` row says whether that

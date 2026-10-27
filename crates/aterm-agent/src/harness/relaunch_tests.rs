@@ -3,6 +3,9 @@
 
 use super::*;
 
+#[path = "relaunch_account_source_tests.rs"]
+mod account_restart_source;
+
 fn words(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_string()).collect()
 }
@@ -203,6 +206,11 @@ fn a_step_is_relaunched_left_not_yet_or_never() {
         outcome("done:resumed"),
         Outcome::Relaunched,
         "the crash rule's relaunch of a self-claimed codex-alab landed: its TUI leads the tab"
+    );
+    assert_eq!(
+        outcome(super::super::upgrade_drive::RESUMED_BY_ANOTHER),
+        Outcome::Relaunched,
+        "someone else brought the conversation back: its agent runs, nothing more is typed"
     );
     assert_eq!(
         outcome("done:no-continue"),
@@ -4428,8 +4436,16 @@ fn a_grok_rows_leader_socket_fits_sun_path_or_is_refused() {
         )
         .to_string())
     );
-    // Under a home as long as `/Users//u/.grok`, that name and its daemon's pass sun_path.
-    assert_eq!(socket("/Users//u/.grok"), Ok(hashed("/Users//u/.grok")));
+    // Under a home as long as `/Users//u/.grok`, that name and its daemon's take 107 bytes: past
+    // macOS's sun_path (103), which takes the hashed name, and Linux's (107) to the byte.
+    let home = "/Users//u/.grok";
+    assert_eq!(named(home).len() + LEADER_DAEMON_SUFFIX.len(), 107);
+    let realistic = if MAX_SUN_PATH < 107 {
+        hashed(home)
+    } else {
+        named(home)
+    };
+    assert_eq!(socket(home), Ok(realistic));
     // A renewal binds the row to a fresh auth file, and the same label then names a fresh leader.
     assert_eq!(
         grok_leader_socket(Path::new("/Users//u/.grok"), "work", login),
@@ -4606,5 +4622,386 @@ fn pool_args_remove_what_each_cli_carries_in_place_of_a_row() {
             "--leader-socket",
             "/Users//u/.grok/leader-work-07d954d5.sock"
         ])
+    );
+}
+
+/// The window host of the 2026-10-26 incident (tab `s-f16681f50e0ff4e76b34`): its harness held
+/// the tab's lease and supervised it, and the upgrade drive ran inside it, so its lease was the
+/// drive's own hand.
+const INCIDENT_HOST: &str = "aterm-harness@53926";
+/// The upgrade's SIGTERM to Claude Code 2.1.306 (pid 93257) at the land rung: its `Exiting` mark.
+const INCIDENT_END_S: u64 = 1_793_034_365;
+/// The person's last keys before it (the `/login`), 95.5 s earlier: past the end's 20 s keys gap,
+/// inside the whole 120 s grace.
+const INCIDENT_KEY_MS: u64 = 1_793_034_269_532;
+
+/// The tab's `status` as it read at `now_ms`, a person's last key at `key_ms`.
+fn incident_status(now_ms: u64, key_ms: u64, input: &str, hand: &str) -> String {
+    format!(
+        "OK schema=1 sid=0 phase=exited hold=0 hand={hand} supervisor={INCIDENT_HOST} \
+         supervisor_proven=0 autopilot=land agent=- input={input} input_bytes=0 human_ms={} \
+         human_seq=1031",
+        now_ms - key_ms
+    )
+}
+
+/// 2026-10-26: the upgrade's SIGTERM went at land past the person's 95.5 s-old keys (the end's
+/// gate narrows to the 20 s keys gap), then the relaunch line it owed read the same keys under the
+/// whole 120 s grace and waited `wait:held` at each try (the drive's own at +1 s, the window's
+/// carries at +4 s and +15 s) until the person relaunched by hand. The line now waits on the grace
+/// its end waited out, which this build's record names; the controls on the same reads: a record
+/// that names none (the incident's own, an earlier build's) and an exit aterm did not end keep the
+/// whole grace, input unread at the prompt and another driver's hand hold it, and a key at the dead
+/// prompt holds it for the end's grace and no longer.
+#[test]
+fn keys_from_before_the_harness_own_end_never_hold_its_relaunch_line() {
+    use RelaunchLineError::{Hand, Wait};
+    let ours = format!("lease:{INCIDENT_HOST}");
+    let land = upgrade::person_grace(upgrade::Rung::Land, 120);
+    let gate = |now_ms: u64, key_ms: u64, input: &str, hand: &str, grace: u32| {
+        let status = incident_status(now_ms, key_ms, input, hand);
+        line_held_by_status(Some(&status), grace, INCIDENT_HOST)
+    };
+    for now_ms in [1_793_034_366_000, 1_793_034_368_956, 1_793_034_379_567] {
+        let status = incident_status(now_ms, INCIDENT_KEY_MS, "clear", &ours);
+        assert!(
+            person_present(&status, 120) && !person_present(&status, land),
+            "PRECONDITION at {now_ms}: a person by the whole grace, none by the end's"
+        );
+        let owed = line_grace(120, INCIDENT_END_S, Some(land));
+        assert_eq!(
+            gate(now_ms, INCIDENT_KEY_MS, "clear", &ours, owed),
+            None,
+            "at {now_ms}: the owed line is typed"
+        );
+        assert_eq!(
+            gate(now_ms, INCIDENT_KEY_MS, "pending", &ours, owed),
+            Some(Wait("held")),
+            "at {now_ms}: input unread at the prompt"
+        );
+        assert_eq!(
+            gate(now_ms, INCIDENT_KEY_MS, "clear", "lease:orchestrator", owed),
+            Some(Hand),
+            "at {now_ms}: another driver's hand"
+        );
+        for (ended_at_s, recorded, why) in [
+            (INCIDENT_END_S, None, "a record that names no grace"),
+            (0, Some(land), "an exit aterm did not end"),
+        ] {
+            assert_eq!(
+                gate(
+                    now_ms,
+                    INCIDENT_KEY_MS,
+                    "clear",
+                    &ours,
+                    line_grace(120, ended_at_s, recorded)
+                ),
+                Some(Wait("held")),
+                "at {now_ms}: {why} keeps the whole grace"
+            );
+        }
+    }
+    let at_prompt_ms = 1_793_034_370_000;
+    let owed = line_grace(120, INCIDENT_END_S, Some(land));
+    assert_eq!(
+        gate(at_prompt_ms + 5_000, at_prompt_ms, "clear", &ours, owed),
+        Some(Wait("held")),
+        "a key at the dead prompt after the end"
+    );
+    assert_eq!(
+        gate(
+            at_prompt_ms + u64::from(land) * 1000,
+            at_prompt_ms,
+            "clear",
+            &ours,
+            owed
+        ),
+        None,
+        "it holds the end's grace, no longer"
+    );
+    let halted = incident_status(1_793_034_366_000, INCIDENT_KEY_MS, "clear", &ours)
+        .replace(" hold=0 ", " hold=1 ");
+    for (status, want) in [
+        (None, Wait("held")),
+        (Some("ERR no such session"), Wait("held")),
+        (Some(halted.as_str()), Hand),
+    ] {
+        assert_eq!(
+            line_held_by_status(status, owed, INCIDENT_HOST),
+            Some(want),
+            "{status:?}"
+        );
+    }
+}
+
+/// The relaunch line an end aterm made owes is held by exactly the gate that let that end go: at
+/// any rung and grace, a key the end went past never holds it at any later read, and a key typed
+/// after the end holds it exactly as long as it would have held the end. A record that names no
+/// grace (an earlier build's) keeps the whole grace, so it never lets a key go that any end's gate
+/// would hold. The controls: the whole grace held some line an end went past, and a record that
+/// names no grace holds some key the end's own grace lets go.
+#[test]
+fn a_line_owed_after_the_harness_own_end_is_held_by_the_gate_that_let_the_end_go() {
+    use upgrade::Rung;
+    let status =
+        |human_ms: u64| format!("OK schema=1 hold=0 hand=- input=clear human_ms={human_ms}");
+    let held = |human_ms: u64, grace: u32| {
+        line_held_by_status(Some(&status(human_ms)), grace, INCIDENT_HOST).is_some()
+    };
+    let (mut whole_grace_held, mut unnamed_held_more) = (0u32, 0u32);
+    for grace_s in [0, 10, 20, 120, 600] {
+        for rung in [Rung::Prefer, Rung::Settled, Rung::KeysOnly, Rung::Land] {
+            let end_grace = upgrade::person_grace(rung, grace_s);
+            let named = line_grace(grace_s, INCIDENT_END_S, Some(end_grace));
+            let unnamed = line_grace(grace_s, INCIDENT_END_S, None);
+            for age_at_end_s in 0..=700u64 {
+                if super::super::upgrade_drive::held_by_status(
+                    &status(age_at_end_s * 1000),
+                    end_grace,
+                ) {
+                    continue;
+                }
+                for after_s in [1, 2, 5, 19, 20, 21, 60, 119, 120, 299] {
+                    let age_ms = (age_at_end_s + after_s) * 1000;
+                    assert!(
+                        !held(age_ms, named),
+                        "{rung:?} grace {grace_s}: a key {age_at_end_s} s before the end, read \
+                         {after_s} s after it"
+                    );
+                    let whole = person_present(&status(age_ms), grace_s);
+                    assert_eq!(
+                        held(age_ms, unnamed),
+                        whole,
+                        "{rung:?} grace {grace_s}: a record naming no grace keeps the whole"
+                    );
+                    whole_grace_held += u32::from(whole);
+                }
+            }
+            for key_after_s in [0, 1, 5, 19, 20, 21, 60, 119, 120, 599, 600] {
+                let age_ms = key_after_s * 1000;
+                assert_eq!(
+                    held(age_ms, named),
+                    super::super::upgrade_drive::held_by_status(&status(age_ms), end_grace),
+                    "{rung:?} grace {grace_s}: a key {key_after_s} s old after the end"
+                );
+                assert!(
+                    !held(age_ms, named) || held(age_ms, unnamed),
+                    "{rung:?} grace {grace_s}: a key {key_after_s} s old after the end holds a \
+                     record naming no grace"
+                );
+                unnamed_held_more += u32::from(held(age_ms, unnamed) && !held(age_ms, named));
+            }
+        }
+    }
+    assert!(
+        whole_grace_held > 0,
+        "the control: the whole grace held some line an end went past"
+    );
+    assert!(
+        unnamed_held_more > 0,
+        "the control: a record naming no grace holds keys the end's own grace lets go"
+    );
+}
+
+/// [`line_at_shell`]: a line planned without a `cd` (its directory recorded) is typed with a `cd`
+/// back to that directory once the person moved the shell, in the form the line builder gives a
+/// `cd` ([`upgrade::relaunch_line_env`]), as the relaunch types it ([`owed_line_at_shell`]); a fish
+/// shell's line, which cannot change directory, waits for the shell to come back
+/// (`wait:shell-moved`, never refused for good), as does one too long with the `cd`, and an unread
+/// dialect waits. The controls: a shell where the line was planned (under either spelling),
+/// a line with its own `cd` (none recorded) and an unread shell directory get the line as planned.
+#[cfg(unix)]
+#[test]
+fn a_line_planned_at_the_shells_directory_carries_a_cd_once_the_shell_moved() {
+    let dir = crate::supervise::ScratchDir::new("relaunch", "shell-moved");
+    let (here, there) = (dir.join("here"), dir.join("there"));
+    std::fs::create_dir_all(&here).expect("here");
+    std::fs::create_dir_all(&there).expect("there");
+    let link = dir.join("here-link");
+    std::os::unix::fs::symlink(&here, &link).expect("another spelling of here");
+    let (here_s, there_s, link_s) = (
+        here.to_string_lossy().into_owned(),
+        there.to_string_lossy().into_owned(),
+        link.to_string_lossy().into_owned(),
+    );
+    let exe = Path::new("/pkg/claude");
+    let args = words(&["--resume", "x"]);
+    let env = [(accounts::HOME_ENV, "/h/.claude-b")];
+    let line = |dialect: Dialect, cd: Option<&str>| {
+        upgrade::relaunch_line_env(dialect, None, cd, &env, exe, &args).expect("a line")
+    };
+    let planned = line(Dialect::Zsh, None);
+    let typed = |line: &str, line_dir: &str, now: Option<&str>, dialect: Option<Dialect>| {
+        match owed_line_at_shell(line, line_dir, now, dialect) {
+            Ok(line) => Ok(line),
+            Err(NoPlan::Wait(why)) => Err(format!("wait:{why}")),
+            Err(NoPlan::Refused { what, .. }) => Err(format!("refused:{what}")),
+        }
+    };
+    let zsh = Some(Dialect::Zsh);
+    assert_eq!(
+        typed(&planned, &here_s, Some(&there_s), zsh),
+        Ok(line(Dialect::Zsh, Some(&here_s))),
+        "the person moved it: the line carries its builder's cd back"
+    );
+    assert_eq!(
+        typed(&planned, &here_s, Some(&here_s), zsh),
+        Ok(planned.clone()),
+        "control: where it was"
+    );
+    assert_eq!(
+        typed(&planned, &link_s, Some(&here_s), zsh),
+        Ok(planned.clone()),
+        "control: one directory under two spellings"
+    );
+    let own_cd = line(Dialect::Zsh, Some(&here_s));
+    assert_eq!(
+        typed(&own_cd, "", Some(&there_s), zsh),
+        Ok(own_cd.clone()),
+        "control: a line with its own cd stands"
+    );
+    assert_eq!(
+        typed(&planned, &here_s, None, zsh),
+        Ok(planned.clone()),
+        "control: unread"
+    );
+    assert_eq!(
+        typed(
+            &line(Dialect::Fish, None),
+            &here_s,
+            Some(&there_s),
+            Some(Dialect::Fish)
+        ),
+        Err("wait:shell-moved".to_string()),
+        "a fish line cannot change directory: it waits for the shell"
+    );
+    // Past every terminal's line cap (1000 bytes on macOS, 4000 on Linux) with or without the cd.
+    let long = format!(" '/pkg/claude' '--resume' '{}'", "x".repeat(4000));
+    assert_eq!(
+        typed(&long, &here_s, Some(&there_s), zsh),
+        Err("wait:shell-moved".to_string()),
+        "a line too long with the cd waits for the shell"
+    );
+    assert_eq!(
+        typed(&long, &here_s, Some(&here_s), zsh),
+        Ok(long.clone()),
+        "control: the same line at its own directory goes as planned"
+    );
+    assert_eq!(
+        typed(&planned, &here_s, Some(&there_s), None),
+        Err("wait:shell-dialect".to_string())
+    );
+}
+
+/// The 2026-10-26 incident's carry: the line a harness restart owes, held by a person's keys, is
+/// tried again one second after its record's own grace lets them go. A key typed 5 s after the end
+/// holds a restart in place's line (its record names the whole 120 s) until 125 s after it, so the
+/// carry comes at about +126 s, not at +26 s; the control: a land-rung upgrade's line (20 s) at
+/// about +26 s. With no key (none read, or one past the grace) the back-off stands, capped at
+/// [`CARRY_EVERY`].
+#[test]
+fn a_harness_restart_held_by_keys_is_tried_once_its_own_grace_lets_them_go() {
+    let dir = crate::supervise::ScratchDir::new("relaunch", "carry-keys");
+    let opts = Opts {
+        home: dir.join("home"),
+        state: dir.join("state"),
+        sock: None,
+        token: None,
+        only_sid: Some("s-k".to_string()),
+        dry_run: false,
+        human_grace_s: 120,
+        hand_back: true,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+        usage_credits: false,
+        instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
+        usage_tap: None,
+        agents_off: Vec::new(),
+        land: false,
+        timings: crate::harness::Timings::FAST,
+    };
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    let (pid, end_s) = (93_257, 1_793_034_365);
+    let restart_as = St {
+        agent: upgrade::Agent::Claude,
+        pid,
+        tab: "s-k".to_string(),
+        cause: CAUSE_MEMORY.to_string(),
+        phase: upgrade::Phase::Exiting { at_s: end_s },
+        line_grace_s: Some(opts.human_grace_s),
+        ..St::default()
+    };
+    let land = St {
+        cause: String::new(),
+        line_grace_s: Some(upgrade::person_grace(
+            upgrade::Rung::Land,
+            opts.human_grace_s,
+        )),
+        ..restart_as.clone()
+    };
+    let key_at = end_s + 5;
+    let carry_at = |st: &St| {
+        save(&opts, "c-1", st);
+        let grace = carry_line_grace(&opts, upgrade::Agent::Claude, Some(pid));
+        let read_at_key = "OK schema=1 hold=0 hand=- input=clear human_ms=0";
+        match carry_pause(BACKOFF[1], Some(read_at_key), grace) {
+            CarryPause::Keys(pause) => key_at + pause.as_secs(),
+            CarryPause::Ladder(pause) => panic!("held by the key, a ladder step: {pause:?}"),
+        }
+    };
+    assert_eq!(carry_at(&restart_as), end_s + 126, "its own grace: 120 s");
+    assert_eq!(carry_at(&land), end_s + 26, "control: the land rung's 20 s");
+    let st = |human: &str| format!("OK schema=1 hold=0 hand=- input=clear human_ms={human}");
+    for (status, why) in [
+        (Some(st("120000")), "a key past the grace"),
+        (Some(st("-")), "no key"),
+        (None, "unread"),
+    ] {
+        assert_eq!(
+            carry_pause(BACKOFF[3], status.as_deref(), 120),
+            CarryPause::Ladder(CARRY_EVERY),
+            "control: {why}"
+        );
+    }
+    assert_eq!(
+        carry_pause(BACKOFF[1], Some(&st("-")), 120),
+        CarryPause::Ladder(BACKOFF[1])
+    );
+    assert_eq!(
+        carry_pause(BACKOFF[1], Some(&st("0")), 600),
+        CarryPause::Keys(Duration::from_secs(STALE_S)),
+        "never past the life of the record that owes the line"
+    );
+}
+
+/// An attempt made as a person's keys let its line go ([`CarryPause::Keys`]) that its line still
+/// holds does not climb the back-off: the next step is the one before it. The control: the same
+/// miss on the back-off's own step climbs it; a keys attempt that misses another way climbs it too.
+#[test]
+fn a_keys_attempt_still_held_does_not_climb_the_back_off() {
+    let now = Instant::now();
+    let restarted = || {
+        let mut r = Relaunches::default();
+        assert!(r.exited(OnExit::Restarted, now).is_ok(), "PRECONDITION");
+        let _ = r.attempted(&Outcome::NotYet(WAIT_HELD.to_string()), now);
+        r
+    };
+    let mut r = restarted();
+    let before = r.pause();
+    let _ = r.attempted_at_keys(&Outcome::NotYet(WAIT_HELD.to_string()), now);
+    assert_eq!(r.pause(), before, "held at the keys' step: no climb");
+    let mut control = restarted();
+    let _ = control.attempted(&Outcome::NotYet(WAIT_HELD.to_string()), now);
+    assert!(
+        control.pause() > before,
+        "control: the back-off's own step climbs"
+    );
+    let mut other = restarted();
+    let _ = other.attempted_at_keys(&Outcome::NotYet("wait:shell-prompt".to_string()), now);
+    assert!(
+        other.pause() > before,
+        "control: a miss of another kind climbs"
     );
 }

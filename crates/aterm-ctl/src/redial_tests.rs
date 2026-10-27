@@ -377,6 +377,47 @@ fn a_resumed_log_stream_continues_after_the_last_record_relayed() {
     assert_eq!(t.anchors(), EventAnchors::default());
 }
 
+/// C13 (ROBUST-3): a resume names the log (`log-base=`) only where the request named one, with
+/// the newest the host said (the `sub` line's `log_base=`, a reset `GAP`'s `base=`), so a resume
+/// after a reset is not reset again by the request's stale base.
+#[test]
+fn a_resumed_log_stream_names_the_log_only_where_its_request_did() {
+    let request = "subscribe @s-a log since-log=5 log-ep=1 log-base=1\n";
+    let mut t = FrameTracker::new(request);
+    t.feed(
+        b"OK subscribe 1\nsub 1 s-a log_seq=5 log_ep=1 log_base=1\n\
+          LOG 1 9 close r1 cmd out=ok src=shell conf=strong t=2\n",
+    );
+    assert_eq!(
+        resume_request(request, &t.sids(), &t.anchors()).as_deref(),
+        Some("subscribe @s-a log since-log=9 log-ep=1 log-base=1\n")
+    );
+    t.feed(
+        b"GAP 1 log-lost=0 why=reset resync_to=0 ep=7 base=6\n\
+          LOG 1 1 open - spawn src=aterm conf=exact t=3\n",
+    );
+    assert_eq!(
+        resume_request(request, &t.sids(), &t.anchors()).as_deref(),
+        Some("subscribe @s-a log since-log=1 log-ep=7 log-base=6\n"),
+        "the reset's base, never the request's stale one"
+    );
+    let plain = "subscribe @s-a log since-log=5 log-ep=1\n";
+    let mut t = FrameTracker::new(plain);
+    t.feed(b"OK subscribe 1\nsub 1 s-a log_seq=5 log_ep=1 log_base=1\n");
+    assert_eq!(
+        resume_request(plain, &t.sids(), &t.anchors()).as_deref(),
+        Some(plain),
+        "a request that named no log resumes naming none"
+    );
+    let tied = [("1".to_string(), "s-a".to_string())];
+    let own = "subscribe @. log since-log=5 log-ep=1 log-base=1\n";
+    assert_eq!(
+        unpinned_resume_request(own, &tied, &EventAnchors::default()).as_deref(),
+        Some("subscribe @. log\n"),
+        "an unpinned resume drops log-base= with since-log="
+    );
+}
+
 #[test]
 fn a_fallback_to_self_survives_a_leg_that_was_pinned() {
     let seen = EventAnchors {
@@ -1920,6 +1961,9 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         "await match prompt",
         "await inbox",
         "@s-a await agent idle,prompt timeout=60000",
+        "@s-a await agent idle,prompt timeout 20000 autopilot=cruise",
+        "@s-a await gone interrupt rows 3 4 timeout 20000 autopilot=-",
+        "await idle 500 autopilot=land",
         "await log need",
         "@s-a await log need timeout=600000",
         "await log close=turn since=4 ep=1 timeout=600000",
@@ -1943,6 +1987,9 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         "inbox since=7",
         "inbox 16 since=7",
         "@s-a await seq 3 timeout=500",
+        "@s-a await seq 3 timeout 20000 autopilot=land",
+        "await seq timeout 20000 autopilot=off",
+        "@s-a await agent busy since=7 timeout 20000 autopilot=cruise",
         "await log close=turn",
         "@s-a await log kind=verdict timeout=5000",
         "await log open=step timeout=1000",
@@ -1982,7 +2029,7 @@ fn a_cut_since_less_await_log_says_to_wait_again_from_status() {
         assert!(!retries_across_replacement(&cut), "{request}");
         let note = not_asked_again_note(&cut);
         assert!(
-            note.contains("since=<log_seq> ep=<log_ep>"),
+            note.contains("since=<log_seq> ep=<log_ep> base=<log_base>"),
             "{request}: {note}"
         );
     }

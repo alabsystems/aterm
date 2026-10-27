@@ -208,6 +208,30 @@ impl Session {
     ///
     /// # Errors
     /// The helper refused it, did not answer, or the socket failed.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Attach",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "AttachKeep",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "AttachRefused",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     pub fn attach(
         stream: UnixStream,
         attach: &Attach,
@@ -359,6 +383,14 @@ impl Session {
     ///
     /// # Errors
     /// The helper refused it (its words) or did not answer.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "ExecBegin",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     pub fn connect(&mut self, port: u32) -> Result<(u64, OwnedFd), ClientError> {
         self.send(&Request::Connect { port })?;
         self.until("Connect", &mut |_| {}, |reply, fd| match (reply, fd) {
@@ -394,6 +426,22 @@ impl Session {
     ///
     /// # Errors
     /// The helper did not answer.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "KeepSet",
+            project = "conformance_lifecycle::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "KeepClear",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     pub fn keep(&mut self, keep: bool) -> Result<(), ClientError> {
         self.done(&Request::Keep(keep), "Keep")?;
         self.keep = keep;
@@ -458,6 +506,14 @@ impl Session {
     }
 
     /// Close the session; the release rule runs (§5.1).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Detach",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     pub fn detach(self) {
         let _ = self.send(&Request::Detach);
     }
@@ -773,6 +829,14 @@ impl<S: Start> Lab<S> {
     /// SIGKILL the helper `record` names, which did not answer `what`, and say so as the run
     /// reports it. The wait for its end is a one-minute hang detector, whatever the spans
     /// are, since a SIGKILLed process's end must come.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Escalate",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     fn escalate(&mut self, record: &Record, what: &str) -> ClientError {
         let outcome = match self.start.kill(record) {
             Ok(()) => match self.wait_gone(record, SPAN) {

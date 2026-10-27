@@ -12,6 +12,11 @@ use crate::rewind::{Faith, RewindView};
 use crate::temporal::Span;
 use crate::{App, WindowId};
 
+/// How many of a rewound pane's `rows` rows the band and the track take: both from 4 rows, the band alone below that.
+pub(crate) const fn band_rows(rows: usize) -> usize {
+    if rows >= 4 { 2 } else { 1 }
+}
+
 /// The band's row for `view`, `cols` wide.
 pub(crate) fn band_row(
     view: &RewindView,
@@ -136,6 +141,18 @@ impl App {
             .collect()
     }
 
+    /// Whether window row `row` (in terminal grid rows) of window `wid` lies under the band or the track of the rewound `session`'s pane: rows the last frame claimed as chrome, or, before any frame, that pane's bottom band rows.
+    pub(crate) fn rewind_band_covers(&self, wid: WindowId, session: u64, row: u16) -> bool {
+        let row = usize::from(row);
+        self.chrome_owns_terminal_row(wid, row)
+            || self.rewound_panes(wid).iter().any(|(s, pane)| {
+                *s == session
+                    && row >= pane.row
+                    && row < pane.row + pane.rows
+                    && row - pane.row >= pane.rows.saturating_sub(band_rows(pane.rows))
+            })
+    }
+
     /// The Rewind fingerprint of window `wid`'s frame: 0 while no pane it shows is rewound.
     pub(crate) fn rewind_frame_fp(&self, wid: WindowId) -> u64 {
         let effects = match self.rewind_effects_status(wid) {
@@ -188,7 +205,7 @@ impl App {
             let effects = self.rewind_effects_status(wid);
             let text =
                 crate::rewind::band_text(view, now_ms, offset, s.ctx.job_feed.bytes(), effects);
-            let track = (pane.rows >= 4).then(|| track_row(view, pane.cols, &inks));
+            let track = (band_rows(pane.rows) == 2).then(|| track_row(view, pane.cols, &inks));
             rows.push((*pane, band_row(view, pane.cols, &inks, &text), track));
         }
         let Some(ws) = self.windows.get_mut(&wid) else {
@@ -277,8 +294,7 @@ impl App {
             .find(|(s, _)| *s == session)
             .map(|(_, pane)| pane);
         let bounds = self.grid_a11y_geometry(wid).zip(pane).map(|(g, pane)| {
-            let band_rows = if pane.rows >= 4 { 2 } else { 1 };
-            let top = (pane.row + pane.rows).saturating_sub(band_rows) as f64;
+            let top = (pane.row + pane.rows).saturating_sub(band_rows(pane.rows)) as f64;
             aterm_a11y::model::Rect {
                 x0: g.origin_x + pane.col as f64 * g.cell_w,
                 y0: g.origin_y + top * g.cell_h,

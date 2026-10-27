@@ -1384,7 +1384,48 @@ mod d4 {
         Outcome::ff(f - m1.0, r - m1.1, lit).with_note(format!("the move followed {}", m1.0 - m0.0))
     }
 
+    /// An identical line stands `dr` rows from the typed one, written before the typing and
+    /// never rewritten. `gap` ms after the last key (inside the type hint's 250 ms with a key in
+    /// flight, or past it, keyless) the program erases the typed row and puts the caret on the
+    /// copy at the line's end: the line went nowhere, and the copy must not light.
+    fn t9(pace: Pace, dr: i16, gap: u64) -> Outcome {
+        let text = "git status --short";
+        let row = 11u16;
+        let copy = row.saturating_add_signed(dr);
+        let mut h = PacedHost::new(24, 80, pace, false);
+        h.land(format!("\x1b[{copy};1H$ {text}\x1b[{row};1H$ ").as_bytes());
+        h.advance(100);
+        h.type_plain(text, 110);
+        h.advance(gap);
+        let m = h.counts();
+        let end = 3 + text.chars().count();
+        h.land(format!("\x1b[{row};1H\x1b[2K\x1b[{copy};{end}H").as_bytes());
+        let (f, r) = h.counts();
+        let mut lit = 0;
+        for _ in 0..60 {
+            h.now += Duration::from_millis(16);
+            h.frame();
+            lit += usize::from(h.lit(copy - 1));
+        }
+        Outcome::ff(f - m.0, r - m.1, lit)
+    }
+
     pub fn cases(v: &mut Vec<Case>) {
+        for pace in PACES {
+            for dr in sweep(&[-5i16, -4, -3, -2, -1, 1, 2, 3, 4, 5], &[-3, -1, 2, 4]) {
+                for (key, gap) in [("keyed", 100u64), ("keyless", 400)] {
+                    case(
+                        v,
+                        format!(
+                            "d4.t9.copy_standing_at_the_target/{}/{key}/dr{dr:+}",
+                            pace.tag()
+                        ),
+                        FF,
+                        move || t9(pace, dr, gap),
+                    );
+                }
+            }
+        }
         for pace in PACES {
             for near in [false, true] {
                 for wait in sweep(&[16u64, 32, 48, 64, 90, 130, 200, 400], &[32, 48, 90, 400]) {
@@ -1625,4 +1666,30 @@ fn the_limit_a_line_moved_beside_its_twin_and_killed_before_it_was_learned_light
 #[test]
 fn a_typo_fixed_in_place_under_the_previous_command_then_killed_goes_nowhere() {
     holds(all_cases(), "d4.t5.");
+}
+
+fn dr_of(id: &str) -> i16 {
+    let at = id.find("/dr").expect("a row offset") + "/dr".len();
+    id[at..]
+        .split('/')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("a row offset")
+}
+
+/// The law holds for a copy one row away, a follow offset the band samples, so the copy is its
+/// twin from the first key. The limit, keyed and keyless, at every pacing: a copy two or more
+/// rows away is followed and lit. Every record starts with each offset clear
+/// (`Witness::insert`) and only a sample of that offset's row makes a copy its twin, and the
+/// witness names a band's rows and their neighbours only (`Engine::band_rows`), so the copy is
+/// first seen as the caret's row on the arrival frame. Two rows away its offset is still clear,
+/// so it reads as an arrival; past the two-row offsets the caret's carry is one by rule
+/// (`Witness::judge_follow`'s `CARRY_BIT`), with no twin evidence asked.
+#[test]
+fn a_copy_standing_at_the_far_target_is_not_a_move() {
+    holds_but(
+        all_cases(),
+        |id| id.starts_with("d4.t9."),
+        |id| dr_of(id).unsigned_abs() >= 2,
+    );
 }

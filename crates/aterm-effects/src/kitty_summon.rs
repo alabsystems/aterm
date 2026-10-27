@@ -146,6 +146,7 @@ impl TypedKittySummon {
     }
 
     /// Feed one committed printed keystroke; reports what the lexicon word it completed owes.
+    #[inline]
     pub fn note_char(
         &mut self,
         now: Instant,
@@ -216,6 +217,7 @@ impl TypedKittySummon {
         }
     }
 
+    #[inline]
     fn trailing_scan_start(buf: &str, last: char) -> usize {
         #[inline]
         const fn is_ascii_tok(b: u8) -> bool {

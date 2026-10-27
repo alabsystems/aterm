@@ -186,7 +186,9 @@ impl EditorBufferView {
         self.reconcile_viewport_with(&EditorLines::scanning(text), visible_lines)
     }
 
-    /// Install the renderer's capacity.
+    /// Install the renderer's capacity. A changed capacity (a resize) reveals the caret, but not
+    /// while a prompt holds the keyboard: the rows its footer takes or gives back as it wraps
+    /// leave the document where the reader scrolled it, the caret behind the prompt unrevealed.
     pub fn reconcile_viewport_with(
         &mut self,
         lines: &EditorLines<'_>,
@@ -195,7 +197,7 @@ impl EditorBufferView {
         let before_anchor = self.viewport_anchor;
         let before_lines = self.viewport_lines;
         self.viewport_lines = visible_line_capacity(visible_lines);
-        if before_lines == self.viewport_lines {
+        if before_lines == self.viewport_lines || self.minibuffer_active() {
             let last_full_viewport_anchor = lines.total().saturating_sub(self.viewport_lines);
             let anchor = lines
                 .number_at(self.viewport_anchor)
@@ -675,6 +677,57 @@ mod tests {
         resized.viewport_anchor = view.viewport_anchor;
         resized.reconcile_viewport_with(&lines, 20);
         assert_eq!(lines.number_at(resized.viewport_anchor), 0);
+    }
+
+    /// A PROMPT HOLDS THE VIEWPORT: while the minibuffer holds the keyboard, a changed capacity
+    /// (its footer wrapping onto another row) keeps the view scrolled away from the caret, the
+    /// anchor only clamped to the last full viewport; the same change with no prompt reveals the
+    /// caret (the NEGATIVE CONTROL), and closing the prompt reveals it again.
+    #[test]
+    fn a_prompt_holds_the_viewport_a_changed_capacity_would_move() {
+        let text = (0..300)
+            .map(|line| format!("line {line:03}\n"))
+            .collect::<String>();
+        let lines = EditorLines::scanning(&text);
+        let (mut store, mut workspace, mut view, _) = editor(&text);
+        view.reconcile_viewport(&text, 35);
+        view.scroll_lines(&text, 200);
+        let scrolled = view.viewport_anchor;
+        assert_eq!(
+            lines.number_at(scrolled),
+            200,
+            "premise: the caret is far above"
+        );
+
+        let mut plain = view.clone();
+        plain.reconcile_viewport(&text, 34);
+        assert_eq!(
+            lines.number_at(plain.viewport_anchor),
+            0,
+            "no prompt: revealed"
+        );
+
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::ExecuteCommand)
+            .unwrap();
+        assert!(view.minibuffer_active(), "premise: the prompt is open");
+        assert!(view.reconcile_viewport(&text, 34));
+        assert_eq!(
+            view.viewport_anchor, scrolled,
+            "the prompt keeps the scroll"
+        );
+        view.reconcile_viewport(&text, 250);
+        assert_eq!(
+            lines.number_at(view.viewport_anchor),
+            lines.total() - 250,
+            "clamped to the last full viewport"
+        );
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::Abort)
+            .unwrap();
+        assert!(!view.minibuffer_active());
+        view.reconcile_viewport(&text, 35);
+        assert_eq!(lines.number_at(view.viewport_anchor), 0, "closed: revealed");
     }
 
     #[test]

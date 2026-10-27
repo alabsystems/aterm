@@ -73,9 +73,9 @@ impl Clock {
     }
 
     pub(super) fn at(&self, offset: i128) -> Instant {
-        let span = Duration::from_nanos(
-            u64::try_from(offset.unsigned_abs()).expect("fixture offsets fit u64 ns"),
-        );
+        let abs = offset.unsigned_abs();
+        assert!(abs <= u128::from(u64::MAX), "fixture offsets fit u64 ns");
+        let span = Duration::from_nanos(abs as u64);
         if offset >= 0 {
             self.origin.checked_add(span)
         } else {
@@ -86,8 +86,16 @@ impl Clock {
 
     pub(super) fn offset(&self, t: Instant) -> i128 {
         match t.checked_duration_since(self.origin) {
-            Some(after) => i128::try_from(after.as_nanos()).expect("fits"),
-            None => -i128::try_from(self.origin.duration_since(t).as_nanos()).expect("fits"),
+            Some(after) => {
+                let ns = after.as_nanos();
+                assert!(ns <= i128::MAX as u128, "fits");
+                ns as i128
+            }
+            None => {
+                let ns = self.origin.duration_since(t).as_nanos();
+                assert!(ns <= i128::MAX as u128, "fits");
+                -(ns as i128)
+            }
         }
     }
 }
@@ -140,7 +148,9 @@ pub(super) fn step(g: &mut MomentumGlow, clock: &Clock, ev: &Ev) -> Obs {
 pub(super) fn assert_admitted(evs: &[Ev]) {
     let p = &MOMENTUM_PROFILE;
     let mut last = None;
-    for ev in evs {
+    let mut i = 0;
+    while i < evs.len() {
+        let ev = &evs[i];
         let at = match *ev {
             Ev::Key { at, tau } => {
                 admit_tau(p, tau).expect("fixture key tau is admitted");
@@ -157,6 +167,7 @@ pub(super) fn assert_admitted(evs: &[Ev]) {
             admit_time(p, last, at).expect("fixture time is admitted");
             last = Some(at);
         }
+        i += 1;
     }
 }
 
@@ -215,7 +226,7 @@ impl Recorder {
 }
 
 /// 10×20 cells, 24×80, at the window's origin.
-pub(super) fn plain() -> Geom {
+pub(super) const fn plain() -> Geom {
     Geom {
         cw: 10,
         ch: 20,
@@ -230,7 +241,7 @@ pub(super) fn plain() -> Geom {
 }
 
 /// A real window: 15×28 cells, padded, under an 80 px head band.
-pub(super) fn padded() -> Geom {
+pub(super) const fn padded() -> Geom {
     Geom {
         cw: 15,
         ch: 28,
@@ -245,7 +256,7 @@ pub(super) fn padded() -> Geom {
 }
 
 /// The host's configuration on a dark or a light page, in `hue`.
-pub(super) fn config(dark: bool, hue: u32) -> MomentumGlowConfig {
+pub(super) const fn config(dark: bool, hue: u32) -> MomentumGlowConfig {
     MomentumGlowConfig {
         enabled: true,
         intensity: 1.0,
@@ -271,7 +282,8 @@ pub(super) fn dark_burst_and_cooldown() -> Vec<Ev> {
     };
     let lane = Duration::from_micros(16_667);
     let mut now = 0;
-    for k in 0..6u16 {
+    let mut k = 0u16;
+    while k < 6 {
         now = i128::from(k) * 60 * MS;
         r.push(Ev::Key { at: now, tau: TAU });
         r.push(Ev::Tick {
@@ -281,6 +293,7 @@ pub(super) fn dark_burst_and_cooldown() -> Vec<Ev> {
             cfg,
         });
         r.push(Ev::Query { at: now, lane });
+        k += 1;
     }
     let parked = r.cool_down(now, Some((4, 15)), geom, cfg, lane);
     let later = parked + 1_000 * MS;
@@ -301,7 +314,8 @@ pub(super) fn light_page_burst() -> Vec<Ev> {
     let lane = Duration::from_micros(33_333);
     let mut now = 0;
     let mut cfg = config(false, 0x0009_69DA);
-    for k in 0..6u16 {
+    let mut k = 0u16;
+    while k < 6 {
         now = i128::from(k) * 90 * MS;
         let col = 20 + k;
         cfg = MomentumGlowConfig {
@@ -320,6 +334,7 @@ pub(super) fn light_page_burst() -> Vec<Ev> {
             cfg,
         });
         r.push(Ev::Query { at: now, lane });
+        k += 1;
     }
     let parked = r.cool_down(now, Some((6, 25)), geom, cfg, lane);
     r.push(Ev::Tick {

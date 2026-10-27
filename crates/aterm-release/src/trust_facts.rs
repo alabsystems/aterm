@@ -47,6 +47,17 @@ pub(crate) fn one_line(s: &str) -> String {
     s.replace(['\t', '\r', '\n'], " ")
 }
 
+/// The `--reason` of `trust run` or `trust judge` (`verb`): the words a lowered floor's row keeps
+/// in its fifth column, so one with none, which would leave that column blank, is refused.
+pub(crate) fn reason_arg(verb: &str, why: &str) -> std::result::Result<String, String> {
+    if why.trim().is_empty() {
+        return Err(format!(
+            "trust {verb}: --reason says why a floor goes down, in its row's fifth column, so it needs words, got {why:?}"
+        ));
+    }
+    Ok(why.to_string())
+}
+
 /// Encodes `bytes` as lowercase hexadecimal.
 pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -2529,6 +2540,9 @@ pub fn judge(
     let mut ratchet_now: Option<String> = ratchet.map(str::to_string);
     let mut backstops_now: Option<String> = backstops.map(str::to_string);
     let mut rewrote = false;
+    // Whether `--reason` went into a row, and if not, what became of each library it was given
+    // for: a reason that lowered nothing is said, never dropped.
+    let (mut reason_kept, mut reason_fates) = (false, Vec::<(String, String)>::new());
     let mut memory_rows: Vec<(String, MemRow)> = Vec::new();
     let mut host_obs: Vec<(String, Option<[String; 5]>)> = Vec::new();
     let mut refused_paths: BTreeMap<&PathRefusal, Vec<&str>> = BTreeMap::new();
@@ -2854,7 +2868,7 @@ pub fn judge(
                 }
                 if !own_floor {
                     notes.push(format!(
-                        "DRIVER CHANGED: {name}: its floor of {f} was recorded under {floor_driver}; this run's prover is {driver_row}, and proved {proved}: fix what it no longer proves, or lower the row onto it with a reason (`targo --unverified ship trust judge --update-ratchet --reason '<why>'`)"
+                        "DRIVER CHANGED: {name}: its floor of {f} was recorded under {floor_driver}; this run's prover is {driver_row}, and proved {proved}: fix what it no longer proves, or lower the row onto it with a reason (`targo --unverified ship trust run -p {name} --update-ratchet --reason '<why>'`, or `ship trust judge --update-ratchet --reason '<why>'` over a whole-tree run's facts)"
                     ));
                 }
                 let skipped = m.skipped.unwrap_or(0);
@@ -2970,10 +2984,23 @@ pub fn judge(
             let run_c = cen.ceil.clone();
             let lowers = floor.is_some_and(|f| proved < f);
             let reason = update.reason.filter(|_| lowers && !own_floor);
+            let mut fate = if reason.is_some() {
+                None
+            } else if lowers {
+                Some(format!(
+                    "{proved} proved, below its floor of {}, which this prover recorded: a reason lowers only another prover's floor",
+                    floor.unwrap_or(0)
+                ))
+            } else {
+                Some(floor.map_or_else(
+                    || format!("{proved} proved, its first floor, which needs no reason"),
+                    |f| format!("{proved} proved, meeting its floor of {f}"),
+                ))
+            };
             if lowers && reason.is_none() {
                 if !own_floor {
                     notes.push(format!(
-                        "NOT LOWERED: {name}: {proved} proved stays below the floor of {} another prover recorded — --update-ratchet lowers no floor; it goes down onto this prover only with its reason: `targo --unverified ship trust judge --update-ratchet --reason '<why>'`",
+                        "NOT LOWERED: {name}: {proved} proved stays below the floor of {} another prover recorded — --update-ratchet lowers no floor; it goes down onto this prover only with its reason: `targo --unverified ship trust run -p {name} --update-ratchet --reason '<why>'` (or `ship trust judge --update-ratchet --reason '<why>'` over a whole-tree run's facts)",
                         floor.unwrap_or(0)
                     ));
                 }
@@ -2981,6 +3008,9 @@ pub fn judge(
                 let withhold = run_withhold.or_else(|| match (floor, run_c.as_deref()) {
                     (Some(f), _) if proved >= f || mem.f == "-" => None,
                     (None, _) => None,
+                    // A prover whose trustc takes no ceiling ran out of none: the floor's
+                    // ceiling cannot explain what it proves.
+                    (Some(_), None) if host.uncapped => None,
                     (Some(_), None) => Some(format!(
                         "this run's log names no verifier ceiling (a seal from trust main has none), and its floor was set at {} GiB; re-base it from a run whose log names its ceiling",
                         mem.f
@@ -3007,7 +3037,11 @@ pub fn judge(
                 });
                 if let Some(w) = withhold {
                     notes.push(format!("RE-BASE WITHHELD: {name}: {w}"));
+                    fate = Some(format!(
+                        "{proved} proved, its re-base withheld (RE-BASE WITHHELD)"
+                    ));
                 } else {
+                    reason_kept |= reason.is_some();
                     let mut lines: Vec<String> = ratchet_now
                         .as_deref()
                         .unwrap_or("")
@@ -3017,7 +3051,10 @@ pub fn judge(
                         .collect();
                     lines.push(match reason {
                         Some(why) => {
-                            format!("{name}\t{proved}\t{all}\t{driver_row}\t{}", one_line(why))
+                            format!(
+                                "{name}\t{proved}\t{all}\t{driver_row}\t{}",
+                                one_line(why.trim())
+                            )
                         }
                         None => format!("{name}\t{proved}\t{all}\t{driver_row}"),
                     });
@@ -3047,7 +3084,25 @@ pub fn judge(
             if let Some(r) = mem_learn(mem, &nf, &cen, today, &host) {
                 memory_rows.push((name.into(), r));
             }
+            if let Some(f) = fate.filter(|_| update.reason.is_some()) {
+                reason_fates.push((name.into(), f));
+            }
         }
+    }
+    if update.on && update.reason.is_some() && !reason_kept {
+        let fates: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                reason_fates.iter().find(|(n, _)| *n == r[0]).map_or_else(
+                    || format!("{}: {}, nothing to lower", r[0], r[1]),
+                    |(n, f)| format!("{n}: {f}"),
+                )
+            })
+            .collect();
+        notes.push(format!(
+            "REASON UNUSED: --reason lowered no floor, so no row keeps it: {}",
+            fates.join("; ")
+        ));
     }
 
     let unverified: Vec<String> = by_trustd.iter().chain(&by_clock).cloned().collect();
@@ -4572,7 +4627,9 @@ pub fn parse_cmd<'a>(
     let value = |f: &str| flags.get(f).copied().flatten();
     let commit = value("--commit").unwrap_or("HEAD").to_string();
     let update = flags.contains_key("--update-ratchet");
-    let reason = value("--reason").map(str::to_string);
+    let reason = value("--reason")
+        .map(|why| reason_arg(verb, why))
+        .transpose()?;
     if reason.is_some() && !update {
         return Err(
             "trust judge: --reason says why --update-ratchet lowers a floor; give both".into(),
@@ -5811,6 +5868,99 @@ mod tests {
         assert!(why.report.contains("TOTAL-ABOVE-ROW(>2)"), "{}", why.report);
     }
 
+    /// `trust judge --reason`, as `trust run`'s, needs `--update-ratchet` and words: a blank one
+    /// would leave the lowered row's fifth column blank.
+    #[test]
+    fn the_judges_reason_needs_words_and_update_ratchet() {
+        let reason = |args: &[&str]| {
+            let mut it = std::iter::once("judge").chain(args.iter().copied());
+            parse_cmd(&mut it).map(|c| match c {
+                TrustCmd::Judge { reason, .. } => reason,
+                other => panic!("{other:?}"),
+            })
+        };
+        assert_eq!(
+            reason(&["--update-ratchet", "--reason", "re-based"]),
+            Ok(Some("re-based".into()))
+        );
+        assert_eq!(reason(&["--update-ratchet"]), Ok(None));
+        for args in [
+            &["--reason", "re-based"][..],
+            &["--update-ratchet", "--reason", ""],
+            &["--update-ratchet", "--reason", " "],
+            &["--update-ratchet", "--reason", "\t\r\n"],
+        ] {
+            assert!(reason(args).is_err(), "{args:?}");
+        }
+    }
+
+    /// A `--reason` that lowered no floor is said, with what became of each library it was given
+    /// for, never dropped without a word; one a row keeps, trimmed, is not, nor is a run with none.
+    #[test]
+    fn a_reason_that_lowers_nothing_is_said() {
+        let theirs = "targo 1.99.0-dev (bbbbbbbbb 2026-09-17) (targo 0.1.0)";
+        let f = facts(vec![
+            ("alpha", gate("Summary: 3 proved (3 total)")),
+            ("beta", gate("Summary: 2 proved (4 total)")),
+            ("gamma", Decision::NoLib),
+        ]);
+        let why = "the new prover asks other obligations";
+        let reasoned = Update {
+            on: true,
+            reason: Some(why),
+        };
+        let unused = |v: &Verdict| {
+            v.report
+                .lines()
+                .find(|l| l.starts_with("REASON UNUSED"))
+                .map(str::to_string)
+        };
+        let met = judge(
+            &f,
+            Some(&format!("alpha\t2\t3\t{theirs}\nbeta\t3\t4\t{DRV}\n")),
+            None,
+            "R",
+            "M",
+            reasoned,
+        );
+        assert_eq!(
+            met.ratchet.as_deref(),
+            Some(format!("alpha\t3\t3\t{DRV}\nbeta\t3\t4\t{DRV}\n").as_str()),
+            "alpha re-based with no reason, beta's own floor kept"
+        );
+        assert_eq!(
+            unused(&met).as_deref(),
+            Some(
+                "REASON UNUSED: --reason lowered no floor, so no row keeps it: alpha: 3 proved, \
+                 meeting its floor of 2; beta: 2 proved, below its floor of 3, which this prover \
+                 recorded: a reason lowers only another prover's floor; gamma: NO-LIB, nothing \
+                 to lower"
+            ),
+            "{}",
+            met.report
+        );
+        let floors = format!("alpha\t9\t9\t{theirs}\nbeta\t2\t4\t{DRV}\n");
+        let lowered = judge(
+            &f,
+            Some(&floors),
+            None,
+            "R",
+            "M",
+            Update {
+                on: true,
+                reason: Some(" the new prover asks other obligations\n"),
+            },
+        );
+        assert_eq!(
+            lowered.ratchet.as_deref(),
+            Some(format!("alpha\t3\t3\t{DRV}\t{why}\nbeta\t2\t4\t{DRV}\n").as_str())
+        );
+        assert_eq!(unused(&lowered), None, "{}", lowered.report);
+        let none = judge(&f, Some(&floors), None, "R", "M", Update::RAISE);
+        assert_eq!(none.ratchet.as_deref(), Some(floors.as_str()));
+        assert_eq!(unused(&none), None, "{}", none.report);
+    }
+
     #[test]
     fn a_reasoned_rebase_is_held_to_the_memory_guard() {
         let theirs = "targo 1.99.0-dev (bbbbbbbbb 2026-09-17) (targo 0.1.0)";
@@ -5862,6 +6012,54 @@ mod tests {
                     when: "2026-09-30".into(),
                 }
             )]
+        );
+    }
+
+    /// A prover whose trustc takes no ceiling names none in its log and ran out of none, so a
+    /// reasoned re-base onto it is not withheld for the ceiling its floor was set at, and the
+    /// floor's ceiling becomes `-`; a capped prover's log that names none still withholds it.
+    #[test]
+    fn an_uncapped_provers_run_rebases_a_floor_set_at_a_ceiling() {
+        let theirs = "targo 1.99.0-dev (bbbbbbbbb 2026-09-17) (targo 0.1.0)";
+        let why = "the new prover asks other obligations";
+        let run = |uncapped: bool| {
+            let mut f = facts(vec![("alpha", gate("Summary: 3 proved (3 total)"))]);
+            f.crates[0].memory = MemRow {
+                f: "6.0".into(),
+                ..MemRow::default()
+            };
+            f.host = Host {
+                uncapped,
+                ..host(48)
+            };
+            let update = Update {
+                on: true,
+                reason: Some(why),
+            };
+            let floor = format!("alpha\t9\t9\t{theirs}\n");
+            judge(&f, Some(&floor), None, "R", "M", update)
+        };
+        let rebased = run(true);
+        assert_eq!(
+            rebased.ratchet.as_deref(),
+            Some(format!("alpha\t3\t3\t{DRV}\t{why}\n").as_str())
+        );
+        assert_eq!(
+            rebased.memory_rows,
+            [(
+                "alpha".to_string(),
+                MemRow {
+                    f: "-".into(),
+                    ..MemRow::default()
+                }
+            )]
+        );
+        let capped = run(false);
+        assert_eq!(capped.ratchet, None);
+        assert!(
+            capped.report.contains("RE-BASE WITHHELD: alpha"),
+            "{}",
+            capped.report
         );
     }
 

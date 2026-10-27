@@ -215,7 +215,7 @@ pub fn run_provision(
         record("front door", front_door_check(bin), &mut checks);
     }
     record("doc tool", doc_tool_check(&home, check_only), &mut checks);
-    record("rust shims", rust_shim_check(&home), &mut checks);
+    record("rust shims", rust_shim_check(), &mut checks);
     record("x86 slice", x86_slice_check(), &mut checks);
     record("apple sdk", apple_clt_check(), &mut checks);
     let host: std::sync::Arc<dyn layer::ReleaseHost> =
@@ -1090,19 +1090,53 @@ fn path_persist_fix(dir: &Path) -> String {
 
 /// Check rustup proxies ([`crate::buildplan::release_rustup_shim_dir`]).
 #[cfg(unix)]
-fn rust_shim_check(home: &str) -> Check {
-    match crate::buildplan::release_rustup_shim_dir(std::ffi::OsStr::new(home)) {
+fn rust_shim_check() -> Check {
+    rust_shim_verdict(
+        aterm_uds::host::tool("rustup").locate(),
+        aterm_uds::host::tooling_dir().as_deref(),
+    )
+}
+
+/// [`rust_shim_check`] on the `rustup` row's answer `rustup`, the row's copy looked for in
+/// `tooling`. A directory that fails is fixed through the row's provider, never by hand: the
+/// row's own copy is removed and placed again, and any other rustup (one on `$PATH`, such as
+/// Homebrew's link) is outranked by the copy `verify provision` places.
+#[cfg(unix)]
+fn rust_shim_verdict(
+    rustup: std::result::Result<PathBuf, aterm_uds::host::Absent>,
+    tooling: Option<&Path>,
+) -> Check {
+    let rustup = match rustup {
+        Ok(rustup) => rustup,
+        Err(absent) => {
+            return Check::Fail {
+                what: absent.why,
+                fix: absent.fix,
+            };
+        }
+    };
+    match crate::buildplan::release_rustup_shim_dir_of(&rustup) {
         Ok(dir) => Check::Pass(format!(
             "cargo and rustup are real files in {}",
             dir.display()
         )),
-        Err(what) => Check::Fail {
-            what,
-            fix: "make cargo and rustup there regular files of yours, not group- or \
-                  world-writable (rustup-init hard-links its proxies; in that directory \
-                  `ln -f rustup cargo` turns a symlinked cargo into one)"
-                .into(),
-        },
+        Err(what) => {
+            let row = aterm_uds::host::tool("rustup");
+            let fix = match tooling.and_then(|t| row.pinned_root(t)) {
+                Some(root) if rustup.starts_with(&root) => format!(
+                    "remove {}, the row's copy, then {}, with cargo and rustc linked beside it",
+                    root.display(),
+                    row.remedy()
+                ),
+                _ => format!(
+                    "{}, with cargo and rustc linked beside it, which the row answers before {} \
+                     on $PATH",
+                    row.remedy(),
+                    rustup.display()
+                ),
+            };
+            Check::Fail { what, fix }
+        }
     }
 }
 
@@ -1472,7 +1506,7 @@ pub fn audit(repo: &Path, id: &str) -> Vec<Finding> {
         found.push(("front door", front_door_check(bin)));
     }
     found.push(("doc tool", doc_tool_check(&home, true)));
-    found.push(("rust shims", rust_shim_check(&home)));
+    found.push(("rust shims", rust_shim_check()));
     found.push(("x86 slice", x86_slice_check()));
     found.push(("apple sdk", apple_clt_check()));
     let (apple, apple_sha1) = apple_identity_check(id, false, None);
@@ -1964,9 +1998,12 @@ fn now_unix() -> Result<u64> {
 mod tests {
     use super::*;
 
-    /// The audit's shim line is the build's own refusal: a symlinked cargo (how one
-    /// machine's rustup linked it) fails with the build's words, and the same proxy as a
-    /// hard link passes.
+    /// The audit's shim line is the build's own refusal, over the `rustup` row's answer: a
+    /// symlinked cargo beside it (how one machine's rustup linked it) fails with the build's
+    /// words, the same proxy as a hard link (how the row's copy lays it) passes, and no
+    /// rustup at all fails naming the row's provider. A failing copy's fix removes and
+    /// re-places it; a failing rustup on `$PATH` (Homebrew's link) is fixed by placing the
+    /// copy that outranks it, never by editing that directory.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_cargo_proxy_fails_the_audit_as_it_fails_the_build() {
@@ -1975,25 +2012,63 @@ mod tests {
             .prefix("provision-shims-")
             .tempdir()
             .unwrap();
-        let bin = home.path().join(".cargo/bin");
+        let bin = home.path().join("tooling.noindex/rustup-1.29.2/bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(bin.join("rustup"), "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(bin.join("rustup"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
         std::os::unix::fs::symlink("rustup", bin.join("cargo")).unwrap();
-        let home_s = home.path().to_str().unwrap();
-        match rust_shim_check(home_s) {
-            Check::Fail { what, .. } => assert!(what.contains("not a real regular file"), "{what}"),
+        let tooling = home.path().join("tooling.noindex");
+        let verdict = || rust_shim_verdict(Ok(bin.join("rustup")), Some(&tooling));
+        match verdict() {
+            Check::Fail { what, fix } => {
+                assert!(what.contains("not a real regular file"), "{what}");
+                assert!(
+                    fix.starts_with(&format!(
+                        "remove {}, the row's copy",
+                        tooling.join("rustup-1.29.2").display()
+                    )),
+                    "{fix}"
+                );
+                assert_eq!(fix.matches("verify provision").count(), 1, "{fix}");
+            }
             other => panic!("a symlinked cargo passed the audit: {other:?}"),
         }
         std::fs::remove_file(bin.join("cargo")).unwrap();
         std::fs::hard_link(bin.join("rustup"), bin.join("cargo")).unwrap();
-        assert!(
-            matches!(rust_shim_check(home_s), Check::Pass(_)),
-            "{:?}",
-            rust_shim_check(home_s)
-        );
+        assert!(matches!(verdict(), Check::Pass(_)), "{:?}", verdict());
+        let row = aterm_uds::host::tool("rustup");
+        let on_path = home.path().join("opt/homebrew/bin");
+        std::fs::create_dir_all(&on_path).unwrap();
+        std::fs::set_permissions(&on_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::copy(bin.join("rustup"), on_path.join("rustup")).unwrap();
+        std::os::unix::fs::symlink("rustup", on_path.join("cargo")).unwrap();
+        match rust_shim_verdict(Ok(on_path.join("rustup")), Some(&tooling)) {
+            Check::Fail { what, fix } => {
+                assert!(what.contains("not a real regular file"), "{what}");
+                assert!(fix.starts_with(&row.remedy()), "the row's provider: {fix}");
+                assert!(
+                    !fix.contains("ln -f") && !fix.contains("remove"),
+                    "nothing is changed in another's directory: {fix}"
+                );
+            }
+            other => panic!("a symlinked cargo on $PATH passed the audit: {other:?}"),
+        }
+        let absent = row
+            .locate_in(&aterm_uds::host::Lookup {
+                named: None,
+                tooling: Some(home.path().join("empty")),
+                path: None,
+            })
+            .unwrap_err();
+        match rust_shim_verdict(Err(absent), Some(&tooling)) {
+            Check::Fail { what, fix } => {
+                assert!(what.starts_with("no rustup (looked in"), "{what}");
+                assert_eq!(fix, row.remedy());
+            }
+            other => panic!("no rustup passed the audit: {other:?}"),
+        }
     }
 
     #[test]

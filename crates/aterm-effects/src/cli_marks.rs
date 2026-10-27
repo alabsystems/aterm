@@ -61,6 +61,7 @@ impl CliMark {
     ];
 
     /// Look up the mark for a canonical lowercase CLI app id.
+    #[inline]
     #[must_use]
     pub const fn for_app(app_id: &str) -> Option<Self> {
         match app_id.as_bytes() {
@@ -75,12 +76,14 @@ impl CliMark {
     }
 
     /// Canonical lowercase word for this CLI.
+    #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
         brand(self).word
     }
 
     /// Display name printed by the lockup for `build`.
+    #[inline]
     #[must_use]
     pub const fn name(self, build: Build) -> &'static str {
         match (build, brand(self).alab_word) {
@@ -90,6 +93,7 @@ impl CliMark {
     }
 
     /// Total cell width of the lockup for `build`.
+    #[inline]
     #[must_use]
     pub const fn lockup_cells(self, build: Build) -> usize {
         ICON_RUN + self.name(build).len() + 1
@@ -133,6 +137,7 @@ pub struct Inks {
 
 impl Inks {
     /// The same inks on either polarity.
+    #[inline]
     const fn both(inks: &'static [u32]) -> Self {
         Self {
             dark: inks,
@@ -141,6 +146,7 @@ impl Inks {
     }
 
     /// Select the ink list for ground polarity `dark`.
+    #[inline]
     #[must_use]
     pub const fn on(self, dark: bool) -> &'static [u32] {
         if dark { self.dark } else { self.paper }
@@ -158,6 +164,7 @@ pub enum Master {
 
 impl Master {
     /// Design scale factor of this master.
+    #[inline]
     #[must_use]
     pub const fn design_scale(self) -> u16 {
         match self {
@@ -190,6 +197,7 @@ pub struct Brand {
 
 impl Brand {
     /// Sprite rows for `master`, if present.
+    #[inline]
     #[must_use]
     pub const fn master(&self, master: Master) -> Option<&'static [&'static str]> {
         match master {
@@ -200,6 +208,7 @@ impl Brand {
 }
 
 /// Look up the [`Brand`] specification for `mark`.
+#[inline]
 #[must_use]
 pub const fn brand(mark: CliMark) -> &'static Brand {
     match mark {
@@ -365,6 +374,7 @@ pub struct Fit {
 
 impl Fit {
     /// Effective resolution in SD-texel units.
+    #[inline]
     #[must_use]
     pub const fn effective(self) -> u32 {
         self.master.design_scale() as u32 * self.scale as u32
@@ -373,6 +383,7 @@ impl Fit {
 
 /// Compute the [`Fit`] of `mark` inside a `cw × ch` cell's icon box.
 #[must_use]
+#[inline]
 pub const fn fit(mark: CliMark, cw: u16, ch: u16) -> Option<Fit> {
     let box_w = ICON_CELLS as u32 * cw as u32;
     let box_h = ch as u32;
@@ -439,6 +450,7 @@ pub const fn fit(mark: CliMark, cw: u16, ch: u16) -> Option<Fit> {
 
 /// Interned `Index8` [`FxArt`] for `mark` and `master`.
 #[must_use]
+#[inline]
 pub fn art(mark: CliMark, master: Master) -> Option<&'static Arc<FxArt>> {
     static ARTS: [OnceLock<[Option<Arc<FxArt>>; 2]>; CliMark::ALL.len()] =
         [const { OnceLock::new() }; CliMark::ALL.len()];
@@ -453,6 +465,7 @@ pub fn art(mark: CliMark, master: Master) -> Option<&'static Arc<FxArt>> {
 }
 
 /// Unfloored ink for letter `letter` of `mark`'s name on ground polarity `dark`.
+#[inline]
 #[must_use]
 pub const fn name_ink(mark: CliMark, letter: usize, dark: bool) -> u32 {
     let inks = brand(mark).name.on(dark);
@@ -461,6 +474,7 @@ pub const fn name_ink(mark: CliMark, letter: usize, dark: bool) -> u32 {
 }
 
 /// Contrast-floored foreground RGB for letter `letter` of `mark`'s name on `ground`.
+#[inline]
 #[must_use]
 pub const fn name_fg(mark: CliMark, letter: usize, ground: u32) -> u32 {
     let ink = name_ink(mark, letter, dark_ground(ground));
@@ -469,6 +483,7 @@ pub const fn name_fg(mark: CliMark, letter: usize, ground: u32) -> u32 {
 
 /// Contrast-floored icon palette for `mark` on `ground`.
 #[must_use]
+#[inline]
 pub fn icon_palette(mark: CliMark, ground: u32) -> Vec<FxInk> {
     let b = brand(mark);
     let inks = b.icon.on(dark_ground(ground));
@@ -495,6 +510,7 @@ pub fn icon_palette(mark: CliMark, ground: u32) -> Vec<FxInk> {
 
 /// Build the [`FxContent`] sprite payload for `mark` at `fit` on `ground`.
 #[must_use]
+#[inline]
 pub fn content(mark: CliMark, fit: Fit, ground: u32) -> Arc<FxContent> {
     let Some(art) = art(mark, fit.master) else {
         return Arc::new(FxContent::new(Vec::new(), Vec::new()));
@@ -517,6 +533,7 @@ pub fn content(mark: CliMark, fit: Fit, ground: u32) -> Arc<FxContent> {
 
 /// Build the [`FxLayer`] placing `content` above the terminal glyphs.
 #[must_use]
+#[inline]
 pub fn layer(id: u64, content: Arc<FxContent>, offset: (i32, i32), clip: PxRect) -> FxLayer {
     let mut layer = FxLayer::new(id, content, FxSlot::Over, FxSpace::Grid, FxBlend::Exact);
     layer.offset = offset;

@@ -73,27 +73,29 @@ pub(crate) enum Origin {
     Settings,
     /// The digest line's mover: the owner's press.
     Digest,
-    /// `aterm ctl devtools hand-over`: every in-session client can send it, so it is held to the
-    /// window's own rules.
-    Ctl {
-        /// Show the panel now instead of waiting for a quiet moment.
-        now: bool,
-    },
+    /// `aterm ctl devtools hand-over`, bare (its `now` is `permissions walk now devtools`, a
+    /// page of [`Self::Walk`]): every in-session client can send it, so it is held to the window's
+    /// own rules.
+    Ctl,
+    /// A page of the permission walk (`crate::permission_walk`): started by the cold first
+    /// launch with the person present, the Permissions row's press, or `aterm ctl permissions
+    /// walk now` for a person at the terminal. It is held as the owner's press: no quiet
+    /// moment and no ten-minute gap between its pages.
+    Walk,
 }
 
 impl Origin {
     /// The owner's own press: it opens the page whatever aterm read, declined or built.
     pub(crate) const fn owner_press(self) -> bool {
-        matches!(self, Self::Settings | Self::Digest)
+        matches!(self, Self::Settings | Self::Digest | Self::Walk)
     }
 
     /// How long after aterm last opened the page (`atpkg::devtools`' shared marker) this origin
     /// may open it again; `None` for an owner's press.
     pub(crate) const fn reopen_after_s(self) -> Option<u64> {
         match self {
-            Self::Settings | Self::Digest => None,
-            Self::Ctl { now: true } => Some(atpkg::devtools::REOPEN_NOW_AFTER_S),
-            Self::Automatic | Self::SystemStateAct | Self::Ctl { now: false } => {
+            Self::Settings | Self::Digest | Self::Walk => None,
+            Self::Automatic | Self::SystemStateAct | Self::Ctl => {
                 Some(atpkg::devtools::REOPEN_AFTER_S)
             }
         }
@@ -101,7 +103,7 @@ impl Origin {
 
     const fn lapses_after(self) -> Option<Duration> {
         match self {
-            Self::Ctl { now: false } | Self::SystemStateAct => Some(ASKED_LAPSE),
+            Self::Ctl | Self::SystemStateAct => Some(ASKED_LAPSE),
             _ => None,
         }
     }
@@ -113,8 +115,8 @@ impl Origin {
             Self::SystemStateAct => "system state act",
             Self::Settings => "settings",
             Self::Digest => "digest",
-            Self::Ctl { now: false } => "ctl",
-            Self::Ctl { now: true } => "ctl now",
+            Self::Ctl => "ctl",
+            Self::Walk => "walk",
         }
     }
 
@@ -136,22 +138,18 @@ pub(crate) enum Page {
     /// of a launch that reads it off ([`admit_fda`]), and the panel beside the page the Security
     /// card's and the digest's *Open Settings* open.
     FullDiskAccess,
+    /// Privacy & Security ▸ Accessibility: a page of the permission walk only, when the
+    /// Messages and FaceTime sign-outs need it.
+    Accessibility,
 }
 
 impl Page {
-    /// The page's System Settings anchor.
-    pub(crate) const fn pane(self) -> crate::menu::PrivacyPane {
-        match self {
-            Self::DeveloperTools => crate::menu::PrivacyPane::DeveloperTools,
-            Self::FullDiskAccess => crate::menu::PrivacyPane::FullDiskAccess,
-        }
-    }
-
     /// The page in aterm.log's words.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::DeveloperTools => "devtools",
             Self::FullDiskAccess => "full disk access",
+            Self::Accessibility => "accessibility",
         }
     }
 
@@ -160,6 +158,7 @@ impl Page {
         match self {
             Self::DeveloperTools => Access::DeveloperTools,
             Self::FullDiskAccess => Access::FullDiskAccess,
+            Self::Accessibility => Access::Accessibility,
         }
     }
 }
@@ -179,9 +178,9 @@ pub(crate) fn declined_for(
 ) -> bool {
     let this_revision = last.is_some_and(|(word, _)| atpkg::devtools::same_step(word, key));
     match origin {
-        Origin::Settings | Origin::Digest => false,
+        Origin::Settings | Origin::Digest | Origin::Walk => false,
         Origin::Automatic | Origin::SystemStateAct => this_revision,
-        Origin::Ctl { .. } => this_revision || held,
+        Origin::Ctl => this_revision || held,
     }
 }
 
@@ -273,8 +272,6 @@ pub(crate) enum Admit {
     Refuse(Refusal),
     /// Hold it for a quiet moment ([`quiet`]).
     Queue,
-    /// Show the panel only: the asker opens the page itself (`aterm doctor`).
-    PanelOnly,
     /// Open the page only: aterm is already on and switched on (an owner's press).
     PaneOnly,
     /// Open the page and show the panel; on a list read whole and empty, run `spctl developer-mode
@@ -308,14 +305,13 @@ pub(crate) fn admit(origin: Origin, moment: Moment, facts: &Facts) -> Admit {
     if origin == Origin::Automatic && !facts.fda_on {
         return Admit::Refuse(Refusal::NoFullDiskAccess);
     }
-    let now = origin == Origin::Ctl { now: true };
-    if !now && atpkg::devtools::Step::of(&facts.list) == atpkg::devtools::Step::ListedOn {
+    if atpkg::devtools::Step::of(&facts.list) == atpkg::devtools::Step::ListedOn {
         return Admit::Refuse(Refusal::Listed);
     }
     if facts.declined {
         return Admit::Refuse(Refusal::Declined);
     }
-    if !facts.grant_stable && !now {
+    if !facts.grant_stable {
         return Admit::Refuse(Refusal::Unstable);
     }
     if origin == Origin::Automatic && facts.shown_this_revision {
@@ -324,10 +320,9 @@ pub(crate) fn admit(origin: Origin, moment: Moment, facts: &Facts) -> Admit {
     if facts.recent {
         return Admit::Refuse(Refusal::Recent);
     }
-    match (now, moment) {
-        (true, _) => Admit::PanelOnly,
-        (false, Moment::Asked) => Admit::Queue,
-        (false, Moment::Quiet) => Admit::Hand {
+    match moment {
+        Moment::Asked => Admit::Queue,
+        Moment::Quiet => Admit::Hand {
             list_terminal: empty,
         },
     }
@@ -421,10 +416,6 @@ pub(crate) enum HandOver {
     Refused(Refusal),
     /// Held for a quiet moment.
     Queued,
-    /// The panel is up; the asker opens the page.
-    Shown,
-    /// The panel could not be shown (the asker opens the page without it).
-    Unshown,
     /// System Settings is open at the page (the panel beside it, when not granted).
     Opened,
     /// `spctl developer-mode enable-terminal` is running; the page opens when it ends.
@@ -445,8 +436,6 @@ impl HandOver {
             Self::Headless => "headless",
             Self::Refused(why) => why.as_str(),
             Self::Queued => "queued",
-            Self::Shown => "shown",
-            Self::Unshown => "unshown",
             Self::Opened => "opened",
             Self::Listing => "listing",
             Self::OpenFailed => "failed",
@@ -595,6 +584,39 @@ pub(crate) const FDA_PANEL_TRADE: &str = "Full Disk Access on a terminal is broa
 
 /// The done words: aterm's own probe reads the grant.
 pub(crate) const FDA_PANEL_DONE: &str = "aterm has Full Disk Access.";
+
+/// macOS's own Quit & Reopen sheet after the switch: aterm's probe reads the grant in the running
+/// process (the S1 measurement, `docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §7), so a relaunch
+/// would only cost the person their tabs.
+pub(crate) const FDA_PANEL_LATER: &str =
+    "If macOS offers Quit & Reopen, choose Later. aterm already sees the change.";
+
+/// The Accessibility page's heading (a page of the permission walk).
+pub(crate) const AX_PANEL_TITLE: &str = "Turn on Accessibility for aterm";
+
+/// Why: only the sign-outs the person chose need it.
+pub(crate) const AX_PANEL_WHY: &str = "Signing out of Messages and FaceTime needs it: aterm \
+                                       presses their Sign Out buttons for you.";
+
+/// The tile's hint while it can be dragged.
+pub(crate) const AX_PANEL_STEP: &str = "Drag aterm into the Accessibility list";
+
+/// How, with aterm's icon to drag.
+pub(crate) const AX_PANEL_HOW: &str = "Drag aterm into the list (or press + below it and choose \
+                                       aterm), enter your password if macOS asks, and switch \
+                                       aterm on.";
+
+/// How, with no icon to drag.
+pub(crate) const AX_PANEL_HOW_PLUS: &str = "Press + below the list, choose aterm, enter your \
+                                            password if macOS asks, and switch aterm on.";
+
+/// The done words: `AXIsProcessTrusted` reads the grant.
+pub(crate) const AX_PANEL_DONE: &str = "aterm has Accessibility.";
+
+/// A walk page's place in the walk: the panel's "Step 1 of 3".
+fn step_words((at, of): (usize, usize)) -> String {
+    format!("Step {at} of {of}")
+}
 
 /// tccd's measured cost, when its log was read whole and it checked any: the Settings row's words.
 #[must_use]
@@ -798,8 +820,8 @@ pub(crate) const PANEL_FOR: Duration = Duration::from_secs(10 * 60);
 /// running, and (on a readable list) read it once.
 pub(crate) const PANEL_TICK: Duration = Duration::from_secs(2);
 
-/// How long the done words stay before the panel closes itself.
-pub(crate) const DONE_FOR: Duration = Duration::from_secs(4);
+/// How long the done words stay before the panel closes itself, or turns to the walk's next page.
+pub(crate) const DONE_FOR: Duration = Duration::from_secs(1);
 
 /// How long after an accepted drop a readable list must read aterm on before the panel says it
 /// may have landed elsewhere.
@@ -832,8 +854,10 @@ pub(crate) enum Phase {
     expect(dead_code, reason = "the AppKit panel is macOS-only")
 )]
 pub(crate) enum PanelEvent {
-    /// Not now, or the close box.
+    /// Not now.
     NotNow,
+    /// The close box: Not now for this page, and the end of a permission walk.
+    CloseBox,
     /// The UNREAD variant's "I've switched it on".
     SwitchedOn,
     /// "No Developer Tools list? Show it" ([`Button::ShowList`]).
@@ -853,8 +877,10 @@ pub(crate) enum PanelEvent {
 /// Why the panel closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Closed {
-    /// Not now, or the close box, with aterm not switched on: the owner's decline.
+    /// Not now, with aterm not switched on: the owner's decline.
     NotNow,
+    /// The close box, with aterm not switched on: a decline, which also ends a permission walk.
+    CloseBox,
     /// The owner says aterm's switch is on (the UNREAD variant).
     SwitchedOn,
     /// aterm reads on, and the done words have stood.
@@ -870,7 +896,7 @@ pub(crate) enum Closed {
 impl Closed {
     /// Whether this close is the owner's Not now (`atpkg::devtools::note_declined`).
     pub(crate) const fn declines(self) -> bool {
-        matches!(self, Self::NotNow)
+        matches!(self, Self::NotNow | Self::CloseBox)
     }
 }
 
@@ -907,6 +933,8 @@ pub(crate) struct Show {
     pub(crate) listed: Option<Result<(), String>>,
     pub(crate) bundle: Option<PathBuf>,
     pub(crate) skips: bool,
+    /// The page's place in the permission walk, 1-based, and the walk's length.
+    pub(crate) step: Option<(usize, usize)>,
 }
 
 /// The panel's state machine: what it shows, and what each of the owner's presses, each reading
@@ -932,6 +960,11 @@ pub(crate) struct Panel {
     done_at: Option<Instant>,
     read_out: bool,
     last_read: Option<Instant>,
+    step: Option<(usize, usize)>,
+    /// Whether the Full Disk Access page says Later to macOS's Quit & Reopen sheet: only in a
+    /// process the owner started, whose running window reads a grant made now at once (§7 S1);
+    /// an update's successor can read it late, so it claims nothing there.
+    later: bool,
 }
 
 fn listed_off(list: DevToolList) -> bool {
@@ -970,6 +1003,8 @@ impl Panel {
             done_at: None,
             read_out: false,
             last_read: Some(now),
+            step: show.step,
+            later: true,
         }
     }
 
@@ -1000,10 +1035,12 @@ impl Panel {
             HELPER_HOW, HELPER_HOW_PLUS, HELPER_LISTED_ON, HELPER_SWITCH_ON, HELPER_TITLE, done,
             only_aterm, trade, why,
         };
-        if self.page == Page::FullDiskAccess {
-            return self.fda_content();
+        match self.page {
+            Page::FullDiskAccess => return self.fda_content(),
+            Page::Accessibility => return self.accessibility_content(),
+            Page::DeveloperTools => {}
         }
-        let mut blocks = vec![Block::text(HELPER_TITLE, Tone::Title)];
+        let mut blocks = self.heading(HELPER_TITLE);
         if self.phase == Phase::Done {
             blocks.push(Block::text(done(self.skips), Tone::Done));
             blocks.push(Block::Link(STATUS_LINK));
@@ -1062,8 +1099,17 @@ impl Panel {
         Content { blocks }
     }
 
+    /// The title, and under it a walk page's place in the walk.
+    fn heading(&self, title: &'static str) -> Vec<Block> {
+        let mut blocks = vec![Block::text(title, Tone::Title)];
+        if let Some(step) = self.step {
+            blocks.push(Block::text(step_words(step), Tone::Secondary));
+        }
+        blocks
+    }
+
     fn fda_content(&self) -> Content {
-        let mut blocks = vec![Block::text(FDA_PANEL_TITLE, Tone::Title)];
+        let mut blocks = self.heading(FDA_PANEL_TITLE);
         if self.phase == Phase::Done {
             blocks.push(Block::text(FDA_PANEL_DONE, Tone::Done));
             blocks.push(Block::Link(STATUS_LINK));
@@ -1092,10 +1138,46 @@ impl Panel {
             },
             Tone::Body,
         ));
+        if self.later {
+            blocks.push(Block::text(FDA_PANEL_LATER, Tone::Body));
+        }
         blocks.push(Block::text(FDA_PANEL_TRADE, Tone::Secondary));
         blocks.push(Block::Buttons(vec![Button::SwitchedOn, Button::NotNow]));
         blocks.push(Block::Link(STATUS_LINK));
         Content { blocks }
+    }
+
+    /// The walk's Accessibility page: the Full Disk Access page's shape, its own words.
+    fn accessibility_content(&self) -> Content {
+        let mut blocks = self.heading(AX_PANEL_TITLE);
+        if self.phase == Phase::Done {
+            blocks.push(Block::text(AX_PANEL_DONE, Tone::Done));
+            return Content { blocks };
+        }
+        blocks.push(Block::text(AX_PANEL_WHY, Tone::Body));
+        if let Some(bundle) = &self.bundle {
+            blocks.push(Block::Tile(Tile {
+                bundle: bundle.clone(),
+                live: self.dropped_at.is_none(),
+                step: AX_PANEL_STEP,
+            }));
+        }
+        blocks.push(Block::text(
+            if self.bundle.is_none() || self.dropped_at.is_some() {
+                AX_PANEL_HOW_PLUS
+            } else {
+                AX_PANEL_HOW
+            },
+            Tone::Body,
+        ));
+        blocks.push(Block::Buttons(vec![Button::NotNow]));
+        Content { blocks }
+    }
+
+    /// The page's place in the permission walk, when it is a walk's page.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) const fn step(&self) -> Option<(usize, usize)> {
+        self.step
     }
 
     /// Whether the owner dropped aterm's icon somewhere this panel's life.
@@ -1106,9 +1188,11 @@ impl Panel {
     /// One of the owner's presses, or the end of their drag.
     pub(crate) fn on(&mut self, event: PanelEvent, now: Instant) -> Effect {
         match event {
-            PanelEvent::NotNow => Effect {
+            PanelEvent::NotNow | PanelEvent::CloseBox => Effect {
                 close: Some(if self.phase == Phase::Done {
                     Closed::Done
+                } else if event == PanelEvent::CloseBox {
+                    Closed::CloseBox
                 } else {
                     Closed::NotNow
                 }),
@@ -1160,11 +1244,14 @@ impl Panel {
         }
     }
 
-    /// A completed read of the list (the lane's one-shot).
+    /// A completed read of the list (the lane's one-shot). Only the Developer Tools page reads
+    /// it: a permission walk turns one panel from page to page under one generation, so a read
+    /// the Developer Tools page sent out can come back to the page after it, whose grant is not
+    /// the list's.
     pub(crate) fn on_read(&mut self, list: DevToolList, now: Instant) -> Effect {
         self.read_out = false;
         self.last_read = Some(now);
-        if self.phase == Phase::Done {
+        if self.page != Page::DeveloperTools || self.phase == Phase::Done {
             return Effect::default();
         }
         if list.label == DevToolListLabel::Read {
@@ -1301,7 +1388,7 @@ impl Panel {
     }
 
     /// Whether the lane should read the list now: only a readable list, one read at a time, at
-    /// most one per [`PANEL_TICK`] (at once after a drop), never once done.
+    /// most one per [`Self::read_every`] (at once after a drop), never once done.
     pub(crate) fn wants_read(&self, now: Instant) -> bool {
         self.page == Page::DeveloperTools
             && self.unread.is_none()
@@ -1309,7 +1396,18 @@ impl Panel {
             && self.phase != Phase::Done
             && self
                 .last_read
-                .is_none_or(|at| now.saturating_duration_since(at) >= PANEL_TICK)
+                .is_none_or(|at| now.saturating_duration_since(at) >= self.read_every())
+    }
+
+    /// How often the list is read while the panel is up: every
+    /// [`crate::permission_walk::GRANT_POLL`] on a walk's page, so a switch flipped there turns
+    /// the page within half a second; otherwise every [`PANEL_TICK`].
+    const fn read_every(&self) -> Duration {
+        if self.step.is_some() {
+            crate::permission_walk::GRANT_POLL
+        } else {
+            PANEL_TICK
+        }
     }
 
     /// The soonest instant [`Self::turn`] changes something.
@@ -1996,7 +2094,7 @@ impl std::fmt::Debug for FdaReach {
 }
 
 fn live_open_fda_pane() -> bool {
-    crate::menu::open_privacy_settings(Page::FullDiskAccess.pane()).opened()
+    crate::menu::open_privacy_settings(crate::menu::PrivacyPane::FullDiskAccess).opened()
 }
 
 fn live_fda_last_opened() -> Option<(String, u64)> {
@@ -2275,10 +2373,9 @@ impl Queued {
 /// [`fda_opened_word`] keeps the revision's word), so the step waits on for the revision, with
 /// no rider (the page was the ask's), and looks again no sooner than `look_after`
 /// ([`Queued::page_wait`]). A page's caller passes [`past_its_ten_minutes`], taken once the page
-/// came up: after its marker was written (the window writes the Full Disk Access page's), or,
-/// for a control verb's `now`, after the window's answer, whose asker brings the Developer Tools
-/// page up and writes its marker later. A Developer Tools marker still within its ten minutes at
-/// that look holds the step on (`App::devtools_page_holds_the_step`), so neither page refuses
+/// came up, after its marker was written. A Developer Tools marker still within its ten minutes
+/// at that look (a page brought up since, by this window, `aterm doctor` or another aterm) holds
+/// the step on (`App::devtools_page_holds_the_step`), so neither page refuses
 /// the step as [`Refusal::Recent`], which would leave the revision's step unasked in this
 /// process.
 fn came_up(slot: &mut Option<Queued>, revision: bool, look_after: Instant) {
@@ -2340,7 +2437,7 @@ impl FdaEnded {
     /// Whether the owner acted on the page: anything but leaving the panel alone (Not now, or
     /// [`PANEL_FOR`] with nothing dropped).
     pub(crate) const fn owner_acted(self) -> bool {
-        self.dropped || !matches!(self.why, Closed::NotNow | Closed::Lapsed)
+        self.dropped || !matches!(self.why, Closed::NotNow | Closed::CloseBox | Closed::Lapsed)
     }
 }
 
@@ -2412,7 +2509,6 @@ pub(crate) struct Lane {
     shared: Arc<Mutex<Shared>>,
     opened: Option<Option<u64>>,
     declined: Option<Option<(u64, u64)>>,
-    now_answered: Option<Instant>,
     refreshing: Arc<std::sync::atomic::AtomicBool>,
     refreshes: u32,
     /// The keys and revision a panel's Not now is noted under ([`Self::set_marks`]).
@@ -2420,6 +2516,13 @@ pub(crate) struct Lane {
     /// Not nows said under an approved revision, until the window records them
     /// ([`Self::take_declines`]).
     declines: Vec<(u64, Access)>,
+    /// The permission walk has a page after the panel's ([`Self::hold_for_walk`]): a walk page
+    /// that closes done or declined leaves the panel up for it.
+    walk_holds: bool,
+    /// The panel is up with no page in it, held for the walk's next ([`Self::show`] turns it).
+    held: bool,
+    /// How the last walk page closed, until the window's walk takes it ([`Self::take_closed`]).
+    closed: Option<(Page, Closed)>,
 }
 
 impl Lane {
@@ -2467,11 +2570,13 @@ impl Lane {
             shared: Arc::new(Mutex::new(Shared::default())),
             opened: None,
             declined: None,
-            now_answered: None,
             refreshing: Arc::default(),
             refreshes: 0,
             marks: Marks::default(),
             declines: Vec::new(),
+            walk_holds: false,
+            held: false,
+            closed: None,
         }
     }
 
@@ -2515,6 +2620,12 @@ impl Lane {
     /// may come [`COLD_START_SETTLE`] after it was made.
     pub(crate) const fn note_cold_start(&mut self) {
         self.settle = COLD_START_SETTLE;
+    }
+
+    /// Whether the owner started this process ([`Self::note_cold_start`]): an update's successor
+    /// never starts the permission walk by itself.
+    pub(crate) fn cold_start(&self) -> bool {
+        self.settle == COLD_START_SETTLE
     }
 
     /// Whether this process has settled enough for a quiet moment ([`quiet`]).
@@ -2670,20 +2781,6 @@ impl Lane {
         }
     }
 
-    /// The window answered a control verb's `now` at `now`, with its panel or without it.
-    pub(crate) const fn noted_now_answered(&mut self, now: Instant) {
-        self.now_answered = Some(now);
-    }
-
-    /// Whether the window answered a `now` within [`atpkg::devtools::REOPEN_NOW_AFTER_S`] before
-    /// `now`: the next one is `recent` whether or not its asker opened the page.
-    pub(crate) fn now_answered_within_its_minute(&self, now: Instant) -> bool {
-        self.now_answered.is_some_and(|at| {
-            now.saturating_duration_since(at)
-                < Duration::from_secs(atpkg::devtools::REOPEN_NOW_AFTER_S)
-        })
-    }
-
     /// The Developer Tools page, or its panel, came up: what waits for it is answered, except
     /// the window's own step while no access revision stands (`revision`), which waits on for
     /// the revision with no rider and looks again no sooner than `look_after` ([`came_up`]).
@@ -2767,6 +2864,12 @@ impl Lane {
             .lock_or_recover()
             .events
             .push((self.generation, event));
+    }
+
+    /// A list reading of the panel's own, as its worker posts it.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn read_for_test(&self, list: DevToolList) {
+        self.shared.lock_or_recover().list = Some((self.generation, list));
     }
 
     /// Whether a Full Disk Access hand-over waits for its quiet moment.
@@ -3146,37 +3249,102 @@ impl Lane {
         }
     }
 
-    /// Show the panel (one at a time: an earlier one closes).
+    /// Show the panel (one at a time: an earlier one closes). A walk's page turns the panel the
+    /// walk held up ([`Self::hold_for_walk`]) to itself: the same panel, in place, with what was
+    /// pressed on the page before it dropped.
     pub(crate) fn show(&mut self, show: Show, now: Instant, wake: Wake) -> bool {
-        self.close(Closed::Replaced);
-        self.generation = self.generation.wrapping_add(1);
-        {
+        let turn = self.held && show.step.is_some();
+        if turn {
+            let mut shared = self.shared.lock_or_recover();
+            shared.events.clear();
+            shared.list = None;
+        } else {
+            self.close(Closed::Replaced);
+            self.release_held();
+            self.generation = self.generation.wrapping_add(1);
             let mut shared = self.shared.lock_or_recover();
             shared.generation = self.generation;
             shared.list = None;
         }
-        let panel = Panel::new(show, now);
-        let events = PanelEvents {
-            panel: self.generation,
-            shared: Arc::clone(&self.shared),
-            wake,
-        };
-        if !(self.arm.show)(&panel.content(), events) {
-            return false;
+        let mut panel = Panel::new(show, now);
+        panel.later = self.cold_start();
+        if turn {
+            (self.arm.update)(&panel.content());
+            self.held = false;
+        } else {
+            let events = PanelEvents {
+                panel: self.generation,
+                shared: Arc::clone(&self.shared),
+                wake,
+            };
+            if !(self.arm.show)(&panel.content(), events) {
+                return false;
+            }
         }
         aterm_log::info!(
-            "{}: the helper panel is up ({}{})",
+            "{}: the helper panel is up ({}{}{})",
             panel.page.as_str(),
             panel.origin().as_str(),
             if panel.page == Page::DeveloperTools && !panel.readable() {
                 ", unread"
             } else {
                 ""
-            }
+            },
+            panel
+                .step
+                .map_or_else(String::new, |(at, of)| format!(", walk {at} of {of}"))
         );
         self.panel = Some(panel);
         self.next_tick = Some(now);
         true
+    }
+
+    /// Whether the permission walk has a page after the one up: a walk page that closes done or
+    /// declined then leaves the panel up, empty, for [`Self::show`] to turn to the next.
+    pub(crate) const fn hold_for_walk(&mut self, continues: bool) {
+        self.walk_holds = continues;
+    }
+
+    /// Whether the permission walk's `page` is up or on its way: its panel shown, or its own
+    /// hand-over waiting (a `spctl` run, the Full Disk Access reading) to show it.
+    pub(crate) fn walk_page_alive(&self, page: Page) -> bool {
+        let walks = |queued: &Option<Queued>| {
+            queued
+                .as_ref()
+                .is_some_and(|queued| queued.origin == Origin::Walk)
+        };
+        self.panel
+            .as_ref()
+            .is_some_and(|panel| panel.page() == page)
+            || match page {
+                Page::FullDiskAccess => walks(&self.fda_queued),
+                Page::DeveloperTools => {
+                    walks(&self.queued) || self.listing == Some(Listing::HandOver(Origin::Walk))
+                }
+                Page::Accessibility => false,
+            }
+    }
+
+    /// Close a panel held for a walk page that will not come (the walk ended, or its next page
+    /// could not open).
+    pub(crate) fn release_held(&mut self) {
+        if std::mem::take(&mut self.held) {
+            (self.arm.close)();
+        }
+    }
+
+    /// How the last walk page closed, once: the window's walk goes on, or ends, by it.
+    pub(crate) const fn take_closed(&mut self) -> Option<(Page, Closed)> {
+        self.closed.take()
+    }
+
+    /// A grant the window read for `page` while its panel is up: the done words, then the close
+    /// (or, in a walk, the next page) after [`DONE_FOR`].
+    pub(crate) fn note_granted(&mut self, page: Page, now: Instant) {
+        if let Some(panel) = self.panel.as_mut().filter(|panel| panel.page == page) {
+            let effect = panel.granted(now);
+            self.redraw(effect);
+        }
     }
 
     /// Set the [`Marks`] a panel's Not now is noted under from now on.
@@ -3194,7 +3362,18 @@ impl Lane {
         let Some(panel) = self.panel.take() else {
             return;
         };
-        (self.arm.close)();
+        let walk_page = panel.step.is_some();
+        if walk_page {
+            self.closed = Some((panel.page, why));
+        }
+        if walk_page
+            && self.walk_holds
+            && matches!(why, Closed::Done | Closed::NotNow | Closed::SwitchedOn)
+        {
+            self.held = true;
+        } else {
+            (self.arm.close)();
+        }
         self.next_tick = None;
         if why.declines()
             && let Some(revision) = self.marks.revision
@@ -3217,6 +3396,8 @@ impl Lane {
                     dropped: panel.dropped(),
                 });
             }
+            // A walk's page only: its Not now is the row's `declined` in the access record.
+            Page::Accessibility => {}
         }
         aterm_log::info!(
             "{}: the helper panel closed ({why:?}, {:?})",
@@ -3289,8 +3470,12 @@ impl Lane {
         {
             effect = effect.and(panel.turn(now));
         }
+        let walk_page = self
+            .panel
+            .as_ref()
+            .is_some_and(|panel| panel.step.is_some());
         if effect.close.is_none()
-            && (due || read_asked)
+            && (due || read_asked || walk_page)
             && let Some(gate) = read
         {
             self.start_read(now, gate, wake);
@@ -3364,6 +3549,10 @@ impl Lane {
             }
             if panel.read_out {
                 fold(now + PANEL_TICK);
+            }
+            // A walk's page reads its grant every quarter second.
+            if panel.step.is_some() && panel.phase != Phase::Done {
+                fold(now + crate::permission_walk::GRANT_POLL);
             }
         }
         if self.listing.is_some() || self.ahead {
@@ -3537,7 +3726,7 @@ pub(crate) mod live {
 
             @sel(windowShouldClose:)
             fn windowShouldClose(&self, _window: Id) -> Bool {
-                self.ivars().events.post(PanelEvent::NotNow);
+                self.ivars().events.post(PanelEvent::CloseBox);
                 Bool::NO
             }
 
@@ -5340,6 +5529,24 @@ pub(crate) mod test_arms {
         }
     }
 
+    /// [`showing`] with its show, in-place turn, close and System Settings' frontmost reading
+    /// given.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn counted(
+        show: fn(&super::Content, super::PanelEvents) -> bool,
+        update: fn(&super::Content),
+        close: fn(),
+        settings_frontmost: fn() -> bool,
+    ) -> DevToolsHelperArm {
+        DevToolsHelperArm {
+            show,
+            update,
+            close,
+            settings_frontmost,
+            ..showing()
+        }
+    }
+
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn stand_in(app: &mut crate::App, reach: Reach) {
         fn no_probe(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
@@ -5462,7 +5669,7 @@ mod tests {
                 Refusal::Recent,
             ),
         ];
-        let act = Origin::Ctl { now: false };
+        let act = Origin::Ctl;
         for (facts, why) in cases {
             for moment in [Moment::Asked, Moment::Quiet] {
                 assert_eq!(
@@ -5559,6 +5766,7 @@ mod tests {
             listed: None,
             bundle,
             skips: false,
+            step: None,
         }
     }
 
@@ -5606,12 +5814,58 @@ mod tests {
         let done = panel.content();
         assert!(has(&done, FDA_PANEL_DONE) && done.buttons().is_empty());
         seen.push(done);
+        assert!(
+            seen[..4]
+                .iter()
+                .all(|content| has(content, FDA_PANEL_LATER)),
+            "every page the switch is still to flip on says Later to macOS's sheet"
+        );
+        let mut reopen_words = 0;
         for content in &seen {
             for (text, _) in content.texts() {
                 assert!(!text.contains("Developer Tools"), "{text}");
+                // The copy rule (DESIGN-macos-tcc-prompts §3.4): aterm never prompts a restart;
+                // its one Reopen word is the line that tells the person to decline macOS's.
+                let lower = text.to_lowercase();
+                if ["reopen", "restart", "relaunch", "quit"]
+                    .iter()
+                    .any(|word| lower.contains(word))
+                {
+                    assert_eq!(text, FDA_PANEL_LATER);
+                    reopen_words += 1;
+                }
             }
             assert!(!content.buttons().contains(&Button::ShowList));
         }
+        assert!(
+            reopen_words > 0,
+            "NEGATIVE CONTROL: the Later line is the one it lets by"
+        );
+    }
+
+    /// The Later line stands on the Full Disk Access page of a process the owner started, whose
+    /// window reads a grant made now at once (S1). NEGATIVE CONTROL: an update's successor,
+    /// which can read it late, shows the page without it.
+    #[test]
+    fn only_a_process_the_owner_started_says_later_to_macos_sheet() {
+        let now = Instant::now();
+        let wake: Wake = Arc::new(|| {});
+        let mut said = Vec::new();
+        for cold in [true, false] {
+            let mut lane = Lane::windowed_with_fda_for_test(
+                test_arms::opening(),
+                test_arms::fda_opening(),
+                test_arms::showing(),
+            );
+            if cold {
+                lane.note_cold_start();
+            }
+            assert!(lane.show(fda_show(None), now, Arc::clone(&wake)));
+            let content = lane.panel().expect("the page is up").content();
+            assert!(has(&content, FDA_PANEL_TRADE));
+            said.push(has(&content, FDA_PANEL_LATER));
+        }
+        assert_eq!(said, [true, false]);
     }
 
     #[test]
@@ -5687,10 +5941,10 @@ mod tests {
             (Origin::SystemStateAct, Some(&cold), true, true),
             (Origin::SystemStateAct, Some(&earlier), true, false),
             (Origin::SystemStateAct, Some(&version), true, false),
-            (Origin::Ctl { now: false }, Some(&earlier), true, true),
-            (Origin::Ctl { now: false }, Some(&earlier), false, false),
-            (Origin::Ctl { now: false }, Some(&this), false, true),
-            (Origin::Ctl { now: true }, Some(&version), true, true),
+            (Origin::Ctl, Some(&earlier), true, true),
+            (Origin::Ctl, Some(&earlier), false, false),
+            (Origin::Ctl, Some(&this), false, true),
+            (Origin::Ctl, Some(&version), true, true),
             (Origin::Settings, Some(&this), true, false),
             (Origin::Digest, Some(&this), true, false),
         ] {
@@ -5782,12 +6036,8 @@ mod tests {
             fda_on: true,
             shown_this_revision: false,
         };
-        let presses = [Origin::Settings, Origin::Digest];
-        let asked = [
-            Origin::Automatic,
-            Origin::Ctl { now: false },
-            Origin::Ctl { now: true },
-        ];
+        let presses = [Origin::Settings, Origin::Digest, Origin::Walk];
+        let asked = [Origin::Automatic, Origin::Ctl];
         for declined in [false, true] {
             for grant_stable in [false, true] {
                 for recent in [false, true] {
@@ -5839,15 +6089,12 @@ mod tests {
                                 Admit::Refuse(Refusal::Unknown),
                                 "fail-closed"
                             );
-                            let now = origin == Origin::Ctl { now: true };
                             let want = if declined {
                                 Admit::Refuse(Refusal::Declined)
-                            } else if !grant_stable && !now {
+                            } else if !grant_stable {
                                 Admit::Refuse(Refusal::Unstable)
                             } else if recent {
                                 Admit::Refuse(Refusal::Recent)
-                            } else if now {
-                                Admit::PanelOnly
                             } else if moment == Moment::Asked {
                                 Admit::Queue
                             } else {
@@ -5866,7 +6113,7 @@ mod tests {
                 }
             }
         }
-        for origin in [Origin::Automatic, Origin::Ctl { now: false }] {
+        for origin in [Origin::Automatic, Origin::Ctl] {
             for moment in [Moment::Asked, Moment::Quiet] {
                 assert_eq!(
                     admit(
@@ -5879,14 +6126,6 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            admit(
-                Origin::Ctl { now: true },
-                Moment::Asked,
-                &facts(DevToolGrant::NotGranted, on(), false, true, false)
-            ),
-            Admit::PanelOnly
-        );
         assert_eq!(
             admit(
                 Origin::Automatic,
@@ -5909,10 +6148,7 @@ mod tests {
                 Admit::Refuse(Refusal::Shown)
             );
         }
-        assert_eq!(
-            admit(Origin::Ctl { now: false }, Moment::Asked, &shown),
-            Admit::Queue
-        );
+        assert_eq!(admit(Origin::Ctl, Moment::Asked, &shown), Admit::Queue);
         assert_eq!(
             admit(Origin::Settings, Moment::Asked, &shown),
             Admit::Hand {
@@ -5931,10 +6167,7 @@ mod tests {
                 Admit::Refuse(Refusal::NoFullDiskAccess)
             );
         }
-        assert_eq!(
-            admit(Origin::Ctl { now: false }, Moment::Asked, &no_fda),
-            Admit::Queue
-        );
+        assert_eq!(admit(Origin::Ctl, Moment::Asked, &no_fda), Admit::Queue);
         assert_eq!(
             admit(Origin::Settings, Moment::Asked, &no_fda),
             Admit::Hand {
@@ -5948,11 +6181,16 @@ mod tests {
             Some(atpkg::devtools::REOPEN_AFTER_S)
         );
         assert_eq!(
-            Origin::Ctl { now: true }.reopen_after_s(),
-            Some(atpkg::devtools::REOPEN_NOW_AFTER_S)
+            Origin::Ctl.reopen_after_s(),
+            Some(atpkg::devtools::REOPEN_AFTER_S)
         );
-        assert!(Origin::Digest.owner_press() && Origin::Settings.owner_press());
-        assert!(!Origin::Automatic.owner_press() && !Origin::Ctl { now: true }.owner_press());
+        assert_eq!(Origin::Walk.reopen_after_s(), None);
+        assert!(
+            Origin::Digest.owner_press()
+                && Origin::Settings.owner_press()
+                && Origin::Walk.owner_press()
+        );
+        assert!(!Origin::Automatic.owner_press() && !Origin::Ctl.owner_press());
     }
 
     #[test]
@@ -5986,6 +6224,7 @@ mod tests {
             listed: None,
             bundle,
             skips: false,
+            step: None,
         }
     }
 
@@ -6329,6 +6568,7 @@ mod tests {
                 listed: None,
                 bundle: bundle.clone(),
                 skips: false,
+                step: None,
             },
             t0,
         );
@@ -6350,6 +6590,7 @@ mod tests {
                 listed: None,
                 bundle: bundle.clone(),
                 skips: false,
+                step: None,
             },
             t0,
         );
@@ -6375,6 +6616,7 @@ mod tests {
                 listed: None,
                 bundle,
                 skips: false,
+                step: None,
             },
             t0,
         );
@@ -6404,6 +6646,7 @@ mod tests {
                 listed: None,
                 bundle: None,
                 skips: false,
+                step: None,
             },
             t0,
             Arc::clone(&wake),
@@ -6458,6 +6701,7 @@ mod tests {
                     listed: None,
                     bundle: None,
                     skips: false,
+                    step: None,
                 },
                 t0,
                 Arc::clone(&wake),
@@ -6973,7 +7217,7 @@ mod tests {
         }
         let t0 = Instant::now();
         let t1 = t0 + RECHECK_EVERY;
-        let ctl = Origin::Ctl { now: false };
+        let ctl = Origin::Ctl;
         let mut lane = Lane::windowed_for_test(Reach::inert(), DevToolsHelperArm::inert());
         lane.queue(Origin::Automatic, t0);
         assert_eq!(lane.take_queued(t0, true), Some((Origin::Automatic, None)));
@@ -7115,7 +7359,7 @@ mod tests {
     fn a_page_up_with_no_revision_leaves_the_window_s_own_step_waiting() {
         let t0 = Instant::now();
         let ten = Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S);
-        let ctl = Origin::Ctl { now: false };
+        let ctl = Origin::Ctl;
         let mut lane = Lane::windowed_for_test(Reach::inert(), DevToolsHelperArm::inert());
         lane.queue(Origin::Automatic, t0);
         lane.queue(ctl, t0);
@@ -7220,10 +7464,10 @@ mod tests {
         lane.defer(t0 + ten + PANEL_TICK);
         assert!(!lane.hand_over_due(t0 + ten), "a reading after the page");
         assert!(lane.hand_over_due(t0 + ten + PANEL_TICK));
-        lane.queue(Origin::Ctl { now: false }, t0);
+        lane.queue(Origin::Ctl, t0);
         assert!(lane.waits_out_a_page(), "an ask rides the step");
         let _ = lane.take_queued(t0 + ten + PANEL_TICK, true);
-        lane.queue(Origin::Ctl { now: false }, t0);
+        lane.queue(Origin::Ctl, t0);
         lane.wait_out_page(t0 + ten);
         assert!(!lane.waits_out_a_page(), "only the window's own step");
 
@@ -7251,9 +7495,9 @@ mod tests {
         let t0 = Instant::now();
         let mut lane = Lane::windowed_for_test(Reach::inert(), DevToolsHelperArm::inert());
         assert_eq!(lane.next_deadline(t0, || true), None, "nothing waits");
-        lane.queue(Origin::Ctl { now: false }, t0);
+        lane.queue(Origin::Ctl, t0);
         lane.queue(Origin::Automatic, t0);
-        lane.queue(Origin::Ctl { now: false }, t0);
+        lane.queue(Origin::Ctl, t0);
         assert_eq!(
             lane.queued(),
             Some(Origin::Automatic),
@@ -7272,7 +7516,7 @@ mod tests {
             "the window's own never lapses"
         );
         assert_eq!(lane.queued(), None);
-        lane.queue(Origin::Ctl { now: false }, t0);
+        lane.queue(Origin::Ctl, t0);
         assert_eq!(lane.take_queued(t0 + ASKED_LAPSE, true), None);
         assert_eq!(lane.queued(), None, "lapsed");
         // The Full Disk Access queue keeps the same order: the window's own outranks a
@@ -7281,14 +7525,14 @@ mod tests {
             #[expect(clippy::disallowed_methods, reason = "the lane's own test")]
             lane.queue_fda(origin, at);
         };
-        queue_fda(&mut lane, Origin::Ctl { now: false }, t0);
-        queue_fda(&mut lane, Origin::Ctl { now: false }, t0 + RECHECK_EVERY);
-        assert_eq!(lane.fda_queued(), Some(Origin::Ctl { now: false }));
+        queue_fda(&mut lane, Origin::Ctl, t0);
+        queue_fda(&mut lane, Origin::Ctl, t0 + RECHECK_EVERY);
+        assert_eq!(lane.fda_queued(), Some(Origin::Ctl));
         assert_eq!(lane.take_queued_fda(t0 + ASKED_LAPSE, false), None);
         assert_eq!(lane.fda_queued(), None, "a client's act lapsed");
-        queue_fda(&mut lane, Origin::Ctl { now: false }, t0);
+        queue_fda(&mut lane, Origin::Ctl, t0);
         queue_fda(&mut lane, Origin::Automatic, t0);
-        queue_fda(&mut lane, Origin::Ctl { now: false }, t0);
+        queue_fda(&mut lane, Origin::Ctl, t0);
         assert_eq!(
             lane.fda_queued(),
             Some(Origin::Automatic),
@@ -7309,15 +7553,15 @@ mod tests {
             t0,
         );
         assert_eq!(lane.queued(), None);
-        lane.queue_after_listing(Origin::Ctl { now: false }, t0, Ok(()));
+        lane.queue_after_listing(Origin::Ctl, t0, Ok(()));
         assert!(!lane.hand_over_due(t0), "the moment was judged just now");
         assert!(lane.hand_over_due(t0 + RECHECK_EVERY));
         assert_eq!(
             lane.take_queued(t0 + RECHECK_EVERY, true),
-            Some((Origin::Ctl { now: false }, Some(Ok(()))))
+            Some((Origin::Ctl, Some(Ok(()))))
         );
         lane.queue(Origin::Automatic, t0);
-        lane.queue_after_listing(Origin::Ctl { now: false }, t0, Ok(()));
+        lane.queue_after_listing(Origin::Ctl, t0, Ok(()));
         assert_eq!(
             lane.take_queued(t0, true),
             Some((Origin::Automatic, Some(Ok(())))),
@@ -7608,7 +7852,7 @@ mod tests {
             Some(Listing::HandOver(Origin::Digest)),
             "the owner's press outranks the window's own"
         );
-        assert!(lane.start_listing(Listing::HandOver(Origin::Ctl { now: false }), nudge()));
+        assert!(lane.start_listing(Listing::HandOver(Origin::Ctl), nudge()));
         assert!(lane.start_listing(Listing::ShowList, nudge()));
         assert_eq!(
             lane.listing(),
@@ -7649,10 +7893,7 @@ mod tests {
         });
         assert!(taken.is_some_and(|(_, _, waiting)| waiting.digest));
         assert!(Listing::ShowList.rank() < Listing::HandOver(Origin::Automatic).rank());
-        assert!(
-            Listing::HandOver(Origin::Ctl { now: true }).rank()
-                < Listing::HandOver(Origin::Settings).rank()
-        );
+        assert!(Listing::HandOver(Origin::Ctl).rank() < Listing::HandOver(Origin::Settings).rank());
     }
 
     #[test]

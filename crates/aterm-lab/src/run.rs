@@ -78,6 +78,9 @@ pub struct Run {
     /// `down` that removes the scratch detaches, once no hold keeps a copy on it; empty when the
     /// home is a plain folder.
     pub home_image: String,
+    /// `1` when the instance's disk scans read the jail's processes alone (`LAB_JAIL_SCAN=1`,
+    /// [`crate::lab::UpOpts::jail_scan`]).
+    pub jail_scan: String,
 }
 
 impl Run {
@@ -135,6 +138,7 @@ impl Run {
             ("WINDOW", self.window.clone()),
             ("REROUTE", self.reroute.clone()),
             ("HOME_IMAGE", self.home_image.clone()),
+            ("JAIL_SCAN", self.jail_scan.clone()),
         ]
     }
 
@@ -190,6 +194,7 @@ impl Run {
                 "WINDOW" => r.window = v,
                 "REROUTE" => r.reroute = v,
                 "HOME_IMAGE" => r.home_image = v,
+                "JAIL_SCAN" => r.jail_scan = v,
                 _ => {}
             }
         }
@@ -397,6 +402,7 @@ mod tests {
             window: "1".into(),
             reroute: "1".into(),
             home_image: "/s/runs/t1/home.sparseimage".into(),
+            jail_scan: "1".into(),
         };
         assert_eq!(Run::parse(&r.render()), r);
         assert_eq!(r.fixture_prefix(), "codex-0.163.0");

@@ -802,7 +802,8 @@ fn mailbox_overrides_preserve_local_path_bytes_and_trim_urls() {
     let byte_path = tmp
         .path()
         .join(OsString::from_vec(b"maildir-\xff".to_vec()));
-    let cfg = mailbox_config_from_override(byte_path.as_os_str(), Some(tmp.path()));
+    let cfg =
+        mailbox_config_from_override(byte_path.as_os_str(), Some(tmp.path()), &Default::default());
     assert_eq!(cfg.dir.as_deref(), Some(byte_path.as_path()));
     assert!(cfg.imap_url.is_none() && cfg.http_url.is_none());
 
@@ -812,7 +813,7 @@ fn mailbox_overrides_preserve_local_path_bytes_and_trim_urls() {
     let dir = tmp.path().join("maildir ");
     std::fs::create_dir(&dir).unwrap();
     std::fs::write(dir.join("code.eml"), message).unwrap();
-    let cfg = mailbox_config_from_override(dir.as_os_str(), Some(tmp.path()));
+    let cfg = mailbox_config_from_override(dir.as_os_str(), Some(tmp.path()), &Default::default());
     assert_eq!(cfg.dir.as_deref(), Some(dir.as_path()));
     assert_eq!(
         poll_mailbox_config_for_credential(
@@ -835,7 +836,7 @@ fn mailbox_overrides_preserve_local_path_bytes_and_trim_urls() {
     std::fs::write(dir.join("code.eml"), message).unwrap();
     let path = tmp.path().join("mailbox.toml ");
     std::fs::write(&path, "[mailbox]\ndir = '~/configured-maildir'\n").unwrap();
-    let cfg = mailbox_config_from_override(path.as_os_str(), Some(tmp.path()));
+    let cfg = mailbox_config_from_override(path.as_os_str(), Some(tmp.path()), &Default::default());
     assert_eq!(cfg.dir.as_deref(), Some(dir.as_path()));
     assert!(cfg.http_url.is_none());
     assert_eq!(
@@ -850,12 +851,14 @@ fn mailbox_overrides_preserve_local_path_bytes_and_trim_urls() {
         (" https://mailbox.example.test/inbox \n", false),
         (" imaps://mailbox.example.test/INBOX \n", true),
     ] {
-        let cfg = mailbox_config_from_override(OsStr::new(url), None);
+        let cfg = mailbox_config_from_override(OsStr::new(url), None, &Default::default());
         assert_eq!(cfg.imap_url.as_deref(), imap.then_some(url.trim()));
         assert_eq!(cfg.http_url.as_deref(), (!imap).then_some(url.trim()));
         assert!(cfg.dir.is_none());
     }
-    assert!(!mailbox_config_from_override(OsStr::new(""), None).is_configured());
+    assert!(
+        !mailbox_config_from_override(OsStr::new(""), None, &Default::default()).is_configured()
+    );
 }
 
 #[cfg(unix)]
@@ -3283,8 +3286,11 @@ fn approval_form_selection_root_loopback_callback_and_csv_slot_inference() {
         Some("https://mail.proton.me/u/0/inbox")
     );
     assert!(toml_cfg.http_url.is_none());
-    let override_cfg =
-        mailbox_config_from_override(std::ffi::OsStr::new("https://app.fastmail.com"), None);
+    let override_cfg = mailbox_config_from_override(
+        std::ffi::OsStr::new("https://app.fastmail.com"),
+        None,
+        &Default::default(),
+    );
     assert_eq!(
         override_cfg.webmail_url.as_deref(),
         Some("https://app.fastmail.com")

@@ -159,5 +159,6 @@ impl Terminal {
         self.refresh_mode_mirror();
         self.alt_archive_after_host_reset();
         let _ = self.reconcile_color_scheme();
+        self.host_journal.push(super::HostOp::Reset);
     }
 }

@@ -199,8 +199,8 @@ use super::fidelity::{LANE_SETTLES, LaneFidelity, ORACLE};
 use super::lane::{LANE_MODEL, Scenario, encode_glass, run};
 #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
 use super::m6_policy::{
-    JUDGED, LOOK_LIST_CAP, MAX_JUDGED, PoolRefusal, READ_LIST_CAP, SetId, SetTag, Side, set_pools,
-    sets_v1, side,
+    JUDGED, LOOK_LIST_CAP, MAX_JUDGED, PoolRefusal, READ_LIST_CAP, SETS_V1, SetId, SetTag, Side,
+    set_pools, side,
 };
 #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
 use super::plan::PLAN_LEN;
@@ -250,6 +250,7 @@ static HELD_OUT_JUDGED: AtomicU64 = AtomicU64::new(0);
 /// How many held-out corpus items any evaluator of this process has judged; every M6 lab command
 /// requires it to read 0 (design §13.3).
 #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[inline]
 #[must_use]
 pub fn held_out_judged() -> u64 {
     HELD_OUT_JUDGED.load(Ordering::SeqCst)
@@ -333,6 +334,7 @@ pub enum CandidateRefusal {
 
 impl CandidateRefusal {
     /// The refusal's law, as a proposer's feedback names it: the failing law.
+    #[inline]
     #[must_use]
     pub const fn law(&self) -> &'static str {
         match self {
@@ -348,6 +350,7 @@ impl CandidateRefusal {
     }
 
     /// The item it was refused on, if it got as far as one.
+    #[inline]
     #[must_use]
     pub const fn item(&self) -> Option<&str> {
         match self {
@@ -496,6 +499,7 @@ impl Compared {
     }
 
     /// `1 − ΣT_c / ΣT_B` in parts per million, truncated toward zero (0 when `ΣT_B` is 0).
+    #[inline]
     #[must_use]
     pub const fn gain_ppm(&self) -> i64 {
         let (c, b) = (self.candidate.ticks as i128, self.baseline.ticks as i128);
@@ -548,24 +552,48 @@ pub(super) struct Sums {
 }
 
 /// `rows`' sums against `policy`'s baseline.
-pub(super) fn sums(policy: &AcceptancePolicy, rows: &[Row]) -> Sums {
-    let mut train_cand = Totals::default();
-    let mut held_out_cand = Totals::default();
-    let mut story = Totals::default();
+#[inline]
+#[must_use]
+pub(super) const fn sums(policy: &AcceptancePolicy, rows: &[Row]) -> Sums {
+    let mut train_cand = Totals {
+        ticks: 0,
+        presented: 0,
+        wasted: 0,
+    };
+    let mut held_out_cand = Totals {
+        ticks: 0,
+        presented: 0,
+        wasted: 0,
+    };
+    let mut story = Totals {
+        ticks: 0,
+        presented: 0,
+        wasted: 0,
+    };
     let mut found_story = false;
-    for r in rows {
+    let mut ri = 0;
+    while ri < rows.len() {
+        let r = &rows[ri];
         match r.split {
             CorpusSplit::Train => train_cand = add(train_cand, r.totals()),
             CorpusSplit::HeldOut => held_out_cand = add(held_out_cand, r.totals()),
         }
-        if !found_story && r.kind == ItemKind::M3Story {
+        if !found_story && matches!(r.kind, ItemKind::M3Story) {
             story = r.totals();
             found_story = true;
         }
+        ri += 1;
     }
-    let mut pinned = Totals::default();
-    for p in policy.items() {
-        if p.kind() == ItemKind::M3Story {
+    let mut pinned = Totals {
+        ticks: 0,
+        presented: 0,
+        wasted: 0,
+    };
+    let pins = policy.items();
+    let mut pi = 0;
+    while pi < pins.len() {
+        let p = &pins[pi];
+        if matches!(p.kind(), ItemKind::M3Story) {
             let b = p.baseline();
             pinned = Totals {
                 ticks: b.ticks,
@@ -574,6 +602,7 @@ pub(super) fn sums(policy: &AcceptancePolicy, rows: &[Row]) -> Sums {
             };
             break;
         }
+        pi += 1;
     }
     Sums {
         train: Compared {
@@ -604,6 +633,7 @@ struct TrainAdmitted {
 
 impl TrainAdmitted {
     /// `plan` admitted with `rows`, its totals summed here.
+    #[inline]
     const fn of(plan: SchedulePlan, rows: Vec<(usize, Row)>) -> TrainAdmitted {
         let mut totals = Totals {
             ticks: 0,
@@ -628,11 +658,13 @@ struct Winner<T> {
 }
 
 impl<T> Winner<T> {
+    #[inline]
     const fn new() -> Winner<T> {
         Winner { best: None }
     }
 
     /// Offers an admitted candidate's training totals and plan, with what to return for it.
+    #[inline]
     fn offer(&mut self, totals: Totals, plan: SchedulePlan, with: T) {
         let cand_key = (totals.ticks, totals.wasted, plan.encode());
         let beats = match &self.best {
@@ -646,6 +678,7 @@ impl<T> Winner<T> {
 
     /// The winner, with its training sums against `policy`'s baseline: a selection iff they
     /// [`Compared::beats`].
+    #[inline]
     fn end(self, policy: &AcceptancePolicy) -> Option<(T, Compared)> {
         self.best.map(|(candidate, _, with)| {
             (
@@ -672,9 +705,12 @@ pub trait Spread: Sync {
 pub struct Serial;
 
 impl Spread for Serial {
+    #[inline]
     fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
-        for i in 0..n {
+        let mut i = 0;
+        while i < n {
             job(i);
+            i += 1;
         }
     }
 }
@@ -737,6 +773,7 @@ struct Fold {
 }
 
 impl Fold {
+    #[inline]
     fn new(id: ProposerId) -> Fold {
         Fold {
             is_grid: id == GridProposer::new().id(),
@@ -749,6 +786,7 @@ impl Fold {
     }
 
     /// Round `round`'s proposals, the proposer shown the feedback so far.
+    #[inline]
     fn propose(&mut self, proposer: &mut dyn Proposer, round: u8) -> Vec<Vec<u8>> {
         self.stats.rounds = round + 1;
         let proposed = proposer.propose(round, &self.feedback);
@@ -758,9 +796,14 @@ impl Fold {
     }
 
     /// `proposed` counted against `budgets`: the distinct candidates, in proposal order.
+    #[inline]
     fn distinct<'p>(&mut self, budgets: &Budgets, proposed: &'p [Vec<u8>]) -> Vec<Distinct<'p>> {
-        let mut out = Vec::new();
-        for (index, bytes) in proposed.iter().enumerate() {
+        let mut out = Vec::with_capacity(proposed.len());
+        let mut next_index = 0;
+        while next_index < proposed.len() {
+            let index = next_index;
+            let bytes = &proposed[index];
+            next_index += 1;
             self.stats.proposed += 1;
             if bytes.len() > budgets.proposal_bytes {
                 self.stats.oversized += 1;
@@ -783,6 +826,7 @@ impl Fold {
     }
 
     /// One distinct candidate's judgment, taken in proposal order.
+    #[inline]
     fn take(&mut self, round: u8, index: usize, cid: Digest, judged: Judged) {
         match judged {
             Judged::Admitted(t) => {
@@ -802,6 +846,7 @@ impl Fold {
 
     /// The selection recorded as `mode`, or why there is none; and whether every round proposed
     /// what the grid proposes.
+    #[inline]
     fn end(self, ev: &Evaluator, mode: Mode) -> (Result<Selection, NoOutcome>, bool) {
         let Fold {
             id,
@@ -835,14 +880,17 @@ impl Fold {
 }
 
 /// `f` of each of `items` through `spread`, any it skipped run in place, in order.
+#[inline]
 fn spread_map<I: Sync, T: Send + Sync>(
     spread: &dyn Spread,
     items: &[I],
     f: &(dyn Fn(&I) -> T + Sync),
 ) -> Vec<T> {
     let mut slots = Vec::with_capacity(items.len());
-    for _ in 0..items.len() {
+    let mut i = 0;
+    while i < items.len() {
         slots.push(OnceLock::new());
+        i += 1;
     }
     spread.run(items.len(), &|i| {
         if let (Some(slot), Some(item)) = (slots.get(i), items.get(i)) {
@@ -850,11 +898,13 @@ fn spread_map<I: Sync, T: Send + Sync>(
         }
     });
     let mut out = Vec::with_capacity(items.len());
-    for (slot, item) in slots.into_iter().zip(items) {
-        out.push(match slot.into_inner() {
+    let mut idx = 0;
+    while idx < slots.len() {
+        out.push(match slots[idx].take() {
             Some(v) => v,
-            None => f(item),
+            None => f(&items[idx]),
         });
+        idx += 1;
     }
     out
 }
@@ -953,7 +1003,8 @@ struct Contradiction {
 
 impl Contradiction {
     /// A slot whose judgments do not add up to its claim (never, for a shaped claim).
-    fn unjudged(slot: u32) -> Contradiction {
+    #[inline]
+    const fn unjudged(slot: u32) -> Contradiction {
         Contradiction {
             slot,
             ordinal: usize::MAX,
@@ -964,6 +1015,7 @@ impl Contradiction {
 }
 
 /// The item of training ordinal `t`, by id.
+#[inline]
 fn claim_item(ev: &Evaluator, train: &[usize], t: usize) -> String {
     if let Some(&k) = train.get(t)
         && let Some(i) = ev.corpus.items().get(k)
@@ -1005,10 +1057,12 @@ struct TaskOut {
 }
 
 /// The contradiction of the lowest slot, then ordinal.
+#[inline]
 fn first_contradiction(done: &[(Task, Result<Done, Contradiction>)]) -> Option<Contradiction> {
     let mut best: Option<&Contradiction> = None;
-    for (_, d) in done {
-        if let Err(c) = d
+    let mut di = 0;
+    while di < done.len() {
+        if let Err(c) = &done[di].1
             && match best {
                 Some(b) => (c.slot, c.ordinal) < (b.slot, b.ordinal),
                 None => true,
@@ -1016,6 +1070,7 @@ fn first_contradiction(done: &[(Task, Result<Done, Contradiction>)]) -> Option<C
         {
             best = Some(c);
         }
+        di += 1;
     }
     best.cloned()
 }
@@ -1037,10 +1092,12 @@ pub struct Distributed<'a> {
 impl fmt::Debug for Distributed<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut claimed = 0usize;
-        for c in &self.claims {
-            if c.is_some() {
+        let mut ci = 0;
+        while ci < self.claims.len() {
+            if self.claims[ci].is_some() {
                 claimed += 1;
             }
+            ci += 1;
         }
         f.debug_struct("Distributed")
             .field("check", &self.check)
@@ -1074,6 +1131,7 @@ impl Distributed<'_> {
     /// Records `claim` for job `slot`.
     /// # Errors
     /// [`DistNoOutcome::Misplaced`] for a slot that is no job, or one already claimed.
+    #[inline]
     pub fn claim(&mut self, slot: u32, claim: Claim) -> Result<(), DistNoOutcome> {
         match self.claims.get_mut(index(slot)) {
             Some(at @ None) => {
@@ -1089,12 +1147,14 @@ impl Distributed<'_> {
     /// # Errors
     /// The first contradiction, an unclaimed job, a proposal after round 0, or the local fold's
     /// [`NoOutcome`].
+    #[inline]
     pub fn finish(self, spread: &dyn Spread) -> Result<Selection, DistNoOutcome> {
         self.finish_noting(spread).0
     }
 
     /// [`Self::finish`], and the (slot, training ordinal) pairs it judged itself: indices, never a
     /// claimed row, so a caller can count local judgments against claimed ones.
+    #[inline]
     pub fn finish_noting(
         self,
         spread: &dyn Spread,
@@ -1302,6 +1362,7 @@ impl Admitted {
     }
 
     /// Declare the caller's toolchain line (declared metadata, not checked or scored).
+    #[inline]
     pub fn declare_toolchain(&mut self, line: &str) {
         line.clone_into(&mut self.bundle.parts_mut().toolchain);
     }
@@ -1315,6 +1376,7 @@ impl Admitted {
 
     /// Records the lab's `measured` timing under `label`, never scored, or returns `false` and
     /// records nothing for an empty label or past [`MAX_TIMINGS`].
+    #[inline]
     #[must_use]
     pub fn record_timing(&mut self, label: &str, measured: Duration) -> bool {
         let timings = &mut self.bundle.parts_mut().timings;
@@ -1380,13 +1442,28 @@ pub struct Evaluator {
     fault: Option<(String, Fault)>,
     #[cfg(test)]
     reads: Reads,
+    /// Every judgment it has made, by schedule and item, each made once for its life (tests only:
+    /// `Evaluator::memoizing`).
+    #[cfg(test)]
+    memo: Option<Memo>,
 }
+
+/// One evaluator's judgments by schedule and item, each a cell its first asker fills while any
+/// other asker of the same pair waits for it (tests only: `Evaluator::memoizing`).
+#[cfg(test)]
+type Memo = Mutex<
+    std::collections::HashMap<
+        (Sched, usize),
+        std::sync::Arc<OnceLock<Option<(Row, Option<CandidateRefusal>)>>>,
+    >,
+>;
 
 impl Evaluator {
     /// Evaluator of [`AcceptancePolicy::pinned`] in `build` with runs offset from `origin`.
     /// # Errors
     /// [`PolicyRefusal::PolicyMutated`], [`PolicyRefusal::CorpusDrift`] or
     /// [`PolicyRefusal::BaselineDrift`], from the policy or from the corpus generated again here.
+    #[inline]
     pub fn v1(build: &str, origin: Instant) -> Result<Evaluator, PolicyRefusal> {
         let policy = AcceptancePolicy::pinned(origin)?;
         let corpus = Corpus::generate().map_err(|_| PolicyRefusal::CorpusDrift {
@@ -1414,6 +1491,8 @@ impl Evaluator {
             fault: None,
             #[cfg(test)]
             reads: Reads::default(),
+            #[cfg(test)]
+            memo: None,
         })
     }
 
@@ -1468,6 +1547,31 @@ impl Evaluator {
             reads: Reads::default(),
             labels: Mutex::new(BTreeMap::new()),
             label_cap: MAX_JUDGED,
+            memo: None,
+        }
+    }
+
+    /// The evaluator judging each item under each schedule once for its life, every later ask of
+    /// the pair answered with that judgment, which is the same: a judgment is a function of the
+    /// evaluator's build, origin, policy and corpus, the schedule and the item alone (tests only:
+    /// the evaluator the tests share, which judged the grid's training rows four times over, for
+    /// the shared search, the serial selection, the workers' claims and the threaded selection,
+    /// and a bundle's 26 rows again at every verify; its read counters and the process's
+    /// held-out count see only the judgments it makes, and no test asserts on either).
+    #[cfg(test)]
+    pub(super) fn memoizing(mut self) -> Evaluator {
+        self.memo = Some(Mutex::default());
+        self
+    }
+
+    /// Drops the judgments it kept, made before an item's scenario or judgment changed (tests
+    /// only).
+    #[cfg(test)]
+    fn forget_judgments(&mut self) {
+        if let Some(memo) = &mut self.memo {
+            memo.get_mut()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
         }
     }
 
@@ -1487,6 +1591,7 @@ impl Evaluator {
             .position(|i| i.id() == id && i.split() == CorpusSplit::HeldOut)
             .expect("fixture: a held-out item");
         self.replaced = Some((at, s));
+        self.forget_judgments();
         self
     }
 
@@ -1511,6 +1616,7 @@ impl Evaluator {
             "fixture: a corpus item"
         );
         self.fault = Some((id.to_owned(), fault));
+        self.forget_judgments();
         self
     }
 
@@ -1523,6 +1629,7 @@ impl Evaluator {
             .map(|(_, fault)| fault)
     }
 
+    #[inline]
     fn facts(&self, k: usize) -> Option<ItemFacts<'_>> {
         let item = self.corpus.items().get(k)?;
         #[cfg(test)]
@@ -1544,6 +1651,7 @@ impl Evaluator {
         Some(ItemFacts::of(item))
     }
 
+    #[inline]
     fn indices(&self, split: CorpusSplit) -> Vec<usize> {
         let mut out = Vec::with_capacity(self.corpus.items().len());
         for (k, i) in self.corpus.items().iter().enumerate() {
@@ -1555,7 +1663,24 @@ impl Evaluator {
     }
 
     /// Evaluate item `k`'s row under `sched` and return any refusal that stops a candidate there.
+    #[inline]
     pub(super) fn judge(&self, sched: Sched, k: usize) -> Option<(Row, Option<CandidateRefusal>)> {
+        #[cfg(test)]
+        if let Some(memo) = &self.memo {
+            let cell = std::sync::Arc::clone(
+                memo.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry((sched, k))
+                    .or_default(),
+            );
+            return cell.get_or_init(|| self.judge_afresh(sched, k)).clone();
+        }
+        self.judge_afresh(sched, k)
+    }
+
+    /// [`Self::judge`], judged now.
+    #[inline]
+    fn judge_afresh(&self, sched: Sched, k: usize) -> Option<(Row, Option<CandidateRefusal>)> {
         let f = self.facts(k)?;
         #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
         if f.split == CorpusSplit::HeldOut {
@@ -1573,10 +1698,12 @@ impl Evaluator {
     }
 
     /// Item `k`'s row under the planned code of `plan`.
+    #[inline]
     pub(super) fn row_at(&self, plan: SchedulePlan, k: usize) -> Option<Row> {
         self.judge(Sched::Plan(plan), k).map(|(row, _)| row)
     }
 
+    #[inline]
     fn judge_trace(
         &self,
         sched: Sched,
@@ -1627,9 +1754,9 @@ impl Evaluator {
         );
         self.count_stepped(read.log.inputs().len());
         let (mut ticks, mut presented) = (0u64, 0u64);
-        let mut glass = Enc::new();
+        let mut glass = Enc::with_capacity(512);
         encode_glass(&mut glass, &MomentumGlowFrame::default(), &[], &[]);
-        let mut drawn = Enc::new();
+        let mut drawn = Enc::with_capacity(512);
         for (_, o) in &replayed.observations {
             if let MomentumObservation::Frame { .. } = o {
                 ticks += 1;
@@ -1656,6 +1783,7 @@ impl Evaluator {
         (row, refusal)
     }
 
+    #[inline]
     fn judge_lane(
         &self,
         sched: Sched,
@@ -1729,7 +1857,7 @@ impl Evaluator {
             Some(Fault::ReplayShort) => inputs.split_last().map_or(inputs, |(_, rest)| rest),
             _ => inputs,
         };
-        let replayed = replay(
+        let (replayed, verdict) = NoStrandedLight::new().replay_judged(
             b.schema(),
             &b.pair().code,
             start,
@@ -1739,7 +1867,6 @@ impl Evaluator {
         );
         self.count_stepped(inputs.len());
         row.chain = replayed.observation_chain;
-        let verdict = NoStrandedLight::new().judge(b.schema(), inputs, &replayed);
         row.stranded_light = row_verdict(&verdict);
         let reproduced = replayed.refused.is_none()
             && replayed.observation_chain == hd.live_chain()
@@ -1773,6 +1900,7 @@ impl Evaluator {
 
     /// `plan`'s training rows, in corpus order up to its first refusal, whose row is the last;
     /// after each passing item, `keep` is given its training ordinal and may stop the run.
+    #[inline]
     pub(super) fn training_rows<B>(
         &self,
         plan: SchedulePlan,
@@ -1803,6 +1931,7 @@ impl Evaluator {
         }
     }
 
+    #[inline]
     fn train(&self, bytes: &[u8]) -> Result<TrainAdmitted, CandidateRefusal> {
         let plan = self.decode(bytes)?;
         let TrainingRows { rows, end } =
@@ -1814,6 +1943,7 @@ impl Evaluator {
         }
     }
 
+    #[inline]
     const fn decode(&self, bytes: &[u8]) -> Result<SchedulePlan, CandidateRefusal> {
         let limit = self.policy.budgets().proposal_bytes;
         if bytes.len() > limit {
@@ -1832,6 +1962,7 @@ impl Evaluator {
     /// # Errors
     /// [`NoOutcome::NoneAdmitted`], or [`NoOutcome::NoGain`] when the winner does not beat the
     /// baseline on training.
+    #[inline]
     pub fn select(&self, proposer: &mut dyn Proposer) -> Result<Selection, NoOutcome> {
         self.select_spread(proposer, &Serial)
     }
@@ -1840,6 +1971,7 @@ impl Evaluator {
     /// proposal order: the same selection, counts and feedback whatever the spread runs.
     /// # Errors
     /// [`Self::select`]'s.
+    #[inline]
     pub fn select_spread(
         &self,
         proposer: &mut dyn Proposer,
@@ -1853,6 +1985,7 @@ impl Evaluator {
     }
 
     /// Return the grid's selection, running the grid search once per evaluator if needed.
+    #[inline]
     pub(super) fn grid_selection(&self) -> Option<GridSelection> {
         *self.grid.get_or_init(|| {
             self.select_local(&mut GridProposer::new(), &Serial)
@@ -1863,6 +1996,7 @@ impl Evaluator {
         })
     }
 
+    #[inline]
     fn select_local(
         &self,
         proposer: &mut dyn Proposer,
@@ -1887,6 +2021,7 @@ impl Evaluator {
 
     /// A distributed search of `proposer`'s round-0 candidates: the jobs workers run, and the
     /// claims they return, folded into a selection only by [`Distributed::finish`].
+    #[inline]
     pub fn distributed<'a>(
         &'a self,
         proposer: &'a mut dyn Proposer,
@@ -1928,6 +2063,7 @@ impl Evaluator {
     }
 
     /// Training ordinal `t` of `plan` judged here and compared with `claim`'s row `t`.
+    #[inline]
     fn judge_claimed(
         &self,
         plan: SchedulePlan,
@@ -1950,6 +2086,7 @@ impl Evaluator {
     /// prefix, the best admitted claim in full, then each other admitted claim until its judged
     /// rows' `ΣT` exceed the winner's, or in full under [`CheckLevel::All`]. Each slot's verdict,
     /// or the first contradiction by slot and item; and the (slot, ordinal) pairs judged.
+    #[inline]
     fn check_claims(
         &self,
         jobs: &[Job],
@@ -2095,6 +2232,7 @@ impl Evaluator {
     }
 
     /// One task of step 5, `winner` being the winner's local `ΣT` for [`Task::Dominate`].
+    #[inline]
     fn run_task(
         &self,
         task: Task,
@@ -2184,6 +2322,7 @@ impl Evaluator {
     /// # Errors
     /// [`NoOutcome::HeldOut`] at the first held-out refusal (no runner-up is tried), or
     /// [`NoOutcome::Foreign`] for a selection made in another build.
+    #[inline]
     pub fn held_out(&self, selection: Selection) -> Result<Admitted, NoOutcome> {
         if selection.build != self.build {
             return Err(NoOutcome::Foreign {
@@ -2198,6 +2337,7 @@ impl Evaluator {
     /// [`Self::select`], then [`Self::held_out`].
     /// # Errors
     /// Either one's.
+    #[inline]
     pub fn search(&self, proposer: &mut dyn Proposer) -> Result<Admitted, NoOutcome> {
         self.held_out(self.select(proposer)?)
     }
@@ -2205,6 +2345,7 @@ impl Evaluator {
     /// The same pipeline for the one candidate `bytes`, training then held out.
     /// # Errors
     /// The first [`CandidateRefusal`], on either split.
+    #[inline]
     pub fn admit_one(&self, bytes: &[u8]) -> Result<Admitted, CandidateRefusal> {
         let winner = self.train(bytes)?;
         self.gate(Selection {
@@ -2218,6 +2359,7 @@ impl Evaluator {
         })
     }
 
+    #[inline]
     fn gate(&self, selection: Selection) -> Result<Admitted, CandidateRefusal> {
         #[cfg(test)]
         self.reads.looks.fetch_add(1, Ordering::Relaxed);
@@ -2321,6 +2463,7 @@ pub struct TrainLabel {
 #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
 impl TrainLabel {
     /// `plan`'s label from its judgment on every training item, the one [`Evaluator::select`] makes.
+    #[inline]
     fn of(plan: SchedulePlan, judged: Result<TrainAdmitted, CandidateRefusal>) -> TrainLabel {
         TrainLabel {
             id: plan.digest(),
@@ -2378,6 +2521,7 @@ pub struct RealSets(
 #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
 impl RealSets {
     /// The capability, for the lab's session entry alone.
+    #[inline]
     #[must_use]
     #[allow(clippy::new_without_default)]
     pub const fn new() -> RealSets {
@@ -2422,6 +2566,7 @@ pub const LIST_DOMAIN: &[u8] = b"aterm-aos-m6-list-v1\0";
 /// The digest of `list`, sorted and deduplicated, under [`LIST_DOMAIN`]: what a token over it
 /// holds, so the ledger can name a list in its line before any token over it exists.
 #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[inline]
 #[must_use]
 pub fn list_digest(list: &[[u8; PLAN_LEN]]) -> Digest {
     let mut list = list.to_vec();
@@ -2505,6 +2650,7 @@ struct Bound {
 #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
 impl Bound {
     /// `list` bound to `set`, refused past `cap` plans or for a plan not of `set`'s side.
+    #[inline]
     fn mint(set: SetId, cap: usize, list: &[[u8; PLAN_LEN]]) -> Result<Bound, MintRefusal> {
         if list.len() > cap {
             return Err(MintRefusal::TooLong {
@@ -2526,9 +2672,10 @@ impl Bound {
     }
 
     /// `H_i` or `E_i` of v1, by `tag`.
+    #[inline]
     fn real(tag: SetTag, i: u32) -> Result<SetId, MintRefusal> {
         let set = SetId { tag, index: i };
-        if sets_v1().contains(&set) {
+        if SETS_V1.contains(&set) {
             Ok(set)
         } else {
             Err(MintRefusal::NoSuchSet { set })
@@ -2536,12 +2683,14 @@ impl Bound {
     }
 
     /// The digest of its list ([`list_digest`]).
+    #[inline]
     fn digest(&self) -> Digest {
         list_digest(&self.list)
     }
 
     /// Whether `plans` is its list exactly (sorted and deduplicated, as the ledger line names
     /// it), each plan of its set's side and in one of its set's pools.
+    #[inline]
     fn admits(&self, plans: &[SchedulePlan]) -> Result<(), LabelRefusal> {
         let mut given = Vec::with_capacity(plans.len());
         for p in plans {
@@ -2603,6 +2752,7 @@ impl LookToken {
     /// # Errors
     /// [`MintRefusal::NoSuchSet`], then [`MintRefusal::TooLong`] past [`LOOK_LIST_CAP`] plans or
     /// [`MintRefusal::Side`].
+    #[inline]
     pub(super) fn mint_real(
         _sets: &RealSets,
         i: u32,
@@ -2615,6 +2765,7 @@ impl LookToken {
     /// A practice-held-out set's look token over `list`.
     /// # Errors
     /// [`MintRefusal::WrongSet`] for a practice-report set, then the bound's and the side's.
+    #[inline]
     pub(super) fn mint_practice(
         set: PracticeSet,
         list: &[[u8; PLAN_LEN]],
@@ -2642,6 +2793,7 @@ impl LookToken {
     }
 
     /// Its list's digest, under [`LIST_DOMAIN`].
+    #[inline]
     #[must_use]
     pub fn digest(&self) -> Digest {
         self.bound.digest()
@@ -2655,6 +2807,7 @@ impl ReadToken {
     /// # Errors
     /// [`MintRefusal::NoSuchSet`], then [`MintRefusal::TooLong`] past [`READ_LIST_CAP`] plans or
     /// [`MintRefusal::Side`].
+    #[inline]
     pub(super) fn mint_real(
         _sets: &RealSets,
         i: u32,
@@ -2667,6 +2820,7 @@ impl ReadToken {
     /// A practice-report set's read token over `list`.
     /// # Errors
     /// [`MintRefusal::WrongSet`] for a practice-held-out set, then the bound's and the side's.
+    #[inline]
     pub(super) fn mint_practice(
         set: PracticeSet,
         list: &[[u8; PLAN_LEN]],
@@ -2694,6 +2848,7 @@ impl ReadToken {
     }
 
     /// Its list's digest, under [`LIST_DOMAIN`].
+    #[inline]
     #[must_use]
     pub fn digest(&self) -> Digest {
         self.bound.digest()
@@ -2707,6 +2862,7 @@ impl ReplayToken {
     /// # Errors
     /// [`MintRefusal::NoSuchSet`], then [`MintRefusal::TooLong`] past [`LOOK_LIST_CAP`] plans or
     /// [`MintRefusal::Side`].
+    #[inline]
     pub(super) fn mint_real(
         _sets: &RealSets,
         i: u32,
@@ -2719,6 +2875,7 @@ impl ReplayToken {
     /// A practice-held-out set's replay token over `list`.
     /// # Errors
     /// [`MintRefusal::WrongSet`] for a practice-report set, then the bound's and the side's.
+    #[inline]
     pub(super) fn mint_practice(
         set: PracticeSet,
         list: &[[u8; PLAN_LEN]],
@@ -2746,6 +2903,7 @@ impl ReplayToken {
     }
 
     /// Its list's digest, under [`LIST_DOMAIN`].
+    #[inline]
     #[must_use]
     pub fn digest(&self) -> Digest {
         self.bound.digest()
@@ -2881,6 +3039,7 @@ impl Evaluator {
     /// # Errors
     /// [`LabelRefusal::ScopeMismatch`], a token set's [`LabelRefusal::Pool`] or
     /// [`LabelRefusal::Budget`], before anything is judged.
+    #[inline]
     pub fn label_spread(
         &self,
         scope: LabelScope,
@@ -2958,17 +3117,20 @@ impl Evaluator {
     }
 
     /// The outcome of one pool's `K` ranked plans, folded by the selection rule.
+    #[inline]
     #[must_use]
     pub(super) fn pool_outcome(&self, labels: [&TrainLabel; JUDGED]) -> PoolOutcome {
         self.outcome(&labels)
     }
 
     /// The outcome of a whole pool, folded by the selection rule (the report's arm O alone).
+    #[inline]
     #[must_use]
     pub(super) fn oracle_outcome(&self, labels: &[&TrainLabel]) -> PoolOutcome {
         self.outcome(labels)
     }
 
+    #[inline]
     fn outcome(&self, labels: &[&TrainLabel]) -> PoolOutcome {
         let mut winner = Winner::new();
         for label in labels {
@@ -3002,6 +3164,7 @@ impl Evaluator {
     }
 }
 
+#[inline]
 fn blank(f: &ItemFacts<'_>) -> Row {
     Row {
         item: f.id.to_owned(),
@@ -3020,6 +3183,7 @@ fn blank(f: &ItemFacts<'_>) -> Row {
 }
 
 /// A verdict as a row records it.
+#[inline]
 pub(super) fn row_verdict(v: &Verdict) -> RowVerdict {
     match v {
         Verdict::Pass => RowVerdict::Pass,
@@ -3027,6 +3191,7 @@ pub(super) fn row_verdict(v: &Verdict) -> RowVerdict {
     }
 }
 
+#[inline]
 fn failed(v: &Verdict) -> Option<(&'static str, u64, String)> {
     match v {
         Verdict::Pass => None,

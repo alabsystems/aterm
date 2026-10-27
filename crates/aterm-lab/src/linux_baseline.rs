@@ -669,8 +669,6 @@ pub struct BaselineArgs {
     pub arches: Vec<Arch>,
     pub screens: Vec<Screen>,
     pub record: bool,
-    /// Build `aterm-gui` with `wgpu-oracle` and replay against the default recordings.
-    pub wgpu_oracle: bool,
     pub keep_build: bool,
     pub keep_up: bool,
 }
@@ -681,7 +679,6 @@ pub fn parse_baseline(args: &[String]) -> Result<BaselineArgs, Fail> {
         arches: Vec::new(),
         screens: Vec::new(),
         record: false,
-        wgpu_oracle: false,
         keep_build: false,
         keep_up: false,
     };
@@ -711,7 +708,6 @@ pub fn parse_baseline(args: &[String]) -> Result<BaselineArgs, Fail> {
                 }
             }
             "--record" => b.record = true,
-            "--wgpu-oracle" => b.wgpu_oracle = true,
             "--keep-build" => b.keep_build = true,
             "--keep-up" => b.keep_up = true,
             other => {
@@ -720,13 +716,6 @@ pub fn parse_baseline(args: &[String]) -> Result<BaselineArgs, Fail> {
                 )));
             }
         }
-    }
-    if b.record && b.wgpu_oracle {
-        return Err(Fail::usage(
-            "linux baseline: --wgpu-oracle replays only: the recordings are the shipped \
-             renderer's"
-                .to_string(),
-        ));
     }
     b.arches = crate::linux_gpu::arches(std::mem::take(&mut b.arches), "baseline")?;
     if b.screens.is_empty() {
@@ -916,6 +905,35 @@ pub fn node_parts(line: &str) -> Option<(&str, String)> {
 
 fn node_role(line: &str) -> Option<&str> {
     proof::field(line, "role")
+}
+
+/// Whether an `atspi-walk` snapshot captured the quiescent post-command prompt state:
+/// the frame's accessible name is reset to `"~"` and the terminal's last non-empty row is
+/// [`proof::PROMPT`].
+fn walk_settled(text: &str) -> bool {
+    let mut frame_settled = false;
+    let mut terminal_settled = false;
+    for line in text.lines() {
+        let Some((_, rest)) = node_parts(line) else {
+            continue;
+        };
+        match node_role(&rest) {
+            Some("frame") => {
+                frame_settled = quoted_field(line, "name").as_deref() == Some("~");
+            }
+            Some("terminal") => {
+                terminal_settled = quoted_field(line, "text")
+                    .and_then(|t| {
+                        t.lines()
+                            .rfind(|l| !l.trim().is_empty())
+                            .map(|last| last.trim_end() == proof::PROMPT)
+                    })
+                    .unwrap_or(false);
+            }
+            _ => {}
+        }
+    }
+    frame_settled && terminal_settled
 }
 
 /// Extract and unescape `key="…"` from `line`.
@@ -1112,7 +1130,7 @@ pub fn x_extensions(text: &str) -> String {
 /// Extract sorted `(crate, version)` pairs for the Linux windowing and accessibility stack from `Cargo.lock`.
 #[must_use]
 pub fn lock_stack(lock: &str) -> Vec<(String, String)> {
-    const NAMES: [&str; 31] = [
+    const NAMES: [&str; 29] = [
         "accesskit",
         "accesskit_atspi_common",
         "accesskit_consumer",
@@ -1135,8 +1153,6 @@ pub fn lock_stack(lock: &str) -> Vec<(String, String)> {
         "wayland-client",
         "wayland-cursor",
         "wayland-protocols",
-        "wgpu",
-        "wgpu-hal",
         "winit",
         "x11-dl",
         "x11rb",
@@ -1385,11 +1401,10 @@ impl Session<'_> {
         self.ctl(&["send", typed])?;
         self.ctl(&["key", "enter"])?;
         let r = self.ctl(&["await", "match", want, "timeout=60000"])?;
-        if r.starts_with("OK match") {
-            Ok(())
-        } else {
-            Err(format!("`{want}` never appeared: {r}"))
+        if !r.starts_with("OK match") {
+            return Err(format!("`{want}` never appeared: {r}"));
         }
+        self.await_prompt()
     }
 
     fn walk(&mut self, phase: &str) {
@@ -1404,7 +1419,14 @@ impl Session<'_> {
             APP.into(),
             self.pid().unwrap_or_else(|| "0".into()),
         ];
-        let out = self.sh(&argv);
+        let t0 = Instant::now();
+        let out = loop {
+            let out = self.sh(&argv);
+            if !out.ok() || walk_settled(&out.text) || t0.elapsed() > HANG {
+                break out;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
         if !out.ok() {
             self.rec.behaviour(
                 &format!("atspi.walk.{phase}"),
@@ -1754,9 +1776,17 @@ impl Session<'_> {
         }
     }
 
+    fn await_prompt(&self) -> Result<(), String> {
+        if self.matched(&format!("^{}\\s*$", regex_literal(proof::PROMPT))) {
+            Ok(())
+        } else {
+            Err(format!("prompt `{}` never returned (60 s)", proof::PROMPT))
+        }
+    }
+
     fn appeared(&self, want: &str) -> Result<(), String> {
         if self.matched(&regex_literal(want)) {
-            Ok(())
+            self.await_prompt()
         } else {
             Err(format!("{want} never appeared (60 s)"))
         }
@@ -4426,8 +4456,6 @@ pub struct Baseline {
     committed: PathBuf,
     results: PathBuf,
     record: bool,
-    /// Whether sessions run `aterm-gui` with `--wgpu-oracle`.
-    pub wgpu_oracle: bool,
 }
 
 /// Set `org.a11y.Status.IsEnabled` on the guest AT-SPI bus.
@@ -4504,7 +4532,6 @@ impl Baseline {
             committed: PathBuf::from(&repo).join(DIR),
             results: results.to_path_buf(),
             record,
-            wgpu_oracle: false,
         })
     }
 
@@ -4516,15 +4543,10 @@ impl Baseline {
     /// Record one session for `arch` and `screen` and compare or write the baseline file.
     pub fn session(&self, up: &Up, arch: Arch, screen: Screen, bin: &str) -> proof::Row {
         let name = format!(
-            "{} ({}) baseline {}{}",
+            "{} ({}) baseline {}",
             arch.name(),
             arch.runs(),
-            screen.name(),
-            if self.wgpu_oracle {
-                " (wgpu oracle)"
-            } else {
-                ""
-            }
+            screen.name()
         );
         println!("\n=== {name} ===");
         let started = Instant::now();
@@ -4667,8 +4689,7 @@ pub fn cmd_baseline(args: &[String]) -> Res {
     let mut stopped = None;
     match Baseline::begin(&up, &results, ask.record) {
         Err(row) => rows.push(row),
-        Ok(mut baseline) => {
-            baseline.wgpu_oracle = ask.wgpu_oracle;
+        Ok(baseline) => {
             'arches: for &arch in &ask.arches {
                 let tag = format!("{} ({})", arch.name(), arch.runs());
                 if arch == Arch::X86_64 {
@@ -4685,11 +4706,6 @@ pub fn cmd_baseline(args: &[String]) -> Res {
                     }
                 }
                 let env = up.cargo_env(arch, &format!("{lane}/target"), false);
-                let oracle = if ask.wgpu_oracle {
-                    " (wgpu oracle)"
-                } else {
-                    ""
-                };
                 let mut argv = vec![
                     "cargo".to_string(),
                     "build".into(),
@@ -4710,16 +4726,13 @@ pub fn cmd_baseline(args: &[String]) -> Res {
                 ] {
                     argv.push(a.into());
                 }
-                if ask.wgpu_oracle {
-                    argv.extend(["--features".into(), "aterm-gpu/wgpu-oracle".into()]);
-                }
-                println!("\n=== {tag}: build aterm-gui{oracle}, aterm-ctl ===");
+                println!("\n=== {tag}: build aterm-gui, aterm-ctl ===");
                 let built =
                     up.guest
                         .shell_streamed(&up.home, &guest::with_env(&env, &argv), "  | ");
                 if !built.ok() {
                     rows.push(proof::Row {
-                        name: format!("{tag} build aterm-gui{oracle}"),
+                        name: format!("{tag} build aterm-gui"),
                         verdict: proof::Verdict::NotRun,
                         secs: built.secs,
                         detail: proof::tally(&built.text)
@@ -4750,8 +4763,6 @@ pub fn cmd_baseline(args: &[String]) -> Res {
         "LINUX LANE PROOF",
         if ask.record {
             "LINUX LANE BASELINE (record)"
-        } else if ask.wgpu_oracle {
-            "LINUX LANE BASELINE (replay, aterm-gui on the wgpu oracle)"
         } else {
             "LINUX LANE BASELINE (replay)"
         },
@@ -4888,19 +4899,7 @@ mod tests {
         .expect("parses");
         assert_eq!(one.screens[0].name(), "mutter-scale1.5");
         assert_eq!(one.arches, [Arch::X86_64]);
-        assert!(one.record && !one.wgpu_oracle);
-        assert!(
-            parse_baseline(&s(&["--wgpu-oracle"]))
-                .expect("parses")
-                .wgpu_oracle
-        );
-        assert_eq!(
-            parse_baseline(&s(&["--wgpu-oracle", "--record"]))
-                .map_err(|f| f.code)
-                .err(),
-            Some(2),
-            "the oracle replays; the recordings stay the shipped renderer's"
-        );
+        assert!(one.record);
         assert_eq!(
             parse_baseline(&s(&["--screen", "kwin"]))
                 .map_err(|f| f.code)
@@ -5357,5 +5356,33 @@ mod tests {
         );
         assert!(guest_packages(Arch::X86_64).contains(&"libx11-6:amd64".to_string()));
         assert!(guest_packages(Arch::Aarch64).contains(&"weston".to_string()));
+    }
+
+    #[test]
+    fn walk_settled_requires_idle_frame_title_and_trailing_prompt() {
+        let snap = |title: &str, text: &str| {
+            format!(
+                "apps 1\n\
+                 node depth=0 path=/org/a11y/atspi/accessible/root role=application name=\"aterm-gui\"\n\
+                 node depth=1 path=/org/a11y/atspi/accessible/0/0 role=frame name=\"{title}\"\n\
+                 node depth=2 path=/org/a11y/atspi/accessible/0/1 role=terminal name=\"aterm terminal\" text=\"{text}\"\n"
+            )
+        };
+        assert!(walk_settled(&snap(
+            "~",
+            "lane$ echo LANE-$((6*7))\\nLANE-42\\nlane$\\n\\n\\n"
+        )));
+        assert!(!walk_settled(&snap(
+            "echo LANE-$((6*7))",
+            "lane$ echo LANE-$((6*7))\\nLANE-42\\nlane$\\n\\n\\n"
+        )));
+        assert!(!walk_settled(&snap(
+            "~",
+            "lane$ echo LANE-$((6*7))\\nLANE-42\\n\\n\\n"
+        )));
+        assert!(!walk_settled(&snap(
+            "~",
+            "lane$ echo LANE-$((6*7))\\nLANE-42\\nlane$ echo X-WLCOPY-42 | tr A-Z a-z\\nx-wlcopy-42\\n\\n"
+        )));
     }
 }

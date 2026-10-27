@@ -101,20 +101,20 @@ impl Mode {
         }
     }
 
-    /// The mode's word where Claude's pill reads aterm's words on the glass (`relabelled`: the host relabelled the pill this frame, drawing [`footer::YOLO_ON`] over the bypass pill and [`footer::YOLO_OFF`] over manual mode's, under its relabel gate and only where the glass took it): the light beside the pill names the state as the pill does, so one state has one name on screen.
+    /// The mode's word where the glass rewrites Claude's mode row (`rewritten`: the host dropped the pill this frame, under its gate and only where the glass took it, [`footer::mode_row_rewrite_under`]), so the lights block is the mode's one home: bypass is [`footer::YOLO_ON`] and manual mode [`footer::YOLO_OFF`]; one state has one name on screen.
     #[must_use]
-    pub const fn word_on_glass(self, relabelled: bool) -> &'static str {
+    pub const fn word_on_glass(self, rewritten: bool) -> &'static str {
         match self {
-            Mode::Bypass if relabelled => footer::YOLO_ON,
-            Mode::Manual if relabelled => footer::YOLO_OFF,
+            Mode::Bypass if rewritten => footer::YOLO_ON,
+            Mode::Manual if rewritten => footer::YOLO_OFF,
             _ => self.word(),
         }
     }
 
-    /// How a title names the mode as a place (`stopped in plan mode`): the word and ` mode`, but a relabelled pill's label alone (`stopped in YOLO off`), which is a state already ([`Self::word_on_glass`]).
+    /// How a title names the mode as a place (`stopped in plan mode`): the word and ` mode`, but a rewritten row's word alone (`stopped in nag mode`), which is a state already ([`Self::word_on_glass`]).
     #[must_use]
-    pub fn named_on_glass(self, relabelled: bool) -> std::borrow::Cow<'static, str> {
-        let word = self.word_on_glass(relabelled);
+    pub fn named_on_glass(self, rewritten: bool) -> std::borrow::Cow<'static, str> {
+        let word = self.word_on_glass(rewritten);
         if word == self.word() {
             format!("{word} mode").into()
         } else {
@@ -318,23 +318,23 @@ mod tests {
         }
     }
 
-    /// THE LIGHT NAMES THE STATE AS THE PILL DOES (review C8): under the
-    /// relabel's gate bypass reads `YOLO on` and manual `YOLO off`, the pill's
-    /// own labels, and a title names them as states (`YOLO off`, no `mode`
-    /// after it).
+    /// THE LIGHT IS THE MODE'S ONE NAME (review C8): where the glass rewrites the
+    /// mode row bypass reads `yolo` and manual `nag mode`, and a title names them
+    /// by the word alone (`nag mode`, not `nag mode mode`).
     #[test]
-    fn the_lights_word_follows_the_pill_relabel_and_only_under_its_gate() {
+    fn the_lights_word_follows_the_rewritten_row_and_only_under_its_gate() {
         assert_eq!(Mode::Bypass.word_on_glass(true), footer::YOLO_ON);
+        assert_eq!(Mode::Bypass.word_on_glass(true), "yolo");
         assert_eq!(Mode::Manual.word_on_glass(true), footer::YOLO_OFF);
-        assert_eq!(Mode::Manual.named_on_glass(true), "YOLO off");
+        assert_eq!(Mode::Manual.named_on_glass(true), "nag mode");
         assert_eq!(Mode::Bypass.word_on_glass(false), "bypass");
         assert_eq!(Mode::Manual.word_on_glass(false), "manual");
         assert_eq!(Mode::Manual.named_on_glass(false), "manual mode");
         for mode in [Mode::Auto, Mode::AcceptEdits, Mode::DontAsk, Mode::Plan] {
-            for relabelled in [true, false] {
-                assert_eq!(mode.word_on_glass(relabelled), mode.word(), "{mode:?}");
+            for rewritten in [true, false] {
+                assert_eq!(mode.word_on_glass(rewritten), mode.word(), "{mode:?}");
                 assert_eq!(
-                    mode.named_on_glass(relabelled),
+                    mode.named_on_glass(rewritten),
                     format!("{} mode", mode.word()),
                     "{mode:?}"
                 );

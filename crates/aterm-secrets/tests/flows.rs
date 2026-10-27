@@ -587,7 +587,7 @@ fn a_machine_that_knows_the_join_password_is_let_in_by_the_admins_subscriber() {
     let admin = lab.home("ma");
     let token = synthetic("gh");
     write_private(&admin.home.join(".secrets/gh_access_token"), &token);
-    let created = client::create(
+    let created = client::test_create_with_password(
         &admin,
         &lab.url,
         Some(&admin.home.join(".secrets")),
@@ -662,7 +662,7 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
     let admin = lab.home("ma");
     let token = synthetic("gh");
     write_private(&admin.home.join(".secrets/gh_access_token"), &token);
-    let created = client::create(
+    let created = client::test_create_with_password(
         &admin,
         &lab.url,
         Some(&admin.home.join(".secrets")),
@@ -806,6 +806,44 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
     applied(client::sync(&machine, None).expect("sync"));
 }
 
+/// A vault `create` makes is open (owner, 2026-10-26: "default ON"): a machine that types no
+/// password is let in by the admin's next approver pass, and the vault holds no join password.
+#[test]
+fn a_new_vault_is_open_and_lets_in_a_machine_that_types_no_password() {
+    let lab = Lab::new("new-open");
+    let admin = lab.home("ma");
+    let token = synthetic("gh");
+    write_private(&admin.home.join(".secrets/gh_access_token"), &token);
+    let created = client::create(
+        &admin,
+        &lab.url,
+        Some(&admin.home.join(".secrets")),
+        Some("ma"),
+    )
+    .expect("create");
+    let doc = client::admin_open(&admin).expect("open").doc.clone();
+    assert!(doc.open());
+    assert!(doc.join_password().is_none());
+    assert!(doc.code_only().is_empty());
+    assert_eq!(Approval::of(&doc), Some(Approval::Open));
+
+    let pinned = format!("{}#{}", lab.url, created.signer);
+    let machine = lab.home("mb");
+    assert!(matches!(
+        join_unattended(&machine, &pinned, "mb").expect("join"),
+        JoinOutcome::Pending { .. }
+    ));
+    let done = client::auto_approve(&admin).expect("approve");
+    assert_eq!(done.approved, ["mb"]);
+    assert!(done.refused.is_empty() && done.code_only.is_empty());
+    assert_eq!(done.seq, Some(2));
+    applied(client::sync(&machine, None).expect("sync"));
+    assert_eq!(
+        read(&machine, "gh_access_token").as_deref(),
+        Some(token.as_str())
+    );
+}
+
 fn approve_key(admin_paths: &Paths, host: &str, key: &str) {
     let open = client::admin_open(admin_paths).expect("open");
     let mut doc = open.doc.clone();
@@ -830,7 +868,7 @@ fn letting_a_machine_go_renews_the_join_password_so_it_is_not_let_in_again() {
         &admin.home.join(".secrets/gh_access_token"),
         &synthetic("gh"),
     );
-    let created = client::create(
+    let created = client::test_create_with_password(
         &admin,
         &lab.url,
         Some(&admin.home.join(".secrets")),
@@ -857,6 +895,11 @@ fn letting_a_machine_go_renews_the_join_password_so_it_is_not_let_in_again() {
         .expect("revoke")
         .published;
     assert!(done.password_renewed && !done.kept_out && done.held.is_empty());
+    assert_eq!(
+        client::admin_open(&admin).expect("open").doc.code_only(),
+        std::slice::from_ref(&mb),
+        "the closed vault names the key it let go"
+    );
     let renewed = client::admin_open(&admin)
         .expect("open")
         .doc
@@ -885,13 +928,13 @@ fn letting_a_machine_go_renews_the_join_password_so_it_is_not_let_in_again() {
     assert_eq!(kept.as_slice(), renewed.as_slice());
 
     let open = client::admin_open(&admin).expect("open");
-    assert!(open.doc.code_only().is_empty());
+    assert_eq!(open.doc.code_only(), std::slice::from_ref(&mb));
     let mut doc = open.doc.clone();
     doc.set_open(true).expect("open");
     let published = client::admin_publish(&admin, &open, &doc).expect("publish");
-    let mut asked: Vec<&str> = published.held.iter().map(|r| r.host.as_str()).collect();
-    asked.sort_unstable();
-    assert_eq!(asked, ["mb", "mc"]);
+    // The key let go is named already; opening holds the one stale request left waiting.
+    let asked: Vec<&str> = published.held.iter().map(|r| r.host.as_str()).collect();
+    assert_eq!(asked, ["mc"]);
     let opened = client::auto_approve(&admin).expect("approve");
     assert!(opened.approved.is_empty(), "{:?}", opened.approved);
     assert!(opened.code_only.contains(&mb));
@@ -909,7 +952,7 @@ fn a_join_whose_subscriber_applied_the_approval_first_is_done() {
         &admin.home.join(".secrets/gh_access_token"),
         &synthetic("gh"),
     );
-    let created = client::create(
+    let created = client::test_create_with_password(
         &admin,
         &lab.url,
         Some(&admin.home.join(".secrets")),
@@ -1273,7 +1316,8 @@ fn removing_an_admin_renews_the_join_password_it_read() {
 fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged() {
     let lab = Lab::changing("settle");
     let admin = lab.home("ma");
-    let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let created =
+        client::test_create_with_password(&admin, &lab.url, None, Some("ma")).expect("create");
     let password = client::admin_open(&admin)
         .expect("open")
         .doc
@@ -1333,8 +1377,9 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
 
     let other = Lab::new("other");
     let other_admin = other.home("other-admin");
-    let created = client::create(&other_admin, &other.url, None, Some("other-admin"))
-        .expect("create other vault");
+    let created =
+        client::test_create_with_password(&other_admin, &other.url, None, Some("other-admin"))
+            .expect("create other vault");
     let opened = client::admin_open(&other_admin).expect("open other vault");
     let mut doc = opened.doc.clone();
     doc.set_open(true).expect("open admission");
@@ -1544,7 +1589,8 @@ fn an_edit_saved_over_another_admins_changes_to_who_is_in_keeps_them() {
 fn an_edit_that_lands_after_a_revocation_keeps_the_machine_out() {
     let lab = Lab::new("revoked");
     let admin = lab.home("ma");
-    let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let created =
+        client::test_create_with_password(&admin, &lab.url, None, Some("ma")).expect("create");
     let password = client::admin_open(&admin)
         .expect("open")
         .doc
@@ -1603,7 +1649,8 @@ fn an_edit_that_lands_after_a_revocation_keeps_the_machine_out() {
 fn an_edit_that_lands_after_the_approver_keeps_the_machine_and_the_password() {
     let lab = Lab::new("edit");
     let admin = lab.home("ma");
-    let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let created =
+        client::test_create_with_password(&admin, &lab.url, None, Some("ma")).expect("create");
     let began = client::admin_open(&admin).expect("open");
     let base = began.doc.clone();
     let password = base.join_password().expect("create makes a join password");
@@ -1756,7 +1803,8 @@ fn a_join_with_the_password_says_how_to_fix_a_mistyped_one_before_it_waits() {
 fn a_machine_admitted_under_another_name_is_named_by_its_code() {
     let lab = Lab::new("names");
     let admin = lab.home("ma");
-    let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let created =
+        client::test_create_with_password(&admin, &lab.url, None, Some("ma")).expect("create");
     let pinned = format!("{}#{}", lab.url, created.signer);
     let password = client::admin_open(&admin)
         .expect("open")
@@ -1882,7 +1930,10 @@ fn an_edit_at_a_path_that_lands_after_another_admin_keeps_the_machine_it_admitte
     let kept = client::keep_admitted(&base, &fresh.doc, &mut edited).expect("merge");
     assert_eq!(kept, ["mc"]);
     let done = client::admin_publish(&admin, &fresh, &edited).expect("publish");
-    assert!(!done.password_renewed, "nobody was let go");
+    assert!(
+        !done.password_renewed && !done.kept_out && done.held.is_empty(),
+        "nobody was let go"
+    );
     applied(client::sync(&machine, None).expect("mc is still in"));
     assert_eq!(read(&machine, "note").as_deref(), Some("synthetic-note"));
 }

@@ -379,10 +379,16 @@ impl Row {
         unsafe { self.cells.get_unchecked_mut(col as usize) }
     }
 
-    /// Get mutable access to a cell range after clearing any orphaned wide-char halves.
+    /// Get mutable access to a cell range after setting the wide-char halves the writes into it
+    /// orphan to `orphan` (the writer's BCE blank).
     #[must_use]
     #[inline]
-    pub fn cells_mut_with_fixup(&mut self, start_col: u16, count: u16) -> Option<&mut [Cell]> {
+    pub fn cells_mut_with_fixup(
+        &mut self,
+        start_col: u16,
+        count: u16,
+        orphan: Cell,
+    ) -> Option<&mut [Cell]> {
         let start = usize::from(start_col);
         if start > self.cells.len() {
             return None;
@@ -390,7 +396,7 @@ impl Row {
 
         let old_len = self.len as usize;
         let end_half_blanked = self.flags.contains(RowFlags::HAS_WIDE_CHARS)
-            && self.fixup_wide_chars_in_range(start_col, count);
+            && self.fixup_wide_chars_in_range(start_col, count, orphan);
         let end = start
             .saturating_add(usize::from(count))
             .min(self.cells.len());

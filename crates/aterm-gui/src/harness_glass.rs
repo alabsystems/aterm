@@ -83,6 +83,33 @@ impl Stamp {
         })
     }
 
+    /// [`Self::at`], in UTC where the zone cannot be read (the trail's rule).
+    #[must_use]
+    pub(crate) fn at_or_utc(at_unix: i64) -> Self {
+        Self::at(at_unix).unwrap_or_else(|| {
+            let minute = at_unix.rem_euclid(86_400) / 60;
+            Self {
+                clock: Clock::of_minute(u16::try_from(minute).unwrap_or(0)),
+                day: at_unix.div_euclid(86_400),
+            }
+        })
+    }
+
+    /// A time ahead as a title says it: `18:41`, and on another local day than `today` (past
+    /// midnight) its weekday, `Sat 00:12`, as an armed timer names a later day; the clock alone
+    /// with no day read for the build (`None`).
+    #[must_use]
+    pub(crate) fn ahead_words(self, today: Option<i64>) -> String {
+        match today.filter(|today| *today != self.day) {
+            Some(_) => format!(
+                "{} {}",
+                Weekday::of_days(self.day).short(),
+                self.clock.as_str()
+            ),
+            None => self.clock.as_str().to_owned(),
+        }
+    }
+
     /// THE WALL TIME (unix ms) ITS MINUTE STARTS AT, [`Self::at`]'s inverse to the minute: the local minute and day placed by the zone's offset at that instant, read twice, so a minute within the zone's offset of a change of offset is placed by the offset it fell under (one read, at the local reading taken as an instant, places it an hour off there); `None` where the platform cannot say.
     #[must_use]
     /// Wall time in unix milliseconds when this stamp's minute starts ([`Self::at`]'s inverse to the minute).
@@ -168,15 +195,8 @@ impl PauseGlass {
     #[must_use]
     /// Builds pause glass state from `plan`.
     pub(crate) fn of(plan: crate::PausePlan) -> Self {
-        let until = Stamp::at(plan.at_unix).unwrap_or_else(|| {
-            let minute = plan.at_unix.rem_euclid(86_400) / 60;
-            Stamp {
-                clock: Clock::of_minute(u16::try_from(minute).unwrap_or(0)),
-                day: plan.at_unix.div_euclid(86_400),
-            }
-        });
         Self {
-            until,
+            until: Stamp::at_or_utc(plan.at_unix),
             short: plan.short,
         }
     }
@@ -185,14 +205,7 @@ impl PauseGlass {
     #[must_use]
     /// Title phrasing of when the pause ends against `today`.
     pub(crate) fn until_words(self, today: Option<i64>) -> String {
-        match today.filter(|today| *today != self.until.day) {
-            Some(_) => format!(
-                "{} {}",
-                Weekday::of_days(self.until.day).short(),
-                self.until.clock.as_str()
-            ),
-            None => self.until.clock.as_str().to_owned(),
-        }
+        self.until.ahead_words(today)
     }
 
     /// The chip's title's part (§10.5.1): `pausing until 18:41 after 3 short turns`, `… after a short turn` for one.
@@ -236,6 +249,40 @@ impl PauseGlass {
                 self.until.clock.as_str()
             ),
             None => format!("Pausing until {}.", self.until.clock.as_str()),
+        }
+    }
+}
+
+/// THE LOOP'S OUTAGE WAIT ON THE GLASS (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.17.5.2; [`on_waiting`]): which outage the loop waits on, and when its next blind try comes as the local clock and day its unix second falls on — read once, where the fact arrived — or none while the route is measured down. Only Settings ▸ Harness's state line and `status waiting=` say it: no chip title, no need, no alert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct WaitGlass {
+    /// The outage waited on.
+    pub(crate) wall: aterm_agent::supervise::Outage,
+    /// When the next try comes; `None` while only the route's edge up resumes.
+    pub(crate) next: Option<Stamp>,
+}
+
+impl WaitGlass {
+    /// The glass of `wait`: its next try's clock and day in the zone's offset at that instant, UTC's where the zone cannot be read (the trail's rule).
+    #[must_use]
+    pub(crate) fn of(wait: crate::OutageWait) -> Self {
+        Self {
+            wall: wait.wall,
+            next: wait.next_unix().map(Stamp::at_or_utc),
+        }
+    }
+
+    /// Settings ▸ Harness's state line's head: `waiting: API overload · next try 18:41` (`next try Sat 00:12` on another day than `today`), `waiting: connection error` while the route is measured down.
+    #[must_use]
+    pub(crate) fn state_words(self, today: Option<i64>) -> String {
+        let waiting = format!("waiting: {}", self.wall.words());
+        match self.next {
+            Some(next) => format!(
+                "{waiting}{}next try {}",
+                crate::native_ui::FACT_SEPARATOR,
+                next.ahead_words(today)
+            ),
+            None => waiting,
         }
     }
 }
@@ -308,6 +355,8 @@ pub(crate) struct SessionGlass {
     hold: Option<HeldGlass>,
     /// ATERM STOPPED TYPING INTO IT (§14.3), by which arm of ruling F's hold, as the session's loop last told its standing exception (`HostNote::ResumeException`'s `held`, [`on_stopped`]): set while the hold stands, whatever its urgency, and cleared as the loop lifts it or ends. What the chip's title and description, the state line, the hover and the Overview, a worker's tip and `status held=` say ([`stop_words`]), each only while the chip carries a mode ([`App::shown_stop`]).
     stopped: Option<HeldBy>,
+    /// THE LOOP'S OUTAGE WAIT (§14.17.5.2), while one stands ([`on_waiting`]): told by the loop's wait at an outage wall, and cleared by the wait that replaces it, the wait's end or the loop's.
+    waiting: Option<WaitGlass>,
 }
 
 /// THE KIND OF A TASK'S END (§11.2.3, item 1): under Autopilot Cruise / Autopilot Land only Land's landing, the face moved to `landed`.
@@ -720,6 +769,23 @@ pub(crate) fn on_stopped(app: &mut App, session: u64, stopped: Option<HeldBy>) -
     true
 }
 
+/// Updates the outage wait of `session` to `wait` ([`SessionGlass::waiting`]), returning whether it changed. No title reads it, so the trail's generation stands.
+pub(crate) fn on_waiting(app: &mut App, session: u64, wait: Option<crate::OutageWait>) -> bool {
+    let waiting = wait.map(WaitGlass::of);
+    let was = app.harness_glass.get(&session).copied().unwrap_or_default();
+    if was.waiting == waiting {
+        return false;
+    }
+    let mut now = was;
+    now.waiting = waiting;
+    if now == SessionGlass::default() {
+        app.harness_glass.remove(&session);
+    } else {
+        app.harness_glass.insert(session, now);
+    }
+    true
+}
+
 /// LAND'S HOLD ON THE GLASS (§12.3.1, §12.3.3 item 3): the hold the loop told ([`LandHeld`]: its legs, open words and counts, its nudges) and its `since` as the local clock and day its unix second falls on, read once where the hold arrived — never a countdown: nothing repaints it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 /// Land hold state on the glass ([`LandHeld`]) with its start stamp.
@@ -737,16 +803,9 @@ impl HeldGlass {
     pub(crate) fn of(held: LandHeld, was: Option<HeldGlass>) -> Self {
         let since = match was {
             Some(was) if was.held.since_ms == held.since_ms => was.since,
-            _ => held.since_ms.map(|ms| {
-                let at_unix = ms.div_euclid(1000);
-                Stamp::at(at_unix).unwrap_or_else(|| {
-                    let minute = at_unix.rem_euclid(86_400) / 60;
-                    Stamp {
-                        clock: Clock::of_minute(u16::try_from(minute).unwrap_or(0)),
-                        day: at_unix.div_euclid(86_400),
-                    }
-                })
-            }),
+            _ => held
+                .since_ms
+                .map(|ms| Stamp::at_or_utc(ms.div_euclid(1000))),
         };
         Self { held, since }
     }
@@ -1022,6 +1081,12 @@ impl App {
         crate::claude_lights::ChipFace::of(self.session_autopilot(session).1, &glass)
             .carries()
             .then_some(stopped)
+    }
+
+    /// THE OUTAGE WAIT OF SESSION `session` (§14.17.5.2): the wait on its glass ([`SessionGlass::waiting`]), whatever its chip's face: only a running loop tells one, and the wait's end or the loop's takes it down.
+    #[must_use]
+    pub(crate) fn shown_wait(&self, session: u64) -> Option<WaitGlass> {
+        self.harness_glass.get(&session)?.waiting
     }
 
     /// Whether the act ticker's label is shown at all: `[claude_footer] acts` on (the default) and serious mode off (`SeriousEffect::HarnessTicker`).

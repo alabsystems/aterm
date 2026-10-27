@@ -4,7 +4,7 @@
 //! What the pinned astream-term models, read off the fold itself.
 
 use astream_term::Record;
-use astream_term::screen::{Color, fold};
+use astream_term::screen::{Color, attr, fold};
 
 /// The capabilities, probed once per call (each is a fold of a few bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,10 +43,33 @@ pub struct Caps {
     pub charsets: bool,
     /// DECLRMM (`?69`) and DECSLRM (`CSI Pl ; Pr s`) left/right margins.
     pub lr_margins: bool,
+    /// A resize of the width that keeps the cursor's next write: a wrap pending at the edge
+    /// takes the next column on a widening, and a cursor whose own cell a narrowing cuts off is
+    /// clamped onto the last column with no wrap, as xterm clamps it.
+    pub width_resize: bool,
+    /// East Asian wide glyphs take a lead cell and a spacer, and no operation leaves half of
+    /// one: a wide glyph with one column left wraps and blanks that column.
+    pub wide_glyphs: bool,
+    /// SGR italic (3/23), blink (5, 6/25), concealed (8/28) and crossed-out (9/29) are
+    /// attributes of their own, and 21 is an underline.
+    pub sgr_attrs: bool,
+    /// 24-bit colour: `38;2;r;g;b` and `48;2;r;g;b`, and the colon forms with and without a
+    /// colour-space id, each channel clamped to 255.
+    pub truecolour: bool,
 }
 
 fn line(cols: u16, rows: u16, bytes: &[u8], row: u16) -> String {
     fold(cols, rows, &[Record::Out(bytes.to_vec())]).line_text(row)
+}
+
+/// Row `row` after `before` at `cols`, a resize to `to` columns and `after`.
+fn resized(cols: u16, rows: u16, before: &[u8], to: u16, after: &[u8], row: u16) -> String {
+    let recs = [
+        Record::Out(before.to_vec()),
+        Record::Resize { cols: to, rows },
+        Record::Out(after.to_vec()),
+    ];
+    fold(cols, rows, &recs).line_text(row)
 }
 
 impl Caps {
@@ -74,6 +97,26 @@ impl Caps {
             newline_mode: line(4, 2, b"\x1b[20hab\nc", 1) == "c",
             charsets: line(4, 1, b"\x1b(0q", 0) == "\u{2500}",
             lr_margins: line(4, 1, b"\x1b[?69h\x1b[1;2sabc", 0) == "c",
+            width_resize: resized(5, 2, b"abcde", 10, b"X", 0) == "abcdeX"
+                && resized(10, 2, b"abc\x1b[8G", 5, b"X", 0) == "abc X",
+            wide_glyphs: fold(4, 2, &[Record::Out("a\u{4e2d}b\u{6587}".into())]).cursor() == (1, 2)
+                && line(4, 1, "\u{4e2d}\u{6587}\x1b[2Gx".as_bytes(), 0) == " x\u{6587}",
+            sgr_attrs: fold(4, 1, &[Record::Out(b"\x1b[3;5;8;9mX\x1b[0;21mY".to_vec())])
+                .cell(0, 0)
+                .map(|c| c.attrs)
+                == Some(attr::ITALIC | attr::BLINK | attr::CONCEAL | attr::STRIKE)
+                && fold(4, 1, &[Record::Out(b"\x1b[21mY".to_vec())])
+                    .cell(0, 0)
+                    .map(|c| c.attrs)
+                    == Some(attr::UNDERLINE),
+            truecolour: fold(
+                4,
+                1,
+                &[Record::Out(b"\x1b[38;2;1;2;300;48:2::4:5:6mX".to_vec())],
+            )
+            .cell(0, 0)
+            .map(|c| (c.fg_rgb, c.bg_rgb))
+                == Some((Some((1, 2, 255)), Some((4, 5, 6)))),
         }
     }
 }

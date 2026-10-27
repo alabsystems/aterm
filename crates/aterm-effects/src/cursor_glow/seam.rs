@@ -32,6 +32,7 @@ pub(super) enum SpawnCall {
 
 impl CursorGlow {
     /// Expire the seam's holds at the tick, before this tick's move.
+    #[inline]
     pub(super) fn expire_seam_holds(&mut self, now: Instant) {
         if let Some(p) = self.held_park
             && (!p.fresh(now) || (p.cross_row && self.typed_credits_within(now) == 0))
@@ -99,6 +100,7 @@ impl CursorGlow {
     }
 
     /// The source of a move whose caret was hidden last frame, first answer winning.
+    #[inline]
     pub(super) fn hidden_bridge_source(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -162,6 +164,7 @@ impl CursorGlow {
     }
 
     /// Judge the observed caret against its source.
+    #[inline]
     pub(super) fn judge_observed_caret(
         &mut self,
         spawn_from: Option<(u16, u16)>,
@@ -289,6 +292,7 @@ impl CursorGlow {
     }
 
     /// The only witness that releases the next keys held out of the generic pool after an unknown insert.
+    #[inline]
     pub(super) fn orphan_exact_echo(
         &self,
         from: (u16, u16),
@@ -373,6 +377,7 @@ impl CursorGlow {
     }
 
     /// Judge the typed lay awaiting the caret's rest ([`TornLay`]).
+    #[inline]
     pub(super) fn settle_torn_lay(&mut self, cur: Option<(u16, u16)>, now: Instant) {
         let Some(mut lay) = self.torn_lay.take() else {
             return;
@@ -399,6 +404,7 @@ impl CursorGlow {
     }
 
     /// Recall a typed lay the caret rests on or left of, keylessly, after a print ended off its row.
+    #[inline]
     pub(super) fn recall_torn_lay(&mut self, lay: TornLay, (row, col): (u16, u16), now: Instant) {
         if !lay.printed_off_row
             || matches!(lay.hand_before, Some(hand) if hand.row == lay.row)
@@ -497,6 +503,7 @@ impl CursorGlow {
     }
 
     /// Write a row's print endpoint and brand back, stamped with the touch clock.
+    #[inline]
     pub(super) const fn remember_anchor_row(&mut self, slot: Option<usize>, mem: AnchorRow) {
         self.anchor_rows_clock = self.anchor_rows_clock.wrapping_add(1);
         let mem = AnchorRow {
@@ -528,6 +535,7 @@ impl CursorGlow {
     }
 
     /// Move the hide-bridge source to where the caret will be shown after a licensed anchored echo under a hidden caret (Rainbow Kitty only).
+    #[inline]
     pub(super) const fn relocate_hide_bridge_to_anchor(
         &mut self,
         ar: u16,
@@ -557,6 +565,7 @@ impl CursorGlow {
     }
 
     /// The glyph at the last cell of the print run ending at `(row, end)`, as this frame's host sampled it.
+    #[inline]
     pub(super) fn glyph_before(&self, row: u16, end: u16, now: Instant) -> Option<char> {
         if end == 0 {
             return None;
@@ -602,6 +611,7 @@ impl CursorGlow {
         verdict
     }
 
+    #[inline]
     fn exact_repaint_run(
         &self,
         from: (u16, u16),
@@ -635,6 +645,7 @@ impl CursorGlow {
         }
     }
 
+    #[inline]
     fn row_inserted_run(
         &self,
         (pr, pc): (u16, u16),
@@ -700,6 +711,7 @@ impl CursorGlow {
         })
     }
 
+    #[inline]
     fn insert_tail_preserved(&self, old_col: u16, new_col: u16) -> bool {
         let Some(tail) = self
             .row_shown
@@ -733,16 +745,21 @@ impl CursorGlow {
         };
         let end = self.ink_end_in_pane(&self.row_below_cur);
         let mut start = None;
+        let mut skipped_border = false;
         let mut col = usize::from(pane_col0);
         while col < end {
             let ch = self.row_below_cur[col];
-            if !matches!(ch, ' ' | '\0')
-                && !(col == usize::from(pane_col0) && rk::is_box_border_glyph(ch))
-            {
-                start = Some(col);
-                break;
+            if matches!(ch, ' ' | '\0') {
+                col += 1;
+                continue;
             }
-            col += 1;
+            if !skipped_border && rk::is_box_border_glyph(ch) {
+                skipped_border = true;
+                col += 1;
+                continue;
+            }
+            start = Some(col);
+            break;
         }
         let Some(start) = start else {
             return false;
@@ -762,6 +779,7 @@ impl CursorGlow {
         false
     }
 
+    #[inline]
     fn exact_hand_prefix(
         &self,
         (row, col): (u16, u16),
@@ -814,15 +832,20 @@ impl CursorGlow {
             ci += 1;
         }
         let last = last?;
+        let dr32 = i32::from(to) - i32::from(row);
+        if !(i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&dr32) {
+            return None;
+        }
         Some(rk::witness::FollowRun {
             row,
             cohort: last.cohort,
             lo,
             hi,
-            dr: i16::try_from(i32::from(to) - i32::from(row)).ok()?,
+            dr: dr32 as i16,
         })
     }
 
+    #[inline]
     fn split_inserted_run(
         &self,
         (pr, pc): (u16, u16),
@@ -879,17 +902,28 @@ impl CursorGlow {
             return None;
         }
         let mut landing_start = None;
+        let mut skipped_border = false;
         let mut col = pane_col0;
         while col < cc {
             let ch = rk::witness::unit_at(&self.row_cur, col).ch;
-            if !matches!(ch, ' ' | '\0') && !(col == pane_col0 && rk::is_box_border_glyph(ch)) {
-                landing_start = Some(col);
-                break;
+            if matches!(ch, ' ' | '\0') {
+                col += 1;
+                continue;
             }
-            col += 1;
+            if !skipped_border && rk::is_box_border_glyph(ch) {
+                skipped_border = true;
+                col += 1;
+                continue;
+            }
+            landing_start = Some(col);
+            break;
         }
         let landing_start = landing_start?;
-        let source_end = u16::try_from(self.ink_end_in_pane(&self.row_above_cur)).ok()?;
+        let source_end_usize = self.ink_end_in_pane(&self.row_above_cur);
+        if source_end_usize > u16::MAX as usize {
+            return None;
+        }
+        let source_end = source_end_usize as u16;
         let source_len = usize::from(source_end.checked_sub(pc)?);
         let landing_len = usize::from(cc - landing_start);
         if source_len == 0 || source_len.checked_add(landing_len)? > EXACT_COALESCED_PREFIX_MAX {
@@ -939,6 +973,7 @@ impl CursorGlow {
     }
 
     /// The glyph at `(row, end - 1)` in this frame's row probe (the caret's row, [`Self::observe_row`], or a flanking row, [`Self::observe_neighbor_rows`]).
+    #[inline]
     pub(super) fn probe_glyph_before(&self, row: u16, end: u16, now: Instant) -> Option<char> {
         let col = end.checked_sub(1)?;
         let meta = self.row_cur_meta?;
@@ -961,6 +996,7 @@ impl CursorGlow {
     }
 
     /// A new glyph immediately before the observed caret, backed by the oldest eligible one-cell press and a resident hand-owned cell.
+    #[inline]
     pub(super) fn exact_pending_prefix_slot(
         &self,
         row: u16,
@@ -1019,6 +1055,7 @@ impl CursorGlow {
     }
 
     /// A Backspace whose retreat is still owed and the keys typed since it, rendered as one repaint.
+    #[inline]
     pub(super) fn merged_correction(
         &self,
         (pr, pc): (u16, u16),
@@ -1030,10 +1067,10 @@ impl CursorGlow {
             return None;
         }
         let keys = i32::from(erase.owed) + i32::from(cc) - i32::from(pc);
-        let keys = usize::try_from(keys).ok()?;
-        if !(1..=EXACT_COALESCED_PREFIX_MAX).contains(&keys) {
+        if !(1..=EXACT_COALESCED_PREFIX_MAX as i32).contains(&keys) {
             return None;
         }
+        let keys = keys as usize;
         let mid = cc.checked_sub(keys as u16)?;
         let prev = if self.last.is_none()
             && let Some(m) = self.row_shown_meta
@@ -1090,6 +1127,7 @@ impl CursorGlow {
         clippy::too_many_arguments,
         reason = "the row, the correction's three columns and its slot, plus the judge's clock, config and geometry"
     )]
+    #[inline]
     pub(super) fn judge_merged_correction(
         &mut self,
         row: u16,
@@ -1110,6 +1148,7 @@ impl CursorGlow {
     }
 
     /// What the observed move `(pr, pc) -> (cr, cc)` is to Rainbow Kitty's Backspace whose retreat is still owed ([`EraseWitness`], [`EraseHop`]), `None` for other styles or with no such erase.
+    #[inline]
     pub(super) fn erase_hop(
         &self,
         (pr, pc): (u16, u16),
@@ -1161,6 +1200,7 @@ impl CursorGlow {
     }
 
     /// A slipped host frame can coalesce Codex's first wrapped-row `a` with later keys.
+    #[inline]
     pub(super) fn coalesced_prefix_echo(
         &mut self,
         from: (u16, u16),
@@ -1188,6 +1228,7 @@ impl CursorGlow {
     }
 
     /// A whole first composer batch can arrive after its first key aged past the per-key hint, or after wrap-fill was refused.
+    #[inline]
     pub(super) fn exact_coalesced_prefix_slot(
         &self,
         row: u16,
@@ -1224,6 +1265,7 @@ impl CursorGlow {
     }
 
     /// A rewrap carried the hand's old word left on its row or down one row and printed queued keys after it.
+    #[inline]
     pub(super) fn rewrapped_typed_run(
         &self,
         (pr, pc): (u16, u16),
@@ -1290,97 +1332,110 @@ impl CursorGlow {
         if !has_end {
             return None;
         }
-        if width == 0 {
-            if current.above != NbrProbe::Probed
-                || self.ink_end_in_pane(&self.row_cur) != usize::from(cc)
-            {
-                return None;
-            }
-            let pc_trim = if ended_at_space { pc - 1 } else { pc };
-            if pc_trim <= pane_start
-                || self.ink_end_in_pane(&self.row_above_cur) > usize::from(pc_trim)
-                || old_row.get(usize::from(pane_start)..usize::from(pc_trim))
-                    != self
-                        .row_above_cur
-                        .get(usize::from(pane_start)..usize::from(pc_trim))
-            {
-                return None;
-            }
-            let mut col = pane_start;
-            while col < cc {
-                let glyph = match self.row_cur.get(usize::from(col)) {
-                    Some(&c) => c,
-                    None => break,
-                };
-                if matches!(glyph, ' ' | '\0') {
-                    col += 1;
-                    continue;
-                }
-                let landing_len = usize::from(cc - col);
-                let dropped_space = usize::from(!ended_at_space);
-                let cells = dropped_space + landing_len;
-                if (1..=EXACT_COALESCED_PREFIX_MAX).contains(&cells) {
-                    let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
-                    let mut valid = true;
-                    let mut i = 0;
-                    let mut c = col;
-                    while c < cc {
-                        let ch = match self.row_cur.get(usize::from(c)) {
-                            Some(&ch) => ch,
-                            None => ' ',
-                        };
-                        if ch == '\0' {
-                            valid = false;
-                            break;
-                        }
-                        glyphs[dropped_space + i] = ch;
-                        i += 1;
-                        c += 1;
-                    }
-                    if valid
-                        && let Some(slot) = self.type_press_ring.exact_unpaid_run_with_tail_window(
-                            now,
-                            previous.at,
-                            &glyphs[..cells],
-                            IN_FLIGHT_PATIENCE_DUR,
-                        )
-                    {
-                        return Some(ExactTypedRun {
-                            origin_row: pr,
-                            slot,
-                            source: None,
-                            landing_start: col,
-                            cells,
-                            rewrap_start: Some((col, 0)),
-                        });
-                    }
-                }
-                if rk::is_box_border_glyph(glyph)
-                    || (!glyph.is_alphanumeric() && old_row.get(usize::from(col)) == Some(&glyph))
+        if width > 0
+            && let Some(source_start) = pc.checked_sub(width)
+            && let Some(expected_word) = old_row.get(usize::from(source_start)..usize::from(pc))
+        {
+            let source_now = if same_row {
+                &self.row_cur
+            } else {
+                &self.row_above_cur
+            };
+            let mut cleared = true;
+            let mut col = source_start;
+            while col < pc {
+                if let Some(&glyph) = source_now.get(usize::from(col))
+                    && glyph != ' '
                 {
-                    col += 1;
-                    continue;
+                    cleared = false;
+                    break;
                 }
-                break;
+                col += 1;
             }
+            if cleared {
+                let mut col = pane_start;
+                while col < cc {
+                    let glyph = match self.row_cur.get(usize::from(col)) {
+                        Some(&c) => c,
+                        None => break,
+                    };
+                    if matches!(glyph, ' ' | '\0') {
+                        col += 1;
+                        continue;
+                    }
+                    if let Some(landing_start) = col.checked_add(width)
+                        && let Some(raw_cells) = cc.checked_sub(landing_start)
+                    {
+                        let cells = usize::from(raw_cells);
+                        if (1..=EXACT_COALESCED_PREFIX_MAX).contains(&cells)
+                            && self
+                                .row_cur
+                                .get(usize::from(col)..usize::from(landing_start))
+                                == Some(expected_word)
+                        {
+                            let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
+                            let mut valid = true;
+                            let mut i = 0;
+                            let mut c = landing_start;
+                            while c < cc {
+                                let ch = match self.row_cur.get(usize::from(c)) {
+                                    Some(&ch) => ch,
+                                    None => ' ',
+                                };
+                                if ch == '\0' {
+                                    valid = false;
+                                    break;
+                                }
+                                glyphs[i] = ch;
+                                i += 1;
+                                c += 1;
+                            }
+                            if valid
+                                && let Some(slot) =
+                                    self.type_press_ring.exact_unpaid_run_with_tail_window(
+                                        now,
+                                        previous.at,
+                                        &glyphs[..cells],
+                                        IN_FLIGHT_PATIENCE_DUR,
+                                    )
+                            {
+                                return Some(ExactTypedRun {
+                                    origin_row: pr,
+                                    slot,
+                                    source: None,
+                                    landing_start,
+                                    cells,
+                                    rewrap_start: Some((col, width)),
+                                });
+                            }
+                        }
+                    }
+                    if rk::is_box_border_glyph(glyph)
+                        || (!glyph.is_alphanumeric()
+                            && old_row.get(usize::from(col)) == Some(&glyph))
+                    {
+                        col += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        if current.above != NbrProbe::Probed
+            || self.ink_end_in_pane(&self.row_cur) != usize::from(cc)
+        {
             return None;
         }
-        let source_start = pc.checked_sub(width)?;
-        let source_now = if same_row {
-            &self.row_cur
-        } else {
-            &self.row_above_cur
-        };
-        let mut col = source_start;
-        while col < pc {
-            if let Some(&glyph) = source_now.get(usize::from(col))
-                && glyph != ' '
-            {
-                return None;
-            }
-            col += 1;
+        let pc_trim = if ended_at_space { pc - 1 } else { pc };
+        if pc_trim <= pane_start
+            || self.ink_end_in_pane(&self.row_above_cur) > usize::from(pc_trim)
+            || old_row.get(usize::from(pane_start)..usize::from(pc_trim))
+                != self
+                    .row_above_cur
+                    .get(usize::from(pane_start)..usize::from(pc_trim))
+        {
+            return None;
         }
-        let expected_word = old_row.get(usize::from(source_start)..usize::from(pc))?;
         let mut col = pane_start;
         while col < cc {
             let glyph = match self.row_cur.get(usize::from(col)) {
@@ -1391,50 +1446,45 @@ impl CursorGlow {
                 col += 1;
                 continue;
             }
-            if let Some(landing_start) = col.checked_add(width)
-                && let Some(raw_cells) = cc.checked_sub(landing_start)
+            let landing_len = usize::from(cc - col);
+            let dropped_space = usize::from(!ended_at_space);
+            let cells = dropped_space + landing_len;
+            if !(dropped_space > 0 && down_one && col == pane_start)
+                && (1..=EXACT_COALESCED_PREFIX_MAX).contains(&cells)
             {
-                let cells = usize::from(raw_cells);
-                if (1..=EXACT_COALESCED_PREFIX_MAX).contains(&cells)
-                    && self
-                        .row_cur
-                        .get(usize::from(col)..usize::from(landing_start))
-                        == Some(expected_word)
+                let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
+                let mut valid = true;
+                let mut i = 0;
+                let mut c = col;
+                while c < cc {
+                    let ch = match self.row_cur.get(usize::from(c)) {
+                        Some(&ch) => ch,
+                        None => ' ',
+                    };
+                    if ch == '\0' {
+                        valid = false;
+                        break;
+                    }
+                    glyphs[dropped_space + i] = ch;
+                    i += 1;
+                    c += 1;
+                }
+                if valid
+                    && let Some(slot) = self.type_press_ring.exact_unpaid_run_with_tail_window(
+                        now,
+                        previous.at,
+                        &glyphs[..cells],
+                        IN_FLIGHT_PATIENCE_DUR,
+                    )
                 {
-                    let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
-                    let mut valid = true;
-                    let mut i = 0;
-                    let mut c = landing_start;
-                    while c < cc {
-                        let ch = match self.row_cur.get(usize::from(c)) {
-                            Some(&ch) => ch,
-                            None => ' ',
-                        };
-                        if ch == '\0' {
-                            valid = false;
-                            break;
-                        }
-                        glyphs[i] = ch;
-                        i += 1;
-                        c += 1;
-                    }
-                    if valid
-                        && let Some(slot) = self.type_press_ring.exact_unpaid_run_with_tail_window(
-                            now,
-                            previous.at,
-                            &glyphs[..cells],
-                            IN_FLIGHT_PATIENCE_DUR,
-                        )
-                    {
-                        return Some(ExactTypedRun {
-                            origin_row: pr,
-                            slot,
-                            source: None,
-                            landing_start,
-                            cells,
-                            rewrap_start: Some((col, width)),
-                        });
-                    }
+                    return Some(ExactTypedRun {
+                        origin_row: pr,
+                        slot,
+                        source: None,
+                        landing_start: col,
+                        cells,
+                        rewrap_start: Some((col, 0)),
+                    });
                 }
             }
             if rk::is_box_border_glyph(glyph)
@@ -1449,6 +1499,7 @@ impl CursorGlow {
     }
 
     /// Witness for a one-glyph echo when a TUI redraws the caret back onto its old cell in the same bracket.
+    #[inline]
     pub(super) fn same_caret_typed_echo(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -1482,6 +1533,7 @@ impl CursorGlow {
         self.admit_exact_prefix(row, col, press_slot, now, cfg, geom)
     }
 
+    #[inline]
     fn admit_exact_prefix(
         &mut self,
         row: u16,
@@ -1506,6 +1558,7 @@ impl CursorGlow {
     }
 
     /// A licensed first-cell admission can take `classify_move`'s re-anchor branch and skip `hand_v2_typed_sweep`.
+    #[inline]
     pub(super) fn remember_exact_first_cell(&mut self, row: u16, col: u16, now: Instant) {
         if !matches!(self.row_cur_meta, Some(m) if m.row == row && m.at == now) {
             return;
@@ -1529,6 +1582,7 @@ impl CursorGlow {
     }
 
     /// Remember a typed fold's landing as the continuation row's first typed run (`RAINBOW-KITTY-V2.md` §44).
+    #[inline]
     pub(super) fn remember_fold_landing(&mut self, row: u16, col0: u16, col1: u16, now: Instant) {
         if col0 >= col1
             || usize::from(col1 - col0) > RECENT_TYPED_RUN_CAP
@@ -1539,6 +1593,7 @@ impl CursorGlow {
         self.recent_typed_run = Some(self.typed_run_from_probe(row, col0, col1, now));
     }
 
+    #[inline]
     const fn typed_run_from_probe(
         &self,
         row: u16,
@@ -1570,6 +1625,7 @@ impl CursorGlow {
     }
 
     /// The hidden/parked-caret echo lane.
+    #[inline]
     pub(super) fn echo_anchor_pass(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -1762,6 +1818,7 @@ impl CursorGlow {
     }
 
     /// Release a held park ([`HeldPark`]) by the move that reached the seam, or leave it for the custody arm and the flush (`None`).
+    #[inline]
     pub(super) fn release_held_park(
         &mut self,
         lane: SpawnLane,
@@ -1836,6 +1893,7 @@ impl CursorGlow {
         clippy::too_many_arguments,
         reason = "the same observed move `spawn` judges"
     )]
+    #[inline]
     fn spawn_on_rows(
         &mut self,
         pr: u16,
@@ -1874,6 +1932,7 @@ impl CursorGlow {
     }
 
     /// Judge a held park ([`HeldPark`]) through the ordinary body at the park's own clock, under the config and geometry it arrived with.
+    #[inline]
     pub(super) fn flush_park(&mut self, p: HeldPark) {
         self.in_flight_tally.park_flushed += 1;
         if p.cross_row {
@@ -1950,6 +2009,7 @@ impl CursorGlow {
     }
 
     /// Hold a move as a park ([`HeldPark`]) with its config, geometry and whether a glyph sits at its landing cell.
+    #[inline]
     pub(super) fn hold_park(
         &mut self,
         (pr, pc): (u16, u16),
@@ -2023,6 +2083,7 @@ impl CursorGlow {
         clippy::too_many_arguments,
         reason = "the observed move, its clock, style and pane geometry determine park eligibility"
     )]
+    #[inline]
     pub(super) fn park_candidate(
         &self,
         pr: u16,
@@ -2074,6 +2135,7 @@ impl CursorGlow {
     }
 
     /// Whether a `pr -> pr + 1` move is an indented/bordered composer wrap landing rather than a background cross-row park.
+    #[inline]
     pub(super) fn indented_wrap_landing(
         &self,
         pr: u16,
@@ -2099,6 +2161,7 @@ impl CursorGlow {
             None => 0,
         };
         let mut col = pane_start;
+        let mut skipped_border = false;
         let mut saw_word = false;
         while col < cc {
             let ch = match self.row_cur.get(usize::from(col)) {
@@ -2109,8 +2172,8 @@ impl CursorGlow {
                 if saw_word {
                     return false;
                 }
-            } else if !saw_word && col == pane_start && rk::is_box_border_glyph(ch) {
-                // Left box border at `pane_start`.
+            } else if !saw_word && !skipped_border && rk::is_box_border_glyph(ch) {
+                skipped_border = true;
             } else {
                 saw_word = true;
             }
@@ -2120,6 +2183,7 @@ impl CursorGlow {
     }
 
     /// A cross-row park needs content evidence.
+    #[inline]
     pub(super) const fn park_source_unchanged(&self, row: u16, col: u16) -> bool {
         if col == 0 {
             return false;
@@ -2155,6 +2219,7 @@ impl CursorGlow {
     }
 
     /// The key pushed the row's text down with the caret.
+    #[inline]
     pub(super) fn key_pushed_text_down(
         &self,
         (row, col): (u16, u16),
@@ -2244,8 +2309,19 @@ impl CursorGlow {
                 skipped_border = true;
                 continue;
             }
-            if i == pane_start && rk::is_box_border_glyph(ch) {
-                return 0;
+            if rk::is_box_border_glyph(ch) {
+                let mut k = pane_start;
+                let mut margin_blank = true;
+                while k < i {
+                    if !matches!(cols[k], ' ' | '\0') {
+                        margin_blank = false;
+                        break;
+                    }
+                    k += 1;
+                }
+                if margin_blank {
+                    return 0;
+                }
             }
             return i + 1;
         }
@@ -2306,6 +2382,7 @@ impl CursorGlow {
     }
 
     /// A typed echo can resume beside cells whose swoosh already removed them.
+    #[inline]
     pub(super) fn hand_v2_typed_sweep(
         &mut self,
         row: u16,
@@ -2415,6 +2492,7 @@ impl CursorGlow {
         }
     }
 
+    #[inline]
     fn typed_run_standing(
         &self,
         row: u16,
@@ -2428,11 +2506,6 @@ impl CursorGlow {
         let ribbon = self.v2.ribbon();
         let mut standing = [false; RECENT_TYPED_RUN_CAP];
         let mut first: Option<(u16, rk::ribbon::RunOrigin)> = None;
-        let cohorts = ribbon.cohorts();
-        let first_cohort = match cohorts.first() {
-            Some(coh) => coh.id,
-            None => 0,
-        };
         let mut cached_coh: Option<(u32, Option<(&rk::ribbon::Cohort, bool)>)> = None;
         let cells = ribbon.cells();
         let mut ci = 0;
@@ -2450,16 +2523,9 @@ impl CursorGlow {
             let coh_entry = match cached_coh {
                 Some((id, entry)) if id == cell.cohort => entry,
                 _ => {
-                    let id_offset = cell.cohort.wrapping_sub(first_cohort);
-                    let entry = match cohorts
-                        .binary_search_by_key(&id_offset, |coh| coh.id.wrapping_sub(first_cohort))
-                    {
-                        Ok(idx) => {
-                            let coh = &cohorts[idx];
-                            Some((coh, coh.leaving_at(now)))
-                        }
-                        Err(_) => None,
-                    };
+                    let entry = ribbon
+                        .cohort_by_id(cell.cohort)
+                        .map(|coh| (coh, coh.leaving_at(now)));
                     cached_coh = Some((cell.cohort, entry));
                     entry
                 }
@@ -2488,6 +2554,7 @@ impl CursorGlow {
     }
 
     /// Read the run's walk on the frame that lays it (§46), once per drawing tick after the engine replayed the frame's events.
+    #[inline]
     pub(super) fn read_fresh_run_origin(&mut self, now: Instant) {
         let Some(run) = self.recent_typed_run.as_ref() else {
             return;
@@ -2504,6 +2571,7 @@ impl CursorGlow {
     }
 
     /// Hand v2 the licensed move (seam point 1).
+    #[inline]
     pub(super) fn hand_v2_the_move(
         &mut self,
         mv: &MoveCtx,
@@ -2746,6 +2814,7 @@ impl CursorGlow {
         clippy::too_many_arguments,
         reason = "from/to cursor cells + clock + config + geometry + lane + the call; packing them into a struct would only obscure two internal call sites"
     )]
+    #[inline]
     pub(super) fn spawn_judged(
         &mut self,
         pr: u16,
@@ -2796,10 +2865,12 @@ impl CursorGlow {
             && lane == SpawnLane::Visible
             && self.park_candidate(pr, pc, cr, cc, now, cfg, geom);
         if park && cr != pr {
+            let take_len = usize::from(pc) + 1;
+            let copy_len = self.row_prev.len().min(take_len);
             self.park_source_cells.clear();
             self.park_source_cells
-                .extend(self.row_prev.iter().take(usize::from(pc) + 1));
-            self.park_source_cells.resize(usize::from(pc) + 1, ' ');
+                .extend_from_slice(&self.row_prev[..copy_len]);
+            self.park_source_cells.resize(take_len, ' ');
         }
         let erase_licensed = matches!(
             self.erase_hop((pr, pc), (cr, cc), now, cfg),
@@ -3033,6 +3104,7 @@ impl CursorGlow {
         clippy::too_many_arguments,
         reason = "one internal call classifies the observed endpoints, frame context and optional exact content proof"
     )]
+    #[inline]
     pub(super) fn classify_move<'a>(
         &mut self,
         pr: u16,

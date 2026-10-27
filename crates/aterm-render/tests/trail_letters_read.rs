@@ -343,9 +343,34 @@ pub struct Judged {
     /// luminance, when the replay reads them ([`Replay::air`]).
     pub air: usize,
     /// The light below the caret's row, column by column from the window's left edge to
-    /// the caret's: each column's greatest channel lift over the clean frame in the
-    /// [`RAIL_BAND`] px under the row's bottom, when the replay reads it ([`Replay::rail`]).
+    /// the caret's, or to where a companion's drawn box meets the band (the underline cat
+    /// stands on its rail's head, its body over it): each column's greatest channel lift
+    /// over the clean frame in the [`RAIL_BAND`] px under the row's bottom, when the replay
+    /// reads it ([`Replay::rail`]).
     pub rail: Vec<u8>,
+    /// The letter under the caret, judged against its clean twin (the theme's own caret
+    /// over it), its [`Letter::own`] that twin's reading, when the replay reads it
+    /// ([`Replay::caret`]) and the caret's cell holds one the effects changed.
+    pub caret: Option<Letter>,
+    /// Where the companion's body lay this frame, when the replay reads it ([`Replay::coat`]).
+    pub coat: Coat,
+}
+
+/// Where a frame's companion lay ([`Replay::coat`]): its drawn body (the knock layer's rects
+/// that meet the pet's box), against the letters' ink and the word icons.
+#[derive(Clone, Debug, Default)]
+pub struct Coat {
+    /// The pet's drawn box, frame px `(x0, x1, y0, y1)`.
+    pub pet: Option<(i32, i32, i32, i32)>,
+    /// The letters' ink pixels (a clean frame's pixels off the page in a cell that holds a
+    /// glyph) the body covers, and the cells they lie in `(row, col, px)`.
+    pub ink_px: usize,
+    pub cells: Vec<(usize, usize, usize)>,
+    /// The caret cell's pixels the body covers.
+    pub caret_px: usize,
+    /// The word icons on glass, frame px, and the pixels of the pet's box that meet them.
+    pub icons: Vec<(i32, i32, i32, i32)>,
+    pub icon_px: usize,
 }
 
 /// The px band under a row's bottom a rail laid clear of the letter guard's ring lies in
@@ -391,14 +416,39 @@ pub struct Replay {
     pub air: bool,
     /// Whether each frame reads the light below the caret's row ([`Judged::rail`]).
     pub rail: bool,
+    /// Whether each frame reads the letter under the caret ([`Judged::caret`]).
+    pub caret: bool,
+    /// Whether each frame takes the host's post passes as the GUI runs them over the
+    /// over-text stream (`post_process`): the bloom unless the frame holds it, at the page's
+    /// share of its strength, then the SDR crown at the default boost.
+    pub post: bool,
+    /// Whether each frame reads where the companion's body lies ([`Judged::coat`]).
+    pub coat: bool,
+    /// Whether the keys reach the terminal without passing the console, as the trail
+    /// gallery's `aterm ctl key` types them: their echo lands and the host notes nothing.
+    pub keys_unnoted: bool,
+    /// The frames' times, ms, in place of one every [`FRAME_MS`]: a headless instance
+    /// advances its effects only when a frame renders, and the trail gallery renders one
+    /// after each key and on its own steps ([`Scene::gallery_frames`]).
+    pub frames_at: Option<Vec<u64>>,
+    /// The pane's rows: [`ROWS`], or a scene's own ([`Scene::rows`]).
+    pub rows: u16,
 }
+
+/// `cursor_glow_sdr_boost`'s default, the SDR crown's ([`Replay::post`]).
+const SDR_BOOST: f32 = 0.25;
 
 impl Replay {
     pub fn new(style: &str, look: Look, trail_color: TrailColor) -> Self {
+        Self::sized(style, look, trail_color, ROWS)
+    }
+
+    /// [`Replay::new`] on a pane of `rows` rows.
+    pub fn sized(style: &str, look: Look, trail_color: TrailColor, rows: u16) -> Self {
         let rend = Renderer::from_system(22.0, Theme::default())
             .expect("no font: build with aterm-render's default embedded-font feature");
         let (cw, ch) = rend.cell_size();
-        let mut term = Terminal::new(ROWS, COLS);
+        let mut term = Terminal::new(rows, COLS);
         let rgb = |c: u32| Rgb {
             r: (c >> 16) as u8,
             g: (c >> 8) as u8,
@@ -439,6 +489,12 @@ impl Replay {
             shade: false,
             air: false,
             rail: false,
+            caret: false,
+            post: false,
+            coat: false,
+            keys_unnoted: false,
+            frames_at: None,
+            rows,
         }
     }
 
@@ -460,7 +516,7 @@ impl Replay {
     /// Present one frame and judge its letters.
     pub fn present(&mut self) -> Judged {
         let (cw, ch) = self.cell;
-        let (rows, cols) = (usize::from(ROWS), usize::from(COLS));
+        let (rows, cols) = (usize::from(self.rows), usize::from(COLS));
         let mut input: RenderInput = self.term.cell_frame(rows, cols);
         let caret = (input.cursor_row, input.cursor_col);
         let key = (self.term.screen_mutations(), caret);
@@ -485,6 +541,21 @@ impl Replay {
             )
             .expect("the frame blooms");
         }
+        if self.post {
+            use aterm_render::{bloom, hdr};
+            let bg = self.look.bg;
+            if !input.bloom_gate.held() {
+                let params = bloom::BloomParams {
+                    strength: bloom::BLOOM_STRENGTH * hdr::light_page_bloom_share(bg),
+                    radius: bloom::BLOOM_RADIUS,
+                };
+                bloom::apply(&mut frame, &input.cursor_glow_add, input.rows, params)
+                    .expect("the frame blooms");
+            }
+            let budget = hdr::sdr_glow_budget(hdr::packed_luma(bg), SDR_BOOST);
+            bloom::sdr_crown(&mut frame, &input.cursor_glow_add, input.rows, budget)
+                .expect("the frame is crowned");
+        }
         let place = self.rend.fx_frame(frame.width, frame.height, rows);
         let mut bodies = Vec::new();
         aterm_render::knock_rects(
@@ -495,6 +566,77 @@ impl Replay {
             &mut aterm_render::SpriteCols::default(),
             &mut bodies,
         );
+        let mut coat = Coat::default();
+        if self.coat {
+            let (px, py) = (place.pad as i32, place.grid_top as i32);
+            let pet = self
+                .fx
+                .companion_hit_rect()
+                .map(|(x0, x1, y0, y1)| (x0 + px, x1 + px, y0 + py, y1 + py));
+            coat.pet = pet;
+            coat.icons = self
+                .fx
+                .word_icon_boxes()
+                .iter()
+                .map(|&(x0, x1, y0, y1)| (x0 + px, x1 + px, y0 + py, y1 + py))
+                .collect();
+            if let Some((qx0, qx1, qy0, qy1)) = pet {
+                let meets = |b: &aterm_render::KnockRect| {
+                    b.x0 < qx1 && b.x1 > qx0 && b.y0 < qy1 && b.y1 > qy0
+                };
+                let body: Vec<_> = bodies.iter().filter(|b| meets(b)).copied().collect();
+                let on_body = |x: i32, y: i32| {
+                    body.iter().any(|b| {
+                        x >= b.x0.max(qx0)
+                            && x < b.x1.min(qx1)
+                            && y >= b.y0.max(qy0)
+                            && y < b.y1.min(qy1)
+                    })
+                };
+                let page = self.look.bg & 0x00FF_FFFF;
+                let w = frame.width;
+                let h = frame.pixels.len() / w;
+                let clean = &self.clean.as_ref().expect("rendered above").2;
+                let off_page = |c: u32| {
+                    [16u32, 8, 0].iter().any(|&sh| {
+                        (((c >> sh) & 0xff) as i32 - ((page >> sh) & 0xff) as i32).abs() > 24
+                    })
+                };
+                for (row, line) in input.cells.iter().enumerate() {
+                    for (col, c) in line.iter().enumerate().take(cols) {
+                        let is_caret = (row, col) == caret;
+                        let glyph = !(c.ch == ' ' || c.ch == '\0' || c.ch.is_control());
+                        if !glyph && !is_caret {
+                            continue;
+                        }
+                        let (x0, y0) = (place.pad + col * cw, place.grid_top + row * ch);
+                        let mut n = 0usize;
+                        for y in y0..(y0 + ch).min(h) {
+                            for x in x0..(x0 + cw).min(w) {
+                                if !on_body(x as i32, y as i32) {
+                                    continue;
+                                }
+                                if is_caret {
+                                    coat.caret_px += 1;
+                                }
+                                if glyph && off_page(clean[y * w + x] & 0x00FF_FFFF) {
+                                    n += 1;
+                                }
+                            }
+                        }
+                        if n > 0 {
+                            coat.ink_px += n;
+                            coat.cells.push((row, col, n));
+                        }
+                    }
+                }
+                for &(ix0, ix1, iy0, iy1) in &coat.icons {
+                    let dx = (ix1.min(qx1) - ix0.max(qx0)).max(0);
+                    let dy = (iy1.min(qy1) - iy0.max(qy0)).max(0);
+                    coat.icon_px += (dx * dy) as usize;
+                }
+            }
+        }
         if let Some(i) = self.dump.iter().position(|(at, _)| *at == self.ms) {
             let (_, path) = self.dump.remove(i);
             std::fs::write(&path, frame.to_png()).expect("dump");
@@ -539,6 +681,21 @@ impl Replay {
                 }
             }
         }
+        let caret_letter = if self.caret {
+            let (row, col) = caret;
+            input
+                .cells
+                .get(row)
+                .and_then(|line| line.get(col))
+                .filter(|c| !c.wide && c.ch != ' ' && c.ch != '\0' && !c.ch.is_control())
+                .and_then(|c| {
+                    let mut l = pair.letter(row, col, 1, c.ch)?;
+                    l.own = pair.own(row, col, 1, c.ch).unwrap_or(f64::INFINITY);
+                    Some(l)
+                })
+        } else {
+            None
+        };
         let mut beds = Vec::new();
         if self.beds {
             for (row, line) in input.cells.iter().enumerate() {
@@ -593,6 +750,14 @@ impl Replay {
         if self.rail {
             let (row, col) = caret;
             let h = frame.pixels.len() / w;
+            let band = (
+                (row + 1) * ch + RAIL_BAND.start,
+                (row + 1) * ch + RAIL_BAND.end,
+            );
+            let stands = self.fx.companion_hit_rect().and_then(|(x0, _, y0, y1)| {
+                let (px, py) = (place.pad as i32, place.grid_top as i32);
+                (y0 + py < band.1 as i32 && y1 + py > band.0 as i32).then_some(x0 + px)
+            });
             let lift = |f: u32, c: u32| {
                 [16u32, 8, 0]
                     .iter()
@@ -603,6 +768,9 @@ impl Replay {
                     .unwrap_or(0) as u8
             };
             for x in 0..(col * cw).min(w) {
+                if stands.is_some_and(|x0| x as i32 >= x0) {
+                    break;
+                }
                 let top = (row + 1) * ch;
                 rail.push(
                     RAIL_BAND
@@ -622,6 +790,8 @@ impl Replay {
             shade,
             air,
             rail,
+            caret: caret_letter,
+            coat,
         }
     }
 
@@ -636,16 +806,21 @@ impl Replay {
             }
         }
         let end = events.last().map_or(0, |e| e.0) + tail;
-        let mut f = FRAME_MS;
-        while f <= end {
-            timeline.push((f, 2, 0));
-            f += FRAME_MS;
+        if let Some(frames) = &self.frames_at {
+            timeline.extend(frames.iter().map(|&f| (f, 2, 0)));
+        } else {
+            let mut f = FRAME_MS;
+            while f <= end {
+                timeline.push((f, 2, 0));
+                f += FRAME_MS;
+            }
         }
         timeline.sort_unstable();
         let mut judged = Vec::new();
         for (at, kind, i) in timeline {
             self.to(at);
             match (kind, &events[i].1) {
+                (0, Ev::Key(..)) if self.keys_unnoted => {}
                 (0, Ev::Key('\r', _)) => {
                     // A window's Enter: the console's submit (the trail's
                     // return flare and the companion's) and the keystroke.
@@ -653,7 +828,9 @@ impl Replay {
                     self.fx.note_keystroke();
                 }
                 (0, Ev::Key(c, _)) => {
-                    let input = self.term.cell_frame(usize::from(ROWS), usize::from(COLS));
+                    let input = self
+                        .term
+                        .cell_frame(usize::from(self.rows), usize::from(COLS));
                     let _ = self.fx.note_committed_char(&mut self.term, &input, *c);
                 }
                 (0, Ev::Out(bytes)) | (1, Ev::Key(_, bytes)) => {
@@ -692,9 +869,65 @@ pub enum Scene {
     EnterBottom,
     Burst,
     Cjk,
+    /// The gallery's `move-up`: lettered rows above a prompt, `./k` typed and entered, and a
+    /// second later the program moves the caret up onto `println!`'s `!` and holds it there,
+    /// as vim's `k` does.
+    MoveUp,
+    /// [`Scene::MoveUp`] with its Enter 10 ms after the last key, before the cat has walked
+    /// clear of the line's last letters: where the gallery's frames left its cat when it
+    /// pressed the Enter (over `k` in every `move-up` instance of looks8 round 2's first
+    /// capture), a pace the 16 ms replay of the gallery's 84 ms does not reach.
+    MoveUpHasty,
+    /// The gallery's `split` burst: [`Scene::Burst`] in the caret's pane of a window split
+    /// top over bottom, 6 rows, the line on its last row but one ([`Scene::rows`]).
+    SplitBurst,
 }
 
 impl Scene {
+    /// The scene's pane rows: the `split` caret pane's 6, else the gallery window's [`ROWS`].
+    pub fn rows(self) -> u16 {
+        match self {
+            Scene::SplitBurst => 6,
+            _ => ROWS,
+        }
+    }
+
+    /// The frames the trail gallery renders through the scene, ms, where it has its own
+    /// steps (`aterm-lab`'s `trail_gallery`): `move-up`'s a frame 30 ms after each key and
+    /// its `typed` frame, every 60 ms for 900 ms after the Enter, none while it awaits the
+    /// program's mark, then `up` as the mark lands, every 40 ms to `u120` and every 60 ms
+    /// to `u470`.
+    pub fn gallery_frames(self) -> Option<Vec<u64>> {
+        match self {
+            Scene::MoveUp | Scene::MoveUpHasty => {
+                let (ev, _) = self.events();
+                let keys: Vec<u64> = ev
+                    .iter()
+                    .filter(|(_, e)| matches!(e, Ev::Key(c, _) if *c != '\r'))
+                    .map(|(at, _)| *at)
+                    .collect();
+                let enter = ev
+                    .iter()
+                    .find(|(_, e)| matches!(e, Ev::Key('\r', _)))
+                    .map(|(at, _)| *at)?;
+                let mark = ev.last().map(|(at, _)| *at)?;
+                let mut frames: Vec<u64> = keys.iter().map(|k| k + 30).collect();
+                frames.push(enter - 20);
+                frames.extend((1..=15).map(|i| enter + 60 * i));
+                let up = mark + 9;
+                frames.push(up);
+                frames.extend((1..=3).map(|i| up + 40 * i));
+                let mut f = up + 120;
+                while f < up + 470 {
+                    f = (f + 60).min(up + 470);
+                    frames.push(f);
+                }
+                Some(frames)
+            }
+            _ => None,
+        }
+    }
+
     pub fn events(self) -> (Vec<(u64, Ev)>, u64) {
         let prompt = |at: u64| (at, Ev::Out(b"\x1b[2J\x1b[5H$ ".to_vec()));
         match self {
@@ -708,7 +941,7 @@ impl Scene {
                 ev.extend(typed("echo 你好世界", 1_000, 60));
                 (ev, 600)
             }
-            Scene::Burst => {
+            Scene::Burst | Scene::SplitBurst => {
                 let mut ev = vec![prompt(200)];
                 ev.extend(typed(BURST_TEXT, 1_000, 50));
                 (ev, 4_600)
@@ -725,6 +958,28 @@ impl Scene {
                 ev.push((enter, Ev::Key('\r', b"\r\n".to_vec())));
                 ev.push((enter + 6, Ev::Out(b"the quick brown fox\r\n$ ".to_vec())));
                 (ev, 600)
+            }
+            Scene::MoveUp | Scene::MoveUpHasty => {
+                let page = "\x1b[2J\x1b[H\
+                    Above: Typography jumps; quick brown gyps (qwerty) _gy|\r\n\
+                    fn main() {\r\n\
+                    \x20   let fox = \"the quick brown fox\";\r\n\
+                    \x20   println!(\"{fox} jumps over the lazy dog\");\r\n\
+                    \x20   // every glyph here must stay legible: pqgyj {braces} [ok]\r\n\
+                    }\r\n\
+                    \x1b[8H$ ";
+                let mut ev = vec![(200, Ev::Out(page.as_bytes().to_vec()))];
+                ev.extend(typed("./k", 1_000, 60));
+                // The Enter 84 ms after the last key, while the hand's rhythm runs, as the
+                // gallery presses it (its `typed` frame between); the hasty one's 10 ms.
+                let after = if self == Scene::MoveUpHasty { 10 } else { 84 };
+                let enter = 1_000 + 60 * 2 + after;
+                ev.push((enter, Ev::Key('\r', b"\r\n".to_vec())));
+                ev.push((
+                    enter + 1_000,
+                    Ev::Out(b"[vim] NORMAL\x1b[5A\x1b[12G".to_vec()),
+                ));
+                (ev, 2_400)
             }
         }
     }
@@ -995,6 +1250,129 @@ fn classic_in_a_chosen_colour_keeps_every_letter() {
     );
 }
 
+/// CLASSIC ON PAPER KEEPS EVERY LETTER (looks8 round 2): the ruling that spares Classic's
+/// spectrum face the letter bar names dark, not paper, and its paper landing ring lays its square
+/// in ink over the letters beside the caret. Through typing, an Enter at the bottom row, a burst,
+/// wide letters and the trail gallery's `move-up` (the caret moved up into a program's lettered
+/// lines, where the ring lands among their letters), Classic on GitHub Light and on Default Light
+/// keeps every letter at the bar, frame by frame. Negative control: the letter guard passing
+/// Classic's paper face by, as it did, leaves a letter beside the `move-up` landing under the bar
+/// on each.
+#[test]
+fn classic_on_paper_keeps_every_letter() {
+    let run = |look: Look, scene: Scene, guarded: bool| {
+        let mut r = Replay::new("classic", look, TrailColor::Automatic);
+        r.fx.set_letter_guard_classic_paper(guarded);
+        let (ev, tail) = scene.events();
+        let judged = r.run(&ev, tail);
+        let bar = look_bar(look);
+        Verdict {
+            style: "classic",
+            look: look.name,
+            scene,
+            under: judged
+                .iter()
+                .map(|j| j.letters.iter().filter(|l| l.judged() < bar).count())
+                .sum(),
+            worst: worst(&judged),
+        }
+    };
+    for look in [GITHUB_LIGHT, DEFAULT_LIGHT] {
+        for scene in SCENES.into_iter().chain([Scene::MoveUp]) {
+            let v = run(look, scene, true);
+            assert!(
+                v.worst.is_some(),
+                "fixture: the judge read the letters: {v}"
+            );
+            assert_eq!(
+                v.under, 0,
+                "a letter under Classic on paper reads under the bar: {v}"
+            );
+        }
+        let old = run(look, Scene::MoveUp, false);
+        assert!(
+            old.under > 0,
+            "negative control: the guard passing Classic's paper face by keeps every letter \
+             (the control no longer controls): {old}"
+        );
+    }
+}
+
+/// THE DARK RING PASSES UNDER THE LETTERS (looks8 round 2): "Ring on jumps" lands a rim about
+/// the caret, and on the dark page the rim is drawn under the text at a fifth of its light on
+/// every lettered cell. Replayed with the host's post passes (the bloom and the SDR crown, which
+/// spread the over-text light), the Enter at the bottom row keeps every letter at the bar from
+/// the Enter on, under each style that reads the Ring knob, with the rim laid there (where
+/// too little of it keeps its whole light the ring is not drawn at all, looks8 round 3, so
+/// the replay lays it whatever its share to judge the letters it passes under). Negative controls: laid over the
+/// text as it was, the rim crosses `echo` after the Enter (the trail gallery read its `e` at
+/// 4.26:1 under Lumen) and, bloomed, takes letters under the bar under Lumen, Sparkle and
+/// Phaser; laid under the text at its whole light, it spends the room the guard leaves a letter
+/// and the bloom of the trail's own light takes one under the bar under Lumen and Laser.
+#[test]
+fn the_dark_ring_passes_under_the_letters() {
+    let (ev, tail) = Scene::EnterBottom.events();
+    let enter = ev
+        .iter()
+        .find(|(_, e)| matches!(e, Ev::Key('\r', _)))
+        .map_or(0, |(at, _)| *at);
+    assert!(enter > 0, "fixture: the scene has its Enter");
+    let run = |style: &'static str, over: bool, share: Option<f32>| {
+        let mut r = Replay::new(style, DARK, TrailColor::Automatic);
+        r.post = true;
+        // The rim laid whatever share of it keeps its whole light: there, after an Enter
+        // at the bottom row, the ring is otherwise not drawn at all (`RIM_SHOWN_SHARE`).
+        r.fx.set_dark_rim_fragments(true);
+        r.fx.set_dark_rim_over(over);
+        if let Some(share) = share {
+            r.fx.set_dark_rim_under_letters(share);
+        }
+        let judged: Vec<Judged> = r
+            .run(&ev, tail)
+            .into_iter()
+            .filter(|j| j.ms >= enter)
+            .collect();
+        let bar = look_bar(DARK);
+        Verdict {
+            style,
+            look: DARK.name,
+            scene: Scene::EnterBottom,
+            under: judged
+                .iter()
+                .map(|j| j.letters.iter().filter(|l| l.judged() < bar).count())
+                .sum(),
+            worst: worst(&judged),
+        }
+    };
+    for style in ["lumen", "comet", "sparkle", "phaser", "laser"] {
+        let v = run(style, false, None);
+        assert!(
+            v.worst.is_some(),
+            "fixture: the judge read the letters: {v}"
+        );
+        assert_eq!(
+            v.under, 0,
+            "a letter after the Enter reads under the bar: {v}"
+        );
+    }
+    for style in ["lumen", "sparkle", "phaser"] {
+        let old = run(style, true, None);
+        assert!(
+            old.under > 0,
+            "negative control: the rim laid over the text keeps every letter (the control no \
+             longer controls): {old}"
+        );
+    }
+    for style in ["lumen", "laser"] {
+        let whole = run(style, false, Some(1.0));
+        assert!(
+            whole.under > 0,
+            "negative control: the rim under the text at its whole light keeps every letter (the \
+             control no longer controls): {whole}"
+        );
+    }
+}
+
 /// On [`DIM_GREY`] and [`SOLARIZED_DARK`], whose solid ink reads under the guard's floor on the
 /// bare page (a guard that gave up on it would leave every light whole), every style but classic,
 /// through every scene, keeps each letter it lies on at four fifths of the theme's own contrast
@@ -1161,9 +1539,14 @@ struct OwnShare {
 /// byte of light and lit the page under `fox` to `#00313c`.
 ///
 /// Negative controls: at the bare share the flat rainbow's burst leaves `f` at 3.77:1 of its
-/// own 4.06 (92.9%); the veil over the lights leaves the flat rainbow's `o` at 3.87:1 of its
-/// own 4.28 (90.7%); with its cuts rounded, Comet's Enter leaves `o` at 3.98:1 of its own
-/// 4.28 (93.1%).
+/// own 4.06 (92.9%); with its cuts rounded, Comet's Enter leaves `o` at 3.98:1 of its own
+/// 4.28 (93.1%); the veil over the lights leaves the rainbow kitty pet's `o` typing wide
+/// letters at 98.1% of its own 4.28, where beneath them its least letter keeps 99.98% (the
+/// pet on its old paths: since looks8 round 3 the first keys spring it off the letters it
+/// lay on, and no letter of the scene lies under its veil). Over
+/// the lights the veil once took the flat rainbow's burst `o` to 90.7%; since a letter on a
+/// companion's body is judged by its ring (`companion_knock_out.rs`) and the pet keeps off
+/// the lettered row in a burst (looks8 K1), no scene takes one under 97% with it there.
 #[test]
 fn a_dim_letter_keeps_its_own_reading() {
     #[derive(Clone, Copy)]
@@ -1171,11 +1554,13 @@ fn a_dim_letter_keeps_its_own_reading() {
         room: bool,
         veil_beneath: bool,
         cuts_rounded: bool,
+        old_paths: bool,
     }
     const SHIPPED: Knobs = Knobs {
         room: true,
         veil_beneath: true,
         cuts_rounded: false,
+        old_paths: false,
     };
     let least = |style: &'static str, scene: Scene, k: Knobs| {
         let (ev, tail) = scene.events();
@@ -1183,6 +1568,7 @@ fn a_dim_letter_keeps_its_own_reading() {
         r.fx.set_letter_guard_room(k.room);
         r.fx.set_pet_veil_beneath(k.veil_beneath);
         r.fx.set_letter_guard_cuts_rounded(k.cuts_rounded);
+        r.fx.set_pet_old_paths(k.old_paths);
         r.own = true;
         r.bloom = Some(false);
         let mut least = OwnShare {
@@ -1269,31 +1655,36 @@ fn a_dim_letter_keeps_its_own_reading() {
         !bare.is_empty(),
         "control: at the bare share every dim letter still keeps 97% of its own reading"
     );
-    type Control<'a> = (&'a str, &'a [(&'static str, Scene)], Knobs);
-    let controls: [Control<'_>; 2] = [
-        (
-            "the pet's veil over the lights",
-            &[("flat rainbow", Scene::Burst)],
-            Knobs {
-                veil_beneath: false,
-                ..SHIPPED
-            },
-        ),
-        (
-            "with its cuts rounded",
-            &[("comet", Scene::EnterBottom)],
+    let rounded = [("comet", Scene::EnterBottom)];
+    assert!(
+        !under(
+            &rounded,
             Knobs {
                 cuts_rounded: true,
                 ..SHIPPED
-            },
-        ),
-    ];
-    for (what, jobs, k) in controls {
-        assert!(
-            !under(jobs, k).is_empty(),
-            "control: {what}, {jobs:?} still keeps 97% of every dim letter's own reading"
-        );
-    }
+            }
+        )
+        .is_empty(),
+        "control: with its cuts rounded, {rounded:?} still keeps 97% of every dim letter's own \
+         reading"
+    );
+    let share = |k: Knobs| least("rainbow kitty pet", Scene::Cjk, k).2.share;
+    let old = Knobs {
+        old_paths: true,
+        ..SHIPPED
+    };
+    let (beneath, over) = (
+        share(old),
+        share(Knobs {
+            veil_beneath: false,
+            ..old
+        }),
+    );
+    assert!(
+        over + 0.01 < beneath,
+        "control: the pet's veil over the lights keeps {over:.4} of a dim letter's own \
+         reading, beneath them {beneath:.4}"
+    );
 }
 
 /// looks7 round 2, A DIM PAGE'S TRAILS LAY NO SHADE: on Solarized Dark (its text 4.75:1 on
@@ -1703,3 +2094,109 @@ fn a_dim_page_s_trail_shows_below_its_letters() {
 
 /// A column under the row this far over the clean frame shows light ([`Judged::rail`]).
 const BELOW_LIT: u8 = 40;
+
+/// What the letter under the caret keeps: [`BAR`], or 97% of what the theme's own caret
+/// leaves it where that is under the bar (the lab's dim-page rule).
+fn caret_bar(own: f64) -> f64 {
+    BAR.min(0.97 * own)
+}
+
+/// The least share of its bar the letter under the caret keeps through
+/// [`Scene::MoveUp`] (`style` on `look`, the host's post passes drawn), with the caret-letter
+/// law `off` turned off, and the frame and letter that kept it.
+fn caret_letter_least(
+    style: &'static str,
+    look: Look,
+    off: Option<aterm_effects::cursor_glow::CaretLetterLaw>,
+) -> Option<(u64, Letter)> {
+    let (ev, tail) = Scene::MoveUp.events();
+    let mut r = Replay::new(style, look, TrailColor::Automatic);
+    r.post = true;
+    r.caret = true;
+    if let Some(law) = off {
+        r.fx.set_caret_letter_law(law, false);
+    }
+    r.run(&ev, tail)
+        .iter()
+        .filter_map(|j| j.caret.map(|l| (j.ms, l)))
+        .min_by(|a, b| {
+            (a.1.judged() / caret_bar(a.1.own)).total_cmp(&(b.1.judged() / caret_bar(b.1.own)))
+        })
+}
+
+/// A style on a look, and the least reading of the letter under its caret with its frame's
+/// time ([`caret_letter_least`]).
+type CaretVerdict = (&'static str, Look, Option<(u64, Letter)>);
+
+/// looks8 WIDEN, THE LETTER UNDER THE CARET READS: the gallery's `move-up` (a program moves
+/// the caret up onto `println!`'s `!`, as vim's `k` does) read that `!` at 1.00:1 under
+/// Laser's bolt, which hid it, 2.45:1 under Water and 4.05:1 under Fire on the dark page:
+/// the block caret draws the letter cut out of its fill in the page's colour, so the letter
+/// reads the fill's contrast, which the page floor held only to 4.5:1, and the post passes
+/// drawn over the finished frame (the SDR crown, the bloom) put the caret's own light back on
+/// it. Replayed with the host's post passes, every style but Classic keeps the letter under
+/// the caret at the bar ([`caret_bar`]) on the dark, GitHub Light, Default Light and Solarized
+/// Dark pages, every frame the caret holds it. Negative controls, each law off on the dark
+/// page: Laser's bolt kept over the letter hides it, Fire's ember held to the page floor
+/// leaves it under the bar, and Water's light left on the caret's cell lifts it under the bar.
+#[test]
+fn the_letter_under_the_caret_reads() {
+    use aterm_effects::cursor_glow::CaretLetterLaw;
+    let mut jobs = Vec::new();
+    for look in [DARK, GITHUB_LIGHT, DEFAULT_LIGHT, SOLARIZED_DARK] {
+        for style in STYLES.iter().copied().filter(|s| *s != "classic") {
+            jobs.push((style, look));
+        }
+    }
+    let lanes = std::thread::available_parallelism().map_or(4, usize::from);
+    let verdicts: Vec<CaretVerdict> = std::thread::scope(|s| {
+        let handles: Vec<_> = jobs
+            .chunks(jobs.len().div_ceil(lanes).max(1))
+            .map(|chunk| {
+                s.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&(style, look)| (style, look, caret_letter_least(style, look, None)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("a replay lane"))
+            .collect()
+    });
+    let under: Vec<String> = verdicts
+        .iter()
+        .filter_map(|(style, look, least)| {
+            let (ms, l) = (*least)?;
+            (l.judged() < caret_bar(l.own)).then(|| {
+                format!(
+                    "{style} on {} at {ms} ms: `{}` {:.2}:1, its own caret's {:.2}",
+                    look.name,
+                    l.ch,
+                    l.judged(),
+                    l.own
+                )
+            })
+        })
+        .collect();
+    assert!(
+        under.is_empty(),
+        "the letter under the caret under its bar:\n{}",
+        under.join("\n")
+    );
+    for (style, law) in [
+        ("laser", CaretLetterLaw::BoltStandsDown),
+        ("fire", CaretLetterLaw::LetterFloor),
+        ("water", CaretLetterLaw::LightOff),
+    ] {
+        let (ms, l) = caret_letter_least(style, DARK, Some(law)).expect("a caret on its letter");
+        assert!(
+            l.judged() < caret_bar(l.own),
+            "control: {law:?} off, {style} still keeps `{}` at {:.2}:1 ({ms} ms)",
+            l.ch,
+            l.judged()
+        );
+    }
+}

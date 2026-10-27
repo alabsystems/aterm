@@ -467,9 +467,11 @@ pub struct VitalsInks {
     pub warn_text: Rgb,
     /// The Deck's critical words and marks.
     pub critical_text: Rgb,
-    /// Five-stop theme-harmonized thermal ramp (idle accent → active → amber → orange → crimson).
+    /// The strain dial's thermal stops: two of the heat ramp, then amber, orange and crimson. Only
+    /// the dial draws them (its glow, hot bloom and hot bezel: the owner, 2026-10-26, "I like the
+    /// glowing orange on the dial"); a data cell draws [`VitalsInks::cell_at`].
     pub thermal: [Rgb; 5],
-    /// The thermal ramp under Increase Contrast.
+    /// The dial's thermal stops under Increase Contrast.
     pub thermal_ic: [Rgb; 5],
 }
 
@@ -557,6 +559,7 @@ pub fn vitals_inks(ground: Rgb, fg: Rgb, accent: Rgb) -> VitalsInks {
         HEAT_FLOOR_LIGHT
     };
     let heat = heat_ramp(ground, heat_floor, heat_stops(dark), dark);
+    let heat_ic = heat_ramp(ground, NON_TEXT, heat_ic_stops(dark), dark);
     let halved = |x: Lab| (x.a * 0.5, x.b * 0.5);
     let machine = neutral(0.21);
     let beyond = |c: Rgb, inner: Rgb| {
@@ -601,7 +604,7 @@ pub fn vitals_inks(ground: Rgb, fg: Rgb, accent: Rgb) -> VitalsInks {
         words2: words_floored(fg, ground, 0.38, WORD_AA),
         heat,
         heat_text: heat.map(|c| floored(c, ground, WORD_AA, dark)),
-        heat_ic: heat_ramp(ground, NON_TEXT, heat_ic_stops(dark), dark),
+        heat_ic,
         hollow: stepped(neutral(0.12), 0.005, dark, halved, |c| {
             contrast(c, ground) >= NON_TEXT
         }),
@@ -614,24 +617,18 @@ pub fn vitals_inks(ground: Rgb, fg: Rgb, accent: Rgb) -> VitalsInks {
         over: floored(over_orange(dark), ground, NON_TEXT, dark),
         warn_text: floored(warn, ground, WORD_AA, dark),
         critical_text: floored(critical, ground, WORD_AA, dark),
-        thermal: {
-            let over_c = floored(over_orange(dark), ground, NON_TEXT, dark);
-            let hot_c = floored(hot_crimson(dark), ground, NON_TEXT, dark);
-            let warm_c = floored(mix(warn, over_c, 0.35), ground, NON_TEXT, dark);
-            let cool0 = floored(mix(aterm, heat[1], 0.55), ground, heat_floor, dark);
-            let cool1 = floored(mix(tab, heat[2], 0.35), ground, NON_TEXT, dark);
-            [cool0, cool1, warm_c, over_c, hot_c]
-        },
-        thermal_ic: {
-            let over_c = floored(over_orange(dark), ground, NON_TEXT, dark);
-            let hot_c = floored(hot_crimson(dark), ground, NON_TEXT, dark);
-            let warm_c = floored(mix(warn, over_c, 0.35), ground, NON_TEXT, dark);
-            let heat_ic = heat_ramp(ground, NON_TEXT, heat_ic_stops(dark), dark);
-            let cool0 = floored(mix(aterm_ic, heat_ic[1], 0.50), ground, NON_TEXT, dark);
-            let cool1 = floored(mix(tab_ic, heat_ic[2], 0.35), ground, NON_TEXT, dark);
-            [cool0, cool1, warm_c, over_c, hot_c]
-        },
+        thermal: thermal_stops(&heat, ground, warn, dark),
+        thermal_ic: thermal_stops(&heat_ic, ground, warn, dark),
     }
+}
+
+/// The dial's thermal stops on `heat`: its steps 1 and 3, then amber, the over orange and crimson,
+/// each floored on `ground`; the theme's accent has no part in them (owner ruling 2026-10-26).
+fn thermal_stops(heat: &[Rgb; 7], ground: Rgb, warn: Rgb, dark: bool) -> [Rgb; 5] {
+    let over_c = floored(over_orange(dark), ground, NON_TEXT, dark);
+    let hot_c = floored(hot_crimson(dark), ground, NON_TEXT, dark);
+    let warm_c = floored(mix(warn, over_c, 0.35), ground, NON_TEXT, dark);
+    [heat[1], heat[3], warm_c, over_c, hot_c]
 }
 
 impl VitalsInks {
@@ -647,29 +644,16 @@ impl VitalsInks {
         mix(self.load[i], self.load[i + 1], t - i as f32)
     }
 
-    /// The theme-harmonized thermal ramp at `level` (`0..=1`), linear in OkLab between stops:
-    /// cool theme accent at idle through warm amber and hot orange to incandescent crimson.
+    /// A data cell's ink at `level` (`0..=1`): the heat ramp's step for it ([`heat_step`]), the
+    /// Increase Contrast ramp's under `ic`. A strip's cells, its live now box, the core squares and
+    /// the CPU lens's per-core map all draw it, so the now box is the ink the strip cell holding
+    /// the same value draws, at every level (979d8c3559's scheme; the owner, 2026-10-26, "go back
+    /// to the orignal color scheme"). A level that is not a number reads as 0.
     #[must_use]
-    pub fn thermal_at(&self, level: f32, ic: bool) -> Rgb {
-        let ramp = if ic { &self.thermal_ic } else { &self.thermal };
-        let t = if level.is_finite() {
-            level.clamp(0.0, 1.0) * 4.0
-        } else {
-            0.0
-        };
-        let i = (t.floor() as usize).min(3);
-        mix(ramp[i], ramp[i + 1], t - i as f32)
-    }
-
-    /// Soft halo ring ink for `glow` over `self.ground` at `strength` (`0..=1`).
-    #[must_use]
-    pub fn glow_veil(&self, glow: Rgb, strength: f32) -> Rgb {
-        let s = if strength.is_finite() {
-            strength.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        mix(self.ground, glow, s)
+    pub fn cell_at(&self, level: f32, ic: bool) -> Rgb {
+        let v = if level.is_finite() { level } else { 0.0 };
+        let ramp = if ic { &self.heat_ic } else { &self.heat };
+        ramp[usize::from(heat_step(v).min(6))]
     }
 
     /// The rising sliver's ink over a fill of colour `fill`.
@@ -1348,32 +1332,74 @@ mod tests {
         assert_eq!(light.rise_mode, HaloMode::Over);
     }
 
+    /// A data cell (a strip's cell, its live now box, a core square, the lens's per-core map)
+    /// draws the heat ramp's step for its level, whatever the theme's accent, under Increase
+    /// Contrast too: 979d8c3559's scheme, with no amber, orange or crimson from any level (the
+    /// owner, 2026-10-26: "go back to the orignal color scheme", and of the now box: "there is a
+    /// "now" box with green that is out of the color scheme"). The dial keeps its warm stops, at
+    /// the non-text floor and running orange to red ("I like the glowing orange on the dial").
     #[test]
-    fn thermal_ramp_harmonizes_with_theme_and_glows_orange_to_red_at_peak() {
-        let dark_cyan = vitals_inks(DEFAULT_DARK_BAND, DEFAULT_FG, [0x50, 0xDC, 0xFA]);
-        let dark_magenta = vitals_inks(DEFAULT_DARK_BAND, DEFAULT_FG, [0xFF, 0x79, 0xC6]);
-        let light = vitals_inks(LIGHT_BAND, LIGHT_FG, LIGHT_ACCENT);
-
-        assert_ne!(
-            dark_cyan.thermal_at(0.0, false),
-            dark_magenta.thermal_at(0.0, false),
-            "cool end of thermal ramp inherits active theme accent"
-        );
-        for inks in [dark_cyan, dark_magenta, light] {
-            for c in inks.thermal_ic {
-                assert!(
-                    contrast(c, inks.ground) >= NON_TEXT - 0.02,
-                    "thermal_ic meets non-text contrast against ground"
+    fn a_data_cell_draws_the_heat_ramp_and_only_the_dial_keeps_the_warm_stops() {
+        let accents = [
+            DEFAULT_ACCENT,
+            LIGHT_ACCENT,
+            [0x50, 0xDC, 0xFA],
+            [0xFF, 0x79, 0xC6],
+            [0x58, 0xA6, 0xFF],
+            [0xFF, 0xB8, 0x6C],
+        ];
+        let grounds = [
+            (DEFAULT_DARK_BAND, DEFAULT_FG),
+            (LIGHT_BAND, LIGHT_FG),
+            (NORD_BAND, DEFAULT_FG),
+            ([0x11, 0x13, 0x18], [0xD0, 0xD0, 0xD0]),
+            ([0xF6, 0xF7, 0xF9], LIGHT_FG),
+        ];
+        let mut accent_moved = 0;
+        for (ground, fg) in grounds {
+            let base = vitals_inks(ground, fg, DEFAULT_ACCENT);
+            for accent in accents {
+                let inks = vitals_inks(ground, fg, accent);
+                let at = format!("{ground:02X?} accent {accent:02X?}");
+                for ic in [false, true] {
+                    let (heat, thermal) = if ic {
+                        (inks.heat_ic, inks.thermal_ic)
+                    } else {
+                        (inks.heat, inks.thermal)
+                    };
+                    for i in 0..=200 {
+                        let v = i as f32 / 200.0;
+                        let got = inks.cell_at(v, ic);
+                        assert_eq!(got, heat[usize::from(heat_step(v))], "{at} ic {ic}: {v}");
+                        assert_eq!(got, base.cell_at(v, ic), "{at} ic {ic}: {v}");
+                        assert!(
+                            !thermal[2..].contains(&got),
+                            "{at} ic {ic}: level {v} drew a dial stop {got:02X?}"
+                        );
+                    }
+                    for c in &thermal[2..] {
+                        assert!(contrast(*c, ground) >= NON_TEXT, "{at} ic {ic}: {c:02X?}");
+                    }
+                    let [_, _, amber, orange, red] = thermal;
+                    assert!(
+                        red[0] > red[2] && orange[0] > orange[2] && amber[0] > amber[2],
+                        "{at} ic {ic}: the dial's warm stops run amber, orange, red: \
+                         {amber:02X?} {orange:02X?} {red:02X?}"
+                    );
+                }
+                assert_eq!(
+                    inks.cell_at(f32::NAN, false),
+                    inks.heat[0],
+                    "{at}: no reading"
                 );
+                // CONTROL: the accent does move the inks it owns, so the equality above is not
+                // two copies of one constant.
+                accent_moved += usize::from(inks.aterm != base.aterm);
             }
-            let hot_orange = inks.thermal_at(0.75, false);
-            let hot_red = inks.thermal_at(1.0, false);
-            assert!(
-                hot_red[0] > hot_red[2] && hot_orange[0] > hot_orange[2],
-                "hot end of thermal ramp is warm orange-to-red: {hot_orange:?} -> {hot_red:?}"
-            );
-            assert_eq!(inks.glow_veil(hot_red, 0.0), inks.ground);
-            assert_eq!(inks.glow_veil(hot_red, 1.0), hot_red);
         }
+        assert!(
+            accent_moved >= 20,
+            "CONTROL: accents moved aterm's ink {accent_moved} times"
+        );
     }
 }

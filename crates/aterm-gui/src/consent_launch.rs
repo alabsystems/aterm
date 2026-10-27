@@ -76,9 +76,7 @@ impl FdaLaunch {
         match answer {
             HandOver::Queued | HandOver::Listing => Self::Waiting,
             HandOver::Opened if panel_up => Self::Waiting,
-            HandOver::Opened | HandOver::Shown | HandOver::Unshown => {
-                Self::Ended { owner_acted: true }
-            }
+            HandOver::Opened => Self::Ended { owner_acted: true },
             HandOver::Headless | HandOver::Refused(_) | HandOver::OpenFailed => Self::NotAsked,
         }
     }

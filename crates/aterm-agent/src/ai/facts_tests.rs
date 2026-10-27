@@ -251,7 +251,9 @@ fn claude_accounts_surfaces_next_sign_in_and_prefers_ready_enrolled_row() {
         m27_dir.display().to_string()
     );
     std::fs::write(&roster_path, &roster_toml).expect("roster");
-    let roster = accounts::Roster::load(&roster_path).expect("load roster");
+    let roster = store
+        .read_usage_roster(Some(&roster_path), now)
+        .expect("load roster");
     let mut note = None;
     store
         .transact_logins(now, &mut note, |state, logins| {
@@ -470,4 +472,224 @@ fn unreadable_account_state_or_bindings_yield_no_actionable_facts() {
             assert_eq!(std::fs::read(path).unwrap(), b"{");
         }
     }
+}
+
+#[test]
+fn pooled_codex_serves_enrolled_staging_login_without_default_auth_and_rotates_past_limit() {
+    use crate::ai::state::{Mark, State, assess};
+    use crate::harness::accounts::{self, Cli, Store};
+    use crate::harness::codex_rollout::fixtures::{meta_as, rate};
+
+    const ROOT: &str = "01900000-0000-7000-8000-000000000011";
+    let b = machine(&["codex"]);
+    let now = 1_800_000_000_i64;
+    let config = b.dir.path().join("config");
+    std::fs::create_dir_all(&config).expect("config");
+    let claude_roster = config.join("accounts.toml");
+    let codex_roster = config.join("accounts-codex.toml");
+    let work_1_base = b.home.join(".aterm/logins/codex/work-1");
+    let work_2_base = b.home.join(".aterm/logins/codex/work-2");
+    std::fs::write(
+        &codex_roster,
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+             [[account]]\nlabel = \"work-1\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"work-1@example.test\"\n\n\
+             [[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"work-2@example.test\"\n",
+            work_1_base.display().to_string(),
+            work_2_base.display().to_string(),
+        ),
+    )
+    .expect("codex roster");
+
+    let home_str = b.home.display().to_string();
+    let var = |k: &str| (k == "HOME").then(|| home_str.clone());
+    let m = Machine {
+        now,
+        home: Some(b.home.clone()),
+        var: &var,
+        pkg: Some(b.pkg.clone()),
+        exclude: Vec::new(),
+        records: Records::default(),
+        harness_state: Some(b.state.clone()),
+        roster: Some(claude_roster),
+    };
+
+    // 1. Before any sign-in: default ~/.codex/auth.json does not exist either, so 0 enrolled.
+    let f0 = gather(&m, &CODEX);
+    let pool0 = f0.pool.as_ref().expect("codex pool");
+    assert_eq!((pool0.rows, pool0.enrolled), (3, 0));
+    assert_eq!(pool0.next.as_deref(), Some("work-1"));
+    assert_eq!(f0.login_file, None);
+    let r0 = assess(&f0, true, now);
+    assert_eq!((r0.state, r0.mark), (State::SignedOut, Mark::Fail));
+    assert!(
+        r0.fact.contains("pool: 3 accounts (0 signed in here)"),
+        "{}",
+        r0.fact
+    );
+
+    // 2. Renew work-1 into staging work-1+1/auth.json while ~/.codex/auth.json still never existed.
+    let store = Store::at_for(&b.state, Cli::Codex, &b.home);
+    let staging_1 = b.home.join(".aterm/logins/codex/work-1+1");
+    std::fs::create_dir_all(&staging_1).expect("staging_1");
+    std::fs::write(staging_1.join("auth.json"), "\u{0}opaque-token").expect("auth 1");
+    let mut note = None;
+    store
+        .transact_logins(now, &mut note, |state, logins| {
+            Ok(accounts::note_renewed(
+                state,
+                logins,
+                "work-1",
+                Some(&work_1_base.display().to_string()),
+                &staging_1.display().to_string(),
+                None,
+                now - 60,
+            ))
+        })
+        .expect("renew work-1");
+
+    let f1 = gather(&m, &CODEX);
+    let pool1 = f1.pool.as_ref().expect("codex pool after renew");
+    let auth_1 = staging_1.join("auth.json").display().to_string();
+    assert_eq!(pool1.enrolled, 1);
+    assert_eq!(
+        pool1.serving_login,
+        Some(("CODEX_AUTH_PATH", Some(auth_1.clone())))
+    );
+    assert_eq!(
+        f1.login_file.as_ref().map(|(p, _)| p.as_path()),
+        Some(staging_1.join("auth.json").as_path())
+    );
+    let r1 = assess(&f1, true, now);
+    assert_eq!((r1.state, r1.mark), (State::Ok, Mark::Ok), "{}", r1.fact);
+
+    // 3. work-1 hits a usage wall while work-2 is still unenrolled -> Due + next_sign_in = work-2.
+    store
+        .transact_logins(now, &mut note, |state, _| {
+            Ok(accounts::note_wall(
+                state,
+                "work-1",
+                "seven_day",
+                Some(now + 3600),
+                now,
+                now,
+            ))
+        })
+        .expect("wall on work-1");
+    let f2 = gather(&m, &CODEX);
+    let r2 = assess(&f2, true, now);
+    assert!(matches!(r2.state, State::Due(until) if until >= now + 3600));
+    assert_eq!(r2.mark, Mark::Warn);
+    assert!(
+        r2.fact.contains("next account `work-2` needs sign-in"),
+        "{}",
+        r2.fact
+    );
+
+    // 4. Enroll work-2 into work-2+1/auth.json while shared ~/.codex/sessions holds work-1's 100%
+    //    rollout -> serving row rotates to work-2 and is Ok (not blocked by shared rollout).
+    let day = b.home.join(".codex/sessions/2026/12/15");
+    std::fs::create_dir_all(&day).expect("day");
+    let rollout_body = [
+        meta_as(
+            (now - 300) * 1000,
+            ROOT,
+            ROOT,
+            None,
+            Some("paginated"),
+            Some(("acct-work-1", "user-work-1")),
+        ),
+        rate(
+            (now - 120) * 1000,
+            "codex",
+            Some((100.0, 300, now + 3600)),
+            None,
+        ),
+    ]
+    .concat();
+    std::fs::write(
+        day.join(format!("rollout-2026-12-15T10-00-00-{ROOT}.jsonl")),
+        rollout_body,
+    )
+    .expect("rollout");
+    let staging_2 = b.home.join(".aterm/logins/codex/work-2+1");
+    std::fs::create_dir_all(&staging_2).expect("staging_2");
+    std::fs::write(staging_2.join("auth.json"), "\u{0}opaque-token-2").expect("auth 2");
+    store
+        .transact_logins(now, &mut note, |state, logins| {
+            Ok(accounts::note_renewed(
+                state,
+                logins,
+                "work-2",
+                Some(&work_2_base.display().to_string()),
+                &staging_2.display().to_string(),
+                None,
+                now - 10,
+            ))
+        })
+        .expect("renew work-2");
+
+    let f3 = gather(&m, &CODEX);
+    let pool3 = f3.pool.as_ref().expect("codex pool with work-2");
+    assert_eq!(pool3.enrolled, 2);
+    assert_eq!(
+        pool3.serving_login,
+        Some((
+            "CODEX_AUTH_PATH",
+            Some(staging_2.join("auth.json").display().to_string())
+        ))
+    );
+    assert_eq!(f3.limited_until, None);
+    let r3 = assess(&f3, true, now);
+    assert_eq!((r3.state, r3.mark), (State::Ok, Mark::Ok), "{}", r3.fact);
+
+    // 5. With [harness] accounts = "off" and no pin, pool overrides nothing.
+    std::fs::write(config.join("aterm.toml"), "[harness]\naccounts = \"off\"\n").expect("cfg");
+    let f4 = gather(&m, &CODEX);
+    assert_eq!(f4.pool.as_ref().and_then(|p| p.serving_login.clone()), None);
+    assert_eq!(f4.login_file, None);
+
+    // 6. A custom CODEX_HOME inspects only that home and leaves the default-home pool aside.
+    std::fs::remove_file(config.join("aterm.toml")).expect("rm cfg");
+    let custom_home = b.dir.path().join("custom-codex");
+    let custom_str = custom_home.display().to_string();
+    let var_custom = |k: &str| match k {
+        "HOME" => Some(home_str.clone()),
+        "CODEX_HOME" => Some(custom_str.clone()),
+        _ => None,
+    };
+    let m_custom = Machine {
+        now,
+        home: m.home.clone(),
+        var: &var_custom,
+        pkg: m.pkg.clone(),
+        exclude: m.exclude.clone(),
+        records: m.records.clone(),
+        harness_state: m.harness_state.clone(),
+        roster: m.roster.clone(),
+    };
+    let f5 = gather(&m_custom, &CODEX);
+    assert_eq!(f5.pool, None);
+    assert_eq!(f5.home, Ok(custom_home));
+
+    // 7. When a Shared row precedes an unenrolled Dedicated successor, both next_sign_in and next
+    //    name the Dedicated successor so `aterm ai login codex` renews what `assess` asked for.
+    let shared_base = b.home.join(".aterm/logins/codex/shared-1");
+    let ded_base = b.home.join(".aterm/logins/codex/ded-1");
+    std::fs::write(
+        &codex_roster,
+        format!(
+            "[[account]]\nlabel = \"shared-1\"\nclass = \"shared\"\ndir = {:?}\nemail = \"shared-1@example.test\"\n\n\
+             [[account]]\nlabel = \"work-1\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"work-1@example.test\"\n\n\
+             [[account]]\nlabel = \"ded-1\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"ded-1@example.test\"\n",
+            shared_base.display().to_string(),
+            work_1_base.display().to_string(),
+            ded_base.display().to_string(),
+        ),
+    )
+    .expect("codex class roster");
+    let f6 = gather(&m, &CODEX);
+    let pool6 = f6.pool.as_ref().expect("class pool");
+    assert_eq!(pool6.next_sign_in.as_deref(), Some("ded-1"));
+    assert_eq!(pool6.next.as_deref(), Some("ded-1"));
 }

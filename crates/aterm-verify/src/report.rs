@@ -221,6 +221,33 @@ pub fn verdict(results: &[CheckResult], release: bool, seconds: f64) -> (String,
     (format!("verify: PASS — {tail}"), crate::exit::PASS)
 }
 
+/// The verdict once the checkout's HEAD was `from` when the run began and `to` when it ended: a
+/// checkout that moved to another commit mid-run (another session's fast-forward of a shared
+/// checkout) had its stages read both trees, so the run's own `line` and `code` hold for neither
+/// and the run could not run. Either HEAD unread, or one HEAD throughout, keeps them.
+#[must_use]
+pub fn moved_checkout(
+    (line, code): (String, i32),
+    from: Option<&str>,
+    to: Option<&str>,
+) -> (String, i32) {
+    fn short(sha: &str) -> &str {
+        sha.get(..10).unwrap_or(sha)
+    }
+    match (from, to) {
+        (Some(from), Some(to)) if from != to => (
+            format!(
+                "verify: COULD NOT RUN — the checkout moved from {} to {} while this ran, so its checks read both trees; rerun where nothing moves the checkout (a worktree of its own). The run's own verdict: {}",
+                short(from),
+                short(to),
+                line.strip_prefix("verify: ").unwrap_or(&line)
+            ),
+            crate::exit::COULD_NOT_RUN,
+        ),
+        _ => (line, code),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +311,34 @@ mod tests {
             crate::exit::FAILED
         );
         assert_eq!(code(&[ok, unrun], false), crate::exit::COULD_NOT_RUN);
+    }
+
+    #[test]
+    fn a_checkout_that_moved_mid_run_could_not_run_whatever_its_checks_said() {
+        let fail = result(Check::Cells, Outcome::Fail(Severity::GateFailed));
+        let ran = verdict(&[fail], false, 1.0);
+        let (line, code) = moved_checkout(ran.clone(), Some("fe2021965c11"), Some("b46f0cf64d22"));
+        assert_eq!(code, crate::exit::COULD_NOT_RUN);
+        assert!(
+            line.contains("moved from fe2021965c to b46f0cf64d") && line.contains("cells failed"),
+            "names both commits and keeps the run's own verdict: {line}"
+        );
+        let pass = verdict(&[result(Check::Fmt, Outcome::Ok)], false, 1.0);
+        assert_eq!(
+            moved_checkout(pass, Some("a"), Some("b")).1,
+            crate::exit::COULD_NOT_RUN,
+            "a pass on two trees is no pass"
+        );
+
+        assert_eq!(
+            moved_checkout(ran.clone(), Some("fe2021965c11"), Some("fe2021965c11")),
+            ran,
+            "one HEAD throughout keeps the run's verdict"
+        );
+        assert_eq!(
+            moved_checkout(ran.clone(), None, Some("b46f0cf64d22")),
+            ran,
+            "an unread HEAD is no move"
+        );
     }
 }

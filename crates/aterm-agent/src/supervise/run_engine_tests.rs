@@ -1054,23 +1054,31 @@ fn a_git_box_reads_the_transcripts_under_the_workers_claude_config_dir() {
         std::fs::create_dir_all(claude.join("sessions")).expect("sessions");
         std::fs::write(
             claude.join("sessions").join(format!("{pid}.json")),
-            format!(
-                r#"{{"pid":{pid},"sessionId":"t-1","cwd":"{}"}}"#,
-                launch.display()
-            ),
+            aterm_json::to_string(&aterm_json::json!({
+                "pid": pid,
+                "sessionId": "t-1",
+                "cwd": launch.to_string_lossy().as_ref(),
+            }))
+            .expect("json"),
         )
         .expect("session file");
         let project = claude
             .join("projects")
             .join(crate::harness::footer::project_slug(&launch));
         std::fs::create_dir_all(&project).expect("project");
+        let user_row = aterm_json::to_string(&aterm_json::json!({
+            "type": "user",
+            "cwd": launch.to_string_lossy().as_ref(),
+        }))
+        .expect("json");
+        let assistant_row = aterm_json::to_string(&aterm_json::json!({
+            "type": "assistant",
+            "cwd": nested.to_string_lossy().as_ref(),
+        }))
+        .expect("json");
         std::fs::write(
             project.join("t-1.jsonl"),
-            format!(
-                "{{\"type\":\"user\",\"cwd\":\"{}\"}}\n{{\"type\":\"assistant\",\"cwd\":\"{}\"}}\n",
-                launch.display(),
-                nested.display()
-            ),
+            format!("{user_row}\n{assistant_row}\n"),
         )
         .expect("transcript");
     };
@@ -13781,6 +13789,7 @@ fn a_retry_mark_with_any_signed_stamp_can_be_taken_up_by_the_session() {
                 attempts: 3,
                 ups: 1,
                 since_ms,
+                down: false,
             }),
             said: Default::default(),
             said_reset_ms: None,
@@ -13823,6 +13832,51 @@ fn a_retry_mark_with_any_signed_stamp_can_be_taken_up_by_the_session() {
         restore(i64::MIN) <= origin,
         "RETRY_MARK_SIGNED_AGE_MUST_NOT_OVERFLOW"
     );
+}
+
+/// A WALL READ WHILE THE ROUTE WAS MEASURED DOWN IS TAKEN UP SO (v6 §14.17.5.2): the session seeds
+/// the wall's track from its retry mark's ` down=yes`, and hands it on in its own books, so a cut
+/// read then stays the connection's outage in every loop that follows.
+#[test]
+fn a_retry_mark_read_measured_down_is_taken_up_and_handed_on_by_the_session() {
+    use crate::supervise::approvals::{Carried, Outcome, RULE_POINT, RetryMark, Row, point_reason};
+    let dir = crate::supervise::ScratchDir::new("retry-mark", "down");
+    let path = dir.join("books.jsonl");
+    let now_ms = 1_790_000_000_000_i64;
+    let kind = aterm_phase::WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: aterm_phase::ApiCause::CutOff,
+    };
+    for down in [true, false] {
+        let carried = Carried {
+            retry: Some(RetryMark {
+                kind,
+                attempts: 0,
+                ups: 0,
+                since_ms: now_ms - 60_000,
+                down,
+            }),
+            ..Carried::streak(2)
+        };
+        let body = Row {
+            rule_id: RULE_POINT,
+            outcome: Outcome::Waiting,
+            command: "",
+            reason: &point_reason(carried, false),
+            box_seq: 1,
+        }
+        .to_json(now_ms - 1_000, Some("@s-9"));
+        let mut ctl = Mock::new(vec![busy_screen()]);
+        let mut s = session(&mut ctl, Some("@s-9".to_string()));
+        assert!(
+            s.seed_from_ledger_text(&path, &body, now_ms, false)
+                .is_none()
+        );
+        let track = s.turn_end.retry_track().expect("the recorded retry track");
+        assert_eq!((track.0, track.4), (kind, down));
+        assert_eq!(s.carried().retry.map(|m| m.down), Some(down), "handed on");
+    }
 }
 
 #[test]

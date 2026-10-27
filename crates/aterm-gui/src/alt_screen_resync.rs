@@ -43,16 +43,39 @@ fn carry_of(t: &Terminal) -> Carry {
 
 /// The drain's second step, after the hold that parsed the prompt.
 pub(crate) fn start(term: &Mutex<Terminal>, master: i32) {
-    let carry = carry_of(&crate::term_lock(term));
-    start_with(master, carry, start_host_client);
+    start_on(term, master, start_host_client);
 }
 
-fn start_with(master: i32, carry: Carry, client: impl FnOnce(i32, Carry) -> io::Result<()>) {
-    if let Err(e) = client(master, carry) {
-        aterm_log::warn!(
-            "console host: a dead app's alternate screen stays up; the host's resync client \
-             did not start ({e})"
-        );
+/// [`start`] with its client. A client that did not start gives the request back
+/// (`Terminal::abandon_alt_screen_resync`), so the next prompt on the stuck screen asks again.
+fn start_on(
+    term: &Mutex<Terminal>,
+    master: i32,
+    client: impl FnOnce(i32, Carry) -> io::Result<()>,
+) {
+    let carry = carry_of(&crate::term_lock(term));
+    if !start_with(master, carry, client) {
+        crate::term_lock(term).abandon_alt_screen_resync();
+    }
+}
+
+/// Whether the host's leave client started. One still running from an earlier
+/// request (`ResourceBusy`: the session runs one at a time) is no fault to log.
+fn start_with(
+    master: i32,
+    carry: Carry,
+    client: impl FnOnce(i32, Carry) -> io::Result<()>,
+) -> bool {
+    match client(master, carry) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::ResourceBusy => false,
+        Err(e) => {
+            aterm_log::warn!(
+                "console host: a dead app's alternate screen stays up until the next prompt; \
+                 the host's resync client did not start ({e})"
+            );
+            false
+        }
     }
 }
 
@@ -87,9 +110,13 @@ fn mainscreen_waiting(
         }
         carry_of(&t)
     };
-    if let Err(e) = client(carry) {
-        aterm_log::warn!("mainscreen: the console host's resync client did not start ({e})");
-        return None;
+    match client(carry) {
+        // A leave client still running from an earlier request is the one to wait for.
+        Err(e) if e.kind() != io::ErrorKind::ResourceBusy => {
+            aterm_log::warn!("mainscreen: the console host's resync client did not start ({e})");
+            return None;
+        }
+        _ => {}
     }
     let deadline = Instant::now() + wait;
     loop {
@@ -97,6 +124,8 @@ fn mainscreen_waiting(
             return Some("OK left=1\n".to_string());
         }
         if Instant::now() >= deadline {
+            // Whichever client was meant to leave, none did: the next prompt asks again.
+            crate::term_lock(term).abandon_alt_screen_resync();
             return Some(format!(
                 "ERR timeout: the console host did not leave its alternate screen within {} ms; \
                  the tab is still on it\n",
@@ -180,12 +209,12 @@ mod tests {
             if self.ours.take_alt_screen_resync_request() {
                 let host_kind = self.host_kind;
                 let mut forwarded = None;
-                start_with(7, carry_of(&self.ours), |master, carry| {
+                assert!(start_with(7, carry_of(&self.ours), |master, carry| {
                     assert_eq!(master, 7, "the session's own host");
                     assert!(host_resyncs(host_kind), "only a forwarding host is asked");
                     forwarded = Some(carry);
                     Ok(())
-                });
+                }));
                 self.clients += 1;
                 if let Some(carry) = forwarded {
                     let mut leave = b"\x1b[?1049l".to_vec();
@@ -331,6 +360,89 @@ mod tests {
         assert_eq!(plain.ours.grid().scrollback_lines(), 0);
     }
 
+    /// A leave client that did not start, or that waits on the session's running one, gives the
+    /// request back: the next prompt on the stuck screen asks again, and the local leave never runs.
+    #[test]
+    fn a_client_that_did_not_start_gives_the_request_back() {
+        for kind in [io::ErrorKind::ResourceBusy, io::ErrorKind::NotFound] {
+            let term = Mutex::new(Terminal::new(ROWS as u16, 40));
+            {
+                let mut t = crate::term_lock(&term);
+                apply_posture(
+                    &mut t,
+                    ResizePolicy::ConPty,
+                    Some(ConsoleHostKind::OpenConsole),
+                );
+                t.process(b"\x1b[?1049hpager\r\n\x1b]133;A\x07C:\\> ");
+                assert!(t.take_alt_screen_resync_request(), "{kind:?}");
+            }
+            start_on(&term, 7, |_, _| Err(io::Error::from(kind)));
+            let mut t = crate::term_lock(&term);
+            t.process(b"\x1b]133;A\x07C:\\> ");
+            assert!(t.is_alternate_screen(), "{kind:?}: no local leave");
+            assert!(t.take_alt_screen_resync_request(), "{kind:?}: asked again");
+        }
+        let term = Mutex::new(Terminal::new(ROWS as u16, 40));
+        {
+            let mut t = crate::term_lock(&term);
+            apply_posture(
+                &mut t,
+                ResizePolicy::ConPty,
+                Some(ConsoleHostKind::OpenConsole),
+            );
+            t.process(b"\x1b[?1049hpager\r\n\x1b]133;A\x07C:\\> ");
+            assert!(t.take_alt_screen_resync_request());
+        }
+        start_on(&term, 7, |_, _| Ok(()));
+        let mut t = crate::term_lock(&term);
+        t.process(b"\x1b]133;A\x07C:\\> ");
+        assert!(
+            !t.take_alt_screen_resync_request(),
+            "a started client keeps the request until the host's leave arrives"
+        );
+    }
+
+    #[test]
+    fn mainscreen_waits_on_the_sessions_running_leave_client() {
+        let term = Mutex::new(Terminal::new(ROWS as u16, 40));
+        crate::term_lock(&term).process(b"\x1b[?1049hpager");
+        let reply = mainscreen_with(&term, Some(ConsoleHostKind::OpenConsole), |_| {
+            crate::term_lock(&term).process(b"\x1b[?1049l");
+            Err(io::Error::from(io::ErrorKind::ResourceBusy))
+        });
+        assert_eq!(reply.as_deref(), Some("OK left=1\n"));
+    }
+
+    /// A `mainscreen` whose leave never came (the running client had already left an earlier
+    /// screen) gives the request back, so the next prompt on the stuck screen asks again.
+    #[test]
+    fn a_mainscreen_that_times_out_gives_the_request_back() {
+        let term = Mutex::new(Terminal::new(ROWS as u16, 40));
+        {
+            let mut t = crate::term_lock(&term);
+            apply_posture(
+                &mut t,
+                ResizePolicy::ConPty,
+                Some(ConsoleHostKind::OpenConsole),
+            );
+            t.process(b"\x1b[?1049hpager");
+        }
+        let reply = mainscreen_waiting(
+            &term,
+            Some(ConsoleHostKind::OpenConsole),
+            |_| Err(io::Error::from(io::ErrorKind::ResourceBusy)),
+            Duration::from_millis(30),
+        );
+        assert!(reply.is_some_and(|r| r.starts_with("ERR timeout: ")));
+        let mut t = crate::term_lock(&term);
+        t.process(b"\r\n\x1b]133;A\x07C:\\> ");
+        assert!(t.is_alternate_screen(), "no local leave");
+        assert!(
+            t.take_alt_screen_resync_request(),
+            "the next prompt asks again"
+        );
+    }
+
     #[test]
     fn the_local_leave_under_a_forwarding_host_is_the_desync() {
         let mut tab = Tab::new(None);
@@ -415,12 +527,23 @@ mod tests {
 
     #[test]
     fn mainscreen_asks_a_forwarding_host_and_reports_our_screen() {
-        let term = std::sync::Arc::new(Mutex::new(Terminal::new(ROWS as u16, 40)));
+        let term = Mutex::new(Terminal::new(ROWS as u16, 40));
         crate::term_lock(&term).process(b"\x1b[?1049hpager");
-        let forwarder = std::sync::Arc::clone(&term);
-        let reply = mainscreen_with(&term, Some(ConsoleHostKind::OpenConsole), move |_| {
-            std::thread::spawn(move || crate::term_lock(&forwarder).process(b"\x1b[?1049l"));
-            Ok(())
+        // The host's switch comes through the PTY reader after the client returned; the
+        // sleep makes the wait's first look find the screen still up, however late it lands.
+        let reply = std::thread::scope(|s| {
+            mainscreen_waiting(
+                &term,
+                Some(ConsoleHostKind::OpenConsole),
+                |_| {
+                    s.spawn(|| {
+                        std::thread::sleep(Duration::from_millis(50));
+                        crate::term_lock(&term).process(b"\x1b[?1049l");
+                    });
+                    Ok(())
+                },
+                aterm_spec::wait::MUST_HAPPEN,
+            )
         });
         assert_eq!(reply.as_deref(), Some("OK left=1\n"));
         assert!(!crate::term_lock(&term).is_alternate_screen());

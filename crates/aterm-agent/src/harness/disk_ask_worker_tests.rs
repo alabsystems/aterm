@@ -299,6 +299,7 @@ fn a_worker_is_due_only_where_the_lease_reads_one_of_its_reasons() {
                 rose: 0,
             },
             orphan_ms: None,
+            free_at_claim: None,
         }),
         ..cooled(T0 - WORKER_COOLDOWN_MS)
     };
@@ -436,6 +437,52 @@ fn rounds_wait_while_the_worker_works_and_elect_again_once_it_is_over() {
     assert_eq!(again, None, "one worker an episode");
 }
 
+/// A WORKER IS CREDITED WITH WHAT IT FREED BEFORE THE LOOK THAT READ IT STARTED: a worker that
+/// frees within a look's interval of its spawn has freed by the look that reads its session, so
+/// its rise is read from the free figure its claim read, not from that look's. MEASURED (the
+/// lab's `disk-ask worker`): it freed 2 GiB inside its first minute and its `worker-over` row and
+/// `aterm harness disk why` said "free space rose 580.0 KiB while it ran". CONTROL: what the
+/// volume rose after that look counts too, and a worker whose volume fell reads no rise.
+#[test]
+fn a_worker_is_credited_with_what_it_freed_before_the_look_that_read_it_started() {
+    for (at_start, at_end, rose) in [(22, 23, 3 * GIB), (20, 23, 3 * GIB), (19, 18, 0)] {
+        let h = host(1);
+        let mut lease = Lease::default();
+        let mut at = At::short(&h);
+        at.reads(20 * GIB);
+        let (mut now, claimed) = out(&mut lease, &at);
+        assert_eq!(claimed, Some(WorkerSaid::Claimed));
+        at.spawned = Some(Spawned {
+            at_ms: now + 1_000,
+            outcome: Ok("w-1".to_owned()),
+        });
+        at.worker = Some(("w-1".to_owned(), TaskSeen::Working));
+        at.reads(at_start * GIB);
+        now += 60_000;
+        let (_, started) = at.look(&mut lease, now);
+        assert_eq!(
+            started,
+            Some(WorkerSaid::Started {
+                sid: "w-1".to_owned()
+            })
+        );
+        at.spawned = None;
+        at.worker = Some(("w-1".to_owned(), TaskSeen::Ended));
+        at.reads(at_end * GIB);
+        now += 60_000;
+        let (_, over) = at.look(&mut lease, now);
+        assert!(
+            matches!(&over, Some(WorkerSaid::Over { why, rose: r, .. }) if why == "finished" && *r == rose),
+            "{at_start} GiB as it was read started, {at_end} GiB at its end: {over:?}"
+        );
+        assert!(
+            matches!(&worker(&lease).state, WorkerState::Over { rose: r, .. } if *r == rose),
+            "{:?}",
+            worker(&lease).state
+        );
+    }
+}
+
 #[test]
 fn no_look_ends_an_episode_while_its_worker_works() {
     let h = host(1);
@@ -490,6 +537,7 @@ fn closing_an_episode_keeps_a_working_worker_and_drops_one_that_is_over() {
             at_ms: T0,
             state,
             orphan_ms: None,
+            free_at_claim: None,
         }),
         last_worker_ms: Some(T0),
         last_ask_ms: Some(T0 - 60_000),
@@ -625,6 +673,7 @@ fn a_worker_over_before_an_episode_opens_does_not_bar_that_episodes_own() {
 fn the_workers_task_fits_its_cap_in_plain_characters_and_asks_for_its_report() {
     let holders: Vec<Hog> = (0..6)
         .map(|i| Hog {
+            built_s_ago: None,
             path: PathBuf::from(format!(
                 "/Users//u/Library/Caches/aterm/cargo-build.noindex/a/very/long/path/to/a/\
                  worktree-number-{i}/.cargo-build"
@@ -680,6 +729,9 @@ fn the_workers_task_fits_its_cap_in_plain_characters_and_asks_for_its_report() {
             "(rule disk-free@v1 worker)",
             "aterm ctl @self sys disk scope=aterm",
             "Never ask a question",
+            // Its fence proves a command only against the shell snapshot Claude Code writes once
+            // its Bash tool ran one, which `pwd` does without a box.
+            "First run `pwd` alone",
         ] {
             assert!(task.contains(said), "{said}: {task}");
         }
@@ -724,6 +776,7 @@ fn with_a_step_in_hand_the_owner_is_needed_only_when_the_fill_outruns_its_window
                 at_ms: started,
                 state,
                 orphan_ms: None,
+                free_at_claim: None,
             }),
             last_worker_ms: Some(started),
             ..open_in(Phase::Out {

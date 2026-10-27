@@ -169,3 +169,96 @@ fn the_decision_table_at_buggy_zero() {
         }
     }
 }
+
+/// The wall over vault adoption's rows (`Vault = 1`, design §6.10): every law proved at
+/// `Buggy = 0` and every mutant caught at `Buggy = 1`, with the same actions firing.
+#[test]
+fn the_vault_rows_keep_every_law() {
+    let vault = interp::with_consts(&agh_route_wall_model(), &[("Vault", 1)]);
+    let lawful: BTreeSet<&str> = ROUTER_AND_WORLD.into_iter().collect();
+    assert_eq!(interp::fired_actions(&vault), lawful);
+    assert!(
+        interp::bmc(&vault).is_ok(),
+        "a law fails over the vault rows"
+    );
+    let buggy = interp::with_buggy(&vault, 1);
+    assert!(
+        interp::bmc(&buggy).is_err(),
+        "no mutant is caught over the vault rows"
+    );
+}
+
+/// The router's decisions over vault adoption's rows, one walk per row: the canonical table
+/// with each absent token's rows left out. The dev token reads first for every owner and is the
+/// dev owner's only reader and writer; the release token is the release owner's writer, and its
+/// reader too only with no dev token; the dev owner's read with no dev token is anonymous.
+#[test]
+fn the_decision_table_over_the_vault_rows() {
+    let vault = interp::with_consts(&agh_route_wall_model(), &[("Vault", 1)]);
+    let rows: [(Walk, Values); 15] = [
+        (&["Decide"], [("phase", 1), ("used", 1)]),
+        (&["ToggleDev", "Decide"], [("phase", 2), ("used", 0)]),
+        (
+            &["ToggleDev", "NextOp", "Decide"],
+            [("phase", 3), ("used", 0)],
+        ),
+        (&["NextTier", "Decide"], [("phase", 1), ("used", 1)]),
+        (
+            &["NextTier", "ToggleRel", "Decide"],
+            [("phase", 1), ("used", 1)],
+        ),
+        (
+            &["NextTier", "ToggleDev", "Decide"],
+            [("phase", 2), ("used", 0)],
+        ),
+        (
+            &["NextTier", "ToggleDev", "ToggleRel", "Decide"],
+            [("phase", 1), ("used", 2)],
+        ),
+        (
+            &["NextTier", "NextOp", "Decide"],
+            [("phase", 3), ("used", 0)],
+        ),
+        (
+            &["NextTier", "NextOp", "ToggleRel", "Decide"],
+            [("phase", 1), ("used", 2)],
+        ),
+        (
+            &["NextTier", "NextOp", "NextOp", "ToggleRel", "Decide"],
+            [("phase", 3), ("used", 0)],
+        ),
+        (
+            &[
+                "NextTier",
+                "NextOp",
+                "NextOp",
+                "ToggleRel",
+                "ToggleNamed",
+                "Decide",
+            ],
+            [("phase", 1), ("used", 2)],
+        ),
+        (
+            &["NextTier", "NextTier", "Decide"],
+            [("phase", 1), ("used", 1)],
+        ),
+        (
+            &["NextTier", "NextTier", "ToggleRel", "Decide"],
+            [("phase", 1), ("used", 1)],
+        ),
+        (
+            &["NextTier", "NextTier", "ToggleDev", "Decide"],
+            [("phase", 2), ("used", 0)],
+        ),
+        (
+            &["NextTier", "NextTier", "NextOp", "Decide"],
+            [("phase", 3), ("used", 0)],
+        ),
+    ];
+    for (path, values) in rows {
+        let state = walk(&vault, path);
+        for (var, want) in values {
+            assert_eq!(state[var], want, "{path:?}: {var} in {state:?}");
+        }
+    }
+}

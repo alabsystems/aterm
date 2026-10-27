@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# Every dark scheme (foreach-scheme dark: the built-ins and the pack themes) with a live band
+# (keys still landing), with OSC 11 setting the page to #ffffff.
+
+foreach-scheme dark {
+  grid 10 60
+  style rainbow kitty
+  hz 60
+
+  at 0 pty "\e[6;1H$ "
+  at 700 key g
+  at 702 pty "g"
+  at 790 key i
+  at 792 pty "i"
+  at 880 key t
+  at 882 pty "t"
+  at 970 key space
+  at 972 pty " "
+  at 1060 key l
+  at 1062 pty "l"
+  at 1150 key o
+  at 1152 pty "o"
+  at 1240 key g
+  at 1242 pty "g"
+  at 1330 key space
+  at 1332 pty " "
+  at 1420 key -
+  at 1420 pty "\e]11;#ffffff\x07"
+  at 1422 pty "-"
+  at 1510 key -
+  at 1512 pty "-"
+  at 1600 key o
+  at 1602 pty "o"
+  at 1690 key n
+  at 1692 pty "n"
+  at 1780 key e
+  at 1782 pty "e"
+  at 1870 key l
+  at 1872 pty "l"
+  at 1960 key i
+  at 1962 pty "i"
+  at 2050 key n
+  at 2052 pty "n"
+  at 2140 key e
+  at 2142 pty "e"
+  at 2230 key space
+  at 2232 pty " "
+  at 2320 key -
+  at 2322 pty "-"
+  at 2410 key -
+  at 2412 pty "-"
+  at 2500 key g
+  at 2502 pty "g"
+  at 2590 key r
+  at 2592 pty "r"
+  at 2680 key a
+  at 2682 pty "a"
+  at 2770 key p
+  at 2772 pty "p"
+  at 2860 key h
+  at 2862 pty "h"
+  run 3750
+}

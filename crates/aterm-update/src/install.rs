@@ -1259,11 +1259,11 @@ fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_buil
         .zip(mtime(&foreign_trial_path(staging)))
         .is_some_and(|(trial, ours)| trial > ours);
     if advanced {
-        let _ = counter.arm(armed_build);
+        let _ = counter.restart_count(armed_build);
         return false;
     }
     if !matches!(counter_state, Some((build, _)) if build == armed_build) {
-        let _ = counter.arm(armed_build);
+        let _ = counter.restart_count(armed_build);
     }
     let observed = counter.observe_launch(armed_build).unwrap_or(0);
     if observed < MAX_BOOT_ATTEMPTS {
@@ -1648,8 +1648,16 @@ fn checked_bundle_exchange(
 }
 
 fn sync_swap_parents(a: &Path, b: &Path, flush: Flush) {
+    // The exchange has landed. Report a failed entry flush without sending its caller
+    // to recover the candidate that is now the installed bundle.
     let sync = |dir: &Path| {
-        let _ = crate::durable::sync_dir(dir, flush);
+        if let Err(error) = flush.dir_best_effort(dir) {
+            crate::warn(&format!(
+                "the bundle swap has landed, but flushing {} failed, so a power loss may \
+                 take it back: {error}",
+                dir.display()
+            ));
+        }
     };
     let parent_a = a.parent();
     let parent_b = b.parent();

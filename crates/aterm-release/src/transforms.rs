@@ -158,7 +158,10 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
                 path.to_string(),
             ))
         })
-        .filter(|(_, _, path)| !in_target_dir(path))
+        // A crate's tests/, examples/ and benches/ stay private; a manifest table naming
+        // a file in one is dropped with it (the target strip). The census's
+        // export-includes guard reads the export's vendor/astream by the same rule.
+        .filter(|(_, _, path)| !aterm_census::export::in_astream_target_dir(path))
         .collect();
     for wanted in &paths {
         let covered = entries
@@ -218,21 +221,6 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
     );
     std::fs::write(dest.join("README.md"), readme).map_err(|e| format!("README.md: {e}"))?;
     Ok((rev, crates))
-}
-
-/// Whether an astream path is in a crate's tests/, examples/ or benches/: targets a
-/// dependency's build never reads, which stay private; a manifest table naming a file
-/// in one is dropped with it (the target strip).
-fn in_target_dir(path: &str) -> bool {
-    let Some((_, in_crate)) = path
-        .strip_prefix("crates/")
-        .and_then(|rest| rest.split_once('/'))
-    else {
-        return false;
-    };
-    ["tests/", "examples/", "benches/"]
-        .iter()
-        .any(|d| in_crate.starts_with(d))
 }
 
 /// astream's root manifest as the export writes it: the `[workspace]` table's `members`

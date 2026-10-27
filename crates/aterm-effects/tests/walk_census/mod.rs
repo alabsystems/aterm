@@ -4,11 +4,10 @@
 //! Shared walk census host (`crate::walk_census`) with [`Shell`], [`Snap::judge`], and [`recolours`].
 #![allow(dead_code)]
 
+use crate::common::{Ground, ground_or, rainbow_cfg_on};
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
-use aterm_effects::cursor_glow::{
-    CursorGlow, Geom, GlowConfig, GlowStyle, InsertWidth, ProbeTrust,
-};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, InsertWidth, ProbeTrust};
 use aterm_effects::rainbow_kitty::TypedClass;
 use aterm_effects::rainbow_kitty::ribbon::{WALK_FAST_CELLS, WALK_LAY_RATE};
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
@@ -29,27 +28,11 @@ pub const FAST: f32 = 1.0 / WALK_FAST_CELLS;
 /// reported as a transient.
 pub const STANDING_FRAMES: usize = 3;
 
+/// The census's rainbow kitty config ([`crate::common::rainbow_cfg`]) on the
+/// ground a [`Host`] stands on: its own dark one, or a
+/// [`crate::common::on_ground`]'s.
 pub fn cfg() -> GlowConfig {
-    GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg: 0x00C8_D3F5,
-        theme_bg: 0x001A_1B26,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
-        accent: 0x007A_A2F7,
-        duration: Duration::from_millis(240),
-        length: 18,
-        intensity: 0.7,
-        audible: true,
-        radius: 0.6,
-        ring: true,
-        beam: false,
-        head_dx: 0.5,
-    }
+    rainbow_cfg_on(ground_or(Ground::TOKYO))
 }
 
 /// The host's `typed_class_for` and `glyph_shifted && !spacebar`.

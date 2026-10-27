@@ -557,17 +557,23 @@ pub(crate) fn clear_build_ready(build_dir: &Path) -> std::io::Result<()> {
 }
 
 /// Take down the completeness marker of every build under `prog_store`.
-pub(crate) fn unmark_program_builds(prog_store: &Path) {
-    let Ok(entries) = std::fs::read_dir(prog_store) else {
-        return;
+///
+/// # Errors
+/// The store scan, an entry's metadata or a marker removal failed, or the directory flush
+/// failed other than as unavailable. Some markers may remain; the caller must remove no tree.
+pub(crate) fn unmark_program_builds(prog_store: &Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(prog_store) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
     };
     let mut unmarked = false;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         // Numeric build dirs only, by the same test every other store scan uses: `current`
         // is a symlink, and `<n>.ready` / `<n>.provenance` / `<n>.shim-env` are files. A
         // build laid aside is its `<n>` link.
-        if !entry.file_type().is_ok_and(|t| t.is_dir())
-            && !aterm_toolchain::layout::is_linked_aside(&entry.path())
+        if !entry.file_type()?.is_dir() && !aterm_toolchain::layout::is_linked_aside(&entry.path())
         {
             continue;
         }
@@ -576,13 +582,15 @@ pub(crate) fn unmark_program_builds(prog_store: &Path) {
         if name.parse::<u64>().is_err() {
             continue;
         }
-        if clear_build_ready(&entry.path()).is_ok() {
-            unmarked = true;
-        }
+        clear_build_ready(&entry.path())?;
+        unmarked = true;
     }
     if unmarked {
-        sync_dir_ordered(prog_store);
+        // Required: every marker's removal reaches the media before any tree goes, or a power
+        // cut part way through the removal can leave a marker over a torn tree.
+        sync_dir_ordered(prog_store)?;
     }
+    Ok(())
 }
 
 /// The suffix of the declared-mode record beside a build dir.
@@ -977,13 +985,15 @@ const EXPOSES_HEADER: &str = "exposes v1";
 
 const MAX_EXPOSES_BYTES: usize = 64 * 1024;
 
-/// The sidecars a stage may write through [`crate::install::StageHooks::sidecars`], which
-/// gc sweeps once their build is gone.
+/// The sidecars a stage writes beside its build — through
+/// [`crate::install::StageHooks::sidecars`], or a kept unit ([`crate::peers::keep`]) — which gc
+/// sweeps once their build is gone.
 pub(crate) const STAGE_SIDECAR_SUFFIXES: &[&str] = &[
     VENDOR_SIDECAR_SUFFIX,
     crate::shim_env::SIDECAR_SUFFIX,
     DECLARED_MODES_SUFFIX,
     EXPOSES_SUFFIX,
+    crate::peers::UNIT_SUFFIX,
 ];
 
 /// Record `tools`, the admitted names of the build's signed `exposes`, beside `build_dir`
@@ -1266,8 +1276,10 @@ pub(crate) fn lay_aside(build_dir: &Path) -> std::io::Result<()> {
         let _ = std::fs::rename(&aside, build_dir);
         return Err(e);
     }
+    // Accepted, failed or not: the move and its link are in place, and a lay-aside a power
+    // cut takes back in part (the tree moved, no link yet) is linked again by relink_aside.
     if let Some(parent) = build_dir.parent() {
-        sync_dir_ordered(parent);
+        let _moved = sync_dir_ordered(parent);
     }
     Ok(())
 }
@@ -1324,39 +1336,33 @@ pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
     }
 }
 
-/// Attempt a full flush of this directory's metadata, its outcome ignored (every error, `EIO`
-/// included): the store's own steps (a discard here; a mark, a lay-aside or a swap through
-/// [`sync_dir_ordered`]) report no failed flush of a store directory. A writer that replaces a
-/// record reports one instead, through [`aterm_durable::Flush::dir_best_effort`] (`status`,
-/// the signature floor, the vendor lane).
-pub(crate) fn sync_dir(dir: &Path) {
-    if let Ok(handle) = std::fs::File::open(dir) {
-        let _ = crate::platform::sync_durable(&handle);
-    }
+/// A full flush of this directory's entries ([`aterm_durable::Flush::dir_best_effort`]): a
+/// directory the volume cannot flush, or cannot open, is no error (no flush is to be had
+/// there), and a failed flush is returned. Each store step says at its call what a failed
+/// one means: one that orders a mark's removal ahead of a tree's stops before the tree.
+///
+/// # Errors
+/// The flush failed other than as unavailable.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    aterm_durable::Flush::Durable
+        .dir_best_effort(dir)
+        .map(|_flushed_or_unavailable| ())
 }
 
-/// Attempt an ordered flush of `dir`, not a full one ([`aterm_durable::ordered`]), its outcome
-/// ignored as [`sync_dir`]'s is.
-pub(crate) fn sync_dir_ordered(dir: &Path) {
-    if let Ok(handle) = std::fs::File::open(dir) {
-        let _ = aterm_durable::ordered(&handle);
-    }
+/// [`sync_dir`] ordered, not full ([`aterm_durable::Flush::Ordered`]).
+///
+/// # Errors
+/// As [`sync_dir`].
+pub(crate) fn sync_dir_ordered(dir: &Path) -> std::io::Result<()> {
+    aterm_durable::Flush::Ordered
+        .dir_best_effort(dir)
+        .map(|_flushed_or_unavailable| ())
 }
 
-/// [`crate::platform::sync_file_contents`], with a refusal degraded to success.
+/// [`crate::platform::sync_file_contents`], with a refusal degraded to success
+/// ([`aterm_durable::refusal_accepted`]: Darwin's `ENOTSUP` among them).
 pub(crate) fn sync_contents_or_accept_refusal(f: &std::fs::File) -> std::io::Result<()> {
-    match crate::platform::sync_file_contents(f) {
-        Ok(()) => Ok(()),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
-            ) =>
-        {
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
+    aterm_durable::refusal_accepted(crate::platform::sync_file_contents(f))
 }
 
 /// What [`sync_tree`] flushed.
@@ -1516,14 +1522,18 @@ pub(crate) fn held_build_in(prog_store: &Path) -> Option<PathBuf> {
         })
 }
 
-/// Discard a build entirely; a held one ([`held_unproven`]) is only unmarked, and stays
-/// until a pass after its hold sweeps it as partial debris.
+/// Discard a build after its marker's removal is flushed. A failed removal or flush
+/// retains the tree; a held build ([`held_unproven`]) stays unmarked until a later sweep.
 pub(crate) fn discard_build(build_dir: &Path) {
-    let _ = clear_build_ready(build_dir);
-    if let Some(parent) = build_dir.parent() {
-        sync_dir(parent);
+    if clear_build_ready(build_dir).is_err() {
+        return;
     }
-    if held_unproven(build_dir) {
+    // Required: the marker's removal reaches the media before the tree goes, or a power cut
+    // part way through the removal can leave the marker over a torn tree.
+    let unmarked = build_dir
+        .parent()
+        .is_none_or(|parent| sync_dir(parent).is_ok());
+    if !unmarked || held_unproven(build_dir) {
         return;
     }
     crate::compat::discard_root_of(build_dir);
@@ -1543,6 +1553,9 @@ pub(crate) fn discard_build(build_dir: &Path) {
     clear_stage_refusal(build_dir);
     clear_vendor_sidecar(build_dir);
     clear_declared_modes(build_dir);
+    if let Some(unit) = sidecar_path(build_dir, crate::peers::UNIT_SUFFIX) {
+        let _ = std::fs::remove_file(unit);
+    }
     if let Some(record) = sidecar_path(build_dir, EXPOSES_SUFFIX) {
         let _ = std::fs::remove_file(record);
     }
@@ -2915,17 +2928,12 @@ mod tests {
         std::fs::create_dir_all(prog.join("8595.incoming-7")).unwrap();
         std::fs::write(prog.join("8595.provenance"), b"src\n").unwrap();
         let recording = aterm_durable::seam::Recording::start();
-        unmark_program_builds(&prog);
-        let flushed: &[aterm_durable::Flush] = if cfg!(windows) {
-            &[]
-        } else {
-            &[aterm_durable::Flush::Ordered]
-        };
+        unmark_program_builds(&prog).unwrap();
         assert_eq!(
             recording.take(),
-            flushed,
+            [aterm_durable::Flush::Ordered],
             "every marker down before any tree goes: one ordered directory flush \
-             (aterm-durable's counting seam)"
+             (aterm-durable's counting seam; on Windows only noted)"
         );
         drop(recording);
         for n in [8590u64, 8595] {
@@ -2941,6 +2949,83 @@ mod tests {
             "other sidecars stay"
         );
         assert!(prog.join("8595.incoming-7").is_dir());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_failed_marker_removal_keeps_the_build() {
+        let home = temp_home("unmark-remove-fails");
+        let build = home.join("store").join("trust").join("8595");
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        let witness = build.join("bin").join("trustc");
+        std::fs::write(&witness, b"keep").unwrap();
+        let marker = ready_marker_path(&build).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        std::fs::write(marker.join("obstruction"), b"keep marker").unwrap();
+        assert!(
+            clear_build_ready(&build).is_err(),
+            "the unmark really fails"
+        );
+        assert!(unmark_program_builds(build.parent().unwrap()).is_err());
+        assert!(
+            unmark_program_builds(&witness).is_err(),
+            "a scan failure is returned"
+        );
+        discard_build(&build);
+        assert_eq!(
+            std::fs::read(&witness).unwrap(),
+            b"keep",
+            "a build whose marker could not be removed is retained"
+        );
+        assert_eq!(
+            std::fs::read(marker.join("obstruction")).unwrap(),
+            b"keep marker"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The store steps that remove a tree after its marker stop before the tree when the
+    /// flush that orders the marker's removal ahead of it fails: an uninstall's unmark
+    /// returns the failure (its caller removes nothing), and a discard keeps the tree,
+    /// unmarked, for a later pass. A folder the volume cannot flush stops neither. With the
+    /// flush's outcome dropped, as before, both went on and removed the tree.
+    #[test]
+    fn a_failed_flush_of_a_markers_removal_keeps_the_tree() {
+        use aterm_durable::seam::{EIO, ENOTSUP, FailingDirs};
+        let home = temp_home("unmark-flush-fails");
+        let prog = home.join("store").join("trust");
+        let build = prog.join("8595");
+        let laid = || {
+            std::fs::create_dir_all(build.join("bin")).unwrap();
+            std::fs::write(build.join("bin").join("trustc"), b"x").unwrap();
+            mark_build_ready(&build).unwrap();
+        };
+        laid();
+        {
+            let _eio = FailingDirs::with(EIO);
+            assert_eq!(
+                unmark_program_builds(&prog).map_err(|e| e.raw_os_error()),
+                Err(Some(EIO))
+            );
+            assert!(!build_is_complete(&build), "the marker is down");
+            mark_build_ready(&build).unwrap();
+            discard_build(&build);
+        }
+        assert_eq!(
+            std::fs::read(build.join("bin").join("trustc")).unwrap(),
+            b"x"
+        );
+        assert!(!build_is_complete(&build), "unmarked: partial debris");
+        {
+            let _refused = FailingDirs::with(ENOTSUP);
+            mark_build_ready(&build).unwrap();
+            unmark_program_builds(&prog).expect("a folder the volume cannot flush stops nothing");
+            discard_build(&build);
+        }
+        assert!(
+            std::fs::symlink_metadata(&build).is_err(),
+            "the discard went on past a refusal"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

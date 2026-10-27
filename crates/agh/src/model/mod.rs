@@ -412,6 +412,53 @@ pub struct UserObject {
     pub raw: Value,
 }
 
+/// One SSH key of a user (`GET /user/keys`).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct KeyObject {
+    /// The numeric id.
+    pub id: u64,
+    /// `<type> <base64>`: GitHub keeps no comment.
+    pub key: String,
+    /// The title it was added with.
+    #[serde(default)]
+    pub title: String,
+    /// When it was added.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// The answer as GitHub sent it.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+/// A git ref (`GET /repos/{o}/{r}/git/ref/{name}`, `POST …/git/refs`).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct RefObject {
+    /// `refs/heads/…` or `refs/tags/…`.
+    #[serde(rename = "ref")]
+    pub reference: String,
+    /// The API URL of the ref.
+    #[serde(default)]
+    pub url: String,
+    /// What it points at.
+    pub object: RefTarget,
+    /// The answer as GitHub sent it.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+/// What a ref points at.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct RefTarget {
+    /// The sha.
+    pub sha: String,
+    /// `commit` or `tag`.
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    /// The answer as GitHub sent it.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
 from_json_raw!(
     OwnerObject,
     Permissions,
@@ -430,6 +477,9 @@ from_json_raw!(
     BranchObject,
     TagObject,
     UserObject,
+    KeyObject,
+    RefObject,
+    RefTarget,
 );
 
 impl FromJson for ReleaseObject {

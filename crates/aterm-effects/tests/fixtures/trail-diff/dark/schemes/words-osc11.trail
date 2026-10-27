@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# Every dark scheme (foreach-scheme dark: the built-ins and the pack themes) with comet, a non-
+# rainbow-kitty style, with Sparkle Words (a feline word and an f-bomb), with OSC 11 setting the
+# page to #ffffff.
+
+foreach-scheme dark {
+  grid 10 60
+  style comet
+  hz 60
+  words rainbow
+
+  at 0 pty "\e[6;1H$ "
+  at 700 key k
+  at 702 pty "k"
+  at 790 key i
+  at 792 pty "i"
+  at 880 key t
+  at 882 pty "t"
+  at 970 key t
+  at 972 pty "t"
+  at 1060 key y
+  at 1062 pty "y"
+  at 1150 key ,
+  at 1152 pty ","
+  at 1240 key space
+  at 1242 pty " "
+  at 1330 key f
+  at 1332 pty "f"
+  at 1420 key u
+  at 1422 pty "u"
+  at 1510 key c
+  at 1512 pty "c"
+  at 1600 key k
+  at 1602 pty "k"
+  at 1690 key space
+  at 1692 pty " "
+  at 1780 key i
+  at 1782 pty "i"
+  at 1870 key t
+  at 1872 pty "t"
+  at 2260 pty "\e]11;#ffffff\x07"
+  run 3460
+}

@@ -44,9 +44,14 @@ impl Proposals {
     /// Read current eligible metadata and signed/local provenance. A missing or
     /// damaged established store is never silently replaced.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        self.with_store(false, |session, store, scope| {
-            Ok(Log::read_with(session, store, scope, decode)?.snapshot())
+        self.with_store(false, |session, store, _| {
+            Self::snapshot_from_store(session, store)
         })
+    }
+    /// Project an already opened proposal store without reopening or enrolling
+    /// its catalog. The caller keeps the authenticated session alive.
+    pub(crate) fn snapshot_from_store(session: &Session<'_>, store: &Store) -> Result<Snapshot> {
+        Ok(Log::read_with(session, store, store.scope(), decode)?.snapshot())
     }
     /// Diagnose explicit references without resolving credentials or authorizing
     /// login. This reads the existing table and appends no application operation.

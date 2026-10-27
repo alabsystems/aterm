@@ -204,6 +204,42 @@ fn rows_show_now_and_wanted_and_at_most_one_chip() {
     );
 }
 
+/// A row the person changed after aterm set it (design §6.9) reads as they left it, under
+/// "Changed by you", with no chip saying it will change; while Set up now runs it, it changes
+/// like any other row, and a differing row without the note still reads as one that will change.
+#[test]
+fn a_row_changed_by_you_reads_as_you_left_it() {
+    let dock = Subject::Setting(Setting::Dock);
+    let mut changed = reading(dock, Standing::Differs, Some("Recent apps shown"));
+    changed.note = Some(aterm_types::macos_setup::CHANGED_BY_YOU.to_owned());
+    let mut status = with_readings(Selection::all(), vec![changed]);
+    let row = row_view(dock, &status, Selection::all());
+    assert_eq!(
+        (row.value, row.chip, row.note.as_deref(), row.label.as_str()),
+        (
+            RowValue::One("Recent apps shown".into()),
+            None,
+            Some("Changed by you"),
+            "Dock: Recent apps shown, changed by you"
+        )
+    );
+
+    status.running = vec![Setting::Dock];
+    assert_eq!(
+        row_view(dock, &status, Selection::all()).chip,
+        Some(Chip::WillChange { busy: true })
+    );
+
+    let status = with_readings(
+        Selection::all(),
+        vec![reading(dock, Standing::Differs, Some("Recent apps shown"))],
+    );
+    assert_eq!(
+        row_view(dock, &status, Selection::all()).chip,
+        Some(Chip::WillChange { busy: false })
+    );
+}
+
 #[test]
 fn a_row_waiting_on_a_person_carries_its_open_and_a_failure_its_reason() {
     let fda = Subject::Access(Access::FullDiskAccess);
@@ -4316,6 +4352,58 @@ fn idle_kitties_stand_still_whatever_repaints_the_page() {
         spec(4_321).starts_with("phase=0;busy=0;"),
         "{}",
         spec(4_321)
+    );
+}
+
+#[test]
+fn a_page_owes_an_animation_wake_only_while_a_run_walks_on_a_shown_page() {
+    assert!(
+        page_owes_animation_wake(true, true, true),
+        "a run on a shown page with the hands off the keys walks, so it owes its tick"
+    );
+    assert!(
+        !page_owes_animation_wake(false, true, true),
+        "a settled or finished page stands still and owes no tick"
+    );
+    assert!(
+        !page_owes_animation_wake(true, false, true),
+        "a hidden page draws no walk, so it owes no tick"
+    );
+    assert!(!page_owes_animation_wake(false, false, true));
+}
+
+/// §5.6: the walk's wake holds off the input path. A key typed within the app-wide
+/// 2.5 s gap withholds a running, shown page's tick; 3 s later it owes it again. The
+/// gap is read from an injected keystroke ([`crate::hands_off_keys`]), so the hold
+/// arm is not vacuously off.
+#[test]
+fn a_recent_key_holds_a_running_shown_pages_walk_wake() {
+    let typed = std::time::Instant::now();
+    let later = typed + std::time::Duration::from_millis(3_000);
+
+    let hands_on = crate::hands_off_keys(true, Some(typed), typed);
+    assert!(
+        !hands_on,
+        "a key read at the instant it was typed is not hands-off"
+    );
+    assert!(
+        !page_owes_animation_wake(true, true, hands_on),
+        "a key typed just now holds the walk's wake off the input path"
+    );
+
+    // Control: 3 s after the last key the hands are off, so the same running, shown
+    // page owes its tick again — the hold, not an absent walk, suppressed it above.
+    let hands_off = crate::hands_off_keys(true, Some(typed), later);
+    assert!(hands_off, "3 s after a key the hands are off the keys");
+    assert!(
+        page_owes_animation_wake(true, true, hands_off),
+        "3 s after the last key the walk owes its tick again"
+    );
+
+    // An unfocused app never holds for typing: its hands are vacuously off.
+    assert!(
+        crate::hands_off_keys(false, Some(typed), typed),
+        "an unfocused app's hands are off the keys whatever was just typed"
     );
 }
 

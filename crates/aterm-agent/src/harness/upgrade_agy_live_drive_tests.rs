@@ -1393,6 +1393,24 @@ fn the_summary_database_is_read_only_open_or_closed() {
         Err(()),
         "empty table missing required summary columns must fail"
     );
+
+    let injected = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+            .arg(&db)
+            .arg(format!(
+                "INSERT INTO conversation_summaries (conversation_id,status,not_fully_idle,parent_conversation_id) \
+                 VALUES ('child-1', 'CASCADE_RUN_STATUS_IDLE|0|' || char(10) || '{C1}|{STATUS_IDLE}|0|', 0, '{C1}'); \
+                 PRAGMA wal_checkpoint(TRUNCATE);"
+            )),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("sqlite3 within the hang detector: {e}"));
+    assert!(injected.status.success(), "{injected:?}");
+    assert_eq!(
+        live::read_summaries(&config, C1),
+        Err(()),
+        "embedded pipe/newline delimiters in summary cells must fail closed"
+    );
     let _ = std::fs::remove_dir_all(&*bad_dir);
     let _ = std::fs::remove_dir_all(&*dir);
 }
@@ -1662,8 +1680,74 @@ fn real_claim_relaunches() -> bool {
         twin: rig.twin.clone(),
     };
     let now = now_s();
-    let st = claim_record(&snap, &mv, now).expect("a claim");
+    let st = claim_record(&snap, &mv, rig.opts.human_grace_s, now).expect("a claim");
     ended_by_restart(&st, Agent::Agy, TAB, TUI, now)
+}
+
+/// 2026-10-26 review: the agy quiet upgrade's SIGTERM waits out the whole grace, so its claim names
+/// that grace, and a key typed at the prompt after it holds the relaunch line it owes exactly as
+/// long as it would have held the SIGTERM, for the upgrade's claim and a quota rotation's (`model:`).
+/// The control: a claim naming the land rung's keys gap (what the line read an agy claim that named
+/// none as) lets go a key the SIGTERM waited on.
+#[test]
+fn an_agy_claim_holds_its_line_on_the_grace_its_sigterm_waited_out() {
+    let rig = LiveRig::new(Knobs::default());
+    let args = rig.kernel.args(TUI).expect("argv");
+    let snap = snapshot(
+        &rig.opts,
+        TAB,
+        TUI,
+        "tui-birth".to_string(),
+        SHELL,
+        &args,
+        &rig.kernel,
+    )
+    .expect("a snapshot");
+    let mv = Move {
+        running: VERSION.to_string(),
+        target: NEW_VERSION.to_string(),
+        twin: rig.twin.clone(),
+    };
+    use crate::harness::relaunch::{PromptLook, line_grace, line_held_by_status};
+    let grace_s = rig.opts.human_grace_s;
+    let key_status =
+        |age_s: u64| format!("OK schema=1 hold=0 hand=- input=clear human_ms={age_s}000");
+    let owed_line_held = |claim: &St, grace_s: u32, age_s: u64| {
+        let mut claim = claim.clone();
+        let look = PromptLook::of(&mut claim);
+        let grace = line_grace(grace_s, look.ended_at_s, look.line_grace_s);
+        line_held_by_status(Some(&key_status(age_s)), grace, "aterm-harness@1").is_some()
+    };
+    let upgrade = claim_record(&snap, &mv, grace_s, now_s()).expect("a claim");
+    assert_eq!(
+        upgrade.line_grace_s,
+        Some(grace_s),
+        "the claim names the grace its SIGTERM waited out"
+    );
+    let rotation = St {
+        cause: format!("{}gemini-3-flash", crate::harness::relaunch::CAUSE_MODEL),
+        ..upgrade.clone()
+    };
+    let sigterm_held =
+        |age_s: u64| crate::harness::upgrade_drive::held_by_status(&key_status(age_s), grace_s);
+    for claim in [&upgrade, &rotation] {
+        for age_s in [0, 1, 19, 20, 21, 30, 60, 119, 120, 121, 300] {
+            assert_eq!(
+                owed_line_held(claim, grace_s, age_s),
+                sigterm_held(age_s),
+                "{:?}: a key {age_s} s old",
+                claim.cause
+            );
+        }
+    }
+    let gap = St {
+        line_grace_s: Some(crate::harness::upgrade::KEYS_GAP_S),
+        ..upgrade.clone()
+    };
+    assert!(
+        (0..=300).any(|age_s| sigterm_held(age_s) && !owed_line_held(&gap, grace_s, age_s)),
+        "control: the keys gap lets go a key the SIGTERM waited on"
+    );
 }
 
 #[test]

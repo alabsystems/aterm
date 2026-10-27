@@ -11,10 +11,10 @@ use super::instance::{
     Budget, CouldNotRun, Ctl, Instance, Scratch, World, could_not_run, field, uint_field,
 };
 use super::paint::{
-    BUDGET_SECS, Capture, Companion, Expect, Ledger, PaintReport, PaintRow, Scene, Split, Style,
-    judge,
+    BUDGET_SECS, Capture, Companion, Expect, Ledger, PLANE_COL, PLANE_ROW, PaintReport, PaintRow,
+    Scene, Split, Style, judge,
 };
-use super::scan::{Cell, RecordingIndex, StatusRow, TakeContext, scan_dir};
+use super::scan::{Cell, RecordingIndex, StatusRow, TakeContext, TypedRow, scan_dir};
 use super::starvation::{DEFAULT_LATE_THRESHOLD_US, Sampler, SchedInputs, classify, paint_verdict};
 
 const SAMPLER_TICK: Duration = Duration::from_millis(50);
@@ -29,10 +29,25 @@ const CAT_SLOT: Duration = Duration::from_millis(250);
 const CAT_TAIL: Duration = Duration::from_secs(1);
 const PLANE_DECAY: Duration = Duration::from_secs(1);
 const COMPANION_STILLS: usize = 3;
-/// The companion plane's caret row and column, zero-based (`ESC [10;10H`).
+/// The plane's caret row and column, zero-based (`ESC [10;10H`, [`PLANE_ROW`]).
 const PLANE_CARET: &str = "9";
 
-const COMPANION_PLANE: &str = r"printf '\033[2J\033[10;10H'; sleep 30";
+/// The plane: the companion rows' isolated stage and [`Scene::Plane`]. A blank screen with the
+/// caret at [`PLANE_CARET`], held by a foreground job that ctrl+c ends. The job draws the plane
+/// itself once the shell has started it, so nothing the shell writes while starting a job lands
+/// after the plane: /bin/sh's job control prints `sh: child setpgid (<pid> to <pid>): Operation
+/// not permitted` when macOS refuses the child's own `setpgid` (and runs the job all the same),
+/// which after a plane the shell drew itself would hold the caret a row below the plane for the
+/// whole take. The job outlives the take's budget, so no prompt comes back over the plane however
+/// slow the take.
+fn plane() -> String {
+    format!(r#"sh -c 'printf "\033[2J\033[10;10H"; exec sleep {BUDGET_SECS}'"#)
+}
+
+const _: () = assert!(
+    PLANE_ROW == 9 && PLANE_COL == 9,
+    "PLANE_CARET names the plane's caret"
+);
 
 /// The take a process makes once, before its first measured row, and throws away: a fresh
 /// bundle's first recording and first trail frames start cold (the driven window opens later and
@@ -46,6 +61,7 @@ const WARM_ROW: PaintRow = PaintRow {
     style: Style::Flying,
     companion: None,
     split: None,
+    reach: None,
 };
 
 static WARMED: std::sync::Once = std::sync::Once::new();
@@ -110,6 +126,7 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
         driven_ms: take.driven_ms,
         band: take.band,
         bench_band,
+        checks: take.checks,
     })
 }
 
@@ -146,6 +163,7 @@ struct Take {
     typed_gap_ms: Option<(u64, u64)>,
     driven_ms: Option<(i64, i64)>,
     band: super::instance::Band,
+    checks: String,
 }
 
 fn config_head(row: &PaintRow) -> String {
@@ -175,10 +193,10 @@ fn run_take(
         stage_split(ctl, split)?;
     }
     let alt_wait_ms = stage_scene(rig, &inst, row.scene)?;
-    if row.companion.is_some() {
-        stage_companion_plane(ctl)?;
+    if row.companion.is_some() || row.scene == Scene::Plane {
+        stage_plane(&inst)?;
     }
-    let cell = cell_of(ctl)?;
+    let (cell, typed_row) = cell_of(ctl, row)?;
     if row.scene == Scene::ColdStreamer {
         fence_walking_caret(ctl)?;
     }
@@ -187,7 +205,9 @@ fn run_take(
     }
     let capture = match row.capture {
         Capture::PinnedVideo => capture_video(ctl, row, sampler)?,
-        Capture::UnpinnedFocused | Capture::UnpinnedUnfocused => capture_burst(ctl, row, sampler)?,
+        Capture::UnpinnedFocused | Capture::UnpinnedUnfocused => {
+            capture_burst(&inst, row, sampler)?
+        }
     };
     let metrics = ctl.ok(&["metrics"])?;
     let backend = field(&metrics, "backend")
@@ -204,11 +224,15 @@ fn run_take(
             inst.log_tail()
         ));
     }
+    if std::env::var_os("ATERM_PAINT_KEEP").is_some() {
+        keep_ledger(&capture, cell, typed_row);
+    }
     let ctx = TakeContext {
         cell,
         statuses: capture.rows.clone(),
         index: capture.index,
         driven_ms: capture.driven_ms,
+        typed_row,
     };
     let scan = scan_dir(&capture.frames_dir, &ctx)
         .map_err(|e| CouldNotRun::Refused(format!("the take could not be scanned: {e}")))?;
@@ -228,7 +252,36 @@ fn run_take(
         typed_gap_ms,
         driven_ms: capture.driven_ms,
         band: inst.band.clone(),
+        checks: super::instance::replay_checks(ctl),
     })
+}
+
+/// A kept take's ledger beside its frames, so the take can become a scanner fixture:
+/// `trail-status.rows` (one row per frame, in frame order) and `take.txt` (the cell, and the
+/// typed row a reach is measured above). Saying it failed is enough: the take is still judged.
+fn keep_ledger(capture: &Captured, cell: Cell, typed_row: Option<TypedRow>) {
+    let dir = &capture.frames_dir;
+    let mut wrote = Ok(());
+    if let Some(rows) = &capture.rows {
+        let text: String = rows.iter().map(|r| format!("{}\n", r.0)).collect();
+        wrote = wrote.and(std::fs::write(dir.join("trail-status.rows"), text));
+    }
+    let take = format!(
+        "cell_w={} cell_h={} row_bottom={} frame_w={} frame_h={}\n",
+        cell.w,
+        cell.h,
+        typed_row.map_or_else(|| "none".to_string(), |r| r.bottom.to_string()),
+        typed_row.map_or_else(|| "none".to_string(), |r| r.frame_w.to_string()),
+        typed_row.map_or_else(|| "none".to_string(), |r| r.frame_h.to_string()),
+    );
+    wrote = wrote.and(std::fs::write(dir.join("take.txt"), take));
+    match wrote {
+        Ok(()) => eprintln!("measure: kept the take's ledger beside {}", dir.display()),
+        Err(e) => eprintln!(
+            "measure: could not keep the take's ledger in {}: {e}",
+            dir.display()
+        ),
+    }
 }
 
 fn stage_split(ctl: &Ctl, split: Split) -> Result<(), CouldNotRun> {
@@ -246,13 +299,23 @@ fn stage_split(ctl: &Ctl, split: Split) -> Result<(), CouldNotRun> {
 }
 
 fn scene_missed(inst: &Instance, why: CouldNotRun) -> CouldNotRun {
-    let screen = match inst.ctl.call(&["text", SCREEN_TAIL_ROWS]) {
+    with_screen(
+        inst,
+        why,
+        &["text", SCREEN_TAIL_ROWS],
+        "the screen's last rows",
+    )
+}
+
+/// `why` with what `text` reads of the screen, under `heading`, and the instance log's tail.
+fn with_screen(inst: &Instance, why: CouldNotRun, text: &[&str], heading: &str) -> CouldNotRun {
+    let screen = match inst.ctl.call(text) {
         reply if reply.ok() => reply.stdout,
         reply => format!("(unreadable: {})", reply.stderr.trim()),
     };
     why.map(|why| {
         format!(
-            "{why}\n--- the screen's last rows ---\n{}\n--- the instance log's tail ---\n{}",
+            "{why}\n--- {heading} ---\n{}\n--- the instance log's tail ---\n{}",
             screen.trim_end(),
             inst.log_tail()
         )
@@ -297,31 +360,64 @@ fn stage_scene(rig: &Rig, inst: &Instance, scene: Scene) -> Result<u64, CouldNot
     Ok(waited)
 }
 
-fn stage_companion_plane(ctl: &Ctl) -> Result<(), CouldNotRun> {
-    ctl.ok(&["send", COMPANION_PLANE])?;
+/// Stage [`plane`] and wait for its caret. A plane that does not come names the caret's last
+/// reading, and [`with_screen`] the whole screen: the plane's caret row is near the top, above the
+/// rows [`scene_missed`] shows.
+fn stage_plane(inst: &Instance) -> Result<(), CouldNotRun> {
+    let ctl = &inst.ctl;
+    ctl.ok(&["send", &plane()])?;
     ctl.ok(&["key", "enter"])?;
-    ctl.await_event("the companion plane", || {
+    let mut last = String::new();
+    ctl.await_event("the plane", || {
         let reply = ctl.call(&["cursor"]);
         let mut it = reply.line().split_whitespace();
-        (it.next() == Some("OK")
+        let placed = it.next() == Some("OK")
             && it.next() == Some(PLANE_CARET)
-            && it.next() == Some(PLANE_CARET))
-        .then_some(())
+            && it.next() == Some(PLANE_CARET);
+        last = format!("{} {}", reply.line(), reply.stderr.trim());
+        placed.then_some(())
+    })
+    .map_err(|e| {
+        let e = e.map(|why| format!("{why} (the caret last read: {})", last.trim()));
+        with_screen(inst, e, &["text"], "the screen")
     })?;
     std::thread::sleep(PLANE_DECAY);
     Ok(())
 }
 
-fn cell_of(ctl: &Ctl) -> Result<Cell, CouldNotRun> {
+/// The cell `dims` reports, and on the plane the typed row's place on the frames: the grid's
+/// top is `pad_top + head` and the tab strip's rows below the frame's top (as the effects box
+/// is placed, aterm-gui `effects_origin_win`), and the row is [`PLANE_ROW`] cells under it.
+fn cell_of(ctl: &Ctl, row: &PaintRow) -> Result<(Cell, Option<TypedRow>), CouldNotRun> {
     let dims = ctl.ok(&["dims"])?;
-    let w = uint_field(&dims, "cell_w")
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or(0);
-    let h = uint_field(&dims, "cell_h")
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or(0);
-    Cell::new(w, h)
-        .ok_or_else(|| CouldNotRun::Refused(format!("ctl dims reported no positive cell ({dims})")))
+    let px = |key: &str| uint_field(&dims, key).and_then(|v| usize::try_from(v).ok());
+    let cell =
+        Cell::new(px("cell_w").unwrap_or(0), px("cell_h").unwrap_or(0)).ok_or_else(|| {
+            CouldNotRun::Refused(format!("ctl dims reported no positive cell ({dims})"))
+        })?;
+    if row.scene != Scene::Plane {
+        return Ok((cell, None));
+    }
+    let (Some(pad_top), Some(head), Some(tab_rows), Some(frame_w), Some(frame_h)) = (
+        px("pad_top"),
+        px("head"),
+        px("tab_rows"),
+        px("frame_w"),
+        px("frame_h"),
+    ) else {
+        return Err(CouldNotRun::Unanswered(format!(
+            "ctl dims did not place the grid on the frame ({dims})"
+        )));
+    };
+    let bottom = pad_top + head + (tab_rows + PLANE_ROW + 1) * cell.h;
+    Ok((
+        cell,
+        Some(TypedRow {
+            bottom,
+            frame_w,
+            frame_h,
+        }),
+    ))
 }
 
 fn caret(ctl: &Ctl) -> Result<(String, String, String), CouldNotRun> {
@@ -480,7 +576,12 @@ impl Burst<'_> {
     }
 }
 
-fn capture_burst(ctl: &Ctl, row: &PaintRow, sampler: &Sampler) -> Result<Captured, CouldNotRun> {
+fn capture_burst(
+    inst: &Instance,
+    row: &PaintRow,
+    sampler: &Sampler,
+) -> Result<Captured, CouldNotRun> {
+    let ctl = &inst.ctl;
     sampler.open_window();
     let mut burst = Burst {
         ctl,
@@ -534,7 +635,7 @@ fn capture_burst(ctl: &Ctl, row: &PaintRow, sampler: &Sampler) -> Result<Capture
     if row.companion.is_some() && !keys.is_empty() {
         ctl.ok(&["key", "ctrl+c"])?;
         ctl.ok(&["await", "match", r"^\$.?$", "timeout=60000"])?;
-        stage_companion_plane(ctl)?;
+        stage_plane(inst)?;
         for _ in 0..COMPANION_STILLS {
             burst.shot()?;
             std::thread::sleep(TAIL_GAP);

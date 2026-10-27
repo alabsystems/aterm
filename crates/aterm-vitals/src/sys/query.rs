@@ -6,7 +6,7 @@
 use crate::explain::WhySubject;
 
 /// The usage line a refused `sys` request answers; a stray word after `why` answers [`WHY_USAGE`].
-pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|net|procs|why] \
+pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|net|procs|why|report] \
                          [scope=pane|tab|window|aterm|global] [instances=all] [top=<1-64>] \
                          [depth=<1-8>] [fresh=<ms>] [since=<ep>.<seq>] [--json]; scope= on \
                          jobs disk procs (cores gpu mem net take it, rows unchanged), depth= on \
@@ -50,11 +50,13 @@ pub enum View {
     Procs,
     /// Who uses the CPU or memory, and why.
     Why,
+    /// Bounded CPU hardware, policy and preserved anomaly report.
+    Report,
 }
 
 impl View {
     /// Every view, in the help's order.
-    pub const ALL: [View; 12] = [
+    pub const ALL: [View; 13] = [
         Self::Overview,
         Self::Tab,
         Self::Aterm,
@@ -67,6 +69,7 @@ impl View {
         Self::Net,
         Self::Procs,
         Self::Why,
+        Self::Report,
     ];
 
     /// Its word.
@@ -85,6 +88,7 @@ impl View {
             Self::Net => "net",
             Self::Procs => "procs",
             Self::Why => "why",
+            Self::Report => "report",
         }
     }
 
@@ -96,7 +100,9 @@ impl View {
     #[must_use]
     pub fn default_scope(self) -> Option<ScopeArg> {
         match self {
-            Self::Overview | Self::Tab | Self::Aterm | Self::Global | Self::Why => None,
+            Self::Overview | Self::Tab | Self::Aterm | Self::Global | Self::Why | Self::Report => {
+                None
+            }
             Self::Jobs | Self::Disk | Self::Procs => Some(ScopeArg::Tab),
             Self::Cores | Self::Gpu | Self::Mem | Self::Net => Some(ScopeArg::Global),
         }
@@ -355,6 +361,7 @@ impl SysQuery {
             | View::Mem
             | View::Net
             | View::Why => true,
+            View::Report => true,
             View::Aterm => false,
             View::Jobs | View::Procs => {
                 matches!(self.effective_scope(), Some(ScopeArg::Tab | ScopeArg::Pane))

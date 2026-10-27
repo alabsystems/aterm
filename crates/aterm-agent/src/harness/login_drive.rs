@@ -165,7 +165,10 @@ enum Want {
 /// names, whether it said it is done, and the email its done line names.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Scan {
-    pending: Option<Want>,
+    /// The value a lead line left owed to the next line of its own stream (0 the child's
+    /// output, 1 its errors): [`drive`] reads the two interleaved in any order, so a line of the
+    /// one never takes the other's value.
+    pending: [Option<Want>; 2],
     /// The page's URL.
     pub url: Option<String>,
     /// The code the page shows or asks for.
@@ -177,14 +180,21 @@ pub struct Scan {
 }
 
 impl Scan {
-    /// Reads one line (as the child printed it) against `grammar`.
+    /// Reads one line (as the child printed it) against `grammar`, all of them one stream's.
     pub fn feed(&mut self, grammar: &Grammar, raw: &str) {
+        self.feed_from(0, grammar, raw);
+    }
+
+    /// [`Scan::feed`] for a line of the child's stream `stream` (0 its output, 1 its errors): a
+    /// lead's value is read from the next line of the lead's own stream.
+    fn feed_from(&mut self, stream: usize, grammar: &Grammar, raw: &str) {
+        let pending = &mut self.pending[stream.min(1)];
         let line = strip_ansi(raw);
         let line = line.trim();
         if line.is_empty() {
             return;
         }
-        if let Some(want) = self.pending.take() {
+        if let Some(want) = pending.take() {
             match want {
                 Want::Url if is_url(line) => {
                     self.url.get_or_insert_with(|| line.to_owned());
@@ -203,7 +213,7 @@ impl Scan {
                 if is_url(rest) {
                     self.url.get_or_insert_with(|| rest.to_owned());
                 } else {
-                    self.pending = Some(Want::Url);
+                    *pending = Some(Want::Url);
                 }
                 return;
             }
@@ -214,7 +224,7 @@ impl Scan {
                 if is_code(rest) {
                     self.code.get_or_insert_with(|| rest.to_owned());
                 } else {
-                    self.pending = Some(Want::Code);
+                    *pending = Some(Want::Code);
                 }
                 return;
             }
@@ -645,7 +655,7 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
         }
     };
     let deadline = Instant::now() + spec.hang;
-    let (tx, rx) = mpsc::channel::<Option<String>>();
+    let (tx, rx) = mpsc::channel::<Option<(usize, String)>>();
     let said_done = Arc::new(AtomicBool::new(false));
     let closed = Arc::new(AtomicUsize::new(0));
     let done_phrases: Vec<String> = spec.grammar.done.iter().map(|p| (*p).to_owned()).collect();
@@ -660,7 +670,10 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
             .map(|s| Box::new(s) as Box<dyn Read + Send>),
     ];
     let mut open = 0usize;
-    for stream in streams.into_iter().flatten() {
+    for (from, stream) in streams.into_iter().enumerate() {
+        let Some(stream) = stream else {
+            continue;
+        };
         open += 1;
         let tx = tx.clone();
         let said_done = Arc::clone(&said_done);
@@ -672,7 +685,7 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
                 if done_phrases.iter().any(|p| text.contains(p.as_str())) {
                     said_done.store(true, Ordering::SeqCst);
                 }
-                let _ = tx.send(Some(line));
+                let _ = tx.send(Some((from, line)));
             });
             closed.fetch_add(1, Ordering::SeqCst);
             let _ = tx.send(None);
@@ -697,7 +710,7 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
             };
         }
         match rx.recv_timeout(left.min(Duration::from_millis(50))) {
-            Ok(Some(line)) => scan.feed(spec.grammar, &line),
+            Ok(Some((from, line))) => scan.feed_from(from, spec.grammar, &line),
             Ok(None) => open = open.saturating_sub(1),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => open = 0,
@@ -780,8 +793,8 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
         }
     }
     while let Ok(msg) = rx.try_recv() {
-        if let Some(line) = msg {
-            scan.feed(spec.grammar, &line);
+        if let Some((from, line)) = msg {
+            scan.feed_from(from, spec.grammar, &line);
         }
     }
     let code = status.and_then(|s| s.code());

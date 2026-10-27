@@ -450,8 +450,65 @@ struct Row {
     cut: bool,
 }
 
+/// What a row says of the agent's usage: the context left and the plan's windows used, in
+/// percent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Usage {
+    ctx_left: Option<u8>,
+    five_hour: Option<u8>,
+    seven_day: Option<u8>,
+}
+
+impl Usage {
+    /// The context left as the screen shows it (`screen`, Claude Code's own indicator), else as
+    /// Claude Code's usage tap last counted it (`tapped`), else as codex's rollout counts it; the
+    /// windows from the tap, else the rollout.
+    fn of(
+        screen: Option<u8>,
+        tapped: Option<&aterm_agent::harness::tap::Reading>,
+        codex: Option<&aterm_agent::harness::codex_facts::CodexFacts>,
+    ) -> Usage {
+        let window =
+            |w: Option<aterm_agent::harness::tap::Window>| w.and_then(|w| u8::try_from(w.pct).ok());
+        Usage {
+            ctx_left: screen
+                .or_else(|| tapped.and_then(|r| r.ctx_left))
+                .or_else(|| codex.and_then(|c| c.ctx_left_pct)),
+            five_hour: tapped
+                .and_then(|r| window(r.five_hour))
+                .or_else(|| codex.and_then(|c| c.usage_5h_pct)),
+            seven_day: tapped
+                .and_then(|r| window(r.seven_day))
+                .or_else(|| codex.and_then(|c| c.usage_7d_pct)),
+        }
+    }
+}
+
+/// The reading Claude Code's usage tap wrote for its process `pgid` (the group's leader) in tab
+/// `sid` since the process started (`started`, Unix seconds) ([`aterm_agent::harness::tap::Reading::read`]).
+fn claude_tap(sid: &str, pgid: i32, started: u64) -> Option<aterm_agent::harness::tap::Reading> {
+    let dir = aterm_agent::harness::tap::rl_dir()?;
+    let pid = u32::try_from(pgid).ok()?;
+    let started = i64::try_from(started).ok()?;
+    aterm_agent::harness::tap::Reading::read(&dir, sid, pid, started).map(|(reading, _)| reading)
+}
+
 fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: u64) -> Row {
-    let (agent, gauges, task, footer, excerpts, codex, shown, needs, needs_by, hold_by, ask, goal) = {
+    let (
+        agent,
+        gauges,
+        task,
+        footer,
+        claude,
+        excerpts,
+        codex,
+        shown,
+        needs,
+        needs_by,
+        hold_by,
+        ask,
+        goal,
+    ) = {
         let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let need = timeline.need();
         (
@@ -459,6 +516,7 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
             timeline.gauges(),
             timeline.task().cloned(),
             timeline.claude_footer_shown(),
+            timeline.claude_footer_identity(),
             timeline.claude_excerpts().cloned(),
             timeline.codex_survey().cloned(),
             timeline.program_shown(),
@@ -504,6 +562,8 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
         None => (agent.word, agent.age_ms()),
     };
     let codex_facts = codex.as_ref().map(|c| &c.facts);
+    let tapped = claude.and_then(|(pgid, started)| claude_tap(h.sid.as_str(), pgid, started?));
+    let usage = Usage::of(gauges.ctx_pct, tapped.as_ref(), codex_facts);
     let excerpts = excerpts.or_else(|| codex.as_ref().map(CodexSurvey::excerpts));
     let engine = engine_read(h, level == SurveyLevel::Content && excerpts.is_none());
     let human = h.ctx.human_input.age_ms(now_us);
@@ -537,7 +597,8 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
     let mut row = format!(
         "session local={} sid={} state={} program={} program_kind={} agent={} agent_detail={} \
          agent_ms={} human_ms={} bg={} task={} task_rev={} task_from={} task_ms={} model={} \
-         effort={} ctx_left_pct={} detail={} doing={} role={} supervisor={} \
+         effort={} ctx_left_pct={} usage_5h_pct={} usage_7d_pct={} detail={} doing={} role={} \
+         supervisor={} \
          attention={attention} goal={goal} needs={needs} needs_by={needs_by} hold_by={hold_by} \
          held_from={} typed_by={} typed_ms={} {}",
         h.local_id,
@@ -566,12 +627,9 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
                 .and_then(|f| f.effort.as_deref())
                 .or_else(|| codex_facts.and_then(|c| c.effort.as_deref()))
         ),
-        number_token(
-            gauges
-                .ctx_pct
-                .or_else(|| codex_facts.and_then(|c| c.ctx_left_pct))
-                .map(u64::from)
-        ),
+        number_token(usage.ctx_left.map(u64::from)),
+        number_token(usage.five_hour.map(u64::from)),
+        number_token(usage.seven_day.map(u64::from)),
         word_token(engine.detail.as_deref()),
         word_token(doing),
         role_token(role.as_deref(), level),

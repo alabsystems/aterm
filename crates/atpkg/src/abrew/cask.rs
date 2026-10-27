@@ -355,7 +355,7 @@ fn install_inner(
                 cask.token
             )));
         } else {
-            eprintln!(
+            super::tty::opoo!(
                 "Warning: Not upgrading {}, the latest version is already installed",
                 cask.token
             );
@@ -410,16 +410,27 @@ fn install_inner(
     prefix.ensure()?;
     let git_plan = git_raw_plan(cask);
     let dest = prefix.cache().join(&file);
+    // Brew's download-queue narration: one heading for the named
+    // cask and a tick once its download is in hand (cached counts).
+    // Dependency casks get the tick only; brew fetches them under a
+    // separate dependency heading this inline walk does not print.
+    if on_request {
+        eprintln!(
+            "{}",
+            super::tty::oh1(&format!(
+                "Fetching downloads for: {}",
+                super::tty::ident(&cask.token)
+            ))
+        );
+    }
     if git_plan.is_none() {
         let expected = cask.sha256.as_deref().unwrap_or("no_check");
         let reusable = cask.sha256.is_some() && fetch::verify_sha256(&dest, expected).is_ok();
         if !reusable {
-            eprintln!("==> Fetching cask {} ({})", cask.token, cask.version);
             fetch::curl_to_file(&cask.url, &dest, &[])?;
         }
         fetch::verify_sha256(&dest, expected)?;
-    } else {
-        eprintln!("==> Fetching cask {} ({})", cask.token, cask.version);
+        eprintln!("✔︎ Cask {} ({})", cask.token, cask.version);
     }
     let work =
         aterm_tempfile::TempDir::new_in(prefix.caskroom()).map_err(|e| format!("abrew: {e}"))?;
@@ -433,6 +444,7 @@ fn install_inner(
         for (source, cached) in fetch_git_raw(prefix, cask, plan)? {
             fetch::copy_regular(&cached, &payload.join(&source))?;
         }
+        eprintln!("✔︎ Cask {} ({})", cask.token, cask.version);
     } else if naked {
         std::fs::create_dir_all(&payload).map_err(|e| format!("abrew: {e}"))?;
         let cached_name = dest
@@ -494,7 +506,13 @@ fn install_inner(
         }
         extract_nested_tars(&payload, &artifacts, &cask.token)?;
     }
-    println!("==> Installing Cask {}", cask.token);
+    println!(
+        "{}",
+        super::tty::oh1(&format!(
+            "Installing Cask {}",
+            super::tty::ident(&cask.token)
+        ))
+    );
     stage_wrappers(prefix, cask, &payload, &staged)?;
     for (relative, _, app, exec) in &artifacts {
         let src = payload.join(relative);
@@ -538,12 +556,17 @@ fn install_inner(
     } else {
         "false"
     };
+    let installed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .to_string();
     let mut receipt_fields: Vec<(&str, &str)> = vec![
         ("token", &cask.token),
         ("version", &cask.version),
         ("installed_by", "abrew"),
         ("installed_on_request", on_request_word),
         ("full_name", &cask.token),
+        ("time", &installed_at),
     ];
     for (k, v) in &artifact_fields {
         receipt_fields.push((k, v));
@@ -1380,9 +1403,19 @@ fn artifact_paths(
 }
 
 /// Remove links into receipt-admitted versions and only those payloads.
-pub fn uninstall(prefix: &Prefix, token: &str, dry_run: bool) -> Result<(), InstallError> {
+/// When the cask definition is known, its `uninstall` stanza's
+/// file-only directives run in brew's order: `trash:` before the
+/// artifacts come out, `rmdir:` deferred until after. Other
+/// directives (quit, launchctl, pkgutil, script, sudo-bound
+/// delete) are not run natively.
+pub fn uninstall(
+    prefix: &Prefix,
+    token: &str,
+    dry_run: bool,
+    cask: Option<&super::formula::Cask>,
+) -> Result<(), InstallError> {
     let directories = artifact_directories(prefix, PathBuf::from("/Applications"))?;
-    uninstall_from(prefix, token, dry_run, &directories)
+    uninstall_from(prefix, token, dry_run, &directories, cask)
 }
 
 /// Legacy unrecorded artifacts used these roots.
@@ -1460,15 +1493,367 @@ fn artifact_directories(
     Ok(directories)
 }
 
+/// Segments match with fnmatch rules (`*`, `?`, `[...]`), the
+/// subset brew's zap path globs use. A leading dot only matches
+/// when the pattern itself starts with one (no FNM_DOTMATCH).
+fn segment_matches(pattern: &str, name: &str) -> bool {
+    if name.starts_with('.') && !pattern.starts_with('.') {
+        return false;
+    }
+    fn inner(p: &[u8], s: &[u8]) -> bool {
+        if p.is_empty() {
+            return s.is_empty();
+        }
+        match p[0] {
+            b'*' => (0..=s.len()).any(|i| inner(&p[1..], &s[i..])),
+            b'?' => !s.is_empty() && inner(&p[1..], &s[1..]),
+            b'[' => {
+                if s.is_empty() {
+                    return false;
+                }
+                let (negate, mut i) = if p.get(1) == Some(&b'!') || p.get(1) == Some(&b'^') {
+                    (true, 2)
+                } else {
+                    (false, 1)
+                };
+                let mut hit = false;
+                while i < p.len() && p[i] != b']' {
+                    if i + 2 < p.len() && p[i + 1] == b'-' && p[i + 2] != b']' {
+                        if (p[i]..=p[i + 2]).contains(&s[0]) {
+                            hit = true;
+                        }
+                        i += 3;
+                    } else {
+                        if p[i] == s[0] {
+                            hit = true;
+                        }
+                        i += 1;
+                    }
+                }
+                if i >= p.len() {
+                    return false;
+                }
+                (hit != negate) && inner(&p[i + 1..], &s[1..])
+            }
+            c => s.first() == Some(&c) && inner(&p[1..], &s[1..]),
+        }
+    }
+    inner(pattern.as_bytes(), name.as_bytes())
+}
+
+fn glob_walk(base: &Path, segments: &[&str], out: &mut Vec<PathBuf>) {
+    let Some((first, rest)) = segments.split_first() else {
+        if base.symlink_metadata().is_ok() {
+            out.push(base.to_path_buf());
+        }
+        return;
+    };
+    if first.contains(['*', '?', '[']) {
+        if let Ok(entries) = std::fs::read_dir(base) {
+            let mut names: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| segment_matches(first, &n.to_string_lossy()))
+                })
+                .collect();
+            names.sort();
+            for path in names {
+                glob_walk(&path, rest, out);
+            }
+        }
+    } else {
+        glob_walk(&base.join(first), rest, out);
+    }
+}
+
+/// Brew's `each_resolved_path`: expand `~`, refuse relative or
+/// dot-segment paths and undeletable ones with a warning, glob
+/// the rest. Yields (stanza path, existing resolved paths).
+/// The API placeholders `$APPDIR` and `$HOMEBREW_PREFIX` are
+/// substituted first, as brew's API loader substitutes them.
+fn resolve_stanza_paths(
+    prefix: &Prefix,
+    action: &str,
+    paths: &[String],
+) -> Vec<(String, Vec<PathBuf>)> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut out: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    for raw in paths {
+        let display = expand_stanza_placeholders(prefix, raw);
+        let shown = display.as_deref().unwrap_or(raw);
+        let expanded: PathBuf = if shown == "~" {
+            home.clone().unwrap_or_default()
+        } else if let Some(rest) = shown.strip_prefix("~/") {
+            home.clone().unwrap_or_default().join(rest)
+        } else {
+            PathBuf::from(shown)
+        };
+        if expanded.as_os_str().is_empty() || expanded.is_relative() {
+            super::tty::opoo!("Warning: Skipping `{action}` for relative path '{shown}'.");
+            continue;
+        }
+        let text = expanded.to_string_lossy();
+        if text.split('/').any(|segment| matches!(segment, "." | "..")) {
+            super::tty::opoo!(
+                "Warning: Skipping `{action}` for path with relative segments '{shown}'."
+            );
+            continue;
+        }
+        let mut resolved = Vec::new();
+        for variant in brace_expand(&text) {
+            let segments: Vec<&str> = variant.split('/').filter(|s| !s.is_empty()).collect();
+            glob_walk(Path::new("/"), &segments, &mut resolved);
+        }
+        resolved.sort();
+        resolved.dedup();
+        resolved.retain(|target| {
+            let parent_ok = target
+                .parent()
+                .is_some_and(crate::platform::dir_writable_by_caller);
+            if !parent_ok {
+                super::tty::opoo!(
+                    "Warning: Skipping `{action}` for undeletable path '{}'.",
+                    target.display()
+                );
+            }
+            parent_ok
+        });
+        out.push((shown.to_string(), resolved));
+    }
+    out
+}
+
+/// Ruby `Dir.glob` brace expansion: `{a,b}` alternatives,
+/// nestable, at any point in the path. A group without a
+/// top-level comma expands to its sole contents, as in Ruby.
+fn brace_expand(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut commas: Vec<usize> = Vec::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                    commas.clear();
+                }
+                depth += 1;
+            }
+            b',' if depth == 1 => commas.push(i),
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let open = start.expect("brace group start");
+                    let mut alts = Vec::new();
+                    let mut prev = open + 1;
+                    for &comma in commas.iter().chain([i].iter()) {
+                        alts.push(&text[prev..comma]);
+                        prev = comma + 1;
+                    }
+                    let mut out = Vec::new();
+                    for alt in alts {
+                        out.extend(brace_expand(&format!(
+                            "{}{}{}",
+                            &text[..open],
+                            alt,
+                            &text[i + 1..]
+                        )));
+                    }
+                    return out;
+                }
+            }
+            _ => {}
+        }
+    }
+    vec![text.to_string()]
+}
+
+/// Substitute the API path placeholders in one stanza path.
+/// Returns `None` when the path carries no placeholder.
+fn expand_stanza_placeholders(prefix: &Prefix, raw: &str) -> Option<String> {
+    for (placeholder, base) in [
+        ("$APPDIR", prefix.applications()),
+        ("$HOMEBREW_PREFIX", prefix.root.clone()),
+    ] {
+        if raw == placeholder {
+            return Some(base.display().to_string());
+        }
+        if let Some(rest) = raw
+            .strip_prefix(placeholder)
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
+            return Some(format!("{}/{rest}", base.display()));
+        }
+    }
+    None
+}
+
+/// One `trash:` block, moved with `/usr/bin/trash` (the same
+/// Foundation trashing brew's Mac impl performs).
+fn zap_trash(prefix: &Prefix, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    let resolved = resolve_stanza_paths(prefix, "trash", paths);
+    println!("{}", super::tty::ohai("Trashing files:"));
+    for (raw, _) in &resolved {
+        println!("{raw}");
+    }
+    let existing: Vec<PathBuf> = resolved.into_iter().flat_map(|(_, paths)| paths).collect();
+    if existing.is_empty() {
+        return;
+    }
+    let args: Vec<String> = existing
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let code = fetch::run_inherit("/usr/bin/trash", &arg_refs);
+    if code != 0 {
+        super::tty::opoo!(
+            "Warning: The following files could not be trashed, please do so manually:"
+        );
+        for path in &existing {
+            if path.symlink_metadata().is_ok() {
+                eprintln!("{}", path.display());
+            }
+        }
+    }
+}
+
+/// Brew's `recursive_rmdir`: remove directories holding only
+/// directories and `.DS_Store` files, bottom-up.
+fn zap_rmdir(prefix: &Prefix, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    println!("{}", super::tty::ohai("Removing directories if empty:"));
+    fn recursive(path: &Path, home: &Path) -> bool {
+        let shown = path.strip_prefix(home).map_or_else(
+            |_| path.display().to_string(),
+            |rel| format!("~/{}", rel.display()),
+        );
+        println!("{shown}");
+        if path.is_symlink() || !path.is_dir() {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return false;
+        };
+        let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        children.sort();
+        if !children.iter().all(|child| {
+            child.is_dir() && !child.is_symlink()
+                || child.file_name().is_some_and(|n| n == ".DS_Store")
+        }) {
+            return false;
+        }
+        if let Some(ds) = children
+            .iter()
+            .position(|child| child.file_name().is_some_and(|n| n == ".DS_Store"))
+        {
+            let ds = children.remove(ds);
+            if std::fs::remove_file(&ds).is_err() {
+                return false;
+            }
+        }
+        if !children.iter().all(|child| recursive(child, home)) {
+            return false;
+        }
+        std::fs::remove_dir(path).is_ok()
+    }
+    let home = std::env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
+    for (_, resolved) in resolve_stanza_paths(prefix, "rmdir", paths) {
+        if resolved.iter().all(|p| p.is_dir()) {
+            for dir in &resolved {
+                recursive(dir, &home);
+            }
+        }
+    }
+}
+
+/// `brew zap` / `uninstall --zap` for the file-only stanza
+/// subset (99% of zaps): trash and rmdir. Any other directive in
+/// either stanza — quit, launchctl, pkgutil, script, sudo-bound
+/// delete — delegates before any effect.
+pub fn zap(
+    prefix: &Prefix,
+    token: &str,
+    cask: &super::formula::Cask,
+    dry_run: bool,
+    force: bool,
+) -> Result<(), InstallError> {
+    if cask.zap_unsupported || !cask.zap_delete.is_empty() || cask.uninstall_unsupported {
+        return Err(InstallError::Unsupported(format!(
+            "zap for {token} uses directives abrew does not run natively"
+        )));
+    }
+    let inst = prefix.installed_one(Kind::Cask, token);
+    if inst.is_none() && !force {
+        return Err(InstallError::Failed(format!(
+            "Error: Cask '{token}' is not installed."
+        )));
+    }
+    if dry_run {
+        println!("Would uninstall cask {token}");
+        return Ok(());
+    }
+    // Brew's order: non-deferred directives (trash) run before the
+    // artifacts come out; rmdir is deferred until after.
+    let plan = match &inst {
+        Some(inst) => {
+            let directories = artifact_directories(prefix, PathBuf::from("/Applications"))?;
+            Some(UninstallPlan::prepare(
+                prefix,
+                token,
+                &inst.versions,
+                &directories,
+            )?)
+        }
+        None => None,
+    };
+    println!(
+        "{}",
+        super::tty::oh1(&format!("Zapping Cask {}", super::tty::ident(token)))
+    );
+    if !cask.zap_present {
+        super::tty::opoo!("Warning: No zap stanza present for Cask '{token}'");
+    }
+    zap_trash(prefix, &cask.uninstall_trash);
+    zap_trash(prefix, &cask.zap_trash);
+    if let Some(plan) = plan {
+        for link in plan.links.keys() {
+            let (label, linked) = destination_label(prefix, link);
+            println!(
+                "==> {} {label} '{}'",
+                if linked { "Unlinking" } else { "Removing" },
+                link.display()
+            );
+        }
+        plan.apply(prefix)?;
+    }
+    zap_rmdir(prefix, &cask.uninstall_rmdir);
+    zap_rmdir(prefix, &cask.zap_rmdir);
+    println!(
+        "{}",
+        super::tty::ohai(&format!("Removing all staged versions of Cask '{token}'"))
+    );
+    Ok(())
+}
+
 fn uninstall_from(
     prefix: &Prefix,
     token: &str,
     dry_run: bool,
     directories: &[PathBuf],
+    cask: Option<&super::formula::Cask>,
 ) -> Result<(), InstallError> {
     let Some(inst) = prefix.installed_one(Kind::Cask, token) else {
         return Err(InstallError::Failed(format!(
-            "abrew: cask {token} is not installed"
+            "Error: Cask '{token}' is not installed."
         )));
     };
     if dry_run {
@@ -1476,16 +1861,47 @@ fn uninstall_from(
         return Ok(());
     }
     let plan = UninstallPlan::prepare(prefix, token, &inst.versions, directories)?;
-    println!("==> Uninstalling Cask {token}");
-    for link in plan.links.keys() {
+    println!(
+        "{}",
+        super::tty::oh1(&format!("Uninstalling Cask {}", super::tty::ident(token)))
+    );
+    if let Some(cask) = cask {
+        zap_trash(prefix, &cask.uninstall_trash);
+    }
+    for (link, (target, _)) in &plan.links {
         let (label, linked) = destination_label(prefix, link);
+        if !linked {
+            // Brew copies a moved artifact back into its staged
+            // path before removing it; the payload never leaves the
+            // Caskroom in abrew's symlink model, so the staged path
+            // the link already points at is that destination.
+            let joined = if target.is_absolute() {
+                target.clone()
+            } else {
+                link.parent()
+                    .map_or_else(|| target.clone(), |p| p.join(target))
+            };
+            let source = std::fs::canonicalize(&joined).unwrap_or(joined);
+            let base = link
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            println!("==> Backing up {label} '{base}' to '{}'", source.display());
+        }
         println!(
             "==> {} {label} '{}'",
             if linked { "Unlinking" } else { "Removing" },
             link.display()
         );
     }
-    plan.apply(prefix)
+    for version in &inst.versions {
+        println!("==> Purging files for version {version} of Cask {token}");
+    }
+    plan.apply(prefix)?;
+    if let Some(cask) = cask {
+        zap_rmdir(prefix, &cask.uninstall_rmdir);
+    }
+    Ok(())
 }
 
 struct UninstallPlan {
@@ -1690,6 +2106,105 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::extract::fixtures::{ZipMember, tar_bytes, zip_bytes};
+
+    #[test]
+    fn zap_gates_and_glob_match_like_brew() {
+        assert!(segment_matches("com.example.*", "com.example.app"));
+        assert!(segment_matches("*.plist", "x.plist"));
+        assert!(!segment_matches("*.plist", ".hidden.plist"));
+        assert!(segment_matches(".hidden*", ".hidden.plist"));
+        assert!(segment_matches("firefo?", "firefox"));
+        assert!(segment_matches("[a-c]pp", "app"));
+        assert!(!segment_matches("[!a-c]pp", "app"));
+        assert_eq!(
+            brace_expand("/x/olivevideoeditor.org{/Olive,}"),
+            ["/x/olivevideoeditor.org/Olive", "/x/olivevideoeditor.org"]
+        );
+        assert_eq!(
+            brace_expand("/Adobe{/CEP{/extensions,},}"),
+            ["/Adobe/CEP/extensions", "/Adobe/CEP", "/Adobe"]
+        );
+        assert_eq!(brace_expand("/literal{a}"), ["/literala"]);
+        assert_eq!(brace_expand("/plain/path"), ["/plain/path"]);
+
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(tmp.path());
+        let mut cask = Cask {
+            token: "demo".to_string(),
+            zap_present: true,
+            zap_trash: vec!["~/Library/Caches/demo".to_string()],
+            ..Cask::default()
+        };
+        // Not installed: failed, not a delegate.
+        assert!(matches!(
+            zap(&prefix, "demo", &cask, false, false),
+            Err(InstallError::Failed(_))
+        ));
+        // A sudo-bound delete directive delegates before effects,
+        // even before the installed check can matter.
+        cask.zap_delete = vec!["/Library/demo".to_string()];
+        assert!(matches!(
+            zap(&prefix, "demo", &cask, false, false),
+            Err(InstallError::Unsupported(_))
+        ));
+        cask.zap_delete.clear();
+        cask.uninstall_unsupported = true;
+        assert!(matches!(
+            zap(&prefix, "demo", &cask, false, false),
+            Err(InstallError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn uninstall_runs_stanza_trash_and_deferred_rmdir() {
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        let payload = prefix.cask_dir("demo", "1");
+        std::fs::create_dir_all(&payload).unwrap();
+        std::fs::write(payload.join("tool"), b"owned payload").unwrap();
+        prefix
+            .write_receipt(
+                &payload,
+                &[
+                    ("token", "demo"),
+                    ("version", "1"),
+                    ("installed_by", "abrew"),
+                ],
+            )
+            .unwrap();
+        // Deferred rmdir target: only a .DS_Store inside.
+        let leftover = tmp.path().join("leftover");
+        std::fs::create_dir(&leftover).unwrap();
+        std::fs::write(leftover.join(".DS_Store"), b"junk").unwrap();
+        // The API `$APPDIR` placeholder resolves into the prefix.
+        let app_leftover = prefix.applications().join("demo-support");
+        std::fs::create_dir(&app_leftover).unwrap();
+        let cask = Cask {
+            token: "demo".to_string(),
+            uninstall_trash: vec![tmp.path().join("absent-trash-target").display().to_string()],
+            uninstall_rmdir: vec![
+                leftover.display().to_string(),
+                "$APPDIR/demo-support".to_string(),
+            ],
+            ..Cask::default()
+        };
+        let directories = [prefix.applications(), prefix.bin()];
+        // Dry run: nothing is touched.
+        uninstall_from(&prefix, "demo", true, &directories, Some(&cask)).unwrap();
+        assert!(payload.exists());
+        assert!(leftover.is_dir());
+        uninstall_from(&prefix, "demo", false, &directories, Some(&cask)).unwrap();
+        assert!(!payload.exists());
+        assert!(
+            !leftover.exists(),
+            "deferred rmdir must remove {leftover:?}"
+        );
+        assert!(
+            !app_leftover.exists(),
+            "$APPDIR rmdir must remove {app_leftover:?}"
+        );
+    }
 
     #[test]
     fn generic_targets_map_only_into_the_prefix() {
@@ -1914,7 +2429,7 @@ mod tests {
         std::fs::write(unknown.join("notes"), b"keep").unwrap();
         super::super::prefix::symlink_file(&unknown.join("notes"), &prefix.bin().join("personal"))
             .unwrap();
-        uninstall(&prefix, "demo", false).unwrap();
+        uninstall(&prefix, "demo", false, None).unwrap();
         assert!(!prefix.cask_dir("demo", "1").exists());
         assert!(std::fs::symlink_metadata(prefix.bin().join("tool")).is_err());
         assert!(std::fs::symlink_metadata(prefix.applications().join("Demo.app")).is_err());
@@ -2042,7 +2557,7 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(prefix.caskroom().join(".abrew-reinstall-demo-2")).is_err()
         );
-        uninstall(&prefix, "demo", false).unwrap();
+        uninstall(&prefix, "demo", false, None).unwrap();
         std::fs::write(&download, b"#!/bin/sh\nprintf 'dep ready\\n'\n").unwrap();
         c.version = "1".to_string();
         assert_eq!(
@@ -2064,7 +2579,7 @@ mod tests {
             Some("false"),
             "upgrade preserves intent"
         );
-        uninstall(&prefix, "demo", false).unwrap();
+        uninstall(&prefix, "demo", false, None).unwrap();
         assert!(std::fs::symlink_metadata(prefix.bin().join("staged-name")).is_err());
     }
 
@@ -2873,7 +3388,7 @@ mod tests {
         assert_eq!(std::fs::read(&artifact).unwrap(), b"owned payload");
         std::fs::remove_file(&man).unwrap();
         let directories = [prefix.applications(), prefix.bin(), local_applications];
-        assert!(uninstall_from(&prefix, "demo", false, &directories).is_err());
+        assert!(uninstall_from(&prefix, "demo", false, &directories, None).is_err());
         assert_eq!(std::fs::read(&artifact).unwrap(), b"owned payload");
         assert_eq!(
             std::fs::read_link(&external_link).unwrap(),
@@ -2887,14 +3402,14 @@ mod tests {
         assert!(payload.join("INSTALL_RECEIPT.json").is_file());
         std::fs::remove_file(prefix.bin()).unwrap();
         std::fs::write(prefix.bin(), b"foreign root file").unwrap();
-        assert!(uninstall_from(&prefix, "demo", false, &directories).is_err());
+        assert!(uninstall_from(&prefix, "demo", false, &directories, None).is_err());
         assert_eq!(std::fs::read(&artifact).unwrap(), b"owned payload");
         assert_eq!(std::fs::read(prefix.bin()).unwrap(), b"foreign root file");
         std::fs::remove_file(prefix.bin()).unwrap();
         std::fs::create_dir(prefix.bin()).unwrap();
         let foreign = prefix.bin().join("foreign");
         super::super::prefix::symlink_file(&outside.join("marker"), &foreign).unwrap();
-        uninstall_from(&prefix, "demo", false, &directories).unwrap();
+        uninstall_from(&prefix, "demo", false, &directories, None).unwrap();
         assert!(std::fs::symlink_metadata(&artifact).is_err());
         assert!(!payload.exists());
         assert_eq!(

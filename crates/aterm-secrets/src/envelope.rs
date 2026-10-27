@@ -125,9 +125,18 @@ impl Retired {
     /// Whether a vault signed by `signer`, reached through `followed` (oldest first), is the ALab
     /// vault this build trusts: `signer` or a key before it is one this build names, and the pin
     /// does not give way ([`Retired::gives_way`]).
+    #[cfg(unix)]
     pub(crate) fn names(&self, signer: &[u8; 32], followed: &[[u8; 32]]) -> bool {
-        (self.knows(signer) || followed.iter().any(|key| self.knows(key)))
-            && !self.gives_way(signer, followed)
+        self.lineage(signer, followed) && !self.gives_way(signer, followed)
+    }
+
+    /// Whether `signer`, reached through `followed`, is of the ALab vault's line: it or a key
+    /// before it is one this build names, whether or not the pin gives way. A server judges its
+    /// store by this, since a version a retired key signed still waits there for the one that
+    /// replaces it.
+    #[cfg(unix)]
+    pub(crate) fn lineage(&self, signer: &[u8; 32], followed: &[[u8; 32]]) -> bool {
+        self.knows(signer) || followed.iter().any(|key| self.knows(key))
     }
 
     /// Whether a pin reached through `followed` (the keys before it, oldest first: the handoff chain of the version that moved the pin there) gives way to [`Retired::current`]: the pin is retired, or a retired key in that lineage endorsed a key this build does not know.

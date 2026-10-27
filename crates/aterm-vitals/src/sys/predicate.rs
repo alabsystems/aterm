@@ -935,10 +935,14 @@ fn tab_sum(
 fn read(metric: &Metric, s: &Snapshot, tab_keys: &[u64], cores_want: bool) -> Reading {
     match metric {
         Metric::Cpu => match s.cpu.as_ref() {
-            Some(c) if cores_want => Reading::Num(f64::from(c.busy.raw.max(0.0))),
-            Some(c) => {
-                Reading::Num(f64::from(c.busy.raw.max(0.0)) / (c.total().max(1) as f64) * 100.0)
-            }
+            Some(c) => c.current_busy().map_or(Reading::Warming, |busy| {
+                let busy = f64::from(busy.max(0.0));
+                Reading::Num(if cores_want {
+                    busy
+                } else {
+                    busy / c.total().max(1) as f64 * 100.0
+                })
+            }),
             None => Reading::Warming,
         },
         Metric::CpuLevel { index, label } => {
@@ -952,10 +956,11 @@ fn read(metric: &Metric, s: &Snapshot, tab_keys: &[u64], cores_want: bool) -> Re
                 }),
             };
             match found {
-                Some(c) if !c.cores.is_empty() => {
-                    let busy: f32 = c.cores.iter().map(|&i| cpu.cores[i].load.raw).sum();
-                    Reading::Num(f64::from(busy.max(0.0)) / c.cores.len() as f64 * 100.0)
-                }
+                Some(c) if !c.cores.is_empty() => cpu
+                    .current_cluster_busy(c)
+                    .map_or(Reading::Warming, |busy| {
+                        Reading::Num(f64::from(busy.max(0.0)) / c.cores.len() as f64 * 100.0)
+                    }),
                 _ => Reading::Unavailable("unsupported"),
             }
         }
@@ -1405,6 +1410,7 @@ mod tests {
         let cores: Vec<CoreView> = (0..10)
             .map(|_| CoreView {
                 load: TrendView::flat(busy_per_core),
+                measured: true,
             })
             .collect();
         Snapshot {
@@ -1987,6 +1993,20 @@ mod tests {
     }
 
     #[test]
+    fn scheduling_unmeasured_cpu_keeps_quiet_pending_without_skipping_cpu() {
+        let mut s = snap(0.0);
+        assert!(evaluate(&machine("sys quiet"), &s, &[7]).holds);
+        s.cpu.as_mut().unwrap().cores[0].measured = false;
+        for text in ["sys quiet", "sys cpu<25%", "sys cpu.l0<25%"] {
+            let result = evaluate(&machine(text), &s, &[7]);
+            assert!(!result.holds, "{text}: {result:?}");
+            assert!(result.refused.is_none(), "{text}: {result:?}");
+            assert!(!result.skipped.iter().any(|s| s.starts_with("cpu")));
+        }
+        assert!(evaluate(&machine("sys cpu.l1<25%"), &s, &[7]).holds);
+    }
+
+    #[test]
     fn for_holds_over_consecutive_snapshots_by_their_stamps() {
         let mut l = Latch::default();
         let s = 1_000_000_000u64;
@@ -2025,7 +2045,13 @@ mod tests {
         Snapshot {
             at_ns: 5_000_000_000,
             cpu: Some(CpuView {
-                cores: vec![CoreView::default(); cores],
+                cores: vec![
+                    CoreView {
+                        measured: true,
+                        ..Default::default()
+                    };
+                    cores
+                ],
                 ..CpuView::default()
             }),
             load,

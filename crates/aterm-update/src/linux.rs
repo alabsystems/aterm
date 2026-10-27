@@ -480,8 +480,7 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
 }
 
 fn sync_dir(path: &Path) -> Result<(), String> {
-    crate::durable::sync_dir(path, aterm_durable::Flush::Durable)
-        .map_err(|e| format!("sync {}: {e}", path.display()))
+    aterm_durable::durable_dir(path).map_err(|e| format!("sync {}: {e}", path.display()))
 }
 
 /// Ordered directory sync ([`aterm_durable::ordered_dir`]).

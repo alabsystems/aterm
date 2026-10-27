@@ -60,7 +60,7 @@ fn exercise(provider: i64, shape: i64, fault: i64) -> [bool; 4] {
                 SyncTarget {
                     path: &path,
                     before: (shape > 0).then_some(raw),
-                    after: &populated,
+                    after: Some(&populated),
                     mode: None,
                 },
                 |state, logins| Ok(note_login_end(state, logins, "main", NOW)),
@@ -257,7 +257,7 @@ fn only_the_supplied_roster_target_can_complete_its_pending_report() {
             SyncTarget {
                 path: &path,
                 before: None,
-                after: &target,
+                after: Some(&target),
                 mode: None,
             },
             |state, logins| Ok(note_login_end(state, logins, "main", NOW)),

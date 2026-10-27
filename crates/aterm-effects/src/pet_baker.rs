@@ -86,6 +86,7 @@ const fn zoom_about(xform: PathTransform, cx: f32, cy: f32, kx: f32, ky: f32) ->
 /// are fractions of the grown footprint, so far and near eyes each get a glint that fits; the
 /// primary at `(-0.22w, -0.23h)` with radius ≤ `0.13·min(w,h)` stays inside an elliptical eye
 /// (normalized distance ≈0.64 plus radius ≤0.26), so no white fleck leaks onto the coat.
+#[inline]
 fn paint_eye_reflections(tile: &mut Tile, eye_mask: &Tile, cx: f32, cy: f32, w: f32, h: f32) {
     let minor = w.min(h);
     if minor < EYE_REFLECTION_MIN_PX {
@@ -131,6 +132,7 @@ struct PetEyeMeta {
 }
 
 impl PetEyeMeta {
+    #[inline]
     const fn from_layers(layers: &'static [Layer]) -> Self {
         let mut eye_layer: Option<&'static Layer> = None;
         let mut i = 0;
@@ -209,6 +211,7 @@ static PET_EYE_META: [PetEyeMeta; PET_GLYPHS.len()] = {
 /// grown about its centre ([`zoom_about`]) toward [`EYE_DOT_TARGET_H_PX`] (open, capped at
 /// [`EYE_DOT_SCALE_MAX`]) or [`EYE_DOT_TARGET_H_PX_ARC`] (shallow, capped at
 /// [`EYE_DOT_SCALE_MAX_SHALLOW`] and [`EYE_DOT_ARC_KX_MAX`] wide).
+#[inline]
 fn paint_eye_dots(
     tile: &mut Tile,
     eye_meta: &PetEyeMeta,
@@ -419,6 +422,7 @@ pub fn bake_pose(pose: PetGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Til
     bake_pose_with_reflections(pose, fills, w, h, true)
 }
 
+#[inline]
 fn bake_pose_with_reflections(
     pose: PetGlyphId,
     fills: &ResolvedFills,
@@ -431,6 +435,7 @@ fn bake_pose_with_reflections(
     tile
 }
 
+#[inline]
 fn paint_pose_onto(
     tile: &mut Tile,
     pose: PetGlyphId,
@@ -642,6 +647,7 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
     }
 
     /// Look `key` up, baking on a miss when the per-frame budget allows.
+    #[inline]
     pub fn tile(&mut self, key: &K) -> Option<&[u8]> {
         let (w, h) = key.size();
         if w == 0 || h == 0 {
@@ -697,6 +703,7 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
 
     /// Drop the least-recently-used slot, lowest index breaking ties, so eviction is a
     /// deterministic function of the request sequence.
+    #[inline]
     fn evict_lru(&mut self) -> Option<Tile> {
         let slots = self.slots.as_slice();
         if slots.is_empty() {

@@ -54,9 +54,11 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
             workstation,
         )
         .and_then(|prepared| prepared.run_tagged(&sys, Mode::Plan));
-        let held = state_root()
-            .ok()
-            .map_or_else(Selection::none, |root| held_at_login(&root));
+        let root = state_root().ok();
+        let held = root.as_deref().map_or_else(Selection::none, held_at_login);
+        let changed_by_you = root
+            .as_deref()
+            .map_or_else(Selection::none, super::kept::changed_by_you_at);
         for setting in Setting::ALL {
             if !workstation.contains(setting) {
                 continue;
@@ -68,7 +70,10 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
                         .filter(|(tag, _)| *tag == setting)
                         .map(|(_, row)| row)
                         .collect();
-                    workstation_observation(setting, &rows, held)
+                    changed_by_you_note(
+                        workstation_observation(setting, &rows, held),
+                        changed_by_you.contains(setting),
+                    )
                 }
                 Err(why) => unread(Subject::Setting(setting), why),
             });
@@ -114,6 +119,7 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
         .filter_map(|subject| match subject {
             Subject::Access(access) => Some(*access),
             Subject::Setting(_) => None,
+            Subject::Sync(_) => None,
         })
         .collect();
     if !access.is_empty() {
@@ -161,6 +167,20 @@ fn at_login(observation: Observation, held: bool) -> Observation {
     }
 }
 
+/// A row whose key the person changed after aterm set it and read it back
+/// ([`super::kept`]) reads [`aterm_types::macos_setup::CHANGED_BY_YOU`] while it still differs:
+/// no automatic pass sets it again, so the page says whose value it is rather than that it will
+/// change. Any other reading is kept.
+fn changed_by_you_note(observation: Observation, kept: bool) -> Observation {
+    if !kept || observation.standing != Standing::Differs {
+        return observation;
+    }
+    Observation {
+        note: Some(aterm_types::macos_setup::CHANGED_BY_YOU.to_owned()),
+        ..observation
+    }
+}
+
 /// What the Secrets vault row reads, from the local records alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum VaultRead {
@@ -168,11 +188,13 @@ enum VaultRead {
     Unconfigured,
     /// Another vault, or another signer, than the plan names.
     OtherVault,
-    /// Asked to join; an admin Mac has not approved it yet (its code, if known).
+    /// Asked to join; an admin Mac has not approved it yet: `approve` is the command that
+    /// lets it in, when this Mac has a key ([`client::Status::approve_command`]: its code, or at
+    /// a path, which has no queue, its key and name).
     /// `with_password` when a join password went with the request
     /// (`client::asked_with_password`): only then can a mistyped one be why it waits.
     Pending {
-        code: Option<String>,
+        approve: Option<String>,
         with_password: bool,
     },
     /// Asked to join with a join password an admin Mac refused
@@ -182,7 +204,7 @@ enum VaultRead {
     /// Asked to join, and the person turned sync off since
     /// ([`aterm_secrets::service::subscriber_off_path`]), so the subscriber that finishes an
     /// approved join does not run. It reads Sync off in place, as [`Self::TurnedOff`] does.
-    PendingOff { code: Option<String> },
+    PendingOff { approve: Option<String> },
     /// A member whose subscriber runs; `synced` once every file is written.
     Member { synced: bool },
     /// A member whose subscriber, the process that keeps `~/.secrets` in sync, is installed but
@@ -198,8 +220,9 @@ enum VaultRead {
     /// state (design §4), which setup leaves be.
     TurnedOff,
     /// A member whose subscriber is not running and is never installed from here: this aterm runs
-    /// from a copy that goes away (a disk image, an App Translocation copy), which a launchd job
-    /// must not name (`aterm_secrets::service::transient`). Only a person moves aterm.
+    /// from a copy that goes away (a disk image, an App Translocation copy, a temporary or cache
+    /// directory), which a launchd job must not name (`aterm_secrets::service::transient`). Only a
+    /// person moves aterm.
     Fleeting,
     /// The vault dropped this Mac.
     Revoked,
@@ -303,10 +326,10 @@ fn vault(plan: &Plan) -> Result<Observation, String> {
         (None, _) => VaultRead::OtherVault,
         (Some(_), Membership::Pending) if client::password_refused(&paths) => VaultRead::Refused,
         (Some(_), Membership::Pending) if sync_turned_off(&paths.home) => VaultRead::PendingOff {
-            code: status.machine.as_ref().map(|(_, code)| code.to_string()),
+            approve: status.approve_command(),
         },
         (Some(_), Membership::Pending) => VaultRead::Pending {
-            code: status.machine.as_ref().map(|(_, code)| code.to_string()),
+            approve: status.approve_command(),
             with_password: client::asked_with_password(&paths),
         },
         (Some(_), Membership::Revoked { .. }) => VaultRead::Revoked,
@@ -323,7 +346,7 @@ fn vault(plan: &Plan) -> Result<Observation, String> {
     // no word about this network from that probe.
     let here = (plan.vault_url == aterm_types::macos_setup::DEFAULT_VAULT_URL)
         .then(scope::vault_here)
-        .and_then(scope::VaultHere::note);
+        .and_then(|here| here.note_for(super::access::last_answer()));
     Ok(vault_observation(
         &read,
         plan.selection.contains(Setting::Secrets),
@@ -388,9 +411,9 @@ const APPROVAL: &str = "Waits for an admin Mac to approve this Mac";
 /// nothing, and Join with it retyped under the row's disclosure sends a new proof.
 const RETYPE: &str = "or retype the join password";
 
-/// What a pending join's approval code is written into on an admin Mac: the command that
-/// approves exactly that Mac (`aterm secrets approve <code>`).
-const APPROVE: &str = "On an admin Mac: aterm secrets approve";
+/// What heads the command that approves exactly a pending Mac on an admin Mac
+/// (`aterm secrets approve <code>`, or `<age1…> --name <host>` at a path).
+const APPROVE: &str = "On an admin Mac:";
 
 /// The value of a join an admin Mac refused for its join password: its fields open to take it
 /// again (no note, so `vault_shown` opens them).
@@ -425,12 +448,12 @@ fn vault_observation(read: &VaultRead, managed: bool, here: Option<&str>) -> Obs
         ),
         // The person's choice: what the row wants, so no change to make.
         VaultRead::TurnedOff => (Standing::InPlace, SYNC_OFF, Some(TURNED_OFF.to_owned())),
-        VaultRead::PendingOff { code } => (
+        VaultRead::PendingOff { approve } => (
             Standing::InPlace,
             SYNC_OFF,
-            Some(match code {
-                Some(code) => format!(
-                    "You turned sync off; once it's on, approving {code} on an admin Mac finishes the join"
+            Some(match approve {
+                Some(approve) => format!(
+                    "You turned sync off; once it's on, {approve} on an admin Mac finishes the join"
                 ),
                 None => PENDING_OFF.to_owned(),
             }),
@@ -438,19 +461,19 @@ fn vault_observation(read: &VaultRead, managed: bool, here: Option<&str>) -> Obs
         // Only a person moves aterm: nothing retries its way out of a disk image.
         VaultRead::Fleeting => (person, "Out of sync", Some(FLEETING.to_owned())),
         VaultRead::Pending {
-            code: Some(code),
+            approve: Some(approve),
             with_password,
         } => (
             person,
             "Awaiting code",
             Some(if *with_password {
-                format!("{APPROVE} {code}, {RETYPE}")
+                format!("{APPROVE} {approve}, {RETYPE}")
             } else {
-                format!("{APPROVE} {code}")
+                format!("{APPROVE} {approve}")
             }),
         ),
         VaultRead::Pending {
-            code: None,
+            approve: None,
             with_password,
         } => (
             Standing::Waiting,
@@ -672,6 +695,30 @@ mod tests {
         assert_eq!(at_login(written.clone(), false), written);
     }
 
+    /// A kept row that still differs reads "Changed by you"; one read in place again, unread, or
+    /// not kept keeps its reading.
+    #[test]
+    fn a_kept_row_that_differs_reads_changed_by_you() {
+        let dock = Subject::Setting(Setting::Dock);
+        let differs = Observation {
+            standing: Standing::Differs,
+            now: Some("Recent apps shown".into()),
+            ..Observation::unknown(dock)
+        };
+        assert_eq!(
+            changed_by_you_note(differs.clone(), true).note.as_deref(),
+            Some(aterm_types::macos_setup::CHANGED_BY_YOU)
+        );
+        assert_eq!(changed_by_you_note(differs.clone(), false), differs);
+        let in_place = Observation {
+            standing: Standing::InPlace,
+            ..differs
+        };
+        assert_eq!(changed_by_you_note(in_place.clone(), true), in_place);
+        let unread = Observation::unknown(dock);
+        assert_eq!(changed_by_you_note(unread.clone(), true), unread);
+    }
+
     /// The Caps Lock key a run set reads in place at once, its live mappings read as wanted:
     /// in effect now, never "at login", though the run's change of its saved mappings is held
     /// for the next login. Trackpad scrolling, whose keys macOS loads only then, keeps it.
@@ -750,7 +797,7 @@ mod tests {
             )
         );
         let pending = |code: Option<&str>, with_password| VaultRead::Pending {
-            code: code.map(str::to_owned),
+            approve: code.map(|code| format!("aterm secrets approve {code}")),
             with_password,
         };
         assert_eq!(
@@ -798,6 +845,20 @@ mod tests {
         assert_eq!(scope::VaultHere::Unreached.note(), Some(scope::NOT_REACHED));
         assert_eq!(scope::VaultHere::Found.note(), None);
         assert_eq!(scope::VaultHere::Unasked.note(), None);
+        // macOS refusing aterm the LAN is named: only the person's Local Network switch moves it.
+        let refused = Some(super::access::LanAnswer::Refused);
+        assert_eq!(
+            scope::VaultHere::Unreached.note_for(refused),
+            Some(scope::LAN_OFF)
+        );
+        assert_eq!(
+            scope::VaultHere::Unreached.note_for(Some(super::access::LanAnswer::Reached)),
+            Some(scope::NOT_REACHED)
+        );
+        assert_eq!(
+            scope::VaultHere::Absent.note_for(refused),
+            Some(scope::NO_VAULT)
+        );
         assert_eq!(
             words(VaultRead::Unconfigured, None),
             (Standing::Differs, "Not joined".into(), None)
@@ -821,7 +882,7 @@ mod tests {
             VaultRead::Stopped,
             VaultRead::NotSetUp,
             VaultRead::TurnedOff,
-            VaultRead::PendingOff { code: None },
+            VaultRead::PendingOff { approve: None },
             VaultRead::Fleeting,
             VaultRead::Refused,
         ] {
@@ -854,19 +915,19 @@ mod tests {
             VaultRead::Unconfigured,
             VaultRead::OtherVault,
             VaultRead::Pending {
-                code: None,
+                approve: None,
                 with_password: false,
             },
             VaultRead::Pending {
-                code: None,
+                approve: None,
                 with_password: true,
             },
             VaultRead::Pending {
-                code: Some("abcd-efgh".into()),
+                approve: Some("aterm secrets approve abcd-efgh".into()),
                 with_password: false,
             },
             VaultRead::Pending {
-                code: Some("abcd-efgh".into()),
+                approve: Some("aterm secrets approve abcd-efgh".into()),
                 with_password: true,
             },
             VaultRead::Member { synced: false },
@@ -874,9 +935,9 @@ mod tests {
             VaultRead::Stopped,
             VaultRead::NotSetUp,
             VaultRead::TurnedOff,
-            VaultRead::PendingOff { code: None },
+            VaultRead::PendingOff { approve: None },
             VaultRead::PendingOff {
-                code: Some("abcd-efgh".into()),
+                approve: Some("aterm secrets approve abcd-efgh".into()),
             },
             VaultRead::Fleeting,
             VaultRead::Revoked,
@@ -913,15 +974,21 @@ mod tests {
     /// an approval lands only once sync is on.
     #[test]
     fn a_pending_join_with_sync_off_reads_sync_off_and_says_what_that_means() {
-        for (code, note) in [
+        for (approve, note) in [
             (None, PENDING_OFF.to_owned()),
             (
-                Some("abcd-efgh".to_owned()),
-                "You turned sync off; once it's on, approving abcd-efgh on an admin Mac finishes the join".to_owned(),
+                Some("aterm secrets approve abcd-efgh".to_owned()),
+                "You turned sync off; once it's on, aterm secrets approve abcd-efgh on an admin Mac finishes the join".to_owned(),
             ),
         ] {
             for managed in [true, false] {
-                let seen = vault_observation(&VaultRead::PendingOff { code: code.clone() }, managed, None);
+                let seen = vault_observation(
+                    &VaultRead::PendingOff {
+                        approve: approve.clone(),
+                    },
+                    managed,
+                    None,
+                );
                 assert_eq!(
                     (seen.standing, seen.now.as_deref(), seen.wanted.as_str()),
                     (Standing::InPlace, Some(SYNC_OFF), SYNC_OFF)
@@ -1058,7 +1125,7 @@ mod tests {
             );
         }
         let code = VaultRead::Pending {
-            code: Some("abcd-efgh".into()),
+            approve: Some("aterm secrets approve abcd-efgh".into()),
             with_password: true,
         };
         assert_eq!(

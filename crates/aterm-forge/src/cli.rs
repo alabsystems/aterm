@@ -57,6 +57,16 @@ USAGE
         docs/measured/third-party-2026-10-15/serde-attrs.tsv. PATHs, relative
         to the workspace root, scan those trees instead. Read-only.
 
+  targo --unverified forge abrew-help [--input SNAPSHOT] [--check|--write]
+        Check captured rerouted Brew help (the default), or regenerate the
+        declared Rust output. Reads an offline snapshot; never runs Brew.
+        Only Trust's formatter is executed. Snapshot paths are inside the
+        workspace so the generated header carries a portable rerun command.
+
+  targo --unverified forge abrew-help import-legacy --input SEALED_F15 --output SNAPSHOT
+        Bootstrap an independent capture from the exact sealed f15 artifact.
+        Explicit migration only; refuses an existing snapshot destination.
+
 OPTIONS
   --root PATH      Workspace root (default: the nearest at or above the CWD)
   --cell NAME      One cell, a target triple and its root package (mac-arm,
@@ -90,6 +100,9 @@ pub enum Cmd {
     SerdeAttrs {
         paths: Vec<PathBuf>,
     },
+    AbrewHelp {
+        options: aterm_forge::abrew_help::Options,
+    },
     Help,
 }
 
@@ -116,7 +129,7 @@ impl ParseError {
             Self::NoVerb => "no verb given — try `targo --unverified forge survey`".into(),
             Self::UnknownVerb(v) => {
                 format!(
-                    "unknown verb `{v}` — expected survey, blame, budget, attest, check or serde-attrs"
+                    "unknown verb `{v}` — expected survey, blame, budget, attest, check, serde-attrs or abrew-help"
                 )
             }
             Self::MissingValue(flag) => format!("`{flag}` needs a value"),
@@ -152,6 +165,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
             other => break other.to_string(),
         }
     };
+
+    if verb == "abrew-help" {
+        return parse_abrew(it, root);
+    }
 
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -196,6 +213,63 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
     Ok(Invocation { root, cmd })
 }
 
+fn parse_abrew<I: Iterator<Item = String>>(
+    mut it: I,
+    mut root: Option<PathBuf>,
+) -> Result<Invocation, ParseError> {
+    use aterm_forge::abrew_help::{INPUT, Mode, Options};
+    let mut input = None;
+    let mut output = None;
+    let mut import = false;
+    let mut mode = None;
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                return Ok(Invocation {
+                    root,
+                    cmd: Cmd::Help,
+                });
+            }
+            "--root" => root = Some(PathBuf::from(next(&mut it, "--root")?)),
+            "--input" if input.is_none() => input = Some(PathBuf::from(next(&mut it, "--input")?)),
+            "--output" if output.is_none() => {
+                output = Some(PathBuf::from(next(&mut it, "--output")?))
+            }
+            "import-legacy" if !import => import = true,
+            "--check" if mode.is_none() => mode = Some(Mode::Check),
+            "--write" if mode.is_none() => mode = Some(Mode::Write),
+            other => return Err(ParseError::UnexpectedArg(other.into())),
+        }
+    }
+    let options = if import {
+        if mode.is_some() {
+            return Err(ParseError::UnexpectedArg(
+                "check/write on legacy import".into(),
+            ));
+        }
+        Options {
+            input: input.ok_or(ParseError::MissingOperand("--input SEALED_F15"))?,
+            mode: Mode::ImportLegacy {
+                output: output.ok_or(ParseError::MissingOperand("--output SNAPSHOT"))?,
+            },
+        }
+    } else {
+        if output.is_some() {
+            return Err(ParseError::UnexpectedArg(
+                "--output without import-legacy".into(),
+            ));
+        }
+        Options {
+            input: input.unwrap_or_else(|| INPUT.into()),
+            mode: mode.unwrap_or(Mode::Check),
+        }
+    };
+    Ok(Invocation {
+        root,
+        cmd: Cmd::AbrewHelp { options },
+    })
+}
+
 fn next<I: Iterator<Item = String>>(it: &mut I, flag: &'static str) -> Result<String, ParseError> {
     it.next().ok_or(ParseError::MissingValue(flag))
 }
@@ -222,5 +296,66 @@ mod tests {
                 paths: vec!["crates/aterm-serde".into(), "crates/x".into()]
             }
         );
+    }
+
+    #[test]
+    fn abrew_help_defaults_to_check_and_import_is_an_explicit_separate_mode() {
+        use aterm_forge::abrew_help::{INPUT, Mode, Options};
+        assert_eq!(
+            p(&["abrew-help"]).unwrap().cmd,
+            Cmd::AbrewHelp {
+                options: Options {
+                    input: INPUT.into(),
+                    mode: Mode::Check
+                }
+            }
+        );
+        assert_eq!(
+            p(&["abrew-help", "--input", "data/new.json", "--write"])
+                .unwrap()
+                .cmd,
+            Cmd::AbrewHelp {
+                options: Options {
+                    input: "data/new.json".into(),
+                    mode: Mode::Write
+                }
+            }
+        );
+        assert_eq!(
+            p(&[
+                "abrew-help",
+                "import-legacy",
+                "--input",
+                "/tmp/f15.rs",
+                "--output",
+                "data/capture.json"
+            ])
+            .unwrap()
+            .cmd,
+            Cmd::AbrewHelp {
+                options: Options {
+                    input: "/tmp/f15.rs".into(),
+                    mode: Mode::ImportLegacy {
+                        output: "data/capture.json".into()
+                    }
+                }
+            }
+        );
+        for bad in [
+            vec!["abrew-help", "--check", "--write"],
+            vec!["abrew-help", "--output", "elsewhere"],
+            vec!["abrew-help", "import-legacy", "--input", "capture.rs"],
+            vec![
+                "abrew-help",
+                "import-legacy",
+                "--input",
+                "capture.rs",
+                "--output",
+                "capture.json",
+                "--write",
+            ],
+        ] {
+            assert!(p(&bad).is_err());
+        }
     }
 }

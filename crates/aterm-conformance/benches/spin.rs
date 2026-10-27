@@ -17,7 +17,7 @@ mod measuring {
 
     use aterm_conformance::measure::Rig;
     use aterm_conformance::measure::instance::CouldNotRun;
-    use aterm_conformance::measure::spin::{SpinRow, SpinScene, measure};
+    use aterm_conformance::measure::spin::{EFFECT_LANE, NEEDLE_LANE, SpinRow, SpinScene, measure};
     use aterm_conformance::measure::starvation::ShapeVerdict;
 
     const MAX_ARMS: u64 = 100;
@@ -41,7 +41,7 @@ mod measuring {
                 window: Duration::from_secs(10),
                 max_arms: MAX_ARMS,
                 max_timer_wakes: Some(12),
-                max_effect_fires: None,
+                max_owner_fires: &[],
                 max_wakes: 150,
             },
         ),
@@ -53,7 +53,7 @@ mod measuring {
                 window: Duration::from_secs(6),
                 max_arms: MAX_ARMS,
                 max_timer_wakes: None,
-                max_effect_fires: None,
+                max_owner_fires: &[],
                 max_wakes: 6,
             },
         ),
@@ -69,7 +69,7 @@ mod measuring {
                 window: Duration::from_secs(10),
                 max_arms: MAX_ARMS,
                 max_timer_wakes: Some(12),
-                max_effect_fires: None,
+                max_owner_fires: &[],
                 max_wakes: 12,
             },
         ),
@@ -94,7 +94,7 @@ mod measuring {
                 window: Duration::from_secs(10),
                 max_arms: MAX_ARMS,
                 max_timer_wakes: None,
-                max_effect_fires: None,
+                max_owner_fires: &[],
                 max_wakes: 200,
             },
         ),
@@ -109,7 +109,16 @@ mod measuring {
         // hand-overs), 40 frames and 92 wakes, bounded at 200 as the row above. Proven red
         // 2026-10-26: that build with a pet that asks for frames whenever it sleeps (a mutant,
         // reverted) measured 570 cursor-effect fires, 607 timer wakes and 698 wakes, focused and
-        // asleep, and the four rows above passed on it.
+        // asleep, and the four rows above passed on it. The window's Folded deck draws the dial,
+        // whose needle sweeps on its own deadline (`stats_needle`) after a reading that moves its
+        // tip a device pixel or more (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §4.3). The
+        // dial reads the machine's own CPU, which even a quiet Mac moves past that pixel now and
+        // then, so the lane is bounded at 20, not 0: a dev build of 272f5972c9 measured 0 needle
+        // fires and 92 wakes here with 0.5 of 14 cores busy, 3 fires and 98 wakes with 1.2, and
+        // 31 fires and 155 wakes while another session's build ran beside it. Twenty leaves
+        // a quiet take room for its drift and one real swing (15 frames at a 60 Hz Mac's
+        // 33.3 ms), and fails a needle that asks three frames or more at each of the window's ten
+        // readings, which the 200-wake bound alone would pass.
         (
             "a_pet_in_deep_sleep_fires_no_effect_wake",
             SpinRow {
@@ -117,7 +126,7 @@ mod measuring {
                 window: Duration::from_secs(10),
                 max_arms: MAX_ARMS,
                 max_timer_wakes: None,
-                max_effect_fires: Some(0),
+                max_owner_fires: &[(EFFECT_LANE, 0), (NEEDLE_LANE, 20)],
                 max_wakes: 200,
             },
         ),

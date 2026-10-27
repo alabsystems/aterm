@@ -61,14 +61,29 @@ impl Terminal {
 
     /// Host knowledge, before the bytes it feeds next: whether a program other than the shell holds the terminal's foreground while it wrote them (a unix host compares the foreground process group it read for those bytes with the shell's pid; a host with no foreground group says `false`).
     pub fn set_foreground_job(&mut self, job: bool) {
+        let prev = (self.shell.foreground_job, self.shell.probe_job_active);
         self.shell.foreground_job = job;
-        if !job
-            && self.shell.cwd_before_job.is_some()
-            && !self.shell.program_runs_since_prompt()
-            && let Some(before) = self.shell.cwd_before_job.take()
-        {
-            let (_, mut handler) = self.split_for_process();
-            handler.apply_cwd_report(before);
+        let mut restored = false;
+        if job {
+            self.shell.probe_job_active = false;
+        } else if self.shell.cwd_before_job.is_some() {
+            let running = self.shell.program_runs_since_prompt();
+            self.shell.probe_job_active = running;
+            if !running && let Some(before) = self.shell.cwd_before_job.take() {
+                restored = true;
+                let (_, mut handler) = self.split_for_process();
+                handler.apply_cwd_report(before);
+            }
+        } else {
+            self.shell.probe_job_active = false;
+        }
+        let after = (self.shell.foreground_job, self.shell.probe_job_active);
+        if after != prev || restored {
+            self.host_journal.push(super::HostOp::ForegroundJob {
+                active: after.0,
+                probed: after.1,
+                restore_cwd: restored,
+            });
         }
     }
 
@@ -97,13 +112,20 @@ impl Terminal {
         let screen = Some(self.transient.screen_replaced);
         self.transient.dead_alt_screen = screen;
         self.transient.alt_screen_resync_screen = screen;
+        self.host_journal.push(super::HostOp::ExpectHostAltLeave);
         true
     }
 
-    /// Take the pending alternate-screen resync request (see [`set_host_resyncs_alt_screen`](Self::set_host_resyncs_alt_screen)): `true` once per stuck screen, when the embedder should make its console host leave the alternate buffer.
+    /// Take the pending alternate-screen resync request (see [`set_host_resyncs_alt_screen`](Self::set_host_resyncs_alt_screen)): `true` when the embedder should make its console host leave the alternate buffer, once per alternate-screen visit: not again until the alternate screen is left (by the host's forwarded `?1049l` or the program's own) or the embedder gives the request back ([`abandon_alt_screen_resync`](Self::abandon_alt_screen_resync)), however many screens a program enters with a prompt mark on each meanwhile. A program that leaves and re-enters asks once per visit, so the bound on host clients is the embedder's (aterm-pty runs one leave client per session at a time).
     #[inline]
     pub fn take_alt_screen_resync_request(&mut self) -> bool {
         std::mem::take(&mut self.transient.alt_screen_resync_requested)
+    }
+
+    /// Give back the request [`take_alt_screen_resync_request`](Self::take_alt_screen_resync_request) took, when the embedder's leave client did not start: the visit is no longer asked for, so the next prompt mark on the alternate screen asks again.
+    #[inline]
+    pub const fn abandon_alt_screen_resync(&mut self) {
+        self.transient.alt_screen_resync_screen = None;
     }
 
     /// Whether the Kitty keyboard protocol capability is enabled (see [`set_kitty_keyboard_enabled`](Self::set_kitty_keyboard_enabled)).
@@ -259,7 +281,7 @@ impl Terminal {
     #[inline]
     #[must_use]
     pub const fn kitty_file_resolver_installed(&self) -> bool {
-        self.kitty_file_resolver.is_some()
+        self.kitty_file_resolver.installed()
     }
 
     /// Authorize a clipboard access class for parser-origin sequences: `Write` covers OSC 52 set/clear and OSC 1337 `CopyToClipboard` / `EndCopy` / `Copy=`; `Query` covers OSC 52 queries.
@@ -304,30 +326,45 @@ impl Terminal {
     #[inline]
     pub const fn authorize_shell_integration(&mut self, nonce: [u8; 32]) {
         self.shell_integration_auth.authorize(nonce);
+        self.host_journal.push(super::HostOp::AuthorizeShell(nonce));
     }
 
     /// [`authorize_shell_integration`][Self::authorize_shell_integration] for a nonce the shell has not taken yet: the re-key of an adopted shell whose nonce did not survive an update, delivered through a file the shell reads at its next prompt (aterm-gui `shell_rekey`).
     #[inline]
     pub const fn authorize_shell_integration_on_first_mark(&mut self, nonce: [u8; 32]) {
         self.shell_integration_auth.authorize_on_first_mark(nonce);
+        self.host_journal
+            .push(super::HostOp::AuthorizeShellOnFirstMark(nonce));
     }
 
     /// [`authorize_shell_integration_on_first_mark`][Self::authorize_shell_integration_on_first_mark] for a typed re-key (aterm-gui `shell_rekey::typed`): a nonce left in a one-use file for a line typed at the prompt.
     #[inline]
     pub const fn authorize_shell_integration_rekey(&mut self, nonce: [u8; 32]) {
         self.shell_integration_auth.authorize_rekey(nonce);
+        self.host_journal
+            .push(super::HostOp::AuthorizeShellRekey(nonce));
     }
 
     /// Take back the typed re-key `nonce`, restoring the authorization it replaced.
     #[inline]
     pub fn withdraw_shell_integration_rekey(&mut self, nonce: &[u8; 32]) -> bool {
-        self.shell_integration_auth.withdraw_rekey(nonce)
+        let withdrew = self.shell_integration_auth.withdraw_rekey(nonce);
+        if withdrew {
+            self.host_journal
+                .push(super::HostOp::WithdrawShellRekey(*nonce));
+        }
+        withdrew
     }
 
     /// Keep the typed re-key `nonce`: the shell read its file, so the authorization it replaced is forgotten.
     #[inline]
     pub fn settle_shell_integration_rekey(&mut self, nonce: &[u8; 32]) -> bool {
-        self.shell_integration_auth.settle_rekey(nonce)
+        let settled = self.shell_integration_auth.settle_rekey(nonce);
+        if settled {
+            self.host_journal
+                .push(super::HostOp::SettleShellRekey(*nonce));
+        }
+        settled
     }
 
     /// The nonce the shell's marks verify with now (a re-key not yet taken is not in use), or `None`.
@@ -455,6 +492,16 @@ impl Terminal {
     #[must_use]
     pub fn hyperlink_extra_scheme_count(&self) -> usize {
         self.hyperlink_auth.extra_schemes().len()
+    }
+
+    /// Copy of live host-minted extra OSC 8 URI schemes in authorization order (lowercased).
+    #[must_use]
+    pub fn hyperlink_extra_schemes(&self) -> Vec<String> {
+        self.hyperlink_auth
+            .extra_schemes()
+            .iter()
+            .map(|s| (**s).to_owned())
+            .collect()
     }
 
     /// Install or replace the OSC / escape-sequence policy engine (the GUI does so for every session before its reader runs).
@@ -625,21 +672,45 @@ impl Terminal {
         self.host_alternate_scroll = on;
         self.refresh_mode_mirror();
     }
+
+    /// Set the host's alternate-scroll baseline without overwriting `modes.alternate_scroll` (for restoring a checkpointed engine whose live DEC 1007 mode was already installed).
+    #[inline]
+    pub const fn set_host_alternate_scroll_default(&mut self, on: bool) {
+        self.host_alternate_scroll = on;
+    }
+
+    /// The host's alternate-scroll baseline that RIS, DECSTR and [`Self::foreground_handback`] restore DEC 1007 to.
+    #[inline]
+    #[must_use]
+    pub const fn host_alternate_scroll_default(&self) -> bool {
+        self.host_alternate_scroll
+    }
 }
 
-/// Queue a DEC mode-2048 in-band size report, `CSI 48 ; rows ; cols ; pixH ; pixW t` (as xterm/ghostty), with the reports the terminal sends unasked ([`super::TransientState::push_report`], which holds the cap a toggle flood or a resize storm against a host that does not drain would test).
+/// A DEC mode-2048 in-band size report, `CSI 48 ; rows ; cols ; pixH ; pixW t` (as xterm/ghostty).
+pub(super) fn in_band_size_report(
+    rows: u16,
+    cols: u16,
+    host_cell_px: Option<(u16, u16)>,
+) -> super::stack_response::StackResponse<48> {
+    use std::fmt::Write as _;
+    let (cell_w, cell_h) = host_cell_px.unwrap_or((0, 0));
+    let pix_h = u32::from(rows) * u32::from(cell_h);
+    let pix_w = u32::from(cols) * u32::from(cell_w);
+    let mut r = super::stack_response::StackResponse::<48>::new();
+    let _ = write!(r, "\x1b[48;{rows};{cols};{pix_h};{pix_w}t");
+    r
+}
+
+/// Queue a host call's [`in_band_size_report`] (a resize, a new cell box) with the reports the
+/// terminal sends unasked ([`super::TransientState::push_report`], which holds the cap a resize
+/// storm against a host that does not drain would test). A report the program's own output
+/// provokes goes through `TerminalHandler::send_report` instead.
 pub(super) fn push_in_band_size_report(
     transient: &mut super::TransientState,
     rows: u16,
     cols: u16,
     host_cell_px: Option<(u16, u16)>,
 ) {
-    use std::fmt::Write as _;
-    const MAX_LEN: usize = 48;
-    let (cell_w, cell_h) = host_cell_px.unwrap_or((0, 0));
-    let pix_h = u32::from(rows) * u32::from(cell_h);
-    let pix_w = u32::from(cols) * u32::from(cell_w);
-    let mut r = super::stack_response::StackResponse::<MAX_LEN>::new();
-    let _ = write!(r, "\x1b[48;{rows};{cols};{pix_h};{pix_w}t");
-    let _ = transient.push_report(r.as_bytes());
+    let _ = transient.push_report(in_band_size_report(rows, cols, host_cell_px).as_bytes());
 }

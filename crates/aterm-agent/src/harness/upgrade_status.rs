@@ -1003,43 +1003,6 @@ impl Row {
         })
     }
 
-    /// The move waits only on the person at its tab.
-    #[must_use]
-    pub fn pause_note(&self, now: u64) -> Option<crate::harness::footer::UpgradeNote> {
-        use crate::harness::footer::{UpgradeNote, UpgradeWords};
-        let owed = matches!(self.phase, Phase::Pending | Phase::Announced { .. });
-        let footed = match self.agent {
-            upgrade::Agent::Claude => true,
-            upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
-        };
-        if !(owed && footed && self.moving(now)) {
-            return None;
-        }
-        let using = match self.wait.as_str() {
-            "attended" if self.person_named => true,
-            "draft" => false,
-            _ => return None,
-        };
-        let product = self.agent.product();
-        let build = (self.from.is_empty() || self.from != self.to).then(|| word(&self.to));
-        let name = match (&build, self.model.is_empty()) {
-            (Some(to), _) => format!("{product} {to}"),
-            (None, false) => format!("{product} with {}", word(&self.model)),
-            (None, true) => product.to_string(),
-        };
-        let joint = if self.ready { " is ready \u{b7} " } else { " " };
-        let words = |holds: &str| UpgradeWords {
-            whole: format!("{name}{joint}{holds}"),
-            short: build
-                .as_ref()
-                .map_or_else(|| holds.to_string(), |to| format!("{to} {holds}")),
-        };
-        Some(UpgradeNote {
-            using: using.then(|| words("waits while you use this tab")),
-            draft: words("waits until your draft is sent or cleared"),
-        })
-    }
-
     /// What the owner can do about this stall, by its kind ([`Remedy`]).
     #[must_use]
     pub fn remedy(&self, now: u64) -> Option<Remedy> {
@@ -1195,14 +1158,19 @@ impl Row {
         self.person_named = self.person_seen(now);
     }
 
+    /// Sets the row aside where its tab holds it: not in front, claimed by another supervisor,
+    /// its agent switched off or its Autopilot off. The person's own Now for the row's build
+    /// (the top rule's ⬆️, the tab menu's Upgrade Now) is a one-shot exception to the last two:
+    /// they asked for this move with the harness off. Not in front and claimed still hold.
     fn set_aside(&mut self, held: &[Holder], unproven_tab: bool, aside: &Aside, now: u64) {
+        let asked_now = self.request == Request::Now;
         if self.held_aside(held, unproven_tab) {
             self.go_aside(NOT_FOREGROUND, now);
         } else if !self.outside && aside.claimed.contains(&self.tab) {
             self.go_aside(CLAIMED, now);
-        } else if !self.outside && aside.agent_off.contains(&self.tab) {
+        } else if !self.outside && !asked_now && aside.agent_off.contains(&self.tab) {
             self.go_aside(AGENT_OFF, now);
-        } else if !self.outside && aside.off.contains(&self.tab) {
+        } else if !self.outside && !asked_now && aside.off.contains(&self.tab) {
             self.go_aside(AUTOPILOT_OFF, now);
         }
     }
@@ -3066,7 +3034,7 @@ impl Need {
                 "aterm cannot read an agent upgrade's record, so its tab's upgrade is not renewed",
                 NEED_WHY_MAX,
             ),
-            then: cut("Fix that file's owner and permissions", NEED_THEN_MAX),
+            then: cut("Move that file out of the upgrade folder", NEED_THEN_MAX),
             command: None,
             since: 0,
             log_line: "upgrade need=upgrade-records-unreadable".to_string(),
@@ -3238,6 +3206,7 @@ fn relaunch_line_words(wait: &str) -> Option<&'static str> {
         "shell-prompt" => "its shell has not taken the terminal back",
         "screen-unreadable" => "aterm cannot read its screen",
         "tab-ownership-changed" => "another program holds its tab now",
+        "shell-moved" => "its shell moved to another directory and its line cannot carry a cd back",
         "conversation-owner-ambiguous" => "another process still holds its conversation",
         _ => return None,
     })
@@ -3336,6 +3305,10 @@ fn stop_words(agent: upgrade::Agent, why: &str) -> String {
         "resumed-elsewhere" => {
             "the conversation was resumed by hand, outside this upgrade".to_string()
         }
+        crate::harness::upgrade_drive::RESUMED_BEHIND => format!(
+            "someone else resumed the conversation on an older {who} before aterm's relaunch \
+             line went in"
+        ),
         "build-fails" => {
             format!("its new build fails to start, so the move was called off and {who} runs on")
         }
@@ -3525,8 +3498,13 @@ fn record_row(opts: &Opts, session: &str, text: &str, now: u64) -> Result<Option
     let st = match St::from_json(text) {
         Some(st) => st,
         None => {
+            // An object with no `phase` under a name no record takes is another document
+            // sharing the folder (the model priority, a restart stamp, a retired writer's
+            // state file); one under a record's own name is that record, damaged.
             let value: Value = aterm_json::from_str(text).map_err(|_| ())?;
-            if value.get("phase").is_none() && super::models::Priority::parse(text).is_some() {
+            let record_named =
+                upgrade::is_session_id(session) || upgrade::Agent::keyed(session).is_some();
+            if value.is_object() && value.get("phase").is_none() && !record_named {
                 return Ok(None);
             }
             return Err(());

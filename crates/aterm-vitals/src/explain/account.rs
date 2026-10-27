@@ -124,6 +124,15 @@ pub struct Account {
     pub causes: Vec<Shown>,
     /// The headline: the top covering cause and at most one context that holds for it.
     pub headline: Option<(CauseId, Option<Context>)>,
+    /// macOS's services that hold past the large bar now, largest first (memory only)
+    /// ([`crate::services::over_in`]).
+    pub services: Vec<crate::services::RowOver>,
+    /// The restart the reply offers (`do class=restart`): the largest service's whose restart is
+    /// due ([`crate::services::RowOver::restart_due`]) and that the person did not put off
+    /// ([`Snapshot::services_filed`]).
+    pub restart: Option<&'static crate::services::Restart>,
+    /// Whether a restart was due but the person put it off for that process.
+    pub restart_filed: bool,
     /// Whether nothing needs doing (`do class=none`) ([`bare_subject`], [`Self::cannot`]).
     pub nothing_needed: bool,
     /// What cannot be read, `(what, why)`, one per limit the reply touches.
@@ -243,13 +252,26 @@ pub fn account_of(subject: WhySubject, panes: &[u64], snap: &Snapshot) -> Accoun
         }
         WhySubject::Mem => pressure_read,
     };
+    let services = match subject {
+        WhySubject::Mem => crate::services::over_in(snap),
+        WhySubject::Cpu => Vec::new(),
+    };
+    let pressed = memory_pressed(snap);
+    let (filed, due): (Vec<_>, Vec<_>) = services
+        .iter()
+        .filter(|o| o.restart_due(pressed))
+        .partition(|o| snap.services_filed.contains(&o.episode));
+    let restart = due.first().and_then(|o| o.restart);
+    let restart_filed = !filed.is_empty();
     let nothing_needed = read
+        && restart.is_none()
+        && !restart_filed
         && causes.iter().all(|s| match s.cause.id {
             CauseId::Activity(_) => true,
             CauseId::Context(c) => !matches!(c, Context::Pressure | Context::Throttled),
             _ => false,
         });
-    if !nothing_needed {
+    if !nothing_needed && restart.is_none() && !restart_filed {
         cannot.insert(0, ("remedy", "unsupported"));
     }
     Account {
@@ -259,9 +281,22 @@ pub fn account_of(subject: WhySubject, panes: &[u64], snap: &Snapshot) -> Accoun
         you,
         causes,
         headline,
+        services,
+        restart,
+        restart_filed,
         nothing_needed,
         cannot,
     }
+}
+
+/// Whether memory is under pressure now: the kernel's level past normal, or swap moving.
+fn memory_pressed(snap: &Snapshot) -> bool {
+    detect::pressed(snap).is_some()
+        || snap
+            .mem
+            .as_ref()
+            .and_then(|m| m.rates)
+            .is_some_and(|r| r.swap_bps() >= crate::events::SWAP_ACTIVE_BPS)
 }
 
 fn cpu_you(
@@ -407,11 +442,10 @@ fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
 #[must_use]
 pub fn bare_subject(snap: &Snapshot) -> Bare {
     let mem = snap.mem.as_ref();
-    let pressed = detect::pressed(snap).is_some();
-    let swapping = mem
-        .and_then(|m| m.rates)
-        .is_some_and(|r| r.swap_bps() >= crate::events::SWAP_ACTIVE_BPS);
-    if pressed || swapping {
+    let huge_service = crate::services::over_in(snap)
+        .iter()
+        .any(|o| o.size == crate::services::Size::Huge);
+    if memory_pressed(snap) || huge_service {
         return Bare::Subject(WhySubject::Mem);
     }
     let facts = snap.why.as_deref();
@@ -433,10 +467,14 @@ pub fn bare_subject(snap: &Snapshot) -> Bare {
         || {
             snap.cpu
                 .as_ref()
-                .map_or(0, |c| (f64::from(c.busy.raw) * 1000.0).round() as i64)
+                .and_then(|c| c.current_busy())
+                .map(|busy| (f64::from(busy) * 1000.0).round() as i64)
         },
-        |f| f.split.global_mc,
+        |f| Some(f.split.global_mc),
     );
+    let Some(busy) = busy else {
+        return Bare::Subject(WhySubject::Cpu);
+    };
     let Some(cpu_pm) = per_mille(busy, capacity).map(i64::from) else {
         return Bare::Subject(WhySubject::Cpu);
     };

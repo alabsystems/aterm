@@ -133,7 +133,7 @@ fn stage(tmp: &Path, bytes: &[u8]) -> io::Result<()> {
     stage_with(tmp, bytes, crate::platform::sync_file_contents)
 }
 
-/// [`stage`], flushed by `flush`.
+/// [`stage`], flushed by `flush`, a refusal accepted ([`aterm_durable::refusal_accepted`]).
 fn stage_with(
     tmp: &Path,
     bytes: &[u8],
@@ -142,17 +142,7 @@ fn stage_with(
     let mut f = create_temp(tmp)?;
     crate::platform::set_mode_on(&f, 0o644)?;
     f.write_all(bytes)?;
-    match flush(&f) {
-        Err(e)
-            if !matches!(
-                e.kind(),
-                io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
-            ) =>
-        {
-            Err(e)
-        }
-        _ => Ok(()),
-    }
+    aterm_durable::refusal_accepted(flush(&f))
 }
 
 /// Create `tmp` exclusively: an existing file of that name is never written through.
@@ -204,6 +194,55 @@ mod tests {
 
     fn dir(label: &str) -> crate::testdir::Dir {
         crate::testdir::dir(&format!("atpkg-vendor-durable-{label}-"))
+    }
+
+    #[test]
+    fn a_staged_file_accepts_a_refused_flush_after_writing_its_body() {
+        let d = dir("refused-flush");
+        let tmp = d.join("stage");
+        stage_with(&tmp, b"a = 1\n", |_| {
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(tmp).unwrap(), b"a = 1\n");
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_staged_file_accepts_a_darwin_raw_flush_refusal() {
+        let d = dir("raw-refused-flush");
+        let tmp = d.join("stage");
+        stage_with(&tmp, b"a = 1\n", |_| Err(io::Error::from_raw_os_error(45))).unwrap();
+        assert_eq!(std::fs::read(tmp).unwrap(), b"a = 1\n");
+    }
+
+    #[test]
+    fn a_staged_file_reports_a_failed_flush_after_writing_its_body() {
+        let d = dir("failed-flush");
+        let tmp = d.join("stage");
+        let error =
+            stage_with(&tmp, b"a = 1\n", |_| Err(io::Error::other(std::fmt::Error))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.get_ref().unwrap().is::<std::fmt::Error>());
+        assert_eq!(std::fs::read(tmp).unwrap(), b"a = 1\n");
+    }
+
+    #[test]
+    fn accepting_a_flush_refusal_does_not_accept_a_failed_stage_open() {
+        let d = dir("occupied-stage");
+        let tmp = d.join("stage");
+        std::fs::write(&tmp, b"keep").unwrap();
+        let error = stage_with(&tmp, b"replace", |_| {
+            panic!("an unsuccessful open cannot reach the flush")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        let error = stage_with(&d.join("stage\0"), b"replace", |_| {
+            panic!("an invalid path cannot reach the flush")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(tmp).unwrap(), b"keep");
     }
 
     #[test]

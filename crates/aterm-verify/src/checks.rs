@@ -81,8 +81,8 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::Selection,
         needs: &["targo-tippy"],
         also: "",
-        runs: "targo-tippy <selection> --all-targets -- -D warnings (+ aterm-gpu's wgpu-oracle arm; \
-               under release, the required-features targets and -p aterm --release)",
+        runs: "targo-tippy <selection> --all-targets -- -D warnings (under release, the \
+               required-features targets and -p aterm --release)",
     },
     Spec {
         check: Check::Test,
@@ -193,11 +193,11 @@ pub const CHECKS: [Spec; 19] = [
     Spec {
         check: Check::GpuOracle,
         name: "gpu-oracle",
-        stages: &[StageId::GpuOracleCompile, StageId::GpuOracle],
+        stages: &[StageId::GpuOracle],
         reach: Reach::WholeTree,
         needs: &["targo", "gpu"],
         also: "",
-        runs: "targo test -p aterm-gpu --features wgpu-oracle (own target dir; after test; with test when aterm-gpu is selected)",
+        runs: "targo test -p aterm-gpu --lib frame_record_tests: this host's arm against aterm's CPU twins of its frames, decided on any adapter, with the record of wgpu's frames a same-adapter signal (on the test run's build, after it; with test when aterm-gpu is selected)",
     },
     Spec {
         check: Check::Appkit,
@@ -335,12 +335,18 @@ pub fn stages_of(checks: &[Check]) -> Vec<StageId> {
     v
 }
 
-/// The package whose tests and lint have a second arm behind a feature, and that feature.
-pub const ORACLE: (&str, &str) = ("aterm-gpu", "wgpu-oracle");
+/// The package that holds each GPU arm's frames to their CPU twins, beside the
+/// record of wgpu's (docs/AUDIT-third-party-2026-10-15.md GW.6 and
+/// ORACLE-ADAPTER), and the test that compares them: the `gpu-oracle` check
+/// passes only when it ran.
+pub const GOLDEN: (&str, &str) = (
+    "aterm-gpu",
+    "frame_record_tests::armed_frames_hold_to_their_cpu_twins",
+);
 
 /// The checks that judge what some packages' own tests cannot, each with those packages.
 pub const PULLS: [(Check, &[&str]); 2] = [
-    (Check::GpuOracle, &[ORACLE.0]),
+    (Check::GpuOracle, &[GOLDEN.0]),
     (
         Check::WasmSmoke,
         &["aterm-wasm", "aterm-gpu-web", "aterm-wasm-abi"],
@@ -371,6 +377,28 @@ pub fn with_pulled(wanted: &[Check], release: bool, holds: impl Fn(&str) -> bool
         .iter()
         .map(|s| s.check)
         .filter(|c| wanted.contains(c) || pulled.iter().any(|(p, _)| p == c))
+        .collect()
+}
+
+/// Whether a run of `wanted` pulls [`Check::Cells`]: a dev run that lints a selection which
+/// compiles something, and does not name `cells` itself. Another OS's arms of the code (its
+/// `cfg`s, the test helpers only its targets compile) are linted on that OS's triple alone, so
+/// a change this machine's lint and tests pass can still break those builds, as the cells
+/// fixes 78f54c26c7, 266437995c and 333be891e9 each repaired on main. The pulled run checks one
+/// cell per other OS, each only where its graph holds a selected crate
+/// ([`crate::cells::pulled_cells`]); `verify cells` checks every cell.
+#[must_use]
+pub fn pulls_cells(wanted: &[Check], release: bool, compiles: bool) -> bool {
+    !release && compiles && wanted.contains(&Check::Lint) && !wanted.contains(&Check::Cells)
+}
+
+/// `wanted` with `check` added, in [`CHECKS`] order.
+#[must_use]
+pub fn with(wanted: &[Check], check: Check) -> Vec<Check> {
+    CHECKS
+        .iter()
+        .map(|s| s.check)
+        .filter(|c| *c == check || wanted.contains(c))
         .collect()
 }
 
@@ -610,12 +638,40 @@ mod tests {
         assert_eq!(
             with_pulled(&[Check::Lint], false, gpu),
             [Check::Lint],
-            "the lint's oracle arm is its own pass, not the oracle's tests"
+            "only a run with the tests holds the frames to the record"
         );
         assert_eq!(
             with_pulled(&RELEASE, true, |_| true),
             RELEASE,
             "release has it already, and runs its set and nothing more"
+        );
+    }
+
+    #[test]
+    fn a_dev_lint_of_a_selection_that_compiles_pulls_the_other_oses_cells() {
+        assert!(pulls_cells(&DEV, false, true));
+        assert!(pulls_cells(&[Check::Lint], false, true));
+        assert_eq!(
+            with(&DEV, Check::Cells),
+            [DEV.as_slice(), &[Check::Cells]].concat()
+        );
+        assert_eq!(
+            with(&[Check::Lint, Check::WasmSmoke], Check::Cells),
+            [Check::Lint, Check::Cells, Check::WasmSmoke],
+            "in CHECKS order"
+        );
+        assert!(
+            !pulls_cells(&DEV, false, false),
+            "an empty cone builds nothing"
+        );
+        assert!(!pulls_cells(&[Check::Test], false, true), "cells is a lint");
+        assert!(
+            !pulls_cells(&[Check::Lint, Check::Cells], false, true),
+            "named: every cell, as `verify cells` checks"
+        );
+        assert!(
+            !pulls_cells(&RELEASE, true, true),
+            "release runs its set and nothing more"
         );
     }
 

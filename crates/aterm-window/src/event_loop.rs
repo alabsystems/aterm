@@ -6,9 +6,9 @@
 
 //! Modified by the aterm project in 2026; see the repository NOTICE.
 //!
-//! LOCAL PATCH (aterm): the Android, iOS, Orbital and Web arms and the `rwh_05` impls are cut, and
-//! so are custom cursors, device-event filters, owned display handles and the control-flow getter,
-//! which no aterm crate calls.
+//! LOCAL PATCH (aterm): the Android, iOS, Orbital and Web arms and the `rwh_05` and `rwh_06` impls
+//! are cut, and so are custom cursors, device-event filters, owned display handles and the
+//! control-flow getter, which no aterm crate calls.
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -143,13 +143,6 @@ impl<T> EventLoop<T> {
     }
 }
 
-#[cfg(feature = "rwh_06")]
-impl<T> rwh_06::HasDisplayHandle for EventLoop<T> {
-    fn display_handle(&self) -> Result<rwh_06::DisplayHandle<'_>, rwh_06::HandleError> {
-        rwh_06::HasDisplayHandle::display_handle(self.event_loop.window_target())
-    }
-}
-
 // LOCAL PATCH (aterm): no `AsFd`/`AsRawFd` for the X11 and Wayland loops: they wait in a `poll(2)`
 // over several descriptors, and no aterm crate embeds the loop.
 impl ActiveEventLoop {
@@ -231,15 +224,6 @@ impl ActiveEventLoop {
         {
             true
         }
-    }
-}
-
-#[cfg(feature = "rwh_06")]
-impl rwh_06::HasDisplayHandle for ActiveEventLoop {
-    fn display_handle(&self) -> Result<rwh_06::DisplayHandle<'_>, rwh_06::HandleError> {
-        let raw = self.p.raw_display_handle_rwh_06()?;
-        // SAFETY: The display will never be deallocated while the event loop is alive.
-        Ok(unsafe { rwh_06::DisplayHandle::borrow_raw(raw) })
     }
 }
 

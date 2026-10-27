@@ -323,7 +323,7 @@ fn bound_roster_read_recovers_new_roster_bytes_before_binding() {
                     SyncTarget {
                         path: &fixture.path,
                         before: Some(&before),
-                        after: &after,
+                        after: Some(&after),
                         mode: None
                     },
                     |_, _| Ok(Vec::new()),
@@ -430,7 +430,7 @@ fn publication_between_raw_and_binding_reads_is_refused_including_an_empty_roste
                     SyncTarget {
                         path: &fixture.path,
                         before: Some(&before),
-                        after: &next,
+                        after: Some(&next),
                         mode: None,
                     },
                     |_, _| Ok(Vec::new()),

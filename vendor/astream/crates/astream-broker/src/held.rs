@@ -67,7 +67,9 @@
 
 use crate::brecord::BrokerRecord;
 use crate::retention::{self, Held, Retention, Stamps};
-use crate::store::{create_like, flush_file, open_sidecar, rename_path, sync_parent_dir};
+use crate::store::{
+    create_like, flush_file, open_sidecar, rename_path, sync_parent_dir, AtRestKey, AtRestRef,
+};
 use astream_wire::{Filter, Frame, HEADER_SIZE};
 use std::collections::BTreeMap;
 use std::fs::{File, Permissions};
@@ -78,7 +80,9 @@ use std::sync::Arc;
 /// Domain-separating AAD for sealing `<log>.held` under the log's at-rest key (the frame's
 /// index follows it).
 #[cfg(feature = "at-rest")]
-const HELD_AAD: &[u8] = b"astream-held-v1";
+const HELD_AAD: &[u8; 15] = b"astream-held-v1";
+#[cfg(feature = "at-rest")]
+const HELD_BOUND_PREFIX: &[u8; 16] = b"astream-held-v2\0";
 
 const KIND_RULES: u8 = b'R';
 const KIND_STAMPS: u8 = b'S';
@@ -117,68 +121,110 @@ pub(crate) fn held_tmp_path(log: &Path) -> PathBuf {
     beside(log, ".held.tmp")
 }
 
-/// A copy of the at-rest key a job seals with outside the log lock, zeroed on drop.
-pub(crate) struct KeyCopy(Option<[u8; 32]>);
+/// A copy of the at-rest key and optional `<log>.seal` binding a job seals with outside
+/// the log lock, zeroed on drop (`AtRestKey`).
+pub(crate) struct KeyCopy(Option<AtRestKey>);
 
 impl KeyCopy {
-    pub(crate) const fn of(key: Option<&[u8; 32]>) -> KeyCopy {
+    pub(crate) const fn of(key: Option<AtRestRef<'_>>) -> KeyCopy {
         match key {
-            Some(k) => KeyCopy(Some(*k)),
+            Some(r) => KeyCopy(Some(AtRestKey {
+                key: *r.key,
+                seal_id: r.seal_id,
+            })),
             None => KeyCopy(None),
         }
     }
 
-    const fn get(&self) -> Option<&[u8; 32]> {
-        self.0.as_ref()
-    }
-}
-
-impl Drop for KeyCopy {
-    fn drop(&mut self) {
-        if let Some(ref mut k) = self.0 {
-            k.fill(0);
-            std::hint::black_box(k);
+    const fn get(&self) -> Option<AtRestRef<'_>> {
+        match &self.0 {
+            Some(k) => Some(k.as_ref()),
+            None => None,
         }
     }
 }
 
 #[cfg(feature = "at-rest")]
-fn aad(index: u64) -> Vec<u8> {
-    let mut a = HELD_AAD.to_vec();
-    a.extend_from_slice(&index.to_le_bytes());
-    a
+const fn aad(index: u64) -> [u8; 23] {
+    let p = HELD_AAD;
+    let idx = index.to_le_bytes();
+    [
+        p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13],
+        p[14], idx[0], idx[1], idx[2], idx[3], idx[4], idx[5], idx[6], idx[7],
+    ]
 }
 
 #[cfg(feature = "at-rest")]
-fn seal(key: Option<&[u8; 32]>, index: u64, plain: &[u8]) -> Vec<u8> {
+const fn held_bound_aad(id: [u8; 16], index: u64) -> [u8; 40] {
+    let p = HELD_BOUND_PREFIX;
+    let idx = index.to_le_bytes();
+    [
+        p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13],
+        p[14], p[15], id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7], id[8], id[9], id[10],
+        id[11], id[12], id[13], id[14], id[15], idx[0], idx[1], idx[2], idx[3], idx[4], idx[5],
+        idx[6], idx[7],
+    ]
+}
+
+#[cfg(feature = "at-rest")]
+fn seal(key: Option<AtRestRef<'_>>, index: u64, plain: &[u8]) -> Vec<u8> {
     match key {
-        Some(k) => astream_aead::seal(k, &aad(index), plain),
+        Some(AtRestRef {
+            key: k,
+            seal_id: Some(id),
+        }) => {
+            let bound = held_bound_aad(id, index);
+            astream_aead::seal(k, &bound, plain)
+        }
+        Some(AtRestRef {
+            key: k,
+            seal_id: None,
+        }) => {
+            let legacy = aad(index);
+            astream_aead::seal(k, &legacy, plain)
+        }
         None => plain.to_vec(),
     }
 }
 #[cfg(not(feature = "at-rest"))]
-fn seal(_key: Option<&[u8; 32]>, _index: u64, plain: &[u8]) -> Vec<u8> {
+fn seal(_key: Option<AtRestRef<'_>>, _index: u64, plain: &[u8]) -> Vec<u8> {
     plain.to_vec()
 }
 
 #[cfg(feature = "at-rest")]
-fn unseal(key: Option<&[u8; 32]>, index: u64, payload: Vec<u8>) -> Option<Vec<u8>> {
+fn unseal(key: Option<AtRestRef<'_>>, index: u64, payload: Vec<u8>) -> Option<Vec<u8>> {
     match key {
-        Some(k) => match astream_aead::open(k, &aad(index), &payload) {
-            Ok(p) => Some(p),
-            Err(_) => None,
-        },
+        Some(AtRestRef {
+            key: k,
+            seal_id: Some(id),
+        }) => {
+            let bound = held_bound_aad(id, index);
+            match astream_aead::open(k, &bound, &payload) {
+                Ok(p) => Some(p),
+                Err(_) => None,
+            }
+        }
+        Some(AtRestRef {
+            key: k,
+            seal_id: None,
+        }) => {
+            let legacy = aad(index);
+            match astream_aead::open(k, &legacy, &payload) {
+                Ok(p) => Some(p),
+                Err(_) => None,
+            }
+        }
         None => Some(payload),
     }
 }
 #[cfg(not(feature = "at-rest"))]
-fn unseal(_key: Option<&[u8; 32]>, _index: u64, payload: Vec<u8>) -> Option<Vec<u8>> {
+fn unseal(_key: Option<AtRestRef<'_>>, _index: u64, payload: Vec<u8>) -> Option<Vec<u8>> {
     Some(payload)
 }
 
 /// Frames being written: their bytes, how many, and the index the next one takes.
 struct Out<'k> {
-    key: Option<&'k [u8; 32]>,
+    key: Option<AtRestRef<'k>>,
     bytes: Vec<u8>,
     index: u64,
     frames: u64,
@@ -237,7 +283,10 @@ impl Out<'_> {
             }
             self.frame(&p)?;
             for h in group {
-                let Ok(payload) = h.rec.encode_payload() else {
+                let Ok(payload) = h
+                    .rec
+                    .encode_payload_marked_bt(crate::brecord::Mark::Unmarked, h.bt_ms)
+                else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "retention: a held record does not encode",
@@ -522,7 +571,7 @@ fn zeros_from(r: &mut BufReader<File>, at: u64) -> io::Result<bool> {
 
 fn read_one(
     r: &mut BufReader<File>,
-    key: Option<&[u8; 32]>,
+    key: Option<AtRestRef<'_>>,
     index: u64,
     at: u64,
     path: &Path,
@@ -596,7 +645,7 @@ impl HeldStore {
     /// before its rename leaves a tmp file that is removed.
     pub(crate) fn load(
         log: &Path,
-        key: Option<&[u8; 32]>,
+        key: Option<AtRestRef<'_>>,
         base: u64,
         created: bool,
     ) -> io::Result<HeldStore> {
@@ -721,14 +770,19 @@ impl HeldStore {
                                 break 'frames;
                             }
                         };
-                        let Some(rec) = BrokerRecord::from_payload(&payload) else {
+                        let Some((rec, mark, bt_ms)) =
+                            BrokerRecord::from_payload_marked_bt(&payload)
+                        else {
                             return Err(bad(&path, rec_at, "a held record does not parse"));
                         };
-                        recs.push((rec, ms));
+                        if mark != crate::brecord::Mark::Unmarked {
+                            return Err(bad(&path, rec_at, "a held record carries a batch mark"));
+                        }
+                        recs.push((rec, ms, bt_ms));
                     }
-                    for (rec, ms) in recs {
+                    for (rec, ms, bt_ms) in recs {
                         if rec.seq.0 < base {
-                            st.insert(rec, ms);
+                            st.insert(rec, ms, bt_ms);
                         }
                     }
                 }
@@ -779,7 +833,7 @@ impl HeldStore {
     pub(crate) fn opened_at(
         &mut self,
         log: &Path,
-        key: Option<&[u8; 32]>,
+        key: Option<AtRestRef<'_>>,
         base: u64,
         next: u64,
     ) -> io::Result<()> {
@@ -816,13 +870,14 @@ impl HeldStore {
         }
     }
 
-    fn insert(&mut self, rec: BrokerRecord, at_ms: u64) {
+    fn insert(&mut self, rec: BrokerRecord, at_ms: u64, bt_ms: Option<u64>) {
         let bytes = retention::record_bytes(&rec);
         let old = self.entries.insert(
             rec.seq.0,
             Held {
                 rec: Arc::new(rec),
                 at_ms,
+                bt_ms,
             },
         );
         if let Some(h) = old {
@@ -892,7 +947,8 @@ impl HeldStore {
         }
     }
 
-    /// The oldest offset a read of `filter` can reach ([`retention::oldest`]).
+    /// The oldest offset of `filter`, at and above which it is complete: the greatest floor
+    /// over what it matches ([`retention::oldest`]).
     pub(crate) fn oldest(&self, base: u64, filter: &Filter) -> u64 {
         retention::oldest(
             self.rules.as_ref(),
@@ -939,7 +995,7 @@ impl HeldStore {
     pub(crate) fn unplanned_job(
         &self,
         log: &Path,
-        key: Option<&[u8; 32]>,
+        key: Option<AtRestRef<'_>>,
         perms: &Permissions,
         base: u64,
         min: u64,
@@ -998,7 +1054,7 @@ impl HeldStore {
     pub(crate) fn set_rules(
         &mut self,
         log: &Path,
-        key: Option<&[u8; 32]>,
+        key: Option<AtRestRef<'_>>,
         perms: &Permissions,
         base: u64,
         rules: Retention,
@@ -1061,7 +1117,7 @@ impl HeldStore {
     pub(crate) fn job(
         &self,
         log: &Path,
-        key: Option<&[u8; 32]>,
+        key: Option<AtRestRef<'_>>,
         perms: &Permissions,
         base: u64,
         plan: retention::Plan,
@@ -1212,6 +1268,16 @@ impl HeldStore {
     /// How many records the store holds.
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Bytes on disk taken by `<log>.held` (`0` when no held sidecar is open).
+    pub(crate) const fn file_bytes(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether `<log>.held` is currently open on disk.
+    pub(crate) const fn has_file(&self) -> bool {
+        self.file.is_some()
     }
 
     /// Drop the stamps no retained record needs any more.

@@ -228,7 +228,7 @@ pub(crate) fn names_node_log(rest: &str) -> bool {
     rest.split_whitespace().any(|w| w == "n")
 }
 
-/// `log n [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [--json]`.
+/// `log n [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [--json]`: the node log is never carried and names no `base=`, so a cursor naming one is refused rather than read unchecked.
 pub(crate) fn cmd_node_log(host: &NodeLogHost, rest: &str) -> String {
     let rest = rest
         .split_whitespace()
@@ -236,7 +236,14 @@ pub(crate) fn cmd_node_log(host: &NodeLogHost, rest: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let q = match LogQuery::parse(&rest) {
-        Ok(q) if q.node == aterm_slog::Node::SESSION && q.lvl.is_none() && !q.turn_class => q,
+        Ok(q)
+            if q.node == aterm_slog::Node::SESSION
+                && q.lvl.is_none()
+                && !q.turn_class
+                && q.cursor.is_none_or(|c| c.base.is_none()) =>
+        {
+            q
+        }
         Ok(_) => return NODE_LOG_USAGE.to_string(),
         Err(usage) => return usage.to_string(),
     };

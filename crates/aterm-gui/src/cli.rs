@@ -486,7 +486,10 @@ const STARTER_CONFIG: &str = concat!(
 #                                  #   macOS: UNUserNotificationCenter from Applications/aterm.app once authorized,
 #                                  #   else /usr/bin/osascript when run outside an app bundle).
 #                                  #   Program OSC 9/99/777 notifications are gated by allow_notifications below
-# temporal_recording = false       # per-session screen history for `aterm ctl temporal` (default off; new sessions)
+# temporal_recording = false       # Rewind: each pane's recent screens, in memory only (default off; new tabs)
+# rewind_budget_mb = 8             # the most one pane's Rewind history holds (1..=1024, at most rewind_total_mb)
+# rewind_total_mb = 128            # the most every pane's Rewind history holds together (1..=16384); the panes
+#                                  #   focused longest ago give up their oldest history first
 
 # --- program permissions (default OFF unless noted) --------------------------
 # allow_window_ops = false         # XTWINOPS title/grid/pixel/cell-size reports (position/screen size stay unanswered);

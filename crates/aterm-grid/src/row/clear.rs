@@ -106,6 +106,54 @@ impl Row {
         super::u16_from_usize(written_start)..super::u16_from_usize(written_end)
     }
 
+    /// Before the columns `left..=right` of this row shift (a scroll, IL or DL between DECSLRM
+    /// margins), turn each wide character straddling `left` or `right` into two narrow blanks
+    /// that keep their renditions, so the shift splits no glyph and no half meets another
+    /// glyph's half. Ghostty's `rowWillBeShifted` does this to every row a shift touches; xterm
+    /// leaves the halves torn. Returns the columns of the leads it unpaired, whose combining
+    /// marks the caller drops from the extras map, as Ghostty's `clearGrapheme` does.
+    #[inline]
+    pub(crate) fn unpair_margin_straddlers(
+        &mut self,
+        left: usize,
+        right: usize,
+    ) -> [Option<u16>; 2] {
+        let mut leads = [None, None];
+        if left > 0 && self.is_cell_wide_continuation(super::u16_from_usize(left)) {
+            self.unpair_wide_at(left - 1);
+            leads[0] = Some(super::u16_from_usize(left - 1));
+        }
+        if right + 1 < self.cells.len()
+            && self.cells[right].flags().contains(CellFlags::WIDE)
+            && self.is_cell_wide_continuation(super::u16_from_usize(right + 1))
+        {
+            self.unpair_wide_at(right);
+            leads[1] = Some(super::u16_from_usize(right));
+        }
+        leads
+    }
+
+    /// The wide character whose lead is at `lead` (its spacer at `lead + 1`) becomes two
+    /// narrow blanks, each keeping its colours and rendition; the former spacer takes the
+    /// lead's `PROTECTED` bit, which its role bit stood in for. The lead's combining marks live
+    /// in the grid's extras map, which this row cannot reach: the caller drops them.
+    fn unpair_wide_at(&mut self, lead: usize) {
+        let mut lead_flags = self.cells[lead].flags();
+        lead_flags.remove(CellFlags::WIDE);
+        lead_flags.remove(CellFlags::COMPLEX);
+        let protected = lead_flags.intersects(CellFlags::PROTECTED);
+        let mut spacer_flags = self.cells[lead + 1].flags();
+        spacer_flags.remove(CellFlags::WIDE_CONTINUATION);
+        if protected {
+            spacer_flags = spacer_flags.union(CellFlags::PROTECTED);
+        }
+        let lead_colors = self.cells[lead].colors();
+        let spacer_colors = self.cells[lead + 1].colors();
+        self.cells[lead] = Cell::from_raw_parts(' ' as u16, lead_colors, lead_flags);
+        self.cells[lead + 1] = Cell::from_raw_parts(' ' as u16, spacer_colors, spacer_flags);
+        self.flags |= RowFlags::DIRTY;
+    }
+
     /// Clears any wide-character half orphaned by a rectangular operation on columns `left..=right`.
     #[inline]
     pub(crate) fn fixup_wide_boundary(

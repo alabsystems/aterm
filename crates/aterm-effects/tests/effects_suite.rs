@@ -45,6 +45,7 @@ mod ink_wrap_line_fill_repro;
 mod jump_over_fading_band;
 mod keys_typed_at_the_line_start;
 mod kitty_activation_conformance;
+mod letter_guard_reuse;
 mod licensed_insert_band;
 mod licensed_typed_parity;
 mod midline_insert_band;

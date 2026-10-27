@@ -541,7 +541,7 @@ pub enum Completion {
 
 /// A sign-in's closed line grammar ([`Drive::Lines`]): each lead is matched within one line,
 /// ANSI stripped; the value follows it on that line, or, when nothing that reads as one does,
-/// is the next line that is not blank.
+/// is the next line of the lead's own stream (the CLI's output or its errors) that is not blank.
 #[derive(Debug)]
 pub struct Grammar {
     /// Leads of the line naming the page's URL.

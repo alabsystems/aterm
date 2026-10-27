@@ -110,8 +110,7 @@ impl SwapchainConfig {
             other => {
                 return Err(format!(
                     "{other:?} is not a CAMetalLayer pixelFormat aterm can present: the \
-                     layer accepts the BGRA8/f16/XR set, and pick_surface_format's \
-                     Rgba8Unorm fallback exists for non-Metal backends only"
+                     layer accepts the BGRA8/f16/XR set"
                 ));
             }
         }

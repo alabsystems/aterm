@@ -126,6 +126,63 @@ fn a_pin_moves_up_never_down_and_an_equal_build_is_a_carry() {
 }
 
 #[test]
+fn a_repo_the_table_moves_needs_a_new_build_above_the_heads_pin() {
+    let mut moved = base(21, &[("ay", 5), ("nn", 108)]);
+    moved.programs.insert("ay".into(), block("ay-old", None));
+    for d in [&["--pin", "nn=109"][..], &["--pin", "ay=5"]] {
+        let err = refused(&moved, &delta(d));
+        assert!(
+            err.contains("REFUSING [programs.ay] repo \"ay-old\" -> \"ay\" with ay pinned at 5")
+                && err.contains("atpkg::succession"),
+            "{d:?}: {err}"
+        );
+    }
+    let (p, log) = ok(&moved, &delta(&["--pin", "ay=6"]));
+    let ay = p.programs.iter().find(|(n, _)| n == "ay").map(|(_, b)| b);
+    assert_eq!(ay.map(|b| b.repo.as_str()), Some("ay"));
+    assert!(
+        log.contains("metadata: ay: repo=\"ay-old\""),
+        "{}",
+        log.text()
+    );
+    // The control: the head already names the table's repo, so nothing switches.
+    let (p, _) = ok(
+        &base(21, &[("ay", 5), ("nn", 108)]),
+        &delta(&["--pin", "nn=109"]),
+    );
+    assert_eq!(p.channel.pin.get("ay"), Some(&5));
+}
+
+#[test]
+fn a_repo_the_table_moves_needs_a_new_build_on_each_target_cell_it_keeps() {
+    let mut moved = with_overlay(base(21, &[("ay", 5), ("nn", 108)]), LINUX, &[("ay", 9)]);
+    moved.programs.insert("ay".into(), block("ay-old", None));
+    let target_pin = format!("{LINUX}:ay=9");
+    for d in [
+        &["--pin", "ay=6"][..],
+        &["--pin", "ay=6", "--target-pin", &target_pin],
+    ] {
+        let err = refused(&moved, &delta(d));
+        assert!(
+            err.contains(&format!(
+                "REFUSING [programs.ay] repo \"ay-old\" -> \"ay\" with ay pinned on {LINUX} at 9"
+            )),
+            "{d:?}: {err}"
+        );
+    }
+    // The controls: the cell names a new build, or the overlay goes.
+    let raised = format!("{LINUX}:ay=10");
+    let (p, _) = ok(&moved, &delta(&["--pin", "ay=6", "--target-pin", &raised]));
+    assert_eq!(p.channel.pin_by_target[LINUX].get("ay"), Some(&10));
+    let retired = format!("{LINUX}:ay");
+    let (p, _) = ok(
+        &moved,
+        &delta(&["--pin", "ay=6", "--retire-target", &retired]),
+    );
+    assert!(p.channel.pin_by_target.is_empty(), "{:?}", p.channel);
+}
+
+#[test]
 fn a_program_leaves_only_when_retired_by_name() {
     let mut b = with_overlay(
         base(21, &[("ay", 1), ("ny", 2), ("codex", 3)]),
@@ -311,7 +368,8 @@ fn each_harness_pins_under_its_own_repo_and_stays_out_of_the_default_set() {
 fn a_head_program_the_table_lacks_keeps_the_heads_block() {
     let mut b = base(21, &[("ay", 1), ("orca", 4)]);
     b.programs.insert("ay".into(), block("ay-old", None));
-    let (p, _) = ok(&b, &delta(&["--pin", "orca=5"]));
+    // ay's repo moves to the table's, so its pin names a new build (the repo-switch rule).
+    let (p, _) = ok(&b, &delta(&["--pin", "orca=5", "--pin", "ay=2"]));
     let names: Vec<&str> = p.programs.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, ["ay", "orca"], "table order, then the rest");
     assert_eq!(p.programs[0].1.repo, "ay", "the table's block is rendered");

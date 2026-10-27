@@ -50,6 +50,10 @@ aterm-json = { workspace = true }
 # The guest agent's wire codec (`wire::Frame`, `Hello`, `Exec`) and its ports
 # (`COMMAND_PORT`, `WATCH_PORT`), which the helper and its client speak.
 aterm-vz-agent = { workspace = true }
+# The anchor attributes' registry (std-only): the helper's core, its client, the run
+# files and the disk layers refine the VzLifecycle model (aterm-models-misc) in test and
+# debug builds; release strips them.
+aterm-spec-anchor = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # `kill` for the escalation by pid, `O_CLOEXEC` for the disk's lock file
@@ -67,6 +71,10 @@ aterm-objc = { workspace = true }
 # The tooling cache's reclaim, which the tests hold to keeping a row the lane
 # reads at every bring-up (`build_cache::tooling::plan`).
 atpkg = { workspace = true }
+# The lifecycle model and its interpreter, which `tests/conformance_lifecycle.rs` binds the
+# helper, its client and the layers to.
+aterm-models-misc = { workspace = true }
+aterm-spec = { workspace = true }
 
 [lints]
 workspace = true

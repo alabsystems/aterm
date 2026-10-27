@@ -130,9 +130,9 @@ pub(crate) struct SpliceLists {
     rules: Vec<RuleWrite>,
     /// agy's glass-only transcript markdown edits.
     agy_edits: Vec<AgyRowEdit>,
-    /// Claude's mode pills relabelled `YOLO on`/`YOLO off` ([`collect_pill_relabel`]).
-    relabels: Vec<RelabelWrite>,
-    relabel_cells: Vec<RenderCell>,
+    /// Claude's mode rows rewritten to its jobs ([`collect_mode_row`]).
+    mode_rows: Vec<RowWrite>,
+    mode_cells: Vec<RenderCell>,
     /// The composer top rules' compositions ([`ComposedTop`]).
     tops: Vec<TopWrite>,
     /// The top-effort key's targets each top rule would put on the glass ([`TopHit`]).
@@ -186,8 +186,8 @@ impl SpliceLists {
         self.bare.clear();
         self.rules.clear();
         self.agy_edits.clear();
-        self.relabels.clear();
-        self.relabel_cells.clear();
+        self.mode_rows.clear();
+        self.mode_cells.clear();
         self.tops.clear();
         self.top_hits.clear();
         self.top_seen.clear();
@@ -221,9 +221,9 @@ struct FooterPane {
         Option<aterm_agent::supervise::Autopilot>,
         crate::autopilot::AutopilotView,
     ),
-    /// Whether Claude's mode pill reads `YOLO on`/`YOLO off` on this pane's glass
-    /// ([`relabels_pill`], [`collect_pill_relabel`]).
-    relabelled: bool,
+    /// Whether the glass rewrote Claude's mode row on this pane, its pill dropped
+    /// ([`rewrites_mode_row`], [`collect_mode_row`]).
+    row_rewritten: bool,
 }
 
 /// A visible Claude Code pane and the lights' reading of its rows.
@@ -249,6 +249,8 @@ pub(crate) struct PaneTextCache {
     changed: Vec<usize>,
     /// The top rules' mark contents, shared by the leaves ([`MarkContents`]).
     marks: MarkContents,
+    /// The top rules' ⬆️ ring contents, shared by the leaves ([`RingContents`]).
+    rings: RingContents,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,8 +517,8 @@ struct Readings {
     rule: FooterRead,
     /// The lights'.
     lights: LightsRead,
-    /// Claude's mode pill under the bottom rule ([`collect_pill_relabel`]).
-    relabel: Option<footer::Relabel>,
+    /// Claude's mode row under the bottom rule ([`collect_mode_row`]).
+    mode: Option<footer::ModeRow>,
 }
 
 impl Readings {
@@ -569,11 +571,11 @@ fn read_pane(
                 .map(|(_, bottom)| aterm_agent::harness::lights::reading_under(rows, bottom)),
             None => aterm_agent::harness::lights::read_lights(rows),
         });
-    let relabel = rule.and_then(|read| {
+    let mode = rule.and_then(|read| {
         #[cfg(test)]
-        crate::work_counts::pill_relabel_read();
-        crate::reader_guard::read_or_none(session, "Claude Code mode pill", rows, || {
-            footer::relabel_under(rows, read.rule)
+        crate::work_counts::mode_row_read();
+        crate::reader_guard::read_or_none(session, "Claude Code mode row", rows, || {
+            footer::mode_row_rewrite_under(rows, read.rule)
         })
         .flatten()
     });
@@ -581,7 +583,7 @@ fn read_pane(
         reach,
         rule,
         lights,
-        relabel,
+        mode,
     }
 }
 
@@ -1114,15 +1116,25 @@ impl PaneTextCache {
         top_line(program, self.panes.get(leaf_index)?.as_ref()?)
     }
 
-    /// Leaf `leaf_index`'s top rule composed from `key` ([`PaneFooter::compose_top`]).
-    fn compose_top(&mut self, leaf_index: usize, key: TopKey) -> &ComposedTop {
-        let Self { footers, marks, .. } = self;
-        footers[leaf_index].compose_top(key, marks)
+    /// Leaf `leaf_index`'s top rule composed from `key` and the cells of Claude Code's label zone
+    /// `tail` ([`PaneFooter::compose_top`]).
+    fn compose_top(&mut self, leaf_index: usize, key: TopKey, tail: &[RenderCell]) -> &ComposedTop {
+        let Self {
+            footers,
+            marks,
+            rings,
+            ..
+        } = self;
+        footers[leaf_index].compose_top(key, tail, marks, rings)
     }
 
-    /// Leaf `leaf_index`'s composed top rule's mark sprite ([`mark_layer`]).
-    fn top_mark(&self, leaf_index: usize) -> Option<&aterm_core::render::FxLayer> {
-        self.footers.get(leaf_index)?.top.mark.as_ref()
+    /// Leaf `leaf_index`'s composed top rule's sprites: its mark's ([`mark_layer`]) and, under the
+    /// pointer, its ⬆️'s ring ([`ring_layer`]).
+    fn top_layers(&self, leaf_index: usize) -> impl Iterator<Item = &aterm_core::render::FxLayer> {
+        self.footers
+            .get(leaf_index)
+            .into_iter()
+            .flat_map(|f| f.top.mark.iter().chain(f.top.ring.iter()))
     }
 
     /// Leaf `leaf_index`'s composed top rule's cells ([`compose_top`]).
@@ -1270,8 +1282,6 @@ struct PaneFooter {
     /// What [`Self::shown`] is made of: the facts the timeline holds for the group in front, the
     /// launch card it keeps for them, the usage switch and the facts the person hid.
     from: Option<(FooterFacts, Option<aterm_phase::LaunchCard>, bool, FactMask)>,
-    /// The live upgrade's note the timeline holds for the pane ([`Self::lay_upgrade`]).
-    note: Option<footer::UpgradeNote>,
     /// What the rule shows ([`with_usage_switch`]).
     shown: FooterFacts,
     /// Bumped on every change of `shown`.
@@ -1392,7 +1402,6 @@ impl PaneFooter {
         let mut shown = facts.filled_from(card);
         with_usage_switch(&mut shown, usage);
         shown.off = off;
-        shown.upgrade = self.shown.upgrade.take();
         let model_changed = shown.model != self.shown.model;
         self.shown = shown;
         self.shown_gen += 1;
@@ -1424,23 +1433,6 @@ impl PaneFooter {
     fn note_goal(&mut self, goal: Option<&str>) {
         if self.goal.as_ref().map(|(text, _)| &**text) != goal {
             self.goal = goal.map(|text| (Box::from(text), goal_term(Some(text))));
-        }
-    }
-
-    /// Take in the live upgrade's note the timeline holds for the pane.
-    fn note_upgrade(&mut self, note: Option<&footer::UpgradeNote>) {
-        if self.note.as_ref() != note {
-            self.note = note.cloned();
-        }
-    }
-
-    /// Lay in the upgrade's words for a composer that holds a draft (`Some(true)`) or none
-    /// (`Some(false)`).
-    fn lay_upgrade(&mut self, draft: Option<bool>) {
-        let words = draft.and_then(|draft| self.note.as_ref()?.words(draft));
-        if self.shown.upgrade.as_ref() != words {
-            self.shown.upgrade = words.cloned();
-            self.shown_gen += 1;
         }
     }
 
@@ -1496,16 +1488,24 @@ impl PaneFooter {
         }
     }
 
-    /// The composer's top line composed from `key` ([`compose_top`], [`mark_layer`]).
-    fn compose_top(&mut self, key: TopKey, marks: &mut MarkContents) -> &ComposedTop {
+    /// The composer's top line composed from `key` and the cells of Claude Code's label zone
+    /// `tail` ([`compose_top`], [`mark_layer`]).
+    fn compose_top(
+        &mut self,
+        key: TopKey,
+        tail: &[RenderCell],
+        marks: &mut MarkContents,
+        rings: &mut RingContents,
+    ) -> &ComposedTop {
         let goal = self.goal.as_ref().map_or(0, |(_, term)| *term);
         if self.top.key != Some(key) || self.top.goal != goal {
             let version = (key.title_gen != 0)
                 .then_some(self.shown.version.as_deref())
                 .flatten();
             let text = self.goal.as_ref().map(|(text, _)| &**text);
-            compose_top(&key, &mut self.top, version, text);
+            compose_top(&key, &mut self.top, version, text, tail);
             self.top.mark = mark_layer(&key, &self.top, self.session, marks);
+            self.top.ring = ring_layer(&key, &self.top, self.session, rings);
             self.top.key = Some(key);
             self.top.goal = goal;
         }
@@ -3066,12 +3066,9 @@ fn resolve_facts_at_with_cwd(
                 && let (Some(args), Some(home)) = (args.as_ref(), home.as_deref())
             {
                 if let Some(read) = aterm_agent::harness::profile::muse_subscription_for(
-                    &args.argv, &args.env, home,
+                    &args.argv, &args.env, home, &sub, clock.now,
                 ) {
-                    match sub.email.as_deref() {
-                        Some(previous) if read.email.as_deref() != Some(previous) => sub = read,
-                        _ => sub.email = read.email,
-                    }
+                    sub = read;
                 }
                 let muse_pid = u32::try_from(identity.pid).unwrap_or(0);
                 resume = aterm_agent::harness::profile::muse_resume_for(
@@ -3141,8 +3138,8 @@ fn resolve_facts_at_with_cwd(
                     floor: started,
                     session_id: format!("{prefix}-{}", identity.pid),
                 }),
-                upgrade: None,
                 account: None,
+                account_progress: None,
                 top_effort: None,
                 off: footer::FactMask::default(),
                 subscription: Some(sub),
@@ -3653,8 +3650,8 @@ pub(crate) fn fingerprint(
         effort_open,
         effort_for,
         owner,
-        upgrade,
         account,
+        account_progress,
         top_effort: _,
         off: _,
         subscription,
@@ -3677,17 +3674,9 @@ pub(crate) fn fingerprint(
         resume,
     )
         .hash(&mut h);
-    (
-        model_open,
-        effort_open,
-        effort_for,
-        owner,
-        upgrade,
-        account,
-        off,
-    )
-        .hash(&mut h);
+    (model_open, effort_open, effort_for, owner, account, off).hash(&mut h);
     subscription.hash(&mut h);
+    account_progress.hash(&mut h);
     context.hash(&mut h);
     if usage {
         usage_facts.hash(&mut h);
@@ -4087,6 +4076,12 @@ impl FooterUndo {
         self.glass.grid_col(row, col)
     }
 
+    /// Whether window grid cell `(row, col)` is one the glass's rewrite of a row vacated: a press
+    /// there lands on nothing, never on what Claude drew under it.
+    pub(crate) fn swallows(&self, row: u16, col: u16) -> bool {
+        self.write.is_some() && self.glass.swallows(row, col)
+    }
+
     /// Whether the write on the glass put `(frame_row, col)`'s edit there.
     fn took(&self, frame_row: usize, col: usize) -> bool {
         self.written()
@@ -4457,7 +4452,14 @@ impl App {
             let card = facts
                 .filter(|f| f.model_open || f.effort_open)
                 .and_then(|_| timeline.claude_card());
-            let off = self.fact_mask(session);
+            let off = self.fact_mask_known(
+                session,
+                timeline
+                    .agent()
+                    .program
+                    .as_deref()
+                    .and_then(aterm_phase::program_of),
+            );
             let kept = facts.and_then(|f| {
                 ws.claude_footer_texts
                     .borrow()
@@ -4467,15 +4469,6 @@ impl App {
             });
             let leaf = kept.unwrap_or_else(|| fingerprint(facts, card, usage, off));
             let shows = facts.is_some();
-            let note = timeline
-                .upgrade_note()
-                .filter(|_| facts.is_some())
-                .map_or(0, |note| {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    note.hash(&mut h);
-                    h.finish()
-                });
             let (agent, group, identified) = (
                 crate::harness_host::agent_of(timeline.agent()),
                 timeline.agent().program_pgid,
@@ -4493,6 +4486,7 @@ impl App {
             let gate = timeline.card_gate().map_or(0, |gate| gate.key());
             let drawer = !shows && timeline.card_drawer_current();
             let goal = goal_term(timeline.goal());
+            let cli = TopCli::from_timeline(&timeline).term();
             drop(timeline);
             let agent = crate::harness_host::admitted_as(&entry.ctx, agent, group);
             let harness = if shows {
@@ -4533,11 +4527,11 @@ impl App {
             };
             fp = fp.rotate_left(7)
                 ^ leaf
-                ^ note.rotate_left(17)
                 ^ harness.rotate_left(29)
                 ^ key.rotate_left(41)
                 ^ top.rotate_left(31)
-                ^ goal.rotate_left(19);
+                ^ goal.rotate_left(19)
+                ^ cli.rotate_left(23);
         }
         if claude {
             fp ^= u64::from(usage).rotate_left(47);
@@ -4593,6 +4587,7 @@ impl App {
             bool,
             bool,
         ),
+        cli: TopCli,
     ) -> (
         Option<SwitchPaint>,
         Option<aterm_effects::harness_card::CardPalette>,
@@ -4601,11 +4596,8 @@ impl App {
             .and_then(|_| crate::autopilot::HarnessSwitch::of(view))
             .map(|face| {
                 let (face, hover) = ws.claude_lights.switch_shown(session, face);
-                SwitchPaint {
-                    face,
-                    hover,
-                    version: agent.and_then(aterm_phase::Program::harness_version),
-                }
+                SwitchPaint::of(face, hover, agent, cli)
+                    .refused_with(ws.claude_lights.up_refused(session))
             });
         let carried = supervised || (prog == aterm_phase::Program::Codex && self_proven);
         let theme =
@@ -4743,7 +4735,18 @@ impl App {
                 0
             },
         };
-        let composed = texts.compose_top(leaf_index, key);
+        // Claude Code's label zone as the grid holds it: a laid switch moves it whole.
+        let tail = run
+            .tail
+            .filter(|t| t.plain)
+            .and_then(|t| {
+                ws.input_scratch
+                    .cells
+                    .get(frame_row)?
+                    .get(t.col..t.col + t.len)
+            })
+            .unwrap_or_default();
+        let composed = texts.compose_top(leaf_index, key, tail);
         let hit = |cols: (usize, usize), ghost: bool| TopHit {
             frame_row: key.frame_row,
             term_row: key.term_row,
@@ -4753,7 +4756,7 @@ impl App {
         };
         if let Some(cols) = composed.ghost {
             lists.top_hits.push(hit(cols, true));
-        } else if let Some(cols) = face.tag {
+        } else if let Some(cols) = composed.tag.or(face.tag) {
             lists.top_hits.push(hit(cols, false));
         }
         if let (Some(laid), Some(paint)) = (composed.switch.clone(), switch) {
@@ -4763,11 +4766,11 @@ impl App {
                     frame_row: key.frame_row,
                     term_row: key.term_row,
                     cols: laid.cols,
-                    switch: laid.switch,
-                    button: laid.button,
+                    label: laid.label.as_ref().map(|(cols, _)| cols.clone()),
+                    arrow: laid.arrow.clone(),
                     session,
                     face: paint.face,
-                    tier: laid.tier,
+                    paint,
                     program,
                 });
         }
@@ -4977,7 +4980,7 @@ impl App {
                     }
                     continue;
                 }
-                let (held, agent, flights, gate, identified, muse_cards_need_account) = {
+                let (held, agent, flights, gate, identified, muse_cards_need_account, top_cli) = {
                     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
                     #[cfg(test)]
                     crate::work_counts::footer_timeline_locked();
@@ -5024,11 +5027,15 @@ impl App {
                             facts,
                             timeline.claude_card(),
                             usage,
-                            self.fact_mask(session),
+                            self.fact_mask_known(
+                                session,
+                                timeline
+                                    .agent()
+                                    .program
+                                    .as_deref()
+                                    .and_then(aterm_phase::program_of),
+                            ),
                         );
-                        texts
-                            .footer(leaf_index, session)
-                            .note_upgrade(timeline.upgrade_note());
                         true
                     });
                     (
@@ -5041,6 +5048,7 @@ impl App {
                         timeline.card_gate(),
                         crate::harness_host::identified_agent(timeline.agent()),
                         timeline.muse_cards_need_account(),
+                        TopCli::from_timeline(&timeline),
                     )
                 };
                 let program_pgid = agent.1;
@@ -5080,7 +5088,7 @@ impl App {
                         let agent = crate::harness_host::admitted_as(&entry.ctx, agent.0, agent.1);
                         let reading = self.session_autopilot_for(session, agent, &claims);
                         let (switch, palette) =
-                            self.bare_top_harness(ws, session, prog, agent, reading);
+                            self.bare_top_harness(ws, session, prog, agent, reading, top_cli);
                         let mut texts = ws.claude_footer_texts.borrow_mut();
                         texts.rows(leaf_index, session, &ws.input_scratch, region);
                         lists.top_only.push(leaf_index);
@@ -5166,7 +5174,14 @@ impl App {
                                     facts,
                                     timeline.claude_card(),
                                     usage,
-                                    self.fact_mask(session),
+                                    self.fact_mask_known(
+                                        session,
+                                        timeline
+                                            .agent()
+                                            .program
+                                            .as_deref()
+                                            .and_then(aterm_phase::program_of),
+                                    ),
                                 );
                             }
                         }
@@ -5194,12 +5209,14 @@ impl App {
                                 .is_some_and(|current| current != email)
                         });
                         let screen_acct = (!stale_muse_cards).then_some(screen_acct).flatten();
-                        let has_live_agy_figure = agent == Some(aterm_phase::Program::Agy)
-                            && shown
-                                .subscription
-                                .as_ref()
-                                .and_then(|sub| sub.weekly_figure)
-                                .is_some();
+                        let has_live_agy_figure = matches!(
+                            agent,
+                            Some(aterm_phase::Program::Agy | aterm_phase::Program::Muse)
+                        ) && shown
+                            .subscription
+                            .as_ref()
+                            .and_then(|sub| sub.weekly_figure)
+                            .is_some();
                         let screen_weekly = (matches!(
                             agent,
                             Some(aterm_phase::Program::Muse | aterm_phase::Program::Agy)
@@ -5296,7 +5313,14 @@ impl App {
                                         facts,
                                         timeline.claude_card(),
                                         usage,
-                                        self.fact_mask(session),
+                                        self.fact_mask_known(
+                                            session,
+                                            timeline
+                                                .agent()
+                                                .program
+                                                .as_deref()
+                                                .and_then(aterm_phase::program_of),
+                                        ),
                                     );
                                 }
                             }
@@ -5319,7 +5343,7 @@ impl App {
                 if !held {
                     if let Some(prog) = bare_top {
                         let (switch, palette) =
-                            self.bare_top_harness(ws, session, prog, agent, reading);
+                            self.bare_top_harness(ws, session, prog, agent, reading, top_cli);
                         lists.top_only.push(leaf_index);
                         self.splice_top_line(
                             ws,
@@ -5373,19 +5397,16 @@ impl App {
                 let harness_on = view.wears_glass(supervised).is_some() && !agy_switch_off;
                 let switch = crate::autopilot::HarnessSwitch::of(view).map(|face| {
                     let (face, hover) = ws.claude_lights.switch_shown(session, face);
-                    let version = agent.and_then(aterm_phase::Program::harness_version);
-                    SwitchPaint {
-                        face,
-                        hover,
-                        version,
-                    }
+                    SwitchPaint::of(face, hover, agent, top_cli)
+                        .refused_with(ws.claude_lights.up_refused(session))
                 });
                 let unhosted_on = self.unhosted_glass(agent);
                 let theme = crate::autopilot::harness_theme(view, supervised, word, unhosted_on);
                 let border = theme.filter(|_| switch.is_some() && !agy_switch_off);
-                let gate = agent
-                    .is_some_and(|prog| relabels_pill(prog, border.is_some()) && !agy_switch_off);
-                let mut relabelled = false;
+                let gate = agent.is_some_and(|prog| {
+                    rewrites_mode_row(prog, border.is_some()) && !agy_switch_off
+                });
+                let mut row_rewritten = false;
                 let top_rule = readings.reach.and_then(|r| r.rules()).map(|(top, _)| top);
                 if let Some(
                     prog @ (aterm_phase::Program::Claude
@@ -5478,18 +5499,18 @@ impl App {
                         });
                     }
                     if gate
-                        && let Some(relabel) = readings.relabel
+                        && let Some(mode) = readings.mode
                         && let Some(Some(cached)) = texts.panes.get(leaf_index)
                     {
-                        relabelled = collect_pill_relabel(
+                        row_rewritten = collect_mode_row(
                             &ws.input_scratch,
                             &cached.rows,
                             region,
-                            relabel,
+                            mode,
                             |term_row| self.chrome_owns_terminal_row(wid, term_row),
                             blank,
-                            &mut lists.relabels,
-                            &mut lists.relabel_cells,
+                            &mut lists.mode_rows,
+                            &mut lists.mode_cells,
                         );
                     }
                 }
@@ -5503,12 +5524,6 @@ impl App {
                 else {
                     continue;
                 };
-                let footer = texts.footer(leaf_index, session);
-                let draft = footer.note.is_some().then(|| {
-                    let (screen, empty) = self.claude_composer_now(session)?;
-                    (!screen.busy).then_some(!empty)
-                });
-                footer.lay_upgrade(draft.flatten());
                 lists.panes.push(FooterPane {
                     session,
                     leaf_index,
@@ -5519,7 +5534,7 @@ impl App {
                     rule,
                     blank,
                     autopilot: (word, view),
-                    relabelled,
+                    row_rewritten,
                 });
             }
             let seen = &lists.seen;
@@ -5548,7 +5563,7 @@ impl App {
         if lists.panes.is_empty()
             && !lines
             && lists.agy_edits.is_empty()
-            && lists.relabels.is_empty()
+            && lists.mode_rows.is_empty()
             && lists.tops.is_empty()
             && lists.top_hits.is_empty()
             && lists.border_toggles.is_empty()
@@ -5564,7 +5579,7 @@ impl App {
                 continue;
             };
             self.note_claude_footer_row(wid, pane.session, chips_room);
-            self.note_claude_autopilot(wid, pane.session, pane.autopilot, pane.relabelled);
+            self.note_claude_autopilot(wid, pane.session, pane.autopilot, pane.row_rewritten);
             self.note_claude_team(wid, pane.session);
             let block = self.claude_lights_block(
                 wid,
@@ -5682,15 +5697,11 @@ impl App {
                 .agy_edits
                 .iter()
                 .map(|e| (e.frame_row, e.col, e.cells.as_slice(), e.ground));
-            let relabel_cells = &lists.relabel_cells;
-            let relabels = lists.relabels.iter().map(|e| {
-                (
-                    e.frame_row,
-                    e.col,
-                    &relabel_cells[e.cells.clone()],
-                    e.ground,
-                )
-            });
+            let mode_cells = &lists.mode_cells;
+            let mode_rows = lists
+                .mode_rows
+                .iter()
+                .map(|e| (e.frame_row, e.col, &mode_cells[e.cells.clone()], e.ground));
             write_edits(
                 claude_footer_undo,
                 input_scratch,
@@ -5698,18 +5709,19 @@ impl App {
                     .chain(rules)
                     .chain(tops)
                     .chain(agy)
-                    .chain(relabels),
+                    .chain(mode_rows),
             );
-            for e in &lists.relabels {
+            for e in &lists.mode_rows {
                 if claude_footer_undo.took(e.frame_row, e.col) {
                     claude_footer_undo.glass.push(e.shift);
                 }
             }
+            // The mark and the ⬆️'s ring show only with the words the write laid over them.
             for t in &lists.tops {
-                if claude_footer_undo.took(t.frame_row, t.col)
-                    && let Some(layer) = texts.top_mark(t.leaf_index)
-                {
-                    claude_card.paint_layer(input_scratch, layer.clone());
+                if claude_footer_undo.took(t.frame_row, t.col) {
+                    for layer in texts.top_layers(t.leaf_index) {
+                        claude_card.paint_layer(input_scratch, layer.clone());
+                    }
                 }
             }
             for r in claude_footer_undo.written() {
@@ -5717,7 +5729,7 @@ impl App {
                     .agy_edits
                     .iter()
                     .map(|e| (e.frame_row, e.col))
-                    .chain(lists.relabels.iter().map(|e| (e.frame_row, e.col)))
+                    .chain(lists.mode_rows.iter().map(|e| (e.frame_row, e.col)))
                     .any(|at| at == (r.frame_row, r.col_off));
                 if !vendor {
                     claude_card.paint_marks(input_scratch, r.frame_row, r.col_off, &r.painted);
@@ -5760,6 +5772,19 @@ impl App {
                     // see it (aterm-effects `PetBrain::over_the_hosts_line`). Codex's slab
                     // pad is blank glass, held only at its marks.
                     pet_chrome.note(r.frame_row, r.col_off, 1, r.painted.len());
+                } else if let Some(e) = lists.mode_rows.iter().find(|e| (e.frame_row, e.col) == at)
+                {
+                    // A rewrite of Claude Code's row: the words it lays are the host's, the rest
+                    // it blanks out to the end of Claude's own words is glass. The pet read
+                    // Claude's cells, so it is told that blank, or it takes the letters hidden
+                    // under it for ink and seats itself out past them in empty-looking glass.
+                    let words = e.words.min(r.painted.len());
+                    pet_chrome.note_painted(r.frame_row, r.col_off, &r.painted[..words]);
+                    pet_chrome.note_blanked(
+                        r.frame_row,
+                        r.col_off + words,
+                        r.painted.len() - words,
+                    );
                 } else {
                     pet_chrome.note_painted(r.frame_row, r.col_off, &r.painted);
                 }
@@ -5915,8 +5940,24 @@ fn note_vendor_drift(session: u64, version: Option<&str>, rows: &[String]) {
             unread_pill_row(rows)
         })
         .flatten();
-    let Some(row) = unread else {
-        return;
+    let kept = || {
+        crate::reader_guard::read_or_none(session, "Claude Code drift check", rows, || {
+            unknown_mode_item_row(rows)
+        })
+        .flatten()
+    };
+    let (row, what) = match unread {
+        Some(row) => (
+            row,
+            "a mode row this aterm does not read, so the lights stand down on it",
+        ),
+        None => match kept() {
+            Some(row) => (
+                row,
+                "a mode row item this aterm does not know, kept as drawn",
+            ),
+            None => return,
+        },
     };
     let build = version.unwrap_or("(unknown build)");
     let head: String = row.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
@@ -5926,9 +5967,15 @@ fn note_vendor_drift(session: u64, version: Option<&str>, rows: &[String]) {
         return;
     }
     logged.push(key);
-    aterm_log::warn!(
-        "claude footer: Claude Code {build} drew a mode row this aterm does not read, so the lights stand down on it: {row:?}"
-    );
+    aterm_log::warn!("claude footer: Claude Code {build} drew {what}: {row:?}");
+}
+
+/// The mode row under the composer whose rewrite keeps an item this build does not know
+/// ([`footer::ModeRow::unknown`]).
+fn unknown_mode_item_row(rows: &[String]) -> Option<String> {
+    let (_, bottom) = aterm_phase::phase::composer_rules(rows)?;
+    let mode = footer::mode_row_rewrite_under(rows, bottom).filter(footer::ModeRow::unknown)?;
+    Some(rows[mode.row].trim_end().to_owned())
 }
 
 /// How many distinct unreadable rows one run logs, across every build.
@@ -5969,7 +6016,112 @@ struct TopRun {
     rule: RenderCell,
     /// Muse Code's rule at rest is labelled ([`laid_run`]).
     voice: Option<VoiceRule>,
+    /// Claude Code's own label zone right after the run ([`Tail`]).
+    tail: Option<Tail>,
+    /// The frame column past the rule's last cell: past the `─` that closes Claude's label zone
+    /// where one follows the run, else the run's own end.
+    end: usize,
 }
+
+impl TopRun {
+    /// The cells a top line may lay its parts in ([`lay_top`]), the ghost's under `face` set
+    /// aside where the tail stays.
+    fn span(&self, face: KeyFace) -> TopSpan {
+        let (tail, stuck) = match self.tail {
+            Some(t) if t.plain => (t.len, false),
+            Some(_) => (0, true),
+            None => (0, false),
+        };
+        TopSpan {
+            run: top_span(self.len, face),
+            whole: if stuck { self.len } else { self.end - self.col },
+            tail,
+            ghost: face.ghost.is_some(),
+            stuck,
+        }
+    }
+}
+
+/// Claude Code's label zone on its top rule (`footer::top_rule_labels`): its words with a blank
+/// on either side (the top-effort key, sandboxed or not, ` fast mode `, a session name). A laid
+/// harness switch moves it whole, cell for cell in Claude's own ink, to its own left
+/// ([`compose_top`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tail {
+    /// Its first cell's frame column.
+    col: usize,
+    len: usize,
+    /// Its cells' hash ([`tail_term`]): a change of Claude's own ink recomposes.
+    term: u64,
+    /// No cluster, combining mark, image or wide glyph touches it: only a plain tail moves.
+    plain: bool,
+}
+
+/// The cache term of a tail's `cells` ([`Tail::term`]).
+fn tail_term(cells: &[RenderCell]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    for c in cells {
+        for word in [
+            u64::from(c.ch),
+            u64::from(pack_rgb(c.fg)),
+            u64::from(pack_rgb(c.bg)),
+            u64::from(c.bold) | u64::from(c.italic) << 1 | (c.underline as u64) << 2,
+        ] {
+            h = (h ^ word).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h | 1
+}
+
+/// The cells a top line lays its parts in ([`TopRun::span`], [`lay_top`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopSpan {
+    /// The plain run's cells, less the ghost's where it is drawn at the run's end ([`top_span`]).
+    run: usize,
+    /// The whole rule's cells from the run's start: Claude's tail and the `─` that closes it
+    /// included (the plain run alone where no tail follows or the tail stays).
+    whole: usize,
+    /// The cells of Claude's tail that move left of a laid switch (0: none).
+    tail: usize,
+    /// aterm's ghost of the key is drawn ([`KeyFace::ghost`]).
+    ghost: bool,
+    /// Claude's tail is there but not plain: it stays where Claude drew it.
+    stuck: bool,
+}
+
+impl TopSpan {
+    /// A plain run of `len` cells with nothing after it.
+    #[cfg(test)]
+    const fn plain(len: usize) -> Self {
+        Self {
+            run: len,
+            whole: len,
+            tail: 0,
+            ghost: false,
+            stuck: false,
+        }
+    }
+
+    /// The tail slot's cells, left of the switch: the ghost, a `─`, then Claude's tail (0: empty).
+    const fn slot(&self) -> usize {
+        match (self.ghost, self.tail) {
+            (true, 0) => GHOST_CELLS,
+            (true, tail) => GHOST_CELLS + 1 + tail,
+            (false, tail) => tail,
+        }
+    }
+
+    /// The tail slot and the `──` it keeps before the switch (0: an empty slot).
+    const fn slot_block(&self) -> usize {
+        match self.slot() {
+            0 => 0,
+            n => n + SLOT_RULE,
+        }
+    }
+}
+
+/// The rule's own `─` between the tail slot and the switch.
+const SLOT_RULE: usize = 2;
 
 /// Muse Code's whole idle voice rule ([`TopRun::voice`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5984,16 +6136,31 @@ fn laid_run(key: &TopKey) -> (TopRun, usize) {
     let run = key.run;
     let lockup = cli_mark(key.program).map(|mark| mark.lockup_cells(key.build));
     let whole = run.voice.filter(|voice| {
-        lay_top(top_span(voice.len, key.face), key.switch, lockup)
-            .is_some_and(|(rung, _)| rung.lockup.is_some())
+        let span = TopSpan {
+            run: top_span(voice.len, key.face),
+            whole: voice.len,
+            tail: 0,
+            ghost: false,
+            stuck: false,
+        };
+        lay_top(span, key.switch, lockup).is_some_and(|laid| laid.rung.lockup.is_some())
     });
     match whole {
-        Some(VoiceRule { col, len, label }) => (TopRun { col, len, ..run }, label),
+        Some(VoiceRule { col, len, label }) => (
+            TopRun {
+                col,
+                len,
+                end: col + len,
+                ..run
+            },
+            label,
+        ),
         None => (run, 0),
     }
 }
 
-/// The ghost's first cell in a run of `len` cells under `face`, where it is drawn.
+/// The ghost's first cell in a run of `len` cells under `face`, where it is drawn at the run's
+/// end (no switch laid beside the tail).
 fn ghost_at(len: usize, face: KeyFace) -> Option<usize> {
     face.ghost
         .filter(|_| len >= GHOST_RUN)
@@ -6050,7 +6217,8 @@ fn top_line_selected(scratch: &RenderInput, frame_row: usize, region: PaneTextRe
         })
 }
 
-/// The rightmost plain run of the composer's top line.
+/// The composer's top line: its longest plain run of rule cells (ties go right), and Claude Code's
+/// label zone where it follows that run ([`Tail`]).
 fn read_top_run(
     scratch: &RenderInput,
     region: PaneTextRegion,
@@ -6102,6 +6270,8 @@ fn read_top_run(
             len: end - region.col_off,
             rule: RenderCell { fg: ink, ..slab },
             voice: None,
+            tail: None,
+            end,
         });
     }
     if pane_slice.is_empty() || pane_slice.iter().any(|c| c.bg != blank.bg) {
@@ -6120,15 +6290,16 @@ fn read_top_run(
     } else {
         first
     };
+    let untouched = |idx: usize| {
+        let col = region.col_off + idx;
+        !touches(&scratch.clusters, frame_row, &(col..col + 1))
+            && !touches(&scratch.combining, frame_row, &(col..col + 1))
+            && !touches(&scratch.images, frame_row, &(col..col + 1))
+    };
     let mut best = 0..0;
     let mut cur_start = None;
     for (idx, cell) in pane_slice.iter().enumerate() {
-        let col = region.col_off + idx;
-        let plain = *cell == rule
-            && !touches(&scratch.clusters, frame_row, &(col..col + 1))
-            && !touches(&scratch.combining, frame_row, &(col..col + 1))
-            && !touches(&scratch.images, frame_row, &(col..col + 1));
-        if plain {
+        if *cell == rule && untouched(idx) {
             let s = *cur_start.get_or_insert(idx);
             if idx + 1 - s >= best.len() {
                 best = s..idx + 1;
@@ -6137,12 +6308,6 @@ fn read_top_run(
             cur_start = None;
         }
     }
-    let untouched = |idx: usize| {
-        let col = region.col_off + idx;
-        !touches(&scratch.clusters, frame_row, &(col..col + 1))
-            && !touches(&scratch.combining, frame_row, &(col..col + 1))
-            && !touches(&scratch.images, frame_row, &(col..col + 1))
-    };
     let voice = muse
         .then(|| {
             let first = pane_slice.iter().position(|c| c.ch == '\u{2500}')?;
@@ -6164,356 +6329,715 @@ fn read_top_run(
             })
         })
         .flatten();
+    let tail = (!muse && !best.is_empty())
+        .then(|| {
+            let text: String = pane_slice.iter().map(|c| c.ch).collect();
+            let (zone, close) = footer::top_rule_labels(&text)?;
+            let cells = pane_slice.get(zone..close)?;
+            (zone == best.end).then(|| {
+                let plain = (zone..=close).all(untouched)
+                    && cells
+                        .iter()
+                        .all(|c| !c.wide && !c.emoji_presentation && c.ch != '\0');
+                (
+                    Tail {
+                        col: region.col_off + zone,
+                        len: close - zone,
+                        term: tail_term(cells),
+                        plain,
+                    },
+                    region.col_off + close + 1,
+                )
+            })
+        })
+        .flatten();
     Some(TopRun {
         col: region.col_off + best.start,
         len: best.len(),
         rule,
         voice,
+        tail: tail.map(|(t, _)| t),
+        end: tail.map_or(region.col_off + best.end, |(_, end)| end),
     })
+}
+
+/// A short text kept inline, so the keys that hold it stay `Copy` ([`SwitchPaint::cli_ver`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Inline<const N: usize> {
+    bytes: [u8; N],
+    len: u8,
+}
+
+impl<const N: usize> Inline<N> {
+    /// Nothing.
+    pub(crate) const EMPTY: Self = Self {
+        bytes: [0; N],
+        len: 0,
+    };
+
+    /// `text`, cut after the last whole character that fits.
+    pub(crate) fn new(text: &str) -> Self {
+        let mut out = Self::EMPTY;
+        let mut end = 0;
+        for (at, ch) in text.char_indices() {
+            let next = at + ch.len_utf8();
+            if next > N || next > usize::from(u8::MAX) {
+                break;
+            }
+            end = next;
+        }
+        out.bytes[..end].copy_from_slice(&text.as_bytes()[..end]);
+        out.len = u8::try_from(end).unwrap_or(u8::MAX);
+        out
+    }
+
+    /// `value`'s `Display`, cut as [`Self::new`] cuts, written in place: no allocation.
+    pub(crate) fn of(value: impl std::fmt::Display) -> Self {
+        use std::fmt::Write as _;
+        let mut out = Self::EMPTY;
+        // A cut ends the write: what is kept is whole characters.
+        let _ = write!(out, "{value}");
+        out
+    }
+
+    /// The text.
+    pub(crate) fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("")
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<const N: usize> std::fmt::Write for Inline<N> {
+    /// Appends `text`'s whole characters that fit; a cut is an error, which ends the write.
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let len = usize::from(self.len);
+        let room = N.min(usize::from(u8::MAX)).saturating_sub(len);
+        let mut end = 0;
+        for (at, ch) in text.char_indices() {
+            let next = at + ch.len_utf8();
+            if next > room {
+                break;
+            }
+            end = next;
+        }
+        self.bytes[len..len + end].copy_from_slice(&text.as_bytes()[..end]);
+        self.len = u8::try_from(len + end).unwrap_or(u8::MAX);
+        if end < text.len() {
+            Err(std::fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<const N: usize> Default for Inline<N> {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl<const N: usize> std::fmt::Debug for Inline<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
+}
+
+/// What of a top line's harness the pointer or the keyboard is on ([`SwitchPaint::hover`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub(crate) enum HoverAt {
+    #[default]
+    None,
+    /// The switch.
+    Switch,
+    /// The harness's label: its slot shows the label's whole words ([`label_title`]).
+    Label,
+    /// The ⬆️ of a newer build of the CLI ([`TopUp`]): it is ringed, and the label's slot says
+    /// when the move would land ([`up_words`]).
+    Arrow,
+}
+
+/// What a top line's ⬆️ says of a newer build of the running CLI ([`TopUp`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum UpState {
+    /// No newer build waits for this tab: no arrow.
+    #[default]
+    None,
+    /// A newer build is installed and its move waits: `⬆️`, a press asks for it now.
+    Ready,
+    /// The person asked for the move, or it is under way: `◐`, and the label names both builds.
+    Asked,
+}
+
+/// The newer build a top line's ⬆️ offers, read off the tab's upgrade row ([`TopUp::of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) struct TopUp {
+    pub(crate) state: UpState,
+    /// The build the move goes to, as the row states it (`2.1.310`).
+    pub(crate) to: Inline<40>,
+    /// When the move would land, in the lane's words ([`up_wait`]); empty where its wait has
+    /// none.
+    pub(crate) wait: &'static str,
+}
+
+impl TopUp {
+    /// The arrow of upgrade `row`: Ready while a numerically later build waits (pending,
+    /// announced, or a round that gave up unanswered) and the owner has not skipped it; Asked
+    /// once the owner's Now is written or the move is under way.
+    pub(crate) fn of(row: &aterm_agent::harness::upgrade_drive::Row) -> Self {
+        use aterm_agent::harness::upgrade::{GAVE_UP, Phase, Request, Version};
+        let skipped = matches!(&row.request,
+            Request::Skip(v) if Version::parse(v) == Version::parse(&row.to));
+        let waits = match &row.phase {
+            Phase::Pending | Phase::Announced { .. } => true,
+            Phase::Failed(why) => why == GAVE_UP,
+            Phase::Exiting { .. } | Phase::Relaunched { .. } | Phase::Done => false,
+        };
+        let moving = matches!(row.phase, Phase::Exiting { .. } | Phase::Relaunched { .. });
+        let state = if skipped || !aterm_phase::cli_version_later(&row.to, &row.from) {
+            UpState::None
+        } else if moving || (waits && row.request == Request::Now) {
+            UpState::Asked
+        } else if waits {
+            UpState::Ready
+        } else {
+            UpState::None
+        };
+        if state == UpState::None {
+            return Self::default();
+        }
+        Self {
+            state,
+            to: Inline::new(&row.to),
+            wait: up_wait(&row.wait),
+        }
+    }
+
+    /// Whether the line lays the arrow.
+    pub(crate) fn shows(&self) -> bool {
+        self.state != UpState::None
+    }
+
+    /// The target build's numbers, as the label names it ([`aterm_phase::cli_version_core`]).
+    fn target_core(&self) -> Option<&str> {
+        aterm_phase::cli_version_core(self.to.as_str())
+    }
+}
+
+/// When a move held by `wait` ([`aterm_agent::harness::upgrade::wait_word`]) would land once
+/// the owner asks for it, in the lane's words: an idle agent's at once, a turn's at its end,
+/// background work's after it, a login's and a usage limit's after them, a person's typing and
+/// draft once they are done (the words the bottom rule's upgrade note said before the ⬆️
+/// carried them); `""` for a wait with no such words (a tab aterm cannot read).
+#[must_use]
+pub(crate) fn up_wait(wait: &str) -> &'static str {
+    let wait = wait.strip_prefix("release:").unwrap_or(wait);
+    let head = wait.split_once(':').map_or(wait, |(head, _)| head);
+    match head {
+        "" | aterm_agent::harness::upgrade::NEXT_POINT | "ready" => "now",
+        "background" | "background-terminal" => "after background jobs",
+        "busy" | "busy-thread" | "not-idle" | "status-stale" | "settling" | "not-ready"
+        | "awaiting-ready" | "notice-shown" => "at turn end",
+        "login" => "after login",
+        "limited" => "after the usage limit",
+        "attended" => "once you stop typing",
+        "draft" | "left-typed" => "once your draft is sent or cleared",
+        _ => "",
+    }
+}
+
+/// The running CLI's build a top line's label names ([`SwitchPaint::cli_ver`]), read off memory
+/// the harness host and the session registry already filled: no file or process is read for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) struct TopCli {
+    /// The build as it states itself (`2.1.305`, `1.4.13-R6996.1`); empty where not known.
+    pub(crate) ver: Inline<40>,
+    /// A newer build the tab's upgrade row offers ([`TopUp::of`]).
+    pub(crate) up: TopUp,
+}
+
+impl TopCli {
+    /// What `timeline` knows of its agent's running build: the session registry's version (Claude
+    /// Code's), then the build of a live upgrade row, then the build the running image's store
+    /// directory names.
+    pub(crate) fn from_timeline(timeline: &crate::session_timeline::SessionTimeline) -> Self {
+        let live_from = timeline
+            .upgrade()
+            .filter(|row| upgrade_row_live(row))
+            .map(|row| row.from.as_str());
+        let ver = timeline
+            .claude_footer()
+            .and_then(|facts| facts.version.as_deref())
+            .filter(|v| !v.is_empty())
+            .or(live_from.filter(|v| !v.is_empty()))
+            .map(Inline::new)
+            .or_else(|| timeline.running_build().map(Inline::of))
+            .unwrap_or_default();
+        let up = timeline.upgrade().map(TopUp::of).unwrap_or_default();
+        Self { ver, up }
+    }
+
+    /// Its repaint term ([`App::claude_footer_fp`]).
+    pub(crate) fn term(&self) -> u64 {
+        let up = &self.up;
+        aterm_hash::fnv1a_64(self.ver.as_str().as_bytes())
+            ^ aterm_hash::fnv1a_64(up.to.as_str().as_bytes()).rotate_left(1)
+            ^ aterm_hash::fnv1a_64(up.wait.as_bytes()).rotate_left(2)
+            ^ (up.state as u64) << 61
+    }
+}
+
+/// Whether an upgrade `row` still stands before its move: its `from` is the running build.
+fn upgrade_row_live(row: &aterm_agent::harness::upgrade_drive::Row) -> bool {
+    use aterm_agent::harness::upgrade::Phase;
+    matches!(
+        row.phase,
+        Phase::Pending | Phase::Announced { .. } | Phase::Exiting { .. } | Phase::Failed(_)
+    )
 }
 
 /// The harness switch's paint on one pane's composer top rule ([`compose_top`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SwitchPaint {
-    face: crate::autopilot::HarnessSwitch,
-    hover: bool,
-    version: Option<&'static str>,
+pub(crate) struct SwitchPaint {
+    pub(crate) face: crate::autopilot::HarnessSwitch,
+    /// What the pointer or the keyboard is on.
+    pub(crate) hover: HoverAt,
+    /// The harness ([`aterm_phase::CliHarness`]): its CLI's word and its version name the label;
+    /// `None` draws the switch with no label.
+    pub(crate) harness: Option<aterm_phase::CliHarness>,
+    /// The running CLI's version as its build states it ([`TopCli::ver`]): the label shows its
+    /// numbers ([`aterm_phase::cli_version_core`]).
+    pub(crate) cli_ver: Inline<40>,
+    /// A newer build of the CLI the line's ⬆️ offers ([`TopUp`]).
+    pub(crate) up: TopUp,
+    /// Why the owner's last press of the ⬆️ was refused, for a few seconds after
+    /// (`claude_lights::REFUSAL_SHOWN`); empty otherwise.
+    pub(crate) refused: Inline<64>,
+    /// High Contrast forces the chrome's tones: the switch wears brackets (`[● on]`).
+    pub(crate) forced: bool,
 }
 
-/// How one cell of a harness switch's face is inked ([`switch_face`], [`switch_cell`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SwitchInk {
-    /// A glyph of the switch's words and state on a line that wears a theme
-    /// ([`SwitchFace::on_arc`]).
-    Arc(u8),
-    /// The switch's label (`alab harness v0.1`), and the face's blanks.
-    Label,
-    /// The ultra-narrow lit state, `● on`: the accent.
-    Lit,
-    /// A glyph of the selected `on` thumb (` ● on `).
-    OnThumb,
-    /// Outer cap of the selected `on` thumb (`▐`).
-    OnCap,
-    /// Inner seam cap from the selected `on` thumb into the recessed track (`▌`).
-    OnSeamCap,
-    /// A glyph of the selected `off` thumb (` ○ off `, or narrow ` on `): neutral slate, never accent.
-    OffThumb,
-    /// Outer cap of the selected `off` thumb (`▐`, `▌`).
-    OffCap,
-    /// Inner seam cap from the recessed track into the selected `off` thumb (`▐`).
-    OffSeamCap,
-    /// A glyph of the unselected segment (` off ` or ` on `) in the recessed track.
-    Track,
-    /// Outer cap of the recessed track (`▐`, `▌`).
-    TrackCap,
-    /// `◐ turning on` or `◐ turning off`: the accent, quieted and floored to 4.5:1
-    /// ([`turning_ink`]).
-    Turning,
-}
-
-impl SwitchInk {
-    #[cfg(test)]
-    const fn is_thumb_cap(self) -> bool {
-        matches!(
-            self,
-            Self::OnCap | Self::OnSeamCap | Self::OffCap | Self::OffSeamCap
-        )
+impl SwitchPaint {
+    /// The paint of `face` for `agent`'s harness, its CLI's build `cli`, the pointer on `hover`.
+    pub(crate) fn of(
+        face: crate::autopilot::HarnessSwitch,
+        hover: HoverAt,
+        agent: Option<aterm_phase::Program>,
+        cli: TopCli,
+    ) -> Self {
+        Self {
+            face,
+            hover,
+            harness: agent.and_then(aterm_phase::Program::cli_harness),
+            cli_ver: cli.ver,
+            up: cli.up,
+            refused: Inline::EMPTY,
+            forced: crate::chrome_band::forced_chrome().is_some(),
+        }
     }
 
+    /// This paint with the ⬆️'s refusal `words` in its label's slot.
+    pub(crate) fn refused_with(mut self, words: Option<&str>) -> Self {
+        self.refused = words.map(Inline::new).unwrap_or_default();
+        self
+    }
+
+    /// A bare paint of `face` for `harness`, as the tests lay it.
     #[cfg(test)]
-    const fn is_thumb(self) -> bool {
-        matches!(self, Self::OnThumb | Self::OffThumb)
+    pub(crate) const fn bare(
+        face: crate::autopilot::HarnessSwitch,
+        harness: Option<aterm_phase::CliHarness>,
+    ) -> Self {
+        Self {
+            face,
+            hover: HoverAt::None,
+            harness,
+            cli_ver: Inline::EMPTY,
+            up: TopUp {
+                state: UpState::None,
+                to: Inline::EMPTY,
+                wait: "",
+            },
+            refused: Inline::EMPTY,
+            forced: false,
+        }
+    }
+
+    /// Whether the pointer or the keyboard is on the switch.
+    fn hovered(&self) -> bool {
+        self.hover == HoverAt::Switch
+    }
+
+    /// The running CLI's version as the label shows it (`None`: not known).
+    fn cli_core(&self) -> Option<&str> {
+        aterm_phase::cli_version_core(self.cli_ver.as_str())
     }
 }
 
-/// The cells a switch face may take: the widest, ` alab harness v0.1 ▐ ● on ▌ off ▌ `, with
-/// headroom for multi-digit harness versions.
-const SWITCH_FACE_MAX: usize = 40;
+/// The cells the harness switch takes: ` ○ off `, its widest face. Every face lays in this slot,
+/// right-aligned, so a flip moves nothing ([`switch_face`]).
+const SWITCH_SLOT: usize = 7;
 
-/// One harness switch face as laid ([`switch_face`]): its cells and where its parts lie in them.
+/// One harness switch as laid ([`switch_face`]): its state's mark and word alone, inked alike
+/// ([`switch_cell`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SwitchFace {
-    cells: [(char, SwitchInk); SWITCH_FACE_MAX],
+    cells: [char; SWITCH_SLOT],
     len: usize,
-    /// The switch's selected state cells (with its label when contiguous on the left).
-    switch: std::ops::Range<usize>,
-    /// The off face's `on` segment (`▐ on ` on the two-half switch, `▐ on ▌` at the narrowest).
-    button: Option<std::ops::Range<usize>>,
 }
 
 impl SwitchFace {
-    fn cells(&self) -> &[(char, SwitchInk)] {
+    fn cells(&self) -> &[char] {
         &self.cells[..self.len]
     }
 
-    /// The face's text, for the tests.
+    /// The face's text.
+    #[cfg(test)]
+    fn text(&self) -> String {
+        self.cells().iter().collect()
+    }
+
+    /// The face's words, its marks and blanks left out: `on` or `off`.
+    #[cfg(a11y_tree)]
+    fn words(&self) -> String {
+        let text: String = self.cells().iter().collect();
+        text.split_whitespace()
+            .filter(|w| w.chars().any(char::is_alphanumeric))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// The harness switch: its state's mark and word alone, ` ● on ` lit and ` ○ off ` held off.
+/// Turning shows the side it turns to with `◐` (` ◐ on `, ` ◐ off `). Under High Contrast the
+/// face wears brackets (`[● on]`). A press anywhere on it turns the switch.
+fn switch_face(paint: SwitchPaint) -> SwitchFace {
+    use crate::autopilot::HarnessSwitch;
+    let (mark, word) = match paint.face {
+        HarnessSwitch::On => ('\u{25cf}', "on"),
+        HarnessSwitch::Off(_) => ('\u{25cb}', "off"),
+        HarnessSwitch::Turning => ('\u{25d0}', "on"),
+        HarnessSwitch::TurningOff => ('\u{25d0}', "off"),
+    };
+    let (open, close) = if paint.forced { ('[', ']') } else { (' ', ' ') };
+    let mut f = SwitchFace {
+        cells: [' '; SWITCH_SLOT],
+        len: 0,
+    };
+    for ch in [open, mark, ' ']
+        .into_iter()
+        .chain(word.chars())
+        .chain([close])
+    {
+        if f.len < SWITCH_SLOT {
+            f.cells[f.len] = ch;
+            f.len += 1;
+        }
+    }
+    f
+}
+
+/// How one cell of a harness label is inked ([`label_face_in`], [`label_cell`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LabelInk {
+    /// A blank.
+    Pad,
+    /// `alab`: the arc's end, bold.
+    Brand,
+    /// The quiet words: `claude harness`, `(v2.1.305)`.
+    Muted,
+    /// The harness's version, `v0.4`, bold.
+    Lit,
+}
+
+/// The cells a label may take.
+const LABEL_MAX: usize = 72;
+
+/// How many forms a label has, widest first ([`label_face_in`]).
+const LABEL_TIERS: usize = 4;
+
+/// One harness label as laid ([`label_face_in`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LabelFace {
+    cells: [(char, LabelInk); LABEL_MAX],
+    len: usize,
+}
+
+impl LabelFace {
+    const EMPTY: Self = Self {
+        cells: [(' ', LabelInk::Pad); LABEL_MAX],
+        len: 0,
+    };
+
+    fn cells(&self) -> &[(char, LabelInk)] {
+        &self.cells[..self.len]
+    }
+
+    /// The label's words.
     #[cfg(test)]
     fn text(&self) -> String {
         self.cells().iter().map(|(ch, _)| *ch).collect()
     }
 
-    fn push(&mut self, text: &str, ink: SwitchInk) {
+    fn push(&mut self, text: &str, ink: LabelInk) {
         for ch in text.chars() {
-            if self.len < SWITCH_FACE_MAX {
-                self.cells[self.len] = (ch, ink);
-                self.len += 1;
-            }
+            self.push_cell(ch, if ch == ' ' { LabelInk::Pad } else { ink });
         }
     }
 
-    /// The face on a line that wears a theme ([`SwitchInk::Arc`], [`compose_top`]):
-    /// the arc runs through its words, while the segmented pill's caps, thumb and track keep their
-    /// inks (the accent, the white line's white, or neutral slate, [`switch_cell`]).
-    fn on_arc(&mut self) {
-        let arcs = |&(ch, ink): &(char, SwitchInk)| {
-            ch != ' ' && matches!(ink, SwitchInk::Label | SwitchInk::Lit | SwitchInk::Turning)
-        };
-        let n = self.cells[..self.len].iter().filter(|&c| arcs(c)).count();
-        let mut k = 0usize;
-        for cell in &mut self.cells[..self.len] {
-            if !arcs(&*cell) {
-                continue;
-            }
-            let ink = &mut cell.1;
-            let stop = if n > 1 { k * 255 / (n - 1) } else { 0 };
-            *ink = SwitchInk::Arc(u8::try_from(stop).unwrap_or(u8::MAX));
-            k += 1;
+    fn push_cell(&mut self, ch: char, ink: LabelInk) {
+        if self.len < LABEL_MAX {
+            self.cells[self.len] = (ch, ink);
+            self.len += 1;
         }
+    }
+
+    /// `words` (each with its ink) right-aligned in `width` cells, cut with `…` at their left
+    /// where they do not fit. A character that is not one cell wide is dropped.
+    fn fitted(words: &[(String, LabelInk)], width: usize) -> Self {
+        let mut whole = Self::EMPTY;
+        let mut buf = [0u8; 4];
+        for (text, ink) in words {
+            for ch in text.chars() {
+                if footer::text_width(ch.encode_utf8(&mut buf)) == 1 {
+                    whole.push_cell(ch, if ch == ' ' { LabelInk::Pad } else { *ink });
+                }
+            }
+        }
+        let mut out = Self::EMPTY;
+        if whole.len <= width {
+            for _ in whole.len..width {
+                out.push_cell(' ', LabelInk::Pad);
+            }
+            for &(ch, ink) in whole.cells() {
+                out.push_cell(ch, ink);
+            }
+        } else if width > 0 {
+            out.push_cell('\u{2026}', LabelInk::Muted);
+            for &(ch, ink) in &whole.cells()[whole.len - (width - 1)..] {
+                out.push_cell(ch, ink);
+            }
+        }
+        out
     }
 }
 
-/// How many forms a switch face has, widest first ([`switch_face`]).
-const SWITCH_TIERS: usize = 4;
+/// [`label_face_in`]'s plain form.
+#[cfg(test)]
+fn label_face(paint: &SwitchPaint, tier: usize) -> Option<LabelFace> {
+    label_face_in(paint, tier, false)
+}
 
-/// The harness switch's face at `tier`, `None` past its narrowest.
-fn switch_face(paint: SwitchPaint, tier: usize) -> Option<SwitchFace> {
-    use crate::autopilot::HarnessSwitch;
-    let mut f = SwitchFace {
-        cells: [(' ', SwitchInk::Label); SWITCH_FACE_MAX],
-        len: 0,
-        switch: 0..0,
-        button: None,
-    };
-    let label = |f: &mut SwitchFace, words: usize| {
-        if words >= 2 {
-            f.push("alab harness ", SwitchInk::Label);
-            if let Some(ver) = paint.version {
-                f.push("v", SwitchInk::Label);
-                f.push(ver, SwitchInk::Label);
-                f.push(" ", SwitchInk::Label);
-            }
-        } else if words == 1 {
-            f.push("alab ", SwitchInk::Label);
+/// The harness label at `tier` (`alab claude harness v0.4 (v2.1.305)`, `alab harness v0.4 (…)`,
+/// `alab v0.4 (…)`, `alab v0.4`), `None` past its narrowest, where a tier says no more than the
+/// next, or for a paint with no harness. The running CLI's version is left out where it is not
+/// known: never `(v?)`. With `moving` it is the form naming both builds while the owner's asked
+/// move is on its way (`alab claude harness v0.4 (v2.1.305 → v2.1.310)`): `None` where the line
+/// offers no such move or the tier names no CLI version.
+fn label_face_in(paint: &SwitchPaint, tier: usize, moving: bool) -> Option<LabelFace> {
+    let harness = paint.harness?;
+    let cli = paint.cli_core();
+    if tier >= LABEL_TIERS || (tier == 2 && cli.is_none()) {
+        return None;
+    }
+    let to = paint
+        .up
+        .target_core()
+        .filter(|_| paint.up.state == UpState::Asked);
+    if moving && (tier >= 3 || cli.is_none() || to.is_none()) {
+        return None;
+    }
+    let mut f = LabelFace::EMPTY;
+    f.push("alab", LabelInk::Brand);
+    match tier {
+        0 => {
+            f.push(" ", LabelInk::Pad);
+            f.push(harness.cli(), LabelInk::Muted);
+            f.push(" harness", LabelInk::Muted);
         }
-    };
-    match paint.face {
-        HarnessSwitch::On => {
-            let words = [2, 1, 0, 0].get(tier).copied()?;
-            f.push(" ", SwitchInk::Label);
-            f.switch.start = f.len;
-            label(&mut f, words);
-            // Tiers 0..3 draw the two-state segmented `[ ● on | off ]` switch: only `● on` wears
-            // the lit thumb fill while `off` sits unselected in the recessed track. Tier 3 keeps
-            // `● on` down to 10-column panes.
-            if tier < 3 {
-                f.push("\u{2590}", SwitchInk::OnCap);
-                f.push(" \u{25cf} on ", SwitchInk::OnThumb);
-                f.push("\u{258c}", SwitchInk::OnSeamCap);
-                f.switch.end = f.len;
-                f.push(" off ", SwitchInk::Track);
-                f.push("\u{258c}", SwitchInk::TrackCap);
-            } else {
-                f.push("\u{25cf} on", SwitchInk::Lit);
-                f.switch.end = f.len;
-            }
-            f.push(" ", SwitchInk::Label);
+        1 => f.push(" harness", LabelInk::Muted),
+        _ => {}
+    }
+    f.push(" ", LabelInk::Pad);
+    f.push("v", LabelInk::Lit);
+    f.push(harness.version_str(), LabelInk::Lit);
+    if let Some(from) = cli.filter(|_| tier < 3) {
+        f.push(" (v", LabelInk::Muted);
+        f.push(from, LabelInk::Muted);
+        if let Some(to) = to.filter(|_| moving) {
+            f.push(" \u{2192} v", LabelInk::Muted);
+            f.push(to, LabelInk::Muted);
         }
-        HarnessSwitch::Off(_) => {
-            let words = [2, 1, 0, 0].get(tier).copied()?;
-            f.push(" ", SwitchInk::Label);
-            label(&mut f, words);
-            // Tiers 0..3 draw the two-state segmented `[ on | ○ off ]` switch: `on` sits
-            // unselected in the muted track and only `○ off` wears a neutral slate thumb (never
-            // active green). Tier 3 keeps `▐ on ▌` in neutral slate down to 12-column panes.
-            if tier < 3 {
-                let on_start = f.len;
-                f.push("\u{2590}", SwitchInk::TrackCap);
-                f.push(" on ", SwitchInk::Track);
-                f.button = Some(on_start..f.len);
-                f.switch.start = f.len;
-                f.push("\u{2590}", SwitchInk::OffSeamCap);
-                f.push(" \u{25cb} off ", SwitchInk::OffThumb);
-                f.push("\u{258c}", SwitchInk::OffCap);
-                f.switch.end = f.len;
-            } else {
-                f.switch = f.len..f.len;
-                let on_start = f.len;
-                f.push("\u{2590}", SwitchInk::OffCap);
-                f.push(" on ", SwitchInk::OffThumb);
-                f.push("\u{258c}", SwitchInk::OffCap);
-                f.button = Some(on_start..f.len);
-            }
-            f.push(" ", SwitchInk::Label);
-        }
-        HarnessSwitch::Turning | HarnessSwitch::TurningOff => {
-            let words = [2, 1, 0, 0].get(tier).copied()?;
-            f.push(" ", SwitchInk::Label);
-            f.switch.start = f.len;
-            label(&mut f, words);
-            let (wide, narrow) = if paint.face == HarnessSwitch::Turning {
-                ("\u{25d0} turning on", "\u{25d0} on")
-            } else {
-                ("\u{25d0} turning off", "\u{25d0} off")
-            };
-            f.push(if tier < 3 { wide } else { narrow }, SwitchInk::Turning);
-            f.switch.end = f.len;
-            f.push(" ", SwitchInk::Label);
-        }
+        f.push(")", LabelInk::Muted);
     }
     Some(f)
 }
 
-/// The widest of `paint`'s faces that fits `room` cells with two of the rule's own on either
-/// side, and its tier: the switch alone, as [`lay_top`]'s lockup-less rungs lay it.
-#[cfg(test)]
-fn fitted_switch_face(paint: SwitchPaint, room: usize) -> Option<(usize, SwitchFace)> {
-    (0..SWITCH_TIERS)
-        .filter_map(|tier| Some((tier, switch_face(paint, tier)?)))
-        .find(|(_, face)| face.len + 4 <= room)
+/// The label's whole words, as its title says them: `alab claude harness 0.4 · Claude Code
+/// 2.1.305`, the CLI's build as it states itself.
+fn label_title(paint: &SwitchPaint) -> Option<String> {
+    let harness = paint.harness?;
+    let mut title = format!(
+        "alab {} harness {} \u{b7} {}",
+        harness.cli(),
+        harness.version_str(),
+        harness.product()
+    );
+    if !paint.cli_ver.is_empty() {
+        title.push(' ');
+        title.push_str(paint.cli_ver.as_str());
+    }
+    Some(title)
 }
 
-/// A face cell in its ink on `blank`'s ground ([`SwitchInk::Arc`], [`brand_letter_fg`]).
-fn switch_cell(
-    ch: char,
-    ink: SwitchInk,
-    paint: SwitchPaint,
-    palette: Option<aterm_effects::harness_card::CardPalette>,
-    blank: RenderCell,
-    mark_fg: [u8; 3],
-) -> RenderCell {
-    use crate::autopilot::HarnessSwitch;
-    let accent = || legible_on(mark_fg, blank.bg);
-    let quiet = || legible_on(mix(blank.fg, blank.bg, 0.3), blank.bg);
-    let agent = || legible_on(mix(accent(), blank.fg, 0.35), blank.bg);
-    // On Autopilot Off's white line (`CardPalette::Off`) a lit `on` thumb wears the moonbow's
-    // white, as its words do; elsewhere a lit `on` thumb wears the accent, while an `off` thumb
-    // always wears neutral slate so an off switch never lights up in active green.
-    let on_pill = || match palette {
-        Some(white @ aterm_effects::harness_card::CardPalette::Off)
-            if paint.face == HarnessSwitch::On =>
-        {
-            brand_letter_fg(white, 0.0, blank)
-        }
-        _ => accent(),
-    };
-    let on_fill = || {
-        let pill = on_pill();
-        if paint.hover {
-            legible_on(mix(pill, blank.fg, 0.25), blank.bg)
-        } else {
-            pill
-        }
-    };
-    let off_fill = || {
-        legible_on(
-            mix(blank.fg, blank.bg, if paint.hover { 0.3 } else { 0.45 }),
-            blank.bg,
-        )
-    };
-    let track_bg = || mix(blank.bg, blank.fg, if paint.hover { 0.18 } else { 0.12 });
-    let track_fg = || {
-        let bg = track_bg();
-        legible_on(
-            if paint.hover {
-                blank.fg
-            } else {
-                mix(blank.fg, bg, 0.35)
-            },
-            bg,
-        )
-    };
-    let on = paint.face.is_on();
-    let mut cell = RenderCell { ch, ..blank };
-    match ink {
-        SwitchInk::Arc(stop) => {
-            let letter = brand_letter_fg(
-                palette.unwrap_or(aterm_effects::harness_card::CardPalette::Cruise),
-                f32::from(stop) / 255.0,
-                blank,
-            );
-            match paint.face {
-                HarnessSwitch::On => {
-                    cell.fg = letter;
-                    cell.bold = true;
-                }
-                HarnessSwitch::Off(_) => cell.fg = letter,
-                HarnessSwitch::Turning | HarnessSwitch::TurningOff => {
-                    cell.fg = turning_ink(letter, blank.bg);
-                }
-            }
-        }
-        SwitchInk::Label => {
-            cell.fg = if on { agent() } else { quiet() };
-            cell.bold = on;
-        }
-        SwitchInk::Lit => {
-            cell.fg = accent();
-            cell.bold = true;
-        }
-        SwitchInk::OnThumb => {
-            cell.fg = blank.bg;
-            cell.bg = on_fill();
-            cell.bold = true;
-        }
-        SwitchInk::OnCap => cell.fg = on_fill(),
-        SwitchInk::OnSeamCap => {
-            cell.fg = on_fill();
-            cell.bg = track_bg();
-        }
-        SwitchInk::OffThumb => {
-            cell.fg = blank.bg;
-            cell.bg = off_fill();
-            cell.bold = true;
-            if paint.hover && ch != ' ' && ch != '\u{25cb}' {
-                cell.underline = aterm_core::terminal::UnderlineStyle::Single;
-            }
-        }
-        SwitchInk::OffCap => cell.fg = off_fill(),
-        SwitchInk::OffSeamCap => {
-            cell.fg = off_fill();
-            cell.bg = track_bg();
-        }
-        SwitchInk::Track => {
-            cell.fg = track_fg();
-            cell.bg = track_bg();
-            if paint.hover && ch != ' ' {
-                cell.bold = true;
-                cell.underline = aterm_core::terminal::UnderlineStyle::Single;
-            }
-        }
-        SwitchInk::TrackCap => cell.fg = track_bg(),
-        SwitchInk::Turning => cell.fg = turning_ink(accent(), blank.bg),
+/// What the ⬆️ says under the pointer, and its button's description: `update to v2.1.310 · at
+/// turn end`, `updating to v2.1.310 · …` once asked; `None` with no arrow.
+pub(crate) fn up_words(up: &TopUp) -> Option<String> {
+    if !up.shows() {
+        return None;
     }
-    if paint.hover
-        && on
-        && matches!(ink, SwitchInk::Label | SwitchInk::Lit | SwitchInk::Arc(_))
-        && ch != ' '
-    {
-        cell.bold = true;
-        cell.underline = aterm_core::terminal::UnderlineStyle::Single;
+    let to = up.target_core().unwrap_or(up.to.as_str());
+    let verb = if up.state == UpState::Asked {
+        "updating"
+    } else {
+        "update"
+    };
+    let mut words = format!("{verb} to v{to}");
+    if !up.wait.is_empty() {
+        words.push_str(" \u{b7} ");
+        words.push_str(up.wait);
+    }
+    Some(words)
+}
+
+/// The words a label's slot shows instead of the label: why the ⬆️'s press was refused, for a
+/// few seconds after; while the pointer is on the label its whole words, on the ⬆️ its words.
+fn slot_words(paint: &SwitchPaint) -> Option<Vec<(String, LabelInk)>> {
+    if !paint.refused.is_empty() {
+        return Some(vec![(
+            format!("couldn't update \u{b7} {}", paint.refused.as_str()),
+            LabelInk::Muted,
+        )]);
+    }
+    match paint.hover {
+        HoverAt::Label => Some(vec![(label_title(paint)?, LabelInk::Muted)]),
+        HoverAt::Arrow => Some(vec![(up_words(&paint.up)?, LabelInk::Muted)]),
+        HoverAt::None | HoverAt::Switch => None,
+    }
+}
+
+/// The inks a top line's switch and label are drawn in ([`switch_cell`], [`label_cell`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FaceInks {
+    /// The harness's version, the ⬆️, and the switch under High Contrast.
+    lit: [u8; 3],
+    /// The switch at rest, and the label's quiet words.
+    muted: [u8; 3],
+    /// The switch while the pointer or the keyboard is on it.
+    lifted: [u8; 3],
+    /// `alab`: the arc's end lifted toward the pane's ink, quiet with the harness off.
+    brand: [u8; 3],
+}
+
+impl FaceInks {
+    /// The inks on `blank`'s ground for `paint` under `palette` (`None`: the accent `mark_fg`).
+    fn of(
+        paint: &SwitchPaint,
+        palette: Option<aterm_effects::harness_card::CardPalette>,
+        blank: RenderCell,
+        mark_fg: [u8; 3],
+    ) -> Self {
+        let (f, g) = (blank.fg, blank.bg);
+        let dark = crate::claude_card::dark_ground(blank);
+        let lit = legible_on(
+            if dark {
+                mix(f, [255; 3], 0.5)
+            } else {
+                mix(f, [0; 3], 0.3)
+            },
+            g,
+        );
+        // On a mid grey a floor's own direction can flip: the quiet words keep the lit ink's
+        // side, lighter or darker than the ground.
+        let luminance = |c: [u8; 3]| aterm_effects::color_math::relative_luminance(pack_rgb(c));
+        let light = luminance(lit) > luminance(g);
+        let muted = floored_toward(mix(f, g, if dark { 0.42 } else { 0.35 }), g, light);
+        let lifted = floored_toward(mix(f, g, 0.15), g, light);
+        let brand = match palette {
+            _ if paint.face.is_off() => muted,
+            Some(palette) if dark => legible_on(mix(rgb_of(palette.art(1.0, true)), f, 0.30), g),
+            Some(palette) => brand_letter_fg(palette, 1.0, blank),
+            None => legible_on(mark_fg, g),
+        };
+        Self {
+            lit,
+            muted,
+            lifted,
+            brand,
+        }
+    }
+}
+
+/// A switch cell on `blank`'s ground ([`FaceInks`]): the label's quiet ink at rest, lifted toward
+/// the pane's ink while the pointer or the keyboard is on it, and the version's lit ink under High
+/// Contrast, which asks for the stronger tone; never bold. Every cell keeps the ground and no
+/// sprite lies under it, so the switch draws no box.
+fn switch_cell(ch: char, paint: &SwitchPaint, inks: &FaceInks, blank: RenderCell) -> RenderCell {
+    RenderCell {
+        ch,
+        fg: if paint.forced {
+            inks.lit
+        } else if paint.hovered() {
+            inks.lifted
+        } else {
+            inks.muted
+        },
+        bold: false,
+        underline: aterm_core::terminal::UnderlineStyle::None,
+        ..blank
+    }
+}
+
+/// A label cell in its ink on `blank`'s ground ([`FaceInks`]).
+fn label_cell(ch: char, ink: LabelInk, inks: &FaceInks, blank: RenderCell) -> RenderCell {
+    let mut cell = RenderCell {
+        ch,
+        bold: false,
+        underline: aterm_core::terminal::UnderlineStyle::None,
+        ..blank
+    };
+    match ink {
+        LabelInk::Pad => cell.ch = ' ',
+        LabelInk::Brand => {
+            cell.fg = inks.brand;
+            cell.bold = true;
+        }
+        LabelInk::Muted => cell.fg = inks.muted,
+        LabelInk::Lit => {
+            cell.fg = inks.lit;
+            cell.bold = true;
+        }
     }
     cell
-}
-
-/// The settling switch's ink (`◐ turning on` or `off`, [`switch_cell`]): `ink` quieted 30%
-/// toward the ground, then floored back to 4.5:1 against it.
-fn turning_ink(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
-    legible_on(mix(ink, ground, 0.3), ground)
 }
 
 /// Adjusts `ink` along its hue to reach at least 4.5:1 contrast against `ground`.
 pub(crate) fn legible_on(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
     floored_on(ink, ground, aterm_effects::cli_marks::NAME_CONTRAST)
+}
+
+/// `ink` moved toward white (`light`) or black until it reads at the name floor on `ground`
+/// ([`aterm_effects::cli_marks::NAME_CONTRAST`]), the extreme where nothing nearer does: never
+/// across to the other side, as [`legible_on`]'s floor may go on a mid grey.
+fn floored_toward(ink: [u8; 3], ground: [u8; 3], light: bool) -> [u8; 3] {
+    let end = if light { [255; 3] } else { [0; 3] };
+    let floor = aterm_effects::cli_marks::NAME_CONTRAST;
+    (0..=32)
+        .map(|k| mix(ink, end, k as f32 / 32.0))
+        .find(|&c| reads_on(c, ground) >= floor)
+        .unwrap_or(end)
 }
 
 /// Adjusts `ink` along its hue to reach at least 3:1 contrast against `ground`.
@@ -6613,25 +7137,74 @@ enum Lockup {
     Icon,
 }
 
+/// Where a rung lays a top line's harness ([`Rung::field`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    /// The whole rule to its last cell: Claude Code's label zone and aterm's ghost move left of
+    /// the switch, into the tail slot ([`TopSpan::slot`]).
+    End,
+    /// The plain run alone, left of a label zone that stays where Claude drew it (and of the ghost
+    /// at the run's end): the switch where the scan put it.
+    Run,
+}
+
 /// One rung of the narrow ladder ([`ladder`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Rung {
-    tier: Option<usize>,
+    /// Whether the rung lays the switch ([`switch_face`]).
+    switch: bool,
+    /// The label's tier ([`label_face_in`]), `None` with no label.
+    label: Option<usize>,
+    /// The label names both builds of an asked move ([`label_face_in`]).
+    moving: bool,
     lockup: Option<Lockup>,
     lead: usize,
+    /// The rule's own `─` the rung keeps before the switch and after the last of its parts.
+    rule: usize,
+    close: usize,
+    field: Field,
     need: usize,
 }
 
-/// The most rungs a ladder has: a full rung per switch tier, then the icon, the icon compact and
-/// the switch alone.
-const LADDER_MAX: usize = SWITCH_TIERS + 3;
+/// The fewest of the rule's own `─` between the lockup (or the line's start) and what follows it.
+const RULE_MIN: usize = 3;
 
-/// The narrow ladder of a top line whose switch is `switch`, widest rung first ([`lay_top`]).
-fn ladder(switch: Option<SwitchPaint>, lockup: Option<usize>) -> ([Rung; LADDER_MAX], usize) {
+/// The cells after a laid harness: a blank, then `──` in the arc's end ink.
+const CLOSE: usize = 3;
+
+/// The cells a laid ⬆️ takes ([`TopUp`]): a blank, then its two.
+const ARROW: usize = 3;
+
+/// The most rungs a ladder has: a label tier each (and each tier's moving form), the switch with
+/// the lockup, with its icon and bare, and the last resort.
+const LADDER_MAX: usize = 2 * LABEL_TIERS + 4;
+
+/// A top line's harness as laid ([`lay_top`]): its rung, its switch and its label.
+#[derive(Debug, Clone)]
+struct Laid {
+    rung: Rung,
+    face: Option<SwitchFace>,
+    label: Option<LabelFace>,
+}
+
+/// The narrow ladder of a top line whose switch is `switch`, its lockup `lockup` cells wide, on
+/// `span`, widest rung first ([`lay_top`]). Words go first: the label's CLI word, `harness`, the
+/// CLI's version, the label, then the lockup's name, then its icon; Claude's tail is never cut,
+/// and the last resort lays the switch in the run left of it.
+fn ladder(
+    span: TopSpan,
+    switch: Option<SwitchPaint>,
+    lockup: Option<usize>,
+) -> ([Rung; LADDER_MAX], usize) {
     let none = Rung {
-        tier: None,
+        switch: false,
+        label: None,
+        moving: false,
         lockup: None,
         lead: 0,
+        rule: 0,
+        close: 0,
+        field: Field::Run,
         need: usize::MAX,
     };
     let mut rungs = [none; LADDER_MAX];
@@ -6641,94 +7214,99 @@ fn ladder(switch: Option<SwitchPaint>, lockup: Option<usize>) -> ([Rung; LADDER_
         n += 1;
     };
     let icon = aterm_effects::cli_marks::ICON_RUN;
-    match switch {
-        Some(paint) => {
-            let mut last = None;
-            for tier in 0..SWITCH_TIERS {
-                let Some(face) = switch_face(paint, tier) else {
-                    break;
-                };
-                match lockup {
-                    Some(cells) => push(Rung {
-                        tier: Some(tier),
-                        lockup: Some(Lockup::Full),
-                        lead: 2,
-                        need: cells + face.len + 6,
-                    }),
-                    None => push(Rung {
-                        tier: Some(tier),
-                        lockup: None,
-                        lead: 0,
-                        need: face.len + 4,
-                    }),
-                }
-                last = Some((tier, face.len));
-            }
-            if let (Some((tier, len)), Some(_)) = (last, lockup) {
+    let Some(paint) = switch else {
+        if let Some(cells) = lockup {
+            for (lockup, cells, lead) in [
+                (Lockup::Full, cells, 2),
+                (Lockup::Icon, icon, 2),
+                (Lockup::Icon, icon, 1),
+            ] {
                 push(Rung {
-                    tier: Some(tier),
-                    lockup: Some(Lockup::Icon),
-                    lead: 2,
-                    need: icon + len + 6,
-                });
-                push(Rung {
-                    tier: Some(tier),
-                    lockup: Some(Lockup::Icon),
-                    lead: 1,
-                    need: icon + len + 4,
-                });
-                push(Rung {
-                    tier: Some(tier),
-                    lockup: None,
-                    lead: 0,
-                    need: len + 4,
+                    lockup: Some(lockup),
+                    lead,
+                    rule: 2,
+                    need: lead + cells + if lead == 1 { 1 } else { 2 },
+                    ..none
                 });
             }
         }
-        None => {
-            if let Some(cells) = lockup {
-                push(Rung {
-                    tier: None,
-                    lockup: Some(Lockup::Full),
-                    lead: 2,
-                    need: cells + 4,
-                });
-                push(Rung {
-                    tier: None,
-                    lockup: Some(Lockup::Icon),
-                    lead: 2,
-                    need: icon + 4,
-                });
-                push(Rung {
-                    tier: None,
-                    lockup: Some(Lockup::Icon),
-                    lead: 1,
-                    need: icon + 2,
-                });
+        return (rungs, n);
+    };
+    let field = if span.stuck { Field::Run } else { Field::End };
+    let slot = match field {
+        Field::End => span.slot_block(),
+        Field::Run => 0,
+    };
+    // The ⬆️ never drops while a rung is laid.
+    let arrow = if paint.up.shows() { ARROW } else { 0 };
+    let rung = |label: Option<(usize, usize, bool)>, lockup: Option<(Lockup, usize)>| {
+        let lead = if lockup.is_some() { 2 } else { 0 };
+        Rung {
+            switch: true,
+            label: label.map(|(tier, _, _)| tier),
+            moving: label.is_some_and(|(_, _, moving)| moving),
+            lockup: lockup.map(|(l, _)| l),
+            lead,
+            rule: RULE_MIN,
+            close: CLOSE,
+            field,
+            need: lead
+                + lockup.map_or(0, |(_, cells)| cells)
+                + RULE_MIN
+                + slot
+                + SWITCH_SLOT
+                + label.map_or(0, |(_, len, _)| 1 + len)
+                + arrow
+                + CLOSE,
+        }
+    };
+    let full = lockup.map(|cells| (Lockup::Full, cells));
+    for tier in 0..LABEL_TIERS {
+        for moving in [true, false] {
+            if let Some(face) = label_face_in(&paint, tier, moving) {
+                push(rung(Some((tier, face.len, moving)), full));
             }
         }
     }
+    push(rung(None, full));
+    if lockup.is_some() {
+        push(rung(None, Some((Lockup::Icon, icon))));
+    }
+    push(rung(None, None));
+    // The last resort needs the switch's own cells, as hb-int's narrowest switch did: a switch
+    // stands wherever one stood.
+    push(Rung {
+        switch: true,
+        rule: 2,
+        close: 2,
+        field: Field::Run,
+        need: 2 + switch_face(paint).len + arrow + 2,
+        ..none
+    });
     (rungs, n)
 }
 
-/// The first of `rungs` a span of `span` cells holds.
-fn first_fit(span: usize, rungs: &[Rung]) -> Option<Rung> {
-    rungs.iter().copied().find(|r| r.need <= span)
+/// The cells `rung` may lay in on `span`.
+const fn field_len(span: TopSpan, rung: &Rung) -> usize {
+    match rung.field {
+        Field::End => span.whole,
+        Field::Run => span.run,
+    }
 }
 
-/// The first rung of [`ladder`] that fits `span` cells, and its switch face.
-fn lay_top(
-    span: usize,
-    switch: Option<SwitchPaint>,
-    lockup: Option<usize>,
-) -> Option<(Rung, Option<SwitchFace>)> {
-    let (rungs, n) = ladder(switch, lockup);
-    let rung = first_fit(span, &rungs[..n])?;
-    let face = rung
-        .tier
+/// The first rung of [`ladder`] that fits `span`, and its switch and label.
+fn lay_top(span: TopSpan, switch: Option<SwitchPaint>, lockup: Option<usize>) -> Option<Laid> {
+    let (rungs, n) = ladder(span, switch, lockup);
+    let rung = rungs[..n]
+        .iter()
+        .copied()
+        .find(|r| r.need <= field_len(span, r))?;
+    let face = switch.filter(|_| rung.switch).map(switch_face);
+    let label = rung
+        .label
         .zip(switch)
-        .and_then(|(tier, paint)| switch_face(paint, tier));
-    Some((rung, face))
+        .and_then(|(tier, paint)| label_face_in(&paint, tier, rung.moving));
+    Some(Laid { rung, face, label })
 }
 
 /// What a composer top line is composed from ([`compose_top`], [`top_build`]).
@@ -6737,9 +7315,11 @@ struct TopKey {
     frame_row: usize,
     term_row: usize,
     line: TopLine,
+    /// The run and Claude Code's label zone after it ([`Tail::term`] keys its cells).
     run: TopRun,
     program: aterm_phase::Program,
     build: Build,
+    /// The switch, the pointer's place on the harness and the running CLI's build.
     switch: Option<SwitchPaint>,
     palette: Option<aterm_effects::harness_card::CardPalette>,
     blank: RenderCell,
@@ -6765,8 +7345,8 @@ struct KeyFace {
 /// The ghost's cells.
 const GHOST_CELLS: usize = aterm_primer::CLAUDE_TOP_EFFORT_KEY.len() + 6;
 
-/// The shortest run the ghost is drawn in: itself, the `─` after it and the rule's lead of `─`
-/// before it.
+/// The shortest run the ghost is drawn in at the run's end: itself, the `─` after it and the
+/// rule's lead of `─` before it.
 const GHOST_RUN: usize = GHOST_CELLS + 1 + footer::RULE_LEAD;
 
 /// The ghost's glyphs, in order.
@@ -6788,22 +7368,29 @@ struct ComposedTop {
     glass: std::ops::Range<usize>,
     switch: Option<LaidSwitch>,
     ghost: Option<(usize, usize)>,
+    /// Where Claude Code's top-effort tag stands once its label zone moved left of the switch:
+    /// frame columns, its hit's ([`TopHit`]).
+    tag: Option<(usize, usize)>,
     lockup: std::ops::Range<usize>,
     icon: Option<usize>,
     mark: Option<aterm_core::render::FxLayer>,
+    /// The ⬆️'s ring under the pointer ([`ring_layer`]).
+    ring: Option<aterm_core::render::FxLayer>,
     /// The [`goal_term`] of the goal it was composed with (0: none).
     goal: u64,
     /// Where the active goal was laid ([`lay_goal`]): frame columns.
     goal_cols: Option<std::ops::Range<usize>>,
 }
 
-/// Where [`compose_top`] laid a harness switch ([`switch_face`]).
+/// Where [`compose_top`] laid a harness switch ([`switch_face`]) and its label ([`label_face_in`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LaidSwitch {
-    tier: usize,
+    /// The switch's cells: a press anywhere on them turns it.
     cols: std::ops::Range<usize>,
-    switch: std::ops::Range<usize>,
-    button: Option<std::ops::Range<usize>>,
+    /// The label's cells and tier: a hover shows its whole words, a press does nothing.
+    label: Option<(std::ops::Range<usize>, usize)>,
+    /// The ⬆️'s cells with the blank on either side ([`TopUp`]): a press asks for the move now.
+    pub(crate) arrow: Option<std::ops::Range<usize>>,
 }
 
 /// The context fact's words for an indicator reading `pct` per cent left.
@@ -6825,21 +7412,54 @@ const fn rgb_of(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
-/// Compose the CLI's top line ([`top_line`]), the agent's active `goal` laid between the lockup and
-/// the switch where it fits ([`lay_goal`]).
-fn compose_top(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, goal: Option<&str>) {
-    compose_top_in(key, top, version, goal, TITLE_LEAD);
+/// Compose the CLI's top line ([`top_line`]), laid from its right end: `──`, the label, the
+/// switch, `──`, Claude Code's label zone moved whole from `tail` (the grid's cells of it, as
+/// [`Tail`] read them) or aterm's ghost, the arc rule with the agent's active `goal` on it
+/// ([`lay_goal`]), and the lockup.
+fn compose_top(
+    key: &TopKey,
+    top: &mut ComposedTop,
+    version: Option<&str>,
+    goal: Option<&str>,
+    tail: &[RenderCell],
+) {
+    compose_top_in(key, top, version, goal, tail, TITLE_LEAD);
 }
 
-/// The `─` the hover title leaves before the switch.
+/// The `─` the hover title leaves before the tail slot or the switch.
 const TITLE_LEAD: usize = 2;
 
-/// [`compose_top`] with the hover title leaving `title_lead` `─` before the switch.
+/// The ⬆️ of a newer build ([`TopUp`]), drawn with emoji presentation over two cells.
+pub(crate) const UP_ARROW: char = '\u{2b06}';
+
+/// A rule cell's ink at `t` of `palette`'s arc over a rule drawn in `rule` on a pane whose ink is
+/// `ink` ([`compose_top`]): the arc lifted a quarter toward the ink, laid 68% over the rule.
+fn arc_rule_fg(
+    palette: aterm_effects::harness_card::CardPalette,
+    t: f32,
+    dark: bool,
+    rule: [u8; 3],
+    ink: [u8; 3],
+) -> [u8; 3] {
+    let lifted = mix(rgb_of(palette.art(t, dark)), ink, 0.25);
+    let mut fg = mix(rule, lifted, 0.68);
+    if fg == rule {
+        fg[0] ^= 1;
+    }
+    fg
+}
+
+/// [`compose_top`] with the hover title leaving `title_lead` `─` before the tail slot.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one line's layout, right to left, read as one pass"
+)]
 fn compose_top_in(
     key: &TopKey,
     top: &mut ComposedTop,
     version: Option<&str>,
     goal: Option<&str>,
+    tail_cells: &[RenderCell],
     title_lead: usize,
 ) {
     #[cfg(test)]
@@ -6848,6 +7468,7 @@ fn compose_top_in(
     top.glass = 0..0;
     top.switch = None;
     top.ghost = None;
+    top.tag = None;
     top.lockup = 0..0;
     top.icon = None;
     top.goal_cols = None;
@@ -6862,18 +7483,18 @@ fn compose_top_in(
         face,
         ..
     } = *key;
-    let (run, label) = laid_run(key);
+    let (mut run, voice_label) = laid_run(key);
+    // A tail whose cells are not at hand as the scan read them stays where Claude drew it.
+    if let Some(t) = run.tail.as_mut()
+        && tail_cells.len() != t.len
+    {
+        t.plain = false;
+    }
     top.col = run.col;
     let rule_cell = run.rule;
     let tint = palette.filter(|_| line == TopLine::Rule);
-    let ghost_at = ghost_at(run.len, face);
-    let mark_at = face.mark.and_then(|_| match ghost_at {
-        Some(at) => at.checked_sub(1),
-        None => face
-            .tag
-            .and_then(|(start, _)| start.checked_sub(2)?.checked_sub(run.col))
-            .filter(|&at| at < run.len),
-    });
+    let span = run.span(face);
+    let mark = cli_mark(program);
     let mark_cell = face.mark.map(|ch| RenderCell {
         ch,
         fg: mark_fg,
@@ -6900,24 +7521,87 @@ fn compose_top_in(
             ..rule_cell
         })
     };
-    if let Some(at) = ghost_at {
-        top.ghost = Some((run.col + at + 1, run.col + at + GHOST_CELLS - 1));
-    }
-    let span_len = top_span(run.len, face);
-    let mark = cli_mark(program);
-    let Some((rung, sface)) = lay_top(span_len, switch, mark.map(|m| m.lockup_cells(build))) else {
-        let first = mark_at.or(ghost_at);
-        if let Some(first) = first {
+    // The key's mark in the run, where nothing moves: the cell before the ghost at the run's end,
+    // or two before Claude's tag when the tag opens its label zone.
+    let mark_in_run = |ghost_end: Option<usize>| {
+        face.mark.and_then(|_| match ghost_end {
+            Some(at) => at.checked_sub(1),
+            None => face
+                .tag
+                .and_then(|(start, _)| start.checked_sub(2)?.checked_sub(run.col))
+                .filter(|&at| at < run.len),
+        })
+    };
+    let Some(laid) = lay_top(span, switch, mark.map(|m| m.lockup_cells(build))) else {
+        let ghost_end = ghost_at(run.len, face);
+        let mark_at = mark_in_run(ghost_end);
+        if let Some(first) = mark_at.or(ghost_end) {
             top.col = run.col + first;
             if let (Some(_), Some(mark)) = (mark_at, mark_cell) {
                 top.cells.push(mark);
             }
-            if let (Some(_), Some(lit)) = (ghost_at, face.ghost) {
+            if let (Some(at), Some(lit)) = (ghost_end, face.ghost) {
+                top.ghost = Some((run.col + at + 1, run.col + at + GHOST_CELLS - 1));
                 top.cells.extend(ghost_cells(lit));
             }
         }
         return;
     };
+    let rung = laid.rung;
+    let field = field_len(span, &rung);
+    let moved = rung.field == Field::End && rung.switch;
+    let ghost_end = if moved { None } else { ghost_at(run.len, face) };
+    // Right to left: the close, the ⬆️ and its blank, the label and its blank, the switch's
+    // slot, `──`, the tail slot.
+    let up = switch
+        .map(|paint| paint.up)
+        .filter(|up| up.shows() && rung.switch);
+    let close_at = field - rung.close;
+    let arrow_at = up.map(|_| close_at - 2..close_at);
+    let x = arrow_at.as_ref().map_or(close_at, |a| a.start - 1);
+    let label_at = laid.label.as_ref().map(|l| x - l.len..x);
+    let y = label_at.as_ref().map_or(x, |l| l.start - 1);
+    let switch_slot = rung.switch.then(|| y - SWITCH_SLOT..y);
+    let face_at = laid.face.as_ref().map(|f| y - f.len..y);
+    let slot_len = if moved { span.slot() } else { 0 };
+    let slot_at = switch_slot
+        .as_ref()
+        .filter(|_| slot_len > 0)
+        .map(|c| c.start - SLOT_RULE - slot_len..c.start - SLOT_RULE);
+    let ghost_slot = slot_at
+        .as_ref()
+        .filter(|_| span.ghost)
+        .map(|s| s.start..s.start + GHOST_CELLS);
+    let tail_slot = slot_at
+        .as_ref()
+        .filter(|_| span.tail > 0)
+        .map(|s| s.end - span.tail..s.end);
+    let next = slot_at
+        .as_ref()
+        .map(|s| s.start)
+        .or(switch_slot.as_ref().map(|c| c.start))
+        .unwrap_or(field);
+    // Where the rule hands over to the harness: a face narrower than its slot leaves the slot's
+    // first cells to the rule.
+    let handover = slot_at
+        .as_ref()
+        .map(|s| s.start)
+        .or(face_at.as_ref().map(|f| f.start))
+        .unwrap_or(next);
+    let mark_at = if moved {
+        let keyed = face.ghost.is_some() || (face.tag.is_some() && tail_slot.is_some());
+        face.mark
+            .and_then(|_| slot_at.as_ref().filter(|_| keyed))
+            .and_then(|s| s.start.checked_sub(1))
+    } else {
+        mark_in_run(ghost_end)
+    };
+    if let (Some(dst), Some(t), Some((a, b))) = (&tail_slot, run.tail, face.tag)
+        && a >= t.col
+    {
+        let at = run.col + dst.start;
+        top.tag = Some((at + a - t.col, at + b - t.col));
+    }
     let lockup_at = rung.lockup.zip(mark).map(|(lockup, mark)| {
         let cells = match lockup {
             Lockup::Full => mark.lockup_cells(build),
@@ -6925,92 +7609,102 @@ fn compose_top_in(
         };
         rung.lead..rung.lead + cells
     });
-    let switch_at = sface.as_ref().map(|f| {
-        let start = span_len - 2 - f.len;
-        start..start + f.len
-    });
-    if let (Some(f), Some(at), Some(tier)) = (&sface, &switch_at, rung.tier) {
+    // The close's blank, before its `──`.
+    let close_pad = (rung.switch && rung.close == CLOSE).then_some(close_at);
+    if let (Some(f), Some(at)) = (&laid.face, &face_at) {
         let col_start = run.col + at.start;
-        let laid = |r: &std::ops::Range<usize>| col_start + r.start..col_start + r.end;
         top.switch = Some(LaidSwitch {
-            tier,
+            arrow: arrow_at
+                .as_ref()
+                .map(|a| run.col + a.start - 1..run.col + a.end + usize::from(close_pad.is_some())),
             cols: col_start..col_start + f.len,
-            switch: laid(&f.switch),
-            button: f.button.as_ref().map(laid),
+            label: label_at
+                .as_ref()
+                .zip(rung.label)
+                .map(|(l, tier)| (run.col + l.start..run.col + l.end, tier)),
         });
     }
-    // The goal takes the rule between the lockup and the switch; the hover title, which grows
+    // The goal takes the rule between the lockup and the tail slot; the hover title, which grows
     // the lockup's name into that room, wins while the pointer is on the mark.
     let goal_at = goal.filter(|_| !key.mark_hover).and_then(|text| {
-        let from = lockup_at.as_ref().map_or(rung.lead, |r| r.end).max(label);
-        let to = [switch_at.as_ref().map(|r| r.start), mark_at]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(span_len);
-        lay_goal(text, from, to)
+        let from = lockup_at
+            .as_ref()
+            .map_or(rung.lead, |r| r.end)
+            .max(voice_label);
+        lay_goal(text, from, mark_at.map_or(next, |m| m.min(next)))
     });
     let (lo, hi) = if tint.is_some() {
-        (0, span_len)
+        (0, field)
     } else {
         let firsts = [
             lockup_at.as_ref().map(|r| r.start),
-            switch_at.as_ref().map(|r| r.start),
             mark_at,
             goal_at.as_ref().map(|g| g.cols.start),
+            slot_at.as_ref().map(|s| s.start),
+            face_at.as_ref().map(|f| f.start),
         ];
         let lasts = [
             lockup_at.as_ref().map(|r| r.end),
-            switch_at.as_ref().map(|r| r.end),
             mark_at.map(|m| m + 1),
             goal_at.as_ref().map(|g| g.cols.end),
+            face_at.as_ref().map(|f| f.end),
+            label_at.as_ref().map(|l| l.end),
+            arrow_at.as_ref().map(|a| a.end),
+            close_pad.map(|p| p + 1),
         ];
         let lo = firsts.into_iter().flatten().min().unwrap_or(0);
-        let hi = match ghost_at {
-            Some(_) => span_len,
-            None => lasts.into_iter().flatten().max().unwrap_or(lo),
+        // Where Claude's zone or the ghost moved, the whole rule is redrawn: the vendor's ` ─`
+        // under the zone it left is the rule's again.
+        let hi = if slot_len > 0 || ghost_end.is_some() {
+            field
+        } else {
+            lasts.into_iter().flatten().max().unwrap_or(lo)
         };
-        (lo, hi.max(label))
+        (lo, hi.max(voice_label))
     };
     top.col = run.col + lo;
     let cells = &mut top.cells;
     cells.resize(hi - lo, rule_cell);
+    let pad = RenderCell { ch: ' ', ..blank };
     if let Some(palette) = tint {
         let dark = crate::claude_card::dark_ground(blank);
-        let gap = switch_at
-            .as_ref()
-            .map(|s| lockup_at.as_ref().map_or(0, |l| l.end)..s.start);
-        for i in 0..span_len {
-            let mine =
-                |r: &Option<std::ops::Range<usize>>| r.as_ref().is_some_and(|r| r.contains(&i));
-            if mine(&lockup_at) || mine(&switch_at) {
+        let gap = lockup_at.as_ref().map_or(0, |l| l.end)..handover;
+        let parts = [
+            lockup_at.clone(),
+            ghost_slot.clone(),
+            tail_slot.clone(),
+            face_at.clone(),
+            label_at.as_ref().map(|l| l.start - 1..l.end),
+            arrow_at.as_ref().map(|a| a.start - 1..a.end),
+            close_pad.map(|p| p..p + 1),
+        ];
+        let face_start = face_at.as_ref().map_or(field, |f| f.start);
+        for i in 0..field {
+            if parts.iter().flatten().any(|r| r.contains(&i)) {
                 continue;
             }
-            let t = match &gap {
-                Some(gap) if gap.contains(&i) => {
-                    let (j, g) = (i - gap.start, gap.len());
-                    if g <= 1 {
-                        0.0
-                    } else {
-                        1.0 - j as f32 / (g - 1) as f32
-                    }
+            let t = if switch_slot.is_none() || i < gap.start {
+                1.0
+            } else if gap.contains(&i) {
+                let (j, g) = (i - gap.start, gap.len());
+                if g <= 1 {
+                    0.0
+                } else {
+                    1.0 - j as f32 / (g - 1) as f32
                 }
-                _ => 1.0,
+            } else if i < face_start {
+                0.0
+            } else {
+                1.0
             };
-            let lifted = mix(rgb_of(palette.art(t, dark)), blank.fg, 0.25);
-            let mut fg = mix(rule_cell.fg, lifted, 0.68);
-            if fg == rule_cell.fg {
-                fg[0] ^= 1;
-            }
             cells[i - lo] = RenderCell {
                 ch: '\u{2500}',
-                fg,
+                fg: arc_rule_fg(palette, t, dark, rule_cell.fg, blank.fg),
                 ..rule_cell
             };
         }
     }
     if let (Some(at), Some(mark)) = (&lockup_at, mark) {
-        let pad = RenderCell { ch: ' ', ..blank };
         for c in at.clone() {
             cells[c - lo] = pad;
         }
@@ -7021,11 +7715,13 @@ fn compose_top_in(
             let name_at = at.start + aterm_effects::cli_marks::ICON_RUN;
             let word = mark.name(build);
             let word_len = word.chars().count();
-            let limit = switch_at.as_ref().map_or(span_len, |s| s.start);
-            let room = limit.saturating_sub(name_at + 1 + title_lead);
+            let room = next.saturating_sub(name_at + 1 + title_lead);
+            // While the label shows the CLI's version the title names the product alone.
+            let says_cli = rung.label.is_some_and(|tier| tier < 3)
+                && switch.is_some_and(|paint| paint.cli_core().is_some());
             let title = key
                 .mark_hover
-                .then(|| hover_title(program.product(), version, room))
+                .then(|| hover_title(program.product(), version.filter(|_| !says_cli), room))
                 .flatten()
                 .filter(|t| t.len >= word_len);
             match title {
@@ -7073,12 +7769,59 @@ fn compose_top_in(
             }
         }
     }
-    if let (Some(mut f), Some(at), Some(paint)) = (sface, &switch_at, switch) {
-        if palette.is_some() {
-            f.on_arc();
+    if let Some(paint) = switch {
+        let inks = FaceInks::of(&paint, palette, blank, mark_fg);
+        if let (Some(f), Some(at)) = (&laid.face, &face_at) {
+            for (k, &ch) in f.cells().iter().enumerate() {
+                cells[at.start + k - lo] = switch_cell(ch, &paint, &inks, blank);
+            }
         }
-        for (k, &(ch, ink)) in f.cells().iter().enumerate() {
-            cells[at.start + k - lo] = switch_cell(ch, ink, paint, palette, blank, mark_fg);
+        if let (Some(label), Some(at)) = (&laid.label, &label_at) {
+            cells[at.start - 1 - lo] = pad;
+            let shown = slot_words(&paint).map(|words| LabelFace::fitted(&words, label.len));
+            for (k, &(ch, ink)) in shown.as_ref().unwrap_or(label).cells().iter().enumerate() {
+                cells[at.start + k - lo] = label_cell(ch, ink, &inks, blank);
+            }
+        }
+        if let (Some(at), Some(up)) = (&arrow_at, up) {
+            cells[at.start - 1 - lo] = pad;
+            let (lead, second) = match up.state {
+                UpState::Asked => (
+                    RenderCell {
+                        ch: '\u{25d0}',
+                        fg: mark_fg,
+                        bold: false,
+                        ..pad
+                    },
+                    pad,
+                ),
+                UpState::Ready | UpState::None => (
+                    RenderCell {
+                        ch: UP_ARROW,
+                        fg: inks.lit,
+                        bold: false,
+                        emoji_presentation: true,
+                        ..pad
+                    },
+                    RenderCell { wide: true, ..pad },
+                ),
+            };
+            cells[at.start - lo] = lead;
+            cells[at.start + 1 - lo] = second;
+        }
+        if let Some(p) = close_pad {
+            cells[p - lo] = pad;
+        }
+    }
+    if let (Some(at), Some(lit)) = (&ghost_slot, face.ghost) {
+        for (k, cell) in ghost_cells(lit).enumerate() {
+            cells[at.start + k - lo] = cell;
+        }
+        top.ghost = Some((run.col + at.start + 1, run.col + at.start + GHOST_CELLS - 1));
+    }
+    if let Some(at) = &tail_slot {
+        for (k, cell) in tail_cells.iter().enumerate() {
+            cells[at.start + k - lo] = *cell;
         }
     }
     if let (Some(at), Some(mark)) = (mark_at, mark_cell) {
@@ -7116,23 +7859,24 @@ fn compose_top_in(
         }
         top.goal_cols = Some(run.col + laid.cols.start..run.col + laid.cols.end);
     }
-    if let (Some(_), Some(lit)) = (ghost_at, face.ghost) {
+    if let (Some(at), Some(lit)) = (ghost_end, face.ghost) {
+        top.ghost = Some((run.col + at + 1, run.col + at + GHOST_CELLS - 1));
         cells.extend(ghost_cells(lit));
     }
     if tint.is_none() && !top.lockup.is_empty() {
         let from = (top.lockup.end - run.col)
-            .max(label)
+            .max(voice_label)
             .max(goal_at.as_ref().map_or(0, |g| g.cols.end));
-        let next = [
-            switch_at.as_ref().map(|r| r.start),
+        let ahead = [
+            switch_slot.as_ref().map(|_| handover),
             mark_at,
-            ghost_at.map(|_| span_len),
+            ghost_end.map(|_| field),
         ]
         .into_iter()
         .flatten()
         .min();
-        if let Some(next) = next.filter(|&next| from < next && next <= hi) {
-            top.glass = from - lo..next - lo;
+        if let Some(ahead) = ahead.filter(|&ahead| from < ahead && ahead <= hi) {
+            top.glass = from - lo..ahead - lo;
         }
     }
 }
@@ -7320,11 +8064,95 @@ fn pane_grid_px(
 
 /// Computes the stable fx layer ID for `session`'s top composer mark.
 pub(crate) const fn top_mark_id(session: u64) -> u64 {
-    let mut z = session ^ 0x746F_702D_6D61_726B;
+    layer_id(session ^ 0x746F_702D_6D61_726B)
+}
+
+/// Computes the stable fx layer ID for `session`'s top composer ⬆️ ring.
+pub(crate) const fn top_ring_id(session: u64) -> u64 {
+    layer_id(session ^ 0x746F_702D_7377_6974)
+}
+
+/// A seed mixed into a layer ID (SplitMix64's finalizer).
+const fn layer_id(seed: u64) -> u64 {
+    let mut z = seed;
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// The contents of the ⬆️ rings' sprites ([`aterm_effects::up_ring::content`]): the last
+/// [`Self::KEPT`] keys, so a hover back finds its bytes.
+#[derive(Debug, Default)]
+struct RingContents(
+    Vec<(
+        aterm_effects::up_ring::RingKey,
+        Arc<aterm_core::render::FxContent>,
+    )>,
+);
+
+impl RingContents {
+    /// How many contents are kept.
+    const KEPT: usize = 4;
+
+    /// The content of `key`'s ring.
+    fn content(
+        &mut self,
+        key: &aterm_effects::up_ring::RingKey,
+    ) -> Arc<aterm_core::render::FxContent> {
+        if let Some((_, kept)) = self.0.iter().find(|(k, _)| k == key) {
+            return Arc::clone(kept);
+        }
+        let content = aterm_effects::up_ring::content(key);
+        if self.0.len() >= Self::KEPT {
+            self.0.remove(0);
+        }
+        self.0.push((*key, Arc::clone(&content)));
+        content
+    }
+}
+
+/// The ring's sprite for a top rule composed from `key` into `top` while the pointer is on its
+/// ⬆️: under the arrow, from half a cell left of its first cell, in the hue of the rule it closes
+/// (`palette`'s arc, the accent `mark_fg` with no theme, none with the harness off); `None` with
+/// the pointer elsewhere. The switch itself has no sprite.
+fn ring_layer(
+    key: &TopKey,
+    top: &ComposedTop,
+    session: u64,
+    rings: &mut RingContents,
+) -> Option<aterm_core::render::FxLayer> {
+    use crate::autopilot::HarnessSwitch;
+    use aterm_effects::up_ring::{RingHue, RingKey};
+    let paint = key.switch.filter(|p| p.hover == HoverAt::Arrow)?;
+    // The arrow's hit begins with its blank: its first cell is the next.
+    let arrow = top.switch.as_ref()?.arrow.as_ref()?.start + 1;
+    let pack = crate::claude_card::pack;
+    let hue = match (paint.face, key.palette) {
+        (HarnessSwitch::Off(_) | HarnessSwitch::TurningOff, _) => RingHue::Neutral,
+        (_, Some(palette)) => RingHue::Arc(palette),
+        (_, None) => RingHue::Accent(pack(key.mark_fg)),
+    };
+    let ring = RingKey {
+        cell: key.cell,
+        ground: pack(key.blank.bg),
+        fg: pack(key.blank.fg),
+        rule: pack(key.run.rule.fg),
+        hue,
+    };
+    let (cw, ch) = key.cell;
+    let px = |cells: usize, side: u16| {
+        i32::try_from(cells)
+            .ok()
+            .and_then(|c| c.checked_mul(i32::from(side)))
+    };
+    let x = px(arrow, cw)?.checked_sub(i32::from(cw) / 2)?;
+    Some(aterm_effects::up_ring::layer(
+        top_ring_id(session),
+        rings.content(&ring),
+        (x, px(key.frame_row, ch)?),
+        key.clip,
+    ))
 }
 
 /// The mark's sprite for a top rule composed from `key` into `top`.
@@ -7352,40 +8180,23 @@ fn mark_layer(
     ))
 }
 
-/// Returns the accessibility label strings for border switch `b` and its optional action button.
+/// Returns the accessibility label of border switch `b`: the label's words whole (`alab claude
+/// harness v0.4 (2.1.305)`, at every width) where one is laid, then the switch's state.
 #[cfg(a11y_tree)]
-pub(crate) fn switch_words(b: &crate::claude_lights::BorderSwitch) -> (String, Option<String>) {
-    let paint = SwitchPaint {
-        face: b.face,
-        hover: false,
-        version: b.program.harness_version(),
-    };
-    let Some(face) = switch_face(paint, b.tier) else {
-        return (String::new(), None);
-    };
-    let words = |range: &std::ops::Range<usize>| -> String {
-        let text: String = face.cells[range.clone()]
-            .iter()
-            .map(|(ch, _)| *ch)
-            .collect();
-        text.split_whitespace()
-            .filter(|w| w.chars().any(char::is_alphanumeric))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let switch = match &face.button {
-        Some(btn) if !face.switch.is_empty() => {
-            let lead = words(&(0..btn.start));
-            let state = words(&face.switch);
-            if lead.is_empty() {
-                state
-            } else {
-                format!("{lead} {state}")
-            }
+pub(crate) fn switch_words(b: &crate::claude_lights::BorderSwitch) -> String {
+    let state = switch_face(b.paint).words();
+    let lead = b.label.as_ref().and(b.paint.harness).map(|harness| {
+        let mut lead = format!("alab {} harness v{}", harness.cli(), harness.version_str());
+        if !b.paint.cli_ver.is_empty() {
+            lead.push_str(&format!(" ({})", b.paint.cli_ver.as_str()));
         }
-        _ => words(&face.switch),
-    };
-    (switch, face.button.as_ref().map(words))
+        lead
+    });
+    match lead {
+        Some(lead) if !state.is_empty() => format!("{lead} {state}"),
+        Some(lead) => lead,
+        None => state,
+    }
 }
 
 /// Whether `row` is an agy tool-call header.
@@ -7764,8 +8575,9 @@ fn render_agy_markdown_row(
     Some(out)
 }
 
-/// Whether Claude's mode pill is relabelled on this pane's glass ([`compose_top`]).
-fn relabels_pill(program: aterm_phase::Program, bordered: bool) -> bool {
+/// Whether Claude's mode row is rewritten on this pane's glass ([`collect_mode_row`]): Claude,
+/// bordered, the harness on.
+fn rewrites_mode_row(program: aterm_phase::Program, bordered: bool) -> bool {
     program == aterm_phase::Program::Claude && bordered
 }
 
@@ -7774,31 +8586,42 @@ fn theme_term(theme: Option<aterm_effects::harness_card::CardPalette>) -> u64 {
     theme.map_or(0, |p| 1 + p as u64)
 }
 
-/// One relabelled pill ([`collect_pill_relabel`]).
-struct RelabelWrite {
+/// One rewritten row ([`collect_mode_row`]).
+struct RowWrite {
     frame_row: usize,
     col: usize,
     cells: std::ops::Range<usize>,
+    /// The cells, from `col`, the rewrite lays words in (the kept items and their separators);
+    /// the rest of `cells` is blank glass over the program's hidden letters
+    /// (`crate::pet_chrome::PetChrome::note_blanked`).
+    words: usize,
     ground: RenderCell,
     shift: GlassShift,
 }
 
-/// Column-shift mapping for a single window row whose mode pill was relabelled (`YOLO on`/`off`).
+/// Column map for a single window row the glass rewrote: Claude's mode row
+/// ([`footer::ModeRow::grid_col`]), or the row its effort hint wrapped to, blanked.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct GlassShift {
     term_row: usize,
     /// The pane's column 0.
     col_off: usize,
-    relabel: Option<footer::Relabel>,
+    /// The mode row's map; `None` for a row blanked whole up to `blank_to`.
+    mode: Option<footer::ModeRow>,
+    blank_to: usize,
 }
 
 impl GlassShift {
-    fn grid_col(&self, row: usize, col: usize) -> Option<usize> {
-        let relabel = self.relabel?;
+    /// `None` off this row; `Some(None)` on a cell the rewrite vacated.
+    fn grid_col(&self, row: usize, col: usize) -> Option<Option<usize>> {
         if row != self.term_row || col < self.col_off {
             return None;
         }
-        Some(self.col_off + relabel.grid_col(col - self.col_off))
+        let at = col - self.col_off;
+        Some(match &self.mode {
+            Some(mode) => mode.grid_col(at).map(|c| self.col_off + c),
+            None => (at >= self.blank_to).then_some(col),
+        })
     }
 }
 
@@ -7825,45 +8648,70 @@ impl GlassColumns {
         }
     }
 
-    /// Maps glass column `col` on `row` back to its terminal grid column across relabelled runs.
-    pub(crate) fn grid_col(&self, row: u16, col: u16) -> u16 {
+    fn mapped(&self, row: u16, col: u16) -> Option<Option<usize>> {
         self.rows[..self.len]
             .iter()
             .find_map(|s| s.grid_col(usize::from(row), usize::from(col)))
+    }
+
+    /// Maps glass column `col` on `row` back to its terminal grid column across rewritten rows;
+    /// a vacated cell is its own column ([`Self::swallows`] keeps a press off it).
+    pub(crate) fn grid_col(&self, row: u16, col: u16) -> u16 {
+        self.mapped(row, col)
+            .flatten()
             .and_then(|c| u16::try_from(c).ok())
             .unwrap_or(col)
     }
+
+    /// Whether `(row, col)` is a cell a rewrite vacated: a press there lands on nothing.
+    pub(crate) fn swallows(&self, row: u16, col: u16) -> bool {
+        self.mapped(row, col) == Some(None)
+    }
 }
 
-/// Collect the relabel of Claude's mode pill `relabel` under pane rows `rows`' bottom rule
-/// ([`GLASS_SHIFTS`]).
-#[allow(clippy::too_many_arguments)]
-fn collect_pill_relabel(
+/// Whether frame row `frame_row`'s cells `written` are plain enough for the glass to rewrite:
+/// no cluster, combining mark or image on them, out of the chrome, no selection, not the
+/// cursor's row, not a wrapped one.
+fn rewritable(
     scratch: &RenderInput,
-    rows: &[String],
-    region: PaneTextRegion,
-    relabel: footer::Relabel,
-    chrome_owned: impl Fn(usize) -> bool,
-    blank: RenderCell,
-    out: &mut Vec<RelabelWrite>,
-    cells: &mut Vec<RenderCell>,
+    frame_row: usize,
+    written: &std::ops::Range<usize>,
+    chrome_owned: bool,
 ) -> bool {
-    let term_row = region.row_off + relabel.row;
-    let frame_row = region.strip + term_row;
-    if out.len() >= GLASS_SHIFTS
-        || relabel.run_end > region.cols
-        || chrome_owned(term_row)
+    !(chrome_owned
         || scratch.any_selection()
         || (scratch.cursor_visible && scratch.cursor_row == frame_row)
         || !scratch.visual_to_logical_row(frame_row).is_empty()
-    {
-        return false;
-    }
-    let from = region.col_off + relabel.start;
-    let written = from..region.col_off + relabel.run_end;
-    if touches(&scratch.clusters, frame_row, &written)
-        || touches(&scratch.combining, frame_row, &written)
-        || touches(&scratch.images, frame_row, &written)
+        || touches(&scratch.clusters, frame_row, written)
+        || touches(&scratch.combining, frame_row, written)
+        || touches(&scratch.images, frame_row, written))
+}
+
+/// Collect the rewrite of Claude's mode row `mode` under pane rows `rows`' bottom rule
+/// ([`footer::ModeRow`]): its kept items cell-copied in Claude's own styles, flush at the
+/// pane's column 0 and joined by ` · ` in the ink of a `·` of Claude's, blanks after; and the row
+/// its effort hint wrapped to, blanked. `false`, the row standing as drawn, where it is not
+/// plainly Claude's ([`rewritable`]), where a cell differs from the text read, is wide or
+/// presented, or a dropped item has a ground of its own (Claude's highlight), or where the
+/// window keeps [`GLASS_SHIFTS`] rows already.
+#[allow(clippy::too_many_arguments)]
+fn collect_mode_row(
+    scratch: &RenderInput,
+    rows: &[String],
+    region: PaneTextRegion,
+    mode: footer::ModeRow,
+    chrome_owned: impl Fn(usize) -> bool,
+    blank: RenderCell,
+    out: &mut Vec<RowWrite>,
+    cells: &mut Vec<RenderCell>,
+) -> bool {
+    let term_row = region.row_off + mode.row;
+    let frame_row = region.strip + term_row;
+    let from = region.col_off;
+    let written = from..from + mode.end;
+    if out.len() >= GLASS_SHIFTS
+        || mode.end > region.cols
+        || !rewritable(scratch, frame_row, &written, chrome_owned(term_row))
     {
         return false;
     }
@@ -7874,34 +8722,86 @@ fn collect_pill_relabel(
     else {
         return false;
     };
-    let text = rows[relabel.row].chars().skip(relabel.start);
-    let pill = relabel.end - relabel.start;
-    let plain = span.iter().zip(text).enumerate().all(|(k, (c, ch))| {
-        c.ch == ch
-            && !c.wide
-            && !c.emoji_presentation
-            && !c.text_presentation
-            && (k >= pill || c.bg == blank.bg)
-    });
-    if !plain || span.len() != relabel.run_end - relabel.start {
+    let kept = |k: usize| mode.kept().iter().any(|i| (i.start..i.end).contains(&k));
+    let plain = |span: &[RenderCell], text: &str, kept: &dyn Fn(usize) -> bool| {
+        span.len() == text.chars().count()
+            && span
+                .iter()
+                .zip(text.chars())
+                .enumerate()
+                .all(|(k, (c, ch))| {
+                    c.ch == ch
+                        && !c.wide
+                        && !c.emoji_presentation
+                        && !c.text_presentation
+                        && (kept(k) || c.bg == blank.bg)
+                })
+    };
+    let text = &rows[mode.row];
+    let drawn = &text[..text
+        .char_indices()
+        .nth(mode.end)
+        .map_or(text.len(), |(b, _)| b)];
+    if !plain(span, drawn, &kept) {
         return false;
     }
-    let style = span[relabel.words - relabel.start];
+    let sep = mode.sep.and_then(|c| span.get(c)).copied().unwrap_or(blank);
     let at = cells.len();
-    cells.extend(relabel.label.chars().map(|ch| RenderCell { ch, ..style }));
-    cells.extend_from_slice(&span[relabel.end - relabel.start..]);
-    cells.extend(std::iter::repeat_n(blank, relabel.shift()));
-    out.push(RelabelWrite {
+    for (i, k) in mode.kept().iter().enumerate() {
+        if i > 0 {
+            cells.extend(
+                footer::MODE_ROW_SEP
+                    .chars()
+                    .map(|ch| RenderCell { ch, ..sep }),
+            );
+        }
+        cells.extend_from_slice(&span[k.start..k.end]);
+    }
+    cells.extend(std::iter::repeat_n(blank, mode.end - mode.glass_end()));
+    out.push(RowWrite {
         frame_row,
         col: from,
         cells: at..cells.len(),
+        words: mode.glass_end(),
         ground: blank,
         shift: GlassShift {
             term_row,
             col_off: region.col_off,
-            relabel: Some(relabel),
+            mode: Some(mode),
+            blank_to: 0,
         },
     });
+    if let Some((row, end)) = mode.effort {
+        let term_row = region.row_off + row;
+        let frame_row = region.strip + term_row;
+        let written = from..from + end;
+        let span = scratch
+            .cells
+            .get(frame_row)
+            .and_then(|cells| cells.get(written.clone()));
+        let text = &rows[row];
+        if out.len() < GLASS_SHIFTS
+            && end <= region.cols
+            && rewritable(scratch, frame_row, &written, chrome_owned(term_row))
+            && span.is_some_and(|span| plain(span, text.trim_end(), &|_| false))
+        {
+            let at = cells.len();
+            cells.extend(std::iter::repeat_n(blank, end));
+            out.push(RowWrite {
+                frame_row,
+                col: from,
+                cells: at..cells.len(),
+                words: 0,
+                ground: blank,
+                shift: GlassShift {
+                    term_row,
+                    col_off: region.col_off,
+                    mode: None,
+                    blank_to: end,
+                },
+            });
+        }
+    }
     true
 }
 
@@ -8818,7 +9718,7 @@ fn collect_agy_transcript_edits(
                         if has_shortcuts && lead_spaces <= 2 && left_trimmed.len() >= lead_spaces {
                             cells.extend(std::iter::repeat_n(blank, lead_spaces));
                             cells.extend(
-                                "YOLO on \u{00B7} "
+                                "yolo \u{00B7} "
                                     .chars()
                                     .map(|ch| RenderCell { ch, ..style }),
                             );
@@ -8952,6 +9852,10 @@ pub(crate) fn read_glass(row: &[RenderCell]) -> String {
 #[cfg(any(test, feature = "bench-support"))]
 #[path = "claude_footer_probe.rs"]
 pub(crate) mod probe;
+
+#[cfg(test)]
+#[path = "claude_account_progress_gallery.rs"]
+mod account_progress_gallery;
 
 #[cfg(test)]
 #[path = "claude_footer_cost_tests.rs"]
@@ -9099,221 +10003,134 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_switch_faces_give_words_up_before_the_switch() {
+    fn the_switch_and_the_label_give_words_up_in_order() {
         use crate::autopilot::{HarnessSwitch, SwitchOff};
-        let paint = |face| SwitchPaint {
-            face,
-            hover: false,
-            version: None,
-        };
-        let faces = |p: SwitchPaint| -> Vec<SwitchFace> {
-            (0..SWITCH_TIERS)
-                .filter_map(|t| switch_face(p, t))
-                .collect()
-        };
-        let texts =
-            |p: SwitchPaint| -> Vec<String> { faces(p).iter().map(SwitchFace::text).collect() };
-        assert_eq!(
-            texts(paint(HarnessSwitch::On)),
-            [
-                " alab harness \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
-                " alab \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
-                " \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
-                " \u{25cf} on ",
-            ]
-        );
-        assert_eq!(
-            texts(SwitchPaint {
-                face: HarnessSwitch::On,
-                hover: false,
-                version: Some("0.1"),
-            }),
-            [
-                " alab harness v0.1 \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
-                " alab \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
-                " \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
-                " \u{25cf} on ",
-            ]
-        );
+        use aterm_phase::CliHarness;
+        let paint = |face| SwitchPaint::bare(face, Some(CliHarness::ClaudeCode));
+        let face = |p: SwitchPaint| switch_face(p).text();
+        assert_eq!(face(paint(HarnessSwitch::On)), " \u{25cf} on ");
         for off in [
             SwitchOff::Master,
             SwitchOff::Agent(aterm_phase::Program::Claude),
         ] {
-            let p = paint(HarnessSwitch::Off(off));
             assert_eq!(
-                texts(p),
-                [
-                    " alab harness \u{2590} on \u{2590} \u{25cb} off \u{258c} ",
-                    " alab \u{2590} on \u{2590} \u{25cb} off \u{258c} ",
-                    " \u{2590} on \u{2590} \u{25cb} off \u{258c} ",
-                    " \u{2590} on \u{258c} ",
-                ],
+                face(paint(HarnessSwitch::Off(off))),
+                " \u{25cb} off ",
                 "{off:?}"
             );
-            for (tier, f) in faces(p).into_iter().enumerate() {
-                let button = f.button.clone().expect("every off form has its on segment");
-                let drawn: String = f.cells()[button].iter().map(|c| c.0).collect();
+        }
+        assert_eq!(
+            face(paint(HarnessSwitch::Turning)),
+            " \u{25d0} on ",
+            "turning on: the side it turns to"
+        );
+        assert_eq!(face(paint(HarnessSwitch::TurningOff)), " \u{25d0} off ");
+        assert_eq!(
+            face(SwitchPaint {
+                forced: true,
+                ..paint(HarnessSwitch::On)
+            }),
+            "[\u{25cf} on]",
+            "High Contrast brackets the switch"
+        );
+        for state in [
+            HarnessSwitch::On,
+            HarnessSwitch::Off(SwitchOff::Master),
+            HarnessSwitch::Turning,
+            HarnessSwitch::TurningOff,
+        ] {
+            for forced in [false, true] {
+                let f = switch_face(SwitchPaint {
+                    forced,
+                    ..paint(state)
+                });
+                assert!(
+                    f.len <= SWITCH_SLOT,
+                    "{state:?}: {:?} in its slot of {SWITCH_SLOT}",
+                    f.text()
+                );
                 assert_eq!(
-                    drawn,
-                    if tier < 3 {
-                        "\u{2590} on "
-                    } else {
-                        "\u{2590} on \u{258c}"
-                    }
+                    f.text().contains("off"),
+                    f.len == SWITCH_SLOT,
+                    "{state:?}: `off` fills the slot, `on` a cell short"
                 );
             }
         }
-        assert_eq!(
-            texts(paint(HarnessSwitch::Turning)),
-            [
-                " alab harness \u{25d0} turning on ",
-                " alab \u{25d0} turning on ",
-                " \u{25d0} turning on ",
-                " \u{25d0} on ",
-            ]
-        );
-        assert_eq!(
-            texts(paint(HarnessSwitch::TurningOff)),
-            [
-                " alab harness \u{25d0} turning off ",
-                " alab \u{25d0} turning off ",
-                " \u{25d0} turning off ",
-                " \u{25d0} off ",
-            ]
-        );
-        let versions = std::iter::once(None).chain(
-            aterm_phase::Program::ALL
-                .into_iter()
-                .map(|p| p.harness_version()),
-        );
-        for version in versions {
-            for face in [
-                HarnessSwitch::On,
-                HarnessSwitch::Off(SwitchOff::Master),
-                HarnessSwitch::Turning,
-                HarnessSwitch::TurningOff,
-            ] {
-                let p = SwitchPaint {
-                    face,
-                    hover: false,
-                    version,
-                };
-                for f in faces(p) {
-                    assert!(f.len < SWITCH_FACE_MAX, "{face:?}: {:?}", f.text());
-                }
-            }
-        }
-        let off = paint(HarnessSwitch::Off(SwitchOff::Master));
-        for (tier, face) in faces(off).into_iter().enumerate() {
-            let room = face.len + 4;
-            assert_eq!(
-                fitted_switch_face(off, room).map(|(t, _)| t),
-                Some(tier),
-                "{tier} fits its room"
-            );
-            assert_eq!(
-                fitted_switch_face(off, room - 1).map(|(t, _)| t),
-                (tier + 1 < SWITCH_TIERS).then_some(tier + 1),
-                "CONTROL: a cell short of {tier}"
-            );
-        }
-    }
-
-    /// A versioned lit face's pill is the switch's own cells in every segmented form, never the
-    /// off face's `on` button, and keeps its caps, thumb and muted `off` track on a themed line;
-    /// every off form keeps its `on` segment in neutral/recessed ink rather than active green.
-    #[test]
-    fn a_lit_pill_is_the_switchs_own_state_not_an_on_button() {
-        use crate::autopilot::{HarnessSwitch, SwitchOff};
-        let pill = "\u{2590} \u{25cf} on \u{258c}";
-        let paint = |face| SwitchPaint {
-            face,
-            hover: false,
-            version: Some("0.1"),
+        let labels = |p: SwitchPaint| -> Vec<String> {
+            (0..LABEL_TIERS)
+                .filter_map(|t| label_face(&p, t))
+                .map(|f| f.text())
+                .collect()
         };
-        let lit: Vec<SwitchFace> = (0..SWITCH_TIERS)
-            .filter_map(|t| switch_face(paint(HarnessSwitch::On), t))
-            .collect();
-        let texts: Vec<String> = lit.iter().map(SwitchFace::text).collect();
-        assert_eq!(lit.len(), 4, "{texts:?}");
-        for (tier, f) in lit.iter().enumerate() {
-            let switch: String = f.cells()[f.switch.clone()].iter().map(|c| c.0).collect();
-            if tier < 3 {
-                assert!(switch.ends_with(pill), "{:?}: {switch:?}", f.text());
-            } else {
-                assert_eq!(switch, "\u{25cf} on");
-            }
-            assert_eq!(f.button, None, "{:?}", f.text());
-        }
-        let mut arced = lit[0].clone();
-        arced.on_arc();
-        let glyphs: Vec<SwitchInk> = arced.cells()[arced.switch.clone()]
-            .iter()
-            .filter(|c| c.0 != ' ')
-            .map(|c| c.1)
-            .collect();
-        let (words, caps) = glyphs.split_at(glyphs.len() - 5);
+        let ver = CliHarness::ClaudeCode.version_str();
         assert_eq!(
-            caps,
+            ver.split('.').count(),
+            2,
+            "the harness's version has no third digit"
+        );
+        let known = SwitchPaint {
+            cli_ver: Inline::new("2.1.305"),
+            ..paint(HarnessSwitch::On)
+        };
+        assert_eq!(
+            labels(known),
             [
-                SwitchInk::OnCap,
-                SwitchInk::OnThumb,
-                SwitchInk::OnThumb,
-                SwitchInk::OnThumb,
-                SwitchInk::OnSeamCap
-            ],
-            "the lit thumb keeps its inks on a themed line"
+                format!("alab claude harness v{ver} (v2.1.305)"),
+                format!("alab harness v{ver} (v2.1.305)"),
+                format!("alab v{ver} (v2.1.305)"),
+                format!("alab v{ver}"),
+            ]
         );
-        let tail: Vec<SwitchInk> = arced.cells()[arced.switch.end..]
-            .iter()
-            .filter(|c| c.0 != ' ')
-            .map(|c| c.1)
-            .collect();
         assert_eq!(
-            tail,
+            labels(paint(HarnessSwitch::On)),
             [
-                SwitchInk::Track,
-                SwitchInk::Track,
-                SwitchInk::Track,
-                SwitchInk::TrackCap
+                format!("alab claude harness v{ver}"),
+                format!("alab harness v{ver}"),
+                format!("alab v{ver}"),
             ],
-            "the unselected `off` segment stays on the recessed track"
+            "an unknown CLI version is left out, never `(v?)`"
         );
-        assert_eq!(
-            (words.first(), words.last()),
-            (Some(&SwitchInk::Arc(0)), Some(&SwitchInk::Arc(u8::MAX))),
-            "the arc runs through the words"
-        );
-        let off = paint(HarnessSwitch::Off(SwitchOff::Master));
-        for (tier, f) in (0..SWITCH_TIERS)
-            .filter_map(|t| switch_face(off, t))
-            .enumerate()
-        {
-            let button = f
-                .button
-                .clone()
-                .expect("CONTROL: every off form's on segment");
-            let drawn: String = f.cells()[button.clone()].iter().map(|c| c.0).collect();
-            if tier < 3 {
-                assert!(button.end <= f.switch.start, "CONTROL: {:?}", f.text());
-                assert_eq!(drawn, "\u{2590} on ");
-            } else {
-                assert!(f.switch.is_empty(), "CONTROL: {:?}", f.text());
-                assert_eq!(drawn, "\u{2590} on \u{258c}");
-            }
+        for (harness, raw, core) in [
+            (CliHarness::Muse, "1.4.13-R6996.1", "1.4.13"),
+            (CliHarness::CodexAlab, "0.165.0-dev.4+g0123abcd9", "0.165.0"),
+            (CliHarness::Agy, "v1.4.0", "1.4.0"),
+        ] {
+            let p = SwitchPaint {
+                cli_ver: Inline::new(raw),
+                ..SwitchPaint::bare(HarnessSwitch::On, Some(harness))
+            };
+            let wide = label_face(&p, 0).expect("the widest").text();
+            assert_eq!(
+                wide,
+                format!(
+                    "alab {} harness v{} (v{core})",
+                    harness.cli(),
+                    harness.version_str()
+                ),
+                "{harness:?}: the numbers alone"
+            );
             assert!(
-                f.cells().iter().all(|&(_, ink)| !matches!(
-                    ink,
-                    SwitchInk::OnThumb | SwitchInk::OnCap | SwitchInk::OnSeamCap | SwitchInk::Lit
-                )),
-                "off switch never uses active lit green inks: {:?}",
-                f.cells()
+                label_title(&p).is_some_and(|t| t.ends_with(raw)),
+                "{harness:?}: the title says the whole build"
             );
         }
+        assert_eq!(
+            label_face(&SwitchPaint::bare(HarnessSwitch::On, None), 0),
+            None,
+            "CONTROL: no harness, no label"
+        );
+        assert_eq!(
+            label_title(&known).as_deref(),
+            Some(format!("alab claude harness {ver} \u{b7} Claude Code 2.1.305").as_str())
+        );
+        let fitted = LabelFace::fitted(&[("update to v2.1.310".to_owned(), LabelInk::Muted)], 12);
+        assert_eq!(fitted.text(), "\u{2026}to v2.1.310", "cut at the left");
+        let fitted = LabelFace::fitted(&[("v0.4".to_owned(), LabelInk::Lit)], 6);
+        assert_eq!(fitted.text(), "  v0.4", "right-aligned");
     }
 
     #[test]
-    fn the_switch_arc_reads_on_paper() {
+    fn the_brand_letter_reads_on_paper() {
         use aterm_effects::color_math::relative_luminance;
         use aterm_effects::harness_card::CardPalette;
         use aterm_types::scheme::{Appearance, builtin, builtin_names};
@@ -9324,12 +10141,7 @@ mod tests {
         };
         let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
         let px = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
-        let (mut light, mut washed, mut quieted) = (0, f32::MAX, f32::MAX);
-        let turning = SwitchPaint {
-            face: crate::autopilot::HarnessSwitch::Turning,
-            hover: false,
-            version: None,
-        };
+        let (mut light, mut washed) = (0, f32::MAX);
         for name in builtin_names() {
             let Some(scheme) = builtin(name) else {
                 continue;
@@ -9339,35 +10151,7 @@ mod tests {
                 bg: rgb(scheme.background),
                 ..RenderCell::default()
             };
-            let accent = rgb(scheme.ansi[4]);
-            let bare = switch_cell('\u{25d0}', SwitchInk::Turning, turning, None, blank, accent);
-            let k = contrast(bare.fg, blank.bg);
-            assert!(k >= 4.5, "{name}: the bare settling switch at {k:.2}:1");
-            for palette in [
-                aterm_effects::harness_card::CardPalette::Cruise,
-                aterm_effects::harness_card::CardPalette::Land,
-                aterm_effects::harness_card::CardPalette::Off,
-            ] {
-                for stop in 0..255u8 {
-                    let t = f32::from(stop) / 255.0;
-                    let settling = switch_cell(
-                        't',
-                        SwitchInk::Arc(stop),
-                        turning,
-                        Some(palette),
-                        blank,
-                        accent,
-                    );
-                    let k = contrast(settling.fg, blank.bg);
-                    assert!(
-                        k >= 4.5 && !settling.bold,
-                        "{name} {palette:?} settling at {t:.3}: {k:.2}:1"
-                    );
-                    if scheme.appearance == Appearance::Light {
-                        let raw = mix(brand_letter_fg(palette, t, blank), blank.bg, 0.3);
-                        quieted = quieted.min(contrast(raw, blank.bg));
-                    }
-                }
+            for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
                 for stop in 0..255 {
                     let t = stop as f32 / 254.0;
                     let fg = brand_letter_fg(palette, t, blank);
@@ -9397,7 +10181,6 @@ mod tests {
         }
         assert!(light >= 3 * 7 * 255, "{light} light letters");
         assert!(washed < 2.0, "CONTROL: {washed:.2}");
-        assert!(quieted < 3.0, "CONTROL: the quieting alone, {quieted:.2}");
     }
 
     #[test]
@@ -10011,8 +10794,8 @@ mod tests {
         let mark_fg = [0, 128, 255];
         let fit = footer::RuleFit {
             segments: vec![
-                footer::Segment::plain(footer::ACCOUNT_MARK, "account unavailable"),
-                footer::Segment::joined(footer::WEEKLY_MARK, "weekly unavailable"),
+                footer::Segment::plain(footer::ACCOUNT_MARK, "owner@example.com"),
+                footer::Segment::joined(footer::WEEKLY_MARK, "weekly 29% left"),
                 footer::Segment {
                     split: Some("Opus 5.5 ".len()),
                     ..footer::Segment::plain(footer::MODEL_MARK, "Opus 5.5 xhigh")
@@ -10111,16 +10894,17 @@ mod tests {
     /// stays as at rest.
     #[test]
     fn the_account_unit_reads_and_lights_as_one() {
-        use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyGap};
+        use aterm_agent::harness::profile::SubscriptionDisplay;
         use aterm_core::terminal::UnderlineStyle;
         let blank = cell(' ', [200, 200, 200]);
         let rule = cell('\u{2500}', [60, 60, 60]);
         let mark_fg = [0, 128, 255];
+        let week = "weekly 61.5% left \u{b7} 59m ago";
         let facts = FooterFacts {
             subscription: Some(SubscriptionDisplay {
                 email: Some("owner@example.com".into()),
                 plan: Some("Max 20x".into()),
-                weekly_gap: Some(WeeklyGap::Untapped),
+                weekly: Some(week.into()),
                 ..Default::default()
             }),
             ..facts()
@@ -10131,9 +10915,8 @@ mod tests {
         assert_eq!(
             text_of(&rest.cells),
             format!(
-                " \u{2386} owner@example.com \u{b7} Max 20x \u{b7} {}   \
-                 \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main ",
-                WeeklyGap::Untapped.words()
+                " \u{2386} owner \u{b7} {week}   \
+                 \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main "
             )
         );
         let unit = rest
@@ -10160,15 +10943,15 @@ mod tests {
             .iter()
             .filter(|c| c.ch == footer::JOIN_MARK)
             .collect();
-        assert_eq!(joins.len(), 3, "two joins and the week's own");
+        assert_eq!(joins.len(), 2, "the join and the week's own");
         assert!(
             joins.iter().all(|c| c.fg == mark.fg),
             "every join in the marks' ink"
         );
         let word = rest.cells[own.clone()]
             .iter()
-            .find(|c| c.ch == 'M')
-            .expect("the plan");
+            .find(|c| c.ch == 'w')
+            .expect("the week's word");
         assert_ne!(word.fg, mark.fg, "CONTROL: a word is in the values' ink");
         let lit = compose_rule_spans(
             &fit,
@@ -12043,13 +12826,13 @@ mod tests {
         let mut s = engine_fill(4);
         let original = s.cells.clone();
         let ground = cell(' ', [0, 0, 0]);
-        let over = row_of("YOLO on", [1, 1, 1]);
+        let over = row_of("yolo", [1, 1, 1]);
         let past = row_of("\u{25C6} Opus", [2, 2, 2]);
         let slot = written(&mut s, vec![(1, 2, over, ground), (2, 20, past, ground)]);
         let text = |cells: &mut dyn Iterator<Item = &RenderCell>| -> String {
             cells.map(|c| c.ch).collect()
         };
-        assert!(text(&mut s.cells[1].iter()).contains("YOLO on"), "CONTROL");
+        assert!(text(&mut s.cells[1].iter()).contains("yolo"), "CONTROL");
         assert!(
             text(&mut s.cells[2].iter()).ends_with("\u{25C6} Opus"),
             "CONTROL"
@@ -12813,27 +13596,18 @@ mod tests {
         );
     }
 
+    /// A MOVE THE PERSON HOLDS IS SAID BY THE ⬆️, NOT THE BOTTOM RULE: the rule carries the
+    /// facts alone (no `⇣ Claude Code 2.1.286 is ready · waits while you use this tab`), the
+    /// row's arrival repaints the footer for the top rule's ⬆️, and the ⬆️'s words say what
+    /// holds it: the person's typing, then their draft. CONTROL: no row, no arrow.
     #[test]
-    fn a_move_the_person_holds_leads_the_rule_until_it_goes() {
+    fn a_move_the_person_holds_is_said_by_the_arrow_not_the_bottom_rule() {
         use aterm_agent::harness::upgrade::Phase;
         use aterm_agent::harness::upgrade_drive::Row;
         let (mut app, wid, session) = glass(150);
         let rows = claude_rows("footer-bypass-idle", 150);
         let bottom = aterm_phase::phase::composer_bottom(&rows).unwrap();
-        let caret = rows
-            .iter()
-            .rposition(|r| r.starts_with('\u{276F}'))
-            .unwrap();
-        let compose = |app: &App, text: &str, dim: bool| {
-            let sgr = if dim { "\x1b[2m" } else { "" };
-            let row = caret + 1;
-            let out = format!("\x1b[{row};1H\x1b[2K\u{276F} {sgr}{text}\x1b[0m\x1b[{row};3H");
-            let term = app.pool.get(session).expect("session").term.clone();
-            crate::term_lock(&term).process(out.as_bytes());
-        };
-        let suggestion = "Try \"refactor lib.rs\"";
         feed_rows(&app, session, &rows);
-        compose(&app, suggestion, true);
         publish(&app, session, facts());
         let tab = {
             let store = app.store.read().unwrap_or_else(|p| p.into_inner());
@@ -12863,95 +13637,42 @@ mod tests {
             ready: true,
             ..Row::default()
         };
-        let note = held.pause_note(now).expect("held by the person: noted");
-        let using = note.using.as_ref().expect("an empty composer's words");
+        let up = |app: &App| {
+            let ctx = app.pool.get(session).expect("session").ctx.clone();
+            let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline
+                .upgrade()
+                .map(TopUp::of)
+                .and_then(|up| up_words(&up))
+        };
+        assert_eq!(up(&app), None, "CONTROL: no row, no arrow");
         let plan = app.active_visible_leaf_plan(wid).unwrap();
         let fp_before = app.claude_footer_fp(wid, &plan);
         app.apply_agent_upgrades(vec![held.clone()]);
-        let fp_held = app.claude_footer_fp(wid, &plan);
-        assert_ne!(fp_held, fp_before, "the note repaints");
+        assert_ne!(
+            app.claude_footer_fp(wid, &plan),
+            fp_before,
+            "the row repaints, for the arrow"
+        );
+        assert_eq!(
+            up(&app).as_deref(),
+            Some("update to v2.1.286 \u{b7} once you stop typing")
+        );
         frame(&mut app, wid);
         let strip = strip(&app, wid);
-        let rule = |app: &App| app.windows[&wid].input_scratch.cells[strip + bottom].clone();
+        let text = text_of(&app.windows[&wid].input_scratch.cells[strip + bottom]);
         let facts_text = "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main \u{2500}";
-        let led = |words: &str| format!(" \u{21E3} {words}   {facts_text}");
-        let text = text_of(&rule(&app));
-        assert!(text.ends_with(&led(&using.whole)), "{text:?}");
-        let cells = rule(&app);
-        let at = cells.iter().position(|c| c.ch == '\u{21E3}').unwrap();
-        let model_mark = cells.iter().position(|c| c.ch == '\u{25C6}').unwrap();
-        assert_eq!(cells[at].fg, cells[model_mark].fg, "the note's mark");
-        let word = at + 1 + cells[at + 1..].iter().position(|c| c.ch != ' ').unwrap();
-        assert_ne!(cells[at].fg, cells[word].fg, "a mark, not a value");
+        assert!(!text.contains('\u{21E3}'), "{text:?}");
+        assert!(!text.contains("waits"), "{text:?}");
+        assert!(text.ends_with(&format!(" {facts_text}")), "{text:?}");
         app.apply_agent_upgrades(vec![Row {
-            wait_seen: now,
-            ..held.clone()
-        }]);
-        assert_eq!(app.claude_footer_fp(wid, &plan), fp_held, "no churn");
-        compose(&app, "fix the build", false);
-        frame(&mut app, wid);
-        let text = text_of(&rule(&app));
-        assert!(text.ends_with(&led(&note.draft.whole)), "typing: {text:?}");
-        let paused = Row {
             wait: "draft".into(),
-            wait_seen: 0,
-            person_named: false,
-            ..held.clone()
-        };
-        app.apply_agent_upgrades(vec![paused.clone()]);
-        frame(&mut app, wid);
-        let text = text_of(&rule(&app));
-        assert!(text.ends_with(&led(&note.draft.whole)), "paused: {text:?}");
-        for (why, text, dim) in [("cleared", "", false), ("its suggestion", suggestion, true)] {
-            compose(&app, text, dim);
-            frame(&mut app, wid);
-            let text = text_of(&rule(&app));
-            assert!(!text.contains('\u{21E3}'), "{why}: {text:?}");
-            assert!(text.ends_with(&format!(" {facts_text}")), "{why}: {text:?}");
-        }
-        let busy = claude_rows("footer-busy", 150);
-        let busy_bottom = aterm_phase::phase::composer_bottom(&busy).unwrap();
-        feed_rows(&app, session, &busy);
-        app.apply_agent_upgrades(vec![held.clone()]);
-        frame(&mut app, wid);
-        let text = text_of(&app.windows[&wid].input_scratch.cells[strip + busy_bottom]);
-        assert!(!text.contains('\u{21E3}'), "a turn runs: {text:?}");
-        assert!(text.contains(facts_text), "a turn runs: {text:?}");
-        feed_rows(&app, session, &rows);
-        compose(&app, suggestion, true);
-        for (why, gone) in [
-            (
-                "no look has seen the person lately",
-                Row {
-                    person_named: false,
-                    ..held.clone()
-                },
-            ),
-            (
-                "the move is under way",
-                Row {
-                    phase: Phase::Exiting { at_s: now },
-                    ..held.clone()
-                },
-            ),
-            (
-                "its own work holds it",
-                Row {
-                    wait: "not-idle:busy".into(),
-                    ..held.clone()
-                },
-            ),
-        ] {
-            app.apply_agent_upgrades(vec![held.clone()]);
-            frame(&mut app, wid);
-            assert!(text_of(&rule(&app)).contains('\u{21E3}'), "{why}: held");
-            app.apply_agent_upgrades(vec![gone]);
-            assert_ne!(app.claude_footer_fp(wid, &plan), fp_held, "{why}: repaints");
-            frame(&mut app, wid);
-            let text = text_of(&rule(&app));
-            assert!(!text.contains('\u{21E3}'), "{why}: {text:?}");
-            assert!(text.ends_with(&format!(" {facts_text}")), "{why}: {text:?}");
-        }
+            ..held
+        }]);
+        assert_eq!(
+            up(&app).as_deref(),
+            Some("update to v2.1.286 \u{b7} once your draft is sent or cleared")
+        );
     }
 
     #[test]
@@ -13210,7 +13931,7 @@ mod tests {
         let strip = strip(&app, wid);
         let card_line = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
         assert!(
-            card_line.contains("enhanced by aterm harness v0.1 \u{00B7} agy")
+            card_line.contains("enhanced by alab agy harness v0.4")
                 && !card_line.contains("autopilot"),
             "agy card line on row top+4: {card_line:?}"
         );
@@ -13236,8 +13957,11 @@ mod tests {
         let top_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 7]);
         assert!(
             top_rule.starts_with("\u{2500}\u{2500}    agy \u{2500}")
-                && top_rule
-                    .contains(" alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C} "),
+                && top_rule.ends_with(&format!(
+                    "{} {} (v1.4.2) \u{2500}\u{2500}",
+                    super::probe::LIT_SWITCH,
+                    super::probe::harness_label(aterm_phase::CliHarness::Agy)
+                )),
             "agy top rule has its lockup and the harness switch: {top_rule:?}"
         );
         assert!(
@@ -13348,6 +14072,42 @@ mod tests {
         );
     }
 
+    /// AN ENTRY KEPT FOR ANOTHER REASON IS NOT A MASK CHOICE: a Muse session whose
+    /// facts entry exists only for an unrelated mark (`top_seen`, a slash press, a menu
+    /// note) still starts from Muse's starting mask, and a choice that only restates
+    /// that mask is kept as the person's when the program changes under it.
+    #[test]
+    fn an_unrelated_facts_entry_never_freezes_a_muse_sessions_starting_mask() {
+        let (mut app, _wid, session) = glass(120);
+        let starting = FactMask::MODEL
+            .union(FactMask::EFFORT)
+            .union(FactMask::PATH);
+        {
+            let entry = app.pool.get(session).expect("session");
+            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.note_foreground_group(5151);
+            timeline.set_program(5151, Some("muse".into()));
+        }
+        assert_eq!(app.fact_mask(session), starting, "no entry yet");
+        app.claude_facts.entry(session).or_default().top_seen = Some(5151);
+        assert_eq!(
+            app.fact_mask(session),
+            starting,
+            "an entry kept for top_seen chose nothing"
+        );
+        app.set_fact_mask(session, starting);
+        {
+            let entry = app.pool.get(session).expect("session");
+            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.set_program(5151, Some("claude".into()));
+        }
+        assert_eq!(
+            app.fact_mask(session),
+            starting,
+            "the restated starting mask is the person's now, not the program's"
+        );
+    }
+
     #[test]
     fn muse_launch_card_and_composer_footer_render_on_the_glass() {
         let (mut app, wid, session) = glass(120);
@@ -13404,7 +14164,7 @@ mod tests {
         let strip = strip(&app, wid);
         let card_line = text_of(&app.windows[&wid].input_scratch.cells[strip + 2]);
         assert!(
-            card_line.contains("enhanced by aterm harness v0.1 \u{00B7} muse \u{00B7}")
+            card_line.contains("enhanced by alab muse harness v0.4 \u{00B7}")
                 && card_line.contains("autopilot"),
             "muse card line on row top+1: {card_line:?}"
         );
@@ -13430,8 +14190,11 @@ mod tests {
         let top_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 3]);
         assert!(
             top_rule.starts_with("\u{2500}\u{2500}    muse \u{2500}")
-                && top_rule
-                    .contains(" alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C} "),
+                && top_rule.ends_with(&format!(
+                    "{} {} (v0.9.3) \u{2500}\u{2500}",
+                    super::probe::LIT_SWITCH,
+                    super::probe::harness_label(aterm_phase::CliHarness::Muse)
+                )),
             "muse top rule has its lockup and the harness switch: {top_rule:?}"
         );
         assert!(
@@ -13448,8 +14211,10 @@ mod tests {
             "muse composer rule has the autopilot chip: {bottom_rule:?}"
         );
         assert!(
-            bottom_rule.contains("\u{25C6} gpt-5.4 high   \u{2302} ~/aterm   \u{2387} main"),
-            "muse composer rule has model, effort, path, and branch: {bottom_rule:?}"
+            bottom_rule
+                .contains("\u{25C6} gpt-5.4 off high off   \u{2302} ~/aterm off   \u{2387} main"),
+            "muse composer rule starts model, effort, and path off (its own status \
+             line below already prints them) and branch on: {bottom_rule:?}"
         );
         host.shutdown_and_join();
     }
@@ -13512,13 +14277,16 @@ mod tests {
         for (cols, rows) in &frames {
             let (top, bottom, icon) = pane(rows, *cols);
             assert!(
-                bottom.contains("\u{221E}") && bottom.contains("\u{25C6} lab-stub"),
-                "{cols}: the chip and the facts on the bottom rule: {bottom:?}"
+                bottom.contains("\u{221E}")
+                    && (!bottom.contains("lab-stub") || bottom.contains("\u{25C6} lab-stub off")),
+                "{cols}: the chip on the bottom rule, the model only as its off stub \
+                 (Muse's own line already prints it): {bottom:?}"
             );
             if *cols >= 32 {
                 assert!(
                     top.starts_with("\u{2500}\u{2500}    muse \u{2500}")
-                        && top.ends_with(" \u{25CF} on \u{258C} off \u{258C} \u{2500}\u{2500}")
+                        && top.contains(" \u{25CF} on ")
+                        && top.ends_with(" \u{2500}\u{2500}")
                         && !top.contains("Voice"),
                     "{cols}: the lockup over the label, the switch at the right: {top:?}"
                 );
@@ -13544,6 +14312,16 @@ mod tests {
     #[test]
     fn muse_signed_in_cards_populate_the_footer() {
         let (mut app, wid, session) = glass(160);
+        // The plan the pane's footer holds: the rule shows it only in the account's hover title.
+        let plan_of = |app: &App| {
+            app.windows[&wid]
+                .claude_footer_texts
+                .borrow()
+                .footers
+                .iter()
+                .find(|f| f.session == session)
+                .and_then(|f| f.shown().subscription.as_ref()?.plan.clone())
+        };
         const RESET: i64 = 1_792_947_600;
         let now = std::cell::Cell::new(RESET - 1);
         let clock_reads = std::cell::Cell::new(0usize);
@@ -13617,7 +14395,7 @@ mod tests {
         let strip = strip(&app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
         assert!(
-            bottom.contains("redacted-user@example.test") && bottom.contains("weekly unavailable"),
+            bottom.contains("\u{2386} redacted-user ") && !bottom.contains("weekly"),
             "CONTROL: no card shown yet: {bottom:?}"
         );
 
@@ -13644,11 +14422,16 @@ mod tests {
         );
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("redacted-user@example.test")
-                && bottom.contains("Muse Code Max Usage")
+            bottom.contains("\u{2386} redacted-user ")
+                && !bottom.contains("Muse Code Max Usage")
                 && bottom.contains("weekly 29% left")
                 && !bottom.contains("unavailable"),
-            "the usage card populates its tier and weekly beside the account: {bottom:?}"
+            "the usage card populates its weekly beside the account: {bottom:?}"
+        );
+        assert_eq!(
+            plan_of(&app).as_deref(),
+            Some("Muse Code Max Usage"),
+            "and its tier, for the hover"
         );
         let mut account_only = carded.clone();
         let status = vec![
@@ -13667,8 +14450,8 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[account_only_bottom]);
         assert!(
-            bottom.contains("redacted-user@example.test")
-                && !bottom.contains("Muse Code Max Usage"),
+            bottom.contains("\u{2386} redacted-user ")
+                && plan_of(&app).as_deref() != Some("Muse Code Max Usage"),
             "a named status card cannot borrow another card's plan: {bottom:?}"
         );
         feed_rows(&app, session, &carded);
@@ -13676,7 +14459,8 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("Muse Code Max Usage") && bottom.contains("weekly 29% left"),
+            plan_of(&app).as_deref() == Some("Muse Code Max Usage")
+                && bottom.contains("weekly 29% left"),
             "usage-only bootstrap remains available before any switch: {bottom:?}"
         );
         let already_read = clock_reads.get();
@@ -13732,8 +14516,8 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("redacted-user@example.test")
-                && bottom.contains("weekly unavailable")
+            bottom.contains("\u{2386} redacted-user ")
+                && !bottom.contains("weekly")
                 && !bottom.contains("weekly 29% left"),
             "an unchanged expired card cannot graft its quota again: {bottom:?}"
         );
@@ -13774,9 +14558,9 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("second@example.test")
-                && bottom.contains("weekly unavailable")
-                && !bottom.contains("Muse Code Max Usage")
+            bottom.contains("\u{2386} second ")
+                && !bottom.contains("weekly")
+                && plan_of(&app).as_deref() != Some("Muse Code Max Usage")
                 && !bottom.contains("weekly 29% left"),
             "anonymous old usage cannot be attributed to the new login: {bottom:?}"
         );
@@ -13793,9 +14577,9 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("second@example.test")
-                && bottom.contains("weekly unavailable")
-                && !bottom.contains("Muse Code Max Usage")
+            bottom.contains("\u{2386} second ")
+                && !bottom.contains("weekly")
+                && plan_of(&app).as_deref() != Some("Muse Code Max Usage")
                 && !bottom.contains("weekly 29% left"),
             "a new pane/text generation cannot reattribute the old card: {bottom:?}"
         );
@@ -13823,9 +14607,9 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[stale_bottom_row]);
         assert!(
-            bottom.contains("second@example.test")
-                && bottom.contains("weekly unavailable")
-                && !bottom.contains("redacted-user@example.test")
+            bottom.contains("\u{2386} second ")
+                && !bottom.contains("weekly")
+                && !bottom.contains("redacted-user")
                 && !bottom.contains("weekly 29% left"),
             "the previous account's cards stay historical after a switch: {bottom:?}"
         );
@@ -13840,10 +14624,10 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[stale_bottom_row]);
         assert!(
-            bottom.contains("second@example.test")
-                && bottom.contains("Muse Code Pro")
-                && bottom.contains("weekly unavailable")
-                && !bottom.contains("Muse Code Max Usage")
+            bottom.contains("\u{2386} second ")
+                && plan_of(&app).as_deref() == Some("Muse Code Pro")
+                && !bottom.contains("weekly")
+                && plan_of(&app).as_deref() != Some("Muse Code Max Usage")
                 && !bottom.contains("weekly 29% left"),
             "only the matching status card's own fields are attributable: {bottom:?}"
         );
@@ -13943,9 +14727,11 @@ mod tests {
             home: scratch_home,
             stored_login: |_, _, _| true,
         };
+        // No reading, no context fact (nor a word for a value the rule does not know); the
+        // reading's arrival after it is the control that the facts are drawn there.
         let fresh = |shown: &str, program: &str| {
             assert!(
-                shown.contains(footer::ACCOUNT_MARK) && !shown.contains(mark),
+                !shown.contains(mark) && !shown.contains("unavailable"),
                 "{program}: the facts, and no context fact without a reading: {shown:?}"
             );
         };
@@ -14114,9 +14900,10 @@ mod tests {
                 PID,
                 None,
                 Some(FooterFacts {
-                    subscription: Some(
-                        aterm_agent::harness::profile::SubscriptionDisplay::default(),
-                    ),
+                    subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
+                        email: Some("owner@example.com".into()),
+                        ..Default::default()
+                    }),
                     ..FooterFacts::default()
                 }),
             ));
@@ -14260,7 +15047,14 @@ mod tests {
 
             let strip = strip(&app, wid);
             let expected_lockup = format!("\u{2500}\u{2500}    {prog} \u{2500}");
-            let expected_switch = " alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C} ";
+            let harness = match prog {
+                "agy" => aterm_phase::CliHarness::Agy,
+                "muse" => aterm_phase::CliHarness::Muse,
+                _ => aterm_phase::CliHarness::ClaudeCode,
+            };
+            let label = super::probe::harness_label(harness);
+            let expected_switch = &format!("{} {label}", super::probe::LIT_SWITCH);
+            let brand = format!("enhanced by alab {} harness v0.4", harness.cli());
             let sid = app.pool.get(session).expect("session").ctx.self_id.clone();
             let chip_line = |app: &App| {
                 let head = format!("autopilot sid={} ", sid.as_str());
@@ -14282,16 +15076,14 @@ mod tests {
             let bottom_on =
                 text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row + 2]);
             assert!(
-                bottom_on.contains("\u{2386} ")
-                    && bottom_on.contains(" \u{b7} weekly ")
-                    && bottom_on.contains("\u{25D0} ctx 84% left"),
-                "{prog}: standardized bottom rule carries account email, weekly budget, and context: {bottom_on:?}"
+                bottom_on.contains("\u{25D0} ctx 84% left") && !bottom_on.contains("unavailable"),
+                "{prog}: standardized bottom rule carries the context, and no value it does not know: {bottom_on:?}"
             );
             if prog == "agy" {
                 assert!(
-                    bottom_on.contains("redacted-user@example.test")
-                        && bottom_on.contains("Google AI Ultra"),
-                    "agy: launch card account email and plan populate standardized footer: {bottom_on:?}"
+                    bottom_on.contains("\u{2386} redacted-user ")
+                        && !bottom_on.contains("Google AI Ultra"),
+                    "agy: the launch card's account populates the standardized footer, its plan the hover: {bottom_on:?}"
                 );
             }
             if prog == "muse" {
@@ -14315,15 +15107,12 @@ mod tests {
             let card_on = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
             if prog == "agy" {
                 assert!(
-                    card_on.contains("enhanced by aterm harness")
-                        && card_on.contains("harness v0.1 \u{00B7} agy"),
+                    card_on.contains(&brand),
                     "agy: active harness draws launch card banner: {card_on:?}"
                 );
             } else {
                 assert!(
-                    card_on.contains("enhanced by aterm harness")
-                        && card_on.contains("autopilot")
-                        && (prog != "muse" || card_on.contains("harness v0.1 \u{00B7} muse")),
+                    card_on.contains(&brand) && card_on.contains("autopilot"),
                     "{prog}: active harness draws launch card banner: {card_on:?}"
                 );
             }
@@ -14364,7 +15153,7 @@ mod tests {
                  lockup still at its left and no wordmark: {top_off:?}"
             );
             assert!(
-                card_off.contains("enhanced by aterm harness")
+                card_off.contains(&brand)
                     && (prog == "agy" || card_off.contains("autopilot \u{25CB} off")),
                 "{prog}: Autopilot Off wears the white card: {card_off:?}"
             );
@@ -14386,8 +15175,7 @@ mod tests {
                 let top_switch_off =
                     text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
                 assert!(
-                    top_switch_off
-                        .contains(" alab harness v0.1 \u{2590} on \u{2590} \u{25CB} off \u{258C} ")
+                    top_switch_off.contains(&format!("{} {label}", super::probe::OFF_SWITCH))
                         && !top_switch_off.starts_with(&expected_lockup)
                         && !top_switch_off.contains("implement vision"),
                     "agy: toggled-off harness leaves only the off switch button on the top rule: {top_switch_off:?}"
@@ -14432,7 +15220,7 @@ mod tests {
             );
             let card_reenabled = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
             assert!(
-                card_reenabled.contains("enhanced by aterm harness"),
+                card_reenabled.contains(&brand),
                 "{prog}: re-enabled harness restores launch card banner: {card_reenabled:?}"
             );
 
@@ -14534,6 +15322,8 @@ mod tests {
             card: Some(false),
             ..Default::default()
         });
+        let label = super::probe::harness_label(aterm_phase::CliHarness::ClaudeCode);
+        let lit = format!("{} {label}", super::probe::LIT_SWITCH);
         let (bare, text) = under(&mut app, Autopilot::Cruise);
         assert!(
             bare.windows(2).all(|w| w[0] == w[1]) && !text.contains("alab kitty"),
@@ -14550,8 +15340,7 @@ mod tests {
         );
         let (claimed, text) = under(&mut app, Autopilot::Cruise);
         assert!(
-            text.contains("alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C}")
-                && claimed.windows(2).any(|w| w[0] != w[1]),
+            text.contains(&lit) && claimed.windows(2).any(|w| w[0] != w[1]),
             "claimed, tinted: {text:?}"
         );
         app.config.claude_footer = None;
@@ -14562,10 +15351,7 @@ mod tests {
         let blue = |c: [u8; 3]| c[0] <= c[1] && i32::from(c[2]) >= i32::from(c[0].max(c[1])) + 56;
 
         let (cruise, text) = under(&mut app, Autopilot::Cruise);
-        assert!(
-            text.contains("alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C}"),
-            "{text:?}"
-        );
+        assert!(text.contains(&lit), "{text:?}");
         assert!(cruise.len() > 60, "the run: {}", cruise.len());
         assert!(
             cruise.iter().copied().any(blue_violet),
@@ -14584,10 +15370,9 @@ mod tests {
         };
         assert!(
             text.starts_with("\u{2500}\u{2500}    claude \u{2500}")
-                && text.ends_with(
-                    " alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C} \u{2500}\u{2500}"
-                ),
-            "the lockup at the rule's left, the switch at its right: {text:?}"
+                && text.contains(&format!("\u{2500}{lit}"))
+                && text.ends_with(" \u{2500}\u{2500}"),
+            "the lockup at the rule's left, the switch and its label at its right: {text:?}"
         );
         let paint = |t: f32| {
             let fg = paint(t);
@@ -14597,9 +15382,10 @@ mod tests {
                 fg
             }
         };
+        let gap = cruise.len() - 4;
         let shown: Vec<[u8; 3]> = [paint(1.0), paint(1.0)]
             .into_iter()
-            .chain((0..71).map(|j| paint(1.0 - j as f32 / 70.0)))
+            .chain((0..gap).map(|j| paint(1.0 - j as f32 / (gap - 1) as f32)))
             .chain([paint(1.0), paint(1.0)])
             .collect();
         assert_eq!(cruise, shown, "the palette backward over the gap");
@@ -14617,10 +15403,7 @@ mod tests {
         );
 
         let (land, text) = under(&mut app, Autopilot::Land);
-        assert!(
-            text.contains("alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C}"),
-            "{text:?}"
-        );
+        assert!(text.contains(&lit), "{text:?}");
         assert!(
             land.iter().copied().all(warm),
             "Land's rule is the sunset: {land:?}"
@@ -14628,8 +15411,7 @@ mod tests {
 
         let (off, text) = under(&mut app, Autopilot::Off);
         assert!(
-            text.contains(" alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C} ")
-                && !text.contains("alab kitty"),
+            text.contains(&format!("{lit} ")) && !text.contains("alab kitty"),
             "Autopilot Off's switch says the harness is on, no wordmark: {text:?}"
         );
         for c in &off {
@@ -14640,10 +15422,7 @@ mod tests {
         release();
         assert!(!app.session_autopilot(session).2, "the claim is given back");
         let (released, text) = under(&mut app, Autopilot::Off);
-        assert!(
-            text.contains("alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C}"),
-            "no claim: {text:?}"
-        );
+        assert!(text.contains(&lit), "no claim: {text:?}");
         assert_eq!(released, off, "white with no claim");
         let (frame_row, cols) = app.windows[&wid]
             .claude_lights
@@ -14703,9 +15482,7 @@ mod tests {
                     "Off wears no wordmark: {text:?}"
                 );
             }
-            let face: Vec<char> = "alab harness v0.1 \u{2590} \u{25CF} on \u{258C} off \u{258C}"
-                .chars()
-                .collect();
+            let face: Vec<char> = lit.chars().collect();
             let at = (0..cells.len().saturating_sub(face.len()))
                 .find(|&k| {
                     cells[k..k + face.len()]
@@ -14714,8 +15491,8 @@ mod tests {
                         .eq(face.iter().copied())
                 })
                 .unwrap_or_else(|| panic!("{word:?}: the switch on paper: {text:?}"));
-            let label_len = "alab harness v0.1 ".chars().count();
-            let letters: Vec<[u8; 3]> = cells[at..at + label_len]
+            let switch = super::probe::LIT_SWITCH.chars().count();
+            let letters: Vec<[u8; 3]> = cells[at + switch..at + face.len()]
                 .iter()
                 .chain(&cells[6..12])
                 .filter(|c| c.ch != ' ')
@@ -14723,14 +15500,14 @@ mod tests {
                 .collect();
             assert_eq!(
                 letters.len(),
-                "alabharnessv0.1claude".chars().count(),
+                label.replace(' ', "").chars().count() + "claude".len(),
                 "{text:?}"
             );
             for c in &letters {
                 assert!(contrast(*c) >= 4.5, "{word:?}: {c:?} too pale on paper");
             }
-            for cell in &cells[at + label_len..at + face.len()] {
-                if cell.ch != ' ' && cell.ch != '\u{2590}' && cell.ch != '\u{258C}' {
+            for cell in &cells[at..at + switch] {
+                if cell.ch != ' ' {
                     assert!(
                         pair_contrast(cell.fg, cell.bg) >= 4.5,
                         "{word:?}: {:?} {:?} on {:?} too pale",
@@ -14755,7 +15532,7 @@ mod tests {
         let (_, text) = under(&mut app, Autopilot::Off);
         assert!(
             !text.contains("alab kitty")
-                && text.contains(" alab harness v0.1 \u{2590} on \u{2590} \u{25CB} off \u{258C} "),
+                && text.contains(&format!("{} {label}", super::probe::OFF_SWITCH)),
             "master off: the bare off switch {text:?}"
         );
         host.shutdown_and_join();
@@ -15367,8 +16144,8 @@ mod tests {
         assert_eq!(row_str(9), "  ● [17:20:01] sleep 30  running");
         let footer_text = row_str(11);
         assert!(
-            footer_text.starts_with("  YOLO on \u{00B7} ? for shortcuts"),
-            "open-panel footer keeps YOLO on prefix: {footer_text:?}"
+            footer_text.starts_with("  yolo \u{00B7} ? for shortcuts"),
+            "open-panel footer keeps yolo prefix: {footer_text:?}"
         );
         assert!(
             !footer_text.contains("Gemini 4 Argon"),
@@ -15755,11 +16532,23 @@ mod tests {
 {"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Populated agy survey excerpts.","tool_calls":[{"name":"run_command","args":{}}]}
 "#;
         std::fs::write(logs_dir.join("transcript.jsonl"), transcript_bytes).unwrap();
+        let win_home = format!(r"C:\Users\dev\{}", home.to_string_lossy());
         std::fs::write(
             cfg.join("history.jsonl"),
             format!(
-                r#"{{"display":"populate agy survey","timestamp":1,"workspace":"{}","conversationId":"{cid}"}}"#,
-                home.display()
+                "{}\n{}\n",
+                aterm_json::json!({
+                    "display": "earlier windows workspace prompt",
+                    "timestamp": 0,
+                    "workspace": win_home,
+                    "conversationId": cid,
+                }),
+                aterm_json::json!({
+                    "display": "populate agy survey",
+                    "timestamp": 1,
+                    "workspace": home.to_string_lossy().as_ref(),
+                    "conversationId": cid,
+                }),
             ),
         )
         .unwrap();
@@ -15790,6 +16579,10 @@ mod tests {
         assert_eq!(
             transcript_excerpts.excerpts.prompts[0].text,
             "populate agy survey"
+        );
+        assert_eq!(
+            transcript_excerpts.excerpts.prompts[1].text,
+            "earlier windows workspace prompt"
         );
         assert_eq!(
             transcript_excerpts.excerpts.said.as_deref(),

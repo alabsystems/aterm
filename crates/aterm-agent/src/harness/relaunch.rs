@@ -18,9 +18,9 @@ use super::upgrade_drive::{
     finished_where_written, first_word, foreground_shell, held, home_carried, host_roster, ids,
     is_our_ancestor, kept_move, kernel_start, launch_kept, ledger, left_to_person, line_model_of,
     live_background, load, model_and_mark, native_root, note_stuck, now_s, owned_by_aterm,
-    process_in_tab, record_asked, restart_models, restore, roster, said, save, screen, since,
-    squash, state_dir, sweep_lock, table, tail_to_end, take_back_ask, terminate, turn, turn_fenced,
-    type_line, typing_fence, under_hand, unique_tab_for_group,
+    process_in_tab, record_asked, restart_models, restore, roster, said, save, save_checked,
+    screen, since, squash, state_dir, sweep_lock, table, tail_to_end, take_back_ask, terminate,
+    turn, turn_fenced, type_line, typing_fence, under_hand, unique_tab_for_group,
 };
 use crate::supervise::approvals;
 use crate::supervise::limit::one_line;
@@ -36,6 +36,11 @@ pub(super) struct Plan {
     /// Why [`Self::line`] does not carry the usage tap its gate offered it ([`line_tap_kept`]):
     /// recorded when the line is typed ([`note_tap_dropped`]).
     pub(super) tap_dropped: Option<String>,
+    /// The directory [`Self::line`] runs the agent in when it carries no `cd` of its own: the
+    /// agent's, where the shell stood when the line was planned (`None`: the line carries its own
+    /// `cd`, or no directory was read). The record keeps it ([`St::line_dir`]), and the line typed
+    /// once the shell stands elsewhere carries a `cd` back to it ([`line_at_shell`]).
+    pub(super) line_dir: Option<String>,
 }
 
 /// Why a session has no relaunch plan.
@@ -218,6 +223,7 @@ pub(super) fn plan(
         dialect,
         line,
         tap_dropped,
+        line_dir: (cd.is_none() && !want.is_empty()).then_some(want),
     })
 }
 
@@ -400,7 +406,7 @@ pub(super) fn note_tap_dropped(opts: &Opts, r: &Report, dropped: Option<&str>) {
 }
 
 /// `flags` with the usage tap's pair, `--settings <value>`, before the trailing `--resume` pair (at the end of a fresh start's flags).
-pub(super) fn with_tap(mut flags: Vec<String>, value: &str) -> Vec<String> {
+pub(crate) fn with_tap(mut flags: Vec<String>, value: &str) -> Vec<String> {
     let at = flags
         .iter()
         .rposition(|f| f == "--resume")
@@ -591,7 +597,7 @@ const fn mode_flag(mode: super::lights::Mode) -> &'static str {
 }
 
 /// `flags` (the launch's, from [`upgrade::rewrite_argv`], resume pair last) resumed in permission `mode` ([`resume_mode`]).
-pub(super) fn with_permission_mode(flags: Vec<String>, mode: Option<&str>) -> Vec<String> {
+pub(crate) fn with_permission_mode(flags: Vec<String>, mode: Option<&str>) -> Vec<String> {
     let Some(mode) = mode.filter(|m| *m != "bypassPermissions") else {
         return flags;
     };
@@ -838,8 +844,15 @@ fn relaunch_held(
     }
     pause(opts.timings.prompt_drawn);
     let tab = st.tab.clone();
-    let line = st.line.clone();
     let dialect = shell_dialect(shell, &table());
+    let line = match owed_line_at_shell(&st.line, &st.line_dir, cwd_of(shell).as_deref(), dialect) {
+        Ok(line) => line,
+        Err(NoPlan::Wait(why @ "shell-moved")) => {
+            st.note_wait(why, now_s());
+            return said(r, format!("wait:{why}"));
+        }
+        Err(no) => return unplanned(opts, r, st, no),
+    };
     let asked = record_asked(opts, session, &st.model_list);
     let block = line_block(c, &tab);
     let typed = type_relaunch_line(
@@ -858,7 +871,10 @@ fn relaunch_held(
         take_back_ask(opts, session, asked);
     }
     match typed {
-        Ok(()) => st.prompt = None,
+        Ok(()) => {
+            st.prompt = None;
+            st.line = line;
+        }
         Err(RelaunchLineError::Wait(why)) => {
             st.note_wait(why, now_s());
             return said(r, format!("wait:{why}"));
@@ -872,7 +888,7 @@ fn relaunch_held(
         Err(RelaunchLineError::Turn(e)) => {
             st.stop("relaunch-refused", now_s());
             let r = said(r, format!("failed:relaunch:{}", first_word(&e)));
-            ledger(opts, &r, &st.line);
+            ledger(opts, &r, &line);
             return r;
         }
     }
@@ -941,6 +957,9 @@ pub(super) struct PromptLook<'a> {
     pub(super) ended_at_s: u64,
     /// Where a hand held the line ([`hand_held_since`]).
     pub(super) held_since_s: u64,
+    /// The grace the record gives a person's keys over the line ([`St::line_grace_s`],
+    /// [`line_grace`]).
+    pub(super) line_grace_s: Option<u32>,
 }
 
 impl<'a> PromptLook<'a> {
@@ -952,6 +971,7 @@ impl<'a> PromptLook<'a> {
             mark: &mut st.prompt,
             ended_at_s,
             held_since_s,
+            line_grace_s: st.line_grace_s,
         }
     }
 }
@@ -989,6 +1009,7 @@ pub(super) fn type_relaunch_line_with(
         mark,
         ended_at_s,
         held_since_s,
+        line_grace_s,
     } = look;
     if !tab_probe(c, shell, tab) {
         return Err(RelaunchLineError::Wait("tab-ownership-changed"));
@@ -999,17 +1020,12 @@ pub(super) fn type_relaunch_line_with(
     if !tab_probe(c, shell, tab) {
         return Err(RelaunchLineError::Wait("tab-ownership-changed"));
     }
-    match super::upgrade_drive::status_line(c, tab) {
-        Some(line) if line.starts_with("OK") && hand_on_tab(&line) => {
-            return Err(RelaunchLineError::Hand);
-        }
-        line if line
-            .as_deref()
-            .is_none_or(|l| super::upgrade_drive::held_by_status(l, opts.human_grace_s)) =>
-        {
-            return Err(RelaunchLineError::Wait("held"));
-        }
-        _ => {}
+    if let Some(held) = line_held_by_status(
+        super::upgrade_drive::status_line(c, tab).as_deref(),
+        line_grace(opts.human_grace_s, ended_at_s, line_grace_s),
+        &super::upgrade_drive::hand_name(),
+    ) {
+        return Err(held);
     }
     if mark.is_none()
         && let Some(scr) = screen(c, tab)
@@ -1436,7 +1452,7 @@ fn await_held(
             r
         }
         Some(sf) => carry_on(opts, r, st, c, session, &sf, Some(hand)),
-        None if ended && st.roll_back(now_s()) => {
+        None if ended && st.roll_back(now_s(), opts.human_grace_s) => {
             let failed = said(r.clone(), "failed:no-resume");
             ledger(
                 opts,
@@ -2519,8 +2535,92 @@ pub fn restart_here(opts: &Opts, why: &Restart) -> Report {
 
 /// [`restart_here`] for a host that keeps the owner's roster of Claude Code accounts.
 #[must_use]
-pub fn restart_under(opts: &Opts, why: &Restart, roster: &accounts::Roster) -> Report {
-    restart_as(opts, why, roster, snapshot(opts), &Live)
+pub fn restart_under(
+    opts: &Opts,
+    why: &Restart,
+    roster: &accounts::Roster,
+    selected: &AccountRestart,
+) -> Report {
+    restart_as(opts, why, roster, snapshot(opts), Some(selected), &Live)
+}
+
+/// The process, target row and reason chosen by an account decision.
+/// `current` fences the caller's generation and pending move; it must perform no I/O.
+pub struct AccountRestart {
+    source: Snapshot,
+    target: accounts::Row,
+    why: Restart,
+    current: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl AccountRestart {
+    /// Capture a selection and its caller-owned cancellation check.
+    #[must_use]
+    pub fn new(
+        why: &Restart,
+        source: &Snapshot,
+        target: &accounts::Row,
+        current: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            source: source.clone(),
+            target: target.clone(),
+            why: why.clone(),
+            current: Box::new(current),
+        }
+    }
+
+    /// Whether fresh observations still describe this exact account selection.
+    #[must_use]
+    pub fn matches(&self, why: &Restart, roster: &accounts::Roster, observed: &Snapshot) -> bool {
+        matches!(why, Restart::Account { to, .. }
+            if self.why == *why && self.target.label == *to
+                && roster.row(to) == Some(&self.target))
+            && self.source.same_auth_context(observed)
+            && self.is_current()
+    }
+
+    fn is_current(&self) -> bool {
+        (self.current)()
+    }
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRestartSource",
+        action = "AnotherCase",
+        reason = "Select a source, target, reason or retirement change"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRestartSource",
+        action = "Choose",
+        reason = "Capture the selected restart before fresh observations"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountRestartSource",
+        action = "Observe",
+        project = "harness::relaunch::tests::account_restart_source::selection_transition"
+    )
+)]
+fn restart_admitted(
+    why: &Restart,
+    roster: &accounts::Roster,
+    observed: &Result<Snapshot, &'static str>,
+    selected: Option<&AccountRestart>,
+) -> bool {
+    match selected {
+        Some(selected) => observed
+            .as_ref()
+            .is_ok_and(|snap| selected.matches(why, roster, snap)),
+        None => !matches!(why, Restart::Account { .. }),
+    }
 }
 
 /// Whether the process `snap` was read from runs under the account the roster labels `label`.
@@ -2855,7 +2955,7 @@ pub(super) fn restart_with(
     snap: Result<Snapshot, &'static str>,
     k: &dyn Kernel,
 ) -> Report {
-    restart_as(opts, why, &accounts::Roster::default(), snap, k)
+    restart_as(opts, why, &accounts::Roster::default(), snap, None, k)
 }
 
 /// The login an account move's relaunch line carries.
@@ -2869,6 +2969,7 @@ pub(super) fn restart_as(
     why: &Restart,
     roster: &accounts::Roster,
     snap: Result<Snapshot, &'static str>,
+    selected: Option<&AccountRestart>,
     k: &dyn Kernel,
 ) -> Report {
     let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
@@ -2887,6 +2988,9 @@ pub(super) fn restart_as(
         },
         _ => None,
     };
+    if !restart_admitted(why, roster, &snap, selected) {
+        return said(r, "wait:account-changed");
+    }
     let _held = match sweep_lock(opts) {
         Ok(lock) => lock,
         Err(why) => return said(r, format!("busy:{why}")),
@@ -2916,6 +3020,9 @@ pub(super) fn restart_as(
     if let Some(st) = prior.clone().filter(St::in_flight) {
         if st.tab != tab {
             return said(r, "wait:conversation-in-other-tab");
+        }
+        if selected.is_some_and(|s| !s.is_current()) {
+            return said(r, "wait:account-changed");
         }
         let cause = st.cause.clone();
         let carried = carry_in_flight(opts, r, st, &session, &tab);
@@ -3005,6 +3112,7 @@ pub(super) fn restart_as(
         shell,
         line,
         tap_dropped,
+        line_dir,
         ..
     } = match planned {
         Ok(p) => p,
@@ -3018,6 +3126,9 @@ pub(super) fn restart_as(
                 None => "would-restart".to_string(),
             },
         );
+    }
+    if selected.is_some_and(|s| !s.is_current()) {
+        return said(r, "wait:account-changed");
     }
     let Ok(mut c) = connect(opts, &tab) else {
         return said(r, "wait:no-socket");
@@ -3050,14 +3161,21 @@ pub(super) fn restart_as(
         let recent = records
             .transcript(&session)
             .map(|p| tail_to_end(&p, TAIL_BYTES));
+        if selected.is_some_and(|s| !s.is_current()) {
+            break 'signal Some(said(r.clone(), "wait:account-changed"));
+        }
         (st.model_before, st.mark) = model_and_mark(recent.as_ref());
         st.pid = snap.pid;
         st.shell = shell;
         st.tab.clone_from(&tab);
         st.line = line;
+        st.line_dir = line_dir.unwrap_or_default();
+        st.line_grace_s = Some(opts.human_grace_s);
         st.phase = upgrade::Phase::Exiting { at_s: now_s() };
+        if save_checked(opts, &session, &st).is_err() {
+            break 'signal Some(said(r.clone(), "wait:claim-unwritten"));
+        }
         super::upgrade_drive::note_moved_writes(opts, &snap, &session, &sf.cwd);
-        save(opts, &session, &st);
         match terminate(&mut c, &tab, pid, opts.human_grace_s) {
             Terminated::Sent => None,
             Terminated::Refused(no) => {
@@ -3137,6 +3255,74 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// The process's start in Unix seconds, only while its kernel identity still
+    /// matches this snapshot. Reads the process table; call from a background worker.
+    #[must_use]
+    pub fn current_start_seconds(&self) -> Option<u64> {
+        let current = kernel_start(self.pid);
+        bound_start_seconds(&self.start, current.as_deref(), || {
+            #[cfg(windows)]
+            {
+                let birth = aterm_uds::process::read_process_birth(i32::try_from(self.pid).ok()?)?;
+                (kernel_start(self.pid).as_deref() == Some(self.start.as_str()))
+                    .then_some(birth.seconds)
+            }
+            #[cfg(not(windows))]
+            {
+                super::upgrade_models::parse_lstart(&self.start)
+            }
+        })
+    }
+
+    /// Match launch and authentication identity while allowing live record metadata to advance.
+    #[must_use]
+    pub fn same_auth_context(&self, other: &Self) -> bool {
+        // Classify every field: metadata and job-control observations may advance independently.
+        let Self {
+            tab,
+            pid,
+            start,
+            program,
+            argv,
+            run,
+            login,
+            home,
+            claude_dir,
+            stored_login,
+            profile,
+            cwd: _,
+            session: _,
+            version: _,
+            shell: _,
+            dialect: _,
+        } = self;
+        (
+            tab,
+            pid,
+            start,
+            program,
+            argv,
+            run,
+            login,
+            home,
+            claude_dir,
+            stored_login,
+            profile,
+        ) == (
+            &other.tab,
+            &other.pid,
+            &other.start,
+            &other.program,
+            &other.argv,
+            &other.run,
+            &other.login,
+            &other.home,
+            &other.claude_dir,
+            &other.stored_login,
+            &other.profile,
+        )
+    }
+
     /// The agent it is of, by its run ([`Snapshot::run`]).
     #[must_use]
     pub const fn agent(&self) -> upgrade::Agent {
@@ -3176,6 +3362,42 @@ impl Snapshot {
             AgentRun::Agy(run) => Some(run),
             AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Muse(_) => None,
         }
+    }
+}
+
+fn bound_start_seconds(
+    recorded: &str,
+    current: Option<&str>,
+    read_seconds: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    if current != Some(recorded) {
+        return None;
+    }
+    read_seconds()
+}
+
+#[cfg(test)]
+mod snapshot_start_tests {
+    use super::bound_start_seconds;
+
+    #[test]
+    fn seconds_require_the_snapshots_current_kernel_start() {
+        for current in [None, Some("replacement-process")] {
+            assert_eq!(
+                bound_start_seconds("recorded-process", current, || {
+                    panic!("a different process must not supply its birth")
+                }),
+                None
+            );
+        }
+        assert_eq!(
+            bound_start_seconds("recorded-process", Some("recorded-process"), || Some(42)),
+            Some(42)
+        );
+        assert_eq!(
+            bound_start_seconds("recorded-process", Some("recorded-process"), || None),
+            None
+        );
     }
 }
 
@@ -4287,6 +4509,7 @@ fn after_exit_as(
         shell,
         line,
         tap_dropped,
+        line_dir,
         ..
     } = match planned {
         Ok(p) => p,
@@ -4312,6 +4535,7 @@ fn after_exit_as(
     st.shell = shell;
     st.tab.clone_from(&snap.tab);
     st.line = line;
+    st.line_dir = line_dir.unwrap_or_default();
     st.phase = upgrade::Phase::Exiting { at_s: now_s() };
     save(opts, &session, &st);
     consume_stamp(opts, snap, cause);
@@ -4442,6 +4666,16 @@ fn adopted_holds(opts: &Opts, st: &St, session: &str) -> bool {
 #[must_use]
 pub fn restarted(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>) -> bool {
     restart_record(opts, agent, pid).is_some()
+}
+
+/// How long a person's keys hold the relaunch line of the restart [`restarted`] finds for the
+/// agent `pid` of tab `opts.only_sid`: its record's own ([`line_grace`]), or the whole grace when
+/// no record is found.
+#[must_use]
+pub fn carry_line_grace(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>) -> u32 {
+    restart_record(opts, agent, pid).map_or(opts.human_grace_s, |(_, st)| {
+        line_grace(opts.human_grace_s, end_asked_at(&st), st.line_grace_s)
+    })
 }
 
 /// The label of the account move whose restart signalled the Claude Code `pid` of tab `opts.only_sid`.
@@ -4935,6 +5169,10 @@ pub const WAIT_ACT_ENDS: &str = "wait:not-exited:act-ends";
 /// The word for an exit the harness made, carried through a hand that waits.
 pub const WAIT_HAND_LIFTS: &str = "wait:held:act-carried";
 
+/// The word for a relaunch line something at its tab holds: a person's keys, input unread, a hand
+/// ([`line_held_by_status`]).
+pub const WAIT_HELD: &str = "wait:held";
+
 /// What one relaunch step came to, for the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -4955,7 +5193,14 @@ pub enum Outcome {
 pub fn outcome(step: &str) -> Outcome {
     // The host hands every relaunched agent to its loop ([`Opts::hand_back`]), so no other word
     // lands, and a carry-on that typed nothing (`done:no-continue`) is never one.
-    if matches!(step, "adopted" | "done:fresh" | "landed" | "done:resumed") {
+    if matches!(
+        step,
+        "adopted"
+            | "done:fresh"
+            | "landed"
+            | "done:resumed"
+            | super::upgrade_drive::RESUMED_BY_ANOTHER
+    ) {
         Outcome::Relaunched
     } else if step == "wait:not-exited" {
         Outcome::Left("not-exited".to_string())
@@ -5026,11 +5271,105 @@ pub fn held_by_someone(status: &str) -> bool {
 /// The hands the relaunch line waits on, from one `status` reply.
 #[must_use]
 pub fn hand_on_tab(status: &str) -> bool {
+    hand_on_tab_as(status, &super::upgrade_drive::hand_name())
+}
+
+/// [`hand_on_tab`] for the host whose hand is named `ours` ([`super::upgrade_drive::hand_name`]):
+/// a hold, or any hand but that host's own lease.
+#[must_use]
+pub(super) fn hand_on_tab_as(status: &str, ours: &str) -> bool {
     status.split_whitespace().any(|t| {
         t == "hold=1"
             || t.strip_prefix("hand=")
-                .is_some_and(|hand| hand != "-" && !super::upgrade_drive::our_hand(hand))
+                .is_some_and(|hand| hand != "-" && hand.strip_prefix("lease:") != Some(ours))
     })
+}
+
+/// How long a person's keys hold the relaunch line a record owes, under the configured `grace_s`.
+///
+/// After an end aterm made (`ended_at_s`, [`end_asked_at`]) it is the grace the record names
+/// (`recorded`, [`St::line_grace_s`]: the one the gate that let that end go waited out, or the
+/// whole grace after a relaunched build ended on its own, [`St::roll_back`]). That gate let the end
+/// go only once every key was older than its grace, so no key from before the end holds the line,
+/// and one typed after it holds the line exactly as long as one would have held the end. A record
+/// that names none (an earlier build's, carried across an update) keeps the whole `grace_s`, as the
+/// line of the build that wrote it did: its end's gate is unknown, and a line typed late costs a
+/// wait while one typed early lands on a person at the prompt. Any other exit (`ended_at_s == 0`: a
+/// crash, an end aterm did not ask) keeps the whole `grace_s` too.
+#[must_use]
+pub(super) fn line_grace(grace_s: u32, ended_at_s: u64, recorded: Option<u32>) -> u32 {
+    match recorded {
+        Some(recorded) if ended_at_s != 0 => recorded.min(grace_s),
+        _ => grace_s,
+    }
+}
+
+/// What holds the relaunch line by one `status` reply of its tab (`None`: none could be read),
+/// for the host whose hand is named `ours`; `None` when nothing does.
+///
+/// A reply that is not `OK` holds it, as do a hand ([`hand_on_tab_as`]), input the tab's program
+/// has not read (`input=`), and a person's keys within `grace_s` (the line's own, [`line_grace`]).
+/// Only the server's own age of the last key (`human_ms=`) is read, never the wall clock.
+pub(super) fn line_held_by_status(
+    status: Option<&str>,
+    grace_s: u32,
+    ours: &str,
+) -> Option<RelaunchLineError> {
+    let Some(line) = status.filter(|l| crate::is_ok_reply(l)) else {
+        return Some(RelaunchLineError::Wait("held"));
+    };
+    if hand_on_tab_as(line, ours) {
+        return Some(RelaunchLineError::Hand);
+    }
+    let keyed = HumanInput::of_status(line).within(grace_s) == Some(true);
+    (super::upgrade_drive::input_pending(line) || keyed).then_some(RelaunchLineError::Wait("held"))
+}
+
+/// The relaunch line a record owes (`line`, planned to run the agent in `line_dir`,
+/// [`St::line_dir`]; empty: it carries its own `cd`) as typed at its shell, which stands in
+/// `shell_now` (`None`: unread, no sign it moved) and speaks `dialect` (`None`: unread).
+///
+/// While the shell stands where the line was planned, the line as planned; once the person moved
+/// it, that line with a `cd` back to `line_dir` ([`upgrade::with_cd`]), so the conversation resumes
+/// where it ran, never in the shell's new directory. A line that cannot carry the `cd` (a fish
+/// shell's, or one too long for the terminal with it) is `Refused`, and its caller waits for the
+/// shell to come back (`wait:shell-moved`); an unread dialect waits.
+/// The line a relaunch owes as typed at its shell ([`line_at_shell`]), where a moved shell whose
+/// line cannot carry the `cd` back waits for the shell to come back (`wait:shell-moved`), as the
+/// line did before it could follow one: refusing would end, for good, a relaunch the person's own
+/// `cd -` could still let go.
+pub(super) fn owed_line_at_shell(
+    line: &str,
+    line_dir: &str,
+    shell_now: Option<&str>,
+    dialect: Option<Dialect>,
+) -> Result<String, NoPlan> {
+    match line_at_shell(line, line_dir, shell_now, dialect) {
+        Ok(line) => Ok(line.into_owned()),
+        Err(NoPlan::Refused { .. }) => Err(NoPlan::Wait("shell-moved")),
+        Err(no) => Err(no),
+    }
+}
+
+pub(super) fn line_at_shell<'a>(
+    line: &'a str,
+    line_dir: &str,
+    shell_now: Option<&str>,
+    dialect: Option<Dialect>,
+) -> Result<std::borrow::Cow<'a, str>, NoPlan> {
+    match shell_now {
+        Some(now) if !line_dir.is_empty() && !same_dir(Some(now), line_dir) => {
+            let dialect = dialect.ok_or(NoPlan::Wait("shell-dialect"))?;
+            upgrade::with_cd(dialect, line, line_dir)
+                .map(std::borrow::Cow::Owned)
+                .map_err(|e| NoPlan::Refused {
+                    why: format!("line:{e}"),
+                    what: "line".to_string(),
+                    detail: e,
+                })
+        }
+        _ => Ok(std::borrow::Cow::Borrowed(line)),
+    }
 }
 
 /// Whether one `status` reply names another driver's hand.
@@ -5078,6 +5417,44 @@ pub const HEALTHY: Duration = Duration::from_secs(600);
 
 /// The longest pause before the next attempt at a harness restart ([`OnExit::Restarted`]).
 pub const CARRY_EVERY: Duration = Duration::from_secs(60);
+
+/// When the next attempt at a harness restart's line ([`OnExit::Restarted`]) comes after one that
+/// did not land ([`carry_pause`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CarryPause {
+    /// The back-off's step ([`Relaunches::pause`]), never past [`CARRY_EVERY`].
+    Ladder(Duration),
+    /// One second after a person's keys let the line go: no attempt before it could land, so none
+    /// is made, and one made then that its line still holds does not climb the back-off
+    /// ([`Relaunches::attempted_at_keys`]).
+    Keys(Duration),
+}
+
+impl CarryPause {
+    /// The pause itself.
+    #[must_use]
+    pub const fn pause(self) -> Duration {
+        match self {
+            Self::Ladder(pause) | Self::Keys(pause) => pause,
+        }
+    }
+}
+
+/// The next attempt at a harness restart's line after one that did not land, by the tab's
+/// `status`: while a person's keys hold the line, under `line_grace_s` (the record's own,
+/// [`carry_line_grace`]), one second after they let it go ([`grace_left`]; never past
+/// [`STALE_S`], the life of the record that owes the line), else the back-off's `ladder`, never
+/// past [`CARRY_EVERY`].
+#[must_use]
+pub fn carry_pause(ladder: Duration, status: Option<&str>, line_grace_s: u32) -> CarryPause {
+    match status.map(|s| grace_left(s, line_grace_s)) {
+        Some(left) if !left.is_zero() => CarryPause::Keys(
+            left.saturating_add(Duration::from_secs(1))
+                .min(Duration::from_secs(STALE_S)),
+        ),
+        _ => CarryPause::Ladder(ladder.min(CARRY_EVERY)),
+    }
+}
 
 /// Consecutive relaunch steps that did not relaunch ([`Outcome::NotYet`]) before the session's attention says so.
 pub const BADGE_AFTER: u32 = 3;
@@ -5193,6 +5570,19 @@ impl Relaunches {
 
     /// One attempt came to `outcome` at `now`.
     pub fn attempted(&mut self, outcome: &Outcome, now: Instant) -> Say {
+        self.attempted_as(outcome, now, true)
+    }
+
+    /// [`Self::attempted`] of an attempt made as a person's keys let its line go
+    /// ([`CarryPause::Keys`]): one its line still held (`wait:held`) does not climb the back-off,
+    /// since the back-off did not time it.
+    pub fn attempted_at_keys(&mut self, outcome: &Outcome, now: Instant) -> Say {
+        let held = matches!(outcome, Outcome::NotYet(step) if step == WAIT_HELD);
+        self.attempted_as(outcome, now, !held)
+    }
+
+    /// [`Self::attempted`], a miss climbing the back-off only when `climbs`.
+    fn attempted_as(&mut self, outcome: &Outcome, now: Instant, climbs: bool) -> Say {
         match outcome {
             Outcome::Relaunched => {
                 // A landing of an exit someone asked for is no crash's: it neither climbs the
@@ -5218,10 +5608,12 @@ impl Relaunches {
                 }
             }
             Outcome::NotYet(_) => {
-                if self.crash {
-                    self.streak = self.streak.saturating_add(1);
-                } else {
-                    self.tries = self.tries.saturating_add(1);
+                if climbs {
+                    if self.crash {
+                        self.streak = self.streak.saturating_add(1);
+                    } else {
+                        self.tries = self.tries.saturating_add(1);
+                    }
                 }
                 self.misses = self.misses.saturating_add(1);
                 if self.misses >= BADGE_AFTER && !self.badged {

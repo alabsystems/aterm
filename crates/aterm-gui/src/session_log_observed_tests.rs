@@ -759,6 +759,177 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
     assert_eq!((totals.mail_in, totals.mail_out), (1, 1), "{totals:?}");
 }
 
+/// A POST THE BRIDGE RETIRES UNDELIVERED IS LOGGED WITH THE REASON ITS CLIENT
+/// WAS TOLD (session log Phase 6 fix unit F6, LOOP-5): `mail-landed` with
+/// `why=<reason>` and no `off=`, by the bridge, for each reason the bridge
+/// gives (read from `DeadReason`, the bridge's own list), and the timeline's
+/// `post-landed` row says `reason=<reason>`. A post to a node nobody knows is
+/// retired `unroutable`.
+#[test]
+fn a_post_the_bridge_retires_is_logged_with_the_reason_its_client_was_told() {
+    use aterm_types::fabric_grammar::DeadReason;
+    let (h, store) = fabric_rig(22);
+    let sid = h.ctx.self_id.as_str().to_string();
+    let wake = |s: &aterm_session::SessionId| crate::control::wake_sid_watchers(&store, s);
+    let told: Vec<&str> = DeadReason::ALL
+        .iter()
+        .filter(|r| !r.aterms_own())
+        .map(|r| r.word())
+        .collect();
+    assert!(told.contains(&"unroutable"), "{told:?}");
+    for (id, why) in (1u64..).zip(&told) {
+        let post = crate::fabric::cmd_post(
+            &h.ctx,
+            "to=@s-0123456789abcdef0123@n-00000000000000b1 kind=task --wait=0 QZP6WORD",
+            None,
+        );
+        assert!(super::overlap_tests::queued(&post, id), "{post}");
+        let rx = parked_log_await(&h, &store, "mail-landed");
+        let line = format!("{sid} {id} off=- reason={why}");
+        assert_eq!(
+            crate::fabric::cmd_outbox_sent_waking(&store, &line, &wake),
+            "OK\n"
+        );
+        let got = returned(&rx, why);
+        assert!(
+            got.contains(&format!(
+                " mark - mail-landed inbox={id} why={why} by=bridge src=fabric "
+            )),
+            "{why}: {got}"
+        );
+    }
+    let landed: Vec<String> = lines_of(&h.ctx.timeline)
+        .into_iter()
+        .filter(|l| l.contains(" mail-landed "))
+        .collect();
+    assert_eq!(landed.len(), told.len(), "{landed:?}");
+    assert!(landed.iter().all(|l| !l.contains(" off=")), "{landed:?}");
+    let rows: Vec<(String, String)> = h
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .since(None)
+        .filter(|e| e.kind == "post-landed")
+        .map(|e| (e.kind.to_string(), e.payload.to_string()))
+        .collect();
+    let said: Vec<(String, String)> = (1u64..)
+        .zip(&told)
+        .map(|(id, why)| {
+            (
+                "post-landed".to_string(),
+                format!("{id} off=- reason={why}"),
+            )
+        })
+        .collect();
+    assert_eq!(rows, said);
+    assert!(
+        content_lines(&h.ctx.timeline)
+            .iter()
+            .all(|l| !l.contains("QZP6WORD")),
+        "no body"
+    );
+}
+
+/// Every reason a post is retired with, the bridge's and aterm's own, is a
+/// `why=` word of the session log, so no retirement reads `why=unknown`.
+#[test]
+fn every_reason_a_post_is_retired_with_is_a_why_word_of_the_log() {
+    for r in aterm_types::fabric_grammar::DeadReason::ALL {
+        assert!(
+            aterm_slog::Fields::new()
+                .word(aterm_slog::Key::Why, r.word())
+                .is_ok(),
+            "{r:?}"
+        );
+    }
+}
+
+/// ATERM'S OWN TWO RETIREMENTS ARE LOGGED BY ATERM (session log Phase 6 fix
+/// unit F6, LOOP-5): a post a seamless update could not carry is retired
+/// `not-carried` by the successor's seeding, and a queued reply whose `re=`
+/// names a record of a bus log the link replaced is retired `log-replaced`
+/// by the link's `log` line. Each is `mail-landed` with `why=<reason>` and
+/// no `off=`, `by=aterm` (the bridge's own reasons read `by=bridge`, above),
+/// and wakes a parked `await log kind=mail-landed`.
+#[test]
+fn aterms_own_retirements_are_logged_by_aterm_with_their_reason() {
+    use aterm_types::fabric_grammar::DeadReason;
+    crate::fabric::with_link_reset(|| {
+        let (old, _) = fabric_rig(24);
+        let post = crate::fabric::cmd_post(&old.ctx, "to=@s-peer kind=note QZP6WORD1", None);
+        assert_eq!(post, "OK 1\n");
+        let mut roomy = crate::fabric::CARRY_MAIL_BYTES;
+        let mut carry = old.ctx.fabric.handoff_carry(&mut roomy);
+        assert!(carry.shed());
+        assert_eq!(carry.uncarried, [1], "the queued post is not carried");
+        let (fresh, successor) = fabric_rig(25);
+        let rx = parked_log_await(&fresh, &successor, "mail-landed");
+        fresh.ctx.fabric.seed_carry(&carry, &fresh.ctx.timeline);
+        let not_carried = DeadReason::NotCarried.word();
+        let got = returned(&rx, not_carried);
+        assert!(
+            got.contains(&format!(
+                " mark - mail-landed inbox=1 why={not_carried} by=aterm src=fabric "
+            )),
+            "{got}"
+        );
+
+        let (h, store) = fabric_rig(26);
+        let sid = h.ctx.self_id.as_str().to_string();
+        let generation = crate::fabric::next_bridge_generation();
+        crate::fabric::bridge_attached(generation);
+        let tell = |hex: &str| {
+            crate::fabric::cmd_link(
+                &store,
+                &format!("log {}.0", hex.repeat(16)),
+                Some(generation),
+            )
+        };
+        assert_eq!(tell("aa"), "OK\n");
+        let ask = format!("{sid} off=7 from=s-peer@n-lab kind=ask trust=agent text=old");
+        assert_eq!(crate::fabric::cmd_deliver(&store, &ask), "OK 1\n");
+        let reply = crate::fabric::cmd_post(&h.ctx, "to=@s-peer kind=answer re=7 QZP6WORD2", None);
+        assert_eq!(reply, "OK 1\n");
+        let rx = parked_log_await(&h, &store, "mail-landed");
+        assert_eq!(tell("bb"), "OK forgot=1\n");
+        let log_replaced = DeadReason::LogReplaced.word();
+        let got = returned(&rx, log_replaced);
+        assert!(
+            got.contains(&format!(
+                " mark - mail-landed inbox=1 why={log_replaced} by=aterm src=fabric "
+            )),
+            "{got}"
+        );
+
+        for (timeline, why) in [
+            (&fresh.ctx.timeline, not_carried),
+            (&h.ctx.timeline, log_replaced),
+        ] {
+            let landed: Vec<String> = lines_of(timeline)
+                .into_iter()
+                .filter(|l| l.contains(" mail-landed "))
+                .collect();
+            assert_eq!(landed.len(), 1, "{why}: {landed:?}");
+            assert!(!landed[0].contains(" off="), "{why}: {landed:?}");
+            let rows: Vec<String> = timeline
+                .lock()
+                .unwrap()
+                .since(None)
+                .filter(|e| e.kind == "post-landed")
+                .map(|e| e.payload.to_string())
+                .collect();
+            assert_eq!(rows, [format!("1 off=- reason={why}")], "{why}");
+            assert!(
+                content_lines(timeline)
+                    .iter()
+                    .all(|l| !l.contains("QZP6WORD")),
+                "{why}: no body"
+            );
+        }
+    });
+}
+
 /// T13'S IN-PROCESS NEGATIVE CONTROL for 5B-7's world test, which asserts
 /// presence only (the delivery path's fault gives no final positive
 /// signal): its check — a delivered mail has its inbox row and its `mail

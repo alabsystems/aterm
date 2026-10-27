@@ -537,27 +537,41 @@ mod tests {
 
     /// A [`Boost`] raises the worker's base priority while it stands and puts
     /// it back when it drops, read off the kernel's own record of the thread
-    /// (an override is invisible to the class a thread reads of itself).
+    /// (an override is invisible to the class a thread reads of itself). That
+    /// record's base priority also carries a push from any thread waiting on a
+    /// lock the worker holds (a turnstile's inheritance), so the worker is read
+    /// only once it is blocked in a read(2) after declaring its role, where it
+    /// holds no lock and runs nothing until it is released. A worker still
+    /// running (sending on a channel, allocating, parking) can hold such a lock
+    /// while one of this binary's default-class threads waits on it, and then
+    /// reads 31, as a standing override does.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_boost_raises_the_worker_while_it_stands_and_no_longer() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::thread::JoinHandleExt as _;
         unsafe extern "C" {
             fn pthread_threadid_np(thread: libc::pthread_t, id: *mut u64) -> libc::c_int;
         }
         /// `<sys/proc_info.h>`'s by-thread-id flavor of `PROC_PIDTHREADINFO`.
         const PROC_PIDTHREADID64INFO: libc::c_int = 15;
+        /// `<mach/thread_info.h>`'s `TH_STATE_WAITING`: blocked in the kernel.
+        const TH_STATE_WAITING: i32 = 3;
         /// `struct proc_threadinfo` (`<sys/proc_info.h>`, not in the generated
-        /// `libc`): 112 bytes, the base priority `pth_priority` at offset 40.
+        /// `libc`): 112 bytes, the run state `pth_run_state` at offset 24 and the
+        /// base priority `pth_priority` at offset 40.
         #[repr(C)]
         struct ProcThreadInfo {
             _user_and_system_time: [u64; 2],
-            _usage_policy_state_flags_sleep_curpri: [i32; 6],
+            _usage_policy: [i32; 2],
+            run_state: i32,
+            _flags_sleep_curpri: [i32; 3],
             priority: i32,
             _max_priority: i32,
             _name: [u8; 64],
         }
         const _: () = assert!(size_of::<ProcThreadInfo>() == 112);
-        let priority_of = |thread: libc::pthread_t| {
+        let record_of = |thread: libc::pthread_t| {
             let mut id = 0u64;
             // SAFETY: `thread` is a live, unjoined thread; `id` a writable slot.
             assert_eq!(unsafe { pthread_threadid_np(thread, &mut id) }, 0);
@@ -575,26 +589,36 @@ mod tests {
             };
             assert_eq!(read, size, "the thread's record reads");
             // SAFETY: the exact-size read initialized every (integer) field.
-            unsafe { info.assume_init() }.priority
+            unsafe { info.assume_init() }
         };
-        use std::os::unix::thread::JoinHandleExt as _;
-        let (declared_tx, declared) = std::sync::mpsc::channel::<()>();
-        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (mut release, mut held) =
+            std::os::unix::net::UnixStream::pair().expect("a socket pair");
         let worker = std::thread::spawn(move || {
             set_self(Role::Background);
-            let _ = declared_tx.send(());
-            let _ = released.recv();
+            let _ = held.read(&mut [0u8; 1]);
         });
-        declared.recv().expect("the worker declared its role");
         let thread = worker.as_pthread_t() as libc::pthread_t;
-        let parked = priority_of(thread);
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the worker blocked in its read at its declared role",
+            || {
+                (class_of(thread) == Some(class_for(Role::Background))
+                    && record_of(thread).run_state == TH_STATE_WAITING)
+                    .then_some(())
+            },
+        );
+        let parked = record_of(thread).priority;
         let boost = Boost::start(Some(&worker));
         assert!(boost.armed(), "an unjoined thread takes an override");
-        let raised = priority_of(thread);
+        let raised = record_of(thread).priority;
         assert!(raised > parked, "boosted {raised}, parked {parked}");
         drop(boost);
-        assert_eq!(priority_of(thread), parked, "the override ended with it");
-        let _ = release.send(());
+        assert_eq!(
+            record_of(thread).priority,
+            parked,
+            "the override ended with it"
+        );
+        release.write_all(b"x").expect("the worker's release");
         worker.join().expect("the worker");
     }
 

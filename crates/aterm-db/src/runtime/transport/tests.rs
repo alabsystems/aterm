@@ -161,7 +161,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
     )
     .unwrap();
     let transport = Transport {
-        endpoint: lab.endpoints[0].clone(),
+        endpoint: Some(lab.endpoints[0].clone()),
         links: vec![],
         hints: Hints::new([1; 32]),
         workers: vec![worker],
@@ -169,6 +169,8 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         dial: Instant::now(),
         rotate: Instant::now() + Duration::from_secs(300),
         scope: Scope::Loopback,
+        contacts: Vec::new(),
+        failed: false,
         observed: std::collections::BTreeMap::new(),
     };
     let control = transport.workers[0].channel.clone();
@@ -290,10 +292,16 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
 }
 
 fn loopback(endpoint: Arc<Endpoint>, port: u16, token: [u8; 32]) -> Transport {
-    let listener = if endpoint.pending() {
-        None
-    } else {
+    loopback_mode(Some(endpoint), port, token)
+}
+fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) -> Transport {
+    let listener = if endpoint
+        .as_ref()
+        .is_some_and(|endpoint| !endpoint.pending())
+    {
         Some(Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
+    } else {
+        None
     };
     let hints = Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, port, Scope::Loopback).unwrap();
     let now = Instant::now();
@@ -310,8 +318,53 @@ fn loopback(endpoint: Arc<Endpoint>, port: u16, token: [u8; 32]) -> Transport {
         dial: now,
         rotate: now + Duration::from_secs(300),
         scope: Scope::Loopback,
+        contacts: Vec::new(),
+        failed: false,
         observed: std::collections::BTreeMap::new(),
     }
+}
+
+#[test]
+fn unconfigured_transports_see_opaque_presence_without_opening_repair() {
+    let mut a = loopback_mode(None, 0, [41; 32]);
+    let mut b = loopback_mode(None, a.links[0].hints.port(), [42; 32]);
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        let now = Instant::now();
+        a.tick(now).unwrap();
+        b.tick(now).unwrap();
+        if a.unverified_peers() == 1 && b.unverified_peers() == 1 {
+            break;
+        }
+        assert!(Instant::now() < until, "opaque presence did not arrive");
+        thread::sleep(Duration::from_millis(1));
+    }
+    for transport in [&mut a, &mut b] {
+        assert!(transport.workers.is_empty());
+        assert!(transport.take_contacts().is_empty());
+        assert!(transport.links.iter().all(|link| link.listener.is_none()));
+    }
+}
+
+#[test]
+fn listen_only_discovery_never_dials_or_promotes_hints_and_expires_them() {
+    let lab = Lab::new();
+    let mut transport = loopback(lab.endpoints[0].clone(), 0, [1; 32]);
+    transport.endpoint = None;
+    transport.links[0].listener = None;
+    let now = Instant::now();
+    transport.hints.observe(
+        &Hints::new([2; 32]).wire(4000),
+        "127.0.0.2:5000".parse().unwrap(),
+        now,
+    );
+    transport.tick(now).unwrap();
+    assert_eq!(transport.unverified_peers(), 1);
+    assert!(transport.workers.is_empty());
+    assert!(transport.take_contacts().is_empty());
+    assert!(transport.links.iter().all(|link| link.listener.is_none()));
+    transport.tick(now + Duration::from_secs(46)).unwrap();
+    assert_eq!(transport.unverified_peers(), 0);
 }
 
 #[test]
@@ -518,6 +571,12 @@ fn native_discovery_repairs_two_replicas_and_an_offline_replica_rejoins() {
         );
         thread::sleep(Duration::from_millis(1));
     }
+    assert!(
+        a.take_contacts()
+            .iter()
+            .any(|(actor, _)| actor[32..] == [4; 16]),
+        "completed authenticated exchanges, not beacon addresses, feed the observer"
+    );
     drop(b);
     let after = Node::test_seal(
         &[21; 32],

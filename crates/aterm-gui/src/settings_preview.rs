@@ -7745,6 +7745,38 @@ mod tests {
         );
     }
 
+    /// The host unreachability pin's companion (`crate::light_fork_pin_tests`,
+    /// `docs/design/PRISM-GLASS.md` §15.1 P0.9): the preview's producer draws every dark theme,
+    /// in each rainbow kitty look, by main's rule; the ground that names no theme previews on
+    /// the renderer's default theme.
+    #[cfg(unix)]
+    #[test]
+    fn the_preview_draws_every_dark_theme_by_mains_rule() {
+        use crate::light_fork_pin_tests::{Ground, config_breaks};
+
+        let grounds = Ground::dark();
+        let looks = [
+            "rainbow kitty",
+            "rainbow kitty tall",
+            "rainbow kitty underline",
+            "rainbow kitty pet",
+        ];
+        let mut drawn = 0;
+        for ground in &grounds {
+            let theme = ground.scheme().map_or_else(Theme::default, |scheme| {
+                PreviewTerminalTheme::from_scheme(&scheme).into_theme()
+            });
+            assert!(aterm_render::theme_is_dark(theme.bg), "{ground} is dark");
+            for raw in looks {
+                let cfg = rainbow_cursor(raw).glow_config(theme, 0.5);
+                let broke = config_breaks(&cfg, (theme.fg, theme.bg));
+                assert!(broke.is_empty(), "{ground}, {raw}: {broke:?}");
+                drawn += 1;
+            }
+        }
+        assert_eq!(drawn, grounds.len() * looks.len());
+    }
+
     #[test]
     fn preview_cache_identity_preserves_case_visible_style_text() {
         let lower = SettingsPreviewSpec::cursor(rainbow_cursor("rainbow kitty flying"));
@@ -8358,7 +8390,10 @@ mod tests {
     #[test]
     fn the_scenes_return_scrolls_the_line_up_with_its_light() {
         let cw = 8_i32;
-        let reach = |input: &RenderInput, row: usize| -> i32 {
+        // The light's reach along `row`, its dust's motes (halos narrower than a cell) left out
+        // when `motes` is false: a mote of the submitted line's dust drifting down past the
+        // line's end is no sweep along the row (Comet's dark dust, looks8 round 3's K4).
+        let reach_with = |input: &RenderInput, row: usize, motes: bool| -> i32 {
             let quads = input
                 .cursor_glow_add
                 .iter()
@@ -8369,6 +8404,7 @@ mod tests {
                 .glow_halo
                 .iter()
                 .filter(|halo| usize::from(halo.row) == row && halo.w > 0)
+                .filter(|halo| motes || 2 * i32::from(halo.rx) >= cw)
                 .map(|halo| i32::from(halo.x) + i32::from(halo.w));
             let trail = input
                 .cursor_trail
@@ -8377,6 +8413,7 @@ mod tests {
                 .map(|cell| (cell.col as i32 + 1) * cw);
             quads.chain(halos).chain(trail).max().unwrap_or(0)
         };
+        let reach = |input: &RenderInput, row: usize| reach_with(input, row, true);
         let text = |cells: &[aterm_core::terminal::RenderCell]| -> String {
             cells.iter().map(|cell| cell.ch).collect()
         };
@@ -8417,9 +8454,9 @@ mod tests {
                     reach(&after, row - 1)
                 );
                 assert!(
-                    reach(&after, row) < line_end,
+                    reach_with(&after, row, false) < line_end,
                     "comet: no sweep back along the prompt's row: {} px",
-                    reach(&after, row)
+                    reach_with(&after, row, false)
                 );
             } else {
                 assert!(

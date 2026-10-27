@@ -209,6 +209,49 @@ pub(crate) struct FindOrigin {
     pub(crate) history_renumber_epoch: u64,
 }
 
+impl FindOrigin {
+    /// Put `terminal`'s viewport back where this origin found it, while its numbering still holds.
+    pub(crate) fn restore(&self, terminal: &mut Terminal) {
+        let coherent = self.on_alt_screen == terminal.is_alternate_screen()
+            && self.history_renumber_epoch == terminal.grid().history_renumber_epoch();
+        if coherent {
+            if self.was_live {
+                terminal.return_to_live();
+            } else {
+                terminal.scroll_to_absolute_row(self.top_visible_absolute_row);
+            }
+        }
+    }
+}
+
+/// Where a find over `terminal` starts: the viewport ⎋ restores, and the search point in `forward`'s direction (the cursor at the live tail, else the viewport's near edge).
+fn find_start(terminal: &Terminal, forward: bool) -> (FindOrigin, i64, u16) {
+    let display_offset = i32::try_from(terminal.grid().display_offset()).unwrap_or(0);
+    let base_y = i64::try_from(terminal.grid().base_y()).unwrap_or(0);
+    let top = base_y.saturating_sub(i64::from(display_offset));
+    let (anchor_absolute_row, anchor_col) = if display_offset == 0 {
+        let cursor = terminal.cursor();
+        (base_y.saturating_add(i64::from(cursor.row)), cursor.col)
+    } else if forward {
+        (top, 0)
+    } else {
+        (
+            top.saturating_add(i64::from(terminal.rows().saturating_sub(1))),
+            u16::MAX,
+        )
+    };
+    (
+        FindOrigin {
+            top_visible_absolute_row: terminal.grid().top_visible_absolute_row(),
+            was_live: display_offset == 0,
+            on_alt_screen: terminal.is_alternate_screen(),
+            history_renumber_epoch: terminal.grid().history_renumber_epoch(),
+        },
+        anchor_absolute_row,
+        anchor_col,
+    )
+}
+
 /// What the find bar, the title and a screen reader say of a search that found nothing while the history was away for a rewrap (the long form; the bar shortens it to fit, `find_bar::status_seg`).
 pub(crate) const HISTORY_AWAY_NONE: &str = "none yet, history rewrapping";
 
@@ -784,34 +827,7 @@ impl App {
         };
         let (case_sensitive, is_regex) = (self.search_sticky_case, self.search_sticky_regex);
         let direction = SearchDirection::from_forward(forward);
-        let origin = {
-            let terminal = term_lock(&term);
-            let display_offset = i32::try_from(terminal.grid().display_offset()).unwrap_or(0);
-            let base_y = i64::try_from(terminal.grid().base_y()).unwrap_or(0);
-            let top = base_y.saturating_sub(i64::from(display_offset));
-            let (anchor_absolute_row, anchor_col) = if display_offset == 0 {
-                let cursor = terminal.cursor();
-                (base_y.saturating_add(i64::from(cursor.row)), cursor.col)
-            } else if forward {
-                (top, 0)
-            } else {
-                (
-                    top.saturating_add(i64::from(terminal.rows().saturating_sub(1))),
-                    u16::MAX,
-                )
-            };
-            (
-                FindOrigin {
-                    top_visible_absolute_row: terminal.grid().top_visible_absolute_row(),
-                    was_live: display_offset == 0,
-                    on_alt_screen: terminal.is_alternate_screen(),
-                    history_renumber_epoch: terminal.grid().history_renumber_epoch(),
-                },
-                anchor_absolute_row,
-                anchor_col,
-            )
-        };
-        let (find_origin, anchor_absolute_row, anchor_col) = origin;
+        let (find_origin, anchor_absolute_row, anchor_col) = find_start(&term_lock(&term), forward);
         let already_open = self.windows.get(&wid).is_some_and(|ws| ws.search.is_some());
         if !already_open {
             self.find_origins
@@ -900,6 +916,38 @@ impl App {
             return;
         };
         self.search_recompute_in(wid);
+    }
+
+    /// Start window `wid`'s open find over the engine now shown, as a fresh find there would: ⎋ restores that engine's viewport, and the search point is its cursor or viewport edge (a buffer-edge point stays).
+    pub(crate) fn search_restart_in(&mut self, wid: crate::WindowId) {
+        let Some((term, session)) = self.front_shown(wid) else {
+            return;
+        };
+        let Some(direction) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.search.as_ref())
+            .map(|s| s.direction)
+        else {
+            return;
+        };
+        let (origin, row, col) =
+            find_start(&term_lock(&term), direction == SearchDirection::Forward);
+        self.find_origins.insert((session, wid), origin);
+        if let Some(search) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut())
+            && !matches!(
+                (
+                    search.direction,
+                    search.anchor_absolute_row,
+                    search.anchor_col
+                ),
+                (SearchDirection::Forward, i64::MIN, 0)
+                    | (SearchDirection::Backward, i64::MAX, u16::MAX)
+            )
+        {
+            search.anchor_absolute_row = row;
+            search.anchor_col = col;
+        }
     }
 
     /// Re-run window `wid`'s find over the screen and scrollback, then show the first match in its direction from the search point.
@@ -1594,16 +1642,7 @@ impl App {
             // Removed whether or not the restore applies: ⎋ ends this find, and a
             // stale entry would be inherited by the next ⌘F on this terminal.
             if let Some(origin) = self.find_origins.remove(&(session, wid)) {
-                let mut terminal = term_lock(&term);
-                let coherent = origin.on_alt_screen == terminal.is_alternate_screen()
-                    && origin.history_renumber_epoch == terminal.grid().history_renumber_epoch();
-                if coherent {
-                    if origin.was_live {
-                        terminal.return_to_live();
-                    } else {
-                        terminal.scroll_to_absolute_row(origin.top_visible_absolute_row);
-                    }
-                }
+                origin.restore(&mut term_lock(&term));
             }
         }
         self.search_close_in(wid, true);

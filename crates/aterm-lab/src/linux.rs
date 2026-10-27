@@ -15,6 +15,7 @@ use atpkg::admit_disk::Admit;
 
 use crate::linux_driver::{Driver, Kind};
 use crate::linux_guest::{self as guest, Arch, Display};
+use crate::linux_owned as owned;
 use crate::paths::paths;
 use crate::{Fail, LAB, Res};
 
@@ -29,10 +30,10 @@ pub const DISK_GIB: u32 = 60;
 /// lima's template for the guest image (the image digest is pinned by the lima release that ships the template).
 pub const TEMPLATE: &str = "template:ubuntu-24.04";
 
-/// The guest-local directory every build of the lane writes, under the guest user's home (never a host mount); the end of a run (a proof, a one-shot `exec`, `down`) and `clean` empty it, and a run that finds another checkout's output in it empties it first ([`BUILT_FROM`]).
+/// The VZ guest's build directory under its user's home. Lima reserves a distinct guest directory and retains its creation receipt instead.
 pub const GUEST_DIR: &str = "aterm-lane";
 
-/// The file in [`GUEST_DIR`] that names the checkout whose build output it
+/// The file in the selected guest build root that names the checkout whose output it
 /// holds. Cargo hashes a path package by its path inside the workspace and
 /// keeps its dep-info relative to it, so the output another checkout left
 /// (`--keep-build`, or an `up` never taken `down`) reads as fresh to this
@@ -61,7 +62,10 @@ capacity`) and waits while they do not fit with 8 GiB to spare beside them, nami
 minute (NOT RUN at once only on a Mac too small for them); --admit now boots at once, saying what it lacks or would have
 waited for. The guest's builds run as many jobs as cores the claim was granted (CARGO_BUILD_JOBS). A lima VM still running
 after the one-shot run that booted it died is stopped as `down` stops it, and booted afresh; one an `up` or a --keep-up run
-left is adopted
+left is adopted. Lima uses ~/Library/Caches/aterm/lima.noindex (or explicit LIMA_HOME), with creation
+receipts for its namespace and each VM. An existing namespace or VM without matching receipts is
+retained and refused. The owner's default ~/.lima is never adopted. Lima build output uses a
+reserved guest directory; historical ~/aterm-lane directories are retained.
   up                       make the VM on first use, mount this checkout read-only, boot, provision; leaves it running
   down                     remove the guest's build output and stop the VM (it is kept; the next run boots it in ~10 s)
   status                   lima, the VM, its mount, provisioning and disk use (guest and host)
@@ -83,7 +87,7 @@ left is adopted
                            an Xvfb window). Every session but the Deck's holds the Deck off ([sys] stats_bars =
                            \"off\"): its figures redraw every second, which races a frame held to the server's.
                            Exit 0 pass, 1 a row failed, 3 NOT RUN. Report and frames: $LAB_STATE/linux/
-  gone [--arch A]... [--display D]... [--wgpu-oracle] [--weston-renderer gl|pixman] [--keep-build] [--keep-up]
+  gone [--arch A]... [--display D]... [--weston-renderer gl|pixman] [--keep-build] [--keep-up]
                            the proof's display-gone rows alone (xvfb and weston unless named): the display's
                            servers killed with SIGKILL under a running aterm-gui, at rest, mid-resize (the
                            server frozen until aterm's requests wait in it) and, on X11, mid-capture (mid-resize
@@ -92,9 +96,7 @@ left is adopted
                            itself, nonzero and without a panic, say that its display connection ended, and
                            leave session.toml holding its tab's folder and no crash journal; and a person's
                            quit (`invoke Quit`, the display up), which must exit 0, say nothing about the
-                           display and save the same layout; --wgpu-oracle builds aterm-gui with aterm-gpu's
-                           wgpu-oracle, so its windows draw on wgpu, and a Wayland mid-resize row must then
-                           show the resize's surface configure rejected inside its error scope
+                           display and save the same layout
   cpu [--arch A]... [--display D]... [--weston-renderer gl|pixman] [--keep-build] [--keep-up]
                            the proof's CPU presenter rows alone (every display unless named): aterm-gui --cpu
                            typed, resized and photographed twice (after the resize, and after one more line typed),
@@ -140,7 +142,7 @@ left is adopted
                            GNOME's default, and no portal); and under weston's pixman renderer, aterm-gui --cpu
                            resized seven times, each frame held to weston's output and weston alive after each
                            (pixman whatever a run names: edges takes no --weston-renderer)
-  baseline [--arch A]... [--screen S]... [--record | --wgpu-oracle] [--keep-build] [--keep-up]
+  baseline [--arch A]... [--screen S]... [--record] [--keep-build] [--keep-up]
                            record a scripted aterm-gui session under each screen (xvfb, xvfb-dpi144, weston,
                            weston-scale2, mutter, mutter-scale1.5, xwayland, weston-x11): dims and scale, resizes
                            and cast drift, clipboard and primary, key repeat, compose, XIM (a dead key, and a
@@ -150,9 +152,7 @@ left is adopted
                            with each frame held to weston's output, the AT-SPI tree and event stream, present
                            percentiles and the item the slowest present ended in, and the stack under it; replay
                            it against the recordings committed in crates/aterm-lab/linux-baseline/ (exit 0 same
-                           behaviour, 1 it moved, 3 NOT RUN), or with --record write them there; --wgpu-oracle
-                           replays with aterm-gui built with aterm-gpu's wgpu-oracle, drawing on wgpu (GW.2's
-                           Vulkan arm) instead of the GL arm
+                           behaviour, 1 it moved, 3 NOT RUN), or with --record write them there
   browser [--arch A]... [--keep-build] [--keep-up]
                            the browser lane in the guest: both web modules built and bound on this Mac (`verify
                            browser-site`), then on each arch aterm-verify built in the guest, its pinned browsers
@@ -527,6 +527,7 @@ pub struct Lima {
     /// What every `limactl` of the run gets beyond this process's environment (the GPU
     /// instance's krunkit, [`crate::linux_gpu::lima_env`]).
     pub env: Vec<(String, String)>,
+    owned: owned::Namespace,
 }
 
 impl Lima {
@@ -554,10 +555,12 @@ impl Lima {
         let pinned = aterm_uds::host::tooling_dir()
             .and_then(|t| aterm_uds::host::tool("limactl").placed_in(&t))
             .map(|p| p.to_string_lossy().into_owned());
+        let owned = lima_namespace()?;
         pick_limactl(named.as_deref(), pinned.as_deref(), crate::sys::executable).map(|bin| Lima {
             bin: PathBuf::from(bin),
             vm: crate::linux_gpu::vm(),
             env,
+            owned,
         })
     }
 
@@ -565,12 +568,45 @@ impl Lima {
         let mut c = aterm_uds::spawnfd::command(&self.bin);
         c.stdin(Stdio::null());
         c.envs(self.env.iter().map(|(k, v)| (k, v)));
+        c.env("LIMA_HOME", &self.owned.path);
         c
     }
 
     /// Run `limactl ARGS`, capturing what it says.
     #[must_use]
     pub fn run(&self, args: &[String]) -> Out {
+        let verb = args.first().map(String::as_str);
+        let result = match verb {
+            Some("list") => self.owned.existing_vm().map(|()| self.run_raw(args)),
+            Some("--version") => self.owned.check().map(|()| self.run_raw(args)),
+            Some("create") => self.owned.create_vm(|| {
+                let out = self.run_raw(args);
+                if out.ok() { Ok(out) } else { Err(out.tail(8)) }
+            }),
+            _ => self.owned.with_vm(|| self.run_raw(args)),
+        };
+        match result {
+            Ok(out) if out.ok() && verb == Some("delete") => match self.owned.retired_vm() {
+                Ok(()) => out,
+                Err(why) => Self::refused(why),
+            },
+            Ok(out) => out,
+            Err(why) => Self::refused(why),
+        }
+    }
+
+    fn refused(why: String) -> Out {
+        Out {
+            code: Some(NOT_RUN),
+            text: format!("Lima ownership refused: {why}"),
+            secs: 0.0,
+            signal: None,
+            not_started: Some(why),
+            lost: None,
+        }
+    }
+
+    fn run_raw(&self, args: &[String]) -> Out {
         let t0 = Instant::now();
         let out = self.command().args(args).output();
         let secs = t0.elapsed().as_secs_f64();
@@ -627,7 +663,11 @@ impl Lima {
         if !out.ok() {
             return Err(format!("limactl list failed: {}", out.tail(5)));
         }
-        Ok(parse_list(&out.text, self.vm))
+        let vm = parse_list(&out.text, self.vm);
+        if let Some(vm) = &vm {
+            self.owned.admit_vm(&vm.dir)?;
+        }
+        Ok(vm)
     }
 
     fn shell_argv(&self, workdir: &str, argv: &[String]) -> Vec<String> {
@@ -644,6 +684,9 @@ impl Lima {
     /// Run `argv` in the guest from `workdir`, capturing its output; `stdin` is written to it when given.
     #[must_use]
     pub fn shell(&self, workdir: &str, argv: &[String], stdin: Option<&str>) -> Out {
+        if let Err(why) = self.owned.admit_vm(&self.owned.vm_dir()) {
+            return Self::refused(why);
+        }
         let t0 = Instant::now();
         let mut cmd = self.command();
         cmd.args(self.shell_argv(workdir, argv))
@@ -698,6 +741,9 @@ impl Lima {
     /// Run `argv` in the guest with its stderr merged into its stdout there (so cargo's `Running` lines and libtest's lines keep their order), each line shown here as it comes, prefixed, and kept.
     #[must_use]
     pub fn shell_streamed(&self, workdir: &str, argv: &[String], prefix: &str) -> Out {
+        if let Err(why) = self.owned.admit_vm(&self.owned.vm_dir()) {
+            return Self::refused(why);
+        }
         let t0 = Instant::now();
         let mut merged = vec![
             "sh".to_string(),
@@ -794,6 +840,15 @@ impl Lima {
             format!("{}:{guest_dir}", self.vm),
             format!("{}/", host_parent.to_string_lossy()),
         ])
+    }
+
+    fn guest_output(&self, home: &str, argv: &[String]) -> Result<String, String> {
+        let out = self.shell(home, argv, None);
+        if out.ok() {
+            Ok(out.text)
+        } else {
+            Err(out.tail(5))
+        }
     }
 }
 
@@ -957,11 +1012,7 @@ impl LaneLock {
     /// the lock file cannot be made.
     pub fn take() -> Result<LaneLock, Fail> {
         let path = match crate::linux_driver::kind()? {
-            Kind::Lima => lane_lock_path(
-                crate::linux_gpu::vm(),
-                std::env::var("LIMA_HOME").ok().as_deref(),
-                paths().need_home().map_err(Fail::die)?,
-            ),
+            Kind::Lima => lima_namespace()?.lock_path(),
             Kind::Vz => crate::linux_vz_driver::lane_lock_path(&crate::linux_vz_driver::root()?),
         };
         LaneLock::at(&path, "linux")
@@ -1065,14 +1116,34 @@ fn holder_name(holder: Option<&named_lock::Holder>) -> String {
     )
 }
 
-/// The lane lock of lima's instance `vm`: one per VM, so beside lima's instances (`$LIMA_HOME`, else `~/.lima`), never in a checkout.
+/// The lane lock of Lima's instance `vm`, beside its instances in the owned namespace.
 #[must_use]
-pub fn lane_lock_path(vm: &str, lima_home: Option<&str>, home: &str) -> PathBuf {
-    let base = match lima_home.filter(|h| !h.is_empty()) {
-        Some(h) => PathBuf::from(h),
-        None => Path::new(home).join(".lima"),
+pub fn lane_lock_path(vm: &str, home: &Path) -> PathBuf {
+    home.join(format!(".{vm}.lane.lock"))
+}
+
+fn lima_namespace() -> Result<owned::Namespace, Fail> {
+    let named = match std::env::var("LIMA_HOME") {
+        Ok(s) => s,
+        Err(std::env::VarError::NotPresent) => String::new(),
+        Err(std::env::VarError::NotUnicode(_)) => return Err(not_run("LIMA_HOME is not Unicode")),
     };
-    base.join(format!(".{vm}.lane.lock"))
+    let default = if named.is_empty() {
+        let path = aterm_uds::host::host_user_cache("lima")
+            .ok_or_else(|| not_run("no HOME for the owned Lima namespace"))?;
+        std::fs::create_dir_all(
+            path.parent()
+                .ok_or_else(|| not_run("Lima cache has no parent"))?,
+        )
+        .map_err(|e| not_run(format!("Lima cache parent: {e}")))?;
+        path
+    } else {
+        PathBuf::new()
+    };
+    let path = owned::home(Some(&named), &default).map_err(not_run)?;
+    let namespace = owned::Namespace::open(&path, crate::linux_gpu::vm()).map_err(not_run)?;
+    namespace.existing_vm().map_err(not_run)?;
+    Ok(namespace)
 }
 
 /// `$LAB_STATE/linux`, made when missing.
@@ -1091,6 +1162,7 @@ pub struct Up {
     /// The guest user's home and `XDG_RUNTIME_DIR`.
     pub home: String,
     pub runtime: String,
+    build_dir: String,
     pub booted_here: bool,
     /// Reserved on the first display start, once per run. Both success and
     /// failure are retained, so a failed reservation cannot fall back to a
@@ -1142,10 +1214,10 @@ impl Up {
         env
     }
 
-    /// The guest-local build directory ([`GUEST_DIR`]).
+    /// The guest-local build root: Lima's reserved directory, or VZ's [`GUEST_DIR`].
     #[must_use]
     pub fn lane_dir(&self) -> String {
-        format!("{}/{GUEST_DIR}", self.home)
+        self.build_dir.clone()
     }
 
     /// Run `argv` in the guest, captured, from its home.
@@ -1266,19 +1338,12 @@ pub fn boot_run(
 }
 
 /// [`boot_run`] for the Linux lane on `kind`: this run's lima instance
-/// ([`crate::linux_gpu::vm`]) beside its lane lock (`$LIMA_HOME`, else `~/.lima`), or the vz
+/// ([`crate::linux_gpu::vm`]) in the owned Lima namespace, or the vz
 /// arm's root.
 fn linux_boot_run(kind: Kind) -> Result<atpkg::admit_disk::Run, Fail> {
     let vm = crate::linux_gpu::vm();
     let base = match kind {
-        Kind::Lima => {
-            let lock = lane_lock_path(
-                vm,
-                std::env::var("LIMA_HOME").ok().as_deref(),
-                paths().need_home().map_err(Fail::die)?,
-            );
-            lock.parent().map_or_else(PathBuf::new, Path::to_path_buf)
-        }
+        Kind::Lima => lima_namespace()?.path,
         Kind::Vz => crate::linux_vz_driver::root()?,
     };
     let dir = match kind {
@@ -1363,6 +1428,12 @@ fn boot_disk_done(lane: &str, held: atpkg::admit_disk::Admitted) {
 }
 
 fn clean_guest_build(guest: &Driver, home: &str) -> Result<(), String> {
+    if let Driver::Lima(lima) = guest {
+        lima.owned
+            .clear_guest(|argv| lima.guest_output(home, argv))?;
+        let _ = guest.shell(home, &["sudo".into(), "fstrim".into(), "/".into()], None);
+        return Ok(());
+    }
     let dir = format!("{home}/{GUEST_DIR}");
     let out = guest.shell(home, &["rm".into(), "-rf".into(), dir], None);
     if !out.ok() {
@@ -1409,11 +1480,7 @@ type Brought = (
 /// No home.
 pub fn booter_path() -> Result<PathBuf, Fail> {
     let vm = crate::linux_gpu::vm();
-    let lock = lane_lock_path(
-        vm,
-        std::env::var("LIMA_HOME").ok().as_deref(),
-        paths().need_home().map_err(Fail::die)?,
-    );
+    let lock = lima_namespace()?.lock_path();
     Ok(lock.with_file_name(format!(".{vm}.booter")))
 }
 
@@ -1440,6 +1507,7 @@ fn bring_up_vz(repo: &str) -> Result<Brought, Fail> {
             guest: Driver::Vz(Box::new(opened.vz)),
             home: user.home(),
             runtime: user.runtime(),
+            build_dir: format!("{}/{GUEST_DIR}", user.home()),
             booted_here: true,
             config: OnceLock::new(),
             timings: Vec::new(),
@@ -1575,6 +1643,7 @@ fn finish_bring_up(
         guest,
         home: home.clone().unwrap_or_default(),
         runtime: runtime.clone().unwrap_or_default(),
+        build_dir: String::new(),
         booted_here,
         config: OnceLock::new(),
         timings,
@@ -1586,6 +1655,20 @@ fn finish_bring_up(
         up.release();
         return Err(not_run("the guest named no HOME or XDG_RUNTIME_DIR"));
     }
+    up.build_dir = if let Driver::Lima(lima) = &up.guest {
+        match lima
+            .owned
+            .prepare_guest(&up.home, |argv| lima.guest_output(&up.home, argv))
+        {
+            Ok(dir) => dir.path,
+            Err(why) => {
+                up.release();
+                return Err(not_run(why));
+            }
+        }
+    } else {
+        format!("{}/{GUEST_DIR}", up.home)
+    };
     match provision(&up) {
         Ok(Some(secs)) => up.timings.push(Step::done("provision", secs)),
         Ok(None) => {}
@@ -1627,8 +1710,7 @@ fn finish_bring_up(
     Ok(up)
 }
 
-/// What the guest's build directory holds for the checkout `repo`, from
-/// whether [`GUEST_DIR`] exists and what its [`BUILT_FROM`] names.
+/// What the selected guest build directory holds for `repo`, from its existence and [`BUILT_FROM`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuildOutput {
     /// No build directory: this run makes it and names itself in it.
@@ -1647,7 +1729,7 @@ fn build_output(dir_exists: bool, built_from: Option<&str>, repo: &str) -> Build
     }
 }
 
-/// Ensure [`GUEST_DIR`] belongs to `repo`, removing any foreign build output first.
+/// Ensure the selected build root belongs to `repo`, clearing another checkout's output first.
 /// # Errors
 /// NOT RUN: the foreign output could not be removed, or the stamp written.
 fn claim_build_output(up: &Up, repo: &str) -> Result<Option<Step>, Fail> {
@@ -1882,6 +1964,7 @@ fn cmd_status() -> Res {
     }
     let lima = Lima::find()?;
     println!("limactl   {} ({})", lima.bin.display(), lima.version());
+    println!("LIMA_HOME {}", lima.owned.path.display());
     let gpu = if crate::linux_gpu::on() { " --gpu" } else { "" };
     let Some(vm) = lima.state().map_err(Fail::die)? else {
         println!("vm        none (`{LAB} linux{gpu} up` makes it)");
@@ -2258,6 +2341,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unowned_lima_never_reaches_the_mutating_or_guest_command() {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let t = aterm_tempfile::tempdir().unwrap();
+        let owned = owned::Namespace::open(&t.path().join("lima"), VM).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(owned.vm_dir())
+            .unwrap();
+        std::fs::write(owned.vm_dir().join("notes"), "keep").unwrap();
+        let lima = Lima {
+            bin: t.path().join("must-not-start"),
+            vm: VM,
+            env: Vec::new(),
+            owned,
+        };
+        for verb in ["list", "create", "stop", "start", "edit", "delete", "copy"] {
+            let out = lima.run(&[verb.into(), VM.into()]);
+            assert_eq!(out.code, Some(NOT_RUN), "{verb}: {}", out.text);
+            assert!(out.not_started.is_some(), "{verb}: {}", out.text);
+        }
+        for out in [
+            lima.shell("/", &["true".into()], None),
+            lima.shell_streamed("/", &["true".into()], ""),
+        ] {
+            assert_eq!(out.code, Some(NOT_RUN));
+            assert!(out.not_started.is_some());
+        }
+        assert_eq!(
+            std::fs::read_to_string(lima.owned.vm_dir().join("notes")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
     fn a_signal_that_ended_limactl_is_named() {
         let run = |script: &str| {
             aterm_uds::spawnfd::command("/bin/sh")
@@ -2536,20 +2653,16 @@ mod tests {
 
     #[test]
     fn every_checkout_takes_the_one_lock_beside_the_vm() {
-        let mine = lane_lock_path(VM, None, "/Users//u");
-        assert_eq!(mine, PathBuf::from("/Users//u/.lima/.aterm-linux.lane.lock"));
+        let home = Path::new("/private/lima");
+        let mine = lane_lock_path(VM, home);
+        assert_eq!(mine, PathBuf::from("/private/lima/.aterm-linux.lane.lock"));
         assert_eq!(
-            lane_lock_path(VM, Some(""), "/Users//u"),
-            mine,
-            "an empty LIMA_HOME is unset"
-        );
-        assert_eq!(
-            lane_lock_path(VM, Some("/v/lima"), "/Users//u"),
+            lane_lock_path(VM, Path::new("/v/lima")),
             PathBuf::from("/v/lima/.aterm-linux.lane.lock")
         );
         assert_eq!(
-            lane_lock_path(crate::linux_gpu::VM, None, "/Users//u"),
-            PathBuf::from("/Users//u/.lima/.aterm-linux-gpu.lane.lock"),
+            lane_lock_path(crate::linux_gpu::VM, home),
+            PathBuf::from("/private/lima/.aterm-linux-gpu.lane.lock"),
             "the GPU instance's runs never wait on the lane VM's"
         );
     }
@@ -2811,6 +2924,7 @@ mod tests {
             guest: Driver::Fake(guest.clone()),
             home: "/home/u.guest".into(),
             runtime: "/run/user/501".into(),
+            build_dir: "/home/u.guest/aterm-lane".into(),
             booted_here,
             config: OnceLock::new(),
             timings: Vec::new(),

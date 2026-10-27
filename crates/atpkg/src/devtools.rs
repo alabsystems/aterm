@@ -409,13 +409,13 @@ pub const fn list_reason(label: DevToolListLabel) -> &'static str {
             "the system TCC.db that holds the list opens only to an app with Full Disk Access"
         }
         DevToolListLabel::OpenFailed => "the system TCC.db could not be opened",
-        DevToolListLabel::ToolFailed => "sqlite3 could not read the system TCC.db",
+        DevToolListLabel::ToolFailed => "the system TCC.db could not be read",
         DevToolListLabel::FormatUnrecognized => {
             "the system TCC.db answered in a shape aterm does not recognise"
         }
         DevToolListLabel::TimedOut => "reading the system TCC.db did not finish in time",
-        DevToolListLabel::SpawnFailed => "sqlite3 could not be started",
-        DevToolListLabel::OutputUnreadable => "sqlite3's answer could not be read",
+        DevToolListLabel::SpawnFailed => "the system TCC.db reader could not be started",
+        DevToolListLabel::OutputUnreadable => "the system TCC.db's answer could not be read",
         DevToolListLabel::RefusedDisabled => "the privacy probe is switched off in the config",
         DevToolListLabel::RefusedObserverOff => "observer = false in aterm.toml's [privacy]",
         DevToolListLabel::RefusedOutOfBundle => "running outside the app bundle",
@@ -1006,12 +1006,8 @@ pub fn last_opened() -> Option<(String, u64)> {
     DEVELOPER_TOOLS.last_opened()
 }
 
-/// How soon a request made with a person at the screen (`aterm ctl devtools hand-over now`,
-/// which `aterm doctor` sends from a terminal) may put the page in front of the owner again.
-pub const REOPEN_NOW_AFTER_S: u64 = 60;
-
 /// How many seconds ago aterm opened the pane, when that was under `window_s` ago
-/// ([`REOPEN_AFTER_S`], [`REOPEN_NOW_AFTER_S`]).
+/// ([`REOPEN_AFTER_S`]).
 #[must_use]
 pub fn opened_within(window_s: u64) -> Option<u64> {
     DEVELOPER_TOOLS.opened_within(window_s)
@@ -1457,6 +1453,30 @@ mod tests {
         ))
         .expect("a row");
         assert_eq!(unknown.level, Level::Note);
+        for label in [
+            DevToolListLabel::Pending,
+            DevToolListLabel::Read,
+            DevToolListLabel::NoFullDiskAccess,
+            DevToolListLabel::OpenFailed,
+            DevToolListLabel::ToolFailed,
+            DevToolListLabel::FormatUnrecognized,
+            DevToolListLabel::TimedOut,
+            DevToolListLabel::SpawnFailed,
+            DevToolListLabel::OutputUnreadable,
+            DevToolListLabel::RefusedDisabled,
+            DevToolListLabel::RefusedObserverOff,
+            DevToolListLabel::RefusedOutOfBundle,
+            DevToolListLabel::RefusedNoExe,
+            DevToolListLabel::RefusedNoSubject,
+        ] {
+            let reason = list_reason(label);
+            for absent_word in ["tccutil", "sqlite3", "sudo"] {
+                assert!(
+                    !reason.contains(absent_word),
+                    "{label:?}: {reason:?} names {absent_word}"
+                );
+            }
+        }
     }
 
     /// The row counts this user's programs macOS's program check holds now, word for word,
@@ -1727,8 +1747,8 @@ mod tests {
             assert_eq!(parse_opened(bad), None, "{bad:?}");
         }
         let at = 1_792_020_637;
-        assert_eq!(opened_ago(at, at + 59, REOPEN_NOW_AFTER_S), Some(59));
-        assert_eq!(opened_ago(at, at + 60, REOPEN_NOW_AFTER_S), None);
+        assert_eq!(opened_ago(at, at + 59, 60), Some(59));
+        assert_eq!(opened_ago(at, at + 60, 60), None);
         assert_eq!(
             opened_ago(at, at - 600, REOPEN_AFTER_S),
             Some(0),

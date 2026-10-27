@@ -220,8 +220,30 @@ impl Run<'_> {
         let since = Instant::now();
         let mut findings = Vec::new();
         let mut stop = None;
-        let metadata = ws.metadata_locked().map_err(started)?;
-        if !metadata.success {
+        let mut metadata = ws.metadata_locked().map_err(started)?;
+        // No aterm build downloads the registry libc, and a cache prune can
+        // take it: fetch the locked graph once, then ask again offline. A
+        // fetch that finds the lock stale (an index too old to say so offline)
+        // is that finding; any other failed fetch stops the run with its own
+        // reason (no network, or a download Cargo.lock's checksum refused).
+        if metadata.locked_failure() == Some(LockedFailure::NotDownloaded) {
+            let fetch = ws.fetch_locked().map_err(started)?;
+            if fetch.success {
+                metadata = ws.metadata_locked().map_err(started)?;
+            } else if fetch.locked_failure() == Some(LockedFailure::StaleLock) {
+                metadata = fetch;
+            } else {
+                stop = Some(CouldNotRun::new(
+                    format!(
+                        "the locked dependencies are not on this machine, and `targo fetch \
+                         --locked` failed:\n{}",
+                        fetch.detail()
+                    ),
+                    FETCH_ONLINE,
+                ));
+            }
+        }
+        if !metadata.success && stop.is_none() {
             match metadata_refusal(&metadata) {
                 Ok(finding) => findings.push(finding),
                 Err(could_not_run) => stop = Some(could_not_run),

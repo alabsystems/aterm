@@ -278,7 +278,8 @@ Run aterm's checks in place, alone or in any combination.
                                   windows, only when named
 
 Sets:
-  dev      fmt census lint test doc (the default)
+  dev      fmt census lint test doc (the default); its lint brings cells,
+           one cell per other OS that builds a selected crate
   release  every check `ship release` requires; --all implied, --app required
 
 Checks:
@@ -300,8 +301,9 @@ Options:
                           after {start}); now starts at once, saying what
                           it lacks, and a starved take is refused; the
                           Linux lane's lab is given it too
-      --test-threads <n>  RUST_TEST_THREADS for every test binary
-      --test-jobs <n>     test binaries at once (default 8)
+      --test-threads <n>  RUST_TEST_THREADS ceiling for every test binary
+      --test-jobs <n>     test binaries at once (default 8); under build-slot,
+                          binaries times threads stays within CARGO_BUILD_JOBS
       --timeout <s|off>   hang ceiling on each child's work (default 3h); its
                           waits for a lock or for room are left out
       --log <path>        where the full log goes (default: a new file in
@@ -309,7 +311,8 @@ Options:
   -h, --help
 
 Exit: 0 every check that ran passed, 1 a check failed, 2 usage, 3 could not run.
-A skip names its fix and fails nothing; under `release` it is exit 3.
+A skip names its fix and fails nothing; under `release` it is exit 3. A checkout
+whose HEAD moved to another commit mid-run is exit 3: its checks read both trees.
 "
     )
 }

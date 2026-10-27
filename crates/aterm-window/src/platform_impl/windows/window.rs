@@ -6,7 +6,8 @@
 
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
 // Adapt pointer handles and preserve thread-executor dispatch with SendHandle; drop the
-// rwh_04 and rwh_05 handle methods; build the FlashWindowEx request apart (`attention_flash`).
+// rwh_04, rwh_05 and rwh_06 handle methods; build the FlashWindowEx request apart
+// (`attention_flash`).
 
 #![cfg(windows_platform)]
 
@@ -231,8 +232,8 @@ impl Window {
 
     /// LOCAL PATCH (aterm) (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6, the Windows
     /// half): the window's `HWND` and its class's `HINSTANCE`, which aterm's crates read through
-    /// first-party `aterm_types::native_window::HasNativeWindow` (the opt-in `rwh_06` handle wraps
-    /// this answer). `None` off the event loop's thread, as upstream's raw-window-handle answered.
+    /// first-party `aterm_types::native_window::HasNativeWindow`. `None` off the event loop's
+    /// thread, as upstream's raw-window-handle answered.
     pub fn native_window(&self) -> Option<aterm_types::native_window::NativeWindow> {
         if !self.thread_executor.in_event_loop_thread() {
             tracing::error!("tried to access window handle outside of the main thread");
@@ -245,30 +246,6 @@ impl Window {
             hwnd: std::ptr::NonNull::new(self.window)?,
             hinstance: std::ptr::NonNull::new(super::handle::from_isize(hinstance)),
         })
-    }
-
-    #[cfg(feature = "rwh_06")]
-    #[inline]
-    pub fn raw_window_handle_rwh_06(&self) -> Result<rwh_06::RawWindowHandle, rwh_06::HandleError> {
-        use aterm_types::native_window::NativeWindow;
-        let id = |p: std::ptr::NonNull<c_void>| {
-            std::num::NonZeroIsize::new(super::handle::to_isize(p.as_ptr()))
-        };
-        let Some(NativeWindow::Win32 { hwnd, hinstance }) = self.native_window() else {
-            return Err(rwh_06::HandleError::Unavailable);
-        };
-        let mut window_handle =
-            rwh_06::Win32WindowHandle::new(id(hwnd).ok_or(rwh_06::HandleError::Unavailable)?);
-        window_handle.hinstance = hinstance.and_then(id);
-        Ok(rwh_06::RawWindowHandle::Win32(window_handle))
-    }
-
-    #[cfg(feature = "rwh_06")]
-    #[inline]
-    pub fn raw_display_handle_rwh_06(
-        &self,
-    ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        Ok(rwh_06::RawDisplayHandle::Windows(rwh_06::WindowsDisplayHandle::new()))
     }
 
     #[inline]

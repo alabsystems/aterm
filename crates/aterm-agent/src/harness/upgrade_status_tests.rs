@@ -1438,6 +1438,70 @@ fn an_agent_the_upgrade_ended_is_said_down_in_a_tab_set_aside_too() {
     }
 }
 
+/// THE PERSON'S NOW PASSES THE OFF ASIDES: a row the person asked to move now (the top rule's
+/// ⬆️, the tab menu's Upgrade Now) is not set aside for its tab's Autopilot Off or its agent
+/// switched off, in the window's rows and in `--status`'s. NEGATIVE CONTROL: with no Now, the
+/// same row goes aside for each.
+#[cfg(unix)]
+#[test]
+fn the_persons_now_passes_the_off_asides() {
+    let dir = ScratchDir::new("upgrade-status", "now-aside");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let strings = |tabs: &[&str]| tabs.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
+    let read = |off: &[&str], agent_off: &[&str]| {
+        let held = behind_in(TAB);
+        let mut view = View::default();
+        view.set_off(&strings(off));
+        view.set_agent_off(&strings(agent_off));
+        let mut sent: Vec<Row> = Vec::new();
+        let _ = view.refresh_with(&o, &tabs, now_s(), &held, &mut |rows| sent = rows.to_vec());
+        let aside = Aside {
+            off: off.iter().map(|t| (*t).to_string()).collect(),
+            agent_off: agent_off.iter().map(|t| (*t).to_string()).collect(),
+            ..Aside::default()
+        };
+        let (cli, vetted) = status_rows_with(&o, now_s(), &held, &|| aside.clone());
+        assert!(vetted);
+        (sent, cli)
+    };
+    for (request, words) in [
+        (Request::Now, ["", ""]),
+        (Request::None, [AUTOPILOT_OFF, AGENT_OFF]),
+    ] {
+        let owed = St {
+            phase: Phase::Pending,
+            from: "2.1.281".to_string(),
+            to: "2.1.282".to_string(),
+            tab: TAB.to_string(),
+            pending_since: now_s() - 7 * 3_600,
+            looked_at: now_s() - 3 * 3_600,
+            request: request.clone(),
+            request_tab: TAB.to_string(),
+            request_at: now_s() - 60,
+            ..St::default()
+        };
+        super::super::save_at(&o, "aaa", &owed, now_s() - 7 * 3_600);
+        for ((how, off, agent_off), word) in [
+            ("its Autopilot Off", &[TAB][..], &[][..]),
+            ("its agent switched off", &[][..], &[TAB][..]),
+        ]
+        .into_iter()
+        .zip(words)
+        {
+            let (window, cli) = read(off, agent_off);
+            for (reader, rows) in [("the window", &window), ("--status", &cli)] {
+                assert_eq!(rows.len(), 1, "{request:?}, {how}, {reader}: {rows:?}");
+                assert_eq!(rows[0].aside, word, "{request:?}, {how}, {reader}");
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_restarts_agent_no_look_saw_gone_is_read_gone_by_the_process_table() {
@@ -2406,6 +2470,60 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     let (status, whole) = read_rows(&filtered, NOW);
     assert!(status.is_empty());
     assert!(whole, "a valid record for another tab is omitted");
+
+    // A retired writer's state document (the shape m22 kept from 2026-09-24) shares the
+    // folder: it is no upgrade record, so it neither hides the live row nor makes the
+    // status incomplete, while the damaged-record cases above stay unreadable.
+    let stray = state_dir(&o).join("state.json");
+    std::fs::write(
+        &stray,
+        r#"{"acts":[],"badges":[],"conversations":{},"last_act_at":1790259448}"#,
+    )
+    .expect("a stray state document");
+    let (status, whole) = status_rows_with(&o, NOW, &held, &Aside::default);
+    assert_eq!(status.len(), 1, "the live upgrade beside a stray document");
+    assert!(
+        whole,
+        "a document with no phase is not an unreadable record"
+    );
+    let mut frames = Vec::new();
+    view.refresh_with_keeping(&o, &tabs, NOW, &held, &mut |rows, tabs| {
+        frames.push((rows.to_vec(), tabs.to_vec()));
+    });
+    assert!(
+        frames.is_empty(),
+        "the stray document changes nothing the window holds: {frames:?}"
+    );
+    assert!(
+        view.unreadable().is_empty(),
+        "the stray document is not named"
+    );
+    // A restart stamp (`asked-<tab>.json`, no phase) is no record either.
+    let stamp = state_dir(&o).join(format!("asked-{TAB}.json"));
+    std::fs::write(
+        &stamp,
+        r#"{"pid":4242,"start":1790259000,"cause":"exit","at":1790259448}"#,
+    )
+    .expect("a restart stamp");
+    let (status, whole) = status_rows_with(&o, NOW, &held, &Aside::default);
+    assert_eq!(status.len(), 1, "the live upgrade beside a restart stamp");
+    assert!(whole, "a restart stamp is not an unreadable record");
+    // But a phase-less object under a record's own name is that record, damaged.
+    for name in ["0badf00d-1111-4222-8333-444455556666", "codex-s-damaged"] {
+        let damaged = state_dir(&o).join(format!("{name}.json"));
+        std::fs::write(&damaged, "{}").expect("a record emptied to an object");
+        let (_, whole) = status_rows_with(&o, NOW, &held, &Aside::default);
+        assert!(!whole, "{name}: an emptied record stays unreadable");
+        let (_, _, unread) = read_records(&o, NOW);
+        assert_eq!(
+            unread.iter().map(|u| u.path.clone()).collect::<Vec<_>>(),
+            std::slice::from_ref(&damaged),
+            "{name}: the emptied record is the one named"
+        );
+        std::fs::remove_file(&damaged).expect("drop the emptied record");
+    }
+    std::fs::remove_file(&stamp).expect("drop the restart stamp");
+    std::fs::remove_file(&stray).expect("drop the stray document");
     std::fs::remove_dir_all(state_dir(&o)).expect("no records");
     view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent.push(rows.to_vec()));
     assert_eq!(sent.len(), 3);
@@ -2681,7 +2799,9 @@ fn every_owners_word_arms_a_new_round() {
         ..St::default()
     };
     save(&o, "aaa", &announced);
+    let asked_from = now_s();
     ask(&o, TAB, Ask::Defer(600), false).expect("defer");
+    let asked_by = now_s();
     let held = load(&o, "aaa").expect("state");
     assert_eq!(held.phase, Phase::Pending, "the hold ends the notice");
     assert!(held.marker.is_empty(), "and its marker");
@@ -2698,7 +2818,10 @@ fn every_owners_word_arms_a_new_round() {
             );
         }
     }
-    assert!(held.request_at >= now_s() - 5, "when the word was given");
+    assert!(
+        (asked_from..=asked_by).contains(&held.request_at),
+        "when the word was given"
+    );
     ask(&o, TAB, Ask::Now, false).expect("--now");
     let hurried = load(&o, "aaa").expect("state");
     assert!(hurried.salt > held.salt, "the owner's word opens a round");
@@ -6759,150 +6882,6 @@ fn a_quiet_give_up_its_own_work_held_is_a_wait_the_owners_now_does_not_move() {
 }
 
 #[test]
-fn a_move_the_person_holds_is_noted_for_their_footer() {
-    let st = St {
-        from: "2.1.285".to_string(),
-        to: "2.1.286".to_string(),
-        tab: TAB.to_string(),
-        pending_since: NOW - (5 * 3_600 + 38 * 60),
-        phase: Phase::Announced {
-            at_s: NOW - 600,
-            asks: 1,
-        },
-        ready_since: NOW - 20,
-        wait: "attended".to_string(),
-        wait_since: NOW - 20,
-        wait_seen: NOW - 5,
-        ..St::default()
-    };
-    let held = Row::of("c", &st, NOW);
-    assert!(held.ready && held.person_named, "{held:?}");
-    assert_eq!(held.rung(NOW), upgrade::Rung::Land);
-    let note = held.pause_note(NOW).expect("held by the person: noted");
-    let using = note.using.clone().expect("the person using the tab");
-    for w in [&using, &note.draft] {
-        assert!(
-            w.whole.contains("2.1.286") && w.short.contains("2.1.286"),
-            "the build named: {w:?}"
-        );
-    }
-    assert_ne!(using, note.draft, "the person, or their draft");
-    assert_eq!(note.words(false), note.using.as_ref());
-    assert_eq!(note.words(true), Some(&note.draft));
-    let drafted = Row::of(
-        "c",
-        &St {
-            wait: "draft".to_string(),
-            ..st.clone()
-        },
-        NOW,
-    );
-    assert!(!drafted.person_named);
-    assert_eq!(
-        drafted.pause_note(NOW),
-        Some(crate::harness::footer::UpgradeNote {
-            using: None,
-            draft: note.draft.clone(),
-        })
-    );
-    let asking = Row::of(
-        "c",
-        &St {
-            ready_since: 0,
-            ..st.clone()
-        },
-        NOW,
-    );
-    assert!(!asking.ready);
-    let asked = asking.pause_note(NOW).expect("held by the person: noted");
-    assert!(asked.using.is_some());
-    assert_ne!(
-        asked.draft.whole, note.draft.whole,
-        "not ready: not said so"
-    );
-    let pending = Row::of(
-        "c",
-        &St {
-            phase: Phase::Pending,
-            ..st.clone()
-        },
-        NOW,
-    );
-    assert!(!pending.ready);
-    assert_eq!(pending.pause_note(NOW), Some(asked));
-    let later = Row::of(
-        "c",
-        &St {
-            wait_seen: NOW + 15,
-            ..st.clone()
-        },
-        NOW + 20,
-    );
-    assert_ne!(later, held, "the row moves at every look");
-    assert_eq!(later.pause_note(NOW + 20), Some(note), "its note does not");
-
-    let unseen = st.wait_seen + ATTENDED_SEEN_S + 1;
-    assert_eq!(Row::of("c", &st, unseen).pause_note(unseen), None, "unseen");
-    for wait in ["not-idle:busy", "box", "release:draft"] {
-        let other = Row::of(
-            "c",
-            &St {
-                wait: wait.to_string(),
-                ..st.clone()
-            },
-            NOW,
-        );
-        assert_eq!(other.pause_note(NOW), None, "{wait}");
-    }
-    for phase in [
-        Phase::Exiting { at_s: NOW - 1 },
-        Phase::Relaunched { at_s: NOW - 1 },
-        Phase::Done,
-    ] {
-        let moved = Row::of(
-            "c",
-            &St {
-                phase: phase.clone(),
-                ..st.clone()
-            },
-            NOW,
-        );
-        assert_eq!(moved.pause_note(NOW), None, "{phase:?}");
-    }
-    for request in [
-        Request::Skip("2.1.286".to_string()),
-        Request::DeferUntil(NOW + 3_600),
-    ] {
-        let held_back = Row::of(
-            "c",
-            &St {
-                request: request.clone(),
-                request_tab: TAB.to_string(),
-                ..st.clone()
-            },
-            NOW,
-        );
-        assert_eq!(held_back.pause_note(NOW), None, "{request:?}");
-    }
-    for wait in ["attended", "draft"] {
-        let codex = Row::of(
-            "codex-c",
-            &St {
-                agent: upgrade::Agent::Codex,
-                wait: wait.to_string(),
-                ..st.clone()
-            },
-            NOW,
-        );
-        assert_eq!(
-            codex.pause_note(NOW),
-            None,
-            "Claude Code's lane alone: {wait}"
-        );
-    }
-}
-
-#[test]
 fn a_token_word_reads_as_the_cut_reads_it() {
     let cut = |s: &str| {
         let w: String = s
@@ -8267,5 +8246,23 @@ fn an_answered_down_record_stays_answered_across_an_unread_look() {
         look(&mut view, &nobody).unwrap().len(),
         1,
         "new down state is shown"
+    );
+}
+
+/// A round the drive stops because someone else resumed its conversation on an older build
+/// (`failed:resumed-by-another`) reads as that stop in its status row, not as the words for a stop
+/// nobody named; the control: a stop nobody named reads those.
+#[test]
+fn a_stop_for_a_resume_by_someone_else_reads_as_its_own() {
+    use crate::harness::upgrade_drive::RESUMED_BEHIND;
+    let claude = upgrade::Agent::Claude;
+    let unnamed = stall_reason(claude, "failed:a-stop-nobody-named");
+    let ours = stall_reason(claude, &format!("failed:{RESUMED_BEHIND}"));
+    assert_ne!(ours, unnamed, "{ours}");
+    assert_ne!(ours, stall_reason(claude, "failed:resumed-elsewhere"));
+    assert_eq!(
+        unnamed,
+        stop_words(claude, "another-stop-nobody-named"),
+        "control: the words for a stop nobody named"
     );
 }

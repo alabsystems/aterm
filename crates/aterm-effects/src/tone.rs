@@ -125,8 +125,7 @@ pub fn for_each_ngram_bucket_chars(
     }
 
     let mut count = 0usize;
-    let mut prev1_h2: Option<u64> = None;
-    let mut prev1_h3: Option<u64> = None;
+    let mut prev1: Option<(u64, u64)> = None;
     let mut prev2_h3: Option<u64> = None;
     let mut last_was_space = false;
     for raw in chars {
@@ -154,17 +153,88 @@ pub fn for_each_ngram_bucket_chars(
         let cb = (c as u32).to_le_bytes();
         f(bucket(fold(SEED_1, cb)));
         count += 1;
-        if let Some(h2_p1) = prev1_h2 {
+        if let Some((h2_p1, h3_p1)) = prev1 {
             f(bucket(fold(h2_p1, cb)));
             count += 1;
             if let Some(h3_p2_p1) = prev2_h3 {
                 f(bucket(fold(h3_p2_p1, cb)));
                 count += 1;
             }
+            prev2_h3 = Some(fold(h3_p1, cb));
         }
-        prev2_h3 = prev1_h3.map(|h3_p1| fold(h3_p1, cb));
-        prev1_h3 = Some(fold(SEED_3, cb));
-        prev1_h2 = Some(fold(SEED_2, cb));
+        prev1 = Some((fold(SEED_2, cb), fold(SEED_3, cb)));
+    }
+    count
+}
+
+/// Emit each normalized character 1/2/3-gram bucket of two contiguous char slices to `f`, returning the total n-gram count.
+#[inline]
+pub(crate) fn for_each_ngram_bucket_char_slices(
+    slices: [&[char]; 2],
+    mut f: impl FnMut(usize),
+) -> usize {
+    use aterm_hash::{FNV64_OFFSET, fnv1a_64_extend};
+    const ORDER_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
+    const SEED_1: u64 = FNV64_OFFSET ^ ORDER_SALT;
+    const SEED_2: u64 = FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(2);
+    const SEED_3: u64 = FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(3);
+
+    #[inline]
+    const fn fold(h: u64, cb: [u8; 4]) -> u64 {
+        fnv1a_64_extend(h, &cb)
+    }
+    #[inline]
+    const fn bucket(h: u64) -> usize {
+        (h as usize) & (BUCKETS - 1)
+    }
+
+    let mut count = 0usize;
+    let mut prev1: Option<(u64, u64)> = None;
+    let mut prev2_h3: Option<u64> = None;
+    let mut last_was_space = false;
+    let mut si = 0;
+    while si < 2 {
+        let slice = slices[si];
+        si += 1;
+        let mut ci = 0;
+        while ci < slice.len() {
+            let raw = slice[ci];
+            ci += 1;
+            let c = if raw.is_ascii() {
+                if matches!(raw, ' ' | '\t'..='\r') {
+                    if last_was_space {
+                        continue;
+                    }
+                    last_was_space = true;
+                    ' '
+                } else {
+                    last_was_space = false;
+                    raw.to_ascii_lowercase()
+                }
+            } else if raw.is_whitespace() {
+                if last_was_space {
+                    continue;
+                }
+                last_was_space = true;
+                ' '
+            } else {
+                last_was_space = false;
+                raw
+            };
+            let cb = (c as u32).to_le_bytes();
+            f(bucket(fold(SEED_1, cb)));
+            count += 1;
+            if let Some((h2_p1, h3_p1)) = prev1 {
+                f(bucket(fold(h2_p1, cb)));
+                count += 1;
+                if let Some(h3_p2_p1) = prev2_h3 {
+                    f(bucket(fold(h3_p2_p1, cb)));
+                    count += 1;
+                }
+                prev2_h3 = Some(fold(h3_p1, cb));
+            }
+            prev1 = Some((fold(SEED_2, cb), fold(SEED_3, cb)));
+        }
     }
     count
 }
@@ -309,7 +379,9 @@ impl<'a> RawTone<'a> {
 }
 
 /// Verify a weight asset (length, magic, checksum, dimensions, scales and finite biases) and view its quantized contents.
+#[inline]
 pub const fn raw(bytes: &[u8]) -> Result<RawTone<'_>, ToneModelError> {
+    #[inline]
     const fn has_magic(bytes: &[u8]) -> bool {
         let mut i = 0;
         while i < MAGIC.len() {
@@ -320,9 +392,11 @@ pub const fn raw(bytes: &[u8]) -> Result<RawTone<'_>, ToneModelError> {
         }
         true
     }
+    #[inline]
     const fn u32_at(bytes: &[u8], off: usize) -> u32 {
         u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
     }
+    #[inline]
     const fn f32_at(bytes: &[u8], off: usize) -> f32 {
         f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
     }
@@ -413,9 +487,13 @@ pub struct ToneModel {
 
 impl ToneModel {
     /// Decode and verify a weight asset.
+    #[inline]
     pub fn from_bytes(bytes: &[u8]) -> Result<ToneModel, ToneModelError> {
+        #[inline]
+        const fn deq_row(scale: f32, byte: u8) -> f32 {
+            (byte as i8) as f32 * scale
+        }
         let raw = raw(bytes)?;
-        let deq_row = |scale: f32, byte: u8| f32::from(byte as i8) * scale;
         let mut emb = Vec::with_capacity(raw.emb.len());
         let mut bi = 0;
         while bi < raw.emb.len() {
@@ -544,36 +622,47 @@ impl ToneModel {
     }
 
     /// Softmax scores in [`Tone::ALL`] order, or `None` when the text is too short ([`MIN_NGRAMS`]).
+    #[must_use]
+    #[inline]
     pub fn scores(&self, text: &str, s: &mut ToneScratch) -> Option<[f32; TONE_COUNT]> {
         if !self.compute_logits(text, s) {
             return None;
         }
         let mut mx = f32::NEG_INFINITY;
-        for &l in &s.logits {
-            mx = mx.max(l);
+        let mut i = 0;
+        while i < TONE_COUNT {
+            mx = mx.max(s.logits[i]);
+            i += 1;
         }
         let mut out = [0.0f32; TONE_COUNT];
         let mut z = 0.0f32;
-        for (o, &l) in out.iter_mut().zip(&s.logits) {
-            *o = crate::color_math::exp_f32(l - mx);
-            z += *o;
+        let mut i = 0;
+        while i < TONE_COUNT {
+            let v = crate::color_math::exp_f32(s.logits[i] - mx);
+            out[i] = v;
+            z += v;
+            i += 1;
         }
         if z > 0.0 {
             let inv_z = 1.0 / z;
-            for o in &mut out {
-                *o *= inv_z;
+            let mut i = 0;
+            while i < TONE_COUNT {
+                out[i] *= inv_z;
+                i += 1;
             }
         }
         Some(out)
     }
 
     /// The verdict with abstention explicit: the argmax tone, or `None` when the evidence is too thin ([`MIN_NGRAMS`]).
+    #[must_use]
     #[inline]
     pub fn classify_opt(&self, text: &str, s: &mut ToneScratch) -> Option<Tone> {
         self.classify_chars_opt(text.chars(), s)
     }
 
     /// [`ToneModel::classify_opt`] over a character iterator without an intermediate `String`.
+    #[must_use]
     #[inline]
     pub fn classify_chars_opt(
         &self,
@@ -584,15 +673,64 @@ impl ToneModel {
             return None;
         }
         let mut best = 0usize;
-        for (i, &l) in s.logits.iter().enumerate() {
-            if l > s.logits[best] {
+        let mut i = 1;
+        while i < TONE_COUNT {
+            if s.logits[i] > s.logits[best] {
                 best = i;
             }
+            i += 1;
+        }
+        Some(Tone::from_index(best))
+    }
+
+    /// [`ToneModel::classify_opt`] over two contiguous `char` slices (`VecDeque::as_slices`).
+    #[must_use]
+    #[inline]
+    pub(crate) fn classify_char_slices_opt(
+        &self,
+        slices: [&[char]; 2],
+        s: &mut ToneScratch,
+    ) -> Option<Tone> {
+        s.sum = [0.0; EMBED];
+        let emb_rows = self.emb.as_chunks::<EMBED>().0.first_chunk::<BUCKETS>()?;
+        let n = for_each_ngram_bucket_char_slices(slices, |bucket| {
+            let row = &emb_rows[bucket & (BUCKETS - 1)];
+            let mut i = 0;
+            while i < EMBED {
+                s.sum[i] += row[i];
+                i += 1;
+            }
+        });
+        if n < MIN_NGRAMS {
+            return None;
+        }
+        let inv = 1.0 / n as f32;
+        s.hid = self.b1;
+        let mut r = 0;
+        while r < EMBED {
+            let row = &self.w1[r];
+            let e = s.sum[r] * inv;
+            let mut c = 0;
+            while c < HIDDEN {
+                s.hid[c] += e * row[c];
+                c += 1;
+            }
+            r += 1;
+        }
+        self.logits_from_pre_activations(s);
+        let mut best = 0usize;
+        let mut i = 1;
+        while i < TONE_COUNT {
+            if s.logits[i] > s.logits[best] {
+                best = i;
+            }
+            i += 1;
         }
         Some(Tone::from_index(best))
     }
 
     /// The verdict: argmax tone, or the neutral [`Tone::Technical`] when the evidence is too thin.
+    #[must_use]
     #[inline]
     pub fn classify(&self, text: &str, s: &mut ToneScratch) -> Tone {
         self.classify_opt(text, s).unwrap_or(Tone::Technical)
@@ -603,6 +741,8 @@ impl ToneModel {
 /// the byte layout has one author.
 ///
 /// Panics unless the slices have the compiled lengths (trainer-only code).
+#[must_use]
+#[inline]
 pub fn encode_model(emb: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32]) -> Vec<u8> {
     assert_eq!(emb.len(), EMB_LEN);
     assert_eq!(w1.len(), W1_LEN);
@@ -624,28 +764,40 @@ pub fn encode_model(emb: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32])
     }
     fn quant(out: &mut Vec<u8>, t: &[f32], scale: f32) {
         let inv_scale = 1.0 / scale;
-        for &x in t {
-            let q = (x * inv_scale).round().clamp(-127.0, 127.0) as i8;
+        let mut i = 0;
+        while i < t.len() {
+            let q = (t[i] * inv_scale).round().clamp(-127.0, 127.0) as i8;
             out.push(q as u8);
+            i += 1;
         }
     }
     let (es, s1, s2) = (scale_of(emb), scale_of(w1), scale_of(w2));
     let mut out = Vec::with_capacity(ASSET_LEN);
     out.extend_from_slice(&MAGIC);
-    for dim in [BUCKETS, EMBED, HIDDEN, TONE_COUNT] {
-        out.extend_from_slice(&(dim as u32).to_le_bytes());
+    let dims = [BUCKETS, EMBED, HIDDEN, TONE_COUNT];
+    let mut di = 0;
+    while di < dims.len() {
+        out.extend_from_slice(&(dims[di] as u32).to_le_bytes());
+        di += 1;
     }
-    for s in [es, s1, s2] {
-        out.extend_from_slice(&s.to_le_bytes());
+    let scales = [es, s1, s2];
+    let mut si = 0;
+    while si < scales.len() {
+        out.extend_from_slice(&scales[si].to_le_bytes());
+        si += 1;
     }
     quant(&mut out, emb, es);
     quant(&mut out, w1, s1);
     quant(&mut out, w2, s2);
-    for &x in b1 {
-        out.extend_from_slice(&x.to_le_bytes());
+    let mut bi = 0;
+    while bi < b1.len() {
+        out.extend_from_slice(&b1[bi].to_le_bytes());
+        bi += 1;
     }
-    for &x in b2 {
-        out.extend_from_slice(&x.to_le_bytes());
+    let mut b2i = 0;
+    while b2i < b2.len() {
+        out.extend_from_slice(&b2[b2i].to_le_bytes());
+        b2i += 1;
     }
     let ck = fnv1a32(&out);
     out.extend_from_slice(&ck.to_le_bytes());
@@ -657,6 +809,7 @@ pub fn encode_model(emb: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32])
 pub const ASSET: &[u8] = include_bytes!("../data/tone_model.atn");
 
 /// The shipped weights ([`ASSET`]), loaded once.
+#[must_use]
 #[inline]
 pub fn builtin() -> Option<&'static ToneModel> {
     static MODEL: OnceLock<Option<ToneModel>> = OnceLock::new();
@@ -670,6 +823,7 @@ pub fn builtin() -> Option<&'static ToneModel> {
 pub const HOLDOUT_TSV: &str = include_str!("../data/tone_holdout.tsv");
 
 /// Parse one corpus/holdout TSV line (shared by the trainer and the conformance tests).
+#[must_use]
 #[inline]
 pub fn parse_corpus_line(line: &str) -> Option<(Tone, &str, &str)> {
     let line = line.trim_end_matches('\r');

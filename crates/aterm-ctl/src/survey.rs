@@ -672,6 +672,11 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
     if let Some(n) = s.number("ctx_left_pct") {
         line.push_str(&format!(" ctx_left={n}%"));
     }
+    for (key, label) in [("usage_5h_pct", "5h"), ("usage_7d_pct", "7d")] {
+        if let Some(n) = s.number(key) {
+            line.push_str(&format!(" {label}={n}%"));
+        }
+    }
     if let Some(ms) = s.number("human_ms").filter(|&ms| ms < NEWLY_DONE_MS) {
         line.push_str(&format!(" human={}", age(ms)));
     }

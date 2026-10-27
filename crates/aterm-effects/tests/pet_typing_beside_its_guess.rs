@@ -115,6 +115,25 @@ struct Knobs {
     /// the one before (one in five, one in twelve), late by up to 3 ms, from this seed
     /// ([`Host::next_present`]). 0: every vsync, on time.
     present_seed: u64,
+    /// The host's footer facts: aterm's rewrite of Claude Code's rows under the composer's
+    /// bottom rule (`claude_footer`'s `collect_mode_row`): the mode row's kept items laid flush
+    /// at column 0 ([`Self::footer_words`] cells of them) and the rest blanked to the end of
+    /// Claude's own words, and the row under it (where Claude's effort hint wraps) blanked
+    /// whole. The pet reads Claude's cells, the frame aterm paints over after it looked:
+    /// `pet_chrome` reserves the words aterm laid as protected and hands the cells it blanked
+    /// as blank glass ([`PetReserve::blanked`]), Claude's letters under them hidden.
+    footer_chrome: bool,
+    /// [`Self::footer_chrome`] as the host handed it before it told the pet the glass it blanks
+    /// (the negative control): the whole extent each rewrite wrote reserved as protected, each
+    /// row up to Claude's last letter, and nothing blanked, so the pet read Claude's hidden
+    /// letters as ink and the reserve as chrome.
+    footer_whole: bool,
+    /// The cells [`Self::footer_chrome`]'s rewrite lays its kept items in: [`MODE_ROW_WORDS`],
+    /// or 0 for a mode row with no job or live state to keep, blanked whole.
+    footer_words: u16,
+    /// A chip of the host's on one row of the screen, `(row, col, cols)`, reserved as the
+    /// footer's chips are (a Codex chip on the blank row over its status row); `cols` 0: none.
+    row_chip: (u16, u16, u16),
 }
 
 impl Knobs {
@@ -129,8 +148,16 @@ impl Knobs {
         chrome_from_ms: 0,
         chrome_lag: false,
         present_seed: 0,
+        footer_chrome: false,
+        footer_whole: false,
+        footer_words: MODE_ROW_WORDS,
+        row_chip: (0, 0, 0),
     };
 }
+
+/// The cells aterm's rewrite of Claude Code's mode row lays its kept items in, flush at column 0
+/// ([`Knobs::footer_chrome`]): `YOLO on · 1 shell`, as the owner's screenshot shows it.
+const MODE_ROW_WORDS: u16 = 17;
 
 const CHIPS_COLS: u16 = 57;
 
@@ -174,9 +201,9 @@ struct Host {
     guesses: Vec<(u16, u16, u64)>,
     shots: Vec<Shot>,
     input: Option<(u64, RenderInput)>,
-    /// The chrome the last present painted, and the content sequence of the frame it painted
-    /// over, for [`Knobs::chrome_lag`].
-    painted: (Vec<PetRect>, Option<u64>),
+    /// The chrome the last present painted, the glass it blanked, and the content sequence of
+    /// the frame it painted over, for [`Knobs::chrome_lag`].
+    painted: (Vec<PetRect>, Vec<PetRect>, Option<u64>),
     /// The present schedule's state ([`Knobs::present_seed`]).
     schedule: u64,
 }
@@ -204,7 +231,7 @@ impl Host {
             guesses: Vec::new(),
             shots: Vec::new(),
             input: None,
-            painted: (Vec::new(), None),
+            painted: (Vec::new(), Vec::new(), None),
             schedule: knobs.present_seed,
         }
     }
@@ -330,6 +357,39 @@ impl Host {
             chips.push(PetRect::new(top as f32, cols - 2.0 - switch, 1.0, switch));
             chips.push(PetRect::new(top as f32, 0.0, 1.0, cols));
         }
+        let mut blanked: Vec<PetRect> = Vec::new();
+        if let Some(bottom) = rule.filter(|_| self.knobs.footer_chrome && chrome) {
+            for (row, words) in [(bottom + 1, self.knobs.footer_words), (bottom + 2, 0)] {
+                let end = input
+                    .cells
+                    .get(row)
+                    .and_then(|cells| cells.iter().rposition(|c| c.ch != ' ' && c.ch != '\0'));
+                let Some(end) = end.map(|e| (e + 1) as f32) else {
+                    continue;
+                };
+                let words = if self.knobs.footer_whole {
+                    end
+                } else {
+                    f32::from(words).min(end)
+                };
+                if words > 0.0 {
+                    chips.push(PetRect::new(row as f32, 0.0, 1.0, words));
+                }
+                if words < end {
+                    blanked.push(PetRect::new(row as f32, words, 1.0, end - words));
+                }
+            }
+        }
+        if let (row, col, n @ 1..) = self.knobs.row_chip
+            && chrome
+        {
+            chips.push(PetRect::new(
+                f32::from(row),
+                f32::from(col),
+                1.0,
+                f32::from(n),
+            ));
+        }
         if let Some((top, _)) = rules.filter(|_| self.knobs.rule_walled) {
             chips.push(PetRect::new(top as f32, 0.0, 1.0, cols));
         }
@@ -338,19 +398,22 @@ impl Host {
         }
         let mut painted_over = Some(input.content_seq);
         if self.knobs.chrome_lag {
-            (chips, painted_over) = std::mem::replace(&mut self.painted, (chips, painted_over));
+            (chips, blanked, painted_over) =
+                std::mem::replace(&mut self.painted, (chips, blanked, painted_over));
         }
         let reserve = match self.knobs.reserve {
             Reserve::Ink => PetReserve {
                 protected: &chips,
                 overlays: &[],
                 ink: &typed,
+                blanked: &blanked,
                 painted_over,
             },
             Reserve::Protected => PetReserve {
                 protected: &chips,
                 overlays: &typed,
                 ink: &[],
+                blanked: &blanked,
                 painted_over,
             },
         };
@@ -3322,4 +3385,676 @@ fn a_caret_at_rest_sends_a_far_cat_once_to_its_seat() {
              {flights:?}"
         );
     }
+}
+
+/// A busy Claude Code on the main screen ([`busy_claude`]).
+#[derive(Clone, Copy, Debug)]
+struct BusyClaude {
+    rows: usize,
+    cols: usize,
+    /// Blank rows between the spinner and the composer's upper rule.
+    gap: usize,
+    /// The transcript fills the screen over the live region from the first frame.
+    full: bool,
+    /// The lengths of the two footer rows under the bottom rule.
+    feet: (usize, usize),
+    /// The account's name at the bottom rule's right end, this many letters of it.
+    account: usize,
+    /// The spinner line's length.
+    spin: usize,
+    /// Each frame hides the cursor while it redraws and shows it at the caret again.
+    hide: bool,
+    /// Every spinner frame redraws the whole live region, not only the spinner's row.
+    whole: bool,
+    /// The mean time between transcript writes (ms), and the seed of their lengths.
+    lines: (u64, u64),
+    /// The mean pause between bursts of letters typed into the composer while Claude Code
+    /// works (ms), seeded from [`Self::lines`]'s seed; 0: nobody types.
+    keys: u64,
+}
+
+/// [`BusyClaude`]'s take, `secs` long: Claude Code's live region (the spinner, the composer's
+/// rules round its input line, the caret parked on that line's third column, two footer rows)
+/// at the bottom of a main screen whose transcript grows over it, a line or three at a time,
+/// and scrolls the screen once it reaches the bottom; the spinner redraws every 50 ms in its
+/// synchronized frames between them. With [`BusyClaude::keys`], someone types into the
+/// composer meanwhile, bursts of letters a fifth of a second or less apart, now and then
+/// cleared, each echoed on the input line 6 ms after its key.
+fn busy_claude(b: BusyClaude, secs: u64) -> Vec<(u64, Rec)> {
+    const WORDS: &str = "the turn reads the files and writes its answer over the composer while the spinner counts on ";
+    const FOOT: [&str; 2] = [
+        "  5h 0% · 7d 3% · bypass permissions on (shift+tab to cycle) · esc to interrupt · more words here ok",
+        "  YOLO on · 1 shell · and some more footer words to make it long enough for a test",
+    ];
+    const ACCOUNT: &str = "andrew@example.com";
+    let cols = b.cols;
+    let rule = "─".repeat(cols);
+    let take = |text: &str, n: usize| -> String { text.chars().take(n.min(cols - 1)).collect() };
+    let feet = [take(FOOT[0], b.feet.0), take(FOOT[1], b.feet.1)];
+    let xorshift = |seed: u64| {
+        let mut x = seed | 1;
+        move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        }
+    };
+    let mut rnd = xorshift(b.lines.1.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mut key_rnd = xorshift(b.lines.1.wrapping_mul(0x2545_F491_4F6C_DD1D));
+    let live = |spin: &str, typed: &str| -> String {
+        let mut rows = vec![spin.to_string()];
+        rows.extend(std::iter::repeat_n(String::new(), b.gap));
+        let account = take(ACCOUNT, b.account);
+        let lower = if account.is_empty() {
+            rule.clone()
+        } else {
+            let n = account.chars().count();
+            rule.chars().take(cols - n - 4).collect::<String>() + " " + &account + " ──"
+        };
+        rows.extend([rule.clone(), format!("❯\u{a0}{typed}"), lower]);
+        rows.extend(feet.iter().cloned());
+        rows.join("\r\n")
+    };
+    let height = 6 + b.gap;
+    let input = 2 + b.gap;
+    let open = if b.hide {
+        "\x1b[?2026h\x1b[?25l"
+    } else {
+        "\x1b[?2026h"
+    };
+    let close = |top: usize, typed: &str| {
+        let show = if b.hide { "\x1b[?25h" } else { "" };
+        let col = 3 + typed.len();
+        format!("\x1b[{};{col}H{show}\x1b[?2026l", top + input + 1)
+    };
+    let mut screen = String::from("\x1b[2J\x1b[H");
+    let mut top = 0;
+    for r in 0..if b.full { b.rows - height - 1 } else { 3 } {
+        let line: String = WORDS
+            .chars()
+            .cycle()
+            .skip(r * 7)
+            .take((30 + r * 37 % 85).min(cols - 3))
+            .collect();
+        screen.push_str(&format!("  {line}\r\n"));
+        top += 1;
+    }
+    screen.push_str(&format!(
+        "{open}\x1b[{};1H\x1b[J{}{}",
+        top + 1,
+        live("✻ Grooving…", ""),
+        close(top, "")
+    ));
+    let mut ev = vec![(0, Rec::Out(screen.into_bytes()))];
+    let glyphs = ['·', '✢', '✳', '✶', '✻', '✽'];
+    let (mut t, mut write_at) = (300, 300 + b.lines.0);
+    let mut typed = String::new();
+    let mut key_at = if b.keys == 0 {
+        u64::MAX
+    } else {
+        300 + key_rnd(b.keys)
+    };
+    for i in 0usize.. {
+        if t > secs * 1_000 {
+            break;
+        }
+        while key_at <= t {
+            if typed.len() + 8 >= cols || key_rnd(9) == 0 {
+                ev.push((key_at, Rec::In(b"\x15".to_vec())));
+                typed.clear();
+            } else {
+                ev.push((key_at, Rec::In(b"a".to_vec())));
+                typed.push('a');
+            }
+            let echo = format!(
+                "{open}\x1b[{};1H\x1b[2K❯\u{a0}{typed}{}",
+                top + input + 1,
+                close(top, &typed)
+            );
+            ev.push((key_at + 6, Rec::Out(echo.into_bytes())));
+            key_at += if key_rnd(5) == 0 {
+                b.keys / 2 + key_rnd(b.keys * 2)
+            } else {
+                60 + key_rnd(140)
+            };
+        }
+        let spin = format!(
+            "{} Grooving… ({}s · ↓ {} tokens · esc to interrupt) and thinking about what to write next",
+            glyphs[i % glyphs.len()],
+            t / 1_000,
+            100 + 7 * i
+        );
+        let spin = take(&spin, b.spin);
+        let frame = if t >= write_at {
+            write_at = t + b.lines.0 / 2 + rnd(b.lines.0.max(1));
+            let mut out = format!("{open}\x1b[{};1H\x1b[J", top + 1);
+            let n = 1 + rnd(3) as usize;
+            for _ in 0..n {
+                let line: String = WORDS
+                    .chars()
+                    .cycle()
+                    .skip(rnd(50) as usize)
+                    .take((10 + rnd(100) as usize).min(cols - 3))
+                    .collect();
+                out.push_str(&format!("  {line}\r\n"));
+            }
+            top = (top + n).min(b.rows - height);
+            out + &live(&spin, &typed) + &close(top, &typed)
+        } else if b.whole {
+            format!(
+                "{open}\x1b[{};1H\x1b[J{}{}",
+                top + 1,
+                live(&spin, &typed),
+                close(top, &typed)
+            )
+        } else {
+            format!(
+                "{open}\x1b[{};1H\x1b[2K{spin}{}",
+                top + 1,
+                close(top, &typed)
+            )
+        };
+        ev.push((t, Rec::Out(frame.into_bytes())));
+        t += 50;
+    }
+    ev
+}
+
+/// The longest stretch of consecutive presents that drew the legs (a walk or a run frame) over a
+/// body that stayed within half a cell, held on glass until the next present, among those that
+/// ran in place ([`IN_PLACE_MS`], [`IN_PLACE_TURNS`]): `(from ms, ms, changes of the legs' art,
+/// col, row, glyph)`. `None` where no stretch ran in place.
+fn legs_in_place(shots: &[Shot], end: u64) -> Option<(u64, u64, usize, f32, f32, &'static str)> {
+    let legs = |s: &Shot| s.frame.alpha > 0 && gait(&s.frame).is_some();
+    let mut worst: Option<(u64, u64, usize, f32, f32, &'static str)> = None;
+    for (i, first) in shots.iter().enumerate().filter(|(_, s)| legs(s)) {
+        let (mut lo, mut hi) = (
+            (first.frame.col, first.frame.row),
+            (first.frame.col, first.frame.row),
+        );
+        let (mut pose, mut turns) = (first.frame.pose, 0);
+        let mut j = i + 1;
+        while let Some(s) = shots.get(j).filter(|s| legs(s)) {
+            let (l, h) = (
+                (lo.0.min(s.frame.col), lo.1.min(s.frame.row)),
+                (hi.0.max(s.frame.col), hi.1.max(s.frame.row)),
+            );
+            if h.0 - l.0 >= 0.5 || h.1 - l.1 >= 0.5 {
+                break;
+            }
+            turns += usize::from(s.frame.pose != pose);
+            pose = s.frame.pose;
+            (lo, hi) = (l, h);
+            j += 1;
+        }
+        let held = shots.get(j).map_or(end, |s| s.ms) - first.ms;
+        if (held >= IN_PLACE_MS || turns >= IN_PLACE_TURNS) && worst.is_none_or(|w| held > w.1) {
+            let glyph = aterm_effects::pet_glyphs_gen::PET_GLYPHS[first.frame.pose as usize].id;
+            worst = Some((
+                first.ms,
+                held,
+                turns,
+                first.frame.col,
+                first.frame.row,
+                glyph,
+            ));
+        }
+    }
+    worst
+}
+
+/// THE LEGS CARRY THE BODY: a second of walk or run frames, or two strides of them (eight
+/// changes of the legs' four-frame art, [`IN_PLACE_TURNS`]), move the body half a cell. Walking
+/// without running in place comes near neither: a slow walk turned about by a key on the caret
+/// stays within half a cell up to 0.55 s and four changes of its art (4000 dealt busy Claude
+/// Code screens, typed into or not); the cat that ran in place beside a busy Claude Code did
+/// so 7.48 s, its art changing 133 times.
+const IN_PLACE_MS: u64 = 1_000;
+
+/// The two strides of [`IN_PLACE_MS`]'s law: eight changes of the legs' art.
+const IN_PLACE_TURNS: usize = 8;
+
+/// The busy Claude Code the cat rests beside the footer of, under the harness host
+/// ([`the_cat_never_runs_in_place_beside_a_busy_claude`]'s first take).
+const BUSY_FOOTER_REST: BusyClaude = BusyClaude {
+    rows: 43,
+    cols: 102,
+    gap: 1,
+    full: true,
+    feet: (33, 62),
+    account: 7,
+    spin: 84,
+    hide: true,
+    whole: false,
+    lines: (400, 196),
+    keys: 0,
+};
+
+/// THE CAT NEVER RUNS IN PLACE BESIDE A BUSY CLAUDE CODE (the owner, 2026-10-26: "the cursor
+/// kitty pet got stuck running in place"). Claude Code works on its turn: the spinner redraws
+/// over the composer, the caret waits on the input line, the transcript grows and scrolls,
+/// and the cat rests beside the footer under the composer, where aterm rewrites Claude Code's
+/// mode row, its words the host's ([`Knobs::footer_chrome`]; reserved then over the whole
+/// extent the rewrite wrote, [`Knobs::footer_whole`], a host this test still runs). Bored there,
+/// the cat went to hide behind the end of the row's words, which are the host's: every step the
+/// walk took onto them the console's frame pass sent back to the perch beside them, and the
+/// hide never arrived, so the cat ran on the spot, its legs turning over and its body never a
+/// cell from where it stood, for as long as nobody typed (7.5 s of the 12 s it was bored for in
+/// the first take below). NEGATIVE CONTROL (as run before the hide asked the console for the
+/// ground behind the words, and before a play the console turns back was given up, the footer
+/// reserved whole): the first take ran in place 7480 ms, its legs' art changing 133 times.
+#[test]
+fn the_cat_never_runs_in_place_beside_a_busy_claude() {
+    let first = BUSY_FOOTER_REST;
+    let takes = [
+        first,
+        BusyClaude {
+            cols: 120,
+            rows: 40,
+            feet: (15, 66),
+            ..first
+        },
+        BusyClaude {
+            whole: true,
+            hide: false,
+            lines: (900, 7),
+            ..first
+        },
+        BusyClaude {
+            gap: 0,
+            spin: 40,
+            lines: (150, 33),
+            ..first
+        },
+    ];
+    let runs: Vec<(usize, u64, (bool, bool))> = (0..takes.len())
+        .flat_map(|take| {
+            [
+                (8, (true, false)),
+                (16, (true, false)),
+                (8, (true, true)),
+                (16, (true, true)),
+                (8, (false, false)),
+            ]
+            .map(|(ms, footer)| (take, ms, footer))
+        })
+        .collect();
+    let seen = crate::common::par_map(&runs, |&(take, frame_ms, footer)| {
+        let (footer_chrome, footer_whole) = footer;
+        let b = takes[take];
+        let window = Take {
+            name: "busy",
+            src: "",
+            rows: b.rows as u16,
+            cols: b.cols as u16,
+        };
+        let knobs = Knobs {
+            chips: true,
+            brand: true,
+            frame_ms,
+            footer_chrome,
+            footer_whole,
+            ..Knobs::SHIPPED
+        };
+        let h = Host::replay_events(&window, knobs, busy_claude(b, 15));
+        let footer_rest = h
+            .shots
+            .iter()
+            .filter(|s| {
+                s.frame.alpha > 0
+                    && gait(&s.frame).is_none()
+                    && s.rule.is_some_and(|r| s.frame.row.round() as usize > r)
+            })
+            .count() as u64
+            * frame_ms;
+        (
+            take,
+            frame_ms,
+            footer,
+            footer_rest,
+            legs_in_place(&h.shots, h.ms()),
+        )
+    });
+    for whole in [false, true] {
+        assert!(
+            seen.iter().any(|&(take, _, footer, rest, _)| take == 0
+                && footer == (true, whole)
+                && rest >= 5_000),
+            "fixture: the cat rests beside the host's footer under the composer (reserved \
+             whole: {whole}): {seen:?}"
+        );
+    }
+    for (take, frame_ms, footer, _, worst) in &seen {
+        assert!(
+            worst.is_none(),
+            "busy take {take} at {frame_ms} ms a frame, footer chrome (on, whole) {footer:?}: \
+             the legs ran in place (from ms, ms, changes of their art, col, row, glyph) \
+             {worst:?}"
+        );
+    }
+}
+
+/// THE LAW OF THE LEGS: whatever the cat is doing, a second of walk or run frames on glass, or
+/// two strides of their art, carry its body half a cell ([`IN_PLACE_MS`], [`IN_PLACE_TURNS`]);
+/// a cat going nowhere is drawn at rest. Over every recorded take, as the shipped host and as
+/// the harness host draws them, and over busy Claude Code screens of every shape the deal below
+/// makes, typed into or not. NEGATIVE CONTROL (as run before the hide asked the console for the
+/// ground behind the words, and before a play the console turns back was given up, the footer
+/// reserved whole, [`Knobs::footer_whole`]): the busy footer's take ran in place 4480 ms.
+#[test]
+fn the_legs_carry_the_body() {
+    let mut runs: Vec<(usize, Knobs)> = Vec::new();
+    for take in 0..TAKES.len() {
+        for knobs in [
+            Knobs::SHIPPED,
+            Knobs {
+                chips: true,
+                brand: true,
+                ..Knobs::SHIPPED
+            },
+            Knobs {
+                chips: true,
+                brand: true,
+                footer_chrome: true,
+                frame_ms: 16,
+                present_seed: 77,
+                ..Knobs::SHIPPED
+            },
+        ] {
+            runs.push((take, knobs));
+        }
+    }
+    let footer_rest = Knobs {
+        chips: true,
+        brand: true,
+        footer_chrome: true,
+        ..Knobs::SHIPPED
+    };
+    let takes: Vec<(BusyClaude, Knobs)> = (1..=64u64)
+        .map(|seed| {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut r = |m: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x % m) as usize
+            };
+            let b = BusyClaude {
+                rows: 24 + r(26),
+                cols: 50 + r(80),
+                gap: r(3),
+                full: r(2) == 1,
+                feet: (6 + r(90), 6 + r(70)),
+                account: r(18),
+                spin: 12 + r(90),
+                hide: r(2) == 1,
+                whole: r(2) == 1,
+                lines: ([150, 400, 900, 2_500][r(4)], seed),
+                keys: [0, 0, 800, 3_000][r(4)],
+            };
+            let brand = r(2) == 1;
+            let knobs = Knobs {
+                chips: brand || r(2) == 1,
+                brand,
+                footer_chrome: r(4) != 0,
+                frame_ms: [8, 16][r(2)],
+                present_seed: [0, 31][r(2)] as u64,
+                footer_words: [MODE_ROW_WORDS, 0][r(2)],
+                ..Knobs::SHIPPED
+            };
+            (b, knobs)
+        })
+        .chain([
+            (BUSY_FOOTER_REST, footer_rest),
+            (
+                BUSY_FOOTER_REST,
+                Knobs {
+                    footer_whole: true,
+                    ..footer_rest
+                },
+            ),
+        ])
+        .collect();
+    let recorded = crate::common::par_map(&runs, |&(take, knobs)| {
+        let shots = replayed(take, knobs);
+        let end = shots.last().map_or(0, |s| s.ms + knobs.frame_ms);
+        (
+            TAKES[take].name.to_string(),
+            knobs,
+            legs_in_place(shots, end),
+        )
+    });
+    let busy = crate::common::par_map(&takes, |&(b, knobs)| {
+        let window = Take {
+            name: "busy",
+            src: "",
+            rows: b.rows as u16,
+            cols: b.cols as u16,
+        };
+        let h = Host::replay_events(&window, knobs, busy_claude(b, 12));
+        (format!("{b:?}"), knobs, legs_in_place(&h.shots, h.ms()))
+    });
+    for (label, knobs, worst) in recorded.iter().chain(&busy) {
+        assert!(
+            worst.is_none(),
+            "{label} under {knobs:?}: the legs ran in place (from ms, ms, changes of their art, \
+             col, row, glyph) {worst:?}"
+        );
+    }
+}
+
+/// A shell prompt on row `row`: `letters` letters typed `gap_ms` apart from 2 s in, and after a
+/// 3 s pause, as many backspaces at the same pace, the caret walked back to the prompt; then
+/// 6 s of quiet.
+fn typed_and_taken_back(row: u16, letters: usize, gap_ms: u64) -> Vec<(u64, Rec)> {
+    let mut ev = vec![(
+        0,
+        Rec::Out(format!("\x1b[2J\x1b[H\x1b[{};1H$ ", row + 1).into_bytes()),
+    )];
+    let mut t = 2_000;
+    for _ in 0..letters {
+        ev.push((t, Rec::In(b"a".to_vec())));
+        ev.push((t + 5, Rec::Out(b"a".to_vec())));
+        t += gap_ms;
+    }
+    t += 3_000;
+    for _ in 0..letters {
+        ev.push((t, Rec::In(vec![0x7f])));
+        ev.push((t + 5, Rec::Out(b"\x08 \x08".to_vec())));
+        t += gap_ms;
+    }
+    ev.push((t + 6_000, Rec::Out(Vec::new())));
+    ev
+}
+
+/// THE CAT HOPS THE HOST'S CHIP TO ITS STATION ([`Knobs::row_chip`]). The cat that followed the
+/// writing out past a chip of the host's on the caret's row sits there while the line is
+/// taken back to the prompt, then goes back to the caret: the frame pass puts its first step
+/// onto the chip back on the perch past it, and the cat hops (or pounces) over the chip to its
+/// station, never running against it. NEGATIVE CONTROL (as run with the walk the console turns
+/// back left to the station, `PetBrain::chrome_hop` never set): every step was put back, and
+/// the cat ran on the spot against the chip until the take ended (5648 ms, its legs' art
+/// changing 172 times, a 3-cell chip at column 20 under a 60 ms hand).
+#[test]
+fn the_cat_hops_the_hosts_chip_to_its_station() {
+    let runs: Vec<((u16, u16), u64, u64)> = [(20, 3), (40, 8), (30, 15), (36, 24)]
+        .into_iter()
+        .flat_map(|chip| {
+            [(60, 8), (150, 16), (400, 8)].map(|(gap, frame_ms)| (chip, gap, frame_ms))
+        })
+        .collect();
+    let seen = crate::common::par_map(&runs, |&((col, cols), gap, frame_ms)| {
+        let window = Take {
+            name: "chip",
+            src: "",
+            rows: 40,
+            cols: 120,
+        };
+        let knobs = Knobs {
+            row_chip: (20, col, cols),
+            frame_ms,
+            ..Knobs::SHIPPED
+        };
+        let h = Host::replay_events(&window, knobs, typed_and_taken_back(20, 70, gap));
+        let past = h.shots.iter().any(|s| s.frame.col >= f32::from(col + cols));
+        let home = h.shots.last().map(|s| (s.frame.col, s.frame.row));
+        (
+            (col, cols, gap, frame_ms),
+            past,
+            home,
+            legs_in_place(&h.shots, h.ms()),
+        )
+    });
+    for (label, past, home, worst) in &seen {
+        assert!(
+            worst.is_none(),
+            "(chip at, cols, ms between keys, ms a frame) {label:?}: the legs ran in place \
+             against the chip (from ms, ms, changes of their art, col, row, glyph) {worst:?}"
+        );
+        assert!(
+            *past && home.is_some_and(|(c, r)| c < f32::from(label.0) && (r - 20.0).abs() < 0.5),
+            "fixture {label:?}: the cat went out past the chip with the writing and is back by \
+             the prompt at the end ({home:?})"
+        );
+    }
+}
+
+/// How far (cells) past the end of what aterm painted on Claude Code's footer rows, or past the
+/// caret's column, the resting cat's left edge may sit
+/// ([`the_cat_rests_by_the_words_the_footer_shows`]).
+const FOOTER_SEAT_REACH: f32 = 2.0;
+
+/// THE CAT RESTS BY THE WORDS THE FOOTER SHOWS (the owner's screenshot, 2026-10-27: the cat
+/// floating far right of `YOLO on · 1 shell` while the caret sat at the input row's left).
+/// Claude Code works on its turn and the cat rests beside its footer, under the composer. aterm
+/// rewrites the mode row there to its kept items and blanks the rest of the row to the end of
+/// Claude's own words, and the row under it whole ([`Knobs::footer_chrome`]); the pet looks at
+/// Claude's cells before aterm paints over them. So it reads the glass aterm blanks as the
+/// blank the person sees ([`PetReserve::blanked`]) and the words aterm laid as the host's
+/// chrome: at rest in the footer its left edge sits within [`FOOTER_SEAT_REACH`] of the end of
+/// those words, or of the caret's column, never out past them in glass that shows nothing, and
+/// its settled body never lies over the words. Judged with the words a job leaves
+/// ([`MODE_ROW_WORDS`]) and with none, the row Claude Code draws with no job blanked whole.
+/// NEGATIVE CONTROLS (as run): with the host handing the rewrite as it did before, its whole
+/// extent protected and nothing blanked ([`Knobs::footer_whole`]), the cat rested 60.4 columns
+/// right of the caret in the first take, 64.4 in the second, past Claude's hidden letters, in
+/// every run; with the pet reading `blanked` as nothing, the same; with the blank left where its
+/// rows were when the composer moves under the chrome a frame late ([`Knobs::chrome_lag`]),
+/// rather than carried with them as the chrome is, the same in every lagging run with words;
+/// with the host blanking its own words too, none of them protected, the cat sat over them from
+/// the first frames to the end in nine of the twelve runs with words.
+#[test]
+fn the_cat_rests_by_the_words_the_footer_shows() {
+    let first = BUSY_FOOTER_REST;
+    let takes = [
+        first,
+        BusyClaude {
+            cols: 120,
+            rows: 40,
+            feet: (15, 66),
+            ..first
+        },
+        BusyClaude {
+            whole: true,
+            hide: false,
+            lines: (900, 7),
+            ..first
+        },
+        BusyClaude {
+            gap: 0,
+            spin: 40,
+            lines: (150, 33),
+            ..first
+        },
+    ];
+    let runs: Vec<(usize, u64, bool, u16)> = (0..takes.len())
+        .flat_map(|take| {
+            [(8, false), (16, true), (8, true)]
+                .into_iter()
+                .flat_map(move |(ms, lag)| {
+                    [MODE_ROW_WORDS, 0].map(|footer_words| (take, ms, lag, footer_words))
+                })
+        })
+        .collect();
+    let seen = crate::common::par_map(&runs, |&(take, frame_ms, chrome_lag, footer_words)| {
+        let b = takes[take];
+        let window = Take {
+            name: "busy",
+            src: "",
+            rows: b.rows as u16,
+            cols: b.cols as u16,
+        };
+        let knobs = Knobs {
+            chips: true,
+            brand: true,
+            footer_chrome: true,
+            footer_words,
+            frame_ms,
+            chrome_lag,
+            ..Knobs::SHIPPED
+        };
+        let h = Host::replay_events(&window, knobs, busy_claude(b, 15));
+        let words = f32::from(footer_words).min(b.feet.0.min(b.cols - 1) as f32);
+        let mut rest = 0;
+        let mut worst: Option<(u64, f32, f32, (u16, u16))> = None;
+        // The first present the settled cat's body lay over the words aterm laid on the mode
+        // row, (ms, its left edge, its feet's row), and how long it lay there in all (ms).
+        let mut over: Option<(u64, f32, f32)> = None;
+        let mut over_ms = 0;
+        for s in &h.shots {
+            let in_footer = s.rule.is_some_and(|r| s.frame.row.round() as usize > r);
+            if s.frame.alpha == 0 || gait(&s.frame).is_some() || !in_footer {
+                continue;
+            }
+            rest += frame_ms;
+            let past = s.frame.col - words.max(f32::from(s.caret.1));
+            if past > FOOTER_SEAT_REACH && worst.is_none_or(|w| past > w.1) {
+                worst = Some((s.ms, past, s.frame.col, s.caret));
+            }
+            let (x0, _, y0, y1) = s
+                .frame
+                .body_px(CW, CH, window.cols, window.rows)
+                .expect("a drawn cat has a body");
+            let mode_row = s.rule.map_or(0, |r| r + 1) as i32 * i32::from(CH);
+            let left = x0 as f32 / f32::from(CW);
+            let on_mode_row = y0 < mode_row + i32::from(CH) && y1 > mode_row;
+            if s.frame.action.settled() && on_mode_row && left < words {
+                over.get_or_insert((s.ms, left, s.frame.row));
+                over_ms += frame_ms;
+            }
+        }
+        let over = over.map(|o| (o, over_ms));
+        (
+            (take, frame_ms, chrome_lag, footer_words),
+            rest,
+            worst,
+            over,
+        )
+    });
+    for (label, rest, _, _) in &seen {
+        assert!(
+            *rest >= 5_000,
+            "fixture (take, ms a frame, chrome lag, words) {label:?}: the cat rests beside the \
+             host's footer under the composer ({rest} ms)"
+        );
+    }
+    let past: Vec<_> = seen
+        .iter()
+        .filter_map(|(label, _, worst, _)| worst.map(|w| (label, w)))
+        .collect();
+    assert!(
+        past.is_empty(),
+        "the cat rested in the footer past the words aterm shows there ((take, ms a frame, \
+         chrome lag, words), (ms, cells past them, col, caret)): {past:?}"
+    );
+    let over: Vec<_> = seen
+        .iter()
+        .filter_map(|(label, _, _, over)| over.map(|o| (label, o)))
+        .collect();
+    assert!(
+        over.is_empty(),
+        "the cat rested over the words aterm lays on the mode row ((take, ms a frame, chrome \
+         lag, words), ((first ms, body's left edge, row), ms in all)): {over:?}"
+    );
 }

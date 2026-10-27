@@ -2315,3 +2315,496 @@ fn a_chosen_colour_keeps_its_chroma_in_the_bed() {
         );
     }
 }
+
+/// The `$` the trail gallery's font draws in a 14×26 cell, as each pixel's
+/// coverage (0–255) read off the gallery's clean classic-pink `enter-bottom`
+/// frame, rows [`DOLLAR_TOP`].. of the cell: a stem of 60–67% coverage through
+/// the S's solid strokes, whose rims are a share of the ink the lab still
+/// judges as solid (a ring's bar beside a stroke lies by most of a thin row's
+/// ink).
+const DOLLAR: [[u8; 14]; 20] = [
+    [0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 171, 154, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 1, 84, 140, 229, 223, 134, 65, 0, 0, 0, 0],
+    [0, 0, 8, 167, 255, 255, 254, 254, 255, 255, 130, 1, 0, 0],
+    [0, 0, 148, 255, 152, 45, 173, 157, 55, 194, 255, 103, 0, 0],
+    [0, 0, 223, 212, 1, 0, 171, 154, 0, 43, 252, 189, 0, 0],
+    [0, 23, 255, 179, 0, 0, 171, 154, 0, 0, 80, 98, 0, 0],
+    [0, 3, 246, 250, 22, 0, 171, 154, 0, 0, 0, 0, 0, 0],
+    [0, 0, 144, 255, 202, 67, 174, 154, 0, 0, 0, 0, 0, 0],
+    [0, 0, 11, 158, 255, 255, 255, 213, 90, 12, 0, 0, 0, 0],
+    [0, 0, 0, 0, 53, 143, 237, 255, 255, 246, 121, 4, 0, 0],
+    [0, 0, 0, 0, 0, 0, 171, 177, 116, 231, 255, 144, 0, 0],
+    [0, 0, 0, 0, 0, 0, 171, 154, 0, 23, 247, 254, 22, 0],
+    [0, 11, 23, 4, 0, 0, 171, 154, 0, 0, 161, 255, 62, 0],
+    [0, 84, 255, 96, 0, 0, 171, 154, 0, 0, 148, 255, 30, 0],
+    [0, 11, 244, 219, 22, 0, 171, 154, 0, 36, 237, 213, 0, 0],
+    [0, 0, 109, 254, 244, 175, 213, 205, 183, 250, 246, 78, 0, 0],
+    [0, 0, 0, 72, 219, 255, 255, 255, 254, 208, 53, 0, 0, 0],
+    [0, 0, 0, 0, 0, 16, 188, 171, 11, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 88, 80, 0, 0, 0, 0, 0, 0],
+];
+
+/// The cell row of [`DOLLAR`]'s first row.
+const DOLLAR_TOP: i32 = 3;
+
+/// Each pixel of the `$` in cell `(row, col)` of `g` (a 14×26 grid), with its
+/// coverage; every other pixel of the cell is bare page.
+fn dollar(g: Geom, row: u16, col: u16) -> Vec<((i32, i32), u8)> {
+    let x0 = i32::from(g.origin_x) + i32::from(col) * g.cw as i32;
+    let y0 = i32::from(g.origin_y) + i32::from(row) * g.ch as i32 + DOLLAR_TOP;
+    (0i32..)
+        .zip(DOLLAR)
+        .flat_map(|(dy, line)| {
+            (0i32..)
+                .zip(line)
+                .filter(|&(_, cov)| cov > 0)
+                .map(move |(dx, cov)| ((y0 + dy, x0 + dx), cov))
+        })
+        .collect()
+}
+
+/// The worst reading of the new prompt's `$` through the one-colour classic's
+/// landing on it, as the trail gallery's classic-pink `enter-bottom` lays it:
+/// on the gallery's grid (14×26 cells under a 12 px pad, 14 rows) and page,
+/// `$ echo the quick brown fox` typed on the last row at 60 ms a key, Enter
+/// 32 ms after the last, the screen scrolled two rows (the command, its output,
+/// the new prompt's `$` on the last row, the caret after it); the frame text
+/// handed over as the host hands it, and judged every 2 ms for 300 ms (the
+/// ring's bar sweeps a stroke's width in a few) as `aterm-lab trail-contrast`
+/// judges it ([`lab_reading`]). `flying` admits the ring as it was.
+fn pink_landing_dollar(flying: bool) -> f32 {
+    use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
+    const PAGE: (u32, u32) = (0x00D0_D0D0, 0x0011_1318);
+    let g = Geom {
+        cw: 14,
+        ch: 26,
+        rows: 14,
+        cols: 72,
+        origin_x: 12,
+        origin_y: 2,
+        win_w: 1032,
+        win_h: 378,
+        head: 0,
+    };
+    let last = g.rows as u16 - 1;
+    let glow_cfg = resolve_glow_config(
+        GlowKnobs {
+            enabled: true,
+            color: Some(0x00D0_3A8C),
+            accent: None,
+            duration_ms: 260,
+            length: 24,
+            intensity: crate::cursor_fx::default_trail_intensity(Some(GlowStyle::Classic), true),
+            radius: 0.6,
+            ring: true,
+        },
+        GlowSpelling {
+            style: Some(GlowStyle::Classic),
+            beam: true,
+            ribbon_tall: true,
+            ribbon_flat: false,
+            classic_mono: true,
+        },
+        CURSOR,
+        true,
+        PAGE.0,
+        PAGE.1,
+        0.5,
+    );
+    let trail_cfg = TrailConfig {
+        enabled: false,
+        duration: Duration::from_millis(260),
+        max_len: 24,
+        color: glow_cfg.color,
+        intensity: 0.0,
+        warmth: 0.0,
+    };
+    let mut fx = CursorFx::default();
+    fx.glow.classic.ring_flying = flying;
+    let input = |now: Instant, cur: (u16, u16)| CursorFxInput {
+        now,
+        cur: Some(cur),
+        live_viewport: true,
+        cursor_style: CursorStyle::SteadyBlock,
+        blink_phase: true,
+        live_cursor: CURSOR,
+        cursor_color_pinned: false,
+        default_bg: PAGE.1,
+        cursor_cell_bg: None,
+        geom: g,
+        focused: true,
+        shed_envelope: 1.0,
+        trail_brightness: 1.0,
+        body_allowed: true,
+        momentum_glow: true,
+        user_tinted: true,
+        accent_pinned: false,
+    };
+    let n = LINE.chars().count();
+    let line = |text: &str| {
+        let mut cols: Vec<char> = text.chars().collect();
+        cols.resize(g.cols, ' ');
+        cols
+    };
+    let typed_row = |typed: usize| {
+        line(&format!(
+            "$ {}",
+            LINE.chars().take(typed).collect::<String>()
+        ))
+    };
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let frame = |lines: &[(u16, &[char])]| {
+        let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for line in &mut rows {
+            for cell in line.iter_mut() {
+                (cell.fg, cell.bg) = (rgb(PAGE.0), rgb(PAGE.1));
+            }
+        }
+        for &(row, text) in lines {
+            for (col, &ch) in text.iter().enumerate() {
+                rows[usize::from(row)][col].ch = ch;
+            }
+        }
+        rows
+    };
+    let blank = vec![' '; g.cols];
+    let mut t = Instant::now();
+    for typed in 0..=n {
+        t += Duration::from_millis(60);
+        if typed > 0 {
+            fx.glow.note_synthetic_typed(t, 1);
+            fx.cadence.on_keystroke(t);
+            fx.momentum.on_key(t, MOMENTUM_GLOW_TAU_S);
+        }
+        let caret = (last, START + typed as u16);
+        let row = typed_row(typed);
+        fx.begin(true, true);
+        fx.glow.observe_row(caret.0, caret.1, &row, t);
+        fx.glow.observe_neighbor_rows(Some(&blank), None);
+        fx.glow
+            .observe_frame_text(Some(caret), &frame(&[(last, &row)]), t);
+        let _ = fx.tick(&input(t, caret), &glow_cfg, trail_cfg);
+    }
+    let (command, output, prompt) = (typed_row(n), line("the quick brown fox"), line("$"));
+    let landed = frame(&[(last - 2, &command), (last - 1, &output), (last, &prompt)]);
+    let enter = t + Duration::from_millis(32);
+    fx.scroll_translate(2);
+    let caret = (last, START);
+    let ink = dollar(g, last, 0);
+    let mut worst = f32::INFINITY;
+    let mut lit = false;
+    for k in 0..=150u64 {
+        let now = enter + Duration::from_millis(2 * k);
+        fx.begin(true, true);
+        fx.glow.observe_row(caret.0, caret.1, &prompt, now);
+        fx.glow.observe_neighbor_rows(Some(&output), None);
+        fx.glow.observe_frame_text(Some(caret), &landed, now);
+        let tint = fx
+            .tick(&input(now, caret), &glow_cfg, trail_cfg)
+            .trail_color;
+        let mut glass = Glass::new(g, PAGE.1);
+        for cell in &fx.trail_scratch {
+            let (x0, y0, x1, y1) = glass.cell_rect(cell.row as u16, cell.col as u16);
+            for y in y0.max(0)..y1.min(glass.h as i32) {
+                for x in x0.max(0)..x1.min(glass.w as i32) {
+                    let slot = &mut glass.px[y as usize * glass.w + x as usize];
+                    *slot = aterm_render::blend_rgb(*slot, tint, cell.alpha);
+                }
+            }
+        }
+        glass.add_quads(fx.glow.under_quads());
+        for &((y, x), cov) in &ink {
+            let slot = &mut glass.px[y as usize * glass.w + x as usize];
+            *slot = aterm_render::blend_rgb(*slot, PAGE.0, cov);
+        }
+        glass.add_quads(&fx.glow_scratch);
+        glass.add_halos(fx.glow.halos());
+        post_passes(&mut glass, &fx.glow_scratch, fx.bloom_held, PAGE.1);
+        let (x0, y0, x1, y1) = glass.cell_rect(last, 0);
+        lit |= (y0..y1).any(|y| (x0..x1).any(|x| glass.at(y, x) & 0x00FF_FFFF != PAGE.1));
+        worst = worst.min(lab_reading(&glass, (x0, y0, x1, y1), &ink, PAGE));
+    }
+    assert!(lit, "fixture: the landing lays light on the prompt's `$`");
+    worst
+}
+
+/// The live terminal's post passes over `glass` on page `bg`, as the hosts
+/// run them over the glow stream `glow` (the GUI's `post_process`): the bloom
+/// unless the frame holds it, at the page's share of its strength, then the
+/// SDR crown at the configuration's default boost.
+fn post_passes(glass: &mut Glass, glow: &[aterm_render::GlowQuad], held: bool, bg: u32) {
+    use aterm_render::{bloom, hdr};
+    /// `cursor_glow_sdr_boost`'s default.
+    const SDR_BOOST: f32 = 0.25;
+    let mut frame = aterm_render::Frame {
+        width: glass.w,
+        height: glass.h,
+        pixels: std::mem::take(&mut glass.px),
+    };
+    let rows = glass.g.rows;
+    if !held {
+        let params = bloom::BloomParams {
+            strength: bloom::BLOOM_STRENGTH * hdr::light_page_bloom_share(bg),
+            radius: bloom::BLOOM_RADIUS,
+        };
+        bloom::apply(&mut frame, glow, rows, params).expect("bloom");
+    }
+    let budget = hdr::sdr_glow_budget(hdr::packed_luma(bg), SDR_BOOST);
+    bloom::sdr_crown(&mut frame, glow, rows, budget).expect("crown");
+    glass.px = frame.pixels;
+}
+
+/// A glyph's reading as `aterm-lab trail-contrast` judges it: the lower of
+/// its whole-cell contrast (the median of its core ink, within 70% of its
+/// extreme's lift, against the median of its bare page) and its local one
+/// (each solid ink pixel, [`SOLID_SHARE`] of the extreme's clean ratio,
+/// against the per-channel median of the bare page on its nearest Chebyshev
+/// ring, 1 then 2; each pixel row's median of those, the worst row). `ink`
+/// is the glyph's coverage; the clean frame is the page under it.
+fn lab_reading(
+    glass: &Glass,
+    (x0, y0, x1, y1): (i32, i32, i32, i32),
+    ink: &[((i32, i32), u8)],
+    (fg, bg): (u32, u32),
+) -> f32 {
+    /// `aterm-lab trail-contrast`'s share of the clean ratio that reads as
+    /// solid ink.
+    const SOLID_SHARE: f32 = 0.85;
+    let cover: std::collections::HashMap<(i32, i32), u8> = ink.iter().copied().collect();
+    let clean = |y: i32, x: i32| {
+        cover
+            .get(&(y, x))
+            .map_or(bg, |&c| aterm_render::blend_rgb(bg, fg, c))
+    };
+    let at = |y: i32, x: i32| glass.at(y, x) & 0x00FF_FFFF;
+    let ratio = |a: u32, b: u32| {
+        let (la, lb) = (rel_luminance(a), rel_luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    };
+    let median = |px: &[u32], mid: usize| {
+        let mut out = 0u32;
+        for shift in [16u32, 8, 0] {
+            let mut ch: Vec<u32> = px.iter().map(|p| (p >> shift) & 0xFF).collect();
+            ch.sort_unstable();
+            out |= ch[mid] << shift;
+        }
+        out
+    };
+    let solid = SOLID_SHARE * ratio(fg, bg);
+    let reach = 0.70 * (rel_luminance(fg) - rel_luminance(bg));
+    let (mut core, mut bed) = (Vec::new(), Vec::new());
+    let mut worst_row = f32::INFINITY;
+    for y in y0..y1 {
+        let mut row = Vec::new();
+        for x in x0..x1 {
+            let c = clean(y, x);
+            if c == bg {
+                bed.push(at(y, x));
+                continue;
+            }
+            if rel_luminance(c) - rel_luminance(bg) >= reach {
+                core.push(at(y, x));
+            }
+            if ratio(c, bg) < solid {
+                continue;
+            }
+            for d in 1..=2i32 {
+                let ring: Vec<u32> = (-d..=d)
+                    .flat_map(|dy| (-d..=d).map(move |dx| (dy, dx)))
+                    .filter(|&(dy, dx)| dy.abs().max(dx.abs()) == d && clean(y + dy, x + dx) == bg)
+                    .map(|(dy, dx)| at(y + dy, x + dx))
+                    .collect();
+                if !ring.is_empty() {
+                    row.push(ratio(at(y, x), median(&ring, ring.len() / 2)));
+                    break;
+                }
+            }
+        }
+        if !row.is_empty() {
+            row.sort_by(f32::total_cmp);
+            worst_row = worst_row.min(row[(row.len() - 1) / 2]);
+        }
+    }
+    let whole = ratio(median(&core, core.len() / 2), median(&bed, bed.len() / 2));
+    whole.min(worst_row)
+}
+
+/// THE ONE-COLOUR LANDING RING KEEPS THE NEW PROMPT'S `$` AT THE LETTER BAR
+/// (looks8 K2): its left bar crosses the prompt's `$` (the trail gallery's
+/// classic-pink `enter-bottom` e120 read it at 4.21–4.32:1, admitted at the
+/// flying lights' floor). Negative control: admitted as it was, the same
+/// landing leaves the `$` under the bar.
+#[test]
+fn the_one_colour_landing_ring_keeps_the_prompt_at_the_bar() {
+    let kept = pink_landing_dollar(false);
+    assert!(
+        kept >= 4.5,
+        "the new prompt's `$` reads {kept:.2}:1 under the pink landing"
+    );
+    let control = pink_landing_dollar(true);
+    assert!(
+        control < 4.5,
+        "control: admitted at the flying floor, the `$` still reads {control:.2}:1"
+    );
+}
+
+/// Each pixel row's lift over `page` (the largest channel step over it, the
+/// most across three columns) from the typed row's bottom down half a cell,
+/// in the columns `behind` cells behind the caret, once `style` typed
+/// [`LINE`] on `page` in `text` (`even`: every rail as looks7 laid it).
+fn rail_profile(style: GlowStyle, (text, page): (u32, u32), even: bool, behind: f32) -> Vec<i32> {
+    use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
+    let g = tall_geom();
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let c = resolve_glow_config(
+        GlowKnobs {
+            enabled: true,
+            color: None,
+            accent: None,
+            duration_ms: 260,
+            length: 24,
+            intensity: crate::cursor_fx::default_trail_intensity(Some(style), false),
+            radius: 0.6,
+            ring: true,
+        },
+        GlowSpelling {
+            style: Some(style),
+            beam: true,
+            ribbon_tall: true,
+            ribbon_flat: false,
+            classic_mono: false,
+        },
+        CURSOR,
+        true,
+        text,
+        page,
+        0.5,
+    );
+    let mut glow = CursorGlow {
+        rail_even: even,
+        ..CursorGlow::default()
+    };
+    let mut out = Vec::new();
+    let mut line = vec![' '; g.cols];
+    line[0] = '$';
+    let mut t = Instant::now();
+    let mut caret = (ROW, START);
+    for (k, ch) in std::iter::once(' ').chain(LINE.chars()).enumerate() {
+        if k > 0 {
+            t += Duration::from_millis(60);
+            line[START as usize + k - 1] = ch;
+            glow.note_synthetic_typed(t, 1);
+        }
+        caret = (ROW, START + k as u16);
+        let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for line_cells in &mut rows {
+            for cell in line_cells.iter_mut() {
+                (cell.fg, cell.bg) = (rgb(text), rgb(page));
+            }
+        }
+        for (col, cell) in rows[usize::from(ROW)].iter_mut().enumerate() {
+            cell.ch = line[col];
+        }
+        glow.observe_row(caret.0, caret.1, &line, t);
+        glow.observe_frame_text(Some(caret), &rows, t);
+        glow.tick(Some(caret), t, &c, g, &mut out);
+    }
+    let mut glass = Glass::new(g, page);
+    glass.add_quads(glow.under_quads());
+    let x = (f32::from(g.origin_x) + (f32::from(caret.1) - behind) * g.cw as f32) as i32;
+    let bottom = i32::from(g.origin_y) + i32::from(ROW + 1) * g.ch as i32;
+    let ch = |c: u32, sh: u32| ((c >> sh) & 0xFF) as i32;
+    (bottom..bottom + g.ch as i32 / 2)
+        .map(|y| {
+            (x - 1..=x + 1)
+                .map(|x| {
+                    let p = glass.at(y, x) & 0x00FF_FFFF;
+                    [16, 8, 0]
+                        .iter()
+                        .map(|&sh| ch(p, sh) - ch(page, sh))
+                        .max()
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// LUMEN'S LIT RAIL IS SOFT (looks8 K10): on Solarized Dark Lumen's rail
+/// was a crisp near-white 2 px hairline that read as a text underline; it
+/// rises to its peak over a soft top and falls off below it with no
+/// plateau, no pixel row stepping more than two thirds of its peak from the
+/// next. Negative control: laid as looks7 laid it (full strength from its
+/// top), the rail steps from the page to its peak in one pixel row.
+#[test]
+fn lumen_s_lit_rail_is_soft() {
+    const SOLARIZED: (u32, u32) = (0x0083_9496, 0x0000_2B36);
+    let steepest = |profile: &[i32]| -> (i32, i32) {
+        let peak = profile.iter().copied().max().unwrap_or(0);
+        let step = profile
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .chain(profile.first().copied())
+            .max()
+            .unwrap_or(0);
+        (peak, step)
+    };
+    let (peak, step) = steepest(&rail_profile(GlowStyle::Lumen, SOLARIZED, false, 2.0));
+    assert!(peak >= 24, "fixture: Lumen's rail lifts the page by {peak}");
+    assert!(
+        step * 3 <= peak * 2,
+        "Lumen's rail steps {step} of its {peak} peak between two pixel rows"
+    );
+    let (peak, step) = steepest(&rail_profile(GlowStyle::Lumen, SOLARIZED, true, 2.0));
+    assert!(
+        step * 10 >= peak * 9,
+        "control: laid as looks7 laid it, the rail steps only {step} of its {peak} peak"
+    );
+}
+
+/// COMET'S RAIL TAPERS BEHIND ITS NUCLEUS (looks8 K10): on Solarized Dark
+/// Beam's and Comet's rails both read as one cyan-blue underline band;
+/// Comet's is deepest at its nucleus and thins behind it with its bed's
+/// taper, while Beam's stays an even tube. Measured as the pixel rows lit
+/// to a third of the column's own peak or more, half a cell and two and a
+/// half cells behind the caret. Negative control: laid even, Comet's rail
+/// is as deep behind its head as at it.
+#[test]
+fn comet_s_rail_tapers_behind_its_nucleus() {
+    const SOLARIZED: (u32, u32) = (0x0083_9496, 0x0000_2B36);
+    let depth = |style: GlowStyle, even: bool, behind: f32| -> usize {
+        let profile = rail_profile(style, SOLARIZED, even, behind);
+        let peak = profile.iter().copied().max().unwrap_or(0);
+        assert!(
+            peak >= 12,
+            "fixture: {style:?}'s rail lifts {peak} at {behind} cells behind"
+        );
+        profile.iter().filter(|&&lift| lift * 3 >= peak).count()
+    };
+    let (head, tail) = (
+        depth(GlowStyle::Comet, false, 0.5),
+        depth(GlowStyle::Comet, false, 2.5),
+    );
+    let (bh, bt) = (
+        depth(GlowStyle::Beam, false, 0.5),
+        depth(GlowStyle::Beam, false, 2.5),
+    );
+    let (eh, et) = (
+        depth(GlowStyle::Comet, true, 0.5),
+        depth(GlowStyle::Comet, true, 2.5),
+    );
+    assert!(
+        head * 2 >= tail * 3,
+        "Comet's rail is {head} px deep at its nucleus and {tail} px behind it"
+    );
+    assert!(
+        bt * 5 >= bh * 4,
+        "Beam's tube is {bh} px deep at its head and {bt} px behind it"
+    );
+    assert!(
+        et * 5 >= eh * 4,
+        "control: laid even, Comet's rail is {eh} px deep at its head and {et} px behind it"
+    );
+}

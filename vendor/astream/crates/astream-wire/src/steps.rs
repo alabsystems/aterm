@@ -298,7 +298,9 @@ pub const fn decode_step_header(payload: &[u8], payload_len: usize) -> Option<(u
 /// [`STEP_VERSION`], or names a body longer than the bytes after the header.
 /// Bytes after the body are ignored, as `astream-engine`'s journal always has
 /// ignored them: the frame's CRC covers them, so they are not damage, and a
-/// reader that refused them would refuse journals that open today.
+/// reader that refused them would refuse journals that open today. aterm's
+/// post journal writes a record's heads there (its B05 review), so that an
+/// earlier aterm reads the same body: a change to this rule breaks that.
 #[must_use]
 #[allow(clippy::question_mark)]
 pub fn decode_step(payload: &[u8]) -> Option<(u64, &[u8])> {
@@ -726,6 +728,28 @@ mod tests {
             decode_step(&payload(STEP_VERSION, 7, 1, b"ok")),
             Some((7, &b"o"[..]))
         );
+    }
+
+    /// The scan skips a record's tail too (the bytes after its body, under its CRC): its
+    /// body range ends at the body, the next record reads, and the run is clean. aterm's
+    /// post journal carries a record's heads there, read by no earlier aterm.
+    #[test]
+    fn the_scan_skips_a_records_tail_and_reads_the_next_record() {
+        let tailed = Frame::new(payload(STEP_VERSION, 0, 4, b"bodyat 42"))
+            .encode()
+            .expect("frames");
+        let mut bytes = tailed.clone();
+        bytes.extend(encode_step(1, b"next").expect("frames"));
+        let scan = scan_steps_from(&bytes, 0);
+        assert_eq!(scan.end, StepEnd::Clean);
+        assert_eq!(scan.valid_len, bytes.len());
+        let bodies: Vec<(u64, &[u8])> = scan
+            .steps
+            .iter()
+            .map(|(step, body)| (*step, &bytes[body.clone()]))
+            .collect();
+        assert_eq!(bodies, [(0, &b"body"[..]), (1, &b"next"[..])]);
+        assert_eq!(scan.steps[0].1.end + b"at 42".len(), tailed.len());
     }
 
     #[test]

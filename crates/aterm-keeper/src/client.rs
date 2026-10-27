@@ -577,6 +577,8 @@ pub struct Stalled {
     rx: std::sync::Mutex<Receiver<Queued>>,
     /// The link's room, which the ordinary ops taken give back as a worker's do.
     room: std::sync::Arc<Room>,
+    /// The bell's far end, which nothing answers: the link rings once, then finds it rung.
+    _door: Door,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -672,7 +674,147 @@ pub struct KeeperLink {
     tx: SyncSender<Queued>,
     /// The ordinary ops' share of the queue ([`Self::offer`]).
     room: std::sync::Arc<Room>,
+    /// Rung behind every op queued, so the worker, waiting on its [`Door`] and the keeper's
+    /// socket together, wakes for either as it arrives.
+    bell: Bell,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// The queue's doorbell, rung by [`KeeperLink`] once it has queued an op.
+#[derive(Debug)]
+struct Bell {
+    /// Its end of a socket pair whose other end is the worker's [`Door`]; non-blocking.
+    near: CtlStream,
+    /// Set from a ring until the worker answers it, so a burst of ops writes one byte.
+    rung: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The worker's end of the [`Bell`], waited on beside the keeper's socket ([`Door::next`]).
+#[derive(Debug)]
+struct Door {
+    /// Non-blocking.
+    far: CtlStream,
+    rung: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The bell's end has closed: the [`KeeperLink`] is gone, so nothing will ring again.
+    hung_up: bool,
+}
+
+/// A bell and its door: a socket pair, each end non-blocking and kept out of every child.
+fn doorbell() -> io::Result<(Bell, Door)> {
+    let (near, far) = CtlStream::pair()?;
+    for end in [&near, &far] {
+        aterm_uds::keep_out_of_children(end)?;
+        end.set_nonblocking(true)?;
+    }
+    let rung = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    Ok((
+        Bell {
+            near,
+            rung: std::sync::Arc::clone(&rung),
+        },
+        Door {
+            far,
+            rung,
+            hung_up: false,
+        },
+    ))
+}
+
+impl Bell {
+    /// Tell the worker an op is queued (call it after the op is in the channel).
+    fn ring(&self) {
+        self.ring_with(|| aterm_uds::fdpass::send_vectored(&self.near, &[io::IoSlice::new(&[1])]));
+    }
+
+    /// Coalesce rings, retrying an interrupted write before leaving the worker to wait.
+    fn ring_with(&self, mut write: impl FnMut() -> io::Result<usize>) {
+        if self.rung.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            // An earlier ring is unanswered: its byte is still to be read, and the worker
+            // clears the flag before it reads the queue.
+            return;
+        }
+        loop {
+            match write() {
+                Ok(n) if n > 0 => return,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // A full door already holds bytes that wake the worker.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                // No byte was written: allow a later ring to try again.
+                Ok(_) | Err(_) => {
+                    self.rung.store(false, std::sync::atomic::Ordering::Release);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl Door {
+    /// Answer every ring so far: clear the flag, then read the bytes written.
+    fn answer(&mut self) {
+        use std::io::Read as _;
+        // A swap, not a store: reading the flag a ring set acquires that ring's op.
+        self.rung.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let mut bytes = [0u8; 64];
+        loop {
+            match (&self.far).read(&mut bytes) {
+                Ok(0) => {
+                    self.hung_up = true;
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// The next op queued, as [`Receiver::recv_timeout`] answers it but waking for the keeper
+    /// too: the op at once when one is queued, else as soon as one is; `Timeout` once `keeper`
+    /// (the link's connection) has something to read or `idle` has passed with neither;
+    /// `Disconnected` once the queue is closed and empty.
+    fn next(
+        &mut self,
+        rx: &Receiver<Queued>,
+        keeper: Option<&KeeperClient>,
+        idle: Duration,
+    ) -> Result<Queued, mpsc::RecvTimeoutError> {
+        use std::os::fd::AsRawFd as _;
+        self.answer();
+        match rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            taken => return taken.map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        }
+        if self.hung_up {
+            // Nothing will ring again, and a hung-up door reads ready for good: wait on the
+            // queue alone (the link is gone, so it is closed, or soon will be).
+            return rx.recv_timeout(idle);
+        }
+        let mut fds = [crate::sys::PollFd {
+            fd: self.far.as_raw_fd(),
+            events: crate::sys::POLLIN,
+            revents: 0,
+        }; 2];
+        let watched = match keeper {
+            Some(c) => {
+                fds[1].fd = c.stream.as_raw_fd();
+                2
+            }
+            None => 1,
+        };
+        let millis = i32::try_from(idle.as_millis()).unwrap_or(i32::MAX);
+        match crate::sys::poll(&mut fds[..watched], millis) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // A poll that fails would fail again at once: wait on the queue alone.
+            Err(_) => return rx.recv_timeout(idle),
+        }
+        self.answer();
+        rx.try_recv().map_err(|e| match e {
+            mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
+            mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
+        })
+    }
 }
 
 /// Who a link is: the window it speaks for, as each of its HELLOs says.
@@ -686,6 +828,10 @@ struct LinkPeer {
     /// This window journals its sessions: every link HELLO states [`CAP_JOURNAL`], and its
     /// companions are told to a keeper that states it.
     journal: bool,
+    /// How long the worker waits with no op queued and nothing from the keeper before it looks
+    /// again ([`LINK_POLL`] but for [`KeeperLink::start_idling`]): what paces its tries at a
+    /// keeper it lost.
+    idle: Duration,
 }
 
 impl KeeperLink {
@@ -698,7 +844,7 @@ impl KeeperLink {
 
     /// Start the worker naming this window's crash marker in every link HELLO.
     /// # Errors
-    /// The thread failing to spawn.
+    /// The worker's doorbell (a socket pair) not being made, or the thread failing to spawn.
     pub fn start_marked(
         path: PathBuf,
         identity: Identity,
@@ -707,32 +853,51 @@ impl KeeperLink {
         booted: Option<KeeperClient>,
         journal: bool,
     ) -> io::Result<Self> {
+        Self::start_idling(path, identity, build, marker, booted, journal, LINK_POLL)
+    }
+
+    /// [`Self::start_marked`] with the worker waiting `idle`, not [`LINK_POLL`], when no op is
+    /// queued and the keeper wrote nothing: what paces its tries at a keeper it lost.
+    /// # Errors
+    /// The worker's doorbell (a socket pair) not being made, or the thread failing to spawn.
+    pub fn start_idling(
+        path: PathBuf,
+        identity: Identity,
+        build: String,
+        marker: Option<MarkerRef>,
+        booted: Option<KeeperClient>,
+        journal: bool,
+        idle: Duration,
+    ) -> io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(LINK_QUEUE + WAITED_ROOM);
         let room = std::sync::Arc::new(Room::default());
         let ended = Ended(std::sync::Arc::clone(&room));
+        let (bell, door) = doorbell()?;
         let peer = LinkPeer {
             path,
             identity,
             build,
             marker,
             journal,
+            idle,
         };
         let thread = std::thread::Builder::new()
             .name("aterm-keeper-link".to_string())
             .spawn(move || {
                 let ended = ended;
-                link_worker(&peer, rx, booted, &ended.0);
+                link_worker(&peer, rx, door, booted, &ended.0);
             })?;
         Ok(Self {
             tx,
             room,
+            bell,
             thread: Some(thread),
         })
     }
 
     /// Start the worker on a connection that already sent the window's boot HELLO.
     /// # Errors
-    /// The thread failing to spawn.
+    /// The worker's doorbell (a socket pair) not being made, or the thread failing to spawn.
     pub fn start_on(
         path: PathBuf,
         identity: Identity,
@@ -754,30 +919,41 @@ impl KeeperLink {
         if !self.room.claim() {
             return Err(Refused::Full(op));
         }
-        self.tx.try_send((op, None)).map_err(|refused| {
-            self.room.give_back(1);
-            match refused {
-                TrySendError::Full((op, _)) => Refused::Full(op),
-                TrySendError::Disconnected((op, _)) => Refused::Gone(op),
+        match self.tx.try_send((op, None)) {
+            Ok(()) => {
+                self.bell.ring();
+                Ok(())
             }
-        })
+            Err(refused) => {
+                self.room.give_back(1);
+                Err(match refused {
+                    TrySendError::Full((op, _)) => Refused::Full(op),
+                    TrySendError::Disconnected((op, _)) => Refused::Gone(op),
+                })
+            }
+        }
     }
 
     /// Create a link with no worker whose queued ops stay until [`Stalled::drain`] takes them.
+    /// # Panics
+    /// The doorbell's socket pair not being made (out of descriptors).
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn stalled() -> (Self, Stalled) {
         let (tx, rx) = mpsc::sync_channel(LINK_QUEUE + WAITED_ROOM);
         let room = std::sync::Arc::new(Room::default());
+        let (bell, door) = doorbell().expect("a stalled link's doorbell");
         (
             Self {
                 tx,
                 room: std::sync::Arc::clone(&room),
+                bell,
                 thread: None,
             },
             Stalled {
                 rx: std::sync::Mutex::new(rx),
                 room,
+                _door: door,
             },
         )
     }
@@ -802,6 +978,7 @@ impl KeeperLink {
         if self.tx.try_send((op, Some(waited))).is_err() {
             return false;
         }
+        self.bell.ring();
         match ack_rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
             Ok(written) => written,
             Err(_) => {
@@ -817,6 +994,8 @@ impl KeeperLink {
     pub fn shutdown(mut self) {
         let (tx, _) = mpsc::sync_channel(1);
         drop(std::mem::replace(&mut self.tx, tx));
+        // Wake the worker to find the queue closed.
+        self.bell.ring();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -865,10 +1044,19 @@ enum Send {
     Frame(Frame),
 }
 
-/// Poll interval for an idle link connection.
+/// How long an idle link's worker waits, with no op queued and nothing from the keeper to read,
+/// before it looks again: what paces its tries at a keeper it lost. A queued op rings its door and
+/// a keeper's frame (a SYNC's answer, a refusal, the keeper's close) makes its socket readable,
+/// and either wakes it at once ([`Door::next`]).
 pub const LINK_POLL: Duration = Duration::from_millis(500);
 
-fn link_worker(peer: &LinkPeer, rx: Receiver<Queued>, booted: Option<KeeperClient>, room: &Room) {
+fn link_worker(
+    peer: &LinkPeer,
+    rx: Receiver<Queued>,
+    mut door: Door,
+    booted: Option<KeeperClient>,
+    room: &Room,
+) {
     let mut held: Held = std::collections::BTreeMap::new();
     let mut metas: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();
     let mut owed: Owed = Owed::new();
@@ -876,7 +1064,7 @@ fn link_worker(peer: &LinkPeer, rx: Receiver<Queued>, booted: Option<KeeperClien
     let mut backoff = Duration::from_millis(50);
     let mut next_try = std::time::Instant::now();
     loop {
-        let (op, ack) = match rx.recv_timeout(LINK_POLL) {
+        let (op, ack) = match door.next(&rx, client.as_ref(), peer.idle) {
             Ok(queued) => {
                 if queued.1.is_none() {
                     room.give_back(1);
@@ -1522,6 +1710,139 @@ mod tests {
             "the keeper offers the fresh region"
         );
         link.shutdown();
+        drop(server);
+    }
+
+    /// An idle wait no hang detector outlasts: a link idling this long wakes only for an op
+    /// queued or a frame from its keeper.
+    const IDLE_FOR_GOOD: Duration = Duration::from_secs(3_600);
+
+    #[test]
+    fn an_interrupted_doorbell_write_is_retried_before_the_worker_is_left_waiting() {
+        use std::io::Read as _;
+
+        let (bell, door) = doorbell().expect("doorbell");
+        let mut writes = 0;
+        bell.ring_with(|| {
+            writes += 1;
+            if writes == 1 {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            aterm_uds::fdpass::send_vectored(&bell.near, &[io::IoSlice::new(&[1])])
+        });
+        assert_eq!(writes, 2);
+        let mut byte = [0];
+        assert_eq!((&door.far).read(&mut byte).expect("the wake byte"), 1);
+        assert_eq!(byte, [1]);
+    }
+
+    #[test]
+    fn a_full_doorbell_already_wakes_the_worker_and_coalesces_later_rings() {
+        let (bell, mut door) = doorbell().expect("doorbell");
+        let bytes = [1];
+        loop {
+            match aterm_uds::fdpass::send_vectored(&bell.near, &[io::IoSlice::new(&bytes)]) {
+                Ok(n) => assert!(n > 0),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("fill the door: {e}"),
+            }
+        }
+        let mut writes = 0;
+        bell.ring_with(|| {
+            writes += 1;
+            let e = aterm_uds::fdpass::send_vectored(&bell.near, &[io::IoSlice::new(&[1])])
+                .expect_err("the door is full");
+            assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+            Err(e)
+        });
+        assert_eq!(writes, 1);
+        bell.ring_with(|| panic!("an unanswered ring is coalesced"));
+        door.answer();
+        // Once answered, the next queued op must be able to ring again.
+        let mut writes = 0;
+        bell.ring_with(|| {
+            writes += 1;
+            aterm_uds::fdpass::send_vectored(&bell.near, &[io::IoSlice::new(&[1])])
+        });
+        assert_eq!(writes, 1);
+        use std::io::Read as _;
+        let mut byte = [0];
+        assert_eq!((&door.far).read(&mut byte).expect("a fresh wake byte"), 1);
+        assert_eq!(byte, [1]);
+    }
+
+    #[test]
+    fn a_doorbell_write_that_writes_nothing_does_not_suppress_the_next_ring() {
+        for failure in [Ok(0), Err(io::ErrorKind::BrokenPipe.into())] {
+            let (bell, door) = doorbell().expect("doorbell");
+            let mut failure = Some(failure);
+            bell.ring_with(|| failure.take().expect("one refused write"));
+            bell.ring();
+            use std::io::Read as _;
+            let mut byte = [0];
+            assert_eq!((&door.far).read(&mut byte).expect("a later wake byte"), 1);
+            assert_eq!(byte, [1]);
+        }
+    }
+
+    /// A recovered window's fence lifts on the keeper's SYNC answer (K1): the worker reads it as
+    /// it arrives, not on its next op or its next idle wake, neither of which comes here.
+    #[test]
+    fn a_receipt_is_confirmed_as_the_keeper_answers_with_no_op_behind_it() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("akl-answer-")
+            .tempdir()
+            .expect("exclusive receipt fixture");
+        let sock = scratch.path().join("k.sock");
+        let mut server = serve(&sock);
+        let (rdev, register) = register_op("/dev/null", 1);
+        let link = KeeperLink::start_idling(
+            sock.clone(),
+            Identity::same_uid(),
+            "t".into(),
+            None,
+            None,
+            true,
+            IDLE_FOR_GOOD,
+        )
+        .expect("link");
+        assert!(link.enqueue(register));
+        let len = aterm_uds::shm::PAGE;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test playing the window makes the region the keeper is sent"
+        )]
+        // SAFETY: this fixture's link and keeper only transfer/hold/query custody, never reopen, map, write or resize it; the region remains inert until it is dropped.
+        let (_region, custody) = unsafe { aterm_uds::shm::Region::create(len) }.expect("a region");
+        let receipt = std::sync::Arc::new(CompanionReceipt::default());
+        assert!(link.enqueue(LinkOp::Companion {
+            rdev,
+            region: custody,
+            len: len as u64,
+            receipt: Some(std::sync::Arc::clone(&receipt)),
+        }));
+        step_until(
+            &mut server,
+            "the keeper's answer to the SYNC behind the COMPANION confirms the receipt",
+            |_| receipt.confirmed(),
+        );
+        assert!(
+            server
+                .core()
+                .companion_view(rdev)
+                .is_some_and(|v| v.offered.is_some()),
+            "the keeper holds the region it confirmed"
+        );
+        let (ended_tx, ended) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            link.shutdown();
+            let _ = ended_tx.send(());
+        });
+        assert!(
+            ended.recv_timeout(aterm_spec::wait::MUST_HAPPEN).is_ok(),
+            "a link shut down ends without waiting out its idle"
+        );
         drop(server);
     }
 

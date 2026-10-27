@@ -67,6 +67,14 @@ pub(crate) const DEFAULT_INDEXED_MINIMUM_CONTRAST: f32 = if cfg!(windows) { 4.5 
 /// Whether panes show the overlay scrollbar when `scrollbar` is unset.
 pub(crate) const DEFAULT_SCROLLBAR: bool = cfg!(windows);
 
+/// Whether new tabs keep Rewind's screen history when `temporal_recording` is unset.
+pub(crate) const DEFAULT_TEMPORAL_RECORDING: bool = false;
+
+/// `mb` mebibytes in bytes.
+const fn mib(mb: u32) -> usize {
+    (mb as usize) * 1024 * 1024
+}
+
 /// User config file (`$XDG_CONFIG_HOME/aterm/aterm.toml`, else `~/.config/aterm/aterm.toml`).
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[cfg_attr(test, derive(Debug))]
@@ -198,6 +206,8 @@ pub(crate) struct Config {
     pub(crate) allow_palette_reconfigure: Option<bool>,
     pub(crate) allow_kitty_file_transfer: Option<bool>,
     pub(crate) temporal_recording: Option<bool>,
+    pub(crate) rewind_budget_mb: Option<u32>,
+    pub(crate) rewind_total_mb: Option<u32>,
     pub(crate) fabric: Option<FabricConfig>,
     pub(crate) fleet: Option<FleetConfig>,
     pub(crate) update: Option<UpdateConfig>,
@@ -2187,6 +2197,29 @@ impl Config {
     /// Whether aterm posts its own notices to the desktop.
     pub(crate) fn desktop_alerts_or_default(&self) -> bool {
         self.desktop_alerts.unwrap_or(false)
+    }
+
+    /// Whether new tabs keep Rewind's screen history (`temporal_recording`).
+    pub(crate) fn temporal_recording_or_default(&self) -> bool {
+        self.temporal_recording
+            .unwrap_or(DEFAULT_TEMPORAL_RECORDING)
+    }
+
+    /// One tab's Rewind history in bytes (`rewind_budget_mb`, 1 to 1024 MiB), never more than the pool's.
+    pub(crate) fn rewind_budget_bytes(&self) -> usize {
+        self.rewind_budget_mb
+            .map_or(crate::temporal::DEFAULT_BUDGET_BYTES, |mb| {
+                mib(mb.clamp(1, 1024))
+            })
+            .min(self.rewind_total_bytes())
+    }
+
+    /// Every tab's Rewind history together, in bytes (`rewind_total_mb`, 1 to 16384 MiB).
+    pub(crate) fn rewind_total_bytes(&self) -> usize {
+        self.rewind_total_mb
+            .map_or(crate::temporal::DEFAULT_TOTAL_BYTES, |mb| {
+                mib(mb.clamp(1, 16384))
+            })
     }
 
     /// Stall threshold, bounded so a mistyped value can neither call every job quiet on arrival nor keep a finished one lit past any useful horizon.
@@ -6086,7 +6119,7 @@ impl App {
 
     /// Throttled entry for interactive window resizes.
     pub(crate) fn on_resize_throttled(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
-        let now = std::time::Instant::now();
+        let now = crate::metrics::host_now();
         let reflows = self.resize_changes_columns(wid, size);
         let apply_now = !reflows
             || self.windows.get(&wid).is_none_or(|ws| {
@@ -6120,7 +6153,7 @@ impl App {
             return;
         };
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.last_resize_at = Some(std::time::Instant::now());
+            ws.last_resize_at = Some(crate::metrics::host_now());
             ws.pending_resize = None;
             ws.next_resize_settle = None;
         }
@@ -7359,7 +7392,9 @@ impl App {
         aterm_pty::set_console_host(aterm_pty::ConsoleHostChoice::from_config(
             config.conpty.as_deref(),
         ));
-        self.session_factory.temporal_recording = config.temporal_recording.unwrap_or(false);
+        self.session_factory.temporal_recording = config.temporal_recording_or_default();
+        self.session_factory.rewind_budget_bytes = config.rewind_budget_bytes();
+        crate::temporal::pool().set_limit(config.rewind_total_bytes());
         self.spare_config_changed();
         crate::control::set_search_max_lines(search_index_depth(&config));
 

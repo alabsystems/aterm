@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Emits `wgpu_arm`, `gl_arm`, `d3d11_arm`, `multi_arm`, `clean_islands`, and `anchor_rules` cfgs.
+//! Emits `gl_arm`, `d3d11_arm`, `clean_islands`, and `anchor_rules` cfgs.
 
 #[path = "../aterm-log/clean_islands.rs"]
 mod clean_islands;
@@ -12,31 +12,17 @@ mod anchor_rules;
 fn main() {
     clean_islands::emit();
     anchor_rules::emit();
-    println!("cargo:rustc-check-cfg=cfg(wgpu_arm)");
-    println!("cargo:rustc-check-cfg=cfg(multi_arm)");
     println!("cargo:rustc-check-cfg=cfg(gl_arm)");
     println!("cargo:rustc-check-cfg=cfg(d3d11_arm)");
     let os = std::env::var("CARGO_CFG_TARGET_OS");
     let wasm = std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32");
-    let mac = os.as_deref() == Ok("macos");
-    let oracle = std::env::var("CARGO_FEATURE_WGPU_ORACLE").is_ok();
     let gl_arm = os.as_deref() == Ok("linux") || wasm;
-    let windows = os.as_deref() == Ok("windows");
-    let wgpu_arm = ((!mac && !gl_arm && !windows) || oracle) && !wasm;
-    if wgpu_arm {
-        println!("cargo:rustc-cfg=wgpu_arm");
-    }
     if gl_arm {
         println!("cargo:rustc-cfg=gl_arm");
     }
     let d3d11_arm = os.as_deref() == Ok("windows");
     if d3d11_arm {
         println!("cargo:rustc-cfg=d3d11_arm");
-    }
-    let arms =
-        usize::from(mac) + usize::from(wgpu_arm) + usize::from(gl_arm) + usize::from(d3d11_arm);
-    if arms > 1 {
-        println!("cargo:rustc-cfg=multi_arm");
     }
     println!("cargo:rerun-if-changed=build.rs");
 }

@@ -35,7 +35,7 @@ fn pending_renewal(world: &World, cli: Cli, staging: &Path, create: bool) {
                 accounts::SyncTarget {
                     path: &path,
                     before: Some(&old),
-                    after: &text,
+                    after: Some(&text),
                     mode: None,
                 },
                 |state, logins| {

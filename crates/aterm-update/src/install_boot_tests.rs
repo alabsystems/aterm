@@ -1329,6 +1329,54 @@ fn a_window_re_trial_is_bounded() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
+/// A window re-trial whose sentinel's folder flush fails after the rename is not counted
+/// against the build, as its warning says: nothing is armed and no trial identity is left,
+/// and the windows' record stays, so a later window launch puts the build back on trial.
+/// With the arm's record left in place, the sentinel stayed armed for the running build
+/// with no identity, so no window launch could confirm it and each one counted it.
+#[test]
+fn a_window_re_trial_whose_arm_flush_fails_is_not_counted() {
+    use aterm_durable::seam::{EIO, FailingDirs};
+    use std::time::Duration;
+    let digest = "ab".repeat(32);
+    let s = scratch("boot-retrial-arm-flush");
+    let installed = s.root.join("Applications").join("aterm.app");
+    arm_window_trial(&s, &installed, 11, &digest);
+    receipt_for(&s, 11, &digest);
+    assert!(confirm_boot_health_at_with_proof(
+        &s,
+        11,
+        crate::TrialWitness::Headless,
+        bundle_at(&installed),
+        Duration::from_millis(100),
+        |_: &Path| Ok(()),
+    ));
+    let sentinel = boot_sentinel(&s);
+    assert_eq!(sentinel.read_state(), None, "settled by a headless launch");
+    let at = WindowUnproven::read(&s).unwrap().at + 1;
+    let rearmed = {
+        let _eio = FailingDirs::with(EIO);
+        rearm_window_unproven_trial(&s, &sentinel, 11, &installed, at)
+    };
+    assert!(!rearmed);
+    assert_eq!(sentinel.read_state(), None, "nothing armed");
+    assert!(FailedMark::read(&s.trial()).is_none(), "no trial identity");
+    assert!(
+        WindowUnproven::read(&s).is_some(),
+        "still the windows' record"
+    );
+    assert!(rearm_window_unproven_trial(
+        &s, &sentinel, 11, &installed, at
+    ));
+    assert_eq!(
+        sentinel.read_state(),
+        Some((11, 0)),
+        "a later window re-trial"
+    );
+    assert!(FailedMark::read(&s.trial()).is_some());
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
 #[test]
 fn a_live_headless_launch_does_not_shield_a_windows_candidate() {
     use crate::TrialWitness::{Headless, Window};

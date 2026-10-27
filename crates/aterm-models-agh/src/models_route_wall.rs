@@ -7,12 +7,17 @@
 use aterm_spec::derive::*;
 
 /// Route-wall model over the canonical config (tier wall, named destination, and redirect hop).
+/// `Vault = 1` is the same wall over the rows vault adoption derives with no agh.toml (design
+/// §6.10). They are the canonical rows with each absent token's rows left out, so two
+/// decisions differ: the dev owner's read with no dev token has no row and goes anonymous, and
+/// the release owner's plain read with no dev token is the release token's.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn agh_route_wall_model() -> Model {
     aterm_spec::ty_model! {
         AghRouteWall {
             const Buggy = 0;
+            const Vault = 0;  // 1: the rows vault adoption derives (design §6.10)
             var tier = 0;     // destination owner: 0 dev, 1 release, 2 external (default row)
             var op = 0;       // 0 Read, 1 WriterRead, 2 Write
             var named = 0;    // 1: the slug was typed literally on this command line
@@ -33,12 +38,17 @@ pub fn agh_route_wall_model() -> Model {
             action Reset when (phase > 0) { phase = 0; used = 0; hop = 0; hopauth = 0; }
 
             action Decide when (phase == 0) {
-                phase = if (dev == 1 && (tier == 0 || op == 0))
-                        || (tier == 1 && rel == 1 && (op == 1 || (op == 2 && named == 1))) { 1 }
-                    else if op == 0 && tier > 0 && dev == 0 { 2 }
+                phase = if Vault == 0 && ((dev == 1 && (tier == 0 || op == 0))
+                        || (tier == 1 && rel == 1 && (op == 1 || (op == 2 && named == 1)))) { 1 }
+                    else if Vault == 0 && op == 0 && tier > 0 && dev == 0 { 2 }
+                    else if Vault == 1 && ((dev == 1 && (tier == 0 || op == 0))
+                        || (tier == 1 && rel == 1
+                            && (op == 1 || (op == 2 && named == 1) || (op == 0 && dev == 0)))) { 1 }
+                    else if Vault == 1 && op == 0 { 2 }
                     else { 3 };
                 used = if dev == 1 && (tier == 0 || op == 0) { 1 }
                     else if tier == 1 && rel == 1 && (op == 1 || (op == 2 && named == 1)) { 2 }
+                    else if Vault == 1 && tier == 1 && rel == 1 && op == 0 && dev == 0 { 2 }
                     else { 0 };
             }
             action Hop when (phase > 0 && phase <= 2 && hop == 0 && op <= 1) { hop = 1; hopauth = 0; }

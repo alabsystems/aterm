@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Optional local GitHub bootstrap for keychain credentials, git HTTPS helper, and repositories.
+//! Local GitHub bootstrap for keychain credentials, git HTTPS helper, and repositories: by
+//! default the first launch's own repository stage ([`native`]), which init.toml's `[github]`
+//! table scopes, turns off, or replaces with its own token source.
 
 use crate::git_credential::{GITHUB, Git, Lookups};
 use crate::items::{Ctx, Item};
@@ -51,29 +53,68 @@ pub fn run_initial_repositories(
 
 const INPUT_MAX: usize = 64 * 1024;
 
+/// The GitHub token the ALab vault's sync writes, under the home: the repository stage's token
+/// source unless init.toml's `[github]` names another. It is the file agh adopts as its dev
+/// profile when there is no agh.toml (agh design §6.10), so the two name one file.
+pub(crate) const TOKEN_FILE: &str = agh::identity::vault::DEV_TOKEN_FILE;
+
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct Config {
-    github: Option<Github>,
+    github: Option<Table>,
     /// The develop profile's checkouts ([`crate::init_develop`]), which the repository item
     /// leaves to the develop items.
     #[serde(default)]
     develop: Option<crate::init_develop::Table>,
 }
 
+/// init.toml's `[github]` table as written ([`Asked`] is what it asks).
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Table {
+    /// `false` leaves the repositories to the person.
+    #[serde(default = "enabled")]
+    enabled: bool,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    token_file: Option<PathBuf>,
+    #[serde(default)]
+    token_key: Option<String>,
+}
+
+const fn enabled() -> bool {
+    true
+}
+
+/// What init.toml's `[github]` table asks of the repository stage.
+enum Asked {
+    /// No table: the native stage over the account's own repositories.
+    Default,
+    /// `enabled = false`: no repository stage.
+    Off,
+    /// `account` (and `owner`, else the account) without a token source: the native stage
+    /// over that owner's repositories, signed in as that account.
+    Scoped(Github),
+    /// A `token_file` too: that source's credential item and its repository item, which also
+    /// fast-forwards the clean worktrees behind GitHub.
+    Profile(Github),
+}
+
+#[derive(Clone)]
 pub(super) struct Github {
     pub account: String,
     pub owner: String,
     pub token_file: PathBuf,
-    #[serde(default)]
     pub token_key: Option<String>,
 }
 
-/// Add GitHub authentication and repository reconciliation only when explicitly configured.
-/// The credential waits for the item `secrets` names, when one does: the secrets vault this run
-/// joins, or this Mac waits to be let into, writes the token file it reads
+/// The repository stage `aterm init` runs: the first launch's own ([`native`]) unless init.toml's
+/// `[github]` turns it off or names its own token source, whose authentication and repository
+/// items then run. Either waits for the item `secrets` names, when one does: the secrets vault
+/// this run joins, or this Mac waits to be let into, writes the token file it reads
 /// ([`crate::init_secrets::Secrets::waited_on`]).
 ///
 /// # Errors
@@ -86,13 +127,16 @@ pub fn items(
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init GitHub requires exactly one local user".into());
     };
-    let Some(mut profile) = profile(sys, user)? else {
-        return Ok(Vec::new());
+    let profile = profile(sys, user)?.unwrap_or_default();
+    let config = match asked(profile.github, user)? {
+        Asked::Off => return Ok(Vec::new()),
+        Asked::Default => return Ok(vec![native::item(user, secrets.map(str::to_owned), true)]),
+        Asked::Scoped(_) => {
+            return Ok(vec![native::item(user, secrets.map(str::to_owned), false)]);
+        }
+        Asked::Profile(config) => config,
     };
     let recorded = crate::init_develop::recorded(user, profile.develop.as_ref())?;
-    let Some(config) = profile.github.take() else {
-        return Ok(Vec::new());
-    };
     Ok(vec![
         Box::new(Auth {
             user: user.clone(),
@@ -110,7 +154,7 @@ fn profile(sys: &dyn System, user: &User) -> Result<Option<Config>, String> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err("cannot safely read ~/.config/aterm/init.toml (requires an owned regular file, no links or group/other writes, at most 64 KiB)".into()),
     };
-    decode(&bytes, user).map(Some)
+    decode(&bytes).map(Some)
 }
 
 /// Returns the home's checkouts of the configured owner's repositories that are aterm workspaces.
@@ -121,7 +165,8 @@ pub(crate) fn aterm_checkouts(sys: &dyn System, ctx: &Ctx) -> Result<Vec<PathBuf
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init --develop requires exactly one local user".into());
     };
-    let Some(config) = profile(sys, user)?.and_then(|mut profile| profile.github.take()) else {
+    let table = profile(sys, user)?.and_then(|profile| profile.github);
+    let Asked::Profile(config) = asked(table, user)? else {
         return Ok(Vec::new());
     };
     let Some(token) = auth_ready(sys, user, &config)? else {
@@ -130,46 +175,73 @@ pub(crate) fn aterm_checkouts(sys: &dyn System, ctx: &Ctx) -> Result<Vec<PathBuf
     repos::aterm_checkouts(sys, user, &config, &token)
 }
 
-fn decode(bytes: &[u8], user: &User) -> Result<Config, String> {
+fn decode(bytes: &[u8]) -> Result<Config, String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| "init.toml must be UTF-8; no configuration contents were printed")?;
-    let mut profile: Config = aterm_toml::from_str(text)
-        .map_err(|_| "invalid init.toml; expected [github] account, owner, token_file and optional token_key, and [develop] checkouts (credential values do not belong in this file)")?;
-    if let Some(config) = &mut profile.github {
-        if !login(&config.account) || !login(&config.owner) {
-            return Err("GitHub account and owner must be valid login names".into());
-        }
-        if config.token_key.as_deref().is_some_and(|k| !env_key(k)) {
-            return Err("GitHub token_key must be an environment assignment name".into());
-        }
-        let path = config
-            .token_file
-            .to_str()
-            .ok_or("GitHub token_file must be UTF-8")?;
-        config.token_file = if let Some(relative) = path.strip_prefix("~/") {
-            Path::new(&user.home).join(relative)
-        } else {
-            config.token_file.clone()
-        };
-        if !config.token_file.is_absolute()
-            || config
-                .token_file
-                .components()
-                .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
-        {
-            return Err(
-                "GitHub token_file must be an absolute or ~/ path without dot components".into(),
-            );
-        }
-        if config
-            .token_file
-            .file_name()
-            .is_some_and(|n| n == "release-credentials.toml")
-        {
-            return Err("GitHub token_file cannot name aterm release credentials".into());
-        }
+    aterm_toml::from_str(text)
+        .map_err(|_| "invalid init.toml; expected [github] enabled, account, owner, token_file and token_key, and [develop] checkouts (credential values do not belong in this file)".into())
+}
+
+/// What `table` asks ([`Asked`]), its names and paths checked.
+fn asked(table: Option<Table>, user: &User) -> Result<Asked, String> {
+    let Some(table) = table else {
+        return Ok(Asked::Default);
+    };
+    if !table.enabled {
+        return Ok(Asked::Off);
     }
-    Ok(profile)
+    let Some(account) = table.account else {
+        return Err(
+            "GitHub owner, token_file and token_key need an account in init.toml's [github]".into(),
+        );
+    };
+    let owner = table.owner.unwrap_or_else(|| account.clone());
+    if !login(&account) || !login(&owner) {
+        return Err("GitHub account and owner must be valid login names".into());
+    }
+    if table.token_key.as_deref().is_some_and(|k| !env_key(k)) {
+        return Err("GitHub token_key must be an environment assignment name".into());
+    }
+    let Some(token_file) = table.token_file else {
+        if table.token_key.is_some() {
+            return Err("GitHub token_key reads the token_file init.toml's [github] names".into());
+        }
+        return Ok(Asked::Scoped(Github {
+            account,
+            owner,
+            token_file: Path::new(&user.home).join(TOKEN_FILE),
+            token_key: None,
+        }));
+    };
+    let path = token_file
+        .to_str()
+        .ok_or("GitHub token_file must be UTF-8")?;
+    let token_file = if let Some(relative) = path.strip_prefix("~/") {
+        Path::new(&user.home).join(relative)
+    } else {
+        token_file.clone()
+    };
+    if !token_file.is_absolute()
+        || token_file
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(
+            "GitHub token_file must be an absolute or ~/ path without dot components".into(),
+        );
+    }
+    if token_file
+        .file_name()
+        .is_some_and(|n| n == "release-credentials.toml")
+    {
+        return Err("GitHub token_file cannot name aterm release credentials".into());
+    }
+    Ok(Asked::Profile(Github {
+        account,
+        owner,
+        token_file,
+        token_key: table.token_key,
+    }))
 }
 
 fn login(value: &str) -> bool {
@@ -496,6 +568,16 @@ fn scrub(bytes: &mut [u8]) {
     }
 }
 
+/// What other modules' tests script of the GitHub stage.
+#[cfg(test)]
+pub(crate) mod scripted {
+    /// `user`'s account on `sys` with one repository of hers, `name`, already a worktree in
+    /// `~`: the stage init runs with no init.toml, converged.
+    pub(crate) fn converged(sys: &crate::port::Fake, user: &crate::model::User, name: &str) {
+        super::native::tests::converged(sys, user, name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,26 +652,80 @@ mod tests {
         );
     }
 
+    /// `text` read as init.toml and its `[github]` table checked.
+    fn checked(text: &[u8], user: &User) -> Result<Asked, String> {
+        decode(text).and_then(|profile| asked(profile.github, user))
+    }
+
+    /// With no init.toml, or one with no `[github]` table, init runs the first launch's own
+    /// repository stage; `enabled = false` turns it off; `account` (and `owner`) alone scope that
+    /// stage; a `token_file` brings the profile's own credential and repository items. A table
+    /// that cannot be used is refused without echoing what it holds.
     #[test]
-    fn config_is_opt_in_and_never_echoes_invalid_or_inline_credentials() {
+    fn the_native_stage_is_the_default_and_init_toml_scopes_replaces_or_turns_it_off() {
         let (sys, _auth, context) = fixture();
-        assert!(items(&sys, &context, None).unwrap().is_empty());
+        let ids = |sys: &Fake| -> Vec<String> {
+            items(sys, &context, None)
+                .unwrap()
+                .iter()
+                .map(|item| item.id())
+                .collect()
+        };
+        assert_eq!(ids(&sys), ["init.github.native@alice"]);
         let u = &context.users[0];
-        let parsed = decode(
+        let native: &[&str] = &["init.github.native@alice"];
+        for (text, want) in [
+            (&b"[github]\nenabled = false\n"[..], &[][..]),
+            (b"[develop]\ncheckouts = []\n", native),
+            (b"[github]\naccount = 'alice'\n", native),
+            (
+                b"[github]\naccount='octocat'\nowner='octocat'\ntoken_file='~/.secrets/github'\n",
+                &["init.github.auth@alice", "init.github.repositories@alice"][..],
+            ),
+        ] {
+            let (sys, _auth, _context) = fixture();
+            let path = "/Users//alice/.config/aterm/init.toml";
+            sys.file(path, text).stat_of(path, stat(0o600, text.len()));
+            assert_eq!(ids(&sys), want, "{}", String::from_utf8_lossy(text));
+        }
+        match checked(b"[github]\naccount='alice'\nowner='team'\n", u).unwrap() {
+            Asked::Scoped(config) => {
+                assert_eq!(
+                    (config.account.as_str(), config.owner.as_str()),
+                    ("alice", "team")
+                );
+                assert_eq!(
+                    config.token_file,
+                    Path::new("/Users//alice/.secrets/gh_access_token")
+                );
+            }
+            _ => panic!("account and owner alone scope the native stage"),
+        }
+        match checked(
             b"[github]\naccount='octocat'\nowner='octocat'\ntoken_file='~/.secrets/github'\n",
             u,
         )
-        .unwrap();
-        assert_eq!(parsed.github.unwrap().token_file, Path::new(SOURCE));
+        .unwrap()
+        {
+            Asked::Profile(config) => assert_eq!(config.token_file, Path::new(SOURCE)),
+            _ => panic!("a token_file is the profile's own source"),
+        }
         for text in [
             format!("[github]\naccount='octocat'\nowner='octocat'\ntoken='{VALUE}'\n"),
             format!("[github]\naccount='octocat'\nowner='octocat'\ntoken_file='{VALUE}\n"),
             "[github]\naccount='-bad'\nowner='octocat'\ntoken_file='~/.secrets/github'".into(),
             "[github]\naccount='octocat'\nowner='octocat'\ntoken_file='../source'".into(),
             "[github]\naccount='octocat'\nowner='octocat'\ntoken_file='~/.aterm/release-credentials.toml'".into(),
+            "[github]\nowner='octocat'\n".into(),
+            format!("[github]\naccount='octocat'\ntoken_key='{VALUE}'\n"),
         ] {
-            let error = decode(text.as_bytes(), u).err().expect("invalid profile refused");
-            assert!(!error.contains(VALUE), "configuration values must not appear in errors");
+            let error = checked(text.as_bytes(), u)
+                .err()
+                .expect("invalid profile refused");
+            assert!(
+                !error.contains(VALUE),
+                "configuration values must not appear in errors"
+            );
         }
     }
 

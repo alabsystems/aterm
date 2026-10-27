@@ -350,6 +350,8 @@ fn meta_names(stdout: &str, key: &str) -> bool {
 pub(super) struct AutopilotWord {
     kept: bool,
     word: Option<Autopilot>,
+    /// The stored word a wait at rest last woke on (`OK autopilot <word>`), until a read.
+    reported: Option<Option<Autopilot>>,
     fresh: bool,
     read: bool,
     answered: bool,
@@ -366,9 +368,25 @@ impl AutopilotWord {
         self.word = meta_word(meta, "autopilot")
             .as_deref()
             .and_then(Autopilot::parse);
+        self.reported = None;
         self.fresh = true;
         self.read = true;
         self.answered = true;
+    }
+
+    /// A wait at rest woke on `word` as the session's stored word ([`Self::latch`]).
+    pub(super) const fn reported(&mut self, word: Option<Autopilot>) {
+        self.reported = Some(word);
+    }
+
+    /// The stored word a wait at rest carries (`-` unset): the one a wait last woke on, else the
+    /// one last read; `None` while `meta` names none.
+    pub(super) fn latch(&self) -> Option<&'static str> {
+        self.kept.then(|| {
+            self.reported
+                .unwrap_or(self.word)
+                .map_or("-", Autopilot::word)
+        })
     }
 
     /// Whether a decision should read the word.
@@ -1321,10 +1339,22 @@ impl<C: Ctl> Session<'_, C> {
 
     /// A busy-read action is a new decision too.
     pub(super) fn autopilot_allows_busy(&mut self, opts: &SuperviseOpts) -> Result<bool, Fail> {
+        Ok(self
+            .autopilot_at_busy(&opts.policy)?
+            .is_some_and(|mode| mode != Autopilot::Off))
+    }
+
+    /// The session's Autopilot under `cfg`, read afresh for an act at a busy screen (a new
+    /// decision, [`Self::autopilot_allows_busy`]); `None` where the session keeps a word the
+    /// read could not get.
+    pub(super) fn autopilot_at_busy(
+        &mut self,
+        cfg: &super::super::config::SupervisorConfig,
+    ) -> Result<Option<Autopilot>, Fail> {
         self.autopilot.begin();
         let known =
             !self.autopilot.worth_a_read() || self.read_autopilot_word()? || !self.autopilot.kept;
-        Ok(known && self.autopilot(opts) != Autopilot::Off)
+        Ok(known.then(|| cfg.autopilot_for(self.autopilot.word)))
     }
 
     fn read_autopilot_word(&mut self) -> Result<bool, Fail> {
@@ -2361,7 +2391,7 @@ impl<C: Ctl> Session<'_, C> {
                 let identity = box_identity(&turn.screen.rows).unwrap_or_default();
                 let deny = self.deny_at(&turn.screen.rows);
                 let screen = match self.box_left(at, &identity, deny, deadline)? {
-                    Past::Moved => {
+                    Past::Moved | Past::Word(_) => {
                         self.press_retry = None;
                         return Ok(Step::Again { settle: true });
                     }
@@ -2602,7 +2632,7 @@ impl<C: Ctl> Session<'_, C> {
                 );
                 let ms = QUESTION_STANDIN_QUIET.as_millis().to_string();
                 match self.wait(&["idle", &ms], QUESTION_STANDIN_QUIET + SETTLE_CAP)? {
-                    Wait::Latched | Wait::Unsupported => {
+                    Wait::Latched | Wait::Unsupported | Wait::Word(_) => {
                         self.question.standin = Some(identity.to_string());
                     }
                     Wait::TimedOut => {}
@@ -2871,8 +2901,8 @@ impl<C: Ctl> Session<'_, C> {
         let mut by = deadline;
         loop {
             let step = until.saturating_duration_since(pressed);
-            let (now, moved) = match self.moved_past(since, by, step)? {
-                Past::Moved => (self.screen()?, true),
+            let (now, moved) = match self.moved_past(since, by, step, false)? {
+                Past::Moved | Past::Word(_) => (self.screen()?, true),
                 Past::Still(Some(now)) => (now, false),
                 Past::Still(None) if self.fx.mono() < deadline => (self.screen()?, false),
                 still => return Ok(still),

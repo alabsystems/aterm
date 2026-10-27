@@ -101,6 +101,12 @@ pub const SEAL_LEN: usize = 5;
 /// The one byte every record of a batch but its last carries after its last field:
 /// the batch continues past it. See [`BREC_VERSION`].
 pub const CONTINUES_TAG: u8 = 0xB4;
+/// Tag byte introducing the optional 9-byte broker-stamped monotone wall-clock
+/// trailer (`[BT_TAG, bt_ms_le_8]`) written immediately before the batch `Mark`
+/// (`REQUIREMENTS` R3). Pre-R3 builds omit this trailer (`bt = None`).
+pub const BT_TAG: u8 = 0xB6;
+/// Byte length of a broker-stamped wall-clock trailer: `BT_TAG` (1) + `u64` LE (8).
+pub const BT_LEN: usize = 9;
 /// The commit-tag byte on a writer-staged `/a/retire` record (`DESIGN-aterm-fabric`
 /// §5.2): an older build's `from_payload_marked` knows only `0` (none) and `1` (group
 /// commit) and refuses `2` as malformed (`_ => return None`), failing closed rather than
@@ -136,7 +142,6 @@ const HEADER: usize = 25;
 /// The bytes every unmarked record payload takes beside its subject, its body and its
 /// commit's group and offset: the header, the two length prefixes and the commit tag
 /// (`retention::record_bytes`).
-#[cfg(feature = "retention")]
 pub(crate) const RECORD_FIXED_LEN: usize = HEADER + 9;
 /// The largest record payload the log accepts: the frame cap minus a margin, so a
 /// stored record ALWAYS also fits the frame wherever it is re-framed — inside a
@@ -146,14 +151,13 @@ pub(crate) const RECORD_FIXED_LEN: usize = HEADER + 9;
 /// on a leader yet never be shippable to, or storable on, a follower.
 pub const MAX_RECORD_PAYLOAD: usize = MAX_PAYLOAD_LEN - RECORD_MARGIN;
 /// The larger of the two re-framing overheads above — the at-rest seal's 40 bytes —
-/// plus room for the largest batch mark, the seal ([`SEAL_LEN`]), rounded up to 48: a
-/// record carries its mark INSIDE the payload the at-rest layer seals, so a record at
-/// the cap must still fit the frame with both. (It was 40 before the batch seal: a
-/// record within 8 bytes of the old cap that an older leader ships is refused here,
-/// which matters only to replication across that upgrade.)
-const RECORD_MARGIN: usize = 48;
+/// plus room for the broker timestamp trailer ([`BT_LEN`], 9 bytes) and the largest
+/// batch mark, the seal ([`SEAL_LEN`], 5 bytes), rounded up to 56: a record carries its
+/// timestamp and mark INSIDE the payload the at-rest layer seals, so a record at the cap
+/// must still fit the frame with all three (`40 + 9 + 5 = 54 <= 56`).
+const RECORD_MARGIN: usize = 56;
 #[cfg(feature = "aead")]
-const _: () = assert!(RECORD_MARGIN >= astream_aead::OVERHEAD + SEAL_LEN);
+const _: () = assert!(RECORD_MARGIN >= astream_aead::OVERHEAD + SEAL_LEN + BT_LEN);
 
 /// One durable message on the broker log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +337,20 @@ const fn decode_mark(rest: &[u8]) -> Option<Mark> {
     }
 }
 
+const fn decode_mark_and_bt(rest: &[u8]) -> Option<(Mark, Option<u64>)> {
+    let (bt_ms, after_bt) = match rest {
+        &[BT_TAG, b0, b1, b2, b3, b4, b5, b6, b7, ref tail @ ..] => (
+            Some(decode_u64_le_bytes(&[b0, b1, b2, b3, b4, b5, b6, b7])),
+            tail,
+        ),
+        _ => (None, rest),
+    };
+    let Some(mark) = decode_mark(after_bt) else {
+        return None;
+    };
+    Some((mark, bt_ms))
+}
+
 const fn encode_seal(count: u32) -> [u8; SEAL_LEN] {
     [
         SEAL_TAG,
@@ -425,8 +443,18 @@ impl BrokerRecord {
     /// record fits never depends on where it lands in a batch. A seal's count of 0 is
     /// no batch and is refused (`TooLarge`, the one error this path has).
     pub(crate) fn encode_payload_marked(&self, mark: Mark) -> Result<Vec<u8>, FrameError> {
-        // Sized exactly (header, two length-prefixed fields, the commit tag and its
-        // body, the mark), so a large body is copied once and never reallocated.
+        self.encode_payload_marked_bt(mark, None)
+    }
+
+    /// [`encode_payload_marked`](Self::encode_payload_marked), optionally stamping the
+    /// 9-byte monotone broker wall-clock trailer (`[BT_TAG, bt_le_8]`, `REQUIREMENTS` R3)
+    /// immediately before `mark`.
+    pub(crate) fn encode_payload_marked_bt(
+        &self,
+        mark: Mark,
+        bt_ms: Option<u64>,
+    ) -> Result<Vec<u8>, FrameError> {
+        // Sized check on the record's own fields before optional bt + mark trailers.
         let commit_len = match &self.commit {
             None => 0usize,
             Some(c) => {
@@ -480,6 +508,10 @@ impl BrokerRecord {
         if p.len() > MAX_RECORD_PAYLOAD {
             return Err(FrameError::TooLarge);
         }
+        if let Some(bt) = bt_ms {
+            p.push(BT_TAG);
+            p.extend_from_slice(&encode_u64_le_bytes(bt));
+        }
         match mark {
             Mark::Unmarked => {}
             Mark::Continues => p.push(CONTINUES_TAG),
@@ -494,17 +526,24 @@ impl BrokerRecord {
     /// (see [`BREC_VERSION`]); the mark itself is the store's business. Every read is
     /// bounds-checked, so hostile bytes yield `None`, never a panic.
     pub fn from_payload(p: &[u8]) -> Option<BrokerRecord> {
-        let Some((rec, _)) = Self::from_payload_marked(p) else {
+        let Some((rec, _, _)) = Self::from_payload_marked_bt(p) else {
             return None;
         };
         Some(rec)
     }
 
     /// [`from_payload`](Self::from_payload), with the batch [`Mark`] the record
-    /// carries. The bytes after the record's last field must be nothing, the one
-    /// continues byte, or exactly one well-formed seal (its tag and a count of at least
-    /// 1); anything else is not a record this build reads.
+    /// carries (ignoring any optional broker timestamp trailer).
     pub(crate) fn from_payload_marked(p: &[u8]) -> Option<(BrokerRecord, Mark)> {
+        let Some((rec, mark, _bt)) = Self::from_payload_marked_bt(p) else {
+            return None;
+        };
+        Some((rec, mark))
+    }
+
+    /// [`from_payload_marked`](Self::from_payload_marked), also returning the optional
+    /// broker-stamped monotone wall-clock time (`bt_ms`, `REQUIREMENTS` R3).
+    pub(crate) fn from_payload_marked_bt(p: &[u8]) -> Option<(BrokerRecord, Mark, Option<u64>)> {
         let (version, seq, producer_id, producer_seq, sl, rest) = decode_record_header_and_sl(p)?;
         if !brecord_version_current(version) {
             return None;
@@ -561,7 +600,7 @@ impl BrokerRecord {
             }
             _ => return None,
         };
-        let mark = decode_mark(rest)?;
+        let (mark, bt_ms) = decode_mark_and_bt(rest)?;
         let rec = BrokerRecord {
             seq,
             producer_id,
@@ -570,7 +609,7 @@ impl BrokerRecord {
             body,
             commit,
         };
-        Some((rec, mark))
+        Some((rec, mark, bt_ms))
     }
 
     /// Project this broker record as a [`CausalEdge<String>`] for [`astream_wire::CausalCut`]

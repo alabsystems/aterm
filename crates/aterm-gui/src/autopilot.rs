@@ -380,6 +380,7 @@ impl HarnessSwitch {
 
     /// Whether the switch reads on (`● on`, lit).
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn is_on(self) -> bool {
         matches!(self, Self::On)
     }
@@ -413,11 +414,11 @@ impl HarnessSwitch {
             Self::Turning => "The aterm harness is turning on.".to_owned(),
             Self::TurningOff => "The aterm harness is turning off.".to_owned(),
             Self::Off(SwitchOff::Agent(agent)) => format!(
-                "{}. Click on to turn it on.",
+                "{}. Click to turn it on.",
                 crate::autopilot::agent_switch_off(agent)
             ),
             Self::Off(SwitchOff::Master) => {
-                "Supervise coding agents is off. Click on to turn it on.".to_owned()
+                "Supervise coding agents is off. Click to turn it on.".to_owned()
             }
         }
     }

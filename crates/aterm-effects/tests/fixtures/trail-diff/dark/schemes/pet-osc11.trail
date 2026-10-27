@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# Every dark scheme (foreach-scheme dark: the built-ins and the pack themes) with the pet, with
+# OSC 11 setting the page to #ffffff.
+
+foreach-scheme dark {
+  grid 10 60
+  style rainbow kitty
+  pet on 7
+  hz 60
+
+  at 0 pty "\e[6;1H$ "
+  at 700 key g
+  at 702 pty "g"
+  at 790 key i
+  at 792 pty "i"
+  at 880 key t
+  at 882 pty "t"
+  at 970 key space
+  at 972 pty " "
+  at 1060 key l
+  at 1062 pty "l"
+  at 1150 key o
+  at 1152 pty "o"
+  at 1240 key g
+  at 1242 pty "g"
+  at 1630 pty "\e]11;#ffffff\x07"
+  run 2830
+}

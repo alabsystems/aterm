@@ -84,6 +84,8 @@ pub(super) struct TransientState {
     pub(super) reset_generation: u64,
     /// Monotonic count of full clears: ED 2, and ED 0 with the cursor home (`resize_journal::is_full_clear`; ED 3 erases only history).
     pub(super) full_clears: u64,
+    /// Of [`Self::full_clears`], those of the primary screen made from home ([`ContentScrollState::screen_clears`](super::ContentScrollState::screen_clears)), never zeroed.
+    pub(super) primary_clears: u64,
     /// Monotonic count of whole-screen replacements: alternate-screen enter and exit (47/1047/1049) and full resets.
     pub(super) screen_replaced: u64,
     /// Monotonic count of the program's DEC 1004 enables: each `CSI ? 1004 h` (or XTRESTORE) that turns focus reporting on from off.
@@ -136,7 +138,7 @@ pub(super) struct TransientState {
     pub(super) host_resyncs_alt_screen: bool,
     /// A resync the embedder has not taken yet (`Terminal::take_alt_screen_resync_request`).
     pub(super) alt_screen_resync_requested: bool,
-    /// [`Self::screen_replaced`] when the last resync was requested: one request per stuck screen.
+    /// [`Self::screen_replaced`] when the host was last asked to leave the alternate screen, until it is left (by any `?1049l`, the program's own included) or the embedder gives the request back (`Terminal::abandon_alt_screen_resync`): one request per alternate-screen visit, however many screens a program enters on it (each `?1049h` on the alternate screen is a new one). It bounds requests, not host clients: a program that leaves and re-enters asks again, and the embedder runs one leave client at a time.
     pub(super) alt_screen_resync_screen: Option<u64>,
     /// The alternate screen ([`Self::screen_replaced`] while it is up) a shell prompt proved dead under the host policy, or the embedder is making its host leave (`Terminal::expect_host_alt_screen_leave`): the `?1049l` that leaves THAT screen is the host's forwarded switch, and it releases the modes the dead app left on as the local leave does (`TerminalHandler::take_dead_alt_screen`).
     pub(super) dead_alt_screen: Option<u64>,
@@ -204,6 +206,7 @@ impl TransientState {
             sync_end_caret: None,
             reset_generation: 0,
             full_clears: 0,
+            primary_clears: 0,
             screen_replaced: 0,
             focus_arms: 0,
             render_debt: super::RenderDebt::default(),
@@ -270,7 +273,7 @@ impl TransientState {
             .saturating_add(self.report_buffer.len())
     }
 
-    /// Queue `report` in `report_buffer` unless it would take what is owed past [`super::MAX_RESPONSE_BUFFER_SIZE`]: every caller writes past `send_response`'s rate limit, so a toggle flood or a resize storm against a host that does not drain must not grow it.
+    /// Queue `report` in `report_buffer` unless it would take what is owed past [`super::MAX_RESPONSE_BUFFER_SIZE`]: a host call's report (a resize, a new cell box, a scheme change) passes no rate limit, so a resize storm against a host that does not drain must not grow it. `TerminalHandler::send_report` checks the same cap before its gates; the DEC 2031 push a program's colour change provokes passes the gates and relies on this check alone.
     #[inline]
     pub(super) fn push_report(&mut self, report: &[u8]) -> bool {
         let fits = self.owed_len().saturating_add(report.len()) <= super::MAX_RESPONSE_BUFFER_SIZE;

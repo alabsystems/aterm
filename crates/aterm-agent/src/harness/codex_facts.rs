@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! What a `codex-alab` rollout says about its session, for `aterm ctl survey`: the prompts,
-//! said and doing a Claude Code transcript's [`Excerpts`] give, and the model, reasoning effort,
-//! context left and working directory Claude Code's footer shows. [`CodexFactsTail`] reads the
+//! said and doing a Claude Code transcript's [`Excerpts`] give, the model, reasoning effort,
+//! context left and working directory Claude Code's footer shows, and the plan's five-hour and
+//! seven-day windows its usage tap reads. [`CodexFactsTail`] reads the
 //! rollout's end once and then what it gains, and [`CodexFactsFold`] folds the rows forward.
 
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -67,6 +68,11 @@ pub struct CodexFacts {
     /// How much of the model's context window is left, in percent, as codex's own footer counts
     /// it.
     pub ctx_left_pct: Option<u8>,
+    /// The plan's five-hour window used, in percent, as the newest `token_count`'s rate limits
+    /// say ([`usage_windows`]).
+    pub usage_5h_pct: Option<u8>,
+    /// Its seven-day window used, in percent.
+    pub usage_7d_pct: Option<u8>,
     /// The newest turn's working directory.
     pub cwd: Option<PathBuf>,
 }
@@ -85,6 +91,8 @@ pub struct CodexFactsFold {
     model: Option<String>,
     effort: Option<String>,
     ctx_left_pct: Option<u8>,
+    usage_5h_pct: Option<u8>,
+    usage_7d_pct: Option<u8>,
     cwd: Option<PathBuf>,
 }
 
@@ -118,6 +126,8 @@ impl CodexFactsFold {
             model: self.model.clone(),
             effort: self.effort.clone(),
             ctx_left_pct: self.ctx_left_pct,
+            usage_5h_pct: self.usage_5h_pct,
+            usage_7d_pct: self.usage_7d_pct,
             cwd: self.cwd.clone(),
         }
     }
@@ -155,6 +165,9 @@ impl CodexFactsFold {
             (Some("event_msg"), Some("token_count")) => {
                 if let Some(pct) = payload.get("info").and_then(ctx_left_pct) {
                     self.ctx_left_pct = Some(pct);
+                }
+                if let Some(limits) = payload.get("rate_limits").filter(|l| l.is_object()) {
+                    (self.usage_5h_pct, self.usage_7d_pct) = usage_windows(limits);
                 }
             }
             (Some("event_msg"), Some("task_started")) => {
@@ -307,6 +320,30 @@ fn ctx_left_pct(info: &Value) -> Option<u8> {
     let effective = u128::from(window - BASELINE_TOKENS);
     let remaining = effective.saturating_sub(u128::from(used.saturating_sub(BASELINE_TOKENS)));
     u8::try_from((remaining * 100 + effective / 2) / effective).ok()
+}
+
+/// A `token_count`'s rate limits as the plan's five-hour and seven-day windows used, rounded:
+/// each of `primary` and `secondary` names its window by `window_minutes`, and either may be
+/// `null` (a plan with a weekly window only names it `primary`).
+fn usage_windows(limits: &Value) -> (Option<u8>, Option<u8>) {
+    let mut windows = (None, None);
+    for slot in ["primary", "secondary"] {
+        let Some(w) = limits.get(slot) else {
+            continue;
+        };
+        let pct = w
+            .get("used_percent")
+            .and_then(Value::as_f64)
+            .filter(|p| p.is_finite() && (0.0..=100.0).contains(p));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let pct = pct.map(|p| p.round() as u8);
+        match w.get("window_minutes").and_then(Value::as_u64) {
+            Some(300) => windows.0 = pct,
+            Some(10_080) => windows.1 = pct,
+            _ => {}
+        }
+    }
+    windows
 }
 
 /// A rollout read for [`CodexFacts`]: its end first (at most [`TAIL_BYTES`]), then what it

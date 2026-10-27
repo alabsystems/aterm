@@ -18,12 +18,23 @@
 //! A build before the journal reads none of it, so the journal also names the incarnation each
 //! attach of this build took ([`Frame::Attached`]): an incarnation above it is one a bridge of
 //! an older build took, which went past the journal ([`super::StateDir::judge_posts`]).
+//!
+//! A RECORD'S TAIL: the bytes of a step record after its body, which astream's step codec
+//! keeps under the frame's CRC and every reader skips ([`astream_wire::steps::decode_step`]: a
+//! reader that refused them would refuse journals that open today). A reservation and a record
+//! in flight carry their heads there ([`PublishPin::at`], [`InFlight::at`]: `at <n>`, and
+//! `pin-at <n>` for an entry's pin), the one fact this build adds to the B19 record, so a
+//! journal this build wrote reads the same, record for record, to a build of the journal before
+//! it, whose parse of a body is strict (aterm-link B05 review). A tail this build cannot read
+//! is no head: the record reads without one, and is not read back before it is published again.
 
 use std::collections::BTreeMap;
 use std::io;
 
 use astream_wire::frame::{validate_frame_at, HEADER_SIZE, MAGIC};
-use astream_wire::steps::{decode_step_header, encode_step, scan_steps_from, StepEnd, STEP_HEADER};
+use astream_wire::steps::{
+    decode_step_header, encode_step_header, scan_steps_from, StepEnd, STEP_HEADER,
+};
 
 use super::{InFlight, PublishPin};
 
@@ -33,6 +44,13 @@ pub(crate) const DIR: &str = "journal";
 pub(crate) const NAME: &str = "posts";
 /// The journal, relative to the state dir.
 pub(crate) const FILE: &str = "journal/posts";
+/// What a stop's hand-off kept of the journal beside the files it wrote, relative to the state
+/// dir: a journal of the same records ([`Index::encode`]) whose tails hold their heads, which
+/// the files cannot ([`super::StateDir::hand_posts_to_files`]). No build reads it but this one's
+/// adoption of those files, which takes each file's heads from it while no attach went past it
+/// ([`super::StateDir::adopt_legacy_posts`]); a build of the journal before the heads reads only
+/// [`FILE`] in this directory, and one before the journal none of it.
+pub(crate) const HANDED: &str = "journal/handed";
 /// The size from which an append first rewrites the journal from its index; after a rewrite the
 /// next one waits for twice the rewritten size, so a rewrite's cost is spread over at least as
 /// many appended bytes as it wrote.
@@ -119,6 +137,60 @@ impl Frame {
         }
     }
 
+    /// The tail this frame is recorded with: its heads, as words (the module's A RECORD'S TAIL).
+    fn tail(&self) -> String {
+        let (at, pin_at) = match self {
+            Self::Reserve { pin, .. } => (pin.at, None),
+            Self::InFlight(entry) => (entry.at, entry.pin.at),
+            Self::Retire { .. } | Self::Landed(_) | Self::Dropped(_) | Self::Attached(_) => {
+                (None, None)
+            }
+        };
+        let mut words = Vec::new();
+        if let Some(at) = at {
+            words.push(format!("at {at}"));
+        }
+        if let Some(at) = pin_at {
+            words.push(format!("pin-at {at}"));
+        }
+        words.join(" ")
+    }
+
+    /// This frame with the heads `tail` names (see [`Frame::tail`]); a tail this build cannot
+    /// read names none.
+    fn with_tail(mut self, tail: &[u8]) -> Self {
+        let mut at = None;
+        let mut pin_at = None;
+        let words: Option<Vec<&str>> = std::str::from_utf8(tail)
+            .ok()
+            .map(|text| text.split_ascii_whitespace().collect());
+        for pair in words.as_deref().unwrap_or_default().chunks(2) {
+            let (slot, value) = match pair {
+                ["at", n] if at.is_none() => (&mut at, n),
+                ["pin-at", n] if pin_at.is_none() => (&mut pin_at, n),
+                _ => return self,
+            };
+            let Some(value) = number(value) else {
+                return self;
+            };
+            *slot = Some(value);
+        }
+        match &mut self {
+            Self::Reserve { pin, .. } if pin_at.is_none() => pin.at = at,
+            Self::InFlight(entry) => {
+                entry.at = at;
+                entry.pin.at = pin_at;
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// The frame a record holds: its body ([`Frame::parse`]) with the heads its tail names.
+    fn of_record(body: &[u8], tail: &[u8]) -> Option<Self> {
+        Some(Self::parse(body)?.with_tail(tail))
+    }
+
     /// Parse a body back, `None` for anything this build did not write.
     fn parse(body: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(body).ok()?;
@@ -155,15 +227,16 @@ impl Frame {
     }
 }
 
-/// `frame` as the record at `step`. A frame whose body would not read back as itself (a session
-/// id the body cannot carry, a reservation its reader refuses) is refused here, so the journal
-/// never holds a record its next read takes for damage.
+/// `frame` as the record at `step`: its body, then its tail (the module's A RECORD'S TAIL). A
+/// frame whose record would not read back as itself (a session id the body cannot carry, a
+/// reservation its reader refuses) is refused here, so the journal never holds a record its
+/// next read takes for damage.
 ///
 /// # Errors
-/// That frame (`InvalidInput`), or a body past a step record's payload cap (`InvalidData`).
+/// That frame (`InvalidInput`), or a record past a step record's payload cap (`InvalidData`).
 pub(crate) fn encode(step: u64, frame: &Frame) -> io::Result<Vec<u8>> {
-    let body = frame.body();
-    if Frame::parse(body.as_bytes()).as_ref() != Some(frame) {
+    let (body, tail) = (frame.body(), frame.tail());
+    if Frame::of_record(body.as_bytes(), tail.as_bytes()).as_ref() != Some(frame) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -172,12 +245,30 @@ pub(crate) fn encode(step: u64, frame: &Frame) -> io::Result<Vec<u8>> {
             ),
         ));
     }
-    encode_step(step, body.as_bytes()).map_err(|e| {
+    let framed = encode_step_header(step, body.len()).and_then(|header| {
+        let mut payload = Vec::with_capacity(STEP_HEADER + body.len() + tail.len());
+        payload.extend_from_slice(&header);
+        payload.extend_from_slice(body.as_bytes());
+        payload.extend_from_slice(tail.as_bytes());
+        astream_wire::frame::Frame::new(payload).encode()
+    });
+    framed.map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("a post journal record does not frame: {e:?}"),
         )
     })
+}
+
+/// The frame of the intact record whose body is `body` in `bytes` (a range a step scan of
+/// `bytes` gave): its body read with its tail, the bytes from the body's end to its frame's.
+fn record(bytes: &[u8], body: &std::ops::Range<usize>) -> Option<Frame> {
+    use astream_wire::frame::decode_frame_header_bytes;
+    let start = body.start.checked_sub(HEADER_SIZE + STEP_HEADER)?;
+    let header = bytes.get(start..start.checked_add(HEADER_SIZE)?)?;
+    let (len, _) = decode_frame_header_bytes(&<[u8; HEADER_SIZE]>::try_from(header).ok()?).ok()?;
+    let end = start.checked_add(HEADER_SIZE)?.checked_add(len)?;
+    Frame::of_record(bytes.get(body.clone())?, bytes.get(body.end..end)?)
 }
 
 /// What the journal holds: every post reserved and not retired, every record in flight that
@@ -321,7 +412,7 @@ pub(crate) fn read(bytes: &[u8]) -> Read {
     let mut index = Index::default();
     let mut next_step = 0u64;
     for (step, body) in &scan.steps {
-        let Some(frame) = bytes.get(body.clone()).and_then(Frame::parse) else {
+        let Some(frame) = record(bytes, body) else {
             let at = body.start.saturating_sub(HEADER_SIZE + STEP_HEADER) as u64;
             return Read {
                 index,
@@ -376,7 +467,7 @@ pub(crate) fn salvage(bytes: &[u8]) -> Index {
         let mut resume_from = at.saturating_add(scan.valid_len);
         let mut stopped_early = false;
         for (step, body) in &scan.steps {
-            let Some(frame) = rest.get(body.clone()).and_then(Frame::parse) else {
+            let Some(frame) = record(rest, body) else {
                 let start = body.start.saturating_sub(HEADER_SIZE + STEP_HEADER);
                 resume_from = at.saturating_add(start).saturating_add(1);
                 stopped_early = true;
@@ -440,12 +531,7 @@ pub(crate) fn records_and_attaches(bytes: &[u8]) -> (u64, u64) {
     let attaches = scan
         .steps
         .iter()
-        .filter(|(_, body)| {
-            matches!(
-                bytes.get(body.clone()).and_then(Frame::parse),
-                Some(Frame::Attached(_))
-            )
-        })
+        .filter(|(_, body)| matches!(record(bytes, body), Some(Frame::Attached(_))))
         .count() as u64;
     (scan.steps.len() as u64 - attaches, attaches)
 }
@@ -481,6 +567,7 @@ fn cut_short(tail: &[u8], step: u64) -> bool {
 mod tests {
     use super::*;
     use crate::state::PublishIdentity;
+    use astream_wire::steps::encode_step;
 
     fn pin(seq: u64) -> PublishPin {
         PublishPin {
@@ -493,6 +580,7 @@ mod tests {
             original: None,
             original_off: None,
             owner: Some(4),
+            at: Some(40 + seq),
         }
     }
 
@@ -502,6 +590,7 @@ mod tests {
             subject: "/f/sim/in/n-1/s-b/n-1/s-a/note".to_string(),
             body: b"v=1 t=5 text=hello".to_vec(),
             log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
+            at: Some(50 + seq),
         }
     }
 
@@ -549,7 +638,10 @@ mod tests {
     fn every_record_round_trips_and_a_rewrite_holds_the_same_index() {
         let frames = every_kind();
         for frame in &frames {
-            assert_eq!(Frame::parse(frame.body().as_bytes()).as_ref(), Some(frame));
+            assert_eq!(
+                Frame::of_record(frame.body().as_bytes(), frame.tail().as_bytes()).as_ref(),
+                Some(frame)
+            );
         }
         let bytes = journal(&frames);
         let read = read(&bytes);
@@ -575,6 +667,96 @@ mod tests {
         assert!(
             rewritten.len() < bytes.len(),
             "the rewrite holds only what is live"
+        );
+    }
+
+    /// The read of a build of the journal before the heads (B19's, on aterm main at 19f6a3e034):
+    /// each record's body by astream's step scan, parsed strictly, its tail never looked at.
+    fn read_as_before_the_heads(bytes: &[u8]) -> Option<Index> {
+        let scan = scan_steps_from(bytes, 0);
+        let mut index = Index::default();
+        for (_, body) in &scan.steps {
+            index.apply(Frame::parse(bytes.get(body.clone())?)?);
+        }
+        (scan.end == StepEnd::Clean).then_some(index)
+    }
+
+    /// **A JOURNAL THIS BUILD WROTE READS, RECORD FOR RECORD, TO A BUILD BEFORE THE HEADS**
+    /// (aterm-link B05 review): the heads ride in each record's tail, which astream's step scan
+    /// leaves out of the body, so the strict parse of an earlier build reads every record as the
+    /// one written, without its heads, and a rewrite from the index too; the text form never
+    /// names a head. CONTROL: this build reads the heads back from the same bytes.
+    #[test]
+    fn a_journal_with_heads_reads_record_for_record_to_a_build_before_them() {
+        let frames = every_kind();
+        let headless = |frame: &Frame| match frame {
+            Frame::Reserve { sid, id, pin } => Frame::Reserve {
+                sid: sid.clone(),
+                id: *id,
+                pin: pin.without_head(),
+            },
+            Frame::InFlight(entry) => Frame::InFlight(entry.without_head()),
+            other => other.clone(),
+        };
+        assert!(frames.iter().any(|frame| *frame != headless(frame)));
+        for frame in &frames {
+            assert_eq!(
+                Frame::parse(frame.body().as_bytes()),
+                Some(headless(frame)),
+                "an earlier build's parse of the body alone"
+            );
+            assert!(!frame.body().contains(" at ") && !frame.body().contains("\nat="));
+        }
+        assert_eq!(
+            pin(7).render(),
+            format!(
+                "7 identity /f/sim/in/n-1/s-b/n-1/s-a/note {} owner 4",
+                "a".repeat(64)
+            ),
+            "the reservation's text form is B19's"
+        );
+        let bytes = journal(&frames);
+        let mut headless_index = Index::default();
+        for frame in &frames {
+            headless_index.apply(headless(frame));
+        }
+        assert_eq!(
+            read_as_before_the_heads(&bytes),
+            Some(headless_index.clone())
+        );
+        let (rewritten, _) = read(&bytes).index.encode().expect("rewrite");
+        assert_eq!(
+            read_as_before_the_heads(&rewritten),
+            Some(headless_index),
+            "a rewrite from the index, without its heads"
+        );
+        let mut with_heads = Index::default();
+        for frame in &frames {
+            with_heads.apply(frame.clone());
+        }
+        assert_eq!(
+            read(&bytes).index,
+            with_heads,
+            "CONTROL: this build reads the heads"
+        );
+        assert_eq!(read(&rewritten).index, with_heads);
+    }
+
+    /// A tail this build cannot read names no head: the record reads as its body alone.
+    #[test]
+    fn a_tail_this_build_cannot_read_names_no_head() {
+        let entry = Frame::InFlight(entry(7));
+        for tail in ["at", "at x", "at 1 at 2", "pin-at 3 later 4", "\u{ff}"] {
+            assert_eq!(
+                Frame::of_record(entry.body().as_bytes(), tail.as_bytes()),
+                Frame::parse(entry.body().as_bytes()),
+                "{tail:?}"
+            );
+        }
+        assert_eq!(
+            Frame::of_record(entry.body().as_bytes(), b"at 57 pin-at 47"),
+            Some(entry),
+            "CONTROL"
         );
     }
 

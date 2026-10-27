@@ -28,17 +28,13 @@ pub const MODEL_MARK: char = '\u{25C6}';
 pub const PATH_MARK: char = '\u{2302}';
 /// The mark before the branch.
 pub const BRANCH_MARK: char = '\u{2387}';
-/// The mark before the account the process runs on, which leads the account unit (its plan and
-/// weekly quota joined on, [`Segment::joined`]).
+/// The mark before the account the process runs on, which leads the account unit (its weekly
+/// quota joined on, [`Segment::joined`]).
 pub const ACCOUNT_MARK: char = '\u{2386}';
-/// Names the account unit's subscription plan ([`Segment::joined`]); the rule draws a
-/// [`JOIN_MARK`] before it.
-pub const PLAN_MARK: char = '\u{25c7}';
 /// Names the account unit's weekly quota ([`Segment::joined`]); the rule draws a [`JOIN_MARK`]
 /// before it. The Accounts menu a click on the unit opens leads its weekly row with this mark.
 pub const WEEKLY_MARK: char = '\u{25f7}';
-/// The mark the rule draws before a part joined to the account unit
-/// (`⎆ me@example.com · Max 20x · weekly 61% left`).
+/// The mark the rule draws before a part joined to the account unit (`⎆ me · weekly 61% left`).
 pub const JOIN_MARK: char = '\u{b7}';
 /// The mark before a limit wall the session hit.
 pub const WALL_MARK: char = '\u{29D7}';
@@ -48,8 +44,6 @@ pub const CONTEXT_MARK: char = '\u{25D0}';
 pub const USAGE_MARK: char = '\u{03A3}';
 /// The mark inside a limit wall that stands for "resets" (`⧗ 5h ♻ 3pm`).
 pub const RESET_MARK: char = '\u{267B}';
-/// The mark before a live upgrade that waits on the person at this composer ([`UpgradeNote`]).
-pub const UPGRADE_MARK: char = '\u{21E3}';
 
 /// Most transcript bytes one [`FooterCache::usage`] folds.
 pub const FOLD_BUDGET: u64 = 64 * 1024 * 1024;
@@ -123,10 +117,10 @@ pub struct FooterFacts {
     pub effort_for: Option<String>,
     /// Whose facts these are, when the registry named a session.
     pub owner: Option<FactsOwner>,
-    /// The live upgrade waiting on the person here, in the words the composer now calls for.
-    pub upgrade: Option<UpgradeWords>,
     /// The roster's label for the login this process runs under.
     pub account: Option<String>,
+    /// The session's observed account recovery decision, independently of rotation policy.
+    pub account_progress: Option<super::account_progress::AccountProgress>,
     /// What the newest statement since the process started says of the top-effort key.
     pub top_effort: Option<bool>,
     /// The facts the person hid in this session by a click.
@@ -155,10 +149,10 @@ pub enum FactKind {
     Branch,
     /// What is left of the context window (`ctx 84% left`).
     Context,
-    /// The session's usage (`Σ 6m33s ↑20M ↓82k`); never hidden by a click.
+    /// The session's usage (`Σ 6m33s`, its tokens in the hover title); never hidden by a click.
     Usage,
-    /// The account unit: the account, and its plan and weekly quota where the profile told them
-    /// (`⎆ me@example.com · Max 20x · weekly 61% left`); never hidden by a click.
+    /// The account unit: the account, and its weekly quota where a read told it (`⎆ me · weekly
+    /// 61% left`); never hidden by a click.
     Account,
 }
 
@@ -232,36 +226,6 @@ impl FactMask {
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
-    }
-}
-
-/// One wording of an [`UpgradeNote`]: whole, and short for a narrow rule.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct UpgradeWords {
-    /// `Claude Code 2.1.286 is ready · waits while you use this tab`.
-    pub whole: String,
-    /// `2.1.286 waits while you use this tab`.
-    pub short: String,
-}
-
-/// What the footer says of a live upgrade that waits only on the person at this composer.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct UpgradeNote {
-    /// While the composer holds no draft: `… waits while you use this tab`.
-    pub using: Option<UpgradeWords>,
-    /// While a draft stands in the composer: `… waits until your draft is sent or cleared`.
-    pub draft: UpgradeWords,
-}
-
-impl UpgradeNote {
-    /// The words for a composer that holds a person's draft (`draft`) or none, if any.
-    #[must_use]
-    pub const fn words(&self, draft: bool) -> Option<&UpgradeWords> {
-        if draft {
-            Some(&self.draft)
-        } else {
-            self.using.as_ref()
-        }
     }
 }
 
@@ -2446,8 +2410,8 @@ fn facts_for_entry_from(
             floor,
             session_id: entry.session_id.clone(),
         }),
-        upgrade: None,
         account: None,
+        account_progress: None,
         top_effort,
         off: FactMask::default(),
         subscription: None,
@@ -2824,91 +2788,294 @@ fn prefix_of_parts(cut: &str, parts: &[&str]) -> bool {
     rest.is_empty()
 }
 
-/// What aterm draws over Claude's bypass pill (`⏵⏵ bypass permissions on`) on the glass.
-pub const YOLO_ON: &str = "YOLO on";
-/// What it draws over the manual-mode pill (`⏸ manual mode on`), the mode that asks before each tool.
-pub const YOLO_OFF: &str = "YOLO off";
+/// What the lights block names Claude's bypass mode (`⏵⏵ bypass permissions on`) where the glass
+/// rewrites its mode row ([`mode_row_rewrite_under`]): yolo, the default, full auto and named
+/// quietly.
+pub const YOLO_ON: &str = "yolo";
+/// What it names the manual mode (`⏸ manual mode on`), the mode that asks before each tool: any
+/// yolo turned off is nag mode.
+pub const YOLO_OFF: &str = "nag mode";
 
-/// Claude's mode pill as [`relabel_under`] found it, in PANE COLUMNS of the GUI's pane text (one char per cell), for the glass to relabel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Relabel {
-    /// The mode row.
-    pub row: usize,
-    /// Claude's pill, its glyph to its `on`: `start..end`.
+/// How many items a rewritten mode row keeps ([`ModeRow`]); a row with more stands as drawn.
+pub const MODE_ROW_ITEMS: usize = 8;
+
+/// What joins the kept items of a rewritten mode row, as Claude joins its own.
+pub const MODE_ROW_SEP: &str = " \u{b7} ";
+
+/// The cells [`MODE_ROW_SEP`] takes.
+pub const MODE_ROW_SEP_CELLS: usize = 3;
+
+/// What a kept item of Claude's mode row is ([`ModeRow`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModeItem {
+    /// vim's `-- INSERT --`.
+    #[default]
+    Vim,
+    /// A count of Claude's jobs: `1 shell`, `2 monitors`, `← 2 agents`, `← 2 done`.
+    Job,
+    /// `/rc active`: a live state, someone else can drive the session.
+    Remote,
+    /// An item this build does not know, kept as drawn.
+    Unknown,
+}
+
+/// One item a rewritten mode row keeps: its pane columns `start..end` in the row Claude drew.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Kept {
     pub start: usize,
     pub end: usize,
-    /// Where the pill's words start (after the glyph and its space).
-    pub words: usize,
-    /// The end of the row's left items, from the pill's end to the first two blanks.
-    pub run_end: usize,
-    /// [`YOLO_ON`] or [`YOLO_OFF`].
-    pub label: &'static str,
+    pub item: ModeItem,
 }
 
-impl Relabel {
-    /// How far the run moves left: the pill's cells less the label's.
+impl Kept {
+    /// The cells it takes.
     #[must_use]
-    pub const fn shift(&self) -> usize {
-        (self.end - self.start).saturating_sub(self.label.len())
+    pub const fn len(&self) -> usize {
+        self.end - self.start
     }
 
-    /// The column after the label.
+    /// Whether it takes no cells (never, for an item [`mode_row_rewrite_under`] kept).
     #[must_use]
-    pub const fn label_end(&self) -> usize {
-        self.start + self.label.len()
+    pub const fn is_empty(&self) -> bool {
+        self.end == self.start
+    }
+}
+
+/// Claude's mode row as [`mode_row_rewrite_under`] read it, in PANE COLUMNS of the GUI's pane
+/// text (one char per cell), for the glass to rewrite: only the jobs, then the live states and
+/// the items this build does not know, each as Claude drew it, flush at column 0 and joined by
+/// [`MODE_ROW_SEP`], blanks after. The pill, its cycle hint, the key hints, the `⧉` items, the
+/// effort hint and the auto-compact reading are dropped: the mode is the lights block's, the
+/// effort the top rule's, the context its fact's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeRow {
+    /// The mode row.
+    pub row: usize,
+    /// The row's drawn cells, `0..end`: what the glass writes.
+    pub end: usize,
+    /// The pill's anchor id (`mode.bypass`).
+    pub mode: &'static str,
+    /// The column of a `·` of Claude's own, whose ink joins the kept items.
+    pub sep: Option<usize>,
+    /// The row under it where Claude's effort hint wrapped to, alone (its drawn cells
+    /// `0..effort.1`), blanked with the row.
+    pub effort: Option<(usize, usize)>,
+    kept: [Kept; MODE_ROW_ITEMS],
+    len: usize,
+}
+
+impl ModeRow {
+    /// The kept items, in the order the glass lays them.
+    #[must_use]
+    pub fn kept(&self) -> &[Kept] {
+        &self.kept[..self.len]
     }
 
-    /// The grid column under glass column `col` of the relabelled row.
+    /// Whether an item this build does not know was kept.
     #[must_use]
-    pub const fn grid_col(&self, col: usize) -> usize {
-        let shift = self.shift();
-        if col < self.label_end() || col >= self.run_end {
-            col
-        } else if col + shift < self.run_end {
-            col + shift
-        } else {
-            self.start
+    pub fn unknown(&self) -> bool {
+        self.kept().iter().any(|k| k.item == ModeItem::Unknown)
+    }
+
+    /// The glass columns kept item `i` takes.
+    #[must_use]
+    pub fn glass_of(&self, i: usize) -> std::ops::Range<usize> {
+        let at = self.kept()[..i]
+            .iter()
+            .map(|k| k.len() + MODE_ROW_SEP_CELLS)
+            .sum::<usize>();
+        at..at + self.kept[i].len()
+    }
+
+    /// The glass columns the kept items and their separators take.
+    #[must_use]
+    pub fn glass_end(&self) -> usize {
+        self.len
+            .checked_sub(1)
+            .map_or(0, |last| self.glass_of(last).end)
+    }
+
+    /// The grid column under glass column `col` of the rewritten row: a kept item's own cell,
+    /// `col` itself past the row's drawn cells, and `None` for a cell the rewrite vacated (a
+    /// separator, a blank after the items), which a press lands on nothing in.
+    #[must_use]
+    pub fn grid_col(&self, col: usize) -> Option<usize> {
+        if col >= self.end {
+            return Some(col);
         }
+        (0..self.len).find_map(|i| {
+            let glass = self.glass_of(i);
+            glass
+                .contains(&col)
+                .then(|| self.kept[i].start + col - glass.start)
+        })
+    }
+
+    fn keep(&mut self, kept: Kept) -> Option<()> {
+        *self.kept.get_mut(self.len)? = kept;
+        self.len += 1;
+        Some(())
     }
 }
 
-/// Claude Code's mode pill to relabel under the composer bottom rule `bottom`.
+/// What one item of Claude's mode row is, `None` for one the rewrite drops.
+fn mode_item(text: &str) -> Option<ModeItem> {
+    let dropped = [
+        "busy.interrupt",
+        "footer.shortcuts",
+        "footer.clear",
+        "mode.manage",
+        "mode.for_agents",
+        "mode.tasks",
+    ]
+    .into_iter()
+    .any(|id| text == aterm_phase::anchor(id));
+    if dropped || text.starts_with('\u{29c9}') || is_effort_hint(text) || auto_compact(text) {
+        return None;
+    }
+    Some(if text == aterm_phase::anchor!("mode.remote") {
+        ModeItem::Remote
+    } else if is_job(text) {
+        ModeItem::Job
+    } else {
+        ModeItem::Unknown
+    })
+}
+
+/// Whether `text` is Claude's auto-compact reading (`7% until auto-compact`).
+fn auto_compact(text: &str) -> bool {
+    text.strip_suffix(aterm_phase::anchor!("mode.auto_compact"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether `text` counts Claude's jobs: `1 shell`, `2 monitors`, `← 2 agents`, `← 2 done`.
+fn is_job(text: &str) -> bool {
+    let text = text.strip_prefix("\u{2190} ").unwrap_or(text);
+    let Some((n, noun)) = text.split_once(' ') else {
+        return false;
+    };
+    !n.is_empty()
+        && n.bytes().all(|b| b.is_ascii_digit())
+        && [
+            "jobs.shell",
+            "jobs.shells",
+            "jobs.monitor",
+            "jobs.monitors",
+            "jobs.agent",
+            "jobs.agents",
+            "jobs.done",
+        ]
+        .into_iter()
+        .any(|id| noun == aterm_phase::anchor(id))
+}
+
+/// Claude Code's mode row under the composer bottom rule `bottom`, read for the glass to rewrite
+/// ([`ModeRow`]): `None` where the row is not one this build reads whole, a cut or unknown pill,
+/// a cut item or hint, or more items than [`MODE_ROW_ITEMS`].
 #[must_use]
-pub fn relabel_under(rows: &[String], bottom: usize) -> Option<Relabel> {
+pub fn mode_row_rewrite_under(rows: &[String], bottom: usize) -> Option<ModeRow> {
     let row = pill_row_under(rows, bottom)?;
     let text = &rows[row];
     if !is_mode_row(text) {
         return None;
     }
+    let col = |b: usize| text[..b].chars().count();
+    let lead = text.strip_prefix("  ")?;
+    let vim = after_vim_insert(lead).is_some();
     let rest = pill_lead(text)?;
-    let (pill, label) = [("mode.bypass", YOLO_ON), ("mode.manual", YOLO_OFF)]
-        .into_iter()
-        .find_map(|(id, label)| {
-            let pill = PILLS.iter().find(|p| p.id == id)?;
-            let after = after_pill(rest, pill)?;
-            (after.is_empty() || after.starts_with(' ')).then_some((pill, label))
-        })?;
-    let start = text[..text.len() - rest.len()].chars().count();
-    let words = start + pill.glyph.chars().count() + 1;
-    let end = words + pill.text.chars().count();
-    let len = text.trim_end().chars().count();
-    let mut run_end = len;
-    let mut blank_before = false;
-    for (k, c) in text.chars().enumerate().take(len).skip(end) {
-        if c == ' ' && blank_before {
-            run_end = k - 1;
-            break;
+    let (mode, after) = PILLS.iter().find_map(|pill| {
+        let after = after_pill(rest, pill)?;
+        (after.is_empty() || after.starts_with(' ')).then_some((pill.id, after))
+    })?;
+    let mut tail = after;
+    if after.starts_with(" (") {
+        let hint = cycle_hint_len(after);
+        let bytes = after
+            .char_indices()
+            .nth(hint)
+            .map_or(after.len(), |(b, _)| b);
+        if hint == 0 || !after[..bytes].ends_with(')') {
+            return None;
         }
-        blank_before = c == ' ';
+        tail = &after[bytes..];
     }
-    Some(Relabel {
+    let mut m = ModeRow {
         row,
-        start,
-        end,
-        words,
-        run_end: run_end.max(end),
-        label,
-    })
+        end: text.trim_end().chars().count(),
+        mode,
+        sep: text.find(MODE_ROW_SEP).map(|b| col(b) + 1),
+        effort: None,
+        kept: [Kept::default(); MODE_ROW_ITEMS],
+        len: 0,
+    };
+    if vim {
+        m.keep(Kept {
+            start: 2,
+            end: 2 + VIM_INSERT.chars().count(),
+            item: ModeItem::Vim,
+        })?;
+    }
+    // The items: ` · `-joined after the pill, then the groups Claude sets off by blanks, each
+    // one item with its own ` · ` (`◐ medium · /effort`, `Not logged in · Run /login`).
+    let mut items = [(0, 0); 2 * MODE_ROW_ITEMS];
+    let mut n = 0;
+    let base = text.len() - tail.len();
+    let mut at = 0;
+    while !tail[at..].trim().is_empty() {
+        let here = &tail[at..];
+        let (start, group) = if here.starts_with(MODE_ROW_SEP) {
+            (at + MODE_ROW_SEP.len(), false)
+        } else if here.starts_with("  ") {
+            (at + here.len() - here.trim_start().len(), true)
+        } else {
+            return None;
+        };
+        let item = &tail[start..];
+        let len = if group {
+            item.find("  ").unwrap_or(item.len())
+        } else {
+            [MODE_ROW_SEP, "  "]
+                .into_iter()
+                .filter_map(|cut| item.find(cut))
+                .min()
+                .unwrap_or(item.len())
+        };
+        if len == 0 {
+            return None;
+        }
+        *items.get_mut(n)? = (base + start, base + start + len);
+        n += 1;
+        at = start + len;
+    }
+    let mut kinds = [None; 2 * MODE_ROW_ITEMS];
+    for (k, &(s, e)) in items[..n].iter().enumerate() {
+        let item = &text[s..e].trim_end();
+        let cut = item.ends_with('\u{2026}')
+            || *item == "\u{b7}"
+            || item.starts_with("\u{b7} ")
+            || item.ends_with(" \u{b7}");
+        if cut || item.is_empty() {
+            return None;
+        }
+        kinds[k] = mode_item(item);
+    }
+    for want in [ModeItem::Job, ModeItem::Remote, ModeItem::Unknown] {
+        for (k, &(s, e)) in items[..n].iter().enumerate() {
+            if kinds[k] == Some(want) {
+                m.keep(Kept {
+                    start: col(s),
+                    end: col(e),
+                    item: want,
+                })?;
+            }
+        }
+    }
+    m.effort = rows.get(row + 1).and_then(|under| {
+        let t = under.trim();
+        (under.starts_with("  ") && is_effort_hint(t))
+            .then(|| (row + 1, under.trim_end().chars().count()))
+    });
+    Some(m)
 }
 
 const FOOTER_ROWS_MAX: usize = 4;
@@ -3020,18 +3187,92 @@ fn agy_agents_panel_under_with(
 
 /// The footer's marked values, in order.
 pub fn segments(facts: &FooterFacts) -> Vec<Segment> {
-    let mut out: Vec<Segment> = facts
-        .upgrade
-        .as_ref()
-        .map(|note| upgrade_segment(&note.whole))
-        .into_iter()
-        .collect();
-    out.extend(fact_segments(facts, true));
-    out
+    fact_segments(facts, true)
 }
 
-fn upgrade_segment(text: &str) -> Segment {
-    Segment::plain(UPGRADE_MARK, text)
+/// The observed recovery stage, never inferred from the auto-rotate setting.
+#[must_use]
+pub fn account_progress_phase(progress: &super::account_progress::AccountProgress) -> String {
+    use super::account_progress::ProgressPhase;
+    match &progress.phase {
+        ProgressPhase::Unknown => "State unknown".into(),
+        ProgressPhase::Watching => "Watching".into(),
+        ProgressPhase::Disabled => "Rotation off".into(),
+        ProgressPhase::Limited => "Limit reached".into(),
+        ProgressPhase::Waiting => "Waiting".into(),
+        ProgressPhase::Probing => "Checking accounts".into(),
+        ProgressPhase::Ready => "Account eligible".into(),
+        ProgressPhase::Switching { to } => format!("Switching to {to}"),
+        ProgressPhase::Verifying { to } => format!("Verifying {to}"),
+        ProgressPhase::SigningIn { label, route } => match route {
+            Some(route) => format!("Signing in {label} via {route}"),
+            None => format!("Signing in {label}"),
+        },
+    }
+}
+
+/// Compact recovery evidence for the existing composer rule and its disclosure.
+#[must_use]
+pub fn account_progress_text(
+    progress: &super::account_progress::AccountProgress,
+    narrow: bool,
+) -> String {
+    if progress.phase == super::account_progress::ProgressPhase::Watching && progress.wall.is_none()
+    {
+        return if progress.known.is_none() && progress.eligible.is_none() {
+            "Accounts unknown".into()
+        } else {
+            progress_inventory(progress).join(" · ")
+        };
+    }
+    let mut parts = Vec::new();
+    if narrow && progress.wall.is_some() {
+        parts.push("Limit reached".into());
+    }
+    if !narrow {
+        if let Some(wall) = &progress.wall {
+            parts.push(format!("Limit reached: {wall}"));
+        }
+        parts.extend(progress_inventory(progress));
+    }
+    let phase = account_progress_phase(progress);
+    parts.push(if narrow {
+        progress_excerpt(&phase)
+    } else {
+        phase
+    });
+    if let Some(detail) = progress.details.first() {
+        parts.push(progress_excerpt(detail));
+    }
+    parts.push(match progress.next_at {
+        Some(at) => format!("Next {}", super::usage::rfc3339_utc(at)),
+        None => "Next unknown".into(),
+    });
+    parts.join(" · ")
+}
+
+fn progress_inventory(progress: &super::account_progress::AccountProgress) -> Vec<String> {
+    vec![
+        progress
+            .eligible
+            .map_or_else(|| "Eligibility unknown".into(), |n| format!("{n} eligible")),
+        progress
+            .known
+            .map_or_else(|| "Inventory unknown".into(), |n| format!("{n} accounts")),
+    ]
+}
+
+fn progress_excerpt(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("");
+    let short: String = aterm_grapheme::grid_graphemes(line)
+        .take_while(|cluster| cluster.end_col <= 32)
+        .map(|cluster| cluster.text)
+        .collect();
+    if short.len() < line.len() {
+        format!("{short}…")
+    } else {
+        short
+    }
 }
 
 fn model_effort_segment(facts: &FooterFacts, stubs: bool) -> Option<Segment> {
@@ -3089,6 +3330,35 @@ fn model_effort_segment(facts: &FooterFacts, stubs: bool) -> Option<Segment> {
     }
 }
 
+impl FooterFacts {
+    /// Reconcile an idle account observation with a still-standing transcript limit.
+    /// An explicit recovery decision remains authoritative; an older idle inventory
+    /// observation cannot hide a limit that the transcript reader has since found.
+    #[must_use]
+    pub fn account_progress_view(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, super::account_progress::AccountProgress>> {
+        use super::account_progress::ProgressPhase;
+        let progress = self.account_progress.as_ref()?;
+        let mut view = std::borrow::Cow::Borrowed(progress);
+        if progress.wall.is_none()
+            && matches!(
+                progress.phase,
+                ProgressPhase::Watching | ProgressPhase::Unknown
+            )
+            && let Some(wall) = self.usage.as_ref().and_then(|usage| usage.wall.as_ref())
+        {
+            let progress = view.to_mut();
+            progress.wall = Some(wall.label.to_owned());
+            progress.phase = ProgressPhase::Waiting;
+            progress
+                .details
+                .insert(0, "Awaiting a recovery decision".into());
+        }
+        Some(view)
+    }
+}
+
 fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
     let usage = facts.usage.as_ref();
     let hidable = |kind: FactKind, value: &Option<String>| -> Option<Segment> {
@@ -3103,40 +3373,50 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
         })
     };
     let plain = |mark: char, text: Option<String>| text.map(|text| Segment::plain(mark, text));
-    let joined = |mark: char, text: Option<String>| text.map(|text| Segment::joined(mark, text));
+    // An unread profile value is not shown: the account's hover title, the Accounts menu and a
+    // screen reader say why. The independent recovery observation can state unknown inventory
+    // or eligibility explicitly. With no email to
+    // lead the account unit, its week stands apart behind its own mark. The plan (`Max 20x`) is
+    // not on the rule at rest: it changes nothing the person does at the tab, and the hover
+    // title and the Accounts menu say it. The email
+    // shows its name alone: the domain says nothing the person at the tab needs at rest, and the
+    // address is private on a shared screen; the hover title and the Accounts menu say it whole.
+    let email = facts
+        .subscription
+        .as_ref()
+        .and_then(|s| s.email.as_deref())
+        .map(|email| email_name(email).unwrap_or(email).to_owned());
+    let headed = email.is_some();
+    let joined = |mark: char, text: Option<String>| {
+        text.map(|text| {
+            if headed {
+                Segment::joined(mark, text)
+            } else {
+                Segment::plain(mark, text)
+            }
+        })
+    };
     [
         plain(
             WALL_MARK,
-            usage
-                .and_then(|u| u.wall.as_ref())
-                .map(super::session_usage::wall_text),
+            facts
+                .account_progress_view()
+                .map(|progress| account_progress_text(&progress, false))
+                .or_else(|| {
+                    usage
+                        .and_then(|u| u.wall.as_ref())
+                        .map(super::session_usage::wall_text)
+                }),
         ),
-        plain(
-            ACCOUNT_MARK,
-            facts.subscription.as_ref().map(|s| {
-                s.email
-                    .clone()
-                    .unwrap_or_else(|| "account unavailable".into())
-            }),
-        ),
-        joined(
-            PLAN_MARK,
-            facts.subscription.as_ref().and_then(|s| s.plan.clone()),
-        ),
+        plain(ACCOUNT_MARK, email),
         joined(
             WEEKLY_MARK,
-            facts.subscription.as_ref().map(|s| {
-                s.weekly.clone().unwrap_or_else(|| {
-                    if usage
+            facts.subscription.as_ref().and_then(|s| {
+                s.weekly.clone().or_else(|| {
+                    usage
                         .and_then(|u| u.wall.as_ref())
                         .is_some_and(|w| w.label == "7d")
-                    {
-                        "weekly 0% left".into()
-                    } else {
-                        s.weekly_gap
-                            .map_or("weekly unavailable", super::profile::WeeklyGap::words)
-                            .into()
-                    }
+                        .then(|| "weekly 0% left".into())
                 })
             }),
         ),
@@ -3154,7 +3434,7 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
         plain(
             USAGE_MARK,
             usage.and_then(|u| {
-                super::session_usage::usage_text_at(u, super::session_usage::UsageGrain::Total)
+                super::session_usage::usage_text_at(u, super::session_usage::UsageGrain::Rule)
             }),
         ),
     ]
@@ -3402,7 +3682,7 @@ pub struct FactSpan {
 }
 
 /// Every fact of one rule's facts, in reading order ([`fact_spans`]).
-pub type FactSpans = [Option<FactSpan>; 7];
+pub type FactSpans = [Option<FactSpan>; 8];
 
 fn glyph_fact(segment: &Segment, tail: bool, quiet: bool) -> Option<(FactKind, FactMask)> {
     let kind = if tail {
@@ -3414,7 +3694,7 @@ fn glyph_fact(segment: &Segment, tail: bool, quiet: bool) -> Option<(FactKind, F
             BRANCH_MARK => FactKind::Branch,
             CONTEXT_MARK => FactKind::Context,
             USAGE_MARK => FactKind::Usage,
-            ACCOUNT_MARK | PLAN_MARK | WEEKLY_MARK => FactKind::Account,
+            ACCOUNT_MARK | WEEKLY_MARK | WALL_MARK => FactKind::Account,
             _ => return None,
         }
     };
@@ -3595,28 +3875,6 @@ fn rule_width(
     facts + lights + if facts > 0 && lights > 0 { RULE_SEP } else { 0 }
 }
 
-fn facts_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
-    let plain = plain_ladder(facts);
-    let Some(note) = &facts.upgrade else {
-        return plain;
-    };
-    let led = |text: &str, rung: &[Segment]| -> Vec<Segment> {
-        std::iter::once(upgrade_segment(text))
-            .chain(rung.iter().cloned())
-            .collect()
-    };
-    let whole = &plain[0];
-    let mut out = vec![led(&note.whole, whole)];
-    for rung in plain.iter().filter(|rung| same_top(rung, whole)) {
-        let rung = led(&note.short, rung);
-        if !out.contains(&rung) {
-            out.push(rung);
-        }
-    }
-    out.extend(plain);
-    out
-}
-
 fn top_of(rung: &[Segment]) -> impl Iterator<Item = &Segment> {
     let subscription = rung.iter().any(|s| s.mark == WEEKLY_MARK);
     rung.iter().filter(move |s| {
@@ -3626,17 +3884,12 @@ fn top_of(rung: &[Segment]) -> impl Iterator<Item = &Segment> {
     })
 }
 
-/// Whether two rungs show the same top ([`top_of`]). The account counts by its email's name
-/// alone: the domain is the unit's first part to give way, before the plan
-/// ([`subscription_ladder`]), so an upgrade note or a reason may take the room of both, and of
-/// no more of the unit.
+/// Whether two rungs show the same top ([`top_of`]): a reason may take the room of the facts
+/// beside it, and of no part of the account unit.
 fn same_top(a: &[Segment], b: &[Segment]) -> bool {
     let shown = |rung| {
         top_of(rung)
-            .map(|segment| match segment.shown_part() {
-                (ACCOUNT_MARK, text) => (ACCOUNT_MARK, email_name(text).unwrap_or(text)),
-                shown => shown,
-            })
+            .map(Segment::shown_part)
             .filter(|(_, text)| !text.is_empty())
     };
     shown(a).eq(shown(b))
@@ -3650,6 +3903,35 @@ fn email_name(text: &str) -> Option<&str> {
 }
 
 fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
+    if let Some(progress) = facts.account_progress_view() {
+        let mut rung = fact_segments(facts, true);
+        let mut out = vec![rung.clone()];
+        for mark in [
+            CONTEXT_MARK,
+            USAGE_MARK,
+            BRANCH_MARK,
+            PATH_MARK,
+            MODEL_MARK,
+            ACCOUNT_MARK,
+            WEEKLY_MARK,
+        ] {
+            rung.retain(|segment| segment.mark != mark);
+            if out.last() != Some(&rung) {
+                out.push(rung.clone());
+            }
+        }
+        out.push(vec![Segment::plain(
+            WALL_MARK,
+            account_progress_text(&progress, true),
+        )]);
+        let mut minimal = progress.into_owned();
+        minimal.details.clear();
+        out.push(vec![Segment::plain(
+            WALL_MARK,
+            account_progress_text(&minimal, true),
+        )]);
+        return out;
+    }
     let mut out = vec![fact_segments(facts, true)];
     for rung in bare_ladder(facts) {
         if !out.contains(&rung) {
@@ -3758,8 +4040,8 @@ fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
 }
 
 /// The rungs of a rule with a subscription, widest first: the other facts give way, then the
-/// account unit narrows as one (the email's domain, the plan, the email cut, the weekly words
-/// narrowed), never shown in part: no rung has the plan or the week without the account.
+/// account unit narrows as one (the email's name cut, the weekly words narrowed), never shown in
+/// part: no rung has the week joined on without the account.
 fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     let mut rung = fact_segments(facts, false);
     let mut out = vec![rung.clone()];
@@ -3768,13 +4050,6 @@ fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
         if out.last() != Some(&rung) {
             out.push(rung.clone());
         }
-    }
-    if elide_subscription_domain(&mut rung) && out.last() != Some(&rung) {
-        out.push(rung.clone());
-    }
-    rung.retain(|segment| segment.mark != PLAN_MARK);
-    if out.last() != Some(&rung) {
-        out.push(rung.clone());
     }
     for limit in [24, 18, 12, 8] {
         let mut short = rung.clone();
@@ -3798,19 +4073,6 @@ fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     out
 }
 
-/// Elide the account's email domain (`me@example.com` to `me@…`), where its text has an `@` with
-/// text on both sides (never `account unavailable`).
-fn elide_subscription_domain(segments: &mut [Segment]) -> bool {
-    let Some(account) = segments.iter_mut().find(|s| s.mark == ACCOUNT_MARK) else {
-        return false;
-    };
-    let Some(name) = email_name(&account.text) else {
-        return false;
-    };
-    account.text = format!("{name}@\u{2026}");
-    true
-}
-
 fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool {
     let Some(account) = segments.iter_mut().find(|s| s.mark == ACCOUNT_MARK) else {
         return false;
@@ -3827,7 +4089,7 @@ fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool 
 }
 
 /// Narrow the weekly segment to its narrow form ([`super::profile::narrow_weekly`]: an aged
-/// figure keeps its `weekly` and its age, a reason its `weekly ?`), where it has one.
+/// figure keeps its `weekly` and its age), where it has one.
 fn narrow_subscription_weekly(segments: &mut [Segment]) -> bool {
     let Some(weekly) = segments.iter_mut().find(|s| s.mark == WEEKLY_MARK) else {
         return false;
@@ -3846,7 +4108,6 @@ fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
         .into_iter()
         .filter(|s| matches!(s.mark, ACCOUNT_MARK | WEEKLY_MARK))
         .collect();
-    elide_subscription_domain(&mut essentials);
     shorten_subscription_account(&mut essentials, 8);
     narrow_subscription_weekly(&mut essentials);
     let with_wall: Vec<_> = wall.iter().cloned().chain(essentials.clone()).collect();
@@ -3861,7 +4122,7 @@ fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
 /// What of the facts and lights fits `room` cells of the rule ([`rule_room`]).
 #[must_use]
 pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -> RuleFit {
-    let ladder = facts_ladder(facts);
+    let ladder = plain_ladder(facts);
     let model = model_alone(facts);
     let chips = lights.is_some();
     let reason = lights.is_some_and(|l| l.reason);
@@ -3894,6 +4155,10 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
     let bare = ladder
         .iter()
         .map(|rung| (rung.as_slice(), TitleFit::None, chips));
+    let recovery = ladder
+        .iter()
+        .filter(|_| facts.account_progress.is_some())
+        .map(|rung| (rung.as_slice(), TitleFit::None, false));
     let last = if facts.subscription.is_some() {
         [(&[][..], true), (model.as_slice(), false)]
     } else {
@@ -3905,6 +4170,7 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
     let (segments, title, chips) = titled
         .chain(reasons)
         .chain(bare)
+        .chain(recovery)
         .chain(last)
         .find(|&(segments, title, chips)| rule_width(segments, title, chips, lights) <= room)
         .unwrap_or((&[], TitleFit::None, false));
@@ -3918,7 +4184,17 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
 /// The most cells the chips may take in a rule of `room` cells.
 #[must_use]
 pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
-    let reserved = if facts.subscription.is_some() {
+    let reserved = if let Some(progress) = facts.account_progress_view() {
+        rule_width(
+            &[Segment::plain(
+                WALL_MARK,
+                account_progress_text(&progress, true),
+            )],
+            TitleFit::None,
+            false,
+            None,
+        )
+    } else if facts.subscription.is_some() {
         subscription_reservation(facts, room)
     } else {
         rule_width(model_alone(facts).as_slice(), TitleFit::None, false, None)
@@ -3929,6 +4205,26 @@ pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
         0
     };
     room.saturating_sub(beside + 2)
+}
+
+/// Where Claude Code's label zone stands in the composer's TOP rule `row`: the words after the
+/// rule's last `──` (the top-effort key, sandboxed or not, `fast mode`, a session name) with the
+/// blank on either side, up to the rule's closing `─`. `None` where the rule carries no words.
+#[must_use]
+pub fn top_rule_labels(row: &str) -> Option<(usize, usize)> {
+    if !aterm_phase::phase::is_rule(row) {
+        return None;
+    }
+    let chars: Vec<char> = row.trim_end().chars().collect();
+    let n = chars.len();
+    if n < 4 || chars[n - 1] != '\u{2500}' || chars[n - 2] != ' ' {
+        return None;
+    }
+    let zone = (1..n - 2)
+        .rev()
+        .find(|&i| chars[i] == '\u{2500}' && chars[i - 1] == '\u{2500}')?
+        + 1;
+    (chars[zone] == ' ' && chars[zone..n - 1].iter().any(|&c| c != ' ')).then_some((zone, n - 1))
 }
 
 /// Where Claude Code's top-effort tag ([`CLAUDE_TOP_EFFORT_KEY`]) stands in the composer's TOP rule `row`.

@@ -26,11 +26,12 @@ pub struct Report {
     pub unchanged: Vec<String>,
     /// Moved aside before being overwritten: name and where it went.
     pub moved_aside: Vec<(String, PathBuf)>,
-    /// Removed because the vault dropped them or took them back.
+    /// Removed because the vault dropped them or took them back, or because their name is
+    /// reserved ([`crate::reserved_name`]) and a build that did not reserve it wrote the file.
     pub removed: Vec<String>,
-    /// Left in place: dropped (or taken back) by the vault but changed since it wrote them, not
-    /// looked at, or ` if-absent` entries whose target or anchor is the machine's own or whose
-    /// anchor could not be looked at.
+    /// Left in place: dropped (or taken back) by the vault, or a reserved name's file, but
+    /// changed since it wrote them, not looked at, or ` if-absent` entries whose target or
+    /// anchor is the machine's own or whose anchor could not be looked at.
     pub left: Vec<String>,
     /// Not written, or not removed: the name and why (never the value).
     pub failed: Vec<(String, String)>,
@@ -60,11 +61,15 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// Where entry `name` lands under `home`.
 pub fn target_path(home: &Path, name: &str) -> crate::Result<PathBuf> {
-    if crate::commons::reserved_name(name) {
-        return Err(Error::new(
-            "the Commons control record has no plaintext file path",
-        ));
+    if crate::reserved_name(name) {
+        return Err(Error::new("a reserved entry has no plaintext file path"));
     }
+    written_path(home, name)
+}
+
+/// Where entry `name` landed under `home` in a build that did not reserve it: [`target_path`]
+/// without the reserved-name refusal, for taking back the file such a build wrote.
+fn written_path(home: &Path, name: &str) -> crate::Result<PathBuf> {
     if !text::valid_entry_name(name) {
         return Err(Error::new(
             "an invalid entry name: a file name [A-Za-z0-9][A-Za-z0-9._-]{0,127} or a ~/ home path",
@@ -127,14 +132,23 @@ pub fn apply_resuming(
     // Control records stay in the encrypted vault cache. Filtering before any
     // path/standing/pending computation also prevents reporting their keys as
     // ordinary materialization failures or treating them as files to restore.
+    // A reserved name the held manifest still names is a file a build that did not
+    // reserve it wrote (the fleet code before it was reserved): it is taken back below,
+    // once this pass's writes are done, as a dropped entry's file is.
+    let written_reserved: Vec<(String, String)> = held
+        .files
+        .iter()
+        .filter(|(name, _)| crate::reserved_name(name))
+        .map(|(name, digest)| (name.clone(), digest.clone()))
+        .collect();
     let ordinary;
     let entries = if entries
         .iter()
-        .any(|entry| crate::commons::reserved_name(&entry.name))
+        .any(|entry| crate::reserved_name(&entry.name))
     {
         ordinary = entries
             .iter()
-            .filter(|entry| !crate::commons::reserved_name(&entry.name))
+            .filter(|entry| !crate::reserved_name(&entry.name))
             .cloned()
             .collect::<Vec<_>>();
         ordinary.as_slice()
@@ -145,7 +159,7 @@ pub fn apply_resuming(
         files: held
             .files
             .iter()
-            .filter(|(name, _)| !crate::commons::reserved_name(name))
+            .filter(|(name, _)| !crate::reserved_name(name))
             .map(|(name, digest)| (name.clone(), digest.clone()))
             .collect(),
     };
@@ -181,7 +195,15 @@ pub fn apply_resuming(
         .collect();
     let standings = standings(&places, entries, held, &history);
     let pending = to_write(&places, entries, held, &history, &standings);
-    ahead(held, &pending)?;
+    if written_reserved.is_empty() {
+        ahead(held, &pending)?;
+    } else {
+        // Saved ahead with the reserved names' records, so a pass cut short leaves their files
+        // for the next pass to take back.
+        let mut kept = held.clone();
+        kept.files.extend(written_reserved.iter().cloned());
+        ahead(&kept, &pending)?;
+    }
     let mut manifest = Manifest::default();
     let mut report = Report::default();
     let mut claimed: BTreeMap<(u64, u64), String> = BTreeMap::new();
@@ -319,27 +341,73 @@ pub fn apply_resuming(
             report.left.push(name.clone());
             continue;
         }
-        match fsx::kind(&target) {
-            Ok(Kind::Missing) => {}
-            Ok(Kind::File) => match fsx::wipe_if(&target, text::MAX_VALUE, |bytes| {
-                digest_hex(bytes) == *digest
-            }) {
-                Ok(true) => report.removed.push(name.clone()),
-                Ok(false) => report.left.push(name.clone()),
-                Err(error) => {
-                    manifest.files.insert(name.clone(), digest.clone());
-                    report.failed.push((name.clone(), error.0));
-                }
-            },
-            Ok(Kind::Symlink | Kind::Dir | Kind::Other) => report.left.push(name.clone()),
-            Err(_) if under_a_file(home, name) => {}
-            Err(error) => {
-                manifest.files.insert(name.clone(), digest.clone());
-                report.failed.push((name.clone(), error.0));
+        take_back(home, name, &target, digest).book(name, digest, &mut manifest, &mut report);
+    }
+    // A reserved name's file is never the vault's to keep: removed while it holds what the
+    // vault wrote, left (and out of the manifest) once the person changed it or where this
+    // pass does not look, and kept in the manifest only when its removal failed, so the next
+    // pass tries again.
+    for (name, digest) in &written_reserved {
+        let Ok(target) = written_path(home, name) else {
+            continue;
+        };
+        let id = fsx::file_id(&target);
+        if id.is_some_and(|id| claimed.contains_key(&id)) {
+            continue;
+        }
+        if !places.reachable(name) || id.is_some_and(|id| spared.contains(&id)) {
+            report.left.push(name.clone());
+            continue;
+        }
+        take_back(home, name, &target, digest).book(name, digest, &mut manifest, &mut report);
+    }
+    Ok((manifest, report))
+}
+
+/// What [`take_back`] did with a file the vault wrote and no longer places.
+enum TakenBack {
+    /// Gone already, or under a file where no file can be.
+    Gone,
+    /// Held what the vault wrote, and removed.
+    Removed,
+    /// Changed since the vault wrote it, or not a plain file: left as it is.
+    Left,
+    /// Could not be looked at or removed: why.
+    Failed(String),
+}
+
+impl TakenBack {
+    /// Book what happened to entry `name`'s file, which the vault wrote with digest `digest`:
+    /// a failed removal keeps the record, so the next pass tries again.
+    fn book(self, name: &str, digest: &str, manifest: &mut Manifest, report: &mut Report) {
+        match self {
+            TakenBack::Gone => {}
+            TakenBack::Removed => report.removed.push(name.to_owned()),
+            TakenBack::Left => report.left.push(name.to_owned()),
+            TakenBack::Failed(why) => {
+                manifest.files.insert(name.to_owned(), digest.to_owned());
+                report.failed.push((name.to_owned(), why));
             }
         }
     }
-    Ok((manifest, report))
+}
+
+/// Remove `target`, entry `name`'s file under `home`, if it still holds the value of digest
+/// `digest`; never through a link.
+fn take_back(home: &Path, name: &str, target: &Path, digest: &str) -> TakenBack {
+    match fsx::kind(target) {
+        Ok(Kind::Missing) => TakenBack::Gone,
+        Ok(Kind::File) => {
+            match fsx::wipe_if(target, text::MAX_VALUE, |bytes| digest_hex(bytes) == digest) {
+                Ok(true) => TakenBack::Removed,
+                Ok(false) => TakenBack::Left,
+                Err(error) => TakenBack::Failed(error.0),
+            }
+        }
+        Ok(Kind::Symlink | Kind::Dir | Kind::Other) => TakenBack::Left,
+        Err(_) if under_a_file(home, name) => TakenBack::Gone,
+        Err(error) => TakenBack::Failed(error.0),
+    }
 }
 
 /// Flush once each directory this pass's writes renamed files into (`written_in`), after their
@@ -888,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn commons_control_is_not_materialized_resumed_reported_or_removed() {
+    fn commons_control_is_not_materialized_or_resumed_and_a_changed_copy_stays() {
         let root = scratch();
         let name = crate::commons::ENTRY;
         let entries = [
@@ -900,7 +968,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         plant(&path, b"an existing local file", 0o600);
         let held = Manifest {
-            files: BTreeMap::from([(name.into(), digest_hex(b"an existing local file"))]),
+            files: BTreeMap::from([(name.into(), digest_hex(b"what an older build wrote"))]),
         };
         let resumed = Pending::from([(name.into(), digest_hex(b"inert control key"))]);
         let (manifest, report) = apply_resuming(
@@ -910,7 +978,11 @@ mod tests {
             &resumed,
             1,
             &mut |held, pending| {
-                assert!(!held.files.contains_key(name));
+                assert_eq!(
+                    held.files.get(name),
+                    Some(&digest_hex(b"what an older build wrote")),
+                    "saved ahead with the record, for a pass cut short"
+                );
                 assert!(!pending.contains_key(name));
                 Ok(())
             },
@@ -918,6 +990,11 @@ mod tests {
         .unwrap();
         assert_eq!(read(&path), b"an existing local file");
         assert_eq!(report.written, ["ordinary"]);
+        assert_eq!(
+            report.left,
+            [name],
+            "a copy changed since it was written stays"
+        );
         assert!(
             report.removed.is_empty() && report.failed.is_empty() && report.moved_aside.is_empty()
         );
@@ -937,6 +1014,99 @@ mod tests {
             !empty.path().join(".secrets").join(name).exists(),
             "a control record never creates a plaintext key file"
         );
+    }
+
+    /// Reserved names a build that did not reserve them could write as files, by the spelling
+    /// its manifest held (a `~/.secrets/` spelling was never a valid entry name).
+    const RESERVED_COPIES: [&str; 3] = [
+        "aterm-fleet-code",
+        "ATERM-FLEET-CODE",
+        crate::commons::ENTRY,
+    ];
+
+    #[test]
+    fn a_reserved_file_an_older_build_wrote_is_removed_while_it_holds_what_it_wrote() {
+        for name in RESERVED_COPIES {
+            let root = scratch();
+            let path = root.path().join(".secrets").join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let held = Manifest {
+                files: BTreeMap::from([
+                    (name.into(), digest_hex(b"inert reserved value")),
+                    ("ordinary".into(), digest_hex(b"ordinary value")),
+                ]),
+            };
+            plant(
+                &root.path().join(".secrets/ordinary"),
+                b"ordinary value",
+                0o600,
+            );
+            // Whether the vault still holds the entry (in place now) or dropped it, the file an
+            // older build wrote goes, and the manifest forgets the name.
+            for entries in [
+                vec![
+                    entry("ordinary", b"ordinary value"),
+                    entry(name, b"inert reserved value"),
+                ],
+                vec![entry("ordinary", b"ordinary value")],
+            ] {
+                plant(&path, b"inert reserved value", 0o600);
+                let (manifest, report) = apply(root.path(), &entries, &held, 1).unwrap();
+                assert!(!path.exists(), "{name}: {report:?}");
+                assert_eq!(report.removed, [name], "{name}");
+                assert!(
+                    report.failed.is_empty() && report.left.is_empty(),
+                    "{name}: {report:?}"
+                );
+                assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["ordinary"]);
+                assert_eq!(
+                    read(&root.path().join(".secrets/ordinary")),
+                    b"ordinary value"
+                );
+                let (again, report) = apply(root.path(), &entries, &manifest, 2).unwrap();
+                assert_eq!(again, manifest, "{name}");
+                assert!(
+                    report.removed.is_empty() && report.left.is_empty(),
+                    "{name}: {report:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reserved_file_the_person_changed_or_linked_stays_and_is_forgotten() {
+        for name in RESERVED_COPIES {
+            let root = scratch();
+            let path = root.path().join(".secrets").join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let held = Manifest {
+                files: BTreeMap::from([(name.into(), digest_hex(b"inert reserved value"))]),
+            };
+            plant(&path, b"the person's own value", 0o600);
+            let (manifest, report) = apply(root.path(), &[], &held, 1).unwrap();
+            assert_eq!(read(&path), b"the person's own value", "{name}");
+            assert_eq!(report.left, [name], "{name}");
+            assert!(
+                report.removed.is_empty() && report.failed.is_empty(),
+                "{name}"
+            );
+            assert!(manifest.files.is_empty(), "{name}: {manifest:?}");
+            // A link in the file's place is never followed, whatever it reaches.
+            std::fs::remove_file(&path).unwrap();
+            let reached = root.path().join("reached");
+            plant(&reached, b"inert reserved value", 0o600);
+            std::os::unix::fs::symlink(&reached, &path).unwrap();
+            let (manifest, report) = apply(root.path(), &[], &held, 2).unwrap();
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(read(&reached), b"inert reserved value", "{name}");
+            assert_eq!(report.left, [name], "{name}");
+            assert!(manifest.files.is_empty(), "{name}: {manifest:?}");
+        }
     }
 
     fn mode(path: &Path) -> u32 {

@@ -8,11 +8,13 @@ use aterm_json::Value;
 
 use crate::client::{Accept, Call, Github, method_refusal};
 use crate::error::{Error, IdentityRef, Result};
+use crate::journal::IntentStore;
 use crate::model::{UserObject, from_json};
 use crate::page::{End, LinkScope, ListOpts};
-use crate::policy::{RouteRequest, RouteTarget};
+use crate::policy::{Access, Permit, RouteRequest, RouteTarget};
 use crate::slug::Slug;
 use crate::wire::Method;
+use crate::write::Outcome;
 
 /// `agh api`.
 pub struct Raw<'a> {
@@ -285,5 +287,61 @@ impl<'a> Raw<'a> {
             pages: listing.pages,
         };
         Ok((outcome, listing.end))
+    }
+}
+
+/// One `agh api` write.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct RawSend {
+    /// POST, PATCH, PUT or DELETE.
+    pub method: Method,
+    /// The path, starting with `/`, as typed.
+    pub path: String,
+    /// The JSON body `-f` and `-F` built, or none.
+    pub body: Option<aterm_json::Value>,
+    /// The Accept header, when given.
+    pub accept: Option<String>,
+    /// How it is routed: always `Access::Write`.
+    pub route: RouteRequest,
+    /// `--include`.
+    pub include: bool,
+}
+
+impl RawSend {
+    /// A write of `method` to `path`, routed by `route` (its access set to Write).
+    #[must_use]
+    pub fn new(method: Method, path: &str, route: RouteRequest) -> RawSend {
+        RawSend {
+            method,
+            path: path.to_string(),
+            body: None,
+            accept: None,
+            route: RouteRequest {
+                access: Access::Write,
+                ..route
+            },
+            include: false,
+        }
+    }
+}
+
+impl Raw<'_> {
+    /// One write, sent once and never retried. A POST is one-shot and journaled
+    /// (`WriteOp::Api`, key `api POST {path}`) through `intents`; PATCH, PUT and DELETE are
+    /// not journaled and `intents` is not called.
+    ///
+    /// # Errors
+    ///
+    /// Usage for a read method (`Raw::get` takes it); `Raw::get`'s path scope rules; the
+    /// pipeline's errors.
+    pub fn send(
+        &self,
+        permit: &Permit,
+        req: &RawSend,
+        intents: &dyn IntentStore,
+    ) -> Result<Outcome<RawOutcome>> {
+        let _ = (self.gh, permit, req, intents);
+        Err(Error::not_yet("api writes", "WP3"))
     }
 }

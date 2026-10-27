@@ -30,6 +30,7 @@ pub(crate) type MatchPositions = [usize; MAX_CONTEXT_LENGTH];
 pub(crate) type MatchFn<'a> = dyn Fn(GlyphId, u16) -> bool + 'a;
 
 pub(crate) struct ApplyContext<'a, 'f> {
+    table_index: usize,
     pub(crate) face: &'a ShapeFace<'f>,
     pub(crate) buffer: &'a mut Buffer,
     lookup_mask: u32,
@@ -40,14 +41,22 @@ pub(crate) struct ApplyContext<'a, 'f> {
     pub(crate) auto_zwj: bool,
     pub(crate) random: bool,
     random_state: u32,
+    pub(crate) last_base: i32,
+    pub(crate) last_base_until: u32,
     /// The glyphs the buffer may hold (grown as substitutions add glyphs).
     pub(crate) digest: Digest,
 }
 
 impl<'a, 'f> ApplyContext<'a, 'f> {
     #[inline]
-    pub(crate) fn new(face: &'a ShapeFace<'f>, buffer: &'a mut Buffer, digest: Digest) -> Self {
+    pub(crate) fn new(
+        table_index: usize,
+        face: &'a ShapeFace<'f>,
+        buffer: &'a mut Buffer,
+        digest: Digest,
+    ) -> Self {
         ApplyContext {
+            table_index,
             face,
             buffer,
             lookup_mask: 1,
@@ -58,6 +67,8 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
             auto_zwj: true,
             random: false,
             random_state: 1,
+            last_base: -1,
+            last_base_until: 0,
             digest,
         }
     }
@@ -71,6 +82,8 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
     #[inline]
     pub(crate) const fn set_lookup_mask(&mut self, mask: u32) {
         self.lookup_mask = mask;
+        self.last_base = -1;
+        self.last_base_until = 0;
     }
 
     #[inline]
@@ -92,10 +105,17 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
         let saved_index = self.lookup_index;
         self.lookup_index = index;
         let face = self.face;
-        let applied = face.gsub_lookup(index).and_then(|lookup| {
-            self.lookup_props = lookup.props;
-            super::gsub::apply_lookup(self, lookup)
-        });
+        let applied = if self.table_index == super::map::GSUB {
+            face.gsub_lookup(index).and_then(|lookup| {
+                self.lookup_props = lookup.props;
+                super::gsub::apply_lookup(self, lookup)
+            })
+        } else {
+            face.gpos_lookup(index).and_then(|lookup| {
+                self.lookup_props = lookup.props;
+                super::gpos::apply_lookup(self, lookup)
+            })
+        };
         self.lookup_props = saved_props;
         self.lookup_index = saved_index;
         self.nesting_level_left += 1;
@@ -179,7 +199,7 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
-enum Outcome {
+pub(crate) enum Outcome {
     Match,
     NoMatch,
     Skip,
@@ -204,6 +224,7 @@ pub(crate) struct SkippyIter<'a, 'b, 'f> {
     lookup_props: u32,
     ignore_zwnj: bool,
     ignore_zwj: bool,
+    ignore_hidden: bool,
     mask: u32,
     matching: Option<&'a MatchFn<'a>>,
     buf_len: usize,
@@ -217,8 +238,9 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
         SkippyIter {
             ctx,
             lookup_props: ctx.lookup_props,
-            ignore_zwnj: context_match && ctx.auto_zwnj,
+            ignore_zwnj: ctx.table_index == super::map::GPOS || (context_match && ctx.auto_zwnj),
             ignore_zwj: context_match || ctx.auto_zwj,
+            ignore_hidden: ctx.table_index == super::map::GPOS,
             mask: if context_match {
                 u32::MAX
             } else {
@@ -229,6 +251,11 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
             glyph_data: 0,
             buf_idx: start,
         }
+    }
+
+    #[inline]
+    pub(crate) const fn set_lookup_props(&mut self, props: u32) {
+        self.lookup_props = props;
     }
 
     #[inline]
@@ -280,7 +307,7 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
     }
 
     #[inline]
-    fn match_(&self, info: &GlyphInfo) -> Outcome {
+    pub(crate) fn match_(&self, info: &GlyphInfo) -> Outcome {
         let skip = self.may_skip(info);
         if skip == MaySkip::Yes {
             return Outcome::Skip;
@@ -320,7 +347,7 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
         if is_default_ignorable_info(info)
             && (self.ignore_zwnj || !is_zwnj(info))
             && (self.ignore_zwj || !is_zwj(info))
-            && !is_hidden(info)
+            && (self.ignore_hidden || !is_hidden(info))
         {
             return MaySkip::Maybe;
         }

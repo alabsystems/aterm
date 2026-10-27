@@ -20,13 +20,18 @@ mod admission;
 mod creation;
 mod enrollment;
 mod entry;
+mod fleet;
+mod foundation;
 mod inspection;
 mod locker_skew;
+mod release;
 mod retirement;
 use admin_keys::parse_admin;
 pub use admission::{Evidence as AdmissionEvidence, Method as AdmissionMethod};
 pub use enrollment::admin_cached;
 pub use entry::{EntrySnapshot, VerifiedEntry, read_account_bound_entry, read_verified_entry};
+pub use fleet::{FLEET_CODE_ENTRY, admin_publish_alab_fleet, alab_fleet_code};
+pub use foundation::{CommonsInit, admin_commons_init};
 pub use inspection::CommonsControlInspection;
 pub use retirement::{Retirement, Revocation, admin_retire, admin_revoke};
 #[cfg(test)]
@@ -85,6 +90,18 @@ impl Paths {
 
     fn answered_file(&self) -> PathBuf {
         self.dir.join("answered")
+    }
+
+    /// The queue file of the approver's record ([`read_answered`]), beside its requests so a
+    /// build before it, which reads `answered` under 64 KiB, always reads them whole.
+    fn answered_queue_file(&self) -> PathBuf {
+        self.dir.join("answered-queue")
+    }
+
+    /// The requests this Mac let in by code ([`record_approved`]): written only by an approval,
+    /// read by the approver, so no write of one undoes the other's.
+    fn answered_approved_file(&self) -> PathBuf {
+        self.dir.join("answered-approved")
     }
 
     fn stuck_file(&self, pid: u32) -> PathBuf {
@@ -181,6 +198,27 @@ pub struct Status {
     pub membership: Membership,
     /// The entry names materialized here.
     pub names: Vec<String>,
+}
+
+impl Status {
+    /// The command an admin Mac runs to let this Mac in while it waits to join: its code for a
+    /// vault at a URL, whose server queues the request, or its key and name for a vault at a
+    /// path, which has no queue (`aterm secrets approve <age1…> --name <host>`). `None` with no
+    /// key yet.
+    pub fn approve_command(&self) -> Option<String> {
+        let (recipient, code) = self.machine.as_ref()?;
+        Some(match &self.config {
+            Some(Config {
+                source: Source::Path(_),
+                host,
+                ..
+            }) => format!(
+                "aterm secrets approve {} --name {host}",
+                recipient.to_bech32()
+            ),
+            _ => format!("aterm secrets approve {code}"),
+        })
+    }
 }
 
 /// How a join should behave.
@@ -760,7 +798,8 @@ struct State {
     /// The tag ([`join::proof_tag`]) of a proof an admin Mac's verdict refused
     /// ([`read_verdict`]).
     refused: Option<String>,
-    /// The last apply left a file unwritten: the next fetch of the same version applies again.
+    /// The last apply left a file of one of the vault's entries unwritten ([`apply_failed`]):
+    /// the next fetch of the same version applies again.
     failed: bool,
     manifest: Manifest,
     /// Entry name → digest of each value a pass is to write, saved before it writes and cleared
@@ -967,6 +1006,23 @@ pub fn status(paths: &Paths) -> crate::Result<Status> {
     })
 }
 
+/// The files the vault wrote on this Mac, each at its path under `paths.home`
+/// ([`materialize::target_path`]): its manifest's entries, and those a pass that was cut short
+/// was writing. Read from local state alone: no key, source or written file is read, and a Mac
+/// with no vault has none.
+/// # Errors
+/// The vault's local state cannot be read.
+pub fn delivered_files(paths: &Paths) -> crate::Result<BTreeSet<PathBuf>> {
+    let state = load_state(paths)?;
+    Ok(state
+        .manifest
+        .files
+        .keys()
+        .chain(state.pending.keys())
+        .filter_map(|name| materialize::target_path(&paths.home, name).ok())
+        .collect())
+}
+
 /// Whether this machine's join request included a join-password proof.
 pub fn asked_with_password(paths: &Paths) -> bool {
     load_state(paths).is_ok_and(|state| state.proof.is_some())
@@ -1122,6 +1178,34 @@ pub struct Materialized<T> {
     pub snapshot: MaterializationSnapshot,
 }
 
+/// Why one guarded local materialization observation could not read its inputs.
+/// These reasons reveal no entry names, credentials, paths or source payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaterializationBlocker {
+    /// A shared observation lock could not be taken; it may be busy or absent.
+    LockUnavailable,
+    /// No vault source is configured under the observation lock.
+    Unconfigured,
+    /// The configured source no longer equals the caller's expected source.
+    ConfigChanged,
+    /// The configured signing authority is not admitted.
+    UntrustedPin,
+    /// The current local state records no admitted vault membership.
+    NotAdmitted,
+    /// The current local state records revoked vault membership.
+    Revoked,
+    /// The applied state is not bound to the configured source and signing identity.
+    SourceChanged,
+    /// Apply, signed cache or tracked files are not complete and intact.
+    LocalFilesIncomplete,
+}
+
+/// A local readiness verdict taken under the same guard as its successful input read.
+pub enum MaterializationObservation<T> {
+    Ready(Box<Materialized<T>>),
+    Blocked(MaterializationBlocker),
+}
+
 /// How long [`MaterializationSnapshot::is_current`] waits for a writer holding the state lock.
 const CURRENT_WAIT: Duration = Duration::from_secs(30);
 
@@ -1178,17 +1262,24 @@ pub fn with_materialization_ready<T>(
     expected: &Config,
     read: impl FnOnce() -> crate::Result<T>,
 ) -> crate::Result<Option<Materialized<T>>> {
-    with_ready_state(paths, Some(expected), files_intact, |config, state| {
-        Ok(Materialized {
-            inputs: read()?,
-            snapshot: MaterializationSnapshot {
-                config,
-                seq: state.seq,
-                digest: state.digest,
-                manifest: state.manifest,
-            },
-        })
+    observe_materialization(paths, expected, read).map(|observation| match observation {
+        MaterializationObservation::Ready(inputs) => Some(*inputs),
+        MaterializationObservation::Blocked(_) => None,
     })
+}
+
+/// Observe readiness and read local inputs under one shared state lock.
+/// `read` runs only when the configured vault still equals `expected` and its
+/// materialization passes the ordinary readiness guard. It must perform only
+/// local reads, with no network, subprocesses or other effects.
+/// # Errors
+/// The local configuration/state or the supplied input reader fails.
+pub fn observe_materialization<T>(
+    paths: &Paths,
+    expected: &Config,
+    read: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<MaterializationObservation<T>> {
+    with_ready_state(paths, Some(expected), files_intact, read)
 }
 
 fn materialization_ready_with(
@@ -1196,32 +1287,54 @@ fn materialization_ready_with(
     expected: Option<&Config>,
     intact: impl FnOnce(&Paths, &State) -> bool,
 ) -> crate::Result<bool> {
-    Ok(with_ready_state(paths, expected, intact, |_, _| Ok(()))?.is_some())
+    Ok(matches!(
+        with_ready_state(paths, expected, intact, || Ok(()))?,
+        MaterializationObservation::Ready(_)
+    ))
 }
 
 fn with_ready_state<T>(
     paths: &Paths,
     expected: Option<&Config>,
     intact: impl FnOnce(&Paths, &State) -> bool,
-    read: impl FnOnce(Config, State) -> crate::Result<T>,
-) -> crate::Result<Option<T>> {
+    read: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<MaterializationObservation<T>> {
+    use MaterializationBlocker as Blocker;
+    let blocked = |why| Ok(MaterializationObservation::Blocked(why));
     let Some(_observation) = StateLock::observe(paths)? else {
-        return Ok(None);
+        return blocked(Blocker::LockUnavailable);
     };
     let Some(config) = config(paths)? else {
-        return Ok(None);
+        return blocked(Blocker::Unconfigured);
     };
-    if expected.is_some_and(|expected| *expected != config) || !pin_admitted(&config, None) {
-        return Ok(None);
+    if expected.is_some_and(|expected| *expected != config) {
+        return blocked(Blocker::ConfigChanged);
+    }
+    if !pin_admitted(&config, None) {
+        return blocked(Blocker::UntrustedPin);
     }
     let state = load_state(paths)?;
-    if !(matches!(state.membership, Stored::In | Stored::Plain)
-        && source_bound(&config, &state)
-        && intact(paths, &state))
-    {
-        return Ok(None);
+    if state.membership == Stored::Revoked {
+        return blocked(Blocker::Revoked);
     }
-    read(config, state).map(Some)
+    if !matches!(state.membership, Stored::In | Stored::Plain) {
+        return blocked(Blocker::NotAdmitted);
+    }
+    if !source_bound(&config, &state) {
+        return blocked(Blocker::SourceChanged);
+    }
+    if !intact(paths, &state) {
+        return blocked(Blocker::LocalFilesIncomplete);
+    }
+    Ok(MaterializationObservation::Ready(Box::new(Materialized {
+        inputs: read()?,
+        snapshot: MaterializationSnapshot {
+            config,
+            seq: state.seq,
+            digest: state.digest,
+            manifest: state.manifest,
+        },
+    })))
 }
 
 fn open_lockers(envelope: &Envelope, identity: &Identity) -> crate::Result<Option<Vec<Entry>>> {
@@ -1768,6 +1881,18 @@ fn missing(config: &Config) -> Error {
     ))
 }
 
+/// Whether a pass left one of the vault's own entries unapplied ([`State::failed`], which
+/// keeps every read of the applied copy back). A reserved name's file an older build wrote whose
+/// removal failed is reported failed and kept in the manifest, so the next pass tries again, but
+/// every entry the vault holds is in place: it keeps no read back (the fleet code, the Commons
+/// control).
+fn apply_failed(report: &Report) -> bool {
+    report
+        .failed
+        .iter()
+        .any(|(name, _)| !crate::reserved_name(name))
+}
+
 const fn quiet(report: &Report) -> bool {
     report.written.is_empty()
         && report.removed.is_empty()
@@ -1957,7 +2082,7 @@ fn apply_fetched_repairing(
         }
         let report = apply_entries(paths, &mut state, &entries)?;
         state.membership = Stored::Plain;
-        state.failed = !report.failed.is_empty();
+        state.failed = apply_failed(&report);
         state.source_identity = (!state.failed).then(|| source_identity(&config));
         state.heard = now();
         save_state(paths, &state)?;
@@ -2055,7 +2180,7 @@ fn apply_fetched_repairing(
     };
     let report = apply_entries(paths, &mut state, &entries)?;
     state.membership = Stored::In;
-    state.failed = !report.failed.is_empty();
+    state.failed = apply_failed(&report);
     state.source_identity = (!state.failed).then(|| source_identity(&config));
     save_state(paths, &state)?;
     Ok(SyncOutcome::Applied {
@@ -2306,15 +2431,50 @@ fn put_back_due(
     due
 }
 
-fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
-    subscriber_loop_until(paths, log, &|| false)
+/// Start the converge pass's runner for the subscriber (`crate::converge::start`, `--trigger
+/// subscriber`) without waiting for it: the pass runs `aterm fleet sync`'s work among its items,
+/// and a dial of the fleet's issuer must never hold up this long-poll (or, on an admin Mac, the
+/// approver beside it).
+#[cfg(not(test))]
+fn start_converge(exe: &Path, log: &dyn Fn(&str)) -> Option<aterm_uds::spawnfd::Child> {
+    crate::converge::start(exe, "subscriber")
+        .map_err(|error| log(&format!("could not start the converge pass: {error}")))
+        .ok()
 }
 
-/// [`subscriber_loop`], ending at the top of a round once `stop` says so (a test's end).
+/// A test build's live subscriber starts no runner: the test binary is no aterm. A test hands
+/// [`subscriber_loop_until`] a [`Converging`] of its own.
+#[cfg(test)]
+fn start_converge(_exe: &Path, _log: &dyn Fn(&str)) -> Option<aterm_uds::spawnfd::Child> {
+    None
+}
+
+/// How the subscriber's loop starts the converge pass's runner, and reads the routes its due
+/// check compares ([`crate::converge::Due`]): [`start_converge`] and
+/// [`crate::server::route_sources`], or a test's own.
+struct Converging<'a> {
+    /// Start the runner of the program at this path, without waiting for it.
+    start: &'a dyn Fn(&Path) -> Option<aterm_uds::spawnfd::Child>,
+    /// This Mac's routes.
+    routes: &'a dyn Fn() -> crate::converge::Routes,
+}
+
+fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
+    let start = |exe: &Path| start_converge(exe, log);
+    let converging = Converging {
+        start: &start,
+        routes: &crate::server::route_sources,
+    };
+    subscriber_loop_until(paths, log, &|| false, &converging)
+}
+
+/// [`subscriber_loop`], ending at the top of a round once `stop` says so (a test's end), its
+/// converge runner started and its routes read through `converging`.
 fn subscriber_loop_until(
     paths: &Paths,
     log: &(dyn Fn(&str) + Sync),
     stop: &dyn Fn() -> bool,
+    converging: &Converging<'_>,
 ) -> crate::Result<()> {
     let mut backoff = Duration::from_secs(5);
     let mut failing = FIRST_RETRY;
@@ -2325,10 +2485,31 @@ fn subscriber_loop_until(
     let exe = std::env::current_exe().ok();
     let stamp = || exe.as_deref().and_then(crate::server::stamp_of);
     let program = stamp();
+    // The converge pass's runner: started as this subscriber starts (after an update replaced
+    // its program, launchd starts it again), after each version it applies, and when a healthy
+    // round finds it due; one at a time, never waited for.
+    let mut converge = crate::converge::Due::default();
+    let mut runner: Option<aterm_uds::spawnfd::Child> = None;
+    let converge_if = |due: bool, runner: &mut Option<aterm_uds::spawnfd::Child>| {
+        if let (true, Some(exe)) = (due, exe.as_deref()) {
+            *runner = (converging.start)(exe);
+        }
+    };
+    let now_ms = || aterm_time::unix_millis().unwrap_or(0);
+    let due = converge.at_start(
+        now_ms(),
+        (converging.routes)(),
+        crate::converge::Last::of(runner.as_mut()),
+    );
+    converge_if(due, &mut runner);
     loop {
         if stop() {
             return Ok(());
         }
+        // Every round, healthy or not, reaps a runner that ended (how it ended is kept for the
+        // next healthy round's due check): one started while the vault cannot be reached is no
+        // zombie for as long as that lasts.
+        let _ = crate::converge::Last::of(runner.as_mut());
         if crate::server::replaced(program, stamp()) {
             log("this program was replaced on disk; exiting so the service starts the new one");
             return Ok(());
@@ -2350,6 +2531,21 @@ fn subscriber_loop_until(
                 if let Some(line) = pass_line(paths, &config, &outcome, &mut repeated) {
                     log(&line);
                 }
+                if matches!(&outcome, SyncOutcome::Applied { .. }) {
+                    match release::materialize_notary(paths) {
+                        Ok(Some(line)) => log(line),
+                        Ok(None) => {}
+                        Err(error) => log(&format!("notary provisioning: {error}")),
+                    }
+                }
+                // A version applied, or (its own route read) moved routes or the recheck.
+                let due = converge.after_pass(
+                    &outcome,
+                    now_ms(),
+                    (converging.routes)(),
+                    crate::converge::Last::of(runner.as_mut()),
+                );
+                converge_if(due, &mut runner);
                 ask_again_if_due(paths, &config, log);
                 // A verdict that ended the long-poll.
                 heed_verdict(paths, log);
@@ -2720,6 +2916,40 @@ fn still_answered(
         .collect()
 }
 
+/// The requests in `pending` from keys on `code-only` lines now (`named`) that the record did
+/// not know on one when its last judged pass of the queue read the vault (`known`), as answered,
+/// save those this approver showed as asking at the version just before (`shown`). An approver
+/// records a request as answered only when it read it while its key was in the vault, so one
+/// that never did (a new admin Mac, the first run of a build with the record, or one that was
+/// off, asleep or no admin while another admin let that Mac in and go) would take the request
+/// that let the Mac in, still queued after a version let it go, for an ask, and show a person a
+/// Mac nobody runs, whose Approve lets it back in. A `code-only` line names a key a version let
+/// go (or one held as the vault opened), so the request it has standing when the line appears is
+/// most often no ask. One that is (a Mac held as the vault opened while this approver did not
+/// read the version before, or one let go that already asked again) is shown once the server
+/// moves its time: a changed request at once, an unchanged one hourly. A key already named stays
+/// as it was: a Mac held and shown is still shown after a restart. A Mac let go that asks again,
+/// with the renewed join password, before this approver reads the version that let it go is held
+/// so too, and let in once its time moves: a proof alone never says when it was made, since an
+/// admin may set an earlier password again.
+fn code_only_standing(
+    named: &std::collections::BTreeSet<String>,
+    known: &std::collections::BTreeSet<String>,
+    shown: &[Asking],
+    pending: &[Request],
+) -> Vec<Answered> {
+    pending
+        .iter()
+        .filter(|request| named.contains(&request.recipient) && !known.contains(&request.recipient))
+        .filter(|request| {
+            !shown
+                .iter()
+                .any(|asking| asking.recipient == request.recipient)
+        })
+        .filter_map(Answered::of)
+        .collect()
+}
+
 /// What the approver keeps from one pass to the next.
 #[derive(Default)]
 struct Approver {
@@ -2747,6 +2977,13 @@ struct Approver {
     /// The join requests the vault answered that are still queued ([`Answered`]), kept in
     /// their record ([`write_answered`]) so an approver started again knows them too.
     answered: std::collections::BTreeSet<Answered>,
+    /// The join queue this approver's record of answered requests was begun on ([`queue_of`]):
+    /// a judged pass of another sets it.
+    begun: Option<String>,
+    /// The keys on `code-only` lines in the version this approver's last judged pass of
+    /// `begun`'s queue read, kept in its record: a key a later version names was let go (or
+    /// held) since, and its standing request is seeded as answered ([`code_only_standing`]).
+    seen: std::collections::BTreeSet<String>,
     /// Whether `answered` differs from its record, which a failed write left behind.
     answered_unwritten: bool,
     /// The join queue as last heard ([`hear_joins`]).
@@ -2784,32 +3021,46 @@ impl JoinKeys {
 impl Approver {
     /// An approver that knows the join requests its earlier runs found answered.
     fn resumed(paths: &Paths) -> Approver {
+        let record = read_answered(paths);
         Approver {
-            answered: read_answered(paths),
+            answered: record.answered,
+            begun: record.begun,
+            seen: record.seen,
             ..Approver::default()
         }
     }
 
-    /// Keep `answered` in its record when it changed, or when the last write failed.
+    /// Keep `answered`, read from the join queue `queue` ([`queue_of`]) at a version whose
+    /// `code-only` lines name `seen`, in its record when any of them changed, or when the last
+    /// write failed.
     fn keep_answered(
         &mut self,
         paths: &Paths,
         log: &dyn Fn(&str),
         answered: std::collections::BTreeSet<Answered>,
+        queue: String,
+        seen: std::collections::BTreeSet<String>,
     ) {
-        if self.answered == answered && !self.answered_unwritten {
+        if self.answered == answered
+            && self.begun.as_deref() == Some(queue.as_str())
+            && self.seen == seen
+            && !self.answered_unwritten
+        {
             return;
         }
         self.answered = answered;
-        self.answered_unwritten = match write_answered(paths, &self.answered) {
-            Ok(()) => false,
-            Err(error) => {
-                log(&format!(
-                    "could not record the join requests the vault answered: {error}"
-                ));
-                true
-            }
-        };
+        self.begun = Some(queue);
+        self.seen = seen;
+        self.answered_unwritten =
+            match write_answered(paths, &self.answered, self.begun.as_deref(), &self.seen) {
+                Ok(()) => false,
+                Err(error) => {
+                    log(&format!(
+                        "could not record the join requests the vault answered: {error}"
+                    ));
+                    true
+                }
+            };
     }
 
     /// Keep `asking` in the record an admin Mac's aterm reads ([`asking`]) when it changed.
@@ -2999,11 +3250,32 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
     if judging {
         let mut publishing = false;
         let mut answered = approver.answered.clone();
+        // What this Mac's own approvals by code recorded ([`record_approved`]).
+        answered.extend(read_approved(paths));
+        let queue = queue_of(&config);
+        // Keys named before are known only on the queue the record was begun on.
+        let known = if approver.begun.as_deref() == Some(queue.as_str()) {
+            approver.seen.clone()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        // A Mac this approver showed at the version just before this one was held as its line
+        // appeared, since one version cannot both let a Mac in and let it go; across more
+        // versions it may have come and gone since, and is seeded like any key named anew.
+        let shown = match &approver.listed {
+            Some((last, ..)) if seq <= last.saturating_add(1) => {
+                approver.told.clone().unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        let mut seen = std::collections::BTreeSet::new();
         let keys = &mut approver.keys;
         let done = admin_open(paths).and_then(|admin| {
             if admin.config != config || admin.seq != seq {
                 return Err(Error::new("the vault changed while checking approval"));
             }
+            seen = admin.published_doc.code_only().into_iter().collect();
+            answered.extend(code_only_standing(&seen, &known, &shown, &pending));
             auto_approve_listed(
                 paths,
                 &admin,
@@ -3015,7 +3287,7 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
         });
         match done {
             Ok(mut done) => {
-                approver.keep_answered(paths, log, answered);
+                approver.keep_answered(paths, log, answered, queue, seen);
                 // Read against the record this pass left, so the next pass rests.
                 approver.listed = Some((seq, judged, still_answered(&pending, &approver.answered)));
                 approver.tell(paths, log, std::mem::take(&mut done.asking));
@@ -3142,7 +3414,12 @@ pub struct AutoApproved {
 /// Approve and publish all queued requests eligible under the vault's `[join]` policy.
 pub fn auto_approve(paths: &Paths) -> crate::Result<AutoApproved> {
     let admin = admin_open(paths)?;
-    auto_approve_opened(paths, &admin, &mut false, &mut read_answered(paths))
+    auto_approve_opened(
+        paths,
+        &admin,
+        &mut false,
+        &mut read_answered(paths).answered,
+    )
 }
 
 /// [`auto_approve_listed`] of the requests queued at `admin`'s source now.
@@ -3321,14 +3598,83 @@ impl Answered {
 /// The most join requests the record of answered ones holds.
 const ANSWERED_MOST: usize = 256;
 
-/// The join requests this admin Mac's approver found answered ([`Answered`]), as it last
-/// recorded them; empty where it recorded none.
-fn read_answered(paths: &Paths) -> std::collections::BTreeSet<Answered> {
-    let Ok(Some(bytes)) = fsx::read_private(&paths.answered_file(), 64 << 10) else {
-        return std::collections::BTreeSet::new();
+/// The line of the record's queue file ([`Paths::answered_queue_file`]) that names the join
+/// queue the record was begun on ([`queue_of`]).
+const ANSWERED_BEGUN: &str = "#\tbegun\t";
+
+/// The join queue an approver judges, as its record of answered requests names it: the vault's
+/// name and where it is served, so a new signing key or host name is the same queue.
+fn queue_of(config: &Config) -> String {
+    let source = match &config.source {
+        Source::Url(url) => url.clone(),
+        Source::Path(path) => path.display().to_string(),
     };
-    String::from_utf8_lossy(bytes.as_slice())
+    format!("{} {source}", config.name)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+/// The lines of the record's queue file that name the keys on `code-only` lines at its last
+/// judged pass of the queue it was begun on, one each.
+const ANSWERED_SEEN: &str = "#\tcode-only\t";
+
+/// What an approver's record of answered join requests holds ([`read_answered`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AnsweredRecord {
+    answered: std::collections::BTreeSet<Answered>,
+    /// The join queue it was begun on ([`ANSWERED_BEGUN`]).
+    begun: Option<String>,
+    /// The keys on `code-only` lines at its last judged pass of that queue ([`ANSWERED_SEEN`]).
+    seen: std::collections::BTreeSet<String>,
+}
+
+/// This admin Mac's approver's record, as it last wrote it: the join requests it found answered
+/// ([`Answered`]) in `answered`, and in its queue file the join queue it was begun on
+/// ([`ANSWERED_BEGUN`]) and the keys it knew on `code-only` lines ([`ANSWERED_SEEN`]). Each is
+/// empty or none where the record holds none of it: all three where there is no record, and
+/// the queue and the keys where a build before the queue file wrote it, whose requests still
+/// read. A record a build of 2026-10-26 wrote, with those lines at the head of `answered`, reads
+/// them there.
+fn read_answered(paths: &Paths) -> AnsweredRecord {
+    let read = |path: &Path, limit: usize| match fsx::read_private(path, limit) {
+        Ok(Some(bytes)) => Some(String::from_utf8_lossy(bytes.as_slice()).into_owned()),
+        _ => None,
+    };
+    // Its `code-only` lines are as long as the vault's own, so the vault's limit bounds them,
+    // in a record of 2026-10-26 too.
+    let limit = crate::text::MAX_TEXT + (64 << 10);
+    let requests = read(&paths.answered_file(), limit).unwrap_or_default();
+    // This build writes no head lines in `answered`, so any there are newer than the queue file.
+    let queue = if requests
         .lines()
+        .any(|line| line.starts_with(ANSWERED_BEGUN))
+    {
+        requests.clone()
+    } else {
+        read(&paths.answered_queue_file(), limit).unwrap_or_else(|| requests.clone())
+    };
+    let begun = queue
+        .lines()
+        .find_map(|line| line.strip_prefix(ANSWERED_BEGUN))
+        .map(str::to_owned);
+    let seen = queue
+        .lines()
+        .filter_map(|line| line.strip_prefix(ANSWERED_SEEN))
+        .filter(|key| key.starts_with("age1") && !key.contains(char::is_whitespace))
+        .map(str::to_owned)
+        .collect();
+    AnsweredRecord {
+        answered: answered_lines(&requests),
+        begun,
+        seen,
+    }
+}
+
+/// The requests in a record's `key<TAB>time<TAB>name` lines, at most [`ANSWERED_MOST`]; other
+/// lines are skipped.
+fn answered_lines(text: &str) -> std::collections::BTreeSet<Answered> {
+    text.lines()
         .filter_map(|line| {
             let mut words = line.splitn(3, '\t');
             let (recipient, at, host) = (words.next()?, words.next()?, words.next()?);
@@ -3343,30 +3689,115 @@ fn read_answered(paths: &Paths) -> std::collections::BTreeSet<Answered> {
         .collect()
 }
 
-/// Write `answered` where [`read_answered`] reads it: one `key<TAB>time<TAB>name` line each, the
-/// record gone when none stand.
-fn write_answered(
-    paths: &Paths,
-    answered: &std::collections::BTreeSet<Answered>,
-) -> crate::Result<()> {
-    let path = paths.answered_file();
-    if answered.is_empty() {
-        return match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
-        };
-    }
-    let text: String = answered
+/// The lines [`answered_lines`] reads: one `key<TAB>time<TAB>name` line each, at most
+/// [`ANSWERED_MOST`].
+fn answered_text(answered: &std::collections::BTreeSet<Answered>) -> String {
+    answered
         .iter()
         .take(ANSWERED_MOST)
         .map(|answered| {
             let host: String = answered.host.chars().filter(|c| !c.is_control()).collect();
             format!("{}\t{}\t{host}\n", answered.recipient, answered.at)
         })
-        .collect();
+        .collect()
+}
+
+/// Remove `path`, which may be gone already.
+fn remove_record(path: &Path) -> crate::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
+    }
+}
+
+/// Write the record [`read_answered`] reads: one `key<TAB>time<TAB>name` line for each of
+/// `answered` in `answered`, gone when none stand; then in its queue file the queue it was
+/// `begun` on ([`ANSWERED_BEGUN`]) and the keys `seen` on `code-only` lines then
+/// ([`ANSWERED_SEEN`]), gone when it was begun on none. A write cut off between the two leaves
+/// the new requests beside the keys named before, whose standing requests the next pass only
+/// seeds again; the other way round, a key named but its request missing would read as an ask.
+fn write_answered(
+    paths: &Paths,
+    answered: &std::collections::BTreeSet<Answered>,
+    begun: Option<&str>,
+    seen: &std::collections::BTreeSet<String>,
+) -> crate::Result<()> {
     fsx::ensure_private_dir(&paths.dir)?;
-    fsx::write_atomic(&path, text.as_bytes(), 0o600)
+    if answered.is_empty() {
+        remove_record(&paths.answered_file())?;
+    } else {
+        fsx::write_atomic(
+            &paths.answered_file(),
+            answered_text(answered).as_bytes(),
+            0o600,
+        )?;
+    }
+    let Some(queue) = begun else {
+        return remove_record(&paths.answered_queue_file());
+    };
+    let plain = |text: &str| -> String { text.chars().filter(|c| !c.is_control()).collect() };
+    let text: String = std::iter::once(format!("{ANSWERED_BEGUN}{}\n", plain(queue)))
+        .chain(
+            seen.iter()
+                .map(|key| format!("{ANSWERED_SEEN}{}\n", plain(key))),
+        )
+        .collect();
+    fsx::write_atomic(&paths.answered_queue_file(), text.as_bytes(), 0o600)
+}
+
+/// The requests this Mac let in by code that the server listed at its last approval
+/// ([`record_approved`]).
+fn read_approved(paths: &Paths) -> std::collections::BTreeSet<Answered> {
+    match fsx::read_private(&paths.answered_approved_file(), 64 << 10) {
+        Ok(Some(bytes)) => answered_lines(&String::from_utf8_lossy(bytes.as_slice())),
+        _ => std::collections::BTreeSet::new(),
+    }
+}
+
+/// Record the requests in `pending` from `recipients`, which this Mac just let in by code, as
+/// answered for its approver ([`read_approved`]), as the approver records a member's request: an
+/// approver that reads no version between this one and one that lets such a key go again (off,
+/// stuck, or outrun) still takes the request for no ask. The approvals keep their own file, which
+/// the approver only reads, so neither's write undoes the other's; each approval keeps only the
+/// requests `pending`, the server's listing, still names.
+pub(crate) fn record_approved(
+    paths: &Paths,
+    pending: &[Request],
+    recipients: &[String],
+) -> crate::Result<()> {
+    let listed: std::collections::BTreeSet<Answered> =
+        pending.iter().filter_map(Answered::of).collect();
+    let before = read_approved(paths);
+    let mut approved: std::collections::BTreeSet<Answered> =
+        before.intersection(&listed).cloned().collect();
+    approved.extend(
+        pending
+            .iter()
+            .filter(|request| recipients.contains(&request.recipient))
+            .filter_map(Answered::of),
+    );
+    if approved == before {
+        return Ok(());
+    }
+    if approved.is_empty() {
+        return remove_record(&paths.answered_approved_file());
+    }
+    fsx::ensure_private_dir(&paths.dir)?;
+    fsx::write_atomic(
+        &paths.answered_approved_file(),
+        answered_text(&approved).as_bytes(),
+        0o600,
+    )
+}
+
+/// The recipients of the requests this Mac's approvals by code recorded ([`record_approved`]).
+#[cfg(test)]
+pub(crate) fn approved_recipients(paths: &Paths) -> Vec<String> {
+    read_approved(paths)
+        .into_iter()
+        .map(|answered| answered.recipient)
+        .collect()
 }
 
 /// The head line of the record of those asking to join that names the approver process that
@@ -3487,6 +3918,8 @@ pub fn approve_request(paths: &Paths, recipient: &str) -> crate::Result<String> 
     doc.add_machine(&host, recipient)
         .map_err(|e| Error::new(e.to_string()))?;
     admin_publish_approved(paths, &admin, &doc, &[recipient.to_owned()])?;
+    // Bookkeeping only: the approver records the request too once it reads this version.
+    let _ = record_approved(paths, &pending, &[recipient.to_owned()]);
     Ok(host)
 }
 
@@ -3523,8 +3956,8 @@ pub enum ProbeOutcome {
 }
 
 /// Check whether `url` serves a vault verified under `pin`: one GET, all of it within `total`
-/// ([`transport::get_within`]); no route to a LAN address is
-/// [`crate::ErrorKind::LocalNetworkPending`].
+/// ([`transport::get_within`]); on macOS, no route to a LAN address is
+/// [`crate::ErrorKind::LocalNetworkPending`] (elsewhere it is [`crate::ErrorKind::Other`]).
 pub fn probe(url: &str, pin: &[u8; 32], total: Duration) -> crate::Result<ProbeOutcome> {
     let name = transport::vault_name(&Source::Url(url.to_string()))?;
     let body = match transport::get_within(url, total)? {
@@ -4082,9 +4515,9 @@ impl Admin {
             .evidence(&Recipient::parse(&machine.recipient).ok()?)
     }
 
-    /// Automatically certify only a proven recipient with durable eligible
-    /// admission evidence. Current audience, root, retirement and possession
-    /// checks still apply. An open-vault admission alone is insufficient.
+    /// Automatically certify only a proven recipient with durable admission
+    /// evidence under this root, an open-vault admission included. Current
+    /// audience, root, retirement and possession checks still apply.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -4946,20 +5379,23 @@ fn let_go(old: &Document, doc: &Document) -> Vec<String> {
         .collect()
 }
 
+/// `doc` with a `code-only` line for each key it lets go of `old`'s machines, on any vault, and,
+/// in a version that opens the vault, for each request already waiting from a key not in it;
+/// whether a key was let go from an open vault (the one a person is told about, [`Published`]);
+/// and the requests held. A let-go key's line keeps its request, still queued, from being let in
+/// when the vault opens and from being shown as asking by an approver that never read it
+/// ([`code_only_standing`]); a password or a code still lets that key in.
 fn code_only_for(
     config: &Config,
     old: &Document,
     doc: &Document,
 ) -> crate::Result<(Option<Document>, bool, Vec<Request>)> {
-    if !doc.open() {
-        return Ok((None, false, Vec::new()));
-    }
     let named = doc.code_only();
     let gone: Vec<String> = let_go(old, doc)
         .into_iter()
         .filter(|key| !named.contains(key))
         .collect();
-    let waiting: Vec<Request> = if old.open() {
+    let waiting: Vec<Request> = if !doc.open() || old.open() {
         Vec::new()
     } else {
         requests_for(config, Some(doc))?
@@ -4980,7 +5416,7 @@ fn code_only_for(
         held.add_code_only(key)
             .map_err(|error| Error::new(error.to_string()))?;
     }
-    Ok((Some(held), !gone.is_empty(), waiting))
+    Ok((Some(held), doc.open() && !gone.is_empty(), waiting))
 }
 
 fn renew_join_password(old: &Document, doc: &Document) -> crate::Result<Option<Document>> {
@@ -5019,13 +5455,30 @@ pub struct Created {
 }
 
 /// Create a new vault at `source` with this machine as its initial admin.
+///
+/// The vault starts open (`[join]`'s `open = yes`): an admin's subscriber lets in every machine
+/// that asks to join. `aterm secrets password new|set` gives it a join password instead, and
+/// `password off` leaves each machine to an admin's approval by code.
 pub fn create(
     paths: &Paths,
     source: &str,
     import: Option<&Path>,
     host: Option<&str>,
 ) -> crate::Result<Created> {
-    create_initial(paths, source, import, host, true)
+    create_initial(paths, source, import, host, true, Approval::Open)
+}
+
+/// Create a new vault, as [`create`] does, that lets machines in by a generated join password
+/// instead of opening: the state `create` then `password new` reaches, in its first version.
+/// This seam is absent from production release builds.
+#[cfg(any(test, debug_assertions))]
+pub fn test_create_with_password(
+    paths: &Paths,
+    source: &str,
+    import: Option<&Path>,
+    host: Option<&str>,
+) -> crate::Result<Created> {
+    create_initial(paths, source, import, host, true, Approval::Password)
 }
 
 /// An explicitly requested remote creation still needs background recovery.
@@ -5046,7 +5499,7 @@ pub fn test_create_unbound(
     import: Option<&Path>,
     host: Option<&str>,
 ) -> crate::Result<Created> {
-    create_initial(paths, source, import, host, false)
+    create_initial(paths, source, import, host, false, Approval::Password)
 }
 
 #[cfg_attr(
@@ -5071,9 +5524,10 @@ fn create_initial(
     import: Option<&Path>,
     host: Option<&str>,
     foundation: bool,
+    approval: Approval,
 ) -> crate::Result<Created> {
     if foundation {
-        return creation::create(paths, source, import, host);
+        return creation::create(paths, source, import, host, approval);
     }
     let (source, _) = transport::parse_source(source, &paths.home)?;
     let name = transport::vault_name(&source)?;
@@ -5105,7 +5559,7 @@ fn create_initial(
         Some(host) => return Err(Error::new(format!("{host:?} is not a valid machine name"))),
         None => default_host_name(),
     };
-    let (bytes, signer, imported) = prepare_initial(paths, &name, import, &host, false)?;
+    let (bytes, signer, imported) = prepare_initial(paths, &name, import, &host, false, approval)?;
     transport::publish(&source, &bytes)?;
     let config = Config {
         source,
@@ -5139,12 +5593,15 @@ fn prepare_initial(
     import: Option<&Path>,
     host: &str,
     foundation: bool,
+    approval: Approval,
 ) -> crate::Result<(Vec<u8>, [u8; 32], Vec<String>)> {
     let identity = machine_identity(paths)?;
     let mut doc = Document::new_vault(host, &identity.recipient().to_bech32());
-    let password = join::generate()?;
-    doc.set_join_password(Some(password.as_slice()))
-        .map_err(|e| Error::new(e.to_string()))?;
+    match approval {
+        Approval::Open => doc.set_open(true),
+        Approval::Password => doc.set_join_password(Some(join::generate()?.as_slice())),
+    }
+    .map_err(|e| Error::new(e.to_string()))?;
     let mut imported = Vec::new();
     if let Some(dir) = import {
         let mut names: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
@@ -6287,6 +6744,138 @@ mod tests {
     }
 
     #[test]
+    fn materialization_observation_explains_each_guard_without_reading_or_mutating_inputs() {
+        fn blocked(paths: &Paths, config: &Config, expected: MaterializationBlocker) {
+            let before_state = std::fs::read(paths.state_file()).ok();
+            let before_config = std::fs::read(paths.source_file()).ok();
+            let called = std::cell::Cell::new(false);
+            let observed = observe_materialization(paths, config, || {
+                called.set(true);
+                Ok(())
+            })
+            .unwrap();
+            assert!(
+                matches!(observed, MaterializationObservation::Blocked(reason) if reason == expected)
+            );
+            assert!(!called.get());
+            assert!(!materialization_ready_for(paths, config).unwrap());
+            assert!(
+                with_materialization_ready::<()>(paths, config, || {
+                    panic!("a blocked legacy reader must not run")
+                })
+                .unwrap()
+                .is_none()
+            );
+            assert_eq!(std::fs::read(paths.state_file()).ok(), before_state);
+            assert_eq!(std::fs::read(paths.source_file()).ok(), before_config);
+        }
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let source = root.path().join("team.secrets");
+        fsx::write_atomic(&source, b"token=inert-token\n", 0o600).unwrap();
+        let paths = Paths::for_home(&root.path().join("reader"));
+        let initial = Config {
+            source: Source::Path(source.clone()),
+            name: "team".into(),
+            signer: None,
+            followed: Vec::new(),
+            host: "reader".into(),
+        };
+        blocked(&paths, &initial, MaterializationBlocker::LockUnavailable);
+        assert!(!paths.home.exists());
+        drop(StateLock::take(&paths).unwrap());
+        blocked(&paths, &initial, MaterializationBlocker::Unconfigured);
+        join_pinned(&paths, source.to_str().unwrap(), "reader");
+        let configured = config(&paths).unwrap().unwrap();
+        let writer = StateLock::take(&paths).unwrap();
+        blocked(&paths, &configured, MaterializationBlocker::LockUnavailable);
+        drop(writer);
+        let mut changed = configured.clone();
+        changed.name.push_str("-other");
+        blocked(&paths, &changed, MaterializationBlocker::ConfigChanged);
+        let original = load_state(&paths).unwrap();
+        for (membership, expected) in [
+            (Stored::Pending, MaterializationBlocker::NotAdmitted),
+            (Stored::Revoked, MaterializationBlocker::Revoked),
+        ] {
+            let mut state = original.clone();
+            state.membership = membership;
+            save_state(&paths, &state).unwrap();
+            blocked(&paths, &configured, expected);
+        }
+        let mut state = original.clone();
+        state.source_identity = None;
+        save_state(&paths, &state).unwrap();
+        blocked(&paths, &configured, MaterializationBlocker::SourceChanged);
+        state = original.clone();
+        state.failed = true;
+        save_state(&paths, &state).unwrap();
+        blocked(
+            &paths,
+            &configured,
+            MaterializationBlocker::LocalFilesIncomplete,
+        );
+        save_state(&paths, &original).unwrap();
+        std::fs::remove_file(materialize::target_path(&paths.home, "token").unwrap()).unwrap();
+        blocked(
+            &paths,
+            &configured,
+            MaterializationBlocker::LocalFilesIncomplete,
+        );
+
+        let admin = Paths::for_home(&root.path().join("admin"));
+        let signed_source = root.path().join("signed.vault");
+        create(&admin, signed_source.to_str().unwrap(), None, Some("admin")).unwrap();
+        let configured = config(&admin).unwrap().unwrap();
+        let old = configured.signer.unwrap();
+        let current = envelope::signer_public(&[238; 32]).unwrap();
+        retiring(vec![old], current, || {
+            blocked(&admin, &configured, MaterializationBlocker::UntrustedPin);
+        });
+    }
+
+    #[test]
+    fn materialization_observation_reads_only_while_ready_and_holding_the_shared_lock() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let source = root.path().join("team.secrets");
+        fsx::write_atomic(&source, b"token=inert-token\n", 0o600).unwrap();
+        let paths = Paths::for_home(&root.path().join("reader"));
+        join_pinned(&paths, source.to_str().unwrap(), "reader");
+        let configured = config(&paths).unwrap().unwrap();
+        let before_state = std::fs::read(paths.state_file()).unwrap();
+        let before_config = std::fs::read(paths.source_file()).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.lock_file())
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let observation = observe_materialization(&paths, &configured, || {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the test checks the shared observation lease without blocking"
+            )]
+            let attempt = writer.try_lock();
+            assert!(matches!(attempt, Err(std::fs::TryLockError::WouldBlock)));
+            calls.set(calls.get() + 1);
+            Ok(42)
+        })
+        .unwrap();
+        assert!(
+            matches!(observation, MaterializationObservation::Ready(value) if value.inputs == 42)
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(materialization_ready_for(&paths, &configured).unwrap());
+        assert!(
+            with_materialization_ready(&paths, &configured, || Ok(42))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(paths.state_file()).unwrap(), before_state);
+        assert_eq!(std::fs::read(paths.source_file()).unwrap(), before_config);
+    }
+
+    #[test]
     fn readiness_observation_creates_no_state_or_lock_and_never_changes_directory_mode() {
         use std::os::unix::fs::PermissionsExt;
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -6436,8 +7025,8 @@ mod tests {
             &store
         )));
         assert!(
-            !retiring(vec![signer], other, || crate::server::holds_alab(&store)),
-            "a retired key's vault gives way"
+            retiring(vec![signer], other, || crate::server::holds_alab(&store)),
+            "a retired key's vault is still the one the store holds until its successor comes"
         );
         // Another vault's bytes in the ALab vault's file, or bytes that do not verify, are not it.
         let bytes = std::fs::read(&source).unwrap();
@@ -7882,7 +8471,8 @@ mod tests {
         for (name, value) in [("first", b"inert-first"), ("second", b"inert-other")] {
             let creator = Paths::for_home(&root.path().join(format!("creator-{name}")));
             let url = format!("http://{addr}/v1/{name}");
-            let created = create(&creator, &url, None, Some("creator")).expect("create");
+            let created =
+                test_create_with_password(&creator, &url, None, Some("creator")).expect("create");
             let opened = admin_open(&creator).expect("open");
             let mut doc = opened.doc.clone();
             doc.add_machine("admin", &recipient).unwrap();
@@ -8035,7 +8625,8 @@ mod tests {
         let vault = |admin: &str, name: &str| {
             let paths = Paths::for_home(&root.path().join(admin));
             let url = format!("http://{}/v1/{name}", server.addr);
-            let created = create(&paths, &url, None, Some(admin)).expect("create");
+            let created =
+                test_create_with_password(&paths, &url, None, Some(admin)).expect("create");
             (paths, format!("{url}#{}", created.signer))
         };
         let (team_admin, team) = vault("ma", "team");
@@ -8170,7 +8761,8 @@ mod tests {
             other_socket.local_addr().expect("address")
         );
         let other_admin = Paths::for_home(&root.path().join("mz"));
-        let other = create(&other_admin, &other_url, None, Some("mz")).expect("create");
+        let other =
+            test_create_with_password(&other_admin, &other_url, None, Some("mz")).expect("create");
         let password = admin_open(&other_admin)
             .expect("admin opens")
             .doc
@@ -8321,7 +8913,7 @@ mod tests {
         let server = std::cell::RefCell::new(Some(serve(&store, &socket)));
         let url = format!("http://{}/v1/team", socket.local_addr().expect("address"));
         let admin = Paths::for_home(&root.path().join("ma"));
-        let created = create(&admin, &url, None, Some("ma")).expect("create");
+        let created = test_create_with_password(&admin, &url, None, Some("ma")).expect("create");
         let password = admin_open(&admin)
             .expect("admin opens")
             .doc
@@ -9059,7 +9651,7 @@ mod tests {
         create(&admin, &url, None, Some("ma")).expect("create");
         let opened = admin_open(&admin).expect("open");
         let mut doc = opened.doc.clone();
-        doc.set_join_password(None).expect("closed");
+        doc.set_open(false).expect("closed");
         admin_publish(&admin, &opened, &doc).expect("publish");
         assert_eq!(approving_here(&admin).expect("read"), None, "no approver");
         server.stop();
@@ -9208,9 +9800,10 @@ mod tests {
     }
 
     /// An approval's bounded wait ends at its own time: the server holds a long-poll for its
-    /// own (here a minute), which a try of [`sync_within`] does not outlast, and running out of
-    /// time is no news, not a failure. Negative control: [`sync`] with the same wait as its
-    /// long-poll fails once its own deadline (the wait plus 15 s) passes.
+    /// own (here two hang detectors), which a try of [`sync_within`] does not outlast, and
+    /// running out of time is no news, not a failure. Negative control: a try on a fetch's
+    /// deadline (its total plus [`transport::FETCH_MARGIN`], under test two hang detectors),
+    /// as [`sync`] fetches, waits out the server's hold, past the detector.
     #[test]
     fn a_bounded_wait_ends_at_its_own_time_whatever_the_server_holds() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -9224,7 +9817,7 @@ mod tests {
                 store: root.path().join("store"),
                 advertise: None,
                 pins: Vec::new(),
-                hold: Duration::from_secs(60),
+                hold: 2 * HANG_DETECTOR,
                 keep_awake: false,
             },
         )
@@ -9234,8 +9827,8 @@ mod tests {
         let took = started.elapsed();
         assert_eq!(outcome, SyncOutcome::Unchanged { seq: 2 });
         assert!(
-            took < transport::FETCH_MARGIN,
-            "the wait ran past its own total: {took:?}"
+            took < HANG_DETECTOR,
+            "the wait ran past its own total toward the server's hold: {took:?}"
         );
         holding.stop();
     }

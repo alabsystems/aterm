@@ -3954,8 +3954,32 @@ fn the_keeping_rules_hold_on_the_filter_over_tokyo_night() {
     );
 }
 
+/// Whether Import… can hold the keyboard here: only where a file picker is wired
+/// ([`crate::menu::local_file_picker_available`]). Elsewhere (Linux) the button is drawn
+/// disabled, so the keyboard never lands on it and no screen owes it a place; the footer's other
+/// link's sweeps keep the footer's rules there.
+fn import_takes_the_keyboard() -> bool {
+    let available = crate::menu::local_file_picker_available();
+    if !available {
+        let mut lab = super::super::modified::Lab::new("");
+        lab.state_mut().navigate(SettingsRoute::Themes);
+        let compiled = lab.compile(876.0, 803.0);
+        let import = compiled
+            .semantic(&UiKey::new(IMPORT))
+            .expect("premise: Import… is drawn");
+        assert!(
+            import.state.is_some_and(|state| !state.enabled),
+            "with no file picker, Import… is drawn disabled"
+        );
+    }
+    available
+}
+
 #[test]
 fn the_keeping_rules_hold_with_the_keyboard_on_import_over_github_light() {
+    if !import_takes_the_keyboard() {
+        return;
+    }
     sweep(
         Scenario {
             keyboard: Keyboard::On(IMPORT),
@@ -4052,6 +4076,9 @@ fn the_keeping_rules_hold_with_the_keyboard_on_the_themes_folder() {
 
 #[test]
 fn the_keeping_rules_hold_with_the_keyboard_on_import() {
+    if !import_takes_the_keyboard() {
+        return;
+    }
     sweep(
         Scenario {
             keyboard: Keyboard::On(IMPORT),

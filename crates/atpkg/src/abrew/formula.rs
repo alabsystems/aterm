@@ -36,12 +36,105 @@ pub struct Formula {
     pub variations: Vec<(String, FormulaVariation)>,
     pub dependencies: Vec<String>,
     pub build_dependencies: Vec<String>,
+    /// Tag-side dependency lists, read by `uses` filters (the JSON
+    /// lists are predicate projections of brew's merged deps).
+    pub test_dependencies: Vec<String>,
+    pub recommended_dependencies: Vec<String>,
+    pub optional_dependencies: Vec<String>,
+    /// `version_scheme` (keg ordering sorts by it before version).
+    pub version_scheme: u64,
     pub keg_only: bool,
+    /// `keg_only_reason` as (reason, explanation): the reason is a
+    /// `:symbol` (inspect form) or free text.
+    pub keg_only_reason: Option<(String, String)>,
+    /// The `service` block, when the formula defines one with a run
+    /// command (display data for caveats; services stay delegated).
+    pub service: Option<ServiceInfo>,
     pub deprecate: bool,
     pub disable: bool,
     pub caveats: String,
     pub aliases: Vec<String>,
     pub oldnames: Vec<String>,
+    /// A `head` spec exists (`urls.head` in the API object).
+    pub head: bool,
+    /// Declared build options as (flag, description) pairs.
+    pub options: Vec<(String, String)>,
+    pub deprecate_disable: DeprecateDisable,
+    /// The API `executables` list (bottle PATH executables).
+    pub executables: Vec<String>,
+}
+
+/// A formula `service` block reduced to what caveats display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceInfo {
+    /// The `run` argv (API strings may carry `$HOMEBREW_PREFIX`).
+    pub run: Vec<String>,
+    /// `require_root: true` (a LaunchDaemon / system service).
+    pub require_root: bool,
+    /// `environment_variables` as (key, value) pairs, sorted by key
+    /// (the JSON map abrew reads is alphabetical).
+    pub environment_variables: Vec<(String, String)>,
+}
+
+/// Parse the API `service` object; a service without a run command
+/// (name-only `to_hash`) has nothing caveats can honestly show.
+fn parse_service(v: Option<&Value>) -> Option<ServiceInfo> {
+    let v = v?;
+    let run = match v.get("run") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|i| i.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()?,
+        Some(Value::String(single)) => vec![single.clone()],
+        _ => return None,
+    };
+    if run.is_empty() {
+        return None;
+    }
+    let mut environment_variables = Vec::new();
+    if let Some(Value::Object(map)) = v.get("environment_variables") {
+        for (key, value) in map {
+            if let Some(value) = value.as_str() {
+                environment_variables.push((key.clone(), value.to_string()));
+            }
+        }
+    }
+    Some(ServiceInfo {
+        run,
+        require_root: v
+            .get("require_root")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        environment_variables,
+    })
+}
+
+/// The `deprecate!`/`disable!` fields of an API object, kept
+/// verbatim for brew's DeprecateDisable message rendering.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeprecateDisable {
+    pub deprecation_reason: Option<String>,
+    pub deprecation_date: Option<String>,
+    pub disable_reason: Option<String>,
+    pub disable_date: Option<String>,
+    pub deprecation_replacement_formula: Option<String>,
+    pub deprecation_replacement_cask: Option<String>,
+    pub disable_replacement_formula: Option<String>,
+    pub disable_replacement_cask: Option<String>,
+}
+
+fn parse_deprecate_disable(v: &Value) -> DeprecateDisable {
+    let field = |key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
+    DeprecateDisable {
+        deprecation_reason: field("deprecation_reason"),
+        deprecation_date: field("deprecation_date"),
+        disable_reason: field("disable_reason"),
+        disable_date: field("disable_date"),
+        deprecation_replacement_formula: field("deprecation_replacement_formula"),
+        deprecation_replacement_cask: field("deprecation_replacement_cask"),
+        disable_replacement_formula: field("disable_replacement_formula"),
+        disable_replacement_cask: field("disable_replacement_cask"),
+    }
 }
 
 /// One bottle file of a formula's stable version.
@@ -223,6 +316,26 @@ pub enum Requirement {
     XcodeMin(Option<String>),
 }
 
+/// The API `options` array: `{"option": "--with-x",
+/// "description": "..."}` entries. Malformed entries are dropped;
+/// options are display data only.
+fn parse_options(v: Option<&Value>) -> Vec<(String, String)> {
+    let Some(items) = v.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let flag = item.get("option").and_then(Value::as_str)?;
+            let description = item
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Some((flag.to_string(), description.to_string()))
+        })
+        .collect()
+}
+
 fn parse_requirements(v: Option<&Value>) -> Result<Vec<Requirement>, ()> {
     let mut out = Vec::new();
     let Some(items) = v.and_then(Value::as_array) else {
@@ -346,7 +459,20 @@ impl Formula {
             variations: parse_formula_variations(v.get("variations")),
             dependencies: str_list(v.get("dependencies")),
             build_dependencies: str_list(v.get("build_dependencies")),
+            test_dependencies: str_list(v.get("test_dependencies")),
+            recommended_dependencies: str_list(v.get("recommended_dependencies")),
+            optional_dependencies: str_list(v.get("optional_dependencies")),
+            version_scheme: v.get("version_scheme").and_then(Value::as_u64).unwrap_or(0),
             keg_only: v.get("keg_only").and_then(Value::as_bool).unwrap_or(false),
+            keg_only_reason: v.get("keg_only_reason").and_then(|r| {
+                let reason = r.get("reason").and_then(Value::as_str)?;
+                let explanation = r
+                    .get("explanation")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Some((reason.to_string(), explanation.to_string()))
+            }),
+            service: parse_service(v.get("service")),
             deprecate: v
                 .get("deprecated")
                 .and_then(Value::as_bool)
@@ -355,6 +481,10 @@ impl Formula {
             caveats: s(v.get("caveats")),
             aliases: str_list(v.get("aliases")),
             oldnames: str_list(v.get("oldnames")),
+            head: matches!(v.pointer("/urls/head"), Some(Value::Object(_))),
+            options: parse_options(v.get("options")),
+            deprecate_disable: parse_deprecate_disable(v),
+            executables: str_list(v.get("executables")),
         })
     }
 
@@ -464,6 +594,10 @@ pub struct Cask {
     pub sha256: Option<String>,
     pub artifacts: Vec<Artifact>,
     pub auto_updates: bool,
+    /// Declared `language` blocks, in API order (info display).
+    pub languages: Vec<String>,
+    pub caveats: String,
+    pub deprecate_disable: DeprecateDisable,
     /// The first top-level constraint the native resolver cannot evaluate.
     pub unsupported_constraints: Option<&'static str>,
     /// The `depends_on macos: ">= X"` floor, when the API states one in plain numeric form.
@@ -480,6 +614,24 @@ pub struct Cask {
     pub depends_cask: Vec<String>,
     /// Per-system overrides.
     pub variations: Vec<(String, Variation)>,
+    /// File directives of the `zap` stanza (`trash:` paths).
+    pub zap_trash: Vec<String>,
+    /// File directives of the `zap` stanza (`delete:` paths);
+    /// brew runs these under sudo, so their presence delegates.
+    pub zap_delete: Vec<String>,
+    /// File directives of the `zap` stanza (`rmdir:` paths).
+    pub zap_rmdir: Vec<String>,
+    /// A zap stanza exists at all (drives brew's "No zap stanza").
+    pub zap_present: bool,
+    /// The zap stanza uses a directive beyond trash/delete/rmdir.
+    pub zap_unsupported: bool,
+    /// File directives of the `uninstall` stanza (`trash:` paths).
+    pub uninstall_trash: Vec<String>,
+    /// File directives of the `uninstall` stanza (`rmdir:` paths).
+    pub uninstall_rmdir: Vec<String>,
+    /// The uninstall stanza uses a directive beyond trash/rmdir
+    /// (quit, launchctl, pkgutil, delete, …): zapping delegates.
+    pub uninstall_unsupported: bool,
     /// `container type: :naked`.
     pub naked: bool,
     /// (branch, only_path) when `url_specs` is exactly a git
@@ -524,6 +676,138 @@ pub enum Artifact {
     /// A plugin/completion artifact linked into a fixed prefix-relative directory.
     Library(String, Option<String>, String),
     Other(String),
+}
+
+/// Brew's `Requirement#display_s` for one parsed formula
+/// requirement (what `deps --include-requirements` prints after
+/// the colon).
+#[must_use]
+pub fn requirement_display(req: &Requirement) -> String {
+    match req {
+        Requirement::MacosMin(Some(v)) => format!("macOS >= {v}"),
+        Requirement::MacosMin(None) => "macOS".to_string(),
+        Requirement::MacosMax(v) => format!("macOS <= {v}"),
+        Requirement::Arch(a) => format!("{a} architecture"),
+        Requirement::XcodeMin(Some(v)) => format!("Xcode >= {v} (on macOS)"),
+        Requirement::XcodeMin(None) => "Xcode (on macOS)".to_string(),
+    }
+}
+
+/// Ruby's `String#capitalize`: first character up, the rest down.
+#[must_use]
+pub fn ruby_capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+    }
+}
+
+fn macos_symbol_number(sym: &str) -> Option<&'static str> {
+    Some(match sym {
+        "tahoe" => "26",
+        "sequoia" => "15",
+        "sonoma" => "14",
+        "ventura" => "13",
+        "monterey" => "12",
+        "big_sur" => "11",
+        "catalina" => "10.15",
+        "mojave" => "10.14",
+        "high_sierra" => "10.13",
+        "sierra" => "10.12",
+        "el_capitan" => "10.11",
+        _ => return None,
+    })
+}
+
+/// Requirements of a cask as brew's `CaskDependent#requirements`
+/// renders them (arch entries, cask tokens capitalized, macOS
+/// bounds), read loosely from the raw API `depends_on` — display
+/// must work even for casks the installer cannot evaluate.
+#[must_use]
+pub fn cask_requirement_displays(item: &Value) -> Vec<String> {
+    cask_requirement_displays_impl(item, true)
+}
+
+/// The `info` Requirements variant: brew excludes the
+/// cask-token requirements (`CaskDependent::Requirement`) there.
+#[must_use]
+pub fn cask_info_requirement_displays(item: &Value) -> Vec<String> {
+    cask_requirement_displays_impl(item, false)
+}
+
+fn cask_requirement_displays_impl(item: &Value, include_cask_tokens: bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(dep) = item.get("depends_on").and_then(Value::as_object) else {
+        return out;
+    };
+    if let Some(arches) = dep.get("arch").and_then(Value::as_array) {
+        for entry in arches {
+            let ty = entry.get("type").and_then(Value::as_str).unwrap_or("");
+            let bits = entry.get("bits").and_then(Value::as_u64).unwrap_or(0);
+            let name = if bits == 64 {
+                if ty == "intel" {
+                    "x86_64".to_string()
+                } else {
+                    format!("{ty}64")
+                }
+            } else if ty == "intel" && bits == 32 {
+                "i386".to_string()
+            } else {
+                ty.to_string()
+            };
+            out.push(format!("{name} architecture"));
+        }
+    }
+    if include_cask_tokens && let Some(casks) = dep.get("cask").and_then(Value::as_array) {
+        for token in casks.iter().filter_map(Value::as_str) {
+            out.push(ruby_capitalize(token));
+        }
+    }
+    let mut macos = |value: Option<&Value>| {
+        let Some(value) = value else { return };
+        match value {
+            Value::Object(bounds) => {
+                if bounds.is_empty() {
+                    out.push("macOS".to_string());
+                }
+                for (cmp, versions) in bounds {
+                    let list: Vec<String> = versions
+                        .as_array()
+                        .map(|vs| {
+                            vs.iter()
+                                .filter_map(Value::as_str)
+                                .map(|v| {
+                                    macos_symbol_number(v)
+                                        .map_or_else(|| v.to_string(), str::to_string)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !list.is_empty() {
+                        out.push(format!("macOS {cmp} {}", list.join(" / ")));
+                    }
+                }
+            }
+            Value::Array(items) => {
+                // Legacy shape: [">= :sonoma"].
+                for item in items.iter().filter_map(Value::as_str) {
+                    let item = item.trim();
+                    if let Some((cmp, sym)) = item.split_once(' ') {
+                        let sym = sym.trim_start_matches(':');
+                        let num = macos_symbol_number(sym).unwrap_or(sym);
+                        out.push(format!("macOS {cmp} {num}"));
+                    } else if item == ":macos" || item == "macos" {
+                        out.push("macOS".to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
+    macos(dep.get("macos"));
+    macos(dep.get("maximum_macos"));
+    out
 }
 
 /// One cask `depends_on` in the plain data forms abrew evaluates.
@@ -639,6 +923,72 @@ fn parse_conflicts(v: Option<&Value>) -> Option<Vec<String>> {
         }
     }
     Some(names)
+}
+
+/// The file directives of a cask's `zap` and `uninstall` stanzas,
+/// plus whether either uses a directive abrew does not run.
+#[derive(Debug, Default)]
+pub struct StanzaFiles {
+    pub zap_trash: Vec<String>,
+    pub zap_delete: Vec<String>,
+    pub zap_rmdir: Vec<String>,
+    pub zap_present: bool,
+    pub zap_unsupported: bool,
+    pub uninstall_trash: Vec<String>,
+    pub uninstall_rmdir: Vec<String>,
+    pub uninstall_unsupported: bool,
+}
+
+fn stanza_paths(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(items) => {
+            for item in items {
+                stanza_paths(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_uninstall_stanzas(v: Option<&Value>) -> StanzaFiles {
+    let mut out = StanzaFiles::default();
+    let Some(arr) = v.and_then(Value::as_array) else {
+        return out;
+    };
+    for item in arr {
+        let Value::Object(map) = item else { continue };
+        for (stanza, entries) in map {
+            let is_zap = match stanza.as_str() {
+                "zap" => true,
+                "uninstall" => false,
+                _ => continue,
+            };
+            if is_zap {
+                out.zap_present = true;
+            }
+            let Value::Array(entries) = entries else {
+                continue;
+            };
+            for entry in entries {
+                let Value::Object(entry) = entry else {
+                    continue;
+                };
+                for (directive, value) in entry {
+                    match (is_zap, directive.as_str()) {
+                        (true, "trash") => stanza_paths(value, &mut out.zap_trash),
+                        (true, "delete") => stanza_paths(value, &mut out.zap_delete),
+                        (true, "rmdir") => stanza_paths(value, &mut out.zap_rmdir),
+                        (true, _) => out.zap_unsupported = true,
+                        (false, "trash") => stanza_paths(value, &mut out.uninstall_trash),
+                        (false, "rmdir") => stanza_paths(value, &mut out.uninstall_rmdir),
+                        (false, _) => out.uninstall_unsupported = true,
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn parse_artifacts(v: Option<&Value>) -> Vec<Artifact> {
@@ -903,6 +1253,7 @@ impl Cask {
         }
         let sha_raw = s(v.get("sha256"));
         let mut artifacts = parse_artifacts(v.get("artifacts"));
+        let stanza_files = parse_uninstall_stanzas(v.get("artifacts"));
         let naked = matches!(v.get("container"), Some(Value::Object(fields))
             if fields.len() == 1 && fields.get("type").and_then(Value::as_str) == Some("naked"));
         // A git checkout limited to one branch and subdirectory,
@@ -1023,6 +1374,9 @@ impl Cask {
                 .get("auto_updates")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            languages: str_list(v.get("languages")),
+            caveats: s(v.get("caveats")),
+            deprecate_disable: parse_deprecate_disable(v),
             unsupported_constraints,
             macos_min,
             macos_exact,
@@ -1031,6 +1385,14 @@ impl Cask {
             depends_formula,
             depends_cask,
             variations,
+            zap_trash: stanza_files.zap_trash,
+            zap_delete: stanza_files.zap_delete,
+            zap_rmdir: stanza_files.zap_rmdir,
+            zap_present: stanza_files.zap_present,
+            zap_unsupported: stanza_files.zap_unsupported,
+            uninstall_trash: stanza_files.uninstall_trash,
+            uninstall_rmdir: stanza_files.uninstall_rmdir,
+            uninstall_unsupported: stanza_files.uninstall_unsupported,
             naked,
             git_branch_path,
             nested,
@@ -1138,6 +1500,43 @@ fn token_cmp(x: &str, y: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requirement_displays_render_like_brew() {
+        assert_eq!(
+            requirement_display(&Requirement::MacosMin(Some("15".into()))),
+            "macOS >= 15"
+        );
+        assert_eq!(requirement_display(&Requirement::MacosMin(None)), "macOS");
+        assert_eq!(
+            requirement_display(&Requirement::XcodeMin(Some("16.0".into()))),
+            "Xcode >= 16.0 (on macOS)"
+        );
+        let item = aterm_json::from_str(
+            r#"{"depends_on":{"arch":[{"type":"arm","bits":64}],"cask":["gstreamer-runtime"],"macos":{">=":["15"]},"maximum_macos":{"<=":["26"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cask_requirement_displays(&item),
+            [
+                "arm64 architecture",
+                "Gstreamer-runtime",
+                "macOS >= 15",
+                "macOS <= 26"
+            ]
+        );
+        let exact = aterm_json::from_str(r#"{"depends_on":{"macos":{"==":["11","12"]}}}"#).unwrap();
+        assert_eq!(cask_requirement_displays(&exact), ["macOS == 11 / 12"]);
+        let legacy = aterm_json::from_str(r#"{"depends_on":{"macos":[">= :sonoma"]}}"#).unwrap();
+        assert_eq!(cask_requirement_displays(&legacy), ["macOS >= 14"]);
+        let bare = aterm_json::from_str(r#"{"depends_on":{"macos":{}}}"#).unwrap();
+        assert_eq!(cask_requirement_displays(&bare), ["macOS"]);
+        // The info variant drops the cask-token requirements.
+        assert_eq!(
+            cask_info_requirement_displays(&item),
+            ["arm64 architecture", "macOS >= 15", "macOS <= 26"]
+        );
+    }
 
     #[test]
     fn bottles_never_require_a_newer_os_or_another_architecture() {

@@ -1,0 +1,73 @@
+<!-- Copyright 2026 Andrew Yates -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <title>nag mode · 1 · ahem</title>
+  <!-- ahem. -->
+  <rect x="1.5" y="1.5" width="18" height="9.5" rx="2" fill="#fff" stroke="#b3122e" stroke-width=".9"/>
+  <path d="M13 10.6l4.4 4.6-.6-4.6" fill="#fff" stroke="#b3122e" stroke-width=".9" stroke-linejoin="round"/>
+  <path d="M13.4 10.5h3" stroke="#fff" stroke-width="1.2"/>
+  <text x="10.5" y="8.6" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-weight="700" font-size="6.6" fill="#b3122e" textLength="14.6" lengthAdjust="spacingAndGlyphs">ahem.</text>
+  <!-- the clipboard of everything you did wrong -->
+  <rect x="1.5" y="39" width="13" height="18" rx="1.5" fill="#c8a26b"/>
+  <rect x="3" y="42" width="10" height="13.5" fill="#fff"/>
+  <rect x="5.5" y="37.5" width="5" height="3" rx="1" fill="#7d7d86"/>
+  <path d="M4.5 45h5M4.5 48h5M4.5 51h5" stroke="#8d93a8" stroke-width=".8"/>
+  <path d="M10.4 44.2l1.6 1.6m0-1.6l-1.6 1.6M10.4 47.2l1.6 1.6m0-1.6l-1.6 1.6M10.4 50.2l1.6 1.6m0-1.6l-1.6 1.6" stroke="#d62828" stroke-width=".8" stroke-linecap="round"/>
+  <!-- neck, blazer, pussy-bow blouse, reviewer's badge -->
+  <path d="M27 42h8v9h-8z" fill="#e8b48e"/>
+  <path d="M7 64Q9 52 21 49L31 52.5L41 49Q53 52 55 64Z" fill="#6d2340"/>
+  <path d="M21 49L31 58L41 49L37 48L31 53L25 48Z" fill="#f3eadb"/>
+  <path d="M31 53.6l-4.2 2.8 1.2 2.6zM31 53.6l4.2 2.8-1.2 2.6z" fill="#f3eadb" stroke="#c9b9a0" stroke-width=".5"/>
+  <circle cx="31" cy="53.8" r="1.2" fill="#c9b9a0"/>
+  <path d="M38.5 50.5L44 55" stroke="#3f6fb5" stroke-width=".8"/>
+  <rect x="42" y="54.5" width="6" height="7.5" rx=".8" fill="#fff" stroke="#8d93a8" stroke-width=".5"/>
+  <rect x="42" y="54.5" width="6" height="2.2" fill="#3f6fb5"/>
+  <path d="M43.3 58.6h3.4M43.3 60.3h2.4" stroke="#8d93a8" stroke-width=".6"/>
+  <!-- the hand on the clipboard -->
+  <path d="M13 63Q12 57 14 51.5" stroke="#6d2340" stroke-width="5.5" stroke-linecap="round" fill="none"/>
+  <ellipse cx="14.6" cy="49.6" rx="2.8" ry="2.4" fill="#f2c4a0" stroke="#a8714b" stroke-width=".6"/>
+  <!-- the red pen, raised to make a point -->
+  <path d="M47 61Q52 53 52 45" stroke="#6d2340" stroke-width="6" stroke-linecap="round" fill="none"/>
+  <g transform="rotate(18 53 40)">
+    <rect x="51.9" y="22" width="2.4" height="17" rx="1" fill="#d62828"/>
+    <path d="M51.9 22.6l1.2-3 1.2 3z" fill="#2b2b2b"/>
+    <rect x="51.9" y="31" width="2.4" height="1.2" fill="#f3d36b"/>
+  </g>
+  <rect x="48.6" y="38" width="8" height="7.4" rx="3" fill="#f2c4a0" stroke="#a8714b" stroke-width=".7"/>
+  <path d="M56.8 16.8l-1.2-1.6M59.9 15.9v-2M62.7 17.2l1.1-1.5" stroke="#e0533d" stroke-width="1" stroke-linecap="round"/>
+  <!-- a bun scraped tight and skewered with a red pencil -->
+  <rect x="20" y="10" width="22" height="2" rx="1" fill="#d62828" transform="rotate(-16 31 11)"/>
+  <path d="M41 7.6l2.6-.8-1.8 2z" fill="#2b2b2b"/>
+  <circle cx="31" cy="12" r="5.6" fill="#4b3a30"/>
+  <path d="M27.4 10.6q3.6-2.6 7.2 0M27.4 13.4q3.6 2.6 7.2 0" stroke="#2e231c" stroke-width=".8" fill="none"/>
+  <!-- the pinched face, the long nose, the pointed chin -->
+  <ellipse cx="19.7" cy="31.5" rx="1.6" ry="2.6" fill="#e8b48e"/>
+  <ellipse cx="42.3" cy="31.5" rx="1.6" ry="2.6" fill="#e8b48e"/>
+  <circle cx="19.7" cy="34.6" r=".95" fill="#f7f1e3" stroke="#c9b9a0" stroke-width=".3"/>
+  <circle cx="42.3" cy="34.6" r=".95" fill="#f7f1e3" stroke="#c9b9a0" stroke-width=".3"/>
+  <path d="M20 30Q20 19 31 19Q42 19 42 30Q42 39.5 36.5 44.5Q33.5 47.5 31 47.5Q28.5 47.5 25.5 44.5Q20 39.5 20 30Z" fill="#f2c4a0"/>
+  <path d="M19 31Q18 16 31 16Q44 16 43 31Q42 23 37 21.5Q33 20.5 31 18.8Q29 20.5 25 21.5Q20 23 19 31Z" fill="#4b3a30"/>
+  <path d="M29.6 18.9Q24.5 20.2 21 25.5" stroke="#a9a9b3" stroke-width="1.2" fill="none" stroke-linecap="round"/>
+  <!-- one plucked brow up, one flat: unimpressed -->
+  <path d="M21.2 25.2Q24 21.2 28 24.2" stroke="#2e231c" stroke-width="1.2" fill="none" stroke-linecap="round"/>
+  <path d="M34 26.6Q37.2 25.9 41 26.4" stroke="#2e231c" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+  <!-- half-lidded eyes peering over the glasses -->
+  <path d="M22 28.6Q24.6 26.8 27.2 28.6Q24.6 30.2 22 28.6Z" fill="#fff"/>
+  <path d="M34.8 28.6Q37.4 26.8 40 28.6Q37.4 30.2 34.8 28.6Z" fill="#fff"/>
+  <circle cx="24.4" cy="29" r="1.1" fill="#1f1f1f"/>
+  <circle cx="37.2" cy="29" r="1.1" fill="#1f1f1f"/>
+  <path d="M21.8 28.7Q24.6 26.6 27.4 28.7Z" fill="#e3a982"/>
+  <path d="M34.6 28.7Q37.4 26.6 40.2 28.7Z" fill="#e3a982"/>
+  <path d="M21.8 28.7H27.4M34.6 28.7H40.2" stroke="#2e231c" stroke-width=".9" stroke-linecap="round"/>
+  <!-- the long pointed nose -->
+  <path d="M31 27.5Q31.5 33 34 36.2Q32.2 37.2 30.4 36.6" stroke="#a8714b" stroke-width="1" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- cat-eye glasses slid down it, on a bead chain -->
+  <path d="M20.4 33.5Q15 44 22 50.5M41.6 33.5Q47 44 40 50.5" stroke="#c9a84a" stroke-width=".9" stroke-dasharray=".1 1.5" stroke-linecap="round" fill="none"/>
+  <path d="M18.5 30L22 31.8L28.7 32.1Q29.2 35.5 27.5 37.1Q25 38.3 22.6 37.1Q20.8 36 20.6 33.5Z" fill="#fff" fill-opacity=".35" stroke="#b3122e" stroke-width="1.4" stroke-linejoin="round"/>
+  <path d="M43.5 30L40 31.8L33.3 32.1Q32.8 35.5 34.5 37.1Q37 38.3 39.4 37.1Q41.2 36 41.4 33.5Z" fill="#fff" fill-opacity=".35" stroke="#b3122e" stroke-width="1.4" stroke-linejoin="round"/>
+  <path d="M28.7 33Q31 32 33.3 33" stroke="#b3122e" stroke-width="1.2" fill="none"/>
+  <!-- lips pursed tight, frown lines -->
+  <path d="M27.4 39Q26.4 42 27.7 44.6M34.6 39Q35.6 42 34.3 44.6" stroke="#d49a78" stroke-width=".7" fill="none" stroke-linecap="round"/>
+  <ellipse cx="31" cy="41.8" rx="1.8" ry="1.15" fill="#9b2f2f"/>
+  <path d="M29.3 40.5l-.5-.8M31 40.3v-.9M32.7 40.5l.5-.8M29.3 43.1l-.5.8M32.7 43.1l.5.8" stroke="#c98a6c" stroke-width=".5" stroke-linecap="round"/>
+</svg>

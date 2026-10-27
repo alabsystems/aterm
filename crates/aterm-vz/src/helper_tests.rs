@@ -956,6 +956,33 @@ fn requests_before_attach_and_out_of_phase_are_answered_by_name() {
 }
 
 #[test]
+fn a_connect_before_ready_is_refused_while_the_vm_boots() {
+    let mut rig = Rig::with(agent_script(), true, true);
+    rig.attached(1, false);
+    assert_eq!(rig.boot(1, Duration::ZERO), Flow::Go);
+    assert_eq!(rig.pump(S * 9), Flow::Go, "Hello");
+    assert_eq!(rig.core.phase(), Phase::Booting);
+    let _ = rig.sent(1);
+    // The agent said hello, so it may listen already: no command runs before its Ready.
+    assert_eq!(rig.req(1, Request::Connect { port: 1024 }, S * 9), Flow::Go);
+    assert_eq!(
+        rig.reply(1),
+        Reply::Error("the VM is booting: no connection".into())
+    );
+    assert_eq!(rig.core.held(), 0);
+    assert_eq!(rig.pump(S * 10), Flow::Go, "Ready");
+    let _ = rig.sent(1);
+    assert_eq!(
+        rig.req(1, Request::Connect { port: 1024 }, S * 11),
+        Flow::Go
+    );
+    assert!(matches!(
+        rig.reply_fd(1),
+        (Reply::Connected { port: 1024, .. }, Some(_))
+    ));
+}
+
+#[test]
 fn state_reports_the_record_the_beat_the_free_space_and_the_tail() {
     let mut rig = ready_rig(false, true);
     assert_eq!(

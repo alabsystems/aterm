@@ -843,6 +843,8 @@ struct ChromeFonts {
     measures: MeasureMemo,
     /// The glyphs rasters drew, kept for the next ([`GlyphMemo`]).
     glyphs: GlyphMemo,
+    /// Chars chrome text measured or drew with no face of this stack ([`chrome_text_holes`]).
+    text_holes: u64,
 }
 
 #[derive(Default)]
@@ -1127,6 +1129,7 @@ fn default_chrome_fonts() -> ChromeFonts {
         semantic_prewarm_ms: None,
         measures: MeasureMemo::default(),
         glyphs: GlyphMemo::default(),
+        text_holes: 0,
     }
 }
 
@@ -1378,6 +1381,15 @@ pub(crate) fn chrome_coverage_epoch() -> u64 {
     fonts.ui_regular.as_ref().map(Arc::as_ptr).hash(&mut epoch);
     fonts.ui_semibold.as_ref().map(Arc::as_ptr).hash(&mut epoch);
     epoch.finish()
+}
+
+/// How many chars chrome text has measured or drawn with no face of the chrome stack (a
+/// synthesized mark's or a hole's advance): the chars a face landing later would draw otherwise.
+/// A native raster that added none while it compiled and painted is stamped with the faces as
+/// they stand once it painted (`retain_native_leaf_raster`), so a face its own previews parsed
+/// mid-paint does not draw it again.
+pub(crate) fn chrome_text_holes() -> u64 {
+    lock_fonts().text_holes
 }
 
 fn chrome_coverage_warm(fonts: &ChromeFonts) -> Option<impl FnOnce() -> usize + Send + 'static> {
@@ -1871,11 +1883,16 @@ impl ChromeFonts {
     /// The advance a UI run in `face` gives `ch`, which the UI face has no glyph for, at `px`: its
     /// [`Self::ui_miss_face`]'s, else a synthesized mark's, else 0.6 em.
     fn ui_miss_advance(&mut self, face: TextFace, ch: char, px: f32) -> f32 {
-        self.ui_miss_face(face, TextWeight::Regular, ch)
-            .map_or_else(
-                || synthesized::advance(ch, px).unwrap_or(px * 0.6),
-                |cface| cface.font.char_metrics(ch, px).advance_width,
-            )
+        if let Some(cface) = self.ui_miss_face(face, TextWeight::Regular, ch) {
+            return cface.font.char_metrics(ch, px).advance_width;
+        }
+        self.note_text_hole();
+        synthesized::advance(ch, px).unwrap_or(px * 0.6)
+    }
+
+    /// Count a char chrome text measured or drew with no face of this stack.
+    const fn note_text_hole(&mut self) {
+        self.text_holes = self.text_holes.wrapping_add(1);
     }
 
     fn label_misses(&mut self, face: TextFace, s: &str) -> Vec<char> {
@@ -2223,7 +2240,10 @@ pub(crate) fn measure_text(s: &str, px: f32, weight: TextWeight) -> f32 {
     for ch in s.chars() {
         if let Some(face) = fonts.face_for(weight, ch) {
             pen_q += px_to_q(face.advance_em(ch) * px);
-        } else if let Some(advance) = synthesized::advance(ch, px) {
+            continue;
+        }
+        fonts.note_text_hole();
+        if let Some(advance) = synthesized::advance(ch, px) {
             pen_q += px_to_q(advance);
         }
     }
@@ -3731,6 +3751,39 @@ fn cov(d: f32) -> f32 {
     (0.5 - d).clamp(0.0, 1.0)
 }
 
+/// The columns, within `x0..x1`, of the row `dy` px from a band's centre column `cx` that a band
+/// covering only pixels between the radii `inner` and `outer` can cover: the run left of its
+/// hole and the run right of it, the right one starting where the left ends. The rows and the
+/// runs each keep a pixel's slack past those radii, so a pixel the band's distance field covers
+/// only by a rounding is still walked; `None` for a row a pixel or more past `outer`. Columns
+/// saturate, so a centre or radius past `i32`'s range walks no column.
+fn band_runs(
+    cx: f32,
+    dy: f32,
+    (inner, outer): (f32, f32),
+    (x0, x1): (i32, i32),
+) -> Option<[std::ops::Range<i32>; 2]> {
+    if dy.abs() >= outer + 1.0 {
+        return None;
+    }
+    let reach = (outer * outer - dy * dy).max(0.0).sqrt();
+    let hole = if inner > dy.abs() {
+        (inner * inner - dy * dy).sqrt()
+    } else {
+        0.0
+    };
+    let col = |x: f32| x - 0.5;
+    let (lo, hole_end) = (
+        col(cx - reach).floor() as i32,
+        (col(cx - hole).ceil() as i32).saturating_add(1),
+    );
+    let (hole_start, hi) = (
+        (col(cx + hole).floor() as i32).max(hole_end),
+        (col(cx + reach).ceil() as i32).saturating_add(1),
+    );
+    Some([lo.max(x0)..hole_end.min(x1), hole_start.max(x0)..hi.min(x1)])
+}
+
 const SPECIMEN_FRAME_CACHE_ENTRIES: usize = 2;
 
 struct SpecimenFrameEntry {
@@ -4214,6 +4267,66 @@ impl Canvas {
         }
     }
 
+    /// [`DrawPrim::Arc`] in device px: the band `width` across about radius `r` from `from` to
+    /// `to` turns clockwise from 12 o'clock, its ends round. Each pixel is covered by its distance
+    /// to the arc's middle line (across the band inside the span, to the nearer end past it), so
+    /// the band and its caps cover each pixel once.
+    fn arc_band(
+        &mut self,
+        (cx, cy): (f32, f32),
+        (r, width): (f32, f32),
+        (from, to): (f32, f32),
+        c: [u8; 4],
+    ) {
+        let half = width.max(0.0) / 2.0;
+        let span = (to - from).clamp(0.0, 1.0);
+        if half <= 0.0 || r <= 0.0 {
+            return;
+        }
+        let reach = r + half + 1.0;
+        let (x0, y0, x1, y1) = self.clipped_bounds(
+            (cx - reach).floor() as i32,
+            (cy - reach).floor() as i32,
+            (cx + reach).ceil() as i32,
+            (cy + reach).ceil() as i32,
+        );
+        let end = |turn: f32| {
+            let t = turn * TAU;
+            (cx + t.sin() * r, cy - t.cos() * r)
+        };
+        let ends = [end(from), end(from + span)];
+        // No point of the arc, its ends included, is nearer a pixel than the circle is, so only
+        // pixels within half a pixel past the band's edges are covered: each row's run left and
+        // right of the ring's hole (`band_runs`).
+        let band = (r - half - 0.5, r + half + 0.5);
+        for py in y0..y1 {
+            let dy = py as f32 + 0.5 - cy;
+            let Some([left, right]) = band_runs(cx, dy, band, (x0, x1)) else {
+                continue;
+            };
+            for px in left.chain(right) {
+                let (sx, sy) = (px as f32 + 0.5, py as f32 + 0.5);
+                let dx = sx - cx;
+                let radial = (dx.hypot(dy) - r).abs();
+                if radial - half >= 0.5 {
+                    continue;
+                }
+                let a = (dx.atan2(-dy) / TAU - from).rem_euclid(1.0);
+                let d = if span >= 1.0 || a <= span {
+                    radial
+                } else {
+                    ends.iter()
+                        .map(|&(ex, ey)| (sx - ex).hypot(sy - ey))
+                        .fold(f32::MAX, f32::min)
+                };
+                let coverage = cov(d - half);
+                if coverage > 0.0 {
+                    self.blend(px, py, c, coverage);
+                }
+            }
+        }
+    }
+
     fn hsv_disk(&mut self, cx: f32, cy: f32, r: f32, value: f32) {
         if r <= 0.0 {
             return;
@@ -4243,7 +4356,8 @@ impl Canvas {
 
     fn arc(&mut self, cx: f32, cy: f32, r_mid: f32, thickness: f32, frac: f32, c: [u8; 4]) {
         let frac = frac.clamp(0.0, 1.0);
-        if frac <= 0.0 {
+        // A clear ink (a `Ring`'s clear track) blends nothing.
+        if frac <= 0.0 || c[3] == 0 {
             return;
         }
         let r_out = r_mid + thickness / 2.0;
@@ -4253,10 +4367,16 @@ impl Canvas {
             (cx + r_out + 1.0) as i32,
             (cy + r_out + 1.0) as i32,
         );
+        // Only pixels within half a pixel past the band's edges are covered: each row's run left
+        // and right of the ring's hole (`band_runs`).
+        let band = (r_mid - thickness / 2.0 - 0.5, r_out + 0.5);
         for py in y0..y1 {
-            for px in x0..x1 {
+            let dy = py as f32 + 0.5 - cy;
+            let Some([left, right]) = band_runs(cx, dy, band, (x0, x1)) else {
+                continue;
+            };
+            for px in left.chain(right) {
                 let dx = px as f32 + 0.5 - cx;
-                let dy = py as f32 + 0.5 - cy;
                 let rr = (dx * dx + dy * dy).sqrt();
                 let radial = (rr - r_mid).abs() - thickness / 2.0;
                 let cov_r = cov(radial);
@@ -4302,10 +4422,13 @@ impl Canvas {
             for ch in s.chars() {
                 let glyph = match fonts.face_for(weight, ch) {
                     Some(cface) => self.raster_glyph(&cface.font, ch, px),
-                    None => match self.raster_synthesized(ch, px) {
-                        Some(own) => own,
-                        None => continue,
-                    },
+                    None => {
+                        fonts.note_text_hole();
+                        match self.raster_synthesized(ch, px) {
+                            Some(own) => own,
+                            None => continue,
+                        }
+                    }
                 };
                 let (m, bitmap) = glyph;
                 let gx = q_round_to_px(pen_q) as i32 + m.xmin;
@@ -4349,6 +4472,7 @@ impl Canvas {
                 pen += self.pen_glyph(&cface.font, ch, px, pen, baseline_i, c);
                 continue;
             }
+            fonts.note_text_hole();
             if let Some((m, bitmap)) = self.raster_synthesized(ch, px) {
                 self.blit_fontdue_glyph(pen, baseline_i, &m, &bitmap, c);
                 pen += m.advance_width;
@@ -5315,6 +5439,15 @@ fn replay_tray(
                 width,
                 color,
             } => cv.line_segment((x1 * s, y1 * s), (x2 * s, y2 * s), width * s, *color),
+            DrawPrim::Arc {
+                cx,
+                cy,
+                r,
+                width,
+                from,
+                to,
+                color,
+            } => cv.arc_band((cx * s, cy * s), (r * s, width * s), (*from, *to), *color),
             DrawPrim::Dashed {
                 x,
                 y,
@@ -5395,6 +5528,59 @@ mod tests {
     use super::*;
     use crate::widget::DrawPrim;
     use aterm_render::Theme;
+
+    /// An arc covers each pixel once: a translucent white arc over black lightens no pixel past
+    /// what one blend of it at full cover does, across its band, its round ends and the run
+    /// where a row crosses the ring's hole, and an opaque one covers about its area (the band's
+    /// length times its width, and the two half-discs of its ends), within 2 %.
+    #[test]
+    fn an_arc_covers_each_pixel_once_and_its_area() {
+        let (w, h) = (120_u32, 120_u32);
+        let raster = |prims: &[DrawPrim]| rasterize_tray(prims, w, h, 1.0, [0, 0, 0, 255]).0;
+        let one = raster(&[DrawPrim::Dot {
+            cx: 0.5,
+            cy: 0.5,
+            r: 3.0,
+            color: [255, 255, 255, 128],
+        }])[0];
+        for (r, width, from, to) in [
+            (40.0, 10.6, -0.375, 0.1),
+            (40.0, 10.6, -0.375, 0.6),
+            (12.0, 30.0, 0.0, 0.3),
+            (30.0, 4.0, 0.2, 0.2),
+        ] {
+            let arc = |color: [u8; 4]| DrawPrim::Arc {
+                cx: 60.3,
+                cy: 59.6,
+                r,
+                width,
+                from,
+                to,
+                color,
+            };
+            let px = raster(&[arc([255, 255, 255, 128])]);
+            let brightest = px.chunks(4).map(|p| p[0]).max().unwrap_or(0);
+            assert!(
+                brightest <= one,
+                "r {r} {from}..{to}: {brightest} past one blend's {one}"
+            );
+            let solid = raster(&[arc([255; 4])]);
+            // The raster blends in linear light: a pixel's cover is its byte decoded.
+            let linear = srgb_to_linear_lut();
+            let area = solid
+                .chunks(4)
+                .map(|p| f64::from(linear[usize::from(p[0])]))
+                .sum::<f64>();
+            let span = f64::from((to - from).clamp(0.0, 1.0));
+            let (r, half) = (f64::from(r), f64::from(width) / 2.0);
+            let want =
+                std::f64::consts::TAU * r * span * 2.0 * half + std::f64::consts::PI * half * half;
+            assert!(
+                (area - want).abs() < 0.02 * want,
+                "r {r} {from}..{to}: covers {area:.1} px, not {want:.1}"
+            );
+        }
+    }
 
     #[test]
     fn a_span_blends_byte_for_byte_as_each_of_its_pixels() {
@@ -8651,6 +8837,120 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A ring inks exactly what the distance field over its whole box inks, though it visits only
+    /// its band: whole and partial, with a hole and without, at fractional centres, clipped or
+    /// not; and a clear ink inks nothing.
+    #[test]
+    fn a_ring_skips_only_pixels_it_cannot_ink() {
+        let cases = [
+            (32.0, 26.0, 20.0, 3.0, 1.0),
+            (31.3, 25.7, 22.25, 6.5, 1.0),
+            (30.5, 26.5, 14.0, 1.2, 0.37),
+            (33.1, 24.9, 9.0, 18.0, 1.0),
+            (29.75, 27.2, 4.0, 2.0, 0.81),
+            (31.0, 26.0, 23.5, 0.6, 0.999),
+            (-3.4, 6.2, 18.0, 4.0, 0.5),
+            // Row 43's centre lies exactly `outer` below the centre, and the pixel under the
+            // centre there rounds to a coverage of 1e-6: a walk with no row slack missed it.
+            (35.5, 20.7, 15.5, 13.6, 1.0),
+        ];
+        let paints = [
+            ([0, 0, 0, 0], [18, 28, 42, 255]),
+            ([31, 47, 63, 255], [92, 176, 255, 0xE0]),
+        ];
+        for clip in [None, Some((1.5, 1.25, 55.0, 40.5))] {
+            for &(backdrop, color) in &paints {
+                for &(cx, cy, r_mid, th, frac) in &cases {
+                    let (mut band, mut every) =
+                        (Canvas::new(66, 52, backdrop), Canvas::new(66, 52, backdrop));
+                    if let Some((x, y, w, h)) = clip {
+                        band.push_clip(x, y, w, h);
+                        every.push_clip(x, y, w, h);
+                    }
+                    band.arc(cx, cy, r_mid, th, frac, color);
+
+                    let r_out = r_mid + th / 2.0;
+                    let (x0, y0, x1, y1) = every.clipped_bounds(
+                        (cx - r_out - 1.0) as i32,
+                        (cy - r_out - 1.0) as i32,
+                        (cx + r_out + 1.0) as i32,
+                        (cy + r_out + 1.0) as i32,
+                    );
+                    for py in y0..y1 {
+                        for px in x0..x1 {
+                            let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+                            let rr = (dx * dx + dy * dy).sqrt();
+                            let cov_r = cov((rr - r_mid).abs() - th / 2.0);
+                            let a = dx.atan2(-dy).rem_euclid(TAU) / TAU;
+                            let d = if frac >= 1.0 {
+                                -1.0
+                            } else if a <= frac {
+                                -(a.min(frac - a))
+                            } else {
+                                (a - frac).min(1.0 - a)
+                            };
+                            every.blend(px, py, color, cov_r * cov(d * TAU * rr.max(1.0)));
+                        }
+                    }
+                    assert!(
+                        band.px == every.px,
+                        "ring ({cx},{cy}) r={r_mid} th={th} frac={frac} colour={color:?} clip={clip:?}"
+                    );
+                    let mut clear = Canvas::new(66, 52, backdrop);
+                    clear.arc(cx, cy, r_mid, th, frac, [color[0], color[1], color[2], 0]);
+                    assert!(
+                        clear.px == Canvas::new(66, 52, backdrop).px,
+                        "a clear ring inks"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A ring or an arc whose centre, radius or width is not finite, or lies past any column,
+    /// inks nothing and does not overflow a column, as the whole-box walk before the runs did not.
+    #[test]
+    fn a_ring_or_arc_past_any_column_inks_nothing() {
+        let (blank, _, _) = rasterize_tray(&[], 32, 16, 2.0, [0, 0, 0, 255]);
+        let ink = [200, 120, 40, 255];
+        let ring = |cx: f32, r_outer: f32, thickness: f32| DrawPrim::Ring {
+            cx,
+            cy: 8.0,
+            r_outer,
+            thickness,
+            track: [90, 90, 90, 255],
+            frac: 1.0,
+            fill: ink,
+        };
+        let arc = |cx: f32, r: f32, width: f32| DrawPrim::Arc {
+            cx,
+            cy: 8.0,
+            r,
+            width,
+            from: 0.0,
+            to: 0.75,
+            color: ink,
+        };
+        let (inf, nan) = (f32::INFINITY, f32::NAN);
+        for prim in [
+            ring(inf, 6.0, 1.5),
+            ring(1e30, 6.0, 1.5),
+            ring(8.0, inf, 1.5),
+            ring(8.0, 6.0, inf),
+            ring(nan, 6.0, 1.5),
+            ring(8.0, nan, nan),
+            arc(inf, 6.0, 1.5),
+            arc(1e30, 6.0, 1.5),
+            arc(8.0, inf, 1.5),
+            arc(8.0, 1e30, 1.5),
+            arc(nan, 6.0, 1.5),
+        ] {
+            let (px, _, _) =
+                rasterize_tray(std::slice::from_ref(&prim), 32, 16, 2.0, [0, 0, 0, 255]);
+            assert!(px == blank, "{prim:?} inks");
         }
     }
 

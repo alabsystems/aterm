@@ -51,7 +51,9 @@ fn at(origin: Instant, offset: u64) -> Instant {
 /// The offset of `t` from `origin`, in ns (0 before it).
 #[inline]
 fn offset(origin: Instant, t: Instant) -> u64 {
-    u64::try_from(t.saturating_duration_since(origin).as_nanos()).unwrap_or(u64::MAX)
+    t.saturating_duration_since(origin)
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
 }
 
 /// The first frame boundary (a multiple of `f` ns) after `t`.
@@ -93,17 +95,24 @@ impl Presentation {
     }
 
     /// Its canonical encoding.
+    #[inline]
     pub fn encode(&self, e: &mut Enc) {
         let (g, c) = (&self.geom, &self.cfg);
         e.opt(self.cur, |e, (row, col)| {
             e.u16(row);
             e.u16(col);
         });
-        for v in [g.cw, g.ch, g.rows, g.cols] {
-            e.u64(count(v));
+        let u64_vals = [g.cw, g.ch, g.rows, g.cols];
+        let mut i = 0;
+        while i < u64_vals.len() {
+            e.u64(count(u64_vals[i]));
+            i += 1;
         }
-        for v in [g.origin_x, g.origin_y, g.win_w, g.win_h, g.head] {
-            e.u16(v);
+        let u16_vals = [g.origin_x, g.origin_y, g.win_w, g.win_h, g.head];
+        let mut i = 0;
+        while i < u16_vals.len() {
+            e.u16(u16_vals[i]);
+            i += 1;
         }
         e.bool(c.enabled);
         e.u32(c.intensity);
@@ -121,6 +130,7 @@ impl Presentation {
         });
     }
 
+    #[inline]
     const fn admit(&self) -> Result<(), AdmitRefusal> {
         match admit_tick(
             &MOMENTUM_PROFILE,
@@ -210,6 +220,7 @@ impl Scenario {
     /// # Errors
     /// The first [`ScenarioFault`], checking the frame interval, the start, the end, the input
     /// count, then each input in order.
+    #[inline]
     pub fn new(
         frame_interval_ns: u64,
         start: Presentation,
@@ -229,22 +240,34 @@ impl Scenario {
     /// The checks [`Self::new`] makes.
     /// # Errors
     /// As [`Self::new`].
+    #[inline]
     pub fn validate(&self) -> Result<(), ScenarioFault> {
         let p = &MOMENTUM_PROFILE;
         let f = self.frame_interval();
         if self.frame_interval_ns == 0 || admit_frame_interval(p, f).is_err() {
             return Err(ScenarioFault::FrameInterval(f));
         }
-        let refused = |index, refusal| ScenarioFault::Refused { index, refusal };
-        self.start.admit().map_err(|r| refused(None, r))?;
-        admit_time(p, None, i128::from(self.end_ns)).map_err(|r| refused(None, r))?;
+        if let Err(refusal) = self.start.admit() {
+            return Err(ScenarioFault::Refused {
+                index: None,
+                refusal,
+            });
+        }
+        if let Err(refusal) = admit_time(p, None, i128::from(self.end_ns)) {
+            return Err(ScenarioFault::Refused {
+                index: None,
+                refusal,
+            });
+        }
         if self.events.len() > LANE_MAX_EVENTS {
             return Err(ScenarioFault::TooMany {
                 len: self.events.len(),
             });
         }
         let mut before = 0u64;
-        for (index, &(at, exo)) in self.events.iter().enumerate() {
+        let mut index = 0;
+        while index < self.events.len() {
+            let (at, exo) = self.events[index];
             if at < before {
                 return Err(ScenarioFault::Order { index, at, before });
             }
@@ -258,11 +281,24 @@ impl Scenario {
             before = at;
             match exo {
                 Exo::Key { tau_bits } => {
-                    admit_tau(p, f32::from_bits(tau_bits)).map_err(|r| refused(Some(index), r))?;
+                    if let Err(refusal) = admit_tau(p, f32::from_bits(tau_bits)) {
+                        return Err(ScenarioFault::Refused {
+                            index: Some(index),
+                            refusal,
+                        });
+                    }
                 }
                 Exo::Reset => {}
-                Exo::Present(pr) => pr.admit().map_err(|r| refused(Some(index), r))?,
+                Exo::Present(pr) => {
+                    if let Err(refusal) = pr.admit() {
+                        return Err(ScenarioFault::Refused {
+                            index: Some(index),
+                            refusal,
+                        });
+                    }
+                }
             }
+            index += 1;
         }
         Ok(())
     }
@@ -303,6 +339,7 @@ impl Scenario {
     }
 
     /// How many keys it types.
+    #[inline]
     #[must_use]
     pub const fn keys(&self) -> usize {
         let events = self.events.as_slice();
@@ -318,6 +355,7 @@ impl Scenario {
     }
 
     /// Whether every presentation change comes at the instant of a key.
+    #[inline]
     #[must_use]
     pub const fn presentation_moves_only_at_keys(&self) -> bool {
         let events = self.events.as_slice();
@@ -345,15 +383,18 @@ impl Scenario {
     }
 
     /// The canonical encoding.
+    #[inline]
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new();
+        let mut e = Enc::with_capacity(64 + self.events.len() * 16);
         e.u8(SCENARIO_FORMAT);
         e.u64(self.frame_interval_ns);
         e.u64(self.end_ns);
         self.start.encode(&mut e);
         e.u64(count(self.events.len()));
-        for &(at, exo) in &self.events {
+        let mut ei = 0;
+        while ei < self.events.len() {
+            let (at, exo) = self.events[ei];
             e.u64(at);
             match exo {
                 Exo::Key { tau_bits } => {
@@ -366,11 +407,13 @@ impl Scenario {
                     p.encode(&mut e);
                 }
             }
+            ei += 1;
         }
         e.finish()
     }
 
     /// `Digest::of(SCENARIO_DOMAIN, [the encoding])`.
+    #[inline]
     #[must_use]
     pub fn digest(&self) -> Digest {
         Digest::of(SCENARIO_DOMAIN, &[&self.encode()])
@@ -480,6 +523,7 @@ impl Glow for MomentumHost {
 pub struct Fnv(u64);
 
 impl Default for Fnv {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -513,6 +557,7 @@ impl Fnv {
     }
 
     /// Folds a quad stream: its length, then three words per quad.
+    #[inline]
     pub const fn quads(&mut self, qs: &[GlowQuad]) {
         self.u64(count(qs.len()));
         let mut i = 0;
@@ -528,6 +573,7 @@ impl Fnv {
     }
 
     /// Folds a frame and the quads it appended.
+    #[inline]
     pub const fn frame(&mut self, f: MomentumGlowFrame, out: &[GlowQuad], under: &[GlowQuad]) {
         self.u64(match f.fill {
             Some(v) => v as u64,
@@ -569,6 +615,7 @@ const fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// The canonical encoding of a frame and the quads it appended.
+#[inline]
 pub fn encode_glass(e: &mut Enc, frame: &MomentumGlowFrame, out: &[GlowQuad], under: &[GlowQuad]) {
     encode_frame(e, frame, out, under);
 }
@@ -784,8 +831,9 @@ struct Lane<'g, G: Glow + ?Sized> {
 }
 
 impl<'g, G: Glow + ?Sized> Lane<'g, G> {
+    #[inline]
     fn new(g: &'g mut G, origin: Instant, f_ns: u64) -> Self {
-        let mut glass = Enc::new();
+        let mut glass = Enc::with_capacity(512);
         encode_frame(&mut glass, &MomentumGlowFrame::default(), &[], &[]);
         Lane {
             g,
@@ -795,17 +843,18 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
             out: Vec::with_capacity(QUADS),
             under: Vec::with_capacity(QUADS),
             next_frame: None,
-            calls: Vec::new(),
-            ticks: Vec::new(),
+            calls: Vec::with_capacity(512),
+            ticks: Vec::with_capacity(256),
             counts: LaneCounts::default(),
             fnv: Fnv::new(),
             glass,
-            drawn: Enc::new(),
+            drawn: Enc::with_capacity(512),
             fault: None,
             keyed: false,
         }
     }
 
+    #[inline]
     fn room(&mut self, n: usize, at: u64) -> Result<(), Stop> {
         if self.calls.len().saturating_add(n) > LANE_MAX_EVENTS {
             self.fault = Some(LaneFault::TooManyEvents {
@@ -817,6 +866,7 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
         Ok(())
     }
 
+    #[inline]
     fn key(&mut self, t: u64, tau_bits: u32) -> Result<(), Stop> {
         self.room(1, t)?;
         self.g.key(at(self.origin, t), f32::from_bits(tau_bits));
@@ -834,6 +884,7 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
         Ok(())
     }
 
+    #[inline]
     fn reset(&mut self, t: u64) -> Result<(), Stop> {
         if !self.keyed {
             self.g.rest();
@@ -848,6 +899,7 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
         Ok(())
     }
 
+    #[inline]
     fn hang(&mut self, at: u64, since: u64) {
         self.fault = Some(LaneFault::Hang {
             ticks: self.ticks.len(),
@@ -856,6 +908,7 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
         });
     }
 
+    #[inline]
     fn tick(&mut self, t: u64, p: &Presentation) -> Result<(), Stop> {
         self.room(2, t)?;
         let cfg = p.cfg.config();
@@ -951,6 +1004,7 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
         if stopped { Err(Stop) } else { Ok(()) }
     }
 
+    #[inline]
     fn finish(self, scenario: Scenario) -> LaneRun {
         LaneRun {
             scenario,
@@ -965,6 +1019,7 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
 }
 
 /// Runs `scenario` against `g` (expected at rest) closed loop from `origin`.
+#[inline]
 pub fn run<G: Glow + ?Sized>(g: &mut G, scenario: &Scenario, origin: Instant) -> LaneRun {
     let mut lane = Lane::new(g, origin, scenario.frame_interval_ns);
     let mut present = scenario.start;
@@ -1060,6 +1115,7 @@ const S0_SEGMENT_STARTS: [u64; 8] = [
 const S0_END_NS: u64 = 55_522_741_583;
 
 /// The M3 story's geometry.
+#[inline]
 #[must_use]
 pub const fn s0_geom() -> Geom {
     Geom {
@@ -1075,6 +1131,7 @@ pub const fn s0_geom() -> Geom {
     }
 }
 
+#[inline]
 const fn s0_config(page: Page, col: u16) -> MomentumGlowConfig {
     let dark = matches!(page, Page::Dark);
     MomentumGlowConfig {
@@ -1092,10 +1149,12 @@ const fn s0_config(page: Page, col: u16) -> MomentumGlowConfig {
     }
 }
 
+#[inline]
 const fn s0_presentation(page: Page, row: u16, col: u16) -> Presentation {
     Presentation::of(Some((row, col)), &s0_geom(), &s0_config(page, col))
 }
 
+#[inline]
 const fn s0_advance(row: u16, col: u16) -> (u16, u16) {
     let col = col + 1;
     if col >= S0_COLS - 1 {
@@ -1106,6 +1165,7 @@ const fn s0_advance(row: u16, col: u16) -> (u16, u16) {
 }
 
 /// The M3 story as the perf harness's closed-loop program (design §8.1).
+#[inline]
 pub fn drive_m3_story<G: Glow + ?Sized>(g: &mut G, origin: Instant) -> LaneRun {
     let mut lane = Lane::new(g, origin, S0_FRAME_INTERVAL_NS);
     let tau_bits = S0_TAU.to_bits();
@@ -1115,7 +1175,10 @@ pub fn drive_m3_story<G: Glow + ?Sized>(g: &mut G, origin: Instant) -> LaneRun {
     let mut page = Page::Dark;
     let start = s0_presentation(page, row, col);
     let mut present = start;
-    'story: for (seg_page, rate, cool) in S0_SEGMENTS {
+    let mut seg_i = 0;
+    'story: while seg_i < S0_SEGMENTS.len() {
+        let (seg_page, rate, cool) = S0_SEGMENTS[seg_i];
+        seg_i += 1;
         if seg_page != page {
             if lane.reset(now).is_err() {
                 break 'story;
@@ -1188,6 +1251,7 @@ pub fn drive_m3_story<G: Glow + ?Sized>(g: &mut G, origin: Instant) -> LaneRun {
 }
 
 /// `S0`, the M3 story frozen as an absolute scenario.
+#[inline]
 #[must_use]
 pub fn s0() -> Scenario {
     let tau_bits = S0_TAU.to_bits();
@@ -1195,7 +1259,8 @@ pub fn s0() -> Scenario {
     let (mut row, mut col) = (2u16, 4u16);
     let mut page = Page::Dark;
     let start = s0_presentation(page, row, col);
-    for seg_idx in 0..S0_SEGMENTS.len() {
+    let mut seg_idx = 0;
+    while seg_idx < S0_SEGMENTS.len() {
         let (seg_page, rate, _) = S0_SEGMENTS[seg_idx];
         let seg_start = S0_SEGMENT_STARTS[seg_idx];
         if seg_page != page {
@@ -1206,12 +1271,15 @@ pub fn s0() -> Scenario {
             inputs.push((seg_start, Exo::Present(s0_presentation(page, row, col))));
         }
         let gap = 1_000_000_000 / rate;
-        for k in 0..u64::from(S0_KEYS_PER_BURST) {
+        let mut k = 0u64;
+        while k < u64::from(S0_KEYS_PER_BURST) {
             let t = seg_start + k * gap;
             inputs.push((t, Exo::Key { tau_bits }));
             (row, col) = s0_advance(row, col);
             inputs.push((t, Exo::Present(s0_presentation(page, row, col))));
+            k += 1;
         }
+        seg_idx += 1;
     }
     Scenario {
         frame_interval_ns: S0_FRAME_INTERVAL_NS,

@@ -25,6 +25,16 @@ use crate::common::cnst;
 
 type State = BTreeMap<&'static str, i64>;
 
+/// The wall the model's wall stands for: a request the API refused, a wall that keeps its own act
+/// (`api-retry@v1`, each try on the refused ladder) and its tries; an overload is an outage,
+/// waited out ([`supervise_conformance_outage_wait`](crate::supervise_conformance_outage_wait)).
+const REFUSED: WallKind = WallKind::ApiError {
+    code: Some(400),
+    retryable: false,
+    cause: aterm_phase::ApiCause::Request,
+};
+const REFUSED_MESSAGE: &str = "API Error: 400 bad request";
+
 /// Work a turn did that counts, and work that does not.
 const LONG: Duration = Duration::from_secs(3 * 60);
 const SHORT: Duration = Duration::from_secs(10);
@@ -111,7 +121,7 @@ fn reading(
     } else {
         Phase::Idle
     };
-    let wall = (st["wall"] > 0 && st["box_up"] == 0).then_some(WallKind::Overloaded);
+    let wall = (st["wall"] > 0 && st["box_up"] == 0).then_some(REFUSED);
     let pending_input = unanswered && phase == Phase::Idle;
     TurnEndReading {
         phase,
@@ -119,7 +129,7 @@ fn reading(
         survey: false,
         wall,
         wall_message: if wall.is_some() {
-            "API Error: 529 Overloaded.".to_string()
+            REFUSED_MESSAGE.to_string()
         } else {
             String::new()
         },
@@ -352,7 +362,7 @@ fn expected(m: &Model, st: &State) -> Verdict {
 fn timing() -> TurnEndTiming {
     let min = |m: u64| Duration::from_secs(m * 60);
     TurnEndTiming {
-        retry_backoff: vec![min(1)],
+        refused_backoff: vec![min(1)],
         window: min(24 * 60),
         short_backoff_max: min(8),
         ..TurnEndTiming::default()
@@ -427,7 +437,7 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             };
             real.st.observe(&r, real.now);
         }
-        "WallDue" => real.now += real.st.timing.retry_backoff[0],
+        "WallDue" => real.now += real.st.timing.refused_backoff[0],
         "HourPasses" => real.now += real.st.timing.window + Duration::from_secs(1),
         "BackoffDue" => {
             let wait = real
@@ -1077,4 +1087,10 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
             );
         }
     }
+}
+
+/// The words this bind hands the decider read as the refused request the model's wall stands for.
+#[test]
+fn the_walls_words_read_as_a_refused_request() {
+    assert_eq!(aterm_phase::classify_wall(REFUSED_MESSAGE), Some(REFUSED));
 }

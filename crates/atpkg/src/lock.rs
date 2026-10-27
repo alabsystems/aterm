@@ -302,6 +302,68 @@ pub fn lock_store_waiting(
     )
 }
 
+/// How long a person's typed verb waits for the pass holding the store before it stops.
+pub const TYPED_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// [`lock_store_waiting`] for a person at a terminal, up to `bound`, with one line on stderr
+/// from the first contended poll on, naming `who` waits ("aterm doctor"): what the pass holding
+/// the store is doing, read from its own progress (the program it is on, its bytes and the time
+/// left; between programs, how many of its programs are done and how long it has run), else
+/// that it waits for the pass. The line is cleared when the wait ends; where no meter can be
+/// drawn, the waiting line is said once instead.
+pub fn lock_store_waiting_shown(
+    layout: &Layout,
+    bound: Duration,
+    who: &str,
+) -> Result<StoreLock, StoreLockError> {
+    let meter = std::cell::RefCell::new(None);
+    let waiting = format!("{who} waits for the install pass that holds the store (Ctrl-C stops)");
+    let waited = lock_store_waiting_on(
+        &MonotonicClock,
+        layout,
+        bound,
+        Duration::ZERO,
+        |_| {
+            let (layout, who, busy) = (layout.clone(), who.to_owned(), waiting.clone());
+            let shown = crate::meter::TtyMeter::start(move || {
+                let now = crate::flow::now_unix().max(0).unsigned_abs();
+                match crate::progress::read_progress(&layout)
+                    .filter(|file| crate::progress::snapshot_running(file, now))
+                {
+                    Some(file) => {
+                        let idle = between_programs(&who, &file, now);
+                        crate::meter::Show::Pass {
+                            file,
+                            focus: None,
+                            idle,
+                        }
+                    }
+                    None => crate::meter::Show::Busy(busy.clone()),
+                }
+            });
+            if shown.is_none() {
+                eprintln!("{waiting}");
+            }
+            *meter.borrow_mut() = shown;
+        },
+        || true,
+    );
+    drop(meter.take());
+    waited
+}
+
+/// [`lock_store_waiting_shown`]'s line while the pass is between programs: `who` waits, how many
+/// of its programs are done, and how long it has run at `now` (Unix seconds).
+fn between_programs(who: &str, file: &crate::progress::ProgressFile, now: u64) -> String {
+    let overall = &file.overall;
+    format!(
+        "{who} waits: install pass {}/{} programs, {} s in (Ctrl-C stops)",
+        overall.programs_done,
+        overall.programs_total,
+        now.saturating_sub(file.started_unix)
+    )
+}
+
 /// The clock a waiting acquisition reads and sleeps on ([`lock_store_waiting_on`]).
 pub(crate) trait WaitClock {
     fn now(&self) -> Instant;
@@ -1232,5 +1294,36 @@ mod tests {
             "a caller that has gone is never announced to"
         );
         let _ = std::fs::remove_dir_all(&a.prefix);
+    }
+
+    /// A WAIT BETWEEN THE PASS'S PROGRAMS SAYS HOW FAR THE PASS IS: who waits, the pass's own
+    /// count of programs done of those it planned, and how long it has run, in the 80 columns
+    /// of a default terminal (a meter cuts a longer line), for either verb that waits.
+    #[test]
+    fn a_wait_between_the_passs_programs_says_how_far_the_pass_is() {
+        let file = crate::progress::ProgressFile {
+            v: crate::progress::PROGRESS_VERSION,
+            pid: Some(1),
+            pass: "net".to_owned(),
+            started_unix: 1_000,
+            generation: None,
+            heartbeat_unix: 1_031,
+            overall: crate::progress::Overall {
+                programs_done: 3,
+                programs_total: 14,
+                bytes_done: 0,
+                bytes_total: 0,
+            },
+            queue: Vec::new(),
+            programs: std::collections::BTreeMap::new(),
+            ended_unix: None,
+        };
+        for who in ["aterm doctor", "aterm init"] {
+            let line = between_programs(who, &file, 1_031);
+            assert!(line.starts_with(who), "{line}");
+            assert!(line.contains("3/14 programs, 31 s in"), "{line}");
+            // The meter's spinner and its space take two columns.
+            assert!(line.chars().count() + 2 <= 80, "{line}");
+        }
     }
 }

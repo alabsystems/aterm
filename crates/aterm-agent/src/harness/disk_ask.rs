@@ -854,6 +854,11 @@ pub struct Worker {
     /// a claim is `lost` and a run `gone`, unless a host that runs its session took it over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orphan_ms: Option<i64>,
+    /// The free figure its claim read: what its rise is read from once it runs
+    /// ([`WorkerState::Running`]), as a worker can free before the look that reads it started.
+    /// `None` in a lease a build before this one wrote; that look's figure stands in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_at_claim: Option<u64>,
 }
 
 impl Worker {
@@ -883,8 +888,8 @@ impl Worker {
 pub enum WorkerState {
     /// Its host asked its main thread to start it.
     Claimed,
-    /// It runs as `sid` since `started_ms`; `free_at` the free figure then, `best_free` the most
-    /// read since.
+    /// It runs as `sid` since `started_ms`; `free_at` the free figure its claim read
+    /// ([`Worker::free_at_claim`]), `best_free` the most read since.
     Running {
         sid: String,
         started_ms: i64,
@@ -2537,6 +2542,7 @@ pub fn worker_step(lease: &mut Lease, look: &Look<'_>) -> Option<WorkerSaid> {
         at_ms: look.now_ms,
         state: WorkerState::Claimed,
         orphan_ms: None,
+        free_at_claim: Some(look.free),
     });
     entry.last_worker_ms = Some(look.now_ms);
     entry.due_ms = None;
@@ -2625,7 +2631,7 @@ fn worker_moves(entry: &mut Entry, look: &Look<'_>) -> Option<WorkerSaid> {
                         w.state = WorkerState::Running {
                             sid: sid.clone(),
                             started_ms: sp.at_ms,
-                            free_at: look.free,
+                            free_at: w.free_at_claim.unwrap_or(look.free),
                             best_free: look.free,
                         };
                         WorkerSaid::Started { sid: sid.clone() }
@@ -2768,9 +2774,10 @@ pub struct Brief<'a> {
 }
 
 /// The disk worker's task (the design's §8.4), in at most [`WORKER_TASK_CAP`] bytes of plain
-/// characters: what the volume reads and the target, what aterm did and kept, how to find what
-/// fills it without a look that raises a privacy dialog, to free only through `aterm harness disk
-/// free`, and the report it ends with.
+/// characters: what the volume reads and the target, what aterm did and kept, to run `pwd` first
+/// (so Claude Code writes the shell snapshot its fence proves the worker's commands against), how to
+/// find what fills it without a look that raises a privacy dialog, to free only through `aterm
+/// harness disk free`, and the report it ends with.
 #[must_use]
 pub fn worker_task(b: &Brief<'_>) -> String {
     let used = b.total.saturating_sub(b.free);
@@ -2826,7 +2833,9 @@ pub fn worker_task(b: &Brief<'_>) -> String {
         ));
     }
     out.push_str(
-        " To find what fills it: `aterm ctl @self sys disk scope=aterm` (every tab's folders and \
+        " First run `pwd` alone: Claude Code runs it without asking, and aterm can prove your \
+         other commands only once your Bash tool has run one. To find what fills it: \
+         `aterm ctl @self sys disk scope=aterm` (every tab's folders and \
          where processes write, with growth), `aterm ctl @self sys procs scope=global top=16` \
          (who writes), `aterm harness disk` (what aterm could free and why it kept the rest), and \
          `aterm harness disk free --dry-run` (what the tool caches under ~/Library/Caches, \

@@ -13,6 +13,9 @@ use super::*;
 #[path = "accounts_sync_new_label_tests.rs"]
 mod new_label_tests;
 
+#[path = "accounts_provider_realm_tests.rs"]
+mod provider_realm_tests;
+
 #[cfg(test)]
 #[path = "accounts_source_presence_tests.rs"]
 mod source_presence;
@@ -35,6 +38,22 @@ fn malformed_automatic_source_is_a_refusal_and_preserves_account_records() {
             format!("email,computer,{member},{alias}\nnew@example.test,m16,{value},0\n"),
             "ambiguous",
         )];
+        for second in [
+            format!("NEW@example.test,m22,{value},\n"),
+            format!("NEW@example.test,m16,{value},banned\n"),
+            format!("NEW@example.test,?,{value},\n"),
+            "NEW@example.test,m16,0,banned\n".to_owned(),
+            "NEW@example.test,m16,unsupported-membership,\n".to_owned(),
+        ] {
+            let first = format!("new@example.test,m16,{value},\n");
+            for rows in [format!("{first}{second}"), format!("{second}{first}")] {
+                sources.push((
+                    ACCOUNTS_CSV_FILE.to_owned(),
+                    format!("email,computer,{member},notes\n{rows}"),
+                    "conflicting duplicate",
+                ));
+            }
+        }
         for (fields, diagnostic) in [
             ("machines=['m16', 17]", "`machines`"),
             ("machines=['m16', 'unassigned']", "`machines`"),
@@ -509,6 +528,92 @@ fn the_sheets_columns_fill_each_pool_and_a_vendor_note_drops_that_vendor_alone()
     );
 }
 
+/// The vault's sheet as the ALab vault publishes it (`ai-accounts.csv`, 2026-10-26): its xAI
+/// column is headed `x`, between `kimi` and `notes`, after a blank-headed machine column.
+const VAULT_SHEET: &str = "\
+m,email,computer,,claude,Open AI,google,meta,kimi,x,notes,,
+,one@example.com,m16,,1,,,,,1,,,
+,two@example.com,m16.2,,1,1,,,,,,,
+,three@example.com,m16.3,,,,,,,device,,,
+,four@example.com,m22,,1,,,,,1,,,
+";
+
+/// THE VAULT'S SHEET heads Grok Build's column `x`: Grok Build's pool reads it, a cell's flow
+/// word kept on its row, and a machine that keeps a Grok roster syncs its rows from the sheet
+/// instead of finding no Grok column there. CONTROL: Codex's and Claude Code's readings of the
+/// same sheet take no row from `x`, and a sheet that heads both `x` and `xai` is refused as
+/// ambiguous rather than read by its first match.
+#[test]
+fn the_vault_sheets_x_column_is_grok_builds() {
+    assert!(csv_names_column(Cli::Grok, VAULT_SHEET));
+    let grok = parse_accounting_csv_for(Cli::Grok, VAULT_SHEET, "ai-accounts.csv").unwrap();
+    assert_eq!(
+        fleet_labels(&grok.roster),
+        ["grok-m16", "grok-m16-3", "grok-m22"]
+    );
+    assert_eq!(grok.roster.accounts[1].vendor.flow, Some(Flow::Device));
+
+    let bed = Bed::new("grok-x-column");
+    bed.keep_roster(Cli::Grok);
+    bed.secret(ACCOUNTS_CSV_FILE, VAULT_SHEET);
+    let Ok(CliSync::Synced(synced)) = bed.sync(Cli::Grok, None) else {
+        panic!("a Grok roster syncs from the vault's sheet");
+    };
+    assert!(
+        synced.source.ends_with(ACCOUNTS_CSV_FILE),
+        "{}",
+        synced.source
+    );
+    assert_eq!(synced.added, ["grok-m16", "grok-m16-3"]);
+
+    let codex = parse_accounting_csv_for(Cli::Codex, VAULT_SHEET, "ai-accounts.csv").unwrap();
+    assert_eq!(
+        fleet_labels(&codex.roster),
+        ["codex-m16-2"],
+        "CONTROL: Codex reads `Open AI` alone"
+    );
+    assert_eq!(
+        fleet_labels(&parse_accounting_csv(VAULT_SHEET, "ai-accounts.csv").unwrap()),
+        ["m16", "m16-2", "m22"],
+        "CONTROL: Claude Code reads `claude` alone"
+    );
+    for other in ["xai", "grok"] {
+        let both = format!("email,computer,{other},x\none@example.com,m16,1,0\n");
+        assert!(
+            parse_accounting_csv_for(Cli::Grok, &both, "ai-accounts.csv")
+                .unwrap_err()
+                .contains("ambiguous"),
+            "CONTROL: `x` beside `{other}` is two Grok columns"
+        );
+    }
+}
+
+/// A NOTE'S `x` names no vendor, though the vault's sheet heads Grok Build's column so: `x
+/// banned` drops the row from every pool, as an unscoped `banned` does, rather than from Grok
+/// Build's alone, so a note's stray `x` never keeps a row a disqualifying note was written to
+/// drop. CONTROL: `grok banned` on the same row drops Grok Build's membership alone.
+#[test]
+fn a_notes_x_names_no_vendor_so_x_banned_drops_every_pool() {
+    let sheet = |note: &str| {
+        format!("email,computer,Open AI,kimi,x,notes\none@example.com,m16,1,global,1,{note}\n")
+    };
+    let pools = |text: &str| {
+        [Cli::Codex, Cli::Grok, Cli::Kimi].map(|cli| {
+            parse_accounting_csv_for(cli, text, "ai-accounts.csv")
+                .unwrap()
+                .roster
+                .accounts
+                .len()
+        })
+    };
+    assert_eq!(pools(&sheet("x banned")), [0, 0, 0]);
+    assert_eq!(
+        pools(&sheet("grok banned")),
+        [1, 0, 1],
+        "CONTROL: a note naming Grok Build drops its membership alone"
+    );
+}
+
 /// A CLI'S SYNC writes its roster beside `aterm.toml` (`accounts-kimi.toml`) and its logins'
 /// directories under `~/.aterm/logins/kimi/`, and nothing under `~/.secrets`. CONTROL: Claude
 /// Code's sync in the same home still writes its own `fleet-accounts.toml` beside `aterm.toml`.
@@ -852,6 +957,7 @@ fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_compl
     fs::write(wrong_cli.join("credentials/kimi-code.json"), "{}").unwrap();
     accounts::write_renewal_checkpoint_for(
         Cli::Grok,
+        None,
         "kimi-1",
         "kimi-one@example.com",
         wrong_cli.to_str().unwrap(),
@@ -866,6 +972,7 @@ fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_compl
     let missing_creds = store.claim_staging_dir("kimi-1").unwrap();
     accounts::write_renewal_checkpoint_for(
         Cli::Kimi,
+        Some(Region::Global),
         "kimi-1",
         "kimi-one@example.com",
         missing_creds.to_str().unwrap(),
@@ -893,6 +1000,7 @@ fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_compl
     fs::write(completed.join("credentials/kimi-code.json"), "{}").unwrap();
     accounts::write_renewal_checkpoint_for(
         Cli::Kimi,
+        Some(Region::Global),
         "kimi-1",
         "kimi-one@example.com",
         completed.to_str().unwrap(),
@@ -1747,6 +1855,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
     fs::write(completed.join("auth.json"), "{}").unwrap();
     accounts::write_renewal_checkpoint_for(
         Cli::Codex,
+        None,
         "codex-2",
         "codex-two@example.com",
         completed.to_str().unwrap(),

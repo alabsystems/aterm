@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Startup of the vault subscriber's mend and join-notice workers.
+//! Startup of the vault subscriber's mend and join-notice workers, and of the converge pass's
+//! window lane beside them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// The process's independent once-only starts of its two vault workers.
+/// The process's independent once-only starts of its two vault workers and its converge lane.
 pub(crate) struct Lanes {
     mending: AtomicBool,
     asking: AtomicBool,
+    converging: AtomicBool,
 }
 
 impl Lanes {
@@ -16,6 +18,7 @@ impl Lanes {
         Self {
             mending: AtomicBool::new(false),
             asking: AtomicBool::new(false),
+            converging: AtomicBool::new(false),
         }
     }
 
@@ -30,6 +33,16 @@ impl Lanes {
         if !inactive {
             Self::start_one(&self.mending, mend);
             Self::start_one(&self.asking, asking);
+        }
+    }
+
+    /// The converge pass's window lane, started once its spawner accepts it, on its own start: a
+    /// launch that runs no first-run setup starts it beside the mend, and a setup's run starts it
+    /// once it ends, not before (the mend starts before a run too). An `inactive` request leaves
+    /// it available.
+    pub(crate) fn start_converge(&self, inactive: bool, converge: impl FnOnce() -> bool) {
+        if !inactive {
+            Self::start_one(&self.converging, converge);
         }
     }
 
@@ -133,6 +146,34 @@ mod tests {
             false,
             || panic!("the successful mend stays started"),
             || panic!("the successful notices worker stays started"),
+        );
+    }
+
+    /// The converge lane starts once, on its own start: the mend's start never starts it, an
+    /// inactive request leaves it available, and a refused start retries.
+    #[test]
+    fn the_converge_lane_starts_once_on_its_own_start() {
+        let lanes = Lanes::new();
+        let converges = Cell::new(0);
+        let converge = || {
+            converges.set(converges.get() + 1);
+            converges.get() > 1
+        };
+        lanes.start(false, || true, || true);
+        assert_eq!(
+            converges.get(),
+            0,
+            "the mend's start starts no converge lane"
+        );
+        lanes.start_converge(true, || panic!("an inactive request starts none"));
+        lanes.start_converge(false, converge);
+        lanes.start_converge(false, converge);
+        assert_eq!(converges.get(), 2, "a refused start retries");
+        lanes.start_converge(false, || panic!("started once"));
+        lanes.start(
+            false,
+            || panic!("the mend stays started"),
+            || panic!("so do notices"),
         );
     }
 

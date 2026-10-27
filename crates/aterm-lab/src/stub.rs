@@ -691,12 +691,10 @@ fn call_input(c: &J) -> J {
         .unwrap_or(J::Obj(Vec::new()))
 }
 
-/// [`ToolTurn`] of a request body against a Claude Code script (one step or a list).
-#[must_use]
-pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
-    let j = J::parse_bytes(body).ok()?;
-    let msgs = j.get("messages").and_then(J::as_arr).unwrap_or_default();
-    let steps: Vec<&J> = match script {
+/// The steps of a Claude Code script (one step or a list): each an object that calls a tool
+/// (`name`), several (`calls`), or says `text`.
+fn script_steps(script: &J) -> Vec<&J> {
+    match script {
         J::Arr(a) => a.iter().collect(),
         one => vec![one],
     }
@@ -708,51 +706,74 @@ pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
                 || c.get("calls")
                     .is_some_and(|calls| !script_calls(calls).is_empty()))
     })
-    .collect();
-    let results = tool_results(msgs);
-    let answer = |c: &J, step: usize| {
-        if c.get("name").is_some_and(J::truthy) {
-            ToolTurn::Call(call_name(c), fill_sids(&call_input(c), &results), step)
-        } else if let Some(calls) = c.get("calls").filter(|_| c.get("text").is_none()) {
-            ToolTurn::Calls(
-                script_calls(calls)
-                    .into_iter()
-                    .map(|k| (call_name(k), fill_sids(&call_input(k), &results)))
-                    .collect(),
-                step,
-            )
-        } else {
-            ToolTurn::Say(
-                c.get("text").and_then(J::as_str).unwrap_or("").to_string(),
-                step,
-            )
-        }
-    };
+    .collect()
+}
+
+/// What step `c`, a conversation's `step`-th, answers, its `@SID:<k>@` filled from the tool
+/// results so far (`results`, [`fill_sids`]).
+fn step_turn(c: &J, step: usize, results: &[String]) -> ToolTurn {
+    if c.get("name").is_some_and(J::truthy) {
+        ToolTurn::Call(call_name(c), fill_sids(&call_input(c), results), step)
+    } else if let Some(calls) = c.get("calls").filter(|_| c.get("text").is_none()) {
+        ToolTurn::Calls(
+            script_calls(calls)
+                .into_iter()
+                .map(|k| (call_name(k), fill_sids(&call_input(k), results)))
+                .collect(),
+            step,
+        )
+    } else {
+        ToolTurn::Say(
+            c.get("text").and_then(J::as_str).unwrap_or("").to_string(),
+            step,
+        )
+    }
+}
+
+/// A step's `when`, the word its conversation's first prompt holds, or `None` (a main step).
+fn step_when(c: &J) -> Option<String> {
+    c.get("when")
+        .filter(|w| w.truthy())
+        .map(|w| w.as_str().map_or_else(|| w.py(), str::to_string))
+}
+
+/// The turn of the conversation `msgs` among `steps` keyed to it: those whose `when` its first
+/// user message holds, in order, the conversation standing at the step its tool results and
+/// replies count. `None` when no step is keyed to it.
+fn keyed_turn(msgs: &[J], steps: &[&J], results: &[String]) -> Option<ToolTurn> {
     let first = msgs
         .iter()
         .find(|m| m.get("role").and_then(J::as_str) == Some("user"))
         .map(|m| text_of(m.get("content")))
         .unwrap_or_default();
-    let when_of = |c: &J| {
-        c.get("when")
-            .filter(|w| w.truthy())
-            .map(|w| w.as_str().map_or_else(|| w.py(), str::to_string))
-    };
     let mine: Vec<&&J> = steps
         .iter()
-        .filter(|c| when_of(c).is_some_and(|w| first.contains(&w)))
+        .filter(|c| step_when(c).is_some_and(|w| first.contains(&w)))
         .collect();
-    if !mine.is_empty() {
-        let done = msgs
-            .iter()
-            .filter(|m| is_tool_result(m) || is_said(m))
-            .count();
-        return Some(match mine.get(done) {
-            Some(c) => answer(c, done),
-            None => ToolTurn::Done,
-        });
+    if mine.is_empty() {
+        return None;
     }
-    let main: Vec<&&J> = steps.iter().filter(|c| when_of(c).is_none()).collect();
+    let done = msgs
+        .iter()
+        .filter(|m| is_tool_result(m) || is_said(m))
+        .count();
+    Some(match mine.get(done) {
+        Some(c) => step_turn(c, done, results),
+        None => ToolTurn::Done,
+    })
+}
+
+/// [`ToolTurn`] of a request body against a Claude Code script (one step or a list).
+#[must_use]
+pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
+    let j = J::parse_bytes(body).ok()?;
+    let msgs = j.get("messages").and_then(J::as_arr).unwrap_or_default();
+    let steps = script_steps(script);
+    let results = tool_results(msgs);
+    if let Some(turn) = keyed_turn(msgs, &steps, &results) {
+        return Some(turn);
+    }
+    let main: Vec<&&J> = steps.iter().filter(|c| step_when(c).is_none()).collect();
     let mut step: Option<usize> = None;
     for m in msgs {
         if is_said(m) {
@@ -771,9 +792,20 @@ pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
     }
     let step = step?;
     Some(match main.get(step) {
-        Some(c) => answer(c, step),
+        Some(c) => step_turn(c, step, &results),
         None => ToolTurn::Done,
     })
+}
+
+/// [`ToolTurn`] of a request body against the keyed steps of `script` alone (each with a `when`):
+/// a custom mode's `script`, which answers only a conversation whose first prompt holds a step's
+/// `when` and leaves every other to the mode's own replies, whatever it says (`toolstart`
+/// included). `None` for a conversation no step is keyed to.
+#[must_use]
+pub fn keyed_tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
+    let j = J::parse_bytes(body).ok()?;
+    let msgs = j.get("messages").and_then(J::as_arr).unwrap_or_default();
+    keyed_turn(msgs, &script_steps(script), &tool_results(msgs))
 }
 
 /// `limit:CLAIM:RESET[:PLAN]` → `(claim, reset unix seconds, plan)`.
@@ -1915,27 +1947,8 @@ impl Stub {
                 .as_ref()
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .and_then(|t| J::parse(&t).ok());
-            match script.and_then(|s| tool_turn(body, &s)) {
-                Some(ToolTurn::Call(name, input, step)) => {
-                    let s = format!("{summary} tool:{name} step {step}");
-                    return self.stream_tool(&base.in_mode(&mode), &s, &name, &input, out);
-                }
-                Some(ToolTurn::Calls(calls, step)) => {
-                    let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
-                    let s = format!("{summary} tool:{} step {step}", names.join("+"));
-                    return self.stream_tools(&base.in_mode(&mode), &s, &calls, out);
-                }
-                Some(ToolTurn::Say(text, step)) => {
-                    let s = format!("{summary} tool:text step {step}");
-                    let deltas = split_deltas(&text);
-                    return self.stream(&base.in_mode(&mode), &s, &deltas, 0.0, &[], out);
-                }
-                Some(ToolTurn::Done) => {
-                    let s = format!("{summary} tool:done");
-                    let done = ["Tool call done.".to_string()];
-                    return self.stream(&base.in_mode(&mode), &s, &done, 0.0, &[], out);
-                }
-                None => {}
+            if let Some(turn) = script.and_then(|s| tool_turn(body, &s)) {
+                return self.tool_turn_answer(&base.in_mode(&mode), &summary, turn, out);
             }
         }
         let mut mode = mode;
@@ -1943,6 +1956,15 @@ impl Stub {
             .take_custom(&mode, None)
             .filter(|sp| kind == "main" || !is_scripted(sp))
         {
+            // A custom mode's `script` answers the conversations keyed to it, step by step, as the
+            // `tool` mode does; its replies answer every other.
+            let keyed = sp
+                .get("script")
+                .filter(|_| kind == "main")
+                .and_then(|s| keyed_tool_turn(body, s));
+            if let Some(turn) = keyed {
+                return self.tool_turn_answer(&base.in_mode(&mode), &summary, turn, out);
+            }
             let sp = with_reply(sp, &message_users(body));
             if let Some((name, input)) = scripted_call(&sp, messages_answered(body)) {
                 let s = format!("{summary} custom tool:{name}");
@@ -2856,6 +2878,36 @@ impl Stub {
             &format!("{summary} sse={} deltas{note}", deltas.len()),
         );
         Ok(())
+    }
+
+    /// Answer a request at `turn` of its script ([`tool_turn`], [`keyed_tool_turn`]): the call or
+    /// calls it makes, the words it says, or, every step answered, `Tool call done.`.
+    fn tool_turn_answer(
+        &self,
+        t: &Turn<'_>,
+        summary: &str,
+        turn: ToolTurn,
+        out: &mut Out<'_>,
+    ) -> io::Result<()> {
+        match turn {
+            ToolTurn::Call(name, input, step) => {
+                let s = format!("{summary} tool:{name} step {step}");
+                self.stream_tool(t, &s, &name, &input, out)
+            }
+            ToolTurn::Calls(calls, step) => {
+                let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
+                let s = format!("{summary} tool:{} step {step}", names.join("+"));
+                self.stream_tools(t, &s, &calls, out)
+            }
+            ToolTurn::Say(text, step) => {
+                let s = format!("{summary} tool:text step {step}");
+                self.stream(t, &s, &split_deltas(&text), 0.0, &[], out)
+            }
+            ToolTurn::Done => {
+                let s = format!("{summary} tool:done");
+                self.stream(t, &s, &["Tool call done.".to_string()], 0.0, &[], out)
+            }
+        }
     }
 
     fn stream_tool(

@@ -41,37 +41,52 @@ impl Chain<'_> {
         sig: &[u8],
         tag: &str,
     ) -> Result<Manifest, String> {
-        let signer = roster
-            .authorize_appcast(bytes, sig, self.now_unix)
-            .map_err(|e| format!("appcast has no authorized live machine signature ({e:?})"))?;
-        let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
-        let manifest = Manifest::parse(text)?;
-        signer
-            .bind(manifest.machine_id.as_deref(), manifest.roster_seq)
-            .map_err(|e| format!("appcast signer attribution mismatch ({e:?})"))?;
-        let version = tag.strip_prefix('v').unwrap_or(tag);
-        if manifest.version != version {
-            return Err("release tag/appcast version mismatch".into());
-        }
-        let commit_ok = manifest.commit.as_deref().is_some_and(|c| {
-            c.len() == 40 && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        });
-        if !commit_ok {
-            return Err("invalid source commit".into());
-        }
-        let dmg = super::releases::dmg_name(version);
-        let url = format!(
-            "https://github.com/{}/releases/download/{tag}/{dmg}",
-            self.slug
-        );
-        if manifest.dmg != dmg || manifest.url.as_deref() != Some(url.as_str()) {
-            return Err("signed release origin mismatch".into());
-        }
-        if manifest.build_number == 0 {
-            return Err("zero release build".into());
-        }
-        Ok(manifest)
+        signed_release_appcast(self.slug, roster, bytes, sig, tag, self.now_unix)
     }
+}
+
+/// `bytes`, the appcast of `slug`'s release `tag`, held under `roster` to the rules install.sh's
+/// `verify_manifest` also holds one to before its floors: signed (`sig`) by a machine of the
+/// roster live at `now_unix` and naming that machine, for `tag`'s version, from a full source
+/// commit, naming that release's DMG as its origin, with a nonzero build. The manifest it signs.
+///
+/// # Errors
+/// Each of those that does not hold, or bytes that are not a manifest.
+pub fn signed_release_appcast(
+    slug: &str,
+    roster: &Roster,
+    bytes: &[u8],
+    sig: &[u8],
+    tag: &str,
+    now_unix: i64,
+) -> Result<Manifest, String> {
+    let signer = roster
+        .authorize_appcast(bytes, sig, now_unix)
+        .map_err(|e| format!("appcast has no authorized live machine signature ({e:?})"))?;
+    let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+    let manifest = Manifest::parse(text)?;
+    signer
+        .bind(manifest.machine_id.as_deref(), manifest.roster_seq)
+        .map_err(|e| format!("appcast signer attribution mismatch ({e:?})"))?;
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    if manifest.version != version {
+        return Err("release tag/appcast version mismatch".into());
+    }
+    let commit_ok = manifest.commit.as_deref().is_some_and(|c| {
+        c.len() == 40 && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    });
+    if !commit_ok {
+        return Err("invalid source commit".into());
+    }
+    let dmg = super::releases::dmg_name(version);
+    let url = format!("https://github.com/{slug}/releases/download/{tag}/{dmg}");
+    if manifest.dmg != dmg || manifest.url.as_deref() != Some(url.as_str()) {
+        return Err("signed release origin mismatch".into());
+    }
+    if manifest.build_number == 0 {
+        return Err("zero release build".into());
+    }
+    Ok(manifest)
 }
 
 impl LinuxProver for Chain<'_> {

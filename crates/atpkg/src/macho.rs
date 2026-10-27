@@ -26,8 +26,12 @@ pub fn is_macho_header(head: &[u8]) -> bool {
     FAT_MAGICS.contains(&magic) && head.get(4..8).is_some_and(|n| n != [0; 4])
 }
 
+/// `LC_LOAD_WEAK_DYLIB`: a dylib the loader maps only if present;
+/// brew's linkage checker excludes these (`DYLIB_USE_WEAK_LINK`).
+const WEAK_DYLIB: u32 = 0x8000_0018;
+
 /// The load commands that name a dylib the loader maps (`<mach-o/loader.h>`): `LC_LOAD_DYLIB`, `LC_LOAD_WEAK_DYLIB`, `LC_REEXPORT_DYLIB`, `LC_LAZY_LOAD_DYLIB` and `LC_LOAD_UPWARD_DYLIB`.
-const DYLIB_LOADS: [u32; 5] = [0xC, 0x8000_0018, 0x8000_001F, 0x20, 0x8000_0023];
+const DYLIB_LOADS: [u32; 5] = [0xC, WEAK_DYLIB, 0x8000_001F, 0x20, 0x8000_0023];
 
 /// `LC_ID_DYLIB`: a dylib's own install name, which a program linked against it records.
 const DYLIB_ID: u32 = 0xD;
@@ -124,6 +128,11 @@ pub struct LoadNames {
     pub id: Vec<String>,
     /// Every dylib it loads ([`DYLIB_LOADS`]).
     pub loads: Vec<String>,
+    /// The loads named ONLY by `LC_LOAD_WEAK_DYLIB` commands (a name
+    /// also loaded by a strong command is not weak): the loader
+    /// tolerates their absence, and brew's linkage checker skips
+    /// them entirely.
+    pub weak_loads: Vec<String>,
     /// Its run paths (`LC_RPATH`).
     pub rpaths: Vec<String>,
 }
@@ -145,6 +154,7 @@ impl LoadNames {
         LoadNames {
             id: once(&self.id),
             loads: once(&self.loads),
+            weak_loads: once(&self.weak_loads),
             rpaths: once(&self.rpaths),
         }
     }
@@ -177,6 +187,7 @@ pub fn load_dylibs(bytes: &[u8]) -> Result<Vec<String>, LoadError> {
 pub fn load_names(bytes: &[u8]) -> Result<LoadNames, LoadError> {
     let magic = word(bytes, 0, false, "the header")?;
     let mut out = LoadNames::default();
+    let mut strong: Vec<String> = Vec::new();
     match magic {
         0xCAFE_BABE | 0xCAFE_BABF => {
             let is_wide = magic == 0xCAFE_BABF;
@@ -215,7 +226,7 @@ pub fn load_names(bytes: &[u8]) -> Result<LoadNames, LoadError> {
                 if slice.starts_with(ARCHIVE_MAGIC) {
                     continue;
                 }
-                thin_loads(slice, &format!("slice {i}"), &mut out)?;
+                thin_loads(slice, &format!("slice {i}"), &mut out, &mut strong)?;
             }
         }
         0xBEBA_FECA | 0xBFBA_FECA => {
@@ -223,13 +234,20 @@ pub fn load_names(bytes: &[u8]) -> Result<LoadNames, LoadError> {
                 "a byte-swapped universal header, which no Apple tool writes".to_owned(),
             ));
         }
-        _ => thin_loads(bytes, "the file", &mut out)?,
+        _ => thin_loads(bytes, "the file", &mut out, &mut strong)?,
     }
+    out.weak_loads.retain(|name| !strong.contains(name));
     Ok(out)
 }
 
-/// The names one thin slice's load commands carry, appended to `out`.
-fn thin_loads(slice: &[u8], what: &str, out: &mut LoadNames) -> Result<(), LoadError> {
+/// The names one thin slice's load commands carry, appended to `out`
+/// (strongly loaded names also to `strong`, for the weak-only split).
+fn thin_loads(
+    slice: &[u8],
+    what: &str,
+    out: &mut LoadNames,
+    strong: &mut Vec<String>,
+) -> Result<(), LoadError> {
     let (little, header, align) = match word(slice, 0, false, what)? {
         0xCFFA_EDFE => (true, HEADER_64, 8),
         0xFEED_FACF => (false, HEADER_64, 8),
@@ -295,7 +313,15 @@ fn thin_loads(slice: &[u8], what: &str, out: &mut LoadNames) -> Result<(), LoadE
             fixed,
             little,
         };
-        list.push(command.name(&format!("{what}'s {kind} command {i}"))?);
+        let name = command.name(&format!("{what}'s {kind} command {i}"))?;
+        if DYLIB_LOADS.contains(&cmd) {
+            if cmd == WEAK_DYLIB {
+                out.weak_loads.push(name.clone());
+            } else {
+                strong.push(name.clone());
+            }
+        }
+        list.push(name);
         at = next;
     }
     Ok(())
@@ -683,7 +709,8 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::fixtures::{
-        archive, dylib_command, dylib_command32, fat, other_command, rpath_command, thin, thin32,
+        LOAD_DYLIB, archive, dylib_command, dylib_command32, fat, other_command, rpath_command,
+        thin, thin32,
     };
     use super::*;
 
@@ -936,6 +963,7 @@ mod tests {
                 "@@HOMEBREW_CELLAR@@/xz/1/lib/liblzma.5.dylib".into(),
                 "/usr/lib/libSystem.B.dylib".into(),
             ],
+            weak_loads: Vec::new(),
             rpaths: vec![
                 "@@HOMEBREW_PREFIX@@/lib".into(),
                 "@loader_path/../lib".into(),
@@ -1021,6 +1049,7 @@ mod tests {
         let want = LoadNames {
             id: vec!["@rpath/libswiftCore.dylib".into()],
             loads: vec!["/usr/lib/libSystem.B.dylib".into()],
+            weak_loads: Vec::new(),
             rpaths: vec!["@loader_path/../lib".into()],
         };
         for little in [true, false] {
@@ -1057,6 +1086,36 @@ mod tests {
                 other => panic!("{what}: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn weak_only_loads_are_split_from_strong_loads() {
+        let weak = 0x8000_0018;
+        let bytes = thin(
+            &[
+                dylib_command(LOAD_DYLIB, "/p/lib/libstrong.dylib", true),
+                dylib_command(weak, "/p/lib/libweak.dylib", true),
+                dylib_command(weak, "/p/lib/libboth.dylib", true),
+                dylib_command(LOAD_DYLIB, "/p/lib/libboth.dylib", true),
+            ],
+            true,
+        );
+        let names = load_names(&bytes).unwrap();
+        assert_eq!(
+            names.loads,
+            [
+                "/p/lib/libstrong.dylib",
+                "/p/lib/libweak.dylib",
+                "/p/lib/libboth.dylib",
+                "/p/lib/libboth.dylib",
+            ]
+        );
+        assert_eq!(
+            names.weak_loads,
+            ["/p/lib/libweak.dylib"],
+            "a dual-loaded name is not weak-only"
+        );
+        assert_eq!(names.once().weak_loads, ["/p/lib/libweak.dylib"]);
     }
 
     /// The reader agrees with Apple's own `otool` on real files: a Command Line Tools

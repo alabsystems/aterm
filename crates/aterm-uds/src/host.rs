@@ -247,6 +247,37 @@ pub struct Tool {
     pub provider: Provider,
 }
 
+/// A fixed place or `$PATH` entry a lookup may take: on Unix a file with an execute bit, as a
+/// shell's `$PATH` search and `execvp` take one, so a mode-0644 `rustup` early on `$PATH` is
+/// passed over for the next.
+fn runnable(candidate: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(candidate)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        candidate.is_file()
+    }
+}
+
+/// Why [`Tool::locate_in`] found no copy, and the provider's one command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Absent {
+    /// What was looked at ([`Tool::looked_in`]), or the `$ATERM_TEST_<NAME>` that names no file.
+    pub why: String,
+    /// [`Tool::remedy`]; for a `$ATERM_TEST_<NAME>` that names no file, unsetting it first.
+    pub fix: String,
+}
+
+impl std::fmt::Display for Absent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.why, self.fix)
+    }
+}
+
 /// What a resolver reads from its environment, injected so a test can stand up any host.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Lookup {
@@ -310,46 +341,109 @@ impl Tool {
             .then_some(exe)
     }
 
-    /// This tool on the host `lookup` describes, in the one order every gate resolves.
-    ///
-    /// # Panics
-    /// When `$ATERM_TEST_<NAME>` names something that is not a file.
-    #[must_use]
-    pub fn find_in(&self, lookup: &Lookup) -> Option<PathBuf> {
+    /// The one resolution order: `Err` when `$ATERM_TEST_<NAME>` names no file.
+    fn resolve(&self, lookup: &Lookup) -> Result<Option<PathBuf>, String> {
         if let Some(named) = &lookup.named {
             let named = PathBuf::from(named);
-            assert!(
-                named.is_file(),
-                "{} points at {named:?}, which is not a file",
-                self.var()
-            );
-            return Some(std::path::absolute(&named).unwrap_or(named));
+            if !named.is_file() {
+                return Err(format!(
+                    "{} points at {named:?}, which is not a file",
+                    self.var()
+                ));
+            }
+            return Ok(Some(std::path::absolute(&named).unwrap_or(named)));
         }
         if let Some(pinned) = lookup
             .tooling
             .as_deref()
             .and_then(|tooling| self.placed_in(tooling))
         {
-            return Some(pinned);
+            return Ok(Some(pinned));
         }
-        if let Some(found) = self
-            .at
-            .iter()
-            .map(Path::new)
-            .find(|candidate| candidate.is_file())
-        {
-            return Some(found.to_path_buf());
+        if let Some(found) = self.at.iter().map(Path::new).find(|at| runnable(at)) {
+            return Ok(Some(found.to_path_buf()));
         }
-        std::env::split_paths(lookup.path.as_ref()?)
+        let Some(path) = lookup.path.as_ref() else {
+            return Ok(None);
+        };
+        Ok(std::env::split_paths(path)
             .filter(|dir| dir.is_absolute())
             .map(|dir| dir.join(self.name))
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| runnable(candidate)))
+    }
+
+    /// This tool on the host `lookup` describes, in the one order every gate resolves.
+    ///
+    /// # Panics
+    /// When `$ATERM_TEST_<NAME>` names something that is not a file.
+    #[must_use]
+    pub fn find_in(&self, lookup: &Lookup) -> Option<PathBuf> {
+        self.resolve(lookup).unwrap_or_else(|why| panic!("{why}"))
     }
 
     /// [`Tool::find_in`] on this host ([`Lookup::host`]).
     #[must_use]
     pub fn find(&self) -> Option<PathBuf> {
         self.find_in(&Lookup::host(self))
+    }
+
+    /// [`Tool::find_in`] for a check that reports rather than panics: found, or what was
+    /// looked at (or the `$ATERM_TEST_<NAME>` that names no file) and the provider's one
+    /// command.
+    ///
+    /// # Errors
+    /// Found nowhere, or `$ATERM_TEST_<NAME>` names something that is not a file.
+    pub fn locate_in(&self, lookup: &Lookup) -> Result<PathBuf, Absent> {
+        match self.resolve(lookup) {
+            Ok(Some(found)) => Ok(found),
+            Ok(None) => Err(Absent {
+                why: format!(
+                    "no {} ({})",
+                    self.missing.unwrap_or(self.name),
+                    self.looked_in(lookup.tooling.as_deref())
+                ),
+                fix: self.remedy(),
+            }),
+            Err(why) => Err(Absent {
+                why,
+                fix: format!(
+                    "unset {} or point it at a {}, since it outranks every other place; \
+                     without it, {}",
+                    self.var(),
+                    self.name,
+                    self.remedy()
+                ),
+            }),
+        }
+    }
+
+    /// [`Tool::locate_in`] on this host ([`Lookup::host`]).
+    ///
+    /// # Errors
+    /// As [`Tool::locate_in`].
+    pub fn locate(&self) -> Result<PathBuf, Absent> {
+        self.locate_in(&Lookup::host(self))
+    }
+
+    /// Where [`Tool::find_in`] looks, in its order: the variable, the stamped pin (under
+    /// `tooling`, where that is known), the usual paths, then `$PATH`.
+    #[must_use]
+    pub fn looked_in(&self, tooling: Option<&Path>) -> String {
+        let mut places = vec![format!("${}", self.var())];
+        if let Some(pin) = self.pin {
+            places.push(match tooling.and_then(|t| self.pinned_in(t)) {
+                Some(exe) => format!("the stamped {} at {}", pin.version, exe.display()),
+                None => format!("the stamped {} in this user's tooling cache", pin.version),
+            });
+        }
+        places.extend(self.at.iter().map(|at| (*at).to_string()));
+        places.push("$PATH".to_string());
+        let last = places.pop().unwrap_or_default();
+        if places.is_empty() {
+            format!("looked in {last}")
+        } else {
+            format!("looked in {} and {last}", places.join(", "))
+        }
     }
 
     /// [`Tool::find_in`], or the calling test ends COULD NOT RUN naming this tool's provider.

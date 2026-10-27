@@ -7,6 +7,8 @@
 
 use std::fs;
 
+use aterm_spec::wait::MUST_HAPPEN;
+
 use super::*;
 
 fn args(a: &[&str]) -> Vec<String> {
@@ -341,7 +343,7 @@ fn a_session_runs_only_under_its_own_live_runner_and_the_runner_waits_for_the_le
         "held"
     );
     let pauses = std::cell::Cell::new(0);
-    let stopped = LabLog::open_within(&root, Pair::Practice(0), Duration::from_secs(30), &|_| {
+    let stopped = LabLog::open_within(&root, Pair::Practice(0), MUST_HAPPEN, &|_| {
         pauses.set(pauses.get() + 1);
         Err("stopped".to_owned())
     });
@@ -351,11 +353,11 @@ fn a_session_runs_only_under_its_own_live_runner_and_the_runner_waits_for_the_le
         std::thread::sleep(Duration::from_millis(1_500));
         drop(child);
     });
-    let taken = LabLog::open_within(&root, Pair::Practice(0), Duration::from_secs(30), &pause)
+    let taken = LabLog::open_within(&root, Pair::Practice(0), MUST_HAPPEN, &pause)
         .expect("taken once the child lets it go");
     release.join().expect("the releasing thread");
     drop(taken);
-    LabLog::open_within(&root, Pair::Practice(0), Duration::from_secs(30), &|_| {
+    LabLog::open_within(&root, Pair::Practice(0), MUST_HAPPEN, &|_| {
         Err("paused".to_owned())
     })
     .expect("a free lock is taken with no pause");

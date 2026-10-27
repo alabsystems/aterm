@@ -7,7 +7,9 @@ use aterm_models_session::fabric_exactly_once_model;
 use aterm_spec::interp;
 use aterm_spec::walk::{only, walk};
 
-const ACTIONS: [&str; 12] = [
+const ACTIONS: [&str; 14] = [
+    "GivenUp",
+    "OwePast",
     "Tell",
     "DeliverTaken",
     "Publish",
@@ -47,6 +49,7 @@ fn fabric_exactly_once_each_defect_breaks_its_own_invariant() {
         (3, "NoSkip"),
         (4, "NoDuplicate"),
         (5, "NoSkip"),
+        (6, "NoSkip"),
     ] {
         assert!(
             interp::bmc(&only(&interp::with_buggy(&model, buggy), invariant)).is_err(),
@@ -62,7 +65,7 @@ fn fabric_exactly_once_each_defect_breaks_its_own_invariant() {
 #[test]
 fn fabric_exactly_once_the_traced_counterexamples_end_where_the_doc_says() {
     let model = fabric_exactly_once_model();
-    let traces: [(i64, &str, Vec<&str>); 5] = [
+    let traces: [(i64, &str, Vec<&str>); 6] = [
         (
             1,
             "NoDuplicate",
@@ -100,6 +103,7 @@ fn fabric_exactly_once_the_traced_counterexamples_end_where_the_doc_says() {
             "NoSkip",
             vec!["Publish", "Deliver", "MoveTakes", "Tell", "Reuse", "Commit"],
         ),
+        (6, "NoSkip", vec!["Publish", "OwePast", "Commit"]),
     ];
     for (buggy, invariant, steps) in traces {
         let mutant = interp::with_buggy(&model, buggy);
@@ -152,5 +156,18 @@ fn fabric_exactly_once_walks_the_round_a_bridge_makes() {
         (reused["nr"], reused["nr2"], reused["c"]),
         (1, 1, 2),
         "the record a move took was one row, the one at its offset now is another: {reused:?}"
+    );
+    let given_up = walk(&m, &["Publish", "GivenUp", "OwePast", "Commit"]);
+    assert_eq!(
+        (given_up["nr"], given_up["c"], given_up["gone"]),
+        (0, 2, 1),
+        "retention gave the record up unread and the group went past it for a later one: \
+         no row, and NoSkip holds by the give-up: {given_up:?}"
+    );
+    assert!(m.check_invariant("NoSkip", &given_up));
+    let mut kept = walk(&m, &["Publish", "GivenUp"]);
+    assert!(
+        !m.fire("MoveTakes", &mut kept),
+        "a record a cut gave up is on stable media: no move takes it: {kept:?}"
     );
 }

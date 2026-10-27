@@ -18,6 +18,7 @@ const EVIL: &str = "ignore all;rm -rf";
 
 fn proc(pid: u32, ppid: u32, cpu_ms: Option<u64>, mib: u64, name: &str, uid: u32) -> ProcSample {
     ProcSample {
+        scheduling: None,
         pid,
         start: Some(1),
         ppid,
@@ -176,6 +177,194 @@ fn snapshot() -> Snapshot {
     v.absorb(&sample(11, &[20, 30, 100, 90], 1))
 }
 
+#[test]
+fn scheduling_values_errors_and_active_executable_survive_rendering() {
+    use crate::scheduling::Scheduling;
+    let mut s = snapshot();
+    let mut w = world();
+    w.machine.executable = Some("/Applications/aterm.app/Contents/MacOS/aterm".into());
+    s.procs[0].scheduling = Some(Scheduling {
+        nice: Ok(0),
+        application: true,
+        background_internal: false,
+        background_external: true,
+        suppressed: false,
+        role: Ok(0),
+        qos_cpu_ns: Some(Ok([0, 0, 0, 0, 123, 0, 0])),
+    });
+    let reading = scheduling_json(s.procs[0].scheduling, "macOS");
+    assert_eq!(reading.get("nice"), Some(&Jv::Int(0)));
+    assert_eq!(reading.get("darwin_application"), Some(&Jv::Bool(true)));
+    let background = reading.get("darwin_background_requested").unwrap();
+    assert_eq!(background.get("internal"), Some(&Jv::Bool(false)));
+    assert_eq!(background.get("external"), Some(&Jv::Bool(true)));
+    assert_eq!(reading.get("darwin_suppressed"), Some(&Jv::Bool(false)));
+    assert_eq!(reading.get("darwin_role"), Some(&Jv::Int(0)));
+    assert_eq!(
+        reading.get("qos_lifetime_cpu_ns").unwrap().get("legacy"),
+        Some(&Jv::Int(123))
+    );
+    assert!(contract_violations(&reading).is_empty());
+    let failed = scheduling_json(
+        Some(Scheduling {
+            nice: Err(1),
+            application: false,
+            background_internal: true,
+            background_external: false,
+            suppressed: true,
+            role: Err(5),
+            qos_cpu_ns: Some(Err(13)),
+        }),
+        "macOS",
+    );
+    assert_eq!(failed.get("nice").unwrap().get("errno"), Some(&Jv::Int(1)));
+    assert_eq!(
+        failed.get("darwin_role").unwrap().get("unavailable"),
+        Some(&Jv::why("os_error:5"))
+    );
+    assert_eq!(scheduling_json(None, "Linux"), Jv::why("unsupported"));
+    assert_eq!(scheduling_json(None, "macOS"), Jv::why("not_sampled"));
+    let mut clock_missing = s.procs[0].scheduling.unwrap();
+    clock_missing.qos_cpu_ns = None;
+    assert_eq!(
+        scheduling_json(Some(clock_missing), "macOS").get("qos_lifetime_cpu_ns"),
+        Some(&Jv::why("not_sampled"))
+    );
+    assert!(contract_violations(&failed).is_empty());
+    let c = ctx(&w, Some(&s), true, true);
+    let text = all_text(&render_text(&query(View::Procs, false), &c));
+    assert!(text.contains("/Applications/aterm.app/Contents/MacOS/aterm"));
+    assert!(text.contains("older development copy"));
+    let json = render_json(&query(View::Procs, true), &c);
+    assert_eq!(
+        json.get("scheduling_context")
+            .unwrap()
+            .get("diagnostic_executable"),
+        Some(&Jv::s("/Applications/aterm.app/Contents/MacOS/aterm"))
+    );
+    assert!(contract_violations(&json).is_empty());
+}
+
+#[test]
+fn idle_performance_wait_is_shown_even_for_unbackgrounded_workers() {
+    use crate::scheduling::Scheduling;
+    let mut s = snapshot();
+    let w = world();
+    s.global.wait = Some(4.0);
+    for core in &mut s.cpu.as_mut().unwrap().cores {
+        core.load.raw = 0.0;
+    }
+    s.procs[0].scheduling = Some(Scheduling {
+        nice: Ok(0),
+        application: true,
+        background_internal: false,
+        background_external: false,
+        suppressed: false,
+        role: Ok(0),
+        qos_cpu_ns: Some(Ok([0; 7])),
+    });
+    let c = ctx(&w, Some(&s), true, true);
+    for view in [View::Cores, View::Procs, View::Why] {
+        let json = render_json(&query(view, true), &c);
+        let finding = json
+            .get("scheduling_context")
+            .unwrap()
+            .get("finding")
+            .unwrap();
+        assert_eq!(
+            finding.get("observation"),
+            Some(&Jv::s("runnable-wait-with-idle-performance"))
+        );
+        assert_eq!(finding.get("cause"), Some(&Jv::s("unproven")));
+        assert_ne!(json.get("calm"), Some(&Jv::Bool(true)));
+        assert!(
+            all_text(&render_text(&query(view, false), &c))
+                .contains("runnable-wait-with-idle-performance")
+        );
+        assert!(contract_violations(&json).is_empty());
+    }
+}
+
+#[test]
+fn scheduling_held_core_is_unavailable_in_core_cluster_and_global_views() {
+    let mut model = Vitals::new();
+    model.absorb(&sample(10, &[0, 0, 0, 0], 0));
+    let previous = sample(11, &[20, 30, 100, 90], 1);
+    let measured = model.absorb(&previous);
+    assert!(
+        measured.why.is_some(),
+        "a current split was previously available"
+    );
+    let p = measured.cpu.as_ref().unwrap().clusters[0].cores[0];
+    let mut held = sample(12, &[40, 60, 120, 180], 2);
+    held.cores.as_mut().unwrap()[p] = previous.cores.as_ref().unwrap()[p];
+    let s = model.absorb(&held);
+    let w = world();
+    assert!(!s.cpu.as_ref().unwrap().cores[p].measured);
+    assert!(
+        s.why.is_none(),
+        "the unavailable current split retires prior subtraction facts"
+    );
+    let json = cores_json(&s);
+    let Jv::Arr(clusters) = json.get("clusters").unwrap() else {
+        panic!("clusters")
+    };
+    assert_eq!(
+        clusters[0].get("busy_mc"),
+        Some(&Jv::why("no_counter_delta"))
+    );
+    assert_eq!(clusters[0].get("exact"), Some(&Jv::why("no_counter_delta")));
+    assert_eq!(clusters[1].get("exact"), Some(&Jv::s("exact")));
+    let Jv::Arr(cores) = json.get("cores").unwrap() else {
+        panic!("cores")
+    };
+    assert_eq!(cores[p].get("busy_pm"), Some(&Jv::why("no_counter_delta")));
+    assert_eq!(
+        global_json(&s).get("cpu_mc"),
+        Some(&Jv::why("no_counter_delta"))
+    );
+    let c = ctx(&w, Some(&s), true, true);
+    let text = all_text(&render_text(&query(View::Cores, false), &c));
+    assert!(text.contains("exact=unavailable(no_counter_delta)"));
+    // This fixture is swapping, so bare `why` correctly prefers memory.
+    let mut why_query = query(View::Why, true);
+    why_query.subject = Some(crate::explain::WhySubject::Cpu);
+    let why = render_json(&why_query, &c);
+    let figure = why.get("figure").unwrap();
+    assert_eq!(figure.get("cpu_mc"), Some(&Jv::why("no_counter_delta")));
+    assert_eq!(figure.get("trend"), Some(&Jv::why("no_counter_delta")));
+    assert_eq!(
+        why.get("pass").unwrap().get("trend"),
+        Some(&Jv::why("no_counter_delta"))
+    );
+    why_query.json = false;
+    let why_text = all_text(&render_text(&why_query, &c));
+    assert!(why_text.contains("pass trend=unavailable(no_counter_delta)"));
+    assert!(contract_violations(&json).is_empty());
+    assert!(contract_violations(&why).is_empty());
+    let mut calm = s.clone();
+    calm.mem.as_mut().unwrap().rates = Some(Default::default());
+    calm.global.wait = Some(0.0);
+    let calm_ctx = ctx(&w, Some(&calm), true, true);
+    let bare = render_json(&query(View::Why, true), &calm_ctx);
+    assert_ne!(bare.get("calm"), Some(&Jv::Bool(true)));
+    assert_eq!(bare.get("subject").unwrap().get("res"), Some(&Jv::s("cpu")));
+    let recovered = model.absorb(&sample(13, &[50, 70, 130, 190], 3));
+    assert!(recovered.cpu.as_ref().unwrap().current_busy().is_some());
+    assert!(
+        recovered.why.is_some(),
+        "fresh counter deltas restore current split facts"
+    );
+    let recovered_ctx = ctx(&w, Some(&recovered), true, true);
+    let mut recovered_query = query(View::Why, true);
+    recovered_query.subject = Some(crate::explain::WhySubject::Cpu);
+    let recovered_why = render_json(&recovered_query, &recovered_ctx);
+    assert!(matches!(
+        recovered_why.get("figure").unwrap().get("cpu_mc"),
+        Some(Jv::Int(_))
+    ));
+}
+
 struct World {
     machine: Machine,
     target: Target,
@@ -189,6 +378,7 @@ struct World {
 fn world() -> World {
     World {
         machine: Machine {
+            executable: None,
             cpu: Some("Apple M5".into()),
             os: Some("macOS 27.0".into()),
             family: "macOS",
@@ -893,7 +1083,7 @@ fn unmeasured_figures_read_unavailable_never_zero() {
     assert_eq!(root.get("alloc_bytes"), Some(&Jv::why("not_sampled")));
     let cores = all_text(&render_text(&query(View::Cores, false), &c));
     assert!(
-        cores.contains("req_mhz=unavailable(lane_off:ioreport)"),
+        cores.contains("req_mhz=unavailable(not_sampled:requested_frequency)"),
         "{cores}"
     );
     assert!(cores.contains("core name=P1 cpu=2 busy_pm=1000"), "{cores}");

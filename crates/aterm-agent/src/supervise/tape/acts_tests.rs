@@ -254,6 +254,48 @@ fn a_probe_is_answered_from_before_the_cursor() {
 }
 
 #[test]
+fn a_wait_carrying_the_word_is_the_bare_wait_a_tape_recorded() {
+    let gone = ["await", "gone", "esc.to.interrupt", "timeout", "20000"];
+    let tape = || {
+        cursor(vec![
+            ctl(&gone, "gone"),
+            ctl(&["text"], "t"),
+            ctl(&["turn", "keep going"], "typed"),
+            ctl(&["await", "seq", "7", "timeout", "20000"], "woke"),
+        ])
+    };
+    let carried = [&gone[..], &["autopilot=-"]].concat();
+    let mut c = tape();
+    assert_eq!(ask(&mut c, &carried).map(|s| s.reply), Ok(said("gone")));
+    assert_eq!((c.account.tainted, c.position()), (0, 1), "the very wait");
+    assert_eq!(ask(&mut c, &carried).map(|s| s.reply), Ok(said("gone")));
+    assert_eq!(c.account.repeated, 1, "asked again: served again");
+    assert_eq!(
+        ask(
+            &mut c,
+            &["await", "seq", "7", "timeout", "20000", "autopilot=land"]
+        )
+        .err(),
+        Some(Refusal::Skipped {
+            closing: 2,
+            class: ActClass::Wait
+        }),
+        "held only past the act, the word aside: the act skipped"
+    );
+    let mut c = tape();
+    assert_eq!(
+        ask(
+            &mut c,
+            &["await", "gone", "other", "timeout", "20000", "autopilot=-"]
+        )
+        .map(|s| s.reply),
+        Ok(said("gone")),
+        "control: another target is only its kind's, tainted"
+    );
+    assert_eq!(c.account.tainted, 1);
+}
+
+#[test]
 fn a_wait_with_other_arguments_is_tainted() {
     let wait = |seq: &str| ctl(&["await", "seq", seq, "timeout", "20000"], "woke");
     let mut c = ActsCursor::new(

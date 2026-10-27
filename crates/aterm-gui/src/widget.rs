@@ -406,6 +406,20 @@ pub(crate) enum DrawPrim {
         width: f32,
         color: Rgba,
     },
+    /// An anti-aliased band along the circle of radius `r` about (`cx`, `cy`), `width` across,
+    /// from `from` to `to` turns clockwise from 12 o'clock (a span of `to − from`, at most a
+    /// turn), each end a half-disc `width` across (as a [`DrawPrim::Line`]'s cap). It covers
+    /// each pixel once, so a translucent arc has no seam where a chain of round-capped lines
+    /// would lay its joints over each other (the stats dial's glow).
+    Arc {
+        cx: f32,
+        cy: f32,
+        r: f32,
+        width: f32,
+        from: f32,
+        to: f32,
+        color: Rgba,
+    },
     /// A dashed stroke `width` thick, its dashes `on` long and `off` apart:
     /// the rect's outline, inside the rect as an unrounded
     /// [`DrawPrim::Stroke`] draws it, with every corner solid. A rect too
@@ -561,6 +575,18 @@ impl DrawPrim {
                 color,
             } => {
                 f32_bits(state, &[*x1, *y1, *x2, *y2, *width]);
+                color.hash(state);
+            }
+            Self::Arc {
+                cx,
+                cy,
+                r,
+                width,
+                from,
+                to,
+                color,
+            } => {
+                f32_bits(state, &[*cx, *cy, *r, *width, *from, *to]);
                 color.hash(state);
             }
             Self::Dashed {
@@ -784,6 +810,7 @@ pub(crate) fn translate_prims(prims: &mut [DrawPrim], dx: f32, dy: f32) {
                 *y += dy;
             }
             DrawPrim::Ring { cx, cy, .. }
+            | DrawPrim::Arc { cx, cy, .. }
             | DrawPrim::Dot { cx, cy, .. }
             | DrawPrim::HsvDisk { cx, cy, .. } => {
                 *cx += dx;
@@ -1039,6 +1066,15 @@ mod tests {
                 width: 1.5,
                 color: ink,
             },
+            DrawPrim::Arc {
+                cx: 9.0,
+                cy: 9.0,
+                r: 6.0,
+                width: 2.5,
+                from: -0.375,
+                to: 0.125,
+                color: ink,
+            },
             DrawPrim::Dashed {
                 x: 1.0,
                 y: 2.0,
@@ -1267,6 +1303,7 @@ mod tests {
                 nudged!(p, Stroke(x, y, w, h, radius, width, color))
             }
             DrawPrim::Line { .. } => nudged!(p, Line(x1, y1, x2, y2, width, color)),
+            DrawPrim::Arc { .. } => nudged!(p, Arc(cx, cy, r, width, from, to, color)),
             DrawPrim::Dashed { .. } => {
                 nudged!(p, Dashed(x, y, w, h, width, on, off, color))
             }

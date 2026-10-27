@@ -434,9 +434,12 @@ struct Script<'a> {
     virtual_time: bool,
 }
 
+/// The door's policy under `occupancy`: the door alone, without Cruise's carry at a break
+/// (`continue_policy` off), which `cruise_carry_loop_tests` runs beside it.
 fn policy(occupancy: Occupancy) -> SupervisorConfig {
     SupervisorConfig {
         occupancy,
+        continue_policy: false,
         ..hosted(30).policy
     }
 }
@@ -838,6 +841,7 @@ fn each_guard_holds_the_due_line_and_nothing_is_written() {
                     let mut reading =
                         s.turn_end_reading(&screen_at(90, ended(SAID)), None, &hosted(30));
                     reading.left_record = true;
+                    reading.autopilot = Autopilot::Land;
                     s.turn_end.observe(&reading, s.fx.mono());
                 }
             },
@@ -1643,6 +1647,7 @@ fn a_persons_exchange_over_a_three_hour_shell_types_nothing() {
                 let mut reading =
                     s.turn_end_reading(&screen_at(90, ended(SAID)), None, &hosted(30));
                 reading.left_record = true;
+                reading.autopilot = Autopilot::Land;
                 s.turn_end.observe(&reading, s.fx.mono());
                 assert!(s.turn_end.left_to_person());
             }
@@ -2333,6 +2338,7 @@ fn of_two_lines_raised_the_word_names_the_one_due_longest() {
         if !s.turn_end.left_to_person() {
             let mut reading = s.turn_end_reading(&screen_at(90, ended(SAID)), None, &hosted(30));
             reading.left_record = true;
+            reading.autopilot = Autopilot::Land;
             s.turn_end.observe(&reading, s.fx.mono());
         }
     });
@@ -3994,6 +4000,7 @@ fn a_fact_at_a_background_break_keeps_an_idle_points_guards() {
         if i == 0 && !s.turn_end.left_to_person() {
             let mut reading = s.turn_end_reading(&screen_at(90, ended(SAID)), None, &hosted(30));
             reading.left_record = true;
+            reading.autopilot = Autopilot::Land;
             s.turn_end.observe(&reading, s.fx.mono());
         }
     });
@@ -4176,3 +4183,6 @@ fn a_fact_at_a_background_break_keeps_the_act_awaited_before_it() {
 
 #[path = "occupancy_wake_write_tests.rs"]
 mod wake_write;
+
+#[path = "cruise_carry_loop_tests.rs"]
+mod cruise_carry_loop;

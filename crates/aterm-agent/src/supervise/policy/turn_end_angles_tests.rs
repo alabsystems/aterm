@@ -197,7 +197,10 @@ fn someones_turn_starts_the_angles_again_and_the_agents_own_work_does_not() {
             Some(Duration::from_secs(5)),
         )
     };
-    assert_eq!(act(&mut st, &theirs, now), TurnEndAction::Nothing);
+    // Their hands on the keys hold the act; Cruise leaves the exchange to nobody (owner ruling
+    // 2026-10-26).
+    let a = act(&mut st, &theirs, now);
+    assert!(matches!(a, TurnEndAction::WaitUntil { .. }), "{a:?}");
     assert_eq!(st.checks(), 0, "someone's turn starts the angles again");
     now += 3 * MIN;
     let (after, _) = claim_checked(&mut st, CLAIMS[3], None, now);

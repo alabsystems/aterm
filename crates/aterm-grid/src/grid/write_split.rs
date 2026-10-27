@@ -16,13 +16,19 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
         let stale = self.stale_extras_pair(cursor_row, cursor_col, 1);
+        let mut orphans = crate::row::BlankedHalves::default();
         if let Some(row) = self.row_mut(cursor_row) {
+            let [head, tail] = row.orphaned_wide_halves(cursor_col, cursor_col.saturating_add(1));
+            orphans[0] = head;
+            orphans[1] = tail;
             row.write_char_packed(cursor_col, c, colors, flags);
         }
         self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
         self.storage
             .extras
             .clear_rgb_ring_cell(cursor_row, cursor_col, 1);
+        // The wide halves the write orphaned took the BCE blank; give them its RGB background.
+        self.fill_bce_rgb_cols(cursor_row, orphans);
         self.storage.mark_content_cell(cursor_row, cursor_col);
     }
 
@@ -52,27 +58,41 @@ impl Grid {
         let cursor_col = self.storage.cursor.col;
 
         let stale = self.stale_extras_pair(cursor_row, cursor_col, 2);
+        let mut orphans = crate::row::BlankedHalves::default();
         if cursor_col.saturating_add(1) < effective_cols
             && let Some(row) = self.row_mut(cursor_row)
-            && row.write_wide_char_packed(cursor_col, c, colors, flags)
+            && {
+                let [head, tail] =
+                    row.orphaned_wide_halves(cursor_col, cursor_col.saturating_add(2));
+                orphans[0] = head;
+                orphans[1] = tail;
+                row.write_wide_char_packed(cursor_col, c, colors, flags)
+            }
         {
             self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
             self.storage
                 .extras
                 .clear_rgb_ring_cell(cursor_row, cursor_col, 2);
+            // The wide halves the write orphaned took the BCE blank; give them its RGB
+            // background.
+            self.fill_bce_rgb_cols(cursor_row, orphans);
             self.storage.mark_content_wide_cell(cursor_row, cursor_col);
             return true;
         }
         false
     }
 
-    /// Pre-wrap for a wide char.
+    /// Pre-wrap for a wide char: with fewer than two columns left before the cursor row's print
+    /// edge (the DECSLRM right margin unless the cursor is past it, as `last_print_col`), blank
+    /// what is left with `fill` and wrap. Returns the print edge (exclusive) of the row the
+    /// glyph goes on, which the write and the advance after it take.
     #[inline]
-    pub fn pre_wrap_wide_ecols(&mut self, effective_cols: u16, fill: Cell) -> u16 {
+    pub fn pre_wrap_wide_ecols(&mut self, fill: Cell) -> u16 {
+        let effective_cols = self.margin_clamped_ecols(self.storage.cursor.row);
         if self.storage.cursor.col.saturating_add(1) >= effective_cols {
             self.blank_wide_wrap_tail(effective_cols, fill);
             self.advance_autowrap_line();
-            self.storage.effective_cols_for_row(self.storage.cursor.row)
+            self.margin_clamped_ecols(self.storage.cursor.row)
         } else {
             effective_cols
         }
@@ -403,8 +423,11 @@ impl Grid {
                     stale = StaleExtras::probe(row, cursor_col, end_col_run);
                 }
                 if (end_col_run as usize) <= row.cells_len() {
-                    let end_half_blanked =
-                        row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
+                    let end_half_blanked = row.fixup_wide_chars_in_range(
+                        cursor_col,
+                        (to_write as u16) * 2,
+                        Cell::bce_blank(colors),
+                    );
                     for i in 0..to_write {
                         let col = cursor_col + (i as u16) * 2;
                         // SAFETY: `col + 1 < cells_len()` on a wide boundary; writes are disjoint.
@@ -498,8 +521,11 @@ impl Grid {
                     stale = StaleExtras::probe(row, cursor_col, end_col);
                 }
                 if (end_col as usize) <= row.cells_len() {
-                    let end_half_blanked =
-                        row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
+                    let end_half_blanked = row.fixup_wide_chars_in_range(
+                        cursor_col,
+                        (to_write as u16) * 2,
+                        Cell::bce_blank(colors),
+                    );
                     for j in 0..to_write {
                         let col = cursor_col + (j as u16) * 2;
                         // SAFETY: `col + 1 < cells_len()` on a wide boundary; writes are disjoint.
@@ -600,8 +626,11 @@ impl Grid {
                     stale = StaleExtras::probe(row, cursor_col, end_col);
                 }
                 if (end_col as usize) <= row.cells_len() {
-                    let end_half_blanked =
-                        row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
+                    let end_half_blanked = row.fixup_wide_chars_in_range(
+                        cursor_col,
+                        (to_write as u16) * 2,
+                        Cell::bce_blank(bmp_colors),
+                    );
                     for (j, &c) in slice.iter().enumerate() {
                         let col = cursor_col + (j as u16) * 2;
                         let fl = if (c as u32) > 0xFFFF {
@@ -727,7 +756,12 @@ impl Grid {
                 StaleExtras::NONE
             };
 
-            if let Some(target) = row.cells_mut_with_fixup(cursor_col, to_write_u16) {
+            // The wide halves the run orphans take its BCE blank, whose RGB background the ring
+            // holds once the run's extras are in (below).
+            let orphans = row.orphaned_wide_halves(cursor_col, cursor_col + to_write_u16);
+            if let Some(target) =
+                row.cells_mut_with_fixup(cursor_col, to_write_u16, Cell::bce_blank(colors))
+            {
                 debug_assert_eq!(target.len(), to_write);
                 let colors_with_extras = colors.with_extras_flag();
                 for (cell, &byte) in target.iter_mut().zip(remaining[..to_write].iter()) {
@@ -759,6 +793,19 @@ impl Grid {
                     vr,
                     c,
                 );
+                if bg_rgb.is_some() {
+                    for col in orphans.into_iter().flatten() {
+                        self.storage.extras.set_rgb_ring_range(
+                            cursor_row,
+                            col,
+                            col.saturating_add(1),
+                            None,
+                            bg_rgb,
+                            vr,
+                            c,
+                        );
+                    }
+                }
             }
 
             self.storage.mark_content_row(cursor_row);

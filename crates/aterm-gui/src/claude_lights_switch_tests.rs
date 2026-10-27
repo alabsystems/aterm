@@ -16,6 +16,7 @@ use super::gesture_tests::{
 };
 use super::{BorderSwitch, Chip};
 use crate::autopilot::{AutopilotView, HarnessSwitch, SwitchOff};
+use crate::claude_footer::probe::{LIT_SWITCH, OFF_SWITCH, harness_label};
 use crate::native_settings::SettingsRoute;
 use crate::{App, WindowId};
 
@@ -96,10 +97,10 @@ fn a_minute_ago() -> Instant {
         .expect("a minute of uptime")
 }
 
-fn on_button(app: &App, wid: WindowId) -> (usize, usize) {
+/// The middle of the switch's face, where a person presses it.
+fn on_switch(app: &App, wid: WindowId) -> (usize, usize) {
     let b = switch(app, wid).expect("a switch");
-    let button = b.button.expect("an off switch's on button");
-    (b.frame_row, button.start + button.len() / 2)
+    (b.frame_row, b.cols.start + b.cols.len() / 2)
 }
 
 fn settings_open(app: &App) -> bool {
@@ -135,12 +136,10 @@ fn not_saved(app: &App, key: &str) -> Option<String> {
         .map(|r| r.detail.join(" "))
 }
 
-const OFF_FACE: &str = " alab harness v0.1 \u{2590} on \u{2590} \u{25cb} off \u{258c} ";
-
 const MASTER_OFF: &str = "[harness]\nenabled = false\n";
 
 /// AUTOPILOT OFF IS NOT THE HARNESS OFF: a session whose Autopilot is Off keeps the harness's
-/// switch lit, `alab harness v0.1 ▐ ● on ▌ off ▌`, in the white the rest of its glass wears (the
+/// switch lit, ` ● on ` and its label, `alab` in the white the rest of its glass wears (the
 /// moonbow, bold, never the bare switch's accent), and a press on it turns the WHOLE harness off:
 /// it writes `harness.enabled = false`, arms `◐ turning off` (the refused write here lets it go),
 /// and writes no Autopilot word. CONTROL: the rule beside the switch is no button.
@@ -148,20 +147,14 @@ const MASTER_OFF: &str = "[harness]\nenabled = false\n";
 fn an_autopilot_off_session_reads_on_in_white_and_its_press_turns_the_harness_off() {
     let (mut app, wid, session, mut reader, _host) = claude_pane(120);
     let lit = switch(&app, wid).expect("a hosted Claude Code pane draws the switch");
-    assert_eq!((lit.face, lit.button.clone()), (HarnessSwitch::On, None));
+    assert_eq!(lit.face, HarnessSwitch::On);
     let row =
         |app: &App, b: &BorderSwitch| app.windows[&wid].input_scratch.cells[b.frame_row].clone();
-    let cruise_slice = &row(&app, &lit)[lit.switch.clone()];
-    let cruise_cap = cruise_slice
-        .iter()
-        .position(|c| c.ch == '\u{2590}')
-        .expect("lit pill cap");
-    let cruise_words: Vec<[u8; 3]> = cruise_slice[..cruise_cap]
-        .iter()
-        .filter(|c| c.ch != ' ')
-        .map(|c| c.fg)
-        .collect();
-    let cruise_pill_bg = cruise_slice[cruise_cap + 1].bg;
+    let brand = |app: &App, b: &BorderSwitch| {
+        let label = b.label.clone().expect("the label");
+        row(app, b)[label.start..label.start + 4].to_vec()
+    };
+    let cruise_brand: Vec<[u8; 3]> = brand(&app, &lit).iter().map(|c| c.fg).collect();
     assert!(app.set_session_autopilot(
         session,
         Some(Autopilot::Off),
@@ -173,30 +166,18 @@ fn an_autopilot_off_session_reads_on_in_white_and_its_press_turns_the_harness_of
         (Some(Autopilot::Off), AutopilotView::Off)
     );
     let on = switch(&app, wid).expect("Autopilot Off draws the switch");
-    assert_eq!(
-        (on.face, on.button.clone()),
-        (HarnessSwitch::On, None),
-        "the harness is on: lit, no `on` button"
-    );
+    assert_eq!(on.face, HarnessSwitch::On, "the harness is on: lit");
     let rule = top_rule(&app, wid);
     assert!(
-        rule.contains(" alab harness v0.1 \u{2590} \u{25cf} on \u{258c} off \u{258c} ")
-            && !rule.contains("alab kitty"),
+        rule.contains(&format!(
+            "{LIT_SWITCH} {}",
+            harness_label(aterm_phase::CliHarness::ClaudeCode)
+        )) && !rule.contains("alab kitty"),
         "{rule:?}"
     );
-    let cells = row(&app, &on);
-    let slice = &cells[on.switch.clone()];
-    let cap = slice
-        .iter()
-        .position(|c| c.ch == '\u{2590}')
-        .expect("white pill cap");
-    let glyphs: Vec<_> = slice[..cap]
-        .iter()
-        .filter(|c| c.ch != ' ')
-        .copied()
-        .collect();
-    assert_eq!(glyphs.len(), "alabharnessv0.1".chars().count());
-    for c in &glyphs {
+    let alab = brand(&app, &on);
+    assert_eq!(alab.iter().map(|c| c.ch).collect::<String>(), "alab");
+    for c in &alab {
         let spread = c.fg.iter().max().unwrap() - c.fg.iter().min().unwrap();
         assert!(
             c.bold && spread <= 24,
@@ -205,34 +186,19 @@ fn an_autopilot_off_session_reads_on_in_white_and_its_press_turns_the_harness_of
             c.fg
         );
     }
-    let pill = &slice[cap..];
-    assert_eq!(
-        pill.iter().map(|c| c.ch).collect::<String>(),
-        "\u{2590} \u{25cf} on \u{258c}"
-    );
-    let fill = pill[1].bg;
-    let fill_spread = fill.iter().max().unwrap() - fill.iter().min().unwrap();
-    assert!(fill_spread <= 24, "the lit thumb's fill is white: {fill:?}");
+    let cells = row(&app, &on);
     assert!(
-        pill[1..pill.len() - 1]
-            .iter()
-            .all(|c| c.bg == fill && c.bold),
-        "one white fill under the lit thumb: {pill:?}"
-    );
-    assert_eq!(
-        [pill[0].fg, pill[pill.len() - 1].fg],
-        [fill, fill],
-        "its caps wear the same white"
+        cells[on.cols.clone()].iter().all(|c| !c.bold),
+        "the switch's word, never bold"
     );
     let mark_fg = crate::chrome_band::band_colors(app.theme).accent;
-    assert_ne!(
-        fill, mark_fg,
-        "CONTROL: the lit thumb is not the bare accent"
+    assert!(
+        alab.iter().all(|c| c.fg != mark_fg),
+        "CONTROL: not the bare accent"
     );
-    assert_ne!(fill, cruise_pill_bg, "CONTROL: not Cruise's accent thumb");
     assert_ne!(
-        glyphs.iter().map(|c| c.fg).collect::<Vec<_>>(),
-        cruise_words,
+        alab.iter().map(|c| c.fg).collect::<Vec<_>>(),
+        cruise_brand,
         "CONTROL: not Cruise's arc"
     );
     super::SWITCHES_LET_GO.with(|n| n.set(0));
@@ -242,7 +208,7 @@ fn an_autopilot_off_session_reads_on_in_white_and_its_press_turns_the_harness_of
         None,
         "CONTROL: the rule beside the switch is no button"
     );
-    click_at(&mut app, wid, (on.frame_row, on.switch.start + 2));
+    click_at(&mut app, wid, (on.frame_row, on.cols.start + 2));
     let said = not_saved(&app, "harness.enabled").expect("the master switch's write was made");
     assert!(said.contains("harness.enabled = false"), "{said:?}");
     let title = app
@@ -269,12 +235,12 @@ fn an_autopilot_off_session_reads_on_in_white_and_its_press_turns_the_harness_of
     );
 }
 
-/// THE OFF FACE'S `on` TURNS ON THE SWITCHES ALONE: under the master switch off, a session whose
-/// own word is Off presses `on`, and the press writes `harness.enabled = true` and never the
+/// THE OFF SWITCH TURNS ON THE SWITCHES ALONE: under the master switch off, a session whose own
+/// word is Off presses ` ○ off `, and the press writes `harness.enabled = true` and never the
 /// Autopilot word `cruise` (the chip writes words); once the policy reads it back the switch is
 /// lit over Autopilot Off.
 #[test]
-fn the_on_button_writes_the_switch_and_never_cruise() {
+fn the_off_switch_writes_the_switch_and_never_cruise() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
     assert!(app.set_session_autopilot(
         session,
@@ -285,11 +251,8 @@ fn the_on_button_writes_the_switch_and_never_cruise() {
     frame(&mut app, wid);
     let off = switch(&app, wid).expect("the master switch off draws the switch");
     assert_eq!(off.face, HarnessSwitch::Off(SwitchOff::Master));
-    assert_eq!(
-        painted(&app, wid, &off, off.button.clone().unwrap()),
-        "\u{2590} on "
-    );
-    let at = on_button(&app, wid);
+    assert_eq!(painted(&app, wid, &off, off.cols.clone()), OFF_SWITCH);
+    let at = on_switch(&app, wid);
     click_at(&mut app, wid, at);
     let said = not_saved(&app, "harness.enabled").expect("the master switch's write was made");
     assert!(said.contains("harness.enabled = true"), "{said:?}");
@@ -309,8 +272,8 @@ fn the_on_button_writes_the_switch_and_never_cruise() {
 }
 
 /// A SWITCH TURNING OFF SAYS SO AND TAKES NO CLICK: while the master switch's off-write has not
-/// read back, the lit switch reads `◐ turning off` (`◐ off` at its narrowest), the side it
-/// turns to is in the repaint key, and a click on it writes nothing; the read-back lets it go.
+/// read back, the switch reads ` ◐ off ` at every width it stands at, the side it turns to is in
+/// the repaint key, and a click on it writes nothing; the read-back lets it go.
 #[test]
 fn a_switch_turning_off_says_so_and_takes_no_click() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
@@ -337,16 +300,13 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
     arm(&mut app, false);
     frame(&mut app, wid);
     let turning = switch(&app, wid).expect("the switch, turning off");
-    assert_eq!(
-        (turning.face, turning.button.clone()),
-        (HarnessSwitch::TurningOff, None)
-    );
+    assert_eq!(turning.face, HarnessSwitch::TurningOff);
     assert!(
-        top_rule(&app, wid).contains(" alab harness v0.1 \u{25d0} turning off "),
+        top_rule(&app, wid).contains(" \u{25d0} off "),
         "{:?}",
         top_rule(&app, wid)
     );
-    click_at(&mut app, wid, (turning.frame_row, turning.switch.start + 2));
+    click_at(&mut app, wid, (turning.frame_row, turning.cols.start + 2));
     assert_eq!(not_saved(&app, "harness.enabled"), None, "no write");
     assert!(!settings_open(&app));
     let mut narrowest = None;
@@ -354,15 +314,16 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
         assert!(app.apply_term_resize(wid, 24, width));
         draw_claude(&app, session, BYPASS);
         frame(&mut app, wid);
-        if let Some(b) = switch(&app, wid).filter(|b| b.tier == 3) {
+        if let Some(b) = switch(&app, wid) {
             assert_eq!(b.face, HarnessSwitch::TurningOff, "{width}");
-            narrowest = Some(painted(&app, wid, &b, b.switch.clone()));
+            let face = painted(&app, wid, &b, b.cols.clone()).trim().to_owned();
+            assert_eq!(face, "\u{25d0} off", "{width}");
+            narrowest = Some(width);
         }
     }
-    assert_eq!(
-        narrowest.as_deref(),
-        Some("\u{25d0} off"),
-        "the narrowest form is met"
+    assert!(
+        narrowest.is_some_and(|w| w < 40),
+        "a narrow pane is met: {narrowest:?}"
     );
     assert!(app.apply_term_resize(wid, 24, 120));
     draw_claude(&app, session, BYPASS);
@@ -400,13 +361,13 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
 }
 
 /// Each press states when it happened, so how long the read-back and the frame between two
-/// presses take never moves the second across a double click's interval. A press on the `on`
-/// button the read-back drew is the switch's own within the interval too, and turns nothing.
+/// presses take never moves the second across a double click's interval. A press anywhere on the
+/// off face the read-back drew is the switch's own within the interval too, and turns nothing.
 #[test]
 fn a_double_click_on_on_leaves_the_harness_on() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
     let lit = switch(&app, wid).expect("lit");
-    let at = (lit.frame_row, lit.switch.start + 2);
+    let at = (lit.frame_row, lit.cols.start + 2);
     super::SWITCHES_LET_GO.with(|n| n.set(0));
     let first = a_minute_ago();
     click_at_when(&mut app, wid, at, first);
@@ -431,12 +392,12 @@ fn a_double_click_on_on_leaves_the_harness_on() {
         "the second click of the double click, at the interval's last instant, turned nothing \
          back on: {said:?}"
     );
-    let at = on_button(&app, wid);
+    let at = on_switch(&app, wid);
     click_at_when(&mut app, wid, at, first + interval());
     let said = not_saved(&app, "harness.enabled").expect("the off-write's record");
     assert!(
         said.contains("harness.enabled = false"),
-        "nor did a press on `on` at the interval's last instant: {said:?}"
+        "nor did a press on the off face's middle at the interval's last instant: {said:?}"
     );
     assert_eq!(
         super::SWITCHES_LET_GO.with(std::cell::Cell::get),
@@ -516,7 +477,7 @@ fn under_the_master_switch_off_on_turns_the_master_switch_on() {
     assert_eq!(off.face, HarnessSwitch::Off(SwitchOff::Master));
     let rule = top_rule(&app, wid);
     assert!(
-        rule.contains(OFF_FACE) && !rule.contains("alab kitty"),
+        rule.contains(OFF_SWITCH) && !rule.contains("alab kitty"),
         "{rule:?}"
     );
     assert_eq!(
@@ -525,9 +486,9 @@ fn under_the_master_switch_off_on_turns_the_master_switch_on() {
         "control: no write yet"
     );
     super::SWITCHES_LET_GO.with(|n| n.set(0));
-    let at = on_button(&app, wid);
+    let at = on_switch(&app, wid);
     click_at(&mut app, wid, at);
-    assert!(!settings_open(&app), "the on button opens nothing");
+    assert!(!settings_open(&app), "the press opens nothing");
     assert_eq!(
         super::SWITCHES_LET_GO.with(std::cell::Cell::get),
         1,
@@ -563,11 +524,11 @@ fn under_the_agents_switch_off_on_turns_the_agents_switch_on() {
         off.face,
         HarnessSwitch::Off(SwitchOff::Agent(aterm_phase::Program::Claude))
     );
-    assert!(top_rule(&app, wid).contains(OFF_FACE));
+    assert!(top_rule(&app, wid).contains(OFF_SWITCH));
     super::SWITCHES_LET_GO.with(|n| n.set(0));
-    let at = on_button(&app, wid);
+    let at = on_switch(&app, wid);
     click_at(&mut app, wid, at);
-    assert!(!settings_open(&app), "the on button opens nothing");
+    assert!(!settings_open(&app), "the press opens nothing");
     assert_eq!(
         super::SWITCHES_LET_GO.with(std::cell::Cell::get),
         1,
@@ -602,16 +563,13 @@ fn a_switch_turning_on_says_so_and_takes_no_click() {
     assert_ne!(footer_fp(&app, wid), at_rest, "turning moves the key");
     frame(&mut app, wid);
     let turning = switch(&app, wid).expect("the switch, turning");
-    assert_eq!(
-        (turning.face, turning.button.clone()),
-        (HarnessSwitch::Turning, None)
-    );
+    assert_eq!(turning.face, HarnessSwitch::Turning);
     assert!(
-        top_rule(&app, wid).contains(" alab harness v0.1 \u{25d0} turning on "),
+        top_rule(&app, wid).contains(" \u{25d0} on "),
         "{:?}",
         top_rule(&app, wid)
     );
-    click_at(&mut app, wid, (turning.frame_row, turning.switch.start + 2));
+    click_at(&mut app, wid, (turning.frame_row, turning.cols.start + 2));
     assert_eq!(not_saved(&app, "harness.enabled"), None, "no second write");
     assert!(!settings_open(&app));
     policy(&mut app, "[harness]\n");
@@ -637,7 +595,7 @@ fn the_switch_draws_its_mark_as_one_set_in_every_state() {
         let b = switch(app, wid).unwrap_or_else(|| panic!("{what}: a switch"));
         let row = &app.windows[&wid].input_scratch.cells[b.frame_row];
         let at = b
-            .switch
+            .cols
             .clone()
             .find(|&c| row[c].ch == want.ch())
             .unwrap_or_else(|| panic!("{what}: the cell keeps {:?}", want.ch()));
@@ -880,7 +838,7 @@ fn a_menu_over_the_top_rule_keeps_the_switch_mark_beside_it() {
     let b = switch(&app, wid).expect("a switch");
     let row = b.frame_row;
     let col = b
-        .switch
+        .cols
         .clone()
         .find(|&c| app.windows[&wid].input_scratch.cells[row][c].ch == BandIcon::Disc.ch())
         .expect("the switch's mark");
@@ -940,17 +898,17 @@ fn hovering_on_moves_the_key_and_leaving_puts_it_back() {
     let at_rest = footer_fp(&app, wid);
     let row = footer_row(&app, wid) - 2;
     let glass: Vec<_> = app.windows[&wid].input_scratch.cells[row].clone();
-    let (r, c) = on_button(&app, wid);
+    let (r, c) = on_switch(&app, wid);
     let (x, y) = px_of(&app, wid, (r, c));
     app.on_cursor_moved(wid, x, y);
     assert_ne!(footer_fp(&app, wid), at_rest, "hover moves the key");
     frame(&mut app, wid);
     let cell = app.windows[&wid].input_scratch.cells[r][c];
     assert!(
-        cell.ch != ' ' && cell.underline == aterm_core::terminal::UnderlineStyle::Single,
-        "the hovered button is underlined: {cell:?}"
+        cell.ch != ' ' && cell.fg != glass[c].fg,
+        "the hovered switch's word lifts: {cell:?}"
     );
-    assert_ne!(cell.bg, glass[c].bg, "its fill lifted");
+    assert_eq!(cell.bg, glass[c].bg, "it keeps the ground");
     assert_ne!(
         app.windows[&wid].input_scratch.cells[row], glass,
         "hover drew"
@@ -1001,14 +959,9 @@ fn the_switch_stands_in_every_hosted_state_and_on_no_other_pane() {
         frame(&mut app, wid);
         let b = switch(&app, wid).unwrap_or_else(|| panic!("{what}: a switch"));
         assert_eq!(b.face, face, "{what}");
-        assert_eq!(b.button.is_some(), !face.is_on(), "{what}: the on button");
         let rule = top_rule(&app, wid);
         assert!(
-            rule.contains(if face.is_on() {
-                " alab harness v0.1 \u{2590} \u{25cf} on \u{258c} off \u{258c} "
-            } else {
-                OFF_FACE
-            }),
+            rule.contains(if face.is_on() { LIT_SWITCH } else { OFF_SWITCH }),
             "{what}: {rule:?}"
         );
     }
@@ -1036,50 +989,37 @@ fn the_switch_stands_in_every_hosted_state_and_on_no_other_pane() {
     );
 }
 
+/// A NARROW PANE KEEPS THE OFF SWITCH TO THE LAST: as the pane narrows the off switch reads
+/// ` ○ off ` at every width it stands at, never comes back once it goes, and stands in a pane of a
+/// dozen columns.
 #[test]
-fn a_narrow_pane_keeps_the_on_button_to_the_last() {
+fn a_narrow_pane_keeps_the_off_switch_to_the_last() {
     let (mut app, wid, session, _reader, _host) = claude_pane(121);
     policy(&mut app, MASTER_OFF);
-    let mut seen: Vec<(u16, Option<usize>)> = Vec::new();
+    let mut seen: Vec<(u16, bool)> = Vec::new();
     for width in (6..=120u16).rev() {
         assert!(app.apply_term_resize(wid, 24, width));
         draw_claude(&app, session, BYPASS);
         frame(&mut app, wid);
-        let tier = switch(&app, wid).map(|b| {
-            let button = b.button.clone().expect("an off form keeps its button");
-            let want_button = if b.tier < 3 {
-                "\u{2590} on "
-            } else {
-                "\u{2590} on \u{258c}"
-            };
-            assert_eq!(painted(&app, wid, &b, button), want_button, "{width}");
-            b.tier
+        let stands = switch(&app, wid).inspect(|b| {
+            assert_eq!(painted(&app, wid, b, b.cols.clone()), OFF_SWITCH, "{width}");
         });
-        if let Some(&(wider, Some(last))) = seen.last() {
+        if let Some(&(wider, false)) = seen.last() {
             assert!(
-                tier.is_none_or(|t| t >= last),
-                "{width} after {wider}: a form came back: {seen:?}"
+                stands.is_none(),
+                "{width} after {wider}: the switch came back"
             );
         }
-        if let Some(&(wider, None)) = seen.last() {
-            assert_eq!(tier, None, "{width} after {wider}: the switch came back");
-        }
-        seen.push((width, tier));
+        seen.push((width, stands.is_some()));
     }
-    for tier in 0..4 {
-        assert!(
-            seen.iter().any(|(_, t)| *t == Some(tier)),
-            "CONTROL: form {tier} is met: {seen:?}"
-        );
-    }
-    let narrowest = seen
-        .iter()
-        .filter(|(_, t)| t.is_some())
-        .map(|(w, _)| *w)
-        .min();
+    let narrowest = seen.iter().filter(|(_, s)| *s).map(|(w, _)| *w).min();
     assert!(
         narrowest.is_some_and(|w| w <= 12),
-        "the button stands in a pane of a dozen columns: {seen:?}"
+        "the switch stands in a pane of a dozen columns: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|(_, s)| !s),
+        "CONTROL: a pane too narrow for it is met: {seen:?}"
     );
 }
 
@@ -1098,7 +1038,7 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
     let nodes = |app: &App| -> Vec<crate::a11y_tree::GridChip> {
         app.claude_chips_a11y(wid)
             .into_iter()
-            .filter(|c| matches!(c.chip, HarnessChip::Switch | HarnessChip::SwitchOn))
+            .filter(|c| c.chip == HarnessChip::Switch)
             .collect()
     };
     let lit = nodes(&app);
@@ -1108,8 +1048,8 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
         (lit[0].chip, lit[0].toggled),
         (HarnessChip::Switch, Some(Toggled::True))
     );
-    let visual = words(&painted(&app, wid, &b, b.switch.clone()));
-    assert_eq!(visual, "alab harness v0.1 on");
+    let visual = words(&painted(&app, wid, &b, b.cols.clone()));
+    assert_eq!(visual, "on");
     assert!(
         crate::native_ui::visible_label_in_name(&visual, &lit[0].label),
         "{visual:?} in {:?}",
@@ -1124,14 +1064,7 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
             && said.contains("off for every session"),
         "{said:?}"
     );
-    let before = autopilot(&app, session);
-    assert_eq!(before.1, AutopilotView::Cruise);
-    app.press_claude_chip_for_reader(wid, session, HarnessChip::SwitchOn);
-    assert_eq!(
-        (autopilot(&app, session), not_saved(&app, "harness.enabled")),
-        (before, None),
-        "`on` on a lit switch is no press"
-    );
+    assert_eq!(autopilot(&app, session).1, AutopilotView::Cruise);
     assert!(app.set_session_autopilot(
         session,
         Some(Autopilot::Off),
@@ -1145,7 +1078,7 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
             .map(|n| (n.chip, n.toggled))
             .collect::<Vec<_>>(),
         [(HarnessChip::Switch, Some(Toggled::True))],
-        "Autopilot Off: the harness is on, one switch toggled on and no `on` button"
+        "Autopilot Off: the harness is on, one switch toggled on"
     );
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Switch);
     let wrote = not_saved(&app, "harness.enabled").expect("the reader's press wrote the master");
@@ -1160,34 +1093,29 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
     frame(&mut app, wid);
     let off = nodes(&app);
     let b = switch(&app, wid).expect("off");
-    assert_eq!(off.len(), 2, "{off:?}");
+    assert_eq!(off.len(), 1, "{off:?}");
     assert_eq!(
         (off[0].chip, off[0].toggled),
         (HarnessChip::Switch, Some(Toggled::False))
     );
-    assert_eq!((off[1].chip, off[1].toggled), (HarnessChip::SwitchOn, None));
-    for (node, cols) in [
-        (&off[0], b.switch.clone()),
-        (&off[1], b.button.clone().unwrap()),
-    ] {
-        assert_eq!((node.col, node.width), (cols.start, cols.len()), "{node:?}");
-        let visual = words(&painted(&app, wid, &b, cols));
-        assert!(
-            crate::native_ui::visible_label_in_name(&visual, &node.label),
-            "{visual:?} in {:?}",
-            node.label
-        );
-        assert!(node.description.is_some(), "{node:?}");
-    }
     assert_eq!(
-        off[1].label, "on: turn the harness on (Supervise coding agents)",
-        "the master switch's `on` turns on the whole harness"
+        (off[0].col, off[0].width),
+        (b.cols.start, b.cols.len()),
+        "the node is the switch's cells"
     );
+    let visual = words(&painted(&app, wid, &b, b.cols.clone()));
+    assert_eq!(visual, "off");
+    assert!(
+        crate::native_ui::visible_label_in_name(&visual, &off[0].label),
+        "{visual:?} in {:?}",
+        off[0].label
+    );
+    assert!(off[0].description.is_some(), "{:?}", off[0]);
     assert!(app.apply_term_resize(wid, 24, 8));
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
     assert!(nodes(&app).is_empty(), "no switch on the glass");
-    app.press_claude_chip_for_reader(wid, session, HarnessChip::SwitchOn);
+    app.press_claude_chip_for_reader(wid, session, HarnessChip::Switch);
     assert!(
         not_saved(&app, "harness.enabled").is_some_and(|said| said.contains("= false")),
         "no switch, no press"
@@ -1195,20 +1123,21 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
     assert!(app.apply_term_resize(wid, 24, 120));
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
-    app.press_claude_chip_for_reader(wid, session, HarnessChip::SwitchOn);
+    later(&mut app, wid, session);
+    app.press_claude_chip_for_reader(wid, session, HarnessChip::Switch);
     let wrote = not_saved(&app, "harness.enabled").expect("the master switch's write");
     assert!(wrote.contains("harness.enabled = true"), "{wrote:?}");
     assert_eq!(
         autopilot(&app, session),
         (Some(Autopilot::Off), AutopilotView::MasterOff),
-        "`on` writes the switch, never `cruise`"
+        "the off switch writes the switch, never `cruise`"
     );
 }
 
-/// THE SWITCH NAMES THE HARNESS IT SWITCHES: lit, or held off by the master switch, the
-/// `Switch` and the off face's `on` name the whole harness and no product (`alab harness on`,
-/// `on: turn the harness on (Supervise coding agents)`), since a press there turns every agent's
-/// harness. NEGATIVE CONTROL: under the agent's own switch off they name the agent's harness.
+/// THE SWITCH NAMES THE HARNESS IT SWITCHES: lit, or held off by the master switch, the `Switch`
+/// names the harness by its label and no product (`alab claude harness v0.4 on`), since a press
+/// there turns every agent's harness. NEGATIVE CONTROL: under the agent's own switch off it names
+/// the agent's harness.
 #[cfg(a11y_tree)]
 #[test]
 fn the_switch_names_the_harness_it_switches() {
@@ -1217,38 +1146,30 @@ fn the_switch_names_the_harness_it_switches() {
     let labels = |app: &App| -> Vec<(HarnessChip, String)> {
         app.claude_chips_a11y(wid)
             .into_iter()
-            .filter(|c| matches!(c.chip, HarnessChip::Switch | HarnessChip::SwitchOn))
+            .filter(|c| c.chip == HarnessChip::Switch)
             .map(|c| (c.chip, c.label))
             .collect()
     };
     let named = |pairs: &[(HarnessChip, &str)]| -> Vec<(HarnessChip, String)> {
         pairs.iter().map(|&(c, l)| (c, l.to_owned())).collect()
     };
+    let label = harness_label(aterm_phase::CliHarness::ClaudeCode);
     assert_eq!(
         labels(&app),
-        named(&[(HarnessChip::Switch, "alab harness v0.1 on")])
+        named(&[(HarnessChip::Switch, &format!("{label} on"))])
     );
     policy(&mut app, MASTER_OFF);
     frame(&mut app, wid);
     assert_eq!(
         labels(&app),
-        named(&[
-            (HarnessChip::Switch, "alab harness v0.1 off"),
-            (
-                HarnessChip::SwitchOn,
-                "on: turn the harness on (Supervise coding agents)"
-            ),
-        ]),
+        named(&[(HarnessChip::Switch, &format!("{label} off"))]),
         "the master switch off"
     );
     policy(&mut app, "[harness.claude]\nenabled = false\n");
     frame(&mut app, wid);
     assert_eq!(
         labels(&app),
-        named(&[
-            (HarnessChip::Switch, "alab harness v0.1 off: Claude Code"),
-            (HarnessChip::SwitchOn, "on: turn the Claude Code harness on"),
-        ]),
+        named(&[(HarnessChip::Switch, &format!("{label} off: Claude Code"))]),
         "NEGATIVE CONTROL: the agent's own switch off"
     );
 }
@@ -1266,7 +1187,7 @@ fn decoration_has_no_node() {
     let cols = rule[..at].chars().count()..rule[..at].chars().count() + lockup.chars().count();
     assert_eq!(cols, 2..13, "two `\u{2500}` in: {rule:?}");
     let product = b.program.product();
-    let (words, _) = crate::claude_footer::switch_words(&b);
+    let words = crate::claude_footer::switch_words(&b);
     let names = |label: &str| crate::native_ui::visible_label_in_name(&words, label);
     let chips = app.claude_chips_a11y(wid);
     let switches: Vec<_> = chips
@@ -1275,8 +1196,9 @@ fn decoration_has_no_node() {
         .collect();
     assert_eq!(switches.len(), 1, "{chips:?}");
     assert_eq!(
-        switches[0].label, "alab harness v0.1 on",
-        "the whole harness, no product"
+        switches[0].label,
+        format!("{} on", harness_label(aterm_phase::CliHarness::ClaudeCode)),
+        "the harness by its label, no product"
     );
     assert!(names(&switches[0].label), "{:?}", switches[0].label);
     assert_eq!(
@@ -1436,11 +1358,8 @@ fn a_pointed_agents_panel_row_keeps_the_switch_the_facts_and_the_chip() {
             strip + 17,
             "{main:?} / {agent:?}: the top rule"
         );
-        let face = painted(&app, wid, &b, b.switch.clone());
-        assert!(
-            face.contains("alab harness v0.1 \u{2590} \u{25cf} on \u{258c}"),
-            "{face:?}"
-        );
+        let face = painted(&app, wid, &b, b.cols.clone());
+        assert_eq!(face, LIT_SWITCH, "{main:?} / {agent:?}");
         let facts = row_text(&app, wid, strip + 19);
         assert!(
             facts.contains(WHOLE_FACTS),
@@ -1473,7 +1392,7 @@ fn the_switch_reads_on_a_tab_theme_the_instance_did_not_choose() {
     let off = switch(&app, wid).expect("the master switch off draws the switch");
     assert_eq!(off.face, HarnessSwitch::Off(SwitchOff::Master));
     assert!(
-        top_rule(&app, wid).contains(OFF_FACE),
+        top_rule(&app, wid).contains(OFF_SWITCH),
         "{:?}",
         top_rule(&app, wid)
     );
@@ -1494,46 +1413,30 @@ fn the_switch_reads_on_a_tab_theme_the_instance_did_not_choose() {
         "CONTROL: the instance's accent reads {:.2} on the tab's paper",
         reads(accent, ground)
     );
-    let button = off.button.clone().expect("the off switch's button");
     let floor = aterm_effects::cli_marks::NAME_CONTRAST;
+    let label = off.label.clone().expect("the label");
     let mut letters = 0;
-    for (col, c) in row
-        .iter()
-        .enumerate()
-        .take(off.cols.end)
-        .skip(off.cols.start)
-    {
+    for col in off.cols.clone().chain(label.clone()) {
+        let c = row[col];
+        let what = format!("{:?} at column {col}", c.ch);
+        assert_eq!(c.bg, ground, "{what}: on the tab's paper");
         if c.ch == ' ' {
             continue;
         }
-        let what = format!("{:?} at column {col}", c.ch);
-        if col == button.start {
-            assert_eq!(c.bg, ground, "{what}: track cap sits on the ground");
-        } else if c.ch == '\u{2590}' || c.ch == '\u{258c}' {
-            assert!(
-                reads(c.fg, ground) >= 3.0,
-                "{what}: a cap at {:.2}",
-                reads(c.fg, ground)
-            );
-        } else {
-            letters += 1;
-            assert!(
-                reads(c.fg, c.bg) >= floor,
-                "{what}: a letter at {:.2}",
-                reads(c.fg, c.bg)
-            );
-            if off.switch.contains(&col) {
-                assert!(
-                    reads(c.bg, ground) >= 3.0,
-                    "{what}: the pill at {:.2}",
-                    reads(c.bg, ground)
-                );
-            }
-        }
+        letters += 1;
+        assert!(
+            reads(c.fg, ground) >= floor,
+            "{what}: at {:.2}",
+            reads(c.fg, ground)
+        );
     }
+    let words: String = format!(
+        "\u{25cb}off{}",
+        harness_label(aterm_phase::CliHarness::ClaudeCode)
+    );
     assert_eq!(
         letters,
-        "alabharnessv0.1on○off".chars().count(),
+        words.chars().filter(|c| *c != ' ').count(),
         "every letter read"
     );
 }
@@ -1746,7 +1649,8 @@ fn the_keyboard_walks_to_the_switch_and_return_presses_it() {
             app.windows[&wid]
                 .claude_lights
                 .switch_shown(session, HarnessSwitch::On)
-                .1,
+                .1
+                == crate::claude_footer::HoverAt::Switch,
             "lit as the pointer lights it"
         );
     };
@@ -1803,68 +1707,206 @@ fn the_keyboard_walks_to_the_switch_and_return_presses_it() {
     );
 }
 
-/// BOTH SEGMENTS OF THE TWO-STATE SWITCH TOGGLE CLEANLY: clicking either the lit `● on` thumb or
-/// the unselected ` off ▌` track segment when ON turns the harness off, and clicking either the
-/// unselected `▐ on ` track segment or the selected `▐ ○ off ▌` thumb when OFF turns the harness
-/// back on.
+/// THE WHOLE FACE IS THE SWITCH: a press on either end of ` ● on ` turns the harness off, on
+/// either end of the master's ` ○ off ` turns it back on, and on either end of the agent's own
+/// ` ○ off ` turns the agent's switch on; nothing reaches the program. CONTROL: the `─` just left
+/// of the face takes no press.
 #[test]
-fn both_segments_of_the_toggle_switch_dispatch_cleanly_in_every_state() {
-    let (mut app, wid, session, mut reader, _host) = claude_pane(120);
+fn the_whole_face_toggles_the_switch_in_every_state() {
+    let cases = [
+        ("lit", None, LIT_SWITCH, "harness.enabled", "false"),
+        (
+            "master off",
+            Some(MASTER_OFF),
+            OFF_SWITCH,
+            "harness.enabled",
+            "true",
+        ),
+        (
+            "agent off",
+            Some("[harness.claude]\nenabled = false\n"),
+            OFF_SWITCH,
+            "harness.claude.enabled",
+            "true",
+        ),
+    ];
+    for (what, off, face, key, want) in cases {
+        for last in [false, true] {
+            let (mut app, wid, session, mut reader, _host) = claude_pane(120);
+            if let Some(off) = off {
+                policy(&mut app, off);
+                frame(&mut app, wid);
+            }
+            let b = switch(&app, wid).unwrap_or_else(|| panic!("{what}: the switch"));
+            assert_eq!(painted(&app, wid, &b, b.cols.clone()), face, "{what}");
+            let rule = (b.frame_row, b.cols.start - 1);
+            assert_eq!(
+                app.windows[&wid].input_scratch.cells[rule.0][rule.1].ch, '\u{2500}',
+                "{what}: CONTROL: the rule's own cell"
+            );
+            click_at(&mut app, wid, rule);
+            assert_eq!(
+                not_saved(&app, key),
+                None,
+                "{what}: CONTROL: the rule beside the face takes no press"
+            );
+            let col = if last { b.cols.end - 1 } else { b.cols.start };
+            click_at(&mut app, wid, (b.frame_row, col));
+            let said =
+                not_saved(&app, key).unwrap_or_else(|| panic!("{what} at {col}: a write of {key}"));
+            assert!(
+                said.contains(&format!("{key} = {want}")),
+                "{what}: a press at {col}: {said:?}"
+            );
+            assert!(
+                app.windows[&wid].claude_lights.sessions[&session]
+                    .switch_pressed
+                    .is_some(),
+                "{what} at {col}: the press was the switch's"
+            );
+            assert!(pty(&mut reader, 0).is_empty(), "{what}: no PTY bytes sent");
+        }
+    }
+}
 
-    let lit = switch(&app, wid).expect("hosted Claude Code draws the lit switch");
-    assert_eq!(lit.face, HarnessSwitch::On);
+/// The PNG the capture route renders for window `wid` (`aterm ctl image`): its width, height and
+/// RGBA bytes.
+fn rendered(app: &mut App, wid: WindowId) -> (usize, usize, Vec<u8>) {
+    let (reply, rx) = std::sync::mpsc::channel();
     assert_eq!(
-        painted(&app, wid, &lit, lit.cols.clone()),
-        " alab harness v0.1 \u{2590} \u{25cf} on \u{258c} off \u{258c} "
+        wid,
+        WindowId(0),
+        "the capture route renders the front window"
     );
-    let off_segment_col = lit.switch.end + 2;
-    assert_eq!(
-        app.windows[&wid].input_scratch.cells[lit.frame_row][off_segment_col].ch, 'f',
-        "clicking inside the `off` track segment"
-    );
-    click_at(&mut app, wid, (lit.frame_row, off_segment_col));
-    let said = not_saved(&app, "harness.enabled").expect("click on `off` segment wrote policy");
-    assert!(
-        said.contains("harness.enabled = false"),
-        "clicking the `off` segment when ON turns the harness off: {said:?}"
-    );
+    app.render_image(crate::control::ImageReq {
+        handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
+        target: crate::control_auth::ConfinedImage::in_memory(),
+        clean: false,
+        session: None,
+        want_bytes: true,
+        want_metadata: false,
+        frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
+        cancel: crate::control::CaptureCancellation::new(),
+        reply,
+    });
+    let (_, _, png) = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("image reply")
+        .expect("image succeeds")
+        .value;
+    let (rgba, width, height) =
+        aterm_render::decode_png_rgba8(&png.expect("PNG bytes")).expect("a PNG");
+    (width, height, rgba)
+}
 
-    later(&mut app, wid, session);
-    policy(&mut app, MASTER_OFF);
-    frame(&mut app, wid);
-    let off = switch(&app, wid).expect("master off draws the segmented off switch");
-    assert_eq!(off.face, HarnessSwitch::Off(SwitchOff::Master));
-    assert_eq!(
-        painted(&app, wid, &off, off.cols.clone()),
-        " alab harness v0.1 \u{2590} on \u{2590} \u{25cb} off \u{258c} "
-    );
-    let on_seg = on_button(&app, wid);
-    click_at(&mut app, wid, on_seg);
-    let said = not_saved(&app, "harness.enabled").expect("click on `on` segment wrote policy");
-    assert!(
-        said.contains("harness.enabled = true"),
-        "clicking the `on` segment when OFF turns the harness on: {said:?}"
-    );
-
-    later(&mut app, wid, session);
-    policy(&mut app, "[harness.claude]\nenabled = false\n");
-    frame(&mut app, wid);
-    let agent_off = switch(&app, wid).expect("agent off draws the segmented off switch");
-    assert_eq!(
-        agent_off.face,
-        HarnessSwitch::Off(SwitchOff::Agent(aterm_phase::Program::Claude))
-    );
-    let off_thumb_col = agent_off.switch.start + 4;
-    assert_eq!(
-        app.windows[&wid].input_scratch.cells[agent_off.frame_row][off_thumb_col].ch, 'o',
-        "clicking inside the `○ off` thumb"
-    );
-    click_at(&mut app, wid, (agent_off.frame_row, off_thumb_col));
-    let said = not_saved(&app, "harness.claude.enabled")
-        .expect("click on `○ off` thumb toggles the agent's switch back on");
-    assert!(
-        said.contains("harness.claude.enabled = true"),
-        "clicking the `○ off` thumb when OFF toggles the switch on: {said:?}"
-    );
-    assert!(pty(&mut reader, 0).is_empty(), "no PTY bytes sent");
+/// THE SWITCH AS A PERSON SEES IT: each face (lit, off, turning on, turning off, lit under the
+/// pointer, and lit and off under High Contrast) on the default dark ground and on Default Light's
+/// paper, rendered by the capture route `aterm ctl image` takes, written whole and as the switch's
+/// row round it, twice its size.
+#[test]
+#[ignore = "writes PNGs for a person to read: set ATERM_SWITCH_GALLERY to a directory"]
+fn harness_switch_gallery() {
+    let Some(dir) = std::env::var_os("ATERM_SWITCH_GALLERY") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).expect("the gallery directory");
+    let scheme = |name: &str| {
+        crate::chrome_band::hc_fixtures::STOCK
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, palette)| *palette)
+    };
+    let before = crate::chrome_band::forced_chrome();
+    for (look, theme, hc) in [
+        ("dark", None, scheme("Night sky")),
+        ("light", Some("Default Light"), scheme("Desert")),
+    ] {
+        for state in [
+            "on",
+            "off",
+            "turning-on",
+            "turning-off",
+            "on-hover",
+            "on-hc",
+            "off-hc",
+        ] {
+            crate::chrome_band::install_forced_chrome(if state.ends_with("-hc") {
+                Some(hc.expect("a stock High Contrast scheme"))
+            } else {
+                None
+            });
+            let (mut app, wid, session, _reader, _host) = claude_pane(110);
+            if let Some(selector) = theme {
+                app.set_session_theme(
+                    session,
+                    Some(crate::session_theme::SessionTheme {
+                        selector: selector.into(),
+                        origin: crate::session_theme::SessionThemeOrigin::Ctl,
+                    }),
+                );
+            }
+            if matches!(state, "off" | "turning-on" | "off-hc") {
+                policy(&mut app, MASTER_OFF);
+            }
+            let turning = match state {
+                "turning-on" => Some(true),
+                "turning-off" => Some(false),
+                _ => None,
+            };
+            if let Some(on) = turning {
+                app.windows
+                    .get_mut(&wid)
+                    .expect("window")
+                    .claude_lights
+                    .sessions
+                    .entry(session)
+                    .or_default()
+                    .switch_turning = Some((on, Instant::now() + Duration::from_secs(60)));
+            }
+            draw_claude(&app, session, BYPASS);
+            frame(&mut app, wid);
+            let b = switch(&app, wid).expect("the switch");
+            if state == "on-hover" {
+                let (x, y) = px_of(&app, wid, (b.frame_row, b.cols.start + b.cols.len() / 2));
+                app.on_cursor_moved(wid, x, y);
+                frame(&mut app, wid);
+            }
+            let b = switch(&app, wid).expect("the switch");
+            let (w, h, rgba) = rendered(&mut app, wid);
+            let whole = crate::app_introspect::encode_rgba8_png(
+                &rgba,
+                u32::try_from(w).expect("a width"),
+                u32::try_from(h).expect("a height"),
+            )
+            .expect("the frame encodes");
+            std::fs::write(dir.join(format!("{look}-{state}.png")), whole).expect("the PNG");
+            let (cw, ch) = app.win_cell_size(wid);
+            let left = app.win_pad(wid);
+            let top = app.win_pad_top(wid) + app.win_head(wid);
+            let first = b.cols.start.saturating_sub(3);
+            let last = b.label.as_ref().map_or(b.cols.end, |l| l.end) + 3;
+            let x0 = left + first * cw;
+            let x1 = (left + last * cw).min(w);
+            let y0 = (top + b.frame_row * ch).saturating_sub(ch / 2);
+            let y1 = (top + (b.frame_row + 1) * ch + ch / 2).min(h);
+            let (cw2, ch2) = (2 * (x1 - x0), 2 * (y1 - y0));
+            let mut crop = Vec::with_capacity(cw2 * ch2 * 4);
+            for y in 0..ch2 {
+                for x in 0..cw2 {
+                    let at = ((y0 + y / 2) * w + x0 + x / 2) * 4;
+                    crop.extend_from_slice(&rgba[at..at + 4]);
+                }
+            }
+            let png = crate::app_introspect::encode_rgba8_png(
+                &crop,
+                u32::try_from(cw2).expect("a width"),
+                u32::try_from(ch2).expect("a height"),
+            )
+            .expect("the crop encodes");
+            std::fs::write(dir.join(format!("{look}-{state}-switch-2x.png")), png)
+                .expect("the PNG");
+        }
+    }
+    crate::chrome_band::install_forced_chrome(before);
 }

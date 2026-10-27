@@ -236,17 +236,6 @@ fn the_hosts_compressor_is_aterm_zstds_encoder_and_packs_what_raw_frames_pack() 
         raw.size,
         raw.stream_bytes
     );
-    let zst = std::fs::read(&host.asset).expect("read the pack");
-    // One frame (RFC 8878 §3.1.1): its descriptor declares a content checksum and no
-    // single segment, and its window is the widest the client's decoder takes.
-    assert_eq!(&zst[..4], &0xFD2F_B528u32.to_le_bytes(), "a zstd frame");
-    assert_eq!(zst[4] & 0x24, 0x04, "a checksum, a window descriptor");
-    assert_eq!(
-        zst[5],
-        (tarwrite::WINDOW_LOG - 10) << 3,
-        "a 2^{} window",
-        tarwrite::WINDOW_LOG
-    );
     let out = tmp.path().join("out");
     extract(&host.asset, &out, host.disk_installed);
     assert_eq!(
@@ -261,14 +250,28 @@ const CHILD_STAGE: &str = "ATPKG_PUBLISH_TEST_CHILD_STAGE";
 const CHILD_ASSET: &str = "ATPKG_PUBLISH_TEST_CHILD_ASSET";
 const CHILD_LEVEL: &str = "ATPKG_PUBLISH_TEST_CHILD_LEVEL";
 
-/// aterm-zstd's encoder at `.0`, written as [`tarwrite::Zstd`] writes at
-/// [`tarwrite::LEVEL`]: the control's compressor.
-struct AtLevel(u8);
+/// aterm-zstd's encoder at `level`, written as [`tarwrite::Zstd`] writes: the controls'
+/// compressor. `fitted` takes the window [`tarwrite::options`] fits to the stream; unfitted
+/// it takes the options of a stream past 2^27 bytes, which every pack had before the window
+/// was fitted (a 2^27 window and no declared size).
+struct Encoded {
+    level: u8,
+    fitted: bool,
+}
 
-impl tarwrite::Compressor for AtLevel {
+impl Encoded {
+    /// Every pack's compressor before the window was fitted.
+    const UNFITTED: Encoded = Encoded {
+        level: tarwrite::LEVEL,
+        fitted: false,
+    };
+}
+
+impl tarwrite::Compressor for Encoded {
     fn compress(
         &self,
         asset: &std::fs::File,
+        len: u64,
         tar: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
         struct Unflushed<W: std::io::Write>(aterm_zstd::encode::Encoder<W>);
@@ -280,10 +283,7 @@ impl tarwrite::Compressor for AtLevel {
                 Ok(())
             }
         }
-        let options = aterm_zstd::encode::Options::new()
-            .level(self.0)
-            .window_log(tarwrite::WINDOW_LOG)
-            .checksum(aterm_zstd::frame::Checksum::Xxh64);
+        let options = tarwrite::options(if self.fitted { len } else { u64::MAX }).level(self.level);
         let mut encoder = Unflushed(aterm_zstd::encode::Encoder::new(
             std::io::BufWriter::with_capacity(1 << 20, asset),
             options,
@@ -291,6 +291,163 @@ impl tarwrite::Compressor for AtLevel {
         tar(&mut encoder)?;
         encoder.0.finish().map(drop)
     }
+}
+
+/// What a frame's header declares (RFC 8878 §3.1.1.1).
+#[derive(Debug, PartialEq, Eq)]
+struct Declared {
+    /// Window_Size: the Window_Descriptor's, or a single segment's Frame_Content_Size.
+    window: u64,
+    /// Single_Segment_Flag.
+    single: bool,
+    /// Frame_Content_Size, when the header carries one.
+    content_size: Option<u64>,
+    /// Content_Checksum_Flag.
+    checksum: bool,
+}
+
+/// The header of the frame `zst` starts with, read by the RFC's layout (§3.1.1.1).
+fn declared(zst: &[u8]) -> Declared {
+    assert_eq!(&zst[..4], &0xFD2F_B528u32.to_le_bytes(), "a zstd frame");
+    let descriptor = zst[4];
+    assert_eq!(descriptor & 0x03, 0, "no dictionary id");
+    let single = descriptor & 0x20 != 0;
+    let (window_descriptor, at) = if single { (None, 5) } else { (Some(zst[5]), 6) };
+    let field = match descriptor >> 6 {
+        0 => usize::from(single),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    let mut bytes = [0u8; 8];
+    bytes[..field].copy_from_slice(&zst[at..at + field]);
+    let value = u64::from_le_bytes(bytes);
+    let content_size = (field > 0).then_some(if field == 2 { value + 256 } else { value });
+    let window = match (window_descriptor, content_size) {
+        (Some(w), _) => {
+            let base = 1u64 << (10 + (w >> 3));
+            base + base / 8 * u64::from(w & 7)
+        }
+        (None, size) => size.expect("a single segment declares its size"),
+    };
+    Declared {
+        window,
+        single,
+        content_size,
+        checksum: descriptor & 0x04 != 0,
+    }
+}
+
+/// A pack declares the smallest window that holds its tar stream: within 2^27 bytes its
+/// frame (one, with its content checksum) is a single segment whose window is the stream,
+/// so a decoder needs no window past the pack's own length. The control: the frame every
+/// pack had before, of the same stage, declares a 2^27 window, more than a hundred times
+/// the stream, and is a pack the client extracts all the same.
+#[test]
+#[cfg(unix)]
+fn a_pack_declares_no_window_past_its_tar_stream() {
+    let tmp = scratch("tar-window");
+    let root = tmp.path().join("stage");
+    compressible(&root);
+    let packed = tarwrite::write(&root, &tmp.path().join("fit.tar.zst")).expect("pack");
+    let fit = declared(&std::fs::read(&packed.asset).expect("read the pack"));
+    assert_eq!(
+        fit,
+        Declared {
+            window: packed.stream_bytes,
+            single: true,
+            content_size: Some(packed.stream_bytes),
+            checksum: true,
+        }
+    );
+    let before = tarwrite::write_with(
+        &root,
+        &tmp.path().join("before.tar.zst"),
+        &Encoded::UNFITTED,
+    )
+    .expect("the unfitted pack");
+    assert_ne!(before.sha256, packed.sha256, "another frame");
+    let unfitted = declared(&std::fs::read(&before.asset).expect("read the unfitted pack"));
+    assert_eq!(
+        unfitted,
+        Declared {
+            window: 1 << tarwrite::WINDOW_LOG_MAX,
+            single: false,
+            content_size: None,
+            checksum: true,
+        }
+    );
+    assert!(unfitted.window > 100 * before.stream_bytes, "{unfitted:?}");
+    extract(
+        &before.asset,
+        &tmp.path().join("out"),
+        before.disk_installed,
+    );
+}
+
+/// Past 2^27 bytes (the trust pack's tar is 3.1 GB) a pack is compressed with the options
+/// every pack had before the window was fitted, so its frame is the bytes it was: the
+/// encoder's output is a function of its options and the stream. The control: a stream of
+/// exactly 2^27 bytes, which fits, declares its size and gets other options.
+#[test]
+fn past_the_widest_window_a_pack_is_compressed_as_before() {
+    use aterm_zstd::encode::Options;
+    use aterm_zstd::frame::{Checksum, WINDOW_MAX};
+
+    let before = Options::new()
+        .level(19)
+        .window_log(27)
+        .checksum(Checksum::Xxh64);
+    for len in [WINDOW_MAX as u64 + 1, 3_102_120_448, u64::MAX] {
+        assert_eq!(tarwrite::options(len), before, "{len}");
+    }
+    assert_ne!(
+        tarwrite::options(WINDOW_MAX as u64),
+        before,
+        "the control: a stream that fits"
+    );
+    assert_eq!(
+        tarwrite::options(WINDOW_MAX as u64),
+        before.content_size(WINDOW_MAX as u64),
+        "2^27 bytes is a single segment under the same window"
+    );
+}
+
+/// Within 2^27 bytes a pack declares its length and the encoder works in the smallest power
+/// of two that holds it, never under the format's 2^10. The control: at a power of two the
+/// next byte takes the next window, so a fixed window, or one a power too wide or too
+/// narrow, fails a row.
+#[test]
+fn within_the_widest_window_a_pack_fits_the_smallest_power_of_two() {
+    use aterm_zstd::encode::Options;
+    use aterm_zstd::frame::{Checksum, WINDOW_MAX};
+
+    let fitted = |log: u8, len: u64| {
+        Options::new()
+            .level(19)
+            .window_log(log)
+            .checksum(Checksum::Xxh64)
+            .content_size(len)
+    };
+    for (len, log) in [
+        (0, 10),
+        (1, 10),
+        (1 << 10, 10),
+        ((1 << 10) + 1, 11),
+        (1 << 20, 20),
+        ((1 << 20) + 1, 21),
+        (1_133_056, 21),
+        (8 << 20, 23),
+        ((8 << 20) + 1, 24),
+        (WINDOW_MAX as u64 - 1, 27),
+    ] {
+        assert_eq!(tarwrite::options(len), fitted(log, len), "{len}");
+    }
+    assert_ne!(
+        tarwrite::options(1 << 20),
+        tarwrite::options((1 << 20) + 1).content_size(1 << 20),
+        "the control: one byte past 2^20 takes the next window"
+    );
 }
 
 /// A signed pack is the stage's alone: two other processes (other pids, other address
@@ -306,7 +463,14 @@ fn a_stage_packs_to_the_same_bytes_in_another_process() {
     {
         let (stage, asset) = (Path::new(&stage), Path::new(&asset));
         match std::env::var(CHILD_LEVEL).ok().and_then(|l| l.parse().ok()) {
-            Some(level) => tarwrite::write_with(stage, asset, &AtLevel(level)),
+            Some(level) => tarwrite::write_with(
+                stage,
+                asset,
+                &Encoded {
+                    level,
+                    fitted: true,
+                },
+            ),
             None => tarwrite::write(stage, asset),
         }
         .expect("the child packs");
@@ -323,7 +487,10 @@ fn a_stage_packs_to_the_same_bytes_in_another_process() {
     let same = tarwrite::write_with(
         &root,
         &tmp.path().join("same.tar.zst"),
-        &AtLevel(tarwrite::LEVEL),
+        &Encoded {
+            level: tarwrite::LEVEL,
+            fitted: true,
+        },
     )
     .expect("the control's compressor at the producer's level");
     assert_eq!(
@@ -366,8 +533,11 @@ fn a_stage_packs_to_the_same_bytes_in_another_process() {
 }
 
 /// The oracle: libzstd's CLI tests and decodes what the producer writes, to the stream the
-/// client's own decoder reads. COULD NOT RUN without it ([`aterm_uds::host::TOOLS`]' zstd
-/// row), never a pass.
+/// client's own decoder reads, under an 8 MB memory limit (RFC 8878 §3.1.1.1.2's
+/// recommended decoder bound), since the pack's tar is within 8 MiB. The control: the
+/// frame every pack had before, of the same stage, passes `zstd -t` without a limit and is
+/// refused under that one for its 2^27 window. COULD NOT RUN without the CLI
+/// ([`aterm_uds::host::TOOLS`]' zstd row), never a pass.
 #[test]
 #[cfg(unix)]
 fn a_pack_decodes_with_the_zstd_cli_to_what_the_client_reads() {
@@ -378,6 +548,7 @@ fn a_pack_decodes_with_the_zstd_cli_to_what_the_client_reads() {
     let root = tmp.path().join("stage");
     compressible(&root);
     let packed = tarwrite::write(&root, &tmp.path().join("x.tar.zst")).expect("pack");
+    assert!(packed.stream_bytes < 8 << 20, "{} B", packed.stream_bytes);
     let mut ours = Vec::new();
     aterm_zstd::Decoder::new(std::fs::File::open(&packed.asset).expect("open"))
         .require_checksum()
@@ -385,27 +556,39 @@ fn a_pack_decodes_with_the_zstd_cli_to_what_the_client_reads() {
         .expect("the client's decoder");
     assert_eq!(ours.len() as u64, packed.stream_bytes);
     let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let mut test = aterm_uds::spawnfd::command(&zstd);
-    test.args(["-t", "-q"]).arg(&packed.asset);
-    let tested = aterm_uds::deadline::output_until(&mut test, deadline()).expect("zstd -t");
-    assert!(
-        tested.status.success(),
-        "zstd -t: {}",
-        String::from_utf8_lossy(&tested.stderr)
-    );
+    let run = |args: &[&str], frame: &Path| {
+        let mut cmd = aterm_uds::spawnfd::command(&zstd);
+        cmd.args(args).arg(frame);
+        let out = aterm_uds::deadline::output_until(&mut cmd, deadline()).expect("zstd runs");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (tested, why) = run(&["-t", "-q", "--memory=8MB"], &packed.asset);
+    assert!(tested, "zstd -t --memory=8MB: {why}");
     // Into a file: a run's captured output keeps only its last MiB.
     let tar = tmp.path().join("x.tar");
-    let mut decode = aterm_uds::spawnfd::command(&zstd);
-    decode.args(["-d", "-q", "-o"]).arg(&tar).arg(&packed.asset);
-    let decoded = aterm_uds::deadline::output_until(&mut decode, deadline()).expect("zstd -d");
-    assert!(
-        decoded.status.success(),
-        "zstd -d: {}",
-        String::from_utf8_lossy(&decoded.stderr)
-    );
+    let to = tar.to_str().expect("a UTF-8 scratch path");
+    let (decoded, why) = run(&["-d", "-q", "--memory=8MB", "-o", to], &packed.asset);
+    assert!(decoded, "zstd -d --memory=8MB: {why}");
     assert!(
         std::fs::read(&tar).expect("the CLI's tar") == ours,
         "the CLI decodes the stream the client reads"
+    );
+
+    let before = tarwrite::write_with(
+        &root,
+        &tmp.path().join("before.tar.zst"),
+        &Encoded::UNFITTED,
+    )
+    .expect("the unfitted pack");
+    let (tested, why) = run(&["-t", "-q"], &before.asset);
+    assert!(tested, "the control decodes without a limit: {why}");
+    let (tested, why) = run(&["-t", "-q", "--memory=8MB"], &before.asset);
+    assert!(
+        !tested && why.contains("too much memory"),
+        "the control: a 2^27 window is refused under 8 MB: {why}"
     );
 }
 
@@ -416,6 +599,7 @@ impl tarwrite::Compressor for StandIn {
     fn compress(
         &self,
         asset: &std::fs::File,
+        _len: u64,
         tar: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
         use std::io::Write as _;
@@ -461,4 +645,64 @@ fn a_compressor_that_fails_or_writes_another_stream_fails_the_pack() {
     let control = StandIn(Some(std::fs::read(&right).expect("read the frames")));
     let packed = tarwrite::write_with(&root, &asset, &control).expect("the archive's own frames");
     extract(&asset, &tmp.path().join("out"), packed.disk_installed);
+}
+
+/// A compressor that sets `file`'s length to `to` once the stream is sized, then compresses
+/// as the producer does.
+struct Resizes {
+    file: std::path::PathBuf,
+    to: Option<u64>,
+}
+
+impl tarwrite::Compressor for Resizes {
+    fn compress(
+        &self,
+        asset: &std::fs::File,
+        len: u64,
+        tar: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if let Some(to) = self.to {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.file)?
+                .set_len(to)?;
+        }
+        tarwrite::Compressor::compress(&tarwrite::Zstd, asset, len, tar)
+    }
+}
+
+/// The stream is sized from the plan before it is written, so a file that shrinks or grows
+/// after its plan read its size is refused by name, before the stream runs past the length
+/// the frame declared (the file grows by more than the rest of the stream, so a copy of the
+/// whole file would meet the encoder's size refusal first). The control: the same
+/// compressor, resizing nothing, packs.
+#[test]
+fn a_file_that_changes_size_after_its_plan_is_refused() {
+    let tmp = scratch("tar-resized");
+    let root = tmp.path().join("stage");
+    let tool = root.join("bin/tool");
+    put(&root.join("share/note"), b"note\n");
+    for to in [4_000, 100_000] {
+        put(&tool, &[7u8; 5_000]);
+        let resizes = Resizes {
+            file: tool.clone(),
+            to: Some(to),
+        };
+        let err = tarwrite::write_with(&root, &tmp.path().join("x.tar.zst"), &resizes)
+            .expect_err("a file resized mid-pack");
+        let want = format!("changed size while it was archived (5000 → {to} bytes)");
+        assert!(err.to_string().contains(&want), "{want}: {err}");
+    }
+    put(&tool, &[7u8; 5_000]);
+    let unresized = Resizes {
+        file: tool,
+        to: None,
+    };
+    let packed = tarwrite::write_with(&root, &tmp.path().join("ok.tar.zst"), &unresized)
+        .expect("the control packs");
+    extract(
+        &packed.asset,
+        &tmp.path().join("out"),
+        packed.disk_installed,
+    );
 }

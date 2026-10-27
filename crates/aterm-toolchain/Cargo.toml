@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Andrew Yates
 #
-# THE TOOLCHAIN, ONE SOURCE: where the pinned Trust toolchain is, where rustup is,
-# where plain targo puts its build intermediates, when a checkout is gone, the
+# THE TOOLCHAIN, ONE SOURCE: where the pinned Trust toolchain is, where rustup's home
+# is, where plain targo puts its build intermediates, when a checkout is gone, the
 # lease a run holds on the toolchain it resolved, and the named lock and the
 # interrupt every wait for a lock or for capacity ends on. Std only but for
 # aterm-libc's signal declarations, so the check runner (aterm-verify), the libc
@@ -17,7 +17,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "The pinned Trust toolchain's discovery, rustup's home and binary, the shared build-cache rule, the gone-checkout rule and the toolchain lease, std only"
+description = "The pinned Trust toolchain's discovery, rustup's home, the shared build-cache rule, the gone-checkout rule and the toolchain lease, std only"
 
 [dependencies]
 # None: std only — but on Windows, where a device is a volume serial and one

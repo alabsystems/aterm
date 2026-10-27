@@ -29,6 +29,7 @@ pub mod init_accounts;
 pub mod init_activation;
 pub mod init_clt;
 pub mod init_develop;
+pub mod init_fseventsd;
 pub mod init_github;
 pub mod init_observe;
 pub mod init_preferences;
@@ -42,6 +43,7 @@ pub mod port;
 pub mod protocol;
 pub mod remote_control;
 pub mod sessions;
+pub mod sync;
 
 /// The converge engine the families run on (docs/DESIGN-init-system-2026-10-20.md §3).
 pub use aterm_converge as converge;

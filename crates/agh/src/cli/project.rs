@@ -196,6 +196,7 @@ const IDENTITY: &[&str] = &[
     "profile",
     "tier",
     "source",
+    "from",
     "presence",
     "why",
     "fingerprint",

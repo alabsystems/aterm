@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# A selection across the band: part of the typed row selected while keys still land, then a
+# selection spanning the rows around it, then none.
+
+grid 16 80
+style rainbow kitty
+hz 60
+
+at 0 pty "\e[9;1H$ "
+at 700 key p
+at 702 pty "p"
+at 800 key r
+at 802 pty "r"
+at 900 key i
+at 902 pty "i"
+at 1000 key n
+at 1002 pty "n"
+at 1100 key t
+at 1102 pty "t"
+at 1200 key f
+at 1202 pty "f"
+at 1300 key space
+at 1302 pty " "
+at 1400 key '
+at 1402 pty "'"
+at 1500 key t
+at 1502 pty "t"
+at 1600 key h
+at 1602 pty "h"
+at 1700 key e
+at 1702 pty "e"
+at 1800 key space
+at 1802 pty " "
+at 1900 key b
+at 1902 pty "b"
+at 2000 key a
+at 2002 pty "a"
+at 2100 key n
+at 2102 pty "n"
+at 2200 key d
+at 2202 pty "d"
+at 2300 key space
+at 2302 pty " "
+at 2400 key u
+at 2402 pty "u"
+at 2500 key n
+at 2502 pty "n"
+at 2600 key d
+at 2602 pty "d"
+at 2700 key e
+at 2700 select 8 0 8 40
+at 2702 pty "e"
+at 2800 key r
+at 2802 pty "r"
+at 2900 key space
+at 2902 pty " "
+at 3000 key a
+at 3002 pty "a"
+at 3100 key space
+at 3102 pty " "
+at 3200 key s
+at 3202 pty "s"
+at 3300 key e
+at 3302 pty "e"
+at 3400 key l
+at 3402 pty "l"
+at 3500 key e
+at 3502 pty "e"
+at 3600 key c
+at 3602 pty "c"
+at 3700 key t
+at 3702 pty "t"
+at 3800 key i
+at 3802 pty "i"
+at 3900 key o
+at 3902 pty "o"
+at 4000 key n
+at 4002 pty "n"
+at 4100 key '
+at 4102 pty "'"
+at 4200 key space
+at 4202 pty " "
+at 4300 key |
+at 4302 pty "|"
+at 4400 key space
+at 4402 pty " "
+at 4500 key t
+at 4502 pty "t"
+at 4600 key r
+at 4602 pty "r"
+at 4700 key space
+at 4702 pty " "
+at 4800 key a
+at 4802 pty "a"
+at 4900 key -
+at 4902 pty "-"
+at 5000 key z
+at 5002 pty "z"
+at 5100 key space
+at 5102 pty " "
+at 5200 key a
+at 5202 pty "A"
+at 5300 key -
+at 5302 pty "-"
+at 5400 key z
+at 5402 pty "Z"
+at 5800 select 7 10 9 20
+at 6400 select off
+run 7300

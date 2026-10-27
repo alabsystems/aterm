@@ -1819,3 +1819,41 @@ fn a_ptys_word_is_read_through_its_device_node() {
         "the keys the editor has not read"
     );
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn this_process_reads_its_start_age_and_executable_on_every_desktop_os() {
+    let me = std::process::id();
+    let mut reader = JobsReader::new();
+    let f = reader
+        .read(ReadReq {
+            pid: me,
+            fds: false,
+        })
+        .expect("this process reads itself");
+    assert_eq!(f.pid, me);
+    assert!(f.start.is_some_and(|s| s > 0), "{f:?}");
+    assert!(f.age_ms.is_some(), "{f:?}");
+    assert_ne!(f.state, RunState::Zombie, "{f:?}");
+    assert!(!f.name.is_empty(), "{f:?}");
+    let own = std::env::current_exe().expect("this test's executable");
+    assert_eq!(
+        f.exe.as_deref(),
+        own.file_name().and_then(|n| n.to_str()),
+        "{f:?}"
+    );
+    assert!(f.counters.is_some(), "{f:?}");
+    assert!(
+        reader.read(ReadReq { pid: 0, fds: false }).is_none(),
+        "pid 0 is no process"
+    );
+    assert!(
+        reader
+            .read(ReadReq {
+                pid: u32::MAX - 1,
+                fds: false,
+            })
+            .is_none(),
+        "an unused pid reads None"
+    );
+}

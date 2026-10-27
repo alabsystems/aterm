@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Stand-in TUI binary (`--shape <claude|streamer|cold-streamer|repainter>`) for headless paint and spin scenes.
+//! Stand-in TUI binary (`--shape <claude|streamer|cold-streamer|repainter>`, `--echo`, `--drain <bytes> <out>`) for private measure scenes.
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -15,7 +15,10 @@ fn main() {
     #[cfg(not(unix))]
     let ran = false;
     if !ran {
-        eprintln!("usage: fake-tui --shape <claude|streamer|cold-streamer|repainter> (unix)");
+        eprintln!(
+            "usage: fake-tui --shape <claude|streamer|cold-streamer|repainter> | --echo | --drain <bytes> \
+             <out> (unix)"
+        );
         std::process::exit(2);
     }
 }
@@ -79,6 +82,25 @@ mod shapes {
 
     fn bracket(body: &str) {
         w(&format!("\x1b[?2026h\x1b[?25l{body}\x1b[?25h\x1b[?2026l"));
+    }
+
+    /// Echo real PTY input as output, without repainting over a resize's retained content.
+    /// The proof line shows the fixture ran; Ctrl-C/D ends it and restores its terminal.
+    fn echo() {
+        let _raw = Raw::enter();
+        w("raw-echo-ready\r\n");
+        loop {
+            let Some(chunk) = read_within(Duration::from_secs(3600)) else {
+                continue;
+            };
+            if chunk.is_empty() || chunk.iter().any(|byte| matches!(byte, 0x03 | 0x04)) {
+                break;
+            }
+            let mut out = std::io::stdout().lock();
+            if out.write_all(&chunk).and_then(|()| out.flush()).is_err() {
+                break;
+            }
+        }
     }
 
     fn claude() {
@@ -234,9 +256,28 @@ mod shapes {
         println!("steady repainter done");
     }
 
+    /// Write `bytes` of numbered, coloured lines as fast as the terminal takes them, then the microseconds that took into `out`.
+    fn drain(bytes: usize, out: &str) {
+        let text = aterm_conformance::measure::rewind::chain_text(bytes);
+        let mut stdout = std::io::stdout().lock();
+        let start = Instant::now();
+        for chunk in text.as_bytes().chunks(64 * 1024) {
+            if stdout.write_all(chunk).is_err() {
+                return;
+            }
+        }
+        let _ = stdout.flush();
+        let _ = std::fs::write(out, format!("{}\n", start.elapsed().as_micros()));
+    }
+
     /// Run the shape `args` name; `false` for anything else.
     pub fn run(args: &[&str]) -> bool {
         match args {
+            ["--drain", bytes, out] => match bytes.parse() {
+                Ok(bytes) => drain(bytes, out),
+                Err(_) => return false,
+            },
+            ["--echo"] => echo(),
             ["--shape", "claude"] => claude(),
             ["--shape", "streamer"] => streamer(),
             ["--shape", "cold-streamer"] => cold_streamer(),

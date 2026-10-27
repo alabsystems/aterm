@@ -7071,7 +7071,7 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
     let tmp = tmp_dir("sweep-why");
     let state = tmp.path().join("state");
     let path = Path::new("/c/ws/.cargo-build");
-    let cases: [(Unused, &[&str]); 6] = [
+    let cases: [(Unused, &[&str]); 7] = [
         (
             Unused::Gone {
                 idle: std::time::Duration::from_secs(26 * 3_600),
@@ -7084,6 +7084,13 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
                 idle: std::time::Duration::from_secs(31 * 86_400),
             },
             &["31d"],
+        ),
+        (
+            Unused::Moved {
+                idle: std::time::Duration::from_secs(3 * 3_600),
+                after: atpkg::build_cache::MOVED_AFTER,
+            },
+            &["3h", "1h", ".ubd"],
         ),
         (Unused::Unfinished, &[]),
         (
@@ -7660,7 +7667,10 @@ fn versions_prints_incremental_numeric_version_for_every_cli_harness() {
         !text.contains("gemini"),
         "a retired harness listed:\n{text}"
     );
-    assert!(text.contains("v0.1"), "expected v0.1 in:\n{text}");
+    for harness in aterm_phase::CliHarness::ALL {
+        let shown = format!("v{}", harness.version_str());
+        assert!(text.contains(&shown), "expected {shown} in:\n{text}");
+    }
 
     let (ok_json, json, err_json) = go(&Cmd::Versions { json: true }, &env);
     assert!(ok_json, "err={err_json}");
@@ -7674,7 +7684,16 @@ fn versions_prints_incremental_numeric_version_for_every_cli_harness() {
         !json.contains(r#""slug":"gemini""#),
         "a retired harness listed:\n{json}"
     );
-    assert!(json.contains(r#""version":"0.1","major":0,"minor":1"#));
+    for harness in aterm_phase::CliHarness::ALL {
+        let v = harness.version();
+        let entry = format!(
+            r#""version":"{}","major":{},"minor":{}"#,
+            v.as_str(),
+            v.major(),
+            v.minor()
+        );
+        assert!(json.contains(&entry), "{entry} in:\n{json}");
+    }
 }
 
 #[path = "cli_signin_tests.rs"]

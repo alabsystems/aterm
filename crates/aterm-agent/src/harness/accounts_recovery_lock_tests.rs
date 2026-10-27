@@ -136,6 +136,7 @@ impl Bed {
         fs::write(login_file, b"private checkpoint fixture").unwrap();
         accounts::write_renewal_checkpoint_for(
             cli,
+            (cli == Cli::Kimi).then_some(Region::Global),
             label,
             &format!("{label}@example.test"),
             staging.to_str().unwrap(),
@@ -173,7 +174,7 @@ fn lock_case(cli: Cli, case: i64) -> [(&'static str, i64); 8] {
     let peer = accounts::Store::at_for(&bed.state, peer_cli, &bed.home);
     assert_eq!(peer.shared_dir(), bed.store.shared_dir());
     let guard = bed.guard();
-    if matches!(case, 15 | 18 | 20 | 21) {
+    if matches!(case, 15 | 18 | 20 | 21 | 23 | 24 | 27 | 28) {
         bed.store
             .transact_logins(NOW - 10, &mut None, |_, logins| {
                 for label in ["account", "second"] {
@@ -197,7 +198,7 @@ fn lock_case(cli: Cli, case: i64) -> [(&'static str, i64); 8] {
         }
         evidence.push(staging);
     }
-    if matches!(case, 15 | 18 | 20 | 21) {
+    if matches!(case, 15 | 18 | 20 | 21 | 23 | 24 | 27 | 28) {
         evidence.push(bed.checkpoint("second"));
         if case == 18 {
             let text = fs::read_to_string(&bed.path).unwrap();
@@ -254,7 +255,7 @@ fn lock_case(cli: Cli, case: i64) -> [(&'static str, i64); 8] {
                     dir.join(cli.connector().stores[0]),
                     dir.join(accounts::RENEWAL_CHECKPOINT_FILE),
                 ]
-                .map(|path| fs::read(path).unwrap())
+                .map(|path| fs::read(path).ok())
             })
             .collect::<Vec<_>>()
     };
@@ -325,15 +326,40 @@ fn lock_case(cli: Cli, case: i64) -> [(&'static str, i64); 8] {
                 held_writer = bed.store.try_acquire().unwrap();
                 assert!(held_writer.is_some());
             }
+            if matches!(case, 23 | 24) && visits == 2 {
+                let checkpoint = evidence[1].join(accounts::RENEWAL_CHECKPOINT_FILE);
+                let text = if case == 23 {
+                    "invalid checkpoint".into()
+                } else {
+                    fs::read_to_string(&checkpoint)
+                        .unwrap()
+                        .replace("second@example.test", "changed@example.test")
+                };
+                fs::write(checkpoint, text).unwrap();
+                evidence_before = evidence_files();
+                before = account_files(&bed.store);
+            }
+            if (matches!(case, 25 | 26) && visits == 1) || (matches!(case, 27 | 28) && visits == 2)
+            {
+                let candidate = usize::from(case >= 27);
+                let login = evidence[candidate].join(cli.connector().stores[0]);
+                fs::rename(&login, login.with_extension("retained")).unwrap();
+                if matches!(case, 26 | 28) {
+                    fs::create_dir(&login).unwrap();
+                }
+                evidence_before = evidence_files();
+                before = account_files(&bed.store);
+            }
         },
     );
-    let mut preserved = i64::from(recovered || before == account_files(&bed.store));
+    let mut preserved =
+        i64::from((!matches!(case, 23..=28) && recovered) || before == account_files(&bed.store));
     for (dir, expected) in evidence.iter().zip(evidence_before) {
         let after = [
             dir.join(cli.connector().stores[0]),
             dir.join(accounts::RENEWAL_CHECKPOINT_FILE),
         ]
-        .map(|path| fs::read(path).unwrap());
+        .map(|path| fs::read(path).ok());
         preserved &= i64::from(expected == after);
     }
     let published = if recovered {
@@ -393,7 +419,8 @@ pub(crate) fn recovery_lock_transition(
 #[test]
 fn recovery_lock_conforms_and_catches_overlap_and_lost_evidence() {
     let model = aterm_models_harness::account_recovery_lock_model();
-    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    assert_eq!(model.mutant_dials(), (1..=34).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 56);
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
@@ -417,13 +444,21 @@ fn recovery_lock_conforms_and_catches_overlap_and_lost_evidence() {
         forged.insert(field, value);
         assert!(!model.check_invariant(invariant, &forged));
     }
+    for (case, stale_publications) in [(23, 2), (24, 2), (25, 1), (26, 1), (27, 2), (28, 2)] {
+        let mut before = model.init_state();
+        before.insert("case", case);
+        let mut forged = recovery_lock_transition(&before, "Recover");
+        forged.insert("published", stale_publications);
+        assert!(!model.check_invariant("PublicationPolicy", &forged));
+    }
 }
 
 #[test]
-fn recovery_lock_cases_cover_every_provider() {
+fn recovery_lock_cases_cover_every_applicable_provider() {
     let model = aterm_models_harness::account_recovery_lock_model();
     for cli in CLIS {
-        for case in 1..=22 {
+        let last_case = if cli == Cli::Claude { 24 } else { 28 };
+        for case in 1..=last_case {
             let mut state = model.init_state();
             state.insert("case", case);
             let mut next = state.clone();
@@ -434,6 +469,37 @@ fn recovery_lock_cases_cover_every_provider() {
                 model.successors("Recover", &state).contains(&next),
                 "{cli:?}: {state:?} -> {next:?}"
             );
+        }
+    }
+}
+
+#[test]
+fn recovery_rechecks_each_checkpoint_after_the_previous_publication() {
+    for cli in CLIS {
+        for case in [23, 24] {
+            let result = lock_case(cli, case);
+            let field = |key| result.iter().find(|(name, _)| *name == key).unwrap().1;
+            assert_eq!(field("published"), 1, "{cli:?}, case {case}");
+            assert_eq!(field("overlap"), 0);
+            assert_eq!(field("preserved"), 1);
+        }
+    }
+}
+
+#[test]
+fn recovery_rechecks_vendor_login_files_before_publication() {
+    // Claude may use the Keychain; its existing nonempty-home policy is separate.
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        for case in 25..=28 {
+            let result = lock_case(cli, case);
+            let field = |key| result.iter().find(|(name, _)| *name == key).unwrap().1;
+            assert_eq!(
+                field("published"),
+                i64::from(case >= 27),
+                "{cli:?}, case {case}"
+            );
+            assert_eq!(field("overlap"), 0);
+            assert_eq!(field("preserved"), 1);
         }
     }
 }

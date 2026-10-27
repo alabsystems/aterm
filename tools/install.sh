@@ -3718,57 +3718,6 @@ install_app_cleanup() {
 	[[ -z "${APP_TO_OPEN:-}" ]] || echo "  launch:  open $(shell_word "$APP_TO_OPEN")"
 }
 
-# Enable at Startup, aterm Caffeine's login job (crates/aterm-caffeine
-# launchd.rs), runs `<exe> caffeine serve` at every login and again each time
-# it fails, so placing an aterm with no `caffeine` verb at <exe> (a release
-# before 0.107.0, by an explicit --version) leaves a job that fails every 10 s
-# all session. When <exe>, at its final path, answers `help caffeine` with a
-# definite no (code::serves_caffeine's probe and its reading: a status <exe>
-# chose, 1 to 125 but bounded's cut-off, 124; from 126 up a run that could not
-# start or one a signal ended is no answer),
-# each such job is turned off, as a running mug whose code lost the verb turns
-# its own off (macos/app.rs restart_or_retire): its plist in this home's
-# ~/Library/LaunchAgents goes, and launchd unloads the job, ending a mug it
-# runs. A job is one such when its label is one aterm makes (launchd.rs
-# is_label) and its ProgramArguments are exactly <exe> caffeine serve. Only on
-# macOS, and under root only over root's own home: a root run acts on another
-# account's home only as that account (run_as_home_account). Nothing runs <exe>
-# when no such job is there.
-retire_caffeine_startup() { # <exe>
-	local exe="$1" plist label s=0 found=()
-	[[ "$(uname -s)" == Darwin ]] || return 0
-	[[ "$(installer_uid)" != 0 || "$(home_owner_uid)" == 0 ]] || return 0
-	for plist in "$HOME"/Library/LaunchAgents/com.aterm.aterm.caffeine*.plist; do
-		[[ -f "$plist" && ! -L "$plist" ]] || continue
-		label="${plist##*/}"
-		label="${label%.plist}"
-		caffeine_label "$label" || continue
-		[[ "$(plist_raw "$plist" Label)" == "$label" ]] || continue
-		[[ "$(plist_raw "$plist" ProgramArguments)" == 3 &&
-			"$(plist_raw "$plist" ProgramArguments.0)" == "$exe" &&
-			"$(plist_raw "$plist" ProgramArguments.1)" == caffeine &&
-			"$(plist_raw "$plist" ProgramArguments.2)" == serve ]] || continue
-		found+=("$plist")
-	done
-	[[ ${#found[@]} -gt 0 ]] && may_run "$exe" || return 0
-	BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" "$exe" help caffeine || s=$?
-	[[ "$s" -ge 1 && "$s" -le 125 && "$s" -ne 124 ]] || return 0
-	for plist in "${found[@]}"; do
-		rm -f "$plist" || continue
-		label="${plist##*/}"
-		# Not loaded is as good as unloaded.
-		BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" launchctl bootout "gui/$(installer_uid)/${label%.plist}" || true
-		echo "install.sh: turned off aterm Caffeine's Enable at Startup ($plist): this aterm has no Caffeine, so its login job would fail every 10 s — an aterm with the Caffeine menu turns it back on"
-	done
-}
-
-# Whether <label> is one aterm Caffeine makes (launchd.rs is_label): the
-# installed app's, or a dev build's with its 8-hex-digit path hash.
-caffeine_label() { # <label>
-	local re='^com\.aterm\.aterm\.caffeine\.dev\.[0123456789abcdef]{8}$'
-	[[ "$1" == com.aterm.aterm.caffeine || "$1" =~ $re ]]
-}
-
 # The value at <keypath> in <plist> as plutil prints it raw (an array's count),
 # or nothing.
 plist_raw() { # <plist> <keypath>
@@ -5984,8 +5933,6 @@ install_app() {
 	mdimport "$DEST/aterm.app" >/dev/null 2>&1 || true
 	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
 		-f "$DEST/aterm.app" >/dev/null 2>&1 || true
-
-	retire_caffeine_startup "$DEST/aterm.app/Contents/MacOS/aterm"
 
 	# Read here, not inside a command substitution, whose stdout is its pipe.
 	local running=0 stdout_tty=0

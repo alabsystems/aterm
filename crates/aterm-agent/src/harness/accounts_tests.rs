@@ -15,6 +15,31 @@ const MIN: i64 = 60;
 const HOUR: i64 = 3600;
 const DAY: i64 = 24 * HOUR;
 
+pub(super) fn record_wall(
+    store: &Store,
+    roster: &Roster,
+    sid: &str,
+    who: &ProcessLogin,
+    wall: &StandingWall,
+    started: i64,
+    now: i64,
+) -> Recorded {
+    let (_directory, captured) = usage_fixture(store, roster);
+    super::record_wall(store, &captured, sid, who, wall, started, now)
+}
+
+pub(super) fn record_usage(
+    store: &Store,
+    roster: &Roster,
+    sid: &str,
+    who: &ProcessLogin,
+    said: &UsageSaid,
+    now: i64,
+) -> Recorded {
+    let (_directory, captured) = usage_fixture(store, roster);
+    super::record_usage(store, &captured, sid, who, said, now)
+}
+
 fn tmp(tag: &str) -> Tmp {
     aterm_tempfile::Builder::new()
         .prefix(&format!("aterm-harness-accounts-{tag}-"))
@@ -8140,6 +8165,79 @@ fn a_kimi_row_with_an_email_names_its_region_and_only_a_known_one() {
         Roster::parse_for(Cli::Kimi, no_email).is_ok(),
         "a row with no email needs none"
     );
+}
+
+#[test]
+fn roster_identity_distinguishes_provider_realms_but_not_login_methods() {
+    let first = Row {
+        label: "first".into(),
+        class: Class::Dedicated,
+        dir: Some("/logins/first".into()),
+        email: Some("one@example.test".into()),
+        vendor: Vendor {
+            region: Some(Region::Global),
+            flow: None,
+        },
+        ..Row::default()
+    };
+    let second = Row {
+        label: "second".into(),
+        dir: Some("/logins/second".into()),
+        email: Some("ONE@example.test".into()),
+        vendor: Vendor {
+            region: Some(Region::MainlandCn),
+            flow: None,
+        },
+        ..first.clone()
+    };
+    let text = append_rows_for(Cli::Kimi, "", &[first.clone(), second.clone()])
+        .expect("one email can name accounts in different provider realms");
+    assert_eq!(
+        Roster::parse_for(Cli::Kimi, &text).unwrap().rows,
+        [first.clone(), second.clone()]
+    );
+    for (conflict, reason) in [
+        (
+            Row {
+                vendor: first.vendor,
+                ..second.clone()
+            },
+            "name one email",
+        ),
+        (
+            Row {
+                label: first.label.clone(),
+                ..second.clone()
+            },
+            "listed twice",
+        ),
+        (
+            Row {
+                dir: first.dir.clone(),
+                ..second.clone()
+            },
+            "name one dir",
+        ),
+    ] {
+        let error = append_rows_for(Cli::Kimi, "", &[first.clone(), conflict])
+            .expect_err("different realms do not bypass identity, label or directory uniqueness");
+        assert!(error.contains(reason), "{error}");
+    }
+    for cli in [Cli::Codex, Cli::Grok] {
+        let mut browser = first.clone();
+        browser.vendor = Vendor {
+            region: None,
+            flow: Some(Flow::Browser),
+        };
+        let mut device = second.clone();
+        device.vendor = Vendor {
+            region: None,
+            flow: Some(Flow::Device),
+        };
+        let error = append_rows_for(cli, "", &[browser, device])
+            .expect_err("login methods do not create separate provider identities");
+        assert!(error.contains("name one email"), "{error}");
+    }
 }
 
 #[test]

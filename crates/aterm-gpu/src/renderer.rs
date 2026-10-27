@@ -3,8 +3,6 @@
 
 //! The GPU terminal renderer (`GpuRenderer`): backend orchestration and the glyph/quad pipelines.
 
-#[cfg(wgpu_arm)]
-use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use aterm_hash::{FxHashMap, FxHashSet};
@@ -16,24 +14,9 @@ use aterm_render::{
 };
 
 use crate::GpuContext;
-#[cfg(any(wgpu_arm, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use crate::pipeline_table::ShaderLibrary;
-#[cfg(wgpu_arm)]
-use crate::pipeline_table::TargetFormats;
 use crate::pipeline_table::{self, Pipeline};
-
-#[cfg(wgpu_arm)]
-#[inline]
-const fn wgsl_source(library: ShaderLibrary) -> &'static str {
-    match library {
-        ShaderLibrary::Cell => SHADER,
-        ShaderLibrary::Blit => BLIT_SHADER,
-        ShaderLibrary::HdrGlow => HDR_GLOW_SHADER,
-        ShaderLibrary::Tray => TRAY_SHADER,
-        ShaderLibrary::Bloom => BLOOM_SHADER,
-        ShaderLibrary::Shimmer => SHIMMER_SHADER,
-    }
-}
 
 const ATLAS_WIDTH: u32 = 1024;
 
@@ -307,1175 +290,6 @@ impl_pod_zeroable!(FireInstance {
 const _: () =
     assert!(std::mem::size_of::<FireInstance>() as u64 == pipeline_table::FIRE_LAYOUT.stride);
 
-#[cfg(wgpu_arm)]
-const SHADER: &str = r#"
-// text_blend != 0.0 => fs_glyph applies the W2 linear-corrected coverage remap.
-struct Uniforms { screen: vec2<f32>, text_blend: f32, pad: f32 };
-@group(0) @binding(0) var<uniform> u: Uniforms;
-
-// Unit quad corner for vertex index 0..6 (two CCW triangles).
-fn corner(vi: u32) -> vec2<f32> {
-    var c = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
-        vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0)
-    );
-    return c[vi];
-}
-
-// Pixel coords (top-left origin, y down) -> clip space (y up, row 0 at top).
-fn to_ndc(px: vec2<f32>) -> vec2<f32> {
-    return vec2<f32>(2.0 * px.x / u.screen.x - 1.0, 1.0 - 2.0 * px.y / u.screen.y);
-}
-
-// sRGB-encoded channel -> linear-light (the proper piecewise curve). The base
-// (OVER/REPLACE) passes render into an sRGB-typed target that re-encodes on store,
-// so emitting linear here makes fixed-function blending composite in linear light,
-// matching the CPU `blend`. Alpha/coverage are NOT sRGB and pass through. (The
-// ADDITIVE glow/deco-add passes render to the Unorm view and must NOT decode.)
-fn s2l(c: vec3<f32>) -> vec3<f32> {
-    let lo = c / 12.92;
-    let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
-    return select(lo, hi, c > vec3<f32>(0.04045));
-}
-
-// Scalar sRGB decode/encode for the W2 corrected-alpha remap — the SAME
-// piecewise curves (and thresholds) as the CPU `srgb_to_linear`/
-// `linear_to_srgb`, so both backends remap coverage float-for-float.
-fn s2l_s(c: f32) -> f32 {
-    if (c <= 0.04045) { return c / 12.92; }
-    return pow((c + 0.055) / 1.055, 2.4);
-}
-fn l2s_s(l: f32) -> f32 {
-    if (l <= 0.0031308) { return 12.92 * l; }
-    return 1.055 * pow(l, 1.0 / 2.4) - 0.055;
-}
-
-struct BgVsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) color: vec4<f32>,
-};
-
-@vertex
-fn vs_bg(@builtin(vertex_index) vi: u32,
-         @location(0) rect_u: vec4<u32>,
-         @location(1) color: vec4<f32>) -> BgVsOut {
-    // Uint16x4 arrives as vec4<u32>; integer pixel coords -> exact f32 (no loss).
-    let rect = vec4<f32>(rect_u);
-    let k = corner(vi);
-    let px = rect.xy + k * rect.zw;
-    var o: BgVsOut;
-    o.pos = vec4<f32>(to_ndc(px), 0.0, 1.0);
-    o.color = color;
-    return o;
-}
-
-@fragment
-fn fs_bg(in: BgVsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(s2l(in.color.rgb), in.color.a);
-}
-
-// GLOW (the LUMEN aurora and every other `GlowQuad` stream): a `GlowInstance` —
-// the bg rect plus a colour PAIR, the quad's LEFT and RIGHT edges.
-// The vertex stage hands the fragment the pair and the rect's x-span FLAT, and
-// the fragment ramps between the two ends PER COLUMN with the SAME integer law
-// the CPU rasterizer uses (`aterm_render::glow_lerp`), for alpha alike:
-//
-//     c(i) = (c0·(2w − m) + c1·m + w) / (2w),   m = 2i + 1
-//
-// A flat pair (c0 == c1) is the identity for every i, so a flat stream keeps
-// its exact bytes; a gradient is continuous inside the quad. The rasterizer's
-// float colour interpolant is deliberately NOT used —
-// its rounding is not the CPU's, and byte parity is the contract. The fragment
-// emits `c / 255.0` RAW (no sRGB decode; the same division the Unorm8x4 decode
-// performed for the flat path) into the glow blend `src + dst·(1 − src_a)`,
-// which rounds ONCE on store: over the offscreen's default view that is
-// byte-exact == the CPU `add_sat` / `over_premul` on native, and lands in
-// linear on downlevel (the accepted approximation — see the header DOWNLEVEL
-// FALLBACK).
-struct GlowVsOut {
-    @builtin(position) pos: vec4<f32>,
-    // The quad's left edge and width in device px, as whole numbers.
-    @location(0) @interpolate(flat) span: vec2<f32>,
-    // The colour pair as exact bytes (r, g, b, a): premultiplied, `a` the mode.
-    @location(1) @interpolate(flat) c0: vec4<u32>,
-    @location(2) @interpolate(flat) c1: vec4<u32>,
-    // The fragment's x INSIDE THE QUAD, in the quad's own px (0 at its left
-    // edge, its width at its right), interpolated linearly: the same pipeline
-    // draws the bloom EXTRACT into the HALF-RES bloom target under the
-    // full-res uniforms, where `pos.x - span.x` would mix a half-res pixel with
-    // a full-res edge and paint the quad's left half in its LEFT colour.
-    // cell.metal's `vs_glow` is the twin.
-    @location(3) @interpolate(linear, center) lx: f32,
-};
-
-@vertex
-fn vs_glow(@builtin(vertex_index) vi: u32,
-           @location(0) rect_u: vec4<u32>,
-           @location(1) c0: vec4<u32>,
-           @location(2) c1: vec4<u32>) -> GlowVsOut {
-    let rect = vec4<f32>(rect_u);
-    let k = corner(vi);
-    let px = rect.xy + k * rect.zw;
-    var o: GlowVsOut;
-    o.pos = vec4<f32>(to_ndc(px), 0.0, 1.0);
-    o.span = rect.xz;
-    o.lx = k.x * rect.z;
-    o.c0 = c0;
-    o.c1 = c1;
-    return o;
-}
-
-// The fragment's 0-based column inside its quad, from its x in the quad's own
-// px. At full res the pixel CENTRE interpolates to i + 0.5, so the floor is i
-// with half a pixel of margin either side; at half res each fragment reads the
-// quad's own column under its centre. The clamp only guards the edges.
-fn glow_column(lx: f32, w: f32) -> u32 {
-    return u32(clamp(floor(lx), 0.0, max(w - 1.0, 0.0)));
-}
-
-// `aterm_render::glow_lerp`, per channel and for alpha alike, at column `i` of
-// a `w`-wide quad (`w >= 1`: a zero-width quad rasterizes no fragment).
-fn glow_lerp4(c0: vec4<u32>, c1: vec4<u32>, i: u32, w: u32) -> vec4<u32> {
-    let m = 2u * min(i, w - 1u) + 1u;
-    return (c0 * (2u * w - m) + c1 * m + vec4<u32>(w)) / (2u * w);
-}
-
-@fragment
-fn fs_glow(in: GlowVsOut) -> @location(0) vec4<f32> {
-    let w = max(u32(in.span.y), 1u);
-    let c = glow_lerp4(in.c0, in.c1, glow_column(in.lx, in.span.y), w);
-    return vec4<f32>(c) / 255.0;
-}
-
-// The bloom's lights as an item list (`aterm_render::bloom::BloomItems`,
-// whose `light` is this reader's twin; cell.metal's GLOW ITEMS spells the
-// layout out), read by instance index: a ramp reaches the bloom whole.
-@group(1) @binding(5) var<storage, read> glow_items: array<u32>;
-
-struct GlowItem {
-    rect: vec4<u32>,
-    c0: vec4<u32>,
-    c1: vec4<u32>,
-};
-
-// An end as bytes (r, g, b, a), its colour times num / den, rounded.
-fn glow_item_end(e: u32, num: u32, den: u32) -> vec4<u32> {
-    let c = ((vec3<u32>(e >> 16u, e >> 8u, e) & vec3<u32>(255u)) * num + vec3<u32>(den / 2u)) / den;
-    return vec4<u32>(c, e >> 24u);
-}
-
-fn glow_item(i: u32, widen: bool) -> GlowItem {
-    var lo = 0u;
-    var hi = glow_items[0] - 1u;
-    loop {
-        if (lo >= hi) {
-            break;
-        }
-        let mid = (lo + hi + 1u) >> 1u;
-        if (glow_items[4u + mid] <= i) {
-            lo = mid;
-        } else {
-            hi = mid - 1u;
-        }
-    }
-    let s = i - glow_items[4u + lo];
-    let r = glow_items[1] + 4u * lo;
-    let xy = glow_items[r];
-    let join = glow_items[r + 2u] & 0xFFFFu;
-    let joined = glow_items[r + 2u] >> 16u;
-    let e = glow_items[2] + glow_items[r + 3u] + 2u * s;
-    let e0 = glow_items[e];
-    let e1 = glow_items[e + 1u];
-    var qw = glow_items[r + 1u] & 0xFFFFu;
-    var qh = select(1u, joined + 1u, s == join);
-    var num = 1u;
-    var den = 1u;
-    if (widen) {
-        if (qw > 0u && qw < 2u) {
-            num = num * qw;
-            den = den * 2u;
-            qw = 2u;
-        }
-        if (qh < 2u) {
-            num = num * qh;
-            den = den * 2u;
-            qh = 2u;
-        }
-    }
-    var it: GlowItem;
-    it.rect = select(
-        vec4<u32>(xy & 0xFFFFu, (xy >> 16u) + s + select(0u, joined, s > join), qw, qh),
-        vec4<u32>(0u),
-        (e0 | e1) == 0u,
-    );
-    it.c0 = glow_item_end(e0, num, den);
-    it.c1 = glow_item_end(e1, num, den);
-    return it;
-}
-
-// `vs_glow` over the item list, widened: the bloom extract's lights.
-@vertex
-fn vs_glow_items(@builtin(vertex_index) vi: u32,
-                 @builtin(instance_index) ii: u32) -> GlowVsOut {
-    let it = glow_item(ii, true);
-    let rect = vec4<f32>(it.rect);
-    let k = corner(vi);
-    let px = rect.xy + k * rect.zw;
-    var o: GlowVsOut;
-    o.pos = vec4<f32>(to_ndc(px), 0.0, 1.0);
-    o.span = rect.xz;
-    o.lx = k.x * rect.z;
-    o.c0 = it.c0;
-    o.c1 = it.c1;
-    return o;
-}
-
-// PHOSPHOR rain bright-head halo (One/One additive, RAW like fs_glow) with an
-// ELLIPTICAL RADIAL FALLOFF. The weight is pure INTEGER math on window-pixel
-// coords so it is byte-for-byte identical to the CPU `draw_rain_add`.
-struct RainVsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) @interpolate(flat) fall: vec4<u32>,   // cx, cy, rx, ry (window px)
-};
-
-@vertex
-fn vs_rain_glow(@builtin(vertex_index) vi: u32,
-                @location(0) rect_u: vec4<u32>,
-                @location(1) color: vec4<f32>,
-                @location(2) fall_u: vec4<u32>) -> RainVsOut {
-    let rect = vec4<f32>(rect_u);
-    let k = corner(vi);
-    let px = rect.xy + k * rect.zw;
-    var o: RainVsOut;
-    o.pos = vec4<f32>(to_ndc(px), 0.0, 1.0);
-    o.color = color;
-    o.fall = fall_u;
-    return o;
-}
-
-@fragment
-fn fs_rain_glow(in: RainVsOut) -> @location(0) vec4<f32> {
-    // Frag pos is the pixel CENTRE (px + 0.5); floor -> the integer pixel index
-    // the CPU walks. All arithmetic below mirrors `draw_rain_add` exactly.
-    let px = i32(floor(in.pos.x));
-    let py = i32(floor(in.pos.y));
-    let cx = i32(in.fall.x);
-    let cy = i32(in.fall.y);
-    let rx = i32(in.fall.z);
-    let ry = i32(in.fall.w);
-    let dx = px - cx;
-    let dy = py - cy;
-    let nsq = (dx * dx * 256) / (rx * rx) + (dy * dy * 256) / (ry * ry);
-    var wt = 256 - nsq;
-    if (wt < 0) { wt = 0; }
-    wt = (wt * wt) / 256;
-    if (wt > 255) { wt = 255; }
-    // mul8(premul_channel, wt) == (c*wt + 127)/255 — matches CPU `premul_rgb`.
-    let cr = i32(round(in.color.r * 255.0));
-    let cg = i32(round(in.color.g * 255.0));
-    let cb = i32(round(in.color.b * 255.0));
-    let r = f32((cr * wt + 127) / 255) / 255.0;
-    let g = f32((cg * wt + 127) / 255) / 255.0;
-    let b = f32((cb * wt + 127) / 255) / 255.0;
-    return vec4<f32>(r, g, b, 1.0);
-}
-
-// HaloMode::Over radial VEIL (RAW like fs_rain_glow — same Unorm view): the
-// SAME integer falloff weight, but emitted as the STRAIGHT (unpremultiplied)
-// colour with the weight as the per-pixel ALPHA into the deco source-over
-// blend state (SrcAlpha/OneMinusSrcAlpha):
-//   out = rgb·(wt/255) + dst·(1 − wt/255)
-// — the float twin of the CPU `over_rgb(dst, rgb, wt)` round-half integer
-// composite. The fixed function rounds ONCE on store; exact ties are
-// impossible (255k + 127.5 is never an integer), so the veil is byte-exact
-// CPU==GPU wherever the One/One adds are (native Unorm offscreen).
-@fragment
-fn fs_rain_glow_over(in: RainVsOut) -> @location(0) vec4<f32> {
-    let px = i32(floor(in.pos.x));
-    let py = i32(floor(in.pos.y));
-    let cx = i32(in.fall.x);
-    let cy = i32(in.fall.y);
-    let rx = i32(in.fall.z);
-    let ry = i32(in.fall.w);
-    let dx = px - cx;
-    let dy = py - cy;
-    let nsq = (dx * dx * 256) / (rx * rx) + (dy * dy * 256) / (ry * ry);
-    var wt = 256 - nsq;
-    if (wt < 0) { wt = 0; }
-    wt = (wt * wt) / 256;
-    if (wt > 255) { wt = 255; }
-    // Per-pixel alpha CEILING (== CPU `wt.min(aterm_render::halo_over_cap)`):
-    // the veil's cap rides the instance colour's ALPHA byte; 0 == uncapped
-    // (255), so every historical veil (packed a == 0) is byte-identical.
-    var cap = i32(round(in.color.a * 255.0));
-    if (cap == 0) { cap = 255; }
-    if (wt > cap) { wt = cap; }
-    return vec4<f32>(in.color.rgb, f32(wt) / 255.0);
-}
-
-// ============================ EMBERFORGE FIRE ============================
-// The WGSL twin of `aterm_render::fire_field` — OP-FOR-OP: every add, mul,
-// shift, division and clamp below mirrors the Rust module exactly (pure
-// i32/u32 math, wrapping u32 semantics), so the CPU rasterizer's pixel and
-// this fragment's byte agree everywhere (the fire-parity contract). Any
-// change here MUST be mirrored in fire_field.rs (and vice versa) — the
-// fire_patch_parity differential is the referee.
-
-fn fire_hash(x: u32, y: u32, seed: u32) -> u32 {
-    var h = x * 0x9E3779B1u + y * 0x85EBCA77u + seed * 0xC2B2AE3Du;
-    h ^= h >> 15u;
-    h = h * 0x2C1B3C6Du;
-    h ^= h >> 12u;
-    h = h * 0x297A2D39u;
-    h ^= h >> 15u;
-    return h;
-}
-
-fn fire_fade(t: i32) -> i32 {
-    return (t * t * (768 - 2 * t)) >> 16u;
-}
-
-fn fire_vnoise(x: u32, y: u32, ymask: u32, seed: u32) -> i32 {
-    let ix = x >> 8u;
-    let iy0 = (y >> 8u) & ymask;
-    let iy1 = (iy0 + 1u) & ymask;
-    let ix1 = ix + 1u;
-    let fx = i32(x & 255u);
-    let fy = i32(y & 255u);
-    let n00 = i32(fire_hash(ix, iy0, seed) >> 24u);
-    let n10 = i32(fire_hash(ix1, iy0, seed) >> 24u);
-    let n01 = i32(fire_hash(ix, iy1, seed) >> 24u);
-    let n11 = i32(fire_hash(ix1, iy1, seed) >> 24u);
-    let ux = fire_fade(fx);
-    let uy = fire_fade(fy);
-    let a = n00 * (256 - ux) + n10 * ux;
-    let b = n01 * (256 - ux) + n11 * ux;
-    return (a * (256 - uy) + b * uy) >> 16u;
-}
-
-struct FireCoreOut {
-    idx: i32,
-    q: i32,
-    edge: i32,
-    body: i32,
-    root: i32,
-    rim: i32,
-};
-
-fn fire_core(px: i32, py: i32, base_y: i32, peak_h: i32, phase: u32,
-             temp: i32, strength: i32, lean: i32, cell_h: i32) -> FireCoreOut {
-    var o: FireCoreOut;
-    o.idx = 0; o.q = 256; o.edge = 0; o.body = 0; o.root = 0; o.rim = 0;
-    let ch = max(cell_h, 2);
-    let chu = u32(ch);
-    let peak = clamp(peak_h, 1, 2048);
-    // ROOT SKIRT (CPU twin: fire_field FireRow): below the root the
-    // envelope mirrors, compressed 5x — the dense base dissolves through the
-    // glyph row's top instead of a hard cut.
-    var v = base_y - py;
-    if (v < 0) { v = -v * 5; }
-    let vn = min((v * 256) / peak, 512);
-    let shear = lean * vn / 4;
-    let xq = bitcast<u32>(px * 256 + shear + 4194304);
-    let sx = (xq * 4u) / (5u * chu);
-    let ts = u32(300 + temp * 2);
-    let tr = (phase * ts) >> 10u;
-    let n0 = fire_vnoise(sx, tr, 0x3FFFu, 0x51F0A3B7u);
-    let n1 = fire_vnoise(sx * 2u + 12799u, tr * 2u + 37199u, 0x7FFFu, 0x9D2C5680u);
-    let n = (n0 * 9 + n1 * 7) >> 4u;
-    let ridge = 255 - abs(2 * n - 255);
-    let hs2 = (ridge * ridge) >> 8u;
-    let hshape = (hs2 * (256 + ridge)) >> 9u;
-    let hq = 30 + ((hshape * 260) >> 8u);
-    let hcol = (peak * hq * strength) / 255;
-    let vv = v * 256;
-    let d = hcol - vv;
-    if (d <= 0) { return o; }
-    let aa = max(ch / 4, 3) * 256;
-    let edge = min((d * 256) / aa, 256);
-    let rim = clamp((2 * aa - d) * 256 / aa, 0, 256);
-    let q = (vv * 256) / hcol;
-    let rs = u32(350 + temp);
-    let offr = (phase * rs) >> 10u;
-    let sy = (u32(vv) * 2u) / (3u * chu);
-    let by = sy - offr;
-    let m0 = fire_vnoise(sx * 3u / 2u + 5023u, by, 0x3FFFu, 0xB5297A4Du);
-    let m1 = fire_vnoise(sx * 3u + 9531u, by * 2u + 15913u, 0x7FFFu, 0x68E31DA4u);
-    let m2 = fire_vnoise(sx * 6u + 26251u, by * 4u + 37633u, 0xFFFFu, 0x1B56C4E9u);
-    let body0 = (m0 * 4 + m1 * 3 + m2) >> 3u;
-    let body = 128 + (((body0 - 128) * edge) >> 8u);
-    let heat = ((256 - q) * (112 + ((temp * 120) >> 8u))) >> 6u;
-    let idx0 = clamp((heat * (150 + ((body * 212) >> 8u))) >> 8u, 0, 850);
-    let root = min((v * 1536) / ch, 256);
-    o.idx = (idx0 * (192 + (root >> 2u))) >> 8u;
-    o.q = q;
-    o.edge = edge;
-    o.body = body;
-    o.root = root;
-    o.rim = rim;
-    return o;
-}
-
-fn fire_pal_add(idx_in: i32) -> vec3<i32> {
-    var pal = array<vec3<i32>, 5>(
-        vec3<i32>(42, 0, 0), vec3<i32>(139, 26, 0), vec3<i32>(224, 74, 0),
-        vec3<i32>(255, 176, 32), vec3<i32>(255, 240, 192));
-    // == FIRE_ADD_IDX_MAX: additive fire stops a breath past amber.
-    let idx = min(idx_in, 780);
-    let seg = clamp(idx >> 8u, 0, 3);
-    let f = idx - (seg << 8u);
-    let a = pal[seg];
-    let b = pal[seg + 1];
-    return vec3<i32>((a.x * (256 - f) + b.x * f) >> 8u,
-                     (a.y * (256 - f) + b.y * f) >> 8u,
-                     (a.z * (256 - f) + b.z * f) >> 8u);
-}
-
-fn fire_pal_over(idx: i32) -> vec3<i32> {
-    var pal = array<vec3<i32>, 5>(
-        vec3<i32>(102, 24, 4), vec3<i32>(168, 40, 0), vec3<i32>(208, 70, 0),
-        vec3<i32>(238, 110, 0), vec3<i32>(255, 166, 30));
-    let seg = clamp(idx >> 8u, 0, 3);
-    let f = idx - (seg << 8u);
-    let a = pal[seg];
-    let b = pal[seg + 1];
-    return vec3<i32>((a.x * (256 - f) + b.x * f) >> 8u,
-                     (a.y * (256 - f) + b.y * f) >> 8u,
-                     (a.z * (256 - f) + b.z * f) >> 8u);
-}
-
-struct FireVsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) @interpolate(flat) geo: vec4<u32>,   // base_y, peak_h, cell_h, 0
-    @location(1) @interpolate(flat) phase: u32,
-    @location(2) @interpolate(flat) tsl: vec4<u32>,   // temp, strength, cov_cap, lean-bits
-};
-
-@vertex
-fn vs_fire(@builtin(vertex_index) vi: u32,
-           @location(0) rect_u: vec4<u32>,
-           @location(1) geo: vec4<u32>,
-           @location(2) phase: u32,
-           @location(3) tsl: vec4<u32>) -> FireVsOut {
-    let rect = vec4<f32>(rect_u);
-    let k = corner(vi);
-    let px = rect.xy + k * rect.zw;
-    var o: FireVsOut;
-    o.pos = vec4<f32>(to_ndc(px), 0.0, 1.0);
-    o.geo = geo;
-    o.phase = phase;
-    o.tsl = tsl;
-    return o;
-}
-
-// FireMode::Add — premultiplied field light on the One/One Unorm view:
-// (palette·cov + 127)/255 per channel is the SINGLE rounding point, the exact
-// CPU `fire_shade_add` bytes, so the add is byte-exact (the fs_rain_glow
-// argument).
-@fragment
-fn fs_fire_add(in: FireVsOut) -> @location(0) vec4<f32> {
-    let px = i32(floor(in.pos.x));
-    let py = i32(floor(in.pos.y));
-    let lean = bitcast<i32>(in.tsl.w << 24u) >> 24u;
-    let temp = i32(in.tsl.x);
-    let c = fire_core(px, py, i32(in.geo.x), i32(in.geo.y), in.phase,
-                      temp, i32(in.tsl.y), lean, i32(in.geo.z));
-    // Coverage law == fire_cov_add: AA edge x temp density x pockets x root.
-    let dens = 150 + ((temp * 106) >> 8u);
-    let bodyc = 110 + ((c.body * 146) >> 8u);
-    let cov = min((((((c.edge * dens) >> 8u) * bodyc) >> 8u) * c.root) >> 8u,
-                  i32(in.tsl.z));
-    // TOP-EDGE FADE == CPU fire_top_fade: dissolve toward the grid top (geo.w).
-    let fade_px = max(i32(in.geo.z) * 2, 2);
-    let ttop = clamp(((py - i32(in.geo.w)) * 255) / fade_px, 0, 255);
-    let covf = (cov * fire_fade(ttop)) / 255;
-    // Rim cooling: outline drops toward deep red, the core stays hot.
-    let idx = (c.idx * (256 - ((c.rim * 112) >> 8u))) >> 8u;
-    let rgb = fire_pal_add(idx);
-    let r = f32((rgb.x * covf + 127) / 255) / 255.0;
-    let g = f32((rgb.y * covf + 127) / 255) / 255.0;
-    let b = f32((rgb.z * covf + 127) / 255) / 255.0;
-    return vec4<f32>(r, g, b, 1.0);
-}
-
-// FireMode::Over — straight ink + field alpha through the deco source-over
-// blend state on the same Unorm view (the fs_rain_glow_over byte-exactness
-// argument: one rounding on store, no exact ties) == CPU `over_rgb` of
-// `fire_shade_over`.
-@fragment
-fn fs_fire_over(in: FireVsOut) -> @location(0) vec4<f32> {
-    let px = i32(floor(in.pos.x));
-    let py = i32(floor(in.pos.y));
-    let lean = bitcast<i32>(in.tsl.w << 24u) >> 24u;
-    let temp = i32(in.tsl.x);
-    let c = fire_core(px, py, i32(in.geo.x), i32(in.geo.y), in.phase,
-                      temp, i32(in.tsl.y), lean, i32(in.geo.z));
-    // Alpha law == fire_alpha_over: pooled rims, dense root, wispy tips.
-    let bodyc = 130 + ((c.body * 166) >> 8u);
-    let tipf = 120 + (((256 - c.q) * 136) >> 8u);
-    let pool = 256 + ((c.rim * 96) >> 8u);
-    let a = min((((((((c.edge * bodyc) >> 8u) * c.root) >> 8u) * tipf) >> 8u) * pool) >> 8u,
-                i32(in.tsl.z));
-    // TOP-EDGE FADE == CPU fire_top_fade: dissolve toward the grid top (geo.w).
-    let fade_px = max(i32(in.geo.z) * 2, 2);
-    let ttop = clamp(((py - i32(in.geo.w)) * 255) / fade_px, 0, 255);
-    let af = (a * fire_fade(ttop)) / 255;
-    // Rim darkening: ink pools at the outline (the watercolor edge law).
-    let idx = (c.idx * (256 - ((c.rim * 128) >> 8u))) >> 8u;
-    let rgb = fire_pal_over(idx);
-    return vec4<f32>(f32(rgb.x) / 255.0, f32(rgb.y) / 255.0, f32(rgb.z) / 255.0,
-                     f32(af) / 255.0);
-}
-
-@group(1) @binding(0) var atlas_tex: texture_2d<f32>;
-@group(1) @binding(1) var atlas_samp: sampler;
-
-struct GlyphVsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) bg: vec4<f32>,
-};
-
-@vertex
-fn vs_glyph(@builtin(vertex_index) vi: u32,
-            @location(0) rect: vec4<f32>,
-            @location(1) uv: vec4<f32>,
-            @location(2) color: vec4<f32>,
-            @location(3) bg: vec4<f32>) -> GlyphVsOut {
-    let k = corner(vi);
-    let px = rect.xy + k * rect.zw;
-    var o: GlyphVsOut;
-    o.pos = vec4<f32>(to_ndc(px), 0.0, 1.0);
-    o.uv = uv.xy + k * uv.zw;
-    o.color = color;
-    o.bg = bg;
-    return o;
-}
-
-// TEXT glyphs. W2 (`u.text_blend != 0.0`, the linear-corrected default): remap
-// the coverage BEFORE the fixed-function sRGB-view blend so the blended
-// LUMINANCE lands where a gamma-space blend would put it — ghostty's
-// perceptual weight compensation, the float twin of the CPU
-// `blend_text(.., corrected=true)`:
-//   blend_l = s2l(l2s(fg_l)*cov + l2s(bg_l)*(1-cov))
-//   cov'    = clamp((blend_l - bg_l) / (fg_l - bg_l), 0, 1)
-// gated EXACTLY like the CPU `blend_text`: interior coverage only
-// (endpoints stay byte-exact) and a non-degenerate luminance gap only (the
-// 0.001 literal == aterm_render::TEXT_BLEND_EPS). `in.bg` is the HOME cell's
-// bg; the CPU uses the true dst pixel, which is identical on cell interiors
-// and within the AA parity tolerance on overhangs.
-@fragment
-fn fs_glyph(in: GlyphVsOut) -> @location(0) vec4<f32> {
-    var cov = textureSample(atlas_tex, atlas_samp, in.uv).r;
-    let fg_lin = s2l(in.color.rgb);
-    if (u.text_blend != 0.0 && cov > 0.0 && cov < 1.0) {
-        let lum = vec3<f32>(0.2126, 0.7152, 0.0722);
-        let fg_l = dot(fg_lin, lum);
-        let bg_l = dot(s2l(in.bg.rgb), lum);
-        if (abs(fg_l - bg_l) >= 0.001) {
-            let blend_l = s2l_s(l2s_s(fg_l) * cov + l2s_s(bg_l) * (1.0 - cov));
-            cov = clamp((blend_l - bg_l) / (fg_l - bg_l), 0.0, 1.0);
-        }
-    }
-    return vec4<f32>(fg_lin, cov);
-}
-
-// Colour-emoji glyphs: the atlas (an RGBA8 texture bound in the SAME group-1
-// slot) already holds the CPU renderer's final, cell-sized RGBA pixels, so we
-// blit them straight through. ALPHA_BLENDING then does `rgb*a + dst*(1-a)` —
-// byte-for-byte the CPU `blend(dst, rgb, a)` for the Rgba blit. The vertex
-// `color` is ignored (the emoji carries its own colour).
-@fragment
-fn fs_glyph_color(in: GlyphVsOut) -> @location(0) vec4<f32> {
-    let c = textureSample(atlas_tex, atlas_samp, in.uv);
-    return vec4<f32>(s2l(c.rgb), c.a);
-}
-
-// Sparkle-word decorations sample a coverage sprite from the deco atlas and use
-// the per-instance `color.a` as an opacity multiplier (text glyphs leave a unused
-// at 1.0; these set it to the decoration's alpha). The effective coverage is
-// QUANTIZED to the CPU's byte lattice — `round(cov·color.a·255)/255`, the
-// float twin of the CPU `(cov * alpha + 127) / 255` — because the CPU stamp
-// rounds that intermediate to a byte before it premultiplies/blends, and the
-// un-quantized f32 product landed ±1 code value off it on ~12% of interior
-// (cov, alpha) pairs (as in fs_sprite_over; ties are unreachable by parity,
-// so round() reproduces the byte exactly).
-//
-// OVER (the feline cat-paw): output (rgb, a) into ALPHA_BLENDING ⇒
-//   dst*(1-a) + rgb*a  == the CPU `blend(dst, color, a)`.
-@fragment
-fn fs_deco_over(in: GlyphVsOut) -> @location(0) vec4<f32> {
-    let cov = textureSample(atlas_tex, atlas_samp, in.uv).r;
-    let a = round(cov * in.color.a * 255.0) / 255.0;
-    return vec4<f32>(s2l(in.color.rgb), a);
-}
-
-// ADD (the profanity sparkle): output PREMULTIPLIED (rgb*a, a) into the One/One
-// additive pipeline ⇒ dst + rgb*a == the CPU `add_sat(dst, premul_rgb(color, a))`.
-@fragment
-fn fs_deco_add(in: GlyphVsOut) -> @location(0) vec4<f32> {
-    let cov = textureSample(atlas_tex, atlas_samp, in.uv).r;
-    let a = round(cov * in.color.a * 255.0) / 255.0;
-    return vec4<f32>(in.color.rgb * a, a);
-}
-
-// RGBA8 sprites use a per-instance multiply tint and opacity. The output
-// into ALPHA_BLENDING on the sRGB view ⇒ dst*(1-a)+rgb*a == the CPU pass-1c sprite stamp.
-@fragment
-// The tint multiply and the opacity multiply are QUANTIZED to 8 bits with
-// round-half BEFORE the sRGB decode, exactly reproducing the CPU stamp's
-// intermediate byte: the cat/free path's mul8(c,f) = (c*f+127)/255 and the
-// scaled-sprite path's (t*tint*255 + 0.5) as u8. round(x255*y255/255) equals
-// mul8 in the float domain (c = x255/255, f = y255/255), so the tinted colour
-// lands on the SAME 8-bit lattice the CPU linearizes and the linear-light
-// composite that follows is parity-exact rather than diverging by the ~1 LSB
-// the un-quantized f32 product injected on mid-ramp tints (the design 9 tint
-// divergence). At the cat's identity tint (0xFFFFFF, a=255) the quantization
-// is a no-op (round(c*1*255)/255 == c), so cat parity is unchanged; the
-// free-sprite paths already quantize CPU-side, so this matches them.
-fn fs_sprite_over(in: GlyphVsOut) -> @location(0) vec4<f32> {
-    let c = textureSample(atlas_tex, atlas_samp, in.uv);
-    let tinted = round(c.rgb * in.color.rgb * 255.0) / 255.0;
-    let a = round(c.a * in.color.a * 255.0) / 255.0;
-    return vec4<f32>(s2l(tinted), a);
-}
-
-// FX LAYERS (design §4.2, §4.6): pixel law F over an `FxInstance`, one band
-// slice of one item. Every operand reaches the fragment as a FLAT integer and
-// the fragment addresses from its own pixel `p = floor(pos.xy)` and the
-// item's UNCLAMPED origin, so a slice cut anywhere draws the bytes the CPU
-// stamps. No sampler and no float UV: texels are read by integer address and
-// their bytes recovered exactly (`round(v·255)`; a stored byte k reads k/255).
-//
-// flags: bits 0-1 the kind (0 Rect, 1 Ramps, 2 Sprite), bit 2 flip_x, bits
-// 3-4 the texel kind (0 Index8, 1 Rgba8Premul, 2 Rgba8Straight), bits 8-15
-// an Index8 sprite's reach (indices 1..=reach have a palette entry).
-// The origin is stored mod 2^16 and every slice lies inside its item's box,
-// whose sides are below 2^16, so `(p - O) mod 2^16` is the item-local pixel.
-struct FxVsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) @interpolate(flat) origin: vec2<i32>,
-    @location(1) @interpolate(flat) dst: vec2<u32>,
-    @location(2) @interpolate(flat) src: vec4<u32>,
-    @location(3) @interpolate(flat) pal: u32,
-    @location(4) @interpolate(flat) flags: u32,
-};
-
-@vertex
-fn vs_fx(@builtin(vertex_index) vi: u32,
-         @location(0) rect_u: vec4<u32>,
-         @location(1) origin: vec2<i32>,
-         @location(2) dst: vec2<u32>,
-         @location(3) src: vec4<u32>,
-         @location(4) pal: u32,
-         @location(5) flags: u32) -> FxVsOut {
-    let rect = vec4<f32>(rect_u);
-    let k = corner(vi);
-    let px = rect.xy + k * rect.zw;
-    var o: FxVsOut;
-    o.pos = vec4<f32>(to_ndc(px), 0.0, 1.0);
-    o.origin = origin;
-    o.dst = dst;
-    o.src = src;
-    o.pal = pal;
-    o.flags = flags;
-    return o;
-}
-
-// The Index8 atlas (R8Unorm), the RGBA atlas (Rgba8Unorm) and the frame's
-// palette (each entry's RGBA bytes read little-endian), at bindings no other
-// entry point names, so one group-1 layout serves the fx rows.
-@group(1) @binding(2) var fx_r8: texture_2d<f32>;
-@group(1) @binding(3) var fx_rgba: texture_2d<f32>;
-@group(1) @binding(4) var<storage, read> fx_pal: array<u32>;
-
-// Palette entry `j` as bytes (r, g, b, a).
-fn fx_ink(j: u32) -> vec4<u32> {
-    let e = fx_pal[j];
-    return vec4<u32>(e & 255u, (e >> 8u) & 255u, (e >> 16u) & 255u, e >> 24u);
-}
-
-// The stored byte of a Unorm8 texel channel.
-fn fx_byte4(v: vec4<f32>) -> vec4<u32> {
-    return vec4<u32>(round(v * 255.0));
-}
-
-// The item-local pixel `l = (p - O) mod 2^16`.
-fn fx_local(pos: vec4<f32>, origin: vec2<i32>) -> vec2<u32> {
-    let p = vec2<i32>(floor(pos.xy));
-    return vec2<u32>(p - origin) & vec2<u32>(65535u);
-}
-
-// The sprite texel under `l`: `t = (l.x·w / dw, l.y·h / dh)`, mirrored under
-// flip_x, offset to the art's atlas region.
-fn fx_texel(l: vec2<u32>, dst: vec2<u32>, src: vec4<u32>, flags: u32) -> vec2<i32> {
-    var t = vec2<u32>(l.x * src.z / dst.x, l.y * src.w / dst.y);
-    if ((flags & 4u) != 0u) {
-        t.x = src.z - 1u - t.x;
-    }
-    return vec2<i32>(src.xy + t);
-}
-
-// A Ramps item's palette row for its row `y`: the rows `src.y + 1 ..= src.y +
-// src.z` repeat row `src.y`'s ends (a run, one light as tall as its rows),
-// which the palette holds once.
-fn fx_ramp_row(y: u32, src: vec4<u32>) -> u32 {
-    return y - min(y - min(y, src.y), src.z);
-}
-
-// The Exact law: `(c, a) / 255` raw into `src + dst·(1 − a)` on the Unorm
-// view, `fs_glow`'s state: `over_premul`, `add_sat` at a = 0.
-@fragment
-fn fs_fx(in: FxVsOut) -> @location(0) vec4<f32> {
-    let l = fx_local(in.pos, in.origin);
-    let kind = in.flags & 3u;
-    var c: vec4<u32>;
-    if (kind == 2u) {
-        let t = fx_texel(l, in.dst, in.src, in.flags);
-        if (((in.flags >> 3u) & 3u) == 0u) {
-            // Index8: 0 writes nothing; k names entry ink + k − 1, and an
-            // index past the palette writes nothing.
-            let k = fx_byte4(textureLoad(fx_r8, t, 0)).x;
-            let reach = (in.flags >> 8u) & 255u;
-            if (k == 0u || k > reach) {
-                discard;
-            }
-            // In range even for the discarded (helper) invocation.
-            c = fx_ink(in.pal + clamp(k, 1u, reach) - 1u);
-        } else {
-            // Rgba8Premul: the texel is its own (c, a); a = 0 is light.
-            c = fx_byte4(textureLoad(fx_rgba, t, 0));
-        }
-    } else {
-        // Rect (row 0) and Ramps (row l.y's palette row): the GlowQuad ramp
-        // over entries j, j + 1 at column l.x of the item's width.
-        let j = in.pal + 2u * select(0u, fx_ramp_row(l.y, in.src), kind == 1u);
-        c = glow_lerp4(fx_ink(j), fx_ink(j + 1u), l.x, max(in.src.x, 1u));
-    }
-    return vec4<f32>(c) / 255.0;
-}
-
-// The Linear law (FreeSprite's): a straight texel under the tint entry,
-// `(mul8(rgb, tint.rgb), mul8(A, tint.a))` in exact integers, decoded and
-// blended in linear light on the sRGB view (ALPHA_BLENDING).
-@fragment
-fn fs_fx_linear(in: FxVsOut) -> @location(0) vec4<f32> {
-    let l = fx_local(in.pos, in.origin);
-    let v = fx_byte4(textureLoad(fx_rgba, fx_texel(l, in.dst, in.src, in.flags), 0));
-    let tint = fx_ink(in.pal);
-    let p = (v * tint + vec4<u32>(127u)) / 255u;
-    if (p.w == 0u) {
-        discard;
-    }
-    return vec4<f32>(s2l(vec3<f32>(p.xyz) / 255.0), f32(p.w) / 255.0);
-}
-
-// The Exact law where every pixel the layer draws is opaque (`FxContent`'s
-// `draws_opaque`, route (1) of the pass economy): `over_premul` at a = 255 is
-// the entry's colour, so the draw stores it through the sRGB view with no
-// blend, as `fs_bg` stores a cell's background, and the Color mask keeps alpha.
-@fragment
-fn fs_fx_store(in: FxVsOut) -> @location(0) vec4<f32> {
-    let l = fx_local(in.pos, in.origin);
-    let kind = in.flags & 3u;
-    var c: vec4<u32>;
-    if (kind == 2u) {
-        let t = fx_texel(l, in.dst, in.src, in.flags);
-        if (((in.flags >> 3u) & 3u) == 0u) {
-            let k = fx_byte4(textureLoad(fx_r8, t, 0)).x;
-            let reach = (in.flags >> 8u) & 255u;
-            if (k == 0u || k > reach) {
-                discard;
-            }
-            c = fx_ink(in.pal + clamp(k, 1u, reach) - 1u);
-        } else {
-            c = fx_byte4(textureLoad(fx_rgba, t, 0));
-        }
-    } else {
-        let j = in.pal + 2u * select(0u, fx_ramp_row(l.y, in.src), kind == 1u);
-        c = glow_lerp4(fx_ink(j), fx_ink(j + 1u), l.x, max(in.src.x, 1u));
-    }
-    return vec4<f32>(s2l(vec3<f32>(c.rgb) / 255.0), 1.0);
-}
-
-"#;
-
-#[cfg(wgpu_arm)]
-const BLIT_SHADER: &str = r#"
-struct VsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-// Oversized triangle covering the whole clip rect; UVs map the framebuffer 1:1.
-@vertex
-fn vs_blit(@builtin(vertex_index) vi: u32) -> VsOut {
-    var uv = array<vec2<f32>, 3>(
-        vec2<f32>(0.0, 0.0), vec2<f32>(2.0, 0.0), vec2<f32>(0.0, 2.0)
-    );
-    var o: VsOut;
-    o.uv = uv[vi];
-    // uv (0..2, y down) -> clip (x: -1..3, y: 1..-3).
-    o.pos = vec4<f32>(o.uv.x * 2.0 - 1.0, 1.0 - o.uv.y * 2.0, 0.0, 1.0);
-    return o;
-}
-
-@group(0) @binding(0) var src_tex: texture_2d<f32>;
-@group(0) @binding(1) var src_samp: sampler;
-// std140 layout — must match the Rust `BlitUniform` byte-for-byte (112 bytes).
-struct Blit {
-    flag: u32,        // bell-flash invert
-    overlay: u32,     // drop-target highlight enabled
-    border_px: f32,   // inset border thickness, device px
-    encode_srgb: f32, // !=0: re-encode linear->sRGB (downlevel WebGL2 blit)
-    accent: vec3<f32>,// overlay accent rgb, normalized 0..1
-    chrome_y1: f32,   // source rows [chrome_y0, chrome_y1) are host chrome: their bands continue the frame's edge pixels
-    dims: vec2<f32>,  // OFFSCREEN frame width,height in px
-    wash_a: f32,      // interior wash alpha 0..1
-    border_a: f32,    // border alpha 0..1
-    band: vec4<f32>,  // W1 remainder-band colour (live terminal bg; a unused)
-    content_off: vec2<f32>, // W1: frame top-left inside the swapchain, device px
-    hdr: f32,         // M3: !=0: decode sRGB->linear, clamp <=1 (f16 EDR swapchain)
-    translucent: f32, // M5: !=0: emit the offscreen/band ALPHA (translucent glass) instead of forcing 1.0
-    sdr_white_scale: f32, // M3 (Windows scRGB): reference-white scale (SDRwhite/80); 1.0 on macOS/SDR
-    visible_y: f32,   // first source row exposed by the frontend crop
-    visible_h: f32,   // exposed source height; rows outside are remainder bands
-    premult: f32,     // H1: !=0: multiply output rgb by the emitted alpha (DComp visual swapchain)
-    chrome_y0: f32,   // first host-chrome source row (rows above it keep flat bands)
-    chrome_pad0: f32, // std140: pad the struct to a 16-byte multiple (112)
-    chrome_pad1: f32,
-    chrome_pad2: f32,
-};
-@group(0) @binding(2) var<uniform> b: Blit;
-
-// Linear-light channel -> sRGB (the standard piecewise encode). Used only on the
-// downlevel blit, which samples an sRGB-typed offscreen view (auto-decoded to linear)
-// and must re-encode before writing to the non-sRGB swapchain.
-fn l2s(c: f32) -> f32 {
-    let cc = clamp(c, 0.0, 1.0);
-    if (cc <= 0.0031308) { return 12.92 * cc; }
-    return 1.055 * pow(cc, 1.0 / 2.4) - 0.055;
-}
-
-// M3 (EDR present): sRGB-encoded rgb -> linear light, CLAMPED to [0,1] — the
-// GRID CLAMP LAW (aterm_render::hdr::hdr_grid_encode is the proven float twin):
-// on the Rgba16Float extended-linear-sRGB swapchain the whole blit stream stays
-// reference-white SDR; only the separate additive aurora pass may exceed 1.0.
-// Same piecewise constants as the cell shader's s2l.
-fn hdr_grid_encode3(c: vec3<f32>) -> vec3<f32> {
-    let cc = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
-    let lo = cc / 12.92;
-    let hi = pow((cc + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
-    return clamp(select(lo, hi, cc > vec3<f32>(0.04045)), vec3<f32>(0.0), vec3<f32>(1.0));
-}
-
-@fragment
-fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
-    // W1 (kill the compositor stretch): the swapchain is the RAW window size;
-    // the offscreen frame sits at `content_off` (the centred remainder split,
-    // `aterm_render::band_offset`) and the surrounding bands are painted the
-    // live terminal background — never sampled, never inverted, never washed
-    // (they are chrome, matching the CPU `place_frame_bands` twin). `in.pos.xy` is the
-    // swapchain pixel CENTER (x+0.5, y+0.5), so `p` floors to exact frame
-    // texel coords: `textureLoad` is a 1:1 texel fetch — zero scaling ever.
-    // At exact fit (`content_off == 0`, dst dims == frame dims) every pixel is
-    // in-bounds and this is byte-identical to the historical NEAREST blit.
-    var p = in.pos.xy - b.content_off;
-    let visible_y1 = b.visible_y + b.visible_h;
-    // CHROME REACHES THE WINDOW EDGE: beside a host-chrome source row
-    // (`chrome_y0 <= p.y < chrome_y1`, `aterm_render::Renderer::chrome_extent_px`)
-    // the horizontal remainder bands CONTINUE the frame's own edge pixel instead
-    // of the band colour — the CPU twin is `place_frame_bands`' `edge_rows`. The
-    // fetched texel is still a BAND pixel: never inverted, never washed.
-    // `chrome_y1 == 0` (every frame without chrome) never takes this arm, and
-    // the rows above `chrome_y0` (a surfaceless strip that keeps the padding)
-    // keep the band colour like any terminal row.
-    var chrome_edge = false;
-    if ((p.x < 0.0 || p.x >= b.dims.x) && p.y >= max(b.visible_y, b.chrome_y0) && p.y < min(visible_y1, b.chrome_y1)) {
-        p.x = clamp(p.x, 0.0, b.dims.x - 1.0);
-        chrome_edge = true;
-    }
-    if (p.x < 0.0 || p.y < b.visible_y || p.x >= b.dims.x || p.y >= visible_y1) {
-        // M3: the bands are chrome in the SAME stream as the frame — on the EDR
-        // swapchain they take the same linear decode (and the same <=1.0 clamp).
-        // M5: on a translucent window the remainder bands take the bg-quad alpha
-        // (`b.band.a`) too, so the whole window reads as one sheet of glass; the
-        // opaque default forces 1.0 (byte-identical chrome).
-        let band_a = select(1.0, b.band.a, b.translucent != 0.0);
-        var band_rgb = b.band.rgb;
-        if (b.hdr != 0.0) {
-            // The SAME reference-white scale as the grid arm below. A band left
-            // at scRGB 1.0 == 80 nits composes 1/scale as bright as the grid
-            // beside it on a Windows HDR desktop (measured in the FP16
-            // composition: a 3 px strip at linear 0.0056 next to a grid at
-            // 0.0168 on a 240-nit SDR-white desktop — a dark frame line around
-            // every non-grid-fit window). The bands are the same sheet as the
-            // grid, so they take the same encode; 1.0 on macOS / SDR.
-            band_rgb = hdr_grid_encode3(band_rgb) * b.sdr_white_scale;
-        }
-        // H1: a premultiplied destination (DComp visual swapchain) wants
-        // rgb·a. Identity on every opaque present (band_a == 1.0 there).
-        if (b.premult != 0.0) {
-            band_rgb = band_rgb * band_a;
-        }
-        return vec4<f32>(band_rgb, band_a);
-    }
-    let c = textureLoad(src_tex, vec2<i32>(p), 0);
-    var rgb = c.rgb;
-    if (b.flag != 0u && !chrome_edge) {
-        rgb = vec3<f32>(1.0) - rgb;
-    }
-    // Drag-and-drop drop-target highlight: faint accent wash + inset accent
-    // border, relative to the CONTENT frame (`p` is the frame-local device
-    // pixel). Gated on `overlay` so a normal present is byte-identical.
-    if (b.overlay != 0u && !chrome_edge) {
-        let visible_p = vec2<f32>(p.x, p.y - b.visible_y);
-        let edge = min(
-            min(visible_p.x, b.dims.x - visible_p.x),
-            min(visible_p.y, b.visible_h - visible_p.y)
-        );
-        var a = b.wash_a;
-        if (edge < b.border_px) { a = b.border_a; }
-        rgb = mix(rgb, b.accent.rgb, a);
-    }
-    // Downlevel: the sampled value was auto-decoded sRGB->linear; re-encode for the
-    // non-sRGB swapchain so the on-screen bytes match the readback (+ the CPU).
-    if (b.encode_srgb != 0.0) {
-        rgb = vec3<f32>(l2s(rgb.r), l2s(rgb.g), l2s(rgb.b));
-    }
-    // M3 (EDR present, native-only so mutually exclusive with encode_srgb): the
-    // f16 swapchain is TAGGED extended-linear-sRGB, so decode the sRGB bytes to
-    // linear light — clamped <= 1.0 (grid clamp law), applied AFTER the
-    // gamma-space invert/overlay so the HDR frame is exactly the linear reading
-    // of the SDR frame (identical on glass at SDR, per ColorSync).
-    if (b.hdr != 0.0) {
-        // Windows scRGB: scale reference-white to the SDR-white level (scRGB 1.0 == 80
-        // nits fixed, desktop white is the user's setting) so the grid is not dim.
-        // b.sdr_white_scale is 1.0 on macOS / SDR, so this is byte-identical there.
-        rgb = hdr_grid_encode3(rgb) * b.sdr_white_scale;
-    }
-    // M5 true vibrancy: on a translucent window emit the offscreen alpha — the bg
-    // quads carry `bg_quad_alpha(opacity)` and ink accumulated to opaque through
-    // the base passes' OVER alpha blend, so the PostMultiplied swapchain composites
-    // this STRAIGHT-alpha pixel over the window's NSVisualEffectView (bg turns to
-    // blurred glass; text/decorations/images stay opaque). The opaque default
-    // forces 1.0 — the byte-identical solid present.
-    let out_a = select(1.0, c.a, b.translucent != 0.0);
-    // H1 (Windows Mica/Acrylic): the DComp visual swapchain composites
-    // PREMULTIPLIED (DXGI rejects straight alpha for composition), so scale rgb
-    // by the emitted alpha. Opaque pixels (the whole grid body — cells are the
-    // ratified opaque surface) have out_a == 1.0 and pass through byte-identical;
-    // only the padding/chrome-bleed margins carry alpha < 1 and pick up the
-    // multiply, which is exactly what stops the "bright fringe" a straight-alpha
-    // frame would show when DWM treats it as premultiplied.
-    if (b.premult != 0.0) {
-        rgb = rgb * out_a;
-    }
-    return vec4<f32>(rgb, out_a);
-}
-"#;
-
-#[cfg(wgpu_arm)]
-const HDR_GLOW_SHADER: &str = r#"
-struct HdrU {
-    screen: vec2<f32>,      // SWAPCHAIN width,height in px (the NDC divisor)
-    content_off: vec2<f32>, // W1 frame top-left inside the swapchain, device px
-    boost: f32,             // linear emission boost (aterm_render::hdr::HDR_GLOW_BOOST)
-    headroom: f32,          // sanitize(edr_max) - 1.0, >= 0 (proven CPU-side)
-    _pad: vec2<f32>,
-};
-@group(0) @binding(0) var<uniform> hu: HdrU;
-
-// The crown reads the SAME `GlowInstance` stream the bloom extract does — a
-// rect plus a colour PAIR (`aterm_render::GlowQuad::color2`) — and ramps it
-// per column with the identical integer law `fs_glow` uses, BEFORE its boost,
-// so a gradient quad is the same gradient in the crown as on the glass and a
-// flat pair is the identity.
-struct HdrVsOut {
-    @builtin(position) pos: vec4<f32>,
-    // The quad's left edge in SWAPCHAIN px (the rect's x plus the W1 band
-    // offset, both whole pixels) and its width.
-    @location(0) @interpolate(flat) span: vec2<f32>,
-    @location(1) @interpolate(flat) c0: vec4<u32>,
-    @location(2) @interpolate(flat) c1: vec4<u32>,
-};
-
-fn glow_column(pos_x: f32, span: vec2<f32>) -> u32 {
-    return u32(clamp(floor(pos_x - span.x), 0.0, max(span.y - 1.0, 0.0)));
-}
-
-fn glow_lerp4(c0: vec4<u32>, c1: vec4<u32>, i: u32, w: u32) -> vec4<u32> {
-    let m = 2u * min(i, w - 1u) + 1u;
-    return (c0 * (2u * w - m) + c1 * m + vec4<u32>(w)) / (2u * w);
-}
-
-// The fragment's premultiplied sRGB-space colour, ramped, as 0..1 floats.
-fn crown_color(in: HdrVsOut) -> vec3<f32> {
-    let w = max(u32(in.span.y), 1u);
-    let c = glow_lerp4(in.c0, in.c1, glow_column(in.pos.x, in.span), w);
-    return vec3<f32>(c.rgb) / 255.0;
-}
-
-fn hdr_corner(vi: u32) -> vec2<f32> {
-    var c = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
-        vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0)
-    );
-    return c[vi];
-}
-
-@vertex
-fn vs_hdr_glow(@builtin(vertex_index) vi: u32,
-               @location(0) rect_u: vec4<u32>,
-               @location(1) c0: vec4<u32>,
-               @location(2) c1: vec4<u32>) -> HdrVsOut {
-    let rect = vec4<f32>(rect_u);
-    let k = hdr_corner(vi);
-    // Offscreen px -> swapchain px (the W1 band placement) -> NDC.
-    let px = rect.xy + k * rect.zw + hu.content_off;
-    var o: HdrVsOut;
-    o.pos = vec4<f32>(2.0 * px.x / hu.screen.x - 1.0, 1.0 - 2.0 * px.y / hu.screen.y, 0.0, 1.0);
-    o.span = vec2<f32>(rect.x + hu.content_off.x, rect.z);
-    o.c0 = c0;
-    o.c1 = c1;
-    return o;
-}
-
-// The bloom's lights as an item list, unwidened (`SHADER`'s `glow_item`, its
-// twin), so the crown reads a ramp whole as the extract does.
-@group(1) @binding(5) var<storage, read> glow_items: array<u32>;
-
-struct GlowItem {
-    rect: vec4<u32>,
-    c0: vec4<u32>,
-    c1: vec4<u32>,
-};
-
-// An end as bytes (r, g, b, a), its colour times num / den, rounded.
-fn glow_item_end(e: u32, num: u32, den: u32) -> vec4<u32> {
-    let c = ((vec3<u32>(e >> 16u, e >> 8u, e) & vec3<u32>(255u)) * num + vec3<u32>(den / 2u)) / den;
-    return vec4<u32>(c, e >> 24u);
-}
-
-fn glow_item(i: u32, widen: bool) -> GlowItem {
-    var lo = 0u;
-    var hi = glow_items[0] - 1u;
-    loop {
-        if (lo >= hi) {
-            break;
-        }
-        let mid = (lo + hi + 1u) >> 1u;
-        if (glow_items[4u + mid] <= i) {
-            lo = mid;
-        } else {
-            hi = mid - 1u;
-        }
-    }
-    let s = i - glow_items[4u + lo];
-    let r = glow_items[1] + 4u * lo;
-    let xy = glow_items[r];
-    let join = glow_items[r + 2u] & 0xFFFFu;
-    let joined = glow_items[r + 2u] >> 16u;
-    let e = glow_items[2] + glow_items[r + 3u] + 2u * s;
-    let e0 = glow_items[e];
-    let e1 = glow_items[e + 1u];
-    var qw = glow_items[r + 1u] & 0xFFFFu;
-    var qh = select(1u, joined + 1u, s == join);
-    var num = 1u;
-    var den = 1u;
-    if (widen) {
-        if (qw > 0u && qw < 2u) {
-            num = num * qw;
-            den = den * 2u;
-            qw = 2u;
-        }
-        if (qh < 2u) {
-            num = num * qh;
-            den = den * 2u;
-            qh = 2u;
-        }
-    }
-    var it: GlowItem;
-    it.rect = select(
-        vec4<u32>(xy & 0xFFFFu, (xy >> 16u) + s + select(0u, joined, s > join), qw, qh),
-        vec4<u32>(0u),
-        (e0 | e1) == 0u,
-    );
-    it.c0 = glow_item_end(e0, num, den);
-    it.c1 = glow_item_end(e1, num, den);
-    return it;
-}
-
-// `vs_hdr_glow` over the item list.
-@vertex
-fn vs_hdr_glow_items(@builtin(vertex_index) vi: u32,
-                     @builtin(instance_index) ii: u32) -> HdrVsOut {
-    let it = glow_item(ii, false);
-    let rect = vec4<f32>(it.rect);
-    let k = hdr_corner(vi);
-    let px = rect.xy + k * rect.zw + hu.content_off;
-    var o: HdrVsOut;
-    o.pos = vec4<f32>(2.0 * px.x / hu.screen.x - 1.0, 1.0 - 2.0 * px.y / hu.screen.y, 0.0, 1.0);
-    o.span = vec2<f32>(rect.x + hu.content_off.x, rect.z);
-    o.c0 = it.c0;
-    o.c1 = it.c1;
-    return o;
-}
-
-// WHITE IS HOT (design §L5). The WHITE PART of a premultiplied sRGB colour is
-// its smallest channel: a spectrum stop (`#FF0000`, `#FFFF00`, ...) has a zero
-// channel and therefore NO white part, however bright it is, while `#FFFFFF`
-// at coverage `k` is white all the way to `k`. So `min(r, g, b)` reads the
-// luminance hierarchy off the colour itself, with no side channel and no
-// per-quad tagging.
-fn white_part(c: vec3<f32>) -> f32 {
-    return min(min(c.r, c.g), c.b);
-}
-
-// Decode the premultiplied sRGB-space aurora colour to linear (same piecewise
-// s2l as everywhere), boost, clamp to the headroom (never negative), and emit
-// into the One/One add. COLOR write-mask: the blit's alpha stays 1.0.
-//
-// THE BOOST IS PER-FRAGMENT (§L5, "in EDR, `out` transients <= 460 ms may
-// exceed reference white"): `1 + 2*smoothstep(0.35, 0.60, white_part)`, capped
-// at 3x linear and then clamped to the panel's real headroom. Below the 0.35
-// knee the factor is EXACTLY 1.0 and a multiply by 1.0 is exact in IEEE-754,
-// so every coloured mark — star bars, halos, the ring, the fan grains, the
-// ribbon's 0.15 hot edge — emits unboosted bits. Only the whitest cores (the meteor
-// nucleus and its white shoulder, the smallest star cores, the landing pin,
-// the caret's flare frame) climb, and they are the smallest marks on the
-// glass — which is what makes the hierarchy read as light instead of as gain.
-@fragment
-fn fs_hdr_glow(in: HdrVsOut) -> @location(0) vec4<f32> {
-    let c = clamp(crown_color(in), vec3<f32>(0.0), vec3<f32>(1.0));
-    let lo = c / 12.92;
-    let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
-    let lin = select(lo, hi, c > vec3<f32>(0.04045));
-    let hot = min(1.0 + 2.0 * smoothstep(0.35, 0.60, white_part(c)), 3.0);
-    let bound = max(hu.headroom, 0.0);
-    let add = max(min(lin * hu.boost * hot, vec3<f32>(bound)), vec3<f32>(0.0));
-    return vec4<f32>(add, 0.0);
-}
-
-// SDR twin of the boost (the swapchain-side crown on a NON-f16 present): scale
-// the aurora colour by the BUDGET (hu.headroom carries it, <= 0.35 by the proven
-// `sdr_glow_budget` bound; hu.boost is 1.0) and emit it RAW — the SDR swapchain
-// is a non-sRGB Unorm view, so blending works in code values (no s2l decode).
-// The pipeline composites this through the BOUNDED screen operator
-// (`pipeline_table::Blend::SCREEN`), NOT One/One: the crown is the last light drawn on
-// the frame and an add here lands outside every budget upstream of it. Scaling
-// (not clamping) preserves the glow's gradient shape: peak = budget at full
-// colour, no plateau. COLOR write-mask: the blit's alpha stays 1.0.
-@fragment
-fn fs_sdr_glow(in: HdrVsOut) -> @location(0) vec4<f32> {
-    let c = clamp(crown_color(in), vec3<f32>(0.0), vec3<f32>(1.0));
-    let bound = max(hu.headroom, 0.0);
-    return vec4<f32>(c * bound * max(hu.boost, 0.0), 0.0);
-}
-"#;
-
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
 struct HdrGlowUniform {
@@ -1492,115 +306,6 @@ impl_pod_zeroable!(HdrGlowUniform {
     headroom: f32,
     _pad: [f32; 2],
 });
-
-#[cfg(wgpu_arm)]
-const TRAY_SHADER: &str = r#"
-struct TrayOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-// std140 layout — must match the Rust `TrayUniform` byte-for-byte (32 bytes:
-// vec4 at 0, vec2 at 16, vec2 pad at 24).
-struct Tray {
-    rect: vec4<f32>, // device-px x, y, w, h
-    fb: vec2<f32>,   // framebuffer width, height in px
-    pad: vec2<f32>,
-};
-@group(0) @binding(2) var<uniform> t: Tray;
-
-// Unit quad as a 4-vert triangle-strip: (0,0) (1,0) (0,1) (1,1).
-@vertex
-fn vs_tray(@builtin(vertex_index) vi: u32) -> TrayOut {
-    var corner = array<vec2<f32>, 4>(
-        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0),
-        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0)
-    );
-    let k = corner[vi];
-    let px = t.rect.xy + k * t.rect.zw;
-    // y-down device px -> y-up NDC.
-    let ndc = vec2<f32>(2.0 * px.x / t.fb.x - 1.0, 1.0 - 2.0 * px.y / t.fb.y);
-    var o: TrayOut;
-    o.pos = vec4<f32>(ndc, 0.0, 1.0);
-    o.uv = k; // full-texture sample
-    return o;
-}
-
-@group(0) @binding(0) var tray_tex: texture_2d<f32>;
-@group(0) @binding(1) var tray_samp: sampler;
-
-@fragment
-fn fs_tray(in: TrayOut) -> @location(0) vec4<f32> {
-    // Straight RGBA passthrough; ALPHA_BLENDING does the src-over composite.
-    return textureSample(tray_tex, tray_samp, in.uv);
-}
-"#;
-
-#[cfg(wgpu_arm)]
-const BLOOM_SHADER: &str = r#"
-struct VsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_fs(@builtin(vertex_index) vi: u32) -> VsOut {
-    var uv = array<vec2<f32>, 3>(
-        vec2<f32>(0.0, 0.0), vec2<f32>(2.0, 0.0), vec2<f32>(0.0, 2.0)
-    );
-    var o: VsOut;
-    o.uv = uv[vi];
-    o.pos = vec4<f32>(o.uv.x * 2.0 - 1.0, 1.0 - o.uv.y * 2.0, 0.0, 1.0);
-    return o;
-}
-
-@group(0) @binding(0) var bloom_src: texture_2d<f32>;
-@group(0) @binding(1) var bloom_samp: sampler;
-struct BloomU {
-    texel: vec2<f32>,
-    strength: f32,
-    radius: f32,        // the WHITE part's radius, half-res texels
-    chroma_radius: f32, // the COLOURED part's, always the shorter of the two
-    _pad0: f32,
-    _pad1: f32,
-};
-@group(0) @binding(2) var<uniform> bu: BloomU;
-
-// The bloom's twin of `HDR_GLOW_SHADER::white_part` — the smallest channel is
-// the white light in a premultiplied colour, the rest is its chroma.
-fn white_part(c: vec3<f32>) -> f32 {
-    return min(min(c.r, c.g), c.b);
-}
-
-// WHITE IS HOT (design §L5), the halo's half: ONE 25-tap kernel, two radii.
-// The white part of the source spreads at `radius`, the chroma at the shorter
-// `chroma_radius`, and the two are summed back into one halo — so a meteor
-// reads as an over-white streak dying into a coloured train, and less coloured
-// light smears sideways into the glyphs beside it. The taps, their gaussian
-// weights and the normalization are the kernel that was here before; only the
-// offset each half samples at differs, and the shorter chroma offset stays
-// well inside the composite scissor the longer white radius already dilates.
-@fragment
-fn fs_bloom(in: VsOut) -> @location(0) vec4<f32> {
-    var white = 0.0;
-    var chroma = vec3<f32>(0.0, 0.0, 0.0);
-    var wsum = 0.0;
-    for (var j: i32 = -2; j <= 2; j = j + 1) {
-        for (var i: i32 = -2; i <= 2; i = i + 1) {
-            let tap = vec2<f32>(f32(i), f32(j)) * bu.texel;
-            let d2 = f32(i * i + j * j);
-            let w = exp(-d2 / 4.0);
-            let sw = textureSample(bloom_src, bloom_samp, in.uv + tap * bu.radius).rgb;
-            white = white + white_part(sw) * w;
-            let sc = textureSample(bloom_src, bloom_samp, in.uv + tap * bu.chroma_radius).rgb;
-            chroma = chroma + (sc - vec3<f32>(white_part(sc))) * w;
-            wsum = wsum + w;
-        }
-    }
-    let sum = vec3<f32>(white) + chroma;
-    return vec4<f32>(sum / wsum * bu.strength, 1.0);
-}
-"#;
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
@@ -1623,96 +328,6 @@ impl_pod_zeroable!(BloomUniform {
     extent: [f32; 2],
     _pad: f32
 });
-
-#[cfg(wgpu_arm)]
-const SHIMMER_SHADER: &str = r#"
-struct VsOut {
-    @builtin(position) pos: vec4<f32>,
-};
-
-@vertex
-fn vs_fs(@builtin(vertex_index) vi: u32) -> VsOut {
-    var xy = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)
-    );
-    var o: VsOut;
-    o.pos = vec4<f32>(xy[vi], 0.0, 1.0);
-    return o;
-}
-
-@group(0) @binding(0) var shimmer_src: texture_2d<f32>;
-@group(0) @binding(1) var shimmer_samp: sampler;
-struct ShimmerU {
-    frame: vec2<f32>,       // full frame dims, device px
-    region_min: vec2<f32>,  // pass rect min (== scissor origin)
-    region_max: vec2<f32>,  // pass rect max
-    hot_top: f32,           // top edge of the hot band (px)
-    rise: f32,              // haze height above the hot band (px)
-    amp: f32,               // max displacement, device px (<= 1.5)
-    period: f32,            // spatial ripple period (~cell height, px)
-    phase: f32,             // present-time phase, seconds (wrapped at 100 s)
-    band_x0: f32,           // heat-band strip origin (px)
-    band_w: f32,            // heat-band width (px)
-    rolloff: f32,           // horizontal edge rolloff width (px)
-    _pad: vec2<f32>,
-    heat: array<vec4<f32>, 16>, // 64 per-column-band heat proxies, 0..1
-};
-@group(0) @binding(2) var<uniform> su: ShimmerU;
-
-const TAU: f32 = 6.28318530718;
-
-fn heat_at(i: u32) -> f32 {
-    return su.heat[i / 4u][i % 4u];
-}
-
-@fragment
-fn fs_shimmer(in: VsOut) -> @location(0) vec4<f32> {
-    let p = in.pos.xy;
-    // Per-column heat, linearly interpolated between adjacent bands so the
-    // haze strength follows the flame's silhouette without band steps.
-    let xb = clamp((p.x - su.band_x0) / max(su.band_w, 1e-3) - 0.5, 0.0, 63.0);
-    let i0 = u32(floor(xb));
-    let heat = mix(heat_at(i0), heat_at(min(i0 + 1u, 63u)), fract(xb));
-    // Height envelope: full strength at the hot band's top edge, smoothstep
-    // fading to zero `rise` px above it (haze thins with altitude).
-    let a = clamp((su.hot_top - p.y) / max(su.rise, 1.0), 0.0, 1.0);
-    let vfade = 1.0 - a * a * (3.0 - 2.0 * a);
-    // Horizontal rolloff: zero AT the region edges, easing in over `rolloff`
-    // px, so the hard scissor bound is met by an already-zero displacement.
-    let xr = min(p.x - su.region_min.x, su.region_max.x - p.x);
-    let e = clamp(xr / max(su.rolloff, 1.0), 0.0, 1.0);
-    let xfade = e * e * (3.0 - 2.0 * e);
-    // The ripple field: two incommensurate plane waves RISING with time (the
-    // +time phase moves constant-phase lines toward smaller y, i.e. upward)
-    // plus a slow columnar wobble that breaks straight-line coherence — the
-    // classic cheap heat-haze. All time rates are two-decimal cycles/s (see
-    // the 100 s wrap note above).
-    let ky = TAU / max(su.period, 4.0);
-    let col = p.x * ky;
-    let w1 = sin(ky * p.y + TAU * (0.55 * su.phase) + 1.7 * sin(0.37 * col + TAU * (0.09 * su.phase)));
-    let w2 = sin(1.93 * ky * p.y + TAU * (0.83 * su.phase) + 0.61 * col);
-    let wx = sin(1.31 * ky * p.y + TAU * (0.70 * su.phase) + 1.11 * col);
-    let env = su.amp * clamp(heat, 0.0, 1.0) * vfade * xfade;
-    var d = vec2<f32>(0.30 * wx, 0.94 * (0.62 * w1 + 0.38 * w2)) * env;
-    // Belt-and-braces displacement cap: |d| <= amp by construction
-    // (sqrt(0.94^2 + 0.30^2) < 1); re-clamp so no future retune can break it.
-    let m = length(d);
-    if (m > su.amp) {
-        d = d * (su.amp / m);
-    }
-    // Never sample outside the frame: clamp the displaced point to the texel
-    // interior (the ClampToEdge sampler is the second fence).
-    let sp = clamp(p + d, vec2<f32>(0.5, 0.5), su.frame - vec2<f32>(0.5, 0.5));
-    let c = textureSampleLevel(shimmer_src, shimmer_samp, sp / su.frame, 0.0);
-    // The WHOLE displaced sample, alpha included: rgb and alpha must describe
-    // the same source pixel, because the translucent (M5 glass) present
-    // publishes that alpha (a stale alpha shows glyph-edge flecks as opaque bg
-    // and ink at bg opacity inside the haze band). On an
-    // opaque present the offscreen alpha is uniform inside the grid, so
-    // carrying it is byte-identical there.
-    return c;
-}
-"#;
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
@@ -1915,26 +530,6 @@ pub enum SurfacePresentFailure {
     Unavailable,
     Occluded,
     Validation,
-}
-
-/// The per-window settings-card texture and its bind group.
-#[cfg(wgpu_arm)]
-pub(crate) struct TrayOverlay {
-    texture: crate::device_layer::LayerTexture,
-    pixels: Vec<u8>,
-    #[cfg(wgpu_arm)]
-    bind: wgpu::BindGroup,
-    w: u32,
-    h: u32,
-}
-
-/// The tray scrim's fill ([`TrayScrim`]) on the wgpu arm.
-#[cfg(wgpu_arm)]
-pub(crate) struct TrayScrimLayer {
-    texture: crate::device_layer::LayerTexture,
-    bind: wgpu::BindGroup,
-    uniform: wgpu::Buffer,
-    rgba: [u8; 4],
 }
 
 #[inline]
@@ -2144,7 +739,7 @@ pub(crate) struct ApronStrip {
     pub(crate) cell_h: u32,
 }
 
-/// The copy plan under `shift_offscreen_band_px`, shared by the wgpu path and the Metal replay.
+/// The copy plan under every arm's band shift (`shift_offscreen_band_px`).
 #[inline]
 pub(crate) const fn band_shift_ops(y0: usize, y1: usize, delta: i64) -> Option<BandShift> {
     if delta == 0 {
@@ -2217,7 +812,6 @@ pub(crate) enum DrawPipe {
 
 impl DrawPipe {
     /// The table row this pipe draws through.
-    #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
     #[inline]
     pub(crate) const fn row(self) -> Pipeline {
         match self {
@@ -2252,7 +846,6 @@ pub(crate) enum DrawAtlas {
 }
 
 /// How many [`DrawAtlas`] slots exist.
-#[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
 pub(crate) const DRAW_ATLAS_COUNT: usize = DrawAtlas::Fx as usize + 1;
 
 /// Every per-frame instance stream, in draw order.
@@ -2858,34 +1451,7 @@ pub(crate) fn build_frame_plan(
     }
 }
 
-/// The wgpu arm's resolution set: the live objects each plan key maps to.
-#[cfg(wgpu_arm)]
-pub(crate) struct WgpuFrameRes<'a> {
-    pub(crate) bg_pipeline: &'a wgpu::RenderPipeline,
-    pub(crate) glyph_pipeline: &'a wgpu::RenderPipeline,
-    pub(crate) color_glyph_pipeline: &'a wgpu::RenderPipeline,
-    pub(crate) effects: &'a EffectPipelines,
-    pub(crate) uniform_bg: &'a wgpu::BindGroup,
-    pub(crate) view: &'a wgpu::TextureView,
-    pub(crate) view_srgb: &'a wgpu::TextureView,
-    pub(crate) atlas_mono: &'a wgpu::BindGroup,
-    pub(crate) atlas_color: &'a wgpu::BindGroup,
-    pub(crate) atlas_deco: Option<&'a wgpu::BindGroup>,
-    pub(crate) atlas_image: Option<&'a wgpu::BindGroup>,
-    pub(crate) atlas_wallpaper: Option<&'a wgpu::BindGroup>,
-    pub(crate) atlas_fx: Option<&'a wgpu::BindGroup>,
-    pub(crate) streams: [Option<wgpu::BufferSlice<'a>>; STREAM_COUNT],
-}
-
-#[allow(
-    clippy::large_enum_variant,
-    reason = "one FrameRes lives on the stack per encoded frame (the 864-byte \
-              Wgpu arm is 27 stream slices + the bind refs); boxing it would put \
-              a heap allocation on the keystroke-echo path to save nothing"
-)]
 pub(crate) enum FrameRes<'a> {
-    #[cfg(wgpu_arm)]
-    Wgpu(WgpuFrameRes<'a>),
     #[cfg(target_os = "macos")]
     Metal(&'a MetalFrameRig),
     #[cfg(gl_arm)]
@@ -2900,10 +1466,6 @@ impl FrameRes<'_> {
     #[inline]
     const fn view(&self, srgb: bool) -> crate::device_layer::FrameView<'_> {
         match self {
-            #[cfg(wgpu_arm)]
-            Self::Wgpu(r) => {
-                crate::device_layer::FrameView::Wgpu(if srgb { r.view_srgb } else { r.view })
-            }
             #[cfg(target_os = "macos")]
             Self::Metal(rig) => crate::device_layer::FrameView::Metal(if srgb {
                 &rig.offscreen_srgb
@@ -2926,8 +1488,6 @@ impl FrameRes<'_> {
     #[inline]
     fn uniforms(&self) -> crate::device_layer::FrameUniforms<'_> {
         match self {
-            #[cfg(wgpu_arm)]
-            Self::Wgpu(r) => crate::device_layer::FrameUniforms::Wgpu(r.uniform_bg),
             #[cfg(target_os = "macos")]
             Self::Metal(rig) => rig.uniforms(),
             #[cfg(gl_arm)]
@@ -2945,7 +1505,7 @@ impl FrameRes<'_> {
 
     #[inline]
     fn pipeline(&self, pipe: DrawPipe, fetch: bool) -> crate::device_layer::FramePipeline<'_> {
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm))]
+        #[cfg(any(gl_arm, d3d11_arm))]
         let split_only = || {
             assert!(
                 !fetch,
@@ -2953,27 +1513,6 @@ impl FrameRes<'_> {
             );
         };
         match self {
-            #[cfg(wgpu_arm)]
-            Self::Wgpu(r) => crate::device_layer::FramePipeline::Wgpu({
-                split_only();
-                match pipe {
-                    DrawPipe::Bg => r.bg_pipeline,
-                    DrawPipe::Glyph => r.glyph_pipeline,
-                    DrawPipe::Color => r.color_glyph_pipeline,
-                    DrawPipe::CursorBlend => r.effects.get(EffectPipeline::CursorBlend),
-                    DrawPipe::GlowAdd => r.effects.get(EffectPipeline::GlowAdd),
-                    DrawPipe::RainGlow => r.effects.get(EffectPipeline::RainGlow),
-                    DrawPipe::RainGlowOver => r.effects.get(EffectPipeline::RainGlowOver),
-                    DrawPipe::FireAdd => r.effects.get(EffectPipeline::FireAdd),
-                    DrawPipe::FireOver => r.effects.get(EffectPipeline::FireOver),
-                    DrawPipe::DecoOver => r.effects.get(EffectPipeline::DecoOver),
-                    DrawPipe::DecoAdd => r.effects.get(EffectPipeline::DecoAdd),
-                    DrawPipe::Wallpaper => r.effects.get(EffectPipeline::SpriteOver),
-                    DrawPipe::Fx => r.effects.get(EffectPipeline::Fx),
-                    DrawPipe::FxLinear => r.effects.get(EffectPipeline::FxLinear),
-                    DrawPipe::FxStore => r.effects.get(EffectPipeline::FxStore),
-                }
-            }),
             #[cfg(target_os = "macos")]
             Self::Metal(rig) => rig.pipeline(pipe, fetch),
             #[cfg(gl_arm)]
@@ -2991,26 +1530,7 @@ impl FrameRes<'_> {
 
     #[inline]
     fn atlas(&self, atlas: DrawAtlas, pipe: DrawPipe) -> crate::device_layer::FrameAtlas<'_> {
-        #[cfg(not(any(target_os = "macos", gl_arm, d3d11_arm)))]
-        let _ = pipe;
         match self {
-            #[cfg(wgpu_arm)]
-            Self::Wgpu(r) => {
-                let bind = match atlas {
-                    DrawAtlas::Mono => Some(r.atlas_mono),
-                    DrawAtlas::Color => Some(r.atlas_color),
-                    DrawAtlas::Deco => r.atlas_deco,
-                    DrawAtlas::Image => r.atlas_image,
-                    DrawAtlas::Wallpaper => r.atlas_wallpaper,
-                    DrawAtlas::Fx => r.atlas_fx,
-                };
-                crate::device_layer::FrameAtlas::Wgpu(bind.unwrap_or_else(|| {
-                    panic!(
-                        "frame plan: item tagged atlas {atlas:?} but its bind group is \
-                         absent — build_frame_plan's coupling broke"
-                    )
-                }))
-            }
             #[cfg(target_os = "macos")]
             Self::Metal(rig) => rig.atlas(atlas, pipe),
             #[cfg(gl_arm)]
@@ -3023,15 +1543,6 @@ impl FrameRes<'_> {
     #[inline]
     fn stream(&self, id: StreamId) -> crate::device_layer::FrameStream<'_> {
         match self {
-            #[cfg(wgpu_arm)]
-            Self::Wgpu(r) => crate::device_layer::FrameStream::Wgpu(
-                r.streams[id as usize].unwrap_or_else(|| {
-                    panic!(
-                        "frame plan: item for stream {id:?} but its buffer was not \
-                         uploaded — build_frame_plan's gate broke"
-                    )
-                }),
-            ),
             #[cfg(target_os = "macos")]
             Self::Metal(rig) => rig.stream(id),
             #[cfg(gl_arm)]
@@ -3068,7 +1579,6 @@ pub(crate) struct GlFxBind<'a> {
     pub(crate) sampler: &'a crate::gl::resources::GlSampler,
 }
 
-#[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
 #[inline]
 fn fx_bind_slots(pipe: DrawPipe) -> ([u32; 2], u32) {
     let binds = &pipe.row().spec().binds;
@@ -3315,7 +1825,6 @@ impl MetalFrameRig {
     }
 }
 
-#[cfg(not(wgpu_arm))]
 fn first_party_note(what: &str) {
     #[cfg(target_os = "macos")]
     metal_arm_note(what);
@@ -3586,12 +2095,6 @@ impl MetalArmLive {
     #[inline]
     const fn current_slot_mut(&mut self) -> &mut ArmFrameSlot {
         &mut self.frame_slots[self.cur_slot]
-    }
-
-    #[cfg(all(test, wgpu_arm))]
-    #[inline]
-    fn has_inflight_frame(&self) -> bool {
-        self.frame_slots.iter().any(|s| s.inflight.is_some())
     }
 
     fn library(&mut self, lib: ShaderLibrary) -> Result<&crate::metal::ffi::Library, String> {
@@ -4509,67 +3012,6 @@ pub(crate) fn run_frame_plan(
     Ok(passes)
 }
 
-/// Which destination a `fs_blit` test case blits into.
-#[cfg(wgpu_arm)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BlitTestTarget {
-    Rgba8Unorm,
-    #[cfg(all(test, target_os = "macos"))]
-    Bgra8Unorm,
-    #[cfg(all(test, target_os = "macos"))]
-    Rgba16Float,
-}
-
-#[cfg(wgpu_arm)]
-impl BlitTestTarget {
-    const fn wgpu(self) -> wgpu::TextureFormat {
-        match self {
-            Self::Rgba8Unorm => wgpu::TextureFormat::Rgba8Unorm,
-            #[cfg(all(test, target_os = "macos"))]
-            Self::Bgra8Unorm => wgpu::TextureFormat::Bgra8Unorm,
-            #[cfg(all(test, target_os = "macos"))]
-            Self::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
-        }
-    }
-
-    #[cfg(all(target_os = "macos", test))]
-    fn bytes_per_texel(self) -> usize {
-        match self {
-            Self::Rgba8Unorm | Self::Bgra8Unorm => 4,
-            Self::Rgba16Float => 8,
-        }
-    }
-}
-
-/// Which of `fs_blit`'s uniform-driven arms a test blit turns on.
-#[cfg(wgpu_arm)]
-#[derive(Clone, Copy)]
-pub(crate) struct BlitTestEffects {
-    pub(crate) invert: bool,
-    pub(crate) overlay: Option<DropOverlay>,
-    pub(crate) crop: Option<PresentCrop>,
-    pub(crate) encode_srgb: bool,
-    pub(crate) hdr: bool,
-    pub(crate) sdr_white_scale: f32,
-    pub(crate) translucent: Option<f32>,
-    pub(crate) premult: bool,
-}
-
-#[cfg(wgpu_arm)]
-impl BlitTestEffects {
-    /// Every effect off: the plain present.
-    pub(crate) const PLAIN: Self = Self {
-        invert: false,
-        overlay: None,
-        crop: None,
-        encode_srgb: false,
-        hdr: false,
-        sdr_white_scale: 1.0,
-        translucent: None,
-        premult: false,
-    };
-}
-
 #[inline]
 const fn frame_live_bg(input: &RenderInput, theme_bg: u32) -> u32 {
     if input.default_bg == aterm_core::render::COLOR_UNSET {
@@ -4679,7 +3121,6 @@ fn present_blit_uniform(
     .with_source_crop(source_crop)
 }
 
-#[cfg(not(wgpu_arm))]
 #[derive(Clone, Copy)]
 struct NeutralSurfaceConfig {
     width: u32,
@@ -4687,7 +3128,7 @@ struct NeutralSurfaceConfig {
     format: crate::device_layer::TexelFormat,
 }
 
-#[cfg(all(not(wgpu_arm), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn metal_attach_format<W: WindowTarget>(
     hdr_glow: bool,
     target: &W,
@@ -4700,124 +3141,28 @@ fn metal_attach_format<W: WindowTarget>(
     }
 }
 
-#[cfg(wgpu_arm)]
-mod live_surface {
-    use super::{GpuRenderer, configure_scoped};
-    use crate::format_plan::HdrReconfigurePlan;
-
-    pub(super) struct LiveSurface(wgpu::Surface<'static>);
-
-    impl LiveSurface {
-        /// Wrap a surface its attach has configured.
-        #[inline]
-        pub(super) const fn attached(surface: wgpu::Surface<'static>) -> Self {
-            Self(surface)
-        }
-
-        /// Reconfigure, then re-tag scRGB when the surface was HDR.
-        #[inline]
-        pub(super) fn configure_retagging(
-            &self,
-            device: &wgpu::Device,
-            config: &wgpu::SurfaceConfiguration,
-            was_hdr: bool,
-        ) -> Result<bool, String> {
-            configure_scoped(device, &self.0, config)?;
-            Ok(was_hdr && GpuRenderer::tag_swapchain_scrgb(&self.0))
-        }
-
-        /// The SDR escape.
-        #[inline]
-        pub(super) fn configure_sdr_escape(
-            &self,
-            device: &wgpu::Device,
-            config: &wgpu::SurfaceConfiguration,
-            plan: HdrReconfigurePlan,
-        ) -> Result<(), String> {
-            assert_eq!(
-                plan,
-                HdrReconfigurePlan::FallbackToSdr,
-                "the untagged reconfigure is the SDR escape and nothing else"
-            );
-            configure_scoped(device, &self.0, config)
-        }
-
-        /// Re-tag the current swapchain scRGB without reconfiguring it.
-        #[inline]
-        pub(super) fn retag(&self) -> bool {
-            GpuRenderer::tag_swapchain_scrgb(&self.0)
-        }
-
-        /// Whether the surface's output advertises the HDR10 desktop colour space.
-        #[inline]
-        pub(super) fn output_hdr_enabled(&self) -> bool {
-            GpuRenderer::surface_output_hdr_enabled(&self.0)
-        }
-
-        #[inline]
-        pub(super) fn get_current_texture(&self) -> wgpu::CurrentSurfaceTexture {
-            self.0.get_current_texture()
-        }
-    }
-}
-
-#[cfg(wgpu_arm)]
-fn configure_scoped(
-    device: &wgpu::Device,
-    surface: &wgpu::Surface<'_>,
-    config: &wgpu::SurfaceConfiguration,
-) -> Result<(), String> {
-    wgpu_scoped(device, || surface.configure(device, config))
-}
-
-#[cfg(wgpu_arm)]
-fn wgpu_scoped<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> Result<T, String> {
-    let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
-    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let out = f();
-    let validation = crate::block_on::block_on(validation.pop());
-    let internal = crate::block_on::block_on(internal.pop());
-    let oom = crate::block_on::block_on(oom.pop());
-    match validation.or(internal).or(oom) {
-        None => Ok(out),
-        Some(err) => Err(err
-            .to_string()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")),
-    }
-}
-
 /// An on-screen presentation target.
 pub struct GpuSurface {
     acquire_id: u64,
-    #[cfg(not(wgpu_arm))]
     neutral: NeutralSurfaceConfig,
-    #[cfg(wgpu_arm)]
-    surface: live_surface::LiveSurface,
-    #[cfg(wgpu_arm)]
-    config: wgpu::SurfaceConfiguration,
-    #[cfg(wgpu_arm)]
-    sdr_format: wgpu::TextureFormat,
     #[cfg_attr(
         target_arch = "wasm32",
         expect(dead_code, reason = "read by the window HDR paths; a canvas has none")
     )]
     supports_f16: bool,
-    #[cfg(any(wgpu_arm, d3d11_arm))]
+    #[cfg(d3d11_arm)]
     last_hdr_probe: Option<aterm_time::Instant>,
     post_mult: bool,
-    #[cfg(any(wgpu_arm, d3d11_arm))]
+    #[cfg(d3d11_arm)]
     pre_mult: bool,
     copyable: bool,
     #[cfg(target_os = "macos")]
     metal: Option<crate::metal::present::MetalWindowSurface>,
-    #[cfg(all(gl_arm, not(wgpu_arm)))]
+    #[cfg(gl_arm)]
     gl: Option<crate::gl::WindowSurface>,
     /// The D3D11 arm's swap chain on the window (the shipped Windows build;
     /// COM and window handles, keeping `GpuSurface` on the attaching thread).
-    #[cfg(all(d3d11_arm, not(wgpu_arm)))]
+    #[cfg(d3d11_arm)]
     d3d11: Option<d3d11_window::D3dWindow>,
 }
 
@@ -4873,36 +3218,18 @@ impl GpuSurface {
         if self.metal.is_some() {
             return None;
         }
-        #[cfg(all(gl_arm, not(wgpu_arm)))]
+        #[cfg(gl_arm)]
         if let Some(gl) = self.gl.as_ref() {
             return gl.synced().then_some(1);
         }
-        #[cfg(wgpu_arm)]
-        {
-            matches!(
-                self.config.present_mode,
-                wgpu::PresentMode::Fifo | wgpu::PresentMode::FifoRelaxed
-            )
-            .then_some(self.config.desired_maximum_frame_latency.max(1))
-        }
-        #[cfg(not(wgpu_arm))]
-        {
-            None
-        }
+        None
     }
 
     /// Whether this swapchain is the HDR (`Rgba16Float` extended-linear) target.
     #[must_use]
     #[inline]
     pub fn is_hdr(&self) -> bool {
-        #[cfg(wgpu_arm)]
-        {
-            self.config.format == wgpu::TextureFormat::Rgba16Float
-        }
-        #[cfg(not(wgpu_arm))]
-        {
-            self.neutral.format == crate::device_layer::TexelFormat::Rgba16Float
-        }
+        self.neutral.format == crate::device_layer::TexelFormat::Rgba16Float
     }
 
     /// Whether a presented snapshot of this surface can be armed.
@@ -4919,13 +3246,6 @@ impl GpuSurface {
         if !self.copyable {
             return None;
         }
-        #[cfg(wgpu_arm)]
-        let (width, height, format) = (
-            self.config.width,
-            self.config.height,
-            crate::device_layer::TexelFormat::from_wgpu(self.config.format)?,
-        );
-        #[cfg(not(wgpu_arm))]
         let (width, height, format) =
             (self.neutral.width, self.neutral.height, self.neutral.format);
         let len = crate::video_tap::presented_snapshot_len(width, height, format).ok()?;
@@ -4935,24 +3255,15 @@ impl GpuSurface {
     #[cfg(target_os = "macos")]
     #[inline]
     const fn neutral_config(&self) -> (u32, u32, crate::device_layer::TexelFormat) {
-        #[cfg(wgpu_arm)]
-        {
-            let f = crate::device_layer::TexelFormat::from_wgpu(self.config.format)
-                .expect("the swapchain format is inside the map's closed set of six");
-            (self.config.width, self.config.height, f)
-        }
-        #[cfg(not(wgpu_arm))]
-        {
-            (self.neutral.width, self.neutral.height, self.neutral.format)
-        }
+        (self.neutral.width, self.neutral.height, self.neutral.format)
     }
 }
 
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 const HDR_COLOR_SPACE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[must_use]
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(d3d11_arm)]
 #[inline]
 fn hdr_color_space_probe_due(last: Option<aterm_time::Instant>, now: aterm_time::Instant) -> bool {
     match last {
@@ -5244,9 +3555,6 @@ const fn deco_sprite_index(g: aterm_render::DecoGlyph) -> usize {
 }
 
 struct DecoAtlas {
-    #[cfg(wgpu_arm)]
-    bind: wgpu::BindGroup,
-    #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
     data: Vec<u8>,
     cw: usize,
     ch: usize,
@@ -5263,8 +3571,6 @@ struct SpriteTex {
     /// (re-made when the arm's device changes).
     #[cfg(d3d11_arm)]
     d3d11_atlas: std::sync::Mutex<Option<Arc<crate::d3d11::resources::D3dTexture>>>,
-    #[cfg(wgpu_arm)]
-    bind: wgpu::BindGroup,
     w: u32,
     h: u32,
     src: Arc<SceneAtlas>,
@@ -5345,10 +3651,6 @@ impl SpriteTex {
 
 struct ResidentAtlas {
     atlas: Atlas,
-    #[cfg(wgpu_arm)]
-    tex: crate::device_layer::LayerTexture,
-    #[cfg(wgpu_arm)]
-    bind: wgpu::BindGroup,
     tex_h: u32,
 }
 
@@ -5364,17 +3666,13 @@ pub struct WindowGpu {
     acquire_queue_sample_ns: Option<u64>,
     last_gpu_park_ns: u64,
     gpu_park_sample_ns: Option<u64>,
-    #[cfg(wgpu_arm)]
-    pub(crate) offscreen: Option<Offscreen>,
     pub(crate) gate_cache: Option<GpuGateCache>,
     pub(crate) image_cache: aterm_render::ImageCache,
     pub(crate) video: Option<crate::video_tap::VideoTap>,
     pub(crate) presented_snapshot: Option<crate::video_tap::PresentedFrameTap>,
-    #[cfg(any(wgpu_arm, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     pub(crate) copy_src_hold: CopySrcHold,
     pub(crate) image_plane: Option<ImagePlane>,
-    #[cfg(wgpu_arm)]
-    pub(crate) tray_overlay: Option<TrayOverlay>,
     pub(crate) present_prev: Option<PresentPrev>,
     sdr_glow_level: f32,
     sdr_glow_level_at: Option<aterm_time::Instant>,
@@ -5387,31 +3685,17 @@ pub struct WindowGpu {
     pub(crate) chrome_y0: u32,
     pub(crate) chrome_y1: u32,
     pub(crate) capture_color_space: crate::video_tap::CaptureColorSpace,
-    #[cfg(wgpu_arm)]
-    pub(crate) shift_scratch: Option<crate::device_layer::LayerTexture>,
     pub(crate) apron_scratch: aterm_render::ApronScratch,
     pub(crate) apron_rgba: Vec<u8>,
     pub(crate) apron_rgba_gen: u64,
-    #[cfg(wgpu_arm)]
-    pub(crate) apron_tex: Option<crate::device_layer::LayerTexture>,
-    #[cfg(wgpu_arm)]
-    pub(crate) apron_tex_bytes: Vec<u8>,
-    #[cfg(wgpu_arm)]
-    pub(crate) apron_tex_gen: u64,
     #[cfg(target_os = "macos")]
     pub(crate) metal_apron_tex: Option<crate::metal::resources::SealedTexture>,
     #[cfg(target_os = "macos")]
     pub(crate) metal_apron_bytes: Vec<u8>,
     #[cfg(target_os = "macos")]
     pub(crate) metal_apron_gen: u64,
-    #[cfg(wgpu_arm)]
-    pub(crate) present_offscreen: Option<PresentOffscreen>,
     pub(crate) offscreen_dirty_since_sync: Option<[u32; 4]>,
     pub(crate) present_offscreen_fx: Option<[u32; 4]>,
-    #[cfg(wgpu_arm)]
-    pub(crate) shimmer_scratch: Option<ShimmerScratch>,
-    #[cfg(wgpu_arm)]
-    pub(crate) virtual_target: Option<VirtualTarget>,
     #[cfg(target_os = "macos")]
     pub(crate) metal_offscreen: Option<MetalOffscreen>,
     #[cfg(gl_arm)]
@@ -5463,13 +3747,6 @@ pub struct WindowGpu {
     #[cfg(gl_arm)]
     gl_bloom_inputs: Vec<u8>,
     #[cfg(gl_arm)]
-    #[cfg_attr(
-        wgpu_arm,
-        expect(
-            dead_code,
-            reason = "read by the GL window post: a build with wgpu posts on wgpu"
-        )
-    )]
     gl_posted_bloom: Vec<u8>,
     #[cfg(target_os = "macos")]
     pub(crate) metal_present_off: Option<crate::metal::resources::SealedTexture>,
@@ -5498,17 +3775,17 @@ const fn encode_work_ns_excluding_park(work_elapsed_ns: u64, frame_slot_park_ns:
 }
 
 /// How long a presented snapshot keeps its window's swapchain copyable after it is armed.
-#[cfg(any(wgpu_arm, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(crate) const SNAPSHOT_COPY_SRC_HOLD: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The copyable-swapchain hold a presented snapshot leaves behind.
-#[cfg(any(wgpu_arm, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CopySrcHold {
     until: Option<aterm_time::Instant>,
 }
 
-#[cfg(any(wgpu_arm, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 impl CopySrcHold {
     /// A snapshot was armed at `now`: hold the bit until the hold elapses.
     #[inline]
@@ -5529,7 +3806,7 @@ impl WindowGpu {
         Self::default()
     }
 
-    #[cfg(any(wgpu_arm, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[inline]
     fn wants_copy_src(&self, now: aterm_time::Instant) -> bool {
         GpuRenderer::tap_wants_copy_src(
@@ -5558,7 +3835,8 @@ impl WindowGpu {
         self.capture_present = on;
     }
 
-    /// Whether the wgpu arm refuses this window's present as `Occluded` on Windows.
+    /// Whether this window's present parks as `Occluded` (Windows): minimized, with no capture,
+    /// one-shot or recording waiting on its frames.
     #[must_use]
     #[inline]
     pub const fn parks_while_minimized(&self) -> bool {
@@ -5566,21 +3844,6 @@ impl WindowGpu {
             && !self.capture_present
             && self.presented_snapshot.is_none()
             && self.video.is_none()
-    }
-
-    /// Test/diagnostic.
-    #[doc(hidden)]
-    #[must_use]
-    #[inline]
-    pub fn bloom_target_resident(&self) -> bool {
-        #[cfg(wgpu_arm)]
-        {
-            self.offscreen.as_ref().is_some_and(|o| o.bloom.is_some())
-        }
-        #[cfg(not(wgpu_arm))]
-        {
-            false
-        }
     }
 
     /// CPU wall time encoding and calling `queue.submit` for the latest successful present.
@@ -5738,7 +4001,7 @@ impl WindowGpu {
             project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
         )
     )]
-    #[cfg(any(wgpu_arm, d3d11_arm))]
+    #[cfg(d3d11_arm)]
     fn apply_hdr_reconfigure_plan(&mut self, plan: crate::format_plan::HdrReconfigurePlan) {
         if plan == crate::format_plan::HdrReconfigurePlan::FallbackToSdr {
             self.capture_color_space = crate::video_tap::CaptureColorSpace::Srgb;
@@ -5755,30 +4018,11 @@ impl WindowGpu {
             project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
         )
     )]
-    #[cfg(any(target_os = "macos", wgpu_arm, d3d11_arm, test))]
+    #[cfg(any(target_os = "macos", d3d11_arm, test))]
     fn apply_hdr_surface_upgrade(&mut self) {
         self.capture_color_space = crate::video_tap::CaptureColorSpace::ExtendedLinearSrgb;
         self.sdr_white_scale = 1.0;
         self.edr_max = 0.0;
-    }
-
-    /// The applied window metadata and the planner's resolved format, projected onto the four
-    /// `HdrReconfigureRetag` model variables.
-    #[cfg(all(test, wgpu_arm))]
-    #[must_use]
-    pub(crate) fn project_hdr_reconfigure_state(
-        &self,
-        stage: u8,
-        retagged: bool,
-        plan: crate::format_plan::HdrReconfigurePlan,
-    ) -> crate::format_plan::HdrReconfigureProjection {
-        crate::format_plan::HdrReconfigureProjection {
-            stage,
-            retagged,
-            is_f16: plan == crate::format_plan::HdrReconfigurePlan::KeepHdr,
-            capture_linear: self.capture_color_space
-                == crate::video_tap::CaptureColorSpace::ExtendedLinearSrgb,
-        }
     }
 
     /// The sanitized scRGB reference-white multiplier used by presentation and capture.
@@ -5816,14 +4060,6 @@ impl WindowGpu {
         self.resident_input_epoch = self.resident_input_epoch.saturating_add(1);
     }
 
-    /// Test probe.
-    #[cfg(all(target_os = "macos", test, wgpu_arm))]
-    pub(crate) fn image_plane_probe_for_test(&self) -> Option<(u64, bool)> {
-        self.image_plane
-            .as_ref()
-            .map(|p| (p.epoch, p.metal_texels.is_some()))
-    }
-
     /// Identity of the input most recently encoded for presentation.
     #[must_use]
     #[inline]
@@ -5846,14 +4082,8 @@ impl WindowGpu {
         self.tapped_virtual_bytes()
     }
 
-    #[cfg(any(wgpu_arm, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     fn tapped_virtual_bytes(&self) -> Option<usize> {
-        #[cfg(wgpu_arm)]
-        let (width, height) = self
-            .virtual_target
-            .as_ref()
-            .map(|target| (target.w, target.h))?;
-        #[cfg(not(wgpu_arm))]
         let (width, height) = {
             let target = self.metal_virtual_off.as_ref()?;
             (
@@ -5866,7 +4096,7 @@ impl WindowGpu {
         usize::try_from(len).ok()
     }
 
-    #[cfg(not(any(wgpu_arm, target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     #[expect(clippy::unused_self, reason = "the twin of the tapping arms' reader")]
     fn tapped_virtual_bytes(&self) -> Option<usize> {
         None
@@ -5914,8 +4144,6 @@ impl WindowGpu {
 pub(crate) struct ImagePlane {
     #[cfg(target_os = "macos")]
     metal_atlas: Option<ArmAtlas>,
-    #[cfg(wgpu_arm)]
-    bind: wgpu::BindGroup,
     w: u32,
     h: u32,
     placements: FxHashMap<(usize, usize, usize), (u32, u32, u32)>,
@@ -5946,93 +4174,21 @@ pub struct GpuRenderer {
     #[cfg(not(target_arch = "wasm32"))]
     font_family: Option<String>,
     theme: Theme,
-    #[cfg(wgpu_arm)]
-    uniform_buf: wgpu::Buffer,
-    #[cfg(wgpu_arm)]
-    uniform_bg: wgpu::BindGroup,
-    #[cfg(wgpu_arm)]
-    uniform_written: Option<(u32, u32, u32)>,
-    #[cfg(wgpu_arm)]
-    atlas_bgl: wgpu::BindGroupLayout,
-    #[cfg(wgpu_arm)]
-    sampler: wgpu::Sampler,
-    #[cfg(wgpu_arm)]
-    bg_pipeline: wgpu::RenderPipeline,
-    #[cfg(wgpu_arm)]
-    glyph_pipeline: wgpu::RenderPipeline,
-    #[cfg(wgpu_arm)]
-    color_glyph_pipeline: wgpu::RenderPipeline,
-    #[cfg(wgpu_arm)]
-    effects: EffectPipelines,
-    #[cfg(wgpu_arm)]
-    bloom_bgl: wgpu::BindGroupLayout,
-    #[cfg(wgpu_arm)]
-    bloom_sampler: wgpu::Sampler,
-    #[cfg(wgpu_arm)]
-    bloom_pipeline: wgpu::RenderPipeline,
-    #[cfg(wgpu_arm)]
-    bloom_uniform_buf: wgpu::Buffer,
     enable_bloom: bool,
     hdr_glow: bool,
     backdrop_margins: bool,
-    #[cfg(wgpu_arm)]
-    hdr_glow_pipeline: Option<wgpu::RenderPipeline>,
-    #[cfg(wgpu_arm)]
-    hdr_glow_uniform_buf: Option<wgpu::Buffer>,
-    #[cfg(wgpu_arm)]
-    hdr_glow_bg: Option<wgpu::BindGroup>,
-    #[cfg(wgpu_arm)]
-    glow_boost_bgl: Option<wgpu::BindGroupLayout>,
-    #[cfg(wgpu_arm)]
-    sdr_glow_pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
-    #[cfg(wgpu_arm)]
-    glow_items_wgpu: GlowItemsWgpu,
     sdr_glow_boost: f32,
     deco_atlas: Option<DecoAtlas>,
     sprite_textures: SpriteTextureLookup,
     bloom_strength: f32,
     bloom_radius: f32,
-    #[cfg(wgpu_arm)]
-    shimmer: Option<ShimmerResources>,
     enable_shimmer: bool,
     shimmer_epoch: aterm_time::Instant,
     shimmer_phase_pin: Option<f32>,
-    #[cfg(wgpu_arm)]
-    blit_shader: wgpu::ShaderModule,
-    #[cfg(wgpu_arm)]
-    blit_bgl: wgpu::BindGroupLayout,
-    #[cfg(wgpu_arm)]
-    blit_layout: wgpu::PipelineLayout,
-    #[cfg(wgpu_arm)]
-    blit_sampler: wgpu::Sampler,
-    #[cfg(wgpu_arm)]
-    blit_uniform_buf: wgpu::Buffer,
-    #[cfg(wgpu_arm)]
-    blit_uniform_written: Option<BlitUniform>,
-    #[cfg(wgpu_arm)]
-    blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
-    #[cfg(wgpu_arm)]
-    tray_shader: wgpu::ShaderModule,
-    #[cfg(wgpu_arm)]
-    tray_bgl: wgpu::BindGroupLayout,
-    #[cfg(wgpu_arm)]
-    tray_layout: wgpu::PipelineLayout,
-    #[cfg(wgpu_arm)]
-    tray_sampler: wgpu::Sampler,
-    #[cfg(wgpu_arm)]
-    tray_uniform_buf: wgpu::Buffer,
-    #[cfg(wgpu_arm)]
-    tray_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
-    #[cfg(wgpu_arm)]
-    tray_scrim: Option<TrayScrimLayer>,
-    #[cfg(wgpu_arm)]
-    cached_surface_format: Option<wgpu::TextureFormat>,
     mono_res: Option<ResidentAtlas>,
     color_res: Option<ResidentAtlas>,
     resident_keys: FxHashSet<GlyphKey>,
     atlas_tex_creations: u64,
-    #[cfg(wgpu_arm)]
-    vbufs: VertexBuffers,
     #[cfg(target_os = "macos")]
     metal_armed: bool,
     #[cfg(target_os = "macos")]
@@ -6045,9 +4201,7 @@ pub struct GpuRenderer {
     metal_pending_band_shift: Option<BandShift>,
     #[cfg(target_os = "macos")]
     metal_inject_loss_after: Option<u64>,
-    #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
     image_plane_epoch: u64,
-    #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
     atlas_epoch: u64,
     #[cfg(gl_arm)]
     gl_armed: bool,
@@ -6079,8 +4233,6 @@ pub struct GpuRenderer {
     d3d11_inject_loss_after: Option<u64>,
     inst: Instances,
     fx: fx_gpu::FxGpu,
-    #[cfg(wgpu_arm)]
-    fx_wgpu: FxWgpu,
     #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
     fx_palette_shared_seam: bool,
     #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
@@ -6148,8 +4300,6 @@ pub struct GpuRenderer {
     #[cfg(target_os = "macos")]
     metal_on_screen: bool,
     last_gpu_time_serial: Option<u64>,
-    #[cfg(wgpu_arm)]
-    wgpu_timer: Option<crate::wgpu_timer::WgpuGpuTimer>,
     frame_plan: Vec<DrawItem>,
     last_frame_load: crate::device_layer::FrameLoad,
     last_frame_scissor: Option<(u32, u32, u32, u32)>,
@@ -6221,7 +4371,7 @@ impl MetalTrayCard {
 }
 
 /// Return the dirty row band (`y0..y1`) where `old` and `new` differ.
-#[cfg(any(target_os = "macos", wgpu_arm))]
+#[cfg(target_os = "macos")]
 pub(crate) fn changed_row_band(old: &[u8], new: &[u8], stride: usize) -> Option<(u32, u32)> {
     if stride == 0 || old.len() != new.len() {
         return None;
@@ -6237,94 +4387,9 @@ pub(crate) fn changed_row_band(old: &[u8], new: &[u8], stride: usize) -> Option<
     Some((first as u32, last as u32 + 1))
 }
 
-#[cfg(wgpu_arm)]
-pub(crate) struct Offscreen {
-    #[cfg(wgpu_arm)]
-    tex: wgpu::Texture,
-    #[cfg(wgpu_arm)]
-    view: wgpu::TextureView,
-    #[cfg(wgpu_arm)]
-    view_srgb: wgpu::TextureView,
-    #[cfg(wgpu_arm)]
-    blit_bind: wgpu::BindGroup,
-    w: u32,
-    h: u32,
-    bloom: Option<BloomTarget>,
-}
-
-/// The present copy (see [`WindowGpu::present_offscreen`]).
-#[cfg(wgpu_arm)]
-pub(crate) struct PresentOffscreen {
-    #[cfg(wgpu_arm)]
-    tex: wgpu::Texture,
-    #[cfg(wgpu_arm)]
-    view: wgpu::TextureView,
-    #[cfg(wgpu_arm)]
-    blit_bind: wgpu::BindGroup,
-    w: u32,
-    h: u32,
-}
-
-/// Shimmer staging texture and sample bind group (see [`WindowGpu::shimmer_scratch`]).
-#[cfg(wgpu_arm)]
-pub(crate) struct ShimmerScratch {
-    #[cfg(wgpu_arm)]
-    tex: wgpu::Texture,
-    #[cfg(wgpu_arm)]
-    bind: wgpu::BindGroup,
-    w: u32,
-    h: u32,
-}
-
-/// Headless virtual swapchain (see [`WindowGpu::virtual_target`]) that
-/// [`GpuRenderer::present_virtual`] renders into.
-#[cfg(wgpu_arm)]
-pub(crate) struct VirtualTarget {
-    #[cfg(wgpu_arm)]
-    tex: wgpu::Texture,
-    w: u32,
-    h: u32,
-}
-
-#[cfg(wgpu_arm)]
-type OffscreenTexHandle = wgpu::Texture;
-#[cfg(not(wgpu_arm))]
-type OffscreenTexHandle = std::convert::Infallible;
-
-#[cfg(any(wgpu_arm, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 const VIRTUAL_PRESENT_TEXEL: crate::device_layer::TexelFormat =
     crate::device_layer::TexelFormat::Bgra8Unorm;
-#[cfg(wgpu_arm)]
-const VIRTUAL_PRESENT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
-
-#[cfg(wgpu_arm)]
-struct PresentDest<'a> {
-    view: &'a wgpu::TextureView,
-    tex: &'a wgpu::Texture,
-    w: u32,
-    h: u32,
-    #[cfg(wgpu_arm)]
-    format: wgpu::TextureFormat,
-    translucent: bool,
-    premult: bool,
-}
-
-/// The half-res bloom target and its composite bind group.
-#[cfg(wgpu_arm)]
-pub(crate) struct BloomTarget {
-    #[cfg(wgpu_arm)]
-    #[expect(
-        dead_code,
-        reason = "owned GPU texture kept alive for its view and bind group; never read"
-    )]
-    tex: wgpu::Texture,
-    #[cfg(wgpu_arm)]
-    view: wgpu::TextureView,
-    #[cfg(wgpu_arm)]
-    bind: wgpu::BindGroup,
-    bw: u32,
-    bh: u32,
-}
 
 #[derive(Default)]
 struct Instances {
@@ -6456,236 +4521,6 @@ impl Instances {
     }
 }
 
-#[cfg(wgpu_arm)]
-#[derive(Default)]
-struct FxWgpu {
-    tex: [Option<fx_gpu::FxArmTex>; 2],
-    palette: Option<(wgpu::Buffer, u64)>,
-    mints: u64,
-    bind: Option<(u64, wgpu::BindGroup)>,
-}
-
-/// The bloom item list's wgpu side: its storage buffer and bind group (group
-/// 1, binding 5, read by the vertex stage) and the extract's and crowns' item
-/// pipelines, each built on first use. `refused` once the device refused one
-/// (a vertex stage that cannot read storage): its bloom then draws glow
-/// instances.
-#[cfg(wgpu_arm)]
-#[derive(Default)]
-struct GlowItemsWgpu {
-    bgl: Option<wgpu::BindGroupLayout>,
-    buf: Option<(wgpu::Buffer, u64)>,
-    bind: Option<wgpu::BindGroup>,
-    extract: Option<wgpu::RenderPipeline>,
-    hdr: Option<wgpu::RenderPipeline>,
-    sdr: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
-    refused: bool,
-}
-
-#[cfg(wgpu_arm)]
-struct VertexBuffers {
-    streams: [VertexBuffer; STREAM_COUNT],
-    bloom_glow: VertexBuffer,
-}
-
-#[cfg(wgpu_arm)]
-impl VertexBuffers {
-    fn new(handle: crate::device_layer::DeviceHandle<'_>) -> Self {
-        const LABELS: [&str; STREAM_COUNT] = [
-            "aterm-gpu wallpaper base instances",
-            "aterm-gpu bg instances",
-            "aterm-gpu below-cell-background image instances",
-            "aterm-gpu image background-cover instances",
-            "aterm-gpu fx linear under instances",
-            "aterm-gpu cursor trail instances",
-            "aterm-gpu emberforge glow-under instances",
-            "aterm-gpu fx under instances",
-            "aterm-gpu emberforge fire add instances",
-            "aterm-gpu emberforge fire over instances",
-            "aterm-gpu fx knock under instances",
-            "aterm-gpu behind-text image instances",
-            "aterm-gpu glyph contrast-halo instances",
-            "aterm-gpu glyph instances",
-            "aterm-gpu colour glyph instances",
-            "aterm-gpu image instances",
-            "aterm-gpu decoration instances",
-            "aterm-gpu undercurl instances",
-            "aterm-gpu lumen glow-add instances",
-            "aterm-gpu fx glow instances",
-            "aterm-gpu glow halo instances",
-            "aterm-gpu glow halo over instances",
-            "aterm-gpu supernova nova-add instances",
-            "aterm-gpu fx over instances",
-            "aterm-gpu rain add instances",
-            "aterm-gpu rain add over instances",
-            "aterm-gpu sparkle-word paw instances",
-            "aterm-gpu sparkle-word sparkle instances",
-            "aterm-gpu fx linear over instances",
-            "aterm-gpu cursor block fill",
-            "aterm-gpu cursor cut-out glyph",
-            "aterm-gpu cursor colour glyph",
-            "aterm-gpu cursor instances",
-        ];
-        Self {
-            streams: LABELS.map(|label| VertexBuffer::new(handle, label)),
-            bloom_glow: VertexBuffer::new(handle, "aterm-gpu bloom halo source (ungated glow)"),
-        }
-    }
-}
-
-#[cfg(wgpu_arm)]
-struct VertexBuffer {
-    buf: crate::device_layer::LayerBuffer,
-    capacity: u64,
-    label: &'static str,
-}
-
-#[cfg(wgpu_arm)]
-impl VertexBuffer {
-    fn new(handle: crate::device_layer::DeviceHandle<'_>, label: &'static str) -> Self {
-        Self {
-            buf: handle.create_instance_buffer(label, 0),
-            capacity: 0,
-            label,
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn upload(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        bytes: &[u8],
-    ) -> Option<wgpu::BufferSlice<'_>> {
-        let handle = crate::device_layer::DeviceHandle::Wgpu { device, queue };
-        if !self.upload_via(handle, bytes) {
-            return None;
-        }
-        Some(self.buf.slice(..bytes.len() as u64))
-    }
-
-    #[cfg(wgpu_arm)]
-    fn upload_via(&mut self, handle: crate::device_layer::DeviceHandle<'_>, bytes: &[u8]) -> bool {
-        if !should_slice(bytes.len()) {
-            return false;
-        }
-        let needed = align_up(bytes.len() as u64, wgpu::COPY_BUFFER_ALIGNMENT);
-        if needed > self.capacity {
-            let max_buf = handle.max_buffer_size();
-            if needed > max_buf {
-                return false;
-            }
-            let new_cap =
-                align_up(needed.next_power_of_two(), wgpu::COPY_BUFFER_ALIGNMENT).min(max_buf);
-            self.buf = handle.create_instance_buffer(self.label, new_cap);
-            self.capacity = new_cap;
-        }
-        // SAFETY: wgpu has no precondition and Metal callers rewrite streams only after command
-        // buffers settle.
-        unsafe { handle.write_buffer_from_zero(&self.buf, bytes) };
-        true
-    }
-}
-
-#[cfg(wgpu_arm)]
-fn fx_wgpu_sync(
-    fxw: &mut FxWgpu,
-    fx: &mut fx_gpu::FxGpu,
-    effects: &mut EffectPipelines,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    inst: &Instances,
-    under_opaque: bool,
-) -> bool {
-    let drawing = inst.fx_instances() > 0;
-    let handle = crate::device_layer::DeviceHandle::Wgpu { device, queue };
-    let mut atlas_bytes = 0;
-    for kind in [fx_gpu::FxAtlasKind::R8, fx_gpu::FxAtlasKind::Rgba] {
-        let side = fx.atlas.side(kind);
-        if !fx_gpu::fx_tex_due(&fxw.tex[kind as usize], side, drawing) {
-            continue;
-        }
-        match fx_gpu::sync_fx_tex(handle, &mut fxw.tex[kind as usize], side, |_| true, || {}) {
-            Ok(synced) => {
-                atlas_bytes += synced.bytes;
-                if synced.minted {
-                    fxw.mints += 1;
-                }
-            }
-            Err(e) => {
-                crate::stderr_line!("aterm-gpu: fx {kind:?} atlas: {e}; fx draws nothing");
-                return false;
-            }
-        }
-    }
-    fx.atlas_bytes = atlas_bytes;
-    if !drawing {
-        return false;
-    }
-    let resident = effects.resident();
-    let (exact, linear, store) = fx_effect_demand(inst, under_opaque);
-    if (exact && !resident[EffectPipeline::Fx as usize])
-        || (linear && !resident[EffectPipeline::FxLinear as usize])
-        || (store && !resident[EffectPipeline::FxStore as usize])
-    {
-        return false;
-    }
-    let Ok(layouts) = effects.fx_layouts(device) else {
-        return false;
-    };
-    let bytes: &[u8] = aterm_bits::cast_slice(&fx.palette);
-    let need = align_up(bytes.len().max(16) as u64, wgpu::COPY_BUFFER_ALIGNMENT);
-    if fxw.palette.as_ref().is_none_or(|(_, cap)| *cap < need) {
-        let cap = need.next_power_of_two();
-        let buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("aterm-gpu fx palette"),
-            size: cap,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        fxw.palette = Some((buf, cap));
-        fxw.mints += 1;
-    }
-    let (buf, _) = fxw.palette.as_ref().expect("minted above");
-    if !bytes.is_empty() {
-        queue.write_buffer(buf, 0, bytes);
-    }
-    if fxw.bind.as_ref().is_none_or(|(k, _)| *k != fxw.mints) {
-        let view = |k: fx_gpu::FxAtlasKind| {
-            fxw.tex[k as usize]
-                .as_ref()
-                .expect("an fx frame syncs both atlases")
-                .tex
-                .wgpu()
-                .create_view(&wgpu::TextureViewDescriptor::default())
-        };
-        let (r8, rgba) = (
-            view(fx_gpu::FxAtlasKind::R8),
-            view(fx_gpu::FxAtlasKind::Rgba),
-        );
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("aterm-gpu fx bg"),
-            layout: &layouts.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&r8),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&rgba),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: buf.as_entire_binding(),
-                },
-            ],
-        });
-        fxw.bind = Some((fxw.mints, bind));
-    }
-    true
-}
-
 trust_contract_fn! {
     /// Whether a vertex stream may be sliced and bound.
     #[must_use]
@@ -6705,157 +4540,12 @@ verify_island! {
     }
 }
 
-#[cfg(wgpu_arm)]
-#[inline]
-const fn align_up(n: u64, align: u64) -> u64 {
-    (n + align - 1) & !(align - 1)
-}
-
-#[cfg(wgpu_arm)]
-fn build_uniform_resources(
-    handle: crate::device_layer::DeviceHandle<'_>,
-) -> (wgpu::Buffer, wgpu::BindGroupLayout, wgpu::BindGroup) {
-    let device = handle.wgpu_device();
-    let uniform_buf = handle
-        .create_uniform_buffer("aterm-gpu uniforms", std::mem::size_of::<Uniforms>() as u64)
-        .into_wgpu();
-
-    let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("aterm-gpu uniform bgl"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
-    let uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("aterm-gpu uniform bg"),
-        layout: &uniform_bgl,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: uniform_buf.as_entire_binding(),
-        }],
-    });
-
-    (uniform_buf, uniform_bgl, uniform_bg)
-}
-
-#[cfg(wgpu_arm)]
-fn build_atlas_resources(
-    handle: crate::device_layer::DeviceHandle<'_>,
-) -> (wgpu::BindGroupLayout, wgpu::Sampler) {
-    let device = handle.wgpu_device();
-    let atlas_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("aterm-gpu atlas bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
-    });
-
-    let sampler = handle
-        .create_sampler(
-            "aterm-gpu nearest",
-            crate::device_layer::SamplerKind::NearestClamp,
-        )
-        .into_wgpu();
-
-    (atlas_bgl, sampler)
-}
-
 use aterm_render::bloom::{BLOOM_DOWNSCALE, BLOOM_RADIUS, BLOOM_STRENGTH};
 
 /// The chroma radius paired with a white blur `radius`, used by every uniform write site.
 #[inline]
 pub(crate) const fn bloom_chroma_radius(radius: f32) -> f32 {
     aterm_render::bloom::chroma_radius(radius)
-}
-
-#[cfg(wgpu_arm)]
-fn build_bloom_resources(
-    handle: crate::device_layer::DeviceHandle<'_>,
-    targets: TargetFormats,
-) -> (
-    wgpu::BindGroupLayout,
-    wgpu::Sampler,
-    wgpu::RenderPipeline,
-    wgpu::Buffer,
-) {
-    let device = handle.wgpu_device();
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("aterm-gpu bloom shader"),
-        source: wgpu::ShaderSource::Wgsl(wgsl_source(Pipeline::Bloom.spec().library).into()),
-    });
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("aterm-gpu bloom bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-    let sampler = handle
-        .create_sampler(
-            "aterm-gpu bloom linear",
-            crate::device_layer::SamplerKind::LinearClamp,
-        )
-        .into_wgpu();
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("aterm-gpu bloom layout"),
-        bind_group_layouts: &[Some(&bgl)],
-        immediate_size: 0,
-    });
-    let spec = Pipeline::Bloom.spec();
-    let pipeline = crate::pipeline_table::build_wgpu(spec, device, &shader, &layout, targets);
-    let uniform = handle
-        .create_uniform_buffer(
-            "aterm-gpu bloom uniform",
-            std::mem::size_of::<BloomUniform>() as u64,
-        )
-        .into_wgpu();
-    (bgl, sampler, pipeline, uniform)
 }
 
 const SHIMMER_BANDS: usize = 64;
@@ -6865,221 +4555,16 @@ const SHIMMER_HEAT_GAIN: f32 = 1.35;
 const SHIMMER_COPY_MARGIN: u32 = 4;
 const SHIMMER_PHASE_WRAP_S: f32 = 100.0;
 
-#[cfg(wgpu_arm)]
-struct ShimmerResources {
-    #[cfg(wgpu_arm)]
-    bgl: wgpu::BindGroupLayout,
-    #[cfg(wgpu_arm)]
-    pipeline: wgpu::RenderPipeline,
-    #[cfg(wgpu_arm)]
-    uniform_buf: wgpu::Buffer,
-}
-
-#[cfg(wgpu_arm)]
-fn build_shimmer_resources(
-    handle: crate::device_layer::DeviceHandle<'_>,
-    targets: TargetFormats,
-) -> ShimmerResources {
-    let device = handle.wgpu_device();
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("aterm-gpu shimmer shader"),
-        source: wgpu::ShaderSource::Wgsl(wgsl_source(Pipeline::Shimmer.spec().library).into()),
-    });
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("aterm-gpu shimmer bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("aterm-gpu shimmer layout"),
-        bind_group_layouts: &[Some(&bgl)],
-        immediate_size: 0,
-    });
-    let spec = Pipeline::Shimmer.spec();
-    let pipeline = crate::pipeline_table::build_wgpu(spec, device, &shader, &layout, targets);
-    let uniform_buf = handle
-        .create_uniform_buffer(
-            "aterm-gpu shimmer uniform",
-            std::mem::size_of::<ShimmerUniform>() as u64,
-        )
-        .into_wgpu();
-    ShimmerResources {
-        bgl,
-        pipeline,
-        uniform_buf,
-    }
-}
-
 struct ShimmerRegion {
     x0: u32,
     y0: u32,
     x1: u32,
     y1: u32,
-    #[cfg(wgpu_arm)]
-    fw: u32,
-    #[cfg(wgpu_arm)]
-    fh: u32,
     hot_top: f32,
     rise: f32,
     band_x0: f32,
     band_w: f32,
     heat: [f32; SHIMMER_BANDS],
-}
-
-#[cfg(wgpu_arm)]
-struct CellLayouts {
-    #[cfg(wgpu_arm)]
-    bg: wgpu::PipelineLayout,
-    #[cfg(wgpu_arm)]
-    glyph: wgpu::PipelineLayout,
-    uniform_bgl: wgpu::BindGroupLayout,
-}
-
-/// The fx rows' group-1 layout and their pipeline layout.
-#[cfg(wgpu_arm)]
-pub(crate) struct FxWgpuLayouts {
-    pub(crate) bgl: wgpu::BindGroupLayout,
-    layout: wgpu::PipelineLayout,
-}
-
-#[cfg(wgpu_arm)]
-fn build_fx_layouts(
-    device: &wgpu::Device,
-    uniform_bgl: &wgpu::BindGroupLayout,
-) -> Result<FxWgpuLayouts, String> {
-    if device.limits().max_storage_buffers_per_shader_stage == 0 {
-        return Err("its fragment stage reads no storage buffer".into());
-    }
-    let texture = |binding| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Texture {
-            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        },
-        count: None,
-    };
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("aterm-gpu fx bgl"),
-        entries: &[
-            texture(2),
-            texture(3),
-            wgpu::BindGroupLayoutEntry {
-                binding: 4,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("aterm-gpu fx layout"),
-        bind_group_layouts: &[Some(uniform_bgl), Some(&bgl)],
-        immediate_size: 0,
-    });
-    Ok(FxWgpuLayouts { bgl, layout })
-}
-
-#[cfg(wgpu_arm)]
-fn note_fx_closed(why: &str) {
-    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        crate::stderr_line!("aterm-gpu: fx layers draw nothing on this device: {why}");
-    }
-}
-
-#[cfg(wgpu_arm)]
-fn build_cell_layouts(
-    device: &wgpu::Device,
-    uniform_bgl: &wgpu::BindGroupLayout,
-    atlas_bgl: &wgpu::BindGroupLayout,
-) -> CellLayouts {
-    CellLayouts {
-        bg: device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("aterm-gpu bg layout"),
-            bind_group_layouts: &[Some(uniform_bgl)],
-            immediate_size: 0,
-        }),
-        glyph: device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("aterm-gpu glyph layout"),
-            bind_group_layouts: &[Some(uniform_bgl), Some(atlas_bgl)],
-            immediate_size: 0,
-        }),
-        uniform_bgl: uniform_bgl.clone(),
-    }
-}
-
-#[cfg(wgpu_arm)]
-type CellPipelines = (
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-);
-
-#[cfg(wgpu_arm)]
-fn build_cell_pipelines(
-    device: &wgpu::Device,
-    shader: &wgpu::ShaderModule,
-    layouts: &CellLayouts,
-    targets: TargetFormats,
-) -> CellPipelines {
-    let bg_layout = &layouts.bg;
-    let glyph_layout = &layouts.glyph;
-
-    let mut pipeline_mark = aterm_time::Instant::now();
-    let bg_pipeline =
-        crate::pipeline_table::build_wgpu(Pipeline::Bg.spec(), device, shader, bg_layout, targets);
-    pipeline_mark = crate::startup_probe::split_cell_pipeline(0, pipeline_mark);
-
-    let glyph_pipeline = crate::pipeline_table::build_wgpu(
-        Pipeline::Glyph.spec(),
-        device,
-        shader,
-        glyph_layout,
-        targets,
-    );
-    pipeline_mark = crate::startup_probe::split_cell_pipeline(1, pipeline_mark);
-
-    let color_glyph_pipeline = crate::pipeline_table::build_wgpu(
-        Pipeline::ColorGlyph.spec(),
-        device,
-        shader,
-        glyph_layout,
-        targets,
-    );
-    let _ = crate::startup_probe::split_cell_pipeline(2, pipeline_mark);
-    (bg_pipeline, glyph_pipeline, color_glyph_pipeline)
 }
 
 /// One of the effect-only cell pipelines, ordered by [`EFFECT_PIPELINE_NAMES`].
@@ -7134,346 +4619,6 @@ pub const EFFECT_PIPELINES: [EffectPipeline; EFFECT_PIPELINE_COUNT] = [
     EffectPipeline::FxLinear,
     EffectPipeline::FxStore,
 ];
-
-/// Demand-driven cache of the effect-only cell pipelines.
-#[cfg(wgpu_arm)]
-pub(crate) struct EffectPipelines {
-    #[cfg(wgpu_arm)]
-    shader: wgpu::ShaderModule,
-    layouts: CellLayouts,
-    fx: Option<Result<FxWgpuLayouts, String>>,
-    targets: TargetFormats,
-    built: [Option<wgpu::RenderPipeline>; EFFECT_PIPELINE_COUNT],
-    builds: u32,
-    build_ns: u64,
-}
-
-#[cfg(wgpu_arm)]
-impl EffectPipelines {
-    const fn new(shader: wgpu::ShaderModule, layouts: CellLayouts, targets: TargetFormats) -> Self {
-        Self {
-            shader,
-            layouts,
-            fx: None,
-            targets,
-            built: [const { None }; EFFECT_PIPELINE_COUNT],
-            builds: 0,
-            build_ns: 0,
-        }
-    }
-
-    /// The fx rows' layouts, built on first call.
-    pub(crate) fn fx_layouts(&mut self, device: &wgpu::Device) -> Result<&FxWgpuLayouts, &str> {
-        let uniform_bgl = &self.layouts.uniform_bgl;
-        self.fx
-            .get_or_insert_with(|| build_fx_layouts(device, uniform_bgl))
-            .as_ref()
-            .map_err(String::as_str)
-    }
-
-    fn ensure(&mut self, device: &wgpu::Device, which: EffectPipeline) {
-        if self.built[which as usize].is_some() {
-            return;
-        }
-        let fx_layout = match which {
-            EffectPipeline::Fx | EffectPipeline::FxLinear | EffectPipeline::FxStore => {
-                if self.fx_layouts(device).is_err() {
-                    return;
-                }
-                self.fx
-                    .as_ref()
-                    .and_then(|l| l.as_ref().ok())
-                    .map(|l| &l.layout)
-            }
-            _ => None,
-        };
-        let started = aterm_time::Instant::now();
-        let build = || {
-            build_effect_pipeline(
-                device,
-                &self.shader,
-                &self.layouts,
-                fx_layout,
-                self.targets,
-                which,
-            )
-        };
-        let pipeline = if fx_layout.is_some() {
-            match wgpu_scoped(device, build) {
-                Ok(pipeline) => pipeline,
-                Err(cause) => {
-                    let why = format!(
-                        "it refused the {} pipeline: {cause}",
-                        EFFECT_PIPELINE_NAMES[which as usize]
-                    );
-                    note_fx_closed(&why);
-                    self.fx = Some(Err(why));
-                    return;
-                }
-            }
-        } else {
-            build()
-        };
-        let elapsed = started.elapsed();
-        self.build_ns = self
-            .build_ns
-            .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
-        self.builds = self.builds.saturating_add(1);
-        crate::startup_probe::record_effect_build(which as usize, elapsed);
-        self.built[which as usize] = Some(pipeline);
-    }
-
-    #[inline]
-    fn get(&self, which: EffectPipeline) -> &wgpu::RenderPipeline {
-        self.built[which as usize].as_ref().unwrap_or_else(|| {
-            panic!(
-                "effect pipeline `{}` was bound without being ensured this frame \
-                 — add its stream to GpuRenderer::ensure_effect_pipelines",
-                EFFECT_PIPELINE_NAMES[which as usize]
-            )
-        })
-    }
-
-    #[inline]
-    fn resident(&self) -> [bool; EFFECT_PIPELINE_COUNT] {
-        std::array::from_fn(|i| self.built[i].is_some())
-    }
-}
-
-#[cfg(wgpu_arm)]
-fn ensure_effect_pipelines(
-    effects: &mut EffectPipelines,
-    device: &wgpu::Device,
-    inst: &Instances,
-    input: &RenderInput,
-    cursor_opaque: bool,
-) {
-    let want = frame_effect_pipelines(inst, input, cursor_opaque);
-    for (slot, wanted) in want.iter().enumerate() {
-        if *wanted {
-            effects.ensure(device, EFFECT_PIPELINES[slot]);
-        }
-    }
-}
-
-#[cfg(wgpu_arm)]
-fn frame_effect_pipelines(
-    inst: &Instances,
-    input: &RenderInput,
-    cursor_opaque: bool,
-) -> [bool; EFFECT_PIPELINE_COUNT] {
-    let mut want = [false; EFFECT_PIPELINE_COUNT];
-    want[EffectPipeline::CursorBlend as usize] = !cursor_opaque;
-    want[EffectPipeline::GlowAdd as usize] = !inst.glow_under.is_empty()
-        || !inst.glow_add.is_empty()
-        || !inst.nova_add.is_empty()
-        || fx_gpu::bloom_source_live(input);
-    want[EffectPipeline::RainGlow as usize] =
-        !inst.glow_halo.is_empty() || !inst.rain_add.is_empty();
-    want[EffectPipeline::RainGlowOver as usize] =
-        !inst.glow_halo_over.is_empty() || !inst.rain_add_over.is_empty();
-    want[EffectPipeline::FireAdd as usize] = !inst.fire_add.is_empty();
-    want[EffectPipeline::FireOver as usize] = !inst.fire_over.is_empty();
-    want[EffectPipeline::DecoOver as usize] =
-        !inst.glyph_halo.is_empty() || !inst.curl.is_empty() || !inst.wdeco_over.is_empty();
-    want[EffectPipeline::DecoAdd as usize] = !inst.wdeco_add.is_empty();
-    want[EffectPipeline::SpriteOver as usize] = !inst.wallpaper.is_empty();
-    let (fx, linear, store) = fx_effect_demand(inst, fx_gpu::under_draws_opaque(input));
-    want[EffectPipeline::Fx as usize] = fx;
-    want[EffectPipeline::FxLinear as usize] = linear;
-    want[EffectPipeline::FxStore as usize] = store;
-    want
-}
-
-/// Which fx pipelines a frame's fx streams need, as `(fx, fx_linear, fx_store)`: an opaque Exact
-/// Under stream always demands `fx_store` (route (1), [`build_frame_plan`]), and `fx` too while a
-/// GlowUnder stream keeps it in its own group.
-#[cfg(wgpu_arm)]
-fn fx_effect_demand(inst: &Instances, under_opaque: bool) -> (bool, bool, bool) {
-    let fx = |s: fx_gpu::FxStream| !inst.fx[s as usize].is_empty();
-    let under = fx(fx_gpu::FxStream::Under);
-    let stored = under_opaque && inst.glow_under.is_empty();
-    (
-        (under && !stored) || fx(fx_gpu::FxStream::Glow) || fx(fx_gpu::FxStream::Over),
-        fx(fx_gpu::FxStream::LinearUnder)
-            || fx(fx_gpu::FxStream::KnockUnder)
-            || fx(fx_gpu::FxStream::LinearOver),
-        under && under_opaque,
-    )
-}
-
-#[cfg(wgpu_arm)]
-fn build_effect_pipeline(
-    device: &wgpu::Device,
-    shader: &wgpu::ShaderModule,
-    layouts: &CellLayouts,
-    fx_layout: Option<&wgpu::PipelineLayout>,
-    targets: TargetFormats,
-    which: EffectPipeline,
-) -> wgpu::RenderPipeline {
-    let fx = || fx_layout.expect("the fx rows build only once their layout exists");
-    let (row, layout) = match which {
-        EffectPipeline::CursorBlend => (Pipeline::CursorBlend, &layouts.bg),
-        EffectPipeline::GlowAdd => (Pipeline::GlowAdd, &layouts.bg),
-        EffectPipeline::RainGlow => (Pipeline::RainGlow, &layouts.bg),
-        EffectPipeline::RainGlowOver => (Pipeline::RainGlowOver, &layouts.bg),
-        EffectPipeline::FireAdd => (Pipeline::FireAdd, &layouts.bg),
-        EffectPipeline::FireOver => (Pipeline::FireOver, &layouts.bg),
-        EffectPipeline::DecoOver => (Pipeline::DecoOver, &layouts.glyph),
-        EffectPipeline::DecoAdd => (Pipeline::DecoAdd, &layouts.glyph),
-        EffectPipeline::SpriteOver => (Pipeline::SpriteOver, &layouts.glyph),
-        EffectPipeline::Fx => (Pipeline::Fx, fx()),
-        EffectPipeline::FxLinear => (Pipeline::FxLinear, fx()),
-        EffectPipeline::FxStore => (Pipeline::FxStore, fx()),
-    };
-    crate::pipeline_table::build_wgpu(row.spec(), device, shader, layout, targets)
-}
-
-#[cfg(wgpu_arm)]
-fn build_blit_resources(
-    handle: crate::device_layer::DeviceHandle<'_>,
-) -> (
-    wgpu::ShaderModule,
-    wgpu::BindGroupLayout,
-    wgpu::PipelineLayout,
-    wgpu::Sampler,
-    wgpu::Buffer,
-) {
-    let device = handle.wgpu_device();
-    let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("aterm-gpu blit shader"),
-        source: wgpu::ShaderSource::Wgsl(wgsl_source(Pipeline::Blit.spec().library).into()),
-    });
-    let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("aterm-gpu blit bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-    let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("aterm-gpu blit layout"),
-        bind_group_layouts: &[Some(&blit_bgl)],
-        immediate_size: 0,
-    });
-    let blit_sampler = handle
-        .create_sampler(
-            "aterm-gpu blit nearest",
-            crate::device_layer::SamplerKind::NearestClamp,
-        )
-        .into_wgpu();
-    let blit_uniform_buf = handle
-        .create_uniform_buffer(
-            "aterm-gpu blit invert uniform",
-            std::mem::size_of::<BlitUniform>() as u64,
-        )
-        .into_wgpu();
-
-    (
-        blit_shader,
-        blit_bgl,
-        blit_layout,
-        blit_sampler,
-        blit_uniform_buf,
-    )
-}
-
-#[cfg(wgpu_arm)]
-fn build_tray_resources(
-    handle: crate::device_layer::DeviceHandle<'_>,
-) -> (
-    wgpu::ShaderModule,
-    wgpu::BindGroupLayout,
-    wgpu::PipelineLayout,
-    wgpu::Sampler,
-    wgpu::Buffer,
-) {
-    let device = handle.wgpu_device();
-    let tray_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("aterm-gpu tray shader"),
-        source: wgpu::ShaderSource::Wgsl(wgsl_source(Pipeline::Tray.spec().library).into()),
-    });
-    let tray_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("aterm-gpu tray bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-    let tray_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("aterm-gpu tray layout"),
-        bind_group_layouts: &[Some(&tray_bgl)],
-        immediate_size: 0,
-    });
-    let tray_sampler = handle
-        .create_sampler(
-            "aterm-gpu tray linear",
-            crate::device_layer::SamplerKind::LinearClamp,
-        )
-        .into_wgpu();
-    let tray_uniform_buf = handle
-        .create_uniform_buffer(
-            "aterm-gpu tray placement uniform",
-            std::mem::size_of::<TrayUniform>() as u64,
-        )
-        .into_wgpu();
-
-    (
-        tray_shader,
-        tray_bgl,
-        tray_layout,
-        tray_sampler,
-        tray_uniform_buf,
-    )
-}
 
 impl GpuRenderer {
     /// Acquire a GPU and a CPU font face.
@@ -7542,62 +4687,13 @@ impl GpuRenderer {
     ) -> Result<Self, String> {
         #[cfg(target_arch = "wasm32")]
         let _ = font_family; // no system font discovery in the browser
-        #[cfg(wgpu_arm)]
-        let device = &ctx.device;
         let from_parts_started = aterm_time::Instant::now();
 
-        #[cfg(wgpu_arm)]
-        let shader = crate::startup_probe::timed(crate::startup_probe::Leg::PipeShader, || {
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("aterm-gpu shader"),
-                source: wgpu::ShaderSource::Wgsl(wgsl_source(Pipeline::Bg.spec().library).into()),
-            })
-        });
-
         let uniform_atlas_started = aterm_time::Instant::now();
-        #[cfg(wgpu_arm)]
-        let (uniform_buf, uniform_bgl, uniform_bg) = build_uniform_resources(ctx.device_layer());
-        #[cfg(wgpu_arm)]
-        let (atlas_bgl, sampler) = build_atlas_resources(ctx.device_layer());
         crate::startup_probe::record(
             crate::startup_probe::Leg::PipeUniformAtlas,
             uniform_atlas_started.elapsed(),
         );
-        #[cfg(wgpu_arm)]
-        let pipeline_targets = ctx.pipeline_targets();
-        #[cfg(wgpu_arm)]
-        let cell_layouts = build_cell_layouts(device, &uniform_bgl, &atlas_bgl);
-        #[cfg(wgpu_arm)]
-        let (bg_pipeline, glyph_pipeline, color_glyph_pipeline) =
-            crate::startup_probe::timed(crate::startup_probe::Leg::PipeCell, || {
-                build_cell_pipelines(device, &shader, &cell_layouts, pipeline_targets)
-            });
-        #[cfg(wgpu_arm)]
-        let effects = EffectPipelines::new(shader, cell_layouts, pipeline_targets);
-
-        #[cfg(wgpu_arm)]
-        let (blit_shader, blit_bgl, blit_layout, blit_sampler, blit_uniform_buf) =
-            crate::startup_probe::timed(crate::startup_probe::Leg::PipeBlit, || {
-                build_blit_resources(ctx.device_layer())
-            });
-
-        #[cfg(wgpu_arm)]
-        let (tray_shader, tray_bgl, tray_layout, tray_sampler, tray_uniform_buf) =
-            crate::startup_probe::timed(crate::startup_probe::Leg::PipeTray, || {
-                build_tray_resources(ctx.device_layer())
-            });
-
-        #[cfg(wgpu_arm)]
-        let (bloom_bgl, bloom_sampler, bloom_pipeline, bloom_uniform_buf) =
-            crate::startup_probe::timed(crate::startup_probe::Leg::PipeBloom, || {
-                build_bloom_resources(ctx.device_layer(), ctx.pipeline_targets())
-            });
-
-        #[cfg(wgpu_arm)]
-        let vbufs =
-            crate::startup_probe::timed(crate::startup_probe::Leg::PipeVertexBuffers, || {
-                VertexBuffers::new(ctx.device_layer())
-            });
 
         let pipe_tail_started = aterm_time::Instant::now();
         let renderer = Self {
@@ -7606,93 +4702,21 @@ impl GpuRenderer {
             #[cfg(not(target_arch = "wasm32"))]
             font_family,
             theme,
-            #[cfg(wgpu_arm)]
-            uniform_buf,
-            #[cfg(wgpu_arm)]
-            uniform_bg,
-            #[cfg(wgpu_arm)]
-            uniform_written: None,
-            #[cfg(wgpu_arm)]
-            atlas_bgl,
-            #[cfg(wgpu_arm)]
-            sampler,
-            #[cfg(wgpu_arm)]
-            bg_pipeline,
-            #[cfg(wgpu_arm)]
-            glyph_pipeline,
-            #[cfg(wgpu_arm)]
-            color_glyph_pipeline,
-            #[cfg(wgpu_arm)]
-            effects,
-            #[cfg(wgpu_arm)]
-            bloom_bgl,
-            #[cfg(wgpu_arm)]
-            bloom_sampler,
-            #[cfg(wgpu_arm)]
-            bloom_pipeline,
-            #[cfg(wgpu_arm)]
-            bloom_uniform_buf,
             enable_bloom: true,
             hdr_glow: false,
             backdrop_margins: false,
-            #[cfg(wgpu_arm)]
-            hdr_glow_pipeline: None,
-            #[cfg(wgpu_arm)]
-            hdr_glow_uniform_buf: None,
-            #[cfg(wgpu_arm)]
-            hdr_glow_bg: None,
-            #[cfg(wgpu_arm)]
-            glow_boost_bgl: None,
-            #[cfg(wgpu_arm)]
-            sdr_glow_pipeline: None,
-            #[cfg(wgpu_arm)]
-            glow_items_wgpu: GlowItemsWgpu::default(),
             sdr_glow_boost: 0.0,
             deco_atlas: None,
             sprite_textures: SpriteTextureLookup::default(),
             bloom_strength: BLOOM_STRENGTH,
             bloom_radius: BLOOM_RADIUS,
-            #[cfg(wgpu_arm)]
-            shimmer: None,
             enable_shimmer: true,
             shimmer_epoch: aterm_time::Instant::now(),
             shimmer_phase_pin: None,
-            #[cfg(wgpu_arm)]
-            blit_shader,
-            #[cfg(wgpu_arm)]
-            blit_bgl,
-            #[cfg(wgpu_arm)]
-            blit_layout,
-            #[cfg(wgpu_arm)]
-            blit_sampler,
-            #[cfg(wgpu_arm)]
-            blit_uniform_buf,
-            #[cfg(wgpu_arm)]
-            blit_uniform_written: None,
-            #[cfg(wgpu_arm)]
-            blit_pipelines: HashMap::new(),
-            #[cfg(wgpu_arm)]
-            tray_shader,
-            #[cfg(wgpu_arm)]
-            tray_bgl,
-            #[cfg(wgpu_arm)]
-            tray_layout,
-            #[cfg(wgpu_arm)]
-            tray_sampler,
-            #[cfg(wgpu_arm)]
-            tray_uniform_buf,
-            #[cfg(wgpu_arm)]
-            tray_pipelines: HashMap::new(),
-            #[cfg(wgpu_arm)]
-            tray_scrim: None,
-            #[cfg(wgpu_arm)]
-            cached_surface_format: None,
             mono_res: None,
             color_res: None,
             resident_keys: FxHashSet::default(),
             atlas_tex_creations: 0,
-            #[cfg(wgpu_arm)]
-            vbufs,
             #[cfg(target_os = "macos")]
             metal_armed: crate::metal_backend_selected(),
             #[cfg(target_os = "macos")]
@@ -7703,12 +4727,10 @@ impl GpuRenderer {
             last_frame_arm_metal: false,
             #[cfg(target_os = "macos")]
             metal_pending_band_shift: None,
-            #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
             image_plane_epoch: 0,
-            #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
             atlas_epoch: 0,
             // Windows draws, presents and reads back on the D3D11 arm (GW.5's
-            // flip); the oracle build's suites disarm it to read wgpu.
+            // flip).
             #[cfg(d3d11_arm)]
             d3d11_armed: true,
             #[cfg(d3d11_arm)]
@@ -7742,8 +4764,6 @@ impl GpuRenderer {
                 .filter(|n| *n > 0),
             inst: Instances::default(),
             fx: fx_gpu::FxGpu::default(),
-            #[cfg(wgpu_arm)]
-            fx_wgpu: FxWgpu::default(),
             #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
             fx_palette_shared_seam: false,
             #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
@@ -7794,8 +4814,6 @@ impl GpuRenderer {
             #[cfg(target_os = "macos")]
             metal_on_screen: false,
             last_gpu_time_serial: None,
-            #[cfg(wgpu_arm)]
-            wgpu_timer: None,
             frame_plan: Vec::new(),
             last_frame_load: crate::device_layer::FrameLoad::Load,
             last_frame_scissor: None,
@@ -8265,25 +5283,6 @@ impl GpuRenderer {
     /// Test/diagnostic.
     #[doc(hidden)]
     #[must_use]
-    pub fn allocator_reserved(&self) -> Option<(u64, u64, Vec<u64>)> {
-        #[cfg(not(wgpu_arm))]
-        {
-            None
-        }
-        #[cfg(wgpu_arm)]
-        {
-            let report = self.ctx.device.generate_allocator_report()?;
-            Some((
-                report.total_allocated_bytes,
-                report.total_reserved_bytes,
-                report.blocks.iter().map(|b| b.size).collect(),
-            ))
-        }
-    }
-
-    /// Test/diagnostic.
-    #[doc(hidden)]
-    #[must_use]
     #[inline]
     pub const fn scissor_taken(&self) -> u64 {
         self.scissor_taken
@@ -8351,7 +5350,7 @@ impl GpuRenderer {
     /// The arm this renderer's frames draw on, as the glow ramps' route
     /// costs know it ([`fx_gpu::ramp_cost`]).
     #[inline]
-    fn ramp_arm(&self) -> fx_gpu::RampArm<'_> {
+    fn ramp_arm(&self) -> fx_gpu::RampArm {
         #[cfg(target_os = "macos")]
         if self.metal_armed {
             return fx_gpu::RampArm::Metal;
@@ -8364,9 +5363,6 @@ impl GpuRenderer {
         if self.d3d11_armed {
             return fx_gpu::RampArm::D3d11;
         }
-        #[cfg(wgpu_arm)]
-        return fx_gpu::RampArm::Wgpu(&self.ctx.backend);
-        #[cfg(not(wgpu_arm))]
         fx_gpu::RampArm::Unarmed
     }
 
@@ -8391,10 +5387,6 @@ impl GpuRenderer {
         #[cfg(target_os = "macos")]
         if let Some(c) = self.metal_arm.as_mut() {
             c.live_mut().fx_tex = [None, None];
-        }
-        #[cfg(wgpu_arm)]
-        {
-            self.fx_wgpu = FxWgpu::default();
         }
         #[cfg(gl_arm)]
         if let Some(live) = self.gl_arm.as_mut() {
@@ -8596,69 +5588,11 @@ impl GpuRenderer {
 
     /// Whether this renderer's presents can report GPU time once a sink is installed.
     #[must_use]
-    pub fn gpu_time_supported(&self) -> bool {
+    pub const fn gpu_time_supported(&self) -> bool {
         #[cfg(target_os = "macos")]
-        let metal = self.metal_armed;
+        return self.metal_armed;
         #[cfg(not(target_os = "macos"))]
-        let metal = false;
-        #[cfg(gl_arm)]
-        let gl = self.gl_armed;
-        #[cfg(not(gl_arm))]
-        let gl = false;
-        #[cfg(wgpu_arm)]
-        let timestamps = self
-            .ctx
-            .device
-            .features()
-            .contains(wgpu::Features::TIMESTAMP_QUERY);
-        #[cfg(not(wgpu_arm))]
-        let timestamps = false;
-        metal || (!gl && timestamps)
-    }
-
-    /// Settle what GPU-time readbacks have landed without presenting again.
-    pub fn poll_gpu_time(&mut self) {
-        #[cfg(wgpu_arm)]
-        if let Some(timer) = self.wgpu_timer.as_mut() {
-            timer.harvest(&crate::wgpu_timer::WgpuClock {
-                device: &self.ctx.device,
-                queue: &self.ctx.queue,
-            });
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn wgpu_gpu_time_begin(&mut self) {
-        self.last_gpu_time_serial = None;
-        if !crate::gpu_time::sink_installed() {
-            return;
-        }
-        if self.wgpu_timer.is_none() {
-            self.wgpu_timer =
-                crate::wgpu_timer::WgpuGpuTimer::new(&self.ctx.device, &self.ctx.queue);
-        }
-        if let Some(timer) = self.wgpu_timer.as_mut() {
-            self.last_gpu_time_serial = timer.begin(&crate::wgpu_timer::WgpuClock {
-                device: &self.ctx.device,
-                queue: &self.ctx.queue,
-            });
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn wgpu_gpu_time_finish(&mut self) {
-        if let Some(timer) = self.wgpu_timer.as_mut() {
-            timer.finish(&crate::wgpu_timer::WgpuClock {
-                device: &self.ctx.device,
-                queue: &self.ctx.queue,
-            });
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    #[inline]
-    fn wgpu_pass_timestamps(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
-        self.wgpu_timer.as_ref()?.pass_writes()
+        false
     }
 
     /// Cell size (pixels), straight from the CPU renderer so geometry matches.
@@ -8824,29 +5758,6 @@ impl GpuRenderer {
         self.metal_armed = true;
     }
 
-    /// Disarm the Metal arm in-process so the differentials' wgpu oracle twin reaches the wgpu arm.
-    #[cfg(target_os = "macos")]
-    #[cfg(test)]
-    pub(crate) fn disarm_metal_for_test(&mut self) {
-        self.metal_armed = false;
-    }
-
-    /// Integration-suite spelling of [`Self::disarm_metal_for_test`].
-    #[doc(hidden)]
-    #[cfg(all(target_os = "macos", wgpu_arm))]
-    pub const fn disarm_metal_for_oracle(&mut self) {
-        self.metal_armed = false;
-    }
-
-    /// Test probe.
-    #[cfg(all(target_os = "macos", test, wgpu_arm))]
-    pub(crate) fn metal_pipeline_probe_for_test(&mut self) -> (bool, u64) {
-        self.metal_arm.as_mut().map_or((false, 0), |c| {
-            let l = c.live_mut();
-            (l.has_inflight_frame(), l.awaited_frames)
-        })
-    }
-
     /// Whether the armed Metal arm is live on this renderer.
     #[cfg(target_os = "macos")]
     #[must_use]
@@ -8889,18 +5800,9 @@ impl GpuRenderer {
 
     #[inline]
     fn clamp_fb_dim(&self, d: u32) -> u32 {
-        #[cfg(wgpu_arm)]
-        {
-            d.max(1)
-                .min(self.ctx.device.limits().max_texture_dimension_2d)
-        }
-        #[cfg(not(wgpu_arm))]
-        {
-            d.clamp(1, self.first_party_max_texture_dim())
-        }
+        d.clamp(1, self.first_party_max_texture_dim())
     }
 
-    #[cfg(not(wgpu_arm))]
     #[inline]
     fn first_party_max_texture_dim(&self) -> u32 {
         #[cfg(target_os = "macos")]
@@ -8924,21 +5826,6 @@ impl GpuRenderer {
     #[inline]
     pub fn max_texture_dim(&self) -> u32 {
         self.clamp_fb_dim(u32::MAX)
-    }
-
-    #[cfg(all(test, wgpu_arm))]
-    fn atlas_tex_creations(&self) -> u64 {
-        self.atlas_tex_creations
-    }
-
-    #[cfg(all(test, wgpu_arm))]
-    fn atlas_tex_dims(&self) -> Option<((u32, u32), (u32, u32))> {
-        let m = self.mono_res.as_ref()?;
-        let c = self.color_res.as_ref()?;
-        Some((
-            (m.tex.wgpu().width(), m.tex.wgpu().height()),
-            (c.tex.wgpu().width(), c.tex.wgpu().height()),
-        ))
     }
 
     /// The adapter/backend the GPU device is running on (for diagnostics).
@@ -8981,76 +5868,10 @@ impl GpuRenderer {
     }
 
     fn create_atlas_texture(&mut self, atlas: Atlas) -> ResidentAtlas {
-        #[cfg(wgpu_arm)]
-        let handle = self.ctx.device_layer();
-        #[cfg(wgpu_arm)]
-        let bpp = atlas.kind.bpp();
-        #[cfg(wgpu_arm)]
-        let (format, label, bg_label) = match atlas.kind {
-            AtlasKind::Mono => (
-                crate::device_layer::TexelFormat::R8Unorm,
-                "aterm-gpu atlas",
-                "aterm-gpu atlas bg",
-            ),
-            AtlasKind::Color => (
-                crate::device_layer::TexelFormat::Rgba8Unorm,
-                "aterm-gpu colour atlas",
-                "aterm-gpu colour atlas bg",
-            ),
-        };
-        #[cfg(wgpu_arm)]
-        let max_tex_dim = handle.max_texture_dim();
-        #[cfg(not(wgpu_arm))]
         let max_tex_dim = self.first_party_max_texture_dim();
         let tex_h = (atlas.height + ATLAS_GROW_HEADROOM).min(max_tex_dim);
-        #[cfg(wgpu_arm)]
-        let tex = handle.create_texture_2d(
-            label,
-            format,
-            atlas.width,
-            tex_h,
-            crate::device_layer::TexUsage::UPLOADED_SAMPLED,
-            None,
-        );
         self.atlas_tex_creations += 1;
-        #[cfg(wgpu_arm)]
-        handle.upload_texture_full(
-            &tex,
-            &atlas.data[..(atlas.width * atlas.height * bpp) as usize],
-            atlas.width * bpp,
-            atlas.width,
-            atlas.height,
-        );
-        #[cfg(wgpu_arm)]
-        let view = tex
-            .wgpu()
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        #[cfg(wgpu_arm)]
-        let bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(bg_label),
-                layout: &self.atlas_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-        ResidentAtlas {
-            atlas,
-            #[cfg(wgpu_arm)]
-            tex,
-            #[cfg(wgpu_arm)]
-            bind,
-            tex_h,
-        }
+        ResidentAtlas { atlas, tex_h }
     }
 
     fn ensure_deco_atlas(&mut self, cw: usize, ch: usize) {
@@ -9087,71 +5908,13 @@ impl GpuRenderer {
                 }
             }
         }
-        #[cfg(wgpu_arm)]
-        let bind = {
-            let handle = self.ctx.device_layer();
-            let tex = handle.create_texture_2d(
-                "aterm-gpu deco atlas",
-                crate::device_layer::TexelFormat::R8Unorm,
-                atlas_w as u32,
-                ch as u32,
-                crate::device_layer::TexUsage::UPLOADED_SAMPLED,
-                None,
-            );
-            handle.upload_texture_full(&tex, &data, atlas_w as u32, atlas_w as u32, ch as u32);
-            let view = tex
-                .wgpu()
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            self.ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("aterm-gpu deco atlas bg"),
-                    layout: &self.atlas_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                    ],
-                })
-        };
         self.deco_atlas = Some(DecoAtlas {
-            #[cfg(wgpu_arm)]
-            bind,
             cw,
             ch,
             curl_band,
             atlas_w,
-            #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
             data,
         });
-    }
-
-    fn upload_atlas_rows(&self, res: &ResidentAtlas, y0: u32, y1: u32) {
-        #[cfg(not(wgpu_arm))]
-        let _ = (res, y0, y1);
-        #[cfg(wgpu_arm)]
-        {
-            if y1 <= y0 {
-                return;
-            }
-            let bpp = res.atlas.kind.bpp();
-            let row = (res.atlas.width * bpp) as usize;
-            let start = y0 as usize * row;
-            let end = y1 as usize * row;
-            self.ctx.device_layer().upload_texture_rows(
-                &res.tex,
-                y0,
-                y1 - y0,
-                &res.atlas.data[start..end],
-                res.atlas.width * bpp,
-                res.atlas.width,
-            );
-        }
     }
 
     fn ensure_atlases(&mut self, keys: &mut [GlyphKey]) {
@@ -9188,23 +5951,14 @@ impl GpuRenderer {
             grow_atlas(&mut self.cpu, &mut res.atlas, &new_keys, cap_color)
         };
         match (mono_band, color_band) {
-            (Some(mb), Some(cb)) => {
-                let mono_res = self.mono_res.as_ref().unwrap();
-                self.upload_atlas_rows(mono_res, mb.0, mb.1);
-                let color_res = self.color_res.as_ref().unwrap();
-                self.upload_atlas_rows(color_res, cb.0, cb.1);
-                self.resident_keys.extend(new_keys);
-            }
+            // Each arm uploads the grown rows from the atlas at its next sync.
+            (Some(_), Some(_)) => self.resident_keys.extend(new_keys),
             _ => self.rebuild_atlases(keys),
         }
     }
 
     fn rebuild_atlases(&mut self, keys: &[GlyphKey]) {
-        #[cfg(wgpu_arm)]
-        let cap_h = self.ctx.device_layer().max_texture_dim();
-        #[cfg(not(wgpu_arm))]
         let cap_h = self.first_party_max_texture_dim();
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         {
             self.atlas_epoch += 1;
         }
@@ -9280,9 +6034,6 @@ impl GpuRenderer {
                 .iter()
                 .map(|(image, fp_w, fp_h, _)| (image, *fp_w, *fp_h)),
         );
-        #[cfg(wgpu_arm)]
-        let max_tex_dim = self.ctx.device.limits().max_texture_dimension_2d;
-        #[cfg(not(wgpu_arm))]
         let max_tex_dim = self.first_party_max_texture_dim();
         let mut total_h: u32 = 0;
         let mut max_w: u32 = 0;
@@ -9341,38 +6092,6 @@ impl GpuRenderer {
         }
         let data = Self::pack_image_plane(&items, tw, th);
 
-        #[cfg(wgpu_arm)]
-        let bind = {
-            let handle = self.ctx.device_layer();
-            let tex = handle.create_texture_2d(
-                "aterm-gpu image plane",
-                crate::device_layer::TexelFormat::Rgba8Unorm,
-                tw,
-                th,
-                crate::device_layer::TexUsage::UPLOADED_SAMPLED,
-                None,
-            );
-            handle.upload_texture_full(&tex, &data, tw * 4, tw, th);
-            let view = tex
-                .wgpu()
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            self.ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("aterm-gpu image plane bg"),
-                    layout: &self.atlas_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                    ],
-                })
-        };
         #[cfg(target_os = "macos")]
         let (metal_texels, epoch) = if self.metal_armed {
             self.image_plane_epoch += 1;
@@ -9398,8 +6117,6 @@ impl GpuRenderer {
         win.image_plane = Some(ImagePlane {
             #[cfg(target_os = "macos")]
             metal_atlas: None,
-            #[cfg(wgpu_arm)]
-            bind,
             w: tw,
             h: th,
             placements: std::mem::take(&mut placements),
@@ -9580,7 +6297,7 @@ impl GpuRenderer {
             win.video = Some(tap);
             return Ok(());
         }
-        #[cfg(all(gl_arm, not(wgpu_arm)))]
+        #[cfg(gl_arm)]
         if self.gl_armed && surf.gl.is_some() {
             let tap = crate::video_tap::VideoTap::new_gl(
                 surf.neutral.width,
@@ -9595,7 +6312,7 @@ impl GpuRenderer {
         }
         // The D3D11 arm records its window's buffer 0 as presented, in the
         // chain's format (an EDR chain's f16 included).
-        #[cfg(all(d3d11_arm, not(wgpu_arm)))]
+        #[cfg(d3d11_arm)]
         if self.d3d11_armed && surf.d3d11.is_some() {
             let tap = crate::video_tap::VideoTap::new_gl(
                 surf.neutral.width,
@@ -9608,25 +6325,7 @@ impl GpuRenderer {
             win.video = Some(tap);
             return Ok(());
         }
-        #[cfg(not(wgpu_arm))]
-        {
-            Err("video: the wgpu tap ring is not in this build".to_string())
-        }
-        #[cfg(wgpu_arm)]
-        {
-            let tap = crate::video_tap::VideoTap::new(
-                &self.ctx.device,
-                surf.config.width,
-                surf.config.height,
-                crate::device_layer::TexelFormat::from_wgpu(surf.config.format)
-                    .ok_or("video: swapchain format outside the closed set")?,
-                win.capture_color_space,
-                win.sdr_white_scale(),
-                opts,
-            )?;
-            win.video = Some(tap);
-            Ok(())
-        }
+        Err("video: the renderer is disarmed: no arm records this window".to_string())
     }
 
     /// Start recording a glass-less window's presents through a persistent `VirtualTarget`.
@@ -9668,15 +6367,15 @@ impl GpuRenderer {
             win.video = Some(tap);
             return Ok(());
         }
-        #[cfg(all(not(wgpu_arm), gl_arm))]
+        #[cfg(gl_arm)]
         {
             Err(format!("video: {}", self.gl_start_error()))
         }
-        #[cfg(all(not(wgpu_arm), d3d11_arm))]
+        #[cfg(d3d11_arm)]
         {
             Err(format!("video: {}", self.d3d11_start_error()))
         }
-        #[cfg(all(not(wgpu_arm), target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         {
             if !self.metal_arm_ready() {
                 return Err(format!("video: {}", self.metal_start_error()));
@@ -9695,22 +6394,6 @@ impl GpuRenderer {
             win.video = Some(tap);
             Ok(())
         }
-        #[cfg(wgpu_arm)]
-        {
-            let tap = crate::video_tap::VideoTap::new(
-                &self.ctx.device,
-                w,
-                h,
-                VIRTUAL_PRESENT_TEXEL,
-                crate::video_tap::CaptureColorSpace::Srgb,
-                1.0,
-                opts,
-            )?;
-            win.virtual_target = Some(self.make_virtual_target(w, h));
-            win.virtual_presented_input_epoch = 0;
-            win.video = Some(tap);
-            Ok(())
-        }
     }
 
     /// Post-submit hook.
@@ -9723,15 +6406,9 @@ impl GpuRenderer {
             // A host-readback ring (the GL or D3D11 arm's).
             #[cfg(any(gl_arm, d3d11_arm))]
             let on_gl = tap.ring_is_gl();
-            #[cfg(all(not(any(gl_arm, d3d11_arm)), wgpu_arm))]
-            let on_gl = false;
             #[cfg(any(gl_arm, d3d11_arm))]
             if on_gl {
                 tap.gl_after_present(t_us);
-            }
-            #[cfg(wgpu_arm)]
-            if !on_gl {
-                tap.after_present(&self.ctx.device, t_us);
             }
         }
     }
@@ -9747,12 +6424,7 @@ impl GpuRenderer {
             if t.ring_is_gl() {
                 return t.gl_finish();
             }
-            #[cfg(wgpu_arm)]
-            {
-                t.finish(&self.ctx.device)
-            }
-            #[cfg(not(wgpu_arm))]
-            unreachable!("a wgpu ring cannot exist on a wgpu-free build")
+            unreachable!("every video ring stages through an arm")
         })
     }
 
@@ -9798,7 +6470,7 @@ impl GpuRenderer {
             win.copy_src_hold.arm(aterm_time::Instant::now());
             return Ok(());
         }
-        #[cfg(all(gl_arm, not(wgpu_arm)))]
+        #[cfg(gl_arm)]
         if self.gl_armed && surface.gl.is_some() {
             win.presented_snapshot = Some(crate::video_tap::PresentedFrameTap::new_gl(
                 surface.neutral.width,
@@ -9810,7 +6482,7 @@ impl GpuRenderer {
             return Ok(());
         }
         // The D3D11 arm's one-shot over its window's buffer 0.
-        #[cfg(all(d3d11_arm, not(wgpu_arm)))]
+        #[cfg(d3d11_arm)]
         if self.d3d11_armed && surface.d3d11.is_some() {
             win.presented_snapshot = Some(crate::video_tap::PresentedFrameTap::new_gl(
                 surface.neutral.width,
@@ -9821,24 +6493,7 @@ impl GpuRenderer {
             )?);
             return Ok(());
         }
-        #[cfg(not(wgpu_arm))]
-        {
-            Err("snapshot: the wgpu tap ring is not in this build".to_string())
-        }
-        #[cfg(wgpu_arm)]
-        {
-            win.presented_snapshot = Some(crate::video_tap::PresentedFrameTap::new(
-                &self.ctx.device,
-                surface.config.width,
-                surface.config.height,
-                crate::device_layer::TexelFormat::from_wgpu(surface.config.format)
-                    .ok_or("snapshot: swapchain format outside the closed set")?,
-                win.capture_color_space,
-                win.sdr_white_scale(),
-            )?);
-            win.copy_src_hold.arm(aterm_time::Instant::now());
-            Ok(())
-        }
+        Err("snapshot: the renderer is disarmed: no arm copies this window".to_string())
     }
 
     /// Post-present half of [`Self::presented_snapshot_begin`].
@@ -9859,12 +6514,7 @@ impl GpuRenderer {
         if tap.tap_is_gl() {
             return tap.gl_after_present(t_us);
         }
-        #[cfg(wgpu_arm)]
-        {
-            tap.after_present(&self.ctx.device, t_us)
-        }
-        #[cfg(not(wgpu_arm))]
-        unreachable!("a wgpu one-shot cannot exist on a wgpu-free build")
+        unreachable!("every one-shot stages through an arm")
     }
 
     /// Complete the one-shot map, blocking only after the capture has left the present hot path.
@@ -9881,12 +6531,7 @@ impl GpuRenderer {
         if tap.tap_is_gl() {
             return tap.gl_finish();
         }
-        #[cfg(wgpu_arm)]
-        {
-            tap.finish(&self.ctx.device)
-        }
-        #[cfg(not(wgpu_arm))]
-        unreachable!("a wgpu one-shot cannot exist on a wgpu-free build")
+        unreachable!("every one-shot stages through an arm")
     }
 
     /// Take the completed exact destination as its staging buffer mapped it
@@ -9926,7 +6571,7 @@ impl GpuRenderer {
         if self.d3d11_armed {
             return self.d3d11_virtual_snapshot(win, t_us);
         }
-        #[cfg(all(not(wgpu_arm), target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         {
             let target = win.metal_virtual_off.as_ref().ok_or_else(|| {
                 "presented snapshot: current virtual destination is unavailable".to_string()
@@ -9961,48 +6606,13 @@ impl GpuRenderer {
             tap.metal_finish()?;
             tap.take_raw()
         }
-        #[cfg(all(not(wgpu_arm), gl_arm))]
+        #[cfg(gl_arm)]
         {
             Err(format!("presented snapshot: {}", self.gl_start_error()))
         }
-        #[cfg(all(not(wgpu_arm), d3d11_arm))]
+        #[cfg(d3d11_arm)]
         {
             Err(format!("presented snapshot: {}", self.d3d11_start_error()))
-        }
-        #[cfg(wgpu_arm)]
-        {
-            let target = win.virtual_target.as_ref().ok_or_else(|| {
-                "presented snapshot: current virtual destination is unavailable".to_string()
-            })?;
-            let mut tap = crate::video_tap::PresentedFrameTap::new(
-                &self.ctx.device,
-                target.w,
-                target.h,
-                VIRTUAL_PRESENT_TEXEL,
-                crate::video_tap::CaptureColorSpace::Srgb,
-                1.0,
-            )?;
-            let mut encoder =
-                self.ctx
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("aterm current virtual presented-frame snapshot"),
-                    });
-            let staged = tap.enqueue_copy(
-                &mut encoder,
-                &target.tex,
-                crate::video_tap::CaptureColorSpace::Srgb,
-                1.0,
-            );
-            crate::device_layer::submit_host_readable(
-                &self.ctx.device,
-                &self.ctx.queue,
-                encoder.finish(),
-                staged.as_slice(),
-            );
-            tap.after_present(&self.ctx.device, t_us)?;
-            tap.finish(&self.ctx.device)?;
-            tap.take_raw()
         }
     }
 
@@ -10017,7 +6627,7 @@ impl GpuRenderer {
         self.cpu
             .checked_frame_size(input.rows, input.cols)
             .expect("renderable framebuffer");
-        let (texture, width, height) = self.render_input_target(win, input, tray);
+        let (width, height) = self.render_input_target(win, input, tray);
         #[cfg(d3d11_arm)]
         if self.last_frame_arm_d3d11 {
             return self
@@ -10063,22 +6673,11 @@ impl GpuRenderer {
                     }
                 });
         }
-        #[cfg(wgpu_arm)]
-        {
-            let texture = texture.expect("a wgpu frame vends its offscreen texture");
-            self.ctx.read_back(&texture, width, height)
-        }
-        #[cfg(not(wgpu_arm))]
-        {
-            let _ = texture;
-            crate::stderr_line!(
-                "aterm-gpu: disarmed render_input on a wgpu-free build; blank frame"
-            );
-            Frame {
-                width: width as usize,
-                height: height as usize,
-                pixels: vec![0; (width as usize) * (height as usize)],
-            }
+        crate::stderr_line!("aterm-gpu: render_input on a disarmed renderer; blank frame");
+        Frame {
+            width: width as usize,
+            height: height as usize,
+            pixels: vec![0; (width as usize) * (height as usize)],
         }
     }
 
@@ -10091,7 +6690,7 @@ impl GpuRenderer {
         tray: Option<TrayQuad<'_>>,
     ) -> Result<Frame, String> {
         self.cpu.checked_frame_size(input.rows, input.cols)?;
-        let (texture, width, height) = self.render_input_target(win, input, tray);
+        let (width, height) = self.render_input_target(win, input, tray);
         #[cfg(d3d11_arm)]
         if self.last_frame_arm_d3d11 {
             return self.d3d11_read_back_offscreen(win, width, height);
@@ -10104,16 +6703,7 @@ impl GpuRenderer {
         if self.last_frame_arm_metal {
             return self.metal_read_back_offscreen(win, width, height);
         }
-        #[cfg(wgpu_arm)]
-        {
-            let texture = texture.expect("a wgpu frame vends its offscreen texture");
-            self.ctx.try_read_back(&texture, width, height)
-        }
-        #[cfg(not(wgpu_arm))]
-        {
-            let _ = texture;
-            Err("the renderer is disarmed and this build carries no wgpu arm".to_string())
-        }
+        Err("the renderer is disarmed: no arm drew the frame".to_string())
     }
 
     fn render_input_target(
@@ -10121,7 +6711,7 @@ impl GpuRenderer {
         win: &mut WindowGpu,
         input: &RenderInput,
         tray: Option<TrayQuad<'_>>,
-    ) -> (Option<OffscreenTexHandle>, u32, u32) {
+    ) -> (u32, u32) {
         let mut dims;
         let mut pass = 1;
         loop {
@@ -10165,7 +6755,7 @@ impl GpuRenderer {
                     "armed readback: tray bake failed ({e}); frame has no settings card"
                 ));
             }
-            return (None, w, h);
+            return (w, h);
         }
         #[cfg(gl_arm)]
         if self.last_frame_arm_gl {
@@ -10194,82 +6784,38 @@ impl GpuRenderer {
                     "armed readback: tray bake failed ({e}); frame has no settings card"
                 ));
             }
-            return (None, w, h);
+            return (w, h);
         }
-        if self.enable_bloom && fx_gpu::bloom_source_live(input) {
-            #[cfg(target_os = "macos")]
-            let armed = self.last_frame_arm_metal;
-            #[cfg(not(target_os = "macos"))]
-            let armed = false;
-            if armed {
-                #[cfg(target_os = "macos")]
-                if let Err(e) = self.metal_composite_bloom_in_place(win, input) {
-                    metal_arm_note(&format!(
-                        "armed readback: in-place bloom failed ({e}); frame has no halo"
-                    ));
-                }
-            } else {
-                #[cfg(wgpu_arm)]
-                self.composite_bloom_in_place(win, input);
-            }
-        }
-        if self.shimmer_live(input) {
-            #[cfg(target_os = "macos")]
-            let armed = self.last_frame_arm_metal;
-            #[cfg(not(target_os = "macos"))]
-            let armed = false;
-            if armed {
-                #[cfg(target_os = "macos")]
-                if let Err(e) = self.metal_shimmer_in_place(win, input) {
-                    metal_arm_note(&format!(
-                        "armed readback: in-place shimmer failed ({e}); frame has no \
-                         refraction"
-                    ));
-                }
-            } else {
-                #[cfg(wgpu_arm)]
-                self.shimmer_offscreen_in_place(win, input);
-            }
-        }
-        self.shift_offscreen_band(win, input);
-        if let Some(t) = tray {
-            #[cfg(not(any(wgpu_arm, target_os = "macos")))]
-            let _ = t;
-            #[cfg(target_os = "macos")]
-            let armed = self.last_frame_arm_metal;
-            #[cfg(not(target_os = "macos"))]
-            let armed = false;
-            if armed {
-                #[cfg(target_os = "macos")]
-                if let Err(e) = self.metal_tray_into_offscreen(win, t) {
-                    metal_arm_note(&format!(
-                        "armed readback: tray bake failed ({e}); frame has no settings \
-                         card"
-                    ));
-                }
-            } else {
-                #[cfg(wgpu_arm)]
-                self.draw_tray_into_offscreen(win, t);
-            }
-        }
+        // An armed Metal frame: bloom, shimmer, the glide, then the tray card.
         #[cfg(target_os = "macos")]
         if self.last_frame_arm_metal {
-            return (None, w, h);
+            if self.enable_bloom
+                && fx_gpu::bloom_source_live(input)
+                && let Err(e) = self.metal_composite_bloom_in_place(win, input)
+            {
+                metal_arm_note(&format!(
+                    "armed readback: in-place bloom failed ({e}); frame has no halo"
+                ));
+            }
+            if self.shimmer_live(input)
+                && let Err(e) = self.metal_shimmer_in_place(win, input)
+            {
+                metal_arm_note(&format!(
+                    "armed readback: in-place shimmer failed ({e}); frame has no refraction"
+                ));
+            }
+            self.shift_offscreen_band(win, input);
+            if let Some(t) = tray
+                && let Err(e) = self.metal_tray_into_offscreen(win, t)
+            {
+                metal_arm_note(&format!(
+                    "armed readback: tray bake failed ({e}); frame has no settings card"
+                ));
+            }
         }
-        #[cfg(wgpu_arm)]
-        {
-            let tex = win
-                .offscreen
-                .as_ref()
-                .expect("encode_frame sets offscreen")
-                .tex
-                .clone();
-            (Some(tex), w, h)
-        }
-        #[cfg(not(wgpu_arm))]
-        {
-            (None, w, h)
-        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = tray;
+        (w, h)
     }
 
     #[cfg(target_os = "macos")]
@@ -10930,8 +7476,6 @@ impl GpuRenderer {
                     }
                     Ok(())
                 }
-                #[cfg(wgpu_arm)]
-                SubmittedFrame::Wgpu => unreachable!("a metal encoder commits a metal frame"),
             }
         })();
         match staged {
@@ -10943,99 +7487,15 @@ impl GpuRenderer {
         }
     }
 
-    #[cfg(all(target_os = "macos", wgpu_arm))]
-    fn metal_swapchain_config(
-        config: &wgpu::SurfaceConfiguration,
-    ) -> Result<crate::metal::swapchain::SwapchainConfig, String> {
-        let format = crate::device_layer::TexelFormat::from_wgpu(config.format)
-            .ok_or_else(|| {
-                format!(
-                    "present format {:?} is outside the map's closed set of six",
-                    config.format
-                )
-            })?
-            .metal();
-        Ok(crate::metal::swapchain::SwapchainConfig {
-            format,
-            width: config.width as usize,
-            height: config.height as usize,
-            framebuffer_only: !config.usage.contains(wgpu::TextureUsages::COPY_SRC),
-            display_sync: config.present_mode != wgpu::PresentMode::Immediate,
-            maximum_drawables: 3,
-            opaque: !matches!(
-                config.alpha_mode,
-                wgpu::CompositeAlphaMode::PostMultiplied | wgpu::CompositeAlphaMode::PreMultiplied
-            ),
-        })
-    }
-
     /// Drop a window's Metal swapchain once the renderer is disarmed, so its stale layer is
-    /// unparented and the wgpu layer beneath shows.
+    /// unparented.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_disarm_sweep(
         &mut self,
         metal_surf: &mut Option<crate::metal::present::MetalWindowSurface>,
     ) {
         if !self.metal_armed && metal_surf.take().is_some() {
-            metal_arm_note("disarmed: dropped this window's armed swapchain; wgpu layer presents");
-        }
-    }
-
-    /// Test hook.
-    #[cfg(all(target_os = "macos", test, wgpu_arm))]
-    pub(crate) fn metal_attach_for_test(
-        &mut self,
-        parent: Option<&crate::metal::ffi::Obj>,
-        w: u32,
-        h: u32,
-    ) -> Option<crate::metal::present::MetalWindowSurface> {
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: wgpu::TextureFormat::Bgra8Unorm,
-            width: w,
-            height: h,
-            present_mode: wgpu::PresentMode::Immediate,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
-            view_formats: vec![],
-        };
-        self.metal_attach_surface(parent, &config)
-    }
-
-    #[cfg(all(target_os = "macos", wgpu_arm))]
-    fn metal_attach_surface(
-        &mut self,
-        parent: Option<&crate::metal::ffi::Obj>,
-        config: &wgpu::SurfaceConfiguration,
-    ) -> Option<crate::metal::present::MetalWindowSurface> {
-        let attached = (|| -> Result<crate::metal::present::MetalWindowSurface, String> {
-            let parent = parent.ok_or("no AppKit view layer to attach under")?;
-            if !self.metal_arm_ready() {
-                return Err(self.metal_start_error());
-            }
-            let want = Self::metal_swapchain_config(config)?;
-            let live = self
-                .metal_arm
-                .as_mut()
-                .expect("metal_arm_ready above")
-                .live_mut();
-            let latch = Arc::clone(live.session.latch());
-            crate::metal::present::MetalWindowSurface::attached(
-                live.mint.device(),
-                parent,
-                want,
-                latch,
-            )
-        })();
-        match attached {
-            Ok(ms) => Some(ms),
-            Err(e) => {
-                metal_arm_note(&format!(
-                    "armed attach failed ({e}); disarmed, continuing on wgpu"
-                ));
-                self.metal_armed = false;
-                None
-            }
+            metal_arm_note("disarmed: dropped this window's armed swapchain");
         }
     }
 
@@ -11112,30 +7572,6 @@ impl GpuRenderer {
             metal_arm_note("armed present refused: window has no armed swapchain (re-attach it)");
             return Err(SurfacePresentFailure::Validation);
         }
-        #[cfg(wgpu_arm)]
-        let (translucent, premult, want) = {
-            let want_alpha = self.surface_alpha_mode(surf.post_mult, surf.pre_mult);
-            let want_usage = Self::swapchain_usage_for(
-                surf.copyable,
-                win.wants_copy_src(aterm_time::Instant::now()),
-            );
-            surf.config.alpha_mode = want_alpha;
-            surf.config.usage = want_usage;
-            let translucent = matches!(
-                want_alpha,
-                wgpu::CompositeAlphaMode::PostMultiplied | wgpu::CompositeAlphaMode::PreMultiplied
-            );
-            let premult = want_alpha == wgpu::CompositeAlphaMode::PreMultiplied;
-            let want = match Self::metal_swapchain_config(&surf.config) {
-                Ok(w) => w,
-                Err(e) => {
-                    metal_arm_note(&format!("armed present: config mapping failed ({e})"));
-                    return Err(SurfacePresentFailure::Validation);
-                }
-            };
-            (translucent, premult, want)
-        };
-        #[cfg(not(wgpu_arm))]
         let (translucent, premult, want) = self.metal_present_want(win, surf);
         {
             let Some(cell) = self.metal_arm.as_mut() else {
@@ -11182,20 +7618,12 @@ impl GpuRenderer {
         self.metal_open_gpu_frame();
 
         let (fw, fh) = self.encode_present_frame(win, input);
-        #[allow(
-            clippy::needless_bool_assign,
-            reason = "symmetry with the wgpu arm's bookkeeping"
-        )]
         if !self.last_frame_arm_metal {
-            metal_arm_note("armed present dropped: frame encode degraded to wgpu");
+            metal_arm_note("armed present dropped: the frame did not draw on Metal");
             return Err(SurfacePresentFailure::Validation);
         }
         win.resident_input_effects_transport_shift_y = effects_transport_shift_y;
         if tray.is_none() {
-            #[cfg(wgpu_arm)]
-            {
-                win.tray_overlay = None;
-            }
             win.metal_tray_card = None;
         }
 
@@ -11343,26 +7771,14 @@ impl GpuRenderer {
             .map_err(|()| "virtual present crop outside the resident frame")?;
         let w = self.clamp_fb_dim(destination.0.max(1));
         let h = self.clamp_fb_dim(destination.1.max(1));
-        #[cfg(wgpu_arm)]
-        if win
-            .virtual_target
-            .as_ref()
-            .is_none_or(|t| t.w != w || t.h != h)
-        {
-            win.virtual_target = Some(self.make_virtual_target(w, h));
-        }
         let work_started = aterm_time::Instant::now();
         self.metal_open_gpu_frame();
         let (fw, fh) = self.encode_present_frame(win, input);
         if !self.last_frame_arm_metal {
-            return Err("the frame encode degraded to wgpu mid-frame".to_owned());
+            return Err("the frame did not draw on Metal".to_owned());
         }
         win.resident_input_effects_transport_shift_y = effects_transport_shift_y;
         if tray.is_none() {
-            #[cfg(wgpu_arm)]
-            {
-                win.tray_overlay = None;
-            }
             win.metal_tray_card = None;
         }
         let needs_dest = win
@@ -11406,7 +7822,7 @@ impl GpuRenderer {
             VIRTUAL_PRESENT_TEXEL,
             false,
             false,
-            cfg!(not(wgpu_arm)),
+            true,
             &target,
         )?;
         self.metal_seal_gpu_frame();
@@ -11417,92 +7833,6 @@ impl GpuRenderer {
         win.last_present_encode_ns = elapsed_ns(work_started).saturating_sub(encode_parked_ns);
         if submitted.wait_outcome() != crate::metal::loss::CbOutcome::Completed {
             return Err("Submit B did not complete".to_owned());
-        }
-        #[cfg(wgpu_arm)]
-        let row = (w as usize) * 4;
-        #[cfg(wgpu_arm)]
-        let bgra = {
-            let live = self
-                .metal_arm
-                .as_mut()
-                .ok_or("the arm is not live")?
-                .live_mut();
-            let rb = live
-                .layer()
-                .try_create_readback_buffer(
-                    "aterm-gpu metal virtual present readback",
-                    (row * h as usize) as u64,
-                )?
-                .into_metal()
-                .into_obj();
-            let mut cb = live.session.begin()?;
-            cb.copy_texture_to_buffer(&target, w as usize, h as usize, &rb, row)?;
-            if cb.commit().wait_outcome() != crate::metal::loss::CbOutcome::Completed {
-                return Err("the virtual-present readback copy did not complete".to_owned());
-            }
-            // SAFETY: shared storage sized `row * h` whose writing command buffer has completed.
-            unsafe { mtl::buffer_bytes(&rb, row * h as usize) }
-        };
-        #[cfg(wgpu_arm)]
-        let tex = win
-            .virtual_target
-            .as_ref()
-            .expect("ensured above")
-            .tex
-            .clone();
-        #[cfg(wgpu_arm)]
-        {
-            self.ctx.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &bgra,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row as u32),
-                    rows_per_image: Some(h),
-                },
-                wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-            );
-            let capture_color_space = win.capture_color_space();
-            let capture_sdr_white_scale = win.sdr_white_scale();
-            let copy_armed = tex.usage().contains(wgpu::TextureUsages::COPY_SRC);
-            let mut enc = self
-                .ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("aterm armed virtual present tap copy"),
-                });
-            let mut staged = Vec::new();
-            if let Some(tap) = win.video.as_mut().filter(|_| copy_armed) {
-                staged.extend(tap.enqueue_copy(
-                    &mut enc,
-                    &tex,
-                    capture_color_space,
-                    capture_sdr_white_scale,
-                ));
-            }
-            if let Some(tap) = win.presented_snapshot.as_mut().filter(|_| copy_armed) {
-                staged.extend(tap.enqueue_copy(
-                    &mut enc,
-                    &tex,
-                    capture_color_space,
-                    capture_sdr_white_scale,
-                ));
-            }
-            crate::device_layer::submit_host_readable(
-                &self.ctx.device,
-                &self.ctx.queue,
-                enc.finish(),
-                staged.as_slice(),
-            );
         }
         win.virtual_presented_input_epoch = win.resident_input_epoch;
         if let Some(cell) = self.metal_arm.as_mut() {
@@ -12176,7 +8506,7 @@ impl GpuRenderer {
         }
         let (fw, fh) = self.encode_present_frame(win, input);
         if !self.last_frame_arm_metal {
-            return Err("the armed encode degraded to wgpu".to_owned());
+            return Err("the frame did not draw on Metal".to_owned());
         }
         let (device, latch) = {
             let live = self
@@ -12259,100 +8589,24 @@ impl GpuRenderer {
         built
     }
 
-    /// Test hook.
-    #[cfg(all(target_os = "macos", test, wgpu_arm))]
-    pub(crate) fn wgpu_present_bytes_for_test(
-        &mut self,
-        win: &mut WindowGpu,
-        input: &RenderInput,
-        (dw, dh): (u32, u32),
-        translucent: bool,
-    ) -> Vec<u8> {
-        let tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("w6a translucent-differential destination"),
-            size: wgpu::Extent3d {
-                width: dw,
-                height: dh,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bgra8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        win.present_prev = None;
-        self.present_to_view(
-            win,
-            input,
-            false,
-            None,
-            None,
-            None,
-            0,
-            PresentDest {
-                view: &view,
-                tex: &tex,
-                w: dw,
-                h: dh,
-                format: wgpu::TextureFormat::Bgra8Unorm,
-                translucent,
-                premult: false,
-            },
-        );
-        let bgra = self.texture_bytes_tight_for_test(&tex, dw, dh, 4);
-        let mut rgba = vec![0u8; bgra.len()];
-        for (dst, src) in rgba
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(bgra.as_chunks::<4>().0)
-        {
-            *dst = [src[2], src[1], src[0], src[3]];
-        }
-        rgba
-    }
-
+    #[cfg(target_os = "macos")]
     fn shift_offscreen_band(&mut self, win: &mut WindowGpu, input: &RenderInput) {
         let frac = i64::from(input.scroll_frac_px);
         if frac == 0 {
             return;
         }
-        #[cfg(not(any(wgpu_arm, target_os = "macos")))]
-        let _ = win;
-        #[cfg(target_os = "macos")]
-        if self.last_frame_arm_metal {
-            let Some(h) = win.metal_offscreen.as_ref().map(|o| o.h) else {
-                return;
-            };
-            let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
-                self.cpu.grid_top(),
-                self.cell_size().1,
-                input.grid_top_row,
-                input.grid_bot_row,
-                h as usize,
-            );
-            if self.metal_shift_offscreen_band_px(win, y0, y1, frac) {
-                self.apron_into_offscreen_metal(win, input);
-            }
-        }
-        #[cfg(wgpu_arm)]
-        {
-            let Some(off) = win.offscreen.as_ref() else {
-                return;
-            };
-            let h = off.h;
-            let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
-                self.cpu.grid_top(),
-                self.cell_size().1,
-                input.grid_top_row,
-                input.grid_bot_row,
-                h as usize,
-            );
-            self.shift_offscreen_band_px(win, y0, y1, frac);
-            self.apron_into_offscreen_wgpu(win, input);
+        let Some(h) = win.metal_offscreen.as_ref().map(|o| o.h) else {
+            return;
+        };
+        let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
+            self.cpu.grid_top(),
+            self.cell_size().1,
+            input.grid_top_row,
+            input.grid_bot_row,
+            h as usize,
+        );
+        if self.metal_shift_offscreen_band_px(win, y0, y1, frac) {
+            self.apron_into_offscreen_metal(win, input);
         }
     }
 
@@ -12363,8 +8617,6 @@ impl GpuRenderer {
         // the immediate context runs the copies before the encode's Load.
         #[cfg(d3d11_arm)]
         let on_first_party = self.last_frame_arm_d3d11;
-        #[cfg(all(not(any(gl_arm, d3d11_arm)), wgpu_arm))]
-        let on_first_party = false;
         #[cfg(d3d11_arm)]
         if on_first_party && let Some(h) = win.d3d11_offscreen.as_ref().map(|o| o.h as usize) {
             let cell_h = self.cell_size().1;
@@ -12410,88 +8662,6 @@ impl GpuRenderer {
                 note_offscreen_written(win, None, dims);
             }
         }
-        #[cfg(wgpu_arm)]
-        if !on_first_party {
-            let Some(h) = win.offscreen.as_ref().map(|o| o.h as usize) else {
-                return;
-            };
-            let cell_h = self.cell_size().1;
-            let grid_top = self.cpu.grid_top();
-            let y0 = grid_top.min(h);
-            let y1 = grid_top.saturating_add(rows.saturating_mul(cell_h)).min(h);
-            self.shift_offscreen_band_px(win, y0, y1, i64::from(delta_rows) * cell_h as i64);
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn shift_offscreen_band_px(&mut self, win: &mut WindowGpu, y0: usize, y1: usize, delta: i64) {
-        let Some(off) = win.offscreen.as_ref() else {
-            return;
-        };
-        let (w, h) = (off.w, off.h);
-        let Some(shift) = band_shift_ops(y0, y1, delta) else {
-            return;
-        };
-        let off_tex = off.tex.clone();
-        note_offscreen_written(win, None, (w, h));
-        let scratch_ok = win
-            .shift_scratch
-            .as_ref()
-            .is_some_and(|t| t.width() == w && t.height() == h);
-        if !scratch_ok {
-            let format = crate::device_layer::TexelFormat::from_wgpu(self.ctx.offscreen_format())
-                .expect("the offscreen format is inside the map's closed set of six");
-            win.shift_scratch = Some(self.ctx.device_layer().create_texture_2d(
-                "aterm-gpu m1b scroll shift scratch",
-                format,
-                w,
-                h,
-                crate::device_layer::TexUsage::COPY_STAGING,
-                None,
-            ));
-        }
-        let scratch = win.shift_scratch.as_ref().expect("just ensured");
-        let mut enc = crate::device_layer::FrameEncoder::wgpu(
-            &self.ctx.device,
-            &self.ctx.queue,
-            None,
-            "aterm-gpu m1b scroll shift",
-        );
-        let off_copy = crate::device_layer::FrameCopyTexture::Wgpu(&off_tex);
-        let scratch_copy = crate::device_layer::FrameCopyTexture::Wgpu(scratch.wgpu());
-        enc.copy_texture_rect(
-            off_copy,
-            (0, shift.src_y),
-            scratch_copy,
-            (0, 0),
-            w,
-            shift.moved,
-        )
-        .expect("the wgpu copy arm has no fallible verb");
-        enc.copy_texture_rect(
-            scratch_copy,
-            (0, 0),
-            off_copy,
-            (0, shift.dst_y),
-            w,
-            shift.moved,
-        )
-        .expect("the wgpu copy arm has no fallible verb");
-        match enc.submit() {
-            crate::device_layer::SubmittedFrame::Wgpu => {}
-            #[cfg(target_os = "macos")]
-            crate::device_layer::SubmittedFrame::Metal(_) => {
-                unreachable!("the production scroll shift constructs the Wgpu arm only")
-            }
-            #[cfg(gl_arm)]
-            crate::device_layer::SubmittedFrame::Gl(_) => {
-                unreachable!("the production scroll shift constructs the Wgpu arm only")
-            }
-            #[cfg(d3d11_arm)]
-            crate::device_layer::SubmittedFrame::D3d11(_) => {
-                unreachable!("the production scroll shift constructs the Wgpu arm only")
-            }
-        }
     }
 
     /// Create an on-screen presentation surface for `target` at the given pixel size, on the
@@ -12514,7 +8684,7 @@ impl GpuRenderer {
             let was = std::mem::replace(&mut self.metal_on_screen, true);
             self.present_pass_switched(was, true);
         }
-        #[cfg(all(not(wgpu_arm), target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         {
             let format = metal_attach_format(self.hdr_glow, &target);
             let _ = (target, &metal_parent); // `target`'s layer was resolved above.
@@ -12525,43 +8695,15 @@ impl GpuRenderer {
                 .ok_or("no AppKit view layer to attach the Metal swapchain under")?;
             self.attach_metal_window_surface(parent, format, width, height)
         }
-        #[cfg(all(not(wgpu_arm), gl_arm))]
+        #[cfg(gl_arm)]
         {
             self.gl_create_window_surface(target, width, height, None)
         }
         // The shipped Windows build: the D3D11 arm's flip-model swap chain, on
         // the window or on a DirectComposition visual.
-        #[cfg(all(not(wgpu_arm), d3d11_arm))]
+        #[cfg(d3d11_arm)]
         {
             self.d3d11_create_window_surface(target, width, height)
-        }
-        #[cfg(wgpu_arm)]
-        {
-            #[cfg(gl_arm)]
-            if self.gl_armed {
-                gl_arm::gl_arm_note(
-                    "a window attached on wgpu (the oracle build); GL disarmed for this renderer",
-                );
-                self.gl_armed = false;
-            }
-            // So does Windows' (`--features wgpu-oracle`).
-            #[cfg(d3d11_arm)]
-            if self.d3d11_armed {
-                d3d11_arm::d3d11_arm_note(
-                    "a window attached on wgpu (the oracle build); D3D11 disarmed for this renderer",
-                );
-                self.d3d11_armed = false;
-            }
-            let surf = self.create_window_surface_wgpu(target, width, height)?;
-            #[cfg(target_os = "macos")]
-            let surf = {
-                let mut surf = surf;
-                if self.metal_armed {
-                    surf.metal = self.metal_attach_surface(metal_parent.as_ref(), &surf.config);
-                }
-                surf
-            };
-            Ok(surf)
         }
     }
 
@@ -12576,156 +8718,15 @@ impl GpuRenderer {
         height: u32,
         sink: Box<dyn FrameSink>,
     ) -> Result<GpuSurface, String> {
-        #[cfg(all(not(wgpu_arm), gl_arm))]
+        #[cfg(gl_arm)]
         {
             self.gl_create_window_surface(target, width, height, Some(sink))
         }
-        #[cfg(not(all(not(wgpu_arm), gl_arm)))]
+        #[cfg(not(gl_arm))]
         {
             drop(sink);
             self.create_window_surface(target, width, height)
         }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn create_window_surface_wgpu<W: WindowTarget>(
-        &mut self,
-        target: W,
-        width: u32,
-        height: u32,
-    ) -> Result<GpuSurface, String> {
-        #[cfg(target_os = "macos")]
-        let target = AppKitSurfaceTarget(target);
-        #[cfg(any(target_os = "linux", windows))]
-        let target = NativeSurfaceTarget(target);
-        let surface = self
-            .ctx
-            .instance
-            .create_surface(target)
-            .map_err(|e| format!("create_surface failed: {e}"))?;
-        if !self.ctx.adapter.is_surface_supported(&surface) {
-            return Err(format!(
-                "{} ({}) cannot present to this window",
-                self.ctx.adapter_name, self.ctx.backend
-            ));
-        }
-        if self.hdr_glow {
-            let caps = surface.get_capabilities(&self.ctx.adapter);
-            let supports_f16 = caps.formats.contains(&wgpu::TextureFormat::Rgba16Float);
-            if crate::format_plan::hdr_swapchain_wants_f16(self.hdr_glow, supports_f16) {
-                let sdr_format = Self::pick_surface_format(&caps)?;
-                let format = wgpu::TextureFormat::Rgba16Float;
-                self.ensure_blit_pipeline(format);
-                let post_mult = Self::caps_support_post_multiplied(&caps);
-                let pre_mult = Self::caps_support_pre_multiplied(&caps);
-                let (usage, copyable) = Self::surface_usage(&caps);
-                let config = wgpu::SurfaceConfiguration {
-                    usage,
-                    format,
-                    width: self.clamp_fb_dim(width),
-                    height: self.clamp_fb_dim(height),
-                    present_mode: Self::pick_present_mode(&caps),
-                    alpha_mode: self.surface_alpha_mode(post_mult, pre_mult),
-                    view_formats: vec![],
-                    desired_maximum_frame_latency: self.desired_frame_latency(),
-                };
-                self.configure_first_attach(&surface, &config)?;
-                if Self::tag_swapchain_scrgb(&surface) {
-                    if crate::verbose() {
-                        crate::stderr_line!(
-                            "aterm-gpu: EDR swapchain (Rgba16Float, scRGB), present mode = {:?}",
-                            config.present_mode
-                        );
-                    }
-                    return Ok(GpuSurface {
-                        acquire_id: next_surface_acquire_id(),
-                        surface: live_surface::LiveSurface::attached(surface),
-                        config,
-                        sdr_format,
-                        supports_f16: true,
-                        #[cfg(wgpu_arm)]
-                        last_hdr_probe: Some(aterm_time::Instant::now()),
-                        post_mult,
-                        #[cfg(wgpu_arm)]
-                        pre_mult,
-                        copyable,
-                        #[cfg(target_os = "macos")]
-                        metal: None,
-                    });
-                }
-                if crate::verbose() {
-                    crate::stderr_line!(
-                        "aterm-gpu: f16 requested but scRGB unsupported (Windows HDR off?) — SDR swapchain"
-                    );
-                }
-            }
-        }
-        let caps = surface.get_capabilities(&self.ctx.adapter);
-        let format = match self.cached_surface_format {
-            Some(f) => {
-                debug_assert!(
-                    caps.formats.contains(&f),
-                    "cached surface format {f:?} is not supported by this surface \
-                     (supported: {:?}); the per-surface-stable assumption broke — \
-                     clear `cached_surface_format` to re-query per attach",
-                    caps.formats
-                );
-                f
-            }
-            None => {
-                let f = Self::pick_surface_format(&caps)?;
-                self.cached_surface_format = Some(f);
-                f
-            }
-        };
-        self.ensure_blit_pipeline(format);
-        let post_mult = Self::caps_support_post_multiplied(&caps);
-        let pre_mult = Self::caps_support_pre_multiplied(&caps);
-        let (usage, copyable) = Self::surface_usage(&caps);
-        let config = wgpu::SurfaceConfiguration {
-            usage,
-            format,
-            width: self.clamp_fb_dim(width),
-            height: self.clamp_fb_dim(height),
-            present_mode: Self::pick_present_mode(&caps),
-            alpha_mode: self.surface_alpha_mode(post_mult, pre_mult),
-            view_formats: vec![],
-            desired_maximum_frame_latency: self.desired_frame_latency(),
-        };
-        self.configure_first_attach(&surface, &config)?;
-        if crate::verbose() {
-            crate::stderr_line!("aterm-gpu: present mode = {:?}", config.present_mode);
-        }
-        Ok(GpuSurface {
-            acquire_id: next_surface_acquire_id(),
-            surface: live_surface::LiveSurface::attached(surface),
-            config,
-            sdr_format: format,
-            supports_f16: caps.formats.contains(&wgpu::TextureFormat::Rgba16Float),
-            #[cfg(wgpu_arm)]
-            last_hdr_probe: Some(aterm_time::Instant::now()),
-            post_mult,
-            #[cfg(wgpu_arm)]
-            pre_mult,
-            copyable,
-            #[cfg(target_os = "macos")]
-            metal: None,
-        })
-    }
-
-    #[cfg(wgpu_arm)]
-    fn configure_first_attach(
-        &self,
-        surface: &wgpu::Surface<'static>,
-        config: &wgpu::SurfaceConfiguration,
-    ) -> Result<(), String> {
-        configure_scoped(&self.ctx.device, surface, config).map_err(|err| {
-            if self.ctx.visual_swapchain {
-                format!("DirectComposition visual swapchain configure failed: {err}")
-            } else {
-                format!("window surface configure failed: {err}")
-            }
-        })
     }
 
     /// Configure the canvas surface [`crate::GpuContext::for_canvas`] made, at `width` x `height`
@@ -12757,142 +8758,11 @@ impl GpuRenderer {
         })
     }
 
-    #[cfg(wgpu_arm)]
-    #[inline]
-    const fn surface_usage(caps: &wgpu::SurfaceCapabilities) -> (wgpu::TextureUsages, bool) {
-        let copyable = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
-        (wgpu::TextureUsages::RENDER_ATTACHMENT, copyable)
-    }
-
     #[must_use]
-    #[cfg(any(wgpu_arm, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[inline]
     const fn tap_wants_copy_src(recording: bool, snapshot: bool, held: bool) -> bool {
         recording || snapshot || held
-    }
-
-    #[cfg(wgpu_arm)]
-    #[inline]
-    fn swapchain_usage_for(copyable: bool, recording: bool) -> wgpu::TextureUsages {
-        if copyable && recording {
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
-        } else {
-            wgpu::TextureUsages::RENDER_ATTACHMENT
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn pick_present_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
-        // Mailbox where it exists: non-blocking, newest-frame-wins, the lowest-latency mode;
-        // input latency outranks animation smoothness.
-        if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            return wgpu::PresentMode::Mailbox;
-        }
-        let forced = aterm_types::dev_seam!("ATERM_GPU_PRESENT_MODE")
-            .map(|v| v.to_string_lossy().into_owned());
-        match forced.as_deref().map(str::trim) {
-            Some("fifo") => {
-                crate::stderr_line!(
-                    "aterm-gpu: $ATERM_GPU_PRESENT_MODE=fifo — forcing Fifo present. \
-                     This RE-ARMS the unbounded nextDrawable() park the default \
-                     avoids; input latency regressions of ~84ms have been measured \
-                     in this mode. Unset it to restore the shipped default."
-                );
-                return wgpu::PresentMode::Fifo;
-            }
-            Some("immediate") if caps.present_modes.contains(&wgpu::PresentMode::Immediate) => {
-                crate::stderr_line!(
-                    "aterm-gpu: $ATERM_GPU_PRESENT_MODE=immediate — forcing Immediate \
-                     present (the shipped default on macOS; an override elsewhere)."
-                );
-                return wgpu::PresentMode::Immediate;
-            }
-            Some(other) => {
-                crate::stderr_line!(
-                    "aterm-gpu: unknown ATERM_GPU_PRESENT_MODE {other:?} \
-                     (want fifo|immediate); using the default"
-                );
-            }
-            None => {}
-        }
-        if cfg!(target_os = "macos") && caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
-            wgpu::PresentMode::Immediate
-        } else {
-            wgpu::PresentMode::Fifo
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn desired_frame_latency(&self) -> u32 {
-        Self::default_frame_latency(
-            cfg!(target_os = "macos"),
-            self.ctx.adapter.get_info().backend == wgpu::Backend::Vulkan,
-        )
-    }
-
-    /// The frame latency.
-    #[cfg(wgpu_arm)]
-    #[inline]
-    pub(crate) const fn default_frame_latency(is_metal: bool, is_vulkan: bool) -> u32 {
-        if is_metal || is_vulkan { 2 } else { 1 }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn pick_surface_format(
-        caps: &wgpu::SurfaceCapabilities,
-    ) -> Result<wgpu::TextureFormat, String> {
-        use wgpu::TextureFormat::{Bgra8Unorm, Rgba8Unorm};
-        if caps.formats.is_empty() {
-            return Err("surface offers no formats: the adapter cannot present to it".to_string());
-        }
-        if caps.formats.contains(&Bgra8Unorm) {
-            return Ok(Bgra8Unorm);
-        }
-        if caps.formats.contains(&Rgba8Unorm) {
-            return Ok(Rgba8Unorm);
-        }
-        caps.formats
-            .iter()
-            .copied()
-            .find(|f| !f.is_srgb() && *f != wgpu::TextureFormat::Rgba16Float)
-            .ok_or_else(|| "surface offers no non-sRGB format".to_string())
-    }
-
-    #[cfg(wgpu_arm)]
-    #[inline]
-    fn caps_support_post_multiplied(caps: &wgpu::SurfaceCapabilities) -> bool {
-        caps.alpha_modes
-            .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
-    }
-
-    #[cfg(wgpu_arm)]
-    #[inline]
-    fn caps_support_pre_multiplied(caps: &wgpu::SurfaceCapabilities) -> bool {
-        caps.alpha_modes
-            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
-    }
-
-    #[cfg(wgpu_arm)]
-    #[inline]
-    const fn present_alpha_mode(opacity: f32, post_mult: bool) -> wgpu::CompositeAlphaMode {
-        if post_mult && aterm_render::vibrancy::is_translucent(opacity) {
-            wgpu::CompositeAlphaMode::PostMultiplied
-        } else {
-            wgpu::CompositeAlphaMode::Opaque
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    #[inline]
-    fn surface_alpha_mode(&self, post_mult: bool, pre_mult: bool) -> wgpu::CompositeAlphaMode {
-        if self.ctx.visual_swapchain {
-            return if self.backdrop_margins_active() && pre_mult {
-                wgpu::CompositeAlphaMode::PreMultiplied
-            } else {
-                wgpu::CompositeAlphaMode::Opaque
-            };
-        }
-        Self::present_alpha_mode(self.cpu.background_opacity(), post_mult)
     }
 
     const BACKDROP_MARGIN_ALPHA: f32 = 0.45;
@@ -13013,7 +8883,6 @@ impl GpuRenderer {
     ) {
         let w = self.clamp_fb_dim(width);
         let h = self.clamp_fb_dim(height);
-        #[cfg(not(wgpu_arm))]
         {
             let _ = win;
             if surf.neutral.width == w && surf.neutral.height == h {
@@ -13027,19 +8896,9 @@ impl GpuRenderer {
                 gs.resize(w, h);
             }
         }
-        #[cfg(wgpu_arm)]
-        {
-            if surf.config.width == w && surf.config.height == h {
-                return;
-            }
-            surf.discard_pending_acquire();
-            surf.config.width = w;
-            surf.config.height = h;
-            self.configure_surface_retagging_scrgb(win, surf, "resize");
-        }
     }
 
-    #[cfg(all(not(wgpu_arm), target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     fn metal_present_want(
         &self,
         win: &WindowGpu,
@@ -13062,7 +8921,7 @@ impl GpuRenderer {
         )
     }
 
-    #[cfg(all(not(wgpu_arm), target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     fn attach_metal_window_surface(
         &mut self,
         parent: &crate::metal::ffi::Obj,
@@ -13116,33 +8975,28 @@ impl GpuRenderer {
         surf: &mut GpuSurface,
         target: &W,
     ) -> bool {
-        #[cfg(all(not(wgpu_arm), gl_arm))]
+        #[cfg(gl_arm)]
         {
             let _ = (win, target);
             debug_assert!(!surf.supports_f16, "a GL surface offers no f16 format");
             surf.supports_f16 && surf.is_hdr()
         }
-        // Windows follows HDR at the present's probe (`d3d11_window`), as the
-        // wgpu arm did; there is no screen to re-read here.
-        #[cfg(all(not(wgpu_arm), d3d11_arm))]
+        // Windows follows HDR at the present's probe (`d3d11_window`); there
+        // is no screen to re-read here.
+        #[cfg(d3d11_arm)]
         {
             let _ = (win, surf, target);
             false
         }
-        #[cfg(all(not(wgpu_arm), target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         {
             self.upgrade_surface_on_screen(win, surf, || {
                 crate::metal::present::screen_edr_potential_of(target)
             })
         }
-        #[cfg(wgpu_arm)]
-        {
-            let _ = (win, surf, target);
-            false
-        }
     }
 
-    #[cfg(all(not(wgpu_arm), target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     fn upgrade_surface_on_screen(
         &mut self,
         win: &mut WindowGpu,
@@ -13189,208 +9043,6 @@ impl GpuRenderer {
         }
         win.apply_hdr_surface_upgrade();
         true
-    }
-
-    #[cfg(wgpu_arm)]
-    fn configure_surface_retagging_scrgb(
-        &mut self,
-        win: &mut WindowGpu,
-        surf: &mut GpuSurface,
-        reason: &'static str,
-    ) {
-        let was_hdr = surf.is_hdr();
-        let scrgb_retagged =
-            match surf
-                .surface
-                .configure_retagging(&self.ctx.device, &surf.config, was_hdr)
-            {
-                Ok(tagged) => tagged,
-                Err(err) => {
-                    self.ctx
-                        .latch_surface_loss(format!("the {reason} configure was rejected: {err}"));
-                    return;
-                }
-            };
-        self.finish_surface_color_space_recovery(
-            win,
-            surf,
-            was_hdr,
-            scrgb_retagged,
-            reason,
-            aterm_time::Instant::now(),
-        );
-    }
-
-    #[cfg(wgpu_arm)]
-    fn finish_surface_color_space_recovery(
-        &mut self,
-        win: &mut WindowGpu,
-        surf: &mut GpuSurface,
-        was_hdr: bool,
-        scrgb_retagged: bool,
-        reason: &'static str,
-        validated_at: aterm_time::Instant,
-    ) {
-        let plan = crate::format_plan::hdr_reconfigure_plan(was_hdr, scrgb_retagged);
-        if plan == crate::format_plan::HdrReconfigurePlan::FallbackToSdr {
-            debug_assert_ne!(
-                surf.sdr_format,
-                wgpu::TextureFormat::Rgba16Float,
-                "the retained fallback must be an SDR format"
-            );
-            self.ensure_blit_pipeline(surf.sdr_format);
-            surf.config.format = surf.sdr_format;
-            if let Err(err) =
-                surf.surface
-                    .configure_sdr_escape(&self.ctx.device, &surf.config, plan)
-            {
-                self.ctx.latch_surface_loss(format!(
-                    "the SDR fallback configure after {reason} was rejected: {err}"
-                ));
-                return;
-            }
-            self.cached_surface_format = Some(surf.sdr_format);
-            if crate::verbose() {
-                crate::stderr_line!(
-                    "aterm-gpu: scRGB re-tag failed after {reason}; fell back to {:?}",
-                    surf.sdr_format
-                );
-            }
-        }
-        win.apply_hdr_reconfigure_plan(plan);
-        surf.last_hdr_probe = Some(validated_at);
-    }
-
-    #[cfg(wgpu_arm)]
-    fn reconcile_live_hdr_state_if_due(&mut self, win: &mut WindowGpu, surf: &mut GpuSurface) {
-        if !cfg!(windows) {
-            return;
-        }
-        if !surf.is_hdr() && !(self.hdr_glow && surf.supports_f16) {
-            return;
-        }
-        let now = aterm_time::Instant::now();
-        if !hdr_color_space_probe_due(surf.last_hdr_probe, now) {
-            return;
-        }
-        if surf.is_hdr() {
-            let scrgb_retagged = surf.surface.retag();
-            self.finish_surface_color_space_recovery(
-                win,
-                surf,
-                true,
-                scrgb_retagged,
-                "live HDR-state revalidation",
-                now,
-            );
-            return;
-        }
-
-        let output_hdr_enabled = surf.surface.output_hdr_enabled();
-        if !crate::format_plan::hdr_live_upgrade_wants_f16(
-            self.hdr_glow,
-            surf.supports_f16,
-            output_hdr_enabled,
-        ) {
-            surf.last_hdr_probe = Some(now);
-            return;
-        }
-        self.ensure_blit_pipeline(wgpu::TextureFormat::Rgba16Float);
-        surf.config.format = wgpu::TextureFormat::Rgba16Float;
-        self.configure_surface_retagging_scrgb(win, surf, "live HDR-state upgrade");
-        if surf.is_hdr() {
-            win.apply_hdr_surface_upgrade();
-        }
-    }
-
-    #[cfg(not(windows))]
-    #[cfg(wgpu_arm)]
-    const fn surface_output_hdr_enabled(_surface: &wgpu::Surface) -> bool {
-        false
-    }
-
-    #[cfg(windows)]
-    #[cfg(wgpu_arm)]
-    fn dx12_swap_chain(surface: &wgpu::Surface) -> Option<aterm_win32::com::Com> {
-        // SAFETY: the hal-surface guard borrows the live surface only for this scope and destroys
-        // nothing through it. `swap_chain()` returns wgpu-hal's `windows` `IDXGISwapChain3` by
-        // value, an `AddRef`'d clone: one non-null interface pointer, `#[repr(transparent)]`,
-        // whose drop does nothing but release it, which `Com` takes over and releases once
-        // instead. The surface keeps its own reference.
-        unsafe {
-            let hal_surf = surface.as_hal::<wgpu::hal::api::Dx12>()?;
-            Some(aterm_win32::com::Com::from_interface(
-                hal_surf.swap_chain()?,
-            ))
-        }
-    }
-
-    #[cfg(windows)]
-    #[cfg(wgpu_arm)]
-    fn surface_output_hdr_enabled(surface: &wgpu::Surface) -> bool {
-        use aterm_win32::com::Com;
-        use aterm_win32::dxgi::{
-            DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_OUTPUT_DESC1, IDXGIOutput6_Vtbl,
-            IDXGISwapChain3_Vtbl, IID_IDXGIOutput6,
-        };
-
-        let Some(sc) = Self::dx12_swap_chain(surface) else {
-            return false;
-        };
-        let mut out = core::ptr::null_mut();
-        // SAFETY: `sc` is a live `IDXGISwapChain3` and `GetContainingOutput` writes one owned
-        // `IDXGIOutput` on success.
-        let hr = unsafe {
-            (sc.vtable::<IDXGISwapChain3_Vtbl>().GetContainingOutput)(sc.as_raw(), &mut out)
-        };
-        // SAFETY: as above.
-        let Some(output) = (hr >= 0).then(|| unsafe { Com::from_raw(out) }).flatten() else {
-            return false;
-        };
-        let Ok(output) = output.query(&IID_IDXGIOutput6) else {
-            return false;
-        };
-        let mut desc = DXGI_OUTPUT_DESC1::default();
-        // SAFETY: `output` is an IDXGIOutput6; GetDesc1 fills `desc`.
-        let hr =
-            unsafe { (output.vtable::<IDXGIOutput6_Vtbl>().GetDesc1)(output.as_raw(), &mut desc) };
-        hr >= 0 && desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-    }
-
-    #[cfg(target_os = "macos")]
-    #[cfg(wgpu_arm)]
-    const fn tag_swapchain_scrgb(_surface: &wgpu::Surface) -> bool {
-        true
-    }
-
-    #[cfg(all(not(target_os = "macos"), not(windows)))]
-    #[cfg(wgpu_arm)]
-    fn tag_swapchain_scrgb(_surface: &wgpu::Surface) -> bool {
-        false
-    }
-
-    #[cfg(windows)]
-    #[cfg(wgpu_arm)]
-    fn tag_swapchain_scrgb(surface: &wgpu::Surface) -> bool {
-        use aterm_win32::dxgi::{
-            DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
-            DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, IDXGISwapChain3_Vtbl,
-        };
-        if !Self::surface_output_hdr_enabled(surface) {
-            return false;
-        }
-        let Some(sc) = Self::dx12_swap_chain(surface) else {
-            return false;
-        };
-        // SAFETY: `sc` is an IDXGISwapChain3, held for this scope.
-        let vt = unsafe { sc.vtable::<IDXGISwapChain3_Vtbl>() };
-        let cs = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
-        let mut flags = 0u32;
-        // SAFETY: result-checked calls on the live swap chain; `flags` is written only on success.
-        let supported = unsafe { (vt.CheckColorSpaceSupport)(sc.as_raw(), cs, &mut flags) } >= 0
-            && flags & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT as u32 != 0;
-        // SAFETY: as above.
-        supported && unsafe { (vt.SetColorSpace1)(sc.as_raw(), cs) } >= 0
     }
 
     /// Render the frame offscreen and present it by blitting that texture into `surf`'s swapchain.
@@ -13470,7 +9122,7 @@ impl GpuRenderer {
             );
         }
         // The D3D11 arm's window present (the shipped Windows build).
-        #[cfg(all(d3d11_arm, not(wgpu_arm)))]
+        #[cfg(d3d11_arm)]
         if self.d3d11_armed {
             return self.d3d11_present_input_with_crop(
                 win,
@@ -13483,7 +9135,7 @@ impl GpuRenderer {
                 effects_transport_shift_y,
             );
         }
-        #[cfg(all(gl_arm, not(wgpu_arm)))]
+        #[cfg(gl_arm)]
         if self.gl_armed {
             return self.gl_present_input_with_crop(
                 win,
@@ -13496,392 +9148,8 @@ impl GpuRenderer {
                 effects_transport_shift_y,
             );
         }
-        #[cfg(not(wgpu_arm))]
-        {
-            first_party_note("present refused: renderer disarmed, no wgpu arm in this build");
-            Err(SurfacePresentFailure::Validation)
-        }
-        #[cfg(wgpu_arm)]
-        {
-            #[cfg(windows)]
-            if win.parks_while_minimized() {
-                return Err(SurfacePresentFailure::Occluded);
-            }
-            let source_crop = self
-                .resident_present_crop(input, source_crop)
-                .map_err(|()| SurfacePresentFailure::Validation)?;
-            let want_alpha = self.surface_alpha_mode(surf.post_mult, surf.pre_mult);
-            let want_usage = Self::swapchain_usage_for(
-                surf.copyable,
-                win.wants_copy_src(aterm_time::Instant::now()),
-            );
-            if surf.config.alpha_mode != want_alpha || surf.config.usage != want_usage {
-                surf.config.alpha_mode = want_alpha;
-                surf.config.usage = want_usage;
-                self.configure_surface_retagging_scrgb(win, surf, "composite-alpha/usage change");
-            }
-            self.reconcile_live_hdr_state_if_due(win, surf);
-            if self.ctx.device_lost() {
-                return Err(SurfacePresentFailure::Validation);
-            }
-
-            use wgpu::CurrentSurfaceTexture as C;
-            let acquired = win.measure_surface_acquire(|| surf.surface.get_current_texture());
-            let frame = match acquired {
-                C::Success(f) | C::Suboptimal(f) => f,
-                C::Outdated | C::Lost => {
-                    self.configure_surface_retagging_scrgb(win, surf, "surface loss recovery");
-                    return Err(SurfacePresentFailure::Reconfigured);
-                }
-                C::Timeout => return Err(SurfacePresentFailure::Timeout),
-                C::Occluded => return Err(SurfacePresentFailure::Occluded),
-                C::Validation => return Err(SurfacePresentFailure::Validation),
-            };
-            let view = frame
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            let work_started = aterm_time::Instant::now();
-            self.present_to_view(
-                win,
-                input,
-                invert,
-                overlay,
-                tray,
-                source_crop,
-                effects_transport_shift_y,
-                PresentDest {
-                    view: &view,
-                    tex: &frame.texture,
-                    w: surf.config.width,
-                    h: surf.config.height,
-                    format: surf.config.format,
-                    translucent: matches!(
-                        want_alpha,
-                        wgpu::CompositeAlphaMode::PostMultiplied
-                            | wgpu::CompositeAlphaMode::PreMultiplied
-                    ),
-                    premult: want_alpha == wgpu::CompositeAlphaMode::PreMultiplied,
-                },
-            );
-            win.last_present_work_ns =
-                u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            win.last_present_encode_ns = win.last_present_work_ns;
-            frame.present();
-            Ok(())
-        }
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the common application-present/headless encoder needs the existing frame effects, source crop, and typed destination"
-    )]
-    #[cfg(wgpu_arm)]
-    fn present_to_view(
-        &mut self,
-        win: &mut WindowGpu,
-        input: &RenderInput,
-        invert: bool,
-        overlay: Option<DropOverlay>,
-        tray: Option<TrayQuad<'_>>,
-        source_crop: Option<PresentCrop>,
-        effects_transport_shift_y: i32,
-        dest: PresentDest<'_>,
-    ) {
-        let tray_over_copy = tray.is_some() || win.tray_overlay.is_some();
-        let frac = input.scroll_frac_px;
-        self.wgpu_gpu_time_begin();
-        let (fw, fh) = self.encode_present_frame(win, input);
-        win.resident_input_effects_transport_shift_y = effects_transport_shift_y;
-
-        let bloom_glow_present = self.enable_bloom && fx_gpu::bloom_source_live(input);
-        let shimmer_present = self.shimmer_live(input);
-        let fx_present = bloom_glow_present || shimmer_present;
-        let mut ungated_built: Option<u32> = None;
-
-        if tray.is_none() {
-            win.tray_overlay = None;
-            #[cfg(target_os = "macos")]
-            {
-                win.metal_tray_card = None;
-            }
-        }
-
-        let use_present_off = fx_present || tray_over_copy || frac != 0;
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu present (composite + blit)"),
-            });
-        if use_present_off && let Some(n) = self.compose_present_offscreen(win, input, &mut enc) {
-            ungated_built = Some(n);
-        }
-        if frac != 0 {
-            self.shift_present_copy_band(win, input, &mut enc);
-        }
-        if tray_over_copy && let Some(t) = tray {
-            self.draw_tray_over_present_copy(win, t, &mut enc);
-        }
-
-        let format = dest.format;
-        self.ensure_blit_pipeline(format);
-        let PresentUniforms {
-            live_bg,
-            want,
-            run_hdr_glow,
-            run_sdr_glow,
-            crown_scissor,
-            crown,
-        } = self.present_uniforms(
-            win,
-            input,
-            invert,
-            overlay,
-            source_crop,
-            (fw, fh),
-            (dest.w, dest.h),
-            format == wgpu::TextureFormat::Rgba16Float,
-            dest.translucent,
-            dest.premult,
-        );
-        if run_hdr_glow {
-            self.ensure_hdr_glow_pipeline();
-        }
-        if run_sdr_glow {
-            self.ensure_sdr_glow_pipeline(format);
-        }
-        let crown_count = if run_hdr_glow || run_sdr_glow {
-            match ungated_built {
-                Some(n) => n,
-                None => self.wgpu_bloom_glow(input).0,
-            }
-        } else {
-            0
-        };
-        if self.bloom_items_live && crown_count > 0 {
-            if run_hdr_glow {
-                self.ensure_glow_items_crown(Pipeline::HdrGlowItems, format);
-            } else if run_sdr_glow {
-                self.ensure_glow_items_crown(Pipeline::SdrGlowItems, format);
-            }
-        }
-        let pipeline = &self.blit_pipelines[&format];
-
-        if self.blit_uniform_written != Some(want) {
-            self.ctx
-                .queue
-                .write_buffer(&self.blit_uniform_buf, 0, aterm_bits::bytes_of(&want));
-            self.blit_uniform_written = Some(want);
-        }
-        if let Some(hu) = crown {
-            self.ctx.queue.write_buffer(
-                self.hdr_glow_uniform_buf.as_ref().expect(
-                    "ensure_hdr_glow_pipeline / ensure_sdr_glow_pipeline set the uniform buf",
-                ),
-                0,
-                aterm_bits::bytes_of(&hu),
-            );
-        }
-        let bind = if use_present_off {
-            &win.present_offscreen
-                .as_ref()
-                .expect("compose_present_offscreen set it")
-                .blit_bind
-        } else {
-            &win.offscreen
-                .as_ref()
-                .expect("encode_frame sets offscreen")
-                .blit_bind
-        };
-
-        let (sw, sh) = (dest.w, dest.h);
-        let bg = live_bg;
-        let clear = wgpu::Color {
-            r: ((bg >> 16) & 0xff) as f64 / 255.0,
-            g: ((bg >> 8) & 0xff) as f64 / 255.0,
-            b: (bg & 0xff) as f64 / 255.0,
-            a: 1.0,
-        };
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu blit pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: dest.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: self.wgpu_pass_timestamps(),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bind, &[]);
-            pass.set_viewport(0.0, 0.0, sw as f32, sh as f32, 0.0, 1.0);
-            pass.set_scissor_rect(0, 0, sw, sh);
-            pass.draw(0..3, 0..1);
-            if run_hdr_glow
-                && crown_count > 0
-                && let Some((x, y, width, height)) = crown_scissor
-            {
-                pass.set_scissor_rect(x, y, width, height);
-                pass.set_pipeline(if self.bloom_items_live {
-                    self.glow_items_wgpu
-                        .hdr
-                        .as_ref()
-                        .expect("ensure_glow_items_crown sets the pipeline")
-                } else {
-                    self.hdr_glow_pipeline
-                        .as_ref()
-                        .expect("ensure_hdr_glow_pipeline sets the pipeline")
-                });
-                pass.set_bind_group(
-                    0,
-                    self.hdr_glow_bg
-                        .as_ref()
-                        .expect("ensure_hdr_glow_pipeline sets the bind group"),
-                    &[],
-                );
-                self.wgpu_crown_stream(&mut pass);
-                pass.draw(0..6, 0..crown_count);
-            } else if run_sdr_glow
-                && crown_count > 0
-                && let Some((x, y, width, height)) = crown_scissor
-            {
-                pass.set_scissor_rect(x, y, width, height);
-                pass.set_pipeline(if self.bloom_items_live {
-                    &self
-                        .glow_items_wgpu
-                        .sdr
-                        .as_ref()
-                        .expect("ensure_glow_items_crown sets the pipeline")
-                        .1
-                } else {
-                    &self
-                        .sdr_glow_pipeline
-                        .as_ref()
-                        .expect("ensure_sdr_glow_pipeline sets the pipeline")
-                        .1
-                });
-                pass.set_bind_group(
-                    0,
-                    self.hdr_glow_bg
-                        .as_ref()
-                        .expect("ensure_sdr_glow_pipeline sets the bind group"),
-                    &[],
-                );
-                self.wgpu_crown_stream(&mut pass);
-                pass.draw(0..6, 0..crown_count);
-            }
-        }
-        let capture_color_space = win.capture_color_space();
-        let capture_sdr_white_scale = win.sdr_white_scale();
-        let copy_armed = dest.tex.usage().contains(wgpu::TextureUsages::COPY_SRC);
-        let mut staged = Vec::new();
-        if let Some(tap) = win.video.as_mut().filter(|_| copy_armed) {
-            staged.extend(tap.enqueue_copy(
-                &mut enc,
-                dest.tex,
-                capture_color_space,
-                capture_sdr_white_scale,
-            ));
-        }
-        if let Some(tap) = win.presented_snapshot.as_mut().filter(|_| copy_armed) {
-            staged.extend(tap.enqueue_copy(
-                &mut enc,
-                dest.tex,
-                capture_color_space,
-                capture_sdr_white_scale,
-            ));
-        }
-        crate::device_layer::submit_host_readable(
-            &self.ctx.device,
-            &self.ctx.queue,
-            enc.finish(),
-            &staged,
-        );
-        self.wgpu_gpu_time_finish();
-    }
-
-    #[cfg(wgpu_arm)]
-    fn shift_present_copy_band(
-        &mut self,
-        win: &mut WindowGpu,
-        input: &RenderInput,
-        enc: &mut wgpu::CommandEncoder,
-    ) {
-        let Some((w, h)) = win.present_offscreen.as_ref().map(|p| (p.w, p.h)) else {
-            return;
-        };
-        let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
-            self.cpu.grid_top(),
-            self.cell_size().1,
-            input.grid_top_row,
-            input.grid_bot_row,
-            h as usize,
-        );
-        let Some(shift) = band_shift_ops(y0, y1, i64::from(input.scroll_frac_px)) else {
-            return;
-        };
-        let scratch_ok = win
-            .shift_scratch
-            .as_ref()
-            .is_some_and(|t| t.width() == w && t.height() == h);
-        if !scratch_ok {
-            let format = crate::device_layer::TexelFormat::from_wgpu(self.ctx.offscreen_format())
-                .expect("the offscreen format is inside the map's closed set of six");
-            win.shift_scratch = Some(self.ctx.device_layer().create_texture_2d(
-                "aterm-gpu m1b scroll shift scratch",
-                format,
-                w,
-                h,
-                crate::device_layer::TexUsage::COPY_STAGING,
-                None,
-            ));
-        }
-        let apron = self.apron_strip_plan(win, input, h as usize);
-        if let Some(strip) = apron {
-            self.ensure_apron_texture(win, strip);
-        }
-        win.present_offscreen_fx = union_rect_opt(
-            win.present_offscreen_fx,
-            Some([0, y0 as u32, w, y1 as u32]),
-            (w, h),
-        );
-        let po = win.present_offscreen.as_ref().expect("dims read above");
-        let scratch = win.shift_scratch.as_ref().expect("just ensured").wgpu();
-        const fn rect(tex: &wgpu::Texture, y: u32) -> wgpu::TexelCopyTextureInfo<'_> {
-            wgpu::TexelCopyTextureInfo {
-                texture: tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            }
-        }
-        let extent = wgpu::Extent3d {
-            width: w,
-            height: shift.moved,
-            depth_or_array_layers: 1,
-        };
-        enc.copy_texture_to_texture(rect(&po.tex, shift.src_y), rect(scratch, 0), extent);
-        enc.copy_texture_to_texture(rect(scratch, 0), rect(&po.tex, shift.dst_y), extent);
-        if let Some(strip) = apron
-            && let Some(ap) = win.apron_tex.as_ref()
-        {
-            enc.copy_texture_to_texture(
-                rect(ap.wgpu(), 0),
-                rect(&po.tex, strip.dst_y),
-                wgpu::Extent3d {
-                    width: strip.w.min(w),
-                    height: strip.rows,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+        first_party_note("present refused: the renderer is disarmed");
+        Err(SurfacePresentFailure::Validation)
     }
 
     fn apron_strip_plan(
@@ -13934,80 +9202,6 @@ impl GpuRenderer {
             w: w as u32,
             cell_h: band_rows as u32,
         })
-    }
-
-    #[cfg(wgpu_arm)]
-    fn ensure_apron_texture(&mut self, win: &mut WindowGpu, strip: ApronStrip) {
-        let (w, h) = (strip.w, strip.cell_h);
-        let resident = win
-            .apron_tex
-            .as_ref()
-            .is_some_and(|t| t.width() == w && t.height() == h);
-        if !resident {
-            let format = crate::device_layer::TexelFormat::from_wgpu(self.ctx.offscreen_format())
-                .expect("the offscreen format is inside the map's closed set of six");
-            win.apron_tex = Some(self.ctx.device_layer().create_texture_2d(
-                "aterm-gpu m1b apron row",
-                format,
-                w,
-                h,
-                crate::device_layer::TexUsage::COPY_STAGING,
-                None,
-            ));
-            win.apron_tex_bytes.clear();
-            win.apron_tex_gen = 0;
-        }
-        if win.apron_tex_gen == win.apron_rgba_gen
-            || win.apron_tex_bytes.as_slice() == win.apron_rgba.as_slice()
-        {
-            win.apron_tex_gen = win.apron_rgba_gen;
-            return;
-        }
-        let tex = win.apron_tex.as_ref().expect("ensured above");
-        self.ctx
-            .device_layer()
-            .upload_texture_full(tex, &win.apron_rgba, w * 4, w, h);
-        win.apron_tex_bytes.clear();
-        win.apron_tex_bytes.extend_from_slice(&win.apron_rgba);
-        win.apron_tex_gen = win.apron_rgba_gen;
-    }
-
-    #[cfg(wgpu_arm)]
-    fn apron_into_offscreen_wgpu(&mut self, win: &mut WindowGpu, input: &RenderInput) {
-        let Some(h) = win.offscreen.as_ref().map(|o| o.h as usize) else {
-            return;
-        };
-        let Some(strip) = self.apron_strip_plan(win, input, h) else {
-            return;
-        };
-        self.ensure_apron_texture(win, strip);
-        let (Some(off), Some(ap)) = (win.offscreen.as_ref(), win.apron_tex.as_ref()) else {
-            return;
-        };
-        const fn at(tex: &wgpu::Texture, y: u32) -> wgpu::TexelCopyTextureInfo<'_> {
-            wgpu::TexelCopyTextureInfo {
-                texture: tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            }
-        }
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu m1b apron strip"),
-            });
-        enc.copy_texture_to_texture(
-            at(ap.wgpu(), 0),
-            at(&off.tex, strip.dst_y),
-            wgpu::Extent3d {
-                width: strip.w.min(off.w),
-                height: strip.rows,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.ctx.queue.submit([enc.finish()]);
     }
 
     #[cfg(target_os = "macos")]
@@ -14095,8 +9289,6 @@ impl GpuRenderer {
                     }
                     Ok(())
                 }
-                #[cfg(wgpu_arm)]
-                SubmittedFrame::Wgpu => unreachable!("a metal encoder commits a metal frame"),
             }
         })();
         if let Err(e) = copied {
@@ -14236,95 +9428,15 @@ impl GpuRenderer {
                 }
             };
         }
-        #[cfg(not(wgpu_arm))]
-        {
-            first_party_note(
-                "virtual present: the renderer is disarmed and this build carries \
-                 no wgpu arm — dropping this present",
-            );
-            false
-        }
-        #[cfg(wgpu_arm)]
-        {
-            let Ok(source_crop) = self.resident_present_crop(input, source_crop) else {
-                return false;
-            };
-            let w = self.clamp_fb_dim(destination.0.max(1));
-            let h = self.clamp_fb_dim(destination.1.max(1));
-            if win
-                .virtual_target
-                .as_ref()
-                .is_none_or(|t| t.w != w || t.h != h)
-            {
-                win.virtual_target = Some(self.make_virtual_target(w, h));
-                win.virtual_presented_input_epoch = 0;
-            }
-            let tex = win
-                .virtual_target
-                .as_ref()
-                .expect("ensured above")
-                .tex
-                .clone();
-            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-            let work_started = aterm_time::Instant::now();
-            self.present_to_view(
-                win,
-                input,
-                invert,
-                overlay,
-                tray,
-                source_crop,
-                effects_transport_shift_y,
-                PresentDest {
-                    view: &view,
-                    tex: &tex,
-                    w,
-                    h,
-                    format: VIRTUAL_PRESENT_FORMAT,
-                    translucent: false,
-                    premult: false,
-                },
-            );
-            win.virtual_presented_input_epoch = win.resident_input_epoch;
-            win.last_present_work_ns =
-                u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            win.last_present_encode_ns = win.last_present_work_ns;
-            true
-        }
+        first_party_note("virtual present: the renderer is disarmed; dropping this present");
+        false
     }
 
-    #[cfg(wgpu_arm)]
-    fn make_virtual_target(&self, w: u32, h: u32) -> VirtualTarget {
-        let tex = self
-            .ctx
-            .device_layer()
-            .create_texture_2d(
-                "aterm-gpu virtual present target",
-                crate::device_layer::TexelFormat::from_wgpu(VIRTUAL_PRESENT_FORMAT)
-                    .expect("the virtual present format is inside the closed set of six"),
-                w,
-                h,
-                crate::device_layer::TexUsage {
-                    sampled: false,
-                    render: true,
-                    copy_src: true,
-                    copy_dst: true,
-                },
-                None,
-            )
-            .into_wgpu();
-        VirtualTarget { tex, w, h }
-    }
-
-    /// Build every effect pipeline not yet resident, off the frame path: the wgpu arm's here; the
-    /// Metal arm's on a worker that hands each over as it lands, covering every row and twin its
-    /// frames and presents can bind under the present switches, from its mint if it has not
-    /// minted yet and again for a pass a switch turns on later. A no-op on the GL arm.
+    /// Build every effect pipeline not yet resident, off the frame path: the Metal arm's on a
+    /// worker that hands each over as it lands, covering every row and twin its frames and
+    /// presents can bind under the present switches, from its mint if it has not minted yet and
+    /// again for a pass a switch turns on later. A no-op on the GL and D3D11 arms.
     pub fn warm_effect_pipelines(&mut self) {
-        #[cfg(wgpu_arm)]
-        for which in EFFECT_PIPELINES {
-            self.effects.ensure(&self.ctx.device, which);
-        }
         #[cfg(target_os = "macos")]
         {
             self.metal_warm_wanted = true;
@@ -14374,277 +9486,6 @@ impl GpuRenderer {
             .map_or_else(Vec::new, |cell| cell.live_ref().built_here.clone())
     }
 
-    /// Which effect pipelines this renderer has built, in [`EFFECT_PIPELINE_NAMES`] order.
-    #[inline]
-    pub fn effect_pipelines_resident(&self) -> [bool; EFFECT_PIPELINE_COUNT] {
-        #[cfg(wgpu_arm)]
-        {
-            self.effects.resident()
-        }
-        #[cfg(not(wgpu_arm))]
-        {
-            [false; EFFECT_PIPELINE_COUNT]
-        }
-    }
-
-    /// `(count, nanoseconds)` spent building effect pipelines since construction.
-    #[inline]
-    pub const fn effect_pipeline_build_cost(&self) -> (u32, u64) {
-        #[cfg(wgpu_arm)]
-        {
-            (self.effects.builds, self.effects.build_ns)
-        }
-        #[cfg(not(wgpu_arm))]
-        {
-            (0, 0)
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn ensure_hdr_glow_pipeline(&mut self) {
-        if self.hdr_glow_pipeline.is_some() {
-            return;
-        }
-        self.ensure_glow_boost_shared();
-        let pipeline =
-            self.build_glow_boost_pipeline(Pipeline::HdrGlow, self.ctx.pipeline_targets());
-        self.hdr_glow_pipeline = Some(pipeline);
-    }
-
-    #[cfg(wgpu_arm)]
-    fn ensure_sdr_glow_pipeline(&mut self, format: wgpu::TextureFormat) {
-        if matches!(&self.sdr_glow_pipeline, Some((f, _)) if *f == format) {
-            return;
-        }
-        self.ensure_glow_boost_shared();
-        let pipeline = self.build_glow_boost_pipeline(
-            Pipeline::SdrGlow,
-            self.ctx.pipeline_targets().with_present(format),
-        );
-        self.sdr_glow_pipeline = Some((format, pipeline));
-    }
-
-    #[cfg(wgpu_arm)]
-    fn ensure_glow_boost_shared(&mut self) {
-        if self.glow_boost_bgl.is_some() {
-            return;
-        }
-        let device = &self.ctx.device;
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("aterm-gpu glow-boost bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let uniform_buf = self
-            .ctx
-            .device_layer()
-            .create_uniform_buffer(
-                "aterm-gpu glow-boost uniform",
-                std::mem::size_of::<HdrGlowUniform>() as u64,
-            )
-            .into_wgpu();
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("aterm-gpu glow-boost bg"),
-            layout: &bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buf.as_entire_binding(),
-            }],
-        });
-        self.glow_boost_bgl = Some(bgl);
-        self.hdr_glow_uniform_buf = Some(uniform_buf);
-        self.hdr_glow_bg = Some(bg);
-    }
-
-    /// Bind the crown's lights: the item list at group 1 where the frame
-    /// blooms one, else its glow instances.
-    #[cfg(wgpu_arm)]
-    fn wgpu_crown_stream(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if self.bloom_items_live {
-            let bind = self.glow_items_wgpu.bind.as_ref();
-            pass.set_bind_group(1, bind.expect("its upload binds it"), &[]);
-        } else {
-            pass.set_vertex_buffer(0, self.vbufs.bloom_glow.buf.slice(..));
-        }
-    }
-
-    /// The bloom item list's group-1 layout and extract pipeline, built on
-    /// first use; `false` where the device refuses them
-    /// ([`GlowItemsWgpu::refused`]).
-    #[cfg(wgpu_arm)]
-    fn ensure_glow_items_wgpu(&mut self) -> bool {
-        let gi = &mut self.glow_items_wgpu;
-        if gi.refused {
-            return false;
-        }
-        if gi.extract.is_some() {
-            return true;
-        }
-        let device = &self.ctx.device;
-        let bgl = gi.bgl.get_or_insert_with(|| {
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("aterm-gpu glow items bgl"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            })
-        });
-        let (shader, uniform_bgl) = (&self.effects.shader, &self.effects.layouts.uniform_bgl);
-        let targets = self.effects.targets;
-        let built = wgpu_scoped(device, || {
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("aterm-gpu glow items layout"),
-                bind_group_layouts: &[Some(uniform_bgl), Some(&*bgl)],
-                immediate_size: 0,
-            });
-            crate::pipeline_table::build_wgpu(
-                Pipeline::GlowItems.spec(),
-                device,
-                shader,
-                &layout,
-                targets,
-            )
-        });
-        match built {
-            Ok(pipeline) => {
-                gi.extract = Some(pipeline);
-                true
-            }
-            Err(why) => {
-                crate::stderr_line!(
-                    "aterm-gpu: the device refused the bloom's item pipeline ({why}); the bloom \
-                     draws its glow instances"
-                );
-                gi.refused = true;
-                false
-            }
-        }
-    }
-
-    /// The frame's bloom stream on the wgpu arm ([`Self::build_bloom_glow`]),
-    /// its item list uploaded where it draws one.
-    #[cfg(wgpu_arm)]
-    fn wgpu_bloom_glow(&mut self, input: &RenderInput) -> (u32, Option<[u32; 4]>, u32) {
-        let items = !input.cursor_glow_add_ramps.is_empty() && self.ensure_glow_items_wgpu();
-        let built = self.build_bloom_glow(input, items);
-        if self.bloom_items_live && built.0 > 0 {
-            let device = &self.ctx.device;
-            let gi = &mut self.glow_items_wgpu;
-            let bytes: &[u8] = aterm_bits::cast_slice(self.bloom_items.words());
-            let need = align_up(bytes.len() as u64, wgpu::COPY_BUFFER_ALIGNMENT);
-            if gi.buf.as_ref().is_none_or(|(_, cap)| *cap < need) {
-                let cap = need.next_power_of_two();
-                let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("aterm-gpu glow items"),
-                    size: cap,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                gi.bind = Some(
-                    device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("aterm-gpu glow items bg"),
-                        layout: gi
-                            .bgl
-                            .as_ref()
-                            .expect("ensure_glow_items_wgpu sets the bgl"),
-                        entries: &[wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: buf.as_entire_binding(),
-                        }],
-                    }),
-                );
-                gi.buf = Some((buf, cap));
-            }
-            let (buf, _) = gi.buf.as_ref().expect("minted above");
-            self.ctx.queue.write_buffer(buf, 0, bytes);
-        }
-        built
-    }
-
-    /// The crown's item pipeline for `row` ([`Pipeline::HdrGlowItems`] or
-    /// [`Pipeline::SdrGlowItems`] onto `format`), built on first use.
-    #[cfg(wgpu_arm)]
-    fn ensure_glow_items_crown(&mut self, row: Pipeline, format: wgpu::TextureFormat) {
-        self.ensure_glow_boost_shared();
-        let built = match row {
-            Pipeline::HdrGlowItems => self.glow_items_wgpu.hdr.is_some(),
-            _ => matches!(&self.glow_items_wgpu.sdr, Some((f, _)) if *f == format),
-        };
-        if built {
-            return;
-        }
-        let device = &self.ctx.device;
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("aterm-gpu glow-boost items shader"),
-            source: wgpu::ShaderSource::Wgsl(wgsl_source(row.spec().library).into()),
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("aterm-gpu glow-boost items layout"),
-            bind_group_layouts: &[
-                Some(
-                    self.glow_boost_bgl
-                        .as_ref()
-                        .expect("ensure_glow_boost_shared sets the bgl"),
-                ),
-                Some(
-                    self.glow_items_wgpu
-                        .bgl
-                        .as_ref()
-                        .expect("an item list's frame built its bgl"),
-                ),
-            ],
-            immediate_size: 0,
-        });
-        let targets = match row {
-            Pipeline::HdrGlowItems => self.ctx.pipeline_targets(),
-            _ => self.ctx.pipeline_targets().with_present(format),
-        };
-        let pipeline =
-            crate::pipeline_table::build_wgpu(row.spec(), device, &shader, &layout, targets);
-        match row {
-            Pipeline::HdrGlowItems => self.glow_items_wgpu.hdr = Some(pipeline),
-            _ => self.glow_items_wgpu.sdr = Some((format, pipeline)),
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn build_glow_boost_pipeline(
-        &self,
-        row: Pipeline,
-        targets: TargetFormats,
-    ) -> wgpu::RenderPipeline {
-        let device = &self.ctx.device;
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("aterm-gpu glow-boost shader"),
-            source: wgpu::ShaderSource::Wgsl(wgsl_source(row.spec().library).into()),
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("aterm-gpu glow-boost layout"),
-            bind_group_layouts: &[Some(
-                self.glow_boost_bgl
-                    .as_ref()
-                    .expect("ensure_glow_boost_shared sets the bgl"),
-            )],
-            immediate_size: 0,
-        });
-        crate::pipeline_table::build_wgpu(row.spec(), device, &shader, &layout, targets)
-    }
-
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -14677,16 +9518,8 @@ impl GpuRenderer {
             win.present_prev.as_ref().is_some_and(|p| p.on_metal)
                 && matches!(&win.metal_offscreen, Some(o) if o.w == w && o.h == h)
         } else {
-            #[cfg(wgpu_arm)]
-            {
-                win.present_prev.as_ref().is_none_or(|p| !p.on_metal)
-                    && matches!(&win.offscreen, Some(o) if o.w == w && o.h == h)
-            }
-            #[cfg(not(wgpu_arm))]
-            {
-                // Disarmed with no wgpu offscreen: nothing resident to diff.
-                false
-            }
+            // Disarmed: nothing resident to diff.
+            false
         };
         #[cfg(gl_arm)]
         let offscreen_holds_prev = if self.gl_armed {
@@ -14696,15 +9529,7 @@ impl GpuRenderer {
                         Some(o) if o.w == w && o.h == h && o.tex.on(&live.dev))
                 })
         } else {
-            #[cfg(wgpu_arm)]
-            {
-                win.present_prev.as_ref().is_none_or(|p| !p.on_gl)
-                    && matches!(&win.offscreen, Some(o) if o.w == w && o.h == h)
-            }
-            #[cfg(not(wgpu_arm))]
-            {
-                false
-            }
+            false
         };
         // The D3D11 arm's twin (Windows).
         #[cfg(d3d11_arm)]
@@ -14715,18 +9540,8 @@ impl GpuRenderer {
                         Some(o) if o.w == w && o.h == h && o.tex.on(&live.dev))
                 })
         } else {
-            #[cfg(wgpu_arm)]
-            {
-                win.present_prev.as_ref().is_none_or(|p| !p.on_d3d11)
-                    && matches!(&win.offscreen, Some(o) if o.w == w && o.h == h)
-            }
-            #[cfg(not(wgpu_arm))]
-            {
-                false
-            }
+            false
         };
-        #[cfg(not(any(target_os = "macos", gl_arm, d3d11_arm)))]
-        let offscreen_holds_prev = matches!(&win.offscreen, Some(o) if o.w == w && o.h == h);
 
         let mut dirty = std::mem::take(&mut self.dirty_scratch);
         let prev_present = win.present_prev.take();
@@ -14885,310 +9700,9 @@ impl GpuRenderer {
         } else {
             v.len()
         } as u32;
-        #[cfg(wgpu_arm)]
-        if n > 0 {
-            let device = &self.ctx.device;
-            let queue = &self.ctx.queue;
-            self.vbufs
-                .bloom_glow
-                .upload(device, queue, aterm_bits::cast_slice(&v));
-        }
         self.bloom_glow_scratch = v;
         self.bloom_quad_scratch = quads;
         (n, bbox, extract_first as u32)
-    }
-
-    #[cfg(wgpu_arm)]
-    fn ensure_present_offscreen(&mut self, win: &mut WindowGpu, w: u32, h: u32) {
-        if matches!(&win.present_offscreen, Some(p) if p.w == w && p.h == h) {
-            return;
-        }
-        win.offscreen_dirty_since_sync = None;
-        win.present_offscreen_fx = None;
-        let tex = self.ctx.offscreen_texture(w, h);
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let src_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let blit_bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("aterm-gpu present-offscreen blit bg"),
-                layout: &self.blit_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&src_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.blit_uniform_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        win.present_offscreen = Some(PresentOffscreen {
-            tex,
-            view,
-            blit_bind,
-            w,
-            h,
-        });
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one GPU pass encoder threading the encoder, target, uniforms and glyph buffers"
-    )]
-    #[cfg(wgpu_arm)]
-    fn encode_bloom_halo(
-        &self,
-        enc: &mut wgpu::CommandEncoder,
-        target_view: &wgpu::TextureView,
-        bt: &BloomTarget,
-        glow_count: u32,
-        bbox: Option<[u32; 4]>,
-        dims: (u32, u32),
-        extract_first: u32,
-        input: &RenderInput,
-    ) -> Option<[u32; 4]> {
-        let bu = BloomUniform {
-            texel: [1.0 / bt.bw as f32, 1.0 / bt.bh as f32],
-            strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
-            radius: self.bloom_radius,
-            chroma_radius: bloom_chroma_radius(self.bloom_radius),
-            extent: [1.0; 2],
-            _pad: 0.0,
-        };
-        self.ctx
-            .queue
-            .write_buffer(&self.bloom_uniform_buf, 0, aterm_bits::bytes_of(&bu));
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu bloom extract pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &bt.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: self.wgpu_pass_timestamps(),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_bind_group(0, &self.uniform_bg, &[]);
-            if self.bloom_items_live {
-                let gi = &self.glow_items_wgpu;
-                pass.set_pipeline(gi.extract.as_ref().expect("an item list's frame built it"));
-                pass.set_bind_group(1, gi.bind.as_ref().expect("its upload binds it"), &[]);
-                pass.draw(0..6, 0..glow_count);
-            } else {
-                pass.set_pipeline(self.effects.get(EffectPipeline::GlowAdd));
-                pass.set_vertex_buffer(0, self.vbufs.bloom_glow.buf.slice(..));
-                pass.draw(0..6, extract_first..extract_first + glow_count);
-            }
-        }
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu bloom composite pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: self.wgpu_pass_timestamps(),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.bloom_pipeline);
-            pass.set_bind_group(0, &bt.bind, &[]);
-            let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {
-                [
-                    u32::from(cx0),
-                    u32::from(cy0),
-                    u32::from(cx1),
-                    u32::from(cy1),
-                ]
-            });
-            let (w, h) = dims;
-            let scissor = if let Some([x0, y0, x1, y1]) = bbox {
-                let d = aterm_render::bloom::reach_px(self.bloom_radius);
-                let sx0 = x0.saturating_sub(d);
-                let sy0 = y0.saturating_sub(d);
-                let sx1 = x1.saturating_add(d).min(w);
-                let sy1 = y1.saturating_add(d).min(h);
-                Some([sx0, sy0, sx1, sy1])
-            } else {
-                clip.map(|_| [0, 0, w, h])
-            };
-            let scissor = match (scissor, clip) {
-                (Some([sx0, sy0, sx1, sy1]), Some([cx0, cy0, cx1, cy1])) => Some([
-                    sx0.max(cx0),
-                    sy0.max(cy0),
-                    sx1.min(cx1).min(w),
-                    sy1.min(cy1).min(h),
-                ]),
-                (s, None) => s,
-                (None, Some(_)) => unreachable!("clip-only case handled above"),
-            };
-            match (scissor, clip) {
-                (Some([sx0, sy0, sx1, sy1]), _) if sx1 > sx0 && sy1 > sy0 => {
-                    pass.set_scissor_rect(sx0, sy0, sx1 - sx0, sy1 - sy0);
-                    pass.draw(0..3, 0..1);
-                    Some([sx0, sy0, sx1, sy1])
-                }
-                (Some(_), Some(_)) => Some([0, 0, 0, 0]),
-                (Some(_), None) | (None, _) => {
-                    pass.draw(0..3, 0..1);
-                    None
-                }
-            }
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn compose_present_offscreen(
-        &mut self,
-        win: &mut WindowGpu,
-        input: &RenderInput,
-        enc: &mut wgpu::CommandEncoder,
-    ) -> Option<u32> {
-        let (w, h) = win.offscreen.as_ref().map(|o| (o.w, o.h))?;
-        self.ensure_present_offscreen(win, w, h);
-        let bloom = self.enable_bloom && fx_gpu::bloom_source_live(input);
-        let (glow_count, glow_bbox, extract_first) = if bloom {
-            self.wgpu_bloom_glow(input)
-        } else {
-            (0, None, 0)
-        };
-        if glow_count > 0 {
-            self.effects
-                .ensure(&self.ctx.device, EffectPipeline::GlowAdd);
-            self.ensure_bloom_target(win);
-        }
-        let shimmer_region = if self.shimmer_live(input) {
-            self.shimmer_region(input, w, h)
-        } else {
-            None
-        };
-        if shimmer_region.is_some() {
-            self.ensure_shimmer_scratch(win, w, h);
-        }
-        let copy_rect = present_copy_rect(
-            win.offscreen_dirty_since_sync,
-            win.present_offscreen_fx,
-            (w, h),
-        );
-        let off = win.offscreen.as_ref().expect("offscreen resident");
-        let po = win
-            .present_offscreen
-            .as_ref()
-            .expect("ensure_present_offscreen set it");
-        if copy_rect[2] > copy_rect[0] && copy_rect[3] > copy_rect[1] {
-            enc.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &off.tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: copy_rect[0],
-                        y: copy_rect[1],
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &po.tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: copy_rect[0],
-                        y: copy_rect[1],
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: copy_rect[2] - copy_rect[0],
-                    height: copy_rect[3] - copy_rect[1],
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-        let mut fx: Option<[u32; 4]> = Some([0, 0, 0, 0]);
-        if glow_count > 0
-            && let Some(bt) = off.bloom.as_ref()
-        {
-            let halo = self.encode_bloom_halo(
-                enc,
-                &po.view,
-                bt,
-                glow_count,
-                glow_bbox,
-                (w, h),
-                extract_first,
-                input,
-            );
-            fx = union_rect_opt(fx, halo, (w, h));
-        }
-        if let Some(region) = &shimmer_region {
-            let scratch = win.shimmer_scratch.as_ref().expect("ensured above");
-            self.encode_shimmer(enc, scratch, &po.tex, &po.view, region);
-            fx = union_rect_opt(
-                fx,
-                Some([region.x0, region.y0, region.x1, region.y1]),
-                (w, h),
-            );
-        }
-        win.offscreen_dirty_since_sync = Some([0, 0, 0, 0]);
-        win.present_offscreen_fx = fx;
-        bloom.then_some(glow_count)
-    }
-
-    #[cfg(wgpu_arm)]
-    fn composite_bloom_in_place(&mut self, win: &mut WindowGpu, input: &RenderInput) -> u32 {
-        let (glow_count, glow_bbox, extract_first) = self.wgpu_bloom_glow(input);
-        if glow_count == 0 {
-            return glow_count;
-        }
-        self.effects
-            .ensure(&self.ctx.device, EffectPipeline::GlowAdd);
-        self.ensure_bloom_target(win);
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu in-place bloom composite"),
-            });
-        let Some(off) = win.offscreen.as_ref() else {
-            return glow_count;
-        };
-        let dims = (off.w, off.h);
-        let Some(bt) = off.bloom.as_ref() else {
-            return glow_count;
-        };
-        let halo = self.encode_bloom_halo(
-            &mut enc,
-            &off.view,
-            bt,
-            glow_count,
-            glow_bbox,
-            dims,
-            extract_first,
-            input,
-        );
-        self.ctx.queue.submit([enc.finish()]);
-        note_offscreen_written(win, halo, dims);
-        glow_count
     }
 
     fn shimmer_phase(&self) -> f32 {
@@ -15322,234 +9836,12 @@ impl GpuRenderer {
             y0: ry0,
             x1: rx1,
             y1: ry1,
-            #[cfg(wgpu_arm)]
-            fw: w,
-            #[cfg(wgpu_arm)]
-            fh: h,
             hot_top: hot_top as f32,
             rise,
             band_x0: x0 as f32,
             band_w,
             heat,
         })
-    }
-
-    #[cfg(wgpu_arm)]
-    fn ensure_bloom_target(&mut self, win: &mut WindowGpu) {
-        if !self.enable_bloom {
-            return;
-        }
-        let Some((w, h)) = win.offscreen.as_ref().map(|o| (o.w, o.h)) else {
-            return;
-        };
-        let bw = (w / BLOOM_DOWNSCALE).max(1);
-        let bh = (h / BLOOM_DOWNSCALE).max(1);
-        if matches!(win.offscreen.as_ref().and_then(|o| o.bloom.as_ref()),
-            Some(b) if b.bw == bw && b.bh == bh)
-        {
-            return;
-        }
-        let btex = self.ctx.offscreen_texture(bw, bh);
-        let bview = btex.create_view(&wgpu::TextureViewDescriptor::default());
-        let sview = btex.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("aterm-gpu bloom bind"),
-                layout: &self.bloom_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&sview),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.bloom_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.bloom_uniform_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        if let Some(off) = win.offscreen.as_mut() {
-            off.bloom = Some(BloomTarget {
-                tex: btex,
-                view: bview,
-                bind,
-                bw,
-                bh,
-            });
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn ensure_shimmer_resources(&mut self) {
-        if self.shimmer.is_none() {
-            self.shimmer = Some(build_shimmer_resources(
-                self.ctx.device_layer(),
-                self.ctx.pipeline_targets(),
-            ));
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn ensure_shimmer_scratch(&mut self, win: &mut WindowGpu, w: u32, h: u32) {
-        self.ensure_shimmer_resources();
-        if matches!(&win.shimmer_scratch, Some(s) if s.w == w && s.h == h) {
-            return;
-        }
-        let sr = self.shimmer.as_ref().expect("ensured above");
-        let tex = self.ctx.offscreen_texture(w, h);
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("aterm-gpu shimmer scratch bg"),
-                layout: &sr.bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.bloom_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: sr.uniform_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        win.shimmer_scratch = Some(ShimmerScratch { tex, bind, w, h });
-    }
-
-    #[cfg(wgpu_arm)]
-    fn encode_shimmer(
-        &self,
-        enc: &mut wgpu::CommandEncoder,
-        scratch: &ShimmerScratch,
-        target_tex: &wgpu::Texture,
-        target_view: &wgpu::TextureView,
-        region: &ShimmerRegion,
-    ) {
-        let (w, h) = (region.fw, region.fh);
-        let sr = self
-            .shimmer
-            .as_ref()
-            .expect("ensure_shimmer_resources set it");
-        let m = SHIMMER_COPY_MARGIN;
-        let cx0 = region.x0.saturating_sub(m);
-        let cy0 = region.y0.saturating_sub(m);
-        let cx1 = region.x1.saturating_add(m).min(w);
-        let cy1 = region.y1.saturating_add(m).min(h);
-        enc.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: target_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: cx0,
-                    y: cy0,
-                    z: 0,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &scratch.tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: cx0,
-                    y: cy0,
-                    z: 0,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: cx1 - cx0,
-                height: cy1 - cy0,
-                depth_or_array_layers: 1,
-            },
-        );
-        let (cw, ch) = self.cpu.cell_size();
-        let mut heat = [[0f32; 4]; SHIMMER_BANDS / 4];
-        for (i, v) in region.heat.iter().enumerate() {
-            heat[i / 4][i % 4] = *v;
-        }
-        let su = ShimmerUniform {
-            frame: [w as f32, h as f32],
-            region_min: [region.x0 as f32, region.y0 as f32],
-            region_max: [region.x1 as f32, region.y1 as f32],
-            hot_top: region.hot_top,
-            rise: region.rise,
-            amp: (ch as f32 / 18.0).clamp(0.75, SHIMMER_AMP_PX),
-            period: (ch as f32).max(4.0),
-            phase: self.shimmer_phase(),
-            band_x0: region.band_x0,
-            band_w: region.band_w,
-            rolloff: (cw as f32).max(1.0),
-            _pad: [0.0; 2],
-            heat,
-        };
-        self.ctx
-            .queue
-            .write_buffer(&sr.uniform_buf, 0, aterm_bits::bytes_of(&su));
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu shimmer pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: self.wgpu_pass_timestamps(),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&sr.pipeline);
-            pass.set_bind_group(0, &scratch.bind, &[]);
-            pass.set_scissor_rect(
-                region.x0,
-                region.y0,
-                region.x1 - region.x0,
-                region.y1 - region.y0,
-            );
-            pass.draw(0..3, 0..1);
-        }
-    }
-
-    #[cfg(wgpu_arm)]
-    fn shimmer_offscreen_in_place(&mut self, win: &mut WindowGpu, input: &RenderInput) {
-        let (w, h) = match win.offscreen.as_ref() {
-            Some(o) => (o.w, o.h),
-            None => return,
-        };
-        let Some(region) = self.shimmer_region(input, w, h) else {
-            return;
-        };
-        self.ensure_shimmer_scratch(win, w, h);
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu in-place shimmer"),
-            });
-        let off = win.offscreen.as_ref().expect("checked above");
-        let scratch = win.shimmer_scratch.as_ref().expect("ensured above");
-        self.encode_shimmer(&mut enc, scratch, &off.tex, &off.view, &region);
-        self.ctx.queue.submit([enc.finish()]);
-        note_offscreen_written(
-            win,
-            Some([region.x0, region.y0, region.x1, region.y1]),
-            (w, h),
-        );
     }
 
     /// Test helper.
@@ -15609,123 +9901,12 @@ impl GpuRenderer {
                     }
                 });
         }
-        #[cfg(not(wgpu_arm))]
-        {
-            let _ = win;
-            Frame {
-                width: w as usize,
-                height: h as usize,
-                pixels: vec![0; (w as usize) * (h as usize)],
-            }
+        // Disarmed: no arm drew the frame, so it reads back blank.
+        Frame {
+            width: w as usize,
+            height: h as usize,
+            pixels: vec![0; (w as usize) * (h as usize)],
         }
-        #[cfg(wgpu_arm)]
-        {
-            let tex = if (self.enable_bloom && fx_gpu::bloom_source_live(input))
-                || self.shimmer_live(input)
-            {
-                let mut enc =
-                    self.ctx
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("aterm-gpu readback present-offscreen composite"),
-                        });
-                self.compose_present_offscreen(win, input, &mut enc);
-                self.ctx.queue.submit([enc.finish()]);
-                win.present_offscreen
-                    .as_ref()
-                    .expect("compose_present_offscreen set it")
-                    .tex
-                    .clone()
-            } else {
-                win.offscreen
-                    .as_ref()
-                    .expect("encode_frame sets offscreen")
-                    .tex
-                    .clone()
-            };
-            self.ctx.read_back(&tex, w, h)
-        }
-    }
-
-    /// Test helper.
-    #[doc(hidden)]
-    #[cfg(wgpu_arm)]
-    pub fn present_encode_poll(&mut self, win: &mut WindowGpu, input: &RenderInput) {
-        let _ = self.encode_present_frame(win, input);
-        self.ctx
-            .device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed");
-    }
-
-    /// Test helper.
-    #[doc(hidden)]
-    #[cfg(wgpu_arm)]
-    pub fn present_swapchain_standin_for_test(
-        &mut self,
-        win: &mut WindowGpu,
-        input: &RenderInput,
-        invert: bool,
-        overlay: Option<DropOverlay>,
-        tray: Option<TrayQuad<'_>>,
-        (w, h): (u32, u32),
-    ) {
-        let tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu test present dst (copyable swapchain stand-in)"),
-            size: wgpu::Extent3d {
-                width: w.max(1),
-                height: h.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: VIRTUAL_PRESENT_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        self.present_to_view(
-            win,
-            input,
-            invert,
-            overlay,
-            tray,
-            None,
-            0,
-            PresentDest {
-                view: &view,
-                tex: &tex,
-                w: w.max(1),
-                h: h.max(1),
-                format: VIRTUAL_PRESENT_FORMAT,
-                translucent: false,
-                premult: false,
-            },
-        );
-    }
-
-    /// Test helper.
-    #[doc(hidden)]
-    #[cfg(wgpu_arm)]
-    pub fn video_begin_standin_for_test(
-        &self,
-        win: &mut WindowGpu,
-        w: u32,
-        h: u32,
-        opts: crate::video_tap::CaptureOpts,
-    ) -> Result<(), String> {
-        let tap = crate::video_tap::VideoTap::new(
-            &self.ctx.device,
-            w,
-            h,
-            VIRTUAL_PRESENT_TEXEL,
-            crate::video_tap::CaptureColorSpace::Srgb,
-            1.0,
-            opts,
-        )?;
-        win.video = Some(tap);
-        Ok(())
     }
 
     /// Test helper.
@@ -15777,29 +9958,6 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// Test helper.
-    #[doc(hidden)]
-    #[cfg(wgpu_arm)]
-    pub fn presented_snapshot_begin_standin_for_test(
-        &self,
-        win: &mut WindowGpu,
-        w: u32,
-        h: u32,
-    ) -> Result<(), String> {
-        if win.presented_snapshot.is_some() {
-            return Err("presented snapshot: capture already armed".to_string());
-        }
-        win.presented_snapshot = Some(crate::video_tap::PresentedFrameTap::new(
-            &self.ctx.device,
-            w.max(1),
-            h.max(1),
-            VIRTUAL_PRESENT_TEXEL,
-            crate::video_tap::CaptureColorSpace::Srgb,
-            1.0,
-        )?);
-        Ok(())
-    }
-
     /// Test helper: reset one window's SDR glow-boost envelope.
     #[doc(hidden)]
     pub const fn reset_glow_ease_for_test(&self, win: &mut WindowGpu) {
@@ -15807,281 +9965,9 @@ impl GpuRenderer {
         win.sdr_glow_level_at = None;
     }
 
-    /// The exact `BlitUniform` bytes the last present-path blit wrote.
-    #[cfg(all(target_os = "macos", test, wgpu_arm))]
-    pub(crate) fn last_blit_uniform_bytes(&self) -> Option<Vec<u8>> {
-        self.blit_uniform_written
-            .as_ref()
-            .map(|u| aterm_bits::bytes_of(u).to_vec())
-    }
-
-    /// Test helper.
-    #[doc(hidden)]
-    #[cfg(wgpu_arm)]
-    pub fn blit_to_offscreen_for_test(&mut self, win: &mut WindowGpu, invert: bool) -> Frame {
-        let (w, h) = {
-            let src = win
-                .offscreen
-                .as_ref()
-                .expect("render a frame before blitting");
-            (src.w, src.h)
-        };
-        self.blit_to_sized_for_test(win, invert, w, h)
-    }
-
-    /// Test helper.
-    #[doc(hidden)]
-    #[cfg(wgpu_arm)]
-    pub fn blit_to_sized_for_test(
-        &mut self,
-        win: &mut WindowGpu,
-        invert: bool,
-        dst_w: u32,
-        dst_h: u32,
-    ) -> Frame {
-        self.blit_to_sized_with_options_for_test(win, invert, None, None, dst_w, dst_h)
-    }
-
-    /// Test helper.
-    #[doc(hidden)]
-    #[cfg(wgpu_arm)]
-    pub fn blit_to_sized_cropped_for_test(
-        &mut self,
-        win: &mut WindowGpu,
-        invert: bool,
-        overlay: Option<DropOverlay>,
-        crop: PresentCrop,
-        dst_w: u32,
-        dst_h: u32,
-    ) -> Frame {
-        self.blit_to_sized_with_options_for_test(win, invert, overlay, Some(crop), dst_w, dst_h)
-    }
-
-    #[cfg(wgpu_arm)]
-    fn blit_to_sized_with_options_for_test(
-        &mut self,
-        win: &mut WindowGpu,
-        invert: bool,
-        overlay: Option<DropOverlay>,
-        source_crop: Option<PresentCrop>,
-        dst_w: u32,
-        dst_h: u32,
-    ) -> Frame {
-        let fx = BlitTestEffects {
-            invert,
-            overlay,
-            crop: source_crop,
-            ..BlitTestEffects::PLAIN
-        };
-        let dst =
-            self.blit_effect_target_for_test(win, fx, BlitTestTarget::Rgba8Unorm, dst_w, dst_h);
-        self.ctx.read_back(&dst, dst_w.max(1), dst_h.max(1))
-    }
-
-    #[cfg(wgpu_arm)]
-    fn blit_effect_target_for_test(
-        &mut self,
-        win: &mut WindowGpu,
-        fx: BlitTestEffects,
-        target: BlitTestTarget,
-        dst_w: u32,
-        dst_h: u32,
-    ) -> wgpu::Texture {
-        let (invert, overlay, source_crop) = (fx.invert, fx.overlay, fx.crop);
-        let src = win
-            .offscreen
-            .as_ref()
-            .expect("render a frame before blitting");
-        let (fw, fh) = (src.w, src.h);
-        assert!(
-            source_crop.is_none_or(|crop| valid_present_crop(crop, fh)),
-            "test crop must be a non-empty interval inside the resident source"
-        );
-        let (w, h) = (dst_w.max(1), dst_h.max(1));
-        let src_view = src.tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let format = target.wgpu();
-        let dst = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu test-blit dst (swapchain stand-in)"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut want =
-            present_blit_uniform(invert, overlay, source_crop, fw, fh, w, h, self.theme.bg);
-        want.chrome_y0 = win.chrome_y0 as f32;
-        want.chrome_y1 = win.chrome_y1 as f32;
-        if let Some(band_a) = fx.translucent {
-            want = want.with_translucency(band_a);
-            if fx.premult {
-                want = want.with_premultiplied_output();
-            }
-        }
-        want.encode_srgb = if fx.encode_srgb || !self.ctx.srgb_offscreen {
-            1.0
-        } else {
-            0.0
-        };
-        want.hdr = f32::from(u8::from(fx.hdr));
-        want.sdr_white_scale = fx.sdr_white_scale;
-        self.ctx
-            .queue
-            .write_buffer(&self.blit_uniform_buf, 0, aterm_bits::bytes_of(&want));
-        self.blit_uniform_written = Some(want);
-
-        let bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("aterm-gpu test blit bg"),
-                layout: &self.blit_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&src_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.blit_uniform_buf.as_entire_binding(),
-                    },
-                ],
-            });
-
-        self.ensure_blit_pipeline(format);
-        let pipeline = &self.blit_pipelines[&format];
-
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu test blit"),
-            });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu test blit pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        self.ctx.queue.submit([enc.finish()]);
-        dst
-    }
-
-    /// Read back [`Self::blit_effect_target_for_test`] as tightly packed RGBA bytes.
-    #[cfg(all(target_os = "macos", test, wgpu_arm))]
-    pub(crate) fn blit_effect_bytes_for_test(
-        &mut self,
-        win: &mut WindowGpu,
-        fx: BlitTestEffects,
-        target: BlitTestTarget,
-        dst_w: u32,
-        dst_h: u32,
-    ) -> Vec<u8> {
-        let (w, h) = (dst_w.max(1), dst_h.max(1));
-        let dst = self.blit_effect_target_for_test(win, fx, target, w, h);
-        self.texture_bytes_tight_for_test(&dst, w, h, target.bytes_per_texel())
-    }
-
-    #[cfg(all(target_os = "macos", test, wgpu_arm))]
-    fn texture_bytes_tight_for_test(
-        &self,
-        tex: &wgpu::Texture,
-        w: u32,
-        h: u32,
-        texel: usize,
-    ) -> Vec<u8> {
-        let row = w as usize * texel;
-        let padded = row.div_ceil(256) * 256;
-        let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("aterm-gpu test raw readback"),
-            size: (padded * h as usize) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu test raw readback"),
-            });
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded as u32),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        crate::device_layer::submit_host_readable(
-            &self.ctx.device,
-            &self.ctx.queue,
-            enc.finish(),
-            std::slice::from_ref(&buffer),
-        );
-        let slice = buffer.slice(..);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the copy was submitted by device_layer::submit_host_readable"
-        )]
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.ctx
-            .device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed");
-        let data = slice.get_mapped_range();
-        let mut out = Vec::with_capacity(row * h as usize);
-        for y in 0..h as usize {
-            out.extend_from_slice(&data[y * padded..y * padded + row]);
-        }
-        drop(data);
-        buffer.unmap();
-        out
-    }
-
     /// Test helper for the HDR clamp laws.
     #[doc(hidden)]
-    #[cfg(any(wgpu_arm, d3d11_arm))]
+    #[cfg(d3d11_arm)]
     pub fn present_hdr_for_test(
         &mut self,
         win: &mut WindowGpu,
@@ -16094,7 +9980,7 @@ impl GpuRenderer {
     /// Test helper; an armed D3D11 renderer runs its real present into an f16 destination
     /// (`d3d11_present_hdr_for_test`).
     #[doc(hidden)]
-    #[cfg(any(wgpu_arm, d3d11_arm))]
+    #[cfg(d3d11_arm)]
     pub fn present_hdr_sized_for_test(
         &mut self,
         win: &mut WindowGpu,
@@ -16109,559 +9995,7 @@ impl GpuRenderer {
                 .d3d11_present_hdr_for_test(win, input, boost_pass, (extra_w, extra_h))
                 .unwrap_or_else(|e| panic!("the D3D11 EDR present: {e}"));
         }
-        #[cfg(not(wgpu_arm))]
-        {
-            panic!("the EDR present seam: {}", self.d3d11_start_error())
-        }
-        #[cfg(wgpu_arm)]
-        {
-            self.wgpu_present_hdr_for_test(win, input, boost_pass, extra_w, extra_h)
-        }
-    }
-
-    /// The wgpu arm's EDR present for [`Self::present_hdr_sized_for_test`].
-    #[cfg(wgpu_arm)]
-    fn wgpu_present_hdr_for_test(
-        &mut self,
-        win: &mut WindowGpu,
-        input: &RenderInput,
-        boost_pass: bool,
-        extra_w: u32,
-        extra_h: u32,
-    ) -> (Vec<f32>, u32, u32) {
-        let (fw, fh) = self.encode_present_frame(win, input);
-        let (w, h) = (fw + extra_w, fh + extra_h);
-        let format = wgpu::TextureFormat::Rgba16Float;
-
-        let glow_present = fx_gpu::crown_glow_present(input);
-        let plan = crate::format_plan::hdr_present_plan(
-            self.hdr_glow,
-            true, // the stand-in target is Rgba16Float
-            glow_present,
-        );
-        let headroom = aterm_render::hdr::additive_headroom(win.edr_max);
-        let run_hdr_glow = boost_pass && plan.glow_boost_pass && headroom > 0.0;
-        let glow_count = if run_hdr_glow {
-            self.wgpu_bloom_glow(input).0
-        } else {
-            0
-        };
-        if self.bloom_items_live && glow_count > 0 {
-            self.ensure_glow_items_crown(Pipeline::HdrGlowItems, format);
-        }
-        if run_hdr_glow {
-            self.ensure_hdr_glow_pipeline();
-        }
-        self.ensure_blit_pipeline(format);
-
-        let src_view = win
-            .offscreen
-            .as_ref()
-            .expect("encode_present_frame sets offscreen")
-            .tex
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let dst = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu test-hdr dst (EDR swapchain stand-in)"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut want = BlitUniform::bell(false).with_bands(fw, fh, w, h, self.theme.bg);
-        want.encode_srgb = if self.ctx.srgb_offscreen { 0.0 } else { 1.0 };
-        want.hdr = if plan.blit_linear_encode { 1.0 } else { 0.0 };
-        want.sdr_white_scale = if plan.blit_linear_encode {
-            win.sdr_white_scale.max(1.0)
-        } else {
-            1.0
-        };
-        self.ctx
-            .queue
-            .write_buffer(&self.blit_uniform_buf, 0, aterm_bits::bytes_of(&want));
-        self.blit_uniform_written = Some(want);
-        if run_hdr_glow {
-            let hu = HdrGlowUniform {
-                screen: [w as f32, h as f32],
-                content_off: want.content_off,
-                boost: aterm_render::hdr::HDR_GLOW_BOOST * win.sdr_white_scale.max(1.0),
-                headroom: headroom * win.sdr_white_scale.max(1.0),
-                _pad: [0.0, 0.0],
-            };
-            self.ctx.queue.write_buffer(
-                self.hdr_glow_uniform_buf
-                    .as_ref()
-                    .expect("ensure_hdr_glow_pipeline sets the uniform buf"),
-                0,
-                aterm_bits::bytes_of(&hu),
-            );
-        }
-
-        let bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("aterm-gpu test hdr bg"),
-                layout: &self.blit_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&src_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.blit_uniform_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        let pipeline = &self.blit_pipelines[&format];
-
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu test hdr present"),
-            });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu test hdr pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.draw(0..3, 0..1);
-            if run_hdr_glow && glow_count > 0 {
-                pass.set_pipeline(if self.bloom_items_live {
-                    self.glow_items_wgpu
-                        .hdr
-                        .as_ref()
-                        .expect("ensure_glow_items_crown sets the pipeline")
-                } else {
-                    self.hdr_glow_pipeline
-                        .as_ref()
-                        .expect("ensure_hdr_glow_pipeline sets the pipeline")
-                });
-                pass.set_bind_group(
-                    0,
-                    self.hdr_glow_bg
-                        .as_ref()
-                        .expect("ensure_hdr_glow_pipeline sets the bind group"),
-                    &[],
-                );
-                self.wgpu_crown_stream(&mut pass);
-                pass.draw(0..6, 0..glow_count);
-            }
-        }
-
-        let padded = {
-            let raw = (w as usize) * 8;
-            raw.div_ceil(256) * 256
-        };
-        let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("aterm-gpu test hdr readback"),
-            size: (padded * h as usize) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &dst,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded as u32),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        crate::device_layer::submit_host_readable(
-            &self.ctx.device,
-            &self.ctx.queue,
-            enc.finish(),
-            std::slice::from_ref(&buffer),
-        );
-        let slice = buffer.slice(..);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the copy was submitted by device_layer::submit_host_readable"
-        )]
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.ctx
-            .device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed");
-        let data = slice.get_mapped_range();
-        let mut out = Vec::with_capacity((w * h * 4) as usize);
-        for row in 0..h as usize {
-            let base = row * padded;
-            for col in 0..w as usize {
-                let p = base + col * 8;
-                for ch in 0..4 {
-                    let bits = u16::from_le_bytes([data[p + ch * 2], data[p + ch * 2 + 1]]);
-                    out.push(f16_bits_to_f32(bits));
-                }
-            }
-        }
-        drop(data);
-        buffer.unmap();
-        (out, w, h)
-    }
-
-    #[cfg(wgpu_arm)]
-    fn ensure_blit_pipeline(&mut self, format: wgpu::TextureFormat) {
-        if self.blit_pipelines.contains_key(&format) {
-            return;
-        }
-        let pipeline = crate::pipeline_table::build_wgpu(
-            Pipeline::Blit.spec(),
-            &self.ctx.device,
-            &self.blit_shader,
-            &self.blit_layout,
-            self.ctx.pipeline_targets().with_present(format),
-        );
-        self.blit_pipelines.insert(format, pipeline);
-    }
-
-    #[cfg(wgpu_arm)]
-    fn ensure_tray_pipeline(&mut self, format: wgpu::TextureFormat) {
-        if self.tray_pipelines.contains_key(&format) {
-            return;
-        }
-        let pipeline = crate::pipeline_table::build_wgpu(
-            Pipeline::Tray.spec(),
-            &self.ctx.device,
-            &self.tray_shader,
-            &self.tray_layout,
-            self.ctx.pipeline_targets().with_present(format),
-        );
-        self.tray_pipelines.insert(format, pipeline);
-    }
-
-    #[cfg(wgpu_arm)]
-    fn ensure_tray_overlay(&mut self, win: &mut WindowGpu, rgba: &[u8], w: u32, h: u32) {
-        let recreate = match &win.tray_overlay {
-            Some(t) => t.w != w || t.h != h,
-            None => true,
-        };
-        if recreate {
-            let texture = self.ctx.device_layer().create_texture_2d(
-                "aterm-gpu tray overlay",
-                crate::device_layer::TexelFormat::Rgba8Unorm,
-                w,
-                h,
-                crate::device_layer::TexUsage::UPLOADED_SAMPLED,
-                None,
-            );
-            let view = texture
-                .wgpu()
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            let bind = self
-                .ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("aterm-gpu tray overlay bg"),
-                    layout: &self.tray_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.tray_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: self.tray_uniform_buf.as_entire_binding(),
-                        },
-                    ],
-                });
-            win.tray_overlay = Some(TrayOverlay {
-                texture,
-                bind,
-                w,
-                h,
-                pixels: Vec::new(),
-            });
-        }
-        let overlay = win.tray_overlay.as_mut().expect("tray_overlay set above");
-        let stride = w as usize * 4;
-        let (y0, y1) = if recreate || overlay.pixels.len() != rgba.len() {
-            (0, h)
-        } else {
-            match changed_row_band(&overlay.pixels, rgba, stride) {
-                Some(band) => band,
-                None => return,
-            }
-        };
-        let band = &rgba[y0 as usize * stride..y1 as usize * stride];
-        self.ctx
-            .device_layer()
-            .upload_texture_rows(&overlay.texture, y0, y1 - y0, band, w * 4, w);
-        if overlay.pixels.len() == rgba.len() {
-            overlay.pixels[y0 as usize * stride..y1 as usize * stride].copy_from_slice(band);
-        } else {
-            overlay.pixels.clear();
-            overlay.pixels.extend_from_slice(rgba);
-        }
-        self.tray_uploads += 1;
-        self.tray_upload_bytes += band.len() as u64;
-    }
-
-    #[cfg(wgpu_arm)]
-    fn place_tray_scrim(&mut self, scrim: TrayScrim, (fw, fh): (u32, u32)) -> Option<[u32; 4]> {
-        let top = scrim.top.min(fh);
-        if top >= fh || fw == 0 {
-            return None;
-        }
-        let fresh = self.tray_scrim.is_none();
-        if fresh {
-            let texture = self.ctx.device_layer().create_texture_2d(
-                "aterm-gpu tray scrim",
-                crate::device_layer::TexelFormat::Rgba8Unorm,
-                1,
-                1,
-                crate::device_layer::TexUsage::UPLOADED_SAMPLED,
-                None,
-            );
-            let view = texture
-                .wgpu()
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            let uniform = self
-                .ctx
-                .device_layer()
-                .create_uniform_buffer(
-                    "aterm-gpu tray scrim placement uniform",
-                    std::mem::size_of::<TrayUniform>() as u64,
-                )
-                .into_wgpu();
-            let bind = self
-                .ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("aterm-gpu tray scrim bg"),
-                    layout: &self.tray_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.tray_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: uniform.as_entire_binding(),
-                        },
-                    ],
-                });
-            self.tray_scrim = Some(TrayScrimLayer {
-                texture,
-                bind,
-                uniform,
-                rgba: scrim.rgba,
-            });
-        }
-        let layer = self.tray_scrim.as_mut().expect("tray_scrim set above");
-        if fresh || layer.rgba != scrim.rgba {
-            self.ctx
-                .device_layer()
-                .upload_texture_full(&layer.texture, &scrim.rgba, 4, 1, 1);
-            layer.rgba = scrim.rgba;
-        }
-        let want = TrayUniform {
-            rect: [0.0, top as f32, fw as f32, (fh - top) as f32],
-            fb: [fw as f32, fh as f32],
-            _pad: [0.0, 0.0],
-        };
-        self.ctx
-            .queue
-            .write_buffer(&layer.uniform, 0, aterm_bits::bytes_of(&want));
-        Some([0, top, fw, fh])
-    }
-
-    #[cfg(wgpu_arm)]
-    fn draw_tray_into_offscreen(&mut self, win: &mut WindowGpu, tray: TrayQuad<'_>) {
-        let format = self.ctx.offscreen_format();
-
-        self.ensure_tray_pipeline(format);
-        self.ensure_tray_overlay(win, tray.rgba, tray.pw, tray.ph);
-
-        let (fw, fh) = {
-            let off = win.offscreen.as_ref().expect("encode_frame sets offscreen");
-            (off.w, off.h)
-        };
-        note_offscreen_written(win, None, (fw, fh));
-        let scrim = tray
-            .scrim
-            .and_then(|scrim| self.place_tray_scrim(scrim, (fw, fh)));
-        let want = TrayUniform {
-            rect: [
-                tray.dx as f32,
-                tray.dy as f32,
-                tray.pw as f32,
-                tray.ph as f32,
-            ],
-            fb: [fw as f32, fh as f32],
-            _pad: [0.0, 0.0],
-        };
-        self.ctx
-            .queue
-            .write_buffer(&self.tray_uniform_buf, 0, aterm_bits::bytes_of(&want));
-
-        let view = &win
-            .offscreen
-            .as_ref()
-            .expect("encode_frame sets offscreen")
-            .view;
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu tray-into-offscreen"),
-            });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu tray offscreen pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: self.wgpu_pass_timestamps(),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            let t = win
-                .tray_overlay
-                .as_ref()
-                .expect("ensure_tray_overlay set it above");
-            pass.set_pipeline(&self.tray_pipelines[&format]);
-            if scrim.is_some()
-                && let Some(layer) = self.tray_scrim.as_ref()
-            {
-                pass.set_bind_group(0, &layer.bind, &[]);
-                pass.draw(0..4, 0..1);
-            }
-            pass.set_bind_group(0, &t.bind, &[]);
-            pass.draw(0..4, 0..1); // 4-vert triangle-strip quad
-        }
-        self.ctx.queue.submit([enc.finish()]);
-    }
-
-    #[cfg(wgpu_arm)]
-    fn draw_tray_over_present_copy(
-        &mut self,
-        win: &mut WindowGpu,
-        tray: TrayQuad<'_>,
-        enc: &mut wgpu::CommandEncoder,
-    ) {
-        let format = self.ctx.offscreen_format();
-        self.ensure_tray_pipeline(format);
-        self.ensure_tray_overlay(win, tray.rgba, tray.pw, tray.ph);
-        let Some((fw, fh)) = win.present_offscreen.as_ref().map(|p| (p.w, p.h)) else {
-            return;
-        };
-        let want = TrayUniform {
-            rect: [
-                tray.dx as f32,
-                tray.dy as f32,
-                tray.pw as f32,
-                tray.ph as f32,
-            ],
-            fb: [fw as f32, fh as f32],
-            _pad: [0.0, 0.0],
-        };
-        self.ctx
-            .queue
-            .write_buffer(&self.tray_uniform_buf, 0, aterm_bits::bytes_of(&want));
-        let rect = [
-            tray.dx.min(fw),
-            tray.dy.min(fh),
-            tray.dx.saturating_add(tray.pw).min(fw),
-            tray.dy.saturating_add(tray.ph).min(fh),
-        ];
-        win.present_offscreen_fx = union_rect_opt(win.present_offscreen_fx, Some(rect), (fw, fh));
-        let scrim = tray
-            .scrim
-            .and_then(|scrim| self.place_tray_scrim(scrim, (fw, fh)));
-        if let Some(rect) = scrim {
-            win.present_offscreen_fx =
-                union_rect_opt(win.present_offscreen_fx, Some(rect), (fw, fh));
-        }
-        let po = win
-            .present_offscreen
-            .as_ref()
-            .expect("the dims read above imply a resident copy");
-        let t = win
-            .tray_overlay
-            .as_ref()
-            .expect("ensure_tray_overlay set it above");
-        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("aterm-gpu tray present-copy pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &po.view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: self.wgpu_pass_timestamps(),
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_pipeline(&self.tray_pipelines[&format]);
-        if scrim.is_some()
-            && let Some(layer) = self.tray_scrim.as_ref()
-        {
-            pass.set_bind_group(0, &layer.bind, &[]);
-            pass.draw(0..4, 0..1);
-        }
-        pass.set_bind_group(0, &t.bind, &[]);
-        pass.draw(0..4, 0..1); // 4-vert triangle-strip quad
+        panic!("the EDR present seam: {}", self.d3d11_start_error())
     }
 
     #[cfg_attr(
@@ -16748,22 +10082,10 @@ impl GpuRenderer {
         }
     }
 
-    /// Encode and submit the GPU work and wait for completion without reading pixels back.
-    #[cfg(wgpu_arm)]
-    pub fn render_no_readback(&mut self, win: &mut WindowGpu, input: &RenderInput) {
-        win.present_prev = None;
-        let _ = self.encode_frame(win, input, &RepaintScope::Full);
-        self.ctx
-            .device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed");
-    }
-
     fn ensure_sprite_texture(
         &mut self,
         slot: &mut Option<Arc<SpriteTex>>,
         source: Option<&Arc<SceneAtlas>>,
-        label: &'static str,
     ) {
         let Some(source) = source else {
             *slot = None;
@@ -16784,46 +10106,6 @@ impl GpuRenderer {
             *slot = Some(texture);
             return;
         }
-        #[cfg(wgpu_arm)]
-        let bind = {
-            let handle = self.ctx.device_layer();
-            let tex = handle.create_texture_2d(
-                label,
-                crate::device_layer::TexelFormat::Rgba8Unorm,
-                src.width,
-                src.height,
-                crate::device_layer::TexUsage::UPLOADED_SAMPLED,
-                None,
-            );
-            handle.upload_texture_full(
-                &tex,
-                &src.rgba[..need],
-                src.width * 4,
-                src.width,
-                src.height,
-            );
-            let view = tex
-                .wgpu()
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            self.ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(label),
-                    layout: &self.atlas_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                    ],
-                })
-        };
-        #[cfg(not(wgpu_arm))]
-        let _ = label;
         let texture = Arc::new(SpriteTex {
             #[cfg(target_os = "macos")]
             metal_atlas: std::sync::OnceLock::new(),
@@ -16831,8 +10113,6 @@ impl GpuRenderer {
             gl_atlas: std::sync::Mutex::new(None),
             #[cfg(d3d11_arm)]
             d3d11_atlas: std::sync::Mutex::new(None),
-            #[cfg(wgpu_arm)]
-            bind,
             w: src.width,
             h: src.height,
             src: Arc::clone(source),
@@ -16843,11 +10123,7 @@ impl GpuRenderer {
 
     #[inline]
     fn ensure_wallpaper_tex(&mut self, win: &mut WindowGpu, input: &RenderInput) {
-        self.ensure_sprite_texture(
-            &mut win.wallpaper_tex,
-            input.wallpaper.as_ref(),
-            "aterm-gpu wallpaper",
-        );
+        self.ensure_sprite_texture(&mut win.wallpaper_tex, input.wallpaper.as_ref());
     }
 
     fn record_frame_instance_totals(
@@ -17202,28 +10478,6 @@ impl GpuRenderer {
         // The D3D11 arm likewise (Windows).
         #[cfg(d3d11_arm)]
         let d3d11_armed = self.d3d11_arm_ready();
-        #[cfg(not(wgpu_arm))]
-        let fx_ok = true;
-        #[cfg(wgpu_arm)]
-        let fx_ok = {
-            #[cfg(target_os = "macos")]
-            let first_party = armed;
-            #[cfg(gl_arm)]
-            let first_party = gl_armed;
-            #[cfg(d3d11_arm)]
-            let first_party = d3d11_armed;
-            #[cfg(not(any(target_os = "macos", gl_arm, d3d11_arm)))]
-            let first_party = false;
-            first_party
-                || input.fx_layers.is_empty()
-                    && input.glow_under_ramps.is_empty()
-                    && input.cursor_glow_add_ramps.is_empty()
-                || self
-                    .effects
-                    .fx_layouts(&self.ctx.device)
-                    .inspect_err(|why| note_fx_closed(why))
-                    .is_ok()
-        };
         self.build_image_plane(win, input);
         let mono_res = self
             .mono_res
@@ -17237,12 +10491,6 @@ impl GpuRenderer {
         let color_atlas = &color_res.atlas;
         let (aw, ah) = (atlas.width as f32, mono_res.tex_h as f32);
         let (caw, cah) = (color_atlas.width as f32, color_res.tex_h as f32);
-        #[cfg(wgpu_arm)]
-        let atlas_bind = &mono_res.bind;
-        #[cfg(wgpu_arm)]
-        let color_bind = &color_res.bind;
-        #[cfg(wgpu_arm)]
-        let deco_bind = self.deco_atlas.as_ref().map(|d| &d.bind);
 
         let backdrop_margins_active = self.backdrop_margins_active();
         let backdrop_margin_alpha_byte = (self.backdrop_margin_alpha() * 255.0).round() as u8;
@@ -18298,7 +11546,7 @@ impl GpuRenderer {
         self.fx.atlas_bytes = 0;
         self.fx.reader_wait = (0, 0);
         self.fx.refused = 0;
-        let fx_built = fx_ok && !(input.fx_layers.is_empty() && input.fx_prefetch.is_empty());
+        let fx_built = !(input.fx_layers.is_empty() && input.fx_prefetch.is_empty());
         if fx_built {
             let cap = self.fx_atlas_cap();
             // The companions' bodies cut where their letters lie, as the CPU composite draws
@@ -18329,11 +11577,10 @@ impl GpuRenderer {
         // linear light, rounding each store, so there order counts), its
         // quads as glow instances first. Elsewhere, and where fx cannot draw,
         // it draws as the quads it stands for.
-        let ramps_fx = fx_ok
-            && self.ramps_open_fx(
-                self.inst.fx_instances() > 0,
-                [&input.glow_under_ramps, &input.cursor_glow_add_ramps],
-            );
+        let ramps_fx = self.ramps_open_fx(
+            self.inst.fx_instances() > 0,
+            [&input.glow_under_ramps, &input.cursor_glow_add_ramps],
+        );
         let raw_adds = self.additive_is_byte_exact();
         let fx_route = |quads: &[aterm_render::GlowQuad], ramps: &aterm_render::GlowRamps| {
             (ramps_fx && !ramps.is_empty()).then(|| raw_adds && fx_gpu::ramps_commute(quads, ramps))
@@ -18561,30 +11808,7 @@ impl GpuRenderer {
 
         let text_blend =
             u32::from(self.cpu.text_blending() == aterm_render::TextBlending::LinearCorrected);
-        #[cfg(wgpu_arm)]
-        {
-            if self.uniform_written != Some((w, h, text_blend)) {
-                self.ctx.queue.write_buffer(
-                    &self.uniform_buf,
-                    0,
-                    aterm_bits::bytes_of(&Uniforms {
-                        screen: [w as f32, h as f32],
-                        text_blend: text_blend as f32,
-                        _pad: 0.0,
-                    }),
-                );
-                self.uniform_written = Some((w, h, text_blend));
-            }
-        }
 
-        #[cfg(wgpu_arm)]
-        ensure_effect_pipelines(
-            &mut self.effects,
-            &self.ctx.device,
-            &self.inst,
-            input,
-            cursor_opaque,
-        );
         #[cfg(gl_arm)]
         if gl_armed {
             let build_ns = elapsed_ns(build_started);
@@ -18629,19 +11853,14 @@ impl GpuRenderer {
                     self.last_frame_arm_gl = true;
                     return (w, h);
                 }
-                Err(e) => gl_arm::gl_arm_note(&format!(
-                    "armed frame failed ({e}); {}",
-                    if cfg!(wgpu_arm) {
-                        "this frame draws on wgpu"
-                    } else {
-                        "this frame is lost"
-                    }
-                )),
+                Err(e) => {
+                    gl_arm::gl_arm_note(&format!("armed frame failed ({e}); this frame is lost"))
+                }
             }
         }
         // The D3D11 tail (Windows, `d3d11_arm.rs`): the same instance bytes,
         // plan and rig law on the D3D11 arm. A failure takes one named note and
-        // falls through to the wgpu tail.
+        // the frame is lost.
         #[cfg(d3d11_arm)]
         if d3d11_armed {
             let build_ns = elapsed_ns(build_started);
@@ -18687,12 +11906,7 @@ impl GpuRenderer {
                     return (w, h);
                 }
                 Err(e) => d3d11_arm::d3d11_arm_note(&format!(
-                    "armed frame failed ({e}); {}",
-                    if cfg!(wgpu_arm) {
-                        "this frame draws on wgpu"
-                    } else {
-                        "this frame is lost"
-                    }
+                    "armed frame failed ({e}); this frame is lost"
                 )),
             }
         }
@@ -19135,10 +12349,6 @@ impl GpuRenderer {
                                 _ => live.current_slot_mut().inflight = Some(submitted),
                             }
                         }
-                        #[cfg(wgpu_arm)]
-                        crate::device_layer::SubmittedFrame::Wgpu => {
-                            unreachable!("a metal encoder commits a metal frame")
-                        }
                     }
                     passes
                 };
@@ -19159,179 +12369,11 @@ impl GpuRenderer {
             }
         }
 
-        #[cfg(not(wgpu_arm))]
+        #[cfg(target_os = "macos")]
         {
-            #[cfg(target_os = "macos")]
-            {
-                self.last_frame_arm_metal = false;
-            }
-            (w, h)
+            self.last_frame_arm_metal = false;
         }
-        #[cfg(wgpu_arm)]
-        {
-            let (device, queue) = (&self.ctx.device, &self.ctx.queue);
-            let build_ns = elapsed_ns(build_started);
-            let stage_started = aterm_time::Instant::now();
-            let fx_ready = fx_wgpu_sync(
-                &mut self.fx_wgpu,
-                &mut self.fx,
-                &mut self.effects,
-                device,
-                queue,
-                &self.inst,
-                fx_gpu::under_draws_opaque(input),
-            );
-            let mut streams: [Option<wgpu::BufferSlice<'_>>; STREAM_COUNT] = [None; STREAM_COUNT];
-            let mut counts: [Option<u32>; STREAM_COUNT] = [None; STREAM_COUNT];
-            for (&id, vb) in StreamId::ALL.iter().zip(self.vbufs.streams.iter_mut()) {
-                if id.is_fx() && !fx_ready {
-                    continue;
-                }
-                let (bytes, count) = self.inst.stream_bytes(id);
-                if let Some(slice) = vb.upload(device, queue, bytes) {
-                    streams[id as usize] = Some(slice);
-                    counts[id as usize] = Some(count);
-                }
-            }
-            let stage_ns = elapsed_ns(stage_started);
-
-            let recreate = match &win.offscreen {
-                Some(o) => o.w != w || o.h != h,
-                None => true,
-            };
-            if recreate {
-                let tex = self.ctx.offscreen_texture(w, h);
-                let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-                let view_srgb = tex.create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(self.ctx.offscreen_srgb_view_format()),
-                    ..Default::default()
-                });
-                let src_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-                let blit_bind = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("aterm-gpu blit bg"),
-                        layout: &self.blit_bgl,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&src_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: self.blit_uniform_buf.as_entire_binding(),
-                            },
-                        ],
-                    });
-                win.offscreen = Some(Offscreen {
-                    tex,
-                    view,
-                    view_srgb,
-                    blit_bind,
-                    w,
-                    h,
-                    bloom: None,
-                });
-            }
-
-            let (load_op, scissor) = frame_load_and_scissor(
-                scope,
-                recreate,
-                dirty_band,
-                grid_top,
-                ch,
-                rows,
-                (w, h),
-                theme_color_alpha(frame_bg, f64::from(bg_opacity)),
-            );
-            note_offscreen_written(
-                win,
-                scissor.map(|(sx, sy, sw, sh)| [sx, sy, sx + sw, sy + sh]),
-                (w, h),
-            );
-
-            #[cfg(wgpu_arm)]
-            let wallpaper_bind = win.wallpaper_tex.as_ref().map(|s| &s.bind);
-
-            let off = win.offscreen.as_ref().expect("offscreen set above");
-            let view = &off.view;
-            let view_srgb = &off.view_srgb;
-
-            let mut plan = std::mem::take(&mut self.frame_plan);
-            let unorm = build_frame_plan(
-                &mut plan,
-                &counts,
-                FramePlanCtx {
-                    has_image_plane: win.image_plane.is_some(),
-                    has_deco: deco_bind.is_some(),
-                    has_wallpaper: wallpaper_bind.is_some(),
-                    cursor_opaque,
-                    ablation: self.ablation,
-                    under_opaque: fx_gpu::under_draws_opaque(input),
-                },
-            );
-            let load0 = load_op;
-            let res = FrameRes::Wgpu(WgpuFrameRes {
-                bg_pipeline: &self.bg_pipeline,
-                glyph_pipeline: &self.glyph_pipeline,
-                color_glyph_pipeline: &self.color_glyph_pipeline,
-                effects: &self.effects,
-                uniform_bg: &self.uniform_bg,
-                view,
-                view_srgb,
-                atlas_mono: atlas_bind,
-                atlas_color: color_bind,
-                atlas_deco: deco_bind,
-                atlas_image: win.image_plane.as_ref().map(|p| &p.bind),
-                atlas_wallpaper: wallpaper_bind,
-                atlas_fx: self
-                    .fx_wgpu
-                    .bind
-                    .as_ref()
-                    .filter(|_| fx_ready)
-                    .map(|(_, b)| b),
-                streams,
-            });
-            let mut fenc = crate::device_layer::FrameEncoder::wgpu(
-                &self.ctx.device,
-                &self.ctx.queue,
-                self.wgpu_timer.as_ref(),
-                "aterm-gpu frame",
-            );
-            let passes = run_frame_plan(&mut fenc, &res, &plan, load0, scissor)
-                .expect("the wgpu frame-plan arm has no fallible verb");
-
-            match fenc.submit() {
-                crate::device_layer::SubmittedFrame::Wgpu => {}
-                #[cfg(target_os = "macos")]
-                crate::device_layer::SubmittedFrame::Metal(_) => {
-                    unreachable!("the production encode constructs the Wgpu arm only")
-                }
-                #[cfg(gl_arm)]
-                crate::device_layer::SubmittedFrame::Gl(_) => {
-                    unreachable!("the production encode constructs the Wgpu arm only")
-                }
-                #[cfg(d3d11_arm)]
-                crate::device_layer::SubmittedFrame::D3d11(_) => {
-                    unreachable!("the production encode constructs the Wgpu arm only")
-                }
-            }
-            self.last_frame_passes = passes as u32;
-            self.frame_plan = plan;
-            self.last_frame_load = load0;
-            self.last_frame_scissor = scissor;
-            self.record_frame_instance_totals(passes as u32, build_ns, stage_ns, unorm, fx_ready);
-            #[cfg(target_os = "macos")]
-            {
-                self.last_frame_arm_metal = false;
-            }
-            (w, h)
-        }
+        (w, h)
     }
 }
 
@@ -19378,7 +12420,7 @@ fn clip_textured_quad_x(
     true
 }
 
-#[cfg(any(wgpu_arm, d3d11_arm))]
+#[cfg(any(d3d11_arm, all(test, target_os = "macos")))]
 #[inline]
 pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
     let sign = if bits & 0x8000 != 0 { -1.0f32 } else { 1.0 };
@@ -19556,1104 +12598,6 @@ fn theme_color_alpha(c: u32, a: f64) -> crate::device_layer::ClearColor4 {
     }
 }
 
-/// One present differential's result.
-#[cfg(all(target_os = "macos", test, wgpu_arm))]
-pub(crate) type PresentDifferential = (Vec<u8>, Vec<u8>, (u32, u32), [bool; 3]);
-
-/// The Metal present replay's yield.
-#[cfg(all(target_os = "macos", test, wgpu_arm))]
-pub(crate) type PresentReplay = (Vec<u8>, [bool; 3]);
-
-#[cfg(all(target_os = "macos", test))]
-impl GpuRenderer {
-    /// The streams the most recent frame's plan drew, so differential fixtures can prove they
-    /// drive the rows they claim.
-    #[cfg(wgpu_arm)]
-    pub(crate) fn last_frame_plan_streams_for_test(&self) -> Vec<(StreamId, DrawPipe)> {
-        self.frame_plan
-            .iter()
-            .map(|item| (item.stream, item.pipe))
-            .collect()
-    }
-
-    /// The recorded pass-0 load op, so a fixture can prove it exercised the scissored `Load` path.
-    #[cfg(wgpu_arm)]
-    pub(crate) fn last_frame_load_for_test(&self) -> crate::device_layer::FrameLoad {
-        self.last_frame_load
-    }
-
-    /// The recorded per-pass scissor — `None` == a full-frame encode.
-    #[cfg(wgpu_arm)]
-    pub(crate) fn last_frame_scissor_for_test(&self) -> Option<(u32, u32, u32, u32)> {
-        self.last_frame_scissor
-    }
-
-    /// Full-frame differential.
-    #[cfg(wgpu_arm)]
-    pub(crate) fn frame_differential_for_test(
-        &mut self,
-        win: &mut WindowGpu,
-        input: &RenderInput,
-    ) -> Result<Option<(Frame, Frame)>, String> {
-        let expected = self.try_render_input(win, input, None)?;
-        let (w, h) = (expected.width as u32, expected.height as u32);
-        Ok(self
-            .metal_replay_recorded_plan_for_test(win, input, (w, h), None)?
-            .map(|actual| (expected, actual)))
-    }
-
-    /// The Metal half of the differential.
-    #[cfg(wgpu_arm)]
-    pub(crate) fn metal_replay_recorded_plan_for_test(
-        &mut self,
-        win: &WindowGpu,
-        input: &RenderInput,
-        (w, h): (u32, u32),
-        seed: Option<&Frame>,
-    ) -> Result<Option<Frame>, String> {
-        use crate::device_layer::{
-            DeviceHandle, FrameCopyTexture, FrameEncoder, LayerTexture, SubmittedFrame, TexUsage,
-            TexelFormat, metal_try_read_back,
-        };
-        use crate::metal::ffi::{Device as MtlDevice, Obj, PixelFormat, SamplerDesc};
-        use crate::metal::loss::{CbOutcome, LossLatch};
-        use crate::metal::resources::{MetalResourceDevice, SealedTexture, SharedBuffer};
-        use std::sync::Arc;
-
-        assert!(
-            !self.enable_bloom && !self.enable_shimmer,
-            "the W4 differential replays the ENCODE plan; bloom/shimmer are \
-             present-time layers (W5) — call set_bloom(false)/set_shimmer(false)"
-        );
-        let _pool = crate::metal::ffi::AutoreleasePool::new();
-        let Some(mdev) = MtlDevice::preferred() else {
-            return Ok(None);
-        };
-
-        let plan = self.frame_plan.clone();
-        let load0 = self.last_frame_load;
-        let scissor = self.last_frame_scissor;
-        assert!(
-            matches!(load0, crate::device_layer::FrameLoad::Clear(_)) || seed.is_some(),
-            "a recorded LOAD plan reads the prior frame's texels — the caller \
-             must seed the Metal offscreen with the pre-encode offscreen bytes"
-        );
-        let mut apron_win = WindowGpu::default();
-        let apron_plan = self.apron_strip_plan(&mut apron_win, input, h as usize);
-
-        let latch = Arc::new(LossLatch::new());
-        let session = crate::metal::encoder::EncodeSession::new(&mdev, Arc::clone(&latch))?;
-        let mint = MetalResourceDevice::new(&mdev, Arc::clone(&latch));
-        let handle = DeviceHandle::Metal(&mint);
-
-        let off_tex = handle.create_texture_2d(
-            "w4 differential offscreen",
-            TexelFormat::Rgba8Unorm,
-            w,
-            h,
-            TexUsage::OFFSCREEN,
-            Some(TexelFormat::Rgba8UnormSrgb),
-        );
-        if let Some(seed) = seed {
-            assert_eq!(
-                (seed.width as u32, seed.height as u32),
-                (w, h),
-                "the seed frame must be the pre-encode offscreen at these dims"
-            );
-            let mut bytes = Vec::with_capacity(seed.pixels.len() * 4);
-            for p in &seed.pixels {
-                bytes.extend_from_slice(&[
-                    (p >> 16) as u8,
-                    (p >> 8) as u8,
-                    *p as u8,
-                    255 - (p >> 24) as u8,
-                ]);
-            }
-            handle.upload_texture_full(&off_tex, &bytes, w * 4, w, h);
-        }
-        let LayerTexture::Metal(offscreen) = off_tex else {
-            unreachable!("the Metal handle mints Metal textures")
-        };
-        let offscreen_srgb = offscreen
-            .alias_view(PixelFormat::Rgba8UnormSrgb)
-            .ok_or_else(|| "the offscreen's sRGB alias view failed to vend".to_owned())?;
-
-        let lib = crate::metal::pipelines::compile_library(&mdev, ShaderLibrary::Cell)?;
-        let mut psos: [Option<Obj>; pipeline_table::PIPELINE_COUNT] = std::array::from_fn(|_| None);
-        let mut uniform_vertex_slot: Option<u32> = None;
-        let mut uniform_fragment_slot: Option<u32> = None;
-        for item in &plan {
-            assert!(
-                !item.fetch,
-                "the differential replays a wgpu plan, which keeps the split"
-            );
-            let row = item.pipe.row();
-            let spec = row.spec();
-            assert!(
-                matches!(spec.library, ShaderLibrary::Cell),
-                "every frame-plan row lives in cell.metal; {row:?} says {:?}",
-                spec.library
-            );
-            let vu = spec
-                .binds
-                .vertex_uniform
-                .unwrap_or_else(|| panic!("frame row {row:?} declares no vertex uniform"));
-            match uniform_vertex_slot {
-                None => uniform_vertex_slot = Some(vu),
-                Some(prev) => assert_eq!(
-                    prev, vu,
-                    "one shared uniform bind per pass requires one slot; {row:?} disagrees"
-                ),
-            }
-            if let Some(&fb) = spec.binds.fragment_buffers.first() {
-                assert_eq!(
-                    spec.binds.fragment_buffers.len(),
-                    1,
-                    "frame rows re-bind at most the one shared uniform block"
-                );
-                match uniform_fragment_slot {
-                    None => uniform_fragment_slot = Some(fb),
-                    Some(prev) => assert_eq!(prev, fb, "{row:?} disagrees on the fragment slot"),
-                }
-            }
-            if psos[row as usize].is_none() {
-                psos[row as usize] = Some(crate::metal::pipelines::build(
-                    &mdev,
-                    &lib,
-                    spec,
-                    PixelFormat::Bgra8Unorm,
-                )?);
-            }
-        }
-
-        let (uw, uh, tb) = self
-            .uniform_written
-            .expect("encode_frame wrote the shared uniforms");
-        assert_eq!(
-            (uw, uh),
-            (w, h),
-            "the differential replays the frame that was just encoded"
-        );
-        let ubuf = mint.buffer(std::mem::size_of::<Uniforms>())?;
-        // SAFETY: `Uniforms` is `Pod` into an exactly-sized fresh shared buffer with no GPU work in
-        // flight.
-        unsafe {
-            crate::metal::ffi::buffer_write(
-                &ubuf,
-                aterm_bits::bytes_of(&Uniforms {
-                    screen: [w as f32, h as f32],
-                    text_blend: tb as f32,
-                    _pad: 0.0,
-                }),
-            );
-        }
-
-        let mut streams: [Option<SharedBuffer>; STREAM_COUNT] = std::array::from_fn(|_| None);
-        for item in &plan {
-            let idx = item.stream as usize;
-            if streams[idx].is_some() {
-                continue;
-            }
-            let (bytes, _) = self.inst.stream_bytes(item.stream);
-            assert!(!bytes.is_empty(), "a planned stream has bytes");
-            let buf = mint.buffer(bytes.len())?;
-            // SAFETY: fresh exactly-sized shared buffer; no GPU work in flight.
-            unsafe { crate::metal::ffi::buffer_write(&buf, bytes) };
-            streams[idx] = Some(SharedBuffer::new(buf));
-        }
-
-        let mut atlases: [Option<(SealedTexture, Obj)>; DRAW_ATLAS_COUNT] =
-            std::array::from_fn(|_| None);
-        for item in &plan {
-            let Some(a) = item.atlas else { continue };
-            if atlases[a as usize].is_some() {
-                continue;
-            }
-            let (format, tw, th, occupied): (TexelFormat, u32, u32, &[u8]) = match a {
-                DrawAtlas::Fx => continue,
-                DrawAtlas::Mono => {
-                    let res = self.mono_res.as_ref().expect("encode set mono_res");
-                    (
-                        TexelFormat::R8Unorm,
-                        res.atlas.width,
-                        res.tex_h,
-                        &res.atlas.data[..(res.atlas.width * res.atlas.height) as usize],
-                    )
-                }
-                DrawAtlas::Color => {
-                    let res = self.color_res.as_ref().expect("encode set color_res");
-                    (
-                        TexelFormat::Rgba8Unorm,
-                        res.atlas.width,
-                        res.tex_h,
-                        &res.atlas.data[..(res.atlas.width * res.atlas.height * 4) as usize],
-                    )
-                }
-                DrawAtlas::Wallpaper => {
-                    let src = win
-                        .wallpaper_tex
-                        .as_ref()
-                        .unwrap_or_else(|| panic!("plan samples {a:?} but its SpriteTex is absent"))
-                        .src
-                        .as_ref();
-                    (
-                        TexelFormat::Rgba8Unorm,
-                        src.width,
-                        src.height,
-                        &src.rgba[..(src.width * src.height * 4) as usize],
-                    )
-                }
-                DrawAtlas::Deco => {
-                    let d = self
-                        .deco_atlas
-                        .as_ref()
-                        .expect("plan samples the deco atlas");
-                    (
-                        TexelFormat::R8Unorm,
-                        d.atlas_w as u32,
-                        d.ch as u32,
-                        &d.data[..],
-                    )
-                }
-                DrawAtlas::Image => {
-                    return Err(
-                        "W4 differential fixture reached the image plane (W5+); keep \
-                         fixtures inside the sweep"
-                            .to_string(),
-                    );
-                }
-            };
-            let bpp = format.bytes_per_texel();
-            let mut data = vec![0u8; (tw * th * bpp) as usize];
-            data[..occupied.len()].copy_from_slice(occupied);
-            let tex = handle.create_texture_2d(
-                "w4 differential atlas",
-                format,
-                tw,
-                th,
-                TexUsage::UPLOADED_SAMPLED,
-                None,
-            );
-            handle.upload_texture_full(&tex, &data, tw * bpp, tw, th);
-            let LayerTexture::Metal(tex) = tex else {
-                unreachable!("the Metal handle mints Metal textures")
-            };
-            let sampler = mint.sampler(SamplerDesc::NEAREST_CLAMP)?;
-            atlases[a as usize] = Some((tex, sampler));
-        }
-
-        let fx = if plan.iter().any(|i| i.atlas == Some(DrawAtlas::Fx)) {
-            let mut texes = [None, None];
-            for kind in [fx_gpu::FxAtlasKind::R8, fx_gpu::FxAtlasKind::Rgba] {
-                fx_gpu::sync_fx_tex(
-                    handle,
-                    &mut texes[kind as usize],
-                    self.fx.atlas.side(kind),
-                    |_| true,
-                    || {},
-                )?;
-            }
-            let palette_bytes: &[u8] = aterm_bits::cast_slice(&self.fx.palette);
-            let palette = mint.buffer(palette_bytes.len().max(16))?;
-            // SAFETY: fresh shared buffer of at least the palette's length with no GPU work in
-            // flight.
-            unsafe { crate::metal::ffi::buffer_write(&palette, palette_bytes) };
-            let [r8, rgba] =
-                texes.map(|t| t.expect("sync_fx_tex mints a texture").tex.into_metal());
-            Some(MetalFxBind { r8, rgba, palette })
-        } else {
-            None
-        };
-
-        let rig = MetalFrameRig {
-            offscreen,
-            offscreen_srgb,
-            psos,
-            fetch_psos: std::array::from_fn(|_| None),
-            uniform: ubuf,
-            uniform_vertex_slot: uniform_vertex_slot.unwrap_or(0),
-            uniform_fragment_slot,
-            streams,
-            atlases,
-            fx,
-        };
-
-        let mut enc = FrameEncoder::metal(&session)?;
-        let res = FrameRes::Metal(&rig);
-        let passes = run_frame_plan(&mut enc, &res, &plan, load0, scissor)?;
-        assert_eq!(
-            passes as u32, self.last_frame_passes,
-            "same plan + same pure coalescer must yield the same pass count"
-        );
-        match enc.submit() {
-            SubmittedFrame::Metal(submitted) => {
-                let outcome = submitted.wait_outcome();
-                if outcome != CbOutcome::Completed {
-                    return Err(format!("the Metal frame replay failed: {outcome:?}"));
-                }
-            }
-            #[cfg(wgpu_arm)]
-            SubmittedFrame::Wgpu => unreachable!("a metal encoder commits a metal frame"),
-        }
-
-        if input.scroll_frac_px != 0 {
-            let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
-                self.cpu.grid_top(),
-                self.cell_size().1,
-                input.grid_top_row,
-                input.grid_bot_row,
-                h as usize,
-            );
-            if let Some(shift) = band_shift_ops(y0, y1, i64::from(input.scroll_frac_px)) {
-                let scratch = handle.create_texture_2d(
-                    "aterm-gpu m1b scroll shift scratch",
-                    TexelFormat::Rgba8Unorm,
-                    w,
-                    h,
-                    TexUsage {
-                        sampled: false,
-                        render: false,
-                        copy_src: true,
-                        copy_dst: true,
-                    },
-                    None,
-                );
-                let mut enc = FrameEncoder::metal(&session)?;
-                enc.copy_texture_rect(
-                    FrameCopyTexture::Metal(&rig.offscreen),
-                    (0, shift.src_y),
-                    FrameCopyTexture::Metal(scratch.metal()),
-                    (0, 0),
-                    w,
-                    shift.moved,
-                )?;
-                enc.copy_texture_rect(
-                    FrameCopyTexture::Metal(scratch.metal()),
-                    (0, 0),
-                    FrameCopyTexture::Metal(&rig.offscreen),
-                    (0, shift.dst_y),
-                    w,
-                    shift.moved,
-                )?;
-                match enc.submit() {
-                    SubmittedFrame::Metal(submitted) => {
-                        let outcome = submitted.wait_outcome();
-                        if outcome != CbOutcome::Completed {
-                            return Err(format!("the Metal scroll twin failed: {outcome:?}"));
-                        }
-                    }
-                    #[cfg(wgpu_arm)]
-                    SubmittedFrame::Wgpu => unreachable!("a metal encoder commits a metal frame"),
-                }
-            }
-        }
-        {
-            if let Some(strip) = apron_plan {
-                let tex = handle.create_texture_2d(
-                    "aterm-gpu m1b apron row",
-                    TexelFormat::Rgba8Unorm,
-                    strip.w,
-                    strip.cell_h,
-                    TexUsage {
-                        sampled: false,
-                        render: false,
-                        copy_src: true,
-                        copy_dst: true,
-                    },
-                    None,
-                );
-                handle.upload_texture_full(
-                    &tex,
-                    &apron_win.apron_rgba,
-                    strip.w * 4,
-                    strip.w,
-                    strip.cell_h,
-                );
-                let mut enc = FrameEncoder::metal(&session)?;
-                enc.copy_texture_rect(
-                    FrameCopyTexture::Metal(tex.metal()),
-                    (0, 0),
-                    FrameCopyTexture::Metal(&rig.offscreen),
-                    (0, strip.dst_y),
-                    strip.w.min(w),
-                    strip.rows,
-                )?;
-                match enc.submit() {
-                    SubmittedFrame::Metal(submitted) => {
-                        let outcome = submitted.wait_outcome();
-                        if outcome != CbOutcome::Completed {
-                            return Err(format!("the Metal apron twin failed: {outcome:?}"));
-                        }
-                    }
-                    #[cfg(wgpu_arm)]
-                    SubmittedFrame::Wgpu => unreachable!("a metal encoder commits a metal frame"),
-                }
-            }
-        }
-
-        let actual = metal_try_read_back(&session, &mint, &rig.offscreen, w, h)?;
-        assert!(
-            !latch.is_lost(),
-            "the differential's loss domain stayed healthy"
-        );
-        Ok(Some(actual))
-    }
-
-    /// Present-path differential.
-    #[cfg(wgpu_arm)]
-    pub(crate) fn present_differential_for_test(
-        &mut self,
-        win: &mut WindowGpu,
-        input: &RenderInput,
-        tray: Option<TrayQuad<'_>>,
-        crop: PresentCrop,
-        destination: (u32, u32),
-    ) -> Result<Option<PresentDifferential>, String> {
-        if crate::metal::ffi::Device::preferred().is_none() {
-            return Ok(None);
-        }
-        assert!(
-            self.sdr_glow_boost == 0.0,
-            "the W5 present differential runs crown-free — set_sdr_glow_boost(0.0); \
-             rows 14/15 are armed by their own byte differentials"
-        );
-        assert!(
-            !self.enable_shimmer || self.shimmer_phase_pin.is_some(),
-            "pin the shimmer phase (set_shimmer_phase_for_test) — the pass's one \
-             wall-clock input must be identical on both arms"
-        );
-        self.virtual_begin(
-            win,
-            destination.0,
-            destination.1,
-            crate::video_tap::CaptureOpts {
-                half_res: false,
-                budget_bytes: 64 << 20,
-                fps_cap: None,
-                requested_ms: 0,
-            },
-        )?;
-        let presented = self.present_virtual_with_crop(
-            win,
-            input,
-            false,
-            None,
-            tray,
-            Some(crop),
-            0,
-            destination,
-        );
-        assert!(presented, "the virtual present cannot fail to acquire");
-        let expected = self
-            .virtual_presented_snapshot_current(win, win.virtual_presented_input_epoch, 1)?
-            .convert()?;
-        assert_eq!(
-            (expected.w, expected.h),
-            destination,
-            "the tap captured the whole virtual destination"
-        );
-        let (fw, fh) = {
-            let off = win.offscreen.as_ref().expect("the present set it");
-            (off.w, off.h)
-        };
-        let clean = {
-            let off = win.offscreen.as_ref().expect("resident");
-            self.texture_bytes_tight_for_test(&off.tex, fw, fh, 4)
-        };
-        let (actual, armed) = self
-            .metal_present_replay_for_test(input, tray, Some(crop), destination, &clean, (fw, fh))?
-            .expect("a Metal device existed above");
-        let _ = self.video_finish(win);
-        Ok(Some((expected.rgba, actual, destination, armed)))
-    }
-
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the whole present replay reads as one §2 Submit B transcript; \
-                  splitting it would scatter the pass order the map pins"
-    )]
-    #[cfg(wgpu_arm)]
-    pub(crate) fn metal_present_replay_for_test(
-        &mut self,
-        input: &RenderInput,
-        tray: Option<TrayQuad<'_>>,
-        source_crop: Option<PresentCrop>,
-        (dw, dh): (u32, u32),
-        clean_offscreen: &[u8],
-        (fw, fh): (u32, u32),
-    ) -> Result<Option<PresentReplay>, String> {
-        use crate::metal::encoder::EncodeSession;
-        use crate::metal::ffi::{
-            self as mtl, Device as MtlDevice, MtlRegion, PixelFormat, SamplerDesc,
-            TEXTURE_USAGE_RENDER_TARGET, TEXTURE_USAGE_SHADER_READ,
-        };
-        use crate::metal::loss::{CbOutcome, LossLatch};
-        use crate::metal::present::{
-            BloomPasses, MetalWindowSurface, PostPass, PresentSequence, ShimmerPass, TrayPass,
-            encode_present_sequence,
-        };
-        use crate::metal::resources::MetalResourceDevice;
-        use crate::metal::swapchain::SwapchainConfig;
-        use std::sync::Arc;
-
-        let _pool = crate::metal::ffi::AutoreleasePool::new();
-        let Some(mdev) = MtlDevice::preferred() else {
-            return Ok(None);
-        };
-        assert_eq!(
-            clean_offscreen.len(),
-            (fw * fh * 4) as usize,
-            "the seed is the tight clean offscreen"
-        );
-
-        let latch = Arc::new(LossLatch::new());
-        let session = EncodeSession::new(&mdev, Arc::clone(&latch))?;
-        let mint = MetalResourceDevice::new(&mdev, Arc::clone(&latch));
-        let usage = TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ;
-
-        let config = SwapchainConfig {
-            format: PixelFormat::Bgra8Unorm,
-            width: dw as usize,
-            height: dh as usize,
-            framebuffer_only: false,
-            display_sync: false,
-            maximum_drawables: 3,
-            opaque: true,
-        };
-        let mut surface = MetalWindowSurface::standalone(&mdev, config, Arc::clone(&latch))?;
-        let reconfigured = surface.reconcile(&mdev, &config)?;
-        assert!(!reconfigured, "a steady present reconciles to no drift");
-
-        let offscreen =
-            mint.texture_2d(PixelFormat::Rgba8Unorm, fw as usize, fh as usize, usage)?;
-        // SAFETY: fresh 2D managed texture of `fw x fh` seeded with `fw * fh * 4` tightly packed
-        // bytes.
-        unsafe {
-            mtl::texture_upload(
-                offscreen.obj(),
-                MtlRegion::full_2d(fw as usize, fh as usize),
-                clean_offscreen,
-                (fw * 4) as usize,
-            );
-        }
-        let present_off =
-            mint.texture_2d(PixelFormat::Rgba8Unorm, fw as usize, fh as usize, usage)?;
-        let linear = mint.sampler(SamplerDesc::LINEAR_CLAMP)?;
-        let nearest = mint.sampler(SamplerDesc::NEAREST_CLAMP)?;
-
-        let bloom_state = if self.enable_bloom && fx_gpu::bloom_source_live(input) {
-            let (count, bbox, extract_first) = self.build_bloom_glow(input, true);
-            (count > 0).then_some((count, bbox, extract_first))
-        } else {
-            None
-        };
-        let (bw, bh) = (
-            (fw / BLOOM_DOWNSCALE).max(1) as usize,
-            (fh / BLOOM_DOWNSCALE).max(1) as usize,
-        );
-        let bloom_parts = if let Some((count, bbox, extract_first)) = bloom_state {
-            let half = mint.texture_2d(PixelFormat::Rgba8Unorm, bw, bh, usage)?;
-            let (bytes, extract_row): (&[u8], _) = if self.bloom_items_live {
-                (
-                    aterm_bits::cast_slice(self.bloom_items.words()),
-                    Pipeline::GlowItems,
-                )
-            } else {
-                (
-                    aterm_bits::cast_slice(&self.bloom_glow_scratch),
-                    Pipeline::GlowAdd,
-                )
-            };
-            let stream = mint.buffer(bytes.len())?;
-            // SAFETY: fresh exactly-sized shared buffer; no GPU work on it.
-            unsafe { mtl::buffer_write(&stream, bytes) };
-            let extract_offset = extract_first as usize * std::mem::size_of::<GlowInstance>();
-            let (uw, uh, tb) = self.uniform_written.unwrap_or((fw, fh, 0));
-            assert_eq!((uw, uh), (fw, fh), "the encode wrote this frame's uniforms");
-            let cell = mint.buffer(std::mem::size_of::<Uniforms>())?;
-            // SAFETY: Pod into an exactly-sized fresh shared buffer.
-            unsafe {
-                mtl::buffer_write(
-                    &cell,
-                    aterm_bits::bytes_of(&Uniforms {
-                        screen: [fw as f32, fh as f32],
-                        text_blend: tb as f32,
-                        _pad: 0.0,
-                    }),
-                );
-            }
-            let bu = mint.buffer(std::mem::size_of::<BloomUniform>())?;
-            // SAFETY: as above.
-            unsafe {
-                mtl::buffer_write(
-                    &bu,
-                    aterm_bits::bytes_of(&BloomUniform {
-                        texel: [1.0 / bw as f32, 1.0 / bh as f32],
-                        strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
-                        radius: self.bloom_radius,
-                        chroma_radius: bloom_chroma_radius(self.bloom_radius),
-                        extent: [1.0; 2],
-                        _pad: 0.0,
-                    }),
-                );
-            }
-            let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {
-                [
-                    u32::from(cx0),
-                    u32::from(cy0),
-                    u32::from(cx1),
-                    u32::from(cy1),
-                ]
-            });
-            let scissor = if let Some([x0, y0, x1, y1]) = bbox {
-                let d = aterm_render::bloom::reach_px(self.bloom_radius);
-                Some([
-                    x0.saturating_sub(d),
-                    y0.saturating_sub(d),
-                    x1.saturating_add(d).min(fw),
-                    y1.saturating_add(d).min(fh),
-                ])
-            } else {
-                clip.map(|_| [0, 0, fw, fh])
-            };
-            let scissor = match (scissor, clip) {
-                (Some([sx0, sy0, sx1, sy1]), Some([cx0, cy0, cx1, cy1])) => Some([
-                    sx0.max(cx0),
-                    sy0.max(cy0),
-                    sx1.min(cx1).min(fw),
-                    sy1.min(cy1).min(fh),
-                ]),
-                (s, None) => s,
-                (None, Some(_)) => unreachable!("clip-only case handled above"),
-            }
-            .filter(|[sx0, sy0, sx1, sy1]| sx1 > sx0 && sy1 > sy0);
-            let extract_spec = extract_row.spec();
-            let extract_lib = crate::metal::pipelines::compile(&mdev, extract_spec)?;
-            let extract_pso = crate::metal::pipelines::build(
-                &mdev,
-                &extract_lib,
-                extract_spec,
-                PixelFormat::Bgra8Unorm,
-            )?;
-            let bloom_spec = Pipeline::Bloom.spec();
-            let bloom_lib = crate::metal::pipelines::compile(&mdev, bloom_spec)?;
-            let bloom_pso = crate::metal::pipelines::build(
-                &mdev,
-                &bloom_lib,
-                bloom_spec,
-                PixelFormat::Bgra8Unorm,
-            )?;
-            Some((
-                half,
-                extract_pso,
-                cell,
-                extract_spec.binds,
-                (stream, extract_offset),
-                count as usize,
-                bloom_pso,
-                bu,
-                bloom_spec.binds,
-                scissor,
-            ))
-        } else {
-            None
-        };
-
-        let shimmer_parts = if self.shimmer_live(input) {
-            self.shimmer_region(input, fw, fh)
-        } else {
-            None
-        }
-        .map(|region| -> Result<_, String> {
-            let scratch =
-                mint.texture_2d(PixelFormat::Rgba8Unorm, fw as usize, fh as usize, usage)?;
-            let (cw, ch) = self.cpu.cell_size();
-            let mut heat = [[0f32; 4]; SHIMMER_BANDS / 4];
-            for (i, v) in region.heat.iter().enumerate() {
-                heat[i / 4][i % 4] = *v;
-            }
-            let su = ShimmerUniform {
-                frame: [fw as f32, fh as f32],
-                region_min: [region.x0 as f32, region.y0 as f32],
-                region_max: [region.x1 as f32, region.y1 as f32],
-                hot_top: region.hot_top,
-                rise: region.rise,
-                amp: (ch as f32 / 18.0).clamp(0.75, SHIMMER_AMP_PX),
-                period: (ch as f32).max(4.0),
-                phase: self.shimmer_phase(),
-                band_x0: region.band_x0,
-                band_w: region.band_w,
-                rolloff: (cw as f32).max(1.0),
-                _pad: [0.0; 2],
-                heat,
-            };
-            let ub = mint.buffer(std::mem::size_of::<ShimmerUniform>())?;
-            // SAFETY: Pod into an exactly-sized fresh shared buffer.
-            unsafe { mtl::buffer_write(&ub, aterm_bits::bytes_of(&su)) };
-            let m = SHIMMER_COPY_MARGIN;
-            let stage = [
-                region.x0.saturating_sub(m),
-                region.y0.saturating_sub(m),
-                region.x1.saturating_add(m).min(fw),
-                region.y1.saturating_add(m).min(fh),
-            ];
-            let spec = Pipeline::Shimmer.spec();
-            let lib = crate::metal::pipelines::compile(&mdev, spec)?;
-            let pso = crate::metal::pipelines::build(&mdev, &lib, spec, PixelFormat::Bgra8Unorm)?;
-            Ok((
-                scratch,
-                stage,
-                pso,
-                ub,
-                spec.binds,
-                [region.x0, region.y0, region.x1, region.y1],
-            ))
-        })
-        .transpose()?;
-
-        let tray_parts = tray
-            .map(|t| -> Result<_, String> {
-                let card = mint.texture_2d(
-                    PixelFormat::Rgba8Unorm,
-                    t.pw as usize,
-                    t.ph as usize,
-                    TEXTURE_USAGE_SHADER_READ,
-                )?;
-                // SAFETY: fresh managed texture of `pw x ph` seeded with `pw * ph * 4` tightly
-                // packed RGBA bytes.
-                unsafe {
-                    mtl::texture_upload(
-                        card.obj(),
-                        MtlRegion::full_2d(t.pw as usize, t.ph as usize),
-                        t.rgba,
-                        (t.pw * 4) as usize,
-                    );
-                }
-                let tu = mint.buffer(std::mem::size_of::<TrayUniform>())?;
-                // SAFETY: Pod into an exactly-sized fresh shared buffer.
-                unsafe {
-                    mtl::buffer_write(
-                        &tu,
-                        aterm_bits::bytes_of(&TrayUniform {
-                            rect: [t.dx as f32, t.dy as f32, t.pw as f32, t.ph as f32],
-                            fb: [fw as f32, fh as f32],
-                            _pad: [0.0, 0.0],
-                        }),
-                    );
-                }
-                let spec = Pipeline::Tray.spec();
-                let lib = crate::metal::pipelines::compile(&mdev, spec)?;
-                let pso =
-                    crate::metal::pipelines::build(&mdev, &lib, spec, PixelFormat::Rgba8Unorm)?;
-                Ok((card, tu, pso, spec.binds))
-            })
-            .transpose()?;
-
-        let live_bg = frame_live_bg(input, self.theme.bg);
-        let mut want = present_blit_uniform(false, None, source_crop, fw, fh, dw, dh, live_bg);
-        let chrome = self.cpu.chrome_extent_px(fh as usize);
-        want.chrome_y0 = chrome.start as f32;
-        want.chrome_y1 = chrome.end as f32;
-        want.encode_srgb = if self.ctx.srgb_offscreen { 0.0 } else { 1.0 };
-        let bu = mint.buffer(std::mem::size_of::<BlitUniform>())?;
-        // SAFETY: Pod into an exactly-sized fresh shared buffer.
-        unsafe { mtl::buffer_write(&bu, aterm_bits::bytes_of(&want)) };
-        let blit_spec = Pipeline::Blit.spec();
-        let blit_lib = crate::metal::pipelines::compile(&mdev, blit_spec)?;
-        let blit_pso =
-            crate::metal::pipelines::build(&mdev, &blit_lib, blit_spec, PixelFormat::Bgra8Unorm)?;
-
-        let use_present_off =
-            bloom_parts.is_some() || shimmer_parts.is_some() || tray_parts.is_some();
-        let seq = PresentSequence {
-            offscreen: &offscreen,
-            present_off: use_present_off.then_some(&present_off),
-            copy_rect: [0, 0, fw, fh],
-            band_shift: None,
-            apron: None,
-            bloom: bloom_parts.as_ref().map(
-                |(half, extract_pso, cell, extract_binds, stream, count, pso, ubuf, binds, sc)| {
-                    BloomPasses {
-                        half_target: half,
-                        extract_pso,
-                        cell_uniform: cell,
-                        cell_uniform_slot: extract_binds
-                            .vertex_uniform
-                            .expect("row 4 has a vertex uniform")
-                            as usize,
-                        extract_stream: &stream.0,
-                        extract_offset: stream.1,
-                        extract_count: *count,
-                        composite: PostPass {
-                            pso,
-                            tex: half.obj(),
-                            tex_slot: binds.fragment_textures[0] as usize,
-                            sampler: &linear,
-                            sampler_slot: binds.fragment_samplers[0] as usize,
-                            uniform: ubuf,
-                            uniform_slot: binds.fragment_buffers[0] as usize,
-                        },
-                        composite_scissor: *sc,
-                    }
-                },
-            ),
-            shimmer: shimmer_parts
-                .as_ref()
-                .map(|(scratch, stage, pso, ubuf, binds, region)| ShimmerPass {
-                    scratch,
-                    stage_rect: *stage,
-                    refract: PostPass {
-                        pso,
-                        tex: scratch.obj(),
-                        tex_slot: binds.fragment_textures[0] as usize,
-                        sampler: &linear,
-                        sampler_slot: binds.fragment_samplers[0] as usize,
-                        uniform: ubuf,
-                        uniform_slot: binds.fragment_buffers[0] as usize,
-                    },
-                    region: *region,
-                }),
-            tray: tray_parts.as_ref().map(|(card, tu, pso, binds)| TrayPass {
-                pso,
-                card_tex: card.obj(),
-                tex_slot: binds.fragment_textures[0] as usize,
-                sampler: &linear,
-                sampler_slot: binds.fragment_samplers[0] as usize,
-                uniform: tu,
-                uniform_slot: binds.vertex_uniform.expect("row 17 binds at 2") as usize,
-            }),
-            blit: PostPass {
-                pso: &blit_pso,
-                tex: if use_present_off {
-                    present_off.obj()
-                } else {
-                    offscreen.obj()
-                },
-                tex_slot: blit_spec.binds.fragment_textures[0] as usize,
-                sampler: &nearest,
-                sampler_slot: blit_spec.binds.fragment_samplers[0] as usize,
-                uniform: &bu,
-                uniform_slot: blit_spec.binds.fragment_buffers[0] as usize,
-            },
-            clear: mtl::ClearColor {
-                r: f64::from((live_bg >> 16) & 0xff) / 255.0,
-                g: f64::from((live_bg >> 8) & 0xff) / 255.0,
-                b: f64::from(live_bg & 0xff) / 255.0,
-                a: 1.0,
-            },
-            crown: None,
-        };
-
-        let frame = surface
-            .acquire()
-            .map_err(|refusal| format!("replay acquire refused: {refusal:?}"))?;
-        let target = frame.render_target();
-        let row = (dw * 4) as usize;
-        let readback = mdev
-            .new_buffer(row * dh as usize)
-            .ok_or_else(|| "the replay's tap readback buffer failed to allocate".to_owned())?;
-        let mut cb = session.begin()?;
-        encode_present_sequence(&mut cb, &target, (dw, dh), &seq)?;
-        cb.copy_texture_to_buffer(&target, dw as usize, dh as usize, &readback, row)?;
-        let submitted = cb.commit();
-        let ticket = frame.present(&session)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            match (submitted.try_outcome(), ticket.try_outcome()) {
-                (Some(s), Some(t)) => {
-                    if s != CbOutcome::Completed || t != CbOutcome::Completed {
-                        return Err(format!("replay frame did not complete: {s:?} / {t:?}"));
-                    }
-                    break;
-                }
-                _ if std::time::Instant::now() > deadline => {
-                    return Err("replay frame never reached a terminal status".into());
-                }
-                _ => std::thread::yield_now(),
-            }
-        }
-        assert!(!latch.is_lost(), "the replay's loss domain stayed healthy");
-
-        // SAFETY: shared storage sized `row * dh` after both command buffers have completed.
-        let bgra = unsafe { mtl::buffer_bytes(&readback, row * dh as usize) };
-        let mut rgba = vec![0u8; bgra.len()];
-        for (dst, src) in rgba
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(bgra.as_chunks::<4>().0)
-        {
-            *dst = [src[2], src[1], src[0], src[3]];
-        }
-        Ok(Some((
-            rgba,
-            [
-                bloom_parts.is_some(),
-                shimmer_parts.is_some(),
-                tray_parts.is_some(),
-            ],
-        )))
-    }
-
-    #[cfg(wgpu_arm)]
-    fn seeded_target_for_test(
-        &self,
-        format: wgpu::TextureFormat,
-        bytes: &[u8],
-        w: u32,
-        h: u32,
-        texel: u32,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
-        assert_eq!(bytes.len(), (w * h * texel) as usize, "tight seed");
-        let tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu test seeded target"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * texel),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        (tex, view)
-    }
-
-    #[cfg(wgpu_arm)]
-    fn stream_buffer_for_test(&self, bytes: &[u8]) -> wgpu::Buffer {
-        let buf = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("aterm-gpu test stream"),
-            size: bytes.len() as u64,
-            usage: wgpu::BufferUsages::VERTEX,
-            mapped_at_creation: true,
-        });
-        buf.slice(..).get_mapped_range_mut().copy_from_slice(bytes);
-        buf.unmap();
-        buf
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the crown fixture states screen geometry, boost and headroom explicitly"
-    )]
-    #[cfg(wgpu_arm)]
-    pub(crate) fn crown_row_bytes_for_test(
-        &mut self,
-        hdr: bool,
-        instances: &[([u16; 4], [u8; 4])],
-        content_off: [f32; 2],
-        boost: f32,
-        headroom: f32,
-        seed: &[u8],
-        scissor: [u32; 4],
-        w: u32,
-        h: u32,
-    ) -> Vec<u8> {
-        let (format, texel) = if hdr {
-            self.ensure_hdr_glow_pipeline();
-            (wgpu::TextureFormat::Rgba16Float, 8u32)
-        } else {
-            self.ensure_sdr_glow_pipeline(wgpu::TextureFormat::Bgra8Unorm);
-            (wgpu::TextureFormat::Bgra8Unorm, 4u32)
-        };
-        let (dst, dst_view) = self.seeded_target_for_test(format, seed, w, h, texel);
-        self.ctx.queue.write_buffer(
-            self.hdr_glow_uniform_buf
-                .as_ref()
-                .expect("the ensure above set the shared uniform buf"),
-            0,
-            aterm_bits::bytes_of(&HdrGlowUniform {
-                screen: [w as f32, h as f32],
-                content_off,
-                boost,
-                headroom,
-                _pad: [0.0, 0.0],
-            }),
-        );
-        let insts: Vec<GlowInstance> = instances
-            .iter()
-            .map(|&(rect, color)| GlowInstance {
-                rect,
-                color,
-                color2: color,
-            })
-            .collect();
-        let stream = self.stream_buffer_for_test(aterm_bits::cast_slice(&insts));
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu test crown draw"),
-            });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("aterm-gpu test crown pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            let pipeline = if hdr {
-                self.hdr_glow_pipeline
-                    .as_ref()
-                    .expect("ensure_hdr_glow_pipeline set it")
-            } else {
-                &self
-                    .sdr_glow_pipeline
-                    .as_ref()
-                    .expect("ensure_sdr_glow_pipeline set it")
-                    .1
-            };
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(
-                0,
-                self.hdr_glow_bg.as_ref().expect("the ensure set it"),
-                &[],
-            );
-            let [x0, y0, x1, y1] = scissor;
-            pass.set_scissor_rect(x0, y0, x1 - x0, y1 - y0);
-            pass.set_vertex_buffer(0, stream.slice(..));
-            pass.draw(0..6, 0..insts.len() as u32);
-        }
-        self.ctx.queue.submit([enc.finish()]);
-        self.texture_bytes_tight_for_test(&dst, w, h, texel as usize)
-    }
-}
-
 /// A GPU renderer for a test, on `family` (the system default for `None`).
 #[cfg(test)]
 pub(crate) fn gpu_renderer_for_test(family: Option<&str>, px: f32, theme: Theme) -> GpuRenderer {
@@ -20669,11 +12613,6 @@ pub(crate) fn gpu_renderer_for_test(family: Option<&str>, px: f32, theme: Theme)
 mod tests {
     use aterm_render::{FaceId, GlowQuad, GlyphClass, StyleBits};
 
-    #[cfg(wgpu_arm)]
-    use super::{
-        EFFECT_PIPELINE_COUNT, EFFECT_PIPELINE_NAMES, EffectPipeline, Instances,
-        frame_effect_pipelines,
-    };
     use super::{FRAME_GROUPS, GROUP_SRGB, WindowGpu};
 
     #[test]
@@ -20723,60 +12662,6 @@ mod tests {
                 moved: 1
             })
         );
-    }
-
-    #[cfg(wgpu_arm)]
-    fn resident_names(want: [bool; EFFECT_PIPELINE_COUNT]) -> Vec<&'static str> {
-        EFFECT_PIPELINE_NAMES
-            .iter()
-            .zip(want)
-            .filter(|(_, w)| *w)
-            .map(|(n, _)| *n)
-            .collect()
-    }
-
-    #[test]
-    #[cfg(wgpu_arm)]
-    fn a_translucent_cursor_demands_the_blend_pipeline_even_with_no_cursor_quads() {
-        let inst = Instances::default(); // blink-off: both cursor streams empty
-        let input = aterm_render::RenderInput::default();
-        assert!(
-            inst.cursor_block.is_empty() && inst.cursor.is_empty(),
-            "precondition: this frame draws no cursor at all"
-        );
-        let want = frame_effect_pipelines(&inst, &input, false);
-        assert!(
-            want[EffectPipeline::CursorBlend as usize],
-            "a translucent cursor pre-warms the blend pipeline (keyed on the cursor mode) \
-             so it exists by the first frame that draws a cursor quad; demanding {:?} \
-             leaves it unbuilt",
-            resident_names(want)
-        );
-        let mut expected = [false; EFFECT_PIPELINE_COUNT];
-        expected[EffectPipeline::CursorBlend as usize] = true;
-        assert_eq!(want, expected);
-    }
-
-    #[test]
-    #[cfg(wgpu_arm)]
-    fn a_row_gated_glow_still_demands_glow_add_for_the_bloom_pass() {
-        let inst = Instances::default(); // row gate emptied every stream
-        let mut input = aterm_render::RenderInput::default();
-        input.cursor_glow_add.push(GlowQuad {
-            row: 0,
-            x: 0,
-            y: 0,
-            w: 4,
-            h: 4,
-            color: 0x0020_2020,
-            alpha: 0,
-            color2: 0x0020_2020,
-            alpha2: 0,
-        });
-        let want = frame_effect_pipelines(&inst, &input, true);
-        let mut expected = [false; EFFECT_PIPELINE_COUNT];
-        expected[EffectPipeline::GlowAdd as usize] = true;
-        assert_eq!(want, expected);
     }
 
     #[test]
@@ -21125,7 +13010,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(wgpu_arm, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     fn copy_src_is_armed_only_by_a_live_tap_on_a_capable_surface() {
         let wants = super::GpuRenderer::tap_wants_copy_src;
         assert!(!wants(false, false, false), "idle: no readback, no cost");
@@ -21142,22 +13027,10 @@ mod tests {
             "a still taken mid-recording needs it too"
         );
         assert!(wants(false, false, true), "a recent still holds it");
-        #[cfg(wgpu_arm)]
-        {
-            use wgpu::TextureUsages as U;
-            let usage = super::GpuRenderer::swapchain_usage_for;
-            assert_eq!(usage(true, false), U::RENDER_ATTACHMENT);
-            assert_eq!(usage(true, true), U::RENDER_ATTACHMENT | U::COPY_SRC);
-            assert_eq!(
-                usage(false, true),
-                U::RENDER_ATTACHMENT,
-                "a surface with no COPY_SRC cap must never be asked for it"
-            );
-        }
     }
 
     #[test]
-    #[cfg(any(wgpu_arm, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     fn polled_snapshots_inside_the_hold_reconfigure_the_swapchain_once() {
         struct Swapchain {
             copyable: bool,
@@ -21739,40 +13612,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(wgpu_arm)]
-    fn admitted_rebuild_preserves_device_and_exact_sources() {
-        const FONT: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
-        let theme = Theme::default();
-        let mut cpu = aterm_render::Renderer::from_bytes(FONT, 16.0, theme)
-            .expect("embedded fixture font parses");
-        cpu.set_styled_font_bytes(1, FONT)
-            .expect("styled fixture parses");
-        cpu.set_fallback_bytes(FONT)
-            .expect("fallback fixture parses");
-        cpu.set_symbol_fallback_bytes(FONT)
-            .expect("symbol fixture parses");
-        cpu.set_color_font_arc(aterm_render::intern_font_bytes(FONT.to_vec()))
-            .expect("emoji fixture parses");
-        let sources = cpu.seal_admitted_font_sources();
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                aterm_spec::host::could_not_run(format!("no GPU available: {error}"));
-            }
-        };
-        let adapter_name = ctx.adapter_name.clone();
-        let backend = ctx.backend.clone();
-        let limits = ctx.device.limits();
-        let mut gpu = GpuRenderer::from_parts(ctx, cpu, None, theme).expect("GPU renderer");
-        gpu.rebuild_font_from_admitted(24.0, theme)
-            .expect("sealed bytes-only GPU rebuild");
-        assert_eq!(gpu.admitted_font_sources(), sources);
-        assert_eq!(gpu.ctx.adapter_name, adapter_name);
-        assert_eq!(gpu.ctx.backend, backend);
-        assert_eq!(gpu.ctx.device.limits(), limits);
-    }
-
-    #[test]
     fn deco_atlas_drops_on_oversized_cell_height_no_abort() {
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
         let (cw, ch) = gpu.cell_size();
@@ -21785,39 +13624,6 @@ mod tests {
         assert!(
             gpu.deco_atlas.is_none(),
             "an oversized cell height must DROP the deco atlas (graceful), not abort"
-        );
-    }
-
-    #[test]
-    #[cfg(wgpu_arm)]
-    fn new_glyph_grows_atlas_in_place_without_recreating_texture() {
-        let theme = Theme::default();
-        let px = 18.0;
-        let mut gpu = crate::renderer::gpu_renderer_for_test(None, px, theme);
-        let (rows, cols) = (2usize, 8usize);
-
-        let mut win = WindowGpu::new();
-        let render = |gpu: &mut GpuRenderer, win: &mut WindowGpu, bytes: &[u8]| {
-            let mut term = Terminal::new(rows as u16, cols as u16);
-            term.process(bytes);
-            let input = term.cell_frame(rows, cols);
-            gpu.render_input(win, &input, None);
-        };
-
-        render(&mut gpu, &mut win, b"\x1b[?25labc");
-        let creations_after_cold = gpu.atlas_tex_creations();
-        let dims_after_cold = gpu.atlas_tex_dims().expect("atlases resident");
-
-        render(&mut gpu, &mut win, b"\x1b[?25labcxyz");
-        assert_eq!(
-            creations_after_cold,
-            gpu.atlas_tex_creations(),
-            "appending a few new glyphs must grow the atlas in place, not recreate the texture"
-        );
-        assert_eq!(
-            dims_after_cold,
-            gpu.atlas_tex_dims().expect("atlases still resident"),
-            "incremental growth must keep the SAME atlas texture (dims unchanged)"
         );
     }
 
@@ -22286,73 +14092,6 @@ mod tests {
         assert_ne!(
             shifted.pixels, zero.pixels,
             "negative control: terminal pixels outside the pinned tray must move"
-        );
-    }
-
-    #[test]
-    #[cfg(wgpu_arm)]
-    fn fractional_scroll_frames_keep_the_scissor_path() {
-        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
-        #[cfg(target_os = "macos")]
-        gpu.disarm_metal_for_test();
-        #[cfg(gl_arm)]
-        gpu.disarm_gl_for_oracle();
-        #[cfg(d3d11_arm)]
-        gpu.disarm_d3d11_for_oracle();
-        let (rows, cols) = (6usize, 12usize);
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        term.process(b"\x1b[?25lrow zero\r\nrow one\r\nrow two\r\nrow three");
-        let mut input = term.cell_frame(rows, cols);
-        input.grid_top_row = 1;
-        input.grid_bot_row = rows - 1;
-        let (fw, fh) = gpu.frame_size(rows, cols);
-        let dest = (fw as u32 + 9, fh as u32 + 7);
-        let mut win = WindowGpu::new();
-
-        input.scroll_frac_px = 0;
-        gpu.present_swapchain_standin_for_test(&mut win, &input, false, None, None, dest);
-        let full_after_prime = gpu.full_repaints();
-        let scissor_after_prime = gpu.scissor_taken();
-
-        input.scroll_frac_px = 3;
-        gpu.present_swapchain_standin_for_test(&mut win, &input, false, None, None, dest);
-        assert_eq!(
-            gpu.full_repaints(),
-            full_after_prime,
-            "a sub-row scroll frame over unchanged content must not force a Full repaint"
-        );
-        assert!(
-            gpu.scissor_taken() > scissor_after_prime,
-            "the frac frame must take the scissor/gate path (scissor_taken={}, full_repaints={})",
-            gpu.scissor_taken(),
-            gpu.full_repaints()
-        );
-
-        for frac in [7, 0] {
-            input.scroll_frac_px = frac;
-            let before = gpu.scissor_taken();
-            gpu.present_swapchain_standin_for_test(&mut win, &input, false, None, None, dest);
-            assert_eq!(
-                gpu.full_repaints(),
-                full_after_prime,
-                "frac {frac}: no Full repaint"
-            );
-            assert!(gpu.scissor_taken() > before, "frac {frac}: scissor path");
-        }
-
-        input.scroll_frac_px = 0;
-        let resident = gpu.present_input_readback(&mut win, &input);
-        let mut fresh = WindowGpu::new();
-        let oracle = gpu.render_input(&mut fresh, &input, None);
-        assert_eq!(
-            resident.pixels, oracle.pixels,
-            "the scissor base must stay untranslated through a glide"
-        );
-        input.scroll_frac_px = 3;
-        let translated = gpu.render_input(&mut fresh, &input, None);
-        assert_ne!(
-            translated.pixels, oracle.pixels,
-            "frac 3 must move terminal pixels"
         );
     }
 
@@ -22869,20 +14608,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(wgpu_arm)]
-    fn present_alpha_mode_is_opacity_and_caps_aware() {
-        use super::GpuRenderer;
-        use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied};
-        assert_eq!(GpuRenderer::present_alpha_mode(1.0, true), Opaque);
-        assert_eq!(GpuRenderer::present_alpha_mode(1.5, true), Opaque);
-        assert_eq!(GpuRenderer::present_alpha_mode(f32::NAN, true), Opaque);
-        assert_eq!(GpuRenderer::present_alpha_mode(0.85, true), PostMultiplied);
-        assert_eq!(GpuRenderer::present_alpha_mode(0.0, true), PostMultiplied);
-        assert_eq!(GpuRenderer::present_alpha_mode(0.85, false), Opaque);
-        assert_eq!(GpuRenderer::present_alpha_mode(0.0, false), Opaque);
-    }
-
-    #[test]
     fn hdr_upgrade_publishes_linear_capture_metadata_with_safe_defaults() {
         use crate::video_tap::CaptureColorSpace;
 
@@ -22899,64 +14624,7 @@ mod tests {
         assert_eq!(win.edr_max(), 0.0);
     }
 
-    #[cfg(wgpu_arm)]
-    fn confirmed_hdr_window() -> WindowGpu {
-        let mut win = WindowGpu::new();
-        win.set_capture_color_space(crate::video_tap::CaptureColorSpace::ExtendedLinearSrgb);
-        win.set_sdr_white_scale(2.5);
-        win.set_edr_max(3.0);
-        win
-    }
-
-    #[cfg(wgpu_arm)]
-    fn project_reconfigure(
-        before: &std::collections::BTreeMap<&'static str, i64>,
-        projection: crate::format_plan::HdrReconfigureProjection,
-    ) -> std::collections::BTreeMap<&'static str, i64> {
-        let mut after = before.clone();
-        after.insert("stage", i64::from(projection.stage));
-        after.insert("retagged", i64::from(projection.retagged));
-        after.insert("is_f16", i64::from(projection.is_f16));
-        after.insert("capture_linear", i64::from(projection.capture_linear));
-        after
-    }
-
-    #[cfg(wgpu_arm)]
-    fn assert_reconfigure_transition(
-        model: &aterm_spec::derive::Model,
-        before: &std::collections::BTreeMap<&'static str, i64>,
-        after: &std::collections::BTreeMap<&'static str, i64>,
-        action: &'static str,
-    ) {
-        assert!(
-            model.action_enabled(action, before),
-            "{action} must be enabled for {before:?}"
-        );
-        assert_eq!(
-            model.successors(action, before).as_slice(),
-            std::slice::from_ref(after),
-            "the shipping plan+apply projection must be the EXACT {action} successor"
-        );
-        let (conforms, evidence) = aterm_spec::verify::validate_transition_tiered(
-            model,
-            &[],
-            before,
-            after,
-            Some(action),
-            "HDR reconfigure plan/apply conformance",
-        );
-        assert!(conforms, "{action}: {evidence}");
-        for invariant in &model.invariants {
-            assert!(
-                model.check_invariant(invariant.name, after),
-                "{action} violates {}::{}: {after:?}",
-                model.name,
-                invariant.name
-            );
-        }
-    }
-
-    #[cfg(all(target_os = "macos", not(wgpu_arm)))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_screen_upgrade_moves_the_layer_before_it_promotes_the_metadata() {
         use crate::device_layer::TexelFormat;
@@ -23032,183 +14700,6 @@ mod tests {
             "one direction only"
         );
     }
-
-    #[test]
-    #[cfg(wgpu_arm)]
-    fn hdr_reconfigure_apply_conforms_to_retag_model() {
-        use crate::format_plan::{HdrReconfigurePlan, hdr_reconfigure_plan};
-        use crate::video_tap::CaptureColorSpace;
-
-        let model = aterm_models_render::hdr_reconfigure_retag_model();
-        let initial = model.init_state();
-
-        let mut downgrade_fallbacks = 0usize;
-        for retagged in [false, true] {
-            let action = if retagged {
-                "RetagSucceeds"
-            } else {
-                "RetagFails"
-            };
-            let mut win = confirmed_hdr_window();
-            let plan = hdr_reconfigure_plan(true, retagged);
-            win.apply_hdr_reconfigure_plan(plan);
-            let after = project_reconfigure(
-                &initial,
-                win.project_hdr_reconfigure_state(2, retagged, plan),
-            );
-            assert_reconfigure_transition(&model, &initial, &after, action);
-            match plan {
-                HdrReconfigurePlan::KeepHdr => {
-                    assert_eq!(win.sdr_white_scale(), 2.5, "a kept HDR epoch is preserved");
-                    assert_eq!(win.edr_max(), 3.0);
-                }
-                HdrReconfigurePlan::FallbackToSdr => {
-                    downgrade_fallbacks += 1;
-                    assert_eq!(win.sdr_white_scale(), 1.0);
-                    assert_eq!(win.edr_max(), 0.0);
-                }
-                HdrReconfigurePlan::KeepSdr => {
-                    panic!("an existing f16 surface cannot take the KeepSdr arm")
-                }
-            }
-        }
-        assert_eq!(
-            downgrade_fallbacks, 1,
-            "exactly the failed f16 re-tag must select SDR fallback"
-        );
-
-        let fallback_plan = hdr_reconfigure_plan(true, false);
-        assert_eq!(fallback_plan, HdrReconfigurePlan::FallbackToSdr);
-        let mut fallback_window = confirmed_hdr_window();
-        fallback_window.apply_hdr_reconfigure_plan(fallback_plan);
-        let sdr = project_reconfigure(
-            &initial,
-            fallback_window.project_hdr_reconfigure_state(1, false, fallback_plan),
-        );
-        assert_reconfigure_transition(&model, &initial, &sdr, "EnterSdrFallback");
-        assert_eq!(sdr["stage"], 1);
-        assert_eq!(sdr["is_f16"], 0);
-        assert_eq!(sdr["capture_linear"], 0);
-
-        let mut upgrade_fallbacks = 0usize;
-        for retagged in [false, true] {
-            let action = if retagged {
-                "UpgradeSucceeds"
-            } else {
-                "UpgradeFails"
-            };
-            let mut win = confirmed_hdr_window();
-            win.apply_hdr_reconfigure_plan(fallback_plan);
-            let plan = hdr_reconfigure_plan(true, retagged);
-            win.apply_hdr_reconfigure_plan(plan);
-            match plan {
-                HdrReconfigurePlan::KeepHdr => {
-                    assert_eq!(
-                        win.capture_color_space(),
-                        CaptureColorSpace::Srgb,
-                        "a successful plan alone must not publish the new encoding"
-                    );
-                    win.apply_hdr_surface_upgrade();
-                }
-                HdrReconfigurePlan::FallbackToSdr => {
-                    upgrade_fallbacks += 1;
-                }
-                HdrReconfigurePlan::KeepSdr => {
-                    panic!("an admitted f16 upgrade cannot take the KeepSdr arm")
-                }
-            }
-            let after =
-                project_reconfigure(&sdr, win.project_hdr_reconfigure_state(2, retagged, plan));
-            assert_reconfigure_transition(&model, &sdr, &after, action);
-        }
-        assert_eq!(
-            upgrade_fallbacks, 1,
-            "a failed upgrade tag must restore exactly one SDR fallback"
-        );
-
-        for retagged in [false, true] {
-            let plan = hdr_reconfigure_plan(false, retagged);
-            assert_eq!(plan, HdrReconfigurePlan::KeepSdr);
-            let mut p3 = WindowGpu::new();
-            p3.set_capture_color_space(CaptureColorSpace::DisplayP3);
-            p3.apply_hdr_reconfigure_plan(plan);
-            assert_eq!(
-                p3.capture_color_space(),
-                CaptureColorSpace::DisplayP3,
-                "KeepSdr must preserve confirmed non-sRGB SDR metadata"
-            );
-        }
-
-        let mut ignored_failure = initial.clone();
-        ignored_failure.insert("stage", 2);
-        ignored_failure.insert("retagged", 0);
-        ignored_failure.insert("is_f16", 1);
-        ignored_failure.insert("capture_linear", 1);
-        let (accepted, evidence) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &initial,
-            &ignored_failure,
-            Some("RetagFails"),
-            "HDR ignored-retag-failure negative control",
-        );
-        assert!(
-            !accepted,
-            "ignored retag failure unexpectedly conformed: {evidence}"
-        );
-
-        let mut failed_upgrade = sdr.clone();
-        failed_upgrade.insert("stage", 2);
-        failed_upgrade.insert("retagged", 0);
-        failed_upgrade.insert("is_f16", 1);
-        failed_upgrade.insert("capture_linear", 0);
-        let (accepted, evidence) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &sdr,
-            &failed_upgrade,
-            Some("UpgradeFails"),
-            "HDR failed-upgrade negative control",
-        );
-        assert!(
-            !accepted,
-            "failed upgrade mutant unexpectedly conformed: {evidence}"
-        );
-
-        let unapplied = confirmed_hdr_window();
-        let unescaped = project_reconfigure(
-            &initial,
-            unapplied.project_hdr_reconfigure_state(1, false, fallback_plan),
-        );
-        assert_eq!(unescaped["capture_linear"], 1);
-        let (accepted, evidence) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &initial,
-            &unescaped,
-            Some("EnterSdrFallback"),
-            "HDR unapplied-escape negative control",
-        );
-        assert!(
-            !accepted,
-            "unapplied SDR escape unexpectedly conformed: {evidence}"
-        );
-        assert!(!model.check_invariant("CaptureMatchesSurfaceEncoding", &unescaped));
-    }
-
-    #[test]
-    #[cfg(wgpu_arm)]
-    fn hdr_state_probe_is_immediate_then_throttled() {
-        let now = aterm_time::Instant::now();
-        assert!(hdr_color_space_probe_due(None, now));
-        assert!(!hdr_color_space_probe_due(Some(now), now));
-
-        let just_before = now + HDR_COLOR_SPACE_PROBE_INTERVAL - std::time::Duration::from_nanos(1);
-        assert!(!hdr_color_space_probe_due(Some(now), just_before));
-
-        let due = now + HDR_COLOR_SPACE_PROBE_INTERVAL;
-        assert!(hdr_color_space_probe_due(Some(now), due));
-    }
 }
 
 impl Rasterizer for GpuRenderer {
@@ -23277,122 +14768,6 @@ pub trait FrameSink: Send {
 /// half-open) of the frame into the store's words.
 #[cfg(target_os = "linux")]
 pub type FrameDraw<'a> = dyn FnMut(&mut [u32], [u32; 4]) -> Result<(), String> + 'a;
-
-/// A window a GPU backend can attach a swapchain to.
-#[cfg(not(any(
-    target_os = "macos",
-    target_os = "linux",
-    windows,
-    target_arch = "wasm32"
-)))]
-pub trait WindowTarget:
-    raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + Send + Sync + 'static
-{
-}
-
-#[cfg(not(any(
-    target_os = "macos",
-    target_os = "linux",
-    windows,
-    target_arch = "wasm32"
-)))]
-impl<T> WindowTarget for T where
-    T: raw_window_handle::HasWindowHandle
-        + raw_window_handle::HasDisplayHandle
-        + Send
-        + Sync
-        + 'static
-{
-}
-
-#[cfg(all(target_os = "macos", wgpu_arm))]
-struct AppKitSurfaceTarget<W>(W);
-
-#[cfg(all(target_os = "macos", wgpu_arm))]
-impl<W: aterm_objc::HasNsView> wgpu::rwh::HasWindowHandle for AppKitSurfaceTarget<W> {
-    fn window_handle(&self) -> Result<wgpu::rwh::WindowHandle<'_>, wgpu::rwh::HandleError> {
-        let view = std::ptr::NonNull::new(self.0.ns_view().as_ptr())
-            .ok_or(wgpu::rwh::HandleError::Unavailable)?;
-        let raw = wgpu::rwh::RawWindowHandle::AppKit(wgpu::rwh::AppKitWindowHandle::new(view));
-        // SAFETY: `HasNsView` keeps the view alive for the lifetime of `self.0`.
-        Ok(unsafe { wgpu::rwh::WindowHandle::borrow_raw(raw) })
-    }
-}
-
-#[cfg(all(target_os = "macos", wgpu_arm))]
-impl<W> wgpu::rwh::HasDisplayHandle for AppKitSurfaceTarget<W> {
-    fn display_handle(&self) -> Result<wgpu::rwh::DisplayHandle<'_>, wgpu::rwh::HandleError> {
-        Ok(wgpu::rwh::DisplayHandle::appkit())
-    }
-}
-
-#[cfg(all(any(target_os = "linux", windows), wgpu_arm))]
-struct NativeSurfaceTarget<W>(W);
-
-#[cfg(all(any(target_os = "linux", windows), wgpu_arm))]
-impl<W: aterm_types::native_window::HasNativeWindow> wgpu::rwh::HasWindowHandle
-    for NativeSurfaceTarget<W>
-{
-    fn window_handle(&self) -> Result<wgpu::rwh::WindowHandle<'_>, wgpu::rwh::HandleError> {
-        use aterm_types::native_window::NativeWindow;
-        let raw = match self.0.native_window() {
-            #[cfg(target_os = "linux")]
-            Some(NativeWindow::Xlib { window, visual, .. }) => {
-                let mut h = wgpu::rwh::XlibWindowHandle::new(window.into());
-                h.visual_id = visual.into();
-                wgpu::rwh::RawWindowHandle::Xlib(h)
-            }
-            #[cfg(target_os = "linux")]
-            Some(NativeWindow::Wayland { surface, .. }) => {
-                wgpu::rwh::RawWindowHandle::Wayland(wgpu::rwh::WaylandWindowHandle::new(surface))
-            }
-            #[cfg(windows)]
-            Some(NativeWindow::Win32 { hwnd, hinstance }) => {
-                let id = |p: std::ptr::NonNull<std::ffi::c_void>| {
-                    std::num::NonZeroIsize::new(p.as_ptr().addr().cast_signed())
-                };
-                let mut h = wgpu::rwh::Win32WindowHandle::new(
-                    id(hwnd).ok_or(wgpu::rwh::HandleError::Unavailable)?,
-                );
-                h.hinstance = hinstance.and_then(id);
-                wgpu::rwh::RawWindowHandle::Win32(h)
-            }
-            None => return Err(wgpu::rwh::HandleError::Unavailable),
-        };
-        // SAFETY: `HasNativeWindow` keeps the handles alive for the lifetime of `self.0`.
-        Ok(unsafe { wgpu::rwh::WindowHandle::borrow_raw(raw) })
-    }
-}
-
-#[cfg(all(any(target_os = "linux", windows), wgpu_arm))]
-impl<W: aterm_types::native_window::HasNativeWindow> wgpu::rwh::HasDisplayHandle
-    for NativeSurfaceTarget<W>
-{
-    fn display_handle(&self) -> Result<wgpu::rwh::DisplayHandle<'_>, wgpu::rwh::HandleError> {
-        use aterm_types::native_window::NativeWindow;
-        let raw = match self.0.native_window() {
-            #[cfg(target_os = "linux")]
-            Some(NativeWindow::Xlib {
-                display, screen, ..
-            }) => wgpu::rwh::RawDisplayHandle::Xlib(wgpu::rwh::XlibDisplayHandle::new(
-                Some(display),
-                screen,
-            )),
-            #[cfg(target_os = "linux")]
-            Some(NativeWindow::Wayland { display, .. }) => {
-                wgpu::rwh::RawDisplayHandle::Wayland(wgpu::rwh::WaylandDisplayHandle::new(display))
-            }
-            // Win32 has no display connection.
-            #[cfg(windows)]
-            Some(NativeWindow::Win32 { .. }) => {
-                wgpu::rwh::RawDisplayHandle::Windows(wgpu::rwh::WindowsDisplayHandle::new())
-            }
-            None => return Err(wgpu::rwh::HandleError::Unavailable),
-        };
-        // SAFETY: the display connection stays open for the lifetime of `self.0`.
-        Ok(unsafe { wgpu::rwh::DisplayHandle::borrow_raw(raw) })
-    }
-}
 
 #[cfg(test)]
 mod device_lost_tests {
@@ -23873,127 +15248,6 @@ mod atlas_upload_sync_tests {
     }
 }
 
-#[cfg(all(test, wgpu_arm))]
-mod fx_wgsl_tests {
-    use super::*;
-
-    fn validation_error(device: &wgpu::Device, f: impl FnOnce()) -> Option<String> {
-        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        f();
-        crate::block_on::block_on(scope.pop()).map(|e| e.to_string())
-    }
-
-    #[test]
-    fn the_wgsl_twin_validates_with_its_fx_entry_points() {
-        let mut gpu = gpu_renderer_for_test(None, 18.0, Theme::default());
-        let device = gpu.ctx.device.clone();
-        let module = |src: &str| {
-            validation_error(&device, || {
-                drop(device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("fx wgsl validation"),
-                    source: wgpu::ShaderSource::Wgsl(src.into()),
-                }));
-            })
-        };
-        assert_eq!(module(SHADER), None, "the cell SHADER validates");
-        gpu.effects.ensure(&device, EffectPipeline::Fx);
-        gpu.effects.ensure(&device, EffectPipeline::FxLinear);
-        assert_eq!(
-            gpu.effects.fx_layouts(&device).err(),
-            None,
-            "the fx pipelines build without a validation error"
-        );
-        let resident = gpu.effects.resident();
-        assert!(
-            resident[EffectPipeline::Fx as usize] && resident[EffectPipeline::FxLinear as usize],
-            "both fx pipelines are resident"
-        );
-        let broken = SHADER.replace("textureLoad(fx_r8, t, 0)", "textureLoad(fx_r8, t)");
-        assert_ne!(broken, SHADER, "the control edits the fx read");
-        assert!(module(&broken).is_some(), "the control is refused");
-    }
-
-    #[test]
-    fn a_refused_fx_row_fails_fx_closed() {
-        use aterm_core::render::{
-            FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace,
-        };
-        let mut input = aterm_core::terminal::Terminal::new(4, 16).cell_frame(4, 16);
-        input.fx_layers = vec![FxLayer::new(
-            1,
-            Arc::new(FxContent::new(
-                vec![FxItem::Rect(FxRect {
-                    x: 4,
-                    y: 4,
-                    w: 40,
-                    h: 12,
-                    ink: 0,
-                })],
-                vec![FxInk::add(0x0030_2010); 2],
-            )),
-            FxSlot::Over,
-            FxSpace::Window,
-            FxBlend::Exact,
-        )];
-        let frames = |shader: Option<String>| {
-            let mut gpu = gpu_renderer_for_test(None, 18.0, Theme::default());
-            #[cfg(target_os = "macos")]
-            gpu.disarm_metal_for_test();
-            #[cfg(gl_arm)]
-            gpu.disarm_gl_for_oracle();
-            #[cfg(d3d11_arm)]
-            gpu.disarm_d3d11_for_oracle();
-            let device = gpu.ctx.device.clone();
-            if let Some(src) = shader {
-                gpu.effects.shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("fx refusal"),
-                    source: wgpu::ShaderSource::Wgsl(src.into()),
-                });
-            }
-            let mut win = WindowGpu::new();
-            let drawn: Vec<(bool, bool)> = (0..2)
-                .map(|frame| {
-                    gpu.try_render_input(&mut win, &input, None)
-                        .unwrap_or_else(|e| panic!("frame {frame}: {e}"));
-                    (
-                        gpu.inst.fx_instances() > 0,
-                        gpu.frame_plan.iter().any(|i| i.stream.is_fx()),
-                    )
-                })
-                .collect();
-            (gpu, device, drawn)
-        };
-        let (_, _, drawn) = frames(None);
-        assert_eq!(
-            drawn,
-            [(true, true), (true, true)],
-            "the control slices and plans its fx stream"
-        );
-
-        let renamed = SHADER.replace("fn fs_fx(", "fn fs_fx_renamed(");
-        assert_ne!(renamed, SHADER, "the refusal renames the Exact entry point");
-        let (mut gpu, device, drawn) = frames(Some(renamed));
-        assert_eq!(
-            drawn,
-            [(true, false), (false, false)],
-            "the first frame slices but plans no fx stream; the second slices none"
-        );
-        let why = gpu
-            .effects
-            .fx_layouts(&device)
-            .err()
-            .expect("the refusal closes fx")
-            .to_owned();
-        assert!(why.contains("refused the fx pipeline"), "{why}");
-        gpu.effects.ensure(&device, EffectPipeline::FxLinear);
-        let resident = gpu.effects.resident();
-        assert!(
-            !resident[EffectPipeline::Fx as usize] && !resident[EffectPipeline::FxLinear as usize],
-            "neither fx row is resident"
-        );
-    }
-}
-
 #[cfg(all(test, target_os = "macos"))]
 mod fx_hazard_tests {
     use super::*;
@@ -24186,36 +15440,7 @@ mod gpu_park_accounting_tests {
     }
 }
 
-#[cfg(all(test, wgpu_arm))]
-mod surface_format_tests {
-    use super::GpuRenderer;
-    use wgpu::TextureFormat::{Bgra8Unorm, Bgra8UnormSrgb, Rgb10a2Unorm, Rgba8UnormSrgb};
-
-    fn caps(formats: &[wgpu::TextureFormat]) -> wgpu::SurfaceCapabilities {
-        wgpu::SurfaceCapabilities {
-            formats: formats.to_vec(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn no_formats_is_an_adapter_that_cannot_present() {
-        let none = GpuRenderer::pick_surface_format(&caps(&[])).expect_err("refused");
-        assert!(none.contains("cannot present"), "{none}");
-        let srgb_only = GpuRenderer::pick_surface_format(&caps(&[Bgra8UnormSrgb, Rgba8UnormSrgb]))
-            .expect_err("refused");
-        assert_ne!(
-            none, srgb_only,
-            "an sRGB-only surface is a different refusal"
-        );
-        assert_eq!(
-            GpuRenderer::pick_surface_format(&caps(&[Bgra8UnormSrgb, Rgb10a2Unorm, Bgra8Unorm])),
-            Ok(Bgra8Unorm)
-        );
-    }
-}
-
-#[cfg(all(test, any(wgpu_arm, target_os = "macos")))]
+#[cfg(all(test, target_os = "macos"))]
 #[path = "window_atlas_tests.rs"]
 mod window_atlas_tests;
 
@@ -24234,35 +15459,35 @@ mod d3d11_arm;
 #[cfg(d3d11_arm)]
 #[path = "d3d11_present.rs"]
 mod d3d11_present;
-#[cfg(all(d3d11_arm, not(wgpu_arm)))]
+#[cfg(d3d11_arm)]
 #[path = "d3d11_window.rs"]
 mod d3d11_window;
 // The shipped Windows build's window presents on real windows, against the
 // arm's own headless present (the desktop session only).
-#[cfg(all(test, d3d11_arm, not(wgpu_arm)))]
+#[cfg(all(test, d3d11_arm))]
 #[path = "d3d11_window_tests.rs"]
 mod d3d11_window_tests;
 
-// The frames the arm differentials and the WARP record draw.
-#[cfg(all(test, any(all(gl_arm, wgpu_arm), windows)))]
+// The frames the arm differentials and the frame records draw.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 #[path = "replay_fixtures_tests.rs"]
 mod replay_fixtures;
 
-#[cfg(all(gl_arm, wgpu_arm, test))]
-#[path = "gl_replay_tests.rs"]
-mod gl_replay_tests;
+// Each arm's frames against the digests wgpu drew on the same adapter: Metal
+// on this Mac's GPU, GL on the Linux lane's Mesa, D3D11 on WARP
+// (docs/AUDIT-third-party-2026-10-15.md GW.5 and GW.6).
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
+#[path = "frame_record_tests.rs"]
+mod frame_record_tests;
 
-// The Windows renderer's frames on WARP against the digests wgpu-dx12 drew
-// before the D3D11 flip (docs/AUDIT-third-party-2026-10-15.md GW.5).
-#[cfg(all(test, windows))]
-#[path = "warp_record_tests.rs"]
-mod warp_record_tests;
-
-// The D3D11 arm's armed frames against wgpu-dx12's on the same adapter
-// (GW.5's live differential, while both arms are in the Windows build).
-#[cfg(all(test, d3d11_arm, wgpu_arm))]
-#[path = "d3d11_replay_tests.rs"]
-mod d3d11_replay_tests;
+// Each first-party arm's headless presents on their own: a changed input
+// reaches the destination, and a lost device drops the present.
+#[cfg(all(test, d3d11_arm))]
+#[path = "d3d11_present_tests.rs"]
+mod d3d11_present_tests;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "gl_present_tests.rs"]
+mod gl_present_tests;
 
 // The D3D11 arm's removal latch where a frame writes resident state before
 // it draws, in both Windows builds.

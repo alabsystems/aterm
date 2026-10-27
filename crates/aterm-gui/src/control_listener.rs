@@ -730,6 +730,11 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
             let Some(fresh) = endpoint.install(fresh, generation, &current) else {
                 continue;
             };
+            // Counted before the fresh accept thread starts, which may serve a queued client at
+            // once: whoever that client tells of the rebind then reads it in `control_rebinds`.
+            if !reopened {
+                HEALTH.rebinds.fetch_add(1, Ordering::Relaxed);
+            }
             beat = match AcceptThread::spawn(
                 fresh,
                 generation,
@@ -754,7 +759,6 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
                      that did not happen"
                 );
             } else {
-                HEALTH.rebinds.fetch_add(1, Ordering::Relaxed);
                 aterm_log::info!(
                     "control listener rebound (generation {generation}); queued clients reconnect"
                 );

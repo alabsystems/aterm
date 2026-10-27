@@ -358,8 +358,8 @@ impl WarmupState {
         self.start_gated(folders, hold_cap, None, poke)
     }
 
-    /// `Self::start`, the worker waiting at `gate` (when one is given) before each folder:
-    /// the launch pass parks while the person is away from System State.
+    /// `Self::start`; with a `gate`, the folders' looks run together, each waiting at it: the
+    /// launch pass parks while the person is away from System State.
     pub(crate) fn start_gated<P>(
         &mut self,
         folders: &[(Folder, PathBuf)],
@@ -573,8 +573,9 @@ fn post(tx: &SyncSender<WarmupProgress>, poke: &(impl Fn() + ?Sized), message: W
     poke();
 }
 
-/// Walk the folders in sequence. Each listing may park indefinitely behind a system dialog,
-/// so this runs on a detached thread nothing joins.
+/// Look at the folders: the owner's pass in sequence; the launch pass (`gate`, which follows a
+/// Full Disk Access page not answered with a grant) all at once ([`look_together`]). Each listing
+/// may park indefinitely behind a system dialog, so this runs on a detached thread nothing joins.
 fn run_pass(
     generation: u64,
     walk: &[(Folder, PathBuf)],
@@ -584,32 +585,33 @@ fn run_pass(
     poke: &(impl Fn() + ?Sized),
 ) {
     let started = Instant::now();
-    let mut answers: Vec<(Folder, ReadDirOutcome)> = Vec::with_capacity(walk.len());
-    for (folder, path) in walk {
-        // The launch pass asks nothing while the person is away from System State.
-        if gate.is_some_and(|gate| !gate.wait_open()) {
-            break;
-        }
-        post(
-            tx,
-            poke,
-            WarmupProgress::Asking {
-                generation,
-                folder: *folder,
-            },
-        );
-        let outcome = (probe.read_dir)(path);
-        answers.push((*folder, outcome));
-        post(
-            tx,
-            poke,
-            WarmupProgress::Answered {
-                generation,
-                folder: *folder,
-                outcome,
-            },
-        );
-    }
+    let answers = match gate {
+        Some(gate) => look_together(generation, walk, probe, gate, tx, poke),
+        None => walk
+            .iter()
+            .map(|(folder, path)| {
+                post(
+                    tx,
+                    poke,
+                    WarmupProgress::Asking {
+                        generation,
+                        folder: *folder,
+                    },
+                );
+                let outcome = (probe.read_dir)(path);
+                post(
+                    tx,
+                    poke,
+                    WarmupProgress::Answered {
+                        generation,
+                        folder: *folder,
+                        outcome,
+                    },
+                );
+                (*folder, outcome)
+            })
+            .collect(),
+    };
     post(
         tx,
         poke,
@@ -619,6 +621,66 @@ fn run_pass(
             answers,
         },
     );
+}
+
+/// One folder's look on the launch pass, as its thread reports it to the pass.
+enum Look {
+    Asking(Folder),
+    Answered(Folder, ReadDirOutcome),
+}
+
+/// The launch pass's looks, each on a thread of its own and each waiting at `gate` (the launch
+/// pass asks nothing while the person is away from System State): macOS queues their questions
+/// back to back, so the next comes up as the last is answered instead of after the pass's own
+/// round trip. The answers come back in `walk`'s order; a look its gate retired never asks.
+fn look_together(
+    generation: u64,
+    walk: &[(Folder, PathBuf)],
+    probe: WarmupProbe,
+    gate: &WarmupGate,
+    tx: &SyncSender<WarmupProgress>,
+    poke: &(impl Fn() + ?Sized),
+) -> Vec<(Folder, ReadDirOutcome)> {
+    let (looked, looks) = std::sync::mpsc::channel::<Look>();
+    let mut answers = std::thread::scope(|scope| {
+        for (folder, path) in walk {
+            let looked = looked.clone();
+            let gate = gate.clone();
+            let read_dir = probe.read_dir;
+            let folder = *folder;
+            scope.spawn(move || {
+                if !gate.wait_open() {
+                    return;
+                }
+                let _ = looked.send(Look::Asking(folder));
+                let _ = looked.send(Look::Answered(folder, read_dir(path)));
+            });
+        }
+        drop(looked);
+        let mut answers = Vec::with_capacity(walk.len());
+        for look in looks {
+            match look {
+                Look::Asking(folder) => {
+                    post(tx, poke, WarmupProgress::Asking { generation, folder });
+                }
+                Look::Answered(folder, outcome) => {
+                    answers.push((folder, outcome));
+                    post(
+                        tx,
+                        poke,
+                        WarmupProgress::Answered {
+                            generation,
+                            folder,
+                            outcome,
+                        },
+                    );
+                }
+            }
+        }
+        answers
+    });
+    answers.sort_by_key(|(folder, _)| walk.iter().position(|(walked, _)| walked == folder));
+    answers
 }
 
 #[cfg(test)]
@@ -949,6 +1011,111 @@ mod tests {
         assert_eq!(
             state.start(&folders, Duration::from_millis(120_000), || {}),
             StartOutcome::Started
+        );
+    }
+
+    /// Folders the [`parking_two`] arm is looking at now.
+    static LOOKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Parks each look until two are under way at once, as two `tccd` questions queued back to
+    /// back are; a pass that looks one folder after the other never gets there (the hang
+    /// detector ends it, refused).
+    fn parking_two(_path: &Path) -> ReadDirOutcome {
+        LOOKING.fetch_add(1, Ordering::AcqRel);
+        let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while LOOKING.load(Ordering::Acquire) < 2 {
+            if Instant::now() >= give_up {
+                return ReadDirOutcome::Refused;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        ReadDirOutcome::Listed
+    }
+
+    /// The launch pass, after a Full Disk Access page answered without a grant, asks every
+    /// folder at once: both looks are under way together and both are answered, in the walk's
+    /// order.
+    #[test]
+    fn the_launch_pass_asks_its_folders_together() {
+        let mut state = WarmupState::inert();
+        state.probe = WarmupProbe {
+            read_dir: parking_two,
+            live: false,
+        };
+        let folders = vec![
+            (Folder::Documents, PathBuf::from("/nonexistent-warm-up-a")),
+            (Folder::Desktop, PathBuf::from("/nonexistent-warm-up-b")),
+        ];
+        assert_eq!(
+            state.start_gated(
+                &folders,
+                Duration::from_millis(120_000),
+                Some(WarmupGate::open()),
+                || {}
+            ),
+            StartOutcome::Started
+        );
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN + Duration::from_secs(5);
+        while state.is_live() && Instant::now() < deadline {
+            state.drain();
+            std::thread::yield_now();
+        }
+        assert!(!state.is_live(), "the pass ended");
+        assert_eq!(
+            state.rows(),
+            &[
+                (Folder::Documents, WarmupRow::Allowed),
+                (Folder::Desktop, WarmupRow::Allowed)
+            ],
+            "both looks were under way at once"
+        );
+    }
+
+    /// Folders the [`counting_read_dir`] arm was asked for.
+    static LOOKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn counting_read_dir(_path: &Path) -> ReadDirOutcome {
+        LOOKED.fetch_add(1, Ordering::AcqRel);
+        ReadDirOutcome::Listed
+    }
+
+    /// Looks waiting at a shut gate (the person away from System State) never ask once the
+    /// pass is retired (Stop, a revoked approval): the pass ends with every row unknown.
+    #[test]
+    fn a_retired_gate_asks_nothing_of_the_looks_waiting_at_it() {
+        let mut state = WarmupState::inert();
+        state.probe = WarmupProbe {
+            read_dir: counting_read_dir,
+            live: false,
+        };
+        let gate = WarmupGate::default();
+        let folders = vec![
+            (Folder::Documents, PathBuf::from("/nonexistent-warm-up-a")),
+            (Folder::Desktop, PathBuf::from("/nonexistent-warm-up-b")),
+        ];
+        assert_eq!(
+            state.start_gated(
+                &folders,
+                Duration::from_millis(120_000),
+                Some(gate.clone()),
+                || {}
+            ),
+            StartOutcome::Started
+        );
+        gate.retire();
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while state.is_live() && Instant::now() < deadline {
+            state.drain();
+            std::thread::yield_now();
+        }
+        assert!(!state.is_live(), "the retired pass ended");
+        assert_eq!(LOOKED.load(Ordering::Acquire), 0, "no look asked");
+        assert_eq!(
+            state.rows(),
+            &[
+                (Folder::Documents, WarmupRow::Unknown),
+                (Folder::Desktop, WarmupRow::Unknown)
+            ]
         );
     }
 

@@ -69,9 +69,13 @@ impl CacheRoot {
         Self::at(clone.with_file_name(leaf))
     }
 
-    /// The cache at `root`, created private when absent.
+    /// The cache at `root`, created private when absent, with its quiet folder ([`Self::quiet`]).
     pub fn at(root: PathBuf) -> Result<Self, String> {
         private_dir(&root, "release cache")?;
+        private_dir(
+            &root.join(aterm_tempfile::QUIET),
+            "release cache's quiet folder",
+        )?;
         Ok(Self { root })
     }
 
@@ -141,16 +145,33 @@ impl CacheRoot {
         self.root.join("cargo-home")
     }
 
+    /// `.ubd/`, where the build's own folders live ([`Self::target`], [`Self::tmp`],
+    /// [`Self::build_cargo_home`], [`Self::stage`]): fseventsd drops the file events of what is
+    /// made under it (`aterm_tempfile::QUIET`), and a release build makes tens of thousands of
+    /// files in two slices.
+    #[must_use]
+    pub fn quiet(&self) -> PathBuf {
+        self.root.join(aterm_tempfile::QUIET)
+    }
+
+    /// Where the build's own folders were until they moved into [`Self::quiet`] (2026-10-26):
+    /// `target`, `tmp`, `cargo-home-build` and `stage` beside `snapshot/`. No take of this
+    /// version writes them; a take removes what is left under its hold.
+    #[must_use]
+    pub fn moved_from(&self) -> [PathBuf; 4] {
+        ["target", "tmp", "cargo-home-build", "stage"].map(|name| self.root.join(name))
+    }
+
     /// The builds' `CARGO_HOME` root.
     #[must_use]
     pub fn build_cargo_home(&self) -> PathBuf {
-        self.root.join("cargo-home-build")
+        self.quiet().join("cargo-home-build")
     }
 
     /// The builds' target root (one `CARGO_TARGET_DIR` per slice under it).
     #[must_use]
     pub fn target(&self) -> PathBuf {
-        self.root.join("target")
+        self.quiet().join("target")
     }
 
     /// The release's bundles.
@@ -162,13 +183,13 @@ impl CacheRoot {
     /// The build's stage (lipo, strip, dSYM), recreated for every build.
     #[must_use]
     pub fn stage(&self) -> PathBuf {
-        self.root.join("stage")
+        self.quiet().join("stage")
     }
 
     /// `TMPDIR` for every child the take runs.
     #[must_use]
     pub fn tmp(&self) -> PathBuf {
-        self.root.join("tmp")
+        self.quiet().join("tmp")
     }
 
     /// `ship check`'s export and wasm32 gates.
@@ -1514,6 +1535,37 @@ fn digest_of(listing: &Listing) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The folders a build writes sit in the cache's quiet folder, still in its `*.noindex`
+    /// root. NEGATIVE CONTROL: what is kept between takes and read (the snapshot, the vendoring
+    /// home, the bundles) and the folders the build used before are outside it.
+    #[test]
+    fn a_release_builds_in_the_caches_quiet_folder() {
+        let cache = CacheRoot {
+            root: PathBuf::from("/c/a-release.noindex"),
+        };
+        for built in [
+            cache.target(),
+            cache.tmp(),
+            cache.build_cargo_home(),
+            cache.stage(),
+        ] {
+            assert_eq!(built.parent(), Some(cache.quiet().as_path()), "{built:?}");
+            assert!(aterm_tempfile::is_quiet(&built), "{built:?}");
+        }
+        assert!(cache.quiet().starts_with("/c/a-release.noindex"));
+        for kept in [
+            cache.snapshot(),
+            cache.vendor_cargo_home(),
+            cache.artifacts(),
+        ] {
+            assert!(!aterm_tempfile::is_quiet(&kept), "{kept:?}");
+        }
+        for old in cache.moved_from() {
+            assert!(!aterm_tempfile::is_quiet(&old), "{old:?}");
+            assert_eq!(old.parent(), Some(cache.path()));
+        }
+    }
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = crate::ledger::testing::git()

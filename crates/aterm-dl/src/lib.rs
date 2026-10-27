@@ -7,10 +7,13 @@ use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::ptr::NonNull;
 
+#[cfg(target_os = "macos")]
+mod darwin;
+
 /// Why a library or one of its symbols could not be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// This platform has no dynamic loader this crate drives (every cell but Linux).
+    /// This platform has no dynamic loader this crate drives.
     Unsupported {
         /// The first name of the list [`Library::open`] was given.
         library: &'static CStr,
@@ -140,7 +143,7 @@ unsafe impl Sync for Library {}
 impl Library {
     /// Open the first of `sonames` that loads.
     pub fn open(sonames: &'static [&'static CStr]) -> Result<Library, Error> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let mut tried = Vec::with_capacity(sonames.len());
             for &soname in sonames {
@@ -151,7 +154,7 @@ impl Library {
             }
             Err(Error::NotFound { tried })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             Err(Error::Unsupported {
                 library: sonames.first().copied().unwrap_or(c"(none)"),
@@ -170,11 +173,11 @@ impl Library {
     #[inline]
     #[must_use]
     pub fn symbol(&self, symbol: &CStr) -> Option<NonNull<c_void>> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             sys::symbol(self.handle, symbol)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (self.handle, symbol);
             None
@@ -191,16 +194,26 @@ impl Library {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod sys {
     use std::ffi::{CStr, c_void};
     use std::ptr::NonNull;
 
+    #[cfg(target_os = "macos")]
+    use super::darwin as native;
+    #[cfg(target_os = "linux")]
+    use libc as native;
+
+    #[cfg(target_os = "macos")]
+    const OPEN_FLAGS: i32 = native::RTLD_LAZY | native::RTLD_LOCAL;
+    #[cfg(target_os = "linux")]
+    const OPEN_FLAGS: i32 = native::RTLD_LAZY;
+
     /// dlopen(3) one name.
     pub(crate) fn open(soname: &CStr) -> Result<NonNull<c_void>, String> {
-        // SAFETY: a NUL-terminated name; RTLD_LAZY with no RTLD_GLOBAL is local scope. Loading runs
+        // SAFETY: a NUL-terminated name; the flags request lazy binding and local scope. Loading runs
         // the library's constructors, which is what opening it means.
-        let handle = unsafe { libc::dlopen(soname.as_ptr(), libc::RTLD_LAZY) };
+        let handle = unsafe { native::dlopen(soname.as_ptr(), OPEN_FLAGS) };
         NonNull::new(handle).ok_or_else(last_error)
     }
 
@@ -209,12 +222,12 @@ mod sys {
         // SAFETY: a handle dlopen returned and never closed, and a
         // NUL-terminated name. A null answer is absence: none of the symbols
         // aterm reads can legitimately sit at address zero.
-        NonNull::new(unsafe { libc::dlsym(handle.as_ptr(), symbol.as_ptr()) })
+        NonNull::new(unsafe { native::dlsym(handle.as_ptr(), symbol.as_ptr()) })
     }
 
     fn last_error() -> String {
         // SAFETY: dlerror returns null or a NUL-terminated string valid until the next loader call on this thread; it is copied out at once.
-        let text = unsafe { libc::dlerror() };
+        let text = unsafe { native::dlerror() };
         if text.is_null() {
             return "the loader gave no reason".to_owned();
         }

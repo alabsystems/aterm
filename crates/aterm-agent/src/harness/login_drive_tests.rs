@@ -441,6 +441,130 @@ fn grok_1_0_70s_sandboxed_lines_still_name_its_url_and_code() {
     assert_eq!(done.email.as_deref(), Some("grok-one@example.com"));
 }
 
+/// Whether `line` holds one of `grammar`'s leads for a value on the next line.
+fn leads(grammar: &Grammar, line: &str) -> bool {
+    grammar
+        .url
+        .iter()
+        .chain(grammar.code)
+        .any(|lead| line.contains(lead))
+}
+
+/// A child's output and errors reach the driver interleaved in any order (a loaded Mac runs
+/// their readers late): a line of the one between a lead and its value on the other never takes
+/// the value, whichever stream carries the leads (Grok Build's errors, Codex's output). CONTROL:
+/// the same lines read as one stream lose both.
+#[test]
+fn a_lead_takes_its_value_from_its_own_stream_however_the_two_interleave() {
+    let (grok, _, _) = lines_grammar(&GROK_SIGNIN, Flow::Device);
+    for (leads_on, other) in [(1, 0), (0, 1)] {
+        let mut split = Scan::default();
+        for line in GROK_NO_DESK.split('\n') {
+            split.feed_from(leads_on, grok, line);
+            if leads(grok, line) {
+                split.feed_from(other, grok, "running 1 test");
+            }
+        }
+        assert_eq!(
+            (split.url.as_deref(), split.code.as_deref()),
+            (
+                Some("https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ"),
+                Some("WMRT-8KQZ")
+            ),
+            "the leads on stream {leads_on}"
+        );
+    }
+    let mut one = Scan::default();
+    for line in GROK_NO_DESK.split('\n') {
+        one.feed(grok, line);
+        if leads(grok, line) {
+            one.feed(grok, "running 1 test");
+        }
+    }
+    assert_eq!(
+        (one.url, one.code),
+        (None, None),
+        "CONTROL: within one stream the next line holds the value"
+    );
+}
+
+/// A CLI whose output and errors interleave, as this test binary run in place: where its
+/// `GROK_HOME` (which only the driver hands it) holds `.split`, it prints Grok Build 1.0.70's
+/// sandboxed lines on its standard error, a line on its standard output between each lead and
+/// its value, and says it signed in (exit 0). Anywhere else it is an empty test.
+#[cfg(unix)]
+#[test]
+fn split_streams_stand_in() {
+    if !std::env::var_os("GROK_HOME").is_some_and(|home| Path::new(&home).join(".split").is_file())
+    {
+        return;
+    }
+    let (grok, _, _) = lines_grammar(&GROK_SIGNIN, Flow::Device);
+    for line in GROK_NO_DESK.split_inclusive('\n') {
+        eprint!("{line}");
+        if leads(grok, line) {
+            // Paced so its output's line reaches the driver between the lead and the value
+            // (the driver's verdict is the same in any order).
+            std::thread::sleep(Duration::from_millis(200));
+            println!("a line of its output");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    eprintln!("\r\u{1b}[K\u{2713} Signed in as grok-one@example.com");
+    std::process::exit(0);
+}
+
+/// A driven child whose output's lines land between a lead and its value on its errors still
+/// hands its page and code over and signs in ([`split_streams_stand_in`]). Unix's, as its child
+/// is handed only `GROK_HOME`.
+#[cfg(unix)]
+#[test]
+fn a_child_whose_output_and_errors_interleave_still_hands_its_page_and_code_over() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let home = tmp.path().join("grok");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(home.join(".split"), "").expect("arm");
+    let (grammar, completion, hosts) = lines_grammar(&GROK_SIGNIN, Flow::Device);
+    let exe = std::env::current_exe().expect("test exe");
+    let lead = [
+        "harness::login_drive::tests::split_streams_stand_in",
+        "--exact",
+        "--nocapture",
+        "--",
+    ]
+    .map(OsString::from);
+    let seen = Seen::default();
+    let drove = drive(
+        &Spec {
+            program: &exe,
+            lead: &lead,
+            args: &[],
+            env: &[("GROK_HOME".to_owned(), home.clone().into_os_string())],
+            cwd: &home,
+            grammar,
+            completion,
+            hosts: hosts.of(None).expect("fixed"),
+            email: Some("grok-one@example.com"),
+            hang: Duration::from_secs(60),
+        },
+        &mut &seen,
+    );
+    assert_eq!(
+        drove.outcome,
+        Outcome::SignedIn {
+            email: Some("grok-one@example.com".to_owned()),
+            page: false
+        }
+    );
+    assert_eq!(
+        *seen.handed.borrow(),
+        [(
+            Some("accounts.x.ai".to_owned()),
+            Some("WMRT-8KQZ".to_owned())
+        )]
+    );
+}
+
 /// The approver found the row's profile signed out. Unix's, as its one test is.
 #[cfg(unix)]
 struct SignedOut;

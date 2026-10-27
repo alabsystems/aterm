@@ -16,13 +16,32 @@
 //!   its own: [`crate::durability::Durability::options`] (the tier, the
 //!   100 ms Ordered horizon, the escalation table on the weak tiers), a fixed
 //!   `Boot::Known` and `Volume::Boot` (so a same-boot unclean stop keeps the
-//!   generation), unguarded, and [`crate::broker_rules::retain`] at every
-//!   open, or for the journal of a world whose broker was unretained, never:
-//!   what `aterm link broker` serves when setting the rules fails. Served on a
-//!   scratch Unix socket and read with astream's codec.
+//!   generation), unguarded, and aterm's rules set at every open (the
+//!   world's, `Opts::rules`), or for the journal of a world whose broker was
+//!   unretained, never: what `aterm link broker` serves when setting the rules
+//!   fails. Its retention tick's interval is a year, and the tick setting the
+//!   rules asks for at once is waited for before anything is served. Served on
+//!   a scratch Unix socket and read with astream's codec.
 //! * MODEL: `bus::Broker::new` with the same table, retained as the real arm
 //!   is, each connection a raw [`bus::SimStream`]. No held acks, refused
-//!   batches, race or mutant.
+//!   batches, race or mutant; its tails write what they match before a
+//!   retention lands (`bus::State::eager_tails`), as astream's tail thread
+//!   does, and an open that sets the rules takes astream's first tick
+//!   (`bus::Broker::open_tick`).
+//!
+//! ## Retention's steps (sim item B05)
+//!
+//! A [`Step::Tick`] runs the tick on both arms at a time on the run's
+//! [`Clock`], an hour past the wall clock, so astream's own first tick at an
+//! open (by the wall clock) never stamps later than a script; a
+//! [`Step::Cut`] is `retain_before_carrying_state` on both, after a tick so
+//! both plan on one clock; a [`Step::StartUnretained`] opens setting no
+//! rules, and a [`Step::StartWith`] rules changed outside aterm's (`world::changed_rules`). Each is compared by the
+//! base it leaves, and what follows by every answer below. The replay ticks
+//! before every stop, so what an open finds was stamped by a script's tick,
+//! and compares a world's deliveries where the model owes one
+//! ([`Step::DeliverAny`]): a world's tail reads lazily, and the replay's ticks
+//! move retention off the world's timeline.
 //!
 //! ## What is compared
 //!
@@ -41,14 +60,19 @@
 //! The scripts are hand-written ones per verb and edge ([`scripts`],
 //! [`long`]) and the door's journal of the seeded [`WORLDS`] ([`replay`]):
 //! what real bridges sent, on every tier with the mirror off, onto a retained
-//! broker and onto an unretained one. Every connection is ended before a
-//! restart, so a will fires at a point the script decides. A real will is
-//! waited for by `BrokerStats::wills_settled`, a real tail by its reader
-//! thread; each wait is a one-minute hang detector.
+//! broker and onto an unretained one, with the world's retention ticks, cuts
+//! and days passing (`scripts::retention` is retention's own hand script).
+//! Every connection is ended before a restart, so a will fires at a point the
+//! script decides. A real will is waited for by `BrokerStats::wills_settled`,
+//! a real tail by its reader thread, the tick an open asks for by
+//! `BrokerStats::retention_ticks`; each wait is a one-minute hang detector.
 //!
 //! Negative controls: the model with an [`ArmMutant`] must diverge: a
-//! forgotten dedup or will fence, an altered payload, and each drift this test
-//! found and `bus.rs` fixed ([`drift`]).
+//! forgotten dedup or will fence, an altered payload, each drift this test
+//! found and `bus.rs` fixed, and retention's: a `Fetch` that clamps below the
+//! floor, a cut that keeps the dedup keys below it, a tail never told a gap,
+//! a told reader's `Fetch` refused as any other or read without its notice
+//! ([`drift`]).
 //!
 //! ## WHAT IT DOES NOT COVER
 //!
@@ -56,9 +80,14 @@
 //!   checked; the table's principal rule (`h-`) applies on a real broker only
 //!   to a producer a bound grant attached, and the refusals a capability draws
 //!   (expired, poisoned, unauthorized) are not drawn.
-//! * RETENTION'S CUTS: no script reaches a bound aterm's rules cut at, so a
-//!   gap notice, a `retained-from=` floor, an `oldest` above 0 and the `cut: `
-//!   retire refusal are never drawn.
+//! * RETENTION AT SCALED BYTES: a world whose rules are scaled to a
+//!   few records is not replayed (the real broker's writer asks for the ticks a
+//!   class past its room needs, by the wall clock, not the run's), so a byte
+//!   give-up is held to astream by astream's own test of the planner it
+//!   exports (`retention_planner`), not here. Nor the `cut: ` retire refusal:
+//!   aterm makes no uncarried cut.
+//! * A TAIL THAT HAS YET TO READ WHEN A CUT LANDS: the worlds explore it (told
+//!   the gap instead of handed the records); both arms here write eagerly.
 //! * POWER-LOSS CUTS: [`bus::law_check`]'s (P2-P7). The one power loss here
 //!   keeps the whole log.
 //! * A BATCH ASTREAM ROLLS BACK (a failed commit): the model's is the seeded
@@ -69,7 +98,7 @@
 //!   one outcome the race allows, and the scripts end every connection first.
 //! * TIME: a tail's catch-up, idle and durable marks and the liveness bound
 //!   they arm, the Ordered horizon's timer (judged only by [`Law`]), the
-//!   retention tick.
+//!   retention tick by its own wall clock (the scripts' ticks are the run's).
 //! * `Last`'s SCAN BOUND: a round of astream's visits at most `LAST_SCAN_MAX`
 //!   (65,536) index entries from the filter's literal prefix; one that stops
 //!   on an entry the filter matches answers a short page resuming there, and
@@ -127,6 +156,11 @@ pub(crate) enum Step {
     Pipeline(u64, Vec<Request>),
     /// Read the next delivery of tail `c`.
     Deliver(u64),
+    /// A world's delivery replayed ([`replay`]): the next frame of tail `c` when the model owes
+    /// one, compared with the real tail's; none when it owes none, the real tail not read. A
+    /// world's tail reads lazily and the arms' eagerly, and the replay's own ticks move
+    /// retention off the world's timeline, so the world's count of frames is no claim.
+    DeliverAny(u64),
     /// The client drops `c`.
     End(u64),
     /// Every connection ends, then the broker stops.
@@ -135,6 +169,34 @@ pub(crate) enum Step {
     Start,
     /// Every connection ends, the broker stops uncleanly, and it opens again in a boot it cannot name, every record kept.
     Reboot,
+    /// The broker opens again setting no rules: what `aterm link broker` serves when setting them fails.
+    StartUnretained,
+    /// The broker opens again setting these rules, not its own: a change no aterm build makes
+    /// (`world::changed_rules`).
+    StartWith(astream_broker::Retention),
+    /// A retention tick at this many ms past the run's clock ([`Clock`]).
+    Tick(u64),
+    /// A cut at this offset, carrying state (`retain_before_carrying_state`); a [`Step::Tick`] comes first.
+    Cut(u64),
+}
+
+/// THE RUN'S CLOCK for its retention ticks: an hour past the wall clock when the run began,
+/// so every tick a script asks for is later than any the real broker takes by the wall
+/// clock itself (its first tick, asked for at once when its rules are set at an open), and
+/// `retention::stamp`'s `now.max(last)` takes the script's time on both arms.
+struct Clock(u64);
+
+impl Clock {
+    fn new() -> Self {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        Self(wall.saturating_add(3_600_000))
+    }
+
+    fn at(&self, rel: u64) -> u64 {
+        self.0.saturating_add(rel)
+    }
 }
 
 /// A script that ran the same on both arms, or the first answer that did not.
@@ -176,9 +238,9 @@ struct Real {
     conns: BTreeMap<u64, RealConn>,
     up: Option<(astream_broker::Broker, astream_broker::BrokerHandle)>,
     durability: Durability,
-    /// Retained by aterm's rules at every open, as `aterm link broker` opens its own;
-    /// otherwise the broker it serves when setting them fails.
-    retained: bool,
+    /// The rules every open sets, as `aterm link broker` opens its own (`None`: the broker
+    /// it serves when setting them fails).
+    retain: Option<astream_broker::Retention>,
     boot: Boot,
     /// Producers whose `/a/will` record the log holds: what an open fires,
     /// one firing each.
@@ -267,7 +329,7 @@ impl Drop for RealConn {
 }
 
 impl Real {
-    fn new(tier: Tier, retained: bool) -> Self {
+    fn new(tier: Tier, retain: Option<astream_broker::Retention>) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-b01")
             .tempdir_in("/tmp")
@@ -278,7 +340,7 @@ impl Real {
                 keep: Arc::new(AtomicBool::new(false)),
             },
             durability: durability(tier),
-            retained,
+            retain,
             boot: Boot::Known(BOOT),
             up: None,
             conns: BTreeMap::new(),
@@ -294,6 +356,12 @@ impl Real {
     }
 
     fn open(&mut self) {
+        let rules = self.retain.clone();
+        self.open_setting(rules);
+    }
+
+    /// Open again setting `rules`, or none.
+    fn open_setting(&mut self, rules: Option<astream_broker::Retention>) {
         let mut opts = self.durability.options();
         opts.boot = self.boot;
         opts.volume = Volume::Boot;
@@ -302,10 +370,30 @@ impl Real {
                 Ok(astream_broker::Prepared::Nothing)
             })
             .expect("the real broker opens");
+        // The tick's own clock is the wall clock: a year between its ticks, so the only
+        // ones it takes by itself are the one setting the rules asks for at once and the ones
+        // a batch past a class's room asks for (none under aterm's rules at their bytes).
+        broker.set_retention_interval(Duration::from_secs(365 * 24 * 60 * 60));
         // As `aterm link broker` and the fabric world harness do at every open, before
         // anything is served: astream retains and advertises only the rules set since an open.
-        if self.retained {
-            crate::broker_rules::retain(&broker).expect("aterm's retention rules are set");
+        if let Some(rules) = rules {
+            broker
+                .set_retention(rules)
+                .expect("aterm's retention rules are set");
+            // Its first tick, asked for at once (the interval's ask before it is the same
+            // one): taken before anything is served, so it stamps only what the open found,
+            // as the model's `open_tick` does.
+            let deadline = Instant::now() + HANG;
+            while {
+                let stats = broker.stats();
+                stats.retention_ticks + stats.retention_skips == 0
+            } {
+                assert!(
+                    Instant::now() < deadline,
+                    "the real broker never took its first retention tick"
+                );
+                std::thread::yield_now();
+            }
         }
         let handle = broker.serve(self.sock()).expect("the real broker serves");
         self.up = Some((broker, handle));
@@ -474,6 +562,22 @@ impl Real {
         self.boot = Boot::Unknown;
         self.open();
     }
+
+    /// A retention tick at `now_ms`; the log's base after it.
+    fn tick(&self, now_ms: u64) -> u64 {
+        let b = self.broker();
+        b.retention_tick_at(now_ms)
+            .expect("the real broker's retention tick");
+        b.base()
+    }
+
+    /// A carried cut at `at`; the log's base after it.
+    fn cut(&self, at: u64) -> u64 {
+        let b = self.broker();
+        b.retain_before_carrying_state(at)
+            .expect("the real broker's carried cut");
+        b.base()
+    }
 }
 
 /// The MODEL arm: the simulated broker, on a world of its own.
@@ -485,14 +589,15 @@ struct Model {
 }
 
 impl Model {
-    fn new(tier: Tier, retained: bool, mutant: ArmMutant) -> Self {
+    fn new(tier: Tier, retain: Option<astream_broker::Retention>, mutant: ArmMutant) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-b01-sim")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let broker = bus::Broker::new(tier, table(tier));
         lock(&broker.state).mutant = mutant;
-        lock(&broker.state).retained = retained;
+        broker.retain(retain);
+        lock(&broker.state).eager_tails = true;
         let core = Core::new(1, broker, Device::new(dir.path()));
         let process = Process::new(Arc::clone(&core), 1);
         Self {
@@ -557,6 +662,19 @@ impl Model {
         self.end_all();
         self.core.broker.stop_keeping_all(Stop::PowerLoss);
         self.core.broker.start();
+        self.core.broker.open_tick();
+    }
+
+    /// A retention tick at `now_ms`; the log's base after it.
+    fn tick(&self, now_ms: u64) -> u64 {
+        self.core.broker.tick(now_ms);
+        self.core.broker.base()
+    }
+
+    /// A carried cut at `at`; the log's base after it.
+    fn cut(&self, at: u64) -> u64 {
+        self.core.broker.cut_to(at);
+        self.core.broker.base()
     }
 }
 
@@ -683,20 +801,33 @@ fn project(tier: Tier, resp: &Response) -> (String, Option<(Option<u64>, u64)>) 
             format!("gap from={} to={} records={:?}", g.from, g.to, g.records),
             None,
         ),
+        // No script asks for them (a bridge never does): named whole if one ever comes.
+        Response::Stats(stats) => (format!("stats {stats:?}"), None),
     }
 }
 
 /// THE DIFFERENTIAL: `steps` on both arms at `tier`, each retained by aterm's rules, the
 /// model with `mutant`.
 fn run(tier: Tier, mutant: ArmMutant, steps: &[Step]) -> Verdict {
-    run_on(tier, true, mutant, steps)
+    run_on(
+        tier,
+        Some(crate::broker_rules::default_rules()),
+        mutant,
+        steps,
+    )
 }
 
-/// [`run`] on two brokers each `retained` or not.
-fn run_on(tier: Tier, retained: bool, mutant: ArmMutant, steps: &[Step]) -> Verdict {
+/// [`run`] on two brokers each retained by `retain`, or not.
+fn run_on(
+    tier: Tier,
+    retain: Option<astream_broker::Retention>,
+    mutant: ArmMutant,
+    steps: &[Step],
+) -> Verdict {
     let table = table(tier);
-    let mut real = Real::new(tier, retained);
-    let mut model = Model::new(tier, retained, mutant);
+    let clock = Clock::new();
+    let mut real = Real::new(tier, retain.clone());
+    let mut model = Model::new(tier, retain, mutant);
     let mut laws = [Law::default(), Law::default()];
     let mut answers = 0u64;
     for (i, step) in steps.iter().enumerate() {
@@ -732,6 +863,16 @@ fn run_on(tier: Tier, retained: bool, mutant: ArmMutant, steps: &[Step]) -> Verd
                 }
                 answers += 1;
             }
+            Step::DeliverAny(c) => {
+                let m = model.deliver(*c).map(|m| m.map(|m| project(tier, &m).0));
+                if m.is_ok() {
+                    let r = Ok(real.deliver(*c).map(|r| project(tier, &r).0));
+                    if r != m {
+                        return Err(at(&format!("real {r:?}, model {m:?}")));
+                    }
+                    answers += 1;
+                }
+            }
             Step::End(c) => {
                 real.end(*c);
                 model.end(*c);
@@ -744,10 +885,37 @@ fn run_on(tier: Tier, retained: bool, mutant: ArmMutant, steps: &[Step]) -> Verd
             Step::Start => {
                 real.open();
                 model.core.broker.start();
+                model.core.broker.open_tick();
             }
             Step::Reboot => {
                 real.reboot();
                 model.reboot();
+            }
+            Step::StartUnretained => {
+                real.open_setting(None);
+                model.core.broker.start_unretained();
+            }
+            Step::StartWith(rules) => {
+                real.open_setting(Some(rules.clone()));
+                model.core.broker.start_with(rules.clone());
+                model.core.broker.open_tick();
+            }
+            Step::Tick(rel) => {
+                let now = clock.at(*rel);
+                let (r, m) = (real.tick(now), model.tick(now));
+                if r != m {
+                    return Err(at(&format!(
+                        "the tick left the real base {r}, the model's {m}"
+                    )));
+                }
+            }
+            Step::Cut(off) => {
+                let (r, m) = (real.cut(*off), model.cut(*off));
+                if r != m {
+                    return Err(at(&format!(
+                        "the cut left the real base {r}, the model's {m}"
+                    )));
+                }
             }
         }
     }
@@ -814,13 +982,24 @@ fn answer(
 /// delivery and end as it happened, a world producer's writes on a connection
 /// of their own, and the restarts.
 fn replay(journal: &[Event]) -> Vec<Step> {
-    let mut steps = Vec::new();
+    // The world's ticks at their distance from its first, on the run's clock ([`Clock`]).
+    // A tick at the last time first, before every stop (so what an open finds was stamped
+    // by a script's tick, and the real broker's own first tick at the open, by the wall
+    // clock, stamps only what the open itself wrote, at the last stamp's time, as the
+    // model's `open_tick` does) and before every cut (which plans by the last stamp's
+    // clock).
+    let t0 = journal.iter().find_map(|e| match e {
+        Event::Tick(now) => Some(*now),
+        _ => None,
+    });
+    let mut last = 0u64;
+    let mut steps = vec![Step::Tick(0)];
     let mut world_dialled = false;
     for e in journal {
         match e {
             Event::Dial(c) => steps.push(Step::Dial(*c)),
             Event::Request(c, req) => steps.push(Step::Send(*c, req.clone())),
-            Event::Deliver(c) => steps.push(Step::Deliver(*c)),
+            Event::Deliver(c) => steps.push(Step::DeliverAny(*c)),
             Event::End(c) => steps.push(Step::End(*c)),
             Event::Publish {
                 producer,
@@ -843,10 +1022,21 @@ fn replay(journal: &[Event]) -> Vec<Step> {
                 ));
             }
             Event::Stop(how) => {
+                steps.push(Step::Tick(last));
                 steps.push(Step::Stop(*how));
                 world_dialled = false;
             }
             Event::Start => steps.push(Step::Start),
+            Event::StartUnretained => steps.push(Step::StartUnretained),
+            Event::StartWith(rules) => steps.push(Step::StartWith(rules.clone())),
+            Event::Tick(now) => {
+                last = now.saturating_sub(t0.unwrap_or(*now));
+                steps.push(Step::Tick(last));
+            }
+            Event::Cut(at) => {
+                steps.push(Step::Tick(last));
+                steps.push(Step::Cut(*at));
+            }
         }
     }
     steps
@@ -1336,6 +1526,55 @@ pub(crate) mod scripts {
         s
     }
 
+    /// A HELD COMMIT RIDING A PUBLISH (critic item B08): the bridge sends a round's held
+    /// inbox commit and its next publish as one burst in one write
+    /// (`Link::send_after_commit`), which astream takes into one batch. Each burst here is
+    /// a commit, then a publish: one commit that moves the group; one max-folded below it,
+    /// beside a resend the dedup answers; and one beside a publish its subject refuses, the
+    /// commit landing all the same. Then a group tail resumes past the last commit that
+    /// moved the group, before and after a restart.
+    pub(crate) fn corked() -> Vec<Step> {
+        let group = || Request::SubscribeGroup {
+            group: GROUP.to_string(),
+            filter: INBOX.to_string(),
+        };
+        let mut s = vec![
+            Step::Dial(1),
+            Step::Send(1, Request::Hello),
+            Step::Send(1, publish(Q, seq(1, 1), LANE, "ask 1")),
+            Step::Send(1, publish(Q, seq(1, 2), LANE_B, "ask 2")),
+            Step::Pipeline(
+                1,
+                vec![commit(GROUP, 0), publish(P, seq(1, 1), LANE_B, "reply 1")],
+            ),
+            Step::Pipeline(
+                1,
+                vec![commit(GROUP, 3), publish(P, seq(1, 2), LANE, "reply 2")],
+            ),
+            Step::Pipeline(
+                1,
+                vec![commit(GROUP, 1), publish(P, seq(1, 2), LANE, "reply 2")],
+            ),
+            Step::Pipeline(
+                1,
+                vec![commit(GROUP, 5), publish(P, seq(1, 3), "/f//x", "x")],
+            ),
+            Step::Dial(2),
+            Step::Send(2, Request::IdleMarks),
+            Step::Send(2, group()),
+            Step::Send(1, publish(P, seq(1, 3), LANE, "after")),
+            Step::Deliver(2),
+            Step::Stop(super::Stop::Clean),
+            Step::Start,
+            Step::Dial(3),
+            Step::Send(3, group()),
+            Step::Deliver(3),
+        ];
+        s.push(Step::Dial(4));
+        s.extend(look(4));
+        s
+    }
+
     /// RESTARTS: a clean close, an unclean stop in the same boot, and a reopen in a boot the open cannot name.
     pub(crate) fn restarts() -> Vec<Step> {
         let mut s = vec![
@@ -1369,6 +1608,152 @@ pub(crate) mod scripts {
         s.extend(look(5));
         s.extend([Step::Reboot, Step::Dial(6), Step::Send(6, Request::Hello)]);
         s.extend(look(6));
+        s
+    }
+
+    /// One session's bulk stream (the prefix rule's under aterm's rules).
+    pub(crate) const EV: &str = "/f/f/pub/n-sim/s-a/ev";
+    /// The group whose read gives this node's mail up under aterm's rules
+    /// (`broker_rules::MAIL_READER` expanded for `LANE`).
+    pub(crate) const MAIL_GROUP: &str = "/f/f/cur/n-sim/node/inbox";
+    /// A receipt on `LANE`'s session's lane, which the changed rules keep the last of only.
+    pub(crate) const ACK: &str = "/f/f/in/n-sim/s-a/n-sim/ack";
+    /// A day on the run's clock ([`super::Clock`]).
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+
+    /// RETENTION'S CUTS (sim item B05), aterm's rules on both arms: a carried cut that takes
+    /// the stream and presence and carries the mail and the halt; a `Fetch` below the floor
+    /// (refused `retained-from=`), a head query, a fetch of the held mail and `Last` of a
+    /// row the cut took; a resend whose dedup key the cut dropped (appended anew); a read
+    /// mail given up a day on; a reader told the gaps below its fetches (paged, and refused
+    /// where its filter holds nothing below the oldest); a tail told the gap below it and
+    /// handed the held mail; the week the age rule gives the unread mail, the halt and the
+    /// stream up; and an open that sets the rules, one that sets none, and one that sets
+    /// them again; then an open under changed rules and the one after it, back on aterm's,
+    /// which leave the mail carried below the base below its oldest (`Step::StartWith`).
+    pub(crate) fn retention() -> Vec<Step> {
+        let mut s = vec![
+            Step::Dial(1),
+            Step::Send(1, Request::Hello),
+            Step::Pipeline(
+                1,
+                vec![
+                    publish(P, seq(1, 1), EV, "e1"),
+                    publish(P, seq(1, 2), EV, "e2"),
+                    publish(P, seq(1, 3), PRES_A, "live"),
+                    publish(P, seq(1, 4), LANE, "m1"),
+                    publish(P, seq(1, 5), LANE_B, "m2"),
+                    publish(P, seq(1, 6), HALT, "on"),
+                    publish(P, seq(1, 7), EV, "e3"),
+                    publish(P, seq(1, 8), LANE, "m3"),
+                ],
+            ),
+            Step::Tick(0),
+            Step::Tick(0),
+            Step::Cut(6),
+            Step::Send(1, fetch(0, EV, 10)),
+            Step::Send(1, fetch(0, EV, 0)),
+            Step::Send(1, fetch(0, INBOX, 10)),
+            Step::Send(1, last(PRES_A, "", 10)),
+            Step::Send(1, publish(P, seq(1, 2), EV, "e2")),
+            Step::Send(1, commit(MAIL_GROUP, 3)),
+            Step::Tick(DAY),
+            Step::Send(1, fetch(0, LANE, 10)),
+            Step::Send(1, fetch(4, LANE_B, 10)),
+            // A reader told what retention gave up (`BrokerLog::fetch_told`): a filter whose
+            // subjects have different floors reads what it still holds below its oldest,
+            // the notice ahead of the page, page by page; one holding none there is refused.
+            Step::Dial(7),
+            Step::Send(7, Request::GapNotices),
+            Step::Send(7, fetch(0, "/f/f/>", 10)),
+            Step::Send(7, fetch(0, "/f/f/>", 1)),
+            Step::Send(7, fetch(4, "/f/f/>", 1)),
+            Step::Send(7, fetch(0, INBOX, 10)),
+            Step::Send(7, fetch(0, EV, 10)),
+            Step::Send(7, fetch(0, EV, 0)),
+            Step::Dial(2),
+            Step::Send(2, Request::GapNotices),
+            Step::Send(
+                2,
+                Request::Subscribe {
+                    from_offset: 0,
+                    filter: INBOX.to_string(),
+                },
+            ),
+            Step::Deliver(2),
+            Step::Deliver(2),
+            Step::Deliver(2),
+            Step::Tick(8 * DAY),
+            Step::Send(1, fetch(0, INBOX, 10)),
+            Step::Send(1, fetch(0, "/f/f/fleet/>", 10)),
+            Step::Send(7, fetch(0, "/f/f/>", 10)),
+            Step::Tick(8 * DAY),
+            Step::Stop(super::Stop::Clean),
+            Step::Start,
+            Step::Dial(3),
+            Step::Send(3, Request::Hello),
+            Step::Send(3, fetch(0, LANE_B, 10)),
+            Step::Tick(8 * DAY),
+            Step::Stop(super::Stop::Clean),
+            Step::StartUnretained,
+            Step::Dial(4),
+            Step::Send(4, Request::Hello),
+            Step::Send(4, fetch(0, LANE_B, 10)),
+            Step::Send(4, publish(P, seq(2, 1), EV, "e4")),
+            Step::Tick(8 * DAY),
+            Step::Stop(super::Stop::Clean),
+            Step::Start,
+            Step::Tick(9 * DAY),
+            Step::Dial(5),
+            Step::Send(5, Request::Hello),
+        ];
+        s.extend(look(5));
+        // An open under changed rules and the one after it on aterm's (`world::changed_rules`):
+        // they give the receipt carried below the base up, and the open setting aterm's again
+        // takes the mail class whole from the base alone, so the mail carried below it lies
+        // below every lane's oldest: refused to a plain read, read by a told one and by a tail.
+        let older = super::super::world::changed_rules(false);
+        s.extend([
+            Step::Pipeline(
+                5,
+                vec![
+                    publish(P, seq(3, 1), LANE, "m4"),
+                    publish(P, seq(3, 2), ACK, "r1"),
+                    publish(P, seq(3, 3), LANE_B, "m5"),
+                    publish(P, seq(3, 4), EV, "e5"),
+                ],
+            ),
+            Step::Tick(10 * DAY),
+            Step::Cut(u64::MAX),
+            Step::Stop(super::Stop::Clean),
+            Step::StartWith(older),
+            Step::Tick(10 * DAY),
+            Step::Dial(9),
+            Step::Send(9, Request::Hello),
+            Step::Send(9, fetch(0, INBOX, 10)),
+            Step::Send(9, fetch(0, ACK, 10)),
+            Step::Stop(super::Stop::Clean),
+            Step::Start,
+            Step::Tick(10 * DAY),
+            Step::Dial(10),
+            Step::Send(10, Request::Hello),
+            Step::Send(10, fetch(0, LANE, 10)),
+            Step::Send(10, Request::GapNotices),
+            Step::Send(10, fetch(0, LANE, 10)),
+            Step::Send(10, fetch(0, INBOX, 10)),
+            Step::Dial(11),
+            Step::Send(11, Request::GapNotices),
+            Step::Send(
+                11,
+                Request::Subscribe {
+                    from_offset: 0,
+                    filter: INBOX.to_string(),
+                },
+            ),
+            Step::DeliverAny(11),
+            Step::DeliverAny(11),
+            Step::DeliverAny(11),
+        ]);
         s
     }
 }
@@ -1480,6 +1865,12 @@ const WORLDS: &[(u64, Tier)] = &[
 fn journalled_opts(seed: u64, tier: Tier) -> super::world::Opts {
     super::world::Opts {
         tier: Some(tier),
+        // Retained at the shipped rules where `seed / 16` is even: six of the nine [`WORLDS`],
+        // the three at seeds 16 and over (one a tier) not. Never scaled: a scaled world's
+        // ticks the real broker's writer asks for by the wall clock, never the run's.
+        retained: (seed / 16).is_multiple_of(2),
+        scaled: false,
+        window: None,
         power_cuts: false,
         bus_losses: false,
         hold_acks: false,
@@ -1517,7 +1908,9 @@ fn the_model_answers_every_script_as_astreams_broker_does() {
             ("retiring conditionally", scripts::conditional()),
             ("wills", scripts::wills()),
             ("groups", scripts::groups()),
+            ("a commit and a publish in one write", scripts::corked()),
             ("restarts", scripts::restarts()),
+            ("retention", scripts::retention()),
         ] {
             if let Err(e) = run(tier, ArmMutant::None, &script) {
                 failed.push(format!("{name}: {e}"));
@@ -1589,18 +1982,24 @@ fn what_real_bridges_sent_astream_answers_as_the_model_did() {
             "seed {seed}'s world never restarted its broker"
         );
         if !served_here(tier) {
-            return (0, Ok(()));
+            return (0, 0, Ok(()));
         }
         let requests = steps.iter().filter(|s| matches!(s, Step::Send(..))).count();
-        let verdict = run_on(tier, opts.retained, ArmMutant::None, &steps)
+        let cuts = steps.iter().filter(|s| matches!(s, Step::Cut(_))).count();
+        let verdict = run_on(tier, opts.rules(), ArmMutant::None, &steps)
             .map_err(|e| format!("seed {seed}: {e}"));
-        (requests, verdict)
+        (requests, cuts, verdict)
     });
-    let requests: usize = replayed.iter().map(|(n, _)| n).sum();
-    eprintln!("replayed {requests} requests real bridges sent");
+    let requests: usize = replayed.iter().map(|(n, _, _)| n).sum();
+    let cuts: usize = replayed.iter().map(|(_, c, _)| c).sum();
+    eprintln!("replayed {requests} requests real bridges sent, and {cuts} cuts");
+    assert!(
+        cuts > 0,
+        "no replayed world cut its broker's log (sim item B05)"
+    );
     let failed: Vec<&String> = replayed
         .iter()
-        .filter_map(|(_, v)| v.as_ref().err())
+        .filter_map(|(_, _, v)| v.as_ref().err())
         .collect();
     assert!(
         failed.is_empty(),
@@ -1641,7 +2040,7 @@ fn what_a_reclaiming_bridge_sent_astream_answers_as_the_model_did() {
             "{tier}: the journal holds {retires} conditional retires, not three sessions' lanes and rows"
         );
         if served_here(tier) {
-            run_on(tier, opts.retained, ArmMutant::None, &steps)
+            run_on(tier, opts.rules(), ArmMutant::None, &steps)
                 .unwrap_or_else(|e| panic!("the model diverged: {e}"));
         }
     }
@@ -1651,6 +2050,31 @@ fn what_a_reclaiming_bridge_sent_astream_answers_as_the_model_did() {
 /// [`ArmMutant`], with the script that must catch it and what it gets wrong.
 fn drift() -> Vec<(ArmMutant, Vec<Step>, &'static str)> {
     vec![
+        (
+            ArmMutant::FetchClampsBelowTheFloor,
+            scripts::retention(),
+            "a Fetch below the floor that clamps instead of `retained-from=`",
+        ),
+        (
+            ArmMutant::KeepsDedupBelowTheCut,
+            scripts::retention(),
+            "a cut that keeps the dedup keys below it",
+        ),
+        (
+            ArmMutant::NoGapNotices,
+            scripts::retention(),
+            "a tail never told what retention gave up below it",
+        ),
+        (
+            ArmMutant::FetchNeverTold,
+            scripts::retention(),
+            "a told reader's Fetch refused below the oldest where retention holds its records",
+        ),
+        (
+            ArmMutant::FetchToldNoNotice,
+            scripts::retention(),
+            "a told Fetch below the oldest with no gap notice ahead of its page",
+        ),
         (
             ArmMutant::HelloNoLineage,
             scripts::publishing(),

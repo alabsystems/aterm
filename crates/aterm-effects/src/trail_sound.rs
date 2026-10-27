@@ -290,6 +290,29 @@ pub struct SoundEvent {
     pub shifted: bool,
 }
 
+impl SoundEvent {
+    /// An event with every field set, for a test that needs one whole: it changes the fields it
+    /// is about by struct update, so a field added later gets its value here and no test literal
+    /// has to name every field (the trail-diff closure's tests among them, §15.0.6).
+    #[cfg(test)]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn sample_for_test() -> Self {
+        Self {
+            style: GlowStyle::RainbowKitty,
+            voice: SoundVoice::Style,
+            kind: SoundGesture::Trail(SoundKind::Typed),
+            pan: 0.25,
+            heat: 0.5,
+            hue: 0.125,
+            gain: 0.75,
+            tone: Tone::Technical,
+            bed: false,
+            shifted: false,
+        }
+    }
+}
+
 /// Side-car scalars for the music box that [`SoundEvent`] does not carry (`docs/design/RAINBOW-KITTY-V2.md` §16).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EventMeta {
@@ -1195,6 +1218,8 @@ struct Bed {
     sky_glide: f32,
     sky_detune_arc: f32,
     sky_detune: f32,
+    hp_dt: f32,
+    hp_k: f32,
 }
 
 impl Bed {
@@ -1221,6 +1246,8 @@ impl Bed {
         sky_glide: 0.0,
         sky_detune_arc: 0.0,
         sky_detune: 0.0,
+        hp_dt: 0.0,
+        hp_k: 0.0,
     };
     #[inline]
     const fn lfo_u1(&self) -> f32 {
@@ -1448,6 +1475,16 @@ impl TrailSynth {
     #[inline]
     #[must_use]
     pub const fn is_quiet(&self) -> bool {
+        if !(self.bed.level < 1e-3
+            && self.bed.energy < 1e-3
+            && self.bed.out_lvl < 1e-5
+            && self.dc_x_l == 0.0
+            && self.dc_x_r == 0.0
+            && self.dc_y_l == 0.0
+            && self.dc_y_r == 0.0)
+        {
+            return false;
+        }
         let mut i = 0;
         while i < self.voices.len() {
             if self.voices[i].on {
@@ -1455,11 +1492,7 @@ impl TrailSynth {
             }
             i += 1;
         }
-        self.bed.level < 1e-3
-            && self.bed.energy < 1e-3
-            && self.bed.out_lvl < 1e-4
-            && self.dc_y_l == 0.0
-            && self.dc_y_r == 0.0
+        true
     }
 
     /// Number of live voices (test/diagnostic hook).
@@ -1534,6 +1567,7 @@ impl TrailSynth {
     }
 
     /// [`Self::push`] with the v2 side-car (§16 rows 6-8).
+    #[inline]
     pub const fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) {
         // TOML accepts NaN/Inf, and one non-finite scalar would poison the
         // persistent voice and bed state. Reject before any mutation and clamp
@@ -1560,6 +1594,7 @@ impl TrailSynth {
         self.block_lead_s = 0.0;
     }
 
+    #[inline]
     const fn push_meta_latched(&mut self, ev: SoundEvent, meta: EventMeta) {
         let ev = SoundEvent {
             pan: ev.pan.clamp(-1.0, 1.0),
@@ -1713,6 +1748,7 @@ impl TrailSynth {
         }
     }
 
+    #[inline]
     const fn advance_song(&mut self, kind: SoundKind, pause: f32) {
         let boundary = matches!(kind, SoundKind::Jump) || pause > PHRASE_PAUSE_S;
         if boundary {
@@ -1736,6 +1772,7 @@ impl TrailSynth {
         }
     }
 
+    #[inline]
     const fn advance_melody(&mut self, kind: SoundKind, pause: f32) {
         let (lo, hi) = tone_register(self.tone);
         let start = SONG_FORM[self.phrase_idx as usize] as usize;
@@ -1806,6 +1843,7 @@ impl TrailSynth {
         Some(self.claim())
     }
 
+    #[inline]
     const fn lane_make_room(&mut self, lane: u8, skip: usize) -> bool {
         let cap = lane_cap(lane);
         let mut live = 0usize;
@@ -1871,6 +1909,7 @@ impl TrailSynth {
         self.spawn_seeded(proto, gain, pan, tw_ph, ph)
     }
 
+    #[inline]
     const fn spawn_seeded(
         &mut self,
         proto: Voice,
@@ -1993,6 +2032,7 @@ impl TrailSynth {
         Some(idx)
     }
 
+    #[inline]
     const fn design_trail(&mut self, ev: SoundEvent, kind: SoundKind, duck: f32, pause: f32) {
         let g = ev.gain * duck * (0.55 + 0.45 * ev.heat);
         let kg = match kind {
@@ -2084,6 +2124,7 @@ impl TrailSynth {
         self.shift_octave = 1.0;
     }
 
+    #[inline]
     const fn design_cursor(&mut self, ev: &SoundEvent, shape: GestureShape, deg: i32, g: f32) {
         let anchor = palette_for(ev.voice, ev.style).anchor_hz();
         let mut i = 0;
@@ -2125,6 +2166,7 @@ impl TrailSynth {
         }
     }
 
+    #[inline]
     const fn design_land(&mut self, ev: &SoundEvent, g: f32) {
         let mut i = 0;
         while i < LAND_STARS {
@@ -2209,6 +2251,7 @@ impl TrailSynth {
         }
     }
 
+    #[inline]
     const fn design_space(&mut self, ev: &SoundEvent, g: f32, pause: f32) {
         let anchor = palette_for(ev.voice, ev.style).anchor_hz();
         if !self.space_head {
@@ -2381,6 +2424,7 @@ impl TrailSynth {
         );
     }
 
+    #[inline]
     const fn design_shift(&mut self, ev: &SoundEvent, deg: i32, g: f32) {
         let anchor = palette_for(ev.voice, ev.style).anchor_hz();
         let deg = deg + SHIFT_ROTATION[self.shift_step as usize];
@@ -2421,6 +2465,7 @@ impl TrailSynth {
         self.spawn(v, g * SHIFT_TING_VOICE_LEVEL, ev.pan);
     }
 
+    #[inline]
     const fn design_erase_poof(&mut self, ev: &SoundEvent, g: f32) {
         let body = Voice {
             dur: POOF_BODY_DUR_S,
@@ -2489,6 +2534,7 @@ impl TrailSynth {
         }
     }
 
+    #[inline]
     const fn design_word_poof(&mut self, ev: &SoundEvent, g: f32) {
         let body = Voice {
             dur: WORD_POOF_BODY_DUR_S,
@@ -2531,6 +2577,7 @@ impl TrailSynth {
         );
     }
 
+    #[inline]
     const fn design_poof(&mut self, ev: &SoundEvent, g: f32) {
         let v = Voice {
             dur: POOF_CLOUD_DUR_S,
@@ -2547,6 +2594,7 @@ impl TrailSynth {
         self.spawn_seeded(v, g * POOF_CLOUD_GAIN, ev.pan, 0.0, [0.0; 3]);
     }
 
+    #[inline]
     const fn design_output_pip(&mut self, ev: &SoundEvent, gesture: OutputGesture, duck: f32) {
         let (kind_gain, octave) = match gesture {
             OutputGesture::Shimmer => (OUTPUT_PIP_KIND_GAIN, 0.25),
@@ -2582,6 +2630,7 @@ impl TrailSynth {
         self.spawn_seeded(v, g, ev.pan, 0.0, [0.0; 3]);
     }
 
+    #[inline]
     const fn design_bonk(&mut self, ev: SoundEvent, duck: f32) {
         let g = ev.gain * duck * (0.55 + 0.45 * ev.heat) * BONK_KIND_GAIN;
         let root = penta(palette_for(ev.voice, ev.style).anchor_hz(), self.walk);
@@ -2647,6 +2696,7 @@ impl TrailSynth {
         self.v2_key_pending = false;
     }
 
+    #[inline]
     const fn design_celebration(&mut self, ev: SoundEvent, bar: u16, sig: u32) {
         // Same-sig bars skip this, and it draws no rng.
         if matches!(self.last_riff_sig, Some(old) if old != sig) {
@@ -2752,6 +2802,7 @@ impl TrailSynth {
         self.sing_hold = CELEBRATION_BAR_SECONDS + 0.1;
     }
 
+    #[inline]
     const fn design_celebration_outro(&mut self, ev: SoundEvent, sig: u32) {
         self.last_riff_sig = Some(sig);
         let g = ev.gain * (0.55 + 0.45 * ev.heat) * CELEBRATION_KIND_GAIN;
@@ -2816,6 +2867,10 @@ impl TrailSynth {
             self.bed.out_lvl = 0.0;
             self.bed.hp_m = 0.0;
             self.bed.hp_s = 0.0;
+            self.dc_x_l = 0.0;
+            self.dc_y_l = 0.0;
+            self.dc_x_r = 0.0;
+            self.dc_y_r = 0.0;
             self.duck = 0.0;
             self.sing = 0.0;
             self.sing_hold = 0.0;
@@ -2865,6 +2920,9 @@ impl TrailSynth {
         } else {
             (0.0, 0.0)
         };
+        const DC_BLOCK_HZ: f32 = 40.0;
+        let dc_r = crate::color_math::exp_f32(-core::f32::consts::TAU * DC_BLOCK_HZ * dt);
+        let dc_g = 0.5 * (1.0 + dc_r);
         let mut active_voices = [0u8; MAX_VOICES];
         let mut active_len = 0usize;
         let mut i = 0;
@@ -3061,11 +3119,11 @@ impl TrailSynth {
             self.duck *= duck_step;
 
             let xl = l * MASTER;
-            let yl = xl - self.dc_x_l + 0.995 * self.dc_y_l;
+            let yl = dc_g * (xl - self.dc_x_l) + dc_r * self.dc_y_l;
             self.dc_x_l = xl;
             self.dc_y_l = yl;
             let xr = r * MASTER;
-            let yr = xr - self.dc_x_r + 0.995 * self.dc_y_r;
+            let yr = dc_g * (xr - self.dc_x_r) + dc_r * self.dc_y_r;
             self.dc_x_r = xr;
             self.dc_y_r = yr;
             let (yl, yr) = if lim_on {
@@ -3117,6 +3175,7 @@ impl TrailSynth {
         self.bed.gain += (gain - self.bed.gain) * 0.3;
     }
 
+    #[inline]
     const fn tick_bed(&mut self, dt: f32) {
         let b = &mut self.bed;
         if b.energy > 0.0 {
@@ -3178,11 +3237,16 @@ impl TrailSynth {
             return (0.0, 0.0);
         }
         const BED_HP_HZ: f32 = 220.0;
-        let k_hp = (BED_HP_HZ * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
-        self.bed.hp_m += k_hp * (m - self.bed.hp_m);
-        self.bed.hp_s += k_hp * (side - self.bed.hp_s);
-        let m = m - self.bed.hp_m;
-        let side = side - self.bed.hp_s;
+        let b = &mut self.bed;
+        if b.hp_dt != dt {
+            b.hp_dt = dt;
+            b.hp_k = 1.0 - crate::color_math::exp_f32(-core::f32::consts::TAU * BED_HP_HZ * dt);
+        }
+        let k_hp = b.hp_k;
+        b.hp_m += k_hp * (m - b.hp_m);
+        b.hp_s += k_hp * (side - b.hp_s);
+        let m = m - b.hp_m;
+        let side = side - b.hp_s;
         (m + side, m - side)
     }
 }

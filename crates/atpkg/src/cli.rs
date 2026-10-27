@@ -185,6 +185,19 @@ const TABLE: &[Verb] = &[
         run: |_| cmd_gc(),
     },
     Verb {
+        name: "serve-units",
+        tier: Tier::Occasional,
+        usage: "aterm pkg serve-units [--listen <addr:port>] | --off  — serve the toolset \
+                archives this Mac installs to LAN peers that name it in `[packages] peers` \
+                (opt-in: listens on 0.0.0.0:7487 until stopped, and keeps each archive it \
+                installs from now on beside its build; --off stops keeping them)",
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: cmd_serve_units,
+    },
+    Verb {
         name: "repair",
         tier: Tier::Occasional,
         usage: "aterm pkg repair [--json]   — restore installed commands, shell integration, \
@@ -2598,6 +2611,55 @@ fn print_unreachable_followup(e: &crate::FlowError, rerun: &str) {
     }
 }
 
+/// `serve-units`: serve this store's kept units on the LAN until stopped, or `--off`.
+fn cmd_serve_units(rest: &[String]) -> ExitCode {
+    let Some(layout) = layout() else {
+        return ExitCode::from(1);
+    };
+    let mut listen = std::net::SocketAddr::from(([0, 0, 0, 0], crate::peers::DEFAULT_PORT));
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--off" if rest.len() == 1 => {
+                return match crate::peers::serve_off(&layout) {
+                    Ok(()) => {
+                        println!("atpkg: serve-units: off — this Mac keeps no toolset archives");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("atpkg: serve-units: --off: {e}");
+                        ExitCode::from(1)
+                    }
+                };
+            }
+            "--listen" => match args.next().and_then(|a| a.parse().ok()) {
+                Some(addr) => listen = addr,
+                None => {
+                    eprintln!("atpkg: serve-units: --listen takes <addr:port>, e.g. 0.0.0.0:7487");
+                    return ExitCode::from(2);
+                }
+            },
+            other => {
+                eprintln!("atpkg: serve-units: unknown argument {other:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    match crate::peers::serve(&layout, listen, |bound| {
+        println!(
+            "atpkg: serve-units: serving this Mac's toolset archives on {bound} — another Mac \
+             takes them with `[packages] peers = [\"<this Mac's address>:{}\"]`; Ctrl-C stops",
+            bound.port()
+        );
+    }) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("atpkg: serve-units: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn layout() -> Option<crate::store::Layout> {
     match crate::store::resolve_configured() {
         Some(l) => Some(l),
@@ -2798,7 +2860,7 @@ fn begin_store_mutation(guard: &mut crate::lock::StoreLock) {
     );
 }
 
-const TYPED_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const TYPED_LOCK_WAIT: std::time::Duration = crate::lock::TYPED_WAIT;
 
 fn a_person_typed_this() -> bool {
     use std::io::IsTerminal as _;
@@ -5103,6 +5165,7 @@ fn github_fetcher(layout: &crate::store::Layout) -> crate::GithubFetcher {
         .with_overrides(crate::repo_overrides(cfg))
         .with_index_floor(floor)
         .with_index_hint(hint)
+        .with_unit_peers(crate::peers::configured(&cfg.peers))
 }
 
 fn discovery_hint(
@@ -5352,10 +5415,12 @@ fn cached_index_for(
     let slug = crate::resolve_account(cfg.account()).slug();
     let cache = crate::IndexCache::for_layout(layout);
     let candidates = cache.load(&format!("github:{slug}"))?;
+    let record = crate::succession::Record::read(layout);
     crate::select_index(
         &effective_anchor(layout),
         candidates,
         build_floor(layout),
+        crate::succession::Record::sources_of(record.as_ref()),
         now_unix(),
     )
     .selected
@@ -6252,6 +6317,12 @@ fn cache_plan_words(why: crate::build_cache::Unused) -> String {
         Unused::Idle { idle } => format!(
             "goes whole: nothing wrote it for {}, a month or more",
             days(idle)
+        ),
+        Unused::Moved { idle, after } => format!(
+            "goes whole: it is in the root the cache moved from (builds now go under .ubd, out \
+             of fseventsd's stream) and nothing wrote it for {} (the pass takes one unwritten {})",
+            days(idle),
+            days(after)
         ),
         Unused::Unfinished => {
             "an earlier pass moved it aside and did not finish removing it".to_owned()
@@ -9509,7 +9580,7 @@ fn install_default_set_inner(
     if let Some(line) = &announcement {
         emit_marker_line(line);
     }
-    let plan: Vec<(usize, Vec<String>)> = groups
+    let mut plan: Vec<(usize, Vec<String>)> = groups
         .iter()
         .enumerate()
         .filter(|(_, group)| disk_refusal.is_none() && !flip_held(group))
@@ -9518,6 +9589,14 @@ fn install_default_set_inner(
             (!missing.is_empty()).then_some((i, missing))
         })
         .collect();
+    // The unit that carries the Trust toolchain lands first, so `targo` is usable before the
+    // rest of the set; the others keep their order.
+    plan.sort_by_key(|(gi, _)| {
+        !groups[*gi]
+            .members
+            .iter()
+            .any(|m| m == crate::seam::SEAM_PROGRAM)
+    });
     let plannable: std::collections::BTreeSet<String> = plan
         .iter()
         .flat_map(|(_, missing)| missing.iter().cloned())

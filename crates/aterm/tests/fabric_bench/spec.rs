@@ -17,6 +17,27 @@ pub const BURST_MAX: usize = 5_000;
 /// The largest attach population on one headless instance.
 pub const ATTACH_MAX: usize = 128;
 
+/// One backlog filler record's bytes as astream's retention counts them
+/// (`astream_broker::record_bytes`): the frame's 12-byte header, the
+/// record's 34 fixed bytes, the 39-byte subject
+/// `/f/f1/pub/n-<16 hex>/backlog/ev` and the 128-byte body. The bench's
+/// backlog tests hold it to astream's count.
+pub const FILL_RECORD_BYTES: usize = 213;
+
+/// The bytes aterm's bulk `ev` rule keeps (`aterm_link::broker_rules::EV_BYTES`,
+/// 256 MiB), which every population's backlog shares: each population fills
+/// `backlog` records of its own, and a fill past this would be cut by the
+/// broker's retention, which checks every 60 s from the open, inside the run.
+pub const EV_RULE_BYTES: usize = 256 * 1024 * 1024;
+
+/// The largest backlog a run of `populations` attach sizes takes: their fills,
+/// [`FILL_RECORD_BYTES`] a record, inside [`EV_RULE_BYTES`] (420,086 records at
+/// the default three sizes, 630,130 at two).
+#[must_use]
+pub const fn backlog_max(populations: usize) -> usize {
+    EV_RULE_BYTES / (FILL_RECORD_BYTES * if populations == 0 { 1 } else { populations })
+}
+
 /// One run's knobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spec {
@@ -50,6 +71,18 @@ pub struct Spec {
     pub paced: usize,
     /// Retaining broker tick interval in milliseconds.
     pub retention_interval_ms: Option<u64>,
+    /// Measured posts per leg of the ask arm: each kind's idle releases, the
+    /// busy ones, the receipts and the person-lane asks of each variant
+    /// (without a pager and with one).
+    pub asks: usize,
+    /// The ask arm's escalated mix: one person-lane post before every
+    /// `mix_every`th ordinary message.
+    pub mix_every: usize,
+    /// The attach world's backlog (B09): records filled on an `ev` face
+    /// after every session's mail is seen, so each session's refill
+    /// watermark trails the head by this many when the bridge restarts. 0
+    /// (the default) is the attach world without it.
+    pub backlog: usize,
 }
 
 /// The scenarios measured in one run.
@@ -61,6 +94,9 @@ pub enum Scenario {
     Pingpong,
     Attach,
     Handoff,
+    /// What agents and people wait on: an ask's release, a receipt, the
+    /// person lane and its bystander cost, and a post across two nodes.
+    Ask,
 }
 
 impl Scenario {
@@ -73,6 +109,7 @@ impl Scenario {
             Self::Pingpong => "pingpong",
             Self::Attach => "attach",
             Self::Handoff => "handoff",
+            Self::Ask => "ask",
         }
     }
 
@@ -87,8 +124,10 @@ impl Scenario {
             "pingpong" => Ok(Self::Pingpong),
             "attach" => Ok(Self::Attach),
             "handoff" => Ok(Self::Handoff),
+            "ask" => Ok(Self::Ask),
             _ => Err(format!(
-                "{ENV}: `scenario=` is all, messaging, pingpong, attach or handoff, not `{word}`"
+                "{ENV}: `scenario=` is all, messaging, pingpong, attach, handoff or ask, not \
+                 `{word}`"
             )),
         }
     }
@@ -183,6 +222,8 @@ pub const DEFAULT_PINGPONG: usize = 200;
 pub const DEFAULT_ATTACH: [usize; 3] = [1, 8, 32];
 pub const DEFAULT_ROUNDS: usize = 3;
 pub const DEFAULT_PACED: usize = 50;
+pub const DEFAULT_ASKS: usize = 100;
+pub const DEFAULT_MIX_EVERY: usize = 10;
 
 impl Spec {
     /// The sender sessions the burst is split across.
@@ -197,7 +238,7 @@ impl Spec {
         let attach: Vec<String> = self.attach.iter().map(usize::to_string).collect();
         let mut words = format!(
             "samples={} warmup={} burst={} pingpong={} attach={} rounds={} bystanders={} paced={} \
-             retention={} log={}",
+             asks={} mix_every={} retention={} log={}",
             self.samples,
             self.warmup,
             self.burst,
@@ -206,11 +247,16 @@ impl Spec {
             self.rounds,
             self.bystanders,
             self.paced,
+            self.asks,
+            self.mix_every,
             if self.retention { "on" } else { "off" },
             self.log.word()
         );
         if let Some(ms) = self.retention_interval_ms {
             words.push_str(&format!(" retention_interval_ms={ms}"));
+        }
+        if self.backlog > 0 {
+            words.push_str(&format!(" backlog={}", self.backlog));
         }
         if self.scenario != Scenario::All {
             words.push_str(&format!(" scenario={}", self.scenario.word()));
@@ -227,11 +273,12 @@ impl Spec {
 ///
 /// # Errors
 /// A word or value it does not know, a count that is not a positive integer
-/// (`warmup`, `bystanders`, `paced` and `horizon_ms` may be 0), a durability
+/// (`warmup`, `bystanders`, `paced`, `backlog` and `horizon_ms` may be 0), a durability
 /// that is not a [`Tier`], a horizon for a tier that is not ordered, a
 /// retention interval on a broker that does not retain, a burst past
 /// [`BURST_MAX`], an attach list that does not rise or passes [`ATTACH_MAX`],
-/// a bystander count past [`ATTACH_MAX`], or no `out=`.
+/// a bystander count past [`ATTACH_MAX`], a backlog past [`backlog_max`] for
+/// its attach sizes or on a run that measures no attach, or no `out=`.
 pub fn parse(raw: &str) -> Result<Spec, String> {
     let mut out = None;
     let mut spec = Spec {
@@ -250,6 +297,9 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
         retention_interval_ms: None,
         bystanders: 0,
         paced: DEFAULT_PACED,
+        asks: DEFAULT_ASKS,
+        mix_every: DEFAULT_MIX_EVERY,
+        backlog: 0,
     };
     let count = |key: &str, v: &str, zero_ok: bool| -> Result<usize, String> {
         match v.parse::<usize>() {
@@ -274,6 +324,9 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
             "rounds" => spec.rounds = count(key, v, false)?,
             "bystanders" => spec.bystanders = count(key, v, true)?,
             "paced" => spec.paced = count(key, v, true)?,
+            "asks" => spec.asks = count(key, v, false)?,
+            "mix_every" => spec.mix_every = count(key, v, false)?,
+            "backlog" => spec.backlog = count(key, v, true)?,
             "durability" => spec.durability = Tier::parse(v)?,
             "retention" => spec.retention = on_off(v)?,
             "log" => spec.log = Log::parse(v)?,
@@ -328,6 +381,21 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
     if spec.bystanders > ATTACH_MAX {
         return Err(format!(
             "{ENV}: bystanders= tops out at {ATTACH_MAX} sessions on one instance"
+        ));
+    }
+    let most = backlog_max(spec.attach.len());
+    if spec.backlog > most {
+        return Err(format!(
+            "{ENV}: backlog= tops out at {most} records at {} attach size(s): each fills its \
+             own, {FILL_RECORD_BYTES} bytes a record, inside the ev rule's {EV_RULE_BYTES} \
+             bytes, past which the broker's retention cuts the fill inside the run",
+            spec.attach.len()
+        ));
+    }
+    if spec.backlog > 0 && !matches!(spec.scenario, Scenario::All | Scenario::Attach) {
+        return Err(format!(
+            "{ENV}: backlog= is the attach world's, and this run measures {}",
+            spec.scenario.word()
         ));
     }
     Ok(spec)
@@ -402,6 +470,7 @@ mod tests {
             Scenario::Pingpong,
             Scenario::Attach,
             Scenario::Handoff,
+            Scenario::Ask,
         ] {
             let word = scenario.word();
             let spec = parse(&format!("out=/o scenario={word}")).expect(word);
@@ -575,6 +644,85 @@ mod tests {
             "bystanders=999",
         ] {
             assert!(parse(&format!("out=/o {bad}")).is_err(), "{bad}");
+        }
+    }
+
+    /// B11's two knobs: the ask arm's posts per leg, and how often its
+    /// escalated mix puts a person-lane post before an ordinary message.
+    #[test]
+    fn the_asks_and_the_mix_are_named_and_reproduce() {
+        use super::*;
+
+        let bare = parse("out=/o").expect("bare");
+        assert_eq!(
+            (bare.asks, bare.mix_every),
+            (DEFAULT_ASKS, DEFAULT_MIX_EVERY)
+        );
+        assert!(
+            bare.words().contains(&format!(
+                " asks={DEFAULT_ASKS} mix_every={DEFAULT_MIX_EVERY} "
+            )),
+            "{}",
+            bare.words()
+        );
+        for (words, asks, mix_every) in [
+            ("asks=40", 40, DEFAULT_MIX_EVERY),
+            ("mix_every=1", DEFAULT_ASKS, 1),
+            ("scenario=ask asks=7 mix_every=3", 7, 3),
+        ] {
+            let spec = parse(&format!("out=/o {words}")).expect(words);
+            assert_eq!((spec.asks, spec.mix_every), (asks, mix_every), "{words}");
+            assert_eq!(
+                parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+                spec,
+                "{words}"
+            );
+        }
+        for bad in ["asks=0", "asks=x", "mix_every=0", "mix_every=-2"] {
+            let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+            assert!(err.contains("positive"), "{bad}: {err}");
+        }
+    }
+
+    /// B09's knob: the attach world's backlog, named only when it is there,
+    /// so every entry without it keeps its words.
+    #[test]
+    fn the_attach_backlog_is_named_only_when_set_and_reproduces() {
+        use super::*;
+
+        let bare = parse("out=/o").expect("bare");
+        assert_eq!(bare.backlog, 0);
+        assert!(!bare.words().contains("backlog"), "{}", bare.words());
+        for (words, backlog) in [
+            ("backlog=0", 0),
+            ("backlog=1", 1),
+            ("scenario=attach attach=8,32 backlog=500000", 500_000),
+            (&*format!("backlog={}", backlog_max(3)), backlog_max(3)),
+        ] {
+            let spec = parse(&format!("out=/o {words}")).expect(words);
+            assert_eq!(spec.backlog, backlog, "{words}");
+            assert_eq!(
+                spec.words().contains(&format!(" backlog={backlog}")),
+                backlog > 0,
+                "{words}"
+            );
+            assert_eq!(
+                parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+                spec,
+                "{words}"
+            );
+        }
+        for bad in [
+            "backlog=-1",
+            "backlog=many",
+            &*format!("backlog={}", backlog_max(3) + 1),
+            "scenario=attach backlog=500000",
+            "attach=32 backlog=1300000",
+            "scenario=pingpong backlog=10",
+            "scenario=handoff backlog=10",
+        ] {
+            let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+            assert!(err.contains("backlog="), "{bad}: {err}");
         }
     }
 }

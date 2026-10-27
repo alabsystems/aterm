@@ -336,15 +336,21 @@ pub const SHIPPED_LADDER_MIN: [i64; LADDER_STEPS as usize] = [2, 4, 8, 16, 32, 6
 /// `scale` ([`SHIPPED_LADDER_MIN`], the cap past its end).
 #[must_use]
 pub fn ladder_step_ms(streak: u32, scale: f64) -> i64 {
-    let i = usize::try_from(streak.max(1) - 1)
+    minutes_scaled(&SHIPPED_LADDER_MIN, streak, scale)
+}
+
+/// Step `n` (from 1) of a ladder of `minutes`, in ms, scaled by `scale`: its last step past its
+/// end.
+fn minutes_scaled(minutes: &[i64], n: u32, scale: f64) -> i64 {
+    let i = usize::try_from(n.max(1) - 1)
         .unwrap_or(usize::MAX)
-        .min(SHIPPED_LADDER_MIN.len() - 1);
+        .min(minutes.len() - 1);
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_precision_loss,
         reason = "a step of minutes scaled by a factor at most 1: far inside both"
     )]
-    let ms = (SHIPPED_LADDER_MIN[i] as f64 * 60_000.0 * scale).round() as i64;
+    let ms = (minutes[i] as f64 * 60_000.0 * scale).round() as i64;
     ms
 }
 
@@ -380,8 +386,8 @@ pub fn tool_end_out_of_reach(h: Harness) -> Option<&'static str> {
 }
 
 /// Why `mode`'s wall scenario is out of this lab's reach on harness `h`: `None` where the stub
-/// draws the usage wall the scenario needs and, for W2 and W4, the lab can take its notice off
-/// the screen ([`hide_of`]).
+/// draws the usage wall or the outage the scenario needs and, for W2 and W4, the lab can take its
+/// notice off the screen ([`hide_of`]).
 #[must_use]
 pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
     match mode {
@@ -402,6 +408,12 @@ pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
                 "Claude Code's limit is its conversation's (its transcript), read again after any relaunch: the relaunch rule is the screen-alone agents' (Muse Code, agy)",
             ),
         },
+        Mode::OutageLand | Mode::OutageCruise => match h {
+            Harness::Claude => None,
+            Harness::Agy | Harness::Muse => Some(
+                "the stub's outage is Claude Code's overload (the Messages API's 529 overloaded_error with x-should-retry: false): agy's and Muse Code's own outage forms are not staged",
+            ),
+        },
         Mode::Land
         | Mode::Cruise
         | Mode::Both
@@ -409,7 +421,8 @@ pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
         | Mode::Cap
         | Mode::Resid
         | Mode::Ladder
-        | Mode::Angles => None,
+        | Mode::Angles
+        | Mode::Switch => None,
     }
 }
 
@@ -500,7 +513,7 @@ impl Harness {
 
 /// Which chains run: the measured pass's by Autopilot (`land`, `cruise`, `both`), the coverage
 /// chains (`cover`), the hour's cap (`cap`), the residuals (`resid`), the scaled ladder
-/// (`ladder`), or one of the stub's usage walls (`wall`, `wall-…`).
+/// (`ladder`), one of the stub's usage walls (`wall`, `wall-…`), or its outage (`outage-…`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Land,
@@ -532,6 +545,15 @@ pub enum Mode {
     /// ANGLES, a new kind of work at each done claim (`angles`, v6 §14.5's 5a), under the short
     /// back-off ladder at an eighth ([`ladder_env`]), as `ladder` runs.
     Angles,
+    /// SWITCH, a running Cruise tab's word switched mid-run (`switch`, v6 §14.10's 10a,
+    /// [`switch`]).
+    Switch,
+    /// O1, an API overload standing from the first prompt under Land and lifted (`outage-land`,
+    /// v6 §14.17.5.2's 12b, [`outage`]), under the ladders at three eighths ([`outage::env`]).
+    OutageLand,
+    /// O2, an API overload met by Cruise's own act and lifted (`outage-cruise`, [`outage`]), under
+    /// the ladders at three eighths.
+    OutageCruise,
 }
 
 impl Mode {
@@ -552,12 +574,15 @@ impl Mode {
             "wall-cruise" => Mode::WallCruise,
             "wall-relaunch" => Mode::WallRelaunch,
             "angles" => Mode::Angles,
+            "switch" => Mode::Switch,
+            "outage-land" => Mode::OutageLand,
+            "outage-cruise" => Mode::OutageCruise,
             _ => return None,
         })
     }
 
-    /// A mode of the stub's usage wall, on a lab of its own on each harness it reaches
-    /// ([`wall_out_of_reach`]), and its one scenario.
+    /// A mode of the stub's usage wall or its outage, on a lab of its own on each harness it
+    /// reaches ([`wall_out_of_reach`]), and its one scenario.
     #[must_use]
     pub const fn walled(self) -> Option<Scenario> {
         match self {
@@ -568,6 +593,8 @@ impl Mode {
             Mode::WallUnread => Some(Scenario::W6),
             Mode::WallCruise => Some(Scenario::W8),
             Mode::WallRelaunch => Some(Scenario::W9),
+            Mode::OutageLand => Some(Scenario::O1),
+            Mode::OutageCruise => Some(Scenario::O2),
             Mode::Land
             | Mode::Cruise
             | Mode::Both
@@ -575,7 +602,8 @@ impl Mode {
             | Mode::Cap
             | Mode::Resid
             | Mode::Ladder
-            | Mode::Angles => None,
+            | Mode::Angles
+            | Mode::Switch => None,
         }
     }
 }
@@ -736,6 +764,20 @@ pub enum Chain {
     SameCruise,
     /// ANGLES (Cruise: every reply its own real work and a done claim, each check another angle).
     CruiseAngles,
+    /// SWA (Cruise at rest in a short-turn back-off, switched to Land: [`switch`]).
+    SwitchAgent,
+    /// SWS (the same, under a draft that stands over the switch).
+    SwitchSeq,
+    /// SWF (Cruise in a back-off, switched to Land then Off within 300 ms).
+    SwitchFlip,
+    /// SWH (Cruise held at the same reply, then switched to Land).
+    SwitchHeld,
+    /// SWB (Cruise switched to Land 5 s into a long busy turn).
+    SwitchBusy,
+    /// O1 (`--mode outage-land`, [`outage`]).
+    LandOutage,
+    /// O2 (`--mode outage-cruise`, [`outage`]).
+    CruiseOutage,
 }
 
 /// The scenarios, by the names the report and the record use.
@@ -810,12 +852,35 @@ pub enum Scenario {
     /// A new kind of work at each done claim under Cruise ([`angles`]): six angles in turn, then
     /// the first again, never held.
     Angles,
+    /// A Cruise tab at rest in a short-turn back-off switched to Land: land@v1 within 5 s of the
+    /// switch, before the back-off's due ([`switch::judge_at_rest`]).
+    SwitchAgent,
+    /// The same under a draft: the switch's wake journaled, nothing typed while the draft stands,
+    /// land@v1 within 5 s of its clearing ([`switch::judge_draft`]).
+    SwitchSeq,
+    /// Land then Off within 300 ms: nothing typed ([`switch::judge_flip`]).
+    SwitchFlip,
+    /// A tab held under Cruise switched to Land: nothing typed, the hold stands
+    /// ([`switch::judge_held`]).
+    SwitchHeld,
+    /// A switch 5 s into a long busy turn: nothing typed mid-turn, land@v1 within 3 s after the
+    /// turn's point ([`switch::judge_busy`]).
+    SwitchBusy,
+    /// An API overload standing from the first prompt under Land: only tries on the outage's
+    /// rungs, the first Land's instruction, one resume after the lift, landed on its answer
+    /// ([`outage::judge`]).
+    O1,
+    /// An API overload met by Cruise's own act: only tries on the outage's rungs, one resume
+    /// after the lift, and Cruise goes on ([`outage::judge`]).
+    O2,
 }
 
 impl Scenario {
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
+            Scenario::O1 => "O1",
+            Scenario::O2 => "O2",
             Scenario::W2 => "W2",
             Scenario::W4 => "W4",
             Scenario::W5 => "W5",
@@ -864,6 +929,11 @@ impl Scenario {
             Scenario::HL => "HL",
             Scenario::HC => "HC",
             Scenario::Angles => "ANGLES",
+            Scenario::SwitchAgent => "SWA",
+            Scenario::SwitchSeq => "SWS",
+            Scenario::SwitchFlip => "SWF",
+            Scenario::SwitchHeld => "SWH",
+            Scenario::SwitchBusy => "SWB",
         }
     }
 
@@ -922,6 +992,12 @@ impl Scenario {
             Scenario::W9 => {
                 "the agent launched again under its wall: nothing typed into it, resumed, landed"
             }
+            Scenario::O1 => {
+                "an overload from the first prompt under Land: tries on its rungs alone, resumed once, landed"
+            }
+            Scenario::O2 => {
+                "an overload met by Cruise: tries on its rungs alone, resumed once, Cruise goes on"
+            }
             Scenario::F18 => "a person's key into an instant turn: LEFT, theirs, nothing typed",
             Scenario::Rewrap => "a judged opener re-wrapped by a resize: not judged again",
             Scenario::SameWords => "a new turn answered with the same words: its own point",
@@ -934,6 +1010,19 @@ impl Scenario {
             Scenario::HC => "one reply to every done check: held at its second answer, and said so",
             Scenario::Angles => {
                 "six done claims after real work: six kinds of work asked in turn, never held"
+            }
+            Scenario::SwitchAgent => {
+                "Cruise at rest in a back-off switched to Land: land@v1 within 5 s, before its due"
+            }
+            Scenario::SwitchSeq => {
+                "switched under a draft: woken, nothing typed over it, land@v1 once it clears"
+            }
+            Scenario::SwitchFlip => "Land then Off within 300 ms: nothing typed",
+            Scenario::SwitchHeld => {
+                "a tab held under Cruise switched to Land: nothing typed, its hold stands"
+            }
+            Scenario::SwitchBusy => {
+                "switched 5 s into a busy turn: nothing typed mid-turn, land@v1 at its point"
             }
         }
     }
@@ -1036,6 +1125,25 @@ impl Chain {
     /// minutes each) and the Off control.
     pub const ANGLES: [Chain; 2] = [Chain::CruiseAngles, Chain::Off];
 
+    /// The switch's chains (`--mode switch`, [`switch`]): a running Cruise tab's word switched
+    /// mid-run, and the Off control. The held chain's tab comes first, so its row stands on the
+    /// Harness page's first screen, which is all a read of the page sees.
+    pub const SWITCH: [Chain; 6] = [
+        Chain::SwitchHeld,
+        Chain::SwitchAgent,
+        Chain::SwitchSeq,
+        Chain::SwitchFlip,
+        Chain::SwitchBusy,
+        Chain::Off,
+    ];
+
+    /// The Land outage's chain (`--mode outage-land`, alone for W1's reason: the stub's outage
+    /// meets every conversation it serves; the scale is the instance's, [`ladder_env`]).
+    pub const OUTAGE_LAND: [Chain; 1] = [Chain::LandOutage];
+
+    /// The Cruise outage's chain (`--mode outage-cruise`, alone for the same reasons).
+    pub const OUTAGE_CRUISE: [Chain; 1] = [Chain::CruiseOutage];
+
     /// Every chain of every mode, each once: what `--chains` may name.
     #[must_use]
     pub fn every() -> Vec<Chain> {
@@ -1053,6 +1161,9 @@ impl Chain {
             .chain(Chain::WALL_CRUISE)
             .chain(Chain::WALL_RELAUNCH)
             .chain(Chain::ANGLES)
+            .chain(Chain::SWITCH)
+            .chain(Chain::OUTAGE_LAND)
+            .chain(Chain::OUTAGE_CRUISE)
         {
             if !v.contains(&c) {
                 v.push(c);
@@ -1077,6 +1188,9 @@ impl Chain {
             Mode::WallCruise => Chain::WALL_CRUISE.to_vec(),
             Mode::WallRelaunch => Chain::WALL_RELAUNCH.to_vec(),
             Mode::Angles => Chain::ANGLES.to_vec(),
+            Mode::Switch => Chain::SWITCH.to_vec(),
+            Mode::OutageLand => Chain::OUTAGE_LAND.to_vec(),
+            Mode::OutageCruise => Chain::OUTAGE_CRUISE.to_vec(),
             Mode::Land | Mode::Cruise | Mode::Both => Chain::ALL
                 .into_iter()
                 .filter(|c| match c.autopilot() {
@@ -1100,9 +1214,25 @@ impl Chain {
                 Chain::RedrawWall => wall_out_of_reach(h, Mode::WallRedraw).is_none(),
                 Chain::UnreadWall => wall_out_of_reach(h, Mode::WallUnread).is_none(),
                 Chain::RelaunchWall => wall_out_of_reach(h, Mode::WallRelaunch).is_none(),
+                Chain::LandOutage => wall_out_of_reach(h, Mode::OutageLand).is_none(),
+                Chain::CruiseOutage => wall_out_of_reach(h, Mode::OutageCruise).is_none(),
                 _ => true,
             })
             .collect()
+    }
+
+    /// It meets the stub's outage ([`outage::step`]): O1's chain and O2's.
+    #[must_use]
+    pub const fn outage(self) -> bool {
+        matches!(self, Chain::LandOutage | Chain::CruiseOutage)
+    }
+
+    /// Its outage stands from before its first prompt, so the prompt meets it and Land's
+    /// instruction was never given (O1's); O2's is raised at its first point, so Cruise's own act
+    /// meets it ([`outage::outage_move`]).
+    #[must_use]
+    pub const fn outage_at_prompt(self) -> bool {
+        matches!(self, Chain::LandOutage)
     }
 
     /// It meets the stub's usage wall ([`wall_step`]): W1's chain, W2's, and W4's to W9's.
@@ -1190,6 +1320,7 @@ impl Chain {
             Chain::SwitchWall => WALL_SWITCH_LIMIT_MS,
             Chain::UnreadWall => WALL_UNREAD_LIMIT_MS,
             Chain::CruiseAngles => angles::LIMIT_MS,
+            Chain::LandOutage | Chain::CruiseOutage => outage::LIMIT_MS,
             _ => CHAIN_LIMIT_MS,
         }
     }
@@ -1244,6 +1375,13 @@ impl Chain {
             Chain::SameLand => "same-land",
             Chain::SameCruise => "same-cruise",
             Chain::CruiseAngles => "cruise-angles",
+            Chain::SwitchAgent => "switch-agent",
+            Chain::SwitchSeq => "switch-seq",
+            Chain::SwitchFlip => "switch-flip",
+            Chain::SwitchHeld => "switch-held",
+            Chain::SwitchBusy => "switch-busy",
+            Chain::LandOutage => "land-outage",
+            Chain::CruiseOutage => "cruise-outage",
         }
     }
 
@@ -1269,7 +1407,13 @@ impl Chain {
             | Chain::CruiseO
             | Chain::CruiseWall
             | Chain::SameCruise
-            | Chain::CruiseAngles => "cruise",
+            | Chain::CruiseAngles
+            | Chain::SwitchAgent
+            | Chain::SwitchSeq
+            | Chain::SwitchFlip
+            | Chain::SwitchHeld
+            | Chain::SwitchBusy
+            | Chain::CruiseOutage => "cruise",
             Chain::Off | Chain::Mgr => "off",
             _ => "land",
         }
@@ -1318,6 +1462,13 @@ impl Chain {
             Chain::SameLand => &[Scenario::HL],
             Chain::SameCruise => &[Scenario::HC],
             Chain::CruiseAngles => &[Scenario::Angles],
+            Chain::SwitchAgent => &[Scenario::SwitchAgent],
+            Chain::SwitchSeq => &[Scenario::SwitchSeq],
+            Chain::SwitchFlip => &[Scenario::SwitchFlip],
+            Chain::SwitchHeld => &[Scenario::SwitchHeld],
+            Chain::SwitchBusy => &[Scenario::SwitchBusy],
+            Chain::LandOutage => &[Scenario::O1],
+            Chain::CruiseOutage => &[Scenario::O2],
         }
     }
 
@@ -1361,6 +1512,7 @@ impl Chain {
                 | Chain::SwitchWall
                 | Chain::UnreadWall
                 | Chain::RelaunchWall
+                | Chain::LandOutage
         )
     }
 
@@ -1402,6 +1554,7 @@ impl Chain {
                 | Chain::WroteC
                 | Chain::SameLand
                 | Chain::SameCruise
+                | Chain::SwitchHeld
         )
     }
 
@@ -1605,7 +1758,7 @@ impl Chain {
                 rule(CONTINUE_KEY, CLEAN),
                 rule("", &needs_reply(N1_HEAD, &[NEED_A, NEED_B])),
             ],
-            Chain::CruiseWall => vec![
+            Chain::CruiseWall | Chain::CruiseOutage => vec![
                 rule(CHECK_KEY, CLEAN),
                 rule(CONTINUE_KEY, DONE_CLAIM),
                 rule(MARK, DONE_CLAIM),
@@ -1616,7 +1769,8 @@ impl Chain {
             | Chain::RedrawWall
             | Chain::SwitchWall
             | Chain::UnreadWall
-            | Chain::RelaunchWall => vec![
+            | Chain::RelaunchWall
+            | Chain::LandOutage => vec![
                 rule(NUDGE_KEY, CLEAN),
                 rule(LAND_KEY, CLEAN),
                 rule(MARK, CLEAN),
@@ -1638,6 +1792,19 @@ impl Chain {
                 .map(|(key, reply)| long(key, reply))
                 .chain([long("", angles::FIRST)])
                 .collect(),
+            Chain::SwitchAgent | Chain::SwitchSeq | Chain::SwitchFlip => vec![
+                rule(NUDGE_KEY, CLEAN),
+                rule(LAND_KEY, CLEAN),
+                rule(CHECK_KEY, CLEAN),
+                rule("", DONE_CLAIM),
+            ],
+            Chain::SwitchHeld => vec![rule(MARK, CLEAN), rule("", DONE_CLAIM)],
+            Chain::SwitchBusy => vec![
+                rule(NUDGE_KEY, CLEAN),
+                rule(LAND_KEY, CLEAN),
+                rule(MARK, CLEAN),
+                long("", WORK),
+            ],
         }
     }
 
@@ -1936,6 +2103,22 @@ pub struct Cover {
     /// ANGLES: what of the other session's work ([`Repo::Others`]) no longer stands as laid, read
     /// once the watch is over ([`angles::others_left`]; empty: all of it stands).
     pub others_left: Option<Vec<String>>,
+    /// SWITCH: the lab's writes of the tab's Autopilot word mid-run, in order
+    /// ([`switch::word_step`]).
+    pub words: Vec<switch::Switched>,
+    /// SWS: the draft that stood over the switch ([`switch::word_step`]).
+    pub draft: Option<switch::Draft>,
+    /// SWITCH: the waits at rest the session's tapes show carrying `autopilot=` and woken by
+    /// another word, read once the watch is over ([`switch::woke_witness`]; `None`: no tape read).
+    pub woke: Option<Vec<switch::Woke>>,
+    /// O1, O2: when the lab raised the stub's outage ([`outage::step`]).
+    pub outage_ms: Option<i64>,
+    /// O1, O2: when the lab gave the stub its scripted mode back.
+    pub outage_lifted_ms: Option<i64>,
+    /// O1, O2: the requests of the conversation the stub read after the lift whose last user text
+    /// holds the outage's line, read once the watch is over ([`outage::resumed_witness`]; `None`:
+    /// not read, or never lifted).
+    pub outage_resumed: Option<usize>,
 }
 
 impl Cover {
@@ -2392,6 +2575,7 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::W6 => walls::judge_wall_unread(seen, land, program, t0),
             Scenario::W8 => walls::judge_wall_cruise(seen, program, t0),
             Scenario::W9 => walls::judge_wall_relaunch(seen, land, program, t0),
+            Scenario::O1 | Scenario::O2 => outage::judge(chain, seen, outage::SCALE, t0),
             Scenario::F18 => cover::judge_person_instant(seen, t0),
             Scenario::Rewrap => cover::judge_rewrap(seen, t0),
             Scenario::Scrolled => cover::judge_scrolled(seen, t0),
@@ -2400,8 +2584,14 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::Ladder => cover::judge_ladder(seen, LADDER_SCALE, t0),
             Scenario::HL | Scenario::HC => surfaces::held::judge_hold(chain, seen, t0),
             Scenario::Angles => angles::judge(seen, t0),
+            Scenario::SwitchAgent => switch::judge_at_rest(seen, t0),
+            Scenario::SwitchSeq => switch::judge_draft(seen, t0),
+            Scenario::SwitchFlip => switch::judge_flip(seen, t0),
+            Scenario::SwitchHeld => switch::judge_held(seen, t0),
+            Scenario::SwitchBusy => switch::judge_busy(seen, t0),
         };
         let cx = surfaces::Ctx { chain, program, t0 };
+        let v = switch::with_at_once(s, seen, &cx, v);
         let v = surfaces::with_window(s, seen, &cx, v);
         out.push((s, surfaces::held::with_held(s, seen, &cx, v)));
     }
@@ -3352,6 +3542,17 @@ fn early_acts(seen: &Seen, t0: i64) -> Vec<String> {
         {
             continue;
         }
+        // A switch of the tab's word to Land between the back-off and the act decides the act
+        // anew: Land's instruction waits no back-off (v6 §14.10).
+        if act_rule(la) == Some(turn_end::RULE_LAND)
+            && seen
+                .cover
+                .words
+                .iter()
+                .any(|w| w.word == "land" && w.at > *tw && w.at < *ta)
+        {
+            continue;
+        }
         match backoff_due(wl) {
             Some(due) if *ta < due - DUE_SLACK_MS => out.push(format!(
                 "+{} {} typed {} BEFORE the due its back-off named (+{} {})",
@@ -3438,8 +3639,14 @@ fn p3_faults(seen: &Seen, t0: i64, first_works: bool) -> Vec<String> {
                 && r.decision == "skipped"
                 && (r.ts - first.ts).abs() <= AT_DONE_MS
         });
+        // A first point that met an outage is decided as the outage's wait, never a short-turn
+        // back-off, so P3's ladder does not start there.
+        let outage = seen
+            .journal
+            .iter()
+            .any(|(t, l)| (t - first.ts).abs() <= AT_DONE_MS && outage::is_wait(l));
         let want = u32::from(!left && !first_works);
-        if streak(first) != Some(want) {
+        if !outage && streak(first) != Some(want) {
             out.push(format!(
                 "the first point at +{} closed {} short turn(s), not {want} (P3: the ladder starts a step late): {}",
                 at(t0, first.ts),
@@ -3455,7 +3662,7 @@ fn p3_faults(seen: &Seen, t0: i64, first_works: bool) -> Vec<String> {
 /// before the due its back-off named ([`early_acts`]), an act typed twice with no point judged
 /// between ([`doubled_acts`]), a point before the first prompt or a first point that closed other
 /// than one short turn, none where the chain's first reply is real work (`first_works`,
-/// [`Chain::first_reply_works`]) ([`p3_faults`]).
+/// [`Chain::first_reply_works`]) and no count where it met an outage ([`p3_faults`]).
 #[must_use]
 pub fn chain_faults(seen: &Seen, t0: i64, first_works: bool) -> Vec<String> {
     let mut out = early_acts(seen, t0);
@@ -3518,13 +3725,16 @@ fn judge_instant_land(
         ));
     };
     let seq = word(el, "seq");
+    // The decision at that point: its back-off, else Land's instruction typed at it at once (v6
+    // §14.10).
     let Some((tw, wl)) = seen
         .journal
         .iter()
         .find(|(t, l)| *t >= *te && t < t1 && backoff_named(l) && word(l, "seq") == seq)
+        .or_else(|| land.filter(|(_, l)| word(l, "seq") == seq))
     else {
         return Verdict::Fail(format!(
-            "the first reply read at +{} ({}), but no back-off decided at that point before land@v1 at +{}",
+            "the first reply read at +{} ({}), but no back-off decided at that point, nor land@v1 typed at it, before land@v1 at +{}",
             at(t0, *te),
             crate::util::one_line(el, 80),
             at(t0, *t1)
@@ -3868,9 +4078,17 @@ pub(crate) fn spawn_tab(door: &Door<'_>, dir: &Path) -> Result<String, Fail> {
     Ok(sid)
 }
 
+/// What [`launch_tab`] said, and a tasked chain's mark: the record as its `task mark` replied, at
+/// the time it was read.
+pub(crate) struct Launched {
+    /// The Autopilot it set and `meta set`'s reply, and the task's.
+    pub(crate) said: String,
+    /// The record's first read, the only `working` one when the task lands before the first look.
+    pub(crate) task: Option<(i64, String)>,
+}
+
 /// `chain`'s program launched in tab `sid` as the forever lab launches it: its Autopilot set, a
-/// tasked chain's task marked working, then `script` typed and entered. What it said: the
-/// Autopilot it set and `meta set`'s reply, and the task's.
+/// tasked chain's task marked working, then `script` typed and entered.
 /// # Errors
 /// A tasked chain's task was not marked working (a COULD NOT RUN).
 pub(crate) fn launch_tab(
@@ -3878,7 +4096,7 @@ pub(crate) fn launch_tab(
     sid: &str,
     chain: Chain,
     script: &Path,
-) -> Result<String, Fail> {
+) -> Result<Launched, Fail> {
     let set = on(door, sid, &["meta", "set", "autopilot", chain.autopilot()]);
     let task = if chain.tasked() {
         let r = on(door, sid, &["task", "mark", "working", "from=ctl"]);
@@ -3889,18 +4107,20 @@ pub(crate) fn launch_tab(
                 r.trim()
             )));
         }
-        format!(", task {}", crate::util::one_line(r.trim(), 120))
+        Some((now_ms(), r.trim().to_string()))
     } else {
-        String::new()
+        None
     };
     let line = format!("sh {}", shell_quote(&script.to_string_lossy()));
     let _ = on(door, sid, &["send", &line]);
     let _ = on(door, sid, &["key", "enter"]);
-    Ok(format!(
-        "autopilot {} ({}){task}",
-        chain.autopilot(),
-        set.trim()
-    ))
+    let marked = task.as_ref().map_or_else(String::new, |(_, r)| {
+        format!(", task {}", crate::util::one_line(r, 120))
+    });
+    Ok(Launched {
+        said: format!("autopilot {} ({}){marked}", chain.autopilot(), set.trim()),
+        task,
+    })
 }
 
 fn git(home: &Path, dir: &Path, args: &[&str]) -> Result<(), String> {
@@ -4923,6 +5143,7 @@ fn status_words(door: &Door<'_>, sid: &str) -> String {
         "land_nudges",
         "land_since",
         "held",
+        "waiting",
     ]
     .iter()
     .map(|k| format!("{k}={}", word(&s, k).unwrap_or_else(|| "?".into())))
@@ -5233,16 +5454,29 @@ pub fn wall_move(chain: Chain, cover: &Cover, now: i64) -> WallMove {
     }
 }
 
+/// Whether a point was read from `t0` on: an idle event with words.
+#[must_use]
+pub fn point_read(seen: &Seen, t0: i64) -> bool {
+    seen.journal
+        .iter()
+        .any(|(t, l)| *t > t0 && idle_words(l).is_some_and(|w| !w.is_empty() && w != "-"))
+}
+
+/// Whether the chain's first point from `t0` was read and nothing was typed yet: when the lab
+/// raises a wall or an outage for the chain's first act to meet ([`wall_step`],
+/// [`outage::outage_move`]).
+#[must_use]
+pub fn first_point_unanswered(seen: &Seen, t0: i64) -> bool {
+    point_read(seen, t0) && seen.all_acts().is_empty()
+}
+
 fn wall_step(run: &Run, tab: &mut Tab, now: i64) -> Result<(), Fail> {
     if !tab.chain.walled() {
         return Ok(());
     }
     match tab.seen.cover.wall {
         None => {
-            let pointed = tab.seen.journal.iter().any(|(t, l)| {
-                *t > tab.t0 && idle_words(l).is_some_and(|w| !w.is_empty() && w != "-")
-            });
-            if !pointed || !tab.seen.all_acts().is_empty() {
+            if !first_point_unanswered(&tab.seen, tab.t0) {
                 return Ok(());
             }
             let reset = reset_s_ahead(now, tab.chain.wall_ahead_ms());
@@ -6024,8 +6258,12 @@ fn finished(tab: &Tab, now: i64) -> bool {
         | Chain::RedrawWall
         | Chain::SwitchWall
         | Chain::UnreadWall
-        | Chain::RelaunchWall => false,
+        | Chain::RelaunchWall
+        | Chain::LandOutage => false,
         Chain::CruiseWall => walls::cruise_went_on(s).is_some_and(|t| now - t >= 10_000),
+        Chain::CruiseOutage => {
+            outage::went_on(s).is_some_and(|t| now - t >= outage::WENT_ON_WATCH_MS)
+        }
         Chain::Mgr => true,
         Chain::LandT => done_since(20_000),
         Chain::LandP => done_since(20_000),
@@ -6161,6 +6399,11 @@ fn finished(tab: &Tab, now: i64) -> bool {
                 && (!s.window.read || s.window.stopped.is_some())
         }
         Chain::CruiseAngles => angles::watched(s, now, tab.t0),
+        Chain::SwitchAgent
+        | Chain::SwitchSeq
+        | Chain::SwitchFlip
+        | Chain::SwitchHeld
+        | Chain::SwitchBusy => switch::watched(tab.chain, s, now),
     }
 }
 
@@ -6266,11 +6509,12 @@ fn run_check(
             Some(own) if chain == Chain::TallScroll => own,
             _ => &script,
         };
-        let said = launch_tab(&door, &sid, chain, script)?;
+        let launched = launch_tab(&door, &sid, chain, script)?;
         println!(
-            "  tab       {} @{sid} in {}: {said}{titled}, launched",
+            "  tab       {} @{sid} in {}: {}{titled}, launched",
             chain.name(),
             dir.display(),
+            launched.said,
         );
         tabs.push(Tab {
             chain,
@@ -6281,6 +6525,7 @@ fn run_check(
                     label: chain.name().to_string(),
                     ..surfaces::Window::default()
                 },
+                task: launched.task.into_iter().collect(),
                 ..Seen::default()
             },
             t0: 0,
@@ -6378,6 +6623,7 @@ fn run_check(
             }
         }
         tab.t0 = now_ms();
+        outage::step(&run, tab, tab.t0)?;
         let took = match opening {
             Opening::Prompt => tab_turn(&door, &tab.sid, h.name(), &tab.chain.prompt())?,
             Opening::Person if window => {
@@ -6527,6 +6773,7 @@ fn run_check(
                 }
             }
             wall_step(&run, tab, now)?;
+            outage::step(&run, tab, now)?;
             hide_step(&door, h, tab, now)?;
             switch_step(&run, &door, h, tab)?;
             relaunch_step(&run, &door, h, tab)?;
@@ -6534,6 +6781,7 @@ fn run_check(
             resize_step(&door, tab, now)?;
             scroll_step(&door, tab, now)?;
             first_screen_step(&door, tab);
+            switch::word_step(&door, h, tab, now)?;
             if let Some(text) = tab.chain.orchestrated()
                 && orchestrator_due(tab.chain, &tab.seen, now)
             {
@@ -6567,6 +6815,13 @@ fn run_check(
                 }
                 tab.seen.cover.window_stub = window_witness(&run, tab);
                 tab.seen.cover.went_on_ms = went_on_witness(&run, tab);
+                tab.seen.cover.outage_resumed = outage::resumed_witness(&run, tab);
+                if let Some(n) = tab.seen.cover.outage_resumed {
+                    println!(
+                        "  [{}] stub    after the outage's lift it read {n} request(s) of the conversation carrying the resume",
+                        tab.chain.name()
+                    );
+                }
                 if tab.chain.repo() == Repo::Others {
                     tab.seen.cover.others_left =
                         Some(angles::others_left(&run.w.join("home"), &tab.dir));
@@ -6582,6 +6837,15 @@ fn run_check(
                 }
                 if tab.chain == Chain::ToolEnd {
                     tab.seen.cover.tool_results = Some(tool_results_of(&run, &tab.chain.token()));
+                }
+                if switch::switches(tab.chain) {
+                    let woke = switch::woke_witness(&run, &tab.sid);
+                    println!(
+                        "  [{}] tape    {}",
+                        tab.chain.name(),
+                        switch::woke_line(woke.as_deref(), tab.t0)
+                    );
+                    tab.seen.cover.woke = woke;
                 }
                 if tab.chain == Chain::Worker {
                     let aim = format!("@{}", tab.sid);
@@ -6754,10 +7018,13 @@ fn lab_opts(
     if mode == Mode::Cap {
         u.harness_keys = format!("{}\ncontinue_per_hour = {CAP_PER_HOUR}", u.harness_keys);
     }
-    if matches!(mode, Mode::Ladder | Mode::Angles) {
-        u.instance_env = format!("{} {}", u.instance_env, ladder_env())
-            .trim()
-            .to_string();
+    let scaled = match mode {
+        Mode::Ladder | Mode::Angles => Some(ladder_env()),
+        Mode::OutageLand | Mode::OutageCruise => Some(outage::env()),
+        _ => None,
+    };
+    if let Some(env) = scaled {
+        u.instance_env = format!("{} {env}", u.instance_env).trim().to_string();
     }
     match crate::lab::opts_refused(&u) {
         Some(why) => Err(Fail::usage(format!("forever: {why}"))),
@@ -6831,7 +7098,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
                 let w = it.next().map(String::as_str);
                 mode = w.and_then(Mode::of).ok_or_else(|| {
                     usage(&format!(
-                        "--mode takes land, cruise, both, cover, cap, wall, wall-hid, wall-redraw, wall-switch, wall-unread, wall-cruise, wall-relaunch, resid, ladder or angles, not {w:?}"
+                        "--mode takes land, cruise, both, cover, cap, wall, wall-hid, wall-redraw, wall-switch, wall-unread, wall-cruise, wall-relaunch, resid, ladder, angles, switch, outage-land or outage-cruise, not {w:?}"
                     ))
                 })?;
             }
@@ -6900,7 +7167,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
 /// `forever --harness <claude|agy|muse|all> [--mode MODE] [--chains a,b] [--no-surfaces]
 /// [--window] [tag] [--keep]`, `MODE` one of `land`, `cruise`, `both`, `cover`, `cap`, `wall`,
 /// `wall-hid`, `wall-redraw`, `wall-switch`, `wall-unread`, `wall-cruise`, `wall-relaunch`,
-/// `resid` or `ladder`.
+/// `resid`, `ladder`, `angles`, `switch`, `outage-land` or `outage-cruise`.
 pub fn cmd_forever(args: &[String]) -> Res {
     let Some(a) = parse_args(args)? else {
         print!("{}", crate::USAGE);
@@ -6985,6 +7252,12 @@ pub mod surfaces;
 
 #[path = "forever_angles.rs"]
 pub mod angles;
+
+#[path = "forever_switch.rs"]
+pub mod switch;
+
+#[path = "forever_outage.rs"]
+pub mod outage;
 
 #[cfg(test)]
 #[path = "forever_tests.rs"]

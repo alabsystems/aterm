@@ -1267,6 +1267,10 @@ fn precheck_with(
             ),
         },
         PrecheckGate {
+            name: "harness versions",
+            outcome: answer(harness_versions_gate_at(git, &commit, &version)),
+        },
+        PrecheckGate {
             name: "handoff policy",
             outcome: answer(
                 handoff_policy_gate_at(git, &commit, &version)
@@ -1279,6 +1283,42 @@ fn precheck_with(
         },
     ];
     Ok(found)
+}
+
+/// The harness versions gate ([`crate::harness_versions`]) for `commit`: every harness whose
+/// sources moved since the previous public release carries a bumped `HARNESS_VER`.
+///
+/// # Errors
+/// A harness owes a bump, the ledger or origin's tags cannot be read, or the previous release's
+/// commit is not in this clone.
+pub fn harness_versions_gate_at(
+    git: &dyn GitRunner,
+    commit: &str,
+    version: &str,
+) -> Result<String> {
+    let ledger_text = GateTree::Commit { git, commit }.text(crate::ledger::LEDGER_FILE)?;
+    let listing = git_ok(git, &["ls-remote", "--tags", "origin"]).map_err(|e| {
+        Error::new(format!(
+            "harness versions gate: cannot list origin's tags, which name the previous public \
+             release: {e}"
+        ))
+    })?;
+    let Some((release, released)) =
+        crate::harness_versions::previous_release(&ledger_text, version, &listing.stdout_utf8())?
+    else {
+        return Ok("harness versions: no earlier public release to compare".to_string());
+    };
+    if !git
+        .git(&["cat-file", "-e", &format!("{released}^{{commit}}")])?
+        .success()
+    {
+        return Err(Error::new(format!(
+            "harness versions gate: v{release}'s commit {} is not in this clone — `git fetch \
+             origin tag v{release}`, then check again",
+            short(&released)
+        )));
+    }
+    crate::harness_versions::gate(git, (&release, &released), commit)
 }
 
 /// The line for what [`handoff_fixture_gate_at`] found.
@@ -2031,7 +2071,7 @@ fn predecessor_in(
     predecessor_release(&ledger_text, version, &shipped)
 }
 
-fn tag_commits(listing: &str) -> std::collections::BTreeMap<String, String> {
+pub(crate) fn tag_commits(listing: &str) -> std::collections::BTreeMap<String, String> {
     let mut tags = std::collections::BTreeMap::new();
     for line in listing.lines() {
         let mut fields = line.split_whitespace();
@@ -2530,15 +2570,24 @@ pub fn x86_target_probe() -> Result<()> {
 /// # Errors
 /// rustup cannot be run, or does not answer.
 pub fn stable_targets_missing(targets: &[&str]) -> Result<Vec<String>> {
-    let out = command("rustup")
+    let rustup = aterm_uds::host::tool("rustup").locate().map_err(|absent| {
+        Error::new(format!(
+            "{}; upstream stable carries the std of the targets Trust has none for.\n\
+             fix:  {}",
+            absent.why, absent.fix
+        ))
+    })?;
+    let out = command(&rustup)
         .env("RUSTUP_TOOLCHAIN", "stable")
         .args(["target", "list", "--installed"])
         .output()
         .map_err(|e| {
             Error::new(format!(
-                "failed to run rustup ({e}); upstream stable carries the std of the targets \
+                "failed to run {} ({e}); upstream stable carries the std of the targets \
                  Trust has none for.\n\
-                 fix:  install rustup, then `rustup toolchain install stable`"
+                 fix:  {}",
+                rustup.display(),
+                aterm_uds::host::tool("rustup").remedy()
             ))
         })?;
     if !out.status.success() {

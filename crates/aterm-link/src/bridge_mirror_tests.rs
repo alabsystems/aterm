@@ -104,6 +104,15 @@ impl World {
         Stamp::new(self.clock, self.clock)
     }
 
+    /// Fixture I/O establishes state or reads an outcome; its bound detects a hang.
+    fn client(&self) -> Conn {
+        let (mut conn, _) =
+            transport::connect(&self.bridge.cfg.broker, aterm_spec::wait::MUST_HAPPEN)
+                .expect("a fixture connection");
+        transport::attach_ring(&mut conn, &self.bridge.caps).expect("fixture capabilities");
+        conn
+    }
+
     fn log<R>(&mut self, f: impl FnOnce(&mut Log) -> R) -> R {
         if let Some(pending) = self.pending.as_mut() {
             return f(pending);
@@ -126,7 +135,7 @@ impl World {
     /// `(ep, seq)` records holding it, and whether a cover covers it.
     fn view(&mut self) -> ([i64; 3], [i64; 3]) {
         let face = subject::session_face("f", &self.bridge.node, SID, "ev");
-        let (mut conn, _) = self.bridge.connect().expect("a read connection");
+        let mut conn = self.client();
         let ((rows, _), _) =
             crate::transport::fetch_kept(&mut conn, 0, &face, 1000).expect("the face");
         let mut recs: BTreeMap<u64, BTreeSet<(u32, u64)>> = BTreeMap::new();
@@ -372,7 +381,7 @@ impl World {
             .map(|m| m.batch().0[0].pseq)
             .expect("a pin");
         let face = subject::session_face("f", &self.bridge.node, SID, "ev");
-        let (mut god, _) = self.bridge.connect().expect("a connection");
+        let mut god = self.client();
         god.publish(self.bridge.producer_id, pseq, &face, b"v=1 t=1 ev=foreign")
             .expect("the foreign record lands");
         self.foreign = true;
@@ -1322,7 +1331,7 @@ fn the_nodes_total_rides_the_pin_and_the_cap_stops_the_mirror() {
 /// broker's window holds below the mirror's own.
 fn fill(w: &World, n: u64) -> Vec<u64> {
     let face = subject::session_face("f", &w.bridge.node, "s-old", "ev");
-    let (mut god, _) = w.bridge.connect().unwrap();
+    let mut god = w.client();
     (1..=n)
         .map(|seq| god.publish(93, seq, &face, b"v=1 t=1 ev=old").unwrap().0)
         .collect()
@@ -1475,11 +1484,11 @@ fn a_closed_sessions_face_is_retired_after_the_brokers_own_cut() {
             "PRECONDITION ({retained}): the session's face is on the bus"
         );
         let past = w.broker.head();
-        let (mut god, _) = w.bridge.connect().expect("a connection of the test's own");
+        let mut god = w.client();
         let filler = "/f/f/pub/n-fill/s-fill/ev";
         for seq in 1..=64 {
             god.publish(93, seq, filler, &[b'e'; BODY])
-                .expect("a filler record");
+                .unwrap_or_else(|error| panic!("filler {seq} (retained={retained}): {error}"));
         }
         if retained {
             aterm_spec::wait::until_within(
@@ -1702,7 +1711,7 @@ fn no_parent_sid_and_no_opener_reach_a_mirrored_body() {
     }
     assert_eq!(landed(&w), Some(head), "the whole log landed");
     let face = subject::session_face("f", &w.bridge.node, SID, "ev");
-    let (mut conn, _) = w.bridge.connect().expect("a read connection");
+    let mut conn = w.client();
     let ((rows, _), _) = crate::transport::fetch_kept(&mut conn, 0, &face, 1000).expect("the face");
     let bodies: Vec<String> = rows
         .iter()
@@ -1747,7 +1756,7 @@ fn a_collision_re_pins_the_slot_and_every_later_one_of_its_session_in_order() {
         .collect();
     assert_eq!(before.len(), 3, "{before:?}");
     let face = subject::session_face("f", &w.bridge.node, SID, "ev");
-    let (mut god, _) = w.bridge.connect().unwrap();
+    let mut god = w.client();
     god.publish(
         w.bridge.producer_id,
         before[1],
@@ -2315,13 +2324,14 @@ fn an_empty_take_that_says_more_waits_its_retry_and_never_spins() {
 
 /// An empty take whose endpoint held a moved mail count's snapshot back to its rate (`due=`, LOOP-2)
 /// owes a take at that instant, not at the roster's next wake; a record appended meanwhile is
-/// still taken at once, and once the instant passes the pass takes again.
+/// still taken at once, and once the instant passes the pass takes again. The owed instant and
+/// the loop's wait are read as of the moment before the take, so a slow take changes neither.
 #[test]
 fn an_empty_take_that_holds_a_snapshot_back_takes_again_when_it_is_due() {
     let mut w = World::new();
     w.lane.mirror.lock().unwrap().refuse_take = Some("OK 0 slots=0 due=400\n".to_string());
     let before = Instant::now();
-    w.bridge.roster_due = before + ROSTER_REFRESH;
+    w.bridge.roster_due = before + aterm_spec::wait::MUST_HAPPEN;
     w.bridge.mirror_step();
     let after = Instant::now();
     assert_eq!(
@@ -2333,19 +2343,23 @@ fn an_empty_take_that_holds_a_snapshot_back_takes_again_when_it_is_due() {
         w.bridge.mirror.as_deref().unwrap().batch().0.is_empty(),
         "PRECONDITION: it took nothing"
     );
+    assert!(
+        w.bridge.deadlines.is_empty() && !w.bridge.sweep_owed(),
+        "PRECONDITION: only the roster's round wakes the loop besides the take"
+    );
     let wait = Duration::from_millis(400);
     let due = w
         .bridge
-        .mirror_due(after)
+        .mirror_due(before)
         .expect("the held-back snapshot owes a take");
     assert!(
         due >= before + wait && due <= after + wait,
         "the take is owed when the snapshot is due"
     );
-    let park = w.bridge.park_wait(after);
-    assert!(
-        park > Duration::ZERO && park <= wait,
-        "the loop wakes for it, not at the roster's next round: {park:?}"
+    assert_eq!(
+        w.bridge.park_wait(before),
+        due.duration_since(before),
+        "the loop wakes for it, not at the roster's next round"
     );
     w.bridge.mirror_wake();
     assert_eq!(
@@ -2694,6 +2708,60 @@ fn a_dedup_whose_record_retention_took_is_sent_again_never_a_collision() {
     assert_eq!(landed(&next_lane), Some(1), "landed");
 }
 
+/// A DEDUP'S READ BACK WHOSE TOLD READ CANNOT BE MADE WAITS, THE LINK KEPT (F3 review): as
+/// above, a republished slot's record taken by a cut, so its read back is refused below the
+/// face's oldest and read again told, but the broker at its connection cap refuses the told
+/// read's connection of its own. Nothing is answered about the record: the slot stays deduped,
+/// unsent and uncollided, the link stands, and the pass is tried again later. CONTROL: the cap
+/// lifted, the next settle reads it back as given up and sends it again.
+#[test]
+fn a_dedup_read_back_whose_told_read_cannot_be_dialled_waits_with_the_link_kept() {
+    let (lane, mut first) = FakeVerbLane::bridge(&[]);
+    let socket = lane.dir.path().join("broker.sock");
+    let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
+    let _server = broker.serve(&socket).unwrap();
+    mirroring(&lane, &mut first, &socket);
+    first.mirror_take();
+    first.mirror_send();
+    first.settle_acks();
+    let Outcome::OnBus(off) = first.mirror.as_deref().unwrap().batch().1[0] else {
+        panic!("PRECONDITION: the slot is on the bus");
+    };
+    let (_next_lane, mut next) = successor(&lane, first, &socket);
+    next.mirror_send();
+    next.settle_acks();
+    assert_eq!(
+        next.mirror.as_deref().unwrap().batch().1[0],
+        Outcome::Deduped(off),
+        "PRECONDITION: the republish is deduped at its record"
+    );
+    assert!(
+        broker.retain_before_carrying_state(off + 1).unwrap() > 0,
+        "PRECONDITION: retention took it"
+    );
+    broker.set_max_conns(1);
+    next.mirror_settle();
+    assert!(next.conn.is_some(), "the link stands");
+    assert!(next.collided.is_none(), "no collision is said");
+    assert_eq!(
+        next.mirror.as_deref().unwrap().batch().1[0],
+        Outcome::Deduped(off),
+        "no answer about the record: the read back waits"
+    );
+    assert!(
+        next.mirror.as_deref().unwrap().retry_at().is_some(),
+        "and is tried again later"
+    );
+    broker.set_max_conns(astream_broker::broker::MAX_CONNS);
+    next.mirror_settle();
+    assert!(next.conn.is_some() && next.collided.is_none());
+    assert_eq!(
+        next.mirror.as_deref().unwrap().batch().1[0],
+        Outcome::Owed,
+        "CONTROL: read back as given up, sent again at its pinned seq"
+    );
+}
+
 /// A second dedup naming the same unseen offset is detected as a collision.
 #[test]
 fn a_second_dedup_at_an_offset_the_face_does_not_hold_is_a_collision() {
@@ -2750,4 +2818,103 @@ fn a_second_dedup_at_an_offset_the_face_does_not_hold_is_a_collision() {
     next.settle_acks();
     next.mirror_settle();
     assert_eq!(landed(&next_lane), Some(1), "landed at its fresh seq");
+}
+
+/// A MOVE THE ATTACH SAW BEFORE THE HELLO JUDGED THE PIN DROPS THE BATCH OF THE PIN ON DISK
+/// (sim item B05, found seed 1883): an `auto` mirror judges its pin only once the broker's
+/// rules, and then the hello, say it runs, after the attach; the batch names the log the move
+/// took records from, and the mirror that judged it later recovered it onto the moved log,
+/// its landing covering what the move took. Off, the next build that mirrors would. The
+/// incarnation, the total and the key stay. NC (run): a forget that drops only a pin judged
+/// into memory leaves the batch on disk.
+#[test]
+fn a_move_before_the_hello_drops_the_batch_of_the_pin_on_disk() {
+    for mode in [crate::mirror::LogMode::Auto, crate::mirror::LogMode::Off] {
+        let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
+        let pin = crate::mirror::Pin {
+            inc: 3,
+            total: 4096,
+            key: Some([7; 16]),
+            win: vec![(10, 100)],
+            slots: vec![crate::mirror::PinSlot {
+                pseq: 9,
+                sid: SID.to_string(),
+                at: aterm_slog::BusCursor::new(4, 2, 1),
+                body: "v=2 t=1 ep=4 seq=2 ms=1 op=open node=t1 k=turn src=screen conf=strong"
+                    .to_string(),
+            }],
+        };
+        bridge.state.set_logpin(&pin.render()).unwrap();
+        bridge.mirror = MirrorRun::new(mode, &bridge.state, Instant::now(), || None);
+        bridge.mirror_forget_log().unwrap();
+        let back = crate::mirror::Pin::parse(&bridge.state.logpin().unwrap().unwrap()).unwrap();
+        assert!(
+            back.slots.is_empty() && back.win.is_empty(),
+            "{mode:?}: the batch and its window go: {back:?}"
+        );
+        assert_eq!(
+            (back.inc, back.total, back.key),
+            (3, 4096, Some([7; 16])),
+            "{mode:?}: the incarnation, the total and the key stay"
+        );
+    }
+}
+
+/// A MOVE'S DROP OF THE PINNED BATCH THAT THE DISK REFUSES REFUSES THE ATTACH (aterm-link B05
+/// review): the forget of the log's offsets returns the refusal before it forgets anything, so
+/// the attach does not go on to move the node's witness to the new log, and the next attach,
+/// meeting the move again, drops the batch. NC (run, `attach_past_an_unwritten_drop`): an
+/// attach that goes on past the refusal leaves the batch on disk, which the hello then judged
+/// and recovered onto the moved log (the review met it at the sim's seed 6371 on aaf03eb42f; no
+/// seed within 8000 of its worlds reaches it since, so this test is its control).
+#[test]
+fn a_move_whose_drop_the_disk_refuses_is_not_gone_past() {
+    for past in [false, true] {
+        for mode in [crate::mirror::LogMode::Auto, crate::mirror::LogMode::Off] {
+            let case = format!("{mode:?} past={past}");
+            let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
+            bridge.attach_past_an_unwritten_drop = past;
+            let pin = crate::mirror::Pin {
+                inc: 3,
+                total: 4096,
+                key: Some([7; 16]),
+                win: vec![(10, 100)],
+                slots: vec![crate::mirror::PinSlot {
+                    pseq: 9,
+                    sid: SID.to_string(),
+                    at: aterm_slog::BusCursor::new(4, 2, 1),
+                    body: "v=2 t=1 ep=4 seq=2 ms=1 op=open node=t1 k=turn src=screen conf=strong"
+                        .to_string(),
+                }],
+            };
+            bridge.state.set_logpin(&pin.render()).unwrap();
+            bridge.mirror = MirrorRun::new(mode, &bridge.state, Instant::now(), || None);
+            let moved = astream_broker::LogIdentity::parse(&format!("{}.4", "5a".repeat(16)));
+            let batch = |bridge: &Bridge| {
+                crate::mirror::Pin::parse(&bridge.state.logpin().unwrap().unwrap())
+                    .unwrap()
+                    .slots
+                    .len()
+            };
+            bridge.state.refuse_writes_of(Some(crate::state::LOGPIN));
+            let refused = bridge.forget_log_offsets(20, moved, None, None);
+            assert_eq!(batch(&bridge), 1, "{case}: the batch is still on disk");
+            if past {
+                assert!(
+                    refused.is_ok(),
+                    "CONTROL {case}: the attach goes on past the batch left on disk"
+                );
+                continue;
+            }
+            assert!(
+                refused.is_err(),
+                "{case}: the attach is refused: {refused:?}"
+            );
+            bridge.state.refuse_writes_of(None);
+            bridge
+                .forget_log_offsets(20, moved, None, None)
+                .expect("the next attach");
+            assert_eq!(batch(&bridge), 0, "{case}: the next attach drops it");
+        }
+    }
 }

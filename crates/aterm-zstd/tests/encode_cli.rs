@@ -74,8 +74,9 @@ fn the_zstd_cli_decodes_every_frame_the_encoder_writes() {
                 Checksum::Omitted,
                 Feed::Chunks(if big { 131_072 } else { 4096 }),
             ),
-            // The producer's packs: level 19 streamed at the widest window, whose long
-            // matches past the tree come from anchors.
+            // The producer's packs past 2^27 bytes: level 19 streamed at the widest window,
+            // whose long matches past the tree come from anchors. (A smaller pack declares
+            // its size, a single segment: level 19's one-shot shape above.)
             (
                 19,
                 Some(27),

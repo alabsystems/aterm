@@ -163,6 +163,9 @@ impl crate::wire::Transport for HttpTransport {
             body,
             limit,
             deadlines,
+            permit: _permit,
+            body_digest: _body_digest,
+            as_profile: _as_profile,
         } = req;
         let mut builder = self.client.request(http_method(method), &url);
         for (name, value) in &headers {

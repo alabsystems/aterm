@@ -130,13 +130,41 @@ fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
         Ok(argv(&["--add-dir", "/a", "/b c", "--resume", ID])),
         "a launch --effort is dropped: the resumed session takes the user's default effort"
     );
+    for attached in ["-nMySession", "-n=MySession", "-dapi", "-d=api"] {
+        assert_eq!(
+            rewrite_argv(&argv(&["claude", attached]), ID),
+            Ok(argv(&[attached, "--resume", ID])),
+            "{attached}"
+        );
+    }
+    assert_eq!(
+        rewrite_argv(&argv(&["claude", "-cnMySession"]), ID),
+        Ok(argv(&["-nMySession", "--resume", ID])),
+        "a bundled continue drops out of the carried name"
+    );
+    assert_eq!(
+        rewrite_argv(&argv(&["claude", "-cr", "abc"]), ID),
+        Ok(argv(&["--resume", ID]))
+    );
+    assert!(one_shot(&argv(&["claude", "-cp"])));
     assert_eq!(
         rewrite_argv(&argv(&["claude", "--brand-new-flag", "x"]), ID),
         Err(ArgvRefusal::UnknownFlag("--brand-new-flag".to_string()))
     );
+    assert_eq!(
+        rewrite_argv(&argv(&["claude", "-pfoo"]), ID),
+        Err(ArgvRefusal::NotResumable("-p".to_string())),
+        "a bundle reads its switches in order: print refuses before its unknown tail"
+    );
+    assert_eq!(
+        rewrite_argv(&argv(&["claude", "-cz"]), ID),
+        Err(ArgvRefusal::UnknownFlag("-cz".to_string())),
+        "an unknown short in a bundle"
+    );
     for not in [
         "-p",
         "--print",
+        "--desktop",
         "--bg",
         "--tmux",
         "-w",
@@ -146,6 +174,20 @@ fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
             rewrite_argv(&argv(&["claude", not]), ID),
             Err(ArgvRefusal::NotResumable(not.to_string())),
             "{not}"
+        );
+    }
+    for attached in ["-wMyTree", "-w=MyTree"] {
+        assert_eq!(
+            rewrite_argv(&argv(&["claude", attached]), ID),
+            Err(ArgvRefusal::NotResumable("-w".to_string())),
+            "{attached}"
+        );
+    }
+    for bundled in ["-cp", "-pc"] {
+        assert_eq!(
+            rewrite_argv(&argv(&["claude", bundled]), ID),
+            Err(ArgvRefusal::NotResumable("-p".to_string())),
+            "{bundled}"
         );
     }
 }
@@ -249,6 +291,9 @@ fn every_short_argv_resumes_with_exactly_the_values_claude_parsed() {
         "--verbose",
         "-c",
         "-r",
+        "-cp",
+        "-cnName",
+        "-crx",
         "--session-id",
         "--print",
         "--file",
@@ -360,6 +405,89 @@ fn the_relaunch_line_heals_a_frozen_shell_and_quotes_every_word() {
     assert_eq!(Dialect::from_exe_name("-zsh"), Some(Dialect::Zsh));
     assert_eq!(Dialect::from_exe_name("/bin/bash"), Some(Dialect::Bash));
     assert_eq!(Dialect::from_exe_name("tcsh"), None);
+}
+
+/// [`with_cd`] gives a line planned with no `cd` exactly the form its builder gives it with that
+/// `cd` (the subshell, `exec`, the directory's quoting, bash's opening command) for every shape the
+/// builders make: zsh and bash, healed or not, exports plain, quoted and empty or in the exact
+/// `/usr/bin/env` form, and a directory that needs quoting. The controls: a line that carries a
+/// `cd` of its own comes back as it is, and a fish line, a directory with a control character in
+/// it, a line no builder made and one the `cd` makes too long are refused.
+#[test]
+fn a_line_planned_with_no_cd_takes_the_one_its_builder_gives_it() {
+    let exe = Path::new("/Users/_me/Library/Application Support/aterm/pkg/agents/claude");
+    let args = argv(&[
+        "--dangerously-skip-permissions",
+        "--resume",
+        ID,
+        "--append-system-prompt",
+        "it's",
+    ]);
+    let dir = "/w/it's here";
+    let exports: [&[(&str, &str)]; 3] = [
+        &[],
+        &[
+            ("CLAUDE_CONFIG_DIR", "/h/.claude-b"),
+            ("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY", "1"),
+        ],
+        &[("ATERM_LOGIN", "it's me"), ("EMPTY", "")],
+    ];
+    let mut shapes = 0;
+    for dialect in [Dialect::Zsh, Dialect::Bash] {
+        let hook = Path::new(match dialect {
+            Dialect::Bash => "/h/00-atpkg.bash",
+            Dialect::Zsh | Dialect::Fish => "/h/it's/00-atpkg.zsh",
+        });
+        for heal in [None, Some(hook)] {
+            for env in exports {
+                for unset in [None, Some(&["CLAUDE_CODE_OAUTH_TOKEN"][..])] {
+                    let line = |cd: Option<&str>| {
+                        match unset {
+                            Some(unset) => {
+                                relaunch_line_env_clear(dialect, heal, cd, env, unset, exe, &args)
+                            }
+                            None => relaunch_line_env(dialect, heal, cd, env, exe, &args),
+                        }
+                        .expect("a line")
+                    };
+                    let (planned, its_cd) = (line(None), line(Some(dir)));
+                    assert_eq!(
+                        with_cd(dialect, &planned, dir).as_deref(),
+                        Ok(its_cd.as_str()),
+                        "{planned}"
+                    );
+                    assert_eq!(
+                        with_cd(dialect, &its_cd, "/elsewhere").as_deref(),
+                        Ok(its_cd.as_str()),
+                        "control: its own cd stands"
+                    );
+                    shapes += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(shapes, 24);
+    let zsh = relaunch_line(Dialect::Zsh, None, None, exe, &args).expect("zsh");
+    let fish = relaunch_line(Dialect::Fish, None, None, exe, &args).expect("fish");
+    assert!(with_cd(Dialect::Fish, &fish, dir).is_err(), "control: fish");
+    assert!(
+        with_cd(Dialect::Zsh, &zsh, "/w/a\nb").is_err(),
+        "control: a control character"
+    );
+    assert!(
+        with_cd(Dialect::Zsh, " claude --resume x", dir).is_err(),
+        "control: no builder's line"
+    );
+    let pad = |len: usize| argv(&["--x", &"p".repeat(len)]);
+    let base = relaunch_line(Dialect::Zsh, None, None, exe, &pad(0))
+        .expect("base")
+        .len();
+    let full = relaunch_line(Dialect::Zsh, None, None, exe, &pad(MAX_LINE - base)).expect("full");
+    assert_eq!(full.len(), MAX_LINE, "PRECONDITION");
+    assert!(
+        with_cd(Dialect::Zsh, &full, "/w").is_err(),
+        "control: too long with the cd"
+    );
 }
 
 #[test]
@@ -1466,6 +1594,11 @@ fn the_launch_resume_names_the_conversation_the_process_kept() {
     let named = |id: &str| Some(Some(id.to_owned()));
     assert_eq!(got(&["claude", "--resume", "abc"]), named("abc"));
     assert_eq!(got(&["claude", "-r", "abc"]), named("abc"));
+    assert_eq!(got(&["claude", "-rabc"]), named("abc"));
+    assert_eq!(got(&["claude", "-r=abc"]), named("abc"));
+    assert_eq!(got(&["claude", "-crabc"]), named("abc"));
+    assert_eq!(got(&["claude", "-cr=abc"]), named("abc"));
+    assert_eq!(got(&["claude", "-cr", "abc"]), named("abc"));
     assert_eq!(got(&["claude", "--resume=abc"]), named("abc"));
     assert_eq!(
         got(&["claude", "--model", "opus", "--resume", "abc", "--verbose"]),

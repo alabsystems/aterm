@@ -4,8 +4,8 @@
 //! The shipped Windows build's window presents on real windows
 //! (`d3d11_window.rs`, docs/AUDIT-third-party-2026-10-15.md GW.5's flip). A
 //! window's present composes into its swap chain's buffer what the arm's
-//! headless present composes into the virtual target, which the WARP record
-//! (`warp_record_tests`) holds to wgpu-dx12's frames; so each window present,
+//! headless present composes into the virtual target, which
+//! `frame_record_tests` holds to its CPU twin; so each window present,
 //! read back by the presented-snapshot tap before the chain shows it, must
 //! equal the headless present of the same input byte for byte.
 //!

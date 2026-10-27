@@ -27,6 +27,8 @@ pub mod cli;
 #[cfg(unix)]
 pub mod client;
 #[cfg(unix)]
+pub mod converge;
+#[cfg(unix)]
 pub mod fsx;
 #[cfg(unix)]
 pub mod heard;
@@ -45,11 +47,22 @@ pub use secret::SecretBytes;
 /// The ALab vault: what `aterm init` joins when it answers on this network.
 pub const ALAB_DEFAULT_URL: &str = aterm_types::macos_setup::DEFAULT_VAULT_URL;
 
+/// The ALab vault's name in a store ([`ALAB_DEFAULT_URL`]'s last segment).
+#[cfg(any(unix, test))]
+pub(crate) const ALAB_VAULT: &str = "alab";
+
 /// The ALab vault's signing key ([`ALAB_DEFAULT_URL`], [`ALAB_RETIRED`]).
 pub const ALAB_SIGNER: &str = "gnUs9ywlj9oLJNA7jDsP6xGO34YTr7xR8ra22GXUoQ4=";
 
 /// The keys the ALab vault rotated away from ([`ALAB_SIGNER`]).
 pub const ALAB_RETIRED: &[&str] = &[];
+
+/// Whether an entry is consumed in place and must never become a secret file.
+pub fn reserved_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("aterm-fleet-code")
+        || name.eq_ignore_ascii_case("~/.secrets/aterm-fleet-code")
+        || commons::reserved_name(name)
+}
 
 /// The port `aterm secrets serve` listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 7484;
@@ -76,7 +89,8 @@ pub enum ErrorKind {
     /// what macOS answers while aterm may not yet reach the local network (its Local Network
     /// question is open, or was answered Don't Allow), and also what a LAN host that is down
     /// gives, which nothing here tells apart. Asked again shortly, it may answer; it is no
-    /// evidence that no vault is there.
+    /// evidence that no vault is there. Only on macOS: elsewhere nothing gates the local
+    /// network, and the same failure is [`ErrorKind::Other`].
     LocalNetworkPending,
     /// A request that ran past its deadline: a long-poll the server still held, a lookup with
     /// no answer, a slow network or a host that sleeps, which nothing here tells apart.
@@ -85,6 +99,13 @@ pub enum ErrorKind {
     /// (another admin's publish came first), or another publish holding its store or path (a
     /// server's 409). It cannot have landed.
     NotStored,
+    /// A publish the vault would not take at all, decided before it stored anything: a server
+    /// that refused what it carries or the Mac that sent it (its 403) or holds its limit of
+    /// vaults (507), or a first write to a path that does not hold the bytes afterwards (a
+    /// missing or unwritable folder, another publisher's lock or file). It cannot have landed,
+    /// and it is not a race with a publish of the same bytes: asked again, it gets the same
+    /// answer until someone changes the server or the path.
+    Refused,
 }
 
 impl Error {

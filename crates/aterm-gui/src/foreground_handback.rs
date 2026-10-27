@@ -304,10 +304,37 @@ impl FgOwners {
         self.suspects(to).find(|&owner| gone(owner))
     }
 
-    /// Probe, before the term lock is taken, every group the handback at the edge `from → to` can ask about.
+    /// The death edge the gather never sampled: the session's shell (`shell`) holds this batch,
+    /// and a group that armed an input-hijacking bit still in force has no member left, though no
+    /// edge from it was cut. A job `fg` resumed that writes nothing has its hold read only if a
+    /// sample lands between the shell's `tcsetpgrp` and the job's death; a reader slower than
+    /// that sees the shell before and after. The edge from that group into the shell, at the
+    /// batch's first byte. `gone` is the bystander rule (no member of the group survives), so a
+    /// stopped or `bg`'d group, even one whose leader exited, keeps its modes; the handback at
+    /// this edge judges `from` by that rule too ([`Self::probe_edge`]'s `from_role`), or a leader
+    /// pid the system gave to a process outside the dead group would keep its modes armed and
+    /// cut this edge again on every batch the shell writes.
+    pub(crate) fn missed_reclaim(
+        &self,
+        holder: i32,
+        shell: i32,
+        gone: impl FnMut(i32) -> bool,
+    ) -> Option<FgEdge> {
+        if shell <= 0 || holder != shell {
+            return None;
+        }
+        self.orphaned_by(holder, gone)
+            .map(|owner| FgEdge::group(0, owner, holder))
+    }
+
+    /// Probe, before the term lock is taken, every group the handback at the edge `from → to` can
+    /// ask about: `from` by `from_role` (the [`FgRole::Holder`] rule for a sampled edge, the
+    /// [`FgRole::Bystander`] rule [`Self::missed_reclaim`] found it gone by for a missed one), every
+    /// other suspect as a bystander.
     pub(crate) fn probe_edge(
         &self,
         from: i32,
+        from_role: FgRole,
         to: i32,
         mut gone: impl FnMut(i32, FgRole) -> bool,
     ) -> FgVerdicts {
@@ -317,7 +344,7 @@ impl FgOwners {
                 continue;
             }
             let role = if pgid == from {
-                FgRole::Holder
+                from_role
             } else {
                 FgRole::Bystander
             };
@@ -672,6 +699,127 @@ pub(crate) fn restored_payload(
 #[path = "foreground_handback_exec_conformance.rs"]
 mod exec_conformance;
 
+/// `foreground_handback_ownership` environment actions, each waived where its Tier-1
+/// (`foreground_handback_conformance`) binds it.
+#[cfg(all(any(test, debug_assertions), unix))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback_ownership",
+    action = "Launch",
+    reason = "The shell's `tcsetpgrp` giving a job the terminal: an environment step. The \
+              Tier-1 rows move the scripted foreground probe exactly there."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback_ownership",
+    action = "Die",
+    reason = "A process's death: an environment step. The Tier-1 rows add the job to the \
+              scripted liveness probe's dead set exactly there."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn ownership_scope_waivers() {}
+
+/// `foreground_handback` actions no one function of the host performs, each
+/// waived where its Tier-1 binds it.
+#[cfg(all(any(test, debug_assertions), unix))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Launch",
+    reason = "zle's `2004l` and the shell's `tcsetpgrp` giving a job the terminal: an \
+              environment step. The PTY Tier-1 writes the bytes and moves the scripted \
+              foreground probe exactly there; the exec rig moves its scripted `tcgetpgrp`."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "OneShot",
+    reason = "A display-only one-shot (`tput smcup`) given the terminal: an environment step, \
+              scripted by the PTY Tier-1's one-shot schedule."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Adopt",
+    reason = "A reader attached while a job holds the terminal: the PTY Tier-1's adopted \
+              schedule feeds the job's screen first and seeds the probe with the job."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "JobWrite",
+    reason = "The job's write to the slave: an environment step the Tier-1 rigs perform."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Die",
+    reason = "The job's death: the PTY Tier-1 adds it to the scripted liveness probe's dead set."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Stop",
+    reason = "Ctrl-Z stopping the job: an environment step of the STOP_FG schedule."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Reclaim",
+    reason = "The shell's `tcsetpgrp` taking the terminal back: the Tier-1 rigs move the \
+              scripted foreground exactly there."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "ShellWrite",
+    reason = "The shell's post-reclaim output: an environment step the PTY Tier-1 writes."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Resume",
+    reason = "`fg` giving the stopped job the terminal back: an environment step of the \
+              STOP_FG schedule."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Exec",
+    reason = "The holder's `execve` and its `NOTE_EXEC`: an environment step. The exec rig \
+              marks the job's later bytes the new image's and the watch pending there; \
+              `ProcWatch`'s own tests drive a real `exec` through the kernel."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "ReadJob",
+    reason = "The gather's `read(2)` of the master inside `aterm_pty::drain_more_nonblocking`, \
+              whose polls name the process watch before the master \
+              (`the_process_watch_is_heard_before_the_master_in_every_poll`)."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "ReadShell",
+    reason = "The same `read(2)` as `ReadJob`, of the shell's bytes behind the job's."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Parse",
+    reason = "The parse stage's slice and handback at the cut (`spawn::ingest` over \
+              `Terminal::foreground_handback`): the PTY Tier-1 projects its effect (`leak`, \
+              `paste`, `prompt`) after every schedule step."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Sweep",
+    reason = "The UI thread's status sweep, which touches no mode: no schedule needs it to run."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Restart",
+    reason = "`park_reader` then `attach_reader_inner` seeding a new cutter with the carried \
+              holder and a new process watch: the PTY Tier-1's PARKED schedule, and the exec \
+              rig's new cutter with a quiet watch."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn handback_scope_waivers() {}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -986,6 +1134,60 @@ mod tests {
         assert_eq!(asked, vec![JOB]);
     }
 
+    /// A death no edge was cut for (a resumed job that wrote nothing, its hold never sampled)
+    /// is the edge from the gone owner into the shell at the batch's first byte, only while the
+    /// shell holds, only for an owner of an input bit still in force, and only once it is gone.
+    #[test]
+    fn foreground_handback_owners_cut_the_death_edge_the_gather_missed() {
+        let mut o = FgOwners::default();
+        o.observe(SHELL, 0, 0);
+        o.observe(JOB, ALT_SCREEN | MOUSE, ALT_SCREEN | MOUSE);
+        let mut asked = Vec::new();
+        assert_eq!(
+            o.missed_reclaim(SHELL, SHELL, |p| {
+                asked.push(p);
+                false
+            }),
+            None,
+            "a stopped or bg'd job keeps its modes"
+        );
+        assert_eq!(asked, vec![JOB], "only the owner is asked");
+        assert_eq!(
+            o.missed_reclaim(SHELL, SHELL, |p| p == JOB),
+            Some(FgEdge::group(0, JOB, SHELL))
+        );
+        assert_eq!(
+            o.missed_reclaim(JOB, SHELL, |_| panic!("not asked")),
+            None,
+            "a batch the job holds is its own"
+        );
+        assert_eq!(
+            o.missed_reclaim(SHELL, 0, |_| panic!("not asked")),
+            None,
+            "no shell known"
+        );
+        o.observe(SHELL, 0, 0);
+        assert_eq!(
+            o.missed_reclaim(SHELL, SHELL, |_| panic!("not asked")),
+            None,
+            "handed back already"
+        );
+
+        let mut o = FgOwners::default();
+        o.observe(JOB, ALT_SCREEN | CURSOR_HIDDEN, ALT_SCREEN | CURSOR_HIDDEN);
+        assert_eq!(
+            o.missed_reclaim(SHELL, SHELL, |_| panic!("not asked")),
+            None,
+            "display bits alone orphan nothing"
+        );
+        o.observe(SHELL, ALT_SCREEN | CURSOR_HIDDEN | MOUSE, MOUSE);
+        assert_eq!(
+            o.missed_reclaim(SHELL, SHELL, |_| panic!("not asked")),
+            None,
+            "the shell's own mouse"
+        );
+    }
+
     /// The pre-lock probe asks each group the locked handback can ask about once (`from`
     /// included even when it also owns bits), never the new holder or a display-only owner;
     /// a group not probed reads as alive.
@@ -996,7 +1198,7 @@ mod tests {
         o.observe(TPUT, ALT_SCREEN, 0);
         o.observe(JOB, ALT_SCREEN | MOUSE | KITTY, 0);
         let mut asked = Vec::new();
-        let v = o.probe_edge(JOB, SHELL, |p, role| {
+        let v = o.probe_edge(JOB, FgRole::Holder, SHELL, |p, role| {
             asked.push((p, role));
             true
         });
@@ -1009,19 +1211,32 @@ mod tests {
         assert!(v.gone(JOB));
         assert!(!v.gone(TPUT) && !v.gone(SHELL), "not probed: alive");
         assert_eq!(o.orphaned_by(SHELL, |p| v.gone(p)), Some(JOB));
+        // A missed edge's group is judged by the bystander rule it was found gone by: a leader
+        // pid that answers (reused outside the group) does not keep its modes.
+        let mut asked = Vec::new();
+        let v = o.probe_edge(JOB, FgRole::Bystander, SHELL, |p, role| {
+            asked.push((p, role));
+            role == FgRole::Bystander
+        });
+        assert_eq!(
+            asked,
+            vec![(JOB, FgRole::Bystander)],
+            "from by its edge's rule"
+        );
+        assert_eq!(o.orphaned_by(SHELL, |p| v.gone(p)), Some(JOB));
 
         let mut o = FgOwners::default();
         o.observe(JOB, MOUSE, 0);
         o.observe(TPUT, MOUSE | FOCUS, 0);
         let mut asked = Vec::new();
-        let v = o.probe_edge(SHELL, TPUT, |p, _| {
+        let v = o.probe_edge(SHELL, FgRole::Holder, TPUT, |p, _| {
             asked.push(p);
             p == JOB
         });
         assert_eq!(asked, vec![SHELL, JOB], "`to` (TPUT) is never probed");
         assert!(!v.gone(SHELL) && v.gone(JOB));
         assert_eq!(o.orphaned_by(TPUT, |p| v.gone(p)), Some(JOB));
-        let v = FgOwners::default().probe_edge(0, SHELL, |_, _| panic!("no group"));
+        let v = FgOwners::default().probe_edge(0, FgRole::Holder, SHELL, |_, _| panic!("no group"));
         assert!(v.probed().is_empty());
     }
 
@@ -1253,124 +1468,3 @@ mod tests {
         );
     }
 }
-
-/// `foreground_handback_ownership` environment actions, each waived where its Tier-1
-/// (`foreground_handback_conformance`) binds it.
-#[cfg(all(any(test, debug_assertions), unix))]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback_ownership",
-    action = "Launch",
-    reason = "The shell's `tcsetpgrp` giving a job the terminal: an environment step. The \
-              Tier-1 rows move the scripted foreground probe exactly there."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback_ownership",
-    action = "Die",
-    reason = "A process's death: an environment step. The Tier-1 rows add the job to the \
-              scripted liveness probe's dead set exactly there."
-)]
-#[allow(
-    dead_code,
-    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
-              not an expect: rustc does not lint a fn the declarative anchors rebuild"
-)]
-fn ownership_scope_waivers() {}
-
-/// `foreground_handback` actions no one function of the host performs, each
-/// waived where its Tier-1 binds it.
-#[cfg(all(any(test, debug_assertions), unix))]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "Launch",
-    reason = "zle's `2004l` and the shell's `tcsetpgrp` giving a job the terminal: an \
-              environment step. The PTY Tier-1 writes the bytes and moves the scripted \
-              foreground probe exactly there; the exec rig moves its scripted `tcgetpgrp`."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "OneShot",
-    reason = "A display-only one-shot (`tput smcup`) given the terminal: an environment step, \
-              scripted by the PTY Tier-1's one-shot schedule."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "Adopt",
-    reason = "A reader attached while a job holds the terminal: the PTY Tier-1's adopted \
-              schedule feeds the job's screen first and seeds the probe with the job."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "JobWrite",
-    reason = "The job's write to the slave: an environment step the Tier-1 rigs perform."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "Die",
-    reason = "The job's death: the PTY Tier-1 adds it to the scripted liveness probe's dead set."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "Stop",
-    reason = "Ctrl-Z stopping the job: an environment step of the STOP_FG schedule."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "Reclaim",
-    reason = "The shell's `tcsetpgrp` taking the terminal back: the Tier-1 rigs move the \
-              scripted foreground exactly there."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "ShellWrite",
-    reason = "The shell's post-reclaim output: an environment step the PTY Tier-1 writes."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "Resume",
-    reason = "`fg` giving the stopped job the terminal back: an environment step of the \
-              STOP_FG schedule."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "Exec",
-    reason = "The holder's `execve` and its `NOTE_EXEC`: an environment step. The exec rig \
-              marks the job's later bytes the new image's and the watch pending there; \
-              `ProcWatch`'s own tests drive a real `exec` through the kernel."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "ReadJob",
-    reason = "The gather's `read(2)` of the master inside `aterm_pty::drain_more_nonblocking`, \
-              whose polls name the process watch before the master \
-              (`the_process_watch_is_heard_before_the_master_in_every_poll`)."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "ReadShell",
-    reason = "The same `read(2)` as `ReadJob`, of the shell's bytes behind the job's."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "Parse",
-    reason = "The parse stage's slice and handback at the cut (`spawn::ingest` over \
-              `Terminal::foreground_handback`): the PTY Tier-1 projects its effect (`leak`, \
-              `paste`, `prompt`) after every schedule step."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "Sweep",
-    reason = "The UI thread's status sweep, which touches no mode: no schedule needs it to run."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "foreground_handback",
-    action = "Restart",
-    reason = "`park_reader` then `attach_reader_inner` seeding a new cutter with the carried \
-              holder and a new process watch: the PTY Tier-1's PARKED schedule, and the exec \
-              rig's new cutter with a quiet watch."
-)]
-#[allow(
-    dead_code,
-    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
-              not an expect: rustc does not lint a fn the declarative anchors rebuild"
-)]
-fn handback_scope_waivers() {}

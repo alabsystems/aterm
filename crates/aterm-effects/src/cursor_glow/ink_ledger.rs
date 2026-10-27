@@ -7,7 +7,11 @@ use super::*;
 use aterm_render::GlowEnd;
 
 mod letter_guard;
-pub(crate) use letter_guard::{LetterGuard, RING as LETTER_GUARD_RING};
+#[cfg(any(test, debug_assertions))]
+mod state_words;
+pub(crate) use letter_guard::{
+    LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, RING as LETTER_GUARD_RING,
+};
 
 /// Per-band RGB lift per unit coverage for a streak sample ([`InkLedger::admit_axis`]).
 pub(super) type BandLifts = [[f32; 3]; InkLedger::BANDS];
@@ -50,9 +54,30 @@ pub(crate) struct InkLedger {
     /// The masked light's pieces, spliced back over the light they cut.
     pieces: Vec<GlowQuad>,
     halo_pieces: Vec<RainHalo>,
-    /// One piece's slice knots, px.
+    /// One piece's slice knots, px, and the dims within the feather's reach
+    /// of the box [`Self::knots`] last sliced: the only dims whose cut
+    /// reaches a point in it ([`Self::mask_at_with`]). Every dim lies on
+    /// whole pixels (the grid's origin and cell size are whole), so the
+    /// whole-pixel reach `knots` tests, rounded up, keeps every dim the
+    /// mask's own reach would read there.
     knots_x: Vec<i32>,
     knots_y: Vec<i32>,
+    near: Vec<Dim>,
+    /// What [`Self::knots_x`] was sliced from: the box's x range and the
+    /// feather's reach, and each near dim's x edges.
+    knot_span: (i32, i32, i32),
+    knot_key: Vec<(i32, i32)>,
+    /// While a pass cuts row after row of fixed dims (`row_near_on`, the
+    /// guard's ramps): the x range [`Self::near`] was gathered over and the
+    /// rows `[from, to)` whose one-row box gathers the very same dims, and
+    /// a count of every fresh gathering, so a cut can tell its knots and
+    /// near dims are the ones it last read.
+    row_near: Option<(i32, i32, i32, i32)>,
+    row_near_on: bool,
+    near_gen: u64,
+    /// A cut ramp row's mask per knot, kept for the next row that reads
+    /// them alike (`guard_mask_ramps`).
+    row_masks: Vec<f32>,
     /// The letter guard's cut ramps, and a run of cut ramp rows' slice knots
     /// and ends (`guard_mask_ramps`).
     ramp_pieces: GlowRamps,
@@ -71,15 +96,21 @@ pub(crate) struct InkLedger {
     /// differently ([`CursorGlow::over_ink_print`]).
     print: u64,
     /// The frame's rails laid clear of their row's ring, as `[from, to)`
-    /// spans of the under stream's quads, ascending ([`Self::note_rail`]).
-    rails: Vec<(u32, u32)>,
+    /// spans of the under stream's quads, ascending ([`Self::note_rail`]),
+    /// each marked whether it lies in its own row's foot band
+    /// ([`Self::note_foot_rail`]).
+    rails: Vec<(u32, u32, bool)>,
     /// The same rails' ramps, as `[from, to)` spans of the under stream's
-    /// ramps ([`Self::note_rail_laid`]).
-    rail_ramps: Vec<(u32, u32)>,
+    /// ramps ([`Self::note_rail_laid`]), each marked as its quads are.
+    rail_ramps: Vec<(u32, u32, bool)>,
     /// A test's negative control: the letter guard feathers its cuts into a
     /// rail laid clear of the ring as into any light (looks7 round 3).
     #[cfg(any(test, debug_assertions))]
     pub(crate) rails_feathered: bool,
+    /// A test's negative control: the letter guard weighs and cuts a rail
+    /// in its row's foot band as any light at a letter (looks8 K9).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) foot_rails_weighed: bool,
 }
 
 impl Default for InkLedger {
@@ -119,6 +150,13 @@ impl InkLedger {
         halo_pieces: Vec::new(),
         knots_x: Vec::new(),
         knots_y: Vec::new(),
+        near: Vec::new(),
+        knot_span: (i32::MIN, i32::MIN, 0),
+        knot_key: Vec::new(),
+        row_near: None,
+        row_near_on: false,
+        near_gen: 0,
+        row_masks: Vec::new(),
         ramp_pieces: GlowRamps::EMPTY,
         run_knots: Vec::new(),
         run_ends: Vec::new(),
@@ -131,6 +169,8 @@ impl InkLedger {
         rail_ramps: Vec::new(),
         #[cfg(any(test, debug_assertions))]
         rails_feathered: false,
+        #[cfg(any(test, debug_assertions))]
+        foot_rails_weighed: false,
     };
     /// Minimum contrast floor for the reference stroke ([`CursorGlow::STREAK_INK_FLOOR`]).
     pub(super) const FLOOR: f32 = CursorGlow::STREAK_INK_FLOOR;
@@ -150,6 +190,9 @@ impl InkLedger {
     pub(super) const MOMENTUM_FLOOR: f32 = 3.1;
     /// Minimum contrast floor on neighbouring text lines above and below the caret row.
     pub(super) const NEIGHBOUR_FLOOR: f32 = 4.6;
+    /// The bar every letter a light lies on keeps ([`letter_guard::LETTER_FLOOR`]),
+    /// for a light that may cross a letter it was not laid for.
+    pub(crate) const LETTER_FLOOR: f32 = letter_guard::LETTER_FLOOR;
     /// Horizontal feather width for masked lights as a fraction of cell width.
     pub(super) const FEATHER_X: f32 = 0.45;
     /// Vertical feather height for masked lights as a fraction of cell height.
@@ -227,10 +270,77 @@ impl InkLedger {
     /// foot (looks7 round 3).
     #[inline]
     pub(crate) fn note_rail(&mut self, from: usize, to: usize) {
-        if to > from
-            && let (Ok(from), Ok(to)) = (u32::try_from(from), u32::try_from(to))
-        {
-            self.rails.push((from, to));
+        self.push_rail(from, to, false);
+    }
+
+    /// Note the under stream's quads `[from, to)` as a rail in its own row's
+    /// foot band: the row's last pixel rows, under its letters' baseline and
+    /// the judge's ring round it, parted round every cell of the row whose
+    /// ink may reach under the baseline (`rainbow_kitty::ribbon::ROW_RAIL_CH`),
+    /// on a row whose glyphs the host named. It meets no letter's ring, of
+    /// its row or the row below (whose tallest letters stand a few pixels
+    /// under its top), so the letter guard neither weighs nor cuts it: the
+    /// guard reads a lettered cell's whole box as ink, and weighed there the
+    /// rail's vivid ink was the brightest ground of every cell of its row,
+    /// and on Solarized Dark the row's cuts took the ribbon's bed with it
+    /// (looks8 K9).
+    #[inline]
+    pub(crate) fn note_foot_rail(&mut self, from: usize, to: usize) {
+        self.push_rail(from, to, true);
+    }
+
+    #[inline]
+    fn push_rail(&mut self, from: usize, to: usize, foot: bool) {
+        if to > from && from <= u32::MAX as usize && to <= u32::MAX as usize {
+            self.rails.push((from as u32, to as u32, foot));
+        }
+    }
+
+    /// Whether under-stream quad `k` lies in a foot rail
+    /// ([`Self::note_foot_rail`]), walking the ascending spans from `*at`
+    /// for ascending `k`.
+    #[inline]
+    const fn in_foot_rail(&self, k: usize, at: &mut usize) -> bool {
+        Self::in_foot_span(self.rails.as_slice(), self.foot_rails_whole(), k, at)
+    }
+
+    /// Whether under-stream ramp `k` lies in a foot rail
+    /// ([`Self::note_foot_rail_laid`]), walking the ascending spans from
+    /// `*at` for ascending `k`.
+    #[inline]
+    const fn in_foot_ramp(&self, k: usize, at: &mut usize) -> bool {
+        Self::in_foot_span(self.rail_ramps.as_slice(), self.foot_rails_whole(), k, at)
+    }
+
+    /// Whether a foot rail is kept whole, neither weighed nor cut (unset by
+    /// the test seam [`Self::foot_rails_weighed`]).
+    #[inline]
+    const fn foot_rails_whole(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        let whole = !self.foot_rails_weighed;
+        #[cfg(not(any(test, debug_assertions)))]
+        let whole = true;
+        whole
+    }
+
+    #[inline]
+    const fn in_foot_span(
+        spans: &[(u32, u32, bool)],
+        whole: bool,
+        k: usize,
+        at: &mut usize,
+    ) -> bool {
+        if !whole {
+            return false;
+        }
+        while *at < spans.len() && spans[*at].1 as usize <= k {
+            *at += 1;
+        }
+        if *at < spans.len() {
+            let (from, _, foot) = spans[*at];
+            foot && from as usize <= k
+        } else {
+            false
         }
     }
 
@@ -244,13 +354,97 @@ impl InkLedger {
         from: (usize, aterm_render::RampMark),
         to: (usize, aterm_render::RampMark),
     ) {
-        self.note_rail(from.0, to.0);
-        let (from, to) = (from.1.items(), to.1.items());
-        if to > from
-            && let (Ok(from), Ok(to)) = (u32::try_from(from), u32::try_from(to))
-        {
-            self.rail_ramps.push((from, to));
+        self.push_rail_laid(from, to, false);
+    }
+
+    /// [`Self::note_foot_rail`] for a rail laid through an
+    /// [`aterm_render::RampSink`] ([`Self::note_rail_laid`]): neither its
+    /// quads nor its ramps are weighed or cut.
+    #[inline]
+    pub(crate) fn note_foot_rail_laid(
+        &mut self,
+        from: (usize, aterm_render::RampMark),
+        to: (usize, aterm_render::RampMark),
+    ) {
+        self.push_rail_laid(from, to, true);
+    }
+
+    #[inline]
+    fn push_rail_laid(
+        &mut self,
+        from: (usize, aterm_render::RampMark),
+        to: (usize, aterm_render::RampMark),
+        foot: bool,
+    ) {
+        if foot {
+            self.note_foot_rail(from.0, to.0);
+        } else {
+            self.note_rail(from.0, to.0);
         }
+        let (from, to) = (from.1.items(), to.1.items());
+        if to > from && from <= u32::MAX as usize && to <= u32::MAX as usize {
+            self.rail_ramps.push((from as u32, to as u32, foot));
+        }
+    }
+
+    /// The frame's rails re-read as spans of the under stream's quads alone,
+    /// its `ramps` about to be folded into its `quads` quads
+    /// ([`aterm_render::GlowRamps::flatten_into`], a test's read of the
+    /// streams): each span of quads or of ramps becomes the span of the
+    /// quads they unfold to. Left as they were, the spans named the quads
+    /// laid before the fold, and every ramp row unfolded ahead of a rail
+    /// moved it past them, so the guard cut the rail and spared the light
+    /// after it.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn fold_rails(&mut self, ramps: &aterm_render::GlowRamps, quads: usize) {
+        if ramps.items.is_empty() || (self.rails.is_empty() && self.rail_ramps.is_empty()) {
+            return;
+        }
+        let mut quad_at = Vec::with_capacity(quads + 1);
+        let mut ramp_at = Vec::with_capacity(ramps.items.len());
+        let mut pos = 0usize;
+        ramps.in_order(quads, |laid| match laid {
+            aterm_render::Laid::Quads(r) => {
+                let mut idx = r.start;
+                while idx < r.end {
+                    quad_at.push(pos);
+                    pos += 1;
+                    idx += 1;
+                }
+            }
+            aterm_render::Laid::Ramp(k) => {
+                let n = ramps.items[k].quads(&ramps.ends).count();
+                ramp_at.push((pos, pos + n));
+                pos += n;
+            }
+        });
+        let mut folded = Vec::with_capacity(self.rails.len() + self.rail_ramps.len());
+        #[inline]
+        fn push_folded(folded: &mut Vec<(u32, u32, bool)>, from: usize, to: usize, foot: bool) {
+            if to > from && from <= u32::MAX as usize && to <= u32::MAX as usize {
+                folded.push((from as u32, to as u32, foot));
+            }
+        }
+        let mut ri = 0;
+        while ri < self.rails.len() {
+            let (from, to, foot) = self.rails[ri];
+            ri += 1;
+            let (from, to) = (from as usize, to as usize);
+            if to > from && to <= quad_at.len() {
+                push_folded(&mut folded, quad_at[from], quad_at[to - 1] + 1, foot);
+            }
+        }
+        let mut rri = 0;
+        while rri < self.rail_ramps.len() {
+            let (from, to, foot) = self.rail_ramps[rri];
+            rri += 1;
+            let (from, to) = (from as usize, to as usize);
+            if to > from && to <= ramp_at.len() {
+                push_folded(&mut folded, ramp_at[from].0, ramp_at[to - 1].1, foot);
+            }
+        }
+        self.rails = folded;
+        self.rail_ramps.clear();
     }
 
     /// Forget the frame's rails ([`Self::note_rail`], [`Self::note_rail_laid`]).
@@ -467,6 +661,75 @@ impl InkLedger {
         cov * share
     }
 
+    #[inline]
+    const fn halo_row_dy2(
+        row: i32,
+        (oy, ch, bh): (f32, f32, f32),
+        cy: f32,
+        inv_ry: f32,
+    ) -> [f32; Self::BANDS] {
+        let ry0 = oy + row as f32 * ch;
+        let mut out = [0.0f32; Self::BANDS];
+        let mut band = 0;
+        while band < Self::BANDS {
+            let y0 = ry0 + band as f32 * bh;
+            let dy = (cy.clamp(y0, y0 + bh) - cy) * inv_ry;
+            out[band] = dy * dy;
+            band += 1;
+        }
+        out
+    }
+
+    #[inline]
+    const fn halo_col_weights(
+        col: i32,
+        (ox, cw): (f32, f32),
+        cx: f32,
+        inv_rx: f32,
+        dy2: &[f32; Self::BANDS],
+    ) -> Option<[Option<f32>; Self::BANDS]> {
+        let x0 = ox + col as f32 * cw;
+        let dx = (cx.clamp(x0, x0 + cw) - cx) * inv_rx;
+        let dx2 = dx * dx;
+        if dx2 >= 1.0 {
+            return None;
+        }
+        let mut out = [None; Self::BANDS];
+        let mut any = false;
+        let mut band = 0;
+        while band < Self::BANDS {
+            let d2 = dx2 + dy2[band];
+            if d2 < 1.0 {
+                let u = 1.0 - d2;
+                out[band] = Some(u * u);
+                any = true;
+            }
+            band += 1;
+        }
+        if any { Some(out) } else { None }
+    }
+
+    #[inline]
+    const fn halo_reached(
+        (row, first, end): (i32, i32, i32),
+        (ox, oy, ch): (f32, f32, f32),
+        (cx, cy): (f32, f32),
+        (rx, ry): (f32, f32),
+        inv_cw: f32,
+    ) -> (i32, i32, i32) {
+        let (y0, y1) = (oy + row as f32 * ch, oy + (row + 1) as f32 * ch);
+        let lo_raw = ((cx - rx - ox) * inv_cw).floor() as i32;
+        let lo = if lo_raw > first { lo_raw } else { first };
+        let hi_raw = ((cx + rx - ox) * inv_cw).floor() as i32 + 1;
+        let hi = if hi_raw < end { hi_raw } else { end };
+        let (c0, c1) = if cy + ry > y0 && cy - ry < y1 && lo < hi {
+            (lo, hi)
+        } else {
+            (0, 0)
+        };
+        (row, c0, c1)
+    }
+
     /// Admit an additive radial halo at `(cx, cy)` with radii `(rx, ry)` down to `floor`.
     pub(super) fn admit_halo(
         &mut self,
@@ -486,48 +749,6 @@ impl InkLedger {
         let (ox, oy, cw, ch) = self.grid;
         let bh = ch * (1.0 / Self::BANDS as f32);
         let (inv_cw, inv_rx, inv_ry) = (1.0 / cw, 1.0 / rx, 1.0 / ry);
-        let row_dy2 = |row: i32| -> [f32; Self::BANDS] {
-            let ry0 = oy + row as f32 * ch;
-            let mut out = [0.0f32; Self::BANDS];
-            let mut band = 0;
-            while band < Self::BANDS {
-                let y0 = ry0 + band as f32 * bh;
-                let dy = (cy.clamp(y0, y0 + bh) - cy) * inv_ry;
-                out[band] = dy * dy;
-                band += 1;
-            }
-            out
-        };
-        let weights = |col: i32, dy2: &[f32; Self::BANDS]| -> [Option<f32>; Self::BANDS] {
-            let x0 = ox + col as f32 * cw;
-            let dx = (cx.clamp(x0, x0 + cw) - cx) * inv_rx;
-            let dx2 = dx * dx;
-            if dx2 >= 1.0 {
-                return [None; Self::BANDS];
-            }
-            let mut out = [None; Self::BANDS];
-            let mut band = 0;
-            while band < Self::BANDS {
-                let d2 = dx2 + dy2[band];
-                if d2 < 1.0 {
-                    let u = 1.0 - d2;
-                    out[band] = Some(u * u);
-                }
-                band += 1;
-            }
-            out
-        };
-        let reached = |(row, first, end): (i32, i32, i32)| {
-            let (y0, y1) = (oy + row as f32 * ch, oy + (row + 1) as f32 * ch);
-            let lo = (((cx - rx - ox) * inv_cw).floor() as i32).max(first);
-            let hi = (((cx + rx - ox) * inv_cw).floor() as i32 + 1).min(end);
-            let (c0, c1) = if cy + ry > y0 && cy - ry < y1 && lo < hi {
-                (lo, hi)
-            } else {
-                (0, 0)
-            };
-            (row, c0, c1)
-        };
         let mut row_spans: [(i32, i32, i32, [f32; Self::BANDS]); 3] = [
             (0, 0, 0, [0.0; Self::BANDS]),
             (0, 0, 0, [0.0; Self::BANDS]),
@@ -542,11 +763,11 @@ impl InkLedger {
                 continue;
             };
             li += 1;
-            let (row, c0, c1) = reached(line);
+            let (row, c0, c1) = Self::halo_reached(line, (ox, oy, ch), (cx, cy), (rx, ry), inv_cw);
             if c0 >= c1 {
                 continue;
             }
-            let dy2 = row_dy2(row);
+            let dy2 = Self::halo_row_dy2(row, (oy, ch, bh), cy, inv_ry);
             row_spans[n_spans] = (row, c0, c1, dy2);
             n_spans += 1;
             let mut col = c0;
@@ -555,11 +776,10 @@ impl InkLedger {
                     col += 1;
                     continue;
                 };
-                let w_bands = weights(col, &dy2);
-                if w_bands == [None; Self::BANDS] {
+                let Some(w_bands) = Self::halo_col_weights(col, (ox, cw), cx, inv_rx, &dy2) else {
                     col += 1;
                     continue;
-                }
+                };
                 let ctx = self.cell_room_ctx(base / Self::BANDS, floor);
                 let mut band = 0;
                 while band < Self::BANDS {
@@ -583,8 +803,9 @@ impl InkLedger {
             let (row, c0, c1, dy2) = &row_spans[si];
             let (row, mut col, c1) = (*row, *c0, *c1);
             while col < c1 {
-                if let Some(base) = self.slot(row, col) {
-                    let w_bands = weights(col, dy2);
+                if let Some(base) = self.slot(row, col)
+                    && let Some(w_bands) = Self::halo_col_weights(col, (ox, cw), cx, inv_rx, dy2)
+                {
                     let mut band = 0;
                     while band < Self::BANDS {
                         if let Some(w) = w_bands[band] {
@@ -616,9 +837,9 @@ impl InkLedger {
             q.alpha == 0 && (q.color | q.color2) & 0x00FF_FFFF != 0
         }
         #[inline]
-        fn span(lo: f32, len: u16, o: f32, inv_size: f32) -> (i32, i32) {
+        const fn span(lo: f32, len: u16, o: f32, inv_size: f32) -> (i32, i32) {
             let first = ((lo - o) * inv_size).floor() as i32;
-            let last = ((lo + f32::from(len) - 1.0 - o) * inv_size).floor() as i32;
+            let last = ((lo + len as f32 - 1.0 - o) * inv_size).floor() as i32;
             (first, last)
         }
         #[inline]
@@ -932,13 +1153,15 @@ impl InkLedger {
         )
     }
 
-    /// The share of a masked light kept at window px `(x, y)`: each dimmed
-    /// cell's share inside it, rising to the whole light over the feather's
-    /// reach off its box (a smoothstep of the normalised distance), the
-    /// least of every dimmed cell's.
+    /// The share of a masked light kept at window px `(x, y)`, a point of
+    /// the box [`Self::knots`] last sliced: each dimmed cell's share inside
+    /// it, rising to the whole light over the feather's reach off its box (a
+    /// smoothstep of the normalised distance), the least of every dimmed
+    /// cell's. Only the dims `knots` found within reach of the box are read:
+    /// no other reaches a point in it.
     #[inline]
     pub(super) const fn mask_at_with(&self, x: f32, y: f32, (fx, fy): (f32, f32)) -> f32 {
-        let dims = self.dims.as_slice();
+        let dims = self.near.as_slice();
         let mut m = 1.0f32;
         let mut i = 0;
         while i < dims.len() {
@@ -1028,34 +1251,94 @@ impl InkLedger {
             (cw * Self::FEATHER_X).ceil() as i32,
             (ch * Self::FEATHER_Y).ceil() as i32,
         );
-        let (kx, ky) = (&mut self.knots_x, &mut self.knots_y);
+        let one_row = self.row_near_on && y1 - y0 == 1;
+        if one_row
+            && let Some((nx0, nx1, from, to)) = self.row_near
+            && (nx0, nx1) == (x0, x1)
+            && y0 >= from
+            && y0 < to
+        {
+            // The rows the last gathering holds for: its dims, its x knots.
+            if self.near.is_empty() {
+                return false;
+            }
+            self.knots_y.clear();
+            self.knots_y.extend([y0, y1]);
+            return true;
+        }
+        self.near_gen += 1;
         let dims = self.dims.as_slice();
-        let mut meets = false;
+        self.near.clear();
+        // The rows about `y0` a one-row box gathers these same dims over.
+        let (mut from, mut to) = (i32::MIN, i32::MAX);
         let mut di = 0;
         while di < dims.len() {
             let d = &dims[di];
             di += 1;
             let (dx0, dy0, dx1, dy1) = (d.x0 as i32, d.y0 as i32, d.x1 as i32, d.y1 as i32);
-            if dx1 + fx <= x0 || dx0 - fx >= x1 || dy1 + fy <= y0 || dy0 - fy >= y1 {
+            if dx1 + fx <= x0 || dx0 - fx >= x1 {
                 continue;
             }
-            if !meets {
-                kx.clear();
-                ky.clear();
-                kx.extend([x0, x1]);
-                ky.extend([y0, y1]);
-                meets = true;
+            let (reach0, reach1) = (dy0 - fy, dy1 + fy);
+            if y0 < reach0 {
+                to = to.min(reach0);
+            } else if y0 >= reach1 {
+                from = from.max(reach1);
+            } else {
+                from = from.max(reach0);
+                to = to.min(reach1);
             }
-            push_edge(kx, (dx0, dx1), fx, (x0, x1));
-            push_edge(ky, (dy0, dy1), fy, (y0, y1));
+            if reach1 <= y0 || reach0 >= y1 {
+                continue;
+            }
+            self.near.push(*d);
         }
-        if !meets {
+        self.row_near = if one_row {
+            Some((x0, x1, from, to))
+        } else {
+            None
+        };
+        if self.near.is_empty() {
             return false;
         }
-        kx.sort_unstable();
-        kx.dedup();
-        ky.sort_unstable();
-        ky.dedup();
+        let near = self.near.as_slice();
+        // The x knots are the box's x range and the near dims' x edges
+        // alone: a ramp's rows, one box each, mostly share them.
+        let mut same_x = self.knot_span == (x0, x1, fx) && self.knot_key.len() == near.len();
+        let mut i = 0;
+        while same_x && i < near.len() {
+            same_x = self.knot_key[i] == (near[i].x0 as i32, near[i].x1 as i32);
+            i += 1;
+        }
+        if !same_x {
+            let kx = &mut self.knots_x;
+            kx.clear();
+            kx.extend([x0, x1]);
+            self.knot_key.clear();
+            let mut i = 0;
+            while i < near.len() {
+                let (dx0, dx1) = (near[i].x0 as i32, near[i].x1 as i32);
+                push_edge(kx, (dx0, dx1), fx, (x0, x1));
+                self.knot_key.push((dx0, dx1));
+                i += 1;
+            }
+            kx.sort_unstable();
+            kx.dedup();
+            self.knot_span = (x0, x1, fx);
+        }
+        let ky = &mut self.knots_y;
+        ky.clear();
+        ky.extend([y0, y1]);
+        // No whole px lies inside a one-row box.
+        if y1 - y0 != 1 {
+            let mut i = 0;
+            while i < near.len() {
+                push_edge(ky, (near[i].y0 as i32, near[i].y1 as i32), fy, (y0, y1));
+                i += 1;
+            }
+            ky.sort_unstable();
+            ky.dedup();
+        }
         true
     }
 
@@ -1066,21 +1349,35 @@ impl InkLedger {
             out.push(q);
             return;
         }
+        #[inline]
+        const fn mask_quad_colour(
+            x: i32,
+            x0: i32,
+            inv_w: f32,
+            c0: [f32; 3],
+            dc: [f32; 3],
+            m: f32,
+        ) -> u32 {
+            let t = (x - x0) as f32 * inv_w;
+            let r = ((c0[0] + dc[0] * t) * m).round() as u32;
+            let g = ((c0[1] + dc[1] * t) * m).round() as u32;
+            let b = ((c0[2] + dc[2] * t) * m).round() as u32;
+            let r = if r < 255 { r } else { 255 };
+            let g = if g < 255 { g } else { 255 };
+            let b = if b < 255 { b } else { 255 };
+            (r << 16) | (g << 8) | b
+        }
         let w = f32::from(q.w);
         let inv_w = 1.0 / w;
         let r1 = ((q.color >> 16) & 0xff) as f32;
         let g1 = ((q.color >> 8) & 0xff) as f32;
         let b1 = (q.color & 0xff) as f32;
-        let dr = ((q.color2 >> 16) & 0xff) as f32 - r1;
-        let dg = ((q.color2 >> 8) & 0xff) as f32 - g1;
-        let db = (q.color2 & 0xff) as f32 - b1;
-        let colour = |x: i32, m: f32| {
-            let t = (x - x0) as f32 * inv_w;
-            let r = (((r1 + dr * t) * m).round() as u32).min(255);
-            let g = (((g1 + dg * t) * m).round() as u32).min(255);
-            let b = (((b1 + db * t) * m).round() as u32).min(255);
-            (r << 16) | (g << 8) | b
-        };
+        let c0 = [r1, g1, b1];
+        let dc = [
+            ((q.color2 >> 16) & 0xff) as f32 - r1,
+            ((q.color2 >> 8) & 0xff) as f32 - g1,
+            (q.color2 & 0xff) as f32 - b1,
+        ];
         let feather = self.feather();
         let ny = self.knots_y.len() - 1;
         let nx = self.knots_x.len() - 1;
@@ -1093,12 +1390,26 @@ impl InkLedger {
             let ya_u = ya as u16;
             let h_u = (yb - ya) as u16;
             let mut xa = x0_knot;
-            let mut ca = colour(xa, self.mask_at_with(xa as f32, ym, feather));
+            let mut ca = mask_quad_colour(
+                xa,
+                x0,
+                inv_w,
+                c0,
+                dc,
+                self.mask_at_with(xa as f32, ym, feather),
+            );
             let mut xi = 0;
             while xi < nx {
                 let xb = self.knots_x[xi + 1];
                 xi += 1;
-                let cb = colour(xb, self.mask_at_with(xb as f32, ym, feather));
+                let cb = mask_quad_colour(
+                    xb,
+                    x0,
+                    inv_w,
+                    c0,
+                    dc,
+                    self.mask_at_with(xb as f32, ym, feather),
+                );
                 if ca | cb != 0 {
                     out.push(GlowQuad {
                         row: q.row,
@@ -1228,57 +1539,26 @@ impl InkLedger {
         let lines = self.lines;
         let mut li = 0;
         while li < lines.len() {
-            let Some((row, first, end)) = lines[li] else {
+            let Some(line) = lines[li] else {
                 li += 1;
                 continue;
             };
             li += 1;
-            let (y0, y1) = (oy + row as f32 * ch, oy + (row + 1) as f32 * ch);
-            if !(cy + ry > y0 && cy - ry < y1) {
-                continue;
-            }
-            let lo = (((cx - rx - ox) * inv_cw).floor() as i32).max(first);
-            let hi = (((cx + rx - ox) * inv_cw).floor() as i32 + 1).min(end);
+            let (row, lo, hi) = Self::halo_reached(line, (ox, oy, ch), (cx, cy), (rx, ry), inv_cw);
             if lo >= hi {
                 continue;
             }
-            let mut dy2 = [0.0f32; Self::BANDS];
-            let mut band = 0;
-            while band < Self::BANDS {
-                let by0 = y0 + band as f32 * bh;
-                let dy = (cy.clamp(by0, by0 + bh) - cy) * inv_ry;
-                dy2[band] = dy * dy;
-                band += 1;
-            }
+            let dy2 = Self::halo_row_dy2(row, (oy, ch, bh), cy, inv_ry);
             let mut col = lo;
             while col < hi {
                 let Some(base) = self.slot(row, col) else {
                     col += 1;
                     continue;
                 };
-                let x0 = ox + col as f32 * cw;
-                let dx = (cx.clamp(x0, x0 + cw) - cx) * inv_rx;
-                let dx2 = dx * dx;
-                if dx2 >= 1.0 {
+                let Some(weights) = Self::halo_col_weights(col, (ox, cw), cx, inv_rx, &dy2) else {
                     col += 1;
                     continue;
-                }
-                let mut weights = [None; Self::BANDS];
-                let mut any_weight = false;
-                let mut band = 0;
-                while band < Self::BANDS {
-                    let d2 = dx2 + dy2[band];
-                    if d2 < 1.0 {
-                        let u = 1.0 - d2;
-                        weights[band] = Some(u * u);
-                        any_weight = true;
-                    }
-                    band += 1;
-                }
-                if !any_weight {
-                    col += 1;
-                    continue;
-                }
+                };
                 let cell = base / Self::BANDS;
                 let ctx = self.cell_room_ctx(cell, floor);
                 let mut share = 1.0f32;
@@ -1390,11 +1670,7 @@ impl CursorGlow {
                 None => None,
             }
         }
-        let spans = self.probed_text_spans();
-        let mut lines = [None; 3];
-        for (slot, line) in lines.iter_mut().zip(spans.lines()) {
-            *slot = Some(line);
-        }
+        let mut lines = self.probed_text_spans().packed_rows();
         let caret_i32 = caret_i32(cur);
         if let Some((row, col)) = caret_i32 {
             let mut typed: Option<(i32, i32)> = None;
@@ -1411,7 +1687,8 @@ impl CursorGlow {
                 }
                 si += 1;
             }
-            let mut add = |line: (i32, i32, i32)| {
+            #[inline]
+            const fn add_line(lines: &mut [Option<(i32, i32, i32)>; 3], line: (i32, i32, i32)) {
                 let mut i = 0;
                 let mut free = None;
                 while i < lines.len() {
@@ -1425,9 +1702,22 @@ impl CursorGlow {
                 if let Some(idx) = free {
                     lines[idx] = Some(line);
                 }
-            };
+            }
+            #[inline]
+            const fn add_neighbour(
+                lines: &mut [Option<(i32, i32, i32)>; 3],
+                text: &TextView<'_>,
+                nbr: i32,
+                (lo, hi): (i32, i32),
+            ) {
+                match text.frame_line(nbr) {
+                    Some(Some((first, end))) => add_line(lines, (nbr, first, end)),
+                    Some(None) => {}
+                    None => add_line(lines, (nbr, lo, hi)),
+                }
+            }
             if let Some((first, last)) = typed {
-                add((row, first, last + 1));
+                add_line(&mut lines, (row, first, last + 1));
             }
             let (first, last) = match typed {
                 Some(t) => t,
@@ -1445,16 +1735,11 @@ impl CursorGlow {
             let above_captured = matches!(meta, Some(m) if m.above == NbrProbe::Probed);
             let below_captured = matches!(meta, Some(m) if m.below == NbrProbe::Probed);
             let text = self.text_view();
-            let mut neighbour = |nbr: i32| match text.frame_line(nbr) {
-                Some(Some((first, end))) => add((nbr, first, end)),
-                Some(None) => {}
-                None => add((nbr, lo, hi)),
-            };
             if row > 0 && !above_captured {
-                neighbour(row - 1);
+                add_neighbour(&mut lines, &text, row - 1, (lo, hi));
             }
             if row + 1 < geom.rows as i32 && !below_captured {
-                neighbour(row + 1);
+                add_neighbour(&mut lines, &text, row + 1, (lo, hi));
             }
         }
         #[cfg(test)]
@@ -1607,18 +1892,28 @@ impl CursorGlow {
                 None => None,
             }
         }
-        let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
-        let caret_row = caret_row_i32(caret);
-        let filled = |row: i32, col: i32| {
-            Some(row) != caret_row
+        #[inline]
+        const fn is_filled_cell(
+            frame_text: &FrameText,
+            caret_row: Option<i32>,
+            page: u32,
+            row: i32,
+            col: i32,
+        ) -> bool {
+            !matches!(caret_row, Some(cr) if cr == row)
                 && matches!(
                     frame_text.pair(row, col),
                     Some((_, ground)) if !super::emit::reads_as_page(ground, page)
                 )
-        };
-        let span = |h: &RainHalo| {
-            let row = (i32::from(h.y) - oy).div_euclid(ch);
-            let (x0, x1) = (i32::from(h.x), i32::from(h.x) + i32::from(h.w));
+        }
+        #[inline]
+        const fn halo_col_span(
+            h: &RainHalo,
+            (ox, oy): (i32, i32),
+            (cw, ch): (i32, i32),
+        ) -> (i32, i32, i32, i32, i32) {
+            let row = (h.y as i32 - oy).div_euclid(ch);
+            let (x0, x1) = (h.x as i32, h.x as i32 + h.w as i32);
             (
                 row,
                 x0,
@@ -1626,23 +1921,33 @@ impl CursorGlow {
                 (x0 - ox).div_euclid(cw),
                 (x1 - 1 - ox).div_euclid(cw),
             )
-        };
-        let first_filled_col = |row: i32, c0: i32, c1: i32| -> Option<i32> {
+        }
+        #[inline]
+        const fn first_filled_col(
+            frame_text: &FrameText,
+            caret_row: Option<i32>,
+            page: u32,
+            row: i32,
+            c0: i32,
+            c1: i32,
+        ) -> Option<i32> {
             let mut c = c0;
             while c <= c1 {
-                if filled(row, c) {
+                if is_filled_cell(frame_text, caret_row, page, row, c) {
                     return Some(c);
                 }
                 c += 1;
             }
             None
-        };
+        }
+        let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
+        let caret_row = caret_row_i32(caret);
         let mut any_filled = false;
         let mut hi = 0;
         while hi < halos.len() {
             let h = &halos[hi];
-            let (row, _, _, c0, c1) = span(h);
-            if h.w > 0 && first_filled_col(row, c0, c1).is_some() {
+            let (row, _, _, c0, c1) = halo_col_span(h, (ox, oy), (cw, ch));
+            if h.w > 0 && first_filled_col(frame_text, caret_row, page, row, c0, c1).is_some() {
                 any_filled = true;
                 break;
             }
@@ -1654,13 +1959,16 @@ impl CursorGlow {
         let mut all = std::mem::take(&mut self.ink_ledger.halo_pieces);
         all.clear();
         std::mem::swap(&mut all, halos);
-        for h in all.drain(..) {
+        let mut hi = 0;
+        while hi < all.len() {
+            let h = all[hi];
+            hi += 1;
             if h.w == 0 {
                 halos.push(h);
                 continue;
             }
-            let (row, x0, x1, c0, c1) = span(&h);
-            let Some(cf) = first_filled_col(row, c0, c1) else {
+            let (row, x0, x1, c0, c1) = halo_col_span(&h, (ox, oy), (cw, ch));
+            let Some(cf) = first_filled_col(frame_text, caret_row, page, row, c0, c1) else {
                 halos.push(h);
                 continue;
             };
@@ -1678,7 +1986,7 @@ impl CursorGlow {
             let mut start: Option<i32> = None;
             let mut c = cf + 1;
             while c <= c1 + 1 {
-                let keep = c <= c1 && !filled(row, c);
+                let keep = c <= c1 && !is_filled_cell(frame_text, caret_row, page, row, c);
                 match (keep, start) {
                     (true, None) => start = Some(c),
                     (false, Some(s)) => {
@@ -1698,6 +2006,7 @@ impl CursorGlow {
                 c += 1;
             }
         }
+        all.clear();
         self.ink_ledger.halo_pieces = all;
     }
 
@@ -1732,13 +2041,20 @@ impl CursorGlow {
         );
         #[cfg(test)]
         let fi = if self.neighbour_hold_hard { 1e-3 } else { fi };
-        let inked = |row: i32, col: i32| {
+        #[inline]
+        const fn cell_is_inked(
+            view: &TextView<'_>,
+            frame_text: &FrameText,
+            page: u32,
+            row: i32,
+            col: i32,
+        ) -> bool {
             view.covers_cell(row, col)
                 || matches!(
-                    self.frame_text.pair(row, col),
+                    frame_text.pair(row, col),
                     Some((ink, ground)) if ink.is_some() || !super::emit::reads_as_page(ground, page)
                 )
-        };
+        }
         let cr = i32::from(cr);
         let mid_y = 0.5 * (top + bot);
         let inv_ease = 1.0 / (fi + fy);
@@ -1775,7 +2091,7 @@ impl CursorGlow {
             let mut near = f32::INFINITY;
             let mut c = c_lo.max(0);
             while c <= c_hi {
-                if inked(row, c) {
+                if cell_is_inked(&view, &self.frame_text, page, row, c) {
                     let (a, b) = (ox + c as f32 * cw, ox + (c + 1) as f32 * cw);
                     near = near.min((a - x1).max(x0 - b).max(0.0));
                     if near == 0.0 {

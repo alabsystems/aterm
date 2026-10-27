@@ -7,6 +7,55 @@ use aterm_agent::harness::upgrade::SessionFile;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::AtomicUsize;
 
+#[path = "harness_transcript_observation_tests.rs"]
+mod transcript_observation_tests;
+
+/// The older reducer tests name a policy directly. Give that policy a real source
+/// before calling the same guarded recorder as the host.
+fn usage_fixture(
+    store: &accounts::Store,
+    roster: &accounts::Roster,
+    now: i64,
+) -> accounts::UsageRoster {
+    let path = store
+        .dir
+        .parent()
+        .unwrap()
+        .ancestors()
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("usage-fixture.toml");
+    let text: String = roster
+        .rows
+        .iter()
+        .map(|row| accounts::row_text(row).unwrap())
+        .collect();
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(&text) {
+        std::fs::write(&path, text).unwrap();
+    }
+    store.read_usage_roster(Some(&path), now).unwrap()
+}
+
+fn account_wall_of(
+    store: &accounts::Store,
+    roster: &accounts::Roster,
+    sid: &str,
+    read: &WallRead<'_>,
+    now: i64,
+) -> (&'static str, Option<String>) {
+    super::account_wall_of(store, &usage_fixture(store, roster, now), sid, read, now)
+}
+
+fn account_usage_of(
+    store: &accounts::Store,
+    roster: &accounts::Roster,
+    sid: &str,
+    read: &UsageRead<'_>,
+    now: i64,
+) -> &'static str {
+    super::account_usage_of(store, &usage_fixture(store, roster, now), sid, read, now)
+}
+
 #[path = "harness_host_agent_gate_tests.rs"]
 mod agent_gate_tests;
 
@@ -3272,7 +3321,10 @@ fn an_agent_the_harness_own_restart_ended_is_carried_whoever_is_at_the_tab() {
     assert_eq!(a.carries.lock().unwrap().len(), 5, "every attempt carried");
     let pauses = a.pauses.lock().unwrap().clone();
     assert!(
-        pauses.len() == 4 && pauses.iter().all(|p| *p <= relaunch::CARRY_EVERY),
+        pauses.len() == 4
+            && pauses
+                .iter()
+                .all(|p| *p <= Duration::from_secs(relaunch::STALE_S)),
         "never a pause its record outlives: {pauses:?}"
     );
     let badges = a.badges.lock().unwrap().clone();
@@ -3378,6 +3430,72 @@ fn an_agent_the_harness_own_restart_ended_is_carried_whoever_is_at_the_tab() {
         );
     }
 }
+
+/// 2026-10-26: the restart the harness made waited `wait:held` on a person's keys, and its carry
+/// climbed the back-off (1 s, 10 s, then 60 s) though the keys stopped holding the line well
+/// before; at a dead prompt for 52 s the person relaunched it by hand first. A carry held by keys
+/// is tried again one second after its record's own grace lets them go
+/// (`relaunch::carry_line_grace`): a key read at the held attempt holds a restart in place's line
+/// (120 s) until 121 s on, a land-rung upgrade's (20 s, the control) until 21 s on; and an attempt
+/// so timed that its line still holds does not climb the back-off. The control: with no key, each
+/// miss climbs it.
+#[test]
+fn a_restart_carry_held_by_keys_is_tried_again_once_its_own_grace_lets_them_go() {
+    let a = Arc::new(Acting::default());
+    let hooks = a.hooks();
+    let claude = || {
+        let job = left_job("s-k", Program::Claude, &on());
+        with_kept(&job, |k| k.snapshot = Some(snap("s-k")));
+        job
+    };
+    let run = |line_grace: u32, keys: &[Option<u64>], steps: &[&'static str]| {
+        *a.line_grace.lock().unwrap() = Some(line_grace);
+        *a.human_ms.lock().unwrap() = None;
+        *a.carry_keys.lock().unwrap() = keys.iter().copied().collect();
+        a.pauses.lock().unwrap().clear();
+        a.restart_in_flight.store(true, Ordering::SeqCst);
+        *a.carry_steps.lock().unwrap() = steps.iter().copied().collect();
+        on_agent_left(&claude(), &hooks);
+        a.pauses.lock().unwrap()[..steps.len()].to_vec()
+    };
+    let secs = Duration::from_secs;
+    let held = |n: usize| {
+        let mut steps = vec!["wait:held"; n];
+        steps.push("adopted");
+        steps
+    };
+    assert_eq!(
+        run(120, &[Some(0)], &held(1)),
+        [relaunch::BACKOFF[0], secs(121)],
+        "a restart in place's line, held by a key at the attempt"
+    );
+    assert_eq!(
+        run(20, &[Some(0)], &held(1)),
+        [relaunch::BACKOFF[0], secs(21)],
+        "control: a land-rung upgrade's"
+    );
+    assert_eq!(
+        run(120, &[Some(0), Some(0), None], &held(3)),
+        [
+            relaunch::BACKOFF[0],
+            secs(121),
+            secs(121),
+            relaunch::BACKOFF[1]
+        ],
+        "attempts the keys timed, still held, leave the back-off at its second step"
+    );
+    assert_eq!(
+        run(120, &[None, None, None], &held(3)),
+        [
+            relaunch::BACKOFF[0],
+            relaunch::BACKOFF[1],
+            relaunch::CARRY_EVERY,
+            relaunch::CARRY_EVERY
+        ],
+        "control: with no key, each miss climbs the back-off"
+    );
+}
+
 #[test]
 fn a_restarts_carry_its_upgrade_row_answers_is_said_there_alone() {
     let a = Arc::new(Acting::default());
@@ -3783,6 +3901,110 @@ fn a_worker_relays_the_loops_next_try_and_a_worker_that_ends_clears_it() {
 enum Handed {
     Wait(Option<i64>),
     Pause(Option<crate::PausePlan>),
+    Outage(Option<crate::OutageWait>),
+}
+
+#[test]
+fn a_worker_hands_an_outage_wait_to_the_glass_and_what_replaces_it_clears_it() {
+    use aterm_agent::supervise::{IdleHost, Outage, WaitKind, WaitPlan};
+    const AT: i64 = 1_789_660_680;
+    let (tx, rx) = std::sync::mpsc::channel::<Handed>();
+    let (wait_tx, fact_tx) = (Mutex::new(tx.clone()), Mutex::new(tx));
+    let (idle, _) = attended_worker_with(&Arc::new(World::default()), &[], |h| {
+        h.waiting = Arc::new(move |_, plan| {
+            let _ = wait_tx
+                .lock()
+                .unwrap()
+                .send(Handed::Wait(plan.map(|p| p.at_unix)));
+        });
+        h.fact = Arc::new(move |_, fact| {
+            let handed = match fact {
+                crate::HarnessFact::Pause(pause) => Handed::Pause(pause),
+                crate::HarnessFact::Waiting(wait) => Handed::Outage(wait),
+                _ => return,
+            };
+            let _ = fact_tx.lock().unwrap().send(handed);
+        });
+    });
+    let plan = |at_unix: i64, kind: WaitKind| {
+        Some(WaitPlan {
+            at_unix,
+            why: format!("{kind:?}"),
+            kind,
+        })
+    };
+    let outage = |wall, tries| WaitKind::Outage { wall, tries };
+    let waits = |wall, tries, at_unix| {
+        Handed::Outage(Some(crate::OutageWait {
+            wall,
+            tries,
+            at_unix,
+        }))
+    };
+    let told = |tell: Option<WaitPlan>| {
+        idle.waiting(tell);
+        rx.try_iter().collect::<Vec<_>>()
+    };
+    assert_eq!(
+        told(plan(AT, WaitKind::Retry)),
+        [Handed::Wait(Some(AT))],
+        "CONTROL: a next try is the tab's countdown"
+    );
+    assert_eq!(
+        told(plan(AT + 120, outage(Outage::Overload, true))),
+        [Handed::Wait(None), waits(Outage::Overload, true, AT + 120)],
+        "an outage clears the countdown it replaces and draws none"
+    );
+    assert_eq!(
+        told(plan(AT + 240, outage(Outage::Connection, false))),
+        [waits(Outage::Connection, false, AT + 240)],
+        "measured down: no try at the wait's end"
+    );
+    assert_eq!(
+        told(plan(AT + 600, WaitKind::Retry)),
+        [Handed::Outage(None), Handed::Wait(Some(AT + 600))],
+        "a next try clears the outage wait"
+    );
+    told(plan(AT + 720, outage(Outage::ApiError, true)));
+    assert_eq!(
+        told(plan(AT + 840, WaitKind::BackOff { short: 2 })),
+        [
+            Handed::Outage(None),
+            Handed::Pause(Some(crate::PausePlan {
+                at_unix: AT + 840,
+                short: 2
+            }))
+        ],
+        "a back-off clears it"
+    );
+    assert_eq!(
+        told(plan(AT + 960, outage(Outage::ApiError, true))),
+        [Handed::Pause(None), waits(Outage::ApiError, true, AT + 960)],
+        "it clears a pause"
+    );
+    assert_eq!(
+        told(None),
+        [Handed::Outage(None)],
+        "the wait's end clears it"
+    );
+    told(plan(AT + 1200, outage(Outage::Overload, true)));
+    assert_eq!(
+        told(plan(AT + 1260, WaitKind::Other)),
+        [Handed::Outage(None)],
+        "a kind the loop never tells clears it"
+    );
+    told(plan(AT + 1500, outage(Outage::Overload, true)));
+    drop(idle);
+    let ended: Vec<Handed> = rx.try_iter().collect();
+    assert_eq!(
+        ended,
+        [
+            Handed::Wait(None),
+            Handed::Pause(None),
+            Handed::Outage(None)
+        ],
+        "a worker that ends takes its outage wait with it"
+    );
 }
 
 #[test]
@@ -5991,6 +6213,12 @@ struct Acting {
     /// What carrying it answers, in turn; `adopted` once spent — and
     /// what each attempt asked it with.
     carry_steps: Mutex<VecDeque<&'static str>>,
+    /// The person's last key (`human_ms`) each carry leaves on the tab's `status`, in turn; the
+    /// status stands once spent.
+    carry_keys: Mutex<VecDeque<Option<u64>>>,
+    /// The grace the restart's record gives a person's keys over its line
+    /// ([`Acts::line_grace`]); `None`: the tab's whole grace.
+    line_grace: Mutex<Option<u32>>,
     carries: Mutex<Vec<(bool, Option<u32>)>>,
     /// Whether each carry was told a hand its exit was carried through had
     /// just lifted (`relaunch::carry_restart`'s `through_hand`).
@@ -6417,7 +6645,7 @@ impl Acting {
         let (a22, a23, a24, a25) = (w(self), w(self), w(self), w(self));
         let a14f = w(self);
         let (a26, a25b) = (w(self), w(self));
-        let a27 = w(self);
+        let (a27, a28) = (w(self), w(self));
         Hooks {
             roster: Arc::new(move || {
                 w1.passes.fetch_add(1, Ordering::SeqCst);
@@ -6871,8 +7099,14 @@ impl Acting {
                     a18.restart_in_flight.load(Ordering::SeqCst)
                         || pid.is_some_and(|pid| a18.restarted_pids.lock().unwrap().contains(&pid))
                 }),
+                line_grace: Arc::new(move |_, grace, _, _| {
+                    a28.line_grace.lock().unwrap().unwrap_or(grace)
+                }),
                 carry: Arc::new(move |sid, _, agent, pid, through_hand| {
                     a19.carried_through.lock().unwrap().push(through_hand);
+                    if let Some(key) = a19.carry_keys.lock().unwrap().pop_front() {
+                        *a19.human_ms.lock().unwrap() = key;
+                    }
                     let codex = agent == aterm_agent::harness::upgrade::Agent::Codex;
                     let step = a19
                         .carry_steps
@@ -6891,7 +7125,7 @@ impl Acting {
                     a19.carries.lock().unwrap().push((codex, pid));
                     step.to_string()
                 }),
-                restart: Arc::new(move |sid, _, why| {
+                restart: Arc::new(move |sid, _, why, _| {
                     a10.restarts.lock().unwrap().push(why.word());
                     a10.set(&[]);
                     std::thread::sleep(Duration::from_millis(40));
@@ -8417,7 +8651,8 @@ fn the_windows_acts_read_a_limits_reset_in_the_agents_own_home() {
 fn the_live_recorder_reads_a_stand_ins_environment_and_its_transcripts_wall() {
     use aterm_uds::spawnfd::{Child, Command, Stdio, command};
     use std::io::BufRead as _;
-    const NOW: u64 = 1_790_000_000;
+    let now = aterm_time::unix_secs().expect("clock") + 86_400;
+    let stamp = aterm_agent::harness::usage::rfc3339_utc(i64::try_from(now - 60).unwrap());
     const TALK: &str = "0badf00d-1111-2222-3333-444455556666";
     let tmp = aterm_tempfile::Builder::new()
         .prefix("aterm-hh-accounts-live-")
@@ -8427,8 +8662,8 @@ fn the_live_recorder_reads_a_stand_ins_environment_and_its_transcripts_wall() {
     let project = home.join(".claude/projects/proj");
     std::fs::create_dir_all(&project).unwrap();
     let row = format!(
-        r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","uuid":"u","timestamp":"2026-09-21T14:13:10.000Z","message":{{"id":"m","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","type":"message","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"text","text":"You've hit your session limit · resets 3pm (UTC)"}}]}},"requestId":"req_0","quotaLimits":{{"status":"rejected","resetsAt":{},"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"five_hour","overageStatus":"rejected","isUsingOverage":false}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"version":"2.1.286"}}"#,
-        NOW + 3600
+        r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","uuid":"u","timestamp":"{stamp}","message":{{"id":"m","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","type":"message","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"text","text":"You've hit your session limit · resets 3pm (UTC)"}}]}},"requestId":"req_0","quotaLimits":{{"status":"rejected","resetsAt":{},"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"five_hour","overageStatus":"rejected","isUsingOverage":false}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"version":"2.1.286"}}"#,
+        now + 3600
     );
     std::fs::write(project.join(format!("{TALK}.jsonl")), format!("{row}\n")).unwrap();
     let listed = tmp.path().join("accounts.toml");
@@ -8441,15 +8676,30 @@ fn the_live_recorder_reads_a_stand_ins_environment_and_its_transcripts_wall() {
     let refused = tmp.path().join("refused.toml");
     std::fs::write(&refused, "rotate = true\n").unwrap();
     let missing = tmp.path().join("none.toml");
-    let start = aterm_agent::harness::footer::lstart_utc(NOW - 100);
     let route_asked = AtomicUsize::new(0);
-    let said = |roster: Option<&Path>, pid: u32| {
-        let snap = Snapshot {
+    let capture = |pid: u32| {
+        let start = aterm_uds::process::read_process_birth(i32::try_from(pid).unwrap())
+            .map(|birth| aterm_agent::harness::footer::lstart_utc(birth.seconds))
+            .unwrap_or_default();
+        let args = atpkg::caller_shell::process_args(pid).unwrap_or_default();
+        let image = aterm_sysprobe::process_path(pid);
+        let (program, argv) = relaunch::launched(&args.argv, image.as_deref(), Path::new(""), true)
+            .unwrap_or_default();
+        Snapshot {
             pid,
-            start: start.clone(),
+            start,
+            program,
+            argv,
+            login: args.env_var(accounts::LOGIN_ENV).map(str::to_owned),
+            home: args.env_var(accounts::HOME_ENV).map(str::to_owned),
+            stored_login: accounts::ProcessLogin::of_exec_env(&args.env)
+                .is_some_and(|who| who.stored_login),
             session: Some(TALK.to_string()),
             ..snap("s-live")
-        };
+        }
+    };
+    let said = |roster: Option<&Path>, pid: u32| {
+        let snap = capture(pid);
         let agent = WalledAgent {
             snap: &snap,
             session: TALK,
@@ -8464,7 +8714,7 @@ fn the_live_recorder_reads_a_stand_ins_environment_and_its_transcripts_wall() {
             "s-live",
             &agent,
             &settled,
-            i64::try_from(NOW).unwrap(),
+            i64::try_from(now).unwrap(),
         )
     };
     let running = |mut command: Command| {
@@ -8518,6 +8768,29 @@ fn the_live_recorder_reads_a_stand_ins_environment_and_its_transcripts_wall() {
     assert_eq!(said(Some(&listed), gone), ("no-env", None));
     assert!(!state.exists(), "nothing made for any of them");
 
+    let mut stale = capture(work.id());
+    stale.login = None;
+    let agent = WalledAgent {
+        snap: &stale,
+        session: TALK,
+        own: false,
+    };
+    assert_eq!(
+        account_wall_at(
+            (&home, &accounts::Store::at(&state), Some(&listed)),
+            "s-live",
+            &agent,
+            &|| true,
+            i64::try_from(now).unwrap(),
+        ),
+        ("no-env", None),
+        "a saved default login cannot borrow the current process's named login"
+    );
+    assert!(
+        !state.exists(),
+        "a stale process observation writes nothing"
+    );
+
     assert_eq!(
         said(Some(&listed), work.id()),
         ("wall", Some("work-2".to_string()))
@@ -8533,6 +8806,42 @@ const ACCT_TALK_B: &str = "0badf00d-1111-2222-3333-444455557777";
 
 #[path = "harness_account_read_tests.rs"]
 mod account_read_tests;
+
+#[path = "harness_account_process_tests.rs"]
+mod account_process;
+
+#[path = "harness_account_landing_tests.rs"]
+mod account_landing;
+
+#[path = "harness_account_immediate_tests.rs"]
+mod account_immediate;
+
+#[path = "harness_account_policy_tests.rs"]
+mod account_policy;
+
+#[path = "harness_account_origin_tests.rs"]
+mod account_origin;
+
+#[path = "harness_account_response_tests.rs"]
+mod account_response;
+
+#[path = "harness_account_session_tests.rs"]
+mod account_session;
+
+#[path = "harness_account_advice_tests.rs"]
+mod account_advice;
+#[path = "harness_account_context_identity_tests.rs"]
+mod account_context_identity;
+#[path = "harness_account_controls_tests.rs"]
+mod account_controls;
+#[path = "harness_account_local_observation_tests.rs"]
+mod account_local_observation;
+#[path = "harness_account_restart_source_tests.rs"]
+mod account_restart_source;
+#[path = "harness_account_return_tests.rs"]
+mod account_return;
+#[path = "harness_snapshot_read_tests.rs"]
+mod snapshot_read;
 
 struct Accts {
     tmp: aterm_tempfile::TempDir,
@@ -8551,6 +8860,8 @@ struct Accts {
     /// [`Acts::account_restart`]: the move's own restart signalled the
     /// agent (its record says so, for the label last asked).
     ended: AtomicBool,
+    /// The simulated restart ends its source after selection admission.
+    leaves_on_restart: AtomicBool,
     /// The label the last relaunch was asked for.
     asked_to: Mutex<Option<String>>,
     /// An `adopted` relaunch's new process cannot be read yet: no snapshot of the tab. It
@@ -8568,7 +8879,7 @@ struct Accts {
     found: Mutex<Vec<Vec<&'static str>>>,
     /// Another writer, run at the n-th read of the seat from now ([`Self::at_seat_read`]): what a
     /// test puts between a move's lock-free read of the state and its commit (the second read of
-    /// the seat, [`account_transact_of`]'s, for the commit's clock, before it takes the lock).
+    /// the seat, [`roster_transact_of`]'s, for the commit's clock, before it takes the lock).
     at_read: Mutex<Option<(usize, SeatAct)>>,
     pids: std::sync::atomic::AtomicU32,
     /// The bounded wait of every take of the store's lock, the seat's and
@@ -8602,6 +8913,7 @@ impl Accts {
             answers: Mutex::default(),
             same_login: AtomicBool::new(false),
             ended: AtomicBool::new(false),
+            leaves_on_restart: AtomicBool::new(false),
             asked_to: Mutex::default(),
             unread: AtomicBool::new(false),
             hidden: Mutex::default(),
@@ -8803,6 +9115,7 @@ impl Accts {
         }
         self.procs.lock().unwrap().insert(pid, env);
         let snap = Snapshot {
+            stored_login: true,
             pid,
             start: aterm_agent::harness::footer::lstart_utc(u64::try_from(started).unwrap()),
             session: Some(talk.to_string()),
@@ -8847,6 +9160,19 @@ impl Accts {
         self.tabs.lock().unwrap().insert(snap.tab.clone(), snap);
     }
 
+    fn seat(&self) -> AccountSeat {
+        AccountSeat {
+            roster: self
+                .listed
+                .load(Ordering::SeqCst)
+                .then(|| self.roster_path()),
+            state: self.state_root(),
+            home: self.tmp.path().join("home"),
+            now: self.clock(),
+            ladder: self.ladder(),
+        }
+    }
+
     fn hooks(self: &Arc<Self>) -> Hooks {
         let world = Arc::new(World::default());
         let mut hooks = hooks(&world, parking_body(&world));
@@ -8871,15 +9197,10 @@ impl Accts {
         hooks.acts = Acts {
             account_seat: Arc::new(move || {
                 a1.seat_read();
-                Some(AccountSeat {
-                    roster: a1.listed.load(Ordering::SeqCst).then(|| a1.roster_path()),
-                    state: a1.state_root(),
-                    home: a1.tmp.path().join("home"),
-                    now: a1.clock(),
-                    ladder: a1.ladder(),
-                })
+                Some(a1.seat())
             }),
-            account_env: Arc::new(move |pid| {
+            account_env: Arc::new(move |snap| {
+                let pid = snap.pid;
                 a2.said.lock().unwrap().push(format!("env:{pid}"));
                 a2.procs.lock().unwrap().get(&pid).cloned()
             }),
@@ -8921,11 +9242,19 @@ impl Accts {
                 let to = a4.asked_to.lock().unwrap().clone();
                 to.filter(|_| a4.ended.load(Ordering::SeqCst))
             }),
-            restart: Arc::new(move |sid, _, why| {
+            restart: Arc::new(move |sid, _, why, selected| {
                 let a = &a5;
                 let Restart::Account { to, .. } = why else {
                     return "refused:inert".to_string();
                 };
+                let current = a.tabs.lock().unwrap().get(sid).cloned();
+                if !selected.is_some_and(|s| {
+                    current
+                        .as_ref()
+                        .is_some_and(|snap| s.matches(why, &a.roster(), snap))
+                }) {
+                    return "wait:account-changed".to_string();
+                }
                 *a.asked_to.lock().unwrap() = Some(to.clone());
                 let lock = lock_word(&a.store());
                 a.said
@@ -8957,6 +9286,11 @@ impl Accts {
                         a.tabs.lock().unwrap().remove(sid);
                         *a.hidden.lock().unwrap() = Some(new);
                     }
+                } else if a.leaves_on_restart.load(Ordering::SeqCst) {
+                    let old = a.tabs.lock().unwrap().remove(sid);
+                    if let Some(old) = old {
+                        a.procs.lock().unwrap().remove(&old.pid);
+                    }
                 }
                 step.to_string()
             }),
@@ -8975,6 +9309,71 @@ impl Accts {
 fn usage_wall() -> AccountPoint {
     AccountPoint::Wall {
         kind: aterm_phase::WallKind::UsageSession,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_eligibility_follows_the_admitted_wall() {
+    let pid = std::process::id();
+    let start = aterm_agent::harness::restart_stamp::kernel_start(pid).unwrap();
+    let born = process_started(&start).unwrap();
+    let now = aterm_time::unix_secs()
+        .and_then(|at| i64::try_from(at).ok())
+        .unwrap();
+    for standing in ["unwritten", "older", "own"] {
+        let a = Accts::new();
+        a.now.store(now, Ordering::SeqCst);
+        let mut snap = a.spawn("s-progress-eligibility", ACCT_TALK_A, "main");
+        let env = a.procs.lock().unwrap().remove(&snap.pid).unwrap();
+        snap.pid = pid;
+        snap.start = start.clone();
+        a.procs.lock().unwrap().insert(pid, env);
+        a.tabs.lock().unwrap().insert(snap.tab.clone(), snap);
+        std::fs::remove_file(PathBuf::from(a.login_dir("pool-a")).join("a-login-file")).unwrap();
+        a.store()
+            .transact(now, &mut None, |state| {
+                Ok(accounts::note_sample(
+                    state,
+                    "work-2",
+                    accounts::Sample {
+                        at: now,
+                        session_pct: Some(95),
+                        session_reset: Some(now + 7200),
+                        ..accounts::Sample::default()
+                    },
+                    now,
+                ))
+            })
+            .unwrap();
+        if standing != "unwritten" {
+            a.wall_of(
+                ACCT_TALK_A,
+                if standing == "own" { now } else { born - 1 },
+                Some("five_hour"),
+                Some(now + 3600),
+            );
+        }
+        let idle = a.worker("s-progress-eligibility", &on());
+        let look = idle.account_look(&a.roster()).unwrap();
+        let expected = standing == "own";
+        assert_eq!(
+            matches!(
+                account_point_read(&a.seat(), &look, usage_wall(), now).0,
+                accounts::Point::Wall { .. }
+            ),
+            expected
+        );
+        idle.account(usage_wall());
+        let kept = idle.kept.lock().unwrap();
+        let progress = &kept
+            .account
+            .progress
+            .as_ref()
+            .expect("attested recovery observation")
+            .value;
+        assert_eq!(progress.known, Some(3));
+        assert_eq!(progress.eligible, Some(usize::from(expected)), "{standing}");
     }
 }
 
@@ -9294,9 +9693,232 @@ fn the_rosters_advice_is_mapped_for_the_policy() {
 }
 
 #[test]
+fn a_kimi_wall_stays_unmeasured_until_a_real_wall_is_seen() {
+    let a = Accts::new();
+    let kimi_roster = a.roster_path().with_file_name("accounts-kimi.toml");
+    std::fs::rename(a.roster_path(), &kimi_roster).unwrap();
+    for label in ["work-2", "pool-a"] {
+        let credentials = format!("{}/credentials", a.login_dir(label));
+        std::fs::create_dir_all(&credentials).unwrap();
+        std::fs::write(format!("{credentials}/kimi-code.json"), "{}").unwrap();
+    }
+    a.spawn("s-kimi-pool", ACCT_TALK_A, "main");
+    for env in a.procs.lock().unwrap().values_mut() {
+        *env = vec!["PATH=/usr/bin".into(), "USER=someone".into()];
+    }
+    let accts = a.clone();
+    let mut kimi = a.worker("s-kimi-pool", &on());
+    kimi.agent = Program::Kimi;
+    kimi.hooks.acts.account_seat = Arc::new(move || {
+        Some(AccountSeat {
+            roster: Some(kimi_roster.clone()),
+            state: accts.state_root(),
+            home: accts.tmp.path().join("home"),
+            now: accts.clock(),
+            ladder: accts.ladder(),
+        })
+    });
+    a.wall(ACCT_TALK_A, ACCT_NOW - 10);
+    assert_eq!(kimi.account(usage_wall()), None);
+}
+
+#[test]
+fn a_kimi_pool_turn_end_proves_its_own_row_ignoring_claude_settings_and_keys() {
+    let a = Accts::new();
+    let kimi_roster = a.roster_path().with_file_name("accounts-kimi.toml");
+    std::fs::rename(a.roster_path(), &kimi_roster).unwrap();
+    let home = a.tmp.path().join("home");
+    for label in ["work-2", "pool-a"] {
+        let credentials = format!("{}/credentials", a.login_dir(label));
+        std::fs::create_dir_all(&credentials).unwrap();
+        std::fs::write(format!("{credentials}/kimi-code.json"), "{}").unwrap();
+    }
+    std::fs::create_dir_all(home.join(".kimi/credentials")).unwrap();
+    std::fs::write(home.join(".kimi/credentials/kimi-code.json"), "{}").unwrap();
+
+    // Claude settings unsettled + ANTHROPIC_API_KEY in env must not taint Kimi's KIMI_CODE_HOME.
+    a.unsettled.store(true, Ordering::SeqCst);
+    let snap = a.spawn("s-kimi-prove", ACCT_TALK_A, "work-2");
+    a.procs.lock().unwrap().insert(
+        snap.pid,
+        vec![
+            "PATH=/usr/bin".into(),
+            "ANTHROPIC_API_KEY=sk-ant-other".into(),
+            format!("KIMI_CODE_HOME={}", a.login_dir("work-2")),
+        ],
+    );
+
+    let store = accounts::Store::at_for(&a.state_root(), accounts::Cli::Kimi, &home);
+    let raw = accounts::Roster::load_for(accounts::Cli::Kimi, &kimi_roster).unwrap();
+    let enrolled = accounts::enrolled_for(accounts::Cli::Kimi, &raw);
+    store
+        .transact(ACCT_NOW - 30, &mut None, |state| {
+            accounts::begin_rotation(
+                state,
+                &raw,
+                &enrolled,
+                None,
+                accounts::Mover {
+                    sid: "s-kimi-prove",
+                    account: "main",
+                },
+                "work-2",
+                ACCT_NOW - 30,
+            )
+            .map(|e| vec![e])
+            .map_err(|e| format!("{e:?}"))
+        })
+        .unwrap();
+    assert!(
+        store.load(ACCT_NOW).unwrap().0.canary.is_some(),
+        "rotation starts unproven"
+    );
+
+    let accts = a.clone();
+    let mut kimi = a.worker("s-kimi-prove", &on());
+    kimi.agent = Program::Kimi;
+    kimi.hooks.acts.account_seat = Arc::new(move || {
+        Some(AccountSeat {
+            roster: Some(kimi_roster.clone()),
+            state: accts.state_root(),
+            home: accts.tmp.path().join("home"),
+            now: accts.clock(),
+            ladder: accts.ladder(),
+        })
+    });
+    assert_eq!(kimi.account(AccountPoint::TurnEnd), None);
+    let after = store.load(ACCT_NOW).unwrap().0;
+    assert_eq!(after.canary, None, "TurnEnd on work-2 proves its canary");
+    assert_eq!(
+        after
+            .sessions
+            .get("s-kimi-prove")
+            .map(|r| r.account.as_str()),
+        Some("work-2")
+    );
+}
+
+#[test]
+fn codex_pool_advice_records_thread_rollout_sample_and_rotates_at_measured_wall() {
+    const THREAD: &str = "01900000-0000-7000-8000-000000000001";
+    const OTHER: &str = "01900000-0000-7000-8000-000000000009";
+    let a = Accts::new();
+    let codex_roster = a.roster_path().with_file_name("accounts-codex.toml");
+    std::fs::rename(a.roster_path(), &codex_roster).unwrap();
+    let home = a.tmp.path().join("home");
+    let codex_home = home.join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(
+        codex_home.join("auth.json"),
+        r#"{"tokens":{"access_token":"m"}}"#,
+    )
+    .unwrap();
+    for label in ["work-2", "pool-a"] {
+        std::fs::write(
+            format!("{}/auth.json", a.login_dir(label)),
+            r#"{"tokens":{"access_token":"t"}}"#,
+        )
+        .unwrap();
+    }
+
+    let day = codex_home.join("sessions/2026/10/26");
+    std::fs::create_dir_all(&day).unwrap();
+    let stamp = aterm_agent::harness::usage::rfc3339_utc(ACCT_NOW - 20).replace('Z', ".000Z");
+    let other_stamp = aterm_agent::harness::usage::rfc3339_utc(ACCT_NOW - 5).replace('Z', ".000Z");
+    let reset = ACCT_NOW + 3600;
+    std::fs::write(
+        day.join(format!("rollout-2026-10-26T00-00-00-{THREAD}.jsonl")),
+        format!(
+            "{{\"timestamp\":\"{stamp}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{THREAD}\",\"session_id\":\"{THREAD}\"}}}}\n\
+             {{\"timestamp\":\"{stamp}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":null,\"rate_limits\":{{\"limit_id\":\"codex\",\"primary\":{{\"used_percent\":62.4,\"window_minutes\":300,\"resets_at\":{reset}}},\"secondary\":null}}}}}}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        day.join(format!("rollout-2026-10-26T00-00-05-{OTHER}.jsonl")),
+        format!(
+            "{{\"timestamp\":\"{other_stamp}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{OTHER}\",\"session_id\":\"{OTHER}\"}}}}\n\
+             {{\"timestamp\":\"{other_stamp}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":null,\"rate_limits\":{{\"limit_id\":\"codex\",\"primary\":{{\"used_percent\":5.0,\"window_minutes\":300,\"resets_at\":{reset}}},\"secondary\":null}}}}}}\n"
+        ),
+    )
+    .unwrap();
+
+    let mut snap = a.spawn("s-codex-pool", THREAD, "work-2");
+    snap.program = "/opt/bin/codex".into();
+    snap.argv = vec!["/opt/bin/codex".into()];
+    snap.login = None;
+    snap.stored_login = false;
+    snap.run = relaunch::AgentRun::Codex(relaunch::CodexRun {
+        home: codex_home.clone(),
+        home_env: None,
+        self_claimed: None,
+    });
+    a.tabs
+        .lock()
+        .unwrap()
+        .insert("s-codex-pool".into(), snap.clone());
+    a.procs.lock().unwrap().insert(
+        snap.pid,
+        vec![
+            "PATH=/usr/bin".into(),
+            format!("CODEX_AUTH_PATH={}/auth.json", a.login_dir("work-2")),
+        ],
+    );
+
+    let accts = a.clone();
+    let mut codex = a.worker("s-codex-pool", &on());
+    codex.agent = Program::Codex;
+    codex.hooks.acts.account_seat = Arc::new(move || {
+        Some(AccountSeat {
+            roster: Some(codex_roster.clone()),
+            state: accts.state_root(),
+            home: accts.tmp.path().join("home"),
+            now: accts.clock(),
+            ladder: accts.ladder(),
+        })
+    });
+
+    assert_eq!(
+        codex.pool_advice_for(
+            accounts::Cli::Codex,
+            accounts::Supervisor::Aterm,
+            AccountPoint::TurnEnd,
+        ),
+        None
+    );
+    let store = accounts::Store::at_for(&a.state_root(), accounts::Cli::Codex, &home);
+    let after_turn = store.load(ACCT_NOW).unwrap().0;
+    assert_eq!(
+        after_turn
+            .accounts
+            .get("work-2")
+            .and_then(|acct| acct.sample.as_ref())
+            .and_then(|s| s.session_pct),
+        Some(63),
+        "records this thread's own rollout sample, ignoring OTHER in shared CODEX_HOME"
+    );
+
+    assert_eq!(
+        codex.pool_advice_for(
+            accounts::Cli::Codex,
+            accounts::Supervisor::Aterm,
+            usage_wall(),
+        ),
+        Some(AccountAdvice::Move {
+            to: "main".to_string()
+        }),
+        "measured Codex wall moves without needing a Claude transcript row"
+    );
+    assert_eq!(
+        store.load(ACCT_NOW).unwrap().0.active.as_deref(),
+        Some("main")
+    );
+}
+
+#[test]
 fn a_move_commits_under_the_lock_and_relaunches_outside_it() {
     let a = Accts::new();
-    a.spawn("s-acct-a", ACCT_TALK_A, "main");
+    let source = a.spawn("s-acct-a", ACCT_TALK_A, "main");
     let idle = a.worker("s-acct-a", &on());
     assert!(
         matches!(idle.account(usage_wall()), Some(AccountAdvice::Wait { .. })),
@@ -9333,10 +9955,18 @@ fn a_move_commits_under_the_lock_and_relaunches_outside_it() {
         ["restart:s-acct-a:work-2:lock-free"],
         "the relaunch alone, the lock not held across it"
     );
+    let destination = a.tabs.lock().unwrap()["s-acct-a"].clone();
+    assert_ne!(source.pid, destination.pid);
     assert_eq!(
-        a.asked("settings:"),
-        1,
-        "its settings, read once for the process the move was advised to"
+        a.said()
+            .into_iter()
+            .filter(|s| s.starts_with("settings:"))
+            .collect::<Vec<_>>(),
+        [
+            format!("settings:{}", source.pid),
+            format!("settings:{}", destination.pid),
+        ],
+        "settings are read for the advised process and its observed replacement"
     );
     assert_eq!(
         *a.seen.lock().unwrap(),
@@ -9377,10 +10007,11 @@ fn a_move_commits_under_the_lock_and_relaunches_outside_it() {
     assert_eq!(
         kept,
         Some(Moved {
+            id: kept.as_ref().unwrap().id.clone(),
+            origin: a.seat().context(),
             to: "work-2".to_string(),
             login: None,
-            pid: now.pid,
-            start: now.start,
+            process: now.clone(),
             untold: false,
             answered: false,
         }),
@@ -9699,8 +10330,12 @@ fn a_relaunch_that_was_not_made_is_taken_back_exactly() {
         Some("wait:changed")
     );
     assert_eq!(bare(a.state()), bare(before.clone()));
-    assert_eq!(a.ledger().len(), rows + 2, "no second pair of rows");
-    assert_eq!(a.wake(), woke, "and nobody woken again");
+    assert_eq!(
+        a.ledger()[rows..],
+        ["rotate", "struck", "rotate", "struck"],
+        "both admitted attempts retain their history"
+    );
+    assert_ne!(a.wake(), woke, "the second rollback is published");
     assert_eq!(
         a.found
             .lock()
@@ -9708,7 +10343,7 @@ fn a_relaunch_that_was_not_made_is_taken_back_exactly() {
             .iter()
             .map(Vec::len)
             .collect::<Vec<_>>(),
-        [rows + 1, rows + 2]
+        [rows + 1, rows + 3]
     );
 
     a.answers.lock().unwrap().push_back("refused:line");
@@ -9728,8 +10363,8 @@ fn a_relaunch_that_was_not_made_is_taken_back_exactly() {
     assert_eq!(bare(after), bare(before));
     assert_eq!(
         a.ledger().len(),
-        rows + 2,
-        "the row says it; the ledger did"
+        rows + 6,
+        "each of the three admitted attempts retains its history"
     );
 
     assert_eq!(
@@ -9794,7 +10429,7 @@ fn an_adopted_relaunch_under_the_old_login_is_not_the_move() {
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     a.answers.lock().unwrap().push_back("failed:no-resume");
     a.ended.store(true, Ordering::SeqCst);
-    a.tabs.lock().unwrap().remove("s-acct-wrong");
+    a.leaves_on_restart.store(true, Ordering::SeqCst);
     assert_eq!(
         idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
         Some("failed:no-resume")
@@ -9821,9 +10456,7 @@ fn a_relaunch_in_flight_keeps_its_rotation() {
         assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
         a.answers.lock().unwrap().push_back("wait:resume");
         a.ended.store(ended, Ordering::SeqCst);
-        if ended {
-            a.tabs.lock().unwrap().remove("s-acct-fly");
-        }
+        a.leaves_on_restart.store(ended, Ordering::SeqCst);
         assert_eq!(
             idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
             Some("wait:resume")
@@ -9939,7 +10572,12 @@ fn a_lost_login_signed_back_in_is_relaunched_under_it() {
     );
     let moved = kept.account.moved.clone().expect("the move, to answer");
     assert_eq!(
-        (moved.to.as_str(), moved.pid, moved.login, moved.answered),
+        (
+            moved.to.as_str(),
+            moved.process.pid,
+            moved.login,
+            moved.answered
+        ),
         ("work-2", new.pid, Some(a.login_dir("work-2")), false),
         "the way back: the login of the process whose move was answered"
     );
@@ -10289,14 +10927,19 @@ fn a_due_probe_is_handed_on_with_the_move_behind_it_and_refuses_no_commit() {
         "{:?}",
         roster_says(&a, sid, false)
     );
-    assert_eq!(
-        idle.kept.lock().unwrap().account.advised,
-        Some(Advised {
-            to: "work-2".to_string(),
-            point: AccountPoint::TurnEnd,
-        }),
-        "the move behind the probe is the move the host will make"
-    );
+    {
+        let k = idle.kept.lock().unwrap();
+        let advice = k
+            .account
+            .advised
+            .as_ref()
+            .expect("the move behind the probe");
+        assert_eq!(
+            (advice.to.as_str(), advice.point),
+            ("work-2", AccountPoint::TurnEnd)
+        );
+        assert!(advice.request.matches_context(&k));
+    }
     assert_eq!(
         idle.restart(&move_to("work-2", AccountAt::Ahead))
             .as_deref(),
@@ -10337,6 +10980,14 @@ fn the_probe_is_claimed_once_under_the_lock_for_the_process_that_asked() {
             label: "main".to_string(),
             pid: agent.pid,
             start: agent.start.clone(),
+            row: a.roster().row("main").unwrap().clone(),
+            who: accounts::ProcessLogin {
+                login: None,
+                default_home: true,
+                stored_login: true
+            },
+            roster: a.roster_path(),
+            state: a.state_root(),
         }),
         "kept with the process it was made for"
     );
@@ -12168,7 +12819,7 @@ fn a_followers_failed_relaunch_strikes_nothing_and_its_row_is_kept_fresh() {
     assert_eq!(moves(&idle.account(AccountPoint::TurnEnd)), Some("work-2"));
     a.answers.lock().unwrap().push_back("failed:no-resume");
     a.ended.store(true, Ordering::SeqCst);
-    a.tabs.lock().unwrap().remove("s-acct-follow");
+    a.leaves_on_restart.store(true, Ordering::SeqCst);
     assert_eq!(
         idle.restart(&move_to("work-2", AccountAt::Ahead))
             .as_deref(),
@@ -12416,7 +13067,7 @@ fn a_move_whose_strike_the_lock_kept_out_is_not_answered() {
             .account
             .lost
             .as_ref()
-            .map(|l| (l.pid, l.at));
+            .map(|l| (l.process.pid, l.at));
         assert_eq!(met, Some((tab.pid, a.clock())), "met at its tell");
         let auth = a.state().account("work-2").auth;
         let login_wall = login_wall();
@@ -13073,10 +13724,11 @@ fn a_move_nobody_could_verify_stands_and_is_made_once_it_is_read() {
     assert_eq!(flying, None);
     let landed = |untold| {
         Some(Moved {
+            id: moved.as_ref().unwrap().id.clone(),
+            origin: a.seat().context(),
             to: "work-2".to_string(),
             login: None,
-            pid: now.pid,
-            start: now.start.clone(),
+            process: now.clone(),
             untold,
             answered: false,
         })
@@ -13246,10 +13898,11 @@ fn a_move_the_hosts_carry_lands_is_a_made_move() {
     assert_eq!(
         moved,
         Some(Moved {
+            id: moved.as_ref().unwrap().id.clone(),
+            origin: a.seat().context(),
             to: "work-2".to_string(),
             login: None,
-            pid: now.pid,
-            start: now.start,
+            process: now.clone(),
             untold: false,
             answered: false,
         }),
@@ -13951,7 +14604,7 @@ fn the_usage_recorder_records_only_where_a_record_is_kept() {
         usage_roster(path, &store, (own, listed), a.clock())
     };
     assert_eq!(
-        roster_of(Some(&path), false, true).map(|r| r.rows.len()),
+        roster_of(Some(&path), false, true).map(|r| r.roster().rows.len()),
         Ok(3)
     );
     assert_eq!(roster_of(Some(&path), true, false).err(), Some("off"));
@@ -13962,7 +14615,7 @@ fn the_usage_recorder_records_only_where_a_record_is_kept() {
     );
     assert_eq!(roster_of(None, false, true).err(), Some("not-listed"));
     assert_eq!(
-        roster_of(Some(&missing), true, false).map(|r| r.rows.len()),
+        roster_of(Some(&missing), true, false).map(|r| r.roster().rows.len()),
         Ok(1)
     );
     std::fs::write(&path, "rotate = true\n").unwrap();
@@ -13975,6 +14628,7 @@ fn the_usage_recorder_records_only_where_a_record_is_kept() {
     let env = vec!["HOME=/Users//someone".to_string()];
     let asked = std::cell::Cell::new(0_u32);
     let read_at = std::cell::Cell::new(0_u32);
+    let started = a.clock() - 120;
     let seen = UsageSeen {
         credits: Some(aterm_phase::credits::Credits {
             started: None,
@@ -13998,6 +14652,7 @@ fn the_usage_recorder_records_only_where_a_record_is_kept() {
         let said = |at: i64| usage_said(&seen, at, 0);
         let read = UsageRead {
             env,
+            started: Some(started),
             settled: &settled,
             answered: &answered,
             said: &said,
@@ -14060,6 +14715,7 @@ fn claude_admission_gates_usage_notes_from_an_existing_worker() {
         let said = |at: i64| usage_said(seen, at, 0);
         let read = UsageRead {
             env: env.as_deref().unwrap_or(&[]),
+            started: process_started(&agent.snap.start),
             settled,
             answered: &answered,
             said: &said,
@@ -14172,6 +14828,9 @@ fn the_usage_recorder_reads_the_roster_through_this_machines_logins() {
     let path = a.roster_path();
     let store = a.store();
     let now = a.clock();
+    let file = store
+        .read_usage_roster(Some(&path), now)
+        .expect("original policy");
     let renewed = a.tmp.path().join("logins").join("work-2+1");
     std::fs::create_dir_all(&renewed).unwrap();
     std::fs::write(renewed.join(".claude.json"), "{}").unwrap();
@@ -14202,20 +14861,20 @@ fn the_usage_recorder_reads_the_roster_through_this_machines_logins() {
             reset: None,
         }),
     };
-    let read = |roster: &accounts::Roster, login: &str, sid: &str, answer: i64| {
+    let read = |roster: &accounts::UsageRoster, login: &str, sid: &str, answer: i64| {
         let env = vec![format!("{}={login}", accounts::LOGIN_ENV)];
         let settled = || true;
         let answered = |by: i64| Some(answer).filter(|at| *at <= by);
         let said = |at: i64| usage_said(&seen, at, 0);
         let read = UsageRead {
             env: &env,
+            started: Some(now - 120),
             settled: &settled,
             answered: &answered,
             said: &said,
         };
-        account_usage_of(&store, roster, sid, &read, now)
+        super::account_usage_of(&store, roster, sid, &read, now)
     };
-    let file = accounts::Roster::load(&path).expect("the roster admits");
     assert_eq!(read(&file, &renewed, "s-new", now - 60), "not-listed");
     let roster = usage_roster(Some(&path), &store, (false, true), now).expect("bound");
     assert_eq!(read(&roster, &renewed, "s-new", now - 60), "usage");
@@ -14286,6 +14945,7 @@ fn a_screen_read_around_a_new_answer_is_no_word_of_it() {
         let said = |at: i64| usage_said(&seen, at, 0);
         let read = UsageRead {
             env: &env,
+            started: Some(wall - 1),
             settled: &settled,
             answered: &answered,
             said: &said,
@@ -15343,7 +16003,7 @@ fn the_tabs_on_one_login_share_its_one_sign_in() {
     let mut hooks = hooks(&world, parking_body(&world));
     hooks.acts = Acts {
         open: Arc::new(|sid| sid != "s-b"),
-        account_env: Arc::new(|pid| match pid {
+        account_env: Arc::new(|snap| match snap.pid {
             1 | 2 | 4 | 6 | 7 => Some(vec!["PATH=/bin".to_string()]),
             3 => Some(vec!["CLAUDE_CONFIG_DIR=/work/b".to_string()]),
             8 => Some(vec!["ANTHROPIC_API_KEY=captured-key".to_string()]),
@@ -15367,7 +16027,12 @@ fn the_tabs_on_one_login_share_its_one_sign_in() {
     let tab = |sid: &str, pid: u32, agent: Program| {
         let mut idle = idle_host(sid, agent, switched(&on()), hooks.clone());
         idle.login_latches = Arc::clone(&host.shared.login_latches);
-        idle.kept.lock().unwrap().snapshot = Some(Snapshot { pid, ..snap(sid) });
+        idle.kept.lock().unwrap().snapshot = Some(Snapshot {
+            pid,
+            stored_login: pid != 8,
+            home: (pid == 3).then(|| "/work/b".to_string()),
+            ..snap(sid)
+        });
         idle
     };
     let a = tab("s-a", 1, Program::Claude);
@@ -22039,6 +22704,60 @@ fn the_master_switch_off_and_on_again_starts_every_worker_as_off_lifted() {
 }
 
 #[test]
+fn an_agents_off_flick_before_worker_publication_survives_the_pass() {
+    use std::thread;
+
+    let world = Arc::new(World::default());
+    world.set(&[("s-a", Program::Claude), ("s-b", Program::Codex)]);
+    let (started, starts) = std::sync::mpsc::channel();
+    let body: Arc<BodyFn> = Arc::new(move |job: &WorkerJob| {
+        started
+            .send((
+                job.sid.clone(),
+                job.opts.idle_host.as_ref().unwrap().lifted_off(),
+            ))
+            .unwrap();
+        let me = thread::current();
+        *job.interrupt.lock().unwrap() = Some(Box::new(move || me.unpark()));
+        while !job.stop.load(Ordering::SeqCst) {
+            thread::park();
+        }
+        BodyEnd::Stopped
+    });
+    let mut hooks = hooks(&world, body);
+    let roster = Arc::clone(&hooks.roster);
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let first = Mutex::new(Some((entered, resume)));
+    hooks.roster = Arc::new(move || {
+        let read = roster();
+        if let Some((entered, resume)) = first.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            resume
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("release the first roster read within one minute");
+        }
+        read
+    });
+    let host = HostHandle::start(on(), false, false, hooks);
+    waiting
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the host reads its roster within one minute");
+    assert!(host.live().is_empty(), "no worker can witness this Off");
+    let mut disabled = on();
+    disabled.set("claude.enabled", "false").unwrap();
+    host.set_config(disabled);
+    host.set_config(on());
+    release.send(()).unwrap();
+    let mut seen: Vec<_> = (0..2)
+        .map(|_| starts.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap())
+        .collect();
+    seen.sort();
+    assert_eq!(seen, [("s-a".into(), true), ("s-b".into(), false)]);
+    host.shutdown_and_join();
+}
+
+#[test]
 fn an_agents_own_switch_off_and_on_again_starts_its_workers_as_off_lifted() {
     let world = Arc::new(World::default());
     let starts: Arc<Mutex<Vec<(String, bool)>>> = Arc::default();
@@ -25332,8 +26051,15 @@ fn an_asked_exit_is_carried_through_every_hand_its_relaunch_line_waits_on() {
 
 #[test]
 fn a_look_that_carries_an_asked_exit_rings_nothing() {
+    // A tab and a conversation no other test names, the agent it left and the one relaunched:
+    // a publish of a conversation a lost word stands for rings ([`publish_snapshot`]), and
+    // [`LOST_SESSIONS`] is the process's, so `snap`'s shared conversation, lost by a test
+    // running beside this one, rang here too.
+    const SID: &str = "s-look-rings";
+    const CONVERSATION: &str = "5ee1004e-7a1b-4c0d-9e2f-a5ced0e11e7d";
     let rings = |held_looks: usize| {
         let a = Arc::new(Acting::default());
+        *a.read_conversation.lock().unwrap() = Some(CONVERSATION.to_string());
         let mut hooks = a.hooks();
         let looked = Arc::new(AtomicUsize::new(0));
         let reads = Arc::clone(&looked);
@@ -25343,11 +26069,14 @@ fn a_look_that_carries_an_asked_exit_rings_nothing() {
                 "OK program=claude hold={hold} hand=- human_ms=- supervisor=-"
             ))
         });
-        let job = left_job("s-k", Program::Claude, &on());
-        let agent = snap("s-k");
+        let job = left_job(SID, Program::Claude, &on());
+        let agent = Snapshot {
+            session: Some(CONVERSATION.to_string()),
+            ..snap(SID)
+        };
         restart_stamp::write(
             a.stamp_dir(),
-            "s-k",
+            SID,
             &restart_stamp::Stamp {
                 pid: agent.pid,
                 start: agent.start.clone(),
@@ -25370,7 +26099,7 @@ fn a_look_that_carries_an_asked_exit_rings_nothing() {
                 a.asked_exits.lock().unwrap().clone()
             ),
             (
-                vec!["s-k".to_string()],
+                vec![SID.to_string()],
                 vec![Some(restart_stamp::Cause::Asked)]
             ),
             "carried through the hold, relaunched as the act's once it lifted"
@@ -27858,8 +28587,8 @@ impl TapWorld {
                     ladder: *a1.ladder.lock().unwrap(),
                 })
             }),
-            account_env: Arc::new(move |pid| {
-                (pid == TAP_PID).then(|| a2.env.lock().unwrap().clone())
+            account_env: Arc::new(move |snap| {
+                (snap.pid == TAP_PID).then(|| a2.env.lock().unwrap().clone())
             }),
             route: Arc::new(|_, _, _| Route::Default),
             account_settings: Arc::new(|_, _, _| true),

@@ -122,6 +122,48 @@ impl Laid {
     }
 }
 
+/// Where the cursor's next glyph goes, read before a resize moves anything. The resize moves the
+/// cursor's own cell; the glyph goes there, or one column on from it under an edge wrap.
+#[derive(Clone, Copy, Debug)]
+struct NextWrite {
+    /// A wrap is pending on the row's last column: the glyph goes on the cell after the one just
+    /// printed, which [`Grid::place_next_write`] finds from where that cell landed, so the cursor
+    /// stays on its cell's row (Ghostty's `Screen.resize` rule for a saved wrap).
+    edge_wrap: bool,
+    /// A wrap pending short of the row's last column, at a DECSLRM right margin: it stays
+    /// pending on the cursor's cell, as xterm keeps `do_wrap`, so the next glyph starts a row.
+    margin_wrap: bool,
+}
+
+impl NextWrite {
+    fn of(grid: &Grid) -> Self {
+        let s = &grid.storage;
+        let wrap = s.pending_wrap();
+        let at_edge = s.cursor.col >= s.max_col_for_row(s.cursor.row);
+        Self {
+            edge_wrap: wrap && at_edge,
+            margin_wrap: wrap && !at_edge,
+        }
+    }
+
+    /// The column the glyph lands on, from the column the cursor's cell landed on.
+    fn col(self, landed: u16) -> u16 {
+        landed.saturating_add(u16::from(self.edge_wrap))
+    }
+
+    /// The cursor's column and pending wrap on a row whose last column is `last`, from the column
+    /// the cursor's cell landed on. A next write that fits takes its column; one past the row's
+    /// end is an edge wrap's (the glyph just printed sits on `last`), which waits there with the
+    /// wrap pending, as if the program had printed up to the edge; otherwise the cursor's own cell
+    /// fell past the end of a row a resize without reflow cut, and it is clamped onto `last` with
+    /// no wrap, as xterm clamps it. A margin wrap stays pending.
+    fn place(self, landed: u16, last: u16) -> (u16, bool) {
+        let next = self.col(landed);
+        let wrap = self.margin_wrap || (next > last && self.edge_wrap);
+        (next.min(last), wrap)
+    }
+}
+
 struct RewrapCursors {
     src: [Option<(usize, u16)>; 3],
     dst: [Option<(usize, u16)>; 3],
@@ -137,10 +179,20 @@ impl RewrapCursors {
             .map(|src| src.and_then(|(r, c)| (r == row).then_some(c)))
     }
 
+    /// Point `i` on a row laid in place at `col`: the live cursor's column stays unclamped, so
+    /// [`Grid::place_next_write`] sees a next write past the row's end.
+    const fn placed(i: usize, col: u16, new_cols: u16) -> u16 {
+        if i == LIVE || col < new_cols {
+            col
+        } else {
+            new_cols.saturating_sub(1)
+        }
+    }
+
     fn place_on_row(&mut self, row: usize, new_row: usize, new_cols: u16) {
         for (i, col) in self.cols_on(row).into_iter().enumerate() {
             if let Some(col) = col {
-                self.dst[i] = Some((new_row, col.min(new_cols.saturating_sub(1))));
+                self.dst[i] = Some((new_row, Self::placed(i, col, new_cols)));
             }
         }
     }
@@ -151,17 +203,20 @@ impl RewrapCursors {
             TrackedPoint {
                 offset: live,
                 at: None,
-                keeps_gap: false,
+                keeps_gap: true,
+                opens_row: false,
             },
             TrackedPoint {
                 offset: saved,
                 at: None,
                 keeps_gap: true,
+                opens_row: true,
             },
             TrackedPoint {
                 offset: base,
                 at: None,
                 keeps_gap: false,
+                opens_row: false,
             },
         ]
     }
@@ -180,6 +235,10 @@ pub(super) fn is_mergeable_continuation(row: &Row) -> bool {
     row.is_wrapped() && row.line_size() == LineSize::SingleWidth
 }
 
+/// How many cells of the cursor's row a rewrap carries: its content and, past it, every cell up to
+/// and including the cursor's, so a cursor after the text keeps its place in the line and its
+/// cell lands on a row of the line (a new continuation row when the last one is full), as
+/// Ghostty's reflow and conhost carry them.
 fn cursor_row_copy_len(row: &Row, cursor_col: u16) -> usize {
     usize::from(row.len())
         .max(usize::from(cursor_col) + 1)
@@ -400,6 +459,7 @@ impl Grid {
         let new_cols = new_cols.clamp(1, MAX_GRID_COLS);
         let old_cols = self.storage.cols;
         self.admit_resize_undo(new_rows, new_cols, policy);
+        let next = NextWrite::of(self);
         let old_rows = self.settled_rows();
         let law = self.storage.resize_law;
         let rewrap_plan = (law == ResizeLaw::Rewrap
@@ -467,19 +527,13 @@ impl Grid {
         }
 
         let cursor_row = self.storage.cursor.row as usize;
-        let cursor_col = self.storage.cursor.col;
+        let mut landed = self.storage.cursor.col;
 
         let mut rewrap_pushed = 0;
         let mut laid = None;
         if new_cols != old_cols && reflow {
-            (rewrap_pushed, laid) = self.reflow_columns(
-                new_rows,
-                new_cols,
-                cursor_row,
-                cursor_col,
-                policy,
-                rewrap_plan,
-            );
+            (rewrap_pushed, laid, landed) =
+                self.reflow_columns(new_rows, new_cols, cursor_row, landed, policy, rewrap_plan);
         } else if new_cols != old_cols {
             // No reflow - just resize each row, after counting what a narrowing cuts off the screen (`ResizeShape::cut`).
             if new_cols < old_cols {
@@ -539,6 +593,7 @@ impl Grid {
                     .saturating_add(row_u16(revealed));
             }
         }
+        self.place_next_write(next, landed);
         for (row, bx) in reveal_extras {
             self.inject_scrolled_extras(row, &bx);
         }
@@ -598,6 +653,20 @@ impl Grid {
         }
         self.cover_retained_rows();
         self.seal_resize_undo();
+    }
+
+    /// Put the cursor where the resize took its next glyph, from the column its cell `landed` on
+    /// ([`NextWrite::place`]). A rewrap carries the cursor's cell into its line, so only an edge
+    /// wrap's next write, or a cell a resize without reflow cut off, falls past the row's end.
+    fn place_next_write(&mut self, next: NextWrite, landed: u16) {
+        let row = self.storage.cursor.row;
+        let (col, wrap) = next.place(landed, self.storage.max_col_for_row(row));
+        self.storage.set_cursor_position(row, col);
+        if wrap {
+            self.storage.mark_pending_wrap();
+        } else {
+            self.storage.clear_pending_wrap();
+        }
     }
 
     fn sever_top_row_continuation(&mut self) {
@@ -1224,6 +1293,8 @@ impl Grid {
         }
     }
 
+    /// Rewrap the screen to `new_cols`, tracking the live cursor from `cursor_col`: the rows
+    /// pushed, the laid plan, and the cursor's column before it is clamped to the width.
     fn reflow_columns(
         &mut self,
         target_rows: u16,
@@ -1232,7 +1303,7 @@ impl Grid {
         cursor_col: u16,
         policy: ResizePolicy,
         plan: Option<RewrapPlan>,
-    ) -> (usize, Option<Laid>) {
+    ) -> (usize, Option<Laid>, u16) {
         let old_extras = self
             .storage
             .extras
@@ -1257,7 +1328,7 @@ impl Grid {
         new_cols: u16,
         policy: ResizePolicy,
         plan: Option<RewrapPlan>,
-    ) -> (usize, Option<Laid>) {
+    ) -> (usize, Option<Laid>, u16) {
         let target_rows = usize::from(target_rows);
 
         let laid = plan.and_then(|plan| Laid::plan(&result, target_rows, plan));
@@ -1351,7 +1422,11 @@ impl Grid {
             self.storage.saved_cursor.cursor.row = row_u16(row);
             self.storage.saved_cursor.cursor.col = col.min(new_cols.saturating_sub(1));
         }
-        (push_count, laid.map(|(_, laid)| Laid { seams, ..laid }))
+        (
+            push_count,
+            laid.map(|(_, laid)| Laid { seams, ..laid }),
+            result.cursor_col,
+        )
     }
 
     fn conpty_reflow_demote(result: &ReflowResult, target_rows: usize) -> usize {
@@ -1376,7 +1451,7 @@ impl Grid {
         old_extras: Option<&CellExtras>,
         policy: ResizePolicy,
         plan: Option<RewrapPlan>,
-    ) -> (usize, Option<Laid>) {
+    ) -> (usize, Option<Laid>, u16) {
         let mut new_pages = PageStore::new();
         let visible_count = usize::from(self.storage.visible_rows);
         let mut new_rows: Vec<Row> = Vec::with_capacity(visible_count);
@@ -1397,7 +1472,6 @@ impl Grid {
         let mut merge_buf: Vec<super::Cell> = Vec::with_capacity(self.storage.cols as usize);
         let mut merge_coords: Vec<CellCoord> = Vec::new();
         let mut new_extras = CellExtras::new();
-        let keep_cursor_cell = policy == ResizePolicy::ConPty;
 
         let mut i = 0;
         while i < visible_count {
@@ -1412,7 +1486,7 @@ impl Grid {
                 }
             };
             let first_row_idx = i;
-            let copy_len = if keep_cursor_cell && cursor_row == first_row_idx {
+            let copy_len = if cursor_row == first_row_idx {
                 cursor_row_copy_len(row, cursor_col)
             } else {
                 row.len() as usize
@@ -1445,7 +1519,6 @@ impl Grid {
                     visible_count,
                     cursor_row,
                     cursor_col,
-                    keep_cursor_cell,
                     &mut merge_buf,
                     &mut merge_coords,
                     &mut i,
@@ -1527,7 +1600,6 @@ impl Grid {
         visible_count: usize,
         cursor_row: usize,
         cursor_col: u16,
-        keep_cursor_cell: bool,
         merge_buf: &mut Vec<super::Cell>,
         merge_coords: &mut Vec<CellCoord>,
         i: &mut usize,
@@ -1614,8 +1686,7 @@ impl Grid {
             }
         }
 
-        if keep_cursor_cell
-            && cursor_row == row_idx
+        if cursor_row == row_idx
             && let Some(row) = self.row(row_u16(row_idx))
         {
             let copied = merge_buf.len() - row_start;
@@ -1638,7 +1709,8 @@ impl Grid {
                 if offset.is_some()
                     && let Some((_, col)) = cursors.src[k]
                 {
-                    cursors.dst[k] = Some((new_rows.len(), col.min(new_cols.saturating_sub(1))));
+                    cursors.dst[k] =
+                        Some((new_rows.len(), RewrapCursors::placed(k, col, new_cols)));
                 }
             }
             new_rows.push(new_row);
@@ -2319,14 +2391,25 @@ mod tests {
         assert_eq!((conpty.cursor_row(), conpty.cursor_col()), (3, 6));
         conpty.assert_invariants();
 
+        // Native carries the cursor's cell the same way, so the next glyph goes where it would
+        // have before the resize rather than onto the last Q.
         let mut native = prompt_with_the_cursor_past_its_end();
         native.resize(6, 5);
-        assert_eq!(history_text(&native), lines(0..=6), "Native pushes one");
+        assert_eq!(history_text(&native), lines(0..=7));
         assert_eq!(
             screen_text(&native),
-            ["L7", "L8", "L9", "PPPPP", "PPPPP", "QQQQQ"]
+            ["L8", "L9", "PPPPP", "PPPPP", "QQQQQ", ""]
         );
-        assert_eq!((native.cursor_row(), native.cursor_col()), (5, 4));
+        assert!(native.row(5).unwrap().is_wrapped());
+        assert_eq!(
+            (
+                native.cursor_row(),
+                native.cursor_col(),
+                native.pending_wrap()
+            ),
+            (5, 1, false)
+        );
+        native.assert_invariants();
     }
 
     #[test]
@@ -2345,11 +2428,23 @@ mod tests {
         assert!(conpty.row(2).unwrap().is_wrapped());
         assert_eq!((conpty.cursor_row(), conpty.cursor_col()), (2, 0));
         conpty.assert_invariants();
+        // Native carries the cursor's cell too: offset 8 is past the line's last row, so the
+        // cursor starts a row that continues the line, where its next glyph lands.
         let mut native = prompt();
         native.resize(3, 4);
         assert_eq!(screen_text(&native), ["PPPP", "PP", ""]);
-        assert!(!native.row(2).unwrap().is_wrapped());
-        assert_eq!((native.cursor_row(), native.cursor_col()), (1, 2));
+        assert!(native.row(2).unwrap().is_wrapped());
+        assert_eq!(
+            (
+                native.cursor_row(),
+                native.cursor_col(),
+                native.pending_wrap()
+            ),
+            (2, 0, false)
+        );
+        native.write_char_wrap('X');
+        assert_eq!(screen_text(&native), ["PPPP", "PP", "X"]);
+        native.assert_invariants();
 
         let mut conpty = prompt();
         conpty.resize_with_policy(3, 5, ResizePolicy::ConPty);
@@ -2358,7 +2453,14 @@ mod tests {
         conpty.assert_invariants();
         let mut native = prompt();
         native.resize(3, 5);
-        assert_eq!((native.cursor_row(), native.cursor_col()), (1, 1));
+        assert_eq!(
+            (
+                native.cursor_row(),
+                native.cursor_col(),
+                native.pending_wrap()
+            ),
+            (1, 3, false)
+        );
     }
 
     #[test]
@@ -2382,6 +2484,11 @@ mod tests {
 
         let mut native = parked();
         native.resize(24, 60);
-        assert_eq!((native.cursor_row(), native.cursor_col()), (5, 59));
+        assert_eq!((native.cursor_row(), native.cursor_col()), (6, 10));
+        assert!(native.row(6).unwrap().is_wrapped());
+        native.resize(24, 80);
+        assert_eq!((native.cursor_row(), native.cursor_col()), (5, 70));
+        assert!((0..24).all(|r| native.row(r).unwrap().is_empty()));
+        native.assert_invariants();
     }
 }

@@ -676,4 +676,65 @@ mod tests {
             )
         );
     }
+
+    /// The sill's core tiles keep the load ramp of the original scheme (979d8c3559) at every
+    /// load, a hot one too, and draw no glow (the owner, 2026-10-26: "go back to the orignal
+    /// color scheme"); orange stays on the dial. CONTROL: no tile takes a warm stop.
+    #[test]
+    fn hot_cores_draw_the_sills_load_ramp_and_no_glow() {
+        let mut snap = snapshot();
+        if let Some(cpu) = snap.cpu.as_mut() {
+            for core in &mut cpu.cores {
+                core.load = TrendView::flat(0.95);
+            }
+        }
+        let i = input(&snap);
+        let hot = rgba(i.inks.load_at(0.95), 0xFF);
+        let (prims, _) = sill_paint(&GEOM, &i);
+        let fills: Vec<[u8; 4]> = prims
+            .iter()
+            .filter_map(|p| match *p {
+                DrawPrim::Panel { fill, .. } => Some(fill),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fills.contains(&hot),
+            "a hot core's tile draws load_at(0.95)"
+        );
+        for warm in &i.inks.thermal[2..] {
+            assert!(
+                !fills.contains(&rgba(*warm, 0xFF)),
+                "CONTROL: no tile draws the dial's warm stop {warm:?}"
+            );
+        }
+        // No glow: a hot sill strokes what a cold one does, every stroke inside the sill's pad.
+        let mut cold = snapshot();
+        if let Some(cpu) = cold.cpu.as_mut() {
+            for core in &mut cpu.cores {
+                core.load = TrendView::flat(0.05);
+            }
+        }
+        let (cold_prims, _) = sill_paint(&GEOM, &input(&cold));
+        let strokes = |prims: &[DrawPrim]| -> Vec<(f32, f32, f32, f32)> {
+            prims
+                .iter()
+                .filter_map(|p| match *p {
+                    DrawPrim::Stroke { x, y, w, h, .. } => Some((x, y, w, h)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            strokes(&prims),
+            strokes(&cold_prims),
+            "a hot core strokes no glow"
+        );
+        for (_, y, _, h) in strokes(&prims) {
+            assert!(
+                y >= -1.0 && y + h <= 19.0,
+                "a stroke at {y}+{h} past the sill's pad"
+            );
+        }
+    }
 }

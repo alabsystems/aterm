@@ -5,9 +5,10 @@
 
 use std::time::Instant;
 
-use astream_wire::frame::{HEADER_SIZE, MAGIC, MAX_PAYLOAD_LEN, VERSION};
+use astream_wire::frame::HEADER_SIZE;
 use aterm_core::terminal::Terminal;
 use aterm_restore::layout::{OFF_HIST_HI, OFF_HIST_LO};
+use aterm_restore::plant;
 use aterm_restore::{
     Geometry, HistoryIdentity, JournalWriter, KeyframeInput, RecoverPolicy, Recovery, RegionStore,
     RegionView, VecStore, WriterIdentity, recover,
@@ -116,35 +117,23 @@ impl Base {
         (self.lo % cap + (end - self.lo) <= cap).then_some(end)
     }
 
-    fn flip(&self, store: &VecStore, pos: u64) {
-        let at = self.at(pos);
-        let mut b = [0u8; 1];
-        store.read(at, &mut b).expect("read");
-        store.write(at, &[b[0] ^ 0xFF]).expect("write");
-    }
-
     /// One payload byte of chunk `i` flipped: its CRC fails, its header stays whole.
     fn damage_chunk(&self, store: &VecStore, i: usize) {
         let (start, end) = self.chunks[i];
         let pos = start + HEADER_SIZE as u64 + 3;
         assert!(pos < end, "a payload byte");
-        self.flip(store, pos);
+        let cap = self.geometry.hist_cap_phys as u64;
+        plant::flip(store, self.geometry.hist_off, cap, pos).expect("flip");
     }
 
     /// Writes synthetic frame look-alikes across ring positions `from..until`.
     fn lookalikes(&self, store: &VecStore, from: u64, until: u64, seg_end: u64) {
-        let mut p = from;
-        while p + (HEADER_SIZE as u64) < until.min(seg_end) {
-            let len = (seg_end - p - HEADER_SIZE as u64).min(MAX_PAYLOAD_LEN as u64);
-            let len = u32::try_from(len).expect("under the frame cap");
-            let mut h = [0u8; HEADER_SIZE];
-            h[0] = MAGIC[0];
-            h[1] = MAGIC[1];
-            h[2] = VERSION;
-            h[4..8].copy_from_slice(&len.to_le_bytes());
-            store.write(self.at(p), &h).expect("write");
-            p += HEADER_SIZE as u64;
-        }
+        let cap = self.geometry.hist_cap_phys as u64;
+        assert!(
+            from >= self.lo && until.min(seg_end) - self.lo <= cap,
+            "inside one lap"
+        );
+        plant::lookalikes(store, self.geometry.hist_off, cap, from, until, seg_end).expect("write");
     }
 
     fn random(&self, store: &VecStore, from: u64, until: u64) {

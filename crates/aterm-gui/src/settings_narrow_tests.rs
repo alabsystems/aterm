@@ -1509,29 +1509,62 @@ fn the_fleet_fields_words_keep_it_a_field() {
                 go_to_route(&mut runtime, instance, view, SettingsRoute::Ai);
                 let key = UiKey::new(format!("settings/control/{}", prefs::EDIT_AI_FLEET));
                 let (mut seen, mut whole) = (false, false);
-                each_screen(
-                    &mut runtime,
-                    instance,
-                    view,
-                    &view_cx_at(width, height),
-                    |screen, _| {
-                        let Some(node) = screen
-                            .paint
-                            .iter()
-                            .find(|node| node.key == key && !node.peek)
-                        else {
-                            return;
-                        };
-                        seen = true;
-                        whole |= node.clip.height >= node.rect.height - 0.5;
-                        let painted = painted_text(node).unwrap_or_default();
-                        assert!(
-                            !painted.contains('\u{2026}')
-                                && reads_as(&painted, "ai-fleet.toml beside aterm.toml"),
-                            "{context}: the fleet field paints {painted:?}"
-                        );
-                    },
-                );
+                let cx = view_cx_at(width, height);
+                let words = "ai-fleet.toml beside aterm.toml";
+                each_screen_of(&mut runtime, instance, view, &cx, |state, screen, _| {
+                    let Some(node) = screen
+                        .paint
+                        .iter()
+                        .find(|node| node.key == key && !node.peek)
+                    else {
+                        return;
+                    };
+                    seen = true;
+                    whole |= node.clip.height >= node.rect.height - 0.5;
+                    let painted = painted_text(node).unwrap_or_default();
+                    if reads_as(&painted, words) {
+                        return;
+                    }
+                    // Past the lines a screen of the list gives a field ([`field_lines_most`]),
+                    // and only there, the field keeps the most leading whole words those lines
+                    // hold and says more follows: the Linux lane's Noto Sans sets these words on
+                    // six lines at 2x in 164pt, where a 348pt window's list gives five, and
+                    // "ai-fleet.toml beside…" takes four.
+                    let list = settings_list_body_height(
+                        state,
+                        SettingsWidth::for_viewport(width),
+                        cx.viewport,
+                    );
+                    let most = {
+                        let _room = FieldListRoom::set(Some(
+                            (list - page_heading_height()).max(scaled_control_height()),
+                        ));
+                        field_lines_most()
+                    };
+                    let px =
+                        crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary)
+                            .get();
+                    let whole = wrap_to_box(
+                        words,
+                        crate::native_ui::field_placeholder_room(node.rect.width, false),
+                        &|line| crate::tray_raster::ui_text_width(line, px),
+                    )
+                    .len();
+                    let stem = painted.strip_suffix('\u{2026}');
+                    assert!(
+                        whole > most
+                            && stem.is_some_and(|stem| {
+                                words
+                                    .char_indices()
+                                    .map(|(at, _)| &words[..at])
+                                    .any(|lead| reads_as(stem, lead))
+                            })
+                            && painted.lines().count() <= most,
+                        "{context}: the fleet field paints {painted:?}, not its words whole \
+                         ({whole} lines), nor its leading words on the {most} lines a screen \
+                         gives it"
+                    );
+                });
                 assert!(seen, "{context}: the fleet field is on the page");
                 assert!(whole, "{context}: the field is whole on some screen");
             }
@@ -3094,7 +3127,17 @@ fn a_short_word_is_never_broken_in_a_control_with_room_for_it() {
             },
         );
         assert!(fields > 0, "premise: a colour field is drawn");
+        // A stacked Messages head, in a window as tall as the report's and 2pt wider: its title
+        // line is the window less 48pt, and at 2× text "Antigravity" is 130.36pt in Noto Sans
+        // (Linux's face), so the report's 178pt window has no room for it there.
         let title = "Antigravity CLI is not installed";
+        let (px, face) =
+            crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+        let word = crate::tray_raster::ui_text_width_for(face, "Antigravity", px);
+        assert!(
+            word <= 180.0 - 48.0,
+            "premise: the word fits its line ({word}pt)"
+        );
         let (mut runtime, instance, view) = super::setup_with_messages();
         let mut messages = super::sample_messages();
         for entry in &mut messages.entries {
@@ -3108,7 +3151,7 @@ fn a_short_word_is_never_broken_in_a_control_with_room_for_it() {
             &mut runtime,
             instance,
             view,
-            &view_cx_at(178.0, 488.0),
+            &view_cx_at(180.0, 488.0),
             1,
             |screen, k| {
                 let mut lines: Vec<(String, String)> = screen

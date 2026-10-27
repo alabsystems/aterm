@@ -288,6 +288,12 @@ pub fn holder(paths: &Paths, pids: &dyn Pids) -> Holder {
         None => Holder::None,
         Some(r) if r.birth_us == 0 => Holder::Unproven(r),
         Some(r) if is_live(&r, pids) => Holder::Live(r),
+        #[cfg(any(test, debug_assertions))]
+        Some(r)
+            if crate::fault::armed(crate::fault::Fault::PidOnly) && pids.uniq(r.pid).is_some() =>
+        {
+            Holder::Live(r)
+        }
         Some(r) => Holder::Dead(r),
     }
 }
@@ -296,6 +302,22 @@ pub fn holder(paths: &Paths, pids: &dyn Pids) -> Holder {
 /// next bring-up boots and no key outlives its VM (a helper SIGKILLed by the escalation
 /// cannot remove its own, measured in V4). Only the leftovers of the helper named `dead` are
 /// removed, so what a new helper wrote meanwhile is kept.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "vz_lifecycle",
+        action = "ClearDead",
+        project = "conformance_lifecycle::project"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "vz_lifecycle",
+        action = "Escalate",
+        project = "conformance_lifecycle::project"
+    )
+)]
 pub fn remove_leftovers(paths: &Paths, dead: &Record) {
     if Record::read(&paths.record()).as_ref() == Some(dead) {
         let _ = std::fs::remove_file(paths.record());
@@ -312,6 +334,14 @@ pub fn remove_leftovers(paths: &Paths, dead: &Record) {
 /// The pid is 0 or 1 ([`helper_pid`]), the record names no start time ([`Holder::Unproven`]),
 /// the unique id or start time differs, the start time cannot be read, or the pid is gone
 /// (nothing was sent), or the kernel refused the signal.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "vz_lifecycle",
+        action = "Escalate",
+        project = "conformance_lifecycle::project"
+    )
+)]
 pub fn kill_helper(record: &Record, pids: &dyn Pids) -> Result<(), String> {
     if !helper_pid(record.pid) {
         return Err(format!(
@@ -328,6 +358,8 @@ pub fn kill_helper(record: &Record, pids: &dyn Pids) -> Result<(), String> {
     }
     match pids.uniq(record.pid) {
         Some(uniq) if uniq == record.uniq => {}
+        #[cfg(any(test, debug_assertions))]
+        Some(_) if crate::fault::armed(crate::fault::Fault::PidOnly) => {}
         Some(uniq) => {
             return Err(format!(
                 "pid {} is now another process (unique id {uniq}, the record's {}): not signalled",
@@ -338,6 +370,8 @@ pub fn kill_helper(record: &Record, pids: &dyn Pids) -> Result<(), String> {
     }
     match pids.birth_us(record.pid) {
         Some(birth) if birth == record.birth_us => {}
+        #[cfg(any(test, debug_assertions))]
+        Some(_) if crate::fault::armed(crate::fault::Fault::PidOnly) => {}
         Some(birth) => {
             return Err(format!(
                 "pid {} is now another process (started {birth} us, the record's {}): not \
@@ -396,6 +430,19 @@ impl DiskLock {
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => Err(e),
         }
+    }
+}
+
+impl DiskLock {
+    /// The lock file opened without the lock: the negative control's helper that does not
+    /// stop at a held `flock` ([`crate::fault::Fault::NoFlock`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn unheld(path: &Path) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        Ok(Self { file })
     }
 }
 

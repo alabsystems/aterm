@@ -16,19 +16,40 @@ use crate::error::{Error, Result};
 /// a binary tree as `zstd -19`'s is.
 pub const LEVEL: u8 = aterm_zstd::encode::LEVEL_MAX;
 
-/// Every pack's window, as a power of two: the widest the client's decoder accepts
-/// (`aterm_zstd::frame::WINDOW_MAX`, which libzstd's default decoder accepts too), so a
-/// repeat anywhere in the last 128 MiB of a pack's tar stream is one match.
+/// The widest window a pack declares, as a power of two: the widest the client's decoder
+/// accepts (`aterm_zstd::frame::WINDOW_MAX`, which libzstd's default decoder accepts too),
+/// so a repeat anywhere in the last 128 MiB of a pack's tar stream is one match.
 ///
-/// RFC 8878 §3.1.1.1.2 recommends that an encoder not need a window over 8 MB and leaves a
-/// decoder free to refuse one. A pack departs from that for its ratio (the trust pack 8%
-/// under `zstd -19`'s 2^23 frame), because every client that installs packs takes 2^27:
-/// atpkg's own decoder, and libzstd's default limit before it. A streamed frame declares
-/// its window before its length is known (§3.1.1.1.1.2: no Single_Segment_Flag without a
-/// Frame_Content_Size), so a decoder held to 8 MB refuses every pack whose tar outgrows one
-/// block, and the client's decoder holds up to 128 MiB of window while it decodes one
-/// (it grows the window only as far as the stream reaches).
-pub const WINDOW_LOG: u8 = aterm_zstd::encode::WINDOW_LOG_MAX;
+/// A pack declares the smallest window that holds its tar stream ([`options`]), and only a
+/// stream longer than 2^27 bytes declares this one. RFC 8878 §3.1.1.1.2 recommends that an
+/// encoder not need a window over 8 MB and leaves a decoder free to refuse one: a pack whose
+/// tar is within 8 MiB never needs more, and a longer one departs from that for its ratio
+/// (the trust pack 8% under `zstd -19`'s 2^23 frame), because every client that installs
+/// packs takes 2^27: atpkg's own decoder, and libzstd's default limit before it.
+pub const WINDOW_LOG_MAX: u8 = aterm_zstd::encode::WINDOW_LOG_MAX;
+
+/// The encoder's options for a pack whose tar stream is `len` bytes: [`LEVEL`], a content
+/// checksum, and the smallest window that holds the stream.
+///
+/// A stream within `aterm_zstd::frame::WINDOW_MAX` declares its length, so its frame is a
+/// single segment whose window is the stream itself (RFC 8878 §3.1.1.1.2: a single
+/// segment's Window_Size is its Frame_Content_Size), and the encoder works in the smallest
+/// power of two that holds it. A longer stream is streamed under the [`WINDOW_LOG_MAX`]
+/// window with no declared size: these are the options every pack was compressed with
+/// before the window was fitted, so such a pack's frame is the bytes it was.
+#[must_use]
+pub fn options(len: u64) -> aterm_zstd::encode::Options {
+    let options = aterm_zstd::encode::Options::new()
+        .level(LEVEL)
+        .checksum(aterm_zstd::frame::Checksum::Xxh64);
+    if len > aterm_zstd::frame::WINDOW_MAX as u64 {
+        return options.window_log(WINDOW_LOG_MAX);
+    }
+    // `window_log` raises a log under 10 to the format's smallest window.
+    let fit =
+        u8::try_from(len.max(1).next_power_of_two().trailing_zeros()).unwrap_or(WINDOW_LOG_MAX);
+    options.window_log(fit).content_size(len)
+}
 
 /// What [`write`](fn@write) produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,7 +95,9 @@ enum Member {
 /// What compresses a pack's tar stream into its asset.
 pub trait Compressor {
     /// Write the zstd frames of the stream `tar` writes into `asset` (an empty file open
-    /// for writing).
+    /// for writing). The stream is `len` bytes, known before its first byte: the tar
+    /// writer sizes it from its plan, and a file that changed size since fails `tar`
+    /// before the stream passes `len`.
     ///
     /// # Errors
     ///
@@ -83,11 +106,12 @@ pub trait Compressor {
     fn compress(
         &self,
         asset: &std::fs::File,
+        len: u64,
         tar: &mut dyn FnMut(&mut dyn Write) -> io::Result<()>,
     ) -> io::Result<()>;
 }
 
-/// aterm-zstd's encoder at [`LEVEL`] with a [`WINDOW_LOG`] window, in this process: the
+/// aterm-zstd's encoder, with the [`options`] of the stream's length, in this process: the
 /// compressor every shipped pack is written by. One frame with its content checksum; its
 /// bytes depend only on the stream (never on how the tar writer cuts its writes), so a
 /// tree packs to the same asset every time.
@@ -98,6 +122,7 @@ impl Compressor for Zstd {
     fn compress(
         &self,
         asset: &std::fs::File,
+        len: u64,
         tar: &mut dyn FnMut(&mut dyn Write) -> io::Result<()>,
     ) -> io::Result<()> {
         /// The encoder, with `flush` a no-op: the tar writer's last flush would otherwise
@@ -111,16 +136,13 @@ impl Compressor for Zstd {
                 Ok(())
             }
         }
-        let options = aterm_zstd::encode::Options::new()
-            .level(LEVEL)
-            .window_log(WINDOW_LOG)
-            .checksum(aterm_zstd::frame::Checksum::Xxh64);
         let mut encoder = Unflushed(aterm_zstd::encode::Encoder::new(
             io::BufWriter::with_capacity(1 << 20, asset),
-            options,
+            options(len),
         ));
         tar(&mut encoder)?;
-        // `finish` writes the last block and the checksum, and flushes the buffer.
+        // `finish` writes the last block and the checksum, and flushes the buffer; it
+        // refuses a stream of another length than the one declared.
         encoder.0.finish().map(drop)
     }
 }
@@ -150,6 +172,7 @@ impl Compressor for RawFrames {
     fn compress(
         &self,
         asset: &std::fs::File,
+        _len: u64,
         tar: &mut dyn FnMut(&mut dyn Write) -> io::Result<()>,
     ) -> io::Result<()> {
         /// Buffers the stream and writes one frame per `max` bytes of it.
@@ -393,10 +416,15 @@ impl<W: Write> Write for Counting<W> {
 }
 
 /// Writes the archive through `compressor` into `asset`; returns the tar stream's length.
+///
+/// The stream is sized before it is written ([`stream_len`]), from the plan alone: the
+/// compressor learns its length before the first byte with no second copy of it, in memory
+/// or on disk, so the producer's memory stays the encoder's own whatever the pack's size.
 fn encode(members: &[Member], asset: &Path, compressor: &dyn Compressor) -> io::Result<u64> {
+    let len = stream_len(members)?;
     let file = std::fs::File::create(asset)?;
     let (mut n, mut sum) = (0u64, 0u64);
-    compressor.compress(&file, &mut |input| {
+    compressor.compress(&file, len, &mut |input| {
         let mut out = Counting {
             inner: input,
             n: 0,
@@ -437,8 +465,53 @@ fn decodes_back(asset: &Path, n: u64, sum: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// The tar stream: every member, then the two zero records that end the archive.
+/// The tar stream: every member, then the two zero records that end the archive. Each
+/// file's body is exactly the size its plan read: a file that changed size since is
+/// refused before the stream passes the length [`stream_len`] gave.
 fn tar(out: &mut impl Write, members: &[Member]) -> io::Result<()> {
+    layout(out, members, &mut |out, path, size| {
+        let mut f = std::fs::File::open(path)?;
+        let copied = io::copy(&mut (&mut f).take(size), out)?;
+        if copied != size || f.read(&mut [0u8; 1])? != 0 {
+            let now = f.metadata().map_or(copied, |m| m.len());
+            return Err(io::Error::other(format!(
+                "{} changed size while it was archived ({size} → {now} bytes)",
+                path.display()
+            )));
+        }
+        Ok(())
+    })
+}
+
+/// The length of the stream [`tar`] writes, from the plan alone: the same layout, each
+/// file's body counted at its planned size and never read.
+fn stream_len(members: &[Member]) -> io::Result<u64> {
+    /// Counts what is written to it.
+    struct Len(u64);
+    impl Write for Len {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut len = Len(0);
+    layout(&mut len, members, &mut |len, _, size| {
+        len.0 += size;
+        Ok(())
+    })?;
+    Ok(len.0)
+}
+
+/// The archive's layout: every member's headers, each file's body by `body` (the file, its
+/// planned size) and its padding, then the two zero records that end the archive.
+fn layout<W: Write>(
+    out: &mut W,
+    members: &[Member],
+    body: &mut dyn FnMut(&mut W, &Path, u64) -> io::Result<()>,
+) -> io::Result<()> {
     for m in members {
         match m {
             Member::Dir(rel) => {
@@ -449,14 +522,7 @@ fn tar(out: &mut impl Write, members: &[Member]) -> io::Result<()> {
             Member::Link { rel, target } => entry(out, rel, b'1', 0o644, 0, Some(target))?,
             Member::File { rel, path, size } => {
                 entry(out, rel, b'0', mode_of(path), *size, None)?;
-                let mut f = std::fs::File::open(path)?;
-                let copied = io::copy(&mut f, out)?;
-                if copied != *size {
-                    return Err(io::Error::other(format!(
-                        "{} changed size while it was archived ({size} → {copied} bytes)",
-                        path.display()
-                    )));
-                }
+                body(out, path, *size)?;
                 pad(out, *size)?;
             }
         }

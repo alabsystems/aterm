@@ -138,6 +138,7 @@ impl Drop for RetireTicket<'_> {
 pub(crate) struct AskpassRequest {
     pub ticket: std::sync::Arc<AskpassTicket>,
     pub attribute_from: i32,
+    pub owned: Option<std::sync::Arc<crate::cpu_policy_authorization::Operation>>,
     pub command: String,
     pub invoker: String,
     pub reply: Sender<AskpassAnswer>,
@@ -239,7 +240,8 @@ impl Backoff {
     }
 }
 
-/// Park on the sheet's answer until it comes, the deadline passes, or the caller hangs up.
+/// Park on the sheet's answer until it comes, the ticket is cancelled, the deadline
+/// passes, or the caller hangs up.
 pub(crate) fn await_answer(
     recv: &Receiver<AskpassAnswer>,
     ticket: &AskpassTicket,
@@ -250,19 +252,21 @@ pub(crate) fn await_answer(
     let _retire = RetireTicket(ticket);
     let deadline = ticket.deadline;
     loop {
-        if now() >= deadline {
+        let observed_at = now();
+        if observed_at >= deadline {
             return public_reply("ERR askpass timeout\n");
         }
-        if hung_up() {
+        if !ticket.is_live(observed_at) || hung_up() {
             return public_reply("ERR askpass declined\n");
         }
         let wait = tick.min(deadline.saturating_duration_since(now()));
         match recv.recv_timeout(wait) {
             Ok(answer) => {
-                if !ticket.is_live(now()) {
+                let answered_at = now();
+                if answered_at >= deadline {
                     return public_reply("ERR askpass timeout\n");
                 }
-                if hung_up() {
+                if !ticket.is_live(answered_at) || hung_up() {
                     return public_reply("ERR askpass declined\n");
                 }
                 return reply_line(&answer);

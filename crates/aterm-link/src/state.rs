@@ -545,12 +545,38 @@ struct Posts {
     entry_on_media: bool,
     /// The size from which the next append rewrites it first ([`journal::COMPACT_AT`]).
     compact_at: u64,
+    /// What a stop's hand-off kept beside the files ([`journal::HANDED`]), where the journal's
+    /// judgement found no attach went past it since: the heads the adoption gives those files'
+    /// records ([`StateDir::adopt_legacy_posts`]).
+    handed: Option<journal::Index>,
 }
 
 impl Posts {
     fn index(&self) -> &journal::Index {
         static EMPTY: journal::Index = journal::Index::EMPTY;
         self.index.as_ref().unwrap_or(&EMPTY)
+    }
+
+    /// `pin`, an older build's file's reservation of post `id` of `sid`, with the head the
+    /// hand-off kept for that very reservation, if it kept one.
+    fn handed_pin(&self, sid: &str, id: u64, pin: PublishPin) -> PublishPin {
+        match self.handed.as_ref().and_then(|handed| handed.pin(sid, id)) {
+            Some(kept) if kept.without_head() == pin => kept.clone(),
+            _ => pin,
+        }
+    }
+
+    /// `entry`, an older build's file's record in flight, with the heads the hand-off kept for
+    /// that very record, if it kept them.
+    fn handed_entry(&self, entry: InFlight) -> InFlight {
+        let kept = self
+            .handed
+            .as_ref()
+            .and_then(|handed| handed.in_flight.get(&entry.pin.seq));
+        match kept {
+            Some(kept) if kept.without_head() == entry => kept.clone(),
+            _ => entry,
+        }
     }
 }
 
@@ -599,6 +625,12 @@ pub struct StateDir {
     copy_on_every_try: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     keep_refused_drops: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    hand_off_without_heads: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    adopt_after_attach: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    adopt_without_the_attach: std::sync::atomic::AtomicBool,
 }
 
 /// The filesystem operations one [`StateDir`] made, by kind (counted only in a test build,
@@ -659,6 +691,14 @@ pub(crate) struct PublishPin {
     pub original_off: Option<u64>,
     /// The original post within this session's key file, before any publish.
     pub owner: Option<u64>,
+    /// The log's head as the bridge knew it when it made the pin: any attempt's record lands
+    /// at or above it, where a retry reads it back from before it publishes again
+    /// (`Bridge::landed_at_its_pin`; none for an older build's pin, which is not read back).
+    /// NEVER IN THE TEXT FORM ([`PublishPin::render`]), which every build parses strictly: a
+    /// journal record carries it after its body ([`journal`]'s tail, which a reader of an
+    /// earlier build skips), and a stop's hand-off beside the files
+    /// ([`StateDir::hand_posts_to_files`]); a receipt's or key's pin file holds none.
+    pub at: Option<u64>,
 }
 
 impl PublishPin {
@@ -723,9 +763,12 @@ impl PublishPin {
             original,
             original_off,
             owner,
+            at: None,
         })
     }
 
+    /// The text form every build reads: never the head [`PublishPin::at`], which an earlier
+    /// build's strict parse refuses.
     fn render(&self) -> String {
         let mut line = self.seq.to_string();
         if self.via_key {
@@ -824,11 +867,39 @@ pub(crate) struct InFlight {
     pub body: Vec<u8>,
     /// The log this body was prepared on, the only one where a `re=` in it points.
     pub log: Option<astream_broker::LogIdentity>,
+    /// The log's head as the bridge knew it when it journaled the entry, on `log`: every
+    /// attempt's record lands at or above it. Where a replay reads its record back from
+    /// before it publishes again (`Bridge::landed_since`), since astream's dedup reaches
+    /// only the records at or above the base retention leaves. Kept as [`PublishPin::at`] is:
+    /// never in the text form.
+    pub at: Option<u64>,
+}
+
+impl PublishPin {
+    /// This pin as its text form holds it: without its head ([`PublishPin::at`]).
+    pub(crate) fn without_head(&self) -> Self {
+        Self {
+            at: None,
+            ..self.clone()
+        }
+    }
+}
+
+impl InFlight {
+    /// This entry as its text form holds it: without its head or its pin's.
+    pub(crate) fn without_head(&self) -> Self {
+        Self {
+            pin: self.pin.without_head(),
+            at: None,
+            ..self.clone()
+        }
+    }
 }
 
 impl InFlight {
     /// The three-line form, or the four with `log=`: what `inflight/<seq>` holds, and a journal
-    /// record's body after its head.
+    /// record's body after its head. Never the head [`InFlight::at`] (nor its pin's), which an
+    /// earlier build's strict parse refuses.
     pub(crate) fn render(&self) -> String {
         let mut text = format!(
             "{}\n{}\n{}",
@@ -859,6 +930,7 @@ impl InFlight {
             subject: subject.to_string(),
             body,
             log,
+            at: None,
         })
     }
 }
@@ -1249,6 +1321,12 @@ impl StateDir {
             copy_on_every_try: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             keep_refused_drops: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            hand_off_without_heads: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            adopt_after_attach: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            adopt_without_the_attach: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1263,6 +1341,30 @@ impl StateDir {
     #[cfg(test)]
     pub(crate) fn keep_refused_drops(&self, on: bool) {
         self.keep_refused_drops
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of a hand-off whose heads the disk refused: the journal goes all
+    /// the same ([`crate::sim::world::Mutant::HandOffWithoutTheHeads`]).
+    #[cfg(test)]
+    pub(crate) fn hand_off_without_heads(&self, on: bool) {
+        self.hand_off_without_heads
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of an attach that takes its incarnation before it takes a
+    /// hand-off's files into the journal ([`crate::sim::world::Mutant::AdoptAfterTheAttach`]).
+    #[cfg(test)]
+    pub(crate) fn adopt_after_attach(&self, on: bool) {
+        self.adopt_after_attach
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of an adoption that names no attach where the hand-off it takes
+    /// named one ([`crate::sim::world::Mutant::AdoptWithoutTheAttach`]).
+    #[cfg(test)]
+    pub(crate) fn adopt_without_the_attach(&self, on: bool) {
+        self.adopt_without_the_attach
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1737,9 +1839,27 @@ impl StateDir {
                 .attached
                 .is_some_and(|named| self.incarnation() > named)
                 && !matches!(self.torn_files_possible(), Ok(true));
+            posts.handed = self.read_handed();
             posts.judged = true;
         }
         Ok(posts)
+    }
+
+    /// WHAT A STOP'S HAND-OFF KEPT ([`journal::HANDED`]), judged as the journal is: kept where it
+    /// names the attach the dir's incarnation is still at, so no attach went past the files it
+    /// wrote since (a bridge of an older build takes an incarnation and names nothing, and may
+    /// have published a post the hand-off held in flight again, and retired it, so its head no
+    /// longer bounds only that post's copies); `None` where it is absent, damaged, names no
+    /// attach, or an attach went past it. Judged before the attach that adopts the files takes
+    /// its incarnation ([`StateDir::name_attach_in_posts`]).
+    fn read_handed(&self) -> Option<journal::Index> {
+        let bytes = self.read_regular(&self.path(journal::HANDED)).ok()??;
+        let read = journal::read(&bytes);
+        if matches!(read.end, journal::End::Fault { .. }) {
+            return None;
+        }
+        let named = read.index.attached?;
+        (self.incarnation() <= named).then_some(read.index)
     }
 
     /// An attach of this build takes incarnation `inc`: the journal names it
@@ -1749,12 +1869,30 @@ impl StateDir {
     /// open and written before the journal's next record, so an attach writes nothing to a
     /// journal that holds nothing (a stale verdict on it retires nothing).
     ///
+    /// Where a stop's hand-off kept heads that are still current, its files are taken into the
+    /// journal first ([`StateDir::posts`]), heads and all, before the lease moves past the attach
+    /// that hand-off names (item F4): an attach that took its incarnation and stopped before it
+    /// read the journal (its run record refused) left those heads stale for the next, whose
+    /// replay then published each record in flight again at its pin unread, twice past a cut
+    /// that dropped its key.
+    ///
     /// # Errors
-    /// The journal unreadable or damaged, or the name's write where it is written at once: the
-    /// open holds it all the same and rewrites the journal before its next record
+    /// The journal unreadable or damaged, the adoption's write (the heads still current for
+    /// the next attach), or the name's write where it is written at once: the open holds it
+    /// all the same and rewrites the journal before its next record
     /// ([`StateDir::append_post_frame`]), and the attach does not take the incarnation.
     fn name_attach_in_posts(&self, inc: u64) -> io::Result<()> {
+        #[cfg(test)]
+        let adopts_first = !self
+            .adopt_after_attach
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let adopts_first = true;
         let mut posts = self.judge_posts()?;
+        if adopts_first && posts.handed.is_some() {
+            drop(posts);
+            posts = self.posts()?;
+        }
         if posts.exists && !posts.index().holds_nothing() {
             return self.append_post_frame(&mut posts, journal::Frame::Attached(inc));
         }
@@ -2015,7 +2153,8 @@ impl StateDir {
     /// it) finds each post's reservation and each record in flight where it looks, and publishes
     /// none of them again under a fresh sequence. A bridge of this build takes them back at its
     /// first read ([`StateDir::adopt_legacy_posts`]), this one too if it goes on. A cut between
-    /// the files and the unlink leaves both, which that read takes as the same records. A stop
+    /// the files and the unlink leaves both, which that read takes as the same records; so does
+    /// a write of the heads the disk refuses, the journal kept for them. A stop
     /// calls it before its clean stop, which then flushes the files and the journal's directory
     /// under its record. The attach the journal named stays named in the open, for a journal
     /// created after. Returns how many records it wrote.
@@ -2045,6 +2184,34 @@ impl StateDir {
             return Err(e);
         }
         posts.file = None;
+        // The heads the files cannot hold, beside them for this build's adoption: a hint one an
+        // older build's attach went past is not taken. Where it cannot be written the journal
+        // stays beside the files, as a cut before the unlink leaves it, so a bridge of this
+        // build reads each record's head from the journal and reads it back before it publishes
+        // it again (item F4: unlinked, the next bridge published each again at its pin, and a
+        // cut that had dropped its key put a post or a receipt on the bus twice).
+        #[cfg(test)]
+        let keeps_journal = !self
+            .hand_off_without_heads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let keeps_journal = true;
+        if let Ok((handed, _)) = index.encode() {
+            if let Err(e) = self.replace_bytes_as(journal::HANDED, &handed, None, STATE_FILE_MODE) {
+                if keeps_journal {
+                    eprintln!(
+                        "aterm-link: the post journal's heads could not be kept beside the \
+                         files: {e}; the journal stays beside them for the next bridge to read \
+                         them back from"
+                    );
+                    return Ok(index.pins().count() + index.in_flight.len());
+                }
+                eprintln!(
+                    "aterm-link: the post journal's heads could not be kept beside the files: \
+                     {e}; the next bridge publishes those records again without reading them back"
+                );
+            }
+        }
         match self.remove_path(&self.path(journal::FILE)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => {
                 posts.dirty = true;
@@ -2059,6 +2226,7 @@ impl StateDir {
             }),
             judged: true,
             compact_at: journal::COMPACT_AT,
+            handed: Some(index.clone()),
             ..Posts::default()
         };
         Ok(index.pins().count() + index.in_flight.len())
@@ -2103,11 +2271,13 @@ impl StateDir {
                 posts.held_sent.insert(name.clone());
                 continue;
             };
-            if posts.index().pin(sid, id) != Some(&pin) {
+            // The journal may hold the very record with its head (a cut between the hand-off's
+            // files and its unlink), kept as it is; one it does not hold takes the hand-off's.
+            if posts.index().pin(sid, id).map(PublishPin::without_head) != Some(pin.clone()) {
                 frames.push(journal::Frame::Reserve {
                     sid: sid.to_string(),
                     id,
-                    pin,
+                    pin: posts.handed_pin(sid, id, pin),
                 });
             }
             taken.push(rel);
@@ -2127,10 +2297,28 @@ impl StateDir {
                     .get_or_insert_with(|| self.path(rel).display().to_string());
                 continue;
             };
-            if posts.index().in_flight.get(&entry.pin.seq) != Some(&entry) {
-                frames.push(journal::Frame::InFlight(entry));
+            let held = posts.index().in_flight.get(&entry.pin.seq);
+            if held.map(InFlight::without_head) != Some(entry.clone()) {
+                frames.push(journal::Frame::InFlight(posts.handed_entry(entry)));
             }
             taken.push(rel);
+        }
+        // THE HAND-OFF'S ATTACH, NAMED WITH THE RECORDS IT KEPT HEADS FOR (item F4): a journal an
+        // adoption starts names no attach until this open's own takes its incarnation, and a
+        // hand-off of it before then (an attach that never came up) kept its heads under no
+        // attach, which the next attach refuses as naming nothing, publishing each record again
+        // at its pin unread, twice past a cut that dropped its key. The hand-off's own attach
+        // took the incarnation the dir is still at (its heads are current), so it is named.
+        #[cfg(test)]
+        let names_the_attach = !self
+            .adopt_without_the_attach
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let names_the_attach = true;
+        if names_the_attach && !frames.is_empty() && posts.index().attached.is_none() {
+            if let Some(named) = posts.handed.as_ref().and_then(|handed| handed.attached) {
+                frames.insert(0, journal::Frame::Attached(named));
+            }
         }
         if !frames.is_empty() || (posts.dirty && !taken.is_empty()) {
             for frame in frames {
@@ -2159,6 +2347,13 @@ impl StateDir {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
                 _ => {}
             }
+        }
+        // Every file the hand-off kept heads for is the journal's now. One left behind (a write
+        // that failed) is judged stale by the next attach's incarnation, never taken.
+        posts.handed = None;
+        let handed = self.path(journal::HANDED);
+        if std::fs::symlink_metadata(&handed).is_ok() {
+            let _ = self.remove_path(&handed);
         }
         Ok(())
     }
@@ -2233,6 +2428,7 @@ impl StateDir {
             original: None,
             original_off: Some(off),
             owner,
+            at: have.at,
         };
         let text = self
             .read_reservation(&format!("keys/{sid}"))?
@@ -2251,13 +2447,23 @@ impl StateDir {
     }
 
     /// What a moved generation resets in the reservations: each `original-off` the new log does
-    /// not vouch for (at or above `keep_below`, or any where it is `None`), taken out.
+    /// not vouch for (at or above `keep_below`, or any where it is `None`), taken out; and each
+    /// head ([`PublishPin::at`]) past where the new log continues the old, brought down to it, or
+    /// taken out where it continues none (aterm-link B05 review): a head is an offset of the log
+    /// the pin was made on, and past the fork the new log's offsets name records published
+    /// since, a copy a retry published there among them, so its read back starts at the fork;
+    /// on another log it bounds nothing, and the pin is published again as before.
     fn publication_offset_resets(&self, keep_below: Option<u64>) -> io::Result<OffsetResets> {
         let reset = |pin: &mut PublishPin| -> bool {
             let stale = pin
                 .original_off
                 .is_some_and(|off| keep_below.is_none_or(|f| off >= f));
-            stale && pin.original_off.take().is_some()
+            let off_reset = stale && pin.original_off.take().is_some();
+            let past = pin.at.is_some_and(|at| keep_below.is_none_or(|f| at > f));
+            if past {
+                pin.at = keep_below;
+            }
+            off_reset || past
         };
         let mut rewrites = Vec::new();
         let path = self.path("keys");
@@ -4258,6 +4464,7 @@ impl StateDir {
                 original: None,
                 original_off: None,
                 owner: None,
+                at: None,
             },
         )
     }
@@ -4329,6 +4536,7 @@ impl StateDir {
                 original: None,
                 original_off: None,
                 owner: None,
+                at: None,
             },
         )
         .map(|pin| pin.seq)
@@ -4859,6 +5067,7 @@ mod tests {
             original: None,
             original_off: None,
             owner: Some(1),
+            at: None,
         };
         st.set_post_pin("s-live", 1, &pin(3))
             .expect("a live reservation");
@@ -4867,6 +5076,7 @@ mod tests {
             subject: "/f/f/in/n-a/s-b/n-a/note".into(),
             body: b"v=1 t=1 text=live".to_vec(),
             log: None,
+            at: None,
         };
         st.set_in_flight(&entry).expect("a live record in flight");
         let journal = dir.join(journal::FILE);
@@ -5099,7 +5309,8 @@ mod tests {
 
     /// A STOP'S HAND-OFF TAKEN BACK (B19 review): the next open of this build takes the files a
     /// hand-off wrote back into the journal with barriers alone where they share its device (its
-    /// records on the media before the unlinks), never a full flush, and unlinks them; a file
+    /// records on the media before the unlinks), never a full flush, and unlinks them and the
+    /// heads the hand-off kept beside them ([`journal::HANDED`], B05 review); a file
     /// whose very record the journal holds already (a cut between the files and the journal's
     /// unlink) is unlinked with no write at all. Each open reads the journal once, counted.
     #[test]
@@ -5117,9 +5328,10 @@ mod tests {
         let spent = next.ops() - before;
         assert_eq!(
             (spent.fsyncs, spent.unlinks, spent.appends),
-            (0, 2, 2),
+            (0, 3, 2),
             "{spent:?}"
         );
+        assert!(!dir.join(journal::HANDED).exists());
         assert!((1..=2).contains(&spent.barriers), "{spent:?}");
         assert!(!dir.join("sent/s-a.1").exists() && !dir.join("inflight/7").exists());
         next.write("sent/s-a.1", "7")
@@ -5140,6 +5352,230 @@ mod tests {
         assert_eq!(third.in_flight().expect("reads").len(), 1);
         assert_eq!(third.ops().reads, reads, "the journal is read once an open");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A receipt's pin file and a key's pin line hold no head (aterm-link B05 review): every
+    /// build reads them, and a build before the heads parses them strictly.
+    #[test]
+    fn a_receipts_and_a_keys_pin_hold_no_head() {
+        let dir = scratch("pin-files");
+        let st = StateDir::open(&dir).expect("open");
+        let pin = PublishPin {
+            at: Some(42),
+            owner: Some(1),
+            ..in_flight_entry(9).pin
+        };
+        st.set_receipt_pin("s-a", 3, &pin).expect("a receipt's pin");
+        st.set_key_pin("s-a", "k", &pin).expect("a key's pin");
+        for file in ["acks/s-a.3", "keys/s-a"] {
+            let text = std::fs::read_to_string(dir.join(file)).expect("written");
+            assert!(!text.contains(" at "), "{file}: {text}");
+        }
+        assert_eq!(
+            st.receipt_pin("s-a", 3).expect("reads"),
+            Some(pin.without_head())
+        );
+        assert_eq!(
+            st.key_pin("s-a", "k").expect("reads"),
+            Some(pin.without_head())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A STOP'S HAND-OFF KEEPS THE HEADS THE FILES CANNOT HOLD** (aterm-link B05 review): the
+    /// files it writes hold each reservation and record in flight as a build before the heads
+    /// parses them (no ` at `, no `at=`), and the next attach of this build takes their heads back
+    /// from what it kept beside them. CONTROL: once an attach went past the hand-off (an older
+    /// build's, which names nothing), the files are taken without heads, so their records are
+    /// published again at their pins rather than read back from a head that may no longer bound
+    /// only their own copies; and the kept heads go with the adoption.
+    #[test]
+    fn a_hand_off_keeps_the_heads_the_files_cannot_hold() {
+        let headed = |seq: u64| InFlight {
+            pin: PublishPin {
+                at: Some(40),
+                ..in_flight_entry(seq).pin
+            },
+            at: Some(50),
+            ..in_flight_entry(seq)
+        };
+        for older_went_past in [false, true] {
+            let dir = scratch("handed-heads");
+            let st = StateDir::open(&dir).expect("open");
+            st.take_incarnation(0).expect("an attach of this build");
+            st.set_post_pin("s-a", 1, &headed(7).pin).expect("reserved");
+            st.set_in_flight(&headed(7)).expect("in flight");
+            assert_eq!(st.hand_posts_to_files().expect("handed"), 2);
+            for file in ["sent/s-a.1", "inflight/7"] {
+                let text = std::fs::read_to_string(dir.join(file)).expect("written");
+                assert!(
+                    !text.contains(" at ") && !text.contains("at="),
+                    "{file}: {text}"
+                );
+            }
+            assert_eq!(
+                PublishPin::parse(&std::fs::read_to_string(dir.join("sent/s-a.1")).unwrap())
+                    .expect("as a build before the heads parses it"),
+                headed(7).pin.without_head()
+            );
+            assert!(dir.join(journal::HANDED).exists());
+            drop(st);
+            if older_went_past {
+                let older = StateDir::open(&dir).expect("an older build's bridge");
+                let mut lease = older.lease().expect("a lease");
+                lease.used += 1;
+                older
+                    .write("inc-lease", &lease.render())
+                    .expect("its attach, which names nothing in the journal");
+            }
+            let next = StateDir::open(&dir).expect("the next bridge of this build");
+            next.take_incarnation(0).expect("its attach");
+            let (pin, entry) = if older_went_past {
+                (headed(7).pin.without_head(), headed(7).without_head())
+            } else {
+                (headed(7).pin, headed(7))
+            };
+            assert_eq!(next.post_pin("s-a", 1).expect("reads"), Some(pin));
+            assert_eq!(next.in_flight().expect("reads"), vec![(7, entry)]);
+            assert!(!dir.join(journal::HANDED).exists(), "taken with the files");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// **A HAND-OFF WHOSE HEADS THE DISK REFUSES KEEPS THE JOURNAL** (item F4): the files are
+    /// written and the heads beside them refused, so the journal stays beside the files, as a
+    /// cut before its unlink leaves it, and the next attach of this build takes each record
+    /// with its head from it, to read back before it publishes it again. CONTROL (the journal
+    /// unlinked all the same, `hand_off_without_heads`): the records come from the files
+    /// without heads and are published again at their pins, which the sim's asking world found
+    /// putting a post on the bus twice past a cut that dropped its key.
+    #[test]
+    fn a_hand_off_whose_heads_the_disk_refuses_keeps_the_journal() {
+        let headed = |seq: u64| InFlight {
+            pin: PublishPin {
+                at: Some(40),
+                ..in_flight_entry(seq).pin
+            },
+            at: Some(50),
+            ..in_flight_entry(seq)
+        };
+        for control in [false, true] {
+            let dir = scratch("handed-refused");
+            let st = StateDir::open(&dir).expect("open");
+            st.take_incarnation(0).expect("an attach of this build");
+            st.set_post_pin("s-a", 1, &headed(7).pin).expect("reserved");
+            st.set_in_flight(&headed(7)).expect("in flight");
+            st.hand_off_without_heads(control);
+            st.refuse_writes_of(Some(journal::HANDED));
+            assert_eq!(st.hand_posts_to_files().expect("handed"), 2);
+            assert!(
+                !dir.join(journal::HANDED).exists(),
+                "the heads were refused"
+            );
+            assert_eq!(
+                dir.join(journal::FILE).exists(),
+                !control,
+                "the journal stays beside the files only where it holds the heads alone"
+            );
+            drop(st);
+            let next = StateDir::open(&dir).expect("the next bridge of this build");
+            next.take_incarnation(0).expect("its attach");
+            let (pin, entry) = if control {
+                (headed(7).pin.without_head(), headed(7).without_head())
+            } else {
+                (headed(7).pin, headed(7))
+            };
+            assert_eq!(next.post_pin("s-a", 1).expect("reads"), Some(pin));
+            assert_eq!(next.in_flight().expect("reads"), vec![(7, entry)]);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// **AN ATTACH TAKES A HAND-OFF'S FILES BEFORE ITS INCARNATION** (item F4): the hand-off's
+    /// records go into the journal with their heads as the next attach names itself, so one
+    /// that stops once it took its incarnation (its run record refused) leaves them, heads and
+    /// all, for the attach after it. CONTROL (`adopt_after_attach`, the files left to a later
+    /// read): the attach after finds the heads stale and takes the records without them, to be
+    /// published again at their pins unread.
+    #[test]
+    fn an_attach_takes_a_hand_offs_files_before_its_incarnation() {
+        let headed = |seq: u64| InFlight {
+            pin: PublishPin {
+                at: Some(40),
+                ..in_flight_entry(seq).pin
+            },
+            at: Some(50),
+            ..in_flight_entry(seq)
+        };
+        for control in [false, true] {
+            let dir = scratch("handed-attach");
+            let st = StateDir::open(&dir).expect("open");
+            st.take_incarnation(0).expect("an attach of this build");
+            st.set_post_pin("s-a", 1, &headed(7).pin).expect("reserved");
+            st.set_in_flight(&headed(7)).expect("in flight");
+            assert_eq!(st.hand_posts_to_files().expect("handed"), 2);
+            drop(st);
+            let stopped = StateDir::open(&dir).expect("an attach that stops");
+            stopped.adopt_after_attach(control);
+            stopped.take_incarnation(0).expect("its incarnation");
+            drop(stopped);
+            let next = StateDir::open(&dir).expect("the attach after it");
+            next.take_incarnation(0).expect("its attach");
+            let (pin, entry) = if control {
+                (headed(7).pin.without_head(), headed(7).without_head())
+            } else {
+                (headed(7).pin, headed(7))
+            };
+            assert_eq!(next.post_pin("s-a", 1).expect("reads"), Some(pin));
+            assert_eq!(next.in_flight().expect("reads"), vec![(7, entry)]);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// **A HAND-OFF HANDED ON BEFORE ITS TAKER ATTACHED KEEPS ITS HEADS** (item F4): a bridge
+    /// that takes a hand-off's files into the journal and hands them on before its own attach
+    /// came up names the first hand-off's attach with them, so its own hand-off keeps their
+    /// heads under that attach and the next attach takes them. CONTROL
+    /// (`adopt_without_the_attach`): kept under no attach, the heads are refused and the records
+    /// taken without them.
+    #[test]
+    fn a_hand_off_handed_on_before_its_taker_attached_keeps_its_heads() {
+        let headed = |seq: u64| InFlight {
+            pin: PublishPin {
+                at: Some(40),
+                ..in_flight_entry(seq).pin
+            },
+            at: Some(50),
+            ..in_flight_entry(seq)
+        };
+        for control in [false, true] {
+            let dir = scratch("handed-on");
+            let st = StateDir::open(&dir).expect("open");
+            st.take_incarnation(0).expect("an attach of this build");
+            st.set_post_pin("s-a", 1, &headed(7).pin).expect("reserved");
+            st.set_in_flight(&headed(7)).expect("in flight");
+            assert_eq!(st.hand_posts_to_files().expect("handed"), 2);
+            drop(st);
+            let middle = StateDir::open(&dir).expect("a bridge whose attach never comes up");
+            middle.adopt_without_the_attach(control);
+            assert_eq!(
+                middle.in_flight().expect("taken in"),
+                vec![(7, headed(7))],
+                "PRECONDITION: the middle bridge takes the heads"
+            );
+            assert_eq!(middle.hand_posts_to_files().expect("handed on"), 2);
+            drop(middle);
+            let next = StateDir::open(&dir).expect("the next bridge");
+            next.take_incarnation(0).expect("its attach");
+            let (pin, entry) = if control {
+                (headed(7).pin.without_head(), headed(7).without_head())
+            } else {
+                (headed(7).pin, headed(7))
+            };
+            assert_eq!(next.post_pin("s-a", 1).expect("reads"), Some(pin));
+            assert_eq!(next.in_flight().expect("reads"), vec![(7, entry)]);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// THE SWEEP SALVAGES A DAMAGED JOURNAL (B19 review): after an unclean stop in an earlier
@@ -5537,6 +5973,7 @@ mod tests {
             }),
             original_off: Some(0),
             owner: Some(1),
+            at: Some(42),
         };
         st.set_post_pin("s-a", 1, &pin).unwrap();
         assert_eq!(
@@ -5550,6 +5987,8 @@ mod tests {
             "17 garbage",
             "17 owner 1 owner 2",
             "17 original-off nope",
+            "17 at nope",
+            "17 at 1 at 2",
         ] {
             st.write("sent/s-a.1", damaged).unwrap();
             assert_eq!(
@@ -5642,10 +6081,12 @@ mod tests {
                 original: None,
                 original_off: None,
                 owner: Some(3),
+                at: None,
             },
             subject: "/f/f/in/n-a/s-b/n-a/note".into(),
             body: body.to_vec(),
             log: None,
+            at: None,
         };
         let late = InFlight {
             log: Some(astream_broker::LogIdentity {
@@ -5859,10 +6300,12 @@ mod tests {
                 original: None,
                 original_off: None,
                 owner: None,
+                at: None,
             },
             subject: face.into(),
             body: format!("v=1 t=1 re={seq}").into_bytes(),
             log,
+            at: None,
         };
         st.set_in_flight(&entry(1, Some(a))).unwrap();
         st.set_in_flight(&entry(2, None)).unwrap();
@@ -5943,12 +6386,14 @@ mod tests {
             original: None,
             original_off,
             owner: None,
+            at: None,
         };
         let in_flight = |seq: u64, re: u64| InFlight {
             pin: PublishPin { seq, ..pin(None) },
             subject: "/f/f/in/n-a/s-b/n-a/answer".into(),
             body: format!("v=1 t=1 re={re}").into_bytes(),
             log: Some(old),
+            at: None,
         };
         let deadline = |off| Deadline {
             off,
@@ -6092,10 +6537,12 @@ mod tests {
                 original: None,
                 original_off: None,
                 owner: None,
+                at: None,
             },
             subject: "/f/f/in/n-a/s-b/n-a/ack".into(),
             body: format!("v=1 t=1 re={re}").into_bytes(),
             log: Some(log(generation)),
+            at: None,
         };
         let fill = |st: &StateDir| {
             st.set_in_flight(&entry(1, 40, 0)).unwrap();
@@ -7190,10 +7637,12 @@ mod tests {
                 original: None,
                 original_off: None,
                 owner: None,
+                at: None,
             },
             subject: "/f/sim/in/n-1/s-a/n-1/note".to_string(),
             body: b"v=1 t=5 text=hello".to_vec(),
             log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
+            at: None,
         }
     }
 

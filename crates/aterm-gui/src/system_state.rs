@@ -17,7 +17,7 @@ use aterm_grapheme::GraphemeClusters;
 use aterm_secrets::SecretBytes;
 use aterm_types::macos_setup::{
     Access, FailureKind, Group, Observation, PassOutcome, Plan, PutBack, RestoreOutcome, Selection,
-    Setting, Standing, Subject, TRIED_TWICE, Unfinished,
+    Setting, Standing, Subject, SyncKind, TRIED_TWICE, Unfinished,
 };
 
 use crate::native_app::{
@@ -1313,6 +1313,14 @@ pub(crate) fn row_slug(subject: Subject) -> &'static str {
             Setting::Secrets => "secrets",
             Setting::Repositories => "repositories",
         },
+        Subject::Sync(kind) => match kind {
+            SyncKind::Peers => "sync-peers",
+            SyncKind::Identity => "sync-identity",
+            SyncKind::Fleet => "sync-fleet",
+            SyncKind::Accounts => "sync-accounts",
+            SyncKind::SharedData => "sync-shared-data",
+            SyncKind::Name => "sync-name",
+        },
     }
 }
 
@@ -1395,6 +1403,9 @@ pub(crate) fn manages(selection: Selection, subject: Subject) -> bool {
             selection.contains(Setting::Permissions) && access.needed_for(selection)
         }
         Subject::Setting(setting) => selection.contains(setting),
+        // A Sync row manages nothing of its own: it rides Secrets and reads as not-applicable
+        // until SYNC-1 fills its behaviour, so it never counts toward the page's managed rows.
+        Subject::Sync(_) => false,
     }
 }
 
@@ -1494,6 +1505,8 @@ fn row_view_as(
         && match subject {
             Subject::Access(access) => status.access_step.is_none_or(|step| step == access),
             Subject::Setting(_) => true,
+            // A Sync row rides Secrets, so it is busy whenever that stage runs.
+            Subject::Sync(_) => true,
         };
     // A row that will change changes what the Mac has after the next login: a value live only
     // until then is no from-side, and the value saved for that login is (`Caps Lock →
@@ -1637,6 +1650,18 @@ fn row_view_as(
                 RowValue::One(wanted.clone()),
                 settled_chip,
                 format!("{name}: {wanted}, {settled_words}"),
+            )
+        }
+        // A row the person changed after aterm set it (design §6.9): no automatic pass sets it
+        // again, so it reads as they left it, under its note, with no chip saying it will
+        // change; Set up now sets it again.
+        Some(Standing::Differs)
+            if !busy && note.as_deref() == Some(aterm_types::macos_setup::CHANGED_BY_YOU) =>
+        {
+            (
+                RowValue::One(from.clone()),
+                None,
+                format!("{name}: {spoken_from}, changed by you"),
             )
         }
         // The probe's own note only (set above): never the description.
@@ -2407,6 +2432,34 @@ const VILLAGE_MIN_W: f32 = 200.0;
 
 /// How far the village's kitties walk in one page tick.
 const VILLAGE_TICK_MS: u64 = 120;
+
+/// §5.6 wake rule (pure): the setup page owes its own sub-second wake only while a
+/// run's village walks — a run going (`running`) on a shown page — and the hands are
+/// off the keys (`hands_off_keys`). Re-reads, offer answers and retries ride the
+/// worker's publications and the one-second status poll, each of which already wakes
+/// the loop (`system_state_host`'s `Host::deadline`), so a settled, finished or
+/// hidden page owes no animation tick and stands still ([`SystemStateApp::tick`]'s
+/// `walked`, the `running && shown` gate without `walks`, so a run whose motion is
+/// reduced still owes no idle wake once it ends).
+///
+/// `hands_off_keys` is the app-wide typing hold ([`crate::hands_off_keys`], a
+/// 2.5 s gap): while a key was typed that recently in a focused window, the walk's
+/// wake is held, so a motion frame never preempts an input frame (§5.6). The status
+/// poll still wakes the loop, so the walk resumes within a poll once the typing
+/// pauses; the walk clock itself ([`SystemStateApp::tick`]'s `walked`) only advances
+/// on a present that is already happening, never on a wake this gate suppressed.
+///
+/// The full motion engine of §5.1–5.5 (paint-only frames, the easing and pose
+/// vocabulary, `MotionPolicy`'s native-page gate) is MOT-1's; until it lands the
+/// page keeps today's static working glyph and content-path transitions, and this
+/// rule holds the idle wake at zero and holds the walk off the typing path.
+pub(crate) const fn page_owes_animation_wake(
+    running: bool,
+    shown: bool,
+    hands_off_keys: bool,
+) -> bool {
+    running && shown && hands_off_keys
+}
 
 /// How far one wheel line scrolls the page.
 const LINE_PX: f32 = 40.0;

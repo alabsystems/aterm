@@ -38,7 +38,11 @@ pub(crate) fn recovery_transition(
                 email: Some("owner@example.test".into()),
                 dir: Some(store.login_dir("account").unwrap().to_str().unwrap().into()),
                 vendor: accounts::Vendor {
-                    region: (cli == Cli::Kimi).then_some(Region::Global),
+                    region: (cli == Cli::Kimi).then_some(if matches!(state["case"], 29 | 30) {
+                        Region::MainlandCn
+                    } else {
+                        Region::Global
+                    }),
                     ..accounts::Vendor::default()
                 },
                 ..Row::default()
@@ -87,6 +91,7 @@ pub(crate) fn recovery_transition(
             fs::write(&login_file, b"private fixture").unwrap();
             accounts::write_renewal_checkpoint_for(
                 cli,
+                row.vendor.region,
                 "account",
                 "owner@example.test",
                 staging.to_str().unwrap(),
@@ -199,6 +204,7 @@ pub(crate) fn recovery_transition(
                     fs::write(login, b"current private fixture").unwrap();
                     accounts::write_renewal_checkpoint_for(
                         cli,
+                        row.vendor.region,
                         "account",
                         "owner@example.test",
                         expected_dir.to_str().unwrap(),
@@ -208,6 +214,28 @@ pub(crate) fn recovery_transition(
                         &store.load_logins(NOW).unwrap().0,
                     )
                     .unwrap();
+                }
+                27 | 29 if cli == Cli::Kimi => {
+                    let mut changed = row.clone();
+                    changed.vendor.region = Some(if state["case"] == 27 {
+                        Region::MainlandCn
+                    } else {
+                        Region::Global
+                    });
+                    fs::write(
+                        &path,
+                        accounts::append_rows_for(cli, "", &[changed]).unwrap(),
+                    )
+                    .unwrap();
+                }
+                28 => {
+                    let path = staging.join(accounts::RENEWAL_CHECKPOINT_FILE);
+                    let mut doc: Value =
+                        aterm_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+                    let object = doc.as_object_mut().unwrap();
+                    object.insert("schema".into(), Value::from(2));
+                    object.remove("region");
+                    fs::write(path, doc.to_string()).unwrap();
                 }
                 _ => {}
             }
@@ -275,7 +303,8 @@ pub(crate) fn recovery_transition(
 #[test]
 fn checkpoint_recovery_conforms_to_current_policy_for_every_provider() {
     let model = aterm_models_harness::account_recovery_policy_model();
-    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    assert_eq!(model.mutant_dials(), (1..=32).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 360);
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
@@ -306,4 +335,112 @@ fn checkpoint_recovery_conforms_to_current_policy_for_every_provider() {
     assert_eq!(stale["recovered"], 0);
     stale.insert("recovered", 1);
     assert!(!model.check_invariant("AdmissibleRecoveryOnly", &stale));
+    for case in [27, 28, 29] {
+        let mut rejected = model.init_state();
+        rejected.insert("provider", 4);
+        rejected.insert("case", case);
+        rejected.insert("phase", 1);
+        let mut forged = recovery_transition(&rejected, "Recover");
+        forged.insert("recovered", 1);
+        assert!(!model.check_invariant("AdmissibleRecoveryOnly", &forged));
+        rejected.insert("provider", 2);
+        let mut refused = recovery_transition(&rejected, "Recover");
+        refused.insert("recovered", 0);
+        assert!(!model.check_invariant("AdmissibleRecoverySucceeds", &refused));
+    }
+}
+
+#[test]
+fn checkpoint_recovery_refuses_a_changed_kimi_account_region() {
+    for case in [27, 29] {
+        let mut state = aterm_models_harness::account_recovery_policy_model().init_state();
+        state.insert("provider", 4);
+        state.insert("case", case);
+        state.insert("phase", 1);
+        let next = recovery_transition(&state, "Recover");
+        assert_eq!(next["recovered"], 0, "case {case}");
+    }
+}
+
+#[test]
+fn checkpoint_region_encoding_rejects_missing_or_foreign_scope() {
+    let root = aterm_tempfile::TempDir::new().unwrap();
+    let mut index = 0;
+    for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
+        for region in [None, Some(Region::Global), Some(Region::MainlandCn)] {
+            let staging = root.path().join(index.to_string());
+            index += 1;
+            fs::create_dir(&staging).unwrap();
+            let checkpoint_path = staging.join(accounts::RENEWAL_CHECKPOINT_FILE);
+            let result = accounts::write_renewal_checkpoint_for(
+                cli,
+                region,
+                "account",
+                "owner@example.test",
+                staging.to_str().unwrap(),
+                None,
+                Some(accounts::Proof::Status),
+                NOW,
+                &accounts::Logins::default(),
+            );
+            let valid = (cli == Cli::Kimi) == region.is_some();
+            assert_eq!(result.is_ok(), valid, "{cli:?}: {region:?}");
+            if !valid {
+                assert!(!checkpoint_path.exists());
+                continue;
+            }
+            let actual = fs::canonicalize(&staging).unwrap();
+            assert_eq!(
+                accounts::read_renewal_checkpoint_for(cli, &staging, &actual, NOW)
+                    .unwrap()
+                    .region,
+                region
+            );
+            let original: Value =
+                aterm_json::from_str(&fs::read_to_string(&checkpoint_path).unwrap()).unwrap();
+            assert_eq!(
+                original["schema"].as_u64(),
+                Some(if cli == Cli::Kimi { 3 } else { 2 })
+            );
+            if cli != Cli::Kimi {
+                assert!(original.get("region").is_none());
+                continue;
+            }
+            for case in 0..7 {
+                let mut invalid = original.clone();
+                let object = invalid.as_object_mut().unwrap();
+                match case {
+                    0 => {
+                        object.remove("region");
+                    }
+                    1 => {
+                        object.insert("region".into(), Value::Null);
+                    }
+                    2 => {
+                        object.insert("region".into(), Value::from("unknown"));
+                    }
+                    3 => {
+                        object.insert("region".into(), Value::from(1));
+                    }
+                    4 => {
+                        object.insert("schema".into(), Value::from(2));
+                    }
+                    5 => {
+                        object.insert("schema".into(), Value::from(4));
+                    }
+                    6 => {
+                        object.insert("program".into(), Value::from("codex"));
+                    }
+                    _ => unreachable!(),
+                }
+                let bytes = invalid.to_string();
+                fs::write(&checkpoint_path, &bytes).unwrap();
+                assert!(
+                    accounts::read_renewal_checkpoint_for(cli, &staging, &actual, NOW).is_none(),
+                    "{region:?}: invalid case {case}"
+                );
+                assert_eq!(fs::read_to_string(&checkpoint_path).unwrap(), bytes);
+            }
+        }
+    }
 }

@@ -5,4 +5,4 @@
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use aterm_uds::network::RouteChanges;
-pub use aterm_uds::network::{InterfaceAddress, interfaces};
+pub use aterm_uds::network::{InterfaceAddress, default_gateway_hw, interfaces};

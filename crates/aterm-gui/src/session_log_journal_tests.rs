@@ -756,6 +756,52 @@ fn eio_eacces_eintr_and_eagain_each_do_what_the_table_says() {
     assert_eq!(rig.report.attention().1, Attention::Stopped(Cause::Denied));
 }
 
+/// Every flush the journal makes is best effort: one that fails (`EIO`: a segment's, the
+/// directory's) is counted and the writer goes on, nothing paused, its quit written whole;
+/// one the volume refuses (`ENOTSUP`) is not counted. With the flushes' outcomes dropped,
+/// as before, nothing was counted.
+#[test]
+fn a_failed_flush_is_counted_and_the_journal_goes_on() {
+    let flushes = |rig: &Rig| rig.report.err_flush.load(Ordering::Relaxed);
+    let rig = Rig::new();
+    let tl = rig.sessions.add("s-flush");
+    let mut w = rig.writer();
+    rig.fs.state().flush_fault = Some(libc::EIO);
+    assert!(w.pass() > 0, "the first segment is made and written");
+    let made = flushes(&rig);
+    assert!(
+        made >= 1,
+        "the new segment's directory flush failed and was counted"
+    );
+    assert!(matches!(w.state, State::Running));
+    assert_eq!(rig.report.attention().1, Attention::None, "nothing paused");
+    mark(&tl, 1);
+    assert!(w.pass() > 0, "the writer goes on");
+    w.finish(rig.clock.mono() + QUIT_BUDGET);
+    assert_eq!(
+        flushes(&rig),
+        made + 2,
+        "the quit's segment flush and its directory flush, each counted"
+    );
+    assert!(
+        rig.frames().iter().any(|f| matches!(
+            f,
+            Frame::End {
+                why: EndWhy::Quit,
+                ..
+            }
+        )),
+        "the quit is written whole"
+    );
+    let rig = Rig::new();
+    let _tl = rig.sessions.add("s-refused");
+    let mut w = rig.writer();
+    rig.fs.state().flush_fault = Some(libc::ENOTSUP);
+    assert!(w.pass() > 0);
+    w.finish(rig.clock.mono() + QUIT_BUDGET);
+    assert_eq!(flushes(&rig), 0, "a refusal is the volume's, not a failure");
+}
+
 #[test]
 fn without_flock_there_is_no_journal() {
     let rig = Rig::new();
@@ -783,6 +829,35 @@ fn low_free_space_pauses_before_enospc() {
     rig.fs.state().free = Some(u64::MAX);
     rig.clock.advance(BACKOFF_FIRST);
     assert!(w.pass() > 0);
+}
+
+/// C7 (ROBUST-1): with a segment open, the minute's cached free-space reading never lets the
+/// first pass out of a full volume's pause write under the floor; the pause holds, doubles,
+/// and ends only at a check that finds room.
+#[test]
+fn under_the_floor_an_open_segments_pause_holds_and_doubles() {
+    let rig = Rig::new();
+    let tl = rig.sessions.add("s-floor");
+    let mut w = rig.writer();
+    assert!(w.pass() > 0, "a segment is open");
+    rig.fs.state().free = Some(FREE_FLOOR - 1);
+    rig.clock.advance(FREE_CHECK_EVERY);
+    assert_eq!(w.pass(), 0, "the minute's check finds the floor");
+    assert_eq!(rig.report.attention().1, Attention::Paused(Cause::Full));
+    assert_eq!(w.wait(), Some(BACKOFF_FIRST));
+    rig.clock.advance(BACKOFF_FIRST + Duration::from_secs(1));
+    mark(&tl, 1);
+    assert_eq!(w.pass(), 0, "the first pass out reads the volume again");
+    assert_eq!(
+        rig.report.attention().1,
+        Attention::Paused(Cause::Full),
+        "the pause holds"
+    );
+    assert_eq!(w.wait(), Some(BACKOFF_FIRST * 2), "the pause doubled");
+    rig.fs.state().free = Some(u64::MAX);
+    rig.clock.advance(BACKOFF_FIRST * 2);
+    assert!(w.pass() > 0, "a check that finds room ends it");
+    assert_eq!(rig.report.attention().1, Attention::None);
 }
 
 #[test]
@@ -1236,6 +1311,25 @@ fn a_clean_quit_closes_its_journal_and_a_late_one_reads_as_a_crash() {
     assert!(!rig.frames().iter().any(|f| matches!(f, Frame::End { .. })));
     let v = rig.view("s-late");
     assert!(v.crashed, "a quit cut short reads as a crash");
+}
+
+/// A clean quit spends [`QUIT_BUDGET`] on the journal's last lines unless a dev build's seam names
+/// whole milliseconds above zero: no seam, zero or anything else keeps it.
+#[test]
+fn a_quit_spends_the_quit_budget_unless_the_seam_names_one() {
+    use std::ffi::OsStr;
+    assert_eq!(quit_budget_of(None), QUIT_BUDGET);
+    for word in ["", "0", "-5", "1.5", "soon", "60s"] {
+        assert_eq!(
+            quit_budget_of(Some(OsStr::new(word))),
+            QUIT_BUDGET,
+            "{word:?}"
+        );
+    }
+    assert_eq!(
+        quit_budget_of(Some(OsStr::new(" 60000 "))),
+        Duration::from_secs(60)
+    );
 }
 
 #[test]
@@ -2015,6 +2109,319 @@ fn a_burst_between_passes_writes_no_evicted_gap() {
         .filter(|f| matches!(f, Frame::Gap { .. }))
         .count();
     assert_eq!(gaps, 0, "nothing the writer could take was evicted");
+}
+
+/// C7 (ROBUST-2): a write that fails gives its take back ([`aterm_slog::Journaled::unwritten`]),
+/// so under pressure in the backoff the ring evicts what is on disk (open detail) before the
+/// unwritten closed detail the failed take held, and the retry writes all of it with no gap.
+#[test]
+fn a_failed_write_marks_nothing_journaled_and_the_retry_writes_no_gap() {
+    use aterm_slog::StepOut;
+    let rig = Rig::new();
+    let tl = rig.sessions.add("s-unwrit");
+    with_log(&tl, |log| {
+        *log = Log::with_limits(1, Limits::new(64, 1 << 20).expect("a ring"));
+        log.open_session(
+            Kind::Spawn,
+            Src::Aterm,
+            Conf::Exact,
+            Actor::Nobody,
+            Fields::new(),
+            at(0),
+        )
+        .expect("opens");
+    });
+    let step = |under: Node, ms: u64| {
+        with_log(&tl, |log| {
+            let s = log
+                .open(
+                    Open::new(Kind::Tool, Src::Transcript, Conf::Strong).under(under),
+                    at(ms),
+                )
+                .expect("a step");
+            log.close(
+                s,
+                Close::new(Out::Step(StepOut::Ok), Src::Transcript, Conf::Strong),
+                at(ms + 1),
+            )
+            .expect("closes");
+        });
+    };
+    let turn = with_log(&tl, |log| {
+        log.open(Open::new(Kind::Turn, Src::Screen, Conf::Strong), at(1))
+            .expect("a turn")
+    });
+    for i in 0..20 {
+        step(turn, 2 + 2 * i);
+    }
+    let mut w = rig.writer();
+    assert!(w.pass() > 0);
+    let on_disk = with_log(&tl, |log| log.last_seq());
+    assert_eq!(with_log(&tl, |log| log.journaled()), Some(on_disk));
+    rig.fs.fault(Some(Fault::Always(libc::ENOSPC)));
+    let run = cmd(&tl, 100);
+    for i in 0..5 {
+        step(run, 101 + 2 * i);
+    }
+    with_log(&tl, |log| {
+        log.close(
+            run,
+            Close::new(Out::Run(RunOut::Ok), Src::Shell, Conf::Exact),
+            at(120),
+        )
+        .expect("closes");
+    });
+    assert_eq!(w.pass(), 0, "the disk is full");
+    assert!(w.wait().is_some(), "backing off");
+    let noted = with_log(&tl, |log| log.journaled());
+    let mut ms = 200;
+    while with_log(&tl, |log| log.len()) < 64 {
+        mark(&tl, ms);
+        ms += 1;
+    }
+    mark(&tl, ms);
+    assert!(
+        with_log(&tl, |log| log.len()) < 65,
+        "the ring evicted (positive control)"
+    );
+    rig.fs.fault(None);
+    rig.clock.advance(BACKOFF_FIRST);
+    assert!(w.pass() > 0, "the retry writes");
+    let gaps: Vec<Frame> = rig
+        .frames()
+        .into_iter()
+        .filter(|f| matches!(f, Frame::Gap { .. }))
+        .collect();
+    assert!(
+        gaps.is_empty(),
+        "nothing the ring could keep was lost: {gaps:?}"
+    );
+    assert_eq!(
+        noted,
+        Some(on_disk),
+        "a write that failed marked none of its take journaled"
+    );
+    let v = rig.view("s-unwrit");
+    assert!(
+        all(&v.log)
+            .iter()
+            .any(|r| r.node == run && r.op == aterm_slog::Op::Close),
+        "the unwritten run's close reached the disk"
+    );
+}
+
+/// A session whose ring holds 64 records, its session node open.
+fn small_ring(rig: &Rig, sid: &str) -> Timeline {
+    let tl = rig.sessions.add(sid);
+    with_log(&tl, |log| {
+        *log = Log::with_limits(1, Limits::new(64, 1 << 20).expect("a ring"));
+        log.open_session(
+            Kind::Spawn,
+            Src::Aterm,
+            Conf::Exact,
+            Actor::Nobody,
+            Fields::new(),
+            at(0),
+        )
+        .expect("opens");
+    });
+    tl
+}
+
+/// A step under `under`, opened and closed: two records.
+fn step(tl: &Timeline, under: Node, ms: u64) {
+    with_log(tl, |log| {
+        let s = log
+            .open(
+                Open::new(Kind::Tool, Src::Transcript, Conf::Strong).under(under),
+                at(ms),
+            )
+            .expect("a step");
+        log.close(
+            s,
+            Close::new(
+                Out::Step(aterm_slog::StepOut::Ok),
+                Src::Transcript,
+                Conf::Strong,
+            ),
+            at(ms + 1),
+        )
+        .expect("closes");
+    });
+}
+
+/// An open turn holding twenty closed steps: 41 records of open detail.
+fn turn_of_steps(tl: &Timeline) {
+    let turn = with_log(tl, |log| {
+        log.open(Open::new(Kind::Turn, Src::Screen, Conf::Strong), at(1))
+            .expect("a turn")
+    });
+    for i in 0..20 {
+        step(tl, turn, 2 + 2 * i);
+    }
+}
+
+/// A closed run of five steps: twelve records, its steps closed detail (spent before open
+/// detail).
+fn closed_run(tl: &Timeline) {
+    let run = cmd(tl, 100);
+    for i in 0..5 {
+        step(tl, run, 101 + 2 * i);
+    }
+    with_log(tl, |log| {
+        log.close(
+            run,
+            Close::new(Out::Run(RunOut::Ok), Src::Shell, Conf::Exact),
+            at(120),
+        )
+        .expect("closes");
+    });
+}
+
+/// Marks until the ring evicts.
+fn marks_past_the_ring(tl: &Timeline) {
+    let mut ms = 200;
+    while with_log(tl, |log| log.len()) < 64 {
+        mark(tl, ms);
+        ms += 1;
+    }
+    mark(tl, ms);
+    assert!(
+        with_log(tl, |log| log.len()) < 65,
+        "the ring evicted (positive control)"
+    );
+}
+
+/// A burst the writer has not reached: a closed run, then marks until the ring evicts.
+fn burst_past_the_ring(tl: &Timeline) {
+    closed_run(tl);
+    marks_past_the_ring(tl);
+}
+
+fn gaps_of(rig: &Rig) -> Vec<Frame> {
+    rig.frames()
+        .into_iter()
+        .filter(|f| matches!(f, Frame::Gap { .. }))
+        .collect()
+}
+
+/// Run one pass on its own thread, its `write(2)` held at a barrier until `meanwhile` has run here
+/// (a burst appended, the timeline's lock taken, a fault set); what `meanwhile` returns is kept
+/// until the pass has returned.
+fn pass_held_at_its_write<R>(
+    rig: &Rig,
+    w: Writer<Sessions>,
+    meanwhile: impl FnOnce() -> R,
+) -> (Writer<Sessions>, usize) {
+    let barrier = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    rig.fs.fault(Some(Fault::Block(Arc::clone(&barrier))));
+    let before = rig.fs.state().entered;
+    let writer = std::thread::spawn(move || {
+        let mut w = w;
+        let n = w.pass();
+        (w, n)
+    });
+    let deadline = std::time::Instant::now() + HANG;
+    while rig.fs.state().entered == before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the writer never wrote"
+        );
+        std::thread::yield_now();
+    }
+    let kept = meanwhile();
+    {
+        let (lock, cv) = &*barrier;
+        *lock.lock().expect("barrier") = true;
+        cv.notify_all();
+    }
+    let out = writer.join().expect("the writer returns");
+    drop(kept);
+    out
+}
+
+/// C7's review: a write that lands while a producer holds its timeline's lock still leaves what
+/// it wrote spent first, so a burst before the next pass, smaller than the ring, loses nothing
+/// the writer could still write (DESIGN §5.3). The take marked it under its own hold; nothing
+/// after the write needs the lock.
+#[test]
+fn a_write_that_lands_on_a_busy_timeline_keeps_the_burst_after_it() {
+    let rig = Rig::new();
+    let tl = small_ring(&rig, "s-busyland");
+    let mut w = rig.writer();
+    assert!(w.pass() > 0, "the open path lands");
+    turn_of_steps(&tl);
+    let (mut w, wrote) = pass_held_at_its_write(&rig, w, || {
+        rig.fs.fault(None);
+        tl.lock().unwrap_or_else(|p| p.into_inner())
+    });
+    assert!(wrote > 0, "the steps landed");
+    let on_disk = with_log(&tl, |log| log.last_seq());
+    assert_eq!(
+        with_log(&tl, |log| log.journaled()),
+        Some(on_disk),
+        "what landed on a busy timeline is spent first"
+    );
+    burst_past_the_ring(&tl);
+    rig.clock.advance(Duration::from_secs(1));
+    assert!(w.pass() > 0, "the next pass writes");
+    let gaps = gaps_of(&rig);
+    assert!(
+        gaps.is_empty(),
+        "the burst after a busy write lost {gaps:?}"
+    );
+}
+
+/// C7's review: a burst while a write is under way spends the records that write took (they are
+/// in its buffer) before the ones it did not reach, so nothing the writer could still write is
+/// lost.
+#[test]
+fn a_burst_during_a_write_spends_what_the_write_took() {
+    let rig = Rig::new();
+    let tl = small_ring(&rig, "s-inflight");
+    let mut w = rig.writer();
+    assert!(w.pass() > 0, "the open path lands");
+    turn_of_steps(&tl);
+    let (mut w, wrote) = pass_held_at_its_write(&rig, w, || {
+        rig.fs.fault(None);
+        burst_past_the_ring(&tl);
+    });
+    assert!(wrote > 0, "the steps landed");
+    rig.clock.advance(Duration::from_secs(1));
+    assert!(w.pass() > 0, "the next pass writes the burst");
+    let gaps = gaps_of(&rig);
+    assert!(gaps.is_empty(), "a burst during the write lost {gaps:?}");
+}
+
+/// C7's review: a write that fails while a producer holds its timeline's lock gives its take back
+/// at once, without the lock, so the backoff's pressure never spends the unwritten records first.
+#[test]
+fn a_write_that_fails_on_a_busy_timeline_gives_its_take_back_at_once() {
+    let rig = Rig::new();
+    let tl = small_ring(&rig, "s-busyfail");
+    turn_of_steps(&tl);
+    let mut w = rig.writer();
+    assert!(w.pass() > 0, "the open path and the steps land");
+    let on_disk = with_log(&tl, |log| log.last_seq());
+    assert_eq!(with_log(&tl, |log| log.journaled()), Some(on_disk));
+    closed_run(&tl);
+    let (mut w, wrote) = pass_held_at_its_write(&rig, w, || {
+        rig.fs.fault(Some(Fault::Always(libc::ENOSPC)));
+        tl.lock().unwrap_or_else(|p| p.into_inner())
+    });
+    assert_eq!(wrote, 0, "the disk is full");
+    assert!(w.wait().is_some(), "backing off");
+    assert_eq!(
+        with_log(&tl, |log| log.journaled()),
+        Some(on_disk),
+        "the failed take was given back while its timeline was busy"
+    );
+    marks_past_the_ring(&tl);
+    rig.fs.fault(None);
+    rig.clock.advance(BACKOFF_FIRST);
+    assert!(w.pass() > 0, "the retry writes");
+    let gaps = gaps_of(&rig);
+    assert!(gaps.is_empty(), "the backoff lost {gaps:?}");
 }
 
 #[test]

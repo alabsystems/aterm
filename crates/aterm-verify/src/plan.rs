@@ -22,15 +22,13 @@ pub enum Lane {
     MainTarget,
     /// Target directory for stages awaiting [`StageId::TestCompile`] alongside [`StageId::Test`].
     AfterCompile,
-    /// `<target>/verify/tippy.noindex` for lint builds.
+    /// `<target>/verify/.ubd/tippy.noindex` for lint builds ([`lanes_dir`]).
     TippyTarget,
-    /// `<target>/verify/checkers.noindex` for `--features aterm-spec/checkers` test builds.
+    /// `<target>/verify/.ubd/checkers.noindex` for `--features aterm-spec/checkers` test builds.
     CheckersTarget,
-    /// `<target>/verify/gpu-oracle.noindex` for `--features wgpu-oracle` test builds.
-    GpuOracleTarget,
-    /// `<target>/verify/trust.noindex` for `ship check --export` release tools.
+    /// `<target>/verify/.ubd/trust.noindex` for `ship check --export` release tools.
     TrustTarget,
-    /// `<target>/verify/cells.noindex` for cross-target cells, wasm modules, and browser runs.
+    /// `<target>/verify/.ubd/cells.noindex` for cross-target cells, wasm modules, and browser runs.
     CellsTarget,
     /// `<root>/libc-oracle/target.noindex` for the per-checkout libc oracle workspace.
     LibcOracleTarget,
@@ -52,9 +50,8 @@ pub enum StageId {
     Census,
     /// Trust checkers over registered formal models (`spec-check`).
     SpecCheck,
-    /// Compiles `wgpu-oracle` tests (`--no-run`) in [`Lane::GpuOracleTarget`].
-    GpuOracleCompile,
-    /// Runs `aterm-gpu` tests with `wgpu-oracle` after [`Self::Test`].
+    /// Holds this host's GPU arm to its CPU twins, with the record of wgpu's frames a signal,
+    /// after [`Self::Test`], on its build in the main target.
     GpuOracle,
     /// Compiles `aterm-spec/checkers` tests (`--no-run`) in [`Lane::CheckersTarget`].
     CheckersCompile,
@@ -143,16 +140,27 @@ pub struct StageSpec {
     pub after_stages: Vec<StageId>,
 }
 
+/// The side lanes' build directories ([`SIDE_LANES`]), each `*.noindex`, live in
+/// `<target>/verify/.ubd`, a folder whose file events fseventsd drops (`aterm_tempfile::QUIET`):
+/// one checkout's lint lane gave it 4,983 file events in a 10-minute census, and a lane under
+/// `.ubd` gives it none.
+#[must_use]
+pub fn lanes_dir(ctx: &Ctx) -> PathBuf {
+    ctx.state_dir().join(aterm_tempfile::QUIET)
+}
+
+/// The side lanes' names, each a `<name>.noindex` directory in [`lanes_dir`].
+pub const SIDE_LANES: [&str; 4] = ["tippy", "checkers", "trust", "cells"];
+
 /// Target directory for `lane`'s cargo invocations, or `None` for [`Lane::Pure`].
 #[must_use]
 pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
-    let side = |name: &str| Some(ctx.state_dir().join(noindex(name)));
+    let side = |name: &str| Some(lanes_dir(ctx).join(noindex(name)));
     match lane {
         Lane::Pure => None,
         Lane::MainTarget | Lane::AfterCompile => Some(ctx.target_dir.clone()),
         Lane::TippyTarget => side("tippy"),
         Lane::CheckersTarget => side("checkers"),
-        Lane::GpuOracleTarget => side("gpu-oracle"),
         Lane::TrustTarget => side("trust"),
         Lane::CellsTarget => Some(cells_dir(ctx)),
         Lane::LibcOracleTarget => Some(ctx.root.join("libc-oracle").join(LIBC_ORACLE_TARGET)),
@@ -162,7 +170,36 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
 /// Directory for [`Lane::CellsTarget`] builds and browser frames.
 #[must_use]
 pub fn cells_dir(ctx: &Ctx) -> PathBuf {
-    ctx.state_dir().join(noindex("cells"))
+    lanes_dir(ctx).join(noindex("cells"))
+}
+
+/// THE SIDE LANES' OLD PLACE, emptied: each `<target>/verify/<lane>.noindex` the lanes built in
+/// before they moved into [`lanes_dir`] goes whole once no build holds its cargo locks
+/// (`atpkg::build_cache::remove_unbuilt`), one line each for the log; one a build holds stays for
+/// a later run. Nothing of this version builds there.
+#[cfg(unix)]
+#[must_use]
+pub fn retire_old_lanes(ctx: &Ctx) -> Vec<String> {
+    let mut said = Vec::new();
+    for name in SIDE_LANES {
+        let old = ctx.state_dir().join(noindex(name));
+        if !std::fs::symlink_metadata(&old).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        said.push(match atpkg::build_cache::remove_unbuilt(&old) {
+            Ok(true) => format!(
+                "removed {}: the {name} lane builds in {} now, out of fseventsd's stream",
+                old.display(),
+                lanes_dir(ctx).display()
+            ),
+            Ok(false) => format!(
+                "kept {}: a build holds its locks; a later run removes it",
+                old.display()
+            ),
+            Err(e) => format!("kept {}: it could not be removed ({e})", old.display()),
+        });
+    }
+    said
 }
 
 /// Planned stages for `ctx.checks` ([`crate::checks::stages_of`]) in declared order.
@@ -179,6 +216,11 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     let present: Vec<StageId> = v.iter().map(|s| s.id).collect();
     for s in &mut v {
         s.after_stages.retain(|id| present.contains(id));
+        // Independent build/test lanes would each spend the same CPU grant.
+        // Keep every stage and its bounds, but let a managed run spend it once.
+        if ctx.env.build_slot_held.is_some() {
+            s.exclusive = true;
+        }
     }
     v
 }
@@ -225,18 +267,13 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
                 Lane::AfterCompile,
             )
         },
-        spec(
-            StageId::GpuOracleCompile,
-            "gpu oracle compile (aterm-gpu's tests with wgpu-oracle, --no-run)",
-            Lane::GpuOracleTarget,
-        ),
         StageSpec {
             after_stages: vec![StageId::Test],
             ..spec(
                 StageId::GpuOracle,
-                "gpu oracle (aterm-gpu's tests with wgpu-oracle: the renderer against wgpu; \
-                 after the test run)",
-                Lane::GpuOracleTarget,
+                "gpu oracle (aterm-gpu's frame record: this host's arm against wgpu's \
+                 recorded frames; after the test run, on its build)",
+                Lane::MainTarget,
             )
         },
         spec(
@@ -387,17 +424,22 @@ mod tests {
             for (l, name) in [
                 (Lane::TippyTarget, "tippy.noindex"),
                 (Lane::CheckersTarget, "checkers.noindex"),
-                (Lane::GpuOracleTarget, "gpu-oracle.noindex"),
                 (Lane::TrustTarget, "trust.noindex"),
                 (Lane::CellsTarget, "cells.noindex"),
             ] {
-                assert_eq!(lane(l), target.join("verify").join(name), "{l:?}");
+                let quiet = target.join("verify").join(".ubd").join(name);
+                assert_eq!(lane(l), quiet, "{l:?}");
+                assert!(aterm_tempfile::is_quiet(&quiet), "{quiet:?}");
             }
             assert_eq!(
                 lane(Lane::LibcOracleTarget),
                 PathBuf::from("/repo/libc-oracle/target.noindex")
             );
             assert_eq!(lane(Lane::MainTarget), target);
+            assert!(
+                !aterm_tempfile::is_quiet(&target),
+                "the caller's target is theirs"
+            );
             assert_eq!(lane_dir(&c, Lane::Pure), None);
         }
     }
@@ -501,9 +543,15 @@ mod tests {
         let p = plan(&ctx(&RELEASE, Scope::workspace()));
         let at = |id| p.iter().position(|s| s.id == id).expect("planned");
         let none = vec![false; p.len()];
-        for compile in [StageId::GpuOracleCompile, StageId::CheckersCompile] {
-            assert!(ready(&p, &none, &none, 0, at(compile)), "{compile:?} at t0");
-        }
+        assert!(
+            ready(&p, &none, &none, 0, at(StageId::CheckersCompile)),
+            "the checkers compile at t0"
+        );
+        assert_eq!(
+            p[at(StageId::GpuOracle)].lane,
+            Lane::MainTarget,
+            "the oracle runs on the test run's build"
+        );
         let (test, oracle, checkers) = (
             at(StageId::Test),
             at(StageId::GpuOracle),
@@ -512,11 +560,7 @@ mod tests {
         assert_eq!(awaited(&p, oracle).collect::<Vec<_>>(), [test]);
         assert_eq!(awaited(&p, checkers).collect::<Vec<_>>(), [test, oracle]);
         let mut done = none.clone();
-        for id in [
-            StageId::TestCompile,
-            StageId::GpuOracleCompile,
-            StageId::CheckersCompile,
-        ] {
+        for id in [StageId::TestCompile, StageId::CheckersCompile] {
             done[at(id)] = true;
         }
         assert!(

@@ -167,7 +167,8 @@ fn a_failed_wake_open_keeps_both_names_for_a_later_release() {
 
 /// A dead owner's FIFO released while no reader holds it: a shell that resolved its link before
 /// the release and opens the FIFO while the release holds its wake gets through at once, and reads
-/// the end when the wake closes.
+/// the end when the wake closes, though a child this process forked while the wake was held has
+/// yet to exec (on Darwin, where the wake is close-on-fork).
 #[test]
 fn a_shell_opening_its_fifo_during_the_release_reads_the_end() {
     use std::io::Read as _;
@@ -207,11 +208,97 @@ fn a_shell_opening_its_fifo_during_the_release_reads_the_end() {
         );
         panic!("the shell's open waited: the release held no wake on the FIFO");
     }
+    #[cfg(target_vendor = "apple")]
+    let forked = Parked::fork();
     drop(wake);
     assert_eq!(
         read_rx.recv_timeout(MUST_HAPPEN),
         Ok(Ok(0)),
         "the shell reads the end once the wake closes"
     );
+    #[cfg(target_vendor = "apple")]
+    forked.release();
     shell.join().expect("the shell's thread");
+}
+
+/// A child forked from this process and parked before its exec, holding a copy of each of this
+/// process's descriptors that is not close-on-fork; it ends without an exec once released.
+#[cfg(target_vendor = "apple")]
+struct Parked {
+    go: Option<std::io::PipeWriter>,
+    spawner: Option<std::thread::JoinHandle<std::io::Result<std::process::Child>>>,
+}
+
+#[cfg(target_vendor = "apple")]
+impl Parked {
+    /// Fork the child, and return once it is parked.
+    fn fork() -> Self {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        let (mut forked_r, forked_w) = std::io::pipe().expect("pipe");
+        let (go_r, go_w) = std::io::pipe().expect("pipe");
+        let (forked_fd, go_fd, go_w_fd) =
+            (forked_w.as_raw_fd(), go_r.as_raw_fd(), go_w.as_raw_fd());
+        let spawner = std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("/usr/bin/true");
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            // SAFETY: the hook runs in the forked child before its exec and calls only
+            // async-signal-safe functions (close, write, read) on descriptors this closure keeps
+            // open across the spawn; it ends the child before any exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    libc::close(go_w_fd);
+                    if libc::write(forked_fd, b"f".as_ptr().cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let mut b = 0u8;
+                    while libc::read(go_fd, (&raw mut b).cast(), 1) < 0 {
+                        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                        {
+                            break;
+                        }
+                    }
+                    Err(std::io::Error::from_raw_os_error(libc::ECANCELED))
+                });
+            }
+            let spawned = cmd.spawn();
+            drop((forked_w, go_r));
+            spawned
+        });
+        let mut b = [0u8; 1];
+        forked_r.read_exact(&mut b).expect("the child forked");
+        Self {
+            go: Some(go_w),
+            spawner: Some(spawner),
+        }
+    }
+
+    /// End the child before its exec, and see it reaped.
+    fn release(mut self) {
+        drop(self.go.take());
+        let spawned = self
+            .spawner
+            .take()
+            .expect("forked")
+            .join()
+            .expect("the spawner");
+        assert_eq!(
+            spawned.err().and_then(|e| e.raw_os_error()),
+            Some(libc::ECANCELED),
+            "the child ended before its exec"
+        );
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+impl Drop for Parked {
+    fn drop(&mut self) {
+        drop(self.go.take());
+        if let Some(spawner) = self.spawner.take() {
+            let _ = spawner.join();
+        }
+    }
 }

@@ -4379,11 +4379,14 @@ fn api_retry_scenarios() -> Vec<Scenario> {
             });
         }
         let land = crate::supervise::policy::turn_end::LAND;
-        let retry = crate::supervise::policy::turn_end::wall_retry_text(
-            crate::supervise::policy::turn_end::RULE_API_RETRY,
-            aterm_phase::WallKind::Overloaded,
-            aterm_phase::Program::Claude,
-        );
+        // A 529 is an outage: its resume is the one line (v6 §14.17.5.2).
+        let retry = crate::supervise::policy::turn_end::cleared_text(
+            crate::supervise::policy::turn_end::Cleared::Outage(
+                crate::supervise::policy::turn_end::Outage::Overload,
+            ),
+            crate::supervise::policy::turn_end::Clearing::Blind,
+        )
+        .to_owned();
         let defense = [
             "⏺ Merged the parser into main and pushed it; every suite passes.",
             "",
@@ -4747,7 +4750,8 @@ fn person_scenarios() -> Vec<Scenario> {
         out.push(Scenario {
             name: format!("KI1016-P6 the act's answer Esc'd, then a person's exchange ({tag})"),
             t0: T0,
-            policy: default_policy(),
+            // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+            policy: land_policy(),
             host: None,
             beats,
             tail_s: 3 * HOUR,
@@ -5524,7 +5528,8 @@ fn sleep_in_person(what: &str, worked: i64, asleep: i64, left: bool) -> Scenario
     Scenario {
         name: format!("{what}: after an Esc"),
         t0: T0,
-        policy: default_policy(),
+        // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+        policy: land_policy(),
         host: None,
         beats,
         tail_s: 3 * HOUR,
@@ -5675,7 +5680,8 @@ fn sleep_before_person(work: i64, asleep: i64, adj: i64, left: bool) -> Scenario
     Scenario {
         name: format!("a person's {work} s turn, the Mac {mac} (adj {adj})"),
         t0: T0,
-        policy: default_policy(),
+        // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+        policy: land_policy(),
         host: None,
         beats,
         tail_s: 3 * HOUR,
@@ -5804,7 +5810,8 @@ fn exchange_then_sleeps(s1: i64, s2: i64) -> Scenario {
     Scenario {
         name,
         t0: T0,
-        policy: default_policy(),
+        // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+        policy: land_policy(),
         host: None,
         beats,
         tail_s: 3 * HOUR,
@@ -6416,9 +6423,12 @@ fn a_persons_exchange_read_running_by_the_loop_before_is_dated_from_that_read() 
         s.ctl.served = 0;
         let mut p = point_at(&s, reply, 102);
         p.screen.human = crate::supervise::screen::HumanInput::Ago(key_ms);
-        let _ = s
-            .turn_end_at_point(&p, None, &auto(30))
-            .expect("a decision");
+        // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+        let land = SuperviseOpts {
+            policy: land_policy(),
+            ..auto(30)
+        };
+        let _ = s.turn_end_at_point(&p, None, &land).expect("a decision");
         assert_eq!(
             s.turn_end.left_to_person(),
             left,
@@ -6940,12 +6950,12 @@ fn older_cells(sc: &Scenario, i: usize, journal: bool, restored: bool) -> (usize
     (cells, broken)
 }
 
+/// No outage wall's scenario is picked: an older build typed its own retry at one, whose rung its
+/// journal names, never this build's resume with the ledger's marks taken off.
 #[test]
 fn a_loop_after_an_older_builds_loop_types_as_that_loop_at_every_handoff() {
     let names = [
         "RS8-F3 short turns in a row to the ladder's top",
-        "API 529 met again at every rung, then taken, take window",
-        "API 500 met again at every rung, then taken",
         "O Opus bucket, no reset (met again, the ladder)",
         "D spend (met again, the ladder)",
         "R1 spend, take window, the read latency (the first read after the try 70 s on)",
@@ -6994,10 +7004,9 @@ fn a_loop_after_an_older_builds_loop_types_as_that_loop_at_every_handoff() {
     );
     let controls = [
         (names[0], "SOONER"),
-        (names[1], "SOONER"),
+        (names[3], "SOONER"),
         (names[5], "SOONER"),
-        (names[7], "SOONER"),
-        (names[11], "OTHER-TEXT"),
+        (names[9], "OTHER-TEXT"),
     ];
     let (_, broken) = run(
         &picked

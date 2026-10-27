@@ -3,7 +3,7 @@
 
 [package]
 # THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, as with
-# crates/aterm-cfg-if, crates/aterm-once-cell and crates/aterm-log-shim:
+# crates/aterm-cfg-if and crates/aterm-once-cell:
 # `[patch.crates-io]` matches on PACKAGE name, so the package must be called
 # `getrandom` to take ring's `getrandom = "0.2.10"` edge; the directory keeps
 # the `aterm-` prefix so nobody mistakes this for a vendored upstream.

@@ -1086,6 +1086,7 @@ impl App {
         let Some(menu) = self.autopilot_menu.take() else {
             return false;
         };
+        self.account_menu_read.close();
         self.request_menu_frame(menu.wid);
         true
     }
@@ -1352,6 +1353,9 @@ impl App {
         let Some(menu) = self.autopilot_menu.as_mut().filter(|m| m.wid == wid) else {
             return false;
         };
+        if meaning != MenuKey::Inert {
+            self.account_menu_read.cancel_keyboard_selection();
+        }
         let shown = menu.rect.map_or(menu.rows.len(), |r| r.h.saturating_sub(2));
         match meaning {
             MenuKey::Inert => true,
@@ -1417,6 +1421,7 @@ impl App {
         let Some(menu) = self.autopilot_menu.as_ref().filter(|m| m.wid == wid) else {
             return false;
         };
+        self.account_menu_read.cancel_keyboard_selection();
         let (laid, cell) = (menu.laid, self.laid_cell_at(wid, menu.laid, x, y));
         let on_card = menu
             .rect
@@ -1468,14 +1473,17 @@ impl App {
 
     /// Update hover highlight and pointer rest state on mouse motion in `wid`.
     pub(crate) fn autopilot_menu_motion(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
-        let Some((rect, laid)) = self
+        let Some((rect, laid, moved)) = self
             .autopilot_menu
             .as_ref()
             .filter(|m| m.wid == wid)
-            .map(|m| (m.rect, m.laid))
+            .map(|m| (m.rect, m.laid, m.rest.px != Some((x, y))))
         else {
             return false;
         };
+        if moved {
+            self.account_menu_read.cancel_keyboard_selection();
+        }
         let cell = self.laid_cell_at(wid, laid, x, y);
         let Some(menu) = self.autopilot_menu.as_mut() else {
             return false;

@@ -150,12 +150,15 @@ impl Claim {
     /// `rows` claimed `kind`, shaped against `pins`, the policy's items in corpus order.
     /// # Errors
     /// The first [`ShapeFault`].
+    #[inline]
     pub fn shaped(kind: ClaimKind, rows: Vec<Row>, pins: &[ItemPin]) -> Result<Claim, ShapeFault> {
         let mut train_len = 0usize;
-        for p in pins {
-            if p.split() == CorpusSplit::Train {
+        let mut pi = 0;
+        while pi < pins.len() {
+            if pins[pi].split() == CorpusSplit::Train {
                 train_len += 1;
             }
+            pi += 1;
         }
         let fits = match kind {
             ClaimKind::Admitted => rows.len() == train_len,
@@ -169,7 +172,9 @@ impl Claim {
         }
         let last = rows.len().saturating_sub(1);
         let mut pin_idx = 0usize;
-        for (row, r) in rows.iter().enumerate() {
+        let mut row = 0;
+        while row < rows.len() {
+            let r = &rows[row];
             while pin_idx < pins.len() && pins[pin_idx].split() != CorpusSplit::Train {
                 pin_idx += 1;
             }
@@ -187,6 +192,7 @@ impl Claim {
             if r.wasted != r.ticks.saturating_sub(r.presented) {
                 return Err(ShapeFault::Wasted { row });
             }
+            row += 1;
         }
         Ok(Claim { kind, rows })
     }
@@ -213,6 +219,7 @@ impl Claim {
     }
 
     /// Its rows' `ΣT`, `ΣP`, `ΣZ`, summed as the evaluator sums a candidate's.
+    #[inline]
     #[must_use]
     pub const fn totals(&self) -> Totals {
         let rows = self.rows.as_slice();
@@ -244,6 +251,7 @@ impl Claim {
     /// Whether row `k` is `judged`, a row judged here.
     /// # Errors
     /// The first part it differs in ([`BundleField::Row`] when there is no row `k`).
+    #[inline]
     pub fn check(&self, k: usize, judged: &Row) -> Result<(), BundleField> {
         let Some(r) = self.rows.get(k) else {
             return Err(BundleField::Row);
@@ -255,16 +263,20 @@ impl Claim {
     }
 
     /// Its encoding: the kind's tag, the row count, then each row as a bundle row.
+    #[inline]
     pub fn encode(&self, e: &mut Enc) {
         encode_claim(e, self.kind, &self.rows);
     }
 }
 
+#[inline]
 fn encode_claim(e: &mut Enc, kind: ClaimKind, rows: &[Row]) {
     e.u8(kind.tag());
-    e.u64(u64::try_from(rows.len()).unwrap_or(u64::MAX));
-    for r in rows {
-        encode_row(e, r);
+    e.u64(rows.len() as u64);
+    let mut ri = 0;
+    while ri < rows.len() {
+        encode_row(e, &rows[ri]);
+        ri += 1;
     }
 }
 
@@ -280,6 +292,7 @@ impl RawClaim {
     /// Decoded from `d`: a count above [`MAX_ROWS`] is refused before any row is read.
     /// # Errors
     /// The first [`WireFault`].
+    #[inline]
     pub fn decode(d: &mut Dec<'_>) -> Result<RawClaim, WireFault> {
         let tag = d.u8("claim.kind")?;
         let kind = ClaimKind::from_tag(tag).ok_or(WireFault::BadTag {
@@ -288,13 +301,16 @@ impl RawClaim {
         })?;
         let count = d.count("claim.rows", MAX_ROWS)?;
         let mut rows = Vec::with_capacity(count);
-        for _ in 0..count {
+        let mut i = 0;
+        while i < count {
             rows.push(decode_row(d)?);
+            i += 1;
         }
         Ok(RawClaim { kind, rows })
     }
 
     /// Its encoding, as [`Claim::encode`]'s.
+    #[inline]
     pub fn encode(&self, e: &mut Enc) {
         encode_claim(e, self.kind, &self.rows);
     }
@@ -309,6 +325,7 @@ impl RawClaim {
     /// Shaped against `pins`.
     /// # Errors
     /// The first [`ShapeFault`].
+    #[inline]
     pub fn shaped(self, pins: &[ItemPin]) -> Result<Claim, ShapeFault> {
         Claim::shaped(self.kind, self.rows, pins)
     }
@@ -324,6 +341,7 @@ impl RawClaim {
 }
 
 impl From<Claim> for RawClaim {
+    #[inline]
     fn from(c: Claim) -> RawClaim {
         RawClaim {
             kind: c.kind,
@@ -425,16 +443,21 @@ pub struct Binary {
 
 impl ExecIdentity {
     /// The identity of `ev` in `binary`.
+    #[inline]
     #[must_use]
     pub fn of(ev: &Evaluator, binary: Binary) -> ExecIdentity {
         let build = ev.build().to_owned();
         let mut tested_assumptions = Vec::with_capacity(TESTED_ASSUMPTIONS.len());
-        for a in TESTED_ASSUMPTIONS {
-            tested_assumptions.push(a.to_owned());
+        let mut ai = 0;
+        while ai < TESTED_ASSUMPTIONS.len() {
+            tested_assumptions.push(TESTED_ASSUMPTIONS[ai].to_owned());
+            ai += 1;
         }
         let mut plan_assumptions = Vec::with_capacity(PLAN_ASSUMPTIONS.len());
-        for a in PLAN_ASSUMPTIONS {
-            plan_assumptions.push(a.to_owned());
+        let mut ai = 0;
+        while ai < PLAN_ASSUMPTIONS.len() {
+            plan_assumptions.push(PLAN_ASSUMPTIONS[ai].to_owned());
+            ai += 1;
         }
         ExecIdentity {
             policy: ev.policy().id().clone(),
@@ -459,6 +482,7 @@ impl ExecIdentity {
     }
 
     /// The first field, by name, in which `other` differs.
+    #[inline]
     #[must_use]
     pub fn first_difference(&self, other: &ExecIdentity) -> Option<&'static str> {
         let fields: [(&'static str, bool); 18] = [
@@ -490,15 +514,19 @@ impl ExecIdentity {
             ("executable", self.executable == other.executable),
             ("faults", self.faults == other.faults),
         ];
-        for (f, same) in fields {
+        let mut fi = 0;
+        while fi < fields.len() {
+            let (f, same) = fields[fi];
             if !same {
                 return Some(f);
             }
+            fi += 1;
         }
         None
     }
 
     /// Its encoding.
+    #[inline]
     pub fn encode(&self, e: &mut Enc) {
         e.artifact(&self.policy);
         e.artifact(&self.stranded_light);
@@ -523,6 +551,7 @@ impl ExecIdentity {
     /// Decoded from `d`.
     /// # Errors
     /// The first [`WireFault`].
+    #[inline]
     pub fn decode(d: &mut Dec<'_>) -> Result<ExecIdentity, WireFault> {
         Ok(ExecIdentity {
             policy: d.artifact("hello.policy")?,
@@ -547,31 +576,39 @@ impl ExecIdentity {
     }
 
     /// `Digest::of(EXEC_DOMAIN, [its encoding])`.
+    #[inline]
     #[must_use]
     pub fn digest(&self) -> Digest {
-        let mut e = Enc::new();
+        let mut e = Enc::with_capacity(2048);
         self.encode(&mut e);
         Digest::of(EXEC_DOMAIN, &[e.as_bytes()])
     }
 }
 
+#[inline]
 fn encode_strs(e: &mut Enc, v: &[String]) {
-    e.u64(u64::try_from(v.len()).unwrap_or(u64::MAX));
-    for s in v {
-        e.str(s);
+    e.u64(v.len() as u64);
+    let mut si = 0;
+    while si < v.len() {
+        e.str(&v[si]);
+        si += 1;
     }
 }
 
+#[inline]
 fn decode_strs(d: &mut Dec<'_>, field: &'static str, limit: u64) -> Result<Vec<String>, WireFault> {
     let n = d.count(field, limit)?;
     let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
+    let mut i = 0;
+    while i < n {
         out.push(d.str(field)?.to_owned());
+        i += 1;
     }
     Ok(out)
 }
 
 /// The id of the job that judges `plan` under the identity whose digest is `exec`.
+#[inline]
 #[must_use]
 pub fn job_id(exec: &Digest, kind: u8, plan: SchedulePlan) -> Digest {
     Digest::of(JOB_DOMAIN, &[&exec.0, &[kind], &plan.encode()])
@@ -579,13 +616,15 @@ pub fn job_id(exec: &Digest, kind: u8, plan: SchedulePlan) -> Digest {
 
 /// A claim's digest: its job id and the claim, without the worker's declared figures, so an
 /// honest late result equals the accepted one.
+#[inline]
 #[must_use]
 pub fn claim_digest(job: &Digest, claim: &RawClaim) -> Digest {
-    let mut e = Enc::new();
+    let mut e = Enc::with_capacity(2048);
     claim.encode(&mut e);
     Digest::of(CLAIM_DOMAIN, &[&job.0, e.as_bytes()])
 }
 
+#[inline]
 fn encode_token(e: &mut Enc, t: &Token) {
     e.u32(t.search);
     e.u32(t.slot);
@@ -593,6 +632,7 @@ fn encode_token(e: &mut Enc, t: &Token) {
     e.u32(t.worker);
 }
 
+#[inline]
 fn decode_token(d: &mut Dec<'_>) -> Result<Token, WireFault> {
     Ok(Token {
         search: d.u32("token.search")?,
@@ -701,6 +741,7 @@ pub enum FrameFault {
 }
 
 impl From<WireFault> for FrameFault {
+    #[inline]
     fn from(w: WireFault) -> FrameFault {
         FrameFault::Wire(w)
     }
@@ -745,6 +786,7 @@ pub enum Sender {
 
 impl Msg {
     /// Its tag.
+    #[inline]
     #[must_use]
     pub const fn tag(&self) -> u8 {
         match self {
@@ -758,6 +800,7 @@ impl Msg {
     }
 
     /// Who sends a message with `tag`.
+    #[inline]
     const fn sender(tag: u8) -> Option<Sender> {
         match tag {
             1 | 4 | 5 | 6 => Some(Sender::Worker),
@@ -767,9 +810,10 @@ impl Msg {
     }
 
     /// Its payload: the magic, the format, the tag, then the body.
+    #[inline]
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new();
+        let mut e = Enc::with_capacity(256);
         e.raw(&JOB_MAGIC);
         e.u8(JOB_FORMAT);
         e.u8(self.tag());
@@ -824,6 +868,7 @@ impl Msg {
     /// encoding back to `bytes`.
     /// # Errors
     /// The first [`FrameFault`].
+    #[inline]
     pub fn decode(bytes: &[u8], from: Sender) -> Result<Msg, FrameFault> {
         let mut d = Dec::new(bytes);
         if d.raw("job.magic", JOB_MAGIC.len()).ok() != Some(&JOB_MAGIC[..]) {
@@ -904,21 +949,24 @@ pub enum JobEnd {
 /// passing item's ordinal and able to stop the run. Reads no held-out item.
 /// # Errors
 /// The [`ShapeFault`] of a run whose rows are not a training run's (never, for this evaluator).
+#[inline]
 pub fn run_job(
     ev: &Evaluator,
     plan: SchedulePlan,
     keep: &mut dyn FnMut(usize) -> ControlFlow<()>,
 ) -> Result<JobEnd, ShapeFault> {
     let TrainingRows { rows, end } = ev.training_rows(plan, keep);
-    let at = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+    let at = rows.len().min(u16::MAX as usize) as u16;
     let kind = match end {
         TrainingEnd::Admitted => ClaimKind::Admitted,
         TrainingEnd::Refused(_) => ClaimKind::Refused,
         TrainingEnd::Stopped(()) => return Ok(JobEnd::Stopped { at }),
     };
     let mut plain_rows = Vec::with_capacity(rows.len());
-    for (_, r) in rows {
-        plain_rows.push(r);
+    let mut ri = 0;
+    while ri < rows.len() {
+        plain_rows.push(rows[ri].1.clone());
+        ri += 1;
     }
     Claim::shaped(kind, plain_rows, ev.policy().items()).map(JobEnd::Claimed)
 }
@@ -982,6 +1030,7 @@ impl std::error::Error for Refusal {}
 
 impl Refusal {
     /// Its name in a summary line.
+    #[inline]
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
@@ -1081,6 +1130,7 @@ pub struct Coordinator {
 
 impl Coordinator {
     /// A coordinator of `identity` under `limits`, judging with `pins`, the policy's items.
+    #[inline]
     #[must_use]
     pub fn new(identity: ExecIdentity, limits: Limits, pins: &[ItemPin]) -> Coordinator {
         Coordinator {
@@ -1143,6 +1193,7 @@ impl Coordinator {
     /// A new worker, or `None` past the limit.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn join(&mut self, now: Nanos) -> Result<Option<WorkerId>, ClockBackwards> {
         let w = self.ledger.join(now)?;
         if w.is_some() {
@@ -1154,14 +1205,18 @@ impl Coordinator {
     /// Opens the next search on `jobs` and leases the idle workers.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn begin(&mut self, jobs: &[Job], now: Nanos) -> Result<Vec<Action>, ClockBackwards> {
         let search = self.ledger.search().saturating_add(1);
-        let n = u32::try_from(jobs.len()).unwrap_or(u32::MAX);
+        let n = jobs.len().min(u32::MAX as usize) as u32;
         let mut effects = self.ledger.begin(search, n, now)?;
         if self.ledger.search() == search {
             let mut pairs = Vec::with_capacity(jobs.len());
-            for &j in jobs {
+            let mut ji = 0;
+            while ji < jobs.len() {
+                let j = jobs[ji];
                 pairs.push((j, job_id(&self.exec, KIND_TRAIN, j.plan)));
+                ji += 1;
             }
             self.jobs = pairs;
             self.claims = vec![None; jobs.len()];
@@ -1172,24 +1227,30 @@ impl Coordinator {
     }
 
     /// The current search's accepted claims, by slot, once it is complete.
+    #[inline]
     #[must_use]
     pub fn take_claims(&mut self) -> Vec<(u32, Claim)> {
         if self.ledger.outcome() != Outcome::Complete {
             return Vec::new();
         }
-        let taken = core::mem::take(&mut self.claims);
-        let mut out = Vec::with_capacity(taken.len());
-        for (c, (j, _)) in taken.into_iter().zip(&self.jobs) {
-            if let Some(c) = c {
+        let mut out = Vec::with_capacity(self.claims.len());
+        let mut ji = 0;
+        while ji < self.claims.len() {
+            if let Some(c) = self.claims[ji].take()
+                && let Some(&(j, _)) = self.jobs.get(ji)
+            {
                 out.push((j.slot, c));
             }
+            ji += 1;
         }
+        self.claims.clear();
         out
     }
 
     /// `w`'s event.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn on(
         &mut self,
         w: WorkerId,
@@ -1209,6 +1270,7 @@ impl Coordinator {
     /// A transport fault voids as its sender's frame fault, unless the sender is already gone: a
     /// worker this coordinator killed can leave a cut frame in its pipe, and nothing it sent after
     /// it was gone is read.
+    #[inline]
     fn broken(
         &mut self,
         w: WorkerId,
@@ -1222,6 +1284,7 @@ impl Coordinator {
         self.void_from(w, Refusal::Frame { worker: w, fault }, now)
     }
 
+    #[inline]
     fn frame(
         &mut self,
         w: WorkerId,
@@ -1272,6 +1335,7 @@ impl Coordinator {
         }
     }
 
+    #[inline]
     fn result(
         &mut self,
         w: WorkerId,
@@ -1331,6 +1395,7 @@ impl Coordinator {
     }
 
     /// Voids for `why`, found in `w`'s frame.
+    #[inline]
     fn void_from(
         &mut self,
         w: WorkerId,
@@ -1345,6 +1410,7 @@ impl Coordinator {
     }
 
     /// Records the ledger's own refusal, once it voided.
+    #[inline]
     fn note_ledger_void(&mut self) {
         if self.refusal.is_none()
             && let Outcome::Void(VoidBy::Ledger(r)) = self.ledger.outcome()
@@ -1356,6 +1422,7 @@ impl Coordinator {
     /// Expires what is due at `now`.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn tick(&mut self, now: Nanos) -> Result<Vec<Action>, ClockBackwards> {
         let mut effects = self.ledger.tick(now)?;
         effects.extend(self.ledger.assign(now)?);
@@ -1366,6 +1433,7 @@ impl Coordinator {
     /// Voids for `why`, found after the search (step 5) or by an interrupt.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn void(&mut self, why: Refusal, now: Nanos) -> Result<Vec<Action>, ClockBackwards> {
         let by = if why == Refusal::Interrupted {
             VoidBy::Interrupted
@@ -1380,10 +1448,14 @@ impl Coordinator {
     }
 
     /// The ledger's effects as the shell's actions.
+    #[inline]
     fn actions(&mut self, effects: Vec<Effect>, now: Nanos) -> Vec<Action> {
         self.note_ledger_void();
         let mut out = Vec::with_capacity(effects.len());
-        for e in effects {
+        let mut ei = 0;
+        while ei < effects.len() {
+            let e = effects[ei];
+            ei += 1;
             match e {
                 Effect::Lease(w, token) => {
                     if let Some(&(j, id)) = self.jobs.get(index(token.slot)) {

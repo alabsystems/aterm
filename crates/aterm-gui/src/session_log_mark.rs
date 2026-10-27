@@ -7,8 +7,10 @@ use super::SessionLog;
 
 impl SessionLog {
     /// THE `status` FIELDS (phase 3A), printed before the `gen=`/`seq=`/
-    /// `hash=` stamp: `log_seq=<n> log_ep=<e> run=<r|-> turn=<t|-> step=<p|->
-    /// need=<w|-> need_since_ms=<ms|->`.
+    /// `hash=` stamp: `log_seq=<n> log_ep=<e> log_base=<b> run=<r|-> turn=<t|-> step=<p|->
+    /// need=<w|-> need_since_ms=<ms|->` (`log_base=` the log's identity, `Log::base_ep`, which a
+    /// reader passes back as `base=` beside `since=`/`ep=` so another log's cursor resets, audit
+    /// fix C13).
     pub(crate) fn status_fields(&self, now_wall: u64) -> String {
         let log = &self.log;
         let st = log.reader_state();
@@ -21,9 +23,10 @@ impl SessionLog {
             .flatten()
             .find(|n| n.src != aterm_slog::Src::Mark);
         format!(
-            "log_seq={} log_ep={} run={} turn={} step={} need={} need_since_ms={}",
+            "log_seq={} log_ep={} log_base={} run={} turn={} step={} need={} need_since_ms={}",
             log.reader_last_seq(),
             log.ep(),
+            log.base_ep(),
             node(st.run()),
             node(st.turn()),
             node(st.step()),
@@ -733,8 +736,8 @@ pub(crate) fn cmd_mark(
 
 /// The `await log` usage line.
 pub(crate) const AWAIT_LOG_USAGE: &str = "ERR usage: await log <wait>[,<wait>...] \
-     [since=<seq> ep=<e>] [timeout=<ms>]; <wait> is need|open=<lvl>|close=<lvl>|kind=<k>, at \
-     most 4, any one answers; <lvl> is session|run|turn|step\n";
+     [since=<seq> ep=<e> [base=<log_base>]] [timeout=<ms>] [autopilot=<cruise|land|off|->]; <wait> is \
+     need|open=<lvl>|close=<lvl>|kind=<k>, at most 4, any one answers; <lvl> is session|run|turn|step\n";
 
 /// The most predicates one `await log` lists.
 pub(crate) const LOG_WAITS_MAX: usize = 4;
@@ -857,10 +860,11 @@ impl LogAwait {
     /// [`LOG_WAITS_MAX`] distinct members); `since=` with the `ep=` it came with, always
     /// (as `log` and `subscribe … since-log= log-ep=` take them: a cursor
     /// with no epoch is one no read can place, which would answer a reset gap
-    /// that never happened).
+    /// that never happened), and `base=` (`status log_base=`) only beside them: the log the
+    /// cursor is of, so a cursor of another log answers `OK gap why=reset`.
     pub(crate) fn parse(args: &[&str]) -> Result<LogAwait, &'static str> {
         let mut what: Option<LogWaits> = None;
-        let (mut since, mut ep) = (None, None);
+        let (mut since, mut ep, mut base) = (None, None, None);
         for tok in args {
             match tok.split_once('=') {
                 Some(("since", v)) if since.is_none() => {
@@ -869,15 +873,19 @@ impl LogAwait {
                 Some(("ep", v)) if ep.is_none() => {
                     ep = Some(v.parse::<u32>().map_err(|_| AWAIT_LOG_USAGE)?);
                 }
-                Some(("since" | "ep", _)) => return Err(AWAIT_LOG_USAGE),
+                Some(("base", v)) if base.is_none() => {
+                    base = Some(v.parse::<u32>().map_err(|_| AWAIT_LOG_USAGE)?);
+                }
+                Some(("since" | "ep" | "base", _)) => return Err(AWAIT_LOG_USAGE),
                 _ if what.is_none() => what = Some(LogWaits::parse(tok).ok_or(AWAIT_LOG_USAGE)?),
                 _ => return Err(AWAIT_LOG_USAGE),
             }
         }
         let what = what.ok_or(AWAIT_LOG_USAGE)?;
-        let since = match (since, ep) {
-            (None, None) => None,
-            (Some(s), Some(e)) => Some(aterm_slog::Cursor::new(e, s)),
+        let since = match (since, ep, base) {
+            (None, None, None) => None,
+            (Some(s), Some(e), None) => Some(aterm_slog::Cursor::new(e, s)),
+            (Some(s), Some(e), Some(b)) => Some(aterm_slog::Cursor::new(e, s).of_log(b)),
             _ => return Err(AWAIT_LOG_USAGE),
         };
         Ok(LogAwait { what, since })
@@ -933,12 +941,22 @@ impl SessionLog {
     /// it), a gap with no match among what the read returned (`OK gap why=
     /// lost= resync_to=<next> ep=` — `resync_to` the read's own `next`, so a
     /// wait re-armed there reads past the hole and never meets the same gap),
-    /// or the cursor to read on from.
+    /// or the cursor to read on from. A cursor that names its log (`base=`)
+    /// is answered with this log's `base=` after `ep=` and read on as this
+    /// log's, so a wait re-armed from a reset's reply reads on rather than
+    /// resetting again (audit fix C13); one that names none is answered as
+    /// before.
     pub(crate) fn await_check(&self, what: LogWaits, cursor: aterm_slog::Cursor) -> LogAwaitStep {
         let log = &self.log;
-        if log.reader_last_seq() == cursor.seq && log.ep() == cursor.ep {
+        if log.reader_last_seq() == cursor.seq
+            && log.ep() == cursor.ep
+            && !cursor.names_another_log(log.base_ep())
+        {
             return LogAwaitStep::Wait(cursor);
         }
+        let named = cursor
+            .base
+            .map_or_else(String::new, |_| format!(" base={}", log.base_ep()));
         let read = log.read(cursor, aterm_slog::MAX_RECORDS);
         if let Some(at) = read.recs.iter().position(|r| what.matches(r)) {
             let upto = log.read(cursor, at + 1);
@@ -949,20 +967,23 @@ impl SessionLog {
             let line = aterm_slog::encode(r, aterm_slog::Tier::Host)
                 .unwrap_or_else(|_| format!("{} {} {}", r.seq, r.op.word(), r.node));
             return LogAwaitStep::Answer(format!(
-                "OK seq={} ep={}{gap} {line}\n",
+                "OK seq={} ep={}{named}{gap} {line}\n",
                 r.seq, upto.next.ep
             ));
         }
         if let Some(g) = read.gap {
             return LogAwaitStep::Answer(format!(
-                "OK gap why={} lost={} resync_to={} ep={}\n",
+                "OK gap why={} lost={} resync_to={} ep={}{named}\n",
                 g.why.word(),
                 g.lost,
                 read.next.seq,
                 read.next.ep
             ));
         }
-        LogAwaitStep::Wait(read.next)
+        LogAwaitStep::Wait(match cursor.base {
+            Some(_) => read.next.of_log(log.base_ep()),
+            None => read.next,
+        })
     }
 
     /// ONE LOOK of an `await log` at an ended session (phase 3A review): the

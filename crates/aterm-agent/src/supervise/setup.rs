@@ -287,7 +287,8 @@ impl SessionSetup {
             short_backoff_max,
             retry_backoff,
             net_backoff,
-            down_hold,
+            outage_first,
+            outage_cap,
             progress,
             reset_grace,
             reset_jitter,
@@ -305,7 +306,6 @@ impl SessionSetup {
         w.duration("turn_end.short_backoff_max", *short_backoff_max);
         w.durations("turn_end.retry_backoff", retry_backoff);
         w.durations("turn_end.net_backoff", net_backoff);
-        w.duration("turn_end.down_hold", *down_hold);
         w.duration("turn_end.progress", *progress);
         w.duration("turn_end.reset_grace", *reset_grace);
         w.duration("turn_end.reset_jitter", *reset_jitter);
@@ -317,6 +317,8 @@ impl SessionSetup {
         w.duration("turn_end.take_within", *take_within);
         w.durations("turn_end.restart_backoff", restart_backoff);
         w.duration("turn_end.credits_bound", *credits_bound);
+        w.duration("turn_end.outage_first", *outage_first);
+        w.duration("turn_end.outage_cap", *outage_cap);
         w.opt_duration("person_hold_wait", *person_hold_wait);
         w.duration("beside_idle_min", *beside_idle_min);
         w.duration("occupancy.nudge_after", *occupancy_nudge_after);
@@ -414,7 +416,6 @@ impl SessionSetup {
             short_backoff_max: r.duration("turn_end.short_backoff_max")?,
             retry_backoff: r.durations("turn_end.retry_backoff")?,
             net_backoff: r.durations("turn_end.net_backoff")?,
-            down_hold: r.duration("turn_end.down_hold")?,
             progress: r.duration("turn_end.progress")?,
             reset_grace: r.duration("turn_end.reset_grace")?,
             reset_jitter: r.duration("turn_end.reset_jitter")?,
@@ -434,7 +435,18 @@ impl SessionSetup {
                 TurnEndTiming::default().credits_bound,
                 Reader::duration,
             )?,
+            outage_first: r.or_shipped(
+                "turn_end.outage_first",
+                TurnEndTiming::default().outage_first,
+                Reader::duration,
+            )?,
+            outage_cap: r.or_shipped(
+                "turn_end.outage_cap",
+                TurnEndTiming::default().outage_cap,
+                Reader::duration,
+            )?,
         };
+        r.retired_duration("turn_end.down_hold")?;
         let person_hold_wait = r.or_shipped("person_hold_wait", None, Reader::opt_duration)?;
         let beside_idle_min = r.or_shipped("beside_idle_min", WAIT_STEP, Reader::duration)?;
         let occupancy_nudge_after = r.or_shipped(

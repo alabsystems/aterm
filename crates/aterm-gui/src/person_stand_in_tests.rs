@@ -631,8 +631,8 @@ fn status_says_the_end_seen_and_cheered_apart() {
     assert_eq!(field(&line, "pause").as_deref(), Some("-"), "{line}");
     assert!(field(&line, "task_state").is_some(), "{line}");
     assert!(
-        line.contains(" land_since=- held=- end="),
-        "right after `pause=`, Land's hold (slice 3c) and the stop (3a): {line}"
+        line.contains(" land_since=- held=- waiting=- end="),
+        "right after `pause=`, Land's hold (slice 3c), the stop (3a) and the outage wait (12b): {line}"
     );
     let serial = app.harness_glass[&0].end().expect("an end").serial;
     assert!(

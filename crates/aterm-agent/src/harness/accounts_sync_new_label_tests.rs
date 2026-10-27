@@ -256,6 +256,7 @@ fn sync_case(case: i64, cli: Cli) -> (i64, i64, i64) {
         fs::write(&credential, b"{}").unwrap();
         accounts::write_renewal_checkpoint_for(
             cli,
+            (cli == Cli::Kimi).then_some(Region::Global),
             "restored",
             "new@example.com",
             staged.to_str().unwrap(),

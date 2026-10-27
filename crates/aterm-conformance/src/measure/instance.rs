@@ -141,7 +141,11 @@ pub fn first_exec(program: &Path) {
         .status();
 }
 
-/// A private `0700` directory under `/tmp`, removed on drop unless kept for a diagnostic read.
+/// A private `0700` directory under `/tmp` itself, removed on drop unless kept for a
+/// diagnostic read. It is made outside `/tmp`'s quiet folder (`aterm_tempfile::QUIET`, a dot
+/// folder): the instance's HOME, runtime dir and socket sit where an installed aterm's would,
+/// since its file wakes refuse a root under a dot folder, and what it measures stays what a
+/// person's aterm does.
 pub struct Scratch {
     path: PathBuf,
     /// The removal guard; `None` once kept.
@@ -155,6 +159,7 @@ impl Scratch {
     pub fn new(prefix: &str) -> std::io::Result<Self> {
         let dir = aterm_tempfile::Builder::new()
             .prefix(&format!("{prefix}-"))
+            .heard()
             .tempdir_in("/tmp")?;
         Ok(Self {
             path: dir.path().to_path_buf(),
@@ -407,6 +412,12 @@ impl Instance {
         Ok(inst)
     }
 
+    /// The instance's process id.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The last lines of the instance log, for a reason.
     #[must_use]
     pub fn log_tail(&self) -> String {
@@ -612,6 +623,18 @@ impl Ctl {
             ))
         })
     }
+}
+
+/// The session's replay checks as `temporal status` counts them, `witnessed=<n> diverged=<n>` (`-` for a count it does not report).
+#[must_use]
+pub fn replay_checks(ctl: &Ctl) -> String {
+    let reply = ctl.call(&["temporal", "status"]);
+    let line = if reply.ok() { reply.line() } else { "" };
+    format!(
+        "witnessed={} diverged={}",
+        field(line, "witnessed").unwrap_or("-"),
+        field(line, "diverged").unwrap_or("-")
+    )
 }
 
 /// The `key=value` token `key` of a reply line.

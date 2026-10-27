@@ -653,37 +653,51 @@ fn a_keeper_recovery_goes_on_counting_dropped() {
 /// the META carries the range the bridge told (`link gap`) with the log its offsets are on; the
 /// recovered session's `inbox` header names it and its log, which a keeper recovery starts over,
 /// marks it once (`mail-gap`), the broker's re-tell being a repeat; a bridge that reports another
-/// log forgets it. A META that names the range without its log, or the rung that sheds it,
-/// carries nothing. NEGATIVE CONTROL (run, B22 land): a `keeper_carry` that leaves the range out
-/// fails it.
+/// log forgets it. The session's own lane's range (`link gap … sid=<sid>`, B12) crosses beside
+/// it in a field of its own, named and marked the same way, a bridge's re-tell of either being a
+/// repeat. A META that names a range without its log, or the rung that sheds them, carries
+/// nothing. NEGATIVE CONTROL (run, B22 land): a `keeper_carry` that leaves the range out fails
+/// it. NEGATIVE CONTROL (run, B12 review): a `recovered_fabric` that reads only `given_up` fails
+/// it.
 #[cfg(unix)]
 #[test]
 fn a_keeper_recovery_goes_on_naming_the_given_up_mail() {
     with_link(|| {
         let store = new_store();
-        let (_sid, ctx) = registered(&store, 1);
+        let (sid, ctx) = registered(&store, 1);
         let generation = next_bridge_generation();
         bridge_attached(generation);
         let log = format!("{}.0", "ab".repeat(16));
         let link = |store: &Store, line: &str| cmd_link(store, line, Some(generation));
         assert_eq!(link(&store, &format!("log {log}")), "OK\n");
         assert_eq!(link(&store, "gap from=10 to=42 records=3"), "OK\n");
+        let lane_line = format!("gap from=50 to=60 sid={sid}");
+        assert_eq!(link(&store, &lane_line), "OK\n");
         let told = GivenUp {
             from: 10,
             to: 42,
             records: Some(3),
         };
+        let lane = GivenUp {
+            from: 50,
+            to: 60,
+            records: None,
+        };
         let carry = ctx.fabric.keeper_carry();
         assert_eq!(
-            (carry.given_up, carry.given_up_log.as_deref()),
-            (Some(told), Some(log.as_str())),
-            "the range, beside its log"
+            (
+                carry.given_up,
+                carry.lane_given_up,
+                carry.given_up_log.as_deref()
+            ),
+            (Some(told), Some(lane), Some(log.as_str())),
+            "both ranges, beside their log"
         );
         assert!(
-            carry.rungs()[1..]
-                .iter()
-                .all(|rung| rung.given_up.is_none() && rung.given_up_log.is_none()),
-            "every shed rung sheds it"
+            carry.rungs()[1..].iter().all(|rung| rung.given_up.is_none()
+                && rung.lane_given_up.is_none()
+                && rung.given_up_log.is_none()),
+            "every shed rung sheds them"
         );
         let screen = aterm_core::terminal::Terminal::new(24, 80).carry_meta_abandoning_partial();
         let meta = crate::seamless::keeper_meta_of(screen, Some(&carry)).expect("a META");
@@ -698,6 +712,7 @@ fn a_keeper_recovery_goes_on_naming_the_given_up_mail() {
             &recovered.carry,
         );
         let new_ctx = fresh.ctx.clone();
+        let new_lane_line = format!("gap from=50 to=60 sid={}", fresh.sid.as_str());
         successor.write().unwrap().register(fresh);
         let header = |ctx: &SessionCtx| {
             let out = cmd_inbox(ctx, "--peek");
@@ -711,35 +726,155 @@ fn a_keeper_recovery_goes_on_naming_the_given_up_mail() {
                 .filter(|r| r.k == aterm_slog::Kind::MailGap)
                 .count()
         };
-        assert!(
-            header(&new_ctx).ends_with(" given_up=@10..@42 given_up_count=3"),
-            "{}",
-            header(&new_ctx)
-        );
-        assert_eq!(marks(&new_ctx), 1, "the new log marks it");
+        let both = " given_up=@10..@42 given_up_count=3 lane_given_up=@50..@60";
+        assert!(header(&new_ctx).ends_with(both), "{}", header(&new_ctx));
+        assert_eq!(marks(&new_ctx), 2, "the new log marks each");
         assert_eq!(link(&successor, &format!("log {log}")), "OK\n");
         assert_eq!(link(&successor, "gap from=10 to=42"), "OK\n");
-        assert_eq!(marks(&new_ctx), 1, "the broker's re-tell is a repeat");
-        assert!(header(&new_ctx).contains(" given_up=@10..@42"));
+        assert_eq!(link(&successor, &new_lane_line), "OK\n");
+        assert_eq!(marks(&new_ctx), 2, "a re-tell of either is a repeat");
+        assert!(header(&new_ctx).ends_with(both), "{}", header(&new_ctx));
         let other = format!("{}.0", "cd".repeat(16));
         assert_eq!(link(&successor, &format!("log {other}")), "OK forgot=1\n");
         assert!(
             !header(&new_ctx).contains("given_up"),
-            "another log forgets it: {}",
+            "another log forgets them: {}",
             header(&new_ctx)
         );
 
         for meta in [
             &br#"{"fabric":{"given_up":{"from":1,"to":2}}}"#[..],
+            br#"{"fabric":{"lane_given_up":{"from":1,"to":2}}}"#,
             br#"{"fabric":{"given_up_log":"x"}}"#,
         ] {
             let recovered = crate::seamless::recovered_fabric(meta);
             assert_eq!(
-                (recovered.carry.given_up, recovered.carry.bus_log),
-                (None, None),
-                "the range is carried with its log or not at all"
+                (
+                    recovered.carry.given_up,
+                    recovered.carry.lane_given_up,
+                    recovered.carry.bus_log
+                ),
+                (None, None, None),
+                "a range is carried with its log or not at all"
             );
         }
+        let recovered = crate::seamless::recovered_fabric(
+            br#"{"fabric":{"lane_given_up":{"from":1,"to":2},"given_up_log":"x"}}"#,
+        );
+        assert_eq!(
+            (
+                recovered.carry.given_up,
+                recovered.carry.lane_given_up,
+                recovered.carry.bus_log.as_deref()
+            ),
+            (
+                None,
+                Some(GivenUp {
+                    from: 1,
+                    to: 2,
+                    records: None
+                }),
+                Some("x")
+            ),
+            "the lane's range alone, beside its log"
+        );
+    });
+}
+
+/// B12: WHAT THE BRIDGE'S OWN READ OF ONE SESSION'S LANE MET reaches that session's log through
+/// the real session: `link gap … sid=<sid>` marks `mail-gap off=<a> floor=<b>` as a node's
+/// give-up does and names the range in `inbox` in a field of its own (`lane_given_up=`);
+/// `… topic=<t>` marks it with the topic (`fp=`, `topic_name=`) and names it on the topic's
+/// `topic ls` row. A seamless update carries the lane's range (`FabricCarry::lane_given_up`,
+/// apart from the node's) and not the topic's, whose mark is what lasts. NEGATIVE CONTROL (run,
+/// B12): a projection that leaves `topic_name=` out fails it.
+#[cfg(unix)]
+#[test]
+fn a_scoped_give_up_marks_the_sessions_log_and_only_the_lanes_range_is_carried() {
+    with_link(|| {
+        let store = new_store();
+        let (sid, ctx) = registered(&store, 1);
+        let generation = next_bridge_generation();
+        bridge_attached(generation);
+        let link = |line: &str| cmd_link(&store, line, Some(generation));
+        assert_eq!(link(&format!("log {}.0", "ab".repeat(16))), "OK\n");
+        assert_eq!(ctx.fabric.topic_add("news", "@40", &ctx.timeline), Ok(true));
+        assert_eq!(link(&format!("gap from=10 to=20 sid={sid}")), "OK\n");
+        assert_eq!(
+            link(&format!("gap from=50 to=60 sid={sid} topic=news")),
+            "OK\n"
+        );
+
+        let gaps: Vec<_> = {
+            let g = ctx.timeline.lock().unwrap();
+            g.slog()
+                .log()
+                .window()
+                .filter(|r| r.k == aterm_slog::Kind::MailGap)
+                .map(|r| {
+                    let f = &r.f;
+                    (
+                        f.get_u(aterm_slog::Key::Off),
+                        f.get_u(aterm_slog::Key::Floor),
+                        f.get_str(aterm_slog::Key::TopicName).map(str::to_string),
+                        f.get(aterm_slog::Key::Fp).is_some(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            gaps,
+            [
+                (Some(10), Some(20), None, false),
+                (Some(50), Some(60), Some("news".to_string()), true),
+            ]
+        );
+        let header = |ctx: &SessionCtx| {
+            let out = cmd_inbox(ctx, "--peek");
+            out.lines().next().unwrap_or_default().to_string()
+        };
+        assert!(
+            header(&ctx).ends_with(" lane_given_up=@10..@20"),
+            "{}",
+            header(&ctx)
+        );
+        assert!(
+            cmd_topic(&*ctx, "ls").contains("topic news since=@40 given_up=@50..@60\n"),
+            "{}",
+            cmd_topic(&*ctx, "ls")
+        );
+
+        let mut budget = CARRY_MAIL_BYTES;
+        let carry = ctx.fabric.handoff_carry(&mut budget);
+        let told = GivenUp {
+            from: 10,
+            to: 20,
+            records: None,
+        };
+        assert_eq!(
+            (carry.given_up, carry.lane_given_up),
+            (None, Some(told)),
+            "the lane's range is carried, in its own field"
+        );
+        let successor = new_store();
+        let fresh = test_handle(1);
+        let next = fresh.ctx.clone();
+        successor.write().unwrap().register(fresh);
+        next.fabric.seed_carry(&carry, &next.timeline);
+        assert_eq!(
+            next.fabric.topic_add("news", "@40", &next.timeline),
+            Ok(true)
+        );
+        assert!(
+            header(&next).ends_with(" lane_given_up=@10..@20"),
+            "{}",
+            header(&next)
+        );
+        assert!(
+            cmd_topic(&*next, "ls").contains("topic news since=@40\n"),
+            "the topic's range is not carried: {}",
+            cmd_topic(&*next, "ls")
+        );
     });
 }
 

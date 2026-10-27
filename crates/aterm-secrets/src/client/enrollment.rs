@@ -32,10 +32,9 @@ pub(super) fn include_approved(
         return Ok(None);
     };
     let mut hosts = old.clone();
-    for (recipient, method) in approved {
-        if *method == AdmissionMethod::Open {
-            continue;
-        }
+    // Every approval, an open one included (owner, 2026-10-26: "always approve by
+    // default"), shares the root with the machine it lets in.
+    for (recipient, _) in approved {
         let machine = doc
             .machines()
             .into_iter()
@@ -266,6 +265,153 @@ pub fn admin_cached(paths: &Paths) -> crate::Result<Admin> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commons::binding::Pending;
+
+    /// A vault `create` made at a path, with Commons control, and the pin a machine joins by.
+    fn founded(root: &Path) -> (Paths, String) {
+        let paths = Paths::for_home(&root.join("m1"));
+        let source = root.join("vault");
+        let created = create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+        (paths, format!("{}#{}", source.display(), created.signer))
+    }
+
+    /// `owner` lets `host` in as an open vault's approver does ([`auto_approve_listed`]), and
+    /// `host` joins. Returns the new machine's paths.
+    fn admitted_open(root: &Path, owner: &Paths, pinned: &str, host: &str) -> Paths {
+        let machine = Paths::for_home(&root.join(host));
+        let recipient = machine_identity(&machine).unwrap().recipient().to_bech32();
+        let admin = admin_cached(owner).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.add_machine(host, &recipient).unwrap();
+        publish_as(
+            owner,
+            &admin,
+            &doc,
+            false,
+            &[(recipient, AdmissionMethod::Open)],
+            false,
+        )
+        .unwrap();
+        join(
+            &machine,
+            &JoinOptions {
+                source: pinned.into(),
+                host: Some(host.into()),
+                interactive: false,
+                wait: Duration::ZERO,
+                confirm: &|_| false,
+                password: JoinPassword::Given(None),
+                fetched: None,
+                requested: &|| {},
+                say: &|_| {},
+            },
+        )
+        .unwrap();
+        machine
+    }
+
+    /// `owner` publishes its vault with `hosts` as the control entry's audience.
+    fn share(owner: &Paths, hosts: &[&str]) {
+        let admin = admin_cached(owner).unwrap();
+        let mut doc = admin.doc.clone();
+        let audience = doc.commons_audience().unwrap().clone();
+        let value = doc
+            .entries()
+            .into_iter()
+            .find(|e| e.name == ENTRY)
+            .unwrap()
+            .value;
+        doc.unset_entry(&audience, ENTRY).unwrap();
+        let hosts = hosts.iter().map(|h| (*h).into()).collect();
+        doc.set_entry(&Audience::Hosts(hosts), ENTRY, value.as_slice())
+            .unwrap();
+        admin_publish(owner, &admin, &doc).unwrap();
+    }
+
+    fn in_audience(owner: &Paths, host: &str) -> bool {
+        matches!(
+            admin_cached(owner).unwrap().published_doc.commons_audience(),
+            Some(Audience::Hosts(hosts)) if hosts.iter().any(|h| h == host)
+        )
+    }
+
+    /// A possession proof from `peer` for `owner`'s root, as the LAN handshake makes one.
+    fn possession(owner: &Bootstrap, peer: &Bootstrap) -> Possession {
+        let request = peer.request().unwrap();
+        let trust = owner.trust();
+        let (mut pending, challenge) =
+            Pending::issue(&request, trust.network, trust.authority).unwrap();
+        let answer = peer.device().answer(&request, &challenge).unwrap();
+        pending.verify(&answer).unwrap()
+    }
+
+    /// `owner`'s cached admin enrolls `proof` into its own control journal.
+    fn enroll(owner: &Paths, proof: Possession) -> crate::Result<Node> {
+        let bootstrap = Bootstrap::required(owner)?;
+        let mut journal = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust())?;
+        admin_cached(owner)?.enroll_commons_member(&bootstrap, &mut journal, proof)
+    }
+
+    #[test]
+    fn an_open_admission_shares_the_root_and_enrolls_while_in_the_audience() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (owner, pinned) = founded(root.path());
+        let m2 = admitted_open(root.path(), &owner, &pinned, "m2");
+        let admin = admin_cached(&owner).unwrap();
+        assert_eq!(
+            admin.commons_admission("m2").unwrap().method,
+            AdmissionMethod::Open
+        );
+        assert!(
+            in_audience(&owner, "m2"),
+            "an open approval shares the control entry in its own publication"
+        );
+        let peer = Bootstrap::required(&m2).unwrap();
+        let proof = possession(&Bootstrap::required(&owner).unwrap(), &peer);
+        // An explicit exclusion between the challenge and the enrollment still refuses.
+        share(&owner, &["m1"]);
+        let refused = enroll(&owner, proof).unwrap_err().to_string();
+        assert!(refused.contains("eligible recipient"), "{refused}");
+        // Shared again, the same open decision enrolls it.
+        share(&owner, &["m1", "m2"]);
+        let proof = possession(&Bootstrap::required(&owner).unwrap(), &peer);
+        enroll(&owner, proof).unwrap();
+        let owner_root = Bootstrap::required(&owner).unwrap();
+        let journal = Journal::open_existing(owner_root.journal_dir(), owner_root.trust()).unwrap();
+        let access = owner_root.access_in(&journal).unwrap().unwrap();
+        assert!(
+            access
+                .members()
+                .iter()
+                .any(|m| m.binding().recipient() == machine_identity(&m2).unwrap().recipient())
+        );
+    }
+
+    #[test]
+    fn a_removed_open_member_put_back_by_a_plain_edit_cannot_enroll() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (owner, pinned) = founded(root.path());
+        let m2 = admitted_open(root.path(), &owner, &pinned, "m2");
+        let peer = Bootstrap::required(&m2).unwrap();
+        let recipient = machine_identity(&m2).unwrap().recipient().to_bech32();
+        admin_revoke(&owner, &admin_open(&owner).unwrap(), "m2", false).unwrap();
+        // Put back by an edit that records no decision, inside the audience.
+        let admin = admin_cached(&owner).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.add_machine("m2", &recipient).unwrap();
+        admin_publish(&owner, &admin, &doc).unwrap();
+        share(&owner, &["m1", "m2"]);
+        assert!(
+            admin_cached(&owner)
+                .unwrap()
+                .commons_admission("m2")
+                .is_none(),
+            "removal forgets the open decision"
+        );
+        let proof = possession(&Bootstrap::required(&owner).unwrap(), &peer);
+        let refused = enroll(&owner, proof).unwrap_err().to_string();
+        assert!(refused.contains("admission evidence"), "{refused}");
+    }
 
     #[test]
     fn sequential_approvals_rehome_one_control_audience() {

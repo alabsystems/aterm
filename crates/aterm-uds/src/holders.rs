@@ -1318,11 +1318,20 @@ pub fn pshm_sizes_of(_pid: u32) -> io::Result<Vec<u64>> {
     ))
 }
 
+#[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
+#[path = "holders_jail.rs"]
+mod jail;
 #[path = "holders_paths.rs"]
 mod paths;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 #[path = "holders_procfs.rs"]
 mod procfs;
+#[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
+pub use jail::lab_jail_pids;
+
+/// LAB SEAM: the variable in which aterm-lab names the mark of the jail its instance runs in, so
+/// that a debug build's path scans read that jail's processes alone ([`lab_jail_pids`], macOS).
+pub const JAIL_SEAM: &str = "ATERM_DEBUG_JAIL_MARK";
 #[cfg(all(debug_assertions, target_vendor = "apple"))]
 pub use paths::a_force_detached_volume_is_no_working_directory;
 #[cfg(all(windows, any(test, debug_assertions)))]

@@ -42,6 +42,16 @@ aterm-types = { workspace = true }
 # its EffectSeam, so a run is taped (--record) and replayed offline (--replay); design §21.
 # Zero dependencies; a path dependency, as aterm-agent's astream crates are.
 astream-effects = { path = "../../vendor/astream/crates/astream-effects" }
+# The write journal's framing (agh::journal, design §6.8): CRC-framed dense steps, a torn
+# tail told from a fault. A path dependency, as astream-effects is; no workspace row.
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
+# Fabric posts (agh::notify, design §21.5): the session's control socket, its token, and the
+# AUTH handshake agh never copies. After WP0a's split it links no editor engine. A path
+# dependency, as every aterm-ctl user's is: the workspace has no aterm-ctl row.
+aterm-ctl = { path = "../aterm-ctl" }
+# The git runner's per-run scratch (agh::git::run): one 0700 directory with a random name,
+# holding the child's empty HOME, its empty working directory and PushDelete's bare repository.
+aterm-tempfile = { workspace = true }
 # --tag-regex, --match and jq test(): linear time, no backtracking.
 aterm-regex = { workspace = true }
 # durable and durable_dir: a finished download survives a power loss.
@@ -56,8 +66,6 @@ agh-fake = { workspace = true }
 # StepEvidence, interp and xref for the route-wall conformance.
 aterm-spec = { workspace = true }
 aterm-models-agh = { workspace = true }
-# Scratch directories (0700, random names).
-aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

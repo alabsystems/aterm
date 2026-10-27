@@ -1,0 +1,56 @@
+# What the v0.144.0 producer committed to for this desk. Written by the
+# release's own cut (seamless_fixture_generator_tests.rs); see ../../README.md.
+producer_version = "0.144.0"
+producer_commit = "9d448e28eec2"
+outgoing_build = 1793046081
+park_carry_ceiling = "visible"
+manifest = "seamless-74683-00000000000000000000000001000017.toml"
+nonce = "00000000000000000000000001000017"
+dir_placeholder = "@HANDOFF_DIR@"
+screen_digest = "0b41f928231fbb97c37c106803dd193fb6ba2629bbd586696e189682f8a14a8c"
+layout_digest = "7c86393c1ae266d28b435398fc9698f63ce59d2b58994aae5776fa108b8afa5a"
+proof_target_build = 1793132481
+proof_target_commit = "fedcba987654"
+proof_identities = [[0, 3, 40000]]
+proof_count = 1
+proof_digest = "9b7b7d9d19e29070b1b73e083c8720b465916ac94009e83222fde505701d85d0"
+ready_wire = "41535231000000019b7b7d9d19e29070b1b73e083c8720b465916ac94009e83222fde505701d85d0"
+commit_wire = "41534331000000019b7b7d9d19e29070b1b73e083c8720b465916ac94009e83222fde505701d85d0"
+files = ["seamless-74683-00000000000000000000000001000017.h1.ctl", "seamless-74683-00000000000000000000000001000017.h1.heldgrid", "seamless-74683-00000000000000000000000001000017.layout.toml", "seamless-74683-00000000000000000000000001000017.s0.ctl", "seamless-74683-00000000000000000000000001000017.s0.grid", "seamless-74683-00000000000000000000000001000017.toml"]
+
+[[session]]
+local_id = 0
+rows = 30
+cols = 100
+history_lines = 0
+alt_grid = false
+control = true
+require_shell_integration_nonce = false
+history_take = 0
+history_lost = 31
+fg_holder = 40000
+absolute_row_counter = 61
+alt_absolute_row_counter = 0
+color = false
+shell_phase = 0
+shell_marks = 0
+shell_completed_seq = 0
+rung = "visible-only"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+repaint = false
+history_dropped = 31
+
+[[held]]
+local_id = 1
+rows = 30
+cols = 100
+alt_grid = false
+sid = "s-00000000010000010101"
+history_take = 0
+history_dropped = 104
+control = true
+failure_seen = false
+exit_code = 2
+

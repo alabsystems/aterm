@@ -127,7 +127,7 @@ impl Bed {
                 accounts::SyncTarget {
                     path: &self.path,
                     before: Some(&before),
-                    after: &after,
+                    after: Some(&after),
                     mode: None,
                 },
                 |state, logins| {

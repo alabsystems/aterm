@@ -1476,25 +1476,31 @@ fn the_top_colors_card_has_one_name_at_every_width() {
 
 #[test]
 fn the_top_text_card_writes_font_px() {
+    // 16 px: no platform's automatic size, which a write removes instead.
+    assert_ne!(
+        crate::FONT_PX,
+        16.0,
+        "premise: 16 px is written, not removed"
+    );
     let mut lab = Lab::new("");
     let patch = lab.commit(
         &format!("settings/set/{}", prefs::EDIT_FONT_PX),
-        Some(SemanticInput::Text("15".to_string())),
+        Some(SemanticInput::Text("16".to_string())),
     );
     assert!(
         patch
             .edits
             .iter()
-            .any(|edit| edit.key == prefs::EDIT_FONT_PX && edit.value.as_deref() == Some("15")),
+            .any(|edit| edit.key == prefs::EDIT_FONT_PX && edit.value.as_deref() == Some("16")),
         "{patch:?}"
     );
-    assert!(lab.text().contains("font_px = 15"), "{}", lab.text());
+    assert!(lab.text().contains("font_px = 16"), "{}", lab.text());
     let compiled = lab.compile(1_200.0, 820.0);
     let specimen = compiled
         .semantic(&UiKey::new("settings/top/text/preview"))
         .expect("the type specimen");
     assert!(
-        matches!(&specimen.value, SemanticValue::Text(value) if value.contains("15 pixels")),
+        matches!(&specimen.value, SemanticValue::Text(value) if value.contains("16 pixels")),
         "{:?}",
         specimen.value
     );
@@ -2368,6 +2374,18 @@ fn the_theme_cards_rows_keep_the_row_rule_at_every_size() {
 
 #[test]
 fn a_rows_layout_never_depends_on_its_state() {
+    // Narrow rows too, and with 2x text: writing a key moves nothing (Typing sound at 120pt:
+    // "Follow the trail (default)" took three lines, written two).
+    at_each_text_scale(
+        &[1.0, 2.0],
+        "a row's layout never depends on its state",
+        |_| {
+            rows_layout_never_depends_on_their_state();
+        },
+    );
+}
+
+fn rows_layout_never_depends_on_their_state() {
     let clean = SettingsViewState::new(&Config::default());
     let mut reserved = 0usize;
     for index in 0..clean.legacy.fields.len() {
@@ -2390,7 +2408,11 @@ fn a_rows_layout_never_depends_on_its_state() {
         let mut written = SettingsViewState::from_snapshot(&service.snapshot()).expect("projects");
         assert!(written.is_explicit(key), "{key} is written");
         for width in [SettingsWidth::Compact, SettingsWidth::Medium] {
-            for text_width in (300..=900).step_by(40).map(|width| width as f32) {
+            for text_width in (120..300)
+                .step_by(20)
+                .chain((300..=900).step_by(40))
+                .map(|width| width as f32)
+            {
                 let measure = |state: &SettingsViewState| {
                     let field = &state.legacy.fields[index];
                     let finished = finished_setting_row(
@@ -2417,6 +2439,13 @@ fn a_rows_layout_never_depends_on_its_state() {
                     let fit = row_tag_fit(&finished.name, &finished.worst, finished.label_width);
                     (height, control, fit.state)
                 };
+                // Below 300pt, and with 2x text, only the state differs: a color written takes a
+                // value of its own, whose words a field that narrow may wrap otherwise, as a
+                // draft's may.
+                let narrow = text_width < 300.0 || settings_text_scale() > 1.5;
+                if narrow && matches!(kind, EditKind::Color) {
+                    continue;
+                }
                 let before = measure(&clean);
                 let after = measure(&written);
                 let draft = match kind {
@@ -2430,16 +2459,17 @@ fn a_rows_layout_never_depends_on_its_state() {
                     &written.legacy.fields[index],
                     false,
                 );
-                let drafted = (field_accepts_text_input(&written.legacy.fields[index]) && !links)
-                    .then(|| {
-                        written.field_inputs.insert(
-                            key.to_string(),
-                            crate::native_text_input::TextInputState::new(draft.to_string()),
-                        );
-                        let drafted = measure(&written);
-                        written.field_inputs.remove(key);
-                        drafted
-                    });
+                let drafted =
+                    (!narrow && field_accepts_text_input(&written.legacy.fields[index]) && !links)
+                        .then(|| {
+                            written.field_inputs.insert(
+                                key.to_string(),
+                                crate::native_text_input::TextInputState::new(draft.to_string()),
+                            );
+                            let drafted = measure(&written);
+                            written.field_inputs.remove(key);
+                            drafted
+                        });
                 let context = format!("{key} {width:?} at {text_width}");
                 assert_eq!(before.0, after.0, "{context}: writing it keeps its height");
                 assert_eq!(before.1, after.1, "{context}: writing it keeps its control");
@@ -4954,18 +4984,23 @@ fn a_text_size_change_keeps_a_screen_that_starts_with_what_it_lists_otherwise() 
         );
     };
     let mut faults = Vec::new();
+    // Music effects' row, which a row-detail holds where it says why no audio plays (off macOS).
+    let trail_sounds: &[&str] = &[
+        "settings/row/80/trail_sounds",
+        "settings/row-detail/trail_sounds",
+    ];
     for (route, (width, height), from, starts) in [
         (
             SettingsRoute::Themes,
             (444.0, 292.0),
             Some("settings/showcase/section/builtin/inset"),
-            "settings/showcase/card/default",
+            &["settings/showcase/card/default"][..],
         ),
         (
             SettingsRoute::Home,
             (1_564.0, 180.0),
             Some("settings/top/playful-effects/title-row"),
-            "settings/row/80/trail_sounds",
+            trail_sounds,
         ),
         (
             SettingsRoute::Home,
@@ -4973,13 +5008,13 @@ fn a_text_size_change_keeps_a_screen_that_starts_with_what_it_lists_otherwise() 
             // preview in a 180pt window: the list has none to start with.
             (738.0, if cfg!(windows) { 186.0 } else { 180.0 }),
             Some("settings/top/cursor-trail/preview"),
-            "settings/top/cursor-trail/title-row",
+            &["settings/top/cursor-trail/title-row"][..],
         ),
         (
             SettingsRoute::Appearance,
             (1_564.0, 180.0),
             None,
-            "settings/row/58/output_streak.enabled",
+            &["settings/row/58/output_streak.enabled"][..],
         ),
     ] {
         set_scale(1.0);
@@ -5006,10 +5041,13 @@ fn a_text_size_change_keeps_a_screen_that_starts_with_what_it_lists_otherwise() 
         let _ = lab.compile(width, height);
         let (two, shown_two) = lab.state().scroll_shown().expect("a list");
         let now = two.identities(shown_two.start).next().cloned();
-        if now.as_ref().map(UiKey::as_str) != Some(starts) {
+        if !now
+            .as_ref()
+            .is_some_and(|key| starts.contains(&key.as_str()))
+        {
             faults.push(format!(
                 "{route:?} {width}x{height}: from the 1× screen starting with {first:?}, the 2× \
-                 screen starts with {now:?}, not {starts}"
+                 screen starts with {now:?}, not {starts:?}"
             ));
         }
     }
@@ -5495,6 +5533,133 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
             faults.len(),
             faults.join("\n")
         );
+    });
+}
+
+#[test]
+fn a_press_on_any_screen_of_a_narrow_list_moves_nothing() {
+    // NOTHING THE PERSON PRESSED MOVES, ON ANY SCREEN: every switch and segment a screen shows
+    // whole, pressed, stands where it was, uncovered, through "Applying…" and the status it
+    // brings. On the list's last screen, which may end short of the room, the status's bar seated
+    // the screen anew flush with the room's end and moved the switch pressed down (Security at
+    // 206x420: Desktop notifications from aterm, 51pt; Sound at 290x420 with 2x text: Terminal
+    // bell sound, 50pt); and a segment in a part of its segmented control split across stops
+    // was lost once chosen (Cursor & Motion at 164x292: Motion's Reduce motion, 49pt).
+    const WINDOWS: [(SettingsRoute, f32, f32, f32); 5] = [
+        (SettingsRoute::CursorMotion, 164.0, 292.0, 1.0),
+        (SettingsRoute::WindowTabs, 164.0, 420.0, 1.0),
+        (SettingsRoute::Security, 206.0, 420.0, 1.0),
+        (SettingsRoute::Sound, 290.0, 420.0, 2.0),
+        (SettingsRoute::Terminal, 304.0, 348.0, 2.0),
+    ];
+    at_each_text_scale(&[1.0, 2.0], "a press on any screen", |scale| {
+        let (mut presses, mut faults) = (0, Vec::new());
+        for (route, width, height, _) in WINDOWS.iter().filter(|window| window.3 == scale) {
+            let (route, width, height) = (*route, *width, *height);
+            let mut probe = Lab::new("");
+            probe.state_mut().navigate(route);
+            let mut targets: Vec<(usize, UiKey)> = Vec::new();
+            for screen in 0..60 {
+                let compiled = probe.compile(width, height);
+                targets.extend(
+                    compiled
+                        .paint
+                        .iter()
+                        .filter(|node| {
+                            let pressable = matches!(node.content, UiContent::Switch(_))
+                                || (node.key.as_str().starts_with("settings/segment/")
+                                    && matches!(node.content, UiContent::Button(_)));
+                            pressable
+                                && node.clip == node.rect
+                                && compiled
+                                    .semantic(&node.key)
+                                    .is_some_and(|live| live.rect == node.rect)
+                        })
+                        .map(|node| (screen, node.key.clone())),
+                );
+                let at = probe.state().scroll_shown().map(|(_, view)| view);
+                probe.dispatch(AppEvent::ScrollPage(1));
+                let _ = probe.compile(width, height);
+                if probe.state().scroll_shown().map(|(_, view)| view) == at {
+                    break;
+                }
+            }
+            for (screen, key) in targets {
+                let mut lab = Lab::new("");
+                lab.state_mut().navigate(route);
+                for _ in 0..screen {
+                    let _ = lab.compile(width, height);
+                    lab.dispatch(AppEvent::ScrollPage(1));
+                }
+                let before = lab.compile(width, height);
+                let Some(rect) = before
+                    .paint
+                    .iter()
+                    .find(|node| node.key == key && node.clip == node.rect)
+                    .map(|node| node.rect)
+                else {
+                    continue;
+                };
+                let segment = key.as_str().strip_prefix("settings/segment/");
+                let (action, value) = match segment {
+                    Some(_) => (key.as_str().to_string(), None),
+                    None => {
+                        let Some(crate::native_ui::SemanticValue::Bool(on)) =
+                            before.semantic(&key).map(|node| node.value.clone())
+                        else {
+                            continue;
+                        };
+                        let setting = key.as_str().trim_start_matches("settings/control/");
+                        (
+                            format!("settings/set/{setting}"),
+                            Some(SemanticInput::Bool(!on)),
+                        )
+                    }
+                };
+                lab.state_mut().common.last_focus = Some(key.clone());
+                let Some((patch, operation)) = lab.invoke(&action, value) else {
+                    continue;
+                };
+                // A segment chosen is drawn under its segmented control's key.
+                let chosen = segment.and_then(|rest| rest.rsplit_once('/')).map_or_else(
+                    || key.clone(),
+                    |(setting, _)| UiKey::new(format!("settings/control/{setting}")),
+                );
+                let stands = |compiled: &crate::native_ui::CompiledUi| {
+                    let at = compiled
+                        .paint
+                        .iter()
+                        .find(|node| node.key == key || node.key == chosen)
+                        .map(|node| (node.rect, node.clip));
+                    let covered = compiled
+                        .semantic(&UiKey::new("settings/feedback"))
+                        .is_some_and(|bar| {
+                            bar.rect
+                                .intersect(rect)
+                                .is_some_and(|both| both.height > 0.5)
+                        });
+                    (at == Some((rect, rect)) && !covered)
+                        .then_some(())
+                        .ok_or(at)
+                };
+                let mid = lab.compile(width, height);
+                let mid = stands(&mid);
+                lab.carry(patch, operation);
+                let after = lab.compile(width, height);
+                let after = stands(&after);
+                presses += 1;
+                if mid.is_err() || after.is_err() {
+                    faults.push(format!(
+                        "{route:?} {width}x{height} at {scale}x, screen {screen}: {} at {:?} \
+                         -> {mid:?}, then {after:?}",
+                        key.as_str(),
+                        rect.y
+                    ));
+                }
+            }
+        }
+        assert!(presses > 12, "{presses} presses at {scale}x");
+        assert!(faults.is_empty(), "{faults:#?}");
     });
 }
 
@@ -6696,7 +6861,16 @@ fn a_bar_held_over_a_press_keeps_its_room_when_the_list_scrolls() {
                 .filter(|word| *word != FACT_SEPARATOR.trim())
                 .collect::<String>()
         };
-        assert_eq!(bare(&every.join(" ")), bare(&feedback), "{every:#?}");
+        // A word too long for the bar's line is set across lines, hyphenated.
+        let joined = every.iter().fold(String::new(), |joined, line| {
+            match joined.strip_suffix('-') {
+                Some(head) if !feedback.contains(&format!("{}-", line_tail(head))) => {
+                    format!("{head}{line}")
+                }
+                _ => format!("{joined} {line}"),
+            }
+        });
+        assert_eq!(bare(&joined), bare(&feedback), "{every:#?}");
     });
 }
 
@@ -6713,7 +6887,8 @@ fn a_bar_held_over_a_press_keeps_its_room_when_the_list_scrolls() {
 fn a_row_with_a_note_says_changed_on_it_and_keeps_its_name_whole() {
     // Terminal at 80x26 with 2x text: Searchable scrollback lines kept a blank line for Changed
     // under its name and the note under that was cut at the screen's end, 58pt of blank. The note
-    // takes Changed on its first line, so the name stays on one line and that line shows.
+    // takes Changed on its first line, so the name stays on one line, and the note after the
+    // control ([`with_row_detail`]) says it on the screen that shows it.
     at_each_text_scale(&[2.0], "changed on the note", |_| {
         for written in [false, true] {
             let source = if written {
@@ -6723,8 +6898,7 @@ fn a_row_with_a_note_says_changed_on_it_and_keeps_its_name_whole() {
             };
             let mut lab = Lab::new(source);
             lab.state_mut().navigate(SettingsRoute::Terminal);
-            let screen = lab.compile(584.0, 376.0);
-            let painted = |prefix: &str| {
+            let painted = |screen: &crate::native_ui::CompiledUi, prefix: &str| {
                 screen
                     .paint
                     .iter()
@@ -6735,12 +6909,21 @@ fn a_row_with_a_note_says_changed_on_it_and_keeps_its_name_whole() {
                     })
                     .collect::<Vec<_>>()
             };
+            let first = lab.compile(584.0, 376.0);
             assert_eq!(
-                painted("settings/label/search_history_lines/visual/line-"),
+                painted(&first, "settings/label/search_history_lines/visual/line-"),
                 ["Searchable scrollback lines"],
                 "written: {written}"
             );
-            let note = painted("settings/detail/search_history_lines/line-0");
+            let mut note = Vec::new();
+            for _ in 0..8 {
+                let screen = lab.compile(584.0, 376.0);
+                note = painted(&screen, "settings/detail/search_history_lines/line-0");
+                if !note.is_empty() {
+                    break;
+                }
+                lab.dispatch(AppEvent::ScrollPage(1));
+            }
             let want = if written {
                 "Changed \u{b7} Find searches"
             } else {
@@ -6754,27 +6937,107 @@ fn a_row_with_a_note_says_changed_on_it_and_keeps_its_name_whole() {
     });
 }
 
+/// Whether `line` is the one line a row keeps under a name of one word, with no note: a name
+/// with no word to break early and no note to share keeps its room for Changed on a line of its
+/// own ([`a_rows_layout_never_depends_on_its_state`]): the Linux lane's Noto Sans sets
+/// "Background · Changed" wider than a stacked row's 118pt at 2x text in a 444pt window.
+fn one_word_alone(compiled: &crate::native_ui::CompiledUi, line: &str) -> bool {
+    let Some(row) = ["settings/note/", "settings/detail/"]
+        .iter()
+        .find_map(|head| line.strip_prefix(head))
+        .and_then(|rest| rest.split('/').next())
+    else {
+        return false;
+    };
+    let lines_of = |head: &str| -> Vec<String> {
+        compiled
+            .paint
+            .iter()
+            .filter(|node| {
+                node.key
+                    .as_str()
+                    .strip_prefix(head)
+                    .is_some_and(|rest| rest.starts_with("line-") && !rest.contains('/'))
+            })
+            .filter_map(|node| match &node.content {
+                UiContent::Text(spec) => Some(spec.text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let name = lines_of(&format!("settings/label/{row}/visual/"));
+    let said: Vec<String> = ["settings/note/", "settings/detail/"]
+        .iter()
+        .flat_map(|head| lines_of(&format!("{head}{row}/")))
+        .filter(|text| !text.trim().is_empty())
+        .collect();
+    name.len() == 1 && name[0].split_whitespace().count() == 1 && said.is_empty()
+}
+
+/// A config that writes every key a row draws at the value that means unset: every row says
+/// Changed, and nothing else differs from no config.
+fn every_key_written() -> String {
+    let clean = SettingsViewState::new(&Config::default());
+    let mut source = String::new();
+    for field in &clean.legacy.fields {
+        let key = field.key;
+        if !native_advanced_key(key) || key == prefs::EDIT_THEME || font_picker_key(key) {
+            continue;
+        }
+        let Some(raw) = crate::prefs::unset_literal(field)
+            .filter(|raw| prefs::check_edit_value(key, raw).is_ok())
+        else {
+            continue;
+        };
+        let Some(next) = crate::prefs::typed_toml_item(key, &raw)
+            .ok()
+            .and_then(|item| crate::prefs::with_toml_item(&source, key, item).ok())
+            .filter(|next| VersionedConfigService::new(next.clone()).is_ok())
+        else {
+            continue;
+        };
+        source = next;
+    }
+    source
+}
+
 #[test]
 fn no_row_keeps_a_blank_line_for_what_it_may_say() {
     // A ROW SAYS CHANGED, AND THE FACTS ONLY SOME VALUES BRING, IN ROOM IT DRAWS EITHER WAY: its
     // name's last line broken a word early, or its note's first line, never a line kept empty
     // (Terminal at 80x26 with 2x text: a 58pt blank under Searchable scrollback lines, the next
-    // line cut at the screen's end). Every screen of every page, at the standard sizes.
+    // line cut at the screen's end). Where its state takes a line of its own, the line says it,
+    // Default at rest, laid out alike for both words: kept empty at rest it read as blank under
+    // short names in narrow windows (623 lines between 164 and 304pt wide with 2x text; Top's
+    // Color theme and Font family cards at 1074x900), and laid out by each word, "Changed ·
+    // Applies after restart" took two lines where "Default · …" took one (Initial columns at
+    // 234pt). Every screen of every page, narrow windows and the standard sizes, with nothing
+    // written and with every key written.
+    let written = every_key_written();
     at_each_text_scale(&[1.0, 2.0], "no blank line", |scale| {
         let mut blank = Vec::new();
         let mut rows = 0;
-        for (width, height) in [
+        for ((width, height), source) in [
             (584.0, 348.0),
             (584.0, 376.0),
             (744.0, 420.0),
             (1_074.0, 684.0),
             (444.0, 292.0),
-        ] {
+            (1_074.0, 900.0),
+            (164.0, 348.0),
+            (178.0, 292.0),
+            (234.0, 348.0),
+            (290.0, 376.0),
+            (304.0, 420.0),
+        ]
+        .into_iter()
+        .flat_map(|size| [(size, ""), (size, written.as_str())])
+        {
             for route in SettingsRoute::ALL {
                 if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
                     continue;
                 }
-                let mut lab = Lab::new("");
+                let mut lab = Lab::new(source);
                 lab.state_mut().navigate(route);
                 for _ in 0..30 {
                     let compiled = lab.compile(width, height);
@@ -6790,8 +7053,15 @@ fn no_row_keeps_a_blank_line_for_what_it_may_say() {
                             UiContent::Text(spec) => spec.text.trim().is_empty(),
                             _ => false,
                         };
-                        if line && empty && node.clip.height > 1.0 {
-                            blank.push(format!("{scale}x {width}x{height} {route:?} {key}"));
+                        if line
+                            && empty
+                            && node.clip.height > 1.0
+                            && !one_word_alone(&compiled, key)
+                        {
+                            blank.push(format!(
+                                "{scale}x {width}x{height} {route:?} {key}{}",
+                                if source.is_empty() { "" } else { " written" }
+                            ));
                         }
                     }
                     let at = lab.state().scroll_shown().map(|(_, view)| view);
@@ -6821,32 +7091,12 @@ fn a_status_bar_keeps_its_undo_where_a_place_holds_it() {
     // bar with its Undo under its words, the Undo goes beside them, their lines scrolling, or the
     // compact toolbar docks it, a word too long for the dock hyphenating; the switch stays where
     // it was pressed, the Undo stays a press away, and the bar stays where it first stood.
+    // Whether it docks: `Some` where the window decides it on every platform's faces; where the
+    // dock is wanted, the first of the short windows the platform's faces dock it in.
     at_each_text_scale(&[2.0], "a bar keeps its Undo", |_| {
-        for (route, setting, width, height, docked) in [
-            (
-                SettingsRoute::SoftwareUpdate,
-                "update.enabled",
-                248.0,
-                292.0,
-                Some(false),
-            ),
-            (
-                SettingsRoute::SoftwareUpdate,
-                "update.enabled",
-                304.0,
-                236.0,
-                Some(true),
-            ),
-            // Over the list for "Applying…", it stays there for the landed status the window's
-            // rules would dock.
-            (
-                SettingsRoute::CursorMotion,
-                "cursor_blink",
-                290.0,
-                236.0,
-                None,
-            ),
-        ] {
+        // Press `setting`'s switch on `route` at `width`x`height`: whether the landed status
+        // docks, the bar's other rules held.
+        let docks_at = |route: SettingsRoute, setting: &str, width: f32, height: f32| {
             let context = format!("{route:?} {width}x{height}");
             let mut lab = Lab::new("");
             lab.state_mut().navigate(route);
@@ -6854,10 +7104,17 @@ fn a_status_bar_keeps_its_undo_where_a_place_holds_it() {
             let mut was = None;
             for _ in 0..8 {
                 let screen = lab.compile(width, height);
+                // Live, not a picture of it in the strip under the list's room.
                 was = screen
                     .paint
                     .iter()
-                    .find(|node| node.key == key && node.clip == node.rect)
+                    .find(|node| {
+                        node.key == key
+                            && node.clip == node.rect
+                            && screen
+                                .semantic(&key)
+                                .is_some_and(|live| live.rect == node.rect)
+                    })
                     .map(|node| node.rect);
                 if was.is_some() {
                     break;
@@ -6907,15 +7164,65 @@ fn a_status_bar_keeps_its_undo_where_a_place_holds_it() {
                 docks(&landed),
                 "{context}: the bar stays where it first stood"
             );
+            docks(&landed)
+        };
+        for (route, setting, width, height, docked) in [
+            (
+                SettingsRoute::SoftwareUpdate,
+                "update.enabled",
+                248.0,
+                292.0,
+                Some(false),
+            ),
+            // Over the list for "Applying…", it stays there for the landed status the window's
+            // rules would dock.
+            (
+                SettingsRoute::CursorMotion,
+                "cursor_blink",
+                290.0,
+                236.0,
+                None,
+            ),
+        ] {
+            let docks = docks_at(route, setting, width, height);
             if let Some(docked) = docked {
                 assert_eq!(
-                    docks(&landed),
-                    docked,
-                    "{context}: the status docks in the toolbar only where no side of the list \
-                     holds it"
+                    docks, docked,
+                    "{route:?} {width}x{height}: the status docks in the toolbar only where no \
+                     side of the list holds it"
                 );
             }
         }
+        // Where no side of a short window's list holds the bar, the toolbar docks it: 304x200 on
+        // macOS's faces; a platform whose wider faces let a side hold it there docks it in a
+        // shorter window.
+        let short = [
+            (304.0, 236.0),
+            (304.0, 224.0),
+            (304.0, 212.0),
+            (304.0, 200.0),
+            (304.0, 188.0),
+            (304.0, 176.0),
+            (290.0, 176.0),
+        ];
+        let docked = short.iter().find(|&&(width, height)| {
+            docks_at(
+                SettingsRoute::SoftwareUpdate,
+                "update.enabled",
+                width,
+                height,
+            )
+        });
+        assert!(
+            docked.is_some(),
+            "SoftwareUpdate: some short window docks the status in the toolbar, of {short:?}"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            docked,
+            Some(&(304.0, 200.0)),
+            "macOS's faces dock it at 304x200"
+        );
     });
 }
 
@@ -6952,6 +7259,10 @@ fn a_status_bar_never_moves_or_covers_the_switch_pressed() {
                 (248.0, 292.0),
                 (290.0, 236.0),
                 (290.0, 520.0),
+                // The least window but one: the bar takes the side away from the press, else the
+                // toolbar's place, never the whole page (at 2x in 178x152 it stood over all 100pt
+                // of it, the switch pressed at the list's top under it).
+                (178.0, 152.0),
             ]
             .into_iter()
             .enumerate()
@@ -7072,6 +7383,11 @@ fn a_status_bar_never_moves_or_covers_the_switch_pressed() {
             );
         }
     });
+}
+
+/// The last word of `text`.
+fn line_tail(text: &str) -> &str {
+    text.rsplit(char::is_whitespace).next().unwrap_or(text)
 }
 
 /// Whether `compiled`'s status bar stands over the list, above the control at `control`.
@@ -7333,6 +7649,500 @@ fn the_person_moves_on_from_a_press_by_keyboard_or_page() {
         );
         assert!(steps > 20 && pages > 5, "{steps} Tabs, {pages} pages");
     });
+}
+
+#[test]
+fn a_stacked_rows_control_stands_where_it_does_at_every_value() {
+    // WHAT A ROW SAYS WITH ITS VALUE COMES AFTER ITS CONTROL: in a narrow row, stacked, the
+    // control stands as far down its row at every value its control offers, so choosing one
+    // moves it nowhere, though the list can scroll nothing back (at its end, or its top).
+    // Universal Control's "Applies at the next ALab tools check" comes only with Off and stood
+    // over the segments, so choosing Leave as is moved them up (Security at 304x520: 18pt); and
+    // where its state went was weighed by that line, so its name took a line more for Off (at
+    // 240pt: 14pt). A value the file alone sets, which gives the row another control
+    // (Predictive echo's Always: one button for the segments), is no choice of the control.
+    at_each_text_scale(
+        &[1.0, 2.0],
+        "a stacked row's control at every value",
+        |scale| {
+            let clean = SettingsViewState::new(&Config::default());
+            let (mut rows, mut faults) = (0, Vec::new());
+            for (index, field) in clean.legacy.fields.iter().enumerate() {
+                let key = field.key;
+                if !native_advanced_key(key) || key == prefs::EDIT_THEME {
+                    continue;
+                }
+                let values: Vec<&str> = match field.kind {
+                    EditKind::Bool => vec!["true", "false"],
+                    EditKind::Enum { options } => options.to_vec(),
+                    _ => continue,
+                };
+                let states: Vec<(&str, SettingsViewState)> = values
+                    .into_iter()
+                    .filter_map(|value| {
+                        let item = crate::prefs::typed_toml_item(key, value).ok()?;
+                        let source = crate::prefs::with_toml_item("", key, item).ok()?;
+                        let service = VersionedConfigService::new(source).ok()?;
+                        Some((
+                            value,
+                            SettingsViewState::from_snapshot(&service.snapshot()).ok()?,
+                        ))
+                    })
+                    .collect();
+                if states.len() < 2 {
+                    continue;
+                }
+                for text_width in (120..=300).step_by(30).map(|width| width as f32) {
+                    let at: Vec<(&str, Option<f32>, usize)> = states
+                        .iter()
+                        .map(|(value, state)| {
+                            let finished = finished_setting_row(
+                                state,
+                                index,
+                                &state.legacy.fields[index],
+                                false,
+                                SettingsWidth::Compact,
+                                text_width,
+                                prefs::footnote_of(key).map(prefs::RowNote::Own),
+                                None,
+                                None,
+                            );
+                            let whole = finished.whole();
+                            let height = fixed_height(&whole);
+                            let compiled = UiTree::new(whole)
+                                .compile(LogicalRect::new(0.0, 0.0, text_width, height.max(1.0)))
+                                .unwrap();
+                            let line = [
+                                format!("settings/controls/{key}"),
+                                format!("settings/control/{key}"),
+                            ];
+                            let top = line.iter().find_map(|line| {
+                                compiled
+                                    .paint
+                                    .iter()
+                                    .find(|node| node.key.as_str() == line)
+                                    .map(|node| node.rect.y)
+                            });
+                            let segment = format!("settings/segment/{key}/");
+                            let segments = compiled
+                                .paint
+                                .iter()
+                                .filter(|node| node.key.as_str().starts_with(&segment))
+                                .count();
+                            (*value, top, segments)
+                        })
+                        .collect();
+                    let offered = at
+                        .iter()
+                        .map(|(_, _, segments)| *segments)
+                        .max_by_key(|count| {
+                            at.iter().filter(|(_, _, other)| other == count).count()
+                        })
+                        .unwrap_or_default();
+                    let choices: Vec<_> = at
+                        .iter()
+                        .filter(|(_, _, segments)| *segments == offered)
+                        .collect();
+                    rows += 1;
+                    if choices.iter().any(|(_, top, _)| *top != choices[0].1) {
+                        faults.push(format!("{key} at {text_width}pt, {scale}x: {at:?}"));
+                    }
+                }
+            }
+            assert!(
+                faults.is_empty(),
+                "{} faults:\n{}",
+                faults.len(),
+                faults.join("\n")
+            );
+            assert!(rows > 300, "{rows} rows");
+        },
+    );
+}
+
+#[test]
+fn a_stacked_rows_second_line_follows_its_control() {
+    // A STACKED ROW SAYS WHAT IT SAYS RIGHT UNDER ITS CONTROL, before the line its Reset takes
+    // under the control: that line, empty while the key is not written, stood between them and
+    // read as a blank gap mid-row (Classify session status at 234pt with 2x text: 40pt between
+    // the switch and "Default").
+    at_each_text_scale(&[1.0, 2.0], "a stacked row's second line", |scale| {
+        let clean = SettingsViewState::new(&Config::default());
+        let (mut rows, mut faults) = (0, Vec::new());
+        for (index, field) in clean.legacy.fields.iter().enumerate() {
+            let key = field.key;
+            if !native_advanced_key(key) {
+                continue;
+            }
+            for text_width in (120..=300).step_by(60).map(|width| width as f32) {
+                let finished = finished_setting_row(
+                    &clean,
+                    index,
+                    field,
+                    false,
+                    SettingsWidth::Compact,
+                    text_width,
+                    prefs::footnote_of(key).map(prefs::RowNote::Own),
+                    None,
+                    None,
+                );
+                if !finished.stacked {
+                    continue;
+                }
+                let whole = finished.whole();
+                let height = fixed_height(&whole);
+                let compiled = UiTree::new(whole)
+                    .compile(LogicalRect::new(0.0, 0.0, text_width, height.max(1.0)))
+                    .unwrap();
+                let rect = |key: String| {
+                    compiled
+                        .paint
+                        .iter()
+                        .find(|node| node.key.as_str() == key)
+                        .map(|node| node.rect)
+                };
+                let (Some(controls), Some(detail)) = (
+                    rect(format!("settings/controls/{key}")),
+                    rect(format!("settings/detail/{key}")),
+                ) else {
+                    continue;
+                };
+                rows += 1;
+                let reset = rect(format!("settings/reset-line/{key}"));
+                if detail.y < controls.bottom() || reset.is_some_and(|reset| reset.y < detail.y) {
+                    faults.push(format!(
+                        "{key} at {text_width}pt, {scale}x: its second line at {:.0}pt, its \
+                         control ending at {:.0}pt, its Reset's line at {:?}",
+                        detail.y,
+                        controls.bottom(),
+                        reset.map(|reset| reset.y)
+                    ));
+                }
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+        assert!(rows > 100, "{rows} rows");
+    });
+}
+
+#[test]
+fn a_split_rows_reset_line_follows_what_it_says() {
+    // A ROW SPLIT ACROSS STOPS KEEPS A WHOLE ROW'S ORDER: the line its Reset takes under the
+    // control comes after the words under the control, in the stop of its last words, not between
+    // the control and them. Left in the row it stood empty between the switch and its note while
+    // the key was not written, a blank band mid-row (Copy on select at 178x418 with 2x text: 40pt
+    // between the switch and "Default"). Only a stop too short for a line of words with it keeps
+    // it in the row: alone, an empty line would be a stop that draws nothing.
+    at_each_text_scale(&[1.0, 2.0], "a split row's Reset line", |scale| {
+        let clean = SettingsViewState::new(&Config::default());
+        let (mut split, mut faults) = (0, Vec::new());
+        for (index, field) in clean.legacy.fields.iter().enumerate() {
+            let key = field.key;
+            if !native_advanced_key(key) {
+                continue;
+            }
+            let reset_line = format!("settings/reset-line/{key}");
+            for text_width in (120..=300).step_by(60).map(|width| width as f32) {
+                let finished = finished_setting_row(
+                    &clean,
+                    index,
+                    field,
+                    false,
+                    SettingsWidth::Compact,
+                    text_width,
+                    prefs::footnote_of(key).map(prefs::RowNote::Own),
+                    None,
+                    None,
+                );
+                let whole = finished.whole();
+                let Some(line) = whole
+                    .children
+                    .iter()
+                    .find(|child| child.key.as_str() == reset_line)
+                    .map(fixed_height)
+                else {
+                    continue;
+                };
+                for most in [60.0, 90.0, 120.0, 180.0, 260.0] {
+                    let (row, blocks) = finished.split(most);
+                    let Some((last, _)) = blocks.last() else {
+                        continue;
+                    };
+                    split += 1;
+                    let in_row = ui_node_holds(&row, &reset_line);
+                    let follows = last
+                        .children
+                        .last()
+                        .is_some_and(|child| child.key.as_str() == reset_line);
+                    let room = row_detail_line_height() + row.layout.gap + line <= most + 0.01;
+                    let context = format!("{key} at {text_width}pt, {most}pt stops, {scale}x");
+                    if room && (in_row || !follows) {
+                        faults.push(format!(
+                            "{context}: its Reset line is {}",
+                            if in_row {
+                                "in the row, over its words"
+                            } else {
+                                "missing"
+                            }
+                        ));
+                    }
+                    if !room && !in_row {
+                        faults.push(format!("{context}: its Reset line left the row alone"));
+                    }
+                    for (block, height) in &blocks {
+                        if *height > most + 0.01 {
+                            faults.push(format!(
+                                "{context}: {} is {height}pt tall",
+                                block.key.as_str()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+        assert!(split > 50, "{split} split rows with a Reset line");
+        if scale > 1.5 {
+            // The case seen: the switch, then what the row says, the Reset's line after.
+            let mut lab = Lab::new("");
+            lab.state_mut().navigate(SettingsRoute::KeyboardInput);
+            let screen = lab.compile(178.0, 418.0);
+            let top = |prefix: &str| {
+                screen
+                    .paint
+                    .iter()
+                    .filter(|node| node.key.as_str().starts_with(prefix) && node.clip.height > 1.0)
+                    .map(|node| node.rect.y)
+                    .reduce(f32::min)
+            };
+            let switch = screen
+                .semantic(&UiKey::new("settings/control/copy_on_select"))
+                .map(|node| node.rect.bottom());
+            let said = top("settings/note/copy_on_select")
+                .or_else(|| top("settings/detail/copy_on_select"));
+            let reset = top("settings/reset-line/copy_on_select");
+            assert!(
+                switch
+                    .zip(said)
+                    .is_some_and(|(switch, said)| said - switch < 10.0)
+                    && reset.zip(said).is_none_or(|(reset, said)| reset > said),
+                "Copy on select at 178x418: its switch ends at {switch:?}, its words at {said:?}, \
+                 its Reset line at {reset:?}"
+            );
+        }
+    });
+}
+
+/// Tab (Shift-Tab where `backwards`) as the window takes it from the keyboard's control, drawn at
+/// `width`×`height` after.
+fn tab(lab: &mut Lab, backwards: bool, width: f32, height: f32) -> Option<UiKey> {
+    let compiled = lab.compile(width, height);
+    let current = lab.state().common.last_focus.clone();
+    let target = crate::app_native::native_tab_target(
+        &compiled,
+        Some(lab.state()),
+        current.as_ref(),
+        backwards,
+    )?;
+    lab.dispatch(AppEvent::FocusChanged(Some(target.clone())));
+    lab.state_mut().common.focus_visible = true;
+    Some(target)
+}
+
+#[test]
+fn the_keyboard_reads_a_status_over_the_list_where_it_stands() {
+    // A STATUS'S BAR OVER THE TOP OF THE LIST IS A TAB STOP WHERE IT STANDS: after a switch or a
+    // segment low on a narrow list is pressed and its status stands over the list, Shift-Tab
+    // goes up through what the screen shows under the bar to the bar's Undo, and Tab comes back
+    // down, and nothing moves: not the control pressed, not the bar. Taken as the list's edge,
+    // Shift-Tab from the switch pressed went to the row hidden under the bar, which sent the bar
+    // back under the list and moved the switch; Tab from the bar went to the list's first row.
+    at_each_text_scale(
+        &[1.0, 2.0],
+        "the keyboard reads a status over the list",
+        |scale| {
+            let (mut read, mut over) = (0, 0);
+            let mut faults = Vec::new();
+            for (width, height) in [
+                (164.0, 292.0),
+                (164.0, 348.0),
+                (178.0, 348.0),
+                (192.0, 348.0),
+                (206.0, 376.0),
+                (220.0, 420.0),
+                (234.0, 348.0),
+                (178.0, 420.0),
+                (248.0, 292.0),
+                (262.0, 348.0),
+                (276.0, 420.0),
+                (290.0, 236.0),
+                (304.0, 348.0),
+            ] {
+                for route in SettingsRoute::ALL {
+                    if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
+                        continue;
+                    }
+                    for segments in [false, true] {
+                        let mut lab = Lab::new("");
+                        lab.state_mut().navigate(route);
+                        let before = lab.compile(width, height);
+                        let Some((key, was)) = before
+                            .paint
+                            .iter()
+                            .rfind(|node| {
+                                let control = if segments {
+                                    node.key.as_str().starts_with("settings/segment/")
+                                        && matches!(node.content, UiContent::Button(_))
+                                } else {
+                                    matches!(node.content, UiContent::Switch(_))
+                                };
+                                control
+                                    && node.clip == node.rect
+                                    && before
+                                        .semantic(&node.key)
+                                        .is_some_and(|live| live.rect == node.rect)
+                            })
+                            .map(|node| (node.key.clone(), node.rect))
+                        else {
+                            continue;
+                        };
+                        let (action, value) = if segments {
+                            (key.as_str().to_string(), None)
+                        } else {
+                            let Some(crate::native_ui::SemanticValue::Bool(on)) =
+                                before.semantic(&key).map(|node| node.value.clone())
+                            else {
+                                continue;
+                            };
+                            let setting = key.as_str().trim_start_matches("settings/control/");
+                            (
+                                format!("settings/set/{setting}"),
+                                Some(SemanticInput::Bool(!on)),
+                            )
+                        };
+                        lab.dispatch(AppEvent::FocusChanged(Some(key.clone())));
+                        let _ = lab.compile(width, height);
+                        let Some((patch, operation)) = lab.invoke(&action, value) else {
+                            continue;
+                        };
+                        lab.carry(patch, operation);
+                        let pressed = lab.compile(width, height);
+                        // A segment chosen takes its segmented control's key.
+                        let control = if segments {
+                            let field = key
+                                .as_str()
+                                .trim_start_matches("settings/segment/")
+                                .rsplit_once('/')
+                                .map_or("", |(field, _)| field);
+                            UiKey::new(format!("settings/control/{field}"))
+                        } else {
+                            key.clone()
+                        };
+                        if !after_bar_over(&pressed, was)
+                            || pressed.semantic(&UiKey::new("settings/undo")).is_none()
+                        {
+                            continue;
+                        }
+                        over += 1;
+                        let context =
+                            format!("{route:?} {width}x{height} at {scale}x {}", key.as_str());
+                        let place = |compiled: &crate::native_ui::CompiledUi| {
+                            (
+                                compiled
+                                    .paint
+                                    .iter()
+                                    .find(|node| node.key == control)
+                                    .map(|node| (node.rect, node.clip)),
+                                compiled
+                                    .semantic(&UiKey::new("settings/feedback"))
+                                    .map(|node| node.rect),
+                            )
+                        };
+                        let stood = place(&pressed);
+                        let bar = stood.1.unwrap_or_default();
+                        lab.state_mut().common.last_focus = Some(control.clone());
+                        let mut reached = false;
+                        for step in 0..6 {
+                            let Some(target) = tab(&mut lab, true, width, height) else {
+                                break;
+                            };
+                            let after = lab.compile(width, height);
+                            if place(&after) != stood {
+                                faults.push(format!(
+                                    "{context}: Shift-Tab {step} to {} moved {:?} to {:?}",
+                                    target.as_str(),
+                                    stood,
+                                    place(&after)
+                                ));
+                                break;
+                            }
+                            let shown = after.semantic(&target).map(|node| node.rect);
+                            if shown.is_none_or(|rect| {
+                                !target.as_str().starts_with("settings/undo")
+                                    && rect.intersect(bar).is_some_and(|both| both.height > 0.5)
+                            }) {
+                                faults.push(format!(
+                                "{context}: Shift-Tab {step} went to {} under the bar: {shown:?}",
+                                target.as_str()
+                            ));
+                                break;
+                            }
+                            if target.as_str() == "settings/undo" {
+                                reached = true;
+                                break;
+                            }
+                        }
+                        if !reached {
+                            faults
+                                .push(format!("{context}: Shift-Tab never reached the bar's Undo"));
+                            continue;
+                        }
+                        read += 1;
+                        let Some(target) = tab(&mut lab, false, width, height) else {
+                            continue;
+                        };
+                        let after = lab.compile(width, height);
+                        let first_under = pressed
+                            .focus_order
+                            .iter()
+                            .skip_while(|stop| stop.as_str() != "settings/undo")
+                            .nth(1);
+                        if place(&after) != stood || Some(&target) != first_under {
+                            faults.push(format!(
+                            "{context}: Tab from the Undo went to {} (the first under the bar is \
+                             {first_under:?}) and moved {:?} to {:?}",
+                            target.as_str(),
+                            stood,
+                            place(&after)
+                        ));
+                        }
+                    }
+                }
+            }
+            assert!(
+                faults.is_empty(),
+                "{} faults:\n{}",
+                faults.len(),
+                faults.join("\n")
+            );
+            if scale > 1.5 {
+                assert!(
+                    over > 3 && read == over,
+                    "{over} bars over the list, {read} read"
+                );
+            }
+        },
+    );
 }
 
 #[test]

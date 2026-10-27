@@ -110,7 +110,11 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
         "uniform rows beside an epoch step cannot be laundered into either \
          exact transform"
     );
-    let change = sync_cursor_effect_scroll(ws, term.content_scroll_state());
+    // The curtain falls on the take's own clock, after its last frame: dropped at the wall
+    // clock's now, it fell some time after the frames timed from it on a loaded host (the Linux
+    // lane's guest stalled past the curtain's quarter second, every frame dark).
+    let fell = t0 + Duration::from_millis(400);
+    let change = ws.fx.sync_scroll(term.content_scroll_state(), fell);
     assert!(change.invalidated);
     assert!(
         ws.fx
@@ -120,7 +124,6 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
             .is_some_and(|r| r.curtained() && !r.at_rest()),
         "an invalidation must still act on the earned light"
     );
-    let fell = Instant::now();
     let mut lit = Vec::new();
     for ms in [0_u64, 16, 33, 50] {
         ws.fx.cursor_mut().glow.tick(

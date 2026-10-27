@@ -139,10 +139,23 @@ impl CursorGlow {
         n
     }
 
+    /// Whether the frame's cell under the caret at `(row, col)` holds a
+    /// letter: a block caret draws it cut out of its fill in the cell's own
+    /// ground. `false` for a cell the frame did not read.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn caret_lettered(&self, (row, col): (u16, u16)) -> bool {
+        matches!(
+            self.frame_text.pair(row as i32, col as i32),
+            Some((Some(_), _))
+        )
+    }
+
     /// Host observation: the cells of the frame about to be presented,
     /// whose first cell is window cell `at` (a split's focused pane hands
     /// its own cells at its offset, the window's composite being drawn only
     /// after the cursor's step). `cur` is in window cells.
+    #[inline]
     pub fn observe_frame_text_at(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -153,10 +166,6 @@ impl CursorGlow {
         /// The most rows one frame reads: a leap longer than this keeps its
         /// far rows unknown.
         const MAX_ROWS: i32 = 256;
-        #[inline]
-        const fn rgb(c: [u8; 3]) -> u32 {
-            ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32)
-        }
         #[inline]
         const fn extend_bounds(lo: &mut i32, hi: &mut i32, row: u16) {
             let r = row as i32;
@@ -185,65 +194,55 @@ impl CursorGlow {
             extend_bounds(&mut lo, &mut hi, a);
             extend_bounds(&mut lo, &mut hi, b);
         }
+        // The rows a landing ring reaches about its caret: 1.7 rows at twice
+        // a hop's radius ([`super::raster::classic_ring_radius_factor`]), and
+        // its rim.
+        const RING_ROWS: u16 = 4;
+        if let Some(Ring {
+            caret: Some((row, _)),
+            ..
+        }) = self.ring
+        {
+            extend_bounds(&mut lo, &mut hi, row.saturating_sub(RING_ROWS));
+            extend_bounds(&mut lo, &mut hi, row.saturating_add(RING_ROWS));
+        }
         let (r0, c0) = (i32::from(at.0), i32::from(at.1));
-        let ft = &mut self.frame_text;
-        ft.rows.clear();
-        ft.pairs.clear();
-        ft.cols = 0;
-        ft.col0 = c0;
-        ft.at = Some(now);
+        // The rows the pet's body lay on last frame, padded for its flight:
+        // its page veil reads the letters under the body wherever it lies,
+        // not only near the caret (`[vim] NORMAL` printed under the cat five
+        // rows below a caret that moved up went bare, looks8 round 2).
+        const PET_TEXT_PAD: i32 = 3;
+        let pet_rows = match (self.pet_body, self.veil_frame) {
+            (Some((_, _, y0, y1)), Some((_, g))) if g.ch > 0 => {
+                let (oy, ch) = (i32::from(g.origin_y), g.ch as i32);
+                Some((
+                    (y0 - oy).div_euclid(ch) - PET_TEXT_PAD,
+                    (y1 - 1 - oy).div_euclid(ch) + PET_TEXT_PAD,
+                ))
+            }
+            _ => None,
+        };
+        #[inline]
+        const fn clamp_row_span(a: i32, b: i32, r0: i32, len: usize) -> (i32, i32) {
+            let hi = r0 + len as i32 - 1;
+            (if a > r0 { a } else { r0 }, if b < hi { b } else { hi })
+        }
+        match pet_rows {
+            Some((a, b)) => {
+                let (a, b) = clamp_row_span(a, b.min(a + MAX_ROWS - 1), r0, cells.len());
+                read_text(&mut self.pet_text, cells, (a, b), c0, r0, now);
+            }
+            None => read_text(&mut self.pet_text, cells, (1, 0), c0, r0, now),
+        }
         if lo > hi {
+            read_text(&mut self.frame_text, cells, (1, 0), c0, r0, now);
             return;
         }
         let lo = (lo - 1 - Self::FRAME_TEXT_RISE).max(r0);
         let hi = (hi + 1)
             .min(r0 + cells.len() as i32 - 1)
             .min(lo + MAX_ROWS - 1);
-        ft.lo = lo;
-        if lo > hi {
-            return;
-        }
-        let mut max_cols = 0usize;
-        let mut r = lo;
-        while r <= hi {
-            let len = cells[(r - r0) as usize].len();
-            if len > max_cols {
-                max_cols = len;
-            }
-            r += 1;
-        }
-        ft.cols = max_cols;
-        let n_rows = (hi - lo + 1) as usize;
-        ft.rows.reserve(n_rows);
-        ft.pairs.reserve(n_rows * ft.cols);
-        let mut row = lo;
-        while row <= hi {
-            let line = cells[(row - r0) as usize].as_slice();
-            let mut glyph_span: Option<(i32, i32)> = None;
-            let n_cols = line.len().min(ft.cols);
-            let mut c = 0;
-            while c < n_cols {
-                let cell = &line[c];
-                let is_glyph = cell.ch != ' ' || cell.wide;
-                if is_glyph {
-                    let ci = c0 + c as i32;
-                    glyph_span = Some(match glyph_span {
-                        Some((first, _)) => (first, ci + 1),
-                        None => (ci, ci + 1),
-                    });
-                }
-                ft.pairs.push(Some((
-                    if is_glyph { Some(rgb(cell.fg)) } else { None },
-                    rgb(cell.bg),
-                )));
-                c += 1;
-            }
-            if n_cols < ft.cols {
-                ft.pairs.resize(ft.pairs.len() + (ft.cols - n_cols), None);
-            }
-            ft.rows.push(glyph_span);
-            row += 1;
-        }
+        read_text(&mut self.frame_text, cells, (lo, hi), c0, r0, now);
     }
 
     /// Host observation.
@@ -400,6 +399,7 @@ impl CursorGlow {
     }
 
     /// Neighbour probe.
+    #[inline]
     pub fn observe_neighbor_rows(&mut self, above: Option<&[char]>, below: Option<&[char]>) {
         let Some(meta) = self.row_cur_meta.as_mut() else {
             return;
@@ -429,5 +429,77 @@ impl CursorGlow {
                 self.v2_probe_row(probed_row + 1, cols);
             }
         }
+    }
+}
+
+/// Read rows `lo..=hi` (window rows; none when `lo > hi`) of `cells`, whose
+/// first cell is window cell `(r0, c0)`, into `ft`: each row's lettered span
+/// and every cell's `(ink, ground)`.
+#[inline]
+fn read_text(
+    ft: &mut FrameText,
+    cells: &[Vec<aterm_core::terminal::RenderCell>],
+    (lo, hi): (i32, i32),
+    c0: i32,
+    r0: i32,
+    now: Instant,
+) {
+    ft.rows.clear();
+    ft.pairs.clear();
+    ft.cols = 0;
+    ft.col0 = c0;
+    ft.at = Some(now);
+    ft.lo = lo;
+    if lo > hi {
+        return;
+    }
+    let mut max_cols = 0usize;
+    let mut r = lo;
+    while r <= hi {
+        let len = cells[(r - r0) as usize].len();
+        if len > max_cols {
+            max_cols = len;
+        }
+        r += 1;
+    }
+    ft.cols = max_cols;
+    #[inline]
+    const fn pack_rgb(c: [u8; 3]) -> u32 {
+        ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32
+    }
+    let n_rows = (hi - lo + 1) as usize;
+    ft.rows.reserve(n_rows);
+    ft.pairs.reserve(n_rows * ft.cols);
+    let mut row = lo;
+    while row <= hi {
+        let line = cells[(row - r0) as usize].as_slice();
+        let mut glyph_span: Option<(i32, i32)> = None;
+        let n_cols = line.len().min(ft.cols);
+        let mut c = 0;
+        while c < n_cols {
+            let cell = &line[c];
+            let is_glyph = cell.ch != ' ' || cell.wide;
+            if is_glyph {
+                let ci = c0 + c as i32;
+                glyph_span = Some(match glyph_span {
+                    Some((first, _)) => (first, ci + 1),
+                    None => (ci, ci + 1),
+                });
+            }
+            ft.pairs.push(Some((
+                if is_glyph {
+                    Some(pack_rgb(cell.fg))
+                } else {
+                    None
+                },
+                pack_rgb(cell.bg),
+            )));
+            c += 1;
+        }
+        if n_cols < ft.cols {
+            ft.pairs.resize(ft.pairs.len() + (ft.cols - n_cols), None);
+        }
+        ft.rows.push(glyph_span);
+        row += 1;
     }
 }

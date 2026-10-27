@@ -834,7 +834,9 @@ mod unix {
         pub(crate) fn retire(self) -> Result<(), String> {
             let removed = remove_if_present(&self.path());
             let _ = fs::remove_file(self.dir.join(self.id.lock_name()));
-            let _ = sync_dir(&self.dir, None);
+            // The removal has happened; report its persistence failure without changing
+            // the quit's result.
+            sync_dir_logged(&self.dir, "the quit removed this run's image");
             drop(self);
             removed
         }
@@ -855,7 +857,9 @@ mod unix {
 
     /// The take-over's second half, once the readers run.
     pub(crate) fn settle_adoption(dir: &Path, parent: JournalId) -> Option<PathBuf> {
-        let _ = sync_dir(dir, None);
+        // The take-over has happened; report its persistence failure and continue settling
+        // the predecessor's lock.
+        sync_dir_logged(dir, "the successor took over its predecessor's image");
         let lock = dir.join(parent.lock_name());
         (!clear_dead_lock(&lock)).then_some(lock)
     }
@@ -913,6 +917,20 @@ mod unix {
         match flush {
             Some(flush) => crate::durable::finish(&handle, flush),
             None => fsync(&handle),
+        }
+    }
+
+    /// [`sync_dir`]'s plain `fsync(2)` after `step` has taken effect: a folder the volume
+    /// cannot flush, or open, is accepted
+    /// (`aterm_durable::DirFlushed::classify`, astream-sys's `dir_flush_unavailable`), and a
+    /// failed flush is logged.
+    fn sync_dir_logged(dir: &Path, step: &str) {
+        if let Err(error) = aterm_durable::DirFlushed::classify(sync_dir(dir, None)) {
+            aterm_log::warn!(
+                "crash journal {}: {step}, but flushing the folder failed, so a \
+                 power loss may take it back: {error}",
+                dir.display()
+            );
         }
     }
 
@@ -1208,7 +1226,9 @@ mod unix {
         }
         clear_leftovers(dir, &leftovers);
         claim.reopened = merge(candidates, quit.windows, &mut claim.set_aside);
-        let _ = sync_dir(dir, None);
+        // The claim has happened; report its persistence failure while preserving the
+        // reopen decision.
+        sync_dir_logged(dir, "the boot claimed the dead runs' images");
         claim
     }
 

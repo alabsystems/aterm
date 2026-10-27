@@ -490,86 +490,72 @@ fn bloom_halo_follows_a_gradient_quad_s_ramp() {
     let theme = Theme::default();
     let (rows, cols) = (8usize, 40usize);
     let (c0, c1) = (0x00E0_0000u32, 0x0000_00E0u32);
-    for oracle in [false, true] {
-        if oracle
-            && !cfg!(all(
-                any(target_os = "macos", target_os = "linux", windows),
-                wgpu_arm
-            ))
-        {
-            continue;
-        }
-        let (cpu, mut gpu) = backends(18.0, theme);
-        #[cfg(all(any(target_os = "macos", target_os = "linux", windows), wgpu_arm))]
-        if oracle {
-            crate::common::disarm_for_oracle(&mut gpu);
-        }
-        let (cw, ch) = cpu.cell_size();
-        let mut win = aterm_gpu::WindowGpu::new();
-        let mut term = Terminal::new(rows as u16, cols as u16);
-        let (x0, n) = (4usize, 30usize);
-        let gradient = vec![GlowQuad::gradient(
-            3,
-            (x0 * cw) as u16,
-            (3 * ch) as u16,
-            (n * cw) as u16,
-            ch as u16,
-            c0,
-            0,
-            c1,
-            0,
-        )];
-        let w = (n * cw) as u32;
-        let cells: Vec<GlowQuad> = (0..n)
-            .map(|k| {
-                let i = (k * cw + cw / 2) as u32;
-                let c = aterm_render::glow_lerp_rgb(c0, c1, i, w);
-                GlowQuad::flat(
-                    3,
-                    ((x0 + k) * cw) as u16,
-                    (3 * ch) as u16,
-                    cw as u16,
-                    ch as u16,
-                    c,
-                    0,
-                )
-            })
-            .collect();
-        let mut gains = Vec::new();
-        for quads in [gradient, cells] {
-            let mut input = term.cell_frame(rows, cols);
-            input.cursor_visible = false;
-            input.cursor_glow_add = quads;
-            gpu.set_bloom(true);
-            let on = gpu.render_input(&mut win, &input, None);
-            gpu.set_bloom(false);
-            let off = gpu.render_input(&mut win, &input, None);
-            let gain = |col: usize| {
-                let p = (3 * ch - 3) * on.width + col * cw + cw / 2;
-                let ch_of = |v: u32, sh: u32| ((v >> sh) & 0xff) as i32;
-                (
-                    ch_of(on.pixels[p], 16) - ch_of(off.pixels[p], 16),
-                    ch_of(on.pixels[p], 0) - ch_of(off.pixels[p], 0),
-                )
-            };
-            gains.push([gain(6), gain(18), gain(32)]);
-        }
-        eprintln!(
-            "oracle={oracle}: (red, blue) halo gain at cols 6/18/32 — gradient {:?}, \
-             flat cells {:?}",
-            gains[0], gains[1]
+    let (cpu, mut gpu) = backends(18.0, theme);
+    let (cw, ch) = cpu.cell_size();
+    let mut win = aterm_gpu::WindowGpu::new();
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    let (x0, n) = (4usize, 30usize);
+    let gradient = vec![GlowQuad::gradient(
+        3,
+        (x0 * cw) as u16,
+        (3 * ch) as u16,
+        (n * cw) as u16,
+        ch as u16,
+        c0,
+        0,
+        c1,
+        0,
+    )];
+    let w = (n * cw) as u32;
+    let cells: Vec<GlowQuad> = (0..n)
+        .map(|k| {
+            let i = (k * cw + cw / 2) as u32;
+            let c = aterm_render::glow_lerp_rgb(c0, c1, i, w);
+            GlowQuad::flat(
+                3,
+                ((x0 + k) * cw) as u16,
+                (3 * ch) as u16,
+                cw as u16,
+                ch as u16,
+                c,
+                0,
+            )
+        })
+        .collect();
+    let mut gains = Vec::new();
+    for quads in [gradient, cells] {
+        let mut input = term.cell_frame(rows, cols);
+        input.cursor_visible = false;
+        input.cursor_glow_add = quads;
+        gpu.set_bloom(true);
+        let on = gpu.render_input(&mut win, &input, None);
+        gpu.set_bloom(false);
+        let off = gpu.render_input(&mut win, &input, None);
+        let gain = |col: usize| {
+            let p = (3 * ch - 3) * on.width + col * cw + cw / 2;
+            let ch_of = |v: u32, sh: u32| ((v >> sh) & 0xff) as i32;
+            (
+                ch_of(on.pixels[p], 16) - ch_of(off.pixels[p], 16),
+                ch_of(on.pixels[p], 0) - ch_of(off.pixels[p], 0),
+            )
+        };
+        gains.push([gain(6), gain(18), gain(32)]);
+    }
+    eprintln!(
+        "(red, blue) halo gain at cols 6/18/32 — gradient {:?}, \
+         flat cells {:?}",
+        gains[0], gains[1]
+    );
+    for (name, g) in [("gradient", gains[0]), ("flat cells", gains[1])] {
+        let ([r6, b6], [r32, b32]) = ([g[0].0, g[0].1], [g[2].0, g[2].1]);
+        assert!(
+            r6 > b6 && r6 > 0,
+            "{name}: the halo over the red end is red: {g:?}"
         );
-        for (name, g) in [("gradient", gains[0]), ("flat cells", gains[1])] {
-            let ([r6, b6], [r32, b32]) = ([g[0].0, g[0].1], [g[2].0, g[2].1]);
-            assert!(
-                r6 > b6 && r6 > 0,
-                "oracle={oracle} {name}: the halo over the red end is red: {g:?}"
-            );
-            assert!(
-                b32 > r32 && b32 > 0,
-                "oracle={oracle} {name}: the halo over the BLUE end is blue: {g:?}"
-            );
-        }
+        assert!(
+            b32 > r32 && b32 > 0,
+            "{name}: the halo over the BLUE end is blue: {g:?}"
+        );
     }
 }
 

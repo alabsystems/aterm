@@ -93,11 +93,12 @@ fn reflow_narrow_terminal_with_wide_chars_terminates() {
         !row0.is_wrapped(),
         "row 0 should not be wrapped after reflow"
     );
+    // The cursor after the A fills nothing: it continues the line on a row of its own, where the
+    // next glyph goes.
     assert!(row1.is_empty(), "row 1 should be empty after reflow");
-    assert!(
-        !row1.is_wrapped(),
-        "row 1 should not be wrapped after reflow"
-    );
+    assert!(row1.is_wrapped(), "row 1 holds the cursor after the A");
+    assert_eq!((grid.cursor_row(), grid.cursor_col()), (1, 0));
+    assert!(grid.row(2).unwrap().is_empty() && !grid.row(2).unwrap().is_wrapped());
 }
 
 #[test]

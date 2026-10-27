@@ -7,10 +7,11 @@
 //! prints one TSV row per file and level: input bytes, frame bytes, the ratio, encode MB/s
 //! (10^6 input bytes a second, one thread), and decode MB/s. Each file is streamed in
 //! 1 MiB writes with a checksum and no declared size, the frame atpkg-publish's
-//! `tarwrite::Zstd` writes at `--window-log 27`; `--declare-size` declares the file's size
-//! in the header too (four more bytes there, and a single segment for a file within the
-//! window). `--window-log N` sets the window; `--write DIR` keeps each frame as
-//! `DIR/<file name>.<level>.zst`.
+//! `tarwrite::Zstd` writes at `--window-log 27` for a tar over 2^27 bytes; `--declare-size`
+//! declares the file's size in the header too (four more bytes there, and a single segment
+//! for a file within the window), the frame it writes for a tar within 2^27 bytes at
+//! `--window-log` the smallest power of two that holds it. `--window-log N` sets the
+//! window; `--write DIR` keeps each frame as `DIR/<file name>.<level>.zst`.
 //!
 //! `encode_measure --decode FRAME...` instead decodes each frame from its file as atpkg's
 //! extractor does (`Decoder::new(file).require_checksum()`), printing the bytes and decode

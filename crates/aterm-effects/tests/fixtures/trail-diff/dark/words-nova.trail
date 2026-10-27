@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# The classic nova: `words nova` sets [sparkle_words.profanity] style = "nova", so every profanity
+# bursts; one printed and two typed.
+
+grid 16 90
+style rainbow kitty
+hz 60
+words nova
+
+at 0 pty "\e[3;1Hfuck, the tests are red\r\n\e[9;1H$ "
+at 700 key o
+at 702 pty "o"
+at 800 key h
+at 802 pty "h"
+at 900 key space
+at 902 pty " "
+at 1000 key f
+at 1002 pty "f"
+at 1100 key u
+at 1102 pty "u"
+at 1200 key c
+at 1202 pty "c"
+at 1300 key k
+at 1302 pty "k"
+at 1400 key ,
+at 1402 pty ","
+at 1500 key space
+at 1502 pty " "
+at 1600 key f
+at 1602 pty "f"
+at 1700 key u
+at 1702 pty "u"
+at 1800 key c
+at 1802 pty "c"
+at 1900 key k
+at 1902 pty "k"
+run 5500

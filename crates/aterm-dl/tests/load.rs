@@ -3,7 +3,7 @@
 
 //! Dynamic loader tests against `libc.so.6` and refusal cases.
 
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 
 use std::ffi::CStr;
 
@@ -33,14 +33,17 @@ aterm_dl::table! {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 static LIBC: &[&CStr] = &[c"libc.so.6"];
+#[cfg(target_os = "macos")]
+static LIBC: &[&CStr] = &[c"/usr/lib/libSystem.B.dylib"];
 static NOWHERE: &[&CStr] = &[c"libaterm-dl-absent.so.9", c"libaterm-dl-absent.so"];
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn reads_libc_and_calls_through_the_table() {
-    let lib = Library::open(LIBC).expect("libc.so.6 loads in every Linux process");
-    assert_eq!(lib.soname(), c"libc.so.6");
+    let lib = Library::open(LIBC).expect("the platform C library");
+    assert_eq!(lib.soname(), LIBC[0]);
     // SAFETY: the rows transcribe glibc's prototypes.
     let fns = unsafe { Libc::load(&lib) }.expect("every required row resolves");
     // SAFETY: getpid takes nothing and cannot fail.
@@ -60,7 +63,7 @@ fn reads_libc_and_calls_through_the_table() {
     assert!(fns.getppid.is_some(), "an optional row it has is read");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_missing_symbol_is_named() {
     let lib = Library::open(LIBC).expect("libc.so.6");
@@ -71,14 +74,17 @@ fn a_missing_symbol_is_named() {
     assert_eq!(
         err,
         Error::MissingSymbol {
-            library: c"libc.so.6",
+            library: LIBC[0],
             symbol: c"aterm_dl_missing_row",
         }
     );
-    assert_eq!(err.to_string(), "libc.so.6 lacks aterm_dl_missing_row");
+    assert_eq!(
+        err.to_string(),
+        format!("{} lacks aterm_dl_missing_row", LIBC[0].to_string_lossy())
+    );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_missing_library_names_every_soname_tried() {
     let err = Library::open(NOWHERE).expect_err("no such library");
@@ -98,7 +104,7 @@ fn a_missing_library_names_every_soname_tried() {
     );
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn off_linux_nothing_loads() {
     assert_eq!(

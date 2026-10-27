@@ -118,10 +118,15 @@ Setup choices:
   Set up aterm's macOS permissions (switches still need your clicks)
   Sync the secrets vault (default http://alab-secrets.local:7484/v1/alab, or the vault
     this Mac is in; editable)
-  Authenticate GitHub via synced credentials and clone accessible repositories
+  Authenticate GitHub via synced credentials and clone your own repositories
 
 Approved setup resumes unfinished steps on later launches, silently, and so does a
-choice cut short by a quit or a crash, which still sets only what it changed. A choice
+choice cut short by a quit or a crash, which still sets only what it changed. A step
+aterm stopped in (a crash, a kill, a power loss) resumes once at the next launch with no
+press, its row reading Resuming after aterm stopped; stopped in it twice, or still in it
+after an hour, the step waits for Check again while the others go on. A quit or an
+update is no stop. A clone a killed aterm left half done is swept at the next
+GitHub repositories step, never one still cloning or a published clone. A choice
 made while another setup holds the records (another aterm, or aterm doctor in a
 terminal) waits for it and is applied when it finishes, as are a Restore and the ALab
 widening; a later choice
@@ -162,7 +167,11 @@ question aterm raised, or a later look, replaces an old refusal, and Check again
 again without ever asking. Completed setup preserves later local changes: a group
 turned to Set up later sets only its own preferences, and a Join or a group turned to
 Leave as is sets none. So it is after an older aterm's setup: its plan gains aterm's
-permissions, and a choice never resets its Dock or signs out again. Rust in Spotlight
+permissions, and a choice never resets its Dock or signs out again. A setting you changed
+after aterm set it and read it back is yours: no retry, widened plan, update, other
+Mac's profile or older aterm's records make this aterm set it again (an older aterm may),
+and its row reads Changed by you until Restore, turning its group off and on, or Set up
+now. Rust in Spotlight
 keeps aterm's own build caches out, and aterm keeps its own Rust toolchain out by
 itself (the toolchain it is using moves at its next update, which the row notes); your
 projects' build folders Spotlight indexes are yours, counted in the row's note and
@@ -253,7 +262,7 @@ REWIND
   underneath. The band says whether a live witness checked that state (`faithful`,
   `may differ from what was on screen`, or `unchecked`). It needs Settings > Terminal >
   Rewind (`temporal_recording = true`) turned on before the tab opens. Its other keys,
-  find, copy and export: `aterm help rewind`.
+  find, copy, export and forget: `aterm help rewind`.
 
 GOTCHAS
   * `aterm <tool>` for an uninstalled store tool exits 127 with `atpkg: <tool> is not
@@ -264,8 +273,10 @@ GOTCHAS
     wins; a malformed mode fails closed to `containment`): the macOS sandbox allows no
     network, no task port but its own, writes only to temp dirs and `~/.zsh_history` /
     `~/.bash_history`, no credential or keychain access, and no Mach lookup but user
-    and group queries, which disables `open`, `osascript` and `pbcopy`/`pbpaste`. The
-    window brokers no OSC 52, Kitty file/shm image or notification for a contained tab.
+    and group queries, which disables `open`, `osascript` and `pbcopy`/`pbpaste`;
+    launchd still restarts, unloads, disables or enables the user's own jobs when asked
+    (it registers none). The window brokers no OSC 52, Kitty file/shm image or
+    notification for a contained tab.
   * macOS `Operation not permitted` on a protected path is privacy consent:
     `aterm ctl privacy` and `aterm help permissions`.
   * macOS builds and tests that stall on freshly linked binaries need aterm on the
@@ -454,34 +465,41 @@ STATUS & RESTORE
         ),
     },
     Topic {
-        name: "caffeine",
-        tagline: "the menu-bar keep-awake mug — a click keeps this Mac awake (on | off | status | startup | quit)",
+        name: "acaffiene",
+        tagline: "the menu-bar keep-awake mug — starts with aterm (on | off | status | startup | quit)",
         body: Some(
-            r#"caffeine — menu-bar keep-awake mug (`aterm caffeine`, macOS only).
+            r#"acaffiene — menu-bar keep-awake mug (`aterm acaffiene`, macOS only).
 
 WHAT IT DOES
   While full, the mug's launchd process holds an idle-sleep assertion (`pmset -g
   assertions`): neither the system nor the display idle-sleeps (closing the lid or
   choosing Sleep still sleeps). A click toggles it; a right-click or Control-click
-  opens the menu (1h, 8h, 24h, Forever, Enable at Startup, Quit Caffeine). Timed
+  opens the menu (1h, 8h, 24h, Forever, Enable at Startup, Quit aCaffiene). Timed
   spans count time asleep, and a change of the date or time neither lengthens nor
-  shortens one; a restart turns it off, a logout keeps it. Enable at Startup works
+  shortens one; a reboot or an expired span returns to forever. Enable at Startup works
   only while aterm's switch under Background App Activity (System Settings >
   General > Login Items & Extensions) is on; while it is off, `startup` reads
   `blocked` and the menu row opens Login Items. A job turned off with `launchctl
   disable` reads `disabled`; turning Enable at Startup on lifts that.
 
-VERBS (`aterm caffeine --help` has each one)
-  aterm caffeine [start] | on [1h|8h|24h|forever|<n>h|<n>m] | off | status
-  aterm caffeine startup [on|off] | quit [own]
+STARTING WITH ATERM
+  Every ordinary aterm window launch starts the mug and keeps this Mac awake
+  forever in every build; headless, diagnostic and private-control launches do
+  not. Quit aCaffiene ends it until the next aterm launch, which turns it back on.
+  Enable at Startup also puts it back at every login, and can be turned off
+  independently.
+
+VERBS (`aterm acaffiene --help` has each one)
+  aterm acaffiene [start] | on [1h|8h|24h|forever|<n>h|<n>m] | off | status
+  aterm acaffiene startup [on|off] | quit [own]
 
 FILES
   Runs from an isolated bundle copy in
-  `~/Library/Application Support/aterm/caffeine-code.noindex/`, with state in
-  `caffeine.state`, lock in `caffeine.lock`, update bridge pid in
-  `caffeine.bridge`, and its job's plist in `caffeine/<label>.plist` beside them
+  `~/Library/Application Support/aterm/acaffiene-code.noindex/`, with state in
+  `acaffiene.state`, lock in `acaffiene.lock`, update bridge pid in
+  `acaffiene.bridge`, and its job's plist in `acaffiene/<label>.plist` beside them
   (`~/Library/LaunchAgents/<label>.plist` while Enable at Startup is on). The job's
-  stderr goes to `~/Library/Logs/aterm/caffeine.log`; why the mug turned off or
+  stderr goes to `~/Library/Logs/aterm/acaffiene.log`; why the mug turned off or
   stopped, a failed Enable at Startup and who sent it a SIGTERM go to `aterm.log`
   beside it."#,
         ),
@@ -525,11 +543,13 @@ ON THE WIRE
 
 WHAT IT DOES
   A tab opened with Settings > Terminal > Rewind on (`temporal_recording = true`)
-  keeps, in memory and within a per-session budget, the bytes its program wrote and
-  keyframes of its screen. Rewind replays them into a separate screen and shows it in
-  the pane, inside an accent border, over a track and a band. The program is not
-  rewound: its output keeps arriving underneath (`live +N KB` on the band), and a
-  person's keys and clicks reach no program while the pane is rewound.
+  keeps, in memory only, the bytes its program wrote and keyframes of its screen:
+  at most `rewind_budget_mb` (8) per pane and `rewind_total_mb` (128) for all panes
+  together, the panes focused longest ago giving up their oldest history first.
+  Rewind replays them into a separate screen and shows it in the pane, inside an
+  accent border, over a track and a band. The program is not rewound: its output
+  keeps arriving underneath (`live +N KB` on the band), and a person's keys and
+  clicks reach no program while the pane is rewound.
 
 KEYS (while the pane is rewound)
   Left / Right            one recorded state
@@ -537,13 +557,15 @@ KEYS (while the pane is rewound)
   Shift-Left / Right      the previous or next command start (OSC 133 marks, from
                           shell integration); the band says when there is none
   Cmd-Left / Right        the oldest or the newest kept state (also Home / End)
-  scroll, Page Up / Down  the past screen's own scrollback, up to 2048 lines
+  scroll, Page Up / Down  the past screen's own scrollback, up to 2048 lines (no more
+                          than the session keeps); scrolled, the band reads `unchecked`
   drag, then Cmd-C        copy from the past screen (Cmd-A selects all of it)
   Cmd-F                   find over the past screen
   click a cell, then B    the state that last changed that cell; B again, the change
                           before it. The band says, for example, `row 18 col 42
                           changed 12.4 s ago: 37 bytes "\e[18;42Hx"`, with every
-                          control byte escaped
+                          control byte escaped; past a replay a live witness
+                          contradicts, it says the history before is unknown
   Esc or Cmd-Shift-R      back to live
   A step never lands inside a synchronized frame (mode 2026) a program had not
   finished drawing.
@@ -553,20 +575,34 @@ THE BAND AND THE TRACK
   803/1412`), and what the live witnesses say of it: `faithful` (a capture of the live
   screen matched the replay), `may differ from what was on screen` (one did not), or
   `unchecked`. The track above it spans the kept history: the block is the shown
-  state, and hatched stretches cannot be rebuilt or did not match. Hosted effects on
-  the window (`aos`) pause while it is rewound and resume after; the band says so.
+  state, and hatched stretches cannot be rebuilt or did not match. The past screen
+  is drawn up to two rows higher so neither covers it; scroll up for its top rows.
+  Hosted effects on the window (`aos`) pause while its focused pane is rewound; the
+  band says so.
 
 ELSEWHERE
   Right-click a tab: its timeline rows open Rewind at their instant.
   View > Export Pane History… (macOS) writes the kept history as an asciicast v2
-  file, mode 0600, where a save panel says; nothing is written without it.
+  file, mode 0600, where a save panel says (elsewhere use `rewind export`). The
+  file keeps what painted (text, colours, titles, links, images that carry their
+  pixels) and the shell marks without the session's key; clipboard writes,
+  notifications, user variables and queries are left out.
+  View > Forget Pane History drops the focused pane's kept history, and Forget All
+  History every pane's; each keeps recording from its screen at that moment. Closing
+  a tab drops its history too.
   A screen reader sees the band as a slider (Increment and Decrement step).
 
 ON THE WIRE (`aterm ctl help rewind`)
   aterm ctl rewind [status] | open [ago=<secs>|at=<tick>] | step <+-n> [by=sec|cmd]
-                   | changed <row>,<col> | text [trim] | export | close
+                   | changed <row>,<col> | text [trim] | export | check [export] | close
+                   | forget [all]
   `rewind changed` takes a 0-based cell; `rewind export` writes the file, mode 0600,
-  under the state directory's `rewind/` folder.
+  under the state directory's `rewind/` folder. `rewind check` replays every kept
+  stretch step by step as an Aos task under this build and says whether each screen
+  capture, reply and clock matched (`verdict=pass`, or the law that failed and where);
+  `rewind check export` also writes that stretch as a trace `aterm ctl aos check`
+  replays, in this or another aterm of the same build. `rewind forget all` needs the
+  owner.
 
 LIMITS
   Images and the child process are not rewound. Nothing before the oldest kept
@@ -621,7 +657,7 @@ CONFIGURATION — `[ai]` in `aterm.toml`
     },
     Topic {
         name: "init",
-        tagline: "set up this Mac from a terminal (SSH, CLI-only Macs); aterm.app's first launch does it by itself",
+        tagline: "set up this Mac (SSH, CLI-only Macs) or a Linux machine from a terminal; aterm.app's first launch does it by itself",
         body: None, // generated — see `init_page()`
     },
     Topic {
@@ -632,14 +668,16 @@ CONFIGURATION — `[ai]` in `aterm.toml`
 `~/.secrets/<name>` (macOS and Linux; `aterm secrets --help` has every verb and flag).
 
   aterm secrets join <url>#<key>               a new machine: paste the line `create` printed
-  aterm secrets approve <age1…> --name <host>  an admin lets in one that typed no password
+  aterm secrets approve <age1…> --name <host>  an admin lets in one a closed or path vault holds
   aterm secrets                                what this machine holds, and whether it syncs
 
 DETAILS
 
   A vault Mac starts with `aterm secrets create http://127.0.0.1:7484/v1/<name> --serve`:
   its server set up and answering, then the vault, then the `join` line to paste on the
-  other machines (with this Mac's LAN name) and, at a terminal, the join password.
+  other machines (with this Mac's LAN name). A new vault is open: its admin's subscriber
+  lets in every machine that asks. `aterm secrets password new` gives it a join password
+  instead, and `password off` leaves each machine to an admin's approval by code.
 
 HOW IT WORKS
   An admin machine encrypts the vault (age X25519, one locker per audience), signs
@@ -667,9 +705,9 @@ VERBS
                   admins, rotate-key
   a server        serve, server on|off|status (`server on` returns once it answers)
   `watch` is the subscriber `agent on` installs; on an admin it also lets in machines
-  that type the join password. `agent off` records that choice, which setup keeps,
-  and every install of the subscriber removes it. A path vault has no join queue:
-  approve each key.
+  that ask (on an open vault) or type the join password. `agent off` records that
+  choice, which setup keeps, and every install of the subscriber removes it. A path
+  vault has no join queue: approve each key.
 
 FILES
   `~/.config/aterm/secrets/{source.toml,identity,state.toml,vault}` and `~/.secrets/<name>`."#,
@@ -778,7 +816,13 @@ AUTOPILOT — how far the harness carries a session's work
   status`; set from the footer chip, with `aterm ctl @<sid> meta set autopilot <mode>`,
   or by default from `[harness] autopilot`):
   * cruise (`∞`, the default; chip: `keeps going for ever, finding more to do`) —
-    continues every turn end (`continue_text`); no report ends it. Each time a reply
+    continues every turn end (`continue_text`) and never parks: no report ends it,
+    and a reply to a person's own message, a `NEEDS YOU:` report and a turn that ends
+    while the agent's own background work runs (a workflow, a background agent, a
+    shell) are continued too, that last with a short prompt to check on the work and
+    keep going (`continue-background@v1`, asked again after 2, 4, 8 … and at most 60
+    minutes while the agent answers it in seconds); only a run of replies with no work
+    stops its typing (Stopped typing, below). Each time a reply
     says the work is done, it asks the agent for another kind of work, in turn: the
     widest check on the merged tree, a hostile review of the landed diff, what its
     reports called out of scope, a measurement against the main it started from, the
@@ -794,12 +838,18 @@ AUTOPILOT — how far the harness carries a session's work
     branch. That check counts nothing unpushed where the repository has no remote, and
     reads nothing in a folder that is not a repository, one macOS guards, a network or
     automounted volume, or where no `git` runs; codex-alab lands by its own check. That
-    marks `task=landed` (`✓ landed`) and stops typing until someone else's turn.
+    marks `task=landed` (`✓ landed`) and stops typing until someone else's turn. A
+    switch to `land` is acted on at once: within about a second when the agent is at
+    rest, at its next turn end when it is mid-turn, never typed into a running turn.
   * off (`○ off`; chip: `hands off`) — nothing is pressed or typed.
 
   Task states (`status task=`): `open` (work goes on), `landed` (a clean `Nothing
-  left:` under `land`), `theirs` (`⤓ quiet`: a person's own exchange in the last 10
-  minutes, left alone).
+  left:` under `land`), `theirs` (`⤓ quiet`: under `land`, a person's own exchange in
+  the last 10 minutes, left alone).
+
+  Under every mode nothing is typed while a person types (`human_grace_s`), another
+  driver holds the tab, or the composer holds a draft or input is unsent; a dialog or
+  question box is answered by its own rule, and a usage limit or a hold waits as before.
 
   Stopped typing: when the agent answers aterm's acts with the same reply twice and
   no work, or six replies in a row with no work, aterm stops typing into its tab, in
@@ -1035,7 +1085,9 @@ HOW IT WORKS & GOTCHAS
       defaults -currentHost delete com.apple.universalcontrol DisableMagicEdges
     and set `universal_control = "leave"` in `aterm.toml`.
   * `[packages]` keys in `aterm.toml`: `enabled` (default `true`), `auto_install`
-    (default `true`), and `exclude = [...]`."#,
+    (default `true`), `exclude = [...]`, and `peers = ["host[:port]", ...]`: LAN Macs a
+    toolset download races, each archive taken from one only when it hashes to the signed
+    digest. A Mac serves its archives to them while `aterm pkg serve-units` runs (opt-in)."#,
         ),
     },
     Topic {
@@ -1715,8 +1767,8 @@ fn overview_page() -> String {
                 "configure and manage a lab of Macs over SSH (init | scan | enroll | status | plan | apply | person)"
             }
             crate::Verb::Init => {
-                "set up this Mac from a terminal (SSH, CLI-only Macs); aterm.app's first launch \
-                 does it by itself"
+                "set up this Mac (SSH, CLI-only Macs) or a Linux machine from a terminal; aterm.app's \
+                 first launch does it by itself"
             }
             crate::Verb::Secrets => {
                 "one credentials file for every machine: the vault, its server and ~/.secrets \
@@ -1731,7 +1783,7 @@ fn overview_page() -> String {
             crate::Verb::Keeper => {
                 "the PTY keeper: shells that outlive a crashed window (start | stop | status | serve; macOS, opt-in)"
             }
-            crate::Verb::Caffeine => {
+            crate::Verb::Acaffiene => {
                 "the menu-bar keep-awake mug: a click keeps this Mac awake (on | off | status | startup | quit; macOS)"
             }
             crate::Verb::Theme => {
@@ -1796,6 +1848,15 @@ fn sys_page() -> String {
     let volume = home.as_deref().and_then(aterm_sysprobe::volume);
     let mut s = String::new();
     s.push_str("aterm help sys — what this machine, aterm and this tab use, measured now\n\n");
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = writeln!(
+            s,
+            "DIAGNOSTIC CLIENT\n  This help runs from {}. sys cores/procs also name the running server's diagnostic_executable. If PATH resolves an older development copy, use that server executable for ctl; do not overwrite an installed app.\n",
+            exe.display()
+        );
+    }
+    s.push_str("AUTHORIZED CPU POLICY DIAGNOSTICS (macOS)\n  aterm ctl @self sys policy status --json reads operation status without prompting. sys policy collect requests one bounded, read-only collection of Game Mode, CarPlay and runaway-mitigation flags through aterm's own password sheet; focus the requesting tab. sys policy cancel requests cancellation. Repeated requests cannot launch another operation until the exact collector and pipe readers have drained. sys report --json includes per-PID generation, per-selector values/errors, actual collector euid, observation window and coverage; a zero-hit census is not an atomic global all-clear or a hardware diagnosis. No automatic reboot or policy change.\n\n");
+    s.push_str("SCHEDULING\n  sys procs reports Darwin nice, target application and requested-background bits, suppression, application role and lifetime CPU nanoseconds by QoS; zero/false are measured values, and refusal, unsupported and OS errors remain distinct. sys cores/procs/why show cluster occupancy and flag runnable wait with idle performance cores only across aligned nominal sampling windows. Unchanged core counters leave current utilization unavailable; a held drawing value is not a new measurement. This is an observation, not proof of which cores a worker used or why it waited. nice=0/background=false do not rule out a QoS ceiling. For a deliberate macOS policy change, taskpolicy -a must wrap the actual worker exec: an outer wrapper's role does not survive fork, and -B only clears Darwin backgrounding. Preserve loader environment and job ownership, and measure counter deltas and the result.\n\n");
     s.push_str("THIS MACHINE (read now)\n");
     let clusters: Vec<String> = layout
         .clusters
@@ -2010,7 +2071,7 @@ READ — `aterm ctl @self sys [<view>] [--json] [since=<cursor>]`
                                     next=<c>, plus the events since (pressure,
                                     throttle, swap, disk, load, tab, orphan,
                                     lane, job)
-  Views: overview tab aterm global jobs cores gpu mem disk procs why; options
+  Views: overview tab aterm global jobs cores gpu mem disk procs why report; options
   scope=, top=, fresh=<ms>, depth=; `instances=all` asks every aterm here, each
   reply in turn. The header (stderr) carries as_of=, age_ms=, window_ms= and
   next=. `aterm ctl help sys` is the full grammar.
@@ -4005,8 +4066,9 @@ THE MOVES (see -> decide -> drive -> observe)
           aterm ctl @sid send '...' | key enter | paste | resize <r> <c>
           Claude Code peer: `turn typed=1 settle=submitted '<line>'`, then in background
           `await agent idle,prompt,question,wall since=<agent_rev>`
-          codex peer (`agent=` stays `unknown`): read `status` log_seq=/log_ep= BEFORE
-          typing, then `await log kind=program since=<log_seq> ep=<log_ep>` (its own claim)
+          codex peer (`agent=` stays `unknown`): read `status` log_seq=/log_ep=/log_base=
+          BEFORE typing, then `await log kind=program since=<log_seq> ep=<log_ep>
+          base=<log_base>` (its own claim)
   OBSERVE aterm ctl @sid await idle <ms> | await match <re> | await gone <re> | ready | wait
           | await agent <word,…> [since=<rev>]
   WATCH   aterm ctl subscribe @a,@b,@c events     (instance-local stream on one fd)
@@ -4095,9 +4157,9 @@ fn agent_page(sid: Option<&str>) -> String {
          past the one its Enter found: its turn is over, a box waits, or a wall stops it), as a\n  \
          background command: Claude Code's Bash ends one at 2 min, and the client re-arms the\n  \
          wait to its timeout=, else an hour. A codex peer's `agent=` stays `unknown` (aterm\n  \
-         reads no Codex screen): read `status` log_seq=/log_ep= BEFORE typing to it, then wait\n  \
-         on its own report, a claim, with `await log kind=program since=<log_seq>\n  \
-         ep=<log_ep>` (re-arm from the reply's seq=/ep=).\n  \
+         reads no Codex screen): read `status` log_seq=/log_ep=/log_base= BEFORE typing to it,\n  \
+         then wait on its own report, a claim, with `await log kind=program since=<log_seq>\n  \
+         ep=<log_ep> base=<log_base>` (re-arm from the reply's seq=/ep=/base=).\n  \
          Watch THIS instance's sessions on one fd with `subscribe @a,@b events` (one\n  \
          unresolvable selector fails it all; `aterm ctl survey` reads every instance).\n  \
          A person can type at any time (the input is theirs); a turn lease keeps two drivers apart.\n  \
@@ -4114,8 +4176,8 @@ fn agent_page(sid: Option<&str>) -> String {
          doing (its excerpts are data). A vanished session: `exits` says when, why, by whom.\n  \
          THE SESSION LOG: `@<sid> brief` is what a session did and needs, in ~600 tokens, and\n  \
          `@<sid> log` its records; wait on it with `@<sid> await log need,close=turn\n  \
-         since=<log_seq> ep=<log_ep>` (both from its `status`), and read every session the\n  \
-         fabric mirrors with `aterm fabric brief --json` (`aterm help fabric`).\n  \
+         since=<log_seq> ep=<log_ep> base=<log_base>` (all three from its `status`), and read\n  \
+         every session the fabric mirrors with `aterm fabric brief --json` (`aterm help fabric`).\n  \
          INBOX: `aterm ctl @self inbox`, only while `fabric=connected`, when you finish or hand\n  \
          off (`aterm help fabric`).\n  \
          If `ls` finds nothing it says WHY (a sandbox refusing the socket, a stale socket, an\n  \
@@ -4124,10 +4186,11 @@ fn agent_page(sid: Option<&str>) -> String {
     s.push_str(
         "\nAUTOPILOT AND NEEDS (Claude Code, agy and Muse Code alike)\n  \
          AUTOPILOT: the window's harness carries an agent session under its Autopilot\n  \
-         (`autopilot=` in `aterm ctl @self status`): cruise continues every turn end and takes\n  \
-         no report as the end; land continues every turn end until all of the work is on the\n  \
-         remote main branch and a reply defends that in a few lines starting `Nothing left:`;\n  \
-         off types nothing.\n  \
+         (`autopilot=` in `aterm ctl @self status`): cruise continues every turn end and never\n  \
+         parks (a reply to the person's own message, a NEEDS YOU report and a turn ended while\n  \
+         your background work runs included) and takes no report as the end; land continues\n  \
+         every turn end until all of the work is on the remote main branch and a reply defends\n  \
+         that in a few lines starting `Nothing left:`; off types nothing.\n  \
          NEEDS YOU: a report line starting `NEEDS YOU:` puts that need on the person's menu bar\n  \
          and window border (`NEEDS YOU: nothing` takes it down); the work goes on.\n",
     );
@@ -4299,6 +4362,13 @@ BROADCAST, IDEMPOTENCY, DEADLINES & RECEIPTS
     `inbox seen <id>` advances `seen=` and sends a `kind=ack re=<off> verdict=<v>`
     receipt on `ask`/`task` rows. `dropped=` counts evicted/overflow rows; `truncated=1`
     marks rows cut to fit one control line (fetch the full record via `inbox get @<off>`).
+    `given_up=@<a>..@<b>` names this node's unread mail the broker's retention gave up
+    (whoever it was for); `lane_given_up=@<a>..@<b>` names mail of your own lane it gave
+    up before you handled it, found when the bridge read your lane again: its refill
+    after an update, a recovery or its own restart (past your last `inbox seen`; a
+    session that never ran it is not told there), or its deadline sweep for an ask of
+    yours (past the ask and your last `inbox seen`). `topic ls` names a topic's range.
+    Your log marks each once (`log kinds=mail-gap`).
   * Delivery failures on a waiting `post`: `queued=1`, `no-bridge=1`, and `ERR timeout
     id=` all leave the message queued in the outbox (do not re-post without `key=`).
     `ERR <unroutable|ambiguous|undeliverable|refused|subject-budget> id=` retires the
@@ -4337,7 +4407,8 @@ IS IT ON HERE? (`aterm fabric help` has every flag)
   aterm fabric                  the status report: config, broker, nodes, bridges,
                                 sessions, the last 10 bus records and warnings (exit 0
                                 healthy, 1 warned, 2 off)
-  aterm fabric tail             the bus records, live
+  aterm fabric tail [--json]    the bus records, live (`--json`: one JSON object per line,
+                                the record's text only with `--bodies`)
   aterm fabric doctor           each warning with its remedy
   aterm ctl @self status        `fabric=connected|stale|stalled|disconnected|absent`,
                                 `fabric_rtt_ms=` and `fabric_link_age_ms=`
@@ -4360,6 +4431,11 @@ THE SESSION LOG ON THE BUS
                                 (`this`). The fabric is one machine's bus, so every node
                                 on it is on this machine; another node's sessions show
                                 only when another instance shares the broker
+  aterm link notify --fleet <F> --broker <ep> --cap-file <cap> --on need[:<word>] --exec <cmd>
+                                run <cmd> once each time a session's need, as the brief
+                                folds it, rises (none to a word, or one word to another);
+                                `$ATERM_NOTIFY_NEED` names the word (`aterm link notify
+                                --help` lists the words)
   aterm ctl @self post to=@<sid>@<node> kind=note re=<off> '<text>'
                                 answer what you read by mail (`re=` the bus offset you
                                 read); no bus record writes into a session's log (a remote
@@ -4401,7 +4477,7 @@ fn page_of(t: &str) -> &str {
         | "containment" | "sandbox" => "aterm",
         "exceptions" => "update",
         "themes" | "colors" | "colours" | "color-scheme" | "colour-scheme" => "theme",
-        "awake" | "keep-awake" => "caffeine",
+        "awake" | "keep-awake" => "acaffiene",
         "secret" | "vault" | "credentials" => "secrets",
         "amacs" | "editor" => "edit",
         "privacy" => "permissions",
@@ -4411,15 +4487,15 @@ fn page_of(t: &str) -> &str {
 
 /// `aterm help init`: the page `aterm init --help` prints, one source for both
 /// ([`aterm_machines::init::usage`]).
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn init_page() -> String {
     aterm_machines::init::usage()
 }
 
 /// `aterm help init` where `aterm init` does not run.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(unix))]
 fn init_page() -> String {
-    "init — set up this Mac from a terminal; macOS only.\n".to_owned()
+    "init — set up this machine from a terminal; Unix only.\n".to_owned()
 }
 
 /// Render the manual: `topic` is the optional `help <topic>` argument, `session` the caller's

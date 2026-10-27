@@ -48,6 +48,10 @@ pub(crate) struct Row {
     pub(crate) kind: String,
     pub(crate) text: String,
     pub(crate) handled: bool,
+    /// The record its row answers (`re=`), for an answer or an `expired`.
+    pub(crate) re: Option<u64>,
+    /// The broadcast topic it came on (`topic=`), for a broadcast.
+    pub(crate) topic: Option<String>,
 }
 
 /// One post a session queued.
@@ -57,6 +61,8 @@ pub(crate) struct Post {
     pub(crate) to: String,
     pub(crate) kind: String,
     pub(crate) re: Option<u64>,
+    /// An ask's deadline, in ms (`dl=`).
+    pub(crate) dl: Option<u64>,
     pub(crate) body: Vec<u8>,
     /// The retirement the bridge sent (`off=<n>[ dup=1]` or `off=- reason=…`).
     pub(crate) retired: Option<String>,
@@ -95,7 +101,24 @@ pub(crate) struct Session {
     /// The session's log (`aterm_slog`), while the node mirrors it onto the
     /// bus (`[fabric] log = "turns"`).
     pub(crate) log: Option<aterm_slog::Log>,
+    /// The offsets of its lane the session asked for (`inbox get @<off>`), parked until the
+    /// bridge answers them: listed on the outbox as `fetch sid= off=`.
+    fetches: Vec<u64>,
+    /// What the bridge answered them (`deliver <sid> fetched=<off> …`), each answer's words
+    /// after the offset with what the broker held of the lane at that offset as the bridge
+    /// answered, in order, until the world takes them ([`Endpoint::take_fetched`]).
+    fetched: Vec<Fetched>,
+    /// The broadcast topics it follows (`topic add <t> since=<s>`), each with its `since=`,
+    /// as `topic ls` names them.
+    pub(crate) topics: BTreeMap<String, String>,
+    /// The newest row id it marked seen, as `topic ls` says it (`seen=`).
+    seen_id: u64,
 }
+
+/// One fetch answer ([`Session::fetched`]): the offset, the answer's words after it, and the
+/// record of the session's lane the broker held there the moment the bridge answered
+/// ([`super::bus::Broker::at`]: the bridge reads nothing between its read and its answer).
+pub(crate) type Fetched = (u64, String, Option<super::bus::At>);
 
 /// A session log's ring in the simulation.
 fn log_limits() -> aterm_slog::Limits {
@@ -118,6 +141,10 @@ impl Session {
             fleet_hold: None,
             bus_log: None,
             addressed_head: None,
+            fetches: Vec::new(),
+            fetched: Vec::new(),
+            topics: BTreeMap::new(),
+            seen_id: 0,
         }
     }
 
@@ -183,8 +210,66 @@ pub(crate) struct EpState {
     pub(crate) byes_acked: u64,
     /// Every alias key a take named.
     pub(crate) take_keys: std::collections::BTreeSet<String>,
+    /// Every `link gap from=<a> to=<b> [records=<n>] [sid=<sid> [topic=<t>]]` a bridge told:
+    /// what retention gave up of this node's unread mail (sim item B05), or of one session's
+    /// lane or topic under the bridge's own read of it (B12).
+    pub(crate) gaps: Vec<ToldGap>,
+    /// How many times a bridge said its mirror waits on its window budget (`link mirror budget`).
+    pub(crate) mirror_waits: u64,
     /// The world's clock as the sessions last stamped a record.
     stamp: aterm_slog::Stamp,
+    /// The world, whose broker each fetch answer is read against as it arrives ([`Fetched`]).
+    world: Option<Arc<super::Core>>,
+}
+
+/// One `link gap` a bridge told, scoped as aterm-gui-fabric's `cmd_link_gap` scopes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToldGap {
+    pub(crate) from: u64,
+    pub(crate) to: u64,
+    pub(crate) records: Option<u64>,
+    /// `sid=`: the session whose lane the bridge's own read met the floor on (B12); `None`: the
+    /// node's unread mail, which every session is told.
+    pub(crate) sid: Option<String>,
+    /// `topic=`: a broadcast topic's range, which is no mail.
+    pub(crate) topic: Option<String>,
+}
+
+impl ToldGap {
+    /// Whether this give-up tells `sid` of its mail at `off`: a node's range tells every
+    /// session, a lane's only its own, a topic's none.
+    pub(crate) fn tells_mail_of(&self, sid: &str, off: u64) -> bool {
+        self.topic.is_none()
+            && self.sid.as_deref().is_none_or(|s| s == sid)
+            && (self.from..self.to).contains(&off)
+    }
+
+    /// `from=<a> to=<b> [records=<n>] [sid=<sid> [topic=<t>]]`, each key once, in any order.
+    fn parse<'a>(words: impl Iterator<Item = &'a str>) -> Option<Self> {
+        let (mut from, mut to, mut records, mut sid, mut topic) = (None, None, None, None, None);
+        for word in words {
+            let (key, value) = word.split_once('=')?;
+            let fresh = match key {
+                "from" => from.replace(value.parse::<u64>().ok()?).is_none(),
+                "to" => to.replace(value.parse::<u64>().ok()?).is_none(),
+                "records" => records.replace(value.parse::<u64>().ok()?).is_none(),
+                "sid" if !value.is_empty() => sid.replace(value.to_string()).is_none(),
+                "topic" if !value.is_empty() => topic.replace(value.to_string()).is_none(),
+                _ => false,
+            };
+            if !fresh {
+                return None;
+            }
+        }
+        let (from, to) = (from?, to?);
+        (from < to && (topic.is_none() || sid.is_some())).then_some(Self {
+            from,
+            to,
+            records,
+            sid,
+            topic,
+        })
+    }
 }
 
 /// THE ENDPOINT, shared by the scheduler and the thread that serves the lane.
@@ -295,8 +380,15 @@ impl Endpoint {
         lock(&self.state).sessions.keys().copied().collect()
     }
 
-    /// Session `local` queues a post.
-    pub(crate) fn post(&self, local: u64, to: &str, kind: &str, text: &str) -> Option<u64> {
+    /// Session `local` queues a post, an ask with a deadline of `dl` ms where one is given.
+    pub(crate) fn post(
+        &self,
+        local: u64,
+        to: &str,
+        kind: &str,
+        text: &str,
+        dl: Option<u64>,
+    ) -> Option<u64> {
         let mut s = lock(&self.state);
         let session = s.sessions.get_mut(&local)?;
         let id = session.next_post;
@@ -306,10 +398,72 @@ impl Endpoint {
             to: to.to_string(),
             kind: kind.to_string(),
             re: None,
+            dl,
             body: text.as_bytes().to_vec(),
             retired: None,
         });
         Some(id)
+    }
+
+    /// What the bridge retired post `id` of session `sid` with, once it has.
+    pub(crate) fn retired(&self, sid: &str, id: u64) -> Option<String> {
+        let s = lock(&self.state);
+        s.sessions
+            .values()
+            .chain(s.gone.iter())
+            .find(|x| x.sid == sid)?
+            .posts
+            .iter()
+            .find(|p| p.id == id)?
+            .retired
+            .clone()
+    }
+
+    /// Session `local` follows broadcast topic `topic` from `since` (`topic add <t>
+    /// since=<s>`), unless it follows it already.
+    pub(crate) fn follow(&self, local: u64, topic: &str, since: &str) -> bool {
+        let mut s = lock(&self.state);
+        let Some(session) = s.sessions.get_mut(&local) else {
+            return false;
+        };
+        if session.topics.contains_key(topic) {
+            return false;
+        }
+        session.topics.insert(topic.to_string(), since.to_string());
+        true
+    }
+
+    /// Session `local` asks for the record of its lane at `off` (`inbox get @<off>`, finding
+    /// F3): parked until the bridge answers it, unless it is parked already.
+    pub(crate) fn fetch(&self, local: u64, off: u64) -> bool {
+        let mut s = lock(&self.state);
+        let Some(session) = s.sessions.get_mut(&local) else {
+            return false;
+        };
+        if session.fetches.contains(&off) {
+            return false;
+        }
+        session.fetches.push(off);
+        true
+    }
+
+    /// Every fetch answer the bridge gave since the last take, with its session's sid, of the
+    /// live sessions and the ones that left.
+    pub(crate) fn take_fetched(&self) -> Vec<(String, Fetched)> {
+        let mut s = lock(&self.state);
+        let EpState { sessions, gone, .. } = &mut *s;
+        let mut out = Vec::new();
+        for session in sessions.values_mut().chain(gone.iter_mut()) {
+            for fetched in std::mem::take(&mut session.fetched) {
+                out.push((session.sid.clone(), fetched));
+            }
+        }
+        out
+    }
+
+    /// The world whose broker a fetch answer is held to ([`EpState::world`]).
+    pub(crate) fn watch(&self, world: Arc<super::Core>) {
+        lock(&self.state).world = Some(world);
     }
 
     /// Session `local` marks every row seen.
@@ -343,6 +497,7 @@ impl Endpoint {
         for r in &mut session.rows {
             r.handled = true;
         }
+        session.seen_id = session.seen_id.max(newest);
         let floor = session.floor();
         let mut line = format!(
             "EVENT {local} inbox-seen {newest} floor={} seen={newest}",
@@ -458,10 +613,20 @@ impl Endpoint {
                     }
                 }
                 Some("quarantine") => "ERR usage\n".to_string(),
+                Some("gap") => match ToldGap::parse(words) {
+                    Some(gap) => {
+                        s.gaps.push(gap);
+                        "OK\n".to_string()
+                    }
+                    None => "ERR usage\n".to_string(),
+                },
                 Some("mirror") => {
                     s.mirror_said = words.collect::<Vec<_>>().join(" ");
                     if s.mirror_said == "stopped reason=pin" {
                         s.pin_stops += 1;
+                    }
+                    if s.mirror_said == "budget" {
+                        s.mirror_waits += 1;
                     }
                     "OK\n".to_string()
                 }
@@ -470,7 +635,20 @@ impl Endpoint {
             v if v.starts_with('@') => {
                 let sid = &v[1..];
                 match words.collect::<Vec<_>>().as_slice() {
-                    ["topic", "ls"] => "OK 0\n".to_string(),
+                    // As aterm-gui-fabric's `cmd_topic` answers it: the count, the session's
+                    // `seen=` watermark, and one row per topic with its `since=`. A session the
+                    // endpoint does not host follows nothing.
+                    ["topic", "ls"] => match s.session_by_sid(sid) {
+                        Some(session) => {
+                            let mut r =
+                                format!("OK {} seen={}\n", session.topics.len(), session.seen_id);
+                            for (t, since) in &session.topics {
+                                r.push_str(&format!("topic {t} since={since}\n"));
+                            }
+                            r
+                        }
+                        None => "OK 0\n".to_string(),
+                    },
                     ["meta"] if s.session_by_sid(sid).is_some() => "OK\n".to_string(),
                     ["status"] => match s.session_by_sid(sid) {
                         Some(session) => {
@@ -512,6 +690,9 @@ impl EpState {
                 if let Some(re) = p.re {
                     frame.push_str(&format!(" re={re}"));
                 }
+                if let Some(dl) = p.dl {
+                    frame.push_str(&format!(" dl={dl}"));
+                }
                 frame.push_str(&format!(" len={}\n", p.body.len()));
                 frame.push_str(&String::from_utf8_lossy(&p.body));
             }
@@ -528,6 +709,11 @@ impl EpState {
                     r.from,
                     if r.earlier { " log=earlier" } else { "" }
                 ));
+            }
+        }
+        for session in self.sessions.values() {
+            for off in &session.fetches {
+                frame.push_str(&format!("fetch sid={} off={off}\n", session.sid));
             }
         }
         frame
@@ -562,6 +748,17 @@ impl EpState {
                 .find_map(|t| t.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
         };
         let dedup = self.rules.dedup;
+        let held = field("fetched")
+            .and_then(|off| off.parse::<u64>().ok())
+            .zip(self.world.as_ref())
+            .and_then(|(off, world)| {
+                let lane = format!(
+                    "/f/{}/in/{}/{sid}/",
+                    super::world::FLEET,
+                    super::world::NODE
+                );
+                world.broker.at(off, &lane)
+            });
         let Some(session) = self.session_by_sid(sid) else {
             return "ERR no such session\n".to_string();
         };
@@ -574,7 +771,20 @@ impl EpState {
             }
             return "OK\n".to_string();
         }
-        if field("fetched").is_some() {
+        if let Some(fetched) = field("fetched") {
+            // A whole answer unparks its fetch; a chunk with more to come waits for the rest.
+            let Ok(off) = fetched.parse::<u64>() else {
+                return "ERR invalid deliver\n".to_string();
+            };
+            let answer: Vec<&str> = toks
+                .iter()
+                .copied()
+                .filter(|t| !t.starts_with("fetched="))
+                .collect();
+            if !answer.contains(&"more=1") {
+                session.fetches.retain(|o| *o != off);
+            }
+            session.fetched.push((off, answer.join(" "), held));
             return "OK\n".to_string();
         }
         let Some(off) = field("off").and_then(|n| n.parse::<u64>().ok()) else {
@@ -600,6 +810,8 @@ impl EpState {
             kind: field("kind").unwrap_or("note").to_string(),
             text,
             handled: false,
+            re: field("re").and_then(|n| n.parse().ok()),
+            topic: field("topic").map(str::to_string),
         });
         session.dedup.insert(off);
         if field("topic").is_none() {

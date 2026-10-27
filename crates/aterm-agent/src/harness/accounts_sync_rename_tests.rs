@@ -65,7 +65,7 @@ impl Bed {
                 &[FleetSnapshot {
                     path: source.clone(),
                     bytes: Some(fs::read(source).unwrap()),
-                    publish: true,
+                    publish: Publish::Fleet,
                 }],
             ),
         )

@@ -1,0 +1,25 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-models-setup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "aterm's models of the first-launch setup run (ty_model!), for aterm-cli's Tier-1 tests and spec-check"
+# No tests of its own: `aterm-models` sweeps these models, and aterm-cli holds the setup run's
+# ledger to them in a conformance test. A tests/*.rs added here compiles into nothing.
+autotests = false
+
+[lib]
+# No unit tests and no doctests live in src/.
+test = false
+doctest = false
+
+[dependencies]
+aterm-spec.workspace = true
+
+[lints]
+workspace = true

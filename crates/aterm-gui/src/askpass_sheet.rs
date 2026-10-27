@@ -23,6 +23,7 @@ pub(crate) struct AskpassSheet {
     ticket: std::sync::Arc<crate::askpass::AskpassTicket>,
     window: crate::WindowId,
     session: u64,
+    owned: Option<std::sync::Arc<crate::cpu_policy_authorization::Operation>>,
     field: Obj,
     panel: Obj,
     parent: Obj,
@@ -55,6 +56,7 @@ impl App {
         let crate::askpass::AskpassRequest {
             ticket,
             attribute_from,
+            owned,
             command,
             invoker,
             reply,
@@ -66,23 +68,35 @@ impl App {
             return;
         }
 
-        let sessions: Vec<(u64, i32)> = self.pool.iter().map(|s| (s.id, s.pid)).collect();
-        let session = crate::consent_observer::session_of_pid(
-            attribute_from,
-            &sessions,
-            crate::session_status::program::parent_of,
-            crate::consent_observer::live_pgid_of,
-        );
-        let Some(session) = session else {
-            let _ = reply.send(AskpassAnswer::Refused("unattributed".into()));
-            return;
-        };
+        let (wid, session) = if let Some(operation) = &owned {
+            if !self.cpu_policy_origin_live(operation) {
+                ticket.cancel();
+                let _ = reply.send(AskpassAnswer::Refused(
+                    "originating resource panel is gone".into(),
+                ));
+                return;
+            }
+            operation.origin()
+        } else {
+            let sessions: Vec<(u64, i32)> = self.pool.iter().map(|s| (s.id, s.pid)).collect();
+            let session = crate::consent_observer::session_of_pid(
+                attribute_from,
+                &sessions,
+                crate::session_status::program::parent_of,
+                crate::consent_observer::live_pgid_of,
+            );
+            let Some(session) = session else {
+                let _ = reply.send(AskpassAnswer::Refused("unattributed".into()));
+                return;
+            };
 
-        let Some(wid) = self.window_of_session(session) else {
-            let _ = reply.send(AskpassAnswer::Refused(
-                "no window hosts that session".into(),
-            ));
-            return;
+            let Some(wid) = self.window_of_session(session) else {
+                let _ = reply.send(AskpassAnswer::Refused(
+                    "no window hosts that session".into(),
+                ));
+                return;
+            };
+            (wid, session)
         };
         let now = Instant::now();
         if let Some(rem) = self.askpass_backoff.quiet_for(wid.0, now) {
@@ -104,7 +118,7 @@ impl App {
             ));
             return;
         }
-        self.build_askpass_sheet(wid, session, &command, &invoker, ticket, reply);
+        self.build_askpass_sheet(wid, session, (&command, &invoker), owned, ticket, reply);
     }
 
     /// Build and attach the askpass sheet, or reply with a refusal on failure.
@@ -112,8 +126,8 @@ impl App {
         &mut self,
         wid: crate::WindowId,
         session: u64,
-        command: &str,
-        invoker: &str,
+        (command, invoker): (&str, &str),
+        owned: Option<std::sync::Arc<crate::cpu_policy_authorization::Operation>>,
         ticket: std::sync::Arc<crate::askpass::AskpassTicket>,
         reply: Sender<AskpassAnswer>,
     ) {
@@ -143,13 +157,19 @@ impl App {
         };
 
         let id = ticket.id;
-        let message = format!(
-            "sudo needs your password in tab for session {session}.\nThe command sudo was \
-             given (as the kernel records it):"
-        );
-        let informative = format!(
-            "{command}\n\nRun by:\n{invoker}\n\nAllowing lets any sudo from that shell run as root without asking again for about 5 minutes (sudo's own cache), not only the command above."
-        );
+        let (message, informative) = if owned.is_some() {
+            ("Authorize CPU diagnostics".to_owned(),
+             "Read CPU scheduling information and save a diagnostic report. Authorization applies to this collection only.".to_owned())
+        } else {
+            (
+                format!(
+                    "sudo needs your password in tab for session {session}.\nThe command sudo was given (as the kernel records it):"
+                ),
+                format!(
+                    "{command}\n\nRun by:\n{invoker}\n\nAllowing lets any sudo from that shell run as root without asking again for about 5 minutes (sudo's own cache), not only the command above."
+                ),
+            )
+        };
         let (Some(message), Some(informative), Some(allow), Some(cancel)) = (
             appkit::nsstring(&message),
             appkit::nsstring(&informative),
@@ -278,6 +298,7 @@ impl App {
             reply,
             _keys: keys,
             _input_fence: input_fence,
+            owned,
         });
     }
 
@@ -288,7 +309,13 @@ impl App {
         }
         let sheet = self.askpass_sheet.take().expect("checked just above");
         let now = Instant::now();
-        if !sheet.ticket.is_live(now) {
+        if !sheet.ticket.is_live(now)
+            || sheet
+                .owned
+                .as_ref()
+                .is_some_and(|op| !self.cpu_policy_origin_live(op))
+        {
+            sheet.ticket.cancel();
             return;
         }
         if proceed {
@@ -298,13 +325,23 @@ impl App {
                 ));
                 return;
             };
-            if !sheet.ticket.is_live(Instant::now()) {
+            if !sheet.ticket.is_live(Instant::now())
+                || sheet
+                    .owned
+                    .as_ref()
+                    .is_some_and(|op| !self.cpu_policy_origin_live(op))
+            {
+                sheet.ticket.cancel();
                 return;
             }
             if secret.is_empty() {
                 let _ = sheet.reply.send(AskpassAnswer::Cancel);
                 self.askpass_backoff.on_cancel(sheet.window.0, now);
             } else {
+                if sheet.owned.as_ref().is_some_and(|op| !op.release_secret()) {
+                    sheet.ticket.cancel();
+                    return;
+                }
                 let _ = sheet.reply.send(AskpassAnswer::Secret(secret));
                 self.askpass_backoff.on_answer(sheet.window.0);
             }
@@ -321,12 +358,14 @@ impl App {
     }
 
     pub(crate) fn withdraw_askpass_window(&mut self, wid: crate::WindowId) {
+        crate::cpu_policy_authorization::cancel_window(wid);
         if let Some(sheet) = self.askpass_sheet.take_if(|sheet| sheet.window == wid) {
             sheet.ticket.cancel();
         }
     }
 
     pub(crate) fn withdraw_askpass_session(&mut self, session: u64) {
+        crate::cpu_policy_authorization::cancel_session(session);
         if let Some(sheet) = self.askpass_sheet.take_if(|sheet| sheet.session == session) {
             sheet.ticket.cancel();
         }

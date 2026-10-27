@@ -210,3 +210,36 @@ fn a_call_deadline_also_bounds_a_write_to_a_peer_that_never_reads() {
     );
     assert!(outcome.unwrap(), "call did not report its timeout");
 }
+
+#[test]
+fn a_joins_handshake_ends_by_the_callers_bound_not_the_default() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let path = scratch.path().join("silent");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let addresses = address::parse(&format!("unix:path={}", path.display())).unwrap();
+    let (done, joined) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        // Frozen, the clock lapses no deadline: the join connects and sends its AUTH whatever
+        // the load, and only the read timeout set from the handshake's deadline ends its wait.
+        FROZEN_NOW.with(|frozen| frozen.set(Some(Instant::now())));
+        let outcome = Connection::open_within(&addresses, Duration::from_millis(100));
+        let _ = done.send(outcome.err());
+    });
+    let outcome = joined.recv_timeout(HANG);
+    // The bus answers nothing, and accepts the join only now: its connection waits in the backlog.
+    listener.set_nonblocking(true).unwrap();
+    let (mut bus, _) = listener.accept().expect("the join connected");
+    bus.set_nonblocking(false).unwrap();
+    // A join still waiting hears the bus hang up and ends; one that gave up has hung up already.
+    let _ = bus.shutdown(Shutdown::Write);
+    worker.join().unwrap();
+    let outcome = outcome.expect("the handshake outlived its caller's bound");
+    assert!(matches!(outcome, Some(Error::Timeout)), "{outcome:?}");
+    let mut heard = Vec::new();
+    bus.read_to_end(&mut heard).unwrap();
+    assert_eq!(
+        heard,
+        auth::first(effective_uid()),
+        "the bound ended the handshake, with the join's AUTH sent and unanswered"
+    );
+}

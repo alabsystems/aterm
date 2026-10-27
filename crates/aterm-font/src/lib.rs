@@ -45,9 +45,10 @@ pub use tables::name::name_id;
 pub use tables::os2::{Permissions, ScriptMetrics, Style, UnicodeRanges, Weight, Width};
 pub use tables::{
     CFFError, PlatformId, avar, cbdt, cblc, cff1 as cff, cff2, cmap, colr, cpal, fvar, gdef, glyf,
-    gsub, gvar, head, hhea, hmtx, hvar, kern, loca, maxp, mvar, name, os2, post, sbix, vhea, vorg,
-    vvar,
+    gpos, gsub, gvar, head, hhea, hmtx, hvar, kern, loca, maxp, mvar, name, os2, post, sbix, vhea,
+    vorg, vvar,
 };
+pub(crate) use tables::{aat, ankr, kerx};
 
 pub use fvar::VariationAxis;
 use head::IndexToLocationFormat;
@@ -657,7 +658,9 @@ struct RawFaceTables<'a> {
     gpos: Option<&'a [u8]>,
     gsub: Option<&'a [u8]>,
     hmtx: Option<&'a [u8]>,
+    ankr: Option<&'a [u8]>,
     kern: Option<&'a [u8]>,
+    kerx: Option<&'a [u8]>,
     loca: Option<&'a [u8]>,
     name: Option<&'a [u8]>,
     os2: Option<&'a [u8]>,
@@ -694,12 +697,14 @@ pub struct FaceTables<'a> {
     pub ebdt: Option<cbdt::Table<'a>>,
     pub gdef: Option<gdef::Table<'a>>,
     pub glyf: Option<glyf::Table<'a>>,
-    /// The `GPOS` layout lists (scripts, features, lookup headers); its positioning subtables are not read.
+    /// The `GPOS` layout table: its lookups' subtables read as [`gpos::PositioningSubtable`].
     pub gpos: Option<opentype_layout::LayoutTable<'a>>,
     /// The `GSUB` layout table: its lookups' subtables read as [`gsub::SubstitutionSubtable`].
     pub gsub: Option<opentype_layout::LayoutTable<'a>>,
     pub hmtx: Option<hmtx::Table<'a>>,
+    pub(crate) ankr: Option<ankr::Table<'a>>,
     pub kern: Option<kern::Table<'a>>,
+    pub(crate) kerx: Option<kerx::Table<'a>>,
     pub name: Option<name::Table<'a>>,
     pub os2: Option<os2::Table<'a>>,
     pub post: Option<post::Table>,
@@ -773,6 +778,7 @@ impl<'a> Face<'a> {
                 b"VORG" => tables.vorg = table_data,
                 b"VVAR" => tables.vvar = table_data,
                 b"avar" => tables.avar = table_data,
+                b"ankr" => tables.ankr = table_data,
                 b"bdat" => tables.bdat = table_data,
                 b"bloc" => tables.bloc = table_data,
                 b"cmap" => tables.cmap = table_data,
@@ -783,6 +789,7 @@ impl<'a> Face<'a> {
                 b"hhea" => tables.hhea = table_data.unwrap_or_default(),
                 b"hmtx" => tables.hmtx = table_data,
                 b"kern" => tables.kern = table_data,
+                b"kerx" => tables.kerx = table_data,
                 b"loca" => tables.loca = table_data,
                 b"maxp" => tables.maxp = table_data.unwrap_or_default(),
                 b"name" => tables.name = table_data,
@@ -879,7 +886,13 @@ impl<'a> Face<'a> {
                 .gsub
                 .and_then(opentype_layout::LayoutTable::parse),
             hmtx,
+            ankr: raw_tables
+                .ankr
+                .and_then(|data| ankr::Table::parse(maxp.number_of_glyphs, data)),
             kern: raw_tables.kern.and_then(kern::Table::parse),
+            kerx: raw_tables
+                .kerx
+                .and_then(|data| kerx::Table::parse(maxp.number_of_glyphs, data)),
             name: raw_tables.name.and_then(name::Table::parse),
             os2: raw_tables.os2.and_then(os2::Table::parse),
             post: raw_tables.post.and_then(post::Table::parse),

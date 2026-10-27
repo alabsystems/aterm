@@ -125,6 +125,7 @@ impl VisibilityHold {
         by_fiat: false,
     };
 
+    #[inline]
     fn update(&mut self, now: Instant, verdict: Option<bool>) -> f32 {
         let dt = self.advance(now);
         if self.by_fiat {
@@ -249,10 +250,12 @@ impl ZHold {
         clear_since: None,
     };
 
+    /// A leg dealt in front (`front`, [`PetBrain::front_pass`]) stays over the ink it reaches in
+    /// front; one already under stays under it until it is clear for the dwell.
     #[inline]
-    fn update(&mut self, now: Instant, ink: bool) -> bool {
+    fn update(&mut self, now: Instant, ink: bool, front: bool) -> bool {
         if ink {
-            self.under = true;
+            self.under |= !front;
             self.clear_since = None;
         } else if self.under {
             let since = match self.clear_since {
@@ -487,6 +490,9 @@ pub(super) struct ConsoleLife {
     /// The host's chrome as this frame's rows carry it ([`rebase_host_chrome`]), when the rows it
     /// was painted on moved: kept between frames so a move allocates nothing.
     chrome_rebased: Vec<PetRect>,
+    /// The glass the host blanks ([`PetReserve::blanked`]) as this frame's rows carry it, as
+    /// [`Self::chrome_rebased`] carries its chrome: painted by the same pass, over the same rows.
+    blanked_rebased: Vec<PetRect>,
     /// This frame's row signatures, read for [`rebase_host_chrome`] only on a frame whose rows
     /// under the host's chrome changed.
     chrome_rows: Vec<u64>,
@@ -516,6 +522,9 @@ impl Default for ConsoleLife {
 /// footer, and back up once the host's next pass caught up (a window's harness turn: two leaps in
 /// 0.65 s).
 ///
+/// The glass that pass blanked ([`PetReserve::blanked`]: the tail of Claude Code's mode row past
+/// the words the host laid there) lies where its rows were alike, and rides them the same way.
+///
 /// Each rect of the chrome goes where the rows it was painted over went: the smallest shift `k`
 /// for which its rows, with one row beside them, read now `k` rows on as they read then (a
 /// composer's two rules alike, their neighbours tell them apart). A rect whose rows read as they
@@ -535,58 +544,121 @@ fn rebase_host_chrome(
     if n == 0 || protected.is_empty() || input.cells.len() - first < n {
         return false;
     }
-    let sig_at = |r: usize| {
+    #[inline]
+    fn sig_at_row(
+        input: &aterm_core::render::RenderInput,
+        first: usize,
+        pane: PetPane,
+        r: usize,
+    ) -> u64 {
         let row = input.cells[first + r].as_slice();
         let start = pane.col.min(row.len());
         let end = (pane.col + pane.cols).min(row.len());
         row_signature(&row[start..end])
-    };
+    }
     // The span of map rows a rect covers, and whether its rows and their neighbours read now as
     // they did: the common frame (a spinner turning elsewhere) costs a few rows' signatures.
-    let span = |rect: &PetRect| -> Option<(usize, usize)> {
+    #[inline]
+    const fn rect_row_span(rect: &PetRect, n: usize) -> Option<(usize, usize)> {
         if !rect.valid() || rect.rows <= 0.0 {
             return None;
         }
         let a = rect.row.floor().max(0.0) as usize;
-        let b = ((rect.row + rect.rows).ceil() as usize).min(n);
-        (a < b).then_some((a, b))
-    };
-    let mut changed = false;
-    for rect in protected {
-        if let Some((a, b)) = span(rect)
-            && (a.saturating_sub(1)..(b + 1).min(n)).any(|r| sig_at(r) != prev[r])
-        {
-            changed = true;
-            break;
+        let b_ceil = (rect.row + rect.rows).ceil() as usize;
+        let b = if b_ceil < n { b_ceil } else { n };
+        if a < b { Some((a, b)) } else { None }
+    }
+    #[inline]
+    const fn rows_moved(cur: &[u64], prev: &[u64], a: usize, b: usize, k: isize) -> bool {
+        #[inline]
+        const fn shifted_row(r: usize, k: isize, n: usize) -> Option<usize> {
+            match r.checked_add_signed(k) {
+                Some(t) if t < n => Some(t),
+                _ => None,
+            }
         }
+        let n = prev.len();
+        let mut r = a;
+        while r < b {
+            let Some(t) = shifted_row(r, k, n) else {
+                return false;
+            };
+            if cur[t] != prev[r] {
+                return false;
+            }
+            r += 1;
+        }
+        let above = if a > 0 {
+            match shifted_row(a - 1, k, n) {
+                Some(t) => cur[t] == prev[a - 1],
+                None => false,
+            }
+        } else {
+            false
+        };
+        let below = b < n
+            && match shifted_row(b, k, n) {
+                Some(t) => cur[t] == prev[b],
+                None => false,
+            };
+        above || below
+    }
+    let mut changed = false;
+    let mut pi = 0;
+    while pi < protected.len() {
+        if let Some((a, b)) = rect_row_span(&protected[pi], n) {
+            let r_end = (b + 1).min(n);
+            let mut r = a.saturating_sub(1);
+            while r < r_end {
+                if sig_at_row(input, first, pane, r) != prev[r] {
+                    changed = true;
+                    break;
+                }
+                r += 1;
+            }
+            if changed {
+                break;
+            }
+        }
+        pi += 1;
     }
     if !changed {
         return false;
     }
     rows.clear();
-    rows.extend((0..n).map(sig_at));
+    let mut ri = 0;
+    while ri < n {
+        rows.push(sig_at_row(input, first, pane, ri));
+        ri += 1;
+    }
     let cur = rows.as_slice();
-    // Whether the rows [a, b) and a neighbour of theirs read now `k` rows on as they read then.
-    let moved = |a: usize, b: usize, k: isize| -> bool {
-        let at = |r: usize| r.checked_add_signed(k).filter(|&t| t < n);
-        let whole = (a..b).all(|r| at(r).is_some_and(|t| cur[t] == prev[r]));
-        let above = a
-            .checked_sub(1)
-            .is_some_and(|r| at(r).is_some_and(|t| cur[t] == prev[r]));
-        let below = b < n && at(b).is_some_and(|t| cur[t] == prev[b]);
-        whole && (above || below)
-    };
     out.clear();
     let mut any = false;
-    for rect in protected {
-        let shift = span(rect).and_then(|(a, b)| {
-            if moved(a, b, 0) {
-                return None;
+    let mut pi = 0;
+    while pi < protected.len() {
+        let rect = &protected[pi];
+        pi += 1;
+        let shift = if let Some((a, b)) = rect_row_span(rect, n)
+            && !rows_moved(cur, prev, a, b, 0)
+        {
+            let mut found = None;
+            let mut k = 1isize;
+            let max_k = n as isize;
+            while k < max_k {
+                if rows_moved(cur, prev, a, b, k) {
+                    found = Some(k);
+                    break;
+                }
+                if rows_moved(cur, prev, a, b, -k) {
+                    found = Some(-k);
+                    break;
+                }
+                k += 1;
             }
-            (1..n as isize)
-                .flat_map(|k| [k, -k])
-                .find(|&k| moved(a, b, k))
-        });
+            found
+        } else {
+            None
+        };
         match shift {
             Some(k) => {
                 any = true;
@@ -687,6 +759,7 @@ impl ConsoleLife {
             row_sig: Vec::new(),
             row_sig_prev: Vec::new(),
             chrome_rebased: Vec::new(),
+            blanked_rebased: Vec::new(),
             chrome_rows: Vec::new(),
             row_changed: Vec::new(),
             row_sig_first: 0,
@@ -743,9 +816,10 @@ impl PetBrain {
         }
         self.paste_hold = match kind {
             PetInputKind::Paste => {
-                let since_tick = self.last_now.map_or(0.0, |tick| {
-                    now.saturating_duration_since(tick).as_secs_f64()
-                });
+                let since_tick = match self.last_now {
+                    Some(tick) => now.saturating_duration_since(tick).as_secs_f64(),
+                    None => 0.0,
+                };
                 Some(self.clock + since_tick + f64::from(PASTE_SETTLE))
             }
             PetInputKind::Submit => self.paste_hold,
@@ -896,6 +970,7 @@ impl PetBrain {
                 protected: exclusions,
                 overlays,
                 ink: &[],
+                blanked: &[],
                 painted_over: None,
             },
             PetFill::Unconsumed,
@@ -974,11 +1049,25 @@ impl PetBrain {
                 &mut self.console.chrome_rows,
                 &mut self.console.chrome_rebased,
             );
+        let blanked_rebased = painted_over_last
+            && rebase_host_chrome(
+                &self.console.row_sig,
+                input,
+                pane,
+                reserve.blanked,
+                &mut self.console.chrome_rows,
+                &mut self.console.blanked_rebased,
+            );
         let seen = PetReserve {
             protected: if rebased {
                 &self.console.chrome_rebased
             } else {
                 reserve.protected
+            },
+            blanked: if blanked_rebased {
+                &self.console.blanked_rebased
+            } else {
+                reserve.blanked
             },
             ..reserve
         };
@@ -1081,7 +1170,7 @@ impl PetBrain {
         // A grid read afresh is all new at once; read before the first tick, its rows take the
         // first time known.
         if let Some(now) = now
-            && console.row_changed.first().is_some_and(Option::is_none)
+            && matches!(console.row_changed.first(), Some(None))
         {
             console.row_changed.fill(Some(now));
         }
@@ -1130,6 +1219,7 @@ impl PetBrain {
 
     /// Whether the map rows `rect` takes in `world` have held their cells for `settled` (a
     /// spinner's line, a reply streaming in, a screen just drawn have not).
+    #[inline]
     fn rows_settled(&self, world: &PetWorld, rect: PetRect, settled: Duration) -> bool {
         let Some(now) = self.last_now else {
             return false;
@@ -1140,12 +1230,23 @@ impl PetBrain {
             (rect.row + top - first).floor().max(0.0) as usize,
             (rect.row + rect.rows + top - first).ceil().max(0.0) as usize,
         );
-        self.console.row_changed.get(a..b).is_some_and(|rows| {
-            rows.iter()
-                .all(|at| at.is_some_and(|at| now.saturating_duration_since(at) >= settled))
-        })
+        let Some(rows) = self.console.row_changed.get(a..b) else {
+            return false;
+        };
+        let mut i = 0;
+        while i < rows.len() {
+            let Some(at) = rows[i] else {
+                return false;
+            };
+            if now.saturating_duration_since(at) < settled {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
+    #[inline]
     pub(super) const fn content_ride(&self, rect: PetRect) -> Option<f32> {
         let (cur, prev) = (
             self.console.row_sig.as_slice(),
@@ -1205,6 +1306,7 @@ impl PetBrain {
     /// it: `Some(-k)` where the rows from over the body down to the one under its feet all moved
     /// up `k` rows together and that one is still the host's line. A line that moved alone, or
     /// rows that came up without one under the feet, carry nothing: the cat steps aside as before.
+    #[inline]
     const fn line_ride(&self, world: &PetWorld, rect: PetRect) -> Option<f32> {
         let (cur, prev) = (
             self.console.row_sig.as_slice(),
@@ -1258,8 +1360,33 @@ impl PetBrain {
         None
     }
 
+    /// Whether a command the console watches run (shell integration's executing block) has
+    /// its last letters on `row`: a carriage return and line feed off that row is the
+    /// command's own output, not an Enter's echo ([`PetBrain::line_returned`]). An Enter's
+    /// echo leaves the command line, which no block's output holds.
+    #[inline]
+    pub(super) const fn console_output_ends_on(&self, row: u16) -> bool {
+        let Some(world) = self.console.world.as_ref() else {
+            return false;
+        };
+        let anchors = world.anchors();
+        let mut i = 0;
+        while i < anchors.len() {
+            if let Some(a) = &anchors[i]
+                && matches!(a.state, BlockState::Executing)
+                && a.col > 0.0
+                && (a.row - row as f32).abs() < 0.5
+            {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// Whether the console's last observation holds a command still running
     /// (shell integration's executing block).
+    #[inline]
     pub(super) const fn console_executing(&self) -> bool {
         let Some(world) = self.console.world.as_ref() else {
             return false;
@@ -1282,6 +1409,7 @@ impl PetBrain {
     /// the map certifies none, and `None` where it covers none of them. An
     /// unobserved cell inside a covered run reads as no letter: the law that
     /// asks keeps its body off what it saw, never off what it guessed.
+    #[inline]
     pub(super) const fn observed_last_letter(
         &self,
         row: f32,
@@ -1313,6 +1441,7 @@ impl PetBrain {
     }
 
     /// Exact locomotion occupancy where the map covers the whole footprint.
+    #[inline]
     pub(super) const fn observed_ink_overlaps(
         &self,
         col: f32,
@@ -1573,6 +1702,7 @@ impl PetBrain {
     }
 
     /// A LANDING SEEN AT FIRST LOOK (§11.3): a cat off glass when its cheer comes due (its home under the host's chrome, where the console law hides it, or not yet faded in) has no flight anyone could watch, and a flight from a refused body is stepped aside on its first frame, the whole arc translated with it, so it lands off its stage.
+    #[inline]
     pub(super) const fn appear_on_cheer_stage(&mut self, sense: PetSense, width: f32) -> bool {
         if self.console.on_glass || self.flight.is_some() {
             return false;
@@ -1685,6 +1815,7 @@ impl PetBrain {
         (self.watch_heat >= WATCH_GATE && !self.watch_spent) || self.vigil_armed || self.vigil
     }
 
+    #[inline]
     pub(super) fn reseat_unshown_console_body(&mut self, sense: PetSense, width: f32) {
         // Nothing was on glass last emission, so a first appearance or a
         // fully faded resident may start its fade at a current safe station;
@@ -2246,32 +2377,35 @@ impl PetBrain {
                     && stamp.top_absolute_row - old.top_absolute_row
                         == stamp.uniform_up_rows.saturating_sub(old.uniform_up_rows);
                 if exact_scroll {
-                    let dy = (stamp.top_absolute_row - old.top_absolute_row) as f32;
-                    target.row -= dy;
-                    body.row -= dy;
-                    let scrolled_off_top = self.row - dy < 0.0;
-                    if !scrolled_off_top {
-                        self.row -= dy;
-                        if let Some(trip) = &mut self.console.trip {
-                            trip.from.1 -= dy;
-                            trip.to.1 -= dy;
-                        }
-                        if let Some(look) = &mut self.adopted_look {
-                            look.seat.1 -= dy;
-                        }
-                        let mut i = 0;
-                        while i < self.departures.len() {
-                            if let Some(d) = &mut self.departures[i]
-                                && d.still
-                                && !d.resight
-                                && d.own_glass.is_none()
-                            {
-                                d.row -= dy;
+                    let delta = stamp.top_absolute_row - old.top_absolute_row;
+                    if delta > 0 {
+                        let dy = delta as f32;
+                        target.row -= dy;
+                        body.row -= dy;
+                        let scrolled_off_top = self.row - dy < 0.0;
+                        if !scrolled_off_top {
+                            self.row -= dy;
+                            if let Some(trip) = &mut self.console.trip {
+                                trip.from.1 -= dy;
+                                trip.to.1 -= dy;
                             }
-                            i += 1;
+                            if let Some(look) = &mut self.adopted_look {
+                                look.seat.1 -= dy;
+                            }
+                            let mut i = 0;
+                            while i < self.departures.len() {
+                                if let Some(d) = &mut self.departures[i]
+                                    && d.still
+                                    && !d.resight
+                                    && d.own_glass.is_none()
+                                {
+                                    d.row -= dy;
+                                }
+                                i += 1;
+                            }
                         }
+                        leaving_view = target.row < 2.0 || scrolled_off_top;
                     }
-                    leaving_view = dy > 0.0 && (target.row < 2.0 || scrolled_off_top);
                 } else if old.top_absolute_row != stamp.top_absolute_row {
                     self.console.anchor = None;
                     self.console.target = None;
@@ -2902,9 +3036,10 @@ impl PetBrain {
     #[inline]
     pub(super) fn typed_left_dur(&self, dur: Duration) -> Option<Duration> {
         match (self.console.typed_at, self.last_now) {
-            (Some(at), Some(now)) => dur
-                .checked_sub(now.saturating_duration_since(at))
-                .filter(|left| !left.is_zero()),
+            (Some(at), Some(now)) => match dur.checked_sub(now.saturating_duration_since(at)) {
+                Some(left) if !left.is_zero() => Some(left),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -3030,7 +3165,10 @@ impl PetBrain {
         // writing paused, or the escort's tail, [`Self::escort_reaches`]), held on top of the line
         // through a short pause.
         let escort = escorting && over.is_none();
-        let hold = over.and_then(|(_, row)| self.pause_hold(row));
+        let hold = match over {
+            Some((_, row)) => self.pause_hold(row),
+            None => None,
+        };
         let kept = (self.console.rest_seat.get(), self.console.rest_stand.get());
         let station = self.console_station_on(world, desired, sense_dims, width, escort);
         if let (Some((row, until)), Some((_, seat_row))) = (hold, station)
@@ -3064,6 +3202,7 @@ impl PetBrain {
     /// turn leapt down and up again in 0.75 s as it paused between bursts of its next prompt. A
     /// pause longer than the hold still seats the cat clean; an Enter ends the writing at once.
     /// Answers the row held on and when the hold ends.
+    #[inline]
     fn pause_hold(&self, row: f32) -> Option<(f32, Instant)> {
         let now = self.last_now?;
         if self.flight.is_some() || self.alpha <= 0.0 || (self.row - row).abs() >= 0.5 {
@@ -3078,7 +3217,11 @@ impl PetBrain {
         let beat = match self.rhythm_at {
             Some(at) if self.watch_heat < WATCH_GATE => {
                 let left = PAUSE_HOLD - (self.clock - at) as f32;
-                (left > 0.0).then(|| Duration::from_secs_f32(left))
+                if left > 0.0 {
+                    Some(Duration::from_secs_f32(left))
+                } else {
+                    None
+                }
             }
             _ => None,
         };
@@ -3086,7 +3229,11 @@ impl PetBrain {
             (Some(a), Some(b)) => a.max(b),
             (a, b) => a.or(b)?,
         };
-        (!left.is_zero()).then(|| (row, now + left))
+        if !left.is_zero() {
+            Some((row, now + left))
+        } else {
+            None
+        }
     }
 
     /// THE ESCORT'S TAIL SENDS NO ONE OUT. Once the writing stops, the escort holds the cat's
@@ -3097,6 +3244,7 @@ impl PetBrain {
     /// rest's. Sent to the stand three
     /// cells off with 0.3 s of the escort left, it walked there and turned back as the rest
     /// took over: a turn-back no caret move made (the harness's generating take, 38.2 s).
+    #[inline]
     fn escort_reaches(&self, stand: (f32, f32)) -> bool {
         if self.flight.is_some() || (self.row - stand.1).abs() >= 0.5 {
             return true;
@@ -3113,6 +3261,7 @@ impl PetBrain {
 
     /// How long (s) the escort lasts from now ([`Self::console_escorting`]): its [`SIT_AFTER`]
     /// from the last key, or from the last rhythm of the caret while the watch is down.
+    #[inline]
     fn escort_left(&self) -> f32 {
         let typed = match (self.console.typed_at, self.last_now) {
             (Some(at), Some(now)) => SIT_AFTER - now.saturating_duration_since(at).as_secs_f32(),
@@ -3159,6 +3308,7 @@ impl PetBrain {
     /// stand is never taken in a rule ([`PetWorld::rule_line`]): over a reserved line that is the
     /// composer's first (the rule above it the program's), the rule's strokes would cross the
     /// cat, so the ladder seats it as it did.
+    #[inline]
     const fn over_the_hosts_line(
         &self,
         world: &PetWorld,
@@ -3558,41 +3708,63 @@ impl PetBrain {
         {
             return None;
         }
-        let along = |near: PetRect, reach: f32| {
-            world.nearest_clear_perch_along(near, CLEARANCE, reach, Some(stand))
-        };
-        let on_walk = |seat: &(f32, f32)| (seat.1 - walk_row).abs() < 0.5;
-        let kept = |seat: (f32, f32)| {
-            let held = Self::console_stand_rect(seat, rows, width);
-            ((held.col - stand.col).abs() <= REST_REACH)
-                .then(|| along(held, SEAT_KEPT))
-                .flatten()
-        };
-        let nearest = || {
-            self.rows_settled(world, stand, WALK_SEAT_SETTLED)
-                .then(|| along(stand, REST_REACH))
-                .flatten()
-        };
+        #[inline]
+        const fn on_walk(seat: (f32, f32), walk_row: f32) -> bool {
+            (seat.1 - walk_row).abs() < 0.5
+        }
+        #[inline]
+        fn kept_seat(
+            world: &PetWorld,
+            seat: (f32, f32),
+            rows: u16,
+            width: f32,
+            stand: PetRect,
+        ) -> Option<PetRect> {
+            let held = PetBrain::console_stand_rect(seat, rows, width);
+            if (held.col - stand.col).abs() <= REST_REACH {
+                world.nearest_clear_perch_along(held, CLEARANCE, SEAT_KEPT, Some(stand))
+            } else {
+                None
+            }
+        }
         // The seat went down (or up) with the composer the caret is in: held on top of its line,
         // it is the same seat on the line where it is now.
         let (dr, jumped) = match self.console.rest_stand.get() {
             Some((c, r)) => (desired.1 - r, (c - desired.0).abs() >= POUNCE_JUMP),
             None => (0.0, false),
         };
-        let held = self
-            .console
-            .rest_seat
-            .get()
-            .map(|(c, r)| (c, r + dr))
-            .filter(on_walk)
-            .and_then(kept)
-            .or_else(|| resting.filter(on_walk).and_then(kept));
+        let held = match self.console.rest_seat.get() {
+            Some((c, r)) if on_walk((c, r + dr), walk_row) => {
+                kept_seat(world, (c, r + dr), rows, width, stand)
+            }
+            _ => None,
+        };
+        let held = match held {
+            Some(seat) => Some(seat),
+            None => match resting {
+                Some(pos) if on_walk(pos, walk_row) => kept_seat(world, pos, rows, width, stand),
+                _ => None,
+            },
+        };
         // Where the ground over the line has not settled, the ladder chooses (and weighs a seat
         // held against the stand the caret jumped to).
         let next = match held {
-            Some(seat) if jumped => Self::seat_as_near(Some(seat), Some(nearest()?), stand),
+            Some(seat) if jumped => {
+                let near = if self.rows_settled(world, stand, WALK_SEAT_SETTLED) {
+                    world.nearest_clear_perch_along(stand, CLEARANCE, REST_REACH, Some(stand))
+                } else {
+                    None
+                }?;
+                Self::seat_as_near(Some(seat), Some(near), stand)
+            }
             Some(seat) => Some(seat),
-            None => nearest(),
+            None => {
+                if self.rows_settled(world, stand, WALK_SEAT_SETTLED) {
+                    world.nearest_clear_perch_along(stand, CLEARANCE, REST_REACH, Some(stand))
+                } else {
+                    None
+                }
+            }
         }?;
         let seat = (next.col, next.foot_row());
         self.console.rest_seat.set(Some(seat));
@@ -3739,6 +3911,7 @@ impl PetBrain {
         world.nearest_under_text_perch_from(held, CLEARANCE, SEAT_KEPT, from)
     }
 
+    #[inline]
     fn rest_reach_from(&self, world: &PetWorld, rows: u16, width: f32) -> Option<PetRect> {
         if self.alpha <= 0.0 {
             return None;
@@ -3782,6 +3955,19 @@ impl PetBrain {
     #[inline]
     pub(super) const fn note_content_ride(&mut self) {
         self.console.reason = "content-ride";
+    }
+
+    /// Whether the console saw `row` drawn as a horizontal rule ([`PetWorld::rule_line`]), whose
+    /// strokes would cross a body standing in it. False where it saw nothing.
+    #[inline]
+    pub(super) const fn console_rule_at(&self, row: f32) -> bool {
+        if !self.console.presentable || !row.is_finite() || row < -0.5 {
+            return false;
+        }
+        let Some(world) = self.console.world.as_ref() else {
+            return false;
+        };
+        matches!(world.rule_line(row.round() as usize), Some(true))
     }
 
     /// Whether the console lets a cat rest at `desired` (`(col, foot row)`) and settle there: no lasting protected cell (the host's chrome; a selection or an overlay passes) under its whole body, as a rest is judged when no escort passes under the host's labels, nor [`ARRIVED`] to either side of it, where the walk that brings it there may stop. Unobserved ground and a console that is not presentable admit it.
@@ -3844,6 +4030,31 @@ impl PetBrain {
         Self::console_must_yield(world, rect, self.console_ground_passing())
     }
 
+    /// Whether the host's frame pass would turn back a walk to `seat` (`(col, foot row)`) or the
+    /// rest it ends in there ([`Self::place_console_body_at_home`]): the body there must yield its
+    /// ground as one passing (its feet's row, and the rows over them against every protection,
+    /// the host's chrome included) or as one at rest. A cat on a cell size of `cell` in a grid
+    /// of `grid` (`(cols, rows)`); false where the console has no coherent reading.
+    #[inline]
+    pub(super) const fn console_turns_back(
+        &self,
+        seat: (f32, f32),
+        cell: (u16, u16),
+        grid: (u16, u16),
+    ) -> bool {
+        if !self.console.presentable {
+            return false;
+        }
+        let Some(world) = self.console.world.as_ref() else {
+            return false;
+        };
+        if world.stamp().is_none() {
+            return false;
+        }
+        let rect = still_body_rect(seat, Stance::NEUTRAL, cell, grid);
+        Self::console_must_yield(world, rect, true) || Self::console_must_yield(world, rect, false)
+    }
+
     /// Whether the host's frame pass carries a body at rest at `seat` with the rows it moved with
     /// ([`Self::content_ride`], [`Self::line_ride`]) where it must yield its ground there.
     #[inline]
@@ -3897,6 +4108,7 @@ impl PetBrain {
         )
     }
 
+    #[inline]
     fn console_caret_home(&self, sense: PetSense, width: f32) -> Option<PetRect> {
         let (r, c) = match sense.caret {
             Some(rc) => rc,
@@ -4086,11 +4298,17 @@ impl PetBrain {
             return;
         }
         let ground_dy = ground_row - frame.row;
+        if matches!(self.action, PetAction::Walk | PetAction::Run)
+            && (shifted.col - frame.col) * self.speed < 0.0
+        {
+            self.walk_turned_back();
+        }
         self.carry_console_body(frame, shifted, ground_dy);
         self.console.reason = "cursor-home";
     }
 
     /// Move the drawn body to `to` and every motion coordinate with it, or the next tick's lerp would restore the body to where it was.
+    #[inline]
     pub(super) const fn carry_console_body(
         &mut self,
         frame: &mut PetFrame,
@@ -4161,6 +4379,7 @@ impl PetBrain {
         }
     }
 
+    #[inline]
     pub(super) fn finish_console_frame(&mut self, frame: &mut PetFrame, sense: PetSense) {
         let drawn = frame.motes;
         self.console.mote_gate = MoteGate::Open;
@@ -4284,7 +4503,8 @@ impl PetBrain {
             match body {
                 Some(rect) if frame.alpha > 0 => {
                     let ink = world.ink_clearance(rect, 0.0) != Some(true);
-                    frame.under_ink |= self.console.z.update(sense.now, ink);
+                    let front = self.front_pass();
+                    frame.under_ink |= self.console.z.update(sense.now, ink, front);
                 }
                 _ => self.console.z = ZHold::default(),
             }
@@ -4374,6 +4594,7 @@ impl PetBrain {
         self.console.hold.settled()
     }
 
+    #[inline]
     pub(super) const fn console_frames(&self) -> Option<bool> {
         if !self.console.presentable || self.console_legacy_motion_pending() {
             return None;
@@ -4426,6 +4647,7 @@ impl PetBrain {
         }
     }
 
+    #[inline]
     pub(super) fn console_deadline(&self, now: Instant) -> Option<Instant> {
         if !self.console.presentable {
             return None;
@@ -4510,21 +4732,30 @@ impl PetBrain {
     /// how the brain's `f32` clocks sum, so an edge can fall a little apart from where a host that
     /// ticked at every step meets it; `a_dozing_pet_draws_what_a_dense_host_draws` holds a host at
     /// these offers to one that also ticks every 2⁻⁸ s.
+    #[inline]
     pub(super) const fn hidden_mote_offer(&self, horizon: Option<f32>) -> Option<f32> {
         let limit = match horizon {
             Some(h) => h,
             None => f32::INFINITY,
         };
         let mut next = [None; PET_MOTES_MAX];
+        let mut any_hidden = false;
         let mut i = 0;
         while i < PET_MOTES_MAX {
             if self.console_hid_mote(i)
                 && let Some(m) = self.motes[i]
                 && m.kind.offers_hidden()
             {
-                next[i] = self.mote_own_edge(&m, 0.0);
+                let edge = self.mote_own_edge(&m, 0.0);
+                if edge.is_some() {
+                    any_hidden = true;
+                }
+                next[i] = edge;
             }
             i += 1;
+        }
+        if !any_hidden {
+            return None;
         }
         let mut walked = 0;
         loop {
@@ -4560,6 +4791,7 @@ impl PetBrain {
     /// again, or a drawn mote the ink now covers. Judged at the pixel each mote draws at
     /// ([`mote_clears`]), clearance turns only at a mote's own edges, so a walk of those edges
     /// meets every turn.
+    #[inline]
     const fn console_motes_change_at(&self, t: f32) -> bool {
         let clock = self.clock + (t as f64);
         let world = match &self.console.world {
@@ -10689,13 +10921,15 @@ mod tests {
     /// ([`PetBrain::waking_moves`]); the z the wake pops rises into the ink, which hides it and
     /// then drops it, and a hidden pop waits at the offer for the moment it could show again or
     /// drop ([`PetMoteKind::offers_hidden`]). So the host sleeps from one offered edge to the
-    /// next, and a host that also ticks every [`DENSE`] draws the same ([`dense_case`]).
+    /// next, and a host that also ticks every [`DENSE`] draws the same ([`dense_case`]). The
+    /// key is a space: a letter typed at the sleeper's feet springs it ahead of the keys
+    /// instead of stretching ([`PetBrain::first_keys_spring`]).
     #[test]
     fn a_wake_below_scrollback_trains_no_frames_while_its_stretch_holds() {
         const FRAME: Duration = Duration::from_nanos(16_666_667);
         let start = Instant::now();
         let key = Duration::from_secs(1);
-        let keys = [(key, b"a".to_vec())];
+        let keys = [(key, b" ".to_vec())];
         let make = || {
             let mut doze = Dozing::new(DOZE_INK, start, false);
             doze.pet.sense_ink(0, &DOZE_INK_SPANS, None);
@@ -10815,5 +11049,154 @@ mod tests {
         doze.pet.quiet = on_beat;
         let _ = doze.tick();
         assert_eq!(doze.pet.mote_mark, 4, "a tick on beat 4 puffs its z");
+    }
+
+    /// THE CAT HIDES ONLY WHERE IT MAY WALK ([`PetBrain::hide_spot`]), AND A WALK THE CONSOLE
+    /// TURNS BACK NEVER WALKS ON ([`PetBrain::walk_turned_back`]). A cat resting past the words
+    /// of a footer row: of ordinary ink, the hide goes behind their end; of words the host
+    /// reserves (aterm's rewrite of Claude Code's mode row holds the whole extent it wrote), no
+    /// hide is dealt there. A hide walked onto them anyway (the chrome came after the deal) is
+    /// given up at the first step the frame pass puts back past them, the cat stopped where it
+    /// was put, and so is a chase of the pointer, cooled; a walk to the cat's own station is put
+    /// back and owes the hop over the chrome to it ([`PetBrain::chrome_hop`]). NEGATIVE CONTROLS
+    /// (as run before): the spot behind the host's words was dealt; the step put back left the
+    /// hide owed and the cat walking at 8 cells a second, to be put back again every frame.
+    #[test]
+    fn a_hide_behind_the_hosts_words_is_never_dealt_and_a_turned_back_walk_never_walks_on() {
+        const WORDS: &[u8] = b"  YOLO on \xc2\xb7 1 shell \xc2\xb7 and some more footer words";
+        let width = art_cols(10, 20);
+        let mut term = Terminal::new(20, 80);
+        term.process(b"\x1b]11;#000000\x07\x1b[15;1H");
+        term.process(WORDS);
+        term.process(b"\x1b[8;3H");
+        let words = core::str::from_utf8(WORDS)
+            .expect("fixture text")
+            .chars()
+            .count();
+        let end = words as f32;
+        let reserved = [PetRect::new(14.0, 0.0, 1.0, end)];
+        let mut spans = [(0u16, 0u16); 20];
+        spans[14] = (2, words as u16);
+        let start = Instant::now();
+        let observe = |pet: &mut PetBrain, term: &mut Terminal, chrome: bool| {
+            let input = term.cell_frame(20, 80);
+            let facts = PetWorldFacts::read(term, 17);
+            let exclusions: &[PetRect] = if chrome { &reserved } else { &[] };
+            pet.observe_console_with_exclusions(&input, &facts, PetPane::full(&input), exclusions);
+            pet.set_console_presentable(true);
+            pet.sense_ink(0, &spans, None);
+        };
+        let sense = |now: Instant| PetSense {
+            caret_drawn: true,
+            now,
+            caret: Some((7, 2)),
+            wrapped: false,
+            rows: 20,
+            cols: 80,
+            cell_w: 10,
+            cell_h: 20,
+            reduced_motion: false,
+            output_burst: false,
+            pointer: None,
+        };
+        let mut resting = |chrome: bool| {
+            let mut pet = PetBrain {
+                col: end + 1.0,
+                row: 14.0,
+                alpha: 1.0,
+                action: PetAction::Sit,
+                quiet: 2.0,
+                last_caret: Some((7, 2)),
+                last_now: Some(start),
+                ..PetBrain::default()
+            };
+            observe(&mut pet, &mut term, chrome);
+            let _ = pet.tick(sense(start));
+            pet
+        };
+        let ink = resting(false);
+        let spot = ink.hide_spot(width, (10, 20), (80, 20));
+        assert!(
+            matches!(spot, Some(dest) if dest < end && dest + width > end),
+            "control: behind ordinary words the hide goes behind their end ({spot:?}, the words end at {end})"
+        );
+        let mut pet = resting(true);
+        assert_eq!(
+            pet.hide_spot(width, (10, 20), (80, 20)),
+            None,
+            "no hide behind the host's words"
+        );
+        // The chrome came after the deal: the hide walks onto the host's words, and the frame
+        // pass puts the step back on the perch past them.
+        let f = pet.tick(sense(start + Duration::from_millis(16)));
+        let walk = |pet: &mut PetBrain, hide: Option<f32>| {
+            pet.set_action(PetAction::Walk);
+            pet.speed = -8.0;
+            pet.hide_to = hide;
+            pet.col = end - 0.4;
+            pet.row = 14.0;
+            pet.console.clipped = false;
+            pet.deferred_arc = None;
+            pet.touched_on_chrome = false;
+            pet.chrome_hop = false;
+            let mut frame = PetFrame {
+                col: pet.col,
+                row: pet.row,
+                action: PetAction::Walk,
+                lift: 0.0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                alpha: 255,
+                ..f
+            };
+            pet.place_console_body_at_home(&mut frame, sense(start + Duration::from_millis(32)));
+            frame
+        };
+        let station = walk(&mut pet, None);
+        assert!(
+            pet.console_reason() == "cursor-home" && station.col >= end,
+            "fixture: the frame pass puts the station walk's step back past the host's words \
+             ({} at {:.2})",
+            pet.console_reason(),
+            station.col
+        );
+        assert!(
+            pet.chrome_hop && pet.hide_to.is_none() && pet.pursuit_t.is_none(),
+            "a walk to the cat's own station the console turned back owes the hop over the chrome \
+             ({}, {:.1} cells/s)",
+            pet.chrome_hop,
+            pet.speed
+        );
+        pet.pursuit_t = Some(0.5);
+        pet.pursuit_cool = 0.0;
+        let chased = walk(&mut pet, None);
+        assert!(
+            chased.col >= end
+                && pet.pursuit_t.is_none()
+                && pet.pursuit_cool >= PURSUIT_COOL
+                && pet.speed == 0.0
+                && !pet.chrome_hop,
+            "a chase the console turned back is given up and cooled, the cat stopped where it was \
+             put ({:?}, cool {:.1}, {:.1} cells/s, hop {})",
+            pet.pursuit_t,
+            pet.pursuit_cool,
+            pet.speed,
+            pet.chrome_hop
+        );
+        let put = walk(&mut pet, spot);
+        assert!(
+            pet.console_reason() == "cursor-home" && put.col >= end,
+            "fixture: the frame pass puts the hide's step back past the host's words ({} at {:.2})",
+            pet.console_reason(),
+            put.col
+        );
+        assert!(
+            pet.hide_to.is_none() && pet.speed == 0.0 && !pet.chrome_hop,
+            "the hide it turned back is given up, the cat stopped where it was put \
+             ({:?}, {:.1} cells/s, hop {})",
+            pet.hide_to,
+            pet.speed,
+            pet.chrome_hop
+        );
     }
 }

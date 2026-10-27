@@ -21,7 +21,7 @@ pub const CONFIG_ENV: &str = "XDG_CONFIG_HOME";
 /// Home directory environment variable.
 pub const HOME_ENV: &str = "HOME";
 
-/// How a root option takes its value (`muse --help`, 1.4.10, clap).
+/// How a root option takes its value (`muse --help`, 1.4.13, clap).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arity {
     /// A switch.
@@ -42,7 +42,7 @@ enum Fate {
     Refuse,
 }
 
-/// Muse Code's root options (`muse --help`, 1.4.10-R6427.1), each with its
+/// Muse Code's root options (`muse --help`, 1.4.13-R6996.1), each with its
 /// fate on a relaunch.
 const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--agents", Arity::One, Fate::Keep),
@@ -95,7 +95,7 @@ fn flag(name: &str) -> Option<(Arity, Fate)> {
         .map(|(_, a, f)| (*a, *f))
 }
 
-/// Muse Code's subcommands (`muse --help`, 1.4.10, and clap's `help`). Only
+/// Muse Code's subcommands (`muse --help`, 1.4.13, and clap's `help`). Only
 /// `resume` runs the interactive TUI a relaunch brings back; `exec` is its
 /// one-shot face, and the rest are tools.
 const SUBCOMMANDS: &[&str] = &[
@@ -116,6 +116,7 @@ const SUBCOMMANDS: &[&str] = &[
     "auth",
     "login",
     "logout",
+    "usage",
     "init",
     "help",
 ];
@@ -125,14 +126,21 @@ fn maybe_option(tok: &str) -> bool {
     tok.len() > 1 && tok.starts_with('-')
 }
 
-/// An option token's name and whether its value is attached
-/// (`--model=x`): a short option is never written attached here (`-cX` is
-/// no form [`FLAGS`] knows, so it refuses as unknown).
+/// An option token's name and whether its value is attached (`--model=x`,
+/// `-cKEY=VALUE`, `-wcreate`): clap attaches the value-taking short options'
+/// values, while the switches `-h`/`-V` take none.
 fn option_name(tok: &str) -> (&str, bool) {
-    match tok.split_once('=') {
-        Some((name, _)) if name.starts_with("--") => (name, true),
-        _ => (tok, false),
+    if let Some((name, _)) = tok.split_once('=')
+        && name.starts_with("--")
+    {
+        return (name, true);
     }
+    if tok.len() > 2
+        && let Some(name) = tok.get(..2).filter(|name| matches!(*name, "-c" | "-w"))
+    {
+        return (name, true);
+    }
+    (tok, false)
 }
 
 /// One launch's argv, read: the root options it carries (verbatim, in

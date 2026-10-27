@@ -22,6 +22,7 @@ pub mod shared;
 #[path = "accounts_sync_commit.rs"]
 mod sync_commit;
 pub(super) use sync_commit::SyncTarget;
+use sync_commit::usage_target;
 
 #[path = "accounts_directory.rs"]
 mod directory;
@@ -351,6 +352,13 @@ impl Row {
     }
 }
 
+/// Whether two configurations name the same provider realm. Login methods do
+/// not distinguish account identities; region-keyed providers do.
+#[must_use]
+pub(crate) fn same_provider_realm(cli: Cli, left: Option<Region>, right: Option<Region>) -> bool {
+    !matches!(cli.accounts().keys, RowKeys::Region) || left == right
+}
+
 /// Admitted `accounts.toml` roster in file order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Roster {
@@ -473,6 +481,7 @@ impl Roster {
     /// a `region` other than `global` or `mainland-cn`, or a Kimi row with an `email` and no
     /// `region`; a `flow` other than `browser` or `device`; `identity_email` outside
     /// Claude or Codex, an invalid identity address, or two rows expecting the same identity.
+    /// Duplicate email addresses are scoped to one provider realm.
     pub fn parse_for(cli: Cli, text: &str) -> Result<Roster, String> {
         let file = cli.accounts().roster_file;
         let doc = aterm_toml::from_str::<aterm_toml::Value>(text).map_err(|e| {
@@ -526,13 +535,14 @@ impl Roster {
                 ));
             }
             if let Some(twin) = rows.iter().find(|r| {
-                r.email
-                    .as_deref()
-                    .zip(row.email.as_deref())
-                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+                same_provider_realm(cli, r.vendor.region, row.vendor.region)
+                    && r.email
+                        .as_deref()
+                        .zip(row.email.as_deref())
+                        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
             }) {
                 return Err(format!(
-                    "{file}: rows `{}` and `{}` name one email; an account is one row",
+                    "{file}: rows `{}` and `{}` name one email in the same provider realm; an account is one row",
                     twin.label, row.label
                 ));
             }
@@ -1531,6 +1541,7 @@ impl RenewalParent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RenewalCheckpoint {
+    pub region: Option<Region>,
     pub label: String,
     pub email: String,
     pub dir: String,
@@ -1572,6 +1583,7 @@ pub(super) fn write_renewal_checkpoint(
 ) -> io::Result<()> {
     write_renewal_checkpoint_for(
         Cli::Claude,
+        None,
         label,
         email,
         staging_text,
@@ -1584,6 +1596,8 @@ pub(super) fn write_renewal_checkpoint(
 
 /// [`write_renewal_checkpoint`] for a renewal of `cli`'s pool: the checkpoint names the CLI's
 /// program, so only that CLI's recovery reads it back ([`read_renewal_checkpoint_for`]).
+/// Kimi also retains the region used by the captured sign-in row. Its schema 3 checkpoint
+/// cannot be read by older clients that would compare only the email.
 /// # Errors
 /// As [`write_renewal_checkpoint`].
 #[expect(
@@ -1592,6 +1606,7 @@ pub(super) fn write_renewal_checkpoint(
 )]
 pub(super) fn write_renewal_checkpoint_for(
     cli: Cli,
+    region: Option<Region>,
     label: &str,
     email: &str,
     staging_text: &str,
@@ -1603,6 +1618,7 @@ pub(super) fn write_renewal_checkpoint_for(
     let staging = Path::new(staging_text);
     std::fs::canonicalize(staging)?;
     let checkpoint = RenewalCheckpoint {
+        region,
         label: label.to_owned(),
         email: email.to_owned(),
         dir: staging_text.to_owned(),
@@ -1611,15 +1627,21 @@ pub(super) fn write_renewal_checkpoint_for(
         proved_by,
         parent: RenewalParent::capture(logins, label),
     };
-    if !checkpoint.valid() {
+    if !checkpoint.valid() || (cli == Cli::Kimi) != region.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid renewal checkpoint scope",
         ));
     }
     let mut doc = Map::new();
-    doc.insert("schema".into(), Value::from(2));
+    doc.insert(
+        "schema".into(),
+        Value::from(if region.is_some() { 3 } else { 2 }),
+    );
     doc.insert("program".into(), Value::from(cli.id()));
+    if let Some(region) = region {
+        doc.insert("region".into(), Value::from(region.as_str()));
+    }
     doc.insert("label".into(), Value::from(checkpoint.label));
     doc.insert("email".into(), Value::from(checkpoint.email));
     doc.insert("dir".into(), Value::from(checkpoint.dir));
@@ -1690,12 +1712,18 @@ pub(super) fn read_renewal_checkpoint_for(
         return None;
     }
     let doc: Value = aterm_json::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
-    // A schema 1 checkpoint has no parent evidence. Preserve it for inspection, but do not
-    // infer a parent from wall time or upgrade an old proof into a recoverable one.
-    if doc.get("schema")?.as_u64()? != 2 || doc.get("program")?.as_str()? != cli.id() {
+    // Schema 1 has no parent evidence; Kimi's schema 2 has no region evidence. Preserve
+    // either for inspection without inventing the missing scope from current policy.
+    if doc.get("program")?.as_str()? != cli.id() {
         return None;
     }
+    let region = match (doc.get("schema")?.as_u64()?, cli) {
+        (2, cli) if cli != Cli::Kimi => None,
+        (3, Cli::Kimi) => Some(Region::parse(doc.get("region")?.as_str()?)?),
+        _ => return None,
+    };
     let checkpoint = RenewalCheckpoint {
+        region,
         label: doc.get("label")?.as_str()?.to_owned(),
         email: doc.get("email")?.as_str()?.to_owned(),
         dir: doc.get("dir")?.as_str()?.to_owned(),
@@ -6679,6 +6707,68 @@ pub struct LoginObservation<'a> {
     pub who: &'a ProcessLogin,
 }
 
+/// A usage reader's account policy and its source. The implicit default account is
+/// distinguished from an explicitly configured row, even when their fields match.
+#[derive(Debug, Clone)]
+pub struct UsageRoster {
+    roster: Roster,
+    path: Option<PathBuf>,
+    target: Option<PathBuf>,
+    store: Store,
+    implicit: bool,
+}
+
+impl UsageRoster {
+    /// The effective rows captured by the reader.
+    #[must_use]
+    pub fn roster(&self) -> &Roster {
+        &self.roster
+    }
+
+    /// Whether this is the default account used in the absence of configured rows.
+    #[must_use]
+    pub const fn implicit(&self) -> bool {
+        self.implicit
+    }
+}
+
+impl std::ops::Deref for UsageRoster {
+    type Target = Roster;
+    fn deref(&self) -> &Self::Target {
+        self.roster()
+    }
+}
+
+/// Core recorder tests supply their policy directly; materialize it so they exercise
+/// the same writer admission as runtime observations without requiring a read first.
+#[cfg(test)]
+pub(super) fn usage_fixture(
+    store: &Store,
+    roster: &Roster,
+) -> (aterm_tempfile::TempDir, UsageRoster) {
+    let directory = aterm_tempfile::TempDir::new().unwrap();
+    let implicit = *roster == Roster::own();
+    let path = (!implicit).then(|| directory.path().join("accounts.toml"));
+    if let Some(path) = &path {
+        let text: String = roster
+            .rows
+            .iter()
+            .map(|row| row_text(row).unwrap())
+            .collect();
+        if std::fs::read_to_string(path).ok().as_deref() != Some(&text) {
+            std::fs::write(path, text).unwrap();
+        }
+    }
+    let captured = UsageRoster {
+        roster: roster.clone(),
+        target: usage_target(path.as_deref()).unwrap(),
+        path,
+        store: store.clone(),
+        implicit,
+    };
+    (directory, captured)
+}
+
 /// Why a bounded read of the current roster and its local bindings could not complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RosterReadError {
@@ -6706,6 +6796,11 @@ pub struct AccountRecords {
 }
 
 impl LoginObservation<'_> {
+    /// Whether this process still belongs to the same account, including retained logins.
+    fn matches_account(&self, current: &Roster) -> bool {
+        account_matches(self.row, self.who, current)
+    }
+
     /// Whether this observation still describes the current row in an effective roster.
     pub(super) fn matches_current(&self, current: &Roster) -> bool {
         let me = self.who.me(current);
@@ -6714,6 +6809,19 @@ impl LoginObservation<'_> {
             && me.account == Some(self.row.label.as_str())
             && current.row(&self.row.label) == Some(self.row)
     }
+}
+
+fn account_matches(captured: &Row, who: &ProcessLogin, current: &Roster) -> bool {
+    let Some(row) = current.row(&captured.label) else {
+        return false;
+    };
+    if judged_label(current, who) != Some(captured.label.as_str()) {
+        return false;
+    }
+    let mut captured = captured.clone();
+    captured.dir.clone_from(&row.dir);
+    captured.was.clone_from(&row.was);
+    captured == *row
 }
 
 /// The raw roster, effective target and bindings captured before a renewal starts.
@@ -7238,6 +7346,36 @@ impl Store {
         now: i64,
     ) -> Result<AccountRecords, RosterReadError> {
         self.read_account_records_with(roster_path, now, || {})
+    }
+
+    /// Captures usage attribution, including the implicit default when no rows exist.
+    /// Its source path and mode travel with the observation until writer admission.
+    /// # Errors
+    /// The same publication, roster and binding failures as [`Self::read_account_records`].
+    pub fn read_usage_roster(
+        &self,
+        path: Option<&Path>,
+        now: i64,
+    ) -> Result<UsageRoster, RosterReadError> {
+        let target = usage_target(path).map_err(RosterReadError::Roster)?;
+        let records = self.read_account_records(path, now)?;
+        if usage_target(path).map_err(RosterReadError::Roster)? != target {
+            return Err(RosterReadError::Roster(
+                "usage roster target changed during read".into(),
+            ));
+        }
+        let implicit = records.roster.rows.is_empty();
+        Ok(UsageRoster {
+            roster: if implicit {
+                Roster::own()
+            } else {
+                records.roster
+            },
+            path: path.map(Path::to_path_buf),
+            target,
+            store: self.clone(),
+            implicit,
+        })
     }
 
     fn read_account_records_with(
@@ -7999,6 +8137,36 @@ impl Store {
         self.transact_logins_held(&held, now, note, edit)
     }
 
+    /// Records a decision only while every effective roster row still matches its input.
+    /// Candidate selection depends on the whole roster, including competing accounts.
+    /// This checks policy and bindings under the writer lock; the caller supplies any
+    /// process evidence. The existing roster-bound receipt fences conflicting edits
+    /// during publication and recovery.
+    /// # Errors
+    /// An unavailable writer, unreadable roster or records, changed effective roster,
+    /// `edit`'s refusal or failed durable publication. Admission failure runs no edit.
+    pub fn observe_roster_within(
+        &self,
+        ladder: &[std::time::Duration],
+        now: i64,
+        roster_path: &Path,
+        captured: &Roster,
+        edit: impl FnOnce(&mut State) -> Result<Vec<Event>, String>,
+    ) -> Result<Vec<Event>, String> {
+        self.transact_pool_logins_within(
+            ladder,
+            roster_path,
+            now,
+            &mut None,
+            |raw, state, logins| {
+                if bound(raw, logins) != *captured {
+                    return Err("account roster changed since observation; nothing recorded".into());
+                }
+                edit(state)
+            },
+        )
+    }
+
     /// Records a process observation only while its own current login still matches the
     /// observed account. Historical logins can attribute usage, but cannot prove or change
     /// the lifecycle of a replacement login. Reads the raw roster inside the same lock as
@@ -8053,6 +8221,97 @@ impl Store {
         )
     }
 
+    /// Records account-wide usage while the captured account metadata and process
+    /// attribution still match under the writer lock. A credential renewal may change
+    /// the effective directory and history; its retained old logins remain attributable.
+    /// All other row fields must match, including an absent identity becoming populated.
+    /// This checks local routing and declared policy, not provider identity or token bytes.
+    ///
+    /// # Errors
+    /// An unavailable writer, unreadable roster or records, changed account metadata,
+    /// lost process attribution, `edit` refusal or failed durable publication. The same
+    /// roster-bound receipt and recovery rules as [`Self::observe_login_within`] apply.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountUsageObservation",
+            action = "Record",
+            project = "aterm_agent::harness::accounts::usage_observation_tests::usage_observation_transition"
+        )
+    )]
+    pub fn observe_account_within(
+        &self,
+        ladder: &[std::time::Duration],
+        now: i64,
+        observation: LoginObservation<'_>,
+        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
+    ) -> Result<Vec<Event>, String> {
+        self.transact_pool_logins_within(
+            ladder,
+            observation.roster_path,
+            now,
+            &mut None,
+            |raw, state, logins| {
+                if !observation.matches_account(&bound(raw, logins)) {
+                    return Err(format!(
+                        "account `{}` changed since observation; nothing recorded",
+                        observation.row.label
+                    ));
+                }
+                edit(state, logins)
+            },
+        )
+    }
+
+    /// Admits a usage observation against its captured source and account under the
+    /// writer lock. A configured row cannot turn into the implicit default, or the
+    /// default into a configured row. Retained logins may report across renewal.
+    /// # Errors
+    /// An unattributed process, changed policy, unreadable records, unavailable writer,
+    /// edit refusal or failed publication. A missing source remains absent in recovery.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "UsageSource",
+            action = "Record",
+            project = "aterm_agent::harness::accounts::usage_source_tests::usage_source_transition"
+        )
+    )]
+    pub fn observe_usage_within(
+        &self,
+        ladder: &[std::time::Duration],
+        now: i64,
+        captured: &UsageRoster,
+        who: &ProcessLogin,
+        edit: impl FnOnce(&mut State) -> Result<Vec<Event>, String>,
+    ) -> Result<Vec<Event>, String> {
+        if self.dir != captured.store.dir
+            || self.logins != captured.store.logins
+            || self.cli != captured.store.cli
+        {
+            return Err("usage store changed; nothing recorded".into());
+        }
+        let label = judged_label(&captured.roster, who).ok_or("usage has no account")?;
+        let row = captured
+            .roster
+            .row(label)
+            .ok_or("usage account is missing")?;
+        self.transact_usage_within(ladder, captured, now, |raw, state, logins| {
+            let implicit = raw.rows.is_empty();
+            let current = if implicit {
+                Roster::own()
+            } else {
+                bound(raw, logins)
+            };
+            if captured.implicit != implicit || !account_matches(row, who, &current) {
+                return Err(format!(
+                    "account `{label}` changed since usage was read; nothing recorded"
+                ));
+            }
+            edit(state)
+        })
+    }
+
     /// Publishes a renewal only while its captured roster and effective target row still
     /// match, including the captured target generation. The roster read, binding check,
     /// completion checkpoint supplied by `edit`, and
@@ -8079,7 +8338,25 @@ impl Store {
         policy: RenewalPolicy<'_>,
         edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
     ) -> Result<Vec<Event>, String> {
-        self.transact_roster_logins_within(ladder, policy.roster_path, now, note, |raw, state, logins| {
+        let held = self
+            .acquire_within(ladder)
+            .map_err(|why| why.to_string())?
+            .ok_or_else(|| LOCK_HELD.to_owned())?;
+        self.transact_renewal_held(&held, now, note, policy, edit)
+    }
+
+    /// Runs the same renewal admission while the caller retains the account writer.
+    /// # Errors
+    /// As [`Self::transact_renewal_within`], without acquiring another writer.
+    pub(super) fn transact_renewal_held(
+        &self,
+        held: &Lock,
+        now: i64,
+        note: &mut Option<String>,
+        policy: RenewalPolicy<'_>,
+        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
+    ) -> Result<Vec<Event>, String> {
+        self.transact_roster_logins_held(held, policy.roster_path, now, note, |raw, state, logins| {
             if raw != policy.roster
                 || bound(raw, logins).row(&policy.row.label) != Some(policy.row)
             {
@@ -8202,13 +8479,14 @@ impl Recorded {
 /// Records a standing usage wall hit by a supervised session under a bounded store lock.
 pub fn record_wall(
     store: &Store,
-    roster: &Roster,
+    captured: &UsageRoster,
     sid: &str,
     who: &ProcessLogin,
     wall: &super::upgrade::StandingWall,
     process_started: i64,
     now: i64,
 ) -> Recorded {
+    let roster = captured.roster();
     let me = who.me(roster);
     let Some(account) = me.label() else {
         return Recorded::NotListed;
@@ -8231,8 +8509,7 @@ pub fn record_wall(
     let sid = one_line(sid, WORD_MAX);
     let mut changed = false;
     let mut cleared = false;
-    let mut note = None;
-    let done = store.transact_within(store.ladder, now, &mut note, |state| {
+    let done = store.observe_usage_within(store.ladder, now, captured, who, |state| {
         let before = state.clone();
         let on_it = state
             .sessions
@@ -8338,12 +8615,13 @@ pub struct UsageSaid {
 /// lock.
 pub fn record_usage(
     store: &Store,
-    roster: &Roster,
+    captured: &UsageRoster,
     sid: &str,
     who: &ProcessLogin,
     said: &UsageSaid,
     now: i64,
 ) -> Recorded {
+    let roster = captured.roster();
     let me = who.me(roster);
     let Some(account) = me.label() else {
         return Recorded::NotListed;
@@ -8354,8 +8632,7 @@ pub fn record_usage(
     let at = said.at.min(now);
     let sid = one_line(sid, WORD_MAX);
     let mut changed = false;
-    let mut note = None;
-    let done = store.transact_within(store.ladder, now, &mut note, |state| {
+    let done = store.observe_usage_within(store.ladder, now, captured, who, |state| {
         let Some(record) = account_mut(state, account) else {
             return Ok(Vec::new());
         };
@@ -8630,6 +8907,25 @@ pub fn account_login_observation_environment() {}
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountUsageObservation",
+        action = "AnotherCase",
+        reason = "Select a captured-account, renewal or refusal fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountUsageObservation",
+        action = "Choose",
+        reason = "Fix the native fixture before recording its observation."
+    )
+)]
+#[doc(hidden)]
+pub fn account_usage_observation_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "AccountLifecycleCommit",
         action = "AnotherProvider",
         reason = "Select a native provider fixture."
@@ -8671,6 +8967,62 @@ pub fn account_lifecycle_environment() {}
     )
 )]
 #[doc(hidden)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRenewalSnapshot",
+        action = "AnotherMode",
+        reason = "Select a local or shared renewal fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRenewalSnapshot",
+        action = "AnotherCase",
+        reason = "Select the competing writer or read-failure fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInPublication",
+        action = "AnotherProvider",
+        reason = "Select a file-backed provider fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInPublication",
+        action = "PriorBinding",
+        reason = "Select a first sign-in or an existing binding."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInPublication",
+        action = "AnotherFault",
+        reason = "Select a retained, absent or replaced credential file."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSharedCheckpoint",
+        action = "PriorBinding",
+        reason = "Select a first or replacement login fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSharedCheckpoint",
+        action = "AfterCheckpoint",
+        reason = "Select a failure before or after completed checkpoint creation."
+    )
+)]
 pub fn account_renewal_policy_environment() {}
 
 #[cfg_attr(
@@ -8770,9 +9122,32 @@ pub fn account_attempt_generation_environment() {}
 #[doc(hidden)]
 pub fn account_signin_policy_environment() {}
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "UsageSource",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: select the source mode, roster edit or store change staged before admission"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "UsageSource",
+        action = "Choose",
+        reason = "Model bookkeeping: fix the case before the native Record"
+    )
+)]
+#[doc(hidden)]
+pub fn account_usage_source_environment() {}
+
 #[cfg(test)]
 #[path = "accounts_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "accounts_usage_source_tests.rs"]
+mod usage_source_tests;
 
 #[cfg(test)]
 #[path = "accounts_logins_tests.rs"]
@@ -8785,6 +9160,10 @@ mod binding_tests;
 #[cfg(test)]
 #[path = "accounts_observation_tests.rs"]
 mod observation_tests;
+
+#[cfg(test)]
+#[path = "accounts_usage_observation_tests.rs"]
+mod usage_observation_tests;
 
 #[cfg(test)]
 #[path = "accounts_lifecycle_commit_tests.rs"]

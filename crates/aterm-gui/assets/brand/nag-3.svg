@@ -1,0 +1,92 @@
+<!-- Copyright 2026 Andrew Yates -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <title>nag mode · 3 · and ANOTHER thing</title>
+  <!-- and ANOTHER thing… / per policy -->
+  <rect x="1" y="1" width="23" height="12.5" rx="2.4" fill="#fff" stroke="#b3122e" stroke-width=".9"/>
+  <path d="M17 13.1l5 4.2-.6-4.2" fill="#fff" stroke="#b3122e" stroke-width=".9" stroke-linejoin="round"/>
+  <path d="M17.4 13h3.6" stroke="#fff" stroke-width="1.2"/>
+  <text x="12.5" y="6.4" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-weight="700" font-size="4.2" fill="#b3122e">and</text>
+  <text x="12.5" y="11.4" text-anchor="middle" font-family="Impact, 'Arial Black', Helvetica, sans-serif" font-weight="900" font-size="5" fill="#b3122e" textLength="19.6" lengthAdjust="spacingAndGlyphs">ANOTHER thing</text>
+  <rect x="46" y="1" width="17" height="7.4" rx="2" fill="#fff" stroke="#8d93a8" stroke-width=".7"/>
+  <path d="M50 8.2l-1.6 3 3.2-3" fill="#fff" stroke="#8d93a8" stroke-width=".7" stroke-linejoin="round"/>
+  <text x="54.5" y="6" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-size="3.8" fill="#3d3d46" textLength="13.6" lengthAdjust="spacingAndGlyphs">per policy…</text>
+  <!-- the list, unrolling to the floor -->
+  <rect x="3" y="54" width="10" height="10" fill="#fff" stroke="#c9ccd6" stroke-width=".4"/>
+  <path d="M4.5 57h5M4.5 59.6h5M4.5 62.2h5" stroke="#8d93a8" stroke-width=".7"/>
+  <path d="M10.4 56.3l1.5 1.5m0-1.5l-1.5 1.5M10.4 58.9l1.5 1.5m0-1.5l-1.5 1.5M10.4 61.5l1.5 1.5m0-1.5l-1.5 1.5" stroke="#d62828" stroke-width=".7" stroke-linecap="round"/>
+  <rect x="1.5" y="37" width="13" height="18" rx="1.5" fill="#c8a26b"/>
+  <rect x="3" y="40" width="10" height="16" fill="#fff"/>
+  <rect x="5.5" y="35.5" width="5" height="3" rx="1" fill="#7d7d86"/>
+  <path d="M4.5 43h5M4.5 45.6h5M4.5 48.2h5M4.5 50.8h5M4.5 53.4h5" stroke="#8d93a8" stroke-width=".7"/>
+  <path d="M10.4 42.3l1.5 1.5m0-1.5l-1.5 1.5M10.4 44.9l1.5 1.5m0-1.5l-1.5 1.5M10.4 47.5l1.5 1.5m0-1.5l-1.5 1.5M10.4 52.7l1.5 1.5m0-1.5l-1.5 1.5" stroke="#d62828" stroke-width=".7" stroke-linecap="round"/>
+  <g transform="rotate(-16 8 47)">
+    <rect x="2.4" y="45.2" width="11.2" height="4.4" rx=".5" fill="#fff" fill-opacity=".7" stroke="#d62828" stroke-width=".7"/>
+    <text x="8" y="48.5" text-anchor="middle" font-family="Impact, 'Arial Black', Helvetica, sans-serif" font-weight="900" font-size="3.2" fill="#d62828" textLength="9.6" lengthAdjust="spacingAndGlyphs">REJECTED</text>
+  </g>
+  <g transform="rotate(12 13 40)">
+    <rect x="10" y="37.4" width="6" height="5.6" fill="#ffe066" stroke="#d9b730" stroke-width=".4"/>
+    <text x="13" y="41.6" text-anchor="middle" font-family="Impact, 'Arial Black', Helvetica, sans-serif" font-weight="900" font-size="3.6" fill="#d62828">!!</text>
+  </g>
+  <!-- neck, blazer, blouse, badge, a sticky note on her too -->
+  <path d="M27 42h8v9h-8z" fill="#e8b48e"/>
+  <path d="M7 64Q9 52 21 49L31 52.5L41 49Q53 52 55 64Z" fill="#6d2340"/>
+  <path d="M21 49L31 58L41 49L37 48L31 53L25 48Z" fill="#f3eadb"/>
+  <path d="M31 53.6l-4.2 2.8 1.2 2.6zM31 53.6l4.2 2.8-1.2 2.6z" fill="#f3eadb" stroke="#c9b9a0" stroke-width=".5"/>
+  <circle cx="31" cy="53.8" r="1.2" fill="#c9b9a0"/>
+  <path d="M38.5 50.5L44 55" stroke="#3f6fb5" stroke-width=".8"/>
+  <rect x="42" y="54.5" width="6" height="7.5" rx=".8" fill="#fff" stroke="#8d93a8" stroke-width=".5"/>
+  <rect x="42" y="54.5" width="6" height="2.2" fill="#3f6fb5"/>
+  <rect x="18" y="55.5" width="5.4" height="5" fill="#ffe066" stroke="#d9b730" stroke-width=".4" transform="rotate(-10 20.7 58)"/>
+  <path d="M19.2 57.4h3M19.2 59h2.2" stroke="#b08a20" stroke-width=".5" transform="rotate(-10 20.7 58)"/>
+  <path d="M13 63Q12 57 14 51.5" stroke="#6d2340" stroke-width="5.5" stroke-linecap="round" fill="none"/>
+  <ellipse cx="14.6" cy="49.6" rx="2.8" ry="2.4" fill="#f2c4a0" stroke="#a8714b" stroke-width=".6"/>
+  <!-- the red pen, jabbing the air -->
+  <path d="M47 61Q52 53 52 45" stroke="#6d2340" stroke-width="6" stroke-linecap="round" fill="none"/>
+  <g opacity=".28">
+    <rect x="51.9" y="22" width="2.4" height="17" rx="1" fill="#d62828" transform="rotate(2 53 40)"/>
+    <rect x="51.9" y="22" width="2.4" height="17" rx="1" fill="#d62828" transform="rotate(34 53 40)"/>
+  </g>
+  <g transform="rotate(18 53 40)">
+    <rect x="51.9" y="22" width="2.4" height="17" rx="1" fill="#d62828"/>
+    <path d="M51.9 22.6l1.2-3 1.2 3z" fill="#2b2b2b"/>
+    <rect x="51.9" y="31" width="2.4" height="1.2" fill="#f3d36b"/>
+  </g>
+  <path d="M50.4 20.6q-2.4-1-3.4 1.4M63.4 27.4q1.4 2-.2 4.2M58 15.4q2.6-.6 3.8 1.4" stroke="#e0533d" stroke-width=".9" fill="none" stroke-linecap="round"/>
+  <rect x="48.6" y="38" width="8" height="7.4" rx="3" fill="#f2c4a0" stroke="#a8714b" stroke-width=".7"/>
+  <!-- the bun, a hair sprung loose -->
+  <rect x="20" y="10" width="22" height="2" rx="1" fill="#d62828" transform="rotate(-16 31 11)"/>
+  <path d="M41 7.6l2.6-.8-1.8 2z" fill="#2b2b2b"/>
+  <circle cx="31" cy="12" r="5.6" fill="#4b3a30"/>
+  <path d="M27.4 10.6q3.6-2.6 7.2 0M27.4 13.4q3.6 2.6 7.2 0" stroke="#2e231c" stroke-width=".8" fill="none"/>
+  <path d="M34.6 7.4q3.4-2.6 1.6-4.4t1.8-2.6" stroke="#4b3a30" stroke-width=".8" fill="none" stroke-linecap="round"/>
+  <!-- the face, wound up -->
+  <ellipse cx="19.7" cy="31.5" rx="1.6" ry="2.6" fill="#e8b48e"/>
+  <ellipse cx="42.3" cy="31.5" rx="1.6" ry="2.6" fill="#e8b48e"/>
+  <circle cx="19.7" cy="34.6" r=".95" fill="#f7f1e3" stroke="#c9b9a0" stroke-width=".3"/>
+  <circle cx="42.3" cy="34.6" r=".95" fill="#f7f1e3" stroke="#c9b9a0" stroke-width=".3"/>
+  <path d="M20 30Q20 19 31 19Q42 19 42 30Q42 39.5 36.5 44.5Q33.5 47.5 31 47.5Q28.5 47.5 25.5 44.5Q20 39.5 20 30Z" fill="#f2c4a0"/>
+  <ellipse cx="23.4" cy="36.6" rx="2.2" ry="1.3" fill="#ef8a8a" fill-opacity=".45"/>
+  <ellipse cx="38.6" cy="36.6" rx="2.2" ry="1.3" fill="#ef8a8a" fill-opacity=".45"/>
+  <path d="M19 31Q18 16 31 16Q44 16 43 31Q42 23 37 21.5Q33 20.5 31 18.8Q29 20.5 25 21.5Q20 23 19 31Z" fill="#4b3a30"/>
+  <path d="M29.6 18.9Q24.5 20.2 21 25.5" stroke="#a9a9b3" stroke-width="1.2" fill="none" stroke-linecap="round"/>
+  <!-- brows hiked up, eyes wide, one twitching -->
+  <path d="M20.6 23.4Q24 19.6 28 22.8M34 22.8Q38 19.6 41.4 23.4" stroke="#2e231c" stroke-width="1.4" fill="none" stroke-linecap="round"/>
+  <circle cx="24.8" cy="30" r="2.5" fill="#fff"/>
+  <circle cx="37.2" cy="30" r="2.5" fill="#fff"/>
+  <circle cx="24.8" cy="30" r=".8" fill="#1f1f1f"/>
+  <circle cx="37.2" cy="30" r=".8" fill="#1f1f1f"/>
+  <path d="M44.2 26.8l1.7-.9M44.6 29.2l1.9.1M44.2 31.6l1.7.9" stroke="#2e231c" stroke-width=".6" stroke-linecap="round"/>
+  <path d="M20.4 30.4Q15 42 22 50.5M41.6 30.4Q47 42 40 50.5" stroke="#c9a84a" stroke-width=".9" stroke-dasharray=".1 1.5" stroke-linecap="round" fill="none"/>
+  <path d="M31 27.5Q31.5 33 34 36.2Q32.2 37.2 30.4 36.6" stroke="#a8714b" stroke-width="1" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <g transform="translate(0 1.4) rotate(5 31 29)">
+    <path d="M18.5 25.5L22 27.3L28.7 27.6Q29.2 31 27.5 32.6Q25 33.8 22.6 32.6Q20.8 31.5 20.6 29Z" fill="#fff" fill-opacity=".25" stroke="#b3122e" stroke-width="1.4" stroke-linejoin="round"/>
+    <path d="M43.5 25.5L40 27.3L33.3 27.6Q32.8 31 34.5 32.6Q37 33.8 39.4 32.6Q41.2 31.5 41.4 29Z" fill="#fff" fill-opacity=".25" stroke="#b3122e" stroke-width="1.4" stroke-linejoin="round"/>
+    <path d="M28.7 28.6Q31 27.6 33.3 28.6" stroke="#b3122e" stroke-width="1.2" fill="none"/>
+  </g>
+  <!-- talking, talking, talking -->
+  <path d="M27.4 38.8Q26.4 42 27.7 44.8M34.6 38.8Q35.6 42 34.3 44.8" stroke="#d49a78" stroke-width=".7" fill="none" stroke-linecap="round"/>
+  <ellipse cx="31" cy="42" rx="3.2" ry="2.5" fill="#4a0b0b" stroke="#b3122e" stroke-width=".8"/>
+  <path d="M28.4 40.6Q31 39.6 33.6 40.6" stroke="#fff" stroke-width=".9" fill="none"/>
+  <ellipse cx="31" cy="43.4" rx="1.6" ry=".9" fill="#d9534f"/>
+</svg>

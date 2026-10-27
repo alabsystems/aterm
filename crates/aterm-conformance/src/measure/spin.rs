@@ -51,9 +51,11 @@ pub struct SpinRow {
     pub window: Duration,
     pub max_arms: u64,
     pub max_timer_wakes: Option<u64>,
-    /// The cursor-effect lane's timer wakes in the window (`deadline_fires_by_owner`'s
-    /// [`EFFECT_LANE`]): the pet's frame train and offers, and the glow's and trail's.
-    pub max_effect_fires: Option<u64>,
+    /// Deadline owners whose timer wakes in the window (`deadline_fires_by_owner`) the row
+    /// bounds, each by its own count: the cursor-effect lane ([`EFFECT_LANE`]: the pet's frame
+    /// train and offers, and the glow's and trail's) and the stats deck's needle
+    /// ([`NEEDLE_LANE`]). An owner the row names but the metrics leave unreported passes nothing.
+    pub max_owner_fires: &'static [(&'static str, u64)],
     /// Every loop wake in the window (`event_wakes`).
     pub max_wakes: u64,
 }
@@ -62,6 +64,9 @@ const SETTLE_QUIET_MS: &str = "3000";
 
 /// The deadline owner the cursor effects (the pet, the glow, the trail) fire as.
 pub const EFFECT_LANE: &str = "cursor_effect";
+
+/// The deadline owner the stats deck's dial needle fires as while it sweeps to a reading.
+pub const NEEDLE_LANE: &str = "stats_needle";
 
 /// How long the pet scene waits on a quiet prompt before its window opens: past the pet's deep
 /// sleep, which `kitty_pet.rs` begins `SLEEP_AFTER` (22 s) and `BREATH_WINDOW` (10 s) after the
@@ -127,8 +132,9 @@ pub struct SpinReport {
     pub wakes_by_variant: Option<String>,
     /// The window's `deadline_fires_by_owner`: whose deadline each timer wake was.
     pub fires_by_owner: Option<String>,
-    /// The cursor-effect lane's timer wakes in the window ([`EFFECT_LANE`]).
-    pub effect_fires: Option<u64>,
+    /// The timer wakes in the window of each owner the row bounds
+    /// ([`SpinRow::max_owner_fires`]), as the metrics read them.
+    pub owner_fires: Vec<(&'static str, Option<u64>)>,
     /// A pet take's [`PET_FIELDS`] at the end of the window.
     pub pet: Option<String>,
     /// A windowed take's window events beyond its redraws (at most [`MAX_OS_EVENTS`]).
@@ -136,6 +142,8 @@ pub struct SpinReport {
     /// The status reasons at the end of the window.
     pub reasons: Option<String>,
     pub verdict: ShapeVerdict,
+    /// The session's replay checks at the end ([`super::instance::replay_checks`]).
+    pub checks: String,
 }
 
 impl std::fmt::Display for SpinReport {
@@ -144,9 +152,9 @@ impl std::fmt::Display for SpinReport {
             f,
             "SPIN scene={:?} window={:?} past_deadline_arms={} max_arms={} stale_arm_heals={:?} \
              frames={:?} timer_wakes={:?} max_timer_wakes={:?} wakes={:?} max_wakes={} \
-             effect_fires={:?} max_effect_fires={:?} wait_cancelled_wakes={:?} turns={:?} \
+             owner_fires={:?} max_owner_fires={:?} wait_cancelled_wakes={:?} turns={:?} \
              wakes_by_variant={:?} fires_by_owner={:?} os_events={:?} pet={:?} reasons={:?} \
-             verdict={:?}",
+             verdict={:?} {}",
             self.row.scene,
             self.row.window,
             self.past_deadline_arms,
@@ -157,8 +165,8 @@ impl std::fmt::Display for SpinReport {
             self.row.max_timer_wakes,
             self.wakes,
             self.row.max_wakes,
-            self.effect_fires,
-            self.row.max_effect_fires,
+            self.owner_fires,
+            self.row.max_owner_fires,
             self.wait_cancelled_wakes,
             self.turns,
             self.wakes_by_variant,
@@ -166,17 +174,19 @@ impl std::fmt::Display for SpinReport {
             self.os_events,
             self.pet,
             self.reasons,
-            self.verdict
+            self.verdict,
+            self.checks
         )
     }
 }
 
 /// The window's counters a row judges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Counts {
+pub struct Counts<'a> {
     pub arms: u64,
     pub timer_wakes: Option<u64>,
-    pub effect_fires: Option<u64>,
+    /// The timer wakes of each owner the metrics reported ([`owner_fires`]).
+    pub owner_fires: &'a [(&'static str, Option<u64>)],
     pub wakes: Option<u64>,
 }
 
@@ -190,14 +200,22 @@ const fn within(max: Option<u64>, n: Option<u64>) -> bool {
     }
 }
 
-/// The row's bounds against the window's counters: past-deadline arms, timer wakes, the
-/// cursor-effect lane's fires, and every loop wake (`wakes`), which an unreported count never
-/// passes.
+/// The row's bounds against the window's counters: past-deadline arms, timer wakes, each
+/// bounded owner's fires ([`SpinRow::max_owner_fires`]), and every loop wake (`wakes`), which an
+/// unreported count never passes.
 #[must_use]
-pub const fn judge(row: &SpinRow, c: Counts) -> ShapeVerdict {
+pub fn judge(row: &SpinRow, c: Counts<'_>) -> ShapeVerdict {
+    let owners = row.max_owner_fires.iter().all(|&(owner, max)| {
+        let fired = c
+            .owner_fires
+            .iter()
+            .find(|(o, _)| *o == owner)
+            .and_then(|&(_, n)| n);
+        within(Some(max), fired)
+    });
     if c.arms <= row.max_arms
         && within(row.max_timer_wakes, c.timer_wakes)
-        && within(row.max_effect_fires, c.effect_fires)
+        && owners
         && within(Some(row.max_wakes), c.wakes)
     {
         ShapeVerdict::Pass
@@ -384,8 +402,12 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     if wakes.is_none() {
         return unanswered("ctl metrics does not report event_wakes");
     }
-    let effect_fires = owner_fires(&metrics, EFFECT_LANE);
-    if row.max_effect_fires.is_some() && effect_fires.is_none() {
+    let fired: Vec<(&'static str, Option<u64>)> = row
+        .max_owner_fires
+        .iter()
+        .map(|&(owner, _)| (owner, owner_fires(&metrics, owner)))
+        .collect();
+    if fired.iter().any(|(_, n)| n.is_none()) {
         return unanswered("ctl metrics does not report deadline_fires_by_owner");
     }
     let arms = after.saturating_sub(before);
@@ -400,7 +422,6 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         turns: uint_field(&metrics, "turns"),
         wakes_by_variant: field(&metrics, "wakes_by_variant").map(str::to_string),
         fires_by_owner: field(&metrics, "deadline_fires_by_owner").map(str::to_string),
-        effect_fires,
         pet,
         os_events,
         reasons,
@@ -409,10 +430,12 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
             Counts {
                 arms,
                 timer_wakes,
-                effect_fires,
+                owner_fires: &fired,
                 wakes,
             },
         ),
+        owner_fires: fired,
+        checks: super::instance::replay_checks(ctl),
     })
 }
 
@@ -425,22 +448,22 @@ mod tests {
         window: Duration::from_secs(10),
         max_arms: 100,
         max_timer_wakes: Some(12),
-        max_effect_fires: None,
+        max_owner_fires: &[],
         max_wakes: 400,
     };
 
     const PET: SpinRow = SpinRow {
         scene: SpinScene::PetAsleep,
         max_timer_wakes: None,
-        max_effect_fires: Some(0),
+        max_owner_fires: &[(EFFECT_LANE, 0), (NEEDLE_LANE, 20)],
         ..CLAUDE
     };
 
-    const fn counts(arms: u64, timer_wakes: Option<u64>, wakes: Option<u64>) -> Counts {
+    const fn counts(arms: u64, timer_wakes: Option<u64>, wakes: Option<u64>) -> Counts<'static> {
         Counts {
             arms,
             timer_wakes,
-            effect_fires: None,
+            owner_fires: &[],
             wakes,
         }
     }
@@ -486,27 +509,30 @@ mod tests {
 
     #[test]
     fn a_sleeping_pets_lane_fails_its_row_on_one_fire_or_none_reported() {
+        let calm = [(EFFECT_LANE, Some(0)), (NEEDLE_LANE, Some(0))];
         let quiet = Counts {
-            effect_fires: Some(0),
+            owner_fires: &calm,
             ..counts(0, Some(20), Some(80))
         };
         assert_eq!(judge(&PET, quiet), ShapeVerdict::Pass);
+        let pet = [(EFFECT_LANE, Some(1)), (NEEDLE_LANE, Some(0))];
         assert_eq!(
             judge(
                 &PET,
                 Counts {
-                    effect_fires: Some(1),
+                    owner_fires: &pet,
                     ..quiet
                 }
             ),
             ShapeVerdict::Fail,
             "a pet that fires in deep sleep, under every other bound"
         );
+        let unread = [(EFFECT_LANE, None), (NEEDLE_LANE, Some(0))];
         assert_eq!(
             judge(
                 &PET,
                 Counts {
-                    effect_fires: None,
+                    owner_fires: &unread,
                     ..quiet
                 }
             ),
@@ -517,6 +543,50 @@ mod tests {
             ShapeVerdict::Pass,
             "a row that bounds no lane passes whatever the lane did"
         );
+    }
+
+    /// The pet row bounds the dial's needle as well as the pet: a quiet machine's drift and one
+    /// real swing pass it, and a needle that asks more frames than that (three or more at each
+    /// of the window's ten readings) fails it under every other bound, as a needle lane the
+    /// metrics leave out does.
+    #[test]
+    fn a_needle_past_a_quiet_machines_drift_fails_the_pet_row() {
+        let calm = [(EFFECT_LANE, Some(0)), (NEEDLE_LANE, Some(3))];
+        let quiet = Counts {
+            owner_fires: &calm,
+            ..counts(0, Some(45), Some(98))
+        };
+        assert_eq!(judge(&PET, quiet), ShapeVerdict::Pass);
+        let swing = [(EFFECT_LANE, Some(0)), (NEEDLE_LANE, Some(20))];
+        assert_eq!(
+            judge(
+                &PET,
+                Counts {
+                    owner_fires: &swing,
+                    ..quiet
+                }
+            ),
+            ShapeVerdict::Pass,
+            "drift and one swing"
+        );
+        for needle in [Some(21), Some(30), None] {
+            let fired = [(EFFECT_LANE, Some(0)), (NEEDLE_LANE, needle)];
+            assert_eq!(
+                judge(
+                    &PET,
+                    Counts {
+                        owner_fires: &fired,
+                        ..quiet
+                    }
+                ),
+                ShapeVerdict::Fail,
+                "{needle:?} needle fires"
+            );
+        }
+        let line = "OK timer_wakes=46 deadline_fires_by_owner=stats_live:30,stats_needle:4,\
+                    system_vitals:10 wakes_by_variant=none";
+        assert_eq!(owner_fires(line, NEEDLE_LANE), Some(4));
+        assert_eq!(owner_fires(line, EFFECT_LANE), Some(0));
     }
 
     #[test]

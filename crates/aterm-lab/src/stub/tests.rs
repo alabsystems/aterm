@@ -229,6 +229,115 @@ fn a_call_with_when_belongs_to_the_subagent_whose_prompt_holds_it() {
     assert!(matches!(tool_turn(&main, &script), Some(ToolTurn::Call(n, _, 0)) if n == "Agent"));
 }
 
+/// A custom mode's `script` answers only a conversation whose first prompt holds a step's `when`,
+/// step by step; every other conversation, `toolstart` in it or not, is the mode's replies', so a
+/// lane can script one session (aterm's disk worker) beside tabs its replies answer.
+#[test]
+fn a_custom_scripts_keyed_steps_answer_only_their_own_conversation() {
+    let script = J::parse(
+        r#"[{"when":"(rule x worker)","name":"Bash","input":{"command":"rm -rf c"}},
+            {"when":"(rule x worker)","text":"Nothing left: kept it."},
+            {"name":"Read","input":{}}]"#,
+    )
+    .unwrap();
+    let start = r#"{"role":"user","content":[{"type":"text","text":"<system-reminder>r</system-reminder>"},{"type":"text","text":"Free it. (rule x worker)"}]}"#;
+    let used = r#"{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{}}]}"#;
+    let declined = r#"{"role":"user","content":[{"type":"tool_result","is_error":true,"content":"declined: keep it"}]}"#;
+    let said =
+        r#"{"role":"assistant","content":[{"type":"text","text":"Nothing left: kept it."}]}"#;
+    let req = |ms: &[&str]| body(&format!(r#"{{"messages":[{}]}}"#, ms.join(",")));
+    match keyed_tool_turn(&req(&[start]), &script) {
+        Some(ToolTurn::Call(name, input, 0)) => {
+            assert_eq!(name, "Bash");
+            assert_eq!(input.get("command").and_then(J::as_str), Some("rm -rf c"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        keyed_tool_turn(&req(&[start, used, declined]), &script),
+        Some(ToolTurn::Say("Nothing left: kept it.".into(), 1))
+    );
+    assert_eq!(
+        keyed_tool_turn(&req(&[start, used, declined, said]), &script),
+        Some(ToolTurn::Done)
+    );
+    let tab = r#"{"role":"user","content":"LABDISK-alpha: keep building"}"#;
+    assert_eq!(keyed_tool_turn(&req(&[tab]), &script), None);
+    let toolstart = r#"{"role":"user","content":"toolstart"}"#;
+    assert_eq!(
+        keyed_tool_turn(&req(&[toolstart]), &script),
+        None,
+        "a main step is the tool mode's, never a custom script's"
+    );
+    assert!(
+        matches!(tool_turn(&req(&[toolstart]), &script), Some(ToolTurn::Call(n, _, 0)) if n == "Read"),
+        "the control: the tool mode answers it"
+    );
+}
+
+/// Served on loopback, a custom mode with replies and a `script` streams the keyed conversation's
+/// tool call and every other conversation its reply.
+#[test]
+fn served_a_custom_modes_script_calls_for_its_conversation_and_replies_to_the_rest() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mode_file = dir.path().join("mode");
+    std::fs::write(&mode_file, "scripted\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("modes")).unwrap();
+    std::fs::write(
+        dir.path().join("modes/scripted.json"),
+        r#"{"stream":true,"text":"Working on it.","replies":[{"last":"(rule x)","text":"Asked."}],
+            "script":[{"when":"(rule x worker)","name":"Bash","input":{"command":"aterm harness disk free --dry-run"}}]}"#,
+    )
+    .unwrap();
+    let args = Args {
+        mode_file: Some(mode_file),
+        modes_dir: Some(dir.path().join("modes")),
+        ..Args::default()
+    };
+    let (port, _) = start(args).unwrap();
+    let client = aterm_http::Client::new(
+        aterm_http::Trust::PlatformVerifier,
+        aterm_http::ProxyMode::Direct,
+        Duration::from_secs(60),
+    );
+    let events = |first: &str| -> Vec<J> {
+        let turn = format!(
+            r#"{{"model":"claude-x","stream":true,"max_tokens":32000,"tools":[{{}}],"messages":[{{"role":"user","content":"{first}"}}]}}"#
+        );
+        let r = client
+            .post(&format!("http://127.0.0.1:{port}/v1/messages"))
+            .send(turn.as_bytes())
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        String::from_utf8_lossy(r.body())
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| J::parse(d).ok())
+            .collect()
+    };
+    let text = |ev: &[J]| -> String {
+        ev.iter()
+            .filter_map(|e| e.get("delta")?.get("text")?.as_str().map(str::to_string))
+            .collect()
+    };
+    let tool = |ev: &[J]| -> Option<String> {
+        ev.iter().find_map(|e| {
+            let b = e.get("content_block")?;
+            if b.get("type")?.as_str()? != "tool_use" {
+                return None;
+            }
+            b.get("name")?.as_str().map(str::to_string)
+        })
+    };
+    let worker = events("Free it. (rule x worker)");
+    assert_eq!(tool(&worker).as_deref(), Some("Bash"), "{worker:?}");
+    let tab = events("keep building");
+    assert_eq!(tool(&tab), None, "{tab:?}");
+    assert_eq!(text(&tab), "Working on it.");
+    let asked = events("free space (rule x)");
+    assert_eq!(text(&asked), "Asked.", "{asked:?}");
+}
+
 #[test]
 fn a_text_step_ends_the_turn_and_the_script_goes_on_at_the_next_user_row() {
     let script = J::parse(

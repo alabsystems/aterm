@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# Pause-swoosh: a shell line typed, a pause long enough for the swoosh (after 900 ms) and the
+# retract, then more typing on the same line and a second pause.
+
+grid 16 80
+style rainbow kitty
+hz 60
+
+at 0 pty "\e[8;1H$ "
+at 700 key g
+at 702 pty "g"
+at 810 key i
+at 812 pty "i"
+at 920 key t
+at 922 pty "t"
+at 1030 key space
+at 1032 pty " "
+at 1140 key s
+at 1142 pty "s"
+at 1250 key t
+at 1252 pty "t"
+at 1360 key a
+at 1362 pty "a"
+at 1470 key t
+at 1472 pty "t"
+at 1580 key u
+at 1582 pty "u"
+at 1690 key s
+at 1692 pty "s"
+at 4400 key space
+at 4402 pty " "
+at 4510 key -
+at 4512 pty "-"
+at 4620 key -
+at 4622 pty "-"
+at 4730 key s
+at 4732 pty "s"
+at 4840 key h
+at 4842 pty "h"
+at 4950 key o
+at 4952 pty "o"
+at 5060 key r
+at 5062 pty "r"
+at 5170 key t
+at 5172 pty "t"
+run 7680

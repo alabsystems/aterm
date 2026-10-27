@@ -134,11 +134,13 @@ pub enum SeriousEffect {
     OutputStreak,
     /// The beat of the stats deck's now marker at each reading: decoration, so serious mode takes it; the marker, its grey when readings stop and the strips' glide stay.
     DeckBeat,
+    /// The steam rising off the stats deck's hot dial: decoration, so serious mode takes it; the dial, its glow and the needle stay.
+    DeckSteam,
 }
 
 impl SeriousEffect {
     #[cfg(test)]
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::TerminalSound,
         Self::CursorTrail,
         Self::CursorGlow,
@@ -154,6 +156,7 @@ impl SeriousEffect {
         Self::HarnessTicker,
         Self::OutputStreak,
         Self::DeckBeat,
+        Self::DeckSteam,
     ];
 }
 
@@ -188,7 +191,8 @@ impl SeriousModePolicy {
             | SeriousEffect::HarnessCard
             | SeriousEffect::HarnessTicker
             | SeriousEffect::OutputStreak
-            | SeriousEffect::DeckBeat => !self.serious,
+            | SeriousEffect::DeckBeat
+            | SeriousEffect::DeckSteam => !self.serious,
         }
     }
 }

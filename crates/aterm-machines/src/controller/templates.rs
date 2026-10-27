@@ -96,7 +96,7 @@ toolset = true
 
 # Other software is yours to add: a [homebrew] table installs Homebrew and its formulae,
 # an [[app]] row one signed app (docs/DESIGN-machines-2026-10-16.md §8). For keeping a Mac
-# awake and editing a file, aterm has its own `aterm caffeine` and `aterm edit`.
+# awake and editing a file, aterm has its own `aterm acaffiene` and `aterm edit`.
 
 # A per-host GitHub key for each user, registered with the [github] machine user.
 [github]

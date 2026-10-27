@@ -26,7 +26,9 @@
 //! (`an_age_rule_cuts_by_when_a_record_was_first_seen_across_restarts`); stamps read back
 //! that are not cut to the head recovered, or cut in memory only
 //! (`a_crash_that_loses_stamped_records_never_ages_the_ones_after_it`); a rewrite's
-//! snapshot without the stamps (`a_rewritten_store_keeps_the_ticks_stamps`); and, for the
+//! snapshot without the stamps (`a_rewritten_store_keeps_the_ticks_stamps`); a prune that
+//! drops every stamp at or below the base
+//! (`a_carried_cut_after_a_cut_to_the_head_ages_nothing_at_once`); and, for the
 //! gap notice a tail below the base is owed (R4's addendum, A9), a count that skips its
 //! checks (`a_tail_below_what_the_rules_gave_up_is_told_the_range_and_the_count`,
 //! `a_cut_no_rules_planned_is_told_by_its_range_alone`), a planning that ledgers nothing
@@ -40,7 +42,12 @@
 //! when it grows, and a ledger that takes a planning's give-ups as if it were whole below
 //! them (`a_give_up_the_ledger_can_no_longer_count_is_told_by_its_range_again`), and a look
 //! that moves the range told while it tells nothing
-//! (`a_look_that_tells_nothing_leaves_the_range_still_owed`).
+//! (`a_look_that_tells_nothing_leaves_the_range_still_owed`); and, for a fetch told of gaps
+//! (BUS-1), one that refuses below the oldest as a reader not told is refused, and one that
+//! reads below it whenever the page holds a record, at or above the oldest too
+//! (`a_wide_fetch_reads_the_mail_retention_still_holds_below_its_oldest`), and one that
+//! refuses a scan that ran out below the oldest having matched nothing
+//! (`a_told_fetch_whose_scan_runs_out_below_the_oldest_reads_on_to_the_held_mail`).
 
 use super::*;
 use crate::compact::{intent_path, kept_path, staged_state_path, Meter, Seam, Step};
@@ -444,6 +451,41 @@ fn a_hold_class_past_its_bytes_gives_up_its_oldest_and_tells_the_reader() {
     }
 }
 
+/// A CUT A CALLER ASKS FOR BETWEEN TICKS PLANS ON THE LAST TICK'S CLOCK, NEVER AT 0: a tick
+/// whose cut reaches the head leaves its stamp (`retention::prune_stamps` keeps the newest),
+/// so the mail that lands after it and that `retain_before_carrying_state` carries is
+/// stamped at that tick's time, and the next tick, a minute on, keeps it and tells no loss.
+/// NC: a prune that drops every stamp at or below the base leaves none; the carried cut then
+/// stamps the mail at 0, and the next tick gives it up as a week old (aterm sim item B05).
+#[test]
+fn a_carried_cut_after_a_cut_to_the_head_ages_nothing_at_once() {
+    let mut fx = Fx::new("held-carried-clock", false);
+    let mut log = fx.create();
+    log.set_retention(rules(None, Some(HOUR), None, 7 * DAY, false))
+        .unwrap();
+    fx.batch(&mut log, &[EV, EV]);
+    assert_eq!(
+        log.retain_by_rules(T0).unwrap().base,
+        0,
+        "nothing is an hour old"
+    );
+    assert_eq!(
+        log.retain_by_rules(T0 + 2 * HOUR).unwrap().base,
+        2,
+        "the stream is past its hour: the cut reaches the head"
+    );
+    fx.batch(&mut log, &[MAIL, EV]);
+    log.retain_before_carrying_state(Offset(4)).unwrap();
+    assert_eq!(read(&log, "/f/F/in/>"), vec![2], "the cut carries the mail");
+    let tick = log.retain_by_rules(T0 + 2 * HOUR + MINUTE).unwrap();
+    assert!(
+        tick.lost.is_empty(),
+        "nothing is a week old: {:?}",
+        tick.lost
+    );
+    assert_eq!(read(&log, "/f/F/in/>"), vec![2], "the mail is still held");
+}
+
 /// AN AGE RULE under the hand clock: the bulk stream keeps an hour, mail a day. Nothing is
 /// cut before its age; at an hour and a minute the records the first tick stamped go; at a
 /// day and two minutes the rest go, and the mail the cut carried is given up by its age and
@@ -509,6 +551,136 @@ fn mail_is_held_until_its_reader_reads_it() {
     assert_eq!(read(&log, "/f/F/in/>"), vec![2], "n2's is still held");
     assert_eq!(log.oldest(&filter("/f/F/in/n1/>")), Offset(2));
     assert_eq!(log.oldest(&filter("/f/F/in/n2/>")), Offset(0));
+}
+
+/// A WIDE FETCH READS THE MAIL RETENTION STILL HOLDS BELOW ITS OLDEST (BUS-1; R4's addendum
+/// A9 on the fetch path): n2's mail is published before n1's, n1's inbox group reads its own,
+/// and the tick releases it. The mail filter's oldest is then n1's floor, 3, the greatest of
+/// its subjects' floors, above n2's unread mail at 1 (n2's own filter is whole from 0). A
+/// reader that did not ask for notices is refused below 3, as before (`fetch_checked`). A
+/// reader told of gaps reads from 0 and from 1 and gets n2's held mail, told `..3` with the
+/// one record given up (n1's, read) counted; from 2, where the filter holds nothing below 3,
+/// it is refused 3; from 3 it reads on with nothing told. `/f/F/>`, whose oldest is the base
+/// (it reaches the prefix rule), reads n2's mail held below the base and the stream's record
+/// at 4, told `0..4` with no count (the prefix rule's records go as a range). Once n1 has
+/// another mail above the cut, a read from 2 is still refused 3: what it finds is at or above
+/// the oldest, so nothing of the filter is held in `2..3`. NC: a `fetch_told` that refuses
+/// below the oldest, as `fetch_checked` does, reads none of it; one that takes any record on
+/// the page for a held one (`Some(_) => true`) reads n1's later mail from 2, told `2..3`.
+#[test]
+fn a_wide_fetch_reads_the_mail_retention_still_holds_below_its_oldest() {
+    let mut fx = Fx::new("held-wide-fetch", false);
+    let mut log = fx.create();
+    log.set_retention(rules(Some(rb(EV)), None, None, 7 * DAY, true))
+        .unwrap();
+    fx.batch(&mut log, &[EV, MAIL2, MAIL, EV, EV]);
+    let tick = log.retain_by_rules(T0).unwrap();
+    assert_eq!((tick.base, tick.carried), (4, 2));
+    log.commit(INBOX.into(), 2).unwrap();
+    let tick = log.retain_by_rules(T0 + MINUTE).unwrap();
+    assert_eq!(tick.released, 1, "n1's reader read its mail");
+    assert!(tick.lost.is_empty(), "a read mail is not lost");
+    let mails = filter("/f/F/in/>");
+    let all = filter("/f/F/>");
+    assert_eq!(log.oldest(&mails), Offset(3), "n1's floor, the greatest");
+    assert_eq!(log.oldest(&filter("/f/F/in/n2/>")), Offset(0));
+    assert_eq!(
+        log.oldest(&all),
+        Offset(4),
+        "the base: it reaches the prefix rule"
+    );
+    let head = log.head().0;
+    let told = |from: u64, f: &Filter| {
+        log.fetch_told(from, f, 10, 100, head)
+            .map(|(page, _, gap)| {
+                let offs: Vec<u64> = page.iter().map(|r| r.seq.0).collect();
+                (offs, gap)
+            })
+    };
+    let gap = |from, to, records| Some(crate::proto::Gap { from, to, records });
+    assert_eq!(
+        log.fetch_checked(0, &mails, 10, 100, head)
+            .map(|(p, _)| p.len()),
+        Err(Offset(3)),
+        "a reader not told is refused, as before"
+    );
+    assert_eq!(told(0, &mails), Ok((vec![1], gap(0, 3, Some(1)))));
+    assert_eq!(told(1, &mails), Ok((vec![1], gap(1, 3, Some(1)))));
+    assert_eq!(
+        told(2, &mails),
+        Err(Offset(3)),
+        "nothing of it held in 2..3"
+    );
+    assert_eq!(told(3, &mails), Ok((vec![], None)));
+    assert_eq!(told(0, &all), Ok((vec![1, 4], gap(0, 4, None))));
+
+    fx.batch(&mut log, &[MAIL]);
+    let head = log.head().0;
+    let told = |from: u64| {
+        log.fetch_told(from, &mails, 10, 100, head)
+            .map(|(page, _, gap)| (page.iter().map(|r| r.seq.0).collect::<Vec<_>>(), gap))
+    };
+    assert_eq!(
+        log.oldest(&mails),
+        Offset(3),
+        "the later mail is above the cut"
+    );
+    assert_eq!(
+        told(2),
+        Err(Offset(3)),
+        "what the read finds is at or above the oldest: nothing held in 2..3"
+    );
+    assert_eq!(
+        told(0),
+        Ok((vec![1, 6], gap(0, 3, Some(1)))),
+        "n1's group commit is at 5"
+    );
+}
+
+/// A TOLD FETCH WHOSE SCAN RUNS OUT BELOW THE OLDEST READS ON TO THE HELD MAIL (BUS-1): the
+/// page's own bounded scan decides whether the filter holds anything below its oldest, and a
+/// scan that ends there having matched nothing cannot say. n2's mail from b, held below the
+/// base and not of the filter (`/f/F/in/*/from/a`), comes before n2's mail from a; with a
+/// scan of one record a told read of the filter from 0 scans n2's mail from b alone. It is
+/// answered as holding: an empty page, its `next` below the oldest (n1's floor, 4), told
+/// `0..4` with n1's read mail counted; the read on from that `next` reaches n2's held mail
+/// from a, told the rest of the range again. NC: a `fetch_told` that refuses a scan that ran
+/// out (`None => false`) refuses the read from 0, and a reader that follows the refusal
+/// skips n2's mail.
+#[test]
+fn a_told_fetch_whose_scan_runs_out_below_the_oldest_reads_on_to_the_held_mail() {
+    const FROM_B: &str = "/f/F/in/n2/from/b";
+    let mut fx = Fx::new("held-told-scan", false);
+    let mut log = fx.create();
+    log.set_retention(rules(Some(rb(EV)), None, None, 7 * DAY, true))
+        .unwrap();
+    fx.batch(&mut log, &[EV, FROM_B, MAIL2, MAIL, EV, EV]);
+    let tick = log.retain_by_rules(T0).unwrap();
+    assert_eq!((tick.base, tick.carried), (5, 3), "the three mails");
+    log.commit(INBOX.into(), 3).unwrap();
+    let tick = log.retain_by_rules(T0 + MINUTE).unwrap();
+    assert_eq!(tick.released, 1, "n1's reader read its mail");
+    let mails = filter("/f/F/in/*/from/a");
+    assert_eq!(log.oldest(&mails), Offset(4), "n1's floor");
+    let head = log.head().0;
+    let told = |from: u64| {
+        log.fetch_told(from, &mails, 10, 1, head)
+            .map(|(page, next, gap)| {
+                let offs: Vec<u64> = page.iter().map(|r| r.seq.0).collect();
+                (offs, next, gap)
+            })
+    };
+    let gap = |from, to, records| Some(crate::proto::Gap { from, to, records });
+    assert_eq!(
+        told(0),
+        Ok((vec![], 2, gap(0, 4, Some(1)))),
+        "the scan ran out on n2's mail from b: answered as holding"
+    );
+    assert_eq!(
+        told(2),
+        Ok((vec![2], 5, gap(2, 4, Some(1)))),
+        "the read on reaches n2's held mail"
+    );
 }
 
 /// A RESTART reads back the held store, its floors, its rules and the carried state: the
@@ -774,9 +946,14 @@ fn a_sealed_held_store_is_sealed() {
         !bytes.windows(BODY.len()).any(|w| w == BODY),
         "a held record's body in the clear"
     );
-    let err = HeldStore::load(&fx.path, Some(&[0x11; 32]), 8, false)
-        .err()
-        .expect("another key");
+    let err = HeldStore::load(
+        &fx.path,
+        Some(crate::store::AtRestRef::v1(&[0x11; 32])),
+        8,
+        false,
+    )
+    .err()
+    .expect("another key");
     assert!(err.to_string().contains("authenticate"), "{err}");
 }
 
@@ -1169,8 +1346,9 @@ fn a_tail_below_what_the_rules_gave_up_is_told_the_range_and_the_count() {
 /// A LATER GIVE-UP INSIDE A RANGE ALREADY TOLD IS TOLD AGAIN, counted once. n2's mail at 0
 /// and n1's at 1 are held below the base at 4. When n1's reader reads its mail, that mail
 /// goes, and a tail on all mail from 0 is told `0..2`, counting 1: n1's mail. n2's mail at
-/// 0 is still held, so the tail is still delivered it (`Fetch` of all mail refuses below
-/// the oldest, 2; of n2's mail it reads it). When n2's mail ages out, inside the
+/// 0 is still held, so the tail is still delivered it (a `Fetch` of all mail that did not
+/// ask for gap notices is refused below the oldest, 2, and one that asked reads it; of n2's
+/// mail any `Fetch` reads it). When n2's mail ages out, inside the
 /// range already told, the tail is told `0..2` again, counting 1: n2's mail, and not n1's a
 /// second time. NC: a count of only what lies at or above the range told (no `seq > seen`)
 /// reads `Some(0)` for n2's mail and tells nothing.

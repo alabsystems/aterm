@@ -9,7 +9,9 @@
 //! is logged by astream (subject and count), answers a `Fetch` below it `ERR retained-from=`, and
 //! is TOLD to the node's inbox group subscription (astream's gap notice, R4's addendum A9): the
 //! bridge says `link gap from=<a> to=<b> [records=<n>]`, and every session the node serves names
-//! it in `inbox` (`given_up=`) and marks it in its log (`mail-gap`).
+//! it in `inbox` (`given_up=`) and marks it in its log (`mail-gap`). Read mail the cut took before
+//! its session handled it is told to that session when the bridge's own read of its lane meets the
+//! floor (its refill from `seen`, its deadline sweep): `link gap … sid=<sid>`.
 
 use std::io;
 use std::time::Duration;

@@ -79,7 +79,7 @@ fn exercise(cli: Cli, reader: i64, fault: i64, shape: i64) -> [bool; 4] {
         SyncTarget {
             path: &path,
             before: Some(&raw_before),
-            after: &after,
+            after: Some(&after),
             mode: None,
         },
         |state, logins| {

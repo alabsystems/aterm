@@ -4,9 +4,10 @@
 //! GUI-faithful frame harness for cursor-trail case families and laws.
 #![allow(dead_code)]
 
+use crate::common::{Ground, ground_or, on_ground, rainbow_cfg_on};
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
-use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig, GlowStyle};
+use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig};
 use aterm_effects::kitty_pet::{PetBrain, PetSense};
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::time::{Duration, Instant};
@@ -166,36 +167,68 @@ pub const LOCK_A: Opts = Opts {
     pane_columns: false,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Theme {
     Tokyo,
     Default,
+    /// `#2b2d33` on `#f6f7f9`.
+    DefaultLight,
+    GithubLight,
+    SolarizedLight,
+    Latte,
 }
 
+impl Theme {
+    /// The light built-ins every law also reads its cases on ([`light_grounds`]).
+    pub const LIGHT: [Theme; 4] = [
+        Theme::DefaultLight,
+        Theme::GithubLight,
+        Theme::SolarizedLight,
+        Theme::Latte,
+    ];
+
+    pub fn ground(self) -> Ground {
+        match self {
+            Theme::Tokyo => Ground::TOKYO,
+            Theme::Default => Ground::scheme("Default"),
+            Theme::DefaultLight => Ground::scheme("Default Light"),
+            Theme::GithubLight => Ground::scheme("GitHub Light"),
+            Theme::SolarizedLight => Ground::scheme("Solarized Light"),
+            Theme::Latte => Ground::scheme("Catppuccin Latte"),
+        }
+    }
+}
+
+/// The rainbow kitty config on `theme`'s ground, `dark_theme` taken from
+/// `theme_is_dark` as the host takes it.
 pub fn cfg(theme: Theme) -> GlowConfig {
-    let (theme_fg, theme_bg) = match theme {
-        Theme::Tokyo => (0x00C8_D3F5, 0x001A_1B26),
-        Theme::Default => (0x00D0_D0D0, 0x0011_1318),
-    };
-    GlowConfig {
-        classic_mono: false,
-        ribbon_tall: true,
-        ribbon_flat: false,
-        enabled: true,
-        dark_theme: true,
-        theme_fg,
-        theme_bg,
-        style: GlowStyle::RainbowKitty,
-        color: 0x0050_FA7B,
-        accent: 0x007A_A2F7,
-        duration: Duration::from_millis(240),
-        length: 18,
-        intensity: 0.7,
-        audible: true,
-        radius: 0.6,
-        ring: true,
-        beam: false,
-        head_dx: 0.5,
+    rainbow_cfg_on(theme.ground())
+}
+
+/// The light grounds a law reads every case on besides its family's own
+/// theme: all of [`Theme::LIGHT`] under the full grid, Default Light on a
+/// debug build's spine ([`sweep`]).
+pub fn light_grounds() -> Vec<Ground> {
+    sweep(&Theme::LIGHT, &[Theme::DefaultLight])
+        .into_iter()
+        .map(Theme::ground)
+        .collect()
+}
+
+/// A plain law's body, run on its family's own theme and then on each light
+/// ground ([`light_grounds`]); a light ground it breaks on is named.
+pub fn on_every_ground(f: impl Fn()) {
+    f();
+    for g in light_grounds() {
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_ground(g, &f)));
+        if let Err(e) = read {
+            let why = e
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| e.downcast_ref::<&str>().copied())
+                .unwrap_or("a panic");
+            panic!("on {}: {why}", g.name);
+        }
     }
 }
 
@@ -230,6 +263,7 @@ pub struct Core {
 }
 
 impl Core {
+    /// A host on its family's `theme`, or on the ground an [`on_ground`] names.
     pub fn new(rows: usize, cols: usize, cw: usize, ch: usize, theme: Theme, o: Opts) -> Self {
         let g = Geom {
             cw,
@@ -250,7 +284,7 @@ impl Core {
         Self {
             term: Terminal::new(rows as u16, cols as u16),
             glow,
-            cfg: cfg(theme),
+            cfg: rainbow_cfg_on(ground_or(theme.ground())),
             g,
             now,
             t0: now,
@@ -624,17 +658,31 @@ pub fn sweep<T: Clone + PartialEq + std::fmt::Debug>(all: &[T], spine: &[T]) -> 
     }
 }
 
+/// Every picked case on its family's own theme and on each light ground
+/// ([`light_grounds`]), one verdict for all: a stated limit reads bad on
+/// every ground.
 fn run_law(cases: Vec<Case>, pick: impl Fn(&str) -> bool, limit: impl Fn(&str) -> bool) {
     let picked: Vec<Case> = cases.into_iter().filter(|c| pick(&c.id)).collect();
     assert!(!picked.is_empty(), "the law picks no case");
-    let outcomes = crate::common::par_map(&picked, |c| (c.run)());
+    let grounds: Vec<Option<Ground>> = std::iter::once(None)
+        .chain(light_grounds().into_iter().map(Some))
+        .collect();
+    let runs: Vec<(&Case, Option<Ground>)> = picked
+        .iter()
+        .flat_map(|c| grounds.iter().map(move |&g| (c, g)))
+        .collect();
+    let outcomes = crate::common::par_map(&runs, |&(c, g)| match g {
+        None => (c.run)(),
+        Some(g) => on_ground(g, || (c.run)()),
+    });
     let mut broken = Vec::new();
-    for (c, o) in picked.iter().zip(outcomes) {
+    for (&(c, g), o) in runs.iter().zip(outcomes) {
         let is_limit = limit(&c.id);
         if o.ok == is_limit {
             broken.push(format!(
-                "{} [{}] {}: followed={} retired={} wrong_lit={} dark={} {}",
+                "{}{} [{}] {}: followed={} retired={} wrong_lit={} dark={} {}",
                 c.id,
+                g.map_or_else(String::new, |g| format!(" on {}", g.name)),
                 c.class,
                 if is_limit {
                     "a stated LIMIT now holds — restate the law"
@@ -651,14 +699,17 @@ fn run_law(cases: Vec<Case>, pick: impl Fn(&str) -> bool, limit: impl Fn(&str) -
     }
     assert!(
         broken.is_empty(),
-        "{} of {} cases:\n{}",
+        "{} of {} readings ({} cases on {} grounds):\n{}",
         broken.len(),
+        runs.len(),
         picked.len(),
+        grounds.len(),
         broken.join("\n")
     );
 }
 
-/// A family holds: every case whose id satisfies `pick` holds.
+/// A family holds: every case whose id satisfies `pick` holds, on every
+/// ground ([`run_law`]).
 pub fn holds_where(cases: Vec<Case>, pick: impl Fn(&str) -> bool) {
     run_law(cases, pick, |_| false);
 }
@@ -669,8 +720,8 @@ pub fn holds(cases: Vec<Case>, prefix: &str) {
 }
 
 /// A family holds but for its stated limits: every picked case `limit` names
-/// must read bad, and every other must hold. Neither side may be empty, so a
-/// grid's spine ([`sweep`]) must keep a case on each.
+/// must read bad and every other must hold, on every ground. Neither side may
+/// be empty, so a grid's spine ([`sweep`]) must keep a case on each.
 pub fn holds_but(cases: Vec<Case>, pick: impl Fn(&str) -> bool, limit: impl Fn(&str) -> bool) {
     let named = cases.iter().filter(|c| pick(&c.id) && limit(&c.id)).count();
     let picked = cases.iter().filter(|c| pick(&c.id)).count();

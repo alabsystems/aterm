@@ -1909,8 +1909,20 @@ fn chooser_panel(
     name: Option<&str>,
 ) -> UiNode {
     let stacked = !matches!(shape, Shape::Beside { .. });
-    let inner = (panel_width - 2.0 * PANEL_INSET).max(0.0);
     let narrow = chooser_is_narrow(panel_width);
+    // THE CHOOSER'S FRAME GIVES WAY BEFORE A ROW OUTGROWS ITS LIST: where its tallest row is
+    // taller than the list its frame leaves, the list takes the panel to its edges (at 1.5x in
+    // 164x98 a two-line name and Community, 84pt, in an 82pt list, the frame's 8pt the
+    // difference).
+    let framed = (panel_width - 2.0 * PANEL_INSET).max(0.0);
+    let inset = if chooser_rows_tallest(state, framed, narrow)
+        > height - 2.0 * PANEL_INSET - chooser_pinned_height(state, ChooserPins::NONE) + 0.5
+    {
+        0.0
+    } else {
+        PANEL_INSET
+    };
+    let inner = (panel_width - 2.0 * inset).max(0.0);
     let forms: &[ChooserPins] = if !lead.is_empty() {
         &[ChooserPins::NONE]
     } else if stacked {
@@ -1934,9 +1946,8 @@ fn chooser_panel(
             ChooserPins::NONE,
         ]
     };
-    let room_for = |pins: ChooserPins| {
-        (height - 2.0 * PANEL_INSET - chooser_pinned_height(state, pins)).max(0.0)
-    };
+    let room_for =
+        |pins: ChooserPins| (height - 2.0 * inset - chooser_pinned_height(state, pins)).max(0.0);
     let footer = footer_rows(state, inner, narrow);
     // The pinned footer is its two rows of a field each ([`footer_height`]): one whose words or
     // links wrap to more rows is listed.
@@ -1992,7 +2003,7 @@ fn chooser_panel(
     };
     let under_head = head
         .iter()
-        .fold(height - PANEL_INSET + PANEL_GAP, |under, (_, tall)| {
+        .fold(height - inset + PANEL_GAP, |under, (_, tall)| {
             under - tall - PANEL_GAP
         });
     for (node, _) in &head {
@@ -2094,7 +2105,7 @@ fn chooser_panel(
         Layout::column()
             .width(Length::Fixed(panel_width))
             .height(Length::Fixed(height))
-            .padding(Insets::all(PANEL_INSET))
+            .padding(Insets::all(inset))
             .gap(PANEL_GAP),
     )
     .children(children)
@@ -2174,7 +2185,7 @@ pub(in crate::native_settings) fn section_items(
         }
         let repeat = if disclosure {
             let caption = Section::Community.caption().unwrap_or_default();
-            let (mut caption, _, _) = section_band(Section::Community, caption, height);
+            let (mut caption, _, _) = section_band(Section::Community, caption, height, row_width);
             caption.layout.width = Length::Fixed(row_width);
             vec![(caption, height)]
         } else {
@@ -2794,6 +2805,7 @@ fn build_list_blocks(
             Section::Attention,
             Section::Attention.caption().unwrap_or_default(),
             false,
+            width,
         ));
         for row in attention {
             blocks.push((
@@ -2824,7 +2836,7 @@ fn build_list_blocks(
             if card.section == Section::Community && query.is_empty() {
                 blocks.push(pack_row(state, community_total, rows_before, width));
             } else if let Some(caption) = card.section.caption_after_rows(rows_before) {
-                blocks.push(section_heading(card.section, caption, rows_before));
+                blocks.push(section_heading(card.section, caption, rows_before, width));
             }
         }
         let in_use = configured.eq_ignore_ascii_case(&card.id);
@@ -2866,25 +2878,37 @@ fn section_heading(
     section: Section,
     caption: &str,
     after_rows: bool,
+    width: f32,
 ) -> (UiNode, f32, Option<String>) {
     // A band of whole rows ([`on_grid`]), its words at its foot, at least [`SECTION_ABOVE`]
     // over them where it follows a row.
-    let height = on_grid(caption_height() + if after_rows { SECTION_ABOVE } else { 0.0 });
-    section_band(section, caption, height)
+    let (_, words) = caption_words(section, caption, width);
+    let height = on_grid(words + if after_rows { SECTION_ABOVE } else { 0.0 });
+    section_band(section, caption, height, width)
+}
+
+/// A section's caption on the lines a row `width` wide sets it on, and their height: never cut
+/// ("COMMU…" over the open Community section's rows at 2x in a 178pt window).
+fn caption_words(section: Section, caption: &str, width: f32) -> (UiNode, f32) {
+    super::wrapped_words_node(
+        &format!("settings/showcase/section/{}", section.word()),
+        caption,
+        (SemanticRole::Heading, StyleRef::Quiet),
+        (width - TEXT_INSET).max(1.0),
+        caption_height(),
+    )
 }
 
 /// A section's caption in a band `height` tall, its words at its foot.
-fn section_band(section: Section, caption: &str, height: f32) -> (UiNode, f32, Option<String>) {
-    let above = (height - caption_height()).max(0.0);
+fn section_band(
+    section: Section,
+    caption: &str,
+    height: f32,
+    width: f32,
+) -> (UiNode, f32, Option<String>) {
+    let (words, tall) = caption_words(section, caption, width);
+    let above = (height - tall).max(0.0);
     let key = format!("settings/showcase/section/{}", section.word());
-    let words = line(
-        key.clone(),
-        caption,
-        SemanticRole::Heading,
-        StyleRef::Quiet,
-        f32::MAX,
-        caption_height(),
-    );
     (inset(&key, words, above, height), height, None)
 }
 

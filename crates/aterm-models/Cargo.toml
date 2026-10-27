@@ -34,14 +34,18 @@ aterm-models-native.workspace = true
 aterm-models-release.workspace = true
 aterm-models-render.workspace = true
 aterm-models-session.workspace = true
+aterm-models-setup.workspace = true
 aterm-models-update.workspace = true
 
 [dev-dependencies]
 # The source-spec closure (`tests/spec_xref_closure.rs`) links every anchored crate, so the
 # registry holds every anchor, waiver and model in one binary. Test-only: nothing ships this
-# crate, and no library depends on it.
+# crate, and no library depends on it. Being every anchored crate's dependent is also what
+# brings this crate's tests, the closure among them, into `verify`'s change cone for a change
+# to any of them.
 agh.workspace = true
 aterm-agent.workspace = true
+aterm-cli = { path = "../aterm-cli" }
 aterm-core.workspace = true
 aterm-db.workspace = true
 aterm-db-core.workspace = true
@@ -59,6 +63,7 @@ aterm-secrets.workspace = true
 aterm-selection.workspace = true
 aterm-session.workspace = true
 aterm-update.workspace = true
+aterm-vz.workspace = true
 
 [lints]
 workspace = true

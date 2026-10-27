@@ -158,6 +158,7 @@ impl CursorPhaser {
 
     /// Advance one frame at `now` with the beam's rolling `hue` (turns `0..1`, read from [`crate::cursor_glow::CursorGlow::beam_hue`] after the aurora tick), typing `energy` (`0..1`), the block cursor cell `cur` (`None`: hidden), theme darkness, grid `geom` and resolved `cfg`.
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -255,6 +256,7 @@ impl CursorPhaser {
         clippy::too_many_arguments,
         reason = "cursor cell + charge/hue + geometry/config; one internal call site"
     )]
+    #[inline]
     fn emit_wings(
         &self,
         cr: u16,
@@ -276,7 +278,10 @@ impl CursorPhaser {
 
         let slab = ((ch * 0.125) as i32).max(2);
         let cy_i32 = cy as i32;
-        for &(rx, cov_x, fringe, hx) in &WING_LAYERS {
+        let mut wli = 0;
+        while wli < WING_LAYERS.len() {
+            let (rx, cov_x, fringe, hx) = WING_LAYERS[wli];
+            wli += 1;
             let r = reach * rx;
             if r < 1.0 {
                 continue;

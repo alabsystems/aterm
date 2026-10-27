@@ -56,6 +56,40 @@ pub(crate) fn serve(
         return public_reply(&format!("ERR askpass refused {why}\n"));
     }
 
+    // A fixed app-owned operation is authorized by the PID generation bound
+    // before suspended sudo was resumed. Unbound requests still take the
+    // unchanged generic argv/refusal path below.
+    let owned_request = match crate::cpu_policy_authorization::request(sudo_pid) {
+        Ok(request) => request,
+        Err(()) => {
+            return public_reply(
+                "ERR askpass refused owned operation already requested or withdrawn\n",
+            );
+        }
+    };
+    if let Some((owned, ticket)) = owned_request {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request = AskpassRequest {
+            ticket: std::sync::Arc::clone(&ticket),
+            attribute_from: std::process::id() as i32,
+            owned: Some(std::sync::Arc::clone(&owned)),
+            command: "Read CPU policy flags (Game Mode, CarPlay, runaway mitigation)".into(),
+            invoker: "aterm system resource diagnostics".into(),
+            reply: tx,
+        };
+        if proxy.send_event(Wake::Askpass(Box::new(request))).is_err() {
+            ticket.cancel();
+            return public_reply("ERR askpass refused the window is gone\n");
+        }
+        let mut hung = || crate::control::caller_hung_up();
+        let response = await_answer(&rx, &ticket, ASKPASS_TICK, &mut hung, &mut Instant::now);
+        let _ = proxy.send_event(Wake::AskpassWithdraw { id: ticket.id });
+        if !owned.matches_live_sudo() {
+            return public_reply("ERR askpass refused owned process changed or withdrawn\n");
+        }
+        return response;
+    }
+
     // Classify the command from exact kernel argv (`KERN_PROCARGS2`), failing closed when unreadable.
     let argv = u32::try_from(sudo_pid)
         .ok()
@@ -85,6 +119,7 @@ pub(crate) fn serve(
     let request = AskpassRequest {
         ticket: std::sync::Arc::clone(&ticket),
         attribute_from: invoker_pid,
+        owned: None,
         command,
         invoker,
         reply: tx,

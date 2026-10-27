@@ -6,7 +6,8 @@
 
 pub mod anchor;
 pub mod doc;
-pub mod edit;
+// edit and uri live in amacs-protocol, so a client (aterm-ctl) links no editor engine.
+pub use amacs_protocol::edit;
 pub mod read;
 pub mod script;
-pub mod uri;
+pub use amacs_protocol::uri;

@@ -639,10 +639,8 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         Instant::now() + HANG,
     );
     assert!(
-        matches!(&refused, Err(Unregistered::Answered(why)) if why.contains(&format!(
-            "`aterm fleet peers rm {}` on the issuer",
-            &node[..8]
-        ))),
+        matches!(&refused, Err(Unregistered::Answered(why))
+            if why.contains(&format!("`aterm fleet peers rm {node}` on the issuer"))),
         "{refused:?}"
     );
     let book = std::fs::read_to_string(inst.tmp.join("state/fleet-peers")).expect("the book");
@@ -780,13 +778,15 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     assert_eq!(ambiguous.status.code(), Some(1), "{ambiguous:?}");
     assert!(ambiguous.stdout.is_empty(), "{ambiguous:?}");
     let named = String::from_utf8_lossy(&ambiguous.stderr);
-    for each in [port.as_str(), &other_port.to_string()] {
-        assert!(named.contains(&format!(":{each}")), "{ambiguous:?}");
-    }
-    for each in [closed_port, silent_port] {
+    for each in [
+        port.as_str(),
+        &other_port.to_string(),
+        &closed_port.to_string(),
+        &silent_port.to_string(),
+    ] {
         assert!(
-            !named.contains(&format!(":{each}")),
-            "an unbound hand entry is not a bound-tier candidate: {ambiguous:?}"
+            named.contains(&format!(":{each}")),
+            "each peer the word names, a hand entry among them: {ambiguous:?}"
         );
     }
     let one = ctl_in(
@@ -1347,6 +1347,49 @@ fn a_grant_written_while_a_drive_is_open_cuts_it_only_once_it_takes_its_grant_aw
 }
 
 #[test]
+fn an_all_member_grant_lets_every_member_drive_and_keeps_the_holds_they_take() {
+    let (issuer, member, worker, target) = driven_pair(("afai", "afam"));
+    let code = std::fs::read_to_string(issuer.tmp.join("state/fleet-join-code")).expect("a code");
+    let third = World(headless_boot::scratch_root("afat"));
+    let (holder, third_port) = hold_a_port();
+    drop(holder);
+    fleet_ok(
+        &third.0,
+        &[
+            "join",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &third_port.to_string(),
+        ],
+        Some(&code),
+    );
+    fleet_ok(&member.tmp, &["allow", "content"], None);
+    let all = fleet_ok(&member.tmp, &["allow", "drive", "--all"], None);
+    assert!(
+        all.contains("drive_from = [\"*\"]")
+            && all.contains("every member the fleet's issuer binds")
+            && !all.contains("each node named"),
+        "{all}"
+    );
+    let at = format!("@{worker}");
+    for driver in [&issuer.tmp, &third.0] {
+        let (read, _) = drive_ok(driver, &target, &[&at, "status"]);
+        assert!(read.starts_with("OK schema="), "{read}");
+    }
+    let (took, _) = drive_ok(&issuer.tmp, &target, &["hold", &worker, "on"]);
+    assert_eq!(took.trim(), "OK hold=1", "{took}");
+    let off = ctl(&member, &["hold", &worker, "off"]);
+    let said = String::from_utf8_lossy(&off.stderr);
+    assert!(
+        off.status.code() == Some(1) && said.contains("which still drives this session's Mac"),
+        "the issuer, answering under the key the member binds, keeps its hold: {off:?}"
+    );
+    let (off, _) = drive_ok(&issuer.tmp, &target, &["hold", &worker, "off"]);
+    assert_eq!(off.trim(), "OK hold=0", "{off}");
+}
+
+#[test]
 fn a_remote_turn_into_a_shell_with_no_integration_is_submitted_by_one_enter() {
     let (issuer, member, worker, target) = driven_pair(("afti", "aftm"));
     let at = format!("@{worker}");
@@ -1453,7 +1496,7 @@ fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_n
     assert!(
         said.contains("origin=remote")
             && said.contains(&by)
-            && said.contains(&format!("`aterm fleet peers rm {}`", &node[..8]))
+            && said.contains(&format!("`aterm fleet peers rm {node}`"))
             && said.contains(&format!("`aterm ctl hold {sid} off`")),
         "the refusal names who holds it and what lifts it: {said}"
     );

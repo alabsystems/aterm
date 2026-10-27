@@ -324,6 +324,7 @@ pub(super) fn read_summaries(config: &Path, conversation: &str) -> Result<String
             std::thread::sleep(Duration::from_millis(50));
         }
         let res = aterm_uds::foreign_db::read_bytes(&db, SUMMARY_DB_MAX_BYTES, |main, wal| {
+            let mut malformed = false;
             let lines = crate::harness::sqlite_read::scan_table_with(
                 main,
                 wal,
@@ -344,9 +345,19 @@ pub(super) fn read_summaries(config: &Path, conversation: &str) -> Result<String
                     }
                     let status = row.get(st_i)?.to_list_field();
                     let nfi = row.get(nfi_i)?.to_list_field();
+                    if [&id, &status, &nfi, &parent]
+                        .iter()
+                        .any(|s| s.contains(['|', '\r', '\n']))
+                    {
+                        malformed = true;
+                        return None;
+                    }
                     Some(format!("{id}|{status}|{nfi}|{parent}"))
                 },
             )?;
+            if malformed {
+                return None;
+            }
             let mut out = lines.join("\n");
             if !out.is_empty() {
                 out.push('\n');
@@ -448,10 +459,13 @@ pub(super) fn look_at(
     )
 }
 
-/// Builds the restart claim record (`G-A3`) written before `SIGTERM` (`--resume <uuid>`).
+/// Builds the restart claim record (`G-A3`) written before `SIGTERM` (`--resume <uuid>`), naming
+/// `grace_s`, the person's grace that `SIGTERM` waits out ([`St::line_grace_s`]: a key typed at the
+/// prompt after it holds the relaunch line as long as it would have held the `SIGTERM`).
 pub(super) fn claim_record(
     snap: &super::super::super::relaunch::Snapshot,
     mv: &Move,
+    grace_s: u32,
     now: u64,
 ) -> Option<St> {
     let run = snap.agy()?;
@@ -477,6 +491,7 @@ pub(super) fn claim_record(
         quiet: true,
         salt: now,
         phase: Phase::Exiting { at_s: now },
+        line_grace_s: Some(grace_s),
         ..St::default()
     })
 }
@@ -568,7 +583,7 @@ pub(super) fn upgrade_visit(
         return Some(said(r, format!("wait:{why}")));
     }
     let now = now_s();
-    let Some(mut st) = claim_record(&snap, &mv, now) else {
+    let Some(mut st) = claim_record(&snap, &mv, opts.human_grace_s, now) else {
         return Some(said(r, "wait:no-session"));
     };
     if let Some(rot) = &rotation {

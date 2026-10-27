@@ -3000,6 +3000,7 @@ mod tests {
         );
         let holders = [
             Hog {
+                built_s_ago: None,
                 path: PathBuf::from("/u/Library/Caches/aterm/cargo-build.noindex/a"),
                 bytes: 61 * GIB,
                 bytes_partial: false,
@@ -3007,6 +3008,7 @@ mod tests {
                 serves: Some(PathBuf::from("/u/aterm")),
             },
             Hog {
+                built_s_ago: None,
                 path: PathBuf::from("/u/trust/build"),
                 bytes: 30 * GIB,
                 bytes_partial: false,
@@ -3274,6 +3276,7 @@ mod tests {
     #[test]
     fn a_session_holds_what_its_own_checkout_holds_and_a_line_typed_here_is_never_typed_twice() {
         let hog = |path: &str, gib: u64, serves: Option<&str>| Hog {
+            built_s_ago: None,
             path: PathBuf::from(path),
             bytes: gib << 30,
             bytes_partial: false,
@@ -3333,6 +3336,7 @@ mod tests {
     #[test]
     fn a_worktree_nested_in_a_checkout_with_no_holder_of_its_own_holds_nothing_of_the_checkouts() {
         let hog = |path: &str, gib: u64, serves: &str| Hog {
+            built_s_ago: None,
             path: PathBuf::from(path),
             bytes: gib << 30,
             bytes_partial: false,
@@ -3454,6 +3458,7 @@ mod tests {
         // worktree nested in ~/aterm that has since been removed (its session landed it), so no
         // `.git` is left to find between its directory and ~/aterm.
         let holders = [Hog {
+            built_s_ago: None,
             path: PathBuf::from("/u/Library/Caches/aterm/cargo-build.noindex/a"),
             bytes: 61 << 30,
             bytes_partial: false,
@@ -3530,6 +3535,7 @@ mod tests {
         assert!(checkout_root(&wt));
         assert!(!checkout_root(&wt.join("crates")));
         let holders = [Hog {
+            built_s_ago: None,
             path: repo.join("target"),
             bytes: 61 << 30,
             bytes_partial: false,
@@ -3893,6 +3899,7 @@ mod tests {
                 best_free: 0,
             },
             orphan_ms: None,
+            free_at_claim: None,
         });
         assert_eq!(
             filling_said(Some("asked @a"), Some(&entry), &[]).as_deref(),

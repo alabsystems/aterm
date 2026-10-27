@@ -11,6 +11,32 @@ fn warn(title: &str) -> Message {
     Message::new(tags::CONFIG, Severity::Warn, title).line("why")
 }
 
+/// How long from `now_ms` (unix milliseconds) to the next local midnight: the one
+/// words boundary that can legitimately fall inside a minute at any record age.
+fn to_local_midnight(now_ms: u64) -> std::time::Duration {
+    let offset_ms = crate::presence::local_offset_at(i64::try_from(now_ms / 1000).unwrap_or(0))
+        .unwrap_or(0)
+        * 1000;
+    let local_ms = i64::try_from(now_ms)
+        .unwrap_or(i64::MAX)
+        .saturating_add(offset_ms);
+    std::time::Duration::from_millis(to_midnight_ms(local_ms))
+}
+
+fn to_midnight_ms(local_ms: i64) -> u64 {
+    const DAY_MS: i64 = 86_400_000;
+    u64::try_from(DAY_MS - local_ms.rem_euclid(DAY_MS)).unwrap_or(0)
+}
+
+#[test]
+fn to_midnight_ms_measures_to_the_next_local_midnight() {
+    const HOUR: i64 = 3_600_000;
+    assert_eq!(to_midnight_ms(0), 86_400_000, "at midnight, the next one");
+    assert_eq!(to_midnight_ms(23 * HOUR + 59 * 60_000 + 30_000), 30_000);
+    assert_eq!(to_midnight_ms(12 * HOUR), 12 * 3_600_000);
+    assert_eq!(to_midnight_ms(-1), 1, "before the epoch, euclid holds");
+}
+
 use crate::toolchain_words::held_row;
 
 fn quiet_past_echoes() -> std::time::Duration {
@@ -1173,8 +1199,9 @@ fn a_headless_messages_page_is_republished_only_when_its_time_words_move() {
         .messages_words_change_in
         .expect("a record's age is said");
     assert!(
-        until > TICK && until <= std::time::Duration::from_millis(50 * MIN),
-        "its next hour, not the minute: {until:?}"
+        (until > TICK || to_local_midnight(now) <= TICK + std::time::Duration::from_secs(5))
+            && until <= std::time::Duration::from_millis(50 * MIN),
+        "its next hour, not the minute (midnight's date words excepted): {until:?}"
     );
     assert_eq!(app.messages_publish_due_at(), Some(published + until));
 
@@ -1237,7 +1264,10 @@ fn a_messages_page_that_slept_through_its_words_is_owed_its_publish_on_waking() 
     let until = app
         .messages_words_change_in
         .expect("a record's age is said");
-    assert!(until > TICK, "`3 h ago` moves at its next hour: {until:?}");
+    assert!(
+        until > TICK || to_local_midnight(now) <= TICK + std::time::Duration::from_secs(5),
+        "`3 h ago` moves at its next hour (midnight's date words excepted): {until:?}"
+    );
     assert_eq!(app.messages_publish_due_at(), Some(published + until));
 
     let (instant, wall) = (std::time::Instant::now(), std::time::SystemTime::now());

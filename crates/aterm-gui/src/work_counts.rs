@@ -546,15 +546,15 @@ pub(crate) fn take_panel_looks() -> usize {
 
 thread_local! {
     static FOOTER_WAKES_ARMED: Cell<usize> = const { Cell::new(0) };
-    static PILL_RELABEL_READS: Cell<usize> = const { Cell::new(0) };
+    static MODE_ROW_READS: Cell<usize> = const { Cell::new(0) };
 }
 
-pub(crate) fn pill_relabel_read() {
-    bump(&PILL_RELABEL_READS);
+pub(crate) fn mode_row_read() {
+    bump(&MODE_ROW_READS);
 }
 #[cfg(unix)]
-pub(crate) fn take_pill_relabel_reads() -> usize {
-    take(&PILL_RELABEL_READS)
+pub(crate) fn take_mode_row_reads() -> usize {
+    take(&MODE_ROW_READS)
 }
 
 pub(crate) fn footer_wake_armed() {

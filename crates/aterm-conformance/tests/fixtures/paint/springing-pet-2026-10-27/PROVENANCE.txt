@@ -1,0 +1,29 @@
+springing-pet-2026-10-27 — the first five frames of one kept paint take, verbatim.
+
+Binary:   the 0.145.0 release cut's bundle (build 1793095432, commit 0b8ca85a96ae)
+Take:     paint::shipped_default_first_still_and_typing_carry_the_resident_pet (benches/paint.rs),
+          ATERM_PAINT_KEEP=1, scratch /tmp/atpaint-70554_18422a6ea7cb807b_1, 2026-10-27,
+          584x350, cell 7x14, 36 image-burst frames.
+Probe:    PAINT ... pet_claimed=36 pet_missing=2 pet_final_run=32 ... verdict=Pass
+          (every release verify of 0.140-0.144 read pet_missing=0 on this row).
+Frames:   shot_0000 frame 0, pet_pose=pet_sleep_1 (the sleeper at the caret's feet)
+          shot_0001 frame 1, pet_pose=pet_leap_rise (the first key springs it ahead of the keys)
+          shot_0002 frame 2, pet_pose=pet_hop, read MISSING by the scanner before 2026-10-27
+          shot_0003 frame 3, pet_pose=pet_leap_descend, read MISSING by the scanner before 2026-10-27
+          shot_0004 frame 4, pet_pose=pet_land
+Rows:     trail-status.rows holds the five paired `trail status` rows in the same order.
+Measured: inside each claimed body the one component (tall_component_records, min_height=1) is
+          leap_rise 36x22, hop 28x17, leap_descend 28x16, land 33x19 px: the hop and the descent
+          stand under COMP_MIN_H (18), over resting_pet_min_width(7) = 15.
+Cause:    the first keys' spring (kitty_pet first_keys_spring), added by ff41e62ca7 (looks8 round 3,
+          K1) and new in 0.145: its parent's bundle wakes this sleeper to stretch and walk instead.
+
+sha256:
+  1b1ff957b8bcf1db3c42e8b5d0b93b63612c2a67e25f28b92c0ff9a64a9aa891  shot_0000.png
+  7c2374bdd1cb9ebc403ae1a902c5a49e6ee3ab76a5d5c7d4637409e0f291f521  shot_0001.png
+  83aabefb483a168e3323c63d3046a634c6547993658db0a9583b2a5f8d2583af  shot_0002.png
+  1bf7e7b35078355e7c45a9893cdd0c4a162c16a5a82247f8aea22492a0419ac3  shot_0003.png
+  d7c0dc083147fbbe793b16d9024c07fee3df4e5befbba68fea033ae27c39fe28  shot_0004.png
+
+Pinned by the spring tests in crates/aterm-conformance/src/measure/scan_tests.rs; the rule is
+RESTING_POSE_STEMS in scan.rs. Do not re-encode or crop: the pin is about the kept take's geometry.

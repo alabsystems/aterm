@@ -22,6 +22,11 @@ const SECRET: &str = "QZP6SECRET1";
 /// (`aterm-gui`'s `desk::HEADLESS_RESTORE_SEAM`).
 const DESK_SEAM: &str = "ATERM_DEBUG_HEADLESS_RESTORE";
 
+/// The development seam that sets what a clean quit spends on the journal's last lines
+/// (`aterm-gui`'s `session_log_journal::QUIT_BUDGET_SEAM`): lifted to [`HANG`], so a loaded
+/// machine's clock never decides whether A's clean quit lands in its journal.
+const QUIT_BUDGET_SEAM: &str = "ATERM_DEBUG_JOURNAL_QUIT_BUDGET_MS";
+
 /// One scratch world the instances share; removed on drop, after them.
 struct World(aterm_tempfile::TempDir);
 
@@ -99,6 +104,7 @@ fn boot(root: &Path, tag: &str, lab: bool) -> Proc {
         .arg("--control-sock")
         .arg(&sock)
         .env("ATERM_STATE_HOME", state_home(root))
+        .env(QUIT_BUDGET_SEAM, HANG.as_millis().to_string())
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);

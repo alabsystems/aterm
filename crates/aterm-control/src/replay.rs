@@ -3,8 +3,11 @@
 
 //! Headless recording replay engine ([`ReplayEngine::fork`]).
 
+use std::sync::Arc;
+
+use aterm_core::config::TerminalConfig;
 use aterm_core::grid::{ResizeLaw, ResizePolicy};
-use aterm_core::terminal::{ClockReading, Terminal, TerminalCheckpoint};
+use aterm_core::terminal::{ClockReading, ReplayCarry, Terminal, TerminalCheckpoint};
 
 /// A headless engine replaying one session's recorded output and resizes.
 pub struct ReplayEngine {
@@ -12,6 +15,7 @@ pub struct ReplayEngine {
     policy: ResizePolicy,
     law: ResizeLaw,
     host_resyncs: bool,
+    config: Option<Arc<TerminalConfig>>,
 }
 
 impl ReplayEngine {
@@ -55,14 +59,34 @@ impl ReplayEngine {
 
     /// Sets `law` as the resize layout law for subsequent resizes.
     #[must_use]
-    pub fn with_resize_law(self, law: ResizeLaw) -> Self {
-        Self::configured(self.term, self.policy, law, self.host_resyncs)
+    pub fn with_resize_law(mut self, law: ResizeLaw) -> Self {
+        self.term.set_resize_law(law);
+        self.law = law;
+        self
+    }
+
+    /// Replays under the session's `config` (its colour baseline, default cursor, mode seeds, budgets and policies) rather than the defaults, keeping the modes the keyframe restored ([`Terminal::apply_config_keeping_modes`]), and so does every [`Self::fork`]; a report the rebase queued is dropped, as the live engine's was.
+    #[must_use]
+    pub fn with_config(mut self, config: Arc<TerminalConfig>) -> Self {
+        self.term.apply_config_keeping_modes(&config);
+        let _ = self.term.take_response();
+        self.config = Some(config);
+        self
     }
 
     /// Configures whether the host forwards `?1049l` to exit an orphaned alternate screen.
     #[must_use]
-    pub fn with_host_resyncs_alt_screen(self, on: bool) -> Self {
-        Self::configured(self.term, self.policy, self.law, on)
+    pub fn with_host_resyncs_alt_screen(mut self, on: bool) -> Self {
+        self.term.set_host_resyncs_alt_screen(on);
+        self.host_resyncs = on;
+        self
+    }
+
+    /// Installs the in-process transient state captured with the keyframe ([`Terminal::capture_replay_carry`]), so subsequent slices and [`Self::fork`] inherit the live engine's open mode-2026 frame start, rate-limit buckets, alternate-screen notes, Kitty ids and serials, shell-integration authorization and pending restore lineage.
+    #[must_use]
+    pub fn with_replay_carry(mut self, carry: &ReplayCarry) -> Self {
+        self.term.apply_replay_carry(carry);
+        self
     }
 
     fn configured(
@@ -80,6 +104,7 @@ impl ReplayEngine {
             policy,
             law,
             host_resyncs,
+            config: None,
         }
     }
 
@@ -98,12 +123,31 @@ impl ReplayEngine {
         self.term.resize_with_policy(rows, cols, self.policy);
     }
 
+    /// Apply a recorded host cell-pixel update; an in-band size report (DEC 2048) it queues is dropped, as the live host drained it on the update.
+    pub fn set_cell_pixel_size(&mut self, width: u16, height: u16) {
+        self.term.set_cell_pixel_size(width, height);
+        let _ = self.term.take_reports();
+    }
+
+    /// Apply a recorded host-side mutation ([`aterm_core::terminal::HostOp`]).
+    pub fn apply_host_op(&mut self, op: aterm_core::terminal::HostOp, clock: Option<ClockReading>) {
+        match clock {
+            Some(c) => self.term.apply_host_op_at(op, c),
+            None => self.term.apply_host_op(op),
+        }
+    }
+
     /// A copy of this engine at this point of the recording.
     #[must_use]
     pub fn fork(&self) -> Option<Self> {
-        self.term
-            .replay_fork()
-            .map(|term| Self::configured(term, self.policy, self.law, self.host_resyncs))
+        let mut fork = Self::configured(
+            self.term.replay_fork()?,
+            self.policy,
+            self.law,
+            self.host_resyncs,
+        );
+        fork.config.clone_from(&self.config);
+        Some(fork)
     }
 
     /// Drop the active grid's resize undo.
@@ -149,6 +193,49 @@ mod tests {
         !archiving(term)
             && modes.win32_input_enabled == console_host
             && modes.kitty_keyboard_enabled != console_host
+    }
+
+    /// A replay under the session's config, and a fork of it, answers a colour query and resets its modes as the live engine does; one under the defaults does neither.
+    #[test]
+    fn a_replay_with_the_sessions_config_answers_as_the_live_engine() {
+        let config = Arc::new(TerminalConfig {
+            default_background: aterm_core::terminal::Rgb { r: 1, g: 2, b: 3 },
+            cursor_style: aterm_core::terminal::CursorStyle::SteadyBar,
+            ..TerminalConfig::default()
+        });
+        let live = || {
+            let mut t = Terminal::new(4, 20);
+            let _ = t.apply_config(&config);
+            t.process(b"\x1b[2 qtext");
+            t
+        };
+        let cp = live().checkpoint();
+        for (configured, forked) in [(false, false), (true, false), (false, true), (true, true)] {
+            let engine = ReplayEngine::from_checkpoint(&cp, ResizePolicy::Native);
+            let engine = if configured {
+                engine.with_config(config.clone())
+            } else {
+                engine
+            };
+            let mut replay = if forked {
+                engine.fork().expect("a ground engine forks")
+            } else {
+                engine
+            };
+            let mut probe = live();
+            let ask = b"\x1b]11;?\x07\x1b[!p";
+            replay.process(ask);
+            probe.process(ask);
+            let mut term = replay.into_terminal();
+            assert_eq!(
+                (
+                    term.take_response() == probe.take_response(),
+                    term.cursor_style() == probe.cursor_style()
+                ),
+                (configured, configured),
+                "configured: {configured}, forked: {forked}"
+            );
+        }
     }
 
     #[test]

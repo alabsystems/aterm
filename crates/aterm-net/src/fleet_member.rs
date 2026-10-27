@@ -41,6 +41,10 @@ pub const PEERS_FILE: &str = "fleet-peers";
 /// (`peers add`, `rm`, a join) writes one.
 pub const ISSUER_BOOK_FILE: &str = "fleet-issuer-book";
 
+/// A leave's record that `aterm fleet sync` joins nothing here, in the state directory: written by
+/// a leave that left a fleet, removed by a join, kept by an init.
+pub const OFF_FILE: &str = "fleet-off";
+
 const PEERS_LOCK: &str = ".fleet-peers.lock";
 
 /// The most peers one book holds: a fleet is one LAN's machines, and a secret holder cannot
@@ -70,12 +74,36 @@ thread_local! {
     /// A test's wait for the book's lock on its thread in place of [`LOCK_WAIT`], and who is told each time the lock is found held.
     static TEST_WAIT: std::cell::RefCell<Option<(Duration, Option<std::sync::mpsc::Sender<()>>)>> =
         const { std::cell::RefCell::new(None) };
+    /// The error a test's [`Leaving::write_off`] on its thread meets in place of any write.
+    static OFF_REFUSED: std::cell::Cell<Option<io::ErrorKind>> = const { std::cell::Cell::new(None) };
+}
+
+/// `run` with this thread's [`Leaving::write_off`] failing as `kind` before it writes anything, as a full volume fails it (a test seam).
+#[cfg(any(test, debug_assertions))]
+pub fn off_refused<R>(kind: io::ErrorKind, run: impl FnOnce() -> R) -> R {
+    let before = OFF_REFUSED.replace(Some(kind));
+    let ran = run();
+    OFF_REFUSED.set(before);
+    ran
 }
 
 /// `run` with this thread's waits for the book's lock lasting `wait` in place of [`LOCK_WAIT`] (a test seam).
 #[cfg(any(test, debug_assertions))]
 pub fn lock_waiting<R>(wait: Duration, run: impl FnOnce() -> R) -> R {
     let before = TEST_WAIT.with_borrow_mut(|seam| seam.replace((wait, None)));
+    let ran = run();
+    TEST_WAIT.with_borrow_mut(|seam| *seam = before);
+    ran
+}
+
+/// [`lock_waiting`], with `told` sent to each time the lock is found held (a test seam).
+#[cfg(any(test, debug_assertions))]
+pub fn lock_waiting_told<R>(
+    wait: Duration,
+    told: std::sync::mpsc::Sender<()>,
+    run: impl FnOnce() -> R,
+) -> R {
+    let before = TEST_WAIT.with_borrow_mut(|seam| seam.replace((wait, Some(told))));
     let ran = run();
     TEST_WAIT.with_borrow_mut(|seam| *seam = before);
     ran
@@ -98,9 +126,53 @@ fn found_held() {
     });
 }
 
-use aterm_uds::private_file::{
-    PrivateDir, check_private_dir, judge_private_dir, remove_private, write_private,
-};
+/// The places tests hold silent ([`HeldSilent`]), read by dials on every thread.
+#[cfg(any(test, debug_assertions))]
+static HELD_SILENT: std::sync::Mutex<Vec<SocketAddr>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether a test holds `to` silent ([`HeldSilent`]).
+#[cfg(any(test, debug_assertions))]
+fn held_silent(to: SocketAddr) -> bool {
+    HELD_SILENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&to)
+}
+
+/// A place a test holds silent while this lives: a dial that connects there ends at once at
+/// [`Stage::Handshake`]'s deadline, as one past a listener that takes the connection and sends no
+/// handshake ends once its deadline comes, so a test bounds that dial by its hang detector and
+/// waits on no clock (a test seam).
+#[cfg(any(test, debug_assertions))]
+#[derive(Debug)]
+pub struct HeldSilent(SocketAddr);
+
+#[cfg(any(test, debug_assertions))]
+impl HeldSilent {
+    /// Hold `at` silent.
+    #[must_use]
+    pub fn at(at: SocketAddr) -> Self {
+        HELD_SILENT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(at);
+        Self(at)
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for HeldSilent {
+    fn drop(&mut self) {
+        let mut held = HELD_SILENT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = held.iter().position(|at| *at == self.0) {
+            held.swap_remove(at);
+        }
+    }
+}
+
+use aterm_uds::private_file::{PrivateDir, judge_private_dir, remove_private, write_private};
 pub use aterm_uds::private_file::{PrivateFileError, ensure_private_dir, read_private};
 
 /// A new fleet secret, [`SECRET_LEN`] bytes from the OS CSPRNG.
@@ -277,9 +349,11 @@ pub enum CodeError {
     Prefix,
     /// No `@<host>:<port>` at its end.
     NoIssuer,
-    /// The character at this 1-based place (code characters only) is no code character.
+    /// The character at this 1-based place after `atf1-` (dashes and white space aside) is no
+    /// code character.
     Character(usize),
-    /// This many code characters, not [`CODE_SYMBOLS`].
+    /// This many characters between `atf1-` and `@` (dashes and white space aside), not
+    /// [`CODE_SYMBOLS`].
     Length(usize),
     /// The check characters do not match: a typo.
     Typo,
@@ -298,13 +372,14 @@ impl fmt::Display for CodeError {
             }
             Self::Character(at) => write!(
                 f,
-                "the join code's character {at} is none of 0-9 and a-z without i, l, o, u: \
-                 it was not copied whole"
+                "the join code's character {at} after its `atf1-`, dashes aside, is none of 0-9 \
+                 and a-z without i, l, o, u: it was not copied whole"
             ),
             Self::Length(n) => write!(
                 f,
-                "a join code has {CODE_SYMBOLS} characters before its `@`, not {n}: it was \
-                 not copied whole"
+                "a join code has {CODE_SYMBOLS} letters and digits between its `atf1-` and its \
+                 `@`, in {} groups of {GROUP}, not {n}: it was not copied whole",
+                CODE_SYMBOLS / GROUP
             ),
             Self::Typo => f.write_str(
                 "the join code's check characters do not match: a character is mistyped or \
@@ -820,6 +895,14 @@ impl Peer {
     }
 }
 
+/// Whether `what` is shaped as a node id or the head of one ([`names_node`]): 8 to 32 hex digits,
+/// which no verb hands the system resolver as a host name.
+#[must_use]
+pub fn is_node_word(what: &str) -> bool {
+    let what = what.trim();
+    (8..=32).contains(&what.len()) && what.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Whether `what` names the node `node`: its whole id, or 8 characters or more of its head, in any
 /// case.
 #[must_use]
@@ -1088,7 +1171,7 @@ impl fmt::Display for Unwritten {
 
 impl std::error::Error for Unwritten {}
 
-/// THE WRITE RULE (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): every write of fleet state — [`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`] and aterm.toml's `[fleet]` — is made in `write`, under the book's lock in `dir` and only while `dir` holds the fleet `began` names, from what `write` reads under it; a leave's is [`leave_held`]'s, and a level's [`level_held`]'s. The files are written by the [`HeldBook`] `write` is handed, and aterm.toml's `[fleet]` beside it, by convention. The lock is taken once per call, never inside another, for at most two seconds; aterm.toml's write lock, where `write` takes it, comes after it.
+/// THE WRITE RULE (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): every write of fleet state — [`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`], [`OFF_FILE`], `fleet sync`'s two records and aterm.toml's `[fleet]` — is made in `write`, under the book's lock in `dir` and only while `dir` holds the fleet `began` names, from what `write` reads under it; a leave's is [`leave_held`]'s, and a level's [`level_held`]'s. The files are written by the [`HeldBook`] `write` is handed, and sync's records and aterm.toml's `[fleet]` beside it, by convention. The lock is taken once per call, never inside another, for at most two seconds; aterm.toml's write lock, where `write` takes it, comes after it.
 /// # Errors
 /// [`Unwritten::Lock`]: another writer holds the lock past its wait, the lock cannot be
 /// taken, or a leave's directory open to others cannot be narrowed; [`Unwritten::Moved`]:
@@ -1113,7 +1196,7 @@ pub fn write_held<R>(
     Ok(write(&book))
 }
 
-/// A leave's write, a first write of its own ([`write_held`]): the directory made private first, as an init or a join makes it (made where there is none, narrowed where it is open to others: [`Leaving::narrowed`]), then the book's lock taken there (one that is there but could not be made private decided by its lock, as any directory is), and gone on without the lock only where no writer could make the directory or take the lock either ([`stops_every_edit`]), so no odd state directory keeps a machine in a fleet. `remove` is handed a [`Leaving`], which removes the fleet's files and writes none.
+/// A leave's write, a first write of its own ([`write_held`]): the directory made private first, as an init or a join makes it (made where there is none, narrowed where it is open to others: [`Leaving::narrowed`]), then the book's lock taken there (one that is there but could not be made private decided by its lock, as any directory is), and gone on without the lock only where no writer could make the directory or take the lock either ([`stops_every_edit`]), so no odd state directory keeps a machine in a fleet. `remove` is handed a [`Leaving`], which removes the fleet's files and writes only [`OFF_FILE`].
 /// # Errors
 /// [`Unwritten::Lock`]: the directory cannot be made or narrowed, or the lock taken, for a reason that does not stop every writer ([`stops_every_edit`]): another writer holding the lock past its wait, the directory removed under it, no descriptor or space free among them.
 pub fn leave_held<R>(dir: &Path, remove: impl FnOnce(&Leaving<'_>) -> R) -> Result<R, Unwritten> {
@@ -1179,7 +1262,7 @@ pub struct HeldBook<'a> {
     _lock: BookLock,
 }
 
-/// A leave's hold on a state directory ([`leave_held`]): the book's lock, or none where no writer could take it either. It removes the fleet's files and writes none.
+/// A leave's hold on a state directory ([`leave_held`]): the book's lock, or none where no writer could take it either. It removes the fleet's files and writes only [`OFF_FILE`].
 pub struct Leaving<'a> {
     dir: &'a Path,
     narrowed: Option<u32>,
@@ -1207,11 +1290,29 @@ impl Leaving<'_> {
         self.narrowed
     }
 
+    /// Whether it holds the book's lock: without it, no writer can make the directory or take the
+    /// lock either ([`leave_held`]), so none writes a fleet there.
+    #[must_use]
+    pub const fn locked(&self) -> bool {
+        self._lock.is_some()
+    }
+
     /// Remove the state directory's file `name`: whether it was there.
     /// # Errors
     /// `name` is no one file name, or the file is there and cannot be removed.
     pub fn remove(&self, name: &str) -> io::Result<bool> {
         remove_private(self.dir, name)
+    }
+
+    /// Write [`OFF_FILE`], empty, in whatever directory the leave holds.
+    /// # Errors
+    /// It cannot be written.
+    pub fn write_off(&self) -> io::Result<()> {
+        #[cfg(any(test, debug_assertions))]
+        if let Some(kind) = OFF_REFUSED.get() {
+            return Err(io::Error::from(kind));
+        }
+        aterm_uds::atomic_file::write(&self.dir.join(OFF_FILE), b"", 0o600)
     }
 }
 
@@ -1411,9 +1512,9 @@ pub fn record(book: &mut Vec<Peer>, peer: Peer) -> Result<Recorded, String> {
 }
 
 fn bound_as(known: &Peer, peer: &Peer) -> Result<(), String> {
-    let node = peer.node.as_deref().unwrap_or("-");
-    let node = node.get(..8).unwrap_or(node);
-    let rm = format!("`aterm fleet peers rm {node}` {REBIND}");
+    let whole = peer.node.as_deref().unwrap_or("-");
+    let node = whole.get(..8).unwrap_or(whole);
+    let rm = format!("`aterm fleet peers rm {whole}` {REBIND}");
     match (known.key, peer.key) {
         (Some(bound), Some(proved)) if bound == proved => Ok(()),
         (Some(_), Some(_)) => Err(format!(
@@ -1447,7 +1548,6 @@ pub const BEFORE_KEYS: &str = "before keys came";
 /// Where in `peers` the one peer `what` names is ([`Peer::answers_to`]): `None` when no peer
 /// answers to it, an error when several do.
 pub fn find(peers: &[Peer], what: &str) -> Result<Option<usize>, String> {
-    let shown = aterm_codec::tty::one_line(what, 80);
     let matches: Vec<usize> = peers
         .iter()
         .enumerate()
@@ -1457,44 +1557,98 @@ pub fn find(peers: &[Peer], what: &str) -> Result<Option<usize>, String> {
     match matches.as_slice() {
         [] => Ok(None),
         [at] => Ok(Some(*at)),
-        many => Err(format!(
-            "`{shown}` names {} peers ({}): name one by its node id{}",
-            many.len(),
-            many.iter()
+        many => Err(several(
+            what,
+            &many
+                .iter()
                 .filter_map(|at| peers.get(*at))
-                .map(|peer| format!(
-                    "{} at {}",
-                    peer.node
-                        .as_deref()
-                        .map_or("-", |n| n.get(..8).unwrap_or(n)),
-                    peer.target()
-                ))
-                .collect::<Vec<_>>()
-                .join(", "),
-            // A place two of them share names neither.
-            if many.iter().enumerate().all(|(i, a)| {
-                many[i + 1..]
-                    .iter()
-                    .all(|b| peers[*a].target() != peers[*b].target())
-            }) {
-                " or its address and port"
-            } else {
-                ""
-            }
+                .collect::<Vec<_>>(),
         )),
     }
 }
 
-/// Take the one peer `what` names out of `book` ([`find`]).
-pub fn remove(book: &mut Vec<Peer>, copies: &[Peer], what: &str) -> Result<Peer, String> {
+/// The one peer `what` names in `book` and `others` (its copy of the issuer's book, and the
+/// `[[fleet.peers]]` entries) read together: each node once (the book's entry first), then each
+/// place an entry with no node holds once, where no node the word names stands. Every verb that
+/// takes a peer's word reads it here.
+/// # Errors
+/// `what` names more than one peer.
+pub fn named<'a>(
+    book: &'a [Peer],
+    others: &'a [Peer],
+    what: &str,
+) -> Result<Option<&'a Peer>, String> {
+    let (nodes, hands): (Vec<&Peer>, Vec<&Peer>) = book
+        .iter()
+        .chain(others)
+        .filter(|peer| peer.answers_to(what))
+        .partition(|peer| peer.node.is_some());
+    let mut peers: Vec<&Peer> = Vec::new();
+    for node in &nodes {
+        if !peers.iter().any(|seen| seen.node == node.node) {
+            peers.push(node);
+        }
+    }
+    for hand in hands {
+        if !nodes.iter().chain(&peers).any(|seen| seen.same_place(hand)) {
+            peers.push(hand);
+        }
+    }
+    match peers.as_slice() {
+        [] => Ok(None),
+        [peer] => Ok(Some(peer)),
+        many => Err(several(what, many)),
+    }
+}
+
+/// The refusal of a word `many` peers answer to, naming each by its whole node id, which tells
+/// them apart where a prefix may not, and how to name one.
+fn several(what: &str, many: &[&Peer]) -> String {
+    format!(
+        "`{}` names {} peers ({}): name one by its node id{}",
+        aterm_codec::tty::one_line(what, 80),
+        many.len(),
+        many.iter()
+            .map(|peer| format!(
+                "{} at {}",
+                peer.node.as_deref().unwrap_or("-"),
+                peer.target()
+            ))
+            .collect::<Vec<_>>()
+            .join(", "),
+        // A place two of them share names neither.
+        if many
+            .iter()
+            .enumerate()
+            .all(|(i, a)| { many[i + 1..].iter().all(|b| a.target() != b.target()) })
+        {
+            " or its address and port"
+        } else {
+            ""
+        }
+    )
+}
+
+/// Take the entry of `book` of the one peer `what` names ([`named`] with `others`) out of it:
+/// its node's, or the entry with no node at its place.
+/// # Errors
+/// No peer or several are named, two entries of `book` answer to it, or the peer is only in
+/// `others`.
+pub fn remove(book: &mut Vec<Peer>, others: &[Peer], what: &str) -> Result<Peer, String> {
     let shown = aterm_codec::tty::one_line(what, 80);
+    let Some(peer) = named(book, others, what)?.cloned() else {
+        return Err(format!("no peer is `{shown}`"));
+    };
+    // `named` read every entry of `book` that answers: each is the named peer's.
     match find(book, what)? {
         Some(at) => Ok(book.remove(at)),
-        None if !matches!(find(copies, what), Ok(None)) => Err(format!(
+        None if peer.via == Via::IssuerBook => Err(format!(
             "`{shown}` is in the fleet issuer's book, which this machine copies at each read: \
              `aterm fleet peers rm` on the issuer takes it out, and this copy follows"
         )),
-        None => Err(format!("no peer is `{shown}`")),
+        None => Err(format!(
+            "`{shown}` is no entry of this machine's book, which `peers rm` edits"
+        )),
     }
 }
 
@@ -1644,6 +1798,8 @@ pub enum Undriven {
         node: String,
         /// Why the issuer's book was not read.
         why: String,
+        /// The issuer answered under another secret ([`rejoins`]).
+        rejoins: bool,
     },
     /// A grant names its node, which neither this machine's book nor its copy of its issuer's
     /// book binds, and the issuer's book could not be read again to find whether it joined since.
@@ -1652,6 +1808,10 @@ pub enum Undriven {
         node: String,
         /// Why the issuer's book was not read.
         why: String,
+        /// The issuer answered under another secret ([`rejoins`]).
+        rejoins: bool,
+        /// This machine holds a copy of its issuer's book.
+        copy: bool,
     },
     /// A grant names its node, which the issuer's book, read again just now, binds no more.
     Unjoined(String),
@@ -1675,24 +1835,34 @@ impl fmt::Display for Undriven {
                  there",
                 short(node)
             ),
-            Self::Unchecked { node, why } => write!(
+            Self::Unchecked { node, why, rejoins } => write!(
                 f,
                 "node {} is bound on the dialled Mac only by its copy of its issuer's book, \
                  which is over {} s old, and it could not read that book again to check it ({}): \
-                 it drives again once the dialled Mac reaches its issuer (aterm fleet peers, \
-                 there, says why it does not)",
+                 {}",
                 short(node),
                 COPY_DRIVES_FOR.as_secs(),
-                aterm_codec::tty::one_line(why, 160)
+                aterm_codec::tty::one_line(why, 160),
+                drives_once(*rejoins, " again")
             ),
-            Self::Unread { node, why } => write!(
+            Self::Unread {
+                node,
+                why,
+                rejoins,
+                copy,
+            } => write!(
                 f,
-                "node {} is bound to no key by the dialled Mac's copy of its issuer's book, and \
-                 it could not read that book again to find whether it joined since ({}): it \
-                 drives once the dialled Mac reaches its issuer (aterm fleet peers, there, says \
-                 why it does not)",
+                "node {} is bound to no key {}, and it could not read that book{} to find whether \
+                 it joined since ({}): {}",
                 short(node),
-                aterm_codec::tty::one_line(why, 160)
+                if *copy {
+                    "by the dialled Mac's copy of its issuer's book"
+                } else {
+                    "on the dialled Mac, which holds no copy of its issuer's book"
+                },
+                if *copy { " again" } else { "" },
+                aterm_codec::tty::one_line(why, 160),
+                drives_once(*rejoins, "")
             ),
             Self::Unjoined(node) => write!(
                 f,
@@ -1706,24 +1876,53 @@ impl fmt::Display for Undriven {
 
 impl std::error::Error for Undriven {}
 
+/// Whether a read of the issuer's book met another secret there (the fleet rotated, or the issuer
+/// left it): the dialled Mac reaches its issuer again only by a join, which keeps no drive grant.
+fn rejoins(why: &BookUnread) -> bool {
+    matches!(
+        why,
+        BookUnread::Unreached(Unreached::Handshake(_, FleetError::ListenerWrongSecret))
+    )
+}
+
+/// When a node [`Undriven::Unchecked`] or [`Undriven::Unread`] refused drives (`again`), as the
+/// dialled Mac's issuer stands ([`rejoins`]).
+fn drives_once(rejoins: bool, again: &str) -> String {
+    if rejoins {
+        format!(
+            "it drives{again} only once the dialled Mac joins again, with its issuer's current \
+             code, and its person lets it drive again (aterm fleet allow drive --from, there), \
+             since a join removes every drive grant"
+        )
+    } else {
+        format!(
+            "it drives{again} once the dialled Mac reaches its issuer (aterm fleet peers, there, \
+             says why it does not)"
+        )
+    }
+}
+
 impl Keyring {
     /// The driver behind `proof`: the node it proved under the key this keyring binds it to
-    /// ([`Self::proven`]), when `grants` names that node with that same key. A node no grant
-    /// names is refused as that before its key is judged, and one that proved another key than
-    /// its grant holds as [`Undriven::Rekeyed`] wherever this keyring binds it no other key.
+    /// ([`Self::proven`]), when `grants` names that node with that same key or every member.
+    /// A node no grant names is refused as that before its key is judged, and one that proved
+    /// another key than its grant holds as [`Undriven::Rekeyed`] wherever this keyring binds it
+    /// no other key. An all-member grant uses the same issuer-book admission and freshness
+    /// checks as a named grant; it never admits a peer merely for knowing the fleet secret.
     pub fn driver(
         &self,
         proof: Option<&NodeProof>,
         grants: &[DriveGrant],
     ) -> Result<String, Undriven> {
         let proof = proof.ok_or(Undriven::Unproven(Unproven::NoProof))?;
-        let Some(grant) = grants.iter().find(|grant| grant.node == proof.node) else {
+        if DriveGrant::admitting(grants, &proof.node, proof.key).is_some() {
+            return self.proven(Some(proof)).map_err(Undriven::Unproven);
+        }
+        if !grants.iter().any(|grant| grant.node == proof.node) {
             return Err(Undriven::Unlisted(proof.node.clone()));
-        };
+        }
         match self.proven(Some(proof)) {
-            Ok(node) | Err(Unproven::Unbound(node)) if proof.key != grant.key => {
-                Err(Undriven::Rekeyed(node))
-            }
+            Ok(node) | Err(Unproven::Unbound(node)) => Err(Undriven::Rekeyed(node)),
             proven => proven.map_err(Undriven::Unproven),
         }
     }
@@ -1785,10 +1984,20 @@ fn driver_as_of(
     let (peers, copies) = book_and_copies(state_dir);
     let keys = Keyring::of(peers.iter().chain(&copies));
     let issuer = issuer_of(&peers);
-    let (node, unread): (String, fn(String, String) -> Undriven) = match keys.driver(proof, grants)
-    {
+    // The refusal, from the node, why the issuer's book was not read, whether it [`rejoins`], and
+    // whether this machine holds a copy of that book.
+    type Refused = fn(String, String, bool, bool) -> Undriven;
+    let copy = issuer
+        .and_then(|issuer| issuer.node.as_deref())
+        .is_some_and(|node| holds_issuer_book(state_dir, node));
+    let (node, unread): (String, Refused) = match keys.driver(proof, grants) {
         Err(Undriven::Unproven(Unproven::Unbound(node))) if issuer.is_some() => {
-            (node, |node, why| Undriven::Unread { node, why })
+            (node, |node, why, rejoins, copy| Undriven::Unread {
+                node,
+                why,
+                rejoins,
+                copy,
+            })
         }
         driven => {
             let node = driven?;
@@ -1798,15 +2007,21 @@ fn driver_as_of(
             if fresh || !keys.copied_alone(&node) {
                 return Ok(node);
             }
-            (node, |node, why| Undriven::Unchecked { node, why })
+            (node, |node, why, rejoins, _| Undriven::Unchecked {
+                node,
+                why,
+                rejoins,
+            })
         }
     };
-    let unchecked = |why: String| unread(node.clone(), why);
-    let issuer = issuer.ok_or_else(|| unchecked("this Mac names no issuer".into()))?;
-    let book = fetch(&target_of(issuer)).map_err(|why| unchecked(why.to_string()))?;
+    let unchecked = |why: String, rejoin: bool| unread(node.clone(), why, rejoin, copy);
+    let issuer = issuer.ok_or_else(|| unchecked("this Mac names no issuer".into(), false))?;
+    let book =
+        fetch(&target_of(issuer)).map_err(|why| unchecked(why.to_string(), rejoins(&why)))?;
     if !book.proven {
         return Err(unchecked(
             "this Mac binds no key to its issuer, so its book binds none".into(),
+            false,
         ));
     }
     let own = read_node_id(state_dir).ok().flatten();
@@ -1883,59 +2098,27 @@ fn lock_refused(dir: &Path, e: &io::Error) -> String {
     }
 }
 
-struct BookLock(std::fs::File);
+/// The membership write lock, `.fleet-peers.lock` beside the book
+/// ([`aterm_uds::private_file::PrivateLock`]): its refusals name `dir`, and each time it is
+/// found held the test seam is told ([`found_held`]).
+struct BookLock {
+    /// Held for the guard's life: `PrivateLock`'s own `Drop` releases it.
+    _held: aterm_uds::private_file::PrivateLock,
+}
 
 impl BookLock {
     fn take(dir: &Path, within: Duration) -> io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        check_private_dir(dir)?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(dir.join(PEERS_LOCK))?;
-        if !file.metadata()?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{} is no regular file", dir.join(PEERS_LOCK).display()),
-            ));
-        }
-        let deadline = Instant::now() + within;
-        let mut backoff = Duration::from_millis(1);
-        loop {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the guard's own take: its Drop releases by LOCK_UN"
-            )]
-            let taken = file.try_lock();
-            match taken {
-                Ok(()) => return Ok(Self(file)),
-                Err(std::fs::TryLockError::Error(e)) => return Err(e),
-                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                    found_held();
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(Duration::from_millis(50));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        format!(
-                            "another aterm is writing the book in {}; run this again",
-                            dir.display()
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-}
-
-impl Drop for BookLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
+        aterm_uds::private_file::PrivateLock::take_with(
+            dir,
+            PEERS_LOCK,
+            within,
+            &format!(
+                "another aterm is writing the book in {}; run this again",
+                dir.display()
+            ),
+            found_held,
+        )
+        .map(|held| Self { _held: held })
     }
 }
 
@@ -3479,6 +3662,12 @@ fn reach(
     match TcpStream::connect_timeout(&to, left.min(CONNECT_WITHIN)) {
         Ok(tcp) => {
             let left = deadline.saturating_duration_since(Instant::now());
+            #[cfg(any(test, debug_assertions))]
+            let left = if held_silent(to) {
+                Duration::ZERO
+            } else {
+                left
+            };
             match client_handshake_by(tcp, secret, me, op, left) {
                 Ok(Dialed {
                     transport,
@@ -4385,19 +4574,37 @@ pub struct Driven {
     pub node: String,
 }
 
+impl Driven {
+    /// Whether the drive's deadline hung the connection up ([`HandshakeWatchdog::fired`]): what a
+    /// read or write meets then is that deadline's, never the peer's.
+    fn cut(&self) -> bool {
+        self.watchdog.as_ref().is_some_and(HandshakeWatchdog::fired)
+    }
+}
+
 impl Read for Driven {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(buf)
+        match self.stream.read(buf) {
+            Ok(0) if !buf.is_empty() && self.cut() => Err(io::ErrorKind::TimedOut.into()),
+            Err(_) if self.cut() => Err(io::ErrorKind::TimedOut.into()),
+            read => read,
+        }
     }
 }
 
 impl Write for Driven {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stream.write(buf)
+        match self.stream.write(buf) {
+            Err(_) if self.cut() => Err(io::ErrorKind::TimedOut.into()),
+            wrote => wrote,
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
+        match self.stream.flush() {
+            Err(_) if self.cut() => Err(io::ErrorKind::TimedOut.into()),
+            flushed => flushed,
+        }
     }
 }
 

@@ -11,21 +11,22 @@ mod common;
 #[path = "../tests/rainbow_kitty_v2_frame_cost.rs"]
 mod frame_cost;
 
-use common::{BUDGET_SCALE_VAR, budget_scale, scaled_budget_us};
+use common::{BUDGET_SCALE_VAR, Ground, budget_scale, scaled_budget_us};
 use frame_cost::{
-    Report, Scenario, engine_selected, measure_cell, print_header, print_idle, print_row, scenarios,
+    Report, Scenario, engine_selected, grounds, measure_cell, print_header, print_idle, print_row,
+    scenarios,
 };
 
-fn measure_all(sc: &Scenario) -> (Report, Report) {
+fn measure_all(sc: &Scenario, ground: Ground) -> (Report, Report) {
     let r2 = if engine_selected("v2") {
-        let r = measure_cell("v2", sc);
+        let r = measure_cell("v2", sc, ground);
         print_row("v2 ", sc, &r);
         r
     } else {
         Report::default()
     };
     let rs = if engine_selected("v2s") {
-        let r = measure_cell("v2s", sc);
+        let r = measure_cell("v2s", sc, ground);
         print_row("v2s", sc, &r);
         r
     } else {
@@ -50,37 +51,36 @@ fn main() {
         "p50 ≤ {p50_budget_us} µs / p90 ≤ {p90_budget_us} µs \
          (reference {P50_BUDGET_US}/{P90_BUDGET_US} × {BUDGET_SCALE_VAR} {scale})"
     );
-    print_header(&format!("release build — §18 budget {budget}"));
     let mut reds: Vec<String> = Vec::new();
-    for sc in scenarios() {
-        let (r2, rs) = measure_all(&sc);
-        if engine_selected("v2") && r2.p50() > p50_budget_us {
-            reds.push(format!(
-                "[{}] v2 p50 {} µs > {p50_budget_us} µs",
-                sc.name,
-                r2.p50()
-            ));
-        }
-        if engine_selected("v2") && r2.p90() > p90_budget_us {
-            reds.push(format!(
-                "[{}] v2 p90 {} µs > {p90_budget_us} µs",
-                sc.name,
-                r2.p90()
-            ));
-        }
-        if engine_selected("v2s") && rs.p50() > p50_budget_us {
-            reds.push(format!(
-                "[{}] v2-via-seam p50 {} µs > {p50_budget_us} µs",
-                sc.name,
-                rs.p50()
-            ));
-        }
-        if engine_selected("v2s") && rs.p90() > p90_budget_us {
-            reds.push(format!(
-                "[{}] v2-via-seam p90 {} µs > {p90_budget_us} µs",
-                sc.name,
-                rs.p90()
-            ));
+    for ground in grounds() {
+        print_header(&format!("release build — §18 budget {budget}"), ground);
+        for sc in scenarios() {
+            let (r2, rs) = measure_all(&sc, ground);
+            let at = format!("{} on {}", sc.name, ground.name);
+            if engine_selected("v2") && r2.p50() > p50_budget_us {
+                reds.push(format!(
+                    "[{at}] v2 p50 {} µs > {p50_budget_us} µs",
+                    r2.p50()
+                ));
+            }
+            if engine_selected("v2") && r2.p90() > p90_budget_us {
+                reds.push(format!(
+                    "[{at}] v2 p90 {} µs > {p90_budget_us} µs",
+                    r2.p90()
+                ));
+            }
+            if engine_selected("v2s") && rs.p50() > p50_budget_us {
+                reds.push(format!(
+                    "[{at}] v2-via-seam p50 {} µs > {p50_budget_us} µs",
+                    rs.p50()
+                ));
+            }
+            if engine_selected("v2s") && rs.p90() > p90_budget_us {
+                reds.push(format!(
+                    "[{at}] v2-via-seam p90 {} µs > {p90_budget_us} µs",
+                    rs.p90()
+                ));
+            }
         }
     }
     assert!(

@@ -297,7 +297,7 @@ fn an_off_on_edit_revokes_an_inflight_exit_attempt_result() {
             &hooks,
             Duration::ZERO,
             &|| OnExit::Restarted,
-            true,
+            Some(&|| 120),
             || {
                 release_after_edit(&released, &entered_tx);
                 "adopted".to_string()

@@ -22,17 +22,12 @@ aterm-objc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 aterm-types = { workspace = true }
-# The interface implementation macro emits absolute windows_core references.
-windows-core = "0.62"
-# UI Automation is COM. The existing windows binding supplies its interfaces;
-# the shared model/tree/text consumer remains independent of this platform arm.
-windows = { version = "0.62", features = [
-    "Win32_UI_Accessibility",
-    "Win32_System_Com",
-    "Win32_System_Ole",
-    "Win32_System_Variant",
-    "Win32_Foundation",
-] }
+# UI Automation is COM: aterm-win32 supplies the provider interfaces' vtables
+# (held to `windows` 0.62.2 by its oracle) and the generated UIAutomationCore,
+# OLE Automation and VARIANT imports; src/uia/ writes the objects out by hand
+# (WIN-UIA, docs/AUDIT-third-party-2026-10-15.md). The shared model/tree/text
+# consumer remains independent of this platform arm.
+aterm-win32 = { workspace = true }
 
 [dev-dependencies]
 aterm-uds = { workspace = true }

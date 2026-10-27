@@ -251,7 +251,7 @@ fn an_answer_into_a_closed_pipe_exits_cleanly() {
         &["link", "--help"],
         &["fabric", "--help"],
         &["keeper", "--help"],
-        &["caffeine", "--help"],
+        &["acaffiene", "--help"],
     ] {
         let (reader, writer) = std::io::pipe().expect("a pipe");
         drop(reader);
@@ -296,7 +296,7 @@ fn an_answer_a_full_disk_refused_exits_1_and_says_so() {
         &["link", "--help"],
         &["fabric", "--help"],
         &["keeper", "--help"],
-        &["caffeine", "--help"],
+        &["acaffiene", "--help"],
     ] {
         let full = std::fs::OpenOptions::new()
             .write(true)
@@ -354,4 +354,226 @@ fn a_refused_sandbox_never_says_the_session_started() {
     let out = on_a_terminal(root.path(), &["--sandbox"]);
     assert!(out.contains("the sandbox exists only on macOS"), "{out:?}");
     assert!(!out.contains("session started"), "{out:?}");
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_policy_child(root: &Path) -> std::process::Child {
+    isolated(&mut aterm_cmd(), root)
+        .arg(aterm_sysprobe::cpu_policy::COLLECTOR_VERB)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("fixed native collector")
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_policy_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
+    cpu_policy_exit_with(child, || {})
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_policy_exit_with(
+    child: &mut std::process::Child,
+    mut drain: impl FnMut(),
+) -> std::process::ExitStatus {
+    let start = Instant::now();
+    loop {
+        drain();
+        if let Some(status) = child.try_wait().expect("owned collector wait") {
+            return status;
+        }
+        if start.elapsed() >= DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fixed collector did not exit within existing front-door deadline");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_policy_hello(child: &mut std::process::Child) -> (std::fs::File, Vec<u8>) {
+    let output = std::fs::File::from(OwnedFd::from(child.stdout.take().unwrap()));
+    cpu_policy_hello_from(child, output)
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_policy_hello_from(
+    child: &mut std::process::Child,
+    mut output: std::fs::File,
+) -> (std::fs::File, Vec<u8>) {
+    aterm_pty::set_nonblocking(output.as_raw_fd(), true).unwrap();
+    let start = Instant::now();
+    let mut bytes = Vec::new();
+    while !bytes.contains(&b'\n') && start.elapsed() < DEADLINE {
+        read_available(&mut output, &mut bytes, start);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !bytes.contains(&b'\n') {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("collector did not emit its identity before asking for an ACK");
+    }
+    (output, bytes)
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn cpu_policy_native_dispatch_rejects_operands_before_gui_startup() {
+    let root = private_root();
+    let mut child = isolated(&mut aterm_cmd(), root.path())
+        .args([aterm_sysprobe::cpu_policy::COLLECTOR_VERB, "unexpected"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::fs::File::from(OwnedFd::from(child.stdout.take().unwrap()));
+    let mut stderr = std::fs::File::from(OwnedFd::from(child.stderr.take().unwrap()));
+    aterm_pty::set_nonblocking(stdout.as_raw_fd(), true).unwrap();
+    aterm_pty::set_nonblocking(stderr.as_raw_fd(), true).unwrap();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let started = Instant::now();
+    let status = cpu_policy_exit_with(&mut child, || {
+        read_available(&mut stdout, &mut out, started);
+        read_available(&mut stderr, &mut err, started);
+    });
+    read_available(&mut stdout, &mut out, started);
+    read_available(&mut stderr, &mut err, started);
+    assert_eq!(status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&err).contains("takes no operands"));
+    assert!(out.is_empty());
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn cpu_policy_native_handshake_keeps_actual_credentials_and_bound_capture() {
+    use std::io::Write;
+    let root = private_root();
+    let mut child = cpu_policy_child(root.path());
+    let (mut output, mut bytes) = cpu_policy_hello(&mut child);
+    let hello: aterm_json::Value =
+        aterm_json::from_slice(bytes.split(|b| *b == b'\n').next().unwrap()).unwrap();
+    assert_eq!(hello["phase"].as_str(), Some("collector_started"));
+    assert_eq!(hello["pid"].as_u64(), Some(u64::from(child.id())));
+    assert_eq!(
+        hello["effective_uid"].as_u64(),
+        Some(u64::from(unsafe { libc::geteuid() }))
+    );
+    assert_eq!(
+        hello["parent_pid"].as_u64(),
+        Some(u64::from(std::process::id()))
+    );
+    child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+    let capture_started = Instant::now();
+    let status = cpu_policy_exit_with(&mut child, || {
+        read_available(&mut output, &mut bytes, capture_started)
+    });
+    read_available(&mut output, &mut bytes, capture_started);
+    let lines = bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2, "identity and one bounded capture");
+    let value: aterm_json::Value = aterm_json::from_slice(lines[1]).unwrap();
+    let capture = aterm_sysprobe::cpu_policy::decode_capture(&value).expect("complete codec");
+    assert_eq!(capture.collector.pid, child.id());
+    assert_eq!(
+        capture.collector.start_s.to_string(),
+        hello["start_s"].as_str().unwrap()
+    );
+    assert_eq!(capture.effective_uid, unsafe { libc::geteuid() });
+    if capture.effective_uid != 0 {
+        assert!(!status.success());
+        assert!(!capture.complete());
+        assert_eq!(
+            capture.error.as_deref(),
+            Some("permission_denied:root_collection_required")
+        );
+        assert!(capture.rows.is_empty());
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn cpu_policy_native_parent_pipe_closure_ends_the_collector() {
+    use std::io::Write;
+    let root = private_root();
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    let mut child = isolated(&mut aterm_cmd(), root.path())
+        .arg(aterm_sysprobe::cpu_policy::COLLECTOR_VERB)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(writer.try_clone().unwrap()))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (_output, _hello) =
+        cpu_policy_hello_from(&mut child, std::fs::File::from(OwnedFd::from(reader)));
+    // Block final output even when the unprivileged capture immediately refuses.
+    // Keep the write end open so normal EOF cannot stand in for collector exit.
+    cpu_policy_fill_output(&mut writer);
+    child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+    drop(child.stdin.take());
+    let status = cpu_policy_exit(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(aterm_sysprobe::cpu_policy::PARENT_LOSS_EXIT),
+        "parent-pipe closure is enforced by the live watchdog after ACK"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_policy_fill_output(writer: &mut (impl std::io::Write + AsRawFd)) {
+    aterm_pty::set_nonblocking(writer.as_raw_fd(), true).unwrap();
+    let bytes = [b'x'; 4096];
+    let mut written = 0;
+    loop {
+        match writer.write(&bytes) {
+            Ok(n) => {
+                assert!(n > 0);
+                written += n;
+                assert!(written < 16 * 1024 * 1024);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("fill own pipe: {error}"),
+        }
+    }
+    loop {
+        match writer.write(b"x") {
+            Ok(1) => {
+                written += 1;
+                assert!(written < 16 * 1024 * 1024);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            other => panic!("fill last pipe byte: {other:?}"),
+        }
+    }
+    aterm_pty::set_nonblocking(writer.as_raw_fd(), false).unwrap();
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn cpu_policy_native_watchdog_exits_even_when_identity_stdout_is_blocked() {
+    let root = private_root();
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    cpu_policy_fill_output(&mut writer);
+    let mut child = isolated(&mut aterm_cmd(), root.path())
+        .arg(aterm_sysprobe::cpu_policy::COLLECTOR_VERB)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Keep both the full pipe's reader and the parent input alive: neither EOF
+    // nor a SIGPIPE can substitute for the collector's own deadline.
+    let status = cpu_policy_exit(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(aterm_sysprobe::cpu_policy::DEADLINE_EXIT),
+        "intrinsic watchdog, not the outer test limit"
+    );
+    drop(reader);
+    drop(child.stdin.take());
 }

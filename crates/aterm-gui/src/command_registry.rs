@@ -176,9 +176,12 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             C::Any,
         ),
         M::ToggleStatsLens => spec("sys.stats_lens.toggle", S::Window, A::LocalUi, C::Any),
+        M::NetworkState => spec("sys.network_state.open", S::Window, A::LocalUi, C::Any),
         M::ResetTerminal => spec("terminal.reset", S::View, A::LocalUi, C::Terminal),
         M::RewindPane => spec("pane.rewind", S::View, A::LocalUi, C::Terminal),
         M::ExportPaneHistory => spec("pane.export_history", S::View, A::LocalUi, C::Terminal),
+        M::ForgetPaneHistory => spec("pane.forget_history", S::View, A::LocalUi, C::Terminal),
+        M::ForgetAllHistory => spec("history.forget_all", S::Process, A::Owner, C::Any),
         M::ChooseTabTheme => spec("palette.choose_tab_theme", S::View, A::LocalUi, C::Terminal),
         M::ClearTabTheme => spec("terminal.theme.clear", S::View, A::LocalUi, C::Terminal),
     }

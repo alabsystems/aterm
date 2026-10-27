@@ -766,6 +766,8 @@ fn each_level_emits_exactly_its_fields() {
         "model",
         "effort",
         "ctx_left_pct",
+        "usage_5h_pct",
+        "usage_7d_pct",
         "detail",
         "doing",
         "role",
@@ -1217,6 +1219,64 @@ fn codex_session(h: &SessionHandle) {
     );
 }
 
+/// A row's usage: the context left Claude Code's own indicator shows wins; else its usage tap's
+/// count (`context_window.remaining_percentage`, which Claude Code hands every status line,
+/// where the indicator stands only near a compaction); else codex's rollout. The plan's windows
+/// come from the tap, else the rollout.
+#[test]
+fn a_rows_usage_takes_the_screen_then_the_tap_then_the_rollout() {
+    use aterm_agent::harness::tap::{Reading, Window};
+    let window = |pct| {
+        Some(Window {
+            pct,
+            resets_at: 1_793_130_600,
+            pct_x10: Some(pct * 10),
+        })
+    };
+    let tapped = Reading {
+        at: 1_793_113_505,
+        sid: "s-f0bcb335df22ac60a794".into(),
+        pid: 43_105,
+        session: None,
+        login: None,
+        home: None,
+        api_ms: 5_206_957,
+        five_hour: window(7),
+        seven_day: window(1),
+        warm: None,
+        cache_expires_at: None,
+        version: Some("2.1.311".into()),
+        model: Some("claude-opus-5-5".into()),
+        ctx_left: Some(64),
+        dur_us: 0,
+    };
+    let codex = codex_survey().facts;
+    let usage = |screen, tapped: Option<&Reading>, codex| Usage::of(screen, tapped, codex);
+    assert_eq!(
+        usage(None, Some(&tapped), None),
+        Usage {
+            ctx_left: Some(64),
+            five_hour: Some(7),
+            seven_day: Some(1),
+        },
+        "no indicator on the glass: the tap says it"
+    );
+    assert_eq!(
+        usage(Some(9), Some(&tapped), None).ctx_left,
+        Some(9),
+        "the glass wins"
+    );
+    assert_eq!(
+        usage(None, None, Some(&codex)),
+        Usage {
+            ctx_left: Some(67),
+            five_hour: None,
+            seven_day: Some(12),
+        }
+    );
+    assert_eq!(usage(None, None, None), Usage::default());
+}
+
 fn codex_survey() -> CodexSurvey {
     CodexSurvey {
         facts: aterm_agent::harness::codex_facts::CodexFacts {
@@ -1229,6 +1289,8 @@ fn codex_survey() -> CodexSurvey {
             model: Some("gpt-5.5".into()),
             effort: Some("high".into()),
             ctx_left_pct: Some(67),
+            usage_5h_pct: None,
+            usage_7d_pct: Some(12),
             cwd: Some("/private/tmp/codex-work".into()),
         },
         branch: Some("feat/parser".into()),
@@ -1267,6 +1329,8 @@ fn a_codex_row_reads_its_own_state_and_its_rollouts_facts() {
         "model",
         "effort",
         "ctx_left_pct",
+        "usage_5h_pct",
+        "usage_7d_pct",
         "doing",
         "prompt",
         "said",
@@ -1287,6 +1351,8 @@ fn a_codex_row_reads_its_own_state_and_its_rollouts_facts() {
         ("model", "gpt-5.5"),
         ("effort", "high"),
         ("ctx_left_pct", "67"),
+        ("usage_5h_pct", "-"),
+        ("usage_7d_pct", "12"),
         ("doing", "exec_command"),
         ("prompt", "port the parser"),
         ("said", "Reading the grammar."),
@@ -1340,6 +1406,7 @@ fn a_codex_row_reads_its_own_state_and_its_rollouts_facts() {
         "model",
         "effort",
         "ctx_left_pct",
+        "usage_7d_pct",
         "doing",
         "prompt",
         "said",

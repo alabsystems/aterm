@@ -1363,45 +1363,58 @@ mod b3 {
         Outcome::mf(df, dr, bad).with_note(format!("wraps={wraps} {}", notes.join(" ")))
     }
 
-    fn h10_case(nlines: usize, moves: &[i32], gap: u64, frame_ms: u64) -> Outcome {
-        const COLS: usize = 80;
+    const TALL_COLS: usize = 80;
+    const TALL_TOP: usize = 14;
+
+    /// A prompt of `nlines` short lines in a box at [`TALL_TOP`], each typed `key_ms` a key after a
+    /// Shift+Enter `line_ms` after the last, 100 ms idle after the last key.
+    fn tall_prompt(nlines: usize, frame_ms: u64, key_ms: u64, line_ms: u64) -> (Host, Vec<String>) {
         let words = [
             "fix it", "test it", "run it", "ship it", "log it", "tag it", "see it", "say it",
         ];
-        let mut h = Host::new(50, COLS, frame_ms);
-        let mut top = 14usize;
+        let mut h = Host::new(50, TALL_COLS, frame_ms);
+        let top = TALL_TOP;
         let mut lines: Vec<String> = vec![String::new()];
-        h.program(&draw_box(COLS, top, &lines, top));
+        h.program(&draw_box(TALL_COLS, top, &lines, top));
         h.idle(100);
         for (k, word) in words.iter().enumerate().take(nlines) {
             if k > 0 {
                 lines.push(String::new());
-                h.now += Duration::from_millis(80);
+                h.now += Duration::from_millis(line_ms);
                 let now = h.now;
                 h.glow.note_newline_break(now);
                 h.glow.note_typed_glyph(now, 1, false, TypedClass::Glyph);
-                h.term.process(&draw_box(COLS, top, &lines, top));
+                h.term.process(&draw_box(TALL_COLS, top, &lines, top));
                 h.frame();
             }
             for ch in word.chars() {
                 lines.last_mut().unwrap().push(ch);
-                h.key(ch, &draw_box(COLS, top, &lines, top), 70);
+                h.key(ch, &draw_box(TALL_COLS, top, &lines, top), key_ms);
             }
         }
         h.idle(100);
-        let lit_of = |h: &Host, top: usize, i: usize, lines: &[String]| {
-            let row = (top + 1 + i) as u16;
-            let n = lines[i].chars().count() as u16;
-            h.live(row).iter().filter(|&&c| c >= 2 && c < 2 + n).count()
-        };
+        (h, lines)
+    }
+
+    /// Live cells over line `i`'s glyphs, the box at `top`.
+    fn tall_lit(h: &Host, top: usize, i: usize, lines: &[String]) -> usize {
+        let row = (top + 1 + i) as u16;
+        let n = lines[i].chars().count() as u16;
+        h.live(row).iter().filter(|&&c| c >= 2 && c < 2 + n).count()
+    }
+
+    fn h10_case(nlines: usize, moves: &[i32], gap: u64, frame_ms: u64) -> Outcome {
+        const COLS: usize = TALL_COLS;
+        let (mut h, lines) = tall_prompt(nlines, frame_ms, 70, 80);
+        let mut top = TALL_TOP;
         let lit0: Vec<usize> = (0..lines.len())
-            .map(|i| lit_of(&h, top, i, &lines))
+            .map(|i| tall_lit(&h, top, i, &lines))
             .collect();
         let mut rep = Vec::new();
         let (mut df, mut dr) = (0, 0);
         for (k, &d) in moves.iter().enumerate() {
             let before: Vec<usize> = (0..lines.len())
-                .map(|i| lit_of(&h, top, i, &lines))
+                .map(|i| tall_lit(&h, top, i, &lines))
                 .collect();
             top = (top as i32 + d) as usize;
             let (f0, r0) = h.counts();
@@ -1411,7 +1424,7 @@ mod b3 {
             df += f1 - f0;
             dr += r1 - r0;
             let after: Vec<usize> = (0..lines.len())
-                .map(|i| lit_of(&h, top, i, &lines))
+                .map(|i| tall_lit(&h, top, i, &lines))
                 .collect();
             for i in 0..lines.len() {
                 let n = lines[i].chars().count();
@@ -1423,6 +1436,42 @@ mod b3 {
         }
         Outcome::mf(df, dr, rep.len() as u64)
             .with_note(format!("lit_at_start={lit0:?} {}", rep.join(" ")))
+    }
+
+    /// The tall cohort: a prompt typed fast enough (10 ms a key, 20 ms a Shift+Enter) that every
+    /// line is lit, moved once `d` rows, past the follow offsets. A line counts as dark when the
+    /// move leaves it unlit while a twin redrawn in place keeps it lit.
+    fn h11_case(nlines: usize, d: i32) -> Outcome {
+        let (mut h, lines) = tall_prompt(nlines, 16, 10, 20);
+        let (mut twin, _) = tall_prompt(nlines, 16, 10, 20);
+        let top = TALL_TOP;
+        let to = (top as i32 + d) as usize;
+        let lit = |h: &Host, top: usize| -> Vec<usize> {
+            (0..lines.len())
+                .map(|i| tall_lit(h, top, i, &lines))
+                .collect()
+        };
+        let before = lit(&h, top);
+        let (f0, r0) = h.counts();
+        h.program(&draw_box(TALL_COLS, to, &lines, to));
+        h.step();
+        twin.program(&draw_box(TALL_COLS, top, &lines, top));
+        twin.step();
+        let (f1, r1) = h.counts();
+        let (moved, stayed) = (lit(&h, to), lit(&twin, top));
+        let whole = |k: usize, i: usize| k * 10 >= lines[i].chars().count() * 9;
+        let mut rep: Vec<String> = (0..lines.len())
+            .filter(|&i| !whole(stayed[i], i) || !whole(moved[i], i))
+            .map(|i| format!("line{i}:{}->{}", before[i], moved[i]))
+            .collect();
+        let tall = (0..lines.len()).filter(|&i| whole(stayed[i], i)).count();
+        if tall < lines.len() {
+            rep.push(format!(
+                "premise: the twin lights {tall} of {} lines",
+                lines.len()
+            ));
+        }
+        Outcome::mf(f1 - f0, r1 - r0, rep.len() as u64).with_note(rep.join(" "))
     }
 
     pub fn cases(v: &mut Vec<Case>) {
@@ -1605,7 +1654,7 @@ mod b3 {
                 );
             }
         }
-        let m10: [&'static [i32]; 8] = [
+        let m10: [&'static [i32]; 12] = [
             &[1, 2],
             &[2, 2],
             &[2, 1],
@@ -1614,6 +1663,10 @@ mod b3 {
             &[-2, -2],
             &[2],
             &[-2],
+            &[3],
+            &[-3],
+            &[4],
+            &[-4],
         ];
         for nlines in [3usize, 5, 6, 7] {
             for moves in m10 {
@@ -1628,6 +1681,16 @@ mod b3 {
                         move || h10_case(nlines, moves, gap, 16),
                     );
                 }
+            }
+        }
+        for nlines in [2usize, 3, 4, 5, 6] {
+            for d in [3i32, -3, 4, -4, 5, -5] {
+                case(
+                    v,
+                    format!("b3.h11.tall_cohort_moved_far/lines{nlines}/dr{d:+}"),
+                    MF,
+                    move || h11_case(nlines, d),
+                );
             }
         }
     }
@@ -2148,10 +2211,41 @@ fn a_tall_lit_prompt_moved_carries_every_line_it_can() {
         |id| {
             let moves = moves_of(id);
             let lines = num_of(id, "lines");
+            // A move past the two-row offsets rides the caret's carry, which asks no twin
+            // evidence, so the copies of a line's glyphs on the rows beside it hold nothing back.
+            let far = moves.len() == 2 && moves[1..].parse::<u32>().is_ok_and(|d| d > 2);
             let two_up_first = moves.starts_with("-2");
-            let near_copy = lines == 6 || (lines == 7 && moves.starts_with("+1"));
+            let near_copy = !far && (lines == 6 || (lines == 7 && moves.starts_with("+1")));
             let retract_ends = num_of(id, "gap") == 60 && moves.len() > 2;
             two_up_first || near_copy || retract_ends
+        },
+    );
+}
+
+fn dr_of(id: &str) -> i32 {
+    let at = id.find("/dr").expect("a row offset") + "/dr".len();
+    id[at..]
+        .split('/')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("a row offset")
+}
+
+/// The limit: a cohort of four or more lit rows moved past the follow offsets loses the rows
+/// whose targets the witness never samples. On the arrival frame `Engine::band_rows` names the
+/// focus row, its two neighbours and its lead row (focus + d), then every cohort row, then each
+/// cohort row's lead row, and stops at `WITNESS_ROWS` (8); a row whose target is not named is
+/// not followed and retracts where it was. Two and three lit rows ride at every distance from ±3
+/// to ±5; four ride at +3, -3 and +4, five at +3 only, six at none.
+#[test]
+fn a_tall_lit_cohort_moved_past_the_follow_offsets_carries_every_row() {
+    holds_but(
+        all_cases(),
+        |id| id.starts_with("b3.h11."),
+        |id| {
+            let lines = num_of(id, "lines");
+            let d = dr_of(id);
+            lines >= 4 && !matches!((lines, d), (4, 3 | -3 | 4) | (5, 3))
         },
     );
 }

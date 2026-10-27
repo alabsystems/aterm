@@ -112,7 +112,7 @@ impl PolicyGates {
 }
 
 /// The terminal's policy.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct PolicyState {
     /// The installed engine, or `None` when the host has not installed a policy.
     engine: Option<PolicyEngine>,
@@ -207,6 +207,34 @@ impl PolicyState {
     #[inline]
     pub(super) fn rate_limit_config(&self, id: &str) -> Option<&RateLimit> {
         self.engine.as_ref()?.rate_limit_config(id)
+    }
+
+    /// Borrow the installed policy document, if any.
+    #[inline]
+    pub(super) fn policy_doc(&self) -> Option<&aterm_policy::Policy> {
+        self.engine.as_ref().map(PolicyEngine::policy)
+    }
+
+    /// Snapshot declared rate-limit buckets, or empty when no policy is installed.
+    pub(super) fn bucket_snapshots(&self) -> Vec<aterm_policy::limits::BucketSnapshot> {
+        self.engine
+            .as_ref()
+            .map_or_else(Vec::new, PolicyEngine::bucket_snapshots)
+    }
+
+    /// Restore declared rate-limit buckets onto the installed policy engine, if any.
+    pub(super) fn restore_bucket_snapshots(
+        &mut self,
+        snaps: &[aterm_policy::limits::BucketSnapshot],
+    ) {
+        if let Some(engine) = &mut self.engine {
+            engine.restore_bucket_snapshots(snaps);
+        }
+    }
+
+    /// Earliest `last_refill` instant across the installed policy's buckets, if any.
+    pub(super) fn earliest_refill(&self) -> Option<aterm_time::Instant> {
+        self.engine.as_ref().and_then(PolicyEngine::earliest_refill)
     }
 }
 

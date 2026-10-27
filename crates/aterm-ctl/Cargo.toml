@@ -30,10 +30,9 @@ aterm-uds = { workspace = true }
 # the server's `aterm_control::wire::pct_*` re-export. Workspace crate: std plus
 # astream-wire (dependency-free, vendor/astream), so still no third-party crate.
 aterm-codec = { workspace = true }
-# The `edit` request, its ticket replies and `await edit` (`amacs::protocol`),
-# for the `amacs` client's exchanges (`edit`): one grammar with the server.
-# First-party; it brings only first-party crates.
-amacs = { workspace = true }
+# The `edit` request, its ticket replies and `await edit` (`amacs_protocol`), for the `amacs`
+# client's exchanges: one grammar with the server, and no editor engine in this crate's graph.
+amacs-protocol = { workspace = true }
 
 # The census's process table (`kproc::records`), read in-process instead of running `ps`.
 # First-party, and so is each crate it brings (its `libc` is aterm-libc).

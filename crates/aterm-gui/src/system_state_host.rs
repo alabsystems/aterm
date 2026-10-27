@@ -336,13 +336,27 @@ impl Host {
         &self.latest_status
     }
 
-    /// The wake [`App::tick_system_state`] serves: the next tick, and the next
-    /// status poll unless one is in flight (its reply wakes the loop itself).
-    pub(crate) fn deadline(&self, now: Instant) -> Option<Instant> {
+    /// The wake [`App::tick_system_state`] serves: the next status poll (unless one
+    /// is in flight — its reply wakes the loop itself), and, only while a run's
+    /// village walks on a shown page
+    /// ([`crate::system_state::page_owes_animation_wake`]), the next animation tick.
+    /// A settled, finished or hidden page owes no sub-second tick wake (§5.6): its
+    /// re-reads, offer answers and retries ride the worker's publications (each
+    /// requests a redraw, which wakes the loop) and the one-second status poll. The
+    /// `next_tick` the page keeps is still its walk clock; folding it here only while
+    /// the walk runs is what holds the idle wake at zero. `hands_off_keys` (the
+    /// caller's app-wide typing hold) also withholds the tick while a key was typed
+    /// within the 2.5 s gap, so the walk never wakes the loop over the input path.
+    pub(crate) fn deadline(&self, now: Instant, hands_off_keys: bool) -> Option<Instant> {
+        let walks = crate::system_state::page_owes_animation_wake(
+            self.latest_status.running(),
+            self.shown,
+            hands_off_keys,
+        );
         self.next_status
             .filter(|_| !self.status_in_flight)
             .into_iter()
-            .chain(self.next_tick)
+            .chain(self.next_tick.filter(|_| walks))
             .min()
             .map(|next| next.max(now))
     }

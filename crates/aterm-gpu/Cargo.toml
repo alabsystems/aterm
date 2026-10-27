@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm GPU renderer (Metal, OpenGL ES and WebGL2, wgpu): glyph-atlas + instanced cell quads. Renders the terminal grid on the GPU; offscreen render-to-texture readback for headless verification."
+description = "aterm GPU renderer (Metal, OpenGL ES and WebGL2, Direct3D 11): glyph-atlas + instanced cell quads. Renders the terminal grid on the GPU; offscreen render-to-texture readback for headless verification."
 # The integration tests separate the environment-writing parity suite and
 # the process-wide GPU timing observer from the ordinary suite (`[[test]]`
 # targets below). Unmounted `tests/*.rs` files never compile.
@@ -22,15 +22,6 @@ autotests = false
 # compiles them anyway; the release cutter never enables it (aterm-gui's
 # `dev-seams` forwards here).
 dev-seams = []
-# The wgpu ORACLE arm, off in every build but its own lane. On macOS, Linux and
-# Windows wgpu is optional and this is its only activator, named on the command
-# line and never by a manifest: `targo --unverified test -p aterm-gpu --features
-# wgpu-oracle` compiles both arms (Metal, GL or D3D11 beside wgpu) and runs the
-# differential suites (the release's gpu-oracle stage). No dev-dependency turns
-# it on, so `-p` and `--workspace` builds compile one aterm-gpu, and none of
-# wgpu/naga on macOS, Linux or Windows. A no-op on the BSDs, where wgpu is
-# required. Code gates on `cfg(wgpu_arm)` (build.rs).
-wgpu-oracle = ["dep:wgpu"]
 # Aos M5a shared-buffer inference (docs/DESIGN-aos-hosted-execution-2026-10-21.md
 # §12): `aterm_gpu::compute`, finite int32-exact/v1 jobs on macOS, compared bit
 # for bit with aterm-effects' CPU reference. Off unless a command line names it
@@ -59,53 +50,27 @@ aterm-bits = { workspace = true }
 # aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
 aterm-spec-anchor = { workspace = true }
 
-# GPU backends: ONE PER CELL (first-party Metal on macOS, first-party OpenGL ES
-# on Linux and, as WebGL2, on wasm32, wgpu's DX12 on Windows), so no cell
-# compiles another's backend (`vulkan` was ~160k lines on Windows;
-# docs/THIRD_PARTY_ROAD_TO_ZERO.md).
-# The trade: a box whose one driver is broken falls to the CPU present
-# path, not a second GPU backend. `gpu = false` chooses that path outright. `dx12`
-# stays in the `cfg(windows)` table: its feature forwards `naga/hlsl-out`, which
-# is not target-gated and would compile ~10k dead lines of HLSL writer on other
-# cells. Native init blocks on this crate's own `block_on`.
+# GPU backends: ONE PER CELL, all first-party (Metal on macOS, OpenGL ES on
+# Linux and, as WebGL2, on wasm32, Direct3D 11 on Windows), so no cell compiles
+# another's backend. The trade: a box whose one driver is broken falls to the
+# CPU present path, not a second GPU backend. `gpu = false` chooses that path
+# outright. A target with none of them does not build (`lib.rs`): GW.6 removed
+# wgpu, the oracle the arms were held to, and its frames are the records in
+# `oracle/` (docs/AUDIT-third-party-2026-10-15.md).
 [target.'cfg(target_os = "macos")'.dependencies]
 aterm-objc = { workspace = true }
-# Optional: the first-party Metal renderer is the macOS backend; wgpu compiles
-# here only as the differential oracle (`wgpu-oracle`).
-wgpu = { version = "29", optional = true, default-features = false, features = ["metal", "wgsl"] }
 # `compute`'s job kind, its layout tables and its CPU reference (`int_bag_mlp`):
 # the same package as the dev-dependency below, which reaches aterm-gpu through
 # no edge.
 aterm-effects = { workspace = true, optional = true }
 
-# The native targets that present on wgpu (the BSDs, which no cell prices): named
-# directly because `renderer::WindowTarget` (`HasWindowHandle + HasDisplayHandle`)
-# bounds the public `create_window_surface`; it adds no package (wgpu already
-# resolves this one version there). macOS's `WindowTarget` is first-party
-# `aterm_objc::HasNsView`, and Linux's and Windows' `aterm_types::native_window::
-# HasNativeWindow`, so no shipped graph has raw-window-handle; their wgpu oracles
-# reach the crate through `wgpu::rwh` (docs/AUDIT-third-party-2026-10-15.md,
-# winit-core step 6: the macOS, Linux and Windows halves). wasm32 attaches no
-# window: its one surface is a canvas (`web::GpuContext::for_canvas`).
-[target.'cfg(not(any(target_os = "macos", target_os = "linux", windows, target_arch = "wasm32")))'.dependencies]
-raw-window-handle = "0.6"
-
-# The unix cells no forge row prices (the BSDs): wgpu's Vulkan, as Linux had
-# before the GL flip.
-[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))'.dependencies]
-wgpu = { version = "29", default-features = false, features = ["vulkan", "wgsl"] }
-
 # Linux renders on the first-party GL arm (`src/gl`,
 # docs/AUDIT-third-party-2026-10-15.md GW.4): it opens `libEGL.so.1` (on
 # Wayland also `libwayland-egl.so.1`; on X11 `libGLX.so.0` and `libX11.so.6`,
 # whose windows post through GLX) with `dlopen` through aterm-libc's
-# declarations; no GL library is linked and no crate binds one. wgpu compiles
-# here only as the oracle (`wgpu-oracle`), with both backends the GL arm is
-# byte-compared against on the same driver: GLES (the downlevel plan) and
-# Vulkan (the native plan, and the rows wgpu's GLES backend cannot build).
+# declarations; no GL library is linked and no crate binds one.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
-wgpu = { version = "29", optional = true, default-features = false, features = ["vulkan", "gles", "wgsl"] }
 
 # wasm32: WebGL2 on the first-party GL arm (`src/gl`), its GL calls the
 # module's `aterm_gl` imports and its canvas a JS object in the glue's table
@@ -117,14 +82,8 @@ aterm-wasm-abi = { workspace = true }
 
 # Windows renders on the first-party Direct3D 11 arm (`src/d3d11`,
 # docs/AUDIT-third-party-2026-10-15.md GW.5 + WB.4) through aterm-win32's COM
-# slices: no wgpu, naga or `windows` crate in the shipped graph. wgpu's DX12
-# backend compiles here only as the oracle (`wgpu-oracle`): the differential
-# suites and the WARP record's wgpu hold (`oracle/warp-frames.tsv`). Its
-# `as_hal::<Dx12>` swap chain is taken over as an aterm-win32 `Com` and tagged
-# scRGB through aterm-win32's DXGI vtables (WB.2), as the D3D11 arm tags its
-# own.
+# slices: no `windows` crate in the graph.
 [target.'cfg(windows)'.dependencies]
-wgpu = { version = "29", optional = true, default-features = false, features = ["dx12", "wgsl"] }
 aterm-win32 = { workspace = true }
 
 [dev-dependencies]
@@ -134,8 +93,7 @@ aterm-log = { workspace = true }
 # Inline-image (OSC 1337) parity tests: encode test PNGs + base64 payloads.
 aterm-png = { workspace = true }
 aterm-codec = { workspace = true }
-# Tier-1 model conformance (`capture_tap_conformance`, `conformance_gpuencode`,
-# `present_real`).
+# Tier-1 model conformance (`capture_tap_conformance`, `conformance_gpuencode`).
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-core = { workspace = true }
@@ -143,9 +101,7 @@ aterm-models-misc = { workspace = true }
 aterm-models-render = { workspace = true }
 # `nova_parity` feeds the clockless supernova emitters into RenderInput directly.
 aterm-effects = { workspace = true }
-
-# The WARP record (`warp_record_tests`) holds each frame by its SHA-256.
-[target.'cfg(windows)'.dev-dependencies]
+# The frame records (`frame_record_tests`) hold each frame by its SHA-256.
 aterm-digest = { workspace = true }
 
 # The GL arm's windowed X11 test (`gl::glx`) runs its work in a child, this test

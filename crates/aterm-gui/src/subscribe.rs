@@ -35,7 +35,7 @@ pub(crate) struct TargetStreams {
     pub trim: bool,
     /// Emit `MAIL <local> id=<n> off=<n> from=<p> kind=<k> [re=<n>]`, one line per row delivered into the watched session's inbox, and a `GAP` when the ring evicted rows this subscriber had not been shown.
     pub mail: bool,
-    /// Emit `LOG <local> <record>`, one line per record appended to the watched session's SESSION LOG (phase 3A), at the host tier `log` shows by default (never the content tier: no OSC title), filtered as `log lvl= class=turn` filter ([`crate::session_log::shows`]), and `GAP <local> log-lost=<n> why=<w> resync_to=<seq> ep=<e>` when the records past the watch's cursor cross a loss, exactly as the read counts it (seqs have holes across a carried update, so no id arithmetic would do).
+    /// Emit `LOG <local> <record>`, one line per record appended to the watched session's SESSION LOG (phase 3A), at the host tier `log` shows by default (never the content tier: no OSC title), filtered as `log lvl= class=turn` filter ([`crate::session_log::shows`]), and `GAP <local> log-lost=<n> why=<w> resync_to=<seq> ep=<e> base=<b>` (`base=` the log's identity, for a resume's `log-base=`) when the records past the watch's cursor cross a loss or name another log, exactly as the read counts it (seqs have holes across a carried update, so no id arithmetic would do).
     pub log: bool,
 }
 
@@ -261,7 +261,7 @@ pub(crate) struct PushOptions {
     pub mail: crate::fabric::MailFilter,
     /// `log`'s filter ([`Requested::log`]), no authority, like `mail`'s.
     pub log: LogFilter,
-    /// `since-log=<seq> log-ep=<e>`: resume the `log` stream after that record of that epoch (a `log`/`brief`/`status`/`await log` reply's), the read saying any loss in between as a `GAP`.
+    /// `since-log=<seq> log-ep=<e> [log-base=<b>]`: resume the `log` stream after that record of that epoch (a `log`/`brief`/`status`/`await log` reply's), the read saying any loss in between as a `GAP`; `log-base=` (`status log_base=`) names the log the cursor is of, so another log's cursor reads as a reset ([`aterm_slog::Cursor::base`]).
     pub log_since: Option<aterm_slog::Cursor>,
     /// `@*`: the roster journal's seq when the target set was resolved.
     pub adopt_after: Option<u64>,
@@ -300,6 +300,8 @@ struct Watch {
 #[derive(Clone, Copy, Debug)]
 struct LogWatch {
     cursor: aterm_slog::Cursor,
+    /// The log the ack says the watch starts in (`log_base=`): the one `log-base=` named, else the watched log's own ([`aterm_slog::Log::base_ep`]).
+    base: u32,
     filter: LogFilter,
 }
 
@@ -809,7 +811,10 @@ fn drain_mail_events(watch: &mut Watch, sid: &str, out: &mut String) {
 
 fn log_anchor(watch: &Watch) -> String {
     watch.log.as_ref().map_or_else(String::new, |lw| {
-        format!(" log_seq={} log_ep={}", lw.cursor.seq, lw.cursor.ep)
+        format!(
+            " log_seq={} log_ep={} log_base={}",
+            lw.cursor.seq, lw.cursor.ep, lw.base
+        )
     })
 }
 
@@ -840,10 +845,13 @@ fn drain_log_events(watch: &mut Watch, sid: &str, out: &mut String) {
     let Some(lw) = watch.log.as_mut() else {
         return;
     };
-    let (gap, recs, next) = {
+    let (gap, recs, next, base) = {
         let tl = watch.src.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let log = tl.slog().log();
-        if log.reader_last_seq() == lw.cursor.seq && log.ep() == lw.cursor.ep {
+        if log.reader_last_seq() == lw.cursor.seq
+            && log.ep() == lw.cursor.ep
+            && !lw.cursor.names_another_log(log.base_ep())
+        {
             return;
         }
         let read = log.read_shared(lw.cursor, aterm_slog::MAX_RECORDS);
@@ -853,12 +861,13 @@ fn drain_log_events(watch: &mut Watch, sid: &str, out: &mut String) {
             .filter(|r| crate::session_log::shows(r, lw.filter.lvl, lw.filter.class_turn))
             .map(Arc::clone)
             .collect();
-        (read.gap, recs, read.next)
+        (read.gap, recs, read.next, log.base_ep())
     };
     lw.cursor = next;
+    lw.base = base;
     if let Some(g) = gap {
         out.push_str(&format!(
-            "GAP {sid} log-lost={} why={} resync_to={} ep={}\n",
+            "GAP {sid} log-lost={} why={} resync_to={} ep={} base={base}\n",
             g.lost,
             g.why.word(),
             g.resync_to,
@@ -1190,18 +1199,22 @@ fn new_watch_at(
             0
         },
         mail: opts.mail.clone(),
-        log: streams.log.then(|| LogWatch {
-            cursor: opts.log_since.unwrap_or_else(|| {
-                let tl = src.timeline.lock().unwrap_or_else(|p| p.into_inner());
-                let log = tl.slog().log();
+        log: streams.log.then(|| {
+            let tl = src.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            let log = tl.slog().log();
+            let cursor = opts.log_since.unwrap_or_else(|| {
                 let from = if log_from_start {
                     0
                 } else {
                     log.reader_last_seq()
                 };
                 aterm_slog::Cursor::new(log.ep(), from)
-            }),
-            filter: opts.log,
+            });
+            LogWatch {
+                cursor,
+                base: cursor.base.unwrap_or_else(|| log.base_ep()),
+                filter: opts.log,
+            }
         }),
         closing: false,
         timeline_held: false,
@@ -2185,11 +2198,11 @@ mod tests {
             &mut cursors,
         ));
         assert!(
-            acks.contains(&format!("sub 5 {sid} log_seq=0 log_ep=1\n")),
+            acks.contains(&format!("sub 5 {sid} log_seq=0 log_ep=1 log_base=1\n")),
             "{acks}"
         );
         assert!(
-            acks.contains(&format!("sub 4 {old_sid} log_seq=1 log_ep=1\n")),
+            acks.contains(&format!("sub 4 {old_sid} log_seq=1 log_ep=1 log_base=1\n")),
             "{acks}"
         );
         let mut take = |local: u64| {
@@ -6891,7 +6904,7 @@ mod log_stream_tests {
         let ack = "OK subscribe 1\nsub 1 s-aaaa\n";
         assert_eq!(
             with_log_anchors(ack, std::slice::from_ref(&live)),
-            "OK subscribe 1\nsub 1 s-aaaa log_seq=2 log_ep=1\n"
+            "OK subscribe 1\nsub 1 s-aaaa log_seq=2 log_ep=1 log_base=1\n"
         );
         let (resumed, _) = log_watch(
             &tl,
@@ -6900,11 +6913,65 @@ mod log_stream_tests {
         );
         assert_eq!(
             with_log_anchors(ack, std::slice::from_ref(&resumed)),
-            "OK subscribe 1\nsub 1 s-aaaa log_seq=1 log_ep=1\n"
+            "OK subscribe 1\nsub 1 s-aaaa log_seq=1 log_ep=1 log_base=1\n"
         );
         let mut quiet = live;
         quiet.log = None;
         assert_eq!(with_log_anchors(ack, std::slice::from_ref(&quiet)), ack);
+    }
+
+    /// C13 (ROBUST-3): a resumed watch whose cursor names another log (`log-base=`) reads this
+    /// log as a reset, at its head too, and the `GAP` names this log's base for the next resume;
+    /// a cursor naming this log reads on.
+    #[test]
+    fn a_cursor_naming_another_log_resets_the_watch_and_the_gap_names_this_one() {
+        let tl = timeline();
+        mark(&tl, aterm_slog::Kind::Bell, aterm_slog::Src::Engine);
+        let (ep, base, head) = {
+            let g = tl.lock().unwrap();
+            let log = g.slog().log();
+            (log.ep(), log.base_ep(), log.last_seq())
+        };
+        let ack = "OK subscribe 1\nsub 1 s-aaaa\n";
+        let (mut own, streams) = log_watch(
+            &tl,
+            Some(aterm_slog::Cursor::new(ep, 1).of_log(base)),
+            LogFilter::default(),
+        );
+        let got = text(&frames_for_watch(&mut own, streams, true));
+        assert!(
+            !got.contains("GAP") && got.starts_with("LOG 1 2 mark - bell "),
+            "its own log's cursor reads on: {got}"
+        );
+        let other = base + 1;
+        let (mut foreign, streams) = log_watch(
+            &tl,
+            Some(aterm_slog::Cursor::new(ep, 1).of_log(other)),
+            LogFilter::default(),
+        );
+        assert_eq!(
+            with_log_anchors(ack, std::slice::from_ref(&foreign)),
+            format!("OK subscribe 1\nsub 1 s-aaaa log_seq=1 log_ep={ep} log_base={other}\n"),
+            "the ack names the log the watch was asked to start in"
+        );
+        let got = text(&frames_for_watch(&mut foreign, streams, true));
+        let gap = got.lines().next().unwrap_or_default();
+        assert!(
+            gap.starts_with("GAP 1 log-lost=")
+                && gap.contains(" why=reset ")
+                && gap.ends_with(&format!(" ep={ep} base={base}")),
+            "another log's cursor reads as a reset: {got}"
+        );
+        assert!(got.contains("\nLOG 1 1 open - spawn "), "{got}");
+        let (mut at_head, streams) = log_watch(
+            &tl,
+            Some(aterm_slog::Cursor::new(ep, head).of_log(other)),
+            LogFilter::default(),
+        );
+        assert!(
+            text(&frames_for_watch(&mut at_head, streams, true)).contains(" why=reset "),
+            "another log's cursor at this log's head is no head of it"
+        );
     }
 
     #[test]

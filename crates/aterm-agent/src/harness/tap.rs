@@ -332,6 +332,9 @@ pub struct Reading {
     pub version: Option<String>,
     /// The process's model (`model.id`), where it is a model id.
     pub model: Option<String>,
+    /// `context_window.remaining_percentage`, rounded: how much of the model's context window
+    /// is left, as Claude Code counts it (`None` before the first reply).
+    pub ctx_left: Option<u8>,
     /// How long the verb took up to its write, microseconds.
     pub dur_us: u64,
 }
@@ -436,6 +439,11 @@ impl Reading {
             version: word_of(doc.get("version"), 32),
             model: word_of(doc.get("model").and_then(|m| m.get("id")), 64)
                 .filter(|m| super::upgrade::is_model_id(m)),
+            ctx_left: doc
+                .get("context_window")
+                .and_then(|c| c.get("remaining_percentage"))
+                .and_then(pct_of)
+                .and_then(|(pct, _)| u8::try_from(pct).ok()),
             dur_us: 0,
         })
     }
@@ -481,6 +489,10 @@ impl Reading {
         o.insert("cache".to_owned(), Value::Object(cache));
         o.insert("version".to_owned(), Value::from(self.version.clone()));
         o.insert("model".to_owned(), Value::from(self.model.clone()));
+        o.insert(
+            "ctx_left".to_owned(),
+            Value::from(self.ctx_left.map(u64::from)),
+        );
         o.insert("dur_us".to_owned(), Value::from(self.dur_us));
         aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
     }
@@ -534,6 +546,11 @@ impl Reading {
                 .and_then(Value::as_str)
                 .filter(|m| super::upgrade::is_model_id(m))
                 .map(str::to_owned),
+            ctx_left: doc
+                .get("ctx_left")
+                .and_then(Value::as_u64)
+                .and_then(|p| u8::try_from(p).ok())
+                .filter(|p| *p <= 100),
             dur_us: doc.get("dur_us").and_then(Value::as_u64).unwrap_or(0),
         })
     }

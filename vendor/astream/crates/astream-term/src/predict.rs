@@ -394,7 +394,12 @@ impl Predictor {
                     ch: p.ch,
                     fg: Color::Default,
                     bg: Color::Default,
+                    fg_rgb: None,
+                    bg_rgb: None,
                     attrs: attr::FAINT,
+                    combining: ['\0'; crate::screen::MAX_COMBINING],
+                    combining_len: 0,
+                    width: 1,
                 },
             );
         }

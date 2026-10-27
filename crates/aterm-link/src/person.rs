@@ -126,10 +126,9 @@ fn parse_post(words: &[String], literal_at: Option<usize>) -> Result<Act, String
         } else if let Some(v) = w.strip_prefix("kind=").filter(|_| kind.is_none()) {
             kind = Some(v.to_string());
         } else if let Some(v) = w.strip_prefix("re=").filter(|_| re.is_none()) {
-            let n = v.strip_prefix('@').unwrap_or(v);
             re = Some(
-                n.parse::<u64>()
-                    .map_err(|_| format!("re={} is not a bus offset", safe(v, 64)))?,
+                aterm_types::fabric_grammar::parse_bus_offset(v)
+                    .ok_or_else(|| format!("re={} is not a bus offset", safe(v, 64)))?,
             );
         } else {
             text_at = i;
@@ -938,6 +937,29 @@ mod tests {
                 text: "yes, ship it".to_string(),
             }
         );
+        for re in ["5", "@5"] {
+            let post = parse(
+                "post",
+                &words(&format!("--cap-file c to=@s-a@n-b re={re} hi")),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(post.act, Act::Post { re: Some(5), .. }),
+                "re={re}: {:?}",
+                post.act
+            );
+        }
+        for re in ["+5", "@", "", "@-1"] {
+            assert_eq!(
+                parse(
+                    "post",
+                    &words(&format!("--cap-file c to=@s-a@n-b re={re} hi"))
+                ),
+                Err(format!("re={re} is not a bus offset")),
+                "re={re}"
+            );
+        }
         for bad in [
             "--cap-file c to=@s-a kind=note hi",
             "--cap-file c to=s-a@n-b kind=note hi",

@@ -728,7 +728,9 @@ pub(crate) fn cmd_ready(
     }
 }
 
-/// `await <idle <ms> | seq [<n>] | match <re> [rows <a> <b>] | gone <re> [rows <a> <b>]`
+/// `await <idle <ms> | seq [<n>] | match <re> [rows <a> <b>] | gone <re> [rows <a> <b>]`; `idle`,
+/// `seq`, `gone` and `agent` also answer `OK autopilot <word>` for an `autopilot=` the stored word
+/// is not ([`take_autopilot`], [`autopilot_moved`]), at the arm or while parked.
 pub(crate) fn cmd_await(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -749,7 +751,8 @@ pub(crate) fn cmd_await(
                          log <need|open=<lvl>|close=<lvl>|kind=<k>>[,...] [since=<seq> ep=<e>] | \
                          sys <predicate> | \
                          edit ticket=<t>|uri=<file-uri> | consent [kind=debugger] | \
-                         momentum <floor 0..=1>; each takes [timeout=<ms>]\n";
+                         momentum <floor 0..=1>; each takes [timeout=<ms>], and idle, seq, gone, \
+                         agent and log [autopilot=<cruise|land|off|->]\n";
 
     let mut toks = rest.split_whitespace();
     let mut timeout_ms = aterm_control::wire::WAIT_DEFAULT_MS;
@@ -773,6 +776,14 @@ pub(crate) fn cmd_await(
     let Some(&kind) = args.first() else {
         return USAGE.to_string();
     };
+    let autopilot = match kind {
+        "seq" => take_autopilot(&mut args, 1),
+        "idle" | "gone" | "agent" | "log" => take_autopilot(&mut args, 2),
+        _ => Ok(None),
+    };
+    let Ok(autopilot) = autopilot else {
+        return USAGE.to_string();
+    };
 
     if kind == "inbox" {
         return crate::fabric::cmd_await_inbox(ctx, &args[1..], timeout_ms);
@@ -791,7 +802,7 @@ pub(crate) fn cmd_await(
                 since = Some(rev);
             }
         }
-        return await_agent(store, session, ctx, &words, since, timeout_ms);
+        return await_agent(store, session, ctx, &words, since, autopilot, timeout_ms);
     }
 
     if kind == "task" {
@@ -814,7 +825,7 @@ pub(crate) fn cmd_await(
 
     if kind == "log" {
         return match crate::session_log::LogAwait::parse(&args[1..]) {
-            Ok(wait) => await_log(store, session, ctx, wait, timeout_ms),
+            Ok(wait) => await_log(store, session, ctx, wait, autopilot, timeout_ms),
             Err(usage) => usage.to_string(),
         };
     }
@@ -866,7 +877,9 @@ pub(crate) fn cmd_await(
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(current);
                 if after > current {
-                    return format!("OK seq {current}\n");
+                    drop(t);
+                    return autopilot_moved(ctx, autopilot)
+                        .unwrap_or_else(|| format!("OK seq {current}\n"));
                 }
                 t.watch(WatcherSpec::SeqAdvanced { after }, now0)
             }
@@ -894,12 +907,57 @@ pub(crate) fn cmd_await(
         OnHangup::Abort,
         Stretch::Hold(ctx.update_parked.as_ref()),
     );
-    match park.run(overall, watcher_look(term, id), disarm_watch(term, id)) {
-        Parked::Done(seq) => format!("OK {kind} {seq}\n"),
+    let mut latch = watcher_look(term, id);
+    let look = |now: Instant, parked: bool, closing: bool| {
+        if let Some(moved) = autopilot_moved(ctx, autopilot) {
+            term_lock(term).watch_disarm(id);
+            return (Some(moved), None);
+        }
+        let (seq, next) = latch(now, parked, closing);
+        (seq.map(|seq| format!("OK {kind} {seq}\n")), next)
+    };
+    match park.run(overall, look, disarm_watch(term, id)) {
+        Parked::Done(reply) => reply,
         Parked::Deadline => "OK timeout\n".to_string(),
         Parked::Exited => "ERR exited\n".to_string(),
         Parked::HungUp => crate::control::HUNG_UP_REPLY.to_string(),
     }
+}
+
+/// Take `idle`'s, `seq`'s, `gone`'s, `agent`'s or `log`'s opt-in `autopilot=<cruise|land|off|->`
+/// out of `args[from..]` (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.10, slice 10a): the
+/// word the caller last read from `meta`'s `autopilot=`, `-` for none stored. Only past the form's
+/// own arguments, so a `gone` pattern that reads `autopilot=…` keeps its meaning. `Ok(None)`
+/// without one; `Err` for a word `meta` never prints (a synonym included) or a second token.
+fn take_autopilot<'a>(args: &mut Vec<&'a str>, from: usize) -> Result<Option<&'a str>, ()> {
+    use aterm_agent::supervise::Autopilot;
+    let tail = args.split_off(from.min(args.len()));
+    let mut read = None;
+    for arg in tail {
+        match arg.strip_prefix("autopilot=") {
+            None => args.push(arg),
+            Some(word)
+                if read.is_none()
+                    && (word == "-" || Autopilot::ALL.iter().any(|m| m.word() == word)) =>
+            {
+                read = Some(word);
+            }
+            Some(_) => return Err(()),
+        }
+    }
+    Ok(read)
+}
+
+/// The answer of a wait that carries `autopilot=<read>` ([`take_autopilot`]) once the session's
+/// stored word is not `read`: `OK autopilot <stored>`, the word as `meta` prints it. A write of
+/// the word records a `meta-change`, which rings the session's watchers, so a parked wait looks
+/// again; one without the token (`None`) takes no lock and never answers here. It takes the meta
+/// lock alone: its caller holds neither the timeline's nor the terminal's.
+fn autopilot_moved(ctx: &SessionCtx, read: Option<&str>) -> Option<String> {
+    let read = read?;
+    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let stored = meta.autopilot.as_deref().unwrap_or("-");
+    (stored != read).then(|| format!("OK autopilot {stored}\n"))
 }
 
 const AGENT_WORDS: [&str; 7] = [
@@ -950,6 +1008,7 @@ fn await_agent(
     ctx: &SessionCtx,
     words: &[AgentWord],
     since: Option<u64>,
+    autopilot: Option<&str>,
     timeout_ms: u64,
 ) -> String {
     use std::time::{Duration, Instant};
@@ -960,6 +1019,11 @@ fn await_agent(
     let in_the_look = || false;
     let park = Park::new(&sub, &in_the_look, OnHangup::Abort, Stretch::None);
     let look = |_: Instant, _: bool, _: bool| {
+        // Outside the timeline's lock (meta → timeline); an exit answers first, as `Park` checks
+        // one ahead of the other forms' looks.
+        if let Some(moved) = autopilot_moved(ctx, autopilot).filter(|_| !exited(store)) {
+            return (Some(moved), None);
+        }
         let (word, rev) = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (tl.agent().word, tl.agent().rev)
@@ -1125,17 +1189,23 @@ fn await_log(
     session: u64,
     ctx: &SessionCtx,
     wait: crate::session_log::LogAwait,
+    autopilot: Option<&str>,
     timeout_ms: u64,
 ) -> String {
-    await_log_seamed(store, session, ctx, wait, timeout_ms, || {})
+    await_log_seamed(store, session, ctx, wait, autopilot, timeout_ms, || {})
 }
 
 /// [`await_log`], running `after_look` the instant after each look it takes at an ended session and before it decides (production passes nothing): the seam a test lands a retire on, to pin that the look is the waiter's only observation.
+///
+/// `autopilot` is the word the wait carries ([`take_autopilot`]): a live session whose stored word
+/// is another answers `OK autopilot <stored>` ahead of the log's own answer, at the arm or on the
+/// write that moves it, as the screen's waits do; an ended session's log answers as before.
 pub(crate) fn await_log_seamed(
     store: &Store,
     session: u64,
     ctx: &SessionCtx,
     wait: crate::session_log::LogAwait,
+    autopilot: Option<&str>,
     timeout_ms: u64,
     mut after_look: impl FnMut(),
 ) -> String {
@@ -1146,6 +1216,10 @@ pub(crate) fn await_log_seamed(
     let overall = Instant::now() + Duration::from_millis(timeout_ms);
     let sub = crate::session_watch::Subscription::single(&ctx.watchers);
     let exited = exit_probe(store, session);
+    let moved = || autopilot_moved(ctx, autopilot).filter(|_| !exited(store));
+    if let Some(reply) = moved() {
+        return reply;
+    }
     let mut cursor = match wait.since {
         Some(since) => since,
         None => match ctx
@@ -1162,6 +1236,9 @@ pub(crate) fn await_log_seamed(
     let in_the_look = || false;
     let park = Park::new(&sub, &in_the_look, OnHangup::Abort, Stretch::None);
     let look = |_: Instant, _: bool, _: bool| {
+        if let Some(reply) = moved() {
+            return (Some(reply), None);
+        }
         let step = ctx
             .timeline
             .lock()
@@ -4017,6 +4094,8 @@ pub(crate) fn cmd_cast(cast: &Mutex<crate::cast::CastRecorder>) -> String {
         rec.snapshot()
     };
     let (header, events) = snapshot.into_cast();
+    let events =
+        crate::cast_scrub::scrubbed(&events, header.evicted == 0 && header.handoff.is_none());
     let mut reply = String::from(HEAD_SLOT);
     aterm_control::asciicast::write_into(&mut reply, &header, &events);
     let head = format!("OK {}\n", reply.len() - HEAD_SLOT.len());
@@ -4213,7 +4292,8 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
         return format!(
             "OK enabled={enabled} latest_tick={} reachable_from={reachable_from} keyframes={} \
              live_events={} dropped_events={} lost_resizes={} dropped_input={} \
-             dropped_replies={} pending_resizes={} witnessed={} diverged={}{}\n",
+             dropped_replies={} pending_resizes={} witnessed={} diverged={} pool_used={} \
+             pool_limit={}{}\n",
             rec.latest_tick().0,
             rec.keyframe_count(),
             rec.live_events(),
@@ -4224,6 +4304,8 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
             if enabled { pending } else { 0 },
             rec.witnessed(),
             rec.diverged(),
+            crate::temporal::pool().used(),
+            crate::temporal::pool().limit(),
             rec.status_tail(),
         );
     }

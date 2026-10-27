@@ -87,6 +87,54 @@ fn curl_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String> 
         .map_err(|e| format!("spawn curl: {e}"))
 }
 
+/// How often [`curl_fetch_until`] looks at its stop flag.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// [`curl_fetch`] that ends the child as soon as `stop` is set, looking every [`STOP_POLL`].
+#[cfg_attr(trust_verify, trust::skip)]
+fn curl_fetch_until(
+    args: &[&str],
+    url: &str,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<std::process::Output, String> {
+    use aterm_uds::spawnfd::Stdio;
+    fn drain(
+        pipe: Option<impl std::io::Read + Send + 'static>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    }
+    let mut child = curl_command(args, url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn curl: {e}"))?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if stop.load(std::sync::atomic::Ordering::Acquire) => {
+                let _ = child.kill();
+                break child.wait().map_err(|e| format!("wait for curl: {e}"))?;
+            }
+            Ok(None) => std::thread::sleep(STOP_POLL),
+            Err(e) => return Err(format!("wait for curl: {e}")),
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
 /// Number of attempts for requests whose body is captured from curl's stdout.
 const CURL_ATTEMPTS: u32 = 3;
 
@@ -720,6 +768,30 @@ pub fn download_to_resumable(
     .map_err(|e| e.to_string())
 }
 
+/// What [`download_to_resumable_until`] answers when its stop flag ended it.
+pub const DOWNLOAD_STOPPED: &str = "download stopped: another source delivered the bytes first";
+
+/// [`download_to_resumable`] that gives up as soon as `stop` is set: the curl child is ended,
+/// its `.part` removed, and the call answers [`DOWNLOAD_STOPPED`]. A transfer that already
+/// completed stands.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn download_to_resumable_until(
+    asset_url: &str,
+    dest: &Path,
+    max_filesize: u64,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    download_to_resumable_with_stop(
+        asset_url,
+        dest,
+        max_filesize,
+        ResumeLane::Release,
+        Sink::Part,
+        Some(stop),
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// [`download_to_resumable`] for a vendor-hosted asset.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_to_resumable_https_only(
@@ -769,6 +841,20 @@ fn download_to_resumable_with(
     lane: ResumeLane,
     sink: Sink,
 ) -> Result<(), HttpError> {
+    download_to_resumable_with_stop(asset_url, dest, max_filesize, lane, sink, None)
+}
+
+/// [`download_to_resumable_with`], ended early once `stop` is set
+/// ([`download_to_resumable_until`]).
+#[cfg_attr(trust_verify, trust::skip)]
+fn download_to_resumable_with_stop(
+    asset_url: &str,
+    dest: &Path,
+    max_filesize: u64,
+    lane: ResumeLane,
+    sink: Sink,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), HttpError> {
     require_https_url(asset_url).map_err(HttpError::Transport)?;
     let part = match sink {
         Sink::Part => part_path(dest)
@@ -808,12 +894,18 @@ fn download_to_resumable_with(
             download_resume_args_https_only(&cap, &max_time, part_s, offset, stall)
         };
         let attempt_began = std::time::Instant::now();
-        let out = if lane == ResumeLane::VendorDirect {
-            vendor_fetch(&args, asset_url)
-        } else {
-            curl_fetch(&args, asset_url)
+        let out = match stop {
+            _ if lane == ResumeLane::VendorDirect => vendor_fetch(&args, asset_url),
+            Some(stop) => curl_fetch_until(&args, asset_url, stop),
+            None => curl_fetch(&args, asset_url),
         }
         .map_err(HttpError::Transport)?;
+        if !out.status.success()
+            && stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire))
+        {
+            clear_sink(&part, sink);
+            return Err(HttpError::Transport(DOWNLOAD_STOPPED.to_string()));
+        }
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if plan.offset > 0 && !retried_fresh && range_refused(out.status.code(), &stderr) {
@@ -2744,6 +2836,102 @@ mod tests {
         loop {
             std::thread::park();
         }
+    }
+
+    /// The directory [`probe_a_stopped_transfer`] downloads into, set only for the child
+    /// [`a_stopped_download_ends_its_curl_and_leaves_no_partial`] starts.
+    #[cfg(unix)]
+    const STOP_PROBE_ENV: &str = "ATERM_TEST_STOP_PROBE_DIR";
+
+    /// The child's half of the stop row: a release-lane download whose curl never finishes,
+    /// stopped once that curl has started; records what the call answered and whether its
+    /// partial is left, then waits to be killed.
+    #[cfg(unix)]
+    #[test]
+    fn probe_a_stopped_transfer() {
+        let Some(dir) = std::env::var_os(STOP_PROBE_ENV) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let url = "https://github.com/alabsystems/aterm/releases/download/atpkg-a-1/a-1.bin";
+        let dest = dir.join("a-1.bin");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let got = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !dir.join("started").exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                stop.store(true, std::sync::atomic::Ordering::Release);
+            });
+            super::download_to_resumable_until(url, &dest, 1 << 20, &stop)
+        });
+        let said = match got {
+            Ok(()) => "ok".to_string(),
+            Err(e) => format!("err {e}"),
+        };
+        let part = dir.join("a-1.bin.part").exists();
+        let pending = dir.join("said.pending");
+        std::fs::write(&pending, format!("{said} part={part}")).unwrap();
+        std::fs::rename(pending, dir.join("said")).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// A STOPPED DOWNLOAD ends its curl at once, removes its partial and says it was stopped:
+    /// the curl behind it writes a few bytes and then never finishes.
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    #[test]
+    fn a_stopped_download_ends_its_curl_and_leaves_no_partial() {
+        use std::os::unix::fs::PermissionsExt as _;
+        const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("curl");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf 'first bytes' > '{part}'\n: > '{started}'\nexec /bin/sleep 600\n",
+                part = dir.path().join("a-1.bin.part").display(),
+                started = dir.path().join("started").display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "--nocapture",
+                "http::tests::probe_a_stopped_transfer",
+            ])
+            .process_group(0)
+            .env(STOP_PROBE_ENV, dir.path())
+            .env(super::CURL_SEAM, &wrapper)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .unwrap();
+        let began = std::time::Instant::now();
+        let said = loop {
+            if let Ok(said) = std::fs::read_to_string(dir.path().join("said")) {
+                break Some(said);
+            }
+            if began.elapsed() > HANG_DETECTOR {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let pid = i32::try_from(child.id()).unwrap();
+        // SAFETY: process_group(0) made this still-unreaped child its group's leader, so the
+        // group holds the probe and any curl stand-in it left.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            said.as_deref(),
+            Some(format!("err {} part=false", super::DOWNLOAD_STOPPED).as_str()),
+            "the stopped call returned at once, said so, and left no partial"
+        );
     }
 
     /// What the test server answers one request with ([`start_transfer`]).

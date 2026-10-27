@@ -97,8 +97,8 @@ pub enum OptionAsAlt {
 }
 
 // LOCAL PATCH (aterm): the content view through first-party `aterm_objc::HasNsView`, so the Metal
-// presenter and aterm-gui's chrome reach it without `raw-window-handle` (`rwh_06` is opt-in and
-// wraps this view).
+// presenter and aterm-gui's chrome reach it without `raw-window-handle` (upstream's `rwh_06`
+// handles are cut).
 // SAFETY: the content view is installed at window creation and never replaced; the `NSWindow`
 // retains it and this `Window` retains the `NSWindow` until it drops, so the view outlives `self`.
 unsafe impl aterm_objc::HasNsView for Window {

@@ -287,26 +287,62 @@ impl fmt::Debug for NodeKey {
     }
 }
 
+/// Every member of the fleet, rather than one named node, in `drive_from`.
+pub const ALL_MEMBERS: &str = "*";
+
 /// A `[fleet] drive_from` grant binding a node id to the [`NodeKey`] approved to drive this host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DriveGrant {
-    /// Granted 32-hex-digit node id.
+    /// Granted 32-hex-digit node id, or [`ALL_MEMBERS`].
     pub node: String,
-    /// Public key bound to `node` when the grant was recorded.
+    /// Public key bound to `node` when the grant was recorded; zero for all members.
     pub key: NodeKey,
 }
 
 impl DriveGrant {
-    /// Format as `<node id>:<key hex>`.
+    /// Format as `<node id>:<key hex>`, or `*` for every member.
     #[must_use]
     pub fn word(&self) -> String {
-        format!("{}:{}", self.node, self.key.hex())
+        if self.all() {
+            ALL_MEMBERS.to_owned()
+        } else {
+            format!("{}:{}", self.node, self.key.hex())
+        }
     }
 
-    /// Parse `<node id>:<key hex>`, returning `None` if either half is missing or invalid.
+    /// Whether this grant admits every node the fleet's issuer currently binds.
+    #[must_use]
+    pub fn all(&self) -> bool {
+        self.node == ALL_MEMBERS
+    }
+
+    /// Whether it admits `node` bound to `key`: it names that node with that key, or every member.
+    #[must_use]
+    pub fn admits(&self, node: &str, key: NodeKey) -> bool {
+        self.all() || (self.node == node && self.key == key)
+    }
+
+    /// The grant among `grants` that admits `node` bound to `key` ([`Self::admits`]), the one
+    /// naming it first: every check that reads grants asks this, so `*` and a named grant agree.
+    #[must_use]
+    pub fn admitting<'a>(grants: &'a [Self], node: &str, key: NodeKey) -> Option<&'a Self> {
+        grants
+            .iter()
+            .find(|grant| !grant.all() && grant.admits(node, key))
+            .or_else(|| grants.iter().find(|grant| grant.all()))
+    }
+
+    /// Parse `<node id>:<key hex>` or `*`, returning `None` if the grant is invalid.
     #[must_use]
     pub fn from_word(word: &str) -> Option<Self> {
-        let (node, key) = word.trim().split_once(':')?;
+        let word = word.trim();
+        if word == ALL_MEMBERS {
+            return Some(Self {
+                node: ALL_MEMBERS.to_owned(),
+                key: NodeKey([0; 32]),
+            });
+        }
+        let (node, key) = word.split_once(':')?;
         let node = node.to_ascii_lowercase();
         if !hex::is_lower(&node, 32) {
             return None;
@@ -1168,10 +1204,11 @@ pub fn serve<H, E>(
     H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
     E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
 {
-    serve_with_handshake(
-        listener,
-        listening,
+    serve_inner(
+        ListenerSocket::Fleet(listener),
+        (listening, &|| (listening.scope, listening.serves)),
         running,
+        Locality::Fleet,
         HANDSHAKE_WITHIN,
         hand_over,
         on_event,
@@ -1203,8 +1240,11 @@ pub fn serve_offering<H, E>(
     );
 }
 
-/// Supply the handshake policy explicitly; test peers use their hang detector.
-pub(crate) fn serve_with_handshake<H, E>(
+/// [`serve`], each connection's TLS and both proofs given `handshake_within` in place of
+/// [`HANDSHAKE_WITHIN`]: a test's peer, which serves in process and so must finish each
+/// handshake, gives it its hang detector.
+#[cfg(any(test, debug_assertions))]
+pub fn serve_with_handshake<H, E>(
     listener: &TcpListener,
     listening: &Listening,
     running: &AtomicBool,

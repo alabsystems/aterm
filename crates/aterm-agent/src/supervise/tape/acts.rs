@@ -142,7 +142,8 @@ fn wait_of(request: &[u8]) -> (Option<String>, Option<u64>) {
 }
 
 /// A wait's TARGET: its words, its timeout (the loop's schedule, not what it
-/// waits for) left out — `await seq 102`.
+/// waits for) and the session's word it carries (`autopilot=<word>`, a wake
+/// beside its target) left out — `await seq 102`.
 fn wait_key(request: &[u8]) -> Vec<String> {
     let words: Vec<String> = codec::ctl_args(request)
         .unwrap_or_default()
@@ -154,11 +155,28 @@ fn wait_key(request: &[u8]) -> Vec<String> {
     while let Some(w) = it.next() {
         if w == "timeout" {
             it.next();
-        } else {
+        } else if !w.starts_with(WORD_TOKEN) {
             key.push(w);
         }
     }
     key
+}
+
+/// The token a wait carries the session's word by (`autopilot=<word>`).
+const WORD_TOKEN: &str = "autopilot=";
+
+/// The wait `request` asks without the session's word it carries, when it
+/// carries one: what a host that never had the token was asked, and answered
+/// alike while the word stood (the token only wakes the wait when the word
+/// moves, which a tape's own reads of it record).
+fn bare_wait(request: &[u8]) -> Option<Vec<u8>> {
+    let words = codec::ctl_args(request).ok()?;
+    let bare: Vec<&str> = words
+        .iter()
+        .map(String::as_str)
+        .filter(|w| !w.starts_with(WORD_TOKEN))
+        .collect();
+    (bare.len() < words.len()).then(|| codec::ctl_request(&bare))
 }
 
 /// A housekeeping request's KIND: its verb's words, its values left out —
@@ -603,6 +621,7 @@ impl ActsCursor {
             }
             ActClass::Wait => {
                 let (kind, timeout) = wait_of(request);
+                let same = same.or_else(|| self.asked(door, &bare_wait(request)?));
                 if let Some(at) = self.ahead(same) {
                     return Ok(self.take(at));
                 }

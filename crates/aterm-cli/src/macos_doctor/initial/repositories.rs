@@ -14,32 +14,44 @@ pub(super) fn run(
     vault: Option<&Plan>,
     mode: Mode,
 ) -> Result<Vec<Row>, String> {
-    run_reading(sys, ctx, vault, mode).map(|(rows, _, _)| rows)
+    run_reading(sys, ctx, vault, mode).map(|ran| ran.rows)
 }
 
-/// [`run`], whether its rows stopped for want of Apple's Command Line Tools
-/// ([`want_developer_tools`]), and the reason a part that failed gives ([`failure_note`]).
+/// What a Repositories stage [`run_reading`] ran came to.
+pub(super) struct Ran {
+    pub rows: Vec<Row>,
+    /// It stopped for want of Apple's Command Line Tools ([`want_developer_tools`]).
+    pub developer_tools: bool,
+    /// The reason a part that failed gives ([`failure_note`]).
+    pub failure: Option<&'static str>,
+    /// It stopped for want of a GitHub token to sign in with ([`want_token`]).
+    pub token: bool,
+}
+
+/// [`run`], with what its rows say it waits on.
 pub(super) fn run_reading(
     sys: &dyn System,
     ctx: &Ctx,
     vault: Option<&Plan>,
     mode: Mode,
-) -> Result<(Vec<Row>, bool, Option<&'static str>), String> {
+) -> Result<Ran, String> {
     Ok(match items(sys, ctx, vault, mode)? {
-        Some(rows) => {
-            let wanted = want_developer_tools(&rows);
-            let failure = failure_note(&rows);
-            (item_rows(rows), wanted, failure)
-        }
-        None => (
-            vec![readiness_row(
+        Some(rows) => Ran {
+            developer_tools: want_developer_tools(&rows),
+            failure: failure_note(&rows),
+            token: want_token(&rows),
+            rows: item_rows(rows),
+        },
+        None => Ran {
+            rows: vec![readiness_row(
                 Stage::Repositories.name(),
                 false,
                 "the selected secrets vault changed or is still syncing; repository inputs wait for a complete version".into(),
             )],
-            false,
-            None,
-        ),
+            developer_tools: false,
+            failure: None,
+            token: false,
+        },
     })
 }
 
@@ -57,6 +69,15 @@ pub(super) fn want_developer_tools(rows: &[aterm_machines::model::ItemReport]) -
     use aterm_machines::init_observe::{Reading, Wait};
     rows.iter()
         .any(|row| Reading::of(row) == Some(Reading::Waits(Wait::CommandLineTools)))
+}
+
+/// Whether the repositories' item `rows` stopped because this Mac has no GitHub token to sign in
+/// with: the file the vault's sync writes, or the one init.toml's `[github]` names, is not there
+/// ([`aterm_machines::init_observe::Wait::Token`]).
+pub(super) fn want_token(rows: &[aterm_machines::model::ItemReport]) -> bool {
+    use aterm_machines::init_observe::{Reading, Wait};
+    rows.iter()
+        .any(|row| Reading::of(row) == Some(Reading::Waits(Wait::Token)))
 }
 
 pub(super) fn observe(
@@ -191,7 +212,7 @@ mod tests {
         for (endpoint, body) in [
             ("/user", aterm_json::json!({"login":"alice"})),
             (
-                "/user/repos?visibility=all&per_page=30&sort=full_name&direction=asc&page=1",
+                "/user/repos?affiliation=owner&visibility=all&per_page=30&sort=full_name&direction=asc&page=1",
                 aterm_json::json!([]),
             ),
         ] {

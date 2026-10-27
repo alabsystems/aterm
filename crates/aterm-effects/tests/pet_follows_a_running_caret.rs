@@ -87,6 +87,7 @@ impl Host {
             protected: &[],
             overlays: &[],
             ink: &[],
+            blanked: &[],
             painted_over: None,
         };
         self.owner
@@ -410,19 +411,20 @@ fn airtimes(shots: &[Shot], from: u64) -> Vec<(u64, u64)> {
 /// 0 for the first key past column 12)`.
 type WrapTake = (String, u16, Vec<(u64, Key)>, u64);
 
-/// THE WRITING'S WRAP IS A BRISK BOUND, AT THE SHELL TOO. A line typed past the margin with
-/// the prompt on the last row wraps onto the line the screen scrolls up, and the cat crosses
-/// after the wrap; a held delete takes the caret back across a wrap, and the cat crosses after
-/// it. Each crossing is the animal's own pace on its arc, in the air no longer than the big
-/// bound's longest shape (850 ms): typed at 33 and 20 keys a second and by hand, typed on after
-/// a pause at the margin, and deleted back across one and two wraps from mid-screen and from the
-/// last row. (The leap ahead of a wrap that is coming, mid-screen, is timed to land with the
-/// wrap and keeps the quiet pace.)
+/// THE WRITING'S WRAP IS A BRISK BOUND, AT THE SHELL TOO. A line typed past the margin wraps
+/// onto the next line (mid-screen) or onto the line the screen scrolls up (the prompt on the
+/// last row), and the cat crosses after the wrap; a held delete takes the caret back across a
+/// wrap, and the cat crosses after it. Each crossing is the animal's own pace on its arc, in the
+/// air no longer than the big bound's longest shape (850 ms): typed at 33 and 20 keys a second
+/// and by hand, typed on after a pause at the margin, and deleted back across one and two wraps,
+/// from mid-screen and from the last row.
 ///
 /// NEGATIVE CONTROL (as run on main before the fix): every crossing 0.99 to 1.17 s in the air,
 /// paced as a quiet crossing, 0.74 of the pane a second. With the wrap the writing's only while
 /// its rhythm was open and the cat on the ground, a wrap typed two or three keys after a pause
-/// crossed in 1.2 s after a perk, and one that came as a hop came down in 1.17 s.
+/// crossed in 1.2 s after a perk, and one that came as a hop came down in 1.17 s. Mid-screen,
+/// with the leap ahead of a wrap that was coming (3984c54ccb), each wrap's flight left on a
+/// guess of when the wrap would come and hung over the line for it: 1.04 to 1.55 s in the air.
 #[test]
 fn each_wrap_typed_through_is_a_brisk_bound() {
     let mut takes: Vec<WrapTake> = Vec::new();
@@ -431,7 +433,13 @@ fn each_wrap_typed_through_is_a_brisk_bound() {
         ("20 keys a second", typed(240, 50)),
         ("by hand", by_hand(240)),
     ] {
-        takes.push((format!("{name}, the prompt on the last row"), 23, keys, 0));
+        takes.push((
+            format!("{name}, the prompt on the last row"),
+            23,
+            keys.clone(),
+            0,
+        ));
+        takes.push((format!("{name}, the prompt mid-screen"), 12, keys, 0));
     }
     // Typed on after a pause at the margin: the wrap comes two or three keys after the pause,
     // short of the writing's rhythm opening again, or as the cat comes down from a hop.
@@ -441,18 +449,17 @@ fn each_wrap_typed_through_is_a_brisk_bound() {
         (70, 100, 1_500, 14, 120),
         (76, 90, 2_500, 8, 150),
     ] {
-        let mut keys = typed(n0, gap0);
-        keys.extend(typed(n0 + n1, gap1).into_iter().skip(n0));
-        keys[n0].0 = pause;
-        takes.push((
-            format!(
-                "{n0} keys {gap0} ms apart, a {pause} ms pause, {n1} keys {gap1} ms apart, the \
-                 prompt on the last row"
-            ),
-            23,
-            keys,
-            0,
-        ));
+        for row0 in [12u16, 23] {
+            takes.push((
+                format!(
+                    "{n0} keys {gap0} ms apart, a {pause} ms pause, {n1} keys {gap1} ms apart, \
+                     the prompt on row {row0}"
+                ),
+                row0,
+                paused(n0, gap0, pause, n1, gap1),
+                0,
+            ));
+        }
     }
     for row0 in [12u16, 23] {
         for (len, dels) in [(130usize, 110usize), (220, 200)] {
@@ -655,4 +662,315 @@ fn no_pose_flashes_as_a_line_is_typed_and_held() {
             &flashes[..flashes.len().min(6)]
         );
     }
+}
+
+/// A line typed toward the margin and a pause: `n0` keys `gap0` ms apart, then `n1` more `gap1`
+/// ms apart, the first of them `pause` ms after the last of the `n0` (none where `n1` is 0).
+fn paused(n0: usize, gap0: u64, pause: u64, n1: usize, gap1: u64) -> Vec<(u64, Key)> {
+    let mut keys = typed(n0, gap0);
+    if n1 > 0 {
+        keys.extend(typed(n0 + n1, gap1).into_iter().skip(n0));
+        keys[n0].0 = pause;
+    }
+    keys
+}
+
+/// The replay of `keys` typed from a prompt on `row0`, watched for `tail` ms past the last key.
+fn replay_watched(row0: u16, keys: &[(u64, Key)], tail: u64) -> Host {
+    let mut ev = line_editor(row0, keys);
+    let last = ev.last().map_or(0, |e| e.0);
+    ev.push((last + tail, Rec::Out(Vec::new())));
+    Host::replay(ev)
+}
+
+/// When each key of `keys` is pressed (ms), as [`line_editor`] presses them.
+fn key_times(keys: &[(u64, Key)]) -> Vec<u64> {
+    keys.iter()
+        .scan(300u64, |t, k| {
+            *t += k.0;
+            Some(*t)
+        })
+        .collect()
+}
+
+/// A flight: `(ms it leaves, its landing (col, row) or NaN where it is still in the air at the
+/// end, ms aloft, the caret at its landing, the caret as it left)`.
+type Aloft = (u64, (f32, f32), u64, (u16, u16), (u16, u16));
+
+/// Each flight from `from` ms on.
+fn flights_from(shots: &[Shot], from: u64) -> Vec<Aloft> {
+    let shots: Vec<&Shot> = shots.iter().filter(|s| s.ms >= from).collect();
+    let end = shots.last().map_or(0, |s| s.ms);
+    shots
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| {
+            w[1].frame.action == PetAction::Leap && w[0].frame.action != PetAction::Leap
+        })
+        .map(|(i, w)| {
+            match shots[i + 1..]
+                .iter()
+                .find(|s| s.frame.action != PetAction::Leap)
+            {
+                Some(d) => (
+                    w[1].ms,
+                    (d.frame.col, d.frame.row),
+                    d.ms - w[1].ms,
+                    d.caret,
+                    w[1].caret,
+                ),
+                None => (
+                    w[1].ms,
+                    (f32::NAN, f32::NAN),
+                    end - w[1].ms,
+                    w[1].caret,
+                    w[1].caret,
+                ),
+            }
+        })
+        .collect()
+}
+
+/// The pauses at the margin: `(n0, gap0, pause, n1, gap1)` as [`paused`] types them. The prompt
+/// takes two cells, so the caret pauses at `n0 + 2` of 80: on the cells the cat stands on at the
+/// wall (77, 78, 79) or short of them (72, 74), for less and more than the cat's sit, by hand
+/// and held, typed on through the wrap after it or never; typed on just after the cat's sit
+/// (its hop off the letters in the air as the line wraps); and stopped at the margin of the
+/// line's second row (`n0` past 78: the caret at `n0 + 2 - 80`, the line's first row over it).
+const MARGIN_PAUSES: [(usize, u64, u64, usize, u64); 19] = [
+    (75, 150, 800, 9, 130),
+    (75, 100, 1_500, 9, 120),
+    (70, 100, 1_500, 14, 120),
+    (76, 90, 2_500, 8, 150),
+    (72, 120, 1_000, 10, 120),
+    (74, 60, 900, 10, 60),
+    (77, 100, 1_800, 6, 100),
+    (72, 100, 4_000, 14, 120),
+    (77, 33, 3_000, 8, 33),
+    (76, 100, 0, 0, 0),
+    (72, 66, 0, 0, 0),
+    (75, 33, 0, 0, 0),
+    (77, 33, 0, 0, 0),
+    (75, 90, 1_450, 9, 100),
+    (76, 90, 1_500, 8, 160),
+    (77, 90, 1_600, 7, 100),
+    (152, 70, 0, 0, 0),
+    (155, 70, 0, 0, 0),
+    (157, 70, 0, 0, 0),
+];
+
+/// How far (cells) from the caret, along the row, a cat waiting by it may stand.
+const BY_THE_CARET: f32 = 8.0;
+
+/// A PAUSE AT THE MARGIN NEVER KEEPS THE CAT IN THE AIR. Typed toward the right margin and
+/// paused there, on the top row, mid-screen and on the last row, the cat waits on the ground by
+/// the caret: no flight is in the air longer than the brisk bound's longest (850 ms); one that
+/// leaves while the hand is paused is a hop of under 0.3 s that comes down by the caret it left
+/// (within two rows and [`BY_THE_CARET`] cells), even where the hand types on through the wrap
+/// while it is in the air; and typing that stops short of the wrap leaves the cat on the ground
+/// by the caret. Every take of [`MARGIN_PAUSES`].
+///
+/// NEGATIVE CONTROL (as run on main before the fix, 3984c54ccb): mid-screen the pause launched
+/// the leap ahead of the wrap, which hung for it: 1.34 to 1.81 s in the air, coming down on the
+/// next line's start, 70 cells from a caret that had not wrapped (and, for typing that stopped
+/// there, never did). With the hop off the letters but a wrap that came while it was in the air
+/// drawing it out to the next line's start at a hop's pace (75d1af3f53): 1.30 to 1.55 s in the
+/// air, gliding low over the line it left.
+#[test]
+fn a_pause_at_the_margin_never_keeps_the_cat_in_the_air() {
+    let mut takes = Vec::new();
+    for row0 in [0u16, 12, 23] {
+        for take in MARGIN_PAUSES {
+            takes.push((row0, take));
+        }
+    }
+    let seen = crate::common::par_map(&takes, |&(row0, (n0, gap0, pause, n1, gap1))| {
+        let keys = paused(n0, gap0, pause, n1, gap1);
+        let at = key_times(&keys);
+        let h = replay_watched(row0, &keys, 6_000);
+        let from = h
+            .shots
+            .iter()
+            .find(|s| s.caret.1 >= 12 && s.frame.action != PetAction::Leap)
+            .map_or(0, |s| s.ms);
+        let (paused_from, paused_to) = (at[n0 - 1], at.get(n0).copied().unwrap_or(u64::MAX));
+        let label = format!("{n0} keys {gap0} ms apart, {pause} ms, {n1} keys, row {row0}");
+        let mut faults = Vec::new();
+        for (ms, (col, row), aloft, _, left) in flights_from(&h.shots, from) {
+            if aloft > 850 {
+                faults.push(format!(
+                    "{label}: the flight at {ms} ms was {aloft} ms in the air"
+                ));
+            }
+            let near = (row - f32::from(left.0)).abs() <= 2.0
+                && (col - f32::from(left.1)).abs() <= BY_THE_CARET;
+            if ms > paused_from && ms < paused_to && (aloft >= 300 || !near) {
+                faults.push(format!(
+                    "{label}: the hand paused, yet the flight at {ms} ms ({aloft} ms) came down \
+                     at ({col:.1}, {row:.1}), the caret at {left:?} as it left"
+                ));
+            }
+        }
+        if n1 == 0 {
+            let last = h.shots.last().expect("presents");
+            let (cr, cc) = last.caret;
+            if last.frame.action == PetAction::Leap
+                || (last.frame.row - f32::from(cr)).abs() > 2.0
+                || (last.frame.col - f32::from(cc)).abs() > BY_THE_CARET
+            {
+                faults.push(format!(
+                    "{label}: the typing stopped short of the wrap, yet the cat ended {:?} at \
+                     ({:.1}, {:.1}), the caret at {:?}",
+                    last.frame.action, last.frame.col, last.frame.row, last.caret
+                ));
+            }
+        }
+        faults
+    });
+    let faults: Vec<String> = seen.into_iter().flatten().collect();
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+}
+
+/// TYPING ON AFTER A PAUSE AT THE MARGIN COSTS ONLY THE WRAP'S FLIGHT. Once the hand types on
+/// after a pause at the margin, on the top row, mid-screen and on the last row, the line end
+/// costs the cat one flight, the wrap's crossing, down on the caret's row; and where the cat's
+/// stand at the wall covers no letter while the hand is paused, the pause costs none either.
+/// Every take of [`MARGIN_PAUSES`] that types on.
+///
+/// NEGATIVE CONTROL (as run before the fix): the keys typed after the pause, short of the
+/// writing's rhythm, found the margin untaken: the cat hopped up a row (the wall side crossed to
+/// the caret's left, over the line's words), on the last row hopped back to the wall as the
+/// rhythm opened, and crossed at the wrap: three flights in a second there, two on the top row
+/// and mid-screen.
+#[test]
+fn typing_on_after_a_pause_at_the_margin_costs_only_the_wraps_flight() {
+    let mut takes = Vec::new();
+    for row0 in [0u16, 12, 23] {
+        for take in MARGIN_PAUSES.into_iter().filter(|t| t.3 > 0) {
+            takes.push((row0, take));
+        }
+    }
+    let seen = crate::common::par_map(&takes, |&(row0, (n0, gap0, pause, n1, gap1))| {
+        let keys = paused(n0, gap0, pause, n1, gap1);
+        let at = key_times(&keys);
+        let h = replay_watched(row0, &keys, 3_000);
+        let label = format!("{n0} keys {gap0} ms apart, {pause} ms, {n1} keys, row {row0}");
+        let mut faults = Vec::new();
+        let resumed = flights_from(&h.shots, at[n0]);
+        if resumed.len() != 1 {
+            faults.push(format!(
+                "{label}: {} flights after the typing resumed (ms, landing, ms aloft, caret): \
+                 {resumed:?}",
+                resumed.len()
+            ));
+        }
+        for &(ms, (_, row), _, caret, _) in &resumed {
+            if (row - f32::from(caret.0)).abs() >= 0.5 {
+                faults.push(format!(
+                    "{label}: the flight at {ms} ms came down on row {row}, the caret on {caret:?}"
+                ));
+            }
+        }
+        // The prompt takes two cells; the wall seat (74.77 of 80) covers no letter while the
+        // caret stands at 75 or short of it.
+        if n0 + 2 <= 75 {
+            let line_end = flights_from(&h.shots, at[n0 - 1]);
+            if line_end.len() != 1 {
+                faults.push(format!(
+                    "{label}: {} flights from the pause on: {line_end:?}",
+                    line_end.len()
+                ));
+            }
+        }
+        faults
+    });
+    let faults: Vec<String> = seen.into_iter().flatten().collect();
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+}
+
+/// The first cell with a glyph on it that the body's silhouette (its drawn box, shaved of the
+/// tile's transparent border at the sides) meets, by any part of a pixel row.
+fn body_meets_glyphs(input: &RenderInput, frame: &PetFrame) -> Option<(u16, u16)> {
+    const CELL_W: u16 = 15;
+    const CELL_H: u16 = 28;
+    const TILE_BORDER: f32 = 0.30;
+    let (x0, x1, y0, y1) = frame.body_px(CELL_W, CELL_H, COLS, ROWS)?;
+    let border = (TILE_BORDER * f32::from(CELL_W)).round() as i32;
+    let (x0, x1) = (x0 + border, x1 - border);
+    let (cw, ch) = (i32::from(CELL_W), i32::from(CELL_H));
+    for row in y0.div_euclid(ch).max(0)..=((y1 - 1).div_euclid(ch)).min(i32::from(ROWS) - 1) {
+        for col in x0.div_euclid(cw).max(0)..=((x1 - 1).div_euclid(cw)).min(i32::from(COLS) - 1) {
+            if input.cells[row as usize]
+                .get(col as usize)
+                .is_some_and(|c| c.ch != ' ' && c.ch != '\0')
+            {
+                return Some((row as u16, col as u16));
+            }
+        }
+    }
+    None
+}
+
+/// A CAT THE HAND LEAVES AT THE MARGIN RESTS OFF ITS LETTERS, BY THE CARET. Typing that stops
+/// at the margin with the line's last letters over the cat's stand at the wall, or at the margin
+/// of a wrapped line's second row under the first row's letters, on the top row, mid-screen and
+/// on the last row, by hand or held: once the hand has stopped (the cat sits, 1.4 s after the
+/// last key, and its hop has landed) every frame of its rest stands off every glyph on the
+/// screen, within two rows and [`BY_THE_CARET`] cells of the caret.
+///
+/// NEGATIVE CONTROL (as run on main before the fix, 3984c54ccb): on the last row the cat sat on
+/// the line's last letters for good; mid-screen it leapt ahead to the next line's start for a
+/// wrap that never came, 70 cells from the caret. On a wrapped line's second row (75d1af3f53),
+/// mid-screen the seat two rows under the caret was let go once the cat had landed on it, and it
+/// hopped again onto a seat with its head among the caret's line; on the last row it sat at the
+/// wall with its head among the first row's letters.
+#[test]
+fn a_cat_the_hand_leaves_at_the_margin_rests_off_its_letters() {
+    let mut takes = Vec::new();
+    for row0 in [0u16, 12, 23] {
+        for take in MARGIN_PAUSES
+            .into_iter()
+            .filter(|t| t.3 == 0 && t.0 + 2 >= 77)
+        {
+            takes.push((row0, take));
+        }
+    }
+    let seen = crate::common::par_map(&takes, |&(row0, (n0, gap0, pause, n1, gap1))| {
+        let keys = paused(n0, gap0, pause, n1, gap1);
+        let at = key_times(&keys);
+        let mut h = replay_watched(row0, &keys, 6_000);
+        let input = h.term.cell_frame(usize::from(ROWS), usize::from(COLS));
+        let label = format!("{n0} keys {gap0} ms apart, stopped, row {row0}");
+        let rest_from = at[n0 - 1] + 2_000;
+        let rests: Vec<&Shot> = h
+            .shots
+            .iter()
+            .filter(|s| s.ms >= rest_from && s.frame.alpha > 0)
+            .collect();
+        let mut faults = Vec::new();
+        if rests.len() < 200 {
+            faults.push(format!("{label}: fixture: {} frames of rest", rests.len()));
+        }
+        for s in rests {
+            let (cr, cc) = s.caret;
+            let met = body_meets_glyphs(&input, &s.frame);
+            let near = (s.frame.row - f32::from(cr)).abs() <= 2.0
+                && (s.frame.col - f32::from(cc)).abs() <= BY_THE_CARET;
+            if !s.frame.action.settled() || met.is_some() || !near {
+                faults.push(format!(
+                    "{label}: {} ms after the last key, {:?} at ({:.2}, {:.2}), the caret at \
+                     {:?}, meets a glyph at {met:?}",
+                    s.ms - at[n0 - 1],
+                    s.frame.action,
+                    s.frame.col,
+                    s.frame.row,
+                    s.caret
+                ));
+                break;
+            }
+        }
+        faults
+    });
+    let faults: Vec<String> = seen.into_iter().flatten().collect();
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
 }

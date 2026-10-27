@@ -79,6 +79,21 @@ pub fn coalition_of(pid: u32) -> Option<u64> {
     imp::coalition_of(pid)
 }
 
+/// Coalition `id`'s live members' footprint, bytes; `None` where it does not answer, its record
+/// is another layout or ends before the figure, and off macOS. Unprivileged, for any user's
+/// coalition: what a root daemon holds reads here where its own task does not.
+#[must_use]
+pub fn footprint(id: u64) -> Option<u64> {
+    imp::footprint(id)
+}
+
+/// The footprint word of a usage record; `None` for another layout or one that ends before it.
+#[must_use]
+pub fn decode_footprint(raw: &[u64; USAGE_WORDS]) -> Option<u64> {
+    (raw[EQOS_LEN] == QOS_CLASSES as u64 && raw[PHYS_FOOTPRINT] != UNWRITTEN)
+        .then_some(raw[PHYS_FOOTPRINT])
+}
+
 /// Each swept process's resource coalition id, kept by pid under the pid version it was read at
 /// ([`crate::procs::processes_keeping`]), so a sweep reads the coalition only of a process it has
 /// not read under its current version.
@@ -326,6 +341,10 @@ mod imp {
         (rc == 0).then_some(raw)
     }
 
+    pub(super) fn footprint(id: u64) -> Option<u64> {
+        super::decode_footprint(&raw_usage(id)?)
+    }
+
     pub(super) fn coalitions() -> Option<CoalitionRead> {
         let (listed, truncated) = list()?;
         let timebase = crate::procs::imp::timebase();
@@ -358,6 +377,10 @@ mod imp {
     }
 
     pub(super) fn coalition_of(_pid: u32) -> Option<u64> {
+        None
+    }
+
+    pub(super) fn footprint(_id: u64) -> Option<u64> {
         None
     }
 

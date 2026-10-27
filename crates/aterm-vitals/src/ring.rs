@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Ten-second wall-clock bucketed hour ring ([`CLAMP_BACK_S`]).
+//! Wall-clock bucketed rings: an hour of ten-second buckets and six hours of ten-minute ones.
 
 use std::collections::VecDeque;
 
@@ -15,6 +15,12 @@ pub const RING_BUCKETS: usize = 360;
 pub const NOW_WINDOW_MS: i64 = 10_000;
 /// The longest step back that still lands in the open bucket, seconds.
 pub const CLAMP_BACK_S: i64 = 60;
+/// Milliseconds one long bucket covers: ten minutes, what a ring keeps past its hour.
+pub const LONG_BUCKET_MS: i64 = 600_000;
+/// Long buckets a ring keeps: six hours and the open one, what the deck's 1 h boxes read.
+pub const LONG_BUCKETS: usize = 37;
+/// How far back a ring's ten-second buckets reach, ms; a strip box older reads the long ones.
+pub const RING_REACH_MS: i64 = RING_BUCKETS as i64 * BUCKET_MS;
 /// How long [`Recent`] keeps a reading, ms: the longest window asked of it.
 pub const RECENT_KEEP_MS: i64 = 60_000;
 const RECENT_CAP: usize = 256;
@@ -98,6 +104,29 @@ impl Cell {
             out.over |= c.over;
         }
         out.mean = (n > 0).then(|| sum / f64::from(n));
+        out
+    }
+
+    /// Merge cells each spanning `w` ms of one box: the read ones' mean weighted by `w`, the
+    /// largest max, over when any is; a cell spanning no time counts for nothing.
+    #[must_use]
+    pub fn merge_weighted(cells: impl IntoIterator<Item = (Cell, i64)>) -> Cell {
+        let (mut sum, mut weight) = (0.0, 0.0);
+        let mut out = Cell::default();
+        for (c, w) in cells {
+            if w <= 0 {
+                continue;
+            }
+            if let Some(m) = c.mean {
+                sum += m * w as f64;
+                weight += w as f64;
+            }
+            if let Some(x) = c.max {
+                out.max = Some(out.max.map_or(x, |o| o.max(x)));
+            }
+            out.over |= c.over;
+        }
+        out.mean = (weight > 0.0).then(|| sum / weight);
         out
     }
 }
@@ -326,7 +355,59 @@ pub fn slots_of(
         .collect()
 }
 
-/// An hour of 10 s buckets, keyed by the wall clock.
+/// Six hours of ten-minute buckets, keyed by the wall clock (`at_unix_ms / LONG_BUCKET_MS`).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Long {
+    /// The key of `b[0]`.
+    first_k: i64,
+    b: VecDeque<Bucket>,
+}
+
+impl Long {
+    fn open_k(&self) -> Option<i64> {
+        (!self.b.is_empty()).then(|| self.first_k + self.b.len() as i64 - 1)
+    }
+
+    /// Record a reading taken at `at_unix_ms`: a step back of one bucket lands in the open one,
+    /// a longer one re-keys the buckets held so the reading opens the next, as the ring does.
+    fn push(&mut self, at_unix_ms: i64, v: Option<f64>, over: bool) {
+        let k = at_unix_ms.div_euclid(LONG_BUCKET_MS);
+        let cap = LONG_BUCKETS as i64;
+        match self.open_k() {
+            None => {
+                self.first_k = k;
+                self.b.push_back(Bucket::default());
+            }
+            Some(open) if k > open => {
+                if k - open >= cap {
+                    self.b.clear();
+                    self.first_k = k;
+                } else {
+                    for _ in 1..k - open {
+                        self.b.push_back(Bucket::default());
+                    }
+                }
+                self.b.push_back(Bucket::default());
+            }
+            Some(open) if open - k <= 1 => {}
+            Some(open) => {
+                self.first_k -= open + 1 - k;
+                self.b.push_back(Bucket::default());
+            }
+        }
+        while self.b.len() > LONG_BUCKETS {
+            self.b.pop_front();
+            self.first_k += 1;
+        }
+        if let Some(v) = v
+            && let Some(b) = self.b.back_mut()
+        {
+            b.add(v, over);
+        }
+    }
+}
+
+/// An hour of 10 s buckets and six hours of ten-minute ones, keyed by the wall clock.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BucketRing {
     cap: usize,
@@ -335,6 +416,8 @@ pub struct BucketRing {
     b: VecDeque<Bucket>,
     /// The readings behind "now".
     recent: Recent,
+    /// The ten-minute buckets the deck's 1 h boxes read.
+    long: Long,
 }
 
 impl Default for BucketRing {
@@ -353,12 +436,14 @@ impl BucketRing {
             first_k: 0,
             b: VecDeque::with_capacity(cap),
             recent: Recent::default(),
+            long: Long::default(),
         }
     }
 
     /// Record a reading taken at `at_unix_ms`.
     pub fn push(&mut self, at_unix_ms: i64, v: Option<f64>, over: bool) -> Option<i64> {
         let v = v.filter(|x| x.is_finite());
+        self.long.push(at_unix_ms, v, over);
         let k = at_unix_ms.div_euclid(BUCKET_MS);
         let closed = match self.open_k() {
             None => {
@@ -477,6 +562,20 @@ impl BucketRing {
         )
     }
 
+    /// Every ten-minute bucket as a cell, oldest first; the last is the open one ([`Self::long_k`]).
+    #[must_use]
+    pub fn long_cells(&self) -> Vec<Cell> {
+        self.long.b.iter().map(Bucket::cell).collect()
+    }
+
+    /// The open ten-minute bucket's key (Unix ms `[600_000 * k, 600_000 * (k + 1))`); `None`
+    /// before the first push.
+    #[inline]
+    #[must_use]
+    pub fn long_k(&self) -> Option<i64> {
+        self.long.open_k()
+    }
+
     /// The last minute of readings, oldest first ([`slots_of`]).
     #[must_use]
     pub fn readings(&self) -> Vec<Reading> {
@@ -503,16 +602,12 @@ impl BucketRing {
         })
     }
 
-    /// Compact snapshot of non-empty 10 s buckets and last-minute readings for persistence.
+    /// Compact snapshot of non-empty 10 s and ten-minute buckets and last-minute readings for
+    /// persistence.
     #[must_use]
     pub fn saved(&self) -> SavedRing {
-        let buckets = self
-            .iter()
-            .filter_map(|(k, b)| {
-                (b.n > 0 && b.sum.is_finite() && b.max.is_finite())
-                    .then_some((k, b.sum, b.n, b.max, b.over_n))
-            })
-            .collect();
+        let buckets = saved_buckets(self.first_k, &self.b);
+        let long = saved_buckets(self.long.first_k, &self.long.b);
         let recent = self
             .recent
             .readings()
@@ -520,48 +615,31 @@ impl BucketRing {
             .filter(|r| r.v.is_finite())
             .map(|r| (r.at_ms, r.v, r.over))
             .collect();
-        SavedRing { buckets, recent }
+        SavedRing {
+            buckets,
+            recent,
+            long,
+        }
     }
 
     /// Restore a ring persisted in an earlier run up to `now_unix_ms`, pruning stale or future
-    /// entries outside the 1-hour window.
+    /// entries outside the 1-hour window (six hours for the ten-minute buckets).
     #[must_use]
     pub fn restored(saved: &SavedRing, now_unix_ms: i64) -> Self {
         let mut ring = Self::default();
         if now_unix_ms <= 0 {
             return ring;
         }
-        let now_k = now_unix_ms.div_euclid(BUCKET_MS);
-        let min_k = now_k - (RING_BUCKETS as i64 - 1);
-        let mut valid: Vec<SavedBucket> = saved
-            .buckets
-            .iter()
-            .copied()
-            .filter(|&(k, sum, n, max, _)| {
-                n > 0 && sum.is_finite() && max.is_finite() && k >= min_k && k <= now_k
-            })
-            .collect();
-        valid.sort_by_key(|&(k, ..)| k);
-        valid.dedup_by_key(|&mut (k, ..)| k);
-        if let (Some(&(first_k, ..)), Some(&(last_k, ..))) = (valid.first(), valid.last()) {
-            let len = usize::try_from(last_k - first_k + 1)
-                .unwrap_or(0)
-                .min(RING_BUCKETS);
-            ring.first_k = last_k - len as i64 + 1;
-            ring.b.resize(len, Bucket::default());
-            for (k, sum, n, max, over_n) in valid {
-                if let Ok(idx) = usize::try_from(k - ring.first_k)
-                    && let Some(slot) = ring.b.get_mut(idx)
-                {
-                    *slot = Bucket {
-                        sum,
-                        n,
-                        max,
-                        over_n: over_n.min(n),
-                    };
-                }
-            }
-        }
+        (ring.first_k, ring.b) = restored_buckets(
+            &saved.buckets,
+            now_unix_ms.div_euclid(BUCKET_MS),
+            RING_BUCKETS,
+        );
+        (ring.long.first_k, ring.long.b) = restored_buckets(
+            &saved.long,
+            now_unix_ms.div_euclid(LONG_BUCKET_MS),
+            LONG_BUCKETS,
+        );
         let min_recent_ms = now_unix_ms.saturating_sub(RECENT_KEEP_MS);
         let mut recs: Vec<SavedReading> = saved
             .recent
@@ -577,6 +655,56 @@ impl BucketRing {
     }
 }
 
+/// `b`'s read buckets, the first keyed `first_k`, as [`SavedBucket`]s.
+fn saved_buckets(first_k: i64, b: &VecDeque<Bucket>) -> Vec<SavedBucket> {
+    b.iter()
+        .enumerate()
+        .filter_map(|(i, b)| {
+            (b.n > 0 && b.sum.is_finite() && b.max.is_finite()).then_some((
+                first_k + i as i64,
+                b.sum,
+                b.n,
+                b.max,
+                b.over_n,
+            ))
+        })
+        .collect()
+}
+
+/// The buckets of `saved` keyed `now_k - (cap - 1)..=now_k`, as a ring's `(first_k, b)`: the
+/// newest last, the unread ones between them empty, at most `cap`.
+fn restored_buckets(saved: &[SavedBucket], now_k: i64, cap: usize) -> (i64, VecDeque<Bucket>) {
+    let min_k = now_k - (cap as i64 - 1);
+    let mut valid: Vec<SavedBucket> = saved
+        .iter()
+        .copied()
+        .filter(|&(k, sum, n, max, _)| {
+            n > 0 && sum.is_finite() && max.is_finite() && k >= min_k && k <= now_k
+        })
+        .collect();
+    valid.sort_by_key(|&(k, ..)| k);
+    valid.dedup_by_key(|&mut (k, ..)| k);
+    let (Some(&(first, ..)), Some(&(last_k, ..))) = (valid.first(), valid.last()) else {
+        return (0, VecDeque::new());
+    };
+    let len = usize::try_from(last_k - first + 1).unwrap_or(0).min(cap);
+    let first_k = last_k - len as i64 + 1;
+    let mut b = VecDeque::from(vec![Bucket::default(); len]);
+    for (k, sum, n, max, over_n) in valid {
+        if let Ok(idx) = usize::try_from(k - first_k)
+            && let Some(slot) = b.get_mut(idx)
+        {
+            *slot = Bucket {
+                sum,
+                n,
+                max,
+                over_n: over_n.min(n),
+            };
+        }
+    }
+    (first_k, b)
+}
+
 /// One persisted non-empty 10 s bucket `(k, sum, n, max, over_n)`.
 pub type SavedBucket = (i64, f64, u16, f64, u16);
 
@@ -590,6 +718,9 @@ pub struct SavedRing {
     pub buckets: Vec<SavedBucket>,
     /// Per-sample readings within the last minute, oldest first.
     pub recent: Vec<SavedReading>,
+    /// Non-empty ten-minute buckets within six hours, oldest first, keyed by
+    /// [`LONG_BUCKET_MS`].
+    pub long: Vec<SavedBucket>,
 }
 
 impl SavedRing {
@@ -597,7 +728,7 @@ impl SavedRing {
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.buckets.is_empty() && self.recent.is_empty()
+        self.buckets.is_empty() && self.recent.is_empty() && self.long.is_empty()
     }
 }
 
@@ -662,7 +793,7 @@ impl TimeGap {
     }
 }
 
-/// One resolution band in a [`MultiScaleSpec`], ordered oldest (left) to newest (right).
+/// One resolution band in a [`MultiScaleSpec`], ordered newest (left) to oldest (right).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScaleBand {
     /// Number of consecutive boxes in this band.
@@ -671,7 +802,7 @@ pub struct ScaleBand {
     pub period_ms: i64,
     /// Relative horizontal width weight of each box in this band.
     pub weight: u16,
-    /// True for the far-right instantaneous live `now` box.
+    /// True for the far-left instantaneous live `now` box.
     pub live_now: bool,
 }
 
@@ -688,8 +819,19 @@ pub struct ProgSlot {
     pub age_lo_ms: i64,
     /// Relative width weight from its [`ScaleBand`].
     pub weight: u16,
-    /// True when this slot is the far-right glowing real-time `now` box.
+    /// True when this slot is the far-left real-time `now` box.
     pub is_live_now: bool,
+}
+
+/// Which edge of an [`AxisTick`]'s label stands on the tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TickAnchor {
+    /// The label starts at the tick: `"now"`, at the strip's left end.
+    Start,
+    /// The label is centred on the tick: an interior age.
+    Centre,
+    /// The label ends at the tick: the horizon, at the strip's right end.
+    End,
 }
 
 /// One X-axis tick mark and horizon label on a [`MultiScaleSpec`] strip.
@@ -699,10 +841,10 @@ pub struct AxisTick {
     pub x_frac: f32,
     /// Age at this tick in milliseconds before `now` (`0` for `"now"`).
     pub age_ms: i64,
-    /// Horizon label (`"–1h"`, `"–15m"`, `"–5m"`, `"–1m"`, `"–10s"`, `"now"`).
+    /// Horizon label (`"now"`, `"–10s"`, `"–1m"`, `"–10m"`, `"–1h"`, `"–6h"`).
     pub label: &'static str,
-    /// True when the label anchors to the right edge (`"now"`).
-    pub align_right: bool,
+    /// Which edge of the label stands on the tick.
+    pub anchor: TickAnchor,
 }
 
 /// One resampled cell in a [`MultiScaleSpec`] strip, carrying its slot geometry and gap marker.
@@ -716,213 +858,203 @@ pub struct ScaleCell {
     pub slot: ProgSlot,
 }
 
-/// Multi-scale progressive time-series specification: fine real-time boxes near `now` on the
-/// right growing into wider aggregated buckets toward the left.
+/// Multi-scale progressive time-series specification: the live `now` box at the left, then fine
+/// real-time boxes growing into wider aggregated buckets toward the right, so the strip reads
+/// outward from now (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §3.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MultiScaleSpec {
-    /// Resolution bands ordered oldest (left) to newest (right).
+    /// Resolution bands ordered newest (left, the live box first) to oldest (right).
     pub bands: &'static [ScaleBand],
-    /// Horizon ticks `(age_ms, label)` ordered left to right.
+    /// Horizon ticks `(age_ms, label)` ordered left to right, `now` first.
     pub ticks: &'static [(i64, &'static str)],
 }
 
-const BANDS_FULL_HOUR: [ScaleBand; 6] = [
+const BANDS_FULL_6H: [ScaleBand; 6] = [
     ScaleBand {
-        slots: 3,
-        period_ms: 900_000,
-        weight: 16,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 2,
-        period_ms: 300_000,
-        weight: 13,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 4,
-        period_ms: 60_000,
+        slots: 1,
+        period_ms: 1_000,
         weight: 10,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 5,
-        period_ms: 10_000,
-        weight: 7,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 4,
-        period_ms: 2_000,
-        weight: 5,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 1,
-        period_ms: 2_000,
-        weight: 11,
         live_now: true,
     },
-];
-
-const TICKS_FULL_HOUR: [(i64, &str); 6] = [
-    (3_600_000, "\u{2013}1h"),
-    (900_000, "\u{2013}15m"),
-    (300_000, "\u{2013}5m"),
-    (60_000, "\u{2013}1m"),
-    (10_000, "\u{2013}10s"),
-    (0, "now"),
-];
-
-const BANDS_FOLD_15M: [ScaleBand; 5] = [
     ScaleBand {
-        slots: 2,
-        period_ms: 300_000,
-        weight: 15,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 4,
-        period_ms: 60_000,
-        weight: 11,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 5,
-        period_ms: 10_000,
-        weight: 7,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 4,
-        period_ms: 2_000,
-        weight: 5,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 1,
-        period_ms: 2_000,
-        weight: 11,
-        live_now: true,
-    },
-];
-
-const TICKS_FOLD_15M: [(i64, &str); 5] = [
-    (900_000, "\u{2013}15m"),
-    (300_000, "\u{2013}5m"),
-    (60_000, "\u{2013}1m"),
-    (10_000, "\u{2013}10s"),
-    (0, "now"),
-];
-
-const BANDS_COMPACT_5M: [ScaleBand; 4] = [
-    ScaleBand {
-        slots: 2,
-        period_ms: 120_000,
-        weight: 14,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 5,
-        period_ms: 10_000,
-        weight: 8,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 4,
-        period_ms: 2_000,
-        weight: 5,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 1,
-        period_ms: 2_000,
-        weight: 11,
-        live_now: true,
-    },
-];
-
-const TICKS_COMPACT_5M: [(i64, &str); 4] = [
-    (300_000, "\u{2013}5m"),
-    (60_000, "\u{2013}1m"),
-    (10_000, "\u{2013}10s"),
-    (0, "now"),
-];
-
-const BANDS_MINI_1M: [ScaleBand; 4] = [
-    ScaleBand {
-        slots: 2,
-        period_ms: 20_000,
-        weight: 13,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 1,
-        period_ms: 10_000,
-        weight: 8,
-        live_now: false,
-    },
-    ScaleBand {
-        slots: 4,
-        period_ms: 2_000,
+        slots: 9,
+        period_ms: 1_000,
         weight: 4,
         live_now: false,
     },
     ScaleBand {
+        slots: 5,
+        period_ms: 10_000,
+        weight: 5,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 9,
+        period_ms: 60_000,
+        weight: 5,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 5,
+        period_ms: 600_000,
+        weight: 7,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 5,
+        period_ms: 3_600_000,
+        weight: 10,
+        live_now: false,
+    },
+];
+
+const TICKS_FULL_6H: [(i64, &str); 6] = [
+    (0, "now"),
+    (10_000, "\u{2013}10s"),
+    (60_000, "\u{2013}1m"),
+    (600_000, "\u{2013}10m"),
+    (3_600_000, "\u{2013}1h"),
+    (21_600_000, "\u{2013}6h"),
+];
+
+const BANDS_FOLD_4H: [ScaleBand; 6] = [
+    ScaleBand {
         slots: 1,
-        period_ms: 2_000,
-        weight: 9,
+        period_ms: 1_000,
+        weight: 2,
         live_now: true,
+    },
+    ScaleBand {
+        slots: 9,
+        period_ms: 1_000,
+        weight: 1,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 5,
+        period_ms: 10_000,
+        weight: 1,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 9,
+        period_ms: 60_000,
+        weight: 1,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 5,
+        period_ms: 600_000,
+        weight: 2,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 3,
+        period_ms: 3_600_000,
+        weight: 2,
+        live_now: false,
+    },
+];
+
+const TICKS_FOLD_4H: [(i64, &str); 6] = [
+    (0, "now"),
+    (10_000, "\u{2013}10s"),
+    (60_000, "\u{2013}1m"),
+    (600_000, "\u{2013}10m"),
+    (3_600_000, "\u{2013}1h"),
+    (14_400_000, "\u{2013}4h"),
+];
+
+const BANDS_COMPACT_6M: [ScaleBand; 4] = [
+    ScaleBand {
+        slots: 1,
+        period_ms: 1_000,
+        weight: 2,
+        live_now: true,
+    },
+    ScaleBand {
+        slots: 9,
+        period_ms: 1_000,
+        weight: 1,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 5,
+        period_ms: 10_000,
+        weight: 1,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 5,
+        period_ms: 60_000,
+        weight: 2,
+        live_now: false,
+    },
+];
+
+const TICKS_COMPACT_6M: [(i64, &str); 4] = [
+    (0, "now"),
+    (10_000, "\u{2013}10s"),
+    (60_000, "\u{2013}1m"),
+    (360_000, "\u{2013}6m"),
+];
+
+const BANDS_MINI_1M: [ScaleBand; 3] = [
+    ScaleBand {
+        slots: 1,
+        period_ms: 1_000,
+        weight: 1,
+        live_now: true,
+    },
+    ScaleBand {
+        slots: 9,
+        period_ms: 1_000,
+        weight: 1,
+        live_now: false,
+    },
+    ScaleBand {
+        slots: 5,
+        period_ms: 10_000,
+        weight: 2,
+        live_now: false,
     },
 ];
 
 const TICKS_MINI_1M: [(i64, &str); 3] =
-    [(60_000, "\u{2013}1m"), (10_000, "\u{2013}10s"), (0, "now")];
+    [(0, "now"), (10_000, "\u{2013}10s"), (60_000, "\u{2013}1m")];
 
 impl MultiScaleSpec {
-    /// Full 1-hour multi-scale horizon (`15m → 5m → 1m → 10s → 2s → now`, 19 slots).
-    pub const FULL_HOUR: Self = Self {
-        bands: &BANDS_FULL_HOUR,
-        ticks: &TICKS_FULL_HOUR,
+    /// Full's six hours: the live second, nine more 1 s boxes, five of 10 s, nine of 1 min,
+    /// five of 10 min and five of 1 h, each size starting where its age is its own block's
+    /// (`docs/DESIGN-stats-deck-owner-2026-10-26.md` §4), 34 slots.
+    pub const FULL_6H: Self = Self {
+        bands: &BANDS_FULL_6H,
+        ticks: &TICKS_FULL_6H,
     };
 
-    /// 15-minute multi-scale horizon (`5m → 1m → 10s → 2s → now`, 16 slots).
-    pub const FOLD_15M: Self = Self {
-        bands: &BANDS_FOLD_15M,
-        ticks: &TICKS_FOLD_15M,
+    /// Four hours: [`Self::FULL_6H`]'s blocks with three of 1 h, 32 slots. The 1 s, 10 s and
+    /// 1 min blocks are one width and the live, 10 min and 1 h ones twice it, so on Folded's
+    /// 129 pt strip a 1 s block is 3 pt or more and "–1m" and "–10m" stand clear of "4h ago".
+    pub const FOLD_4H: Self = Self {
+        bands: &BANDS_FOLD_4H,
+        ticks: &TICKS_FOLD_4H,
     };
 
-    /// Compact 5-minute multi-scale horizon (`2m → 10s → 2s → now`, 12 slots).
-    pub const COMPACT_5M: Self = Self {
-        bands: &BANDS_COMPACT_5M,
-        ticks: &TICKS_COMPACT_5M,
+    /// Six minutes: the 1 s, 10 s and five 1 min blocks; too narrow for the 10 min and 1 h
+    /// ones, 20 slots. The live and 1 min blocks are twice the 1 s and 10 s ones, so on a 79 pt
+    /// strip a 1 s block is 3 pt or more and "–10s" stands clear of "6m ago".
+    pub const COMPACT_6M: Self = Self {
+        bands: &BANDS_COMPACT_6M,
+        ticks: &TICKS_COMPACT_6M,
     };
 
-    /// Narrow 1-minute multi-scale horizon (`20s → 10s → 2s → now`, 8 slots).
+    /// One minute: the 1 s and 10 s blocks alone, 15 slots, the 10 s ones twice as wide, so on a
+    /// 59 pt strip a 1 s block is 2.95 pt (3 device px at 1×) and "–10s", at the strip's
+    /// middle, stands clear of "–1m".
     pub const MINI_1M: Self = Self {
         bands: &BANDS_MINI_1M,
         ticks: &TICKS_MINI_1M,
     };
-
-    /// Pick the widest-horizon multi-scale preset whose finest (`2s`) boxes remain crisp inside
-    /// `strip_px` device pixels at `scale_x100` (`100` = 1x, `200` = 2x).
-    #[must_use]
-    pub fn for_strip_px(strip_px: u32, scale_x100: u32, prefer_hour: bool) -> Self {
-        let pt = strip_px.saturating_mul(100) / scale_x100.max(1);
-        if prefer_hour && pt >= 156 {
-            Self::FULL_HOUR
-        } else if pt >= 120 {
-            if prefer_hour && pt >= 140 {
-                Self::FULL_HOUR
-            } else {
-                Self::FOLD_15M
-            }
-        } else if pt >= 82 {
-            Self::COMPACT_5M
-        } else {
-            Self::MINI_1M
-        }
-    }
 
     /// Total number of boxes across all bands.
     #[must_use]
@@ -949,34 +1081,46 @@ impl MultiScaleSpec {
             .max(1)
     }
 
-    /// Compute normalized `[x0, x1]` and `[age_lo_ms, age_hi_ms]` layout for every slot, oldest first.
+    /// Compute normalized `[x0, x1]` and `[age_lo_ms, age_hi_ms]` layout for every slot, newest
+    /// first: the live `now` box at `x0 = 0`, then each older box to the right of the last.
     #[must_use]
     pub fn slots(&self) -> Vec<ProgSlot> {
         let total_w = self.total_weight() as f32;
-        let mut rem_age = self.horizon_ms();
+        let mut age = 0_i64;
         let mut acc_w = 0u32;
         let mut out = Vec::with_capacity(self.slot_count());
         for band in self.bands {
             for _ in 0..band.slots {
                 let next_w = acc_w + u32::from(band.weight);
-                let next_age = (rem_age - band.period_ms).max(0);
+                let next_age = age + band.period_ms;
                 out.push(ProgSlot {
                     x0: acc_w as f32 / total_w,
                     x1: next_w as f32 / total_w,
-                    age_hi_ms: rem_age,
-                    age_lo_ms: next_age,
+                    age_hi_ms: next_age,
+                    age_lo_ms: age,
                     weight: band.weight,
                     is_live_now: band.live_now,
                 });
                 acc_w = next_w;
-                rem_age = next_age;
+                age = next_age;
             }
         }
         out
     }
 
+    /// The finest history box's period, ms: the band right after the live box (1 s on every
+    /// preset), whose boxes the live edge slides; `None` for a spec with no history band.
+    #[must_use]
+    pub fn fine_period_ms(&self) -> Option<i64> {
+        self.bands
+            .iter()
+            .find(|b| !b.live_now && b.slots > 0)
+            .map(|b| b.period_ms)
+    }
+
     /// Map an event age `age_ms` (`now_unix_ms - event_unix_ms`) to its exact continuous
-    /// normalized X coordinate in `0.0..=1.0`, or `None` when older than [`Self::horizon_ms`].
+    /// normalized X coordinate in `0.0..=1.0`, growing with age (now is `0`, the horizon `1`), or
+    /// `None` when older than [`Self::horizon_ms`].
     #[must_use]
     pub fn x_frac_of_age_ms(&self, age_ms: i64) -> Option<f32> {
         if age_ms < -2_000 {
@@ -990,29 +1134,38 @@ impl MultiScaleSpec {
         for slot in self.slots() {
             if age <= slot.age_hi_ms && age >= slot.age_lo_ms {
                 let span = (slot.age_hi_ms - slot.age_lo_ms).max(1) as f32;
-                let into = (slot.age_hi_ms - age) as f32 / span;
+                let into = (age - slot.age_lo_ms) as f32 / span;
                 return Some((slot.x0 + (slot.x1 - slot.x0) * into).clamp(0.0, 1.0));
             }
         }
         Some(1.0)
     }
 
-    /// Horizon ticks with exact normalized X positions on this strip.
+    /// Horizon ticks with exact normalized X positions on this strip: `now` at `0`, its label
+    /// starting there; the horizon at `1`, its label ending there; each age between centred.
     #[must_use]
     pub fn axis_ticks(&self) -> Vec<AxisTick> {
+        let horizon = self.horizon_ms();
         self.ticks
             .iter()
             .filter_map(|&(age_ms, label)| {
                 let x_frac = if age_ms == 0 {
-                    1.0
+                    0.0
                 } else {
                     self.x_frac_of_age_ms(age_ms)?
+                };
+                let anchor = if age_ms == 0 {
+                    TickAnchor::Start
+                } else if age_ms >= horizon {
+                    TickAnchor::End
+                } else {
+                    TickAnchor::Centre
                 };
                 Some(AxisTick {
                     x_frac,
                     age_ms,
                     label,
-                    align_right: age_ms == 0,
+                    anchor,
                 })
             })
             .collect()
@@ -1046,14 +1199,29 @@ fn slot_gap_kind(
     }
 }
 
-/// Resample a 1-hour bucket ring (`ring_cells` ending at `last_k`) and last-minute per-sample
-/// `recent` readings into progressive [`ScaleCell`]s for `spec` at `now_unix_ms`, marking
-/// discontinuous `gaps` without smearing adjacent readings across them.
+/// What a strip resamples ([`multi_scale_cells`]): a ring's hour of 10 s cells, its six hours
+/// of ten-minute cells, and its last minute of readings.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Tiers<'a> {
+    /// The 10 s cells, oldest first, the last keyed `ring_k` ([`BucketRing::cells`]).
+    pub ring: &'a [Cell],
+    /// The last 10 s cell's key ([`BucketRing::open_k`]).
+    pub ring_k: i64,
+    /// The ten-minute cells, oldest first, the last keyed `long_k` ([`BucketRing::long_cells`]).
+    pub long: &'a [Cell],
+    /// The last ten-minute cell's key ([`BucketRing::long_k`]).
+    pub long_k: i64,
+    /// The last minute of readings, oldest first ([`BucketRing::readings`]).
+    pub recent: &'a [Reading],
+}
+
+/// Resample `tiers` into progressive [`ScaleCell`]s for `spec` at `now_unix_ms`, marking
+/// discontinuous `gaps` without smearing adjacent readings across them: a box within the last
+/// minute reads the readings, one within [`RING_REACH_MS`] the 10 s cells, and an older one the
+/// ten-minute cells, each weighted by how much of the box it spans.
 #[must_use]
 pub fn multi_scale_cells(
-    ring_cells: &[Cell],
-    last_k: i64,
-    recent: &[Reading],
+    tiers: Tiers<'_>,
     now_unix_ms: i64,
     spec: MultiScaleSpec,
     cover_ms: i64,
@@ -1061,12 +1229,33 @@ pub fn multi_scale_cells(
 ) -> Vec<ScaleCell> {
     let slots = spec.slots();
     let now_k = now_unix_ms.div_euclid(BUCKET_MS);
+    let (ring_cells, last_k, recent) = (tiers.ring, tiers.ring_k, tiers.recent);
     let first_k = last_k + 1 - ring_cells.len() as i64;
     let ring_at = |k: i64| -> Option<Cell> {
         (k >= first_k && k <= last_k && k <= now_k)
             .then(|| usize::try_from(k - first_k).ok())
             .flatten()
             .and_then(|i| ring_cells.get(i).copied())
+    };
+    let long_first = tiers.long_k + 1 - tiers.long.len() as i64;
+    let long_cell = |lo_ms: i64, hi_ms: i64| -> Cell {
+        let (k_lo, k_hi) = (
+            lo_ms.div_euclid(LONG_BUCKET_MS),
+            hi_ms
+                .saturating_sub(1)
+                .max(lo_ms)
+                .div_euclid(LONG_BUCKET_MS),
+        );
+        Cell::merge_weighted(
+            (k_lo.max(long_first)..=k_hi.min(tiers.long_k)).filter_map(|k| {
+                let cell = tiers
+                    .long
+                    .get(usize::try_from(k - long_first).ok()?)
+                    .copied()?;
+                let (b_lo, b_hi) = (k * LONG_BUCKET_MS, (k + 1) * LONG_BUCKET_MS);
+                Some((cell, hi_ms.min(b_hi) - lo_ms.max(b_lo)))
+            }),
+        )
     };
     let recent_valid = &recent[..recent.partition_point(|r| r.at_ms <= now_unix_ms)];
     slots
@@ -1080,7 +1269,9 @@ pub fn multi_scale_cells(
                 let k_hi = hi_ms.saturating_sub(1).max(lo_ms).div_euclid(BUCKET_MS);
                 Cell::merge((k_lo..=k_hi).filter_map(ring_at))
             };
-            let mut raw = if slot.age_hi_ms <= RECENT_KEEP_MS && !recent_valid.is_empty() {
+            let mut raw = if slot.age_lo_ms >= RING_REACH_MS {
+                long_cell(lo_ms, hi_ms)
+            } else if slot.age_hi_ms <= RECENT_KEEP_MS && !recent_valid.is_empty() {
                 let from = recent_valid.partition_point(|r| r.at_ms < lo_ms);
                 let to = if slot.is_live_now {
                     recent_valid.partition_point(|r| r.at_ms <= hi_ms)
@@ -1493,26 +1684,46 @@ mod tests {
     }
 
     #[test]
-    fn multi_scale_presets_grow_older_boxes_wider_and_place_ticks_on_exact_boundaries() {
+    fn multi_scale_presets_read_outward_from_now_with_older_boxes_wider() {
         for spec in [
-            MultiScaleSpec::FULL_HOUR,
-            MultiScaleSpec::FOLD_15M,
-            MultiScaleSpec::COMPACT_5M,
+            MultiScaleSpec::FULL_6H,
+            MultiScaleSpec::FOLD_4H,
+            MultiScaleSpec::COMPACT_6M,
             MultiScaleSpec::MINI_1M,
         ] {
             let slots = spec.slots();
             assert_eq!(slots.len(), spec.slot_count());
-            assert!(slots.last().is_some_and(|s| s.is_live_now));
-            assert!(slots[..slots.len() - 1].iter().all(|s| !s.is_live_now));
-            assert!((slots[0].x0 - 0.0).abs() < 1e-6);
+            // Newest first: the live box at the left end, holding now.
+            let live = slots[0];
+            assert!(live.is_live_now && live.x0.abs() < 1e-6 && live.age_lo_ms == 0);
+            assert!(slots[1..].iter().all(|s| !s.is_live_now));
             assert!((slots.last().unwrap().x1 - 1.0).abs() < 1e-6);
-            for pair in slots[..slots.len() - 1].windows(2) {
-                assert!(
-                    pair[0].weight >= pair[1].weight,
-                    "historical boxes grow wider toward older left bands: {pair:?}"
-                );
-                assert_eq!(pair[0].age_lo_ms, pair[1].age_hi_ms);
+            assert_eq!(slots.last().unwrap().age_hi_ms, spec.horizon_ms());
+            for pair in slots.windows(2) {
+                assert_eq!(pair[0].x1, pair[1].x0, "the boxes tile the strip");
+                assert_eq!(pair[0].age_hi_ms, pair[1].age_lo_ms, "and the age");
             }
+            for pair in slots[1..].windows(2) {
+                assert!(
+                    pair[0].weight <= pair[1].weight,
+                    "historical boxes grow wider toward older right bands: {pair:?}"
+                );
+            }
+            assert_eq!(spec.fine_period_ms(), Some(1_000));
+            // x grows with age: now at 0, the horizon at 1, every box edge on its own x.
+            assert_eq!(spec.x_frac_of_age_ms(0), Some(0.0));
+            assert_eq!(spec.x_frac_of_age_ms(spec.horizon_ms()), Some(1.0));
+            assert_eq!(spec.x_frac_of_age_ms(spec.horizon_ms() + 1), None);
+            for slot in &slots {
+                let at = |age| spec.x_frac_of_age_ms(age).expect("inside the horizon");
+                assert!((at(slot.age_lo_ms) - slot.x0).abs() < 1e-6, "{slot:?}");
+                assert!((at(slot.age_hi_ms) - slot.x1).abs() < 1e-6, "{slot:?}");
+            }
+            let xs: Vec<f32> = (0..=spec.horizon_ms())
+                .step_by(500)
+                .filter_map(|age| spec.x_frac_of_age_ms(age))
+                .collect();
+            assert!(xs.windows(2).all(|w| w[0] <= w[1]), "x grows with age");
             let ticks = spec.axis_ticks();
             assert_eq!(ticks.len(), spec.ticks.len());
             for pair in ticks.windows(2) {
@@ -1521,11 +1732,184 @@ mod tests {
                     "ticks increase left to right"
                 );
             }
+            let (first, last) = (ticks[0], ticks[ticks.len() - 1]);
+            assert_eq!(
+                (first.label, first.x_frac, first.anchor),
+                ("now", 0.0, TickAnchor::Start)
+            );
+            assert_eq!(
+                (last.age_ms, last.x_frac, last.anchor),
+                (spec.horizon_ms(), 1.0, TickAnchor::End)
+            );
+            assert!(
+                ticks[1..ticks.len() - 1]
+                    .iter()
+                    .all(|t| t.anchor == TickAnchor::Centre)
+            );
         }
-        assert_eq!(MultiScaleSpec::FULL_HOUR.horizon_ms(), 3_600_000);
-        assert_eq!(MultiScaleSpec::FOLD_15M.horizon_ms(), 900_000);
-        assert_eq!(MultiScaleSpec::COMPACT_5M.horizon_ms(), 300_000);
+        assert_eq!(MultiScaleSpec::FULL_6H.horizon_ms(), 6 * 3_600_000);
+        assert_eq!(MultiScaleSpec::FOLD_4H.horizon_ms(), 4 * 3_600_000);
+        assert_eq!(MultiScaleSpec::COMPACT_6M.horizon_ms(), 360_000);
         assert_eq!(MultiScaleSpec::MINI_1M.horizon_ms(), 60_000);
+    }
+
+    /// The owner's blocks (2026-10-26): 1 s, 10 s, 1 min, 10 min and 1 h, at least three of each
+    /// size a strip draws and five of each in Full, each size starting at the age of its own
+    /// block, where a tick names it; a narrower preset drops the largest sizes, never a middle
+    /// one.
+    #[test]
+    fn every_block_size_starts_at_its_own_age_with_three_to_five_of_it() {
+        const SIZES: [i64; 5] = [1_000, 10_000, 60_000, 600_000, 3_600_000];
+        for (spec, sizes, least) in [
+            (MultiScaleSpec::FULL_6H, 5, 5),
+            (MultiScaleSpec::FOLD_4H, 5, 3),
+            (MultiScaleSpec::COMPACT_6M, 3, 5),
+            (MultiScaleSpec::MINI_1M, 2, 5),
+        ] {
+            let slots = spec.slots();
+            let mut age = 0;
+            for &size in &SIZES[..sizes] {
+                let of: Vec<&ProgSlot> = slots
+                    .iter()
+                    .filter(|s| s.age_hi_ms - s.age_lo_ms == size)
+                    .collect();
+                assert!(of.len() >= least, "{size} ms: {} boxes", of.len());
+                assert_eq!(of[0].age_lo_ms, age, "{size} ms blocks follow the smaller");
+                assert!(
+                    of.windows(2).all(|w| w[0].age_hi_ms == w[1].age_lo_ms),
+                    "{size} ms blocks stand together"
+                );
+                if size > 1_000 {
+                    assert_eq!(age, size, "a size starts where its age is its own block");
+                    assert!(
+                        spec.ticks.iter().any(|&(at, _)| at == size),
+                        "a tick names where {size} ms blocks start"
+                    );
+                }
+                age = of.last().map_or(age, |s| s.age_hi_ms);
+            }
+            assert_eq!(age, spec.horizon_ms(), "no other size is drawn");
+            assert_eq!(spec.ticks.last().map(|t| t.0), Some(spec.horizon_ms()));
+        }
+    }
+
+    #[test]
+    fn a_ring_keeps_six_hours_of_ten_minute_buckets_and_restores_them() {
+        let mut r = BucketRing::default();
+        assert_eq!((r.long_k(), r.long_cells().len()), (None, 0));
+        let t0 = T0 - T0.rem_euclid(LONG_BUCKET_MS);
+        for i in 0..8 * 360 {
+            let at = t0 + i * 10_000;
+            let _ = r.push(at, Some(if at < t0 + 3_600_000 { 1.0 } else { 3.0 }), false);
+        }
+        let k_now = (t0 + (8 * 360 - 1) * 10_000).div_euclid(LONG_BUCKET_MS);
+        assert_eq!(r.long_k(), Some(k_now));
+        let cells = r.long_cells();
+        assert_eq!(cells.len(), LONG_BUCKETS, "six hours and the open bucket");
+        assert!(
+            cells.iter().all(|c| c.mean == Some(3.0)),
+            "the first hour aged out"
+        );
+        assert_eq!(r.len(), RING_BUCKETS, "the 10 s ring still keeps its hour");
+
+        let saved = r.saved();
+        assert_eq!(saved.long.len(), LONG_BUCKETS);
+        let now = t0 + 8 * 3_600_000 - 1;
+        let back = BucketRing::restored(&saved, now);
+        assert_eq!(back.long_cells(), r.long_cells());
+        assert_eq!(back.long_k(), r.long_k());
+        let later = BucketRing::restored(&saved, now + 3 * 3_600_000);
+        assert_eq!(
+            later.long_cells().len(),
+            LONG_BUCKETS - 18,
+            "three hours on, the oldest three are gone"
+        );
+        let old = SavedRing {
+            long: Vec::new(),
+            ..saved
+        };
+        assert!(
+            BucketRing::restored(&old, now).long_cells().is_empty(),
+            "a file written before the long buckets restores none"
+        );
+
+        let mut back_step = BucketRing::default();
+        let _ = back_step.push(t0 + 2 * LONG_BUCKET_MS, Some(1.0), false);
+        let _ = back_step.push(t0 + LONG_BUCKET_MS + 5_000, Some(3.0), false);
+        assert_eq!(
+            back_step
+                .long_cells()
+                .iter()
+                .map(|c| c.mean)
+                .collect::<Vec<_>>(),
+            [Some(2.0)],
+            "a step back of one bucket lands in the open one"
+        );
+        let _ = back_step.push(t0 - 3 * 3_600_000, Some(5.0), false);
+        assert_eq!(
+            back_step.long_k(),
+            Some((t0 - 3 * 3_600_000).div_euclid(LONG_BUCKET_MS))
+        );
+        assert_eq!(
+            back_step.long_cells().last().and_then(|c| c.mean),
+            Some(5.0)
+        );
+    }
+
+    #[test]
+    fn hour_boxes_read_the_ten_minute_buckets_by_how_much_of_each_they_span() {
+        let mut r = BucketRing::default();
+        let t0 = T0 - T0.rem_euclid(LONG_BUCKET_MS);
+        for i in 0..6 * 360 {
+            let at = t0 + i * 10_000;
+            let v = (at.div_euclid(LONG_BUCKET_MS) - t0 / LONG_BUCKET_MS) as f64;
+            let _ = r.push(at, Some(v), false);
+        }
+        let now = t0 + 6 * 3_600_000 - 1 + 300_000;
+        let (ring, long, recent) = (r.cells(), r.long_cells(), r.readings());
+        let tiers = Tiers {
+            ring: &ring,
+            ring_k: r.open_k().unwrap_or(0),
+            long: &long,
+            long_k: r.long_k().unwrap_or(0),
+            recent: &recent,
+        };
+        let cells = multi_scale_cells(tiers, now, MultiScaleSpec::FULL_6H, 2_500, &[]);
+        let hours: Vec<&ScaleCell> = cells
+            .iter()
+            .filter(|c| c.slot.age_hi_ms - c.slot.age_lo_ms == 3_600_000)
+            .collect();
+        assert_eq!(hours.len(), 5);
+        // Bucket k of the six hours read k - first, so an hour box reads the mean of its
+        // buckets' keys weighted by how many of its ms each holds.
+        let first = r.long_k().unwrap_or(0) + 1 - long.len() as i64;
+        assert_eq!(first, t0 / LONG_BUCKET_MS);
+        for h in &hours {
+            let (lo, hi) = (now - h.slot.age_hi_ms, now - h.slot.age_lo_ms);
+            let (mut sum, mut ms) = (0.0, 0.0);
+            for k in lo.div_euclid(LONG_BUCKET_MS)..=(hi - 1).div_euclid(LONG_BUCKET_MS) {
+                let ov = hi.min((k + 1) * LONG_BUCKET_MS) - lo.max(k * LONG_BUCKET_MS);
+                sum += (k - first) as f64 * ov as f64;
+                ms += ov as f64;
+            }
+            let got = h.cell.mean.expect("an hour the ring read");
+            assert!(
+                (got - sum / ms).abs() < 1e-6,
+                "{got} against {}: {h:?}",
+                sum / ms
+            );
+        }
+        assert!(
+            hours.windows(2).all(|w| w[0].cell.mean > w[1].cell.mean),
+            "older hours read the older, lower buckets"
+        );
+        assert!(
+            cells
+                .iter()
+                .filter(|c| c.slot.age_lo_ms < RING_REACH_MS && c.slot.age_lo_ms >= 600_000)
+                .all(|c| c.cell.mean.is_some()),
+            "the 10 min boxes read the ring"
+        );
     }
 
     #[test]
@@ -1547,16 +1931,16 @@ mod tests {
                 kind: GapKind::Crash,
             },
         ];
-        let scaled = multi_scale_cells(
-            &ring.cells(),
-            ring.open_k().unwrap_or(0),
-            &ring.readings(),
-            now,
-            MultiScaleSpec::COMPACT_5M,
-            15_000,
-            &gaps,
-        );
-        assert_eq!(scaled.last().unwrap().cell.mean, Some(80.0));
+        let (cells, recent) = (ring.cells(), ring.readings());
+        let tiers = Tiers {
+            ring: &cells,
+            ring_k: ring.open_k().unwrap_or(0),
+            recent: &recent,
+            ..Tiers::default()
+        };
+        let scaled = multi_scale_cells(tiers, now, MultiScaleSpec::COMPACT_6M, 15_000, &gaps);
+        assert!(scaled[0].slot.is_live_now, "newest first");
+        assert_eq!(scaled[0].cell.mean, Some(80.0));
         assert!(
             scaled
                 .iter()
@@ -1567,12 +1951,15 @@ mod tests {
                 .iter()
                 .any(|s| s.gap == Some(GapKind::Crash) && s.cell.mean.is_none())
         );
-        let x_crash = MultiScaleSpec::COMPACT_5M
+        let x_crash = MultiScaleSpec::COMPACT_6M
             .x_frac_of_age_ms(6_000)
             .expect("6s inside 5m horizon");
-        let x_10s = MultiScaleSpec::COMPACT_5M
+        let x_10s = MultiScaleSpec::COMPACT_6M
             .x_frac_of_age_ms(10_000)
             .expect("10s boundary");
-        assert!(x_crash > x_10s && x_crash < 1.0);
+        assert!(
+            x_crash > 0.0 && x_crash < x_10s,
+            "now at the left, x grows with age"
+        );
     }
 }

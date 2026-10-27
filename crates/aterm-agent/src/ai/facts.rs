@@ -232,6 +232,30 @@ pub struct CliAccounts {
     pub enrolled: usize,
     /// The rows whose login is due for renewal or has ended (`accounts::renew_due`), by label.
     pub due: Vec<String>,
+    /// The pool's on-disk store (`accounts::Store::at_for`), when loaded.
+    pub store: Option<crate::harness::accounts::Store>,
+    /// The serving row's label, when the pool selects one.
+    pub serving_label: Option<String>,
+    /// What a default-home run sets for the serving row (`accounts::login_env_for`), when the
+    /// pool selects one.
+    pub serving_login: Option<(&'static str, Option<String>)>,
+    /// The serving row's login file on disk and when the vendor last wrote it, when `serving_login`
+    /// is `Some`.
+    pub serving_login_file: Option<(PathBuf, Option<i64>)>,
+    /// `accounts::LoginState::as_str` on the serving row, where it renews, or `"expired"` when the
+    /// pool store recorded a login wall on a non-renewing serving row.
+    pub state: Option<&'static str>,
+    /// The serving row's forecast end, when due.
+    pub renew_by: Option<i64>,
+    /// The serving row's usage limit end from the pool store, when limited.
+    pub limited_until: Option<i64>,
+    /// The newest turn served under the serving row.
+    pub served_at: Option<i64>,
+    /// When a renewal last bound the serving row, in unix seconds.
+    pub renewed_at: Option<i64>,
+    /// Another row with an email that is signed out or not enrolled when the serving row is
+    /// limited or signed out.
+    pub next_sign_in: Option<String>,
 }
 
 /// What the doctor reads, gathered once for every CLI.
@@ -464,13 +488,27 @@ pub fn codex_keyring(home: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// A CLI's stored login file under `dir` (`stat`ed, never opened), with its write time.
+fn store_file_in(dir: &Path, stores: &[&str]) -> Option<(PathBuf, Option<i64>)> {
+    stores
+        .iter()
+        .map(|rel| dir.join(rel))
+        .find(|p| p.is_file())
+        .map(|p| {
+            let w = mtime(&p);
+            (p, w)
+        })
+}
+
 /// The end of Codex's usage limit from its own `rate_limits` readings
 /// ([`super::codex_limits::home_pick`]): the latest reset ahead of a window at 100%, read only
-/// from a reading no older than [`super::codex_limits::FRESH_S`].
-fn codex_limit(home: &Path, now: i64) -> Option<i64> {
+/// from a reading no older than [`super::codex_limits::FRESH_S`]. A reading older than `since` is
+/// ignored.
+fn codex_limit(home: &Path, since: Option<i64>, now: i64) -> Option<i64> {
     use super::codex_limits as limits;
     let pick = limits::home_pick(home, now)?;
-    if now.saturating_sub(pick.newest) > limits::FRESH_S {
+    if now.saturating_sub(pick.newest) > limits::FRESH_S || since.is_some_and(|at| pick.newest < at)
+    {
         return None;
     }
     pick.windows
@@ -506,16 +544,7 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
     } else {
         None
     };
-    let login_file = home.as_ref().ok().and_then(|h| {
-        c.stores
-            .iter()
-            .map(|rel| h.join(rel))
-            .find(|p| p.is_file())
-            .map(|p| {
-                let w = mtime(&p);
-                (p, w)
-            })
-    });
+    let home_login_file = home.as_ref().ok().and_then(|h| store_file_in(h, c.stores));
     let default_home = c
         .home
         .var
@@ -535,9 +564,29 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
     };
     let is_codex = c.id == super::connector::CODEX.id;
     let hidden_store = is_codex && home.as_ref().is_ok_and(|h| codex_keyring(h));
-    let limited_until = match (is_codex, home.as_ref()) {
-        (true, Ok(h)) => codex_limit(h, m.now),
-        _ => accounts.as_ref().and_then(|a| a.limited_until),
+    let pool = if default_home {
+        crate::harness::accounts::Cli::parse(c.id).and_then(|cli| pool_for(m, cli))
+    } else {
+        None
+    };
+    let login_file = match pool.as_ref().filter(|p| p.serving_login.is_some()) {
+        Some(p) => p.serving_login_file.clone(),
+        None => home_login_file,
+    };
+    let limited_until = match pool.as_ref().filter(|p| p.serving_login.is_some()) {
+        Some(p) => p.limited_until.or_else(|| {
+            if is_codex && p.enrolled <= 1 {
+                home.as_ref()
+                    .ok()
+                    .and_then(|h| codex_limit(h, p.renewed_at, m.now))
+            } else {
+                None
+            }
+        }),
+        None => match (is_codex, home.as_ref()) {
+            (true, Ok(h)) => codex_limit(h, None, m.now),
+            _ => accounts.as_ref().and_then(|a| a.limited_until),
+        },
     };
     Facts {
         connector: c,
@@ -559,7 +608,7 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
             .copied()
             .filter(|k| (m.var)(k).is_some_and(|v| !v.is_empty()))
             .collect(),
-        pool: crate::harness::accounts::Cli::parse(c.id).and_then(|cli| pool_for(m, cli)),
+        pool,
     }
 }
 
@@ -568,16 +617,13 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
 /// and for Claude Code, whose pool is [`ClaudeAccounts`].
 #[must_use]
 pub fn pool_for(m: &Machine<'_>, cli: crate::harness::accounts::Cli) -> Option<CliAccounts> {
-    use crate::harness::accounts::{self, Cli};
+    use crate::harness::accounts::{self, Class, Cli, Condition, LoginState, Mode};
     if cli == Cli::Claude {
         return None;
     }
     cli.accounts().signin.as_ref()?;
-    let roster_path = m
-        .roster
-        .as_ref()?
-        .parent()?
-        .join(cli.accounts().roster_file);
+    let config_dir = m.roster.as_ref()?.parent()?;
+    let roster_path = config_dir.join(cli.accounts().roster_file);
     if !roster_path.is_file() {
         return None;
     }
@@ -594,14 +640,16 @@ pub fn pool_for(m: &Machine<'_>, cli: crate::harness::accounts::Cli) -> Option<C
     let cache = match (m.harness_state.as_deref(), m.home.as_deref()) {
         (Some(state), Some(home)) => {
             let store = accounts::Store::at_for(state, cli, home);
-            store
-                .load(m.now)
-                .and_then(|(state, _)| store.load_logins(m.now).map(|(logins, _)| (state, logins)))
+            store.load(m.now).and_then(|(state, _)| {
+                store
+                    .load_logins(m.now)
+                    .map(|(logins, _)| (home, store, state, logins))
+            })
         }
         _ => Err("account store is unavailable".to_owned()),
     };
-    let (state, logins) = match cache {
-        Ok(cache) => cache,
+    let (user_home, store, state, logins) = match cache {
+        Ok(loaded) => loaded,
         Err(why) => {
             return Some(CliAccounts {
                 roster: roster_path,
@@ -610,27 +658,162 @@ pub fn pool_for(m: &Machine<'_>, cli: crate::harness::accounts::Cli) -> Option<C
             });
         }
     };
+    let c = cli.connector();
+    let default_dir = user_home.join(cli.accounts().default_home);
+    let default_login = store_file_in(&default_dir, c.stores);
     let bound = accounts::bound(&roster, &logins);
-    let enrolled = accounts::enrolled_for(cli, &bound);
+    let mut enrolled_here = accounts::enrolled_for(cli, &bound);
+    if default_login.is_none() {
+        for r in bound.rows.iter().filter(|r| r.dir.is_none()) {
+            enrolled_here.remove(&r.label);
+        }
+    }
     let with_email = || bound.rows.iter().filter(|r| r.email.is_some());
-    let due = accounts::renew_due(&bound, &logins, &state, &enrolled, m.now);
+    let due: Vec<String> = bound
+        .rows
+        .iter()
+        .filter(|row| row.email.is_some() && enrolled_here.contains(&row.label))
+        .filter(|row| {
+            matches!(
+                accounts::login_state(row, &logins, &state, m.now),
+                LoginState::Expired | LoginState::Due { .. }
+            )
+        })
+        .map(|row| row.label.clone())
+        .collect();
     let next = with_email()
-        .find(|r| !enrolled.contains(&r.label))
+        .find(|r| !enrolled_here.contains(&r.label))
         .map(|r| r.label.clone())
         .or_else(|| due.first().cloned())
         .or_else(|| with_email().next().map(|r| r.label.clone()));
-    Some(CliAccounts {
+    let enrolled_count = bound
+        .rows
+        .iter()
+        .filter(|r| enrolled_here.contains(&r.label))
+        .count();
+    let default_home = c
+        .home
+        .var
+        .is_none_or(|v| (m.var)(v).is_none_or(|s| s.is_empty()));
+    let hidden_store = cli == Cli::Codex && codex_keyring(&default_dir);
+    let mode =
+        crate::supervise::config::SupervisorConfig::from_path(Some(&config_dir.join("aterm.toml")))
+            .0
+            .accounts;
+    let row_cond =
+        |r: &accounts::Row| accounts::condition(r, &state, enrolled_here.contains(&r.label), m.now);
+    let row_present =
+        |r: &accounts::Row| !matches!(row_cond(r), Condition::NotEnrolled | Condition::SignedOut);
+    let row_ready = |r: &accounts::Row| {
+        matches!(
+            row_cond(r),
+            Condition::Usable | Condition::Low | Condition::Unseen
+        )
+    };
+    let serving =
+        if !bound.rows.is_empty() && cli.accounts().measured && default_home && !hidden_store {
+            let active = state.active.as_deref().and_then(|label| bound.row(label));
+            if mode == Mode::Off {
+                active.filter(|r| state.pinned && row_present(r))
+            } else {
+                let own = bound
+                    .row_for_login(None)
+                    .or_else(|| {
+                        bound
+                            .rows
+                            .iter()
+                            .find(|r| r.was.iter().any(Option::is_none))
+                    })
+                    .or_else(|| bound.rows.first());
+                let first_in_class = |pred: &dyn Fn(&accounts::Row) -> bool| {
+                    [Class::Dedicated, Class::Shared]
+                        .into_iter()
+                        .find_map(|cls| {
+                            bound
+                                .rows
+                                .iter()
+                                .filter(|r| r.class == cls)
+                                .find(|r| pred(r))
+                        })
+                };
+                active
+                    .filter(|r| (state.pinned && row_present(r)) || row_cond(r).fresh())
+                    .or_else(|| own.filter(|r| row_cond(r).fresh()))
+                    .or_else(|| first_in_class(&|r| row_cond(r).fresh()))
+                    .or_else(|| active.filter(|r| row_ready(r)))
+                    .or_else(|| own.filter(|r| row_ready(r)))
+                    .or_else(|| first_in_class(&row_ready))
+                    .or_else(|| bound.rows.iter().find(|r| row_present(r)))
+                    .or(own)
+            }
+        } else {
+            None
+        };
+    let mut out = CliAccounts {
         roster: roster_path,
         refused: None,
         next,
         rows: bound.rows.len(),
-        enrolled: bound
-            .rows
-            .iter()
-            .filter(|r| enrolled.contains(&r.label))
-            .count(),
+        enrolled: enrolled_count,
         due,
-    })
+        store: Some(store),
+        ..CliAccounts::default()
+    };
+    if let Some(row) = serving {
+        out.serving_label = Some(row.label.clone());
+        out.serving_login = Some(accounts::login_env_for(cli, row));
+        out.serving_login_file = match row.dir.as_deref().filter(|d| !d.is_empty()) {
+            Some(dir) => store_file_in(Path::new(dir), c.stores),
+            None => default_login,
+        };
+        let cond = row_cond(row);
+        out.limited_until = match cond {
+            Condition::Limited { until } => Some(until),
+            _ => None,
+        };
+        let signed_out = matches!(cond, Condition::SignedOut | Condition::NotEnrolled);
+        if out.limited_until.is_some() || signed_out {
+            out.next_sign_in = [Class::Dedicated, Class::Shared]
+                .into_iter()
+                .find_map(|cls| {
+                    bound
+                        .rows
+                        .iter()
+                        .filter(|r| {
+                            r.class == cls
+                                && r.label != row.label
+                                && r.email.is_some()
+                                && matches!(
+                                    row_cond(r),
+                                    Condition::NotEnrolled | Condition::SignedOut
+                                )
+                                && !state
+                                    .accounts
+                                    .get(&r.label)
+                                    .is_some_and(|a| a.limited_until(m.now).is_some())
+                        })
+                        .map(|r| r.label.clone())
+                        .next()
+                })
+                .or_else(|| (signed_out && row.email.is_some()).then(|| row.label.clone()));
+            if let Some(next) = &out.next_sign_in {
+                out.next = Some(next.clone());
+            }
+        }
+        let binding = logins.get(&row.label);
+        out.served_at = binding.and_then(|b| b.served_at);
+        out.renewed_at = binding.and_then(|b| b.renewed_at);
+        if row.email.is_some() {
+            let ls = accounts::login_state(row, &logins, &state, m.now);
+            if let LoginState::Due { by } = ls {
+                out.renew_by = Some(by);
+            }
+            out.state = Some(ls.as_str());
+        } else if cond == Condition::SignedOut {
+            out.state = Some("expired");
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]

@@ -13,98 +13,77 @@ use crate::stats_plan::{
 
 const EPS: f64 = 1e-9;
 
-/// 10:42:10 on the mockups' day, unix ms: a 10 s column opens.
+/// 10:42:10 on the mockups' day, unix ms: a second (and a 10 s column) opens.
 const OPEN: i64 = 1_792_000_800_000 + 42 * 60_000 + 10_000;
 
+/// Full's glide runs with the wall clock for a slot of the snapshot's grid from the reading,
+/// wherever in its slot the reading fell, and holds there.
 #[test]
-fn the_open_column_runs_with_the_wall_clock() {
-    assert_eq!(open_start_ms(OPEN + 7_000, 10), OPEN);
-    assert_eq!(open_start_ms(OPEN, 10), OPEN);
-    // A reading on the column's first instant: nothing of it has run, then half, then all.
-    assert!(open_frac(OPEN, OPEN, 10).abs() < EPS);
-    assert!((open_frac(OPEN, OPEN + 5_000, 10) - 0.5).abs() < EPS);
-    assert!((open_frac(OPEN, OPEN + 10_000, 10) - 1.0).abs() < EPS);
-    // Past its end with no reading to open the next: the strip waits full, it does not run on.
-    assert!((open_frac(OPEN, OPEN + 25_000, 10) - 1.0).abs() < EPS);
-    // A reading 7 s into its column already holds 0.7 of it; a clock behind the reading counts
-    // as the reading's, so the strips never glide backward.
-    assert!((open_frac(OPEN + 7_000, OPEN + 7_000, 10) - 0.7).abs() < EPS);
-    assert!((open_frac(OPEN + 7_000, OPEN, 10) - 0.7).abs() < EPS);
-    // The other periods align to the wall clock too: 10:42:10 is 10 s into a 20 s column.
-    assert!((open_frac(OPEN, OPEN, 20) - 0.5).abs() < EPS);
-    assert!((open_frac(OPEN, OPEN + 5_000, 30) - 0.5).abs() < EPS);
+fn the_glide_runs_a_slot_from_its_reading() {
+    let secs = SlotGrid::SECONDS;
+    assert_eq!(glide_end_ms(OPEN + 500, secs), OPEN + 1_500);
+    assert_eq!(glide_end_ms(OPEN + 900, secs), OPEN + 1_900);
+    assert_eq!(glide_end_ms(OPEN, secs), OPEN + 1_000);
+    // On the snapshot's grid, its slots starting half a second in: a slot's length still.
+    let half = SlotGrid {
+        origin_ms: 500,
+        ..secs
+    };
+    assert_eq!(glide_end_ms(OPEN + 900, half), OPEN + 1_900);
+    // From a reading half a second into its slot: nothing of it has run, then half, then all.
+    let (at, end) = (OPEN + 500, OPEN + 1_500);
+    assert!(glide_frac(at, at, end).abs() < EPS);
+    assert!((glide_frac(at, at + 500, end) - 0.5).abs() < EPS);
+    assert!((glide_frac(at, end, end) - 1.0).abs() < EPS);
+    // Past its end with no reading to open the next: the band waits in its slots.
+    assert!((glide_frac(at, end + 15_000, end) - 1.0).abs() < EPS);
+    // A clock behind the reading counts as the reading's, so the band never glides backward.
+    assert!(glide_frac(at, at - 300, end).abs() < EPS);
+    // A reading with nothing of its slot left has run out.
+    assert!((glide_frac(end, end, end) - 1.0).abs() < EPS);
 }
 
+/// A reading moves the fine band by the time it opened (§3.4 of the now-left design): a 1 s
+/// reading on 2 s boxes moves half a box, two seconds a whole one, and more never more than
+/// one. What it still lags is the part not yet run in whole pixels, rounded up: all of it as the
+/// move starts, none only once it has run.
 #[test]
-fn columns_slide_right_of_their_slots_by_the_part_not_yet_run() {
-    // Five 3-wide cells on a 4 pitch from x = 10: the strip ends at 29, which is now.
-    let (x0, pitch, cell, n) = (10.0, 4.0, 3.0, 5);
-    // Run out: every column in its slot, the one before the oldest outside.
-    assert_eq!(
-        column_xs(x0, pitch, cell, n, 1.0),
-        vec![
-            None,
-            Some(10.0),
-            Some(14.0),
-            Some(18.0),
-            Some(22.0),
-            Some(26.0)
-        ]
-    );
-    // Half run: half a pitch right; the open column shows its first half up to now, and the
-    // one before the oldest slides in at the left.
-    assert_eq!(
-        column_xs(x0, pitch, cell, n, 0.5),
-        vec![
-            Some(8.0),
-            Some(12.0),
-            Some(16.0),
-            Some(20.0),
-            Some(24.0),
-            Some(28.0)
-        ]
-    );
-    // Just opened: a whole pitch right, so the open column is not on the strip yet and the
-    // newest closed one stands in the last slot.
-    assert_eq!(
-        column_xs(x0, pitch, cell, n, 0.0),
-        vec![
-            Some(10.0),
-            Some(14.0),
-            Some(18.0),
-            Some(22.0),
-            Some(26.0),
-            None
-        ]
-    );
-    // Out-of-range glides stand in the nearest end.
-    assert_eq!(
-        column_xs(x0, pitch, cell, n, 7.0),
-        column_xs(x0, pitch, cell, n, 1.0)
-    );
-    assert_eq!(
-        column_xs(x0, pitch, cell, n, -1.0),
-        column_xs(x0, pitch, cell, n, 0.0)
-    );
-}
-
-#[test]
-fn the_gridlines_stand_at_wall_clock_minutes() {
-    // At 10:42:10 the open 10 s column is the 11th of n = 60 + 1; 10:42:00 opened one column
-    // earlier and 10:41:00 seven earlier.
-    let minutes = minute_columns(OPEN, 10, 60);
-    assert!(minutes.contains(&59), "{minutes:?}");
-    assert!(minutes.contains(&53), "{minutes:?}");
-    assert!(minutes.windows(2).all(|w| w[1] - w[0] == 6), "{minutes:?}");
-    assert_eq!(minutes.len(), 10, "{minutes:?}");
-    // A column opening on the minute is itself a minute.
-    assert_eq!(minute_columns(OPEN - 10_000, 10, 60).last(), Some(&60));
-    // 30 s columns: every other one.
-    assert!(
-        minute_columns(OPEN - 10_000, 30, 20)
-            .iter()
-            .all(|k| k.is_multiple_of(2))
-    );
+fn a_reading_moves_the_fine_band_by_the_time_it_opened() {
+    let band = FineBand {
+        box_px: 8.0,
+        period_ms: 2_000,
+    };
+    assert_eq!(band.step_px(1_000), 4.0);
+    assert_eq!(band.step_px(2_000), 8.0);
+    assert_eq!(band.step_px(5_000), 8.0);
+    assert_eq!(band.step_px(0), 0.0);
+    assert_eq!(band.step_px(-1_000), 0.0);
+    // A pitch as laid out, before rounding: the step is whole pixels.
+    let laid = FineBand {
+        box_px: 4.6,
+        period_ms: 2_000,
+    };
+    assert_eq!(laid.step_px(1_000), 2.0);
+    assert_eq!(FineBand::default().step_px(1_000), 0.0);
+    // The faster of two bands sets a card's frames.
+    let slow = FineBand {
+        box_px: 8.0,
+        period_ms: 4_000,
+    };
+    assert_eq!(band.faster(slow), band);
+    assert_eq!(slow.faster(band), band);
+    assert_eq!(FineBand::default().faster(band), band);
+    // What it lags.
+    assert_eq!(lag_px(4.0, 0.0), 4.0);
+    assert_eq!(lag_px(4.0, 0.25), 3.0);
+    assert_eq!(lag_px(4.0, 0.3), 3.0);
+    assert_eq!(lag_px(4.0, 0.99), 1.0);
+    assert_eq!(lag_px(4.0, 1.0), 0.0);
+    assert_eq!(lag_px(4.0, 7.0), 0.0);
+    assert_eq!(lag_px(4.0, -1.0), 4.0);
+    for step in [0.0, -2.0, f64::NAN] {
+        assert_eq!(lag_px(step, 0.5), 0.0, "{step}");
+    }
 }
 
 #[test]
@@ -145,19 +124,34 @@ fn a_reading_speaks_for_three_of_the_slower_cadence() {
 
 #[test]
 fn the_glide_steps_a_whole_pixel_within_its_bounds() {
-    // A Full strip at 1119 pt 2x, 2 px a second: a whole pixel every 500 ms, every other frame
-    // of the grid; at 1x, 1 px a second: a pixel a second.
+    // A band gliding 2 px a second: a whole pixel every 500 ms, every other frame of the grid;
+    // 1 px a second: a pixel a second.
     assert_eq!(glide_step(2.0), Duration::from_millis(500));
     assert_eq!(glide_step(1.0), Duration::from_secs(1));
     assert_eq!(glide_step(4.0), FRAME);
-    // The slowest strip drawn (Full slim at 1x: 20 cells of 4 pt over ten minutes) still steps
-    // a whole pixel, never a fraction of one.
-    let slim = 20.0 * 4.0 / 600.0;
+    // A slow band (2 px over the 15 s of a slot) still steps a whole pixel, never a fraction of
+    // one.
+    let slim = 2.0 / 15.0;
     assert!(
         (glide_step(slim).as_secs_f64() * slim - 1.0).abs() < 1e-3,
         "{:?}",
         glide_step(slim)
     );
+    // Whole milliseconds, rounded up: a band gliding 3 px a second steps every 334 ms, never
+    // 333, so no step of its clock moves it under a pixel (a 299 ms step of a 3 px glide once
+    // asked a frame that drew nothing new, the review of 2026-10-26).
+    assert_eq!(glide_step(3.0), Duration::from_millis(334));
+    for tenths in 1..=400_u32 {
+        let px_per_s = f64::from(tenths) / 10.0;
+        let step = glide_step(px_per_s);
+        assert_eq!(step.subsec_nanos() % 1_000_000, 0, "{px_per_s}: {step:?}");
+        assert!(
+            step == GLIDE_STEP_MIN
+                || step == GLIDE_STEP_MAX
+                || step.as_secs_f64() * px_per_s >= GLIDE_QUANTUM_PX,
+            "{px_per_s} px/s steps {step:?}"
+        );
+    }
     // Fast strips are held to the grid's four frames a second, slow ones to one each 10 s.
     assert_eq!(glide_step(100.0), GLIDE_STEP_MIN);
     assert_eq!(GLIDE_STEP_MIN, FRAME);
@@ -168,6 +162,8 @@ fn the_glide_steps_a_whole_pixel_within_its_bounds() {
     }
 }
 
+/// A reading that landed at `landed`, whose Full strips glide a second's step from `OPEN` to
+/// `OPEN + 4 s` in 250 ms steps.
 fn facts(landed: Instant, motion: bool, beat: bool) -> LiveFacts {
     LiveFacts {
         landed: Some(landed),
@@ -175,11 +171,21 @@ fn facts(landed: Instant, motion: bool, beat: bool) -> LiveFacts {
         motion,
         beat,
         tween: false,
+        needle: None,
+        drawn: None,
         flow: Flow::Glide {
+            opened_ms: 1_000,
+            from_ms: OPEN,
+            end_ms: OPEN + 4_000,
             step: Duration::from_millis(250),
-            end_ms: None,
         },
+        steam: false,
     }
+}
+
+/// How far a frame's glide or slide has run, `None` with every box in its slot.
+fn ran(live: DeckLive) -> Option<f64> {
+    live.flow.map(|flow| flow.ran)
 }
 
 /// `t` on the wall clock when `t0` is `ms0`.
@@ -193,11 +199,8 @@ fn a_fresh_reading_beats_once_and_the_strips_glide() {
     let ms0 = OPEN + 1_234;
     let f = facts(t0, true, true);
     let at = f.live(t0, ms0);
-    assert_eq!(
-        at.glide_ms,
-        Some(OPEN + 1_000),
-        "quantized to the glide's step"
-    );
+    assert_eq!(ran(at), Some(0.25), "quantized to the glide's step");
+    assert_eq!(at.flow.map(|flow| flow.opened_ms), Some(1_000));
     assert_eq!(at.beat, beat_phase(0));
     assert!(at.fresh);
     // Inside a frame of the grid nothing moves: the edge stands as at the frame's moment.
@@ -206,13 +209,13 @@ fn a_fresh_reading_beats_once_and_the_strips_glide() {
     // Each frame of the grid beats wider and fainter, and the glide moves with it.
     let one = f.live(t0 + FRAME, ms0 + 250);
     assert_eq!(one.beat, beat_phase(1));
-    assert_eq!(one.glide_ms, Some(OPEN + 1_250));
+    assert_eq!(ran(one), Some(0.3125));
     assert!(beat_phase(1) > beat_phase(0) && beat_phase(2) > beat_phase(1));
     // The beat rings for its frames and ends; the strips glide on.
     assert_eq!(FRAME * BEAT_FRAMES, ms(750));
     let after = f.live(t0 + FRAME * BEAT_FRAMES, ms0 + 750);
     assert_eq!(after.beat, None);
-    assert!(after.fresh && after.glide_ms == Some(OPEN + 1_750));
+    assert!(after.fresh && ran(after) == Some(0.4375));
     // The next frame is the grid's next.
     assert_eq!(f.next_change(t0, ms0), Some(t0 + FRAME));
     assert_eq!(f.next_change(t0 + ms(10), ms0 + 10), Some(t0 + FRAME));
@@ -240,70 +243,185 @@ fn a_fresh_reading_beats_once_and_the_strips_glide() {
     assert_eq!(f.live(now, wall(t0, ms0, now)), DeckLive::STALE);
 }
 
-/// Once the open column has run out, every column stands in its slot until a reading opens the
-/// next: the glide holds and asks no frame that would draw the same strips.
+/// Once the glide has run its slot from the reading, every box stands in its slot until a reading
+/// opens the next: the glide holds and asks no frame that would draw the same strips. Its steps
+/// count from the reading, which landed 150 ms after it was read.
 #[test]
-fn the_glide_holds_at_the_open_columns_end() {
+fn the_glide_holds_at_its_end() {
     let t0 = Instant::now();
-    let ms0 = OPEN + 9_400;
-    let end = OPEN + 10_000;
+    let (from, ms0) = (OPEN + 9_250, OPEN + 9_400);
+    let end = glide_end_ms(from, SlotGrid::SECONDS);
     let f = LiveFacts {
         flow: Flow::Glide {
+            opened_ms: 1_000,
+            from_ms: from,
+            end_ms: end,
             step: FRAME,
-            end_ms: Some(end),
         },
         ..facts(t0, true, false)
     };
     let ms = Duration::from_millis;
-    assert_eq!(f.live(t0, ms0).glide_ms, Some(OPEN + 9_250));
-    assert_eq!(f.live(t0 + ms(500), ms0 + 500).glide_ms, Some(OPEN + 9_750));
-    assert_eq!(f.live(t0 + ms(750), ms0 + 750).glide_ms, Some(end));
-    assert_eq!(f.live(t0 + ms(1_000), ms0 + 1_000).glide_ms, Some(end));
-    assert!(
-        (open_frac(OPEN, end, 10) - 1.0).abs() < EPS,
-        "CONTROL: run out"
-    );
-    // Three frames to the end, then only the grey.
+    assert_eq!(ran(f.live(t0, ms0)), Some(0.0));
+    assert_eq!(ran(f.live(t0 + ms(500), ms0 + 500)), Some(0.5));
+    assert_eq!(ran(f.live(t0 + ms(750), ms0 + 750)), Some(0.75));
+    assert_eq!(ran(f.live(t0 + ms(1_000), ms0 + 1_000)), None);
+    assert_eq!(ran(f.live(t0 + ms(1_250), ms0 + 1_250)), None);
+    // Four frames to the end, then only the grey.
     assert_eq!(f.next_change(t0, ms0), Some(t0 + FRAME));
     assert_eq!(
-        f.next_change(t0 + FRAME * 2, ms0 + 500),
-        Some(t0 + FRAME * 3)
+        f.next_change(t0 + FRAME * 3, ms0 + 750),
+        Some(t0 + FRAME * 4)
     );
     assert_eq!(
-        f.next_change(t0 + FRAME * 3, ms0 + 750),
+        f.next_change(t0 + FRAME * 4, ms0 + 1_000),
         Some(t0 + f.stale_after),
-        "past the column's end nothing glides"
+        "past the glide's end nothing glides"
     );
-    // Unbounded, the same clock would glide on.
+    // CONTROL: further off, the same clock would glide on.
     let on = LiveFacts {
         flow: Flow::Glide {
+            opened_ms: 1_000,
+            from_ms: from,
+            end_ms: end + 1_000,
             step: FRAME,
-            end_ms: None,
         },
         ..f
     };
     assert_eq!(
-        on.next_change(t0 + FRAME * 3, ms0 + 750),
-        Some(t0 + FRAME * 4)
+        on.next_change(t0 + FRAME * 4, ms0 + 1_000),
+        Some(t0 + FRAME * 5)
     );
 }
 
-/// A reading that opens a new second slides a Folded strip one pitch left over the frames of
-/// the grid after it, the beat's own: the reading's frame brings the newest slot a quarter in,
-/// and 750 ms on it has come in and nothing moves until the next reading. A reading that opens
-/// no new second (the lens's half-second cadence) moves nothing.
+/// The most a frame moves a Full fine band of `box_px` device px on boxes of `period_ms`, under
+/// readings landing each `cadence_ms` (each opening as much), the first `into_ms` into its slot,
+/// when each reading's glide is `flow_of` it: the band a frame draws is the steps landed so far
+/// less the lag left of the glide; a reading moves it what its predecessor's glide had left.
+/// Panics on a frame that moves it left.
+fn biggest_glide_move(
+    (box_px, period_ms): (f64, i64),
+    cadence_ms: i64,
+    into_ms: i64,
+    flow_of: impl Fn(FineBand, Opened) -> Flow,
+) -> f64 {
+    let band = FineBand { box_px, period_ms };
+    let t0 = Instant::now();
+    let ms0 = OPEN + into_ms;
+    let cadence = Duration::from_millis(u64::try_from(cadence_ms).unwrap_or(0));
+    let (mut landed_px, mut drawn, mut biggest) = (0.0, 0.0, 0.0_f64);
+    for r in 0..4_u32 {
+        let landed = t0 + cadence * r;
+        let opened = Opened {
+            at_ms: wall(t0, ms0, landed),
+            ms: cadence_ms,
+            landed,
+        };
+        let f = LiveFacts {
+            stale_after: Duration::from_secs(10),
+            flow: flow_of(band, opened),
+            ..facts(landed, true, false)
+        };
+        landed_px += band.step_px(cadence_ms);
+        let at = |t: Instant| {
+            let lag = f
+                .live(t, wall(t0, ms0, t))
+                .flow
+                .map_or(0.0, |flow| lag_px(band.step_px(flow.opened_ms), flow.ran));
+            landed_px - lag
+        };
+        let mut now = landed;
+        let mut frames = vec![landed];
+        while let Some(next) = f.next_change(now, wall(t0, ms0, now)) {
+            if next >= landed + cadence {
+                break;
+            }
+            frames.push(next);
+            now = next;
+        }
+        for t in frames {
+            let x = at(t);
+            assert!(
+                x >= drawn,
+                "{box_px} px, {cadence_ms} ms, {into_ms} ms in: left at {:?}",
+                t - t0
+            );
+            biggest = biggest.max(x - drawn);
+            drawn = x;
+        }
+    }
+    biggest
+}
+
+/// Full's glide spreads each reading's step over a slot's length (the review of 2026-10-26):
+/// wherever in its second a reading lands, no frame moves the band half a box or more, which the
+/// eye reads either way, or backward, on the 1 s boxes the owner's blocks lay (a whole box a
+/// reading a second) as on the 2 s boxes before them (half a box). Gliding to the reading's
+/// slot's end instead packed the step into what was left of the slot: for a reading 900 ms into
+/// its second, half a box or more in a frame.
+#[test]
+fn no_glide_frame_moves_the_band_half_a_box() {
+    let to_slot_end = |band: FineBand, opened: Opened| {
+        let secs = SlotGrid::SECONDS;
+        let end = (secs.slot(opened.at_ms) + 1) * secs.slot_ms;
+        let step = band.step_px(opened.ms);
+        let run_s = (end - opened.at_ms) as f64 / 1000.0;
+        Flow::Glide {
+            opened_ms: opened.ms,
+            from_ms: opened.at_ms,
+            end_ms: end,
+            step: glide_step(step / run_s),
+        }
+    };
+    let mut checked = 0;
+    for period_ms in [1_000, 2_000] {
+        for box_px in [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 12.0, 16.0] {
+            let boxes = (box_px, period_ms);
+            for cadence_ms in [1_000, 2_000] {
+                for into_ms in [100, 300, 500, 700, 900] {
+                    let biggest = biggest_glide_move(boxes, cadence_ms, into_ms, |band, opened| {
+                        Flow::of((band, FineBand::default()), opened, SlotGrid::SECONDS)
+                    });
+                    assert!(
+                        biggest > 0.0 && biggest < box_px / 2.0,
+                        "{box_px} px boxes of {period_ms} ms, a reading each {cadence_ms} ms, \
+                         {into_ms} ms into its second: a frame moved {biggest} px"
+                    );
+                    checked += 1;
+                }
+            }
+            // CONTROL: the glide to the slot's end moves a late reading's step in one frame.
+            assert!(
+                biggest_glide_move(boxes, 1_000, 900, to_slot_end) >= box_px / 2.0 - 0.5,
+                "{box_px} px"
+            );
+            assert!(
+                biggest_glide_move(boxes, 2_000, 900, to_slot_end) >= box_px,
+                "{box_px} px"
+            );
+        }
+    }
+    assert_eq!(checked, 160);
+}
+
+/// A reading that opens a new second slides a Folded strip's fine band its step right over the
+/// frames of the grid after it, the beat's own: the reading's frame carries it a quarter of the
+/// way, and 750 ms on it has come in and nothing moves until the next reading.
 #[test]
 fn a_reading_that_opens_a_second_slides_the_strip_in_on_the_beats_frames() {
     let t0 = Instant::now();
     let ms0 = OPEN + 1_234;
     let slide = |frames, beat| LiveFacts {
-        flow: Flow::Slide { frames },
+        flow: Flow::Slide {
+            opened_ms: 1_000,
+            landed: t0,
+            frames,
+        },
         ..facts(t0, true, beat)
     };
     let f = slide(slide_frames(6.0), true);
     let at = |k: u32| f.live(t0 + FRAME * k, ms0 + 250 * i64::from(k));
     assert_eq!(
-        [0, 1, 2, 3, 4].map(|k| at(k).slide),
+        [0, 1, 2, 3, 4].map(|k| ran(at(k))),
         [Some(0.25), Some(0.5), Some(0.75), None, None]
     );
     assert!(
@@ -311,8 +429,8 @@ fn a_reading_that_opens_a_second_slides_the_strip_in_on_the_beats_frames() {
         "on the beat's frames"
     );
     assert!(
-        (0..5).all(|k| at(k).glide_ms.is_none()),
-        "a Folded strip never glides with the clock"
+        (0..3).all(|k| at(k).flow.is_some_and(|flow| flow.opened_ms == 1_000)),
+        "the reading's step"
     );
     // Its frames are the beat's: four, then only the grey.
     let mut now = t0;
@@ -333,53 +451,56 @@ fn a_reading_that_opens_a_second_slides_the_strip_in_on_the_beats_frames() {
         quiet.next_change(t0 + FRAME * 3, ms0 + 750),
         Some(t0 + quiet.stale_after)
     );
-    // A reading in the same second as the last: nothing slides, nothing is asked but the grey.
-    let none = slide(0, false);
-    assert!((0..5).all(|k| none.live(t0 + FRAME * k, ms0).slide.is_none()));
+    // A band whose reading moved it nothing: nothing slides, nothing is asked but the grey.
+    let none = LiveFacts {
+        flow: Flow::None,
+        ..quiet
+    };
+    assert!((0..5).all(|k| none.live(t0 + FRAME * k, ms0).flow.is_none()));
     assert_eq!(none.next_change(t0, ms0), Some(t0 + none.stale_after));
     // Without motion the strip stands in its slots.
     let still = LiveFacts { motion: false, ..f };
     assert_eq!(still.live(t0, ms0), DeckLive::STILL);
 }
 
-/// Each frame of a slide moves the strip at least a whole device pixel and under half a pitch,
-/// so it reads as a step left even over a strip of one heat step, where a move of half a pitch
-/// or more reads either way; and it takes at most the grid's four frames.
+/// Each frame of a slide moves the fine band at least a whole device pixel and, on boxes of 3 px
+/// or more, under half a box, so it reads as a step right even over a strip of one heat step,
+/// where a move of half a box or more reads either way; and it takes at most the grid's four
+/// frames, whatever time the reading opened.
 #[test]
-fn every_frame_of_a_slide_moves_a_pixel_and_under_half_a_pitch() {
-    for pitch in 1..=24_u32 {
-        let p = f64::from(pitch);
-        let frames = slide_frames(p);
-        assert!(
-            (1..=SLIDE_FRAMES).contains(&frames) && frames <= pitch,
-            "{pitch} px: {frames}"
-        );
-        // The shift, device px, before the reading (the last reading's strip, one pitch right
-        // of the new one's slots) and at each of the slide's frames, as `column_xs` rounds it.
-        let mut shifts = vec![p];
-        shifts.extend((0..frames).map(|k| {
-            let f = slide_phase(k, frames).map_or(1.0, f64::from);
-            ((1.0 - f) * p).round()
-        }));
-        assert_eq!(shifts.last(), Some(&0.0), "{pitch} px: it comes in");
-        for w in shifts.windows(2) {
-            let moved = w[0] - w[1];
+fn every_frame_of_a_slide_moves_a_pixel_and_under_half_a_box() {
+    for box_px in 2..=24_u32 {
+        let b = f64::from(box_px);
+        let band = FineBand {
+            box_px: b,
+            period_ms: 2_000,
+        };
+        for opened in [1_000, 2_000, 3_000] {
+            let step = band.step_px(opened);
+            let frames = slide_frames(step);
+            let at = format!("{box_px} px boxes, {opened} ms opened, a {step} px step");
             assert!(
-                moved >= 1.0,
-                "{pitch} px: a frame moved {moved}: {shifts:?}"
+                (1..=SLIDE_FRAMES).contains(&frames) && f64::from(frames) <= step,
+                "{at}: {frames}"
             );
-            if pitch >= 3 {
+            // The lag before the reading (the last reading's band stood at rest, a step right of
+            // where the new reading's slots put the same time) and at each of the slide's frames.
+            let mut lags = vec![step];
+            lags.extend(
+                (0..frames).map(|k| lag_px(step, slide_phase(k, frames).map_or(1.0, f64::from))),
+            );
+            assert_eq!(lags.last(), Some(&0.0), "{at}: it comes in: {lags:?}");
+            for w in lags.windows(2) {
+                let moved = w[0] - w[1];
                 assert!(
-                    moved < p / 2.0,
-                    "{pitch} px: a frame moved {moved}: {shifts:?}"
+                    moved >= 1.0 && moved.fract() == 0.0,
+                    "{at}: a frame moved {moved}: {lags:?}"
                 );
+                if box_px >= 3 {
+                    assert!(moved < b / 2.0, "{at}: a frame moved {moved}: {lags:?}");
+                }
             }
         }
-    }
-    // The column positions the painter draws are the same whole pixels.
-    for f in [0.25, 0.5, 0.75] {
-        let xs = column_xs(10.0, 6.0, 4.0, 5, f);
-        assert!(xs.iter().flatten().all(|x| x.fract() == 0.0), "{f}: {xs:?}");
     }
     for p in [f64::NAN, 0.0, -3.0, 0.5] {
         assert_eq!(slide_frames(p), 1, "{p}");
@@ -387,17 +508,19 @@ fn every_frame_of_a_slide_moves_a_pixel_and_under_half_a_pitch() {
 }
 
 #[test]
-fn a_reading_opens_a_second_once() {
+fn a_reading_opens_its_slots_once() {
     let secs = SlotGrid::SECONDS;
-    assert!(
-        !opened_slot(None, OPEN, secs),
-        "the first reading slides nothing"
+    assert_eq!(
+        opened_ms(None, OPEN, secs),
+        0,
+        "the first reading moves nothing"
     );
-    assert!(!opened_slot(Some(OPEN + 100), OPEN + 900, secs));
-    assert!(opened_slot(Some(OPEN + 900), OPEN + 1_100, secs));
-    assert!(opened_slot(Some(OPEN - 5_000), OPEN, secs));
-    assert!(
-        !opened_slot(Some(OPEN + 2_000), OPEN + 1_000, secs),
+    assert_eq!(opened_ms(Some(OPEN + 100), OPEN + 900, secs), 0);
+    assert_eq!(opened_ms(Some(OPEN + 900), OPEN + 1_100, secs), 1_000);
+    assert_eq!(opened_ms(Some(OPEN - 5_000), OPEN, secs), 5_000);
+    assert_eq!(
+        opened_ms(Some(OPEN + 2_000), OPEN + 1_000, secs),
+        0,
         "a clock set back"
     );
     // On the snapshot's grid, its slots starting half a second in: readings at 900 and 1100 ms
@@ -406,8 +529,8 @@ fn a_reading_opens_a_second_once() {
         origin_ms: 500,
         ..secs
     };
-    assert!(!opened_slot(Some(OPEN + 900), OPEN + 1_100, half));
-    assert!(opened_slot(Some(OPEN + 400), OPEN + 600, half));
+    assert_eq!(opened_ms(Some(OPEN + 900), OPEN + 1_100, half), 0);
+    assert_eq!(opened_ms(Some(OPEN + 400), OPEN + 600, half), 1_000);
     // The strip's slot is the grid's.
     assert_eq!(
         i64::from(crate::stats_plan::FOLD_SLOT_S) * 1000,
@@ -415,48 +538,164 @@ fn a_reading_opens_a_second_once() {
     );
 }
 
-/// How the strips move in [`frames_over`]: a Full glide of `px/s` on `period` s columns, or a
-/// Folded slide of a pitch of `px`.
+/// A reading that opens no slot (the lens's second in a second) leaves the strips' fine band to
+/// the reading before it, whose slide or glide runs on to its end; with the lens open the second
+/// reading of each slot once snapped the band to rest with the rest of its step undrawn (the
+/// review of 2026-10-26). The first reading, and one after a reading that opened nothing either,
+/// moves nothing.
+#[test]
+fn a_reading_that_opens_no_slot_lets_the_last_ones_move_run_on() {
+    let secs = SlotGrid::SECONDS;
+    let t0 = Instant::now();
+    let ms = Duration::from_millis;
+    let first = Opened::after(None, None, OPEN + 300, secs, t0);
+    assert_eq!(
+        first,
+        Opened {
+            at_ms: OPEN + 300,
+            ms: 0,
+            landed: t0
+        }
+    );
+    let opener = Opened::after(
+        Some(first),
+        Some(OPEN + 300),
+        OPEN + 1_250,
+        secs,
+        t0 + ms(950),
+    );
+    assert_eq!((opener.at_ms, opener.ms), (OPEN + 1_250, 1_000));
+    // Half a second on, in the same slot: the opener still moves the band.
+    let second = t0 + ms(1_450);
+    let same = Opened::after(Some(opener), Some(OPEN + 1_250), OPEN + 1_750, secs, second);
+    assert_eq!(same, opener);
+    // The next slot's reading takes over.
+    let next = Opened::after(
+        Some(same),
+        Some(OPEN + 1_750),
+        OPEN + 2_250,
+        secs,
+        t0 + ms(1_950),
+    );
+    assert_eq!((next.at_ms, next.ms), (OPEN + 2_250, 1_000));
+    // A clock set back opens nothing either: the band's last move has long run out.
+    assert_eq!(
+        Opened::after(Some(next), Some(OPEN + 2_250), OPEN + 1_000, secs, t0),
+        next
+    );
+
+    // A Full glide runs on through the second reading: its frames keep coming and each moves.
+    let band = FineBand {
+        box_px: 20.0,
+        period_ms: 2_000,
+    };
+    let glide = |landed: Instant| LiveFacts {
+        landed: Some(landed),
+        stale_after: STALE_FLOOR,
+        motion: true,
+        beat: true,
+        tween: false,
+        flow: Flow::of((band, FineBand::default()), opener, secs),
+        needle: None,
+        drawn: None,
+        steam: false,
+    };
+    let (by_opener, by_second) = (glide(opener.landed), glide(second));
+    let wall = |t: Instant| {
+        OPEN + 1_250 + 50 + i64::try_from((t - opener.landed).as_millis()).unwrap_or(0)
+    };
+    let at = second + FRAME;
+    assert_eq!(
+        by_second.live(at, wall(at)).flow,
+        by_opener.live(at, wall(at)).flow,
+        "the second reading draws the opener's glide"
+    );
+    assert!(by_second.live(second, wall(second)).flow.is_some());
+    // CONTROL: without the carry the second reading's own step is nothing, and the band stood.
+    let own = Opened::after(None, Some(OPEN + 1_250), OPEN + 1_750, secs, second);
+    assert_eq!(Flow::of((band, FineBand::default()), own, secs), Flow::None);
+
+    // A Folded slide runs on through it too, on the second reading's grid.
+    let slide = |landed: Instant| LiveFacts {
+        flow: Flow::of((FineBand::default(), band), opener, secs),
+        ..glide(landed)
+    };
+    let sliding = slide(second);
+    assert_eq!(
+        ran(sliding.live(second, OPEN)),
+        Some(0.75),
+        "half a second in, the slide's third frame"
+    );
+    assert_eq!(ran(sliding.live(second + FRAME, OPEN)), None);
+    assert_eq!(sliding.next_change(second, OPEN), Some(second + FRAME));
+}
+
+/// How the strips move in [`frames_over`]: a Full glide or a Folded slide of a fine band whose
+/// boxes are `px` wide on 2 s, as its card's layout says ([`Flow::of`]).
 #[derive(Clone, Copy, Debug)]
 enum Moves {
-    Glide(f64, u32),
+    Glide(f64),
     Slide(f64),
 }
 
-/// Frames the live edge asks of one window over `secs` seconds of readings every `cadence`,
-/// its strips moving as `moves` says, counting each reading's own frame, and the frames that
-/// would have drawn nothing new.
-fn frames_over(cadence: Duration, moves: Moves, beat: bool, secs: u32) -> (usize, Vec<String>) {
+/// A needle each reading swings across most of the dial, so it is in motion on every grid frame
+/// (Full's dial at 2×, at a 60 Hz window's effect interval).
+fn swinging(landed: Instant, r: u32) -> (Needle, View) {
+    let view = View {
+        px_per_deg: crate::stats_gauge::tip_px_per_deg(crate::stats_gauge::R_FACE, 2.0),
+        interval: Duration::from_micros(33_333),
+    };
+    let (from, to) = if r.is_multiple_of(2) {
+        (-120.0, 120.0)
+    } else {
+        (120.0, -120.0)
+    };
+    let rest = Needle::at_rest(landed, (from, 0.0));
+    let n = Needle::retarget(Some(rest), landed, Some((to, 0.0)), view.px_per_deg);
+    (n.expect("a needle"), view)
+}
+
+/// Frames the live edge's grid asks of one window over `secs` seconds of readings every
+/// `cadence`, its strips moving as `moves` says (and, with `needle`, its dial swinging at every
+/// reading; with `steam`, its hot dial steaming), counting each reading's own frame, and the
+/// frames that would have drawn nothing new.
+fn frames_over(
+    cadence: Duration,
+    moves: Moves,
+    (beat, needle, steam): (bool, bool, bool),
+    secs: u32,
+) -> (usize, Vec<String>) {
     let t0 = Instant::now();
     let ms0 = OPEN + 3_456;
     let readings =
         u32::try_from(Duration::from_secs(u64::from(secs)).as_nanos() / cadence.as_nanos())
             .unwrap_or(0);
-    let (mut frames, mut idle) = (0, Vec::new());
+    let band = |px| FineBand {
+        box_px: px,
+        period_ms: 2_000,
+    };
+    let bands = match moves {
+        Moves::Glide(px) => (band(px), FineBand::default()),
+        Moves::Slide(px) => (FineBand::default(), band(px)),
+    };
+    let (mut frames, mut idle, mut was) = (0, Vec::new(), None);
     for r in 0..readings {
         let landed = t0 + cadence * r;
         let at_ms = wall(t0, ms0, landed);
         let prev_ms = r.checked_sub(1).map(|p| wall(t0, ms0, t0 + cadence * p));
-        let flow = match moves {
-            Moves::Glide(px_per_s, period_s) => Flow::Glide {
-                step: glide_step(px_per_s),
-                end_ms: Some(open_start_ms(at_ms, period_s) + i64::from(period_s) * 1000),
-            },
-            Moves::Slide(pitch_px) => Flow::Slide {
-                frames: if opened_slot(prev_ms, at_ms, SlotGrid::SECONDS) {
-                    slide_frames(pitch_px)
-                } else {
-                    0
-                },
-            },
-        };
+        let opened = Opened::after(was, prev_ms, at_ms, SlotGrid::SECONDS, landed);
+        was = Some(opened);
+        let flow = Flow::of(bands, opened, SlotGrid::SECONDS);
         let f = LiveFacts {
             landed: Some(landed),
             stale_after: stale_after(cadence, None),
             motion: true,
             beat,
             tween: false,
+            needle: needle.then(|| swinging(landed, r)),
+            drawn: None,
             flow,
+            steam,
         };
         frames += 1;
         let until = landed + cadence;
@@ -465,7 +704,7 @@ fn frames_over(cadence: Duration, moves: Moves, beat: bool, secs: u32) -> (usize
             if next >= until {
                 break;
             }
-            if f.live(now, wall(t0, ms0, now)) == f.live(next, wall(t0, ms0, next)) {
+            if f.grid(now, wall(t0, ms0, now)) == f.grid(next, wall(t0, ms0, next)) {
                 idle.push(format!("reading {r}: {:?}", next - landed));
             }
             frames += 1;
@@ -475,37 +714,181 @@ fn frames_over(cadence: Duration, moves: Moves, beat: bool, secs: u32) -> (usize
     (frames, idle)
 }
 
-/// The cost bound (§6): a focused, live deck asks at most four frames a second, whatever its
-/// strips' speed and the readings' cadence, and none that draws nothing new; with the beat it
-/// still moves on most of them, so it looks live.
+/// The cost bound (§6): a focused, live deck asks at most four frames a second on the grid,
+/// whatever its strips' speed and the readings' cadence, and none that draws nothing new; with
+/// the beat it still moves on most of them, so it looks live. A needle in motion asks its own
+/// frames (`the_needle_asks_its_own_frames_and_none_once_settled`) and none of the grid's. A hot
+/// dial's steam (`docs/DESIGN-stats-deck-owner-2026-10-26.md` §5) asks none the beat does not,
+/// and without the beat still at most four a second.
 #[test]
 fn the_live_edge_asks_at_most_four_frames_a_second() {
     let ms = Duration::from_millis;
     for cadence in [ms(1_000), ms(500), ms(2_000)] {
         for moves in [
-            Moves::Glide(0.2, 30),
-            Moves::Glide(0.27, 30),
-            Moves::Glide(0.5, 20),
-            Moves::Glide(1.2, 10),
-            Moves::Glide(2.0, 10),
-            Moves::Glide(40.0, 10),
+            Moves::Glide(2.0),
+            Moves::Glide(4.6),
+            Moves::Glide(8.3),
+            Moves::Glide(16.6),
+            Moves::Glide(80.0),
             Moves::Slide(3.0),
-            Moves::Slide(6.0),
-            Moves::Slide(10.0),
+            Moves::Slide(4.0),
+            Moves::Slide(8.0),
+            Moves::Slide(16.0),
         ] {
             for beat in [true, false] {
                 let secs = 30;
-                let (frames, idle) = frames_over(cadence, moves, beat, secs);
+                let (frames, idle) = frames_over(cadence, moves, (beat, false, false), secs);
                 let per_s = frames as f64 / f64::from(secs);
                 let what = format!("{cadence:?} readings, {moves:?}, beat {beat}");
                 assert!(per_s <= 4.0, "{what}: {per_s} frames a second");
                 assert!(idle.is_empty(), "{what}: {idle:?}");
+                let swung = frames_over(cadence, moves, (beat, true, false), secs);
+                assert_eq!(
+                    swung,
+                    (frames, idle.clone()),
+                    "{what}: a swinging needle moves the grid"
+                );
+                let (steamed, steam_idle) = frames_over(cadence, moves, (beat, false, true), secs);
+                let steam_per_s = steamed as f64 / f64::from(secs);
+                assert!(
+                    steam_per_s <= 4.0,
+                    "{what}, steaming: {steam_per_s} frames a second"
+                );
+                assert!(steam_idle.is_empty(), "{what}, steaming: {steam_idle:?}");
+                if beat {
+                    assert_eq!(
+                        steamed, frames,
+                        "{what}: the steam asks no frame the beat does not"
+                    );
+                }
                 if beat && cadence == ms(1_000) {
                     assert!(per_s >= 3.0, "CONTROL {what}: the beat draws ({per_s})");
                 }
             }
         }
     }
+}
+
+/// The needle's own bound (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §4.3): over half a
+/// minute of readings at the deck's and the lens's cadences, each retargeted from where the
+/// needle stands, every frame it asks draws a needle the tip of which stands a whole device pixel
+/// from the last, each reading's episode asks at most its settle time over the window's interval,
+/// and a settled needle asks for nothing. A quiet machine, whose readings drift under a pixel at
+/// the tip, asks no needle frame at all; without motion or once readings stop, none either.
+#[test]
+fn the_needle_asks_its_own_frames_and_none_once_settled() {
+    let ms = Duration::from_millis;
+    let px_per_deg = crate::stats_gauge::tip_px_per_deg(crate::stats_gauge::R_FACE, 2.0);
+    let view = View {
+        px_per_deg,
+        interval: Duration::from_micros(16_667),
+    };
+    // A load that climbs, holds, plunges and wanders, as busy % then the redline, degrees.
+    let busy = |i: u32| {
+        let v = [0.1, 0.35, 0.8, 0.82, 1.4, 0.6, 0.62, 0.3, 0.05, 1.9][i as usize % 10];
+        crate::stats_gauge::tip_deg(v)
+    };
+    let quiet = |i: u32| 10.0 + 0.4 / px_per_deg * f64::from(i % 3);
+    for (cadence, target, wants_frames) in [
+        (ms(1_000), &busy as &dyn Fn(u32) -> f64, true),
+        (ms(500), &busy, true),
+        (ms(1_000), &quiet, false),
+    ] {
+        let t0 = Instant::now();
+        let mut needle: Option<Needle> = None;
+        let mut asked = 0;
+        for r in 0..30_u32 {
+            let landed = t0 + cadence * r;
+            needle = Needle::retarget(needle, landed, Some((target(r), 0.0)), px_per_deg);
+            let f = LiveFacts {
+                landed: Some(landed),
+                stale_after: stale_after(cadence, None),
+                motion: true,
+                beat: true,
+                tween: false,
+                flow: Flow::None,
+                needle: needle.map(|n| (n, view)),
+                drawn: None,
+                steam: false,
+            };
+            let at = format!("{cadence:?}, reading {r}");
+            let (mut now, mut episode) = (landed, 0_u32);
+            let mut last = None;
+            while let Some(next) = f.next_needle(now) {
+                if next >= landed + cadence {
+                    break;
+                }
+                let (was, drawn) = (f.live(now, OPEN), f.live(next, OPEN));
+                let deg = |l: &DeckLive| {
+                    l.needle.map_or(target(r), |(a, _)| {
+                        f64::from(a) / crate::stats_needle::ANGLE_PER_DEG
+                    })
+                };
+                let px = (deg(&drawn) - deg(&was)).abs() * px_per_deg;
+                assert!(
+                    px >= 1.0 - px_per_deg / crate::stats_needle::ANGLE_PER_DEG,
+                    "{at}: a needle frame at {:?} moves the tip {px} px",
+                    next - landed
+                );
+                if let Some(last) = last {
+                    assert!(next - last >= view.interval, "{at}: {:?}", next - last);
+                }
+                last = Some(next);
+                now = next;
+                episode += 1;
+                assert!(episode < 200, "{at}: the needle never settles");
+            }
+            // Settled before the next reading: it draws the reading and asks nothing.
+            if f.next_needle(now).is_none() {
+                assert_eq!(
+                    f.live(now, OPEN).needle,
+                    None,
+                    "{at}: settled on the reading"
+                );
+            }
+            let bound = (0.8 / view.interval.as_secs_f64()).ceil() as u32 + 1;
+            assert!(
+                episode <= bound,
+                "{at}: {episode} needle frames, at most {bound}"
+            );
+            asked += episode;
+        }
+        assert_eq!(
+            asked > 0,
+            wants_frames,
+            "{cadence:?}: {asked} needle frames"
+        );
+    }
+    // Without motion the needle draws the reading and asks for nothing; once readings stop, the
+    // grey draws it at rest.
+    let t0 = Instant::now();
+    let rest = Needle::at_rest(t0, (-120.0, 0.0));
+    let n = Needle::retarget(Some(rest), t0, Some((120.0, 0.0)), px_per_deg);
+    let f = LiveFacts {
+        needle: n.map(|n| (n, view)),
+        ..facts(t0, true, true)
+    };
+    assert!(f.live(t0, OPEN).needle.is_some(), "CONTROL: it moves");
+    assert!(f.next_needle(t0).is_some(), "CONTROL: it asks");
+    assert_eq!(
+        f.next_change(t0, OPEN),
+        facts(t0, true, true).next_change(t0, OPEN)
+    );
+    let still = LiveFacts { motion: false, ..f };
+    assert_eq!(still.live(t0, OPEN), DeckLive::STILL);
+    assert_eq!(still.next_needle(t0), None);
+    let stale = t0 + f.stale_after;
+    assert_eq!(f.live(stale, OPEN), DeckLive::STALE);
+    assert_eq!(f.next_needle(stale), None);
+    let late = LiveFacts {
+        stale_after: ms(40),
+        ..f
+    };
+    assert!(
+        late.next_needle(t0 + ms(39))
+            .is_none_or(|at| at < t0 + ms(40)),
+        "no needle frame past the grey"
+    );
 }
 
 #[test]
@@ -554,11 +937,17 @@ fn a_stalled_deck_never_looks_live() {
 fn the_card_key_and_the_layers_follow_what_moved() {
     let still = DeckLive::STILL;
     let glide = DeckLive {
-        glide_ms: Some(OPEN),
+        flow: Some(FlowAt {
+            opened_ms: 1_000,
+            ran: 0.3125,
+        }),
         ..still
     };
     let slide = DeckLive {
-        slide: Some(0.5),
+        flow: Some(FlowAt {
+            opened_ms: 1_000,
+            ran: 0.5,
+        }),
         ..still
     };
     let beat = DeckLive {
@@ -585,15 +974,15 @@ fn the_card_key_and_the_layers_follow_what_moved() {
 const TEXT: HeaderText<'static> = HeaderText {
     tab: "Tab 2",
     machine: "this Mac",
-    machine_forms: &[],
     over: true,
+    totals: &[],
 };
 
 fn head_of(form: DeckForm, w: f64, m: &FaceMetrics) -> Option<(HeaderPlan, Strip)> {
     match form {
         DeckForm::Full => {
             let p = plan::plan_full(w, m);
-            (!p.ground_only).then(|| (plan::header_full(&p, TEXT, m), p.strip))
+            (!p.ground_only).then(|| (plan::header_full(&p, TEXT, None, m), p.strip))
         }
         DeckForm::Folded => {
             let p = plan::plan_folded(w, m);
@@ -678,25 +1067,25 @@ fn ruler_faults(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Vec<String>
         ));
     }
     let time_w = header_pt_words(m, &time.text);
-    // The label stands over the strip's left end, or beside it: ending STRIP_LEAD short of
-    // the strip, whose left end a tick then marks.
-    let lo = if (time.x - strip.x).abs() < EPS {
+    // The label stands over the strip's right (old) end, right-aligned to it, or beside it:
+    // starting STRIP_LEAD past that end, which a tick then marks.
+    let hi = if (time.x + time_w - strip.end()).abs() < EPS {
         if head.time_tick.is_some() {
             why.push("a tick at the strip's end under a label over it".into());
         }
-        strip.x + time_w + 6.0
+        time.x - 6.0
     } else {
-        if (time.x + time_w - (strip.x - plan::STRIP_LEAD)).abs() > EPS {
+        if (time.x - (strip.end() + plan::STRIP_LEAD)).abs() > EPS {
             why.push(format!(
                 "the label beside the strip spans {}..{}",
                 time.x,
                 time.x + time_w
             ));
         }
-        if head.time_tick != Some(strip.x) {
+        if head.time_tick != Some(strip.end()) {
             why.push(format!("the strip's end tick is {:?}", head.time_tick));
         }
-        strip.x
+        strip.end()
     };
     if head.ruler.is_empty()
         && let Some(could) = scale_could_go(head, strip, m)
@@ -705,7 +1094,8 @@ fn ruler_faults(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Vec<String>
             "no tick says how far back the strip reaches: {could}"
         ));
     }
-    let hi = strip.end() - MARKER_ROOM;
+    // The now marker's room at the strip's left end stays clear.
+    let lo = strip.x + MARKER_ROOM;
     for (i, t) in head.ruler.iter().enumerate() {
         let want = strip
             .x_at_age_ms(i64::from(t.age_s) * 1_000)
@@ -747,11 +1137,11 @@ fn ruler_faults(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Vec<String>
 }
 
 /// Why a header that carries no scale could have carried one, or `None` when it could not: no
-/// tick's words fit under their middle half beside either label over the strip, and with the
-/// label beside the strip every tick that fits there costs the key an item other than "not
-/// read" by rule K's own search ([`plan::place_key`]), which the scale never does.
+/// tick's words fit under their middle half before either label over the strip's old end, and
+/// with the label beside the strip every tick that fits there costs the key "over max" by rule
+/// K's own search ([`plan::place_key`]), which the scale never does.
 fn scale_could_go(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Option<String> {
-    let hi = strip.end() - MARKER_ROOM;
+    let lo = strip.x + MARKER_ROOM;
     let tick = |age: u32| -> Option<(f64, f64)> {
         let x = strip.x_at_age_ms(i64::from(age) * 1_000)?;
         Some((x, header_pt_words(m, &plan::tick_words(age))))
@@ -759,11 +1149,11 @@ fn scale_could_go(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Option<St
     let ages = plan::tick_ages(strip);
     let labels = plan::time_words(strip);
     for label in &labels {
-        let lo = strip.x + header_pt_words(m, label) + 6.0;
+        let hi = strip.end() - header_pt_words(m, label) - 6.0;
         for &age in &ages {
             let Some((x, w)) = tick(age) else { continue };
             if lo.max(x - 0.75 * w) <= (hi - w).min(x - 0.25 * w) {
-                return Some(format!("{} fits beside {label:?}", plan::tick_words(age)));
+                return Some(format!("{} fits before {label:?}", plan::tick_words(age)));
             }
         }
     }
@@ -775,19 +1165,19 @@ fn scale_could_go(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Option<St
             .collect()
     };
     let now = kept(head.key.spans.clone());
-    let lead = strip.x - plan::STRIP_LEAD;
-    let is_lead = |s: &plan::KeySpan| !s.strip && (s.x1 - lead).abs() < EPS;
+    let lead = strip.end() + plan::STRIP_LEAD;
+    let is_lead = |s: &plan::KeySpan| !s.strip && s.x0 >= strip.end() - EPS && s.x0 <= lead + EPS;
     let on_strip =
         |s: &plan::KeySpan| s.strip && s.x0 >= strip.x - EPS && s.x1 <= strip.end() + EPS;
-    let name = head.key.spans.iter().copied().find(is_lead)?;
+    let free = head.key.spans.iter().copied().find(is_lead)?;
     for label in &labels {
-        let x = lead - header_pt_words(m, label);
-        if name.x0 > x {
+        let lw = header_pt_words(m, label);
+        if free.x1 < lead + lw {
             continue;
         }
         for &age in &ages {
             let Some((tx, w)) = tick(age) else { continue };
-            let (least, most) = (strip.x.max(tx - 0.75 * w), (hi - w).min(tx - 0.25 * w));
+            let (least, most) = (lo.max(tx - 0.75 * w), (strip.end() - w).min(tx - 0.25 * w));
             if least > most {
                 continue;
             }
@@ -800,9 +1190,9 @@ fn scale_could_go(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Option<St
                 .filter(|s| !is_lead(s) && !on_strip(s))
                 .collect();
             for (x0, x1, strip) in [
-                (name.x0, x - plan::KEY_GAP, false),
-                (lead + plan::KEY_GAP, left - plan::KEY_GAP, true),
-                (left + w + plan::KEY_GAP, hi, true),
+                (lead + lw + plan::KEY_GAP, free.x1, false),
+                (lo, left - plan::KEY_GAP, true),
+                (left + w + plan::KEY_GAP, lead - plan::KEY_GAP, true),
             ] {
                 if x1 > x0 {
                     spans.push(plan::KeySpan { x0, x1, strip });
@@ -811,7 +1201,7 @@ fn scale_could_go(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Option<St
             let trial = kept(spans);
             if now
                 .iter()
-                .all(|item| *item == plan::KeyItem::NotRead || trial.contains(item))
+                .all(|item| *item != plan::KeyItem::Over || trial.contains(item))
             {
                 return Some(format!(
                     "{label:?} beside the strip with {} keeps the key",
@@ -825,9 +1215,11 @@ fn scale_could_go(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Option<St
 
 /// T-G4's widths, both faces, both forms: wherever the header carries the time label, a scale
 /// says how far back the strip reaches, each tick at its age from now under the middle of its
-/// words. Where the strip is too short for the label and a tick, the label stands beside it;
-/// the scale is missing only where every placement would cost the key "over max" or the ramp
-/// ([`scale_could_go`]), which on the Mac's face (Helvetica Neue's metrics) is nowhere.
+/// words, clear of the now marker at the strip's left end. With now at the left every deck
+/// width's strip holds the label over its old end and a tick, so none needs the label beside
+/// it (that placement is pinned on a strip too short for both, below); the scale is missing
+/// only where every placement would cost the key "over max" ([`scale_could_go`]),
+/// which on the Mac's face (Helvetica Neue's metrics) is nowhere.
 #[test]
 fn the_time_scale_marks_how_far_back_at_every_width() {
     let faces = [
@@ -861,18 +1253,48 @@ fn the_time_scale_marks_how_far_back_at_every_width() {
         "CONTROL: {drew} headers carried the time label"
     );
     assert!(
-        beside > 0 && beside < drew / 2,
-        "CONTROL: {beside} of {drew} labels stand beside their strip"
+        beside < drew / 2,
+        "{beside} of {drew} labels stand beside their strip"
     );
     assert_eq!(bare_hn, 0, "headers without a scale on the Mac's face");
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+
+    // A strip too short for its label over it and a tick (41 pt of the 1-minute scale) sets the
+    // label beside it, past its old end, where the scope key leaves a free span; with none
+    // there the label stands over it alone.
+    for (face, m) in &faces {
+        let strip = Strip::folded(100.0, 14, 3.0);
+        let free = plan::KeySpan {
+            x0: strip.end() + plan::STRIP_LEAD,
+            x1: strip.end() + 160.0,
+            strip: false,
+        };
+        let head = plan::header_of_strip(strip, &[free], m);
+        assert_eq!(
+            head.time_tick,
+            Some(strip.end()),
+            "{face}: {:?}",
+            head.labels
+        );
+        assert!(!head.ruler.is_empty(), "{face}: a scale beside it");
+        let faults = ruler_faults(&head, strip, m);
+        assert!(faults.is_empty(), "{face}: {}", faults.join("\n"));
+        let alone = plan::header_of_strip(strip, &[], m);
+        assert_eq!(
+            (alone.time_tick, alone.ruler.len()),
+            (None, 0),
+            "{face}: no room beside it"
+        );
+        assert!(ruler_faults(&alone, strip, m).is_empty(), "{face}");
+    }
 }
 
 /// The scale at the widths the mockups draw and the owner's default window, and at each
-/// strip's period: the ticks, by age. Where "–1 min" stands near the strip's end (Full 550,
-/// Folded 1119 and 800) its words cannot keep the tick under their middle half and clear the
-/// marker, so "–2 min" stands instead (with words free to slide until their edge sits on the
-/// tick, "–1 min" stood there).
+/// strip's period: the label over the strip's old end, and the ticks, by age. The strip is
+/// each row's widest element (the owner, 2026-10-26: "the time series is too short"), so from
+/// Full 550 and Folded 1119 it reads six hours (Full 550's narrow header keeps its key's three
+/// items and the hour's tick); Folded 800's and 600's narrower blocks read 4 hours, the label
+/// taking the room the coarser ticks would.
 #[test]
 fn the_time_scale_at_the_mockups_widths() {
     let m = FaceMetrics::helvetica_neue();
@@ -902,18 +1324,18 @@ fn the_time_scale_at_the_mockups_widths() {
     assert_eq!(
         got,
         [
-            (10, "1h ago".into(), vec![10, 60, 300, 900]),
-            (10, "1h ago".into(), vec![10, 60, 300, 900]),
-            (10, "1h ago".into(), vec![10, 60, 300, 900]),
-            (10, "1h ago".into(), vec![10, 60, 300, 900]),
-            (30, "1m ago".into(), vec![10]),
-            (1, "15m ago".into(), vec![10, 60]),
-            (1, "5m ago".into(), vec![10]),
-            (1, "\u{2013}1m".into(), vec![10]),
+            (10, "6h ago".into(), vec![10, 60, 600, 3600]),
+            (10, "6h ago".into(), vec![10, 60, 600, 3600]),
+            (10, "6h ago".into(), vec![10, 60, 600, 3600]),
+            (10, "6h ago".into(), vec![10, 60, 600, 3600]),
+            (10, "6h ago".into(), vec![3600]),
+            (1, "6h ago".into(), vec![10, 60, 600, 3600]),
+            (1, "4h ago".into(), vec![60, 600]),
+            (1, "4h ago".into(), vec![60, 600]),
         ]
     );
-    // The owner's default window (Folded at about 600 pt): its 1m multi-scale strip carries the
-    // "–10s" tick over the fine real-time region, with the tick under the middle half of its words.
+    // The owner's default window (Folded at about 600 pt): its 4h multi-scale strip carries the
+    // "–1m" tick past the fine real-time region, with the tick under the middle half of its words.
     let (head, _strip) = head_of(DeckForm::Folded, 600.0, &m).expect("the table is drawn");
     let mid = &head.ruler[0];
     let w = header_pt_words(&m, &mid.text);
@@ -924,7 +1346,7 @@ fn the_time_scale_at_the_mockups_widths() {
 }
 
 /// A headless App whose one focused window draws the v2 deck, holding a reading that landed at
-/// `landed`.
+/// `landed`, a second after the reading before it.
 #[cfg(unix)]
 fn live_app(landed: Instant) -> (crate::App, crate::WindowId) {
     let mut app = crate::App::headless_for_test();
@@ -934,6 +1356,11 @@ fn live_app(landed: Instant) -> (crate::App, crate::WindowId) {
         .get_or_insert_with(Default::default)
         .stats_bars = Some("deck".into());
     let snap = crate::stats_deck::paint_tests::scene(crate::stats_deck::paint_tests::Scene::Calm);
+    app.vitals.landed_open = Some(Opened {
+        at_ms: snap.at_unix_ms,
+        ms: 1_000,
+        landed,
+    });
     app.vitals.snapshot = Some(std::sync::Arc::new(snap));
     app.vitals.landed_at = Some(landed);
     app.windows.get_mut(&wid).expect("the window").focused = true;
@@ -956,46 +1383,59 @@ fn the_app_moves_the_live_edge_only_where_motion_is_allowed() {
     assert_eq!(facts.landed, Some(t0));
     assert_eq!(facts.flow, Flow::None);
     let live = facts.live(t0, OPEN);
-    assert!(live.fresh && live.glide_ms.is_none() && live.slide.is_none());
+    assert!(live.fresh && live.flow.is_none());
     assert_eq!(live.beat, beat_phase(0));
-    // A Folded strip of 6 px a slot, after a reading that opened a second: it slides on the
-    // beat's frames.
+    // A Folded strip of 12 px boxes on 2 s, after a reading that opened a second: its fine band
+    // slides 6 px on the beat's frames.
     let at_ms = app.vitals.snapshot.as_ref().expect("a snapshot").at_unix_ms;
-    app.vitals.landed_prev_at_ms = Some(at_ms - 1000);
+    let fine = |box_px| FineBand {
+        box_px,
+        period_ms: 2_000,
+    };
     let ws = app.windows.get_mut(&wid).expect("the window");
-    ws.deck_glide.set((0.0, 0, 6.0));
+    ws.deck_glide.set((FineBand::default(), fine(12.0)));
     let facts = app.live_facts(wid).expect("the deck draws");
-    assert_eq!(facts.flow, Flow::Slide { frames: 4 });
+    assert_eq!(
+        facts.flow,
+        Flow::Slide {
+            opened_ms: 1_000,
+            landed: t0,
+            frames: 4
+        }
+    );
     let live = facts.live(t0, OPEN);
-    assert!(live.fresh && live.glide_ms.is_none() && live.slide == Some(0.25));
-    // A reading inside the second the last one opened (the lens reads every half second) opens
-    // none: the beat rings, the strip stands.
-    let mut half = (**app.vitals.snapshot.as_ref().expect("a snapshot")).clone();
-    half.at_unix_ms = at_ms + 600;
-    app.vitals.snapshot = Some(std::sync::Arc::new(half));
-    app.vitals.landed_prev_at_ms = Some(at_ms + 100);
+    assert!(live.fresh && ran(live) == Some(0.25));
+    // The band moves for the reading the host says opened a slot (`Opened::after`): one that
+    // opened none moves nothing.
+    app.vitals.landed_open = Some(Opened {
+        at_ms,
+        ms: 0,
+        landed: t0,
+    });
     let facts = app.live_facts(wid).expect("the deck draws");
-    assert_eq!(facts.flow, Flow::Slide { frames: 0 });
-    assert_eq!(facts.live(t0, OPEN).slide, None);
-    // Slots are the snapshot's grid's, not the wall clock's seconds: with its edges half a
-    // second in, readings at 900 and 1100 ms share a slot.
-    let mut edged = (**app.vitals.snapshot.as_ref().expect("a snapshot")).clone();
-    edged.at_unix_ms = at_ms + 1_100;
-    edged.slot_grid.origin_ms = 500;
-    app.vitals.snapshot = Some(std::sync::Arc::new(edged));
-    app.vitals.landed_prev_at_ms = Some(at_ms + 900);
-    let facts = app.live_facts(wid).expect("the deck draws");
-    assert_eq!(facts.flow, Flow::Slide { frames: 0 });
-    app.vitals.landed_prev_at_ms = Some(at_ms + 400);
-    let facts = app.live_facts(wid).expect("the deck draws");
-    assert_eq!(facts.flow, Flow::Slide { frames: 4 }, "CONTROL");
-    // A Full strip glides on the wall clock instead.
+    assert_eq!(facts.flow, Flow::None);
+    assert_eq!(facts.live(t0, OPEN).flow, None);
+    app.vitals.landed_open = None;
+    assert_eq!(
+        app.live_facts(wid).map(|f| f.flow),
+        Some(Flow::None),
+        "nothing landed that opened a slot"
+    );
+    app.vitals.landed_open = Some(Opened {
+        at_ms,
+        ms: 1_000,
+        landed: t0,
+    });
+    // A Full strip glides on the wall clock instead, from the reading for a slot.
     let ws = app.windows.get_mut(&wid).expect("the window");
-    ws.deck_glide.set((0.6, 10, 0.0));
+    ws.deck_glide.set((fine(8.0), FineBand::default()));
     let facts = app.live_facts(wid).expect("the deck draws");
-    assert!(matches!(facts.flow, Flow::Glide { .. }), "{facts:?}");
-    let live = facts.live(t0, OPEN);
-    assert!(live.fresh && live.glide_ms.is_some() && live.slide.is_none());
+    assert!(
+        matches!(facts.flow, Flow::Glide { from_ms, end_ms, .. } if from_ms == at_ms && end_ms == at_ms + 1_000),
+        "{facts:?}"
+    );
+    let live = facts.live(t0, at_ms + 100);
+    assert!(live.fresh && live.flow.is_some());
     assert_eq!(live.beat, beat_phase(0));
     // The grid's next frame, which beats.
     let next = app.stats_live_deadline(t0);
@@ -1060,6 +1500,251 @@ fn the_app_moves_the_live_edge_only_where_motion_is_allowed() {
     assert_eq!(app.deck_live(wid), DeckLive::STILL);
 }
 
+/// Lays `wid`'s deck out to its form, so its card is the height that form draws.
+#[cfg(unix)]
+fn fit_deck(app: &mut crate::App, wid: crate::WindowId) {
+    let (_, cell) = app.win_cell_size(wid);
+    let ws = app.windows.get_mut(&wid).expect("the window");
+    ws.metrics.head = crate::stats_deck::reserved_deck_px(
+        crate::stats_deck::StatsBars::Deck,
+        ws.deck_form,
+        ws.scale,
+        cell,
+    );
+}
+
+/// A reading adopted at `at` whose CPU and GPU stand at `share` of their capacity: the needle
+/// retargeted to it.
+#[cfg(unix)]
+fn busier(app: &mut crate::App, share: f64, at: Instant) -> crate::stats_needle::Needle {
+    let mut snap = (**app.vitals.snapshot.as_ref().expect("a reading")).clone();
+    snap.seq += 1;
+    for res in [aterm_vitals::Resource::Cpu, aterm_vitals::Resource::Gpu] {
+        let row = &mut snap.resources[res.index()];
+        row.now = row.capacity.map(|cap| cap * share);
+    }
+    app.vitals.snapshot = Some(std::sync::Arc::new(snap));
+    app.vitals.landed_at = Some(at);
+    app.retarget_needle(at);
+    app.vitals.needle.get().expect("the reading's needle")
+}
+
+/// One needle for the app, retargeted where a reading is adopted: the first reading rests it on
+/// the dial, a busier one sweeps it on its own deadline (`stats_needle`, serious mode or not) from
+/// where it stood; a window without motion draws the reading and asks nothing, and a reading no
+/// window animates rests it; a layout that adds, drops or resizes the dial rests it too.
+#[cfg(unix)]
+#[test]
+fn the_app_retargets_one_needle_and_rests_it_where_it_must() {
+    use crate::stats_needle::Needle;
+    let _attached = crate::stats_deck::tests::attach_stats();
+    let t0 = Instant::now();
+    let (mut app, wid) = live_app(t0);
+    app.vitals.landed_period = Some(Duration::from_secs(3600));
+    app.windows.get_mut(&wid).expect("the window").cols = 160;
+    fit_deck(&mut app, wid);
+    let _ = app.stats_deck_fp(wid);
+    let px = app.windows[&wid].deck_needle_px.get();
+    assert!(px > 0.0, "CONTROL: the deck draws a dial");
+    app.retarget_needle(t0);
+    let first = app.vitals.needle.get().expect("the reading's needle");
+    assert_eq!(
+        first,
+        Needle::at_rest(t0, first.target()),
+        "the first reading rests"
+    );
+    assert_eq!(app.stats_needle_deadline(t0), None);
+    // A busier reading sweeps it from where it stood, on its own deadline.
+    let t1 = t0 + Duration::from_secs(1);
+    let hot = busier(&mut app, 0.95, t1);
+    assert!(
+        (hot.target().0 - first.target().0).abs() > 10.0,
+        "CONTROL: {first:?} then {hot:?}"
+    );
+    assert_eq!((hot.tip.x0, hot.tip.v0), (first.tip.target, 0.0));
+    let next = app
+        .stats_needle_deadline(t1)
+        .expect("the needle asks a frame");
+    let interval = app.windows[&wid].effect_present_interval();
+    assert_eq!(
+        next,
+        t1 + interval,
+        "a large swing runs at the window's rate"
+    );
+    let facts = app.live_facts(wid).expect("the deck draws");
+    assert!(facts.live(t1, OPEN).needle.is_some());
+    assert_eq!(
+        app.stats_live_deadline(t1),
+        facts.next_change(t1, now_unix_ms()),
+        "CONTROL: the grid keeps its own deadline"
+    );
+    app.serious_mode = true;
+    assert_eq!(
+        app.stats_needle_deadline(t1),
+        Some(next),
+        "serious mode keeps the needle"
+    );
+    app.serious_mode = false;
+    // Without motion the window draws the reading and asks nothing, and a reading rests it.
+    app.config.motion = Some("reduced".into());
+    assert_eq!(app.stats_needle_deadline(t1), None);
+    let reduced = app.live_facts(wid).expect("the deck draws");
+    assert_eq!(reduced.live(t1, OPEN).needle, None);
+    let t2 = t1 + Duration::from_secs(1);
+    let calm = busier(&mut app, 0.10, t2);
+    assert_eq!(
+        calm,
+        Needle::at_rest(t2, calm.target()),
+        "no window animates: at rest"
+    );
+    app.config.motion = None;
+    let t3 = t2 + Duration::from_secs(1);
+    let swing = busier(&mut app, 0.95, t3);
+    assert!(
+        app.stats_needle_deadline(t3).is_some(),
+        "CONTROL: it sweeps"
+    );
+    // The other form's dial is another size: the needle rests on its reading at once.
+    let ws = app.windows.get_mut(&wid).expect("the window");
+    ws.deck_form = match ws.deck_form {
+        DeckForm::Full => DeckForm::Folded,
+        DeckForm::Folded => DeckForm::Full,
+    };
+    fit_deck(&mut app, wid);
+    let _ = app.stats_deck_fp(wid);
+    let resized = app.windows[&wid].deck_needle_px.get();
+    assert!(
+        resized > 0.0 && resized != px,
+        "CONTROL: {px} then {resized}"
+    );
+    let rested = app.vitals.needle.get().expect("the needle");
+    assert_eq!(rested.target(), swing.target());
+    assert_eq!((rested.tip.x0, rested.tip.v0), (swing.target().0, 0.0));
+    assert_eq!(
+        app.stats_needle_deadline(t3),
+        None,
+        "a resized dial draws the reading"
+    );
+}
+
+/// What window `wid` draws of the needle at `at`, kept as what it drew as the splice keeps it
+/// (`WindowState::deck_needle_drawn`): its angle, degrees, `None` for the reading itself.
+#[cfg(unix)]
+fn draw_needle_at(app: &crate::App, wid: crate::WindowId, at: Instant) -> Option<f64> {
+    let facts = app.live_facts(wid).expect("the deck draws");
+    let needle = facts.live(at, OPEN).needle;
+    app.windows[&wid].deck_needle_drawn.set(facts.needle_at(at));
+    needle.map(|(a, _)| f64::from(a) / crate::stats_needle::ANGLE_PER_DEG)
+}
+
+/// A window never draws the needle back where it already stood
+/// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §4.2). One whose motion goes mid-sweep
+/// (`motion = "reduced"`, the focus moving to another window) draws the reading, and keeps it
+/// when its motion comes back before the next reading; one whose effect interval changes
+/// mid-sweep moves the needle on from the frame it drew. The splice keeps what each layout drew.
+/// A window that kept nothing of what it drew would draw the needle back mid-sweep (the CONTROL).
+#[cfg(unix)]
+#[test]
+fn a_window_never_draws_the_needle_back_where_it_stood() {
+    let _attached = crate::stats_deck::tests::attach_stats();
+    let t0 = Instant::now();
+    let (mut app, wid) = live_app(t0);
+    app.vitals.landed_period = Some(Duration::from_secs(3600));
+    app.windows.get_mut(&wid).expect("the window").cols = 160;
+    fit_deck(&mut app, wid);
+    let _ = app.stats_deck_fp(wid);
+    assert!(
+        app.windows[&wid].deck_needle_px.get() > 0.0,
+        "CONTROL: the deck draws a dial"
+    );
+    app.retarget_needle(t0);
+    let mut at = t0;
+    let mut share = 0.95;
+    for lose in ["reduced", "unfocused"] {
+        at += Duration::from_secs(1);
+        let n = busier(&mut app, share, at);
+        share = 1.05 - share;
+        let target = n.target().0;
+        assert!(
+            (n.tip.x0 - target).abs() > 10.0,
+            "CONTROL {lose}: it sweeps"
+        );
+        // The splice keeps what its layout drew of this sweep.
+        let _ = app.stats_deck_fp(wid);
+        assert_eq!(
+            app.windows[&wid].deck_needle_drawn.get().map(|d| d.t0),
+            Some(n.t0),
+            "{lose}: the layout keeps what it drew"
+        );
+        let ms = |m: u32| at + Duration::from_millis(u64::from(m));
+        let mut nearest = f64::MAX;
+        for m in 0..80 {
+            let drawn = draw_needle_at(&app, wid, ms(m)).map_or(0.0, |a| (a - target).abs());
+            assert!(drawn <= nearest, "{lose}: back at {m} ms");
+            nearest = drawn;
+        }
+        assert!(nearest > 1.0, "CONTROL {lose}: mid-sweep at 80 ms");
+        let set_motion = |app: &mut crate::App, on: bool| match lose {
+            "reduced" => app.config.motion = (!on).then(|| "reduced".into()),
+            _ => app.windows.get_mut(&wid).expect("the window").focused = on,
+        };
+        set_motion(&mut app, false);
+        assert_eq!(
+            draw_needle_at(&app, wid, ms(90)),
+            None,
+            "{lose}: the reading"
+        );
+        set_motion(&mut app, true);
+        let forgot = LiveFacts {
+            drawn: None,
+            ..app.live_facts(wid).expect("the deck draws")
+        };
+        assert!(
+            forgot.live(ms(200), OPEN).needle.is_some(),
+            "CONTROL {lose}: a window that kept nothing draws the needle back mid-sweep"
+        );
+        for m in (100..1000).step_by(10) {
+            assert_eq!(
+                draw_needle_at(&app, wid, ms(m)),
+                None,
+                "{lose}: motion back at {m} ms draws the reading still"
+            );
+            assert_eq!(app.stats_needle_deadline(ms(m)), None, "{lose}: {m} ms");
+        }
+    }
+    // A sweep whose window's effect interval halves, then doubles back, mid-way.
+    at += Duration::from_secs(1);
+    let n = busier(&mut app, share, at);
+    let target = n.target().0;
+    let set_rate = |app: &mut crate::App, us: u64| {
+        let ws = app.windows.get_mut(&wid).expect("the window");
+        ws.frame_interval = Some(Duration::from_micros(us));
+        ws.effect_present_interval()
+    };
+    let fast = set_rate(&mut app, 8_333);
+    let mut nearest = f64::MAX;
+    for m in 0..1500_u32 {
+        if m == 55 {
+            assert_ne!(
+                set_rate(&mut app, 16_667),
+                fast,
+                "CONTROL: the interval moved"
+            );
+        }
+        if m == 140 {
+            set_rate(&mut app, 8_333);
+        }
+        let now = at + Duration::from_millis(u64::from(m));
+        let drawn = draw_needle_at(&app, wid, now).map_or(0.0, |a| (a - target).abs());
+        assert!(
+            drawn <= nearest,
+            "back at {m} ms: {drawn}° from the reading after {nearest}°"
+        );
+        nearest = drawn;
+    }
+    assert_eq!(nearest, 0.0, "the sweep ends on the reading");
+}
+
 /// A frame that moves only the live edge lays the deck out once, for its fingerprint and its
 /// raster both, over the words and the header line the last layout read: it measures no words and
 /// plans no header line. A new reading, a form, a width or a tab of its own reads them again. Every
@@ -1075,7 +1760,7 @@ fn a_live_frame_lays_the_deck_out_once_over_what_it_kept() {
     let fit = |app: &mut crate::App| {
         let (_, cell) = app.win_cell_size(wid);
         let ws = app.windows.get_mut(&wid).expect("the window");
-        ws.metrics.head = crate::stats_deck::deck_px(
+        ws.metrics.head = crate::stats_deck::reserved_deck_px(
             crate::stats_deck::StatsBars::Deck,
             ws.deck_form,
             ws.scale,
@@ -1178,10 +1863,16 @@ fn a_live_frame_lays_the_deck_out_once_over_what_it_kept() {
     assert_eq!(shows(&app), DeckLive::STILL);
     assert_eq!(work, [1, 0, 0]);
     app.config.motion = None;
+    // A reading that opened a slot a moment ago: its strips move on the wall clock.
+    app.vitals.landed_open = Some(Opened {
+        at_ms: now_unix_ms(),
+        ms: 1_000,
+        landed: Instant::now(),
+    });
     let work = split(&mut app, &|app| app.vitals.landed_at = None);
     whole(&app, "a frame whose edge moved after its fingerprint");
     assert!(
-        shows(&app).fresh && shows(&app).glide_ms.is_some(),
+        shows(&app).fresh && shows(&app).flow.is_some(),
         "the raster draws the fingerprint's gliding edge, not {:?}",
         shows(&app)
     );
@@ -1209,7 +1900,7 @@ fn a_deck_turned_off_and_on_lays_its_card_out_again() {
     app.vitals.landed_period = Some(Duration::from_secs(3600));
     let (_, cell) = app.win_cell_size(wid);
     let ws = app.windows.get_mut(&wid).expect("the window");
-    ws.metrics.head = crate::stats_deck::deck_px(
+    ws.metrics.head = crate::stats_deck::reserved_deck_px(
         crate::stats_deck::StatsBars::Deck,
         ws.deck_form,
         ws.scale,
@@ -1281,7 +1972,10 @@ fn tween_interpolates_exponentially_settles_cleanly_and_snaps_under_reduce_motio
         motion: true,
         beat: false,
         tween: true,
+        needle: None,
+        drawn: None,
         flow: Flow::None,
+        steam: false,
     };
     let mut now = t0;
     let mut steps = Vec::new();
@@ -1310,4 +2004,155 @@ fn tween_interpolates_exponentially_settles_cleanly_and_snaps_under_reduce_motio
     assert!(LiveLayer::NowBox.moved(&DeckLive::STILL, &blending));
     assert!(!LiveLayer::Glide.moved(&DeckLive::STILL, &blending));
     assert!(!LiveLayer::NowBox.moved(&DeckLive::STILL, &beating));
+}
+
+/// The steam's frames (`docs/DESIGN-stats-deck-owner-2026-10-26.md` §5): a hot dial's steam
+/// clock moves on the beat's own frames, the reading's and the next [`BEAT_FRAMES`], 250 ms on a
+/// frame, and holds after them; the next reading carries it on from the moment it lands, so a
+/// puff rises on across readings; without motion, once readings stop or while the dial is cool
+/// there is no steam, and a dial that steams with nothing else moving asks only those frames.
+#[test]
+fn the_steam_rides_the_beats_frames_and_holds_between_them() {
+    let t0 = Instant::now();
+    let ms0 = OPEN + 1_234;
+    let hot = LiveFacts {
+        steam: true,
+        flow: Flow::None,
+        ..facts(t0, true, false)
+    };
+    let clock: Vec<Option<i64>> = (0..8)
+        .map(|k| hot.live(t0 + FRAME * k, ms0).steam)
+        .collect();
+    let first = clock[0].expect("a hot dial steams");
+    for (k, at) in clock.iter().enumerate() {
+        let held = i64::try_from(k)
+            .unwrap_or(i64::MAX)
+            .min(i64::from(BEAT_FRAMES));
+        assert_eq!(*at, Some(first + 250 * held), "frame {k}: {clock:?}");
+    }
+    let next = LiveFacts {
+        landed: Some(t0 + Duration::from_secs(1)),
+        ..hot
+    };
+    assert_eq!(
+        next.live(t0 + Duration::from_secs(1), ms0 + 1_000).steam,
+        Some(first + 1_000),
+        "the next reading carries the steam on"
+    );
+    // Its frames: the beat's three after the reading's own, then none until the grey.
+    let mut asks = Vec::new();
+    let mut now = t0;
+    while let Some(at) = hot.next_change(now, ms0) {
+        asks.push(at - t0);
+        now = at;
+    }
+    assert_eq!(
+        asks,
+        [FRAME, FRAME * 2, FRAME * 3, hot.stale_after],
+        "the steam's frames, then the grey"
+    );
+    assert_eq!(
+        hot.live(t0 + hot.stale_after, ms0),
+        DeckLive::STALE,
+        "once readings stop, no steam"
+    );
+    for (f, said) in [
+        (
+            LiveFacts {
+                steam: false,
+                ..hot
+            },
+            "a cool dial",
+        ),
+        (
+            LiveFacts {
+                motion: false,
+                ..hot
+            },
+            "without motion",
+        ),
+    ] {
+        assert_eq!(f.live(t0 + FRAME, ms0).steam, None, "{said}");
+        assert_eq!(
+            f.next_change(t0, ms0),
+            Some(t0 + f.stale_after),
+            "{said}: only the grey is scheduled"
+        );
+    }
+    // One clock for every window, from a fixed moment: a second on is 1000 ms on.
+    let a = crate::stats_live::steam_ms(t0);
+    assert_eq!(
+        crate::stats_live::steam_ms(t0 + Duration::from_secs(1)),
+        a + 1_000
+    );
+    assert!(crate::stats_live::steam_ms(t0 + Duration::from_millis(1)) >= a);
+}
+
+/// The window's steam: it rides the grid only while the deck's last layout laid a hot dial's
+/// steam rect, outside serious mode, with the card presented alone and with motion.
+#[cfg(unix)]
+#[test]
+fn the_app_steams_only_a_hot_dial_presented_alone_where_motion_is_allowed() {
+    let _attached = crate::stats_deck::tests::attach_stats();
+    let t0 = Instant::now();
+    let (mut app, wid) = live_app(t0);
+    let steams = |app: &crate::App| app.live_facts(wid).is_some_and(|f| f.steam);
+    assert!(!steams(&app), "before a layout laid a steaming dial, none");
+    let slot = (20.0, 8.0, 108.0, 108.0);
+    let rects = |app: &mut crate::App, layers: &[LiveLayer]| {
+        let ws = app.windows.get_mut(&wid).expect("the window");
+        *ws.deck_live_rects.borrow_mut() = layers.iter().map(|&l| (l, slot)).collect();
+    };
+    rects(&mut app, &[LiveLayer::Gauge]);
+    assert!(!steams(&app), "a cool dial lays its gauge's slot alone");
+    rects(&mut app, &[LiveLayer::Gauge, LiveLayer::Steam]);
+    let facts = app.live_facts(wid).expect("the deck draws");
+    assert!(facts.steam, "{facts:?}");
+    assert!(facts.live(t0, OPEN).steam.is_some());
+    assert!(
+        app.stats_live_deadline(t0)
+            .is_some_and(|at| at > t0 && at <= t0 + FRAME),
+        "the steam's next frame is the grid's"
+    );
+
+    app.serious_mode = true;
+    let serious = app.live_facts(wid).expect("the deck draws");
+    assert!(
+        serious.motion && !serious.steam,
+        "serious mode takes the steam"
+    );
+    app.serious_mode = false;
+
+    let ws = app.windows.get_mut(&wid).expect("the window");
+    ws.lens_card = Some(crate::SettingsCard {
+        rgba: vec![0; 4],
+        pw: 1,
+        ph: 1,
+        dx: 0,
+        dy: 0,
+        fp: 1,
+        geom: 1,
+        raster_fingerprint_once: std::sync::OnceLock::new(),
+        scrim: None,
+    });
+    assert!(!steams(&app), "a card over the deck takes the steam");
+    app.windows.get_mut(&wid).expect("the window").lens_card = None;
+
+    app.config.motion = Some("reduced".into());
+    let reduced = app.live_facts(wid).expect("the deck draws");
+    assert_eq!(
+        reduced.live(t0, OPEN),
+        DeckLive::STILL,
+        "no steam without motion"
+    );
+    app.config.motion = None;
+    app.system_reduce_motion = true;
+    let reduced = app.live_facts(wid).expect("the deck draws");
+    assert_eq!(
+        reduced.live(t0, OPEN).steam,
+        None,
+        "no steam under Reduce Motion"
+    );
+    app.system_reduce_motion = false;
+    assert!(steams(&app), "CONTROL: it steams again");
 }

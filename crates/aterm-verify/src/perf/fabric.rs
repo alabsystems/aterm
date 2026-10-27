@@ -4,14 +4,13 @@
 //! `verify perf fabric` benchmark lane runner and provenance ledger writer.
 
 use std::collections::BTreeMap;
-use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 
-use aterm_uds::spawnfd::{Command, Stdio};
-
 use super::arena::{self, Halt};
+use super::bench_build::{
+    self, Built, Provenance, Targo, another_build, cpus, ledger_paths, load_average,
+};
 use super::{LaneRun, workspace_root};
-use crate::perf::driver::CargoDriver;
 
 /// THE BENCH'S OWN GRAMMAR for a run, mounted from the bench (std-only) the way
 /// `crate::toolchain` is shared with atpkg: the lane refuses exactly what the
@@ -26,15 +25,7 @@ use crate::perf::driver::CargoDriver;
 )]
 mod bench_spec;
 
-/// THE BENCH'S OWN TABLE of arms, mounted the same way: the cargo profile each
-/// builds with, where its binaries land, and the opt-level it promises.
-#[path = "../../../aterm/tests/fabric_bench/profile.rs"]
-mod bench_profile;
-
-mod flags;
-mod units;
-
-use bench_profile::Profile;
+use bench_build::bench_profile::Profile;
 
 /// One benchmark arm: broker durability tier and optional ordered horizon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +88,12 @@ pub(crate) struct Args {
     pub retention_interval_ms: Option<u64>,
     /// Idle bystander sessions spawned alongside measured sessions (`--bystanders`).
     pub bystanders: Option<u32>,
+    /// Posts per leg of the ask scenario (`--asks`).
+    pub asks: Option<u32>,
+    /// One person-lane post every this many messages in the ask scenario's mix (`--mix-every`).
+    pub mix_every: Option<u32>,
+    /// Records behind every session's refill watermark in the attach world (`--attach-backlog`).
+    pub backlog: Option<u32>,
 }
 
 fn positive(flag: &str, raw: &str) -> Result<u32, String> {
@@ -122,9 +119,14 @@ impl Args {
             match *flag {
                 "--scenario" => {
                     a.scenario = bench_spec::Scenario::parse(raw).map_err(|_| {
-                        format!("`--scenario` takes all, messaging, pingpong, attach or handoff, not `{raw}`")
+                        format!(
+                            "`--scenario` takes all, messaging, pingpong, attach, handoff or ask, \
+                             not `{raw}`"
+                        )
                     })?;
                 }
+                "--asks" => a.asks = Some(positive(flag, raw)?),
+                "--mix-every" => a.mix_every = Some(positive(flag, raw)?),
                 "--latency-samples" => a.samples = Some(positive(flag, raw)?),
                 "--burst" => a.burst = Some(positive(flag, raw)?),
                 "--pingpong-rounds" => a.pingpong = Some(positive(flag, raw)?),
@@ -185,6 +187,11 @@ impl Args {
                 }
                 "--bystanders" => {
                     a.bystanders = Some(raw.parse::<u32>().map_err(|_| {
+                        format!("`{flag}` needs a non-negative integer, got `{raw}`")
+                    })?);
+                }
+                "--attach-backlog" => {
+                    a.backlog = Some(raw.parse::<u32>().map_err(|_| {
                         format!("`{flag}` needs a non-negative integer, got `{raw}`")
                     })?);
                 }
@@ -285,6 +292,15 @@ impl Args {
         if let Some(n) = self.bystanders {
             words.push(format!("bystanders={n}"));
         }
+        if let Some(n) = self.asks {
+            words.push(format!("asks={n}"));
+        }
+        if let Some(n) = self.mix_every {
+            words.push(format!("mix_every={n}"));
+        }
+        if let Some(n) = self.backlog {
+            words.push(format!("backlog={n}"));
+        }
         words.extend(arm.words());
         words.join(" ")
     }
@@ -326,6 +342,15 @@ impl Args {
         if let Some(n) = self.bystanders {
             line.push_str(&format!(" --bystanders {n}"));
         }
+        if let Some(n) = self.asks {
+            line.push_str(&format!(" --asks {n}"));
+        }
+        if let Some(n) = self.mix_every {
+            line.push_str(&format!(" --mix-every {n}"));
+        }
+        if let Some(n) = self.backlog {
+            line.push_str(&format!(" --attach-backlog {n}"));
+        }
         line.push_str(&arm.flags());
         line
     }
@@ -345,7 +370,6 @@ impl Args {
 
 const BENCH_ENV: &str = "FABRIC_BENCH";
 const PROGRESS: &str = "fabric bench:";
-const TAIL: usize = 60;
 
 /// Run the `fabric` performance lane.
 pub(crate) fn run(args: &Args) -> LaneRun {
@@ -360,63 +384,9 @@ fn measure(args: &Args) -> Result<String, Halt> {
             "run the lane in the development checkout, which carries docs/measured/fabric",
         ));
     }
-    let targo = Targo::new(crate::perf::driver::cargo_driver()?);
-    let profile = args.profile;
-    let removed: Vec<String> = std::env::vars_os()
-        .filter_map(|(key, _)| key.into_string().ok())
-        .filter(|key| flags::is_env_source(key))
-        .collect();
-    let sources = config_rustflags(&targo)?;
-    if let Some(why) = flags::refusal(&sources) {
-        return Err(Halt::Fail(format!(
-            "the `{}` arm's build is not what the arm says: {why}",
-            profile.name()
-        )));
-    }
-    let audit = plan(&targo, args)?;
-    if let Some(why) = audit.refusal(profile.every_crate_at()) {
-        return Err(Halt::Fail(format!(
-            "the `{}` arm's build is not what the arm says: {why}",
-            profile.name()
-        )));
-    }
-    let mut build = format!(
-        "`{}` — {}. Cargo's plan, read before the run: {}; {}",
-        profile.name(),
-        profile.describe(),
-        audit.summary(),
-        flags::describe(&sources)
-    );
-    if !removed.is_empty() {
-        build.push_str(&format!(" (the caller's {} removed)", removed.join(", ")));
-    }
-    let pins: Vec<String> = targo
-        .git_facts
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect();
-    build.push_str(&format!(
-        "; the build's git facts pinned for every run: {}",
-        pins.join(" ")
-    ));
-    eprintln!("  {build}");
-    let load_before = load_average();
-    let built = build_bench(&targo, args)?;
-    if Profile::of_binary(&built) != Some(profile) {
-        return Err(Halt::Fail(format!(
-            "cargo built the `{}` arm's aterm at {}, outside the arm's `{}` directory",
-            profile.name(),
-            built.display(),
-            profile.dir()
-        )));
-    }
-    let built_identity = bench_profile::identity(&built)
-        .map_err(|why| Halt::Fail(format!("the aterm cargo just built cannot be read: {why}")))?;
-    let built = Built {
-        path: built,
-        identity: built_identity,
-        lane_build: build,
-    };
+    let driver = crate::perf::driver::cargo_driver()?;
+    let (targo, built, load_before) =
+        bench_build::prepare(driver, args.profile, &args.build_args())?;
     let plan = args.plan();
     let mut written = Vec::with_capacity(plan.len());
     let mut load = format!("{load_before} before the build");
@@ -436,12 +406,6 @@ fn measure(args: &Args) -> Result<String, Halt> {
     Ok(format!("ledger entries {}", written.join(", ")))
 }
 
-struct Built {
-    path: PathBuf,
-    identity: String,
-    lane_build: String,
-}
-
 fn run_arm(
     targo: &Targo<'_>,
     args: &Args,
@@ -456,52 +420,14 @@ fn run_arm(
         .tempdir()
         .map_err(|e| format!("could not make a scratch directory: {e}"))?;
     let words = args.bench_words(scratch.path(), arm);
-    let mut bench_args = vec!["-q"];
-    bench_args.extend(args.build_args());
-    eprintln!(
-        "  $ {BENCH_ENV}=\"{words}\" {}",
-        targo.display("bench", &bench_args)
-    );
-    let mut child = targo
-        .command("bench")
-        .args(bench_args)
-        .env(BENCH_ENV, &words)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not run targo: {e}"))?;
-    let stdout = child.stdout.take().map(|out| {
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            let _ = std::io::Read::read_to_string(&mut std::io::BufReader::new(out), &mut text);
-            text
-        })
-    });
-    let mut tail: Vec<String> = Vec::new();
-    if let Some(err) = child.stderr.take() {
-        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
-            if line.starts_with(PROGRESS) {
-                eprintln!("  {line}");
-            }
-            tail.push(line);
-            if tail.len() > TAIL {
-                tail.remove(0);
-            }
-        }
-    }
-    let status = child
-        .wait()
-        .map_err(|e| format!("could not wait for targo: {e}"))?;
-    let stdout = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
-    if !status.success() {
-        let out_tail: Vec<&str> = stdout.lines().rev().take(TAIL).collect();
-        return Err(Halt::Fail(format!(
-            "the fabric bench exited {:?}\n--- stderr (tail) ---\n{}\n--- stdout (tail) ---\n{}",
-            status.code(),
-            tail.join("\n"),
-            out_tail.into_iter().rev().collect::<Vec<_>>().join("\n")
-        )));
-    }
+    bench_build::run_bench(
+        targo,
+        &args.build_args(),
+        BENCH_ENV,
+        &words,
+        PROGRESS,
+        "the fabric bench",
+    )?;
     let read = |name: &str| {
         let path = scratch.path().join(name);
         std::fs::read_to_string(&path)
@@ -532,7 +458,8 @@ fn run_arm(
 
     let date = super::trend::utc_date();
     let header = Provenance {
-        scenario: args.scenario,
+        heading: &heading(args.scenario),
+        protocol: "docs/measured/fabric/README.md",
         date: &date,
         machine: &arena::chip(),
         macos: &arena::macos_version(),
@@ -557,7 +484,7 @@ fn run_arm(
         load: &load,
     }
     .render();
-    let (md_path, json_path) = ledger_paths(ledger_dir, &date);
+    let (md_path, json_path) = ledger_paths(ledger_dir, &date, "fabric");
     std::fs::write(&md_path, format!("{header}\n{tables}\n"))
         .map_err(|e| format!("could not write {}: {e}", md_path.display()))?;
     std::fs::write(&json_path, &json)
@@ -575,319 +502,15 @@ fn run_arm(
     Ok(md_path)
 }
 
-struct Targo<'a> {
-    driver: &'a CargoDriver,
-    build_dir: Option<String>,
-    git_facts: Vec<(&'static str, String)>,
-}
-
-impl<'a> Targo<'a> {
-    fn new(driver: &'a CargoDriver) -> Self {
-        Targo {
-            driver,
-            build_dir: crate::perf::driver::workspace_build_dir().map(str::to_string),
-            git_facts: git_facts(
-                |key| std::env::var(key).ok(),
-                || probe_git_facts(&workspace_root()),
-            ),
+/// An entry's title: the scenarios it measured.
+fn heading(scenario: bench_spec::Scenario) -> String {
+    let scenarios = match scenario {
+        bench_spec::Scenario::All => {
+            "post -> deliver, burst, ping-pong, attach, handoff, ask, cross-node"
         }
-    }
-
-    fn lead(&self, verb: &str) -> Vec<String> {
-        let mut lead = Vec::new();
-        if let Some(value) = &self.build_dir {
-            lead.extend(["--config".to_string(), value.clone()]);
-        }
-        lead.extend(
-            CargoDriver::lane_args(verb)
-                .iter()
-                .map(|s| (*s).to_string()),
-        );
-        lead.push(verb.to_string());
-        lead
-    }
-
-    fn command(&self, verb: &str) -> Command {
-        let mut cmd = aterm_uds::spawnfd::command(&self.driver.program);
-        cmd.args(self.lead(verb)).current_dir(workspace_root());
-        for (key, _) in std::env::vars_os() {
-            if key.to_str().is_some_and(flags::is_env_source) {
-                cmd.env_remove(key);
-            }
-        }
-        for (key, value) in &self.git_facts {
-            cmd.env(key, value);
-        }
-        cmd
-    }
-
-    fn display(&self, verb: &str, args: &[&str]) -> String {
-        let mut parts = vec![self.driver.program.display().to_string()];
-        parts.extend(self.lead(verb));
-        parts.extend(args.iter().map(|s| (*s).to_string()));
-        parts.join(" ")
-    }
-
-    fn output(&self, verb: &str, args: &[&str], what: &str) -> Result<String, Halt> {
-        let out = self
-            .command(verb)
-            .args(args)
-            .output()
-            .map_err(|e| format!("could not run targo for {what}: {e}"))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let tail: Vec<&str> = err.lines().rev().take(TAIL).collect();
-            return Err(Halt::Fail(format!(
-                "`{}` exited {:?}\n{}",
-                self.display(verb, args),
-                out.status.code(),
-                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
-            )));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-}
-
-const GIT_FACTS: [&str; 3] = [
-    "ATERM_BUILD_GIT_COMMIT",
-    "ATERM_BUILD_GIT_COMMIT_FULL",
-    "ATERM_BUILD_DEV_COMMITS",
-];
-
-fn git_facts(
-    caller: impl Fn(&str) -> Option<String>,
-    probe: impl FnOnce() -> [String; 3],
-) -> Vec<(&'static str, String)> {
-    let pinned: Vec<String> = GIT_FACTS
-        .iter()
-        .filter_map(|key| caller(key).filter(|v| !v.trim().is_empty()))
-        .collect();
-    let values = match <[String; 3]>::try_from(pinned) {
-        Ok(all) => all,
-        Err(_) => probe(),
+        selected => selected.word(),
     };
-    GIT_FACTS.into_iter().zip(values).collect()
-}
-
-fn probe_git_facts(dir: &Path) -> [String; 3] {
-    let git = |args: &[&str]| {
-        arena::stdout_of(
-            aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
-                .args(args)
-                .current_dir(dir),
-        )
-        .filter(|s| !s.is_empty())
-    };
-    let short = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dirty = git(&["status", "--porcelain"]).is_some();
-    let commit = if short != "unknown" && dirty {
-        format!("{short}-dirty")
-    } else {
-        short
-    };
-    let full = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dev_commits = git(&["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"])
-        .and_then(|tag| git(&["rev-list", &format!("{}..HEAD", tag.trim()), "--count"]))
-        .unwrap_or_else(|| "0".into());
-    [commit, full, dev_commits]
-}
-
-fn plan(targo: &Targo<'_>, args: &Args) -> Result<units::Audit, Halt> {
-    let mut plan_args = args.build_args();
-    plan_args.extend(["--unit-graph", "-Z", "unstable-options"]);
-    let graph = targo.output("bench", &plan_args, "the build plan")?;
-    units::Audit::of(&graph)
-        .map_err(|why| Halt::Fail(format!("the build plan does not read: {why}")))
-}
-
-fn config_rustflags(targo: &Targo<'_>) -> Result<Vec<flags::Source>, Halt> {
-    let table = |name: &str| -> Result<Option<String>, Halt> {
-        let args = ["-Z", "unstable-options", "get", "--format", "json", name];
-        let out = targo
-            .command("config")
-            .args(args)
-            .output()
-            .map_err(|e| format!("could not run targo config get: {e}"))?;
-        let err = String::from_utf8_lossy(&out.stderr);
-        if out.status.success() {
-            Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
-        } else if err.contains("is not set") {
-            Ok(None)
-        } else {
-            Err(Halt::Fail(format!(
-                "`{}` exited {:?}\n{err}",
-                targo.display("config", &args),
-                out.status.code()
-            )))
-        }
-    };
-    flags::config_sources(table("build")?.as_deref(), table("target")?.as_deref())
-        .map_err(|why| Halt::Fail(format!("cargo's config does not read: {why}")))
-}
-
-fn build_bench(targo: &Targo<'_>, args: &Args) -> Result<PathBuf, Halt> {
-    let mut build_args = vec!["-q"];
-    build_args.extend(args.build_args());
-    build_args.extend(["--no-run", "--message-format", "json-render-diagnostics"]);
-    eprintln!("  $ {}", targo.display("bench", &build_args));
-    let messages = targo.output("bench", &build_args, "the bench's build")?;
-    built_binary(&messages, "aterm").map_err(|why| Halt::Fail(format!("the bench's build: {why}")))
-}
-
-fn built_binary(messages: &str, name: &str) -> Result<PathBuf, String> {
-    for line in messages.lines() {
-        let Ok(message) = aterm_json::from_str::<aterm_json::Value>(line) else {
-            continue;
-        };
-        if message.get("reason").and_then(aterm_json::Value::as_str) != Some("compiler-artifact") {
-            continue;
-        }
-        let target = message.get("target");
-        let named = target
-            .and_then(|t| t.get("name"))
-            .and_then(aterm_json::Value::as_str)
-            == Some(name);
-        let bin = target
-            .and_then(|t| t.get("kind"))
-            .and_then(aterm_json::Value::as_array)
-            .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some("bin")));
-        if named && bin {
-            return message
-                .get("executable")
-                .and_then(aterm_json::Value::as_str)
-                .map(PathBuf::from)
-                .ok_or_else(|| format!("cargo built the `{name}` binary and named no executable"));
-        }
-    }
-    Err(format!("cargo reported no `{name}` binary"))
-}
-
-fn another_build(report: &aterm_json::Value, built: &Path, identity: &str) -> Option<String> {
-    let ran = report
-        .get("aterm_binary")
-        .and_then(aterm_json::Value::as_str)
-        .unwrap_or("(none reported)");
-    if Path::new(ran) != built {
-        return Some(format!(
-            "the bench launched {ran}, not the {} cargo just built",
-            built.display()
-        ));
-    }
-    let seen = report.get("aterm_binary_identity");
-    for moment in ["start", "end"] {
-        let at = seen
-            .and_then(|s| s.get(moment))
-            .and_then(aterm_json::Value::as_str)
-            .unwrap_or("(none reported)");
-        if at != identity {
-            return Some(format!(
-                "{ran} at the bench's {moment} was {at}, not the build's {identity}: another build \
-                 wrote that path"
-            ));
-        }
-    }
-    None
-}
-
-fn ledger_paths(dir: &Path, date: &str) -> (PathBuf, PathBuf) {
-    let mut n = 1;
-    loop {
-        let stem = if n == 1 {
-            format!("{date}-fabric")
-        } else {
-            format!("{date}-fabric-{n}")
-        };
-        let md = dir.join(format!("{stem}.md"));
-        let json = dir.join(format!("{stem}.json"));
-        if !md.exists() && !json.exists() {
-            return (md, json);
-        }
-        n += 1;
-    }
-}
-
-fn load_average() -> String {
-    arena::stdout_of(
-        aterm_uds::spawnfd::command(aterm_uds::os_path!("sysctl")).args(["-n", "vm.loadavg"]),
-    )
-    .map(|s| {
-        s.trim_matches(|c| c == '{' || c == '}' || c == ' ')
-            .to_string()
-    })
-    .filter(|s| !s.is_empty())
-    .unwrap_or_else(|| "unavailable".to_string())
-}
-
-fn cpus() -> String {
-    let logical = std::thread::available_parallelism()
-        .map_or_else(|_| "?".to_string(), |n| n.get().to_string());
-    match arena::stdout_of(
-        aterm_uds::spawnfd::command(aterm_uds::os_path!("sysctl"))
-            .args(["-n", "hw.perflevel0.physicalcpu"]),
-    )
-    .filter(|s| !s.is_empty())
-    {
-        Some(performance) => format!("{logical} logical, {performance} performance cores"),
-        None => format!("{logical} logical"),
-    }
-}
-
-struct Provenance<'a> {
-    scenario: bench_spec::Scenario,
-    date: &'a str,
-    machine: &'a str,
-    macos: &'a str,
-    aterm: &'a str,
-    astream: &'a str,
-    spec: &'a str,
-    profile: &'a str,
-    elapsed_s: f64,
-    command: &'a str,
-    build: &'a str,
-    thermal: &'a str,
-    cpus: &'a str,
-    load: &'a str,
-}
-
-impl Provenance<'_> {
-    fn render(&self) -> String {
-        let scenarios = match self.scenario {
-            bench_spec::Scenario::All => "post -> deliver, burst, ping-pong, attach",
-            selected => selected.word(),
-        };
-        format!(
-            "<!-- SPDX-License-Identifier: Apache-2.0 -->\n\
-             <!-- Copyright 2026 Andrew Yates -->\n\
-             \n\
-             # Fabric: {scenarios} — {date}\n\
-             \n\
-             Protocol: `docs/measured/fabric/README.md`. MEASURED, not judged. Append-only: a \
-             superseding run gets a new file.\n\
-             \n\
-             - **Machine:** {machine}\n\
-             - **macOS:** {macos}\n\
-             - **aterm:** {aterm} ({profile})\n\
-             - **astream:** vendor/astream at {astream}\n\
-             - **Run:** `{command}` ({spec}), {elapsed:.1} s\n\
-             - **Build:** {build}\n\
-             - **Thermal:** {thermal}\n\
-             - **CPUs:** {cpus}\n\
-             - **Load average (1/5/15 min):** {load}\n",
-            date = self.date,
-            machine = self.machine,
-            macos = self.macos,
-            aterm = self.aterm,
-            profile = self.profile,
-            astream = self.astream,
-            command = self.command,
-            spec = self.spec,
-            elapsed = self.elapsed_s,
-            build = self.build,
-            thermal = self.thermal,
-            cpus = self.cpus,
-            load = self.load,
-        )
-    }
+    format!("Fabric: {scenarios}")
 }
 
 #[cfg(test)]
@@ -956,7 +579,7 @@ mod tests {
                 .bench_words(Path::new("/s"), shipped),
             "out=/s durability=ordered horizon_ms=100"
         );
-        for word in ["all", "messaging", "pingpong", "attach", "handoff"] {
+        for word in ["all", "messaging", "pingpong", "attach", "handoff", "ask"] {
             let mut selected = BTreeMap::new();
             selected.insert("--scenario", word.to_string());
             let a = Args::from_options(&selected).expect(word);
@@ -1085,6 +708,73 @@ mod tests {
         }
     }
 
+    /// B09: the attach world's backlog reaches the bench's words and each
+    /// entry's Run line, and the bench's own refusals reach the flag (500,000
+    /// records at the default three attach sizes fill past the `ev` rule's bytes).
+    #[test]
+    fn the_attach_backlog_reaches_the_bench_and_the_ledger() {
+        let shipped = Arm::shipped();
+        for n in ["0", "400000"] {
+            let mut o = BTreeMap::new();
+            o.insert("--attach-backlog", n.to_string());
+            o.insert("--scenario", "attach".to_string());
+            let a = Args::from_options(&o).expect("parses");
+            assert_eq!(
+                a.bench_words(Path::new("/s"), shipped),
+                format!("out=/s scenario=attach backlog={n} durability=ordered horizon_ms=100")
+            );
+            assert!(
+                a.command_line(shipped)
+                    .contains(&format!(" --scenario attach --attach-backlog {n} ")),
+                "{}",
+                a.command_line(shipped)
+            );
+        }
+        let a = Args::from_options(&BTreeMap::new()).expect("bare");
+        assert!(!a.bench_words(Path::new("/s"), shipped).contains("backlog"));
+        for (scenario, bad) in [
+            ("attach", "-1"),
+            ("attach", "many"),
+            ("attach", "1000001"),
+            ("attach", "500000"),
+            ("pingpong", "10"),
+        ] {
+            let mut o = BTreeMap::new();
+            o.insert("--attach-backlog", bad.to_string());
+            o.insert("--scenario", scenario.to_string());
+            assert!(Args::from_options(&o).is_err(), "{scenario} {bad}");
+        }
+    }
+
+    #[test]
+    fn the_asks_and_the_mix_reach_the_bench_and_the_ledger() {
+        let shipped = Arm::shipped();
+        let mut o = BTreeMap::new();
+        o.insert("--scenario", "ask".to_string());
+        o.insert("--asks", "40".to_string());
+        o.insert("--mix-every", "5".to_string());
+        let a = Args::from_options(&o).expect("parses");
+        let words = a.bench_words(Path::new("/s"), shipped);
+        assert_eq!(
+            words,
+            "out=/s scenario=ask asks=40 mix_every=5 durability=ordered horizon_ms=100"
+        );
+        let spec = bench_spec::parse(&words).expect("the bench reads them");
+        assert_eq!((spec.asks, spec.mix_every), (40, 5));
+        let line = a.command_line(shipped);
+        assert!(
+            line.contains(" --scenario ask ") && line.contains(" --asks 40 --mix-every 5 "),
+            "{line}"
+        );
+        let bare = Args::from_options(&BTreeMap::new()).expect("bare");
+        assert!(!bare.bench_words(Path::new("/s"), shipped).contains("asks"));
+        for (flag, bad) in [("--asks", "0"), ("--asks", "x"), ("--mix-every", "0")] {
+            let mut o = BTreeMap::new();
+            o.insert(flag, bad.to_string());
+            assert!(Args::from_options(&o).is_err(), "{flag} {bad}");
+        }
+    }
+
     #[test]
     fn the_arms_run_in_order_and_alternate_by_pass() {
         use bench_spec::Tier;
@@ -1128,53 +818,6 @@ mod tests {
         );
         o.insert("--json-out", "/tmp/f.json".to_string());
         assert!(Args::from_options(&o).is_err(), "eight runs, one file");
-    }
-
-    #[test]
-    fn the_build_git_facts_are_the_callers_three_or_one_probe() {
-        let probe = || {
-            [
-                "0123456789ab-dirty".to_string(),
-                "0123456789abcdef".to_string(),
-                "7".to_string(),
-            ]
-        };
-        let pinned = git_facts(
-            |key| Some(format!("pinned {key}")),
-            || panic!("probed beside the caller's three pins"),
-        );
-        assert_eq!(
-            pinned.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
-            GIT_FACTS
-        );
-        assert!(
-            pinned
-                .iter()
-                .all(|(key, value)| *value == format!("pinned {key}")),
-            "{pinned:?}"
-        );
-        let partials: [fn(&str) -> Option<String>; 3] = [
-            |key: &str| (key != "ATERM_BUILD_DEV_COMMITS").then(|| "x".to_string()),
-            |key: &str| {
-                Some(if key == "ATERM_BUILD_GIT_COMMIT" {
-                    " ".to_string()
-                } else {
-                    "x".to_string()
-                })
-            },
-            |_: &str| None,
-        ];
-        for partial in partials {
-            let facts = git_facts(partial, probe);
-            assert_eq!(
-                facts
-                    .into_iter()
-                    .map(|(_, value)| value)
-                    .collect::<Vec<_>>(),
-                probe(),
-                "short of three pins, all three are probed"
-            );
-        }
     }
 
     #[test]
@@ -1231,99 +874,6 @@ mod tests {
             o.insert("--profile", bad.to_string());
             let why = Args::from_options(&o).expect_err(bad);
             assert!(why.contains("`dev` or `opt`"), "{bad}: {why}");
-        }
-    }
-
-    #[test]
-    fn the_built_aterm_is_the_binary_cargo_reports() {
-        let messages = [
-            r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"aterm"},"executable":null,"fresh":true}"#,
-            r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"aterm"},"filenames":["/w/target/opt-test/aterm"],"executable":"/w/target/opt-test/aterm","fresh":false}"#,
-            r#"{"reason":"compiler-artifact","target":{"kind":["bench"],"name":"fabric_bench"},"executable":"/c/.cargo-build/opt-test/deps/fabric_bench-7b2c","fresh":false}"#,
-            r#"{"reason":"build-finished","success":true}"#,
-            "not json: a stray line",
-        ]
-        .join("\n");
-        assert_eq!(
-            built_binary(&messages, "aterm"),
-            Ok(PathBuf::from("/w/target/opt-test/aterm"))
-        );
-        assert!(built_binary(&messages, "aterm-ctl").is_err());
-        let nameless = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"aterm"},"executable":null}"#;
-        assert!(built_binary(nameless, "aterm").is_err());
-    }
-
-    #[test]
-    fn a_report_of_another_path_or_another_file_there_is_another_build() {
-        let built = Path::new("/w/target/opt-test/aterm");
-        let id = "87127144 bytes, modified 1792221563.000000001";
-        let report = |path: &str, start: &str, end: &str| {
-            aterm_json::json!({
-                "aterm_binary": path,
-                "aterm_binary_identity": { "start": start, "end": end },
-            })
-        };
-        let path = built.to_str().expect("utf-8");
-        assert_eq!(another_build(&report(path, id, id), built, id), None);
-        let why =
-            another_build(&report("/w/target/debug/aterm", id, id), built, id).expect("refused");
-        assert!(why.contains("/w/target/debug/aterm"), "{why}");
-        let other = "84000000 bytes, modified 1792221999.000000001";
-        for (start, end, moment) in [(other, id, "start"), (id, other, "end")] {
-            let why = another_build(&report(path, start, end), built, id).expect("refused");
-            assert!(why.contains(moment) && why.contains(other), "{why}");
-        }
-        let bare = aterm_json::json!({ "aterm_binary": path });
-        assert!(another_build(&bare, built, id).is_some());
-    }
-
-    #[test]
-    fn a_second_run_on_one_day_gets_its_own_entry() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
-        let (md, json) = ledger_paths(dir.path(), "2026-10-16");
-        assert!(md.ends_with("2026-10-16-fabric.md"), "{}", md.display());
-        assert!(json.ends_with("2026-10-16-fabric.json"));
-        std::fs::write(&md, "x").expect("write");
-        let (md2, json2) = ledger_paths(dir.path(), "2026-10-16");
-        assert!(md2.ends_with("2026-10-16-fabric-2.md"), "{}", md2.display());
-        assert!(json2.ends_with("2026-10-16-fabric-2.json"));
-    }
-
-    #[test]
-    fn the_entry_head_carries_every_provenance_field() {
-        let p = Provenance {
-            scenario: bench_spec::Scenario::All,
-            date: "2026-10-16",
-            machine: "Apple M5 Max",
-            macos: "27.0",
-            aterm: "abc123",
-            astream: "6aab5d26a405",
-            spec: "samples=200",
-            profile: "dev",
-            elapsed_s: 81.0,
-            command: "targo --unverified verify perf fabric",
-            build: "`dev` — 96 units on the measured path: opt-level 0 ×87",
-            thermal: "No thermal warning level has been recorded",
-            cpus: "18 logical, 6 performance cores",
-            load: "5.62 4.40 4.08 before the build, 6.00 5.00 4.00 after the run",
-        };
-        let head = p.render();
-        for (field, value) in [
-            ("date", p.date),
-            ("machine", p.machine),
-            ("macos", p.macos),
-            ("aterm", p.aterm),
-            ("astream", p.astream),
-            ("spec", p.spec),
-            ("profile", p.profile),
-            ("elapsed", "81.0"),
-            ("command", p.command),
-            ("build", p.build),
-            ("thermal", p.thermal),
-            ("cpus", p.cpus),
-            ("load", p.load),
-        ] {
-            assert!(head.contains(value), "the head lost the {field}:\n{head}");
         }
     }
 }

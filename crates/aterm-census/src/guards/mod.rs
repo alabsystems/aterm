@@ -17,10 +17,12 @@ mod agent_gate;
 mod aos_step;
 mod bridge_fx;
 mod captures;
+mod closure_anchor;
 mod doc_sentence;
 mod doors;
 mod eager_drop;
 mod export_content;
+mod export_includes;
 mod generated;
 mod github;
 mod grants;
@@ -32,6 +34,7 @@ mod machines;
 mod mint;
 mod mktemp;
 mod rules;
+mod rustup_keg;
 mod shown_term;
 mod slog_inert;
 mod stock_label;
@@ -85,6 +88,7 @@ pub const GUARDS: &[Rule] = &[
     keys::KEY_MATERIAL,
     captures::CAPTURE_PRIVACY,
     export_content::EXPORT_CONTENT,
+    export_includes::EXPORT_INCLUDES,
     doors::DEVTOOLS_DOOR,
     machines::MACHINES_ROOT_DOOR,
     doors::FFI_DOOR,
@@ -94,6 +98,7 @@ pub const GUARDS: &[Rule] = &[
     mint::LAUNCHER_MINT,
     grants::PROMPT_GRANT,
     mktemp::CHECKED_MKTEMP,
+    rustup_keg::RUSTUP_KEG,
     installer::INSTALLER_NETWORK,
     agent_gate::AGENT_GATE,
     term_write::TERM_WRITE,
@@ -105,6 +110,7 @@ pub const GUARDS: &[Rule] = &[
     github::GITHUB_AUTH_DOOR,
     github::GH_SPAWN,
     github::AGH_FX,
+    closure_anchor::CLOSURE_ANCHOR,
     rules::LICENCE_HEADER,
     generated::GENERATED_SEAL,
 ];

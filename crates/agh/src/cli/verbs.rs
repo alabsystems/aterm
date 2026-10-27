@@ -16,9 +16,10 @@ pub enum Class {
     Read,
     /// A listing.
     List,
-    /// This machine only (`whoami --verify` also asks GitHub as each profile).
+    /// This machine only (`whoami --verify` also asks GitHub as each profile, and with no
+    /// agh.toml, `whoami` and `auth status` learn a vault token's login once, design §6.10).
     Local,
-    /// A person provisions an identity.
+    /// Provisions an identity (an agent as a person does, owner ruling 2026-10-26).
     Provision,
     /// As its method says (`api`).
     ByMethod,
@@ -518,7 +519,7 @@ pub static VERBS: &[Verb] = &[
         path: &["auth", "status"],
         class: Class::Local,
         usage: "agh auth status",
-        summary: "every profile and ambient token, with presence and fingerprint, and agh.toml's faults",
+        summary: "every profile, from agh.toml or the vault, and ambient token, with presence and faults",
         example: "agh auth status",
         noun: Noun::Policy,
         gh: "gh auth status",
@@ -531,7 +532,7 @@ pub static VERBS: &[Verb] = &[
         path: &["auth", "add"],
         class: Class::Provision,
         usage: "agh auth add NAME (--file PATH | --stdin) --tier dev|release|external [--owner OWNER]... [--write [--drafts]]",
-        summary: "a person provisions a profile from a token file or stdin",
+        summary: "provision a profile from a token file or stdin, with or without a terminal",
         example: "agh auth add <name> --file <path> --tier dev --owner <owner>",
         noun: Noun::Identity,
         gh: "gh auth login",
@@ -563,7 +564,7 @@ pub static VERBS: &[Verb] = &[
         path: &["auth", "remove"],
         class: Class::Provision,
         usage: "agh auth remove NAME",
-        summary: "remove a profile and every reference to it, and the token file --stdin wrote",
+        summary: "remove a profile, its references and the token file --stdin wrote; or forget a vault login",
         example: "agh auth remove <name>",
         noun: Noun::Policy,
         gh: "gh auth logout",
@@ -736,7 +737,7 @@ pub static REFUSED: &[Refused] = &[
     Refused {
         path: &["auth", "login"],
         why: "agh has no device flow",
-        next: "a person runs: agh auth add NAME --file PATH --tier TIER",
+        next: "agh auth add NAME --file PATH --tier TIER",
     },
     Refused {
         path: &["auth", "token"],
@@ -746,7 +747,7 @@ pub static REFUSED: &[Refused] = &[
     Refused {
         path: &["auth", "import"],
         why: "importing a gh login arrives in M2",
-        next: "a person runs: agh auth add NAME --stdin --tier TIER < FILE",
+        next: "agh auth add NAME --stdin --tier TIER < FILE",
     },
     Refused {
         path: &["auth", "git-credential"],

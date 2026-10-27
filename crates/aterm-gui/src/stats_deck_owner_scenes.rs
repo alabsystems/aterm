@@ -87,6 +87,26 @@ fn flat(n: usize, heat: f64, over_every: Option<usize>) -> Vec<Bucket> {
         .collect()
 }
 
+/// Six hours of ten-minute cells for `ring`: its ten-minute means, newest last. A ring that holds
+/// the whole hour has its hour played again back to six hours, so a scene's 1 h blocks read as its
+/// hour does; a shorter one (a series the sketch reads for its strip alone) has nothing older, so
+/// its 10 min and 1 h blocks agree that it was not read.
+fn long_of(ring: &[Cell]) -> Vec<Cell> {
+    let tens: Vec<Cell> = ring
+        .rchunks(60)
+        .map(|c| Cell::merge(c.iter().copied()))
+        .collect();
+    let whole = ring.len() >= HOUR;
+    let mut long: Vec<Cell> = (0..aterm_vitals::ring::LONG_BUCKETS)
+        .map(|i| {
+            let at = if whole { i % tens.len().max(1) } else { i };
+            tens.get(at).copied().unwrap_or_default()
+        })
+        .collect();
+    long.reverse();
+    long
+}
+
 /// A row of `cells` (oldest first, the open bucket last) against `cap`, `now` raw.
 fn view(now: f64, cap: f64, cells: &[Bucket], aterm: ScopeFig, tab: ScopeFig) -> ResourceView {
     let ring: Vec<Cell> = cells
@@ -106,6 +126,8 @@ fn view(now: f64, cap: f64, cells: &[Bucket], aterm: ScopeFig, tab: ScopeFig) ->
         heat_now: Some((now / cap) as f32),
         over: cells.last().is_some_and(|c| c.1),
         recent: readings_of(&ring, AT),
+        long: long_of(&ring).into(),
+        long_k: AT.div_euclid(aterm_vitals::ring::LONG_BUCKET_MS),
         ring: ring.into(),
         ring_k: AT.div_euclid(10_000),
         aterm,
@@ -130,6 +152,7 @@ fn series(now: f64, cap: f64, cells: &[Bucket], binds: bool) -> Series {
         now: Some(now),
         capacity: Some(cap),
         recent: readings_of(&ring, AT),
+        long: long_of(&ring).into(),
         ring: ring.into(),
         binds,
     }
@@ -509,6 +532,8 @@ pub(crate) fn owner_scene(o: Owner) -> Snapshot {
 /// The deck at the owner's window for `snap`: Full, 1039 pt at 2×, 110 pt tall, dark.
 pub(crate) fn owner_input(snap: &Snapshot) -> DeckInput<'_> {
     DeckInput {
+        network: None,
+        network_target: crate::network_deck::Target::Overview,
         snap: Some(snap),
         prev_snap: None,
         tab_panes: vec![FRONT],
@@ -582,7 +607,8 @@ fn the_owner_window_is_110_pt_and_the_glance_tier() {
 
 /// The deck says more only while the Mac struggles, in Full and in Folded at the owner's window:
 /// the glance's words appear only when unusual, the key shows "over max" only while a strip draws
-/// it, and "now" stays beside each live dot.
+/// it, and "now" stays beside each live dot but where a state no row has room to say takes its
+/// place over the names (the marker's line still marks now down the rows).
 #[test]
 fn the_deck_says_more_only_when_the_mac_struggles() {
     let m = FaceMetrics::helvetica_neue();
@@ -677,31 +703,40 @@ fn the_deck_says_more_only_when_the_mac_struggles() {
                     "{form:?} {o:?} says {gone:?}: {runs:?}"
                 );
             }
+            // The legend names this Mac, with its totals where no run says each row's maximum.
             assert!(
-                !runs
-                    .iter()
-                    .any(|r| r.contains(" of 18 cores") || r.contains(" of 128 GiB")),
-                "{form:?} {o:?}: no denominator but Network's peak: {runs:?}"
-            );
-            assert!(
-                runs.iter().any(|r| r == "this Mac"),
+                runs.iter()
+                    .any(|r| r == "this Mac" || r.starts_with("this Mac \u{b7} ")),
                 "{form:?} {o:?}: {runs:?}"
             );
             let dots = if form == DeckForm::Full { 1 } else { 2 };
-            assert_eq!(
-                runs.iter().filter(|r| *r == "now").count(),
-                dots,
+            let head = owner_laid_at(*o, form, OWNER_W, &m).head.expect("a header");
+            let stated = head
+                .labels
+                .iter()
+                .filter(|l| matches!(l.label, plan::Label::State(_)))
+                .count();
+            let nows = runs.iter().filter(|r| *r == "now").count();
+            assert!(
+                nows <= dots && nows + stated >= dots,
                 "{form:?} {o:?}: \"now\" beside each live edge's dot: {runs:?}"
             );
+            if matches!(o, Owner::Idle | Owner::Light) {
+                assert_eq!(nows, dots, "{form:?} {o:?}: a calm deck says now: {runs:?}");
+            }
         }
     }
 }
 
-/// The glance is Full wide and mid's at every width, Details or none, and every Folded tier's
-/// (the form every window draws unless Full is chosen): only Full narrow and slim say the words
-/// before it, under the headers that key them.
+/// Every form at every width says each row's reading once, in one run at the end of its bar
+/// (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §3), where a bar at least as long as the run
+/// leaves it room: this Mac's reading in the row's unit with the row's maximum; never aterm's or
+/// this tab's figures in a run of their own, which the bar's segments show. Where no run stands,
+/// the legend names this Mac with its totals where they fit (Folded's at the owner's widths
+/// always), so the deck still says each row's maximum. The legend over the bars names the three
+/// scopes once.
 #[test]
-fn the_glance_is_full_wide_and_mid_and_every_folded_tier() {
+fn the_run_says_the_machines_reading_where_it_fits() {
     let m = FaceMetrics::helvetica_neue();
     let snap = owner_scene(Owner::Light);
     let said = |w: f64, form: DeckForm| -> Vec<String> {
@@ -712,72 +747,92 @@ fn the_glance_is_full_wide_and_mid_and_every_folded_tier() {
         let words = DeckWords::new(&input, &m);
         runs(&lay(&owner_geom_at(form, w, 2.0), &input, &words, &m, true))
     };
-    let mid = plan::plan_full(900.0, &m);
-    assert_eq!(
-        (mid.kind, mid.details),
-        (FullKind::Mid, None),
-        "CONTROL: mid at 900 pt has no Details"
-    );
-    let folded = |w: f64| plan::plan_folded(w, &m).blocks[0].kind;
-    assert_eq!(
-        [1424.0, 1119.0, OWNER_W, 750.0, 550.0, 350.0].map(folded),
-        [
-            BlockKind::Wide,
-            BlockKind::Wide,
-            BlockKind::Mid,
-            BlockKind::Narrow,
-            BlockKind::Slim,
-            BlockKind::Slim
-        ],
-        "CONTROL: every Folded tier"
-    );
-    let amounts = [
-        "0.8 cores",
-        "16.5 GiB",
-        "1.31 TB",
-        "18 of 200 KB/s peak",
-        "743",
+    let readings = [
+        ("0.8", "of 18 cores", "cores"),
+        ("16.5", "of 128 GiB", "GiB"),
+        ("1.31", "of 2.00 TB", "TB"),
     ];
-    for (w, form, scopes) in [
-        (900.0, DeckForm::Full, true),
-        (OWNER_W, DeckForm::Full, true),
-        (1424.0, DeckForm::Full, true),
-        (1424.0, DeckForm::Folded, true),
-        (1119.0, DeckForm::Folded, true),
-        (OWNER_W, DeckForm::Folded, false),
-        (750.0, DeckForm::Folded, false),
+    let scopes = ["0.4", "0.1", "2.2", "0.5", "48", "3"];
+    let (mut with_run, mut without) = (0, 0);
+    for (w, form) in [
+        (1424.0, DeckForm::Full),
+        (OWNER_W, DeckForm::Full),
+        (900.0, DeckForm::Full),
+        (700.0, DeckForm::Full),
+        (550.0, DeckForm::Full),
+        (2560.0, DeckForm::Folded),
+        (1424.0, DeckForm::Folded),
+        (OWNER_W, DeckForm::Folded),
+        (940.0, DeckForm::Folded),
     ] {
         let runs = said(w, form);
-        let figures: &[&str] = if scopes { &["0.4", "48"] } else { &[] };
-        for glance in amounts.iter().chain(figures) {
+        let (run, pt) = match form {
+            DeckForm::Full => {
+                let p = plan::plan_full(w, &m);
+                (p.meter.run, p.rows.amount_pt)
+            }
+            DeckForm::Folded => {
+                let p = plan::plan_folded(w, &m);
+                (p.blocks[0].meter.run, p.blocks[0].rows.amount_pt)
+            }
+        };
+        for (mac, max, unit) in readings {
+            let long = format!("{mac} {max}");
+            let short = format!("{mac} {unit}");
+            match run {
+                Some(run) => {
+                    assert!(
+                        m.width(&long, pt, false) <= run.w + 1e-9,
+                        "{w} pt {form:?}: {long:?} fits the run {run:?}"
+                    );
+                    assert!(
+                        runs.contains(&long),
+                        "{w} pt {form:?}: {long:?} in {runs:?}"
+                    );
+                }
+                None => assert!(
+                    !runs.iter().any(|r| *r == long || *r == short),
+                    "{w} pt {form:?}: no run, yet {mac:?} is said: {runs:?}"
+                ),
+            }
             assert!(
-                runs.iter().any(|r| r == glance),
-                "{w} pt {form:?}: {glance:?} in {runs:?}"
+                !runs.contains(&short),
+                "{w} pt {form:?}: {short:?} without its maximum: {runs:?}"
             );
         }
+        if run.is_some() {
+            with_run += 1;
+        } else {
+            without += 1;
+        }
+        let machine: Vec<&String> = runs.iter().filter(|r| r.starts_with("this Mac")).collect();
+        assert_eq!(machine.len(), 1, "{w} pt {form:?}: this Mac once: {runs:?}");
+        let totals = machine[0].starts_with("this Mac \u{b7} ");
         assert!(
-            !runs
-                .iter()
-                .any(|r| r.starts_with("busy ") || r == "Global" || r.contains("0.2 MB/s peak")),
-            "{w} pt {form:?}: {runs:?}"
+            if run.is_some() {
+                !totals
+            } else {
+                totals || form == DeckForm::Full
+            },
+            "{w} pt {form:?}: the legend's totals where no run says the maxima: {runs:?}"
         );
+        for scope in ["aterm", "Tab 1"] {
+            assert_eq!(
+                runs.iter().filter(|r| *r == scope).count(),
+                1,
+                "{w} pt {form:?}: {scope:?} once in the legend: {runs:?}"
+            );
+        }
+        for lone in scopes {
+            assert!(
+                !runs.iter().any(|r| r == lone),
+                "{w} pt {form:?}: a scope's {lone:?} in a run of its own: {runs:?}"
+            );
+        }
     }
-    for w in [550.0, 350.0] {
-        let runs = said(w, DeckForm::Folded);
-        assert!(
-            !runs
-                .iter()
-                .any(|r| amounts.contains(&r.as_str()) || r == "Global"),
-            "{w} pt Folded slim says no amount: {runs:?}"
-        );
-    }
-    let before = said(700.0, DeckForm::Full);
     assert!(
-        before
-            .iter()
-            .any(|r| r.starts_with("0.0") && r.ends_with("0.2 MB/s peak"))
-            && before.iter().any(|r| r == "Global"),
-        "Full narrow keeps 0.134's words: {before:?}"
+        with_run >= 4 && without >= 3,
+        "CONTROL: tables with and without a run: {with_run}, {without}"
     );
 }
 
@@ -797,7 +852,7 @@ fn the_folded_gauge_sits_top_left_inside_its_slot() {
     let (mut drawn, mut bare) = (0, 0);
     for s in [1.0, 2.0] {
         for w in [
-            1424.0, 1119.0, OWNER_W, 750.0, 550.0, 450.0, 417.0, 416.0, 350.0,
+            1424.0, 1119.0, OWNER_W, 750.0, 550.0, 450.0, 419.0, 418.0, 350.0,
         ] {
             let plan = plan::plan_folded(w, &m);
             let laid = lay(
@@ -814,7 +869,7 @@ fn the_folded_gauge_sits_top_left_inside_its_slot() {
                 .map(|b| b.r)
                 .collect();
             let Some(g) = plan.gauge else {
-                assert!(w < 417.0, "{w} pt has room for the gauge");
+                assert!(w < 419.0, "{w} pt has room for the gauge");
                 assert!(dials.is_empty(), "{w} pt draws no gauge: {dials:?}");
                 bare += 1;
                 continue;
@@ -885,8 +940,9 @@ fn owner_laid_at(o: Owner, form: DeckForm, w: f64, m: &FaceMetrics) -> Laid {
 }
 
 /// The six scenes for a person to read beside the sketches: Full and Folded at the owner's 1039 pt
-/// window and Folded at 550 and 350 pt, all at 2×, dark as the sketches are and light as nobody
-/// sketched them, with each layout's text runs in `owner_text.tsv`. All are laid on the UI face
+/// window, Folded at 750, 550 and 350 pt and Full at 700, 400 and 350 pt, all at 2×, dark as the
+/// sketches are and light as nobody sketched them, with each layout's text runs in
+/// `owner_text.tsv`. All are laid on the UI face
 /// this host installs, as [`deck_paint`] lays the PNG, so the table says what the picture shows: a
 /// clause that fits on that face can fall to its short form on the tests' Helvetica Neue advances.
 #[test]
@@ -898,11 +954,18 @@ fn deck_owner_gallery() {
     let dir = std::path::PathBuf::from(dir);
     std::fs::create_dir_all(&dir).expect("the gallery directory");
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    // The owner's width in both forms, then narrower ones, where the run gives way to the bar and
+    // the bar to its place under the % (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §2).
     let layouts = [
         (DeckForm::Full, OWNER_W),
         (DeckForm::Folded, OWNER_W),
+        (DeckForm::Folded, 940.0),
+        (DeckForm::Folded, 750.0),
         (DeckForm::Folded, 550.0),
         (DeckForm::Folded, 350.0),
+        (DeckForm::Full, 700.0),
+        (DeckForm::Full, 400.0),
+        (DeckForm::Full, 350.0),
     ];
     let mut tsv = String::from("scene\tform\tpt\truns\tchars\ttext\n");
     let mut written = 0;
@@ -955,6 +1018,204 @@ fn deck_owner_gallery() {
     assert_eq!(written, Owner::ALL.len() * layouts.len() * 2);
 }
 
+/// The owner's 0.144.0 window (`docs/DESIGN-stats-deck-owner-2026-10-26.md`), 1248 pt at 2×,
+/// Full and Folded, idle, busy and hot-hard, on Default (the owner's, a green accent), Default
+/// Light and Tokyo Night (a blue accent): the frames a person compares before and after.
+#[test]
+#[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
+fn deck_owner_compare_gallery() {
+    let Some(dir) = std::env::var_os("ATERM_DECK_GALLERY") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).expect("the gallery directory");
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut written = 0;
+    for o in [Owner::Idle, Owner::Busy, Owner::HotHard] {
+        let snap = owner_scene(o);
+        for form in [DeckForm::Full, DeckForm::Folded] {
+            for (theme, name) in [
+                ("Default", "default"),
+                ("Default Light", "light"),
+                ("Tokyo Night", "tokyo"),
+            ] {
+                // The steam a frame of the live edge draws: only hot-hard's dial is hot enough.
+                let input = DeckInput {
+                    inks: theme_inks(theme),
+                    form,
+                    live: crate::stats_live::DeckLive {
+                        steam: Some(GALLERY_STEAM_MS),
+                        ..crate::stats_live::DeckLive::STILL
+                    },
+                    ..owner_input(&snap)
+                };
+                let g = owner_geom_at(form, 1248.0, 2.0);
+                let (prims, _) = deck_paint(&g, &input);
+                let (rgba, pw, ph) = crate::tray_raster::rasterize_tray(
+                    &prims,
+                    g.w as u32,
+                    g.h as u32,
+                    1.0,
+                    [0, 0, 0, 0],
+                );
+                let png = crate::app_introspect::encode_rgba8_png(&rgba, pw, ph)
+                    .expect("the frame encodes");
+                let form = if form == DeckForm::Full {
+                    "full"
+                } else {
+                    "folded"
+                };
+                let file = dir.join(format!("{form}_{}_{name}.png", o.name()));
+                std::fs::write(&file, png).expect("the PNG writes");
+                written += 1;
+            }
+        }
+    }
+    assert_eq!(written, 18);
+    // Hot-hard's steam over the beat's four frames, as the owner's window draws it.
+    let snap = owner_scene(Owner::HotHard);
+    let mut steam = 0;
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        for k in 0..4_i64 {
+            let input = DeckInput {
+                inks: theme_inks("Default"),
+                form,
+                live: crate::stats_live::DeckLive {
+                    steam: Some(GALLERY_STEAM_MS + 250 * k),
+                    ..crate::stats_live::DeckLive::STILL
+                },
+                ..owner_input(&snap)
+            };
+            let g = owner_geom_at(form, 1248.0, 2.0);
+            let (prims, _) = deck_paint(&g, &input);
+            let (rgba, pw, ph) =
+                crate::tray_raster::rasterize_tray(&prims, g.w as u32, g.h as u32, 1.0, [0; 4]);
+            let png =
+                crate::app_introspect::encode_rgba8_png(&rgba, pw, ph).expect("the frame encodes");
+            let form = if form == DeckForm::Full {
+                "full"
+            } else {
+                "folded"
+            };
+            let file = dir.join(format!("steam_{form}_hot-hard_{:03}ms.png", 250 * k));
+            std::fs::write(&file, png).expect("the PNG writes");
+            steam += 1;
+        }
+    }
+    assert_eq!(steam, 8);
+}
+
+/// The steam clock the gallery draws its frames at, ms.
+const GALLERY_STEAM_MS: i64 = 12_000;
+
+/// The dial steams only while it reads hot (`docs/DESIGN-stats-deck-owner-2026-10-26.md` §5):
+/// hot-hard's pinned dial lays its slot as a [`crate::stats_live::LiveLayer::Steam`] rect, the
+/// gauge's own, and on the steam's clock draws wisps inside that slot and nowhere else, a frame on
+/// drawn on; idle's and busy's dials (0.01 and 0.70, under the hot bloom's 0.78) lay no such rect
+/// and draw the same deck at any clock. A steam frame patches the card to the whole raster's
+/// bytes, Full and Folded, 1× and 2×, dark and light.
+#[test]
+fn only_a_hot_dial_steams_inside_its_slot_and_a_steam_frame_patches_byte_for_byte() {
+    use crate::stats_live::{DeckLive, LiveLayer};
+    let steam_at = |t: i64| DeckLive {
+        steam: Some(t),
+        ..DeckLive::STILL
+    };
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        for s in [1.0, 2.0] {
+            for (ground, inks) in [("dark", owner_inks()), ("light", super::light_inks())] {
+                let at = format!("{form:?} {s}x {ground}");
+                let g = owner_geom_at(form, 1248.0, s);
+                let paint = |o: Owner, live: DeckLive| {
+                    let snap = owner_scene(o);
+                    let input = DeckInput {
+                        inks,
+                        form,
+                        live,
+                        ..owner_input(&snap)
+                    };
+                    let (prims, _, out) = deck_paint_live(&g, &input);
+                    (prims, out)
+                };
+                let whole = |prims: &[DrawPrim]| {
+                    crate::tray_raster::rasterize_tray(prims, g.w as u32, g.h as u32, 1.0, [0; 4])
+                };
+                let (still, out) = paint(Owner::HotHard, DeckLive::STILL);
+                let rect = |layer| out.rects.iter().find(|r| r.0 == layer).map(|r| r.1);
+                assert!(rect(LiveLayer::Gauge).is_some(), "{at}: a dial");
+                assert_eq!(
+                    rect(LiveLayer::Steam),
+                    rect(LiveLayer::Gauge),
+                    "{at}: hot-hard steams in its dial's slot"
+                );
+                let (a, _) = paint(Owner::HotHard, steam_at(10_000));
+                let (b, _) = paint(Owner::HotHard, steam_at(10_250));
+                assert!(a.len() > still.len(), "{at}: the steam draws");
+                assert_ne!(
+                    format!("{a:?}"),
+                    format!("{b:?}"),
+                    "{at}: a frame on, it has risen"
+                );
+                let (base, pw, ph) = whole(&still);
+                let (steamy, _, _) = whole(&a);
+                let (x, y, w, h) = rect(LiveLayer::Steam).expect("the steam's rect");
+                let (x0, y0) = (x.floor().max(0.0) as u32, y.floor().max(0.0) as u32);
+                let (x1, y1) = (
+                    ((x + w).ceil().max(0.0) as u32).min(pw),
+                    ((y + h).ceil().max(0.0) as u32).min(ph),
+                );
+                let mut shown = 0;
+                for py in 0..ph {
+                    for px in 0..pw {
+                        let i = ((py * pw + px) * 4) as usize;
+                        if base[i..i + 4] != steamy[i..i + 4] {
+                            assert!(
+                                (x0..x1).contains(&px) && (y0..y1).contains(&py),
+                                "{at}: the steam drew at ({px}, {py}), outside its slot"
+                            );
+                            shown += 1;
+                        }
+                    }
+                }
+                assert!(shown > 0, "{at}: CONTROL: the steam shows");
+                let mut card = crate::SettingsCard {
+                    rgba: steamy,
+                    pw,
+                    ph,
+                    dx: 0,
+                    dy: 0,
+                    fp: 1,
+                    geom: 1,
+                    raster_fingerprint_once: std::sync::OnceLock::new(),
+                    scrim: None,
+                };
+                assert!(patch_live(
+                    &mut card,
+                    &b,
+                    &out.rects,
+                    &steam_at(10_000),
+                    &steam_at(10_250)
+                ));
+                assert!(
+                    card.rgba == whole(&b).0,
+                    "{at}: the steam's patch is the whole raster's bytes"
+                );
+                for o in [Owner::Idle, Owner::Busy] {
+                    let (cool, out) = paint(o, DeckLive::STILL);
+                    assert!(
+                        out.rects.iter().all(|r| r.0 != LiveLayer::Steam),
+                        "{at} {o:?}: a cool dial lays no steam"
+                    );
+                    assert!(
+                        format!("{:?}", paint(o, steam_at(10_250)).0) == format!("{cool:?}"),
+                        "{at} {o:?}: and draws none"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The gauge reads each scene as the sketches drew it: the needle the busier engine now (pinned
 /// past the redline in hot-hard), the bezel the hour. The soak is [`aterm_vitals::Strain`]'s,
 /// an exponential average with a 10 minute time constant (spike 0.21, recovering 0.54), and the
@@ -999,4 +1260,94 @@ fn the_gauge_reads_each_scene() {
             "{o:?}: the dial on the six rows"
         );
     }
+}
+
+/// Every scope shows its own ink in the bar under a % figure
+/// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5), read off the raster as a person sees it.
+/// The line nests its fills by length alone, each its whole height, so a scope above zero keeps a
+/// device px or more of its own ink past the fill inside it, however close the two round and
+/// where their shares are equal (the Hot-hard scene's Disk, the machine's 0.68 and aterm's), as
+/// the column shows it a rim: in every owner scene, Folded at 550 and 350 pt and Full under
+/// slim's width, at 1× and 2×.
+#[test]
+fn every_scope_shows_its_own_ink_in_the_bar_under_the_percent() {
+    let m = FaceMetrics::helvetica_neue();
+    let inks = owner_inks();
+    let scope_inks = [inks.machine, inks.aterm, inks.tab].map(|c| rgba(c, 0xFF));
+    let share = |v: Option<f32>| {
+        v.filter(|v| v.is_finite() && *v > 0.0)
+            .map_or(0.0, |v| v.clamp(0.0, 1.0))
+    };
+    let mut shown = 0;
+    for o in Owner::ALL {
+        let snap = owner_scene(o);
+        for (form, w) in [
+            (DeckForm::Folded, 450.0),
+            (DeckForm::Folded, 350.0),
+            (DeckForm::Full, 210.0),
+        ] {
+            for s in [1.0, 2.0] {
+                let at = format!("{o:?} {form:?} {w} pt {s}×");
+                let input = DeckInput {
+                    form,
+                    ..owner_input(&snap)
+                };
+                let words = DeckWords::new(&input, &m);
+                let g = owner_geom_at(form, w, s);
+                let laid = lay(&g, &input, &words, &m, true);
+                let (raster, pw, _) = crate::tray_raster::rasterize_tray(
+                    &laid.prims,
+                    g.w as u32,
+                    g.h as u32,
+                    1.0,
+                    [0, 0, 0, 0],
+                );
+                let pixel = |x: u32, y: u32| {
+                    let i = ((y * pw + x) * 4) as usize;
+                    [raster[i], raster[i + 1], raster[i + 2], raster[i + 3]]
+                };
+                for (ti, (rows, _, _, under)) in bar_tables(form, w, &m).into_iter().enumerate() {
+                    let col = under.unwrap_or_else(|| panic!("CONTROL {at}: bars under the %"));
+                    let first = if form == DeckForm::Full { 0 } else { ti * 4 };
+                    for r in 0..rows.count {
+                        let Some(&res) = DECK_RESOURCES.get(first + r as usize) else {
+                            continue;
+                        };
+                        let Some(fill) =
+                            words.rows.iter().find(|w| w.res == res).and_then(|w| w.bar)
+                        else {
+                            continue;
+                        };
+                        let base = px(rows.top(r) + rows.baseline, s);
+                        let next = px(rows.top(r + 1), s);
+                        let drawn = panels_at(&laid.prims, px(col.x, s), (base, next));
+                        let Some(&((x, y, lw, h), _)) = drawn.first() else {
+                            panic!("{at} {res:?}: no bar under the %");
+                        };
+                        // A row of the line clear of its rounded ends' corners.
+                        let mid = (y + (h / 2.0).floor()) as u32;
+                        let own = scope_inks.map(|ink| {
+                            (x as u32..(x + lw) as u32)
+                                .filter(|&px| pixel(px, mid) == ink)
+                                .count()
+                        });
+                        let (gs, ats, ts) =
+                            (share(fill.global), share(fill.aterm), share(fill.tab));
+                        for (k, share) in [gs, ats, ts].into_iter().enumerate() {
+                            if share > 0.0 {
+                                assert!(
+                                    own[k] >= 1,
+                                    "{at} {res:?}: {} shows no ink of its own: {own:?} px of \
+                                     the machine's, aterm's and this tab's (shares {gs} {ats} {ts})",
+                                    ["the machine", "aterm", "this tab"][k]
+                                );
+                                shown += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(shown > 100, "CONTROL: {shown} scopes above zero");
 }

@@ -146,7 +146,7 @@ pub struct Machine {
     pub browser: PathBuf,
     /// The checkout, whose `publish/config.sh` names the wasm32 pin.
     pub repo: PathBuf,
-    /// rustup's homes.
+    /// rustup's home and how the `rustup` row is resolved (its copy looked for in `tooling`).
     pub homes: stable::Homes,
 }
 
@@ -233,9 +233,10 @@ pub fn usage() -> String {
 Fetch or build the tools this checkout pins into this user's cache, each placed whole
 or not at all beside a stamp.json; each download is held to a pinned sha256 (pwsh's
 also to Microsoft's Developer ID), and wasm-bindgen builds from crates.io. The rustup
-row instead has rustup add stable with clippy, its cross targets and the wasm32 pin to
-rustup's homes, first installing rustup (auto-install off) from a pinned rustup-init
-where there is none. It reads the network.
+row copies the pinned rustup-init in as `rustup` (its self-install never runs, and
+nothing is written to CARGO_HOME), then has that copy add stable with clippy, its cross
+targets and the wasm32 pin to rustup's own home where they are missing (auto-install
+off first in a home it never ran in). It reads the network.
 
   (no ROW)    the rows every checkout needs
   --linux     and the Linux lane's VM: lima, Ubuntu's pinned image for its own VM, and
@@ -336,7 +337,8 @@ fn target(row: &Row, machine: &Machine) -> Option<Target> {
         | Install::Build { .. }
         | Install::Configure { .. }
         | Install::Cargo
-        | Install::Files { .. } => {
+        | Install::Files { .. }
+        | Install::Rustup { .. } => {
             let tool = row.tool_row()?;
             let pin = tool.pin?;
             if !pin.pinned_for(&machine.platform) {
@@ -390,7 +392,6 @@ fn target(row: &Row, machine: &Machine) -> Option<Target> {
                 sizes: Vec::new(),
             })
         }
-        Install::Rustup { .. } => None,
     }
 }
 
@@ -460,45 +461,64 @@ pub fn check(row: &Row, machine: &Machine, host: &dyn Host) -> State {
 /// or not pinned here. `--linux` holds the rustup row to the Linux lane's stable targets
 /// ([`stable::LINUX_LANE_TARGETS`]) too.
 pub fn check_for(row: &Row, opts: &Options, machine: &Machine, host: &dyn Host) -> State {
-    if matches!(row.install, Install::Rustup { .. }) {
-        let pin = match stable::wasm_pin_wanted(&machine.repo) {
-            Ok(pin) => pin,
-            Err(why) => return State::Missing(format!("rustup: the wasm32 pin — {why}")),
-        };
-        let lacks = stable::missing(&machine.homes, host.rustup(), pin.as_deref(), opts.linux);
-        return if lacks.is_empty() {
-            State::Present(machine.homes.rustup_home.clone())
-        } else {
-            State::Missing(format!("rustup: a run would {}", lacks.join("; ")))
-        };
-    }
     let Some(t) = target(row, machine) else {
         return State::NotPinned(not_pinned(row, machine));
     };
+    if matches!(row.install, Install::Rustup { .. }) {
+        return rustup_check(&t, opts.linux, machine, host);
+    }
     if complete(&t) {
         State::Present(t.dir.join(&t.exe))
-    } else if let Some(name) = short(&t).filter(|_| t.dir.join(&t.exe).is_file()) {
-        State::Missing(format!(
-            "{} {}: {} lacks {name} at its pinned size, which a run fetches again",
-            row.name,
+    } else {
+        State::Missing(not_complete(row.name, &t))
+    }
+}
+
+/// Why `t`, which is not [`complete`], is not in place.
+fn not_complete(name: &str, t: &Target) -> String {
+    if let Some(file) = short(t).filter(|_| t.dir.join(&t.exe).is_file()) {
+        format!(
+            "{name} {}: {} lacks {file} at its pinned size, which a run fetches again",
             t.version,
             t.dir.display()
-        ))
+        )
     } else if t.dir.join(&t.exe).is_file() {
-        State::Missing(format!(
-            "{} {}: {} holds a copy without this pin's stamp for {}, which a run replaces",
-            row.name,
+        format!(
+            "{name} {}: {} holds a copy without this pin's stamp for {}, which a run replaces",
             t.version,
             t.dir.display(),
             t.platform
-        ))
+        )
     } else {
-        State::Missing(format!(
-            "{} {}: not in {}",
-            row.name,
-            t.version,
-            t.dir.display()
-        ))
+        format!("{name} {}: not in {}", t.version, t.dir.display())
+    }
+}
+
+/// The rustup row, read only: its copy `t`, then what rustup's home lacks, read through the
+/// rustup the `rustup` row resolves (where none does, what a run reads once it is placed);
+/// `linux` holds stable to the Linux lane's targets too.
+fn rustup_check(t: &Target, linux: bool, machine: &Machine, host: &dyn Host) -> State {
+    let pin = match stable::wasm_pin_wanted(&machine.repo) {
+        Ok(pin) => pin,
+        Err(why) => return State::Missing(format!("rustup: the wasm32 pin — {why}")),
+    };
+    let mut lacks = Vec::new();
+    let placed = complete(t);
+    if !placed {
+        lacks.push(format!("place {}", not_complete("rustup", t)));
+    }
+    match stable::missing(&machine.homes, host.rustup(), pin.as_deref(), linux) {
+        Ok(steps) => lacks.extend(steps),
+        Err(_) if !placed => lacks.push(format!(
+            "then read {} for stable and the wasm32 pin",
+            machine.homes.rustup_home.display()
+        )),
+        Err(absent) => lacks.push(absent.why),
+    }
+    if lacks.is_empty() {
+        State::Present(t.dir.join(&t.exe))
+    } else {
+        State::Missing(format!("rustup: a run would {}", lacks.join("; ")))
     }
 }
 
@@ -516,12 +536,12 @@ pub fn provide_for(
     host: &dyn Host,
     say: &mut dyn FnMut(&str),
 ) -> State {
-    if let Install::Rustup { version, .. } = row.install {
-        return rustup_row(row, version, opts.linux, machine, host, say);
-    }
     let Some(t) = target(row, machine) else {
         return State::NotPinned(not_pinned(row, machine));
     };
+    if matches!(row.install, Install::Rustup { .. }) {
+        return rustup_row(row, &t, opts.linux, machine, host, say);
+    }
     let exe = t.dir.join(&t.exe);
     if complete(&t) {
         place::touch_stamp(&t.dir);
@@ -553,7 +573,7 @@ pub fn provide_for(
         }
         Install::Cargo => return cargo_row(row, &t, machine, host, say),
         Install::Browser(engine) => return browser_row(engine, &t, machine, host, say),
-        Install::Rustup { .. } => unreachable!("handled above"),
+        Install::Rustup { .. } => unreachable!("rustup_row places it"),
     };
     match done {
         Ok(exe) => State::Placed(exe),
@@ -564,61 +584,109 @@ pub fn provide_for(
     }
 }
 
-/// The rustup row: [`stable::run`], handed rustup-init at the pin where no rustup is installed;
-/// `linux` adds the Linux lane's stable targets.
+/// The proxies the rustup row lays beside its copy: what the release's compat slice runs by
+/// the copy's directory (`buildplan::release_rustup_shim_dir`).
+pub(crate) const RUSTUP_PROXIES: [&str; 2] = ["cargo", "rustc"];
+
+/// The rustup row: its copy `t` placed ([`place_rustup`]) where it is not complete, then
+/// [`stable::run`] with the rustup the `rustup` row resolves; `linux` adds the Linux lane's
+/// stable targets.
 fn rustup_row(
     row: &Row,
-    version: &str,
+    t: &Target,
     linux: bool,
     machine: &Machine,
     host: &dyn Host,
     say: &mut dyn FnMut(&str),
 ) -> State {
-    let fetched = if stable::lacks_rustup(&machine.homes) {
-        let fetched = (|| -> Result<(place::Scratch, PathBuf), String> {
-            let archive = row.archive_for(&machine.platform).ok_or_else(|| {
-                format!(
-                    "no rustup-init {version} is pinned for {}",
-                    machine.platform
-                )
-            })?;
-            let scratch = place::Scratch::new(&machine.tooling, row.name)?;
-            let url = archive.url_at(version);
-            let init =
-                place::fetch_checked(host, &scratch, &url, archive.sha256, archive.bytes, say)?;
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o755))
-                    .map_err(|e| format!("chmod {}: {e}", init.display()))?;
-            }
-            Ok((scratch, init))
-        })();
-        match fetched {
-            Ok(fetched) => Some(fetched),
-            Err(why) => return State::Failed(format!("rustup: rustup was not installed — {why}")),
-        }
+    let exe = t.dir.join(&t.exe);
+    let placed = if complete(t) {
+        place::touch_stamp(&t.dir);
+        false
     } else {
-        None
+        let archive = row
+            .archive_for(&machine.platform)
+            .expect("target() found it");
+        if let Err(why) = place_rustup(row, &archive, t, machine, host, say) {
+            return State::Failed(format!("{} {}: {why}", row.name, t.version));
+        }
+        true
     };
-    let init = fetched.as_ref().map(|(_, init)| init.as_path());
-    match stable::run(
-        &machine.repo,
-        &machine.homes,
-        host.rustup(),
-        init,
-        linux,
-        say,
-    ) {
-        Ok(acquired) if acquired.is_empty() => State::Present(machine.homes.rustup_home.clone()),
-        Ok(_) => State::Placed(machine.homes.rustup_home.clone()),
-        Err(why) => match fetched {
-            Some((scratch, _)) => State::Failed(format!(
-                "rustup: {why}; keeping rustup-init's scratch at {}",
-                scratch.keep().display()
-            )),
-            None => State::Failed(format!("rustup: {why}")),
-        },
+    match stable::run(&machine.repo, &machine.homes, host.rustup(), linux, say) {
+        Ok(acquired) if acquired.is_empty() && !placed => State::Present(exe),
+        Ok(_) => State::Placed(exe),
+        Err(why) => State::Failed(format!("{}: {why}", row.name)),
     }
+}
+
+/// rustup-init at its pin, held to its sha256 and copied into the tree as `bin/rustup`:
+/// rustup-init is rustup's multi-call binary, so under that name it is rustup itself, and
+/// [`RUSTUP_PROXIES`] are hard links to it. It answers `--version` as its pin from the
+/// scratch, over a scratch `RUSTUP_HOME` and `CARGO_HOME`, before it is stamped and placed.
+/// It never runs as an installer, so nothing is written to the account's `CARGO_HOME`.
+fn place_rustup(
+    row: &Row,
+    archive: &Archive,
+    t: &Target,
+    machine: &Machine,
+    host: &dyn Host,
+    say: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let url = archive.url_at(&t.version);
+    let scratch = place::Scratch::new(&machine.tooling, row.name)?;
+    let init = place::fetch_checked(host, &scratch, &url, archive.sha256, archive.bytes, say)?;
+    let tree = scratch.fresh("tree")?;
+    let rustup = tree.join(&t.exe);
+    let bin = rustup
+        .parent()
+        .ok_or_else(|| format!("{} has no directory", t.exe))?;
+    std::fs::create_dir_all(bin).map_err(|e| format!("could not create {}: {e}", bin.display()))?;
+    std::fs::copy(&init, &rustup)
+        .map_err(|e| format!("could not copy rustup-init to {}: {e}", rustup.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", rustup.display()))?;
+    }
+    for proxy in RUSTUP_PROXIES {
+        std::fs::hard_link(&rustup, bin.join(proxy))
+            .map_err(|e| format!("could not link {proxy} to {}: {e}", rustup.display()))?;
+    }
+    let homes = scratch.fresh("probe-homes")?;
+    let probe = Spawn {
+        program: rustup.clone(),
+        args: vec!["--version".into()],
+        cwd: scratch.path().to_path_buf(),
+        set: vec![
+            ("RUSTUP_HOME".into(), homes.join("rustup").into_os_string()),
+            ("CARGO_HOME".into(), homes.join("cargo").into_os_string()),
+        ],
+        remove: vec!["RUSTUP_TOOLCHAIN".into()],
+    };
+    let (scratch, out) = scratch
+        .run_copied(host, &probe)
+        .map_err(|e| format!("{} did not answer --version: {e}", rustup.display()))?;
+    let reports = out.lines().next().unwrap_or_default().trim().to_string();
+    if !reports.starts_with(&format!("rustup {} ", t.version)) {
+        return Err(format!(
+            "{} answers `{reports}`, not rustup {}",
+            rustup.display(),
+            t.version
+        ));
+    }
+    place::write_stamp(
+        &tree,
+        &t.stamp(row.name, Some(url), "sha256", Some(reports)),
+    )?;
+    place::place(&scratch, &tree, &t.dir, &|| complete(t))?;
+    say(&format!(
+        "placed {}: rustup-init {} under its multi-call name, with {} beside it; its \
+         self-install never ran, so nothing was written to CARGO_HOME",
+        t.dir.join(&t.exe).display(),
+        t.version,
+        RUSTUP_PROXIES.join(" and ")
+    ));
+    Ok(())
 }
 
 /// An unpacked row: fetch, check, unpack under its cap, hold the tree to its anchor and its
@@ -1095,12 +1163,13 @@ pub fn this_machine(repo: &Path) -> Option<Machine> {
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)?;
+    let tooling = aterm_uds::host::tooling_dir()?;
     Some(Machine {
         platform: platform_of(std::env::consts::OS, std::env::consts::ARCH, translated()),
-        tooling: aterm_uds::host::tooling_dir()?,
+        homes: stable::Homes::from_env(&home, &tooling),
+        tooling,
         browser: crate::browser::chromium::host_cache_root()?,
         repo: repo.to_path_buf(),
-        homes: stable::Homes::from_env(&home),
     })
 }
 

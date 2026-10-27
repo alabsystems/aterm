@@ -22,7 +22,7 @@ use std::{
     collections::BTreeSet,
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub(crate) mod enrollment;
@@ -61,6 +61,7 @@ pub struct Report {
 #[derive(Clone, Default, Debug)]
 pub struct Repair {
     peer: Option<(Trust, Actor)>,
+    authenticated: Option<Instant>,
     cursor: Option<Digest>,
     data: crate::replica::Repair,
     application: Option<crate::replica::Report>,
@@ -79,12 +80,22 @@ impl Repair {
     pub fn actor(&self) -> Option<Actor> {
         self.peer.map(|(_, actor)| actor)
     }
+    pub(crate) fn begin_round(&mut self) {
+        self.authenticated = None;
+    }
+    pub(crate) fn authenticated_actor(&self) -> Option<Actor> {
+        self.authenticated.and(self.actor())
+    }
+    pub(crate) fn authenticated_contact(&self) -> Option<(Actor, Instant)> {
+        self.actor().zip(self.authenticated)
+    }
     /// Only a fully completed application round has a report. None also covers
     /// legacy peers and deferred/failed upgrades, never a claim of no data.
     pub const fn application(&self) -> Option<crate::replica::Report> {
         self.application
     }
     fn prepare(&mut self, trust: Trust, actor: Actor) {
+        self.authenticated = Some(Instant::now());
         if self.peer != Some((trust, actor)) {
             self.cursor = None;
             self.peer = Some((trust, actor));
@@ -320,6 +331,7 @@ impl Endpoint {
         side: Side,
         repair: &mut Repair,
     ) -> Result<Report> {
+        repair.begin_round();
         repair.clear_application();
         let (tcp, locality) = connection.into_parts();
         locality.recheck()?;
@@ -400,12 +412,15 @@ impl Endpoint {
             return enrollment::serve(self, stream, proof, &hello, repair);
         }
         let actor = authenticate(self.trust, self.actor, proof, &hello)?;
+        let authenticated_at = Instant::now();
         repair.prepare(self.trust, actor);
+        repair.authenticated = Some(authenticated_at);
         repair.clear_application();
         // Opposite directions share local journals too. Lease either direction
         // so two simultaneous channels with one actor cannot race every batch.
         let mut lease = self.peers.acquire(actor, repair)?;
         lease.prepare(self.trust, actor);
+        lease.authenticated = Some(authenticated_at);
         lease.clear_application();
         if side == Side::Responder {
             send_frame(stream, &self.hello)?;

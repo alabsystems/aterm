@@ -1966,13 +1966,24 @@ impl Fleet {
     }
 
     /// [`Fleet::boot`] with the broker opened with `opts`.
-    pub fn boot_opts(_tag: &str, opts: OpenOptions) -> Self {
+    pub fn boot_opts(tag: &str, opts: OpenOptions) -> Self {
+        Self::boot_arm(tag, opts, true)
+    }
+
+    /// [`Fleet::boot_opts`], its broker retained by aterm's default rules
+    /// only when `retained` (as [`open_broker`] and
+    /// [`open_broker_unretained`] open one).
+    pub fn boot_arm(_tag: &str, opts: OpenOptions, retained: bool) -> Self {
         let scratch = aterm_tempfile::Builder::new()
             .prefix("a5-")
             .tempdir_in("/tmp")
             .expect("exclusive fleet scratch");
         let tmp = scratch.path().to_path_buf();
-        let broker = open_broker(tmp.join("b.log"), &opts);
+        let broker = if retained {
+            open_broker(tmp.join("b.log"), &opts)
+        } else {
+            open_broker_unretained(tmp.join("b.log"), &opts)
+        };
         let sock = tmp.join("b.sock").to_string_lossy().into_owned();
         assert_sock_fits(&sock);
         let handle = broker.serve(&sock).expect("serve the broker's socket");

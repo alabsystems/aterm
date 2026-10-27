@@ -7,11 +7,8 @@ use super::*;
 use crate::autopilot::HarnessSwitch;
 use aterm_effects::harness_card::CardPalette;
 
-const LIT: SwitchPaint = SwitchPaint {
-    face: HarnessSwitch::On,
-    hover: false,
-    version: None,
-};
+const LIT: SwitchPaint =
+    SwitchPaint::bare(HarnessSwitch::On, Some(aterm_phase::CliHarness::ClaudeCode));
 
 const VISION: &str = "implement the aos aterm vision";
 
@@ -34,6 +31,8 @@ fn run(len: usize) -> TopRun {
             ..blank()
         },
         voice: None,
+        tail: None,
+        end: 4 + len,
     }
 }
 
@@ -59,7 +58,7 @@ fn key(program: aterm_phase::Program, len: usize, palette: Option<CardPalette>) 
 
 fn composed(key: &TopKey, goal: Option<&str>) -> ComposedTop {
     let mut top = ComposedTop::default();
-    compose_top(key, &mut top, None, goal);
+    compose_top(key, &mut top, None, goal, &[]);
     top
 }
 
@@ -200,16 +199,32 @@ fn a_line_with_no_lockup_still_shows_the_goal_before_its_switch() {
 fn a_pane_footer_recomposes_its_top_line_when_the_goal_moves() {
     let mut footer = PaneFooter::default();
     let mut marks = MarkContents::default();
+    let mut rings = RingContents::default();
     let key = key(aterm_phase::Program::Claude, 120, None);
-    assert_eq!(footer.compose_top(key, &mut marks).goal_cols, None);
+    assert_eq!(
+        footer
+            .compose_top(key, &[], &mut marks, &mut rings)
+            .goal_cols,
+        None
+    );
     footer.note_goal(Some(VISION));
-    assert!(footer.compose_top(key, &mut marks).goal_cols.is_some());
+    assert!(
+        footer
+            .compose_top(key, &[], &mut marks, &mut rings)
+            .goal_cols
+            .is_some()
+    );
     footer.note_goal(Some("ship it"));
-    let top = footer.compose_top(key, &mut marks);
+    let top = footer.compose_top(key, &[], &mut marks, &mut rings);
     let cols = top.goal_cols.clone().expect("laid");
     assert_eq!(text_at(top, cols), " \u{25ce} ship it ");
     footer.note_goal(None);
-    assert_eq!(footer.compose_top(key, &mut marks).goal_cols, None);
+    assert_eq!(
+        footer
+            .compose_top(key, &[], &mut marks, &mut rings)
+            .goal_cols,
+        None
+    );
     assert_eq!(goal_term(None), 0);
     assert_ne!(goal_term(Some("a")), goal_term(Some("b")));
 }

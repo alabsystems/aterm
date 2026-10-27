@@ -8,7 +8,7 @@
 use std::cell::Cell;
 #[cfg(not(target_arch = "wasm32"))]
 use std::ffi::{CStr, c_void};
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -29,11 +29,11 @@ pub(crate) struct GlCaps {
     /// Whether both `EXT_sRGB_write_control` and `EXT_texture_sRGB_decode` are supported.
     pub(crate) srgb_views: bool,
     /// Symbol name of the context's `glGetGraphicsResetStatus` entry point.
-    #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) reset_query: Option<&'static CStr>,
     /// `EXT_read_format_bgra`: a readback can be `GL_BGRA_EXT`, the byte order of an X11 window's
     /// pixels (`surface`'s readback post).
-    #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) bgra_read: bool,
 }
 
@@ -66,13 +66,13 @@ pub(crate) struct GlShared {
     /// The context's `glGetGraphicsResetStatus`, where the context was made
     /// to report resets (a robust GLX context); `None` elsewhere, where it
     /// could only answer `GL_NO_ERROR`.
-    #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     reset_status: Option<ffi::GetGraphicsResetStatusFn>,
     /// A reset status the next [`Current::poll_reset`] reads in place of the
     /// driver's (`GL_NO_ERROR`: none): the drill on a GLX device, so its
     /// latch comes from the check a real reset hits, after the present's GLX
     /// calls; and the tests' statuses.
-    #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     inject_reset: AtomicU32,
     pub(crate) gl: GlFns,
     pub(crate) caps: GlCaps,
@@ -87,14 +87,6 @@ pub(crate) struct GlShared {
 /// type stays `Send`).
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    wgpu_arm,
-    expect(
-        dead_code,
-        reason = "a build carrying wgpu attaches windows on wgpu; the shipped build's \
-                  window attach names these"
-    )
-)]
 pub(crate) enum WindowSystem {
     /// An Xlib `Display*` and the screen number.
     X11 { display: usize, screen: i32 },
@@ -107,7 +99,6 @@ pub(crate) enum WindowSystem {
 enum Binding {
     Egl(EglBinding),
     /// An X11 window system's GLX context (`super::glx`).
-    #[cfg(not(wgpu_arm))]
     Glx(super::glx::GlxContext),
 }
 
@@ -125,10 +116,6 @@ pub(crate) struct EglBinding {
     tracked: bool,
     /// The config the context was made with, or `EGL_NO_CONFIG_KHR` for a context any surface of
     /// the display can bind.
-    #[cfg_attr(
-        wgpu_arm,
-        expect(dead_code, reason = "read by the shipped build's window surfaces")
-    )]
     pub(crate) config: EGLConfig,
 }
 
@@ -200,7 +187,7 @@ impl Current<'_> {
     }
 }
 
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl Current<'_> {
     /// Binds `surface` as the context's draw and read surface for the rest of the guard.
     pub(crate) fn bind_window(&self, surface: EGLSurface) -> Result<(), String> {
@@ -306,7 +293,7 @@ impl Drop for Current<'_> {
     }
 }
 
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl GlShared {
     /// The GLX context, on an X11 window system's GLX device.
     #[inline]
@@ -335,7 +322,6 @@ impl GlShared {
     pub(crate) fn egl_binding(&self) -> Option<&EglBinding> {
         match &self.binding {
             Binding::Egl(b) => Some(b),
-            #[cfg(not(wgpu_arm))]
             Binding::Glx(_) => None,
         }
     }
@@ -380,7 +366,7 @@ impl GlShared {
     /// Arm the injected-loss drill, and say what it will do.
     #[inline]
     pub(crate) fn inject_context_loss(&self) -> &'static str {
-        #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         if self.glx().is_some() {
             self.inject_reset(ffi::GL_UNKNOWN_CONTEXT_RESET);
             return "the GL device's next present reads GL_UNKNOWN_CONTEXT_RESET from its \
@@ -395,7 +381,7 @@ impl GlShared {
     }
 
     /// Have the next [`Current::poll_reset`] read `status` in place of the driver's answer.
-    #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     pub(crate) fn inject_reset(&self, status: ffi::GLenum) {
         self.inject_reset.store(status, Ordering::Release);
@@ -403,7 +389,7 @@ impl GlShared {
 
     /// Whether the reset check asks the driver (the context was made to report resets and its
     /// `glGetGraphicsResetStatus` was found).
-    #[cfg(all(test, not(wgpu_arm), not(target_arch = "wasm32")))]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) const fn asks_the_driver_for_resets(&self) -> bool {
         self.reset_status.is_some()
     }
@@ -462,7 +448,6 @@ impl GlShared {
                 }
                 Ok(())
             }
-            #[cfg(not(wgpu_arm))]
             Binding::Glx(g) => g
                 .make_current()
                 .inspect_err(|e| self.latch_lost(&format!("{e} (on its own pbuffer)"))),
@@ -480,7 +465,6 @@ impl GlShared {
                     ffi::EGL_NO_CONTEXT,
                 );
             },
-            #[cfg(not(wgpu_arm))]
             Binding::Glx(g) => g.release(),
         }
     }
@@ -651,25 +635,11 @@ impl GlDevice {
     }
 
     /// A device on a window system's display, the one its windows' surfaces are made on.
-    #[cfg(not(wgpu_arm))]
     pub(crate) fn on_window_system(ws: WindowSystem) -> Result<Self, String> {
         Self::on_window_system_via(ws, Self::on_glx)
     }
 
-    /// [`Self::on_window_system`] in a build carrying wgpu, which attaches windows on wgpu and has
-    /// no GLX: the display's EGL platform.
-    #[cfg(wgpu_arm)]
-    pub(crate) fn on_window_system(ws: WindowSystem) -> Result<Self, String> {
-        if !HELD.with(Cell::get).is_null() {
-            return Err(
-                "gl: a GL device is held on this thread; create devices outside a guard".to_owned(),
-            );
-        }
-        Self::on_egl_window_system(ws)
-    }
-
     /// [`Self::on_window_system`] with `glx` as the X11 device's mint (a test refuses it).
-    #[cfg(not(wgpu_arm))]
     pub(super) fn on_window_system_via(
         ws: WindowSystem,
         glx: impl FnOnce(usize, i32, WindowSystem) -> Result<Self, String>,
@@ -741,7 +711,6 @@ impl GlDevice {
     /// A device on an X11 display's GLX (see `super::glx` for why X11 is
     /// GLX's): a GLX OpenGL ES 3 context, current on its pbuffer between
     /// posts, which a present asks for resets where the context reports them.
-    #[cfg(not(wgpu_arm))]
     fn on_glx(display: usize, screen: i32, ws: WindowSystem) -> Result<Self, String> {
         Self::on_glx_context(
             super::glx::GlxContext::new(display as *mut c_void, screen)?,
@@ -751,7 +720,6 @@ impl GlDevice {
 
     /// [`Self::on_glx`]'s device on the context `glx` (a test makes one robust where GLX lists no
     /// robustness).
-    #[cfg(not(wgpu_arm))]
     pub(super) fn on_glx_context(
         glx: super::glx::GlxContext,
         ws: WindowSystem,
@@ -986,9 +954,7 @@ impl GlDevice {
             lost: AtomicBool::new(false),
             loss_reason: std::sync::OnceLock::new(),
             inject_loss: AtomicBool::new(false),
-            #[cfg(not(wgpu_arm))]
             reset_status: None,
-            #[cfg(not(wgpu_arm))]
             inject_reset: AtomicU32::new(ffi::GL_NO_ERROR),
             gl,
             caps,
@@ -1024,9 +990,7 @@ impl GlDevice {
         }
         let has = |e: &str| exts.iter().any(|x| x == e);
         let caps = GlCaps {
-            #[cfg(not(wgpu_arm))]
             reset_query: reset_query(&version, has),
-            #[cfg(not(wgpu_arm))]
             bgra_read: has("GL_EXT_read_format_bgra"),
             renderer,
             version,
@@ -1041,7 +1005,7 @@ impl GlDevice {
 /// `version` and whose extensions `has` names: GLES 3.2's core name, else the
 /// spelling of the robustness extension it lists (`KHR`, `EXT`, then `ARB`);
 /// `None` when it has none.
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn reset_query(version: &str, has: impl Fn(&str) -> bool) -> Option<&'static CStr> {
     let minor = version
         .strip_prefix("OpenGL ES 3.")
@@ -1320,7 +1284,6 @@ mod tests {
     /// A present's reset check latches the device lost on any reset status
     /// but `GL_NO_ERROR`, NVIDIA's purge among them, and names the status as
     /// the cause the frontend's downgrade line prints.
-    #[cfg(not(wgpu_arm))]
     #[test]
     fn a_reset_status_other_than_no_error_latches_the_device_lost() {
         for status in [
@@ -1366,7 +1329,6 @@ mod tests {
     /// desk are 3.2), else the spelling of the robustness extension the
     /// context lists, `KHR` before `EXT` before `ARB`; none on a 3.0 or 3.1
     /// context that lists none.
-    #[cfg(not(wgpu_arm))]
     #[test]
     fn the_reset_query_is_gles_3_2_s_or_the_robustness_extension_s() {
         let none = |_: &str| false;

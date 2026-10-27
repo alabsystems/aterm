@@ -112,7 +112,7 @@ fn ensure_offscreen_family(
 }
 
 /// The tray scrim's 1×1 fill on the arm's device, re-uploaded only when its
-/// colour changes (the twin of the wgpu arm's `TrayScrimLayer`).
+/// colour changes.
 pub(crate) struct D3dScrimFill {
     tex: D3dTexture,
     rgba: [u8; 4],
@@ -221,8 +221,8 @@ impl GpuRenderer {
                 t.dy.saturating_add(t.ph).min(fh),
             ]
         });
-        // The scrim covers every pixel from its top row down (the wgpu arm's
-        // `place_tray_scrim`); `None` when it covers nothing.
+        // The scrim covers every pixel from its top row down; `None` when it
+        // covers nothing.
         let scrim = tray
             .as_ref()
             .and_then(|t| t.scrim)
@@ -868,7 +868,7 @@ impl GpuRenderer {
     /// larger than the frame, read back and decoded to linear f32. Without
     /// `boost_pass` the window's panel is taken as SDR for this present
     /// (`edr_max` 1.0, no headroom), which the gate answers with no aurora
-    /// pass, the pass the wgpu seam leaves out.
+    /// pass.
     pub(crate) fn d3d11_present_hdr_for_test(
         &mut self,
         win: &mut WindowGpu,

@@ -3,7 +3,7 @@
 
 //! Split-pane scroll copy conformance for `rainbow_kitty::witness::Witness::follow_runs`.
 
-use crate::trail_host::{Core, Opts, Theme};
+use crate::trail_host::{Core, Opts, Theme, on_every_ground};
 use std::time::Duration;
 
 const ROWS: usize = 24;
@@ -90,11 +90,13 @@ fn copy_written_by_a_scroll(mut h: Host, last: u16) -> (u64, usize) {
 /// A scroll copy on a split pane's new last row is treated as a twin, not a move.
 #[test]
 fn a_copy_written_on_a_split_pane_s_new_last_row_by_a_scroll_is_not_where_the_line_went() {
-    let last = 11;
-    assert_eq!(
-        copy_written_by_a_scroll(Host::in_pane(12, last), last),
-        (0, 0),
-        "the original erased above its copy in the top pane: (followed, frames the copy's row \
-         was lit)"
-    );
+    on_every_ground(|| {
+        let last = 11;
+        assert_eq!(
+            copy_written_by_a_scroll(Host::in_pane(12, last), last),
+            (0, 0),
+            "the original erased above its copy in the top pane: (followed, frames the copy's row \
+             was lit)"
+        );
+    });
 }

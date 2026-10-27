@@ -455,14 +455,6 @@ fn an_opaque_under_layer_stored_in_the_base_pass_lands_the_cpus_bytes() {
     ];
     #[allow(unused_mut, reason = "the oracle build adds an arm")]
     let mut arms = vec![("native", gpu)];
-    #[cfg(wgpu_arm)]
-    {
-        let (_, mut oracle) = backends(18.0, light);
-        oracle.set_bloom(false);
-        oracle.set_shimmer(false);
-        crate::common::disarm_for_oracle(&mut oracle);
-        arms.push(("wgpu-oracle", oracle));
-    }
     for (arm, mut gpu) in arms {
         let mut split_passes = Vec::new();
         for (what, input, stored) in &cases {

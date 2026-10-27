@@ -22,8 +22,9 @@ use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
     ACCOUNT_MOVES_PER_WINDOW, AccountAdvice, AccountAnswer, AccountAt, AccountBad, AccountMove,
-    AccountPoint, Composer, RULE_ACCOUNT, RULE_CONTINUE, RULE_LIMIT_RESUME, Restart, TurnEndAction,
-    TurnEndReading, TurnEndState, TurnEndTiming, decide_turn_end,
+    AccountPoint, Cleared, Clearing, Composer, RULE_ACCOUNT, RULE_CONTINUE, RULE_LIMIT_RESUME,
+    Restart, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, cleared_text,
+    decide_turn_end,
 };
 use aterm_models_harness::supervisor_account_rotation_model;
 use aterm_phase::WallKind;
@@ -1303,7 +1304,7 @@ fn the_owners_clearing(
     let mut te = d.te.clone();
     let first = decided_on(&mut te, &advice, None);
     let continued = TurnEndAction::Type {
-        text: cfg.continue_text.clone(),
+        text: cleared_text(Cleared::UsageLimit, Clearing::Measured).to_string(),
         rule_id: RULE_LIMIT_RESUME,
     };
     if first.action != continued || waits_until(&first.today).is_none() {

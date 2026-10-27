@@ -39,15 +39,64 @@
 //!   (`proto::will_is_fenced`), and exempt from the budget;
 //! * `Last` (a page in subject order of at most `LAST_PAGE_MAX` rows, which
 //!   resumes after its last row once it reached its max), `Fetch` (a scan of
-//!   at most `FETCH_SCAN_MAX` records, its `Mark` naming the oldest offset, 0),
-//!   `Commit` (a hidden record; a group resumes at `upto + 1`, folded by
-//!   `proto::group_commit_monotone`), `Subscribe` and `SubscribeGroup` (every
-//!   matching record from the start, then live; a refused one ends its
-//!   connection), `IdleMarks`, `GapNotices`, `Keepalive`, `Budget`; a name past
-//!   `MAX_NAME_LEN` refused.
+//!   at most `FETCH_SCAN_MAX` records from the held ones up, its `Mark` naming
+//!   the oldest offset its filter is complete from; below it, refused
+//!   `retained-from=`, or told, for a reader that asked for gap notices, while
+//!   it still holds records there), `Commit` (a hidden record; a group resumes at
+//!   `upto + 1`, folded by `proto::group_commit_monotone`), `Subscribe` and
+//!   `SubscribeGroup` (every matching record it can still read from its start,
+//!   the held ones first, then live, told its gaps first when it asked; a
+//!   refused one ends its connection), `IdleMarks`, `GapNotices`, `Keepalive`,
+//!   `Budget`; a name past `MAX_NAME_LEN` refused.
 //!
-//! Unguarded: no capability is checked. The log is never cut: retention's
-//! bounds are never reached, so no tail is told a gap.
+//! Unguarded: no capability is checked.
+//!
+//! ## Retention: astream's own planner (sim item B05)
+//!
+//! A retained world's broker sets aterm's rules at every open
+//! ([`State::retain`]: [`crate::broker_rules::default_rules`], or the same rules
+//! at bytes a few records reach, `rules_scaled`), as `aterm link broker` does, and
+//! cuts its log as astream's does: each tick ([`Broker::tick`]) and each forced
+//! cut ([`Broker::cut_to`], `retain_before_carrying_state`'s, standing in for a
+//! byte bound the fleet's traffic reaches) is planned by
+//! `astream_broker::retention::plan` on the records from the base, the tick's
+//! stamps on the world's wall clock, the group commits and the held store, and
+//! applied as astream's held store applies a plan ([`State::apply`]): the records
+//! a hold rule still wants are carried at their absolute offsets, the ones given
+//! up raise their subjects' floors and are named in the ledger, the base rises
+//! to the cut, the dedup keys of the records below it are dropped, and the
+//! compaction leaves the whole log flushed. A `Fetch` below its filter's oldest
+//! (`retention::oldest`) is refused `ERR_RECORD_REFUSED retained-from=<oldest>`
+//! (a head query never), unless its reader asked for gap notices and its filter
+//! still holds records there (`BrokerLog::fetch_told`): then its page reads them
+//! from its `from`, the gap notice of that range ahead of it. A tail reads the
+//! held records below the base and is told what it can no longer read by
+//! astream's gap notice, counted from the ledger where it names every record
+//! (`retention::counted_from`). The last-value
+//! index, the group commits, the wills, the producers' high water and the
+//! subjects' charges are carried across every cut, as astream's carried state
+//! keeps them. An open in a retained world may set no rules
+//! ([`Broker::start_unretained`]): it reads by the rules the held store kept,
+//! advertises none and cuts nothing until an open sets them again. The ledger is
+//! in memory, so an open starts it whole from the base; the stamps are cut back
+//! to the head an open finds (`retention::clamp_stamps`).
+//!
+//! Before a retention lands every tail is caught up as astream's tail thread is
+//! when it is not writing, past what it does not match and never past a gap it is
+//! owed; a world's tails have yet to read what they match (they are told its gap
+//! once a cut takes it), the differential's write it first
+//! ([`State::eager_tails`]), as that thread does the moment a record lands. A
+//! world's open ticks by the world's clock; the differential's model takes the
+//! tick astream's open asks for at once at the last stamp's time
+//! ([`Broker::open_tick`]), as the real arm's wall clock does. The oracle reads
+//! what retention gave up ([`Retained::gone`]), the keys a cut dropped and what
+//! landed while no rules were set.
+//!
+//! Not modelled: the held store's file, its frames and rewrites, and its floor
+//! bound (past 65,536 subjects astream folds floors into a spill; a world names
+//! a few dozen); a tick's room and the writer asking for one (the scheduler draws
+//! ticks, and every minute of the world's clock runs one); the writer's caps
+//! (aterm sets none); an uncarried cut (aterm makes none on a retained log).
 //!
 //! ## Held to astream's broker
 //!
@@ -81,13 +130,16 @@
 //! the client's `write`, on the bridge's thread; a subscription's deliveries
 //! are produced only when the scheduler pumps it.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
 
 use astream_broker::proto::{decode_request, encode_response, Request, Response};
-use astream_broker::{LogIdentity, NonceExt, ServedInfo, ServedReason, Tier as WireTier};
-use astream_wire::Filter;
+use astream_broker::retention::{self, Ledger, Plan, Stamps};
+use astream_broker::{
+    BrokerRecord, LogIdentity, NonceExt, Retention, ServedInfo, ServedReason, Tier as WireTier,
+};
+use astream_wire::{Filter, Offset};
 
 use super::{lock, Process, Rng};
 use crate::fx::BusCloser;
@@ -237,6 +289,26 @@ struct ConnState {
     open: bool,
     /// `Some((cursor, filter))` once it is a subscription.
     sub: Option<(u64, Filter)>,
+    /// Whether it asked for gap notices (`Request::GapNotices`).
+    gaps: bool,
+    /// What its tail was told of the records retention gave up below it, once it is a
+    /// subscription that asked.
+    told: Option<Told>,
+}
+
+impl ConnState {
+    fn new(pid: u64) -> Self {
+        Self {
+            pid,
+            inbound: Vec::new(),
+            out: VecDeque::new(),
+            held: VecDeque::new(),
+            open: true,
+            sub: None,
+            gaps: false,
+            told: None,
+        }
+    }
 }
 
 /// One answer the broker holds ([`ConnState::held`]).
@@ -246,6 +318,75 @@ struct Held {
     ack_of: Option<u64>,
     /// The framed answer.
     frame: Vec<u8>,
+}
+
+/// What one tail was TOLD of the records retention gave up below it, as astream's
+/// `store::Told` keeps it: up to where its last notice told (its start before any; a look
+/// that tells nothing leaves it), the ledger's order when it last looked, whether its last
+/// notice carried a count, and the retention epoch it last looked at.
+#[derive(Clone, Copy, Debug)]
+struct Told {
+    to: u64,
+    seen: u64,
+    counted: bool,
+    epoch: Option<u64>,
+}
+
+impl Told {
+    const fn at(start: u64) -> Self {
+        Self {
+            to: start,
+            seen: 0,
+            counted: false,
+            epoch: None,
+        }
+    }
+}
+
+/// THE LOG'S RETENTION (sim item B05; the module docs): the rules, the held store, the
+/// floors, the stamps and the ledger, as astream's held store keeps them in memory.
+#[derive(Debug, Default)]
+pub(crate) struct Retained {
+    /// The rules the held store holds by: set by an open, or read back by one that sets none.
+    rules: Option<Retention>,
+    /// Whether this open set them: only then does a tick or a cut plan by them and `Hello`
+    /// advertise them.
+    active: bool,
+    /// The log's base: every record below it went with a cut.
+    pub(crate) base: u64,
+    /// The held store: the records below the base a hold rule still wants, by offset.
+    held: BTreeMap<u64, retention::Held>,
+    /// Each subject's floor: the offset after the newest record of it a hold rule gave up.
+    floors: BTreeMap<String, u64>,
+    /// The highest of every floor.
+    floor_max: u64,
+    /// From where each class of `rules` is whole (`retention::carried_since`).
+    since: Vec<u64>,
+    /// The tick's stamps (`retention::stamp`).
+    stamps: Stamps,
+    /// What the hold rules gave up since the open, one by one.
+    ledger: Ledger,
+    /// Moves with every retention that lands, as astream's `retention_epoch`: a tail looks
+    /// for its gap notice again.
+    epoch: u64,
+    /// THE ORACLE'S: every visible record retention gave up, by offset.
+    pub(crate) gone: BTreeSet<u64>,
+    /// THE ORACLE'S: the dedup keys a cut dropped.
+    pub(crate) dropped: BTreeSet<(u64, u64)>,
+    /// THE ORACLE'S: the offsets of the records the log took while no open set its rules
+    /// (what an `auto` mirror must never have written).
+    pub(crate) unretained: BTreeSet<u64>,
+    /// THE ORACLE'S: each record's offset a tail was told it can no longer read, and on
+    /// which connection.
+    pub(crate) told: Vec<(u64, astream_broker::Gap)>,
+    /// Ticks and cuts that landed, cuts that moved the base, and fetches refused below a floor.
+    pub(crate) ticks: u64,
+    pub(crate) cuts: u64,
+    pub(crate) refusals: u64,
+    /// The next open sets no rules ([`Broker::start_unretained`]).
+    unretained_next: bool,
+    /// The next open sets these rules, not its own ([`Broker::start_with`]).
+    rules_next: Option<Retention>,
 }
 
 /// The simulated broker's state.
@@ -285,10 +426,21 @@ pub(crate) struct State {
     pub(crate) held_total: u64,
     pub(crate) tries_not_yet: u64,
     pub(crate) seen_before_ack: u64,
-    /// RETAINED by aterm's rules from its open ([`crate::broker_rules::retain`]), as every
-    /// `Hello` advertises; unretained is the broker `aterm link broker` serves when setting
-    /// them fails, and one opened by a build before them.
-    pub(crate) retained: bool,
+    /// Writes that carried a group commit and a publish together, the commit first: a
+    /// bridge's held inbox commit riding its next publish (critic item B08); and group
+    /// commits written alone.
+    pub(crate) commits_corked: u64,
+    pub(crate) commits_alone: u64,
+    /// The rules every open SETS ([`crate::broker_rules::retain`]), as its `Hello` advertises
+    /// them; `None` is the broker `aterm link broker` serves when setting them fails, and one
+    /// opened by a build before them ([`Broker::retain`]).
+    pub(crate) retain: Option<Retention>,
+    /// THE LOG'S RETENTION by them (sim item B05).
+    pub(crate) ret: Retained,
+    /// Every tail is written what it matches before a retention lands, as astream's tail
+    /// thread writes it the moment it lands ([`State::catch_up_tails`]): the differential's
+    /// model, held to a real broker's tails; a world explores the tail that has yet to read.
+    pub(crate) eager_tails: bool,
     /// NEGATIVE CONTROLS of the arm itself ([`law_check`]'s).
     pub(crate) mutant: ArmMutant,
     /// A SIBLING RACING AN ATTACH ([`Race`]), in the worlds that have one.
@@ -390,6 +542,19 @@ pub(crate) enum ArmMutant {
     FetchNamesNoOldest,
     /// `Fetch` scans past `FETCH_SCAN_MAX`.
     FetchUnbounded,
+    /// `Fetch` below its filter's oldest offset answers a page from there instead of
+    /// `retained-from=`.
+    FetchClampsBelowTheFloor,
+    /// A `Fetch` of a reader told what retention gave up (one that asked for gap notices) is
+    /// refused below its filter's oldest as any other is, whatever retention still holds there.
+    FetchNeverTold,
+    /// A told `Fetch` below its filter's oldest reads the held records without the gap
+    /// notice ahead of them.
+    FetchToldNoNotice,
+    /// A cut keeps the dedup keys of the records below it: a resend there is deduped.
+    KeepsDedupBelowTheCut,
+    /// No tail is told a gap notice, whatever retention gave up below it.
+    NoGapNotices,
     /// `Last` resumes after a full page only when more rows follow it.
     LastResumesOnlyBeforeMore,
     /// `Last` answers more than `LAST_PAGE_MAX` rows.
@@ -425,6 +590,14 @@ pub(crate) enum Event {
     Stop(Stop),
     /// The broker opened again ([`Broker::start`]).
     Start,
+    /// The broker opened again setting no rules ([`Broker::start_unretained`]).
+    StartUnretained,
+    /// The broker opened again setting these rules, not its own ([`Broker::start_with`]).
+    StartWith(Retention),
+    /// A retention tick at the world's wall clock, ms ([`Broker::tick`]).
+    Tick(u64),
+    /// A cut at this offset ([`Broker::cut_to`]).
+    Cut(u64),
 }
 
 /// The simulated broker every connection of a world reaches.
@@ -473,7 +646,11 @@ impl Broker {
                 held_total: 0,
                 tries_not_yet: 0,
                 seen_before_ack: 0,
-                retained: true,
+                commits_corked: 0,
+                commits_alone: 0,
+                retain: None,
+                ret: Retained::default(),
+                eager_tails: false,
                 mutant: ArmMutant::None,
                 race: None,
                 journal: None,
@@ -482,6 +659,94 @@ impl Broker {
                 notes: Vec::new(),
             }),
         }
+        .retaining(Some(crate::broker_rules::default_rules()))
+    }
+
+    /// `self`, retained by `rules` ([`Broker::retain`]).
+    fn retaining(self, rules: Option<Retention>) -> Self {
+        self.retain(rules);
+        self
+    }
+
+    /// RETAIN BY `rules` at every open from this one on (`None`: never), as `aterm link
+    /// broker` does: set now, on a log that holds nothing yet.
+    pub(crate) fn retain(&self, rules: Option<Retention>) {
+        let mut s = lock(&self.state);
+        s.ret = Retained::default();
+        s.retain = rules;
+        if let Some(rules) = s.retain.clone() {
+            s.set_rules(rules);
+        }
+    }
+
+    /// THE RETENTION TICK at `now_ms`, the world's wall clock (astream's
+    /// `Broker::retention_tick_at`): planned by the rules this open set, the cut never above
+    /// the head. Nothing on a broker that is down or set no rules. Whether anything landed.
+    pub(crate) fn tick(&self, now_ms: u64) -> bool {
+        let mut s = lock(&self.state);
+        if !s.up || !s.ret.active {
+            return false;
+        }
+        s.note_event(|| Event::Tick(now_ms));
+        s.catch_up_tails();
+        s.ret.ticks += 1;
+        let head = s.log.len() as u64;
+        s.plan_and_apply(now_ms, head, None)
+    }
+
+    /// ASTREAM'S FIRST TICK OF AN OPEN THAT SETS THE RULES (asked for at once by
+    /// `Broker::set_retention`) as a differential's real arm takes it: by the wall clock, which
+    /// the run's clock is always ahead of, so `retention::stamp`'s `now.max(last)` stamps what
+    /// the open found at the last stamp's time. A world's opens tick by the world's own clock
+    /// instead (`super::world`).
+    pub(crate) fn open_tick(&self) -> bool {
+        let now = lock(&self.state).ret.stamps.last().map_or(0, |&(_, ms)| ms);
+        self.tick(now)
+    }
+
+    /// A CUT AT `at` on a log this open retains (astream's `retain_before_carrying_state`,
+    /// planned by the rules at that cut, on the clock of the tick's last stamp): what a byte
+    /// bound the fleet's traffic reaches does. Clamped to the head; nothing at or below the
+    /// base, on a broker that is down, or on one that set no rules. Whether it cut.
+    pub(crate) fn cut_to(&self, at: u64) -> bool {
+        let mut s = lock(&self.state);
+        if !s.up || !s.ret.active {
+            return false;
+        }
+        let head = s.log.len() as u64;
+        let min = astream_broker::proto::compact_floor_monotone(at.min(head), s.ret.base);
+        if min <= s.ret.base {
+            return false;
+        }
+        s.note_event(|| Event::Cut(min));
+        s.catch_up_tails();
+        let now = s.ret.stamps.last().map_or(0, |&(_, ms)| ms);
+        s.plan_and_apply(now, min, Some(min))
+    }
+
+    /// OPEN AGAIN SETTING NO RULES, as `aterm link broker` serves when setting them fails:
+    /// reads answer by the rules the held store kept, `Hello` advertises none, nothing cuts.
+    pub(crate) fn start_unretained(&self) {
+        lock(&self.state).ret.unretained_next = true;
+        self.start();
+    }
+
+    /// OPEN AGAIN SETTING `rules`, not the ones every open of this world sets: a change of rules
+    /// no aterm build makes (`world::changed_rules`; rules set outside aterm, as
+    /// `asb serve --retain-file` sets them). The open after it sets its own again.
+    pub(crate) fn start_with(&self, rules: Retention) {
+        lock(&self.state).ret.rules_next = Some(rules);
+        self.start();
+    }
+
+    /// The offsets of every visible record retention gave up, for the oracle.
+    pub(crate) fn gone(&self) -> BTreeSet<u64> {
+        lock(&self.state).ret.gone.clone()
+    }
+
+    /// The log's base: every record below it went with a cut.
+    pub(crate) fn base(&self) -> u64 {
+        lock(&self.state).ret.base
     }
 
     /// Keep a journal of the door from now on ([`State::journal`]).
@@ -580,6 +845,12 @@ impl Broker {
         (s.held_total, s.tries_not_yet, s.seen_before_ack)
     }
 
+    /// `(commits that rode a publish in one write, commits written alone)` ([`State::commits_corked`]).
+    pub(crate) fn commit_writes(&self) -> (u64, u64) {
+        let s = lock(&self.state);
+        (s.commits_corked, s.commits_alone)
+    }
+
     /// THE RECORDS WHOSE ACKS THIS BROKER HOLDS for process `pid` on its open connections.
     pub(crate) fn held_for(&self, pid: u64) -> Vec<(u64, String, Vec<u8>)> {
         let s = lock(&self.state);
@@ -606,15 +877,17 @@ impl Broker {
 
     /// Whether a subscription's next read has something to answer: a frame owed, or its end.
     pub(crate) fn readable(&self, conn: u64) -> bool {
-        let s = lock(&self.state);
+        let mut s = lock(&self.state);
         let Some(c) = s.conns.get(&conn) else {
             return true;
         };
         if !c.out.is_empty() || !c.open {
             return true;
         }
-        match &c.sub {
-            Some((cursor, filter)) => s.next_match(*cursor, filter).is_some(),
+        match c.sub.clone() {
+            Some((cursor, filter)) => {
+                s.next_match(cursor, &filter).is_some() || s.owed_gap(conn, false).is_some()
+            }
             None => false,
         }
     }
@@ -674,6 +947,8 @@ impl Broker {
         let moves = stop == Stop::PowerLoss && s.tier != Tier::Strict;
         let moves = moves && !(s.mutant == ArmMutant::LoseWithoutMove);
         s.log.truncate(usize::try_from(kept).unwrap_or(usize::MAX));
+        // The offsets a loss took name other records from here.
+        s.ret.unretained.retain(|&off| off < kept);
         s.rebuild();
         if moves {
             s.generation += 1;
@@ -715,7 +990,13 @@ impl Broker {
     /// OPEN AGAIN.
     pub(crate) fn start(&self) {
         let mut s = lock(&self.state);
-        s.note_event(|| Event::Start);
+        let unretained = std::mem::take(&mut s.ret.unretained_next);
+        let instead = s.ret.rules_next.take();
+        s.note_event(|| match (&instead, unretained) {
+            (_, true) => Event::StartUnretained,
+            (Some(rules), false) => Event::StartWith(rules.clone()),
+            (None, false) => Event::Start,
+        });
         s.rebuild();
         s.durable = s.log.len() as u64;
         s.up = true;
@@ -724,7 +1005,23 @@ impl Broker {
         for i in latest {
             s.fire_will(i);
         }
-        let line = format!("broker start head={} gen={}", s.log.len(), s.generation);
+        // The rules are set after the open's own writes, as aterm sets them.
+        let older = instead.is_some();
+        let rules = instead.or_else(|| s.retain.clone()).filter(|_| !unretained);
+        if let Some(rules) = rules {
+            s.set_rules(rules);
+        }
+        let line = format!(
+            "broker start head={} gen={} base={}{}",
+            s.log.len(),
+            s.generation,
+            s.ret.base,
+            match (s.ret.active, older) {
+                (false, _) => " unretained",
+                (true, true) => " older-rules",
+                (true, false) => "",
+            }
+        );
         s.notes.push(line);
     }
 
@@ -781,6 +1078,76 @@ impl Broker {
             .map(|(i, r)| (i as u64, r.subject.clone(), r.body.clone(), r.key))
             .collect()
     }
+
+    /// THE ORACLE OF A READ OF ONE OFFSET (finding F3): the visible record at `off`, if one
+    /// is there and its subject starts with `prefix`, with whether the broker still holds it
+    /// (at or above the base, or carried below it: a read can still be handed it) and
+    /// whether it lies below the oldest of `prefix>` (where a plain read of it is refused).
+    pub(crate) fn at(&self, off: u64, prefix: &str) -> Option<At> {
+        let s = lock(&self.state);
+        let rec = s.log.get(usize::try_from(off).ok()?)?;
+        if rec.hidden() || !rec.subject.starts_with(prefix) {
+            return None;
+        }
+        let oldest = Filter::new(format!("{prefix}>")).map_or(0, |f| s.oldest(&f));
+        Some(At {
+            body: rec.body.clone(),
+            holds: off >= s.ret.base || s.ret.held.contains_key(&off),
+            below_oldest: off < oldest,
+        })
+    }
+
+    /// THE ORACLE OF WHAT A READ CAN STILL BE HANDED: whether the visible record at `off` is
+    /// one the broker holds (at or above the base, or carried below it), not one retention
+    /// gave up.
+    pub(crate) fn holds(&self, off: u64) -> bool {
+        let s = lock(&self.state);
+        usize::try_from(off)
+            .ok()
+            .and_then(|i| s.log.get(i))
+            .is_some_and(|rec| {
+                !rec.hidden() && (off >= s.ret.base || s.ret.held.contains_key(&off))
+            })
+    }
+
+    /// The log's identity now (`<id>.<generation>`, as `link log` names it).
+    pub(crate) fn log_identity(&self) -> String {
+        let s = lock(&self.state);
+        astream_broker::LogIdentity {
+            id: s.id,
+            generation: s.generation,
+        }
+        .to_string()
+    }
+
+    /// The offsets of the visible records whose subject starts with `prefix`: every one, and
+    /// the ones the broker carries below its base; and the head.
+    pub(crate) fn offsets_of(&self, prefix: &str) -> (Vec<u64>, Vec<u64>, u64) {
+        let s = lock(&self.state);
+        let all: Vec<u64> = s
+            .log
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.hidden() && r.subject.starts_with(prefix))
+            .map(|(i, _)| i as u64)
+            .collect();
+        let held = s
+            .ret
+            .held
+            .iter()
+            .filter(|(_, h)| h.rec.subject.starts_with(prefix))
+            .map(|(&off, _)| off)
+            .collect();
+        (all, held, s.log.len() as u64)
+    }
+}
+
+/// What the broker holds at one offset ([`Broker::at`]).
+#[derive(Clone, Debug)]
+pub(crate) struct At {
+    pub(crate) body: Vec<u8>,
+    pub(crate) holds: bool,
+    pub(crate) below_oldest: bool,
 }
 
 impl State {
@@ -799,10 +1166,14 @@ impl State {
         self.groups.clear();
         self.max_seq.clear();
         let head = self.log.len() as u64;
+        let base = self.ret.base;
         for (i, rec) in self.log.iter().enumerate() {
             let off = i as u64;
             if let Some(key) = rec.key {
-                self.dedup.entry(key).or_insert(off);
+                // A cut dropped the dedup keys below the base; the high water is carried.
+                if off >= base {
+                    self.dedup.entry(key).or_insert(off);
+                }
                 if key.1 < astream_broker::ACK_SEQ_BASE {
                     let m = self.max_seq.entry(key.0).or_insert(0);
                     *m = astream_broker::proto::high_water_monotone(*m, key.1);
@@ -842,6 +1213,310 @@ impl State {
                 self.reserve(producer, subject);
             }
         }
+        // An open reads the held store's rules back and retains by none until it sets them;
+        // its ledger, in memory only, is whole from the base; the stamps are cut back to the
+        // head it finds.
+        self.ret.active = false;
+        self.ret.ledger = Ledger::default();
+        self.ret.ledger.whole_from(base);
+        retention::clamp_stamps(&mut self.ret.stamps, head);
+    }
+
+    /// SET `rules` at an open, as astream's held store does: the rules it already holds by
+    /// keep it whole from where it was; others start each class where
+    /// `retention::carried_since` says.
+    fn set_rules(&mut self, rules: Retention) {
+        let same = self
+            .ret
+            .rules
+            .as_ref()
+            .is_some_and(|held| held.encode() == rules.encode());
+        if !same {
+            self.ret.since = retention::carried_since(
+                self.ret.rules.as_ref(),
+                &self.ret.since,
+                &rules,
+                self.ret.base,
+            );
+            self.ret.rules = Some(rules);
+        }
+        self.ret.active = true;
+        self.ret.epoch += 1;
+    }
+
+    /// THE OLDEST offset a read of `filter` can reach (astream's `BrokerLog::oldest`).
+    pub(crate) fn oldest(&self, filter: &Filter) -> u64 {
+        retention::oldest(
+            self.ret.rules.as_ref(),
+            self.ret.base,
+            &self.ret.since,
+            &self.ret.floors,
+            0,
+            self.ret.floor_max,
+            filter,
+        )
+    }
+
+    /// The record at `off` as astream's log holds it, for the planner: a hidden record's
+    /// subject, body and commit as astream writes them, so its bytes count as they do there.
+    fn brecord(&self, off: u64) -> Option<Arc<BrokerRecord>> {
+        let rec = self.log.get(usize::try_from(off).ok()?)?;
+        let seq = Offset(off);
+        let made = match &rec.kind {
+            Kind::Plain => {
+                let (producer_id, producer_seq) = rec.key.unwrap_or((0, 0));
+                BrokerRecord {
+                    seq,
+                    producer_id,
+                    producer_seq,
+                    subject: rec.subject.clone(),
+                    body: rec.body.clone(),
+                    commit: None,
+                }
+            }
+            Kind::Commit { group, upto } => BrokerRecord {
+                seq,
+                producer_id: 0,
+                producer_seq: 0,
+                subject: astream_broker::store::COMMIT_SUBJECT.to_string(),
+                body: Vec::new(),
+                commit: Some(astream_broker::brecord::GroupCommit {
+                    group: group.clone(),
+                    upto: *upto,
+                }),
+            },
+            Kind::WillReg(i) => {
+                let w = self.wills.get(*i)?;
+                // astream's `WillRecord::encode_body`: the subject's length, the subject, the body.
+                let mut body = u32::try_from(w.subject.len())
+                    .unwrap_or(u32::MAX)
+                    .to_le_bytes()
+                    .to_vec();
+                body.extend_from_slice(w.subject.as_bytes());
+                body.extend_from_slice(&w.body);
+                BrokerRecord {
+                    seq,
+                    producer_id: w.producer,
+                    producer_seq: w.seq,
+                    subject: astream_broker::store::WILL_SUBJECT.to_string(),
+                    body,
+                    commit: None,
+                }
+            }
+            Kind::Retire => {
+                BrokerRecord::marked_retire(seq, 0, &String::from_utf8_lossy(&rec.body))
+            }
+        };
+        Some(Arc::new(made))
+    }
+
+    /// THE RETENTION at `now` (ms of the world's wall clock), the cut never above `ceiling`,
+    /// or at `forced`: astream's planning (`BrokerLog::retention_plan`: the stamps first,
+    /// then `retention::plan`), then what its job's finish does ([`State::apply`]). Whether
+    /// anything landed.
+    fn plan_and_apply(&mut self, now: u64, ceiling: u64, forced: Option<u64>) -> bool {
+        let head = self.log.len() as u64;
+        let stamps_before = self.ret.stamps.clone();
+        retention::stamp(&mut self.ret.stamps, head, now);
+        let Some(rules) = self.ret.rules.clone() else {
+            return false;
+        };
+        let base = self.ret.base;
+        let records: Vec<Arc<BrokerRecord>> =
+            (base..head).filter_map(|off| self.brecord(off)).collect();
+        let groups: HashMap<String, u64> = self
+            .groups
+            .iter()
+            .map(|(g, upto)| (g.clone(), *upto))
+            .collect();
+        let plan = {
+            let view = retention::View {
+                base,
+                ceiling: ceiling.min(head),
+                records: &records,
+                // No record here has a broker time (`bt=`, astream 93ec213): a bridge never asks.
+                record_bts: &[],
+                stamps: &self.ret.stamps,
+                groups: &groups,
+                held: &self.ret.held,
+                now,
+            };
+            retention::plan(&rules, &view, forced)
+        };
+        if plan.is_empty(base) {
+            // A tick that took stamps writes them, and its job's finish moves the epoch.
+            if self.ret.stamps != stamps_before {
+                self.ret.epoch += 1;
+            }
+            return false;
+        }
+        self.apply(plan);
+        true
+    }
+
+    /// WHAT A PLAN'S JOB DOES ONCE IT LANDS (astream's `HeldStore::finish` and, for a cut,
+    /// `BrokerLog::compact_finish_tick`): the held records it gave up go, the ones it carries
+    /// are held, the floors rise, the ledger takes its give-ups; a cut drops the dedup keys
+    /// still pointing below it, moves the base, and leaves the whole log flushed (the
+    /// compaction's copy is). The stamps below the base go.
+    fn apply(&mut self, plan: Plan) {
+        let base = self.ret.base;
+        let head = self.log.len() as u64;
+        let carried: BTreeSet<u64> = plan.carry.iter().map(|h| h.rec.seq.0).collect();
+        for off in base..plan.cut {
+            let Some(rec) = usize::try_from(off).ok().and_then(|i| self.log.get(i)) else {
+                continue;
+            };
+            if let Some(key) = rec.key {
+                if self.dedup.get(&key) == Some(&off)
+                    && self.mutant != ArmMutant::KeepsDedupBelowTheCut
+                {
+                    self.dedup.remove(&key);
+                    self.ret.dropped.insert(key);
+                }
+            }
+            if !rec.hidden() && !carried.contains(&off) {
+                self.ret.gone.insert(off);
+            }
+        }
+        for off in &plan.remove {
+            self.ret.held.remove(off);
+            self.ret.gone.insert(*off);
+        }
+        for h in plan.carry {
+            self.ret.held.insert(h.rec.seq.0, h);
+        }
+        for (subject, floor) in plan.floors {
+            let f = self.ret.floors.entry(subject).or_insert(0);
+            *f = (*f).max(floor);
+            self.ret.floor_max = self.ret.floor_max.max(*f);
+        }
+        self.ret.ledger.take(plan.given);
+        if plan.cut > base {
+            self.ret.base = plan.cut;
+            self.durable = head;
+            self.ret.cuts += 1;
+        }
+        retention::prune_stamps(&mut self.ret.stamps, self.ret.base);
+        self.ret.epoch += 1;
+        self.notes.push(format!(
+            "retention base={} held={} floors={}",
+            self.ret.base,
+            self.ret.held.len(),
+            self.ret.floors.len()
+        ));
+    }
+
+    /// Every tail caught up before a retention lands, as astream's tail thread is whenever
+    /// it is not writing: past what it does not match, its cursor at its next match or the
+    /// head. With [`State::eager_tails`] every record it matches is written to it first
+    /// too, its gap notice ahead of them, as that thread writes them the moment they land,
+    /// so its cursor is the head; without, a world explores the tail that has yet to read
+    /// them when the cut lands, and is told their gap instead.
+    fn catch_up_tails(&mut self) {
+        let head = self.log.len() as u64;
+        let tails: Vec<(u64, u64, Filter)> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.open)
+            .filter_map(|(id, c)| c.sub.clone().map(|(cursor, f)| (*id, cursor, f)))
+            .collect();
+        for (id, cursor, filter) in tails {
+            if !self.eager_tails {
+                // It never reads past a gap it is owed a notice of: the notice comes first.
+                if self.owed_gap(id, false).is_some() {
+                    continue;
+                }
+                let to = self.next_match(cursor, &filter).unwrap_or(head);
+                if let Some((at, _)) = self.conns.get_mut(&id).and_then(|c| c.sub.as_mut()) {
+                    *at = to.max(cursor);
+                }
+                continue;
+            }
+            let mut frames = Vec::new();
+            if let Some(gap) = self.owed_gap(id, true) {
+                self.ret.told.push((id, gap));
+                frames.push(Response::Gap(gap));
+            }
+            let mut at = cursor;
+            while let Some(off) = self.next_match(at, &filter) {
+                let rec = &self.log[usize::try_from(off).unwrap_or(0)];
+                frames.push(Response::Delivery {
+                    offset: off,
+                    subject: rec.subject.clone(),
+                    body: rec.body.clone(),
+                });
+                at = off + 1;
+            }
+            if let Some(c) = self.conns.get_mut(&id) {
+                for frame in &frames {
+                    put(&mut c.out, frame);
+                }
+                c.sub = Some((head.max(cursor), filter));
+            }
+        }
+    }
+
+    /// THE GAP NOTICE a tail reading `filter` is owed at `cursor` (astream's
+    /// `BrokerLog::gap_notice`): looked for once per retention epoch, owed only below the
+    /// base, from the cursor to the filter's oldest, counted from the ledger where it names
+    /// every record; a range a count found nothing in is not told.
+    fn gap_notice(
+        &self,
+        filter: &Filter,
+        cursor: u64,
+        told: &mut Told,
+    ) -> Option<astream_broker::Gap> {
+        if told.epoch == Some(self.ret.epoch) {
+            return None;
+        }
+        told.epoch = Some(self.ret.epoch);
+        let seen = self.ret.ledger.seq();
+        if cursor >= self.ret.base {
+            told.seen = seen;
+            return None;
+        }
+        let to = told.to.max(self.oldest(filter));
+        let notice = if cursor < to {
+            match self.gap_count(filter, cursor, to, told) {
+                Some(0) => None,
+                Some(n) => Some(Some(n)),
+                None if to > told.to || told.counted => Some(None),
+                None => None,
+            }
+        } else {
+            None
+        };
+        told.seen = seen;
+        let records = notice?;
+        told.to = to;
+        told.counted = records.is_some();
+        Some(astream_broker::Gap {
+            from: cursor,
+            to,
+            records,
+        })
+    }
+
+    /// How many records of `filter` in `cursor..to` the hold rules gave up that `told` was not
+    /// told of, where the ledger names every one (astream's `HeldStore::gap_count`).
+    fn gap_count(&self, filter: &Filter, cursor: u64, to: u64, told: &Told) -> Option<u64> {
+        if self.ret.ledger.whole() > cursor
+            || !retention::counted_from(
+                self.ret.rules.as_ref(),
+                &self.ret.since,
+                self.ret.base,
+                cursor,
+                filter,
+            )
+        {
+            return None;
+        }
+        Some(
+            self.ret
+                .ledger
+                .count(filter, cursor, to, told.to, told.seen),
+        )
     }
 
     fn reserve(&mut self, producer: u64, subject: String) {
@@ -949,6 +1624,9 @@ impl State {
                 }
             }
         }
+        if !self.ret.active {
+            self.ret.unretained.insert(off);
+        }
         let escalated = rec.escalated;
         self.log.push(rec);
         let head = self.log.len() as u64;
@@ -1000,17 +1678,7 @@ impl State {
                     let refuse_next = std::mem::take(&mut self.refuse_next);
                     let sibling_conn = self.next_conn;
                     self.next_conn += 1;
-                    self.conns.insert(
-                        sibling_conn,
-                        ConnState {
-                            pid: u64::MAX,
-                            inbound: Vec::new(),
-                            out: VecDeque::new(),
-                            held: VecDeque::new(),
-                            open: true,
-                            sub: None,
-                        },
-                    );
+                    self.conns.insert(sibling_conn, ConnState::new(u64::MAX));
                     let _ = self.handle(
                         sibling_conn,
                         Request::Will {
@@ -1453,12 +2121,26 @@ impl State {
         }
     }
 
+    /// The next record from `from` a tail of `filter` is handed: the held records below the
+    /// base first, then the retained ones (astream's `BrokerLog::read_chunk`).
     fn next_match(&self, from: u64, filter: &Filter) -> Option<u64> {
-        let from = usize::try_from(from).ok()?;
+        let base = self.ret.base;
+        if from < base {
+            let held = self
+                .ret
+                .held
+                .range(from..base)
+                .find(|(_, h)| filter.matches_str(&h.rec.subject))
+                .map(|(&off, _)| off);
+            if held.is_some() {
+                return held;
+            }
+        }
+        let start = usize::try_from(from.max(base)).ok()?;
         self.log
             .iter()
             .enumerate()
-            .skip(from)
+            .skip(start)
             .find(|(_, r)| !r.hidden() && filter.matches_str(&r.subject))
             .map(|(i, _)| i as u64)
     }
@@ -1498,13 +2180,23 @@ impl State {
                 } else {
                     astream_broker::Lineage::from_steps(&self.lineage)
                 },
+                // astream's whole set, as its `Hello` says it: the broker times and the stats
+                // (astream 93ec213) are asked for by no bridge, and answered here as not simulated.
                 requests: Some(
-                    astream_broker::REQUEST_RETIRE | astream_broker::REQUEST_GAP_NOTICES,
+                    astream_broker::REQUEST_RETIRE
+                        | astream_broker::REQUEST_GAP_NOTICES
+                        | astream_broker::REQUEST_TOLD_FETCH
+                        | astream_broker::REQUEST_BROKER_TIMES
+                        | astream_broker::REQUEST_STATS,
                 ),
                 health: None,
-                // This log never reaches a bound aterm's rules cut at.
-                retention: (self.retained && self.mutant != ArmMutant::Unretained)
-                    .then(|| crate::broker_rules::default_rules().encode()),
+                // The rules this open set, and none read back from an earlier one's.
+                retention: self
+                    .ret
+                    .rules
+                    .as_ref()
+                    .filter(|_| self.ret.active && self.mutant != ArmMutant::Unretained)
+                    .map(Retention::encode),
             },
         }
     }
@@ -1519,12 +2211,13 @@ impl State {
         }
         match req {
             Request::Hello => vec![self.hello()],
-            // GapNotices is taken as the real broker takes it; a simulated log retains
-            // everything, so no tail of it is ever told a gap.
-            Request::Attach { .. }
-            | Request::IdleMarks
-            | Request::GapNotices
-            | Request::Keepalive => {
+            Request::GapNotices => {
+                if let Some(c) = self.conns.get_mut(&conn) {
+                    c.gaps = true;
+                }
+                vec![self.mark(head, String::new())]
+            }
+            Request::Attach { .. } | Request::IdleMarks | Request::Keepalive => {
                 vec![self.mark(head, String::new())]
             }
             Request::Publish {
@@ -1648,48 +2341,7 @@ impl State {
                 from_offset,
                 filter,
                 max,
-            } => {
-                let Ok(filt) = Filter::new(filter.as_str()) else {
-                    return vec![Response::Error {
-                        code: astream_broker::proto::ERR_BAD_FILTER,
-                        msg: format!("bad filter {filter:?}"),
-                    }];
-                };
-                let mut out = Vec::new();
-                let mut next = from_offset;
-                if max > 0 {
-                    let scan = if self.mutant == ArmMutant::FetchUnbounded {
-                        u64::MAX
-                    } else {
-                        astream_broker::broker::FETCH_SCAN_MAX as u64
-                    };
-                    let limit = from_offset.saturating_add(scan).min(head);
-                    let mut off = from_offset;
-                    while off < limit {
-                        next = off + 1;
-                        let rec = &self.log[usize::try_from(off).unwrap_or(0)];
-                        if !rec.hidden() && filt.matches_str(&rec.subject) {
-                            out.push(Response::Delivery {
-                                offset: off,
-                                subject: rec.subject.clone(),
-                                body: rec.body.clone(),
-                            });
-                            if out.len() >= max as usize {
-                                break;
-                            }
-                        }
-                        off = next;
-                    }
-                }
-                let mut mark = self.mark(next, String::new());
-                if let Response::Mark { oldest, .. } = &mut mark {
-                    if self.mutant != ArmMutant::FetchNamesNoOldest {
-                        *oldest = Some(0);
-                    }
-                }
-                out.push(mark);
-                out
-            }
+            } => self.fetch(conn, from_offset, &filter, max),
             Request::Subscribe {
                 from_offset,
                 filter,
@@ -1712,6 +2364,124 @@ impl State {
                 msg: format!("malformed request (not simulated): {other:?}"),
             }],
         }
+    }
+
+    /// A `Fetch` (astream's `serve_fetch`). BELOW THE OLDEST: told, never a page that
+    /// silently starts later. A reader told what retention gave up (one that asked for gap
+    /// notices) reads the records retention still holds of its filter from its `from`, the
+    /// notice for the range ahead of the page (`BrokerLog::fetch_told`), and is refused where
+    /// it holds none there; every other is refused `retained-from=<oldest>`. A head query is
+    /// never refused, and its `Mark` names the oldest.
+    fn fetch(&mut self, conn: u64, from_offset: u64, filter: &str, max: u32) -> Vec<Response> {
+        let Ok(filt) = Filter::new(filter) else {
+            return vec![Response::Error {
+                code: astream_broker::proto::ERR_BAD_FILTER,
+                msg: format!("bad filter {filter:?}"),
+            }];
+        };
+        let oldest = self.oldest(&filt);
+        let told = self.conns.get(&conn).is_some_and(|c| c.gaps)
+            && self.mutant != ArmMutant::FetchNeverTold;
+        let below = max > 0 && from_offset < oldest;
+        let (page, next, gap) = if max == 0 {
+            (Vec::new(), from_offset, None)
+        } else if !below || self.mutant == ArmMutant::FetchClampsBelowTheFloor {
+            let (page, next) = self.fetch_from(from_offset.max(oldest), &filt, max);
+            (page, next, None)
+        } else {
+            let (page, next) = self.fetch_from(from_offset, &filt, max);
+            // Scanned in offset order: the page's first record is the lowest of the filter
+            // at or above `from`, held below the oldest when it lies below it.
+            let held = page
+                .first()
+                .map_or(next < oldest, |&(off, _, _)| off < oldest);
+            if !(told && held) {
+                self.ret.refusals += 1;
+                self.notes.push(format!(
+                    "fetch c{conn} {filter} from={from_offset} refused retained-from={oldest}"
+                ));
+                return vec![Response::Error {
+                    code: astream_broker::proto::ERR_RECORD_REFUSED,
+                    msg: format!(
+                        "{}{oldest}: records of {filter} below offset {oldest} are not all \
+                         kept; read from there",
+                        astream_broker::proto::RETAINED_FROM_PREFIX
+                    ),
+                }];
+            }
+            let gap = self
+                .gap_notice(&filt, from_offset, &mut Told::at(from_offset))
+                .filter(|_| self.mutant != ArmMutant::FetchToldNoNotice);
+            if let Some(g) = gap {
+                self.ret.told.push((conn, g));
+            }
+            (page, next, gap)
+        };
+        let mut out: Vec<Response> = gap.map(Response::Gap).into_iter().collect();
+        out.extend(
+            page.into_iter()
+                .map(|(offset, subject, body)| Response::Delivery {
+                    offset,
+                    subject,
+                    body,
+                }),
+        );
+        let mut mark = self.mark(next, String::new());
+        if let Response::Mark { oldest: o, .. } = &mut mark {
+            if self.mutant != ArmMutant::FetchNamesNoOldest {
+                *o = Some(oldest);
+            }
+        }
+        out.push(mark);
+        out
+    }
+
+    /// The scan every `Fetch` shares, from `from` (astream's `BrokerLog::fetch_from`): at most
+    /// `FETCH_SCAN_MAX` records, the held ones below the base first, each scanned as a
+    /// retained one, then the retained suffix to the head; `max` records of `filter` at most.
+    /// The page, and the offset after the last record it scanned.
+    fn fetch_from(&self, from: u64, filt: &Filter, max: u32) -> (Vec<(u64, String, Vec<u8>)>, u64) {
+        let head = self.log.len() as u64;
+        let max = max as usize;
+        let mut out = Vec::new();
+        let mut budget = if self.mutant == ArmMutant::FetchUnbounded {
+            u64::MAX
+        } else {
+            astream_broker::broker::FETCH_SCAN_MAX as u64
+        };
+        let base = self.ret.base;
+        let mut start = from;
+        if from < base {
+            for (&off, h) in self.ret.held.range(from..base) {
+                if budget == 0 {
+                    return (out, start);
+                }
+                budget -= 1;
+                start = off + 1;
+                if filt.matches_str(&h.rec.subject) {
+                    out.push((off, h.rec.subject.clone(), h.rec.body.clone()));
+                    if out.len() >= max {
+                        return (out, start);
+                    }
+                }
+            }
+        }
+        let start = start.max(base);
+        let limit = start.saturating_add(budget).min(head);
+        let mut next = start;
+        let mut off = start;
+        while off < limit {
+            next = off + 1;
+            let rec = &self.log[usize::try_from(off).unwrap_or(0)];
+            if !rec.hidden() && filt.matches_str(&rec.subject) {
+                out.push((off, rec.subject.clone(), rec.body.clone()));
+                if out.len() >= max {
+                    break;
+                }
+            }
+            off = next;
+        }
+        (out, next)
     }
 
     fn register(
@@ -1807,8 +2577,30 @@ impl State {
             .push(format!("subscribe c{conn} from={from} {filter}"));
         if let Some(c) = self.conns.get_mut(&conn) {
             c.sub = Some((from, filt));
+            c.told = c.gaps.then(|| Told::at(from));
         }
         Vec::new()
+    }
+
+    /// The gap notice tail `conn` is owed before its next record, if it asked and has
+    /// something to read (astream's tail looks only then); `told` is updated when `take`.
+    fn owed_gap(&mut self, conn: u64, take: bool) -> Option<astream_broker::Gap> {
+        if self.mutant == ArmMutant::NoGapNotices {
+            return None;
+        }
+        let c = self.conns.get(&conn)?;
+        let (cursor, filter) = c.sub.clone()?;
+        let mut told = c.told?;
+        if (self.log.len() as u64) <= cursor {
+            return None;
+        }
+        let gap = self.gap_notice(&filter, cursor, &mut told);
+        if take {
+            if let Some(c) = self.conns.get_mut(&conn) {
+                c.told = Some(told);
+            }
+        }
+        gap
     }
 }
 
@@ -1884,17 +2676,7 @@ pub(crate) fn dial_stream(p: &Arc<Process>) -> io::Result<SimStream> {
         }
         let id = s.next_conn;
         s.next_conn += 1;
-        s.conns.insert(
-            id,
-            ConnState {
-                pid: p.pid,
-                inbound: Vec::new(),
-                out: VecDeque::new(),
-                held: VecDeque::new(),
-                open: true,
-                sub: None,
-            },
-        );
+        s.conns.insert(id, ConnState::new(p.pid));
         s.note_event(|| Event::Dial(id));
         id
     };
@@ -1923,7 +2705,20 @@ impl Read for SimStream {
         };
         if out_empty && open && up {
             if let Some((cursor, filter)) = sub {
-                if let Some(off) = s.next_match(cursor, &filter) {
+                // TOLD FIRST: what retention gave up below the tail, ahead of what it reads.
+                if let Some(gap) = s.owed_gap(self.conn, true) {
+                    s.note_event(|| Event::Deliver(self.conn));
+                    s.ret.told.push((self.conn, gap));
+                    let line = format!(
+                        "gap c{} {}..{} records={:?}",
+                        self.conn, gap.from, gap.to, gap.records
+                    );
+                    s.notes.push(line);
+                    if let Some(c) = s.conns.get_mut(&self.conn) {
+                        put(&mut c.out, &Response::Gap(gap));
+                    }
+                    out_empty = false;
+                } else if let Some(off) = s.next_match(cursor, &filter) {
                     // THE REORDER aterm-0 must survive: a record handed to a reader while its
                     // publisher's ack is still held.
                     if s.conns
@@ -2032,6 +2827,26 @@ impl std::io::Write for SimStream {
             (frames, broken)
         };
         let (frames, broken) = frames;
+        let commit = |p: Option<&Vec<u8>>| {
+            matches!(
+                p.and_then(|p| decode_request(p)),
+                Some(Request::Commit { .. })
+            )
+        };
+        let publish = |p: Option<&Vec<u8>>| {
+            matches!(
+                p.and_then(|p| decode_request(p)),
+                Some(Request::Publish { .. })
+            )
+        };
+        if commit(frames.first()) {
+            let mut s = lock(&self.process.core.broker.state);
+            match frames.len() {
+                1 => s.commits_alone += 1,
+                2 if publish(frames.get(1)) => s.commits_corked += 1,
+                _ => {}
+            }
+        }
         for payload in frames {
             self.process.step("bus-before");
             let req = decode_request(&payload);

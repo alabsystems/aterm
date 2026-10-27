@@ -1152,8 +1152,8 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     let record = status(&app);
     assert!(
         record.contains(
-            " flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- held=- end=- end_seen=- \
-             end_cheered=- goal=- task_state=- task_rev=0 log_seq=1 log_ep=1 run=- \
+            " flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- held=- waiting=- end=- end_seen=- \
+             end_cheered=- goal=- task_state=- task_rev=0 log_seq=1 log_ep=1 log_base=1 run=- \
              turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
@@ -1307,7 +1307,7 @@ fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     let record = status(&app);
     assert!(
         record.contains(&format!(
-            " task=- pause={AT} land_held=- land_nudges=- land_since=- held=- end=- end_seen=- end_cheered=- \
+            " task=- pause={AT} land_held=- land_nudges=- land_since=- held=- waiting=- end=- end_seen=- end_cheered=- \
              goal=- task_state=- task_rev=0 log_seq="
         )),
         "{record}"
@@ -1686,13 +1686,14 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              last_act os_appearance theme_side reported_scheme scheme_from bg_dark \
              session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_rss_mb \
              disk disk_free_mb disk_room_mb disk_age_ms job job_quiet_ms program_check syspolicyd \
-             syspolicyd_workers syspolicyd_full_ms occupancy occupancy_hold ready slots \
+             syspolicyd_workers syspolicyd_full_ms service_mem service_mem_top occupancy \
+             occupancy_hold ready slots \
              idle_ready_min waits waits_ready supervisor supervisor_proven autopilot \
              human_ms human_seq launch launch_seq path_evidence copy upgrade history_lost \
              journal journal_off integration_rev born render \
-             resizes flaps land_at task pause land_held land_nudges land_since held end end_seen \
-             end_cheered goal task_state task_rev \
-             log_seq log_ep run turn step need need_since_ms rollout rollout_asks editing bells \
+             resizes flaps land_at task pause land_held land_nudges land_since held waiting end \
+             end_seen end_cheered goal task_state task_rev \
+             log_seq log_ep log_base run turn step need need_since_ms rollout rollout_asks editing bells \
              bells_sounded last_bell gen seq hash"
         ),
         "{observed}"
@@ -1918,8 +1919,10 @@ fn a_refused_sample_still_advances_the_observation_gate() {
 fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
     let cases: &[(&str, Option<&str>)] = &[
         ("claude --dangerously-skip-permissions", Some("claude")),
-        ("$ sleep 30", Some("sleep")),
-        ("❯ codex", Some("codex")),
+        // A line arrives as the shell said it (633;E) or scraped from the B mark's column, so no
+        // prompt is in front: a `$` or `❯` first word is the program word, and it has no name.
+        ("$ sleep 30", None),
+        ("❯ codex", None),
         ("% ", None),
         ("codex", Some("codex")),
         ("targo --unverified test -p x", Some("targo test")),
@@ -2004,7 +2007,7 @@ fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
         ("echo 'x && y' && codex", Some("codex")),
         ("echo a \\; codex", Some("echo")),
         ("for i in 1 2 3; do sleep 1; done", Some("for")),
-        ("$ for i in 1 2 3; do sleep 1; done", Some("for")),
+        ("! for i in 1 2 3; do sleep 1; done", Some("for")),
         ("while true; do claude; done", Some("while")),
         ("if [ -f x ]; then claude; fi", Some("if")),
         ("{ cd x; claude; }", Some("cd")),
@@ -2440,6 +2443,160 @@ fn each_wrapper_reads_its_own_flags_and_closes_on_any_other() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The program word is a line's first word that is no assignment and no reserved word stepped
+/// over ([`STEPPED_OVER`]). When it has no name to read, the detail is that word where people
+/// know it ([`NAMELESS_COMMANDS`]) or nothing, never a later word: every `QZP6WORD` here is an
+/// argument, another line's words (a history designator, whatever the shell reports: zsh 5.9,
+/// bash 3.2 and 5.3 report it expanded) or an expression.
+#[test]
+fn a_nameless_first_word_never_makes_an_argument_the_program() {
+    let mut cases: Vec<(String, Option<&str>)> = [
+        (": QZP6WORD1", Some(":")),
+        ("!! QZP6WORD2", None),
+        ("!$ QZP6WORD2", None),
+        ("!-2 QZP6WORD2", None),
+        ("!git QZP6WORD2", None),
+        ("^QZP6WORD2^x", None),
+        ("[ -f QZP6WORD3 ]", Some("[")),
+        ("[ -f QZP6WORD3 ] && make", Some("make")),
+        (". QZP6WORD4/x.sh", Some(".")),
+        (". ./run.sh QZP6WORD4", Some(".")),
+        ("-- QZP6WORD5", None),
+        ("& ./QZP6WORD6/run.ps1 QZP6WORD6", Some("run.ps1")),
+        ("| QZP6WORD7", None),
+        ("((QZP6WORD8+1))", None),
+        ("(( QZP6WORD8 ))", None),
+        ("'' QZP6WORD9", None),
+        ("$ QZP6WORD10", None),
+        ("FOO=1 ! QZP6WORD11", None),
+        ("sudo !! QZP6WORD12", Some("sudo")),
+        ("nohup ! QZP6WORD13", Some("nohup")),
+        ("! make test", Some("make test")),
+        ("! ! make QZP6WORD14", Some("make")),
+        ("{ make; }", Some("make")),
+        ("( cd x && make )", Some("make")),
+        ("(make QZP6WORD15)", Some("make")),
+        ("! for i in QZP6WORD16; do QZP6WORD16; done", Some("for")),
+    ]
+    .into_iter()
+    .map(|(cmd, want)| (cmd.to_owned(), want))
+    .collect();
+    for word in STEPPED_OVER {
+        cases.push((format!("{word} prog QZP6WORD17"), Some("prog")));
+        cases.push((format!("'{word}' prog QZP6WORD17"), None));
+        cases.push((format!("FOO=1 {word} prog QZP6WORD17"), None));
+        assert_eq!(
+            lead(Some(word), word.trim_matches(WORD_TRIM)),
+            Lead::Step(word),
+            "{word:?} is stepped over"
+        );
+    }
+    for word in NAMELESS_COMMANDS {
+        cases.push((format!("{word} QZP6WORD18 prog"), Some(word)));
+        cases.push((format!("sudo {word} QZP6WORD18 prog"), Some(word)));
+    }
+    for word in [
+        "$", "%", "❯", "-", "--", "|", "*", "?", "~", "=", "@", ",", "\"\"",
+    ] {
+        assert!(
+            !STEPPED_OVER.contains(&word) && !NAMELESS_COMMANDS.contains(&word),
+            "{word:?} is outside both lists"
+        );
+        cases.push((format!("{word} QZP6WORD19 prog"), None));
+        cases.push((format!("cd x && {word} QZP6WORD19 prog"), None));
+    }
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|(cmd, want)| {
+            let got = command_detail(cmd);
+            (got.as_deref() != *want || got.as_deref().is_some_and(|d| d.contains("QZP6")))
+                .then(|| format!("{cmd:?}: {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A word is an assignment only where its reader takes it for one, by that reader's rule: the
+/// shell on the word as typed ([`shell_assignment`]: `'FOO=1' x` runs `FOO=1` with the argument
+/// `x`, as bash 3.2 and 5.3 and zsh 5.9 do), sudo and env on the argv they are handed
+/// ([`argv_assignment`]), and `time` only as the shell's own keyword. Every `QZP6WORD20` is an
+/// argument and every `QZP6WORD21` a value: neither is ever the detail.
+#[test]
+fn a_word_is_an_assignment_only_where_its_reader_takes_it_for_one() {
+    let mut cases: Vec<(String, Option<&str>)> = [
+        ("'FOO=1' QZP6WORD20 x", None),
+        ("\"FOO=1\" QZP6WORD20 x", None),
+        ("\"A=b c\" QZP6WORD20 x", None),
+        ("F\"O\"O=1 QZP6WORD20", None),
+        ("FOO\\=1 QZP6WORD20", None),
+        ("! 'FOO=1' QZP6WORD20", None),
+        ("FOO=1 'BAR=2' QZP6WORD20", None),
+        ("1=x QZP6WORD20", None),
+        ("é=1 QZP6WORD20", None),
+        ("'FOO=QZP6WORD21'", None),
+        ("$env:FOO='QZP6WORD21'", None),
+        ("FOO=QZP6WORD21 make", Some("make")),
+        ("FOO=\"QZP6WORD21 x\" make", Some("make")),
+        ("_x9=QZP6WORD21 make", Some("make")),
+        ("FOO+=QZP6WORD21 make", Some("make")),
+        ("a[1]=QZP6WORD21 make", Some("make")),
+        ("(FOO=QZP6WORD21 make)", Some("make")),
+        ("time 'FOO=1' QZP6WORD20", Some("time")),
+        ("time FOO=QZP6WORD21 make", Some("make")),
+        ("! time FOO=QZP6WORD21 make", Some("make")),
+        ("(time FOO=QZP6WORD21 make)", Some("make")),
+        ("/usr/bin/time FOO=1 QZP6WORD20", Some("time")),
+        ("FOO=1 time BAR=2 QZP6WORD20", Some("time")),
+        ("sudo time FOO=1 QZP6WORD20", Some("time")),
+        ("env time FOO=1 QZP6WORD20", Some("time")),
+        ("env =QZP6WORD21 make", Some("env")),
+    ]
+    .into_iter()
+    .map(|(cmd, want)| (cmd.to_owned(), want))
+    .collect();
+    for wrapper in &WRAPPERS {
+        let name = wrapper.name;
+        // To the wrapper itself every one of these is an assignment; to the shell none is.
+        let argv = [
+            "'FOO=QZP6WORD21'",
+            "a.b=QZP6WORD21",
+            "\"A=QZP6WORD21 x\"",
+            "1=QZP6WORD21",
+        ];
+        match wrapper.assignments {
+            Assignments::Argv => {
+                for value in argv {
+                    cases.push((format!("{name} {value} prog"), Some("prog")));
+                }
+                cases.push((format!("{name} /x=QZP6WORD20 y"), Some(name)));
+            }
+            Assignments::Keyword => {
+                cases.push((format!("{name} FOO=QZP6WORD21 prog"), Some("prog")));
+                for typed in [format!("'{name}'"), format!("/usr/bin/{name}")] {
+                    cases.push((format!("{typed} FOO=1 QZP6WORD20"), Some(name)));
+                }
+            }
+            Assignments::None => {
+                cases.push((format!("{name} FOO=1 QZP6WORD20"), Some(name)));
+            }
+        }
+        if wrapper.assignments != Assignments::Argv {
+            for word in argv {
+                cases.push((format!("{name} {word} QZP6WORD20"), Some(name)));
+            }
+        }
+    }
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|(cmd, want)| {
+            let got = command_detail(cmd);
+            (got.as_deref() != *want || got.as_deref().is_some_and(|d| d.contains("QZP6")))
+                .then(|| format!("{cmd:?}: {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[test]
 fn executing_detail_reads_only_an_executing_block() {
     let mut term = aterm_core::terminal::Terminal::new(24, 80);
@@ -2611,7 +2768,7 @@ fn the_status_record_carries_the_task_record() {
     let none = app.session_status_record(0).expect("live session");
     assert!(
         none.contains(
-            " pause=- land_held=- land_nudges=- land_since=- held=- end=- end_seen=- end_cheered=- \
+            " pause=- land_held=- land_nudges=- land_since=- held=- waiting=- end=- end_seen=- end_cheered=- \
              goal=- task_state=- task_rev=0 log_seq="
         ),
         "{none}"
@@ -2622,7 +2779,7 @@ fn the_status_record_carries_the_task_record() {
     let record = app.session_status_record(0).expect("live session");
     assert!(
         record.contains(
-            " task=- pause=- land_held=- land_nudges=- land_since=- held=- end=- end_seen=- end_cheered=- \
+            " task=- pause=- land_held=- land_nudges=- land_since=- held=- waiting=- end=- end_seen=- end_cheered=- \
              goal=- task_state=done task_rev=2 log_seq="
         ),
         "{record}"

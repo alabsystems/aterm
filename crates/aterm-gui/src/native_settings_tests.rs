@@ -3109,27 +3109,19 @@ fn the_debugger_alert_says_what_the_press_changes() {
     use aterm_containment::consent::{
         DEBUGGER_ACCESS_REVERT, DebuggerChange, DebuggerMember, DebuggerMode, SelfHardening,
     };
+    /// Two short lines: what the change does, then macOS's dialog.
     fn laid_out(case: &str, body: &str) {
-        for paragraph in body.split("\n\n") {
-            let lines: Vec<&str> = paragraph.split('\n').collect();
+        let lines: Vec<&str> = body.split("\n\n").collect();
+        assert_eq!(lines.len(), 2, "{case}: two lines, not a wall: {body:?}");
+        for line in lines {
             assert!(
-                lines.len() == 1 || lines.iter().all(|l| l.starts_with("\u{2022} ")),
-                "{case}: one line or a list of bullets: {paragraph:?}"
+                !line.is_empty() && line.trim() == line && !line.contains('\n'),
+                "{case}: one unpadded line each: {body:?}"
             );
-            for line in lines {
-                assert!(
-                    !line.is_empty() && line.trim() == line,
-                    "{case}: no empty or padded line in {body:?}"
-                );
-                assert!(
-                    !line.starts_with('\u{2022}') || line.starts_with("\u{2022} "),
-                    "{case}: a bullet line starts with the bullet and a space: {line:?}"
-                );
-                assert!(
-                    line.chars().count() <= 150,
-                    "{case}: a short line, not a wall: {line:?}"
-                );
-            }
+            assert!(
+                line.chars().count() <= 150,
+                "{case}: a short line: {line:?}"
+            );
         }
     }
     let measured = SpikeEvidence {
@@ -3150,23 +3142,20 @@ fn the_debugger_alert_says_what_the_press_changes() {
                 "{hardening:?} measured={}",
                 evidence.devtools_enable_measured
             );
-            let (_, undo) = body.rsplit_once("\n\n").expect("paragraphs");
+            let (_, undo) = body.rsplit_once("\n\n").expect("two lines");
             assert!(
                 undo.contains(DEBUGGER_ACCESS_REVERT),
-                "{case}: the undo carries the revert line"
+                "{case}: the last line carries the revert"
             );
-            let bullet = debugger_alert_not_hardened_bullet(hardening);
             assert_eq!(
-                bullet.is_some_and(|bullet| body.split('\n').any(|line| line == bullet)),
+                body.contains("not this aterm"),
                 off.not_hardened(),
                 "{case}: what an unhardened aterm exposes, exactly when it is one"
             );
             assert_eq!(
-                body.split('\n')
-                    .filter(|line| line.contains("this aterm"))
-                    .count(),
+                body.matches("this aterm").count(),
                 1,
-                "{case}: one line speaks of this aterm, so none contradicts it"
+                "{case}: one clause speaks of this aterm, so none contradicts it"
             );
             assert!(
                 body.contains("SamplingTools"),
@@ -4888,15 +4877,28 @@ fn walk_open_choice_picker(
 fn top_settings_rainbow_banner_present_and_yielding() {
     let key = UiKey::new("settings/top/rainbow");
     let (runtime, instance, view) = setup();
-    let roomy = if crate::trail_audio::output_available() {
-        1_000.0
-    } else {
-        1_050.0
-    };
-    let cx = view_cx_at(1_200.0, roomy);
-    let compiled = compile_settings_view(&runtime, instance, view, &cx);
     let painted =
         |compiled: &crate::native_ui::CompiledUi| compiled.paint.iter().any(|node| node.key == key);
+    // The banner takes the room the Home grid leaves, which the platform's faces and Sound's
+    // rows set: 1,000pt on macOS, 1,100pt in the Linux lane's Noto Sans with no audio output.
+    let roomy = (1_000..=1_400)
+        .step_by(50)
+        .map(|height| height as f32)
+        .find(|&height| {
+            painted(&compile_settings_view(
+                &runtime,
+                instance,
+                view,
+                &view_cx_at(1_200.0, height),
+            ))
+        })
+        .expect("a roomy Home page shows the rainbow banner");
+    #[cfg(target_os = "macos")]
+    if crate::trail_audio::output_available() {
+        assert_eq!(roomy, 1_000.0, "macOS's faces show it at 1200x1000");
+    }
+    let cx = view_cx_at(1_200.0, roomy);
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
     assert!(
         painted(&compiled),
         "roomy Home page shows the rainbow banner"
@@ -7626,6 +7628,179 @@ fn the_serious_mode_note_stays_in_view_while_styles_are_tried() {
             }
         }
     }
+}
+
+/// A CURSOR STYLE'S CHECK GIVES UP ITS TAIL WHERE IT COSTS A TOO-TALL NAME A LINE: in a narrow
+/// window at 2x text the check beside the saved style narrowed its name onto a line more than
+/// the list had room for. NEGATIVE CONTROL: where the row fits the list, the saved style keeps
+/// its check beside the same name.
+#[test]
+fn a_cursor_styles_check_gives_up_its_tail_where_it_costs_a_too_tall_name_a_line() {
+    at_each_text_scale(&[2.0], "check tail", |scale| {
+        let style = ListedCursorStyle {
+            value: "rainbow-kitty-flat".to_string(),
+            name: "Flat rainbow kitty".to_string(),
+            description: "A flat rainbow trails the cursor".to_string(),
+            group: CursorStyleGroup::Companions,
+            default: false,
+        };
+        let lines = |width: f32| {
+            wrapped_words_lines(
+                &style.label(),
+                (SemanticRole::Text, StyleRef::Primary),
+                width,
+            )
+            .len()
+        };
+        let (px, face) =
+            crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+        let measure = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
+        let row_width = (60..400)
+            .map(|width| width as f32)
+            .find(|&width| {
+                pieces_fit(&style.label(), width - 56.0, &measure)
+                    && lines(width - 56.0) > lines(width - 24.0)
+            })
+            .expect("premise: a row whose check costs the name a line");
+        let checked = |rows: &[(UiNode, f32)]| {
+            matches!(&rows[0].0.content, UiContent::Button(control)
+                if control.spec.trailing_icon == Some(ButtonIcon::Check))
+        };
+        let roomy = cursor_style_row(&style, true, row_width, 10_000.0);
+        assert!(
+            checked(&roomy),
+            "{row_width}pt: a row that fits keeps its check"
+        );
+        let tight = cursor_style_row(&style, true, row_width, 0.0);
+        assert!(
+            !checked(&tight),
+            "{row_width}pt: a too-tall row gives up its check"
+        );
+        let wide = lines(row_width - 24.0) as f32;
+        assert!(
+            (tight[0].1 - (16.0 + wide * 20.0 * scale).max(scaled_control_height())).abs() < 0.01,
+            "{row_width}pt: the name takes the row's width: {}pt",
+            tight[0].1
+        );
+    });
+}
+
+/// FONT SIZE'S STATE LINE BREAKS ALIKE FOR AUTOMATIC AND CHANGED ([`rest_breaking_alike`]): in
+/// a column narrower than "Automatic" but wide enough for "Changed" (the Linux lane's Noto Sans
+/// with 2x text in a 164pt window), the line under the name says "Default" at rest and "Changed"
+/// once a size is written, each on the one line it keeps. Before, the at-rest "Auto-" / "matic"
+/// kept two lines and "Changed" left the second blank. NEGATIVE CONTROL: where "Automatic" fits
+/// its line, the row says it at rest.
+#[test]
+fn font_sizes_state_line_breaks_alike_for_automatic_and_changed() {
+    let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
+    let width_of =
+        |word: &str| crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, word, px);
+    let (changed, automatic) = (width_of(CHANGED_WORD), width_of(AUTOMATIC_WORD));
+    assert!(
+        changed.max(48.0) + 2.0 < automatic,
+        "premise: some column takes Changed on a line but not Automatic ({changed} < {automatic})"
+    );
+    let placement = |said: &str| RowTagPlacement {
+        lines: Vec::new(),
+        below: Vec::new(),
+        worst_below: Vec::new(),
+        state_below: Some(StateBelow {
+            said: vec![said.to_string()],
+            worst: vec![AUTOMATIC_WORD.to_string()],
+            rest: vec![AUTOMATIC_WORD.to_string()],
+            facts: Vec::new(),
+            worst_facts: Vec::new(),
+        }),
+    };
+    let between = (changed.max(48.0) + automatic) / 2.0;
+    for (said, shown) in [(AUTOMATIC_WORD, DEFAULT_WORD), (CHANGED_WORD, CHANGED_WORD)] {
+        assert_eq!(
+            row_second_line(&placement(said), None, None, between),
+            vec![shown.to_string()],
+            "{between}pt: {said} keeps one line, none blank"
+        );
+    }
+    let wide = automatic + 8.0;
+    for said in [AUTOMATIC_WORD, CHANGED_WORD] {
+        assert_eq!(
+            row_second_line(&placement(said), None, None, wide),
+            vec![said.to_string()],
+            "{wide}pt: {said} on its line"
+        );
+    }
+}
+
+/// A DEFAULT STYLE TOO TALL FOR THE LIST SAYS IT IS THE DEFAULT IN ITS DESCRIPTION: "Rainbow kitty
+/// (default)" took four lines at 2x text in a 178pt window on the Linux lane, a row taller than
+/// the window; its name alone takes fewer, and "Default · …" leads its description. The button
+/// is still named in full. NEGATIVE CONTROL: where the row fits the list, its name says it.
+#[test]
+fn a_too_tall_default_style_says_so_in_its_description() {
+    fn words(rows: &[(UiNode, f32)], key: &str) -> Option<String> {
+        fn find<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
+            if node.key.as_str() == key {
+                return Some(node);
+            }
+            node.children.iter().find_map(|child| find(child, key))
+        }
+        rows.iter()
+            .find_map(|(node, _)| find(node, key))
+            .and_then(|node| match &node.content {
+                UiContent::Text(spec) => Some(spec.text.clone()),
+                UiContent::Group(spec) => spec.label.clone(),
+                _ => None,
+            })
+    }
+    at_each_text_scale(&[2.0], "default below", |_| {
+        let style = ListedCursorStyle {
+            value: "rainbow-kitty-pet".to_string(),
+            name: "Rainbow kitty".to_string(),
+            description: "A kitty runs behind the cursor".to_string(),
+            group: CursorStyleGroup::Companions,
+            default: true,
+        };
+        let lines = |text: &str, width: f32| {
+            wrapped_words_lines(text, (SemanticRole::Text, StyleRef::Primary), width).len()
+        };
+        let row_width = (60..400)
+            .map(|width| width as f32)
+            .find(|&width| {
+                [width - 56.0, width - 24.0]
+                    .into_iter()
+                    .all(|text| lines(&style.label(), text) > lines(&style.name, text))
+            })
+            .expect("premise: a row whose name alone takes fewer lines than with (default)");
+        let key = "settings/cursor-style/rainbow-kitty-pet";
+        let named = |rows: &[(UiNode, f32)]| -> String {
+            match &rows[0].0.content {
+                UiContent::Button(control) => control.spec.label.clone(),
+                other => panic!("the row is a button: {other:?}"),
+            }
+        };
+        let roomy = cursor_style_row(&style, false, row_width, 10_000.0);
+        assert_eq!(
+            words(&roomy, &format!("{key}/name")).as_deref(),
+            Some("Rainbow kitty (default)"),
+            "{row_width}pt: a row that fits says (default) in its name"
+        );
+        let tight = cursor_style_row(&style, false, row_width, 0.0);
+        assert_eq!(
+            words(&tight, &format!("{key}/name")).as_deref(),
+            Some("Rainbow kitty"),
+            "{row_width}pt: a too-tall row's name"
+        );
+        assert_eq!(
+            words(&tight, &format!("{key}/description")).as_deref(),
+            Some("Default \u{b7} A kitty runs behind the cursor"),
+            "{row_width}pt: a too-tall row's description says it is the default"
+        );
+        assert_eq!(
+            named(&tight),
+            "Rainbow kitty (default)",
+            "the button keeps its name"
+        );
+    });
 }
 
 #[test]
@@ -22111,17 +22286,43 @@ fn text_fonts_still_lists_font_family_and_size() {
 #[test]
 fn top_settings_is_default_native_page_with_requested_controls_and_previews() {
     let (runtime, instance, view) = setup();
-    let roomy = if crate::trail_audio::output_available() {
-        820.0
-    } else {
-        880.0
+    let requested = [
+        prefs::EDIT_THEME,
+        prefs::EDIT_WINDOW_THEME,
+        prefs::EDIT_FONT_FAMILY,
+        prefs::EDIT_FONT_PX,
+        prefs::EDIT_CURSOR_TRAIL_STYLE,
+        prefs::EDIT_TRAIL_SOUNDS,
+        SPARKLE_WORDS_KEY,
+        KEYWORD_KITTIES_KEY,
+    ];
+    let render = |cx: &ViewCx<'_>| {
+        runtime
+            .render(instance, view, cx)
+            .unwrap()
+            .compile(cx.viewport)
+            .unwrap()
     };
+    // The window whose Home grid holds every requested control, which the platform's faces and
+    // Sound's rows set: 820pt on macOS, more in the Linux lane's Noto Sans with no audio output.
+    let roomy = (820..=1_200)
+        .step_by(20)
+        .map(|height| height as f32)
+        .find(|&height| {
+            let compiled = render(&view_cx_at(1_200.0, height));
+            requested.iter().all(|key| {
+                compiled
+                    .semantic(&UiKey::new(format!("settings/control/{key}")))
+                    .is_some()
+            })
+        })
+        .expect("a window whose Top Settings exposes every requested control");
+    #[cfg(target_os = "macos")]
+    if crate::trail_audio::output_available() {
+        assert_eq!(roomy, 820.0, "macOS's faces hold them at 1200x820");
+    }
     let cx = view_cx_at(1_200.0, roomy);
-    let compiled = runtime
-        .render(instance, view, &cx)
-        .unwrap()
-        .compile(cx.viewport)
-        .unwrap();
+    let compiled = render(&cx);
     compiled.validate_parity().unwrap();
     let overflow = compiled
         .paint_audit_lines()
@@ -22138,16 +22339,7 @@ fn top_settings_is_default_native_page_with_requested_controls_and_previews() {
         panic!("Settings view")
     };
     assert_eq!(state.route, SettingsRoute::Home);
-    for key in [
-        prefs::EDIT_THEME,
-        prefs::EDIT_WINDOW_THEME,
-        prefs::EDIT_FONT_FAMILY,
-        prefs::EDIT_FONT_PX,
-        prefs::EDIT_CURSOR_TRAIL_STYLE,
-        prefs::EDIT_TRAIL_SOUNDS,
-        SPARKLE_WORDS_KEY,
-        KEYWORD_KITTIES_KEY,
-    ] {
+    for key in requested {
         assert!(
             compiled
                 .semantic(&UiKey::new(format!("settings/control/{key}")))
@@ -22870,12 +23062,18 @@ fn undo_puts_back_an_old_style_alias() {
             edits: vec![ConfigKeyEdit {
                 key: prefs::EDIT_FONT_PX.to_string(),
                 expected: ExpectedValue::Exact(None),
-                value: Some("15".to_string()),
+                value: Some("16".to_string()),
             }],
         }) else {
             panic!("the later change was refused")
         };
     };
+    // 16 px: no platform's automatic size, which a write removes instead.
+    assert_ne!(
+        crate::FONT_PX,
+        16.0,
+        "premise: 16 px is written, not removed"
+    );
     let mut service = VersionedConfigService::new(SOURCE.to_string()).unwrap();
     let undo = choose(&mut service, "comet");
     let ConfigPatchResult::Applied { snapshot, .. } = service.undo(undo) else {
@@ -22894,7 +23092,7 @@ fn undo_puts_back_an_old_style_alias() {
         undone.raw_value(prefs::EDIT_CURSOR_TRAIL_STYLE).as_deref(),
         Some("nyan")
     );
-    assert_eq!(undone.raw_value(prefs::EDIT_FONT_PX).as_deref(), Some("15"));
+    assert_eq!(undone.raw_value(prefs::EDIT_FONT_PX).as_deref(), Some("16"));
 
     const MONO: &str = "cursor_trail_style = \"classic mono\"\n";
     let mut service = VersionedConfigService::new(MONO.to_string()).unwrap();
@@ -22914,7 +23112,7 @@ fn undo_puts_back_an_old_style_alias() {
         (prefs::EDIT_CURSOR_TRAIL_STYLE, Some("classic mono")),
         (prefs::EDIT_CURSOR_TRAIL_COLOR, None),
         (prefs::EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF, None),
-        (prefs::EDIT_FONT_PX, Some("15")),
+        (prefs::EDIT_FONT_PX, Some("16")),
     ] {
         assert_eq!(
             undone.raw_value(key).as_deref(),
@@ -27202,10 +27400,13 @@ fn setting_row_paints_its_disclosure_verbatim() {
             _ => None,
         });
         if painted == label {
-            assert_eq!(
-                second.as_deref(),
-                Some(note.visual.as_str()),
-                "{key}: the row's second line paints the note verbatim"
+            // The note may share its line with the row's own words, which follow it
+            // (`facts_on_note`): Linux's "Audio unavailable" note leaves the melody's words room.
+            let second = second.unwrap_or_default();
+            assert!(
+                second == note.visual
+                    || second.starts_with(&format!("{}{FACT_SEPARATOR}", note.visual)),
+                "{key}: the row's second line paints the note verbatim: {second:?}"
             );
         } else {
             assert_eq!(
@@ -28232,6 +28433,79 @@ fn settings_route_at(state: &SettingsViewState, cx: &ViewCx<'_>) -> crate::nativ
     )
     .compile(cx.viewport)
     .expect("Settings compiles")
+}
+
+/// A FRAME THAT TAKES OR GIVES BACK THE COMPACT TOOLBAR DRAWS THE SCREEN THE NEXT FRAME DRAWS:
+/// whether a warning docks in the toolbar is weighed from the chrome the last frame chose, so
+/// the first frame at 2x text after 1x docked a warning the next frame stood under the page
+/// (the Linux lane's Noto Sans at 919x158, the keeping rules' R1). Here the page is held to
+/// list its toolbar ([`PAGE_CHROME_HELD`]) after a frame that kept it over the page.
+/// NEGATIVE CONTROL: drawn once from that chrome, the frame and the next differ.
+#[test]
+fn a_frame_that_changes_the_toolbars_listing_draws_what_the_next_draws() {
+    const WARNING: &str = "aterm.toml reload rejected: repair the invalid authored value before \
+                           automatic reload can resume.";
+    at_each_text_scale(&[2.0], "toolbar listing", |_| {
+        let screen = |compiled: &crate::native_ui::CompiledUi| -> Vec<String> {
+            compiled
+                .paint
+                .iter()
+                .map(|node| format!("{} {:?} {:?}", node.key.as_str(), node.rect, node.clip))
+                .collect()
+        };
+        let fresh = |route: SettingsRoute| {
+            let mut state = SettingsViewState::new(&Config::default());
+            state.navigate(route);
+            state.config_watch_status = Some(WARNING.to_string());
+            state
+        };
+        let once = |state: &SettingsViewState, cx: &ViewCx<'_>| {
+            settings_tree_once(
+                state,
+                &UpdateState::from_status(1, "0.1.0", None, false).projection(),
+                &PackagesState::unobserved().projection(),
+                &MessagesState::empty(),
+                &HarnessState::unobserved().projection(),
+                cx,
+            )
+            .compile(cx.viewport)
+            .expect("Settings compiles")
+        };
+        PAGE_CHROME_HELD.with(|held| {
+            held.set(Some(PageChrome {
+                toolbar_listed: true,
+                ..PageChrome::FULL
+            }));
+        });
+        let found = SettingsRoute::ALL
+            .into_iter()
+            .filter(|&route| route != SettingsRoute::Messages)
+            .find_map(|route| {
+                [164.0_f32, 178.0, 240.0, 300.0]
+                    .into_iter()
+                    .find_map(|width| {
+                        (98..=420).step_by(6).find_map(|height| {
+                            let cx = view_cx_at(width, height as f32);
+                            let state = fresh(route);
+                            let first = screen(&once(&state, &cx));
+                            (state.page_chrome.get().toolbar_listed
+                                && first != screen(&once(&state, &cx)))
+                            .then_some((route, cx))
+                        })
+                    })
+            });
+        let (route, cx) =
+            found.expect("premise: a frame drawn once from a stale chrome differs from the next");
+        let state = fresh(route);
+        let first = screen(&settings_route_at(&state, &cx));
+        let next = screen(&settings_route_at(&state, &cx));
+        PAGE_CHROME_HELD.with(|held| held.set(None));
+        assert_eq!(
+            first, next,
+            "{route:?} at {:?}: the frame that listed the toolbar draws the next frame",
+            cx.viewport
+        );
+    });
 }
 
 #[test]
@@ -29788,6 +30062,48 @@ fn the_deep_link_selects_and_lands_on_the_entry() {
     }
 }
 
+/// NO PART OF A TALL ENTRY IS A SLIVER: an entry taller than the list's room is parted where
+/// what is left is more than a peek, every part from a peek to the room tall, the last ending
+/// at the entry's end. Negative control: a stacked head 184pt tall in an 88pt room, its lines
+/// ending every 44pt, was parted at 88pt and 176pt, its 8pt foot a screen of its own (2x in a
+/// 164x98 window), a band of empty card.
+#[test]
+fn no_part_of_a_tall_entry_is_a_sliver() {
+    let peek = crate::native_ui::LIST_PEEK_MIN;
+    for (blocks, pad) in [
+        (vec![(184.0, vec![44.0, 88.0, 132.0, 176.0])], 0.0),
+        (vec![(140.0, vec![44.0, 88.0, 132.0]), (40.0, vec![])], 4.0),
+        (vec![(180.0, vec![])], 0.0),
+    ] {
+        let total: f32 = blocks.iter().map(|(height, _)| height).sum::<f32>() + pad;
+        let (parts, heights, skips) = messages_tall_parts(&blocks, pad, 88.0);
+        let context = format!("{blocks:?} +{pad}: {parts:?} {heights:?} {skips:?}");
+        assert!(parts.len() > 1, "{context}");
+        assert!(
+            heights
+                .iter()
+                .all(|height| *height >= peek - 0.01 && *height <= 88.01),
+            "{context}"
+        );
+        let last = parts.len() - 1;
+        let top = |part: usize| {
+            blocks[..parts[part].start]
+                .iter()
+                .map(|(height, _)| height)
+                .sum::<f32>()
+                + skips[part]
+        };
+        assert!(
+            (top(last) + heights[last] - total).abs() < 0.01,
+            "the last part ends at the entry's end: {context}"
+        );
+        assert!(
+            (1..parts.len()).all(|part| top(part) <= top(part - 1) + heights[part - 1] + 0.01),
+            "no band of it is skipped: {context}"
+        );
+    }
+}
+
 fn messages_with_tall_notice(at: usize) -> (MessagesState, MessageView) {
     let mut log = sample_messages();
     let mut notice = log.entries[0].clone();
@@ -30174,6 +30490,87 @@ fn a_tag_pop_up_opened_on_a_scrolled_wide_page_is_drawn() {
         message_rows(&compiled).contains(&last),
         "the scroll to the end must show the last entry"
     );
+}
+
+/// A SCROLL TO THE END SHOWS THE LAST ENTRY, CLAMPED BY WHATEVER CHROME: a page's chrome (its
+/// subtitle, its insets) is chosen as it draws, so a scroll before the next frame is clamped by
+/// the chrome the last frame chose: after the tag pop-up closed, the leaner chrome the open
+/// pop-up left (the Linux lane's Noto Sans: 45 of 46 stops). The frame that draws the fuller
+/// chrome keeps the list at its end. NEGATIVE CONTROL: a scroll that stopped short of the end
+/// stays where it stopped.
+#[test]
+fn a_scroll_to_the_end_clamped_by_a_leaner_chrome_shows_the_last_entry() {
+    let mut log = script_tag_messages(12);
+    log.saved = false;
+    let last = log.entries.last().expect("the log has entries").id;
+    let width = 864.0;
+    let (mut runtime, instance, view) = setup_with_messages();
+    assert!(runtime.replace_settings_messages(log.clone(), 8));
+    let lean = PageChrome {
+        no_subtitle: true,
+        ..PageChrome::FULL
+    };
+    let set_chrome = |runtime: &mut NativeRuntime, chrome: PageChrome| {
+        if let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) {
+            state.page_chrome.set(chrome);
+        }
+    };
+    let (cx, full_end, lean_end) = (300..1_000)
+        .step_by(4)
+        .find_map(|height| {
+            let cx = view_cx_at(width, height as f32);
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            if messages_view_state(&runtime, view).page_chrome.get() != PageChrome::FULL {
+                return None;
+            }
+            let full = messages_plan_drawn(&runtime, view, &log);
+            set_chrome(&mut runtime, lean);
+            let leaner = messages_plan_drawn(&runtime, view, &log);
+            set_chrome(&mut runtime, PageChrome::FULL);
+            (!full.scrolls && full.limit() > leaner.limit())
+                .then(|| (cx, full.limit(), leaner.limit()))
+        })
+        .expect("premise: a window whose full chrome gives the list more stops than a lean one");
+    for short in [false, true] {
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollLines(-10_000))
+            .unwrap();
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        set_chrome(&mut runtime, lean);
+        let lines = if short {
+            i32::try_from(lean_end).unwrap() - 1
+        } else {
+            i32::MAX
+        };
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollLines(lines))
+            .unwrap();
+        let clamped = messages_view_state(&runtime, view).page_scroll;
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert_eq!(
+            messages_view_state(&runtime, view).page_chrome.get(),
+            PageChrome::FULL,
+            "premise: the frame draws the full chrome"
+        );
+        if short {
+            assert_eq!(
+                messages_view_state(&runtime, view).messages_drawn.get(),
+                Some(clamped),
+                "a scroll short of the end stays where it stopped"
+            );
+        } else {
+            assert_eq!(clamped, lean_end, "premise: clamped by the lean chrome");
+            assert_eq!(
+                messages_view_state(&runtime, view).messages_drawn.get(),
+                Some(full_end),
+                "the list stays at its end"
+            );
+            assert!(
+                message_rows(&compiled).contains(&last),
+                "the scroll to the end shows the last entry"
+            );
+        }
+    }
 }
 
 #[test]
@@ -39076,7 +39473,9 @@ fn the_keyword_toys_say_why_they_are_off_and_how_to_turn_them_on() {
         let service = VersionedConfigService::new(toml.to_string()).unwrap();
         let mut state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
         state.navigate(SettingsRoute::Home);
-        settings_route_at(&state, &view_cx_at(1_200.0, 900.0))
+        // Tall enough for the Home grid's playful card on every platform's faces (the Linux
+        // lane's Noto Sans lists the page as one column at 1200x900).
+        settings_route_at(&state, &view_cx_at(1_200.0, 1_200.0))
     };
     let status = UiKey::new("settings/top/playful-effects/word-effects-off");
     let off = top(source);

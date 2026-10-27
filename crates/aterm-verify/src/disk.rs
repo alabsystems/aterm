@@ -22,13 +22,12 @@ use crate::{Check, Ctx};
 /// One gibibyte.
 const GIB: u64 = 1 << 30;
 
-/// What a run from EMPTY directories writes into them: 27 GiB, the budget the gate's preflight
-/// kept (42e8a9a273^, `crates/aterm-verify/src/disk.rs`). MEASURED there: the cold runs of
-/// `cb770c598` (2026-09-20) and `b994cadd0` (2026-09-23) left their build lanes at 23 GiB and
-/// 20.2 GiB (`du`), read up to 24 GiB for a workspace that only grows, and `gate cells-foreign`
-/// wrote 2.6 GiB into an empty cells lane (2026-09-27), read up to 3. A first run claims it less
-/// what its directories hold already; a run measured here claims what it wrote instead.
-pub const COLD_BYTES: u64 = 24 * GIB + 3 * GIB;
+/// The fallback for a run without measured footprints: 72 GiB. On 2026-10-27, the whole
+/// workspace at `932f1ef624` grew empty tracked directories by 61.1 GiB; AppKit then brought
+/// their peak to 63.2 GiB (`docs/measured/verify-disk-2026-10-27.md`). Round up with room for
+/// growth. A first run claims this less what its directories hold already; a run measured
+/// here claims what it wrote instead.
+pub const COLD_BYTES: u64 = 72 * GIB;
 
 /// The file in `<target>/verify` keeping what the last runs wrote (`aterm_capacity::Footprints`).
 pub const FOOTPRINT: &str = "footprint.json";

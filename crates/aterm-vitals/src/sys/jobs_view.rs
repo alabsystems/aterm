@@ -484,6 +484,7 @@ pub(crate) mod fixtures {
             mu_from: None,
             verdict,
             no_progress: false,
+            working_descendant: None,
             episode: 1,
             exit: None,
             tick: Tick::default(),

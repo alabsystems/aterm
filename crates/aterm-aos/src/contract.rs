@@ -5,9 +5,10 @@
 
 use core::fmt;
 
+use crate::effects::EffectPort;
 use crate::ident::ArtifactId;
-use crate::replay::Run;
-use crate::task::Schema;
+use crate::replay::{FoldedRun, Run, replay};
+use crate::task::{Code, Schema};
 
 /// A behavioural contract over runs of schema `S`.
 pub trait Contract<S: Schema> {
@@ -15,6 +16,20 @@ pub trait Contract<S: Schema> {
     fn id(&self) -> &ArtifactId;
     /// Judges a run of `inputs` (whose observations carry their cursors).
     fn judge(&self, schema: &S, inputs: &[S::Input], run: &Run<S>) -> Verdict;
+    /// Replays `code` from `start` over `inputs` from `first_cursor` and judges the run, keeping only what this contract reads when overridden.
+    fn replay_judged<C: Code<S>>(
+        &self,
+        schema: &S,
+        code: &C,
+        start: S::State,
+        inputs: &[S::Input],
+        first_cursor: u64,
+        port: &mut dyn EffectPort,
+    ) -> (FoldedRun<S>, Verdict) {
+        let run = replay(schema, code, start, inputs, first_cursor, port);
+        let verdict = self.judge(schema, inputs, &run);
+        (run.into_folded(), verdict)
+    }
 }
 
 /// A contract's judgement of one run.

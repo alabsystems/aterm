@@ -63,7 +63,7 @@ pub fn help() -> String {
     format!("usage: aterm doctor {GRAMMAR}\n{HELP_ROWS}")
 }
 
-const ROWS: [(&str, &str, &str, &str); 12] = [
+const ROWS: [(&str, &str, &str, &str); 13] = [
     ("shell:", SHELL, "shell", "the shell aterm starts"),
     (
         "privacy:",
@@ -95,6 +95,12 @@ const ROWS: [(&str, &str, &str, &str); 12] = [
         "base.machine.syspolicyd",
         "machine",
         "whether macOS's program check answers",
+    ),
+    (
+        "services:",
+        "base.machine.services",
+        "machine",
+        "what macOS's own services hold in memory",
     ),
     (
         "conpty:",
@@ -329,15 +335,16 @@ pub struct Section {
 pub struct Gathered {
     lines: Vec<DoctorRow>,
     copies: Option<Copies>,
-    hand_over: Option<atpkg::devtools::Facts>,
+    hand_over: Option<super::Missing>,
     /// Spotlight indexes `rust-docs` pages ([`Self::rust_docs_indexed`]).
     rust_docs: bool,
 }
 
-/// The Developer Tools hand-over a fix-mode gather left due ([`gather`]): aterm is not granted
-/// and a person is at this terminal. [`answer`] makes it after the report.
+/// The hand-over a fix-mode gather left due ([`gather`]): Full Disk Access or Developer Tools
+/// reads off and a person is at this terminal. [`answer`] makes it after the report, through
+/// the aterm window's permission walk where one runs.
 #[derive(Debug)]
-pub struct HandOver(atpkg::devtools::Facts);
+pub struct HandOver(super::Missing);
 
 impl Gathered {
     /// The facts already read, as the pure report's tests build them.
@@ -391,7 +398,7 @@ impl Gathered {
         self.rust_docs
     }
 
-    /// The Developer Tools hand-over due after the report, when the gather left one.
+    /// The hand-over due after the report, when the gather left one.
     #[must_use]
     pub fn hand_over(&self) -> Option<HandOver> {
         self.hand_over.clone().map(HandOver)
@@ -447,8 +454,8 @@ impl Gathered {
 
 /// Read this machine's facts for `aterm doctor`, only the rows `only` names (the shell's
 /// always: [`reads`]), each probe on a thread of its own, the stale copies' look among them;
-/// it waits on no person. With `fix`, the Developer Tools hand-over is left due for after the
-/// report ([`Gathered::hand_over`]).
+/// it waits on no person. With `fix`, the Full Disk Access and Developer Tools hand-over is left
+/// due for after the report ([`Gathered::hand_over`]).
 #[must_use]
 pub fn gather(fix: bool, only: &[String]) -> Gathered {
     let reads = |label: &str| reads(only, label);
@@ -823,7 +830,7 @@ fn report_lines(gathered: &Gathered, rows: &[ItemReport], sections: &[Section]) 
 }
 
 /// Print `aterm doctor`'s answer, spelled for the shell that reads it, then make the
-/// Developer Tools hand-over the gather left due ([`HandOver`]). A report (`stdout`: the text,
+/// hand-over the gather left due ([`HandOver`]). A report (`stdout`: the text,
 /// the JSON, a settings action's) goes to stdout whatever its code, which carries the verdict
 /// (`aterm doctor && aterm`), so `aterm doctor | less` and a captured stdout read it; only a
 /// refusal goes to stderr. The hand-over follows the report and never holds it back; its
@@ -839,11 +846,11 @@ pub fn answer(
         text,
         code,
         stdout,
-        hand_over.as_ref().map(|HandOver(facts)| facts),
+        hand_over.as_ref().map(|HandOver(missing)| missing),
         &Ends {
             stdout: &|text| aterm_uds::stdout::answer(&super::cli_text::for_stdout(text)),
             stderr: &|text| eprint!("{}", super::cli_text::for_stderr(text)),
-            hand_over: &super::devtools_hand_over_live,
+            hand_over: &super::permissions_hand_over_live,
         },
     );
     std::process::ExitCode::from(status)
@@ -856,8 +863,8 @@ pub(crate) struct Ends<'a> {
     pub(crate) stdout: &'a dyn Fn(&str) -> std::io::Result<()>,
     /// Write to stderr.
     pub(crate) stderr: &'a dyn Fn(&str),
-    /// The hand-over ([`super::devtools_hand_over_live`]).
-    pub(crate) hand_over: &'a dyn Fn(&atpkg::devtools::Facts),
+    /// The hand-over ([`super::permissions_hand_over_live`]).
+    pub(crate) hand_over: &'a dyn Fn(&super::Missing),
 }
 
 /// [`answer`] over `ends`: the text, then the hand-over; the exit status, which is `code`
@@ -867,7 +874,7 @@ pub(crate) fn answer_over(
     text: &str,
     code: u8,
     stdout: bool,
-    hand_over: Option<&atpkg::devtools::Facts>,
+    hand_over: Option<&super::Missing>,
     ends: &Ends<'_>,
 ) -> u8 {
     let status = if stdout {
@@ -881,8 +888,8 @@ pub(crate) fn answer_over(
         (ends.stderr)(text);
         code
     };
-    if let Some(facts) = hand_over {
-        (ends.hand_over)(facts);
+    if let Some(missing) = hand_over {
+        (ends.hand_over)(missing);
     }
     status
 }
@@ -976,6 +983,35 @@ struct Copies {
     early: Mutex<Option<atpkg::copies::Pruned>>,
     looked: Mutex<Option<atpkg::copies::Pruned>>,
     did: Mutex<Option<atpkg::copies::Pruned>>,
+}
+
+/// The stale copies of aterm as an item outside a gather, which a launch applies by itself:
+/// looked at with `prune(true)` and moved by `after` that look, else by `prune(false)`
+/// ([`atpkg::copies::prune`] and [`atpkg::copies::prune_after`], or a test's).
+pub struct StaleCopies(Copies);
+
+impl StaleCopies {
+    #[must_use]
+    pub fn new(
+        prune: fn(bool) -> atpkg::copies::Pruned,
+        after: Option<fn(&atpkg::copies::Pruned) -> atpkg::copies::Pruned>,
+    ) -> Self {
+        let mut copies = Copies::new(prune, None);
+        copies.after = after;
+        Self(copies)
+    }
+
+    /// The [`COPIES`] item.
+    #[must_use]
+    pub fn item(&self) -> Box<dyn Item + '_> {
+        Box::new(CopiesItem(&self.0))
+    }
+
+    /// What the last prune or look says ([`atpkg::copies::row`]).
+    #[must_use]
+    pub fn said(&self) -> String {
+        atpkg::copies::row(&self.0.shown()).text
+    }
 }
 
 impl Copies {

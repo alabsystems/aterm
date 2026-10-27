@@ -149,6 +149,39 @@ impl Selection {
     }
 }
 
+/// Where the export writes astream's files: `vendor/astream` is a gitlink the manifest
+/// withholds, and the transforms write, in its place, files from the commit it pins.
+pub const ASTREAM: &str = "vendor/astream";
+
+/// Whether an astream path (relative to astream's root) is in a crate's `tests/`,
+/// `examples/` or `benches/`: targets a dependency's build never reads, which stay
+/// private, so the export's `vendor/astream` leaves them out.
+#[must_use]
+pub fn in_astream_target_dir(path: &str) -> bool {
+    let Some((_, in_crate)) = path
+        .strip_prefix("crates/")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+    ["tests/", "examples/", "benches/"]
+        .iter()
+        .any(|d| in_crate.starts_with(d))
+}
+
+/// Whether the export's `vendor/astream` can carry astream's file at `path` (relative to
+/// astream's root): its root `Cargo.toml`, or a file of a crate's tree outside
+/// [`in_astream_target_dir`]. The transforms write only the crates the export's manifests
+/// reach, so this is what they carry of a crate they write.
+#[must_use]
+pub fn astream_carries(path: &str) -> bool {
+    let in_a_crate = path
+        .strip_prefix("crates/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(name, file)| !name.is_empty() && !file.is_empty());
+    path == "Cargo.toml" || (in_a_crate && !in_astream_target_dir(path))
+}
+
 /// The developer account the export renames.
 const ACCOUNT: &str = concat!("aya", "tes");
 

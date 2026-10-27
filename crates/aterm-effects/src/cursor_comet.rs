@@ -156,6 +156,7 @@ impl CursorComet {
         clippy::too_many_arguments,
         reason = "cursor cell + clock + blaze + geometry + config + the two streams it draws into"
     )]
+    #[inline]
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -244,6 +245,7 @@ impl CursorComet {
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
     )]
+    #[inline]
     fn emit_coma_light(
         &mut self,
         cr: u16,
@@ -295,6 +297,7 @@ impl CursorComet {
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe/phase + geometry/config; one internal call site"
     )]
+    #[inline]
     fn emit_coma(
         &self,
         cr: u16,
@@ -335,8 +338,6 @@ impl CursorComet {
         let slab = ((ch * 0.125) as i32).max(2);
         let wob_freq = 0.55 / ch.max(1.0) * 10.0;
         let wob_phase = phase * 1.3;
-        let wobble =
-            |ym: f32| 1.0 + 0.05 * crate::supernova::sin_cos_f32(ym * wob_freq + wob_phase).0;
 
         let (cxi, cyi) = (cx as i32, cy as i32);
         let mut di = 0;
@@ -359,8 +360,8 @@ impl CursorComet {
                 let (y0, y1) = (cy_dy.max(cell_y0), (cy_dy + h).min(cell_y1));
                 if y1 > y0 {
                     let ym = dy as f32 + h as f32 * 0.5;
-                    let hw =
-                        (crate::color_math::sqrt_f32((r2 - ym * ym).max(0.0)) * wobble(ym)) as i32;
+                    let hw = (crate::color_math::sqrt_f32((r2 - ym * ym).max(0.0))
+                        * coma_wobble(ym, wob_freq, wob_phase)) as i32;
                     let (x0, x1) = ((cxi - hw).max(cell_x0), (cxi + hw).min(cell_x1));
                     if hw >= 1 && x1 > x0 {
                         push_rect(out, geom, x0, y0, x1 - x0, y1 - y0, premul);
@@ -408,7 +409,7 @@ impl CursorComet {
                         &ring_premul,
                         (cx, cy),
                         (y, h),
-                        wobble,
+                        (wob_freq, wob_phase),
                         in_band,
                         (cell_x0, cell_x1),
                         geom,
@@ -456,6 +457,11 @@ impl CursorComet {
     }
 }
 
+#[inline]
+const fn coma_wobble(ym: f32, wob_freq: f32, wob_phase: f32) -> f32 {
+    1.0 + 0.05 * crate::supernova::sin_cos_f32(ym * wob_freq + wob_phase).0
+}
+
 /// One slab row `[y, y + h)` of the outside rings: band `i` spans
 /// between disc `i`'s half-width and disc `i + 1`'s and carries the
 /// coverage-weighted colour of discs `0..=i` at their summed coverage ×
@@ -464,12 +470,13 @@ impl CursorComet {
     clippy::too_many_arguments,
     reason = "the slab row, the shared disc table and the cell cut; one call site"
 )]
+#[inline]
 fn ring_row(
     discs: &[(f32, f32, f32, u32); 4],
     ring_premul: &[u32; 4],
     (cx, cy): (f32, f32),
     (y, h): (i32, i32),
-    wobble: impl Fn(f32) -> f32,
+    (wob_freq, wob_phase): (f32, f32),
     in_band: bool,
     (cell_x0, cell_x1): (i32, i32),
     geom: Geom,
@@ -481,7 +488,7 @@ fn ring_row(
     if d2_0 <= 0.0 {
         return;
     }
-    let wob = wobble(ym);
+    let wob = coma_wobble(ym, wob_freq, wob_phase);
     let hw0 = crate::color_math::sqrt_f32(d2_0) * wob;
     if hw0 < 1.0 {
         return;

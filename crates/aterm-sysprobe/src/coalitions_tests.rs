@@ -66,6 +66,19 @@ fn a_record_cut_before_the_footprint_gives_none_for_it() {
     assert_eq!(usage.cpu_ns, 4_198_156_800_000);
 }
 
+/// The footprint word alone decodes as the whole record's does, and a record of
+/// another layout or one cut before it gives none.
+#[test]
+fn the_footprint_word_decodes_as_the_record_does() {
+    assert_eq!(decode_footprint(&mds_record()), Some(119_589_683));
+    let mut cut = mds_record();
+    cut[40..].fill(UNWRITTEN);
+    assert_eq!(decode_footprint(&cut), None);
+    let mut other = mds_record();
+    other[23] = 6;
+    assert_eq!(decode_footprint(&other), None);
+}
+
 /// The negative control: a record whose QoS count is not this layout's, a
 /// zeroed one, or one the kernel wrote nothing to, decodes to nothing.
 #[test]
@@ -150,7 +163,12 @@ mod live {
         assert!(mine.tasks_started >= 1 && mine.cpu_ns > 0, "{mine:?}");
         assert!(mine.eqos_ns.iter().any(|ns| *ns > 0), "{mine:?}");
         assert_ne!(mine.footprint, Some(0), "this process is a live member");
+        assert!(footprint(id).is_some_and(|b| b > 0), "{id}");
         let root = coalition_of(1).expect("launchd's coalition");
+        assert!(
+            footprint(root).is_some_and(|b| b > 0),
+            "a root coalition's footprint reads unprivileged"
+        );
         assert!(read.rows.iter().any(|r| r.id == root), "{root}");
     }
 

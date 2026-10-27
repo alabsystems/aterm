@@ -3,7 +3,8 @@
 
 //! Tests that an echoed line scrolled up by Enter keeps its glow within its row.
 
-use crate::trail_host::{Pace, PacedHost};
+use crate::common::on_ground;
+use crate::trail_host::{Pace, PacedHost, light_grounds, on_every_ground};
 use std::time::Duration;
 
 const ROWS: usize = 14;
@@ -30,7 +31,13 @@ fn on_top_of(h: &PacedHost, row: u16, share: f32, c0: usize, c1: usize) -> f32 {
         .sum()
 }
 
-fn enter_at_the_bottom(printed: &str) -> Vec<(u64, f32, f32)> {
+/// One frame after Enter: ms since it, the light on the printed line's
+/// ascenders, the light in the echo's own row, and whether the Return's
+/// meteor still flies.
+type Read = (u64, f32, f32, bool);
+
+/// The frames after Enter, and whether the host stands on a dark ground.
+fn enter_at_the_bottom(printed: &str) -> (Vec<Read>, bool) {
     let mut h = PacedHost::new(ROWS, COLS, Pace::Flat(16), false);
     h.c.flanks = true;
     let mut seq = String::from("\x1b[2J\x1b[H");
@@ -61,33 +68,76 @@ fn enter_at_the_bottom(printed: &str) -> Vec<(u64, f32, f32)> {
             h.t() - enter,
             on_top_of(&h, echo + 1, 0.35, 0, TYPED.len() + 2),
             on_top_of(&h, echo, 1.0, 2, TYPED.len() + 2),
+            h.glow.v2_status().is_some_and(|s| s.meteors > 0),
         ));
         h.advance(16);
     }
-    out
+    (out, h.cfg.dark_theme)
 }
 
-#[test]
-fn a_line_an_enter_scrolls_up_keeps_its_light_in_its_row() {
-    let frames = enter_at_the_bottom(PRINTED);
-    let (_, _, first_own) = frames[0];
+fn premise(frames: &[Read]) {
+    let (_, _, first_own, _) = frames[0];
     assert!(
         first_own > 100.0,
         "premise: the echo's own row is lit when Enter lands ({first_own:.1})"
     );
-    for &(ms, ascenders, _) in &frames {
-        assert!(
-            ascenders < 0.5,
-            "+{ms} ms after Enter: the echo lays {ascenders:.1} px of light on the printed \
-             line's ascenders"
-        );
-    }
+}
 
-    let free = enter_at_the_bottom("");
+fn control() {
+    let (free, _) = enter_at_the_bottom("");
     let reach = free.iter().map(|f| f.1).fold(0.0f32, f32::max);
     assert!(
         reach > 20.0,
         "control: over a blank row the free line's light reaches into it ({reach:.1} px at most); \
          the reading above sees nothing"
     );
+}
+
+/// On a light ground the Return's meteor's frames are the stated limit below.
+#[test]
+fn a_line_an_enter_scrolls_up_keeps_its_light_in_its_row() {
+    on_every_ground(|| {
+        let (frames, dark) = enter_at_the_bottom(PRINTED);
+        premise(&frames);
+        for &(ms, ascenders, _, meteor) in &frames {
+            if meteor && !dark {
+                continue;
+            }
+            assert!(
+                ascenders < 0.5,
+                "+{ms} ms after Enter: the echo lays {ascenders:.1} px of light on the printed \
+                 line's ascenders"
+            );
+        }
+        control();
+    });
+}
+
+/// The limit, on every light ground: main's paper arm draws the Return's
+/// meteor train as Over ink in the under stream (meteor.rs `draw_train`) on a
+/// rail `LIGHT_RAIL_CH` below its row's centre, and the row hold
+/// (`Ribbon::plan_over`) holds only the ribbon, so while the meteor flies the
+/// echo lays ink on the printed line's ascenders (84.8 px at +4 ms after Enter
+/// on each light built-in). Dark's Add train stays in its row.
+#[test]
+fn the_limit_on_light_the_returns_meteor_lays_ink_on_the_printed_lines_ascenders() {
+    for g in light_grounds() {
+        on_ground(g, || {
+            let (frames, dark) = enter_at_the_bottom(PRINTED);
+            assert!(!dark, "premise: {} is a light ground", g.name);
+            premise(&frames);
+            let worst = frames
+                .iter()
+                .filter(|f| f.3)
+                .map(|f| f.1)
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst >= 0.5,
+                "on {}: a stated LIMIT now holds — restate the law: while the meteor flies the \
+                 echo lays at most {worst:.1} px on the printed line's ascenders",
+                g.name
+            );
+            control();
+        });
+    }
 }

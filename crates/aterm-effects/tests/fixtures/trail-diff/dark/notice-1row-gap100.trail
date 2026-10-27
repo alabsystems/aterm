@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# A job notice pushes the typed line down 1 row 100 ms after the last key (zsh's notify,
+# moves_are_followed.rs t6b; a key in flight): the shell erases below, prints the notice and
+# redraws the line.
+
+grid 24 80
+style rainbow kitty
+hz 60
+
+at 0 pty "\e[10;1H$ cargo build --release\r\n$ "
+at 700 key c
+at 702 pty "c"
+at 810 key a
+at 812 pty "a"
+at 920 key r
+at 922 pty "r"
+at 1030 key g
+at 1032 pty "g"
+at 1140 key o
+at 1142 pty "o"
+at 1250 key space
+at 1252 pty " "
+at 1360 key b
+at 1362 pty "b"
+at 1470 key u
+at 1472 pty "u"
+at 1580 key i
+at 1582 pty "i"
+at 1690 key l
+at 1692 pty "l"
+at 1800 key d
+at 1802 pty "d"
+at 1910 key space
+at 1912 pty " "
+at 2020 key -
+at 2022 pty "-"
+at 2130 key -
+at 2132 pty "-"
+at 2240 key r
+at 2242 pty "r"
+at 2350 key e
+at 2352 pty "e"
+at 2460 key l
+at 2462 pty "l"
+at 2570 key e
+at 2572 pty "e"
+at 2680 key a
+at 2682 pty "a"
+at 2790 key s
+at 2792 pty "s"
+at 2900 key e
+at 2902 pty "e"
+at 3000 pty "\r\e[J[1]  + done       sleep 1\r\n$ cargo build --release"
+run 4500

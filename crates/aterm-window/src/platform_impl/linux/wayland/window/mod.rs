@@ -666,8 +666,7 @@ impl Window {
     }
 
     /// LOCAL PATCH (aterm; docs/AUDIT-third-party-2026-10-15.md, WC.6): the window's handles as
-    /// first-party `aterm_types::native_window`, which the GL arm and the CPU presenter read; the
-    /// opt-in `rwh_06` handle wraps this same answer.
+    /// first-party `aterm_types::native_window`, which the GL arm and the CPU presenter read.
     #[inline]
     pub fn native_window(&self) -> NativeWindow {
         NativeWindow::Wayland {

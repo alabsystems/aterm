@@ -57,12 +57,28 @@ pub enum ScreenOp {
     DeleteLines(u16),
     /// Reverse index (`RI`): up a row, scrolling the region down at its top.
     ReverseIndex,
-    /// Set the drawing pen to a **resolved** colour/attribute state.
+    /// Set the drawing pen to a **resolved** palette/default colour and attribute state
+    /// (emitted when neither channel carries 24-bit truecolour).
     SetSgr {
         /// Resolved foreground.
         fg: Color,
         /// Resolved background.
         bg: Color,
+        /// Resolved attribute bits.
+        attrs: u8,
+    },
+    /// Set the drawing pen when one or both channels carry a **resolved** 24-bit
+    /// truecolour `(r, g, b)` value (`38;2;r;g;b`, `38:2::r:g;b`, `48;2;r;g;b`,
+    /// `48:2::r:g:b`).
+    SetSgrRgb {
+        /// Resolved palette/default foreground (`Color::Default` when `fg_rgb` is `Some`).
+        fg: Color,
+        /// Resolved 24-bit foreground `(r, g, b)`, if active.
+        fg_rgb: Option<(u8, u8, u8)>,
+        /// Resolved palette/default background (`Color::Default` when `bg_rgb` is `Some`).
+        bg: Color,
+        /// Resolved 24-bit background `(r, g, b)`, if active.
+        bg_rgb: Option<(u8, u8, u8)>,
         /// Resolved attribute bits.
         attrs: u8,
     },
@@ -265,6 +281,13 @@ fn put_color(out: &mut Vec<u8>, c: Color) {
     }
 }
 
+fn put_opt_rgb(out: &mut Vec<u8>, rgb: Option<(u8, u8, u8)>) {
+    match rgb {
+        None => out.push(0),
+        Some((r, g, b)) => out.extend_from_slice(&[1, r, g, b]),
+    }
+}
+
 fn take_u8(rest: &[u8]) -> Result<(u8, &[u8]), OpsWireError> {
     let &[b, ref tail @ ..] = rest else {
         return Err(OpsWireError::Truncated);
@@ -307,6 +330,220 @@ fn take_color(rest: &[u8]) -> Result<(Color, &[u8]), OpsWireError> {
     }
 }
 
+type RgbTriple = (u8, u8, u8);
+
+fn take_opt_rgb(rest: &[u8]) -> Result<(Option<RgbTriple>, &[u8]), OpsWireError> {
+    let (present, tail) = take_bool(rest)?;
+    if !present {
+        return Ok((None, tail));
+    }
+    let (r, t1) = take_u8(tail)?;
+    let (g, t2) = take_u8(t1)?;
+    let (b, t3) = take_u8(t2)?;
+    Ok((Some((r, g, b)), t3))
+}
+
+const fn encode_op_group(op: &ScreenOp) -> u8 {
+    match op {
+        ScreenOp::Print(_)
+        | ScreenOp::CarriageReturn
+        | ScreenOp::LineFeed
+        | ScreenOp::Tab
+        | ScreenOp::Backspace
+        | ScreenOp::CursorUp(_)
+        | ScreenOp::CursorDown(_)
+        | ScreenOp::CursorForward(_)
+        | ScreenOp::CursorBack(_)
+        | ScreenOp::MoveTo(_, _)
+        | ScreenOp::SaveCursor
+        | ScreenOp::RestoreCursor => 0,
+        ScreenOp::EraseDisplay(_)
+        | ScreenOp::EraseLine(_)
+        | ScreenOp::EraseChars(_)
+        | ScreenOp::InsertChars(_)
+        | ScreenOp::DeleteChars(_)
+        | ScreenOp::InsertLines(_)
+        | ScreenOp::DeleteLines(_)
+        | ScreenOp::ReverseIndex
+        | ScreenOp::ScrollUp(_)
+        | ScreenOp::ScrollDown(_) => 1,
+        ScreenOp::SetSgr { .. }
+        | ScreenOp::SetSgrRgb { .. }
+        | ScreenOp::SetMode { .. }
+        | ScreenOp::SetScrollRegion { .. }
+        | ScreenOp::SetInsertMode(_)
+        | ScreenOp::SetNewlineMode(_)
+        | ScreenOp::Designate { .. }
+        | ScreenOp::LockShift { .. }
+        | ScreenOp::SetLeftRightMargins { .. }
+        | ScreenOp::Reset
+        | ScreenOp::Resize(_, _) => 2,
+    }
+}
+
+fn encode_op_cursor(out: &mut Vec<u8>, op: &ScreenOp) {
+    match op {
+        ScreenOp::Print(ch) => {
+            out.push(0x01);
+            put_u32_le(out, *ch as u32);
+        }
+        ScreenOp::CarriageReturn => out.push(0x02),
+        ScreenOp::LineFeed => out.push(0x03),
+        ScreenOp::Tab => out.push(0x04),
+        ScreenOp::Backspace => out.push(0x05),
+        ScreenOp::CursorUp(n) => {
+            out.push(0x06);
+            put_u16_le(out, *n);
+        }
+        ScreenOp::CursorDown(n) => {
+            out.push(0x07);
+            put_u16_le(out, *n);
+        }
+        ScreenOp::CursorForward(n) => {
+            out.push(0x08);
+            put_u16_le(out, *n);
+        }
+        ScreenOp::CursorBack(n) => {
+            out.push(0x09);
+            put_u16_le(out, *n);
+        }
+        ScreenOp::MoveTo(r, c) => {
+            out.push(0x0A);
+            put_u16_le(out, *r);
+            put_u16_le(out, *c);
+        }
+        ScreenOp::SaveCursor => out.push(0x15),
+        ScreenOp::RestoreCursor => out.push(0x16),
+        _ => {}
+    }
+}
+
+fn encode_op_edit(out: &mut Vec<u8>, op: &ScreenOp) {
+    match op {
+        ScreenOp::EraseDisplay(m) => {
+            out.push(0x0B);
+            put_u16_le(out, *m);
+        }
+        ScreenOp::EraseLine(m) => {
+            out.push(0x0C);
+            put_u16_le(out, *m);
+        }
+        ScreenOp::EraseChars(n) => {
+            out.push(0x0D);
+            put_u16_le(out, *n);
+        }
+        ScreenOp::InsertChars(n) => {
+            out.push(0x0E);
+            put_u16_le(out, *n);
+        }
+        ScreenOp::DeleteChars(n) => {
+            out.push(0x0F);
+            put_u16_le(out, *n);
+        }
+        ScreenOp::InsertLines(n) => {
+            out.push(0x10);
+            put_u16_le(out, *n);
+        }
+        ScreenOp::DeleteLines(n) => {
+            out.push(0x11);
+            put_u16_le(out, *n);
+        }
+        ScreenOp::ReverseIndex => out.push(0x12),
+        ScreenOp::ScrollUp(n) => {
+            out.push(0x1D);
+            put_u16_le(out, *n);
+        }
+        ScreenOp::ScrollDown(n) => {
+            out.push(0x1E);
+            put_u16_le(out, *n);
+        }
+        _ => {}
+    }
+}
+
+fn encode_op_style_or_mode(out: &mut Vec<u8>, op: &ScreenOp) -> Result<(), OpsWireError> {
+    match op {
+        ScreenOp::SetSgr { fg, bg, attrs } => {
+            out.push(0x13);
+            put_color(out, *fg);
+            put_color(out, *bg);
+            out.push(*attrs);
+        }
+        ScreenOp::SetMode { params, set } => {
+            if params.len() > MAX_MODE_PARAMS {
+                return Err(OpsWireError::TooManyModeParams(params.len()));
+            }
+            out.push(0x14);
+            out.push(u8::from(*set));
+            put_u16_le(out, params.len() as u16);
+            for &p in params {
+                put_u16_le(out, p);
+            }
+        }
+        ScreenOp::SetScrollRegion { top, bottom } => {
+            out.push(0x17);
+            put_u16_le(out, *top);
+            put_u16_le(out, *bottom);
+        }
+        ScreenOp::SetInsertMode(set) => {
+            out.push(0x18);
+            out.push(u8::from(*set));
+        }
+        ScreenOp::SetNewlineMode(set) => {
+            out.push(0x19);
+            out.push(u8::from(*set));
+        }
+        ScreenOp::Designate { g1, charset } => {
+            out.push(0x1A);
+            out.push(u8::from(*g1));
+            out.push(match charset {
+                Charset::Ascii => 0,
+                Charset::DecSpecial => 1,
+            });
+        }
+        ScreenOp::LockShift { g1 } => {
+            out.push(0x1B);
+            out.push(u8::from(*g1));
+        }
+        ScreenOp::SetLeftRightMargins { left, right } => {
+            out.push(0x1C);
+            put_u16_le(out, *left);
+            put_u16_le(out, *right);
+        }
+        ScreenOp::Reset => out.push(0x1F),
+        ScreenOp::Resize(cols, rows) => {
+            out.push(0x20);
+            put_u16_le(out, *cols);
+            put_u16_le(out, *rows);
+        }
+        ScreenOp::SetSgrRgb {
+            fg,
+            fg_rgb,
+            bg,
+            bg_rgb,
+            attrs,
+        } => {
+            out.push(0x21);
+            put_color(out, *fg);
+            put_opt_rgb(out, *fg_rgb);
+            put_color(out, *bg);
+            put_opt_rgb(out, *bg_rgb);
+            out.push(*attrs);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn encode_one_op(out: &mut Vec<u8>, op: &ScreenOp) -> Result<(), OpsWireError> {
+    match encode_op_group(op) {
+        0 => encode_op_cursor(out, op),
+        1 => encode_op_edit(out, op),
+        _ => encode_op_style_or_mode(out, op)?,
+    }
+    Ok(())
+}
+
 /// Encode a slice of normalized [`ScreenOp`]s into a self-describing, versioned
 /// binary batch (`"ASOP"` + `v1` + `count: u32 LE` + tagged ops) suitable for
 /// publishing over `astream-broker` to cross-machine viewers.
@@ -319,136 +556,184 @@ pub fn encode_ops(ops: &[ScreenOp]) -> Result<Vec<u8>, OpsWireError> {
     if ops.len() > MAX_OPS_PER_BATCH {
         return Err(OpsWireError::TooManyOps(ops.len()));
     }
-    let mut out = Vec::with_capacity(9usize.saturating_add(ops.len().saturating_mul(3)));
+    let mut out = Vec::new();
     out.extend_from_slice(&OPS_WIRE_MAGIC);
     out.push(OPS_WIRE_VERSION);
     put_u32_le(&mut out, ops.len() as u32);
     for op in ops {
-        match op {
-            ScreenOp::Print(ch) => {
-                out.push(0x01);
-                put_u32_le(&mut out, *ch as u32);
-            }
-            ScreenOp::CarriageReturn => out.push(0x02),
-            ScreenOp::LineFeed => out.push(0x03),
-            ScreenOp::Tab => out.push(0x04),
-            ScreenOp::Backspace => out.push(0x05),
-            ScreenOp::CursorUp(n) => {
-                out.push(0x06);
-                put_u16_le(&mut out, *n);
-            }
-            ScreenOp::CursorDown(n) => {
-                out.push(0x07);
-                put_u16_le(&mut out, *n);
-            }
-            ScreenOp::CursorForward(n) => {
-                out.push(0x08);
-                put_u16_le(&mut out, *n);
-            }
-            ScreenOp::CursorBack(n) => {
-                out.push(0x09);
-                put_u16_le(&mut out, *n);
-            }
-            ScreenOp::MoveTo(r, c) => {
-                out.push(0x0A);
-                put_u16_le(&mut out, *r);
-                put_u16_le(&mut out, *c);
-            }
-            ScreenOp::EraseDisplay(m) => {
-                out.push(0x0B);
-                put_u16_le(&mut out, *m);
-            }
-            ScreenOp::EraseLine(m) => {
-                out.push(0x0C);
-                put_u16_le(&mut out, *m);
-            }
-            ScreenOp::EraseChars(n) => {
-                out.push(0x0D);
-                put_u16_le(&mut out, *n);
-            }
-            ScreenOp::InsertChars(n) => {
-                out.push(0x0E);
-                put_u16_le(&mut out, *n);
-            }
-            ScreenOp::DeleteChars(n) => {
-                out.push(0x0F);
-                put_u16_le(&mut out, *n);
-            }
-            ScreenOp::InsertLines(n) => {
-                out.push(0x10);
-                put_u16_le(&mut out, *n);
-            }
-            ScreenOp::DeleteLines(n) => {
-                out.push(0x11);
-                put_u16_le(&mut out, *n);
-            }
-            ScreenOp::ReverseIndex => out.push(0x12),
-            ScreenOp::SetSgr { fg, bg, attrs } => {
-                out.push(0x13);
-                put_color(&mut out, *fg);
-                put_color(&mut out, *bg);
-                out.push(*attrs);
-            }
-            ScreenOp::SetMode { params, set } => {
-                if params.len() > MAX_MODE_PARAMS {
-                    return Err(OpsWireError::TooManyModeParams(params.len()));
-                }
-                out.push(0x14);
-                out.push(u8::from(*set));
-                put_u16_le(&mut out, params.len() as u16);
-                for &p in params {
-                    put_u16_le(&mut out, p);
-                }
-            }
-            ScreenOp::SaveCursor => out.push(0x15),
-            ScreenOp::RestoreCursor => out.push(0x16),
-            ScreenOp::SetScrollRegion { top, bottom } => {
-                out.push(0x17);
-                put_u16_le(&mut out, *top);
-                put_u16_le(&mut out, *bottom);
-            }
-            ScreenOp::SetInsertMode(set) => {
-                out.push(0x18);
-                out.push(u8::from(*set));
-            }
-            ScreenOp::SetNewlineMode(set) => {
-                out.push(0x19);
-                out.push(u8::from(*set));
-            }
-            ScreenOp::Designate { g1, charset } => {
-                out.push(0x1A);
-                out.push(u8::from(*g1));
-                out.push(match charset {
-                    Charset::Ascii => 0,
-                    Charset::DecSpecial => 1,
-                });
-            }
-            ScreenOp::LockShift { g1 } => {
-                out.push(0x1B);
-                out.push(u8::from(*g1));
-            }
-            ScreenOp::SetLeftRightMargins { left, right } => {
-                out.push(0x1C);
-                put_u16_le(&mut out, *left);
-                put_u16_le(&mut out, *right);
-            }
-            ScreenOp::ScrollUp(n) => {
-                out.push(0x1D);
-                put_u16_le(&mut out, *n);
-            }
-            ScreenOp::ScrollDown(n) => {
-                out.push(0x1E);
-                put_u16_le(&mut out, *n);
-            }
-            ScreenOp::Reset => out.push(0x1F),
-            ScreenOp::Resize(cols, rows) => {
-                out.push(0x20);
-                put_u16_le(&mut out, *cols);
-                put_u16_le(&mut out, *rows);
-            }
-        }
+        encode_one_op(&mut out, op)?;
     }
     Ok(out)
+}
+
+fn decode_op_low(tag: u8, tail: &[u8]) -> Result<(ScreenOp, &[u8]), OpsWireError> {
+    match tag {
+        0x01 => {
+            let (raw, t) = take_u32_le(tail)?;
+            let Some(ch) = char::from_u32(raw) else {
+                return Err(OpsWireError::InvalidChar(raw));
+            };
+            Ok((ScreenOp::Print(ch), t))
+        }
+        0x02 => Ok((ScreenOp::CarriageReturn, tail)),
+        0x03 => Ok((ScreenOp::LineFeed, tail)),
+        0x04 => Ok((ScreenOp::Tab, tail)),
+        0x05 => Ok((ScreenOp::Backspace, tail)),
+        0x06 => {
+            let (n, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::CursorUp(n), t))
+        }
+        0x07 => {
+            let (n, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::CursorDown(n), t))
+        }
+        0x08 => {
+            let (n, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::CursorForward(n), t))
+        }
+        0x09 => {
+            let (n, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::CursorBack(n), t))
+        }
+        0x0A => {
+            let (r, t1) = take_u16_le(tail)?;
+            let (c, t2) = take_u16_le(t1)?;
+            Ok((ScreenOp::MoveTo(r, c), t2))
+        }
+        0x0B => {
+            let (m, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::EraseDisplay(m), t))
+        }
+        0x0C => {
+            let (m, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::EraseLine(m), t))
+        }
+        0x0D => {
+            let (n, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::EraseChars(n), t))
+        }
+        0x0E => {
+            let (n, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::InsertChars(n), t))
+        }
+        0x0F => {
+            let (n, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::DeleteChars(n), t))
+        }
+        0x10 => {
+            let (n, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::InsertLines(n), t))
+        }
+        0x11 => {
+            let (n, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::DeleteLines(n), t))
+        }
+        other => Err(OpsWireError::UnknownOpTag(other)),
+    }
+}
+
+fn decode_op_high(tag: u8, tail: &[u8]) -> Result<(ScreenOp, &[u8]), OpsWireError> {
+    match tag {
+        0x12 => Ok((ScreenOp::ReverseIndex, tail)),
+        0x13 => {
+            let (fg, t1) = take_color(tail)?;
+            let (bg, t2) = take_color(t1)?;
+            let (attrs, t3) = take_u8(t2)?;
+            Ok((ScreenOp::SetSgr { fg, bg, attrs }, t3))
+        }
+        0x14 => {
+            let (set, t1) = take_bool(tail)?;
+            let (len_u16, mut t2) = take_u16_le(t1)?;
+            let plen = len_u16 as usize;
+            if plen > MAX_MODE_PARAMS {
+                return Err(OpsWireError::TooManyModeParams(plen));
+            }
+            let mut params = Vec::new();
+            let mut p_idx = 0usize;
+            while p_idx < plen {
+                let (p, next_t) = take_u16_le(t2)?;
+                params.push(p);
+                t2 = next_t;
+                p_idx = p_idx.saturating_add(1);
+            }
+            Ok((ScreenOp::SetMode { params, set }, t2))
+        }
+        0x15 => Ok((ScreenOp::SaveCursor, tail)),
+        0x16 => Ok((ScreenOp::RestoreCursor, tail)),
+        0x17 => {
+            let (top, t1) = take_u16_le(tail)?;
+            let (bottom, t2) = take_u16_le(t1)?;
+            Ok((ScreenOp::SetScrollRegion { top, bottom }, t2))
+        }
+        0x18 => {
+            let (set, t) = take_bool(tail)?;
+            Ok((ScreenOp::SetInsertMode(set), t))
+        }
+        0x19 => {
+            let (set, t) = take_bool(tail)?;
+            Ok((ScreenOp::SetNewlineMode(set), t))
+        }
+        0x1A => {
+            let (g1, t1) = take_bool(tail)?;
+            let (cs_tag, t2) = take_u8(t1)?;
+            let charset = match cs_tag {
+                0 => Charset::Ascii,
+                1 => Charset::DecSpecial,
+                other => return Err(OpsWireError::InvalidCharsetTag(other)),
+            };
+            Ok((ScreenOp::Designate { g1, charset }, t2))
+        }
+        0x1B => {
+            let (g1, t) = take_bool(tail)?;
+            Ok((ScreenOp::LockShift { g1 }, t))
+        }
+        0x1C => {
+            let (left, t1) = take_u16_le(tail)?;
+            let (right, t2) = take_u16_le(t1)?;
+            Ok((ScreenOp::SetLeftRightMargins { left, right }, t2))
+        }
+        0x1D => {
+            let (n, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::ScrollUp(n), t))
+        }
+        0x1E => {
+            let (n, t) = take_u16_le(tail)?;
+            Ok((ScreenOp::ScrollDown(n), t))
+        }
+        0x1F => Ok((ScreenOp::Reset, tail)),
+        0x20 => {
+            let (cols, t1) = take_u16_le(tail)?;
+            let (rows, t2) = take_u16_le(t1)?;
+            Ok((ScreenOp::Resize(cols, rows), t2))
+        }
+        0x21 => {
+            let (fg, t1) = take_color(tail)?;
+            let (fg_rgb, t2) = take_opt_rgb(t1)?;
+            let (bg, t3) = take_color(t2)?;
+            let (bg_rgb, t4) = take_opt_rgb(t3)?;
+            let (attrs, t5) = take_u8(t4)?;
+            Ok((
+                ScreenOp::SetSgrRgb {
+                    fg,
+                    fg_rgb,
+                    bg,
+                    bg_rgb,
+                    attrs,
+                },
+                t5,
+            ))
+        }
+        other => Err(OpsWireError::UnknownOpTag(other)),
+    }
+}
+
+fn decode_one_op(rest: &[u8]) -> Result<(ScreenOp, &[u8]), OpsWireError> {
+    let (tag, tail) = take_u8(rest)?;
+    if tag <= 0x11 {
+        decode_op_low(tag, tail)
+    } else {
+        decode_op_high(tag, tail)
+    }
 }
 
 /// Decode a binary [`ScreenOp`] batch frame produced by [`encode_ops`].
@@ -472,148 +757,12 @@ pub fn decode_ops(bytes: &[u8]) -> Result<Vec<ScreenOp>, OpsWireError> {
     if count > MAX_OPS_PER_BATCH {
         return Err(OpsWireError::TooManyOps(count));
     }
-    // Every encoded op takes at least 1 tag byte, so bounding capacity by
-    // `rest.len()` prevents a tiny header with a huge declared `count` from
-    // pre-allocating megabytes before failing with `Truncated`.
-    let mut ops = Vec::with_capacity(count.min(rest.len()));
+    // Grow lazily as elements are decoded so a tiny header with a huge declared
+    // `count` never pre-allocates before failing with `Truncated`.
+    let mut ops = Vec::new();
     let mut i = 0usize;
     while i < count {
-        let (tag, tail) = take_u8(rest)?;
-        let (op, next) = match tag {
-            0x01 => {
-                let (raw, t) = take_u32_le(tail)?;
-                let Some(ch) = char::from_u32(raw) else {
-                    return Err(OpsWireError::InvalidChar(raw));
-                };
-                (ScreenOp::Print(ch), t)
-            }
-            0x02 => (ScreenOp::CarriageReturn, tail),
-            0x03 => (ScreenOp::LineFeed, tail),
-            0x04 => (ScreenOp::Tab, tail),
-            0x05 => (ScreenOp::Backspace, tail),
-            0x06 => {
-                let (n, t) = take_u16_le(tail)?;
-                (ScreenOp::CursorUp(n), t)
-            }
-            0x07 => {
-                let (n, t) = take_u16_le(tail)?;
-                (ScreenOp::CursorDown(n), t)
-            }
-            0x08 => {
-                let (n, t) = take_u16_le(tail)?;
-                (ScreenOp::CursorForward(n), t)
-            }
-            0x09 => {
-                let (n, t) = take_u16_le(tail)?;
-                (ScreenOp::CursorBack(n), t)
-            }
-            0x0A => {
-                let (r, t1) = take_u16_le(tail)?;
-                let (c, t2) = take_u16_le(t1)?;
-                (ScreenOp::MoveTo(r, c), t2)
-            }
-            0x0B => {
-                let (m, t) = take_u16_le(tail)?;
-                (ScreenOp::EraseDisplay(m), t)
-            }
-            0x0C => {
-                let (m, t) = take_u16_le(tail)?;
-                (ScreenOp::EraseLine(m), t)
-            }
-            0x0D => {
-                let (n, t) = take_u16_le(tail)?;
-                (ScreenOp::EraseChars(n), t)
-            }
-            0x0E => {
-                let (n, t) = take_u16_le(tail)?;
-                (ScreenOp::InsertChars(n), t)
-            }
-            0x0F => {
-                let (n, t) = take_u16_le(tail)?;
-                (ScreenOp::DeleteChars(n), t)
-            }
-            0x10 => {
-                let (n, t) = take_u16_le(tail)?;
-                (ScreenOp::InsertLines(n), t)
-            }
-            0x11 => {
-                let (n, t) = take_u16_le(tail)?;
-                (ScreenOp::DeleteLines(n), t)
-            }
-            0x12 => (ScreenOp::ReverseIndex, tail),
-            0x13 => {
-                let (fg, t1) = take_color(tail)?;
-                let (bg, t2) = take_color(t1)?;
-                let (attrs, t3) = take_u8(t2)?;
-                (ScreenOp::SetSgr { fg, bg, attrs }, t3)
-            }
-            0x14 => {
-                let (set, t1) = take_bool(tail)?;
-                let (len_u16, mut t2) = take_u16_le(t1)?;
-                let plen = len_u16 as usize;
-                if plen > MAX_MODE_PARAMS {
-                    return Err(OpsWireError::TooManyModeParams(plen));
-                }
-                let mut params = Vec::with_capacity(plen.min(t2.len() / 2));
-                let mut p_idx = 0usize;
-                while p_idx < plen {
-                    let (p, next_t) = take_u16_le(t2)?;
-                    params.push(p);
-                    t2 = next_t;
-                    p_idx = p_idx.saturating_add(1);
-                }
-                (ScreenOp::SetMode { params, set }, t2)
-            }
-            0x15 => (ScreenOp::SaveCursor, tail),
-            0x16 => (ScreenOp::RestoreCursor, tail),
-            0x17 => {
-                let (top, t1) = take_u16_le(tail)?;
-                let (bottom, t2) = take_u16_le(t1)?;
-                (ScreenOp::SetScrollRegion { top, bottom }, t2)
-            }
-            0x18 => {
-                let (set, t) = take_bool(tail)?;
-                (ScreenOp::SetInsertMode(set), t)
-            }
-            0x19 => {
-                let (set, t) = take_bool(tail)?;
-                (ScreenOp::SetNewlineMode(set), t)
-            }
-            0x1A => {
-                let (g1, t1) = take_bool(tail)?;
-                let (cs_tag, t2) = take_u8(t1)?;
-                let charset = match cs_tag {
-                    0 => Charset::Ascii,
-                    1 => Charset::DecSpecial,
-                    other => return Err(OpsWireError::InvalidCharsetTag(other)),
-                };
-                (ScreenOp::Designate { g1, charset }, t2)
-            }
-            0x1B => {
-                let (g1, t) = take_bool(tail)?;
-                (ScreenOp::LockShift { g1 }, t)
-            }
-            0x1C => {
-                let (left, t1) = take_u16_le(tail)?;
-                let (right, t2) = take_u16_le(t1)?;
-                (ScreenOp::SetLeftRightMargins { left, right }, t2)
-            }
-            0x1D => {
-                let (n, t) = take_u16_le(tail)?;
-                (ScreenOp::ScrollUp(n), t)
-            }
-            0x1E => {
-                let (n, t) = take_u16_le(tail)?;
-                (ScreenOp::ScrollDown(n), t)
-            }
-            0x1F => (ScreenOp::Reset, tail),
-            0x20 => {
-                let (cols, t1) = take_u16_le(tail)?;
-                let (rows, t2) = take_u16_le(t1)?;
-                (ScreenOp::Resize(cols, rows), t2)
-            }
-            other => return Err(OpsWireError::UnknownOpTag(other)),
-        };
+        let (op, next) = decode_one_op(rest)?;
         ops.push(op);
         rest = next;
         i = i.saturating_add(1);

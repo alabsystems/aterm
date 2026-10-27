@@ -13,7 +13,7 @@ use aterm_aos::log::LogFault;
 use aterm_aos::publish::{
     Admit, Boundary, Commit, Head, Prepared, PublishRefusal, RETIRED_CAP, Stats,
 };
-use aterm_aos::replay::{Run, chain_link, empty_chain};
+use aterm_aos::replay::{FoldedRun, Run, chain_link, empty_chain, replay_fold};
 use aterm_aos::task::{Code, EntryRefusal, PausedClass, Schema, StepRefusal, state_digest};
 use aterm_aos::wire::{Dec, Enc, WireFault};
 use aterm_aos::{ArtifactId, ArtifactKind, Digest, TaskIdentity};
@@ -220,6 +220,7 @@ impl MomentumState {
         self.clock
     }
 
+    #[inline]
     fn last_time(&self, epoch: Instant) -> Option<i128> {
         match self.glow.snapshot(epoch) {
             Ok(s) => self.clock.max(s.rate_at).max(s.stamp),
@@ -419,11 +420,12 @@ pub enum Applied {
     Refused(AdmitRefusal),
 }
 
-fn observe(
+#[inline]
+fn observe_owned(
     applied: &Applied,
     epoch: Instant,
-    out: &[GlowQuad],
-    under: &[GlowQuad],
+    out: Vec<GlowQuad>,
+    under: Vec<GlowQuad>,
 ) -> MomentumObservation {
     match *applied {
         Applied::Keyed => MomentumObservation::Keyed,
@@ -432,8 +434,8 @@ fn observe(
             fill: f.fill,
             hot: f.hot,
             fp: f.fp,
-            out: out.to_vec(),
-            under: under.to_vec(),
+            out,
+            under,
         },
         Applied::Schedule {
             is_active,
@@ -447,6 +449,19 @@ fn observe(
             deadline: deadline.map(|t| offset_of(epoch, t)),
         },
         Applied::Refused(r) => MomentumObservation::Refused(r),
+    }
+}
+
+#[inline]
+fn observe(
+    applied: &Applied,
+    epoch: Instant,
+    out: &[GlowQuad],
+    under: &[GlowQuad],
+) -> MomentumObservation {
+    match *applied {
+        Applied::Frame(_) => observe_owned(applied, epoch, out.to_vec(), under.to_vec()),
+        _ => observe_owned(applied, epoch, Vec::new(), Vec::new()),
     }
 }
 
@@ -476,6 +491,7 @@ impl MomentumSchema {
     }
 }
 
+#[inline]
 const fn snapshot_fault(r: SnapshotRefusal) -> WireFault {
     match r {
         SnapshotRefusal::Length { expected, found } => WireFault::Truncated {
@@ -536,6 +552,7 @@ const QUAD_LEN: usize = 20;
 
 const FRAME_HEAD_LEN: usize = 1 + 5 + 1 + 8 + 8 + 8;
 
+#[inline]
 const fn quad_bytes(q: &GlowQuad) -> [u8; QUAD_LEN] {
     let [r0, r1] = q.row.to_le_bytes();
     let [x0, x1] = q.x.to_le_bytes();
@@ -549,13 +566,17 @@ const fn quad_bytes(q: &GlowQuad) -> [u8; QUAD_LEN] {
     ]
 }
 
+#[inline]
 fn encode_quads(e: &mut Enc, quads: &[GlowQuad]) {
     e.u64(usize_u64(quads.len()));
-    for q in quads {
-        e.raw(&quad_bytes(q));
+    let mut qi = 0;
+    while qi < quads.len() {
+        e.raw(&quad_bytes(&quads[qi]));
+        qi += 1;
     }
 }
 
+#[inline]
 fn encode_frame(e: &mut Enc, frame: &MomentumGlowFrame, out: &[GlowQuad], under: &[GlowQuad]) {
     e.u8(2);
     e.opt(frame.fill, |e, f| e.u32(f));
@@ -565,10 +586,12 @@ fn encode_frame(e: &mut Enc, frame: &MomentumGlowFrame, out: &[GlowQuad], under:
     encode_quads(e, under);
 }
 
+#[inline]
 const fn frame_room(quads: usize) -> usize {
     FRAME_HEAD_LEN.saturating_add(QUAD_LEN.saturating_mul(quads))
 }
 
+#[inline]
 fn encode_refusal(e: &mut Enc, r: &AdmitRefusal) {
     match *r {
         AdmitRefusal::Tau(bits) => {
@@ -812,6 +835,7 @@ impl Schema for MomentumSchema {
 }
 
 /// The target this build runs on, as `arch-os[-env]` (`std::env::consts` and `target_env`).
+#[inline]
 #[must_use]
 pub fn target_name() -> String {
     let env = if cfg!(target_env = "gnu") {
@@ -827,6 +851,7 @@ pub fn target_name() -> String {
 }
 
 /// The task artifact `aterm.cursor.momentum-glow` v1.
+#[inline]
 #[must_use]
 pub fn task_artifact() -> ArtifactId {
     let mut e = Enc::new();
@@ -835,6 +860,7 @@ pub fn task_artifact() -> ArtifactId {
 }
 
 /// The schema artifact `momentum-glow.state+events` v1.
+#[inline]
 #[must_use]
 pub fn schema_artifact() -> ArtifactId {
     let mut e = Enc::new();
@@ -845,6 +871,7 @@ pub fn schema_artifact() -> ArtifactId {
 }
 
 /// The profile artifact.
+#[inline]
 #[must_use]
 pub fn profile_artifact() -> ArtifactId {
     let target = target_name();
@@ -866,6 +893,7 @@ pub fn profile_artifact() -> ArtifactId {
 }
 
 /// The five artifacts a momentum task runs under, with `code` running it.
+#[inline]
 #[must_use]
 pub fn momentum_identity(code: &PrebuiltMomentum) -> TaskIdentity {
     TaskIdentity {
@@ -923,6 +951,7 @@ impl MomentumCode {
     }
 
     /// The implementation a short or artifact name names.
+    #[inline]
     #[must_use]
     pub const fn from_name(name: &str) -> Option<MomentumCode> {
         match name.as_bytes() {
@@ -955,6 +984,7 @@ impl MomentumCode {
     }
 
     /// Its artifact.
+    #[inline]
     #[must_use]
     pub fn artifact(self, build: &str) -> ArtifactId {
         let mut e = Enc::new();
@@ -1111,6 +1141,7 @@ impl Sched {
     }
 
     /// One input.
+    #[inline]
     pub fn apply(
         self,
         s: &mut MomentumState,
@@ -1119,15 +1150,21 @@ impl Sched {
         out: &mut Vec<GlowQuad>,
         under: &mut Vec<GlowQuad>,
     ) -> Applied {
-        let p = &MOMENTUM_PROFILE;
-        let admit_at = |s: &MomentumState, at: i128| -> Result<Instant, AdmitRefusal> {
+        #[inline]
+        fn admit_at(
+            p: &crate::cursor_momentum::MomentumProfile,
+            s: &MomentumState,
+            epoch: Instant,
+            at: i128,
+        ) -> Result<Instant, AdmitRefusal> {
             admit_time(p, s.last_time(epoch), at)?;
             instant_of(epoch, at).ok_or(AdmitRefusal::Horizon(at))
-        };
+        }
+        let p = &MOMENTUM_PROFILE;
         match *ev {
             MomentumEvent::Key { at, tau_bits } => {
                 let tau = f32::from_bits(tau_bits);
-                let now = match admit_at(s, at) {
+                let now = match admit_at(p, s, epoch, at) {
                     Ok(now) => match admit_tau(p, tau) {
                         Ok(()) => now,
                         Err(r) => return Applied::Refused(r),
@@ -1144,7 +1181,7 @@ impl Sched {
             }
             MomentumEvent::Tick { cur, at, geom, cfg } => {
                 let (geom, cfg) = (geom.geom(), cfg.config());
-                let now = match admit_at(s, at) {
+                let now = match admit_at(p, s, epoch, at) {
                     Ok(now) => now,
                     Err(r) => return Applied::Refused(r),
                 };
@@ -1159,7 +1196,7 @@ impl Sched {
                 Applied::Frame(frame)
             }
             MomentumEvent::Query { at, frame_interval } => {
-                let now = match admit_at(s, at) {
+                let now = match admit_at(p, s, epoch, at) {
                     Ok(now) => match admit_frame_interval(p, frame_interval) {
                         Ok(()) => now,
                         Err(r) => return Applied::Refused(r),
@@ -1261,7 +1298,7 @@ impl Code<MomentumSchema> for PrebuiltMomentum {
         let applied = self
             .sched
             .apply(state, schema.epoch, input, &mut out, &mut under);
-        Ok(observe(&applied, schema.epoch, &out, &under))
+        Ok(observe_owned(&applied, schema.epoch, out, under))
     }
 }
 
@@ -1272,6 +1309,7 @@ pub struct NoStrandedLight {
 }
 
 impl Default for NoStrandedLight {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -1288,16 +1326,20 @@ impl NoStrandedLight {
     }
 
     /// Its artifact: the descriptor names the laws and the settle margin.
+    #[inline]
     #[must_use]
     pub fn artifact() -> ArtifactId {
-        let mut e = Enc::new();
-        for law in [
+        const LAWS: [&str; 4] = [
             HOT_HAS_WAKE,
             WAKE_NO_LATER_THAN_CLEAR,
             COLD_TICK_CLEARS,
             RUN_MATCHES_INPUTS,
-        ] {
-            e.str(law);
+        ];
+        let mut e = Enc::new();
+        let mut li = 0;
+        while li < LAWS.len() {
+            e.str(LAWS[li]);
+            li += 1;
         }
         e.duration(SETTLE_MARGIN);
         ArtifactId::new(ArtifactKind::Contract, CONTRACT_NAME, 1, e.as_bytes())
@@ -1323,6 +1365,169 @@ const fn nanos(d: Duration) -> i128 {
     }
 }
 
+struct StrandedFold {
+    margin: i128,
+    forecast: Option<(i128, ConfigRecord)>,
+    last_tick: Option<ConfigRecord>,
+    latch_current: bool,
+    failed: Option<Verdict>,
+}
+
+impl StrandedFold {
+    #[inline]
+    const fn new() -> Self {
+        StrandedFold {
+            margin: nanos(SETTLE_MARGIN),
+            forecast: None,
+            last_tick: None,
+            latch_current: false,
+            failed: None,
+        }
+    }
+
+    #[inline]
+    fn step(
+        &mut self,
+        cursor: u64,
+        input: Option<&MomentumEvent>,
+        index: usize,
+        obs: &MomentumObservation,
+    ) {
+        if self.failed.is_some() {
+            return;
+        }
+        let Some(input) = input else {
+            self.failed = Some(fail(
+                cursor,
+                RUN_MATCHES_INPUTS,
+                format!("observation {index} has no recorded input"),
+            ));
+            return;
+        };
+        let margin = self.margin;
+        match (input, obs) {
+            (_, MomentumObservation::Refused(_)) => {}
+            (MomentumEvent::Key { .. }, MomentumObservation::Keyed)
+            | (MomentumEvent::Reset, MomentumObservation::WasReset) => {
+                self.forecast = None;
+                self.latch_current = false;
+            }
+            (
+                MomentumEvent::Tick { at, cfg, .. },
+                MomentumObservation::Frame {
+                    hot,
+                    fp,
+                    out,
+                    under,
+                    fill,
+                },
+            ) => {
+                if let Some((cold, latched)) = self.forecast {
+                    let lit =
+                        *hot || *fp != 0 || fill.is_some() || !out.is_empty() || !under.is_empty();
+                    if *at >= cold.saturating_add(margin) && latched == *cfg && lit {
+                        self.failed = Some(fail(
+                            cursor,
+                            COLD_TICK_CLEARS,
+                            format!(
+                                "the tick at {at} ns, past the cold forecast {cold} ns, still draws \
+                                 (hot {hot}, fp {fp:#x}, {} + {} quads)",
+                                out.len(),
+                                under.len()
+                            ),
+                        ));
+                        return;
+                    }
+                }
+                if matches!(self.forecast, Some((_, latched)) if latched != *cfg) {
+                    self.forecast = None;
+                }
+                self.last_tick = Some(*cfg);
+                self.latch_current = true;
+            }
+            (
+                MomentumEvent::Query { at, frame_interval },
+                MomentumObservation::Schedule {
+                    is_active,
+                    settling,
+                    cold_at,
+                    deadline,
+                },
+            ) => {
+                if (*is_active || *settling) && deadline.is_none() {
+                    self.failed = Some(fail(
+                        cursor,
+                        HOT_HAS_WAKE,
+                        format!(
+                            "the glow is hot ({}) at {at} ns and the code names no wake",
+                            if *settling { "settling" } else { "active" }
+                        ),
+                    ));
+                    return;
+                }
+                if *settling && let Some(d) = *deadline {
+                    let floor = at.saturating_add(nanos(*frame_interval));
+                    let limit = match cold_at {
+                        Some(c) => c.saturating_add(margin).max(floor),
+                        None => floor,
+                    };
+                    if d < floor || d > limit {
+                        self.failed = Some(fail(
+                            cursor,
+                            WAKE_NO_LATER_THAN_CLEAR,
+                            format!(
+                                "the settle wake {d} ns is outside [{floor}, {limit}] ns \
+                                 (at {at} ns, cold at {cold_at:?})"
+                            ),
+                        ));
+                        return;
+                    }
+                }
+                self.forecast = match (self.latch_current, *cold_at, self.last_tick) {
+                    (true, Some(c), Some(t)) => Some((c, t)),
+                    _ => None,
+                };
+            }
+            (input, obs) => {
+                self.failed = Some(fail(
+                    cursor,
+                    RUN_MATCHES_INPUTS,
+                    format!("{input:?} observed as {obs:?}"),
+                ));
+            }
+        }
+    }
+
+    #[inline]
+    fn finish(
+        self,
+        inputs_len: usize,
+        observations_len: usize,
+        last_cursor: Option<u64>,
+        refused: Option<&(u64, StepRefusal)>,
+    ) -> Verdict {
+        if let Some(v) = self.failed {
+            return v;
+        }
+        if let Some((cursor, r)) = refused {
+            return fail(
+                *cursor,
+                RUN_MATCHES_INPUTS,
+                format!("the replay stopped: {r}"),
+            );
+        }
+        if observations_len != inputs_len {
+            let cursor = last_cursor.unwrap_or(0);
+            return fail(
+                cursor,
+                RUN_MATCHES_INPUTS,
+                format!("{observations_len} observations for {inputs_len} inputs"),
+            );
+        }
+        Verdict::Pass
+    }
+}
+
 impl Contract<MomentumSchema> for NoStrandedLight {
     fn id(&self) -> &ArtifactId {
         &self.id
@@ -1334,134 +1539,52 @@ impl Contract<MomentumSchema> for NoStrandedLight {
         inputs: &[MomentumEvent],
         run: &Run<MomentumSchema>,
     ) -> Verdict {
-        let margin = nanos(SETTLE_MARGIN);
-        let mut forecast: Option<(i128, ConfigRecord)> = None;
-        let mut last_tick: Option<ConfigRecord> = None;
-        let mut latch_current = false;
-        for (i, (cursor, obs)) in run.observations.iter().enumerate() {
-            let cursor = *cursor;
-            let Some(input) = inputs.get(i) else {
-                return fail(
-                    cursor,
-                    RUN_MATCHES_INPUTS,
-                    format!("observation {i} has no recorded input"),
-                );
-            };
-            match (input, obs) {
-                (_, MomentumObservation::Refused(_)) => {}
-                (MomentumEvent::Key { .. }, MomentumObservation::Keyed)
-                | (MomentumEvent::Reset, MomentumObservation::WasReset) => {
-                    forecast = None;
-                    latch_current = false;
-                }
-                (
-                    MomentumEvent::Tick { at, cfg, .. },
-                    MomentumObservation::Frame {
-                        hot,
-                        fp,
-                        out,
-                        under,
-                        fill,
-                    },
-                ) => {
-                    if let Some((cold, latched)) = forecast {
-                        let lit = *hot
-                            || *fp != 0
-                            || fill.is_some()
-                            || !out.is_empty()
-                            || !under.is_empty();
-                        if *at >= cold.saturating_add(margin) && latched == *cfg && lit {
-                            return fail(
-                                cursor,
-                                COLD_TICK_CLEARS,
-                                format!(
-                                    "the tick at {at} ns, past the cold forecast {cold} ns, still draws \
-                                     (hot {hot}, fp {fp:#x}, {} + {} quads)",
-                                    out.len(),
-                                    under.len()
-                                ),
-                            );
-                        }
-                    }
-                    if matches!(forecast, Some((_, latched)) if latched != *cfg) {
-                        forecast = None;
-                    }
-                    last_tick = Some(*cfg);
-                    latch_current = true;
-                }
-                (
-                    MomentumEvent::Query { at, frame_interval },
-                    MomentumObservation::Schedule {
-                        is_active,
-                        settling,
-                        cold_at,
-                        deadline,
-                    },
-                ) => {
-                    if (*is_active || *settling) && deadline.is_none() {
-                        return fail(
-                            cursor,
-                            HOT_HAS_WAKE,
-                            format!(
-                                "the glow is hot ({}) at {at} ns and the code names no wake",
-                                if *settling { "settling" } else { "active" }
-                            ),
-                        );
-                    }
-                    if *settling && let Some(d) = *deadline {
-                        let floor = at.saturating_add(nanos(*frame_interval));
-                        let limit = match cold_at {
-                            Some(c) => c.saturating_add(margin).max(floor),
-                            None => floor,
-                        };
-                        if d < floor || d > limit {
-                            return fail(
-                                cursor,
-                                WAKE_NO_LATER_THAN_CLEAR,
-                                format!(
-                                    "the settle wake {d} ns is outside [{floor}, {limit}] ns \
-                                     (at {at} ns, cold at {cold_at:?})"
-                                ),
-                            );
-                        }
-                    }
-                    forecast = match (latch_current, *cold_at, last_tick) {
-                        (true, Some(c), Some(t)) => Some((c, t)),
-                        _ => None,
-                    };
-                }
-                (input, obs) => {
-                    return fail(
-                        cursor,
-                        RUN_MATCHES_INPUTS,
-                        format!("{input:?} observed as {obs:?}"),
-                    );
-                }
+        let mut fold = StrandedFold::new();
+        let mut i = 0;
+        while i < run.observations.len() {
+            let (cursor, ref obs) = run.observations[i];
+            fold.step(cursor, inputs.get(i), i, obs);
+            if fold.failed.is_some() {
+                break;
             }
+            i += 1;
         }
-        if let Some((cursor, r)) = &run.refused {
-            return fail(
-                *cursor,
-                RUN_MATCHES_INPUTS,
-                format!("the replay stopped: {r}"),
-            );
-        }
-        if run.observations.len() != inputs.len() {
-            let cursor = match run.observations.last() {
-                Some(&(c, _)) => c,
-                None => 0,
-            };
-            return fail(
-                cursor,
-                RUN_MATCHES_INPUTS,
-                format!(
-                    "{} observations for {} inputs",
-                    run.observations.len(),
-                    inputs.len()
-                ),
-            );
-        }
-        Verdict::Pass
+        fold.finish(
+            inputs.len(),
+            run.observations.len(),
+            run.observations.last().map(|&(c, _)| c),
+            run.refused.as_ref(),
+        )
+    }
+
+    fn replay_judged<C: Code<MomentumSchema>>(
+        &self,
+        schema: &MomentumSchema,
+        code: &C,
+        start: MomentumState,
+        inputs: &[MomentumEvent],
+        first_cursor: u64,
+        port: &mut dyn EffectPort,
+    ) -> (FoldedRun<MomentumSchema>, Verdict) {
+        let mut fold = StrandedFold::new();
+        let run = replay_fold(
+            schema,
+            code,
+            start,
+            inputs,
+            first_cursor,
+            port,
+            |i, cursor, input, obs| {
+                fold.step(cursor, Some(input), i, &obs);
+            },
+        );
+        let verdict = fold.finish(
+            inputs.len(),
+            run.observations,
+            run.last_cursor,
+            run.refused.as_ref(),
+        );
+        (run, verdict)
     }
 }
 
@@ -1490,15 +1613,29 @@ struct Held {
 impl Held {
     /// Whether a paused tick at (`cur`, `geom`, `cfg`) is shown this overlay.
     #[inline]
-    fn shows(&self, cur: Option<(u16, u16)>, geom: &Geom, cfg: &MomentumGlowConfig) -> bool {
+    const fn shows(&self, cur: Option<(u16, u16)>, geom: &Geom, cfg: &MomentumGlowConfig) -> bool {
+        let Some((cr, cc)) = cur else {
+            return false;
+        };
+        let Some((hr, hc)) = self.cur else {
+            return false;
+        };
         cfg.enabled
             && cfg.intensity.is_finite()
             && cfg.intensity > 0.0
-            && cur.is_some()
             && geom.cw != 0
             && geom.ch != 0
-            && self.cur == cur
-            && self.geom == GeomRecord::from(geom)
+            && hr == cr
+            && hc == cc
+            && self.geom.cw == geom.cw
+            && self.geom.ch == geom.ch
+            && self.geom.rows == geom.rows
+            && self.geom.cols == geom.cols
+            && self.geom.origin_x == geom.origin_x
+            && self.geom.origin_y == geom.origin_y
+            && self.geom.win_w == geom.win_w
+            && self.geom.win_h == geom.win_h
+            && self.geom.head == geom.head
             && self.dark == cfg.dark_theme
             && self.block == cfg.block
     }
@@ -1544,6 +1681,7 @@ struct Hosted {
     guard: Guard,
 }
 
+#[inline]
 fn refill(v: &mut Vec<GlowQuad>, from: &[GlowQuad]) {
     if from.is_empty() {
         *v = Vec::new();
@@ -1599,6 +1737,7 @@ pub struct MomentumHost {
 }
 
 impl Default for MomentumHost {
+    #[inline]
     fn default() -> Self {
         MomentumHost {
             mode: HostMode::Direct(MomentumGlow::default()),
@@ -1698,10 +1837,12 @@ impl Hosted {
         }
     }
 
+    #[inline]
     fn fold(&mut self, cursor: u64, obs: &MomentumObservation) {
         self.link(cursor, |schema, e| schema.encode_observation(obs, e));
     }
 
+    #[inline]
     fn link(&mut self, cursor: u64, encode: impl FnOnce(&MomentumSchema, &mut Enc)) {
         let Some(log) = self.boundary.log() else {
             return;
@@ -1723,6 +1864,7 @@ impl Hosted {
         self.chain.len = self.chain.len.saturating_add(1);
     }
 
+    #[inline]
     fn live_chain(&self) -> Digest {
         match self.boundary.log() {
             Some(log)
@@ -1734,15 +1876,20 @@ impl Hosted {
         }
     }
 
+    #[inline]
     fn fold_delivered(
         &mut self,
         first: u64,
         delivered: &[Result<MomentumObservation, StepRefusal>],
     ) {
         let mut cursor = first;
-        for obs in delivered.iter().flatten() {
-            self.fold(cursor, obs);
-            cursor = cursor.saturating_add(1);
+        let mut di = 0;
+        while di < delivered.len() {
+            if let Ok(obs) = &delivered[di] {
+                self.fold(cursor, obs);
+                cursor = cursor.saturating_add(1);
+            }
+            di += 1;
         }
     }
 
@@ -1839,6 +1986,7 @@ impl Hosted {
         Some(applied)
     }
 
+    #[inline]
     fn reset_changes_nothing(&self) -> bool {
         if self.boundary.is_paused() {
             match self.boundary.last_queued() {
@@ -1851,6 +1999,7 @@ impl Hosted {
         }
     }
 
+    #[inline]
     fn next_change_deadline(&mut self, now: Instant, frame_interval: Duration) -> Option<Instant> {
         let (at, moved) = self.logical(now);
         let ev = MomentumEvent::Query { at, frame_interval };
@@ -1882,12 +2031,14 @@ impl MomentumHost {
     }
 
     /// Stops recording for the reason `why`, keeping the recording's retired segments for the watcher.
+    #[inline]
     fn detach_by_itself(&mut self, why: &'static str) {
         self.aos_detach();
         self.detached = Some(why);
     }
 
     /// Moves the recording's undrained retired segments into the ones kept for [`Self::aos_take_retired`], the oldest dropped past [`RETIRED_CAP`].
+    #[inline]
     fn keep_retired(&mut self) {
         let retired = self.aos_take_retired();
         self.left = retired;
@@ -2049,6 +2200,7 @@ impl MomentumHost {
     }
 
     /// Starts hosting.
+    #[inline]
     pub fn aos_attach(&mut self, epoch: Instant, code: MomentumCode, build: &str, log_epoch: u64) {
         self.attach_with(
             epoch,
@@ -2060,6 +2212,7 @@ impl MomentumHost {
         );
     }
 
+    #[inline]
     fn attach_with(
         &mut self,
         epoch: Instant,
@@ -2081,6 +2234,7 @@ impl MomentumHost {
 
     /// Attaches as [`Self::aos_attach`] does with `plan` as the live code ([`PrebuiltMomentum::planned`]) and log epochs of `max_events` inputs, for the candidate evaluator.
     #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+    #[inline]
     pub(crate) fn attach_planned(
         &mut self,
         epoch: Instant,
@@ -2161,6 +2315,7 @@ impl MomentumHost {
     }
 
     /// The glow out of the host, any recording dropped with its undrained retired segments kept for the watcher.
+    #[inline]
     fn take_glow(&mut self) -> MomentumGlow {
         self.keep_retired();
         match core::mem::replace(&mut self.mode, HostMode::Direct(MomentumGlow::default())) {
@@ -2173,6 +2328,7 @@ impl MomentumHost {
     }
 
     /// Stops hosting; the glow draws on in the ink the host last set.
+    #[inline]
     pub fn aos_detach(&mut self) {
         let mut glow = self.take_glow();
         glow.set_light_vivid(self.light_vivid);
@@ -2183,6 +2339,7 @@ impl MomentumHost {
     /// # Errors
     /// [`PublishRefusal::NotAttached`] or [`PublishRefusal::AlreadyPaused`]; nothing is recorded
     /// then.
+    #[inline]
     pub fn aos_pause(
         &mut self,
         now: Instant,
@@ -2204,6 +2361,7 @@ impl MomentumHost {
     /// # Errors
     /// Any [`PublishRefusal`] `prepare` or `commit` returns (`NotAttached`, `NotPaused`,
     /// `CandidateFailed`, …).
+    #[inline]
     pub fn aos_repair(
         &mut self,
         candidate: MomentumCode,
@@ -2222,6 +2380,7 @@ impl MomentumHost {
     /// A copy of the paused glow's boundary and `candidate`, for [`RepairJob::prepare`] on another thread.
     /// # Errors
     /// [`PublishRefusal::NotAttached`] or [`PublishRefusal::NotPaused`].
+    #[inline]
     pub fn aos_repair_job(&self, candidate: MomentumCode) -> Result<RepairJob, PublishRefusal> {
         let HostMode::Hosted(h) = &self.mode else {
             return Err(PublishRefusal::NotAttached);
@@ -2238,6 +2397,7 @@ impl MomentumHost {
     /// Commits a prepare made on a copy of this glow's boundary, with every check `commit` makes, and folds what the queue returned.
     /// # Errors
     /// The prepare's refusal, then [`PublishRefusal::NotAttached`] or any refusal `commit` returns (`NotPaused`, `StaleHead`, `WitnessMismatch`, …).
+    #[inline]
     pub fn aos_commit(
         &mut self,
         prepared: PreparedRepair,
@@ -2264,21 +2424,22 @@ impl MomentumHost {
     }
 
     /// Takes the retired log epochs, oldest first, for the online watcher ([`Segment::judge`]), with those of the recordings the host dropped kept.
+    #[inline]
     pub fn aos_take_retired(&mut self) -> Vec<Segment> {
         let mut out = core::mem::take(&mut self.left);
         if let HostMode::Hosted(h) = &mut self.mode {
             let schema = h.boundary.schema().clone();
-            out.extend(
-                h.boundary
-                    .drain_retired()
-                    .into_iter()
-                    .map(|retired| Segment::new(schema.clone(), retired)),
-            );
+            let drained = h.boundary.drain_retired();
+            out.reserve(drained.len());
+            for retired in drained {
+                out.push(Segment::new(schema.clone(), retired));
+            }
         }
         out
     }
 
     /// Rejects the pending update.
+    #[inline]
     pub fn aos_resume(&mut self) -> Vec<Result<MomentumObservation, StepRefusal>> {
         let HostMode::Hosted(h) = &mut self.mode else {
             return Vec::new();
@@ -2331,6 +2492,7 @@ impl MomentumHost {
     }
 
     /// What the wrapper and its boundary hold, as plain data.
+    #[inline]
     #[must_use]
     pub fn aos_status(&self) -> MomentumAosStatus {
         let h = match &self.mode {
@@ -2372,6 +2534,24 @@ impl MomentumHost {
         };
         #[cfg(not(any(test, debug_assertions, feature = "aos-candidates")))]
         let (guard_moved, guard_firings) = (None, None);
+        let mut checkpoint = None;
+        if let Some(c) = b.checkpoint() {
+            checkpoint = Some(c.digest().short());
+        }
+        let mut cold_at = None;
+        if let Some(t) = code.cold_at(state) {
+            cold_at = Some(offset_of(epoch, t));
+        }
+        let mut last_frame = None;
+        if let Some(held) = h.held.as_ref() {
+            last_frame = Some(FrameSummary {
+                fill: held.frame.fill,
+                hot: held.frame.hot,
+                fp: held.frame.fp,
+                out: held.out.len(),
+                under: held.under.len(),
+            });
+        }
         MomentumAosStatus {
             attached: true,
             code: code.name(),
@@ -2386,7 +2566,7 @@ impl MomentumHost {
             log_len,
             input_cursor: b.pair().head.input_cursor,
             broken,
-            checkpoint: b.checkpoint().map(|c| c.digest().short()),
+            checkpoint,
             state_digest: Some(state_digest(b.schema(), state).short()),
             observation_chain: Some(h.live_chain().short()),
             latched,
@@ -2398,16 +2578,10 @@ impl MomentumHost {
             settling,
             guard_moved,
             guard_firings,
-            cold_at: code.cold_at(state).map(|t| offset_of(epoch, t)),
+            cold_at,
             last_query_at,
             next_deadline,
-            last_frame: h.held.as_ref().map(|held| FrameSummary {
-                fill: held.frame.fill,
-                hot: held.frame.hot,
-                fp: held.frame.fp,
-                out: held.out.len(),
-                under: held.under.len(),
-            }),
+            last_frame,
             stats: b.stats(),
             clamped: h.clamped,
         }
@@ -2416,6 +2590,7 @@ impl MomentumHost {
     /// The ancestor checkpoint and the log since it.
     /// # Errors
     /// [`TraceRefusal::NotAttached`], or an encoder's `TooLarge`.
+    #[inline]
     pub fn aos_trace(&self) -> Result<MomentumTrace, TraceRefusal> {
         let HostMode::Hosted(h) = &self.mode else {
             return Err(TraceRefusal::NotAttached);
@@ -2451,6 +2626,7 @@ impl fmt::Debug for RepairJob {
 
 impl RepairJob {
     /// Shadow-replays the copy's live code and the candidate from the ancestor checkpoint ([`Boundary::prepare`]).
+    #[inline]
     #[must_use]
     pub fn prepare(self) -> PreparedRepair {
         let mut boundary = self.boundary;
@@ -2563,10 +2739,13 @@ impl fmt::Display for MomentumAosStatus {
                 self.code, self.hot, self.is_active, self.settling
             );
         }
-        let opt = |v: Option<i128>| match v {
-            Some(t) => t.to_string(),
-            None => "none".to_owned(),
-        };
+        #[inline]
+        const fn fmt_opt_i128(v: Option<i128>) -> impl fmt::Display {
+            fmt::from_fn(move |f| match v {
+                Some(t) => write!(f, "{t}"),
+                None => f.write_str("none"),
+            })
+        }
         write!(
             f,
             "aos attached code={} build={} rev={} branch={} paused={} queued={}/{} log={}@{} cursor={} broken={} \
@@ -2592,14 +2771,14 @@ impl fmt::Display for MomentumAosStatus {
             self.latched.unwrap_or(0.0),
             self.fp_last.unwrap_or(0),
             self.fp_prev.unwrap_or(0),
-            opt(self.cold_at),
-            opt(self.next_deadline),
+            fmt_opt_i128(self.cold_at),
+            fmt_opt_i128(self.next_deadline),
         )?;
         if let Some(fr) = self.last_frame {
-            let fill = match fr.fill {
-                Some(c) => format!("{c:#08x}"),
-                None => "none".to_owned(),
-            };
+            let fill = fmt::from_fn(move |f| match fr.fill {
+                Some(c) => write!(f, "{c:#08x}"),
+                None => f.write_str("none"),
+            });
             write!(
                 f,
                 " frame=fill:{fill} fp:{:#x} quads:{}+{}",

@@ -62,20 +62,27 @@ fn sweep_dead_with(
 /// resolved `link` before its unlink, gets through, reads the end once the wake closes, finds its
 /// link gone, and exits. A write-only, non-blocking wake fails (`ENXIO`) while no reader holds the
 /// FIFO, as in the instant a shell spends between reading the end and opening it again, which
-/// would leave that shell waiting for ever on a FIFO nobody can name. If the wake cannot open,
-/// both names stay for a later sweep.
+/// would leave that shell waiting for ever on a FIFO nobody can name. On Darwin the wake is
+/// close-on-fork: a child this process forks while the wake is held would otherwise keep a writer
+/// open until it execs, and the shell would read no end until then. If the wake cannot open, both
+/// names stay for a later sweep.
 fn release(path: &Path, link: &Path) -> Option<std::fs::File> {
-    let wake = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .ok()?;
+    let mut wake = std::fs::OpenOptions::new();
+    wake.read(true).write(true);
+    #[cfg(target_vendor = "apple")]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut wake, O_CLOFORK);
+    let wake = wake.open(path).ok()?;
     if std::fs::read_link(link).is_ok_and(|to| Some(to.as_os_str()) == path.file_name()) {
         let _ = std::fs::remove_file(link);
     }
     let _ = std::fs::remove_file(path);
     Some(wake)
 }
+
+/// Darwin's `O_CLOFORK` (`<sys/fcntl.h>`): a child this process forks gets no copy of the
+/// descriptor.
+#[cfg(target_vendor = "apple")]
+const O_CLOFORK: i32 = 0x0800_0000;
 
 /// `(pid, birth, sid)` of a FIFO's name, its sid `s-<hex>` of at most 64 characters.
 fn name_parts(name: &str) -> Option<(u32, u64, &str)> {

@@ -211,3 +211,20 @@ fn a_closed_summary_keeps_to_a_kilobyte_and_reads_as_the_log_did() {
         old.footprint()
     );
 }
+
+/// C7's review: the journal writer's hold on a take ([`aterm_slog::Journaled`]) marks the take
+/// spent first at once and gives it back to the log it was taken from, and to no other: a copy of
+/// that log keeps a mark of its own, and a kept copy follows no writer.
+#[test]
+fn a_takes_hold_gives_back_to_its_own_log_only() {
+    let mut log = realistic_log(3);
+    log.note_journaled(2);
+    let held = log.take_journaled(2, 9);
+    assert_eq!(log.journaled(), Some(9), "the take is spent first at once");
+    let copy = log.clone();
+    let kept = log.kept_within(64 * 1024);
+    held.unwritten();
+    assert_eq!(log.journaled(), Some(2), "the hold gave the take back");
+    assert_eq!(copy.journaled(), Some(9), "a copy's mark is its own");
+    assert_eq!(kept.journaled(), None, "a kept copy follows no writer");
+}

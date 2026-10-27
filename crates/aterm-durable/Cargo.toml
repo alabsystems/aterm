@@ -13,10 +13,11 @@ description = "How aterm finishes a write: durable (on stable media at return, F
 # Std-only apart from astream-sys, so a dependency-free crate (aterm-primer) can
 # finish its writes here and still pull no third-party code: astream-sys has no
 # dependencies, and its cordoned modules of FFI calls (astream claim `os.cordon`) hold
-# the only `unsafe` the barrier needs. On every target this crate classifies a directory
-# flush's error by astream's one rule (`dir_flush_unavailable`, for
-# `Flush::dir_best_effort` and `DirFlushed::classify`), a plain judgement of the error
-# that crosses into no kernel. On Apple targets, the only ones with an ordering-only
+# the only `unsafe` the barrier needs. On every target this crate classifies refused file
+# flushes (`file_flush_refused`, for the opt-in `refusal_accepted`) and unavailable
+# directory flushes (`dir_flush_unavailable`, for `Flush::dir_best_effort` and
+# `DirFlushed::classify`) by astream's rules, plain judgements of the error that cross
+# into no kernel. On Apple targets, the only ones with an ordering-only
 # flush, it also calls `barrier_sync` (`fcntl(F_BARRIERFSYNC)`) and `barrier_refused`,
 # on files and on directories (`ordered_dir`), and reads and sets the test mark
 # (`test_plain_fsync`, `TEST_PLAIN_FSYNC_ENV`); it never installs the `SIGHUP` handler.

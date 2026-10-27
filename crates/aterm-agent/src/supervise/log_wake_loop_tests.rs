@@ -101,6 +101,35 @@ const WAIT_41: &str = "log close=turn,need,kind=agent since=41 ep=1 timeout 2000
 const WAIT_42: &str = "log close=turn,need,kind=agent since=42 ep=1 timeout 20000";
 const GONE: &str = "await gone esc.to.interrupt rows 2 7 timeout 20000";
 
+/// C13 (ROBUST-3): a host whose `status` prints `log_base=` is waited on with `base=`, the log
+/// the cursor is of, so a cursor of another log would be answered as a reset; an older host's
+/// `status` prints none, and its wait names none.
+#[test]
+fn the_wait_names_the_log_its_cursor_is_of() {
+    let mut world = LogWorld::new();
+    world.base = Some(1_760_000_123);
+    let (_, m) = run_on(worked_twice(), Some(world), held_twice);
+    let asked = &log_of(&m).asked;
+    assert!(
+        !asked.is_empty(),
+        "the loop waited on the log: {:#?}",
+        m.requests
+    );
+    assert!(
+        asked
+            .iter()
+            .all(|a| a.contains(" since=") && a.contains(" ep=1 base=1760000123 timeout ")),
+        "{asked:#?}"
+    );
+    let (_, older) = run_on(worked_twice(), Some(LogWorld::new()), held_twice);
+    assert!(
+        !log_of(&older).asked.is_empty()
+            && log_of(&older).asked.iter().all(|a| !a.contains("base=")),
+        "{:#?}",
+        log_of(&older).asked
+    );
+}
+
 /// How many `status` reads stand right before a screen wait for the busy row to go.
 fn statuses_before_gone(m: &Mock) -> usize {
     m.requests

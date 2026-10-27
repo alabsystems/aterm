@@ -37,6 +37,9 @@ pub mod dev_channel;
 mod durable;
 #[cfg(unix)]
 mod exec_plain;
+/// On a first launch from a copy that goes away, install the running bundle and relaunch
+/// from it (design §6.8).
+pub mod first_launch;
 /// Who raised an update floor, so a revocation can take it back.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod floor_sources;

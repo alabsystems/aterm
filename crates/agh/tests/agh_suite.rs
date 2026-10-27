@@ -40,6 +40,8 @@ mod slugs;
 mod tape_fixtures;
 mod tapes;
 mod users_rate;
+#[cfg(unix)]
+mod vault_adoption;
 mod waits;
 mod wire_loopback;
 mod wire_types;

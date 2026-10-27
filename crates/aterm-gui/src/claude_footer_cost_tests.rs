@@ -94,8 +94,12 @@ fn selected_subscription_repaints_without_old_account_data_or_extra_rows() {
     );
     assert_eq!(cost(&mut app, wid).composed, 1);
     let first = glass_row(&app, wid, rule);
-    assert!(first.contains("first@example.com"), "{first:?}");
-    assert!(first.contains("Max 5x"), "{first:?}");
+    assert!(first.contains("\u{2386} first "), "{first:?}");
+    assert!(!first.contains("@example.com"), "the name alone: {first:?}");
+    assert!(
+        !first.contains("Max 5x"),
+        "the plan is the hover's: {first:?}"
+    );
     assert!(first.contains("weekly 29% left"), "{first:?}");
     assert_eq!(glass_row(&app, wid, rule + 1), mode);
     assert_eq!(cost(&mut app, wid), Cost::default());
@@ -103,11 +107,14 @@ fn selected_subscription_repaints_without_old_account_data_or_extra_rows() {
     publish(&app, session, selected("second@example.com", "Pro", None));
     assert_eq!(cost(&mut app, wid).composed, 1);
     let second = glass_row(&app, wid, rule);
-    assert!(second.contains("second@example.com"), "{second:?}");
-    assert!(second.contains("Pro"), "{second:?}");
-    assert!(second.contains("weekly unavailable"), "{second:?}");
+    assert!(second.contains("\u{2386} second "), "{second:?}");
+    assert!(!second.contains("Pro"), "{second:?}");
     assert!(
-        !second.contains("first@example.com") && !second.contains("29%"),
+        !second.contains("weekly"),
+        "no week told, none shown: {second:?}"
+    );
+    assert!(
+        !second.contains("first") && !second.contains("29%"),
         "{second:?}"
     );
     assert_eq!(glass_row(&app, wid, rule + 1), mode);
@@ -119,8 +126,11 @@ fn unicode_subscription_text_survives_the_native_splice_and_rests_without_alloca
     for email in [
         "jose\u{0301}@example.com",
         "x\u{0301}\u{0323}@example.com",
-        "使用者-jose\u{0301}-x\u{0301}\u{0323}-\u{1f469}\u{200d}\u{1f4bb}@example.com",
+        // The rule shows the name before the last `@`: this one keeps an `@` beside the emoji.
+        "使用者-jose\u{0301}-x\u{0301}\u{0323}-\u{1f469}\u{200d}\u{1f4bb}@b@example.com",
     ] {
+        let name = email.rsplit_once('@').map_or(email, |(name, _)| name);
+        let shown = format!("\u{2386}{name}\u{b7}");
         let facts = FooterFacts {
             subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
                 email: Some(email.into()),
@@ -152,8 +162,8 @@ fn unicode_subscription_text_survives_the_native_splice_and_rests_without_alloca
             text
         };
         assert!(
-            reading(&app).contains(email),
-            "{email:?}: {:?}",
+            reading(&app).contains(&shown),
+            "{email:?}: the name alone, whole: {:?}",
             reading(&app)
         );
         if email.contains('\u{0301}') {
@@ -216,7 +226,7 @@ fn unicode_subscription_text_survives_the_native_splice_and_rests_without_alloca
                 Cost::default(),
                 "{email:?}, frame {frame}"
             );
-            assert!(reading(&app).contains(email), "{email:?}, frame {frame}");
+            assert!(reading(&app).contains(&shown), "{email:?}, frame {frame}");
         }
     }
 }

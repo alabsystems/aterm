@@ -212,7 +212,8 @@ pub fn console_resident_handoff_model() -> Model {
     }
 }
 
-/// Emitted resident z-order model (`PetFrame::under_ink`).
+/// Emitted resident z-order model (`PetFrame::under_ink`); a leg dealt in front
+/// (`PetBrain::front_pass`) reaches ink over it.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn console_pet_z_order_model() -> Model {
@@ -224,29 +225,38 @@ pub fn console_pet_z_order_model() -> Model {
             var under = 0;
             var prev_under = 0;
             var dwelt = 0;
+            var front = 0;
 
             action Ink when (drawn <= 1) {
                 prev_under = under;
                 under = if Buggy == 1 && under == 0 && ink == 0 { 0 } else { 1 };
-                ink = 1; drawn = 1; dwelt = 0;
+                ink = 1; drawn = 1; dwelt = 0; front = 0;
+            }
+            action InkOnFrontPass when (drawn <= 1) {
+                prev_under = under;
+                under = if Buggy == 1 { 1 } else { under };
+                ink = 1; drawn = 1; dwelt = 0; front = 1;
             }
             action Clear when (drawn <= 1) {
                 prev_under = under;
                 under = if Buggy == 1 && ink == 0 { 1 - under } else { under };
-                ink = 0; drawn = 1; dwelt = 0;
+                ink = 0; drawn = 1; dwelt = 0; front = 0;
             }
             action ClearDwelt when (drawn == 1 && ink == 0 && under == 1) {
                 prev_under = under;
                 under = if Buggy == 1 { 1 } else { 0 };
-                ink = 0; drawn = 1; dwelt = 1;
+                ink = 0; drawn = 1; dwelt = 1; front = 0;
             }
             action Hide when (drawn <= 1) {
                 prev_under = under;
                 under = if Buggy == 1 { under } else { 0 };
-                ink = 0; drawn = 0; dwelt = 0;
+                ink = 0; drawn = 0; dwelt = 0; front = 0;
             }
 
-            invariant InkStaysInFront: if drawn == 1 && ink == 1 { under == 1 } else { under <= 1 };
+            invariant InkStaysInFront:
+                if drawn == 1 && ink == 1 && front == 0 { under == 1 } else { under <= 1 };
+            invariant FrontPassStaysOver:
+                if drawn == 1 && ink == 1 && front == 1 && prev_under == 0 { under == 0 } else { under <= 1 };
             invariant ClearNeverSinks:
                 if drawn == 1 && ink == 0 && prev_under == 0 { under == 0 } else { under <= 1 };
             invariant SurfacingWaitsTheDwell:

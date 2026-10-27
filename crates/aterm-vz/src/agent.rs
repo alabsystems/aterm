@@ -51,6 +51,14 @@ pub fn exec_of(argv: &[&str], cwd: &str, env: &[(&str, &str)]) -> Exec {
 /// # Errors
 /// The connection failed, the agent sent a frame no command sends, or a read waited past
 /// `span` (the words say which).
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "vz_lifecycle",
+        action = "ExecExit",
+        project = "conformance_lifecycle::project"
+    )
+)]
 pub fn run(fd: OwnedFd, exec: &Exec, span: Duration) -> Result<Output, String> {
     let mut stream = UnixStream::from(fd);
     // XNU refuses every option on a socket that can neither send nor receive (EINVAL): the
@@ -68,7 +76,13 @@ pub fn run(fd: OwnedFd, exec: &Exec, span: Duration) -> Result<Output, String> {
         match wire::read_frame(&mut stream) {
             Ok(Some(Frame::Out(b))) => out.extend_from_slice(&b),
             Ok(Some(Frame::Err(b))) => err.extend_from_slice(&b),
-            Ok(Some(Frame::Exit(exit))) => return Ok(Output { exit, out, err }),
+            Ok(Some(Frame::Exit(exit))) => {
+                #[cfg(any(test, debug_assertions))]
+                if crate::fault::armed(crate::fault::Fault::DropExit) {
+                    continue;
+                }
+                return Ok(Output { exit, out, err });
+            }
             Ok(Some(other)) => {
                 return Err(format!(
                     "the agent sent a frame of kind {:#04x} on a command connection",

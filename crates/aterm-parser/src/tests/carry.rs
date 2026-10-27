@@ -1191,3 +1191,94 @@ fn a_header_carry_has_the_older_builds_form_beside_it() {
         assert_eq!(carry.for_older_builds(), None, "{bytes:?}");
     }
 }
+
+#[test]
+fn every_hooked_dcs_split_continues_exactly_and_refuses_invalid_carries() {
+    let streams: &[&[u8]] = &[
+        b"a\x1bP$qm\x1b\\b\x1bP+q544E\x9cc\x1bP$q\xe6\x9c\xac\x1b\\d",
+        b"\x1bP$qm\x1b[5;7Hafter\x1bP+q544E\x1b]2;t\x07end",
+        b"\x1bPtmux;\x1b\x1bP$qm\x1b\x1b\\\x1b\\ok",
+        b"\x1bPtmux;\x1b\x1bP+q544E\x1b\x1b\\more\x1b\\done",
+    ];
+    for c1 in [false, true] {
+        for &stream in streams {
+            let mut whole = RecordingSink::default();
+            parser_c1(c1).advance_fast(stream, &mut whole);
+            let mut saw_active = false;
+            let mut saw_st_pending = false;
+            for split in 0..=stream.len() {
+                let (head, tail) = stream.split_at(split);
+                let mut sink = RecordingSink::default();
+                let mut outgoing = parser_c1(c1);
+                outgoing.advance_fast(head, &mut sink);
+                let mut successor = parser_c1(c1);
+                if let Some(carry) = outgoing.carry() {
+                    assert_eq!(outgoing.hooked_dcs_carry(), None, "split {split}");
+                    successor.restore_carry(&carry).expect("restores");
+                } else {
+                    let hooked = outgoing
+                        .hooked_dcs_carry()
+                        .expect("uncarried iff in_hooked_dcs");
+                    if hooked.st_pending {
+                        saw_st_pending = true;
+                    } else {
+                        saw_active = true;
+                    }
+                    successor
+                        .restore_hooked_dcs(&hooked)
+                        .expect("restores hooked DCS");
+                    assert_eq!(successor.hooked_dcs_carry().as_ref(), Some(&hooked));
+                    successor.assert_invariants();
+                    for byte in 0..=u8::MAX {
+                        let mut next = successor.clone();
+                        next.advance_fast(&[byte], &mut NullSink);
+                        next.assert_invariants();
+                    }
+                }
+                successor.advance_fast(tail, &mut sink);
+                assert_eq!(
+                    sink,
+                    whole,
+                    "c1={c1} split {split} ({:?} | {:?})",
+                    String::from_utf8_lossy(head),
+                    String::from_utf8_lossy(tail)
+                );
+            }
+            assert!(saw_active && saw_st_pending, "c1={c1} {stream:?}");
+        }
+    }
+
+    let invalid = [
+        (
+            HookedDcsCarry {
+                st_pending: true,
+                string_utf8_tail: vec![0xE6],
+                tmux: TmuxPassthrough::Off,
+            },
+            CarryRefusal::FieldOutsideState,
+        ),
+        (
+            HookedDcsCarry {
+                st_pending: false,
+                string_utf8_tail: vec![0xE6, b'a'],
+                tmux: TmuxPassthrough::Off,
+            },
+            CarryRefusal::Utf8Tail,
+        ),
+        (
+            HookedDcsCarry {
+                st_pending: false,
+                string_utf8_tail: Vec::new(),
+                tmux: TmuxPassthrough::Head(2),
+            },
+            CarryRefusal::FieldOutsideState,
+        ),
+    ];
+    for (bad, want) in invalid {
+        let mut p = Parser::new();
+        p.advance_fast(b"\x1b[1", &mut RecordingSink::default());
+        let before = format!("{p:?}");
+        assert_eq!(p.restore_hooked_dcs(&bad), Err(want));
+        assert_eq!(format!("{p:?}"), before);
+    }
+}

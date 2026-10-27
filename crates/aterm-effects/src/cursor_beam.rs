@@ -163,6 +163,7 @@ impl CursorBeamRod {
         clippy::too_many_arguments,
         reason = "cursor cell + clock + blaze + geometry + config + the two streams it draws into"
     )]
+    #[inline]
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -251,6 +252,7 @@ impl CursorBeamRod {
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
     )]
+    #[inline]
     fn emit_rod(
         &self,
         cr: u16,
@@ -307,6 +309,7 @@ impl CursorBeamRod {
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
     )]
+    #[inline]
     fn emit_rod_light(
         &mut self,
         cr: u16,
@@ -373,6 +376,7 @@ impl CursorBeamRod {
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
     )]
+    #[inline]
     fn emit_aura(
         &self,
         cr: u16,
@@ -415,32 +419,13 @@ impl CursorBeamRod {
                 let half = rx * crate::color_math::sqrt_f32(w2);
                 if half > hw {
                     let span = half - hw;
-                    let knot = |k: usize| {
-                        let t = k as f32 * (1.0 / AURA_SEGMENTS as f32);
-                        let dx = hw + span * t;
-                        let (rx_i, lx_i) = ((cx + dx).round() as i32, (cx - dx).round() as i32);
-                        if k == AURA_SEGMENTS {
-                            return (rx_i, lx_i, 0, 0);
-                        }
-                        let u = dx * inv_rx;
-                        let rho2 = u * u + v2;
-                        let f_1 = (1.0 - rho2).max(0.0);
-                        let f = f_1 * f_1 * inv_f_edge;
-                        let cov = (peak * f).round().min(OVER_INK_COV_CAP) as u8;
-                        if cov == 0 {
-                            return (rx_i, lx_i, 0, 0);
-                        }
-                        let color = lerp_rgb(
-                            cfg.color,
-                            cfg.haze,
-                            0.75 * crate::color_math::sqrt_f32(rho2),
-                        );
-                        (rx_i, lx_i, cov, premul_rgb(color, cov))
-                    };
-                    let mut prev = knot(0);
+                    let geom_knot = (cx, hw, span);
+                    let falloff_knot = (inv_rx, v2, inv_f_edge, peak);
+                    let rgb_knot = (cfg.color, cfg.haze);
+                    let mut prev = aura_knot(0, geom_knot, falloff_knot, rgb_knot);
                     let mut k = 1;
                     while k <= AURA_SEGMENTS {
-                        let next = knot(k);
+                        let next = aura_knot(k, geom_knot, falloff_knot, rgb_knot);
                         k += 1;
                         let ((r_in, l_in, c_in, inner), (r_out, l_out, c_out, outer)) =
                             (prev, next);
@@ -458,6 +443,31 @@ impl CursorBeamRod {
             y += h;
         }
     }
+}
+
+#[inline(always)]
+const fn aura_knot(
+    k: usize,
+    (cx, hw, span): (f32, f32, f32),
+    (inv_rx, v2, inv_f_edge, peak): (f32, f32, f32, f32),
+    (color, haze): (u32, u32),
+) -> (i32, i32, u8, u32) {
+    let t = k as f32 * (1.0 / AURA_SEGMENTS as f32);
+    let dx = hw + span * t;
+    let (rx_i, lx_i) = ((cx + dx).round() as i32, (cx - dx).round() as i32);
+    if k == AURA_SEGMENTS {
+        return (rx_i, lx_i, 0, 0);
+    }
+    let u = dx * inv_rx;
+    let rho2 = u * u + v2;
+    let f_1 = (1.0 - rho2).max(0.0);
+    let f = f_1 * f_1 * inv_f_edge;
+    let cov = (peak * f).round().min(OVER_INK_COV_CAP) as u8;
+    if cov == 0 {
+        return (rx_i, lx_i, 0, 0);
+    }
+    let rgb = lerp_rgb(color, haze, 0.75 * crate::color_math::sqrt_f32(rho2));
+    (rx_i, lx_i, cov, premul_rgb(rgb, cov))
 }
 
 #[cfg(test)]

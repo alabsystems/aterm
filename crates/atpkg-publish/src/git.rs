@@ -36,8 +36,24 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
 
 /// The build number of `rev` in `dir`.
 /// # Errors
-/// When git fails or prints something that is not a count.
+/// When the repository is shallow, git fails, or its output is not recognized.
 pub fn rev_count(dir: &Path, rev: &str) -> Result<u64> {
+    match run(dir, &["rev-parse", "--is-shallow-repository"])?.as_str() {
+        "false" => {}
+        "true" => {
+            return Err(Error::refused(format!(
+                "{} is shallow; publication build numbers require complete history. \
+                 Use a full clone or fetch --unshallow before publishing",
+                dir.display()
+            )));
+        }
+        other => {
+            return Err(Error::refused(format!(
+                "`git rev-parse --is-shallow-repository` in {} printed `{other}`",
+                dir.display()
+            )));
+        }
+    }
     let n = run(dir, &["rev-list", "--count", rev])?;
     n.parse().map_err(|_| {
         Error::refused(format!(

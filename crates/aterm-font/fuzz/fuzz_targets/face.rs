@@ -103,6 +103,12 @@ fuzz_target!(|data: &[u8]| {
                     {
                         sink.0 += u64::from(s.coverage().get(GlyphId(1)).is_some());
                     }
+                    if let Some(s) = lookup
+                        .subtables
+                        .get::<aterm_font::gpos::PositioningSubtable>(j)
+                    {
+                        sink.0 += u64::from(s.coverage().get(GlyphId(1)).is_some());
+                    }
                 }
             }
         }

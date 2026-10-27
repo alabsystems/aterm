@@ -82,13 +82,21 @@ USAGE
       hand the directory to the cutter (--linux-artifacts), or let the cutter
       drive the hosts (--linux-worker).
 
+  targo --unverified ship pin-verifier --from-release vX.Y.Z
   targo --unverified ship pin-verifier dist/aterm-bootstrap-verify-pin.toml
-      Once a release is public: pin the static bootstrap verifiers its cut froze
-      (the record its sign step wrote into dist/) in this checkout, as
-      tools/install.sh's pin and crates/aterm-bootstrap-verify/pinned.toml, to
-      commit together. Refuses a release this checkout's RELEASES.ledger does
-      not claim, or one whose verifiers speak another interface than this tree's
-      install.sh; then nothing is written.
+      Once a release is public: pin its static bootstrap verifiers in this
+      checkout, as tools/install.sh's pin and
+      crates/aterm-bootstrap-verify/pinned.toml, to commit together.
+      --from-release works in any checkout of main: it reads the release from
+      the public channel, holds its appcast to the paper master, the head's
+      roster and apply floor and this checkout's claim and tag, downloads each
+      verifier the appcast signs and holds it to the signed digest. The record
+      form takes the file the cut's sign step wrote into dist/ on the cutting
+      machine. Refuses a release this checkout's RELEASES.ledger does not
+      claim, one whose verifiers speak another interface than this tree's
+      install.sh, and (--from-release) one whose appcast signs no verifier
+      digest, that serves other bytes, or that the channel no longer serves (a
+      prerelease, or below the head's floor); then nothing is written.
 
   targo --unverified ship cut [--dry-run] [--resume] [--abandon vX.Y.Z]
                  [--min-build N] [--release-credentials <profile.toml>]
@@ -165,8 +173,9 @@ USAGE
                            naming sections narrows it to them, none is all three:
         --cut              the cut's pre-claim gates that read only the commit
                            and this clone's records (cutter identity, release
-                           notes, the predecessor's handoff fixtures, the handoff
-                           policy, the `verify release` record), in seconds.
+                           notes, harness versions, the predecessor's handoff
+                           fixtures, the handoff policy, the `verify release`
+                           record), in seconds.
                            Answered only by REV's own cutter (built from REV),
                            else it could not run. publish/pre-promote runs this
         --export           the publication engine's export guards (forbidden
@@ -182,10 +191,20 @@ USAGE
                            REV's own tree
       Exits 0 READY, 1 a gate would refuse, 2 no checkout or REV names no
       release, 3 a gate could not run (each line names its fix), 130 interrupted
+  targo --unverified ship harness-bump
+                           write the harness versions the `harness versions` gate
+                           asks for: each harness (claude, codex, agy, grok, kimi,
+                           muse) whose sources (its reader in crates/aterm-phase/src
+                           and the shared lane crates/aterm-agent/src/harness/)
+                           changed since the previous public release under an
+                           unchanged HARNESS_VER gets its minor raised by one, and
+                           CHANGELOG [Unreleased] a line naming it. A harness
+                           version is MAJOR.MINOR, never a third part; one bump per
+                           release window covers every change in it
   targo --unverified ship trust run (-p <crate>... | --whole-tree | --remeasure)
         [--jobs N|auto] [--target-root DIR] [--crate-budget SECONDS] [--prover BIN-DIR]
-        [--update-ratchet] [--try-refused] [--obligations|--no-obligations] [--stop-if-narrowed]
-        [--no-wait] [--admit wait|now]
+        [--update-ratchet [--reason WHY]] [--try-refused] [--obligations|--no-obligations]
+        [--stop-if-narrowed] [--no-wait] [--admit wait|now]
                            the Trust lane: `targo trust check -p <lib> --lib
                            --allow-l0-gaps` over the named libraries (-p <lib>
                            also selects its <lib>+<feature> rows, one for each
@@ -224,7 +243,12 @@ USAGE
                            another toolchain's bin/ (an absolute path). A
                            whole-tree run on a clean checkout files the facts
                            `trust judge` reads. --update-ratchet raises the floors
-                           a run meets and keeps trust/memory.tsv current;
+                           a run meets and keeps trust/memory.tsv current; with
+                           --reason WHY it lowers onto this prover a floor
+                           another prover recorded that the run falls below,
+                           WHY (words, never blank) in its fifth column, as
+                           `trust judge` does, and a WHY that lowers nothing
+                           is said (REASON UNUSED);
                            --try-refused verifies what this host would refuse for
                            memory; --stop-if-narrowed stops before any check when
                            memory would narrow the run. Each check keeps its
@@ -258,7 +282,9 @@ USAGE
                            floor, a raise, a corrected total, a re-base onto this
                            prover), never a lowering; with --reason WHY it lowers
                            onto this prover a floor another prover recorded that
-                           the facts fall below, WHY in its fifth column. A
+                           the facts fall below, WHY (words, never blank) in
+                           its fifth column; a WHY that lowers nothing is said
+                           (REASON UNUSED). A
                            working floor the up-only rule refuses is named
                            LOWERED, and fails. Exit 0 pass, 1 fail or no facts,
                            2 undecided or could not judge, 4 narrowed by memory
@@ -308,6 +334,15 @@ USAGE
                            and demote its channel release to a prerelease
 ";
 
+/// Where `pin-verifier` reads the release's verifier receipts.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PinSource {
+    /// The record a cut's sign step wrote into its `dist/`.
+    Record(std::path::PathBuf),
+    /// The public release `vX.Y.Z` itself.
+    Release(String),
+}
+
 /// A parsed invocation.
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
@@ -318,9 +353,10 @@ pub enum Cmd {
         commit: String,
         out: std::path::PathBuf,
     },
-    /// `pin-verifier <record>`: install.sh's verifier pin from a cut's receipts
-    /// ([`crate::buildplan::linux::pin_verifier`]).
-    PinVerifier(std::path::PathBuf),
+    /// `pin-verifier <record>` or `pin-verifier --from-release <tag>`: install.sh's verifier
+    /// pin from a cut's receipts ([`crate::buildplan::linux::pin_verifier`]) or from the
+    /// public release ([`crate::buildplan::linux::from_release::pin_from_release`]).
+    PinVerifier(PinSource),
     /// `build`: the release bundle, or HEAD's provisional bundle ([`crate::artifact::run_build`]).
     Build,
     Cut {
@@ -350,6 +386,8 @@ pub enum Cmd {
     },
     /// `dev-app`: this checkout as `aterm (dev).app` ([`crate::dev_app`]).
     DevApp(crate::dev_app::Cmd),
+    /// `harness-bump`: the harness versions the release gate asks for ([`crate::harness_versions`]).
+    HarnessBump,
     /// `trust run|judge`: the Trust lane and the judge of its stored facts ([`crate::trust_facts`]).
     Trust(crate::trust_facts::TrustCmd),
     /// `site`: alab.systems brought to a release ([`crate::site`]), which parses its flags.
@@ -464,12 +502,16 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             )),
         },
         "release" => parse_release(&mut it).map(Cmd::Release),
-        "pin-verifier" => match (it.next(), it.next()) {
-            (Some(record), None) if !record.starts_with('-') => {
-                Ok(Cmd::PinVerifier(std::path::PathBuf::from(record)))
+        "pin-verifier" => match (it.next(), it.next(), it.next()) {
+            (Some("--from-release"), Some(tag), None) if !tag.starts_with('-') => {
+                Ok(Cmd::PinVerifier(PinSource::Release(tag.to_string())))
             }
+            (Some(record), None, None) if !record.starts_with('-') => Ok(Cmd::PinVerifier(
+                PinSource::Record(std::path::PathBuf::from(record)),
+            )),
             _ => Err(format!(
-                "pin-verifier takes the one record a cut wrote (dist/{})",
+                "pin-verifier takes `--from-release vX.Y.Z`, or the one record a cut wrote \
+                 (dist/{})",
                 crate::buildplan::linux::PIN_RECORD
             )),
         },
@@ -690,6 +732,13 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             }
             Ok(Cmd::Yank { build, opts })
         }
+        "harness-bump" => match it.next() {
+            None => Ok(Cmd::HarnessBump),
+            Some(extra) => Err(format!(
+                "harness-bump takes no arguments (got {extra:?}): it compares this checkout \
+                 with the previous public release"
+            )),
+        },
         "trust" => crate::trust_facts::parse_cmd(&mut it).map(Cmd::Trust),
         "dev-app" => crate::dev_app::parse(&mut it).map(Cmd::DevApp),
         "site" => Ok(Cmd::Site(it.map(str::to_string).collect())),
@@ -973,9 +1022,15 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             out,
         } => crate::buildplan::linux::run_worker(&repo_root()?, &out, &version, build, &commit)
             .map_err(Error::new),
-        Cmd::PinVerifier(record) => {
+        Cmd::PinVerifier(source) => {
             let root = repo_root()?;
-            let pin = crate::buildplan::linux::pin_verifier(&root, &record).map_err(Error::new)?;
+            let pin = match source {
+                PinSource::Record(record) => crate::buildplan::linux::pin_verifier(&root, &record),
+                PinSource::Release(tag) => {
+                    crate::buildplan::linux::from_release::pin_from_release(&root, &tag)
+                }
+            }
+            .map_err(Error::new)?;
             println!(
                 "pinned {}'s bootstrap verifier from {} into tools/install.sh and {}; commit \
                  both:\n{}",
@@ -1028,6 +1083,7 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             )
         }
         Cmd::Verify { version } => verify::run_verify(&repo_root()?, version),
+        Cmd::HarnessBump => crate::harness_versions::run(&repo_root()?),
         Cmd::Yank { build, opts } => verify::run_yank(&repo_root()?, build, &opts),
         Cmd::Trust(t) => match crate::trust_facts::run_cmd(&repo_root()?, t) {
             0 => Ok(()),

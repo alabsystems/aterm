@@ -101,6 +101,14 @@ one-shot run that booted it died is stopped as `down` stops it, and booted afres
                            (aterm-gui --cpu), each holding the frame aterm presented to the window's pixels as its DC
                            holds them (GetDIBits). Exit 0 pass, 1 a row failed, 3 NOT RUN.
                            Report and screenshots: $LAB_STATE/windows/
+  uia [--arch aarch64|x86_64]... [--record]
+                           what a UI Automation client sees of a windowed aterm-gui per arch (both unless named), in
+                           lane's desktop session through .NET's UIAutomationClient: the window's events while a line
+                           is typed, the focus is taken away and given back, a second tab is opened and the first
+                           selected through the client, and the find bar searches, then its raw view walked (every
+                           element's properties and patterns, each text pattern read), held to the committed record
+                           crates/aterm-lab/windows-uia/<arch>.txt; --record rewrites it. Exit 0 pass, 1 a row failed or
+                           the record differs, 3 NOT RUN. Report and records: $LAB_STATE/windows/
   destroy                  stop the VM and delete it (disk, firmware variables, TPM, key); the images stay cached
 ";
 
@@ -142,6 +150,7 @@ pub fn cmd_windows(args: &[String]) -> Res {
         "exec" => cmd_exec(rest),
         "smoke" => crate::windows_smoke::cmd_smoke(rest),
         "window" => crate::windows_window::cmd_window(rest),
+        "uia" => crate::windows_uia::cmd_uia(rest),
         "destroy" => cmd_destroy(),
         "help" | "-h" | "--help" => {
             print!("{}", USAGE.replace("{rust}", guest::RUST));
@@ -2140,6 +2149,37 @@ pub fn plan_copy(
     (send, remove)
 }
 
+/// The directories removing `remove` empties: each folder above a removed path that holds no
+/// path of `here`, deepest first. Git keeps no empty folder, so the guest's copy keeps none
+/// either: cargo reads an empty folder under a workspace glob (`crates/*`) as a member with
+/// no manifest.
+#[must_use]
+pub fn emptied_dirs(here: &[Entry], remove: &[String]) -> Vec<String> {
+    let mut kept = std::collections::BTreeSet::new();
+    for e in here {
+        let mut path = e.path.as_str();
+        while let Some((dir, _)) = path.rsplit_once('/') {
+            if !kept.insert(dir) {
+                break;
+            }
+            path = dir;
+        }
+    }
+    let mut gone = std::collections::BTreeSet::new();
+    for r in remove {
+        let mut path = r.as_str();
+        while let Some((dir, _)) = path.rsplit_once('/') {
+            if kept.contains(dir) || !gone.insert(dir) {
+                break;
+            }
+            path = dir;
+        }
+    }
+    let mut dirs: Vec<String> = gone.into_iter().map(str::to_string).collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
+    dirs
+}
+
 const GUEST_MANIFEST: &str = r"C:\lane\manifest";
 
 /// Bring the guest's copy of `repo` up to its working tree.
@@ -2204,12 +2244,20 @@ pub fn copy_tree(l: &Layout, ssh: &Ssh, repo: &Path) -> Result<(usize, usize), S
         }
     }
     if !remove.is_empty() {
+        // Files first, then each folder they emptied (a trailing `/`), deepest first; a folder
+        // the guest put anything else in stays.
+        let mut lines = remove.clone();
+        lines.extend(emptied_dirs(&here, &remove).into_iter().map(|d| d + "/"));
         let gone = run_dir.join("copy.remove");
-        std::fs::write(&gone, remove.join("\n")).map_err(|e| e.to_string())?;
+        std::fs::write(&gone, lines.join("\n")).map_err(|e| e.to_string())?;
         let put = ssh.put(&gone, "C:/lane/copy.remove");
         let out = ssh.ps(&format!(
-            "Get-Content -LiteralPath 'C:\\lane\\copy.remove' | ForEach-Object {{ \
-             Remove-Item -LiteralPath (Join-Path {} $_) -Force -ErrorAction SilentlyContinue }}",
+            "Get-Content -LiteralPath 'C:\\lane\\copy.remove' | ForEach-Object {{\n\
+             $p = Join-Path {} $_.TrimEnd('/')\n\
+             if (-not $_.EndsWith('/')) {{ Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }} \
+             elseif ((Test-Path -LiteralPath $p -PathType Container) -and -not (Get-ChildItem -LiteralPath $p -Force)) {{ \
+             Remove-Item -LiteralPath $p -Force }}\n\
+             }}",
             guest::ps_quote(guest::SRC)
         ));
         if !put.ok() || !out.ok() {
@@ -3224,6 +3272,36 @@ mod tests {
         assert_eq!(
             parse_manifest("1 10.0 a b.rs\r\n"),
             BTreeMap::from([("a b.rs".to_string(), (1, "10.0".to_string()))])
+        );
+    }
+
+    #[test]
+    fn a_copy_prunes_the_folders_its_removals_empty_deepest_first() {
+        let e = |p: &str| Entry {
+            path: p.into(),
+            size: 1,
+            mtime: "1.0".into(),
+        };
+        let here = vec![e("Cargo.toml"), e("crates/kept/src/lib.rs"), e("docs/a.md")];
+        let remove: Vec<String> = [
+            "crates/gone/Cargo.toml",
+            "crates/gone/src/lib.rs",
+            "crates/gone/src/deep/mod.rs",
+            "crates/kept/src/old.rs",
+            "docs/b.md",
+            "top.rs",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            emptied_dirs(&here, &remove),
+            ["crates/gone/src/deep", "crates/gone/src", "crates/gone"]
+        );
+        assert!(emptied_dirs(&here, &[]).is_empty());
+        assert_eq!(
+            emptied_dirs(&[], &["a/b/c.rs".to_string()]),
+            ["a/b", "a"],
+            "with nothing kept, every folder goes, the root's own excepted"
         );
     }
 

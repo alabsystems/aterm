@@ -666,7 +666,7 @@ VendorID ProductID Product  Built-In\n\
         let cached_tool = format!("{tooling}/a-tool-used-by-another-build");
         for path in [
             "/Users//alice/Library/Caches",
-            "/Users//alice/Library/Caches/aterm/cargo-build.noindex",
+            "/Users//alice/Library/Caches/aterm/.ubd/cargo-build.noindex",
             tooling,
         ] {
             sys.stat_of(

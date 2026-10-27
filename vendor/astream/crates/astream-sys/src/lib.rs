@@ -34,6 +34,9 @@
 //!   at the same point, without the drain of the drive's cache, which only a power loss
 //!   shows and no test makes. No application sets the mark, and a release build never
 //!   reads it.
+//! - [`flush_tally`]: how many of those three calls this process has made, by kind, so
+//!   a reading around a span of the broker's work counts every flush it asked the OS
+//!   for, whatever the broker's own counts say (astream-broker's benches gate it).
 //! - [`boot_session`]: THIS BOOT of the machine as the kernel names it, as 16 bytes.
 //!   Two readings are equal exactly when no boot came between them, which is the
 //!   question a log that trusts the page cache asks — "has the kernel holding my
@@ -42,6 +45,9 @@
 //!   panic or a power loss give a new one. Apple: `kern.bootsessionuuid`. Linux:
 //!   `/proc/sys/kernel/random/boot_id` (safe `std`). Elsewhere `None`, which the
 //!   broker reads as "a boot it cannot vouch for": the safe direction.
+//!   [`parse_boot_id`] reads a boot id's text as its 16 bytes and [`boot_id_text`]
+//!   writes them back in the kernel's form, so a caller that records a boot as text
+//!   and compares it later holds no UUID writer of its own.
 //! - `socket_hung_up` (Apple only): whether a zero-wait `poll` sees both directions
 //!   of a socket hung up. astream-broker's client asks it only after setting a
 //!   socket's read or write timeout was refused with `EINVAL`
@@ -92,18 +98,23 @@
 //!
 //! aterm depends on this crate directly (astream's `docs/ROADMAP.md`, "What aterm
 //! uses beyond the fabric"). It reads the boot through [`boot_session`] and
-//! [`parse_boot_id`] in aterm-link, aterm-agent, aterm-caffeine, aterm-gui and
+//! [`parse_boot_id`] in aterm-link, aterm-agent, aterm-caffeine, aterm-gui, aterm-uds,
+//! aterm-release (its publisher fence's `fence-boot`, compared as 16 bytes) and
 //! aterm-update (which reads Linux's `boot_id` file itself and judges it with
-//! [`parse_boot_id`]), but not everywhere: aterm-release's publisher fence still
-//! names the boot its own way (Linux's `boot_id` file, else `sysctl -n
-//! kern.boottime`, a wall-clock reading), outside this crate's contract. On Apple
-//! targets every ordered write it makes, to a file or a directory, is finished with
-//! [`barrier_sync`], [`barrier_refused`] telling a volume that takes no barrier from
-//! a failed flush; elsewhere aterm-durable's ordered write is a full flush of its
+//! [`parse_boot_id`]), and writes the boot text it records (aterm-agent's ledger and
+//! tapes, aterm-caffeine's state file, aterm-release's fence, aterm-link's messages)
+//! with [`boot_id_text`]. Outside tests (whose oracle is the kernel's own text), only
+//! aterm-machines reads `kern.bootsessionuuid` otherwise, with a `sysctl -n`
+//! subprocess, to read what its enrollment root script reads. On
+//! Apple targets every ordered write it makes, to a file or a directory, is finished
+//! with [`barrier_sync`], [`barrier_refused`] telling a volume that takes no barrier
+//! from a failed flush; elsewhere aterm-durable's ordered write is a full flush of its
 //! own, not this crate's. aterm-durable's `Flush::dir_best_effort` and aterm-link's
 //! tolerated state-dir flushes go on without a directory's flush exactly where
 //! [`dir_flush_unavailable`] says so, the broker's own rule, and return any other
-//! failure. aterm reaches `fcntl`, `sysctlbyname` and `poll` (the last through
+//! failure. [`file_flush_refused`] classifies refusals from a file's selected flush;
+//! whether a writer accepts one is its own durability policy. aterm reaches `fcntl`,
+//! `sysctlbyname` and `poll` (the last through
 //! astream-broker's client, whose `Closer` it bounds both ways on every dial), and
 //! never installs the `SIGHUP` handler. Its private files are held to
 //! the owner rule: aterm-uds's `private_file` judges each file it reads with
@@ -114,6 +125,7 @@
 
 use std::fs::File;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_vendor = "apple")]
 macro_rules! apple_ffi {
@@ -366,6 +378,7 @@ pub fn test_plain_fsync() -> bool {
 /// # Errors
 /// The flush's own error.
 pub fn full_sync(file: &File) -> io::Result<()> {
+    let _ = FULL_FLUSHES.fetch_add(1, Ordering::Relaxed);
     #[cfg(all(debug_assertions, target_vendor = "apple"))]
     if test_plain_fsync() {
         return apple::plain_fsync(file);
@@ -380,6 +393,7 @@ pub fn full_sync(file: &File) -> io::Result<()> {
 /// # Errors
 /// The flush's own error.
 pub fn full_sync_data(file: &File) -> io::Result<()> {
+    let _ = FULL_FLUSHES.fetch_add(1, Ordering::Relaxed);
     #[cfg(all(debug_assertions, target_vendor = "apple"))]
     if test_plain_fsync() {
         return apple::plain_fsync(file);
@@ -396,6 +410,7 @@ pub fn full_sync_data(file: &File) -> io::Result<()> {
 /// then flushes in full instead. Elsewhere: [`File::sync_data`], a full flush, which
 /// orders everything because it persists everything.
 pub fn barrier_sync(file: &File) -> io::Result<()> {
+    let _ = BARRIERS.fetch_add(1, Ordering::Relaxed);
     #[cfg(target_vendor = "apple")]
     {
         apple::barrier_fsync(file)
@@ -403,6 +418,43 @@ pub fn barrier_sync(file: &File) -> io::Result<()> {
     #[cfg(not(target_vendor = "apple"))]
     {
         file.sync_data()
+    }
+}
+
+/// The [`full_sync`] and [`full_sync_data`] calls this process has made ([`flush_tally`]).
+static FULL_FLUSHES: AtomicU64 = AtomicU64::new(0);
+
+/// The [`barrier_sync`] calls this process has made ([`flush_tally`]).
+static BARRIERS: AtomicU64 = AtomicU64::new(0);
+
+/// How many flushes this process has asked this crate for since it started, by kind
+/// ([`flush_tally`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlushTally {
+    /// [`full_sync`] and [`full_sync_data`] calls.
+    pub full: u64,
+    /// [`barrier_sync`] calls (a full flush off Apple, counted here all the same).
+    pub barrier: u64,
+}
+
+/// The flushes this process has asked this crate for so far: every [`full_sync`] and
+/// [`full_sync_data`] call is one `full`, every [`barrier_sync`] call one `barrier`,
+/// counted as the call begins, whatever it then returns (a barrier the device refuses
+/// is counted, and so is the full flush a caller issues in its place).
+///
+/// It counts calls, not what any caller meant by them. `astream-broker` is
+/// `forbid(unsafe_code)` and finishes every write it makes durable or ordered through
+/// this crate, so two readings around a span of a broker's work count every flush that
+/// work asked for, whether or not the broker's own bookkeeping (its `FlushCounts`)
+/// counted it; a flush through [`File::sync_data`] or [`File::sync_all`] directly is no
+/// call here and escapes the tally. The count is process-wide, so it reads one
+/// caller's flushes alone only in a process where nothing else flushes through this
+/// crate meanwhile: astream-broker's benches, which gate it, run one broker each.
+#[must_use]
+pub fn flush_tally() -> FlushTally {
+    FlushTally {
+        full: FULL_FLUSHES.load(Ordering::Relaxed),
+        barrier: BARRIERS.load(Ordering::Relaxed),
     }
 }
 
@@ -434,15 +486,51 @@ pub fn barrier_refused(err: &io::Error) -> bool {
     }
 }
 
+/// Whether `err`, from a flush of an open handle ([`full_sync`], [`full_sync_data`], a
+/// plain `fsync(2)`, or the full flush a caller issues where [`barrier_refused`] said
+/// the barrier was refused), says the handle's file or volume cannot be flushed at all,
+/// rather than that a flush failed: `Unsupported` or `InvalidInput` by kind everywhere,
+/// and on Apple the errnos a volume answers a flush `fcntl` it cannot take with
+/// ([`is_apple_barrier_refused_errno`]: `F_FULLFSYNC` is refused as `F_BARRIERFSYNC`
+/// is). Darwin's `ENOTSUP` is 45 and its `EOPNOTSUPP` 102, and std reads only the second
+/// as `Unsupported`, so the kind alone misses the usual refusal.
+///
+/// A refused flush leaves the bytes where they were, in the page cache: a crash of the
+/// process loses none of them, a power loss may. Any other error (`EIO`, `ENOSPC`, ...)
+/// is a failed flush, handled as a failed `fsync` is: a later flush that succeeds says
+/// nothing about what the failed one was to cover.
+///
+/// This is the classification only. A writer whose promise rests on the flush refuses
+/// either way; one that can go on where its volume takes no flush (a mark whose loss
+/// costs a repeat) goes on exactly where this says so. [`dir_flush_unavailable`] is this
+/// rule for a directory's handle, and more.
+#[must_use]
+pub fn file_flush_refused(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+    ) {
+        return true;
+    }
+    // Plain errno numbers, not FFI, as in `barrier_refused`.
+    #[cfg(target_vendor = "apple")]
+    {
+        err.raw_os_error()
+            .is_some_and(is_apple_barrier_refused_errno)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        false
+    }
+}
+
 /// Whether `err`, from opening a directory or from a full flush of its handle
 /// ([`full_sync`]), says the directory's entries simply cannot be flushed here, rather
 /// than that a flush failed:
 ///
-/// - a filesystem that refuses to flush a directory handle: `Unsupported` or
-///   `InvalidInput`, and on Apple the errnos a volume answers a flush `fcntl` it cannot
-///   take with ([`is_apple_barrier_refused_errno`]: `F_FULLFSYNC` is refused as
-///   `F_BARRIERFSYNC` is). Darwin's `ENOTSUP` is 45 and its `EOPNOTSUPP` 102, and std
-///   reads only the second as `Unsupported`, so the kind alone misses the usual refusal;
+/// - a filesystem that refuses to flush a directory handle ([`file_flush_refused`]:
+///   `Unsupported` or `InvalidInput`, and on Apple the refusal errnos, Darwin's `ENOTSUP`
+///   among them);
 /// - a directory this process may write but not OPEN (`PermissionDenied`): a
 ///   write-only `0300` directory, where opening a file inside it is allowed;
 /// - a directory that is gone by the time it is opened (`NotFound`).
@@ -457,25 +545,10 @@ pub fn barrier_refused(err: &io::Error) -> bool {
 /// writer whose promise rests on that flush refuses instead.
 #[must_use]
 pub fn dir_flush_unavailable(err: &io::Error) -> bool {
-    if matches!(
+    matches!(
         err.kind(),
-        io::ErrorKind::Unsupported
-            | io::ErrorKind::InvalidInput
-            | io::ErrorKind::PermissionDenied
-            | io::ErrorKind::NotFound
-    ) {
-        return true;
-    }
-    // Plain errno numbers, not FFI, as in `barrier_refused`.
-    #[cfg(target_vendor = "apple")]
-    {
-        err.raw_os_error()
-            .is_some_and(is_apple_barrier_refused_errno)
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        false
-    }
+        io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+    ) || file_flush_refused(err)
 }
 
 /// This boot's id as 16 bytes, or `None` where this host cannot read one (or reads
@@ -618,11 +691,12 @@ pub const fn scan_boot_id_words(raw: &[u8]) -> Option<(u64, u64)> {
 }
 
 /// The kernel's boot id text as 16 bytes: the bytes up to a NUL, whitespace trimmed,
-/// then exactly 32 hexadecimal digits once the hyphens of the UUID form are dropped
-/// (either case). Anything else — empty, too short or long, a stray character — is
-/// `None`, and so is the all-zero id, which a log's identity sidecar reserves for "the
-/// boot is unknown": a damaged answer must never pass as a boot, because two equal
-/// damaged answers would read as "no reboot came between them".
+/// then exactly 32 hexadecimal digits (either case) once every hyphen is dropped,
+/// wherever it falls: the UUID form's four, none, or any others between the digits.
+/// Anything else — empty, too short or long, a stray character — is `None`, and so is
+/// the all-zero id, which a log's identity sidecar reserves for "the boot is unknown":
+/// a damaged answer must never pass as a boot, because two equal damaged answers would
+/// read as "no reboot came between them". [`boot_id_text`] is its inverse.
 #[must_use]
 #[allow(clippy::question_mark)]
 pub fn parse_boot_id(raw: &[u8]) -> Option<[u8; 16]> {
@@ -634,6 +708,36 @@ pub fn parse_boot_id(raw: &[u8]) -> Option<[u8; 16]> {
     } else {
         None
     }
+}
+
+/// Whether this host's kernel spells its boot id in lower-case hex: Linux's and
+/// Android's `/proc/sys/kernel/random/boot_id` do; Apple's `kern.bootsessionuuid`
+/// does not.
+pub const KERNEL_SPELLS_BOOT_ID_LOWER: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
+/// A boot id as text, the inverse of [`parse_boot_id`]: its 32 hex digits hyphenated
+/// 8-4-4-4-12, the kernel's own form, lower-case when `lower` and upper-case otherwise.
+/// [`KERNEL_SPELLS_BOOT_ID_LOWER`] is the case this host's kernel answers in, so
+/// `boot_id_text(id, KERNEL_SPELLS_BOOT_ID_LOWER)` is the text the kernel answered for
+/// the [`boot_session`] that read `id`. For every id but the reserved all-zero one,
+/// `parse_boot_id(boot_id_text(id, lower).as_bytes()) == Some(id)`, in either case.
+#[must_use]
+pub fn boot_id_text(id: [u8; 16], lower: bool) -> String {
+    let digits: &[u8; 16] = if lower {
+        b"0123456789abcdef"
+    } else {
+        b"0123456789ABCDEF"
+    };
+    let mut text = String::with_capacity(36);
+    for (at, byte) in id.into_iter().enumerate() {
+        if matches!(at, 4 | 6 | 8 | 10) {
+            text.push('-');
+        }
+        for nibble in [byte >> 4, byte & 0x0F] {
+            text.push(char::from(digits[usize::from(nibble)]));
+        }
+    }
+    text
 }
 
 /// This process's effective user id: the owner [`owner_private`] holds a file to.
@@ -882,6 +986,71 @@ mod tests {
         }
     }
 
+    /// The digits are the id: a hyphen is dropped wherever it falls, so the bare 32 digits
+    /// and a misplaced hyphen read as the same boot as the 8-4-4-4-12 form.
+    #[test]
+    fn a_hyphen_is_dropped_wherever_it_falls() {
+        let want = parse_boot_id(ID.as_bytes()).expect("the UUID form");
+        let bare: String = ID.chars().filter(|c| *c != '-').collect();
+        let misplaced = format!("-{}-{}-", &bare[..1], &bare[1..]);
+        for spelled in [
+            bare.as_str(),
+            misplaced.as_str(),
+            "64C7D12D5B0E4F439A1C2E7F00D1A9B3--",
+        ] {
+            assert_eq!(parse_boot_id(spelled.as_bytes()), Some(want), "{spelled:?}");
+        }
+    }
+
+    /// The writer is the reader's inverse: the kernel's 8-4-4-4-12 form, in the case asked,
+    /// read back as the same 16 bytes; and this host's own reading, written in the case its
+    /// kernel spells it, is the text the kernel answers (compared, case and all, with the
+    /// kernel's own text where this test can read it without FFI: Linux's `boot_id` file).
+    #[test]
+    fn the_written_boot_id_reads_back_as_the_same_bytes() {
+        let id = parse_boot_id(ID.as_bytes()).expect("the UUID form");
+        assert_eq!(boot_id_text(id, false), ID);
+        assert_eq!(boot_id_text(id, true), ID.to_lowercase());
+        let mut last = id;
+        last[15] ^= 1;
+        for one in [
+            id,
+            last,
+            [0xFF; 16],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        ] {
+            for lower in [false, true] {
+                let text = boot_id_text(one, lower);
+                assert_eq!(text.len(), 36, "{text}");
+                let hyphens: Vec<usize> = text.match_indices('-').map(|(at, _)| at).collect();
+                assert_eq!(hyphens, [8, 13, 18, 23], "{text}");
+                let letters_lower = text
+                    .bytes()
+                    .filter(u8::is_ascii_alphabetic)
+                    .all(|b| b.is_ascii_lowercase());
+                let letters_upper = text
+                    .bytes()
+                    .filter(u8::is_ascii_alphabetic)
+                    .all(|b| b.is_ascii_uppercase());
+                assert!(if lower { letters_lower } else { letters_upper }, "{text}");
+                assert_eq!(parse_boot_id(text.as_bytes()), Some(one), "{text}");
+            }
+        }
+        // The reserved all-zero id is written like any other and still reads as no boot.
+        assert_eq!(parse_boot_id(boot_id_text([0; 16], false).as_bytes()), None);
+
+        #[cfg(target_os = "linux")]
+        if let (Some(live), Ok(kernel)) = (
+            boot_session(),
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id"),
+        ) {
+            assert_eq!(
+                boot_id_text(live, KERNEL_SPELLS_BOOT_ID_LOWER),
+                kernel.trim()
+            );
+        }
+    }
+
     /// The live reading, where this host has one: stable within a process (no boot can
     /// come between two calls of one test), and never the reserved all-zero id.
     #[test]
@@ -922,27 +1091,65 @@ mod tests {
         ] {
             assert!(dir_flush_unavailable(&io::Error::from(kind)), "{kind:?}");
         }
-        // EACCES, ENOENT, EINVAL by number.
-        for errno in [13, 2, 22] {
+        // POSIX errno numbers are not Win32 error codes.
+        #[cfg(unix)]
+        {
+            // EACCES, ENOENT, EINVAL.
+            for errno in [13, 2, 22] {
+                let e = io::Error::from_raw_os_error(errno);
+                assert!(dir_flush_unavailable(&e), "{e}");
+            }
+            // EIO and ENOSPC are failed flushes.
+            for errno in [5, 28] {
+                let e = io::Error::from_raw_os_error(errno);
+                assert!(!dir_flush_unavailable(&e), "{e}");
+            }
+        }
+        // Darwin's ENOTSUP, EOPNOTSUPP, ENODEV and ENOTTY.
+        #[cfg(target_vendor = "apple")]
+        for errno in [45, 102, 19, 25] {
             let e = io::Error::from_raw_os_error(errno);
             assert!(dir_flush_unavailable(&e), "{e}");
         }
-        // Darwin's ENOTSUP, ENODEV and ENOTTY: refusals on Apple only (elsewhere the
-        // numbers name other errors).
-        for errno in [45, 19, 25] {
-            let e = io::Error::from_raw_os_error(errno);
-            assert_eq!(
-                dir_flush_unavailable(&e),
-                cfg!(target_vendor = "apple"),
-                "{e}"
-            );
-        }
-        // EIO and ENOSPC are failed flushes everywhere.
-        for errno in [5, 28] {
-            let e = io::Error::from_raw_os_error(errno);
-            assert!(!dir_flush_unavailable(&e), "{e}");
-        }
+        assert!(!dir_flush_unavailable(&io::Error::from(
+            io::ErrorKind::StorageFull
+        )));
         assert!(!dir_flush_unavailable(&io::Error::other("not an errno")));
+    }
+
+    /// A file's flush that its volume refuses is refused, on every platform by its kind and
+    /// on Apple by Darwin's own refusal errnos too; a real I/O failure never is, and
+    /// neither is what only a directory's open answers (`PermissionDenied`, `NotFound`),
+    /// which [`dir_flush_unavailable`] adds to it.
+    #[test]
+    fn a_refused_file_flush_is_its_kinds_and_apples_errnos_and_eio_is_not() {
+        for kind in [io::ErrorKind::Unsupported, io::ErrorKind::InvalidInput] {
+            assert!(file_flush_refused(&io::Error::from(kind)), "{kind:?}");
+        }
+        // POSIX errno numbers are not Win32 error codes.
+        #[cfg(unix)]
+        {
+            // EINVAL is a refusal; EIO, ENOSPC, EACCES and ENOENT are not.
+            assert!(file_flush_refused(&io::Error::from_raw_os_error(22)));
+            for errno in [5, 28, 13, 2] {
+                let e = io::Error::from_raw_os_error(errno);
+                assert!(!file_flush_refused(&e), "{e}");
+            }
+        }
+        // Darwin's ENOTSUP, EOPNOTSUPP, ENODEV and ENOTTY.
+        #[cfg(target_vendor = "apple")]
+        for errno in [45, 102, 19, 25] {
+            let e = io::Error::from_raw_os_error(errno);
+            assert!(file_flush_refused(&e), "{e}");
+        }
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::NotFound] {
+            assert!(!file_flush_refused(&io::Error::from(kind)), "{kind:?}");
+            assert!(dir_flush_unavailable(&io::Error::from(kind)), "{kind:?}");
+        }
+        assert!(!file_flush_refused(&io::Error::from(
+            io::ErrorKind::StorageFull
+        )));
+        assert!(!file_flush_refused(&io::Error::other("not an errno")));
     }
 
     /// On Apple a descriptor that is no file on a volume refuses the full flush with an
@@ -953,6 +1160,7 @@ mod tests {
     fn apples_refusal_of_a_full_flush_reads_as_unavailable() {
         let null = File::open("/dev/null").unwrap();
         let refused = null.sync_all().expect_err("/dev/null takes no F_FULLFSYNC");
+        assert!(file_flush_refused(&refused), "{refused:?}");
         assert!(dir_flush_unavailable(&refused), "{refused:?}");
         assert!(
             !matches!(
@@ -964,6 +1172,43 @@ mod tests {
             ),
             "CONTROL: the kind alone names this refusal ({refused:?}); the errno half is untested"
         );
+    }
+
+    /// Each flush call raises its own kind's count as it begins, whatever it returns. Other
+    /// tests of this binary flush meanwhile, so a count only rises by at least what this
+    /// test asked for; one that missed a call, or counted it as the other kind, falls short
+    /// unless a test running beside it made up the difference.
+    #[test]
+    fn the_tally_counts_each_flush_call_by_its_kind() {
+        let dir = std::env::temp_dir().join(format!("astream-sys-tally-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tally");
+        let mut f = File::create(&path).unwrap();
+        std::io::Write::write_all(&mut f, b"counted").unwrap();
+        let before = flush_tally();
+        let full = full_sync(&f).and_then(|()| full_sync_data(&f));
+        let after_full = flush_tally();
+        let barrier = barrier_sync(&f);
+        let after = flush_tally();
+        let _ = std::fs::remove_dir_all(&dir);
+        full.unwrap();
+        barrier.unwrap();
+        assert!(
+            after_full.full >= before.full + 2,
+            "{before:?} -> {after_full:?}"
+        );
+        assert!(
+            after.barrier > after_full.barrier,
+            "{after_full:?} -> {after:?}"
+        );
+        #[cfg(target_vendor = "apple")]
+        {
+            // A barrier the device refuses is a call all the same.
+            let null = File::open("/dev/null").unwrap();
+            let at = flush_tally();
+            assert!(barrier_sync(&null).is_err_and(|e| barrier_refused(&e)));
+            assert!(flush_tally().barrier > at.barrier);
+        }
     }
 
     #[test]

@@ -1383,7 +1383,7 @@ pub fn remove_fabric_table(text: &str) -> Result<(String, Vec<String>), String> 
 }
 
 pub(crate) use aterm_uds::atomic_file::{
-    create_temp_beside, write as write_atomic, ConfigFile, LOCK_OPEN_FLAGS,
+    create_temp_beside, write as write_atomic, ConfigFile, EditLanded, LOCK_OPEN_FLAGS,
 };
 
 /// `n` random bytes through the one audited entropy helper (`aterm_uds::rand`).
@@ -1555,11 +1555,17 @@ fn mint_caps(p: &Paths, node: &str) -> Result<usize, String> {
     result
 }
 
-/// The step lines, printed as they happen.
+/// The step lines, printed as they happen, or kept for a caller that reports them its own way
+/// ([`Self::kept`]).
 pub(crate) struct Out {
     pub(crate) dry_run: bool,
     pub(crate) changed: usize,
     pub(crate) failed: bool,
+    /// The WARNING lines said ([`Self::warn`]).
+    #[cfg(test)]
+    pub(crate) warned: std::cell::Cell<usize>,
+    /// Where the lines go in place of stdout, each as `name verdict detail`.
+    kept: Option<std::cell::RefCell<Vec<String>>>,
 }
 
 impl Out {
@@ -1568,10 +1574,34 @@ impl Out {
             dry_run,
             changed: 0,
             failed: false,
+            #[cfg(test)]
+            warned: std::cell::Cell::new(0),
+            kept: None,
         }
     }
 
+    /// An `Out` that changes things (not a dry run) and keeps its lines ([`Self::said`]) rather
+    /// than print them.
+    pub(crate) fn kept() -> Self {
+        Self {
+            kept: Some(std::cell::RefCell::new(Vec::new())),
+            ..Self::new(false)
+        }
+    }
+
+    /// The lines a [`Self::kept`] `Out` kept, joined by `; `.
+    pub(crate) fn said(&self) -> String {
+        self.kept
+            .as_ref()
+            .map(|kept| kept.borrow().join("; "))
+            .unwrap_or_default()
+    }
+
     pub(crate) fn line(&self, name: &str, verdict: &str, detail: &str) {
+        if let Some(kept) = &self.kept {
+            kept.borrow_mut().push(format!("{name} {verdict} {detail}"));
+            return;
+        }
         let mut out = io::stdout().lock();
         let _ = writeln!(out, "  {name:<11} {verdict:<9} {detail}");
         let _ = out.flush();
@@ -1594,6 +1624,8 @@ impl Out {
 
     /// Something the operator has to know that is not this run's failure.
     pub(crate) fn warn(&self, name: &str, detail: &str) {
+        #[cfg(test)]
+        self.warned.set(self.warned.get() + 1);
         self.line(name, "WARNING", detail);
     }
 
@@ -1663,23 +1695,55 @@ fn config_step(config: Option<&Path>, command: &[String], out: &mut Out) -> bool
     if out.dry_run {
         return true;
     }
-    match file.lock().and_then(|edit| edit.replace(&new_text)) {
-        Ok(bak) => {
-            out.ok(
-                "config",
-                &format!(
-                    "{did} [fabric] command in {}{}",
-                    config.display(),
-                    bak.map_or_else(String::new, |b| format!(
-                        " (previous saved as {})",
-                        b.display()
-                    ))
-                ),
-            );
-            true
-        }
-        Err(e) => fail(out, &e),
+    said_replaced(
+        out,
+        config,
+        file.lock().and_then(|edit| edit.replace(&new_text)),
+        |saved| format!("{did} [fabric] command in {}{saved}", config.display()),
+    )
+}
+
+/// What a `[fabric]` edit of aterm.toml (`replaced`, from `ConfigEdit::replace`) did, said on
+/// `out` as `config`'s step, with `did` naming it beside where the previous text was saved:
+/// `true` when the edit is in effect.
+///
+/// An edit whose directory flush failed after its rename ([`EditLanded`]) is in effect: the
+/// step is ok, beside a WARNING that a power loss may take it back, and the run goes on. A
+/// FAILED would have the operator believe aterm.toml unchanged while its `[fabric]` table
+/// was what the next start reads.
+fn said_replaced(
+    out: &mut Out,
+    config: &Path,
+    replaced: io::Result<Option<PathBuf>>,
+    did: impl FnOnce(&str) -> String,
+) -> bool {
+    let (bak, unflushed) = match replaced {
+        Ok(bak) => (bak, None),
+        Err(e) => match EditLanded::of(&e) {
+            Some(landed) => (landed.bak.clone(), Some(landed.flush.to_string())),
+            None => {
+                out.fail("config", &format!("{}: {e}", config.display()));
+                return false;
+            }
+        },
+    };
+    out.ok(
+        "config",
+        &did(&bak.map_or_else(String::new, |b| {
+            format!(" (previous saved as {})", b.display())
+        })),
+    );
+    if let Some(flush) = unflushed {
+        out.warn(
+            "config",
+            &format!(
+                "the edit is in effect, but flushing {}'s folder failed, so a power loss may \
+                 take it back: {flush}",
+                config.display()
+            ),
+        );
     }
+    true
 }
 
 fn root_step(p: &Paths, state: &Path, out: &mut Out) -> bool {
@@ -2367,6 +2431,208 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
                 }
             }
         }
+    }
+}
+
+/// What [`renew_replaced_broker`] found, and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokerRenewal {
+    /// No `[fabric] command`: the fabric is off, and nothing of it was read or changed.
+    Off,
+    /// The broker runs the build on disk, or none holds its socket now (`aterm fabric` says
+    /// why): what was found.
+    Current(String),
+    /// The broker runs a build an update replaced, and `aterm fabric on`'s job does not keep it
+    /// (the person runs it: `--service none`, or a broker that is not the job `on` installed;
+    /// or the command names another socket than its root's): it is left as it is, and why.
+    Kept(String),
+    /// The broker runs a build an update replaced, and a look ([`Renew::Look`]) leaves it: which.
+    Due(String),
+    /// It ran a replaced build, and `aterm fabric on`'s broker step renewed it: what that step
+    /// said.
+    Renewed(String),
+}
+
+/// Whether [`renew_replaced_broker`] renews a broker that runs a replaced build, or only looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renew {
+    /// Read, and change nothing.
+    Look,
+    /// Renew it with `aterm fabric on`'s broker step.
+    Apply,
+}
+
+/// The fabric root `[fabric] command` names, as `aterm fabric on` would resolve it, and its
+/// broker as the report names it.
+struct Found {
+    p: Paths,
+    /// The root's node id; `None` where it holds none (the step then cannot run).
+    node: Option<String>,
+    /// The supervisor `on`'s installed job names; [`Service::None`] where it installed none.
+    service: Service,
+    /// The pid that job runs now; `None` where it is not loaded or not running.
+    job: Option<u32>,
+    view: fabric::BrokerView,
+}
+
+/// Renew this Mac's fabric broker where it runs a build an update replaced, with `aterm fabric
+/// on`'s broker step alone (its job (re)started as `on` restarts it, then waited for), nothing
+/// else of `on`: the converge pass's `sync.fabric`. Where `[fabric] command` is unset nothing is
+/// read and nothing changes, so it never turns the fabric on; a broker the person keeps
+/// (`--service none`, or one that is not the job `on` installed), or one at another socket than
+/// the command's root's, is left as it is. [`Renew::Look`] reads alone.
+///
+/// # Errors
+/// aterm.toml, the root's role or installed job, or the command cannot be read, or the step
+/// failed (what it said).
+pub fn renew_replaced_broker(renew: Renew) -> Result<BrokerRenewal, String> {
+    renew_with(configured_command()?, renew, look_at, step_on)
+}
+
+/// The configured fabric command as the app reads it (`[fabric] command` in aterm.toml), `None`
+/// where there is no file or no command.
+fn configured_command() -> Result<Option<Vec<String>>, String> {
+    Ok(fabric::resolve_command(
+        fabric::command_seam().as_deref(),
+        fabric::config_path().as_deref(),
+    )?
+    .map(|(_, command)| command))
+}
+
+/// [`renew_replaced_broker`] over the configured `command`, with `look` resolving its root and
+/// naming its broker, and `step` running the broker step: nothing is looked at without a
+/// command, and the step runs only to [`Renew::Apply`] a replaced broker `on`'s job keeps.
+fn renew_with(
+    command: Option<Vec<String>>,
+    renew: Renew,
+    look: impl FnOnce(&[String]) -> Result<Found, String>,
+    step: impl FnOnce(&Found) -> Result<String, String>,
+) -> Result<BrokerRenewal, String> {
+    let Some(command) = command else {
+        return Ok(BrokerRenewal::Off);
+    };
+    let found = look(&command)?;
+    let pid = found
+        .view
+        .pid
+        .map_or_else(|| "-".to_string(), |pid| pid.to_string());
+    let Some(exe) = found.view.replaced.as_deref() else {
+        return Ok(BrokerRenewal::Current(match found.view.pid {
+            Some(_) => format!("the broker (pid {pid}) runs the build on disk"),
+            None => format!(
+                "no broker holds {} now (`aterm fabric` says why)",
+                safe(&found.view.endpoint, 256)
+            ),
+        }));
+    };
+    let which = format!(
+        "the broker (pid {pid}) runs a replaced build ({} is another file now)",
+        safe(exe, 256)
+    );
+    if let Some(why) = kept(&found) {
+        return Ok(BrokerRenewal::Kept(format!("{which}; {why}")));
+    }
+    match renew {
+        Renew::Look => Ok(BrokerRenewal::Due(which)),
+        Renew::Apply => step(&found).map(BrokerRenewal::Renewed),
+    }
+}
+
+/// Why `on`'s broker step leaves `found`'s broker as it is, where it does: no job of `on`'s, a
+/// socket other than its root's, or a broker that is not the process `on`'s job runs (one the
+/// person started by hand, with that job not loaded or running another process), which the step
+/// would refuse as unmanaged, or start the job over.
+fn kept(found: &Found) -> Option<String> {
+    if found.service == Service::None {
+        return Some(
+            "no job of `aterm fabric on`'s keeps it (it runs as `--service none`): restart it \
+             yourself"
+                .to_string(),
+        );
+    }
+    let sock = found.p.sock();
+    if found.view.endpoint != sock {
+        return Some(format!(
+            "[fabric] command names {}, not its root's {sock}: `aterm fabric on` renews it",
+            safe(&found.view.endpoint, 256)
+        ));
+    }
+    (found.view.pid != found.job).then(|| {
+        let job = found.job.map_or_else(
+            || "is not running".to_string(),
+            |pid| format!("runs pid {pid}"),
+        );
+        format!(
+            "it is not the job `aterm fabric on` installed ({} {job}): you run it, so restart it \
+             yourself, or stop it and run `aterm fabric on`",
+            found.p.label()
+        )
+    })
+}
+
+/// The root `command` points into, resolved as `on` resolves it (fleet, durability and node
+/// kept), its broker named as `aterm fabric` names it (the process holding the socket and
+/// whether an update replaced its build), and the pid the job `on` installed runs now. Nothing
+/// connects to it. The program is the one the installed job runs, not `on`'s (the `aterm` on
+/// `$PATH`): the renewal restarts the job onto the file an update put at its path and never
+/// points it at another aterm, so the plist `on` wrote stays as it is.
+fn look_at(command: &[String]) -> Result<Found, String> {
+    let cfg = fabric::bridge_config(command)?;
+    let mut p = Paths::resolve(None)?;
+    if let Some(root) = root_of(&cfg.broker) {
+        p.root = root;
+    }
+    if let Some(fleet) = Role::of(&p).map_err(|e| e.to_string())?.fleet() {
+        p.fleet = fleet.to_string();
+    }
+    p.durability = kept_durability(&p)?.0;
+    let node = read_node(&p.state());
+    let service = match installed_job(&p).map_err(|e| e.to_string())? {
+        Some((service, argv)) => {
+            if let Some(program) = argv.into_iter().next() {
+                p.aterm = program;
+            }
+            service
+        }
+        None => Service::None,
+    };
+    let job = match service {
+        Service::Launchd => match launchd_job(&p.label()) {
+            LaunchdJob::Loaded(pid) => pid,
+            LaunchdJob::Absent | LaunchdJob::NoGuiLogin => None,
+        },
+        Service::Systemd => systemd_main_pid(&p.label()),
+        Service::None => None,
+    };
+    let mut view = fabric::BrokerView {
+        endpoint: cfg.broker,
+        ..fabric::BrokerView::default()
+    };
+    view.locate();
+    Ok(Found {
+        p,
+        node,
+        service,
+        job,
+        view,
+    })
+}
+
+/// `aterm fabric on`'s broker step over `found`, its lines kept: what it said, an error where it
+/// failed.
+fn step_on(found: &Found) -> Result<String, String> {
+    let node = found.node.as_deref().ok_or_else(|| {
+        format!(
+            "{} holds no node id: `aterm fabric on` provisions one",
+            found.p.state().display()
+        )
+    })?;
+    let mut out = Out::kept();
+    let ok = broker_step(&found.p, node, found.service, false, &mut out);
+    if ok {
+        Ok(out.said())
+    } else {
+        Err(out.said())
     }
 }
 
@@ -3275,20 +3541,12 @@ fn off_config_step(config: Option<&Path>, out: &mut Out) {
     if out.dry_run {
         return;
     }
-    match file.lock().and_then(|edit| edit.replace(&new_text)) {
-        Ok(bak) => out.ok(
-            "config",
-            &format!(
-                "{headers} removed from {}{}",
-                config.display(),
-                bak.map_or_else(String::new, |b| format!(
-                    " (previous saved as {})",
-                    b.display()
-                ))
-            ),
-        ),
-        Err(e) => fail(out, &e),
-    }
+    said_replaced(
+        out,
+        config,
+        file.lock().and_then(|edit| edit.replace(&new_text)),
+        |saved| format!("{headers} removed from {}{saved}", config.display()),
+    );
 }
 
 /// `aterm fabric off`.
@@ -4197,6 +4455,145 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
 mod tests {
     use super::*;
 
+    /// A [`Found`] of a root under a path nothing holds, its broker (pid 4242) at the root's own
+    /// socket, kept by `service`'s job (which runs it), an update having replaced its build
+    /// where `replaced` says.
+    fn found(service: Service, replaced: Option<&str>) -> Found {
+        let p = Paths {
+            home: PathBuf::from("/nonexistent/home"),
+            login_home: None,
+            root: PathBuf::from("/nonexistent/home/.local/share/aterm-fabric"),
+            aterm: "/nonexistent/bin/aterm".to_string(),
+            fleet: DEFAULT_FLEET.to_string(),
+            config: None,
+            rendezvous: None,
+            durability: None,
+        };
+        Found {
+            view: fabric::BrokerView {
+                endpoint: p.sock(),
+                pid: Some(4242),
+                replaced: replaced.map(str::to_string),
+                ..fabric::BrokerView::default()
+            },
+            p,
+            node: Some("n-0123456789abcdef".to_string()),
+            job: (service != Service::None).then_some(4242),
+            service,
+        }
+    }
+
+    /// The converge pass's broker renewal: with no `[fabric] command` nothing is looked at and
+    /// nothing runs; a broker on the build on disk reads current; one on a replaced build that
+    /// `on`'s job keeps is renewed once by the broker step (a look leaves it due); one the person
+    /// keeps (`--service none`, or one started by hand that is not the process `on`'s job runs,
+    /// with that job not loaded or running another), or at another socket, is left as it is.
+    /// NEGATIVE CONTROLS: a renewal that reads no command as due runs the step with the fabric
+    /// off; one that takes any broker of a root with `on`'s job for that job's steps a broker
+    /// the person started by hand.
+    #[test]
+    fn a_broker_is_renewed_only_where_the_fabric_is_on_and_it_runs_a_replaced_build() {
+        use std::cell::Cell;
+        let command = || Some(words("aterm link serve --broker /nonexistent/bus.sock"));
+        let (looks, steps) = (Cell::new(0), Cell::new(0));
+        let renew = |command: Option<Vec<String>>, renew: Renew, at: Found| {
+            renew_with(
+                command,
+                renew,
+                |_: &[String]| {
+                    looks.set(looks.get() + 1);
+                    Ok(at)
+                },
+                |_: &Found| {
+                    steps.set(steps.get() + 1);
+                    Ok("broker done (re)started launchd".to_string())
+                },
+            )
+        };
+        let off = renew(
+            None,
+            Renew::Apply,
+            found(Service::Launchd, Some("/old/aterm")),
+        );
+        assert_eq!(off, Ok(BrokerRenewal::Off));
+        assert_eq!(
+            (looks.get(), steps.get()),
+            (0, 0),
+            "absent: nothing read or run"
+        );
+
+        let current = renew(command(), Renew::Apply, found(Service::Launchd, None));
+        assert!(
+            matches!(current, Ok(BrokerRenewal::Current(_))),
+            "{current:?}"
+        );
+        assert_eq!((looks.get(), steps.get()), (1, 0), "current: no step");
+
+        let due = renew(
+            command(),
+            Renew::Look,
+            found(Service::Launchd, Some("/old/aterm")),
+        );
+        assert!(matches!(due, Ok(BrokerRenewal::Due(_))), "{due:?}");
+        assert_eq!(steps.get(), 0, "a look runs no step");
+
+        let renewed = renew(
+            command(),
+            Renew::Apply,
+            found(Service::Launchd, Some("/old/aterm")),
+        );
+        assert_eq!(
+            renewed,
+            Ok(BrokerRenewal::Renewed(
+                "broker done (re)started launchd".to_string()
+            ))
+        );
+        assert_eq!(steps.get(), 1, "replaced: one renewal");
+
+        let theirs = renew(
+            command(),
+            Renew::Apply,
+            found(Service::None, Some("/old/aterm")),
+        );
+        assert!(matches!(theirs, Ok(BrokerRenewal::Kept(_))), "{theirs:?}");
+        let mut elsewhere = found(Service::Launchd, Some("/old/aterm"));
+        elsewhere.view.endpoint = "/elsewhere/bus.sock".to_string();
+        let elsewhere = renew(command(), Renew::Apply, elsewhere);
+        assert!(
+            matches!(elsewhere, Ok(BrokerRenewal::Kept(_))),
+            "{elsewhere:?}"
+        );
+        for job in [None, Some(4343)] {
+            let mut by_hand = found(Service::Launchd, Some("/old/aterm"));
+            by_hand.job = job;
+            let by_hand = renew(command(), Renew::Apply, by_hand);
+            assert!(
+                matches!(&by_hand, Ok(BrokerRenewal::Kept(why)) if why.contains("not the job")),
+                "{job:?}: {by_hand:?}"
+            );
+        }
+        assert_eq!(steps.get(), 1, "a broker the person keeps is left as it is");
+    }
+
+    /// A kept `Out` prints nothing and hands back what it said; a step it ran without a node id
+    /// fails, naming the remedy.
+    #[test]
+    fn a_kept_out_hands_back_its_lines_and_a_root_with_no_node_is_not_stepped() {
+        let mut out = Out::kept();
+        out.already("plist", "/x.plist");
+        out.done("broker", "would restart", "restarted");
+        assert_eq!(out.said(), "plist already /x.plist; broker done restarted");
+        let mut nodeless = found(Service::Launchd, Some("/old/aterm"));
+        nodeless.node = None;
+        let refused = step_on(&nodeless);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains("`aterm fabric on` provisions one")),
+            "{refused:?}"
+        );
+    }
+
     fn words(line: &str) -> Vec<String> {
         aterm_types::fabric_command::split_line(line)
     }
@@ -5044,6 +5441,57 @@ mod tests {
         assert!(remove_fabric_table(in_a_string).is_err());
         assert!(remove_fabric_table("fabric.command = \"x\"\n").is_err());
         assert!(remove_fabric_table("fabric = { command = \"x\" }\n").is_err());
+    }
+
+    /// A `[fabric]` edit whose folder flush fails after its rename is in effect: `on`'s and
+    /// `off`'s config steps say ok beside a WARNING, not FAILED, and the run goes on. A flush
+    /// that fails before the edit (its `.bak`'s) still fails the step, aterm.toml unchanged.
+    /// With every replace error said as FAILED, as before, the step returned false.
+    #[test]
+    fn an_edit_in_effect_whose_folder_flush_failed_is_ok_beside_a_warning() {
+        use aterm_durable::seam::{FailingDirs, EIO};
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let config = dir.path().join("aterm.toml");
+        std::fs::write(&config, "font_px = 12.0\n").expect("seed");
+        let command = |config: &Path| {
+            fabric::command_in_toml(&std::fs::read_to_string(config).expect("config"))
+        };
+        let cmd = &words("aterm link serve --fleet local --broker /b.sock");
+
+        let mut on = Out::new(false);
+        {
+            let _edits = FailingDirs::after(1, EIO);
+            assert!(config_step(Some(&config), cmd, &mut on), "the step is done");
+        }
+        assert!(!on.failed, "nothing FAILED");
+        assert_eq!(
+            on.warned.get(),
+            1,
+            "one WARNING: a power loss may take it back"
+        );
+        assert_eq!(
+            command(&config),
+            Ok(Some(cmd.clone())),
+            "the edit is in effect"
+        );
+
+        let mut off = Out::new(false);
+        {
+            let _edits = FailingDirs::after(1, EIO);
+            off_config_step(Some(&config), &mut off);
+        }
+        assert!(!off.failed);
+        assert_eq!(off.warned.get(), 1);
+        assert_eq!(command(&config), Ok(None), "the removal is in effect");
+
+        let mut early = Out::new(false);
+        {
+            let _baks = FailingDirs::with(EIO);
+            assert!(!config_step(Some(&config), cmd, &mut early));
+        }
+        assert!(early.failed, "the .bak's flush failed before any edit");
+        assert_eq!(early.warned.get(), 0);
+        assert_eq!(command(&config), Ok(None), "aterm.toml unchanged");
     }
 
     #[test]

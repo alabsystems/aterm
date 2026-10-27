@@ -318,7 +318,7 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
     crate::activate::sweep_agents_dir(layout);
 
     if prog_store.starts_with(&layout.prefix) && prog_store.exists() {
-        crate::store::unmark_program_builds(&prog_store);
+        crate::store::unmark_program_builds(&prog_store)?;
         if let Ok(entries) = std::fs::read_dir(&prog_store) {
             for entry in entries.flatten() {
                 crate::store::unseal_bin(&entry.path());

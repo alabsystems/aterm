@@ -285,10 +285,10 @@ fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
     assert_eq!(
         off,
         "this machine is in no fleet; if this machine took s-a1 on lab-mini, that Mac lifts the \
-         hold when its person takes the tab (Take Over), runs `aterm fleet peers rm 496e9154` \
-         there, or lowers `aterm fleet allow` there (to content or facts), and `aterm ctl --host \
-         lab-mini hold s-a1 off` from here works once this machine is in that fleet again (a \
-         fleet it issued went with its leave)"
+         hold when its person takes the tab (Take Over), runs `aterm fleet peers rm \
+         496e9154e57ae1d4bb20b01cf5d624cf` there, or lowers `aterm fleet allow` there (to content \
+         or facts), and `aterm ctl --host lab-mini hold s-a1 off` from here works once this \
+         machine is in that fleet again (a fleet it issued went with its leave)"
     );
     assert!(!off.contains("stands until"), "{off}");
     let at = run("lab-mini", &words("hold @s-a1 off"), None, &local)
@@ -318,9 +318,9 @@ fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
         off,
         "`lab-mnii` is no Mac this machine's book records; if this machine took s-a1 on \
          lab-mnii, that Mac lifts the hold when its person takes the tab (Take Over), runs \
-         `aterm fleet peers rm 496e9154` there, or lowers `aterm fleet allow` there (to content \
-         or facts), and `aterm ctl --host lab-mnii hold s-a1 off` from here works once this \
-         machine's book records that Mac again"
+         `aterm fleet peers rm 496e9154e57ae1d4bb20b01cf5d624cf` there, or lowers `aterm fleet \
+         allow` there (to content or facts), and `aterm ctl --host lab-mnii hold s-a1 off` from \
+         here works once this machine's book records that Mac again"
     );
     let on = run("lab-mnii", &words("hold s-a1 on"), None, &local)
         .expect_err("no such Mac in the book")
@@ -600,7 +600,7 @@ fn a_reply_cut_at_a_shorter_timeout_is_said_as_that_timeout_not_the_peers() {
         drive("lab-mini", DRIVE_WITHIN).expect("a link"),
         "spawn agent=claude len=2",
         b"go",
-        Within::Timeout(Duration::from_secs(5), DRIVE_WITHIN),
+        Within::Timeout(Duration::from_secs(5), Longer::Drive(DRIVE_WITHIN)),
     )
     .expect_err("unanswered")
     .to_string();
@@ -717,7 +717,11 @@ fn an_await_over_a_drive_ends_within_ctls_own_timeout() {
         &local,
     )
     .expect("the rows read");
-    assert_eq!(code, ExitCode::from(EXIT_TIMEOUT));
+    assert_eq!(
+        code,
+        ExitCode::from(crate::EXIT_REPLACED),
+        "the leg cut was never served"
+    );
     let asked = ASKED.lock().unwrap();
     assert_eq!(asked.len(), 2, "a baseline and one leg: {asked:?}");
     assert!(asked.iter().all(|within| *within <= five), "{asked:?}");

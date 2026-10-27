@@ -737,6 +737,7 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn AgyKernel) -> Result<Plan, NoPl
         dialect,
         line,
         tap_dropped: None,
+        line_dir: None,
     })
 }
 

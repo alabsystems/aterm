@@ -38,6 +38,23 @@ pub(crate) fn set_predecessor(pid: u32) {
 #[cfg(unix)]
 pub(crate) const META_POLL: Duration = Duration::from_millis(250);
 
+/// Development seam: milliseconds the keeper link's worker waits idle (for
+/// [`aterm_keeper::client::LINK_POLL`]) and the META pump waits between its passes (for
+/// [`META_POLL`]). An hour leaves only a queued op or the keeper's own frame to wake the worker:
+/// the live lane's check that a recovered window reads its keeper's SYNC answer as it arrives.
+#[cfg(unix)]
+const QUIET_SEAM: &str = "ATERM_DEBUG_KEEPER_QUIET_MS";
+
+/// [`QUIET_SEAM`]'s wait, when it is set to a number of milliseconds.
+#[cfg(unix)]
+fn quiet() -> Option<Duration> {
+    aterm_types::dev_seam!(QUIET_SEAM)?
+        .to_str()?
+        .parse()
+        .ok()
+        .map(Duration::from_millis)
+}
+
 /// How long the update worker waits for its PENDING to be written before it
 /// grants anyway (the holder scan is the keeper's independent gate, §5.4).
 #[cfg(unix)]
@@ -665,8 +682,12 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
     let booted = match KeeperClient::connect(&socket, &identity, Duration::from_secs(2)) {
         Ok(client) => match client.hello_app_marked(&build(), marker(), JOURNAL) {
             Ok(offers) => {
+                crate::metrics::mark_keeper_hello();
+                let seam_at_hello = crate::metrics::keeper_seam();
                 KEEPER_JOURNALS.store(client.keeper_journals(), Ordering::Relaxed);
                 let mut used_cells = 0u64;
+                let offered = offers.len();
+                let mut slowest = Duration::ZERO;
                 for offer in offers {
                     let recovery_count = offer.companion.as_ref().map(|_| {
                         let accepted = Arc::new(AtomicBool::new(false));
@@ -680,7 +701,14 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
                     {
                         recovery.owners.push(owner);
                     }
-                    match admit_recovered_master(offer, &mut used_cells, cfg) {
+                    // The restore lane's seam's own work is off this clock: a really damaged
+                    // region never pays it (`metrics::keeper_seam`).
+                    let seam_before = crate::metrics::keeper_seam();
+                    let started = std::time::Instant::now();
+                    let admitted = admit_recovered_master(offer, &mut used_cells, cfg);
+                    let seam = crate::metrics::keeper_seam().since(seam_before);
+                    slowest = slowest.max(started.elapsed().saturating_sub(seam.spent()));
+                    match admitted {
                         Ok(mut adopted) => {
                             if let Some(claim) = adopted.keeper.as_mut() {
                                 claim.recovery_count = recovery_count;
@@ -702,6 +730,11 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
                         }
                     }
                 }
+                crate::metrics::record_keeper_admitted(
+                    offered,
+                    slowest,
+                    crate::metrics::keeper_seam().since(seam_at_hello),
+                );
                 Some(client)
             }
             Err(e) => {
@@ -742,7 +775,8 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
             recovery.restores.counts.meta
         );
     }
-    match KeeperLink::start_marked(socket, identity, build(), marker(), booted, JOURNAL) {
+    let idle = quiet().unwrap_or(aterm_keeper::client::LINK_POLL);
+    match KeeperLink::start_idling(socket, identity, build(), marker(), booted, JOURNAL, idle) {
         Ok(link) => {
             keeper_state().phase = Phase::Live(Arc::new(link));
             start_meta_pump();
@@ -769,7 +803,8 @@ pub(crate) fn activate() {
     let Some((socket, identity)) = place() else {
         return;
     };
-    match KeeperLink::start_marked(socket, identity, build(), marker(), None, JOURNAL) {
+    let idle = quiet().unwrap_or(aterm_keeper::client::LINK_POLL);
+    match KeeperLink::start_idling(socket, identity, build(), marker(), None, JOURNAL, idle) {
         Ok(link) => {
             st.phase = Phase::Live(Arc::new(link));
             for (id, op) in std::mem::take(&mut st.buffered) {
@@ -1592,8 +1627,9 @@ fn start_meta_pump() {
         "aterm-keeper-meta".to_string(),
         crate::qos::Role::Housekeeping,
         || {
+            let period = quiet().unwrap_or(META_POLL);
             loop {
-                std::thread::sleep(META_POLL);
+                std::thread::sleep(period);
                 if !on() {
                     return;
                 }

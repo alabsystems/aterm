@@ -68,6 +68,86 @@ pub fn rainbow_cfg() -> GlowConfig {
     }
 }
 
+/// [`rainbow_cfg`] on `ground` ([`Ground::lay`]).
+#[allow(dead_code)]
+pub fn rainbow_cfg_on(ground: Ground) -> GlowConfig {
+    ground.lay(rainbow_cfg())
+}
+
+/// A scheme's ground as the host hands it to the trail (`app_render.rs`'s
+/// frame glow config): its default fg and bg, with `dark_theme` read off the
+/// bg by `theme_is_dark`.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ground {
+    /// The ground's name in a verdict.
+    pub name: &'static str,
+    pub fg: u32,
+    pub bg: u32,
+}
+
+#[allow(dead_code)]
+impl Ground {
+    /// [`rainbow_cfg`]'s dark ground.
+    pub const TOKYO: Self = Self {
+        name: "Tokyo",
+        fg: 0x00C8_D3F5,
+        bg: 0x001A_1B26,
+    };
+
+    /// The built-in scheme `name`'s ground.
+    pub fn scheme(name: &'static str) -> Self {
+        let s = aterm_types::scheme::builtin(name)
+            .unwrap_or_else(|| panic!("{name:?} is no built-in scheme"));
+        let rgb = |c: aterm_types::Rgb| aterm_render::rgb_to_u32([c.r, c.g, c.b]);
+        Self {
+            name,
+            fg: rgb(s.foreground),
+            bg: rgb(s.background),
+        }
+    }
+
+    /// The host's polarity rule: no dark theme on a light bg.
+    pub fn dark(self) -> bool {
+        aterm_render::theme_is_dark(self.bg)
+    }
+
+    /// `cfg` with this ground's colours and polarity, as the host lays them.
+    pub fn lay(self, cfg: GlowConfig) -> GlowConfig {
+        GlowConfig {
+            dark_theme: self.dark(),
+            theme_fg: self.fg,
+            theme_bg: self.bg,
+            ..cfg
+        }
+    }
+}
+
+thread_local! {
+    static GROUND: std::cell::Cell<Option<Ground>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with every host this thread builds standing on `ground` instead of
+/// the one its test names ([`ground_or`]), so a family reads on a light scheme
+/// as it reads on its own. A panic in `f` restores the host's own ground.
+#[allow(dead_code)]
+pub fn on_ground<T>(ground: Ground, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Ground>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GROUND.with(|g| g.set(self.0));
+        }
+    }
+    let _restore = Restore(GROUND.with(|g| g.replace(Some(ground))));
+    f()
+}
+
+/// The ground a host stands on: [`on_ground`]'s, else its own.
+#[allow(dead_code)]
+pub fn ground_or(own: Ground) -> Ground {
+    GROUND.with(std::cell::Cell::get).unwrap_or(own)
+}
+
 /// Construct a `rows × cols` grid geometry with `cw × ch` pixel cells at the origin.
 #[allow(dead_code)]
 pub fn geom(rows: usize, cols: usize, cw: usize, ch: usize) -> Geom {

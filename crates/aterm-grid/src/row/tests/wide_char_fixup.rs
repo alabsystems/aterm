@@ -21,7 +21,7 @@ fn cells_mut_with_fixup_handles_multiple_wide_chars() {
 
     {
         let target = row
-            .cells_mut_with_fixup(1, 4)
+            .cells_mut_with_fixup(1, 4, Cell::EMPTY)
             .expect("range inside row should produce a slice");
         assert_eq!(target.len(), 4);
     }
@@ -41,7 +41,7 @@ fn cells_mut_with_fixup_ignores_out_of_bounds_start_without_overflow() {
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert!(
-            row.cells_mut_with_fixup(u16::MAX, 1).is_none(),
+            row.cells_mut_with_fixup(u16::MAX, 1, Cell::EMPTY).is_none(),
             "out-of-bounds start should return None"
         );
     }));
@@ -513,7 +513,9 @@ fn cells_mut_with_fixup_shrinks_len_on_tail_wide_orphan() {
     assert_eq!(row.len(), 7, "wide char at 5-6 → len 7");
 
     {
-        let target = row.cells_mut_with_fixup(3, 3).expect("range inside row");
+        let target = row
+            .cells_mut_with_fixup(3, 3, Cell::EMPTY)
+            .expect("range inside row");
         assert_eq!(target.len(), 3);
         for (i, cell) in target.iter_mut().enumerate() {
             *cell = Cell::from_ascii_fast(b'A' + i as u8);
@@ -595,7 +597,7 @@ fn an_early_wrap_hole_lasts_until_its_cell_is_written() {
     assert!(!row.has_early_wrap_hole(), "the run lane");
 
     let (_p, mut row) = hole_row();
-    let _ = row.cells_mut_with_fixup(1, 3);
+    let _ = row.cells_mut_with_fixup(1, 3, Cell::EMPTY);
     assert!(!row.has_early_wrap_hole(), "the bulk lane");
 
     let (_p, mut row) = hole_row();

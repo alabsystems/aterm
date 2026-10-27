@@ -223,6 +223,20 @@ fn every_one_character_typo_and_neighbour_swap_is_refused() {
 }
 
 #[test]
+fn a_short_code_is_refused_counting_what_was_pasted() {
+    let short = JoinCode::parse("atf1-garbage@127.0.0.1:47501").unwrap_err();
+    assert_eq!(short, CodeError::Length(7));
+    let said = short.to_string();
+    assert!(
+        said.contains("36 letters and digits between its `atf1-` and its `@`")
+            && said.contains("not 7"),
+        "{said}"
+    );
+    let said = CodeError::Character(5).to_string();
+    assert!(said.contains("character 5 after its `atf1-`"), "{said}");
+}
+
+#[test]
 fn a_code_that_is_not_whole_is_refused_by_what_is_wrong() {
     let text = code().text();
     let (chars, issuer) = split(&text);
@@ -923,7 +937,11 @@ fn a_node_is_bound_to_its_first_key_and_another_is_refused() {
     ] {
         let why = record(&mut book, refused).unwrap_err();
         assert!(
-            why.contains(says) && why.contains("`aterm fleet peers rm abababab` on the issuer"),
+            why.contains(says)
+                && why.contains(&format!(
+                    "`aterm fleet peers rm {}` on the issuer",
+                    node_of(0xab)
+                )),
             "{why}"
         );
         assert_eq!(book, held, "a refusal changes nothing");
@@ -944,7 +962,8 @@ fn a_node_is_bound_to_its_first_key_and_another_is_refused() {
     let mut book = vec![older.clone()];
     let why = record(&mut book, upgraded([10, 0, 0, 66])).unwrap_err();
     assert!(
-        why.contains("recorded from 10.0.0.8") && why.contains("peers rm cdcdcdcd"),
+        why.contains("recorded from 10.0.0.8")
+            && why.contains(&format!("peers rm {}`", node_of(0xcd))),
         "{why}"
     );
     assert_eq!(book, vec![older], "no key is bound from another address");
@@ -1238,6 +1257,48 @@ fn a_drive_grant_holds_the_key_it_was_made_for() {
 }
 
 #[test]
+fn an_all_member_grant_still_requires_an_issuer_binding() {
+    let member = identity(&node_of(0xa2), 3);
+    let all = DriveGrant::from_word(crate::fleet::ALL_MEMBERS).expect("all parses");
+    assert!(all.all());
+    assert_eq!(all.word(), crate::fleet::ALL_MEMBERS);
+    let grants = [all];
+    let bound = Keyring::of(&[keyed(0xa2, member.key(), [10, 0, 0, 8], 7100)]);
+    assert_eq!(
+        bound.driver(Some(&proof(member.node(), member.key())), &grants),
+        Ok(member.node().to_owned())
+    );
+    assert_eq!(
+        Keyring::default().driver(Some(&proof(member.node(), member.key())), &grants),
+        Err(Undriven::Unproven(Unproven::Unbound(
+            member.node().to_owned()
+        )))
+    );
+    assert_eq!(
+        bound.driver(None, &grants),
+        Err(Undriven::Unproven(Unproven::NoProof))
+    );
+    let named = DriveGrant {
+        node: member.node().to_owned(),
+        key: member.key(),
+    };
+    let both = [grants[0].clone(), named.clone()];
+    assert_eq!(
+        DriveGrant::admitting(&both, member.node(), member.key()),
+        Some(&named)
+    );
+    assert_eq!(
+        DriveGrant::admitting(&both, &node_of(0xa3), member.key()),
+        Some(&grants[0])
+    );
+    let rekeyed = identity(&node_of(0xa2), 4).key();
+    assert_eq!(
+        DriveGrant::admitting(std::slice::from_ref(&named), member.node(), rekeyed),
+        None
+    );
+}
+
+#[test]
 fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
     let issuer_state = State::new("recheck-issuer");
     issue(issuer_state.dir());
@@ -1339,10 +1400,24 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
         Undriven::Unchecked {
             node: node(),
             why: why(),
+            rejoins: false,
+        },
+        Undriven::Unchecked {
+            node: node(),
+            why: why(),
+            rejoins: true,
         },
         Undriven::Unread {
             node: node(),
             why: why(),
+            rejoins: false,
+            copy: true,
+        },
+        Undriven::Unread {
+            node: node(),
+            why: why(),
+            rejoins: true,
+            copy: false,
         },
         Undriven::Unjoined(node()),
     ] {
@@ -1404,8 +1479,26 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
     );
     let said = unread_now.unwrap_err().to_string();
     assert!(
-        said.contains("whether it joined since") && said.contains("reaches its issuer"),
+        said.contains("whether it joined since")
+            && said.contains("reaches its issuer")
+            && said.contains("by the dialled Mac's copy of its issuer's book"),
         "{said}"
+    );
+    std::fs::remove_file(member.dir().join(ISSUER_BOOK_FILE)).unwrap();
+    let said = driver_as_of(
+        as_of(&n).as_ref(),
+        (member.dir(), &grants, &secret(5)),
+        young(),
+        fetched,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        said.contains(
+            "is bound to no key on the dialled Mac, which holds no copy of its issuer's \
+             book, and it could not read that book to find whether it joined since"
+        ),
+        "a copy it does not hold is never named: {said}"
     );
 
     keep_copy(member.dir(), i.node(), &[copy(entry.clone())]).unwrap();
@@ -1425,6 +1518,42 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
         said.contains("could not read that book again") && said.contains("aterm fleet peers"),
         "{said}"
     );
+    // A rotate: the dialled Mac reaches its issuer only by a join, which keeps no grant.
+    let rotated = |issuer: &Target| -> Result<Book, BookUnread> {
+        let at = SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), issuer.port);
+        Err(BookUnread::Unreached(Unreached::Handshake(
+            at,
+            FleetError::ListenerWrongSecret,
+        )))
+    };
+    for (now, kind) in [(old(), "Unchecked"), (young(), "Unread")] {
+        if kind == "Unread" {
+            keep_copy(member.dir(), i.node(), &[]).unwrap();
+        }
+        let refused = driver_as_of(
+            as_of(&n).as_ref(),
+            (member.dir(), &grants, &secret(5)),
+            now,
+            rotated,
+        );
+        assert!(
+            matches!(
+                &refused,
+                Err(Undriven::Unchecked { rejoins: true, .. }
+                    | Undriven::Unread { rejoins: true, .. })
+            ),
+            "{kind}: {refused:?}"
+        );
+        let said = refused.unwrap_err().to_string();
+        assert!(
+            said.contains("another secret")
+                && said.contains("only once the dialled Mac joins again")
+                && said.contains("lets it drive again (aterm fleet allow drive --from, there)")
+                && !said.contains("reaches its issuer"),
+            "{kind}: {said}"
+        );
+    }
+    keep_copy(member.dir(), i.node(), &[copy(entry.clone())]).unwrap();
     assert_eq!(copied(), vec![copy(entry.clone())]);
     write_book(member.dir(), &[issuer_at(issuing.port, None)]);
     let claimed = driver_as_of(
@@ -1956,7 +2085,11 @@ fn a_registration_binds_only_the_key_its_connection_proved() {
         None,
     );
     assert!(
-        outcome.is_err() && answer.contains("`aterm fleet peers rm cdcdcdcd` on the issuer"),
+        outcome.is_err()
+            && answer.contains(&format!(
+                "`aterm fleet peers rm {}` on the issuer",
+                me.node()
+            )),
         "{answer}"
     );
 
@@ -2080,7 +2213,10 @@ fn a_join_binds_the_members_key_and_refuses_another_for_its_node() {
         .unwrap_err();
     assert!(
         why.contains("another key")
-            && why.contains("`aterm fleet peers rm abababab` on the issuer"),
+            && why.contains(&format!(
+                "`aterm fleet peers rm {}` on the issuer",
+                taker.node()
+            )),
         "{why}"
     );
     let unproved = join_as(issuing.port, (&secret(5), None), &reg(&taker))
@@ -2623,6 +2759,90 @@ fn a_copy_of_the_issuers_book_yields_to_the_machines_own_entries() {
         crowd(PEERS_MAX),
         "a full book leaves no room for a copy"
     );
+}
+
+#[test]
+fn a_word_that_names_the_issuer_and_a_copy_removes_neither() {
+    let own = vec![issuer_entry(0x11, 48401)];
+    let copies: Vec<Peer> = [(0x22, 48403), (0x33, 48404), (0x44, 48408)]
+        .into_iter()
+        .map(|(node, port)| copy(joined(node, "127.0.0.1", [127, 0, 0, 1], port)))
+        .collect();
+    let mut book = own.clone();
+    let refused = remove(&mut book, &copies, "127.0.0.1").unwrap_err();
+    assert_eq!(
+        refused,
+        "`127.0.0.1` names 4 peers (11111111111111111111111111111111 at 127.0.0.1:48401, \
+         22222222222222222222222222222222 at 127.0.0.1:48403, \
+         33333333333333333333333333333333 at 127.0.0.1:48404, \
+         44444444444444444444444444444444 at 127.0.0.1:48408): name one by its node id or its address and port"
+    );
+    assert_eq!(book, own, "nothing taken out");
+    let read: Vec<Peer> = own.iter().chain(&copies).cloned().collect();
+    assert_eq!(
+        named(&own, &copies, "127.0.0.1"),
+        Err(find(&read, "127.0.0.1").unwrap_err()),
+        "one sentence, as a drive's word is refused"
+    );
+    assert!(remove(&mut book, &copies, "127.0.0.1:48403").is_err());
+
+    let by_hand = manual("127.0.0.1", 48409);
+    book.push(by_hand.clone());
+    assert_eq!(
+        remove(&mut book, &copies, "127.0.0.1"),
+        Err(
+            "`127.0.0.1` names 5 peers (11111111111111111111111111111111 at 127.0.0.1:48401, \
+             22222222222222222222222222222222 at 127.0.0.1:48403, \
+             33333333333333333333333333333333 at 127.0.0.1:48404, \
+             44444444444444444444444444444444 at 127.0.0.1:48408, - at 127.0.0.1:48409): name one by its node id or \
+             its address and port"
+                .to_owned()
+        ),
+        "an entry named by hand elsewhere is one more peer"
+    );
+    let alone = &copies[..1];
+    let two =
+        "`127.0.0.1` names 2 peers (22222222222222222222222222222222 at 127.0.0.1:48403, - at \
+               127.0.0.1:48409): name one by its node id or its address and port"
+            .to_owned();
+    assert_eq!(
+        named(std::slice::from_ref(&by_hand), alone, "127.0.0.1"),
+        Err(two.clone())
+    );
+    assert_eq!(
+        remove(&mut vec![by_hand.clone()], alone, "127.0.0.1"),
+        Err(two),
+        "never the entry of a peer other than the one the word names"
+    );
+    assert!(remove(&mut book, &[], "127.0.0.1").is_err());
+    let at_its_place = [copy(manual("127.0.0.1", 48403))];
+    assert_eq!(
+        named(
+            &book[..1],
+            &[alone, &at_its_place].concat(),
+            "127.0.0.1:48403"
+        ),
+        Ok(Some(&alone[0])),
+        "an entry with no node at a node's place stands for that node"
+    );
+    assert_eq!(remove(&mut book, &copies, "127.0.0.1:48409"), Ok(by_hand));
+    assert_eq!(
+        remove(&mut book, &copies, "127.0.0.1:48401").map(|peer| peer.via),
+        Ok(Via::Issuer)
+    );
+
+    let mut book = own.clone();
+    let copied_by_hand = [copy(manual("127.0.0.1", 5555))];
+    assert_eq!(
+        remove(&mut book, &copied_by_hand, "127.0.0.1"),
+        Err(
+            "`127.0.0.1` names 2 peers (11111111111111111111111111111111 at 127.0.0.1:48401, - at \
+             127.0.0.1:5555): name one by its node id or its address and port"
+                .to_owned()
+        ),
+        "a hand entry the copy holds is another peer too"
+    );
+    assert_eq!(book, own, "the issuer stays");
 }
 
 #[test]
@@ -5136,6 +5356,50 @@ fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
             other.map(|d| d.node.clone())
         ),
     }
+    running.store(false, Ordering::Release);
+    serving.join().unwrap();
+}
+
+#[test]
+fn a_drive_its_deadline_hangs_up_reads_as_that_deadline_never_as_the_peers_cut() {
+    let host = identity(&node_of(0xd7), 4);
+    let me = identity(&node_of(0x3a), 8);
+    let bound = Keyring::of(&[keyed(0xd7, host.key(), [127, 0, 0, 1], 7100)]);
+    let (port, running, serving) = node_listener(host.clone(), &[FleetOp::Survey, FleetOp::Drive]);
+    let target = Target {
+        host: "127.0.0.1".to_owned(),
+        addr: None,
+        port,
+        node: Some(host.node().to_owned()),
+        key: None,
+    };
+    let mut driven = drive(
+        &target,
+        &bound,
+        (&secret(6), &me),
+        (Instant::now() + HANG, HANG),
+    )
+    .expect("the bound node is driven");
+    // The deadline's watchdog hangs up before the socket's own read timeout, as it may at one
+    // deadline.
+    driven
+        .stream
+        .get_ref()
+        .set_read_timeout(Some(HANG))
+        .unwrap();
+    if let Some(watchdog) = driven.watchdog.take() {
+        let _ = watchdog.finish();
+    }
+    driven.watchdog =
+        Some(HandshakeWatchdog::arm(driven.stream.get_ref(), Duration::from_millis(50)).unwrap());
+    let mut line = String::new();
+    let read = io::BufRead::read_line(&mut io::BufReader::new(&mut driven), &mut line);
+    assert_eq!(read.map_err(|e| e.kind()), Err(io::ErrorKind::TimedOut));
+    let wrote = driven
+        .write_all(b"s-1 status\n")
+        .and_then(|()| driven.flush());
+    assert_eq!(wrote.map_err(|e| e.kind()), Err(io::ErrorKind::TimedOut));
+    drop(driven);
     running.store(false, Ordering::Release);
     serving.join().unwrap();
 }

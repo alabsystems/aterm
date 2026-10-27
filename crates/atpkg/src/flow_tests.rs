@@ -3026,6 +3026,169 @@ fn a_member_stage_failure_aborts_the_group_and_a_retry_heals_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `fake` with each row signing its archive's true size, as published rows do, so a group
+/// pass stages each download as it arrives; with `wrong_sha`, that program's row signs bytes
+/// its archive does not hold.
+fn true_sized(mut fake: Fake, wrong_sha: Option<&str>) -> Fake {
+    for ((program, build), (body, sig)) in &mut fake.pkg {
+        let asset = format!("{program}-{build}.tar.zst");
+        let archive = fake.archives.get(&asset).unwrap();
+        let size = std::fs::metadata(archive).unwrap().len();
+        let mut text = String::from_utf8(body.clone())
+            .unwrap()
+            .replace("size = 100\n", &format!("size = {size}\n"));
+        if wrong_sha == Some(program.as_str()) {
+            let sha = crate::tree::file_sha256(archive).unwrap();
+            text = text.replace(&sha, &"a".repeat(64));
+        }
+        *sig = sign(&RELEASE_SEED, text.as_bytes());
+        *body = text.into_bytes();
+    }
+    fake
+}
+
+/// A fetcher that writes each archive into `<dest>.part`, as curl does, and finishes the
+/// download only once the pass has laid that archive's tree into a staging scratch beside its
+/// builds: a pass that stages only a completed download never gets past it.
+struct HeldUntilLaid {
+    inner: Fake,
+    layout: Layout,
+}
+
+impl HeldUntilLaid {
+    /// Whether a staging scratch of `program` holds its laid binary.
+    fn laid(&self, program: &str) -> bool {
+        let builds = self.layout.build_dir(program, 0);
+        let Some(store) = builds.parent() else {
+            return false;
+        };
+        std::fs::read_dir(store).is_ok_and(|entries| {
+            entries.flatten().any(|e| {
+                e.file_name().to_string_lossy().contains(".incoming-")
+                    && tool_bin(&e.path(), program).is_file()
+            })
+        })
+    }
+}
+
+impl Fetcher for HeldUntilLaid {
+    fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
+        self.inner.index_candidates()
+    }
+
+    fn pkg_manifest(
+        &self,
+        repo: &str,
+        program: &str,
+        build: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.inner.pkg_manifest(repo, program, build)
+    }
+
+    fn download(&self, _repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+        let src = self.inner.archives.get(asset).ok_or("no such asset")?;
+        let program = asset.split('-').next().unwrap_or(asset);
+        let mut part = dest.as_os_str().to_os_string();
+        part.push(".part");
+        std::fs::copy(src, &part).map_err(|e| e.to_string())?;
+        let began = std::time::Instant::now();
+        while !self.laid(program) {
+            if began.elapsed() > std::time::Duration::from_secs(60) {
+                return Err(format!("{program}'s tree was not laid while it downloaded"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::fs::rename(&part, dest).map_err(|e| e.to_string())
+    }
+}
+
+/// STAGED AS IT ARRIVES: each member's tree is laid while its download is still running, and
+/// the group lands exactly as one staged from completed downloads does.
+#[test]
+fn a_group_pass_lays_each_tree_while_its_download_runs_and_lands_it() {
+    let dir = scratch("as-it-arrives");
+    let layout = layout(&dir);
+    let fake = HeldUntilLaid {
+        inner: true_sized(group_fixture(&dir), None),
+        layout: layout.clone(),
+    };
+    let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
+    let report = apply_channel(
+        &fake,
+        &layout,
+        &anchor(),
+        "stable",
+        TRIPLE,
+        &installed,
+        &[],
+        fl(0),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        report.groups[0].1,
+        TxnOutcome::Applied(vec!["ay".into(), "trust".into()]),
+        "every tree was laid before its download finished, and the group landed"
+    );
+    for (program, build) in [("ay", 18), ("trust", 4821)] {
+        assert_eq!(
+            crate::ops::which(&layout, program).unwrap(),
+            tool_bin(&layout.build_dir(program, build), program)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The control of the row above: the same pass, the tree laid as the bytes arrive, but one
+/// row signs other bytes. The streamed stage is thrown away and the group aborts before any
+/// flip, exactly as a download that missed its digest always did.
+#[test]
+fn a_tree_laid_from_bytes_that_miss_their_signed_digest_aborts_the_group() {
+    let dir = scratch("as-it-arrives-mismatch");
+    let layout = layout(&dir);
+    let fake = HeldUntilLaid {
+        inner: true_sized(group_fixture(&dir), Some("trust")),
+        layout: layout.clone(),
+    };
+    let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
+    let report = apply_channel(
+        &fake,
+        &layout,
+        &anchor(),
+        "stable",
+        TRIPLE,
+        &installed,
+        &[],
+        fl(0),
+        0,
+    )
+    .unwrap();
+    let TxnOutcome::Aborted {
+        failed,
+        during_flip,
+        why,
+    } = &report.groups[0].1
+    else {
+        panic!("the group must abort: {:?}", report.groups[0].1);
+    };
+    assert_eq!(failed, "trust");
+    assert!(!during_flip, "it aborted before any flip");
+    assert!(
+        why.contains("sha256"),
+        "the signed digest refused it: {why}"
+    );
+    assert!(
+        crate::ops::which(&layout, "trust").is_none(),
+        "trust never flipped"
+    );
+    assert!(crate::ops::which(&layout, "ay").is_none(), "nor ay");
+    assert!(
+        !fake.laid("trust"),
+        "the tree laid from those bytes is gone"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_group_abort_never_discards_a_member_that_was_already_live() {
     let dir = scratch("group-abort-live");

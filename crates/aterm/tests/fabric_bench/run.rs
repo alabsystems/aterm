@@ -26,6 +26,15 @@ mod pingpong;
 #[path = "run/handoff.rs"]
 mod handoff;
 
+#[path = "run/ask.rs"]
+mod ask;
+
+#[path = "run/cross.rs"]
+mod cross;
+
+#[path = "run/backlog.rs"]
+mod backlog;
+
 /// What a run hands back.
 pub struct Report {
     pub json: Value,
@@ -58,8 +67,23 @@ fn post(ctl: &mut Ctl, clock: Clock, from: &str, to: &str, text: &str) -> (u64, 
 ///
 /// Any answer but a row — `OK timeout` after the hang detector — as the request and its reply.
 fn await_note(ctl: &mut Ctl, clock: Clock, sid: &str, since: u64) -> Result<(u64, u64), String> {
+    await_kinds(ctl, clock, sid, since, "note")
+}
+
+/// [`await_note`] for the rows of `kinds` (`ask`, `ask,task`, …).
+///
+/// # Errors
+///
+/// As [`await_note`].
+fn await_kinds(
+    ctl: &mut Ctl,
+    clock: Clock,
+    sid: &str,
+    since: u64,
+    kinds: &str,
+) -> Result<(u64, u64), String> {
     let line = format!(
-        "@{sid} await inbox since={since} kinds=note timeout={}",
+        "@{sid} await inbox since={since} kinds={kinds} timeout={}",
         DEADLINE.as_millis()
     );
     let reply = request(ctl, &line);
@@ -190,15 +214,32 @@ fn consume(
     ctl: &mut Ctl,
     clock: Clock,
     sid: &str,
-    mut since: u64,
+    since: u64,
     prefix: &str,
+    want: usize,
+    credit: Option<&Credit>,
+) -> Result<Consumed, String> {
+    consume_kinds(ctl, clock, sid, since, (prefix, "note"), want, credit)
+}
+
+/// [`consume`] of the rows of `kinds` (`ask`, …), `(prefix, kinds)`.
+///
+/// # Errors
+///
+/// As [`consume`].
+fn consume_kinds(
+    ctl: &mut Ctl,
+    clock: Clock,
+    sid: &str,
+    mut since: u64,
+    (prefix, kinds): (&str, &str),
     want: usize,
     credit: Option<&Credit>,
 ) -> Result<Consumed, String> {
     let mut seen = Vec::with_capacity(want);
     let mut distinct = HashSet::with_capacity(want);
     while distinct.len() < want {
-        let (woke_at, t_wake) = await_note(ctl, clock, sid, since)?;
+        let (woke_at, t_wake) = await_kinds(ctl, clock, sid, since, kinds)?;
         let rows = list_since(ctl, sid, since);
         let t_list = clock.us();
         for row in rows {
@@ -392,6 +433,15 @@ fn stop_and_read(w: &mut World) -> Vec<Rec> {
 /// Run `phases` beside a head sampler on `w`'s broker.
 fn sampled<T: Send>(w: &World, clock: Clock, phases: impl FnOnce() -> T + Send) -> (T, Heads) {
     let broker = w.broker.as_ref().expect("the world serves its own broker");
+    sampled_on(broker, clock, phases)
+}
+
+/// [`sampled`] on any broker this process serves (a fleet's, say).
+fn sampled_on<T: Send>(
+    broker: &Broker,
+    clock: Clock,
+    phases: impl FnOnce() -> T + Send,
+) -> (T, Heads) {
     let stop = AtomicBool::new(false);
     std::thread::scope(|s| {
         let sampler = s.spawn(|| {
@@ -476,6 +526,30 @@ fn flushes_line(f: FlushCounts, n: usize) -> String {
     )
 }
 
+/// What the broker wrote between a delivery and its inbox commit, over `of` round trips
+/// (`rounds` of them saw any), for the latency section.
+fn beside_line(c: &census::Census, rounds: usize, of: usize) -> String {
+    if c.total == 0 {
+        return format!(
+            "Between each delivery and its inbox commit the broker wrote nothing else, in all \
+             {of} round trips (warm-up included).\n"
+        );
+    }
+    let kinds: Vec<String> = c
+        .by_class
+        .iter()
+        .map(|(class, n)| format!("`{class}` {n}"))
+        .collect();
+    format!(
+        "Between a delivery and its inbox commit the broker wrote {} other records, in {rounds} \
+         of the {of} round trips (warm-up included), by kind: {}. None of them ended a round \
+         trip's wait, and each round trip's commit sat below the visible head read before the \
+         next post went out.\n",
+        c.total,
+        kinds.join(", ")
+    )
+}
+
 /// The broker's retention ticks so far.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Ticks {
@@ -521,7 +595,7 @@ const CALIBRATION_PUBLISHES: usize = 50;
 const CALIBRATION_PRODUCER: u64 = 0x0fab_0be7_0000_0001;
 
 /// The yardstick: blocks of `CALIBRATION_PUBLISHES` bare publishes, one at a time, from a client in this process — one round trip each, no aterm, no bridge — of three kinds ([`Yardstick`]).
-fn calibrate(ruler: &Ruler, w: &World, clock: Clock, seq: &mut u64) -> Yardstick {
+fn calibrate(ruler: &Ruler, node: &str, clock: Clock, seq: &mut u64) -> Yardstick {
     let block = |c: &mut astream_broker::Client, subject: &str, seq: &mut u64| -> Vec<f64> {
         (0..CALIBRATION_PUBLISHES)
             .map(|_| {
@@ -533,11 +607,11 @@ fn calibrate(ruler: &Ruler, w: &World, clock: Clock, seq: &mut u64) -> Yardstick
             })
             .collect()
     };
-    let mut strict = ruler.strict_client(w);
+    let mut strict = ruler.strict_client();
     let mut ordered = ruler.ordered_client();
     let escalated = format!(
         "{}/note",
-        aterm_link::subject::person_lane(FLEET, "h-bench", &w.node)
+        aterm_link::subject::person_lane(FLEET, "h-bench", node)
     );
     Yardstick {
         strict: block(
@@ -574,9 +648,16 @@ struct Ruler {
 
 impl Ruler {
     fn for_world(w: &World) -> Ruler {
+        Ruler::beside(&w.tmp, w.opts.durability, &w.broker_sock)
+    }
+
+    /// The yardstick's brokers in `tmp`, beside a broker of `durability`
+    /// served on `sock`, whose strict blocks take that broker when it is
+    /// strict.
+    fn beside(tmp: &Path, durability: Durability, sock: &str) -> Ruler {
         let serve = |log: &str, sock: &str, tier: aterm_link::durability::Durability| {
-            let sock = w.tmp.join(sock).to_string_lossy().into_owned();
-            let broker = harness::open_broker(w.tmp.join(log), &harness::broker_opts(tier));
+            let sock = tmp.join(sock).to_string_lossy().into_owned();
+            let broker = harness::open_broker(tmp.join(log), &harness::broker_opts(tier));
             let handle = broker
                 .serve(&sock)
                 .unwrap_or_else(|e| panic!("serve the yardstick's broker on {sock}: {e}"));
@@ -587,10 +668,10 @@ impl Ruler {
             "yo.sock",
             aterm_link::durability::Durability::Ordered,
         );
-        if w.opts.durability == Durability::Strict {
+        if durability == Durability::Strict {
             return Ruler {
                 own: None,
-                sock: w.broker_sock.clone(),
+                sock: sock.to_string(),
                 ordered,
                 ordered_sock,
             };
@@ -618,11 +699,9 @@ impl Ruler {
         c
     }
 
-    /// A god client of the strict block's broker.
-    fn strict_client(&self, w: &World) -> astream_broker::Client {
-        if self.own.is_none() {
-            return w.god();
-        }
+    /// A god client of the strict block's broker: the world's own when it is
+    /// strict ([`World::god`] is this client of its socket).
+    fn strict_client(&self) -> astream_broker::Client {
         Self::god_of(&self.sock)
     }
 
@@ -751,15 +830,19 @@ struct LatSample {
     t_seen: u64,
 }
 
-/// How finely [`latency`] watches for the previous message's commit to land.
+/// How finely [`await_commit`] watches the visible head for the previous message's commit
+/// to land.
 const IDLE_POLL: Duration = Duration::from_micros(100);
 
 /// What the latency phase measured.
 struct LatRaw {
     /// The measured round trips.
     samples: Vec<LatSample>,
-    /// Every round trip's text, warm-up included: each one's idle wait is checked against the log after the run.
-    texts: Vec<String>,
+    /// Every round trip, warm-up included: its text, and the broker's visible head read
+    /// once its wait for the commit ended, before the next post went out. After the run
+    /// each one's commit is held to that head ([`census::lands_before`]): a commit the next
+    /// post went out ahead of sits at that head or past it.
+    trips: Vec<(String, u64)>,
     /// The newest row id it listed.
     since: u64,
     /// The broker's flushes over the measured round trips.
@@ -768,12 +851,68 @@ struct LatRaw {
     ticks: Ticks,
 }
 
-/// The latency phase: `warmup + samples` round trips, one at a time.
+/// [`await_commit`]'s probe over its two reads: `head`, the lock-free visible head, on
+/// every poll, and `start`, where the group resumes (it takes the log lock), only on the
+/// first poll and on one that found the head moved since `start` last ran. A commit
+/// counts in `start` with the batch that makes it visible, which moves the head, so a
+/// poll that finds the head where it was finds `start` where it was too. That holds in
+/// every tier but Replicated, which the bench never serves.
+fn commit_counted(
+    off: u64,
+    mut head: impl FnMut() -> u64,
+    mut start: impl FnMut() -> u64,
+) -> impl FnMut() -> Option<()> {
+    let mut read_at = None;
+    move || {
+        let now = head();
+        if read_at == Some(now) {
+            return None;
+        }
+        read_at = Some(now);
+        (start() > off).then_some(())
+    }
+}
+
+/// Wait for `group`'s commit through offset `off` to land: until the broker counts it
+/// where the group resumes ([`Broker::group_start`], which counts a commit with the batch
+/// that makes it visible). Whatever else lands first — the bus mirror's `ev` rows, which
+/// the bridge writes beside its inbox commit — does not end the wait.
+///
+/// The wait runs inside a measured window: a round trip's visible -> the inbox commit
+/// acked, and the burst's time to the commit covering its last message. `group_start`
+/// takes the log lock, which the writer stages and promotes that commit's batch under, so
+/// the wait polls the lock-free visible head every [`IDLE_POLL`], as the head poll before
+/// it did, and reads `group_start` only when the head has moved ([`commit_counted`]): at
+/// most once per batch the writer publishes, never on a poll that found the head where it
+/// was.
+///
+/// # Panics
+///
+/// If the polling wait expires without observing the commit, naming `what`. Each
+/// read waits for the broker's log lock; [`DEADLINE`] does not time that acquisition.
+fn await_commit(broker: &Broker, group: &str, off: u64, what: &str) {
+    aterm_spec::wait::within(
+        DEADLINE,
+        IDLE_POLL,
+        commit_counted(off, || broker.visible_head(), || broker.group_start(group)),
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "{what}: no commit of {group} through offset {off} landed within {DEADLINE:?} (the \
+             group resumes at {})",
+            broker.group_start(group)
+        )
+    });
+}
+
+/// The latency phase: `warmup + samples` round trips, one at a time, each after the
+/// one before it has landed its inbox commit ([`await_commit`]).
 fn latency(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &str) -> LatRaw {
+    let group = aterm_link::subject::inbox_group(FLEET, &w.node);
     let mut ctl = w.ctl();
     let mut since = newest_id(&mut ctl, b);
     let mut out = Vec::with_capacity(spec.samples);
-    let mut texts = Vec::with_capacity(spec.warmup + spec.samples);
+    let mut trips = Vec::with_capacity(spec.warmup + spec.samples);
     let mut flushes_before = broker.flush_counts();
     let mut ticks_before = ticks(broker);
     for i in 0..spec.warmup + spec.samples {
@@ -790,15 +929,9 @@ fn latency(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &s
             rows.len() == 1 && rows[0].text == text && rows[0].id == woke_at,
             "round trip {i}: woke at row {woke_at}, listed {rows:?}"
         );
-        let off = rows[0].off;
-        aterm_spec::wait::within(DEADLINE, IDLE_POLL, || {
-            (broker.visible_head() > off + 1).then_some(())
-        })
-        .unwrap_or_else(|| {
-            panic!("round trip {i}: nothing landed after offset {off} within {DEADLINE:?}")
-        });
+        await_commit(broker, &group, rows[0].off, &format!("round trip {i}"));
+        trips.push((text.clone(), broker.visible_head()));
         since = woke_at;
-        texts.push(text.clone());
         if i >= spec.warmup {
             out.push(LatSample {
                 text,
@@ -810,7 +943,7 @@ fn latency(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &s
     }
     LatRaw {
         samples: out,
-        texts,
+        trips,
         since,
         flushes: flushes_between(flushes_before, broker.flush_counts()),
         ticks: ticks_between(ticks_before, ticks(broker)),
@@ -831,6 +964,10 @@ struct BurstRaw {
     flushes: FlushCounts,
     /// The broker's retention ticks over the same window ([`Ticks`]).
     ticks: Ticks,
+    /// The broker's visible head once the wait for the commit covering the last message
+    /// ended, read before the fence's post went out: after the run the commit is held to it
+    /// ([`census::lands_before`]).
+    fence_head: u64,
 }
 
 /// The burst phase, reading `b`'s inbox on from row `since` (the latency phase's last).
@@ -893,12 +1030,13 @@ fn burst(
         .unwrap_or_else(|e| panic!("burst: every message is seen exactly once, but {e}"));
 
     let b_last = consumed.seen.iter().map(|s| s.off).max().unwrap_or(0);
-    aterm_spec::wait::within(DEADLINE, IDLE_POLL, || {
-        (broker.visible_head() > b_last + 1).then_some(())
-    })
-    .unwrap_or_else(|| {
-        panic!("burst: nothing landed after the last message's offset {b_last} within {DEADLINE:?}")
-    });
+    await_commit(
+        broker,
+        &aterm_link::subject::inbox_group(FLEET, &w.node),
+        b_last,
+        "burst",
+    );
+    let fence_head = broker.visible_head();
     let batches = flushed() - flushed_before;
     let flushes = flushes_between(flush_counts_before, broker.flush_counts());
     let ticks = ticks_between(ticks_before, ticks(broker));
@@ -913,12 +1051,20 @@ fn burst(
         batches,
         flushes,
         ticks,
+        fence_head,
     }
 }
 
 /// What a world's broker serves, in one line for its section.
 fn served_line(w: &World, spec: &Spec) -> String {
-    let broker = w.broker.as_ref().expect("the world serves its own broker");
+    served_line_of(
+        w.broker.as_ref().expect("the world serves its own broker"),
+        spec,
+    )
+}
+
+/// [`served_line`] for any broker this process serves (a fleet's, say).
+fn served_line_of(broker: &Broker, spec: &Spec) -> String {
     let s = broker.served_durability();
     let horizon = s
         .horizon_ms
@@ -967,7 +1113,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     );
     let ruler = Ruler::for_world(&w);
     let mut cal_seq = 0;
-    let cal_before = calibrate(&ruler, &w, clock, &mut cal_seq);
+    let cal_before = calibrate(&ruler, &w.node, clock, &mut cal_seq);
     eprintln!(
         "fabric bench: latency, {} round trips ({} warm-up)",
         spec.samples, spec.warmup
@@ -984,7 +1130,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         await_durable(broker);
         (lat, bur)
     });
-    let cal_after = calibrate(&ruler, &w, clock, &mut cal_seq);
+    let cal_after = calibrate(&ruler, &w.node, clock, &mut cal_seq);
     let unit = yardstick(&cal_before, &cal_after);
     let recs = stop_and_read(&mut w);
     let lane = format!("/f/{FLEET}/in/{}/{b}/{}/note", w.node, w.node);
@@ -1005,15 +1151,31 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             .unwrap_or_else(|| panic!("no record of `{text}` on {lane}"))
             .seq
     };
-    for text in &lat_raw.texts {
-        census::next_is_its_commit(&recs, &group, seq_of(text)).unwrap_or_else(|e| {
-            panic!(
-                "`{text}`: the latency phase's idle wait passed on the record after the \
-                 delivery, and {e} — so the next sample may carry this commit's tail. Make \
-                 `latency` wait for the commit itself."
-            )
-        });
+    // Every round trip's wait for its commit, warm-up included, held to the log: the commit
+    // sits below the visible head read once the wait ended, before the next post went out
+    // (a commit that post carried, which the bridge writes ahead of it, sits at that head or
+    // past it, as does any commit not yet visible then), and what else the broker wrote
+    // while it was owed is counted.
+    let mut beside = Vec::new();
+    let mut rounds_beside = 0;
+    for (text, head) in &lat_raw.trips {
+        let seq = seq_of(text);
+        census::lands_before(&recs, &group, seq, *head)
+            .and_then(|()| census::before_its_commit(&recs, &group, seq))
+            .map(|owed| {
+                rounds_beside += usize::from(!owed.is_empty());
+                beside.extend(owed);
+            })
+            .unwrap_or_else(|e| {
+                panic!(
+                    "`{text}`: the latency phase waits for each delivery's inbox commit to be \
+                     visible before the next post goes out, and {e}, the visible head read \
+                     before that post — so the next round trip left with this commit still \
+                     owed, and may carry it. Make `await_commit` wait for the commit itself."
+                )
+            });
     }
+    let beside_census = census::census(beside.iter().copied());
     let lat = &lat_raw.samples;
 
     let mut post_call = Vec::new();
@@ -1079,10 +1241,11 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let t_all_durable = latest(&durable_all);
     let b_lo = seqs.iter().copied().min().unwrap_or(0);
     let b_last = seqs.iter().copied().max().unwrap_or(0);
-    census::lands_before(&recs, &group, b_last, seq_of("fence-0")).unwrap_or_else(|e| {
+    census::lands_before(&recs, &group, b_last, bur.fence_head).unwrap_or_else(|e| {
         panic!(
-            "the burst's window ends at the commit covering its last message, and {e} — so the \
-             burst's numbers would carry the fence's round trip. Make `burst` wait for that \
+            "the burst's window ends at the commit covering its last message, and {e}, the \
+             visible head read before the fence's post — so the burst's counts stop short of \
+             that commit, and the fence's round trip may carry it. Make `burst` wait for that \
              commit itself before it posts the fence."
         )
     });
@@ -1122,6 +1285,17 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "flushes": flushes_json(lat_raw.flushes, lat.len()),
             "retention_ticks": ticks_json(lat_raw.ticks),
             "census": census::to_json(&lat_census, lat.len(), (lat_lo, lat_hi)),
+            "between_delivery_and_commit": {
+                "what": "the records the broker wrote between a delivery and its inbox commit, over every round trip (warm-up included); each round trip waits for its commit before the next post",
+                "round_trips": lat_raw.trips.len(),
+                "round_trips_with_any": rounds_beside,
+                "records": beside_census.total,
+                "by_class": beside_census
+                    .by_class
+                    .iter()
+                    .map(|(class, n)| (class.clone(), json!(n)))
+                    .collect::<aterm_json::Map>(),
+            },
         },
         "burst": {
             "messages": n,
@@ -1162,7 +1336,10 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
              by a full flush). On a strict broker the two are one; on an ordered one durable \
              follows at the next full flush, at most the horizon plus a batch and a flush after \
              the first uncovered ack; on a relaxed one no record is ever durable. The inbox \
-             commit follows the delivery, after the row is visible.\n",
+             commit follows the delivery, after the row is visible, and the next post waits for \
+             it: for the broker to count it where the inbox group resumes \
+             (`Broker::group_start`, read each time the visible head moves), and each \
+             commit is held to the visible head read before the next post went out.\n",
             lat.len(),
             spec.warmup
         ),
@@ -1186,6 +1363,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     md.extend(census::rows(&lat_census, lat.len()));
     md.extend([
         String::new(),
+        beside_line(&beside_census, rounds_beside, lat_raw.trips.len()),
         format!(
             "## Burst: {n} posts back to back to one recipient ({} sender sessions)\n",
             bur.senders
@@ -1230,8 +1408,8 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         stats::row("post -> durable", &b_to_durable),
         String::new(),
         format!(
-            "Broker batches over the burst (writer batches that appended a record, through the \
-             record past the last message): {} — {} per message.\n",
+            "Broker batches over the burst (writer batches that appended a record, counted once \
+             the commit covering the last message was visible): {} — {} per message.\n",
             bur.batches,
             if n == 0 {
                 "–".to_string()
@@ -1274,6 +1452,13 @@ struct Round {
     /// The live mail ([`attach`]): its text, and the moment it was visible in its recipient's inbox.
     mail: String,
     t_mail_seen: u64,
+    /// With a backlog ([`backlog`]): when every other session's live mail
+    /// (`<mail>-to-<i>`, posted in the kill window after the first) was
+    /// visible too, and so every session's refill done.
+    t_every_mail_seen: Option<u64>,
+    /// When the kill window's posts were all answered: a backlog run posts one per session
+    /// there, and an entry shows they ended before the new pid ([`Round::t_pid`]).
+    t_posted: u64,
 }
 
 /// The bridge's pid from its state dir, if it has written one.
@@ -1396,6 +1581,124 @@ impl AttachRecords {
     }
 }
 
+/// One population's backlog ([`backlog`], B09): the fill, and the paced
+/// publisher's ack latencies inside its attaches and outside them.
+struct Backlog {
+    sessions: usize,
+    fill_ms: f64,
+    /// `(inside, outside)` ([`backlog::split`]): inside is a beat that meets
+    /// a round's kill -> every session's live mail visible.
+    steady: (Vec<f64>, Vec<f64>),
+}
+
+/// One `| … | n | mean | p50 | p95 | p99 | max |` cell run of `values`.
+fn with_max(values: &[f64]) -> String {
+    match stats::summarize(values) {
+        None => "0 | – | – | – | – | –".to_string(),
+        Some(s) => format!(
+            "{} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2}",
+            s.n, s.mean, s.p50, s.p95, s.p99, s.max
+        ),
+    }
+}
+
+/// The attach section's backlog part, pushed onto `md`: its JSON, `null` for a run without one.
+fn backlog_report(spec: &Spec, node: &str, backlogs: &[Backlog], md: &mut Vec<String>) -> Value {
+    if spec.backlog == 0 {
+        return Value::Null;
+    }
+    md.push(format!(
+        "### The backlog: {} records behind every session's refill watermark (B09)\n",
+        spec.backlog
+    ));
+    md.push(format!(
+        "Before each population's restarts every session is sent a note, marks it seen, and the \
+         bridge persists its refill watermark there (`seen/<sid>`); then {} records of {} bytes \
+         are filled on `{}`, an `ev` face no session owns. Each restart's bridge refills every \
+         session from its watermark, so it pages a `Fetch` of each session's lane over the \
+         backlog, astream scanning at most {} records per page under the broker's log lock. In \
+         the kill window the boot session posts one more note to every other session; \"kill -> \
+         every session's live mail visible\" ends when the last of them is listed. A paced \
+         publisher on its own connection publishes on `{}` every {} ms across the restarts \
+         (the yardstick's kind of bare publish, not aterm's): an ack that meets a round's kill -> \
+         every live mail is inside, every other is outside, and the difference is what the \
+         attach — the refill's scans above all — costs every other writer. Its records and the \
+         other sessions' notes are left out of the census.\n",
+        spec.backlog,
+        backlog::FILL_BODY_LEN,
+        backlog::fill_subject(node),
+        astream_broker::broker::FETCH_SCAN_MAX,
+        backlog::steady_subject(),
+        backlog::STEADY_EVERY.as_millis()
+    ));
+    md.push(
+        "| sessions | fill (ms) | paced publish -> ack (ms) | n | mean | p50 | p95 | p99 | max |"
+            .to_string(),
+    );
+    md.push("|---:|---:|---|---:|---:|---:|---:|---:|---:|".to_string());
+    let mut sizes = Vec::new();
+    for b in backlogs {
+        let (inside, outside) = &b.steady;
+        md.push(format!(
+            "| {} | {:.0} | inside an attach | {} |",
+            b.sessions,
+            b.fill_ms,
+            with_max(inside)
+        ));
+        md.push(format!(
+            "| {} | | outside | {} |",
+            b.sessions,
+            with_max(outside)
+        ));
+        sizes.push(json!({
+            "sessions": b.sessions,
+            "fill_ms": stats::round3(b.fill_ms),
+            "steady_inside_ms": stats::to_json(inside),
+            "steady_outside_ms": stats::to_json(outside),
+        }));
+    }
+    md.push(String::new());
+    json!({
+        "records": spec.backlog,
+        "body_bytes": backlog::FILL_BODY_LEN,
+        "subject": backlog::fill_subject(node),
+        "steady_every_ms": u64::try_from(backlog::STEADY_EVERY.as_millis()).unwrap_or(u64::MAX),
+        "fetch_scan_max": astream_broker::broker::FETCH_SCAN_MAX,
+        "sizes": Value::Array(sizes),
+    })
+}
+
+/// The attach table's rows, in the order of a size's series: the last two
+/// ([`ATTACH_BACKLOG_ROWS`] on) are the backlog's (B09).
+const ATTACH_ROWS: [&str; 10] = [
+    "**pid -> every row acked (attach)**",
+    "pid -> node row acked",
+    "node row -> last session row",
+    "kill -> new pid (supervisor relaunch)",
+    "kill -> every row acked",
+    "pid -> every row durable",
+    "**kill -> the first live mail visible**",
+    "every row acked -> the live mail visible (the mirror's start, the refill, the drain)",
+    "**kill -> every session's live mail visible** (the backlog's: every refill done)",
+    "kill -> the kill window's posts answered (the backlog's: before the new pid)",
+];
+
+/// The first of the backlog's own rows in [`ATTACH_ROWS`].
+const ATTACH_BACKLOG_ROWS: usize = 8;
+
+/// One size's rows of the attach table: every row, an empty one as `0 | – …`
+/// (a head that never landed is a hole the table shows), but the backlog's
+/// own two on a run without a backlog, which entries before it never had.
+fn attach_table_rows(size: usize, series: &[Vec<f64>; 10], backlog: usize) -> Vec<String> {
+    ATTACH_ROWS
+        .iter()
+        .zip(series)
+        .enumerate()
+        .filter(|(i, _)| backlog > 0 || *i < ATTACH_BACKLOG_ROWS)
+        .map(|(_, (name, values))| format!("| {size} |{}", &stats::row(name, values)[1..]))
+        .collect()
+}
+
 /// The attach world: grow the population, restart the bridge `rounds` times at each size, census.
 fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the attach world");
@@ -1409,7 +1712,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let presence_filter = format!("/f/{FLEET}/pub/{}/*/presence", w.node);
     let ruler = Ruler::for_world(&w);
     let mut cal_seq = 0;
-    let cal_before = calibrate(&ruler, &w, clock, &mut cal_seq);
+    let cal_before = calibrate(&ruler, &w.node, clock, &mut cal_seq);
     let (rounds, heads) = sampled(&w, clock, || {
         let broker = w.broker.as_ref().expect("the world serves its own broker");
         let mut mail_ctl = w.ctl();
@@ -1419,72 +1722,150 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         let mut pid = w.bridge_pid();
         let mut up_since = Instant::now();
         let mut rounds = Vec::new();
-        for &size in &spec.attach {
+        let mut backlogs = Vec::new();
+        let mut steady_seq = 1;
+        for (size_index, &size) in spec.attach.iter().enumerate() {
             while sids.len() < size {
                 sids.push(spawn(&w));
             }
             wait_live(&w, &sids, 0, "every session's presence row to say live");
             let session_subjects: Vec<String> =
                 sids.iter().map(|sid| presence_subject(&w, sid)).collect();
+            let mut others_since = HashMap::new();
+            let mut fill_ms = None;
+            if spec.backlog > 0 {
+                eprintln!(
+                    "fabric bench: {size} session(s) mark a note seen, then {} records fill the \
+                     backlog",
+                    spec.backlog
+                );
+                others_since =
+                    backlog::seed_seen(&w, &mut mail_ctl, clock, &mailer, &sids, &size.to_string());
+                mail_since = others_since.remove(&mailer).unwrap_or(mail_since);
+                fill_ms = Some(backlog::fill(
+                    &w,
+                    backlog::FILL_PRODUCER + size_index as u64,
+                    spec.backlog,
+                ));
+            }
             eprintln!(
                 "fabric bench: attach with {size} session(s), {} restart(s)",
                 spec.rounds
             );
-            for _ in 0..spec.rounds {
-                if let Some(rest) = SUPERVISOR_HEALTHY.checked_sub(up_since.elapsed()) {
-                    std::thread::sleep(rest);
+            let stop_steady = AtomicBool::new(false);
+            let size_rounds = std::thread::scope(|s| {
+                let steady = (spec.backlog > 0)
+                    .then(|| s.spawn(|| backlog::steady(&w, clock, steady_seq, &stop_steady)));
+                let mut size_rounds = Vec::new();
+                for _ in 0..spec.rounds {
+                    if let Some(rest) = SUPERVISOR_HEALTHY.checked_sub(up_since.elapsed()) {
+                        std::thread::sleep(rest);
+                    }
+                    let mark = broker.visible_head();
+                    let mut watch = w
+                        .god()
+                        .subscribe(mark, &presence_filter)
+                        .unwrap_or_else(|e| {
+                            panic!("subscribe to {presence_filter} from {mark}: {e}")
+                        });
+                    watch
+                        .set_read_timeout(Some(DEADLINE))
+                        .expect("bound the presence subscription");
+                    let t_kill = clock.us();
+                    harness::kill(pid, 9);
+                    let mail = format!("live-{}", rounds.len() + size_rounds.len());
+                    post(&mut mail_ctl, clock, &mailer, &mailer, &mail);
+                    if spec.backlog > 0 {
+                        for (i, sid) in sids.iter().enumerate().skip(1) {
+                            post(
+                                &mut mail_ctl,
+                                clock,
+                                &mailer,
+                                sid,
+                                &format!("{mail}-to-{i}"),
+                            );
+                        }
+                    }
+                    let t_posted = clock.us();
+                    let new_pid = aterm_spec::wait::within(DEADLINE, PID_POLL, || {
+                        read_pid(&w).filter(|p| *p != pid)
+                    })
+                    .unwrap_or_else(|| panic!("the bridge did not come back within {DEADLINE:?}"));
+                    let t_pid = clock.us();
+                    pid = new_pid;
+                    up_since = Instant::now();
+                    let (woke_at, t_mail_seen) =
+                        await_note(&mut mail_ctl, clock, &mailer, mail_since)
+                            .unwrap_or_else(|e| panic!("the live mail `{mail}`: {e}"));
+                    let listed = list_since(&mut mail_ctl, &mailer, mail_since);
+                    assert!(
+                        listed.len() == 1 && listed[0].text == mail && listed[0].id == woke_at,
+                        "the live mail `{mail}`: woke at row {woke_at}, listed {listed:?}"
+                    );
+                    mail_since = woke_at;
+                    let t_every_mail_seen = (spec.backlog > 0).then(|| {
+                        for (i, sid) in sids.iter().enumerate().skip(1) {
+                            let text = format!("{mail}-to-{i}");
+                            let since = others_since.get(sid).copied().unwrap_or(0);
+                            let (id, _) = await_note(&mut mail_ctl, clock, sid, since)
+                                .unwrap_or_else(|e| panic!("the live mail `{text}`: {e}"));
+                            let listed = list_since(&mut mail_ctl, sid, since);
+                            assert!(
+                                listed.len() == 1 && listed[0].text == text && listed[0].id == id,
+                                "the live mail `{text}`: woke at row {id}, listed {listed:?}"
+                            );
+                            others_since.insert(sid.clone(), id);
+                        }
+                        clock.us()
+                    });
+                    await_attach(&mut watch, &node_subject, &session_subjects, new_pid);
+                    drop(watch);
+                    size_rounds.push(Round {
+                        sessions: size,
+                        mark,
+                        pid: new_pid,
+                        t_kill,
+                        t_pid,
+                        sids: sids.clone(),
+                        mail,
+                        t_mail_seen,
+                        t_every_mail_seen,
+                        t_posted,
+                    });
                 }
-                let mark = broker.visible_head();
-                let mut watch = w
-                    .god()
-                    .subscribe(mark, &presence_filter)
-                    .unwrap_or_else(|e| panic!("subscribe to {presence_filter} from {mark}: {e}"));
-                watch
-                    .set_read_timeout(Some(DEADLINE))
-                    .expect("bound the presence subscription");
-                let t_kill = clock.us();
-                harness::kill(pid, 9);
-                let mail = format!("live-{}", rounds.len());
-                post(&mut mail_ctl, clock, &mailer, &mailer, &mail);
-                let new_pid = aterm_spec::wait::within(DEADLINE, PID_POLL, || {
-                    read_pid(&w).filter(|p| *p != pid)
-                })
-                .unwrap_or_else(|| panic!("the bridge did not come back within {DEADLINE:?}"));
-                let t_pid = clock.us();
-                pid = new_pid;
-                up_since = Instant::now();
-                let (woke_at, t_mail_seen) = await_note(&mut mail_ctl, clock, &mailer, mail_since)
-                    .unwrap_or_else(|e| panic!("the live mail `{mail}`: {e}"));
-                let listed = list_since(&mut mail_ctl, &mailer, mail_since);
-                assert!(
-                    listed.len() == 1 && listed[0].text == mail && listed[0].id == woke_at,
-                    "the live mail `{mail}`: woke at row {woke_at}, listed {listed:?}"
-                );
-                mail_since = woke_at;
-                await_attach(&mut watch, &node_subject, &session_subjects, new_pid);
-                drop(watch);
-                rounds.push(Round {
+                stop_steady.store(true, std::sync::atomic::Ordering::Relaxed);
+                let beats = steady
+                    .map(|h| h.join().expect("the paced publisher"))
+                    .unwrap_or_default();
+                (size_rounds, beats)
+            });
+            let (size_rounds, beats) = size_rounds;
+            steady_seq += beats.len() as u64;
+            if let Some(fill_ms) = fill_ms {
+                let windows: Vec<(u64, u64)> = size_rounds
+                    .iter()
+                    .map(|r| (r.t_kill, r.t_every_mail_seen.unwrap_or(r.t_mail_seen)))
+                    .collect();
+                backlogs.push(Backlog {
                     sessions: size,
-                    mark,
-                    pid: new_pid,
-                    t_kill,
-                    t_pid,
-                    sids: sids.clone(),
-                    mail,
-                    t_mail_seen,
+                    fill_ms,
+                    steady: backlog::split(&beats, &windows),
                 });
             }
+            rounds.extend(size_rounds);
         }
         await_durable(broker);
-        rounds
+        (rounds, backlogs)
     });
-    let cal_after = calibrate(&ruler, &w, clock, &mut cal_seq);
+    let (rounds, backlogs) = rounds;
+    let cal_after = calibrate(&ruler, &w.node, clock, &mut cal_seq);
     let unit = yardstick(&cal_before, &cal_after);
     let recs = stop_and_read(&mut w);
     let fired = census::will_firings(&recs);
 
     let mut by_size: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
-    let mut series: BTreeMap<usize, [Vec<f64>; 8]> = BTreeMap::new();
+    let mut series: BTreeMap<usize, [Vec<f64>; 10]> = BTreeMap::new();
+    let steady_subject = backlog::steady_subject();
     let mut records: BTreeMap<usize, AttachRecords> = BTreeMap::new();
     for r in &rounds {
         let rows: Vec<(u64, &str, &str)> = recs
@@ -1526,7 +1907,14 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             r.mail,
             found.node
         );
-        let in_window = || census::window(&recs, r.mark, last).filter(|rec| rec.seq != mail_seq);
+        let others = format!("{}-to-", r.mail);
+        let in_window = || {
+            census::window(&recs, r.mark, last).filter(|rec| {
+                rec.seq != mail_seq
+                    && !rec.text.starts_with(&others)
+                    && rec.subject != steady_subject
+            })
+        };
         let c = census::census(in_window().filter(|rec| !fired.contains(&rec.seq)));
         let fired_here = in_window().filter(|rec| fired.contains(&rec.seq)).count();
         let s = series.entry(r.sessions).or_default();
@@ -1538,6 +1926,10 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         s[5].extend(ms_opt(Some(r.t_pid), t_all_durable));
         s[6].push(ms(r.t_kill, r.t_mail_seen));
         s[7].extend(ms_opt(t_all, Some(r.t_mail_seen)));
+        s[8].extend(ms_opt(Some(r.t_kill), r.t_every_mail_seen));
+        if r.t_every_mail_seen.is_some() {
+            s[9].push(ms(r.t_kill, r.t_posted));
+        }
         by_size.entry(r.sessions).or_default().push(json!({
             "mark": r.mark,
             "pid": r.pid,
@@ -1549,6 +1941,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "kill_to_pid_ms": stats::round3(ms(r.t_kill, r.t_pid)),
             "pid_to_all_ms": ms_opt(Some(r.t_pid), t_all).map(stats::round3),
             "kill_to_live_mail_ms": stats::round3(ms(r.t_kill, r.t_mail_seen)),
+            "kill_to_every_live_mail_ms": ms_opt(Some(r.t_kill), r.t_every_mail_seen).map(stats::round3),
         }));
         let rec = records.entry(r.sessions).or_default();
         rec.censuses.push(c);
@@ -1591,20 +1984,8 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             .to_string(),
         "|---:|---:|---:|---:|---:|".to_string(),
     ];
-    let names = [
-        "**pid -> every row acked (attach)**",
-        "pid -> node row acked",
-        "node row -> last session row",
-        "kill -> new pid (supervisor relaunch)",
-        "kill -> every row acked",
-        "pid -> every row durable",
-        "**kill -> the first live mail visible**",
-        "every row acked -> the live mail visible (the mirror's start, the refill, the drain)",
-    ];
     for (size, s) in &series {
-        for (name, values) in names.iter().zip(s.iter()) {
-            md.push(format!("| {size} |{}", &stats::row(name, values)[1..]));
-        }
+        md.extend(attach_table_rows(*size, s, spec.backlog));
         let rec = &records[size];
         let recs_per: Vec<f64> = rec.censuses.iter().map(|c| c.total as f64).collect();
         let commits_per: Vec<f64> = rec.censuses.iter().map(|c| c.commits as f64).collect();
@@ -1637,6 +2018,8 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "attach_durable_ms": stats::to_json(&s[5]),
             "kill_to_live_mail_ms": stats::to_json(&s[6]),
             "attach_to_live_mail_ms": stats::to_json(&s[7]),
+            "kill_to_every_live_mail_ms": stats::to_json(&s[8]),
+            "kill_to_posted_ms": stats::to_json(&s[9]),
             "records_per_attach": stats::to_json(&recs_per),
             "commit_records_per_attach": stats::to_json(&commits_per),
             "records_by_kind_mean": Value::Object(by_kind),
@@ -1674,6 +2057,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         ));
     }
     md.push(String::new());
+    let backlog_json = backlog_report(spec, &w.node, &backlogs, &mut md);
     md.extend(yardstick_rows(&ruler, &cal_before, &cal_after));
     md.extend(normalized);
     md.push(String::new());
@@ -1684,6 +2068,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "durable_head_changes_sampled": heads.durable.len(),
         "yardstick": yardstick_json(&ruler, &cal_before, &cal_after, unit),
         "sizes": Value::Array(sizes),
+        "backlog": backlog_json,
     });
     drop(ruler);
     (json, md)
@@ -1774,6 +2159,10 @@ pub fn measure(spec: &Spec) -> Report {
     let (handoff, handoff_md) = measure_scenario(spec.scenario, Scenario::Handoff, || {
         handoff::measure(spec, clock)
     });
+    let (asks, asks_md) =
+        measure_scenario(spec.scenario, Scenario::Ask, || ask::measure(spec, clock));
+    let (cross, cross_md) =
+        measure_scenario(spec.scenario, Scenario::Ask, || cross::measure(spec, clock));
     let mut md = vec![
         format!("**Broker:** {}", broker_note(spec)),
         String::new(),
@@ -1791,6 +2180,8 @@ pub fn measure(spec: &Spec) -> Report {
     md.extend(pingpong_md);
     md.extend(attach_md);
     md.extend(handoff_md);
+    md.extend(asks_md);
+    md.extend(cross_md);
     let binary_at_end = binary_identity();
     let arm = Profile::of_binary(Path::new(harness::aterm()));
     let json = json!({
@@ -1809,6 +2200,8 @@ pub fn measure(spec: &Spec) -> Report {
         "pingpong": pingpong,
         "attach": attach,
         "handoff": handoff,
+        "ask": asks,
+        "cross_node": cross,
     });
     Report {
         json,
@@ -1824,12 +2217,86 @@ fn binary_identity() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The attach table keeps every row a run measured, an empty one too (a
+    /// relaxed run's `pid -> every row durable`, an acked head that never
+    /// landed), and leaves out only the backlog's own two rows on a run
+    /// without a backlog.
+    #[test]
+    fn the_attach_table_keeps_an_empty_row_and_names_the_backlogs_only_with_one() {
+        use super::*;
+
+        let mut series: [Vec<f64>; 10] = Default::default();
+        for (i, s) in series.iter_mut().enumerate() {
+            if i != 5 && i < ATTACH_BACKLOG_ROWS {
+                s.push(1.0);
+            }
+        }
+        let bare = attach_table_rows(8, &series, 0);
+        assert_eq!(bare.len(), ATTACH_BACKLOG_ROWS, "{bare:#?}");
+        assert_eq!(
+            bare[5], "| 8 | pid -> every row durable | 0 | – | – | – | – |",
+            "the empty row is a hole the table shows"
+        );
+        assert!(bare.iter().all(|row| !row.contains("the backlog's")));
+        let backlog = attach_table_rows(8, &series, 1);
+        assert_eq!(backlog.len(), ATTACH_ROWS.len(), "{backlog:#?}");
+        assert!(
+            backlog[ATTACH_BACKLOG_ROWS..]
+                .iter()
+                .all(|row| row.contains("the backlog's") && row.contains("| 0 |"))
+        );
+    }
+
+    /// The wait for a commit takes the log lock only when the lock-free head moved: the
+    /// head reads 5, 5, 5, 6, 6, 7, 7, 8, and the group resumes past offset 6 once the head
+    /// is at 8 (the commit at 7 visible). Eight polls, and four reads of the group's place,
+    /// one at each head.
+    #[test]
+    fn the_commit_wait_reads_the_groups_place_only_when_the_head_moved() {
+        use super::*;
+        use std::cell::Cell;
+
+        let heads = [5, 5, 5, 6, 6, 7, 7, 8];
+        let polls = Cell::new(0);
+        let starts = Cell::new(Vec::new());
+        let head = || {
+            let h = heads[polls.get()];
+            polls.set(polls.get() + 1);
+            h
+        };
+        let start = || {
+            let at = heads[polls.get() - 1];
+            let mut seen = starts.take();
+            seen.push(at);
+            starts.set(seen);
+            if at >= 8 { 7 } else { 6 }
+        };
+        let mut probe = commit_counted(6, head, start);
+        let answers: Vec<Option<()>> = (0..heads.len()).map(|_| probe()).collect();
+        assert_eq!(
+            answers,
+            [None, None, None, None, None, None, None, Some(())],
+            "the commit counts at the last poll, and not before"
+        );
+        drop(probe);
+        assert_eq!(
+            starts.take(),
+            [5, 6, 7, 8],
+            "one read of the group's place per head"
+        );
+    }
+
     #[test]
     fn only_selected_scenarios_are_measured() {
         use super::*;
         use std::cell::Cell;
 
-        for phase in [Scenario::Messaging, Scenario::Attach, Scenario::Handoff] {
+        for phase in [
+            Scenario::Messaging,
+            Scenario::Attach,
+            Scenario::Handoff,
+            Scenario::Ask,
+        ] {
             let (json, markdown) = measure_scenario(Scenario::Pingpong, phase, || {
                 panic!("pingpong-only started {}", phase.word());
             });
@@ -1854,6 +2321,7 @@ mod tests {
             Scenario::Pingpong,
             Scenario::Attach,
             Scenario::Handoff,
+            Scenario::Ask,
         ] {
             let (json, markdown) = measure_scenario(Scenario::All, phase, || {
                 calls.set(calls.get() + 1);
@@ -1865,7 +2333,7 @@ mod tests {
             assert_eq!(json["measured"].as_str(), Some(phase.word()));
             assert_eq!(markdown, [phase.word()]);
         }
-        assert_eq!(calls.get(), 4);
+        assert_eq!(calls.get(), 5);
     }
 
     #[test]
@@ -1880,8 +2348,8 @@ mod tests {
         let bare = opts_for(&spec(""));
         let shipped = harness::broker_opts(aterm_link::durability::default_for(true));
         assert_eq!(
-            (bare.durability, bare.escalation),
-            (shipped.durability, shipped.escalation),
+            (&bare.durability, &bare.escalation),
+            (&shipped.durability, &shipped.escalation),
             "the bench's default arm is aterm's default for its guarded broker"
         );
         let strict = opts_for(&spec("durability=strict"));

@@ -379,10 +379,10 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
         &home.join("idle/target/criterion/bench/base/estimates.json"),
         4096,
     )?;
-    let mirror = home
-        .join("Library/Caches/aterm/cargo-build.noindex")
-        .join(home.strip_prefix("/").unwrap_or(&home))
-        .join("gone/ws/.cargo-build");
+    let mirror = atpkg::build_cache::build_dir(
+        &atpkg::build_cache::cache_root(&home),
+        &home.join("gone/ws"),
+    );
     lay_target(&mirror)?;
     std::fs::create_dir_all(home.join(".local/bin")).map_err(|e| format!("bin: {e}"))?;
     // No tool is built there: the link dangles, which keeps linked/'s build and nothing else.

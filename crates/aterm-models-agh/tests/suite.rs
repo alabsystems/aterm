@@ -6,4 +6,6 @@
 //! that is not a `mod` line here never compiles. Run one file's tests with
 //! `targo --unverified test -p aterm-models-agh --test suite -- route_wall::`.
 
+mod ensure_once;
+mod git_grant;
 mod route_wall;

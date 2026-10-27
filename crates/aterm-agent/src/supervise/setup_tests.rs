@@ -41,7 +41,8 @@ fn every_field_moved(dir: &Path) -> SessionSetup {
             short_backoff_max: d(7),
             retry_backoff: vec![d(8), d(9)],
             net_backoff: vec![d(10)],
-            down_hold: d(11),
+            outage_first: d(11),
+            outage_cap: d(60),
             progress: d(12),
             reset_grace: d(13),
             reset_jitter: d(14),
@@ -245,7 +246,7 @@ fn an_older_tape_waits_in_the_step_its_recorded_settle_gave() {
 }
 
 #[test]
-fn the_ladder_seam_scales_the_short_back_off_ladder_and_nothing_else() {
+fn the_ladder_seam_scales_the_short_and_outage_ladders_and_nothing_else() {
     use std::ffi::OsStr;
     let shipped = TurnEndTiming::default();
     let scaled = TurnEndTiming::default().ladder_scaled(0.125);
@@ -257,16 +258,29 @@ fn the_ladder_seam_scales_the_short_back_off_ladder_and_nothing_else() {
             })
             .collect()
     };
+    let outage = |t: &TurnEndTiming| -> Vec<u64> {
+        (0..7)
+            .map(|n| crate::supervise::ladder::doubling(t.outage_first, n, t.outage_cap).as_secs())
+            .collect()
+    };
     assert_eq!(steps(&scaled), [15, 30, 60, 120, 240, 450, 450]);
     assert_eq!(steps(&shipped), [120, 240, 480, 960, 1920, 3600, 3600]);
+    assert_eq!(
+        outage(&scaled),
+        steps(&scaled),
+        "the outage ladder scales as the short one"
+    );
+    assert_eq!(outage(&shipped), steps(&shipped));
     assert_eq!(
         TurnEndTiming {
             short_backoff: shipped.short_backoff,
             short_backoff_max: shipped.short_backoff_max,
+            outage_first: shipped.outage_first,
+            outage_cap: shipped.outage_cap,
             ..scaled.clone()
         },
         shipped,
-        "only the ladder moves"
+        "only the ladders move"
     );
     assert_eq!(TurnEndTiming::default().ladder_scaled(1.0), shipped);
     let read = |v: &str| TurnEndTiming::ladder_scale(Some(OsStr::new(v)));

@@ -979,6 +979,64 @@ impl crate::App {
     }
 }
 
+/// `HarnessPolicyOneWriter` actions no shipping function performs, each waived where
+/// its Tier-1 (`tests`) binds it.
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "WriteOn",
+    reason = "The environment: a person saves aterm.toml with approvals on. The Tier-1 \
+              writes the real file and the real watcher read (observed_harness) sees it."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "WriteOff",
+    reason = "The environment: a person saves the kill switch, refused for a stray \
+              non-UTF-8 byte. The Tier-1 writes the real file and the real watcher read \
+              (observed_harness) sees it."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "Commit",
+    reason = "A seamless successor's Commit (Wake::ActivateCommittedHandoff), bound by the \
+              native-update handoff machines. Its one effect here, repost_after_commit, \
+              raises the process-wide REPOST_AFTER_COMMIT that a live watcher thread in \
+              the same test binary could consume, so the Tier-1 stands in for it."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "Forget",
+    reason = "An inline block of the watcher thread's loop (REPOST_AFTER_COMMIT's swap, \
+              then last_harness = None), which the Tier-1 transcribes: the loop polls \
+              forever and posts through a real event-loop proxy."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "SecondWriterOff",
+    reason = "The Buggy=1 mutant: an admission adopting its own kill switch, the design \
+              this replaced; no shipping code, and the Tier-1's negative control sees the \
+              step refused."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "SecondWriterOn",
+    reason = "The Buggy=1 mutant: an admission adopting its own approvals, the design this \
+              replaced; no shipping code, and the Tier-1's negative control sees the step \
+              refused."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HarnessPolicyOneWriter",
+    action = "CommitWithoutForget",
+    reason = "The Buggy=1 mutant: a Commit that raises no REPOST_AFTER_COMMIT; no shipping \
+              code (the Commit handler calls repost_after_commit)."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn harness_policy_one_writer_waivers() {}
+
 #[cfg(test)]
 pub(crate) mod tests {
     #[cfg(unix)]
@@ -2170,61 +2228,3 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
-
-/// `HarnessPolicyOneWriter` actions no shipping function performs, each waived where
-/// its Tier-1 (`tests`) binds it.
-#[cfg(any(test, debug_assertions))]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "HarnessPolicyOneWriter",
-    action = "WriteOn",
-    reason = "The environment: a person saves aterm.toml with approvals on. The Tier-1 \
-              writes the real file and the real watcher read (observed_harness) sees it."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "HarnessPolicyOneWriter",
-    action = "WriteOff",
-    reason = "The environment: a person saves the kill switch, refused for a stray \
-              non-UTF-8 byte. The Tier-1 writes the real file and the real watcher read \
-              (observed_harness) sees it."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "HarnessPolicyOneWriter",
-    action = "Commit",
-    reason = "A seamless successor's Commit (Wake::ActivateCommittedHandoff), bound by the \
-              native-update handoff machines. Its one effect here, repost_after_commit, \
-              raises the process-wide REPOST_AFTER_COMMIT that a live watcher thread in \
-              the same test binary could consume, so the Tier-1 stands in for it."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "HarnessPolicyOneWriter",
-    action = "Forget",
-    reason = "An inline block of the watcher thread's loop (REPOST_AFTER_COMMIT's swap, \
-              then last_harness = None), which the Tier-1 transcribes: the loop polls \
-              forever and posts through a real event-loop proxy."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "HarnessPolicyOneWriter",
-    action = "SecondWriterOff",
-    reason = "The Buggy=1 mutant: an admission adopting its own kill switch, the design \
-              this replaced; no shipping code, and the Tier-1's negative control sees the \
-              step refused."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "HarnessPolicyOneWriter",
-    action = "SecondWriterOn",
-    reason = "The Buggy=1 mutant: an admission adopting its own approvals, the design this \
-              replaced; no shipping code, and the Tier-1's negative control sees the step \
-              refused."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "HarnessPolicyOneWriter",
-    action = "CommitWithoutForget",
-    reason = "The Buggy=1 mutant: a Commit that raises no REPOST_AFTER_COMMIT; no shipping \
-              code (the Commit handler calls repost_after_commit)."
-)]
-#[allow(
-    dead_code,
-    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
-              not an expect: rustc does not lint a fn the declarative anchors rebuild"
-)]
-fn harness_policy_one_writer_waivers() {}

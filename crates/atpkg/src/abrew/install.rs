@@ -127,6 +127,20 @@ pub enum InstallError {
     Failed(String),
     /// Recipe or arguments need a native capability that is not implemented.
     Unsupported(String),
+    /// The user answered no at brew's confirmation prompt.
+    Aborted,
+}
+
+impl InstallError {
+    /// The failure or refusal text (an aborted prompt has none
+    /// of its own; callers that only ever see planning errors
+    /// use this for those).
+    pub fn message(&self) -> String {
+        match self {
+            InstallError::Failed(m) | InstallError::Unsupported(m) => m.clone(),
+            InstallError::Aborted => "aborted".to_string(),
+        }
+    }
 }
 
 impl From<String> for InstallError {
@@ -147,6 +161,9 @@ pub struct InstallOpts {
     pub reinstall: bool,
     /// Whether this formula is installed as another package's dependency.
     pub as_dependency: bool,
+    /// Brew's ask mode: prompt before proceeding when planned
+    /// dependencies will pour (cleared by --no-ask or the env).
+    pub ask: bool,
 }
 
 /// Resolves `name`'s runtime dependency install plan in dependency-first order.
@@ -183,11 +200,11 @@ pub(super) struct DryRow {
 pub(super) fn warn_already_installed(prefix: &Prefix, inst: &Installed, version: &str) {
     let full = prefix.specified_name(inst);
     if is_linked(prefix, &inst.name, version) {
-        eprintln!("Warning: {full} {version} is already installed and up-to-date.");
+        super::tty::opoo!("Warning: {full} {version} is already installed and up-to-date.");
         eprintln!("To reinstall {version}, run:");
         eprintln!("  brew reinstall {}", inst.name);
     } else {
-        eprintln!("Warning: {full} {version} is already installed, it's just not linked.");
+        super::tty::opoo!("Warning: {full} {version} is already installed, it's just not linked.");
         eprintln!("To link this version, run:");
         eprintln!("  brew link {full}");
     }
@@ -474,27 +491,87 @@ pub fn install(
         && !opts.as_dependency
         && !top_current;
     let parents = dep_parents(&planned, &top_short);
-    if narrate && let Some(f) = top {
-        println!("==> Installing {} from {}", f.name, tap_of(f));
-        let deps: Vec<String> = planned
-            .iter()
-            .filter(|d| d.name != top_short)
-            .map(|d| d.name.clone())
-            .collect();
-        if !deps.is_empty() {
+    // Brew's plain-install narration: the requested formula's
+    // manifest first, then the plan (only when dependencies will
+    // pour), then every download under one heading, then the
+    // pours. The phases below run in that order.
+    let will_pour = |f: &Formula| -> bool {
+        opts.force
+            || prefix
+                .installed_one(Kind::Formula, &f.name)
+                .is_none_or(|inst| {
+                    version_cmp(&inst.version, &keg_version(f)) == std::cmp::Ordering::Less
+                })
+    };
+    let pouring_deps: Vec<&Formula> = planned
+        .iter()
+        .filter(|f| f.name != top_short && will_pour(f))
+        .collect();
+    if narrate && let Some(top_f) = top {
+        if !bottle_manifest_cached(prefix, top_f) {
+            eprintln!("{}", super::tty::oh1("Downloading bottle manifests"));
+            if fetch_bottle_manifest(prefix, top_f)? {
+                eprintln!("✔︎ Bottle Manifest {} ({})", top_f.name, keg_version(top_f));
+            }
+        }
+        if !pouring_deps.is_empty() {
+            let row = |f: &Formula| DryRow {
+                name: specified_of(&f.full_name),
+                old_version: prefix
+                    .installed_one(Kind::Formula, &f.name)
+                    .filter(|inst| inst.version != keg_version(f))
+                    .map(|inst| inst.version),
+                new_version: keg_version(f),
+            };
+            let dep_rows: Vec<DryRow> = pouring_deps.iter().map(|f| row(f)).collect();
+            super::commands::print_dry_sections(
+                &[(top_short.clone(), Some(row(top_f)), dep_rows)],
+                &[],
+            );
+            if opts.ask {
+                ask_to_proceed("installation")?;
+            }
+        }
+        eprintln!(
+            "{}",
+            super::tty::oh1(&format!(
+                "Fetching downloads for: {}",
+                specified_of(&top_f.full_name)
+            ))
+        );
+        for f in planned.iter().filter(|f| will_pour(f)) {
+            fetch_bottle(prefix, f, opts.quiet, true)?;
+        }
+        let tap = tap_of(top_f);
+        if tap != "homebrew/core" {
             println!(
-                "==> Installing dependencies for {}: {}",
-                specified_of(&f.full_name),
-                super::commands::to_sentence(&deps)
+                "{}",
+                super::tty::ohai(&format!("Installing {} from {}", top_f.name, tap))
             );
         }
     }
+    // Children that will pour, per parent, for brew's
+    // more-than-one dependency roll headline.
+    let mut rolls: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for dep in &pouring_deps {
+        let parent = parents
+            .get(&dep.name)
+            .map_or(top_short.as_str(), String::as_str);
+        rolls
+            .entry(parent.to_string())
+            .or_default()
+            .push(dep.name.clone());
+    }
+    let mut rolls_printed: BTreeSet<String> = Default::default();
+    let mut caveat_notes: Vec<(String, String)> = Vec::new();
+    let mut completion_notes: Vec<String> = Vec::new();
     let mut last = String::new();
     let mut installed_now: Vec<String> = Vec::new();
     let mut completed = false;
     for (f, link) in planned.iter().zip(link_states) {
         let version = keg_version(f);
         let mut replacing = ReplaceMode::None;
+        let mut old_version: Option<String> = None;
         if let Some(inst) = prefix.installed_one(Kind::Formula, &f.name) {
             if !opts.force && version_cmp(&inst.version, &version) != std::cmp::Ordering::Less {
                 if !opts.quiet {
@@ -506,6 +583,7 @@ pub fn install(
             replacing = if inst.version == version {
                 ReplaceMode::SameKeg
             } else {
+                old_version = Some(inst.version.clone());
                 ReplaceMode::NewKeg
             };
         }
@@ -524,25 +602,49 @@ pub fn install(
                 let parent = parents
                     .get(&f.name)
                     .map_or(top_short.as_str(), String::as_str);
-                println!("==> Installing {parent} dependency: {} ({version})", f.name);
+                if let Some(children) = rolls.get(parent)
+                    && children.len() > 1
+                    && rolls_printed.insert(parent.to_string())
+                {
+                    let parent_full = planned
+                        .iter()
+                        .find(|p| p.name == parent)
+                        .map_or(parent, |p| p.full_name.as_str());
+                    let names: Vec<String> =
+                        children.iter().map(|n| super::tty::ident(n)).collect();
+                    println!(
+                        "{}",
+                        super::tty::oh1(&format!(
+                            "Installing dependencies for {}: {}",
+                            specified_of(parent_full),
+                            super::commands::to_sentence(&names)
+                        ))
+                    );
+                }
+                let from = old_version
+                    .as_ref()
+                    .map_or_else(String::new, |old| format!("{old} -> "));
+                println!(
+                    "{}",
+                    super::tty::oh1(&format!(
+                        "Installing {parent} dependency: {} ({from}{version})",
+                        super::tty::ident(&f.name)
+                    ))
+                );
             }
-            match install_one(prefix, f, on_request, link, replacing, opts.quiet) {
+            if narrate && f.name == top_short && !pouring_deps.is_empty() {
+                println!(
+                    "{}",
+                    super::tty::oh1(&format!("Installing {}", specified_of(&f.full_name)))
+                );
+            }
+            match install_one(prefix, f, on_request, link, replacing, opts.quiet, narrate) {
                 Ok(()) => {
                     completed = true;
                     if !prior.contains_key(&f.name) {
                         installed_now.push(f.name.clone());
                     }
                     if !opts.quiet {
-                        if !f.caveats.trim().is_empty() {
-                            println!("==> Caveats");
-                            println!(
-                                "{}",
-                                f.caveats
-                                    .replace("$HOMEBREW_PREFIX", &prefix.root.to_string_lossy())
-                                    .replace("$HOMEBREW_CELLAR", &prefix.cellar().to_string_lossy())
-                                    .trim_end()
-                            );
-                        }
                         let keg = prefix.keg(&f.name, &version);
                         let shown = std::fs::canonicalize(&keg).unwrap_or_else(|_| keg.clone());
                         let summary =
@@ -550,6 +652,25 @@ pub fn install(
                         match super::install_badge() {
                             Some(badge) => println!("{badge}  {summary}"),
                             None => println!("{summary}"),
+                        }
+                        // Brew records caveats for requested
+                        // formulae and displays them after every
+                        // pour; the same for the generated
+                        // completion lines.
+                        if on_request {
+                            completion_notes.extend(super::commands::completions_and_elisp(
+                                prefix,
+                                f,
+                                &prefix.keg(&f.name, &version),
+                            ));
+                            let caveats = super::commands::formula_caveats_text(
+                                prefix,
+                                f,
+                                Some(&prefix.keg(&f.name, &version)),
+                            );
+                            if !caveats.is_empty() {
+                                caveat_notes.push((specified_of(&f.full_name), caveats));
+                            }
                         }
                     }
                 }
@@ -563,6 +684,16 @@ pub fn install(
             }
         }
         last = version;
+    }
+    if !opts.quiet && (!completion_notes.is_empty() || !caveat_notes.is_empty()) {
+        println!("{}", super::tty::oh1("Caveats"));
+        for note in &completion_notes {
+            print!("{note}");
+        }
+        for (package, text) in &caveat_notes {
+            println!("{}", super::tty::ohai(package));
+            print!("{text}");
+        }
     }
     if !opts.dry_run {
         prefix.rebuild_state()?;
@@ -1141,12 +1272,13 @@ fn install_one(
     link: bool,
     replace: ReplaceMode,
     quiet: bool,
+    prefetched: bool,
 ) -> Result<(), InstallError> {
     let version = keg_version(f);
     let keg = prefix.keg(&f.name, &version);
     let work =
         aterm_tempfile::TempDir::new_in(prefix.cellar()).map_err(|e| format!("abrew: {e}"))?;
-    let poured = pour_bottle(prefix, f, work.path(), quiet)?;
+    let poured = pour_bottle(prefix, f, work.path(), quiet, prefetched)?;
     // Brew substitutes the @@HOMEBREW_*@@ placeholders in text files
     // for EVERY bottle pour, `:any_skip_relocation` included (only
     // linkage fixups are skipped there). The macOS `:any` path does
@@ -1173,13 +1305,20 @@ fn install_one(
             leftovers.first().cloned().unwrap_or_default()
         )));
     }
+    let installed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .to_string();
+    let version_scheme = f.version_scheme.to_string();
     prefix.write_receipt(
         &poured,
         &[
             ("name", &f.name),
             ("version", &version),
+            ("version_scheme", &version_scheme),
             ("source", "bottle"),
             ("installed_by", "abrew"),
+            ("time", &installed_at),
             (
                 "installed_on_request",
                 if on_request { "true" } else { "false" },
@@ -1981,7 +2120,7 @@ fn activate_keg_with(
         return if refused.is_empty() {
             Err(error)
         } else {
-            let (InstallError::Failed(message) | InstallError::Unsupported(message)) = error;
+            let message = error.message();
             Err(InstallError::Failed(format!(
                 "{message}; could not restore aliases: {}",
                 refused.join(", ")
@@ -2035,9 +2174,7 @@ fn owned_keg_links(prefix: &Prefix, name: &str, include_opt: bool) -> Result<Vec
     if !super::valid_component(name) {
         return Err("abrew: invalid formula name".to_string());
     }
-    check_directory(&prefix.cellar().join(name), &prefix.root).map_err(|e| match e {
-        InstallError::Failed(message) | InstallError::Unsupported(message) => message,
-    })?;
+    check_directory(&prefix.cellar().join(name), &prefix.root).map_err(|e| e.message())?;
     let cellar = prefix.cellar().join(name);
     let mut links = Vec::new();
     for sub in ["bin", "sbin", "lib", "include", "share", "etc"] {
@@ -2126,18 +2263,24 @@ pub fn remove_dangling_links(prefix: &Prefix, name: &str) -> Result<usize, Strin
     Ok(removed)
 }
 
-fn pour_bottle(
+/// Download (or reuse) the manifest and bottle. When
+/// `announce`, each is reported like brew's download queue (a
+/// manifest only when this call fetched it, the bottle always).
+fn fetch_bottle(
     prefix: &Prefix,
     f: &Formula,
-    staging: &Path,
     quiet: bool,
-) -> Result<PathBuf, InstallError> {
+    announce: bool,
+) -> Result<(PathBuf, String), InstallError> {
     let Some(bottle) = f.bottle_for(&Machine::this().bottle_tags()).cloned() else {
         return Err(InstallError::Unsupported(format!(
             "no bottle for {} on this platform",
             f.name
         )));
     };
+    if fetch_bottle_manifest(prefix, f)? && announce && !quiet {
+        eprintln!("✔︎ Bottle Manifest {} ({})", f.name, keg_version(f));
+    }
     let bottle_tag = bottle.tag.clone();
     let (url, sha) = (bottle.url, bottle.sha256);
     let version = keg_version(f);
@@ -2156,8 +2299,26 @@ fn pour_bottle(
         fetch::curl_to_file(&url, &dest, &hrefs)?;
     }
     fetch::verify_digest_strict(&dest, &sha)?;
+    if announce && !quiet {
+        eprintln!("✔︎ Bottle {} ({version})", f.name);
+    }
+    Ok((dest, bottle_tag))
+}
+
+fn pour_bottle(
+    prefix: &Prefix,
+    f: &Formula,
+    staging: &Path,
+    quiet: bool,
+    prefetched: bool,
+) -> Result<PathBuf, InstallError> {
+    let (dest, bottle_tag) = fetch_bottle(prefix, f, quiet, !prefetched)?;
+    let version = keg_version(f);
     if !quiet {
-        println!("==> Pouring {}", bottle_filename(f, &bottle_tag));
+        println!(
+            "{}",
+            super::tty::ohai(&format!("Pouring {}", bottle_filename(f, &bottle_tag)))
+        );
     }
     fetch::untar(&dest, staging)?;
     selected_bottle_payload(staging, &f.name, &version)
@@ -2253,9 +2414,17 @@ pub fn uninstall(
 ) -> Result<(), InstallError> {
     let short = Formula::short_name(name);
     let Some(inst) = prefix.installed_one(Kind::Formula, short) else {
-        return Err(InstallError::Failed(format!(
-            "abrew: {short} is not installed"
-        )));
+        // Brew's resolution order: a known formula is a missing
+        // keg, a known cask is its not-installed error, and a
+        // name nothing answers to is unavailable.
+        let sentence = if api.formula(name).is_ok() || super::tap::lookup(prefix, name).is_some() {
+            format!("No such keg: {}", prefix.cellar().join(short).display())
+        } else if api.cask(short).is_ok() {
+            format!("Cask '{short}' is not installed.")
+        } else {
+            super::commands::formula_unavailable(api, name)
+        };
+        return Err(InstallError::Failed(format!("Error: {sentence}")));
     };
     if !ignore_dependencies {
         let deps_on = dependents(api, prefix, short)?;
@@ -2303,6 +2472,124 @@ pub fn uninstall(
 }
 
 /// Downloads and verifies `f`'s bottle or source tarball into the cache without installing.
+/// The OCI bottle manifest brew downloads beside every GHCR
+/// bottle (its annotations carry the tab attributes). Cached as
+/// `{name}-{keg_version}.bottle_manifest.json`; `Ok(false)` when
+/// the bottle has no GHCR manifest resource (non-GHCR root).
+/// Brew `Homebrew::Ask.confirm?`: on a terminal, show the
+/// proceed prompt and read single characters; only `y`
+/// proceeds. Without a terminal it never prompts.
+pub(super) fn ask_to_proceed(action: &str) -> Result<(), InstallError> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(());
+    }
+    println!(
+        "{}",
+        super::tty::ohai(&format!("Do you want to proceed with the {action}? [y/n]"))
+    );
+    // Single-character reads, like IO#getch: raw mode for the
+    // prompt's duration so y/n register without Enter.
+    #[cfg(unix)]
+    struct RawMode(libc::termios);
+    #[cfg(unix)]
+    impl RawMode {
+        fn engage() -> Option<Self> {
+            unsafe {
+                let mut prior: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(libc::STDIN_FILENO, &raw mut prior) != 0 {
+                    return None;
+                }
+                let mut raw = prior;
+                libc::cfmakeraw(&raw mut raw);
+                if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const raw) == 0 {
+                    Some(Self(prior))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for RawMode {
+        fn drop(&mut self) {
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const self.0);
+            }
+        }
+    }
+    // No termios off unix: reads stay line-buffered there.
+    #[cfg(not(unix))]
+    struct RawMode;
+    #[cfg(not(unix))]
+    impl RawMode {
+        fn engage() -> Option<Self> {
+            Some(Self)
+        }
+    }
+    let mut stdin = std::io::stdin().lock();
+    use std::io::Read as _;
+    loop {
+        // Raw mode per read, restored between reads like IO#getch.
+        let _raw = RawMode::engage();
+        let mut byte = [0u8; 1];
+        let read = stdin.read(&mut byte);
+        drop(_raw);
+        match read {
+            Ok(1) => match byte[0] {
+                b'y' | b'Y' => return Ok(()),
+                b'n' | b'N' | 0x1b | 0x03 | 0x04 => return Err(InstallError::Aborted),
+                _ => println!("Invalid input. Please press 'y' to proceed, or 'n' to abort."),
+            },
+            _ => return Err(InstallError::Aborted),
+        }
+    }
+}
+
+pub(super) fn bottle_manifest_dest(prefix: &Prefix, f: &Formula) -> PathBuf {
+    prefix.cache().join(format!(
+        "{}-{}.bottle_manifest.json",
+        f.name,
+        keg_version(f)
+    ))
+}
+
+/// Whether a usable bottle manifest is already in the cache
+/// (brew only downloads — and only reports — the ones missing).
+pub fn bottle_manifest_cached(prefix: &Prefix, f: &Formula) -> bool {
+    std::fs::read(bottle_manifest_dest(prefix, f)).is_ok_and(|b| b.starts_with(b"{"))
+}
+
+/// Fetch the bottle manifest when missing; `true` when this call
+/// downloaded it (the case brew reports with a ✔ line).
+pub fn fetch_bottle_manifest(prefix: &Prefix, f: &Formula) -> Result<bool, InstallError> {
+    let Some(bottle) = f.bottle_for(&Machine::this().bottle_tags()).cloned() else {
+        return Ok(false);
+    };
+    let Some(repo) = super::api::ghcr_repo_of(&bottle.url) else {
+        return Ok(false);
+    };
+    let version = keg_version(f);
+    let tag = if f.bottle_rebuild > 0 {
+        format!("{version}-{}", f.bottle_rebuild)
+    } else {
+        version.clone()
+    };
+    let dest = bottle_manifest_dest(prefix, f);
+    if bottle_manifest_cached(prefix, f) {
+        return Ok(false);
+    }
+    prefix.ensure()?;
+    let headers = [
+        format!("Authorization: Bearer {}", super::api::ghcr_token(&repo)?),
+        "Accept: application/vnd.oci.image.index.v1+json".to_string(),
+    ];
+    let hrefs: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let url = format!("https://ghcr.io/v2/{repo}/manifests/{tag}");
+    fetch::curl_to_file(&url, &dest, &hrefs)?;
+    Ok(true)
+}
+
 pub fn fetch_only(prefix: &Prefix, f: &Formula) -> Result<PathBuf, InstallError> {
     if !super::valid_component(&f.name) || !super::valid_cask_version(&keg_version(f)) {
         return Err(InstallError::Unsupported(
@@ -2310,6 +2597,7 @@ pub fn fetch_only(prefix: &Prefix, f: &Formula) -> Result<PathBuf, InstallError>
         ));
     }
     prefix.ensure()?;
+    fetch_bottle_manifest(prefix, f)?;
     let Some(bottle) = f.bottle_for(&Machine::this().bottle_tags()).cloned() else {
         return Err(InstallError::Unsupported(format!(
             "no bottle for {} on this platform; fetch -s for source",

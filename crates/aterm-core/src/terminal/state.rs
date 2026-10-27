@@ -36,6 +36,15 @@ pub struct ContentScrollState {
     pub band_seq: u64,
     /// The ring of the most recent [`CONTENT_SCROLL_BAND_RING`] moves.
     pub bands: [RowBandMove; CONTENT_SCROLL_BAND_RING],
+    /// Full clears of the primary screen from home (ED 2 or ED 0 with the
+    /// cursor at the top-left: `clear`, Ctrl-L). No row moved, so
+    /// [`Self::delta_since`] reads none of them, but no row kept its content:
+    /// whatever a host anchored to the old screen's letters has nothing left
+    /// under it. An ED 2 with the cursor elsewhere is a repaint in place (a
+    /// prompt's redraw, an input box moved by a program), whose letters come
+    /// back where they were: the owner's 2026-09-10 report "when the screen
+    /// is refreshed the rainbow disapears" (`an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it`).
+    pub screen_clears: u64,
 }
 
 /// Host coordinate update action between two [`ContentScrollState`] snapshots.
@@ -189,11 +198,9 @@ pub struct Terminal {
     pub(super) title: TitleState,
     /// Bell callback (called when BEL is received).
     pub(super) bell_callback: Option<Box<dyn FnMut() + Send>>,
-    /// Host resolver for Kitty non-direct transmission mediums (`t=f`, `t=t`, `t=s`).
-    #[allow(clippy::type_complexity)]
-    pub(super) kitty_file_resolver: Option<
-        Box<dyn Fn(crate::terminal::kitty_graphics::KittyMedium, &str) -> Option<Vec<u8>> + Send>,
-    >,
+    /// Host resolver for Kitty non-direct transmission mediums (`t=f`, `t=t`, `t=s`), reached
+    /// only through a capability ([`super::kitty_auth`]).
+    pub(super) kitty_file_resolver: super::kitty_auth::KittyResolverSlot,
     /// Last time a BEL callback fired, for rate limiting BEL floods.
     pub(super) last_bell_time: Option<aterm_time::Instant>,
     /// Monotonic count of bells that fired past the throttle (`subscribe events`).
@@ -307,6 +314,8 @@ pub struct Terminal {
     pub(super) content_scroll_state: ContentScrollState,
     /// Journal of active-grid resizes ([`super::resize_journal`]).
     pub(super) resize_journal: super::resize_journal::ResizeJournal,
+    /// Journal of host-side mutations ([`super::host_journal`]).
+    pub(super) host_journal: super::host_journal::HostJournal,
 }
 
 impl std::fmt::Debug for Terminal {
@@ -394,7 +403,9 @@ impl Terminal {
     #[must_use]
     #[inline]
     pub const fn content_scroll_state(&self) -> ContentScrollState {
-        self.content_scroll_state
+        let mut state = self.content_scroll_state;
+        state.screen_clears = self.transient.primary_clears;
+        state
     }
 
     /// Revision for top-anchored protected-footer row insertions.

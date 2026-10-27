@@ -422,7 +422,7 @@ impl Prefix {
         let target = std::fs::read_link(self.opt(name)).ok()?;
         let version = target.file_name()?.to_str()?.to_owned();
         let keg = self.keg(name, &version);
-        (target == keg
+        (resolve_link_target(&self.root.join("opt"), &target) == keg
             && std::fs::symlink_metadata(&keg).is_ok_and(|metadata| metadata.file_type().is_dir())
             && owned_receipt(&keg, Kind::Formula, name, &version))
         .then_some(version)
@@ -444,7 +444,7 @@ impl Prefix {
         let target = std::fs::read_link(self.root.join("Pinned").join(name)).ok()?;
         let version = target.file_name()?.to_str()?.to_owned();
         let keg = self.keg(name, &version);
-        (target == keg
+        (resolve_link_target(&self.root.join("Pinned"), &target) == keg
             && std::fs::symlink_metadata(&keg).is_ok_and(|metadata| metadata.file_type().is_dir())
             && owned_receipt(&keg, Kind::Formula, name, &version))
         .then_some(version)
@@ -682,7 +682,7 @@ impl Prefix {
         };
         let keg = self.keg(name, version);
         super::valid_cask_version(version)
-            && target == keg
+            && resolve_link_target(&self.root.join("Pinned"), &target) == keg
             && matches!(std::fs::symlink_metadata(&keg), Err(error)
                 if error.kind() == std::io::ErrorKind::NotFound)
     }
@@ -969,6 +969,29 @@ pub(super) fn receipt_word(dir: &Path, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A symlink target resolved against its link's directory, with
+/// `.`/`..` folded lexically. Abrew writes absolute opt/pin
+/// links; brew writes relative ones (`../Cellar/...`), and state
+/// touched by either must read the same.
+fn resolve_link_target(parent: &Path, target: &Path) -> PathBuf {
+    let joined = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        parent.join(target)
+    };
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub(super) fn owned_receipt(dir: &Path, kind: Kind, name: &str, version: &str) -> bool {
     let Ok(bytes) =
         crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 64 * 1024)
@@ -1153,6 +1176,44 @@ mod tests {
         p.unpin_cask("widget").unwrap();
         assert!(!p.cask_is_pinned("widget"));
         assert!(std::fs::symlink_metadata(&pins).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn relative_opt_and_pin_links_resolve() {
+        // Brew writes opt/pin links relative (`../Cellar/...`);
+        // abrew's own are absolute. Both spellings must read.
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let keg = p.keg("widget", "1.0");
+        std::fs::create_dir_all(&keg).unwrap();
+        p.write_receipt(
+            &keg,
+            &[
+                ("installed_by", "abrew"),
+                ("name", "widget"),
+                ("version", "1.0"),
+            ],
+        )
+        .unwrap();
+        let opt_dir = p.root.join("opt");
+        std::fs::create_dir_all(&opt_dir).unwrap();
+        symlink_dir(
+            std::path::Path::new("../Cellar/widget/1.0"),
+            &opt_dir.join("widget"),
+        )
+        .unwrap();
+        assert_eq!(p.optlinked_version("widget").as_deref(), Some("1.0"));
+        let pins = p.root.join("Pinned");
+        std::fs::create_dir_all(&pins).unwrap();
+        symlink_dir(
+            std::path::Path::new("../Cellar/widget/1.0"),
+            &pins.join("widget"),
+        )
+        .unwrap();
+        assert_eq!(p.pinned_version("widget").as_deref(), Some("1.0"));
+        assert!(p.is_pinned("widget"));
     }
 
     #[test]

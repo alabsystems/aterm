@@ -65,6 +65,9 @@ mod gates;
 #[path = "../../src/github.rs"]
 #[allow(dead_code)]
 mod github;
+#[path = "../../src/harness_versions.rs"]
+#[allow(dead_code)]
+mod harness_versions;
 #[path = "../../src/hook.rs"]
 #[allow(dead_code)]
 mod hook;

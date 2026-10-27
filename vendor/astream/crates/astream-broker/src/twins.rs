@@ -165,7 +165,6 @@ pub const fn storage_len_advance(cur_len: u64, next_len: u64) -> u64 {
 
 /// `sharded_clamp_index` as `sharded_island.rs` defines it in Clean:
 /// `if idx < shards then idx else shards`.
-#[cfg(unix)]
 #[must_use]
 pub const fn sharded_clamp_index(idx: u64, shards: u64) -> u64 {
     if idx < shards {
@@ -205,6 +204,50 @@ pub const fn broker_batch_clamp(queued: u64, max_batch: u64) -> u64 {
         queued
     } else {
         max_batch
+    }
+}
+
+/// `broker_bt_advance` as `bt_island.rs` defines it in Clean:
+/// `if prev_bt < wall_ms then wall_ms else prev_bt`.
+#[must_use]
+pub const fn broker_bt_advance(prev_bt: u64, wall_ms: u64) -> u64 {
+    if prev_bt < wall_ms {
+        wall_ms
+    } else {
+        prev_bt
+    }
+}
+
+/// `at_rest_version_advance` as `at_rest_island.rs` defines it in Clean:
+/// `if prev_ver < next_ver then next_ver else prev_ver`.
+#[must_use]
+pub const fn at_rest_version_advance(prev_ver: u64, next_ver: u64) -> u64 {
+    if prev_ver < next_ver {
+        next_ver
+    } else {
+        prev_ver
+    }
+}
+
+/// `tail_wake_head_advance` as `tail_wake_island.rs` defines it in Clean:
+/// `if cur_matched < new_vis then new_vis else cur_matched`.
+#[must_use]
+pub const fn tail_wake_head_advance(cur_matched: u64, new_vis: u64) -> u64 {
+    if cur_matched < new_vis {
+        new_vis
+    } else {
+        cur_matched
+    }
+}
+
+/// `tail_skip_clamp` as `tail_wake_island.rs` defines it in Clean:
+/// `if cand_skip < vis_head then cand_skip else vis_head`.
+#[must_use]
+pub const fn tail_skip_clamp(cand_skip: u64, vis_head: u64) -> u64 {
+    if cand_skip < vis_head {
+        cand_skip
+    } else {
+        vis_head
     }
 }
 
@@ -315,14 +358,19 @@ mod tests {
             answers(|[a, b]| super::client_walk_page_advance(a, b)),
             want
         );
+        assert_eq!(answers(|[a, b]| crate::broker_bt_advance(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::broker_bt_advance(a, b)), want);
+        assert_eq!(answers(|[a, b]| crate::at_rest_version_advance(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::at_rest_version_advance(a, b)), want);
+        assert_eq!(answers(|[a, b]| crate::tail_wake_head_advance(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::tail_wake_head_advance(a, b)), want);
         let want = "000011012";
-        #[cfg(unix)]
-        {
-            assert_eq!(answers(|[a, b]| crate::sharded_clamp_index(a, b)), want);
-            assert_eq!(answers(|[a, b]| super::sharded_clamp_index(a, b)), want);
-        }
+        assert_eq!(answers(|[a, b]| crate::sharded_clamp_index(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::sharded_clamp_index(a, b)), want);
         assert_eq!(answers(|[a, b]| crate::broker_batch_clamp(a, b)), want);
         assert_eq!(answers(|[a, b]| super::broker_batch_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| crate::tail_skip_clamp(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::tail_skip_clamp(a, b)), want);
     }
 
     // Not vacuous: `group_commit_monotone` with its branches swapped answers otherwise.

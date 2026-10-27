@@ -4,7 +4,9 @@
 
 //! Identity token kinds, sources, profiles, credentials, and ambient-token inspection.
 
+pub mod import;
 pub mod provision;
+pub mod vault;
 
 pub use aterm_http::proxy::{EnvSource, ProcessEnv};
 
@@ -73,7 +75,8 @@ impl TokenKind {
     }
 }
 
-/// Token storage location for a [`Profile`].
+/// Token storage location for a [`Profile`]. `#[non_exhaustive]`: `Inline(InlineToken)` is a
+/// token a library caller holds in memory, which agh.toml cannot spell (design §6.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Source {
@@ -81,6 +84,46 @@ pub enum Source {
     File(std::path::PathBuf),
     /// An environment variable.
     Env(String),
+    /// A token a library caller holds in memory (design §6.1). agh.toml cannot spell it.
+    Inline(InlineToken),
+}
+
+/// An in-memory token (design §6.1): an `Arc` of [`aterm_uds::secret::Secret`], scrubbed when
+/// the last holder drops it. Two are equal when their fingerprints are, and `Debug` prints
+/// `InlineToken(<fingerprint>)`.
+#[derive(Clone)]
+pub struct InlineToken(std::sync::Arc<Secret>);
+
+impl InlineToken {
+    /// `token` with one trailing `\n` or `\r\n` trimmed, once `TokenKind::of` accepts it.
+    ///
+    /// # Errors
+    ///
+    /// `LoadError::Malformed` or `LoadError::Unsupported`, as for a token file.
+    pub fn new(token: Secret) -> Result<InlineToken, LoadError> {
+        let _ = token;
+        Err(LoadError::Unavailable("not yet: inline tokens land in WP1"))
+    }
+
+    /// `fingerprint(token)`.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        fingerprint(self.0.expose())
+    }
+}
+
+impl PartialEq for InlineToken {
+    fn eq(&self, other: &InlineToken) -> bool {
+        self.fingerprint() == other.fingerprint()
+    }
+}
+
+impl Eq for InlineToken {}
+
+impl std::fmt::Debug for InlineToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InlineToken({})", self.fingerprint())
+    }
 }
 
 /// Named identity profile from `agh.toml`.
@@ -99,6 +142,9 @@ pub struct Profile {
     pub covers_all_repos: bool,
     /// Token fingerprint vouched for via `auth add --drafts`.
     pub drafts_fp: Option<String>,
+    /// Whether AghHost's loader honoured `legacy_loose` for this profile: set only through
+    /// `set_legacy_loose`, by `config::load_for_host` and `provision::add_with`.
+    legacy_loose: bool,
 }
 
 impl Profile {
@@ -111,7 +157,37 @@ impl Profile {
             login: None,
             covers_all_repos: false,
             drafts_fp: None,
+            legacy_loose: false,
         }
+    }
+
+    /// An inline profile (design §6.1), never release tier. `login` is mandatory: the client's
+    /// first send as this profile is `GET /user`, and a different login is Unauthenticated
+    /// `login_mismatch`.
+    ///
+    /// # Errors
+    ///
+    /// Refused `tier_mismatch` (`Sub::Policy(RefusalCode::TierMismatch)`) for `Tier::Release`.
+    pub fn inline(
+        name: impl Into<String>,
+        tier: Tier,
+        login: impl Into<String>,
+        token: InlineToken,
+    ) -> crate::error::Result<Profile> {
+        let _ = (name, tier, login, token);
+        Err(crate::error::Error::not_yet("inline profiles", "WP1"))
+    }
+
+    /// Whether AghHost's loader honoured `legacy_loose` for this profile.
+    #[must_use]
+    pub fn legacy_loose(&self) -> bool {
+        self.legacy_loose
+    }
+
+    /// Set whether `legacy_loose` is honoured: `config::load_for_host` (WP1) and
+    /// `provision::add_with` (WP8) are its two callers.
+    pub(crate) fn set_legacy_loose(&mut self, on: bool) {
+        self.legacy_loose = on;
     }
 
     /// The same profile with `login`.
@@ -267,7 +343,7 @@ impl LoadError {
             LoadError::Loose(_) => loose_remedy(profile, home),
             LoadError::Symlink => Some(match &profile.source {
                 Source::File(file) => token_link_remedy(file, home),
-                Source::Env(_) => FILE_LINK.to_string(),
+                Source::Env(_) | Source::Inline(_) => FILE_LINK.to_string(),
             }),
             LoadError::Malformed(why) => Some(malformed_remedy(why, &profile.source)),
             LoadError::Unsupported(_) => Some(
@@ -433,7 +509,7 @@ const TOO_LONG: &str = "longer than such a file can be";
 /// size, and a regular file for a path that names none.
 fn malformed_remedy(why: &str, source: &Source) -> String {
     match source {
-        Source::Env(_) => format!("the variable holds {ONE_TOKEN}"),
+        Source::Env(_) | Source::Inline(_) => format!("the variable holds {ONE_TOKEN}"),
         Source::File(_) if why == SHAPE || why == TOO_LONG => {
             format!("the token file holds {ONE_TOKEN}")
         }
@@ -614,6 +690,7 @@ pub(crate) fn load(profile: &Profile, env: &dyn EnvSource) -> Result<Credential,
     match &profile.source {
         Source::File(path) => load_file(profile, path),
         Source::Env(var) => load_env(profile, env, var),
+        Source::Inline(_) => Err(LoadError::Unavailable("not yet: inline tokens land in WP1")),
     }
 }
 
@@ -732,6 +809,19 @@ pub fn presence(profile: &Profile, env: &dyn EnvSource) -> Presence {
         Ok(_) => Presence::Present,
         Err(e) => e.presence(),
     }
+}
+
+/// `load`, reduced to whether the profile may make a WriterRead (design §6.4): `Ok(true)` when
+/// the credential's kind is not `FineGrained` or `profile.drafts_vouched(&cred)` holds,
+/// `Ok(false)` for a fine-grained token nobody vouched for. The credential is dropped and
+/// scrubbed before it returns.
+///
+/// # Errors
+///
+/// `load`'s `LoadError`.
+pub fn lists_drafts(profile: &Profile, env: &dyn EnvSource) -> Result<bool, LoadError> {
+    let cred = load(profile, env)?;
+    Ok(profile.drafts_vouched(&cred))
 }
 
 /// Returns the first 12 hex characters of `sha256("agh/fp/v1\0" || token)`.

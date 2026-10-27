@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Mode-light YOLO relabeling tests under the Claude Code footer gate.
+//! The mode light as the mode's one home where the glass rewrites Claude Code's mode row
+//! (`yolo`, `nag mode`), under the footer's gate.
 
 use std::time::{Duration, Instant};
 
@@ -9,18 +10,17 @@ use aterm_agent::harness::lights::{self, Light};
 use aterm_window::event::{ElementState, MouseButton};
 
 use super::gesture_tests::{
-    Hosted, PGID, app, cell_at, draw_claude, feed, footer_row, frame, hit, host, painted, pty,
-    publish_facts, px_of, row_text,
+    BYPASS, Hosted, PGID, app, cell_at, draw_claude, feed, footer_row, frame, hit, host, painted,
+    pty, publish_facts, px_of, row_text,
 };
 use super::{Chip, cells_of};
 use crate::{App, WindowId};
 
 const MANUAL: &str = "  \u{23F8} manual mode on \u{00B7} ? for shortcuts";
-const BYPASS: &str = "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)";
 
 fn claude_app(
     cols: u16,
-    relabel: bool,
+    rewrite: bool,
 ) -> (App, WindowId, u64, std::os::unix::net::UnixStream, Hosted) {
     let (mut app, wid, session, reader) = app();
     let hosted = host(&mut app);
@@ -34,7 +34,7 @@ fn claude_app(
         timeline.note_foreground_group(PGID);
         timeline.set_program(PGID, Some("claude".into()));
     }
-    if relabel {
+    if rewrite {
         crate::session_timeline::claim_supervisor(
             &ctx,
             &crate::harness_host::holder(),
@@ -47,8 +47,16 @@ fn claude_app(
     (app, wid, session, reader, hosted)
 }
 
+/// `mode` as Claude Code draws it in a pane of `cols`: whole, or cut with `…` at its end.
 fn mode_row_in(mode: &str, cols: u16) -> String {
-    mode.chars().take(usize::from(cols) - 1).collect()
+    let room = usize::from(cols) - 1;
+    if mode.chars().count() <= room {
+        return mode.to_owned();
+    }
+    mode.chars()
+        .take(room - 1)
+        .chain(std::iter::once('\u{2026}'))
+        .collect()
 }
 
 fn light_cells(app: &App, wid: WindowId) -> (Vec<(usize, usize)>, String) {
@@ -63,26 +71,33 @@ fn light_cells(app: &App, wid: WindowId) -> (Vec<(usize, usize)>, String) {
     (cells, text)
 }
 
-fn pill_glass(app: &App, wid: WindowId) -> String {
+fn mode_glass(app: &App, wid: WindowId) -> String {
     row_text(app, wid, footer_row(app, wid) + 1)
 }
 
+/// THE MODE LIGHT IS THE MODE'S ONE HOME: where the glass rewrites the mode row (the pill and
+/// the key hints dropped, no job to keep: a blank row) the light names manual mode `nag mode`
+/// in one run of cells, at every width the whole row is drawn, pushing neither Autopilot nor
+/// the model off, and its last cell is still the click that asks for the next mode. Bypass, an
+/// expected mode no light shows at rest on Claude's own row, reads `yolo` alone there. A row
+/// Claude cut stands as drawn, the light naming `manual`. CONTROL: unhosted, Claude's row and
+/// the light's own word.
 #[test]
-fn the_mode_light_names_manual_as_the_relabelled_pill_does_in_every_width() {
-    for cols in [120_u16, 80, 50, 33] {
-        for relabel in [true, false] {
-            let (mut app, wid, session, mut reader, _host) = claude_app(cols, relabel);
+fn the_mode_light_is_the_modes_one_home_on_a_rewritten_row() {
+    for cols in [120_u16, 80, 50] {
+        for rewrite in [true, false] {
+            let (mut app, wid, session, mut reader, _host) = claude_app(cols, rewrite);
             draw_claude(&app, session, &mode_row_in(MANUAL, cols));
             frame(&mut app, wid);
-            let what = format!("{cols} columns, relabel={relabel}");
-            let pill = pill_glass(&app, wid);
+            let what = format!("{cols} columns, rewrite={rewrite}");
+            let row = mode_glass(&app, wid);
             assert_eq!(
-                pill.starts_with("  YOLO off"),
-                relabel,
-                "{what}: the gate's witness, Claude's pill: {pill:?}"
+                row.trim().is_empty(),
+                rewrite,
+                "{what}: the gate's witness, the mode row: {row:?}"
             );
-            let word = if relabel {
-                "\u{23F8} YOLO off"
+            let word = if rewrite {
+                "\u{23F8} nag mode"
             } else {
                 "\u{23F8} manual"
             };
@@ -114,28 +129,43 @@ fn the_mode_light_names_manual_as_the_relabelled_pill_does_in_every_width() {
             );
         }
     }
-    for relabel in [true, false] {
-        let (mut app, wid, session, _reader, _host) = claude_app(30, relabel);
-        draw_claude(&app, session, &mode_row_in(MANUAL, 30));
+    for rewrite in [true, false] {
+        let (mut app, wid, session, _reader, _host) = claude_app(120, rewrite);
+        draw_claude(&app, session, BYPASS);
         frame(&mut app, wid);
+        let (_, text) = light_cells(&app, wid);
         assert_eq!(
-            painted(&app, wid, Light::Mode),
-            !relabel,
-            "30 columns, relabel={relabel}"
+            text,
+            if rewrite { "yolo" } else { "" },
+            "bypass at rest, rewrite={rewrite}"
         );
-        assert!(painted(&app, wid, Chip::Autopilot), "relabel={relabel}");
     }
+    let (mut app, wid, session, _reader, _host) = claude_app(33, true);
+    let cut = mode_row_in(MANUAL, 33);
+    assert!(cut.ends_with('\u{2026}'), "Claude's own cut: {cut:?}");
+    draw_claude(&app, session, &cut);
+    frame(&mut app, wid);
+    assert_eq!(mode_glass(&app, wid).trim_end(), cut, "a cut row stands");
+    assert_eq!(light_cells(&app, wid).1, "\u{23F8} manual");
 }
 
+/// THE MODE LIGHT'S TITLES NAME BYPASS AND MANUAL AS THE LIGHT DOES: where the row is rewritten
+/// the hover says `click for yolo or auto`, a stop says `stopped in nag mode`, and the arrival
+/// reads `yolo`; on Claude's own row they say `bypass` and `manual mode`.
 #[test]
-fn the_mode_lights_titles_name_bypass_and_manual_as_the_pill_does() {
-    for relabel in [true, false] {
-        let (on, off, stopped) = if relabel {
-            ("YOLO on", "YOLO off", "stopped in YOLO off")
+fn the_mode_lights_titles_name_bypass_and_manual_as_the_light_does() {
+    for rewrite in [true, false] {
+        let (on, off, stopped, arrived) = if rewrite {
+            ("yolo", "nag mode", "stopped in nag mode", "yolo")
         } else {
-            ("bypass", "manual", "stopped in manual mode")
+            (
+                "bypass",
+                "manual",
+                "stopped in manual mode",
+                "\u{23F5}\u{23F5} bypass",
+            )
         };
-        let (mut app, wid, session, mut reader, _host) = claude_app(120, relabel);
+        let (mut app, wid, session, mut reader, _host) = claude_app(120, rewrite);
         draw_claude(&app, session, MANUAL);
         frame(&mut app, wid);
         let (x, y) = px_of(&app, wid, hit(&app, wid, Light::Mode));
@@ -146,7 +176,7 @@ fn the_mode_lights_titles_name_bypass_and_manual_as_the_pill_does() {
             rule.contains(&format!(
                 "\u{23F8} {off}  Permission mode: click for {on} or auto"
             )),
-            "relabel={relabel}: the hover: {rule:?}"
+            "rewrite={rewrite}: the hover: {rule:?}"
         );
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
@@ -162,7 +192,7 @@ fn the_mode_lights_titles_name_bypass_and_manual_as_the_pill_does() {
         let rule = row_text(&app, wid, footer_row(&app, wid));
         assert!(
             rule.contains(&format!("Permission mode: {stopped}")),
-            "relabel={relabel}: the stop: {rule:?}"
+            "rewrite={rewrite}: the stop: {rule:?}"
         );
         let (x, y) = px_of(&app, wid, hit(&app, wid, Light::Mode));
         app.on_cursor_moved(wid, x, y);
@@ -183,35 +213,38 @@ fn the_mode_lights_titles_name_bypass_and_manual_as_the_pill_does() {
         );
         let rule = row_text(&app, wid, footer_row(&app, wid));
         assert!(
-            rule.contains(&format!("\u{23F5}\u{23F5} {on}  Permission mode: {on} ")),
-            "relabel={relabel}: the arrival: {rule:?}"
+            rule.contains(&format!("{arrived}  Permission mode: {on} ")),
+            "rewrite={rewrite}: the arrival: {rule:?}"
         );
-        let pill = pill_glass(&app, wid);
+        let row = mode_glass(&app, wid);
         assert_eq!(
-            pill.starts_with("  YOLO on"),
-            relabel,
-            "relabel={relabel}: the gate's witness: {pill:?}"
+            row.trim().is_empty(),
+            rewrite,
+            "rewrite={rewrite}: the gate's witness: {row:?}"
         );
     }
 }
 
+/// THE MODE LIGHT'S WORD FOLLOWS THE REWRITE THE GLASS TAKES: with the cursor on the mode row
+/// the row stands as Claude drew it and the light says `manual`; the cursor back at the caret,
+/// the row is rewritten and the light says `nag mode`.
 #[test]
-fn the_mode_lights_word_follows_the_relabel_the_glass_takes() {
+fn the_mode_lights_word_follows_the_rewrite_the_glass_takes() {
     let (mut app, wid, session, _reader, _host) = claude_app(120, true);
     draw_claude(&app, session, MANUAL);
     feed(&app, session, b"\x1b[24;5H");
     frame(&mut app, wid);
-    let pill = pill_glass(&app, wid);
+    let row = mode_glass(&app, wid);
     assert!(
-        pill.starts_with("  \u{23F8} manual mode on"),
-        "the pill as Claude drew it: {pill:?}"
+        row.starts_with("  \u{23F8} manual mode on"),
+        "the row as Claude drew it: {row:?}"
     );
     let (_, text) = light_cells(&app, wid);
     assert_eq!(text, "\u{23F8} manual", "the light names it so too");
     feed(&app, session, b"\x1b[22;3H");
     frame(&mut app, wid);
-    let pill = pill_glass(&app, wid);
-    assert!(pill.starts_with("  YOLO off"), "{pill:?}");
+    let row = mode_glass(&app, wid);
+    assert!(row.trim().is_empty(), "{row:?}");
     let (_, text) = light_cells(&app, wid);
-    assert_eq!(text, "\u{23F8} YOLO off");
+    assert_eq!(text, "\u{23F8} nag mode");
 }

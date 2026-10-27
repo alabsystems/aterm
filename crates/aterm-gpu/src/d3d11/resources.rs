@@ -40,8 +40,6 @@ pub(crate) const fn d3d_format(f: TexelFormat) -> D3dFormat {
         TexelFormat::Rgba8Unorm => (dxgi::DXGI_FORMAT_R8G8B8A8_UNORM, 4),
         TexelFormat::Rgba8UnormSrgb => (dxgi::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 4),
         TexelFormat::Bgra8Unorm => (dxgi::DXGI_FORMAT_B8G8R8A8_UNORM, 4),
-        #[cfg(wgpu_arm)]
-        TexelFormat::Bgra8UnormSrgb => (dxgi::DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, 4),
         TexelFormat::Rgba16Float => (dxgi::DXGI_FORMAT_R16G16B16A16_FLOAT, 8),
     };
     D3dFormat { dxgi, bytes }

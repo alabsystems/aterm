@@ -9,6 +9,7 @@ pub(crate) mod conform;
 mod conform_broker;
 pub(crate) mod device;
 pub(crate) mod endpoint;
+pub(crate) mod refill;
 pub(crate) mod world;
 
 #[cfg(test)]
@@ -134,6 +135,8 @@ pub(crate) struct Core {
     pub(crate) mutants: Mutex<BTreeSet<world::Mutant>>,
     /// What the broker held unanswered for a process when it PARKED with nothing queued ([`Process::idle`]).
     pub(crate) idle_held: Mutex<Vec<(u64, String, Vec<u8>)>>,
+    /// The refill law's findings ([`refill`]).
+    pub(crate) refills: Mutex<refill::Law>,
 }
 
 impl Core {
@@ -152,6 +155,7 @@ impl Core {
             trace: Mutex::new(Vec::new()),
             mutants: Mutex::new(BTreeSet::new()),
             idle_held: Mutex::new(Vec::new()),
+            refills: Mutex::new(refill::Law::default()),
         })
     }
 
@@ -236,6 +240,7 @@ impl Core {
             reader.source,
             reader.generation,
             &reader.closer,
+            self.now(),
         );
         if on {
             lock(&self.readers).push(reader);
@@ -257,6 +262,8 @@ pub(crate) struct Process {
     alive: AtomicBool,
     /// Inside a read that must not wait ([`Process::trying`]).
     trying: AtomicBool,
+    /// Its refills in progress, by session ([`refill`]).
+    refills: Mutex<std::collections::BTreeMap<String, refill::Mark>>,
 }
 
 impl Process {
@@ -266,6 +273,7 @@ impl Process {
             pid,
             alive: AtomicBool::new(true),
             trying: AtomicBool::new(false),
+            refills: Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
@@ -290,6 +298,23 @@ impl Process {
     /// Whether the world switched `rule` off.
     pub(crate) fn mutant(&self, rule: world::Mutant) -> bool {
         lock(&self.core.mutants).contains(&rule)
+    }
+
+    /// One step of a refill of this process ([`refill`]): an ending one is judged against
+    /// the log as it stands.
+    pub(crate) fn refill_tap(&self, tap: crate::fx::RefillTap<'_>) {
+        let mut marks = lock(&self.refills);
+        let mut law = lock(&self.core.refills);
+        refill::tap(&mut marks, &mut law, tap, || {
+            let records = self
+                .core
+                .broker
+                .records()
+                .into_iter()
+                .map(|(off, subject, _, _)| (off, subject))
+                .collect();
+            (records, self.core.broker.gone())
+        });
     }
 
     /// Whether this process still runs.

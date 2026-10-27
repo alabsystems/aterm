@@ -2,15 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 //! Who gets the profile by itself (`docs/DESIGN-system-state-2026-10-21.md`
-//! §3.5). aterm's own Permissions are managed on every Mac; the rest of the
-//! profile only on an ALab Mac: a login already in a vault, a Mac in an aterm
-//! fleet, or one where the ALab vault answers under the key built into aterm.
-//! Elsewhere the automatic plan is Permissions alone, saved as provisional, and
-//! the launch that finds the signal, this one or a later one, widens it as a new
-//! revision. A plan a person shaped is never changed.
+//! §3.5, `docs/DESIGN-init-on-by-default-2026-10-25.md` §8.1). Every Mac syncs the
+//! base plan — aterm's own Permissions, the Secrets vault lane (discovery and the
+//! Sync rows ride it) and Spotlight for aterm's own folders. The rest of the profile
+//! — the workstation preferences, Dock, Repositories and the Messages and FaceTime
+//! sign-outs — only on an ALab Mac, which is one whose login opened a locker in the
+//! ALab vault under this Mac's own freshly minted recipient key. Elsewhere the
+//! automatic plan is the base plan, saved as provisional, and the launch that finds
+//! the signal, this one or a later one, widens it to the whole profile as a new
+//! revision. A plan a person shaped is never changed, and this scoping never narrows
+//! a saved plan.
 
 use super::*;
-use aterm_types::macos_setup::{DIALOG_WAIT, MacosDialog};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 #[cfg(any(test, debug_assertions))]
@@ -26,6 +29,10 @@ pub(super) const NO_VAULT: &str = "No vault on this network";
 /// there is none: macOS's Local Network switch, the network itself, or the
 /// vault being down look the same from here.
 pub(super) const NOT_REACHED: &str = "The ALab vault did not answer on this network";
+
+/// The note when the ALab vault did not answer while macOS refuses aterm the local network: no
+/// look can reach it until the person turns Local Network on, which its own row opens.
+pub(super) const LAN_OFF: &str = "Local Network is off for aterm";
 
 /// How long one probe of the ALab vault takes at most, all of it: it answers within
 /// milliseconds on its own LAN, and a Mac elsewhere must not hold its first launch longer.
@@ -54,6 +61,15 @@ impl VaultHere {
             Self::Absent => Some(NO_VAULT),
             Self::Unreached => Some(NOT_REACHED),
             Self::Unasked | Self::Found => None,
+        }
+    }
+
+    /// [`Self::note`], naming Local Network ([`LAN_OFF`]) for a vault nobody answered while the
+    /// last LAN look heard macOS refuse aterm (`lan`, [`access::last_answer`]).
+    pub(super) fn note_for(self, lan: Option<access::LanAnswer>) -> Option<&'static str> {
+        match (self, lan) {
+            (Self::Unreached, Some(access::LanAnswer::Refused)) => Some(LAN_OFF),
+            _ => self.note(),
         }
     }
 
@@ -88,21 +104,60 @@ pub(super) fn vault_here() -> VaultHere {
 /// An answer from it is also the only proof an app has that macOS lets it use
 /// the local network, and macOS refusing it the `.local` name the only proof it
 /// does not: either is kept for later launches ([`access::lan_answered`]). Its
-/// first request can raise macOS's Local Network alert, so the caller holds a
-/// [`MacosDialog`] ([`vault_here_now`] takes one).
+/// first request can raise macOS's Local Network alert, so its one caller (the
+/// Secrets stage's join) holds a [`aterm_types::macos_setup::MacosDialog`] across
+/// the probe, one macOS dialog this process started at a time.
+///
+/// Another vault's signed answer at the ALab vault's address, kept on this network by this look
+/// or `aterm init`'s within a day ([`aterm_machines::init_secrets::kept_elsewhere`]), stands for
+/// it: no request is made, and nothing is kept of the LAN.
 pub(super) fn probe_vault() -> VaultHere {
-    let here = probe_lan();
+    let here = probe_vault_with(
+        || {
+            look_place().is_some_and(|(home, network, now)| {
+                aterm_machines::init_secrets::kept_elsewhere(&home, network.as_deref(), now)
+            })
+        },
+        probe_lan,
+    );
     LAST_PROBE.store(here.code(), Ordering::Release);
     here
 }
 
-/// [`probe_vault`]'s look, keeping only what it heard of the LAN: what the last probe of this
-/// process heard of the vault ([`vault_here`]) stays as it was. Check again's look
-/// ([`super::probe_local_network_again`]).
+/// [`probe_vault`] with what a kept look says (`kept_elsewhere`) and the look itself (`probe`).
+fn probe_vault_with(
+    kept_elsewhere: impl FnOnce() -> bool,
+    probe: impl FnOnce() -> VaultHere,
+) -> VaultHere {
+    if kept_elsewhere() {
+        VaultHere::Absent
+    } else {
+        probe()
+    }
+}
+
+/// Where this login keeps its looks for the ALab vault (its home), the network this Mac is on
+/// now ([`aterm_secrets::heard::network`]) and the time (unix seconds).
+fn look_place() -> Option<(std::path::PathBuf, Option<String>, u64)> {
+    let home = aterm_secrets::client::Paths::live().ok()?.home;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    Some((home, aterm_secrets::heard::network_key(), now))
+}
+
+/// [`probe_vault`]'s look, keeping only what it heard of the LAN, and a definitive answer for
+/// the next look on this network ([`aterm_machines::init_secrets::keep_look`]): what the last
+/// probe of this process heard of the vault ([`vault_here`]) stays as it was. It is also Check
+/// again's look ([`super::probe_local_network_again`]), which a kept answer never stands for.
 pub(super) fn probe_lan() -> VaultHere {
     use access::LanAnswer;
     use aterm_secrets::client::ProbeOutcome;
-    match aterm_secrets::client::probe_default(PROBE_WAIT) {
+    let probed = aterm_secrets::client::probe_default(PROBE_WAIT);
+    if let Some((home, network, now)) = look_place() {
+        aterm_machines::init_secrets::keep_look(&home, network, now, &probed);
+    }
+    match probed {
         Ok(ProbeOutcome::Found(_)) => {
             access::lan_answered(LanAnswer::Reached);
             VaultHere::Found
@@ -129,22 +184,8 @@ pub(super) fn probe_lan() -> VaultHere {
     }
 }
 
-/// [`probe_vault`] while no other macOS dialog this process started is up (§6:
-/// one gesture at a time). One still up past the hang detector leaves the vault
-/// unreached for this launch; a provisional plan is probed again on the next.
-fn vault_here_now() -> VaultHere {
-    let Some(dialog) = MacosDialog::when_none_up(DIALOG_WAIT) else {
-        return VaultHere::Unreached;
-    };
-    // Only this process's first request to the LAN can raise macOS's Local Network alert: a
-    // later probe waits out a dialog that is up, but puts none on screen, so it holds no slot
-    // (a Debugger Turn On… pressed meanwhile is refused while one is held).
-    let _dialog = (vault_here() == VaultHere::Unasked).then_some(dialog);
-    probe_vault()
-}
-
-/// This login belongs to the ALab vault, or has asked to join it at its address
-/// under the key built into aterm ([`member_of_the_alab_vault`]).
+/// This login belongs to the ALab vault: a locker opened under this Mac's own
+/// recipient key ([`member_of_the_alab_vault`]).
 fn vault_member() -> bool {
     use aterm_secrets::client::{self, Paths};
     Paths::live()
@@ -155,9 +196,12 @@ fn vault_member() -> bool {
 
 /// Only the ALab vault says a Mac is ALab's (DESIGN-init-on-by-default §8.1): a
 /// membership of a vault pinned to its key ([`aterm_secrets::client::alab_vault`]),
-/// or a pending request to it at its address. Anyone can run a vault of their own,
-/// read a plain file, or ask to join some vault, and none of that is a reason to
-/// set up a Mac as ALab's or sign it out of Messages and FaceTime.
+/// held through a locker this Mac's own recipient key opens. An admin signed that
+/// locker after this Mac existed, so no replayed envelope of another Mac produces
+/// it. A pending request to the ALab vault starts a join and nothing more; anyone
+/// can run a vault of their own, read a plain file, hold a fleet key, or ask to join
+/// some vault, and none of that is a reason to set up a Mac as ALab's or sign it out
+/// of Messages and FaceTime.
 fn member_of_the_alab_vault(status: &aterm_secrets::client::Status) -> bool {
     use aterm_secrets::client::{self, Membership};
     let Some(config) = status.config.as_ref() else {
@@ -165,27 +209,24 @@ fn member_of_the_alab_vault(status: &aterm_secrets::client::Status) -> bool {
     };
     match status.membership {
         Membership::In { .. } => client::alab_vault(config),
-        Membership::Pending => {
-            config.source
-                == aterm_secrets::transport::Source::Url(
-                    aterm_types::macos_setup::DEFAULT_VAULT_URL.into(),
-                )
-                && client::alab_vault(config)
-        }
-        Membership::Plain | Membership::Unconfigured | Membership::Revoked { .. } => false,
+        Membership::Pending
+        | Membership::Plain
+        | Membership::Unconfigured
+        | Membership::Revoked { .. } => false,
     }
 }
 
-/// Whether this is an ALab Mac (§3.5): local records first, then one bounded
-/// probe of the ALab vault. Only a yes is kept for the process: a probe that
-/// heard nothing (macOS's Local Network question still open, the network, the
-/// vault down) proves nothing, so the next caller asks again. Holding a fleet's
-/// key is no signal: `aterm fleet init` makes a fleet of anyone's Macs.
+/// Whether this is an ALab Mac (§3.5): a membership opened under this Mac's own
+/// recipient key in the ALab vault ([`member_of_the_alab_vault`]), kept for the
+/// process once seen. Reads this login's secrets records only, with no network
+/// probe. Nothing else is the signal: a probe that found the vault's address, a
+/// pending request to it, a plain file, another vault, or a fleet key (`aterm fleet
+/// init` makes a fleet of anyone's Macs) each start a join at most. The Secrets lane
+/// every Mac runs ([`scoped`]) does the join; this gates only the workstation
+/// profile and the sign-outs.
 pub fn alab_mac() -> bool {
     static ALAB: AtomicBool = AtomicBool::new(false);
-    kept_if_found(&ALAB, || {
-        vault_member() || vault_here_now() == VaultHere::Found
-    })
+    kept_if_found(&ALAB, vault_member)
 }
 
 /// `found`, read only until it says yes once.
@@ -200,12 +241,18 @@ fn kept_if_found(kept: &AtomicBool, found: impl FnOnce() -> bool) -> bool {
     found
 }
 
-/// The plan aterm admits by itself where nobody chose one: the whole profile on
-/// an ALab Mac, aterm's own permissions everywhere else.
+/// The plan aterm admits by itself where nobody chose one: the whole profile on an
+/// ALab Mac; elsewhere the base plan every Mac syncs — aterm's own Permissions, the
+/// Secrets vault lane (the discovery look and the Sync rows ride it) and Spotlight
+/// for aterm's own folders. The workstation preferences, Dock, Repositories and the
+/// Messages and FaceTime sign-outs wait for the ALab signal ([`alab_mac`]); the base
+/// plan reaches every Mac so sync is on by default (§8.1).
 fn scoped(mut plan: Plan, alab: bool) -> Plan {
     if !alab {
         let mut selection = Selection::none();
         selection.set(Setting::Permissions, true);
+        selection.set(Setting::Secrets, true);
+        selection.set(Setting::Spotlight, true);
         plan.selection = selection;
     }
     plan
@@ -930,6 +977,42 @@ pub(super) fn settle_put_back(root: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// One look per network: another vault's answer at the ALab vault's address, kept by any
+    /// look on this network (`aterm init`'s too), stands for System State's look for a day; on
+    /// another network, or after it, the vault is asked.
+    #[test]
+    fn a_kept_answer_of_another_vault_stands_for_the_look_on_its_network() {
+        use aterm_secrets::heard::{self, ABSENT_FOR, Heard, Verdict};
+        let home = aterm_tempfile::tempdir().unwrap();
+        let lan = "aabbcc112233@192.168.4.0/24";
+        let paths = aterm_secrets::client::Paths::for_home(home.path());
+        let verdict = Verdict {
+            at: 1_000,
+            heard: Heard::Absent,
+            network: lan.into(),
+        };
+        heard::write(&paths, &verdict).unwrap();
+        let looks = std::cell::Cell::new(0);
+        let look = |network: Option<&str>, now: u64| {
+            probe_vault_with(
+                || aterm_machines::init_secrets::kept_elsewhere(home.path(), network, now),
+                || {
+                    looks.set(looks.get() + 1);
+                    VaultHere::Unreached
+                },
+            )
+        };
+        assert_eq!(look(Some(lan), 1_000 + ABSENT_FOR - 1), VaultHere::Absent);
+        assert_eq!(looks.get(), 0, "no request on its network");
+        assert_eq!(
+            look(Some("ddeeff445566@10.0.0.0/8"), 1_001),
+            VaultHere::Unreached
+        );
+        assert_eq!(look(Some(lan), 1_000 + ABSENT_FOR), VaultHere::Unreached);
+        assert_eq!(look(None, 1_001), VaultHere::Unreached);
+        assert_eq!(looks.get(), 3);
+    }
+
     #[test]
     fn an_upgrade_checkpoint_round_trips_every_progress_field() {
         let mut desktop = Selection::none();
@@ -1299,7 +1382,8 @@ mod tests {
                 .unwrap(),
                 _ => {
                     let mut other = narrow.clone();
-                    other.selection.set(Setting::Spotlight, true);
+                    // A setting the base plan does not already carry, so this is a different plan.
+                    other.selection.set(Setting::Dock, true);
                     save_plan_as(root.path(), &other, true).unwrap();
                 }
             }
@@ -1638,18 +1722,36 @@ mod tests {
         assert_eq!(asked.get(), 3);
     }
 
+    /// Every Mac syncs the base plan — Permissions, the Secrets vault lane and Spotlight — so
+    /// sync is on by default (§8.1); the workstation preferences, Dock, Repositories and the
+    /// sign-outs wait for the ALab signal. The negative control is the base plan's Secrets and
+    /// Spotlight bits, which an old build left out of a Mac outside ALab (Permissions alone).
     #[test]
-    fn a_mac_outside_alab_manages_only_aterms_own_permissions() {
+    fn a_mac_outside_alab_syncs_the_base_plan_and_waits_for_the_signal() {
         let full = scoped(Plan::default(), true);
         assert_eq!(full.selection, Selection::all());
         let elsewhere = scoped(Plan::default(), false);
-        assert!(elsewhere.selection.contains(Setting::Permissions));
+        let base = [Setting::Permissions, Setting::Secrets, Setting::Spotlight];
         for setting in Setting::ALL {
             assert_eq!(
                 elsewhere.selection.contains(setting),
-                setting == Setting::Permissions,
+                base.contains(&setting),
                 "{setting:?}"
             );
+        }
+        // The rest of the profile waits for the signal.
+        for gated in [
+            Setting::CapsLock,
+            Setting::NaturalScrolling,
+            Setting::TrackpadScrolling,
+            Setting::Desktop,
+            Setting::Widgets,
+            Setting::Dock,
+            Setting::Messages,
+            Setting::FaceTime,
+            Setting::Repositories,
+        ] {
+            assert!(!elsewhere.selection.contains(gated), "{gated:?}");
         }
         assert_eq!(elsewhere.vault_url, Plan::default().vault_url);
     }
@@ -1710,8 +1812,13 @@ mod tests {
         );
     }
 
+    /// The ALab signal is only an `In` membership of the ALab vault, held under this Mac's own
+    /// recipient key (§8.1). A `Pending` request to the ALab address starts a join and nothing
+    /// more; `Plain`, another vault and an unconfigured login never count. The negative controls
+    /// are the two that stop being the signal with SYNC-1: a `Pending` request to the ALab vault,
+    /// which the interim counted, and which an old build still reads as the signal.
     #[test]
-    fn only_a_member_or_a_request_to_the_alab_vault_is_the_alab_signal() {
+    fn only_an_in_membership_of_the_alab_vault_is_the_alab_signal() {
         use aterm_secrets::client::{Config, Membership, Status};
         use aterm_secrets::transport::Source;
         let alab: [u8; 32] = aterm_secrets::b64::decode_padded(aterm_secrets::ALAB_SIGNER)
@@ -1734,7 +1841,7 @@ mod tests {
         let default = || url(aterm_types::macos_setup::DEFAULT_VAULT_URL);
         let other = || url("https://vault.example/v1/team");
         let in_ = || Membership::In { seq: 3, heard: 0 };
-        // The ALab vault's membership, wherever it is served from.
+        // An `In` membership of the ALab vault, wherever it is served from, is the signal.
         assert!(member_of_the_alab_vault(&status(
             in_(),
             default(),
@@ -1745,7 +1852,8 @@ mod tests {
             other(),
             Some(alab)
         )));
-        assert!(member_of_the_alab_vault(&status(
+        // A pending request to the ALab vault starts a join only; it is not the signal.
+        assert!(!member_of_the_alab_vault(&status(
             Membership::Pending,
             default(),
             Some(alab)

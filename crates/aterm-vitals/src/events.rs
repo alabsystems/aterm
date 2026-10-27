@@ -728,6 +728,7 @@ mod tests {
             scope: ScopeView::default(),
         };
         let proc = |pid: u32, name: &str, scope: RowScope, cores: f32| ProcView {
+            scheduling: None,
             pid,
             ppid: 1,
             pgid: pid,

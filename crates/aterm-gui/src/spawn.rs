@@ -585,8 +585,10 @@ pub(crate) struct SessionFactory {
     pub(crate) notify_tx: std::sync::mpsc::SyncSender<notify::NotifyMsg>,
     /// Config `allow_kitty_file_transfer` (default false).
     pub(crate) allow_kitty_file_transfer: bool,
-    /// Config `temporal_recording` (default false).
+    /// Config `temporal_recording` (default [`crate::app_config::DEFAULT_TEMPORAL_RECORDING`]).
     pub(crate) temporal_recording: bool,
+    /// Config `rewind_budget_mb`, in bytes: one recording's retained-byte budget.
+    pub(crate) rewind_budget_bytes: usize,
     /// Overlap handoff (incoming side).
     pub(crate) defer_adopted_readers: bool,
     /// A tab spawned off the event loop (`tab_spawn`).
@@ -607,7 +609,8 @@ pub(crate) struct SessionFactory {
     pub(crate) lone_leader: fn(i32) -> Option<String>,
     /// Whether the leader of foreground group `pgid` has handed the terminal to another program
     /// in its group: a bare Ctrl-r/Ctrl-s asks it to decide whether an agent's composer owns the
-    /// key (`App::front_agent_composer`).
+    /// key (`App::front_agent_composer`), and a generic licence boundary whether it keeps the
+    /// glow's hand on the composer's row (`App::boundary_keeps_hand`).
     pub(crate) handed_terminal: fn(i32) -> bool,
     /// The image of foreground group `pgid`'s leader (card engine §3.4), read by each PTY gather
     /// at a foreground edge (given no last image) and by the parse stage's byte arm (given the
@@ -660,6 +663,7 @@ impl SessionFactory {
             notify_tx: _,
             allow_kitty_file_transfer,
             temporal_recording,
+            rewind_budget_bytes,
             defer_adopted_readers: _,
             reader_after_install: _,
             fg_probe: _,
@@ -692,6 +696,7 @@ impl SessionFactory {
         sandbox_wrap.hash(&mut h);
         integrate.hash(&mut h);
         temporal_recording.hash(&mut h);
+        rewind_budget_bytes.hash(&mut h);
         allow_kitty_file_transfer.hash(&mut h);
         aterm_containment::mode_or_containment()
             .level()
@@ -1484,24 +1489,61 @@ pub(crate) fn seed_temporal_keyframe(
 ) -> bool {
     let (checkpoint, at) = {
         let engine = term_lock(term);
-        match crate::temporal::keyframe_of(&engine, usize::MAX) {
-            Some(checkpoint) => (checkpoint, crate::temporal::SpinePre::take(&engine)),
-            None => {
-                aterm_log::warn!(
-                    "temporal: session {id} starts inside a {} no keyframe can carry; its \
-                     recording is not seeded",
-                    engine
-                        .partial_sequence_state()
-                        .unwrap_or("partial sequence")
-                );
-                return false;
-            }
+        match seed_of(&engine, id) {
+            Some(seed) => seed,
+            None => return false,
         }
     };
     let mut rec = temporal.lock().unwrap_or_else(|p| p.into_inner());
     rec.record_keyframe(checkpoint);
     rec.spine_watermark().seed(at);
     true
+}
+
+/// The seed keyframe of session `id`'s `engine` and where its spine starts, or `None` (logged) inside a sequence no keyframe carries.
+fn seed_of(
+    engine: &Terminal,
+    id: u64,
+) -> Option<(crate::temporal::ReplayKeyframe, crate::temporal::SpinePre)> {
+    let Some(checkpoint) = crate::temporal::keyframe_of(engine, usize::MAX) else {
+        aterm_log::warn!(
+            "temporal: session {id} starts inside a {} no keyframe can carry; its recording is \
+             not seeded",
+            engine
+                .partial_sequence_state()
+                .unwrap_or("partial sequence")
+        );
+        return None;
+    };
+    Some((checkpoint, crate::temporal::SpinePre::take(engine)))
+}
+
+/// Start recording promoted spare `id`'s running reader: [`seed_temporal_keyframe`]'s seed and the reader's queue, both under the terminal's lock, so the reader's next slice is the first recorded.
+/// # Errors
+/// The shared writer could not be started.
+pub(crate) fn arm_promoted(session: &mut Session, id: u64) -> Result<(), String> {
+    let tx = crate::temporal::open(&session.ctx.temporal, crate::temporal::QUEUE_CAP)?;
+    let drain = tx.drain();
+    {
+        let engine = term_lock(&session.term);
+        let mut rec = session
+            .ctx
+            .temporal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match seed_of(&engine, id) {
+            Some((checkpoint, at)) => {
+                rec.record_keyframe(checkpoint);
+                rec.spine_watermark().seed(at);
+            }
+            None => rec.want_keyframe(),
+        }
+        drop(rec);
+        session.temporal_arm.set(tx);
+    }
+    session.temporal_drain = Some(drain);
+    crate::temporal::pool().join(id, &session.ctx.temporal);
+    Ok(())
 }
 
 /// Install the fallback title (`record_title`: [`Adopted::title`], the park's layout title or
@@ -1822,9 +1864,11 @@ pub(crate) fn spawn_session(
     let cast = Arc::new(std::sync::Mutex::new(crate::cast::CastRecorder::new(
         cols, rows,
     )));
-    let temporal = Arc::new(std::sync::Mutex::new(
-        crate::temporal::TemporalRecorder::new(),
-    ));
+    let temporal = Arc::new(std::sync::Mutex::new({
+        let mut rec = crate::temporal::TemporalRecorder::with_budget(factory.rewind_budget_bytes);
+        rec.set_replay_config(factory.terminal_config.clone().map(Arc::new));
+        rec
+    }));
     let byte_fanout = Arc::new(crate::cast::ByteFanout::new());
     let term = Arc::new(Mutex::new(new_live_terminal(
         rows,
@@ -1985,7 +2029,14 @@ pub(crate) fn spawn_session(
 
     let reach = session_host_reach();
     match spare {
-        Some(s) => crate::spare::wire_spare_taint(&term, &s.link),
+        Some(s) => {
+            crate::spare::wire_spare_taint(
+                &term,
+                &s.link,
+                reach,
+                factory.allow_kitty_file_transfer,
+            );
+        }
         None => arm_host_reach(&term, reach, factory, proxy, id, window, &ctx),
     }
 
@@ -1995,14 +2046,15 @@ pub(crate) fn spawn_session(
 
     configure_palette_refusal(&term);
 
+    // A spare records nothing until a tab adopts it (`arm_promoted`).
+    let record = factory.temporal_recording && spare.is_none();
     arm_shell_nonce_then_seed(
         &term,
         &temporal,
         shell_nonce.map(|nonce| (nonce, lost_nonce)),
-        factory.temporal_recording,
+        record,
         id,
     );
-
     match crate::keeper_link::journal_refusal() {
         #[cfg(unix)]
         None => match crate::crash_restore::SessionJournal::create(
@@ -2076,7 +2128,8 @@ pub(crate) fn spawn_session(
         wake_wr: -1,
         reader_stop: Arc::new(AtomicBool::new(false)),
         reader_join: None,
-        temporal_writer_join: None,
+        temporal_drain: None,
+        temporal_arm: Arc::default(),
         reflow_cancel: Arc::new(AtomicBool::new(false)),
         fg_holder: Arc::new(std::sync::atomic::AtomicI32::new(carried_fg_holder)),
         handoff_history: adopted.then_some(adopt_history),
@@ -3472,28 +3525,30 @@ fn attach_reader_inner(
         let rec = session.ctx.cast.lock().unwrap_or_else(|p| p.into_inner());
         (rec.epoch(), rec.watermark())
     };
-    if let Some(old_writer) = session.temporal_writer_join.take() {
-        let _ = old_writer.join();
+    if let Some(old) = session.temporal_drain.take() {
+        old.wait();
     }
-    let (temporal_tx, temporal_writer_join, spine_mark) = if factory.temporal_recording {
+    {
         let policy = crate::app_render::pty_resize_policy(session.master);
         let host_resyncs =
             crate::alt_screen_resync::host_resyncs(aterm_pty::conpty_host(session.master));
-        let spine_mark = {
-            let mut rec = session
-                .ctx
-                .temporal
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            rec.set_resize_policy(policy);
-            rec.set_host_resyncs_alt_screen(host_resyncs);
-            crate::temporal::SpineMark::attach(rec.spine_watermark())
-        };
-        let (tx, join) = spawn_temporal_writer(session.ctx.temporal.clone())?;
-        (Some(tx), Some(join), spine_mark)
+        let mut rec = session
+            .ctx
+            .temporal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        rec.set_resize_policy(policy);
+        rec.set_host_resyncs_alt_screen(host_resyncs);
+    }
+    let (temporal_tx, spine_mark) = if factory.temporal_recording && factory.spare.is_none() {
+        let tx = crate::temporal::open(&session.ctx.temporal, crate::temporal::QUEUE_CAP)?;
+        let mark = crate::temporal::SpineMark::attach(tx.spine());
+        crate::temporal::pool().join(session.id, &session.ctx.temporal);
+        (Some(tx), mark)
     } else {
-        (None, None, crate::temporal::SpineMark::default())
+        (None, crate::temporal::SpineMark::default())
     };
+    let temporal_drain = temporal_tx.as_ref().map(crate::temporal::TemporalTx::drain);
     let (reply_tx, _reply_writer_join) = spawn_reply_writer(
         session.ctx.sink.clone(),
         ReportRoute::of(&session.term, &session.ctx.modes),
@@ -3529,6 +3584,7 @@ fn attach_reader_inner(
         cast_watermark,
         temporal_tx,
         spine_mark,
+        temporal_arm: session.temporal_arm.clone(),
         byte_fanout: session.ctx.byte_fanout.clone(),
         watchers: session.ctx.watchers.clone(),
         #[cfg(unix)]
@@ -3598,13 +3654,13 @@ fn attach_reader_inner(
         aterm_pty::close_fd(session.wake_wr);
     }
     session.wake_wr = wake_wr;
-    session.temporal_writer_join = temporal_writer_join;
+    session.temporal_drain = temporal_drain;
     session.reader_join = Some(reader);
     Ok(())
 }
 
 /// True when a parked or deferred session can be reattached without blocking the caller on its
-/// old PTY reader or temporal writer.
+/// old PTY reader or on the writer still writing what that reader queued.
 #[must_use]
 pub(crate) fn reader_attach_ready(session: &Session) -> bool {
     session
@@ -3612,9 +3668,9 @@ pub(crate) fn reader_attach_ready(session: &Session) -> bool {
         .as_ref()
         .is_none_or(std::thread::JoinHandle::is_finished)
         && session
-            .temporal_writer_join
+            .temporal_drain
             .as_ref()
-            .is_none_or(std::thread::JoinHandle::is_finished)
+            .is_none_or(crate::temporal::TemporalDrain::is_finished)
 }
 
 /// Whether a session's parser is behind its program because of an update's park
@@ -3687,16 +3743,15 @@ pub(crate) fn park_reader(session: &mut Session, deadline: Instant) -> bool {
     if join.join().is_err() {
         return false;
     }
-    if let Some(writer) = session.temporal_writer_join.take() {
-        while !writer.is_finished() {
+    if let Some(drain) = session.temporal_drain.take() {
+        while !drain.is_finished() {
             if Instant::now() >= deadline {
-                session.temporal_writer_join = Some(writer);
+                session.temporal_drain = Some(drain);
                 return false;
             }
             crate::watchdog::beat(crate::watchdog::Breadcrumb::UpdateHandoff);
             std::thread::yield_now();
         }
-        drop(writer);
     }
     true
 }
@@ -3720,6 +3775,100 @@ mod act_barrier_reader_tests;
 #[cfg(all(test, unix))]
 #[path = "holder_image_reader_tests.rs"]
 mod holder_image_reader_tests;
+
+#[cfg(all(test, unix))]
+mod spare_promotion_tests {
+    use std::sync::{Arc, mpsc};
+    use std::time::Instant;
+
+    use super::{attach_reader_inner, park_reader};
+    use crate::temporal::Exported;
+    use crate::{App, Wake, WindowId};
+
+    const PATIENCE: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+
+    fn write_shown(session: &crate::Session, slave: i32, bytes: &[u8], shown: &str) {
+        // SAFETY: a bounded write of a live slice to the test-owned slave.
+        let wrote = unsafe { libc::write(slave, bytes.as_ptr().cast(), bytes.len()) };
+        assert_eq!(wrote, bytes.len() as isize);
+        let seen = aterm_spec::wait::within(PATIENCE, std::time::Duration::ZERO, || {
+            crate::control::screen_text(&crate::term_lock(&session.term))
+                .contains(shown)
+                .then_some(())
+        });
+        assert!(seen.is_some(), "timed out waiting for {shown:?} on screen");
+    }
+
+    /// A spare records nothing; promoted, it records from one keyframe of the screen it had, then every slice after (Rewind R4).
+    #[test]
+    fn a_promoted_spare_records_from_one_keyframe_of_its_screen() {
+        let mut app = App::headless_for_test();
+        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+        // SAFETY: A zeroed termios is a valid out-slot for tcgetattr, then cfmakeraw/tcsetattr on the test-owned slave fd.
+        unsafe {
+            let mut tio: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut tio), 0, "tcgetattr");
+            libc::cfmakeraw(&mut tio);
+            assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &tio), 0, "tcsetattr");
+        }
+        let mut session = crate::stub_session(93);
+        session.master = master;
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let post = Arc::new(move |wake: Wake| {
+            if matches!(wake, Wake::Ready { .. }) {
+                let _ = ready_tx.send(());
+            }
+            true
+        });
+        let mut spare = app.session_factory.clone();
+        spare.temporal_recording = false;
+        attach_reader_inner(&mut session, WindowId(0), post, &spare, None)
+            .expect("attach the real reader");
+        ready_rx
+            .recv_timeout(PATIENCE)
+            .expect("the reader's gather started");
+        write_shown(&session, slave, b"rc output\r\n", "rc output");
+        assert_eq!(session.ctx.temporal.lock().unwrap().total_events(), 0);
+
+        app.session_factory.temporal_recording = true;
+        app.prepare_adopted_spare(&mut session, WindowId(0));
+        write_shown(&session, slave, b"after adoption\r\n", "after adoption");
+        session
+            .temporal_drain
+            .as_ref()
+            .expect("its queue's drain")
+            .wait();
+        {
+            let live = crate::control::screen_text(&crate::term_lock(&session.term));
+            let rec = session.ctx.temporal.lock().unwrap();
+            assert_eq!(rec.keyframe_count(), 1, "keyframes=1");
+            let replayed = rec.replay_at(None).expect("a replay from the promotion");
+            assert_eq!(
+                crate::control::screen_text(&replayed),
+                live,
+                "the replay is the live screen"
+            );
+            let export = rec.export().expect("an export");
+            let slices: Vec<&[u8]> = export
+                .events
+                .iter()
+                .filter_map(|(_, ev)| match ev {
+                    Exported::Output(slice) => Some(slice.bytes()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                slices,
+                [&b"after adoption\r\n"[..]],
+                "only what came after it"
+            );
+        }
+        assert!(park_reader(&mut session, Instant::now() + PATIENCE));
+        let master = std::mem::replace(&mut session.master, -1);
+        aterm_pty::close_fd(slave);
+        aterm_pty::close_fd(master);
+    }
+}
 
 #[cfg(all(test, unix))]
 mod shell_exit_tests {
@@ -4314,18 +4463,16 @@ mod park_reader_tests {
         );
         assert!(stopped.is_some(), "timed out waiting for the reader to end");
         session.reader_join = Some(reader);
-        let (finish_writer, writer_held) = std::sync::mpsc::channel::<()>();
-        session.temporal_writer_join = Some(std::thread::spawn(move || {
-            let _ = writer_held.recv();
-        }));
+        let (drain, finish_writer) = crate::temporal::TemporalDrain::held_for_test();
+        session.temporal_drain = Some(drain);
         assert!(!park_reader(&mut session, std::time::Instant::now()));
         assert!(
             session.reader_join.is_none(),
             "the stopped reader is joined"
         );
         assert!(
-            session.temporal_writer_join.is_some(),
-            "the writer's handle is kept"
+            session.temporal_drain.is_some(),
+            "the unwritten queue's drain is kept"
         );
         assert!(!super::reader_attach_ready(&session));
         drop(finish_writer);
@@ -4801,9 +4948,7 @@ pub(crate) fn arm_host_reach(
         witness,
         &ctx.box_banner,
     );
-    if factory.allow_kitty_file_transfer {
-        configure_kitty_file_transfer(term, reach);
-    }
+    configure_kitty_file_transfer(term, reach, factory.allow_kitty_file_transfer);
     configure_bell(term, proxy, id, window, witness);
     #[cfg(target_os = "linux")]
     configure_window_ops(term, proxy, id, window);
@@ -4996,11 +5141,21 @@ pub(crate) fn window_op_wake(
 /// Maximum bytes a Kitty non-direct medium may supply (the engine's `MAX_KITTY_IMAGE_BYTES`).
 pub(crate) const MAX_KITTY_MEDIUM_BYTES: u64 = 4 * 1024 * 1024;
 
-fn configure_kitty_file_transfer(term: &Arc<Mutex<Terminal>>, reach: HostReach) {
-    if reach == HostReach::Refused {
-        return;
+/// Install the Kitty medium resolver where `allow` (`allow_kitty_file_transfer`) and `reach` admit
+/// it, and clear any other: an adopted spare's taint resolver must not outlive its adoption.
+fn configure_kitty_file_transfer(term: &Arc<Mutex<Terminal>>, reach: HostReach, allow: bool) {
+    let mut t = term_lock(term);
+    if kitty_media_admitted(reach, allow) {
+        t.set_kitty_file_resolver(crate::host_io_prefetch::take_kitty_medium);
+    } else {
+        t.clear_kitty_file_resolver();
     }
-    term_lock(term).set_kitty_file_resolver(crate::host_io_prefetch::take_kitty_medium);
+}
+
+/// Whether a session's program may name a Kitty file medium for aterm to read: the setting
+/// (`allow_kitty_file_transfer`) allows it and the session's reach is not [`HostReach::Refused`].
+pub(crate) fn kitty_media_admitted(reach: HostReach, allow: bool) -> bool {
+    allow && reach != HostReach::Refused
 }
 
 /// One Kitty non-direct medium's bytes, read under [`configure_kitty_file_transfer`]'s policy.
@@ -5219,25 +5374,6 @@ fn unlink_posix_shm(name: &str) {
 
 #[cfg(not(unix))]
 fn unlink_posix_shm(_name: &str) {}
-
-const TEMPORAL_QUEUE_CAP: usize = 1024;
-
-fn spawn_temporal_writer(
-    temporal: Arc<std::sync::Mutex<crate::temporal::TemporalRecorder>>,
-) -> Result<(crate::temporal::TemporalTx, std::thread::JoinHandle<()>), String> {
-    let (temporal_tx, temporal_rx) = crate::temporal::queue(TEMPORAL_QUEUE_CAP);
-    let join = crate::qos::spawn_lane_thread(
-        "aterm-temporal-writer",
-        crate::qos::Role::Responsive,
-        move || {
-            while let Some(msg) = temporal_rx.recv() {
-                crate::temporal::write(&temporal, msg);
-            }
-        },
-    )
-    .map_err(|error| format!("spawn temporal writer: {error}"))?;
-    Ok((temporal_tx, join))
-}
 
 const REPLY_QUEUE_CAP: usize = 1024;
 
@@ -6119,6 +6255,11 @@ fn note_cut(
 fn retire_gone(
     term: &Mutex<Terminal>,
     timeline: &Mutex<crate::session_timeline::SessionTimeline>,
+    temporal_arm: &crate::temporal::Arm,
+    temporal_lane: &mut (
+        Option<crate::temporal::TemporalTx>,
+        crate::temporal::SpineMark,
+    ),
     pid: i32,
 ) {
     let Some(token) = timeline
@@ -6132,6 +6273,10 @@ fn retire_gone(
     let marks: Vec<u64> = {
         let mut t = term_lock(term);
         t.retire_holder_mark(token);
+        crate::temporal::pick_up(temporal_arm, &mut temporal_lane.0, &mut temporal_lane.1);
+        if let Some(tx) = &temporal_lane.0 {
+            temporal_lane.1.flush_host(tx, &t);
+        }
         t.holder_fence().tokens().collect()
     };
     let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -6491,6 +6636,7 @@ struct PtyReaderWiring {
     cast_watermark: Arc<crate::cast::CastWatermark>,
     temporal_tx: Option<crate::temporal::TemporalTx>,
     spine_mark: crate::temporal::SpineMark,
+    temporal_arm: Arc<crate::temporal::Arm>,
     byte_fanout: Arc<crate::cast::ByteFanout>,
     watchers: Arc<crate::session_watch::Watchers>,
     #[cfg(unix)]
@@ -6833,6 +6979,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
         cast_watermark,
         temporal_tx,
         spine_mark,
+        temporal_arm,
         byte_fanout,
         watchers,
         #[cfg(unix)]
@@ -6962,7 +7109,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 }
                 return;
             }
-            let mut spine_mark = spine_mark;
+            let mut temporal_lane = (temporal_tx, spine_mark);
             #[cfg(windows)]
             let _ = post(Wake::Ready {
                 session: id,
@@ -7028,7 +7175,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     output_wake(cadence);
                 }
             };
-            let mut ingest = |buf: &[u8],
+            let mut ingest = |temporal_lane: &mut (
+                Option<crate::temporal::TemporalTx>,
+                crate::temporal::SpineMark,
+            ),
+                              buf: &[u8],
                               edge: Option<crate::foreground_handback::FgEdge>,
                               holder: i32,
                               image: Option<Arc<crate::holder_image::HolderImage>>,
@@ -7042,6 +7193,25 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     job_feed.read(buf);
                     crate::echo_rtt::note_output_burst(id);
                 }
+                let mut from_role = crate::foreground_handback::FgRole::Holder;
+                let edge = edge.or_else(|| {
+                    let missed = fg_owners.missed_reclaim(holder, fg_shell, |pgid| {
+                        let master = if probe_sink.upgrade().is_some() {
+                            master
+                        } else {
+                            -1
+                        };
+                        fg_gone(master, pgid, crate::foreground_handback::FgRole::Bystander)
+                    })?;
+                    aterm_log::info!(
+                        "session {id}: group {} armed an input mode and is gone, the shell \
+                         holds, and no edge from it was sampled: its death is the edge",
+                        missed.from
+                    );
+                    // Found gone by the bystander rule, so its handback judges it by that rule.
+                    from_role = crate::foreground_handback::FgRole::Bystander;
+                    Some(missed)
+                });
                 if edge.is_some() {
                     cadence.foreground_edge(&output_wake_pending);
                 }
@@ -7057,15 +7227,21 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 let mut cuts = crate::cast::CastCuts::default();
                 let mut emitted = 0usize;
                 let spine_copy: Option<std::sync::Arc<[u8]>> =
-                    temporal_tx.as_ref().map(|_| std::sync::Arc::from(buf));
+                    temporal_lane.0.as_ref().map(|_| std::sync::Arc::from(buf));
                 #[cfg(unix)]
                 let mut journal_keyframe: Option<crate::crash_restore::Captured> = None;
                 let (response, reports) = {
                     let bytes: &[u8] = spine_copy.as_deref().unwrap_or(buf);
                     if let Some(req) = pending_reset.take() {
                         let mut t = term_lock(&term);
+                        crate::temporal::pick_up(
+                            &temporal_arm,
+                            &mut temporal_lane.0,
+                            &mut temporal_lane.1,
+                        );
                         cuts.observe(emitted, &t, &cast_watermark);
-                        let spine_pre = temporal_tx
+                        let spine_pre = temporal_lane
+                            .0
                             .as_ref()
                             .map(|_| crate::temporal::SpinePre::take(&t));
                         #[cfg(unix)]
@@ -7075,10 +7251,12 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         emitted += reset_bytes.len();
                         fg_owners.observe(holder, t.program_evidence(), t.take_evidence_asserted());
                         if !reset_bytes.is_empty()
-                            && let (Some(tx), Some(pre)) = (&temporal_tx, spine_pre)
+                            && let (Some(tx), Some(pre)) = (&temporal_lane.0, spine_pre)
                         {
                             let input = crate::temporal::InputSlice::at(&reset_bytes[..], clock);
-                            spine_mark.record(tx, pre, &t, input);
+                            temporal_lane.1.record(tx, pre, &t, input);
+                        } else if let Some(tx) = &temporal_lane.0 {
+                            temporal_lane.1.flush_host(tx, &t);
                         }
                         #[cfg(unix)]
                         if let (Some(j), Some(pre)) = (&journal, journal_pre.as_mut()) {
@@ -7151,7 +7329,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             (Some(at), Some(e)) if at == off => {
                                 let held = probe_sink.upgrade();
                                 let master = if held.is_some() { master } else { -1 };
-                                Some(fg_owners.probe_edge(e.from, e.to, |pgid, role| {
+                                Some(fg_owners.probe_edge(e.from, from_role, e.to, |pgid, role| {
                                     fg_gone(master, pgid, role)
                                 }))
                             }
@@ -7215,11 +7393,17 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             let waited = term_busy(&term).then(Instant::now);
                             let mut t = term_lock(&term);
                             crate::metrics::note_parse_hold(parse_hold_wait(waited));
+                            crate::temporal::pick_up(
+                                &temporal_arm,
+                                &mut temporal_lane.0,
+                                &mut temporal_lane.1,
+                            );
                             let clock = aterm_core::terminal::ClockReading::now();
                             let card_from = card_rows_wanted.then(|| t.screen_mutations());
                             t.holder_rings();
                             cuts.observe(emitted, &t, &cast_watermark);
-                            let spine_pre = temporal_tx
+                            let spine_pre = temporal_lane
+                                .0
                                 .as_ref()
                                 .map(|_| crate::temporal::SpinePre::take(&t));
                             #[cfg(unix)]
@@ -7247,10 +7431,10 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 );
                                 if let Some(h) = run {
                                     emitted += h.bytes.len();
-                                    if let (Some(tx), Some(pre)) = (&temporal_tx, spine_pre) {
+                                    if let (Some(tx), Some(pre)) = (&temporal_lane.0, spine_pre) {
                                         let input =
                                             crate::temporal::InputSlice::at(&h.bytes[..], clock);
-                                        spine_mark.record(tx, pre, &t, input);
+                                        temporal_lane.1.record(tx, pre, &t, input);
                                     }
                                     #[cfg(unix)]
                                     if let (Some(j), Some(pre)) = (&journal, journal_pre.as_mut()) {
@@ -7311,6 +7495,10 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                         .and_then(|i| i.token)
                                 },
                             );
+                            let slice_pre = temporal_lane
+                                .0
+                                .as_ref()
+                                .map(|_| crate::temporal::SpinePre::take(&t));
                             let started_before = t.started_command_seq();
                             if let Some(unread) =
                                 launch.process(&mut t, &bytes[off..end], clock, &person)
@@ -7333,13 +7521,21 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 t.program_evidence(),
                                 t.take_evidence_asserted(),
                             );
-                            if let Some(r) = t.take_reports() {
+                            let (slice_reports, slice_response) =
+                                (t.take_reports(), t.take_response());
+                            let slice_reply = temporal_lane.0.as_ref().and_then(|_| {
+                                crate::temporal::reply_of(
+                                    slice_response.as_deref(),
+                                    slice_reports.as_deref(),
+                                )
+                            });
+                            if let Some(r) = slice_reports {
                                 match &mut reports {
                                     Some(a) => a.extend_from_slice(&r),
                                     None => reports = Some(r),
                                 }
                             }
-                            if let Some(r) = t.take_response() {
+                            if let Some(r) = slice_response {
                                 match &mut acc {
                                     Some(a) => a.extend_from_slice(&r),
                                     None => acc = Some(r),
@@ -7348,12 +7544,20 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             backlog = t.lazy_backlog_len();
                             let moved = screen_moves.fed(crate::control::screen_gen(&t));
                             job_feed.fed(&t, &bytes[off..end], moved, Instant::now);
-                            if let (Some(tx), Some(pre), Some(copy)) =
-                                (&temporal_tx, spine_pre, &spine_copy)
-                            {
-                                let input =
-                                    crate::temporal::InputSlice::new(copy.clone(), off..end, clock);
-                                spine_mark.record(tx, pre, &t, input);
+                            if let (Some(tx), Some(pre)) = (&temporal_lane.0, slice_pre) {
+                                let input = match &spine_copy {
+                                    Some(copy) => crate::temporal::InputSlice::new(
+                                        copy.clone(),
+                                        off..end,
+                                        clock,
+                                    ),
+                                    // Armed mid-batch: this batch was not copied.
+                                    None => {
+                                        crate::temporal::InputSlice::at(&bytes[off..end], clock)
+                                    }
+                                }
+                                .replying(slice_reply);
+                                temporal_lane.1.record(tx, pre, &t, input);
                             }
                             #[cfg(unix)]
                             if let (Some(j), Some(pre)) = (&journal, journal_pre.as_mut()) {
@@ -7430,15 +7634,15 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 }
                 if let Some(resp) = response {
                     let resp: std::sync::Arc<[u8]> = resp.into();
-                    if let Some(tx) = &temporal_tx {
-                        spine_mark.reply(tx);
+                    if let Some(tx) = &temporal_lane.0 {
+                        temporal_lane.1.reply(tx);
                     }
                     let _ = reply_tx.submit(resp);
                 }
                 if let Some(report) = reports {
                     let report: std::sync::Arc<[u8]> = report.into();
-                    if let Some(tx) = &temporal_tx {
-                        spine_mark.reply(tx);
+                    if let Some(tx) = &temporal_lane.0 {
+                        temporal_lane.1.reply(tx);
                     }
                     let _ = reply_tx.submit_report(report);
                 }
@@ -7538,7 +7742,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         (filled, read_at)
                     }
                 };
-                ingest(&buf[..r.0], None, 0, None, Some(r.1));
+                ingest(&mut temporal_lane, &buf[..r.0], None, 0, None, Some(r.1));
             }
             #[cfg(unix)]
             loop {
@@ -7568,17 +7772,17 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         }
                     }
                     Ok(GatherMsg::Edge(edge, holder, image)) => {
-                        ingest(&[], Some(edge), holder, image, None);
+                        ingest(&mut temporal_lane, &[], Some(edge), holder, image, None);
                     }
                     Ok(GatherMsg::Gone(pid)) => {
                         #[cfg(test)]
                         if crate::holder_image::hold_hook::no_retire(id) {
                             continue;
                         }
-                        retire_gone(&term, &timeline, pid);
+                        retire_gone(&term, &timeline, &temporal_arm, &mut temporal_lane, pid);
                     }
                     Ok(GatherMsg::Data(batch, len, edge, holder, image)) => {
-                        ingest(&batch[..len], edge, holder, image, None);
+                        ingest(&mut temporal_lane, &batch[..len], edge, holder, image, None);
                         let _ = free_tx.try_send(batch);
                         parse_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -7600,7 +7804,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     Ok(GatherMsg::Wake) | Err(_) => break,
                     Ok(GatherMsg::Reset(req)) => {
                         pending_reset.set(Some(req));
-                        ingest(&[], None, 0, None, None);
+                        ingest(&mut temporal_lane, &[], None, 0, None, None);
                     }
                     Ok(GatherMsg::Journal) => {
                         if let Some(j) = &journal {
@@ -10993,8 +11197,38 @@ mod kitty_transfer_tests {
     fn term_with_resolver() -> Arc<Mutex<Terminal>> {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         term_lock(&term).set_cell_pixel_size(10, 20);
-        configure_kitty_file_transfer(&term, HostReach::Platform);
+        configure_kitty_file_transfer(&term, HostReach::Platform, true);
         term
+    }
+
+    /// A spare's taint resolver goes at adoption unless the setting and the reach admit the real
+    /// one, so a `t=f` query answers medium-disabled as a fresh tab's does.
+    #[test]
+    fn an_adopted_spares_taint_resolver_goes_unless_the_medium_is_allowed() {
+        for (reach, allow) in [
+            (HostReach::Platform, false),
+            (HostReach::Refused, true),
+            (HostReach::Refused, false),
+        ] {
+            let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+            term_lock(&term).set_kitty_file_resolver(|_, _| None);
+            configure_kitty_file_transfer(&term, reach, allow);
+            let mut t = term_lock(&term);
+            assert!(
+                !t.kitty_file_resolver_installed(),
+                "{reach:?} allow={allow}"
+            );
+            t.process(&apc("a=q,i=1,t=f", b"/etc/hosts"));
+            let reply =
+                String::from_utf8_lossy(&t.take_response().unwrap_or_default()).into_owned();
+            assert!(
+                reply.contains("ENOTSUPPORTED"),
+                "{reach:?} allow={allow}: {reply:?}"
+            );
+        }
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        configure_kitty_file_transfer(&term, HostReach::Platform, true);
+        assert!(term_lock(&term).kitty_file_resolver_installed());
     }
 
     #[test]
@@ -11092,7 +11326,7 @@ mod kitty_transfer_tests {
         );
 
         output(b"", "before");
-        configure_kitty_file_transfer(&term, HostReach::Platform);
+        configure_kitty_file_transfer(&term, HostReach::Platform, true);
         output(b"", "installed");
         output(&seq, "sent");
         assert!(
@@ -11331,7 +11565,7 @@ mod kitty_transfer_tests {
         for mode in [Cm::User, Cm::Safety, Cm::Containment] {
             let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
             term_lock(&term).set_cell_pixel_size(10, 20);
-            configure_kitty_file_transfer(&term, host_reach(mode));
+            configure_kitty_file_transfer(&term, host_reach(mode), true);
             let file = cell_file(&scratch.0, "present.rgba");
             let temp = cell_file(&marked, "sent.rgba");
             let present = transmit_reply(&term, "f", &file);

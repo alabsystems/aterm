@@ -42,6 +42,7 @@ pub(super) fn fixture() -> HarnessState {
         posture: HarnessPosture::On(Autopilot::Cruise),
         sessions: vec![HarnessSession {
             stopped: None,
+            waiting: None,
             local_id: 7,
             sid: "s-7".to_string(),
             title: "fix the build".to_string(),
@@ -283,22 +284,27 @@ fn the_harness_route_renders_its_cards_and_controls() {
             Some(key)
         );
     }
-    let harness_build = node(&pages, "harness/updates/row/claude-harness");
-    let own = format!(
-        "v{} (built-in) · in aterm {}",
-        aterm_phase::CliHarness::ClaudeCode.version_str(),
-        crate::build_info::version()
-    );
-    assert!(
-        harness_build.label.contains(&own),
-        "the harness's own version, then the aterm it ships in: {:?}",
-        harness_build.label
-    );
-    assert!(
-        harness_build
-            .label
-            .contains(crate::build_info::git_commit())
-    );
+    for harness in aterm_phase::CliHarness::ALL {
+        let cli = harness.cli();
+        let harness_build = node(&pages, &format!("harness/updates/row/alab-{cli}-harness"));
+        let own = format!(
+            "v{} (built-in) · in aterm {}",
+            harness.version_str(),
+            crate::build_info::version()
+        );
+        assert!(
+            harness_build.label.contains(&format!("alab {cli} harness"))
+                && harness_build.label.contains(&own),
+            "{harness:?}: its name as its top rule reads it, its own version, then the aterm it \
+             ships in: {:?}",
+            harness_build.label
+        );
+        assert!(
+            harness_build
+                .label
+                .contains(crate::build_info::git_commit())
+        );
+    }
     for cli in ["claude", "codex"] {
         assert!(
             node(&pages, &format!("harness/updates/row/{cli}-cli"))
@@ -2586,9 +2592,22 @@ fn the_fact_cards_labels_are_whole_at_large_type() {
                 &context,
             );
             if scale > 1.2 {
+                // A card whose labels leave its values no column stacks each value under its
+                // label (the Linux lane's Noto Sans stacks DID at 2x in 504pt): STATUS's column
+                // is then its own however wide DID's labels are.
+                let label_x = |card: &str| {
+                    pages
+                        .iter()
+                        .flat_map(|page| page.paint.iter())
+                        .find(|node| node.key.as_str().starts_with(&format!("{card}label/")))
+                        .map(|node| node.rect.x)
+                };
+                let did_stacked =
+                    label_x("harness/did/").is_some_and(|x| (x_of["harness/did/"] - x).abs() < 0.5);
                 assert!(
-                    x_of["harness/status/"] + 1.0 < x_of["harness/did/"],
-                    "{context}: STATUS's column is its own, {x_of:?}"
+                    did_stacked || x_of["harness/status/"] + 1.0 < x_of["harness/did/"],
+                    "{context}: STATUS's column is its own, {x_of:?} (DID's labels at {:?})",
+                    label_x("harness/did/")
                 );
             }
             if (scale - 1.0).abs() < 0.01 {

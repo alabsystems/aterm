@@ -94,15 +94,6 @@ impl ActiveEventLoop {
     pub(crate) fn exit_code(&self) -> Option<i32> {
         self.exit.get()
     }
-
-    /// There is no display, so there is no handle to hand out.
-    #[cfg(feature = "rwh_06")]
-    #[inline]
-    pub fn raw_display_handle_rwh_06(
-        &self,
-    ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        Err(rwh_06::HandleError::NotSupported)
-    }
 }
 
 pub struct EventLoop<T: 'static> {

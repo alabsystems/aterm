@@ -48,7 +48,7 @@ impl Terminal {
             cursor_save: CursorSaveState::new(),
             title: TitleState::new(),
             bell_callback: None,
-            kitty_file_resolver: None,
+            kitty_file_resolver: super::kitty_auth::KittyResolverSlot::new(),
             last_bell_time: None,
             bell_total: 0,
             notify_total: 0,
@@ -106,6 +106,7 @@ impl Terminal {
             evidence_asserted: 0,
             content_scroll_state: super::ContentScrollState::default(),
             resize_journal: super::resize_journal::ResizeJournal::default(),
+            host_journal: super::host_journal::HostJournal::default(),
         };
 
         if terminal.modes.allow_osc52_set {

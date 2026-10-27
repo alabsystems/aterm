@@ -38,6 +38,7 @@ mod primary_flap_with_output;
 mod reload_keeps_program_colours;
 mod replay_corpus_probe;
 mod replay_offset_determinism;
+mod resize_keeps_the_next_write;
 mod resize_preserves_non_bmp;
 mod resize_quiet_flap_identity;
 mod resize_rewrap_fidelity;
@@ -55,6 +56,7 @@ mod sgr_rendition_parity;
 mod shell_mark_rows_across_resize;
 mod tab_stops_across_grid_seams;
 mod unicode_content_generation;
+mod wide_glyph_halves;
 
 // OSC 1337 `File=` fixtures shared by the `image_*` modules.
 #[path = "support/osc1337.rs"]

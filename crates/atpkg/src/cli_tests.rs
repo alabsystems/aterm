@@ -7823,6 +7823,7 @@ fn the_window_seed_says_the_recorded_verdict_when_no_update_is_due() {
             &test_anchor(),
             cache.load(&source)?,
             build_floor(&layout),
+            None,
             testkit::NOW,
         )
         .selected
@@ -8475,6 +8476,103 @@ fn write_toolchain_registry_and(dir: &Path, singletons: &[(&str, u64)]) {
     for (p, b) in singletons {
         write_pkg(dir, p, *b);
     }
+}
+
+/// A fetcher that records the archives it downloads, in order, one at a time (no lane of its
+/// own fetches ahead), and whether the Trust toolchain was live in `layout` as each began.
+struct OrderFetcher {
+    inner: crate::DirFetcher,
+    layout: crate::Layout,
+    downloads: std::sync::Mutex<Vec<(String, bool)>>,
+}
+
+impl crate::flow::Fetcher for OrderFetcher {
+    fn index_candidates(&self) -> Result<Vec<crate::Candidate>, String> {
+        crate::flow::Fetcher::index_candidates(&self.inner)
+    }
+
+    fn pkg_manifest(
+        &self,
+        repo: &str,
+        program: &str,
+        build: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        crate::flow::Fetcher::pkg_manifest(&self.inner, repo, program, build)
+    }
+
+    fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+        let toolchain_live = crate::active_builds(&self.layout).contains_key("trust");
+        self.downloads
+            .lock()
+            .unwrap()
+            .push((asset.to_string(), toolchain_live));
+        crate::flow::Fetcher::download(&self.inner, repo, asset, dest)
+    }
+
+    fn source_id(&self) -> String {
+        crate::flow::Fetcher::source_id(&self.inner)
+    }
+}
+
+/// THE TOOLCHAIN LANDS FIRST: a set completion fetches and lands the unit that carries the
+/// Trust toolchain before any other, whatever the other units are named, so `targo` is usable
+/// before the optional units behind it.
+#[test]
+fn the_toolchain_unit_lands_before_the_rest_of_the_set() {
+    let dir = scratch("toolchain-first");
+    let body = format!(
+        "schema = 2\nindex_build = 51\nvalid_until = \"2099-01-01T00:00:00Z\"\n\
+         machine_id = \"{id}\"\nroster_seq = {seq}\n\
+         [programs.ka]\nrepo = \"ka\"\ncoherence_group = \"kit\"\n\
+         [programs.kb]\nrepo = \"kb\"\ncoherence_group = \"kit\"\n\
+         [programs.trust]\nrepo = \"trust\"\ncoherence_group = \"rustc\"\n\
+         [programs.tb]\nrepo = \"tb\"\ncoherence_group = \"rustc\"\n\
+         [programs.aa]\nrepo = \"aa\"\n\
+         [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
+         pin = {{ ka = 2, kb = 3, trust = 4821, tb = 6, aa = 9 }}\n",
+        id = testkit::MACHINE_ID,
+        seq = testkit::SEQ
+    );
+    std::fs::write(dir.join("index.toml"), body.as_bytes()).unwrap();
+    std::fs::write(
+        dir.join("index.toml.sig"),
+        sign(&RELEASE_SEED, body.as_bytes()),
+    )
+    .unwrap();
+    write_roster(&dir);
+    for (p, b) in [("ka", 2), ("kb", 3), ("trust", 4821), ("tb", 6), ("aa", 9)] {
+        write_pkg(&dir, p, b);
+    }
+    let layout = temp_layout("toolchain-first");
+    let fetcher = OrderFetcher {
+        inner: crate::DirFetcher::new(dir.clone()),
+        layout: (*layout).clone(),
+        downloads: std::sync::Mutex::new(Vec::new()),
+    };
+    let out = install_default_set(
+        &layout,
+        &fetcher,
+        &test_anchor(),
+        &crate::config::PackagesConfig::default(),
+        0,
+    );
+    assert_eq!(out.failures, 0);
+    assert_eq!(
+        fetcher.downloads.into_inner().unwrap(),
+        [
+            ("tb-6.tar.zst".to_string(), false),
+            ("trust-4821.tar.zst".to_string(), false),
+            ("ka-2.tar.zst".to_string(), true),
+            ("kb-3.tar.zst".to_string(), true),
+            ("aa-9.tar.zst".to_string(), true),
+        ],
+        "the toolchain's unit first and live before any other unit is fetched"
+    );
+    let live = crate::active_builds(&layout);
+    assert_eq!(live.get("trust").copied(), Some(4821));
+    assert_eq!(live.get("aa").copied(), Some(9));
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

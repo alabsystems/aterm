@@ -76,7 +76,7 @@ pub use anchor_lend::{AnchorLend, LendReach};
 pub use history_carry::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
 };
-pub use resize_handback::ResizeLaw;
+pub use resize_handback::{CanonicalHandbackCarry, GridHandbackCarry, ResizeLaw};
 pub(crate) use scroll_convert::ScrolledRowExtras;
 pub use scroll_materialize::{MaterializedRow, materialize_from_line, stored_line_cells};
 pub use scrollback_access::HistoryLines;

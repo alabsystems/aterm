@@ -951,6 +951,7 @@ mod tests {
         b.freed
             .add(41 * GIB, BUILD_CACHES, &clock(UTC_MIDNIGHT + 30_000));
         let hog = Hog {
+            built_s_ago: None,
             path: PathBuf::from("/Users//x/aterm/target"),
             bytes: 212 * GIB,
             bytes_partial: false,

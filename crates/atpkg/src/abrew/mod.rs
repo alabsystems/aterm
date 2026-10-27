@@ -3,6 +3,8 @@
 //! Native brew compatibility in atpkg (`docs/DESIGN-abrew-2026-10-19.md`).
 
 mod commands;
+mod help_texts;
+mod tty;
 use commands::*;
 
 pub mod api;
@@ -77,6 +79,17 @@ pub fn rerouted_entry(args: &[String]) -> ExitCode {
 
 /// Runs `abrew` on `args`.
 pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
+    VIA_REROUTE.store(via_reroute, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(unix)]
+    {
+        // Rust ignores SIGPIPE, which turns `abrew ... | head` into
+        // a panic on EPIPE; restore the default disposition so the
+        // process ends quietly with the signal, as brew does.
+        // SAFETY: restoring a default signal disposition.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     if cfg!(windows) {
         eprintln!("abrew: Homebrew is macOS/Linux software; abrew does nothing on Windows");
         return ExitCode::from(1);
@@ -86,6 +99,7 @@ pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
         eprintln!("abrew: warning: {w}");
     }
     let args = command_args(args);
+    let args: &[String] = &args;
     let first = args.first().map(String::as_str).unwrap_or("");
     if first == stub::REAL_FLAG {
         return unsupported(
@@ -126,7 +140,7 @@ fn not_native(_prefix: &Prefix, _args: &[String], cmd: &str) -> ExitCode {
 }
 
 fn failed(msg: &str) -> ExitCode {
-    eprintln!("{msg}");
+    eprintln!("{}", tty::error_line(msg));
     ExitCode::from(1)
 }
 
@@ -165,11 +179,76 @@ pub(super) fn no_env_hints() -> bool {
     env_set("HOMEBREW_NO_ENV_HINTS")
 }
 
+/// Whether this process was entered through the `brew` reroute
+/// (`atpkg __abrew`, what the stub execs) rather than as `abrew`.
+/// A CLI process has exactly one entry mode; `run` records it.
+static VIA_REROUTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn via_reroute() -> bool {
+    VIA_REROUTE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The canonical command a help topic or argv0 names, resolving
+/// brew's command aliases (as `Commands.path` does).
+fn canonical_help_command(cmd: &str) -> &str {
+    let cmd = match cmd {
+        "instal" => "install",
+        "uninstal" => "uninstall",
+        "abv" => "info",
+        "up" => "update",
+        "environment" => "--env",
+        "--config" => "config",
+        "post_install" => "postinstall",
+        other => other,
+    };
+    help_texts::ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == cmd)
+        .map_or(cmd, |(_, target)| target)
+}
+
+/// Brew's help text for a command, or the top-level help message
+/// when the command has no help of its own (brew's fallback).
+fn brew_help_text(cmd: &str) -> &'static str {
+    let cmd = canonical_help_command(cmd);
+    help_texts::TEXTS
+        .iter()
+        .find(|(name, _)| *name == cmd)
+        .map_or(help_texts::TOP, |(_, text)| text)
+}
+
+/// Brew prints the command's help before an Invalid usage error;
+/// under the `brew` reroute, do the same.
+fn print_usage_preamble(args: &[String]) {
+    if !via_reroute() {
+        return;
+    }
+    let cmd = args.first().map_or("", String::as_str);
+    eprint!("{}", brew_help_text(cmd));
+    eprintln!();
+}
+
+/// A failed() for `Error: Invalid usage:` messages, carrying
+/// brew's help preamble under the reroute.
+pub(super) fn usage_failed(cmd: &str, message: &str) -> ExitCode {
+    if via_reroute() {
+        eprint!("{}", brew_help_text(cmd));
+        eprintln!();
+    }
+    failed(message)
+}
+
 fn from_install(_prefix: &Prefix, _args: &[String], r: Result<(), InstallError>) -> ExitCode {
     match r {
         Ok(()) => ExitCode::SUCCESS,
-        Err(InstallError::Failed(m)) => failed(&m),
+        Err(InstallError::Failed(m)) => {
+            if m.starts_with("Error: Invalid usage:") {
+                print_usage_preamble(_args);
+            }
+            failed(&m)
+        }
         Err(InstallError::Unsupported(reason)) => unsupported(&reason),
+        Err(InstallError::Aborted) => ExitCode::from(1),
     }
 }
 
@@ -222,13 +301,62 @@ fn mutates(cmd: &str) -> bool {
 }
 
 fn canonical_kind_switches(rest: &[String]) -> Vec<String> {
-    rest.iter()
-        .map(|s| match s.as_str() {
-            "--formulae" => "--formula".to_string(),
-            "--casks" => "--cask".to_string(),
-            _ => s.clone(),
-        })
-        .collect()
+    let mut out = Vec::with_capacity(rest.len());
+    let mut literal = false;
+    for s in rest {
+        if literal {
+            out.push(s.clone());
+            continue;
+        }
+        match s.as_str() {
+            "--" => {
+                literal = true;
+                out.push(s.clone());
+            }
+            "--formulae" => out.push("--formula".to_string()),
+            "--casks" => out.push("--cask".to_string()),
+            _ => {
+                // OptionParser bundles boolean short switches (-vq,
+                // -1l); admit-checking then validates each one, so
+                // an undefined bundled letter is refused downstream
+                // exactly where brew's parser refuses it.
+                let short = s.strip_prefix('-').filter(|t| {
+                    !t.starts_with('-')
+                        && t.chars().count() > 1
+                        && t.chars().all(|c| c.is_ascii_alphanumeric())
+                });
+                match short {
+                    Some(t) => out.extend(t.chars().map(|c| format!("-{c}"))),
+                    None => out.push(s.clone()),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Brew's named-argument type phrase for the Invalid usage
+/// count errors ("formula or cask", "installed formula or
+/// installed cask", …), from each command's `named_args`.
+fn named_arg_types(cmd: &str) -> String {
+    let types: &[&str] = match cmd {
+        "install" | "reinstall" | "fetch" | "cat" | "log" | "deps" | "info" | "home"
+        | "homepage" | "missing" | "outdated" | "cleanup" => &["formula", "cask"],
+        "uninstall" | "remove" | "rm" | "link" | "ln" | "unlink" | "list" | "ls" | "upgrade" => {
+            &["installed formula", "installed cask"]
+        }
+        "search" | "-S" => &["text or regex"],
+        "desc" => &["formula", "cask", "text or regex"],
+        "uses" | "dependents" | "options" => &["formula"],
+        "zap" => &["cask"],
+        "untap" | "tap" | "tap-info" => &["tap"],
+        _ => &["named"],
+    };
+    match types {
+        [] => "named".to_string(),
+        [only] => (*only).to_string(),
+        [.., last] => format!("{} or {last}", types[..types.len() - 1].join(", ")),
+    }
 }
 
 fn native_args(
@@ -258,14 +386,27 @@ fn native_args(
             "style",
             "test",
             "unpack",
-            "zap",
         ];
         if COMMANDS.contains(&cmd) || UNSUPPORTED_KNOWN.contains(&cmd) {
             InstallError::Unsupported(format!("'{cmd}' is not native"))
         } else {
-            InstallError::Unsupported(format!("'{cmd}' is not a command abrew knows natively"))
+            let dictionary: Vec<String> = command_names(true)
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            InstallError::Failed(format!(
+                "Error: Invalid usage: Unknown command: brew {cmd}{}",
+                commands::command_suggestion(cmd, &dictionary)
+            ))
         }
     };
+    // Brew's `--ask` switch is disabled (ask mode is the default).
+    if matches!(cmd, "install" | "upgrade" | "reinstall") && has_flag(rest, "--ask", "") {
+        return Err(InstallError::Failed(
+            "Error: Calling the `--ask` switch is disabled! Use the default behaviour instead."
+                .to_string(),
+        ));
+    }
     if cmd == "bundle" {
         return bundle_args(rest);
     }
@@ -286,6 +427,9 @@ fn native_args(
                 "--debug",
                 "-d",
                 "--no-quarantine",
+                "--no-ask",
+                "--yes",
+                "-y",
             ],
             1,
             usize::MAX,
@@ -303,6 +447,9 @@ fn native_args(
                 "--quiet",
                 "-q",
                 "--greedy",
+                "--no-ask",
+                "--yes",
+                "-y",
             ],
             0,
             usize::MAX,
@@ -317,6 +464,7 @@ fn native_args(
                 "-n",
                 "--force",
                 "-f",
+                "--zap",
             ],
             1,
             usize::MAX,
@@ -334,6 +482,9 @@ fn native_args(
                 "--analytics",
                 "--days",
                 "--category",
+                "--github",
+                "--verbose",
+                "-v",
             ],
             0,
             usize::MAX,
@@ -362,6 +513,10 @@ fn native_args(
                 "--missing",
                 "--recursive",
                 "--include-build",
+                "--include-test",
+                "--include-optional",
+                "--include-implicit",
+                "--skip-recommended",
                 "--formula",
                 "--formulae",
                 "--cask",
@@ -371,8 +526,13 @@ fn native_args(
             usize::MAX,
             true,
         ),
-        "home" | "homepage" => (&[], 0, usize::MAX, true),
-        "cat" => (&["--cask", "--formula"], 1, 1, true),
+        "home" | "homepage" => (
+            &["--formula", "--formulae", "--cask", "--casks"],
+            0,
+            usize::MAX,
+            true,
+        ),
+        "cat" => (&["--cask", "--formula"], 1, usize::MAX, true),
         "outdated" => (
             &[
                 "--formula",
@@ -391,10 +551,30 @@ fn native_args(
             true,
         ),
         "missing" => (&[], 0, usize::MAX, true),
+        "zap" => (&["--force", "-f", "--cask", "--casks"], 1, usize::MAX, true),
         "cleanup" => (&["--dry-run", "-n", "-s", "--scrub"], 0, usize::MAX, true),
-        "autoremove" => (&["--dry-run", "-n"], 0, 1, true),
-        "pin" | "unpin" => (&[], 0, usize::MAX, true),
-        "link" | "ln" | "unlink" => (&["--dry-run", "-n"], 1, 1, true),
+        "autoremove" => (&["--dry-run", "-n"], 0, 0, true),
+        "pin" | "unpin" => (
+            &["--formula", "--formulae", "--cask", "--casks"],
+            0,
+            usize::MAX,
+            true,
+        ),
+        "link" | "ln" | "unlink" => (
+            &[
+                "--dry-run",
+                "-n",
+                "--force",
+                "-f",
+                "--formula",
+                "--formulae",
+                "--cask",
+                "--casks",
+            ],
+            1,
+            usize::MAX,
+            true,
+        ),
         "switch" => (&[], 2, 2, true),
         "list" | "ls" => (
             &[
@@ -426,27 +606,53 @@ fn native_args(
                 "--union",
                 "--topological",
                 "-n",
+                "--full-name",
+                "--include-build",
+                "--include-test",
+                "--include-optional",
+                "--include-implicit",
+                "--skip-recommended",
+                "--include-requirements",
+                "--prune",
+                "--graph",
+                "--dot",
+                "--annotate",
+                "--missing",
+                "--formula",
+                "--formulae",
+                "--cask",
+                "--casks",
             ],
             0,
             usize::MAX,
             true,
         ),
-        "log" => (&[], 0, 1, true),
+        "log" => (
+            &["--formula", "--formulae", "--cask", "--casks"],
+            0,
+            1,
+            true,
+        ),
         "tap" => (&["--list-official"], 0, 2, false),
-        "untap" => (&[], 1, 1, false),
-        "tap-info" => (&[], 0, usize::MAX, false),
+        "untap" => (&[], 1, usize::MAX, false),
+        "tap-info" => (
+            &["--json", "--json=v1", "--installed"],
+            0,
+            usize::MAX,
+            false,
+        ),
         "help" | "--help" | "-h" => (&[], 0, 1, false),
         "completions" => (&[], 1, 1, false),
-        "--prefix" | "--cellar" | "--caskroom" => (&[], 0, 1, true),
+        "--prefix" | "--cellar" | "--caskroom" => (&[], 0, usize::MAX, true),
         "--cache" => (&["--formula", "--cask"], 0, usize::MAX, true),
         "--repository" | "--repo" => (&[], 0, 1, false),
         "--taps" => (&[], 0, 0, false),
         "analytics" => (&[], 0, 1, false),
-        "doctor" | "dr" => (&["--quiet", "-q"], 0, 0, false),
-        "shellenv" => (&[], 0, 1, false),
+        "doctor" | "dr" => (&["--quiet", "-q", "--list-checks"], 0, usize::MAX, false),
+        "shellenv" => (&[], 0, usize::MAX, false),
         "on" | "off" | "status" | "--version" | "-v" | "--env" | "env" | "formulae" | "casks"
         | "config" | "developer" | "update" => (&[], 0, 0, false),
-        "commands" => (&["--quiet", "--include-aliases"], 0, 0, false),
+        "commands" => (&["--quiet", "-q", "--include-aliases"], 0, 0, false),
         "leaves" => (
             &[
                 "--installed-on-request",
@@ -461,7 +667,12 @@ fn native_args(
         _ => return Err(unknown()),
     };
     let flag_ok = |arg: &str| {
-        flags.contains(&arg)
+        // Brew's parser carries the global switches on every
+        // command; handlers read the ones they honor.
+        matches!(
+            arg,
+            "--verbose" | "-v" | "--quiet" | "-q" | "--debug" | "-d"
+        ) || flags.contains(&arg)
             || (cmd == "info"
                 && (arg
                     .strip_prefix("--days=")
@@ -473,15 +684,27 @@ fn native_args(
                 }))
             || (cmd == "missing"
                 && arg.strip_prefix("--hide=").is_some_and(|v| {
-                    !v.is_empty()
-                        && v.split(',').all(|part| {
-                            let part = part.trim();
-                            !part.is_empty()
-                                && part.split('/').all(valid_component)
-                                && matches!(part.matches('/').count(), 0 | 2)
-                        })
+                    v.is_empty()
+                        || !v.is_empty()
+                            && v.split(',').all(|part| {
+                                let part = part.trim();
+                                !part.is_empty()
+                                    && part.split('/').all(valid_component)
+                                    && matches!(part.matches('/').count(), 0 | 2)
+                            })
                 }))
     };
+    if cmd == "info" {
+        for arg in rest {
+            if let Some(version) = arg.strip_prefix("--json=")
+                && !matches!(version, "v1" | "v2")
+            {
+                return Err(InstallError::Failed(format!(
+                    "Error: Invalid usage: invalid JSON version: {version}"
+                )));
+            }
+        }
+    }
     if rest.iter().any(|arg| arg.starts_with('-') && !flag_ok(arg)) {
         return Err(unsupported());
     }
@@ -511,11 +734,95 @@ fn native_args(
                 && s.strip_prefix("homebrew/cask/")
                     .is_some_and(valid_component))
     };
-    if !(min..=max).contains(&ops.len()) || (names && !ops.iter().all(valid_package_name)) {
+    if names && !ops.iter().all(valid_package_name) {
         return Err(unsupported());
     }
-    if has_flag(rest, "--cask", "") && has_flag(rest, "--formula", "") {
+    if ops.len() < min {
+        return Err(InstallError::Failed(format!(
+            "Error: Invalid usage: This command requires {} {} {} {}.",
+            if min == max { "exactly" } else { "at least" },
+            min,
+            named_arg_types(cmd),
+            if min == 1 { "argument" } else { "arguments" }
+        )));
+    }
+    if ops.len() > max {
+        if max == 0 && !matches!(cmd, "--env" | "env" | "developer") {
+            return Err(InstallError::Failed(
+                "Error: Invalid usage: This command does not take named arguments.".to_string(),
+            ));
+        }
+        if matches!(cmd, "log" | "tap") {
+            return Err(InstallError::Failed(format!(
+                "Error: Invalid usage: This command does not take more than {} {} {}.",
+                max,
+                named_arg_types(cmd),
+                if max == 1 { "argument" } else { "arguments" }
+            )));
+        }
         return Err(unsupported());
+    }
+    if matches!(cmd, "tap" | "untap" | "tap-info") {
+        let checked: &[String] = if cmd == "tap" {
+            ops.first().map_or(&[][..], std::slice::from_ref)
+        } else {
+            &ops
+        };
+        for op in checked {
+            let mut parts = op.split('/');
+            let valid = matches!(
+                (parts.next(), parts.next(), parts.next()),
+                (Some(u), Some(r), None) if valid_component(u) && valid_component(r)
+            );
+            if !valid {
+                return Err(InstallError::Failed(format!(
+                    "Error: Invalid tap name: '{op}'"
+                )));
+            }
+        }
+    }
+    if has_flag(rest, "--cask", "") && has_flag(rest, "--formula", "") {
+        // Brew's parser conflicts the kind switches on most
+        // commands; the wording follows each command's own switch
+        // definitions. `desc` accepts both as "either kind";
+        // `search` implements its own resolution; the remaining
+        // commands keep the native refusal. Plain `list` forms
+        // never reach brew's parser — its Bash path prints
+        // nothing — while the other list forms conflict.
+        if matches!(cmd, "list" | "ls") {
+            if has_flag(rest, "--json", "") && has_flag(rest, "--versions", "") {
+                return Err(InstallError::Failed(
+                    "Error: `--formula` and `--cask` are mutually exclusive.".to_string(),
+                ));
+            }
+            let bash_form = ops.is_empty()
+                && !has_flag(rest, "--versions", "")
+                && !has_flag(rest, "--pinned", "")
+                && !has_flag(rest, "--multiple", "")
+                && !has_flag(rest, "--full-name", "")
+                && !has_flag(rest, "--json", "");
+            if !bash_form {
+                return Err(InstallError::Failed(
+                    "Error: Invalid usage: Options --formula and --cask are mutually exclusive."
+                        .to_string(),
+                ));
+            }
+        }
+        let exclusive = match cmd {
+            "install" | "upgrade" | "reinstall" => {
+                Some("Error: Invalid usage: Options --cask and --formulae are mutually exclusive.")
+            }
+            "info" | "outdated" | "uses" | "dependents" | "home" | "homepage" | "cat" | "deps"
+            | "pin" | "unpin" | "uninstall" | "remove" | "rm" | "fetch" | "link" | "ln"
+            | "unlink" | "log" | "--cache" => {
+                Some("Error: Invalid usage: Options --formula and --cask are mutually exclusive.")
+            }
+            "desc" | "search" | "-S" | "list" | "ls" => None,
+            _ => return Err(unsupported()),
+        };
+        if let Some(message) = exclusive {
+            return Err(InstallError::Failed(message.to_string()));
+        }
     }
     if matches!(cmd, "install" | "reinstall" | "upgrade")
         && !has_flag(rest, "--formula", "")
@@ -523,20 +830,46 @@ fn native_args(
     {
         return Err(unsupported());
     }
-    if matches!(cmd, "list" | "ls") && !ops.is_empty() && has_flag(rest, "--pinned", "") {
-        return Err(unsupported());
-    }
     if matches!(cmd, "list" | "ls") {
-        if has_flag(rest, "--multiple", "")
-            && (has_flag(rest, "--cask", "")
-                || has_flag(rest, "--pinned", "")
-                || has_flag(rest, "--full-name", ""))
-        {
-            return Err(unsupported());
+        // Brew's list conflicts whose switches abrew admits, in
+        // its definition order (the -r/-t and installation-kind
+        // pairs name switches outside the native row). The
+        // `--versions --json` forms never reach brew's parser
+        // (its Bash fast path answers them), so they keep the
+        // json gates below instead.
+        let json_versions = has_flag(rest, "--json", "") && has_flag(rest, "--versions", "");
+        let conflicts: &[(&str, &str)] = if json_versions {
+            &[]
+        } else {
+            &[
+                ("--multiple", "--cask"),
+                ("--pinned", "--multiple"),
+                ("--versions", "-1"),
+                ("--multiple", "-1"),
+                ("--pinned", "-1"),
+                ("--versions", "-l"),
+                ("--multiple", "-l"),
+                ("--pinned", "-l"),
+                ("--full-name", "--versions"),
+                ("--full-name", "--multiple"),
+                ("--full-name", "--pinned"),
+                ("--full-name", "-l"),
+            ]
+        };
+        for (a, b) in conflicts {
+            if has_flag(rest, a, "") && has_flag(rest, b, "") {
+                return Err(InstallError::Failed(format!(
+                    "Error: Invalid usage: Options {a} and {b} are mutually exclusive."
+                )));
+            }
+        }
+        if has_flag(rest, "--json", "") && !has_flag(rest, "--versions", "") {
+            return Err(InstallError::Failed(
+                "Error: Invalid usage: `brew list --json` requires `--versions`.".to_string(),
+            ));
         }
         if has_flag(rest, "--json", "")
-            && (!has_flag(rest, "--versions", "")
-                || !ops.is_empty()
+            && (!ops.is_empty()
                 || has_flag(rest, "--multiple", "")
                 || has_flag(rest, "--pinned", "")
                 || has_flag(rest, "--full-name", "")
@@ -549,8 +882,13 @@ fn native_args(
     if cmd == "autoremove" && !ops.is_empty() {
         return Err(unsupported());
     }
-    if cmd == "deps" && !has_flag(rest, "--installed", "") && ops.is_empty() {
-        return Err(unsupported());
+    if matches!(cmd, "uninstall" | "remove" | "rm")
+        && has_flag(rest, "--zap", "")
+        && has_flag(rest, "--formula", "")
+    {
+        return Err(InstallError::Failed(
+            "Error: Invalid usage: Options --formula and --zap are mutually exclusive.".to_string(),
+        ));
     }
     if cmd == "info" {
         let analytics = has_flag(rest, "--analytics", "");
@@ -699,11 +1037,24 @@ fn prelock_admission(
         upgrade: args.first().is_some_and(|a| a == "upgrade"),
         reinstall: args.first().is_some_and(|a| a == "reinstall"),
         as_dependency: false,
+        ask: false,
     };
     let mut result = Ok(());
     let mut any = false;
     for name in rest.iter().filter(|s| !s.starts_with('-')) {
         any = true;
+        // Upgrading a name that is not installed is the command's
+        // own error, not a plan to admit or delegate.
+        if opts.upgrade {
+            let short = Formula::short_name(name);
+            if prefix.installed_one(prefix::Kind::Formula, short).is_none()
+                && prefix
+                    .installed_one(prefix::Kind::Cask, api::canonical_cask_token(short))
+                    .is_none()
+            {
+                continue;
+            }
+        }
         result = if want_cask || (!want_formula && api.formula(name).is_err()) {
             match api.cask(name) {
                 Ok(c) => cask::preflight(prefix, &c, machine::Machine::this())
@@ -728,20 +1079,29 @@ fn prelock_admission(
 }
 
 /// The single supported leading verbosity flag does not change the command's identity.
-fn command_args(args: &[String]) -> &[String] {
-    if args.len() > 1
-        && matches!(args[0].as_str(), "--verbose" | "-v" | "--debug" | "-d")
-        && !args[1].starts_with('-')
-    {
-        &args[1..]
+fn command_args(args: &[String]) -> std::borrow::Cow<'_, [String]> {
+    // Brew's shell entry shifts a leading `-v` to the end of the
+    // argument list (so `brew -v info x` is `brew info x -v`);
+    // a lone `-v` stays the version command.
+    if args.len() > 1 && args[0] == "-v" {
+        let mut rotated: Vec<String> = args[1..].to_vec();
+        rotated.push("-v".to_string());
+        std::borrow::Cow::Owned(rotated)
     } else {
-        args
+        std::borrow::Cow::Borrowed(args)
     }
 }
 
 fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
     let args = command_args(args);
+    let args: &[String] = &args;
     if args.is_empty() {
+        // Under the `brew` reroute, no arguments is brew's usage
+        // error: the help message on stderr, exit 1.
+        if via_reroute() {
+            eprint!("{}", help_texts::TOP);
+            return ExitCode::from(1);
+        }
         print!("{HELP_MAIN}");
         return ExitCode::SUCCESS;
     }
@@ -749,8 +1109,83 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         Some((c, r)) => (c.as_str(), r),
         None => ("", &[]),
     };
+    let cmd = match cmd {
+        "instal" => "install",
+        "uninstal" => "uninstall",
+        "abv" => "info",
+        "up" => "update",
+        "environment" => "--env",
+        "--config" => "config",
+        "post_install" => "postinstall",
+        other => other,
+    };
     let canonical = canonical_kind_switches(rest);
     let rest: &[String] = &canonical;
+    if via_reroute() {
+        // Brew's help surface, intercepted before admission as
+        // brew.rb does: `help <topic>`, and `--help`/`-h` anywhere
+        // in a command's arguments (before `--`).
+        if matches!(cmd, "--help" | "-h" | "help") {
+            // The topic is the first argument; `--help`/`-h` there
+            // (or no argument) means the top-level message, while
+            // dashed commands like `--cache` are real topics.
+            let topic = rest
+                .first()
+                .filter(|arg| !matches!(arg.as_str(), "--help" | "-h" | "help"));
+            return match topic {
+                None => {
+                    print!("{}", help_texts::TOP);
+                    ExitCode::SUCCESS
+                }
+                Some(topic) => {
+                    let known = help_texts::TEXTS
+                        .iter()
+                        .any(|(name, _)| *name == canonical_help_command(topic));
+                    if known {
+                        print!("{}", brew_help_text(topic));
+                        ExitCode::SUCCESS
+                    } else {
+                        let suggestion = commands::command_suggestion(
+                            topic,
+                            &command_names(true)
+                                .iter()
+                                .map(|n| n.to_string())
+                                .collect::<Vec<_>>(),
+                        );
+                        usage_failed(
+                            topic,
+                            &format!(
+                                "Error: Invalid usage: Unknown command: brew {topic}{suggestion}"
+                            ),
+                        )
+                    }
+                }
+            };
+        }
+        let help_flag = rest
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
+        if help_flag
+            && help_texts::TEXTS
+                .iter()
+                .any(|(name, _)| *name == canonical_help_command(cmd))
+        {
+            print!("{}", brew_help_text(cmd));
+            return ExitCode::SUCCESS;
+        }
+    } else {
+        // Direct abrew answers `--help`/`-h` on a known command
+        // with its own usage text, like `abrew help <cmd>`.
+        let help_flag = rest
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
+        if help_flag && command_names(true).contains(&canonical_help_command(cmd)) {
+            print!("{}", help_for(cmd));
+            return ExitCode::SUCCESS;
+        }
+    }
     let prepared = match native_args(cmd, rest) {
         Ok(prepared) => prepared,
         Err(error) => return from_install(prefix, args, Err(error)),
@@ -902,14 +1337,38 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "status" => cmd_status(prefix),
         "search" | "-S" => cmd_search(prefix, &api, rest),
         "info" => cmd_info(prefix, &api, args, rest),
-        "desc" => cmd_desc(&api, rest),
+        "desc" => cmd_desc(prefix, &api, rest),
         "home" | "homepage" => cmd_home(&api, rest),
-        "cat" => cmd_cat(prefix, rest),
+        "cat" => cmd_cat(prefix, &api, rest),
         "formulae" => list_index(&api, false),
         "casks" => list_index(&api, true),
         "commands" => {
-            for c in command_names(has_flag(rest, "--include-aliases", "")) {
-                println!("{c}");
+            if has_flag(rest, "--include-aliases", "") && !has_flag(rest, "--quiet", "-q") {
+                eprintln!(
+                    "Error: Invalid usage: `--include-aliases` cannot be passed without `--quiet`."
+                );
+                return ExitCode::from(1);
+            }
+            if has_flag(rest, "--quiet", "-q") {
+                let names: Vec<String> = command_names(has_flag(rest, "--include-aliases", ""))
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                commands::print_columns_pub(&names);
+            } else {
+                let mut first = true;
+                for (title, names) in [
+                    ("Built-in commands", BREW_BUILTIN_COMMANDS),
+                    ("Built-in developer commands", BREW_DEVELOPER_COMMANDS),
+                ] {
+                    if !first {
+                        println!();
+                    }
+                    first = false;
+                    println!("{}", tty::ohai(title));
+                    let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+                    commands::print_columns_pub(&names);
+                }
             }
             ExitCode::SUCCESS
         }
@@ -919,7 +1378,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         }
         "config" => cmd_config(prefix),
         "shellenv" => cmd_shellenv(prefix, rest),
-        "doctor" | "dr" => cmd_doctor(prefix, rest),
+        "doctor" | "dr" => cmd_doctor(prefix, &api, rest),
         "analytics" => {
             println!("abrew: analytics are always off; abrew records nothing");
             ExitCode::SUCCESS
@@ -930,6 +1389,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         }
         "install" => cmd_install(prefix, &api, args, rest),
         "uninstall" | "remove" | "rm" => cmd_uninstall(prefix, &api, args, rest),
+        "zap" => cmd_zap(prefix, &api, args, rest),
         "reinstall" => cmd_reinstall(prefix, &api, args, rest),
         "upgrade" => cmd_upgrade(prefix, &api, args, rest),
         "outdated" => cmd_outdated(prefix, &api, rest),
@@ -943,15 +1403,32 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
                 );
                 return ExitCode::from(1);
             }
+            let want_cask = has_flag(rest, "--cask", "");
+            let want_formula = has_flag(rest, "--formula", "");
             each_name(rest, |n| {
                 let short = Formula::short_name(n);
                 let token = api::canonical_cask_token(short);
-                if prefix.installed_one(prefix::Kind::Formula, short).is_some() {
+                if !want_cask && prefix.installed_one(prefix::Kind::Formula, short).is_some() {
                     prefix.pin(short)
-                } else if prefix.installed_one(prefix::Kind::Cask, token).is_some() {
+                } else if !want_formula && prefix.installed_one(prefix::Kind::Cask, token).is_some()
+                {
                     prefix.pin_cask(token)
+                } else if want_cask {
+                    if commands::package_definitively_unknown(prefix, &api, token, false, true) {
+                        Err(format!("Error: {}", commands::cask_unavailable(token)))
+                    } else {
+                        Err(format!("Error: {token} not installed"))
+                    }
+                } else if want_formula {
+                    if commands::package_definitively_unknown(prefix, &api, n, true, false) {
+                        Err(format!("Error: {}", commands::formula_unavailable(&api, n)))
+                    } else {
+                        Err(format!("Error: {short} not installed"))
+                    }
+                } else if commands::package_definitively_unknown(prefix, &api, n, true, true) {
+                    Err(format!("Error: {}", commands::formula_unavailable(&api, n)))
                 } else {
-                    prefix.pin(short)
+                    Err(format!("Error: {short} not installed"))
                 }
             })
         }
@@ -959,7 +1436,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "link" | "ln" => cmd_link(prefix, &api, args, rest, true),
         "unlink" => cmd_link(prefix, &api, args, rest, false),
         "switch" => cmd_switch(prefix, &api, args, rest),
-        "list" | "ls" => cmd_list(prefix, rest),
+        "list" | "ls" => cmd_list(prefix, &api, rest),
         "fetch" => cmd_fetch(prefix, &api, args, rest),
         "deps" => cmd_deps(prefix, &api, rest),
         "uses" | "dependents" => cmd_uses(prefix, &api, rest),
@@ -970,7 +1447,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "log" => cmd_log(prefix, rest),
         "tap" => cmd_tap(prefix, rest),
         "untap" => each_name(rest, |n| tap::remove(prefix, n)),
-        "tap-info" => cmd_tap_info(prefix, rest),
+        "tap-info" => cmd_tap_info(prefix, &api, rest),
         "bundle" => cmd_bundle(prefix, &api, args, rest, prepared),
         _ => not_native(prefix, args, cmd),
     }
@@ -1074,27 +1551,168 @@ const COMMANDS: &[&str] = &[
     "update",
     "upgrade",
     "uses",
+    "zap",
 ];
 
-const COMMAND_ALIASES: &[&str] = &[
+/// Brew 7.0's built-in command inventory, in brew's own listing
+/// order (what `commands` shows; every name routes natively or
+/// delegates, so the list is the honest CLI surface).
+const BREW_BUILTIN_COMMANDS: &[&str] = &[
+    "--cache",
+    "--caskroom",
+    "--cellar",
+    "--env",
+    "--prefix",
+    "--repository",
+    "--taps",
+    "--version",
+    "alias",
+    "analytics",
+    "as-brew-user",
+    "as-console-user",
+    "autoremove",
+    "bundle",
+    "casks",
+    "cleanup",
+    "command-not-found-init",
+    "command",
+    "commands",
+    "completions",
+    "config",
+    "deps",
+    "desc",
+    "developer",
+    "docs",
+    "doctor",
+    "exec",
+    "fetch",
+    "formulae",
+    "gist-logs",
+    "help",
+    "home",
+    "info",
+    "install",
+    "leaves",
+    "link",
+    "list",
+    "log",
+    "mcp-server",
+    "migrate",
+    "missing",
+    "nodenv-sync",
+    "options",
+    "outdated",
+    "pin",
+    "postinstall",
+    "pyenv-sync",
+    "rbenv-sync",
+    "readall",
+    "reinstall",
+    "sandbox-exec",
+    "search",
+    "services",
+    "setup-ruby",
+    "shellenv",
+    "source",
+    "tab",
+    "tap-info",
+    "tap",
+    "trust",
+    "unalias",
+    "uninstall",
+    "unlink",
+    "unpin",
+    "untap",
+    "untrust",
+    "update-if-needed",
+    "update-reset",
+    "update",
+    "upgrade",
+    "uses",
+    "version-install",
+    "vulns",
+    "which-formula",
+];
+const BREW_DEVELOPER_COMMANDS: &[&str] = &[
+    "audit",
+    "benchmark",
+    "bottle",
+    "bump-cask-pr",
+    "bump-compatibility-version",
+    "bump-formula-pr",
+    "bump-revision",
+    "bump-unversioned-casks",
+    "bump",
+    "cat",
+    "contributions",
+    "create",
+    "debugger",
+    "edit",
+    "extract",
+    "find-appcast",
+    "formula",
+    "generate-cask-token",
+    "generate-man-completions",
+    "generate-zap",
+    "install-bundler-gems",
+    "irb",
+    "lgtm",
+    "linkage",
+    "livecheck",
+    "prof",
+    "rubocop",
+    "ruby",
+    "rubydoc",
+    "sh",
+    "style",
+    "tap-new",
+    "test-bot",
+    "test",
+    "tests",
+    "typecheck",
+    "unbottled",
+    "unpack",
+    "update-perl-resources",
+    "update-python-resources",
+    "update-test",
+    "vendor-gems",
+    "verify",
+    "which-update",
+];
+/// Aliases brew adds under `--include-aliases` (beyond abrew's own
+/// `COMMAND_ALIASES` subset used for dispatch).
+const BREW_COMMAND_ALIASES: &[&str] = &[
+    "--config",
     "--repo",
     "-S",
     "-v",
-    "dependents",
+    "abv",
     "dr",
+    "environment",
     "homepage",
+    "instal",
+    "lc",
     "ln",
     "ls",
+    "post_install",
     "remove",
     "rm",
+    "tc",
+    "uninstal",
+    "up",
+    "x",
 ];
 
 fn command_names(include_aliases: bool) -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = COMMANDS.to_vec();
+    let mut names: Vec<&'static str> = BREW_BUILTIN_COMMANDS
+        .iter()
+        .chain(BREW_DEVELOPER_COMMANDS)
+        .copied()
+        .collect();
     if include_aliases {
-        names.extend(COMMAND_ALIASES.iter().copied());
-        names.sort_unstable();
+        names.extend(BREW_COMMAND_ALIASES.iter().copied());
     }
+    names.sort_unstable();
     names
 }
 
@@ -1172,7 +1790,9 @@ fn help_for(cmd: &str) -> &'static str {
         "fetch" => {
             "Usage: abrew fetch [--formula|--cask] [--deps] <name>…\n  Downloads into the cache without installing; a cask needs --cask, and --deps\n  also fetches a formula's dependencies.\n"
         }
-        "link" | "ln" | "unlink" => "Usage: abrew link|unlink [--dry-run|-n] <formula>\n",
+        "link" | "ln" | "unlink" => {
+            "Usage: abrew link|unlink [--dry-run|-n] [--force|-f] [--formula|--cask] <formula|cask>\n"
+        }
         "doctor" | "dr" => {
             "Usage: abrew doctor [--quiet|-q]\n  Warns about the native prefix (unwritable, broken links, missing receipts,\n  extra versions, unlinked kegs, bad pins, bin not on PATH) and exits 1 on any;\n  --quiet drops the all-clear line. Homebrew is not a dependency.\n  `aterm pkg doctor` checks the managed `brew` stub.\n"
         }
@@ -1225,16 +1845,41 @@ mod admission_tests {
     }
 
     #[test]
+    fn brew_help_texts_cover_commands_and_aliases() {
+        assert!(help_texts::TOP.starts_with("Example usage:\n  brew search"));
+        let install = brew_help_text("install");
+        assert!(
+            install.starts_with("Usage: brew install [options] formula|cask"),
+            "{install:.60}"
+        );
+        assert!(install.ends_with("Show this message.\n"));
+        // Aliases resolve to the canonical command's text.
+        assert_eq!(brew_help_text("ls"), brew_help_text("list"));
+        assert_eq!(brew_help_text("instal"), install);
+        // Unknown topics fall back to the top-level message.
+        assert_eq!(brew_help_text("frobnicate"), help_texts::TOP);
+        // Every builtin/developer command brew documents resolves
+        // to its own text or, like brew, the top-level message.
+        for name in command_names(false) {
+            let _ = brew_help_text(name);
+        }
+    }
+
+    #[test]
     fn command_names_merge_aliases_sorted() {
         let plain = command_names(false);
-        assert_eq!(plain.len(), COMMANDS.len());
+        assert_eq!(
+            plain.len(),
+            BREW_BUILTIN_COMMANDS.len() + BREW_DEVELOPER_COMMANDS.len()
+        );
         assert!(!plain.contains(&"ls"));
+        assert!(plain.windows(2).all(|w| w[0] < w[1]), "plain is sorted");
         let merged = command_names(true);
-        assert_eq!(merged.len(), COMMANDS.len() + COMMAND_ALIASES.len());
+        assert_eq!(merged.len(), plain.len() + BREW_COMMAND_ALIASES.len());
         assert!(merged.windows(2).all(|w| w[0] < w[1]), "merged is sorted");
-        for alias in COMMAND_ALIASES {
+        for alias in BREW_COMMAND_ALIASES {
             assert!(merged.contains(alias), "{alias} listed");
-            assert!(!COMMANDS.contains(alias), "{alias} not duplicated");
+            assert!(!plain.contains(alias), "{alias} not duplicated");
         }
     }
 
@@ -1288,7 +1933,6 @@ mod admission_tests {
             ),
             ("link", vec!["--overwrite", "wget"]),
             ("services", vec!["start", "wget"]),
-            ("uninstall", vec!["--zap", "firefox"]),
             ("completions", vec!["powershell"]),
             ("completions", vec![]),
             ("postinstall", vec!["wget"]),
@@ -1301,13 +1945,7 @@ mod admission_tests {
             ("desc", vec!["-s", "-n", "wget"]),
             ("desc", vec!["--search", "--description", "wget"]),
             ("desc", vec!["-s", "/(?=http)client/"]),
-            ("missing", vec!["--hide="]),
             ("missing", vec!["--hide=../outside"]),
-            ("list", vec!["--pinned", "wget"]),
-            ("list", vec!["--multiple", "--cask"]),
-            ("list", vec!["--multiple", "--pinned"]),
-            ("list", vec!["--multiple", "--full-name"]),
-            ("list", vec!["--json"]),
             ("list", vec!["--versions", "--json", "wget"]),
             ("list", vec!["--versions", "--json", "-l"]),
             ("list", vec!["--versions", "--json", "--pinned"]),
@@ -1409,7 +2047,6 @@ mod admission_tests {
             ("list", vec!["--versions", "--json", "--formula"]),
             ("list", vec!["--versions", "--json", "--casks"]),
             ("list", vec!["--full-name"]),
-            ("list", vec!["--full-name", "--versions"]),
             ("outdated", vec!["wget"]),
             ("outdated", vec!["--json=v2", "wget", "tree"]),
             ("list", vec!["-l"]),
@@ -1677,6 +2314,123 @@ mod admission_tests {
     }
 
     #[test]
+    fn kind_switch_conflicts_are_brew_usage_errors() {
+        let failed = |cmd: &str, args: &[&str]| match native_args(cmd, &argv(args)) {
+            Err(InstallError::Failed(m)) => m,
+            other => panic!("expected usage failure for {cmd} {args:?}, got {other:?}"),
+        };
+        assert_eq!(
+            failed("install", &["--formula", "--cask", "acl"]),
+            "Error: Invalid usage: Options --cask and --formulae are mutually exclusive."
+        );
+        assert_eq!(
+            failed("install", &["--ask", "acl"]),
+            "Error: Calling the `--ask` switch is disabled! Use the default behaviour instead."
+        );
+        assert!(native_args("install", &argv(&["--no-ask", "acl"])).is_ok());
+        assert!(native_args("install", &argv(&["-y", "acl"])).is_ok());
+        assert!(native_args("upgrade", &argv(&["--yes"])).is_ok());
+        assert_eq!(
+            failed("info", &["--formula", "--cask", "acl"]),
+            "Error: Invalid usage: Options --formula and --cask are mutually exclusive."
+        );
+        assert_eq!(
+            failed("uninstall", &["--zap", "--formula", "hello"]),
+            "Error: Invalid usage: Options --formula and --zap are mutually exclusive."
+        );
+        assert_eq!(
+            failed("list", &["--multiple", "--cask", "--pinned"]),
+            "Error: Invalid usage: Options --multiple and --cask are mutually exclusive."
+        );
+        assert_eq!(
+            failed("list", &["--multiple", "--pinned", "--full-name"]),
+            "Error: Invalid usage: Options --pinned and --multiple are mutually exclusive."
+        );
+        assert_eq!(
+            failed("list", &["--versions", "-l", "--full-name"]),
+            "Error: Invalid usage: Options --versions and -l are mutually exclusive."
+        );
+        assert_eq!(
+            failed("list", &["--full-name", "--multiple", "--versions"]),
+            "Error: Invalid usage: Options --full-name and --versions are mutually exclusive."
+        );
+        assert_eq!(
+            failed("list", &["--pinned", "-1"]),
+            "Error: Invalid usage: Options --pinned and -1 are mutually exclusive."
+        );
+        // Named pinned listings are native.
+        assert!(native_args("list", &argv(&["--pinned", "hello"])).is_ok());
+        assert!(native_args("list", &argv(&["--pinned", "--versions", "hello"])).is_ok());
+        // desc and search accept both kind switches (each handler
+        // resolves them brew's way); plain list forms print
+        // nothing on brew's Bash path, the rest conflict.
+        assert!(native_args("desc", &argv(&["--formula", "--cask", "acl"])).is_ok());
+        assert!(native_args("search", &argv(&["--formula", "--cask", "acl"])).is_ok());
+        assert!(native_args("list", &argv(&["--formula", "--cask"])).is_ok());
+        assert!(native_args("list", &argv(&["--formula", "--cask", "-l"])).is_ok());
+        assert_eq!(
+            failed("list", &["--formula", "--cask", "hello"]),
+            "Error: Invalid usage: Options --formula and --cask are mutually exclusive."
+        );
+        assert_eq!(
+            failed("list", &["--formula", "--cask", "--versions"]),
+            "Error: Invalid usage: Options --formula and --cask are mutually exclusive."
+        );
+        assert_eq!(
+            failed("list", &["--formula", "--cask", "--json", "--versions"]),
+            "Error: `--formula` and `--cask` are mutually exclusive."
+        );
+        // deps --installed/--missing is the handler's usage error.
+        assert!(native_args("deps", &argv(&["--installed", "--missing"])).is_ok());
+        assert_eq!(
+            failed("pin", &["--formula", "--cask", "acl"]),
+            "Error: Invalid usage: Options --formula and --cask are mutually exclusive."
+        );
+        assert!(native_args("pin", &argv(&["--cask", "caffeine"])).is_ok());
+        assert!(native_args("unpin", &argv(&["--formula", "acl"])).is_ok());
+        assert_eq!(
+            failed("link", &["--formula", "--cask", "acl"]),
+            "Error: Invalid usage: Options --formula and --cask are mutually exclusive."
+        );
+        assert!(native_args("link", &argv(&["--cask", "caffeine"])).is_ok());
+        assert!(native_args("link", &argv(&["--force", "acl"])).is_ok());
+        assert!(native_args("unlink", &argv(&["--formula", "-n", "acl"])).is_ok());
+        assert!(matches!(
+            native_args("link", &argv(&["--overwrite", "acl"])),
+            Err(InstallError::Unsupported(_))
+        ));
+        assert!(matches!(
+            native_args("link", &argv(&["--HEAD", "acl"])),
+            Err(InstallError::Unsupported(_))
+        ));
+        assert_eq!(
+            failed("log", &["--formula", "--cask", "acl"]),
+            "Error: Invalid usage: Options --formula and --cask are mutually exclusive."
+        );
+        assert!(native_args("log", &argv(&["--cask", "caffeine"])).is_ok());
+    }
+
+    #[test]
+    fn deps_graph_forms_are_admitted() {
+        // The browser form is native; the --tree/--graph conflict is
+        // the handler's brew usage error, not an admission refusal.
+        assert!(native_args("deps", &argv(&["--graph", "jq"])).is_ok());
+        assert!(native_args("deps", &argv(&["--graph", "--dot", "jq"])).is_ok());
+        assert!(native_args("deps", &argv(&["--tree", "--graph", "jq"])).is_ok());
+    }
+
+    #[test]
+    fn bundled_short_switches_expand_like_optionparser() {
+        assert_eq!(
+            canonical_kind_switches(&argv(&["-vq", "acl", "--", "-1l"])),
+            argv(&["-v", "-q", "acl", "--", "-1l"])
+        );
+        assert!(native_args("info", &argv(&["-vq", "acl"])).is_ok());
+        assert!(native_args("list", &argv(&["-1l"])).is_ok());
+        assert!(native_args("info", &argv(&["-vz", "acl"])).is_err());
+    }
+
+    #[test]
     fn native_admission_messages_are_precise() {
         let msg = |args: &[&str]| {
             let args = argv(args);
@@ -1705,8 +2459,36 @@ mod admission_tests {
             assert_eq!(dispatch(&fresh, &argv(q)), ExitCode::SUCCESS, "{q:?}");
             assert!(!fresh.root.exists(), "{q:?}");
         }
-        assert!(msg(&["frobnicate"]).contains("not a command abrew knows"));
-        assert!(msg(&["zap"]).contains("'zap' is not native"));
+        assert!(matches!(
+            native_args("frobnicate", &argv(&[])),
+            Err(InstallError::Failed(m)) if m
+                == "Error: Invalid usage: Unknown command: brew frobnicate"
+        ));
+        assert!(native_args("missing", &argv(&["--hide="])).is_ok());
+        assert!(matches!(
+            native_args("search", &argv(&[])),
+            Err(InstallError::Failed(m)) if m
+                == "Error: Invalid usage: This command requires at least 1 text or regex argument."
+        ));
+        assert!(matches!(
+            native_args("autoremove", &argv(&["wget"])),
+            Err(InstallError::Failed(m)) if m
+                == "Error: Invalid usage: This command does not take named arguments."
+        ));
+        assert!(matches!(
+            native_args("info", &argv(&["--json=v9", "wget"])),
+            Err(InstallError::Failed(m)) if m
+                == "Error: Invalid usage: invalid JSON version: v9"
+        ));
+        assert!(matches!(
+            native_args("untap", &argv(&["notatap"])),
+            Err(InstallError::Failed(m)) if m == "Error: Invalid tap name: 'notatap'"
+        ));
+        assert!(matches!(
+            native_args("list", &argv(&["--json"])),
+            Err(InstallError::Failed(m)) if m
+                == "Error: Invalid usage: `brew list --json` requires `--versions`."
+        ));
         assert!(msg(&["audit"]).contains("'audit' is not native"));
     }
 

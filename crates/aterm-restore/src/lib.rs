@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod layout;
+pub mod plant;
 pub mod policy;
 pub mod records;
 pub mod recover;

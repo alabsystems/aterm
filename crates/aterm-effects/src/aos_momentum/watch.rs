@@ -9,7 +9,6 @@ use aterm_aos::contract::Contract;
 use aterm_aos::effects::NoEffects;
 use aterm_aos::publish::{Retire, Retired};
 use aterm_aos::registry::Judged;
-use aterm_aos::replay::replay;
 
 use super::{MomentumSchema, MomentumTrace, NoStrandedLight, PrebuiltMomentum};
 
@@ -63,6 +62,7 @@ impl Segment {
     }
 
     /// The segment as a judgement of `judged`, with no fault kept.
+    #[inline]
     fn judgement(&self, judged: Judged) -> SegmentJudgement {
         let log = &self.retired.log;
         SegmentJudgement {
@@ -77,12 +77,14 @@ impl Segment {
     }
 
     /// The segment left unjudged for `why` with no replay, as when the watcher's worker did not run.
+    #[inline]
     #[must_use]
     pub fn unjudged(self, why: &'static str) -> SegmentJudgement {
         self.judgement(Judged::Unjudged(why))
     }
 
     /// Replays the segment from its checkpoint under the code that ran it, requires the replay to reach the state the segment ended in, and judges the run by `momentum-glow.no-stranded-light`.
+    #[inline]
     #[must_use]
     pub fn judge(self) -> SegmentJudgement {
         let mut out = self.judgement(Judged::Unjudged("not judged"));
@@ -103,7 +105,7 @@ impl Segment {
             out.judged = Judged::Unjudged("the checkpoint does not restore");
             return out;
         };
-        let run = replay(
+        let (run, verdict) = contract.replay_judged(
             &schema,
             &retired.code,
             start,
@@ -116,7 +118,6 @@ impl Segment {
                 Judged::Unjudged("the replay does not reach the state the segment ended in");
             return out;
         }
-        let verdict = contract.judge(&schema, log.inputs(), &run);
         out.judged = Judged::from(&verdict);
         if out.judged.failed()
             && let (Ok(checkpoint), Ok(encoded)) =

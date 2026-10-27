@@ -3667,16 +3667,24 @@ fn the_channel_head_line_names_update_only_where_it_can_land_the_newer_index() {
     use std::time::{Duration, UNIX_EPOCH};
     let now: i64 = 1_790_000_000;
     let at = |ago: u64| UNIX_EPOCH + Duration::from_secs(now.unsigned_abs() - ago);
-    let line = |floor: u64, near, reached_index_at: Option<i64>, held: Option<Vec<u64>>| {
+    let line_refusing = |floor: u64,
+                         near,
+                         reached_index_at: Option<i64>,
+                         held: Option<Vec<u64>>,
+                         refused: &[u64]| {
         let (row, _) = index_head_line(
             &CachedProbe { floor, near },
             &LastPass {
                 reached_index_at,
                 held,
+                refused: refused.to_vec(),
             },
             now,
         );
         format!("doctor: {}\n", spelled(&row))
+    };
+    let line = |floor: u64, near, reached_index_at: Option<i64>, held: Option<Vec<u64>>| {
+        line_refusing(floor, near, reached_index_at, held, &[])
     };
     let published = Some((RangeAnswer::Published, at(120)));
     let not_newest = "doctor: warn — index 42 is not the newest";
@@ -3699,6 +3707,13 @@ fn the_channel_head_line_names_update_only_where_it_can_land_the_newer_index() {
             "{said}"
         );
     }
+    let said = line_refusing(42, None, Some(now - 60), Some(vec![43, 42]), &[43]);
+    assert!(
+        said.starts_with(not_newest)
+            && said.contains("index 43 was downloaded and refused as a successor")
+            && !said.contains("signatures did not verify"),
+        "{said}"
+    );
     assert!(!line(43, None, Some(now - 60), Some(vec![43, 42])).contains("not the newest"));
     let said = line(42, Some((RangeAnswer::Failed, at(60))), None, None);
     assert!(
@@ -3767,6 +3782,47 @@ fn doctor_reads_a_downloaded_newer_index_off_the_last_pass() {
     );
     let (_, out, _) = run(false);
     assert!(!out.contains("not the newest"), "{out}");
+    assert!(
+        !out.contains("index succession") && !out.contains("is refused against"),
+        "no record, no succession row:\n{out}"
+    );
+
+    let trusted = crate::succession::Sources {
+        index_build: 42,
+        roster_seq: 5,
+        ..crate::succession::Sources::default()
+    };
+    let refusal = crate::succession::Refusal {
+        label: "atpkg-index-43".into(),
+        index_build: 43,
+        machine_id: "m22".into(),
+        trusted_build: 42,
+        breaks: vec![crate::succession::Break::RepoSwitch {
+            channel: "stable".into(),
+            program: "codex".into(),
+            from_repo: "codex-alab".into(),
+            to_repo: "aterm".into(),
+            from: 2_026_102_501,
+            to: 2_026_102_501,
+        }],
+    };
+    crate::succession::trust(&l, Some(&trusted), &[refusal]).unwrap();
+    let (ok, out, _) = run(true);
+    assert!(
+        ok && out.contains("index 43 was downloaded and refused as a successor")
+            && !out.contains("signatures did not verify"),
+        "the held row names the refusal, not a bad signature:\n{out}"
+    );
+    assert!(
+        out.contains("index 43 (signed by machine m22) is refused against index 42")
+            && out.contains("[programs.codex] moves from repo \"codex-alab\" to \"aterm\""),
+        "the succession row says which rule it breaks:\n{out}"
+    );
+    let (_, out, _) = run(false);
+    assert!(
+        out.contains("is refused against index 42"),
+        "the succession row needs no index probe:\n{out}"
+    );
     let _ = std::fs::remove_dir_all(&l.prefix);
     let _ = std::fs::remove_dir_all(&home);
 }

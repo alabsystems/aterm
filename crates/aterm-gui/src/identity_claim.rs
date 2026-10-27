@@ -560,6 +560,28 @@ fn write_pid(file: &std::fs::File) -> std::io::Result<()> {
     f.write_all(format!("pid {}\n", std::process::id()).as_bytes())
 }
 
+/// `HandoffAddressOwner` environment actions, each waived where its Tier-1 (`tests`)
+/// binds it.
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HandoffAddressOwner",
+    action = "StrangerPublishes",
+    reason = "An unrelated instance's discovery entry; the Tier-1 binds plant one naming \
+              a live pid that is not this process."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "HandoffAddressOwner",
+    action = "Commit",
+    reason = "`seamless::commit_and_exit` `_exit`s this process: nothing it answers \
+              afterwards exists to project."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn handoff_address_owner_scope_waivers() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,25 +962,3 @@ mod tests {
         );
     }
 }
-
-/// `HandoffAddressOwner` environment actions, each waived where its Tier-1 (`tests`)
-/// binds it.
-#[cfg(any(test, debug_assertions))]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "HandoffAddressOwner",
-    action = "StrangerPublishes",
-    reason = "An unrelated instance's discovery entry; the Tier-1 binds plant one naming \
-              a live pid that is not this process."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "HandoffAddressOwner",
-    action = "Commit",
-    reason = "`seamless::commit_and_exit` `_exit`s this process: nothing it answers \
-              afterwards exists to project."
-)]
-#[allow(
-    dead_code,
-    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
-              not an expect: rustc does not lint a fn the declarative anchors rebuild"
-)]
-fn handoff_address_owner_scope_waivers() {}

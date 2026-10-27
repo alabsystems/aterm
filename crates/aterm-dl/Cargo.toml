@@ -18,5 +18,9 @@ description = "First-party dlopen tables for aterm: a system C library opened by
 # dlopen(3), dlsym(3) and dlerror(3) (aterm-libc, package `libc`).
 libc = { workspace = true }
 
+[dev-dependencies]
+# The shared native SDK declaration probe writes a bounded scratch C translation unit.
+aterm-tempfile = { workspace = true }
+
 [lints]
 workspace = true

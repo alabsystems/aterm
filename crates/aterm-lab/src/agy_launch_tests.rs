@@ -20,8 +20,10 @@ fn check_launch(test: &str) {
         println!("launch fixture completed");
         return;
     }
+    // `heard`: the door's socket shape is `/tmp/at.*/a.sock`, so not in `/tmp/.ubd`.
     let root = aterm_tempfile::Builder::new()
         .prefix("at.launch-")
+        .heard()
         .tempdir_in("/tmp")
         .unwrap();
     // Run `first_exec` on the two fixture scripts before starting the timed

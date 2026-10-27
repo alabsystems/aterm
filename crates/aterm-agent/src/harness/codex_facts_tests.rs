@@ -180,6 +180,43 @@ fn the_context_left_is_counted_as_codexs_footer_counts_it() {
     );
 }
 
+/// The plan's windows (codex 0.164's `token_count`): each of `primary` and `secondary` names
+/// its window by `window_minutes`, 300 the five-hour one and 10080 the week; a plan with only a
+/// weekly window names it `primary`; a count whose `rate_limits` is `null` keeps the last.
+#[test]
+fn the_plans_windows_are_read_by_their_minutes() {
+    let limits = |json: &str| {
+        row(
+            "event_msg",
+            &format!("{{\"type\":\"token_count\",\"info\":null,\"rate_limits\":{json}}}"),
+        )
+    };
+    let both = limits(
+        "{\"primary\":{\"used_percent\":6.6,\"window_minutes\":300,\"resets_at\":1},\
+         \"secondary\":{\"used_percent\":1.0,\"window_minutes\":10080,\"resets_at\":2}}",
+    );
+    let facts = facts_of(std::slice::from_ref(&both));
+    assert_eq!((facts.usage_5h_pct, facts.usage_7d_pct), (Some(7), Some(1)));
+    let weekly = limits(
+        "{\"limit_id\":\"codex\",\"primary\":{\"used_percent\":1.0,\"window_minutes\":10080,\
+         \"resets_at\":1793718245},\"secondary\":null}",
+    );
+    let facts = facts_of(&[both.clone(), weekly]);
+    assert_eq!((facts.usage_5h_pct, facts.usage_7d_pct), (None, Some(1)));
+    let facts = facts_of(&[both, tokens(135_200, 258_400)]);
+    assert_eq!(
+        (facts.usage_5h_pct, facts.usage_7d_pct),
+        (Some(7), Some(1)),
+        "a count with no limits keeps the last"
+    );
+    let odd = limits("{\"primary\":{\"used_percent\":140,\"window_minutes\":300}}");
+    assert_eq!(
+        facts_of(&[odd]).usage_5h_pct,
+        None,
+        "past 100 is no percent"
+    );
+}
+
 #[test]
 fn a_persons_prompts_are_kept_newest_first_and_codexs_context_is_none_of_them() {
     let facts = facts_of(&[

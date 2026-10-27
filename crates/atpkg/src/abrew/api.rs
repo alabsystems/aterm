@@ -258,17 +258,27 @@ impl Api {
                 let row = if casks {
                     cask_record(item, name)
                         .map(|c| DepRow {
+                            full_name: c.token.clone(),
                             name: c.token,
                             deps: shorts(&c.depends_formula),
                             build_deps: Vec::new(),
+                            test_deps: Vec::new(),
+                            recommended_deps: Vec::new(),
+                            optional_deps: Vec::new(),
+                            requirements: super::formula::cask_requirement_displays(item),
                         })
                         .ok()
                 } else {
                     formula_record(item, name, machine)
                         .map(|f| DepRow {
+                            full_name: f.full_name.clone(),
                             name: f.name,
                             deps: shorts(&f.dependencies),
                             build_deps: shorts(&f.build_dependencies),
+                            test_deps: shorts(&f.test_dependencies),
+                            recommended_deps: shorts(&f.recommended_dependencies),
+                            optional_deps: shorts(&f.optional_dependencies),
+                            requirements: Vec::new(),
                         })
                         .ok()
                 };
@@ -510,6 +520,56 @@ fn get_document(rel_url: &str) -> Result<Vec<u8>, fetch::GetError> {
     Ok(bytes)
 }
 
+impl Api {
+    /// `tap_migrations.json` of homebrew/core (`casks: false`) or
+    /// homebrew/cask: name → new tap (optionally `/new-name`).
+    /// Read quietly through the API cache from the tap's raw file
+    /// on GitHub; empty on any failure (a search footnote is never
+    /// worth an error of its own).
+    pub fn core_tap_migrations(&self, casks: bool) -> std::collections::BTreeMap<String, String> {
+        let (repo, cache_file) = if casks {
+            ("homebrew-cask", "cask-tap-migrations.json")
+        } else {
+            ("homebrew-core", "formula-tap-migrations.json")
+        };
+        let path = self.cache_path(cache_file);
+        let read_cache = |path: &std::path::Path| {
+            crate::metadata_io::read_bounded_regular(path, API_BYTES)
+                .ok()
+                .and_then(|bytes| parse_json(&bytes).ok())
+        };
+        let value = if Self::fresh(&path, Duration::from_secs(86_400)) {
+            read_cache(&path)
+        } else {
+            None
+        };
+        let value = value.or_else(|| {
+            let url = format!(
+                "https://raw.githubusercontent.com/Homebrew/{repo}/HEAD/tap_migrations.json"
+            );
+            match fetch::curl_get_with_status(&url, &[]) {
+                Ok(bytes) if bytes.len() <= API_BYTES => {
+                    let parsed = parse_json(&bytes).ok();
+                    if parsed.is_some() && self.writable {
+                        let _ = write_metadata(&path, &bytes);
+                    }
+                    parsed
+                }
+                _ => read_cache(&path),
+            }
+        });
+        let mut out = std::collections::BTreeMap::new();
+        if let Some(obj) = value.as_ref().and_then(Value::as_object) {
+            for (name, target) in obj {
+                if let Some(target) = target.as_str() {
+                    out.insert(name.clone(), target.to_string());
+                }
+            }
+        }
+        out
+    }
+}
+
 /// The full formula (`formula.json`) or cask (`cask.json`) index fetched in memory.
 pub fn fetch_index(casks: bool) -> Result<Vec<u8>, String> {
     get_document(if casks { "cask.json" } else { "formula.json" })
@@ -584,10 +644,128 @@ pub struct SearchRow {
 }
 
 /// One [`Api::deps_index`] record.
+#[derive(Debug, Clone, Default)]
 pub struct DepRow {
     pub name: String,
+    /// Brew's `full_name` (tap-qualified except for core taps).
+    pub full_name: String,
     pub deps: Vec<String>,
     pub build_deps: Vec<String>,
+    pub test_deps: Vec<String>,
+    pub recommended_deps: Vec<String>,
+    pub optional_deps: Vec<String>,
+    /// `Requirement#display_s` strings (without the leading colon
+    /// `deps` prints), for `--include-requirements`. Empty for
+    /// API-sourced formulae, matching brew's struct generation.
+    pub requirements: Vec<String>,
+}
+
+impl DepRow {
+    /// Whether the edge to `target` passes brew's `uses` tag
+    /// filter (`select_includes` over merged-dependency
+    /// predicates; the JSON lists are those predicates).
+    #[must_use]
+    pub fn edge_passes(&self, target: &str, filter: &DepFilter) -> bool {
+        self.edge_tags(target)
+            .is_some_and(|tags| tags.passes(filter))
+    }
+
+    #[must_use]
+    pub fn edge_tags(&self, target: &str) -> Option<DepTags> {
+        let has = |list: &[String]| list.iter().any(|d| d == target);
+        let tags = DepTags {
+            required: has(&self.deps),
+            build: has(&self.build_deps),
+            test: has(&self.test_deps),
+            recommended: has(&self.recommended_deps),
+            optional: has(&self.optional_deps),
+        };
+        (tags.required || tags.build || tags.test || tags.recommended || tags.optional)
+            .then_some(tags)
+    }
+
+    /// Every declared dependency name with its merged tags.
+    pub fn edges(&self) -> Vec<(String, DepTags)> {
+        let mut names: Vec<&String> = Vec::new();
+        for list in [
+            &self.deps,
+            &self.build_deps,
+            &self.test_deps,
+            &self.recommended_deps,
+            &self.optional_deps,
+        ] {
+            for name in list {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+            .into_iter()
+            .filter_map(|name| self.edge_tags(name).map(|tags| (name.clone(), tags)))
+            .collect()
+    }
+}
+
+/// Merged brew dependency tags for one edge, as projected by the
+/// API lists (`dependencies` is exactly `required?`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DepTags {
+    pub required: bool,
+    pub build: bool,
+    pub test: bool,
+    pub recommended: bool,
+    pub optional: bool,
+}
+
+impl DepTags {
+    /// Brew's `Dependency.merge_tags` over duplicate occurrences:
+    /// necessity is required if any occurrence is neither
+    /// recommended nor optional, else recommended if any is, else
+    /// optional; build only if every occurrence is build; test if
+    /// any occurrence is test.
+    #[must_use]
+    pub fn merge(occurrences: &[DepTags]) -> DepTags {
+        if occurrences.is_empty() {
+            return DepTags::default();
+        }
+        let any_plain = occurrences.iter().any(|t| !t.recommended && !t.optional);
+        let any_reco = occurrences.iter().any(|t| t.recommended);
+        let build = occurrences.iter().all(|t| t.build);
+        let test = occurrences.iter().any(|t| t.test);
+        let recommended = !any_plain && any_reco;
+        let optional = !any_plain && !any_reco;
+        DepTags {
+            required: !build && !test && !recommended && !optional,
+            build,
+            test,
+            recommended,
+            optional,
+        }
+    }
+
+    #[must_use]
+    pub fn passes(&self, filter: &DepFilter) -> bool {
+        if filter.skip_recommended && self.recommended {
+            return false;
+        }
+        self.required
+            || self.recommended
+            || (filter.include_build && self.build)
+            || (filter.include_test && self.test)
+            || (filter.include_optional && self.optional)
+    }
+}
+
+/// The `uses` include/ignore switches (`--include-implicit` is
+/// accepted but the API graph carries no implicit edges, exactly
+/// as oracle API-mode brew observes none).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DepFilter {
+    pub include_build: bool,
+    pub include_test: bool,
+    pub include_optional: bool,
+    pub skip_recommended: bool,
 }
 
 pub struct OptionsRow {
@@ -764,6 +942,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(api.cask("caffiene").unwrap().token, "caffeine");
+    }
+
+    #[test]
+    fn dep_tag_filter_matches_brew_predicates() {
+        // abook→gettext is in both runtime and build lists; brew's
+        // JSON `dependencies` list is exactly `required?`, so the
+        // edge passes unconditionally. abseil→cmake is build+test:
+        // needs either include. Oracle-verified shapes.
+        let abook = DepRow {
+            name: "abook".to_string(),
+            deps: vec!["readline".to_string(), "gettext".to_string()],
+            build_deps: vec!["autoconf".to_string(), "gettext".to_string()],
+            ..DepRow::default()
+        };
+        let plain = DepFilter::default();
+        assert!(abook.edge_passes("gettext", &plain));
+        let abseil = DepRow {
+            name: "abseil".to_string(),
+            build_deps: vec!["cmake".to_string()],
+            test_deps: vec!["cmake".to_string()],
+            ..DepRow::default()
+        };
+        assert!(!abseil.edge_passes("cmake", &plain));
+        assert!(abseil.edge_passes(
+            "cmake",
+            &DepFilter {
+                include_test: true,
+                ..DepFilter::default()
+            }
+        ));
+        assert!(abseil.edge_passes(
+            "cmake",
+            &DepFilter {
+                include_build: true,
+                ..DepFilter::default()
+            }
+        ));
+        let reco = DepRow {
+            name: "x".to_string(),
+            recommended_deps: vec!["y".to_string()],
+            ..DepRow::default()
+        };
+        assert!(reco.edge_passes("y", &plain));
+        assert!(!reco.edge_passes(
+            "y",
+            &DepFilter {
+                skip_recommended: true,
+                ..DepFilter::default()
+            }
+        ));
+        assert!(!abook.edge_passes("nope", &plain));
     }
 
     #[test]

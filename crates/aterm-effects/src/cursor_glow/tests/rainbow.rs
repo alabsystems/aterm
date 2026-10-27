@@ -1099,6 +1099,56 @@ fn a_dim_theme_s_letters_read_over_the_pet_through_a_page_veil() {
     );
 }
 
+/// THE PET'S VEIL READS THE LETTERS UNDER THE BODY WHEREVER IT LIES (looks8 round 2): the caret
+/// on the top row, a dim theme's letters twelve rows below it under the pet's body, the frame
+/// after the body was first noted lays the page veil over them: the veil reads the rows the body
+/// lay on, not only the trail's rows about the caret (`[vim] NORMAL` on Solarized Dark printed
+/// under the cat five rows below a caret that moved up went bare, the whole cat drawn over it).
+/// Negative control: reading only the caret's rows, it lays none.
+#[test]
+fn the_pet_s_veil_reads_the_letters_far_from_the_caret() {
+    use aterm_core::terminal::RenderCell;
+    let g = Geom {
+        rows: 16,
+        win_h: 256,
+        ..geom()
+    };
+    let caret = (0u16, 30u16);
+    let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+    for (c, cell) in cells[12].iter_mut().enumerate() {
+        cell.ch = if c < 20 && c % 5 != 4 { 'o' } else { ' ' };
+        cell.fg = [0x83, 0x94, 0x96];
+        cell.bg = [0x00, 0x2b, 0x36];
+    }
+    // The body over columns 2..12 of row 12 and the row above.
+    let body = (16, 96, 11 * 16, 13 * 16);
+    let veil = |caret_rows: bool| {
+        let mut glow = CursorGlow::default();
+        glow.set_pet_veil_caret_rows(caret_rows);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        for k in 0..2u64 {
+            glow.observe_frame_text(Some(caret), &cells, t0 + Duration::from_millis(16 * k));
+            glow.note_veil_frame(Some(caret), g);
+            glow.note_pet_body(Some(body));
+            out.clear();
+            let mut ramps = aterm_render::GlowRamps::default();
+            glow.veil_letters_on_pet((&mut out, &mut ramps), Some(caret), g, None);
+        }
+        out
+    };
+    let on = veil(false);
+    assert!(
+        on.iter()
+            .any(|q| i32::from(q.y) < 13 * 16 && i32::from(q.y + q.h) > 12 * 16),
+        "the veil lies over the letters under the body, twelve rows below the caret: {on:?}"
+    );
+    assert!(
+        veil(true).is_empty(),
+        "negative control: reading only the caret's rows, the veil lays nothing"
+    );
+}
+
 /// THE PET'S VEIL RISES OFF ITS ROW (looks7 round 2): cut at its lettered
 /// row's top and foot, the page veil sliced the coat across at the row's
 /// edge (the burst on Solarized Dark, the body gone under `flies` below a
@@ -1522,6 +1572,243 @@ fn a_word_icon_new_to_the_frame_wears_no_trail_light() {
             on_icon(dark, true),
             0,
             "a light lies on the word icon above its foot (dark {dark})"
+        );
+    }
+}
+
+/// A CLEARED SCREEN TAKES THE TRAIL'S LIGHTS WITH ITS LETTERS (looks8 K7):
+/// a line typed, Enter, and 300 ms on the screen is cleared (`clear`, Ctrl-L)
+/// and the caret leaps to its top. The host's content-scroll snapshot counts
+/// the clear, and from the frame it lands no light of the old screen (a
+/// ribbon's bed and Enter tracer, a sparkle's dust, fire's heat) lies below
+/// the top rows the caret's own light reaches. Negative control: the same
+/// frames without the clear keep them floating on the empty screen.
+#[test]
+fn a_primary_screen_clear_drops_the_lights_the_old_screen_carried() {
+    use aterm_core::terminal::ContentScrollState;
+    let g = geom();
+    let below_top = |glow: &CursorGlow, out: &[GlowQuad]| {
+        let floor = 2 * g.ch as i32 + i32::from(g.origin_y);
+        let lit = |c: u32| c & 0x00FF_FFFF != 0;
+        out.iter()
+            .chain(glow.under_quads())
+            .filter(|q| q.w > 0 && q.h > 0 && (lit(q.color) || lit(q.color2)))
+            .filter(|q| i32::from(q.y) + i32::from(q.h) > floor)
+            .count()
+            + glow
+                .halos()
+                .iter()
+                .filter(|h| h.w > 0 && h.h > 0 && lit(h.color))
+                .filter(|h| i32::from(h.y) + i32::from(h.h) > floor)
+                .count()
+    };
+    for style in [GlowStyle::RainbowKitty, GlowStyle::Sparkle, GlowStyle::Fire] {
+        let c = cfg(style, true);
+        let run = |cleared: bool| {
+            let mut pipe = crate::pipeline::EffectsPipeline::new();
+            let base = ContentScrollState::default();
+            let t0 = Instant::now();
+            let _ = pipe.sync_scroll(base, t0);
+            let glow = &mut pipe.cursor_mut().glow;
+            let mut out = Vec::new();
+            glow.tick(Some((3, 2)), t0, &c, g, &mut out);
+            let t = type_echoed(glow, 3, 2, "echo quick fox", t0 + ms(16), &c, g);
+            let enter = t + ms(30);
+            glow.note_synthetic_move(enter);
+            glow.tick(Some((4, 2)), enter, &c, g, &mut out);
+            for k in 1..=18u64 {
+                out.clear();
+                glow.tick(Some((4, 2)), enter + ms(16 * k), &c, g, &mut out);
+            }
+            let clear = enter + ms(300);
+            let snapshot = ContentScrollState {
+                screen_clears: u64::from(cleared),
+                ..base
+            };
+            let _ = pipe.sync_scroll(snapshot, clear);
+            let glow = &mut pipe.cursor_mut().glow;
+            let mut worst = 0;
+            for k in 0..=4u64 {
+                out.clear();
+                glow.tick(Some((0, 2)), clear + ms(16 * k), &c, g, &mut out);
+                worst = worst.max(below_top(glow, &out));
+            }
+            worst
+        };
+        assert_eq!(
+            run(true),
+            0,
+            "{style:?}: light of the cleared screen floats below its top"
+        );
+        assert!(
+            run(false) > 0,
+            "control: {style:?} without the clear keeps no light below the top"
+        );
+    }
+}
+
+/// Classic keeps its ruled face through a clear (looks8 K7): its tracer runs
+/// to the caret, and the frames after the clear are the frames without it.
+#[test]
+fn a_primary_screen_clear_leaves_classic_as_it_was() {
+    use aterm_core::terminal::ContentScrollState;
+    let g = geom();
+    let c = cfg(GlowStyle::Classic, true);
+    let run = |cleared: bool| {
+        let mut pipe = crate::pipeline::EffectsPipeline::new();
+        let base = ContentScrollState::default();
+        let t0 = Instant::now();
+        let _ = pipe.sync_scroll(base, t0);
+        let glow = &mut pipe.cursor_mut().glow;
+        let mut out = Vec::new();
+        glow.tick(Some((3, 2)), t0, &c, g, &mut out);
+        let t = type_echoed(glow, 3, 2, "echo quick fox", t0 + ms(16), &c, g);
+        glow.tick(Some((4, 2)), t + ms(30), &c, g, &mut out);
+        let clear = t + ms(330);
+        let snapshot = ContentScrollState {
+            screen_clears: u64::from(cleared),
+            ..base
+        };
+        let _ = pipe.sync_scroll(snapshot, clear);
+        let glow = &mut pipe.cursor_mut().glow;
+        let mut frames = Vec::new();
+        for k in 0..=4u64 {
+            out.clear();
+            glow.tick(Some((0, 2)), clear + ms(16 * k), &c, g, &mut out);
+            frames.push((out.clone(), glow.under_quads().to_vec()));
+        }
+        frames
+    };
+    let (kept, plain) = (run(true), run(false));
+    assert!(
+        plain.iter().any(|(o, u)| !o.is_empty() || !u.is_empty()),
+        "fixture: Classic draws after the leap"
+    );
+    assert_eq!(kept, plain, "a clear changed Classic's frames");
+}
+
+/// A COMPOSER'S SKY UNDER ITS RULE (Prism Glass P0.11): Claude Code's
+/// composer stands one row under a `─` rule. The sky births its stars in
+/// that row, under the rule's stroke (stardust's
+/// `a_light_rule_over_the_typing_row_keeps_the_sky_alive`), but the rule's
+/// cells are lettered cells of a row the caret is not on, so the frame's
+/// keep-out (`CursorGlow::keep_out_boxes`) holds each of them off the glass:
+/// on either page no sky star is painted there, nor anywhere else, while the
+/// sky keeps them. Controls: with the rule left out of the frame's text (the
+/// probe still names it) the same stars are painted under it, and under a
+/// blank row the same keys paint stars in it.
+#[test]
+fn no_composer_sky_star_is_painted_under_a_rule_on_the_row_above() {
+    use aterm_core::terminal::RenderCell;
+    let g = Geom {
+        cw: 15,
+        ch: 28,
+        rows: 8,
+        cols: 80,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 1200,
+        win_h: 224,
+        head: 0,
+    };
+    let (rule_row, row) = (4u16, 5u16);
+    let text = "the quick brown fox jumps over the lazy dog, typed into the box";
+    // The stars painted in the rule's row from its stroke's top down, the
+    // stars painted anywhere, and the most the sky held in a frame; `kept`
+    // hands the rule to the frame's text, which the keep-out is read from.
+    let run = |dark: bool, ruled: bool, kept: bool| -> (usize, usize, u32) {
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
+        if !dark {
+            c.dark_theme = false;
+            c.theme_fg = 0x002B_2D33;
+            c.theme_bg = 0x00F6_F7F9;
+        }
+        let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+        let blank = RenderCell {
+            fg: rgb(c.theme_fg),
+            bg: rgb(c.theme_bg),
+            ..RenderCell::default()
+        };
+        let mut cells = vec![vec![blank; g.cols]; g.rows];
+        if ruled {
+            for cell in &mut cells[usize::from(rule_row)] {
+                cell.ch = '─';
+            }
+        }
+        cells[usize::from(row)][0].ch = '>';
+        let chars = |cells: &[Vec<RenderCell>], r: u16| -> Vec<char> {
+            cells[usize::from(r)].iter().map(|cell| cell.ch).collect()
+        };
+        let y0 = i32::from(g.origin_y) + i32::from(rule_row) * g.ch as i32;
+        let stroke_top = y0 + (rk::stardust::RULE_INK_TOP_CH * g.ch as f32).floor() as i32;
+        let y1 = y0 + g.ch as i32;
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        let (mut under_rule, mut painted, mut sky) = (0usize, 0usize, 0u32);
+        for (k, ch) in text.chars().enumerate() {
+            let col = 2 + k as u16;
+            t += ms(100);
+            let class = if ch == ' ' {
+                rk::TypedClass::Space
+            } else {
+                rk::TypedClass::Glyph
+            };
+            glow.note_typed_glyph(t, 1, false, class);
+            cells[usize::from(row)][usize::from(col)].ch = ch;
+            let caret = (row, col + 1);
+            for dt in [3u64, 36, 69] {
+                let now = t + ms(dt);
+                let mut framed = cells.clone();
+                if !kept {
+                    framed[usize::from(rule_row)].fill(blank);
+                }
+                glow.observe_frame_text(Some(caret), &framed, now);
+                glow.observe_row(row, caret.1, &chars(&cells, row), now);
+                glow.observe_neighbor_rows(
+                    Some(&chars(&cells, rule_row)),
+                    Some(&chars(&cells, row + 1)),
+                );
+                glow.tick(Some(caret), now, &c, g, &mut out);
+                sky = sky.max(glow.v2_status().map_or(0, |s| s.stars));
+                let marks = glow.v2.sky_marks();
+                painted += marks.len();
+                under_rule += marks
+                    .iter()
+                    .filter(|m| m.rect.2 < y1 && m.rect.3 > stroke_top)
+                    .count();
+            }
+        }
+        (under_rule, painted, sky)
+    };
+    for dark in [true, false] {
+        let page = if dark {
+            "dark"
+        } else {
+            "light (main's paper arm)"
+        };
+        let (under_rule, painted, sky) = run(dark, true, true);
+        assert!(
+            sky > 0,
+            "fixture ({page}): the sky over the composer holds no star"
+        );
+        assert_eq!(
+            under_rule, 0,
+            "{page}: {under_rule} sky stars painted under the composer's rule"
+        );
+        assert_eq!(
+            painted, 0,
+            "{page}: {painted} sky stars painted while the composer stands under a rule"
+        );
+        let (unkept, ..) = run(dark, true, false);
+        assert!(
+            unkept > 0,
+            "control ({page}): with the rule out of the frame's text no star is painted under it"
+        );
+        let (blank, ..) = run(dark, false, true);
+        assert!(
+            blank > 0,
+            "control ({page}): under a blank row no sky star is painted in it"
         );
     }
 }

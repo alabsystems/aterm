@@ -1027,6 +1027,7 @@ impl App {
                     false
                 }
             }
+            Intent::RestartService { service } => self.restart_service(wid, &service),
             Intent::ShowTab { .. } => false,
             Intent::ShowSession {
                 window, session, ..
@@ -1133,7 +1134,13 @@ impl App {
             _ => false,
         };
         let performed = self.perform_intent(wid, id, intent.clone());
-        let feedback = act_feedback(&intent, performed, applies);
+        let mut feedback = act_feedback(&intent, performed, applies);
+        if !performed
+            && matches!(intent, Intent::RestartService { .. })
+            && let Some(why) = crate::services_watch::take_refusal()
+        {
+            feedback = why;
+        }
         if performed {
             MessageActOutcome::Performed { feedback }
         } else {

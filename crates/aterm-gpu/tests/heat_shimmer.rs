@@ -4,10 +4,6 @@
 //! Heat shimmer post-pass tests.
 
 use aterm_core::terminal::Terminal;
-#[cfg(wgpu_arm)]
-use aterm_gpu::video_tap::{CaptureOpts, DEFAULT_BUDGET};
-#[cfg(wgpu_arm)]
-use aterm_render::RenderInput;
 use aterm_render::{FirePatch, GlowQuad, Theme, premul_rgb};
 
 use crate::common;
@@ -194,109 +190,6 @@ fn shimmer_bounded_displacement_and_scoped_to_region() {
     assert!(
         max_diff >= 8,
         "the shimmer should be a visible refraction, not FP dust (max diff {max_diff})"
-    );
-}
-
-#[cfg(wgpu_arm)]
-fn opts() -> CaptureOpts {
-    CaptureOpts {
-        half_res: false,
-        budget_bytes: DEFAULT_BUDGET,
-        fps_cap: None,
-        requested_ms: 0,
-    }
-}
-
-#[cfg(wgpu_arm)]
-fn tap_swapchain(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, h: u32) -> Vec<u8> {
-    let mut win = aterm_gpu::WindowGpu::new();
-    gpu.video_begin_standin_for_test(&mut win, w, h, opts())
-        .expect("standin tap");
-    gpu.present_swapchain_standin_for_test(&mut win, input, false, None, None, (w, h));
-    gpu.video_after_present(&mut win, 1);
-    let take = gpu.video_finish(&mut win).expect("swapchain take").settle();
-    assert_eq!(take.frames.len(), 1);
-    take.frames[0].rgba.clone()
-}
-
-#[cfg(wgpu_arm)]
-fn tap_virtual(gpu: &mut aterm_gpu::GpuRenderer, input: &RenderInput, w: u32, h: u32) -> Vec<u8> {
-    let mut win = aterm_gpu::WindowGpu::new();
-    gpu.virtual_begin(&mut win, w, h, opts())
-        .expect("virtual tap");
-    assert!(gpu.present_virtual(&mut win, input, false, None, None));
-    gpu.video_after_present(&mut win, 1);
-    let take = gpu.video_finish(&mut win).expect("virtual take").settle();
-    assert_eq!(take.frames.len(), 1);
-    take.frames[0].rgba.clone()
-}
-
-#[test]
-#[cfg(wgpu_arm)]
-fn shimmer_reaches_all_three_introspection_paths() {
-    let mut gpu = gpu();
-    crate::common::disarm_for_oracle(&mut gpu);
-    gpu.set_bloom(true); // the full parity-class stack, as shipped
-    gpu.set_sdr_glow_boost(0.0); // keep the crown's own wall-clock ease out
-    gpu.set_shimmer_phase_for_test(Some(0.31));
-    let (rows, cols) = (10usize, 30usize);
-    let (cw, ch) = gpu.cell_size();
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"$ shimmer across every tap\r\ntext above the fire line");
-    let mut input = term.cell_frame(rows, cols);
-    input.cursor_glow_add = fire_comet(6, 4..14, cw, ch);
-    input.fire_patch = fire_marker();
-    let (rx0, ry0, rx1, ry1) = gpu
-        .shimmer_region_for_test(&input)
-        .expect("hot region derives");
-    let (fw, fh) = gpu.frame_size(rows, cols);
-    let (fw, fh) = (fw as u32, fh as u32);
-
-    gpu.set_shimmer(true);
-    let swap_on = tap_swapchain(&mut gpu, &input, fw, fh);
-    let virt_on = tap_virtual(&mut gpu, &input, fw, fh);
-    assert!(
-        swap_on == virt_on,
-        "swapchain and virtual presents must harvest byte-identical shimmer frames"
-    );
-
-    gpu.set_shimmer(false);
-    let swap_off = tap_swapchain(&mut gpu, &input, fw, fh);
-    assert!(
-        swap_on != swap_off,
-        "the video tap must capture the shimmer (non-vacuous)"
-    );
-    let mut diffs_in = 0usize;
-    for y in 0..fh as usize {
-        for x in 0..fw as usize {
-            let i = (y * fw as usize + x) * 4;
-            let same = swap_on[i..i + 4] == swap_off[i..i + 4];
-            let in_region =
-                (x as u32) >= rx0 && (x as u32) < rx1 && (y as u32) >= ry0 && (y as u32) < ry1;
-            if in_region {
-                diffs_in += usize::from(!same);
-            } else {
-                assert!(
-                    same,
-                    "tapped pixel ({x},{y}) outside the region rect changed — the \
-                     shimmer leaked past its bound"
-                );
-            }
-        }
-    }
-    assert!(
-        diffs_in > 0,
-        "the tapped shimmer must land inside the region"
-    );
-
-    let mut win = aterm_gpu::WindowGpu::new();
-    gpu.set_shimmer(true);
-    let rb_on = gpu.render_input(&mut win, &input, None).pixels;
-    gpu.set_shimmer(false);
-    let rb_off = gpu.render_input(&mut win, &input, None).pixels;
-    assert!(
-        rb_on != rb_off,
-        "the offscreen readback must carry the shimmer (image introspection)"
     );
 }
 

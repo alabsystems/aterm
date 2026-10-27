@@ -353,14 +353,15 @@ with it, the line goes without it and a `tap-dropped` ledger row says so. The wi
 footer shows the tab's week from the tap, from Claude Code's own `/usage` cache, or from the
 accounts store (another tapped session on the same login), whichever is newer:
 `weekly <p>% left` up to 15 minutes old, `weekly <p>% left \u{b7} 40m ago` up to an hour, then
-nothing. Without a figure it says why, and never asks you to act:
+nothing. Without a figure the footer shows no week; the account's hover title and the
+Accounts menu say why, and never ask you to act:
 `weekly ? \u{b7} until relaunch` (a relaunch aterm offers now would add the tap),
 `weekly ? \u{b7} untapped` (no relaunch line can carry it, or none is offered, or the line
 would have no room for it),
 `weekly ? \u{b7} tap off` (the tap is off),
 `weekly ? \u{b7} no reply yet` (tapped, and no reply since it started brought the week),
 `weekly ? \u{b7} no reply 1h` (tapped, and its week is over an hour old),
-`weekly unavailable` (no account profile is trusted for this process, so neither figure is:
+no words at all (no account profile is trusted for this process, so neither figure is:
 the profile could not be read, `accounts.toml` or the store's `logins.json` could not be, or
 the roster has no row for this login, or one with no `email` or another one; only the
 default login, where the roster lists at most one account, needs no `email`).
@@ -424,11 +425,11 @@ VERBS:
     (the first `add` also lists the default login as `main`). Labels match
     `[a-z0-9][a-z0-9._-]{0,63}` (not `help`). A row stays `not-enrolled` until signed in.
     Where a fleet file on this machine writes the roster (`fleet-accounts.toml` beside it,
-    and its copy in `~/.secrets` where that lists this machine alone), the row is listed
-    there too, for this machine, so the next sync keeps it (it then needs `--email`); where
-    `[fleet] accounts_source` or the vault's files write it, `add` writes nothing and names
-    that source. The report's `list:` line (`--json`: `list.origin`) says which it is:
-    `discovered` for a list found on this Mac.
+    and the copy in `~/.secrets` that aterm keeps of it or that lists this machine alone),
+    the row is listed there too, for this machine, so the next sync keeps it (it then needs
+    `--email`); where `[fleet] accounts_source` or another file in `~/.secrets` writes it,
+    `add` writes nothing and names that source. The report's `list:` line (`--json`:
+    `list.origin`) says which it is: `discovered` for a list found on this Mac.
     New labels must have no retained local account state. If the implicit `main`
     conflicts, use `adopt-default <unused-label>` to name the default login first.
   - `accounts adopt-default <label> --email <e> [--identity-email <e>] [--browser <b>]`
@@ -513,16 +514,17 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     removes no row the roster has. The fleet is the source named, else
     `~/.secrets/ai-accounts-<cli>.toml` (the rows of `fleet-accounts.toml`, with `region` or
     `flow`), else the CLI's column of `~/.secrets/ai-accounts.csv` (`Open AI` for codex,
-    `xai` or `grok`, `kimi`; a cell of `1`, or a vendor word: `global`/`mainland-cn` for kimi,
-    whose bare `1` is held, `browser`/`device` for codex and grok), its rows labelled
+    `xai`, `x` or `grok`, `kimi`; a cell of `1`, or a vendor word: `global`/`mainland-cn`
+    for kimi, whose bare `1` is held, `browser`/`device` for codex and grok), its rows labelled
     `<cli>-<machine label>`. A note naming a vendor (`kimi banned`) drops that vendor's
     membership alone among these pools; Claude Code's own `accounts sync` drops the row on any
     disqualifying note, a vendor's included, so `kimi banned` removes that account's Claude
     Code row on every machine that syncs from the sheet too. It writes the roster and the
     CLI's store, never `~/.secrets`. With no
-    source named it reads nothing unless the roster exists: a vault file alone opts no
-    machine in, and `aterm init`, `aterm secrets` and a window sync each CLI whose roster this
-    machine keeps. A new label with retained local login or account state is refused.
+    source named it reads nothing unless the roster exists: for these pools a vault file
+    alone opts no machine in (Claude Code's own pool differs: FLEET ACCOUNTS below), and
+    `aterm init`, `aterm secrets` and a window sync each CLI whose roster this machine
+    keeps. A new label with retained local login or account state is refused.
     Additions also yield to an ongoing sign-in; unchanged rosters can still sync.
   - `accounts renew <label>… [--due] --cli <id>` runs the CLI's own sign-in in a fresh
     staging home (Codex's native PKCE sign-in, or its `login --device-auth`; Grok's `login
@@ -560,9 +562,21 @@ FLEET ACCOUNTS (fetched where a source is named, signed in wherever a roster sta
   - Opt in with `[fleet] accounts_source = \"<source>\"` in aterm.toml, by running
     `accounts sync <source>` once (its `fleet-accounts.toml` then says `opt_in = \"named\"`),
     or by keeping `fleet-accounts.toml`, `ai-accounts.csv`, `ai-mailbox.toml` or
-    `mailbox.toml` in `~/.secrets/`, which a window syncs from. A `fleet-accounts.toml`
-    without `opt_in = \"named\"` (or `\"discovered\"`) opts nothing in. To opt out, remove
-    the key, delete `fleet-accounts.toml`, and move those `~/.secrets/` files away.
+    `mailbox.toml` in `~/.secrets/`, which a window syncs from (in Claude Code's pool alone;
+    the other CLIs' pools above take no machine in by a file there). A
+    `~/.secrets/fleet-accounts.toml` outranks `ai-accounts.csv` there, except a copy aterm
+    wrote there (its first line says so) that lists the accounts of the `fleet-accounts.toml`
+    beside the roster and that the vault did not deliver. Where the sheet gives this machine
+    rows, the sheet outranks that copy and the sync that reads it removes the copy, so each
+    edit of the sheet reaches the roster; where it gives none, the copy stays this Mac's
+    list. aterm copies only a list it found on this Mac into `~/.secrets`. A window's sync
+    that failed is tried again once what it reads changes (the fleet, sheet or mailbox file
+    here, the roster, aterm.toml, the default login), else after 15 minutes (at once where
+    the accounts lock was held), and a failure is logged once until its reason changes. A
+    `fleet-accounts.toml` beside the roster without `opt_in = \"named\"` (or
+    `\"discovered\"`) opts nothing in. To opt out, remove the key, delete
+    `fleet-accounts.toml`, and move those `~/.secrets/` files away; a file the vault
+    delivered comes back, so take it out of the vault instead.
   - Where no source was found, a sync keeps the accounts this machine's own logins,
     profiles and transcripts show (`opt_in = \"discovered\"`; a `named` fleet of this
     machine's rows alone is taken as one), and a window adds each one it finds later (it
@@ -607,7 +621,18 @@ MODES:
     (turn over; no child shell, background task, subagent or workflow; no box; empty draft;
     nobody at the tab; the ladder's settle), sends SIGTERM, types the relaunch line with
     `--resume <session>`, and resumes without typing a prompt (`done:resumed`;
-    `wait:notice-shown` before the move).
+    `wait:notice-shown` before the move). That line waits on the quiet the SIGTERM
+    waited on (keys from before it never hold it; keys typed after it hold it as long as
+    they would have held the SIGTERM), on unread input, and on a hold on the tab. A shell
+    moved to another directory since the line was planned gets the line with a `cd` back
+    to the conversation's directory; one that cannot carry it (a fish shell's, or one too
+    long with it) waits for the shell to come back (`wait:shell-moved`).
+    If someone else resumes the conversation in the tab first, the round closes as
+    theirs (`done:resumed-by-another`; `failed:resumed-by-another` when they resumed an
+    older build) and nothing is typed. Two things can still be typed: a tasked session
+    whose resumed build says something it ran did not come back gets one line asking it
+    to restore what it relies on (`continued:restore`), and a job the supervisor is
+    continuing gets its next continuation in the resumed session.
   - Cooperative mode (`[harness] upgrade_ask = true`): types a readiness notice asking the
     agent to finish background work and confirm. It repeats every 30m, up to 4 notices,
     then rests 2h (then 4h, 8h, and 24h from the fourth unanswered round in a row) and
@@ -7225,7 +7250,8 @@ fn fleet_rows_for_write(
         FleetOrigin::Local { files, .. } => return list_in_local_fleet(env, files, asked),
         FleetOrigin::Key(_) => "list the account there",
         FleetOrigin::Vault(_) => {
-            "list the account in the vault's copy (on a Mac that edits the vault)"
+            "list the account where that file comes from (the vault's entry, on a Mac that \
+             edits the vault)"
         }
     };
     Err(format!(
@@ -8975,6 +9001,14 @@ fn signin_policy_matches(
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
+        machine = "AccountSignInPublication",
+        action = "Publish",
+        project = "aterm_agent::harness::cli::tests::identity::publication_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "AccountIdentity",
         action = "Exact",
         project = "aterm_agent::harness::cli::tests::identity::identity_transition"
@@ -9038,11 +9072,12 @@ fn bind_signed_in(
     let say = |err: &mut dyn Write, what: &str| {
         let _ = writeln!(err, "aterm harness accounts {verb}: {label}: {what}");
     };
-    if !c
-        .stores
-        .iter()
-        .any(|name| plan.staging.join(name).is_file())
-    {
+    let has_login = || {
+        c.stores
+            .iter()
+            .any(|name| plan.staging.join(name).is_file())
+    };
+    if !has_login() {
         drop_staging(&plan.staging, err);
         say(
             err,
@@ -9174,9 +9209,15 @@ fn bind_signed_in(
             } else if logins.shared.required(row)?.is_some() {
                 return Err("this account requires a supported shared renewal adapter".into());
             }
+            // The provider probe and writer wait can outlive the initial file check.
+            // Refuse before creating evidence that recovery could later adopt.
+            if !has_login() {
+                return Err("the staging login disappeared before publication".into());
+            }
             if !email.is_empty() {
                 accounts::write_renewal_checkpoint_for(
                     cli,
+                    row.vendor.region,
                     label,
                     email,
                     &plan.staging_text,

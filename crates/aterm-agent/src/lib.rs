@@ -33,7 +33,9 @@ mod fleet_member;
 /// `aterm ctl survey --fleet | --host`: the fleet's peers; `aterm ctl --host <h> …`: another Mac
 /// driven over it.
 #[cfg(unix)]
-pub use fleet_member::{drive_fleet, survey_fleet};
+pub use fleet_member::{
+    FleetCheck, FleetSync, check_from_cache, drive_fleet, survey_fleet, sync_from_cache,
+};
 /// The harness core.
 pub mod harness;
 /// The launcher's half of `aterm --headless --ready-fd <n>`.
@@ -465,8 +467,8 @@ MENTAL MODEL
     for it, `aterm ctl @<sid> result` reads its report; `turn`, `text`, `image` and
     `await agent idle,prompt,question,wall` drive and watch a Claude Code, agy or
     Muse Code session; for a codex (whose `agent=` stays `unknown`),
-    `await log kind=program since=<log_seq> ep=<log_ep>`, both read from `status`
-    before typing to it, waits on its own report.
+    `await log kind=program since=<log_seq> ep=<log_ep> base=<log_base>`, all three read
+    from `status` before typing to it, waits on its own report.
     `aterm ctl @sid meta set questions ask|recommended|long-term|short-term` sets how
     the window answers that session's questions (`ask` leaves them to a person or
     `aterm drive answer`); `meta unset questions` hands them back to `[harness]`

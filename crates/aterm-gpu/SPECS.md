@@ -56,6 +56,22 @@
 > floors in step 5 is refused). Two compile_fail doctests (E0594, E0616) were added to
 > `compute-job-typestate`. §2 then held 357 map rows; the kind table and gap histogram are unchanged.
 
+> Status 2026-10-26 (GW.6, docs/AUDIT-third-party-2026-10-15.md): the wgpu arm is gone. The
+> tests only the `wgpu-oracle` build compiled (the arm differentials, `block_on`, `wgpu_timer`,
+> `blit_bands`, `blit_invert`, `effect_pipeline_demand`, `gpu_memory_floor`, `present_real`) are
+> deleted with it and their map rows with them, as are `block-on-runs-to-ready` and
+> `effect-pipeline-demand`, whose demand function and tests went with the wgpu arm. Where a row still
+> says an arm equals wgpu's bytes, the frame record (`frame_record_tests`, `oracle/*.tsv`) is what
+> holds it now. A row's functions or tests can still name the wgpu side (`pick_surface_format`,
+> `build_wgpu`, a `wgpu present`) or a deleted test: those name the law as it was held before
+> GW.6, and §2's map holds only tests that exist. Counts elsewhere in this file were taken before.
+
+> Status 2026-10-26 (ORACLE-ADAPTER, docs/AUDIT-third-party-2026-10-15.md): the frame record's
+> verdict is each frame's CPU twin (the CPU renderer's frame of the same input, or the CPU's run of
+> the present's shaders over it) under the parity suites' tolerance, decided alike on any adapter;
+> wgpu's rows in `oracle/*.tsv` are a same-adapter signal that fails nothing. Where a row says an
+> arm equals wgpu's bytes, the frame record now holds that arm to its CPU twin.
+
 Source: `crates/aterm-gpu` (read only). Every `#[test]` in `src/` (block_on, device_layer, format_plan,
 lib, pipeline_table, present_glass, renderer, startup_probe, video_tap, window_atlas_tests, and
 `metal/{acquire_worker,encoder,ffi,loss,mod,pipelines,present,shaders,swapchain,warm}`) and in `tests/`
@@ -98,7 +114,7 @@ when it is the sole blocker).
 
 ```tsv
 id	kind	owner	functions	statement	subsumes	blocking_gaps
-frame-instrumentation	contract	aterm-gpu	gpu_time::{FrameRing,FrameToken,span_ns,settled,set_paused}, wgpu_timer::{TimestampRing,busy_ns}, GpuRenderer::{frame_shape,set_unorm_ablation,gpu_time_supported}, WindowGpu::last_present_encode_ns	An admitted frame settles once after both seal and its last held part complete. Valid u64-nanosecond parts sum exactly; missing clocks, invalid/nonfinite/reversed spans, out-of-range nanoseconds or sum overflow fail the frame. No parts settles Untimed, never a measured zero; a paused clock (development seam) opens no frame. A busy ring slot skips admission without disturbing its resident frame; results remain readable until reuse, and independent rings cannot evict one another. Metal supplies command-buffer clocks; wgpu, on an adapter granting TIMESTAMP_QUERY, times each render pass with a timestamp-query pair and resolves and reads them only once the device reports the frame's submitted work done, reporting one held part that counts one part per timed pass and spans the union of the pass intervals (an unwritten or reversed pair, a frame out of pairs, a failed readback map or a timer dropped with the frame outstanding fails it); GL supplies none. After a successful GPU present, frame_shape describes the latest encoded offscreen's passes, built instance counts/bytes, CPU build/stage spans and the Unorm draws and instances of the plan the arm ran under the ablation it recorded, with the route those draws took (unorm-fetch-route); reused offscreens do not imply a fresh encode or completed transfer. CPU present-encode time excludes recorded GPU parks and virtual readback waits. The development-only Unorm ablation either drops exactly those draws or thins each to one instance (keeping every pass), preserving sRGB order and built instances, and turns off cleanly.	src/gpu_time.rs tests; src/wgpu_timer.rs tests; tests/frame_instrumentation.rs tests; src/renderer.rs::the_unorm_ablation_drops_or_thins_exactly_the_one_one_groups	1,3,5,7,8
+frame-instrumentation	contract	aterm-gpu	gpu_time::{FrameRing,FrameToken,span_ns,settled,set_paused}, GpuRenderer::{frame_shape,set_unorm_ablation,gpu_time_supported}, WindowGpu::last_present_encode_ns	An admitted frame settles once after both seal and its last held part complete. Valid u64-nanosecond parts sum exactly; missing clocks, invalid/nonfinite/reversed spans, out-of-range nanoseconds or sum overflow fail the frame. No parts settles Untimed, never a measured zero; a paused clock (development seam) opens no frame. A busy ring slot skips admission without disturbing its resident frame; results remain readable until reuse, and independent rings cannot evict one another. Metal supplies command-buffer clocks; GL and D3D11 supply none. After a successful GPU present, frame_shape describes the latest encoded offscreen's passes, built instance counts/bytes, CPU build/stage spans and the Unorm draws and instances of the plan the arm ran under the ablation it recorded, with the route those draws took (unorm-fetch-route); reused offscreens do not imply a fresh encode or completed transfer. CPU present-encode time excludes recorded GPU parks and virtual readback waits. The development-only Unorm ablation either drops exactly those draws or thins each to one instance (keeping every pass), preserving sRGB order and built instances, and turns off cleanly.	src/gpu_time.rs tests; tests/frame_instrumentation.rs tests; src/renderer.rs::the_unorm_ablation_drops_or_thins_exactly_the_one_one_groups	1,3,5,7,8
 should-slice-nonempty	contract	aterm-gpu	renderer::should_slice	should_slice(n) = (n != 0) for every n: usize. With n = 12 * instances this is GpuEncode's NeverSliceEmpty.	tests/conformance_gpuencode.rs::real_gpu_encode_slice_decision_conforms_to_the_gpuencode_model	9
 surface-attach-fallback	contract	aterm-gpu	lib::surface_attach_fallback	For all v, o: surface_attach_fallback(v, o) = DeclineWindow if o; RebuildOpaque if !o && v; CpuRenderer if !o && !v.	src/lib.rs::rebuild_iff_visual_and_alone	1
 swapchain-config-validate	contract	aterm-gpu	metal::swapchain::SwapchainConfig::validate	validate(c) = Ok iff c.format is Bgra8Unorm or Rgba16Float, 2 <= c.maximum_drawables <= 3, c.width > 0 and c.height > 0. An Err reports the first failing clause in that order: the format name, '[2, 3]', then the extent.	src/metal/swapchain.rs::the_config_rejects_what_the_layer_would_throw_on	1
@@ -140,19 +156,17 @@ metal-enum-abi-constants	table-property	aterm-gpu	metal::pipelines::{metal_attr_
 metal-device-selection	contract	aterm-gpu	metal::ffi::{choose_listed,Device::preferred}	For every listing gpus and want_high, let D = [(i,g) | gpus[i] = Some(g), !g.headless] in index order. choose_listed(gpus, want_high) = Some((i, 'low-power')) for the first low-power (i,g) in D if !want_high and one exists; otherwise Some((i, 'the only display GPU')) if |D| = 1; otherwise None. Device::preferred() returns the listed device without calling MTLCreateSystemDefaultDevice whenever choose_listed is Some, and asks the window server (>= 1 call) otherwise.	src/metal/ffi.rs::listing_decides_every_shape_it_can, src/metal/ffi.rs::preferred_asks_the_window_server_only_when_the_listing_cannot_decide	1,7,8
 metal-upload-length-guards	contract	aterm-gpu	device_layer::DeviceHandle::{upload_texture_rows,write_buffer_from_zero} (Metal arm)	On the Metal arm, upload_texture_rows(tex, y0, rows, bytes, stride, w) panics with 'row-ranged upload' before replaceRegion when bytes.len() < rows * stride. write_buffer_from_zero(buf, bytes) panics naming 'MTLBuffer' before any memcpy when bytes.len() > buf.len(). Neither call touches memory outside the named region.	src/device_layer.rs::the_metal_arm_refuses_short_uploads_and_oversized_writes	3,8
 readback-padding-contract	contract	aterm-gpu	lib::{padded_bytes_per_row,frame_from_padded_rgba}; device_layer::{metal_stage_readback,metal_try_read_back}; GpuContext::try_read_back	padded_bytes_per_row(w) = ceil(4w/256) * 256. For all w, h, p >= 4w and b with |b| >= (h-1)p + 4w: frame_from_padded_rgba(b,w,h,p) = Frame{w, h, pixels[y*w+x] = ((255-a)<<24) | (r<<16) | (g<<8) | bl} where (r,g,bl,a) = b[y*p+4x .. +4]; no padding byte is read. metal_stage_readback returns stride = padded_bytes_per_row(w), lands row y at y*stride and leaves every padding byte untouched. For an Rgba8Unorm texture uploaded from tight bytes, the Metal and wgpu readbacks both equal frame_from_padded_rgba(bytes, w, h, 4w).	src/device_layer.rs::the_padding_tail_is_neither_written_nor_consulted	1,7,8
-metal-pipeline-state-mapping	contract	aterm-gpu	metal::pipelines::{metal_blend,metal_write_mask,metal_vertex_descriptor}; pipeline_table::PipelineSpec::wgpu_vertex_buffers	For every row r of ALL_PIPELINES: metal_blend(r.blend) = None iff the blend is absent or Blend::is_replace; metal_write_mask(Color) = COLOR and every other mask maps to ALL; metal_vertex_descriptor(r.vertex) = None iff r.vertex.spec() = None, and otherwise every attribute a has (pinned format(a.format), a.offset, INSTANCE_STREAM_SLOT), the layout at INSTANCE_STREAM_SLOT is (stride, PerInstance=2, rate 1), and there is no layout at buffer 0; wgpu_vertex_buffers() is empty iff there is no layout, and otherwise one buffer {stride, Instance, [(location, offset, format.wgpu())]} with the last attribute's offset < stride.	src/metal/pipelines.rs::only_replace_rows_disable_blending	1,7,8,12
+metal-pipeline-state-mapping	contract	aterm-gpu	metal::pipelines::{metal_blend,metal_write_mask,metal_vertex_descriptor}	For every row r of ALL_PIPELINES: metal_blend(r.blend) = None iff the blend is absent or Blend::is_replace; metal_write_mask(Color) = COLOR and every other mask maps to ALL; metal_vertex_descriptor(r.vertex) = None iff r.vertex.spec() = None, and otherwise every attribute a has (pinned format(a.format), a.offset, INSTANCE_STREAM_SLOT), the layout at INSTANCE_STREAM_SLOT is (stride, PerInstance=2, rate 1), and there is no layout at buffer 0.	src/metal/pipelines.rs::only_replace_rows_disable_blending	1,7,8,12
 shader-interface-matches-table	table-property	aterm-gpu	metal::shaders::source; renderer WGSL sources; pipeline_table::ALL_PIPELINES	For every ShaderLibrary L, the entry points defined in MSL(L) are exactly the multiset {r.vs, r.fs | r.library = L}, and likewise for WGSL(L). For every row r: the buffer/texture/sampler slots that r.vs and r.fs declare in MSL equal r.binds per stage and kind; the vertex stage declares no texture or sampler; [[stage_in]] is present iff r.vertex != None. No MSL source declares buffer(INSTANCE_STREAM_SLOT), and every buffer index is < 8. The WGSL @group/@binding declarations, mapped to per-type sequential Metal slots in (group, binding) order, equal the union of the library's BindSpecs. Needs a shader-declaration grammar model in Clean.	-	1,7,14
-effect-pipeline-demand	contract	aterm-gpu	renderer::{frame_effect_pipelines,GpuRenderer::{encode_frame,warm_effect_pipelines}}	frame_effect_pipelines(inst, input, opaque) demands each pipeline exactly when: CursorBlend: !opaque; GlowAdd: glow_under, glow_add or nova_add is non-empty, or the frame feeds the bloom (input.cursor_glow_add non-empty or a bloom fx layer, fx_gpu::bloom_source_live); RainGlow: glow_halo or rain_add non-empty; RainGlowOver: glow_halo_over or rain_add_over non-empty; FireAdd / FireOver: fire_add / fire_over non-empty; DecoOver: glyph_halo, curl or wdeco_over non-empty; DecoAdd: wdeco_add non-empty; SpriteOver: wallpaper non-empty. With U = (the Exact Under fx stream is non-empty) and O = fx_gpu::under_draws_opaque(input) (every Exact Under layer draws only opaque pixels): Fx: (U and not (O and glow_under empty)) or the Exact Glow or Over fx stream non-empty; FxLinear: a Linear fx stream (Under, the knock layers' Under, Over) non-empty; FxStore: U and O. A frame builds exactly the demanded pipelines that are not yet resident and never rebuilds one, and warm_effect_pipelines makes every slot resident, except that once the device has refused the fx layouts or an fx pipeline no fx row (Fx, FxLinear, FxStore) is built again; the wgpu-free build's warm_effect_pipelines is a no-op. The demand function is gap 1 only; the build cache adds gaps 2 and 8.	src/renderer.rs::a_translucent_cursor_demands_the_blend_pipeline_even_with_no_cursor_quads, src/renderer.rs::a_row_gated_glow_still_demands_glow_add_for_the_bloom_pass, tests/effect_pipeline_demand.rs::an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_add, tests/effect_pipeline_demand.rs::the_warm_up_seam_builds_every_slot_off_the_frame_path, tests/effect_pipeline_demand.rs::an_fx_frame_demands_exactly_its_rows	1,2,8
 repaint-path-selection	contract	aterm-gpu	GpuRenderer::{present_input_readback,present_virtual,scissor_taken,full_repaints,scroll_rescues}; WindowGpu::invalidate_present; aterm_render::{compute_dirty_rows,scroll_blit_plan}	Each present increments exactly one of Sc and Fu (Sc' + Fu' = Sc + Fu + 1). Fu is taken iff there is no prior present on win, the offscreen no longer has (w,h), prev.grid_top differs from grid_top, invalidate_present was called since the last present, or compute_dirty_rows(prev, I, ...) = FullRepaint and scroll_blit_plan(...) = None. Otherwise Sc is taken, including when zero rows are dirty. Rs is incremented iff scroll_blit_plan returned Some, and that frame counts as Sc. A resident tray card or live bloom halo never forces Fu (they composite over the present copy, not the persistent offscreen). Policy facts owned by aterm-render's compute_dirty_rows: a DECDHL row forces FullRepaint; a frame whose real cursor moves in the same tick as a scroll gets scroll_blit_plan = None.	tests/scissor_repaint.rs::gpu_invalidate_present_forces_full_repaint, tests/scroll_blit_gpu.rs::a_cursor_that_really_moves_still_refuses_the_scroll_rescue	1,2,3,4
 dirty-gate	contract	aterm-gpu	GpuRenderer::{render_input_cached,gate_hits,gate_misses}; renderer::GpuGateCache; aterm_render::{Renderer::render_input_cached,WindowCpu::last_damage}	For every history h and input I: render_input_cached is a gate hit (gate_hits += 1, or WindowCpu.last_damage = GateHit) iff (I, blink, override) equals the gate cache's previous (input, blink_phase, cursor_style_override) as a value; every observable input counts (cells, cursor style and effect override, selection, display offset, effect fingerprints and atlas versions, grid origin and pad_top, bloom radius). On a hit the returned pixels equal the cached pixels, which equal the fresh render of I. On a miss gate_misses += 1 and the result follows cached-render-equals-fresh. Corollary: a settled frame presented twice hits on the second call; a frame whose decos or ring moved misses.	tests/dirty_gate.rs::gpu_dirty_gate_byte_identical, tests/dirty_gate.rs::gpu_dirty_gate_one_cell_change_after_hit, tests/dirty_gate.rs::gpu_dirty_gate_tracks_cursor_effect_style_override_and_plain_clear, tests/nova_parity.rs::settled_after_supernova_gate_hits_with_frozen_rainbow_ink	1,2,4
 instance-stream-confined	contract	aterm-gpu	GpuRenderer::{encode_frame (row_active, origin clip),last_instances}; renderer::{push_bg_run,flush_bg_run}	Every background instance emitted for a frame belongs to a row r with row_active(r) (every row under Full, dirty[r] under Dirty), and every glyph instance to such a row or to a lower-apron row (a kept row under a dirty row whose glyphs may ink above, `glyph_windows`), whose quads lie in the dirty band above it; each has a pixel origin inside the clamped framebuffer, apart from band-edge pad strips bounded by a constant per dirty band. Hence last_instances <= k * |{(r,c) : row_active(r) or row_active(r-1), and the cell origin is on screen}| + k0. Corollaries: a 4096-column grid clamped in width emits fewer than rows*cols instances, and a scissored keystroke-plus-moving-comet frame emits instances proportional to its dirty rows even with bloom on.	tests/oversized_resize.rs::densely_filled_oversized_grid_bounds_instances_no_abort, tests/scissor_repaint.rs::bloom_scissor_dirty_band_stays_proportional	1,2,5,7
 render-no-panic-and-bounded-resources	no-panic	aterm-gpu	GpuRenderer::{render_input,present_input_readback,encode_frame}; renderer::build_frame_plan	For every I in Adm and any history, render_input and present_input_readback return without panicking and without a wgpu validation error. Every texture extent is in [1, maxTex]; every scissor rect lies inside the attachment (band y0 = min(grid_top + first*ch, h), y1 = min(..., h), so a band below the fold collapses to an empty in-bounds rect); every buffer is <= max_buffer_size; and the returned frame is non-empty with dims (clampD(fw), clampD(fh)). wgpu validation rules enter as requires on the FFI calls.	also samples tests/parity_fuzz_adversarial.rs::gpu_render_adversarial_states_never_panics_and_matches_cpu, tests/oversized_resize.rs::densely_filled_oversized_grid_bounds_instances_no_abort, tests/oversized_resize.rs::oversized_tall_grid_bottom_row_change_scissors_without_abort	1,2,3,7,8
-block-on-runs-to-ready	contract	aterm-gpu	block_on::block_on; block_on::Signal::{notify,wait,wake,wake_by_ref}	For every F: Future, block_on(f) returns exactly the value of the first poll of f that returns Ready, and polls f once per wake epoch: a future Ready on its first poll is polled exactly once. Liveness: if every Pending poll causes at least one wake (wake or wake_by_ref, on any clone of the waker, from any thread, before or after the executor parks), block_on terminates. k >= 1 wakes delivered before one wait cause exactly one further poll (the latch is a bool that wait resets), so surplus wakes never cause a busy spin.	src/block_on.rs::ready_future_is_polled_exactly_once, src/block_on.rs::wakes_from_another_thread, src/block_on.rs::wake_during_poll_is_not_lost	7,11,13
 loss-latch-sticky-first-reason	invariant	aterm-gpu	metal::loss::LossLatch::{new,record,is_lost,reason,fed_count}	For every sequence of record calls on a fresh latch: is_lost() iff some recorded outcome is Lost; reason() = Some(Debug of the first recorded Lost), or None if none was recorded, and later outcomes never change it. In debug builds fed_count() = the number of record calls.	src/metal/loss.rs::the_latch_flips_only_on_lost_and_stays_flipped	1,2,5,13
 command-buffer-outcome-observed	contract	aterm-gpu	metal::loss::{outcome_of,command_buffer_status,command_buffer_error_code}	For every committed MTLCommandBuffer cb, outcome_of(cb) = classify(status(cb), the error code of cb.error). An empty command buffer that has been committed and waited reads STATUS_COMPLETED and outcome Completed. Needs a PlatformSpec of MTLCommandBuffer.	-	8
 encode-session-loss-protocol	invariant	aterm-gpu	metal::encoder::EncodeSession::{new,begin}; metal::encoder::Submitted::{wait_outcome,try_outcome,settle}; metal::swapchain::{PresentTicket,Swapchain::acquire,Frame::present,Swapchain::reconfigure}; metal::loss::LossLatch::{try_bind_encode_session,unbind_encode_session}; renderer::GpuContext::device_lost	For every latch L: at most one live EncodeSession binds L (new errs 'one latch means ONE queue' while one is live; Drop unbinds). If L is lost, begin, Swapchain::acquire, Frame::present and reconfigure return Err naming 'encode refused' and the first loss reason, with no FFI call (queue_ffi_census unchanged). A healthy begin mints exactly one command buffer. Each Submitted or PresentTicket records exactly one outcome into L, at its first terminal observation (wait_outcome or try_outcome), and answers every later observation from that cache. try_outcome never blocks: while the buffer is not terminal it returns None and records nothing. settle(o) records o on every call. For A committed before B on one queue, B terminal implies A terminal. A Retryable outcome never stops encoding. A latch wired into GpuContext makes device_lost() true exactly when L is lost; a second wire is refused.	src/metal/encoder.rs::an_injected_loss_refuses_further_encodes_fast_and_named, src/metal/encoder.rs::one_latch_one_session_and_drop_frees_the_slot, src/metal/encoder.rs::terminal_outcomes_feed_the_latch_exactly_once_across_wait_and_poll, src/metal/swapchain.rs::an_injected_loss_latches_and_every_later_acquire_and_present_refuses_fast, src/metal/swapchain.rs::a_present_ticket_feeds_the_latch_exactly_once_however_asked, src/renderer.rs::a_wired_metal_loss_latch_feeds_device_lost	1,2,8,13
 loss-domain-seal	invariant	aterm-gpu	metal::resources::{MetalResourceDevice::texture_2d,SealedTexture::{alias_view,latch}}; metal::encoder::CommandBuffer::{render_pass,copy_texture_to_texture,copy_texture_sub_rect,copy_texture_to_buffer}; metal::swapchain::{Frame::{render_target,present},Swapchain::standalone}; device_layer::DeviceHandle::{create_texture_2d,upload_texture_rows}; acquire-worker Frame handoff	Every sealed texture, alias view, drawable and drawable alias carries, by Arc identity, the latch of the mint or swapchain that created it; alias_view inherits its parent's latch. On a session with latch L, every encoder verb (render_pass target, copy source and destination, readback source, Frame::present) refuses any resource whose latch is not L, with an Err naming 'loss domain' or the latch, before anything is encoded, so the command buffer still commits and completes; these refusals never latch. A CPU-synchronous replaceRegion upload across domains is allowed. A worker handoff packet recovers a Frame only for its origin layer and loss domain; a same-size, same-format foreign layer is refused ('different layer/loss domain').	src/device_layer.rs::no_texture_launders_across_loss_domains, src/metal/swapchain.rs::the_two_latch_cross_wired_present_has_no_remaining_shape, src/metal/swapchain.rs::worker_handoff_accepts_its_origin_and_rejects_same_size_foreign_layers	1,2,8
-backend-crossing-refuses-by-name	contract	aterm-gpu	device_layer::{LayerTexture,LayerBuffer,LayerSampler}::{wgpu,metal}; device_layer::DeviceHandle::wgpu_device; device_layer::FrameEncoder seams	Every handle of one backend that reaches an accessor or frame-encoder seam of the other backend panics with a message containing 'device layer'. This covers textures, buffers, samplers and the device, and the pass-target, uniform, pipeline and copy-texture seams, in both directions. The property to prove in place of the panic: every production caller builds matched arms of one backend, so these panics are unreachable (whole-program reachability, gap 4).	-	1,4,8
+backend-crossing-refuses-by-name	contract	aterm-gpu	device_layer::{DeviceHandle,LayerTexture,LayerBuffer,LayerSampler,FrameEncoder,FramePass}	Each target compiles one backend's variant of every handle and seam (Metal on macOS, GL on Linux and wasm32, D3D11 on Windows), so a handle of one backend never reaches another backend's seam: since GW.6 removed the wgpu arm the crossing is unrepresentable, and no seam has a crossing arm to refuse.	-	1,4,8
 metal-encoder-validators	contract	aterm-gpu	metal::encoder::CommandBuffer::{render_pass,copy_texture_sub_rect,copy_texture_to_texture,copy_texture_to_buffer}; metal::encoder::RenderPass::{draw_fullscreen_triangle,draw_instanced,set_vertex_buffer}; metal::ffi::draw_and_read	Each verb returns a named Err and encodes nothing for: an out-of-bounds source or destination rect; an empty region; formats that are not copy-compatible; bytes_per_row < width * bytes_per_texel ('destinationBytesPerRow'); a buffer shorter than (h-1)*stride + w*bpp ('holds'); an extent past the attachment ('exceeds'); an overlapping same-texture copy (a disjoint one is allowed); a pass target without RENDER_TARGET usage; a draw with no pipeline; an instanced draw with no stream; a vertex buffer at INSTANCE_STREAM_SLOT. After any refusal the command buffer still commits and completes and the latch stays clean. The guards are pure usize arithmetic and become provable once split from the FFI.	src/metal/encoder.rs::the_copy_validators_refuse_what_metal_would_corrupt, src/metal/encoder.rs::the_draw_state_machine_refuses_what_the_driver_punishes	1,2,3,8
 acquire-worker-protocol-refinement	refinement	aterm-gpu	metal::acquire_worker::AcquireWorker::{spawn,try_request,try_take,close,is_pending}; metal::acquire_worker::run_worker	AcquireWorker refines the MetalDrawableAcquire machine. try_request(g, i) = Err(i), with nothing queued, iff !request_allowed(is_pending, closed) or the queue is full or absent; otherwise Ok and pending = Some(g). try_take returns None until the result is ready, then Some(Completed{generation=g, ..}) exactly once per admitted request, and clears pending. A stale result fails result_is_current. close(r) never blocks: it closes admission, drops the result receiver (no later wake) and queues Retire(r) behind any queued request; the retirement fires only after the in-flight acquisition returns. A panicking acquisition publishes Panicked and closes admission. A disconnected producer yields Disconnected for the pending generation (queue_ns 0) and closes admission. queue_ns is the admission-to-dequeue span. The worker thread runs at QOS_CLASS_USER_INTERACTIVE.	src/metal/acquire_worker.rs::blocked_acquire_keeps_request_read_and_close_nonblocking_and_retires_afterward, src/metal/acquire_worker.rs::close_queues_retirement_behind_a_request_that_has_not_started, src/metal/acquire_worker.rs::real_worker_admission_publication_and_stale_result_match_the_model, src/metal/acquire_worker.rs::acquire_panic_publishes_terminal_failure_and_closes_admission, src/metal/acquire_worker.rs::disconnected_producer_is_terminal_instead_of_permanently_pending, src/metal/acquire_worker.rs::acquisition_runs_at_user_interactive_so_the_waiting_ui_thread_is_not_outranked	2,8,10,11,13
 acquire-bounded-and-failure-mapping	contract	aterm-gpu	metal::present::{surface_present_failure,terminal_worker_refusal,MetalWindowSurface::acquire}; metal::swapchain::Swapchain::acquire	surface_present_failure(r, occ) maps Pending -> AcquirePending, LatchLost -> Validation, Drift -> Reconfigured, and AcquireNil -> Occluded if occ, else Timeout. terminal_worker_refusal(L) records a Lost into L and returns LatchLost. MetalWindowSurface::acquire returns Err(Drift) iff the drawable extent disagrees with the retained config, Err(LatchLost) before any FFI when the latch is lost, and Err(AcquireNil) when the layer cannot vend; it returns rather than parks. Swapchain::acquire likewise returns a named Err, and after the device is restored the next acquire succeeds. The mapping is gap 1 only; the bounded return is a platform assumption.	src/metal/present.rs::terminal_worker_failure_enters_permanent_backend_recovery, src/metal/present.rs::acquire_refusals_map_to_the_wgpu_failure_contract	1,2,8
@@ -238,7 +252,7 @@ Pure deciders and tables (`should-slice-nonempty`, the gap-1/3 contracts) → `h
 `loss-latch-sticky-first-reason` → `encode-session-loss-protocol` → `loss-domain-seal`. `band-shift-ops`,
 `present-copy-rect-union`, `present-crop-normalize`, `visible-source-scissor`, `fb-dim-clamp` →
 `repaint-path-selection` and `dirty-gate` → aterm-render's `compute_dirty_rows` soundness →
-`cached-render-equals-fresh`. `frame-plan-draw-order` + `frame-pass-coalescing` + `effect-pipeline-demand` →
+`cached-render-equals-fresh`. `frame-plan-draw-order` + `frame-pass-coalescing` →
 plan equality CPU vs GPU → `gpu-frame-refines-cpu` (with the GPU model). `metal-encoder-validators` →
 `metal-encoder-implements-pass-semantics` → `metal-arm-byte-equals-wgpu-arm`.
 
@@ -282,15 +296,7 @@ src/gpu_time.rs	a_paused_clock_opens_no_frame	frame-instrumentation
 src/gpu_time.rs	unknown_serials_are_not_settled	frame-instrumentation
 src/renderer.rs	the_unorm_ablation_drops_or_thins_exactly_the_one_one_groups	frame-instrumentation
 src/renderer.rs	the_ablation_seam_reads_its_modes	frame-instrumentation
-src/wgpu_timer.rs	a_healthy_frame_is_timed_once_its_work_has_run	frame-instrumentation
-src/wgpu_timer.rs	a_frame_out_of_query_pairs_is_dropped	frame-instrumentation
-src/wgpu_timer.rs	a_failed_readback_map_drops_the_frame	frame-instrumentation
-src/wgpu_timer.rs	a_readback_with_an_unwritten_sample_drops_the_frame	frame-instrumentation
-src/wgpu_timer.rs	a_timer_dropped_with_a_frame_outstanding_drops_it	frame-instrumentation
-src/wgpu_timer.rs	an_untimed_present_and_a_full_ring_report_no_time	frame-instrumentation
-src/wgpu_timer.rs	busy_time_is_the_union_of_the_pass_intervals	frame-instrumentation
 tests/frame_instrumentation.rs	a_metal_present_reports_its_gpu_time	frame-instrumentation
-tests/frame_instrumentation.rs	a_wgpu_present_reports_its_gpu_time_through_timestamp_queries	frame-instrumentation
 tests/frame_instrumentation.rs	the_frame_shape_counts_streams_passes_and_bytes	frame-instrumentation
 tests/frame_instrumentation.rs	the_unorm_ablation_saves_the_glow_frames_passes	frame-instrumentation
 src/metal/fetch_tests.rs	the_device_returns_every_byte_through_its_srgb_store_and_fetch	unorm-fetch-route
@@ -308,12 +314,8 @@ src/metal/warm.rs	the_probe_is_pending_from_the_claim_until_the_warm_ran_it	firs
 tests/fetch_route.rs	the_fetch_route_lands_the_splits_bytes_in_one_pass	unorm-fetch-route	gpu-frame-refines-cpu
 tests/fetch_route.rs	an_opaque_under_layer_stored_in_the_base_pass_lands_the_cpus_bytes	opaque-under-store	gpu-frame-refines-cpu
 tests/frame_instrumentation.rs	the_fetch_route_draws_the_glow_frames_light_in_one_pass	unorm-fetch-route	frame-instrumentation
-src/block_on.rs	ready_future_is_polled_exactly_once	block-on-runs-to-ready	
-src/block_on.rs	wake_during_poll_is_not_lost	block-on-runs-to-ready	
-src/block_on.rs	wakes_from_another_thread	block-on-runs-to-ready	
 src/device_layer.rs	no_texture_launders_across_loss_domains	loss-domain-seal	
 src/device_layer.rs	the_metal_arm_refuses_short_uploads_and_oversized_writes	metal-upload-length-guards	
-src/device_layer.rs	the_padding_tail_is_neither_written_nor_consulted	readback-padding-contract	
 src/format_plan.rs	screen_gate_narrows_only_on_a_known_sdr_screen	hdr-gate-policy	
 src/format_plan.rs	screen_upgrade_gate_needs_a_positive_edr_answer	hdr-gate-policy	
 src/format_plan.rs	sdr_boost_gate_is_exclusive_and_fail_off	hdr-gate-policy	
@@ -335,29 +337,17 @@ src/metal/ffi.rs	listing_decides_every_shape_it_can	metal-device-selection
 src/metal/ffi.rs	preferred_asks_the_window_server_only_when_the_listing_cannot_decide	metal-device-selection	
 src/metal/loss.rs	every_error_code_classifies_as_declared	loss-classify-table	
 src/metal/loss.rs	the_latch_flips_only_on_lost_and_stays_flipped	loss-latch-sticky-first-reason	
-src/metal/mod.rs	a_disarm_unparents_the_previously_armed_windows_stale_layer	metal-arm-disarm-sweep	
-src/metal/mod.rs	armed_inline_image_plane_matches_the_wgpu_arm_byte_for_byte	metal-arm-byte-equals-wgpu-arm	
 src/metal/mod.rs	armed_present_tap_ring_captures_the_submit_b_destination_byte_for_byte	metal-arm-byte-equals-wgpu-arm	
-src/metal/mod.rs	armed_present_translucency_matches_wgpu_end_to_end	metal-arm-byte-equals-wgpu-arm	
-src/metal/mod.rs	armed_readback_effects_match_the_wgpu_arm_byte_for_byte	metal-arm-byte-equals-wgpu-arm	
-src/metal/mod.rs	armed_scissored_present_cadence_matches_wgpu_byte_for_byte	metal-arm-byte-equals-wgpu-arm	
-src/metal/mod.rs	armed_submit_a_pipelines_and_stays_byte_identical	metal-arm-byte-equals-wgpu-arm	
-src/metal/mod.rs	armed_virtual_present_feeds_the_unchanged_tap_ring_byte_for_byte	metal-arm-byte-equals-wgpu-arm	
-src/metal/mod.rs	blit_matches_wgpu_byte_for_byte	metal-arm-byte-equals-wgpu-arm	
 src/metal/mod.rs	color_write_mask_gates_each_channel_on_the_gpu	metal-encoder-implements-pass-semantics	
 src/metal/mod.rs	compile_options_pin_invariance_and_the_language_version	metal-library-and-pipeline-build	
-src/metal/mod.rs	crown_rows_match_wgpu_byte_for_byte	metal-arm-byte-equals-wgpu-arm	
 src/metal/mod.rs	fire_field_matches_the_cpu_bit_for_bit	shader-kernels-equal-cpu-functions	
-src/metal/mod.rs	full_frame_render_input_matches_wgpu_byte_for_byte	metal-arm-byte-equals-wgpu-arm	
-src/metal/mod.rs	present_path_matches_wgpu_virtual_present_byte_for_byte	metal-arm-byte-equals-wgpu-arm	
 src/metal/mod.rs	rain_halo_matches_the_cpu_bit_for_bit	shader-kernels-equal-cpu-functions	
 src/metal/mod.rs	sampler_mag_filter_changes_the_magnified_bytes	metal-encoder-implements-pass-semantics	
 src/metal/mod.rs	sampler_min_filter_changes_the_minified_bytes	metal-encoder-implements-pass-semantics	
-src/metal/mod.rs	the_scissored_load_frame_is_byte_identical_across_arms	metal-arm-byte-equals-wgpu-arm	
 src/metal/mod.rs	udiv_small_is_the_integer_divide_over_its_callers_domain	shader-kernels-equal-cpu-functions	
 src/metal/pipelines.rs	every_table_row_builds_a_metal_pipeline	metal-library-and-pipeline-build	
 src/metal/pipelines.rs	only_replace_rows_disable_blending	metal-pipeline-state-mapping	
-src/metal/present.rs	acquire_refusals_map_to_the_wgpu_failure_contract	acquire-bounded-and-failure-mapping	
+src/metal/present.rs	acquire_refusals_map_to_the_surface_failure_contract	acquire-bounded-and-failure-mapping	
 src/metal/present.rs	terminal_worker_failure_enters_permanent_backend_recovery	acquire-bounded-and-failure-mapping	
 src/metal/present.rs	the_no_drift_reconcile_still_tracks_the_parents_contents_scale	swapchain-configure-postconditions	
 src/metal/swapchain.rs	a_present_beside_a_live_foreign_metal_layer_touches_only_its_own_layer	swapchain-configure-postconditions	
@@ -383,10 +373,7 @@ src/renderer.rs	a_failed_first_frame_warm_leaves_the_inline_mint_and_its_failure
 src/renderer.rs	a_gpu_park_accumulates_per_attempt_and_publishes_exactly_once	present-sample-publication	
 src/renderer.rs	a_new_attempt_discards_an_unconsumed_old_sample	present-sample-publication	
 src/renderer.rs	a_refused_acquire_is_measured_and_published_once	present-sample-publication	
-src/renderer.rs	a_row_gated_glow_still_demands_glow_add_for_the_bloom_pass	effect-pipeline-demand	
-src/renderer.rs	a_translucent_cursor_demands_the_blend_pipeline_even_with_no_cursor_quads	effect-pipeline-demand	
 src/renderer.rs	a_wired_metal_loss_latch_feeds_device_lost	encode-session-loss-protocol	
-src/renderer.rs	admitted_rebuild_preserves_device_and_exact_sources	renderer-rebuild-preserves-config	
 src/renderer.rs	an_in_place_atlas_upload_settles_every_frame_reader	gpu-resource-residency	
 src/renderer.rs	an_fx_append_settles_every_frame_reader	gpu-resource-residency	
 src/renderer.rs	a_frame_palette_never_lands_under_a_reader	gpu-resource-residency	
@@ -404,15 +391,10 @@ src/renderer.rs	bloom_glow_frames_scissor_and_match_full_render	cached-render-eq
 src/renderer.rs	copy_src_is_armed_only_by_a_live_tap_on_a_capable_surface	swapchain-usage-and-alpha	
 src/renderer.rs	deco_atlas_drops_on_oversized_cell_height_no_abort	gpu-resource-residency	
 src/renderer.rs	fitted_fallback_styles_reach_the_atlas_as_the_cpu_fit_them	atlas-mirrors-cpu-glyph-cache	
-src/renderer.rs	fractional_scroll_frames_keep_the_scissor_path	cached-render-equals-fresh	
 src/renderer.rs	fractional_scroll_keeps_tray_pixels_pinned	present-blit-denotation	
 src/renderer.rs	frame_passes_coalesce_maximally_without_reordering	frame-pass-coalescing	
-src/renderer.rs	hdr_reconfigure_apply_conforms_to_retag_model	hdr-reconfigure-retag-refinement	
-src/renderer.rs	hdr_state_probe_is_immediate_then_throttled	hdr-probe-throttle	
 src/renderer.rs	hdr_upgrade_publishes_linear_capture_metadata_with_safe_defaults	hdr-reconfigure-retag-refinement	
-src/renderer.rs	new_glyph_grows_atlas_in_place_without_recreating_texture	gpu-resource-residency	
 src/renderer.rs	polled_snapshots_inside_the_hold_reconfigure_the_swapchain_once	swapchain-usage-and-alpha	
-src/renderer.rs	present_alpha_mode_is_opacity_and_caps_aware	swapchain-usage-and-alpha	
 src/renderer.rs	present_crop_normalizes_only_after_logical_validation	present-crop-normalize	
 src/renderer.rs	present_prev_is_per_window_no_cross_window_leak	cached-render-equals-fresh	
 src/renderer.rs	scaled_border_px_is_sixteenths_never_thinner_than_a_pixel	scaled-border-px	
@@ -441,15 +423,6 @@ src/video_tap.rs	should_capture_fps10_spacing	video-fps-gate
 src/video_tap.rs	should_capture_uncapped_accepts_all	video-fps-gate	
 src/window_atlas_tests.rs	window_atlas_metal_reuses_distinct_artwork_and_releases_closed_windows	window-atlas-ownership-refinement	
 src/window_atlas_tests.rs	window_atlas_metal_shares_sources_and_releases_the_last_owner	window-atlas-ownership-refinement	
-src/window_atlas_tests.rs	window_atlas_wgpu_reuses_distinct_artwork_and_releases_closed_windows	window-atlas-ownership-refinement	
-src/window_atlas_tests.rs	window_atlas_wgpu_shares_sources_and_releases_the_last_owner	window-atlas-ownership-refinement	
-tests/blit_bands.rs	asymmetric_crop_keeps_raw_bands_outside_invert_and_drop_overlay	present-blit-denotation	
-tests/blit_bands.rs	bands_do_not_invert_on_bell	present-blit-denotation	
-tests/blit_bands.rs	chrome_rows_continue_their_edge_pixels_through_the_leftover_bands	present-blit-denotation	
-tests/blit_bands.rs	rows_above_the_chrome_start_keep_the_flat_leftover_band	present-blit-denotation	
-tests/blit_bands.rs	undersized_swapchain_crops_centred_never_scales	present-blit-denotation	
-tests/blit_bands.rs	window_seven_px_past_grid_fit_offsets_content_without_scaling	present-blit-denotation	
-tests/blit_invert.rs	blit_double_invert_round_trips_the_real_output	present-blit-denotation	
 tests/capture_tap_conformance.rs	harvested_store_sorts_callbacks_and_evicts_lowest_sequence	capture-store-ordered-budget	
 tests/capture_tap_conformance.rs	presented_frame_shipping_gate_conforms_on_success_and_every_error_edge	capture-lifecycle-refinement	
 tests/capture_tap_conformance.rs	video_slot_shipping_gate_conforms_and_invalid_metadata_is_counted	capture-lifecycle-refinement	
@@ -466,9 +439,6 @@ tests/dirty_gate.rs	gpu_dirty_gate_byte_identical	dirty-gate	cached-render-equal
 tests/dirty_gate.rs	gpu_dirty_gate_one_cell_change_after_hit	dirty-gate	
 tests/dirty_gate.rs	gpu_dirty_gate_settled_and_drained_rain	cached-render-equals-fresh	
 tests/dirty_gate.rs	gpu_dirty_gate_tracks_cursor_effect_style_override_and_plain_clear	dirty-gate	
-tests/effect_pipeline_demand.rs	an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_add	effect-pipeline-demand	
-tests/effect_pipeline_demand.rs	the_warm_up_seam_builds_every_slot_off_the_frame_path	effect-pipeline-demand	
-tests/effect_pipeline_demand.rs	an_fx_frame_demands_exactly_its_rows	effect-pipeline-demand	
 tests/empty_channels_gpu.rs	every_empty_channel_is_byte_identical_on_the_gpu_and_clear_overlays_restores_it	gpu-frame-refines-cpu	
 tests/feature_flip_parity.rs	live_font_feature_flip_keeps_parity	atlas-follows-cpu-rasters	
 tests/feature_flip_parity.rs	live_font_feature_flip_reaches_gpu_pixels	atlas-follows-cpu-rasters	
@@ -502,10 +472,8 @@ tests/glow_under_parity.rs	char_fg_follows_into_line_decorations_on_both_backend
 tests/glow_under_parity.rs	damaged_path_glow_under_char_fg_parity_cpu_matches_gpu	cached-render-equals-fresh	
 tests/glow_under_parity.rs	glow_under_char_fg_field_is_byte_exact_over_text	gpu-frame-refines-cpu	
 tests/glow_under_parity.rs	gradient_glow_under_is_byte_exact_cpu_vs_gpu	shader-kernels-equal-cpu-functions	
-tests/glow_under_parity.rs	gradient_glow_under_is_byte_exact_cpu_vs_wgpu_oracle	shader-kernels-equal-cpu-functions	
 tests/glow_under_parity.rs	ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu	gpu-frame-refines-cpu	
 tests/glow_under_parity.rs	source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone	gpu-frame-refines-cpu	
-tests/glow_under_parity.rs	the_bed_is_never_boosted_or_bloomed	hdr-crown-emission	
 tests/gpu_matches_cpu.rs	background_and_cursor_opacity_gpu_match_cpu	gpu-frame-refines-cpu	
 tests/gpu_matches_cpu.rs	cursor_trail_gpu_matches_cpu	gpu-frame-refines-cpu	
 tests/gpu_matches_cpu.rs	gpu_matches_cpu_and_clips_italic_ink_at_pane_edge	gpu-frame-refines-cpu	
@@ -531,8 +499,6 @@ tests/gpu_matches_cpu.rs	sub_script_gpu_matches_cpu	gpu-frame-refines-cpu
 tests/gpu_matches_cpu.rs	synthetic_symbol_cells_match_cpu_within_tolerance	gpu-frame-refines-cpu	
 tests/gpu_matches_cpu.rs	the_overline_colour_channel_paints_the_same_seam_on_both_backends	gpu-frame-refines-cpu	
 tests/gpu_matches_cpu.rs	word_decorations_gpu_match_cpu	gpu-frame-refines-cpu	
-tests/gpu_memory_floor.rs	bloom_target_is_built_on_demand_not_with_the_offscreen	gpu-resource-residency	
-tests/gpu_memory_floor.rs	suballocator_reserves_a_terminal_sized_floor	gpu-resource-residency	
 tests/hdr_gate.rs	gpu_hdr_aurora_bounded_by_edr_and_nonvacuous	hdr-crown-emission	
 tests/hdr_gate.rs	gpu_hdr_blit_bands_take_the_reference_white_scale	present-blit-denotation	
 tests/hdr_gate.rs	gpu_hdr_blit_grid_clamped_and_linear	present-blit-denotation	
@@ -541,7 +507,6 @@ tests/hdr_gate.rs	hdr_gate_exhaustive_attach_present_chain	hdr-gate-policy
 tests/hdr_gate.rs	only_the_whitest_cores_exceed_reference_white	hdr-crown-emission	
 tests/heat_shimmer.rs	shimmer_bounded_displacement_and_scoped_to_region	effect-layer-laws	
 tests/heat_shimmer.rs	shimmer_no_op_law_flag_off_and_empty_region	effect-layer-laws	
-tests/heat_shimmer.rs	shimmer_reaches_all_three_introspection_paths	effect-layer-laws	
 tests/heat_shimmer.rs	shimmer_region_derivation_sanity	effect-layer-laws	
 tests/heat_shimmer.rs	shimmer_scissored_present_matches_fresh_render	cached-render-equals-fresh	
 tests/inline_image_parity.rs	a_kitty_frame_advance_repaints_on_retained_cpu_and_gpu_renderers	render-history-independence	
@@ -571,21 +536,14 @@ tests/nova_parity.rs	settled_after_supernova_gate_hits_with_frozen_rainbow_ink	d
 tests/nova_parity.rs	supernova_damaged_path_wash_to_shockwave_cached_equals_fresh	cached-render-equals-fresh	supernova-emitter-envelope
 tests/nova_parity.rs	supernova_detonation_peak_over_text_matches_within_tolerance	gpu-frame-refines-cpu	
 tests/oversized_resize.rs	densely_filled_oversized_grid_bounds_instances_no_abort	instance-stream-confined	render-no-panic-and-bounded-resources
-src/lib.rs	offscreen_texture_clamps_zero_and_oversized_dims	fb-dim-clamp	
 tests/oversized_resize.rs	oversized_grid_clamps_offscreen_instead_of_aborting	fb-dim-clamp	
 tests/oversized_resize.rs	oversized_tall_grid_bottom_row_change_scissors_without_abort	cached-render-equals-fresh	render-no-panic-and-bounded-resources
 tests/oversized_resize.rs	oversized_tall_grid_normalizes_cropped_virtual_present	present-crop-normalize	
 tests/parity_fuzz.rs	cpu_gpu_parity_fuzz	gpu-frame-refines-cpu	
 tests/parity_fuzz_adversarial.rs	gpu_render_adversarial_states_never_panics_and_matches_cpu	gpu-frame-refines-cpu	render-no-panic-and-bounded-resources
-tests/present_real.rs	overflowing_frame_crop_is_the_visible_intersection	present-blit-denotation	
-tests/present_real.rs	one_shot_presented_snapshot_is_independent_from_video	present-arms-agree	
-tests/present_real.rs	present_real_theorem_fire_glow_bloom_halo_crown	present-arms-agree	
-tests/present_real.rs	present_real_theorem_text_and_scissored_present	present-arms-agree	
-tests/present_real.rs	production_present_resolves_odd_bands_and_trailing_content	present-blit-denotation	
 tests/rain_parity.rs	rain_effect_only_parity_pinned_over_bg_and_text	gpu-frame-refines-cpu	
 tests/rain_parity.rs	scissored_path_rain_row_filter_matches_full_render	cached-render-equals-fresh	
 tests/row_overshoot_gpu.rs	scissored_rows_beside_overshooting_glyphs_are_byte_exact	cached-render-equals-fresh	
-tests/scissor_repaint.rs	bloom_scissor_dirty_band_stays_proportional	instance-stream-confined	
 tests/scissor_repaint.rs	gpu_invalidate_present_forces_full_repaint	repaint-path-selection	cached-render-equals-fresh
 tests/scissor_repaint.rs	gpu_scissor_animating_rain_byte_identical	cached-render-equals-fresh	
 tests/scissor_repaint.rs	gpu_scissor_one_cell_change_preserves_other_rows	cached-render-equals-fresh	
@@ -725,8 +683,8 @@ Counts by action, of the rows left: moved to bench 1, deleted 2.
 3. **`hdr-gate-policy`** (5 tests, an exhaustive bool/Option<f32> policy) then `hdr-reconfigure-retag-refinement`
    and `acquire-worker-guards-refine-model` / `capture-lifecycle-refinement` (gap 10 refinements over
    const fns): small state, high value, they bind existing `ty_model!` machines to the code.
-4. **`fb-dim-clamp`, `visible-source-scissor`, `frame-pass-coalescing`, `frame-plan-draw-order`,
-   `effect-pipeline-demand` (demand half)**: the pure planning layer under the GPU encode. With
+4. **`fb-dim-clamp`, `visible-source-scissor`, `frame-pass-coalescing`, `frame-plan-draw-order`**: the
+   pure planning layer under the GPU encode. With
    `repaint-path-selection`, `dirty-gate` and aterm-render's `compute_dirty_rows` soundness lemma, this is the
    pure core of `cached-render-equals-fresh` (40 tests).
 5. **`pixel-conversion-laws`** (10 tests; loops and floats) and `loss-latch-sticky-first-reason` →

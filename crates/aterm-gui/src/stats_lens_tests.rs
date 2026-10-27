@@ -42,7 +42,7 @@ fn hour_ring(s: &Snapshot, i: usize, from: f64, noise: f64, r: &mut Rng) -> Arc<
     let mut cells: Vec<Cell> = (0..n)
         .map(|k| {
             let t = k as f64 / n as f64;
-            let v = (from + (to - from) * t + r.uniform(-noise, noise)) * cap;
+            let v = (from + (to - from) * t + r.uniform(-noise, noise)).max(0.0) * cap;
             let unread = (120..132).contains(&k);
             Cell {
                 mean: (!unread).then_some(v),
@@ -432,6 +432,8 @@ fn a_chart_says_one_hour_ago_in_the_singular() {
         under: DAY,
         min_span: 1.0,
         mark: None,
+        gaps: Vec::new(),
+        events: Vec::new(),
     };
     let said = |n: usize, bucket_ms: i64| {
         trace_said(
@@ -467,6 +469,8 @@ fn a_chart_says_an_unread_span_once() {
         under: HOUR,
         min_span: 1.0,
         mark: None,
+        gaps: Vec::new(),
+        events: Vec::new(),
     };
     let said = trace_said("Used", "GiB", &trace, (0, 60_000), &LOC);
     assert!(said.ends_with(" Not read from 16:01 to 16:03."), "{said}");
@@ -690,7 +694,17 @@ fn each_lens_shows_its_sections() {
         names(Instrument::HowToRead),
         ["Heat", "Cells", "Scopes", "Marks", "Gestures"]
     );
-    for focus in [Instrument::Network, Instrument::Tokens, Instrument::Gpu] {
+    assert_eq!(
+        names(Instrument::Network),
+        [
+            "Now",
+            "Traffic now",
+            "Throughput, last hour",
+            "Open sockets",
+            "Connectivity"
+        ]
+    );
+    for focus in [Instrument::Tokens, Instrument::Gpu] {
         assert_eq!(names(focus), ["Now", "Details"], "{focus:?}");
     }
     let trouble = lens_scene(Scene::Trouble);
@@ -770,9 +784,9 @@ fn each_lens_shows_its_sections() {
         "the event takes precedence"
     );
     let net = heard(&snap, pinned(Instrument::Network));
-    assert!(well(&net, "Details").contains("no per-app network figure"));
+    assert!(well(&net, "Open sockets").contains("no per-app network figure"));
     let now = well(&net, "Now");
-    assert!(now.starts_with("Network "), "{now}");
+    assert!(!now.is_empty(), "{now}");
 }
 
 #[test]
@@ -1294,7 +1308,7 @@ fn the_keys_step_and_copy_the_instruments() {
                 ..LOC
             }
         )
-        .contains("The bar shows this computer in grey"),
+        .contains("this computer"),
         "off macOS the machine is this computer, as the deck names it"
     );
     let mut at = Instrument::Cpu;
@@ -1307,7 +1321,7 @@ fn the_keys_step_and_copy_the_instruments() {
     assert_eq!(at, Instrument::Cpu);
     assert_eq!(
         step_instrument(Instrument::Cpu, false),
-        Instrument::Processes
+        Instrument::NetworkState
     );
     assert_eq!(
         step_instrument(Instrument::HowToRead, true),
@@ -1315,7 +1329,7 @@ fn the_keys_step_and_copy_the_instruments() {
     );
     assert_eq!(
         step_instrument(Instrument::HowToRead, false),
-        Instrument::Processes
+        Instrument::NetworkState
     );
 }
 
@@ -1453,6 +1467,52 @@ fn lens_gallery() {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let calm = lens_scene(Scene::Calm);
     let trouble = lens_scene(Scene::Trouble);
+    let mut net_live = lens_scene(Scene::Calm);
+    let mut net_rng = Rng(11);
+    net_live.resources[Resource::Network.index()].capacity = Some(125_000_000.0);
+    net_live.resources[Resource::Network.index()].now = Some(8_400_000.0);
+    net_live.resources[Resource::Network.index()].heat_now = Some(0.067);
+    net_live.resources[Resource::Network.index()].ring = hour_ring(
+        &net_live,
+        Resource::Network.index(),
+        0.08,
+        0.03,
+        &mut net_rng,
+    );
+    net_live.resources[Resource::Network.index()].aterm = ScopeFig {
+        now: Some(12.0),
+        missing: None,
+        ..ScopeFig::default()
+    };
+    net_live.facts.link = Some(aterm_vitals::LinkSample {
+        name: "en0".into(),
+        kind: aterm_vitals::LinkKind::Wifi,
+        rate_bps: Some(1_000_000_000),
+        ..aterm_vitals::LinkSample::default()
+    });
+    net_live.net = Some(aterm_vitals::NetView {
+        rates: Some(aterm_vitals::LinkRates {
+            rx_bps: 8_400_000.0,
+            tx_bps: 1_200_000.0,
+            rx_pps: 6_000.0,
+            tx_pps: 1_000.0,
+            rx_err_ps: 0.0,
+            tx_err_ps: 0.0,
+            rx_drop_ps: 0.0,
+            tx_drop_ps: None,
+        }),
+        tcp: Some(aterm_vitals::TcpCounts {
+            established: 15,
+            listen: 11,
+            time_wait: 1,
+            ..aterm_vitals::TcpCounts::default()
+        }),
+        srtt_ms: Some(14.6),
+        state: aterm_vitals::NetState::Online,
+        aterm_sockets: Some(12),
+        tab_sockets: vec![(FRONT, 4), (3, 7)],
+        ..aterm_vitals::NetView::default()
+    });
     let mut shots: Vec<(String, &Snapshot, Instrument, f64, f64)> = Vec::new();
     for (name, snap) in [("calm", &calm), ("trouble", &trouble)] {
         for (lw, lh) in [(1024.0, 250.0), (526.0, 250.0), (526.0, 154.0)] {
@@ -1475,6 +1535,20 @@ fn lens_gallery() {
         shots.push((format!("{name}_1024x250"), &calm, focus, 1024.0, 250.0));
         shots.push((format!("{name}_526x250"), &calm, focus, 526.0, 250.0));
     }
+    shots.push((
+        "network_1024x250".into(),
+        &net_live,
+        Instrument::Network,
+        1024.0,
+        250.0,
+    ));
+    shots.push((
+        "network_526x250".into(),
+        &net_live,
+        Instrument::Network,
+        526.0,
+        250.0,
+    ));
     for (lw, lh) in [(1024.0, 250.0), (640.0, 250.0), (526.0, 250.0)] {
         shots.push((
             format!("cpu_trouble_{lw}x{lh}"),
@@ -1502,7 +1576,7 @@ fn lens_gallery() {
             written.push(file);
         }
     }
-    assert_eq!(written.len(), (6 + 10 + 3) * 2);
+    assert_eq!(written.len(), (6 + 12 + 3) * 2);
 }
 
 /// The card a reading splices (its body over the kept shell's raster) is the card one raster of
@@ -1647,12 +1721,17 @@ fn a_cjk_line_of_the_lens_wraps_between_its_characters() {
 fn cpu_and_network_lenses_surface_chip_connectivity_latency_and_scoped_sockets() {
     let mut snap = lens_scene(Scene::Calm);
     snap.facts.cpu_brand = Some("Apple M5 Max".into());
+    if let Some(cpu) = snap.cpu.as_mut() {
+        cpu.core_history =
+            vec![vec![Some(0.95); aterm_vitals::model::CORE_HISTORY_LEN]; cpu.total()];
+    }
+    let inks = dark_inks();
     let cpu_laid = lay_lens(
         &shell(1119.0, 760.0, 2.0),
-        &input(&snap, dark_inks()),
+        &input(&snap, inks),
         &pinned(Instrument::Cpu),
         &FaceMetrics::helvetica_neue(),
-        false,
+        true,
     );
     assert!(
         cpu_laid
@@ -1662,7 +1741,21 @@ fn cpu_and_network_lenses_surface_chip_connectivity_latency_and_scoped_sockets()
         "CPU lens header names the processor chip: {:?}",
         cpu_laid.boxes
     );
+    let hot_core = rgba(inks.heat[usize::from(ink::heat_step(0.95))], 0xFF);
+    assert!(
+        cpu_laid
+            .prims
+            .iter()
+            .any(|p| matches!(p, DrawPrim::Panel { fill, .. } if *fill == hot_core)),
+        "CPU lens colors hot core history cells in the deck's heat ramp"
+    );
 
+    snap.facts.link = Some(aterm_vitals::LinkSample {
+        name: "en0".into(),
+        kind: aterm_vitals::LinkKind::Wifi,
+        rate_bps: Some(1_000_000_000),
+        ..aterm_vitals::LinkSample::default()
+    });
     snap.net = Some(aterm_vitals::NetView {
         rates: Some(aterm_vitals::LinkRates {
             rx_bps: 8_400_000.0,
@@ -1674,10 +1767,16 @@ fn cpu_and_network_lenses_surface_chip_connectivity_latency_and_scoped_sockets()
             rx_drop_ps: 0.0,
             tx_drop_ps: None,
         }),
+        tcp: Some(aterm_vitals::TcpCounts {
+            established: 15,
+            listen: 11,
+            time_wait: 1,
+            ..aterm_vitals::TcpCounts::default()
+        }),
         srtt_ms: Some(14.6),
         state: aterm_vitals::NetState::Online,
         aterm_sockets: Some(12),
-        tab_sockets: vec![(1, 4)],
+        tab_sockets: vec![(FRONT, 4), (3, 7)],
         ..aterm_vitals::NetView::default()
     });
     snap.resources[Resource::Network.index()].aterm = aterm_vitals::ScopeFig {
@@ -1686,17 +1785,209 @@ fn cpu_and_network_lenses_surface_chip_connectivity_latency_and_scoped_sockets()
         ..aterm_vitals::ScopeFig::default()
     };
     let net = heard(&snap, pinned(Instrument::Network));
-    let details = well(&net, "Details");
+    let traffic = well(&net, "Traffic now");
     assert!(
-        details.contains("Connectivity: Online") && details.contains("14.6 ms"),
-        "Network lens surfaces live state and passive TCP RTT: {details}"
+        traffic.contains("download") && traffic.contains("8.4 MB/s") && traffic.contains("upload"),
+        "Network lens splits download and upload rates: {traffic}"
+    );
+    let conn = well(&net, "Connectivity");
+    assert!(
+        conn.contains("Online") && conn.contains("median TCP RTT 14.6 ms"),
+        "Network lens surfaces live state and passive TCP RTT: {conn}"
+    );
+    let sockets = well(&net, "Open sockets");
+    assert!(
+        sockets.contains("aterm, 12 sockets") && sockets.contains("Tab 2, 4 sockets"),
+        "Network lens lists machine, aterm, and tab socket counts: {sockets}"
     );
     assert!(
-        details.contains("open sockets counted per scope"),
-        "Network lens explains per-scope socket attribution: {details}"
+        !sockets.contains("no per-app network figure"),
+        "Network lens drops 'no per-app network figure' when socket figures are present: {sockets}"
+    );
+    let tcp = well(&net, "TCP states");
+    assert!(
+        tcp.contains("15 established") && tcp.contains("11 listen") && tcp.contains("1 time-wait"),
+        "Network lens summarizes TCP states: {tcp}"
+    );
+    let net_drawn = lay_lens(
+        &shell(1024.0, 250.0, 2.0),
+        &input(&snap, dark_inks()),
+        &pinned(Instrument::Network),
+        &FaceMetrics::helvetica_neue(),
+        true,
     );
     assert!(
-        !details.contains("no per-app network figure"),
-        "Network lens drops 'no per-app network figure' when socket figures are present: {details}"
+        faults(&net_drawn, 1024.0, 250.0).is_empty(),
+        "{:?}",
+        faults(&net_drawn, 1024.0, 250.0)
     );
+    assert!(
+        net_drawn
+            .boxes
+            .iter()
+            .any(|b| b.text.contains("open sockets counted per scope")),
+        "Network lens draws the per-scope socket attribution note: {:?}",
+        net_drawn.boxes
+    );
+    assert!(
+        net_drawn
+            .boxes
+            .iter()
+            .any(|b| b.text.contains("link 125 MB/s"))
+            && !net_drawn
+                .boxes
+                .iter()
+                .any(|b| b.text.contains("1,000 MB/s")),
+        "Network lens converts 1 Gbps link_bps (bits/s) to 125 MB/s (bytes/s): {:?}",
+        net_drawn.boxes
+    );
+    let tab_lens = Lens {
+        focus: Instrument::Network,
+        bar: Bar::Tab,
+        how: Opened::Pinned,
+    };
+    let net_tab = lay_lens(
+        &shell(1024.0, 250.0, 2.0),
+        &input(&snap, dark_inks()),
+        &tab_lens,
+        &FaceMetrics::helvetica_neue(),
+        false,
+    );
+    let tab_sockets = well(&net_tab, "Open sockets in Tab 2");
+    assert!(
+        tab_sockets.contains("Tab 2, 4 sockets") && !tab_sockets.contains("aterm,"),
+        "Bar::Tab filters Open sockets to the active tab: {tab_sockets}"
+    );
+}
+
+#[test]
+fn how_to_read_and_traces_surface_multiscale_gaps_and_events() {
+    let words_said = how_to_read_words(Platform::MacOs);
+    assert!(
+        words_said.contains("4 hours")
+            && words_said.contains("6 hours")
+            && words_said.contains("1 second, 10 seconds, 1 minute, 10 minutes and 1 hour")
+            && words_said.contains("live now cell at the left end")
+            && words_said.contains("on a narrow deck the line under each percent figure")
+            && !words_said.contains("at the right")
+            && !words_said.contains("two and a half")
+            && !words_said.contains("15 minutes"),
+        "how_to_read_words reflects multi-scale live now strip: {words_said}"
+    );
+    let mut snap = lens_scene(Scene::Calm);
+    let htr = heard(&snap, pinned(Instrument::HowToRead));
+    assert!(
+        htr.explainer
+            .contains("up to 6 h where a strip has the room")
+            && htr.explainer.contains("1 s, 10 s, 1 min, 10 min and 1 h"),
+        "How to read explainer reflects multi-scale horizons: {}",
+        htr.explainer
+    );
+    let cells = well(&htr, "Cells");
+    assert!(
+        cells.contains("live now") && cells.contains("sleep, crash"),
+        "Cells section explains multi-scale live now and gaps/events: {cells}"
+    );
+    // Every form the Cells legend draws reads from now, never toward it: a short lens's one line
+    // once said "multi-scale to live now", the old axis's direction (the review of 2026-10-26).
+    let m = FaceMetrics::helvetica_neue();
+    let mut drawn = std::collections::BTreeSet::new();
+    for lw in [1024.0, 760.0, 526.0, 420.0, 340.0] {
+        for lh in [90.0, 120.0, 160.0, 250.0, 400.0] {
+            let laid = lay_lens(
+                &shell(lw, lh, 2.0),
+                &input(&snap, dark_inks()),
+                &pinned(Instrument::HowToRead),
+                &m,
+                true,
+            );
+            drawn.extend(
+                laid.boxes
+                    .iter()
+                    .filter(|b| b.text.starts_with("multi-scale"))
+                    .map(|b| b.text.clone()),
+            );
+        }
+    }
+    assert!(
+        drawn.iter().any(|t| t.contains('\u{b7}')),
+        "CONTROL: a lens draws the Cells legend's one line: {drawn:?}"
+    );
+    assert!(
+        drawn
+            .iter()
+            .all(|t| !t.contains("to live now") && !t.contains("to now")),
+        "the Cells legend reads from now: {drawn:?}"
+    );
+
+    // Populate a crash gap across the unread span in Memory's 1-hour ring (buckets 120..132 of 360
+    // 10s buckets = minutes 20..22 of the 60-minute window) and wake/pressure event markers.
+    let now = snap.at_unix_ms;
+    let hour_start = (now.div_euclid(60_000) - 59) * 60_000;
+    snap.time_gaps = vec![
+        aterm_vitals::TimeGap {
+            start_ms: hour_start + 19 * 60_000,
+            end_ms: hour_start + 23 * 60_000,
+            kind: aterm_vitals::GapKind::Crash,
+        },
+        aterm_vitals::TimeGap {
+            start_ms: now - 12 * 3_600_000,
+            end_ms: now - 10 * 3_600_000,
+            kind: aterm_vitals::GapKind::Sleep,
+        },
+    ];
+    snap.strip_events = vec![
+        aterm_vitals::StripEvent {
+            at_unix_ms: hour_start + 23 * 60_000,
+            kind: aterm_vitals::StripEventKind::Crash,
+            label: "unclean exit".into(),
+        },
+        aterm_vitals::StripEvent {
+            at_unix_ms: hour_start + 44 * 60_000,
+            kind: aterm_vitals::StripEventKind::PressureSpike,
+            label: "memory pressure critical".into(),
+        },
+        aterm_vitals::StripEvent {
+            at_unix_ms: now - 10 * 3_600_000,
+            kind: aterm_vitals::StripEventKind::SleepWake,
+            label: "woke from sleep".into(),
+        },
+    ];
+    let m = FaceMetrics::helvetica_neue();
+    for (focus, expect_gap, expect_ev) in [
+        (Instrument::Memory, "crash", "pressure"),
+        (Instrument::Disk, "asleep", "woke"),
+    ] {
+        for lw in [1024.0, 526.0] {
+            let laid = lay_lens(
+                &shell(lw, 250.0, 2.0),
+                &input(&snap, dark_inks()),
+                &pinned(focus),
+                &m,
+                true,
+            );
+            let why = faults(&laid, lw, 250.0);
+            assert!(why.is_empty(), "{focus:?} {lw}: {why:?}");
+            if lw >= 1024.0 {
+                assert!(
+                    laid.boxes.iter().any(|b| b.text == expect_gap),
+                    "{focus:?}: expected gap label {expect_gap:?} in {:?}",
+                    laid.boxes
+                );
+                assert!(
+                    laid.boxes.iter().any(|b| b.text == expect_ev),
+                    "{focus:?}: expected event label {expect_ev:?} in {:?}",
+                    laid.boxes
+                );
+                if focus == Instrument::Memory {
+                    assert_eq!(
+                        laid.boxes.iter().filter(|b| b.text == "crash").count(),
+                        1,
+                        "narrow crash gap keeps the top event label without colliding a second bottom label across the vertical rule: {:?}",
+                        laid.boxes
+                    );
+                }
+            }
+        }
+    }
 }

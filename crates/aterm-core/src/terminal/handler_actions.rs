@@ -526,7 +526,7 @@ impl TerminalHandler<'_> {
 
     #[inline]
     fn kitty_medium_works(&self, medium: KittyMedium) -> bool {
-        medium == KittyMedium::Direct || self.kitty_file_resolver.is_some()
+        medium == KittyMedium::Direct || self.kitty_file_resolver.installed()
     }
 
     #[inline]
@@ -2205,9 +2205,9 @@ impl TerminalHandler<'_> {
                 std::mem::take(&mut cmd.payload)
             }
         } else {
-            let resolver = self.kitty_file_resolver.as_ref()?;
+            let cap = self.kitty_file_resolver.try_mint(cmd.medium)?;
             let name = std::str::from_utf8(&cmd.payload).ok()?;
-            let bytes = resolver(cmd.medium, name)?;
+            let bytes = self.kitty_file_resolver.resolve(cap, cmd.medium, name)?;
             if bytes.is_empty() || bytes.len() > MAX_KITTY_IMAGE_BYTES {
                 return None;
             }

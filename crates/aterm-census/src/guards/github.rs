@@ -54,6 +54,8 @@ const AUTH_HEADER_CAPS: &[(&str, usize)] = &[
 const GH_SPAWN_CAPS: &[(&str, usize)] = &[
     // `DOOR_GH`, the tape door named `gh`: a const the rule's shape reads, which spawns nothing.
     ("crates/agh/src/fx/mod.rs", 1),
+    // `GH_ABSOLUTE`: `auth import --from-gh`'s one gh lookup (§12).
+    ("crates/agh/src/identity/import.rs", 1),
 ];
 
 const AGH_CLOCKS: &[(&str, ClockShape, &str)] = &[

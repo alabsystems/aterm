@@ -36,7 +36,8 @@ const PATH_CHARS: usize = 72;
 pub struct RepoWork {
     /// The repository's top-level directory, as `git rev-parse --show-toplevel` names it.
     pub repo: String,
-    /// Tracked paths with changes, staged or not.
+    /// Tracked paths with changes, staged or not (a submodule whose checkout only lags the commit
+    /// recorded for it is none).
     pub changed: usize,
     /// Untracked paths git does not ignore (a directory with nothing tracked in it is one).
     pub untracked: usize,
@@ -672,6 +673,7 @@ fn probe_reads(dir: &Path, reads: &Reads<'_>) -> Option<RepoRead> {
         reads.cut.set(true);
         return None;
     };
+    let status = without_lagging_submodules(&root, &status, excludes.as_deref(), reads);
     let branch = git(
         &root,
         &["symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -888,6 +890,9 @@ pub fn probe_hygiene(dir: &Path, home: Option<&Path>, limit: Duration) -> Option
         .unwrap_or(0)
     };
     let (worktree_bytes, temp_bytes) = probe_hygiene_disk(&root, &worktree_list, &table, reads);
+    // Last, so its reads, which share the one deadline, starve none of the others: one that runs
+    // out leaves a lagging submodule counted.
+    let status = without_lagging_submodules(&root, &status, None, reads);
     let drive_free_bytes = super::disk::volume_of(&root, &table).ok().map(|r| r.free);
     Some(
         RepoHygiene::of_git(
@@ -1018,6 +1023,205 @@ fn bounded_dir_bytes(
         }
     }
     total
+}
+
+/// The most submodules [`without_lagging_submodules`] reads one by one: any past them stay.
+const LAG_READS: usize = 8;
+
+/// How much of the end of `HEAD`'s reflog [`without_lagging_submodules`] reads: a thousand or
+/// more of its moves.
+const LAG_REFLOG: u64 = 256 * 1024;
+
+/// `status` (`git status --porcelain=v1 -z` of the repository at `root`) without each submodule
+/// whose checkout only lags its record: nothing edited or untracked in it (as far as the
+/// repository's own submodule settings let git see), and its `HEAD` the commit this checkout
+/// recorded for it at a point its own `HEAD` moved from or to, in the last [`LAG_REFLOG`] bytes of
+/// that reflog. That is what a pull, a merge or a checkout that did not update its submodules
+/// leaves: `git submodule update` loses nothing such a checkout holds, and the one commit its
+/// entry asks for would record the older commit again. A checkout at a commit this one never
+/// recorded there (a bump not yet committed, a branch switched to, a commit made in it) stays, as
+/// does every entry past the first [`LAG_READS`] submodules, every entry where that reflog is off,
+/// gone or no file (a `reftable` repository), and every entry when a read fails or is cut. The
+/// reads cost the same at any length of history, none looks into a submodule's objects, and none
+/// fetches ([`git_offline`]).
+fn without_lagging_submodules(
+    root: &Path,
+    status: &str,
+    excludes: Option<&str>,
+    reads: &Reads<'_>,
+) -> String {
+    let mut submodules = Vec::new();
+    let mut fields = status.split('\0');
+    while let Some(entry) = fields.next() {
+        let (Some(code), Some(path)) = (entry.get(..2), entry.get(3..)) else {
+            continue;
+        };
+        if code.starts_with(['R', 'C']) {
+            fields.next();
+        }
+        if code == " M"
+            && submodules.len() < LAG_READS
+            && !path.is_empty()
+            && root.join(path).join(".git").exists()
+        {
+            submodules.push(path);
+        }
+    }
+    if submodules.is_empty() {
+        return status.to_string();
+    }
+    let mut args: Vec<&str> = Vec::new();
+    if let Some(flag) = excludes {
+        args.extend(["-c", flag]);
+    }
+    args.extend([
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=normal",
+        "--",
+    ]);
+    args.extend(submodules);
+    let Some(described) = git_offline(root, &args, reads, None) else {
+        return status.to_string();
+    };
+    // `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>`: `SC..` is a submodule whose commit
+    // alone moved, `hI` the commit the index records for it.
+    let mut moved = Vec::new();
+    let mut fields = described.split('\0');
+    while let Some(entry) = fields.next() {
+        if entry.starts_with("2 ") {
+            fields.next();
+            continue;
+        }
+        let Some(rest) = entry.strip_prefix("1 ") else {
+            continue;
+        };
+        let parts: Vec<&str> = rest.splitn(8, ' ').collect();
+        if let &[".M", "SC..", _, _, _, _, recorded, path] = parts.as_slice() {
+            moved.push((path, recorded));
+        }
+    }
+    if moved.is_empty() {
+        return status.to_string();
+    }
+    let Some(reflog) = git_offline(root, &["rev-parse", "--git-path", "logs/HEAD"], reads, None)
+        .and_then(|at| reflog_tail(&root.join(at.trim_end_matches(['\n', '\r']))))
+    else {
+        return status.to_string();
+    };
+    // Each reflog line, `<old> <new> <who> <when>\t<why>`, is to `diff-tree --stdin` the commit
+    // `<old>` with `<new>` as its one parent (the list of parents ends at `<who>`): its records
+    // are the submodules' commits at both ends of that move. A line whose commit is gone gives
+    // nothing.
+    let mut args = vec![
+        "diff-tree",
+        "--stdin",
+        "-r",
+        "--raw",
+        "-z",
+        "--no-abbrev",
+        "--",
+    ];
+    args.extend(moved.iter().map(|(path, _)| *path));
+    let Some(history) = git_offline(root, &args, reads, Some(reflog)) else {
+        return status.to_string();
+    };
+    let before = records_of(&history);
+    let mut lagging = Vec::new();
+    for (path, recorded) in moved {
+        let Some(head) = git_offline(
+            &root.join(path),
+            &["rev-parse", "--verify", "--quiet", "HEAD"],
+            reads,
+            None,
+        ) else {
+            continue;
+        };
+        let head = head.trim();
+        if is_head(head) && head != recorded && before.contains(&(path, head)) {
+            lagging.push(path);
+        }
+    }
+    if lagging.is_empty() || reads.cut.get() {
+        return status.to_string();
+    }
+    let mut kept = String::with_capacity(status.len());
+    let mut fields = status.split('\0');
+    while let Some(entry) = fields.next() {
+        if entry.is_empty() {
+            continue;
+        }
+        let renamed = entry.starts_with(['R', 'C']);
+        let gone = entry
+            .strip_prefix(" M ")
+            .is_some_and(|path| lagging.contains(&path));
+        if !gone {
+            kept.push_str(entry);
+            kept.push('\0');
+        }
+        if renamed && let Some(from) = fields.next() {
+            kept.push_str(from);
+            kept.push('\0');
+        }
+    }
+    kept
+}
+
+/// The reflog file at `path`, read-only, at the first whole line of its last [`LAG_REFLOG`]
+/// bytes; `None` where it is no file or cannot be read.
+fn reflog_tail(path: &Path) -> Option<std::fs::File> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file
+        .metadata()
+        .ok()
+        .filter(std::fs::Metadata::is_file)?
+        .len();
+    let from = len.saturating_sub(LAG_REFLOG);
+    if from > 0 {
+        // From the byte before `from`: a line that starts at `from` is whole.
+        file.seek(SeekFrom::Start(from - 1)).ok()?;
+        let mut head = [0_u8; 4096];
+        let read = file.read(&mut head).ok()?;
+        let newline = head.get(..read)?.iter().position(|&b| b == b'\n')?;
+        file.seek(SeekFrom::Start(from + u64::try_from(newline).ok()?))
+            .ok()?;
+    }
+    Some(file)
+}
+
+/// The `(path, commit)` records `history` (`git diff-tree --raw -z --no-abbrev`) names: a
+/// gitlink's commit on each side of each change (`:160000 160000 <before> <after> M`, then its
+/// path, or a rename's two).
+fn records_of(history: &str) -> std::collections::HashSet<(&str, &str)> {
+    let mut records = std::collections::HashSet::new();
+    let mut fields = history.split('\0');
+    while let Some(field) = fields.next() {
+        let Some(meta) = field.trim_start_matches('\n').strip_prefix(':') else {
+            continue;
+        };
+        let &[from_mode, to_mode, from, to, change] =
+            meta.split(' ').collect::<Vec<_>>().as_slice()
+        else {
+            continue;
+        };
+        let Some(from_path) = fields.next() else {
+            break;
+        };
+        let to_path = if change.starts_with(['R', 'C']) {
+            fields.next().unwrap_or(from_path)
+        } else {
+            from_path
+        };
+        if from_mode == "160000" {
+            records.insert((from_path, from));
+        }
+        if to_mode == "160000" {
+            records.insert((to_path, to));
+        }
+    }
+    records
 }
 
 /// The work's state ([`RepoWork::state`]) of the repository at `root`: a hash of `head`, `stash`
@@ -1191,6 +1395,30 @@ impl Reads<'_> {
 }
 
 fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<String> {
+    run_git(dir, args, reads, global, false, None)
+}
+
+/// [`git`] for [`without_lagging_submodules`]: nothing it reads is fetched (`GIT_NO_LAZY_FETCH`;
+/// a git before 2.45 knows no lazy fetch to stop and ignores it), so an object a partial clone
+/// lacks fails the read, and `feed`, where given, is its standard input.
+fn git_offline(
+    dir: &Path,
+    args: &[&str],
+    reads: &Reads<'_>,
+    feed: Option<std::fs::File>,
+) -> Option<String> {
+    run_git(dir, args, reads, false, true, feed)
+}
+
+/// [`git_as`], or with `offline` [`git_offline`].
+fn run_git(
+    dir: &Path,
+    args: &[&str],
+    reads: &Reads<'_>,
+    global: bool,
+    offline: bool,
+    feed: Option<std::fs::File>,
+) -> Option<String> {
     let deadline = reads.deadline.get();
     #[cfg(test)]
     let deadline = deadline
@@ -1225,17 +1453,25 @@ fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<
         cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("XDG_CONFIG_HOME", "/dev/null");
     }
-    let output = match aterm_uds::deadline::output_until_complete_stdout(&mut cmd, deadline) {
-        Ok(output) => output,
-        // No `git` here: the probe cannot run, and reads clean.
-        Err(aterm_uds::deadline::CompleteOutputError::Run(
-            aterm_uds::deadline::RunError::Spawn(e),
-        )) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(_) => {
-            reads.cut.set(true);
-            return None;
-        }
-    };
+    if offline {
+        cmd.env("GIT_NO_LAZY_FETCH", "1");
+    }
+    let stdin = feed.map_or_else(
+        aterm_uds::spawnfd::Stdio::null,
+        aterm_uds::spawnfd::Stdio::from,
+    );
+    let output =
+        match aterm_uds::deadline::output_until_complete_stdout_from(&mut cmd, stdin, deadline) {
+            Ok(output) => output,
+            // No `git` here: the probe cannot run, and reads clean.
+            Err(aterm_uds::deadline::CompleteOutputError::Run(
+                aterm_uds::deadline::RunError::Spawn(e),
+            )) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => {
+                reads.cut.set(true);
+                return None;
+            }
+        };
     reads.ended();
     if output.status.code().is_none() {
         // A signal ended it: what it would have said is not known.

@@ -538,30 +538,37 @@ fn harness_update_rows(
             .map(|row| format!("{} · {}", row.title, row.detail))
             .unwrap_or_else(|| "Not read yet. Open AI CLI versions to refresh.".to_string())
     };
-    vec![
-        (
-            "Claude harness".to_string(),
-            // The Claude Code harness's own version, built into this aterm build.
-            format!(
-                "v{} (built-in) · in aterm {} ({})",
-                aterm_phase::CliHarness::ClaudeCode.version_str(),
-                crate::build_info::version(),
-                crate::build_info::git_commit()
-            ),
-        ),
+    // Every harness by the name its top rule reads (`alab <cli> harness`), with its own version,
+    // built into this aterm build.
+    let mut rows: Vec<(String, String)> = aterm_phase::CliHarness::ALL
+        .iter()
+        .map(|h| {
+            (
+                format!("alab {} harness", h.cli()),
+                format!(
+                    "v{} (built-in) · in aterm {} ({})",
+                    h.version_str(),
+                    crate::build_info::version(),
+                    crate::build_info::git_commit()
+                ),
+            )
+        })
+        .collect();
+    rows.extend([
         ("aterm updates".to_string(), update.headline.clone()),
         ("CLI observations".to_string(), harness.ai.health.clone()),
         ("Claude CLI".to_string(), cli("claude")),
         ("Codex CLI".to_string(), cli("codex")),
         (
             "Delivery".to_string(),
-            "Claude's harness updates with aterm. Published CLI builds arrive through Packages. Sessions resume on a replacement when it is safe.".to_string(),
+            "Each alab harness updates with aterm. Published CLI builds arrive through Packages. Sessions resume on a replacement when it is safe.".to_string(),
         ),
         (
             "This session".to_string(),
             "In codex-alab, /alab update shows the running build and pending update. codex --version and claude --version show the installed CLI.".to_string(),
         ),
-    ]
+    ]);
+    rows
 }
 
 /// Existing update and version pages remain the places that check, install, and report failures.

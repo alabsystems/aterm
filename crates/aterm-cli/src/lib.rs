@@ -3,6 +3,11 @@
 
 //! `aterm`'s front door: `--help`, the verb roster, the diagnostic subcommands
 //! (`doctor`, `show-config`, …) and the plain PTY shell session.
+// The setup run's ledger carries `aterm_spec_anchor::refines` anchors, all in macOS code.
+#![cfg_attr(
+    all(anchor_rules, target_os = "macos", any(test, debug_assertions)),
+    feature(macro_attr)
+)]
 #![cfg_attr(
     test,
     allow(
@@ -33,6 +38,10 @@ mod manual;
 mod spotlight;
 
 pub mod amacs_launch;
+
+/// The git-and-friends shim dispatch: what the one `aterm` binary does run as `git`, `cc`, … on
+/// a Mac whose Command Line Tools are still installing.
+pub mod clt_shim;
 
 mod cli_text;
 
@@ -200,8 +209,8 @@ pub enum Verb {
     Harness,
     /// `aterm keeper` — the PTY keeper (`start | stop | status | serve`).
     Keeper,
-    /// `aterm caffeine` — the macOS menu-bar keep-awake helper.
-    Caffeine,
+    /// `aterm acaffiene` — the macOS menu-bar keep-awake helper.
+    Acaffiene,
     /// `aterm theme` — list, check, create, export, import, pack and install themes.
     Theme,
     /// `aterm edit` — amacs editor (also the `amacs` argv0 alias).
@@ -236,7 +245,7 @@ impl Verb {
         Verb::Db,
         Verb::Harness,
         Verb::Keeper,
-        Verb::Caffeine,
+        Verb::Acaffiene,
         Verb::Theme,
         Verb::Edit,
         Verb::NewTab,
@@ -266,7 +275,7 @@ impl Verb {
             Verb::Db => "db",
             Verb::Harness => "harness",
             Verb::Keeper => "keeper",
-            Verb::Caffeine => "caffeine",
+            Verb::Acaffiene => "acaffiene",
             Verb::Theme => "theme",
             Verb::Edit => "edit",
             Verb::NewTab => "new-tab",
@@ -299,7 +308,7 @@ impl Verb {
             | Verb::Db
             | Verb::Harness
             | Verb::Keeper
-            | Verb::Caffeine
+            | Verb::Acaffiene
             | Verb::Theme
             | Verb::NewTab
             | Verb::NewWindow
@@ -332,7 +341,7 @@ impl Verb {
             | Verb::Db
             | Verb::Harness
             | Verb::Keeper
-            | Verb::Caffeine
+            | Verb::Acaffiene
             | Verb::Theme
             | Verb::Edit => false,
         }
@@ -362,7 +371,7 @@ impl Verb {
             Verb::Db => "aterm db <cmd> --dir <database>",
             Verb::Harness => "aterm harness <cmd>",
             Verb::Keeper => "aterm keeper <cmd>",
-            Verb::Caffeine => "aterm caffeine [<cmd>]",
+            Verb::Acaffiene => "aterm acaffiene [<cmd>]",
             Verb::Theme => "aterm theme <cmd>",
             Verb::Edit => "aterm edit [+L[:C]] <file>...",
             Verb::NewTab => "aterm new-tab [-d dir]",
@@ -443,8 +452,9 @@ impl Verb {
                 "Restore aterm's commands and shell integration",
                 "(over SSH too); at this Mac's console, set its",
                 "keyboard, scrolling, widgets, Dock and accounts.",
-                "Join the secrets vault; init.toml adds GitHub",
-                "authentication and clones. Current macOS user.",
+                "Join the secrets vault; clone your own GitHub",
+                "repositories. Current user. Linux: the base,",
+                "vault and repositories only.",
                 "`--develop`: fast-forward recorded checkouts and",
                 "provision their test tools, no settings.",
             ],
@@ -471,7 +481,7 @@ impl Verb {
                 "a crashed window's shells live on (start | stop |",
                 "status | serve). macOS only, opt-in.",
             ],
-            Verb::Caffeine => &[
+            Verb::Acaffiene => &[
                 "The menu-bar keep-awake mug: a click keeps this",
                 "Mac awake, a right click picks 1, 8 or 24 hours or",
                 "forever (on | off | status | startup …). macOS.",
@@ -667,7 +677,8 @@ fn explain_config_report() -> String {
          \x20              attach; writes only to temp dirs and shell history; no credential\n\
          \x20              stores or private data; no mach service lookups but user and\n\
          \x20              group queries, so open, osascript, pbcopy and the keychain do\n\
-         \x20              nothing. Safety's caps, as hard limits.\n",
+         \x20              nothing. launchd still restarts, unloads or disables the\n\
+         \x20              user's own jobs when asked. Safety's caps, as hard limits.\n",
     );
     out.push_str("  safety       Soft resource caps (binding on Windows), no OS sandbox.\n");
     out.push_str("  user         No sandbox, no extra limits (the default).\n");
@@ -1208,7 +1219,27 @@ fn probe_reason(label: ProbeLabel) -> String {
     }
 }
 
-fn privacy_row(facts: &PrivacyFacts) -> (Mark, String) {
+/// What the `privacy:` row leaves for after doctor's report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivacyNext {
+    /// Nothing: the grant reads on, or it went unmeasured.
+    Nothing,
+    /// Full Disk Access reads off: hand it to the aterm window's permission walk, or, with no
+    /// window, open its page and watch for the switch ([`permissions_hand_over`]).
+    HandOver,
+}
+
+fn privacy_row(facts: &PrivacyFacts) -> (Mark, String, PrivacyNext) {
+    let (mark, fact) = privacy_words(facts);
+    let next = if !facts.fda_label.refused() && facts.fda == FdaState::Denied {
+        PrivacyNext::HandOver
+    } else {
+        PrivacyNext::Nothing
+    };
+    (mark, fact, next)
+}
+
+fn privacy_words(facts: &PrivacyFacts) -> (Mark, String) {
     let who = facts.responsible.as_deref().unwrap_or("unknown");
     let churns = matches!(facts.dr, DrClass::Cdhash | DrClass::Unsigned);
     let dev = if churns {
@@ -1416,6 +1447,8 @@ struct FactReads<'a> {
     devtools: &'a (dyn Fn(bool, bool) -> (DevtoolsFacts, Option<atpkg::devtools::Facts>) + Sync),
     /// [`spotlight::facts`].
     spotlight: &'a (dyn Fn() -> Option<Result<spotlight::Spotlit, String>> + Sync),
+    /// [`services_fact`].
+    services: &'a (dyn Fn() -> Option<Result<aterm_uds::services::Reading, String>> + Sync),
     /// [`privacy_facts`].
     privacy: &'a (dyn Fn() -> PrivacyFacts + Sync),
     /// [`debugger_facts`].
@@ -1424,6 +1457,8 @@ struct FactReads<'a> {
     instances: &'a (dyn Fn() -> Result<aterm_ctl::census::Census, String> + Sync),
     /// [`fabric_fact`], given why every program's command line goes unread.
     fabric: &'a (dyn Fn(Option<&str>) -> FabricFact + Sync),
+    /// [`person_here`]: a hand-over may follow the report.
+    person_here: &'a (dyn Fn() -> bool + Sync),
 }
 
 /// The fabric's row as [`fabric_fact`] reads it: its mark, its fact, and whether it went
@@ -1435,25 +1470,74 @@ impl FactReads<'static> {
         program_check: &program_check_fact,
         devtools: &devtools_facts,
         spotlight: &spotlight::facts,
+        services: &services_fact,
         privacy: &privacy_facts,
         debugger: &debugger_facts,
         instances: &instances_fact,
         fabric: &fabric_fact,
+        person_here: &person_here,
     };
 }
 
+/// A person at this Mac's console reads doctor's stdout ([`console_absence`], and a stdout
+/// that is a terminal): a page may be brought up for them after the report.
+fn person_here() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdout().is_terminal() && console_absence().is_none()
+}
+
+/// The grants `aterm doctor` hands over after its report: Full Disk Access when the
+/// `privacy:` row reads it off ([`PrivacyNext::HandOver`]), Developer Tools when its hand-over
+/// is due ([`devtools_hand_over_due`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Missing {
+    /// Full Disk Access reads off.
+    pub(crate) fda: bool,
+    /// Developer Tools' facts, when its hand-over is due.
+    pub(crate) devtools: Option<atpkg::devtools::Facts>,
+}
+
+impl Missing {
+    /// The hand-over due after a report, when there is one.
+    fn due(self) -> Option<Self> {
+        (self.fda || self.devtools.is_some()).then_some(self)
+    }
+
+    /// The walk's subjects, in its order: `permissions walk now <words>`.
+    fn words(&self) -> String {
+        [
+            self.fda.then_some("fda"),
+            self.devtools.is_some().then_some("devtools"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
+    }
+
+    /// The pages, as a person reads them.
+    fn pages(&self) -> &'static str {
+        match (self.fda, self.devtools.is_some()) {
+            (true, true) => "Full Disk Access, then Developer Tools",
+            (true, false) => "Full Disk Access",
+            _ => "Developer Tools",
+        }
+    }
+}
+
 /// `aterm doctor`'s own rows that `reads` names (the shell's always), each probe on a thread
-/// of its own, and the Developer Tools facts when the hand-over is due after the report
-/// ([`devtools_hand_over_due`]). Nothing here waits on a person or opens a pane.
+/// of its own, and the grants to hand over after the report ([`Missing`]). Nothing here waits
+/// on a person or opens a pane.
 fn doctor_facts_rows(fix: bool, reads: &dyn Fn(&str) -> bool) -> FactsRead {
     facts_rows_over(fix, reads, &FactReads::LIVE)
 }
 
-/// What [`facts_rows_over`] read: the rows, the Developer Tools hand-over due after the report,
-/// and whether Spotlight indexes `rust-docs` pages ([`spotlight::Spotlit::docs_indexed`]).
+/// What [`facts_rows_over`] read: the rows, the grants to hand over after the report
+/// ([`Missing`]), and whether Spotlight indexes `rust-docs` pages
+/// ([`spotlight::Spotlit::docs_indexed`]).
 struct FactsRead {
     rows: Vec<DoctorRow>,
-    hand_over: Option<atpkg::devtools::Facts>,
+    hand_over: Option<Missing>,
     rust_docs: bool,
 }
 
@@ -1479,6 +1563,7 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
         let devtools =
             reads("devtools:").then(|| scope.spawn(move || (ports.devtools)(fix, check_full)));
         let spotlight = reads("spotlight:").then(|| scope.spawn(ports.spotlight));
+        let services = reads("services:").then(|| scope.spawn(ports.services));
         let privacy = reads("privacy:").then(|| scope.spawn(ports.privacy));
         let debugger = reads("debugger:").then(|| scope.spawn(ports.debugger));
         let instances = reads("instances:").then(|| {
@@ -1502,6 +1587,8 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
             console_host: reads("conpty:").then(console_host_fact).flatten(),
             fabric: fabric.and_then(join),
             spotlight: spotlight.and_then(join),
+            services: services.and_then(join),
+            shim_cache: reads("services:").then(shim_cache_fact).flatten(),
             program_check,
             ..MachineFacts::absent()
         };
@@ -1514,7 +1601,15 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
             join,
         );
         let instances = instances.map_or_else(unread, join);
-        let (devtools, hand_over) = devtools.map_or_else(|| (DevtoolsFacts::absent(), None), join);
+        let (devtools, devtools_due) =
+            devtools.map_or_else(|| (DevtoolsFacts::absent(), None), join);
+        let fda_due =
+            fix && privacy_row(&privacy).2 == PrivacyNext::HandOver && (ports.person_here)();
+        let hand_over = Missing {
+            fda: fda_due,
+            devtools: devtools_due,
+        }
+        .due();
         let rust_docs = machine
             .spotlight
             .as_ref()
@@ -1596,6 +1691,10 @@ struct MachineFacts {
     /// macOS: one look at the program check's pool
     /// ([`aterm_uds::program_check::look`]).
     program_check: Option<aterm_uds::program_check::Look>,
+    /// macOS: what its own services hold ([`services_fact`]).
+    services: Option<Result<aterm_uds::services::Reading, String>>,
+    /// macOS: the cache root plain `targo` builds in ([`shim_cache_fact`]).
+    shim_cache: Option<std::path::PathBuf>,
 }
 
 impl MachineFacts {
@@ -1606,6 +1705,8 @@ impl MachineFacts {
             fabric: None,
             spotlight: None,
             program_check: None,
+            services: None,
+            shim_cache: None,
         }
     }
 }
@@ -1618,6 +1719,128 @@ fn instances_fact() -> Result<aterm_ctl::census::Census, String> {
 fn program_check_fact() -> Option<aterm_uds::program_check::Look> {
     cfg!(target_os = "macos")
         .then(|| aterm_uds::program_check::look(aterm_uds::program_check::PS_HANG))
+}
+
+/// macOS: one unprivileged read of what its own services hold ([`aterm_uds::services::read`]);
+/// `None` elsewhere.
+fn services_fact() -> Option<Result<aterm_uds::services::Reading, String>> {
+    cfg!(target_os = "macos").then(|| {
+        aterm_uds::services::read()
+            .ok_or_else(|| "the process table or the machine's memory could not be read".to_owned())
+    })
+}
+
+/// macOS: the cache root plain `targo` builds in, as the `targo` shim on `PATH` names it
+/// (`aterm_toolchain::build_cache::shim_root`); `None` elsewhere and with no home.
+fn shim_cache_fact() -> Option<std::path::PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let home = aterm_types::dirs::home_dir()?;
+    Some(atpkg::build_cache::shim_root(
+        &home,
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ))
+}
+
+/// Why fseventsd hears nothing of a `.ubd` folder.
+const QUIET_WHY: &str = "whose file events fseventsd drops before it delivers or keeps them \
+                         (observed on macOS 27.0, documented nowhere)";
+
+/// The `services:` row's last line once the services were read: what aterm keeps from
+/// fseventsd by where it puts its own files (`aterm_tempfile::QUIET`), the build cache only
+/// where the `targo` shim on `PATH` builds in a quiet folder (`shim_cache`).
+fn services_prevented(shim_cache: Option<&std::path::Path>) -> String {
+    match shim_cache {
+        Some(root) if aterm_tempfile::is_quiet(root) => format!(
+            "prevented: aterm's build cache, verify's side lanes, release targets and test \
+             scratch sit in .ubd folders, {QUIET_WHY}"
+        ),
+        Some(root) => format!(
+            "prevented in part: verify's side lanes, release targets and test scratch sit in \
+             .ubd folders, {QUIET_WHY}; the targo shim on PATH still builds in {}, outside one, \
+             until an aterm update lays the new shim",
+            root.display()
+        ),
+        None => format!(
+            "prevented: verify's side lanes, release targets and test scratch sit in .ubd \
+             folders, {QUIET_WHY}"
+        ),
+    }
+}
+
+/// The `services:` row: each of macOS's services past the bar any service needs
+/// ([`aterm_vitals::services`]) with the restart aterm knows for it, else the largest, then
+/// what aterm prevents ([`services_prevented`]).
+fn services_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
+    use aterm_vitals::services::{Size, large_bar, restart_of, size};
+    use aterm_vitals::words::mem;
+    let Some(read) = &facts.services else {
+        return Vec::new();
+    };
+    let name = |s: &aterm_uds::services::Service| aterm_vitals::sys::exe_word(&s.name).to_owned();
+    let (mark, mut fact, unmeasured) = match read {
+        Err(why) => (
+            Mark::Note,
+            format!("what macOS's services hold could not be read ({why})"),
+            true,
+        ),
+        Ok(r) => {
+            let bar = mem(large_bar(r.total));
+            let over: Vec<String> = r
+                .services
+                .iter()
+                .filter(|s| size(s.footprint, r.total) != Size::Usual)
+                .map(|s| {
+                    let then = restart_of(s).map_or_else(
+                        || {
+                            "aterm knows no safe restart for it: restart the Mac once your work \
+                             is saved"
+                                .to_owned()
+                        },
+                        |restart| {
+                            format!(
+                                "restart it: `aterm init --only {}` (one password prompt)",
+                                restart.init
+                            )
+                        },
+                    );
+                    format!(
+                        "{} holds {}, past the {bar} any service needs\n{then}",
+                        name(s),
+                        mem(s.footprint)
+                    )
+                })
+                .collect();
+            match (over.is_empty(), r.services.first()) {
+                (false, _) => (Mark::Warn, over.join("\n"), false),
+                (true, Some(top)) => (
+                    Mark::Ok,
+                    format!(
+                        "each holds under {bar}; the largest, {}, holds {}",
+                        name(top),
+                        mem(top.footprint)
+                    ),
+                    false,
+                ),
+                (true, None) => (
+                    Mark::Note,
+                    "no service of macOS's own accounts was read".to_owned(),
+                    true,
+                ),
+            }
+        }
+    };
+    if read.is_ok() {
+        fact.push('\n');
+        fact.push_str(&services_prevented(facts.shim_cache.as_deref()));
+    }
+    vec![DoctorRow {
+        label: "services:",
+        mark,
+        fact,
+        unmeasured,
+    }]
 }
 
 fn args_read_withheld(look: Option<&aterm_uds::program_check::Look>) -> Option<String> {
@@ -1816,14 +2039,19 @@ const fn console_absence() -> Option<&'static str> {
     Some("this is not a Mac")
 }
 
-/// `aterm doctor`'s Developer Tools hand-over, after its report ([`doctor::answer`]), over
-/// the live reach: the window, System Settings, the markers, a wait for the switch that Enter
-/// ends ([`enter_pressed`]), and stderr for its lines.
-fn devtools_hand_over_live(facts: &atpkg::devtools::Facts) {
+/// `aterm doctor`'s hand-over, after its report ([`doctor::answer`]), over the live reach: the
+/// window and its permission walk, System Settings, the markers, the waits for a switch that
+/// Enter ends ([`enter_pressed`]), and stderr for its lines.
+fn permissions_hand_over_live(missing: &Missing) {
     use atpkg::devtools as dt;
-    let subject = facts.subject.clone().unwrap_or_default();
+    let subject = missing
+        .devtools
+        .as_ref()
+        .and_then(|facts| facts.subject.clone())
+        .unwrap_or_default();
     let version = aterm_types::version::app_version();
     let reach = DevtoolsReach {
+        ask_walk: &ask_window_for_walk,
         ask_window: &ask_window_for_devtools,
         list_terminal: &dt::list_terminal,
         open_pane: &dt::open_pane,
@@ -1840,40 +2068,297 @@ fn devtools_hand_over_live(facts: &atpkg::devtools::Facts) {
             list.listing == aterm_containment::DevToolListing::On
         },
         refresh_verdict: &dt::refresh_verdict,
+        open_fda_pane: &open_fda_pane,
+        await_fda_on: &await_fda_on,
         local_day: &|at| local_day_words(at, i64::try_from(at).ok().and_then(local_offset_at)),
         say: &|words| eprintln!("{words}"),
     };
-    devtools_hand_over_after(facts, &reach);
+    permissions_hand_over_after(missing, &reach);
 }
 
-/// The hand-over over `reach` ([`devtools_hand_over`]), then the one line that says what it
-/// did: the report is already out, so nothing it did is a row.
+/// The hand-over over `reach` ([`permissions_hand_over`]), then a line for each thing it did:
+/// the report is already out, so nothing it did is a row.
+fn permissions_hand_over_after(missing: &Missing, reach: &DevtoolsReach<'_>) {
+    for did in permissions_hand_over(missing, reach) {
+        (reach.say)(&format!("aterm doctor: {did}"));
+    }
+}
+
+/// The Developer Tools hand-over alone over `reach` ([`devtools_hand_over`]), as an aterm
+/// window older than the permission walk takes it, then its one line.
+#[cfg(test)]
 fn devtools_hand_over_after(facts: &atpkg::devtools::Facts, reach: &DevtoolsReach<'_>) {
     let (did, _) = devtools_hand_over(facts, reach);
     (reach.say)(&format!("aterm doctor: {did}"));
 }
 
-/// Set once Enter is pressed at this terminal: a line read on stdin, read only while stdin is
-/// a terminal this process's group holds in the foreground, so a closed or redirected stdin
-/// never ends the wait and a background job (`aterm doctor &`) is never stopped by `SIGTTIN`.
-/// It ends doctor's wait for the switch early; the reading thread is left to the process's
-/// end.
-fn enter_pressed() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-    use std::io::IsTerminal as _;
-    let pressed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if std::io::stdin().is_terminal() && stdin_in_foreground() {
-        let seen = std::sync::Arc::clone(&pressed);
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            if std::io::stdin()
-                .read_line(&mut line)
-                .is_ok_and(|read| read > 0)
-            {
-                seen.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
+/// Hand every grant doctor found missing to the running aterm window's permission walk
+/// (`permissions walk now <subjects>`): one panel beside System Settings takes the person from
+/// page to page, each turning to the next once its switch reads on, so doctor opens nothing
+/// and waits for nothing. Where no walk takes them (no window, no answer, a window whose
+/// reading has them held already) doctor opens each page itself and waits for its switch; a
+/// window older than the walk takes Developer Tools through its own verb
+/// ([`devtools_hand_over`]). Returns what it did, a line each.
+fn permissions_hand_over(missing: &Missing, reach: &DevtoolsReach<'_>) -> Vec<String> {
+    let here = |missing: &Missing, reach: &DevtoolsReach<'_>| {
+        let mut did = Vec::new();
+        if missing.fda {
+            did.push(fda_open_here(reach));
+        }
+        if let Some(facts) = &missing.devtools {
+            did.push(devtools_open_here(facts, reach, true).0);
+        }
+        did
+    };
+    let reply = match (reach.ask_walk)(&missing.words()) {
+        WindowAnswer::Unreachable | WindowAnswer::Unanswered(_) => return here(missing, reach),
+        WindowAnswer::Reply(reply) => reply,
+    };
+    let reply = reply.trim_end();
+    if reply.starts_with("OK walking") {
+        // A walk already under way answers with its own pages, which may leave out one doctor
+        // asked for: the window reads that grant held (another app holds doctor's grant, the
+        // terminal running it), as `OK granted` says, so doctor opens that page itself.
+        let walked = |word: &str| walk_names(reply, word);
+        let left = Missing {
+            fda: missing.fda && !walked("fda"),
+            devtools: missing.devtools.clone().filter(|_| !walked("devtools")),
+        };
+        let taken = Missing {
+            fda: missing.fda && !left.fda,
+            devtools: missing.devtools.clone().filter(|_| left.devtools.is_none()),
+        };
+        let mut did = Vec::new();
+        if taken.fda || taken.devtools.is_some() {
+            did.push(format!(
+                "the aterm window walks you through {} beside System Settings: each page turns \
+                 to the next once its switch reads on, and its Not now skips it",
+                taken.pages()
+            ));
+        }
+        did.extend(here(&left, reach));
+        return did;
     }
-    pressed
+    if reply == "OK granted" {
+        // The window's reading has them held, doctor's a moment ago did not: the window's is
+        // older, or another app (the terminal running doctor) is the one without them.
+        return here(missing, reach);
+    }
+    if reply.starts_with("ERR unknown verb") {
+        let mut did = Vec::new();
+        if missing.fda {
+            did.push(fda_open_here(reach));
+        }
+        if let Some(facts) = &missing.devtools {
+            did.push(devtools_hand_over(facts, reach).0);
+        }
+        return did;
+    }
+    if reply.starts_with("ERR headless") {
+        return vec![
+            "did nothing: the aterm instance doctor reached is headless, so no page opens"
+                .to_string(),
+        ];
+    }
+    if reply == "OK declined" {
+        return vec![
+            "did nothing: you said Not now to these pages; System State's Permissions rows in \
+             the aterm window open them again"
+                .to_string(),
+        ];
+    }
+    if reply == "OK recent" {
+        return vec![
+            "did nothing: the aterm window walked these pages within the last minute".to_string(),
+        ];
+    }
+    vec![format!("did nothing: the aterm window answered `{reply}`")]
+}
+
+/// `aterm init`'s hand-over of the grants its Permissions phase left to the person
+/// (`aterm_machines::init::Host::walk`): the running window's permission walk takes them, for a
+/// person at this Mac's console reading the run. The line to print once it does; `None` where
+/// no walk takes them, and the rows' own words stand.
+#[must_use]
+pub fn init_permissions_walk(missing: &[aterm_types::macos_setup::Access]) -> Option<String> {
+    init_walk_over(missing, person_here(), &ask_window_for_walk)
+}
+
+/// [`init_permissions_walk`] over a person's presence and the window's answer.
+fn init_walk_over(
+    missing: &[aterm_types::macos_setup::Access],
+    here: bool,
+    ask_walk: &dyn Fn(&str) -> WindowAnswer,
+) -> Option<String> {
+    let walked: Vec<aterm_types::macos_setup::Access> = missing
+        .iter()
+        .copied()
+        .filter(|access| walks(*access))
+        .collect();
+    if !here || walked.is_empty() {
+        return None;
+    }
+    let words: Vec<&str> = walked.iter().map(|access| access.word()).collect();
+    let WindowAnswer::Reply(reply) = ask_walk(&words.join(" ")) else {
+        return None;
+    };
+    // A walk already under way names its own pages: only those it takes are the window's.
+    let names: Vec<&str> = walked
+        .iter()
+        .filter(|access| walk_names(&reply, access.word()))
+        .map(|access| access.name())
+        .collect();
+    (!names.is_empty()).then(|| {
+        format!(
+            "the aterm window walks you through {} beside System Settings: each page turns to \
+             the next once its switch reads on",
+            names.join(", then ")
+        )
+    })
+}
+
+/// Whether the window's `OK walking <subject>…` answer names `word`'s page: the walk's own word
+/// (`fda`, `devtools`, `accessibility`, `debugger`), or a Permissions row's
+/// (`full-disk-access`, `developer-tools`), which the walk answers with its own.
+fn walk_names(reply: &str, word: &str) -> bool {
+    fn own(word: &str) -> &str {
+        match word {
+            "full-disk-access" => "fda",
+            "developer-tools" => "devtools",
+            other => other,
+        }
+    }
+    reply
+        .trim_end()
+        .strip_prefix("OK walking")
+        .is_some_and(|walking| {
+            walking
+                .split_whitespace()
+                .any(|walked| own(walked) == own(word))
+        })
+}
+
+/// Whether the window's permission walk has a step for `access`: Local Network has no switch to
+/// turn (macOS asks it on a program's first look at the network), so it stays a row of its own.
+const fn walks(access: aterm_types::macos_setup::Access) -> bool {
+    use aterm_types::macos_setup::Access;
+    match access {
+        Access::FullDiskAccess
+        | Access::DeveloperTools
+        | Access::Accessibility
+        | Access::Debugger => true,
+        Access::LocalNetwork => false,
+    }
+}
+
+/// The banner doctor prints before it opens Full Disk Access itself.
+const FDA_BANNER: &str = "aterm doctor: switch on aterm (or the terminal running this) in \
+                          System Settings \u{25b8} Privacy & Security \u{25b8} Full Disk Access, \
+                          so macOS stops interrupting programs run here with consent dialogs";
+
+/// The line printed while doctor waits for Full Disk Access to read on.
+const FDA_WAIT_LINE: &str = "aterm doctor: waiting up to 2 min for Full Disk Access to read on \
+                             (Enter or ctrl-c ends the wait; the report above stands)\u{2026}";
+
+/// Open Full Disk Access from doctor, after its report, and wait for its switch.
+fn fda_open_here(reach: &DevtoolsReach<'_>) -> String {
+    (reach.say)(FDA_BANNER);
+    if let Err(why) = (reach.open_fda_pane)() {
+        return format!("could not open Full Disk Access: {why}");
+    }
+    (reach.say)(FDA_WAIT_LINE);
+    if (reach.await_fda_on)() {
+        "opened Full Disk Access; you switched it on".to_string()
+    } else {
+        "opened Full Disk Access; not switched on while doctor waited".to_string()
+    }
+}
+
+/// `/usr/bin/open` at Privacy & Security ▸ Full Disk Access.
+#[cfg(target_os = "macos")]
+fn open_fda_pane() -> Result<(), String> {
+    let mut command = aterm_uds::spawnfd::command("/usr/bin/open");
+    command.arg(aterm_machines::items::person::PANE_FULL_DISK_ACCESS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    match aterm_uds::deadline::output_until(&mut command, deadline) {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(format!(
+            "open exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// No Full Disk Access page to open off macOS; the hand-over is never due there
+/// ([`console_absence`]).
+#[cfg(not(target_os = "macos"))]
+fn open_fda_pane() -> Result<(), String> {
+    Err("Full Disk Access is macOS's".to_owned())
+}
+
+/// How often doctor reads Full Disk Access while it waits for the switch.
+const FDA_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Read Full Disk Access every [`FDA_POLL`] for up to [`DEVTOOLS_WAIT`], or until Enter:
+/// `true` once it reads on.
+fn await_fda_on() -> bool {
+    let entered = enter_pressed();
+    let until = std::time::Instant::now() + DEVTOOLS_WAIT;
+    loop {
+        if aterm_containment::probe_fda(ProbeGate::on()).state == FdaState::Granted {
+            return true;
+        }
+        if entered.load(std::sync::atomic::Ordering::Relaxed) || std::time::Instant::now() >= until
+        {
+            return false;
+        }
+        std::thread::sleep(FDA_POLL);
+    }
+}
+
+/// Whether Enter was pressed at this terminal since the wait that holds it began
+/// ([`enter_pressed`]).
+struct EnterSince(u64);
+
+impl EnterSince {
+    fn load(&self, order: std::sync::atomic::Ordering) -> bool {
+        enters().load(order) > self.0
+    }
+}
+
+/// How many lines were read on this terminal's stdin so far, by the one reader thread the first
+/// wait starts: read only while stdin is a terminal this process's group holds in the
+/// foreground, so a closed or redirected stdin never ends a wait and a background job (`aterm
+/// doctor &`) is never stopped by `SIGTTIN`. One reader for the process, so a later wait (the
+/// Developer Tools switch after Full Disk Access) hears its own Enter, never a reader the earlier
+/// wait left blocked on stdin; the thread is left to the process's end.
+fn enters() -> &'static std::sync::atomic::AtomicU64 {
+    use std::io::IsTerminal as _;
+    static LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static READER: std::sync::Once = std::sync::Once::new();
+    READER.call_once(|| {
+        if std::io::stdin().is_terminal() && stdin_in_foreground() {
+            std::thread::spawn(|| {
+                let mut line = String::new();
+                while std::io::stdin()
+                    .read_line(&mut line)
+                    .is_ok_and(|read| read > 0)
+                {
+                    line.clear();
+                    LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    &LINES
+}
+
+/// Set once Enter is pressed at this terminal after this call ([`enters`]): it ends doctor's
+/// wait for a switch early.
+fn enter_pressed() -> EnterSince {
+    EnterSince(enters().load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Whether this process's group is the foreground group of the terminal on stdin; a read
@@ -1917,6 +2402,18 @@ fn ask_window_for_devtools() -> WindowAnswer {
     ))
 }
 
+/// Ask the running aterm window to walk the person through `subjects`
+/// (`permissions walk now <subjects>`).
+fn ask_window_for_walk(subjects: &str) -> WindowAnswer {
+    let Some(sock) = aterm_ctl::front_door_instance() else {
+        return WindowAnswer::Unreachable;
+    };
+    window_answer(aterm_ctl::front_door_send(
+        &sock,
+        &format!("permissions walk now {subjects}\n"),
+    ))
+}
+
 fn window_answer(sent: std::io::Result<String>) -> WindowAnswer {
     match sent {
         Ok(reply) if aterm_ctl::front_door_refused(&reply) => WindowAnswer::Unreachable,
@@ -1929,8 +2426,11 @@ fn window_answer(sent: std::io::Result<String>) -> WindowAnswer {
 }
 
 struct DevtoolsReach<'a> {
+    /// Ask the running aterm window's permission walk to take these subjects
+    /// ([`ask_window_for_walk`]).
+    ask_walk: &'a dyn Fn(&str) -> WindowAnswer,
     /// Ask the running aterm window ([`ask_window_for_devtools`]), for a person at
-    /// this terminal (`now`).
+    /// this terminal (`now`): a window older than the walk.
     ask_window: &'a dyn Fn() -> WindowAnswer,
     /// [`atpkg::devtools::list_terminal`].
     list_terminal: &'a dyn Fn() -> Result<(), String>,
@@ -1949,6 +2449,10 @@ struct DevtoolsReach<'a> {
     /// switch read on (the running aterm, checked before, keeps that verdict until a
     /// fresh aterm process asks).
     refresh_verdict: &'a dyn Fn() -> Result<(), String>,
+    /// [`open_fda_pane`].
+    open_fda_pane: &'a dyn Fn() -> Result<(), String>,
+    /// [`await_fda_on`].
+    await_fda_on: &'a dyn Fn() -> bool,
     /// A unix time as the calendar day it fell on here ([`local_day_words`]).
     local_day: &'a dyn Fn(u64) -> String,
     /// Where the banner, the wait line and the did-line go: stderr, after the report
@@ -2252,7 +2756,8 @@ fn front_door_alias(name: &str, first: &str) -> Option<aterm_ctl::census::Verb> 
         | AliasRoute::Link
         | AliasRoute::Askpass
         | AliasRoute::MachinesAskpass
-        | AliasRoute::Amacs => Some(Census::Program),
+        | AliasRoute::Amacs
+        | AliasRoute::CommandLineToolsShim => Some(Census::Program),
         AliasRoute::FrontDoor => None,
     }
 }
@@ -2429,7 +2934,7 @@ fn doctor_rows(
         unmeasured: false,
     }];
     if privacy.fda_label != ProbeLabel::UnsupportedPlatform {
-        let (mark, fact) = privacy_row(privacy);
+        let (mark, fact, _) = privacy_row(privacy);
         checks.push(DoctorRow {
             label: "privacy:",
             mark,
@@ -2476,6 +2981,7 @@ fn doctor_rows(
     checks.extend(copies_rows(machine));
     checks.extend(spotlight_rows(machine));
     checks.extend(program_check_rows(machine));
+    checks.extend(services_rows(machine));
     checks.extend(console_host_rows(machine));
     let (instances_mark, instances_fact) = instances_row(instances);
     let (recovery_mark, recovery_fact) = recovery_row(recovery);
@@ -5241,6 +5747,106 @@ mod tests {
         assert!(!r.contains("syspolicyd:"), "{r}");
     }
 
+    /// The `services:` row names each of macOS's services past the bar and the restart aterm
+    /// knows for it, or says none exists; under the bar it names the largest; once read, it
+    /// says what aterm keeps from fseventsd. NEGATIVE CONTROL: a look-alike of fseventsd at
+    /// another image gets no restart, and a row that could not read claims nothing.
+    #[test]
+    fn the_services_row_names_a_service_past_the_bar_and_its_restart() {
+        use aterm_uds::services::{Reading, Service};
+        let report = |services| {
+            doctor_checks_with_origin(
+                "/bin/sh",
+                ShellCheck::Runs,
+                None,
+                &unmeasured(),
+                &no_debugger(),
+                &DevtoolsFacts::absent(),
+                &no_census(),
+                &no_recovery(),
+                &no_exceptions(),
+                &MachineFacts {
+                    services,
+                    ..MachineFacts::absent()
+                },
+            )
+        };
+        let service = |name: &str, path: &str, footprint: u64| Service {
+            name: name.into(),
+            path: Some(path.into()),
+            live: 1,
+            footprint,
+            ..Service::default()
+        };
+        let fseventsd = aterm_vitals::services::FSEVENTSD.path;
+        let read = |services| {
+            Some(Ok(Reading {
+                total: 128 << 30,
+                services,
+                ..Reading::default()
+            }))
+        };
+        let (r, code) = report(read(vec![
+            service("fseventsd", fseventsd, 152_000_000_000),
+            service("mds", "/System/mds", 1_330_000_000),
+        ]));
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(mark_of(&r, "services:"), "warn", "{r}");
+        assert!(
+            r.contains("fseventsd holds 141.6 GiB, past the 8.0 GiB any service needs"),
+            "{r}"
+        );
+        assert!(
+            r.contains("restart it: `aterm init --only init.fseventsd` (one password prompt)"),
+            "{r}"
+        );
+        let (r, _) = report(read(vec![service("fseventsd", "/tmp/fseventsd", 40 << 30)]));
+        assert!(r.contains("aterm knows no safe restart for it"), "{r}");
+        let (r, _) = report(read(vec![service("mds", "/System/mds", 1_330_000_000)]));
+        assert_eq!(mark_of(&r, "services:"), "ok", "{r}");
+        assert!(r.contains("the largest, mds, holds 1.2 GiB"), "{r}");
+        assert!(r.contains("whose file events fseventsd drops"), "{r}");
+        let with_shim = |root: &str| {
+            doctor_checks_with_origin(
+                "/bin/sh",
+                ShellCheck::Runs,
+                None,
+                &unmeasured(),
+                &no_debugger(),
+                &DevtoolsFacts::absent(),
+                &no_census(),
+                &no_recovery(),
+                &no_exceptions(),
+                &MachineFacts {
+                    services: read(vec![service("mds", "/System/mds", 1_330_000_000)]),
+                    shim_cache: Some(root.into()),
+                    ..MachineFacts::absent()
+                },
+            )
+            .0
+        };
+        let quiet = with_shim("/Users//u/Library/Caches/aterm/.ubd/cargo-build.noindex");
+        assert!(
+            quiet.contains("prevented: aterm's build cache, "),
+            "{quiet}"
+        );
+        let old = with_shim("/Users//u/Library/Caches/aterm/cargo-build.noindex");
+        assert!(
+            old.contains("prevented in part: ")
+                && old.contains("the targo shim on PATH still builds in /Users//u/")
+                && !old.contains("aterm's build cache, "),
+            "an old shim's cache is claimed for nothing: {old}"
+        );
+        let (r, _) = report(Some(Err("unread".into())));
+        assert_eq!(mark_of(&r, "services:"), "note", "{r}");
+        assert!(
+            !r.contains("prevented:"),
+            "nothing claimed of an unread row: {r}"
+        );
+        let (r, _) = report(None);
+        assert!(!r.contains("services:"), "{r}");
+    }
+
     #[test]
     fn the_fabric_row_is_a_counted_warning_never_a_failure() {
         let report = |fabric: Option<(Mark, String)>| {
@@ -5387,6 +5993,8 @@ mod tests {
             fabric: None,
             spotlight: None,
             program_check: None,
+            services: None,
+            shim_cache: None,
         };
         let report = |d: &DevtoolsFacts| {
             doctor_checks_with_origin(
@@ -5430,6 +6038,8 @@ mod tests {
     /// order instead of done (nothing is asked, run, opened, written, waited for or printed).
     struct Scripted {
         answer: super::WindowAnswer,
+        /// What the window's permission walk answers.
+        walk: super::WindowAnswer,
         declined_at: Option<u64>,
         /// The wait sees the switch go on.
         switched: bool,
@@ -5441,6 +6051,7 @@ mod tests {
         fn new(answer: super::WindowAnswer) -> Self {
             Self {
                 answer,
+                walk: super::WindowAnswer::Reply("ERR unknown verb (try: help)".to_string()),
                 declined_at: None,
                 switched: true,
                 before_wait: Box::new(|| {}),
@@ -5457,6 +6068,10 @@ mod tests {
         fn with<R>(&self, act: impl FnOnce(&super::DevtoolsReach<'_>) -> R) -> (R, Vec<String>) {
             let note = |entry: String| self.log.borrow_mut().push(entry);
             let reach = super::DevtoolsReach {
+                ask_walk: &|subjects| {
+                    note(format!("walk {subjects}"));
+                    self.walk.clone()
+                },
                 ask_window: &|| {
                     note("ask".to_string());
                     self.answer.clone()
@@ -5479,6 +6094,14 @@ mod tests {
                 refresh_verdict: &|| {
                     note("refresh".to_string());
                     Ok(())
+                },
+                open_fda_pane: &|| {
+                    note("open fda".to_string());
+                    Ok(())
+                },
+                await_fda_on: &|| {
+                    note("wait fda".to_string());
+                    self.switched
                 },
                 local_day: &|at| super::local_day_words(at, Some(0)),
                 say: &|words| note(format!("say {words}")),
@@ -5576,6 +6199,10 @@ mod tests {
                     self.read("spotlight");
                     None
                 },
+                services: &|| {
+                    self.read("services");
+                    None
+                },
                 privacy: &|| {
                     self.read("privacy");
                     unmeasured()
@@ -5592,6 +6219,7 @@ mod tests {
                     self.read("fabric");
                     None
                 },
+                person_here: &|| false,
             };
             let rows = super::facts_rows_over(false, reads, &ports).rows;
             let mut read = self.reads.lock().unwrap().clone();
@@ -5628,6 +6256,7 @@ mod tests {
                 "fabric",
                 "instances",
                 "privacy",
+                "services",
                 "spotlight"
             ],
             "each probe once"
@@ -5646,13 +6275,13 @@ mod tests {
     fn doctors_own_probes_read_at_once() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let all = CountedReads::new(Some(std::sync::Barrier::new(6)));
+            let all = CountedReads::new(Some(std::sync::Barrier::new(7)));
             let _ = tx.send(all.rows(&|label| super::doctor::reads(&[], label)).1);
         });
         let read = rx
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("the probes never met: one waited for another to finish");
-        assert_eq!(read.len(), 6, "{read:?}");
+        assert_eq!(read.len(), 7, "{read:?}");
     }
 
     fn devtools_facts_with(list: aterm_containment::DevToolList) -> atpkg::devtools::Facts {
@@ -5710,7 +6339,8 @@ mod tests {
         let stderr = RefCell::new(String::new());
         let script = waits_after(&stdout);
         let waited = std::cell::Cell::new(false);
-        let hand_over = |facts: &atpkg::devtools::Facts| {
+        let hand_over = |missing: &super::Missing| {
+            let facts = missing.devtools.as_ref().expect("Developer Tools is due");
             let ((), log) = script.with(|reach| super::devtools_hand_over_after(facts, reach));
             waited.set(log.iter().any(|entry| entry == "wait"));
             for line in log.iter().filter_map(|entry| entry.strip_prefix("say ")) {
@@ -5725,7 +6355,11 @@ mod tests {
             stderr: &|text| stderr.borrow_mut().push_str(text),
             hand_over: &hand_over,
         };
-        let status = super::doctor::answer_over(report, 1, true, Some(&absent), &ends);
+        let due = super::Missing {
+            fda: false,
+            devtools: Some(absent.clone()),
+        };
+        let status = super::doctor::answer_over(report, 1, true, Some(&due), &ends);
         assert_eq!(status, 1, "the report's own code");
         assert!(waited.get(), "no window: doctor waits for the switch");
         assert_eq!(*stdout.borrow(), report, "the whole report, on stdout");
@@ -5926,6 +6560,234 @@ mod tests {
             ))),
             WindowAnswer::Unreachable
         );
+    }
+
+    /// A Full Disk Access reading off is no longer only a note pointing at `aterm help
+    /// permissions`: the row stays a note, and leaves a hand-over for after the report. A grant,
+    /// a dev build's grant and an unmeasured reading leave none. NEGATIVE CONTROL: the row's
+    /// mark alone (a note either way) cannot tell them apart.
+    #[test]
+    fn a_full_disk_access_reading_off_is_handed_over_after_the_report() {
+        use super::{PrivacyNext, privacy_row};
+        let (mark, fact, next) =
+            privacy_row(&measured(FdaState::Denied, DrClass::Identity, "aterm"));
+        assert_eq!((mark, next), (Mark::Note, PrivacyNext::HandOver), "{fact}");
+        for facts in [
+            measured(FdaState::Granted, DrClass::Identity, "aterm"),
+            measured(FdaState::Granted, DrClass::Cdhash, "aterm (dev)"),
+            unmeasured(),
+        ] {
+            assert_eq!(privacy_row(&facts).2, PrivacyNext::Nothing, "{facts:?}");
+        }
+        assert_eq!(
+            privacy_row(&unmeasured()).0,
+            mark,
+            "the mark alone is a note for both"
+        );
+    }
+
+    /// The gather leaves Full Disk Access due only with `fix`, a reading off and a person here.
+    #[test]
+    fn full_disk_access_is_due_only_for_a_person_here_with_fix() {
+        let due = |fix: bool, fda: FdaState, here: bool| {
+            let privacy = move || measured(fda, DrClass::Identity, "aterm");
+            let person = move || here;
+            let ports = super::FactReads {
+                program_check: &|| None,
+                devtools: &|_, _| (DevtoolsFacts::absent(), None),
+                spotlight: &|| None,
+                services: &|| None,
+                privacy: &privacy,
+                debugger: &no_debugger,
+                instances: &no_census,
+                fabric: &|_| None,
+                person_here: &person,
+            };
+            super::facts_rows_over(fix, &|label| label == "privacy:", &ports)
+                .hand_over
+                .map(|missing| (missing.fda, missing.devtools.is_some()))
+        };
+        assert_eq!(due(true, FdaState::Denied, true), Some((true, false)));
+        assert_eq!(due(false, FdaState::Denied, true), None, "--read-only");
+        assert_eq!(due(true, FdaState::Denied, false), None, "nobody here");
+        assert_eq!(due(true, FdaState::Granted, true), None, "granted");
+    }
+
+    /// `aterm doctor` hands what it found missing to the window's permission walk in one
+    /// request, and then opens and waits for nothing. With no walk to take it (no window, no
+    /// answer, a window that reads them held) it opens each page itself and waits for each
+    /// switch; a window older than the walk gets Developer Tools through its own verb.
+    #[test]
+    fn doctor_hands_every_missing_grant_to_the_windows_walk() {
+        use super::{Missing, WindowAnswer};
+        use aterm_containment::DevToolListing;
+        let absent = devtools_facts_with(read_list(DevToolListing::Absent, 2));
+        let both = Missing {
+            fda: true,
+            devtools: Some(absent.clone()),
+        };
+        let reply = |line: &str| WindowAnswer::Reply(line.to_string());
+        let run = |script: &Scripted, missing: &Missing| {
+            script.with(|reach| super::permissions_hand_over(missing, reach))
+        };
+
+        let mut walking = Scripted::new(WindowAnswer::Unreachable);
+        walking.walk = reply("OK walking fda devtools\n");
+        let (did, log) = run(&walking, &both);
+        assert_eq!(
+            log,
+            ["walk fda devtools"],
+            "one request, nothing opened here"
+        );
+        assert_eq!(did.len(), 1, "{did:?}");
+        assert!(
+            did[0].contains("walks you through Full Disk Access, then Developer Tools"),
+            "{did:?}"
+        );
+        let fda_only = Missing {
+            fda: true,
+            devtools: None,
+        };
+        let (_, log) = run(&walking, &fda_only);
+        assert_eq!(log, ["walk fda"]);
+
+        // A walk already under way over Developer Tools alone: the window reads Full Disk
+        // Access held (another app is the one without it), so doctor opens that page itself and
+        // leaves Developer Tools to the walk. NEGATIVE CONTROL: its answer is `OK walking` too.
+        let mut under_way = Scripted::new(WindowAnswer::Unreachable);
+        under_way.walk = reply("OK walking devtools\n");
+        let (did, log) = run(&under_way, &both);
+        assert_eq!(log[0], "walk fda devtools");
+        assert!(log.iter().any(|e| e == "open fda"), "{log:?}");
+        assert!(!log.iter().any(|e| e == "open" || e == "wait"), "{log:?}");
+        assert_eq!(did.len(), 2, "{did:?}");
+        assert!(
+            did[0].contains("walks you through Developer Tools "),
+            "{did:?}"
+        );
+        assert_eq!(did[1], "opened Full Disk Access; you switched it on");
+
+        for answer in [
+            WindowAnswer::Unreachable,
+            WindowAnswer::Unanswered("did not answer within 10s".to_string()),
+            reply("OK granted"),
+        ] {
+            let mut script = Scripted::new(WindowAnswer::Unreachable);
+            script.walk = answer.clone();
+            let (did, log) = run(&script, &both);
+            assert_eq!(did.len(), 2, "{answer:?}: {did:?}");
+            assert_eq!(did[0], "opened Full Disk Access; you switched it on");
+            for entry in ["open fda", "wait fda", "open", "wait"] {
+                assert!(
+                    log.iter().any(|e| e == entry),
+                    "{answer:?}: {entry} in {log:?}"
+                );
+            }
+            assert!(!log.iter().any(|e| e == "ask"), "{log:?}");
+        }
+
+        // An older window: Full Disk Access here, Developer Tools through `devtools hand-over
+        // now`, whose panel confirms the switch.
+        let older = Scripted::new(reply("OK shown"));
+        let (did, log) = run(&older, &both);
+        assert_eq!(did.len(), 2, "{did:?}");
+        assert!(log.iter().any(|e| e == "ask"), "{log:?}");
+        assert!(log.iter().any(|e| e == "open fda"), "{log:?}");
+
+        let mut headless = Scripted::new(WindowAnswer::Unreachable);
+        headless.walk =
+            reply("ERR headless: a headless instance brings no System Settings page up");
+        let (did, log) = run(&headless, &both);
+        assert_eq!(log, ["walk fda devtools"]);
+        assert!(did[0].contains("headless"), "{did:?}");
+
+        // The owner's Not now, or a walk within the minute: the window's answer stands, and
+        // doctor opens nothing past it.
+        for (answer, words) in [("OK declined", "Not now"), ("OK recent", "last minute")] {
+            let mut held = Scripted::new(WindowAnswer::Unreachable);
+            held.walk = reply(answer);
+            let (did, log) = run(&held, &both);
+            assert_eq!(log, ["walk fda devtools"], "{answer}");
+            assert_eq!(did.len(), 1, "{answer}: {did:?}");
+            assert!(did[0].contains(words), "{answer}: {did:?}");
+        }
+    }
+
+    /// Doctor's two waits (Full Disk Access, then the Developer Tools switch) share one stdin
+    /// reader: each hears an Enter pressed after it began. NEGATIVE CONTROL: the Enter that ended
+    /// the first wait does not end the second.
+    #[test]
+    fn each_wait_hears_only_an_enter_pressed_after_it_began() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let first = super::enter_pressed();
+        assert!(!first.load(Relaxed));
+        super::enters().fetch_add(1, Relaxed);
+        assert!(first.load(Relaxed), "Enter during the first wait ends it");
+        let second = super::enter_pressed();
+        assert!(
+            !second.load(Relaxed),
+            "the first wait's Enter is not the second's"
+        );
+        super::enters().fetch_add(1, Relaxed);
+        assert!(second.load(Relaxed));
+    }
+
+    /// `aterm init` hands its Permissions phase's grants to the window's walk by their row
+    /// words, for a person here; with nobody here, nothing asked, or a window that takes none,
+    /// it says nothing more.
+    #[test]
+    fn init_hands_its_grants_to_the_windows_walk() {
+        use super::{WindowAnswer, init_walk_over};
+        use aterm_types::macos_setup::Access;
+        let asked = std::cell::RefCell::new(Vec::new());
+        let walking = |words: &str| {
+            asked.borrow_mut().push(words.to_owned());
+            WindowAnswer::Reply(format!("OK walking {words}"))
+        };
+        let missing = [
+            Access::FullDiskAccess,
+            Access::LocalNetwork,
+            Access::Debugger,
+        ];
+        let line = init_walk_over(&missing, true, &walking).expect("a walk took them");
+        assert_eq!(
+            asked.take(),
+            ["full-disk-access debugger"],
+            "Local Network has no step of the walk's"
+        );
+        assert_eq!(
+            init_walk_over(&[Access::LocalNetwork], true, &walking),
+            None,
+            "nothing walkable asks nothing"
+        );
+        assert!(
+            line.contains("Full Disk Access, then Debugger access")
+                || line.contains("Full Disk Access, then Debugger"),
+            "{line}"
+        );
+        assert_eq!(
+            init_walk_over(&missing, false, &walking),
+            None,
+            "nobody here"
+        );
+        assert_eq!(init_walk_over(&[], true, &walking), None);
+        assert!(asked.take().is_empty(), "neither asks");
+        for answer in [
+            WindowAnswer::Unreachable,
+            WindowAnswer::Reply("OK granted".to_owned()),
+            WindowAnswer::Reply("ERR unknown verb (try: help)".to_owned()),
+            // A walk already under way over none of these pages.
+            WindowAnswer::Reply("OK walking devtools".to_owned()),
+        ] {
+            assert_eq!(
+                init_walk_over(&missing, true, &|_| answer.clone()),
+                None,
+                "{answer:?}"
+            );
+        }
+        let under_way = WindowAnswer::Reply("OK walking fda devtools\n".to_owned());
+        let line = init_walk_over(&missing, true, &|_| under_way.clone()).expect("it takes one");
+        assert!(line.contains("through Full Disk Access beside"), "{line}");
     }
 
     #[test]

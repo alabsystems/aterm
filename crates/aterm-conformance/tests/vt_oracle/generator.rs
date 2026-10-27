@@ -58,19 +58,33 @@ pub enum Kind {
     Lrmm { set: bool },
     /// DECSLRM (`CSI Pl ; Pr s` under DECLRMM), valid or not.
     Margins,
+    /// A resize to `cols` columns, the rows kept: the fold clips rows from the top where aterm
+    /// keeps the cursor's rows on the screen, so only the width moves.
+    Resize { cols: u16 },
 }
 
 /// What [`Track`] knows of one DECSC slot: it was written with origin mode
-/// on, and a DECSTBM or DECSLRM has come since.
+/// on, and a DECSTBM or DECSLRM has come since; or a resize has. The engines
+/// carry a slot a resize came between by different rules, so a restore of one
+/// is kept out. aterm moves the slot with the text it was saved on (aterm-core
+/// `saved-cursor-follows-content`): past a row with room it is clamped onto the
+/// blank last column with no wrap, as xterm's `CursorRestore` clamps it, past
+/// a full row the rewrap gives it a row of its own, and a wrap it saved at a
+/// right margin restores as the next column (Ghostty's `Screen.resize`). The
+/// fold leaves the slot where it was saved, arms a wrap for any column past
+/// the edge and keeps a margin wrap pending. aterm-core's
+/// `saved_cursor_follows_resize` and `resize_keeps_the_next_write` tests hold
+/// aterm's side; a restore with no resize since the save is compared here.
 #[derive(Clone, Copy, Debug, Default)]
 struct OriginSlot {
     origin: bool,
     region_moved: bool,
+    resized: bool,
 }
 
 impl OriginSlot {
     fn blocks_restore(self) -> bool {
-        self.origin && self.region_moved
+        (self.origin && self.region_moved) || self.resized
     }
 }
 
@@ -166,6 +180,7 @@ impl Track {
             }
             // Without DECLRMM `CSI Pl ; Pr s` is a cursor save the tracking misses.
             Kind::Margins => self.lrmm,
+            Kind::Resize { .. } => caps.width_resize,
             Kind::Alt { .. }
             | Kind::Plain
             | Kind::Save
@@ -239,6 +254,10 @@ impl Track {
                 self.alt_slot.region_moved = true;
             }
             Kind::Lrmm { set } => self.lrmm = set,
+            Kind::Resize { .. } => {
+                self.main_slot.resized = true;
+                self.alt_slot.resized = true;
+            }
             Kind::Plain => {}
         }
     }
@@ -266,10 +285,23 @@ fn num(r: &mut Rng, limit: u16) -> String {
     }
 }
 
-fn text(r: &mut Rng, len: usize) -> Vec<u8> {
+/// East Asian Wide and Fullwidth glyphs every width table agrees on (CJK ideographs, kana,
+/// Hangul, fullwidth forms): Unicode's East Asian Width, xterm's `wcwidth`, Ghostty's and aterm's
+/// tables all give each two columns. Emoji are left out: their width turns on presentation
+/// selectors and grapheme rules the engines draw differently.
+const WIDE_GLYPHS: &[char] = &[
+    '\u{4e2d}', '\u{6587}', '\u{3042}', '\u{30a2}', '\u{ac00}', '\u{ff21}', '\u{ff57}',
+];
+
+/// `len` glyphs, one in four wide when the fold models wide glyphs.
+fn text(r: &mut Rng, len: usize, wide: bool) -> Vec<u8> {
     let mut s = String::new();
     for _ in 0..len {
-        s.push(r.pick(GLYPHS));
+        if wide && r.chance(1, 4) {
+            s.push(r.pick(WIDE_GLYPHS));
+        } else {
+            s.push(r.pick(GLYPHS));
+        }
     }
     s.into_bytes()
 }
@@ -285,7 +317,32 @@ fn run_len(r: &mut Rng, cols: u16) -> usize {
     }
 }
 
-fn sgr(r: &mut Rng, bg: bool) -> Vec<u8> {
+/// The SGR attributes the fold models with `sgr_attrs`: italic, blink (5 and 6), concealed,
+/// crossed-out, the double underline (21), and their resets.
+const MORE_ATTRS: &[&str] = &["3", "5", "6", "8", "9", "21", "23", "25", "28", "29"];
+
+/// A 24-bit colour channel: mostly in range, now and then past 255, which both engines clamp.
+fn channel(r: &mut Rng) -> u64 {
+    if r.chance(1, 8) {
+        256 + r.below(800)
+    } else {
+        r.below(256)
+    }
+}
+
+/// A 24-bit colour SGR for `code` (38 or 48) in one of its spellings: `;2;r;g;b`, or the colon
+/// forms `:2::r:g:b`, `:2:r:g:b` and `:2:cs:r:g:b` with a colour-space id.
+fn rgb(r: &mut Rng, code: u16) -> String {
+    let (red, green, blue) = (channel(r), channel(r), channel(r));
+    match r.below(4) {
+        0 => format!("{code};2;{red};{green};{blue}"),
+        1 => format!("{code}:2::{red}:{green}:{blue}"),
+        2 => format!("{code}:2:{red}:{green}:{blue}"),
+        _ => format!("{code}:2:{}:{red}:{green}:{blue}", r.below(3)),
+    }
+}
+
+fn sgr(r: &mut Rng, caps: Caps) -> Vec<u8> {
     let mut parts: Vec<String> = Vec::new();
     let n = r.below(4);
     if n == 0 {
@@ -297,7 +354,7 @@ fn sgr(r: &mut Rng, bg: bool) -> Vec<u8> {
     }
     for _ in 0..n {
         let fg_or_attr = |r: &mut Rng| -> String {
-            match r.below(9) {
+            match r.below(9 + u64::from(caps.sgr_attrs) + u64::from(caps.truecolour)) {
                 0 => r.pick(&["0", "1", "4", "7", "22", "24", "27"]).to_string(),
                 1 | 2 => (30 + r.below(8)).to_string(),
                 3 => "39".to_string(),
@@ -305,15 +362,18 @@ fn sgr(r: &mut Rng, bg: bool) -> Vec<u8> {
                 5 => format!("38;5;{}", r.below(256)),
                 6 => format!("38:5:{}", r.below(256)),
                 7 => format!("4:{}", r.below(6)),
-                _ => r.pick(&["1", "4", "7"]).to_string(),
+                8 => r.pick(&["1", "4", "7"]).to_string(),
+                9 if caps.sgr_attrs => r.pick(MORE_ATTRS).to_string(),
+                _ => rgb(r, 38),
             }
         };
-        let p = if bg && r.chance(1, 3) {
-            match r.below(5) {
+        let p = if caps.bce_on_scroll && r.chance(1, 3) {
+            match r.below(5 + u64::from(caps.truecolour)) {
                 0 | 1 => (40 + r.below(8)).to_string(),
                 2 => (100 + r.below(8)).to_string(),
                 3 => format!("48;5;{}", r.below(256)),
-                _ => "49".to_string(),
+                4 => "49".to_string(),
+                _ => rgb(r, 48),
             }
         } else {
             fg_or_attr(r)
@@ -409,10 +469,10 @@ impl Gen {
         let (cols, rows, caps) = (self.cols, self.rows, self.caps);
         let lim = cols.max(rows);
         let r = &mut self.r;
-        let plain = match r.below(38) {
+        let plain = match r.below(40) {
             0..=8 => {
                 let n = run_len(r, cols);
-                text(r, n)
+                text(r, n, caps.wide_glyphs)
             }
             9..=12 => {
                 let mut set: Vec<&[u8]> =
@@ -441,20 +501,21 @@ impl Gen {
                 t.extend(erase(r, caps));
                 t
             }
-            20 | 21 => sgr(r, caps.bce_on_scroll),
+            20 | 21 => sgr(r, caps),
             22 => {
                 let row = 1 + r.below(u64::from(rows));
                 let col = r.below(u64::from(cols));
                 let room = usize::from(cols) - 1 - col as usize;
                 let len = r.below(room as u64 + 1) as usize;
                 let mut t = csi(&format!("{row};{}", col + 1), 'H');
-                let bg = match r.below(3) {
+                let bg = match r.below(3 + u64::from(caps.truecolour)) {
                     0 => format!("{}", 40 + r.below(8)),
                     1 => format!("{}", 100 + r.below(8)),
-                    _ => format!("48;5;{}", r.below(256)),
+                    2 => format!("48;5;{}", r.below(256)),
+                    _ => rgb(r, 48),
                 };
                 t.extend(csi(&bg, 'm'));
-                t.extend(text(r, len));
+                t.extend(text(r, len, caps.wide_glyphs));
                 if r.chance(1, 2) {
                     t.extend(erase(r, caps));
                 }
@@ -533,7 +594,7 @@ impl Gen {
                 };
                 if r.chance(1, 3) {
                     let n = run_len(r, cols);
-                    t.extend(text(r, n));
+                    t.extend(text(r, n, caps.wide_glyphs));
                 }
                 t
             }
@@ -552,9 +613,21 @@ impl Gen {
                     (Kind::Lrmm { set }, csi("?69", if set { 'h' } else { 'l' }))
                 };
             }
+            // A width change: wider or narrower by a few columns, to twice the width, to a
+            // width a program starts at, or to the same width ([`Kind::Resize`]).
+            38 | 39 if caps.width_resize => {
+                let to = match r.below(5) {
+                    0 => r.pick(&COLS),
+                    1 => cols.saturating_add(1 + r.below(4) as u16),
+                    2 => cols.saturating_sub(1 + r.below(4) as u16).max(1),
+                    3 => cols.saturating_mul(2).min(40),
+                    _ => cols,
+                };
+                return (Kind::Resize { cols: to }, Vec::new());
+            }
             _ => {
                 let n = run_len(r, cols);
-                text(r, n)
+                text(r, n, caps.wide_glyphs)
             }
         };
         (Kind::Plain, plain)
@@ -578,6 +651,14 @@ pub fn program(seed: u64, caps: Caps) -> Program {
     for _ in 0..n {
         let (kind, t) = g.token();
         g.track.step(kind);
+        if let Kind::Resize { cols } = kind {
+            g.cols = cols;
+            tokens.push(Token {
+                kind,
+                chunks: Vec::new(),
+            });
+            continue;
+        }
         let chunks = if t.len() > 1 && g.r.chance(1, 4) {
             let at = 1 + g.r.below(t.len() as u64 - 1) as usize;
             vec![t[..at].to_vec(), t[at..].to_vec()]
@@ -601,8 +682,34 @@ pub struct Mismatch {
     pub aterm: Snap,
 }
 
+/// What the resizes of a run started from (see `resizes::the_generated_resizes_reach_the_rule`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Reach {
+    /// Resizes both engines took.
+    pub applied: u64,
+    /// Resizes the main-screen rewrap guard kept out.
+    pub kept_out: u64,
+    /// Applied resizes that kept the width, which leave the cursor and its wrap alone.
+    pub same_width: u64,
+    pub widened: u64,
+    pub narrowed: u64,
+    /// Width changes applied with a wrap pending on the last column.
+    pub edge_wrap: u64,
+    /// Width changes applied with the cursor after its row's text.
+    pub past_text: u64,
+    /// Narrowings applied with the cursor's own cell (no wrap pending) past the new width.
+    pub cut_off: u64,
+    /// Width changes applied with the cursor on a row that continues the one above.
+    pub on_continuation: u64,
+}
+
 /// Run `p` through both engines, comparing after every chunk.
 pub fn run(p: &Program) -> Option<Mismatch> {
+    run_reaching(p, &mut Reach::default())
+}
+
+/// [`run`], adding to `reach` what each resize started from.
+pub fn run_reaching(p: &Program, reach: &mut Reach) -> Option<Mismatch> {
     let mut a = Astream::new(p.cols, p.rows);
     let mut t = Aterm::new(p.cols, p.rows);
     let (sa, st) = (a.snap(), t.snap());
@@ -615,6 +722,36 @@ pub fn run(p: &Program) -> Option<Mismatch> {
         });
     }
     for (i, tok) in p.tokens.iter().enumerate() {
+        if let Kind::Resize { cols } = tok.kind {
+            // One that aterm's main-screen rewrap would make move cells, the fold cannot judge.
+            if t.reflow_moves_cells(cols, p.rows) {
+                reach.kept_out += 1;
+            } else {
+                let (edge_wrap, past_text, on_continuation) = t.cursor_reach();
+                let before = t.snap();
+                let moved = u64::from(cols != before.cols);
+                reach.applied += 1;
+                reach.same_width += 1 - moved;
+                reach.widened += u64::from(cols > before.cols);
+                reach.narrowed += u64::from(cols < before.cols);
+                reach.edge_wrap += moved * u64::from(edge_wrap);
+                reach.past_text += moved * u64::from(past_text);
+                reach.cut_off += u64::from(!before.wrap && before.cursor.1 >= cols);
+                reach.on_continuation += moved * u64::from(on_continuation);
+                a.resize(cols, p.rows);
+                t.resize(cols, p.rows);
+            }
+            let (sa, st) = (a.snap(), t.snap());
+            if let Some(what) = sa.first_difference(&st) {
+                return Some(Mismatch {
+                    token: i,
+                    what,
+                    astream: sa,
+                    aterm: st,
+                });
+            }
+            continue;
+        }
         for chunk in &tok.chunks {
             a.feed(chunk);
             t.feed(chunk);
@@ -680,9 +817,25 @@ pub fn literal(bytes: &[u8]) -> String {
     s
 }
 
+/// The steps `p` is fed as: each chunk as a byte-string literal, each resize as `resize(<cols>)`.
+pub fn steps(p: &Program) -> String {
+    let parts: Vec<String> = p
+        .tokens
+        .iter()
+        .flat_map(|t| match t.kind {
+            Kind::Resize { cols } => vec![format!("resize({cols})")],
+            _ => t.chunks.iter().map(|c| literal(c)).collect(),
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
 /// The failure report.
 pub fn report(seed: u64, original: (&Program, &Mismatch), p: &Program, m: &Mismatch) -> String {
-    let chunked = p.tokens.iter().any(|t| t.chunks.len() > 1);
+    let chunked = p
+        .tokens
+        .iter()
+        .any(|t| t.chunks.len() > 1 || matches!(t.kind, Kind::Resize { .. }));
     let mut out = format!(
         "seed {seed:#018x}: {}x{} (cols x rows); the generated program ({} tokens) \
          first diverged at token {}: {}\n  shrunk to {} tokens, divergence at token {}: \
@@ -698,13 +851,7 @@ pub fn report(seed: u64, original: (&Program, &Mismatch), p: &Program, m: &Misma
         literal(&p.bytes()),
     );
     if chunked {
-        let parts: Vec<String> = p
-            .tokens
-            .iter()
-            .flat_map(|t| &t.chunks)
-            .map(|c| literal(c))
-            .collect();
-        let _ = writeln!(out, "  fed as chunks: [{}]", parts.join(", "));
+        let _ = writeln!(out, "  fed as: {}", steps(p));
     }
     let _ = write!(
         out,

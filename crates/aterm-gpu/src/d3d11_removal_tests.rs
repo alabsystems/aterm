@@ -4,9 +4,8 @@
 //! The D3D11 arm's device-removed latch where a frame writes resident state
 //! before it draws (docs/AUDIT-third-party-2026-10-15.md GW.5): a removed
 //! device refuses those writes, and the frame must fail by name and reach
-//! `device_lost`, which sends the frontend to the CPU renderer, never panic.
-//! Both builds: the shipped one, where the failed frame has no other arm, and
-//! the oracle's, where it falls through to wgpu.
+//! `device_lost`, which sends the frontend to the CPU renderer, never panic:
+//! the failed frame has no other arm.
 
 use super::replay_fixtures::*;
 use super::*;
@@ -119,8 +118,7 @@ fn an_fx_atlas_growing_on_a_removed_device_reaches_device_lost() {
         .dev
         .shared()
         .inject_device_loss();
-    // `Err` in the shipped build (no other arm draws it), a wgpu frame in the
-    // oracle's: either way, no panic.
+    // `Err` (no other arm draws it), and no panic.
     let after = drilled.try_render_input(&mut win, &grown, None);
     assert!(
         !drilled.last_frame_on_d3d11(),

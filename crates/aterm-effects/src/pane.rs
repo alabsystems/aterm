@@ -10,6 +10,7 @@
     clippy::too_many_arguments,
     reason = "the pane placement (row/col offset + rows/cols) and cell metrics are one flat geometry tuple; a wrapper struct would relocate the list, not simplify it"
 )]
+#[inline]
 pub fn translate_rain_into_pane(
     quads: &mut Vec<crate::matrix_rain::RainCell>,
     add: &mut Vec<aterm_render::RainHalo>,

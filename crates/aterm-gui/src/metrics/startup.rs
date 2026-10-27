@@ -7,6 +7,7 @@ use super::wire::{self, FieldSink};
 use crate::label_enum::label_enum;
 use aterm_uds::process::{BootClock, ProcessStart};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Process-wide startup ledger written during boot and read by `metrics` summaries.
@@ -66,6 +67,16 @@ pub(crate) struct Startup {
     birth_to_main: OnceLock<u64>,
     worker: OnceLock<StartupWorkerSample>,
     gpu: OnceLock<StartupGpuSample>,
+    /// The keeper's boot HELLO answered, its offers in hand ([`mark_keeper_hello`]).
+    keeper_hello: OnceLock<Instant>,
+    /// Every offer of that HELLO admitted or refused ([`record_keeper_admitted`]).
+    keeper_admitted: OnceLock<KeeperAdmitted>,
+    /// Every session that admission recovered placed ([`mark_keeper_placed`]).
+    keeper_placed: OnceLock<Instant>,
+    /// Their history imports settled ([`mark_keeper_imported`]).
+    keeper_imported: OnceLock<Instant>,
+    /// What the restore lane's look-alike seam did so far (`record_keeper_seam`).
+    keeper_seam: SeamCounters,
 }
 
 impl Startup {
@@ -92,6 +103,11 @@ impl Startup {
             birth_to_main: OnceLock::new(),
             worker: OnceLock::new(),
             gpu: OnceLock::new(),
+            keeper_hello: OnceLock::new(),
+            keeper_admitted: OnceLock::new(),
+            keeper_placed: OnceLock::new(),
+            keeper_imported: OnceLock::new(),
+            keeper_seam: SeamCounters::new(),
         }
     }
 
@@ -158,11 +174,240 @@ impl Startup {
         .unwrap_or_default()
     }
 
-    /// Emit pre-winit boot fields (`handoff_claim`, `startup_prepare`, `startup_worker`).
+    /// Emit pre-winit boot fields (`handoff_claim`, `startup_prepare`, `startup_worker`,
+    /// `startup_keeper`).
     pub(crate) fn emit_boot(&self, facts: &StartupFacts, s: &mut dyn FieldSink) {
         self.emit_handoff_claim(s);
         self.emit_startup_prepare(facts, s);
+        self.emit_keeper_recovery(s);
+        #[cfg(all(unix, any(test, debug_assertions)))]
+        super::restore_experiment::emit(s);
     }
+
+    /// The keeper's boot recovery: `startup_keeper_offers=`, `startup_keeper_hello_ms=` (Rust
+    /// `main` to the answered HELLO), `startup_keeper_admit_ms=` (that HELLO to every offer
+    /// admitted or refused, one after another), `startup_keeper_admit_max_ms=` (the slowest one
+    /// offer), `startup_keeper_placed_ms=` (that HELLO to every recovered session placed) and
+    /// `startup_keeper_imported_ms=` (that HELLO to their history imports settled); every one
+    /// `none` on a launch whose HELLO no keeper answered, and each until its moment. A build that
+    /// compiles the crash-restore seams adds `startup_keeper_seam_copies=`,
+    /// `startup_keeper_seam_plants=` and `startup_keeper_seam_ms=`: what the restore lane's
+    /// look-alike seam did in that admission, whose time each reading above leaves out
+    /// ([`keeper_recovery`]).
+    fn emit_keeper_recovery(&self, s: &mut dyn FieldSink) {
+        let sample = keeper_recovery(KeeperStamps {
+            main: self.main_start(),
+            hello: self.keeper_hello.get().copied(),
+            admitted: self.keeper_admitted.get().copied(),
+            placed: self.keeper_placed.get().copied(),
+            imported: self.keeper_imported.get().copied(),
+        });
+        s.opt_count("startup_keeper_offers", sample.map(|k| k.offers), "none");
+        for (key, ns) in [
+            ("startup_keeper_hello_ms", sample.and_then(|k| k.hello_ns)),
+            ("startup_keeper_admit_ms", sample.and_then(|k| k.admit_ns)),
+            (
+                "startup_keeper_admit_max_ms",
+                sample.and_then(|k| k.slowest_ns),
+            ),
+            ("startup_keeper_placed_ms", sample.and_then(|k| k.placed_ns)),
+            (
+                "startup_keeper_imported_ms",
+                sample.and_then(|k| k.imported_ns),
+            ),
+        ] {
+            s.opt_decimal(key, ns.map(wire::ms), "none");
+        }
+        #[cfg(any(test, debug_assertions))]
+        {
+            let seam = sample.and_then(|k| k.admit.map(|a| a.seam));
+            s.opt_count("startup_keeper_seam_copies", seam.map(|w| w.copies), "none");
+            s.opt_count("startup_keeper_seam_plants", seam.map(|w| w.plants), "none");
+            s.opt_decimal(
+                "startup_keeper_seam_ms",
+                seam.map(|w| wire::ms(w.ns)),
+                "none",
+            );
+        }
+    }
+}
+
+/// What the restore lane's look-alike seam did (`crash_restore::LOOKALIKE_SEAM`, the
+/// `verify perf restore-e2e` copy and lookalike arms): the copies of offered regions it made,
+/// the plants that took in them, and the time both took. Work a really damaged region never
+/// pays, so [`keeper_recovery`] leaves it out of every reading that spans it. Only a debug or
+/// test build's seam adds to it (`record_keeper_seam`); everywhere else it stays zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SeamSpent {
+    pub(crate) copies: u64,
+    pub(crate) plants: u64,
+    pub(crate) ns: u64,
+}
+
+impl SeamSpent {
+    /// What was spent after `earlier`, a reading taken before this one.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    #[must_use]
+    pub(crate) const fn since(self, earlier: Self) -> Self {
+        Self {
+            copies: self.copies.saturating_sub(earlier.copies),
+            plants: self.plants.saturating_sub(earlier.plants),
+            ns: self.ns.saturating_sub(earlier.ns),
+        }
+    }
+
+    /// The time it took.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    #[must_use]
+    pub(crate) const fn spent(self) -> Duration {
+        Duration::from_nanos(self.ns)
+    }
+}
+
+/// The process's running [`SeamSpent`] ([`keeper_seam`]).
+struct SeamCounters {
+    copies: AtomicU64,
+    plants: AtomicU64,
+    ns: AtomicU64,
+}
+
+impl SeamCounters {
+    const fn new() -> Self {
+        Self {
+            copies: AtomicU64::new(0),
+            plants: AtomicU64::new(0),
+            ns: AtomicU64::new(0),
+        }
+    }
+
+    fn read(&self) -> SeamSpent {
+        SeamSpent {
+            copies: self.copies.load(Ordering::Relaxed),
+            plants: self.plants.load(Ordering::Relaxed),
+            ns: self.ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The end of the boot recovery's admission ([`record_keeper_admitted`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeeperAdmitted {
+    at: Instant,
+    offers: u64,
+    /// The slowest one offer, less the seam's work inside it.
+    slowest_ns: u64,
+    /// What the seam did between the answered HELLO and `at`.
+    seam: SeamSpent,
+}
+
+/// The boot recovery's stamps, as [`keeper_recovery`] reads them.
+#[derive(Clone, Copy, Debug, Default)]
+struct KeeperStamps {
+    /// Rust `main` (or the GUI entry).
+    main: Option<Instant>,
+    hello: Option<Instant>,
+    admitted: Option<KeeperAdmitted>,
+    placed: Option<Instant>,
+    imported: Option<Instant>,
+}
+
+/// The keeper's boot recovery as `metrics` reports it ([`keeper_recovery`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeeperRecovery {
+    /// The offers the HELLO answered with (0 before the admission's end is recorded).
+    offers: u64,
+    /// Rust `main` (or the GUI entry) to the answered HELLO; `None` with no such stamp.
+    hello_ns: Option<u64>,
+    /// The answered HELLO to the admission's end, less the seam; `None` before that end.
+    admit_ns: Option<u64>,
+    /// The slowest one offer, less the seam; `None` before the admission's end.
+    slowest_ns: Option<u64>,
+    /// The answered HELLO to every recovered session placed, less the seam; `None` before then.
+    placed_ns: Option<u64>,
+    /// The answered HELLO to their history imports settled, less the seam; `None` before then.
+    imported_ns: Option<u64>,
+    admit: Option<KeeperAdmitted>,
+}
+
+/// The keeper's boot recovery from its stamps: `None` until a keeper answered the HELLO. The
+/// seam's work all falls inside the admission, so every reading from the HELLO to a moment at or
+/// after the admission's end leaves it out, and placement and the imports read only once the
+/// admission's end is stamped.
+fn keeper_recovery(stamps: KeeperStamps) -> Option<KeeperRecovery> {
+    let hello = stamps.hello?;
+    let admitted = stamps.admitted;
+    let less_seam = |at: Instant| {
+        let a = admitted?;
+        (at >= a.at)
+            .then(|| duration_ns(hello, at))
+            .flatten()
+            .map(|ns| ns.saturating_sub(a.seam.ns))
+    };
+    Some(KeeperRecovery {
+        offers: admitted.map_or(0, |a| a.offers),
+        hello_ns: stamps.main.and_then(|main| duration_ns(main, hello)),
+        admit_ns: admitted.and_then(|a| less_seam(a.at)),
+        slowest_ns: admitted.map(|a| a.slowest_ns),
+        placed_ns: stamps.placed.and_then(less_seam),
+        imported_ns: stamps.imported.and_then(less_seam),
+        admit: admitted,
+    })
+}
+
+/// Mark the keeper's boot HELLO answered, its offers in hand (`keeper_link::boot`).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn mark_keeper_hello() {
+    let _ = STARTUP.keeper_hello.set(Instant::now());
+}
+
+/// Record the end of the boot recovery's admission: `offers` admitted or refused one after
+/// another, the slowest one taking `slowest` (less the seam's work inside it), and what the
+/// restore lane's seam did since the HELLO (`seam`, [`keeper_seam`]'s reading since then).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn record_keeper_admitted(offers: usize, slowest: Duration, seam: SeamSpent) {
+    let _ = STARTUP.keeper_admitted.set(KeeperAdmitted {
+        at: Instant::now(),
+        offers: u64::try_from(offers).unwrap_or(u64::MAX),
+        slowest_ns: u64::try_from(slowest.as_nanos()).unwrap_or(u64::MAX),
+        seam,
+    });
+}
+
+/// Mark every session the keeper's boot recovery brought back placed: the restore pass that
+/// places them after the first has drained, which a window runs once its first frame is on glass.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn mark_keeper_placed() {
+    let _ = STARTUP.keeper_placed.set(Instant::now());
+}
+
+/// Mark the history imports settled: the first settle after the keeper's boot recovery placed
+/// its sessions (a launch with no HELLO answered reports none, whatever it imported).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn mark_keeper_imported() {
+    if STARTUP.keeper_placed.get().is_some() {
+        let _ = STARTUP.keeper_imported.set(Instant::now());
+    }
+}
+
+/// What the restore lane's look-alike seam did so far in this process ([`SeamSpent`]).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn keeper_seam() -> SeamSpent {
+    STARTUP.keeper_seam.read()
+}
+
+/// Count one copy the restore lane's look-alike seam made of an offered region, `planted` when
+/// its plant took, and the `spent` time both took ([`SeamSpent`]).
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(crate) fn record_keeper_seam(spent: Duration, planted: bool) {
+    let seam = &STARTUP.keeper_seam;
+    seam.copies.fetch_add(1, Ordering::Relaxed);
+    if planted {
+        seam.plants.fetch_add(1, Ordering::Relaxed);
+    }
+    seam.ns.fetch_add(
+        u64::try_from(spent.as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 fn kept<T: Copy>(cell: &OnceLock<T>, derive: impl FnOnce() -> Option<T>) -> Option<T> {
@@ -2080,6 +2325,146 @@ mod startup_phase_tests {
             )
             .valid,
             "negative control: an out-of-order attach stamp must fail closed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod keeper_recovery_tests {
+    use super::*;
+
+    const fn spent(copies: u64, plants: u64, ms: u64) -> SeamSpent {
+        SeamSpent {
+            copies,
+            plants,
+            ns: ms * 1_000_000,
+        }
+    }
+
+    /// The boot recovery's readings come from its stamps: `main` to the answered HELLO, and
+    /// from that HELLO to the admission's end, to every session placed and to their imports
+    /// settled, each less the seam's work (which all falls inside the admission); the slowest
+    /// one offer as recorded. Negative controls: no HELLO answered is no reading at all,
+    /// whatever else was stamped; a HELLO whose admission has not ended reads no admission,
+    /// placement or import; no `main` stamp leaves only the HELLO's own reading out; no seam
+    /// work leaves every reading whole.
+    #[test]
+    fn the_keeper_recovery_reads_from_the_hello_less_the_seam_s_own_work() {
+        let main = Instant::now();
+        let hello = main + Duration::from_millis(7);
+        let admitted = KeeperAdmitted {
+            at: hello + Duration::from_millis(18),
+            offers: 32,
+            slowest_ns: 2_000_000,
+            seam: spent(32, 32, 12),
+        };
+        let stamps = KeeperStamps {
+            main: Some(main),
+            hello: Some(hello),
+            admitted: Some(admitted),
+            placed: Some(hello + Duration::from_millis(20)),
+            imported: Some(hello + Duration::from_millis(31)),
+        };
+        let k = keeper_recovery(stamps).expect("answered");
+        assert_eq!(
+            (k.offers, k.hello_ns, k.admit_ns, k.slowest_ns),
+            (32, Some(7_000_000), Some(6_000_000), Some(2_000_000)),
+            "the admission less the seam's 12 ms"
+        );
+        assert_eq!(
+            (k.placed_ns, k.imported_ns),
+            (Some(8_000_000), Some(19_000_000)),
+            "placement and the imports less the seam's 12 ms"
+        );
+        let unseamed = KeeperStamps {
+            admitted: Some(KeeperAdmitted {
+                seam: SeamSpent::default(),
+                ..admitted
+            }),
+            ..stamps
+        };
+        let whole = keeper_recovery(unseamed).expect("answered");
+        assert_eq!(
+            (whole.admit_ns, whole.placed_ns, whole.imported_ns),
+            (Some(18_000_000), Some(20_000_000), Some(31_000_000)),
+            "no seam work, every reading whole"
+        );
+        assert_eq!(
+            keeper_recovery(KeeperStamps {
+                hello: None,
+                ..stamps
+            }),
+            None,
+            "no HELLO answered"
+        );
+        let pending = keeper_recovery(KeeperStamps {
+            admitted: None,
+            ..stamps
+        })
+        .expect("answered");
+        assert_eq!(
+            (
+                pending.offers,
+                pending.admit_ns,
+                pending.slowest_ns,
+                pending.placed_ns,
+                pending.imported_ns
+            ),
+            (0, None, None, None, None),
+            "an admission not ended reads nothing after the HELLO"
+        );
+        assert_eq!(
+            keeper_recovery(KeeperStamps {
+                main: None,
+                ..stamps
+            })
+            .map(|k| (k.hello_ns, k.admit_ns)),
+            Some((None, Some(6_000_000))),
+            "no main stamp"
+        );
+    }
+
+    /// What the seam spent between two readings is their difference, never below zero.
+    #[test]
+    fn the_seam_s_work_since_a_reading_is_the_difference() {
+        assert_eq!(spent(5, 3, 40).since(spent(2, 1, 15)), spent(3, 2, 25));
+        assert_eq!(spent(1, 0, 1).since(spent(2, 1, 5)), SeamSpent::default());
+        assert_eq!(spent(0, 0, 3).spent(), Duration::from_millis(3));
+    }
+
+    /// `metrics` spells the fields on every summary: `none` on a launch no keeper answered
+    /// (the negative control), the readings once the stamps are set, and in this build (which
+    /// compiles the seams) what the seam did.
+    #[test]
+    fn metrics_spells_the_keeper_recovery_or_none() {
+        let fields = |startup: &Startup| wire::render_text(|s| startup.emit_keeper_recovery(s));
+        let unanswered = Startup::new();
+        let _ = unanswered.rust_main.set(Instant::now());
+        assert_eq!(
+            fields(&unanswered),
+            " startup_keeper_offers=none startup_keeper_hello_ms=none \
+             startup_keeper_admit_ms=none startup_keeper_admit_max_ms=none \
+             startup_keeper_placed_ms=none startup_keeper_imported_ms=none \
+             startup_keeper_seam_copies=none startup_keeper_seam_plants=none \
+             startup_keeper_seam_ms=none"
+        );
+        let answered = Startup::new();
+        let main = Instant::now();
+        let _ = answered.rust_main.set(main);
+        let _ = answered.keeper_hello.set(main + Duration::from_millis(3));
+        let _ = answered.keeper_admitted.set(KeeperAdmitted {
+            at: main + Duration::from_millis(9),
+            offers: 2,
+            slowest_ns: 4_000_000,
+            seam: spent(2, 1, 1),
+        });
+        let _ = answered.keeper_placed.set(main + Duration::from_millis(12));
+        assert_eq!(
+            fields(&answered),
+            " startup_keeper_offers=2 startup_keeper_hello_ms=3.00 startup_keeper_admit_ms=5.00 \
+             startup_keeper_admit_max_ms=4.00 startup_keeper_placed_ms=8.00 \
+             startup_keeper_imported_ms=none startup_keeper_seam_copies=2 \
+             startup_keeper_seam_plants=1 startup_keeper_seam_ms=1.00"
         );
     }
 }

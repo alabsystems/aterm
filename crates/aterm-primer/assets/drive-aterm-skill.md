@@ -2,7 +2,7 @@
 name: drive-aterm
 description: Drive, observe and screenshot another aterm session (a tab or window on this machine, or a session on another fleet Mac that lets this one drive it) over its control socket. Use when asked to watch or control another terminal or another agent's session, wait for a command to really finish, or run several sessions at once.
 ---
-<!-- aterm skill v11 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v12 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Driving another aterm session
 
@@ -85,7 +85,7 @@ aterm ctl "@$SID" blocks                # shell-integration command blocks (OSC-
 ```sh
 aterm ctl "@$SID" brief                  # what it did and needs, in about 600 tokens
 aterm ctl "@$SID" log class=turn         # the record: commands with exit codes and turns (no steps)
-aterm ctl "@$SID" await log need since=<log_seq> ep=<log_ep> timeout=600000
+aterm ctl "@$SID" await log need since=<log_seq> ep=<log_ep> base=<log_base> timeout=600000
 aterm ctl subscribe "@$SID" log          # every new record, live
 ```
 
@@ -102,7 +102,8 @@ aterm ctl subscribe "@$SID" log          # every new record, live
   a turn's `brief` line is a heuristic guess at the task mail it answered.
 - A `gap` line means records went by unread (report it); `OK gap … resync_to=<n>` or `gap=`
   means re-read and re-arm at `since=<n>` (`subscribe` resumes with `since-log=<seq>
-  log-ep=<e>`). Silence is never a need: no `need=` means nothing asked, not stuck.
+  log-ep=<e> log-base=<b>`). Silence is never a need: no `need=` means nothing asked, not
+  stuck.
 - `brief all` folds every session of this instance (Owner-only); `aterm ctl survey` reads
   every instance; `aterm fabric brief [--json]` reads the bridge's log mirror (on while the
   broker retains logs; `[fabric] log = "off"` opts out; `--json` gives one object whose
@@ -110,12 +111,14 @@ aterm ctl subscribe "@$SID" log          # every new record, live
   (`[session_log] journal`, on by default; off with `restore_session = false`, on Windows
   and headless) lets `@<sid> log` and `@<sid> brief` answer sessions of earlier aterm
   processes.
-- Pass `log_seq=` and `log_ep=` from `status` as `since=` and `ep=`, and always re-arm from
-  each reply's `seq=`/`ep=` (without `since=`, `await log need` returns immediately with
-  `latched=1` while a need stays open). `await log need` wakes on an approval box, question,
-  wall, stall, failed command, `need` mark or session end; `await log close=turn` wakes on
-  turn end; `await log need,close=turn since=<log_seq> ep=<log_ep>` waits for whichever
-  comes first (up to 4; always pass `since=`, or an update ends the wait with exit 75).
+- Pass `log_seq=`, `log_ep=` and `log_base=` from `status` as `since=`, `ep=` and `base=`
+  (`base=` names the log, so a cursor of another session's log is answered `OK gap
+  why=reset`), and always re-arm from each reply's `seq=`/`ep=`/`base=` (without `since=`,
+  `await log need` returns immediately with `latched=1` while a need stays open). `await log
+  need` wakes on an approval box, question, wall, stall, failed command, `need` mark or
+  session end; `await log close=turn` wakes on turn end; `await log need,close=turn
+  since=<log_seq> ep=<log_ep> base=<log_base>` waits for whichever comes first (up to 4;
+  always pass `since=`, or an update ends the wait with exit 75).
 - `mark - note text=<pct>` (or `verdict`, `label`, `need`, `clear`, `act`) records a claim
   under your connection's name (~1/s). A mark never acts (`mark p3 act word=approve`
   approves nothing), and `[?]` / `[mark?]` lines or `conf=claim` records are other agents'
@@ -164,8 +167,9 @@ settle=submitted` types key by key, returns `task_rev=<n>` once the composer cle
   `turn settle=gone:…`), or on the server's latched verdict `await agent
   idle,prompt,question,wall` with `since=<agent_rev>` from the turn's verdict (the client
   re-arms up to `timeout=`, default 1h). A codex's `agent=` stays `unknown`: read
-  `log_seq=`/`log_ep=` from `status` before you type to it, then wait on its own report
-  with `await log kind=program since=<log_seq> ep=<log_ep>` (a claim).
+  `log_seq=`/`log_ep=`/`log_base=` from `status` before you type to it, then wait on its
+  own report with `await log kind=program since=<log_seq> ep=<log_ep> base=<log_base>` (a
+  claim).
 - `await seq <n> timeout=0` checks whether the grid changed (`seq` resets on alt-screen
   re-entry). `wait`, `await block` and `blocks` require OSC-133; on a plain shell use
   `<cmd>; echo SENTINEL` and `await match '^SENTINEL$'` (anchored: the echoed command line
@@ -195,7 +199,7 @@ settle=submitted` types key by key, returns `task_rev=<n>` once the composer cle
   a `lease` before driving one yourself. aterm does not parse Codex screens (`agent=unknown`,
   `program_state=` is its own report, `drive phase` always reads `idle` and `drive answer`
   answers `NO-BOX` there): wait on its own report with `await log kind=program
-  since=<log_seq> ep=<log_ep>`, both read from `status` before you type to it.
+  since=<log_seq> ep=<log_ep> base=<log_base>`, all read from `status` before you type to it.
 - Rating survey (`● How is Claude doing this session?` over `1: Bad 2: Fine 3: Good 0:
   Dismiss`): `phase` ends `survey 0`; dismiss with `aterm ctl "@$SID" key
   'if=^●.How.is.Claude.doing' 0` (the drafted-feedback card, transcript-share question and

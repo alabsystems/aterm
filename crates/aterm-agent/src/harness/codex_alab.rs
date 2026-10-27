@@ -226,6 +226,7 @@ const SUBCOMMANDS: &[&str] = &[
     "archive",
     "delete",
     "migrate-rollouts",
+    "migrate-nfs-db",
     "unarchive",
     "fork",
     "cloud",
@@ -370,6 +371,33 @@ pub fn line_env(home: Option<&str>) -> Vec<(&'static str, &str)> {
     home.map(|value| (HOME_ENV, value)).into_iter().collect()
 }
 
+/// Skips the separate values of the flag token just read (`i` at the next
+/// token), as [`kept_flag_levels`] consumes them: one for [`Arity::One`], and
+/// for [`Arity::Many`] the first whatever it looks like plus each following
+/// non-option. An attached value (`--image=a.png`, `-ia.png`) takes none.
+fn skip_flag_values(argv: &[String], i: &mut usize, tok: &str) {
+    let attached = tok.contains('=') || (!tok.starts_with("--") && tok.chars().count() > 2);
+    if attached {
+        return;
+    }
+    match flag(tok) {
+        Some((Arity::One, _)) => {
+            if *i < argv.len() {
+                *i += 1;
+            }
+        }
+        Some((Arity::Many, _)) => {
+            if *i < argv.len() {
+                *i += 1;
+            }
+            while *i < argv.len() && !maybe_option(&argv[*i]) && argv[*i] != "--" {
+                *i += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Whether `argv` is an interactive Codex TUI's.
 #[must_use]
 pub fn is_tui_argv(argv: &[String]) -> bool {
@@ -383,13 +411,7 @@ pub fn is_tui_argv(argv: &[String]) -> bool {
         if !maybe_option(tok) {
             return !SUBCOMMANDS.contains(&tok) || tok == "resume" || tok == "fork";
         }
-        let attached = tok.contains('=') || (!tok.starts_with("--") && tok.chars().count() > 2);
-        if !attached {
-            let name = tok;
-            if matches!(flag(name), Some((Arity::One | Arity::Many, _))) {
-                i += 1;
-            }
-        }
+        skip_flag_values(argv, &mut i, tok);
     }
     true
 }
@@ -415,10 +437,7 @@ pub fn resumed_thread(argv: &[String]) -> Option<String> {
             }
             return is_thread_id(tok).then(|| tok.to_string());
         }
-        let attached = tok.contains('=') || (!tok.starts_with("--") && tok.chars().count() > 2);
-        if !attached && matches!(flag(tok), Some((Arity::One | Arity::Many, _))) {
-            i += 1;
-        }
+        skip_flag_values(argv, &mut i, tok);
     }
     None
 }

@@ -303,6 +303,14 @@ pub fn reviewer_env(
             .and_then(|a| a.login.clone())
             .unwrap_or_default();
         env.push((crate::harness::accounts::LOGIN_ENV.to_string(), login));
+    } else if default_home
+        && !f.hidden_store
+        && let Some((name, value)) = f.pool.as_ref().and_then(|p| p.serving_login.as_ref())
+    {
+        env.retain(|(k, _)| k != name);
+        if let Some(v) = value {
+            env.push(((*name).to_string(), v.clone()));
+        }
     }
     env
 }
@@ -479,6 +487,36 @@ fn run_one(h: &Host<'_>, f: &Facts, ask: &Ask<'_>) -> (Answer, Option<Outcome>) 
             None
         }
     };
+    let default_home = c
+        .home
+        .var
+        .is_none_or(|v| (h.var)(v).is_none_or(|s| s.is_empty()));
+    if default_home
+        && !f.hidden_store
+        && let Some(seam @ super::connector::Seam::Overlay { .. }) = c.accounts.map(|a| a.seam)
+        && let Some((_, Some(dir))) = f.pool.as_ref().and_then(|p| p.serving_login.as_ref())
+    {
+        let Ok(def_home) = &f.home else {
+            answer.why = Some("no default home for its login overlay".to_string());
+            return (answer, None);
+        };
+        match crate::harness::accounts_overlay::ensure(seam, Path::new(dir), def_home) {
+            Ok(ensured) if ensured.drift.is_empty() => {}
+            Ok(ensured) => {
+                answer.why = Some(format!(
+                    "{dir} holds its own {} ({} shared entr{} not linked to the default home)",
+                    ensured.drift[0].name,
+                    ensured.drift.len(),
+                    if ensured.drift.len() == 1 { "y" } else { "ies" }
+                ));
+                return (answer, None);
+            }
+            Err(e) => {
+                answer.why = Some(format!("its login overlay could not be prepared: {e}"));
+                return (answer, None);
+            }
+        }
+    }
     let env = reviewer_env(c, f, h.var, h.vars);
     let started = Instant::now();
     let ran = h.runner.run(&Job {
@@ -641,9 +679,47 @@ pub fn run_review(
                 && default_home
                 && let Some(fact) = fact
             {
-                let _ = h
-                    .store
-                    .note_if_current(answer.id, &fact.record, How::Review, o, (h.now)());
+                let at = (h.now)();
+                let isolated_pool_login = !fact.hidden_store
+                    && fact
+                        .pool
+                        .as_ref()
+                        .and_then(|p| p.serving_login.as_ref())
+                        .is_some_and(|(_, v)| v.is_some());
+                if !fact.hidden_store
+                    && let Some(pool) = &fact.pool
+                    && let (Some(pool_store), Some(label)) =
+                        (&pool.store, pool.serving_label.as_deref())
+                {
+                    let mut note = None;
+                    let _ = pool_store.transact_logins(at, &mut note, |state, logins| match o {
+                        Outcome::Worked => {
+                            let events = crate::harness::accounts::note_signed_back(
+                                state, logins, label, at,
+                            );
+                            if events.is_empty() {
+                                crate::harness::accounts::note_served_login(logins, label, at);
+                            }
+                            Ok(events)
+                        }
+                        Outcome::Ended(_) => Ok(crate::harness::accounts::note_login_end(
+                            state, logins, label, at,
+                        )),
+                        Outcome::Limited(until) => Ok(crate::harness::accounts::note_wall(
+                            state,
+                            label,
+                            "five_hour",
+                            until,
+                            at,
+                            at,
+                        )),
+                    });
+                }
+                if !isolated_pool_login || matches!(o, Outcome::Worked) {
+                    let _ = h
+                        .store
+                        .note_if_current(answer.id, &fact.record, How::Review, o, at);
+                }
             }
             answers.push(answer);
         }

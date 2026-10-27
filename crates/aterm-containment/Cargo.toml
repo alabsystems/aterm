@@ -23,13 +23,15 @@ aterm-log.workspace = true
 # none inherits a descriptor of this process above stdio (clippy.toml: one child
 # constructor). A dependency-free leaf the one binary links already.
 aterm-uds = { workspace = true }
+# `aterm_tempfile::QUIET`: a test run's `TMPDIR` is the user's `T/.ubd`, which the
+# sandbox profile admits as the user's own temporary root. Dependency-free.
+aterm-tempfile.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]
 aterm-log = { workspace = true }
-aterm-tempfile.workspace = true
 # `aterm_spec::host::could_not_run`: a proof this host cannot run (no HOME, a
 # missing tool) ends COULD NOT RUN, never a silent pass.
 aterm-spec = { workspace = true }

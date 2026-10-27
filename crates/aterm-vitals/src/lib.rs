@@ -9,6 +9,7 @@ pub mod delegated;
 pub mod events;
 pub mod explain;
 pub mod gpu_clients;
+pub mod hardware;
 pub mod history;
 pub mod ink;
 pub mod jobs;
@@ -16,6 +17,8 @@ pub mod model;
 pub mod peaks;
 pub mod program_check;
 pub mod ring;
+pub mod scheduling;
+pub mod services;
 pub mod strain;
 pub mod sys;
 pub mod trend;
@@ -36,7 +39,7 @@ pub use model::{
 pub use peaks::{DailyMax, PeakRow, Peaks, PlanDay, PlanWeek};
 pub use ring::{
     AxisTick, Bucket, BucketRing, Cell, GapKind, MultiScaleSpec, ProgSlot, Reading, SavedBucket,
-    SavedReading, SavedRing, ScaleBand, ScaleCell, SlotGrid, TimeGap,
+    SavedReading, SavedRing, ScaleBand, ScaleCell, SlotGrid, TickAnchor, Tiers, TimeGap,
 };
 pub use strain::Strain;
 pub use trend::{History, Motion, Trend, TrendView};

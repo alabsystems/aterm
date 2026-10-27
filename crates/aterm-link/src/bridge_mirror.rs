@@ -8,13 +8,14 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use super::{
-    past_the_budget, read_back_rows, refused_for_good, Bridge, Opens, Then, DEADLINE_RETRY,
+    past_the_budget, refused_for_good, Bridge, Opens, ReadAt, Then, DEADLINE_RETRY,
     LINK_MIRROR_WAIT_LANE, PIPELINE_WINDOW,
 };
 use crate::ctl::Reply;
 use crate::mirror::{self, Bucket, LandedWord, LogMode, Pin, PinSlot};
 use crate::state::StateDir;
 use crate::subject;
+use aterm_types::fabric_grammar::{MirrorReason, MirrorState};
 
 /// How long a batch none of whose slots could land (every session in it refused by the subject budget) waits before the next take offers them again: the budget is asked again then, never every round.
 pub(super) const REFUSED_WAIT: Duration = Duration::from_secs(2);
@@ -58,7 +59,7 @@ pub(super) struct MirrorRun {
     /// reconciles it, is not complete ([`Bridge::mirror_hello_answered`]).
     awaiting: bool,
     /// An `auto` mirror over a broker that retains nothing, said once a
-    /// change (`link mirror unretained`).
+    /// change ([`MirrorState::Unretained`]).
     unretained: bool,
     /// Why it stopped for this bridge's life, if it did.
     stopped: Option<String>,
@@ -111,9 +112,12 @@ pub(super) struct MirrorRun {
     /// The broker's `oldest=` for this node's `ev` faces as last read:
     /// it only rises, so a window it counts under the budget is.
     oldest: u64,
-    /// The window budget holds the take: said once to the endpoint (`link
-    /// mirror budget`) until the mirror goes on (`link mirror on`).
+    /// The window budget holds the take: said once to the endpoint
+    /// ([`MirrorState::Budget`]) until the mirror goes on ([`MirrorState::On`]).
     waiting: bool,
+    /// The window budget, in body bytes: [`mirror::NODE_WINDOW_BYTES`] (a simulation's
+    /// scaled one, `Bridge::simulate_window`).
+    window: u64,
 }
 
 impl MirrorRun {
@@ -162,6 +166,7 @@ impl MirrorRun {
                 batch: mirror::BATCH_MAX,
                 oldest: 0,
                 waiting: false,
+                window: mirror::NODE_WINDOW_BYTES,
             })
         })
     }
@@ -297,9 +302,11 @@ enum ReadBack {
     Ours,
     /// Another record at that offset on the face: another writer's.
     Other,
-    /// No record at that offset on the face: retention may have taken the
-    /// record since the dedup answer (the broker drops its dedup entry with
-    /// it), or the record there is on a subject this face does not hold.
+    /// No record at that offset on the face: retention gave the record up
+    /// since the dedup answer (a cut, `ReadAt::Cut`: the broker drops its
+    /// dedup entry with it), or the record there is on a subject this face
+    /// does not hold. On a broker that does not tell fetches, also a refusal
+    /// below the face's oldest (`ReadAt::Untold`), the record perhaps held.
     Unread,
 }
 
@@ -344,7 +351,7 @@ impl Bridge {
             if !acked && !stopped {
                 self.introduce();
             } else if unretained && !stopped {
-                let _ = self.ctl_request("link mirror on");
+                let _ = self.ctl_request(&MirrorState::On.request());
             }
             return;
         }
@@ -363,7 +370,7 @@ impl Bridge {
             self.introduce();
         }
         if self.endpoint_lane >= LINK_MIRROR_WAIT_LANE {
-            let _ = self.ctl_request("link mirror unretained");
+            let _ = self.ctl_request(&MirrorState::Unretained.request());
         }
     }
 
@@ -415,7 +422,7 @@ impl Bridge {
 
     /// JUDGE THE PIN an acknowledged mirror starts from, and its durable
     /// copies ([`Bridge::mirror_hello_answered`]'s doc), and say whether the
-    /// mirror runs (`link mirror on`) or stopped for it (`reason=pin`).
+    /// mirror runs ([`MirrorState::On`]) or stopped for it ([`MirrorReason::Pin`]).
     fn mirror_judge_pin(&mut self) {
         let Some(m) = self.mirror.as_deref_mut() else {
             return;
@@ -522,11 +529,24 @@ impl Bridge {
         let report = match self.mirror.as_deref().and_then(|m| m.stopped.as_deref()) {
             Some(why) => {
                 stderr_line!("aterm-link: mirror stopped: {why}");
-                "link mirror stopped reason=pin"
+                MirrorReason::Pin.request()
             }
-            None => "link mirror on",
+            None => MirrorState::On.request(),
         };
-        let _ = self.ctl_request(report);
+        // What aterm is told now is that the mirror runs: a wait on the window budget a run
+        // before this hello announced is no longer what it shows, so the window's next check
+        // says it again while it holds (`Bridge::mirror_window_open` speaks only on a change of
+        // what it last said; aterm-link B05 review: aterm showed the mirror on while it waited).
+        #[cfg(test)]
+        let forget_the_wait = !self
+            .fx
+            .mutant(crate::sim::world::Mutant::JudgeKeepsAnAnnouncedWait);
+        #[cfg(not(test))]
+        let forget_the_wait = true;
+        if let Some(m) = self.mirror.as_deref_mut().filter(|_| forget_the_wait) {
+            m.waiting = false;
+        }
+        let _ = self.ctl_request(&report);
     }
 
     /// WHAT A PERSON DOES about a mirror the pin or its copies stopped: one
@@ -668,6 +688,15 @@ impl Bridge {
         self.broker_retains
     }
 
+    /// TEST-ONLY: the mirror's window budget at `bytes` instead of [`mirror::NODE_WINDOW_BYTES`],
+    /// so a simulation whose rules keep a few records reaches it (sim item B05).
+    #[cfg(test)]
+    pub(crate) fn simulate_window(&mut self, bytes: u64) {
+        if let Some(m) = self.mirror.as_deref_mut() {
+            m.window = bytes;
+        }
+    }
+
     /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, a held-back snapshot's when only it is owed, `None` for nothing.
     pub(super) fn mirror_due(&self, now: Instant) -> Option<Instant> {
         if !self.mirror_engaged() || self.conn.is_none() {
@@ -686,7 +715,7 @@ impl Bridge {
     /// Stop the mirror for this bridge's life: said on stderr and to the
     /// endpoint (`fabric status mirror=stopped:<reason>` or `capped`), the
     /// pin kept for a later bridge.
-    fn mirror_stop(&mut self, why: &str, report: &str) {
+    fn mirror_stop(&mut self, why: &str, reason: MirrorReason) {
         let Some(m) = self.mirror.as_deref_mut() else {
             return;
         };
@@ -698,7 +727,7 @@ impl Bridge {
             "aterm-link: mirror stopped for this bridge's life: {why}; the pinned batch, if \
              any, is kept for the next"
         );
-        let _ = self.ctl_request(report);
+        let _ = self.ctl_request(&reason.request());
     }
 
     /// THE PASS: re-pin after a collision, take when nothing is pinned, send what is owed, and settle a batch whose every slot concluded.
@@ -758,7 +787,7 @@ impl Bridge {
                 if let Some(m) = self.mirror.as_deref_mut() {
                     m.waiting = false;
                 }
-                let _ = self.ctl_request("link mirror on");
+                let _ = self.ctl_request(&MirrorState::On.request());
             }
             if total >= mirror::TOTAL_MAX_BYTES {
                 self.mirror_stop(
@@ -766,7 +795,7 @@ impl Bridge {
                         "the node mirrored its total of {} bytes with no retention in the broker",
                         mirror::TOTAL_MAX_BYTES
                     ),
-                    "link mirror capped reason=total",
+                    MirrorReason::Total,
                 );
                 return;
             }
@@ -805,7 +834,7 @@ impl Bridge {
                 } else {
                     self.mirror_stop(
                         &format!("the endpoint refused log-take ({header})"),
-                        "link mirror stopped reason=endpoint",
+                        MirrorReason::Endpoint,
                     );
                 }
                 return;
@@ -814,7 +843,7 @@ impl Bridge {
         let mirror::Taken { slots, more, due } = match mirror::parse_take(&header, &body) {
             Ok(taken) => taken,
             Err(e) => {
-                self.mirror_stop(&e, "link mirror stopped reason=endpoint");
+                self.mirror_stop(&e, MirrorReason::Endpoint);
                 return;
             }
         };
@@ -878,9 +907,9 @@ impl Bridge {
 
     /// THE WINDOW BUDGET, on a
     /// retaining broker: whether this node's landed bytes in the broker's
-    /// window are under [`mirror::NODE_WINDOW_BYTES`].
+    /// window are under [`mirror::NODE_WINDOW_BYTES`] (the run's `window`).
     fn mirror_window_open(&mut self) -> bool {
-        let over = |m: &MirrorRun| m.pin.window_bytes(m.oldest) >= mirror::NODE_WINDOW_BYTES;
+        let over = |m: &MirrorRun| m.pin.window_bytes(m.oldest) >= m.window;
         if self.mirror.as_deref().is_some_and(over) {
             let faces = format!("/f/{}/pub/{}/*/ev", self.cfg.fleet, self.node);
             let fx = self.fx.clone();
@@ -892,6 +921,12 @@ impl Bridge {
             let Ok((oldest, _)) = self.observe(started, answer, Some("read")) else {
                 return false;
             };
+            #[cfg(test)]
+            let oldest = oldest.filter(|_| {
+                !self
+                    .fx
+                    .mutant(crate::sim::world::Mutant::MirrorIgnoresOldest)
+            });
             if let (Some(m), Some(oldest)) = (self.mirror.as_deref_mut(), oldest) {
                 m.oldest = m.oldest.max(oldest);
                 m.pin.prune_window(m.oldest);
@@ -901,7 +936,7 @@ impl Bridge {
             return false;
         };
         let window = m.pin.window_bytes(m.oldest);
-        let open = window < mirror::NODE_WINDOW_BYTES;
+        let open = window < m.window;
         if open == !m.waiting {
             return open;
         }
@@ -910,21 +945,21 @@ impl Bridge {
             stderr_line!(
                 "aterm-link: mirror: the broker's window has room again; the mirror goes on"
             );
-            "link mirror on"
+            MirrorState::On
         } else {
             stderr_line!(
                 "aterm-link: mirror: this node's {window} bytes in the broker's window (from \
                  @{}) reach its budget of {}; the mirror waits for the broker's retention to \
                  give the oldest of them up",
                 m.oldest,
-                mirror::NODE_WINDOW_BYTES
+                m.window
             );
             if self.endpoint_lane < LINK_MIRROR_WAIT_LANE {
                 return open;
             }
-            "link mirror budget"
+            MirrorState::Budget
         };
-        let _ = self.ctl_request(report);
+        let _ = self.ctl_request(&report.request());
         open
     }
 
@@ -1150,7 +1185,7 @@ impl Bridge {
             Err(e) if refused_for_good(&e) => {
                 self.mirror_stop(
                     &format!("the broker refused a mirrored record for good: {e}"),
-                    "link mirror stopped reason=refused",
+                    MirrorReason::Refused,
                 );
                 Outcome::Owed
             }
@@ -1261,18 +1296,39 @@ impl Bridge {
         let mut again = false;
         for (i, off, sid, body, pseq) in checks {
             let face = subject::session_face(&self.cfg.fleet, &self.node, &sid, "ev");
-            let fx = self.fx.clone();
-            let Some(conn) = self.conn_now() else {
-                return;
-            };
-            let started = fx.now();
-            let answer = read_back_rows(conn.fetch(off, &face, 1), off);
-            let read = match self.observe(started, answer, Some("read")) {
-                Ok(rows) => match rows.iter().find(|(at, f, _)| *at == off && *f == face) {
-                    Some((_, _, bytes)) if bytes == body.as_bytes() => ReadBack::Ours,
-                    Some(_) => ReadBack::Other,
-                    None => ReadBack::Unread,
-                },
+            // A cut is no record there yet: the slot is sent again at its pinned sequence, and
+            // since astream dropped its key with it, it appends anew. A record retention still
+            // holds below the face's oldest is read, never taken for a cut ([`Bridge::read_at`]).
+            let read = match self.read_at(off, &face) {
+                Ok(ReadAt::Rows(rows)) => {
+                    match rows.iter().find(|(at, f, _)| *at == off && *f == face) {
+                        Some((_, _, bytes)) if bytes == body.as_bytes() => ReadBack::Ours,
+                        Some(_) => ReadBack::Other,
+                        None => ReadBack::Unread,
+                    }
+                }
+                Ok(ReadAt::Cut(_)) => ReadBack::Unread,
+                // As before told fetches: a broker that does not tell them leaves the refusal
+                // undecided, and it is read as no record there.
+                Ok(ReadAt::Untold(floor)) => {
+                    stderr_line!(
+                        "aterm-link: mirror: the read back of sequence {pseq} at @{off} meets \
+                         {face}'s oldest @{floor} on a broker that does not tell fetches: read \
+                         as no record there, which retention may still hold"
+                    );
+                    ReadBack::Unread
+                }
+                // No answer about the record, and none of the link's: the pass waits, the link
+                // kept, rather than taking it for no record and sending a second copy.
+                Ok(ReadAt::Unasked(e)) => {
+                    stderr_line!(
+                        "aterm-link: mirror: the read back of sequence {pseq} at @{off} meets \
+                         {face}'s oldest, and its told read could not be made ({e}); tried \
+                         again later"
+                    );
+                    self.mirror_retry_in(DEADLINE_RETRY);
+                    return;
+                }
                 Err(_) => return,
             };
             let doubted = self
@@ -1382,7 +1438,7 @@ impl Bridge {
                 return;
             }
             Err(e) => {
-                self.mirror_stop(&e, "link mirror stopped reason=endpoint");
+                self.mirror_stop(&e, MirrorReason::Endpoint);
                 return;
             }
         };
@@ -1456,21 +1512,75 @@ impl Bridge {
         }
     }
 
-    /// The bus log was replaced: the pinned batch names the old one.
-    pub(super) fn mirror_forget_log(&mut self) {
+    /// The bus log was replaced: the pinned batch names the old one. Its write refused refuses the
+    /// attach (`Bridge::forget_log_offsets` returns it) before the attach moves the node's
+    /// witness to the new log (`Bridge::save_log_witness`), so the next attach meets the move
+    /// again and drops the batch again (aterm-link B05 review: an attach
+    /// that went on past it left the batch on disk, which the hello then judged and recovered
+    /// onto the moved log, a slot of a lost batch landed and the batch never mirrored again).
+    ///
+    /// # Errors
+    /// The dropped pin's write.
+    pub(super) fn mirror_forget_log(&mut self) -> io::Result<()> {
         let Some(m) = self.mirror.as_deref_mut() else {
-            return;
+            return self.mirror_forget_pinned_batch();
         };
         m.oldest = 0;
         if m.pin.slots.is_empty() && m.pin.win.is_empty() {
-            return;
+            // A pin no hello has judged yet is on disk alone (an `auto` mirror waits for the
+            // broker's rules, and then the hello, after the attach saw the move): the mirror
+            // that judges it later would recover its batch onto this log (sim item B05). So is
+            // one whose drop an earlier attach's write did not put there.
+            return self.mirror_forget_pinned_batch();
         }
         m.pin.win.clear();
         m.clear_batch();
         m.repin = false;
         m.owed = true;
-        if let Err(e) = self.state.set_logpin(&m.pin.render()) {
-            stderr_line!("aterm-link: mirror: the dropped pin could not be written ({e})");
+        let written = self.state.set_logpin(&m.pin.render());
+        self.refused_drop(written)
+    }
+
+    /// [`Bridge::mirror_forget_log`] for the pin on disk: its batch and its window ledger go,
+    /// its total and key stay. A pin that does not read is the hello's to judge, as before.
+    fn mirror_forget_pinned_batch(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::ForgetOnlyAJudgedPin)
+        {
+            return Ok(());
         }
+        let Ok(Some(text)) = self.state.logpin() else {
+            return Ok(());
+        };
+        let Ok(pin) = Pin::parse(&text) else {
+            return Ok(());
+        };
+        if pin.slots.is_empty() && pin.win.is_empty() {
+            return Ok(());
+        }
+        let pin = Pin {
+            win: Vec::new(),
+            slots: Vec::new(),
+            ..pin
+        };
+        let written = self.state.set_logpin(&pin.render());
+        self.refused_drop(written)
+    }
+
+    /// A dropped pin's write, said where the disk refused it; returned, so the attach does not
+    /// go on past it (but with the rule switched off, `attach_past_an_unwritten_drop`, a test's
+    /// negative control).
+    fn refused_drop(&self, written: io::Result<()>) -> io::Result<()> {
+        let Err(e) = written else {
+            return Ok(());
+        };
+        stderr_line!("aterm-link: mirror: the dropped pin could not be written ({e})");
+        #[cfg(test)]
+        if self.attach_past_an_unwritten_drop {
+            return Ok(());
+        }
+        Err(e)
     }
 }

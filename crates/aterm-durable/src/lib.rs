@@ -138,6 +138,11 @@ impl Flush {
     /// The directory could not be opened, or the flush's own error.
     #[inline]
     pub fn dir(self, dir: &Path) -> io::Result<()> {
+        #[cfg(any(test, debug_assertions, feature = "test-support"))]
+        if let Some(failed) = seam::dir_failure() {
+            seam::note(self);
+            return Err(failed);
+        }
         if cfg!(windows) {
             #[cfg(any(test, debug_assertions, feature = "test-support"))]
             seam::note(self);
@@ -201,6 +206,22 @@ impl DirFlushed {
     #[must_use]
     pub const fn is_flushed(&self) -> bool {
         matches!(self, Self::Flushed)
+    }
+}
+
+/// Accept a refused file flush for a writer that can proceed without its durability promise.
+/// Pass only the flush's result: opening or writing the file must still succeed. A refusal
+/// is classified by `astream_sys::file_flush_refused`; accepting it does not establish that
+/// the write will survive power loss. Writers that require a successful flush use
+/// [`durable`], [`ordered`] or [`Flush::file`] without this opt-in.
+///
+/// # Errors
+/// The original flush error unless it is a refusal. I/O failures, exhausted space, denied
+/// permission and missing files remain errors.
+pub fn refusal_accepted(flushed: io::Result<()>) -> io::Result<()> {
+    match flushed {
+        Err(error) if astream_sys::file_flush_refused(&error) => Ok(()),
+        result => result,
     }
 }
 
@@ -488,6 +509,87 @@ pub mod seam {
         });
     }
 
+    /// The number this platform gives a volume's I/O error, a flush that failed, for
+    /// [`FailingDirs::with`]: `EIO` (5) on Unix, and `ERROR_IO_DEVICE` (1117) on Windows,
+    /// where 5 is `ERROR_ACCESS_DENIED`, which [`astream_sys::dir_flush_unavailable`] reads as
+    /// a folder this process may not open rather than as a failed flush.
+    pub const EIO: i32 = if cfg!(windows) { 1117 } else { 5 };
+
+    /// The number this platform gives a volume's refusal to flush, which
+    /// [`astream_sys::dir_flush_unavailable`] reads as unavailable, for
+    /// [`FailingDirs::with`]: `ENOTSUP` on Unix (Darwin's 45, Linux's 95), and
+    /// `ERROR_CALL_NOT_IMPLEMENTED` (120, std's `Unsupported`) on Windows.
+    pub const ENOTSUP: i32 = if cfg!(target_vendor = "apple") {
+        45
+    } else if cfg!(windows) {
+        120
+    } else {
+        95
+    };
+
+    #[derive(Clone, Copy)]
+    enum DirFailure {
+        Errno(i32),
+        Kind(std::io::ErrorKind),
+    }
+
+    /// Directory flushes to let through before the injected error starts.
+    type Failing = Option<(u32, DirFailure)>;
+
+    thread_local! {
+        static FAILING_DIRS: std::cell::Cell<Failing> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Fail directory flushes on this thread before opening a directory, recording the
+    /// requested strength. Nested guards restore the outer fault when they drop.
+    #[must_use = "the failure stops when it drops"]
+    pub struct FailingDirs {
+        outer: Failing,
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl FailingDirs {
+        /// Fail this thread's directory flushes with `errno`, a number as this platform gives
+        /// it ([`EIO`], [`ENOTSUP`]): a POSIX errno is another error on Windows.
+        pub fn with(errno: i32) -> Self {
+            Self::after(0, errno)
+        }
+
+        /// Let `real` directory flushes through, then fail each with `errno`.
+        pub fn after(real: u32, errno: i32) -> Self {
+            Self::install(real, DirFailure::Errno(errno))
+        }
+
+        /// Fail with a portable kind, without assuming another platform's errno numbers.
+        pub fn with_kind(kind: std::io::ErrorKind) -> Self {
+            Self::install(0, DirFailure::Kind(kind))
+        }
+
+        fn install(real: u32, failure: DirFailure) -> Self {
+            Self {
+                outer: FAILING_DIRS.with(|failing| failing.replace(Some((real, failure)))),
+                _thread: std::marker::PhantomData,
+            }
+        }
+    }
+
+    impl Drop for FailingDirs {
+        fn drop(&mut self) {
+            FAILING_DIRS.with(|failing| failing.set(self.outer.take()));
+        }
+    }
+
+    pub(crate) fn dir_failure() -> Option<std::io::Error> {
+        FAILING_DIRS.with(|failing| match failing.get()? {
+            (0, DirFailure::Errno(errno)) => Some(std::io::Error::from_raw_os_error(errno)),
+            (0, DirFailure::Kind(kind)) => Some(std::io::Error::from(kind)),
+            (real, failure) => {
+                failing.set(Some((real - 1, failure)));
+                None
+            }
+        })
+    }
+
     /// The environment variable [`plain_durable_flushes`] sets, on Apple targets, the only
     /// ones that read it. A process a test starts without it takes the durable flushes aterm
     /// ships ([`crate::durable_flushes_are_plain`] is `false` there).
@@ -511,14 +613,77 @@ pub mod seam {
 mod tests {
     #[cfg(unix)]
     use super::DirFlushed;
-    use super::{Flush, durable, durable_data, durable_dir, ordered, ordered_dir, primitive, seam};
-    use std::io::Write as _;
+    use super::{
+        Flush, durable, durable_data, durable_dir, ordered, ordered_dir, primitive,
+        refusal_accepted, seam,
+    };
+    use std::io::{self, Write as _};
 
     fn scratch() -> aterm_tempfile::TempDir {
         aterm_tempfile::Builder::new()
             .prefix("aterm-durable-")
             .tempdir()
             .expect("a scratch directory")
+    }
+
+    /// The seam's numbers are this platform's own: [`seam::EIO`] is a failed flush and
+    /// [`seam::ENOTSUP`] the volume's refusal, as astream reads them here (on Windows a POSIX
+    /// 5 would be `ERROR_ACCESS_DENIED`, read as unavailable).
+    #[test]
+    fn the_seams_numbers_are_a_failed_flush_and_a_refusal_here() {
+        let error = io::Error::from_raw_os_error;
+        assert!(!astream_sys::dir_flush_unavailable(&error(seam::EIO)));
+        assert!(astream_sys::dir_flush_unavailable(&error(seam::ENOTSUP)));
+        assert!(astream_sys::file_flush_refused(&error(seam::ENOTSUP)));
+    }
+
+    #[test]
+    fn directory_faults_preserve_strength_restore_nesting_and_stay_on_their_thread() {
+        let dir = scratch();
+        let recorded = seam::Recording::start();
+        {
+            let _failure = seam::FailingDirs::with_kind(io::ErrorKind::Other);
+            assert_eq!(
+                Flush::Ordered.dir(dir.path()).unwrap_err().kind(),
+                io::ErrorKind::Other
+            );
+            {
+                let _refused = seam::FailingDirs::with_kind(io::ErrorKind::Unsupported);
+                assert!(matches!(
+                    Flush::Durable.dir_best_effort(dir.path()),
+                    Ok(super::DirFlushed::Unavailable(_))
+                ));
+            }
+            assert_eq!(
+                Flush::Durable.dir(dir.path()).unwrap_err().kind(),
+                io::ErrorKind::Other
+            );
+            let path = dir.path().to_path_buf();
+            std::thread::spawn(move || Flush::Ordered.dir(&path))
+                .join()
+                .unwrap()
+                .unwrap();
+        }
+        Flush::Durable.dir(dir.path()).unwrap();
+        {
+            let _second = seam::FailingDirs::after(1, 5);
+            Flush::Ordered.dir(dir.path()).unwrap();
+            assert_eq!(
+                Flush::Durable.dir(dir.path()).unwrap_err().raw_os_error(),
+                Some(5)
+            );
+        }
+        assert_eq!(
+            recorded.take(),
+            [
+                Flush::Ordered,
+                Flush::Durable,
+                Flush::Durable,
+                Flush::Durable,
+                Flush::Ordered,
+                Flush::Durable
+            ]
+        );
     }
 
     #[test]
@@ -619,15 +784,51 @@ mod tests {
         }
     }
 
-    /// `ENOTSUP` as this platform numbers it: Darwin's 45, which std leaves uncategorized,
-    /// and Linux's 95, which std reads as `Unsupported`.
+    /// `ENOTSUP` as this platform numbers it ([`seam::ENOTSUP`]): Darwin's 45, which std leaves
+    /// uncategorized, and Linux's 95, which std reads as `Unsupported`.
     #[cfg(unix)]
     fn enotsup() -> std::io::Error {
-        std::io::Error::from_raw_os_error(if cfg!(target_vendor = "apple") {
-            45
-        } else {
-            95
-        })
+        std::io::Error::from_raw_os_error(seam::ENOTSUP)
+    }
+
+    #[test]
+    fn accepting_a_file_refusal_preserves_success_and_portable_refusals() {
+        assert!(refusal_accepted(Ok(())).is_ok());
+        for kind in [io::ErrorKind::Unsupported, io::ErrorKind::InvalidInput] {
+            assert!(refusal_accepted(Err(io::Error::from(kind))).is_ok());
+        }
+    }
+
+    #[test]
+    fn accepting_a_file_refusal_preserves_other_errors_and_their_payloads() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::StorageFull,
+            io::ErrorKind::Other,
+            io::ErrorKind::WriteZero,
+        ] {
+            let error = refusal_accepted(Err(io::Error::new(kind, std::fmt::Error))).unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert!(error.get_ref().unwrap().is::<std::fmt::Error>());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepting_a_file_refusal_preserves_real_io_failure_errnos() {
+        for errno in [5, 28, 1, 9, 13, 2] {
+            let error = refusal_accepted(Err(io::Error::from_raw_os_error(errno))).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn accepting_a_file_refusal_recognizes_darwin_raw_refusals() {
+        for errno in [19, 22, 25, 45] {
+            assert!(refusal_accepted(Err(io::Error::from_raw_os_error(errno))).is_ok());
+        }
     }
 
     /// A directory flush that fails with `EIO` is an error to a best-effort writer too; one
@@ -648,6 +849,26 @@ mod tests {
             other => panic!("ENOTSUP is the volume's refusal, not {other:?}"),
         }
         assert!(DirFlushed::classify(Ok(())).unwrap().is_flushed());
+    }
+
+    /// The kernel's own refusal is accepted: `F_FULLFSYNC` on `/dev/null`. std gives Darwin's
+    /// `ENOTSUP` (45) neither kind a check of the kind alone accepted, so it is the errno half
+    /// of the classification that accepts it.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn accepting_a_file_refusal_accepts_the_kernels_own() {
+        assert!(
+            !matches!(
+                enotsup().kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+            ),
+            "CONTROL: std now names Darwin's ENOTSUP by kind; the errno half is untested"
+        );
+        let null = std::fs::File::open("/dev/null").unwrap();
+        assert!(
+            refusal_accepted(primitive::full(&null)).is_ok(),
+            "the real refusal of F_FULLFSYNC on /dev/null"
+        );
     }
 
     /// Over real directories: a directory flushes either way; one that is gone, and one this

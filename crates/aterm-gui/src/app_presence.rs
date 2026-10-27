@@ -778,6 +778,13 @@ impl App {
                 }
                 self.harness_screen_moved();
             }
+            // Only Settings ▸ Harness's state line and `status waiting=` say it, so no title,
+            // hover or status item is read again.
+            crate::HarnessFact::Waiting(wait) => {
+                if crate::harness_glass::on_waiting(self, session, wait) {
+                    self.harness_screen_moved();
+                }
+            }
             crate::HarnessFact::Needs => {
                 let was = self
                     .presence
@@ -1450,7 +1457,7 @@ impl App {
 
     /// The native pill's click as its wake delivers it (`Wake::PillAct`).
     pub(crate) fn on_pill_wake(&mut self, window: WindowId, session: u64, hit: presence::PillHit) {
-        self.clear_tab_surface_move_license(Some(window));
+        self.fence_pointer_license(window);
         self.settle_rename_edit(window);
         self.on_pill_act(window, session, hit);
     }

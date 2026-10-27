@@ -51,6 +51,7 @@ pub const ORCA_ECHO: &str = "ORCA-42";
 pub const SPEECHD_CONF: &str = "\
 AddModule \"dummy\" \"sd_dummy\" \"\"\n\
 DefaultModule dummy\n\
+AudioOutputMethod \"libao\"\n\
 LogLevel 5\n";
 
 /// What speech-dispatcher's log writes before each message a client asked it to speak.
@@ -967,7 +968,74 @@ impl OrcaScreen {
             OrcaScreen::MutterWayland => "orca-mutter-wayland",
         }
     }
+
+    /// Whether Mutter runs here, and with it its frames client ([`FRAMES`]).
+    #[must_use]
+    pub const fn mutter(self) -> bool {
+        match self {
+            OrcaScreen::Xvfb => false,
+            OrcaScreen::MutterX11 | OrcaScreen::MutterWayland => true,
+        }
+    }
 }
+
+/// What an Orca row does, in order: [`orca_steps`] names them and `orca_run` runs them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrcaStep {
+    /// Mutter's frames client on the AT-SPI registry ([`FRAMES`], [`FRAMES_PRIMER`]).
+    Frames,
+    /// speech-dispatcher listening on its own socket, its dummy module the only output.
+    Speech,
+    /// The screen reader flag on, Orca started, and its first message queued.
+    Orca,
+    /// aterm-gui started on the row's screen: its control socket ready and its publisher joined.
+    Gui,
+    /// aterm-gui's window given the keyboard: the X focus (Xvfb), Mutter's activation (its
+    /// Xwayland), or the RemoteDesktop seat's first key (Wayland).
+    Focus,
+    /// The walk reads the terminal's prompt, and Orca spoke it.
+    Read,
+    /// [`ORCA_TYPED`] typed, and its output on the screen.
+    Type,
+    /// Orca spoke the output, or, as a Wayland client, said why it did not.
+    Heard,
+}
+
+/// An Orca row's steps on `screen` ([`OrcaStep`]).
+///
+/// Under Mutter, the frames client is on the registry before aterm-gui starts
+/// ([`OrcaStep::Frames`]). Mutter starts it with Xwayland, for the first X11 client, and it joins
+/// the registry only when it first frames a window. Once it joined only after aterm-gui's window
+/// had the focus. Orca then took the frame it drew for aterm-gui's window activation and left the
+/// terminal's script (docs/measured/linux-lane-2026-10-23.md). The step comes first, so Orca
+/// joins a registry that already holds the client and never hears the window that brought it.
+#[must_use]
+pub fn orca_steps(screen: OrcaScreen) -> Vec<OrcaStep> {
+    let mut steps = Vec::new();
+    if screen.mutter() {
+        steps.push(OrcaStep::Frames);
+    }
+    steps.extend([
+        OrcaStep::Speech,
+        OrcaStep::Orca,
+        OrcaStep::Gui,
+        OrcaStep::Focus,
+        OrcaStep::Read,
+        OrcaStep::Type,
+        OrcaStep::Heard,
+    ]);
+    steps
+}
+
+/// Mutter's frames client: the GTK program Mutter runs beside its Xwayland to draw each X11
+/// window's frame (`/usr/libexec/mutter-x11-frames`), and the application it joins the AT-SPI
+/// registry as.
+pub const FRAMES: &str = "mutter-x11-frames";
+
+/// The throwaway X11 window (x11-utils' `xev`) that the frames client frames, which has it join
+/// the registry ([`OrcaStep::Frames`]): its unit's name after [`guest::UNIT_PREFIX`], and its
+/// title.
+pub const FRAMES_PRIMER: &str = "frames-primer";
 
 /// A variable a client is started with: its name and value.
 pub type Var = (String, String);
@@ -1165,11 +1233,26 @@ enum On<'a> {
     MutterWayland(&'a Mutter),
 }
 
-impl On<'_> {
+impl<'a> On<'a> {
     fn x(self, up: &Up) -> Vec<(String, String)> {
         match self {
             On::Xvfb => vec![Display::Xvfb.client_env(&up.runtime)],
             On::MutterX11(m) | On::MutterWayland(m) => m.x.clone(),
+        }
+    }
+
+    const fn screen(self) -> OrcaScreen {
+        match self {
+            On::Xvfb => OrcaScreen::Xvfb,
+            On::MutterX11(_) => OrcaScreen::MutterX11,
+            On::MutterWayland(_) => OrcaScreen::MutterWayland,
+        }
+    }
+
+    const fn mutter(self) -> Option<&'a Mutter> {
+        match self {
+            On::Xvfb => None,
+            On::MutterX11(m) | On::MutterWayland(m) => Some(m),
         }
     }
 }
@@ -1181,222 +1264,442 @@ fn x_client(x: &[(String, String)], argv: &[&str]) -> Vec<String> {
     )
 }
 
-fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result<String, String> {
-    let up = gui.up;
-    let d = &gui.dir;
-    let conf = format!("{d}/speechd");
-    let socket = format!("{d}/speechd.sock");
-    let _ = up.sh(&[
-        "install".into(),
-        "-d".into(),
-        conf.clone(),
-        format!("{d}/speechd-log"),
-        format!("{d}/seat"),
-    ]);
-    let made = up.guest.shell(
-        &up.home,
-        &["tee".into(), format!("{conf}/speechd.conf")],
-        Some(SPEECHD_CONF),
-    );
-    if !made.ok() {
-        return Err(format!("speechd.conf: {}", made.tail(2)));
-    }
-    let speechd = guest::Unit {
-        name: format!("{}speechd", guest::UNIT_PREFIX),
-        env: Vec::new(),
-        argv: [
-            "speech-dispatcher",
-            "--run-single",
-            "--timeout",
-            "0",
-            "--communication-method",
-            "unix_socket",
-            "--socket-path",
-            &socket,
-            "--config-dir",
-            &conf,
-            "--log-dir",
-            &format!("{d}/speechd-log"),
-        ]
-        .map(str::to_string)
-        .to_vec(),
-        socket: socket.clone(),
-    };
-    let started = up.sh(&guest::run_unit(&speechd, None));
-    if !started.ok() || !up.sh(&guest::wait_socket(&socket, HANG_SECS)).ok() {
-        return Err(format!(
-            "speech-dispatcher never listened ({HANG_SECS} s): {}",
-            started.tail(2)
-        ));
-    }
-    let _ = screen_reader(up, true);
-    let x = on.x(up);
-    let mut env = x.clone();
-    if let On::MutterWayland(m) = on {
-        env.push(m.wayland.clone());
-        env.push(("XDG_SESSION_TYPE".into(), "wayland".into()));
-    }
-    env.extend([
-        (
-            "DBUS_SESSION_BUS_ADDRESS".into(),
-            format!("unix:path={}/bus", up.runtime),
+/// `$pid`: Mutter's (`$1`) newest child process whose command line names `$2` ([`FRAMES`]).
+const FRAMES_PID: &str = "pid=$(pgrep -n -P \"$1\" -f \"$2\")";
+
+/// Wait in the guest until Mutter's frames client is an application on the AT-SPI registry.
+/// `lane-bus atspi-walk` (`$3`) finds it by name and pid among the registry's children. This is a
+/// hang detector, as [`guest::wait_socket`] is.
+fn frames_wait(mutter: &str, lane_bus: &str, runtime: &str, secs: u32) -> Vec<String> {
+    vec![
+        "env".into(),
+        format!("DBUS_SESSION_BUS_ADDRESS=unix:path={runtime}/bus"),
+        "timeout".into(),
+        secs.to_string(),
+        "sh".into(),
+        "-c".into(),
+        format!(
+            "until {FRAMES_PID} && \"$3\" atspi-walk \"$2\" \"$pid\" >/dev/null 2>&1; \
+             do sleep 0.1; done"
         ),
-        ("HOME".into(), format!("{d}/home")),
-        ("XDG_RUNTIME_DIR".into(), up.runtime.clone()),
-        ("SPEECHD_ADDRESS".into(), format!("unix_socket:{socket}")),
-    ]);
-    let orca = guest::Unit {
-        name: format!("{}orca", guest::UNIT_PREFIX),
-        env,
-        argv: vec![
-            "orca".into(),
-            "--debug-file".into(),
-            debug.into(),
-            "--user-prefs".into(),
-            format!("{d}/orca-prefs"),
-        ],
-        socket: String::new(),
-    };
-    if !up.sh(&guest::run_unit(&orca, None)).ok() {
-        return Err("Orca's unit did not start".into());
-    }
-    wait_lines(
+        "wait-frames".into(),
+        mutter.into(),
+        FRAMES.into(),
+        lane_bus.into(),
+    ]
+}
+
+/// What the guest shows once [`frames_wait`] gave up: whether the window's unit (`$4`) still
+/// runs, the frames client's process, and what `lane-bus atspi-walk` read on the registry.
+fn frames_seen(mutter: &str, lane_bus: &str, runtime: &str, primer: &str) -> Vec<String> {
+    vec![
+        "env".into(),
+        format!("DBUS_SESSION_BUS_ADDRESS=unix:path={runtime}/bus"),
+        "sh".into(),
+        "-c".into(),
+        format!(
+            "echo \"$4 is $(systemctl --user is-active \"$4\");\"; \
+             if {FRAMES_PID}; then echo \"$2 is process $pid, Mutter's ($1); lane-bus says:\"; \
+             \"$3\" atspi-walk \"$2\" \"$pid\" 2>&1 | tail -n 2; \
+             else echo \"Mutter ($1) runs no $2\"; fi"
+        ),
+        "frames-seen".into(),
+        mutter.into(),
+        FRAMES.into(),
+        lane_bus.into(),
+        primer.into(),
+    ]
+}
+
+/// Stop the window's unit (`$1`), and succeed only once it no longer runs: its X connection is
+/// closed, so Mutter unmaps the window before Orca starts.
+fn primer_closed(primer: &str) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        "systemctl --user stop \"$1\"; ! systemctl --user is-active --quiet \"$1\"".into(),
+        "primer-closed".into(),
+        primer.into(),
+    ]
+}
+
+/// What an Orca row's steps share ([`orca_steps`]).
+struct OrcaRun<'r, 'g> {
+    gui: &'r Gui<'g>,
+    on: On<'r>,
+    speechd_log: &'r str,
+    debug: &'r str,
+    /// aterm-gui's main pid ([`OrcaStep::Gui`]).
+    pid: String,
+    /// The frame's name the walk read ([`OrcaStep::Read`]).
+    frame: String,
+    /// The outputs Orca's debug log left unspoken before the line was typed ([`NO_CAUSE`]).
+    unspoken_before: usize,
+}
+
+fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result<String, String> {
+    let mut run = OrcaRun {
         gui,
+        on,
         speechd_log,
-        QUEUED,
-        1,
-        "Orca never spoke after starting",
-    )?;
-    let stderr = format!("{d}/gui.stderr");
-    match on {
-        On::Xvfb => gui.start_logged(Some(Display::Xvfb), &[], &stderr)?,
-        On::MutterX11(m) => gui.start_logged_on(&m.x, &stderr)?,
-        On::MutterWayland(m) => gui.start_logged_on(std::slice::from_ref(&m.wayland), &stderr)?,
+        debug,
+        pid: String::new(),
+        frame: String::new(),
+        unspoken_before: 0,
     };
-    if !up.sh(&guest::wait_socket(&gui.sock(), 60)).ok() {
-        return Err("the control socket never listened (60 s)".into());
+    for step in orca_steps(on.screen()) {
+        run.step(step)?;
     }
-    gui.expect(&["ready", "60000"], &|r| r.starts_with("OK ready"))?;
-    wait_lines(
-        gui,
-        &log_path(gui),
-        JOINED,
-        1,
-        "the publisher never joined the AT-SPI bus",
-    )?;
-    let pid = proof::unit_pid(up, &Gui::unit_name()).ok_or("aterm-gui's unit has no main pid")?;
-    let seat = format!("{d}/seat");
-    match on {
-        On::Xvfb | On::MutterX11(_) => {
-            let found = up.sh(&x_client(
-                &x,
-                &[
-                    "timeout",
-                    "60",
-                    "xdotool",
-                    "search",
-                    "--sync",
-                    "--onlyvisible",
-                    "--pid",
-                    &pid,
-                ],
+    Ok(run.frame)
+}
+
+impl OrcaRun<'_, '_> {
+    fn step(&mut self, step: OrcaStep) -> Result<(), String> {
+        match step {
+            OrcaStep::Frames => self.frames(),
+            OrcaStep::Speech => self.speech(),
+            OrcaStep::Orca => self.orca(),
+            OrcaStep::Gui => self.start_gui(),
+            OrcaStep::Focus => self.focus(),
+            OrcaStep::Read => self.read(),
+            OrcaStep::Type => self.type_line(),
+            OrcaStep::Heard => self.heard(),
+        }
+    }
+
+    fn speechd_socket(&self) -> String {
+        format!("{}/speechd.sock", self.gui.dir)
+    }
+
+    fn seat(&self) -> String {
+        format!("{}/seat", self.gui.dir)
+    }
+
+    fn speech(&self) -> Result<(), String> {
+        let up = self.gui.up;
+        let d = &self.gui.dir;
+        let conf = format!("{d}/speechd");
+        let socket = self.speechd_socket();
+        let _ = up.sh(&[
+            "install".into(),
+            "-d".into(),
+            conf.clone(),
+            format!("{d}/speechd-log"),
+            self.seat(),
+        ]);
+        let made = up.guest.shell(
+            &up.home,
+            &["tee".into(), format!("{conf}/speechd.conf")],
+            Some(SPEECHD_CONF),
+        );
+        if !made.ok() {
+            return Err(format!("speechd.conf: {}", made.tail(2)));
+        }
+        let speechd = guest::Unit {
+            name: format!("{}speechd", guest::UNIT_PREFIX),
+            env: Vec::new(),
+            argv: [
+                "speech-dispatcher",
+                "--run-single",
+                "--timeout",
+                "0",
+                "--communication-method",
+                "unix_socket",
+                "--socket-path",
+                &socket,
+                "--config-dir",
+                &conf,
+                "--log-dir",
+                &format!("{d}/speechd-log"),
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            socket: socket.clone(),
+        };
+        let started = up.sh(&guest::run_unit(&speechd, None));
+        if !started.ok() || !up.sh(&guest::wait_socket(&socket, HANG_SECS)).ok() {
+            return Err(format!(
+                "speech-dispatcher never listened ({HANG_SECS} s): {}",
+                started.tail(2)
             ));
-            let window = found
-                .text
-                .lines()
-                .map(str::trim)
-                .find(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit()))
-                .ok_or_else(|| format!("aterm-gui's X window was never mapped: {}", found.tail(2)))?
-                .to_string();
-            let how = if matches!(on, On::Xvfb) {
-                "windowfocus"
-            } else {
-                "windowactivate"
-            };
-            let focused = up.sh(&x_client(&x, &["xdotool", how, "--sync", &window]));
-            if !focused.ok() {
-                return Err(format!("the window refused the focus: {}", focused.tail(2)));
-            }
         }
-        On::MutterWayland(m) => {
-            let mut argv = vec![
-                format!("{}/lane-bus", gui.bin),
-                "seat".into(),
-                m.pid.clone(),
-                APP.into(),
-                pid.clone(),
-                format!("touch:{seat}/ready"),
-                format!("wait:{seat}/go"),
-            ];
-            argv.extend(seat_keys(ORCA_TYPED));
-            argv.extend([
-                "tap:Return".into(),
-                format!("touch:{seat}/done"),
-                format!("wait:{seat}/stop"),
-            ]);
-            let unit = guest::Unit {
-                name: format!("{}seat", guest::UNIT_PREFIX),
-                env: vec![(
-                    "DBUS_SESSION_BUS_ADDRESS".into(),
-                    format!("unix:path={}/bus", up.runtime),
-                )],
-                argv,
-                socket: String::new(),
-            };
-            if !up.sh(&guest::run_unit(&unit, None)).ok() {
-                return Err("lane-bus seat did not start".into());
-            }
-            if !up
-                .sh(&guest::wait_file(&format!("{seat}/ready"), HANG_SECS))
-                .ok()
-            {
-                return Err(format!(
-                    "the seat's keyboard never had the window's focus ({HANG_SECS} s)"
-                ));
-            }
+        Ok(())
+    }
+
+    fn orca(&self) -> Result<(), String> {
+        let up = self.gui.up;
+        let d = &self.gui.dir;
+        let _ = screen_reader(up, true);
+        let mut env = self.on.x(up);
+        if let On::MutterWayland(m) = self.on {
+            env.push(m.wayland.clone());
+            env.push(("XDG_SESSION_TYPE".into(), "wayland".into()));
+        }
+        env.extend([
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                format!("unix:path={}/bus", up.runtime),
+            ),
+            ("HOME".into(), format!("{d}/home")),
+            ("XDG_RUNTIME_DIR".into(), up.runtime.clone()),
+            (
+                "SPEECHD_ADDRESS".into(),
+                format!("unix_socket:{}", self.speechd_socket()),
+            ),
+        ]);
+        let orca = guest::Unit {
+            name: format!("{}orca", guest::UNIT_PREFIX),
+            env,
+            argv: vec![
+                "orca".into(),
+                "--debug-file".into(),
+                self.debug.into(),
+                "--user-prefs".into(),
+                format!("{d}/orca-prefs"),
+            ],
+            socket: String::new(),
+        };
+        if !up.sh(&guest::run_unit(&orca, None)).ok() {
+            return Err("Orca's unit did not start".into());
+        }
+        wait_lines(
+            self.gui,
+            self.speechd_log,
+            QUEUED,
+            1,
+            "Orca never spoke after starting",
+        )
+    }
+
+    /// [`OrcaStep::Frames`]: a throwaway X11 window ([`FRAMES_PRIMER`]) stays on Mutter's
+    /// Xwayland until the frames client that frames it is on the registry ([`frames_wait`]), and
+    /// then it is closed. The window's connection starts Xwayland, and Mutter starts the client
+    /// with it. The client joins only once it draws a frame, so without this window nothing would
+    /// bring it there before aterm-gui's own window.
+    fn frames(&self) -> Result<(), String> {
+        let m = self.on.mutter().ok_or("no Mutter for its frames client")?;
+        let up = self.gui.up;
+        let primer = guest::Unit {
+            name: format!("{}{FRAMES_PRIMER}", guest::UNIT_PREFIX),
+            env: m.x.clone(),
+            argv: ["xev", "-name", FRAMES_PRIMER, "-event", "structure"]
+                .map(str::to_string)
+                .to_vec(),
+            socket: String::new(),
+        };
+        let started = up.sh(&guest::run_unit(&primer, None));
+        if !started.ok() {
+            return Err(format!(
+                "{} (xev) did not start: {}",
+                primer.name,
+                started.tail(2)
+            ));
+        }
+        let lane_bus = format!("{}/lane-bus", self.gui.bin);
+        let joined = up
+            .sh(&frames_wait(&m.pid, &lane_bus, &up.runtime, HANG_SECS))
+            .ok();
+        let seen = if joined {
+            String::new()
+        } else {
+            up.sh(&frames_seen(&m.pid, &lane_bus, &up.runtime, &primer.name))
+                .text
+        };
+        let closed = up.sh(&primer_closed(&primer.name));
+        if !joined {
+            return Err(format!(
+                "Mutter's frames client ({FRAMES}) never joined the AT-SPI registry while it \
+                 framed {} ({HANG_SECS} s): {}",
+                primer.name,
+                crate::util::one_line(&seen, 300)
+            ));
+        }
+        if closed.ok() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} still runs after its stop, so Orca would hear its window: {}",
+                primer.name,
+                closed.tail(2)
+            ))
         }
     }
-    let walk = walk_until(gui, &pid, proof::PROMPT);
-    let frame = read_back(&walk, proof::PROMPT).map_err(|why| format!("walk: {why}"))?;
-    wait_lines(
-        gui,
-        speechd_log,
-        proof::PROMPT,
-        1,
-        "Orca never had the terminal's text spoken",
-    )?;
-    let unspoken_before = up
-        .sh(&["grep".into(), "-cF".into(), NO_CAUSE.into(), debug.into()])
-        .text
-        .trim()
-        .parse::<usize>()
-        .unwrap_or(0);
-    match on {
-        On::Xvfb | On::MutterX11(_) => {
-            for keys in [
-                &["xdotool", "type", "--delay", "30", ORCA_TYPED][..],
-                &["xdotool", "key", "Return"][..],
-            ] {
-                let typed = up.sh(&x_client(&x, keys));
-                if !typed.ok() {
-                    return Err(format!("{}: {}", keys.join(" "), typed.tail(2)));
+
+    fn start_gui(&mut self) -> Result<(), String> {
+        let gui = self.gui;
+        let up = gui.up;
+        let stderr = format!("{}/gui.stderr", gui.dir);
+        match self.on {
+            On::Xvfb => gui.start_logged(Some(Display::Xvfb), &[], &stderr)?,
+            On::MutterX11(m) => gui.start_logged_on(&m.x, &stderr)?,
+            On::MutterWayland(m) => {
+                gui.start_logged_on(std::slice::from_ref(&m.wayland), &stderr)?
+            }
+        };
+        if !up.sh(&guest::wait_socket(&gui.sock(), 60)).ok() {
+            return Err("the control socket never listened (60 s)".into());
+        }
+        gui.expect(&["ready", "60000"], &|r| r.starts_with("OK ready"))?;
+        wait_lines(
+            gui,
+            &log_path(gui),
+            JOINED,
+            1,
+            "the publisher never joined the AT-SPI bus",
+        )?;
+        self.pid =
+            proof::unit_pid(up, &Gui::unit_name()).ok_or("aterm-gui's unit has no main pid")?;
+        Ok(())
+    }
+
+    fn focus(&self) -> Result<(), String> {
+        let gui = self.gui;
+        let up = gui.up;
+        let pid = &self.pid;
+        let seat = self.seat();
+        match self.on {
+            On::Xvfb | On::MutterX11(_) => {
+                let x = self.on.x(up);
+                let found = up.sh(&x_client(
+                    &x,
+                    &[
+                        "timeout",
+                        "60",
+                        "xdotool",
+                        "search",
+                        "--sync",
+                        "--onlyvisible",
+                        "--pid",
+                        pid,
+                    ],
+                ));
+                let window = found
+                    .text
+                    .lines()
+                    .map(str::trim)
+                    .find(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit()))
+                    .ok_or_else(|| {
+                        format!("aterm-gui's X window was never mapped: {}", found.tail(2))
+                    })?
+                    .to_string();
+                let how = if matches!(self.on, On::Xvfb) {
+                    "windowfocus"
+                } else {
+                    "windowactivate"
+                };
+                let focused = up.sh(&x_client(&x, &["xdotool", how, "--sync", &window]));
+                if !focused.ok() {
+                    return Err(format!("the window refused the focus: {}", focused.tail(2)));
+                }
+            }
+            On::MutterWayland(m) => {
+                let mut argv = vec![
+                    format!("{}/lane-bus", gui.bin),
+                    "seat".into(),
+                    m.pid.clone(),
+                    APP.into(),
+                    pid.clone(),
+                    format!("touch:{seat}/ready"),
+                    format!("wait:{seat}/go"),
+                ];
+                argv.extend(seat_keys(ORCA_TYPED));
+                argv.extend([
+                    "tap:Return".into(),
+                    format!("touch:{seat}/done"),
+                    format!("wait:{seat}/stop"),
+                ]);
+                let unit = guest::Unit {
+                    name: format!("{}seat", guest::UNIT_PREFIX),
+                    env: vec![(
+                        "DBUS_SESSION_BUS_ADDRESS".into(),
+                        format!("unix:path={}/bus", up.runtime),
+                    )],
+                    argv,
+                    socket: String::new(),
+                };
+                if !up.sh(&guest::run_unit(&unit, None)).ok() {
+                    return Err("lane-bus seat did not start".into());
+                }
+                if !up
+                    .sh(&guest::wait_file(&format!("{seat}/ready"), HANG_SECS))
+                    .ok()
+                {
+                    return Err(format!(
+                        "the seat's keyboard never had the window's focus ({HANG_SECS} s)"
+                    ));
                 }
             }
         }
-        On::MutterWayland(_) => {
-            let _ = up.sh(&["touch".into(), format!("{seat}/go")]);
-            if !up
-                .sh(&guest::wait_file(&format!("{seat}/done"), HANG_SECS))
-                .ok()
-            {
-                return Err(format!("the seat never typed the line ({HANG_SECS} s)"));
+        Ok(())
+    }
+
+    fn read(&mut self) -> Result<(), String> {
+        let walk = walk_until(self.gui, &self.pid, proof::PROMPT);
+        self.frame = read_back(&walk, proof::PROMPT).map_err(|why| format!("walk: {why}"))?;
+        wait_lines(
+            self.gui,
+            self.speechd_log,
+            proof::PROMPT,
+            1,
+            "Orca never had the terminal's text spoken",
+        )
+    }
+
+    fn type_line(&mut self) -> Result<(), String> {
+        let up = self.gui.up;
+        self.unspoken_before = up
+            .sh(&[
+                "grep".into(),
+                "-cF".into(),
+                NO_CAUSE.into(),
+                self.debug.into(),
+            ])
+            .text
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(0);
+        match self.on {
+            On::Xvfb | On::MutterX11(_) => {
+                let x = self.on.x(up);
+                for keys in [
+                    &["xdotool", "type", "--delay", "30", ORCA_TYPED][..],
+                    &["xdotool", "key", "Return"][..],
+                ] {
+                    let typed = up.sh(&x_client(&x, keys));
+                    if !typed.ok() {
+                        return Err(format!("{}: {}", keys.join(" "), typed.tail(2)));
+                    }
+                }
+            }
+            On::MutterWayland(_) => {
+                let seat = self.seat();
+                let _ = up.sh(&["touch".into(), format!("{seat}/go")]);
+                if !up
+                    .sh(&guest::wait_file(&format!("{seat}/done"), HANG_SECS))
+                    .ok()
+                {
+                    return Err(format!("the seat never typed the line ({HANG_SECS} s)"));
+                }
             }
         }
+        Ok(())
     }
-    gui.expect(&["await", "match", ORCA_ECHO, "timeout=60000"], &|r| {
-        r.starts_with("OK match")
-    })?;
-    if matches!(on, On::MutterWayland(_)) {
+
+    fn heard(&self) -> Result<(), String> {
+        let gui = self.gui;
+        let up = gui.up;
+        gui.expect(&["await", "match", ORCA_ECHO, "timeout=60000"], &|r| {
+            r.starts_with("OK match")
+        })?;
+        if !matches!(self.on, On::MutterWayland(_)) {
+            return wait_lines(
+                gui,
+                self.speechd_log,
+                ORCA_ECHO,
+                1,
+                "Orca never had the typed line's output spoken",
+            );
+        }
         let decided = up.sh(&[
             "timeout".into(),
             HANG_SECS.to_string(),
@@ -1407,28 +1710,21 @@ fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result
              do sleep 0.1; done"
                 .into(),
             "wait-spoken".into(),
-            speechd_log.into(),
+            self.speechd_log.into(),
             ORCA_ECHO.into(),
-            debug.into(),
+            self.debug.into(),
             NO_CAUSE.into(),
-            unspoken_before.to_string(),
+            self.unspoken_before.to_string(),
         ]);
-        let _ = up.sh(&["touch".into(), format!("{seat}/stop")]);
-        if !decided.ok() {
-            return Err(format!(
+        let _ = up.sh(&["touch".into(), format!("{}/stop", self.seat())]);
+        if decided.ok() {
+            Ok(())
+        } else {
+            Err(format!(
                 "Orca neither spoke the typed line's output nor said why not ({HANG_SECS} s)"
-            ));
+            ))
         }
-    } else {
-        wait_lines(
-            gui,
-            speechd_log,
-            ORCA_ECHO,
-            1,
-            "Orca never had the typed line's output spoken",
-        )?;
     }
-    Ok(frame)
 }
 
 #[cfg(test)]
@@ -1842,5 +2138,76 @@ mod tests {
             ]
         );
         assert_eq!(seat_keys(ORCA_TYPED).len(), ORCA_TYPED.len());
+    }
+
+    /// Whether `steps` have Mutter's frames client on the registry before Orca and aterm-gui start
+    /// (`frames`), so Orca never hears the window that brings it there, or never wait for it
+    /// (`!frames`).
+    fn frames_first(steps: &[OrcaStep], frames: bool) -> Result<(), String> {
+        let at = |step| steps.iter().position(|s| *s == step);
+        let orca = at(OrcaStep::Orca).ok_or_else(|| format!("Orca never starts: {steps:?}"))?;
+        let gui = at(OrcaStep::Gui).ok_or_else(|| format!("aterm-gui never starts: {steps:?}"))?;
+        match (frames, at(OrcaStep::Frames)) {
+            (true, Some(f)) if f < orca && f < gui => Ok(()),
+            (true, Some(f)) if f > gui => Err(format!(
+                "the frames wait follows aterm-gui's start: {steps:?}"
+            )),
+            (true, Some(_)) => Err(format!("the frames wait follows Orca's start: {steps:?}")),
+            (true, None) => Err(format!("no frames wait: {steps:?}")),
+            (false, None) => Ok(()),
+            (false, Some(_)) => Err(format!("a frames wait with no Mutter: {steps:?}")),
+        }
+    }
+
+    #[test]
+    fn under_mutter_the_frames_client_joins_the_registry_before_orca_and_aterm_gui_start() {
+        for screen in OrcaScreen::ALL {
+            let steps = orca_steps(screen);
+            assert_eq!(frames_first(&steps, screen.mutter()), Ok(()), "{screen:?}");
+            assert_eq!(
+                steps.iter().filter(|s| **s == OrcaStep::Frames).count(),
+                usize::from(screen.mutter()),
+                "{screen:?}: {steps:?}"
+            );
+        }
+        assert!(OrcaScreen::MutterX11.mutter() && OrcaScreen::MutterWayland.mutter());
+        assert!(!OrcaScreen::Xvfb.mutter());
+        let mutter = orca_steps(OrcaScreen::MutterX11);
+        let without: Vec<OrcaStep> = mutter
+            .iter()
+            .copied()
+            .filter(|s| *s != OrcaStep::Frames)
+            .collect();
+        assert!(
+            frames_first(&without, true)
+                .unwrap_err()
+                .contains("no frames wait")
+        );
+        let mut late = without.clone();
+        late.push(OrcaStep::Frames);
+        assert!(
+            frames_first(&late, true)
+                .unwrap_err()
+                .contains("aterm-gui's start")
+        );
+        let mut heard = without.clone();
+        let gui = heard.iter().position(|s| *s == OrcaStep::Gui).unwrap();
+        heard.insert(gui, OrcaStep::Frames);
+        assert!(
+            frames_first(&heard, true)
+                .unwrap_err()
+                .contains("Orca's start")
+        );
+        assert!(frames_first(&mutter, false).is_err());
+    }
+
+    #[test]
+    fn speech_dispatcher_uses_libao_so_dummy_loads_without_a_pulse_socket() {
+        assert!(
+            SPEECHD_CONF
+                .lines()
+                .any(|l| l == "AudioOutputMethod \"libao\""),
+            "{SPEECHD_CONF}"
+        );
     }
 }

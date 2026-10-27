@@ -166,6 +166,10 @@ pub(super) const REPO_REPROBE: Duration = Duration::from_secs(20);
 /// The reason of the due the wake's settle places.
 pub(super) const WOKE: &str = "the Mac woke";
 
+/// The reason of the due an act at a point waits on while a switch of the session's word settles
+/// ([`Session::word_moved`]): the word read when it has stood decides the act.
+pub(super) const WORD_SETTLES: &str = "the session's Autopilot word settles";
+
 /// Why the point is decided again after the hour's typing budget held its act.
 pub(super) const BUDGET_FREES: &str = "the hour's typing budget (continue_per_hour) frees";
 
@@ -1493,6 +1497,7 @@ impl<C: Ctl> Session<'_, C> {
         cfg: Option<&SupervisorConfig>,
         review: &mut dyn Review,
     ) {
+        self.cruise_carry.live(self.turn_end.typed_untaken());
         self.hold_live(seq, cfg, review);
         if self.turn_end.wake_may_keep_landing()
             && self.stall_host.as_ref().and_then(|h| h.finished()) == Some(true)
@@ -1716,11 +1721,12 @@ impl<C: Ctl> Session<'_, C> {
             retry: self
                 .turn_end
                 .retry_track()
-                .map(|(kind, attempts, ups, since)| approvals::RetryMark {
+                .map(|(kind, attempts, ups, since, down)| approvals::RetryMark {
                     kind,
                     attempts,
                     ups,
                     since_ms: self.unix_ms_of(since),
+                    down,
                 }),
             said: self.turn_end.replies(),
             said_reset_ms: self.turn_end.replies_reset().map(|t| self.unix_ms_of(t)),
@@ -2156,14 +2162,24 @@ impl<C: Ctl> Session<'_, C> {
             cfg = std::borrow::Cow::Owned(policy);
             action = self.turn_end_decision(&r, &cfg, now, "pass:prose-word", trace);
         }
-        r.autopilot = if matches!(
-            action,
-            TurnEndAction::Nothing | TurnEndAction::WaitUntil { .. }
-        ) {
+        // A wait Cruise decides on the word last read stands only where no switch is noted: every
+        // wait carries that word, at rest and inside the turn ([`Session::busy_wait`]), so a
+        // switch made since wakes one ([`Session::word_moved`]). A point with one noted decides on
+        // the word read now, never on a stale Land that would turn Cruise's wait into its
+        // instruction; one inside the switch's settle waits for it (`WORD_SETTLES`, v6 §14.10).
+        let noted = self.word_at;
+        r.autopilot = if noted.is_none()
+            && matches!(
+                action,
+                TurnEndAction::Nothing | TurnEndAction::WaitUntil { .. }
+            ) {
             self.autopilot(opts)
         } else {
             self.autopilot_read(opts)?
         };
+        if noted.is_some_and(|at| self.fx.mono() >= at) {
+            self.word_at = None;
+        }
         if r.autopilot != Autopilot::Cruise {
             action = self.turn_end_decision(&r, &cfg, now, "pass:autopilot", trace);
         }
@@ -2539,6 +2555,12 @@ impl<C: Ctl> Session<'_, C> {
             self.set_due(at, WOKE);
             return Ok(());
         }
+        if action.rule_id().is_some()
+            && let Some(at) = self.word_at.filter(|&at| self.fx.mono() < at)
+        {
+            self.set_due(at, WORD_SETTLES);
+            return Ok(());
+        }
         let hold = matches!(action, TurnEndAction::Nothing).then(|| {
             super::HoldSaid::Point(if withheld {
                 "withheld"
@@ -2553,6 +2575,7 @@ impl<C: Ctl> Session<'_, C> {
             action,
             TurnEndAction::Nothing | TurnEndAction::WaitUntil { .. }
         );
+        self.cruise_carry.point();
         self.hold_point(&point.screen, acts, Some(&opts.policy), review);
         let (text, rule) = match &action {
             TurnEndAction::Nothing => return Ok(()),

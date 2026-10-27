@@ -42,11 +42,23 @@ pub const WRITABLE_ROOTS: &[&str] = &["/private/tmp", "/private/var/tmp", "/dev"
 pub const USER_TEMP_PARENT: &str = "/private/var/folders";
 
 /// The user's own `$TMPDIR` as a canonical write root, admitted only in the one
-/// shape macOS gives it: `<USER_TEMP_PARENT>/<xx>/<id>/T`.
+/// shape macOS gives it, `<USER_TEMP_PARENT>/<xx>/<id>/T`, or as that folder's quiet
+/// folder `T/.ubd` ([`user_temp_root`]), which a test run's `TMPDIR` names: then only
+/// the quiet folder is writable.
 fn admitted_user_temp(temp: &Path) -> Option<PathBuf> {
     let canon = std::fs::canonicalize(temp).ok()?;
-    let bucket = canon.parent()?.parent()?;
-    (canon.file_name()? == "T" && bucket.parent()? == Path::new(USER_TEMP_PARENT)).then_some(canon)
+    let t = user_temp_root(&canon);
+    let bucket = t.parent()?.parent()?;
+    (t.file_name()? == "T" && bucket.parent()? == Path::new(USER_TEMP_PARENT)).then_some(canon)
+}
+
+/// `temp` without a last [`aterm_tempfile::QUIET`] component: `…/T/.ubd` is `…/T`, any
+/// other path itself.
+pub(crate) fn user_temp_root(temp: &Path) -> &Path {
+    match (temp.file_name(), temp.parent()) {
+        (Some(name), Some(parent)) if name == aterm_tempfile::QUIET => parent,
+        _ => temp,
+    }
 }
 
 /// SBPL rule denying `user-preference-write` under [`FsCapability::TmpOnly`].
@@ -608,21 +620,24 @@ mod tests {
         assert!(!plain_or_absent(&canon_home.join(".zsh_history").join("x")));
     }
 
-    /// Only the user's own `$TMPDIR` (`/private/var/folders/<xx>/<id>/T`) is
-    /// added to the write roots — never its siblings (`C`, which holds clang's
-    /// module cache that later unsandboxed builds read; `0`), never the folders
-    /// above it, never a `$TMPDIR` pointed somewhere else.
+    /// Only the user's own `$TMPDIR` (`/private/var/folders/<xx>/<id>/T`), or its
+    /// quiet folder `T/.ubd`, is added to the write roots — never its siblings (`C`,
+    /// which holds clang's module cache that later unsandboxed builds read; `0`), never
+    /// the folders above it or a folder inside the quiet one, never a `$TMPDIR` pointed
+    /// somewhere else (a lookalike's quiet folder included).
     #[test]
     fn only_the_users_own_tmpdir_joins_the_write_roots() {
         let home = aterm_tempfile::tempdir().unwrap();
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
         let lookalike = canon_home.join("a/b/T");
-        std::fs::create_dir_all(&lookalike).unwrap();
+        let lookalike_quiet = lookalike.join(aterm_tempfile::QUIET);
+        std::fs::create_dir_all(&lookalike_quiet).unwrap();
         for elsewhere in [
             canon_home.as_path(),
             Path::new(USER_TEMP_PARENT),
             Path::new("/"),
             lookalike.as_path(),
+            lookalike_quiet.as_path(),
         ] {
             assert_eq!(
                 admitted_user_temp(elsewhere),
@@ -652,7 +667,8 @@ mod tests {
                     "$TMPDIR is not a per-user /private/var/folders/…/T here",
                 );
             };
-            let per_user = temp.parent().unwrap();
+            let t = user_temp_root(&temp);
+            let per_user = t.parent().unwrap();
             for sibling in ["C", "0"] {
                 let sibling = per_user.join(sibling);
                 if sibling.exists() {
@@ -660,6 +676,14 @@ mod tests {
                 }
             }
             assert_eq!(admitted_user_temp(per_user), None, "{}", per_user.display());
+            assert_eq!(admitted_user_temp(t).as_deref(), Some(t));
+            let quiet = t.join(aterm_tempfile::QUIET);
+            if quiet.is_dir() {
+                assert_eq!(admitted_user_temp(&quiet), Some(quiet.clone()));
+                let inside = aterm_tempfile::TempDir::new_in(&quiet).unwrap();
+                let inside = std::fs::canonicalize(inside.path()).unwrap();
+                assert_eq!(admitted_user_temp(&inside), None, "{}", inside.display());
+            }
             let profile = profile_for_home(canon_home.to_str(), Some(&temp), FsCapability::TmpOnly);
             let allows = write_allows(&profile);
             let expect = format!("(subpath \"{}\")", sbpl_str(&temp));

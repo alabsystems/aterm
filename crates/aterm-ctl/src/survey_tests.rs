@@ -1668,6 +1668,30 @@ fn context_reads_as_what_is_left() {
     assert!(text.contains(" ctx_left=5%"), "{text}");
 }
 
+/// The plan's windows follow the context left; a window the row does not know (`-`) is not
+/// shown.
+#[test]
+fn the_plans_windows_read_as_what_is_used() {
+    let text = |five: &str, seven: &str| {
+        let row = wire_row(&[
+            ("sid", "s-00000000000000000003"),
+            ("program", "claude"),
+            ("program_kind", "agent"),
+            ("agent", "busy"),
+            ("agent_ms", "1000"),
+            ("ctx_left_pct", "64"),
+            ("usage_5h_pct", five),
+            ("usage_7d_pct", seven),
+        ]);
+        render_text(&[reply(4, vec![row])], DEFAULT_BUDGET, None)
+    };
+    let both = text("7", "1");
+    assert!(both.contains(" ctx_left=64% 5h=7% 7d=1%"), "{both}");
+    let weekly = text("-", "12");
+    assert!(weekly.contains(" ctx_left=64% 7d=12%"), "{weekly}");
+    assert!(!weekly.contains("5h="), "{weekly}");
+}
+
 #[test]
 fn one_machine_reads_in_full() {
     let idle = wire_row(&[

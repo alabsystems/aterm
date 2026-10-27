@@ -1696,6 +1696,13 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     manual(
+        "packages.peers",
+        "LAN peers for toolset downloads",
+        ConfigSchemaKind::StringList,
+        &["atpkg", "lan", "peer", "cache", "serve-units"],
+        true,
+    ),
+    manual(
         "packages.links",
         "Local package links",
         ConfigSchemaKind::DynamicStringMap,
@@ -3062,11 +3069,12 @@ fn fleet_writer(key: &str) -> Option<&'static str> {
     match key {
         "fleet.allow" => Some(
             "`aterm fleet allow facts|content` sets the level, and `aterm fleet allow drive \
-             --from <host|node>` grants a drive",
+             --all` or `--from <host|node>` grants a drive",
         ),
         "fleet.drive_from" => Some(
             "`aterm fleet allow drive --from <host|node>` writes it with the key the book binds \
-             that node to, and `aterm fleet allow facts|content` takes it back",
+             that node to; `--all` admits every issuer-bound member, and `aterm fleet allow \
+             facts|content` takes it back",
         ),
         "fleet.listen" => Some(
             "`aterm fleet init` or `aterm fleet join` writes it (`--port <n>` names its port), \
@@ -5587,10 +5595,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · at Claude Code's \"We recommend compacting earlier\" offer, chooses Autocompact at this size (300k to 900k), never the keep row or Esc · it changes Claude Code's own autocompact setting for that model (/autocompact switches back) · off: the offer is yours"
         }
         "harness.accounts" => {
-            " · at a usage limit, a Claude Code session is relaunched under the next listed account; \"early\" also moves it ahead of the limit and types /usage to sample it; \"off\" moves no session · the one key for every CLI whose roster this machine keeps beside aterm.toml (accounts-codex.toml, accounts-grok.toml, accounts-kimi.toml): those pools are listed, pinned, synced and renewed (aterm harness accounts --cli <id>), and no session of theirs is moved in this build"
+            " · at a usage limit, a Claude Code or Codex session is relaunched under the next listed account; \"early\" also moves it ahead of the limit (typing /usage to sample Claude Code, and reading Codex's usage); \"off\" moves no session · the one key for every CLI whose roster this machine keeps beside aterm.toml (accounts-codex.toml, accounts-grok.toml, accounts-kimi.toml): those pools are listed, pinned, synced and renewed (aterm harness accounts --cli <id>), launches start under their serving row, and no running Grok Build or Kimi Code session is moved in this build"
         }
         "harness.logins" => {
-            " · a login listed with an email is signed in again by aterm itself when it ends or comes due, and a Claude Code session on it is relaunched onto the new login; aterm types no /login over it, and where nothing relaunches the tab (relaunch or resume_limits off, a restart it cannot make) the tab waits, its record naming why · a lost login listed nowhere is signed in where it stands: aterm types /login once and the browser sign-in is yours · off: aterm signs no listed login in by itself and no session follows a renewal, so a lost login gets /login once · in every CLI's roster: a window renews a due login of another CLI's roster in the background where a headless browser is installed and the row names an email (on macOS, Grok Build's and Codex's sign-in runs in a sandbox that keeps it from opening a browser on the desk, and not at all where that sandbox is missing), and off stops that too (aterm harness accounts renew --cli <id> by hand still runs)"
+            " · a login listed with an email is signed in again by aterm itself when it ends or comes due, and a Claude Code session on it is relaunched onto the new login; aterm types no /login over it, and where nothing relaunches the tab (relaunch or resume_limits off, a restart it cannot make) the tab waits, its record naming why · a lost login listed nowhere is signed in where it stands: aterm types /login once and the browser sign-in is yours · off: aterm signs no listed login in by itself and no session follows a renewal, so a lost login gets /login once · in every CLI's roster: a window renews a due login of another CLI's roster in the background where a headless browser is installed and the row names an email (on macOS, Grok Build's sign-in and Codex's device-flow sign-in run in a sandbox that keeps them from opening a browser on the desk, and not at all where that sandbox is missing), and off stops that too (aterm harness accounts renew --cli <id> by hand still runs)"
         }
         "harness.hosts" => {
             " · read by aterm harness accounts renew --due alone · each is host or host:/abs/path/to/aterm"
@@ -5656,7 +5664,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · default true: while the harness's theme is on a Claude Code session (its composer border drawn), the agents panel under the footer wears the theme's rainbow — each row's name in its stripe at Claude's own lightness, a workflow's bar along the whole palette — and each agent's dot tells its work: hue = which agent, brightness and glow = how much work, saturation = how fresh, full hue with a dim steady glow = in its own tool call (inside that call's timeout plus 30 s, read from its transcript), a grey breath = stuck (no work for 150 s with nothing of its own in flight), a still amber ring = awaiting approval, Claude's own green or red = done or failed — glass only; false leaves the panel as Claude drew it · serious mode keeps the colours and drops the glow · read live"
         }
         "claude_footer.card" => {
-            " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by aterm harness <harness version> · autopilot ∞ cruise`, and under Autopilot off the same card in white (`· autopilot ○ off`) — glass only; false leaves the card bare · read live"
+            " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by alab claude harness <harness version> · autopilot ∞ cruise`, and under Autopilot off the same card in white (`· autopilot ○ off`) — glass only; false leaves the card bare · read live"
         }
         "keeper.enabled" => {
             " · read at launch; on, every terminal is registered with this build's PTY keeper (`aterm keeper start` runs one) and a launch after a crash or kill reattaches the shells it held · macOS only"
@@ -5668,7 +5676,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · on (the default): a record of what each session did under the logs folder's `session-log/`: each command's program name (`detail=`: the wrapper's own name when the wrapper's flags are not known, and for a listed tool one known subcommand word; a secret typed at a prompt and run is kept as that name too) and the foreground program's name (`prog=`), outcomes and durations, agent turns and their tools' names, the session's folder (`cwd=`), its meta values (an attention text only as a fingerprint), mail's sender, recipient and offsets; never a command's other arguments, an OSC title, a mail's body or an agent's transcript text · files 0600 in a 0700 folder, the oldest deleted first to keep its own near 64 MiB and 2048 files (files a running instance still writes can hold it above that), so `aterm ctl @<sid> log` and `aterm ctl @<sid> brief` answer for a session from an earlier run or a crash · off: aterm keeps no journal, creates no file and deletes nothing · read at launch; follows restore_session; a window's only · macOS and Linux"
         }
         "sys.stats_bars" => {
-            " · default deck: a table under the titlebar with one row per resource, CPU, GPU, memory, disk, network and processes, plus the cores: each row's multi-scale heat strip (up to 15 min Folded, 1 h Full, cold to hot, 0 to 100% of that resource's max, a glowing live now cell at the right, hollow cells where nothing was read, plus gap and crash/sleep markers), its % now, a Global ⊇ aterm ⊇ Tab bar on its capacity and the amount with its unit; Folded, or Full where `stats_deck_size` says so · sill: thin lanes in the window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on a row, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"
+            " · default deck: a table under the titlebar with one row per resource, CPU, GPU, memory, disk, network and processes, plus the cores: each row's multi-scale heat strip, the widest thing on the row (blocks of 1 s, 10 s, 1 min, 10 min and 1 h, up to 6 h where the strip has the room, 4 h, 6 min or 1 min on a narrower one, cold to hot, 0 to 100% of that resource's max, the live now cell at the left in the strip's own colours, older and wider cells to its right, hollow cells where nothing was read, plus gap and crash/sleep markers), its % now, a Global ⊇ aterm ⊇ Tab bar on its capacity keyed once over the bars, and at the bar's end, where it fits, this Mac's amount in the row's unit with the row's maximum, else the machine's maxima in the key (aterm's and the tab's amounts are in the close-up); Folded, or Full where `stats_deck_size` says so · sill: thin lanes in the window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on a row, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"
         }
         "sys.stats_deck_size" => {
             " · default auto: the Deck stays Folded, two blocks of four rows in 62 pt, however tall the window · full: always Full, a header line and a row per resource in about 100 pt, which takes whole terminal rows · folded: always Folded · decided when a window opens, resizes, changes display or the font changes, never by what the deck shows · View ▸ Deck Size picks one · read live"

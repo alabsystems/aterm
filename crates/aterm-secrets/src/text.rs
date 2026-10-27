@@ -324,7 +324,7 @@ impl Document {
         }
     }
 
-    /// The keys an open vault leaves to approval by code (`[join]`'s `code-only` lines), in file order: a machine it let go, or one that asked before it opened.
+    /// The keys a vault leaves to approval by code (`[join]`'s `code-only` lines), in file order: a machine it let go, or one that asked before it opened. An open vault's approver lets none of them in by itself.
     pub fn code_only(&self) -> Vec<String> {
         self.model
             .code_only

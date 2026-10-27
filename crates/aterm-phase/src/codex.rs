@@ -5,21 +5,11 @@
 
 use crate::text::blank;
 
-/// Major component of the Codex (`codex-alab`) harness version, starting at `0.1`.
-pub const HARNESS_VERSION_MAJOR: u16 = 0;
-
-/// Minor component of the Codex (`codex-alab`) harness version, starting at `0.1`.
-pub const HARNESS_VERSION_MINOR: u16 = 1;
-
-/// Version of the Codex harness, tracked independently per harness starting at `"0.1"`.
-pub const HARNESS_VERSION: &str = "0.1";
-
-/// Structured incremental numeric version of the Codex (`codex-alab`) harness.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(
-    HARNESS_VERSION_MAJOR,
-    HARNESS_VERSION_MINOR,
-    HARNESS_VERSION,
-);
+/// The Codex (`codex-alab`) harness version, `MAJOR.MINOR` with no third part.
+///
+/// Its minor goes up once per public release window in which its sources changed
+/// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 4, "0.4");
 
 /// The prompt glyph, in column 0 (U+203A).
 const PROMPT: char = '›';

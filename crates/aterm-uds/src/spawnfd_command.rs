@@ -345,6 +345,13 @@ impl Command {
         self.cwd.as_deref()
     }
 
+    /// Whether the child starts as its own responsible process
+    /// ([`Self::disclaim_responsibility`]).
+    #[must_use]
+    pub const fn get_disclaim_responsibility(&self) -> bool {
+        self.disclaim.is_some()
+    }
+
     /// Start the child; unset stdio is inherited.
     /// # Errors
     /// As `std`'s: `InvalidInput` for a NUL, `NotFound` for a program (or a working directory) that does not exist, `PermissionDenied` for one that may not be run, and whatever else the spawn answers.

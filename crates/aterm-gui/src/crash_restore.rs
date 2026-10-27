@@ -2938,6 +2938,108 @@ pub(crate) const QUIET: std::time::Duration =
 #[cfg(unix)]
 const HOLD_KEYFRAMES_SEAM: &str = "ATERM_DEBUG_CRASH_JOURNAL_HOLD_KEYFRAMES";
 
+/// The look-alike arms' seam (`verify perf restore-e2e`): set to a size in KiB, every offered
+/// region restores from a copy of it, and with a size above 0 the copy carries
+/// `aterm_restore::plant::lookalike_tail` (the newest history chunk damaged, that many KiB of frame
+/// look-alikes past the ring's commit), the damage the ring walk's resync bound was built for.
+/// `0` is the arm that restores from the copy alone. The keeper's region is only read, and the
+/// seam's own work (the copy, the plant and their log lines) is counted and timed apart
+/// (`metrics::record_keeper_seam`), so the boot recovery's readings leave it out.
+#[cfg(all(unix, any(test, debug_assertions)))]
+const LOOKALIKE_SEAM: &str = "ATERM_DEBUG_CRASH_RESTORE_LOOKALIKE_KIB";
+
+/// The plant [`LOOKALIKE_SEAM`] names, in KiB, or the one a test armed on its own thread
+/// (`tests::seam::arm_lookalike`); `None` with neither set, or the seam not a size.
+#[cfg(all(unix, any(test, debug_assertions)))]
+fn lookalike_kib() -> Option<usize> {
+    #[cfg(test)]
+    if let Some(kib) = tests::seam::lookalike_kib() {
+        return Some(kib);
+    }
+    aterm_types::dev_seam!(LOOKALIKE_SEAM)?
+        .to_str()?
+        .parse()
+        .ok()
+}
+
+/// [`LOOKALIKE_SEAM`]'s copy of `region` ([`lookalike_copy_of`]), its making counted and timed
+/// (`metrics::record_keeper_seam`); `None` with the seam unset or not a size, or when its
+/// requested copy or plant is refused. A refused experiment restores the original region.
+#[cfg(all(unix, any(test, debug_assertions)))]
+fn lookalike_copy(region: &impl aterm_restore::RegionView) -> Option<aterm_restore::VecStore> {
+    let kib = lookalike_kib()?;
+    let started = std::time::Instant::now();
+    let copy = lookalike_copy_measured(region, kib, crate::metrics::record_restore_experiment)?;
+    crate::metrics::record_keeper_seam(started.elapsed(), kib > 0);
+    Some(copy)
+}
+
+/// Record whether the requested copy or plant succeeded, or was refused.
+#[cfg(all(unix, any(test, debug_assertions)))]
+fn lookalike_copy_measured(
+    region: &impl aterm_restore::RegionView,
+    kib: usize,
+    record: impl FnOnce(crate::metrics::RestoreExperiment),
+) -> Option<aterm_restore::VecStore> {
+    use crate::metrics::RestoreExperiment;
+    match lookalike_copy_of(region, kib) {
+        Ok(copy) => {
+            record(if kib == 0 {
+                RestoreExperiment::Copy
+            } else {
+                RestoreExperiment::Lookalike
+            });
+            Some(copy)
+        }
+        Err(why) => {
+            record(RestoreExperiment::Refused);
+            aterm_log::warn!(
+                "crash restore: the experimental copy was refused ({why:?}); restoring the original region"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LookalikeRefusal {
+    Read,
+    Copy,
+    Plant(&'static str),
+}
+
+/// A copy of `region`, with [`aterm_restore::plant::lookalike_tail`] of `kib` KiB planted in it
+/// when `kib` is above 0. A refusal discards the private copy, including any partial plant.
+///
+/// # Errors
+/// The region cannot be copied or the requested plant was refused.
+#[cfg(all(unix, any(test, debug_assertions)))]
+fn lookalike_copy_of(
+    region: &impl aterm_restore::RegionView,
+    kib: usize,
+) -> Result<aterm_restore::VecStore, LookalikeRefusal> {
+    use aterm_restore::RegionStore as _;
+    use aterm_restore::plant::{Planted, lookalike_tail};
+    let mut bytes = vec![0u8; region.len()];
+    region
+        .read(0, &mut bytes)
+        .map_err(|_| LookalikeRefusal::Read)?;
+    let copy = aterm_restore::VecStore::new(bytes.len());
+    copy.write(0, &bytes).map_err(|_| LookalikeRefusal::Copy)?;
+    if kib > 0 {
+        match lookalike_tail(&copy, kib) {
+            Planted::Tail { damaged, from, to } => aterm_log::info!(
+                "crash restore: the look-alike seam flipped ring byte {damaged} and planted {} \
+                 bytes of look-alikes past the commit at {from}",
+                to - from
+            ),
+            Planted::Refused(why) => return Err(LookalikeRefusal::Plant(why)),
+        }
+    }
+    Ok(copy)
+}
+
 /// What a restore produced for one offered session: the checkpoint to adopt (with its repaint flag), and the report.
 #[cfg(unix)]
 pub(crate) struct Restore {
@@ -3026,12 +3128,19 @@ unsafe fn restore_screen(
             .into_parts()
             .0,
     };
+    #[cfg(any(test, debug_assertions))]
+    let planted = lookalike_copy(&region);
     let recovery = crate::reader_guard::guarded(|| {
-        aterm_restore::recover(&region, policy, |rows, cols| {
+        let engine = |rows, cols| {
             #[cfg(test)]
             tests::seam::replay_reached();
             scratch_engine(rows, cols, cfg, cell_px)
-        })
+        };
+        #[cfg(any(test, debug_assertions))]
+        if let Some(copy) = &planted {
+            return aterm_restore::recover(copy, policy, engine);
+        }
+        aterm_restore::recover(&region, policy, engine)
     })
     .map_err(|panic| {
         aterm_log::warn!(

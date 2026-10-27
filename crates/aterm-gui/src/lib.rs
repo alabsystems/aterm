@@ -133,6 +133,9 @@ mod app_settings;
 mod app_tabs;
 mod app_take_over;
 mod app_update_handoff;
+/// Update handoffs land on item boundaries: non-idempotent items hold a guard the handoff waits
+/// for, at most 10 s (design §6.7).
+pub mod app_update_handoff_boundary;
 mod app_update_screen;
 mod app_window;
 #[cfg(target_os = "macos")]
@@ -242,6 +245,7 @@ pub fn configured_update_settings() -> Option<aterm_update::CheckSettings> {
 }
 mod budget;
 mod cast;
+mod cast_scrub;
 mod chrome_band;
 mod chrome_label;
 mod claude_card;
@@ -286,8 +290,11 @@ mod devtools_helper;
 mod devtools_helper_drive;
 mod overview;
 mod overview_fabric;
+mod permission_walk;
 pub(crate) use amacs_files::save_words;
 mod clt_install;
+mod clt_shim;
+mod converge_lane;
 #[cfg(unix)]
 mod secrets_asking;
 mod secrets_join;
@@ -335,6 +342,17 @@ pub fn set_secrets_sync_gate(wanted: fn() -> bool, while_wanted: fn(&mut dyn FnM
     let _ = SECRETS_SYNC_GATE.set((wanted, while_wanted));
 }
 
+/// What a launch repairs by itself once its seed is done ([`set_launch_repairs`]).
+static LAUNCH_REPAIRS: std::sync::OnceLock<fn() -> Vec<String>> = std::sync::OnceLock::new();
+
+/// Say what a launch repairs by itself once its seed is done, saying what moved, one line each:
+/// the composing `aterm`'s asked repairs (the stale copies of aterm to the Trash, copied commands
+/// moved aside, a stale rustup trust link). Set once, before the window starts; a later call is
+/// ignored, and a process that sets none repairs nothing.
+pub fn set_launch_repairs(repairs: fn() -> Vec<String>) {
+    let _ = LAUNCH_REPAIRS.set(repairs);
+}
+
 /// [`set_secrets_sync_gate`]'s answer now. A process that never set one keeps nothing in sync
 /// by itself: only a person's press starts the subscriber there.
 #[cfg(target_os = "macos")]
@@ -349,9 +367,31 @@ pub(crate) fn secrets_sync_while_wanted(work: &mut dyn FnMut()) -> bool {
     SECRETS_SYNC_GATE.get().is_some_and(|gate| gate.1(work))
 }
 
+/// This process's once-only starts of its vault workers and its converge lane.
+static SECRETS_LANES: secrets_lanes::Lanes = secrets_lanes::Lanes::new();
+
+/// Start the converge pass's window lane (`converge_lane`: `aterm init --converge --trigger
+/// window` at once and every `secrets_join::MEND_EVERY`) once a setup's run ended, finished or
+/// completed; a launch that runs no setup starts it beside the mend. One lane per process.
+pub fn start_converge_lane() {
+    converge_lane_once(false, false);
+}
+
+/// Start one converge pass for the first-launch Secrets stage that just ended (`--trigger setup`),
+/// without waiting for it.
+pub fn converge_after_secrets_stage() {
+    converge_lane::start_after_secrets();
+}
+
+fn converge_lane_once(headless: bool, unified_setup: bool) {
+    SECRETS_LANES.start_converge(
+        !converge_lane::runs(headless, unified_setup, &converge_lane::env_set),
+        converge_lane::spawn_lane,
+    );
+}
+
 fn mend_secrets_subscriber_once(headless: bool) {
-    static LANES: secrets_lanes::Lanes = secrets_lanes::Lanes::new();
-    LANES.start(
+    SECRETS_LANES.start(
         headless || !cfg!(target_os = "macos"),
         || secrets_join::spawn_mend_lane(headless, app_config::config_path()),
         || {
@@ -382,6 +422,24 @@ mod devtools_watch;
 mod harness_policy_cell;
 #[cfg(feature = "bench-support")]
 mod settings_frame_probe;
+/// Each window's trail frame reads for `lab trail-diff`'s dump ([`trail_frame_reads`]).
+#[cfg(all(any(test, all(unix, feature = "bench-support")), debug_assertions))]
+mod trail_frame_reads;
+/// The headless App `lab trail-diff`'s dump drives (`examples/trail_dump.rs`).
+#[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
+mod trail_rig;
+#[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
+#[doc(hidden)]
+pub use trail_frame_reads::WindowTrailReads;
+#[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
+#[doc(hidden)]
+pub use trail_rig::{TrailFrame, TrailRig};
+/// The host unreachability pin: no dark ground reaches the light fork through the frame path.
+#[cfg(all(test, unix))]
+mod light_fork_pin_tests;
+/// The dump's script and printer, run by the tests on [`trail_rig`].
+#[cfg(all(test, unix))]
+mod trail_dump_tests;
 /// What the `footer_pass_cost` bench measures.
 #[cfg(feature = "bench-support")]
 #[doc(hidden)]
@@ -454,6 +512,8 @@ mod control_edit;
 mod control_listener;
 mod control_privacy;
 mod control_socket_identity;
+#[cfg(target_os = "macos")]
+mod cpu_policy_authorization;
 mod crash_journal;
 mod crash_signal;
 mod cwd_native;
@@ -575,6 +635,7 @@ pub use diagnostics::{
 #[cfg(test)]
 mod document_journal_conformance;
 pub(crate) use aterm_gui_documents::document_store;
+mod account_menu_read;
 #[cfg(test)]
 mod document_store_conformance;
 mod echo_rtt;
@@ -679,6 +740,7 @@ mod login_notice_verb;
 #[cfg(target_os = "macos")]
 mod memory_pressure;
 mod needs;
+mod network_deck;
 mod predict_seen;
 #[cfg(any(test, debug_assertions))]
 mod predict_trace;
@@ -717,6 +779,7 @@ mod self_claim;
 mod semantic_prewarm_conformance;
 #[cfg(test)]
 mod serde_corpus_tests;
+mod services_watch;
 mod session_chrome;
 mod session_edge_audit;
 mod session_log;
@@ -745,9 +808,11 @@ mod stats_deck;
 mod stats_gauge;
 mod stats_lens;
 mod stats_live;
+mod stats_needle;
 mod stats_paint;
 mod stats_plan;
 mod stats_sill;
+mod stats_steam;
 mod submit_count;
 mod subscribe;
 mod summarize;
@@ -2942,6 +3007,8 @@ pub(crate) enum HarnessFact {
     SelfTask(aterm_agent::harness::acts::TaskFace),
     TaskNoted(aterm_agent::harness::acts::TaskFace, i64),
     Pause(Option<PausePlan>),
+    /// The loop's outage wait (v6 §14.17.5.2), while one stands.
+    Waiting(Option<OutageWait>),
     Needs,
     LandHeld,
 }
@@ -2953,8 +3020,28 @@ pub(crate) struct PausePlan {
     pub(crate) short: u8,
 }
 
+/// The loop's wait on an outage wall, as the window is told it ([`HarnessFact::Waiting`]): the
+/// outage, the unix second the wait ends, and whether a blind try comes then (`tries`), which it
+/// does not while the route is measured down (only its edge up resumes). Kept to 16 bytes, so
+/// the fact stays the size its pause makes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct OutageWait {
+    pub(crate) wall: aterm_agent::supervise::Outage,
+    pub(crate) tries: bool,
+    pub(crate) at_unix: i64,
+}
+
+impl OutageWait {
+    /// The unix second of the next try, `None` while the route is measured down.
+    #[must_use]
+    pub(crate) const fn next_unix(self) -> Option<i64> {
+        if self.tries { Some(self.at_unix) } else { None }
+    }
+}
+
 #[derive(Debug)]
 enum Wake {
+    AccountMenuRead(account_menu_read::Completion),
     WorkstationSetup(workstation_setup::Request),
     /// Whether a setup pass's Repositories stage, at its end, waits on Apple's Command Line
     /// Tools: a tab installs them ([`clt_install`]).
@@ -3442,6 +3529,19 @@ enum Wake {
     #[cfg(target_os = "macos")]
     Askpass(Box<askpass::AskpassRequest>),
     #[cfg(target_os = "macos")]
+    CpuPolicyReport(Box<aterm_json::Value>),
+    #[cfg(target_os = "macos")]
+    CpuPolicyPermit {
+        operation: std::sync::Arc<cpu_policy_authorization::Operation>,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
+    #[cfg(target_os = "macos")]
+    CpuPolicyAction {
+        session: u64,
+        action: cpu_policy_authorization::Action,
+        reply: std::sync::mpsc::Sender<String>,
+    },
+    #[cfg(target_os = "macos")]
     AskpassAnswered {
         id: u64,
         proceed: bool,
@@ -3718,9 +3818,14 @@ enum Wake {
         request: aterm_messages::wire::NoticeRequest,
         reply: std::sync::mpsc::Sender<String>,
     },
+    /// `aterm ctl devtools hand-over`, bare.
     DevToolsHandOverAsked {
-        now: bool,
         reply: std::sync::mpsc::Sender<devtools_helper::HandOver>,
+    },
+    /// `aterm ctl permissions walk now [<subject>…]` (and `devtools hand-over now`).
+    PermissionWalkAsked {
+        subjects: Vec<permission_walk::Subject>,
+        reply: std::sync::mpsc::Sender<permission_walk::Started>,
     },
     PkgProgress {
         snapshot: Option<Box<PkgProgressSnapshot>>,
@@ -5396,7 +5501,8 @@ struct Session {
     reader_stop: Arc<AtomicBool>,
     reflow_cancel: Arc<AtomicBool>,
     pub(crate) fg_holder: Arc<std::sync::atomic::AtomicI32>,
-    temporal_writer_join: Option<std::thread::JoinHandle<()>>,
+    temporal_drain: Option<crate::temporal::TemporalDrain>,
+    temporal_arm: Arc<crate::temporal::Arm>,
     handoff_history: Option<crate::handoff_history::AdoptedHistory>,
     _pty_census: crate::metrics::PtyCensus,
 }
@@ -6817,6 +6923,8 @@ struct WindowState {
     hover_pointer: bool,
     native_text_cursor: bool,
     link_hover: Option<link_target::LinkHover>,
+    /// The head Rewind paused this window's hosted effects at, while its focused pane is rewound.
+    rewind_paused: Option<aterm_aos::publish::Head>,
     hover_memo: Option<app_mouse::HoverMemo>,
     shown_caption: Option<app_mouse::ShownCaption>,
     chrome_rows: Vec<std::ops::Range<usize>>,
@@ -7051,14 +7159,19 @@ struct WindowState {
     deck_laid: std::cell::RefCell<Option<crate::stats_deck::DeckLaid>>,
     deck_still: std::cell::RefCell<crate::stats_deck::DeckStill>,
     /// The deck's live edge as its last layout drew it ([`crate::stats_live`]): its key, what
-    /// the card's raster holds, the card's rects that move with it, how fast its Full strips
-    /// glide (device px a second) with that strip's column period (s), and how far each reading
-    /// slides its Folded strips (device px).
+    /// the card's raster holds, the card's rects that move with it, and the fine bands its Full
+    /// strips glide and its Folded strips slide ([`crate::stats_live::FineBand`], in that order).
     deck_live_drawn: std::cell::Cell<Option<u64>>,
     deck_live_card: std::cell::Cell<(u64, crate::stats_live::DeckLive)>,
     deck_live_rects:
         std::cell::RefCell<Vec<(crate::stats_live::LiveLayer, crate::stats_paint::Rect)>>,
-    deck_glide: std::cell::Cell<(f64, u32, f64)>,
+    deck_glide: std::cell::Cell<(crate::stats_live::FineBand, crate::stats_live::FineBand)>,
+    /// How far the tip of the dial the deck's last layout drew travels per degree, device px
+    /// (0 with no dial): one device pixel of the needle in motion ([`crate::stats_needle::View`]).
+    deck_needle_px: std::cell::Cell<f64>,
+    /// What the deck's last layout drew of the needle, which the window's next needle frames walk
+    /// on from ([`crate::stats_needle::Needle::follow`]); `None` with no needle or no dial.
+    deck_needle_drawn: std::cell::Cell<Option<crate::stats_needle::Drawn>>,
     stats_hits: std::cell::RefCell<Vec<crate::stats_paint::Hit>>,
     lens_card: Option<SettingsCard>,
     stats_lens: crate::stats_lens::LensSlot,
@@ -7893,6 +8006,7 @@ impl WindowState {
             hover_pointer: false,
             native_text_cursor: false,
             link_hover: None,
+            rewind_paused: None,
             hover_memo: None,
             shown_caption: None,
             chrome_rows: Vec::new(),
@@ -8117,7 +8231,9 @@ impl WindowState {
             deck_live_drawn: std::cell::Cell::new(None),
             deck_live_card: std::cell::Cell::new((0, crate::stats_live::DeckLive::STILL)),
             deck_live_rects: std::cell::RefCell::new(Vec::new()),
-            deck_glide: std::cell::Cell::new((0.0, 0, 0.0)),
+            deck_glide: std::cell::Cell::default(),
+            deck_needle_px: std::cell::Cell::new(0.0),
+            deck_needle_drawn: std::cell::Cell::new(None),
             stats_hits: std::cell::RefCell::new(Vec::new()),
             lens_card: None,
             stats_lens: crate::stats_lens::LensSlot::default(),
@@ -8608,6 +8724,9 @@ const fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
         Wake::NativeTabCommand { .. } => UpdateHandoffEventClass::Revoking,
         #[cfg(target_os = "macos")]
         Wake::StatusAction { .. }
+        | Wake::CpuPolicyPermit { .. }
+        | Wake::CpuPolicyAction { .. }
+        | Wake::CpuPolicyReport(_)
         | Wake::Askpass(_)
         | Wake::AskpassAnswered { .. }
         | Wake::AskpassWithdraw { .. } => UpdateHandoffEventClass::Revoking,
@@ -9249,6 +9368,10 @@ const fn resample_wants_repair_frame(cause: ResampleCause) -> bool {
 type HostResumeProbe = Box<dyn FnOnce(&App)>;
 
 struct App {
+    network_snapshot: Arc<aterm_types::network_state::NetworkStateSnapshot>,
+    network_source: Option<NetworkSnapshotSource>,
+    network_next_poll: Option<Instant>,
+    harness_progress_next_poll: Option<Instant>,
     workstation_setup: workstation_setup::Host,
     system_state_host: system_state_host::Host,
     apprt: platform::PlatformAppRt,
@@ -9465,6 +9588,7 @@ struct App {
     claimant_retire_refusal: Option<&'static str>,
     devtools_watch: devtools_watch::DevToolsWatch,
     devtools_helper: devtools_helper::Lane,
+    permission_walk: permission_walk::WalkLane,
     debugger_change: debugger_access::DebuggerChangeLane,
     debugger_launch: debugger_access::DebuggerStepQueue,
     access_steps: system_state_access::AccessSteps,
@@ -9702,6 +9826,7 @@ struct App {
     autopilot_timers: autopilot_timers::AutopilotTimers,
     autopilot_recorded: std::collections::HashMap<u64, u64>,
     autopilot_menu: Option<autopilot_menu::AutopilotMenu>,
+    account_menu_read: account_menu_read::State,
     autopilot_menu_spent: Option<autopilot_menu::SpentCard>,
     claude_facts: std::collections::HashMap<u64, claude_facts::SessionFacts>,
     update_handoff_activity_epoch: u64,
@@ -10127,7 +10252,7 @@ impl App {
         self.start_consent_warmup_pass(&folders, None)
     }
 
-    /// One warm-up pass over `folders`; its worker waits at `gate` before each folder.
+    /// One warm-up pass over `folders`; with a `gate`, each folder's look waits at it.
     fn start_consent_warmup_pass(
         &mut self,
         folders: &[(aterm_containment::consent::Folder, std::path::PathBuf)],
@@ -10346,9 +10471,13 @@ impl App {
         // A `[privacy]` switch on again makes the launch's decisions it held first.
         self.resume_held_launch_steps(now);
         self.tick_macos_access_card(now);
+        // The permission walk starts before any step takes the moment (a cold first launch).
+        self.tick_permission_walk(now);
         // The Local Network step goes first in an approved revision's order.
         self.tick_local_network_step(now);
         self.tick_devtools_hand_over(now);
+        // A walk page that closed this turn turns the panel to the next at once.
+        self.drive_permission_walk(now);
         // A control client's act on the Local Network or Accessibility row, at the
         // same step moment, after the pages.
         self.tick_queued_pane(now);
@@ -10374,7 +10503,10 @@ impl App {
         if let Some(wake) = self.workstation_setup.deadline(now) {
             fold_owned_deadline(deadline, owner, wake, metrics::DeadlineOwner::ConsentCard);
         }
-        if let Some(wake) = self.system_state_host.deadline(now) {
+        // The setup page's walk holds off the typing path app-wide (§5.6): a key
+        // typed within the gap in any focused window withholds the walk's wake.
+        let hands_off = hands_off_keys(self.any_os_window_focused(), self.last_keystroke_at, now);
+        if let Some(wake) = self.system_state_host.deadline(now, hands_off) {
             fold_owned_deadline(deadline, owner, wake, metrics::DeadlineOwner::ConsentCard);
         }
         if let Some(wake) = self.next_access_step_deadline(now) {
@@ -10394,6 +10526,14 @@ impl App {
                 owner,
                 wake,
                 metrics::DeadlineOwner::DebuggerChange,
+            );
+        }
+        if let Some(wake) = self.next_permission_walk_deadline(now) {
+            fold_owned_deadline(
+                deadline,
+                owner,
+                wake,
+                metrics::DeadlineOwner::DevToolsHandOver,
             );
         }
         if let Some(wake) = self.next_devtools_hand_over_deadline(now) {
@@ -10497,7 +10637,7 @@ impl App {
             match rearmed {
                 Some(revision) if self.access_revision() == Some(revision) => {
                     self.queue_rearmed_devtools_step(now);
-                    self.list_ahead_for_queued_devtools_step(now);
+                    self.list_ahead_for_queued_devtools_step();
                 }
                 Some(_) if self.access_revision().is_none() => {
                     // Stop holds gestures, not this observed fact. The same
@@ -10554,8 +10694,7 @@ impl App {
     fn devtools_admit_facts(
         &mut self,
         origin: devtools_helper::Origin,
-        now: Instant,
-    ) -> (devtools_helper::Reading, devtools_helper::Facts, bool) {
+    ) -> (devtools_helper::Facts, bool) {
         let reading = if !origin.owner_press() && self.devtools_watch.reading_revision().is_some() {
             // Old Lane facts cannot admit a pane or a list-ahead run while
             // the newly approved revision still owes its fresh slot reading.
@@ -10581,16 +10720,12 @@ impl App {
             grant_stable: (reach.grant_stable)(),
             recent: origin
                 .reopen_after_s()
-                .is_some_and(|window| (reach.opened_within)(window).is_some())
-                || (origin == devtools_helper::Origin::Ctl { now: true }
-                    && (self.devtools_helper.now_answered_within_its_minute(now)
-                        || self.devtools_helper.fda_first())),
+                .is_some_and(|window| (reach.opened_within)(window).is_some()),
             fda_on: fda.fda == aterm_containment::consent::FdaState::Granted,
             shown_this_revision: origin == devtools_helper::Origin::Automatic
                 && self.devtools_shown_this_revision(),
         };
         (
-            reading,
             facts,
             fda.probe == aterm_containment::consent::ProbeLabel::Pending,
         )
@@ -10624,6 +10759,7 @@ impl App {
         let focused = self.any_os_window_focused();
         focused
             && !self.consent_warmup.is_live()
+            && !self.permission_walk.active()
             && devtools_helper::quiet(
                 focused,
                 (self.user_input_recent)(devtools_helper::QUIET_FOR),
@@ -10637,7 +10773,7 @@ impl App {
     /// admitted it or brought back by one approved in this process: when admission would queue
     /// it now and its list reads whole and empty, the `spctl` run its moment needs starts now
     /// ([`devtools_helper::Lane::list_ahead`]), as for a step asked under an approved revision.
-    pub(crate) fn list_ahead_for_queued_devtools_step(&mut self, now: Instant) {
+    pub(crate) fn list_ahead_for_queued_devtools_step(&mut self) {
         use devtools_helper::{Admit, Moment, Origin};
         if !cfg!(target_os = "macos")
             || !self.devtools_helper.windowed()
@@ -10646,7 +10782,7 @@ impl App {
         {
             return;
         }
-        let (_, facts, _) = self.devtools_admit_facts(Origin::Automatic, now);
+        let (facts, _) = self.devtools_admit_facts(Origin::Automatic);
         if devtools_helper::admit(Origin::Automatic, Moment::Asked, &facts) == Admit::Queue
             && facts.lists_terminal()
         {
@@ -10676,7 +10812,7 @@ impl App {
             }
             return HandOver::Queued;
         }
-        let (reading, facts, fda_pending) = self.devtools_admit_facts(origin, now);
+        let (facts, fda_pending) = self.devtools_admit_facts(origin);
         let admitted = devtools_helper::admit(origin, moment, &facts);
         // A `spctl` run made ahead of the moment serves the hand-over it was made for: whatever
         // that hand-over comes to (a list read again since needs no run), it is spent, unless the
@@ -10703,23 +10839,6 @@ impl App {
                     self.devtools_helper.list_ahead(wake);
                 }
                 HandOver::Queued
-            }
-            Admit::PanelOnly => {
-                let shown = self.show_devtools_helper(origin, reading, None, now);
-                self.devtools_watch.note_handed_over();
-                // The verb's asker brings the page up itself after this answer (`aterm-cli`'s
-                // devtools_open_here, behind its `spctl` run) and writes the marker then: a step
-                // kept waiting looks in ten minutes, and that marker, if younger, holds it on
-                // (`Self::devtools_page_holds_the_step`).
-                let revision = self.access_revision().is_some();
-                self.devtools_helper
-                    .page_came_up(revision, devtools_helper::past_its_ten_minutes());
-                self.devtools_helper.noted_now_answered(now);
-                if shown {
-                    HandOver::Shown
-                } else {
-                    HandOver::Unshown
-                }
             }
             Admit::PaneOnly => self.open_devtools_page(origin, None, false, now),
             Admit::Hand {
@@ -10867,6 +10986,7 @@ impl App {
             listed,
             bundle: (reach.drag_bundle)(reading.subject),
             skips: aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check,
+            step: self.walk_step(devtools_helper::Page::DeveloperTools, origin),
         };
         let wake = self.devtools_hand_over_wake();
         let shown = self.devtools_helper.show(show, now, wake);
@@ -10995,11 +11115,16 @@ impl App {
                         self.note_macos_access_settings_opened(now);
                     }
                 }
+                // The walk reads this page's grant itself (`App::drive_permission_walk`).
+                devtools_helper::Page::Accessibility => {}
             }
             if asks.open_status {
                 let _ = self.open_settings_tab(native_settings::SettingsRoute::Security);
             }
         }
+        // A walk whose last page (or a page asked for by name) just closed is over now, not at
+        // the walk's own turn: the steps below judge their moment without it.
+        self.settle_walk_close(now);
         self.tick_fda_hand_over(now);
         if self.devtools_helper.hand_over_due(now) {
             let step = self
@@ -11039,8 +11164,8 @@ impl App {
     }
 
     /// Whether the page the window's own Developer Tools step waits out is still within its ten
-    /// minutes at the step's look (its marker younger than the wait allowed for: a control
-    /// verb's `now` whose asker wrote it late, or a page brought up since). The step then waits
+    /// minutes at the step's look (its marker younger than the wait allowed for: a page brought
+    /// up since, by this window, `aterm doctor` or another aterm). The step then waits
     /// out the rest, a wait and never a refusal as [`devtools_helper::Refusal::Recent`], unless
     /// this revision brought the page up already, which refuses it as shown at once.
     fn devtools_page_holds_the_step(&mut self, now: Instant) -> bool {
@@ -11978,7 +12103,7 @@ impl App {
                 clippy::disallowed_methods,
                 reason = "the one Full Disk Access door, after admit_fda"
             )]
-            Admit::PaneOnly | Admit::Hand { .. } | Admit::PanelOnly => {
+            Admit::PaneOnly | Admit::Hand { .. } => {
                 self.open_fda_page(origin, admitted != Admit::PaneOnly, now)
             }
         };
@@ -12143,6 +12268,7 @@ impl App {
             listed: None,
             bundle: (reach.drag_bundle)(signing_identity::running_bundle_id_if_warm()),
             skips: false,
+            step: self.walk_step(devtools_helper::Page::FullDiskAccess, origin),
         };
         let wake = self.devtools_hand_over_wake();
         let shown = self.devtools_helper.show(show, now, wake);
@@ -12422,8 +12548,8 @@ impl App {
                     self.consent_launch.skip(Skip::OnlyAppData);
                     return;
                 }
-                // A step of System State's run: it parks between folders while the
-                // person is away from System State (`App::settle_access_steps`).
+                // A step of System State's run: its looks run together, each parked while
+                // the person is away from System State (`App::settle_access_steps`).
                 let gate = consent_warmup::WarmupGate::open();
                 match self.start_consent_warmup_pass(&folders, Some(gate.clone())) {
                     consent_warmup::StartOutcome::Started => {
@@ -12481,7 +12607,7 @@ impl App {
                 .queue_after_listing(origin, now, listed);
             return HandOver::Queued;
         }
-        let (_, facts, fda_pending) = self.devtools_admit_facts(origin, now);
+        let (facts, fda_pending) = self.devtools_admit_facts(origin);
         let moment = if origin.system_state_step() {
             self.access_step_moment(now)
         } else {
@@ -14417,7 +14543,7 @@ impl App {
                 });
             }
             ws.page_buttons = 0;
-            ws.fx.front_replaced(Instant::now());
+            ws.fx.front_replaced(crate::metrics::host_now());
             ws.fx
                 .companions_mut()
                 .cursor_cat
@@ -14485,6 +14611,7 @@ impl App {
         self.sync_native_visibility();
         self.refresh_window_tabs(wid);
         self.refresh_presence_window(wid);
+        self.rewind_reconcile_effects(wid);
         if front_changed {
             self.rederive_pointer_cell(wid);
         }
@@ -14756,6 +14883,7 @@ impl App {
             notify_tx,
             allow_kitty_file_transfer: false,
             temporal_recording: false,
+            rewind_budget_bytes: crate::temporal::DEFAULT_BUDGET_BYTES,
             defer_adopted_readers: false,
             reader_after_install: false,
             fg_probe: crate::quit_safety::foreground_pgrp,
@@ -14893,6 +15021,10 @@ impl App {
             hold: false,
             session_factory,
             proxy: None,
+            network_snapshot: network_deck::inactive_snapshot(),
+            network_source: None,
+            network_next_poll: None,
+            harness_progress_next_poll: None,
             vitals: vitals_host::VitalsHost::default(),
             diskwalk: diskwalk_host::DiskwalkHost::default(),
             #[cfg(all(test, unix))]
@@ -15070,6 +15202,7 @@ impl App {
             claimant_retire_refusal: None,
             devtools_watch: devtools_watch::DevToolsWatch::default(),
             devtools_helper: devtools_helper::Lane::new(true),
+            permission_walk: permission_walk::WalkLane::new(true),
             debugger_change: debugger_access::DebuggerChangeLane::new(true),
             debugger_launch: debugger_access::DebuggerStepQueue::new(false),
             access_steps: system_state_access::AccessSteps::inert(),
@@ -15273,6 +15406,7 @@ impl App {
             autopilot_timers: autopilot_timers::AutopilotTimers::default(),
             autopilot_recorded: std::collections::HashMap::new(),
             autopilot_menu: None,
+            account_menu_read: account_menu_read::State::default(),
             autopilot_menu_spent: None,
             claude_facts: std::collections::HashMap::new(),
             update_handoff_activity_epoch: 0,
@@ -15517,7 +15651,7 @@ impl App {
     }
 
     /// Install an already-spawned `session` as a new pane splitting `owner`'s focused pane in `dir`, and focus it.
-    #[cfg(test)]
+    #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
     pub(crate) fn install_split_pane(
         &mut self,
         owner: WindowId,
@@ -15879,7 +16013,7 @@ impl App {
         )
     )]
     fn on_focus(&mut self, wid: WindowId, focused: bool) {
-        let focus_now = Instant::now();
+        let focus_now = crate::metrics::host_now();
         let cursor_fx_presentable = self.cursor_fx_focus(wid, focused, focus_now);
         if !focused {
             self.settle_selection_gesture(wid);
@@ -17344,6 +17478,9 @@ impl ApplicationHandler<Wake> for App {
         self.service_split_regrid_holds(Instant::now());
         self.service_kitty_animations(Instant::now());
         self.service_vitals(Instant::now());
+        self.service_network_state(Instant::now());
+        self.service_harness_account_progress(Instant::now());
+        self.service_account_menu_read(Instant::now());
         self.service_stats_lens(Instant::now());
         self.service_stats_live(Instant::now());
         self.service_diskwalk(Instant::now());
@@ -17513,22 +17650,25 @@ impl ApplicationHandler<Wake> for App {
         let mut park_now = Instant::now();
         self.poll_consent_observer(park_now);
         self.tick_consent_lanes(park_now);
-        if self.headless || self.desk.on_glass(self.first_present_done) {
+        // A headless app has no glass to wait for: its restore pass (a keeper recovery's
+        // sessions after session 0 among what it places) runs at its first park, whatever its
+        // desk keeps.
+        let on_glass = self.headless || self.desk.on_glass(self.first_present_done);
+        if on_glass {
             spawn::release_held_prime();
         }
         if restore_pass_due(
             RestorePassSite::Park,
             self.restore_pass_handoff_lane(),
-            self.desk.on_glass(self.first_present_done),
+            on_glass,
             self.restore_pass_queued(),
         ) {
             self.run_restore_pass(el, RestorePassSite::Park);
             park_now = Instant::now();
         }
         #[cfg(unix)]
-        if self.keeper_history_owed
-            && !(self.restore_pass_queued() && self.desk != desk::Desk::Headless)
-        {
+        if self.keeper_history_owed && !self.restore_pass_queued() {
+            crate::metrics::mark_keeper_placed();
             self.keeper_history_owed = false;
             self.start_keeper_history_imports();
         }
@@ -18314,6 +18454,7 @@ impl ApplicationHandler<Wake> for App {
             self.note_palette_refused();
         }
         self.note_person_refusals();
+        self.note_rewind_focus();
         let status_rebuilt = self.take_status_rebuild();
         if status_rebuilt {
             self.refresh_status_item();
@@ -18402,6 +18543,14 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::SystemVitals,
             );
         }
+        if let Some(network_wake) = self.network_state_deadline() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                network_wake,
+                metrics::DeadlineOwner::SystemVitals,
+            );
+        }
         if let Some(lens_wake) = self.stats_lens_deadline() {
             fold_owned_deadline(
                 &mut deadline,
@@ -18410,12 +18559,28 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::StatsLens,
             );
         }
+        if let Some(menu_wake) = self.account_menu_read_deadline() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                menu_wake,
+                metrics::DeadlineOwner::SessionChrome,
+            );
+        }
         if let Some(live_wake) = self.stats_live_deadline(Instant::now()) {
             fold_owned_deadline(
                 &mut deadline,
                 &mut deadline_owner,
                 live_wake,
                 metrics::DeadlineOwner::StatsLive,
+            );
+        }
+        if let Some(needle_wake) = self.stats_needle_deadline(Instant::now()) {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                needle_wake,
+                metrics::DeadlineOwner::StatsNeedle,
             );
         }
         if let Some(log_wake) = self.next_session_log_wake() {
@@ -18433,6 +18598,14 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline,
                 &mut deadline_owner,
                 status_wake,
+                metrics::DeadlineOwner::SessionStatus,
+            );
+        }
+        if let Some(wake) = self.harness_progress_next_poll {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                wake,
                 metrics::DeadlineOwner::SessionStatus,
             );
         }
@@ -18661,6 +18834,7 @@ impl App {
             Wake::ClaudeFooter { session } => {
                 self.on_claude_footer_changed(session);
             }
+            Wake::AccountMenuRead(completion) => self.on_account_menu_read(completion),
             Wake::SessionLogMoved { session } => {
                 self.on_session_log_moved(session);
             }
@@ -19035,7 +19209,7 @@ impl App {
             }
             #[cfg(target_os = "macos")]
             Wake::TabContextMenuOpening { window } => {
-                self.clear_tab_surface_move_license(Some(window));
+                self.fence_pointer_license(window);
             }
             #[cfg(target_os = "macos")]
             Wake::TabMenuConnection {
@@ -19663,9 +19837,12 @@ impl App {
             Wake::Notice { request, reply } => {
                 let _ = reply.send(self.take_notice(request));
             }
-            Wake::DevToolsHandOverAsked { now, reply } => {
-                let _ =
-                    reply.send(self.hand_devtools_to_owner(devtools_helper::Origin::Ctl { now }));
+            Wake::DevToolsHandOverAsked { reply } => {
+                let _ = reply.send(self.hand_devtools_to_owner(devtools_helper::Origin::Ctl));
+            }
+            Wake::PermissionWalkAsked { subjects, reply } => {
+                let started = self.ask_permission_walk(&subjects, Instant::now());
+                let _ = reply.send(started);
             }
             Wake::AgentUpgrade { rows, kept } => self.apply_host_upgrades(rows, kept),
             Wake::AgentUpgradeWord { ask, result } => self.apply_upgrade_word(&ask, result),
@@ -20000,6 +20177,20 @@ impl App {
             },
             #[cfg(target_os = "macos")]
             Wake::Askpass(request) => self.present_askpass_sheet(*request),
+            #[cfg(target_os = "macos")]
+            Wake::CpuPolicyReport(report) => self.accept_cpu_policy_report(*report),
+            #[cfg(target_os = "macos")]
+            Wake::CpuPolicyPermit { operation, reply } => {
+                let _ = reply.send(self.cpu_policy_permit(&operation));
+            }
+            #[cfg(target_os = "macos")]
+            Wake::CpuPolicyAction {
+                session,
+                action,
+                reply,
+            } => {
+                let _ = reply.send(self.cpu_policy_action(session, action));
+            }
             #[cfg(target_os = "macos")]
             Wake::AskpassAnswered { id, proceed } => self.answer_askpass_sheet(id, proceed),
             #[cfg(target_os = "macos")]
@@ -21895,6 +22086,10 @@ mod pkg_progress_tests;
 #[path = "lib_pass_verdict_tests.rs"]
 mod pass_verdict_tests;
 
+#[cfg(test)]
+#[path = "lib_launch_repairs_tests.rs"]
+mod launch_repairs_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PassVerb {
     Seed,
@@ -22628,6 +22823,85 @@ fn spawn_machine_settings_once(atpkg: std::path::PathBuf, proxy: LaneSink) {
     }
 }
 
+/// Run the launch's repairs ([`set_launch_repairs`]) once, on a background lane of their own so
+/// the pass after the seed starts at once; what moved is one exceptions entry, never a dialog.
+fn spawn_launch_repairs(private_state_root: bool) {
+    let Some(repairs) = LAUNCH_REPAIRS
+        .get()
+        .copied()
+        .filter(|_| !private_state_root)
+    else {
+        return;
+    };
+    let spawned =
+        crate::qos::spawn_lane_thread("launch-repairs", crate::qos::Role::Background, move || {
+            launch_repairs_run(Some(repairs), private_state_root, |entry| {
+                #[cfg(unix)]
+                crate::message_inbox::queue_exception(entry);
+                #[cfg(not(unix))]
+                drop(entry);
+            });
+        });
+    if let Err(e) = spawned {
+        aterm_log::warn!("launch repairs: no thread ({e})");
+    }
+}
+
+/// Run `repairs`, log what moved one line each (or that nothing did), and raise it
+/// ([`launch_repairs_entry`]); a laboratory's instance (a private state root) repairs nothing.
+fn launch_repairs_run(
+    repairs: Option<fn() -> Vec<String>>,
+    private_state_root: bool,
+    raise: impl FnOnce(aterm_messages::exceptions::Entry),
+) {
+    let Some(repairs) = repairs.filter(|_| !private_state_root) else {
+        return;
+    };
+    let moved = repairs();
+    if moved.is_empty() {
+        aterm_log::info!("launch repairs: nothing moved");
+    }
+    for line in &moved {
+        aterm_log::info!("launch repairs: {line}");
+    }
+    if let Some(entry) = launch_repairs_entry(&moved) {
+        raise(entry);
+    }
+}
+
+/// The exceptions digest's entry for what a launch's repairs moved, one line each: a fact for
+/// later, never an alert. `None` when nothing moved.
+fn launch_repairs_entry(moved: &[String]) -> Option<aterm_messages::exceptions::Entry> {
+    use aterm_messages::exceptions::{Entry, Family, MORE_LINES};
+    use aterm_messages::need::{Reason, Then, Why};
+    if moved.is_empty() {
+        return None;
+    }
+    let mut entry = Entry::new(
+        Family::Setup,
+        "",
+        "launch-repairs",
+        "Stale aterm leftovers set aside",
+        Why::OnlyYou(Reason::new("only you can say whether to keep what moved")),
+        Then::step("Put it back from where its line says to keep it"),
+    );
+    let shown = if moved.len() > MORE_LINES {
+        MORE_LINES - 1
+    } else {
+        moved.len()
+    };
+    for line in &moved[..shown] {
+        entry = entry.more(line);
+    }
+    if shown < moved.len() {
+        entry = entry.more(format!(
+            "{} more: aterm.log names each",
+            moved.len() - shown
+        ));
+    }
+    Some(entry.log_line(format!("launch repairs: {}", moved.join("; "))))
+}
+
 fn launch_update_park(
     just_updated: bool,
     layout: Option<&atpkg::store::Layout>,
@@ -23161,6 +23435,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: LaneSink) -> bool {
         };
         lane.hold_band();
         let mut seed_pending = lane.run_launch_seed();
+        spawn_launch_repairs(lane.private_state_root);
         let just_updated = JUST_UPDATED.get().copied().unwrap_or(false);
         if just_updated {
             aterm_log::info!(
@@ -24745,6 +25020,24 @@ fn warm_prologue(
             .or(inherited_path.as_deref()),
     )
     .or(path_pair);
+    // While a setup pass wants Apple's Command Line Tools, the shim directory exists; put it
+    // ahead of `/usr/bin` so a shell that runs `git` reaches aterm, not the stub that raises
+    // the install dialog (design §6.3). It is absent on a Mac that has the tools, so this is a
+    // no-op there, and the owner's Mac never lays it.
+    let path_pair = match clt_shim::shim_dir()
+        .filter(|dir| dir.is_dir())
+        .and_then(|dir| dir.to_str().map(str::to_owned))
+    {
+        Some(shim) => {
+            let base = path_pair
+                .map(|(_, value)| value)
+                .or_else(|| inherited_path.clone())
+                .unwrap_or_default();
+            let composed = clt_shim::on_path(&base, &shim);
+            (!composed.is_empty()).then_some(("PATH".to_string(), composed))
+        }
+        None => path_pair,
+    };
     if let Some(path_pair) = path_pair {
         env_add.push(path_pair);
     }
@@ -24984,6 +25277,23 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
 
 /// The terminal window entry with an optional cold interactive startup action.
 pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Option<fn() -> bool>) {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "compatibility entry delegates to the same window door"
+    )]
+    main_entry_with_network(argv, first_run, None);
+}
+
+/// A nonblocking read of a host-owned immutable network/service snapshot.
+pub type NetworkSnapshotSource =
+    Arc<dyn Fn() -> Arc<aterm_types::network_state::NetworkStateSnapshot> + Send + Sync>;
+
+/// Window entry with an injected network observer; no provider runs in painting.
+pub fn main_entry_with_network(
+    argv: Vec<std::ffi::OsString>,
+    first_run: Option<fn() -> bool>,
+    network_source: Option<NetworkSnapshotSource>,
+) {
     metrics::mark_process_start();
     #[cfg(target_os = "macos")]
     code_readahead::read_ahead_own_code();
@@ -25423,6 +25733,11 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     let overlap_admitted = handoff_commit.is_some();
     let first_run_eligible = !headless_flag
         && workstation_setup::eligible_launch_command(
+            // A copy that goes away (a disk image, an App Translocation copy, a plain binary)
+            // sets nothing up: it installs itself and relaunches first (design §6.8). No posture
+            // (not macOS) is not gated here; the base sync plan reaches every Mac.
+            running_install_posture()
+                .is_none_or(aterm_update::first_launch::setup_runs_from_posture),
             first_run_commandless,
             relaunch_of_running,
             overlap_admitted,
@@ -25643,8 +25958,18 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         || (!headless
             && aterm_types::dirs::runs_under_private_state_root()
             && aterm_types::dev_seam!("ATERM_DEBUG_WORKSTATION_SETUP").is_some());
-    if !unified_setup {
+    // ... and only from an installed copy: a copy that goes away installs itself and relaunches
+    // first, and its installed successor mends the subscriber (design §6.8). No posture (not
+    // macOS) is not gated here.
+    let installed_posture =
+        running_install_posture().is_none_or(aterm_update::first_launch::setup_runs_from_posture);
+    if !unified_setup && installed_posture {
         mend_secrets_subscriber_once(headless);
+    }
+    // The converge pass's window lane, beside the mend and on the same terms; a setup's run
+    // starts it once it ends ([`start_converge_lane`]).
+    if installed_posture {
+        converge_lane_once(headless, unified_setup);
     }
     spawn::prime_agents_if_due(spawn::PrimeCue::Launch);
     let carry_frame = seamless_window.clone();
@@ -25735,6 +26060,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     ));
     let startup_colors =
         config.resolved_colors(os_appearance, &startup_config_snapshot.assets.themes, None);
+    crate::temporal::pool().set_limit(config.rewind_total_bytes());
     let mut session_factory = SessionFactory {
         spawn_cap,
         sandbox_cap,
@@ -25751,7 +26077,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         loop_idle: Arc::default(),
         notify_tx,
         allow_kitty_file_transfer: config.allow_kitty_file_transfer.unwrap_or(false),
-        temporal_recording: config.temporal_recording.unwrap_or(false),
+        temporal_recording: config.temporal_recording_or_default(),
+        rewind_budget_bytes: config.rewind_budget_bytes(),
         defer_adopted_readers: overlap_channels_present,
         reader_after_install: false,
         fg_probe: crate::quit_safety::foreground_pgrp,
@@ -26396,6 +26723,18 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
             let _ = proxy.send_event(Wake::HostNote(note));
         })
     });
+    services_watch::start({
+        let proxy = event_loop.create_proxy();
+        std::sync::Arc::new(move |note| {
+            let _ = proxy.send_event(Wake::HostNote(note));
+        })
+    });
+    let _ = aterm_agent::harness::accounts_sync::watch_login_activity({
+        let proxy = event_loop.create_proxy();
+        Box::new(move || {
+            let _ = proxy.send_event(Wake::HostNote(harness_host::HostNote::AccountProgress));
+        })
+    });
     occupancy_wakes::install(store.clone(), {
         let proxy = event_loop.create_proxy();
         std::sync::Arc::new(move |note| {
@@ -26753,6 +27092,14 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         hold,
         session_factory,
         proxy: Some(proxy.clone()),
+        network_snapshot: network_source
+            .as_ref()
+            .map_or_else(network_deck::inactive_snapshot, |read| {
+                network_deck::fresh_snapshot(read(), aterm_time::unix_millis())
+            }),
+        network_source,
+        network_next_poll: None,
+        harness_progress_next_poll: None,
         vitals: vitals_host::VitalsHost::default(),
         diskwalk: diskwalk_host::DiskwalkHost::default(),
         #[cfg(all(test, unix))]
@@ -26945,6 +27292,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
             }
             lane
         },
+        permission_walk: permission_walk::WalkLane::new(headless),
         debugger_change: debugger_access::DebuggerChangeLane::new(headless),
         debugger_launch: debugger_access::DebuggerStepQueue::new(
             !headless && cfg!(target_os = "macos"),
@@ -27175,6 +27523,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         autopilot_timers: autopilot_timers::AutopilotTimers::default(),
         autopilot_recorded: std::collections::HashMap::new(),
         autopilot_menu: None,
+        account_menu_read: account_menu_read::State::default(),
         autopilot_menu_spent: None,
         claude_facts: std::collections::HashMap::new(),
         update_handoff_activity_epoch: 0,
@@ -27352,7 +27701,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     app.kitty_log.flush_exit();
     let _ = app.close_messages_at_exit();
     app.session_log_journal
-        .finish_at_quit(session_log_journal::QUIT_BUDGET);
+        .finish_at_quit(session_log_journal::quit_budget());
     let mut quit_wrote_its_desk = false;
     if app.desk.kept() && app.config.restore_session_or_default() {
         let mut manifest = app
@@ -27585,7 +27934,8 @@ fn ptyless_session(id: u64, self_id: SessionId, term: Terminal, sink: Arc<SinkWr
         reader_join: None,
         wake_wr: -1,
         reader_stop: Arc::new(AtomicBool::new(false)),
-        temporal_writer_join: None,
+        temporal_drain: None,
+        temporal_arm: Arc::default(),
         reflow_cancel: Arc::new(AtomicBool::new(false)),
         fg_holder: Arc::new(std::sync::atomic::AtomicI32::new(0)),
         handoff_history: None,

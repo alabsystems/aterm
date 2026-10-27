@@ -6,9 +6,9 @@ use crate::harness::login_latch::LoginLatches;
 use crate::harness::repo_work::{RepoRead, RepoWork};
 use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::turn_end::{
-    DONE_CHECK, FINISHED, LAND, LAND_NUDGE, REPO_UNREAD_OWN, RULE_CONTINUE, RULE_DONE_CHECK,
-    RULE_LAND, RULE_LEFT, RULE_LOGIN, RULE_LOGIN_BACK, RULE_SUGGESTION, done_check_words,
-    own_repo_work_suffix,
+    Cleared, Clearing, DONE_CHECK, FINISHED, LAND, LAND_NUDGE, Outage, REPO_UNREAD_OWN,
+    RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LEFT, RULE_LOGIN, RULE_LOGIN_BACK,
+    RULE_OUTAGE_RESUME, RULE_SUGGESTION, cleared_text, done_check_words, own_repo_work_suffix,
 };
 use std::sync::PoisonError;
 
@@ -1149,7 +1149,7 @@ fn an_unknown_composer_is_never_typed_over_or_submitted() {
 }
 
 #[test]
-fn a_529_waits_its_backoff_then_continues_exactly_once() {
+fn a_529_waits_its_rung_then_tries_its_one_line_exactly_once() {
     let (dir, path) = journal_file("te-529");
     let end_529 = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::END_529);
     let mut m = Mock::new(vec![
@@ -1166,16 +1166,17 @@ fn a_529_waits_its_backoff_then_continues_exactly_once() {
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
         s.set_turn_end_timing(TurnEndTiming {
-            retry_backoff: vec![Duration::from_millis(50); 3],
+            outage_first: Duration::from_millis(50),
+            outage_cap: Duration::from_millis(50),
             ..TurnEndTiming::default()
         });
     });
     assert_eq!(count(&m, "turn"), 1, "{lines:#?}\n{:#?}", m.requests);
+    let line = cleared_text(Cleared::Outage(Outage::Overload), Clearing::Blind);
     assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("CONTINUED seq=102 rule=api-retry@v1 ")
-                && !l.ends_with(" keep going")),
+        lines.iter().any(|l| l.starts_with(&format!(
+            "CONTINUED seq=102 rule={RULE_OUTAGE_RESUME} {line}"
+        ))),
         "{lines:#?}"
     );
     let (records, _) = journal_records(&path);
@@ -1185,7 +1186,7 @@ fn a_529_waits_its_backoff_then_continues_exactly_once() {
         .find(|r| r.kind == "waiting")
         .expect("a WAITING row");
     assert!(
-        waiting.summary.ends_with("overloaded retry 1"),
+        waiting.summary.ends_with("waiting: API overload"),
         "{}",
         waiting.summary
     );
@@ -2497,7 +2498,7 @@ fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_tex
         let caret = shown.iter().position(|row| row == "❯").expect("caret row");
         shown[caret] = "❯ keep going, then merge when ready".to_string();
         let mut typed = shown.clone();
-        typed[caret] = "❯ keep going".to_string();
+        typed[caret] = format!("❯ {CLEARED}");
         let mut screens = vec![busy_screen(), shown.clone()];
         if !unmoved {
             screens.push(shown);
@@ -2537,10 +2538,17 @@ fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_tex
 
     let t = world(true);
     assert_eq!(t.sends().len(), 1, "written once: {}", t.evidence());
-    assert!(t.sends()[0].ends_with(" -- keep going"), "{}", t.evidence());
+    assert!(
+        t.sends()[0].ends_with(&format!(" -- {CLEARED}")),
+        "{}",
+        t.evidence()
+    );
     assert_eq!(t.enters().len(), 1, "one Enter: {}", t.evidence());
     assert!(
-        t.enters()[0].contains("if=^❯\\x20keep\\x20going\\s*$"),
+        t.enters()[0].contains(&format!(
+            "if={}",
+            super::super::super::policy::row_guard(&format!("❯ {CLEARED}"))
+        )),
         "fenced on the read that showed it whole: {}",
         t.evidence()
     );
@@ -4950,6 +4958,12 @@ fn a_muse_code_report_ending_with_the_token_gets_the_done_check() {
 struct ReachHost {
     script: std::sync::Mutex<VecDeque<Reach>>,
     last: std::sync::Mutex<Reach>,
+    /// An up entry is stamped up as of the ask that reaches it, as a host measures the edge
+    /// ([`ReachHost::edged`]).
+    stamps_edges: bool,
+    /// The loop's own clock, an edge stamped on it ([`ReachHost::stamps_on`]): a test loop's
+    /// clock runs on its steps, apart from the system's.
+    clock: std::sync::Mutex<Option<Arc<crate::supervise::fx::ScriptedClock>>>,
     asks: std::sync::atomic::AtomicUsize,
     /// Every plan the loop told the host, in order ([`IdleHost::waiting`]).
     told: std::sync::Mutex<Vec<Option<crate::supervise::WaitPlan>>>,
@@ -4961,6 +4975,22 @@ impl ReachHost {
             script: std::sync::Mutex::new(script.iter().copied().collect()),
             ..Self::default()
         })
+    }
+
+    /// [`Self::scripted`], each up entry the route's edge up at the ask that reaches it, on the
+    /// loop's clock once [`Self::stamps_on`] names it.
+    fn edged(script: &[Reach]) -> Arc<Self> {
+        Arc::new(Self {
+            script: std::sync::Mutex::new(script.iter().copied().collect()),
+            stamps_edges: true,
+            ..Self::default()
+        })
+    }
+
+    /// Stamp each edge on the clock of the loop `s` (from the run's setup), as the shipped host
+    /// and loop share the system's.
+    fn stamps_on<C: Ctl>(&self, s: &mut Session<'_, C>) {
+        *self.clock.lock().unwrap() = s.fx.scripted_handle();
     }
 
     fn asks(&self) -> usize {
@@ -4989,7 +5019,17 @@ impl IdleHost for ReachHost {
         self.asks.fetch_add(1, Ordering::SeqCst);
         let mut last = self.last.lock().unwrap();
         if let Some(next) = self.script.lock().unwrap().pop_front() {
-            *last = next;
+            *last = match next {
+                Reach::Up { .. } if self.stamps_edges => Reach::Up {
+                    since: self
+                        .clock
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map_or_else(Instant::now, |c| c.mono()),
+                },
+                next => next,
+            };
         }
         *last
     }
@@ -5003,7 +5043,8 @@ fn far_rungs() -> TurnEndTiming {
     let hour = Duration::from_secs(3600);
     TurnEndTiming {
         net_backoff: vec![hour],
-        down_hold: hour,
+        outage_first: hour,
+        outage_cap: hour,
         ..TurnEndTiming::default()
     }
 }
@@ -5017,7 +5058,7 @@ fn outage_timed(
     max_s: u64,
     timing: TurnEndTiming,
 ) -> (Vec<String>, Arc<ReachHost>, Mock, Vec<String>) {
-    let host = ReachHost::scripted(script);
+    let host = ReachHost::edged(script);
     let tag = timing.net_backoff.first().map_or(0, Duration::as_secs);
     let (dir, path) = journal_file(&format!("te-outage-{}-{max_s}-{tag}", script.len()));
     let mut m = Mock::new(vec![busy_screen(), enotfound(), busy_screen(), ended(STOP)]);
@@ -5029,7 +5070,10 @@ fn outage_timed(
         journal: Some(path.clone()),
         ..hosted(max_s)
     };
-    let (lines, _) = watch_lines_with(&mut m, &opts, |s| s.set_turn_end_timing(timing));
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        host.stamps_on(s);
+        s.set_turn_end_timing(timing);
+    });
     let (records, _) = journal_records(&path);
     let _ = std::fs::remove_dir_all(&dir);
     let waiting = records
@@ -5060,7 +5104,8 @@ fn short_outage(
     };
     let timing = TurnEndTiming {
         net_backoff: vec![Duration::from_millis(50)],
-        down_hold: Duration::from_millis(50),
+        outage_first: Duration::from_millis(50),
+        outage_cap: Duration::from_millis(50),
         take_within: Duration::from_millis(300),
         ..TurnEndTiming::default()
     };
@@ -5294,11 +5339,15 @@ fn the_loop_reads_the_wall_of_a_tall_panes_short_transcript() {
     assert_eq!(tall.len(), 50, "the measured pane");
     let (lines, told, whole, waiting, requests) = run("te-tall-pane", tall.clone());
     assert!(
-        waiting.iter().any(|w| w.contains("api-error retry 1")),
+        waiting
+            .iter()
+            .any(|w| w.contains("waiting: connection error")),
         "the wall is read: {waiting:#?}\n{lines:#?}\n{requests:#?}"
     );
     assert!(
-        told.iter().flatten().any(|p| p.why.contains("api-error")),
+        told.iter()
+            .flatten()
+            .any(|p| p.why.contains("connection error")),
         "a plan told: {told:#?}"
     );
     assert!(
@@ -5313,11 +5362,13 @@ fn the_loop_reads_the_wall_of_a_tall_panes_short_transcript() {
     }
     let (lines, told, whole, waiting, requests) = run("te-tall-pane-full", full);
     assert!(
-        !waiting.iter().any(|w| w.contains("api-error")),
+        !waiting.iter().any(|w| w.contains("connection error")),
         "the error is outside the zone: {waiting:#?}\n{lines:#?}"
     );
     assert!(
-        told.iter().flatten().all(|p| p.kind != WaitKind::Retry),
+        told.iter()
+            .flatten()
+            .all(|p| !matches!(p.kind, WaitKind::Retry | WaitKind::Outage { .. })),
         "{told:#?}"
     );
     assert_eq!(whole, 0, "the tail alone: {requests:#?}");
@@ -5326,7 +5377,9 @@ fn the_loop_reads_the_wall_of_a_tall_panes_short_transcript() {
     short.drain(11..31);
     let (lines, told, whole, waiting, requests) = run("te-tall-pane-short", short);
     assert!(
-        waiting.iter().any(|w| w.contains("api-error retry 1")),
+        waiting
+            .iter()
+            .any(|w| w.contains("waiting: connection error")),
         "{waiting:#?}\n{lines:#?}"
     );
     assert!(told.iter().flatten().count() >= 1, "{told:#?}");
@@ -5349,22 +5402,26 @@ fn awaits_before_turn(m: &Mock) -> usize {
 fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
     let t = Instant::now();
     let down = Reach::Down { since: t };
-    let up = Reach::Up {
-        since: t + Duration::from_secs(1),
-    };
+    // Stamped on the loop's clock at the ask that reaches it ([`ReachHost::edged`]): an edge up
+    // after the wall, however long the run takes on the system's clock.
+    let up = Reach::Up { since: t };
     let (lines, host, m, waiting) = outage_under(&[down, down, down, up], 30);
     let continued: Vec<&String> = lines
         .iter()
         .filter(|l| l.starts_with("CONTINUED"))
         .collect();
     assert_eq!(continued.len(), 1, "{lines:#?}");
-    assert!(
-        continued[0].starts_with("CONTINUED seq=102 rule=api-back@v1 "),
-        "{lines:#?}"
+    let resumed = format!(
+        "CONTINUED seq=102 rule={RULE_OUTAGE_RESUME} {}",
+        cleared_text(Cleared::Outage(Outage::Connection), Clearing::Measured)
     );
+    assert!(continued[0].starts_with(&resumed), "{lines:#?}");
     assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
-    assert_eq!(waiting.len(), 1, "the hold, said once: {waiting:#?}");
-    assert!(waiting[0].contains("the API is unreachable"), "{waiting:?}");
+    assert_eq!(waiting.len(), 1, "the wait, said once: {waiting:#?}");
+    assert!(
+        waiting[0].ends_with("waiting: connection error"),
+        "{waiting:?}"
+    );
     assert_eq!(host.asks(), 6, "{lines:#?}");
 
     let (_, _, longer, _) = outage_under(&[down, down, down, down, up], 30);
@@ -5383,7 +5440,9 @@ fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
         "{lines:#?}"
     );
     assert!(
-        waiting.iter().any(|w| w.contains("the API is unreachable")),
+        waiting
+            .iter()
+            .any(|w| w.ends_with("waiting: connection error")),
         "{waiting:#?}"
     );
     assert!(host.asks() > 2, "asked at each step while it waited");
@@ -5413,7 +5472,7 @@ fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
             })
             .collect();
     let run_agy = |script: &[Reach], max_s: u64| {
-        let host = ReachHost::scripted(script);
+        let host = ReachHost::edged(script);
         let (dir, path) = journal_file(&format!("te-agy-outage-{}-{max_s}", script.len()));
         let mut m = agy_mock(vec![
             agy_busy.clone(),
@@ -5429,7 +5488,10 @@ fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
             journal: Some(path.clone()),
             ..hosted(max_s)
         };
-        let (lines, _) = watch_lines_with(&mut m, &opts, |s| s.set_turn_end_timing(far_rungs()));
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            host.stamps_on(s);
+            s.set_turn_end_timing(far_rungs());
+        });
         let (records, _) = journal_records(&path);
         let _ = std::fs::remove_dir_all(&dir);
         let waiting: Vec<String> = records
@@ -5446,7 +5508,9 @@ fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
         "agy must not send messages during a network outage: {lines:#?}"
     );
     assert!(
-        waiting.iter().any(|w| w.contains("the API is unreachable")),
+        waiting
+            .iter()
+            .any(|w| w.ends_with("waiting: connection error")),
         "{waiting:#?}"
     );
     assert!(host.asks() > 2, "{lines:#?}");
@@ -5457,13 +5521,91 @@ fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
         .filter(|l| l.starts_with("CONTINUED"))
         .collect();
     assert_eq!(continued.len(), 1, "{lines:#?}");
-    assert!(
-        continued[0].starts_with("CONTINUED seq=102 rule=api-back@v1 "),
-        "{lines:#?}"
-    );
+    assert!(continued[0].starts_with(&resumed), "{lines:#?}");
     assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
     assert_eq!(waiting.len(), 1, "{waiting:#?}");
-    assert!(waiting[0].contains("the API is unreachable"), "{waiting:?}");
+    assert!(
+        waiting[0].ends_with("waiting: connection error"),
+        "{waiting:?}"
+    );
+}
+
+/// A CONNECTION WALL MEASURED DOWN (v6 §14.17.5.2): the loop types nothing however many reads
+/// find the route down, resumes once on the edge up with the measured line, and, the wall met
+/// again after it, reads the route up again and types nothing more: an up measured before the
+/// last try is no clearing, the wall's next try its blind rung an hour on.
+#[test]
+fn a_connection_measured_down_types_nothing_then_resumes_once_on_the_edge_up() {
+    let t = Instant::now();
+    let mut script = vec![Reach::Down { since: t }; 12];
+    script.push(Reach::Up { since: t });
+    let host = ReachHost::edged(&script);
+    let (dir, path) = journal_file("te-outage-edge-up-once");
+    let mut m = Mock::new(vec![busy_screen(), enotfound(), busy_screen(), enotfound()]);
+    m.turn_releases = Some(1);
+    m.vanish_after = Some(12);
+    m.stall_sleep = Some(Duration::from_millis(5));
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        journal: Some(path.clone()),
+        ..hosted(30)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        host.stamps_on(s);
+        s.set_turn_end_timing(far_rungs());
+    });
+    let (records, _) = journal_records(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    let continued: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .collect();
+    let resumed = format!(
+        "CONTINUED seq=102 rule={RULE_OUTAGE_RESUME} {}",
+        cleared_text(Cleared::Outage(Outage::Connection), Clearing::Measured)
+    );
+    assert!(
+        continued.len() == 1 && continued[0].starts_with(&resumed),
+        "one resume, on the edge up: {lines:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
+    assert!(
+        host.asks() > script.len(),
+        "the route read up again at the wall met again: {} asks, {lines:#?}",
+        host.asks()
+    );
+    let waits: Vec<(String, bool)> = host
+        .told()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| match p.kind {
+            WaitKind::Outage {
+                wall: Outage::Connection,
+                tries,
+            } => Some((p.why, tries)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        waits.first().is_some_and(|(_, tries)| !tries)
+            && waits.last().is_some_and(|(_, tries)| *tries)
+            && waits
+                .iter()
+                .all(|(why, _)| why == "waiting: connection error"),
+        "a wait typing nothing, then the blind rung's: {waits:#?}"
+    );
+    let waiting: Vec<String> = records
+        .into_iter()
+        .filter(|r| r.kind == "waiting")
+        .map(|r| r.summary)
+        .collect();
+    assert!(
+        !waiting.is_empty()
+            && waiting
+                .iter()
+                .all(|w| w.ends_with("waiting: connection error")),
+        "{waiting:#?}"
+    );
 }
 
 #[test]
@@ -6348,10 +6490,10 @@ fn a_weekly_wall_hit_in_the_evening_that_resets_in_the_morning_is_waited_for() {
 
 const TAB_EVENING: i64 = TEST_NOW + 8 * 3600 + 31 * 60;
 
-fn limit_resets_5am(typed: bool) -> Vec<String> {
+fn limit_resets_5am(typed: Option<&str>) -> Vec<String> {
     let mut r = rows(&["⏺ Still done, and I'm not starting new work.", ""]);
-    if typed {
-        r.extend(rows(&["❯ keep going", ""]));
+    if let Some(typed) = typed {
+        r.extend(rows(&[&format!("❯ {typed}"), ""]));
     }
     r.extend(composer("  ⚠ Usage limit reached · limit resets 5am"));
     r.push("  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string());
@@ -6398,16 +6540,16 @@ fn a_weekly_wall_still_standing_after_a_typed_line_is_never_typed_into_again_bef
             vec![
                 busy_screen(),
                 ended("Still done, and I'm not starting new work."),
-                limit_resets_5am(true),
+                limit_resets_5am(Some("keep going")),
             ],
             1,
-            "continue@v1",
+            "continue@v1 keep going",
         ),
         (
             "te-tab-sitting",
-            vec![limit_resets_5am(false), limit_resets_5am(true)],
+            vec![limit_resets_5am(None), limit_resets_5am(Some(CLEARED))],
             0,
-            "usage-resume@v1",
+            &*format!("usage-resume@v1 {CLEARED}"),
         ),
     ] {
         let (m, lines, waits) = tab_run(case, screens, Some(sits), TAB_EVENING);
@@ -6416,7 +6558,7 @@ fn a_weekly_wall_still_standing_after_a_typed_line_is_never_typed_into_again_bef
             .filter(|l| l.starts_with("CONTINUED"))
             .collect();
         assert!(
-            acts.len() == 1 && acts[0].ends_with(&format!(" rule={typed} keep going")),
+            acts.len() == 1 && acts[0].ends_with(&format!(" rule={typed}")),
             "{case}: one act, nothing typed into the wall: {lines:#?}\n{waits:#?}"
         );
         assert_eq!(count(&m, "turn"), 1, "{case}: {:#?}", m.requests);
@@ -6445,7 +6587,7 @@ fn a_session_limit_whose_reset_has_passed_is_continued() {
         ]);
         if typed {
             r.extend(rows(&[
-                "❯ keep going",
+                &format!("❯ {CLEARED}"),
                 "  ⎿  You've hit your session limit · resets 3pm (America/Los_Angeles)",
                 "",
             ]));
@@ -6465,7 +6607,7 @@ fn a_session_limit_whose_reset_has_passed_is_continued() {
         .collect();
     assert_eq!(
         typed,
-        ["CONTINUED seq=101 rule=usage-resume@v1 keep going"],
+        [&format!("CONTINUED seq=101 rule=usage-resume@v1 {CLEARED}")],
         "{lines:#?}\n{waits:#?}"
     );
     assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
@@ -6886,7 +7028,7 @@ fn a_limit_whose_notice_left_is_waited_on_across_a_loop_restart() {
     assert!(
         m.requests
             .iter()
-            .any(|r| r.contains(" turn submit=guarded:") && r.ends_with(" keep going")),
+            .any(|r| r.contains(" turn submit=guarded:") && r.ends_with(CLEARED)),
         "{:#?}",
         m.requests
     );
@@ -7328,7 +7470,7 @@ fn a_resume_the_limit_answers_inside_its_window_is_waited_on_to_the_new_reset() 
         typed,
         [
             "CONTINUED seq=102 rule=continue@v1 keep going",
-            "CONTINUED seq=104 rule=usage-resume@v1 keep going",
+            &format!("CONTINUED seq=104 rule=usage-resume@v1 {CLEARED}"),
         ],
         "nothing typed into the limit that answered the resume: {lines:#?}\n{waits:#?}"
     );
@@ -7419,7 +7561,7 @@ fn an_older_cancelled_limit_resumed_inside_the_acts_window_is_no_days_wait() {
     assert!(
         typed.len() >= 2
             && typed[0].ends_with(" rule=continue@v1 keep going")
-            && typed[1].ends_with(" rule=usage-resume@v1 keep going"),
+            && typed[1].ends_with(&format!(" rule=usage-resume@v1 {CLEARED}")),
         "the act, then the continuation at the passed reset's grace: {lines:#?}\n{waits:#?}"
     );
 }
@@ -7697,11 +7839,9 @@ fn a_sleep_between_two_steps_of_the_wait_is_seen_by_the_wait_itself() {
         let mut m = Mock::new(vec![busy_screen()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
         s.set_clock(TEST_NOW, PDT);
+        let far = Instant::now() + Duration::from_secs(3 * 3600);
         if standing {
-            s.set_due(
-                Instant::now() + Duration::from_secs(3 * 3600),
-                "usage-weekly resets",
-            );
+            s.set_due(far, "usage-weekly resets");
         }
         s.set_clock_jump(step);
         let seen = Turn {
@@ -7724,9 +7864,9 @@ fn a_sleep_between_two_steps_of_the_wait_is_seen_by_the_wait_itself() {
             .turn_end_due
             .clone()
             .map(|d| (d.at.saturating_duration_since(began), d.why));
-        (lines, due, took)
+        (lines, due, took, far.saturating_duration_since(began))
     };
-    let (lines, due, took) = run(4 * 3600, true);
+    let (lines, due, took, _) = run(4 * 3600, true);
     assert!(
         lines.iter().any(|l| l.starts_with("WAITING seq=102 until=")
             && l.ends_with("the Mac woke: deciding again")),
@@ -7739,14 +7879,19 @@ fn a_sleep_between_two_steps_of_the_wait_is_seen_by_the_wait_itself() {
         "the far deadline is replaced by a settle: {after:?} (the wait took {took:?})"
     );
     for step in [0, 20, -30] {
-        let (lines, due, _) = run(step, true);
+        let (lines, due, _, far) = run(step, true);
         assert!(
             !lines.iter().any(|l| l.contains("the Mac woke")),
             "step {step}: {lines:#?}"
         );
-        assert!(due.expect("still standing").0 > Duration::from_secs(3 * 3600 - 5));
+        let (left, why) = due.expect("still standing");
+        assert_eq!(
+            (left, why.as_str()),
+            (far, "usage-weekly resets"),
+            "step {step}"
+        );
     }
-    let (lines, due, _) = run(4 * 3600, false);
+    let (lines, due, _, _) = run(4 * 3600, false);
     assert!(lines.is_empty() && due.is_none(), "{lines:#?} {due:?}");
 }
 
@@ -8013,7 +8158,6 @@ fn a_reset_the_sleep_carried_past_waits_for_the_settle_though_a_repaint_wakes_th
 
 #[test]
 fn a_back_off_the_mac_slept_through_is_over_once_the_wake_settles() {
-    use crate::supervise::policy::turn_end::RULE_API_RETRY;
     let end_529 = || aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::END_529);
     let run = |slept: bool| {
         let mut m = Mock::new(vec![end_529()]);
@@ -8022,7 +8166,8 @@ fn a_back_off_the_mac_slept_through_is_over_once_the_wake_settles() {
         let mut s = virtual_session(&mut m, Some("@s-1".to_string()));
         s.set_clock(TEST_NOW, PDT);
         s.set_turn_end_timing(TurnEndTiming {
-            retry_backoff: vec![Duration::from_secs(3600)],
+            outage_first: Duration::from_secs(3600),
+            outage_cap: Duration::from_secs(3600),
             ..TurnEndTiming::default()
         });
         let point = point_at(&s, end_529(), 102);
@@ -8030,7 +8175,7 @@ fn a_back_off_the_mac_slept_through_is_over_once_the_wake_settles() {
             .turn_end_at_point(&point, Some(Duration::from_secs(180)), &opts)
             .expect("a decision");
         assert!(
-            matches!(&action, TurnEndAction::WaitUntil { why, .. } if why == "overloaded retry 1"),
+            matches!(&action, TurnEndAction::WaitUntil { why, .. } if why == "waiting: API overload"),
             "{action:?}"
         );
         s.turn_end_execute(&point, action, &opts, &[], &mut heard)
@@ -8054,19 +8199,18 @@ fn a_back_off_the_mac_slept_through_is_over_once_the_wake_settles() {
         woke.lines
     );
     assert!(
-        continued(&settled.lines, RULE_API_RETRY),
+        continued(&settled.lines, RULE_OUTAGE_RESUME),
         "the rung slept through is over: {:#?}",
         settled.lines
     );
     assert_eq!(typed, 1, "{:#?}", settled.lines);
     let (_, settled, typed) = run(false);
-    assert_eq!(settled.due.as_deref(), Some("overloaded retry 1"));
+    assert_eq!(settled.due.as_deref(), Some("waiting: API overload"));
     assert_eq!(typed, 0, "{:#?}", settled.lines);
 }
 
 #[test]
 fn an_edge_at_the_wake_types_nothing_before_the_settle() {
-    use crate::supervise::policy::turn_end::RULE_API_BACK;
     let run = |slept: bool| {
         let host = ReachHost::scripted(&[Reach::Unknown]);
         let mut m = Mock::new(vec![enotfound()]);
@@ -8106,7 +8250,7 @@ fn an_edge_at_the_wake_types_nothing_before_the_settle() {
     };
     let (woke, settled, typed) = run(true);
     assert!(
-        !continued(&woke.lines, RULE_API_BACK),
+        !continued(&woke.lines, RULE_OUTAGE_RESUME),
         "the edge types nothing inside the settle: {:#?}",
         woke.lines
     );
@@ -8117,13 +8261,17 @@ fn an_edge_at_the_wake_types_nothing_before_the_settle() {
         woke.lines
     );
     assert!(
-        continued(&settled.lines, RULE_API_BACK),
+        continued(&settled.lines, RULE_OUTAGE_RESUME),
         "the try goes once the settle has passed: {:#?}",
         settled.lines
     );
     assert_eq!(typed, 1);
     let (woke, _, typed) = run(false);
-    assert!(continued(&woke.lines, RULE_API_BACK), "{:#?}", woke.lines);
+    assert!(
+        continued(&woke.lines, RULE_OUTAGE_RESUME),
+        "{:#?}",
+        woke.lines
+    );
     assert_eq!(typed, 1);
 }
 
@@ -8212,15 +8360,15 @@ fn a_wait_inside_the_wakes_settle_steps_to_its_fall() {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
             ..hosted(30)
         };
-        let mut s = session(&mut m, None);
+        let mut s = virtual_session(&mut m, None);
         s.set_clock(TEST_NOW, PDT);
         let screen = s.screen().expect("the point");
         let point = s.turn_of(screen);
         if settling {
-            let woke = Instant::now() + Duration::from_millis(300) - WAKE_SETTLE;
+            let woke = s.fx.mono() + Duration::from_millis(300) - WAKE_SETTLE;
             s.settle_wake(TEST_NOW, woke);
         }
-        let mut deadline = Instant::now() + Duration::from_secs(5);
+        let mut deadline = s.fx.mono() + Duration::from_secs(5);
         let _ = s.wait_for_next(point, &opts, &[], &mut deadline, &mut Heard::default());
         drop(s);
         m.requests
@@ -10385,18 +10533,20 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             human_grace_s: 0,
+            // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+            autopilot: Autopilot::Land,
             ..owners_policy()
         },
         ..auto(1)
     };
-    let run = |ledger: &std::path::Path, person: bool| {
+    let run_under = |opts: &SuperviseOpts, ledger: &std::path::Path, person: bool| {
         let mut m = Mock::new(vec![busy_screen(), quick(greeting)]);
         m.turn_releases = Some(1);
         m.vanish_after = Some(8);
         if person {
             m.human = vec!["2000"];
         }
-        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        let (lines, _) = watch_lines_with(&mut m, opts, |s| {
             s.set_turn_end_timing(TurnEndTiming {
                 short_backoff: Duration::from_millis(30),
                 short_backoff_max: Duration::from_millis(60),
@@ -10406,6 +10556,7 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
         });
         (count(&m, "turn"), lines)
     };
+    let run = |ledger: &std::path::Path, person: bool| run_under(&opts, ledger, person);
     let (dir, ledger) = ledger_at("left-next-loop");
     let (turns, lines) = run(&ledger, true);
     assert_eq!(turns, 0, "{lines:#?}");
@@ -10419,9 +10570,7 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
     let (turns, lines) = run(&ledger, false);
     assert_eq!(turns, 0, "the next loop: {lines:#?}");
     assert!(
-        !lines
-            .iter()
-            .any(|l| l.contains(&format!("rule={RULE_DONE_CHECK} "))),
+        !lines.iter().any(|l| l.starts_with("CONTINUED ")),
         "{lines:#?}"
     );
     let closed = format!(
@@ -10439,18 +10588,31 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
     std::fs::write(&ledger, closed).expect("ledger");
     let (_, lines) = run(&ledger, false);
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains(&format!("rule={RULE_DONE_CHECK} "))),
+        lines.iter().any(|l| l.starts_with("CONTINUED ")),
         "a typed act closed it: {lines:#?}"
     );
     std::fs::write(&ledger, "").expect("ledger");
     let (_, lines) = run(&ledger, false);
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains(&format!("rule={RULE_DONE_CHECK} "))),
+        lines.iter().any(|l| l.starts_with("CONTINUED ")),
         "no row: {lines:#?}"
+    );
+    // CRUISE NEVER PARKS: the same greeting to the person's own message is carried under Cruise,
+    // and no row leaves it to them (owner ruling 2026-10-26).
+    std::fs::write(&ledger, "").expect("ledger");
+    let cruise = SuperviseOpts {
+        policy: SupervisorConfig {
+            autopilot: Autopilot::Cruise,
+            ..opts.policy.clone()
+        },
+        ..opts.clone()
+    };
+    let (turns, lines) = run_under(&cruise, &ledger, true);
+    assert!(turns >= 1, "carried: {lines:#?}");
+    let body = std::fs::read_to_string(&ledger).unwrap_or_default();
+    assert!(
+        !body.contains(&format!("\"rule_id\":\"{RULE_LEFT}\"")),
+        "{body}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -10507,6 +10669,8 @@ fn a_persons_exchange_is_left_under_its_prompts_key() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
+                // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+                autopilot: Autopilot::Land,
                 ..owners_policy()
             },
             idle_host: Some(Arc::new(host) as Arc<dyn IdleHost>),
@@ -10535,11 +10699,7 @@ fn a_persons_exchange_is_left_under_its_prompts_key() {
         fresh: tail.to_string(),
         again: tail.to_string(),
     };
-    let checked = |lines: &[String]| {
-        lines
-            .iter()
-            .any(|l| l.contains(&format!("rule={RULE_DONE_CHECK} ")))
-    };
+    let checked = |lines: &[String]| lines.iter().any(|l| l.starts_with("CONTINUED "));
     let (dir, ledger) = ledger_at("left-under-prompt");
     for (what, tail) in [
         ("the prompt alone, re-read alike", format!("{prompt}\n")),
@@ -10632,6 +10792,8 @@ fn a_persons_exchange_an_older_build_noted_left_stays_theirs_in_the_next_loop() 
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
+                // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+                autopilot: Autopilot::Land,
                 ..owners_policy()
             },
             idle_host: Some(Arc::new(LagHost {
@@ -10650,11 +10812,7 @@ fn a_persons_exchange_an_older_build_noted_left_stays_theirs_in_the_next_loop() 
         });
         (count(&m, "turn"), lines)
     };
-    let checked = |lines: &[String]| {
-        lines
-            .iter()
-            .any(|l| l.contains(&format!("rule={RULE_DONE_CHECK} ")))
-    };
+    let checked = |lines: &[String]| lines.iter().any(|l| l.starts_with("CONTINUED "));
     let note = |at: i64, line: &str| JournalRecord::of_line(at, None, line, None).to_json() + "\n";
     let left = note(
         noted_ms,
@@ -10720,7 +10878,8 @@ fn a_persons_exchange_an_older_build_noted_left_stays_theirs_in_the_next_loop() 
 
 #[test]
 fn a_persons_exchange_at_a_wall_stays_theirs_in_the_next_loop() {
-    use crate::supervise::policy::turn_end::{RULE_ANSWER, RULE_API_RETRY};
+    // Land answers the person's question with its own words (`land-answer@v1`).
+    use crate::supervise::policy::turn_end::RULE_LAND_ANSWER as RULE_ANSWER;
     let tail = include_str!("fixtures/claude-2.1.294-transcript-529.jsonl");
     let greeting = "Hello! How can I help?";
     let answer = format!(
@@ -10749,6 +10908,8 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_the_next_loop() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
+                // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+                autopilot: Autopilot::Land,
                 ..owners_policy()
             },
             idle_host: Some(Arc::new(LagHost {
@@ -10759,7 +10920,8 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_the_next_loop() {
         };
         let (lines, _) = watch_lines_with(m, &opts, |s| {
             s.set_turn_end_timing(TurnEndTiming {
-                retry_backoff: vec![backoff; 3],
+                outage_first: backoff,
+                outage_cap: backoff,
                 short_backoff: Duration::from_millis(30),
                 short_backoff_max: Duration::from_millis(60),
                 ..TurnEndTiming::default()
@@ -10802,7 +10964,7 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_the_next_loop() {
         |lines: &[String], rule: &str| lines.iter().any(|l| l.contains(&format!("rule={rule} ")));
     let (turns, lines) = next(&ledger);
     assert_eq!(turns, 1, "the retry alone: {lines:#?}");
-    assert!(typed(&lines, RULE_API_RETRY), "{lines:#?}");
+    assert!(typed(&lines, RULE_OUTAGE_RESUME), "{lines:#?}");
     assert!(!typed(&lines, RULE_ANSWER), "{lines:#?}");
     std::fs::write(&ledger, carrying("")).expect("ledger");
     let (turns, lines) = next(&ledger);
@@ -10814,14 +10976,13 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_the_next_loop() {
     std::fs::write(&ledger, "").expect("ledger");
     let (turns, lines) = next(&ledger);
     assert_eq!(turns, 2, "{lines:#?}");
-    assert!(typed(&lines, RULE_API_RETRY), "{lines:#?}");
+    assert!(typed(&lines, RULE_OUTAGE_RESUME), "{lines:#?}");
     assert!(typed(&lines, RULE_ANSWER), "{lines:#?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_persons_exchange_retried_at_a_wall_stays_theirs_in_the_next_loop() {
-    use crate::supervise::policy::turn_end::RULE_API_RETRY;
     let tail = include_str!("fixtures/claude-2.1.294-transcript-529.jsonl");
     let greeting = "Hello! How can I help?";
     let wall = || {
@@ -10846,6 +11007,8 @@ fn a_persons_exchange_retried_at_a_wall_stays_theirs_in_the_next_loop() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
+                // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+                autopilot: Autopilot::Land,
                 ..owners_policy()
             },
             idle_host: Some(Arc::new(LagHost {
@@ -10856,7 +11019,8 @@ fn a_persons_exchange_retried_at_a_wall_stays_theirs_in_the_next_loop() {
         };
         let (lines, _) = watch_lines_with(m, &opts, |s| {
             s.set_turn_end_timing(TurnEndTiming {
-                retry_backoff: vec![Duration::from_millis(50); 3],
+                outage_first: Duration::from_millis(50),
+                outage_cap: Duration::from_millis(50),
                 short_backoff: Duration::from_millis(30),
                 short_backoff_max: Duration::from_millis(60),
                 take_within: Duration::from_millis(50),
@@ -10875,7 +11039,7 @@ fn a_persons_exchange_retried_at_a_wall_stays_theirs_in_the_next_loop() {
     let body = std::fs::read_to_string(&ledger).unwrap_or_default();
     let retry = body
         .lines()
-        .filter(|l| l.contains(&format!("\"rule_id\":\"{RULE_API_RETRY}\"")))
+        .filter(|l| l.contains(&format!("\"rule_id\":\"{RULE_OUTAGE_RESUME}\"")))
         .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
         .find_map(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_owned))
         .expect(body.as_str());
@@ -10974,6 +11138,8 @@ fn a_persons_question_answered_at_length_is_left_to_them() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
+                // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+                autopilot: Autopilot::Land,
                 ..owners_policy()
             },
             journal: Some(journal.clone()),
@@ -11079,8 +11245,20 @@ fn claude_codes_idle_compaction_is_no_turn() {
             true,
         ),
     ];
+    // The person's own exchange is Land's to leave; Cruise carries it (owner ruling 2026-10-26).
+    let cruise_left = (
+        "left, under Cruise",
+        run(vec![greeted.clone(), left.clone()]),
+        true,
+        true,
+    );
     let mut wrong = Vec::new();
-    for (arm, screens, answers, typed) in arms {
+    for (arm, screens, answers, typed) in arms.into_iter().chain([cruise_left]) {
+        let autopilot = if arm.starts_with("left") && !arm.ends_with("under Cruise") {
+            Autopilot::Land
+        } else {
+            Autopilot::Cruise
+        };
         let last = screens.len() - 1;
         let mut m = Mock::new(screens);
         m.turn_releases = Some(last);
@@ -11098,6 +11276,7 @@ fn claude_codes_idle_compaction_is_no_turn() {
             policy: SupervisorConfig {
                 human_grace_s: 0,
                 answer_questions: answers,
+                autopilot,
                 ..owners_policy()
             },
             ..auto(max)
@@ -11210,6 +11389,8 @@ fn a_persons_exchange_stays_theirs_under_an_idle_compaction() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
+                // The person's own exchange is Land's to leave (owner ruling 2026-10-26).
+                autopilot: Autopilot::Land,
                 ..owners_policy()
             },
             journal: Some(journal.clone()),
@@ -11783,6 +11964,119 @@ fn a_move_ahead_of_a_wall_types_nothing_and_its_point_is_decided_as_with_no_move
     assert_eq!(host.said("carry-on"), ["carry-on"], "{log}");
     assert!(carried.is_empty(), "the host's turn took the point: {log}");
     assert_ne!(carried, unmoved, "{log}");
+}
+
+/// A window host whose live upgrade takes idle points as a quiet round at rung land does
+/// (`upgrade::quiet_step`): its idle steps answer the next of [`Self::steps`] while one is
+/// left, so `adopted` is the move made inside the step (SIGTERM, then the relaunch line), and
+/// `done:resumed` the relaunched agent's carry-on, which types nothing.
+#[derive(Debug, Default)]
+struct Upgrader {
+    steps: std::sync::Mutex<VecDeque<&'static str>>,
+    taken: std::sync::Mutex<Vec<&'static str>>,
+}
+
+impl Upgrader {
+    fn with(steps: &[&'static str]) -> Arc<Self> {
+        Arc::new(Self {
+            steps: std::sync::Mutex::new(steps.iter().copied().collect()),
+            ..Self::default()
+        })
+    }
+    fn taken(&self) -> Vec<&'static str> {
+        self.taken.lock().unwrap().clone()
+    }
+}
+
+impl IdleHost for Upgrader {
+    fn wants(&self) -> bool {
+        !self.steps.lock().unwrap().is_empty()
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        let step = self.steps.lock().unwrap().pop_front()?;
+        self.taken.lock().unwrap().push(step);
+        Some(HostStep {
+            line: format!("upgrade step={step}"),
+            moved: crate::harness::upgrade_drive::moved(step),
+            typed: crate::harness::upgrade_drive::host_turn(step),
+            repeat: false,
+        })
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+}
+
+/// A LIVE UPGRADE MOVES A JOB THE LOOP KEEPS CONTINUING AT ITS TURN END, AND THE JOB GOES ON
+/// ONCE IN THE RESUMED SESSION (the owner, 2026-10-26: "swap out the running claude code instance
+/// to the latest update automatically and seamlessly"; seen live that day: `step=adopted`, then
+/// `done:resumed`, then the continuation, 3 s after the turn ended). The host's step comes before
+/// the decided "keep going" is typed, the move drops that decision, and at the relaunched agent's
+/// idle point the loop types it, once. A step that waits on the agent's own shells (`wait:background`,
+/// which never holds a continuation) leaves the continuation to go at once, as with no upgrade owed.
+#[test]
+fn a_live_upgrade_moves_a_continued_job_at_its_turn_end_and_the_job_goes_on_once() {
+    let done = "Stage 3 done; the suite is green.";
+    let run = |tag: &str, host: &Arc<Upgrader>| {
+        let (dir, path) = journal_file(tag);
+        let mut m = Mock::new(vec![busy_screen(), ended(done), ended(done)]);
+        m.vanish_after = Some(4);
+        m.cursor_on_caret = true;
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
+            journal: Some(path.clone()),
+            ..hosted(3)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| s.set_clock(ACCOUNT_NOW, PDT));
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let journal: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        let turns: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("turn"))
+            .cloned()
+            .collect();
+        let log = format!("{lines:#?}\n{journal:#?}");
+        (turns, journal, log)
+    };
+    let at = |journal: &[String], what: &dyn Fn(&str) -> bool, log: &str| {
+        journal
+            .iter()
+            .position(|l| what(l))
+            .unwrap_or_else(|| panic!("no such journal line: {log}"))
+    };
+    let continued = |l: &str| l.starts_with("CONTINUED ");
+    let host_said = |step: &'static str| {
+        move |l: &str| l.starts_with("HOST seq=") && l.ends_with(&format!(" upgrade step={step}"))
+    };
+
+    let none = Upgrader::with(&[]);
+    let (unmoved, _, log) = run("upgrade-none", &none);
+    assert_eq!(unmoved, [continue_request("keep going")], "{log}");
+
+    let host = Upgrader::with(&["adopted", "done:resumed"]);
+    let (moved, journal, log) = run("upgrade-moved", &host);
+    assert_eq!(host.taken(), ["adopted", "done:resumed"], "{log}");
+    assert_eq!(moved, unmoved, "the same continuation, typed once: {log}");
+    let adopted = at(&journal, &host_said("adopted"), &log);
+    let resumed = at(&journal, &host_said("done:resumed"), &log);
+    let typed = at(&journal, &continued, &log);
+    assert!(
+        adopted < resumed && resumed < typed,
+        "moved, resumed, then continued: {log}"
+    );
+    assert_eq!(journal.iter().filter(|l| continued(l)).count(), 1, "{log}");
+
+    let host = Upgrader::with(&["wait:background"]);
+    let (waited, journal, log) = run("upgrade-background", &host);
+    assert_eq!(host.taken(), ["wait:background"], "{log}");
+    assert_eq!(waited, unmoved, "{log}");
+    assert!(
+        at(&journal, &host_said("wait:background"), &log) < at(&journal, &continued, &log),
+        "{log}"
+    );
 }
 
 fn account_point_of(rows: Vec<String>, phase: Phase) -> Turn {
@@ -13908,7 +14202,7 @@ fn a_lost_login_no_read_saw_busy_is_struck_before_the_host_is_asked() {
             );
             s.turn_end.acted(
                 &TurnEndAction::Type {
-                    text: "keep going".to_string(),
+                    text: CLEARED.to_string(),
                     rule_id: RULE_LIMIT_RESUME,
                 },
                 &r,
@@ -14637,7 +14931,7 @@ fn a_move_made_at_a_wall_is_carried_on_past_the_limit_it_left() {
         (stepped, action, host.all())
     };
     let resume = TurnEndAction::Type {
-        text: "keep going".to_string(),
+        text: CLEARED.to_string(),
         rule_id: crate::supervise::policy::turn_end::RULE_LIMIT_RESUME,
     };
     let (stepped, action, said) = moved(true);
@@ -14820,7 +15114,7 @@ fn a_limit_only_the_transcript_shows_is_the_wall_and_holds_the_carry_on() {
     assert_eq!(
         action,
         TurnEndAction::Type {
-            text: "keep going".to_string(),
+            text: CLEARED.to_string(),
             rule_id: crate::supervise::policy::turn_end::RULE_LIMIT_RESUME,
         }
     );
@@ -17366,20 +17660,14 @@ fn a_buckets_notice_cancelled_before_the_loops_first_read_answers_its_try() {
                     let r = s.turn_end_reread(&p.screen, &opts);
                     s.turn_end.acted(
                         &TurnEndAction::Type {
-                            text: "keep going".to_string(),
+                            text: CLEARED.to_string(),
                             rule_id: RULE_LIMIT_RESUME,
                         },
                         &r,
                         Instant::now(),
                     );
                     let reason = act_reason(s.turn_end.limit_try());
-                    s.ledger_row(
-                        RULE_LIMIT_RESUME,
-                        Outcome::Typed,
-                        "keep going",
-                        &reason,
-                        101,
-                    );
+                    s.ledger_row(RULE_LIMIT_RESUME, Outcome::Typed, CLEARED, &reason, 101);
                 }
                 let act_ms = usage_attempt(&ledger, Some("@s-1"))
                     .expect("the try's row")
@@ -19143,7 +19431,7 @@ fn the_owners_clearing_continues_a_session_at_its_wall_once() {
                     .wall_attempts(aterm_phase::WallKind::UsageSession),
             )
         };
-        let typed = m.requests.iter().filter(|r| r.contains("keep going"));
+        let typed = m.requests.iter().filter(|r| r.contains(CLEARED));
         (attempts, typed.count(), host.all())
     };
     let ((first, attempts), turns, said) = run(Some(AccountAdvice::Resume {
@@ -19152,7 +19440,7 @@ fn the_owners_clearing_continues_a_session_at_its_wall_once() {
     assert_eq!(
         first,
         TurnEndAction::Type {
-            text: "keep going".to_string(),
+            text: CLEARED.to_string(),
             rule_id: RULE_LIMIT_RESUME,
         }
     );
@@ -19228,7 +19516,7 @@ fn a_loop_that_takes_up_a_move_made_at_a_wall_carries_it_on_past_the_notice() {
         let (lines, m, journal) =
             account_run(&format!("te-{tag}"), vec![limited_screen()], &host, &ledger);
         let _ = std::fs::remove_dir_all(&dir);
-        let typed = m.requests.iter().filter(|r| r.contains("keep going"));
+        let typed = m.requests.iter().filter(|r| r.contains(CLEARED));
         (
             host.all(),
             typed.count(),
@@ -19259,10 +19547,16 @@ fn a_loop_that_takes_up_a_move_made_at_a_wall_carries_it_on_past_the_notice() {
 
 #[test]
 fn a_host_that_answers_a_short_wait_is_asked_again_when_it_runs_out() {
-    let decided = |first: Option<AccountAdvice>| {
+    let decided = |lead: Option<Duration>| {
+        let mut m = Mock::new(vec![limited_screen()]);
+        let (mut s, wall) = account_session(&mut m);
+        s.set_mono_standing();
+        let asked_at = s.fx.mono();
         let host = AccountHost::scripted(
             &[
-                first,
+                lead.map(|lead| AccountAdvice::Wait {
+                    until: asked_at + lead,
+                }),
                 Some(AccountAdvice::Move {
                     to: "work-2".to_string(),
                 }),
@@ -19270,9 +19564,6 @@ fn a_host_that_answers_a_short_wait_is_asked_again_when_it_runs_out() {
             &["adopted"],
         );
         let opts = account_opts(&host);
-        let mut m = Mock::new(vec![limited_screen()]);
-        let (mut s, wall) = account_session(&mut m);
-        let asked_at = Instant::now();
         let action = s
             .turn_end_at_point(&wall, Some(Duration::from_secs(180)), &opts)
             .expect("a decision");
@@ -19287,8 +19578,7 @@ fn a_host_that_answers_a_short_wait_is_asked_again_when_it_runs_out() {
         let again = s.turn_end_at_point(&wall, None, &opts).expect("a decision");
         (waits, again, host.said("account").len())
     };
-    let soon = Instant::now() + Duration::from_secs(5);
-    let (waits, again, asked) = decided(Some(AccountAdvice::Wait { until: soon }));
+    let (waits, again, asked) = decided(Some(Duration::from_secs(5)));
     assert!(
         (Duration::from_secs(60)..Duration::from_secs(90)).contains(&waits),
         "cut to the host's moment, never nearer than a minute: {waits:?}"
@@ -19381,10 +19671,7 @@ fn a_clearing_the_loop_before_answered_is_not_answered_again() {
                 ["account:wall:usage-session"],
                 "{what}: {lines:#?}\n{journal:#?}"
             );
-            m.requests
-                .iter()
-                .filter(|r| r.contains("keep going"))
-                .count()
+            m.requests.iter().filter(|r| r.contains(CLEARED)).count()
         };
         assert_eq!(
             typed_again("account-cleared-before", 300),
@@ -23767,7 +24054,8 @@ fn a_loop_started_on_a_done_record_at_a_wall_still_types_the_retry() {
             s.set_clock(TEST_NOW, PDT);
             s.set_zone_lookup(test_zones);
             s.set_turn_end_timing(TurnEndTiming {
-                retry_backoff: vec![Duration::from_millis(50); 3],
+                outage_first: Duration::from_millis(50),
+                outage_cap: Duration::from_millis(50),
                 ..TurnEndTiming::default()
             });
             let _ = s.watch(&opts, &mut out);
@@ -23788,7 +24076,8 @@ fn a_loop_started_on_a_done_record_at_a_wall_still_types_the_retry() {
     assert!(
         lines
             .iter()
-            .any(|l| l.starts_with("CONTINUED ") && l.contains("rule=api-retry@v1")),
+            .any(|l| l.starts_with("CONTINUED ")
+                && l.contains(&format!("rule={RULE_OUTAGE_RESUME}"))),
         "{lines:#?}"
     );
     assert_eq!(
@@ -23835,7 +24124,8 @@ fn a_seed_read_served_after_the_loop_acted_reads_nothing_into_the_point() {
             s.set_clock(TEST_NOW, PDT);
             s.set_zone_lookup(test_zones);
             s.set_turn_end_timing(TurnEndTiming {
-                retry_backoff: vec![Duration::ZERO; 3],
+                outage_first: Duration::ZERO,
+                outage_cap: Duration::ZERO,
                 ..TurnEndTiming::default()
             });
             let point = point_at(&s, wall.clone(), 101);

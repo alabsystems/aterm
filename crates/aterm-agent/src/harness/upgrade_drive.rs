@@ -501,12 +501,16 @@ pub(super) fn at_second<R>(now: u64, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+#[cfg(all(not(test), not(target_os = "macos")))]
+const PS_WAIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const PS_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
+
 #[cfg(any(not(target_os = "macos"), test))]
 fn ps(args: &[&str]) -> Option<String> {
     let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("ps"));
     cmd.args(args).env("LC_ALL", "C").env("TZ", "UTC");
-    let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(10))
-        .ok()?;
+    let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + PS_WAIT).ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -745,9 +749,20 @@ fn base_name(comm: &str) -> String {
         .to_string()
 }
 
+/// The `ps` column that names a process's controlling terminal. On macOS it is `tdev`, the device
+/// number `ps` prints from the kernel's record: its `tty` name comes from `devname(3)`, a scan of
+/// `/dev` that skips a live terminal's node while an earlier node is removed, so under another
+/// process's pty churn it prints `??` for a process that holds a terminal.
+#[cfg(any(not(target_os = "macos"), test))]
+const PS_TTY: &str = if cfg!(target_os = "macos") {
+    "tdev"
+} else {
+    "tty"
+};
+
 #[cfg(any(not(target_os = "macos"), test))]
 fn tty_table() -> Vec<(u32, u32, String, String)> {
-    let Some(out) = ps(&["-A", "-o", "pid=,ppid=,tty=,comm="]) else {
+    let Some(out) = ps(&["-A", "-o", &format!("pid=,ppid=,{PS_TTY}=,comm=")]) else {
         return Vec::new();
     };
     out.lines()
@@ -812,7 +827,12 @@ fn opener(agent: u32, parent: u32) -> Option<String> {
 
 #[cfg(any(not(target_os = "macos"), test))]
 fn ps_opener(agent: u32, parent: u32) -> Option<String> {
-    let out = ps(&["-o", "pid=,tty=,comm=", "-p", &format!("{agent},{parent}")])?;
+    let out = ps(&[
+        "-o",
+        &format!("pid=,{PS_TTY}=,comm="),
+        "-p",
+        &format!("{agent},{parent}"),
+    ])?;
     let rows: Vec<(u32, String, String)> = out
         .lines()
         .filter_map(|l| {
@@ -1218,8 +1238,9 @@ pub(super) fn lsof_holders(file: &Path, pids: &[u32]) -> Option<Vec<u32>> {
     let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("lsof"));
     cmd.args(["-n", "-P", "-t", "-a", "-p", &list.join(","), "--"])
         .arg(file);
-    let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(10))
-        .ok()?;
+    let out =
+        aterm_uds::deadline::output_until(&mut cmd, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+            .ok()?;
     lsof_holder_pids(&out)
 }
 
@@ -2084,11 +2105,16 @@ pub(super) fn self_claimed_by_status(line: &str) -> bool {
 pub(super) fn held_by_status(line: &str, grace_s: u32) -> bool {
     !crate::is_ok_reply(line)
         || super::relaunch::hand_on_tab(line)
-        || line.split_whitespace().any(|t| {
-            t.strip_prefix("input=")
-                .is_some_and(|input| !matches!(input, "-" | "clear"))
-        })
+        || input_pending(line)
         || super::relaunch::person_present(line, grace_s)
+}
+
+/// Whether one `status` reply says the tab holds input its program has not read (`input=`).
+pub(super) fn input_pending(line: &str) -> bool {
+    line.split_whitespace().any(|t| {
+        t.strip_prefix("input=")
+            .is_some_and(|input| !matches!(input, "-" | "clear"))
+    })
 }
 
 /// How long a hand lasts unless renewed (`lease acquire ttl=`).
@@ -3305,6 +3331,16 @@ pub(super) struct St {
     pub(super) tabs: Vec<String>,
     pub(super) tabs_until: Vec<(String, u64)>,
     pub(super) line: String,
+    /// The directory [`Self::line`] runs the agent in when it carries no `cd` of its own
+    /// ([`Plan`]'s `line_dir`; empty: it does, or none was read): once the shell stands elsewhere,
+    /// the line is typed with a `cd` back to it ([`super::relaunch::line_at_shell`]).
+    pub(super) line_dir: String,
+    /// How long a person's keys hold [`Self::line`] ([`super::relaunch::line_grace`]): the grace
+    /// the gate that let aterm's end of the agent go waited out (every claim aterm signals under
+    /// names it), or the whole grace once a relaunched build ended on its own
+    /// ([`Self::roll_back`]); `None`: none recorded (no end of aterm's, or an earlier build's
+    /// record), and the line keeps the whole grace.
+    pub(super) line_grace_s: Option<u32>,
     pub(super) back_line: String,
     pub(super) prompt: Option<PromptMark>,
     pub(super) line_block: Option<u64>,
@@ -3669,7 +3705,10 @@ impl St {
         self.stop_streak = kept.stop_streak;
     }
 
-    pub(super) fn roll_back(&mut self, now: u64) -> bool {
+    /// Turns a restart whose relaunched build ended without registering the conversation back
+    /// to the build it ran ([`Self::back_line`]), at `now`. No gate let that end go, so a
+    /// person's keys hold the line back for the whole `grace_s` ([`Self::line_grace_s`]).
+    pub(super) fn roll_back(&mut self, now: u64, grace_s: u32) -> bool {
         let claude = match self.agent {
             upgrade::Agent::Claude => true,
             upgrade::Agent::Codex | upgrade::Agent::Agy | upgrade::Agent::Muse => false,
@@ -3682,6 +3721,7 @@ impl St {
         SAME_PROGRAM.clone_into(&mut self.source);
         self.to.clone_from(&self.from);
         self.line = std::mem::take(&mut self.back_line);
+        self.line_grace_s = Some(grace_s);
         self.model_list.clear();
         self.prompt = None;
         self.phase = Phase::Exiting { at_s: now };
@@ -4254,6 +4294,12 @@ impl St {
         if !self.back_line.is_empty() {
             o.insert("back_line".into(), Value::from(self.back_line.as_str()));
         }
+        if !self.line_dir.is_empty() {
+            o.insert("line_dir".into(), Value::from(self.line_dir.as_str()));
+        }
+        if let Some(grace) = self.line_grace_s {
+            o.insert("line_grace".into(), Value::from(u64::from(grace)));
+        }
         if let Some(block) = self.line_block {
             o.insert("line_block".into(), Value::from(block));
         }
@@ -4424,6 +4470,11 @@ impl St {
             shell: small("shell"),
             tab: s("tab"),
             line: s("line"),
+            line_dir: s("line_dir"),
+            line_grace_s: v
+                .get("line_grace")
+                .and_then(Value::as_u64)
+                .and_then(|g| u32::try_from(g).ok()),
             back_line: s("back_line"),
             prompt: PromptMark::parse(&s("prompt")),
             line_block: v.get("line_block").and_then(Value::as_u64),
@@ -4795,6 +4846,8 @@ impl St {
         self.shell = shell;
         tab.clone_into(&mut self.tab);
         self.line = line;
+        self.line_dir.clear();
+        self.line_grace_s = None;
         self.back_line.clear();
         self.exited_at = 0;
         self.hand_seen_s = 0;
@@ -6996,6 +7049,98 @@ pub fn named_standing_wall(
     upgrade::transcript_standing_wall(&snapshot_tail(user_home, snap)?)
 }
 
+/// Reads the environment only while the process identity and captured login agree.
+///
+/// The identity is sampled on both sides of the read. The snapshot's legacy start
+/// has whole-second precision on Unix; this cannot distinguish a prior same-second
+/// PID reuse with identical routing, nor an exec preserving routing on a kernel
+/// without an exec version. This is a local observation, not a process lease.
+#[must_use]
+pub fn snapshot_login_env(snap: &super::relaunch::Snapshot) -> Option<Vec<String>> {
+    let pid = i32::try_from(snap.pid).ok()?;
+    snapshot_login_env_with(
+        snap,
+        || aterm_uds::process::read_identity(pid),
+        || kernel_start(snap.pid),
+        || atpkg::caller_shell::process_args(snap.pid),
+        || exe_of(snap.pid),
+    )
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "TranscriptProcess",
+        action = "AnotherCase",
+        reason = "Select a process identity, routing or unavailable-read fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "TranscriptProcess",
+        action = "Choose",
+        reason = "Finish selecting the sampled process fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "TranscriptProcess",
+        action = "Read",
+        project = "harness::upgrade_drive::snapshot_env_tests::process_transition"
+    )
+)]
+fn snapshot_login_env_with(
+    snap: &super::relaunch::Snapshot,
+    mut identity: impl FnMut() -> Option<aterm_uds::process::Identity>,
+    start: impl FnOnce() -> Option<String>,
+    args: impl FnOnce() -> Option<atpkg::caller_shell::ProcArgs>,
+    image: impl FnOnce() -> Option<PathBuf>,
+) -> Option<Vec<String>> {
+    let before = identity()?;
+    if before.pid != i32::try_from(snap.pid).ok()? || start().as_deref() != Some(&snap.start) {
+        return None;
+    }
+    let args = args()?;
+    let image = image()?;
+    let (program, argv) = launched(&args.argv, Some(&image), Path::new(""), true)?;
+    let matches_run = match &snap.run {
+        super::relaunch::AgentRun::Claude => {
+            let who = super::accounts::ProcessLogin::of_exec_env(&args.env)?;
+            args.env_var(super::accounts::LOGIN_ENV) == snap.login.as_deref()
+                && args.env_var(super::accounts::HOME_ENV) == snap.home.as_deref()
+                && who.stored_login == snap.stored_login
+        }
+        super::relaunch::AgentRun::Codex(codex) => {
+            !args.env.is_empty()
+                && args.env_var(super::codex_alab::HOME_ENV) == codex.home_env.as_deref()
+                && codex.self_claimed.as_ref().is_none_or(|resume| {
+                    args.env_var(super::codex_alab::AUTH_PATH_ENV)
+                        == resume.codex_auth_path.as_deref()
+                })
+        }
+        super::relaunch::AgentRun::Muse(muse) => {
+            !args.env.is_empty()
+                && muse
+                    .env
+                    .iter()
+                    .all(|(k, v)| args.env_var(k) == Some(v.as_str()))
+        }
+        super::relaunch::AgentRun::Agy(agy) => {
+            !args.env.is_empty()
+                && agy
+                    .env
+                    .iter()
+                    .all(|(k, v)| args.env_var(k) == Some(v.as_str()))
+        }
+    };
+    if program != snap.program || argv != snap.argv || !matches_run || identity()? != before {
+        return None;
+    }
+    Some(args.env)
+}
+
 /// When the newest answer of the conversation `snap` names came.
 #[must_use]
 pub fn named_last_answer(
@@ -8659,6 +8804,9 @@ fn visit_models(
             note_stuck(opts, &r, &mut st, &sf.session_id, now_s());
             return r;
         }
+        if matches!(st.phase, Phase::Exiting { .. }) {
+            return resumed_by_another(opts, r, &mut st, sf);
+        }
         match relaunch_of(k, sf, &sf.session_id, st.pid, st.shell) {
             Relaunch::Ours => {}
             Relaunch::Unread => return said(r, "wait:ids"),
@@ -9663,6 +9811,76 @@ pub(super) fn model_and_mark(recent: Option<&(String, u64)>) -> (String, u64) {
     })
 }
 
+/// The step that closes a restart whose relaunch line was not typed since the agent's last end,
+/// once a process aterm did not start holds the conversation in its tab ([`resumed_by_another`]).
+pub const RESUMED_BY_ANOTHER: &str = "done:resumed-by-another";
+
+/// Why a restart whose conversation came back in its tab on an older build than its target, by a
+/// launch it never typed, is stopped ([`resumed_by_another`]).
+pub const RESUMED_BEHIND: &str = "resumed-by-another";
+
+/// An in-flight restart whose relaunch line was not typed since the agent's last end
+/// ([`Phase::Exiting`]: aterm's own, or a relaunched build's that ended on its own,
+/// [`St::roll_back`]) while `sf`, a process in its own tab, holds the conversation: someone else
+/// started it (a person at the prompt, or another driver). It is never adopted as aterm's relaunch, nothing is typed into it,
+/// and the record and ledger say who resumed it: [`RESUMED_BY_ANOTHER`], or a stop
+/// ([`RESUMED_BEHIND`]) when an upgrade's conversation came back on an older build than its
+/// target.
+fn resumed_by_another(opts: &Opts, mut r: Report, st: &mut St, sf: &SessionFile) -> Report {
+    if opts.dry_run {
+        return said(r, "would-close:resumed-by-another");
+    }
+    let now = now_s();
+    let waited = match st.phase {
+        Phase::Exiting { at_s } if !st.wait.is_empty() && st.wait_since >= at_s => {
+            let words = wait_words_of(st.agent, &st.wait)
+                .map(|words| format!(": {words}"))
+                .unwrap_or_default();
+            format!(" waited (`wait:{}`{words}) and was", st.wait)
+        }
+        _ => " was".to_string(),
+    };
+    st.seen_gone(now);
+    let before = recorded(&st.model_before)
+        .map(|m| format!("; it ran {m} before the restart"))
+        .unwrap_or_default();
+    let version = crate::supervise::limit::one_line(&sf.version);
+    let detail = format!(
+        "claude {version} (pid {}) holds the conversation in its tab, started by someone else, \
+         not by aterm: the relaunch line aterm owed since the agent's last end{waited} never \
+         typed{before}",
+        sf.pid
+    );
+    st.resumed_on = version.clone();
+    st.resumed_pid = sf.pid;
+    st.relaunched_pid = 0;
+    st.confirm_by = 0;
+    let behind = st.is_upgrade()
+        && matches!(
+            (Version::parse(&sf.version), Version::parse(&st.to)),
+            (Some(running), Some(to)) if running < to
+        );
+    if behind {
+        st.stop(RESUMED_BEHIND, now);
+        let r = said(r, format!("failed:{RESUMED_BEHIND}"));
+        ledger(
+            opts,
+            &r,
+            &format!("{detail}; it runs an older build than {}", st.to),
+        );
+        save(opts, &sf.session_id, st);
+        return r;
+    }
+    st.phase = Phase::Done;
+    r.to = format!("{version}({})", st.source);
+    let r = said(r, RESUMED_BY_ANOTHER);
+    st.outcome = detail;
+    st.done_at = now;
+    ledger(opts, &r, &st.outcome);
+    save(opts, &sf.session_id, st);
+    r
+}
+
 fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
     let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
         return Vec::new();
@@ -10429,6 +10647,7 @@ fn restart(
         shell,
         line,
         tap_dropped,
+        line_dir,
         ..
     } = match planned {
         Ok(p) => p,
@@ -10486,6 +10705,8 @@ fn restart(
         };
         let back = st.signalled(sf.pid, shell, tab, line, now_s());
         st.back_line.clone_from(&back_line);
+        st.line_dir = line_dir.unwrap_or_default();
+        st.line_grace_s = Some(grace);
         st.login = login.map(str::to_owned);
         if fresh {
             super::relaunch::CAUSE_UPGRADE_FRESH.clone_into(&mut st.cause);
@@ -10600,6 +10821,10 @@ fn confirmations(opts: &Opts) -> Vec<Report> {
 #[cfg(all(test, unix))]
 #[path = "upgrade_drive_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "upgrade_snapshot_env_tests.rs"]
+mod snapshot_env_tests;
 
 #[cfg(all(test, windows))]
 mod kernel_start_win_tests {

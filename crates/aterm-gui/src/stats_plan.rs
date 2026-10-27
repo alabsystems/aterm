@@ -89,20 +89,35 @@ const X0: f64 = 12.0;
 const MIN_TABLE_W: f64 = 160.0;
 const DETAILS_MIN: f64 = 120.0;
 const DETAILS_MAX: f64 = 560.0;
-const GROW_GAP_MAX: f64 = 16.0;
-const SLIM_AMOUNT_MIN: f64 = 92.0;
-const AMOUNT_DRAWN_MIN: f64 = 40.0;
 const BLOCK_GUTTER: f64 = 29.0;
-/// The widest Folded block: fwide's columns (489 pt on Helvetica Neue with the 3-scope bar
-/// restored), the gap and the widest Details. Wider decks centre the table.
-const B_MAX: f64 = 489.0 + 10.0 + DETAILS_MAX;
 const CORES_BLOCK_W: f64 = 68.0;
-/// The amount column where the Full deck shows its glance (wide, mid): `16.5 GiB`, `18 of 200 KB/s
-/// peak` (the refined deck, 2026-10-24; 120 pt held 0.134's longer words).
-const GLANCE_AMOUNT_W: f64 = 96.0;
-/// The aterm and Tab columns there, each: a bare figure (`2.2`, `0.1 MB/s`); 76 pt held 0.134's
-/// `0.46 GiB` and `48 processes`.
-const GLANCE_SCOPE_W: f64 = 56.0;
+/// From the meter's end (its figure run, else its bar) to Details, pt.
+const DETAILS_GAP: f64 = 10.0;
+/// The least Details a Folded wide block lays, pt.
+const FOLD_DETAILS_MIN: f64 = 130.0;
+/// Details' share of a Full table's room from its strip's start, before the strip takes its own.
+const DETAILS_SHARE: f64 = 0.18;
+/// From the bar's end to the figure run, pt.
+const RUN_GAP: f64 = 6.0;
+/// The widest figure run's column where no Details stands past it, pt: a reading with its
+/// maximum and a state's words after it (`112.6 of 128 GiB ● pressure warn`).
+const RUN_MAX: f64 = 170.0;
+/// The widest Folded block: its widest names, % and gaps (101 pt on Helvetica Neue), the
+/// widest meter Folded wide lays ([`FOLD_WIDE`]) and the widest Details. Wider decks centre the
+/// table.
+const B_MAX: f64 = 101.0
+    + FOLD_WIDE.strip.1
+    + FOLD_WIDE.bar_gap
+    + FOLD_WIDE.bar.1
+    + RUN_GAP
+    + FOLD_WIDE.run
+    + DETAILS_GAP
+    + DETAILS_MAX;
+/// The least room between a scope's words in the legend over the bars and the next scope's
+/// swatch, pt.
+const LEGEND_GAP: f64 = 8.0;
+/// The widest a legend's tab title stands, pt, before it is fitted (`Tab 1` is 25).
+const TAB_HEAD_MAX: f64 = 48.0;
 /// The strain gauge at the Folded deck's top left (the refined deck's Folded form, 2026-10-24):
 /// its dial's radius, pt. The dial is 54 pt across (Full's is 62) and sits 4 pt inside the
 /// 62 pt band at its top and its foot, the largest the band holds with room for the bezel's
@@ -126,28 +141,57 @@ const ROW_NAMES: [&str; 8] = [
     "Cores",
 ];
 pub(crate) const HEADER_PT: f64 = 9.5;
-/// What a strip's header keeps clear at its right end for the now marker and its beat
+/// From a row's baseline to the top of the three-scope bar it draws under its % figure where no
+/// bar column fits, pt (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5): the digits, `<` and
+/// `%` have no descenders, so a point clears them.
+pub(crate) const UNDER_GAP: f64 = 1.0;
+/// The height of that bar, pt: with [`UNDER_GAP`] it ends 3 pt below the baseline, inside the
+/// row's pitch (1 pt clear of the next row in Folded, 0.5 pt in Full narrow and slim). At 1× in
+/// Full, where the rows whose top falls on a half point hold 1 device px between the line's top
+/// and a px short of the next row, the painter draws every row's line 1 px tall (`under_h` in
+/// `stats_deck.rs`).
+pub(crate) const UNDER_H: f64 = 2.0;
+/// What a strip's header keeps clear at its left end, now, for the now marker and its beat
 /// ([`crate::stats_live`]), pt.
 pub(crate) const MARKER_ROOM: f64 = 8.0;
-/// The time scale's ticks after the middle of the span, how long ago each is, most wanted
-/// first: the last minute, two minutes, half a minute, five minutes ([`tick_ages`]).
-const TICK_AGES: [u32; 4] = [60, 120, 30, 300];
-/// A strip under a minute's ticks after the middle of its span: twenty seconds, then ten.
-const TICK_AGES_SHORT: [u32; 2] = [20, 10];
-/// A Folded strip's column, seconds: one reading's second, at the focused window's cadence of a
-/// reading a second, so each reading slides the strip one whole cell left, a step a person sees
-/// at a glance (`docs/DESIGN-stats-deck-live-2026-10-24.md` §12). The cells are v2's own (20 on
-/// 3 or 4 pt, 30 on 5 pt), so a Folded strip spans 20 or 30 seconds.
+/// From the % column's end to its strip's start, pt. The % (the value now) stands between the
+/// well and the strip (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §3.1), and the now marker's
+/// line between the column and the strip: centred [`crate::stats_live::LINE_DX`] left of the
+/// strip and at most a point wide, so its left edge stands 4 pt past the column's end at 1× and
+/// at 2×, with the digits, the line and the live box reading as one place.
+pub(crate) const PCT_TO_STRIP: f64 = 7.0;
+/// Where the header's words left of a strip's now marker end, pt before the strip: a point past
+/// the widest ring the marker's dot beats, centred [`crate::stats_live::LINE_DX`] left of the strip
+/// and reaching [`crate::stats_live::DOT_R`] + [`crate::stats_live::BEAT_REACH`] from there. The
+/// `now` over the % column ends here, about 3 pt short of the digits' right end (the ring drew over
+/// it where it ended with them, the review of 2026-10-26), and so do state words that take the
+/// column's header and, where there is no % column, words over the names.
+pub(crate) const WORDS_TO_STRIP: f64 =
+    crate::stats_live::LINE_DX + crate::stats_live::DOT_R + crate::stats_live::BEAT_REACH + 1.0;
+/// From the well's end to its strip's start where no % column stands between them (under slim's
+/// width, where the % goes first), pt: the now marker's line, [`crate::stats_live::LINE_DX`] left
+/// of the strip and at most a point wide, then starts a point past the well's end, clear of the
+/// widest row mark the well draws (0.36 of its size each side of the well's middle,
+/// `Deck::mark`).
+const BARE_STRIP_GAP: f64 = 4.0;
+/// A Folded strip's slot, seconds: its `Strip::period_s`, which marks a strip as Folded (the live
+/// edge slides a Folded strip's fine band and glides a Full one's), and the snapshot's slot, one
+/// reading's second at the focused window's cadence (`aterm_vitals::ring::SLOT_MS`). It sets
+/// neither how far a reading moves the strip nor what the strip spans: each reading that opens a
+/// slot slides the fine band right by the time it opened over the fine box's period, half a 2 s
+/// box ([`crate::stats_live::FineBand::step_px`], `docs/DESIGN-stats-deck-now-left-2026-10-26.md`
+/// §3.4), and the strip spans its multi-scale horizon ([`Strip::span_s`]). The step's lever is the
+/// fine band's share of its preset's weights in `aterm_vitals::ring` (live §8, 2026-10-26).
 pub(crate) const FOLD_SLOT_S: u32 = 1;
-/// The most slots a Folded strip draws (fwide's 30), and the one its slide brings in.
-pub(crate) const FOLD_SLOTS_MAX: usize = 30;
 /// The least room between a tick's words and the words beside them, pt.
 const TICK_GAP: f64 = 6.0;
 /// How far a tick's words may stand off centre over it, as a share of their width: the tick
 /// stays under their middle half, so "–5 min" never reads as a minute later.
 const TICK_SLACK: f64 = 0.25;
-/// What the header keeps clear before a strip's left end, pt: a key span over the names ends
-/// here, and a time label standing beside the strip ends here.
+/// What the header keeps clear between words and the place they lead to, pt: a key span over the
+/// names ends this far before the `now` over the % column, and a time label standing beside the
+/// strip starts this far past its right end. Where there is no % column, words over the names end
+/// [`WORDS_TO_STRIP`] before the strip, clear of the now marker's beat.
 pub(crate) const STRIP_LEAD: f64 = 6.0;
 const DETAILS_LONG: &str = "Details · point at a row for more";
 const SWATCH_ADVANCE: f64 = 0.62 * HEADER_PT + 3.0;
@@ -160,6 +204,13 @@ fn name_width(base: f64, pt: f64, m: &FaceMetrics) -> f64 {
         .map(|name| m.width(name, pt, true))
         .fold(0.0, f64::max);
     base.max((widest + 1.5).ceil())
+}
+
+/// The legend's least width on the header line, whole pt: `■ Mac ■ aterm ■ Tab`, the machine's
+/// noun and the tab's title at their shortest ([`Header::legend`]).
+fn legend_least(m: &FaceMetrics) -> f64 {
+    let words = |s: &str| m.width(s, HEADER_PT, false);
+    (3.0 * SWATCH_ADVANCE + words("Mac") + words("aterm") + words("Tab") + 2.0 * LEGEND_GAP).ceil()
 }
 
 const fn whole_width(w_pt: f64) -> f64 {
@@ -188,18 +239,257 @@ impl Col {
     }
 }
 
-struct Pen(f64);
+/// One table's meter measures, pt (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §2): how the
+/// room right of the % column is shared between the strip, the scope bar and the figure run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MeterSpec {
+    /// The strip's least and most width.
+    strip: (f64, f64),
+    /// The strip's box pitch: it is a whole number of them wide, less the last box's gap.
+    pitch: f64,
+    /// The strip's share of the room (Details aside): the time series is the row's widest part.
+    share: f64,
+    /// From the strip's last box's pitch to the bar.
+    bar_gap: f64,
+    /// The bar's least and most width.
+    bar: (f64, f64),
+    /// The least bar with no run beside it, where that is longer than the bar's least: Full's,
+    /// as long as the legend over it ([`legend_least`], set where the plan is laid).
+    bar_alone: f64,
+    /// The figure run's column: this Mac's reading with the row's maximum (`112.6 of 128 GiB`).
+    run: f64,
+    /// The least Details the table lays where room is left, and the least strip it leaves beside
+    /// them; `None` where it lays none.
+    details: Option<(f64, f64)>,
+    /// Whether each row's bar may stand under its % where no bar column fits beside the strip.
+    under: bool,
+}
 
-impl Pen {
-    fn col(&mut self, gap: f64, w: f64) -> Col {
-        let col = Col::new(self.0 + gap, w);
-        self.0 = col.end();
-        col
+/// Full wide: six hours' strip from 239 pt taking 0.65 of the room, a bar of 40 to 240 pt, a run
+/// at 10 pt, and Details where they leave the strip 360 pt.
+const FULL_WIDE: MeterSpec = MeterSpec {
+    strip: (239.0, 600.0),
+    pitch: 5.0,
+    share: 0.65,
+    bar_gap: 8.0,
+    bar: (40.0, 240.0),
+    bar_alone: 0.0,
+    run: 88.0,
+    details: Some((DETAILS_MIN, 360.0)),
+    under: false,
+};
+
+/// Full mid: no Details, a 4 pt pitch, and the strip at 0.6 of the room, which keeps the run
+/// beside a bar as long as it down to about 700 pt.
+const FULL_MID: MeterSpec = MeterSpec {
+    pitch: 4.0,
+    share: 0.6,
+    details: None,
+    ..FULL_WIDE
+};
+
+/// Full narrow: a strip from 99 pt at a 5 pt pitch.
+const FULL_NARROW: MeterSpec = MeterSpec {
+    strip: (99.0, 600.0),
+    pitch: 5.0,
+    bar_gap: 6.0,
+    ..FULL_MID
+};
+
+/// Full slim: a strip from 79 pt at a 4 pt pitch, a run at 9.5 pt, and the bar under each %
+/// where no column fits.
+const FULL_SLIM: MeterSpec = MeterSpec {
+    strip: (79.0, 600.0),
+    pitch: 4.0,
+    run: 72.0,
+    under: true,
+    ..FULL_NARROW
+};
+
+/// Folded wide: a strip from 129 pt taking eight tenths of the block's room (six tenths of the
+/// block at the owner's 940 to 1040 pt), a bar of 32 to 160 pt, a run at 9.5 pt where the bar
+/// is at least as long, and Details where they leave the strip 480 pt.
+const FOLD_WIDE: MeterSpec = MeterSpec {
+    strip: (129.0, 600.0),
+    pitch: 5.0,
+    share: 0.8,
+    bar_gap: 6.0,
+    bar: (32.0, 160.0),
+    bar_alone: 0.0,
+    run: 82.0,
+    details: Some((FOLD_DETAILS_MIN, 480.0)),
+    under: false,
+};
+
+/// Folded mid: a strip from 79 pt at a 4 pt pitch, a bar from 28 pt, no Details. The strip
+/// keeps its share: a narrower block keeps a bar column by a shorter bar's least.
+const FOLD_MID: MeterSpec = MeterSpec {
+    strip: (79.0, 480.0),
+    pitch: 4.0,
+    bar: (28.0, 160.0),
+    details: None,
+    ..FOLD_WIDE
+};
+
+/// Folded narrow: a strip from 59 pt at a 3 pt pitch and a bar from 24 pt.
+const FOLD_NARROW: MeterSpec = MeterSpec {
+    strip: (59.0, 480.0),
+    pitch: 3.0,
+    bar: (24.0, 160.0),
+    ..FOLD_MID
+};
+
+/// Folded slim: narrow's, with the bar under each % where no column fits.
+const FOLD_SLIM: MeterSpec = MeterSpec {
+    under: true,
+    ..FOLD_NARROW
+};
+
+/// What a table lays right of its strip (the owner, 2026-10-26: "extend the progress brs so
+/// that the fill more horizontal space. the stats in columns after the time series doesn't make
+/// sense to me"): the scope bar, stretched over what the strip leaves, and at its end, where a
+/// bar at least as long stands beside it, one figure run per row, this Mac's reading with the
+/// row's maximum. No column of figures stands after the strip: aterm's and this tab's amounts
+/// are the bar's segments.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Meter {
+    /// The scope bar's column; `None` where each row's bar stands under its % instead.
+    pub(crate) bar: Option<Col>,
+    /// The figure run's column, [`RUN_GAP`] past the bar: each row's run starts at its left edge,
+    /// in the first form that fits its width. `None` where the run gives way to the bar.
+    pub(crate) run: Option<Col>,
+}
+
+impl Meter {
+    /// Its columns, left to right.
+    pub(crate) fn cols(&self) -> Vec<Col> {
+        self.bar.into_iter().chain(self.run).collect()
+    }
+
+    /// Where its last column ends, pt; `None` with no bar column.
+    pub(crate) fn end(&self) -> Option<f64> {
+        self.run.or(self.bar).map(Col::end)
+    }
+
+    fn shift(&mut self, dx: f64) {
+        for col in [&mut self.bar, &mut self.run].into_iter().flatten() {
+            col.x += dx;
+        }
     }
 }
 
-/// Progressive multi-scale heat strip geometry: fine real-time boxes near `now` on the right
-/// growing into wider aggregated time buckets toward the left.
+/// How many boxes of `spec`'s pitch a strip at most `w` wide (and at most `spec`'s most) lays.
+fn strip_cols(spec: &MeterSpec, w: f64) -> u32 {
+    ((w.min(spec.strip.1) + 1.0) / spec.pitch).floor().max(0.0) as u32
+}
+
+/// How a table shares the room from `x`, where its strip starts, to `end` (`docs/DESIGN-stats-deck-
+/// meter-2026-10-26.md` §2): the strip's boxes, the meter, and the Details column past it; `None`
+/// where `spec`'s strip, or its bar where it has no place under the %, does not fit.
+///
+/// [`share_meter`] shares the room between the strip, the bar and the run. Details, where `spec`
+/// lays it, takes [`DETAILS_SHARE`] of the room (its least to [`DETAILS_MAX`]) where the rest
+/// still lays the run it would without them and `spec`'s strip beside Details: Details never cost
+/// a row its maximum, nor the time series its length. What the strip's and the bar's most leave
+/// goes to the run's column (up to [`RUN_MAX`]) or to Details (up to [`DETAILS_MAX`]). Where not
+/// even the bar's least fits beside the strip's least, a table that may stands each row's bar
+/// under its % and gives the strip the room.
+fn lay_meter(x: f64, end: f64, spec: &MeterSpec) -> Option<(u32, Meter, Option<Col>)> {
+    let room = end - x;
+    let without = share_meter(room, spec);
+    let details_w = spec.details.and_then(|(least, strip)| {
+        let d = (room * DETAILS_SHARE).floor().clamp(least, DETAILS_MAX);
+        let with = share_meter(room - d - DETAILS_GAP, spec)?;
+        let run = |laid: Option<(u32, f64, f64)>| laid.map(|(_, run, _)| run);
+        let keeps = f64::from(with.0) * spec.pitch - 1.0 >= strip;
+        (keeps && run(Some(with)) >= run(without)).then_some(d)
+    });
+    let m = details_w.map_or(room, |d| room - d - DETAILS_GAP);
+    let Some((cols, run_w, bar_w)) = share_meter(m, spec) else {
+        if !spec.under {
+            return None;
+        }
+        // The bar stands under each %, and the strip takes the room.
+        let cols = strip_cols(spec, m);
+        if cols < strip_cols(spec, spec.strip.0) {
+            return None;
+        }
+        return Some((cols, Meter::default(), None));
+    };
+    let bar = Col::new(x + f64::from(cols) * spec.pitch + spec.bar_gap, bar_w);
+    let used = bar.end() - x + if run_w > 0.0 { RUN_GAP + run_w } else { 0.0 };
+    let spare = (m - used).max(0.0);
+    let run = (run_w > 0.0).then(|| {
+        let w = if details_w.is_some() {
+            run_w
+        } else {
+            (run_w + spare).min(RUN_MAX)
+        };
+        Col::new(bar.end() + RUN_GAP, w)
+    });
+    // Details stay narrower than the strip, the row's widest part.
+    let strip_w = f64::from(cols) * spec.pitch - 1.0;
+    let details = details_w.map(|d| {
+        let at = run.map_or(bar.end(), Col::end) + DETAILS_GAP;
+        Col::new(
+            at,
+            (d + spare)
+                .min(DETAILS_MAX)
+                .min(end - at)
+                .min(strip_w - 1.0),
+        )
+    });
+    Some((
+        cols,
+        Meter {
+            bar: Some(bar),
+            run,
+        },
+        details,
+    ))
+}
+
+/// The strip's boxes, the run's width (0 for none) and the bar's for `m` pt from the strip's
+/// start to the meter's end ([`lay_meter`]); `None` where no bar of `spec`'s least (with no run
+/// beside it, `spec.bar_alone`) fits beside the strip.
+///
+/// The strip takes `spec.share` of the room, whole boxes between its least and its most: the
+/// time series is the row's widest part, and it never cedes its share. The bar takes what it
+/// leaves: the run stands at the bar's end only where the bar is then at least as long as the
+/// run, so as the room narrows the run gives way first, then the bar (to a narrower spec's, or
+/// under each %), and the strip last. A bar past its most gives the excess to the strip, up to
+/// the strip's most.
+fn share_meter(m: f64, spec: &MeterSpec) -> Option<(u32, f64, f64)> {
+    let mut cols = strip_cols(spec, (m * spec.share).floor()).max(strip_cols(spec, spec.strip.0));
+    // From the strip's last box's pitch, and the bar's gap, to the meter's end.
+    let rest = (m - f64::from(cols) * spec.pitch - spec.bar_gap).floor();
+    if rest < spec.bar.0 {
+        return None;
+    }
+    let with_run = (rest - RUN_GAP - spec.run).floor();
+    let (run_w, mut bar_w) = if with_run >= spec.run.max(spec.bar.0) {
+        (spec.run, with_run)
+    } else if rest >= spec.bar_alone {
+        (0.0, rest)
+    } else {
+        return None;
+    };
+    // What the bar's most leaves goes to the strip, up to its own most.
+    if bar_w > spec.bar.1 {
+        let more = strip_cols(
+            spec,
+            f64::from(cols) * spec.pitch - 1.0 + bar_w - spec.bar.1,
+        )
+        .max(cols);
+        bar_w -= f64::from(more - cols) * spec.pitch;
+        cols = more;
+        bar_w = bar_w.min(spec.bar.1);
+    }
+    Some((cols, run_w, bar_w))
+}
+
+/// Progressive multi-scale heat strip geometry: the live `now` box at the left end, then fine
+/// real-time boxes growing into wider aggregated time buckets toward the right.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Strip {
     pub(crate) x: f64,
@@ -211,50 +501,53 @@ pub(crate) struct Strip {
 }
 
 impl Strip {
-    /// What a legacy uniform Full strip spanned (kept for column pitch math).
-    const FULL_SPAN_S: u32 = 600;
+    /// A Full strip's `period_s`: what a box of the legacy uniform 10-minute strip held, which
+    /// tells a Full strip from a Folded one ([`FOLD_SLOT_S`]).
+    const FULL_PERIOD_S: u32 = 10;
 
-    /// A Full strip: multi-scale progressive horizon (`1h` on wide/mid, `15m`/`5m` on narrow,
-    /// `1m` on slim).
-    fn new(x: f64, cols: u32, pitch: f64) -> Self {
-        let spec = if cols >= 60 {
-            MultiScaleSpec::FULL_HOUR
-        } else if cols >= 30 {
-            MultiScaleSpec::FOLD_15M
-        } else if pitch >= 5.0 {
-            MultiScaleSpec::COMPACT_5M
-        } else {
-            MultiScaleSpec::MINI_1M
-        };
-        Self::of(x, cols, Self::FULL_SPAN_S / cols, pitch, spec)
+    /// A Full strip of `cols` boxes at `pitch` from `x`, its horizon the widest its width holds
+    /// ([`Self::spec_for`]).
+    fn full(x: f64, cols: u32, pitch: f64) -> Self {
+        Self::of(x, cols, Self::FULL_PERIOD_S, pitch)
     }
 
-    /// A Folded strip: multi-scale progressive horizon (`15m` on wide, `5m` on mid, `1m` on
-    /// narrow/slim).
-    const fn folded(x: f64, cols: u32, pitch: f64) -> Self {
-        let spec = if cols >= 26 {
-            MultiScaleSpec::FOLD_15M
-        } else if pitch >= 4.0 {
-            MultiScaleSpec::COMPACT_5M
-        } else {
-            MultiScaleSpec::MINI_1M
-        };
-        Self::of(x, cols, FOLD_SLOT_S, pitch, spec)
+    /// A Folded strip of `cols` boxes at `pitch` from `x`, its horizon the widest its width
+    /// holds ([`Self::spec_for`]).
+    pub(crate) fn folded(x: f64, cols: u32, pitch: f64) -> Self {
+        Self::of(x, cols, FOLD_SLOT_S, pitch)
     }
 
-    const fn of(x: f64, cols: u32, period_s: u32, pitch: f64, spec: MultiScaleSpec) -> Self {
+    /// The widest of the owner's block presets (`docs/DESIGN-stats-deck-owner-2026-10-26.md` §4)
+    /// a strip `w` pt wide (its boxes' pitches, less the last one's gap) holds: six hours from
+    /// 239 pt, four from 129, six minutes from 79, else a minute. Each is where main's tiers
+    /// first lay it (Full mid's 60 columns at 4 pt, Folded wide's 26 at 5, Folded mid's 20 at
+    /// 4), so its 1 s block keeps 3 device px or more at 1× and its scale its ticks.
+    pub(crate) fn spec_for(w: f64) -> MultiScaleSpec {
+        if w >= 239.0 {
+            MultiScaleSpec::FULL_6H
+        } else if w >= 129.0 {
+            MultiScaleSpec::FOLD_4H
+        } else if w >= 79.0 {
+            MultiScaleSpec::COMPACT_6M
+        } else {
+            MultiScaleSpec::MINI_1M
+        }
+    }
+
+    fn of(x: f64, cols: u32, period_s: u32, pitch: f64) -> Self {
+        let w = f64::from(cols) * pitch - 1.0;
         Self {
             x,
             cols,
             period_s,
             pitch,
             cell: pitch - 1.0,
-            spec,
+            spec: Self::spec_for(w),
         }
     }
 
-    /// How far back the strip reaches, seconds: its multi-scale horizon (`3600`, `900`, `300` or
-    /// `60`).
+    /// How far back the strip reaches, seconds: its multi-scale horizon (`21600`, `14400`, `360`
+    /// or `60`).
     pub(crate) fn span_s(self) -> u32 {
         u32::try_from(self.spec.horizon_ms() / 1_000).unwrap_or(60)
     }
@@ -271,19 +564,23 @@ impl Strip {
             .map(|f| self.x + f64::from(f) * self.width())
     }
 
-    /// How fast its finest edge glides left, pt a second.
+    /// How fast its fine band moves right, pt a second: its first history box's width over that
+    /// box's period (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §3.4).
     #[cfg(test)]
     pub(crate) fn pt_per_s(self) -> f64 {
-        self.pitch / f64::from(self.period_s.max(1))
+        self.spec
+            .slots()
+            .iter()
+            .find(|slot| !slot.is_live_now)
+            .map_or(0.0, |slot| {
+                let period_s = (slot.age_hi_ms - slot.age_lo_ms) as f64 / 1000.0;
+                f64::from(slot.x1 - slot.x0) * self.width() / period_s.max(1e-3)
+            })
     }
 
-    /// Right edge of the last strip cell (`now`).
+    /// Right edge of the last strip cell, the horizon (the oldest box's far edge).
     pub(crate) fn end(self) -> f64 {
         self.x + f64::from(self.cols.saturating_sub(1)) * self.pitch + self.cell
-    }
-
-    fn after(self) -> f64 {
-        self.x + f64::from(self.cols) * self.pitch
     }
 }
 
@@ -359,18 +656,26 @@ impl Rows {
     pub(crate) fn top(&self, r: u32) -> f64 {
         self.top0 + f64::from(r) * self.pitch
     }
+
+    /// The top and bottom of the three-scope bar row `r` draws under its % figure where no bar
+    /// column fits, pt, as planned: [`UNDER_GAP`] below the digits' baseline and [`UNDER_H`]
+    /// tall (the painter draws it from that top, shorter at 1× in Full, as [`UNDER_H`] says).
+    pub(crate) fn under(&self, r: u32) -> (f64, f64) {
+        let y = self.top(r) + self.baseline + UNDER_GAP;
+        (y, y + UNDER_H)
+    }
 }
 
 /// Width tier for the `Full` deck form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FullKind {
-    /// Cores block, 60-cell strip with variable pitch, and Details.
+    /// Cores block, a strip of six hours at a 5 pt pitch, the meter, and Details.
     Wide,
-    /// Cores block, 60-cell strip at 4 pt pitch, and optional Details.
+    /// Cores block, a strip of six hours at a 4 pt pitch, and the meter.
     Mid,
-    /// Cores row, no scope bar, amount, and both figures.
+    /// Cores row, a strip from 100 pt, the meter, and optional Details.
     Narrow,
-    /// Cores row, compact scope bar, and amount.
+    /// Cores row, a strip from 80 pt, and the meter, or the bar under each %.
     Slim,
 }
 
@@ -397,25 +702,29 @@ pub(crate) struct FullPlan {
     pub(crate) kind: FullKind,
     /// Whether the deck is too narrow to draw anything besides its background.
     pub(crate) ground_only: bool,
-    /// Extra width added to each gap right of the strip in wide windows.
-    pub(crate) gap_grow: f64,
-    /// Horizontal centering offset applied to all columns.
+    /// Horizontal centering offset applied to all columns, where the widest strip, bar and
+    /// Details leave room.
     pub(crate) offset: f64,
     pub(crate) rows: Rows,
     pub(crate) cores: CoresAt,
     pub(crate) name: Col,
     pub(crate) well: Col,
     pub(crate) strip: Strip,
-    /// Right-aligned percentage column.
+    /// Right-aligned percentage column, between the well and the strip.
     pub(crate) pct: Option<Col>,
-    pub(crate) bar: Option<Col>,
-    pub(crate) amount: Option<Col>,
-    pub(crate) aterm: Option<Col>,
-    pub(crate) tab: Option<Col>,
+    /// The scope bar and the figure run right of the strip; where the bar's column does not fit,
+    /// each row draws its bar under its % ([`Self::bar_under`]).
+    pub(crate) meter: Meter,
     pub(crate) details: Option<Col>,
 }
 
 impl FullPlan {
+    /// The % column where no bar column fits: each row that prints a % draws its three-scope bar
+    /// under the figure there (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5).
+    pub(crate) fn bar_under(&self) -> Option<Col> {
+        self.pct.filter(|_| self.meter.bar.is_none())
+    }
+
     /// Chooses the Cores row's [`CoresMode`] for `clusters`: narrow and slim have the row;
     /// wide and mid draw the strain gauge in [`CoresAt::Block`] and have none.
     pub(crate) fn cores_mode(
@@ -447,41 +756,10 @@ impl FullPlan {
         self.name.x += dx;
         self.well.x += dx;
         self.strip.x += dx;
-        for col in [
-            &mut self.pct,
-            &mut self.bar,
-            &mut self.amount,
-            &mut self.aterm,
-            &mut self.tab,
-            &mut self.details,
-        ]
-        .into_iter()
-        .flatten()
-        {
+        self.meter.shift(dx);
+        for col in [&mut self.pct, &mut self.details].into_iter().flatten() {
             col.x += dx;
         }
-    }
-
-    fn grow(&mut self, extra: f64) {
-        let grow = (extra / 6.0).min(GROW_GAP_MAX).floor();
-        let mut moved = 0.0;
-        for col in [
-            &mut self.pct,
-            &mut self.bar,
-            &mut self.amount,
-            &mut self.aterm,
-            &mut self.tab,
-            &mut self.details,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            moved += grow;
-            col.x += moved;
-        }
-        self.gap_grow = grow;
-        self.offset = ((extra - 6.0 * grow) / 2.0).floor();
-        self.shift(self.offset);
     }
 }
 
@@ -490,21 +768,25 @@ pub(crate) fn plan_full(w_pt: f64, m: &FaceMetrics) -> FullPlan {
     let w = whole_width(w_pt);
     if let Some(plan) = FullKind::ALL
         .into_iter()
-        .map(|kind| lay_full(w, kind, m))
+        .map(|kind| lay_full(w, kind, m, true))
         .find_map(|(plan, fits)| fits.then_some(plan))
     {
         return plan;
     }
     let right = w - X0;
-    let (mut plan, _) = lay_full(w, FullKind::Slim, m);
-    plan.amount = plan.amount.filter(|amount| amount.w >= AMOUNT_DRAWN_MIN);
-    plan.bar = plan.bar.filter(|bar| bar.end() <= right);
+    // Under slim's width the % column goes before the strip does: the strip takes its place.
+    let (mut plan, _) = lay_full(w, FullKind::Slim, m, true);
+    if plan.strip.end() > right {
+        plan = lay_full(w, FullKind::Slim, m, false).0;
+    }
     plan.pct = plan.pct.filter(|pct| pct.end() <= right);
     plan.ground_only = w < MIN_TABLE_W || plan.strip.end() > right;
     plan
 }
 
-fn lay_full(w: f64, kind: FullKind, m: &FaceMetrics) -> (FullPlan, bool) {
+/// The Full plan of `kind` at `w`, and whether it fits; `pct` lays the % column between the well
+/// and the strip, and without it the strip stands where the column would.
+fn lay_full(w: f64, kind: FullKind, m: &FaceMetrics, pct: bool) -> (FullPlan, bool) {
     let right = w - X0;
     let rows = Rows::full(kind);
     let (name_x, name_base) = match kind {
@@ -514,15 +796,26 @@ fn lay_full(w: f64, kind: FullKind, m: &FaceMetrics) -> (FullPlan, bool) {
     };
     let name = Col::new(name_x, name_width(name_base, rows.name_pt, m));
     let well = Col::new(name.end(), 10.0);
-    let strip_x = well.end() + if kind == FullKind::Slim { 3.0 } else { 4.0 };
-    let strip = match kind {
-        FullKind::Wide => {
-            let pitch = 5.0 + ((w - 1100.0) / 300.0).floor().clamp(0.0, 5.0);
-            Strip::new(strip_x, 60, pitch)
-        }
-        FullKind::Mid => Strip::new(strip_x, 60, 4.0),
-        FullKind::Narrow => Strip::new(strip_x, if w >= 640.0 { 30 } else { 20 }, 5.0),
-        FullKind::Slim => Strip::new(strip_x, 20, 4.0),
+    // The % column (the value now) and then the strip, which reads outward from now.
+    let pct_col = match kind {
+        FullKind::Wide | FullKind::Mid | FullKind::Narrow => Col::new(well.end() + 3.0, 30.0),
+        FullKind::Slim => Col::new(well.end(), 26.0),
+    };
+    let strip_x = if pct {
+        pct_col.end() + PCT_TO_STRIP
+    } else {
+        well.end() + BARE_STRIP_GAP
+    };
+    let spec = match kind {
+        FullKind::Wide => FULL_WIDE,
+        FullKind::Mid => FULL_MID,
+        FullKind::Narrow => FULL_NARROW,
+        FullKind::Slim => FULL_SLIM,
+    };
+    // The legend stands over the meter's own columns, so a bar with no run is as long as it.
+    let spec = MeterSpec {
+        bar_alone: legend_least(m),
+        ..spec
     };
     let cores = match kind {
         FullKind::Wide | FullKind::Mid => CoresAt::Block {
@@ -530,80 +823,56 @@ fn lay_full(w: f64, kind: FullKind, m: &FaceMetrics) -> (FullPlan, bool) {
             divider: 88.0,
         },
         FullKind::Narrow | FullKind::Slim => {
-            CoresAt::Row(Col::new(strip.x, (right - strip.x).max(0.0)))
+            CoresAt::Row(Col::new(pct_col.x, (right - pct_col.x).max(0.0)))
         }
     };
     let mut plan = FullPlan {
         w,
         kind,
         ground_only: false,
-        gap_grow: 0.0,
         offset: 0.0,
         rows,
         cores,
         name,
         well,
-        strip,
-        pct: None,
-        bar: None,
-        amount: None,
-        aterm: None,
-        tab: None,
+        strip: Strip::full(strip_x, strip_cols(&spec, spec.strip.0), spec.pitch),
+        pct: pct.then_some(pct_col),
+        meter: Meter::default(),
         details: None,
     };
-    let mut pen = Pen(strip.after());
-    let fits = match kind {
-        FullKind::Wide | FullKind::Mid => {
-            plan.pct = Some(pen.col(6.0, 30.0));
-            let bar_w = if kind == FullKind::Wide { 96.0 } else { 80.0 };
-            plan.bar = Some(pen.col(8.0, bar_w));
-            plan.amount = Some(pen.col(8.0, GLANCE_AMOUNT_W));
-            plan.aterm = Some(pen.col(8.0, GLANCE_SCOPE_W));
-            plan.tab = Some(pen.col(8.0, GLANCE_SCOPE_W));
-            let rest = right - (pen.0 + 10.0);
-            if rest >= DETAILS_MIN {
-                plan.details = Some(Col::new(pen.0 + 10.0, rest.min(DETAILS_MAX)));
-            }
-            let fits = pen.0 <= right && (kind == FullKind::Mid || plan.details.is_some());
-            if fits && kind == FullKind::Wide && rest > DETAILS_MAX {
-                plan.grow(rest - DETAILS_MAX);
-            }
-            fits
-        }
-        FullKind::Narrow => {
-            plan.pct = Some(pen.col(6.0, 30.0));
-            plan.bar = Some(pen.col(6.0, 24.0));
-            let amount_w = (right - (pen.0 + 8.0) - (8.0 + 76.0 + 8.0 + 76.0)).min(160.0);
-            plan.amount = Some(pen.col(8.0, amount_w));
-            plan.aterm = Some(pen.col(8.0, 76.0));
-            plan.tab = Some(pen.col(8.0, 76.0));
-            let rest = right - (pen.0 + 10.0);
-            if amount_w >= 160.0 && rest >= DETAILS_MIN {
-                plan.details = Some(Col::new(pen.0 + 10.0, rest.min(DETAILS_MAX)));
-            }
-            amount_w >= 120.0
-        }
-        FullKind::Slim => {
-            plan.pct = Some(pen.col(4.0, 26.0));
-            plan.bar = Some(pen.col(6.0, 24.0));
-            let amount_x = pen.0 + 6.0;
-            plan.amount = Some(Col::new(amount_x, right - amount_x));
-            right - amount_x >= SLIM_AMOUNT_MIN
-        }
+    // Wide needs its Details; slim, the last kind, takes whatever fits.
+    let laid = lay_meter(strip_x, right, &spec)
+        .filter(|(_, _, details)| kind != FullKind::Wide || details.is_some());
+    let Some((cols, meter, details)) = laid else {
+        return (plan, false);
     };
-    (plan, fits)
+    plan.strip = Strip::full(strip_x, cols, spec.pitch);
+    plan.meter = meter;
+    plan.details = details;
+    // What the widest strip, bar and Details leave centres the table.
+    let laid_end = details
+        .or(meter.run)
+        .or(meter.bar)
+        .map_or(plan.strip.end(), Col::end);
+    let extra = right - laid_end;
+    if kind == FullKind::Wide && extra > 0.0 {
+        plan.offset = (extra / 2.0).floor();
+        plan.shift(plan.offset);
+    }
+    (plan, plan.strip.end() <= right)
 }
 
 /// Width tier for each block of the `Folded` deck form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum BlockKind {
-    /// 30-cell strip, amount, both figures, and optional Details.
+    /// A strip from 160 pt at a 5 pt pitch, the meter, and Details where room is left.
     Wide,
-    /// 20-cell strip, compact scope bar, and amount.
+    /// A strip from 120 pt at a 4 pt pitch, and the meter.
     Mid,
-    /// Compact strip, amount, and optional scope bar.
+    /// A strip from 60 pt at a 3 pt pitch, and the meter.
     Narrow,
-    /// Strip and percentage only, with state in the header.
+    /// Strip and percentage, and the meter or the scope bar under each %, with state in the
+    /// header.
     Slim,
 }
 
@@ -639,18 +908,24 @@ pub(crate) struct BlockPlan {
     pub(crate) name: Col,
     pub(crate) well: Col,
     pub(crate) strip: Strip,
-    /// Right-aligned percentage column, if fitted.
+    /// Right-aligned percentage column between the well and the strip, if fitted.
     pub(crate) pct: Option<Col>,
-    pub(crate) bar: Option<Col>,
-    pub(crate) amount: Option<Col>,
-    pub(crate) aterm: Option<Col>,
-    pub(crate) tab: Option<Col>,
+    /// The scope bar and the figure run right of the strip; where the bar's column does not fit,
+    /// each row draws its bar under its % ([`Self::bar_under`]).
+    pub(crate) meter: Meter,
     pub(crate) details: Option<Col>,
     /// Horizontal span available for Block B's Cores row.
     pub(crate) cores: Col,
 }
 
 impl BlockPlan {
+    /// The % column where no bar column fits (fnarrow and fslim): each row that prints a % draws
+    /// its three-scope bar under the figure there
+    /// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5).
+    pub(crate) fn bar_under(&self) -> Option<Col> {
+        self.pct.filter(|_| self.meter.bar.is_none())
+    }
+
     /// Chooses the [`CoresMode`] for Block B's Cores row.
     pub(crate) fn cores_mode(&self, clusters: &[Cluster<'_>], m: &FaceMetrics) -> CoresMode {
         cores_row_mode(
@@ -726,14 +1001,11 @@ fn lay_folded(w: f64, gauge: bool, m: &FaceMetrics) -> (FoldedPlan, bool) {
     }
     let kind = BlockKind::ALL
         .into_iter()
-        .find(|&kind| lay_block(xa, b, kind, m).1);
+        .find(|&kind| lay_block(xa, b, kind, m, true).1);
+    // Where not even slim fits, the % column goes and the strip takes its place.
     let block = |x: f64| match kind {
-        Some(kind) => lay_block(x, b, kind, m).0,
-        None => {
-            let (mut plan, _) = lay_block(x, b, BlockKind::Slim, m);
-            plan.pct = None;
-            plan
-        }
+        Some(kind) => lay_block(x, b, kind, m, true).0,
+        None => lay_block(x, b, BlockKind::Slim, m, false).0,
     };
     let blocks = [block(xa), block(xa + b + BLOCK_GUTTER)];
     let plan = FoldedPlan {
@@ -749,23 +1021,35 @@ fn lay_folded(w: f64, gauge: bool, m: &FaceMetrics) -> (FoldedPlan, bool) {
     (plan, kind.is_some())
 }
 
-fn lay_block(x: f64, b: f64, kind: BlockKind, m: &FaceMetrics) -> (BlockPlan, bool) {
+/// One Folded block of `kind` at `x`, `b` wide, and whether it fits; `pct` lays the % column
+/// between the well and the strip, and without it the strip stands where the column would.
+fn lay_block(x: f64, b: f64, kind: BlockKind, m: &FaceMetrics, pct: bool) -> (BlockPlan, bool) {
     let rows = Rows::folded(kind);
-    let (name_base, well_w, strip_gap, cols, pitch) = match kind {
-        BlockKind::Wide => (52.0, 10.0, 4.0, 26, 5.0),
-        BlockKind::Mid => (52.0, 10.0, 4.0, 20, 4.0),
-        BlockKind::Narrow => (48.0, 7.0, 3.0, 20, 3.0),
-        BlockKind::Slim => (48.0, 7.0, 2.0, 20, 3.0),
+    let (name_base, well_w, pct_gap, pct_w) = match kind {
+        BlockKind::Wide => (52.0, 10.0, 2.0, 30.0),
+        BlockKind::Mid => (52.0, 10.0, 2.0, 28.0),
+        BlockKind::Narrow | BlockKind::Slim => (48.0, 7.0, 0.0, 26.0),
+    };
+    let spec = match kind {
+        BlockKind::Wide => FOLD_WIDE,
+        BlockKind::Mid => FOLD_MID,
+        BlockKind::Narrow => FOLD_NARROW,
+        BlockKind::Slim => FOLD_SLIM,
     };
     let name = Col::new(x, name_width(name_base, rows.name_pt, m));
     let well = Col::new(name.end(), well_w);
-    let strip = Strip::folded(well.end() + strip_gap, cols, pitch);
-    let e = strip.after();
+    // The % column (the value now) and then the strip, which reads outward from now.
+    let pct_col = Col::new(well.end() + pct_gap, pct_w);
+    let strip_x = if pct {
+        pct_col.end() + PCT_TO_STRIP
+    } else {
+        well.end() + BARE_STRIP_GAP
+    };
     let end = x + b;
     let cores_x = if kind == BlockKind::Slim {
         name.x
     } else {
-        strip.x
+        pct_col.x
     };
     let mut plan = BlockPlan {
         kind,
@@ -773,56 +1057,23 @@ fn lay_block(x: f64, b: f64, kind: BlockKind, m: &FaceMetrics) -> (BlockPlan, bo
         rows,
         name,
         well,
-        strip,
-        pct: None,
-        bar: None,
-        amount: None,
-        aterm: None,
-        tab: None,
+        strip: Strip::folded(strip_x, strip_cols(&spec, spec.strip.0), spec.pitch),
+        pct: pct.then_some(pct_col),
+        meter: Meter::default(),
         details: None,
         cores: Col::new(cores_x, (end - cores_x).max(0.0)),
     };
-    let fits = match kind {
-        BlockKind::Wide => {
-            plan.pct = Some(Col::new(e + 5.0, 30.0));
-            plan.bar = Some(Col::new(e + 40.0, 28.0));
-            let amount = Col::new(e + 73.0, GLANCE_AMOUNT_W);
-            plan.amount = Some(amount);
-            let aterm = Col::new(amount.end() + 6.0, GLANCE_SCOPE_W);
-            plan.aterm = Some(aterm);
-            let tab = Col::new(aterm.end() + 6.0, GLANCE_SCOPE_W);
-            plan.tab = Some(tab);
-            let spare = end - tab.end();
-            if spare >= 130.0 {
-                plan.details = Some(Col::new(tab.end() + 10.0, DETAILS_MAX.min(spare - 10.0)));
-            }
-            spare >= 0.0
+    // Slim, the last kind, stands the bar under each % where no column fits; the block fits
+    // where its strip does.
+    match lay_meter(strip_x, end, &spec) {
+        Some((cols, meter, details)) => {
+            plan.strip = Strip::folded(strip_x, cols, spec.pitch);
+            plan.meter = meter;
+            plan.details = details;
+            (plan, plan.strip.end() <= end)
         }
-        BlockKind::Mid => {
-            plan.pct = Some(Col::new(e + 5.0, 28.0));
-            plan.bar = Some(Col::new(e + 39.0, 28.0));
-            let amount = Col::new(e + 73.0, (end - (e + 73.0)).min(160.0));
-            plan.amount = Some(amount);
-            amount.w >= 100.0
-        }
-        BlockKind::Narrow => {
-            plan.pct = Some(Col::new(e + 4.0, 26.0));
-            let mut amount_x = e + 35.0;
-            if end - (amount_x + 29.0) >= SLIM_AMOUNT_MIN {
-                plan.bar = Some(Col::new(amount_x, 24.0));
-                amount_x += 29.0;
-            }
-            let amount = Col::new(amount_x, (end - amount_x).min(140.0));
-            plan.amount = Some(amount);
-            amount.w >= SLIM_AMOUNT_MIN
-        }
-        BlockKind::Slim => {
-            let pct = Col::new(e + 3.0, 26.0);
-            plan.pct = Some(pct);
-            pct.end() <= end
-        }
-    };
-    (plan, fits)
+        None => (plan, false),
+    }
 }
 
 /// Minimum widths at which each full and folded kind fits on a face.
@@ -848,8 +1099,8 @@ pub(crate) fn breakpoints(m: &FaceMetrics) -> Breakpoints {
             .find(|&w| fits(w))
             .unwrap_or(f64::INFINITY)
     };
-    let full = FullKind::ALL.map(|kind| first(&|w| lay_full(w, kind, m).1));
-    let block = BlockKind::ALL.map(|kind| first(&|b| lay_block(X0, b, kind, m).1));
+    let full = FullKind::ALL.map(|kind| first(&|w| lay_full(w, kind, m, true).1));
+    let block = BlockKind::ALL.map(|kind| first(&|b| lay_block(X0, b, kind, m, true).1));
     let folded = block.map(|b| 2.0 * b + 2.0 * X0 + BLOCK_GUTTER + FOLD_GAUGE_W);
     Breakpoints {
         full,
@@ -981,12 +1232,14 @@ pub(crate) enum Label {
     Time,
     /// Right-aligned `"now"` over a percentage column.
     Now,
-    /// Scope swatch and label for `Bar`.
+    /// A scope's name after its swatch, in the legend over the bars or in the key to the bars
+    /// under the % figures; the machine's may carry its totals (`this Mac · 18c · 128G · 2T`).
     Scope(Bar),
     /// Details column header.
     Details,
-    /// Worst state summary in an `fslim` block header.
-    State,
+    /// The worst state no row of block `0` (Full's table, or Folded's block A) or `1` (block B)
+    /// says: over its names, or at its strip's left where they leave it no room.
+    State(u8),
 }
 
 /// Positioned label on the header line.
@@ -1003,18 +1256,17 @@ pub(crate) struct HeaderLabel {
 pub(crate) struct HeaderText<'a> {
     /// Active tab label (`"Tab 2"`).
     pub(crate) tab: &'a str,
-    /// The machine's noun (`"this Mac"` or `"this computer"`): the Global label where the deck
-    /// says the glance (Full wide and mid, and Folded), and nothing elsewhere.
+    /// The machine's noun (`"this Mac"` or `"this computer"`): the legend's word for the bar's
+    /// grey.
     pub(crate) machine: &'a str,
-    /// Progressive machine identity + hardware capacity forms (`"this Mac · M5 Max · 18c · 128 GiB
-    /// · 2.00 TB"` down to `"this Mac · 18c · 128 GiB"`), longest first; empty falls back to
-    /// [`Self::machine`].
-    pub(crate) machine_forms: &'a [String],
     /// Whether a strip on screen draws an over mark. Where the deck says the glance (Full wide
     /// and mid, and Folded) the header keys "over max" only then, and keys nothing else (the
     /// refined deck, 2026-10-24: a legend learned once need not stay); Full narrow and slim key
     /// all three marks by rule K.
     pub(crate) over: bool,
+    /// The machine's totals, longest first (`18 cores · 128 GiB · 2 TB`, `18c · 128G · 2T`): the
+    /// legend says them after the machine's noun where no row's run says its maximum.
+    pub(crate) totals: &'a [String],
 }
 
 /// Worst-state strings for an `fslim` block header.
@@ -1168,28 +1420,29 @@ pub(crate) fn place_key(mut spans: Vec<KeySpan>, items: &[KeyItem], m: &FaceMetr
     KeyPlan { spans, placed }
 }
 
-/// One tick of the time scale over the strip that carries the time label: the strip's right
-/// end is now, and a tick `age_s` back sits `age_s / period_s` pitches left of it.
+/// One tick of the time scale over the strip that carries the time label: the strip's left end
+/// is now, and a tick `age_s` back sits where the strip's multi-scale axis puts that age
+/// ([`Strip::x_at_age_ms`]), further right the further back.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RulerTick {
     /// How long ago the tick is, seconds.
     pub(crate) age_s: u32,
     /// The tick's x, pt.
     pub(crate) x: f64,
-    /// Its words' left edge, pt: centred on the tick, or pushed along until clear of the time
-    /// label and the now marker, never so far that the tick leaves their middle half
+    /// Its words' left edge, pt: centred on the tick, or pushed along until clear of the now
+    /// marker and the time label, never so far that the tick leaves their middle half
     /// ([`TICK_SLACK`]).
     pub(crate) left: f64,
-    /// Its words, `–5 min`, `–30 s`.
+    /// Its words, `–15m`, `–10s` ([`tick_words`]).
     pub(crate) text: String,
 }
 
-/// The words of a tick `age_s` back (`–15m`, `–5m`, `–1m`, `–10s`).
+/// The words of a tick `age_s` back (`–1h`, `–10m`, `–1m`, `–10s`).
 pub(crate) fn tick_words(age_s: u32) -> String {
     format!("\u{2013}{}", compact_age_words(age_s))
 }
 
-/// Compact horizon age (`1h`, `15m`, `5m`, `1m`, `10s`) for X-axis ticks and labels.
+/// Compact horizon age (`6h`, `1h`, `10m`, `1m`, `10s`) for X-axis ticks and labels.
 fn compact_age_words(age_s: u32) -> String {
     if age_s >= 3_600 && age_s.is_multiple_of(3_600) {
         format!("{}h", age_s / 3_600)
@@ -1201,27 +1454,24 @@ fn compact_age_words(age_s: u32) -> String {
 }
 
 /// The time label over (or beside) `strip`, long then short: how far back its multi-scale
-/// horizon reaches (`1h ago` / `–1h`, `15m ago` / `–15m`, `5m ago` / `–5m`, `1m ago` / `–1m`).
+/// horizon reaches (`6h ago` / `–6h`, `4h ago` / `–4h`, `6m ago` / `–6m`, `1m ago` / `–1m`).
 pub(crate) fn time_words(strip: Strip) -> [String; 2] {
     let span = compact_age_words(strip.span_s());
     [format!("{span} ago"), format!("\u{2013}{span}")]
 }
 
-/// Interior horizon ages `strip`'s multi-scale X-axis marks, most wanted first.
+/// Interior horizon ages `strip`'s multi-scale X-axis marks, most wanted first: the coarsest
+/// (they say how the scale compresses), then finer; each is where a block size starts.
 pub(crate) fn tick_ages(strip: Strip) -> Vec<u32> {
     let horizon_s = strip.span_s();
-    let mut ages: Vec<u32> = strip
+    strip
         .spec
         .ticks
         .iter()
+        .rev()
         .filter_map(|&(age_ms, _)| u32::try_from(age_ms / 1_000).ok())
         .filter(|&age_s| age_s > 0 && age_s < horizon_s)
-        .collect();
-    if horizon_s <= 60 && !ages.contains(&20) {
-        ages.insert(0, 20);
-    }
-    let _ = (TICK_AGES, TICK_AGES_SHORT);
-    ages
+        .collect()
 }
 
 /// Where a tick `age_s` back on `strip` goes when its words, `w` wide, must stay inside
@@ -1237,10 +1487,10 @@ fn tick_slot(strip: Strip, age_s: u32, w: f64, (lo, hi): (f64, f64)) -> Option<(
 /// Where the time label stands on the header line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TimeAt {
-    /// Over the strip's left end, the scale's ticks after it.
+    /// Over the strip's right (old) end, right-aligned to it, the scale's ticks before it.
     Over,
-    /// Beside the strip, ending [`STRIP_LEAD`] short of its left end (where a tick marks
-    /// it), in the free span over the names: the strip's whole header is then the scale's.
+    /// Beside the strip, starting [`STRIP_LEAD`] past its right end (where a tick marks it), in
+    /// a free span the scope key leaves there: the strip's whole header is then the scale's.
     Beside,
 }
 
@@ -1250,8 +1500,8 @@ struct TimeRoom {
     x: f64,
     /// The key's spans with the label's own place taken out of them.
     spans: Vec<KeySpan>,
-    /// Where the strip's own free header starts, pt.
-    from: f64,
+    /// The strip's own free header, pt: from past the now marker to short of the label.
+    key: (f64, f64),
     /// The room it leaves the ticks' words, pt.
     ticks: (f64, f64),
 }
@@ -1262,7 +1512,7 @@ struct TimeScale {
     /// The label's left edge, pt.
     x: f64,
     ticks: Vec<RulerTick>,
-    /// The tick at the strip's left end when the label stands beside it.
+    /// The tick at the strip's right end when the label stands beside it.
     end_tick: Option<f64>,
     /// The key's spans with what the label and the ticks leave of them.
     spans: Vec<KeySpan>,
@@ -1275,11 +1525,15 @@ pub(crate) struct HeaderPlan {
     pub(crate) key: KeyPlan,
     /// The time scale over the strip that carries the time label, left to right.
     pub(crate) ruler: Vec<RulerTick>,
-    /// The tick at that strip's left end, pt, when the time label stands beside the strip
-    /// rather than over it.
+    /// The tick at that strip's right end (its horizon), pt, when the time label stands beside
+    /// the strip rather than over it.
     pub(crate) time_tick: Option<f64>,
     /// The key's items this header may place (rule K searches only these).
     pub(crate) keys: &'static [KeyItem],
+    /// The left end (pt) of the strip whose now marker draws no dot: a Folded slim block's
+    /// state words too long for the room before the marker take that strip's header too, and
+    /// its line alone marks now ([`header_folded`]).
+    pub(crate) dotless: Option<f64>,
 }
 
 struct Header<'m> {
@@ -1288,8 +1542,36 @@ struct Header<'m> {
     spans: Vec<KeySpan>,
     /// The strip whose header carries the time label and the scale.
     time: Option<Strip>,
+    /// Where the time strip's header is free from, pt: past the now marker's room, or past a
+    /// state standing at the strip's left ([`Self::state`]).
+    lead: f64,
     /// The key's items this header may place.
     keys: &'static [KeyItem],
+    /// [`HeaderPlan::dotless`].
+    dotless: Option<f64>,
+    /// The scope key's Global and Tab words where the bars stand under the % figures, placed
+    /// last ([`Self::place_under_key`]).
+    under_key: Option<(String, String)>,
+    /// A legend over the time strip's header from its x, in the forms that fit there, longest
+    /// first, and the scope key's words that stand for it where each would cost the scale its
+    /// last tick ([`Self::finish`]).
+    strip_legend: Option<(f64, Vec<LegendForm>, (String, String))>,
+}
+
+/// One form of the legend: the machine's words, the tab's, and the width the three take.
+type LegendForm = (String, String, f64);
+
+/// Where a block's worst state stood ([`Header::state`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StateAt {
+    /// No state: `now` stands over the %, and the names' header is free up to the returned x.
+    Free(f64),
+    /// Over the names, beside `now`.
+    Names,
+    /// At the strip's left; its header is free from the returned x.
+    Lead(f64),
+    /// Over the names and the % column, `now` yielding to it.
+    Yielded,
 }
 
 impl<'m> Header<'m> {
@@ -1299,7 +1581,11 @@ impl<'m> Header<'m> {
             labels: Vec::new(),
             spans: Vec::new(),
             time: None,
+            lead: 0.0,
             keys: &KeyItem::SEARCH,
+            dotless: None,
+            under_key: None,
+            strip_legend: None,
         }
     }
 
@@ -1323,62 +1609,210 @@ impl<'m> Header<'m> {
         self.time = Some(strip);
     }
 
+    /// `"now"` over the % column before `strip`, right-aligned just left of the now marker's
+    /// widest beat ([`WORDS_TO_STRIP`]); answers where words before it end ([`STRIP_LEAD`] short
+    /// of it).
+    fn now(&mut self, strip: Strip) -> f64 {
+        let end = strip.x - WORDS_TO_STRIP;
+        self.label(Label::Now, end, "now");
+        end - self.words("now") - STRIP_LEAD
+    }
+
+    /// A block's `now` and its worst `state` (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §4):
+    /// with no state, `now` over the % and the names' header free; else the state over the names
+    /// beside `now` where it fits whole, else at its strip's left, past the now marker's room,
+    /// where it leaves the strip's header `keep` pt before `limit` (the time label, or the
+    /// legend's least), so `now` stays; else, as an fslim block's, over the names and the %
+    /// column, `now` yielding to it, up to the marker's beat.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one block's names, % and strip, and what its header keeps"
+    )]
+    fn state(
+        &mut self,
+        block: u8,
+        name_x: f64,
+        pct: bool,
+        strip: Strip,
+        state: Option<StateLabel<'_>>,
+        keep: f64,
+        limit: f64,
+    ) -> StateAt {
+        let words_end = strip.x - WORDS_TO_STRIP;
+        let now_w = if pct {
+            self.words("now") + STRIP_LEAD
+        } else {
+            0.0
+        };
+        let Some(st) = state else {
+            let end = if pct { self.now(strip) } else { words_end };
+            return StateAt::Free(end);
+        };
+        let forms = [st.full, st.bare];
+        let w = |f: &str| MARK_ADVANCE + self.m.width(f, HEADER_PT, true);
+        if let Some(f) = forms
+            .into_iter()
+            .find(|f| w(f) <= words_end - now_w - name_x + 0.01)
+        {
+            if pct {
+                self.now(strip);
+            }
+            self.label(Label::State(block), name_x, f);
+            return StateAt::Names;
+        }
+        let lo = strip.x + MARKER_ROOM;
+        if let Some(f) = forms
+            .into_iter()
+            .find(|f| lo + w(f) + TICK_GAP + keep <= limit + 0.01)
+        {
+            if pct {
+                self.now(strip);
+            }
+            self.label(Label::State(block), lo, f);
+            return StateAt::Lead(lo + w(f) + TICK_GAP);
+        }
+        let room = words_end - name_x - MARK_ADVANCE;
+        let words = self.m.fit(&forms, room, HEADER_PT, true);
+        self.label(Label::State(block), name_x, words);
+        StateAt::Yielded
+    }
+
     fn scope(&mut self, bar: Bar, x: f64, words: String) -> f64 {
         let w = SWATCH_ADVANCE + self.words(&words);
         self.label(Label::Scope(bar), x, words);
         w
     }
 
-    fn scope_keys(
+    /// The legend over the bars (`■ this Mac ■ aterm ■ Tab 1`), once, in `lo..hi`, from `lo` or,
+    /// with `right`, ending at `hi` (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §4): each
+    /// scope's swatch in the bar's ink and its name, [`LEGEND_GAP`] apart. With `tail`, the
+    /// machine's name first carries its totals (`this Mac · 18c · 128G · 2T`), the longest form
+    /// that fits. Where it does not fit, the totals go first, then the machine's noun gives way to
+    /// its last word (`Mac`), then the tab's title to `Tab`; a title past [`TAB_HEAD_MAX`] is
+    /// `Tab` from the first. Where even that does not fit, nothing is laid (`None`). Answers where
+    /// it starts and ends.
+    fn legend(
         &mut self,
-        mut x: f64,
-        limit: f64,
-        global: &str,
-        machine_forms: &[String],
-        tab: &str,
-    ) -> f64 {
-        let rest_need = 8.0
-            + SWATCH_ADVANCE
-            + self.words("aterm")
-            + 8.0
-            + SWATCH_ADVANCE
-            + self.words(tab).min(48.0);
-        let global_choice = machine_forms
+        (lo, hi): (f64, f64),
+        text: &HeaderText<'_>,
+        tail: bool,
+        right: bool,
+    ) -> Option<(f64, f64)> {
+        let (global, tab, w) = self
+            .legend_forms(text, tail)
+            .into_iter()
+            .find(|form| form.2 <= hi - lo + 1e-9)?;
+        let x = if right { hi - w } else { lo };
+        Some((x, self.legend_at(x, &global, &tab)))
+    }
+
+    /// The legend's forms, longest first: with the machine's totals where `tail`, then the
+    /// machine's name and the tab's title (`Tab` past [`TAB_HEAD_MAX`]), the machine's last
+    /// word, then `Tab`.
+    fn legend_forms(&self, text: &HeaderText<'_>, tail: bool) -> Vec<LegendForm> {
+        let machine = text.machine;
+        let noun = machine.rsplit(' ').next().unwrap_or(machine);
+        let tab = if self.words(text.tab) > TAB_HEAD_MAX {
+            "Tab"
+        } else {
+            text.tab
+        };
+        let totals = text
+            .totals
             .iter()
-            .find(|f| self.words(f) <= limit - x - SWATCH_ADVANCE - rest_need)
-            .map_or(global, String::as_str);
+            .filter(|_| tail)
+            .map(|t| (format!("{machine} \u{b7} {t}"), tab));
+        let plain = [(machine, tab), (noun, tab), (noun, "Tab")].map(|(g, t)| (g.to_owned(), t));
+        totals
+            .chain(plain)
+            .map(|(global, tab)| {
+                let need = 3.0 * SWATCH_ADVANCE
+                    + self.words(&global)
+                    + self.words("aterm")
+                    + self.words(tab)
+                    + 2.0 * LEGEND_GAP;
+                (global, tab.to_owned(), need)
+            })
+            .collect()
+    }
+
+    /// Lays the legend's three names from `x`, each after its swatch; where it ends.
+    fn legend_at(&mut self, x: f64, global: &str, tab: &str) -> f64 {
+        let mut at = x;
         for (bar, words) in [
-            (Bar::Global, global_choice),
+            (Bar::Global, global),
             (Bar::Aterm, "aterm"),
             (Bar::Tab, tab),
         ] {
-            let room = limit - x - SWATCH_ADVANCE;
-            let words = if bar == Bar::Tab {
-                self.m.fit(&[words], room, HEADER_PT, false)
-            } else if self.words(words) <= room {
-                words.to_owned()
-            } else {
-                break;
-            };
-            if words.is_empty() {
-                break;
-            }
-            x += self.scope(bar, x, words) + 8.0;
+            at += self.scope(bar, at, words.to_owned()) + LEGEND_GAP;
         }
-        x
+        at - LEGEND_GAP
     }
 
-    /// `base` (the key's spans) with the time strip's own: what lies from `from` to the strip's
-    /// end that `ticks` leave, short of the now marker.
-    fn spans_with(
-        &self,
-        base: &[KeySpan],
-        strip: Strip,
-        from: f64,
-        ticks: &[RulerTick],
-    ) -> Vec<KeySpan> {
+    /// The scope key (`this Mac ■ aterm ■ Tab`) where the bars stand under the % figures
+    /// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5) or no legend stands over them, once
+    /// the scale and rule K's items have their places: in the leftmost room they leave over no
+    /// strip that holds its three names (the machine's noun giving way to its last word, `Mac`),
+    /// the Tab's cut to fit as over a bar column but given up to 48 pt. Where none does, the key
+    /// is dropped, before the scale, and How to read still names the inks.
+    fn place_under_key(&mut self, key: &KeyPlan, global: &str, tab: &str) {
+        let noun = global.rsplit(' ').next().unwrap_or(global);
+        let need = |global: &str| {
+            3.0 * SWATCH_ADVANCE
+                + self.words(global)
+                + 8.0
+                + self.words("aterm")
+                + 8.0
+                + self.words(tab).min(TAB_HEAD_MAX)
+        };
+        let rooms: Vec<(f64, f64)> = key
+            .spans
+            .iter()
+            .filter(|span| !span.strip)
+            .map(|span| {
+                let x0 = key
+                    .placed
+                    .iter()
+                    .filter(|&&(_, x)| span.x0 <= x + 1e-9 && x < span.x1)
+                    .map(|&(item, x)| x + item.width(self.m) + KEY_GAP)
+                    .fold(span.x0, f64::max);
+                (x0, span.x1)
+            })
+            .collect();
+        let found = [global, noun].into_iter().find_map(|global| {
+            rooms
+                .iter()
+                .copied()
+                .filter(|&(x0, x1)| x1 - x0 >= need(global) - 1e-9)
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|room| (global, room))
+        });
+        if let Some((global, (x0, x1))) = found {
+            let mut x = x0;
+            for (bar, words) in [
+                (Bar::Global, global),
+                (Bar::Aterm, "aterm"),
+                (Bar::Tab, tab),
+            ] {
+                let words = if bar == Bar::Tab {
+                    self.m
+                        .fit(&[words], x1 - x - SWATCH_ADVANCE, HEADER_PT, false)
+                } else {
+                    words.to_owned()
+                };
+                if words.is_empty() {
+                    break;
+                }
+                x += self.scope(bar, x, words) + 8.0;
+            }
+        }
+    }
+
+    /// `base` (the key's spans) with the time strip's own: what lies in `room` (from past the
+    /// now marker to short of the time label) that `ticks` leave.
+    fn spans_with(&self, base: &[KeySpan], room: (f64, f64), ticks: &[RulerTick]) -> Vec<KeySpan> {
         let mut spans = base.to_vec();
-        let mut x0 = from;
+        let mut x0 = room.0;
         let mut by_x: Vec<&RulerTick> = ticks.iter().collect();
         by_x.sort_by(|a, b| a.left.total_cmp(&b.left));
         for tick in by_x {
@@ -1391,7 +1825,7 @@ impl<'m> Header<'m> {
         }
         spans.push(KeySpan {
             x0,
-            x1: strip.end() - MARKER_ROOM,
+            x1: room.1,
             strip: true,
         });
         spans.retain(|s| s.x1 > s.x0);
@@ -1415,34 +1849,35 @@ impl<'m> Header<'m> {
             .collect()
     }
 
-    /// Where a time label `w` wide can stand `at` `strip`, or `None` when no free span over
-    /// the names ends at the strip's lead to hold it beside the strip.
+    /// Where a time label `w` wide can stand `at` `strip`, or `None` when no free span the
+    /// scope key leaves right of the strip starts at its lead to hold it beside the strip.
     fn time_room(&self, strip: Strip, w: f64, at: TimeAt) -> Option<TimeRoom> {
-        let hi = strip.end() - MARKER_ROOM;
+        let lo = (strip.x + MARKER_ROOM).max(self.lead);
         match at {
-            TimeAt::Over => Some(TimeRoom {
-                x: strip.x,
-                spans: self.spans.clone(),
-                from: strip.x + w + KEY_GAP,
-                ticks: (strip.x + w + TICK_GAP, hi),
-            }),
+            TimeAt::Over => {
+                let x = strip.end() - w;
+                Some(TimeRoom {
+                    x,
+                    spans: self.spans.clone(),
+                    key: (lo, x - KEY_GAP),
+                    ticks: (lo, x - TICK_GAP),
+                })
+            }
             TimeAt::Beside => {
-                let end = strip.x - STRIP_LEAD;
-                let x = end - w;
-                let at = self
-                    .spans
-                    .iter()
-                    .position(|s| !s.strip && (s.x1 - end).abs() < 1e-9 && s.x0 <= x)?;
+                let x = strip.end() + STRIP_LEAD;
+                let at = self.spans.iter().position(|s| {
+                    !s.strip && s.x0 >= strip.end() - 1e-9 && s.x0 <= x + 1e-9 && s.x1 >= x + w
+                })?;
                 let mut spans = self.spans.clone();
                 if let Some(span) = spans.get_mut(at) {
-                    span.x1 = x - KEY_GAP;
+                    span.x0 = x + w + KEY_GAP;
                 }
                 spans.retain(|s| s.x1 > s.x0);
                 Some(TimeRoom {
                     x,
                     spans,
-                    from: end + KEY_GAP,
-                    ticks: (end + TICK_GAP, hi),
+                    key: (lo, x - KEY_GAP),
+                    ticks: (lo, x - TICK_GAP),
                 })
             }
         }
@@ -1463,23 +1898,35 @@ impl<'m> Header<'m> {
         (items, ramp_over_strip)
     }
 
-    /// The time label and its scale. The label stands over the strip's left end in its long
-    /// form, else its short one, when that leaves a tick room; else beside the strip, long then
-    /// short; else long and alone over the strip. The scale is weighed against the key the long
-    /// label alone leaves (v2's own header, rule K): it takes ticks in order of want while the
+    /// The time label and its scale. The label stands over the strip's right (old) end,
+    /// right-aligned to it, in its long form, else its short one, when that leaves a tick room;
+    /// else beside the strip, past that end, long then short; else long and alone over the
+    /// strip. The scale is weighed against the key the long label alone leaves (v2's own
+    /// header, rule K): it takes ticks in order of want while the
     /// key keeps every item it places and the heat ramp over a strip; failing that, every item;
     /// failing that, every item but its least, "not read", since in rule K's order the scale
-    /// ranks after the ramp and before "not read". The test is the items themselves, not their
-    /// summed weights, which can hold while one item is traded for another. It never costs
-    /// "over max" or the ramp a place; where every placement would, the label stands alone.
+    /// ranks after the ramp and before "not read"; failing that, "over max" alone: where a narrow
+    /// deck's strip header holds the ramp or a tick but not both, the scale reads the time series
+    /// the row is built around (the owner, 2026-10-26) and the ramp gives way. The test is the
+    /// items themselves, not their summed weights, which can hold while one item is traded for
+    /// another. It never costs "over max" a place; where every placement would, the label stands
+    /// alone.
     fn ruler(&self, strip: Strip) -> TimeScale {
         let [long, short] = time_words(strip);
-        let alone = strip.x + self.words(&long) + KEY_GAP;
-        let (items, ramp) = self.key_keeps(self.spans_with(&self.spans, strip, alone, &[]));
+        let alone_x = strip.end() - self.words(&long);
+        let alone = ((strip.x + MARKER_ROOM).max(self.lead), alone_x - KEY_GAP);
+        let (items, ramp) = self.key_keeps(self.spans_with(&self.spans, alone, &[]));
         let but_not_read: Vec<KeyItem> = items
             .iter()
             .copied()
             .filter(|&item| item != KeyItem::NotRead)
+            .collect();
+        // Where the strip's header holds no tick beside them, the ramp's and not read's keys give
+        // way to the scale; the over mark's never does.
+        let over_only: Vec<KeyItem> = items
+            .iter()
+            .copied()
+            .filter(|&item| item == KeyItem::Over)
             .collect();
         let placements = [
             (&long, TimeAt::Over),
@@ -1491,6 +1938,7 @@ impl<'m> Header<'m> {
             (items.as_slice(), ramp),
             (items.as_slice(), false),
             (but_not_read.as_slice(), false),
+            (over_only.as_slice(), false),
         ];
         let clear = |chosen: &[RulerTick], t: &RulerTick| {
             let w = self.words(&t.text);
@@ -1504,7 +1952,7 @@ impl<'m> Header<'m> {
                 let Some(TimeRoom {
                     x,
                     spans: base,
-                    from,
+                    key,
                     ticks: room,
                 }) = self.time_room(strip, self.words(label), at)
                 else {
@@ -1514,7 +1962,7 @@ impl<'m> Header<'m> {
                 for t in self.tick_room(strip, room) {
                     let mut trial = chosen.clone();
                     trial.push(t.clone());
-                    let (kept, r) = self.key_keeps(self.spans_with(&base, strip, from, &trial));
+                    let (kept, r) = self.key_keeps(self.spans_with(&base, key, &trial));
                     if clear(&chosen, &t) && must.iter().all(|i| kept.contains(i)) && (r || !ramp) {
                         chosen = trial;
                     }
@@ -1526,51 +1974,91 @@ impl<'m> Header<'m> {
                 return TimeScale {
                     label: label.clone(),
                     x,
-                    spans: self.spans_with(&base, strip, from, &chosen),
+                    spans: self.spans_with(&base, key, &chosen),
                     ticks: chosen,
-                    end_tick: (at == TimeAt::Beside).then_some(strip.x),
+                    end_tick: (at == TimeAt::Beside).then_some(strip.end()),
                 };
             }
         }
         TimeScale {
             label: long,
-            x: strip.x,
-            spans: self.spans_with(&self.spans, strip, alone, &[]),
+            x: alone_x,
+            spans: self.spans_with(&self.spans, alone, &[]),
             ticks: Vec::new(),
             end_tick: None,
         }
     }
 
+    /// The header's plan: the time label and its scale over the time strip, a legend over that
+    /// strip's header where one waits and a form of it leaves the scale a tick (else the scope
+    /// key the legend stands for), the key's items, and the scope key where it waits.
     fn finish(mut self) -> HeaderPlan {
         let (mut ruler, mut time_tick) = (Vec::new(), None);
         if let Some(strip) = self.time {
-            let scale = self.ruler(strip);
+            let mut scale = self.ruler(strip);
+            if let Some((x, forms, key)) = self.strip_legend.take() {
+                let lead = self.lead;
+                let fit = forms.into_iter().find_map(|(global, tab, w)| {
+                    self.lead = lead.max(x + w + KEY_GAP);
+                    let scale = self.ruler(strip);
+                    (!scale.ticks.is_empty()).then_some((global, tab, scale))
+                });
+                match fit {
+                    Some((global, tab, with)) => {
+                        self.legend_at(x, &global, &tab);
+                        scale = with;
+                    }
+                    None => {
+                        self.lead = lead;
+                        self.under_key = Some(key);
+                    }
+                }
+            }
             self.spans = scale.spans;
             self.label(Label::Time, scale.x, scale.label);
             ruler = scale.ticks;
             time_tick = scale.end_tick;
         }
+        let key = place_key(std::mem::take(&mut self.spans), self.keys, self.m);
+        if let Some((global, tab)) = self.under_key.take() {
+            self.place_under_key(&key, &global, &tab);
+        }
         HeaderPlan {
-            key: place_key(self.spans, self.keys, self.m),
+            key,
             labels: self.labels,
             ruler,
             time_tick,
             keys: self.keys,
+            dotless: self.dotless,
         }
     }
 }
 
-fn fit_machine(text: &HeaderText<'_>, room: f64, m: &FaceMetrics) -> String {
-    for form in text.machine_forms {
-        if m.width(form, HEADER_PT, false) <= room {
-            return form.clone();
-        }
-    }
-    m.fit(&[text.machine], room, HEADER_PT, false)
+/// The header line of `strip` alone with the key's free `spans` beside it, keying the over mark
+/// (the tests' way to a time placement no deck width needs on the faces the deck draws).
+#[cfg(test)]
+pub(crate) fn header_of_strip(strip: Strip, spans: &[KeySpan], m: &FaceMetrics) -> HeaderPlan {
+    let mut head = Header::new(m);
+    head.keys = &[KeyItem::Over];
+    head.spans = spans.to_vec();
+    head.time(strip);
+    head.finish()
 }
 
-/// Lays out the header line and key for a `Full` deck plan.
-pub(crate) fn header_full(plan: &FullPlan, text: HeaderText<'_>, m: &FaceMetrics) -> HeaderPlan {
+/// Lays out the header line and key for a `Full` deck plan. `state` is the worst of the states
+/// no row says (in its Details, or in its run's cell after the reading, which the painter
+/// measures); where no Details stands, it stands over the names beside `now`, else at the
+/// strip's left before the scale, else over the names and the % column, `now` yielding to it
+/// ([`Header::state`]). The legend keys the bars once, over the bar's column from its left edge
+/// ([`Header::legend`]), or where the bars stand under each % over the strip's header at its
+/// left, before the scale; with the machine's totals where no run says the rows' maxima. Where it
+/// does not fit there the scope key takes what room the scale and rule K's items leave, or none.
+pub(crate) fn header_full(
+    plan: &FullPlan,
+    text: HeaderText<'_>,
+    state: Option<StateLabel<'_>>,
+    m: &FaceMetrics,
+) -> HeaderPlan {
     if plan.ground_only {
         return HeaderPlan::default();
     }
@@ -1583,54 +2071,58 @@ pub(crate) fn header_full(plan: &FullPlan, text: HeaderText<'_>, m: &FaceMetrics
     if long {
         head.keys = if text.over { &[KeyItem::Over] } else { &[] };
     }
-    if let Some(pct) = plan.pct {
-        head.label(Label::Now, pct.end(), "now");
-    }
-    if let CoresAt::Row(_) = plan.cores {
-        head.span(plan.name.x, plan.strip.x - STRIP_LEAD, false);
-    }
-    if plan.kind == FullKind::Slim {
-        if let (Some(bar), Some(amount)) = (plan.bar, plan.amount) {
-            let end = head.scope_keys(bar.x, plan.w - X0, "Global", &[], text.tab);
-            head.span(end + 2.0, amount.end(), false);
-        } else if let Some(bar) = plan.bar {
-            head.scope_keys(bar.x, plan.w - X0, "Global", &[], text.tab);
+    let state = state.filter(|_| plan.details.is_none());
+    // A state at the strip's left leaves the time label room in its long form, which the scale
+    // keeps when no tick fits beside it.
+    let label = head.words(&time_words(plan.strip)[0]);
+    let at = head.state(
+        0,
+        plan.name.x,
+        plan.pct.is_some(),
+        plan.strip,
+        state,
+        label,
+        plan.strip.end(),
+    );
+    match at {
+        StateAt::Free(names_end) => {
+            if let CoresAt::Row(_) = plan.cores {
+                head.span(plan.name.x, names_end, false);
+            }
         }
-        return head.finish();
+        StateAt::Lead(lead) => head.lead = lead,
+        StateAt::Names | StateAt::Yielded => {}
     }
-    if let Some(amount) = plan.amount {
-        let x = plan.bar.map_or(amount.x, |bar| bar.x);
-        let room = amount.end() - x - SWATCH_ADVANCE;
-        let global = if long {
-            fit_machine(&text, room, m)
-        } else {
-            m.fit(&["Global"], room, HEADER_PT, false)
-        };
-        let w = head.scope(Bar::Global, x, global);
-        head.span(x + w + KEY_GAP, amount.end(), false);
-    }
-    if let (Some(aterm), Some(tab)) = (plan.aterm, plan.tab) {
-        let aterm_forms: &[&str] = &["aterm"];
-        let tab_forms: &[&str] = &[text.tab];
-        let tab_gap = plan.details.map_or(X0, |details| details.x - tab.end());
-        for (col, bar, forms, gap) in [
-            (aterm, Bar::Aterm, aterm_forms, tab.x - aterm.end()),
-            (tab, Bar::Tab, tab_forms, tab_gap),
-        ] {
-            let room = col.w + gap - 8.0;
-            let words = forms
-                .iter()
-                .find(|form| SWATCH_ADVANCE + head.words(form) <= room)
-                .map_or_else(
-                    || {
-                        let last = forms.last().copied().unwrap_or_default();
-                        m.fit(&[last], room - SWATCH_ADVANCE, HEADER_PT, false)
-                    },
-                    |form| (*form).to_owned(),
-                );
-            let w = head.scope(bar, col.x, words);
-            head.span(col.x + w + KEY_GAP, col.end(), false);
+    // Over the bars and their runs, to Details or the deck's right margin: the legend, then room
+    // for the over mark's key; narrow and slim key the strip's ramp and not read by rule K too.
+    // Where no legend fits there, the scope key takes what room rule K and the scale leave.
+    let meter_end = plan.details.map_or(plan.w - X0, |d| d.x - KEY_GAP);
+    let tail = plan.meter.run.is_none();
+    let legend = if let Some(bar) = plan.meter.bar {
+        head.legend((bar.x, meter_end), &text, tail, false)
+            .map(|(_, end)| head.span(end + KEY_GAP, meter_end, false))
+    } else if plan.bar_under().is_some() {
+        // The bars stand under each %: the legend over the strip's header at its left, past the
+        // now marker's room (or the state there), in the longest form that leaves the time label
+        // its room at the end and the scale a tick ([`Header::finish`]).
+        let lo = (plan.strip.x + MARKER_ROOM).max(head.lead);
+        let hi = plan.strip.end() - label - KEY_GAP;
+        let forms = head
+            .legend_forms(&text, tail)
+            .into_iter()
+            .filter(|form| lo + form.2 <= hi + 1e-9)
+            .collect();
+        let key = (text.machine.to_owned(), text.tab.to_owned());
+        head.strip_legend = Some((lo, forms, key));
+        Some(())
+    } else {
+        None
+    };
+    if legend.is_none() && (plan.meter.bar.is_some() || plan.bar_under().is_some()) {
+        if let Some(bar) = plan.meter.bar {
+            head.span(bar.x, meter_end, false);
         }
+        head.under_key = Some((text.machine.to_owned(), text.tab.to_owned()));
     }
     if let Some(details) = plan.details {
         if long {
@@ -1654,7 +2146,24 @@ pub(crate) fn header_full(plan: &FullPlan, text: HeaderText<'_>, m: &FaceMetrics
 
 /// Lays out the header line and key for a `Folded` deck plan. Folded says the glance (§6.8) at
 /// every tier, so its header does as Full wide and mid's: "now" over each %, "this Mac" for
-/// Global, no "Details", and a key for the over mark only while a strip draws one.
+/// Global, no "Details", and a key for the over mark only while a strip draws one. `states` are
+/// each block's worst that no row of it says (the painter measures its runs' cells).
+///
+/// Where the blocks lay a bar column (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §4), block A's
+/// strip carries the time label and the scale, and block B's header ends with the legend, once
+/// for both blocks' bars: right-aligned to B's meter, over its bars and as far left over its
+/// strip's old end as it needs, with the machine's totals where no run says the rows' maxima. It
+/// never crosses the blocks' divider. Each block's state stands over its names beside `now`,
+/// else at its strip's left, leaving A's scale its short label and B's legend its least
+/// ([`Header::state`]); else over its names and %, `now` yielding.
+///
+/// Where the bars stand under each % (fslim), an fslim block's state words stand over its names,
+/// and where they need more room they take the % column's too, `now` yielding to them, up to
+/// where `now` ends ([`WORDS_TO_STRIP`]): never past it, where the now marker's dot beats, so both
+/// strips keep their headers and block A's carries the time label. Where even the room before
+/// the marker is too short, one block's words take its strip's header too, its marker's dot
+/// yields ([`HeaderPlan::dotless`]), and the other block's strip carries the time label. The
+/// scope key then takes the leftmost room left over no strip ([`Header::place_under_key`]).
 pub(crate) fn header_folded(
     plan: &FoldedPlan,
     text: HeaderText<'_>,
@@ -1664,87 +2173,143 @@ pub(crate) fn header_folded(
     if plan.ground_only {
         return HeaderPlan::default();
     }
+    let [a, b] = plan.blocks;
     let mut head = Header::new(m);
     head.keys = if text.over { &[KeyItem::Over] } else { &[] };
-    let mut free_strips: [Option<Strip>; 2] = [None; 2];
-    let mut a_spilled = false;
-    for (i, (block, state)) in plan.blocks.iter().zip(states).enumerate() {
-        if let Some(pct) = block.pct {
-            head.label(Label::Now, pct.end(), "now");
-        }
-        let name_room = block.strip.x - STRIP_LEAD - block.name.x;
-        let mut strip_free = true;
-        match state.filter(|_| block.amount.is_none()) {
-            None => head.span(block.name.x, block.strip.x - STRIP_LEAD, false),
-            Some(state) => {
-                let forms = [state.full, state.bare];
-                let words = if MARK_ADVANCE + m.width(state.full, HEADER_PT, true) <= name_room {
-                    state.full.to_owned()
-                } else if !a_spilled {
-                    strip_free = false;
-                    a_spilled = i == 0;
-                    m.fit(
-                        &forms,
-                        block.strip.end() - MARKER_ROOM - block.name.x - MARK_ADVANCE,
-                        HEADER_PT,
-                        true,
-                    )
-                } else {
-                    m.fit(&forms, name_room - MARK_ADVANCE, HEADER_PT, true)
-                };
-                head.label(Label::State, block.name.x, words);
+    let (Some(_), Some(b_end)) = (a.meter.bar, b.meter.end()) else {
+        return header_folded_under(head, plan, text, states);
+    };
+    let legend_hi = b_end.min(b.at.end());
+    let label = head.words(&time_words(a.strip)[0]);
+    let keep = [
+        (label, a.strip.end()),
+        (legend_least(m) + KEY_GAP - TICK_GAP, legend_hi),
+    ];
+    let mut b_lead = b.strip.x + MARKER_ROOM;
+    for (i, ((block, state), (keep, limit))) in plan.blocks.iter().zip(states).zip(keep).enumerate()
+    {
+        let at = head.state(
+            u8::try_from(i).unwrap_or(1),
+            block.name.x,
+            block.pct.is_some(),
+            block.strip,
+            state,
+            keep,
+            limit,
+        );
+        let lead = match at {
+            StateAt::Free(names_end) => {
+                head.span(block.name.x, names_end, false);
+                None
             }
-        }
-        if strip_free && let Some(free) = free_strips.get_mut(i) {
-            *free = Some(block.strip);
-        }
-        if let (Some(amount), Some(aterm), Some(tab)) = (block.amount, block.aterm, block.tab) {
-            let gx = block.bar.map_or(amount.x, |bar| bar.x);
-            let groom = amount.end() - gx - SWATCH_ADVANCE;
-            let gwords = if i == 0 {
-                fit_machine(&text, groom, m)
-            } else {
-                m.fit(&[text.machine], groom, HEADER_PT, false)
-            };
-            let gw = head.scope(Bar::Global, gx, gwords);
-            head.span(gx + gw + KEY_GAP, amount.end(), false);
-            for (col, bar, words) in [(aterm, Bar::Aterm, "aterm"), (tab, Bar::Tab, text.tab)] {
-                let words = m.fit(&[words], col.w - SWATCH_ADVANCE, HEADER_PT, false);
-                let w = head.scope(bar, col.x, words);
-                head.span(col.x + w + KEY_GAP, col.end(), false);
-            }
-        } else if let (Some(bar), Some(amount)) = (block.bar, block.amount) {
-            // The bar's key once, over block A: block B's bar is the same three scopes on the
-            // same line, and a legend learned once need not be said twice.
-            if i == 0 {
-                let end = head.scope_keys(
-                    bar.x,
-                    block.at.end(),
-                    text.machine,
-                    text.machine_forms,
-                    text.tab,
-                );
-                head.span(end + 2.0, amount.end(), false);
-            } else {
-                head.span(bar.x, amount.end(), false);
-            }
-        } else if let Some(amount) = block.amount {
-            head.span(amount.x, amount.end(), false);
+            StateAt::Lead(lead) => Some(lead),
+            StateAt::Names | StateAt::Yielded => None,
+        };
+        match (i, lead) {
+            (0, Some(lead)) => head.lead = lead,
+            (_, Some(lead)) => b_lead = lead + KEY_GAP - TICK_GAP,
+            _ => {}
         }
         if let Some(details) = block.details {
             head.span(details.x, details.end(), false);
         }
     }
-    match free_strips {
-        [Some(a), b] => {
-            head.time(a);
-            if let Some(b) = b {
-                head.span(b.x, b.end() - MARKER_ROOM, true);
+    // Block A's meter keeps its header free; block B's ends with the legend.
+    if let (Some(bar), Some(end)) = (a.meter.bar, a.meter.end()) {
+        head.span(bar.x, end.min(a.at.end()), false);
+    }
+    let tail = a.meter.run.is_none();
+    match head.legend((b_lead, legend_hi), &text, tail, true) {
+        Some((x0, _)) => head.span(b_lead, x0 - KEY_GAP, true),
+        None => {
+            head.span(b_lead, legend_hi, true);
+            head.under_key = Some((text.machine.to_owned(), text.tab.to_owned()));
+        }
+    }
+    head.time(a.strip);
+    head.finish()
+}
+
+/// [`header_folded`] where the bars stand under each %: the fslim header.
+fn header_folded_under(
+    mut head: Header<'_>,
+    plan: &FoldedPlan,
+    text: HeaderText<'_>,
+    states: [Option<StateLabel<'_>>; 2],
+) -> HeaderPlan {
+    let m = head.m;
+    let mut spilled = None;
+    for (i, (block, state)) in plan.blocks.iter().zip(states).enumerate() {
+        // Where words left of the now marker end, clear of its beat.
+        let words_end = block.strip.x - WORDS_TO_STRIP;
+        let names_end = if block.pct.is_some() {
+            words_end - head.words("now") - STRIP_LEAD
+        } else {
+            words_end
+        };
+        let block_ix = u8::try_from(i).unwrap_or(1);
+        match state {
+            None => {
+                if block.pct.is_some() {
+                    head.now(block.strip);
+                }
+                head.span(block.name.x, names_end, false);
+            }
+            Some(state) => {
+                let name_room = names_end - block.name.x;
+                let forms = [state.full, state.bare];
+                // The room before the marker's dot and its beat, left of the strip.
+                let before_dot = words_end - block.name.x;
+                let fits_before =
+                    |f: &&str| MARK_ADVANCE + m.width(f, HEADER_PT, true) <= before_dot + 0.01;
+                let words = if MARK_ADVANCE + m.width(state.full, HEADER_PT, true) <= name_room {
+                    if block.pct.is_some() {
+                        head.now(block.strip);
+                    }
+                    state.full.to_owned()
+                } else if spilled.is_none() && !forms.iter().any(fits_before) {
+                    // Words too long for the room before the marker take the strip's header
+                    // too, to its old end: the marker's dot and `now` yield to them (its line
+                    // still marks now down the rows), and the time scale stands over the other
+                    // block's strip. One block spills at most.
+                    spilled = Some(i);
+                    let room = block.strip.end() - block.name.x - MARK_ADVANCE;
+                    m.fit(&forms, room, HEADER_PT, true)
+                } else {
+                    m.fit(&forms, before_dot - MARK_ADVANCE, HEADER_PT, true)
+                };
+                head.label(Label::State(block_ix), block.name.x, words);
             }
         }
-        [None, Some(b)] => head.time(b),
-        [None, None] => {}
+        if let Some(details) = block.details {
+            head.span(details.x, details.end(), false);
+        }
     }
+    let under = plan.blocks.iter().any(|block| block.bar_under().is_some());
+    let [a, b] = plan.blocks.map(|block| block.strip);
+    // Where neither block spills, the legend stands over block B's strip, right-aligned to its
+    // old end as over a bar column, and the key takes what it leaves; else the scope key takes
+    // what room the scale and rule K's items leave.
+    let mut legend = false;
+    match spilled {
+        None => {
+            head.time(a);
+            let lo = b.x + MARKER_ROOM;
+            let at = if under {
+                head.legend((lo, b.end()), &text, true, true)
+            } else {
+                None
+            };
+            legend = at.is_some();
+            head.span(lo, at.map_or(b.end(), |(x0, _)| x0 - KEY_GAP), true);
+        }
+        Some(0) => head.time(b),
+        Some(_) => head.time(a),
+    }
+    if under && !legend {
+        head.under_key = Some((text.machine.to_owned(), text.tab.to_owned()));
+    }
+    head.dotless = spilled.and_then(|i| plan.blocks.get(i)).map(|b| b.strip.x);
     head.finish()
 }
 
@@ -1755,8 +2320,8 @@ mod tests {
     const TEXT: HeaderText<'static> = HeaderText {
         tab: "Tab 2",
         machine: "this Mac",
-        machine_forms: &[],
         over: true,
+        totals: &[],
     };
 
     fn hn() -> FaceMetrics {
@@ -1776,36 +2341,20 @@ mod tests {
         if let CoresAt::Block { at, divider } = plan.cores {
             cols.extend([at, Col::new(divider, 0.0)]);
         }
-        cols.extend([plan.name, plan.well, strip_col(plan.strip)]);
-        cols.extend(
-            [
-                plan.pct,
-                plan.bar,
-                plan.amount,
-                plan.aterm,
-                plan.tab,
-                plan.details,
-            ]
-            .into_iter()
-            .flatten(),
-        );
+        cols.extend([plan.name, plan.well]);
+        cols.extend(plan.pct);
+        cols.push(strip_col(plan.strip));
+        cols.extend(plan.meter.cols());
+        cols.extend(plan.details);
         cols
     }
 
     fn block_cols(block: &BlockPlan) -> Vec<Col> {
-        let mut cols = vec![block.name, block.well, strip_col(block.strip)];
-        cols.extend(
-            [
-                block.pct,
-                block.bar,
-                block.amount,
-                block.aterm,
-                block.tab,
-                block.details,
-            ]
-            .into_iter()
-            .flatten(),
-        );
+        let mut cols = vec![block.name, block.well];
+        cols.extend(block.pct);
+        cols.push(strip_col(block.strip));
+        cols.extend(block.meter.cols());
+        cols.extend(block.details);
         cols
     }
 
@@ -1829,6 +2378,18 @@ mod tests {
         }
     }
 
+    /// A Full plan's strip and meter: the strip's (x, cols, pitch), then its bar and run.
+    fn full_meter(p: &FullPlan) -> ((f64, u32, f64), Option<Col>, Option<Col>) {
+        (
+            (p.strip.x, p.strip.cols, p.strip.pitch),
+            p.meter.bar,
+            p.meter.run,
+        )
+    }
+
+    /// The strip takes the row (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §2): from the
+    /// strip's own start, the bar `bar_gap` past its end, the run [`RUN_GAP`] past the bar's,
+    /// then Details, every edge on whole device px.
     #[test]
     fn plan_golden_tables_full() {
         let m = hn();
@@ -1838,21 +2399,19 @@ mod tests {
             assert_on_pixels(&full_cols(&plan), &format!("W {w}"));
             plan
         };
+        let col = |x: f64, w: f64| Some(Col::new(x, w));
 
-        let p = at(1119.0);
-        assert_eq!((p.kind, p.offset, p.gap_grow), (FullKind::Wide, 0.0, 0.0));
-        assert_eq!(p.name, Col::new(97.0, 56.0));
+        // The owner's window: six hours' strip of 429 pt, a bar of 134 and the run with each
+        // row's maximum.
+        let p = at(1039.0);
+        assert_eq!((p.kind, p.offset), (FullKind::Wide, 0.0));
+        assert_eq!((p.name, p.pct), (Col::new(97.0, 56.0), col(166.0, 30.0)));
         assert_eq!(
-            (p.strip.x, p.strip.cols, p.strip.pitch, p.strip.cell),
-            (167.0, 60, 5.0, 4.0)
+            full_meter(&p),
+            ((203.0, 86, 5.0), col(641.0, 134.0), col(781.0, 88.0))
         );
-        assert_eq!(p.strip.end(), 466.0);
-        assert_eq!(p.pct.map(Col::end), Some(503.0));
-        assert_eq!(p.bar, Some(Col::new(511.0, 96.0)));
-        assert_eq!(p.amount, Some(Col::new(615.0, 96.0)));
-        assert_eq!(p.aterm, Some(Col::new(719.0, 56.0)));
-        assert_eq!(p.tab, Some(Col::new(783.0, 56.0)));
-        assert_eq!(p.details, Some(Col::new(849.0, 258.0)));
+        assert_eq!((p.strip.end(), p.strip.span_s()), (632.0, 21_600));
+        assert_eq!(p.details, col(879.0, 148.0));
         assert_eq!(
             p.cores,
             CoresAt::Block {
@@ -1860,65 +2419,67 @@ mod tests {
                 divider: 88.0
             }
         );
-        assert_eq!([2.0, 1.0].map(|s| px(p.strip.x, s)), [334.0, 167.0]);
+        assert_eq!([2.0, 1.0].map(|s| px(p.strip.x, s)), [406.0, 203.0]);
         assert_eq!([2.0, 1.0].map(|s| px(p.strip.cell, s)), [8.0, 4.0]);
 
         let p = at(1424.0);
         assert_eq!(
-            (p.kind, p.strip.pitch, p.strip.end()),
-            (FullKind::Wide, 6.0, 526.0)
+            full_meter(&p),
+            ((203.0, 120, 5.0), col(811.0, 240.0), col(1057.0, 88.0))
         );
-        assert_eq!(p.pct.map(Col::end), Some(563.0));
-        assert_eq!(p.amount.map(|a| a.x), Some(675.0));
-        assert_eq!(p.details, Some(Col::new(909.0, 503.0)));
+        assert_eq!(p.details, col(1155.0, 257.0));
+        // Past the strip's and the bar's most, the table centres and Details take the rest.
+        let p = at(2560.0);
+        assert_eq!((p.offset, p.strip.x, p.strip.cols), (416.0, 619.0, 120));
+        assert_eq!(p.details, col(1571.0, 560.0));
 
+        let p = at(940.0);
+        assert_eq!(
+            full_meter(&p),
+            ((203.0, 76, 5.0), col(591.0, 103.0), col(700.0, 88.0))
+        );
+        assert_eq!(p.details, col(798.0, 130.0));
+        // Mid lays no Details: the strip takes their room at a finer pitch.
         let p = at(900.0);
         assert_eq!(p.kind, FullKind::Mid);
         assert_eq!(
-            (p.strip.x, p.strip.cols, p.strip.pitch, p.strip.cell),
-            (167.0, 60, 4.0, 3.0)
+            full_meter(&p),
+            ((203.0, 103, 4.0), col(623.0, 171.0), col(800.0, 88.0))
         );
-        assert_eq!(p.strip.end(), 406.0);
-        assert_eq!(p.pct.map(Col::end), Some(443.0));
-        assert_eq!(p.bar, Some(Col::new(451.0, 80.0)));
-        assert_eq!(p.amount.map(|a| a.x), Some(539.0));
-        assert_eq!(p.aterm.map(|a| a.x), Some(643.0));
-        assert_eq!(p.tab.map(|t| t.x), Some(707.0));
         assert_eq!(p.details, None);
-
-        let p = at(580.0);
-        assert_eq!(p.kind, FullKind::Narrow);
-        assert_eq!((p.name, p.well.x), (Col::new(12.0, 52.0), 64.0));
-        assert_eq!((p.strip.x, p.strip.cols, p.strip.pitch), (78.0, 20, 5.0));
-        assert_eq!(p.pct, Some(Col::new(184.0, 30.0)));
-        assert_eq!((p.bar, p.details), (Some(Col::new(220.0, 24.0)), None));
-        assert_eq!(p.amount, Some(Col::new(252.0, 148.0)));
-        assert_eq!(p.aterm, Some(Col::new(408.0, 76.0)));
-        assert_eq!(p.tab, Some(Col::new(492.0, 76.0)));
-        assert_eq!(p.cores, CoresAt::Row(Col::new(78.0, 490.0)));
-
+        let p = at(700.0);
+        assert_eq!(
+            full_meter(&p),
+            ((203.0, 73, 4.0), col(503.0, 91.0), col(600.0, 88.0))
+        );
+        // Narrowing, the run gives way first, then the bar (as long as its legend at least),
+        // and the strip, which keeps its share, last.
+        let p = at(550.0);
+        assert_eq!(
+            (p.kind, p.name, p.pct),
+            (FullKind::Narrow, Col::new(12.0, 52.0), col(77.0, 30.0))
+        );
+        assert_eq!(full_meter(&p), ((114.0, 51, 5.0), col(375.0, 163.0), None));
+        assert_eq!(p.strip.span_s(), 21_600);
+        let p = at(450.0);
+        assert_eq!(full_meter(&p), ((114.0, 39, 5.0), col(315.0, 123.0), None));
+        assert_eq!(p.cores, CoresAt::Row(Col::new(77.0, 361.0)));
+        // Where no bar as long as its legend fits, it stands under each % and the strip takes
+        // the room: four hours at 350 pt.
         let p = at(350.0);
-        assert_eq!(p.kind, FullKind::Slim);
-        assert_eq!((p.name, p.well.x), (Col::new(12.0, 48.0), 60.0));
-        assert_eq!((p.strip.x, p.strip.cols, p.strip.pitch), (73.0, 20, 4.0));
-        assert_eq!(p.pct, Some(Col::new(157.0, 26.0)));
-        assert_eq!(p.bar, Some(Col::new(189.0, 24.0)));
-        assert_eq!(p.amount, Some(Col::new(219.0, 119.0)));
-        assert_eq!((p.aterm, p.tab, p.details), (None, None, None));
-
-        let p = at(2560.0);
-        assert_eq!((p.kind, p.strip.pitch), (FullKind::Wide, 9.0));
-        assert_eq!((p.gap_grow, p.offset), (16.0, 401.0));
-        let CoresAt::Block { at: cores, divider } = p.cores else {
-            panic!("wide has the cores block");
-        };
-        assert_eq!((cores.x, divider, p.name.x), (413.0, 489.0, 498.0));
-        let details = p.details.expect("wide has Details");
-        assert_eq!(details.w, 560.0);
-        assert!((cores.x - (p.w - details.end())).abs() <= 1.0);
-        assert_eq!([1700.0, 2000.0].map(|w| at(w).offset), [31.0, 151.0]);
+        assert_eq!((p.kind, p.meter), (FullKind::Slim, Meter::default()));
+        assert_eq!(
+            (p.strip.x, p.strip.cols, p.strip.span_s()),
+            (103.0, 59, 14_400)
+        );
+        assert!(p.bar_under().is_some());
+        let p = at(210.0);
+        assert_eq!((p.kind, p.meter), (FullKind::Slim, Meter::default()));
+        assert!(p.bar_under().is_some());
     }
 
+    /// Folded's blocks as Full's rows: the strip, the bar past it and the run past that, inside
+    /// each block; at the owner's widths the strip is over half its block.
     #[test]
     fn plan_golden_tables_folded() {
         let m = hn();
@@ -1930,92 +2491,101 @@ mod tests {
             }
             plan
         };
-        let kinds = |plan: &FoldedPlan| plan.blocks.map(|b| b.kind);
-        let details = |plan: &FoldedPlan| plan.blocks.map(|b| b.details);
-        let gauge = |at: f64| FoldedGauge {
-            at: Col::new(at, 54.0),
-            divider: at + 63.0,
+        let col = |x: f64, w: f64| Some(Col::new(x, w));
+        let block_meter = |b: &BlockPlan| {
+            (
+                (b.strip.x, b.strip.cols, b.strip.pitch),
+                b.meter.bar,
+                b.meter.run,
+            )
         };
 
-        // The gauge at the top left, 54 pt across, its divider 9 pt past it and block A 9 pt
-        // past that; the blocks share what is left.
-        let p = at(1119.0);
-        assert_eq!(p.gauge, Some(gauge(12.0)));
-        assert_eq!(p.gauge.map(|g| g.dial()), Some([12.0, 4.0, 66.0, 58.0]));
-        assert_eq!(kinds(&p), [BlockKind::Wide; 2]);
-        assert_eq!(
-            p.blocks.map(|b| b.at),
-            [Col::new(84.0, 497.0), Col::new(610.0, 497.0)]
-        );
-        assert_eq!(p.divider, 595.0);
-        assert_eq!(details(&p), [None, None]);
-        let a = p.blocks[0];
-        assert_eq!(
-            (a.strip.x, a.strip.cols, a.strip.period_s, a.strip.pitch),
-            (150.0, 26, 1, 5.0)
-        );
-        assert_eq!((a.strip.end(), a.strip.span_s()), (279.0, 900));
-        assert_eq!(a.pct, Some(Col::new(285.0, 30.0)));
-        assert_eq!(a.bar, Some(Col::new(320.0, 28.0)));
-        assert_eq!(a.amount, Some(Col::new(353.0, 96.0)));
-        assert_eq!(
-            (a.aterm, a.tab),
-            (Some(Col::new(455.0, 56.0)), Some(Col::new(517.0, 56.0)))
-        );
-
-        let p = at(1424.0);
-        assert_eq!(kinds(&p), [BlockKind::Wide; 2]);
-        assert_eq!(
-            details(&p),
-            [Some(Col::new(583.0, 150.0)), Some(Col::new(1261.0, 150.0))]
-        );
-
-        // The owner's window: mid beside the gauge.
         let p = at(1039.0);
         assert_eq!(
-            (p.gauge, kinds(&p)),
-            (Some(gauge(12.0)), [BlockKind::Mid; 2])
+            p.gauge,
+            Some(FoldedGauge {
+                at: Col::new(12.0, 54.0),
+                divider: 75.0
+            })
         );
-        assert_eq!(p.blocks[0].bar, Some(Col::new(269.0, 28.0)));
-        assert_eq!(p.blocks[0].amount, Some(Col::new(303.0, 160.0)));
+        assert_eq!(
+            p.blocks.map(|b| (b.kind, b.at)),
+            [
+                (BlockKind::Wide, Col::new(84.0, 457.0)),
+                (BlockKind::Wide, Col::new(570.0, 457.0))
+            ]
+        );
+        let [a, b] = p.blocks;
+        assert_eq!((a.name, a.pct), (Col::new(84.0, 52.0), col(148.0, 30.0)));
+        // Six hours' strip of 284 pt and the bar to the block's end: no run, whose room the
+        // strip keeps.
+        assert_eq!(block_meter(&a), ((185.0, 57, 5.0), col(476.0, 65.0), None));
+        assert_eq!(
+            (a.strip.end(), a.strip.span_s(), a.details),
+            (469.0, 21_600, None)
+        );
+        assert_eq!(block_meter(&b), ((671.0, 57, 5.0), col(962.0, 65.0), None));
 
-        let p = at(750.0);
-        assert_eq!(kinds(&p), [BlockKind::Narrow; 2]);
-        assert_eq!(p.blocks[0].bar, Some(Col::new(237.0, 24.0)));
-        assert_eq!(p.blocks[0].amount, Some(Col::new(266.0, 130.0)));
-
-        for w in [550.0, 450.0] {
-            let p = at(w);
-            assert_eq!(
-                (p.gauge, kinds(&p)),
-                (Some(gauge(12.0)), [BlockKind::Slim; 2])
-            );
-            assert_eq!(p.blocks[0].pct, Some(Col::new(204.0, 26.0)));
-            assert_eq!(p.blocks[0].amount, None);
-        }
-
-        // Under 417 pt not even slim fits beside the gauge: the deck draws none, and the blocks
-        // are 0.134's.
+        let a = at(940.0).blocks[0];
+        assert_eq!(a.at, Col::new(84.0, 407.0));
+        assert_eq!(block_meter(&a), ((185.0, 49, 5.0), col(436.0, 55.0), None));
+        let a = at(1424.0).blocks[0];
+        assert_eq!(block_meter(&a), ((185.0, 87, 5.0), col(626.0, 107.0), None));
+        // A run where the bar is as long as it, and Details where they leave the strip 480 pt.
+        let a = at(2560.0).blocks[0];
+        assert_eq!(
+            block_meter(&a),
+            ((185.0, 120, 5.0), col(791.0, 160.0), col(957.0, 82.0))
+        );
+        assert_eq!(a.details, col(1049.0, 252.0));
+        // Narrower blocks keep the strip's share: a shorter bar, a finer pitch, then the bar
+        // under the %.
+        let a = at(750.0).blocks[0];
+        assert_eq!(
+            (a.kind, block_meter(&a)),
+            (BlockKind::Wide, ((185.0, 33, 5.0), col(356.0, 40.0), None))
+        );
+        let a = at(650.0).blocks[0];
+        assert_eq!(
+            (a.kind, block_meter(&a)),
+            (BlockKind::Mid, ((183.0, 32, 4.0), col(317.0, 29.0), None))
+        );
+        let a = at(600.0).blocks[0];
+        assert_eq!((a.kind, a.meter), (BlockKind::Slim, Meter::default()));
+        assert_eq!(
+            (a.strip.x, a.strip.cols, a.strip.span_s()),
+            (172.0, 50, 14_400)
+        );
+        assert!(a.bar_under().is_some());
+        let a = at(450.0).blocks[0];
+        assert_eq!((a.kind, a.meter), (BlockKind::Slim, Meter::default()));
+        assert!(a.bar_under().is_some());
         let p = at(350.0);
-        assert_eq!((p.gauge, kinds(&p)), (None, [BlockKind::Slim; 2]));
-        assert_eq!(p.blocks[0].pct, Some(Col::new(132.0, 26.0)));
-        assert_eq!(p.blocks[0].amount, None);
-
-        // Past the cap the table is centred, the gauge leading it as Full's slot leads its table.
-        let p = at(2560.0);
-        assert_eq!(p.gauge, Some(gauge(170.0)));
         assert_eq!(
-            p.blocks.map(|b| b.at),
-            [Col::new(242.0, 1059.0), Col::new(1330.0, 1059.0)]
+            (p.gauge, p.blocks[0].strip.x, p.blocks[0].strip.cols),
+            (None, 100.0, 20)
         );
-        assert_eq!(details(&p).map(|d| d.map(|d| d.w)), [Some(560.0); 2]);
 
-        let p = at(320.0);
-        assert_eq!(
-            (p.gauge, kinds(&p), p.blocks.map(|b| b.pct)),
-            (None, [BlockKind::Slim; 2], [None; 2])
-        );
-        assert!(!p.ground_only);
+        // The owner's widths (2026-10-26, about 940 to 1040 pt): each strip is well over half
+        // its block (six tenths, to a box), reaches back six hours, and is the widest thing on
+        // its row; the bar takes the rest of the block.
+        for w in (940..=1040).map(f64::from) {
+            for b in at(w).blocks {
+                assert_eq!(b.strip.span_s(), 21_600, "W {w}");
+                assert_eq!(
+                    b.meter.bar.map(Col::end),
+                    Some(b.at.end()),
+                    "W {w}: the bar ends the block"
+                );
+                assert!(
+                    b.strip.width() >= 0.6 * b.at.w - b.strip.pitch,
+                    "W {w}: a strip of {} in a block of {}",
+                    b.strip.width(),
+                    b.at.w
+                );
+                assert_widest(b.strip, &b.meter, b.details, &format!("W {w}"));
+            }
+        }
     }
 
     #[test]
@@ -2042,7 +2612,7 @@ mod tests {
             (10.5, 10.0, 10.0, 6.0)
         );
 
-        let narrow = plan_full(580.0, &m).rows;
+        let narrow = plan_full(400.0, &m).rows;
         assert_eq!(
             (narrow.count, narrow.pitch, narrow.cell, narrow.baseline),
             (8, 10.5, 8.0, 7.0)
@@ -2051,7 +2621,7 @@ mod tests {
             (narrow.name_pt, narrow.amount_pt, narrow.figure_pt),
             (10.0, 10.0, 10.0)
         );
-        let slim = plan_full(350.0, &m).rows;
+        let slim = plan_full(250.0, &m).rows;
         assert_eq!((slim.name_pt, slim.amount_pt, slim.bar_h), (9.5, 9.5, 5.0));
 
         let folded = plan_folded(1119.0, &m).blocks[0].rows;
@@ -2074,22 +2644,201 @@ mod tests {
         assert_eq!(plan_folded(350.0, &m).blocks[0].rows.name_pt, 9.5);
     }
 
+    /// The bar under a % figure stands where the now-left design's table puts it
+    /// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5): from a point below the digits'
+    /// baseline, 2 pt tall, clear of the next row's top by a point in Folded and half a point in
+    /// Full narrow and slim, so it costs the deck no height.
+    #[test]
+    fn the_bar_under_the_percent_stays_inside_the_row_pitch() {
+        let m = hn();
+        for (what, rows, want, clear) in [
+            (
+                "Folded",
+                plan_folded(350.0, &m).blocks[0].rows,
+                (8.5, 10.5),
+                1.0,
+            ),
+            ("Full slim", plan_full(210.0, &m).rows, (8.0, 10.0), 0.5),
+            ("Full narrow", plan_full(400.0, &m).rows, (8.0, 10.0), 0.5),
+            ("Full wide", plan_full(1119.0, &m).rows, (9.0, 11.0), 1.0),
+        ] {
+            for r in 0..rows.count {
+                let (y0, y1) = rows.under(r);
+                let top = rows.top(r);
+                assert_eq!((y0 - top, y1 - top), want, "{what} row {r}");
+                assert_eq!(rows.top(r + 1) - y1, clear, "{what} row {r}");
+                assert_eq!(y0 - (top + rows.baseline), UNDER_GAP, "{what} row {r}");
+            }
+        }
+    }
+
+    /// Every row that prints a % keys its three-scope bar
+    /// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5): in a column right of the strip in
+    /// Full wide, mid and narrow, in fwide, fmid and fnarrow, and in Full slim with room left,
+    /// else under the % figure (fslim's always), never both, on both faces at every width. The
+    /// legend names the three scopes once, whole, or not at all.
+    #[test]
+    fn every_percent_has_its_bar_at_every_width() {
+        let scopes = |head: &HeaderPlan| {
+            head.labels
+                .iter()
+                .filter(|l| matches!(l.label, Label::Scope(_)))
+                .count()
+        };
+        // Bars under the % seen in Full and in fslim, and Full slim's column.
+        let mut seen = [0_u32; 3];
+        for m in [hn(), FaceMetrics::test_stack()] {
+            for w in (160..=5120).map(f64::from) {
+                let full = plan_full(w, &m);
+                if !full.ground_only && full.pct.is_some() {
+                    let at = format!("Full {:?} W {w}", full.kind);
+                    let bar = full.meter.bar;
+                    assert!(bar.is_some() != full.bar_under().is_some(), "{at}");
+                    match (full.kind, bar) {
+                        (FullKind::Slim, None) => seen[0] += 1,
+                        (FullKind::Slim, Some(_)) => seen[2] += 1,
+                        (_, bar) => assert!(bar.is_some(), "{at}: its column"),
+                    }
+                    let n = scopes(&header_full(&full, TEXT, None, &m));
+                    assert!(n == 0 || n == 3, "{at}: the legend in part, {n} names");
+                }
+                let folded = plan_folded(w, &m);
+                if folded.ground_only {
+                    continue;
+                }
+                for block in folded.blocks.iter().filter(|b| b.pct.is_some()) {
+                    let at = format!("Folded {:?} W {w}", block.kind);
+                    let bar = block.meter.bar;
+                    assert!(bar.is_some() != block.bar_under().is_some(), "{at}");
+                    match (block.kind, bar) {
+                        (BlockKind::Slim, bar) => {
+                            assert_eq!(bar, None, "{at}: fnarrow lays slim's column first");
+                            seen[1] += 1;
+                        }
+                        (_, bar) => assert!(bar.is_some(), "{at}: its column"),
+                    }
+                }
+                let n = scopes(&header_folded(&folded, TEXT, [None, None], &m));
+                assert!(n == 0 || n == 3, "Folded W {w}: the legend once, {n} names");
+            }
+        }
+        assert!(seen.iter().all(|&n| n > 10), "CONTROL: {seen:?}");
+    }
+
+    /// Where the bars stand under the % figures, the scope key (`this Mac ■ aterm ■ Tab`) takes
+    /// the leftmost room over no strip that the scale and rule K's items leave, whole (the
+    /// machine's last word standing for "this Mac" where only that fits), or none
+    /// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5): it never costs the scale a tick or
+    /// the key an item. Where bars stand under the % the scopes' heads (over their figures or
+    /// shares) usually key them, so the header here is planned over rooms of its own.
+    #[test]
+    fn the_key_of_bars_under_the_percent_comes_after_the_scale() {
+        let m = hn();
+        // A minute's strip, whose header holds its label and a tick but not "over max".
+        let strip = plan_folded(350.0, &m).blocks[0].strip;
+        let words = |s: &str| m.width(s, HEADER_PT, false);
+        let need =
+            3.0 * SWATCH_ADVANCE + words("this Mac") + words("aterm") + words("Tab 2") + 16.0;
+        let noun_need = need - words("this Mac") + words("Mac");
+        let over = KeyItem::Over.width(&m) + KEY_GAP;
+        let x0 = strip.end() + 20.0;
+        let plan = |keys: &'static [KeyItem], room: f64, strip_room: bool, under: bool| {
+            let mut head = Header::new(&m);
+            head.keys = keys;
+            head.time(strip);
+            head.span(x0, x0 + room, strip_room);
+            if under {
+                head.under_key = Some(("this Mac".to_owned(), "Tab 2".to_owned()));
+            }
+            head.finish()
+        };
+        let names = |head: &HeaderPlan| -> Vec<(f64, String)> {
+            head.labels
+                .iter()
+                .filter(|l| matches!(l.label, Label::Scope(_)))
+                .map(|l| (l.x, l.text.clone()))
+                .collect()
+        };
+        let rest = |head: &HeaderPlan| {
+            let labels: Vec<HeaderLabel> = head
+                .labels
+                .iter()
+                .filter(|l| !matches!(l.label, Label::Scope(_)))
+                .cloned()
+                .collect();
+            (labels, head.key.clone(), head.ruler.clone())
+        };
+        let firsts = |head: &HeaderPlan| names(head).first().map(|n| n.0);
+        let shown: &'static [KeyItem] = &[KeyItem::Over];
+        for keys in [shown, &[]] {
+            for room in [need - 0.5, need, over + need - 0.5, over + need, 400.0] {
+                for strip_room in [false, true] {
+                    let with = plan(keys, room, strip_room, true);
+                    let at = format!("{keys:?}, {room} pt, over a strip {strip_room}");
+                    assert_eq!(
+                        rest(&with),
+                        rest(&plan(keys, room, strip_room, false)),
+                        "{at}: the key costs the scale and rule K nothing"
+                    );
+                    let said = names(&with);
+                    assert!(said.is_empty() || said.len() == 3, "{at}: {said:?}");
+                    if strip_room {
+                        assert_eq!(said, [], "{at}: the key stands over no strip");
+                    }
+                }
+            }
+        }
+        // "over max" takes the room's start (the strip's own header has none for it), and the
+        // key the rest, when it holds the key's need.
+        assert_eq!(
+            placed(&plan(shown, 400.0, false, true), KeyItem::Over),
+            Some(x0)
+        );
+        assert_eq!(
+            firsts(&plan(shown, over + need, false, true)),
+            Some(x0 + over)
+        );
+        let noun = |head: &HeaderPlan| names(head).first().map(|n| n.1.clone());
+        assert_eq!(
+            noun(&plan(shown, over + need - 0.5, false, true)).as_deref(),
+            Some("Mac")
+        );
+        assert_eq!(
+            firsts(&plan(shown, over + noun_need - 0.5, false, true)),
+            None
+        );
+        assert_eq!(firsts(&plan(&[], need, false, true)), Some(x0));
+        assert_eq!(
+            noun(&plan(&[], need - 0.5, false, true)).as_deref(),
+            Some("Mac")
+        );
+        assert_eq!(firsts(&plan(&[], noun_need - 0.5, false, true)), None);
+        assert_eq!(
+            names(&plan(shown, 400.0, false, true))
+                .into_iter()
+                .map(|n| n.1)
+                .collect::<Vec<_>>(),
+            ["this Mac", "aterm", "Tab 2"]
+        );
+    }
+
     #[test]
     fn breakpoints_follow_the_face() {
         let helvetica = breakpoints(&hn());
-        assert_eq!(helvetica.full, [981.0, 775.0, 552.0, 323.0]);
-        assert_eq!(helvetica.block, [489.0, 319.0, 245.0, 146.0]);
-        assert_eq!(helvetica.folded, [1103.0, 763.0, 615.0, 417.0]);
-        assert_eq!(helvetica.folded_bare, 345.0);
+        assert_eq!(helvetica.full, [909.0, 565.0, 389.0, 194.0]);
+        assert_eq!(helvetica.block, [274.0, 257.0, 229.0, 147.0]);
+        assert_eq!(helvetica.folded, [673.0, 639.0, 583.0, 419.0]);
+        assert_eq!(helvetica.folded_bare, 347.0);
 
         let stack = FaceMetrics::test_stack();
         assert_eq!(plan_full(1119.0, &stack).name.w, 59.0);
-        assert_eq!(plan_full(580.0, &stack).name.w, 56.0);
+        assert_eq!(plan_full(580.0, &stack).name.w, 59.0);
+        assert_eq!(plan_full(450.0, &stack).name.w, 56.0);
         let dejavu = breakpoints(&stack);
-        assert_eq!(dejavu.full, [984.0, 778.0, 556.0, 328.0]);
-        assert_eq!(dejavu.block, [493.0, 323.0, 250.0, 151.0]);
-        assert_eq!(dejavu.folded, [1111.0, 771.0, 625.0, 427.0]);
-        assert_eq!(dejavu.folded_bare, 355.0);
+        assert_eq!(dejavu.full, [912.0, 572.0, 402.0, 199.0]);
+        assert_eq!(dejavu.block, [278.0, 261.0, 234.0, 152.0]);
+        assert_eq!(dejavu.folded, [681.0, 647.0, 593.0, 429.0]);
+        assert_eq!(dejavu.folded_bare, 357.0);
 
         let drawn = |w: f64| {
             (
@@ -2097,8 +2846,11 @@ mod tests {
                 !plan_folded(w, &hn()).ground_only,
             )
         };
+        // Without the % column the strip starts BARE_STRIP_GAP past the well, so the narrowest
+        // decks that draw a table are a point (Full) and four (Folded's two blocks) wider than
+        // where the now marker's line stood over the well's marks (the review of 2026-10-26).
         assert_eq!(
-            [163.0, 164.0, 284.0, 285.0].map(drawn),
+            [164.0, 165.0, 288.0, 289.0].map(drawn),
             [(false, false), (true, false), (true, false), (true, true)]
         );
 
@@ -2129,25 +2881,246 @@ mod tests {
         }
     }
 
+    /// Where the now marker's line stands in a table with `well`, `pct` and `strip`, against
+    /// what is beside it (`what` names the table): a point wide at most, clear of the well's
+    /// marks and of the % column in device px at 1× and 2×. Under slim's width it once stood
+    /// inside fslim's well, over the right edge of its marks (the review of 2026-10-26).
+    fn marker_faults(what: &str, well: Col, pct: Option<Col>, strip: Strip) -> Vec<String> {
+        let x = strip.x - crate::stats_live::LINE_DX;
+        let mut faults = Vec::new();
+        for s in [1.0_f64, 2.0] {
+            // As `Deck::live_edge` draws it.
+            let lw = (0.75 * s).round().max(1.0);
+            let lx = (x * s - lw / 2.0).round();
+            if lx < (well.end() + 0.5) * s {
+                faults.push(format!(
+                    "{what} {s}×: the line at {lx} px meets the well {well:?}"
+                ));
+            }
+            if let Some(pct) = pct
+                && lx < pct.end() * s
+            {
+                faults.push(format!("{what} {s}×: the line at {lx} px meets {pct:?}"));
+            }
+        }
+        faults
+    }
+
+    /// The strip is the row's widest part (the owner, 2026-10-26: "see how the time series is
+    /// too showr"): wider than the bar, the figure run and Details, each.
+    fn assert_widest(strip: Strip, meter: &Meter, details: Option<Col>, what: &str) {
+        for col in meter.cols().into_iter().chain(details) {
+            assert!(
+                strip.width() > col.w,
+                "{what}: the strip {strip:?} is no wider than {col:?}"
+            );
+        }
+    }
+
+    /// Narrowing, the run gives way first, then the bar (to a narrower kind's least, then under
+    /// each %), and the strip last (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §2): at every
+    /// width, on both faces, a run stands only beside a bar at least as long as the run's least,
+    /// no width lays a run below one that lays no bar column, and every strip beside a bar keeps
+    /// its kind's share of the meter's room (up to its most). CONTROL: runs, bar columns and bars under the % are
+    /// each seen in both forms.
+    #[test]
+    fn narrowing_drops_the_run_then_the_bar_and_the_strip_keeps_its_share() {
+        for m in [hn(), FaceMetrics::test_stack()] {
+            // (form, width, strip, meter, the kind's share, the run's least, a bar under the %)
+            let mut tables = Vec::new();
+            for px2 in 320..=5_120 {
+                let w = f64::from(px2) / 2.0;
+                let full = plan_full(w, &m);
+                if !full.ground_only {
+                    let spec = match full.kind {
+                        FullKind::Wide => FULL_WIDE,
+                        FullKind::Mid => FULL_MID,
+                        FullKind::Narrow => FULL_NARROW,
+                        FullKind::Slim => FULL_SLIM,
+                    };
+                    let under = full.bar_under().is_some();
+                    tables.push(("Full", w, full.strip, full.meter, spec, under));
+                }
+                let folded = plan_folded(w, &m);
+                if !folded.ground_only {
+                    for b in folded.blocks {
+                        let spec = match b.kind {
+                            BlockKind::Wide => FOLD_WIDE,
+                            BlockKind::Mid => FOLD_MID,
+                            BlockKind::Narrow => FOLD_NARROW,
+                            BlockKind::Slim => FOLD_SLIM,
+                        };
+                        let under = b.bar_under().is_some();
+                        tables.push(("Folded", w, b.strip, b.meter, spec, under));
+                    }
+                }
+            }
+            for form in ["Full", "Folded"] {
+                let ours = || tables.iter().filter(move |t| t.0 == form);
+                let lowest_run = ours()
+                    .filter(|t| t.3.run.is_some())
+                    .map(|t| t.1)
+                    .fold(f64::INFINITY, f64::min);
+                let highest_under = ours()
+                    .filter(|t| t.3.bar.is_none())
+                    .map(|t| t.1)
+                    .fold(0.0, f64::max);
+                assert!(
+                    highest_under < lowest_run,
+                    "{form}: a run at {lowest_run} pt, no bar column at {highest_under} pt"
+                );
+                let seen = (
+                    ours().filter(|t| t.3.run.is_some()).count(),
+                    ours().filter(|t| t.3.bar.is_some()).count(),
+                    ours().filter(|t| t.5).count(),
+                );
+                assert!(
+                    seen.0 > 0 && seen.1 > seen.0 && seen.2 > 0,
+                    "CONTROL {form}: {seen:?}"
+                );
+                for &(_, w, strip, meter, spec, _) in ours() {
+                    let Some(bar) = meter.bar else { continue };
+                    if meter.run.is_some() {
+                        assert!(bar.w >= spec.run, "{form} {w} pt: {bar:?} beside a run");
+                    }
+                    let room = bar.end() - strip.x;
+                    assert!(
+                        strip.width() + spec.pitch >= (spec.share * room).min(spec.strip.1),
+                        "{form} {w} pt: a strip of {} short of its share of {room}",
+                        strip.width()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The legend keys the bars once and never across the Folded blocks' divider: every scope
+    /// name stands, with its swatch, inside one block, at every width, with and without the
+    /// machine's totals. CONTROL: a legend is laid at most widths.
+    #[test]
+    fn the_legend_stays_inside_one_block() {
+        let m = hn();
+        let totals = [
+            "18 cores \u{b7} 128 GiB \u{b7} 2 TB".to_owned(),
+            "18c \u{b7} 128G \u{b7} 2T".to_owned(),
+        ];
+        let mut laid = 0;
+        for w in (300..=2_560).map(f64::from) {
+            let plan = plan_folded(w, &m);
+            if plan.ground_only {
+                continue;
+            }
+            for text in [
+                TEXT,
+                HeaderText {
+                    totals: &totals,
+                    ..TEXT
+                },
+            ] {
+                let head = header_folded(&plan, text, [None, None], &m);
+                let said = heads(&head, &m);
+                laid += usize::from(said.len() == 3);
+                for (l, (words, end)) in head
+                    .labels
+                    .iter()
+                    .filter(|l| matches!(l.label, Label::Scope(_)))
+                    .zip(&said)
+                {
+                    assert!(
+                        plan.blocks
+                            .iter()
+                            .any(|b| l.x >= b.at.x - 1e-9 && *end <= b.at.end() + 1e-9),
+                        "W {w}: {words:?} at {}..{end} crosses a block's edge",
+                        l.x
+                    );
+                }
+            }
+        }
+        assert!(laid > 3_000, "CONTROL: {laid} legends laid");
+    }
+
+    /// A state no row says keeps `now` beside each live edge's dot at the owner's widths and down
+    /// to Full's narrow tables: it stands over the names beside `now`, or at the strip's left
+    /// (the owner's hot scene said "Memory warn" over `now`, review of 2026-10-26).
+    #[test]
+    fn a_state_keeps_now_beside_the_dot() {
+        let m = hn();
+        let states = [
+            StateLabel {
+                full: "Memory warn +1",
+                bare: "Memory warn",
+            },
+            StateLabel {
+                full: "Disk full ~34 min +1",
+                bare: "Disk full ~34 min",
+            },
+        ];
+        let nows = |head: &HeaderPlan| head.labels.iter().filter(|l| l.label == Label::Now).count();
+        let stated = |head: &HeaderPlan| {
+            head.labels
+                .iter()
+                .filter(|l| matches!(l.label, Label::State(_)))
+                .count()
+        };
+        for state in states {
+            for w in [1039.0, 940.0, 700.0, 450.0, 400.0] {
+                let plan = plan_full(w, &m);
+                let head = header_full(&plan, TEXT, Some(state), &m);
+                assert_eq!(
+                    nows(&head),
+                    1,
+                    "Full {w} pt, {:?}: {:?}",
+                    state.full,
+                    head.labels
+                );
+                // Where Details stand, they say the state.
+                assert_eq!(
+                    stated(&head),
+                    usize::from(plan.details.is_none()),
+                    "Full {w} pt"
+                );
+            }
+            for w in (940..=1_040).map(f64::from) {
+                let plan = plan_folded(w, &m);
+                let head = header_folded(&plan, TEXT, [Some(state), Some(state)], &m);
+                assert_eq!(
+                    nows(&head),
+                    2,
+                    "Folded {w} pt, {:?}: {:?}",
+                    state.full,
+                    head.labels
+                );
+                assert_eq!(stated(&head), 2, "Folded {w} pt");
+            }
+        }
+    }
+
     #[test]
     fn every_width_plans_inside_the_card() {
         for m in [hn(), FaceMetrics::test_stack()] {
             let slim_beside = breakpoints(&m).folded[3];
             for w in (160..=5120).map(f64::from) {
                 let full = plan_full(w, &m);
-                let period = match full.kind {
-                    FullKind::Wide | FullKind::Mid => 10,
-                    FullKind::Narrow if w >= 640.0 => 20,
-                    FullKind::Narrow | FullKind::Slim => 30,
-                };
+                assert_ne!(full.strip.period_s, FOLD_SLOT_S, "W {w}: a Full strip");
                 assert_eq!(
-                    (full.strip.period_s, full.strip.cols * period),
-                    (period, 600),
+                    full.strip.spec,
+                    Strip::spec_for(full.strip.width()),
                     "W {w}"
                 );
-                assert!(full.strip.cols * full.rows.count.min(7) <= 420);
                 if !full.ground_only {
+                    // A reading a second moves its fine band 2 pt or more, half a 2 s box of 4 pt
+                    // or more, to the rounding of the box's place in the strip.
+                    assert!(full.strip.pt_per_s() >= 1.99, "Full W {w}");
+                    assert_widest(
+                        full.strip,
+                        &full.meter,
+                        full.details,
+                        &format!("Full W {w}"),
+                    );
                     assert_in_order(&full_cols(&full), X0, w - X0, &format!("Full W {w}"));
+                    let what = format!("Full W {w}");
+                    let faults = marker_faults(&what, full.well, full.pct, full.strip);
+                    assert!(faults.is_empty(), "{faults:?}");
                 }
                 if full.offset > 0.0
                     && let (CoresAt::Block { at, .. }, Some(details)) = (full.cores, full.details)
@@ -2172,25 +3145,24 @@ mod tests {
                 }
                 assert_eq!(folded.gauge.is_some(), w >= slim_beside, "Folded W {w}");
                 for block in &folded.blocks {
-                    let (width, span, pitch) = match block.kind {
-                        BlockKind::Wide => (130, 900, 5.0),
-                        BlockKind::Mid => (80, 300, 4.0),
-                        BlockKind::Narrow | BlockKind::Slim => (60, 60, 3.0),
+                    let pitch = match block.kind {
+                        BlockKind::Wide => 5.0,
+                        BlockKind::Mid => 4.0,
+                        BlockKind::Narrow | BlockKind::Slim => 3.0,
                     };
                     assert_eq!(
-                        (
-                            block.strip.period_s,
-                            block.strip.span_s(),
-                            block.strip.pitch
-                        ),
-                        (FOLD_SLOT_S, span, pitch),
+                        (block.strip.period_s, block.strip.pitch),
+                        (FOLD_SLOT_S, pitch),
                         "Folded W {w}"
                     );
-                    assert!(block.strip.pt_per_s() >= 3.0, "Folded W {w}");
-                    assert!(
-                        (block.strip.end() + 1.0 - block.strip.x - f64::from(width)).abs() < 1e-9,
-                        "Folded W {w}: the strip keeps its place"
-                    );
+                    assert_eq!(block.strip.spec, Strip::spec_for(block.strip.width()));
+                    if !folded.ground_only {
+                        // A reading a second moves its fine band 2 pt or more (the now-left
+                        // design's time-true step, live §8's ruling of 2026-10-26).
+                        assert!(block.strip.pt_per_s() >= 1.99, "Folded W {w}");
+                        let what = format!("Folded W {w}");
+                        assert_widest(block.strip, &block.meter, block.details, &what);
+                    }
                     if !folded.ground_only {
                         assert_in_order(
                             &block_cols(block),
@@ -2198,6 +3170,9 @@ mod tests {
                             block.at.end(),
                             &format!("Folded W {w}"),
                         );
+                        let what = format!("Folded W {w}");
+                        let faults = marker_faults(&what, block.well, block.pct, block.strip);
+                        assert!(faults.is_empty(), "{faults:?}");
                     }
                 }
                 if !folded.ground_only {
@@ -2392,7 +3367,7 @@ mod tests {
             "the gauge's slot"
         );
         assert_eq!(
-            plan_full(550.0, &m).cores_mode(&m5, &m),
+            plan_full(400.0, &m).cores_mode(&m5, &m),
             Some(CoresMode::Stack)
         );
         assert_eq!(
@@ -2421,6 +3396,38 @@ mod tests {
         head.labels.iter().find(|l| l.label == label).map(|l| l.x)
     }
 
+    /// The header's scope names, each after its swatch: its words and where it ends.
+    fn heads(head: &HeaderPlan, m: &FaceMetrics) -> Vec<(String, f64)> {
+        head.labels
+            .iter()
+            .filter_map(|l| match l.label {
+                Label::Scope(_) => {
+                    let end = l.x + SWATCH_ADVANCE + m.width(&l.text, HEADER_PT, false);
+                    Some((l.text.clone(), end))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The legend over the bars: `names` in order, each after its swatch, the first from `x`
+    /// and each next [`LEGEND_GAP`] past the one before.
+    fn assert_legend(head: &HeaderPlan, m: &FaceMetrics, x: f64, names: &[&str]) {
+        let got = heads(head, m);
+        let words: Vec<&str> = got.iter().map(|h| h.0.as_str()).collect();
+        assert_eq!(words, names, "{:?}", head.labels);
+        let mut at = x;
+        for (l, (_, end)) in head
+            .labels
+            .iter()
+            .filter(|l| matches!(l.label, Label::Scope(_)))
+            .zip(&got)
+        {
+            assert!((l.x - at).abs() < 1e-9, "{l:?} starts at {}, not {at}", l.x);
+            at = end + LEGEND_GAP;
+        }
+    }
+
     #[test]
     fn the_key_goes_where_the_spec_says() {
         let m = hn();
@@ -2430,11 +3437,11 @@ mod tests {
         // to the next free span.
         let plan = plan_full(1119.0, &m);
         let [label, _] = time_words(plan.strip);
-        assert_eq!(label, "1h ago", "a Full wide strip spans one hour");
-        let head = header_full(&plan, TEXT, &m);
+        assert_eq!(label, "6h ago", "a Full wide strip spans six hours");
+        let head = header_full(&plan, TEXT, None, &m);
         let ticks: Vec<u32> = head.ruler.iter().map(|t| t.age_s).collect();
         assert!(
-            ticks.contains(&900) && ticks.contains(&300),
+            ticks.contains(&3600) && ticks.contains(&600),
             "Full wide marks multi-scale horizon ticks: {ticks:?}"
         );
         assert!(placed(&head, KeyItem::Over).is_some());
@@ -2446,20 +3453,20 @@ mod tests {
             (None, None),
             "wide keys only the over mark"
         );
-        let scope = |bar| {
-            head.labels
-                .iter()
-                .find(|l| l.label == Label::Scope(bar))
-                .map(|l| l.text.as_str())
-        };
-        assert_eq!(
-            [Bar::Global, Bar::Aterm, Bar::Tab].map(scope),
-            [Some("this Mac"), Some("aterm"), Some("Tab 2")]
+        // The legend once over the bars, from the bar's start, its swatches in the bar's inks;
+        // the over mark's key over the strip, clear of it.
+        let bar = plan.meter.bar.expect("wide's bar");
+        let names = ["this Mac", "aterm", "Tab 2"];
+        assert_legend(&head, &m, bar.x, &names);
+        let over = placed(&head, KeyItem::Over).expect("the over mark's key");
+        assert!(
+            over + KeyItem::Over.width(&m) < bar.x,
+            "the over key {over} before the legend"
         );
         assert_eq!(
             label_x(&head, Label::Now),
-            plan.pct.map(Col::end),
-            "\"now\" beside the live edge's dot"
+            Some(plan.strip.x - WORDS_TO_STRIP),
+            "\"now\" beside the live edge's dot, clear of its beat"
         );
         assert_eq!(label_x(&head, Label::Details), None);
         // With no over mark on screen the key is empty, and the scale keeps what it had.
@@ -2469,48 +3476,79 @@ mod tests {
                 over: false,
                 ..TEXT
             },
+            None,
             &m,
         );
         assert!(calm.key.placed.is_empty(), "{:?}", calm.key.placed);
         assert!(calm.ruler.len() >= head.ruler.len());
 
-        let plan = plan_full(580.0, &m);
-        let head = header_full(&plan, TEXT, &m);
+        // Narrow keys all three marks by rule K, the over mark over the names; the legend
+        // stands over the bar, which is as long as it, from the bar's start.
+        let plan = plan_full(400.0, &m);
+        assert_eq!(plan.kind, FullKind::Narrow);
+        let head = header_full(&plan, TEXT, None, &m);
         assert_eq!(placed(&head, KeyItem::Over), Some(plan.name.x));
-        let global = label_x(&head, Label::Scope(Bar::Global));
-        assert_eq!(global, plan.bar.map(|b| b.x));
-        let global_end =
-            global.unwrap_or_default() + SWATCH_ADVANCE + m.width("Global", HEADER_PT, false);
-        let ramp = placed(&head, KeyItem::Ramp).expect("the ramp is placed");
-        assert!(
-            (ramp - (global_end + KEY_GAP)).abs() < 1e-9,
-            "the ramp at {ramp}"
-        );
-
+        assert!(placed(&head, KeyItem::Ramp).is_some(), "{:?}", head.key);
+        let bar = plan.meter.bar.expect("narrow's bar");
+        let said = heads(&head, &m);
+        let names: Vec<&str> = said.iter().map(|h| h.0.as_str()).collect();
+        assert_eq!(names, ["Mac", "aterm", "Tab"], "{:?}", head.labels);
+        assert_legend(&head, &m, bar.x, &names);
+        assert!(said[2].1 <= bar.end() + 1e-9, "{said:?} past {bar:?}");
+        // Where the bars stand under each %, the legend stands over the strip's header at its
+        // left, past the now marker's room, and the scale keeps its label and a tick.
         let plan = plan_full(350.0, &m);
-        let head = header_full(&plan, TEXT, &m);
-        assert_eq!(placed(&head, KeyItem::Over), Some(plan.name.x));
-        assert_eq!(
-            label_x(&head, Label::Scope(Bar::Global)),
-            plan.bar.map(|b| b.x)
+        assert!(plan.meter.bar.is_none() && plan.bar_under().is_some());
+        let head = header_full(&plan, TEXT, None, &m);
+        let said = heads(&head, &m);
+        let names: Vec<&str> = said.iter().map(|h| h.0.as_str()).collect();
+        assert_eq!(names.len(), 3, "{:?}", head.labels);
+        assert_legend(&head, &m, plan.strip.x + MARKER_ROOM, &names);
+        assert!(
+            !head.ruler.is_empty(),
+            "the scale keeps a tick: {:?}",
+            head.labels
         );
-        assert!(label_x(&head, Label::Scope(Bar::Tab)).is_some());
+        assert!(
+            head.ruler
+                .iter()
+                .all(|t| t.left >= said[2].1 + KEY_GAP - 1e-9),
+            "the ticks stand past the legend: {:?}",
+            head.ruler
+        );
+        assert_eq!(
+            label_x(&head, Label::Time).map(|x| x > said[2].1),
+            Some(true)
+        );
 
-        // Folded says the glance: "over max" alone, over block B's strip (block A's carries the
-        // time label and the scale), and only while a strip draws an over mark.
+        // Folded says the glance: "over max" alone, over block B's strip past its now marker
+        // (block A's carries the time label, right-aligned over its old end, and the scale), and
+        // only while a strip draws an over mark.
         let plan = plan_folded(1119.0, &m);
         let head = header_folded(&plan, TEXT, [None, None], &m);
         let [a, b] = plan.blocks;
-        assert_eq!(label_x(&head, Label::Time), Some(a.strip.x));
+        assert_eq!(
+            label_x(&head, Label::Time),
+            Some(a.strip.end() - m.width("6h ago", HEADER_PT, false))
+        );
         assert_eq!(
             head.labels
                 .iter()
                 .find(|l| l.label == Label::Time)
                 .map(|l| l.text.as_str()),
-            Some("15m ago")
+            Some("6h ago")
         );
         assert!(!head.ruler.is_empty(), "Folded wide places X-axis ticks");
-        assert_eq!(placed(&head, KeyItem::Over), Some(b.strip.x));
+        assert_eq!(
+            head.labels
+                .iter()
+                .filter(|l| l.label == Label::Now)
+                .map(|l| l.x)
+                .collect::<Vec<_>>(),
+            [a.strip, b.strip].map(|strip| strip.x - WORDS_TO_STRIP),
+            "\"now\" over each %, right-aligned clear of the dot's beat"
+        );
+        assert_eq!(placed(&head, KeyItem::Over), Some(b.strip.x + MARKER_ROOM));
         assert_eq!(
             (
                 placed(&head, KeyItem::Ramp),
@@ -2528,106 +3566,162 @@ mod tests {
                 .placed
                 .is_empty()
         );
-        let scopes = |head: &HeaderPlan| -> Vec<(f64, String)> {
-            head.labels
-                .iter()
-                .filter(|l| matches!(l.label, Label::Scope(_)))
-                .map(|l| (l.x, l.text.clone()))
-                .collect()
+        // The legend once, at the deck's top right: ending at block B's bar's end, over its
+        // bars and its strip's old end, clear of the over mark's key and never across the
+        // blocks' divider; with the machine's totals where they fit, as no run says the rows'
+        // maxima.
+        let whole = |global: &str| {
+            3.0 * SWATCH_ADVANCE
+                + m.width(global, HEADER_PT, false)
+                + m.width("aterm", HEADER_PT, false)
+                + m.width("Tab 2", HEADER_PT, false)
+                + 2.0 * LEGEND_GAP
         };
-        assert_eq!(
-            scopes(&head),
-            [
-                (a.bar.map_or(0.0, |c| c.x), "this Mac".to_owned()),
-                (a.aterm.map_or(0.0, |c| c.x), "aterm".to_owned()),
-                (a.tab.map_or(0.0, |c| c.x), "Tab 2".to_owned()),
-                (b.bar.map_or(0.0, |c| c.x), "this Mac".to_owned()),
-                (b.aterm.map_or(0.0, |c| c.x), "aterm".to_owned()),
-                (b.tab.map_or(0.0, |c| c.x), "Tab 2".to_owned()),
-            ],
-            "wide heads each block's columns starting at the restored scope bar"
-        );
+        let b_end = b.meter.bar.map(Col::end).expect("fwide's bar");
+        assert_legend(&head, &m, b_end - whole("this Mac"), &names);
+        let over = placed(&head, KeyItem::Over).expect("the over mark's key");
+        assert!(over + KeyItem::Over.width(&m) + KEY_GAP <= b_end - whole("this Mac") + 1e-9);
         assert_eq!(label_x(&head, Label::Details), None);
-        // Mid keys the bar once, over block A, and fits hardware totals when present.
-        let plan = plan_folded(1039.0, &m);
-        let head = header_folded(&plan, TEXT, [None, None], &m);
-        let bar = plan.blocks[0].bar.map_or(0.0, |c| c.x);
-        assert_eq!(
-            scopes(&head)
-                .iter()
-                .map(|(x, t)| (*x >= bar && *x < plan.divider, t.as_str()))
-                .collect::<Vec<_>>(),
-            [(true, "this Mac"), (true, "aterm"), (true, "Tab 2")]
-        );
-        let forms = vec![
-            "this Mac \u{b7} M5 Max \u{b7} 18c \u{b7} 128 GiB \u{b7} 2.00 TB".to_owned(),
-            "this Mac \u{b7} 18c \u{b7} 128 GiB \u{b7} 2.00 TB".to_owned(),
-            "this Mac \u{b7} 18c \u{b7} 128 GiB".to_owned(),
+        let totals = [
+            "18 cores \u{b7} 128 GiB \u{b7} 2 TB".to_owned(),
+            "18c \u{b7} 128G \u{b7} 2T".to_owned(),
         ];
-        let rich = header_folded(
-            &plan,
-            HeaderText {
-                machine_forms: &forms,
+        for w in [1039.0, 940.0, 750.0] {
+            let plan = plan_folded(w, &m);
+            let [_, b] = plan.blocks;
+            let b_end = b.meter.bar.map(Col::end).expect("the bar's column");
+            let head = header_folded(&plan, TEXT, [None, None], &m);
+            assert_legend(&head, &m, b_end - whole("this Mac"), &names);
+            let with = HeaderText {
+                totals: &totals,
                 ..TEXT
-            },
-            [None, None],
-            &m,
-        );
-        let rich_global = scopes(&rich)
-            .into_iter()
-            .next()
-            .expect("global scope label")
-            .1;
-        assert!(
-            rich_global.contains("18c") && rich_global.contains("128 GiB"),
-            "Folded mid fits hardware totals: {rich_global:?}"
-        );
+            };
+            let head = header_folded(&plan, with, [None, None], &m);
+            let said = heads(&head, &m);
+            let x0 = head
+                .labels
+                .iter()
+                .find(|l| l.label == Label::Scope(Bar::Global))
+                .map(|l| l.x)
+                .expect("the legend");
+            assert!(x0 >= b.strip.x + MARKER_ROOM, "W {w}: {:?}", head.labels);
+            assert!((said[2].1 - b_end).abs() < 1e-9, "W {w}: {said:?}");
+            assert!(said[0].0.starts_with("this Mac \u{b7} "), "W {w}: {said:?}");
+        }
     }
 
+    /// An fslim block's state takes the header: over its names, and where it needs more room
+    /// over the % column's too, short of the widest ring the now marker's dot beats (the ring
+    /// once drew over words that ended at the dot, review of 2026-10-26). Words too long even for
+    /// that take the strip's header as well, whole: the marker's dot and `now` yield to them (one
+    /// block at most), and the time scale stands over the other block's strip.
     #[test]
     fn an_fslim_state_takes_the_header() {
         let m = hn();
-        let plan = plan_folded(350.0, &m);
+        let plan = plan_folded(450.0, &m);
+        assert!(plan.blocks.iter().all(|b| b.kind == BlockKind::Slim));
         let [a, b] = plan.blocks;
+        let (a_pct, b_pct) = (a.pct.expect("fslim's %"), b.pct.expect("fslim's %"));
+        let short = StateLabel {
+            full: "Disk full",
+            bare: "Disk full",
+        };
+        let mid = StateLabel {
+            full: "Memory warn +1",
+            bare: "Memory warn",
+        };
         let long = StateLabel {
             full: "Disk full ~34 min +1",
             bare: "Disk full ~34 min",
         };
-        let head = header_folded(&plan, TEXT, [Some(long), None], &m);
-        let states: Vec<_> = head
-            .labels
-            .iter()
-            .filter(|l| l.label == Label::State)
-            .collect();
-        assert_eq!(states.len(), 1);
-        assert_eq!(
-            (states[0].x, states[0].text.as_str()),
-            (a.name.x, "Disk full ~34 min +1")
+        let nows = |head: &HeaderPlan| -> Vec<f64> {
+            head.labels
+                .iter()
+                .filter(|l| l.label == Label::Now)
+                .map(|l| l.x)
+                .collect()
+        };
+        let state_of = |head: &HeaderPlan, x: f64| -> String {
+            head.labels
+                .iter()
+                .find(|l| matches!(l.label, Label::State(_)) && l.x == x)
+                .map(|l| l.text.clone())
+                .expect("the block names its state")
+        };
+        let end_of = |x: f64, words: &str| x + MARK_ADVANCE + m.width(words, HEADER_PT, true);
+        let ring = |strip: Strip| {
+            use crate::stats_live::{BEAT_REACH, DOT_R, LINE_DX};
+            strip.x - LINE_DX - DOT_R - BEAT_REACH
+        };
+        // "now" ends over its % column, a point short of the dot's widest ring.
+        let now_end = |strip: Strip| strip.x - WORDS_TO_STRIP;
+        for (strip, pct) in [(a.strip, a_pct), (b.strip, b_pct)] {
+            let now_x = now_end(strip) - m.width("now", HEADER_PT, false);
+            assert!(now_end(strip) <= ring(strip) - 1.0 + 1e-9 && now_x >= pct.x);
+        }
+        // A state that fits over the names leaves "now" over the % and every dot.
+        let head = header_folded(&plan, TEXT, [Some(short), None], &m);
+        assert_eq!(state_of(&head, a.name.x), "Disk full");
+        assert_eq!(nows(&head), [now_end(a.strip), now_end(b.strip)]);
+        assert!(time_on(&head, a.strip, &m), "{:?}", head.labels);
+        assert_eq!(head.dotless, None);
+
+        // One that needs the %'s header too takes it, ending where "now" would, short of the
+        // dot's ring; "now" yields.
+        let head = header_folded(&plan, TEXT, [Some(mid), None], &m);
+        let words = state_of(&head, a.name.x);
+        assert!(words.starts_with("Memory warn"), "{words:?}");
+        let end = end_of(a.name.x, &words);
+        assert!(
+            end <= now_end(a.strip) + 1e-9 && end <= ring(a.strip) - 1.0 + 1e-9,
+            "{words:?} ends at {end}"
         );
+        assert!(
+            end > now_end(a.strip) - m.width("now", HEADER_PT, false) - STRIP_LEAD,
+            "CONTROL: {words:?} needed the %'s header"
+        );
+        assert_eq!(nows(&head), [now_end(b.strip)], "\"now\" yields over A");
+        assert_eq!(head.dotless, None, "the dot stays");
+
+        // A long one takes block A's strip's header too and is said whole; A's dot yields to it,
+        // and the time scale stands over B's strip.
+        let head = header_folded(&plan, TEXT, [Some(long), None], &m);
+        let words = state_of(&head, a.name.x);
+        assert_eq!(words, "Disk full ~34 min +1");
+        assert!(
+            end_of(a.name.x, &words) > now_end(a.strip),
+            "CONTROL: it needed the strip"
+        );
+        assert!(end_of(a.name.x, &words) <= a.strip.end() + 1e-9);
+        assert_eq!(head.dotless, Some(a.strip.x));
+        assert_eq!(nows(&head), [now_end(b.strip)]);
         assert!(time_on(&head, b.strip, &m), "{:?}", head.labels);
 
+        // Only one block spills: B's long state is fitted short of its dot.
         let head = header_folded(&plan, TEXT, [Some(long), Some(long)], &m);
-        let b_state = head
-            .labels
-            .iter()
-            .find(|l| l.label == Label::State && l.x == b.name.x);
-        let b_state = b_state.expect("block B names its state");
-        assert!(b_state.text.ends_with('…'));
-        assert!(
-            MARK_ADVANCE + m.width(&b_state.text, HEADER_PT, true) <= b.strip.x - 6.0 - b.name.x
-        );
+        assert_eq!(state_of(&head, a.name.x), "Disk full ~34 min +1");
+        let words = state_of(&head, b.name.x);
+        let end = end_of(b.name.x, &words);
+        assert!(words.ends_with('…'), "{words:?}");
+        assert!(end <= now_end(b.strip) + 1e-9, "{words:?}");
+        assert_eq!(head.dotless, Some(a.strip.x));
+        assert!(nows(&head).is_empty(), "{:?}", head.labels);
         assert!(time_on(&head, b.strip, &m), "{:?}", head.labels);
+        // B alone spilling keeps the scale over A.
+        let head = header_folded(&plan, TEXT, [None, Some(long)], &m);
+        assert_eq!(head.dotless, Some(b.strip.x));
+        assert!(time_on(&head, a.strip, &m), "{:?}", head.labels);
     }
 
-    /// Whether `head`'s time label stands on `strip`: over its left end, or beside it, ending
-    /// [`STRIP_LEAD`] short of it with a tick marking that end.
+    /// Whether `head`'s time label stands on `strip`: over its right (old) end, right-aligned to
+    /// it, or beside it, starting [`STRIP_LEAD`] past that end with a tick marking it.
     fn time_on(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> bool {
         head.labels.iter().any(|l| {
+            let w = m.width(&l.text, HEADER_PT, false);
             l.label == Label::Time
-                && (l.x == strip.x && head.time_tick.is_none()
-                    || (l.x + m.width(&l.text, HEADER_PT, false) - (strip.x - STRIP_LEAD)).abs()
-                        < 1e-9
-                        && head.time_tick == Some(strip.x))
+                && ((l.x + w - strip.end()).abs() < 1e-9 && head.time_tick.is_none()
+                    || (l.x - (strip.end() + STRIP_LEAD)).abs() < 1e-9
+                        && head.time_tick == Some(strip.end()))
         })
     }
 
@@ -2658,7 +3752,7 @@ mod tests {
                 .iter()
                 .filter(|l| l.label == Label::Time)
                 .count();
-            assert_eq!(times, 1, "{what}");
+            assert_eq!(times, 1, "{what}: one time label");
         };
         for m in [hn(), FaceMetrics::test_stack()] {
             for px2 in 320..=10_240 {
@@ -2666,30 +3760,33 @@ mod tests {
                 let full = plan_full(w, &m);
                 if !full.ground_only {
                     check(
-                        &header_full(&full, TEXT, &m),
+                        &header_full(&full, TEXT, None, &m),
                         &m,
                         false,
                         &format!("Full W {w}"),
+                    );
+                    // A state over the names may take the key's room there.
+                    let said = full.details.is_none();
+                    check(
+                        &header_full(&full, TEXT, Some(long), &m),
+                        &m,
+                        said,
+                        &format!("Full W {w}, a state"),
                     );
                 }
                 let folded = plan_folded(w, &m);
                 if folded.ground_only {
                     continue;
                 }
-                let fslim = folded.blocks[0].amount.is_none();
-                let states: &[[Option<StateLabel<'_>>; 2]] = if fslim {
-                    &[
-                        [None, None],
-                        [Some(long), None],
-                        [None, Some(short)],
-                        [Some(short), Some(long)],
-                        [Some(long), Some(long)],
-                    ]
-                } else {
-                    &[[Some(long), Some(long)]]
-                };
-                for &pair in states {
-                    let both = fslim && pair.iter().all(Option::is_some);
+                let states: [[Option<StateLabel<'_>>; 2]; 5] = [
+                    [None, None],
+                    [Some(long), None],
+                    [None, Some(short)],
+                    [Some(short), Some(long)],
+                    [Some(long), Some(long)],
+                ];
+                for pair in states {
+                    let both = pair.iter().all(Option::is_some);
                     let head = header_folded(&folded, TEXT, pair, &m);
                     check(&head, &m, both, &format!("Folded W {w}"));
                 }

@@ -232,6 +232,18 @@ impl Scratch {
         self.path.join(rel)
     }
 
+    /// The scratch's own folder.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "only the macOS-only scratch-removal test reads the scratch's own folder"
+        )
+    )]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// `rel`, created with its parents.
     pub fn mkdir(&self, rel: &str) -> PathBuf {
         let dir = self.join(rel);
@@ -261,6 +273,23 @@ impl Scratch {
         }
         aterm_tempfile::stand_in(&file, body).expect("a stand-in");
         file
+    }
+}
+
+/// A test's folder can carry an ACL that denies its own removal (`group:everyone deny delete`),
+/// and then the TempDir could not remove the scratch: it stayed in [`scratch_root`], and a
+/// removal of the folder that holds it stopped at it. So every ACL under the scratch goes first,
+/// on a failed test's unwind too (`chmod -R` does not follow a link out of it).
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        let _ = aterm_uds::spawnfd::command("/bin/chmod")
+            .args(["-R", "-N"])
+            .arg(&self.path)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .status();
     }
 }
 

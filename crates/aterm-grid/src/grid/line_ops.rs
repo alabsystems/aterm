@@ -299,6 +299,8 @@ impl Grid {
         let width = right_usize + 1 - left_usize;
         let cols = self.storage.cols as usize;
 
+        // Unpair what straddles a margin first, so the shift splits no glyph.
+        self.unpair_margin_straddlers(top, bottom, left_usize, right_usize);
         let mut buf = vec![super::Cell::EMPTY; width];
         for dst_offset in (n..region_size).rev() {
             let dst_row = row_u16(top + dst_offset);
@@ -469,6 +471,8 @@ impl Grid {
         let width = right_usize + 1 - left_usize;
         let cols = self.storage.cols as usize;
 
+        // Unpair what straddles a margin first, so the shift splits no glyph.
+        self.unpair_margin_straddlers(top, bottom, left_usize, right_usize);
         let mut buf = vec![super::Cell::EMPTY; width];
         for dst_offset in 0..(region_size - n) {
             let dst_row = row_u16(top + dst_offset);

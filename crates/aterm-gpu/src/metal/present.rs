@@ -180,7 +180,6 @@ impl MetalWindowSurface {
     }
 
     /// Current swapchain configuration.
-    #[cfg(not(wgpu_arm))]
     #[inline]
     pub(crate) const fn config(&self) -> &SwapchainConfig {
         &self.config
@@ -277,7 +276,6 @@ pub(crate) fn parent_layer_of<W: aterm_objc::HasNsView>(target: &W) -> Option<Ob
 }
 
 /// Query `maximumPotentialExtendedDynamicRangeColorComponentValue` for `target`'s window screen.
-#[cfg(not(wgpu_arm))]
 pub(crate) fn screen_edr_potential_of<W: aterm_objc::HasNsView>(target: &W) -> Option<f32> {
     let view: ffi::Id = target.ns_view();
     if view.is_null() {
@@ -724,7 +722,7 @@ mod tests {
     /// Live drift, deviceless-nil and latch refusals map to `Reconfigured`,
     /// `Timeout`/`Occluded` (by the hint) and `Validation`.
     #[test]
-    fn acquire_refusals_map_to_the_wgpu_failure_contract() {
+    fn acquire_refusals_map_to_the_surface_failure_contract() {
         let dev = device();
         let latch = Arc::new(LossLatch::new());
         let config = SwapchainConfig {

@@ -655,8 +655,10 @@ fn lay_view_aside(layout: &Layout, build: &Path, view: &Path) -> io::Result<Refr
         let _ = crate::store::remove_tree(&aside);
         return Err(e);
     }
+    // Accepted, failed or not: the new view's link stands, and a view a power cut takes
+    // back is put in order by settle_view_aside and laid again from its build.
     if let Some(root) = view.parent() {
-        crate::store::sync_dir_ordered(root);
+        let _linked = crate::store::sync_dir_ordered(root);
     }
     if plain {
         let _ = std::fs::remove_dir_all(&parked);

@@ -287,6 +287,7 @@ pub const fn material_bitmap(c: char) -> Option<[u8; 8]> {
 }
 
 /// Authors a hybrid 64-slot master with `chars` in the leading slots and decorative ROM in the tail.
+#[inline]
 #[must_use]
 pub fn rasterize_material_master(chars: &[char]) -> RomMaster {
     let mut master = rasterize_master();
@@ -299,6 +300,7 @@ pub fn rasterize_material_master(chars: &[char]) -> RomMaster {
     master
 }
 
+#[inline]
 fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) -> bool {
     let Some(bitmap) = material_bitmap(ch) else {
         return false;
@@ -330,6 +332,7 @@ fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) -> bool 
 }
 
 /// Re-authors `slot` of `master` in place for `ch`, or restores its decorative glyph when `None` or unsupported.
+#[inline]
 pub fn reauthor_material_glyph(master: &mut RomMaster, slot: usize, ch: Option<char>) {
     if slot >= ROM_GLYPHS {
         return;
@@ -368,6 +371,7 @@ const fn stamp_thick(rows: &mut [u32; ROM_GLYPHS * MASTER_H], base: usize, x: i3
     }
 }
 
+#[inline]
 const fn stamp_line(
     rows: &mut [u32; ROM_GLYPHS * MASTER_H],
     base: usize,
@@ -397,6 +401,7 @@ const fn stamp_line(
     }
 }
 
+#[inline]
 const fn stamp_dot(rows: &mut [u32; ROM_GLYPHS * MASTER_H], base: usize, x: i32, y: i32) {
     let mut dy = -2;
     while dy <= 2 {

@@ -311,7 +311,7 @@ mod imp {
         }
         Ok(Some(match symbol(pc) {
             Some(name) if name == "flock" => Asleep::Flock {
-                fd: i32::try_from(arg & 0xffff_ffff).unwrap_or(-1),
+                fd: super::low_c_int(arg),
             },
             Some(name) => Asleep::Elsewhere(name),
             None => Asleep::Elsewhere(format!("pc {pc:#x}")),
@@ -319,16 +319,70 @@ mod imp {
     }
 }
 
+/// Truncates a 64-bit syscall argument register to its low 32-bit signed C `int` descriptor.
+pub(crate) fn low_c_int(reg: u64) -> i32 {
+    let low = u32::try_from(reg & 0xffff_ffff).unwrap_or(u32::MAX);
+    i32::from_ne_bytes(low.to_ne_bytes())
+}
+
+#[cfg(any(target_os = "linux", test))]
+mod proc_syscall {
+    use super::{Asleep, low_c_int};
+
+    /// `flock(2)`'s number in `/proc/<pid>/task/<tid>/syscall`, which the kernel formats in its
+    /// own architecture's syscall table even when this process runs under a binary translator
+    /// (`x86_64` under Rosetta on an `aarch64` kernel reports `32`, not `73`).
+    pub(super) const fn sys_flock_for_kernel_arch(arch: &str) -> Option<i64> {
+        match arch.trim_ascii().as_bytes() {
+            b"x86_64" => Some(73),
+            b"aarch64" => Some(32),
+            _ => None,
+        }
+    }
+
+    pub(super) fn parse_with(line: &str, flock_nr: i64) -> Option<Asleep> {
+        let mut words = line.split_whitespace();
+        let first = words.next()?;
+        if first == "running" {
+            return None;
+        }
+        Some(match first.parse::<i64>() {
+            Ok(n) if n == flock_nr => Asleep::Flock {
+                fd: words
+                    .next()
+                    .and_then(|a| a.strip_prefix("0x"))
+                    .and_then(|a| u64::from_str_radix(a, 16).ok())
+                    .map_or(-1, low_c_int),
+            },
+            Ok(-1) => Asleep::Elsewhere("no call".to_string()),
+            Ok(n) => Asleep::Elsewhere(format!("syscall {n}")),
+            Err(_) => Asleep::Elsewhere(first.to_string()),
+        })
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use std::io;
+    use std::sync::OnceLock;
 
+    use super::proc_syscall::{parse_with, sys_flock_for_kernel_arch};
     use super::{Asleep, Thread};
 
     #[cfg(target_arch = "x86_64")]
-    const SYS_FLOCK: i64 = 73;
+    const TARGET_SYS_FLOCK: i64 = 73;
     #[cfg(target_arch = "aarch64")]
-    const SYS_FLOCK: i64 = 32;
+    const TARGET_SYS_FLOCK: i64 = 32;
+
+    pub(super) fn sys_flock() -> i64 {
+        static NR: OnceLock<i64> = OnceLock::new();
+        *NR.get_or_init(|| {
+            std::fs::read_to_string("/proc/sys/kernel/arch")
+                .ok()
+                .and_then(|arch| sys_flock_for_kernel_arch(&arch))
+                .unwrap_or(TARGET_SYS_FLOCK)
+        })
+    }
 
     pub(super) fn this_thread() -> Thread {
         // SAFETY: `gettid` takes no argument and cannot fail.
@@ -351,23 +405,7 @@ mod imp {
     /// What `/proc/<pid>/task/<tid>/syscall` says: `running`, `-1 …` (asleep in no call), or
     /// the call's number and its arguments in hex.
     pub(super) fn parse(line: &str) -> Option<Asleep> {
-        let mut words = line.split_whitespace();
-        let first = words.next()?;
-        if first == "running" {
-            return None;
-        }
-        Some(match first.parse::<i64>() {
-            Ok(SYS_FLOCK) => Asleep::Flock {
-                fd: words
-                    .next()
-                    .and_then(|a| a.strip_prefix("0x"))
-                    .and_then(|a| i32::from_str_radix(a, 16).ok())
-                    .unwrap_or(-1),
-            },
-            Ok(-1) => Asleep::Elsewhere("no call".to_string()),
-            Ok(n) => Asleep::Elsewhere(format!("syscall {n}")),
-            Err(_) => Asleep::Elsewhere(first.to_string()),
-        })
+        parse_with(line, sys_flock())
     }
 
     pub(super) fn asleep(thread: Thread) -> io::Result<Option<Asleep>> {
@@ -474,23 +512,65 @@ mod tests {
     }
 
     /// Linux's reading of `/proc/<pid>/task/<tid>/syscall`'s shapes.
-    #[cfg(target_os = "linux")]
     #[test]
     fn the_proc_syscall_line_names_flock_and_its_descriptor_another_call_or_none() {
-        use super::imp::parse;
-        assert_eq!(parse("running\n"), None);
+        use super::low_c_int;
+        use super::proc_syscall::{parse_with, sys_flock_for_kernel_arch};
+        assert_eq!(parse_with("running\n", 73), None);
         assert_eq!(
-            parse("-1 0x7ffc 0x401000\n"),
+            parse_with("-1 0x7ffc 0x401000\n", 73),
             Some(Asleep::Elsewhere("no call".into()))
         );
-        #[cfg(target_arch = "x86_64")]
-        let (flock, other) = ("73 0x1a 0x2 0x0 0x0 0x0 0x0 0x7ffc 0x401000\n", "202");
-        #[cfg(target_arch = "aarch64")]
-        let (flock, other) = ("32 0x1a 0x2 0x0 0x0 0x0 0x0 0x7ffc 0x401000\n", "98");
-        assert_eq!(parse(flock), Some(Asleep::Flock { fd: 26 }));
-        assert_eq!(
-            parse(&format!("{other} 0x1 0x2\n")),
-            Some(Asleep::Elsewhere(format!("syscall {other}")))
-        );
+        assert_eq!(sys_flock_for_kernel_arch("x86_64\n"), Some(73));
+        assert_eq!(sys_flock_for_kernel_arch("aarch64\n"), Some(32));
+        assert_eq!(sys_flock_for_kernel_arch("unknown\n"), None);
+        assert_eq!(low_c_int(0x1_0000_001a), 26);
+        assert_eq!(low_c_int(0x8000_0000), i32::MIN);
+        assert_eq!(low_c_int(0xffff_ffff_ffff_fffe), -2);
+        for (flock_nr, other) in [(73, 32), (32, 73)] {
+            assert_eq!(
+                parse_with(
+                    &format!("{flock_nr} 0x1a 0x2 0x0 0x0 0x0 0x0 0x7ffc 0x401000\n"),
+                    flock_nr
+                ),
+                Some(Asleep::Flock { fd: 26 })
+            );
+            assert_eq!(
+                parse_with(
+                    &format!("{flock_nr} 0x10000001a 0x2 0x0 0x0 0x0 0x0 0x7ffc 0x401000\n"),
+                    flock_nr
+                ),
+                Some(Asleep::Flock { fd: 26 }),
+                "upper 32-bit register noise truncated to C int descriptor"
+            );
+            assert_eq!(
+                parse_with(
+                    &format!("{flock_nr} 0xfffffffffffffffe 0x2 0x0 0x0 0x0 0x0 0x7ffc 0x401000\n"),
+                    flock_nr
+                ),
+                Some(Asleep::Flock { fd: -2 }),
+                "sign-extended 64-bit negative descriptor preserved"
+            );
+            assert_eq!(
+                parse_with(&format!("{other} 0x1a 0x2\n"), flock_nr),
+                Some(Asleep::Elsewhere(format!("syscall {other}")))
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use super::imp::{parse, sys_flock};
+            let live = sys_flock();
+            let other = if live == 32 { 98 } else { 202 };
+            assert_eq!(
+                parse(&format!(
+                    "{live} 0x1a 0x2 0x0 0x0 0x0 0x0 0x7ffc 0x401000\n"
+                )),
+                Some(Asleep::Flock { fd: 26 })
+            );
+            assert_eq!(
+                parse(&format!("{other} 0x1 0x2\n")),
+                Some(Asleep::Elsewhere(format!("syscall {other}")))
+            );
+        }
     }
 }

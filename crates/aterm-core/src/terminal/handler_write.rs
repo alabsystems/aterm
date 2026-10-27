@@ -163,6 +163,13 @@ impl TerminalHandler<'_> {
         }
         self.transient.last_combining_was_zwj = false;
 
+        if width == 2 && self.grid.cols() < 2 {
+            // A screen one column wide has no room for a wide glyph: it prints as a narrow
+            // space in the pen, as Ghostty's `print` writes it (xterm's `dotext` gives up on
+            // the glyph), never a blank-and-wrap that leaves the cursor on the next row.
+            self.write_char_core(' ', 1);
+            return;
+        }
         self.write_char_core(translated, width);
     }
 
@@ -175,13 +182,16 @@ impl TerminalHandler<'_> {
         // Preconditions: no insert mode, autowrap on, no style extras. VT52
         // addressing never reaches here (`print_unicode_bulk` routes it per
         // character). U+00A0-U+00FF may need GR-mapped translation when a
-        // non-ASCII charset is designated on the GR G-set, so fall back then.
+        // non-ASCII charset is designated on the GR G-set, so fall back then,
+        // and on a screen one column wide, where `write_char` prints a wide
+        // glyph as a narrow space.
         if self.modes.insert_mode
             || !self.modes.auto_wrap
             || self.transient.has_transient_extras
             || self.style.has_style_extras()
             || self.transient.last_combining_was_zwj
             || !self.charset.gr_is_passthrough()
+            || self.grid.cols() < 2
         {
             for &c in chars {
                 self.write_char(c);
@@ -408,8 +418,10 @@ impl TerminalHandler<'_> {
         let (did_write, ecols) = if width == 2 {
             let mut ecols = self.grid.effective_cols_for_current_row();
             if self.modes.auto_wrap {
+                // The print edge is the right margin, as on the fast path: a wide glyph
+                // with one column left before it wraps (xterm `dotext`, Ghostty `print`).
                 let fill = crate::grid::Cell::bce_blank(colors);
-                ecols = self.grid.pre_wrap_wide_ecols(ecols, fill);
+                ecols = self.grid.pre_wrap_wide_ecols(fill);
             }
             if self.modes.insert_mode {
                 if !self.modes.auto_wrap && self.grid.cursor_col().saturating_add(1) >= ecols {

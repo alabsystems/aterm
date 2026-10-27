@@ -441,6 +441,7 @@ fn every_themes_screen_names_its_section(scale: f32) {
         (1_074.0, 684.0, true),
         (164.0, 348.0, true),
         (178.0, 348.0, true),
+        (178.0, 516.0, true),
         (244.0, 440.0, true),
         (300.0, 516.0, true),
     ] {
@@ -461,9 +462,20 @@ fn every_themes_screen_names_its_section(scale: f32) {
             }
         });
         let row = showcase_page::chooser_row_height();
-        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+        each_screen_of(&mut runtime, instance, view, &cx, |state, compiled, top| {
             let list = rect_of(compiled, "settings/showcase/list");
             if list.height + 0.5 < row + tallest.max(row) {
+                return;
+            }
+            // A screen that starts on a row the list holds whole only without its section's
+            // caption starts bare ([`scroll::ScrollPlan::starts_bare`]): the whole row wins.
+            // Every other screen inside a section names it, whatever row of it does not fit
+            // under its caption (178x516 at 2x: one four-line name lost COMMUNITY over every
+            // screen of the open Community section).
+            if state
+                .scroll_plan()
+                .is_some_and(|plan| plan.screen(top.min(plan.limit())).bare)
+            {
                 return;
             }
             let first = compiled
@@ -7247,6 +7259,181 @@ fn the_page_keys_show_every_chooser_row_whole() {
                 }
             }
         }
+    });
+}
+
+/// THE KEYS FROM A FILTER LISTED WITH THE ROWS MOVE THROUGH THE LIST: in windows too short or
+/// narrow to pin the filter over the chooser (178x152, 164x98, 300x160, 444x180, at 1× and 2×
+/// text), with the keyboard in the filter, Page Down shows every row whole on some screen and
+/// Page Up brings the filter back whole; after every key the keyboard's control is drawn, and
+/// no key tries a theme whose row the screen does not draw whole. Negative control: the keys
+/// drove the highlight from the filter, trying theme after theme while every screen stayed on
+/// the filter, the rows never drawn (Page Down never left it at 178x152).
+#[test]
+fn the_keys_from_a_filter_listed_with_the_rows_move_through_the_list() {
+    const FILTER: &str = "settings/showcase/filter";
+    let whole = |node: &crate::native_ui::PaintNode| {
+        !node.peek
+            && node.clip.height > 0.5
+            && node.clip.y <= node.rect.y + 0.5
+            && node.clip.bottom() + 0.5 >= node.rect.bottom()
+    };
+    at_each_text_scale(&[1.0, 2.0], "listed filter keys", |scale| {
+        let mut faults = Vec::new();
+        for (width, height) in [
+            (178.0, 152.0),
+            (164.0, 98.0),
+            (300.0, 160.0),
+            (444.0, 180.0),
+        ] {
+            let context = format!("{width}x{height} at {scale}x");
+            let cx = view_cx_at(width, height);
+            let (_service, mut runtime, instance, view) = themes_view("theme = \"Default\"\n");
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            let listed = state(&runtime, view)
+                .scroll_plan()
+                .is_some_and(|plan| plan.stop_of(&UiKey::new(FILTER)).is_some());
+            if !listed {
+                faults.push(format!("{context}: the filter stands over the rows"));
+                continue;
+            }
+            let shown = state(&runtime, view);
+            let order: Vec<String> = shown
+                .showcase
+                .visible()
+                .into_iter()
+                .map(|index| {
+                    format!(
+                        "settings/showcase/card/{}",
+                        shown.showcase.cards[index].slug
+                    )
+                })
+                .collect();
+            let into_filter = |runtime: &mut NativeRuntime| {
+                let _ = dispatch(
+                    runtime,
+                    instance,
+                    view,
+                    AppEvent::FocusChanged(Some(UiKey::new(FILTER))),
+                );
+            };
+            // What a screen shows of the rows (each whole, or, taller than the list, from its
+            // top), and whether it breaks the rules: the keyboard's control undrawn, a theme
+            // tried whose row it does not show.
+            let tried = |runtime: &NativeRuntime| {
+                let shown = state(runtime, view);
+                matches!(shown.showcase.trial, ShowcaseTrial::Trying { .. })
+                    .then(|| shown.highlighted_slug())
+                    .flatten()
+            };
+            let look = |runtime: &NativeRuntime,
+                        at: &str,
+                        was: Option<String>,
+                        faults: &mut Vec<String>| {
+                let compiled = compile_settings_view(runtime, instance, view, &cx);
+                let room = rect_of(&compiled, showcase_page::SHOWCASE_LIST).height;
+                let drawn: Vec<String> = compiled
+                    .paint
+                    .iter()
+                    .filter(|node| {
+                        whole(node)
+                            || (node.rect.height > room + 0.5
+                                && node.clip.height > 0.5
+                                && node.clip.y <= node.rect.y + 0.5)
+                    })
+                    .map(|node| node.key.as_str().to_string())
+                    .collect();
+                let shown = state(runtime, view);
+                // A screen that draws a control has the keyboard on one (a screen with none
+                // leaves it where it was, as on every page).
+                let controls = compiled.paint.iter().any(|node| {
+                    node.clip.height > 0.5
+                        && !node.key.as_str().starts_with("settings/compact-")
+                        && !node.key.as_str().starts_with("settings/search")
+                        && compiled.focus_order.contains(&node.key)
+                });
+                if controls
+                    && let Some(focus) = shown.common.last_focus.as_ref()
+                    && !compiled
+                        .paint
+                        .iter()
+                        .any(|node| node.key == *focus && node.clip.height > 0.5)
+                {
+                    faults.push(format!(
+                        "{context} {at}: the keyboard's {focus:?} is not drawn"
+                    ));
+                }
+                // A key that tries a theme shows its row.
+                if let Some(slug) = tried(runtime).filter(|slug| was.as_ref() != Some(slug))
+                    && !drawn.contains(&format!("settings/showcase/card/{slug}"))
+                {
+                    let rows: Vec<&String> =
+                        drawn.iter().filter(|key| order.contains(key)).collect();
+                    faults.push(format!(
+                        "{context} {at}: {slug} is tried, its row not shown ({rows:?}, the \
+                         keyboard on {:?})",
+                        shown.common.last_focus
+                    ));
+                }
+                let place = (
+                    shown.page_scroll,
+                    shown.common.last_focus.clone(),
+                    drawn.clone(),
+                );
+                (drawn, place)
+            };
+            into_filter(&mut runtime);
+            let (drawn, mut before) = look(&runtime, "in the filter", None, &mut faults);
+            let mut seen: BTreeSet<String> = drawn.into_iter().collect();
+            for turn in 0..4 * order.len() + 8 {
+                let was = tried(&runtime);
+                let _ = dispatch(&mut runtime, instance, view, AppEvent::ScrollPage(1));
+                let (drawn, place) = look(&runtime, &format!("Page Down {turn}"), was, &mut faults);
+                seen.extend(drawn);
+                if place == before {
+                    break;
+                }
+                before = place;
+            }
+            let never: Vec<&String> = order.iter().filter(|row| !seen.contains(*row)).collect();
+            if !never.is_empty() {
+                faults.push(format!(
+                    "{context}: by Page Down from the filter, never shown: {never:?}"
+                ));
+            }
+            let mut back = false;
+            for turn in 0..4 * order.len() + 8 {
+                let was = tried(&runtime);
+                let _ = dispatch(&mut runtime, instance, view, AppEvent::ScrollPage(-1));
+                let (drawn, place) = look(&runtime, &format!("Page Up {turn}"), was, &mut faults);
+                back |= drawn.iter().any(|key| key == FILTER);
+                if place == before {
+                    break;
+                }
+                before = place;
+            }
+            if !back {
+                faults.push(format!("{context}: Page Up never brings the filter back"));
+            }
+            into_filter(&mut runtime);
+            let _ = look(&runtime, "back in the filter", tried(&runtime), &mut faults);
+            for (event, name) in [
+                (AppEvent::StepFocus(1), "Down"),
+                (AppEvent::StepFocus(-1), "Up"),
+            ] {
+                into_filter(&mut runtime);
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                let was = tried(&runtime);
+                let _ = dispatch(&mut runtime, instance, view, event);
+                let _ = look(
+                    &runtime,
+                    &format!("{name} from the filter"),
+                    was,
+                    &mut faults,
+                );
+            }
+        }
+        assert!(faults.is_empty(), "{}", faults.join("\n"));
     });
 }
 

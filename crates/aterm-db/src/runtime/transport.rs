@@ -72,6 +72,7 @@ impl Worker {
             .name("commons-repair".into())
             .spawn(move || {
                 let mut repair = repair;
+                repair.begin_round();
                 let result = (|| -> Result<()> {
                     let (connection, side) = if let Some(connection) = connection {
                         (connection, Side::Responder)
@@ -98,7 +99,11 @@ impl Worker {
                     Ok(())
                 })();
                 let mut control = control.lock().unwrap_or_else(|p| p.into_inner());
-                let success = result.is_ok() && !control.stopped && repair.actor().is_some();
+                let success =
+                    result.is_ok() && !control.stopped && repair.authenticated_actor().is_some();
+                if control.stopped {
+                    repair.begin_round();
+                }
                 control.socket = None;
                 (target, repair, success)
             })?;
@@ -130,7 +135,7 @@ struct Link {
 }
 
 pub(super) struct Transport {
-    endpoint: Arc<Endpoint>,
+    endpoint: Option<Arc<Endpoint>>,
     links: Vec<Link>,
     hints: Hints,
     workers: Vec<Worker>,
@@ -138,18 +143,27 @@ pub(super) struct Transport {
     dial: Instant,
     rotate: Instant,
     scope: Scope,
+    contacts: Vec<(astream_wire::sync::Actor, Instant)>,
+    failed: bool,
     #[cfg(test)]
     observed: std::collections::BTreeMap<astream_wire::sync::Digest, usize>,
 }
 impl Transport {
     pub(super) fn open(endpoint: Endpoint, addresses: &[SocketAddr]) -> Result<Self> {
+        Self::open_mode(Some(endpoint), addresses)
+    }
+    /// Opaque presence only: no TCP listener, identity advertisement or dialing.
+    pub(super) fn presence_only(addresses: &[SocketAddr]) -> Result<Self> {
+        Self::open_mode(None, addresses)
+    }
+    fn open_mode(endpoint: Option<Endpoint>, addresses: &[SocketAddr]) -> Result<Self> {
         let mut token = [0; 32];
         SystemRandom::new()
             .fill(&mut token)
             .map_err(|_| crate::Error::new("discovery randomness unavailable"))?;
         let now = Instant::now();
         let mut transport = Self {
-            endpoint: Arc::new(endpoint),
+            endpoint: endpoint.map(Arc::new),
             links: Vec::new(),
             hints: Hints::new(token),
             workers: Vec::new(),
@@ -157,6 +171,8 @@ impl Transport {
             dial: now,
             rotate: now + Duration::from_secs(300),
             scope: Scope::Lan,
+            contacts: Vec::new(),
+            failed: false,
             #[cfg(test)]
             observed: std::collections::BTreeMap::new(),
         };
@@ -164,6 +180,7 @@ impl Transport {
         Ok(transport)
     }
     pub(super) fn refresh(&mut self, addresses: &[SocketAddr]) {
+        self.failed = false;
         for address in addresses {
             let IpAddr::V4(source) = address.ip() else {
                 continue;
@@ -171,10 +188,15 @@ impl Transport {
             if self.links.iter().any(|link| link.source == address.ip()) {
                 continue;
             }
-            let listener = if self.endpoint.pending() {
+            let listener = if self
+                .endpoint
+                .as_ref()
+                .is_none_or(|endpoint| endpoint.pending())
+            {
                 None
             } else {
                 let Ok(listener) = Listener::bind(*address, self.scope) else {
+                    self.failed = true;
                     continue;
                 };
                 Some(listener)
@@ -186,16 +208,31 @@ impl Transport {
                     hints,
                 });
                 self.beacon = Instant::now();
+            } else {
+                self.failed = true;
             }
         }
     }
     pub(super) fn interfaces(&self) -> usize {
         self.links.len()
     }
+    pub(super) fn unavailable(&self) -> bool {
+        self.links.is_empty() && self.failed
+    }
     pub(super) fn peers(&self) -> usize {
         self.hints.count()
     }
+    pub(super) fn unverified_peers(&self) -> usize {
+        self.hints.unverified_count()
+    }
+    pub(super) fn take_contacts(&mut self) -> Vec<(astream_wire::sync::Actor, Instant)> {
+        std::mem::take(&mut self.contacts)
+    }
     pub(super) fn tick(&mut self, now: Instant) -> io::Result<()> {
+        self.hints.expire_presence(now);
+        if self.endpoint.is_none() {
+            self.hints.expire_listen_only(now);
+        }
         if now >= self.rotate {
             let mut token = [0; 32];
             SystemRandom::new()
@@ -210,6 +247,15 @@ impl Transport {
                 let worker = self.workers.swap_remove(index);
                 match worker.task.join() {
                     Ok((target, repair, success)) => {
+                        if let Some((actor, at)) = repair.authenticated_contact() {
+                            if let Some((_, old)) =
+                                self.contacts.iter_mut().find(|(id, _)| *id == actor)
+                            {
+                                *old = (*old).max(at);
+                            } else if self.contacts.len() < 64 {
+                                self.contacts.push((actor, at));
+                            }
+                        }
                         #[cfg(test)]
                         if let Some(report) = repair.application()
                             && let Some(table) = report.table
@@ -238,11 +284,12 @@ impl Transport {
                     listener.recheck()?;
                 }
                 link.hints.recheck()?;
-                if now >= self.beacon
-                    && let Some(listener) = &link.listener
-                {
-                    link.hints
-                        .send(&self.hints.wire(listener.local_addr()?.port()))?;
+                if now >= self.beacon {
+                    let wire = match &link.listener {
+                        Some(listener) => self.hints.wire(listener.local_addr()?.port()),
+                        None => self.hints.presence_wire(),
+                    };
+                    link.hints.send(&wire)?;
                 }
                 // Bound work from an unauthenticated multicast flood per tick.
                 for _ in 0..16 {
@@ -255,15 +302,17 @@ impl Transport {
                         continue;
                     }
                     self.hints.observe(&wire, source, now);
+                    self.hints.observe_presence(&wire, source, now);
                 }
                 // Unproved inbound peers cannot occupy the outbound repair budget.
                 if self.workers.len() < WORKERS
                     && self.workers.iter().filter(|worker| worker.incoming).count() < WORKERS / 2
                     && let Some(listener) = &link.listener
+                    && let Some(endpoint) = &self.endpoint
                 {
                     match listener.accept() {
                         Ok(connection) => self.workers.push(Worker::start(
-                            self.endpoint.clone(),
+                            endpoint.clone(),
                             Some(connection),
                             None,
                             self.scope,
@@ -280,6 +329,7 @@ impl Transport {
                 Ok(())
             })();
             if serviced.is_err() {
+                self.failed = true;
                 let local = self.links.remove(index).source;
                 for worker in &self.workers {
                     worker.stop_on(local);
@@ -292,17 +342,12 @@ impl Transport {
             self.beacon = now + Duration::from_secs(5);
         }
         if now >= self.dial
+            && let Some(endpoint) = &self.endpoint
             && !self.links.is_empty()
             && self.workers.len() < WORKERS
             && let Some((address, repair)) = self.hints.next(now)
         {
-            match Worker::start(
-                self.endpoint.clone(),
-                None,
-                Some(address),
-                self.scope,
-                repair,
-            ) {
+            match Worker::start(endpoint.clone(), None, Some(address), self.scope, repair) {
                 Ok(worker) => self.workers.push(worker),
                 Err(error) => {
                     self.hints.finish(address, Repair::default(), false, now);

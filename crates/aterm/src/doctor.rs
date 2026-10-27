@@ -18,8 +18,40 @@ use aterm_converge::{
 };
 use atpkg::converge::repair::{self, Ground, Pass};
 
-/// What bare doctor says when an install pass holds the store (design §3.2).
-pub(crate) const CONTENDED: &str = "an install pass holds the store; nothing was repaired";
+/// What bare doctor says when an install pass holds the store and the wait for it ran out
+/// (design §3.2).
+pub(crate) const CONTENDED: &str =
+    "an install pass holds the store; nothing that needs it was repaired";
+
+/// Why the pass's own items are left to it: a run nobody waits in, beside an install pass
+/// that holds the store (each row's `why` ends with it, and it leads the `repair:` note).
+pub(crate) const PASS_LAYS: &str = "the running install pass lays these";
+
+/// What a [`Wait`] answers: the store lock, or why it was not had.
+type Waited = Result<atpkg::lock::StoreLock, atpkg::lock::StoreLockError>;
+
+/// The wait behind an install pass holding the store, for a person at the terminal
+/// ([`wait_for_pass`]; a test's own).
+pub(crate) type Wait = dyn Fn(&atpkg::store::Layout) -> Waited;
+
+/// Whether a person is at this terminal, who waits for an install pass holding the store: stdin
+/// and stderr, where the wait's one line goes, are both terminals.
+fn person_at_terminal() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// [`Wait`] for `aterm <verb>`: up to [`atpkg::lock::TYPED_WAIT`], the pass's own progress on one
+/// line ([`atpkg::lock::lock_store_waiting_shown`]).
+fn wait_for_pass(verb: &'static str) -> impl Fn(&atpkg::store::Layout) -> Waited {
+    move |layout| {
+        atpkg::lock::lock_store_waiting_shown(
+            layout,
+            atpkg::lock::TYPED_WAIT,
+            &format!("aterm {verb}"),
+        )
+    }
+}
 
 /// `aterm doctor [--read-only] [--json] [--only <id,...>] | (--check | --apply | --restore)
 /// [--json]` over this machine.
@@ -68,6 +100,7 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
     let docs: Option<&DocsRepair<'_>> = Some(&rust_docs);
     #[cfg(not(target_os = "macos"))]
     let docs = None;
+    let wait = wait_for_pass("doctor");
     let ran = run(
         &args,
         &Ports {
@@ -78,6 +111,7 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
             not_own_account: aterm_types::dirs::not_own_account(),
             develop,
             docs,
+            wait: person_at_terminal().then_some(&wait as &Wait),
         },
     );
     cli::answer(&ran.text, ran.code, ran.stdout, ran.hand_over)
@@ -157,6 +191,10 @@ pub(crate) struct Ports<'a> {
     /// The `rust-docs` repair ([`DocsRepair`]), built and run in the account's own shell when
     /// the gather found Spotlight indexing rust-docs pages; `None` where aterm has none.
     pub(crate) docs: Option<&'a DocsRepair<'a>>,
+    /// The wait behind an install pass holding the store, for a person at the terminal, taken
+    /// only when a repair needs the store ([`needs_the_store`]); `None` with nobody there, and
+    /// the pass's own items are left to it ([`How::LeftToPass`]).
+    pub(crate) wait: Option<&'a Wait>,
 }
 
 /// A run's answer: the text (the report, the JSON, or the refusal), its exit status,
@@ -177,8 +215,15 @@ enum How {
     Applied,
     /// `--read-only`, or a shell not the account's own: probed and planned, unlocked.
     Planned,
-    /// An install pass held the lock: each stood aside, and this line says so (a note).
+    /// An install pass held the lock and the wait for it ran out: what touches nothing of the
+    /// store runs unlocked and the rest stands aside ([`beside_the_pass`]), and this line says
+    /// so (a note).
     StoodAside(String),
+    /// An install pass held the lock and nobody waits for it, or no repair needs the lock
+    /// ([`needs_the_store`]): its own items are left to it
+    /// ([`PASS_LAYS`]), what touches nothing of the store runs unlocked, and the rest stands
+    /// aside ([`beside_the_pass`]); this line says so (a note).
+    LeftToPass(String),
     /// The lock could not be taken for another reason: each change is held back, and
     /// this line says why (a warning: the store is not in order).
     HeldBack(String),
@@ -339,35 +384,66 @@ fn converge<'a>(
         _ => Vec::new(),
     };
 
+    let scope = Scope {
+        not_own_account: ports.not_own_account,
+        ..Scope::REPAIR
+    };
     let mut lock = None;
+    // Whether this run waited for an install pass: what it read of the store before is stale.
+    let mut waited = false;
     let how = match ports.ground {
         _ if args.read_only || !own => How::Planned,
-        Some(ground) if !repairs.is_empty() => match atpkg::lock::try_lock_store(&ground.layout) {
-            Ok(held) => {
-                lock = Some(held);
-                How::Applied
+        Some(ground) if !repairs.is_empty() => {
+            // A person at the terminal waits for an install pass holding the store when a repair
+            // needs it, so one run is enough; with nobody there, or nothing for the lock to do,
+            // the pass's own items are left to it and the report comes at once.
+            let taken = match (atpkg::lock::try_lock_store(&ground.layout), ports.wait) {
+                (Err(atpkg::lock::StoreLockError::Contended(_)), Some(wait))
+                    if needs_the_store(&repairs, scope) =>
+                {
+                    waited = true;
+                    let taken = wait(&ground.layout);
+                    ground.reads.forget();
+                    taken
+                }
+                (taken, _) => taken,
+            };
+            match taken {
+                Ok(held) => {
+                    lock = Some(held);
+                    How::Applied
+                }
+                Err(atpkg::lock::StoreLockError::Contended(_)) if !waited => {
+                    How::LeftToPass(format!("an install pass holds the store; {PASS_LAYS}"))
+                }
+                Err(atpkg::lock::StoreLockError::Contended(_)) => {
+                    How::StoodAside(CONTENDED.to_owned())
+                }
+                Err(why) => How::HeldBack(format!(
+                    "the store lock could not be taken ({why}); nothing was repaired"
+                )),
             }
-            Err(atpkg::lock::StoreLockError::Contended(_)) => How::StoodAside(CONTENDED.to_owned()),
-            Err(why) => How::HeldBack(format!(
-                "the store lock could not be taken ({why}); nothing was repaired"
-            )),
-        },
+        }
         _ => How::Applied,
     };
     laps.lap("lock");
     let (facts, repairs, docs) = match &how {
-        How::StoodAside(line) => {
-            let aside = StoodAside::Lock(line.clone());
-            (
-                aterm_converge::standing_aside(facts, &aside),
-                aterm_converge::standing_aside(repairs, &aside),
-                aterm_converge::standing_aside(docs, &aside),
-            )
-        }
+        // The facts and the rust-docs touch nothing of the store (the stale copies are the
+        // facts' one change; the rust-docs repair sets aside rustup's own toolchains' HTML).
+        How::StoodAside(line) => (
+            facts,
+            beside_the_pass(repairs, &StoodAside::Lock(line.clone()), false),
+            docs,
+        ),
         How::HeldBack(line) => (
             aterm_converge::held_back(facts, line),
             aterm_converge::held_back(repairs, line),
             aterm_converge::held_back(docs, line),
+        ),
+        How::LeftToPass(_) => (
+            facts,
+            beside_the_pass(repairs, &StoodAside::Lock(CONTENDED.to_owned()), true),
+            docs,
         ),
         How::Applied | How::Planned => (facts, repairs, docs),
     };
@@ -377,12 +453,10 @@ fn converge<'a>(
         Mode::Apply
     };
     let mut journal: Box<dyn Journal> = match ports.state {
-        Some(state) if how == How::Applied => Box::new(aterm_converge::FileJournal::under(state)),
+        Some(state) if matches!(how, How::Applied | How::LeftToPass(_) | How::StoodAside(_)) => {
+            Box::new(aterm_converge::FileJournal::under(state))
+        }
         _ => Box::new(aterm_converge::ReadOnly),
-    };
-    let scope = Scope {
-        not_own_account: ports.not_own_account,
-        ..Scope::REPAIR
     };
     let mut refused = Vec::new();
     let mut ran = |items: &[Box<dyn Item + '_>], id| {
@@ -425,13 +499,14 @@ fn converge<'a>(
     drop(lock);
 
     // An apply that changed something, or failed partway, may have changed what the early
-    // read saw: the packages are read again after it. Either read is in before the develop
-    // rows start, so a build a checkout's `--check` runs is never counted as a lease or a
-    // live build.
-    let rewrote = fact_rows
-        .iter()
-        .chain(&repair_rows)
-        .any(|row| matches!(row.outcome, Outcome::Changed | Outcome::Failed));
+    // read saw, as an install pass this run waited for did: the packages are read again after
+    // it. Either read is in before the develop rows start, so a build a checkout's `--check`
+    // runs is never counted as a lease or a live build.
+    let rewrote = waited
+        || fact_rows
+            .iter()
+            .chain(&repair_rows)
+            .any(|row| matches!(row.outcome, Outcome::Changed | Outcome::Failed));
     let mut packages = match early() {
         Some(rows) if !rewrote => rows,
         Some(_) => (ports.packages)(),
@@ -447,6 +522,9 @@ fn converge<'a>(
         !ran_ids.contains(&row.id.as_str())
             && (tokens.is_empty() || tokens.iter().any(|token| named_by(token, row)))
     });
+    if matches!(how, How::LeftToPass(_)) {
+        packages.iter_mut().for_each(left_to_the_pass);
+    }
     // `aterm pkg doctor`'s own policy, judged before the rows join doctor's: only a row that
     // fails that surface is unresolved here; its other warnings count as notes.
     let pkg_judged: Vec<ItemReport> = packages.iter().map(as_pkg_doctor_judges).collect();
@@ -608,6 +686,30 @@ fn converge<'a>(
     }
 }
 
+/// A packages row the install pass holding the store lays (relay or install) and has not laid
+/// yet, read as left to it ([`PASS_LAYS`]), as [`beside_the_pass`] leaves the repairs: the
+/// toolset that pass is installing reads `NotApplicable`, not planned. A failure stays one.
+fn left_to_the_pass(row: &mut ItemReport) {
+    use aterm_converge::{Class, Explain};
+    if matches!(row.class, Some(Class::Relay | Class::Install))
+        && matches!(
+            row.outcome,
+            Outcome::Planned | Outcome::Blocked | Outcome::Unknown
+        )
+    {
+        let why = match row.why.take().or_else(|| row.from.clone()) {
+            Some(said) => format!("{said}; left as it is: {PASS_LAYS}"),
+            None => format!("left as it is: {PASS_LAYS}"),
+        };
+        row.outcome = Outcome::NotApplicable;
+        row.explain = Some(Explain {
+            why: why.clone(),
+            remedy: Remedy::None,
+        });
+        row.why = Some(why);
+    }
+}
+
 /// A packages row as readiness counts it: as `aterm pkg doctor` judges it, so a row that does
 /// not fail that surface ([`ItemReport::fails_surface`], judged while the row still says whether
 /// it is essential) counts as a note, not unresolved. The JSON's row stays as it read.
@@ -636,7 +738,7 @@ fn brief_rows<'r>(
     use cli::{Kind, Shown};
     let aside = match how {
         How::StoodAside(line) | How::HeldBack(line) => Some(line.as_str()),
-        How::Applied | How::Planned => None,
+        How::LeftToPass(_) | How::Applied | How::Planned => None,
     };
     let mut shown = Vec::new();
     let mut changes = Vec::new();
@@ -686,7 +788,9 @@ fn brief_rows<'r>(
             };
             let kind = if row.outcome == Outcome::Unknown {
                 Kind::Unread
-            } else if row.stood_aside.is_some() && matches!(how, How::StoodAside(_)) {
+            } else if row.stood_aside.is_some()
+                && matches!(how, How::StoodAside(_) | How::LeftToPass(_))
+            {
                 Kind::Note
             } else {
                 Kind::NeedsYou
@@ -728,26 +832,49 @@ fn unmeasured(id: &str, family: &str, layer: Option<Layer>, why: String) -> Item
 
 /// The base items `aterm init` runs before its workstation items (design §4.2, S5): the
 /// same repair items, the doctor's pass (an opted-out rc stays as the person left it),
-/// `base.ai.accounts`, and `base.clt` over atpkg's C toolchain probe (S6).
-#[cfg(target_os = "macos")]
-pub(crate) fn init_base(applies: bool) -> aterm_machines::init::Base {
+/// `base.ai.accounts`, and on a Mac `base.clt` over atpkg's C toolchain probe (S6).
+#[cfg(unix)]
+pub(crate) fn init_base(lock: aterm_machines::init::BaseLock) -> aterm_machines::init::Base {
+    let wait = wait_for_pass("init");
     let mut base = match atpkg::store::resolve_configured() {
-        Some(layout) => {
-            init_base_over(&Arc::new(Ground::of_process(layout, Pass::Doctor)), applies)
-        }
+        Some(layout) => init_base_over(
+            &Arc::new(Ground::of_process(layout, Pass::Doctor)),
+            lock,
+            person_at_terminal().then_some(&wait as &Wait),
+        ),
         None => aterm_machines::init::Base::none(),
     };
     base.items.push(Box::new(AiAccountsItem));
+    // Apple's Command Line Tools exist on a Mac alone.
+    #[cfg(target_os = "macos")]
+    let clt = command_line_tools();
+    #[cfg(not(target_os = "macos"))]
+    let clt = None;
     aterm_machines::init::Base {
-        clt: command_line_tools(),
+        clt,
         targo: Some(Arc::new(targo)),
         ..base
     }
 }
 
+/// The base items the converge pass re-lays after an update (`aterm init --converge`,
+/// [`aterm_machines::sync`]): the doctor's repair items alone, the store lock as `lock` says and
+/// never waited for, so a held store stands each item that needs it aside. Not
+/// `base.ai.accounts` (the pass's `sync.accounts` row) or `base.clt` (a person's).
+#[cfg(unix)]
+pub(crate) fn sync_base(lock: aterm_machines::init::BaseLock) -> aterm_machines::init::Base {
+    atpkg::store::resolve_configured().map_or_else(aterm_machines::init::Base::none, |layout| {
+        init_base_over(
+            &Arc::new(Ground::of_process(layout, Pass::Doctor)),
+            lock,
+            None,
+        )
+    })
+}
+
 /// The toolset's `targo` for `develop.workspace-tools@<path>`: the `bin/targo` shim of the
 /// atpkg store (the shim, so its own exports apply), once it resolves into the store.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn targo() -> Result<std::path::PathBuf, String> {
     const INSTALL: &str = "the toolset's targo is not installed: `aterm pkg install \
                            --default-set` installs it";
@@ -758,10 +885,10 @@ fn targo() -> Result<std::path::PathBuf, String> {
 
 /// `base.ai.accounts`: converges `accounts.toml` and `fleet-accounts.toml`
 /// during `aterm init` when a fleet accounts source is configured or discoverable.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 struct AiAccountsItem;
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 impl Item for AiAccountsItem {
     fn id(&self) -> String {
         "base.ai.accounts".to_owned()
@@ -835,7 +962,7 @@ impl Item for AiAccountsItem {
 /// Whether `env`'s machine keeps another CLI's pool and no source of Claude Code's: then
 /// `base.ai.accounts` is the other pools' alone, and Claude Code's sync having nothing to read
 /// is no failure of it.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn ai_accounts_others_only(env: &aterm_agent::harness::cli::Env) -> bool {
     let (Some(home), Some(roster_path)) = (env.home.as_deref(), env.accounts_roster()) else {
         return false;
@@ -850,7 +977,7 @@ fn ai_accounts_others_only(env: &aterm_agent::harness::cli::Env) -> bool {
 
 /// The other CLIs' pools beside Claude Code's roster in one phrase (`codex 1, kimi 1`,
 /// `accounts_sync::cli_pools_words`); `None` where this machine keeps none.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn ai_accounts_pools(env: &aterm_agent::harness::cli::Env) -> Option<Result<String, String>> {
     use aterm_agent::harness::accounts_sync::{cli_pools, cli_pools_words};
     let (config, home) = (env.config.as_deref()?, env.home.as_deref()?);
@@ -864,7 +991,7 @@ fn ai_accounts_pools(env: &aterm_agent::harness::cli::Env) -> Option<Result<Stri
 /// `base.ai.accounts`' probe over `env`: Claude Code's pool, as it always read
 /// ([`ai_accounts_claude_probe`]), and each other CLI's whose roster this machine keeps after it
 /// (`other CLIs: codex 1, kimi 1`). A machine with Claude Code's alone reads as it always did.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn ai_accounts_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Probe {
     use aterm_converge::Probe;
     let claude = ai_accounts_claude_probe(env);
@@ -888,7 +1015,7 @@ fn ai_accounts_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Pr
 }
 
 /// Claude Code's half of [`ai_accounts_probe`].
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Probe {
     use aterm_agent::harness::{
         accounts,
@@ -1013,46 +1140,197 @@ fn clt_found(verdict: &atpkg::prereq::CcVerdict, clt_git: bool) -> aterm_machine
     }
 }
 
-/// [`init_base`] over `ground`. A run that applies tries the store lock, which init holds
-/// over these items alone (never while a workstation item waits on a person). An install
-/// pass holding it makes each item stand aside, and init exits 75 when they are all that
-/// is left; a lock that cannot be taken otherwise holds each change back, a failure
-/// (exit 1), since no retry takes it.
-#[cfg(target_os = "macos")]
-fn init_base_over(ground: &Arc<Ground>, applies: bool) -> aterm_machines::init::Base {
-    use aterm_machines::init::Base;
+/// [`init_base`] over `ground`, its store lock as `lock` says. An apply takes the store lock,
+/// which init holds over these items alone (never while a workstation item waits on a person).
+/// An install pass holding it is waited for with `wait` (a person at the terminal) when an item
+/// would change the store ([`needs_the_store`]), or else its own items are left to it
+/// ([`beside_the_pass`]), so init needs no second run; `--no-wait`
+/// ([`aterm_machines::init::BaseLock::Try`]), or a wait that ran out, makes each item that
+/// touches the store stand aside instead (exit 75). A lock that cannot be taken for another
+/// reason holds each change back, a failure (exit 1), since no retry takes it.
+#[cfg(unix)]
+fn init_base_over(
+    ground: &Arc<Ground>,
+    lock: aterm_machines::init::BaseLock,
+    wait: Option<&Wait>,
+) -> aterm_machines::init::Base {
+    use aterm_machines::init::{Base, BaseLock};
+    use atpkg::lock::StoreLockError::Contended;
     let items = repair::items(ground);
-    if !applies {
-        return Base {
-            items,
-            held: None,
-            clt: None,
-            targo: None,
-        };
+    let base = |items, held: Option<Box<dyn std::any::Any>>| Base {
+        items,
+        held,
+        clt: None,
+        targo: None,
+    };
+    if lock == BaseLock::Read {
+        return base(items, None);
     }
-    match atpkg::lock::try_lock_store(&ground.layout) {
-        Ok(lock) => Base {
-            items,
-            held: Some(Box::new(lock)),
-            clt: None,
-            targo: None,
-        },
-        Err(why @ atpkg::lock::StoreLockError::Contended(_)) => Base {
-            items: aterm_converge::standing_aside(items, &StoodAside::Lock(why.to_string())),
-            held: None,
-            clt: None,
-            targo: None,
-        },
-        Err(why) => Base {
-            items: aterm_converge::held_back(
+    let mut waited = false;
+    let taken = match (atpkg::lock::try_lock_store(&ground.layout), wait) {
+        (Err(Contended(_)), Some(wait))
+            if lock == BaseLock::Wait && needs_the_store(&items, Scope::EVERY) =>
+        {
+            waited = true;
+            let taken = wait(&ground.layout);
+            ground.reads.forget();
+            taken
+        }
+        (taken, _) => taken,
+    };
+    match taken {
+        Ok(held) => base(items, Some(Box::new(held))),
+        Err(why @ Contended(_)) => base(
+            beside_the_pass(
                 items,
-                &format!("the store lock could not be taken ({why})"),
+                &StoodAside::Lock(why.to_string()),
+                lock == BaseLock::Wait && !waited,
             ),
-            held: None,
-            clt: None,
-            targo: None,
-        },
+            None,
+        ),
+        Err(why) => base(
+            aterm_converge::held_back(items, &format!("the store lock could not be taken ({why})")),
+            None,
+        ),
     }
+}
+
+/// `repairs` beside an install pass that holds the store, in their run order: the copied
+/// commands, which touch nothing of the store, run without its lock; with `laid` (a run nobody
+/// waits in) the pass's own items (relay and install) are left to it, each reading
+/// `NotApplicable` ([`PASS_LAYS`], [`aterm_converge::left_to_another`]); and the rest (with
+/// `laid`, the stale rustup trust link, which rewrites the store's records) stand aside on
+/// `aside`.
+fn beside_the_pass<'a>(
+    repairs: Vec<Box<dyn Item + 'a>>,
+    aside: &StoodAside,
+    laid: bool,
+) -> Vec<Box<dyn Item + 'a>> {
+    use aterm_converge::Class;
+    repairs
+        .into_iter()
+        .flat_map(|item| match item.class() {
+            _ if item.id() == repair::COPIED_COMMANDS => vec![item],
+            Class::Relay | Class::Install if laid => {
+                aterm_converge::left_to_another(vec![item], PASS_LAYS)
+            }
+            _ => aterm_converge::standing_aside(vec![item], aside),
+        })
+        .collect()
+}
+
+/// Whether an apply of `items` under `scope` would change something of the store, as a read
+/// without its lock finds them: a change in a class `scope` applies, other than the copied
+/// commands, which run without the lock. A run the engine refuses is read as one that would.
+fn needs_the_store(items: &[Box<dyn Item + '_>], scope: Scope) -> bool {
+    let mut read = aterm_converge::ReadOnly;
+    aterm_converge::run_scoped(items, Mode::Plan, scope, &mut read, &mut |_| {}).map_or(
+        true,
+        |rows| {
+            rows.iter().any(|row| {
+                row.outcome == Outcome::Planned
+                    && row.id != repair::COPIED_COMMANDS
+                    && row.class.is_some_and(|class| scope.applies(class))
+            })
+        },
+    )
+}
+
+/// The asked repairs a launch of the release app makes by itself once its seed is done (design
+/// §3.2), each journaled under the account's state root: the stale copies of aterm moved to the
+/// Trash, the copied commands in `~/.local/bin` moved aside, and a stale rustup trust link
+/// re-pointed when the store lock is free (else the next launch does). What moved, one line each;
+/// nothing from another executable or a shell that is not the account's own.
+#[cfg(target_os = "macos")]
+pub(crate) fn launch_repairs() -> Vec<String> {
+    if aterm_types::dirs::not_own_account().is_some() {
+        return Vec::new();
+    }
+    let (Some(layout), Some(state)) = (
+        atpkg::store::resolve_configured(),
+        aterm_types::dirs::account_state_dir(),
+    ) else {
+        return Vec::new();
+    };
+    launch_repairs_over(
+        &Arc::new(Ground::of_process(layout, Pass::Doctor)),
+        &state,
+        &cli::StaleCopies::new(atpkg::copies::prune, Some(atpkg::copies::prune_after)),
+    )
+}
+
+/// [`launch_repairs`] over `ground`, journaled under `state`, the stale copies through `copies`:
+/// only when `ground`'s executable is the installed release app's.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn launch_repairs_over(
+    ground: &Arc<Ground>,
+    state: &Path,
+    copies: &cli::StaleCopies,
+) -> Vec<String> {
+    if !ground
+        .exe
+        .as_deref()
+        .is_some_and(atpkg::hooks::is_installed_release_exe)
+    {
+        return Vec::new();
+    }
+    // The stale copies and the copied commands touch nothing of the store, so they run without
+    // its lock: the install pass that follows the seed starts beside them and never waits behind
+    // a census or a Trash move. The rustup trust link rewrites the store's records, so only it
+    // takes the lock, and only once a read without it finds the link stale.
+    let mut free: Vec<Box<dyn Item + '_>> = vec![copies.item()];
+    let mut store = Vec::new();
+    for item in repair::items(ground) {
+        match item.id().as_str() {
+            repair::COPIED_COMMANDS => free.push(item),
+            repair::RUSTUP_LOCAL => store.push(item),
+            _ => {}
+        }
+    }
+    let scope = Scope {
+        applies: &[aterm_converge::Class::Asked],
+        ..Scope::REPAIR
+    };
+    let (mut journal, mut read) = (
+        aterm_converge::FileJournal::under(state),
+        aterm_converge::ReadOnly,
+    );
+    let mut run = |items: &[Box<dyn Item + '_>], mode: Mode| {
+        let journal: &mut dyn Journal = match mode {
+            Mode::Apply => &mut journal,
+            Mode::Plan => &mut read,
+        };
+        aterm_converge::run_scoped(items, mode, scope, journal, &mut |_| {})
+            .inspect_err(|refusal| aterm_log::warn!("launch repairs: {refusal}"))
+            .unwrap_or_default()
+    };
+    let mut rows = run(&free, Mode::Apply);
+    if run(&store, Mode::Plan)
+        .iter()
+        .any(|row| row.outcome == Outcome::Planned)
+        && let Ok(lock) = atpkg::lock::try_lock_store(&ground.layout)
+    {
+        rows.extend(run(&store, Mode::Apply));
+        drop(lock);
+    }
+    let mut moved = Vec::new();
+    for row in &rows {
+        match row.outcome {
+            Outcome::Changed if row.id == cli::COPIES => moved.push(copies.said()),
+            Outcome::Changed => moved.extend(
+                row.detail
+                    .iter()
+                    .flat_map(|detail| detail.lines().map(str::to_owned)),
+            ),
+            Outcome::Failed | Outcome::Blocked | Outcome::Unknown => aterm_log::warn!(
+                "launch repairs: {}: {}",
+                row.id,
+                row.why.as_deref().unwrap_or("not done")
+            ),
+            _ => {}
+        }
+    }
+    moved
 }
 
 fn named_by(token: &str, row: &ItemReport) -> bool {
@@ -1151,7 +1429,7 @@ fn repair_section(rows: &[ItemReport], how: &How, hold: Option<&str>) -> Option<
         return None;
     }
     let (lead, lead_warns) = match how {
-        How::StoodAside(line) => (Some(line.as_str()), false),
+        How::StoodAside(line) | How::LeftToPass(line) => (Some(line.as_str()), false),
         How::HeldBack(line) => (Some(line.as_str()), true),
         How::Applied | How::Planned => (None, false),
     };

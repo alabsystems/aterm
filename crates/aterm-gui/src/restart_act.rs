@@ -133,7 +133,7 @@ fn relaunchable(
 }
 
 /// WHETHER THE ACT IS OFFERED FOR PROCESS `pid` IN TAB `sid` as far as a word outside the
-/// session can tell (the Claude Code footer's `weekly ? · until relaunch`): the host's published
+/// session can tell (the Claude Code account's `weekly ? · until relaunch`): the host's published
 /// snapshot names that process (else `not-the-hosts-agent`: an Autopilot-off tab has none) and
 /// its relaunch would bring it back (else `not-relaunchable`, a program with no shell under it
 /// among them). The host's hand (`not-supervised`, `halted`, a driver's lease or turn) is the
@@ -145,7 +145,7 @@ pub(crate) fn offered_for(sid: &str, pid: u32) -> bool {
 }
 
 /// WHETHER THE RELAUNCH LINE aterm would type for process `pid` in tab `sid` HAS ROOM FOR THE
-/// USAGE TAP (the Claude Code footer's `weekly ? · until relaunch`, beside [`offered_for`]): the
+/// USAGE TAP (the Claude Code account's `weekly ? · until relaunch`, beside [`offered_for`]): the
 /// host's published snapshot names that process and its line, with the longer of the tap's two
 /// values (the one that carries the owner's statusLine) for this aterm's lasting path, fits the
 /// tty's line ([`aterm_agent::harness::relaunch::tap_room`]). `false` where any of that is unread.

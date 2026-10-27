@@ -15,6 +15,10 @@ use crate::{Ctx, is_executable_file};
 #[must_use]
 pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
     let mut r = Report::new(spec.title.clone());
+    if let Err(why) = crate::test_workers::admitted_share(&ctx.env) {
+        r.cannot_run(format!("{why}; no stage was run"));
+        return r;
+    }
     if ctx.no_windows
         && let Some(why) = spec.id.no_windows_skip()
     {
@@ -34,7 +38,6 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::SpecCheck => spec_check(ctx, &mut r),
         StageId::CheckersCompile => checkers_compile(ctx, &mut r),
         StageId::SpecCheckers => spec_checkers(ctx, &mut r),
-        StageId::GpuOracleCompile => gpu_oracle_compile(ctx, &mut r),
         StageId::GpuOracle => gpu_oracle(ctx, &mut r),
         StageId::MeasurePrebuild => measure_prebuild(ctx, &mut r),
         #[cfg(unix)]
@@ -281,18 +284,6 @@ pub fn tippy_gated_args(scope: &Scope, gated: &[(String, String)]) -> Option<Vec
 
 /// The `census` check's walks, by their `aterm_census::CENSUSES` names: the five L0 censuses (main-loop reach, lock order, wasm reach, scope cardinality, lazy-init reentrancy) and the source guards, so the `dev` set runs each walk once.
 pub const CENSUS_WALKS: [&str; 6] = ["mainloop", "locks", "wasm", "scope", "lazy-init", "guards"];
-
-/// `<tippy> -p aterm-gpu --features wgpu-oracle <LINT_TAIL>` ([`crate::checks::ORACLE`]): the lint's pass over the oracle's arm, which the first pass's default features never compile.
-#[must_use]
-pub fn tippy_oracle_args(scope: &Scope) -> Option<Vec<String>> {
-    let (pkg, feature) = crate::checks::ORACLE;
-    if !scope.includes_crate(pkg) {
-        return None;
-    }
-    let mut a: Vec<String> = ["-p", pkg, "--features", feature].map(String::from).into();
-    a.extend(LINT_TAIL.map(String::from));
-    Some(a)
-}
 
 /// The package of the one shipped executable, which `ship` builds `--release`.
 pub const SHIPPED: &str = "aterm";
@@ -547,7 +538,7 @@ fn run_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
 }
 
 fn run_tests_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
-    let env = crate::findings::rerun_env(cmd, ctx.test_threads);
+    let env = crate::findings::rerun_env(cmd, ctx.test_thread_override());
     let cmd = &cmd.clone().counting_waits();
     run_child(ctx, r, label, cmd, |r, run, label| {
         r.decide_test_child(run, label, &env);
@@ -596,7 +587,7 @@ pub fn main_targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
 #[must_use]
 pub const fn lane_build_jobs(lane: Lane) -> Option<u32> {
     match lane {
-        Lane::TrustTarget | Lane::CellsTarget | Lane::GpuOracleTarget => Some(4),
+        Lane::TrustTarget | Lane::CellsTarget => Some(4),
         Lane::CheckersTarget => Some(8),
         _ => None,
     }
@@ -1103,6 +1094,7 @@ fn cargo_doc_driver(ctx: &Ctx, driver: &DocDriver) -> Option<std::path::PathBuf>
             home: Some(&ctx.env.home)
                 .filter(|h| !h.as_os_str().is_empty())
                 .map(std::path::PathBuf::as_path),
+            root: None,
             cwd: Some(&ctx.root),
             env: &lookup,
             read: &read_config,
@@ -1175,15 +1167,6 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         &format!("tippy {} -D warnings{borrowed}", ctx.scope.label()),
         &tippy_cmd(ctx, &bin, tippy_args(&ctx.scope)),
     );
-    if let Some(args) = tippy_oracle_args(&ctx.scope) {
-        let (pkg, feature) = crate::checks::ORACLE;
-        run_scoped(
-            ctx,
-            r,
-            &format!("tippy -p {pkg} --features {feature} -D warnings{borrowed}"),
-            &tippy_cmd(ctx, &bin, args),
-        );
-    }
     if ctx.release
         && let Some(args) = tippy_gated_args(&ctx.scope, &gated_lint_features(&ctx.root))
     {
@@ -1260,7 +1243,7 @@ pub const EXPORT_LABEL: &str = "ship check --export";
 /// The `SIGTERM` grace `ship check --export` gets at its ceiling.
 pub const EXPORT_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// `ship check --export` from the root, its release tools built in `<target>/verify/trust.noindex` ([`Lane::TrustTarget`]), ended at its ceiling with [`EXPORT_TERM_GRACE`].
+/// `ship check --export` from the root, its release tools built in `<target>/verify/.ubd/trust.noindex` ([`Lane::TrustTarget`]), ended at its ceiling with [`EXPORT_TERM_GRACE`].
 #[must_use]
 pub fn export_cmd(ctx: &Ctx) -> Cmd {
     in_lane(
@@ -1432,23 +1415,24 @@ pub fn spec_checkers_args() -> Vec<String> {
     a
 }
 
-/// `targo --unverified test -p aterm-gpu --features wgpu-oracle --no-fail-fast --tests`: the `gpu-oracle` check's child.
+/// `targo --unverified test -p aterm-gpu --lib --no-fail-fast frame_record_tests`: the
+/// `gpu-oracle` check's child, this host's arm against its CPU twins and the record of
+/// wgpu's frames ([`crate::checks::GOLDEN`]).
 #[must_use]
 pub fn gpu_oracle_args() -> Vec<String> {
-    let (pkg, feature) = crate::checks::ORACLE;
-    let mut a: Vec<String> = [
+    let (pkg, test) = crate::checks::GOLDEN;
+    let module = test.split_once("::").map_or(test, |(m, _)| m);
+    [
         "--unverified",
         "test",
         "-p",
         pkg,
-        "--features",
-        feature,
+        "--lib",
         "--no-fail-fast",
+        module,
     ]
     .map(String::from)
-    .into();
-    a.extend(TEST_TARGETS.map(String::from));
-    a
+    .into()
 }
 
 fn no_run(mut args: Vec<String>) -> Vec<String> {
@@ -1490,92 +1474,55 @@ fn spec_checkers(ctx: &Ctx, r: &mut Report) {
     );
 }
 
-fn gpu_oracle_compile(ctx: &Ctx, r: &mut Report) {
-    feature_compile(
-        ctx,
-        r,
-        Lane::GpuOracleTarget,
-        gpu_oracle_args(),
-        "gpu oracle",
-    );
-}
-
-/// aterm-gpu's suites that drive the wgpu oracle, by file stem: each `crates/aterm-gpu/tests/*.rs` whose text names it (`wgpu_oracle`, `wgpu-oracle`).
+/// Did a passing gpu-oracle child not pass the oracle's test ([`crate::checks::GOLDEN`])?
+/// Its filter then matched no test, so no frame was held to its twin.
 #[must_use]
-pub fn gpu_oracle_suites(root: &std::path::Path) -> Vec<String> {
-    let mut v: Vec<String> = std::fs::read_dir(root.join("crates/aterm-gpu/tests"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            let stem = name.strip_suffix(".rs")?.to_string();
-            let text = std::fs::read_to_string(e.path()).ok()?;
-            (text.contains("wgpu_oracle") || text.contains("wgpu-oracle")).then_some(stem)
-        })
-        .collect();
-    v.sort();
-    v
-}
-
-/// Did a passing gpu-oracle child pass not one test of the oracle's `suites` ([`gpu_oracle_suites`])? A suite's tests are its own binary's (`tests/<suite>.rs`) or, where a binary mounts it as a module (aterm-gpu's `gpu_suite` mounts them all), the tests named `<suite>::…`.
-#[must_use]
-pub fn gpu_oracle_compared_nothing(run: &exec::Run, suites: &[String]) -> bool {
+pub fn gpu_oracle_compared_nothing(run: &exec::Run) -> bool {
     if !run.ok {
         return false;
     }
+    let (_, test) = crate::checks::GOLDEN;
     let log = crate::libtest::strip_ansi(&run.output);
-    let mut target = String::new();
-    for line in log.lines() {
-        if let Some(h) = crate::libtest::header(line) {
-            target = h
-                .split_once(" (")
-                .map_or(h.as_str(), |(t, _)| t)
-                .to_string();
-            continue;
-        }
-        let Some((name, verdict)) = line
-            .strip_prefix("test ")
+    !log.lines().any(|line| {
+        line.strip_prefix("test ")
             .and_then(|rest| rest.split_once(" ... "))
-        else {
-            continue;
-        };
-        let of_a_suite = |suite: &String| {
-            target == format!("tests/{suite}.rs")
-                || name
-                    .strip_prefix(suite.as_str())
-                    .is_some_and(|rest| rest.starts_with("::"))
-        };
-        if verdict.starts_with("ok") && suites.iter().any(of_a_suite) {
-            return false;
-        }
-    }
-    true
+            .is_some_and(|(name, verdict)| name.ends_with(test) && verdict.starts_with("ok"))
+    })
 }
 
 fn gpu_oracle(ctx: &Ctx, r: &mut Report) {
-    const LABEL: &str = "targo test -p aterm-gpu --features wgpu-oracle";
+    const LABEL: &str = "targo test -p aterm-gpu --lib frame_record_tests";
     if !ctx.tools.have_targo() {
         r.skip("gpu oracle (no targo)");
         return;
     }
-    let suites = gpu_oracle_suites(&ctx.root);
-    let cmd = in_lane(ctx, Lane::GpuOracleTarget, targo(ctx, gpu_oracle_args()));
-    let env = crate::findings::rerun_env(&cmd, ctx.test_threads);
+    let cmd = main_targo(ctx, gpu_oracle_args());
+    let env = crate::findings::rerun_env(&cmd, ctx.test_thread_override());
     run_child(ctx, r, LABEL, &cmd, |r, run, label| {
-        if gpu_oracle_compared_nothing(run, &suites) {
-            let named = if suites.is_empty() {
-                "no suite under crates/aterm-gpu/tests names the oracle".to_string()
-            } else {
-                format!("not one of its suites passed a test ({})", suites.join(" "))
-            };
+        if gpu_oracle_compared_nothing(run) {
             r.cannot_run(format!(
-                "{label} — {named}, so the renderer was compared against nothing"
+                "{label} — {} did not run, so no frame was held to its twin",
+                crate::checks::GOLDEN.1
             ));
             return;
         }
-        r.decide_test_child(run, label, &env);
+        match gpu_oracle_verdict(run) {
+            Some(verdict) => r.decide_test_child(run, format!("{label} — {verdict}"), &env),
+            None => r.decide_test_child(run, label, &env),
+        }
     });
+}
+
+/// The gpu-oracle child's verdict line (`frame-record: verdict: …`, the last one): how many
+/// frames it held to their twins on which adapter, how many strayed, the widest margin, and
+/// how many of the record's rows moved there.
+#[must_use]
+pub fn gpu_oracle_verdict(run: &exec::Run) -> Option<String> {
+    crate::libtest::strip_ansi(&run.output)
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("frame-record: verdict: "))
+        .map(str::to_owned)
 }
 
 /// How the ladder reads one harness exit code (`0` pass / `1` fail / `2` not run, declared in aterm-gui's `control_redraw_conformance.rs`).
@@ -2634,51 +2581,48 @@ mod tests {
     }
 
     #[test]
-    fn the_gpu_oracle_counts_only_the_suites_that_drive_it() {
-        let run = |ok: bool, output: &str| exec::Run {
-            ok,
-            output: output.to_string(),
-            code: Some(i32::from(!ok)),
-            spawn_error: None,
-        };
-        let section = |target: &str, tests: &[&str]| {
-            let mut s = format!(
-                "     Running {target} (target/debug/deps/x-1)\n\nrunning {} tests\n",
+    fn the_gpu_oracle_passes_only_when_its_test_ran_and_names_the_verdict() {
+        let run = |ok: bool, tests: &[&str]| {
+            let mut output = format!(
+                "     Running unittests src/lib.rs (target/debug/deps/aterm_gpu-1)\n\nrunning {} \
+                 tests\n",
                 tests.len()
             );
             for t in tests {
-                s.push_str(&format!("test {t} ... ok\n"));
+                output.push_str(&format!("test {t} ... ok\n"));
             }
-            s.push_str(&format!(
-                "\ntest result: ok. {} passed; 0 failed; 0 ignored; 0 measured; 0 filtered \
-                 out; finished in 0.01s\n",
-                tests.len()
-            ));
-            s
+            exec::Run {
+                ok,
+                output,
+                code: Some(i32::from(!ok)),
+                spawn_error: None,
+            }
         };
-        let tmp = aterm_tempfile::tempdir().expect("tempdir");
-        let tests = tmp.path().join("crates/aterm-gpu/tests");
-        std::fs::create_dir_all(&tests).expect("mkdir");
-        std::fs::write(
-            tests.join("bands.rs"),
-            "let g = common::wgpu_oracle(18.0);\n",
-        )
-        .expect("write");
-        std::fs::write(tests.join("cpu_only.rs"), "let r = common::cpu(18.0);\n").expect("write");
-        let suites = gpu_oracle_suites(tmp.path());
-        assert_eq!(suites, ["bands"]);
-        let lib = section("unittests src/lib.rs", &["bands_in_the_lib", "metal::x"]);
-        let others = format!(
-            "{lib}{}",
-            section("tests/suite.rs", &["cpu_only::a", "bandsx::b"])
+        let compared = "renderer::frame_record_tests::armed_frames_hold_to_their_cpu_twins";
+        assert!(!gpu_oracle_compared_nothing(&run(true, &[compared])));
+        assert_eq!(gpu_oracle_verdict(&run(true, &[compared])), None);
+        let mut decided = run(true, &[compared]);
+        decided.output.push_str(
+            "frame-record: verdict: 118 of 127 frames compared with their CPU twins on Apple M5 \
+             Max (aarch64), 0 off, the widest 10.0 codes off (fire/readback/0); the record holds \
+             no Apple M5 Max block\n",
         );
-        assert!(gpu_oracle_compared_nothing(&run(true, &others), &suites));
-        let mounted = format!("{others}{}", section("tests/suite.rs", &["bands::draws"]));
-        assert!(!gpu_oracle_compared_nothing(&run(true, &mounted), &suites));
-        let own = format!("{others}{}", section("tests/bands.rs", &["draws"]));
-        assert!(!gpu_oracle_compared_nothing(&run(true, &own), &suites));
-        assert!(gpu_oracle_compared_nothing(&run(true, &own), &[]));
-        assert!(!gpu_oracle_compared_nothing(&run(false, &others), &suites));
+        assert_eq!(
+            gpu_oracle_verdict(&decided).as_deref(),
+            Some(
+                "118 of 127 frames compared with their CPU twins on Apple M5 Max (aarch64), 0 off, \
+                 the widest 10.0 codes off (fire/readback/0); the record holds no Apple M5 Max block"
+            )
+        );
+        assert!(gpu_oracle_compared_nothing(&run(true, &[])));
+        assert!(gpu_oracle_compared_nothing(&run(
+            true,
+            &["renderer::frame_record_tests::a_neighbour"]
+        )));
+        assert!(
+            !gpu_oracle_compared_nothing(&run(false, &[])),
+            "a failed child is the test's verdict"
+        );
     }
 
     #[test]
@@ -2777,7 +2721,7 @@ mod tests {
         };
         let said = format!(" (the managed Trust build's {})", managed.display());
         let borrowed = rows(&c);
-        assert_eq!(borrowed.len(), 3, "{borrowed:?}");
+        assert_eq!(borrowed.len(), 2, "{borrowed:?}");
         assert!(
             borrowed.iter().all(|(_, l)| l.contains(&said)),
             "{borrowed:?}"
@@ -2785,7 +2729,7 @@ mod tests {
         c.tools.tippy = Some(own);
         c.tools.borrowed.clear();
         let theirs = rows(&c);
-        assert_eq!(theirs.len(), 3, "{theirs:?}");
+        assert_eq!(theirs.len(), 2, "{theirs:?}");
         assert!(
             theirs
                 .iter()
@@ -2903,31 +2847,6 @@ mod tests {
                 "aterm-scrollback/disk-tier"
             ]
         );
-    }
-
-    #[test]
-    fn the_oracle_arm_is_linted_wherever_the_selection_holds_aterm_gpu() {
-        let want = [
-            "-p",
-            "aterm-gpu",
-            "--features",
-            "wgpu-oracle",
-            "--all-targets",
-            "--keep-going",
-            "--",
-            "-D",
-            "warnings",
-        ];
-        assert_eq!(
-            tippy_oracle_args(&Scope::changed("main", vec!["aterm-gpu".into()], true))
-                .expect("the cone holds aterm-gpu"),
-            want
-        );
-        assert_eq!(
-            tippy_oracle_args(&Scope::workspace()).expect("the workspace holds it"),
-            want
-        );
-        assert_eq!(tippy_oracle_args(&Scope::crate_only("aterm-core")), None);
     }
 
     #[test]
@@ -3370,12 +3289,7 @@ mod tests {
 
     #[test]
     fn a_callers_cargo_build_jobs_is_a_ceiling_for_the_side_lanes() {
-        for lane in [
-            Lane::TrustTarget,
-            Lane::CellsTarget,
-            Lane::CheckersTarget,
-            Lane::GpuOracleTarget,
-        ] {
+        for lane in [Lane::TrustTarget, Lane::CellsTarget, Lane::CheckersTarget] {
             let own = lane_build_jobs(lane);
             assert_eq!(lane_jobs(lane, None), own, "{lane:?}");
             assert_eq!(

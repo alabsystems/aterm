@@ -86,6 +86,42 @@ impl Dirs {
     pub fn config_file(&self) -> PathBuf {
         self.config.join(CONFIG_FILE)
     }
+
+    /// [`Dirs::from_env`]'s rule over explicit values, for a process about to run with them:
+    /// a lane unit's environment, read at `lane install`. That is `<config dir>/agh` from
+    /// `aterm_types::dirs::resolve_aterm_config_dir(xdg_config_home.map(Path::as_os_str),
+    /// None, Some(home.as_os_str()))`, `<state dir>/agh` from
+    /// `aterm_types::dirs::resolve_state_dir(None, StatePlatform { home: Some(home.to_path_buf()),
+    /// xdg_state_home: xdg_state_home.map(Path::to_path_buf), local_app_data: None })`, and
+    /// `home`. (Both resolvers take `Option<&OsStr>` or `Option<PathBuf>`, never `&Path`.)
+    #[must_use]
+    pub fn resolve(
+        home: &Path,
+        xdg_config_home: Option<&Path>,
+        xdg_state_home: Option<&Path>,
+    ) -> Option<Dirs> {
+        // WP1 writes the body (plan §5, body 4); until then no directory is resolved.
+        let _ = (home, xdg_config_home, xdg_state_home);
+        None
+    }
+
+    /// `<state>/journal`: the write journals.
+    #[must_use]
+    pub fn journal(&self) -> PathBuf {
+        self.state.join("journal")
+    }
+
+    /// `<state>/grants`: the git grants.
+    #[must_use]
+    pub fn grants(&self) -> PathBuf {
+        self.state.join("grants")
+    }
+
+    /// `<state>/needs`: the need files.
+    #[must_use]
+    pub fn needs(&self) -> PathBuf {
+        self.state.join("needs")
+    }
 }
 
 /// agh.toml as written.
@@ -101,6 +137,33 @@ pub struct AghConfig {
     pub default: Option<DefaultRow>,
     /// `[targets]`.
     pub targets: BTreeMap<String, String>,
+    /// `vault = true`: the vault's adopted rows join these (design §6.10), as they route with
+    /// no agh.toml. `agh auth add` writes it when it starts an agh.toml beside a vault token.
+    pub vault: bool,
+    /// `[[writers]]`: unattended callers' release-tier grants (L11).
+    pub writers: Vec<WriterRow>,
+}
+
+/// Where a [`Validated`] came from. Only a file grants (design §10.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConfigOrigin {
+    /// `load` or `load_for_host` read it from the owner's agh.toml.
+    File,
+    /// `validate` made it from text a caller handed in.
+    Text,
+}
+
+/// One `[[writers]]` row (design §6.2): an unattended caller, and the release-tier
+/// repositories the owner opens to its writes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct WriterRow {
+    /// `[a-z][a-z0-9-]{0,31}`, in one row only.
+    pub caller: String,
+    /// Literal `OWNER/NAME` slugs, each a release-tier owner's.
+    pub repos: Vec<String>,
 }
 
 /// One `[profiles.NAME]` row.
@@ -120,6 +183,9 @@ pub struct ProfileRow {
     pub covers_all_repos: bool,
     /// `drafts_fp`: the fingerprint a person vouched for.
     pub drafts_fp: Option<String>,
+    /// Accept this profile's token file when it is group- or world-readable. Honoured only by
+    /// `load_for_host`, in M2 only (design §6.6); `load` reads the key and ignores it.
+    pub legacy_loose: bool,
 }
 
 /// One `[[owners]]` row.
@@ -200,9 +266,27 @@ pub struct Validated {
     pub(crate) owners: BTreeMap<String, OwnerRule>,
     pub(crate) default_read: Vec<ChainStep>,
     pub(crate) targets: BTreeMap<String, Slug>,
+    /// `vault = true`: vault adoption's rows join these (design §6.10).
+    pub(crate) vault: bool,
+    /// Where it came from: only a file grants (design §10.2).
+    pub(crate) origin: ConfigOrigin,
+    /// The `[[writers]]` rows: callers in file order, each row's slugs in file order.
+    pub(crate) writers: Vec<(String, Vec<Slug>)>,
 }
 
 impl Validated {
+    /// Where it came from.
+    #[must_use]
+    pub fn origin(&self) -> ConfigOrigin {
+        self.origin
+    }
+
+    /// The `[[writers]]` rows: callers in file order, each row's slugs in file order.
+    #[must_use]
+    pub fn writers(&self) -> &[(String, Vec<Slug>)] {
+        &self.writers
+    }
+
     /// The profiles, by name.
     #[inline]
     #[must_use]
@@ -230,7 +314,17 @@ impl Validated {
     pub const fn targets(&self) -> &BTreeMap<String, Slug> {
         &self.targets
     }
+
+    /// Whether the file says `vault = true`, so vault adoption's rows join these.
+    #[inline]
+    #[must_use]
+    pub const fn joins_vault(&self) -> bool {
+        self.vault
+    }
 }
+
+/// The profiles vault adoption names, which an agh.toml with `vault = true` leaves to it.
+pub(crate) const VAULT_PROFILES: [&str; 2] = ["dev", "release"];
 
 /// L1: the TOML and its schema.
 /// # Errors
@@ -271,7 +365,7 @@ const TOKEN_FLOOR: usize = 20;
 /// A parser message with every value it quotes taken out. A double-quoted run (serde's
 /// `string "…"`) becomes `"…"`; a backticked run becomes `` `…` `` unless it is a short key
 /// (dot-separated identifier segments) or short punctuation (`` `]` ``, `` `=` ``), so
-/// `` unknown field `legacy_loose` `` still names its key; and any remaining run of
+/// `` unknown field `bogus` `` still names its key; and any remaining run of
 /// `[A-Za-z0-9_]` of `TOKEN_FLOOR` bytes or more becomes `…`.
 fn unquoted(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
@@ -398,7 +492,7 @@ pub(crate) fn no_profile(name: &str, next: &str) -> crate::error::Error {
 
 /// 12 lowercase hex characters: a fingerprint (`identity::fingerprint`).
 #[inline]
-fn is_fingerprint(text: &str) -> bool {
+pub(crate) fn is_fingerprint(text: &str) -> bool {
     text.len() == 12
         && text
             .bytes()
@@ -837,6 +931,16 @@ impl Rows<'_> {
             if let Some(fault) = profile_name_fault(name) {
                 faults.push("L10", fault);
             }
+            if self.config.vault && VAULT_PROFILES.contains(&name.as_str()) {
+                faults.push(
+                    "L10",
+                    format!(
+                        "profile {} is the vault's: with vault = true, agh.toml names no profile \
+                         dev or release",
+                        as_name(name)
+                    ),
+                );
+            }
         }
         for name in self.config.targets.keys() {
             if !is_row_name(name) {
@@ -907,6 +1011,9 @@ impl Rows<'_> {
             owners,
             default_read,
             targets,
+            vault: self.config.vault,
+            origin: ConfigOrigin::Text,
+            writers: Vec::new(),
         })
     }
 }
@@ -984,6 +1091,93 @@ pub fn load(dirs: &Dirs) -> Result<Option<Validated>> {
         let _ = dirs;
         Ok(None)
     }
+}
+
+/// [`load`] for AghHost (design §10.3): the same file and the same rules, with each profile's
+/// `legacy_loose` honoured. `Ok(None)` when agh.toml is missing, and always `Ok(None)` off
+/// unix.
+///
+/// # Errors
+///
+/// As [`load`].
+pub fn load_for_host(dirs: &Dirs) -> Result<Option<Validated>> {
+    let _ = dirs;
+    Err(crate::error::Error::not_yet("load_for_host", "WP1"))
+}
+
+/// Make `leaf`, a directory strictly under `dirs.state`, and every directory between them,
+/// as rate.rs's `try_record` makes the rate book's: `std::fs::create_dir_all` of the directory
+/// above `dirs.state`, then `aterm_uds::private_file::create_private_dir` of `dirs.state` and
+/// of each level below it, down to `leaf`, in that order. A level that already exists is
+/// accepted when it is private and refused as `create_private_dir` refuses it, and nothing in
+/// it is touched. For each level `symlink_metadata` did not find before, its
+/// `create_private_dir` is followed by `aterm_durable::durable_dir` of its parent, so a new
+/// directory survives a power loss. The write journal, the git grants and the need files are
+/// made through it, so the first write on a fresh state directory finds its parents.
+///
+/// # Errors
+///
+/// `ErrorKind::InvalidInput` when `leaf` is not strictly under `dirs.state`, and nothing is
+/// made; otherwise the first failing call's own error.
+#[cfg(unix)]
+pub(crate) fn make_state_subdir(dirs: &Dirs, leaf: &Path) -> std::io::Result<()> {
+    use std::path::Component;
+    let below = leaf.strip_prefix(&dirs.state).ok().filter(|rest| {
+        !rest.as_os_str().is_empty()
+            && rest
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+    });
+    let Some(below) = below else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not strictly under {}",
+                leaf.display(),
+                dirs.state.display()
+            ),
+        ));
+    };
+    if let Some(above) = dirs.state.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(above)?;
+    }
+    let mut level = dirs.state.clone();
+    make_private_level(&level)?;
+    for part in below.components() {
+        level.push(part);
+        make_private_level(&level)?;
+    }
+    Ok(())
+}
+
+/// One level of [`make_state_subdir`]: `create_private_dir`, then, when `symlink_metadata` did
+/// not find it before, `durable_dir` of its parent.
+#[cfg(unix)]
+fn make_private_level(dir: &Path) -> std::io::Result<()> {
+    let fresh = matches!(
+        std::fs::symlink_metadata(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    aterm_uds::private_file::create_private_dir(dir)?;
+    if fresh && let Some(parent) = dir.parent() {
+        aterm_durable::durable_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// agh.toml's text with `repo` added to `caller`'s `[[writers]]` row (`add`), or removed from
+/// it, in aterm-toml's comment-preserving document. Adding to a missing row appends the row;
+/// removing a row's last repository removes the row. `agh policy grant` and `revoke` call it.
+///
+/// # Errors
+///
+/// Invalid when the text does not parse.
+pub(crate) fn edit_writers(text: &str, caller: &str, repo: &Slug, add: bool) -> Result<String> {
+    let _ = (text, caller, repo, add);
+    Err(crate::error::Error::not_yet(
+        "agh.toml's writers edit",
+        "WP1",
+    ))
 }
 
 /// `load` on unix: agh.toml through `read_private`.

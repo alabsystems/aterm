@@ -22,17 +22,34 @@ use std::time::{Duration, Instant};
 use aterm_uds::spawnfd::Stdio;
 
 use crate::instance::{take_flag, take_value};
-use crate::mac::{NOT_RUN, POLL, ROW, STEP, Vm, not_run};
+use crate::mac::{NOT_RUN, PERSON_HELPER, POLL, ROW, STEP, Vm, not_run};
+use crate::mac_nux_guest::{
+    HidProof, STALL_MS, Stall, Waited, click_latencies, completed_at, dialogs, hid_proof,
+    read_census, read_person, read_record, read_watch, setup_field, stage_name, stage_starts,
+};
 use crate::paths::paths;
 use crate::{Fail, LAB, Res, stop};
 
 pub const USAGE: &str = "\
-  nux [--app PATH] [--scenario ROW,...] [--standard-user] [--image REF] [--keep] [--record FILE]
+  nux [--app PATH] [--scenario ROW,...] [--standard-user] [--person] [--no-clt | --vanilla] [--repeat N]
+      [--image REF] [--keep] [--record [FILE]]
                 what a person meets on a new Mac, each row in a fresh clone of REF's prepared base (as dmg):
                 the app built here (ship dev-app made release-shaped: aterm.app, com.aterm.aterm, hardened
                 runtime, signed ad hoc) or --app PATH (read, never changed), unpacked into the guest's
                 /Applications (--standard-user: a non-admin account logged in at the console, and its
-                ~/Applications). Rows (default all), each step under a 300 s hang detector:
+                ~/Applications). --person: the person base, whose guest helper (aterm-lab-guest, granted
+                Accessibility and event posting while the image's SIP is off) is the person at the
+                console: a pointer move every 5 s, Allow and OK pressed in dialogs, the account's password
+                typed into a password field, System Settings switches naming aterm turned on, each input
+                with the HIDIdleTime it left (a row whose input did not reset it says NOT MEASURED).
+                --no-clt: a base with the Command Line Tools removed (xcode-select -p fails); --vanilla:
+                REF's cirruslabs -vanilla image (NOT RUN when it must be pulled with under 71 GB free).
+                --repeat N: each row N times, each in its own clone. Every row also reads the dialog census
+                (each window owner that appears, the guest helper polling the window list every 250 ms with
+                no Screen Recording grant), tccd's consent prompts, xcode-select -p, and the ALab guard:
+                alab-secrets.local unreached and no _alab-vault._tcp advert in the guest, none from a guest
+                on this Mac's tart bridge (the vault port is null-routed in every guest but to loopback and
+                tart's own network). Rows (default all), each step under a 300 s hang detector:
                   init-apply       aterm init --json on a terminal, each prompt answered with its default
                                    (a vault join password with none): first byte, end, prompts, lines,
                                    exit, every row's elapsed_ms (the slowest named), Dock/Finder/
@@ -43,15 +60,32 @@ pub const USAGE: &str = "\
                   init-ssh         aterm init over ssh -tt to the guest itself (Remote Login turned on
                                    first), then a bare aterm over ssh -tt to its shell prompt, with what
                                    each changed
-                  doctor           aterm doctor on a terminal (Developer Tools not granted): first byte, end,
-                                   lines, prompts, exit, System Settings opened; aterm doctor --json | cat
-                                   (no terminal): System Settings opened; aterm doctor --read-only --json
-                                   x10: p50/p95, rows, timed rows, phases
-                  first-launch     the app opened and watched 10 min: first prompt, first present, WARN
-                                   lines, consent dialogs (with a ~/Desktop control), the toolset pass,
-                                   the setup lines and hand-overs in order, change-journal records,
-                                   defaults and killall execs, relaunches (the guest's disk grown to
-                                   100 GB first)
+                  pass-held        aterm pkg install --default-set started, and while it holds the store:
+                                   aterm doctor --json and aterm init (no terminal), aterm init --no-wait,
+                                   then aterm doctor on a terminal: each one's end, exit and lines, whether
+                                   the pass still held the store at its start, the change-journal records
+                                   (the guest's disk grown to 100 GB first)
+                  doctor           aterm doctor on a terminal (Developer Tools not granted) x10: the first
+                                   run's first byte, end, lines, prompts, exit, System Settings opened, and
+                                   p50/p95; aterm doctor --json | cat (no terminal): System Settings opened;
+                                   aterm doctor --read-only --json x10: p50/p95, rows, timed rows, phases
+                  launch-repairs   a copied command planted at ~/.local/bin/aterm, the app opened until its
+                                   launch repairs log (after its seed), then quit and opened again: each
+                                   launch's open to prompt, first present and present p50/p95/p99,
+                                   its repairs' lines and when, what
+                                   ~/.local/bin/aterm is after it, the change-journal records (the guest's
+                                   disk grown to 100 GB first)
+                  first-launch     the app opened, then watched until the guest's own aterm ctl status says
+                                   setup=done (the progress record's completion on a build without the
+                                   field), or until setup stood still a minute: first prompt, first
+                                   present, each stage's start (a guest-side watch of initial-setup.json)
+                                   and the first one's after first present, n_present and present and
+                                   input p50/p95/p99 while setup ran, aterm's state folder at boot and at
+                                   window focus, WARN lines, consent dialogs (with a ~/Desktop control),
+                                   folder dialogs after Full Disk Access was granted (target 0), the
+                                   toolset pass, the setup lines and hand-overs in order, the mDNS
+                                   questions for the ALab vault, change-journal records, defaults and
+                                   killall execs, relaunches (the guest's disk grown to 100 GB first)
                   terminal-launch  a bare aterm on a terminal (Terminal.app's shape) to its shell's first
                                    prompt, cold then warm
                   app-launch       the app opened to its first tab's prompt, cold then warm
@@ -71,7 +105,36 @@ pub const USAGE: &str = "\
                                    typed steps a person still has), then the opened app's first log line
                                    and its toolset pass's start and end within 3 min (the guest's disk
                                    grown to 100 GB first)
-                Prints a markdown table; --record FILE appends it. Exit 0 every row measured, 1 a row
+                Fault rows (`faults`, or each by name; never in all), one thing going wrong in each guest:
+                  kill-stage       the app SIGKILLed at each stage it runs (the guest helper's watch of
+                                   initial-setup.json kills within 50 ms; the first stage twice) and
+                                   opened again: each launch's first stage, any done stage re-run, the
+                                   stage killed twice running a third time or parked, setup's end
+                  kill-clt         (--no-clt or --vanilla) the app SIGKILLed while the Command Line Tools
+                                   install runs: whether it outlived the kill, the relaunch's installers
+                  kill-publish     NOT RUN: a clone's publish needs a test organization's token
+                  rerun            a first launch to setup's end, then a second launch (stages, changes,
+                                   dialogs) and a second aterm init (prompts, lines, changes)
+                  legacy-upgrade   a 0.109 pending first-run.json and a Dock the person changed: whether
+                                   setup starts and the person's Dock keys after it
+                  person-change    setup to its end, the person's Dock change, a relaunch: the keys after
+                  offline          the guest's network down for the first 30 s of a launch: tart exec
+                                   while it is down, setup's first progress once it is back, rows left
+                                   not in place
+                  lossy            a launch through dnctl's 1 Mbit/s, 150 ms, 1% loss pipe: setup's end,
+                                   rows not in place shaped and once clean, the packets the pipe carried
+                  mdns-silent      the vault row with mDNS dropped by the packet filter
+                  mdns-no-route    the vault row with mDNS refused (block return)
+                  dmg              the app in a disk image hdiutil builds in the guest, opened twice from
+                                   the mounted image, then twice quarantined: where it ran, Gatekeeper
+                                   dialogs, an installed copy
+                  agent-ssh        aterm init under a parent named claude and over ssh -tt (the presence
+                                   each read, what each changed), then a guest-local vault joined over
+                                   SSH (prompts, Dock and defaults calls, the secret on disk)
+                  clock-back       the guest's clock moved back an hour once a stage runs: setup's end,
+                                   any done stage re-run, rows not in place
+                Prints a markdown table; --record FILE appends it (--record alone: docs/measured/
+                mac-nux-<date>.md in this checkout). Exit 0 every row measured, 1 a row
                 failed (a hang detector fired, a guest step failed), 3 NOT RUN (a row the guest could not
                 run, no tart)
 ";
@@ -79,7 +142,31 @@ pub const USAGE: &str = "\
 /// The guest folder the drivers and every record live in (outside the share).
 const GUEST_NUX: &str = "/tmp/aterm-nux";
 
-/// How long `first-launch` watches the app.
+/// The guest helper's file name (`src/guest/main.rs`), in the share and in [`GUEST_NUX`].
+const GUEST_HELPER: &str = "aterm-lab-guest";
+
+/// The launchd labels of the census and the person, agents of the account's GUI session.
+const CENSUS_AGENT: &str = "com.aterm.nux.census";
+const PERSON_AGENT: &str = "com.aterm.nux.person";
+
+/// The progress record setup keeps (`initial.rs`), under the account's home.
+const SETUP_RECORD: &str = "Library/Application Support/aterm/doctor/initial-setup.json";
+
+/// How often the wait on setup looks at the guest.
+const SETUP_POLL: Duration = Duration::from_secs(1);
+
+/// The guest's packet filter: the ALab vault's port refused to every address but loopback and
+/// tart's own network (where a lab vault of another guest lives), the host's end of it included,
+/// so no guest reaches a vault on this Mac's LAN whatever its names resolve to. Names are left as
+/// they are, so a guest off the ALab LAN looks the ALab vault up as such a Mac does.
+const PF_GUARD: &str = "block return out quick proto tcp from any to 192.168.64.1 port 7484
+pass out quick proto tcp from any to 127.0.0.0/8 port 7484
+pass out quick proto tcp from any to 192.168.64.0/24 port 7484
+block return out quick proto tcp from any to any port 7484
+";
+
+/// The ceiling of `first-launch`'s wait on setup: past it the wait ends even while setup still
+/// moves (it ends sooner once setup is done, or stood still a minute).
 const WATCH: Duration = Duration::from_secs(600);
 
 /// The disk `first-launch` and `install-sh` grow their clone to: the toolset pass refuses under
@@ -223,7 +310,9 @@ pub enum Scenario {
     InitApply,
     InitNotty,
     InitSsh,
+    PassHeld,
     Doctor,
+    LaunchRepairs,
     FirstLaunch,
     TerminalLaunch,
     AppLaunch,
@@ -231,14 +320,29 @@ pub enum Scenario {
     VaultLocal,
     Successor,
     InstallSh,
+    KillStage,
+    KillClt,
+    KillPublish,
+    Rerun,
+    LegacyUpgrade,
+    PersonChange,
+    Offline,
+    Lossy,
+    MdnsSilent,
+    MdnsNoRoute,
+    Dmg,
+    AgentSsh,
+    ClockBack,
 }
 
 /// Every row, in the order a run takes them.
-pub const ALL: [Scenario; 11] = [
+pub const ALL: [Scenario; 13] = [
     Scenario::InitApply,
     Scenario::InitNotty,
     Scenario::InitSsh,
+    Scenario::PassHeld,
     Scenario::Doctor,
+    Scenario::LaunchRepairs,
     Scenario::FirstLaunch,
     Scenario::TerminalLaunch,
     Scenario::AppLaunch,
@@ -248,6 +352,29 @@ pub const ALL: [Scenario; 11] = [
     Scenario::InstallSh,
 ];
 
+/// The fault rows (`faults`; `mac_nux_fault.rs`), each one thing going wrong in its own guest, in
+/// the order a run takes them, after [`ALL`]'s.
+pub const FAULTS: [Scenario; 13] = [
+    Scenario::KillStage,
+    Scenario::KillClt,
+    Scenario::KillPublish,
+    Scenario::Rerun,
+    Scenario::LegacyUpgrade,
+    Scenario::PersonChange,
+    Scenario::Offline,
+    Scenario::Lossy,
+    Scenario::MdnsSilent,
+    Scenario::MdnsNoRoute,
+    Scenario::Dmg,
+    Scenario::AgentSsh,
+    Scenario::ClockBack,
+];
+
+/// Every row [`ALL`] and [`FAULTS`] name, in run order.
+fn every() -> impl Iterator<Item = Scenario> {
+    ALL.into_iter().chain(FAULTS)
+}
+
 impl Scenario {
     /// Its name on the command line and in the table.
     #[must_use]
@@ -256,7 +383,9 @@ impl Scenario {
             Scenario::InitApply => "init-apply",
             Scenario::InitNotty => "init-notty",
             Scenario::InitSsh => "init-ssh",
+            Scenario::PassHeld => "pass-held",
             Scenario::Doctor => "doctor",
+            Scenario::LaunchRepairs => "launch-repairs",
             Scenario::FirstLaunch => "first-launch",
             Scenario::TerminalLaunch => "terminal-launch",
             Scenario::AppLaunch => "app-launch",
@@ -264,7 +393,52 @@ impl Scenario {
             Scenario::VaultLocal => "vault-local",
             Scenario::Successor => "successor",
             Scenario::InstallSh => "install-sh",
+            Scenario::KillStage => "kill-stage",
+            Scenario::KillClt => "kill-clt",
+            Scenario::KillPublish => "kill-publish",
+            Scenario::Rerun => "rerun",
+            Scenario::LegacyUpgrade => "legacy-upgrade",
+            Scenario::PersonChange => "person-change",
+            Scenario::Offline => "offline",
+            Scenario::Lossy => "lossy",
+            Scenario::MdnsSilent => "mdns-silent",
+            Scenario::MdnsNoRoute => "mdns-no-route",
+            Scenario::Dmg => "dmg",
+            Scenario::AgentSsh => "agent-ssh",
+            Scenario::ClockBack => "clock-back",
         }
+    }
+
+    /// Why a guest cannot run it at all (it is NOT RUN before a clone is made); `None` for a row
+    /// a guest runs.
+    #[must_use]
+    pub const fn not_run(self) -> Option<&'static str> {
+        match self {
+            Scenario::KillPublish => Some(fault::KILL_PUBLISH),
+            _ => None,
+        }
+    }
+
+    /// Whether its clone's disk grows to [`FIRST_LAUNCH_DISK_GB`] first: a row that opens the app
+    /// and lets its toolset pass run.
+    #[must_use]
+    pub const fn grows_disk(self) -> bool {
+        matches!(
+            self,
+            Scenario::FirstLaunch
+                | Scenario::InstallSh
+                | Scenario::PassHeld
+                | Scenario::LaunchRepairs
+                | Scenario::KillStage
+                | Scenario::KillClt
+                | Scenario::Rerun
+                | Scenario::LegacyUpgrade
+                | Scenario::PersonChange
+                | Scenario::Offline
+                | Scenario::Lossy
+                | Scenario::Dmg
+                | Scenario::ClockBack
+        )
     }
 
     /// Whether it runs the app this run built or was handed (the others install a public release).
@@ -274,30 +448,29 @@ impl Scenario {
     }
 }
 
-/// The rows `--scenario` names (comma-separated, `all` for every row), in [`ALL`]'s order, each
-/// once.
+/// The rows `--scenario` names (comma-separated, `all` for [`ALL`], `faults` for [`FAULTS`]), in
+/// run order, each once.
 ///
 /// # Errors
 /// An empty list or a name no row has.
 pub fn parse_scenarios(list: &str) -> Result<Vec<Scenario>, String> {
     let mut picked = Vec::new();
     for word in list.split(',').map(str::trim) {
-        if word == "all" {
-            picked.extend(ALL);
-            continue;
+        match word {
+            "all" => picked.extend(ALL),
+            "faults" => picked.extend(FAULTS),
+            _ => picked.push(every().find(|s| s.name() == word).ok_or_else(|| {
+                format!(
+                    "no row '{word}' (rows: all, faults, {})",
+                    every().map(Scenario::name).collect::<Vec<_>>().join(", ")
+                )
+            })?),
         }
-        let row = ALL.into_iter().find(|s| s.name() == word).ok_or_else(|| {
-            format!(
-                "no row '{word}' (rows: {})",
-                ALL.map(Scenario::name).join(", ")
-            )
-        })?;
-        picked.push(row);
     }
     if picked.is_empty() {
         return Err("--scenario names no row".into());
     }
-    Ok(ALL.into_iter().filter(|s| picked.contains(s)).collect())
+    Ok(every().filter(|s| picked.contains(s)).collect())
 }
 
 /// What a run was asked.
@@ -306,9 +479,37 @@ pub struct Ask {
     pub app: Option<PathBuf>,
     pub scenarios: Vec<Scenario>,
     pub standard_user: bool,
+    /// The person base: the guest helper acting as the person at the console.
+    pub person: bool,
+    /// A base with the Command Line Tools removed.
+    pub no_clt: bool,
+    /// The image is REF's `-vanilla` sibling.
+    pub vanilla: bool,
+    /// How many times each row runs, each in its own clone.
+    pub repeat: usize,
     pub image: String,
     pub keep: bool,
     pub record: Option<PathBuf>,
+}
+
+/// The most `--repeat` takes.
+const MOST_REPEATS: usize = 10;
+
+/// The cirruslabs `-vanilla` image beside `image` (a `-base` one): the same macOS with no Command
+/// Line Tools or Homebrew of its own.
+#[must_use]
+pub fn vanilla_image(image: &str) -> Option<String> {
+    let (name, tag) = image.rsplit_once(':').unwrap_or((image, "latest"));
+    let stem = name.strip_suffix("-base")?;
+    Some(format!("{stem}-vanilla:{tag}"))
+}
+
+/// The dated record `--record` alone appends to.
+fn dated_record() -> PathBuf {
+    paths().repo.join(format!(
+        "docs/measured/mac-nux-{}.md",
+        crate::util::ymd(crate::util::now_secs())
+    ))
 }
 
 /// Parse `mac nux`'s arguments (`image` is the default image).
@@ -325,9 +526,47 @@ pub fn parse(args: &[String], image: String) -> Result<Ask, Fail> {
         None => ALL.to_vec(),
     };
     let standard_user = take_flag(&mut a, "--standard-user");
+    let person = take_flag(&mut a, "--person");
+    let no_clt = take_flag(&mut a, "--no-clt");
+    let vanilla = take_flag(&mut a, "--vanilla");
+    if no_clt && vanilla {
+        return Err(Fail::usage(
+            "mac nux: --no-clt and --vanilla each give a Mac without the Command Line Tools: pick one",
+        ));
+    }
+    let repeat = match take_value(&mut a, "--repeat")? {
+        Some(n) => n
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=MOST_REPEATS).contains(n))
+            .ok_or_else(|| {
+                Fail::usage(format!(
+                    "mac nux: --repeat {n}: a count from 1 to {MOST_REPEATS}"
+                ))
+            })?,
+        None => 1,
+    };
     let image = take_value(&mut a, "--image")?.unwrap_or(image);
+    let image = if vanilla {
+        vanilla_image(&image).ok_or_else(|| {
+            Fail::usage(format!(
+                "mac nux: --vanilla needs a cirruslabs -base image to find its -vanilla sibling, not {image}"
+            ))
+        })?
+    } else {
+        image
+    };
     let keep = take_flag(&mut a, "--keep");
-    let record = take_value(&mut a, "--record")?.map(from_caller);
+    let record = match a.iter().position(|w| w == "--record") {
+        Some(at) => {
+            a.remove(at);
+            match a.get(at).filter(|w| !w.starts_with("--")) {
+                Some(_) => Some(from_caller(a.remove(at))),
+                None => Some(dated_record()),
+            }
+        }
+        None => None,
+    };
     if let Some(extra) = a.first() {
         return Err(Fail::usage(format!(
             "mac nux: unexpected '{extra}' ({LAB} mac help)"
@@ -337,6 +576,10 @@ pub fn parse(args: &[String], image: String) -> Result<Ask, Fail> {
         app,
         scenarios,
         standard_user,
+        person,
+        no_clt,
+        vanilla,
+        repeat,
         image,
         keep,
         record,
@@ -610,6 +853,65 @@ fn lines_cell(row: &mut Row, label: &str, out: &str) {
     );
 }
 
+/// The rows an `aterm init` run left open, each as its outcome and id (`failed base.clt`): from
+/// the last `--json` report in `out` (every row whose outcome is not ok, changed or not
+/// applicable), else from the text rows it printed (`<word>: <title> (<id>)`, every word but
+/// `changed`). A `planned` row is open: a `--check` run's rows that still differ read so and
+/// fail it (only `--plan`, which the lane never runs, counts them done). A waiting row an
+/// admin's approval finishes is named too: it is not the exit's.
+#[must_use]
+pub fn open_rows(out: &str) -> Vec<String> {
+    const DONE: [&str; 3] = ["ok", "changed", "not-applicable"];
+    const OPEN: [&str; 7] = [
+        "failed",
+        "unknown",
+        "blocked",
+        "deferred",
+        "needs action",
+        "waiting",
+        "planned",
+    ];
+    let report = out.lines().rev().find_map(|line| {
+        let v: aterm_json::Value = aterm_json::from_str(line.trim()).ok()?;
+        v.get("items")?.as_array().cloned()
+    });
+    if let Some(items) = report {
+        return items
+            .iter()
+            .filter_map(|item| {
+                let outcome = item.get("outcome")?.as_str()?;
+                let id = item.get("id")?.as_str()?;
+                (!DONE.contains(&outcome)).then(|| format!("{outcome} {id}"))
+            })
+            .collect();
+    }
+    out.lines()
+        .filter_map(|line| {
+            let (word, rest) = line.trim_end().split_once(": ")?;
+            let (_, id) = rest.strip_suffix(')')?.rsplit_once(" (")?;
+            (OPEN.contains(&word) && !id.is_empty() && !id.contains(char::is_whitespace))
+                .then(|| format!("{word} {id}"))
+        })
+        .collect()
+}
+
+/// When `d` ended nonzero, the rows its `aterm init` output left open ([`open_rows`]) under
+/// `label`, so the exit names its cause.
+fn open_rows_cell(row: &mut Row, label: &str, d: &Drive, out: &str) {
+    if d.exit.is_none_or(|code| code == 0) {
+        return;
+    }
+    let open = open_rows(out);
+    row.cell(
+        format!("{label}rows left open"),
+        if open.is_empty() {
+            Value::Missing("init's output names no row left open".into())
+        } else {
+            Value::Text(squeeze(&open.join(", "), 300))
+        },
+    );
+}
+
 /// One `aterm.log` line: `<epoch.ms> <pid> <LEVEL> <target>: <message>`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct LogLine<'a> {
@@ -772,6 +1074,30 @@ pub fn dock_labels(read: &str) -> Vec<String> {
         .collect()
 }
 
+/// Start recording the guest's mDNS packets on its network ([`stop_mdns`] ends it).
+fn start_mdns(g: &Guest) -> Result<(), Fail> {
+    g.sh(
+        &format!(
+            // Its own output away from `tart exec`'s, which would otherwise wait on it.
+            "({} </dev/null >/dev/null 2>&1 &) ; sleep 1",
+            g.as_root(&format!(
+                "exec /usr/sbin/tcpdump -l -n -i en0 udp port 5353 > {GUEST_NUX}/mdns.txt 2>/dev/null"
+            ))
+        ),
+        STEP,
+    )
+    .map(drop)
+}
+
+/// End [`start_mdns`]'s recording: the packets it wrote.
+fn stop_mdns(g: &Guest) -> Result<String, Fail> {
+    let _ = g.vm.exec(
+        &format!("{}; sleep 0.5", g.as_root("pkill -INT -x tcpdump")),
+        STEP,
+    );
+    g.read(&format!("{GUEST_NUX}/mdns.txt"))
+}
+
 /// The mDNS packets (tcpdump's lines) that ask after the ALab vault ([`ALAB_HOST`],
 /// [`ALAB_SERVICE`]).
 #[must_use]
@@ -799,6 +1125,85 @@ pub fn tcc_prompts(log: &str) -> BTreeMap<String, usize> {
         *seen.entry(service.to_owned()).or_insert(0) += 1;
     }
     seen
+}
+
+/// One consent dialog tccd put up: when (epoch ms, from the event's `timestamp`), the service,
+/// and the subject it asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TccPrompt {
+    pub at_ms: Option<u64>,
+    pub service: String,
+    pub subject: String,
+}
+
+/// tccd's consent dialogs (`AUTHREQ_PROMPTING`) in a `log stream --style ndjson` record, in order.
+#[must_use]
+pub fn tcc_prompt_events(log: &str) -> Vec<TccPrompt> {
+    log.lines()
+        .filter_map(|line| {
+            let message = crate::mac::event_message(line);
+            let (_, rest) = message.split_once("AUTHREQ_PROMPTING:")?;
+            let service = rest
+                .split_once("service=")
+                .map_or("?", |(_, s)| s.split([',', ' ', '"']).next().unwrap_or(""));
+            let subject = rest
+                .split_once("subject=Sub:{")
+                .and_then(|(_, s)| s.split_once('}'))
+                .map_or("?", |(s, _)| s);
+            let at_ms = aterm_json::from_str::<aterm_json::Value>(line)
+                .ok()
+                .and_then(|v| v.get("timestamp")?.as_str().and_then(log_timestamp_ms));
+            Some(TccPrompt {
+                at_ms,
+                service: service
+                    .strip_prefix("kTCCService")
+                    .unwrap_or(service)
+                    .to_owned(),
+                subject: subject.replace("\\/", "/"),
+            })
+        })
+        .collect()
+}
+
+/// The folder (TCC) dialogs tccd put up for the app at or after `since_ms` (epoch ms): a
+/// `SystemPolicy…` service other than Full Disk Access itself, asked for a subject naming aterm
+/// (never the guest agent's ~/Desktop control).
+#[must_use]
+pub fn folder_prompts_after(prompts: &[TccPrompt], since_ms: u64) -> usize {
+    prompts
+        .iter()
+        .filter(|p| {
+            p.service.starts_with("SystemPolicy")
+                && p.service != "SystemPolicyAllFiles"
+                && p.subject.contains("aterm")
+                && p.at_ms.is_none_or(|at| at >= since_ms)
+        })
+        .count()
+}
+
+/// Epoch ms of a unified log `timestamp` (`2026-10-26 08:30:01.123456-0700`).
+#[must_use]
+pub fn log_timestamp_ms(ts: &str) -> Option<u64> {
+    let (date, rest) = ts.trim().split_once(' ')?;
+    let mut ymd = date.split('-').map(str::parse::<i64>);
+    let (y, m, d) = (ymd.next()?.ok()?, ymd.next()?.ok()?, ymd.next()?.ok()?);
+    let zone_at = rest.rfind(['+', '-'])?;
+    let (clock, zone) = rest.split_at(zone_at);
+    let (hms, frac) = clock.split_once('.').unwrap_or((clock, "0"));
+    let mut hms = hms.split(':').map(str::parse::<i64>);
+    let (h, mi, sec) = (hms.next()?.ok()?, hms.next()?.ok()?, hms.next()?.ok()?);
+    let ms: i64 = format!("{frac:0<3}").get(..3)?.parse().ok()?;
+    let sign = if zone.starts_with('-') { -1 } else { 1 };
+    let zone: i64 = zone.get(1..)?.parse().ok()?;
+    let offset = sign * ((zone / 100) * 3600 + (zone % 100) * 60);
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    let secs = days * 86_400 + h * 3600 + mi * 60 + sec - offset;
+    u64::try_from(secs * 1000 + ms).ok()
 }
 
 /// The `vMAJOR.MINOR.PATCH` a release URL (a `location:` header) names.
@@ -913,7 +1318,12 @@ pub struct ReportJson {
     /// The three rows that took longest, slowest first: each id and its `elapsed_ms`.
     pub slowest: Vec<(String, u64)>,
     pub phases: BTreeMap<String, u64>,
+    /// Each row whose outcome is not in place ([`IN_PLACE`]): its id and outcome, in report order.
+    pub not_ok: Vec<(String, String)>,
 }
+
+/// The outcomes of a report's rows that leave nothing to do.
+pub const IN_PLACE: [&str; 4] = ["ok", "changed", "not-applicable", "n/a"];
 
 /// [`ReportJson`] over the last line of `text` that parses as a report (a terminal's output holds
 /// the prompts' lines too); `None` when none does.
@@ -939,13 +1349,43 @@ pub fn read_report_json(text: &str) -> Option<ReportJson> {
                     .collect()
             })
             .unwrap_or_default();
+        let not_ok = items
+            .iter()
+            .filter_map(|i| {
+                let outcome = i.get("outcome")?.as_str()?;
+                if IN_PLACE.contains(&outcome) {
+                    return None;
+                }
+                Some((i.get("id")?.as_str()?.to_owned(), outcome.to_owned()))
+            })
+            .collect();
         Some(ReportJson {
             rows: items.len(),
             timed: items.iter().filter(|i| elapsed(i).is_some()).count(),
             slowest,
             phases,
+            not_ok,
         })
     })
+}
+
+/// The rows a report left not in place, as one cell under `label` (a run that exited non-zero
+/// names them; `from` says which report).
+fn not_ok_cell(row: &mut Row, label: &str, from: &str, report: Option<&ReportJson>) {
+    row.cell(
+        format!("{label}rows not ok ({from})"),
+        match report {
+            Some(j) if j.not_ok.is_empty() => Value::Text("none".into()),
+            Some(j) => Value::Text(
+                j.not_ok
+                    .iter()
+                    .map(|(id, outcome)| format!("{id} {outcome}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            None => Value::Missing("the report did not parse as JSON".into()),
+        },
+    );
 }
 
 /// A run's `--json` report as cells under `label`.
@@ -1141,6 +1581,11 @@ struct Guest {
     app: String,
     aterm: String,
     standard: bool,
+    /// The account's uid: its GUI session's launchd domain is `gui/<uid>`.
+    uid: String,
+    /// What a row's dialogs count from (the guest's clock, epoch ms): the open, for a launch; the
+    /// census' own start when a row sets none.
+    mark_ms: std::cell::Cell<Option<u64>>,
 }
 
 impl Guest {
@@ -1287,6 +1732,555 @@ impl Guest {
             .trim()
             == "yes")
     }
+
+    /// Run `args` as the launchd agent `label` in the account's GUI session ([`agent_plist`]).
+    fn agent_start(&self, label: &str, args: &[&str]) -> Result<(), Fail> {
+        self.sh(
+            &format!(
+                "cat > {GUEST_NUX}/{label}.plist <<'EOF'\n{}EOF",
+                agent_plist(label, args)
+            ),
+            STEP,
+        )?;
+        self.sh(
+            &self.as_root(&format!(
+                "launchctl bootout gui/{uid}/{label} 2>/dev/null; launchctl bootstrap gui/{uid} {GUEST_NUX}/{label}.plist",
+                uid = self.uid
+            )),
+            STEP,
+        )?;
+        Ok(())
+    }
+
+    fn agent_stop(&self, label: &str) {
+        let _ = self.run(
+            &self.as_root(&format!(
+                "launchctl bootout gui/{}/{label} 2>/dev/null || true",
+                self.uid
+            )),
+            STEP,
+        );
+    }
+
+    /// Wait until `file` holds a line (within [`STEP`]): `Err` with the agent's stderr otherwise.
+    fn await_line(&self, file: &str, label: &str) -> Result<(), String> {
+        let started = Instant::now();
+        while started.elapsed() < STEP {
+            if self
+                .vm
+                .exec(&format!("test -s {file}"), STEP)
+                .is_ok_and(|o| o.status.success())
+            {
+                return Ok(());
+            }
+            if stop::sleep(POLL).is_err() {
+                break;
+            }
+        }
+        let err = self
+            .read(&format!("{GUEST_NUX}/{label}.err"))
+            .unwrap_or_default();
+        Err(format!(
+            "{label} wrote nothing within {} s{}",
+            STEP.as_secs(),
+            if err.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", squeeze(err.trim(), 160))
+            }
+        ))
+    }
+
+    /// The guest's clock, in epoch ms.
+    fn clock_ms(&self) -> Result<u64, Fail> {
+        let out = self.sh(
+            "perl -MTime::HiRes=time -e 'printf \"%d\\n\", time * 1000'",
+            STEP,
+        )?;
+        out.trim()
+            .parse()
+            .map_err(|_| Fail::die(format!("the guest's clock did not read back: {out}")))
+    }
+
+    /// Watch the progress record ([`SETUP_RECORD`]) with the guest helper (the watch before it
+    /// stopped), its record a fresh `file` in [`GUEST_NUX`]; with `kill`, that pid is killed the
+    /// first time the record runs a stage of that mask of stage bits.
+    fn watch_record(&self, file: &str, kill: Option<(u32, u64)>) -> Result<(), Fail> {
+        let kill = kill.map_or(String::new(), |(pid, mask)| {
+            format!(" --kill {pid} --when-running {mask}")
+        });
+        self.sh(
+            &format!(
+                "pkill -f '{GUEST_HELPER} watch' || true; : > {GUEST_NUX}/{file}; \
+                 ({GUEST_NUX}/{GUEST_HELPER} watch \"$HOME/{SETUP_RECORD}\" {GUEST_NUX}/{file}{kill} </dev/null >/dev/null 2>&1 &); sleep 0.3"
+            ),
+            STEP,
+        )?;
+        Ok(())
+    }
+}
+
+/// A launchd agent's plist: `args` run at load in the account's GUI session, where the window list
+/// and posted events reach its console and launchd, not the guest agent, is its responsible
+/// process (tccd judges the helper's own grants); its stderr to `<label>.err`.
+fn agent_plist(label: &str, args: &[&str]) -> String {
+    let args: String = args
+        .iter()
+        .map(|a| format!("<string>{a}</string>"))
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array>{args}</array>\
+<key>RunAtLoad</key><true/><key>ProcessType</key><string>Interactive</string>\
+<key>StandardErrorPath</key><string>{GUEST_NUX}/{label}.err</string></dict></plist>
+"
+    )
+}
+
+/// What every row watches from its start: tccd's log and the dialog census.
+struct Watchers {
+    tccd: aterm_uds::spawnfd::Child,
+    /// The census agent started and wrote its first line, or why not.
+    census: Result<(), String>,
+}
+
+impl Watchers {
+    /// tccd's log streamed to `tccd.ndjson` (as root) and the census agent started, each once it
+    /// wrote its first line.
+    fn start(g: &Guest) -> Result<Watchers, Fail> {
+        let mut tccd = aterm_uds::spawnfd::command(&g.vm.tart)
+            .args(["exec", &g.vm.name, "/bin/sh", "-c"])
+            .arg(format!(
+                "exec {}",
+                g.as_root(&format!(
+                    "exec /usr/bin/log stream --info --style ndjson --predicate 'process == \"tccd\"' > {GUEST_NUX}/tccd.ndjson 2>&1"
+                ))
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| Fail::die(format!("tccd's log: {e}")))?;
+        let started = Instant::now();
+        while !g
+            .vm
+            .exec(&format!("test -s {GUEST_NUX}/tccd.ndjson"), STEP)
+            .is_ok_and(|o| o.status.success())
+        {
+            if started.elapsed() >= STEP {
+                let _ = tccd.kill();
+                let _ = tccd.wait();
+                return Err(Fail::die(format!(
+                    "tccd's log stream wrote nothing within {} s",
+                    STEP.as_secs()
+                )));
+            }
+            stop::sleep(POLL)?;
+        }
+        let census_out = format!("{GUEST_NUX}/census.txt");
+        let census = g
+            .agent_start(
+                CENSUS_AGENT,
+                &[
+                    &format!("{GUEST_NUX}/{GUEST_HELPER}"),
+                    "census",
+                    &census_out,
+                ],
+            )
+            .map_err(|f| f.msg.unwrap_or_default())
+            .and_then(|()| g.await_line(&census_out, CENSUS_AGENT));
+        Ok(Watchers { tccd, census })
+    }
+
+    /// Stop both and read them: the dialogs since the row's mark, and (for a row that read no
+    /// consent dialogs of its own) tccd's prompts.
+    fn finish(mut self, g: &Guest, row: &mut Row) -> Result<(), Fail> {
+        g.agent_stop(CENSUS_AGENT);
+        let dialogs_cell = match &self.census {
+            Err(why) => Value::Missing(why.clone()),
+            Ok(()) => {
+                let census = read_census(&g.read(&format!("{GUEST_NUX}/census.txt"))?);
+                match &census.error {
+                    Some(why) => {
+                        Value::Missing(format!("the census could not read the window list: {why}"))
+                    }
+                    None => {
+                        let since = g
+                            .mark_ms
+                            .get()
+                            .or(census.started.map(|(at, _)| at))
+                            .unwrap_or(0);
+                        Value::Text(dialog_text(&dialogs(&census, since)))
+                    }
+                }
+            }
+        };
+        row.cell("dialogs", dialogs_cell);
+        let _ =
+            g.vm.exec(&g.as_root("pkill -INT -f '^/usr/bin/log stream'"), STEP);
+        crate::mac::reap_within(&mut self.tccd, STEP);
+        if !row.cells.iter().any(|(name, _)| name == "consent dialogs") {
+            let tcc = g.sh(
+                &format!("grep -h 'AUTHREQ_PROMPTING' {GUEST_NUX}/tccd.ndjson || true"),
+                STEP,
+            )?;
+            let prompts = tcc_prompts(&tcc);
+            row.cell(
+                "consent prompts",
+                Value::Text(if prompts.is_empty() {
+                    "none".to_owned()
+                } else {
+                    prompts
+                        .iter()
+                        .map(|(s, n)| format!("{s} {n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The dialogs a census saw, as one cell.
+fn dialog_text(dialogs: &[crate::mac_nux_guest::Dialog]) -> String {
+    if dialogs.is_empty() {
+        return "none".to_owned();
+    }
+    dialogs
+        .iter()
+        .map(|d| {
+            let more = if d.windows > 1 {
+                format!(" x{}", d.windows)
+            } else {
+                String::new()
+            };
+            format!("{} ({}) {} ms{more}", d.owner, d.kind, d.first_ms)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The person at the guest's console: the helper at [`PERSON_HELPER`] run as an agent of the
+/// account's GUI session, the account's password its answer to a password field.
+fn person_start(g: &Guest) -> Result<(), Fail> {
+    let out = format!("{GUEST_NUX}/person.txt");
+    g.agent_start(
+        PERSON_AGENT,
+        &[
+            PERSON_HELPER,
+            "person",
+            &out,
+            "--password",
+            g.sudo_password(),
+        ],
+    )?;
+    g.await_line(&out, PERSON_AGENT).map_err(Fail::die)
+}
+
+/// Stop the person and read what it did: its grants, whether its input reset `HIDIdleTime` (the
+/// proof every person stage needs, else NOT MEASURED), each press with its latency, and the
+/// passwords it typed.
+fn person_cells(g: &Guest, row: &mut Row) -> Result<HidProof, Fail> {
+    g.agent_stop(PERSON_AGENT);
+    let p = read_person(&g.read(&format!("{GUEST_NUX}/person.txt"))?);
+    let word = |v: Option<bool>| match v {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "?",
+    };
+    row.cell(
+        "person's grants",
+        Value::Text(format!(
+            "Accessibility {}, event posting {}",
+            word(p.trusted),
+            word(p.may_post)
+        )),
+    );
+    let proof = hid_proof(&p);
+    row.cell(
+        "person's input resets HIDIdleTime",
+        match &proof {
+            HidProof::Reset {
+                inputs,
+                worst_after_ns,
+            } => Value::Text(format!(
+                "yes, {inputs} inputs, idle at most {} ms after one",
+                worst_after_ns / 1_000_000
+            )),
+            HidProof::NotMeasured(why) => Value::Missing(why.clone()),
+        },
+    );
+    let presses = click_latencies(&p);
+    row.cell(
+        "person's presses (seen to press)",
+        Value::Text(if presses.is_empty() {
+            "none".to_owned()
+        } else {
+            presses
+                .iter()
+                .map(|(owner, what, ms)| format!("{owner} {what} {ms} ms"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }),
+    );
+    row.cell("passwords typed", Value::Count(p.typed.len() as u64));
+    Ok(proof)
+}
+
+/// Where setup stands in the guest, in one look: `setup=` from its own `aterm ctl status` and the
+/// progress record.
+fn setup_reading(g: &Guest) -> Result<crate::mac_nux_guest::Reading, Fail> {
+    let out = g.run(
+        &format!(
+            "{} ctl status 2>/dev/null | head -1; echo '--- record'; cat \"$HOME/{SETUP_RECORD}\" 2>/dev/null",
+            g.aterm
+        ),
+        STEP,
+    )?;
+    let (status, record) = out.split_once("--- record").unwrap_or((&out, ""));
+    Ok(crate::mac_nux_guest::Reading {
+        setup: setup_field(status).map(str::to_owned),
+        record: read_record(record),
+    })
+}
+
+/// Wait for setup: until `setup=done` (the record's completion on a build without the field),
+/// until it stood still for [`STALL_MS`] (the one-minute no-progress hang detector), or until
+/// [`WATCH`]; its cell under `label` counts from `from_ms` (ms before the wait began). The time
+/// it ended, in ms after `from_ms`, once done.
+fn wait_setup(g: &Guest, row: &mut Row, label: &str, from_ms: u64) -> Result<Option<u64>, Fail> {
+    let mut stall = Stall::new(STALL_MS);
+    let started = Instant::now();
+    loop {
+        stop::check()?;
+        let reading = setup_reading(g)?;
+        let now = millis(started.elapsed());
+        let at = from_ms + now;
+        match stall.see(now, &reading) {
+            Waited::Done => {
+                row.cell(format!("{label}setup done"), Value::Ms(at));
+                return Ok(Some(at));
+            }
+            Waited::Stalled { stood, since_ms } => {
+                row.cell(
+                    format!("{label}setup done"),
+                    Value::Missing(format!(
+                        "it stood at {stood} from {} ms to {at} ms, and the one-minute no-progress hang detector ended the wait",
+                        from_ms + since_ms
+                    )),
+                );
+                return Ok(None);
+            }
+            Waited::Moving => {}
+        }
+        if started.elapsed() >= WATCH {
+            row.cell(
+                format!("{label}setup done"),
+                Value::Missing(format!(
+                    "still moving at {} min: {}",
+                    WATCH.as_secs() / 60,
+                    reading.said()
+                )),
+            );
+            return Ok(None);
+        }
+        stop::sleep(SETUP_POLL)?;
+    }
+}
+
+/// Present and input latency from the guest's own `aterm ctl metrics percentiles`, as cells under
+/// `label`: `n_present`, `present_p50/p95/p99_ms`, `n_input` and `input_p50/p95/p99_ms`.
+fn percentile_cells(g: &Guest, row: &mut Row, label: &str) -> Result<(), Fail> {
+    let text = g.run(&format!("{} ctl metrics percentiles 2>&1", g.aterm), STEP)?;
+    for kind in ["present", "input"] {
+        let n = metric(&text, &format!("n_{kind}"));
+        row.cell(
+            format!("{label}n_{kind}"),
+            or_missing(
+                n.map(ms_value),
+                Value::Count,
+                "aterm ctl metrics percentiles did not answer",
+            ),
+        );
+        let spread = ["p50", "p95", "p99"]
+            .iter()
+            .map(|p| metric(&text, &format!("{kind}_{p}_ms")))
+            .collect::<Option<Vec<f64>>>();
+        row.cell(
+            format!("{label}{kind} p50/p95/p99"),
+            match (n, spread) {
+                (Some(n), Some(v)) if n > 0.0 => {
+                    Value::Text(format!("{:.2}/{:.2}/{:.2} ms", v[0], v[1], v[2]))
+                }
+                (Some(_), _) => Value::Missing(format!("no {kind} sample while setup ran")),
+                (None, _) => Value::Missing("aterm ctl metrics percentiles did not answer".into()),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// aterm's state folder at one moment, `at`: its first two levels and its setup records, printed
+/// whole to the run's output, and as a cell.
+fn state_snapshot(g: &Guest, row: &mut Row, at: &str) -> Result<(), Fail> {
+    let out = g.run(
+        "d=\"$HOME/Library/Application Support/aterm\"; [ -d \"$d\" ] || { echo '(absent)'; exit 0; }; \
+         cd \"$d\" && find . -mindepth 1 -maxdepth 2 | sort | head -80; \
+         for f in doctor/*.json; do [ -f \"$f\" ] && { echo \"== $f\"; head -c 1500 \"$f\"; echo; }; done; true",
+        STEP,
+    )?;
+    println!("mac nux: aterm's state folder at {at}:\n{}", out.trim_end());
+    row.cell(format!("state at {at}"), Value::Text(state_summary(&out)));
+    Ok(())
+}
+
+/// [`state_snapshot`]'s listing in a few words: how many entries, and the setup records.
+#[must_use]
+pub fn state_summary(listing: &str) -> String {
+    if listing.trim() == "(absent)" {
+        return "no aterm folder".to_owned();
+    }
+    let entries: Vec<&str> = listing
+        .lines()
+        .take_while(|l| !l.starts_with("== "))
+        .map(|l| l.trim().trim_start_matches("./"))
+        .filter(|l| !l.is_empty())
+        .collect();
+    let records: Vec<&str> = entries
+        .iter()
+        .filter_map(|l| l.strip_prefix("doctor/"))
+        .collect();
+    format!(
+        "{} entries; doctor/: {}",
+        entries.len(),
+        if records.is_empty() {
+            "none".to_owned()
+        } else {
+            records.join(", ")
+        }
+    )
+}
+
+/// `xcode-select -p`'s answer (its output, then an `exit=<status>` line): the developer folder, or
+/// that it fails.
+#[must_use]
+pub fn xcode_select_text(out: &str) -> String {
+    let mut lines: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let status = lines
+        .pop()
+        .and_then(|l| l.strip_prefix("exit="))
+        .unwrap_or("?");
+    let first = lines.first().copied().unwrap_or("");
+    if status == "0" {
+        first.to_owned()
+    } else {
+        format!("fails (exit {status}: {})", squeeze(first, 80))
+    }
+}
+
+/// What the guest saw of the ALab vault: `alab-secrets.local`'s address (`none` unresolved), the
+/// HTTP status of a GET of its URL (`000`: no answer), and the `_alab-vault._tcp` adverts it
+/// heard. Unreached when nothing answered; why not, else.
+///
+/// # Errors
+/// The guest reached it: the row must not go on.
+pub fn alab_probe_verdict(address: &str, http: &str, adverts: u32) -> Result<String, String> {
+    if http.trim() != "000" || adverts > 0 {
+        return Err(format!(
+            "the guest reached an ALab vault (alab-secrets.local {address}, HTTP {}, {adverts} {ALAB_SERVICE} advert(s))",
+            http.trim()
+        ));
+    }
+    Ok(format!(
+        "Unreached (alab-secrets.local {}, no answer, no {ALAB_SERVICE} advert)",
+        if address == "none" {
+            "unresolved"
+        } else {
+            address
+        }
+    ))
+}
+
+/// The `_alab-vault._tcp` adverts a `dns-sd -B` on this Mac heard over a tart bridge (a vmnet
+/// `bridge1NN`): a guest's. `name_of` names an interface index.
+#[must_use]
+pub fn guest_adverts(browse: &str, name_of: &dyn Fn(u32) -> Option<String>) -> Vec<String> {
+    browse
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.get(1) != Some(&"Add") {
+                return None;
+            }
+            let name = name_of(f.get(3)?.parse().ok()?)?;
+            let vmnet = name
+                .strip_prefix("bridge")
+                .and_then(|n| n.parse::<u32>().ok())
+                .is_some_and(|n| n >= 100);
+            vmnet.then(|| {
+                format!(
+                    "{} on {name}",
+                    f.get(6..).map(|i| i.join(" ")).unwrap_or_default()
+                )
+            })
+        })
+        .collect()
+}
+
+/// The ALab guard every row ends with: the guest's look at the ALab vault ([`alab_probe_verdict`])
+/// and this Mac's for a guest's production advert ([`guest_adverts`]); either one failing fails
+/// the row.
+fn alab_guard(g: &Guest, run: &Path, row: &mut Row) -> Result<(), Fail> {
+    let seen = g.run(
+        &format!(
+            "/usr/bin/python3 -c \"import socket\ntry: print(socket.getaddrinfo('{ALAB_HOST}', 7484)[0][4][0])\nexcept Exception: print('none')\"; \
+             curl -s -o /dev/null -m 3 -w '%{{http_code}}\\n' '{url}'; \
+             script -q {GUEST_NUX}/guard.txt dns-sd -B {ALAB_SERVICE} >/dev/null 2>&1 & sleep 3; pkill -x dns-sd; sleep 0.3; \
+             grep -c ' Add ' {GUEST_NUX}/guard.txt || true",
+            url = aterm_types::macos_setup::DEFAULT_VAULT_URL
+        ),
+        STEP,
+    )?;
+    let mut lines = seen.lines().map(str::trim);
+    let address = lines.next().unwrap_or("none").to_owned();
+    let http = lines.next().unwrap_or("000").to_owned();
+    let adverts = lines.next_back().and_then(|n| n.parse().ok()).unwrap_or(0);
+    match alab_probe_verdict(&address, &http, adverts) {
+        Ok(text) => row.cell("ALab probe", Value::Text(text)),
+        Err(why) => row.fail(why),
+    }
+    let file = run.join("host-browse.txt");
+    let _ = std::fs::remove_file(&file);
+    let mut browse = aterm_uds::spawnfd::command("/usr/bin/script")
+        .arg("-q")
+        .arg(&file)
+        .args(["/usr/bin/dns-sd", "-B", ALAB_SERVICE, "local."])
+        .setsid(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| Fail::die(format!("dns-sd on this Mac: {e}")))?;
+    stop::sleep(Duration::from_secs(3))?;
+    let _ = crate::sys::kill_group(i32::try_from(browse.id()).unwrap_or(0), libc::SIGTERM);
+    crate::mac::reap_within(&mut browse, STEP);
+    let heard = std::fs::read_to_string(&file).unwrap_or_default();
+    let from_guests = guest_adverts(&heard, &crate::sys::interface_name);
+    if from_guests.is_empty() {
+        row.cell("production adverts from guests", Value::Text("none".into()));
+    } else {
+        row.fail(format!(
+            "this Mac heard a guest advertise {ALAB_SERVICE}: {}",
+            from_guests.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// What a step changed in the account: the processes init and setup restart, the Dock's pins,
@@ -1446,7 +2440,7 @@ fn guest(
     row: &mut Row,
 ) -> Result<Guest, Fail> {
     let mut vm = Vm::clone_from(tart, base, run, share, ask.keep)?;
-    if matches!(scenario, Scenario::FirstLaunch | Scenario::InstallSh) {
+    if scenario.grows_disk() {
         let status = aterm_uds::spawnfd::command(tart)
             .args(["set", &vm.name, "--disk-size", FIRST_LAUNCH_DISK_GB])
             .stdin(Stdio::null())
@@ -1478,11 +2472,39 @@ fn guest(
     };
     vm.sh(
         &format!(
-            "rm -rf {GUEST_NUX} && mkdir -p {GUEST_NUX} && cp '{share}'/drive.exp '{share}'/notty.pl '{share}'/install.sh {GUEST_NUX}/",
+            "rm -rf {GUEST_NUX} && mkdir -p {GUEST_NUX} && cp '{share}'/drive.exp '{share}'/notty.pl '{share}'/install.sh '{share}'/{GUEST_HELPER} {GUEST_NUX}/ \
+             && chmod 755 {GUEST_NUX}/{GUEST_HELPER}",
             share = crate::mac::GUEST_SHARE
         ),
         STEP,
     )?;
+    vm.sh(
+        &format!("cat > {GUEST_NUX}/pf.conf <<'EOF'\n{PF_GUARD}EOF"),
+        STEP,
+    )?;
+    let rules = vm.sh(
+        &root_command(
+            standard,
+            &format!("/sbin/pfctl -q -E -f {GUEST_NUX}/pf.conf 2>/dev/null; /sbin/pfctl -q -s rules 2>/dev/null"),
+        ),
+        STEP,
+    )?;
+    if !rules.contains("7484") {
+        return Err(Fail::die(format!(
+            "the guest's packet filter did not take the vault port's null route: {}",
+            squeeze(rules.trim(), 200)
+        )));
+    }
+    let uid = vm.sh("id -u", STEP)?.trim().to_owned();
+    let developer = vm
+        .exec("xcode-select -p 2>&1; echo \"exit=$?\"", STEP)
+        .map_err(Fail::die)?;
+    row.cell(
+        "xcode-select -p",
+        Value::Text(xcode_select_text(&String::from_utf8_lossy(
+            &developer.stdout,
+        ))),
+    );
     if scenario.needs_app() && !standard {
         let started = Instant::now();
         vm.sh(
@@ -1491,7 +2513,7 @@ fn guest(
         )?;
         row.cell("app unpacked", Value::Ms(millis(started.elapsed())));
     }
-    if matches!(scenario, Scenario::FirstLaunch | Scenario::InstallSh) {
+    if scenario.grows_disk() {
         let free = vm.sh("df -g / | awk 'NR==2 {print $4}'", STEP)?;
         row.cell(
             "guest disk free",
@@ -1503,6 +2525,8 @@ fn guest(
         app,
         vm,
         standard,
+        uid,
+        mark_ms: std::cell::Cell::new(None),
     })
 }
 
@@ -1516,11 +2540,18 @@ fn init_apply(g: &Guest, row: &mut Row) -> Result<(), Fail> {
     let sudo = format!("NUX_SUDO={}", g.sudo_password());
     let around = Around::take(g)?;
     let (d, out) = g.drive("init-apply", &sudo, &format!("{} init --json", g.aterm))?;
+    row.cell("presence read", fault::presence_cell(&out));
     drive_cells(row, "", &d);
+    open_rows_cell(row, "", &d, &out);
     lines_cell(row, "", &out);
-    report_cells(row, "", read_report_json(&out));
+    let report = read_report_json(&out);
+    if d.exit != Some(0) {
+        not_ok_cell(row, "", "its --json", report.as_ref());
+    }
+    report_cells(row, "", report);
     around.cells(g, row, "")?;
     phase_cells(row, "", &g.log()?, "aterm init:");
+    let mut failed = false;
     for (tag, args, label) in [
         ("init-noop", "init", "no-op: "),
         ("init-check", "init --check", "check: "),
@@ -1528,9 +2559,30 @@ fn init_apply(g: &Guest, row: &mut Row) -> Result<(), Fail> {
         let mark = g.log_mark()?;
         let (d, out) = g.drive(tag, &sudo, &format!("{} {args}", g.aterm))?;
         drive_cells(row, label, &d);
+        open_rows_cell(row, label, &d, &out);
         lines_cell(row, label, &out);
         g.phase_cells_since(row, label, mark, "aterm init:")?;
+        failed |= d.exit != Some(0);
     }
+    if failed {
+        checked_not_ok(g, row)?;
+    }
+    Ok(())
+}
+
+/// The rows a text `aterm init` that exited non-zero left, named by a read-only
+/// `aterm init --check --json` (a text run names no ids).
+fn checked_not_ok(g: &Guest, row: &mut Row) -> Result<(), Fail> {
+    let (_, out) = g.notty(
+        "init-check-json",
+        &format!("{} init --check --json", g.aterm),
+    )?;
+    not_ok_cell(
+        row,
+        "",
+        "init --check --json",
+        read_report_json(&out).as_ref(),
+    );
     Ok(())
 }
 
@@ -1574,9 +2626,14 @@ fn init_ssh(g: &Guest, row: &mut Row) -> Result<(), Fail> {
         &format!("NUX_SUDO={}", g.sudo_password()),
         &format!("{ssh} init"),
     )?;
+    row.cell("presence read", fault::presence_cell(&out));
     drive_cells(row, "", &d);
+    open_rows_cell(row, "", &d, &out);
     lines_cell(row, "", &out);
     around.cells(g, row, "")?;
+    if d.exit != Some(0) {
+        checked_not_ok(g, row)?;
+    }
     phase_cells(row, "", &g.log()?, "aterm init:");
     g.sh(PROMPT_MARKER, STEP)?;
     let label = "bare aterm: ";
@@ -1609,19 +2666,228 @@ fn shell_cells(row: &mut Row, label: &str, d: &Drive, out: &str) {
 fn init_notty(g: &Guest, row: &mut Row) -> Result<(), Fail> {
     let around = Around::take(g)?;
     let (d, out) = g.notty("init-notty", &format!("{} init", g.aterm))?;
+    row.cell("presence read", fault::presence_cell(&out));
     drive_cells(row, "", &d);
+    open_rows_cell(row, "", &d, &out);
     lines_cell(row, "", &out);
     around.cells(g, row, "")?;
+    if d.exit != Some(0) {
+        checked_not_ok(g, row)?;
+    }
     phase_cells(row, "", &g.log()?, "aterm init:");
     Ok(())
 }
 
-/// How many `aterm doctor --read-only --json` runs `doctor` times.
+/// A shell test that exits 0 while another process holds the account's package store lock
+/// (`flock`), 1 while it is free, 2 when there is none.
+const STORE_HELD: &str = "/usr/bin/perl -MFcntl=:flock -e 'open(F, \"<\", $ARGV[0]) or exit 2; \
+     exit(flock(F, LOCK_EX | LOCK_NB) ? 1 : 0)' \"$HOME/Library/Application Support/aterm/pkg/store.lock\"";
+
+/// What a run beside the pass said, for its row: a JSON report's completeness and each
+/// unresolved row with its outcome and why, else its printed lines as a terminal shows them
+/// (escape sequences dropped, a line rewritten after a carriage return read as its last
+/// rewrite) joined, at most 600 characters.
+#[must_use]
+pub fn said_beside_the_pass(out: &str) -> String {
+    let report = out.lines().rev().find_map(|line| {
+        let v: aterm_json::Value = aterm_json::from_str(line.trim()).ok()?;
+        v.get("items")?.as_array()?;
+        Some(v)
+    });
+    if let Some(v) = report {
+        fn text(v: Option<&aterm_json::Value>) -> Option<&str> {
+            v.and_then(aterm_json::Value::as_str)
+        }
+        let items = v
+            .get("items")
+            .and_then(aterm_json::Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        let unresolved: Vec<String> = v
+            .get("readiness")
+            .and_then(|r| r.get("unresolved"))
+            .and_then(aterm_json::Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .filter_map(aterm_json::Value::as_str)
+            .map(|id| {
+                let item = items.iter().find(|i| text(i.get("id")) == Some(id));
+                let outcome = text(item.and_then(|i| i.get("outcome"))).unwrap_or("?");
+                let why = text(item.and_then(|i| i.get("why")))
+                    .or_else(|| text(item.and_then(|i| i.get("from"))))
+                    .unwrap_or("");
+                format!(
+                    "{id} {outcome}: {}",
+                    why.chars().take(140).collect::<String>()
+                )
+            })
+            .collect();
+        let complete = v
+            .get("complete")
+            .and_then(aterm_json::Value::as_bool)
+            .map_or("?", |c| if c { "true" } else { "false" });
+        return format!("complete {complete}; unresolved: {}", unresolved.join("; "))
+            .replace('|', "\u{a6}")
+            .chars()
+            .take(600)
+            .collect();
+    }
+    let mut plain = String::with_capacity(out.len());
+    let mut rewrite = false;
+    let mut chars = out.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => {
+                // A CSI or OSC sequence, or a two-character escape: up to its final byte.
+                match chars.next() {
+                    Some('[') => {
+                        for c in chars.by_ref() {
+                            if ('@'..='~').contains(&c) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        for c in chars.by_ref() {
+                            if c == '\u{7}' || c == '\\' {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // A carriage return the next character does not end the line after: the terminal
+            // rewrites this line from its start.
+            '\r' => rewrite = true,
+            '\n' => {
+                rewrite = false;
+                plain.push('\n');
+            }
+            c => {
+                if std::mem::take(&mut rewrite) {
+                    let start = plain.rfind('\n').map_or(0, |at| at + 1);
+                    plain.truncate(start);
+                }
+                plain.push(c);
+            }
+        }
+    }
+    let lines: Vec<&str> = plain
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines
+        .join(" / ")
+        .replace('|', "\u{a6}")
+        .chars()
+        .take(600)
+        .collect()
+}
+
+/// `pass-held`: `aterm pkg install --default-set` started in the background and, once it holds
+/// the store, what doctor and init do beside it: the ones that never wait first (no terminal, and
+/// `--no-wait`), then doctor on a terminal, which waits for the pass. Each with whether the pass
+/// still held the store as it started; NOT RUN when the pass never took the store.
+fn pass_held(g: &Guest, row: &mut Row) -> Result<(), Fail> {
+    g.run(
+        // Its own session, so the end of this `tart exec` ends nothing of it.
+        &format!(
+            "/usr/bin/perl -MPOSIX -e 'fork and exit; POSIX::setsid(); open(P, \">\", shift) and \
+             print P $$; close P; exec @ARGV' {GUEST_NUX}/pass.pid {} pkg install --default-set \
+             > {GUEST_NUX}/pass.out 2>&1 < /dev/null",
+            g.aterm
+        ),
+        STEP,
+    )?;
+    let started = Instant::now();
+    loop {
+        if g.run(&format!("{STORE_HELD} && echo held || true"), STEP)?
+            .trim()
+            == "held"
+        {
+            break;
+        }
+        if started.elapsed() >= STEP {
+            return Err(not_run(format!(
+                "aterm pkg install --default-set held no store lock within {} s",
+                STEP.as_secs()
+            )));
+        }
+        stop::sleep(POLL)?;
+    }
+    row.cell("pass took the store", Value::Ms(millis(started.elapsed())));
+    let around = Around::take(g)?;
+    for (tag, tty, args, label) in [
+        (
+            "held-doctor-json",
+            false,
+            "doctor --json",
+            "doctor --json: ",
+        ),
+        ("held-init", false, "init", "init: "),
+        (
+            "held-init-no-wait",
+            false,
+            "init --no-wait",
+            "init --no-wait: ",
+        ),
+        ("held-doctor-tty", true, "doctor", "doctor on a terminal: "),
+    ] {
+        let held = g.run(&format!("{STORE_HELD} && echo yes || echo no"), STEP)?;
+        row.cell(
+            format!("{label}pass held the store at its start"),
+            Value::Text(held.trim().to_owned()),
+        );
+        let cmd = format!("{} {args}", g.aterm);
+        let (d, out) = if tty {
+            g.drive(tag, &format!("NUX_SUDO={}", g.sudo_password()), &cmd)?
+        } else {
+            g.notty(tag, &cmd)?
+        };
+        drive_cells(row, label, &d);
+        lines_cell(row, label, &out);
+        row.cell(
+            format!("{label}said"),
+            Value::Text(said_beside_the_pass(&out)),
+        );
+    }
+    around.cells(g, row, "")?;
+    let pass = g.run(
+        &format!(
+            "p=$(cat {GUEST_NUX}/pass.pid); n=0; while kill -0 $p 2>/dev/null; do n=$((n+1)); \
+             [ $n -gt {limit} ] && break; sleep 0.1; done; kill -0 $p 2>/dev/null && echo running || echo ended",
+            limit = ROW.as_secs() * 10
+        ),
+        ROW + STEP,
+    )?;
+    row.cell("pass", Value::Text(pass.trim().to_owned()));
+    Ok(())
+}
+
+/// How many runs of the bare `aterm doctor` and of `aterm doctor --read-only --json` `doctor`
+/// times.
 const READ_ONLY_RUNS: usize = 10;
 
-/// `doctor`: on a terminal, then `--json | cat` with no terminal, each with whether System
-/// Settings opened and the phases its own summary line names, then [`READ_ONLY_RUNS`] read-only
-/// reports.
+/// Quit System Settings and wait (up to 30 s) for it to be gone.
+const QUIT_SETTINGS: &str = "pkill -x 'System Settings'; n=0; while pgrep -x 'System Settings' >/dev/null; do \
+                             n=$((n+1)); [ $n -gt 300 ] && break; sleep 0.1; done";
+
+/// The p50 and p95 cells of `ends` (each run's end, ms) under `label`.
+fn spread_cells(row: &mut Row, label: &str, mut ends: Vec<u64>, why: &str) {
+    ends.sort_unstable();
+    for pct in [50, 95] {
+        row.cell(
+            format!("{label}p{pct} of {}", ends.len()),
+            or_missing(nearest_rank(&ends, pct), Value::Ms, why),
+        );
+    }
+}
+
+/// `doctor`: on a terminal [`READ_ONLY_RUNS`] times (Developer Tools never granted in a fresh
+/// clone; System Settings quit between runs), then `--json | cat` with no terminal, each with
+/// whether System Settings opened and the phases its own summary line names, then
+/// [`READ_ONLY_RUNS`] read-only reports.
 fn doctor(g: &Guest, row: &mut Row) -> Result<(), Fail> {
     let opened = |g: &Guest| -> Result<Value, Fail> {
         Ok(Value::Text(
@@ -1629,21 +2895,32 @@ fn doctor(g: &Guest, row: &mut Row) -> Result<(), Fail> {
         ))
     };
     let label = "terminal: ";
-    let mark = g.log_mark()?;
-    let (d, out) = g.drive(
-        "doctor-tty",
-        &format!("NUX_SUDO={}", g.sudo_password()),
-        &format!("{} doctor", g.aterm),
-    )?;
-    drive_cells(row, label, &d);
-    lines_cell(row, label, &out);
-    g.phase_cells_since(row, label, mark, "aterm doctor")?;
-    row.cell(format!("{label}System Settings opened"), opened(g)?);
-    g.run(
-        "pkill -x 'System Settings'; n=0; while pgrep -x 'System Settings' >/dev/null; do \
-         n=$((n+1)); [ $n -gt 300 ] && break; sleep 0.1; done",
-        STEP,
-    )?;
+    let mut ends = Vec::new();
+    for at in 0..READ_ONLY_RUNS {
+        let mark = g.log_mark()?;
+        let (d, out) = g.drive(
+            &format!("doctor-tty-{at}"),
+            &format!("NUX_SUDO={}", g.sudo_password()),
+            &format!("{} doctor", g.aterm),
+        )?;
+        if at == 0 {
+            drive_cells(row, label, &d);
+            lines_cell(row, label, &out);
+            g.phase_cells_since(row, label, mark, "aterm doctor")?;
+            row.cell(format!("{label}System Settings opened"), opened(g)?);
+        }
+        g.run(QUIT_SETTINGS, STEP)?;
+        match d.end_ms {
+            Some(end) if d.hang.is_none() => ends.push(end),
+            _ => {
+                if at > 0 {
+                    drive_cells(row, &format!("terminal run {}: ", at + 1), &d);
+                }
+                break;
+            }
+        }
+    }
+    spread_cells(row, label, ends, "no terminal run ended");
     let label = "--json | cat: ";
     let mark = g.log_mark()?;
     let (d, out) = g.notty(
@@ -1683,17 +2960,7 @@ fn doctor(g: &Guest, row: &mut Row) -> Result<(), Fail> {
             }
         }
     }
-    ends.sort_unstable();
-    for pct in [50, 95] {
-        row.cell(
-            format!("{label}p{pct} of {}", ends.len()),
-            or_missing(
-                nearest_rank(&ends, pct),
-                Value::Ms,
-                "no read-only run ended",
-            ),
-        );
-    }
+    spread_cells(row, label, ends, "no read-only run ended");
     Ok(())
 }
 
@@ -1789,47 +3056,128 @@ fn app_launch(g: &Guest, row: &mut Row) -> Result<(), Fail> {
     Ok(())
 }
 
-fn first_launch(g: &Guest, row: &mut Row) -> Result<(), Fail> {
+/// `launch-repairs`: a copied command planted at `~/.local/bin/aterm` (a copy of the app's
+/// executable, as a hand install leaves one), then the app opened until its launch repairs log
+/// (after its seed), and quit and opened again: each launch's `launch repairs:` lines in
+/// `aterm.log`, how long after the prompt they came, and what `~/.local/bin/aterm` is after it.
+fn launch_repairs(g: &Guest, row: &mut Row) -> Result<(), Fail> {
+    g.sh(PROMPT_MARKER, STEP)?;
+    g.sh(
+        &format!("mkdir -p ~/.local/bin && cp {} ~/.local/bin/aterm", g.aterm),
+        STEP,
+    )?;
+    let around = Around::take(g)?;
+    let said = |mark: usize| -> Result<Vec<String>, Fail> {
+        Ok(appended(&g.log()?, mark)
+            .lines()
+            .filter_map(|line| {
+                line.split_once("launch repairs: ")
+                    .map(|(_, said)| said.to_owned())
+            })
+            .collect())
+    };
+    for (tag, label) in [("first", "first launch: "), ("second", "second launch: ")] {
+        let mark = g.log_mark()?;
+        let (_, prompt) = open_until_prompt(g, tag)?;
+        prompt_cell(row, &format!("{label}open to prompt"), prompt);
+        metrics_cells(g, row, label)?;
+        let shown = g.run(&format!("{} ctl metrics percentiles 2>&1", g.aterm), STEP)?;
+        row.cell(
+            format!("{label}presents"),
+            match [
+                "n_present",
+                "present_p50_ms",
+                "present_p95_ms",
+                "present_p99_ms",
+            ]
+            .map(|key| metric(&shown, key))
+            {
+                [Some(n), Some(p50), Some(p95), Some(p99)] => Value::Text(format!(
+                    "n_present={n} present_p50/p95/p99={p50:.2}/{p95:.2}/{p99:.2} ms"
+                )),
+                _ => Value::Missing("aterm ctl metrics percentiles did not answer".to_owned()),
+            },
+        );
+        let prompted = Instant::now();
+        let mut lines = said(mark)?;
+        while lines.is_empty() && prompted.elapsed() < WATCH {
+            stop::sleep(Duration::from_secs(2))?;
+            lines = said(mark)?;
+        }
+        let ran = millis(prompted.elapsed());
+        if !lines.is_empty() {
+            // The rest of one run's lines, logged together.
+            stop::sleep(Duration::from_secs(1))?;
+            lines = said(mark)?;
+        }
+        row.cell(
+            format!("{label}repairs logged after the prompt"),
+            if lines.is_empty() {
+                Value::Missing(format!(
+                    "no `launch repairs:` line in the {} min watched",
+                    WATCH.as_secs() / 60
+                ))
+            } else {
+                Value::Ms(ran)
+            },
+        );
+        row.cell(
+            format!("{label}repairs"),
+            Value::Text(if lines.is_empty() {
+                "none".to_owned()
+            } else {
+                lines.join("; ")
+            }),
+        );
+        let local = g.sh(
+            "if [ -L ~/.local/bin/aterm ]; then echo link; elif [ -e ~/.local/bin/aterm ]; then \
+             echo file; else echo none; fi; ls ~/.local/bin | grep -c moved-aside || true",
+            STEP,
+        )?;
+        let mut local = local.lines().map(str::trim);
+        row.cell(
+            format!("{label}~/.local/bin/aterm"),
+            Value::Text(format!(
+                "{}, {} moved aside",
+                local.next().unwrap_or("unread"),
+                local.next().unwrap_or("?")
+            )),
+        );
+        quit_app(g)?;
+    }
+    around.cells(g, row, "")?;
+    Ok(())
+}
+
+/// `first-launch`: the app opened by a person (with `--person`, one at the console), then
+/// watched until setup is done or stood still a minute ([`wait_setup`]).
+fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     g.sh(PROMPT_MARKER, STEP)?;
     let around = Around::take(g)?;
-    let mut stream = aterm_uds::spawnfd::command(&g.vm.tart)
-        .args(["exec", &g.vm.name, "/bin/sh", "-c"])
-        .arg(format!(
-            "exec {}",
-            g.as_root(&format!(
-                "exec /usr/bin/log stream --info --style ndjson --predicate 'process == \"tccd\"' > {GUEST_NUX}/tccd.ndjson 2>&1"
-            ))
-        ))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| Fail::die(format!("tccd's log: {e}")))?;
-    let started = Instant::now();
-    while !g
-        .vm
-        .exec(&format!("test -s {GUEST_NUX}/tccd.ndjson"), STEP)
-        .is_ok_and(|o| o.status.success())
-    {
-        if started.elapsed() >= STEP {
-            return Err(Fail::die(format!(
-                "tccd's log stream wrote nothing within {} s",
-                STEP.as_secs()
-            )));
-        }
-        stop::sleep(POLL)?;
+    state_snapshot(g, row, "boot")?;
+    g.watch_record("watch.txt", None)?;
+    if ask.person {
+        person_start(g)?;
     }
+    // What the app asks after the ALab vault while it is watched: System State's watch for the
+    // vault looks on a Mac that has none.
+    start_mdns(g)?;
     let (opened, prompt) = open_until_prompt(g, "first")?;
+    let open_ms = secs_to_ms(opened);
+    g.mark_ms.set(Some(open_ms));
     prompt_cell(row, "open to prompt", prompt);
+    let present = first_present_ms(g)?;
     metrics_cells(g, row, "")?;
-    let watched = Instant::now();
-    while watched.elapsed() < WATCH {
-        stop::sleep(Duration::from_secs(5).min(WATCH.saturating_sub(watched.elapsed())))?;
-    }
+    state_snapshot(g, row, "window focus")?;
+    let waited_from = g.clock_ms()?.saturating_sub(open_ms);
+    let done = wait_setup(g, row, "", waited_from)?;
+    percentile_cells(g, row, "during setup: ")?;
+    let mdns = stop_mdns(g)?;
+    row.cell(
+        "mDNS questions for the ALab vault",
+        Value::Count(alab_questions(&mdns) as u64),
+    );
     let desktop_read_passed = crate::mac::desktop_read(&g.vm, &format!("{GUEST_NUX}/tccd.ndjson"))?;
-    let _ =
-        g.vm.exec(&g.as_root("pkill -INT -f '^/usr/bin/log stream'"), STEP);
-    crate::mac::reap_within(&mut stream, STEP);
     let tcc = g.sh(
         &format!(
             "grep -h 'AUTHREQ_PROMPTING\\|Handling access request' {GUEST_NUX}/tccd.ndjson || true"
@@ -1858,10 +3206,21 @@ fn first_launch(g: &Guest, row: &mut Row) -> Result<(), Fail> {
             Err(why) => Value::Missing(format!("control FAILED: {why}")),
         },
     );
-    let open_ms = secs_to_ms(opened);
-    let launch = read_launch(&g.log()?, open_ms);
+    let log = g.log()?;
+    if done.is_none() {
+        // What the app said while setup did not finish, whole, for the run's record: the cause
+        // of a launch that never starts setup is in it (the admin first-launch gap, SCR-1).
+        let lines: Vec<&str> = log.lines().collect();
+        println!(
+            "mac nux: aterm.log's last {} lines (setup not done):\n{}",
+            lines.len().min(LOG_SHOWN),
+            lines[lines.len().saturating_sub(LOG_SHOWN)..].join("\n")
+        );
+    }
+    let launch = read_launch(&log, open_ms);
     // A line the watch never saw is the app's silence over it, said with the watch's length.
-    let within = format!("in the {} min watched", WATCH.as_secs() / 60);
+    let watched = done.unwrap_or_else(|| g.clock_ms().unwrap_or(open_ms).saturating_sub(open_ms));
+    let within = format!("in the {} s watched", watched / 1000);
     row.cell(
         "first log line",
         or_missing(
@@ -1870,6 +3229,9 @@ fn first_launch(g: &Guest, row: &mut Row) -> Result<(), Fail> {
             &format!("aterm.log has no line after the open {within}"),
         ),
     );
+    // First present after the open: its first log line (Rust's main) and main to first present.
+    let present_ms = launch.first_log_ms.zip(present).map(|(log, p)| log + p);
+    stage_cells(g, row, open_ms, present_ms)?;
     row.cell("WARN lines", Value::Count(launch.warns as u64));
     row.cell("ERROR lines", Value::Count(launch.errors as u64));
     row.cell(
@@ -1893,8 +3255,25 @@ fn first_launch(g: &Guest, row: &mut Row) -> Result<(), Fail> {
         or_missing(
             launch.fda_granted_ms,
             Value::Ms,
-            &format!("not granted {within} (nobody answers in the guest)"),
+            &format!(
+                "not granted {within}{}",
+                if ask.person {
+                    ""
+                } else {
+                    " (nobody answers in the guest)"
+                }
+            ),
         ),
+    );
+    row.cell(
+        "folder dialogs once Full Disk Access was granted (target 0)",
+        match launch.fda_granted_ms {
+            Some(granted) => Value::Count(folder_prompts_after(
+                &tcc_prompt_events(&tcc),
+                open_ms + granted,
+            ) as u64),
+            None => Value::Missing("Full Disk Access was not granted in the walk".into()),
+        },
     );
     row.cell(
         "toolset pass",
@@ -1924,12 +3303,87 @@ fn first_launch(g: &Guest, row: &mut Row) -> Result<(), Fail> {
             ))
         },
     );
+    person_stage_cells(g, ask, row)?;
+    state_snapshot(g, row, "the end")?;
     around.cells(g, row, "")?;
+    Ok(())
+}
+
+/// A person-stage row's person: with `--person`, what it did and whether its input reset
+/// `HIDIdleTime` (else the person stages are NOT MEASURED, never a pass); without, that no
+/// person was there.
+fn person_stage_cells(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
+    if !ask.person {
+        row.cell(
+            "person stages",
+            Value::Missing("no person at the console (--person puts one there)".into()),
+        );
+        return Ok(());
+    }
+    if let HidProof::NotMeasured(why) = person_cells(g, row)? {
+        row.cell(
+            "person stages",
+            Value::Missing(format!("the person's input did not show: {why}")),
+        );
+    }
+    Ok(())
+}
+
+/// Main to first present (`rust_main_to_first_present_ms` in `aterm ctl metrics`).
+fn first_present_ms(g: &Guest) -> Result<Option<u64>, Fail> {
+    let metrics = g.run(&format!("{} ctl metrics 2>&1", g.aterm), STEP)?;
+    Ok(metric(&metrics, "rust_main_to_first_present_ms").map(ms_value))
+}
+
+/// Each stage start the progress record's watch saw, in ms after the open (`open_ms`, epoch ms),
+/// the first one's after first present (`present_ms` after the open), and the record's completion.
+fn stage_cells(
+    g: &Guest,
+    row: &mut Row,
+    open_ms: u64,
+    present_ms: Option<u64>,
+) -> Result<(), Fail> {
+    let (looks, _) = read_watch(&g.read(&format!("{GUEST_NUX}/watch.txt"))?);
+    let starts = stage_starts(&looks);
+    let after = |at: u64| at.saturating_sub(open_ms);
+    row.cell(
+        "stage starts",
+        if starts.is_empty() {
+            Value::Missing("initial-setup.json never named a running stage".into())
+        } else {
+            Value::Text(
+                starts
+                    .iter()
+                    .map(|(at, bit)| format!("{} {} ms", stage_name(*bit), after(*at)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        },
+    );
+    row.cell(
+        "first stage after first present",
+        match (starts.first(), present_ms) {
+            (None, _) => Value::Missing("no stage started".into()),
+            (Some(_), None) => Value::Missing("first present did not read back".into()),
+            (Some((at, _)), Some(present)) => Value::Ms(after(*at).saturating_sub(present)),
+        },
+    );
+    row.cell(
+        "setup record completed",
+        or_missing(
+            completed_at(&looks).map(after),
+            Value::Ms,
+            "initial-setup.json never said completed",
+        ),
+    );
     Ok(())
 }
 
 /// How many of the setup lines a first launch's row names.
 const SETUP_SHOWN: usize = 8;
+
+/// How many of `aterm.log`'s last lines a first launch whose setup did not finish prints.
+const LOG_SHOWN: usize = 80;
 
 /// The first `max` of `lines` (each its ms and text) as one cell, and how many more there were.
 fn timeline(lines: &[(u64, String)], max: usize) -> String {
@@ -1962,26 +3416,13 @@ fn vault(g: &Guest, row: &mut Row) -> Result<(), Fail> {
             "an ALab vault answers on the guest's network ({ALAB_HOST} {address}, {adverts} {ALAB_SERVICE} advert(s)): the lane never asks a real vault to admit a guest"
         )));
     }
-    g.sh(
-        &format!(
-            // Its own output away from `tart exec`'s, which would otherwise wait on it.
-            "({} </dev/null >/dev/null 2>&1 &) ; sleep 1",
-            g.as_root(&format!(
-                "exec /usr/sbin/tcpdump -l -n -i en0 udp port 5353 > {GUEST_NUX}/mdns.txt 2>/dev/null"
-            ))
-        ),
-        STEP,
-    )?;
+    start_mdns(g)?;
     let (d, out) = g.drive(
         "vault",
         &format!("NUX_JOIN= NUX_SUDO={}", g.sudo_password()),
         &format!("{} init --only workstation", g.aterm),
     )?;
-    let _ = g.vm.exec(
-        &format!("{}; sleep 0.5", g.as_root("pkill -INT -x tcpdump")),
-        STEP,
-    );
-    let mdns = g.read(&format!("{GUEST_NUX}/mdns.txt"))?;
+    let mdns = stop_mdns(g)?;
     let asked = d.prompts.iter().find(|(_, _, text)| text.contains("vault"));
     row.cell(
         "to the vault prompt",
@@ -1992,6 +3433,7 @@ fn vault(g: &Guest, row: &mut Row) -> Result<(), Fail> {
         or_missing(asked.map(|p| p.1), Value::Ms, "init asked for no vault"),
     );
     drive_cells(row, "", &d);
+    open_rows_cell(row, "", &d, &out);
     let join = d
         .prompts
         .iter()
@@ -2042,7 +3484,8 @@ const LOCAL_VAULT_ENTRY: &str = "NUX_PROBE";
 /// under `admin`): a server on 127.0.0.1 that advertises nothing, the vault (the lane's entry in
 /// `[everyone]`, a join password in `admin/password`) and its approver (`aterm secrets watch`);
 /// they print the vault's signer (off the `join` line `create` prints), which the joining Mac
-/// pins. `password show` writes the join
+/// pins. A new vault is open, so `password new` gives it the join password the lane types (with
+/// no terminal it prints none). `password show` writes the join
 /// password only to a terminal, so the setup reads it as the person at one would, on the
 /// pseudo-terminal `expect` spawns it on (its line end's `\r` dropped; a terminal's EOF, which
 /// `script` with no input would type and the terminal echo as `^D`, never reaches it), and a
@@ -2055,6 +3498,7 @@ fn local_vault_setup(aterm: &str, admin: &str) -> String {
          n=0; until curl -s -o /dev/null --max-time 1 http://127.0.0.1:{LOCAL_VAULT_PORT}/; do \
          n=$((n+1)); [ $n -gt 600 ] && {{ echo 'the vault server did not answer within 60 s'; cat $A/serve.log; exit 1; }}; sleep 0.1; done; \
          {aterm} secrets create '{url}' --import $A/seed --no-agent --name nux-admin > $A/create.out 2>&1 || {{ cat $A/create.out; exit 1; }}; \
+         {aterm} secrets password new --no-agent </dev/null > $A/password-new.out 2>&1 || {{ cat $A/password-new.out; exit 1; }}; \
          expect -c 'set timeout 60; spawn -noecho {aterm} secrets password show; expect eof' > $A/password.tty 2>$A/password.err || {{ cat $A/password.err; exit 1; }}; \
          tr -d '\\r' < $A/password.tty > $A/password; \
          case \"$(cat $A/password)\" in ''|*' '*) echo 'password show printed no join password:'; cat $A/password.tty; exit 1;; esac; \
@@ -2126,6 +3570,7 @@ fn vault_local(g: &Guest, row: &mut Row) -> Result<(), Fail> {
         ),
     );
     drive_cells(row, "", &d);
+    open_rows_cell(row, "", &d, &out);
     row.cell(
         "vault step",
         or_missing(
@@ -2135,6 +3580,13 @@ fn vault_local(g: &Guest, row: &mut Row) -> Result<(), Fail> {
                 .map(|l| squeeze(l.trim(), 100)),
             Value::Text,
             "no `Secrets vault` row in init's output",
+        ),
+    );
+    row.cell(
+        "advertised",
+        Value::Text(
+            "no: served on 127.0.0.1 only, as main's server has no lab service type to advertise under (only _alab-vault._tcp, which a guest never advertises)"
+                .into(),
         ),
     );
     let approver = g.read(&format!("{admin}/watch.log"))?;
@@ -2408,23 +3860,153 @@ fn run_row(
     ask: &Ask,
     scenario: Scenario,
 ) -> Result<Row, Fail> {
+    if let Some(why) = scenario.not_run() {
+        return Err(not_run(why.to_owned()));
+    }
     let mut row = Row::new(scenario);
     let g = guest(tart, base, run, share, ask, scenario, &mut row)?;
-    match scenario {
-        Scenario::InitApply => init_apply(&g, &mut row)?,
-        Scenario::InitSsh => init_ssh(&g, &mut row)?,
-        Scenario::InitNotty => init_notty(&g, &mut row)?,
-        Scenario::Doctor => doctor(&g, &mut row)?,
-        Scenario::FirstLaunch => first_launch(&g, &mut row)?,
-        Scenario::TerminalLaunch => terminal_launch(&g, &mut row)?,
-        Scenario::AppLaunch => app_launch(&g, &mut row)?,
-        Scenario::Vault => vault(&g, &mut row)?,
-        Scenario::VaultLocal => vault_local(&g, &mut row)?,
-        Scenario::Successor => successor(&g, &mut row)?,
-        Scenario::InstallSh => install_sh(&g, &mut row, None, true)?,
-    }
+    let watchers = Watchers::start(&g)?;
+    let body = match scenario {
+        Scenario::InitApply => init_apply(&g, &mut row),
+        Scenario::InitSsh => init_ssh(&g, &mut row),
+        Scenario::InitNotty => init_notty(&g, &mut row),
+        Scenario::PassHeld => pass_held(&g, &mut row),
+        Scenario::Doctor => doctor(&g, &mut row),
+        Scenario::LaunchRepairs => launch_repairs(&g, &mut row),
+        Scenario::FirstLaunch => first_launch(&g, ask, &mut row),
+        Scenario::TerminalLaunch => terminal_launch(&g, &mut row),
+        Scenario::AppLaunch => app_launch(&g, &mut row),
+        Scenario::Vault => vault(&g, &mut row),
+        Scenario::VaultLocal => vault_local(&g, &mut row),
+        Scenario::Successor => successor(&g, &mut row),
+        Scenario::InstallSh => install_sh(&g, &mut row, None, true),
+        Scenario::KillStage => fault::kill_stage(&g, &mut row),
+        Scenario::KillClt => fault::kill_clt(&g, &mut row),
+        // Refused before its guest ([`Scenario::not_run`]).
+        Scenario::KillPublish => Ok(()),
+        Scenario::Rerun => fault::rerun(&g, &mut row),
+        Scenario::LegacyUpgrade => fault::legacy_upgrade(&g, &mut row),
+        Scenario::PersonChange => fault::person_change(&g, &mut row),
+        Scenario::Offline => fault::offline(&g, &mut row),
+        Scenario::Lossy => fault::lossy(&g, &mut row),
+        Scenario::MdnsSilent => fault::mdns(&g, &mut row, false),
+        Scenario::MdnsNoRoute => fault::mdns(&g, &mut row, true),
+        Scenario::Dmg => fault::dmg(&g, &mut row),
+        Scenario::AgentSsh => fault::agent_ssh(&g, &mut row),
+        Scenario::ClockBack => fault::clock_back(&g, &mut row),
+    };
+    // The census, tccd and the guard are read whatever the row came to, before the clone goes.
+    let watched = watchers.finish(&g, &mut row);
+    let guarded = alab_guard(&g, run, &mut row);
     drop(g);
+    body?;
+    watched?;
+    guarded?;
     Ok(row)
+}
+
+/// The executable of the binary target `name` in cargo's `--message-format=json` lines.
+#[must_use]
+pub fn bin_executable(json_lines: &str, name: &str) -> Option<PathBuf> {
+    json_lines
+        .lines()
+        .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
+        .filter(|v| {
+            v.get("reason").and_then(aterm_json::Value::as_str) == Some("compiler-artifact")
+        })
+        .filter(|v| {
+            v.get("target")
+                .and_then(|t| t.get("name"))
+                .and_then(aterm_json::Value::as_str)
+                == Some(name)
+        })
+        .find_map(|v| Some(PathBuf::from(v.get("executable")?.as_str()?)))
+}
+
+/// Build the guest helper here (`aterm-lab-guest`, this package's other binary) and put it in the
+/// share: the first 12 hex digits of its digest, which name a person base made with it.
+fn build_helper(share: &Path) -> Result<String, Fail> {
+    let out = crate::util::targo(&[
+        "--unverified",
+        "build",
+        "-p",
+        "aterm-lab",
+        "--bin",
+        GUEST_HELPER,
+        "--message-format",
+        "json-render-diagnostics",
+    ])
+    .stdin(Stdio::null())
+    .output()
+    .map_err(|e| Fail::die(format!("targo: {e}")))?;
+    let lines = String::from_utf8_lossy(&out.stdout);
+    let built = bin_executable(&lines, GUEST_HELPER).filter(|_| out.status.success());
+    let Some(built) = built else {
+        return Err(Fail::die(format!(
+            "the guest helper did not build (targo --unverified build -p aterm-lab --bin {GUEST_HELPER}): {}",
+            squeeze(String::from_utf8_lossy(&out.stderr).trim(), 400)
+        )));
+    };
+    let copy = share.join(GUEST_HELPER);
+    std::fs::copy(&built, &copy).map_err(|e| format!("{}: {e}", built.display()))?;
+    let digest = crate::sys::digest_file(&copy, GUEST_HELPER.as_bytes())?;
+    Ok(digest.hex().chars().take(12).collect())
+}
+
+/// Refuse (NOT RUN) to make `base` from `image` when tart must pull the image first and this Mac
+/// has under [`PULL_ROOM_GB`] free: the pull takes about 41 GB, and 30 GB stays for every build.
+fn pull_room(tart: &str, image: &str, base: &str) -> Result<(), Fail> {
+    let listed = |source: &str| -> String {
+        aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command(tart)
+                .args(["list", "--source", source, "--quiet"])
+                .stdin(Stdio::null()),
+            Instant::now() + STEP,
+        )
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+    };
+    if listed("local").lines().any(|n| n.trim() == base)
+        || listed("oci").lines().any(|n| n.trim() == image)
+    {
+        return Ok(());
+    }
+    let df = crate::windows::run(
+        Path::new("/bin/df"),
+        &["-g".into(), "/System/Volumes/Data".into()],
+        None,
+    );
+    let free = df_free_gb(&df.text);
+    match free {
+        Some(gb) if gb >= PULL_ROOM_GB => Ok(()),
+        _ => Err(not_run(format!(
+            "{image} is not on this Mac and its pull needs {PULL_ROOM_GB} GB free (about 41 GB for the image, 30 GB kept for builds); df says {}",
+            free.map_or_else(|| "nothing readable".to_owned(), |gb| format!("{gb} GB"))
+        ))),
+    }
+}
+
+/// The free space before an image pull: 41 GB for the image and 30 GB that stays for builds.
+const PULL_ROOM_GB: u64 = 71;
+
+/// The available GB `df -g` names for its one volume.
+#[must_use]
+pub fn df_free_gb(df: &str) -> Option<u64> {
+    df.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()
+}
+
+/// This Mac's load average (`sysctl -n vm.loadavg`), as it reads.
+fn host_load() -> String {
+    let out = crate::windows::run(
+        Path::new("/usr/sbin/sysctl"),
+        &["-n".into(), "vm.loadavg".into()],
+        None,
+    );
+    out.text
+        .trim()
+        .trim_matches(|c| c == '{' || c == '}')
+        .trim()
+        .to_owned()
 }
 
 /// Append `text` to `file`, made with its parent when absent.
@@ -2470,26 +4052,43 @@ pub fn cmd_nux(args: &[String]) -> Res {
     let install = paths().repo.join("tools/install.sh");
     std::fs::copy(&install, share.join("install.sh"))
         .map_err(|e| format!("{}: {e}", install.display()))?;
+    let digest = build_helper(&share)?;
     let app = if ask.scenarios.iter().any(|s| s.needs_app()) {
         Some(stage_app(ask.app.as_deref(), run, &share)?)
     } else {
         None
     };
-    let base = crate::mac::prepared_base(&tart, &ask.image, false, run, &share, &mut || Ok(()))?;
+    let prep = crate::mac::Prep {
+        fda: false,
+        no_clt: ask.no_clt,
+        person: ask.person.then(|| (GUEST_HELPER.to_owned(), digest)),
+    };
+    pull_room(&tart, &ask.image, &crate::mac::prep_name(&ask.image, &prep))?;
+    let base =
+        crate::mac::prepared_base_with(&tart, &ask.image, &prep, run, &share, &mut || Ok(()))?;
+    let load = host_load();
     let mut rows = Vec::new();
     for &scenario in &ask.scenarios {
-        stop::check()?;
-        println!("mac nux: {} in a fresh clone of {base}", scenario.name());
-        let row = match run_row(&tart, &base, run, &share, &ask, scenario) {
-            Ok(row) => row,
-            Err(fail) if fail.stopped.is_some() => return Err(fail),
-            Err(fail) => Row::refused(scenario, &fail),
-        };
-        println!("{}", table("", std::slice::from_ref(&row)).trim());
-        rows.push(row);
+        for at in 0..ask.repeat {
+            stop::check()?;
+            println!(
+                "mac nux: {} ({} of {}) in a fresh clone of {base}",
+                scenario.name(),
+                at + 1,
+                ask.repeat
+            );
+            let row = match run_row(&tart, &base, run, &share, &ask, scenario) {
+                Ok(row) => row,
+                Err(fail) if fail.stopped.is_some() => return Err(fail),
+                Err(fail) => Row::refused(scenario, &fail),
+            };
+            println!("{}", table("", std::slice::from_ref(&row)).trim());
+            rows.push(row);
+        }
     }
     let head = format!(
-        "### lab mac nux, {} ({}{})\n\nGuest: a clone of {} per row (SIP on, no window). App: {}.",
+        "### lab mac nux, {} ({}{})\n\nGuest: a clone of {base} per row (SIP on, no window){}{}, one guest at a time, \
+         this Mac's load average {load} at the start. App: {}.",
         {
             let now = crate::util::now_secs();
             format!("{} {}", crate::util::ymd(now), crate::util::hms(now))
@@ -2500,7 +4099,16 @@ pub fn cmd_nux(args: &[String]) -> Res {
             "the image's administrator"
         },
         if ask.keep { ", clones kept" } else { "" },
-        ask.image,
+        if ask.person {
+            ", the guest helper as the person at the console"
+        } else {
+            ", nobody at the console"
+        },
+        if ask.repeat > 1 {
+            format!(", each row {} times", ask.repeat)
+        } else {
+            String::new()
+        },
         app.as_ref().map_or_else(
             || "a public release (install.sh)".to_owned(),
             |a| format!("{} {} ({})", a.id, a.version, a.how)
@@ -2514,6 +4122,9 @@ pub fn cmd_nux(args: &[String]) -> Res {
     }
     Ok(exit_code(&rows))
 }
+
+#[path = "mac_nux_fault.rs"]
+mod fault;
 
 #[cfg(test)]
 mod tests {
@@ -2533,9 +4144,34 @@ mod tests {
                 .contains("no row 'init'")
         );
         assert!(parse_scenarios("").is_err());
-        for s in ALL {
+        for s in every() {
             assert_eq!(parse_scenarios(s.name()).unwrap(), [s]);
         }
+        // The fault rows come by name or as `faults`, never with `all`, and after its rows.
+        assert_eq!(parse_scenarios("faults").unwrap(), FAULTS);
+        assert!(
+            parse_scenarios("all")
+                .unwrap()
+                .iter()
+                .all(|s| !FAULTS.contains(s))
+        );
+        assert_eq!(
+            parse_scenarios("dmg,doctor").unwrap(),
+            [Scenario::Doctor, Scenario::Dmg]
+        );
+        let names: Vec<_> = every().map(Scenario::name).collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+        // Only kill-publish is refused before a guest; every fault row runs the app.
+        assert_eq!(
+            every()
+                .filter(|s| s.not_run().is_some())
+                .collect::<Vec<_>>(),
+            [Scenario::KillPublish]
+        );
+        assert!(FAULTS.iter().all(|s| s.needs_app()));
     }
 
     #[test]
@@ -2584,6 +4220,208 @@ mod tests {
         // Only the rows that run the app need it built or handed over.
         let needing: Vec<_> = ALL.into_iter().filter(|s| !s.needs_app()).collect();
         assert_eq!(needing, [Scenario::Successor, Scenario::InstallSh]);
+    }
+
+    #[test]
+    fn the_base_flags_pick_a_base_a_count_and_a_dated_record() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let golden = "ghcr.io/cirruslabs/macos-golden-gate-base:latest";
+        let ask = parse(&args(&[]), golden.into()).unwrap();
+        assert!(!ask.person && !ask.no_clt && !ask.vanilla);
+        assert_eq!(ask.repeat, 1);
+        let ask = parse(
+            &args(&["--person", "--no-clt", "--repeat", "3"]),
+            golden.into(),
+        )
+        .unwrap();
+        assert!(ask.person && ask.no_clt && !ask.vanilla);
+        assert_eq!((ask.repeat, ask.image.as_str()), (3, golden));
+        // The vanilla image is the -base image's sibling: the same macOS, no Command Line Tools.
+        let ask = parse(&args(&["--vanilla"]), golden.into()).unwrap();
+        assert_eq!(
+            ask.image,
+            "ghcr.io/cirruslabs/macos-golden-gate-vanilla:latest"
+        );
+        assert_eq!(
+            vanilla_image("ghcr.io/cirruslabs/macos-tahoe-base"),
+            Some("ghcr.io/cirruslabs/macos-tahoe-vanilla:latest".into())
+        );
+        assert_eq!(vanilla_image("ghcr.io/x/other:1"), None);
+        for refused in [
+            &["--vanilla", "--image", "ghcr.io/x/other:1"][..],
+            &["--no-clt", "--vanilla"],
+            &["--repeat", "0"],
+            &["--repeat", "11"],
+            &["--repeat", "x"],
+        ] {
+            assert_eq!(
+                parse(&args(refused), golden.into()).unwrap_err().code,
+                2,
+                "{refused:?}"
+            );
+        }
+        // `--record` alone appends to today's dated table, wherever it stands among the flags.
+        let dated = format!(
+            "docs/measured/mac-nux-{}.md",
+            crate::util::ymd(crate::util::now_secs())
+        );
+        for alone in [&["--record"][..], &["--record", "--keep"]] {
+            let ask = parse(&args(alone), golden.into()).unwrap();
+            let file = ask.record.unwrap();
+            assert!(file.ends_with(&dated), "{}", file.display());
+            assert!(file.starts_with(&paths().repo), "{}", file.display());
+            assert_eq!(ask.keep, alone.len() == 2);
+        }
+    }
+
+    #[test]
+    fn a_report_names_each_row_left_not_in_place() {
+        let json = r#"{"items":[{"id":"workstation.dock","outcome":"changed"},{"id":"base.clt","outcome":"person"},
+            {"id":"base.ok","outcome":"ok"},{"id":"secrets.vault","outcome":"failed"},{"id":"x.na","outcome":"not-applicable"},
+            {"id":"repos.clone","outcome":"deferred"}]}"#
+            .replace('\n', "");
+        let j = read_report_json(&json).unwrap();
+        assert_eq!(
+            j.not_ok,
+            [
+                ("base.clt".to_owned(), "person".to_owned()),
+                ("secrets.vault".to_owned(), "failed".to_owned()),
+                ("repos.clone".to_owned(), "deferred".to_owned()),
+            ]
+        );
+        let mut row = Row::new(Scenario::InitApply);
+        not_ok_cell(&mut row, "", "init --check --json", Some(&j));
+        assert_eq!(
+            row.cells[0],
+            (
+                "rows not ok (init --check --json)".to_owned(),
+                Value::Text("base.clt person, secrets.vault failed, repos.clone deferred".into())
+            )
+        );
+        // NEGATIVE CONTROL: a report every row of which is in place names none, and one that did
+        // not parse is not measured, never "none".
+        let all_ok = read_report_json(
+            r#"{"items":[{"id":"a","outcome":"ok"},{"id":"b","outcome":"changed"}]}"#,
+        );
+        let mut row = Row::new(Scenario::InitApply);
+        not_ok_cell(&mut row, "", "init", all_ok.as_ref());
+        not_ok_cell(&mut row, "", "init", None);
+        assert_eq!(row.cells[0].1, Value::Text("none".into()));
+        assert!(matches!(row.cells[1].1, Value::Missing(_)));
+    }
+
+    #[test]
+    fn xcode_select_and_the_state_folder_read_in_a_few_words() {
+        assert_eq!(
+            xcode_select_text("/Library/Developer/CommandLineTools\nexit=0\n"),
+            "/Library/Developer/CommandLineTools"
+        );
+        let failed = xcode_select_text(
+            "xcode-select: error: unable to get active developer directory, use `sudo xcode-select --switch path/to/Xcode.app` to set one (or see `man xcode-select`)\nexit=2\n",
+        );
+        assert!(
+            failed.starts_with(
+                "fails (exit 2: xcode-select: error: unable to get active developer directory"
+            ) && failed.ends_with("…)"),
+            "{failed}"
+        );
+        assert_eq!(xcode_select_text(""), "fails (exit ?: )");
+
+        assert_eq!(state_summary("(absent)\n"), "no aterm folder");
+        let listing = "./doctor\n./doctor/initial-setup.json\n./doctor/first-run.json\n./pkg\n\
+                       == doctor/initial-setup.json\n{\"state\":\"pending\"}\n";
+        assert_eq!(
+            state_summary(listing),
+            "4 entries; doctor/: initial-setup.json, first-run.json"
+        );
+        assert_eq!(state_summary("./pkg\n"), "1 entries; doctor/: none");
+    }
+
+    #[test]
+    fn the_alab_guard_fails_a_row_that_reached_the_vault_or_heard_a_guest_advert() {
+        let unreached = alab_probe_verdict("none", "000\n", 0).unwrap();
+        assert!(
+            unreached.starts_with("Unreached (alab-secrets.local unresolved"),
+            "{unreached}"
+        );
+        // A name that resolves but nothing answers (the pf null route) is still unreached.
+        assert!(alab_probe_verdict("192.168.64.1", "000", 0).is_ok());
+        // NEGATIVE CONTROLS: any HTTP answer, or any advert, fails the row.
+        assert!(alab_probe_verdict("192.168.64.1", "200", 0).is_err());
+        assert!(alab_probe_verdict("none", "403", 0).is_err());
+        assert!(alab_probe_verdict("none", "000", 1).is_err());
+
+        let browse = "Browsing for _alab-vault._tcp.local.\n\
+                      DATE: ---Mon 26 Oct 2026---\n \
+                      8:30:01.123  ...STARTING...\n\
+                      Timestamp     A/R    Flags  if Domain               Service Type         Instance Name\n \
+                      8:30:01.200  Add        3  15 local.               _alab-vault._tcp.    nux lab\n \
+                      8:30:01.201  Add        3   4 local.               _alab-vault._tcp.    alab-secrets\n \
+                      8:30:01.202  Add        2   9 local.               _alab-vault._tcp.    thunderbolt\n \
+                      8:30:01.203  Rmv        0  15 local.               _alab-vault._tcp.    nux lab\n";
+        let name_of = |index: u32| match index {
+            15 => Some("bridge100".to_owned()),
+            4 => Some("en0".to_owned()),
+            9 => Some("bridge0".to_owned()),
+            _ => None,
+        };
+        // The office's own vault on en0 and a Thunderbolt bridge are not a guest's.
+        assert_eq!(guest_adverts(browse, &name_of), ["nux lab on bridge100"]);
+        assert!(guest_adverts(&browse.replace("15 local.", "77 local."), &name_of).is_empty());
+    }
+
+    #[test]
+    fn a_folder_dialog_counts_for_aterm_after_the_mark_only() {
+        assert_eq!(
+            log_timestamp_ms("2026-10-26 08:30:01.123456-0700"),
+            Some(1_793_028_601_123)
+        );
+        assert_eq!(
+            log_timestamp_ms("2026-10-26 15:30:01.1+0000"),
+            Some(1_793_028_601_100)
+        );
+        assert_eq!(
+            log_timestamp_ms("2026-10-26 15:30:01+0000"),
+            Some(1_793_028_601_000)
+        );
+        assert_eq!(log_timestamp_ms("yesterday"), None);
+
+        let log = [
+            r#"{"timestamp":"2026-10-26 08:30:00.000000-0700","eventMessage":"AUTHREQ_PROMPTING: msgID=1.1, service=kTCCServiceSystemPolicyDocumentsFolder, subject=Sub:{com.aterm.aterm}, "}"#,
+            r#"{"timestamp":"2026-10-26 08:30:05.000000-0700","eventMessage":"AUTHREQ_PROMPTING: msgID=1.2, service=kTCCServiceSystemPolicyDownloadsFolder, subject=Sub:{com.aterm.aterm}, "}"#,
+            r#"{"timestamp":"2026-10-26 08:30:06.000000-0700","eventMessage":"AUTHREQ_PROMPTING: msgID=1.3, service=kTCCServiceSystemPolicyDesktopFolder, subject=Sub:{\/usr\/local\/bin\/tart-guest-agent}, "}"#,
+            r#"{"timestamp":"2026-10-26 08:30:07.000000-0700","eventMessage":"AUTHREQ_PROMPTING: msgID=1.4, service=kTCCServiceSystemPolicyAllFiles, subject=Sub:{com.aterm.aterm}, "}"#,
+            r#"{"timestamp":"2026-10-26 08:30:08.000000-0700","eventMessage":"AUTHREQ_PROMPTING: msgID=1.5, service=kTCCServiceAccessibility, subject=Sub:{com.aterm.aterm}, "}"#,
+            r#"{"eventMessage":"AUTHREQ_CTX: msgID=1.6, service=kTCCServiceSystemPolicyDocumentsFolder"}"#,
+        ]
+        .join("\n");
+        let prompts = tcc_prompt_events(&log);
+        assert_eq!(prompts.len(), 5);
+        assert_eq!(prompts[2].subject, "/usr/local/bin/tart-guest-agent");
+        assert_eq!(prompts[0].at_ms, Some(1_793_028_600_000));
+        // Before the walk granted Full Disk Access (the mark) the Documents dialog came; after it
+        // only the Downloads one, never the guest agent's Desktop or Full Disk Access itself.
+        assert_eq!(folder_prompts_after(&prompts, 0), 2);
+        assert_eq!(folder_prompts_after(&prompts, 1_793_028_601_000), 1);
+        assert_eq!(folder_prompts_after(&prompts, 1_793_028_609_000), 0);
+    }
+
+    #[test]
+    fn the_helper_is_found_in_cargos_json_and_free_space_in_df() {
+        let json = r#"{"reason":"compiler-artifact","target":{"name":"aterm-lab","kind":["bin"]},"executable":"/c/debug/aterm-lab"}
+{"reason":"compiler-artifact","target":{"name":"aterm-lab-guest","kind":["bin"]},"executable":"/c/debug/aterm-lab-guest"}
+{"reason":"build-finished","success":true}"#;
+        assert_eq!(
+            bin_executable(json, "aterm-lab-guest"),
+            Some(PathBuf::from("/c/debug/aterm-lab-guest"))
+        );
+        assert_eq!(bin_executable(json, "aterm"), None);
+        assert_eq!(bin_executable("", "aterm-lab-guest"), None);
+
+        let df = "Filesystem   1G-blocks Used Available Capacity iused ifree %iused  Mounted on\n\
+                  /dev/disk3s5       926  833        67    93%  3.4M  698M    0%   /System/Volumes/Data\n";
+        assert_eq!(df_free_gb(df), Some(67));
+        assert_eq!(df_free_gb("df: /nope: No such file or directory\n"), None);
     }
 
     #[test]
@@ -2887,6 +4725,58 @@ mod tests {
     }
 
     #[test]
+    fn an_init_exit_names_the_rows_it_left_open() {
+        // On a terminal: the prompts' lines, a change, and the rows left open with their whys.
+        let text = "Secrets vault URL or path (none skips): none\r\n\
+                    changed: Secrets vault (secrets.vault)\r\n    synced into ~/.secrets\r\n\
+                    failed: Command Line Tools (base.clt)\r\n    failed: not (this.why)\r\n\
+                    waiting: GitHub sign-in (github.auth@alice)\r\n\
+                    aterm init: 30 ok \u{b7} 1 changed \u{b7} 1 failed\r\n";
+        assert_eq!(
+            open_rows(text),
+            ["failed base.clt", "waiting github.auth@alice"]
+        );
+        // A `--check` run's rows that still differ read `planned`, and fail it.
+        let check = "planned: Caps Lock on keyboard 1452-1-0 (keyboard.caps-lock.1452-1-0@admin)\r\n\
+                     needs action: Debugger access (init.permissions.debugger)\r\n";
+        assert_eq!(
+            open_rows(check),
+            [
+                "planned keyboard.caps-lock.1452-1-0@admin",
+                "needs action init.permissions.debugger"
+            ]
+        );
+        // A `--json` report names each row's outcome, after the prompts' lines.
+        let json = "Secrets vault URL or path (none skips): none\r\n\
+                    {\"items\":[{\"id\":\"a\",\"outcome\":\"ok\"},{\"id\":\"base.clt\",\"outcome\":\"failed\"},\
+                    {\"id\":\"p\",\"outcome\":\"person\"},{\"id\":\"n\",\"outcome\":\"not-applicable\"},\
+                    {\"id\":\"c\",\"outcome\":\"changed\"}]}\r\n";
+        assert_eq!(open_rows(json), ["failed base.clt", "person p"]);
+        assert!(open_rows("aterm init: 41 ok\r\n").is_empty());
+
+        let mut row = Row::new(Scenario::VaultLocal);
+        let mut d = Drive {
+            exit: Some(0),
+            ..Drive::default()
+        };
+        open_rows_cell(&mut row, "", &d, text);
+        assert!(row.cells.is_empty(), "a clean exit names nothing");
+        d.exit = Some(1);
+        open_rows_cell(&mut row, "", &d, text);
+        open_rows_cell(&mut row, "again: ", &d, "aterm init: 1 failed\r\n");
+        assert_eq!(
+            row.cells
+                .iter()
+                .map(|(k, v)| format!("{k} = {v}"))
+                .collect::<Vec<_>>(),
+            [
+                "rows left open = failed base.clt, waiting github.auth@alice",
+                "again: rows left open = NOT MEASURED (init's output names no row left open)",
+            ]
+        );
+    }
+
+    #[test]
     fn a_refused_step_is_not_run_and_a_failed_one_fails_the_run() {
         let refused = Row::refused(
             Scenario::Vault,
@@ -3027,5 +4917,20 @@ mod tests {
         assert!(listen.starts_with("127.0.0.1:"), "{serve}");
         assert!(words.contains(&"--no-advertise"), "{serve}");
         assert!(!words.contains(&"--advertise"), "{serve}");
+    }
+
+    /// A run beside the pass says, in its row, a JSON report's completeness and its unresolved
+    /// rows, or its printed lines with the terminal's escape sequences dropped.
+    #[test]
+    fn a_run_beside_the_pass_says_its_unresolved_rows_or_its_lines() {
+        let json = r#"{"schema":1,"mode":"apply","complete":false,"items":[{"id":"base.shell.rc","outcome":"blocked","why":"the hooks are not current"},{"id":"base.pkg.toolset","outcome":"planned","from":"no ALab programs are installed"}],"readiness":{"all_green":false,"unresolved":["base.shell.rc","base.pkg.toolset"]}}"#;
+        assert_eq!(
+            said_beside_the_pass(&format!("a prompt line\n{json}\n")),
+            "complete false; unresolved: base.shell.rc blocked: the hooks are not current; \
+             base.pkg.toolset planned: no ALab programs are installed"
+        );
+        let tty = "\u{1b}[1mrepair:\u{1b}[0m ok\r\n\u{1b}]0;aterm\u{7}\n\nwaits /\rwaits -\r\u{1b}[2K\
+                   2 rows | done\n";
+        assert_eq!(said_beside_the_pass(tty), "repair: ok / 2 rows \u{a6} done");
     }
 }

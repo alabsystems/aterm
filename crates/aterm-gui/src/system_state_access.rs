@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use aterm_types::macos_setup::opt_out::OptOut;
 use aterm_types::macos_setup::{
-    Access, AccessOutcome, MacosDialog, Selection, Setting, Standing, Subject,
+    Access, AccessOutcome, MacosDialog, Selection, Setting, Standing, Subject, SyncKind,
 };
 
 use crate::status_item::SystemStateLine;
@@ -415,6 +415,12 @@ const fn setup_word(subject: Subject) -> &'static str {
         Subject::Setting(Setting::Permissions) => "permissions",
         Subject::Setting(Setting::Secrets) => "vault",
         Subject::Setting(Setting::Repositories) => "repos",
+        Subject::Sync(SyncKind::Peers) => "sync-peers",
+        Subject::Sync(SyncKind::Identity) => "sync-identity",
+        Subject::Sync(SyncKind::Fleet) => "sync-fleet",
+        Subject::Sync(SyncKind::Accounts) => "sync-accounts",
+        Subject::Sync(SyncKind::SharedData) => "sync-shared-data",
+        Subject::Sync(SyncKind::Name) => "sync-name",
     }
 }
 
@@ -622,11 +628,29 @@ impl App {
             .is_some_and(|(word, _)| atpkg::devtools::same_step(&word, &key))
     }
 
-    /// Whether one of the window's own access gestures is up: a hand-over panel,
-    /// a folder warm-up walking, an installer terminal, or an alert or pane's hold.
-    fn access_gesture_up(&self, now: Instant) -> bool {
+    /// Whether System State is the visible view of a focused window ([`StepsReach::frontmost`]).
+    pub(crate) fn system_state_in_front(&self) -> bool {
+        (self.access_steps.reach.frontmost)(self)
+    }
+
+    /// Whether System State's row for `access` offers its button: the setup run reads it as
+    /// needing the person.
+    pub(crate) fn system_state_offers(&self, access: Access) -> bool {
+        self.native_runtime
+            .instance_by_kind(crate::native_app::AppKind::SystemState)
+            .is_some_and(|instance| {
+                matches!(self.native_runtime.app(instance),
+                    Some(crate::native_app::NativeApp::SystemState(state)) if state.can_open_access(access))
+            })
+    }
+
+    /// Whether one of the window's own access gestures is up: a hand-over panel (or the
+    /// permission walk between its pages), a folder warm-up walking, an installer terminal, or
+    /// an alert or pane's hold.
+    pub(crate) fn access_gesture_up(&self, now: Instant) -> bool {
         self.developer_tools_install_active()
             || self.devtools_helper.panel().is_some()
+            || self.permission_walk.active()
             || self.consent_warmup.is_live()
             || self.access_steps.local_network_alert_up(now)
             || self.access_steps.pane_up(now)
@@ -665,6 +689,12 @@ impl App {
             return true;
         }
         self.reserve_access_dialog()
+    }
+
+    /// Give up the window's dialog slot outright: the permission walk hands it to the debugger
+    /// change, whose administrator dialog takes a slot of its own.
+    pub(crate) fn drop_access_dialog(&mut self) {
+        self.access_steps.dialog = None;
     }
 
     /// A failed start releases its reservation; an already visible gesture
@@ -1175,45 +1205,47 @@ impl App {
         access: Access,
         by_person: bool,
     ) -> bool {
-        let (opened, how) =
-            if !by_person && (self.access_revision().is_none() || !self.access_steps_allowed()) {
-                (false, "no approved revision, or a [privacy] switch off")
-            } else {
-                match access {
-                    Access::FullDiskAccess => {
-                        let answer = self.open_fda_from_system_state(by_person);
-                        (answer.brings_owner(), answer.as_str())
-                    }
-                    Access::DeveloperTools => {
-                        let origin = if by_person {
-                            devtools_helper::Origin::Settings
-                        } else {
-                            devtools_helper::Origin::SystemStateAct
-                        };
-                        let answer = self.hand_devtools_to_owner(origin);
-                        (answer.brings_owner(), answer.as_str())
-                    }
-                    Access::LocalNetwork | Access::Accessibility if by_person => {
-                        let opened = self.open_access_pane(
-                            access,
-                            devtools_helper::Origin::Settings,
-                            Instant::now(),
-                        );
-                        (opened, if opened { "opened" } else { "failed" })
-                    }
-                    Access::LocalNetwork | Access::Accessibility if self.headless => {
-                        (false, "headless")
-                    }
-                    Access::LocalNetwork | Access::Accessibility => {
-                        self.access_steps.pane_act = Some((access, Instant::now()));
-                        (false, "queued")
-                    }
-                    Access::Debugger => {
-                        let started = self.turn_on_debugger_from_system_state(by_person);
-                        (started, if started { "started" } else { "not started" })
-                    }
+        let walked = by_person.then(|| self.walk_from_row(access)).flatten();
+        let (opened, how) = if let Some(walked) = walked {
+            walked
+        } else if !by_person && (self.access_revision().is_none() || !self.access_steps_allowed()) {
+            (false, "no approved revision, or a [privacy] switch off")
+        } else {
+            match access {
+                Access::FullDiskAccess => {
+                    let answer = self.open_fda_from_system_state(by_person);
+                    (answer.brings_owner(), answer.as_str())
                 }
-            };
+                Access::DeveloperTools => {
+                    let origin = if by_person {
+                        devtools_helper::Origin::Settings
+                    } else {
+                        devtools_helper::Origin::SystemStateAct
+                    };
+                    let answer = self.hand_devtools_to_owner(origin);
+                    (answer.brings_owner(), answer.as_str())
+                }
+                Access::LocalNetwork | Access::Accessibility if by_person => {
+                    let opened = self.open_access_pane(
+                        access,
+                        devtools_helper::Origin::Settings,
+                        Instant::now(),
+                    );
+                    (opened, if opened { "opened" } else { "failed" })
+                }
+                Access::LocalNetwork | Access::Accessibility if self.headless => {
+                    (false, "headless")
+                }
+                Access::LocalNetwork | Access::Accessibility => {
+                    self.access_steps.pane_act = Some((access, Instant::now()));
+                    (false, "queued")
+                }
+                Access::Debugger => {
+                    let started = self.turn_on_debugger_from_system_state(by_person);
+                    (started, if started { "started" } else { "not started" })
+                }
+            }
+        };
         aterm_log::info!(
             "system state: {} {how} ({})",
             access.name(),
@@ -1224,6 +1256,39 @@ impl App {
             }
         );
         opened
+    }
+
+    /// A person's press on the Full Disk Access, Developer Tools or Accessibility row starts the
+    /// permission walk with that row's page first, going on to every other grant missing
+    /// (`crate::permission_walk`); a walk at another page gives way to it. `None` leaves the
+    /// press to its own page: another row, a headless instance, or a grant the window reads held,
+    /// whose page an owner's press opens anyway.
+    fn walk_from_row(&mut self, access: Access) -> Option<(bool, &'static str)> {
+        use crate::permission_walk::{Started, Subject};
+        let subject = match access {
+            Access::FullDiskAccess => Subject::FullDiskAccess,
+            Access::DeveloperTools => Subject::DeveloperTools,
+            Access::Accessibility => Subject::Accessibility,
+            Access::LocalNetwork | Access::Debugger => return None,
+        };
+        let now = Instant::now();
+        self.take_walk_close(now);
+        match self.permission_walk.walk().map(|walk| walk.current()) {
+            Some(current) if current == Some(subject) => {
+                self.drive_permission_walk(now);
+                return Some((true, "walking"));
+            }
+            Some(_) => self.permission_walk.end("a person's press on another row"),
+            None => {}
+        }
+        if !self.walk_missing(subject, true) {
+            self.drive_permission_walk(now);
+            return None;
+        }
+        match self.start_permission_walk(&[subject], "a person's press", now) {
+            Started::Walking(_) => Some((true, "walking")),
+            Started::Headless | Started::Granted | Started::Recent | Started::Declined => None,
+        }
     }
 
     /// Full Disk Access from System State's row, through the one hand-over
@@ -1385,13 +1450,13 @@ impl App {
         let lapsed = std::mem::take(&mut self.access_steps.revision_lapsed);
         let Some(seen) = self.access_steps.seen_revision.replace(revision) else {
             // A step asked before any revision stood waits for this one at its moment.
-            self.list_ahead_for_queued_devtools_step(now);
+            self.list_ahead_for_queued_devtools_step();
             return;
         };
         if seen == revision {
             if lapsed {
                 // The same revision back: a step asked while none stood waits for it.
-                self.list_ahead_for_queued_devtools_step(now);
+                self.list_ahead_for_queued_devtools_step();
             }
             return;
         }
@@ -1400,7 +1465,7 @@ impl App {
         );
         self.rearm_fda_step(now);
         self.rearm_devtools_step(now);
-        self.list_ahead_for_queued_devtools_step(now);
+        self.list_ahead_for_queued_devtools_step();
     }
 
     /// A `[privacy]` switch on again runs what it held at launch (design §4): a switch off is a
@@ -1567,7 +1632,7 @@ impl App {
     /// The System Settings pane of a grant aterm has no page of its own for:
     /// Local Network and Accessibility. Once open it counts as up for
     /// [`PANE_HOLD`], so no other step's gesture comes over it.
-    fn open_access_pane(
+    pub(crate) fn open_access_pane(
         &mut self,
         access: Access,
         origin: devtools_helper::Origin,

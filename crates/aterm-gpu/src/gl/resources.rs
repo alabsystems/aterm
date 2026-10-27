@@ -32,10 +32,6 @@ pub(crate) fn gl_format(f: TexelFormat) -> Result<GlFormat, String> {
         TexelFormat::Bgra8Unorm => {
             return Err("gl: GLES 3.0 has no BGRA8 texture format".to_owned());
         }
-        #[cfg(wgpu_arm)]
-        TexelFormat::Bgra8UnormSrgb => {
-            return Err("gl: GLES 3.0 has no BGRA8 sRGB texture format".to_owned());
-        }
     };
     Ok(GlFormat {
         internal,

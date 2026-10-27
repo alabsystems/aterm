@@ -1389,7 +1389,7 @@ fn redial_ends(need_close: &mut Watch) -> Result<Verdict, Fail> {
     Ok(match need_close.wait_end(HANG)? {
         Some(75) => {
             let errs = need_close.errs().join(" ");
-            if errs.contains("since=<log_seq> ep=<log_ep>") {
+            if errs.contains("since=<log_seq> ep=<log_ep> base=<log_base>") {
                 Verdict::Pass(format!("`{}` ended 75 and named since=", need_close.what))
             } else {
                 Verdict::Fail(format!(

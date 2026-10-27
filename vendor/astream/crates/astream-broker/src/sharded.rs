@@ -30,15 +30,25 @@
 //! disks/nodes, or where the single writer thread rather than the disk is the
 //! bottleneck (the `Relaxed` tier).
 
+#[cfg(unix)]
 use crate::client::{Event, SubscriptionCloser};
+#[cfg(unix)]
 use crate::proto::Gap;
-use crate::{Broker, BrokerHandle, Client, Durability};
-use astream_wire::{assign_partition, Filter, PartitionKey};
+#[cfg(unix)]
+use crate::Client;
+use crate::{Broker, BrokerHandle, Durability};
+#[cfg(unix)]
+use astream_wire::Filter;
+use astream_wire::{assign_partition, PartitionKey};
+#[cfg(unix)]
 use std::cell::Cell;
+#[cfg(unix)]
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::mpsc::{self, Receiver};
+#[cfg(unix)]
 use std::thread::{self, JoinHandle};
 
 #[cfg(clean_islands)]
@@ -167,6 +177,7 @@ fn check_or_record_log_shards(dir: &Path, shards: u32) -> io::Result<()> {
 }
 
 /// A client-side check against the socket directory's sidecar (written by `serve`).
+#[cfg(unix)]
 fn check_sock_shards(dir: &Path, shards: u32) -> io::Result<()> {
     match read_shards_file(dir)? {
         Some(have) if have == shards => Ok(()),
@@ -206,24 +217,49 @@ impl ShardedBroker {
         shards: u32,
         durability: Durability,
     ) -> io::Result<ShardedBroker> {
+        Self::open_opts(dir, shards, crate::OpenOptions::new(durability))
+    }
+
+    /// Open `shards` independent broker logs under `dir` using `opts` (capabilities,
+    /// at-rest encryption with independent `<shard-i.log>.seal` bindings, anti-rollback,
+    /// health sidecars, and escalation rules).
+    pub fn open_opts(
+        dir: impl AsRef<Path>,
+        shards: u32,
+        opts: crate::OpenOptions,
+    ) -> io::Result<ShardedBroker> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let shards = shards.max(1);
         check_or_record_log_shards(dir, shards)?;
         let mut brokers = Vec::new();
         for i in 0..shards {
-            brokers.push(Broker::open_with(
+            brokers.push(Broker::open_opts(
                 dir.join(format!("shard-{i}.log")),
-                durability,
+                opts.clone(),
+                || Ok(crate::Prepared::Nothing),
             )?);
         }
         Ok(ShardedBroker { brokers, shards })
+    }
+
+    /// Borrow the per-shard [`Broker`] at index `shard` (`0..shards()`).
+    #[must_use]
+    pub fn broker(&self, shard: usize) -> Option<&Broker> {
+        self.brokers.get(shard)
+    }
+
+    /// Borrow all per-shard [`Broker`] instances in `0..shards()` order.
+    #[must_use]
+    pub fn brokers(&self) -> &[Broker] {
+        &self.brokers
     }
 
     /// Bind one Unix socket per shard (`shard-<i>.sock`) under `sock_dir` and start
     /// accepting. Each shard runs its own acceptor + writer; there is no cross-shard
     /// lock, so the shards serve fully in parallel. The shard count is written to
     /// `sock_dir/shards` (before any socket appears) so clients can validate theirs.
+    #[cfg(unix)]
     pub fn serve(&self, sock_dir: impl AsRef<Path>) -> io::Result<ShardedHandle> {
         let dir = sock_dir.as_ref();
         std::fs::create_dir_all(dir)?;
@@ -231,6 +267,28 @@ impl ShardedBroker {
         let mut handles = Vec::new();
         for (i, b) in self.brokers.iter().enumerate() {
             handles.push(b.serve(dir.join(format!("shard-{i}.sock")))?);
+        }
+        Ok(ShardedHandle {
+            handles,
+            shards: self.shards,
+        })
+    }
+
+    /// Bind one ephemeral loopback TCP listener (`127.0.0.1:0`) per shard and start
+    /// accepting. Cross-platform (including Windows, where Unix sockets are absent)
+    /// and immune to the 104-byte `SUN_LEN` path cap.
+    pub fn serve_tcp_loopback(&self) -> io::Result<ShardedHandle> {
+        let mut handles = Vec::new();
+        for b in &self.brokers {
+            match b.serve_tcp("127.0.0.1:0") {
+                Ok(h) => handles.push(h),
+                Err(e) => {
+                    for mut started in handles {
+                        started.shutdown();
+                    }
+                    return Err(e);
+                }
+            }
         }
         Ok(ShardedHandle {
             handles,
@@ -251,10 +309,20 @@ pub struct ShardedHandle {
 }
 
 impl ShardedHandle {
-    /// Shut down every shard (each unlinks its socket).
+    /// Shut down every shard (each unlinks its socket or closes its TCP listener).
     pub fn shutdown(&mut self) {
         for h in &mut self.handles {
             h.shutdown();
+        }
+    }
+
+    /// Bound TCP address for `shard` (`0..shards()`) when started via
+    /// [`ShardedBroker::serve_tcp_loopback`], or `None` for Unix sockets / out-of-range shard.
+    #[must_use]
+    pub fn tcp_addr(&self, shard: usize) -> Option<&str> {
+        match self.handles.get(shard) {
+            Some(h) => h.tcp_addr(),
+            None => None,
         }
     }
 
@@ -265,11 +333,13 @@ impl ShardedHandle {
 }
 
 /// A client that routes by subject across the shards: one connection per shard.
+#[cfg(unix)]
 pub struct ShardedClient {
     conns: Vec<Client>,
     shards: u32,
 }
 
+#[cfg(unix)]
 impl ShardedClient {
     /// Connect to all `shards` shard sockets under `sock_dir`. The count is validated
     /// against the directory's `shards` sidecar (written by [`ShardedBroker::serve`]):
@@ -320,12 +390,14 @@ impl ShardedClient {
 }
 
 /// One merged delivery: `(shard, offset, subject, body)`.
+#[cfg(unix)]
 pub type ShardedDelivery = (usize, u64, String, Vec<u8>);
 
 /// What a fan-in carries: a delivery, or one shard's gap notice
 /// ([`Event::Gap`]): retention gave up records of the filter on
 /// that shard below its tail, so the records of `gap.from..gap.to` that shard does not
 /// deliver are gone. Offsets are per shard, so a notice is only ever that shard's.
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShardedEvent {
     /// A delivery, as [`ShardedSubscription::recv`] returns it.
@@ -355,6 +427,7 @@ pub enum ShardedEvent {
 /// Each shard's tail asks for gap notices (R4's addendum, A9), and a notice is forwarded in
 /// the shard's order: [`recv_event`](Self::recv_event) returns it, and
 /// [`take_gaps`](Self::take_gaps) hands back, shard by shard, every notice a read passed.
+#[cfg(unix)]
 pub struct ShardedSubscription {
     rx: Receiver<io::Result<ShardedEvent>>,
     closers: Vec<SubscriptionCloser>,
@@ -364,6 +437,7 @@ pub struct ShardedSubscription {
     gaps: Cell<BTreeMap<usize, Gap>>,
 }
 
+#[cfg(unix)]
 impl ShardedSubscription {
     /// Subscribe to `filter` on EVERY shard from `from_offset`, merging deliveries. Each
     /// shard gets its own connection + a forwarder thread that pushes its deliveries onto
@@ -479,6 +553,7 @@ impl ShardedSubscription {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ShardedSubscription {
     /// Shut every shard socket (unblocking its forwarder's read) and join the
     /// forwarders, so a dropped fan-in leaves no thread, no client fd, and no

@@ -1101,20 +1101,10 @@ impl WindowDelegate {
     }
 
     /// LOCAL PATCH (aterm): the content view as a borrowed `id`, what `aterm_objc::HasNsView`
-    /// hands out (`platform/macos.rs`); the `rwh_06` handle below wraps the same pointer.
+    /// hands out (`platform/macos.rs`).
     #[inline]
     pub(crate) fn ns_view(&self) -> Id {
         self.view().as_id()
-    }
-
-    #[cfg(feature = "rwh_06")]
-    #[inline]
-    pub fn raw_window_handle_rwh_06(&self) -> rwh_06::RawWindowHandle {
-        let window_handle = rwh_06::AppKitWindowHandle::new({
-            let ptr: *mut ::core::ffi::c_void = self.ns_view().as_ptr();
-            std::ptr::NonNull::new(ptr).expect("Retained<T> should never be null")
-        });
-        rwh_06::RawWindowHandle::AppKit(window_handle)
     }
 
     #[inline]

@@ -2714,11 +2714,35 @@ pub(crate) fn read(
         )),
         _ => {}
     }
+    let refused = crate::succession::Record::read(layout)
+        .map(|r| (r.sources.index_build, r.refused))
+        .filter(|(_, refused)| !refused.is_empty());
+    if let Some((trusted, rows)) = &refused {
+        f.push(Finding::change(
+            c::INDEX_SUCCESSION,
+            Class::Install,
+            "the index succession",
+            format!(
+                "{} \u{2014} this machine stays on index {trusted} until the channel publishes \
+                 an index that keeps the publisher's pin and repo rules; the release needs \
+                 fixing, not this machine",
+                rows.iter()
+                    .map(crate::succession::Refused::sentence)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            "every newer index keeps the publisher's pin and repo rules",
+            Remedy::None,
+        ));
+    }
     if probes.index_head {
         let last_pass = LastPass {
             reached_index_at: crate::status::read(layout)
                 .and_then(|s| crate::flow::rfc3339_to_unix(&s.last_success_at)),
             held: crate::index_probe::held_index_builds(layout),
+            refused: refused
+                .map(|(_, rows)| rows.iter().map(|r| r.index_build).collect())
+                .unwrap_or_default(),
         };
         let (row, remedy) =
             index_head_line(&crate::index_probe::cached_answer(layout), &last_pass, now);
@@ -3807,6 +3831,8 @@ const INDEX_HEAD_FRESH_SECS: i64 = 15 * 60;
 struct LastPass {
     reached_index_at: Option<i64>,
     held: Option<Vec<u64>>,
+    /// The held builds refused as successors of the accepted index ([`crate::succession`]).
+    refused: Vec<u64>,
 }
 
 fn index_head_line(
@@ -3834,15 +3860,24 @@ fn index_head_line(
         .as_ref()
         .and_then(|builds| builds.iter().copied().filter(|b| *b > floor).max())
     {
+        let text = if last.refused.contains(&held) {
+            format!(
+                "index {floor} is not the newest: index {held} was downloaded and refused as \
+                 a successor of the index this machine trusts (the index succession row says \
+                 which publisher rule it breaks); the release needs fixing, not this machine"
+            )
+        } else {
+            format!(
+                "index {floor} is not the newest: index {held} was downloaded but not \
+                 accepted — its signatures did not verify here, or its pass stopped early; \
+                 if `aterm pkg update` still ends on index {floor}, the release needs \
+                 fixing, not this machine"
+            )
+        };
         return (
             Row {
                 level: Level::Warn,
-                text: format!(
-                    "index {floor} is not the newest: index {held} was downloaded but not \
-                     accepted — its signatures did not verify here, or its pass stopped early; \
-                     if `aterm pkg update` still ends on index {floor}, the release needs \
-                     fixing, not this machine"
-                ),
+                text,
             },
             Remedy::None,
         );

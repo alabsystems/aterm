@@ -300,6 +300,7 @@ pub(crate) fn control_press(verb: &str, rest: &str) -> Option<InputEvent> {
         "ctrl" => parse_ctrl(rest),
         "paste" => Some(paste_event(rest)),
         "focus" => parse_focus(rest).map(InputEvent::Focus),
+        "mouse" => parse_mouse(rest).ok(),
         _ => None,
     }
 }
@@ -1923,6 +1924,23 @@ mod tests {
                 Some(true)
             );
         }
+        for body in [
+            "press left 2 4",
+            "release left 2 4",
+            "move left 2 5",
+            "wheelup left 2 4",
+        ] {
+            assert_eq!(
+                control_fence(input_of("mouse"), "mouse", body, false),
+                Some(true),
+                "`mouse {body}` keeps the hand on its row"
+            );
+        }
+        assert_eq!(
+            control_fence(input_of("mouse"), "mouse", "move 2 5", false),
+            None,
+            "a hover holds no button and draws no fence"
+        );
         assert_eq!(
             control_fence(input_of("key"), "key", "a", true),
             Some(false)

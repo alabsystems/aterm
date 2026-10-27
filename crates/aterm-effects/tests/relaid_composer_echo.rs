@@ -4,6 +4,8 @@
 //! End-to-end [`CursorGlow`] coverage tests when a composer relayout moves the bottom-anchored box.
 //! Covers keys whose echo rides a relayout, stalled frame trains across relayouts, and keyless relayouts.
 
+use crate::common::{Ground, ground_or};
+use crate::trail_host::{Case, MF, Outcome, case, holds_but, holds_where};
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig, GlowStyle};
@@ -62,15 +64,22 @@ fn geom() -> Geom {
     }
 }
 
+/// This file's own dark ground; an [`crate::common::on_ground`] lays another.
+const GROUND: Ground = Ground {
+    name: "Echo",
+    fg: 0x00D0_D0D0,
+    bg: 0x0011_1318,
+};
+
 fn cfg() -> GlowConfig {
-    GlowConfig {
+    ground_or(GROUND).lay(GlowConfig {
         classic_mono: false,
         ribbon_tall: true,
         ribbon_flat: false,
         enabled: true,
         dark_theme: true,
-        theme_fg: 0x00D0_D0D0,
-        theme_bg: 0x0011_1318,
+        theme_fg: GROUND.fg,
+        theme_bg: GROUND.bg,
         style: GlowStyle::RainbowKitty,
         color: 0x0050_FA7B,
         accent: 0x007A_A2F7,
@@ -82,7 +91,7 @@ fn cfg() -> GlowConfig {
         ring: true,
         beam: false,
         head_dx: 0.5,
-    }
+    })
 }
 
 fn rule() -> String {
@@ -168,6 +177,10 @@ struct Host {
     label: String,
     census: Vec<Census>,
     stalled: bool,
+    /// The redraw erases the whole screen first (ED 2), so its writes leave full damage.
+    erase_all: bool,
+    /// Whether the last relayout's writes left full damage.
+    relaid_full: bool,
 }
 
 impl Host {
@@ -195,6 +208,8 @@ impl Host {
             label: "start".into(),
             census: Vec::new(),
             stalled: false,
+            erase_all: false,
+            relaid_full: false,
         };
         let screen = h.screen();
         h.term.process(&screen);
@@ -221,6 +236,9 @@ impl Host {
         let top = self.row - text_i;
         assert!(top >= 1 && top + rows.len() - 1 <= ROWS, "the screen fits");
         let mut s = format!("{SYNC_BEGIN}\x1b[?25l\x1b[H");
+        if self.erase_all {
+            s.push_str("\x1b[2J");
+        }
         for r in 1..top {
             s.push_str(&format!("\x1b[{r};1H\x1b[K"));
         }
@@ -358,13 +376,13 @@ impl Host {
         }
     }
 
-    /// Echo `ch` inside a full-screen relayout that lifts the composer one row.
-    fn relay(&mut self, ch: char, delivery: Delivery) {
+    /// Echo `ch` inside a full-screen relayout that lifts the composer `rows` rows.
+    fn relay_rows(&mut self, ch: char, rows: usize, delivery: Delivery) {
         self.press(ch);
         self.text.push(ch);
-        self.agents += 1;
-        self.row -= 1;
+        self.shift_box(rows as isize);
         let bytes = self.screen();
+        self.term.take_damage();
         match delivery {
             Delivery::Whole => self.term.process(&bytes),
             Delivery::Reads => {
@@ -378,6 +396,7 @@ impl Host {
                 }
             }
         }
+        self.relaid_full = self.term.grid().damage().is_full();
         self.label = "after relayout".into();
     }
 
@@ -393,8 +412,8 @@ impl Host {
         self.term.process(&bytes);
     }
 
-    /// Perform a keyless relayout shifting the composer by `rows` (positive = up, negative = down).
-    fn keyless_relay_rows(&mut self, rows: isize) {
+    /// Grow (positive `rows`) or shrink the box under the composer, lifting or lowering its text row.
+    fn shift_box(&mut self, rows: isize) {
         for _ in 0..rows {
             if self.agents < AGENTS.len() {
                 self.agents += 1;
@@ -413,6 +432,11 @@ impl Host {
             .row
             .checked_add_signed(-rows)
             .expect("the box stays on the screen");
+    }
+
+    /// Perform a keyless relayout shifting the composer by `rows` (positive = up, negative = down).
+    fn keyless_relay_rows(&mut self, rows: isize) {
+        self.shift_box(rows);
         let bytes = self.screen();
         self.term.process(&bytes);
         self.label = "keyless relayout".into();
@@ -468,61 +492,155 @@ impl Host {
     }
 }
 
-/// Assert that from `label` onward the relaid text row has no holes, lights the rider's column, and forgets no press.
-fn assert_whole_from(h: &Host, label: &str, what: &str, forgotten_before: u64) {
+/// Read whether from `label` onward the relaid text row has no holes, lights the rider's column, and forgets no press.
+fn whole_from(h: &Host, label: &str, what: &str, forgotten_before: u64) -> Result<(), String> {
     let from = h.first_frame_labelled(label);
+    let relaid = (h.row - 1) as u16;
     let holed = h.census[from..]
         .iter()
-        .any(|c| c.row == (TEXT_ROW - 2) as u16 && !c.holes.is_empty());
-    assert!(
-        !holed,
-        "{what}: the key that rode the relayout left a hole in the band\n{}",
-        h.story(from)
-    );
+        .any(|c| c.row == relaid && !c.holes.is_empty());
+    if holed {
+        return Err(format!(
+            "{what}: the key that rode the relayout left a hole in the band\n{}",
+            h.story(from)
+        ));
+    }
     let rider_col = COL0 + BEFORE.chars().count();
     let last = h.census.last().expect("frames ran");
-    assert_eq!(
-        last.row,
-        (TEXT_ROW - 2) as u16,
-        "the census reads the relaid text row"
-    );
-    assert_eq!(
-        last.lit.as_bytes()[rider_col],
-        b'#',
-        "{what}: the column of the key that rode the relayout is dark\n{}",
-        h.story(from)
-    );
-    assert_eq!(
-        h.inflight_forgotten(),
-        forgotten_before,
-        "{what}: a press the relayout carried was forgotten as an unexplained hop"
-    );
+    assert_eq!(last.row, relaid, "the census reads the relaid text row");
+    if last.lit.as_bytes()[rider_col] != b'#' {
+        return Err(format!(
+            "{what}: the column of the key that rode the relayout is dark\n{}",
+            h.story(from)
+        ));
+    }
+    if h.inflight_forgotten() != forgotten_before {
+        return Err(format!(
+            "{what}: a press the relayout carried was forgotten as an unexplained hop"
+        ));
+    }
+    Ok(())
 }
 
-fn take(delivery: Delivery) {
+/// Assert [`whole_from`].
+fn assert_whole_from(h: &Host, label: &str, what: &str, forgotten_before: u64) {
+    if let Err(e) = whole_from(h, label, what, forgotten_before) {
+        panic!("{e}");
+    }
+}
+
+/// A take's reading as a law case: dark when the relaid line is not whole.
+fn outcome(read: Result<(), String>) -> Outcome {
+    let note = read.as_ref().err().cloned().unwrap_or_default();
+    Outcome::mf(0, 0, u64::from(read.is_err())).with_note(note)
+}
+
+/// A key rides a relayout `rows` rows up, its frame redrawn row by row or, `erase_all`, under ED 2.
+fn take(rows: usize, delivery: Delivery, erase_all: bool) -> Result<(), String> {
     let mut h = Host::new();
+    h.erase_all = erase_all;
     h.type_str(BEFORE);
     let forgotten_before = h.inflight_forgotten();
-    h.relay(RIDER, delivery);
+    h.relay_rows(RIDER, rows, delivery);
+    assert_eq!(
+        h.relaid_full, erase_all,
+        "premise: the relayout's writes leave full damage exactly under ED 2"
+    );
     h.type_str(AFTER);
     h.idle(200);
-    assert_whole_from(
+    whole_from(
         &h,
         "after relayout",
-        &format!("{delivery:?}"),
+        &format!("{rows} row(s) up, {delivery:?}, ED 2 {erase_all}"),
         forgotten_before,
-    );
+    )
 }
 
 /// Verify that a key riding a 1-row relayout lights its glyph under whole and chunked delivery.
 #[test]
 fn a_key_whose_echo_rides_a_relayout_a_row_up_is_laid_under_its_glyph() {
-    take(Delivery::Whole);
-    take(Delivery::Reads);
+    for delivery in [Delivery::Whole, Delivery::Reads] {
+        if let Err(e) = take(1, delivery, false) {
+            panic!("{e}");
+        }
+    }
 }
 
-/// Stall the frame train across `before` keys, the relayout, and `after` keys on the relaid row.
-fn stalled_take(before: usize, after: usize) {
+/// The relayouts as law cases: `relaid.rides` and `relaid.stalled` lift the box two, three or
+/// six rows (agents launched in one frame) under each delivery and every stall width around the
+/// relayout, and `relaid.ed2` redraws it under ED 2 one to six rows up.
+fn cases() -> Vec<Case> {
+    let mut v = Vec::new();
+    for rows in [2usize, 3, 6] {
+        for delivery in [Delivery::Whole, Delivery::Reads] {
+            case(
+                &mut v,
+                format!("relaid.rides/rows{rows}/{delivery:?}"),
+                MF,
+                move || outcome(take(rows, delivery, false)),
+            );
+        }
+        for before in 0..=3 {
+            for after in 0..=3 {
+                case(
+                    &mut v,
+                    format!("relaid.stalled/rows{rows}/before{before}/after{after}"),
+                    MF,
+                    move || outcome(stalled_take(before, after, rows)),
+                );
+            }
+        }
+    }
+    for rows in [1usize, 2, 3, 6] {
+        for delivery in [Delivery::Whole, Delivery::Reads] {
+            case(
+                &mut v,
+                format!("relaid.ed2/rows{rows}/{delivery:?}"),
+                MF,
+                move || outcome(take(rows, delivery, true)),
+            );
+        }
+    }
+    v
+}
+
+fn rows_of(id: &str) -> usize {
+    let at = id.find("/rows").expect("a row count") + "/rows".len();
+    id[at..]
+        .split('/')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("a row count")
+}
+
+/// Verify that a key riding a relayout two, three or six rows up lights its glyph under whole
+/// and chunked delivery and under every stall width around it.
+#[test]
+fn a_key_whose_echo_rides_a_relayout_three_rows_up_is_laid_under_its_glyph() {
+    holds_where(cases(), |id| {
+        id.starts_with("relaid.rides/") || id.starts_with("relaid.stalled/")
+    });
+}
+
+/// Verify that a relayout redrawn under ED 2, which leaves full damage, is followed as main
+/// follows the row-by-row redraw, one to six rows up. The limit: delivered in reads with a frame
+/// presented between them, the first read erases the hand's row and writes the line on its new
+/// row two or more rows away, past the ±1 rows the witness samples beside a band
+/// (`Engine::band_rows`), while the caret is hidden; the witness reads the run as gone and
+/// retires it before the last read shows the caret there. One row up the new row is a sampled
+/// neighbour and the run is followed on that frame; the row-by-row redraw writes the new row
+/// before it overwrites the old one, so no frame shows the line gone.
+#[test]
+fn a_full_damage_relayout_is_followed_as_main() {
+    holds_but(
+        cases(),
+        |id| id.starts_with("relaid.ed2/"),
+        |id| id.ends_with("/Reads") && rows_of(id) >= 2,
+    );
+}
+
+/// Stall the frame train across `before` keys, the relayout `rows` rows up, and `after` keys on the relaid row.
+fn stalled_take(before: usize, after: usize, rows: usize) -> Result<(), String> {
     let mut h = Host::new();
     let n = BEFORE.chars().count();
     h.type_str(&BEFORE.chars().take(n - before).collect::<String>());
@@ -530,18 +648,20 @@ fn stalled_take(before: usize, after: usize) {
     let forgotten_before = h.inflight_forgotten();
     h.stall();
     h.type_str(&BEFORE.chars().skip(n - before).collect::<String>());
-    h.relay(RIDER, Delivery::Whole);
+    h.relay_rows(RIDER, rows, Delivery::Whole);
     h.type_str(&AFTER.chars().take(after).collect::<String>());
     h.label = "resumed".into();
     h.resume();
     h.type_str(&AFTER.chars().skip(after).collect::<String>());
     h.idle(200);
-    assert_whole_from(
+    whole_from(
         &h,
         "resumed",
-        &format!("a stall over {before} key(s), the relayout and {after} key(s) after it"),
+        &format!(
+            "a stall over {before} key(s), the relayout {rows} row(s) up and {after} key(s) after it"
+        ),
         forgotten_before,
-    );
+    )
 }
 
 /// Verify that every stall width around the relayout (`0..=3` keys before and after) lights every typed glyph.
@@ -549,7 +669,9 @@ fn stalled_take(before: usize, after: usize) {
 fn every_stall_width_around_the_relayout_lays_every_key() {
     for before in 0..=3 {
         for after in 0..=3 {
-            stalled_take(before, after);
+            if let Err(e) = stalled_take(before, after, 1) {
+                panic!("{e}");
+            }
         }
     }
 }
@@ -561,8 +683,7 @@ fn a_keyless_relayout_moves_the_band_and_the_next_keys_join_it() {
     h.type_str(BEFORE);
     h.idle(150);
     let forgotten_before = h.inflight_forgotten();
-    h.agents += 1;
-    h.row -= 1;
+    h.shift_box(1);
     let bytes = h.screen();
     h.term.process(&bytes);
     h.label = "after relayout".into();
@@ -582,7 +703,7 @@ fn the_band_laid_before_the_relayout_stays_lit_under_the_hand() {
             h.stall();
         }
         h.type_str(&BEFORE[BEFORE.len() - 1..]);
-        h.relay(RIDER, Delivery::Whole);
+        h.relay_rows(RIDER, 1, Delivery::Whole);
         h.type_str(&AFTER[..2]);
         h.resume();
         h.type_str(&AFTER[2..]);

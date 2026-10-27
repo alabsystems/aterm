@@ -40,9 +40,13 @@ that one cell.
 Exit 0 means all requested checks passed; 1 means a finding; 2 is usage; 3 means
 the check could not run. A build, clean or inspection failure never counts as a
 caught mismatch. `--upstream` (or WINDOWS_SYS_SRC) selects the pinned registry
-source; without either, the oracle reads Cargo's registry copy, and fetches it
-first (`targo fetch --locked` of win32-oracle/) on a host that has none, since no
-aterm build downloads it. `--stock` selects the rustup toolchain. `--target-dir` (or
+source; without either, the driver reads Cargo's registry copy. The `oracle`,
+`oracle-052` and `record` builds run `--locked --offline`, so before them the
+driver resolves their reference workspace offline and runs `targo fetch --locked`
+of it only when that fails: no aterm build downloads these crates, and a cache
+prune can take Cargo's index entries while an unpacked source stays. `gen` and
+`check` build nothing there, and resolve win32-oracle/ only when no copy is
+unpacked. `--stock` selects the rustup toolchain. `--target-dir` (or
 ORACLE_TARGET_DIR) owns the oracle build cache; NM selects its object inspector.
 The default cache, which the first build makes, is this checkout's
 win32-oracle/target.noindex (`oracle-052`:

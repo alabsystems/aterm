@@ -50,6 +50,9 @@ fn main() -> ExitCode {
             aterm_forge::check::run(&aterm_forge::resolve::Cargo::from_env(), &root, &cells)
         }
         (cli::Cmd::SerdeAttrs { paths }, Ok(root)) => aterm_forge::serde_attrs::run(&root, &paths),
+        (cli::Cmd::AbrewHelp { options }, Ok(root)) => {
+            aterm_forge::abrew_help::run(&root, &options)
+        }
     };
 
     match out {

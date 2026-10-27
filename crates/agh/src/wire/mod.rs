@@ -433,7 +433,9 @@ pub enum WireBody<'a> {
     },
 }
 
-/// One request, as the client hands it to a transport.
+/// One request, as the client hands it to a transport. Built outside agh with
+/// `WireRequest::new` (`#[non_exhaustive]`); `HttpTransport` checks its `permit` before it
+/// sends a write (design §10.1).
 #[non_exhaustive]
 pub struct WireRequest<'a> {
     /// The method.
@@ -450,6 +452,16 @@ pub struct WireRequest<'a> {
     pub limit: u64,
     /// The time limits.
     pub deadlines: Deadlines,
+    /// The write permit (design §10.1): `None` for a read. Crate-private, so only agh's
+    /// pipeline (`client::send`) sets it; `WireRequest::new` sets `None`.
+    pub(crate) permit: Option<&'a crate::policy::Permit>,
+    /// `sha256:{hex}` of a `WireBody::Reader`'s bytes, set by the write pipeline for a file body,
+    /// so a tape names the body it cannot hold.
+    pub(crate) body_digest: Option<&'a str>,
+    /// The profile the routing decision sends this request as (`Decision::Send`), set by the
+    /// pipeline live and under every tape. A replay loads no credential, so `auth` is `None`
+    /// there, and this field still names the profile the recording spoke as.
+    pub(crate) as_profile: Option<&'a str>,
 }
 
 impl<'a> WireRequest<'a> {
@@ -469,6 +481,9 @@ impl<'a> WireRequest<'a> {
             body: WireBody::Empty,
             limit,
             deadlines,
+            permit: None,
+            body_digest: None,
+            as_profile: None,
         }
     }
 }

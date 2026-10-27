@@ -18,11 +18,12 @@ use crate::bridge::{read_cap_file, Config};
 use crate::ctl::Ctl;
 use crate::render::{safe, trust_of, SCREEN};
 use crate::transport::{self, Conn};
+use aterm_types::fabric_grammar::ANSWER_KINDS;
 
 /// Usage, printed for `help` (exit 0) and after a usage error (exit 2).
-pub const USAGE: &str = "\
+const USAGE: &str = "\
 usage: aterm fabric [status] [--json]
-       aterm fabric tail [--bodies] [--from <offset>] [--filter <subject-filter>]
+       aterm fabric tail [--bodies] [--json] [--from <offset>] [--filter <subject-filter>]
        aterm fabric brief [@<sid>[@<node>]] [--window <records>] [--budget <tokens>]
                           [--cap-file <path>] [--json]
        aterm fabric on  [--dry-run] [--fleet <F>] [--service launchd|systemd|none]
@@ -58,11 +59,17 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
                    - TRAFFIC: the last 10 bus records, metadata only
                    - WARNINGS: each problem found (`doctor` prints its fix)
   --json           status: one JSON object of the same data; brief: one object whose
-                   `sessions` each carry node, sid, this, ep, need, detail, open,
-                   mail_in, mail_out, last_seq, age_s and partial
+                   `sessions` each carry these keys:
+@SESSION_KEYS@
+                   tail: one object per record, one per line, with these keys (`node`
+                   and `sid` null where the subject names none; `body` only with
+                   --bodies):
+@TAIL_KEYS@
+                   and, where retention gave records up before it read them, one
+                   {\"gap\":{...}} line
   tail             stream bus records as they land, until Ctrl-C
   --from <offset>  tail: replay from bus offset <offset> first
-  --bodies         tail: print each record's text after its trust label
+  --bodies         tail: print each record's text after its trust label (--json: `body`)
   --filter <f>     tail: one full subject pattern, `/f/<F>/…` (`*` one segment, `>`
                    the rest), instead of the whole fleet
   brief            fold each session's mirrored log into a few lines (need, open work,
@@ -122,6 +129,29 @@ refused or failed, 2 fabric off, unreadable config, a refused precondition, or a
 error.
 ";
 
+/// The keys of each record `aterm fabric tail --json` prints, in order ([`tail_json`]).
+pub const TAIL_KEYS: [&str; 12] = [
+    "off", "subject", "node", "sid", "t_ms", "time", "kind", "len", "trust", "from", "to", "body",
+];
+
+/// `aterm fabric --help`, its key lists filled from the declarations the JSON writers use.
+#[must_use]
+pub fn usage() -> String {
+    USAGE
+        .replace(
+            "@SESSION_KEYS@\n",
+            &key_list(&crate::fabric_brief::SESSION_KEYS),
+        )
+        .replace("@TAIL_KEYS@\n", &key_list(&TAIL_KEYS))
+}
+
+/// One key list as [`usage`] prints it: each key backticked, in its order, filled to the
+/// help's width, one newline after.
+fn key_list(keys: &[&str]) -> String {
+    let words: Vec<String> = keys.iter().map(|k| format!("`{k}`")).collect();
+    format!("{}\n", crate::render::fill(&words, 19, 90))
+}
+
 const FABRIC_COMMAND_ENV: &str = "ATERM_FABRIC_COMMAND";
 
 /// The [`FABRIC_COMMAND_ENV`] seam's value: `None` in a shipped build, which compiles the read out.
@@ -153,10 +183,12 @@ pub enum Cmd {
         /// `--json`.
         json: bool,
     },
-    /// `aterm fabric tail [--bodies] [--from <offset>] [--filter <subject>]`.
+    /// `aterm fabric tail [--bodies] [--json] [--from <offset>] [--filter <subject>]`.
     Tail {
         /// `--bodies`.
         bodies: bool,
+        /// `--json`: one object per record ([`tail_json`]).
+        json: bool,
         /// `--from <offset>`; `None` is "new records only".
         from: Option<u64>,
         /// `--filter <subject-filter>`; `None` is the whole fleet.
@@ -229,7 +261,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
         };
         match (verb, flag.as_str()) {
             (_, "-h" | "--help") => return Ok(Cmd::Help),
-            ("status", "--json") => json = true,
+            ("status" | "tail", "--json") => json = true,
             ("tail", "--bodies") => bodies = true,
             ("tail", "--filter") => {
                 let f = value()?;
@@ -244,10 +276,9 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
             }
             ("tail", "--from") => {
                 let v = value()?;
-                let n = v.strip_prefix('@').unwrap_or(&v);
                 from = Some(
-                    n.parse::<u64>()
-                        .map_err(|_| format!("--from {} is not a bus offset", safe(&v, 64)))?,
+                    aterm_types::fabric_grammar::parse_bus_offset(&v)
+                        .ok_or_else(|| format!("--from {} is not a bus offset", safe(&v, 64)))?,
                 );
             }
             ("mint-for", "--out") => mint.out = Some(value()?),
@@ -301,10 +332,10 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
                         .to_string(),
                 );
             }
-            ("tail", "--json") => {
+            (_, "--json") => {
                 return Err(
-                    "--json is a `status` or `brief` flag (`aterm fabric --json`, \
-                     `aterm fabric brief --json`)"
+                    "--json is a `status`, `tail` or `brief` flag (`aterm fabric --json`, \
+                     `aterm fabric tail --json`, `aterm fabric brief --json`)"
                         .to_string(),
                 );
             }
@@ -345,6 +376,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
     Ok(match verb {
         "tail" => Cmd::Tail {
             bodies,
+            json,
             from,
             filter,
         },
@@ -366,13 +398,14 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
 #[must_use]
 pub fn main(args: &[String]) -> ExitCode {
     match parse_args(args) {
-        Ok(Cmd::Help) => aterm_uds::stdout::answer_exit("aterm fabric", USAGE, 0),
+        Ok(Cmd::Help) => aterm_uds::stdout::answer_exit("aterm fabric", &usage(), 0),
         Ok(Cmd::Status { json }) => status_main(json),
         Ok(Cmd::Tail {
             bodies,
+            json,
             from,
             filter,
-        }) => tail_main(bodies, from, filter.as_deref()),
+        }) => tail_main(TailFmt::new(bodies, json), from, filter.as_deref()),
         Ok(Cmd::Brief(opts)) => crate::fabric_brief::brief_main(&opts),
         Ok(Cmd::On(opts)) => crate::enable::on(&opts),
         Ok(Cmd::Off(opts)) => crate::enable::off(&opts),
@@ -384,7 +417,7 @@ pub fn main(args: &[String]) -> ExitCode {
         },
         Err(e) => {
             eprintln!("aterm fabric: {e}");
-            eprint!("{USAGE}");
+            eprint!("{}", usage());
             ExitCode::from(2)
         }
     }
@@ -1605,6 +1638,11 @@ pub(crate) fn traffic_of_body(fleet: &str, off: u64, subject: &str, body: Body) 
     }
 }
 
+/// TRAFFIC: the newest `n` records the broker holds of the fleet (or of `faces`), read TOLD
+/// ([`transport::fetch_told_kept`]): the fleet's root reaches the bulk stream's class and the
+/// held mail and presence below its cut, so its oldest is the cut, and a plain read on at it
+/// would leave out the records retention still holds below it (astream's
+/// `retention::oldest`; audit finding BUS-1).
 fn last_records(
     conn: &mut Conn,
     fleet: &str,
@@ -1621,7 +1659,7 @@ fn last_records(
             let mut next = start;
             loop {
                 let ((page, (after, now_head)), _) =
-                    transport::fetch_kept(conn, next, filter, transport::POST_PAGE)?;
+                    transport::fetch_told_kept(conn, next, filter, transport::POST_PAGE)?;
                 for (off, subject, raw) in &page {
                     let older = merged.len() >= n
                         && merged
@@ -1648,14 +1686,19 @@ fn last_records(
     }
 }
 
+/// The `t=` of the record at `off` on `filter`, read TOLD ([`transport::fetch_told_kept`]): a
+/// record retention still holds below the filter's oldest has its age too (the fleet's `in`
+/// lanes span one reader group per node and the person lanes', and the oldest is the greatest
+/// of their floors). `None` when no record of the filter is at `off`.
 fn record_t(conn: &mut Conn, filter: &str, off: u64) -> Option<u64> {
-    let (page, _) = conn.fetch(off, filter, 1).ok()?;
+    let ((page, _), _) = transport::fetch_told_kept(conn, off, filter, 1).ok()?;
     let (at, _, raw) = page.first()?;
     (*at == off).then(|| Body::decode(raw).0.t)
 }
 
 /// An `ask` or `task` whose `dl=` has passed with no `answer`, `report` or `ack` carrying its
-/// offset as `re=` anywhere on the fleet's `in` lanes.
+/// offset as `re=` anywhere on the fleet's `in` lanes, of the lanes whose verdicts above it the
+/// bus still keeps (`overdue_work`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Overdue {
     /// The ask's offset — what a reply would carry as `re=`.
@@ -1671,12 +1714,27 @@ pub struct Overdue {
     /// How long past the deadline it is, ms.
     pub late_ms: u64,
     /// Whether the asker's own bridge, which owns that verdict, has already put
-    /// `expired re=<off>` on the asker's lane.
-    pub expired: bool,
+    /// `expired re=<off>` on the asker's lane: `None` when retention gave up records of the
+    /// asker's `expired` verdicts above the ask, so the bus no longer says.
+    pub expired: Option<bool>,
 }
 
 const OVERDUE_SCAN_SPAN: u64 = 1 << 16;
 
+/// The overdue asks on the fleet's `in` lanes (or the `in` faces of `faces`) within the last
+/// [`OVERDUE_SCAN_SPAN`] offsets, read TOLD ([`transport::fetch_told_kept`]). Those lanes span
+/// one reader group per node and the person lanes' (`/f/<F>/cur/p/node/inbox`, which nothing
+/// commits), and a filter's oldest is the greatest floor of what it reaches, so a node's read
+/// mail given up past an unread ask to a person raises it above that ask, which retention
+/// still holds: a read on at the floor would never list it (audit finding BUS-1). A broker
+/// that does not tell fetches (one older than this build's astream) is read on at the floor,
+/// as before.
+///
+/// Each ask is judged only on verdicts the bus still keeps ([`verdicts_kept`]): an ask is
+/// listed only while every `answer`, `report` and `ack` that could reach its asker's lane
+/// above it is kept (retention gives up the asker node's read mail with the cut while it
+/// holds the ask, so a reply given up beside a held ask would read as none), and its
+/// `expired` is `None` where the asker's `expired` verdicts above it are not all kept.
 fn overdue_work(
     conn: &mut Conn,
     fleet: &str,
@@ -1691,7 +1749,7 @@ fn overdue_work(
         let mut next = head.saturating_sub(OVERDUE_SCAN_SPAN);
         loop {
             let ((page, (after, now_head)), _) =
-                transport::fetch_kept(conn, next, filter, transport::POST_PAGE)?;
+                transport::fetch_told_kept(conn, next, filter, transport::POST_PAGE)?;
             for (off, subject, raw) in &page {
                 if fed.insert(*off) {
                     scan.feed(fleet, *off, subject, raw);
@@ -1703,7 +1761,109 @@ fn overdue_work(
             next = after;
         }
     }
-    Ok(scan.finish(now_ms))
+    let mut oldest = BTreeMap::new();
+    let mut overdue = Vec::new();
+    for (mut o, lane) in scan.finish_on_lanes(now_ms) {
+        let above = o.off.saturating_add(1);
+        if !verdicts_kept(conn, &mut oldest, &filters, &lane, &ANSWER_KINDS, above)? {
+            continue;
+        }
+        if o.expired == Some(false)
+            && !verdicts_kept(conn, &mut oldest, &filters, &lane, &["expired"], above)?
+        {
+            o.expired = None;
+        }
+        overdue.push(o);
+    }
+    Ok(overdue)
+}
+
+/// Whether the bus keeps, from `from` on, every record of `kinds` on the asker's `lane`
+/// ([`verdict_lane`]) the scan of `faces` reads: the oldest of each (`Client::oldest`, the
+/// offset at and above which a filter is complete; astream's `retention::oldest` takes the
+/// greatest floor of the subjects it matches, and a subject's floor is one past its newest
+/// record given up) is at or below `from`. Each filter's oldest is asked once (`oldest`). A
+/// broker that names no oldest predates retention's held records (no aterm pin carried them
+/// without it) and serves everything from its base, so what it serves is whole. `false` when
+/// no face reaches the lane: the scan reads none of those verdicts.
+fn verdicts_kept(
+    conn: &mut Conn,
+    oldest: &mut BTreeMap<String, Option<u64>>,
+    faces: &[String],
+    lane: &str,
+    kinds: &[&str],
+    from: u64,
+) -> io::Result<bool> {
+    for kind in kinds {
+        let verdicts = format!("{lane}/{kind}");
+        let mut reached = false;
+        for face in faces {
+            let Some(filter) = filter_meet(&verdicts, face) else {
+                continue;
+            };
+            reached = true;
+            let floor = match oldest.get(&filter) {
+                Some(floor) => *floor,
+                None => {
+                    let (floor, _) = conn.oldest(&filter)?;
+                    oldest.insert(filter, floor);
+                    floor
+                }
+            };
+            if floor.is_some_and(|floor| floor > from) {
+                return Ok(false);
+            }
+        }
+        if !reached {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Where the verdicts on an ask at `subject` (an `in` lane, `/f/<F>/in/<a>/<b>/<src>/<kind>`)
+/// from `from` (its body's `from=`) land, as a filter of the lane with the verdict's source
+/// left `*` (the kind follows): a session's ask (`src` a node, `from` its session) is answered
+/// on that session's lane, `/f/<F>/in/<src>/<from>/*`, and expired there by its bridge; a
+/// person's on the person's lane, `/f/<F>/in/p/<src>/*` (bridge.rs's reply lanes). An asker
+/// the record does not name gets every `in` lane, `/f/<F>/in/*/*/*`.
+fn verdict_lane(fleet: &str, subject: &str, from: Option<&str>) -> String {
+    let src = subject.split('/').nth(6).unwrap_or("");
+    let principal = crate::subject::is_principal;
+    let session = from.filter(|sid| sid.starts_with("s-") && principal(sid));
+    if src.starts_with("n-") && principal(src) {
+        if let Some(sid) = session {
+            return format!("/f/{fleet}/in/{src}/{sid}/*");
+        }
+    } else if !src.starts_with("s-") && principal(src) {
+        return format!("/f/{fleet}/in/p/{src}/*");
+    }
+    format!("/f/{fleet}/in/*/*/*")
+}
+
+/// The filter of exactly the subjects both `a` and `b` match (segments literal, `*` for one,
+/// a trailing `>` for one or more), or `None` where no subject matches both.
+fn filter_meet(a: &str, b: &str) -> Option<String> {
+    let (a, b): (Vec<&str>, Vec<&str>) = (a.split('/').collect(), b.split('/').collect());
+    let mut out: Vec<&str> = Vec::with_capacity(a.len().max(b.len()));
+    let mut i = 0usize;
+    loop {
+        match (a.get(i).copied(), b.get(i).copied()) {
+            (None, None) => return Some(out.join("/")),
+            (Some(">"), Some(_)) => {
+                out.extend(b.iter().skip(i));
+                return Some(out.join("/"));
+            }
+            (Some(_), Some(">")) => {
+                out.extend(a.iter().skip(i));
+                return Some(out.join("/"));
+            }
+            (Some(x), Some(y)) if x == y || y == "*" => out.push(x),
+            (Some("*"), Some(y)) => out.push(y),
+            _ => return None,
+        }
+        i = i.saturating_add(1);
+    }
 }
 
 fn in_filters(fleet: &str, faces: Option<&[String]>) -> Vec<String> {
@@ -1731,20 +1891,25 @@ pub(crate) fn overdue_of(
     for (off, subject, raw) in records {
         scan.feed(fleet, *off, subject, raw);
     }
-    scan.finish(now_ms)
+    scan.finish_on_lanes(now_ms)
+        .into_iter()
+        .map(|(o, _)| o)
+        .collect()
 }
 
 #[derive(Default)]
 struct OverdueScan {
     settled: BTreeSet<u64>,
     expired: BTreeSet<u64>,
-    asks: Vec<(Traffic, u64)>,
+    /// Each work record with a deadline, its `dl=` and its asker's lane ([`verdict_lane`]).
+    asks: Vec<(Traffic, u64, String)>,
 }
 
 impl OverdueScan {
     fn feed(&mut self, fleet: &str, off: u64, subject: &str, raw: &[u8]) {
         let (body, _) = Body::decode(raw);
         let (dl, re) = (body.dl, body.re);
+        let lane = verdict_lane(fleet, subject, body.from.as_deref());
         let t = traffic_of_body(fleet, off, subject, body);
         match t.kind.as_str() {
             k if WORK_KINDS.contains(&k) => {
@@ -1753,7 +1918,7 @@ impl OverdueScan {
                         text: String::new(),
                         ..t
                     };
-                    self.asks.push((t, dl));
+                    self.asks.push((t, dl, lane));
                 }
             }
             "answer" | "report" | "ack" => {
@@ -1770,25 +1935,29 @@ impl OverdueScan {
         }
     }
 
-    fn finish(self, now_ms: u64) -> Vec<Overdue> {
+    /// The overdue asks among what was fed, each with its asker's lane ([`verdict_lane`]).
+    fn finish_on_lanes(self, now_ms: u64) -> Vec<(Overdue, String)> {
         let Self {
             settled,
             expired,
             asks,
         } = self;
         asks.into_iter()
-            .filter(|(t, _)| !settled.contains(&t.off))
-            .filter_map(|(t, dl)| {
+            .filter(|(t, _, _)| !settled.contains(&t.off))
+            .filter_map(|(t, dl, lane)| {
                 let at = t.t_ms;
                 let due = at.saturating_add(dl);
-                (at > 0 && now_ms > due).then(|| Overdue {
-                    off: t.off,
-                    expired: expired.contains(&t.off),
-                    from: t.from,
-                    to: t.to,
-                    kind: t.kind,
-                    dl,
-                    late_ms: now_ms - due,
+                (at > 0 && now_ms > due).then(|| {
+                    let o = Overdue {
+                        off: t.off,
+                        expired: Some(expired.contains(&t.off)),
+                        from: t.from,
+                        to: t.to,
+                        kind: t.kind,
+                        dl,
+                        late_ms: now_ms - due,
+                    };
+                    (o, lane)
                 })
             })
             .collect()
@@ -2226,7 +2395,12 @@ pub struct Report {
     pub exited: usize,
     /// TRAFFIC, oldest first.
     pub traffic: Vec<Traffic>,
-    /// Every `ask`/`task` on the bus past its `dl=` with no reply, each a warning.
+    /// Every `ask`/`task` on the bus past its `dl=` with no reply, each a warning: one
+    /// retention still holds below the `in` lanes' oldest included (`overdue_work` reads them
+    /// told, [`transport::fetch_told_kept`]). Judged only where the bus keeps the verdicts:
+    /// an ask whose asker's lane gave up an `answer`, `report` or `ack` above it is not
+    /// listed, as status cannot say it had none, and `expired` is `None` where the asker's
+    /// `expired` verdicts above it are not all kept.
     pub overdue: Vec<Overdue>,
     /// WARNINGS.
     pub warnings: Vec<String>,
@@ -2920,10 +3094,10 @@ fn warnings(
             safe(&o.to, 128),
             age(o.late_ms),
             o.dl,
-            if o.expired {
-                "the asker's bridge recorded it expired"
-            } else {
-                "not yet recorded expired by the asker's bridge"
+            match o.expired {
+                Some(true) => "the asker's bridge recorded it expired",
+                Some(false) => "not yet recorded expired by the asker's bridge",
+                None => "whether the asker's bridge recorded it expired is not kept on the bus",
             }
         ));
     }
@@ -4042,29 +4216,7 @@ pub fn render_json(r: &Report) -> String {
             ])
         })
         .collect();
-    let traffic = r
-        .traffic
-        .iter()
-        .map(|t| {
-            J::Obj(vec![
-                ("off", J::Num(t.off)),
-                ("t_ms", J::Num(t.t_ms)),
-                (
-                    "time",
-                    if t.t_ms == 0 {
-                        J::Null
-                    } else {
-                        J::Str(aterm_types::rfc3339::format_rfc3339(t.t_ms / 1000))
-                    },
-                ),
-                ("from", J::s(&t.from)),
-                ("to", J::s(&t.to)),
-                ("kind", J::s(&t.kind)),
-                ("len", J::Num(t.len as u64)),
-                ("trust", J::s(t.trust)),
-            ])
-        })
-        .collect();
+    let traffic = r.traffic.iter().map(|t| J::Obj(traffic_json(t))).collect();
     let obj = J::Obj(vec![
         ("schema", J::Num(1)),
         ("exit", J::Num(u64::from(exit_of(r)))),
@@ -4161,7 +4313,7 @@ pub fn render_json(r: &Report) -> String {
                             ("kind", J::s(&o.kind)),
                             ("dl_ms", J::Num(o.dl)),
                             ("late_ms", J::Num(o.late_ms)),
-                            ("expired", J::Bool(o.expired)),
+                            ("expired", o.expired.map_or(J::Null, J::Bool)),
                         ])
                     })
                     .collect(),
@@ -4229,12 +4381,132 @@ pub fn tail_line(t: &Traffic, now_ms: u64, offset: i64, bodies: bool) -> String 
     line.trim_end().to_string()
 }
 
-fn tail_main(bodies: bool, from: Option<u64>, filter: Option<&str>) -> ExitCode {
+/// A record's metadata as JSON fields, the keys `aterm fabric --json`'s `traffic` carries.
+fn traffic_json(t: &Traffic) -> Vec<(&'static str, J)> {
+    vec![
+        ("off", J::Num(t.off)),
+        ("t_ms", J::Num(t.t_ms)),
+        (
+            "time",
+            if t.t_ms == 0 {
+                J::Null
+            } else {
+                J::Str(aterm_types::rfc3339::format_rfc3339(t.t_ms / 1000))
+            },
+        ),
+        ("from", J::s(&t.from)),
+        ("to", J::s(&t.to)),
+        ("kind", J::s(&t.kind)),
+        ("len", J::Num(t.len as u64)),
+        ("trust", J::s(t.trust)),
+    ]
+}
+
+/// The node and session a record's subject names: `/f/<F>/pub|in|term/<node>/<sid>/…`, the
+/// node an `n-` principal and the sid an `s-` one (a node's own face, a person's lane and the
+/// fleet's lanes name no session).
+fn subject_session<'a>(fleet: &str, subject: &'a str) -> (Option<&'a str>, Option<&'a str>) {
+    let segs: Vec<&str> = subject.split('/').collect();
+    let faced = segs.len() >= 6
+        && segs[0].is_empty()
+        && segs[1] == "f"
+        && segs[2] == fleet
+        && matches!(segs[3], "pub" | "in" | "term");
+    let named = |seg: &'a str, class: &str| {
+        Some(seg).filter(|s| s.starts_with(class) && crate::subject::is_principal(s))
+    };
+    match faced.then(|| named(segs[4], "n-")).flatten() {
+        Some(node) => (Some(node), named(segs[5], "s-")),
+        None => (None, None),
+    }
+}
+
+/// One `aterm fabric tail --json` line: the keys [`TAIL_KEYS`] names, in its order. `body`,
+/// only under `--bodies`, is the text `--bodies` prints in the table.
+#[must_use]
+pub fn tail_json(fleet: &str, subject: &str, t: &Traffic, bodies: bool) -> String {
+    let (node, sid) = subject_session(fleet, subject);
+    let mut fields = traffic_json(t);
+    fields.extend([
+        ("subject", J::s(subject)),
+        ("node", J::opt_s(node)),
+        ("sid", J::opt_s(sid)),
+    ]);
+    if bodies {
+        fields.push(("body", J::Str(safe(&t.text, crate::render::TEXT_CAP))));
+    }
+    let mut keyed = Vec::with_capacity(fields.len());
+    for key in TAIL_KEYS {
+        if let Some(i) = fields.iter().position(|(k, _)| *k == key) {
+            keyed.push(fields.swap_remove(i));
+        }
+    }
+    let mut out = String::new();
+    J::Obj(keyed).render(&mut out);
+    out
+}
+
+/// A gap notice as `tail --json` prints it: `{"gap":{"filter","from","to","records"}}`.
+fn tail_gap_json(filter: &str, gap: &astream_broker::Gap) -> String {
+    let mut out = String::new();
+    J::Obj(vec![(
+        "gap",
+        J::Obj(vec![
+            ("filter", J::s(filter)),
+            ("from", J::Num(gap.from)),
+            ("to", J::Num(gap.to)),
+            ("records", J::opt_n(gap.records)),
+        ]),
+    )])
+    .render(&mut out);
+    out
+}
+
+/// How `tail` prints: the table's lines, or one JSON object per line (`--json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TailFmt {
+    bodies: bool,
+    json: bool,
+    /// The local clock's offset from UTC, seconds (the table's TIME column).
+    offset: i64,
+}
+
+impl TailFmt {
+    const fn new(bodies: bool, json: bool) -> Self {
+        Self {
+            bodies,
+            json,
+            offset: 0,
+        }
+    }
+
+    fn record(self, fleet: &str, off: u64, subject: &str, raw: &[u8]) -> String {
+        let t = traffic_of(fleet, off, subject, raw);
+        if self.json {
+            tail_json(fleet, subject, &t, self.bodies)
+        } else {
+            tail_line(&t, crate::now_ms(), self.offset, self.bodies)
+        }
+    }
+
+    /// A gap notice: under `--json` the object it prints in line, else the line it says on
+    /// stderr (and `None`).
+    fn gap(self, filter: &str, gap: &astream_broker::Gap) -> Option<String> {
+        if self.json {
+            Some(tail_gap_json(filter, gap))
+        } else {
+            tail_gap(filter, gap);
+            None
+        }
+    }
+}
+
+fn tail_main(fmt: TailFmt, from: Option<u64>, filter: Option<&str>) -> ExitCode {
     let cfg = match configured() {
         Ok(cfg) => cfg,
         Err(code) => return code,
     };
-    match tail(&cfg, bodies, from, filter) {
+    match tail(&cfg, fmt, from, filter, &mut io::stdout().lock()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("aterm fabric tail: {e}");
@@ -4303,7 +4575,13 @@ fn is_subject_filter(f: &str) -> bool {
     })
 }
 
-fn tail(cfg: &Config, bodies: bool, from: Option<u64>, want: Option<&str>) -> io::Result<()> {
+fn tail(
+    cfg: &Config,
+    fmt: TailFmt,
+    from: Option<u64>,
+    want: Option<&str>,
+    out: &mut impl Write,
+) -> io::Result<()> {
     let broker = safe(&cfg.broker, 256);
     let (mut conn, closer) = transport::connect(&cfg.broker, IO_TIMEOUT)
         .map_err(|e| io::Error::new(e.kind(), format!("the broker at {broker}: {e}")))?;
@@ -4340,6 +4618,10 @@ fn tail(cfg: &Config, bodies: bool, from: Option<u64>, want: Option<&str>) -> io
         .map_or_else(|| whole.clone(), |f| f.join(" "));
     let start = from.unwrap_or(head);
     let offset = local_offset();
+    let fmt = TailFmt {
+        offset: offset.unwrap_or(0),
+        ..fmt
+    };
     eprintln!(
         "aterm fabric tail — {filter} on {broker}, from @{start}{} ({}); Ctrl-C stops{}",
         if from.is_some() {
@@ -4348,13 +4630,12 @@ fn tail(cfg: &Config, bodies: bool, from: Option<u64>, want: Option<&str>) -> io
             " (new records only)"
         },
         zone_label(offset),
-        if bodies {
+        if fmt.bodies {
             ""
         } else {
             "; bodies hidden (--bodies shows them)"
         }
     );
-    let mut out = io::stdout().lock();
     let header = format!(
         "{:<8} {:<8}  {:<10} {:>5}  {:<8} {:<42} {}",
         TRAFFIC_HEADER[0],
@@ -4365,28 +4646,30 @@ fn tail(cfg: &Config, bodies: bool, from: Option<u64>, want: Option<&str>) -> io
         TRAFFIC_HEADER[5],
         TRAFFIC_HEADER[6]
     );
-    if writeln!(out, "{header}")
-        .and_then(|()| out.flush())
-        .is_err()
+    if !fmt.json
+        && writeln!(out, "{header}")
+            .and_then(|()| out.flush())
+            .is_err()
     {
         return Ok(());
     }
     if let Some(faces) = faces {
         drop(conn);
-        return tail_faces(cfg, &faces, start, bodies, offset.unwrap_or(0), &mut out);
+        return tail_faces(cfg, &faces, start, fmt, out);
     }
     let mut sub = conn.subscribe(start, &filter)?;
     closer.set_read_timeout(None)?;
     loop {
         let read = sub.recv_live(&closer, astream_broker::IDLE_MARK_DEADLINE);
-        if let Some(gap) = sub.take_gap() {
-            tail_gap(&filter, &gap);
+        if let Some(line) = sub.take_gap().and_then(|gap| fmt.gap(&filter, &gap)) {
+            if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+                return Ok(());
+            }
         }
         let Some((off, subject, raw)) = read.map_err(|e| silent_link(e, &broker))? else {
             break;
         };
-        let t = traffic_of(&cfg.fleet, off, &subject, &raw);
-        let line = tail_line(&t, crate::now_ms(), offset.unwrap_or(0), bodies);
+        let line = fmt.record(&cfg.fleet, off, &subject, &raw);
         if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
             return Ok(());
         }
@@ -4419,17 +4702,22 @@ fn silent_link(e: io::Error, broker: &str) -> io::Error {
     }
 }
 
+/// What one face's reader hands [`tail_faces`]: a record, or a gap retention made in it.
+enum FaceRead {
+    Record(u64, String, Vec<u8>),
+    Gap(String, astream_broker::Gap),
+}
+
 fn tail_faces(
     cfg: &Config,
     faces: &[String],
     start: u64,
-    bodies: bool,
-    offset: i64,
+    fmt: TailFmt,
     out: &mut impl Write,
 ) -> io::Result<()> {
     use std::sync::mpsc;
     let broker = safe(&cfg.broker, 256);
-    let (tx, rx) = mpsc::sync_channel::<io::Result<(u64, String, Vec<u8>)>>(0);
+    let (tx, rx) = mpsc::sync_channel::<io::Result<FaceRead>>(0);
     for face in faces {
         let (mut conn, closer) = transport::connect(&cfg.broker, IO_TIMEOUT)?;
         transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
@@ -4441,11 +4729,13 @@ fn tail_faces(
         std::thread::spawn(move || loop {
             let read = sub.recv_live(&closer, astream_broker::IDLE_MARK_DEADLINE);
             if let Some(gap) = sub.take_gap() {
-                tail_gap(&face, &gap);
+                if tx.send(Ok(FaceRead::Gap(face.clone(), gap))).is_err() {
+                    return;
+                }
             }
             match read.map_err(|e| silent_link(e, &broker)) {
-                Ok(Some(rec)) => {
-                    if tx.send(Ok(rec)).is_err() {
+                Ok(Some((off, subject, raw))) => {
+                    if tx.send(Ok(FaceRead::Record(off, subject, raw))).is_err() {
                         return;
                     }
                 }
@@ -4465,15 +4755,21 @@ fn tail_faces(
     drop(tx);
     let mut printed: BTreeSet<u64> = BTreeSet::new();
     while let Ok(next) = rx.recv() {
-        let (off, subject, raw) = next?;
-        if !printed.insert(off) {
-            continue;
-        }
-        while printed.len() > 4096 {
-            printed.pop_first();
-        }
-        let t = traffic_of(&cfg.fleet, off, &subject, &raw);
-        let line = tail_line(&t, crate::now_ms(), offset, bodies);
+        let line = match next? {
+            FaceRead::Gap(face, gap) => match fmt.gap(&face, &gap) {
+                Some(line) => line,
+                None => continue,
+            },
+            FaceRead::Record(off, subject, raw) => {
+                if !printed.insert(off) {
+                    continue;
+                }
+                while printed.len() > 4096 {
+                    printed.pop_first();
+                }
+                fmt.record(&cfg.fleet, off, &subject, &raw)
+            }
+        };
         if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
             return Ok(());
         }
@@ -4595,6 +4891,7 @@ mod tests {
             parse_args(&argv("tail --filter /f/lab/pub/*/*/say/>")),
             Ok(Cmd::Tail {
                 bodies: false,
+                json: false,
                 from: None,
                 filter: Some("/f/lab/pub/*/*/say/>".to_string())
             })
@@ -4615,7 +4912,8 @@ mod tests {
             "status --filter /f/lab/>",
             "doctor --filter /f/lab/>",
             "status --bodies",
-            "tail --json",
+            "doctor --json",
+            "on --json",
             "tail --from",
             "tail --from x",
             "stats",
@@ -4637,6 +4935,205 @@ mod tests {
         ] {
             assert!(parse_args(&argv(bad)).is_err(), "{bad} must be refused");
         }
+    }
+
+    #[test]
+    fn tail_takes_json_beside_its_other_flags_and_the_others_name_where_it_is_valid() {
+        let tail = |bodies: bool, json: bool, from: Option<u64>| {
+            Ok(Cmd::Tail {
+                bodies,
+                json,
+                from,
+                filter: None,
+            })
+        };
+        assert_eq!(parse_args(&argv("tail --json")), tail(false, true, None));
+        assert_eq!(
+            parse_args(&argv("tail --bodies --json --from @5")),
+            tail(true, true, Some(5))
+        );
+        assert_eq!(parse_args(&argv("tail --bodies")), tail(true, false, None));
+        for verb in ["doctor", "on", "off", "mint-for h-jsmith"] {
+            let e = parse_args(&argv(&format!("{verb} --json"))).expect_err(verb);
+            assert!(
+                e.contains("`aterm fabric tail --json`") && e.contains("`aterm fabric --json`"),
+                "{verb}: {e}"
+            );
+        }
+        let help = usage();
+        assert!(
+            help.contains("aterm fabric tail [--bodies] [--json]"),
+            "{help}"
+        );
+        assert_lists(&help, &TAIL_KEYS, "the keys tail_json writes");
+    }
+
+    /// `help` prints `keys` as one whole list, and [`key_list`] names exactly them, in order.
+    fn assert_lists(help: &str, keys: &[&str], what: &str) {
+        let list = key_list(keys);
+        let named: Vec<&str> = list
+            .split_whitespace()
+            .map(|w| w.trim_matches('`'))
+            .collect();
+        assert_eq!(named, keys, "{what}: the list names them, in order");
+        assert!(
+            help.contains(&format!("\n{list}")),
+            "{what}: the help prints that list whole: {help}"
+        );
+    }
+
+    #[test]
+    fn the_help_lists_the_keys_the_brief_writes_for_each_session() {
+        let help = usage();
+        assert_lists(
+            &help,
+            &crate::fabric_brief::SESSION_KEYS,
+            "the keys session_json writes",
+        );
+        assert!(
+            !help.contains("@SESSION_KEYS@") && !help.contains("@TAIL_KEYS@"),
+            "every key list is filled: {help}"
+        );
+    }
+
+    #[test]
+    fn tail_from_reads_a_bus_offset_by_the_shared_grammar() {
+        for from in ["5", "@5"] {
+            let args = ["tail", "--from", from].map(str::to_string);
+            assert_eq!(
+                parse_args(&args),
+                Ok(Cmd::Tail {
+                    bodies: false,
+                    json: false,
+                    from: Some(5),
+                    filter: None,
+                }),
+                "{from}"
+            );
+        }
+        for from in ["+5", "@", "", "@-1"] {
+            let args = ["tail", "--from", from].map(str::to_string);
+            assert_eq!(
+                parse_args(&args),
+                Err(format!("--from {from} is not a bus offset")),
+                "{from}"
+            );
+        }
+    }
+
+    /// A writer that keeps what it is given and refuses a write once it holds `lines` lines,
+    /// as a closed pipe does (the tail then ends, as it does when its reader goes).
+    struct Lines {
+        got: Vec<u8>,
+        lines: usize,
+    }
+
+    impl Write for Lines {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            if self.got.iter().filter(|c| **c == b'\n').count() >= self.lines {
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            self.got.extend_from_slice(b);
+            Ok(b.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tail_json_prints_one_object_per_record_and_a_body_only_under_bodies() {
+        let dir = std::env::temp_dir().join(format!("atlink-tail-json-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let broker = crate::test_broker(dir.join("t.log")).expect("a broker");
+        let sock = dir.join("t.sock");
+        let mut server = broker.serve(&sock).expect("serves");
+        let (mut conn, _) = transport::connect(&sock.to_string_lossy(), IO_TIMEOUT).expect("dial");
+        let records = [
+            (
+                "/f/f1/in/n-a/s-x/h-jsmith/note",
+                "v=1 t=1700000000000 text=QZP8NOTE",
+            ),
+            ("/f/f1/pub/n-a/node/presence", "v=1 t=1700000000001 inc=3"),
+            (
+                "/f/f1/pub/n-a/s-x/presence",
+                "v=1 t=1700000000002 state=live",
+            ),
+        ];
+        let mut offs = Vec::new();
+        for (seq, (subject, body)) in (1..).zip(records) {
+            offs.push(
+                conn.publish(7, seq, subject, body.as_bytes())
+                    .expect("lands")
+                    .0,
+            );
+        }
+        let sock = sock.to_string_lossy().into_owned();
+        let cfg = crate::cli::parse(&[
+            "--fleet".to_string(),
+            "f1".to_string(),
+            "--broker".to_string(),
+            sock,
+        ])
+        .expect("a config")
+        .cfg;
+        for bodies in [false, true] {
+            let mut out = Lines {
+                got: Vec::new(),
+                lines: 2,
+            };
+            tail(&cfg, TailFmt::new(bodies, true), Some(0), None, &mut out)
+                .expect("the tail ends when its reader does");
+            let text = String::from_utf8(out.got).expect("utf-8");
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(
+                lines.len(),
+                2,
+                "{bodies}: no header, one line per record: {text}"
+            );
+            for (i, line) in lines.iter().enumerate() {
+                let v: aterm_json::Value = aterm_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("{bodies}: one JSON object: {e}: {line}"));
+                let aterm_json::Value::Object(map) = &v else {
+                    panic!("{bodies}: an object: {line}");
+                };
+                let keys: BTreeSet<&str> = map.keys().map(String::as_str).collect();
+                let want: BTreeSet<&str> = TAIL_KEYS
+                    .iter()
+                    .copied()
+                    .filter(|k| bodies || *k != "body")
+                    .collect();
+                assert_eq!(keys, want, "{bodies}: {line}");
+                let (subject, body) = records[i];
+                let field = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+                assert_eq!(
+                    v.get("off").and_then(aterm_json::Value::as_u64),
+                    Some(offs[i])
+                );
+                assert_eq!(field("subject"), Some(subject));
+                assert_eq!(field("node"), Some("n-a"));
+                assert_eq!(field("sid"), [Some("s-x"), None][i], "{line}");
+                assert_eq!(field("kind"), Some(["note", "presence"][i]));
+                let t = traffic_of("f1", offs[i], subject, body.as_bytes());
+                let table = tail_line(&t, 0, 0, true);
+                let printed = table.split_once("  text=").map_or("", |(_, text)| text);
+                assert_eq!(
+                    field("body"),
+                    bodies.then_some(printed),
+                    "{bodies}: the body is the text --bodies prints, and only under it"
+                );
+                assert_eq!(
+                    line.contains("QZP8NOTE"),
+                    bodies && i == 0,
+                    "{bodies}: {line}"
+                );
+            }
+        }
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6274,6 +6771,269 @@ mod tests {
         assert!(warnings(&r, &ages, &[]).is_empty(), "a note is not work");
     }
 
+    /// A bus where retention holds overdue asks below the `in` lanes' oldest and gave up the
+    /// verdicts of some ([`held_ask_bus`]).
+    #[cfg(unix)]
+    struct HeldAsk {
+        _server: astream_broker::BrokerHandle,
+        _broker: astream_broker::Broker,
+        _dir: aterm_tempfile::TempDir,
+        path: String,
+        /// The ask nothing answered or expired.
+        ask: u64,
+        /// The ask its asker's bridge expired, the `expired` given up.
+        lapsed: u64,
+        /// The ask the person answered, the answer given up.
+        answered: u64,
+        /// Each ask's `t=`.
+        t: u64,
+        /// When their deadlines are ten minutes past.
+        now: u64,
+        /// The bus head after the cut.
+        head: u64,
+        /// The node cap's faces (`enable::node_grants`), its group grant left out as
+        /// `readable_faces` leaves it.
+        node_faces: Vec<String>,
+    }
+
+    #[cfg(unix)]
+    impl HeldAsk {
+        fn dial(&self) -> Conn {
+            transport::connect(&self.path, aterm_spec::wait::MUST_HAPPEN)
+                .expect("connect")
+                .0
+        }
+    }
+
+    /// RETENTION HOLDS OVERDUE ASKS BELOW THE `in` LANES' OLDEST (audit finding BUS-1, on one
+    /// node): `s-one@n-a` asks the person `h-jsmith` three times with a deadline of 10 min, 20
+    /// min before `now`; the person lanes' reader group (`/f/lab/cur/p/node/inbox`) is one
+    /// nothing commits, so retention holds the asks. On `s-one`'s own lane, the person answers
+    /// the first (`answered`) and `s-one`'s bridge records the second expired (`lapsed`); the
+    /// third (`ask`) gets neither. Last, a mail between two of the node's sessions. The node's
+    /// inbox group reads all three, and the bulk stream's cut (aterm's rules, its bytes
+    /// scaled) gives them up past the asks, which raises their subjects' floors, and so the
+    /// oldest of the whole fleet's `in` lanes (`/f/lab/in/>`) and of the node cap's
+    /// `in/*/*/n-a/*`, above every ask. CONTROL (each filter): read on at its floor
+    /// (`transport::fetch_kept`, every read status made before audit fix unit F7), it misses
+    /// the asks.
+    #[cfg(unix)]
+    fn held_ask_bus(tag: &str) -> HeldAsk {
+        const BODY: u64 = 4096;
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(tag)
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let socket = dir.path().join("b.sock");
+        let broker = crate::test_broker(dir.path().join("b.log")).expect("a broker");
+        broker.set_retention_interval(Duration::from_secs(3600));
+        broker
+            .set_retention(crate::broker_rules::rules_scaled(
+                3 * BODY / 2,
+                1 << 30,
+                1 << 30,
+            ))
+            .expect("aterm's rules, scaled");
+        let server = broker.serve(&socket).expect("serve the broker");
+        let path = socket.to_string_lossy().into_owned();
+        let (mut writer, _) =
+            transport::connect(&path, aterm_spec::wait::MUST_HAPPEN).expect("connect");
+        let t = 1_000_000_u64;
+        let now = t + 20 * 60 * 1000;
+        let mut seq = 0u64;
+        let mut publish = |subject: &str, body: &str| {
+            seq += 1;
+            writer
+                .publish(91, seq, subject, body.as_bytes())
+                .unwrap_or_else(|e| panic!("publish on {subject}: {e}"))
+                .0
+        };
+        let to_person = format!(
+            "{}/ask",
+            crate::subject::person_lane("lab", "h-jsmith", "n-a")
+        );
+        let asked = format!("v=1 t={t} from=s-one dl=600000 text=which");
+        let answered = publish(&to_person, &asked);
+        publish(
+            &crate::subject::post_lane("lab", "n-a", "s-one", "h-jsmith", "answer"),
+            &format!("v=1 t=1 re={answered} text=yes"),
+        );
+        let lapsed = publish(&to_person, &asked);
+        publish(
+            &crate::subject::post_lane("lab", "n-a", "s-one", "n-a", "expired"),
+            &format!("v=1 t=1 re={lapsed} dl=600000 text=expired"),
+        );
+        let ask = publish(&to_person, &asked);
+        let read = publish(
+            &crate::subject::post_lane("lab", "n-a", "s-two", "n-a", "note"),
+            "v=1 t=1 from=s-one text=fyi",
+        );
+        let filler = "e".repeat(BODY as usize);
+        for _ in 0..3 {
+            publish("/f/lab/pub/n-a/s-one/ev", &filler);
+        }
+        writer
+            .commit(&crate::subject::inbox_group("lab", "n-a"), read)
+            .expect("the node's inbox group reads the answer, the verdict and the mail");
+        broker
+            .retention_tick_at(broker.now_ms())
+            .expect("the retention tick");
+        let (_, (_, head)) = writer.fetch(0, "/f/lab/>", 0).expect("the head");
+        let node_faces: Vec<String> = crate::enable::node_grants("lab", "n-a")
+            .iter()
+            .filter_map(|g| astream_cap::Grant::parse(g).ok())
+            .map(|g| g.filter)
+            .filter(|f| !f.starts_with("/f/lab/cur/"))
+            .collect();
+        for filter in ["/f/lab/in/>", "/f/lab/in/*/*/n-a/*"] {
+            let of = astream_wire::Filter::new(filter).expect("a filter");
+            assert!(
+                broker.oldest(&of) > ask,
+                "PRECONDITION: {filter}'s oldest lies above the asks retention holds"
+            );
+            let ((rows, _), floor) =
+                transport::fetch_kept(&mut writer, 0, filter, transport::POST_PAGE)
+                    .expect("a read on at the floor");
+            assert!(
+                floor.is_some() && rows.iter().all(|(off, _, _)| *off > ask),
+                "CONTROL: {filter} read on at its floor misses the held asks: {floor:?} {rows:?}"
+            );
+        }
+        HeldAsk {
+            _server: server,
+            _broker: broker,
+            _dir: dir,
+            path,
+            ask,
+            lapsed,
+            answered,
+            t,
+            now,
+            head,
+            node_faces,
+        }
+    }
+
+    /// `aterm fabric status` LISTS AN ASK RETENTION HOLDS BELOW THE `in` LANES' OLDEST, JUDGED ON
+    /// THE VERDICTS THE BUS KEEPS (audit fix unit F7, C12, finding BUS-1; [`held_ask_bus`]):
+    /// read told, the deadline scan over the whole fleet's `in` lanes and over the node cap's
+    /// `in` faces both list the ask nothing answered or expired (`expired` `Some(false)`), and
+    /// the one whose `expired` retention gave up with `expired` `None` (`null` in `--json`),
+    /// and leave out the one whose answer retention gave up: status cannot say it had none.
+    /// NEGATIVE CONTROLS (run): `overdue_work` reading through `transport::fetch_kept` lists
+    /// nothing; skipping its check of the asker's answers lists the answered ask; skipping its
+    /// check of the asker's `expired` verdicts says `Some(false)` for the lapsed one.
+    #[cfg(unix)]
+    #[test]
+    fn an_ask_held_below_the_in_lanes_oldest_is_listed_overdue() {
+        let bus = held_ask_bus("al-held-ask");
+        assert!(bus.answered < bus.lapsed && bus.lapsed < bus.ask);
+        for faces in [None, Some(bus.node_faces.as_slice())] {
+            let overdue = overdue_work(&mut bus.dial(), "lab", faces, bus.head, bus.now)
+                .expect("the deadlines");
+            assert_eq!(
+                overdue
+                    .iter()
+                    .map(|o| (o.off, o.expired))
+                    .collect::<Vec<_>>(),
+                vec![(bus.lapsed, None), (bus.ask, Some(false))],
+                "{faces:?}: {overdue:#?}"
+            );
+            let mut r = healthy();
+            r.overdue = overdue;
+            let json = render_json(&r);
+            assert!(
+                json.contains(&format!("{{\"off\":{},", bus.lapsed))
+                    && json.contains("\"expired\":null"),
+                "{json}"
+            );
+        }
+    }
+
+    /// THE LANE AN ASK'S VERDICTS LAND ON, AND THE FACES THAT READ IT (`verdict_lane`,
+    /// `filter_meet`): a session's ask (to a person or a session) is answered on its own lane,
+    /// a person's on the person's lane, an asker the record does not name on every lane; the
+    /// meet of two filters matches exactly what both match. NEGATIVE CONTROL (run): a meet
+    /// that takes the first filter's `*` over the second's literal fails it.
+    #[test]
+    fn an_asks_verdicts_are_read_on_its_askers_lane() {
+        let lane = |subject: &str, from: Option<&str>| verdict_lane("lab", subject, from);
+        assert_eq!(
+            lane("/f/lab/in/p/h-jsmith/n-a/ask", Some("s-one")),
+            "/f/lab/in/n-a/s-one/*"
+        );
+        assert_eq!(
+            lane("/f/lab/in/n-b/s-two/n-a/ask", Some("s-one")),
+            "/f/lab/in/n-a/s-one/*"
+        );
+        assert_eq!(
+            lane("/f/lab/in/n-a/s-one/h-jsmith/ask", None),
+            "/f/lab/in/p/h-jsmith/*"
+        );
+        for (subject, from) in [
+            ("/f/lab/in/n-b/s-two/n-a/ask", None),
+            ("/f/lab/in/n-b/s-two/n-a/ask", Some("s-Bad")),
+            ("/f/lab/in/n-b/s-two/s-one/ask", Some("s-one")),
+        ] {
+            assert_eq!(lane(subject, from), "/f/lab/in/*/*/*", "{subject} {from:?}");
+        }
+        let verdicts = "/f/lab/in/n-b/s-two/*/answer";
+        assert_eq!(
+            filter_meet(verdicts, "/f/lab/in/>").as_deref(),
+            Some(verdicts)
+        );
+        assert_eq!(
+            filter_meet(verdicts, "/f/lab/in/*/*/n-a/*").as_deref(),
+            Some("/f/lab/in/n-b/s-two/n-a/answer")
+        );
+        assert_eq!(
+            filter_meet("/f/lab/in/*/*/n-a/*", verdicts).as_deref(),
+            Some("/f/lab/in/n-b/s-two/n-a/answer")
+        );
+        assert_eq!(filter_meet(verdicts, "/f/lab/in/n-a/>"), None);
+        assert_eq!(filter_meet(verdicts, "/f/lab/in/*/*/*"), None);
+        assert_eq!(
+            filter_meet("/f/lab/in/>", "/f/lab/>").as_deref(),
+            Some("/f/lab/in/>")
+        );
+    }
+
+    /// A HELD RECORD BELOW ITS FILTER'S OLDEST HAS ITS AGE (`record_t`, [`held_ask_bus`]): read
+    /// told on a connection that asked for nothing before, the record at the ask's offset is
+    /// found on the whole fleet's `in` lanes and on the node cap's first `in` face. NEGATIVE
+    /// CONTROL (run): `record_t` reading with a plain `fetch` gets no age.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_held_below_the_in_lanes_oldest_has_its_age() {
+        let bus = held_ask_bus("al-held-age");
+        for faces in [None, Some(bus.node_faces.as_slice())] {
+            let mut fresh = bus.dial();
+            assert_eq!(
+                in_filters("lab", faces)
+                    .iter()
+                    .find_map(|f| record_t(&mut fresh, f, bus.ask)),
+                Some(bus.t),
+                "{faces:?}"
+            );
+        }
+    }
+
+    /// TRAFFIC SHOWS A RECORD HELD BELOW THE FLEET'S OLDEST (`last_records`,
+    /// [`held_ask_bus`]): the fleet's root reaches the bulk stream's class, so its oldest is the
+    /// cut, and read told the newest records include the ask held below it. NEGATIVE CONTROL
+    /// (run): `last_records` reading through `transport::fetch_kept` leaves it out.
+    #[cfg(unix)]
+    #[test]
+    fn traffic_shows_a_record_held_below_the_fleets_oldest() {
+        let bus = held_ask_bus("al-held-traffic");
+        let traffic = last_records(&mut bus.dial(), "lab", None, bus.head, TRAFFIC_ROWS)
+            .expect("the traffic");
+        assert!(
+            traffic.iter().any(|t| t.off == bus.ask && t.kind == "ask"),
+            "{traffic:#?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_status_reports_only_a_halt_a_bridge_applies() {
@@ -6378,8 +7138,12 @@ mod tests {
             rec(51, lane("n-b", "report"), "v=1 t=1 re=50 text=done"),
         ];
         let overdue = overdue_of("lab", &records, now);
-        let offs: Vec<(u64, bool)> = overdue.iter().map(|o| (o.off, o.expired)).collect();
-        assert_eq!(offs, vec![(40, false), (42, true)], "{overdue:#?}");
+        let offs: Vec<(u64, Option<bool>)> = overdue.iter().map(|o| (o.off, o.expired)).collect();
+        assert_eq!(
+            offs,
+            vec![(40, Some(false)), (42, Some(true))],
+            "{overdue:#?}"
+        );
         assert_eq!(overdue[0].late_ms, 10 * 60 * 1000);
         assert_eq!(overdue[0].from, "h-andrew");
         assert_eq!(overdue[0].to, "s-one@n-a");

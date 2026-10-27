@@ -30,7 +30,8 @@ fn going_in(on: &[(i64, String)], from: i64, until: i64, t0: i64) -> Option<Stri
         .map(|(t, rule)| format!("{rule} at +{}", at(t0, *t)))
 }
 
-fn unledgered(seen: &Seen, rule: &str, t: i64, t0: i64) -> Option<String> {
+/// Why the act of `rule` journaled at `t` is not one the ledger typed; `None` where it is.
+pub(super) fn unledgered(seen: &Seen, rule: &str, t: i64, t0: i64) -> Option<String> {
     seen.typed_row(rule, t)
         .is_none()
         .then(|| format!("{rule} journaled at +{} but NO ledger row typed", at(t0, t)))
@@ -701,7 +702,8 @@ fn gone_past(
 
 const CRUISE_AFTER_WALL_MS: i64 = 4 * 60_000 + PERSISTENCE_GRACE_MS + 60_000;
 
-fn named_backoff(seen: &Seen, tg: i64) -> Option<(i64, &str)> {
+/// The first short-turn back-off journaled after `tg`: its due (unix ms) and its line.
+pub(super) fn named_backoff(seen: &Seen, tg: i64) -> Option<(i64, &str)> {
     seen.journal
         .iter()
         .filter(|(t, l)| {

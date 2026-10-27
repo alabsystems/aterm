@@ -495,7 +495,8 @@ impl Grid {
                 StaleExtras::NONE
             };
 
-            if let Some(target) = row.cells_mut_with_fixup(cursor_col, to_write_u16) {
+            // Default-style bytes: the BCE blank an orphaned wide half takes is the empty cell.
+            if let Some(target) = row.cells_mut_with_fixup(cursor_col, to_write_u16, Cell::EMPTY) {
                 debug_assert_eq!(target.len(), to_write);
                 for (cell, &byte) in target.iter_mut().zip(remaining[..to_write].iter()) {
                     *cell = Cell::from_ascii_fast(byte);
@@ -614,7 +615,9 @@ impl Grid {
                 StaleExtras::NONE
             };
 
-            if let Some(target) = row.cells_mut_with_fixup(cursor_col, to_write_u16) {
+            if let Some(target) =
+                row.cells_mut_with_fixup(cursor_col, to_write_u16, Cell::bce_blank(colors))
+            {
                 debug_assert_eq!(target.len(), to_write);
                 for (cell, &byte) in target.iter_mut().zip(remaining[..to_write].iter()) {
                     *cell = Cell::from_ascii_styled(byte, colors, flags);

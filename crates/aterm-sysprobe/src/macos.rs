@@ -74,6 +74,11 @@ fn host_port() -> libc::mach_port_t {
 
 /// An integer sysctl (4 or 8 bytes, native-endian).
 pub(crate) fn sysctl_int(name: &CStr) -> Option<i64> {
+    sysctl_integer_result(name).ok()
+}
+
+/// The same integer read, retaining errno for diagnostic reports.
+pub(crate) fn sysctl_integer_result(name: &CStr) -> Result<i64, i32> {
     let mut buf = [0u8; 8];
     let mut len: libc::size_t = buf.len();
     // SAFETY: `name` is NUL-terminated; `buf` is writable for `len` bytes and
@@ -88,14 +93,15 @@ pub(crate) fn sysctl_int(name: &CStr) -> Option<i64> {
         )
     };
     if rc != 0 {
-        return None;
+        // SAFETY: __error is this thread's errno pointer.
+        return Err(unsafe { *libc::__error() });
     }
     match len {
-        4 => Some(i64::from(i32::from_ne_bytes([
+        4 => Ok(i64::from(i32::from_ne_bytes([
             buf[0], buf[1], buf[2], buf[3],
         ]))),
-        8 => Some(i64::from_ne_bytes(buf)),
-        _ => None,
+        8 => Ok(i64::from_ne_bytes(buf)),
+        _ => Err(libc::EINVAL),
     }
 }
 
@@ -432,6 +438,62 @@ pub(crate) fn cores_of(words: &[libc::integer_t], count: usize) -> Option<Vec<Co
     )
 }
 
+/// Kernel processor slots currently online (`PROCESSOR_BASIC_INFO`).
+pub(crate) fn online_processors() -> Result<Vec<u32>, String> {
+    let mut count: libc::natural_t = 0;
+    let mut info: libc::processor_info_array_t = std::ptr::null_mut();
+    let mut words: libc::mach_msg_type_number_t = 0;
+    // SAFETY: all output pointers are writable. Success maps words initialized
+    // integers, released below on every success path.
+    let rc = unsafe {
+        libc::host_processor_info(
+            host_port(),
+            iokit::PROCESSOR_BASIC_INFO,
+            &raw mut count,
+            &raw mut info,
+            &raw mut words,
+        )
+    };
+    if rc != 0 || info.is_null() {
+        return Err(format!("os_error:mach_{rc}"));
+    }
+    let len = words as usize;
+    // SAFETY: the mapped size is exactly the successful reply's word count.
+    let data = unsafe { std::slice::from_raw_parts(info, len) };
+    let result = online_processors_of(data, count as usize);
+    // SAFETY: release this call's out-of-line allocation with its exact size.
+    unsafe {
+        libc::vm_deallocate(
+            mach_task_self_,
+            info.addr(),
+            len * std::mem::size_of::<libc::integer_t>(),
+        )
+    };
+    result
+}
+
+/// Decode only complete SDK-layout records; inactive slots are not online.
+pub(crate) fn online_processors_of(
+    data: &[libc::integer_t],
+    count: usize,
+) -> Result<Vec<u32>, String> {
+    type Basic = iokit::processor_basic_info_data_t;
+    const WORD: usize = std::mem::size_of::<libc::integer_t>();
+    const WORDS: usize = iokit::PROCESSOR_BASIC_INFO_COUNT as usize;
+    const RUNNING: usize = std::mem::offset_of!(Basic, running) / WORD;
+    const SLOT: usize = std::mem::offset_of!(Basic, slot_num) / WORD;
+    const _: () = assert!(std::mem::size_of::<Basic>() == WORDS * WORD);
+    if count > 1024 || data.len() != count * WORDS {
+        return Err("unread_format:processor_basic_info".into());
+    }
+    data.as_chunks::<WORDS>()
+        .0
+        .iter()
+        .filter(|p| p[RUNNING] != 0)
+        .map(|p| u32::try_from(p[SLOT]).map_err(|_| "unread_format:processor_slot".to_owned()))
+        .collect()
+}
+
 /// [`crate::Probe::core_ticks`] on macOS.
 pub(crate) fn core_ticks() -> Option<Vec<CoreTicks>> {
     let mut count: libc::natural_t = 0;
@@ -532,17 +594,17 @@ fn perf_levels() -> Vec<Level> {
 }
 
 /// A +1 CoreFoundation object, released on drop.
-struct Cf(CFTypeRef);
+pub(crate) struct Cf(pub(crate) CFTypeRef);
 
 impl Cf {
     /// Adopt a +1 reference; `None` for NULL.
-    fn adopt(object: CFTypeRef) -> Option<Self> {
+    pub(crate) fn adopt(object: CFTypeRef) -> Option<Self> {
         // Lazy (`then`, not `then_some`) so a NULL pointer is never wrapped in `Cf` and passed to `CFRelease`.
         (!object.is_null()).then(|| Self(object))
     }
 
     /// A new CFString of `text`.
-    fn string(text: &CStr) -> Option<Self> {
+    pub(crate) fn string(text: &CStr) -> Option<Self> {
         // SAFETY: `text` is NUL-terminated UTF-8; the result is +1 or NULL.
         Self::adopt(
             unsafe {
@@ -557,7 +619,7 @@ impl Cf {
     }
 
     /// `entry`'s registry property `key`.
-    fn property(entry: io_registry_entry_t, key: CFTypeRef) -> Option<Self> {
+    pub(crate) fn property(entry: io_registry_entry_t, key: CFTypeRef) -> Option<Self> {
         // SAFETY: `entry` is a live registry entry and `key` a live CFString;
         // the result is +1 (the Create rule) or NULL.
         Self::adopt(unsafe {
@@ -574,7 +636,7 @@ impl Drop for Cf {
 }
 
 /// A borrowed CF value read as an integer.
-fn cf_u64(value: CFTypeRef) -> Option<u64> {
+pub(crate) fn cf_u64(value: CFTypeRef) -> Option<u64> {
     if value.is_null() {
         return None;
     }
@@ -602,7 +664,7 @@ fn cf_u64(value: CFTypeRef) -> Option<u64> {
 ///
 /// # Safety
 /// `value` is a live CF object that outlives the returned slice.
-unsafe fn cf_bytes<'a>(value: CFTypeRef) -> Option<&'a [u8]> {
+pub(crate) unsafe fn cf_bytes<'a>(value: CFTypeRef) -> Option<&'a [u8]> {
     // SAFETY: The caller's; the type is checked before the data is read, and
     // CFData's byte pointer is valid for its length while it lives.
     unsafe {
@@ -634,7 +696,7 @@ pub(crate) fn cluster_kind(bytes: &[u8]) -> Option<u8> {
 }
 
 /// A borrowed CF value as text: a CFString, or a CFData's bytes up to the first NUL.
-fn cf_text(value: CFTypeRef) -> Option<String> {
+pub(crate) fn cf_text(value: CFTypeRef) -> Option<String> {
     if value.is_null() {
         return None;
     }

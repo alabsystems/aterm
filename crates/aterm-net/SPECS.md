@@ -5,7 +5,8 @@
 
 > Status 2026-10-16: this is `aterm-net`'s migration worklist. Each of the 12 specs below is
 > proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
-> deleted. The one test in §4 that samples no spec is to be deleted now. No test has been deleted yet.
+> deleted. The one test in §4 that samples no spec was rewritten on 2026-10-27 as a one-minute hang
+> detector. No test has been deleted yet.
 >
 > Since the recovery pass (2026-10-16, the merge of the sessions-as-subagents work): the network
 > drive left this crate (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §7) — `drive.rs` with
@@ -138,7 +139,7 @@ src/tls.rs	a_wrong_fingerprint_pin_rejects_the_handshake	pinned-cert-verifier
 src/tls.rs	relay_ingests_a_full_record_followed_by_small_ones_without_tearing_down	relay-duplex-fidelity	
 src/slots.rs	real_listener_readiness_wakes_before_the_shutdown_interval	listener-readiness	poll-timeout-ceil
 src/slots.rs	idle_listener_readiness_wait_is_bounded_without_spinning	listener-readiness	poll-timeout-ceil (timing lower bound, §5.5)
-src/slots.rs	finishing_an_early_handshake_does_not_wait_out_a_wake_interval	(none: §4, delete)	watchdog-claim-exactly-once states its structural part
+src/slots.rs	finishing_an_early_handshake_wakes_the_watchdog_instead_of_waiting_out_its_deadline	(none: §4, keep)	watchdog-claim-exactly-once states its structural part
 src/slots.rs	spurious_wakes_neither_shorten_nor_starve_the_watchdog_deadline	watchdog-deadline-safety-and-liveness	watchdog-claim-exactly-once (0.8 slack, §5.4)
 src/slots.rs	a_newcomer_takes_only_an_unauthenticated_slot_by_the_rule	pick-displaced-rule	
 src/slots.rs	an_address_is_an_ipv4_address_or_an_ipv6_slash_64	source-of-slash64	
@@ -173,7 +174,7 @@ src/fleet_member_tests.rs	an_issuer_that_cannot_share_its_book_now_leaves_the_co
 
 | test | why | action |
 |---|---|---|
-| slots::finishing_an_early_handshake_does_not_wait_out_a_wake_interval | A latency budget: it asserts that the fastest of 10 `finish()` calls takes under 20 ms. AGENTS.md says a wait is a one-minute hang detector, never a latency budget. Its only non-timing assertion (`finish() == Claim::Authed` when nothing else claimed) is part of `watchdog-claim-exactly-once`. It also reads a `#[cfg(test)]`-only field (`waiting`) that exists for it alone. | **delete** (and the `waiting` field with it if nothing else reads it) |
+| slots::finishing_an_early_handshake_wakes_the_watchdog_instead_of_waiting_out_its_deadline | Was `finishing_an_early_handshake_does_not_wait_out_a_wake_interval`, a latency budget: the fastest of 10 `finish()` calls under 20 ms, which AGENTS.md rules out. Its `finish() == Claim::Authed` is part of `watchdog-claim-exactly-once`, but what the budget stood for is in no spec: `finish()` unparks the watchdog it joins, so an early handshake never blocks until the deadline. It reads a `#[cfg(test)]`-only field (`waiting`) that says the watchdog parked. | **rewritten** 2026-10-27: armed for ten minutes and parked, `finish()` returns `Authed` within the one-minute hang detector |
 
 No test is a pure regression of a removed bug with no general property. Every regression-shaped
 test (the silent dialer, the spurious wakes, the full-record ingest, the guarded-ack half-close) is an

@@ -71,6 +71,13 @@ fn a_relaunch_carries_the_provider_and_drops_what_the_session_keeps() {
     assert_eq!(rewrite_argv(&prompt, None), Ok(argv(&["--base-url", "u"])));
     let dashed = argv(&[STORE, "--", "--yolo", "resume"]);
     assert_eq!(rewrite_argv(&dashed, Some(S1)), Ok(argv(&["resume", S1])));
+    for attached in ["-cprovider=meta", "-c=provider=meta"] {
+        assert_eq!(
+            rewrite_argv(&argv(&[STORE, attached]), Some(S1)),
+            Ok(argv(&[attached, "resume", S1])),
+            "{attached}"
+        );
+    }
 }
 
 #[test]
@@ -113,6 +120,10 @@ fn a_worker_follows_how_its_starter_reaches_its_provider() {
         Ok(Vec::new())
     );
     assert_eq!(
+        provider_flags(&argv(&[STORE, "-cprovider=meta", "-c=provider=local"])),
+        Ok(argv(&["-cprovider=meta", "-c=provider=local"]))
+    );
+    assert_eq!(
         provider_flags(&argv(&[STORE, "--brand-new", "x", "--provider", "p"])),
         Err(ArgvRefusal::UnknownFlag("--brand-new".to_string()))
     );
@@ -128,10 +139,14 @@ fn a_launch_no_resume_carries_is_refused() {
     for (words, why) in [
         (&[STORE, "--no-session-log"][..], "--no-session-log"),
         (&[STORE, "-w"], "-w"),
+        (&[STORE, "-wcreate"], "-w"),
+        (&[STORE, "-w=create"], "-w"),
         (&[STORE, "--worktree", "create"], "--worktree"),
+        (&[STORE, "--worktree=create"], "--worktree"),
         (&[STORE, "--worktree-base", "HEAD"], "--worktree-base"),
         (&[STORE, "--workspace", "/w"], "--workspace"),
         (&[STORE, "exec", "hi"], "exec"),
+        (&[STORE, "usage"], "usage"),
         (&[STORE, "--base-url", "u", "login"], "login"),
         (&[STORE, "--help"], "--help"),
         (&[STORE, "resume", "-V"], "-V"),
@@ -145,6 +160,11 @@ fn a_launch_no_resume_carries_is_refused() {
     assert_eq!(
         rewrite_argv(&argv(&[STORE, "--brand-new", "resume"]), Some(S1)),
         Err(ArgvRefusal::UnknownFlag("--brand-new".to_string()))
+    );
+    assert_eq!(
+        rewrite_argv(&argv(&[STORE, "-hfoo"]), Some(S1)),
+        Err(ArgvRefusal::UnknownFlag("-hfoo".to_string())),
+        "a switch takes no attached value"
     );
     assert_eq!(
         rewrite_argv(&argv(&[STORE, "--model"]), Some(S1)),
@@ -173,6 +193,7 @@ fn only_the_interactive_tui_is_snapshotted() {
         &[STORE, "exec", "hi"][..],
         &[STORE, "--base-url", "u", "exec"],
         &[STORE, "skills"],
+        &[STORE, "--base-url", "u", "usage"],
         &[STORE, "--help"],
         &[STORE, "-V"],
         &[STORE, "--brand-new", "--version"],

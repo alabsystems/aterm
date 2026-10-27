@@ -278,16 +278,19 @@ fn a_seamless_update_carries_the_epoch_and_never_reissues_a_node_id() {
     let after = lines_of(&successor_tl);
     let s0 = 6 + LOG_SEQ_RESERVE;
     assert_eq!(read.sessions[0].log_seq, s0);
+    // Told the ids but not the log, the successor starts a space of its own at an epoch the
+    // allocator issues above its predecessor's 1: here the hand clock's seconds (C13's review).
+    let ep2 = WALL0 / 1000;
     assert_eq!(
         after[..2],
         [
             format!(
-                "{} gap - gap why=handoff epoch=2 build=7 by=aterm src=aterm conf=exact \
+                "{} gap - gap why=handoff epoch={ep2} build=7 by=aterm src=aterm conf=exact \
                  t={WALL0}",
                 s0 + 1
             ),
             format!(
-                "{} open - adopt epoch=2 state=alive src=aterm conf=exact t={WALL0}",
+                "{} open - adopt epoch={ep2} state=alive src=aterm conf=exact t={WALL0}",
                 s0 + 2
             ),
         ]
@@ -300,7 +303,10 @@ fn a_seamless_update_carries_the_epoch_and_never_reissues_a_node_id() {
         )),
         "{after:?}"
     );
-    assert_eq!(successor_tl.lock().unwrap().slog().log().ep(), 2);
+    assert_eq!(
+        u64::from(successor_tl.lock().unwrap().slog().log().ep()),
+        ep2
+    );
 
     {
         let mut g = producer_tl.lock().unwrap();
@@ -1545,7 +1551,7 @@ fn log_answers_its_header_then_one_record_per_line() {
     let log = sample_log();
     let reply = render_log(&log, &query(""));
     let mut it = reply.lines();
-    assert_eq!(it.next(), Some("OK 4 v=2 as_of=4 ep=3 oldest=1"));
+    assert_eq!(it.next(), Some("OK 4 v=2 as_of=4 ep=3 base=3 oldest=1"));
     let body: Vec<&str> = it.collect();
     assert_eq!(body.len(), 4);
     assert!(body[1].starts_with("2 open r1 cmd par=- blk=1 src=shell conf=strong t="));
@@ -1568,7 +1574,7 @@ fn log_answers_its_header_then_one_record_per_line() {
         1 + 2
     );
     let newest = render_log(&log, &query("n=1"));
-    assert!(newest.starts_with("OK 1 v=2 as_of=4 ep=3 oldest=1 more=3\n4 mark r1 title"));
+    assert!(newest.starts_with("OK 1 v=2 as_of=4 ep=3 base=3 oldest=1 more=3\n4 mark r1 title"));
     for bad in [
         "bogus",
         "r1 r2",
@@ -1578,9 +1584,17 @@ fn log_answers_its_header_then_one_record_per_line() {
         "tier=wire",
         "since=3",
         "n=-1",
+        "base=3",
+        "since=3 base=3",
+        "since=3 ep=3 base=x",
     ] {
         assert!(LogQuery::parse(bad).is_err(), "`{bad}` should be refused");
     }
+    assert_eq!(
+        query("since=3 ep=4 base=2").cursor,
+        Some(Cursor::new(4, 3).of_log(2))
+    );
+    assert_eq!(query("since=3 ep=4").cursor, Some(Cursor::new(4, 3)));
 }
 
 #[test]
@@ -1609,13 +1623,13 @@ fn log_tells_a_reader_behind_the_ring_or_of_another_epoch_with_a_gap_line() {
     let log = sample_log();
     let on = render_log(&log, &query("since=2 ep=3"));
     assert!(
-        on.starts_with("OK 2 v=2 as_of=4 ep=3 oldest=1\n3 mark "),
+        on.starts_with("OK 2 v=2 as_of=4 ep=3 base=3 oldest=1\n3 mark "),
         "{on}"
     );
     let stale = render_log(&log, &query("since=2 ep=2"));
     assert!(
         stale.starts_with(
-            "OK 5 v=2 as_of=4 ep=3 oldest=1\ngap why=reset lost=0 resync_to=0\n1 open - spawn"
+            "OK 5 v=2 as_of=4 ep=3 base=3 oldest=1\ngap why=reset lost=0 resync_to=0\n1 open - spawn"
         ),
         "{stale}"
     );
@@ -1639,14 +1653,14 @@ fn log_tells_a_reader_behind_the_ring_or_of_another_epoch_with_a_gap_line() {
     let behind = render_log(&small, &query("since=1 ep=1"));
     assert!(
         behind.starts_with(
-            "OK 2 v=2 as_of=6 ep=1 oldest=6 lost=4\ngap why=evicted lost=4 resync_to=5\n6 mark"
+            "OK 2 v=2 as_of=6 ep=1 base=1 oldest=6 lost=4\ngap why=evicted lost=4 resync_to=5\n6 mark"
         ),
         "{behind}"
     );
     let from_start = render_log(&small, &query(""));
     assert!(
         from_start.starts_with(
-            "OK 3 v=2 as_of=6 ep=1 oldest=6 lost=4\ngap why=evicted lost=4 resync_to=0\n1 open - spawn"
+            "OK 3 v=2 as_of=6 ep=1 base=1 oldest=6 lost=4\ngap why=evicted lost=4 resync_to=0\n1 open - spawn"
         ),
         "the pinned open first, the loss spread after it: {from_start}"
     );
@@ -1764,7 +1778,7 @@ fn cmd_log_reads_the_targets_log() {
     store.register(h.clone());
     let reply = crate::control::cmd_log(&h.ctx, "");
     assert!(
-        reply.starts_with("OK 1 v=2 as_of=1 ep=1 oldest=1\n1 open - spawn epoch=1 "),
+        reply.starts_with("OK 1 v=2 as_of=1 ep=1 base=1 oldest=1\n1 open - spawn epoch=1 "),
         "{reply}"
     );
     assert!(crate::control::cmd_log(&h.ctx, "since=1").starts_with("ERR usage: log since="));
@@ -1806,9 +1820,21 @@ fn brief_answers_the_targets_rollup_and_all_of_them_for_the_owner() {
         "{all}"
     );
     assert!(!body.iter().any(|l| l.starts_with("OK ")), "{all}");
-    for bad in ["t1 t2", "budget=x", "all since=1 ep=1", "since=1", "nope"] {
+    for bad in [
+        "t1 t2",
+        "budget=x",
+        "all since=1 ep=1",
+        "since=1",
+        "nope",
+        "base=1",
+        "all since=1 ep=1 base=1",
+    ] {
         assert!(BriefQuery::parse(bad).is_err(), "`{bad}`");
     }
+    assert_eq!(
+        BriefQuery::parse("since=1 ep=2 base=1").map(|q| q.cursor),
+        Ok(Some(Cursor::new(2, 1).of_log(1)))
+    );
 }
 
 #[test]
@@ -5208,7 +5234,8 @@ fn two_crash_adoptions_in_one_second_take_growing_epochs() {
     }
     assert_eq!(
         crate::keeper_link::registration_tag(&s, 1, None).slog_ep,
-        Some(7)
+        u32::try_from(WALL0 / 1000).ok(),
+        "an uncarried adoption's epoch, above its predecessor's 6 (C13's review)"
     );
 }
 
@@ -6181,7 +6208,7 @@ fn a_predecessors_cursor_resets_on_a_relaunch_under_the_same_sid() {
 }
 
 #[test]
-fn a_cursor_of_another_session_resets() {
+fn an_uncarried_sessions_cursor_resets_in_another_session() {
     let epochs = process(None);
     let a = spawned_in(&epochs, 0, 6);
     let b = spawned_in(&epochs, 0, 10);
@@ -6201,6 +6228,169 @@ fn a_cursor_of_another_session_resets() {
         "{reply}"
     );
     assert_ne!(a.log().ep(), b.log().ep(), "one second, two epochs");
+}
+
+/// `pred` carried through a seamless update into a log of the process `epochs` stands for: its
+/// manifest's ids and seq count and its carry's lines, adopted as `adopt` adopts them.
+fn carried_in(epochs: &Arc<Epochs>, pred: &mut SessionLog, ms: u64) -> SessionLog {
+    let ids = pred.handoff_carry();
+    let seq = pred.handoff_seq();
+    let lines = pred
+        .carry_source()
+        .encode(aterm_slog::CarryBudget::SESSION)
+        .expect("carried")
+        .lines;
+    let mut next = SessionLog::starting(Arc::clone(epochs), at(ms));
+    next.set_clock(Clock::reading(move || at(ms)));
+    next.adopt(
+        LogAdopt {
+            ids: Some(ids),
+            seq,
+            lines: Some(lines),
+            ..LogAdopt::default()
+        },
+        false,
+        None,
+        at(ms),
+    );
+    assert!(next.log_carried(), "PRECONDITION: the carry was adopted");
+    next
+}
+
+/// The first body line of a `log` reply, if it says a gap: `gap why=<w> …`.
+fn gap_of(reply: &str) -> Option<&str> {
+    reply.lines().nth(1).filter(|l| l.starts_with("gap why="))
+}
+
+/// C13 (ROBUST-3): two logs spawned in one second hold epochs E and E+1, and once both are
+/// carried through an update A spans [E, E+1] and B [E+1, E+2], so B's pre-update cursor sits in
+/// A's range. Given with B's `log_base=`, A answers it `gap why=reset`; A's own cursor, given
+/// with A's base, reads on; with no `base=` the read is as before.
+#[test]
+fn another_carried_logs_cursor_resets_when_it_names_its_log() {
+    let before = process(None);
+    let mut a = spawned_in(&before, 0, 6);
+    let mut b = spawned_in(&before, 0, 10);
+    let (e, base_a, base_b) = (a.log().ep(), a.log().base_ep(), b.log().base_ep());
+    assert_eq!(
+        b.log().ep(),
+        e + 1,
+        "PRECONDITION: one second, consecutive epochs"
+    );
+    let b_cursor = format!("since=4 ep={}", b.log().ep());
+    let after = process(None);
+    let a2 = carried_in(&after, &mut a, 5_000);
+    let b2 = carried_in(&after, &mut b, 5_000);
+    assert_eq!(
+        (
+            a2.log().base_ep(),
+            a2.log().ep(),
+            b2.log().base_ep(),
+            b2.log().ep()
+        ),
+        (base_a, e + 1, base_b, e + 2),
+        "PRECONDITION: a carry keeps its base and takes ep+1, so the ranges overlap"
+    );
+    assert_ne!(base_a, base_b, "two logs, two bases");
+    let named = render_log(a2.log(), &query(&format!("{b_cursor} base={base_b}")));
+    assert!(
+        gap_of(&named).is_some_and(|g| g.starts_with("gap why=reset ")),
+        "B's cursor, naming B, read on in A: {named}"
+    );
+    assert!(
+        named
+            .lines()
+            .nth(2)
+            .is_some_and(|l| l.starts_with("1 open - spawn ")),
+        "a reset reads A from its start: {named}"
+    );
+    let unnamed = render_log(a2.log(), &query(&b_cursor));
+    assert!(
+        gap_of(&unnamed).is_none_or(|g| !g.starts_with("gap why=reset ")),
+        "with no base= the read is as before (ROBUST-3's hole, which base= closes): {unnamed}"
+    );
+    let own = render_log(a2.log(), &query(&format!("since=4 ep={e} base={base_a}")));
+    assert!(
+        gap_of(&own).is_none_or(|g| !g.starts_with("gap why=reset ")),
+        "A's own cursor reads on: {own}"
+    );
+    assert!(
+        own.lines().any(|l| l.starts_with("5 mark ")),
+        "A's records after its cursor: {own}"
+    );
+    let header = own.lines().next().unwrap_or_default();
+    assert!(
+        header.contains(&format!(" ep={} base={base_a} ", e + 1)),
+        "the header names A's base beside its epoch: {header}"
+    );
+}
+
+/// C13's review: an adoption told its predecessor's ids but not its log starts a space of its
+/// own, and its base comes from the allocator, above every epoch of the update noted before any
+/// session adopts ([`Epochs::note_handoff`]), never a plain `+ 1` that the log spawned beside its
+/// predecessor in the same second keeps as its carried base. A and B spawn in one second (E,
+/// E+1); in the same second the update adopts A uncarried, then carries B: no two logs share a
+/// base, and each one's cursor, naming its log, resets in the other.
+#[test]
+fn an_uncarried_adoption_takes_a_base_no_carried_log_keeps() {
+    let before = process(None);
+    let mut a = spawned_in(&before, 0, 6);
+    let mut b = spawned_in(&before, 0, 10);
+    let e = a.log().ep();
+    assert_eq!(
+        b.log().ep(),
+        e + 1,
+        "PRECONDITION: one second, consecutive epochs"
+    );
+    let base_b = b.log().base_ep();
+    let b_cursor = format!("since=4 ep={} base={base_b}", b.log().ep());
+    let rows = [a.handoff_carry().row(), b.handoff_carry().row()];
+    let after = process(None);
+    after.note_handoff(rows.iter().map(String::as_str));
+    let mut a2 = SessionLog::starting(Arc::clone(&after), at(500));
+    a2.set_clock(Clock::reading(move || at(500)));
+    a2.adopt(
+        LogAdopt {
+            ids: Some(a.handoff_carry()),
+            seq: a.handoff_seq(),
+            ..LogAdopt::default()
+        },
+        false,
+        None,
+        at(500),
+    );
+    a2.open_session(None, None, at(500));
+    for _ in 0..6 {
+        a2.human_input(true, at(500));
+    }
+    assert!(!a2.log_carried(), "PRECONDITION: A's log was not carried");
+    let b2 = carried_in(&after, &mut b, 500);
+    let bases = [a2.log().base_ep(), b2.log().base_ep()];
+    assert_ne!(
+        bases[0],
+        bases[1],
+        "two logs of one process share a base: A2 (base, ep) ({}, {}), B2 ({}, {})",
+        bases[0],
+        a2.log().ep(),
+        bases[1],
+        b2.log().ep()
+    );
+    assert!(
+        a2.log().ep() > e,
+        "the uncarried successor is above its predecessor: {e} then {}",
+        a2.log().ep()
+    );
+    let in_a = render_log(a2.log(), &query(&b_cursor));
+    assert!(
+        gap_of(&in_a).is_some_and(|g| g.starts_with("gap why=reset ")),
+        "B's cursor, naming B, read on in A's successor: {in_a}"
+    );
+    let a_cursor = format!("since=2 ep={} base={}", a2.log().ep(), a2.log().base_ep());
+    let in_b = render_log(b2.log(), &query(&a_cursor));
+    assert!(
+        gap_of(&in_b).is_some_and(|g| g.starts_with("gap why=reset ")),
+        "A's successor's cursor, naming it, read on in B's: {in_b}"
+    );
 }
 
 #[test]

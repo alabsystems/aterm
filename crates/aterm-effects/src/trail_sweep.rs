@@ -21,7 +21,7 @@ pub fn line_cells_tail(
     let dc = (i64::from(destination.1) - i64::from(origin.1)).abs();
     let major = dr.max(dc);
     let available = major + i64::from(include_destination);
-    let keep = available.min(i64::try_from(limit).unwrap_or(i64::MAX));
+    let keep = available.min(limit.min(i64::MAX as usize) as i64);
     if keep <= 0 {
         return;
     }

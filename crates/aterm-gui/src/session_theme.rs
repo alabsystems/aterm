@@ -260,6 +260,12 @@ impl App {
                     let mut term = crate::term_lock(&session.term);
                     let changes = term.apply_config(&tc);
                     session.ctx.crash_journal.host_settings(&term, Some(&tc));
+                    session
+                        .ctx
+                        .temporal
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .set_replay_config(Some(Arc::clone(&tc)));
                     (changes.contains(&aterm_core::config::ConfigChange::ColorScheme)
                         && term.report_color_scheme_enabled())
                     .then(|| term.take_response())

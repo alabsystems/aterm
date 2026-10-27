@@ -99,6 +99,7 @@ pub const fn nuke_nat_size(part: NukePart, cell_w: u16, cell_h: u16) -> (u16, u1
 }
 
 /// Bake `part` at `w x h` in white for per-sprite tinting.
+#[inline]
 #[must_use]
 pub fn bake_nuke(w: u16, h: u16, part: NukePart) -> Tile {
     let mut tile = Tile::new(u32::from(w), u32::from(h));
@@ -108,6 +109,7 @@ pub fn bake_nuke(w: u16, h: u16, part: NukePart) -> Tile {
 
 /// Paint `part` onto a cleared `tile` at its current dimensions in white for
 /// per-sprite tinting.
+#[inline]
 pub fn paint_nuke(tile: &mut Tile, part: NukePart) {
     let (w, h) = (tile.width(), tile.height());
     if w == 0 || h == 0 {

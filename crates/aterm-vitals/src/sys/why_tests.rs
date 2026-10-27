@@ -26,6 +26,7 @@ struct World {
 fn world(family: &'static str, tabs: u64) -> World {
     World {
         machine: Machine {
+            executable: None,
             cpu: Some("Apple M5 Max".into()),
             os: Some("macOS 27.0".into()),
             family,
@@ -391,6 +392,202 @@ cannot what=uncharged_memory why=unsupported
             assert!(!l.contains("cpu_mc="), "{l}");
         }
     }
+}
+
+/// [`mem_1142`] with fseventsd holding 44.4 GiB, as on 2026-10-22, its lead signed as
+/// `signing_id`.
+fn fseventsd_1142(signing_id: &str) -> Scene {
+    let mut scene = mem_1142();
+    let born = USERSPACE_MS + 2_000;
+    scene.coalitions.push(Coal {
+        footprint: Some(47_675_000_000),
+        ..Coal::new(777, 0)
+    });
+    scene
+        .procs
+        .push(Proc::new(537, 1, 0, 777, born, "fseventsd", 0));
+    scene.leads.push(apple(537, born, "fseventsd", signing_id));
+    scene
+}
+
+/// `scene` with the kernel's memory pressure past normal.
+fn pressed(mut scene: Scene) -> Scene {
+    if let Some(mem) = scene.mem.as_mut() {
+        mem.pressure = Pressure::Warn;
+    }
+    scene
+}
+
+/// The service-memory cause lines of a reply.
+fn service_causes(t: &str) -> Vec<&str> {
+    lines(t, "cause")
+        .into_iter()
+        .filter(|l| l.contains("id=service-memory"))
+        .collect()
+}
+
+/// A service past the huge bar while memory is under pressure is memory's headline and a cause
+/// line for every caller, its pid only for the owner's; a restart aterm knows is the reply's
+/// `do`, so it never says nothing is needed nor that no remedy exists. NEGATIVE CONTROL: the
+/// same service with memory not under pressure is a cause and no `do`; one whose alert the
+/// person put off for that process offers no restart and claims no missing remedy; a look-alike
+/// not signed as fseventsd gets no restart, and the reply says no remedy exists.
+#[test]
+fn a_huge_service_under_pressure_is_the_cause_and_its_restart_the_step() {
+    let w = mac();
+    let s = read_at(&pressed(fseventsd_1142("com.apple.fseventsd")), 3);
+    assert_eq!(subject_word(&q("why"), Some(&s)), Some("global.mem"));
+    for owner in [true, false] {
+        let c = ctx(&w, &s, owner);
+        let t = why("why", &c);
+        assert!(
+            lines(&t, "why")[0].contains("; macOS's fseventsd holds 44.4 GiB; "),
+            "{t}"
+        );
+        let cause = service_causes(&t);
+        assert_eq!(cause.len(), 1, "{t}");
+        let pid = if owner { " pid=537 coalition=777" } else { "" };
+        assert_eq!(
+            cause[0],
+            format!(
+                "cause id=service-memory exe=fseventsd uid=0 fp_bytes=47675000000 size=huge \
+                 restart=fseventsd{pid} sure=held src=kernel"
+            )
+        );
+        assert_eq!(
+            lines(&t, "do"),
+            ["do class=restart service=fseventsd may=person destructive=1"]
+        );
+        assert!(!t.contains("what=remedy"), "{t}");
+        let j = render_json(&q("why --json"), &c);
+        assert_eq!(contract_violations(&j), Vec::<String>::new());
+        let text = j.to_text();
+        assert!(
+            text.contains(
+                r#""do":[{"class":"restart","service":"fseventsd","may":"person","destructive":1}]"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"{"cause":"service-memory","sure":"held","exe":"fseventsd","size":"huge""#
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            text.contains(r#""pid":537,"coalition":777"#),
+            owner,
+            "{text}"
+        );
+    }
+
+    let calm = read_at(&fseventsd_1142("com.apple.fseventsd"), 3);
+    let t = why("why mem", &ctx(&w, &calm, true));
+    assert_eq!(service_causes(&t).len(), 1, "{t}");
+    assert!(
+        lines(&t, "do").iter().all(|l| !l.contains("class=restart")),
+        "no pressure: a fact for later: {t}"
+    );
+
+    let mut filed = s.clone();
+    filed.services_filed = crate::services::over_in(&s)
+        .iter()
+        .map(|o| o.episode.clone())
+        .collect();
+    assert_eq!(filed.services_filed.len(), 1);
+    let t = why("why mem", &ctx(&w, &filed, true));
+    assert_eq!(service_causes(&t).len(), 1, "{t}");
+    assert!(lines(&t, "do").is_empty(), "put off: {t}");
+    assert!(!t.contains("what=remedy"), "{t}");
+
+    let s = read_at(&pressed(fseventsd_1142("com.example.fseventsd")), 3);
+    let t = why("why mem", &ctx(&w, &s, true));
+    assert!(service_causes(&t)[0].contains(" restart=none "), "{t}");
+    assert!(lines(&t, "do").is_empty(), "{t}");
+    assert_eq!(
+        lines(&t, "cannot")[0],
+        "cannot what=remedy why=unsupported",
+        "{t}"
+    );
+}
+
+/// A service past only the large bar is a cause line of `why mem` and nothing more: no
+/// restart, a headline of its own, and a bare `why` that it does not turn to memory.
+/// NEGATIVE CONTROL: past the huge bar it turns a bare `why` to memory and leads it.
+#[test]
+fn a_service_past_only_the_large_bar_is_a_fact_for_later() {
+    let w = mac();
+    let mut scene = pressed(fseventsd_1142("com.apple.fseventsd"));
+    for c in &mut scene.coalitions {
+        if c.id == 777 {
+            c.footprint = Some(10 << 30);
+        }
+    }
+    let s = read_at(&scene, 3);
+    let t = why("why mem", &ctx(&w, &s, true));
+    let cause = service_causes(&t);
+    assert_eq!(cause.len(), 1, "{t}");
+    assert!(cause[0].contains(" size=large "), "{t}");
+    assert!(
+        lines(&t, "do").iter().all(|l| !l.contains("class=restart")),
+        "{t}"
+    );
+    assert!(!lines(&t, "why")[0].contains("macOS's fseventsd"), "{t}");
+    let calm = read_at(
+        &{
+            let mut calm = scene.clone();
+            if let Some(mem) = calm.mem.as_mut() {
+                mem.pressure = Pressure::Normal;
+            }
+            calm
+        },
+        3,
+    );
+    assert_ne!(subject_word(&q("why"), Some(&calm)), Some("global.mem"));
+    let huge = read_at(&fseventsd_1142("com.apple.fseventsd"), 3);
+    assert_eq!(subject_word(&q("why"), Some(&huge)), Some("global.mem"));
+}
+
+/// With the split by coalition cold (no Deck in view), the reply names the service from its
+/// own read ([`Snapshot::services`]): memory is the bare reply's subject, with the cause line
+/// and, under pressure, the restart. NEGATIVE CONTROL: the same snapshot without that read
+/// names none.
+#[test]
+fn a_service_is_named_from_its_own_read_while_the_split_is_cold() {
+    use crate::services::{FSEVENTSD, Reading, Service};
+    let w = mac();
+    let mut s = read_at(&pressed(mem_1142()), 3);
+    s.why = None;
+    let t = why("why mem", &ctx(&w, &s, true));
+    assert!(service_causes(&t).is_empty(), "{t}");
+    s.services = Some(std::sync::Arc::new(Reading {
+        total: 128 << 30,
+        services: vec![Service {
+            coalition: 245,
+            pid: 537,
+            uid: 0,
+            name: "fseventsd".into(),
+            path: Some(FSEVENTSD.path.into()),
+            live: 1,
+            footprint: 152_000_000_000,
+            ..Service::default()
+        }],
+        ..Reading::default()
+    }));
+    assert_eq!(subject_word(&q("why"), Some(&s)), Some("global.mem"));
+    let t = why("why", &ctx(&w, &s, true));
+    assert_eq!(
+        service_causes(&t),
+        [
+            "cause id=service-memory exe=fseventsd uid=0 fp_bytes=152000000000 size=huge \
+          restart=fseventsd pid=537 coalition=245 sure=held src=kernel"
+        ],
+        "{t}"
+    );
+    assert_eq!(
+        lines(&t, "do"),
+        ["do class=restart service=fseventsd may=person destructive=1"]
+    );
 }
 
 #[test]

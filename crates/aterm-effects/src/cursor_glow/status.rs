@@ -70,14 +70,9 @@ impl AdmissionRecord {
     pub const LICENCE_NONE: &'static str = "none";
 
     /// Format one diagnostic line in the `trail` verb's row shape.
+    #[inline]
     #[must_use]
     pub fn line(&self, now: Instant) -> String {
-        let source_view = self
-            .source
-            .map_or_else(|| "-".to_string(), |s| s.view.to_string());
-        let source_session = self
-            .source
-            .map_or_else(|| "-".to_string(), |s| s.session.to_string());
         format!(
             "admission seq={} phase={} reason={} age_ms={:.0} origin={},{} target={},{} alt={} licence={} source={} source_view={} source_session={}",
             self.seq,
@@ -95,8 +90,14 @@ impl AdmissionRecord {
             } else {
                 "unknown"
             },
-            source_view,
-            source_session,
+            std::fmt::from_fn(|f| match self.source {
+                Some(s) => write!(f, "{}", s.view),
+                None => f.write_str("-"),
+            }),
+            std::fmt::from_fn(|f| match self.source {
+                Some(s) => write!(f, "{}", s.session),
+                None => f.write_str("-"),
+            }),
         )
     }
 }
@@ -174,6 +175,7 @@ impl AdmissionLog {
         true
     }
 
+    #[inline]
     pub(super) const fn push(&mut self, mut record: AdmissionRecord) {
         self.seq += 1;
         record.seq = self.seq;
@@ -230,11 +232,12 @@ impl AdmissionLog {
     }
 
     /// Entries oldest → newest.
+    #[inline]
     pub(super) fn iter(&self) -> impl Iterator<Item = &AdmissionRecord> {
         self.records[self.head..]
             .iter()
             .chain(&self.records[..self.head])
-            .filter_map(Option::as_ref)
+            .flatten()
     }
 }
 
@@ -440,6 +443,7 @@ impl TrailStatus<'_> {
     }
 
     /// Format the `trail status` wire tail.
+    #[inline]
     #[must_use]
     pub fn line(&self) -> String {
         debug_assert!(
@@ -548,6 +552,7 @@ impl TrailStatus<'_> {
     }
 
     /// Format [`Self::line`] plus rainbow kitty v2 status rows.
+    #[inline]
     #[must_use]
     pub fn line_v2(&self, v2: Option<rk::Status>) -> String {
         let mut line = self.line();
@@ -775,6 +780,7 @@ impl CursorGlow {
     }
 
     /// Recompute [`Self::probed_spans`] after rotating or lifting the previous row probe.
+    #[inline]
     pub(super) const fn refresh_probed_text_spans(&mut self) {
         let mut spans = TextSpans::EMPTY;
         let Some(m) = self.row_prev_meta.as_ref() else {
@@ -904,6 +910,8 @@ impl CursorGlow {
         #[cfg(any(test, debug_assertions))]
         if self.fold_rows.unwrap_or(cfg!(test)) {
             self.out_ramps.flatten_into(out);
+            self.ink_ledger
+                .fold_rails(&self.under_ramps, self.under_out.len());
             self.under_ramps.flatten_into(&mut self.under_out);
         }
         #[cfg(not(any(test, debug_assertions)))]
@@ -925,6 +933,7 @@ impl CursorGlow {
     /// [`Self::under_quads`] with every lit ramp row the quad it stands for,
     /// in draw order, however the tick laid it.
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     #[must_use]
     pub fn under_laid(&self) -> Vec<GlowQuad> {
         let mut all = Vec::new();
@@ -935,6 +944,7 @@ impl CursorGlow {
     /// A test's read of the last tick's whole `out` stream: `out` with every
     /// lit row of [`Self::out_ramps`] the quad it stands for, in draw order.
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     #[must_use]
     pub fn out_laid(&self, out: &[GlowQuad]) -> Vec<GlowQuad> {
         let mut all = Vec::new();
@@ -1114,11 +1124,20 @@ impl TextSpans {
         false
     }
 
-    /// Each probed line of text as `(row, first, end)`: the column span from
-    /// its first glyph to one past its last.
+    /// Probed lines packed from slot 0 with no `None` gaps.
     #[inline]
-    pub(super) fn lines(&self) -> impl Iterator<Item = (i32, i32, i32)> + '_ {
-        self.rows.iter().flatten().copied()
+    pub(super) const fn packed_rows(&self) -> [Option<(i32, i32, i32)>; 3] {
+        let mut out = [None; 3];
+        let mut dst = 0;
+        let mut src = 0;
+        while src < 3 {
+            if let Some(line) = self.rows[src] {
+                out[dst] = Some(line);
+                dst += 1;
+            }
+            src += 1;
+        }
+        out
     }
 
     /// A test's probe of up to three lines `(row, first, end)`, each row read.
@@ -1268,6 +1287,19 @@ impl<'a> TextView<'a> {
             Some(Some((first, end))) => col >= first && col < end,
             _ => false,
         }
+    }
+
+    /// Whether window pixel `(x, y)` lies in a cell on a line of text the frame shows.
+    #[inline]
+    pub(crate) const fn covers_px(
+        &self,
+        (x, y): (f32, f32),
+        (ox, oy): (f32, f32),
+        (inv_cw, inv_ch): (f32, f32),
+    ) -> bool {
+        let row = ((y - oy) * inv_ch).floor() as i32;
+        let col = ((x - ox) * inv_cw).floor() as i32;
+        self.covers_cell(row, col)
     }
 
     /// Whether grid row `row` was read and contains no glyphs.

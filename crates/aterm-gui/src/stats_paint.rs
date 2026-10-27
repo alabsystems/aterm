@@ -62,17 +62,20 @@ pub(crate) enum Instrument {
     Processes,
     /// The header line's "How to read" lens.
     HowToRead,
+    /// Authenticated peer history and shared-service access.
+    NetworkState,
 }
 
 impl Instrument {
     /// The rows' instruments in the lens's ←/→ order.
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Cpu,
         Self::Gpu,
         Self::Memory,
         Self::Disk,
         Self::Network,
         Self::Processes,
+        Self::NetworkState,
     ];
 
     /// The instrument of a deck row.
@@ -98,7 +101,7 @@ impl Instrument {
             Self::Network => Resource::Network,
             Self::Tokens => Resource::Tokens,
             Self::Processes => Resource::Processes,
-            Self::HowToRead => return None,
+            Self::HowToRead | Self::NetworkState => return None,
         })
     }
 
@@ -106,6 +109,7 @@ impl Instrument {
     pub(crate) const fn word(self) -> &'static str {
         match self.resource() {
             Some(res) => words::resource_name(res),
+            None if matches!(self, Self::NetworkState) => "Network State",
             None => "How to read",
         }
     }
@@ -130,6 +134,8 @@ impl Bar {
 /// Target kind of a stats hit region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum HitKind {
+    /// One stable machine or service cell in the network rows.
+    Network(crate::network_deck::Target),
     /// A row, or one of its scope cells.
     Row(Instrument, Bar),
     /// The cores block, or the Cores row: the lens on CPU, cores well.
@@ -177,6 +183,7 @@ impl Hit {
             HitKind::Row(instrument, _) => instrument,
             HitKind::Cores => Instrument::Cpu,
             HitKind::Header => Instrument::HowToRead,
+            HitKind::Network(_) => Instrument::NetworkState,
         }
     }
 
@@ -184,7 +191,7 @@ impl Hit {
     pub(crate) const fn bar(self) -> Bar {
         match self.kind {
             HitKind::Row(_, bar) => bar,
-            HitKind::Cores | HitKind::Header => Bar::Global,
+            HitKind::Cores | HitKind::Header | HitKind::Network(_) => Bar::Global,
         }
     }
 }
@@ -452,6 +459,30 @@ impl<'a> Painter<'a> {
     pub(crate) fn figure_w(&self, s: &str, small: bool) -> f32 {
         let size = if small { self.small_px } else { self.text_px };
         crate::tray_raster::measure_text(s, size.get(), TextWeight::Regular).ceil()
+    }
+
+    /// A resource-deck caption in the same UI face and 9.5-point size as its rows.
+    pub(crate) fn ui_text(&mut self, x: f32, baseline: f32, s: String, color: Rgb, bold: bool) {
+        let px = 9.5 * self.s;
+        self.prims.push(text_prim(
+            x.round(),
+            baseline.round(),
+            s,
+            TypeStep::Caption.px_clamped(px, px, px),
+            TextWeight::Regular,
+            if bold { TextFace::UiBold } else { TextFace::Ui },
+            rgba(color, 255),
+        ));
+    }
+
+    /// Width measured in the exact face and size used by [`Self::ui_text`].
+    pub(crate) fn ui_text_w(&self, s: &str, bold: bool) -> f32 {
+        crate::tray_raster::ui_text_width_for(
+            if bold { TextFace::UiBold } else { TextFace::Ui },
+            s,
+            9.5 * self.s,
+        )
+        .ceil()
     }
 
     fn clipped(&mut self, clip: Rect, f: impl FnOnce(&mut Self)) {
@@ -1009,6 +1040,7 @@ pub(crate) mod tests {
             mu_from: None,
             verdict,
             no_progress: false,
+            working_descendant: None,
             episode: 0,
             exit: None,
             tick: Tick::default(),

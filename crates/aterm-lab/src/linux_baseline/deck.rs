@@ -16,6 +16,10 @@ use crate::linux_proof::{self as proof, Gui};
 /// `stats_deck::FOLDED_PT`.
 pub const DECK_PT: f64 = 62.0;
 
+/// Fixed Network State headroom reserved under the stats bars: aterm-gui's
+/// `network_deck::HEIGHT_PT`.
+pub const NETWORK_PT: f64 = 30.0;
+
 const FIRST_TAB_COL: u16 = 5;
 
 struct Check {
@@ -206,6 +210,7 @@ impl Dims {
 
     fn deck_want(&self) -> usize {
         (DECK_PT * self.scale).round() as usize
+            + (NETWORK_PT * self.scale).round().max(0.0) as usize
     }
 
     const fn deck_rows(&self) -> Range<usize> {
@@ -268,15 +273,16 @@ fn session_checks(s: &Session<'_>, presenter: &'static str, on: &str) -> Vec<Che
 
 fn head(d: &Dims) -> Result<String, String> {
     let want = d.deck_want();
+    let pts = DECK_PT + NETWORK_PT;
     if d.deck_h != want || d.deck_y != 0 || d.head < d.deck_h {
         return Err(format!(
-            "deck_y={} deck_h={} in head={}, where the Deck's {DECK_PT} pt at scale {:.2} \
-             is {want} px at the head's top",
+            "deck_y={} deck_h={} in head={}, where the Deck's {pts} pt ({DECK_PT}+{NETWORK_PT}) \
+             at scale {:.2} is {want} px at the head's top",
             d.deck_y, d.deck_h, d.head, d.scale
         ));
     }
     Ok(format!(
-        "deck_y=0 deck_h={want} ({DECK_PT} pt at scale {:.2}) in head={}",
+        "deck_y=0 deck_h={want} ({pts} pt at scale {:.2}) in head={}",
         d.scale, d.head
     ))
 }
@@ -523,15 +529,18 @@ mod tests {
             ))
             .expect("dims")
         };
-        assert!(head(&dims("1.00", 76, 0, 62)).is_ok());
-        assert!(head(&dims("1.50", 114, 0, 93)).is_ok());
-        assert!(head(&dims("2.00", 152, 0, 124)).is_ok());
-        assert!(head(&dims("1.00", 76, 14, 62)).is_err());
-        assert!(head(&dims("2.00", 152, 0, 62)).is_err());
+        assert!(head(&dims("1.00", 106, 0, 92)).is_ok());
+        assert!(head(&dims("1.25", 134, 0, 116)).is_ok());
+        assert!(head(&dims("1.50", 159, 0, 138)).is_ok());
+        assert!(head(&dims("2.00", 212, 0, 184)).is_ok());
+        assert!(head(&dims("1.00", 76, 0, 62)).is_err());
+        assert!(head(&dims("1.25", 134, 0, 115)).is_err());
+        assert!(head(&dims("1.00", 106, 14, 92)).is_err());
+        assert!(head(&dims("2.00", 212, 0, 92)).is_err());
         assert!(head(&dims("1.00", 14, 0, 0)).is_err());
-        let d = dims("1.00", 76, 0, 62);
-        assert_eq!(d.band_foot(), 98);
-        assert_eq!(d.deck_rows(), 0..62);
+        let d = dims("1.00", 106, 0, 92);
+        assert_eq!(d.band_foot(), 128);
+        assert_eq!(d.deck_rows(), 0..92);
         assert!(Dims::read("OK 24x80 scale=1.00").is_err());
     }
 }

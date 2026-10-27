@@ -335,7 +335,7 @@ fn look_here(home: &Path) -> aterm_secrets::Result<ProbeOutcome> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    look_here_with(home, aterm_secrets::heard::network(), now, || {
+    look_here_with(home, aterm_secrets::heard::network_key(), now, || {
         aterm_secrets::client::probe_default(PROBE_WAIT)
     })
 }
@@ -347,29 +347,59 @@ fn look_here_with(
     now: u64,
     probe: impl FnOnce() -> aterm_secrets::Result<ProbeOutcome>,
 ) -> aterm_secrets::Result<ProbeOutcome> {
-    use aterm_secrets::heard::{self, Heard, Verdict};
-    let paths = Paths::for_home(home);
-    if let Some(network) = &network
-        && heard::read(&paths).and_then(|kept| kept.standing(network, now)) == Some(Heard::Absent)
-    {
+    if kept_elsewhere(home, network.as_deref(), now) {
         return Ok(ProbeOutcome::Absent);
     }
     let probed = probe();
-    // Only a definitive answer is kept: the vault, or another vault's signed envelope at its
-    // address. A 404 (a server whose store holds no vault yet, moving or new), an answer that
-    // is no vault (an error page or redirect from a server mid-restart), a refused or
-    // timed-out connect (its Mac asleep) and a lookup macOS holds while its Local Network
-    // question is open prove nothing about this network, and a record of them would skip the
-    // vault here for a day.
-    let heard = match &probed {
-        Ok(ProbeOutcome::Found(_)) => Some(Heard::Found),
+    keep_look(home, network, now, &probed);
+    probed
+}
+
+/// Whether a look kept under `home` ([`aterm_secrets::heard`]) heard another vault answer at the
+/// ALab vault's address on `network` within [`aterm_secrets::heard::ABSENT_FOR`] of `now`: the
+/// one kept answer that stands for a look, for `aterm init`'s and System State's alike.
+#[must_use]
+pub fn kept_elsewhere(home: &Path, network: Option<&str>, now: u64) -> bool {
+    use aterm_secrets::heard::{self, Heard};
+    network.is_some_and(|network| {
+        matches!(
+            heard::read(&Paths::for_home(home))
+                .as_ref()
+                .and_then(|kept| kept.standing(network, now)),
+            Some(Heard::Absent)
+        )
+    })
+}
+
+/// Keep what a look for the ALab vault on `network` at `now` heard (`probed`) under `home`, for
+/// the next look on that network ([`kept_elsewhere`]).
+///
+/// Only a definitive answer is kept: the vault, or another vault's signed envelope at its
+/// address. A 404 (a server whose store holds no vault yet, moving or new), an answer that is no
+/// vault (an error page or redirect from a server mid-restart), a refused or timed-out connect
+/// (its Mac asleep) and a lookup macOS holds while its Local Network question is open prove
+/// nothing about this network, and a record of them would skip the vault here for a day.
+pub fn keep_look(
+    home: &Path,
+    network: Option<String>,
+    now: u64,
+    probed: &aterm_secrets::Result<ProbeOutcome>,
+) {
+    use aterm_secrets::heard::{self, Heard, Verdict};
+    let heard = match probed {
+        // The vault answered: keep its address and signer as a hint (never a pin) for the Peers
+        // row and the join. `probe_default` asks the ALab vault's own address.
+        Ok(ProbeOutcome::Found(found)) => Some(Heard::Found {
+            url: aterm_secrets::ALAB_DEFAULT_URL.to_owned(),
+            signer: found.fingerprint.clone(),
+        }),
         Ok(ProbeOutcome::AnotherVault(_)) => Some(Heard::Absent),
         Ok(ProbeOutcome::Absent | ProbeOutcome::NotThisVault(_)) | Err(_) => None,
     };
     if let (Some(heard), Some(network)) = (heard, network) {
         // The record only spares a later look: one not written costs that look, nothing else.
         let _ = heard::write(
-            &paths,
+            &Paths::for_home(home),
             &Verdict {
                 at: now,
                 heard,
@@ -377,23 +407,17 @@ fn look_here_with(
             },
         );
     }
-    probed
 }
 
 /// Whether a failed look is macOS holding this app off the local network until a person
-/// answers its question: a connect to the address the vault's `.local` name resolved to that
-/// fails "no route" (`EHOSTUNREACH`, or `ENETUNREACH`), as macOS fails it for an app it has not
-/// let onto the LAN yet. A refusal ([`aterm_secrets::client::refused_by_local_network`]) is the
-/// answer Don't Allow, not a pending one. The transport keeps only its error's text, which
-/// carries the errno's own words.
+/// answers its question: a connect to the private or link-local address the vault's `.local`
+/// name resolved to that found no route, as macOS fails it for an app it has not let onto the
+/// LAN yet (the transport's [`aterm_secrets::ErrorKind::LocalNetworkPending`], which no route to
+/// any other address never is). A refusal ([`aterm_secrets::client::refused_by_local_network`])
+/// is the answer Don't Allow, not a pending one.
 fn local_network_pending(why: &aterm_secrets::Error) -> bool {
     !aterm_secrets::client::refused_by_local_network(why)
-        && [libc::EHOSTUNREACH, libc::ENETUNREACH]
-            .into_iter()
-            .any(|errno| {
-                why.0
-                    .contains(&io::Error::from_raw_os_error(errno).to_string())
-            })
+        && why.kind() == aterm_secrets::ErrorKind::LocalNetworkPending
 }
 
 /// The live vault of one user.
@@ -981,10 +1005,11 @@ enum Looked {
     Unanswered,
 }
 
-/// Look for the ALab vault ([`SecretsOps::probe_alab`]). While macOS holds this app off the
-/// local network for a person's answer ([`local_network_pending`]) it says so once and looks
-/// again every second, up to [`LOCAL_NETWORK_TRIES`] looks.
-fn look(ops: &dyn SecretsOps) -> Looked {
+/// Look for the ALab vault ([`SecretsOps::probe_alab`]). On a Mac (`mac`), while macOS holds
+/// this app off the local network for a person's answer ([`local_network_pending`]) it says so
+/// once and looks again every second, up to [`LOCAL_NETWORK_TRIES`] looks. Elsewhere (Linux) no
+/// privacy question holds a look, so an unreachable host or network is no vault here, at once.
+fn look(ops: &dyn SecretsOps, mac: bool) -> Looked {
     let mut told = false;
     for _ in 0..LOCAL_NETWORK_TRIES {
         match ops.probe_alab() {
@@ -992,7 +1017,7 @@ fn look(ops: &dyn SecretsOps) -> Looked {
             Err(why) if aterm_secrets::client::refused_by_local_network(&why) => {
                 return Looked::Refused;
             }
-            Err(why) if local_network_pending(&why) => {
+            Err(why) if mac && local_network_pending(&why) => {
                 if !told {
                     told = true;
                     ops.say(LOCAL_NETWORK_ASK);
@@ -1144,7 +1169,7 @@ pub fn items(
             Chose::Join(source) => source,
             Chose::Note(probe) => return Ok(Secrets::note(user, probe)),
         },
-        None => match look(ops.as_ref()) {
+        None => match look(ops.as_ref(), sys.macos()) {
             Looked::Found => {
                 ops.say("the ALab vault answers on this network");
                 aterm_secrets::ALAB_DEFAULT_URL.to_owned()
@@ -1464,6 +1489,7 @@ impl Vault {
 
     fn join(&self, sys: &dyn System, interactive: bool) -> Result<(), String> {
         let planned = self.planned();
+        let before = planned.over.clone();
         let replaces = match self.origin {
             Origin::Selected => Replaces::Read(planned.over),
             Origin::Chosen | Origin::Configured => Replaces::Any,
@@ -1485,6 +1511,10 @@ impl Vault {
             .take();
         // A person's join asks and returns: one sent with the join password then waits out its
         // window here, and one without waits for nobody, since the subscriber finishes it.
+        // System State's join waits its window inside the join, which ends the moment the Mac
+        // is in, only when it carries the join password an approver answers within seconds; one
+        // by code waits for nobody either: its row names the code, and the subscriber's
+        // state.toml wakes the parked run once an admin approves it.
         let chosen = self.origin == Origin::Chosen;
         if chosen {
             self.ops.say(&format!("joining {}…", shown(&self.source)));
@@ -1495,7 +1525,11 @@ impl Vault {
             (&self.source, &replaces),
             password.as_ref(),
             interactive,
-            if chosen { Duration::ZERO } else { self.wait },
+            if chosen || !sent {
+                Duration::ZERO
+            } else {
+                self.wait
+            },
             &requested,
         );
         let outcome = match outcome {
@@ -1509,7 +1543,26 @@ impl Vault {
                 } else {
                     drop(password);
                 }
-                return Err(format!("joining the vault: {why}"));
+                let why = format!("joining the vault: {why}");
+                // A join that fails after saving the vault (its request refused or its reply
+                // lost) leaves this Mac set to it and waiting, its request due at once: the
+                // subscriber that asks goes in now, as `aterm secrets join`'s does. A change to
+                // some other vault (another program's join meanwhile) is not this join's.
+                let home = Path::new(&self.user.home);
+                let saved = self.ops.configured().ok().flatten().is_some_and(|after| {
+                    before.as_ref() != Some(&after)
+                        && matches!(
+                            selected_vault(&self.source, home, Some(&after)),
+                            Ok(Some(_))
+                        )
+                });
+                if saved && self.subscribe_queued(&installed) {
+                    return Err(format!(
+                        "{why}; this Mac is now set to {} and its subscriber asks to join again shortly",
+                        shown(&self.source)
+                    ));
+                }
+                return Err(why);
             }
         };
         installed
@@ -1550,8 +1603,17 @@ impl Vault {
                 waits = true;
             }
         }
-        if !inside() {
-            self.wait_for_admin(Some(&code), sent || !chosen);
+        // One read, as `inside` makes: at a path, which has no queue, an admin approves this
+        // Mac's key, not its code.
+        let status = self.ops.status().ok();
+        if !status
+            .as_ref()
+            .is_some_and(|status| matches!(status.membership, Membership::In { .. }))
+        {
+            let approve = status
+                .and_then(|status| status.approve_command())
+                .unwrap_or_else(|| format!("aterm secrets approve {code}"));
+            self.wait_for_admin(Some(&approve), sent || !chosen);
         }
         Ok(())
     }
@@ -1583,7 +1645,7 @@ impl Vault {
         };
         match status.membership {
             Membership::Pending => {
-                self.wait_for_admin(status.machine.as_ref().map(|(_, code)| code.as_str()), true);
+                self.wait_for_admin(status.approve_command().as_deref(), true);
             }
             Membership::In { .. } | Membership::Plain
                 if planned.files && !self.ops.synced().unwrap_or(false) =>
@@ -1600,12 +1662,12 @@ impl Vault {
         Ok(())
     }
 
-    /// Stand aside waiting for an admin, naming the fix for a mistyped join password when one
-    /// may have been sent (`retyped`).
-    fn wait_for_admin(&self, code: Option<&str>, retyped: bool) {
+    /// Stand aside waiting for an admin to run `approve` ([`Status::approve_command`]), naming
+    /// the fix for a mistyped join password when one may have been sent (`retyped`).
+    fn wait_for_admin(&self, approve: Option<&str>, retyped: bool) {
         let admin = format!(
             "waiting for an admin: {}",
-            approval(code, &self.source, retyped)
+            approval(approve, &self.source, retyped)
         );
         let mut aside = self.aside.lock().unwrap_or_else(PoisonError::into_inner);
         *aside = Some(match aside.take() {
@@ -1629,12 +1691,12 @@ fn source_text(source: &Source) -> String {
     }
 }
 
-/// The approval an admin gives, and, when a join password may have been sent (`retyped`), how
-/// a mistyped one is fixed.
-fn approval(code: Option<&str>, source: &str, retyped: bool) -> String {
-    let approve = match code {
-        Some(code) => format!(
-            "approve this Mac on an admin Mac: aterm secrets approve {code} (the subscriber finishes the join once it is approved)"
+/// The approval an admin gives (`approve`, [`Status::approve_command`]), and, when a join
+/// password may have been sent (`retyped`), how a mistyped one is fixed.
+fn approval(approve: Option<&str>, source: &str, retyped: bool) -> String {
+    let approve = match approve {
+        Some(approve) => format!(
+            "approve this Mac on an admin Mac: {approve} (the subscriber finishes the join once it is approved)"
         ),
         None => "approve this Mac on an admin Mac: aterm secrets requests, then aterm secrets approve <code> (the subscriber finishes the join once it is approved)".into(),
     };
@@ -1695,7 +1757,7 @@ fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool, of
         .config
         .as_ref()
         .map_or("(unnamed)", |config| config.name.as_str());
-    let code = status.machine.as_ref().map(|(_, code)| code.as_str());
+    let approve = status.approve_command();
     let inside = status.names.iter().filter(|n| !n.starts_with("~/")).count();
     let elsewhere = status.names.len() - inside;
     let held = if elsewhere == 0 {
@@ -1750,7 +1812,10 @@ fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool, of
         // The subscriber finishes the join once an admin approves: nothing for this Mac to
         // do, so the row waits ([`Item::read_aside`]) rather than asking the person.
         Membership::Pending if watched => Probe::Unusable {
-            why: format!("waiting for an admin: {}", approval(code, source, true)),
+            why: format!(
+                "waiting for an admin: {}",
+                approval(approve.as_deref(), source, true)
+            ),
         },
         Membership::Pending => unwatched(format!("waiting for an admin to approve vault {name}")),
         Membership::Revoked { seq } => Probe::Blocked {
@@ -2105,6 +2170,9 @@ pub(crate) mod tests {
         windows: Mutex<Vec<Duration>>,
         /// How many pauses between looks were taken.
         pauses: Mutex<u32>,
+        /// What this Mac's vault state becomes as a join runs, before its outcome: the client
+        /// saving the vault before the request it then fails to queue.
+        saved_by_join: Mutex<Option<Status>>,
     }
 
     impl Scripted {
@@ -2140,7 +2208,37 @@ pub(crate) mod tests {
             *self.probes.lock().unwrap()
         }
 
-        fn joins(&self) -> Vec<(String, bool)> {
+        /// A join ends with `outcome`, this Mac's vault state becoming `saved` as it runs.
+        pub(crate) fn joins_as(
+            &self,
+            saved: Option<Status>,
+            outcome: aterm_secrets::Result<JoinOutcome>,
+        ) {
+            *self.saved_by_join.lock().unwrap() = saved;
+            *self.outcome.lock().unwrap() = Some(outcome);
+        }
+
+        /// Whether each approval wait ends with this Mac let in.
+        pub(crate) fn approves(&self, approvals: Vec<bool>) {
+            *self.approvals.lock().unwrap() = approvals.into();
+        }
+
+        /// Whether each join was given a join password.
+        pub(crate) fn passwords(&self) -> Vec<bool> {
+            self.passwords.lock().unwrap().clone()
+        }
+
+        /// The window each approval wait was given.
+        pub(crate) fn windows(&self) -> Vec<Duration> {
+            self.windows.lock().unwrap().clone()
+        }
+
+        /// The person turns the subscriber off.
+        pub(crate) fn turn_off(&self) {
+            *self.turned_off.lock().unwrap() = true;
+        }
+
+        pub(crate) fn joins(&self) -> Vec<(String, bool)> {
             self.joins.lock().unwrap().clone()
         }
 
@@ -2158,6 +2256,17 @@ pub(crate) mod tests {
                 .filter(|event| !event.starts_with("line "))
                 .collect()
         }
+    }
+
+    /// A vault this machine is in, its subscriber installed and every file it wrote in place:
+    /// converged.
+    pub(crate) fn converged() -> Arc<Scripted> {
+        let ops = Scripted::new(vec![Ok(configured(Membership::In {
+            seq: 7,
+            heard: 1_800_000_000,
+        }))]);
+        ops.subscribed(Ok(installed_state()));
+        ops
     }
 
     fn installed_state() -> State {
@@ -2291,6 +2400,9 @@ pub(crate) mod tests {
                 self.hooked.lock().unwrap().push(answer);
             }
             self.installed_by_join.lock().unwrap().push(self.installs());
+            if let Some(saved) = self.saved_by_join.lock().unwrap().take() {
+                *self.statuses.lock().unwrap() = vec![Ok(saved)].into();
+            }
             self.outcome
                 .lock()
                 .unwrap()
@@ -2385,7 +2497,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn configured(membership: Membership) -> Status {
+    pub(crate) fn configured(membership: Membership) -> Status {
         Status {
             config: Some(Config {
                 source: Source::Url(aterm_secrets::ALAB_DEFAULT_URL.into()),
@@ -2822,10 +2934,13 @@ pub(crate) mod tests {
     }
 
     fn pending_look() -> aterm_secrets::Result<ProbeOutcome> {
-        Err(aterm_secrets::Error::new(format!(
-            "fetching http://alab-secrets.local:7484/v1/alab: {}",
-            io::Error::from_raw_os_error(libc::EHOSTUNREACH)
-        )))
+        Err(aterm_secrets::Error::of_kind(
+            aterm_secrets::ErrorKind::LocalNetworkPending,
+            format!(
+                "fetching http://alab-secrets.local:7484/v1/alab: {}",
+                io::Error::from_raw_os_error(libc::EHOSTUNREACH)
+            ),
+        ))
     }
 
     #[test]
@@ -2862,6 +2977,40 @@ pub(crate) mod tests {
         assert_eq!(rows[0].why.as_deref(), Some(LAN_UNANSWERED));
         assert_eq!(ops.probes(), LOCAL_NETWORK_TRIES);
         assert_eq!(asked(&sys), 0);
+
+        // On Linux no privacy question holds the look: the same unreachable host is no vault
+        // here after one look, with no wait, no word about macOS and nothing asked.
+        let mut sys = fake();
+        sys.linux = true;
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        *ops.probed.lock().unwrap() = Some(pending_look());
+        let rows = run(&sys, &ops, Mode::Apply);
+        assert_eq!(rows[0].outcome, Outcome::NotApplicable, "{rows:?}");
+        assert_eq!(rows[0].why.as_deref(), Some(NOT_HERE));
+        assert_eq!(ops.probes(), 1);
+        assert_eq!(*ops.pauses.lock().unwrap(), 0);
+        assert!(
+            !ops.said
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line == LOCAL_NETWORK_ASK)
+        );
+        assert_eq!(asked(&sys), 0);
+
+        // On a Mac, no route to an address off the LAN (the same errno's words, which the
+        // transport never marks as macOS's gate) is no vault here after one look, with no wait.
+        let sys = fake();
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        *ops.probed.lock().unwrap() = Some(Err(aterm_secrets::Error::new(format!(
+            "fetching http://alab-secrets.local:7484/v1/alab: {}",
+            io::Error::from_raw_os_error(libc::EHOSTUNREACH)
+        ))));
+        let rows = run(&sys, &ops, Mode::Apply);
+        assert_eq!(rows[0].why.as_deref(), Some(NOT_HERE), "{rows:?}");
+        assert_eq!(ops.probes(), 1);
+        assert_eq!(*ops.pauses.lock().unwrap(), 0);
+        assert_eq!(asked(&sys), 0);
     }
 
     #[test]
@@ -2869,7 +3018,7 @@ pub(crate) mod tests {
         use aterm_secrets::heard::{self, Heard, Verdict};
         let root = aterm_tempfile::tempdir().unwrap();
         let paths = Paths::for_home(root.path());
-        let here = || Some("192.168.4.0/24".to_owned());
+        let here = || Some("aabbcc112233@192.168.4.0/24".to_owned());
         let asked = Cell::new(0);
         let probe = |answer: aterm_secrets::Result<ProbeOutcome>| {
             let asked = &asked;
@@ -2887,7 +3036,7 @@ pub(crate) mod tests {
             Some(Verdict {
                 at: 1_000,
                 heard: Heard::Absent,
-                network: "192.168.4.0/24".into(),
+                network: "aabbcc112233@192.168.4.0/24".into(),
             })
         );
         // The next run on this network makes no request.
@@ -2897,16 +3046,19 @@ pub(crate) mod tests {
         // Another network is looked at again; a look macOS held is not kept.
         let looked = look_here_with(
             root.path(),
-            Some("10.1.0.0/16".into()),
+            Some("ddeeff445566@10.1.0.0/16".into()),
             2_000,
             probe(pending_look()),
         );
         assert!(looked.is_err());
         assert_eq!(asked.get(), 2);
-        assert_eq!(heard::read(&paths).unwrap().network, "192.168.4.0/24");
+        assert_eq!(
+            heard::read(&paths).unwrap().network,
+            "aabbcc112233@192.168.4.0/24"
+        );
         // Nor is a 404, an answer that is no vault, a timeout or a refused connect: none is an
         // answer about the network.
-        let elsewhere = || Some("172.16.0.0/12".to_owned());
+        let elsewhere = || Some("001122334455@172.16.0.0/12".to_owned());
         for (n, failed) in [
             Ok(ProbeOutcome::Absent),
             Ok(ProbeOutcome::NotThisVault("503 Service Unavailable".into())),
@@ -2921,7 +3073,7 @@ pub(crate) mod tests {
             let _ = look_here_with(root.path(), elsewhere(), 3_000 + n as u64, probe(failed));
             assert_eq!(
                 heard::read(&paths).unwrap().network,
-                "192.168.4.0/24",
+                "aabbcc112233@192.168.4.0/24",
                 "{n}"
             );
         }
@@ -3149,6 +3301,39 @@ pub(crate) mod tests {
         );
         assert_eq!(rows[0].why.as_deref(), Some(UNCONFIGURED));
         assert!(ops.checks.lock().unwrap().is_empty(), "nor a named vault");
+    }
+
+    /// A vault at a path has no join queue: a Mac waiting on it names the command that lets
+    /// its key in under its name, never a code no admin Mac can approve.
+    #[test]
+    fn a_mac_waiting_on_a_vault_at_a_path_names_its_key_not_its_code() {
+        let path = "/Users//someone/home.vault";
+        let mut status = configured(Membership::Pending);
+        if let Some(config) = status.config.as_mut() {
+            config.source = Source::Path(path.into());
+        }
+        let Probe::Unusable { why } = judge(&status, path, None, true, false) else {
+            panic!("a watched pending join waits for an admin");
+        };
+        let key = Recipient([7; 32]).to_bech32();
+        assert!(
+            why.contains(&format!("aterm secrets approve {key} --name m22")),
+            "{why}"
+        );
+        assert!(!why.contains(CODE), "{why}");
+        let Probe::Unusable { why } = judge(
+            &configured(Membership::Pending),
+            aterm_secrets::ALAB_DEFAULT_URL,
+            None,
+            true,
+            false,
+        ) else {
+            panic!("a watched pending join waits for an admin");
+        };
+        assert!(
+            why.contains(&format!("aterm secrets approve {CODE}")),
+            "{why}"
+        );
     }
 
     #[test]
@@ -3537,6 +3722,53 @@ pub(crate) mod tests {
         assert_eq!(
             rows[0].why.as_deref(),
             Some("joining the vault: vault alab: the signature does not verify")
+        );
+        assert_eq!(ops.installs(), 0);
+
+        // A join that fails after saving the vault (its request refused) leaves this Mac set to
+        // it and waiting: the subscriber that asks again goes in, and the row says so.
+        let sys = fake();
+        sys.answer(None);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.alab_answers();
+        *ops.saved_by_join.lock().unwrap() = Some(configured(Membership::Pending));
+        *ops.outcome.lock().unwrap() = Some(Err(aterm_secrets::Error::new(
+            "asking to join: the join queue already holds 256 requests",
+        )));
+        let rows = run(&sys, &ops, Mode::Apply);
+        assert_eq!(rows[0].outcome, Outcome::Failed, "{rows:?}");
+        assert_eq!(
+            rows[0].why.as_deref(),
+            Some(
+                format!(
+                    "joining the vault: asking to join: the join queue already holds 256 requests; this Mac is now set to {} and its subscriber asks to join again shortly",
+                    shown(aterm_secrets::ALAB_DEFAULT_URL)
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(ops.installs(), 1);
+
+        // What another program saved meanwhile, a vault this join did not ask for, is not this
+        // join's save: no subscriber goes in for it and the row says only what failed.
+        let sys = fake();
+        sys.answer(None);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.alab_answers();
+        let mut elsewhere = configured(Membership::Pending);
+        if let Some(config) = elsewhere.config.as_mut() {
+            config.source = Source::Url("http://vault.example:7484/v1/other".into());
+            config.name = "other".into();
+        }
+        *ops.saved_by_join.lock().unwrap() = Some(elsewhere);
+        *ops.outcome.lock().unwrap() = Some(Err(aterm_secrets::Error::new(
+            "asking to join: the join queue already holds 256 requests",
+        )));
+        let rows = run(&sys, &ops, Mode::Apply);
+        assert_eq!(rows[0].outcome, Outcome::Failed, "{rows:?}");
+        assert_eq!(
+            rows[0].why.as_deref(),
+            Some("joining the vault: asking to join: the join queue already holds 256 requests")
         );
         assert_eq!(ops.installs(), 0);
 
@@ -4007,6 +4239,31 @@ pub(crate) mod tests {
         let row = setup_pass(&ops, source, &mut held, false);
         assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
         assert!(held.is_some(), "kept for the next try");
+    }
+
+    #[test]
+    fn a_selected_join_waits_for_an_admin_only_with_the_join_password() {
+        let source = aterm_secrets::ALAB_DEFAULT_URL;
+        for typed in [false, true] {
+            let ops = Scripted::new(vec![Ok(unconfigured()), Ok(unconfigured())]);
+            *ops.outcome.lock().unwrap() = Some(Ok(JoinOutcome::Pending {
+                code: CODE.into(),
+                host: "m22".into(),
+            }));
+            let mut held = typed.then(password);
+            let row = setup_pass(&ops, source, &mut held, false);
+            let wait = if typed { SETUP_WAIT } else { Duration::ZERO };
+            assert_eq!(*ops.waits.lock().unwrap(), [wait], "typed: {typed}");
+            assert!(
+                row.outcome == Outcome::Blocked
+                    && matches!(row.stood_aside, Some(StoodAside::Waiting(_)))
+                    && row
+                        .why
+                        .as_deref()
+                        .is_some_and(|why| why.contains(&format!("aterm secrets approve {CODE}"))),
+                "typed: {typed}: {row:?}"
+            );
+        }
     }
 
     #[test]
@@ -4871,7 +5128,9 @@ pub(crate) mod tests {
         .unwrap();
         let admin = Paths::for_home(&root.path().join("admin"));
         let url = format!("http://{}/v1/team", running.addr);
-        let created = aterm_secrets::client::create(&admin, &url, None, Some("admin")).unwrap();
+        let created =
+            aterm_secrets::client::test_create_with_password(&admin, &url, None, Some("admin"))
+                .unwrap();
         let source = format!("{url}#{}", created.signer);
         let held = aterm_secrets::client::admin_open(&admin)
             .unwrap()
@@ -4951,7 +5210,9 @@ pub(crate) mod tests {
         .unwrap();
         let admin = Paths::for_home(&root.path().join("admin"));
         let url = format!("http://{}/v1/team", running.addr);
-        let created = aterm_secrets::client::create(&admin, &url, None, Some("admin")).unwrap();
+        let created =
+            aterm_secrets::client::test_create_with_password(&admin, &url, None, Some("admin"))
+                .unwrap();
         let source = format!("{url}#{}", created.signer);
         let heard = Arc::new(Mutex::new(Vec::new()));
         let live = LiveSecrets {

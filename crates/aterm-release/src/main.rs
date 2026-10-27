@@ -33,6 +33,8 @@ mod durable;
 mod fixtures;
 mod gates;
 
+mod harness_versions;
+
 mod github;
 
 mod hook;

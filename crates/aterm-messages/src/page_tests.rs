@@ -1134,6 +1134,23 @@ fn a_headed_list_says_the_local_time_of_a_past_row() {
     let flat = MessagesClock::of(&[&today], NOW, 0);
     assert!(!flat.headed);
     assert_eq!(flat.when(today.at_unix_ms), "3 h ago");
+    // Unheaded (no header can stand over a row), a past row's time says its day.
+    let unheaded = MessagesClock {
+        headed: false,
+        ..clock
+    };
+    assert_eq!(unheaded.when(today.at_unix_ms), "3 h ago");
+    assert_eq!(unheaded.when(yesterday.at_unix_ms), "Yesterday");
+    // Its forms start with what it says; only an unheaded past day's take fewer words.
+    let older = entry_at(3, NOW - 9 * DAY);
+    let forms = unheaded.when_forms(older.at_unix_ms);
+    assert_eq!(forms.first(), Some(&unheaded.when(older.at_unix_ms)));
+    assert_eq!(forms.len(), 2, "{forms:?}");
+    assert_eq!(unheaded.when_forms(today.at_unix_ms), ["3 h ago", "3 h"]);
+    assert_eq!(
+        clock.when_forms(older.at_unix_ms),
+        [clock.when(older.at_unix_ms)]
+    );
     let west = MessagesClock::of(&[&today], NOW, -25_200);
     assert_eq!(west.offset_s, -25_200);
     assert_eq!(west.today, words::local_day(NOW, -25_200));

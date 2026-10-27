@@ -1211,11 +1211,11 @@ fn appearance_paint_identity_forces_full_native_raster() {
             },
             compiled,
         },
-        width,
-        height,
+        (width, height),
         1.0,
         app.chrome_palette_theme().into(),
         app.theme,
+        crate::tray_raster::chrome_text_holes(),
     );
     let raster = cache.native.as_ref().unwrap();
     assert!(matches!(
@@ -1224,6 +1224,86 @@ fn appearance_paint_identity_forces_full_native_raster() {
     ));
     assert_eq!(raster.full_rasters, full_rasters + 1);
     assert_eq!(raster.regional_rasters, regional_rasters);
+}
+
+/// A RASTER THAT INKED EVERY CHAR KEEPS THE FACES IT PAINTED WITH: a full raster whose compile
+/// and paint measured and drew every char of its chrome text with a face carries the faces as
+/// they stand once it painted, so one its own previews parsed mid-paint (a terminal sample's
+/// fallback glyph, which the Linux lane's chain loads on demand) does not draw it again; the
+/// next frame's stamp matches it. NEGATIVE CONTROL: a raster that drew a char with no face keeps
+/// the faces its stamp was taken with, and the next frame draws it again.
+#[test]
+fn a_raster_that_inked_every_char_keeps_the_faces_it_painted_with() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let (instance, view) = app.active_native_view(wid).expect("native Settings view");
+    assert!(app.prepare_native_input_scratch(wid));
+    let viewport = app.native_ui_viewport(wid).unwrap();
+    let now = crate::tray_raster::chrome_coverage_epoch();
+    for drew_a_hole in [false, true] {
+        let mut cache = app
+            .windows
+            .get_mut(&wid)
+            .unwrap()
+            .leaf_render_cache
+            .remove(&view)
+            .unwrap();
+        let retained = cache.native.as_ref().expect("a retained raster");
+        let (width, height) = (retained.width, retained.height);
+        let compiled = retained.compiled.clone();
+        // The stamp taken before a face landed mid-paint.
+        let before = crate::app_native::NativeUiCompileStamp {
+            coverage_epoch: now.wrapping_add(1),
+            ..retained.stamp
+        };
+        let holes = crate::tray_raster::chrome_text_holes();
+        retain_native_leaf_raster(
+            &mut cache,
+            crate::app_native::NativeLeafScene {
+                stamp: before,
+                instance,
+                view,
+                viewport,
+                damage: crate::native_app::DamageRegion::All,
+                compiled,
+            },
+            (width, height),
+            1.0,
+            app.chrome_palette_theme().into(),
+            app.theme,
+            if drew_a_hole {
+                holes.wrapping_sub(1)
+            } else {
+                holes
+            },
+        );
+        assert_eq!(
+            crate::tray_raster::chrome_text_holes(),
+            holes,
+            "premise: Home's chrome text has a face for every char"
+        );
+        let raster = cache.native.as_ref().unwrap();
+        let expected = if drew_a_hole {
+            before.coverage_epoch
+        } else {
+            now
+        };
+        assert_eq!(
+            raster.stamp.coverage_epoch, expected,
+            "drew a hole: {drew_a_hole}"
+        );
+        assert_eq!(
+            raster.stamp == app.native_ui_compile_stamp(wid).unwrap(),
+            !drew_a_hole,
+            "the next frame keeps the raster only where it inked every char"
+        );
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .leaf_render_cache
+            .insert(view, cache);
+    }
 }
 
 #[test]

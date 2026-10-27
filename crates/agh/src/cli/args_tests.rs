@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use super::{Parsed, parse};
-use crate::config::Validated;
+use crate::config::{ConfigOrigin, Validated};
 use crate::policy::{Named, Router};
 use crate::slug::Slug;
 
@@ -23,6 +23,9 @@ fn router() -> Router {
         owners: BTreeMap::new(),
         default_read: Vec::new(),
         targets,
+        vault: false,
+        origin: ConfigOrigin::Text,
+        writers: Vec::new(),
     })
 }
 

@@ -15,7 +15,7 @@ use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::host::{
     CaptureMode, FrameGeom, HostFrameInput, SingFacts, TerminalFacts, Visibility,
 };
-use aterm_effects::kitty_pet::{PetFrame, PetInputKind};
+use aterm_effects::kitty_pet::{PetAction, PetFrame, PetInputKind};
 use aterm_effects::pet_world::{PetPane, PetReserve, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
 use aterm_lexicon::Lexicon;
@@ -169,6 +169,7 @@ impl Host {
             protected: &[],
             overlays: &[],
             ink: &[],
+            blanked: &[],
             painted_over: None,
         };
         self.owner
@@ -389,7 +390,6 @@ fn a_cat_rests_beside_the_line_an_enter_at_the_bottom_prints() {
 /// presence it left the ground with, the least and the most it was drawn at
 /// from its gather to its last landing frame)`.
 fn flights(shots: &[&Shot]) -> Vec<(u64, u8, u8, u8, u8)> {
-    use aterm_effects::kitty_pet::PetAction;
     let mut out = Vec::new();
     let mut i = 1;
     while i < shots.len() {
@@ -543,16 +543,23 @@ fn meets_glyphs(input: &RenderInput, frame: &PetFrame) -> Option<(u16, u16)> {
     None
 }
 
-/// THE HEAD LAW AT THE WRAP, end to end: the trail gallery's `burst` (a line
-/// typed at 50 ms a key to three cells short of the margin, then quiet). The
-/// cat leaps ahead to the row under the line for the wrap that never comes,
-/// and rests there: every rest frame's silhouette stands off every glyph,
-/// on dark and on paper, the whole body on blank rows (its top under the
-/// line's cells, so no letter cuts its head away). The negative control (the
-/// letter reader blinded: the stand as it was) rests on the row under the
-/// line with its head 0.7 of a row up among the letters.
+/// THE HEAD LAW AT THE MARGIN, end to end: the trail gallery's `burst` (a
+/// line typed at 50 ms a key to three cells short of the margin, then quiet).
+/// The cat waits at the wall, the line's last letters running over it, while
+/// the hand may still write on and wrap; it never leaves on a guess of a wrap
+/// that never comes. Once the hand has stopped (the cat sits, `SIT_AFTER`
+/// after the last key) it hops off the letters to the nearest seat by the
+/// caret that covers none, and rests there: every rest frame from then on
+/// stands off every glyph, on dark and on paper, the whole body on blank rows,
+/// and it is back on the ground within `SETTLED_BY` of the last key. The
+/// negative control (the letter reader blinded: the stand as it was) rests on
+/// the line among its letters.
 #[test]
 fn a_cat_waiting_on_a_wrap_that_never_comes_rests_off_the_line() {
+    /// The cat's sit after the hand's last key (`kitty_pet::SIT_AFTER`).
+    const SIT_AFTER: u64 = 1_400;
+    /// The sit, the hop off the letters, and its landing.
+    const SETTLED_BY: u64 = SIT_AFTER + 600;
     let text = "echo the quick brown fox jumps over the lazy dog as the kitty flies";
     let mut ev = vec![(300u64, Rec::Out(b"\x1b[2J\x1b[5H$ ".to_vec()), None)];
     let mut t = 1_000u64;
@@ -570,13 +577,25 @@ fn a_cat_waiting_on_a_wrap_that_never_comes_rests_off_the_line() {
         let rests: Vec<&Shot> = h
             .shots
             .iter()
-            .filter(|s| s.ms >= quiet && s.frame.action.settled() && s.frame.alpha > 0)
+            .filter(|s| s.ms >= quiet + SETTLED_BY && s.frame.action.settled() && s.frame.alpha > 0)
             .collect();
         assert!(
             rests.len() > 100,
             "{}: the cat rests after the burst ({} frames)",
             theme.name,
             rests.len()
+        );
+        let aloft: Vec<u64> = h
+            .shots
+            .iter()
+            .filter(|s| s.ms >= quiet && s.frame.action == PetAction::Leap)
+            .map(|s| s.ms - quiet)
+            .collect();
+        assert!(
+            aloft.iter().all(|&ms| ms >= SIT_AFTER - 100),
+            "{}: the cat leaves the wall only once the hand has stopped, in the air at {:?} ms",
+            theme.name,
+            aloft
         );
         for s in &rests {
             assert_eq!(

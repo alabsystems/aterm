@@ -21,20 +21,22 @@ mod initial;
 pub use initial::{
     BroughtForward, InitialSetupAdmission, InitialSetupAuthorization, InitialSetupObservation,
     InitialSetupObserved, InitialSetupParkMark, InitialSetupRestart, InitialSetupSnapshot,
-    InitialSetupSnapshotError, InitialSetupUpgrade, ParkWatch, SETUP_BUSY, SetAside, SetupHooks,
-    SetupNext, SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, Watches, alab_mac,
-    apply_initial_setup, apply_initial_setup_observed, automatic_plan,
+    InitialSetupSnapshotError, InitialSetupUpgrade, LocalNetworkHeard, ParkWatch, SETUP_BUSY,
+    SetAside, SetupHooks, SetupNext, SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, Watches,
+    alab_mac, apply_initial_setup, apply_initial_setup_observed, automatic_plan,
     bring_forward_restored_setup, bring_forward_restored_setup_observing, check_initial_setup,
     check_initial_setup_observed, decline_provisional_setup_widen, forget_set_aside_setup,
     initial_setup_access_revision, initial_setup_access_step, initial_setup_admission,
     initial_setup_finished, initial_setup_keeps_vault_sync, initial_setup_observation,
     initial_setup_park_mark, initial_setup_review_revision, initial_setup_revision,
-    initial_setup_snapshot, initial_setup_snapshot_offering, observe_initial_setup,
+    initial_setup_snapshot, initial_setup_snapshot_offering, local_network_heard,
+    look_for_the_alab_vault, note_setup_interrupted, observe_initial_setup,
     probe_local_network_again, provisional_setup_widened, provisional_setup_widens,
     put_back_held_initial_setup, request_initial_setup_stop, restart_initial_setup,
-    restart_initial_setup_observed, run_initial_setup_pass, set_aside_unreadable_setup,
-    set_aside_unreadable_setup_observing, setup_is_newer, setup_records_held,
-    validate_initial_setup_plan, vault_config_unread, with_initial_setup_vault_sync,
+    restart_initial_setup_observed, retry_parked_setup_stages, run_initial_setup_pass,
+    set_aside_unreadable_setup, set_aside_unreadable_setup_observing, setup_is_newer,
+    setup_ledger_environment, setup_records_held, validate_initial_setup_plan, vault_config_unread,
+    with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
@@ -222,12 +224,16 @@ impl Report {
     }
 
     /// The rows a pass left as they are because they changed after this setup had them as
-    /// wanted ([`SETTLED`]): drift after a row read back ok, which no automatic pass rewrites.
+    /// wanted ([`SETTLED`]), or because the person changed them after aterm set them
+    /// ([`initial::kept::KEPT`]): drift after a row read back ok, which no automatic pass
+    /// rewrites.
     #[must_use]
     pub fn changed_since(&self) -> Vec<&str> {
         self.rows
             .iter()
-            .filter(|row| row.detail.ends_with(SETTLED))
+            .filter(|row| {
+                row.detail.ends_with(SETTLED) || row.detail.ends_with(initial::kept::KEPT)
+            })
             .map(|row| row.name.as_str())
             .collect()
     }
@@ -558,6 +564,11 @@ fn mutation_observed(
 
 /// The action body after its caller admitted the person and took the profile lock.
 fn run_mutation(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, String> {
+    // A person's Restore or Apply sets every key again: what they changed since aterm set it is
+    // forgotten first, so a pass after either never leaves it as they set it (design §6.6).
+    if matches!(action, Action::Apply | Action::Restore) {
+        initial::kept::forget_at(root, None)?;
+    }
     let explicit = if action == Action::Apply {
         Some(initial::save_explicit_workstation_plan(root)?)
     } else {
@@ -705,10 +716,11 @@ fn apply_preferences_at(
     apply_part_at(root, Part::Preferences { only })
 }
 
-/// The Accounts stage of a setup run: the selected Messages and FaceTime sign-outs, with the one
-/// Accessibility request they need. A sign-out drives those apps and may raise macOS's
-/// Accessibility and Automation prompts, so it runs only while System State is on screen
-/// (`on_screen`, System State design §6); accounts already signed out finish here.
+/// The Accounts stage of a setup run: the selected Messages and FaceTime sign-outs. A sign-out
+/// drives those apps and needs Accessibility, which the window's permission walk asks for
+/// (`aterm_gui`'s `permission_walk`, with Automation for System Events right after it), so it
+/// runs only while System State is on screen (`on_screen`, System State design §6); accounts
+/// already signed out finish here, and one waiting on the grant stands aside until it is on.
 fn apply_accounts_at(root: &Path, on_screen: bool) -> Result<Option<Report>, String> {
     apply_part_at(root, Part::Accounts { on_screen })
 }
@@ -854,54 +866,11 @@ fn apply_part_with(
         &root.join("automatic-attempt.json"),
         &json!({ "profile": PROFILE, "accessibility_ready": accessibility }),
     )?;
-    let consent = root.join("accessibility-request.json");
-    let mut request_failure = None;
-    if accounts_selected
-        && accessibility != Some(true)
-        && !consent
-            .try_exists()
-            .map_err(|e| format!("{}: {e}", consent.display()))?
-        && aterm_machines::init_accounts::accessibility_needed_selected(sys, selected)
-            .unwrap_or(false)
-        && let Some(_dialog) = aterm_types::macos_setup::MacosDialog::when_none_up(
-            aterm_types::macos_setup::DIALOG_WAIT,
-        )
-    {
-        write_json(
-            &consent,
-            &json!({ "profile": PROFILE, "state": "requested" }),
-        )?;
-        let asked = std::time::Instant::now();
-        match aterm_machines::init_accounts::request_accessibility(sys) {
-            Err(detail) => {
-                request_failure = Some((detail, aterm_converge::millis(asked.elapsed())));
-            }
-            Ok(true) => {}
-            Ok(false) => {
-                let deadline = std::time::Instant::now() + aterm_types::macos_setup::DIALOG_WAIT;
-                while std::time::Instant::now() < deadline
-                    && aterm_machines::init_accounts::accessibility_ready(sys) != Ok(true)
-                {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                }
-            }
-        }
-    }
+    // Accessibility is the window's permission walk's to ask for, beside its System Settings
+    // page: a sign-out without it stands aside (`StoodAside::Permission`), and the grant's
+    // access-record line wakes this run again.
     host.select(selected);
-    let mut report = automatic_pass(host, root, build, now)?;
-    if report.needs_attention()
-        && let Some((detail, took)) = request_failure
-    {
-        as_is(
-            &mut report,
-            Row {
-                name: "Native account permission request".into(),
-                status: "blocked".into(),
-                detail,
-                elapsed_ms: Some(took),
-            },
-        );
-    }
+    let report = automatic_pass(host, root, build, now)?;
     Ok(Some(report))
 }
 
@@ -985,6 +954,10 @@ const SETTLED_OWED: &str = "Notification Center's widget list is left to setup's
 
 const TRIES: u32 = 2;
 
+/// What an item held as it is says ahead of the hold's words when its probe found a change
+/// (`aterm_converge::left_as_is`): the words before it are what it reads now.
+const LEFT_AS_IS: &str = "; left as it is: ";
+
 const SECOND_TRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 const HELD_BUILDS: usize = 16;
@@ -1000,15 +973,31 @@ fn automatic_pass(
     let revision = initial::revision_at(root)?;
     let now = epoch_secs(now);
     let mut record = Automatic::load(root, revision)?;
+    // What aterm set and the person changed since, across every run and build (design §6.6):
+    // unreadable, nothing is set rather than one of the person's keys.
+    let mut kept = initial::kept::Kept::load(root)?;
     let owed = if host.full_disk_access() == Some(true) {
         load_withheld(root)?
     } else {
         Withheld::default()
     };
-    host.hold(&record.holds(build, now, &owed));
+    let mut holds = record.holds(build, now, &owed);
+    kept.hold(&mut holds, &|item| {
+        if owed.items.iter().any(|owes| owes == item) {
+            SETTLED_OWED
+        } else {
+            SETTLED
+        }
+    });
+    host.hold(&holds);
     let pass = execute_pass(host, root, Action::Apply, build, now)?;
     if record.add(build, now, &pass) {
         record.save(root, revision)?;
+    }
+    if kept.note(&pass.settled, &pass.readings, &pass.drifted, &|item| {
+        host.item_setting(item)
+    }) {
+        kept.save(root)?;
     }
     Ok(pass.report)
 }
@@ -1583,6 +1572,19 @@ trait Host {
     fn withheld(&mut self) -> Vec<String>;
     fn hold(&mut self, items: &[(String, Hold)]);
     fn held(&self) -> Vec<String>;
+    /// The items an apply pass left as they were ([`Hold::AsIs`]) although they read otherwise
+    /// than it sets them, since the last take.
+    fn drifted(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// What each item an apply pass settled reads now, in its row's words, since the last take.
+    fn readings(&mut self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// The System State row the item `item` was built for.
+    fn item_setting(&self, item: &str) -> Option<Setting> {
+        aterm_machines::init_preferences::setting_of(item)
+    }
     fn journal(
         &mut self,
         id: &str,
@@ -1643,6 +1645,11 @@ struct NativeHost {
     settled: Vec<String>,
     withheld: Vec<String>,
     held: Vec<(String, Hold)>,
+    /// [`Host::drifted`] and [`Host::readings`], as the pass's rows said them.
+    drifted: Vec<String>,
+    readings: Vec<(String, String)>,
+    /// Each item's System State row, as the passes' tagged rows said ([`Host::item_setting`]).
+    tagged: Vec<(String, Setting)>,
 }
 
 impl NativeHost {
@@ -1670,6 +1677,9 @@ impl NativeHost {
             settled: Vec::new(),
             withheld: Vec::new(),
             held: Vec::new(),
+            drifted: Vec::new(),
+            readings: Vec::new(),
+            tagged: Vec::new(),
         }
     }
 
@@ -1730,6 +1740,19 @@ impl Host for NativeHost {
     }
     fn held(&self) -> Vec<String> {
         self.held.iter().map(|(item, _)| item.clone()).collect()
+    }
+    fn drifted(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.drifted)
+    }
+    fn readings(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.readings)
+    }
+    fn item_setting(&self, item: &str) -> Option<Setting> {
+        self.tagged
+            .iter()
+            .find(|(id, _)| id == item)
+            .map(|(_, setting)| *setting)
+            .or_else(|| aterm_machines::init_preferences::setting_of(item))
     }
     fn journal(
         &mut self,
@@ -1905,6 +1928,30 @@ impl Host for NativeHost {
                     })
                     .map(|row| row.id.clone()),
             );
+            // An item held as it is whose probe found a change reads its value in its row's
+            // words ahead of the hold's (`aterm_converge::left_as_is`): it drifted.
+            for row in &result.rows {
+                let held_as_is = self
+                    .held
+                    .iter()
+                    .any(|(item, hold)| *item == row.id && matches!(hold, Hold::AsIs(_)));
+                let reads = match row.outcome {
+                    Outcome::NotApplicable if held_as_is => row
+                        .why
+                        .as_deref()
+                        .and_then(|why| why.split_once(LEFT_AS_IS))
+                        .map(|(from, _)| {
+                            self.drifted.push(row.id.clone());
+                            from.to_owned()
+                        }),
+                    Outcome::Ok | Outcome::Changed => row.to.clone(),
+                    _ => None,
+                };
+                if let Some(reads) = reads {
+                    self.readings.push((row.id.clone(), reads));
+                }
+            }
+            self.tagged.extend(settings.iter().cloned());
             self.withheld.extend(result.withheld);
             result.rows
         } else {
@@ -2374,6 +2421,10 @@ struct Pass {
     report: Report,
     unverified: Vec<String>,
     settled: Vec<String>,
+    /// Of `settled`, the items left as they were although they read otherwise ([`Host::drifted`]).
+    drifted: Vec<String>,
+    /// What the settled items read ([`Host::readings`]).
+    readings: Vec<(String, String)>,
 }
 
 impl From<Report> for Pass {
@@ -2382,6 +2433,8 @@ impl From<Report> for Pass {
             report,
             unverified: Vec::new(),
             settled: Vec::new(),
+            drifted: Vec::new(),
+            readings: Vec::new(),
         }
     }
 }
@@ -2486,6 +2539,8 @@ fn execute_pass(
         report,
         unverified,
         settled,
+        drifted: host.drifted(),
+        readings: host.readings(),
     })
 }
 
@@ -3782,6 +3837,7 @@ mod tests {
 
     mod automatic_withheld_tests;
     mod init_stage_outcomes_tests;
+    mod kept_by_person_tests;
     mod restore_activation_tests;
     mod withheld_revision_tests;
 
@@ -3817,6 +3873,9 @@ mod tests {
         attempts: Vec<Attempt>,
         settled: Vec<String>,
         held: Vec<(String, Hold)>,
+        /// [`Host::drifted`] and [`Host::readings`] since the last take.
+        drifted: Vec<String>,
+        readings: Vec<(String, String)>,
         /// Every journal line, write and relaunch, in order.
         events: Vec<String>,
         /// Each journal line's id, from, to and revert.
@@ -6706,6 +6765,18 @@ mod tests {
         fn held(&self) -> Vec<String> {
             self.held.iter().map(|(item, _)| item.clone()).collect()
         }
+        fn drifted(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.drifted)
+        }
+        fn readings(&mut self) -> Vec<(String, String)> {
+            std::mem::take(&mut self.readings)
+        }
+        fn item_setting(&self, item: &str) -> Option<Setting> {
+            self.items()
+                .into_iter()
+                .find(|(id, _)| id == item)
+                .and_then(|(_, keys)| keys.first().map(|(target, _)| Self::setting(target)))
+        }
         fn journal(
             &mut self,
             id: &str,
@@ -6746,6 +6817,8 @@ mod tests {
             self.attempts.clear();
             self.settled.clear();
             self.withheld.clear();
+            self.drifted.clear();
+            self.readings.clear();
             Ok(self
                 .wants()
                 .into_iter()
@@ -6797,6 +6870,8 @@ mod tests {
                     if apply && left_alone {
                         self.withheld.push(item.clone());
                     }
+                    let targets: Vec<Target> =
+                        keys.iter().map(|(target, _)| target.clone()).collect();
                     let unmet: Vec<(Target, PValue)> = keys
                         .into_iter()
                         .filter(|(target, value)| {
@@ -6821,6 +6896,7 @@ mod tests {
                                 let from: Vec<String> =
                                     unmet.iter().map(|(target, _)| target.describe()).collect();
                                 detail = format!("{}; left as it is: {why}", from.join(", "));
+                                self.drifted.push(item.clone());
                             }
                             None if unmet
                                 .iter()
@@ -6873,6 +6949,11 @@ mod tests {
                     }
                     if apply && matches!(status, "ok" | "applied") {
                         self.settled.push(item.clone());
+                        let reads: Vec<String> = targets
+                            .iter()
+                            .map(|target| format!("{:?}", self.values.get(target)))
+                            .collect();
+                        self.readings.push((item.clone(), reads.join(", ")));
                     }
                     rows.push((
                         Some(setting),
@@ -7484,6 +7565,8 @@ mod tests {
             },
             unverified: vec!["dock".to_owned()],
             settled: Vec::new(),
+            drifted: Vec::new(),
+            readings: Vec::new(),
         };
         let build = |n: usize| format!("1.0.{n}+g0000");
         let mut record = Automatic::default();

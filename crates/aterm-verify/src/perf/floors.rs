@@ -351,16 +351,20 @@ pub(crate) const EFFECTS_LANE: FloorLane = FloorLane {
     cli: "effects",
 };
 
-/// The effects lane's gated keys.
+/// A lane's gated keys: its GPU keys, its CPU work keys, and both, in that order.
 macro_rules! effects_keys {
-    (gpu: [$($gpu:literal),* $(,)?], cpu: [$($cpu:literal),* $(,)?] $(,)?) => {
-        const EFFECTS_GPU_KEYS: &[&str] = &[$($gpu),*];
-        const EFFECTS_CPU_KEYS: &[&str] = &[$($cpu),*];
-        const EFFECTS_KEYS: &[&str] = &[$($gpu,)* $($cpu),*];
+    (
+        $all:ident, $gpu_keys:ident, $cpu_keys:ident;
+        gpu: [$($gpu:literal),* $(,)?], cpu: [$($cpu:literal),* $(,)?] $(,)?
+    ) => {
+        const $gpu_keys: &[&str] = &[$($gpu),*];
+        const $cpu_keys: &[&str] = &[$($cpu),*];
+        const $all: &[&str] = &[$($gpu,)* $($cpu),*];
     };
 }
 
 effects_keys! {
+    EFFECTS_KEYS, EFFECTS_GPU_KEYS, EFFECTS_CPU_KEYS;
     gpu: [
         "ref_text_gpu_rel",
         "episode_gpu_rel",
@@ -390,19 +394,110 @@ effects_keys! {
     ],
 }
 
-/// [`EFFECTS_LANE`]'s GPU keys alone: an arm with a GPU clock on a host with no instruction
-/// counter the harness reads (wgpu with timestamp queries off macOS).
-const EFFECTS_GPU_LANE: FloorLane = FloorLane {
-    keys: EFFECTS_GPU_KEYS,
-    ..EFFECTS_LANE
+/// A lane the effects harness measures: the harness run it judges, and the halves of its keys
+/// a host with only one of the GPU clock and the instruction counter judges.
+pub(crate) struct EffectsLane {
+    /// Every gated key.
+    pub full: FloorLane,
+    /// The GPU keys alone: an arm with a GPU clock (Metal's) on a host with no instruction
+    /// counter the harness reads.
+    pub gpu: FloorLane,
+    /// The CPU work keys alone: an arm with no GPU clock (a device without timestamp queries)
+    /// on a host that counts instructions.
+    pub cpu: FloorLane,
+    /// The harness's arguments: the scenes it runs and the ground it draws them on.
+    pub args: &'static [&'static str],
+    /// The ground its report must name (`dark` or `light`): a light lane fed a dark frame
+    /// would judge the dark trail under the light trail's name.
+    pub ground: &'static str,
+}
+
+/// [`EFFECTS_LANE`], every scene a bare harness run draws, on the dark ground.
+pub(crate) const EFFECTS: EffectsLane = EffectsLane {
+    gpu: FloorLane {
+        keys: EFFECTS_GPU_KEYS,
+        ..EFFECTS_LANE
+    },
+    cpu: FloorLane {
+        keys: EFFECTS_CPU_KEYS,
+        ..EFFECTS_LANE
+    },
+    full: EFFECTS_LANE,
+    args: &[],
+    ground: "dark",
 };
 
-/// [`EFFECTS_LANE`]'s CPU work keys alone: an arm with no GPU clock (a device without
-/// timestamp queries) on a host that counts instructions.
-const EFFECTS_CPU_LANE: FloorLane = FloorLane {
-    keys: EFFECTS_CPU_KEYS,
-    ..EFFECTS_LANE
-};
+effects_keys! {
+    COMPOSER_KEYS, COMPOSER_GPU_KEYS, COMPOSER_CPU_KEYS;
+    gpu: ["composer_gpu_rel"],
+    cpu: [
+        "composer_emit_per_ginsn",
+        "composer_raster_per_ginsn",
+        "composer_encode_per_ginsn",
+    ],
+}
+
+/// A lane of the cursor trail on Claude Code's composer (docs/design/PRISM-GLASS.md §15.1
+/// P0.12): the effects harness's `composer` scene alone, drawn on `ground` by `args`.
+const fn composer_lane(
+    cli: &'static str,
+    baseline_file: &'static str,
+    comment: &'static str,
+    args: &'static [&'static str],
+    ground: &'static str,
+) -> EffectsLane {
+    let full = FloorLane {
+        lane: cli,
+        example: "effects_harness",
+        keys: COMPOSER_KEYS,
+        baseline_file,
+        comment,
+        cli,
+    };
+    EffectsLane {
+        gpu: FloorLane {
+            keys: COMPOSER_GPU_KEYS,
+            ..full
+        },
+        cpu: FloorLane {
+            keys: COMPOSER_CPU_KEYS,
+            ..full
+        },
+        full,
+        args,
+        ground,
+    }
+}
+
+/// The composer's trail on Default, the dark ground.
+pub(crate) const TRAIL_DARK_COMPOSER: EffectsLane = composer_lane(
+    "trail-dark-composer",
+    "perf-baseline-trail-dark-composer.json",
+    "aterm TRAIL-DARK-COMPOSER baseline (docs/design/PRISM-GLASS.md §15.1 P0.12): the effects \
+     harness's composer scene, Rainbow Kitty typed at 10 keys a second to a 117-cell line in \
+     Claude Code's composer (its prompt between two rules) on Default's dark ground: the GPU \
+     time as a reference full-repaint frame's p50 over the scene's (composer_gpu_rel), and the \
+     CPU work of the producer, the CPU raster and the GPU encode as frames per 10^9 \
+     instructions retired (_per_ginsn). BIGGER-IS-BETTER. Re-record with targo --unverified \
+     verify perf --record trail-dark-composer.",
+    &["--only", "composer"],
+    "dark",
+);
+
+/// The composer's trail on Default Light: main's light (paper) arm.
+pub(crate) const TRAIL_LIGHT_COMPOSER: EffectsLane = composer_lane(
+    "trail-light-composer",
+    "perf-baseline-trail-light-composer.json",
+    "aterm TRAIL-LIGHT-COMPOSER baseline (docs/design/PRISM-GLASS.md §15.1 P0.12): \
+     trail-dark-composer's scene on Default Light (effects_harness --light), the glow's \
+     dark_theme read off that ground as a window reads it (theme_is_dark), so the trail draws \
+     main's light (paper) arm: the GPU time as a reference full-repaint frame's p50 over the \
+     scene's (composer_gpu_rel), and the CPU work of the producer, the CPU raster and the GPU \
+     encode as frames per 10^9 instructions retired (_per_ginsn). BIGGER-IS-BETTER. Re-record \
+     with targo --unverified verify perf --record trail-light-composer.",
+    &["--only", "composer", "--light"],
+    "light",
+);
 
 /// The report keys whose figures are the operating point the effects lane's GPU keys are
 /// measured at: the reference full repaint's GPU p50 and the blank one's, in us. Every GPU
@@ -478,11 +573,16 @@ fn write_baseline(path: &Path, text: &str) -> LaneRun {
 
 /// Run an `aterm-bench` example in release and return its JSON report.
 pub(crate) fn measure_example(example: &str) -> Result<Value, String> {
-    measure_example_with(example, &[])
+    measure_example_with(example, &[], &[])
 }
 
-/// [`measure_example`] with `aterm-bench` features on (a harness that needs a dev seam).
-fn measure_example_with(example: &str, features: &[&str]) -> Result<Value, String> {
+/// [`measure_example`] with `aterm-bench` features on (a harness that needs a dev seam), handed
+/// `harness_args` (the scenes a harness runs, and on what).
+fn measure_example_with(
+    example: &str,
+    features: &[&str],
+    harness_args: &[&str],
+) -> Result<Value, String> {
     let driver = super::driver::cargo_driver()?;
     let features = features.join(",");
     let mut args = vec!["--release", "-q", "-p", "aterm-bench"];
@@ -490,6 +590,10 @@ fn measure_example_with(example: &str, features: &[&str]) -> Result<Value, Strin
         args.extend(["--features", features.as_str()]);
     }
     args.extend(["--example", example]);
+    if !harness_args.is_empty() {
+        args.push("--");
+        args.extend(harness_args);
+    }
     eprintln!("  $ {}", driver.display_workspace("run", &args));
     let out = driver
         .workspace_command("run")
@@ -667,27 +771,28 @@ fn judge_crash_restore(json: &Value, record: bool) -> LaneRun {
     run
 }
 
-/// Effects: the calibrated floors, judged on the keys the harness's GPU clock allows.
-pub(crate) fn gate_effects(record: bool) -> LaneRun {
-    match measure_example_with(EFFECTS_LANE.example, EFFECTS_FEATURES) {
-        Ok(json) => judge_effects(&json, record),
+/// An effects harness lane: the calibrated floors, judged on the keys the harness's GPU clock
+/// allows.
+pub(crate) fn gate_effects(lane: &EffectsLane, record: bool) -> LaneRun {
+    match measure_example_with(lane.full.example, EFFECTS_FEATURES, lane.args) {
+        Ok(json) => judge_effects(lane, &json, record),
         Err(e) => LaneRun::fail(format!("could not measure: {e}")),
     }
 }
 
-fn judge_effects(json: &Value, record: bool) -> LaneRun {
-    let (lane, missing) = match effects_lane(json, record) {
-        Ok(lane) => lane,
+fn judge_effects(lane: &EffectsLane, json: &Value, record: bool) -> LaneRun {
+    let (judged, missing) = match effects_lane(lane, json, record) {
+        Ok(judged) => judged,
         Err(run) => return run,
     };
-    let mut run = judge_keyed(lane, json, record);
-    run.unjudged.extend(missing.map(str::to_string));
-    at_gpu_point(&mut run, json);
+    let mut run = judge_keyed(judged, json, record);
+    run.unjudged.extend(missing);
+    at_gpu_point(lane, &mut run, json);
     let reported = json.as_object().map_or(0, |o| o.len());
     eprintln!(
         "    UNGATED — {} more keys reported, not judged (the record: absolute costs, spreads, \
          time against the reference, the ablation)",
-        reported.saturating_sub(lane.keys.len())
+        reported.saturating_sub(judged.keys.len())
     );
     run
 }
@@ -695,7 +800,7 @@ fn judge_effects(json: &Value, record: bool) -> LaneRun {
 /// Pin each GPU trend sample to the GPU state the report measured it in, or keep it out of the
 /// trend when the report does not say: held against another state's rows, a state change reads
 /// as a regression.
-fn at_gpu_point(run: &mut LaneRun, json: &Value) {
+fn at_gpu_point(lane: &EffectsLane, run: &mut LaneRun, json: &Value) {
     let at: Option<Vec<PointFigure>> = EFFECTS_GPU_POINT
         .iter()
         .map(|&name| {
@@ -706,7 +811,7 @@ fn at_gpu_point(run: &mut LaneRun, json: &Value) {
         .collect();
     let before = run.samples.len();
     run.samples.retain_mut(|s| {
-        if !EFFECTS_GPU_KEYS.contains(&s.metric.as_str()) {
+        if !lane.gpu.keys.contains(&s.metric.as_str()) {
             return true;
         }
         s.at.clone_from(at.as_ref().unwrap_or(&Vec::new()));
@@ -720,17 +825,19 @@ fn at_gpu_point(run: &mut LaneRun, json: &Value) {
              {figures}, so it does not say which GPU state they were measured in."
         );
         run.unjudged.push(format!(
-            "effects GPU trend ({dropped} key(s); the report lacks {figures})"
+            "{} GPU trend ({dropped} key(s); the report lacks {figures})",
+            lane.full.cli
         ));
     }
 }
 
-/// The lane that judges an effects report, and what this host could not measure for it; or the
-/// run that ends it before any baseline is read.
-fn effects_lane(
+/// The keys that judge an effects report, and what this host could not measure for them; or
+/// the run that ends it before any baseline is read.
+fn effects_lane<'a>(
+    lane: &'a EffectsLane,
     json: &Value,
     record: bool,
-) -> Result<(&'static FloorLane, Option<&'static str>), LaneRun> {
+) -> Result<(&'a FloorLane, Option<String>), LaneRun> {
     if let Some(why) = json.get("skip").and_then(Value::as_str) {
         return Err(LaneRun::skip(
             format!("the effects harness could not draw here: {why}"),
@@ -738,26 +845,38 @@ fn effects_lane(
         ));
     }
     let named = |key: &str| json.get(key).and_then(Value::as_str);
+    if named("ground") != Some(lane.ground) {
+        return Err(LaneRun::fail(format!(
+            "the harness report names the {} ground, not the {} ground {} measures; refusing \
+             to judge it",
+            named("ground").unwrap_or("no"),
+            lane.ground,
+            lane.full.cli
+        )));
+    }
     let (Some(clock), Some(counter)) = (named("gpu_clock"), named("cpu_counter")) else {
         return Err(LaneRun::fail(
             "the harness report does not name its gpu_clock and cpu_counter; refusing to judge it",
         ));
     };
-    if !matches!(clock, "metal" | "wgpu" | "none") || !matches!(counter, "instructions" | "none") {
+    if !matches!(clock, "metal" | "none") || !matches!(counter, "instructions" | "none") {
         return Err(LaneRun::fail(format!(
             "the harness report names an unsupported clock or counter ({clock}, {counter}); \
              refusing to judge it"
         )));
     }
-    let (lane, missing) = match (clock != "none", counter != "none") {
-        (true, true) => (&EFFECTS_LANE, None),
+    let cli = lane.full.cli;
+    let (judged, missing) = match (clock != "none", counter != "none") {
+        (true, true) => (&lane.full, None),
         (true, false) => (
-            &EFFECTS_GPU_LANE,
-            Some("effects CPU work (no instruction counter on this host)"),
+            &lane.gpu,
+            Some(format!(
+                "{cli} CPU work (no instruction counter on this host)"
+            )),
         ),
         (false, true) => (
-            &EFFECTS_CPU_LANE,
-            Some("effects GPU time (this arm has no GPU clock)"),
+            &lane.cpu,
+            Some(format!("{cli} GPU time (this arm has no GPU clock)")),
         ),
         (false, false) => {
             return Err(LaneRun::skip(
@@ -767,13 +886,13 @@ fn effects_lane(
             ));
         }
     };
-    if let Some(what) = missing.filter(|_| record) {
+    if let Some(what) = missing.as_ref().filter(|_| record) {
         return Err(LaneRun::fail(format!(
             "REFUSING to record — the baseline would lose the floors this host cannot judge \
              ({what}); record on a host that has both (macOS)"
         )));
     }
-    Ok((lane, missing))
+    Ok((judged, missing))
 }
 
 /// The tail tap's fence: a missing ratio is a breach (an unmeasured cost is not a small one).
@@ -976,7 +1095,7 @@ mod tests {
         assert!(compare_against_baseline(&path, &report(1234.5)).failed());
     }
 
-    const KEYED_LANES: [&FloorLane; 10] = [
+    const KEYED_LANES: [&FloorLane; 16] = [
         &PATHOLOGICAL_LANE,
         &SCROLL_LANE,
         &SEARCH_LANE,
@@ -984,9 +1103,15 @@ mod tests {
         &RESIZE_LANE,
         &ZSTD_LANE,
         &CRASH_RESTORE_LANE,
-        &EFFECTS_LANE,
-        &EFFECTS_GPU_LANE,
-        &EFFECTS_CPU_LANE,
+        &EFFECTS.full,
+        &EFFECTS.gpu,
+        &EFFECTS.cpu,
+        &TRAIL_DARK_COMPOSER.full,
+        &TRAIL_DARK_COMPOSER.gpu,
+        &TRAIL_DARK_COMPOSER.cpu,
+        &TRAIL_LIGHT_COMPOSER.full,
+        &TRAIL_LIGHT_COMPOSER.gpu,
+        &TRAIL_LIGHT_COMPOSER.cpu,
     ];
 
     fn keyed_line(lane: &FloorLane, scale: f64) -> Value {
@@ -1216,15 +1341,23 @@ mod tests {
     /// lane-selection checks do not depend on the measured costs of a frame.
     const HEALTHY: f64 = 1e12;
 
-    /// An effects report: every key of `keys` at `value`, the clock and counter the harness
-    /// named, and a few of the ungated keys it reports beside them.
-    fn effects_report(
+    /// Every lane the effects harness measures.
+    const EFFECTS_LANES: [&EffectsLane; 3] =
+        [&EFFECTS, &TRAIL_DARK_COMPOSER, &TRAIL_LIGHT_COMPOSER];
+
+    /// An effects report on `ground`: every key of `keys` at `value`, the clock and counter the
+    /// harness named, and a few of the ungated keys it reports beside them.
+    fn report_on(
+        ground: Option<&str>,
         clock: Option<&str>,
         counter: Option<&str>,
         keys: &[&str],
         value: f64,
     ) -> Value {
         let mut s = String::from("{");
+        if let Some(ground) = ground {
+            s.push_str(&format!("\"ground\":\"{ground}\","));
+        }
         if let Some(clock) = clock {
             s.push_str(&format!("\"gpu_clock\":\"{clock}\","));
         }
@@ -1238,19 +1371,36 @@ mod tests {
         json(&s)
     }
 
-    /// The lane choice's verdict, as the lane's CLI name or the run's status.
-    fn chosen(json: &Value, record: bool) -> Result<(&'static str, Option<&'static str>), Status> {
-        effects_lane(json, record)
-            .map(|(lane, missing)| (lane.keys[0], missing))
+    /// [`report_on`] the ground `lane` measures.
+    fn effects_report(
+        lane: &EffectsLane,
+        clock: Option<&str>,
+        counter: Option<&str>,
+        keys: &[&str],
+        value: f64,
+    ) -> Value {
+        report_on(Some(lane.ground), clock, counter, keys, value)
+    }
+
+    /// The lane choice's verdict, as the first key it judges or the run's status.
+    fn chosen(
+        lane: &EffectsLane,
+        json: &Value,
+        record: bool,
+    ) -> Result<(&'static str, Option<String>), Status> {
+        effects_lane(lane, json, record)
+            .map(|(judged, missing)| (judged.keys[0], missing))
             .map_err(|run| run.status)
     }
 
     #[test]
     fn an_effects_host_without_a_gpu_skips_and_names_why() {
-        let run = judge_effects(&json("{\"skip\":\"no Metal device\"}"), false);
-        match run.status {
-            Status::Skip { why, .. } => assert!(why.contains("no Metal device"), "{why}"),
-            other => panic!("a host without a GPU skips, got {other:?}"),
+        for lane in EFFECTS_LANES {
+            let run = judge_effects(lane, &json("{\"skip\":\"no Metal device\"}"), false);
+            match run.status {
+                Status::Skip { why, .. } => assert!(why.contains("no Metal device"), "{why}"),
+                other => panic!("a host without a GPU skips, got {other:?}"),
+            }
         }
     }
 
@@ -1258,55 +1408,108 @@ mod tests {
     /// work keys; no instruction counter, the GPU keys; neither, a skip.
     #[test]
     fn an_effects_host_is_judged_on_what_it_measures_and_records_only_with_both() {
-        let full = effects_report(
-            Some("metal"),
-            Some("instructions"),
-            EFFECTS_LANE.keys,
-            HEALTHY,
-        );
-        assert_eq!(chosen(&full, false), Ok((EFFECTS_LANE.keys[0], None)));
-        assert_eq!(chosen(&full, true), Ok((EFFECTS_LANE.keys[0], None)));
-        assert!(!judge_effects(&full, false).failed());
+        for lane in EFFECTS_LANES {
+            let cli = lane.full.cli;
+            let full = effects_report(
+                lane,
+                Some("metal"),
+                Some("instructions"),
+                lane.full.keys,
+                HEALTHY,
+            );
+            assert_eq!(chosen(lane, &full, false), Ok((lane.full.keys[0], None)));
+            assert_eq!(chosen(lane, &full, true), Ok((lane.full.keys[0], None)));
+            assert!(!judge_effects(lane, &full, false).failed(), "{cli}");
 
-        let clockless = effects_report(
-            Some("none"),
-            Some("instructions"),
-            EFFECTS_CPU_LANE.keys,
-            HEALTHY,
-        );
-        let run = judge_effects(&clockless, false);
-        assert!(!run.failed(), "{run:?}");
-        assert!(
-            run.unjudged.iter().any(|u| u.contains("no GPU clock")),
-            "{run:?}"
-        );
-        assert!(
-            run.samples.iter().all(|t| t.metric.ends_with("_per_ginsn")),
-            "{run:?}"
-        );
+            let clockless = effects_report(
+                lane,
+                Some("none"),
+                Some("instructions"),
+                lane.cpu.keys,
+                HEALTHY,
+            );
+            let run = judge_effects(lane, &clockless, false);
+            assert!(!run.failed(), "{run:?}");
+            assert!(
+                run.unjudged
+                    .iter()
+                    .any(|u| u.starts_with(cli) && u.contains("no GPU clock")),
+                "{run:?}"
+            );
+            assert!(
+                run.samples.iter().all(|t| t.metric.ends_with("_per_ginsn")),
+                "{run:?}"
+            );
 
-        let uncounted = effects_report(Some("wgpu"), Some("none"), EFFECTS_GPU_LANE.keys, HEALTHY);
-        let run = judge_effects(&uncounted, false);
-        assert!(!run.failed(), "{run:?}");
-        assert!(
-            run.unjudged
-                .iter()
-                .any(|u| u.contains("no instruction counter")),
-            "{run:?}"
-        );
-        assert!(
-            run.samples.iter().all(|t| t.metric.ends_with("_gpu_rel")),
-            "{run:?}"
-        );
+            let uncounted =
+                effects_report(lane, Some("metal"), Some("none"), lane.gpu.keys, HEALTHY);
+            let run = judge_effects(lane, &uncounted, false);
+            assert!(!run.failed(), "{run:?}");
+            assert!(
+                run.unjudged
+                    .iter()
+                    .any(|u| u.starts_with(cli) && u.contains("no instruction counter")),
+                "{run:?}"
+            );
+            assert!(
+                run.samples.iter().all(|t| t.metric.ends_with("_gpu_rel")),
+                "{run:?}"
+            );
 
-        for partial in [&clockless, &uncounted] {
-            match chosen(partial, true) {
-                Err(Status::Fail(f)) => assert!(f[0].starts_with("REFUSING to record"), "{f:?}"),
-                other => panic!("a partial host must not record, got {other:?}"),
+            for partial in [&clockless, &uncounted] {
+                match chosen(lane, partial, true) {
+                    Err(Status::Fail(f)) => {
+                        assert!(f[0].starts_with("REFUSING to record"), "{f:?}");
+                    }
+                    other => panic!("a partial host must not record, got {other:?}"),
+                }
             }
+            let neither = effects_report(lane, Some("none"), Some("none"), &[], HEALTHY);
+            assert!(matches!(
+                chosen(lane, &neither, false),
+                Err(Status::Skip { .. })
+            ));
         }
-        let neither = effects_report(Some("none"), Some("none"), &[], HEALTHY);
-        assert!(matches!(chosen(&neither, false), Err(Status::Skip { .. })));
+    }
+
+    /// A lane judges only a report drawn on its own ground: the light composer lane fed the
+    /// dark scene (a `--light` that never reached the harness) would hold the light trail to
+    /// the dark trail's floors. NEGATIVE CONTROL: the same report on the lane's own ground is
+    /// judged.
+    #[test]
+    fn a_report_on_another_ground_is_refused_not_judged() {
+        for lane in EFFECTS_LANES {
+            let keys = lane.full.keys;
+            let other = if lane.ground == "dark" {
+                "light"
+            } else {
+                "dark"
+            };
+            for ground in [Some(other), None] {
+                let report = report_on(ground, Some("metal"), Some("instructions"), keys, HEALTHY);
+                for record in [false, true] {
+                    match chosen(lane, &report, record) {
+                        Err(Status::Fail(f)) => assert!(
+                            f[0].contains(lane.ground) && f[0].contains(lane.full.cli),
+                            "{f:?}"
+                        ),
+                        other => panic!("{ground:?} under {}: {other:?}", lane.full.cli),
+                    }
+                }
+            }
+            let own = report_on(
+                Some(lane.ground),
+                Some("metal"),
+                Some("instructions"),
+                keys,
+                HEALTHY,
+            );
+            assert!(
+                !judge_effects(lane, &own, false).failed(),
+                "{}",
+                lane.full.cli
+            );
+        }
     }
 
     /// Each GPU trend sample names the reference and blank repaints' GPU p50s it was measured
@@ -1315,59 +1518,60 @@ mod tests {
     /// unchanged.
     #[test]
     fn effects_gpu_trend_samples_carry_the_reference_repaints_they_were_measured_at() {
-        let mut full = effects_report(
-            Some("metal"),
-            Some("instructions"),
-            EFFECTS_LANE.keys,
-            HEALTHY,
-        );
-        let unplaced = judge_effects(&full, false);
-        let mut half = full.clone();
-        if let Some(o) = full.as_object_mut() {
-            o.insert("ref_gpu_p50_us".to_string(), Value::from(535.667));
-            o.insert("ref_blank_gpu_p50_us".to_string(), Value::from(367.5));
-        }
-        if let Some(o) = half.as_object_mut() {
-            o.insert("ref_gpu_p50_us".to_string(), Value::from(535.667));
-        }
-        let run = judge_effects(&full, false);
-        assert!(!run.failed(), "{run:?}");
-        assert_eq!(run.samples.len(), EFFECTS_LANE.keys.len());
-        for s in &run.samples {
-            let gpu = EFFECTS_GPU_KEYS.contains(&s.metric.as_str());
-            let want = if gpu {
-                vec![
-                    PointFigure {
-                        name: "ref_gpu_p50_us",
-                        value: 535.667,
-                    },
-                    PointFigure {
-                        name: "ref_blank_gpu_p50_us",
-                        value: 367.5,
-                    },
-                ]
-            } else {
-                Vec::new()
-            };
-            assert_eq!(s.at, want, "{}", s.metric);
-        }
-        for partial in [unplaced, judge_effects(&half, false)] {
-            assert!(!partial.failed(), "{partial:?}");
-            assert!(
-                partial
-                    .samples
-                    .iter()
-                    .all(|s| s.metric.ends_with("_per_ginsn") && s.at.is_empty()),
-                "{partial:?}"
+        for lane in EFFECTS_LANES {
+            let mut full = effects_report(
+                lane,
+                Some("metal"),
+                Some("instructions"),
+                lane.full.keys,
+                HEALTHY,
             );
-            assert_eq!(partial.samples.len(), EFFECTS_CPU_KEYS.len());
-            assert!(
-                partial
-                    .unjudged
-                    .iter()
-                    .any(|u| u.contains("ref_blank_gpu_p50_us")),
-                "{partial:?}"
-            );
+            let unplaced = judge_effects(lane, &full, false);
+            let mut half = full.clone();
+            if let Some(o) = full.as_object_mut() {
+                o.insert("ref_gpu_p50_us".to_string(), Value::from(535.667));
+                o.insert("ref_blank_gpu_p50_us".to_string(), Value::from(367.5));
+            }
+            if let Some(o) = half.as_object_mut() {
+                o.insert("ref_gpu_p50_us".to_string(), Value::from(535.667));
+            }
+            let run = judge_effects(lane, &full, false);
+            assert!(!run.failed(), "{run:?}");
+            assert_eq!(run.samples.len(), lane.full.keys.len());
+            for s in &run.samples {
+                let gpu = lane.gpu.keys.contains(&s.metric.as_str());
+                let want = if gpu {
+                    vec![
+                        PointFigure {
+                            name: "ref_gpu_p50_us",
+                            value: 535.667,
+                        },
+                        PointFigure {
+                            name: "ref_blank_gpu_p50_us",
+                            value: 367.5,
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(s.at, want, "{}", s.metric);
+            }
+            for partial in [unplaced, judge_effects(lane, &half, false)] {
+                assert!(!partial.failed(), "{partial:?}");
+                assert!(
+                    partial
+                        .samples
+                        .iter()
+                        .all(|s| s.metric.ends_with("_per_ginsn") && s.at.is_empty()),
+                    "{partial:?}"
+                );
+                assert_eq!(partial.samples.len(), lane.cpu.keys.len());
+                assert!(
+                    partial.unjudged.iter().any(|u| u.starts_with(lane.full.cli)
+                        && u.contains("ref_blank_gpu_p50_us")),
+                    "{partial:?}"
+                );
+            }
         }
     }
 
@@ -1375,36 +1579,32 @@ mod tests {
     /// which clock or counter it read, is refused rather than judged on what is left.
     #[test]
     fn an_effects_report_names_its_clock_and_counter_and_carries_every_key() {
-        let full = effects_report(
-            Some("metal"),
-            Some("instructions"),
-            EFFECTS_LANE.keys,
-            HEALTHY,
-        );
-        for key in [
-            "ref_text_gpu_rel",
-            "typing_gpu_rel",
-            "scroll_encode_per_ginsn",
-        ] {
-            let mut partial = full.clone();
-            if let Some(o) = partial.as_object_mut() {
-                o.remove(key);
+        for lane in EFFECTS_LANES {
+            let keys = lane.full.keys;
+            let full = effects_report(lane, Some("metal"), Some("instructions"), keys, HEALTHY);
+            let gpu_key = lane.gpu.keys[lane.gpu.keys.len() - 1];
+            let cpu_key = lane.cpu.keys[lane.cpu.keys.len() - 1];
+            for key in [keys[0], gpu_key, cpu_key] {
+                let mut partial = full.clone();
+                if let Some(o) = partial.as_object_mut() {
+                    o.remove(key);
+                }
+                assert!(judge_effects(lane, &partial, false).failed(), "{key}");
             }
-            assert!(judge_effects(&partial, false).failed(), "{key}");
-        }
-        let no_clock = effects_report(None, Some("instructions"), EFFECTS_LANE.keys, HEALTHY);
-        assert!(judge_effects(&no_clock, false).failed());
-        let no_counter = effects_report(Some("metal"), None, EFFECTS_LANE.keys, HEALTHY);
-        assert!(judge_effects(&no_counter, false).failed());
-        for (clock, counter) in [
-            ("", "instructions"),
-            ("metla", "instructions"),
-            ("metal", ""),
-            ("metal", "cycles"),
-        ] {
-            let unknown = effects_report(Some(clock), Some(counter), EFFECTS_LANE.keys, HEALTHY);
-            assert!(judge_effects(&unknown, false).failed());
-            assert!(matches!(chosen(&unknown, true), Err(Status::Fail(_))));
+            let no_clock = effects_report(lane, None, Some("instructions"), keys, HEALTHY);
+            assert!(judge_effects(lane, &no_clock, false).failed());
+            let no_counter = effects_report(lane, Some("metal"), None, keys, HEALTHY);
+            assert!(judge_effects(lane, &no_counter, false).failed());
+            for (clock, counter) in [
+                ("", "instructions"),
+                ("metla", "instructions"),
+                ("metal", ""),
+                ("metal", "cycles"),
+            ] {
+                let unknown = effects_report(lane, Some(clock), Some(counter), keys, HEALTHY);
+                assert!(judge_effects(lane, &unknown, false).failed());
+                assert!(matches!(chosen(lane, &unknown, true), Err(Status::Fail(_))));
+            }
         }
     }
 }

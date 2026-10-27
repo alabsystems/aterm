@@ -754,12 +754,28 @@ struct Wrapper {
     name: &'static str,
     short: &'static [(char, Takes)],
     long: &'static [(&'static str, Takes)],
-    /// `NAME=value` words may sit between its flags and the program (sudo, env, the shell's `time`).
-    assignments: bool,
+    /// Who reads the `NAME=value` words that may sit between its flags and the program.
+    assignments: Assignments,
     /// nice's old `-N` adjustment.
     numeric: bool,
     /// env's lone `-`, the old spelling of `-i`.
     lone_dash: bool,
+}
+
+/// Who reads a wrapper's `NAME=value` words, by whose rule: the reader decides what is an
+/// assignment and what is the program word, and a word read by the wrong rule makes an
+/// argument the program (`'FOO=1' x` runs `FOO=1`) or shows a value as the program
+/// (`env a.b=x make` runs make).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Assignments {
+    /// None: a word shaped like one is the program word ([`lead`] closes on it).
+    None,
+    /// The wrapper, from the argv it is handed ([`argv_assignment`]): sudo, env.
+    Argv,
+    /// The shell ([`shell_assignment`], as typed), only where the wrapper is its own `time`
+    /// keyword: the line's program word, typed bare, with no assignment before it. As a program
+    /// (`/usr/bin/time`, after an assignment, or run by another wrapper) `time` reads none.
+    Keyword,
 }
 
 const WRAPPERS: [Wrapper; 7] = [
@@ -815,7 +831,7 @@ const WRAPPERS: [Wrapper; 7] = [
             ("shell", Takes::Nothing),
             ("login", Takes::Nothing),
         ],
-        assignments: true,
+        assignments: Assignments::Argv,
         numeric: false,
         lone_dash: false,
     },
@@ -837,7 +853,7 @@ const WRAPPERS: [Wrapper; 7] = [
             ("ignore-environment", Takes::Nothing),
             ("null", Takes::Nothing),
         ],
-        assignments: true,
+        assignments: Assignments::Argv,
         numeric: false,
         lone_dash: true,
     },
@@ -860,7 +876,7 @@ const WRAPPERS: [Wrapper; 7] = [
             ("verbose", Takes::Nothing),
             ("quiet", Takes::Nothing),
         ],
-        assignments: true,
+        assignments: Assignments::Keyword,
         numeric: false,
         lone_dash: false,
     },
@@ -868,7 +884,7 @@ const WRAPPERS: [Wrapper; 7] = [
         name: "nice",
         short: &[('n', Takes::Value)],
         long: &[("adjustment", Takes::Value)],
-        assignments: false,
+        assignments: Assignments::None,
         numeric: true,
         lone_dash: false,
     },
@@ -876,7 +892,7 @@ const WRAPPERS: [Wrapper; 7] = [
         name: "command",
         short: &[('p', Takes::Nothing)],
         long: &[],
-        assignments: false,
+        assignments: Assignments::None,
         numeric: false,
         lone_dash: false,
     },
@@ -884,7 +900,7 @@ const WRAPPERS: [Wrapper; 7] = [
         name: "nohup",
         short: &[],
         long: &[],
-        assignments: false,
+        assignments: Assignments::None,
         numeric: false,
         lone_dash: false,
     },
@@ -896,13 +912,99 @@ const WRAPPERS: [Wrapper; 7] = [
             ('l', Takes::Nothing),
         ],
         long: &[],
-        assignments: false,
+        assignments: Assignments::None,
         numeric: false,
         lone_dash: false,
     },
 ];
 const KEYWORD_OPENERS: [&str; 6] = ["for", "while", "if", "until", "case", "{"];
+/// The words, as typed, that the shell reads in a command's first place without running them,
+/// stepped over to the command they stand before: `!` alone negates its pipeline's status, `{`
+/// and `(` open a group and a subshell, and pwsh's `&` calls the program its next word names.
+/// The shell knows them only unquoted and before any assignment.
+const STEPPED_OVER: [&str; 4] = ["!", "{", "(", "&"];
+/// The commands with no letter or digit in their name that people know by sight: the null
+/// command, sourcing a file (`source`'s other spelling, so the file is its argument, as
+/// `bash run.sh` reads `bash`) and `test`. A detail names the word itself, never a word after it.
+const NAMELESS_COMMANDS: [&str; 3] = [":", ".", "["];
 const WORD_TRIM: [char; 8] = ['\'', '"', '`', ';', '(', ')', '&', '|'];
+
+/// What a word in a command's first place is: the one rule [`command_detail`], [`leading_word`]
+/// and a wrapper's program ([`unwrap`]) read it by. The first word that is neither an assignment
+/// nor a word of [`STEPPED_OVER`] is the program word; when it has no name to read, nothing after
+/// it is read, because every later word is its argument.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lead {
+    /// `NAME=value`: environment for the command after it.
+    Assignment,
+    /// A word of [`STEPPED_OVER`].
+    Step(&'static str),
+    /// The program word, with a name to read.
+    Program,
+    /// A word of [`NAMELESS_COMMANDS`]: the command is the word itself.
+    Nameless(&'static str),
+    /// No program can be named: a word with no letter or digit, a history designator (`!!`,
+    /// `!$`, `!git`, `^old^new`), whose words are another line's, an arithmetic command
+    /// (`((n+1))`), which runs none, or a word whose name holds an `=` the shell takes for no
+    /// assignment (`'FOO=1'`, `"A=b c"`, `1=x`, pwsh's `$env:A='b'`), which reads as a value.
+    Closed,
+}
+
+/// Reads one word in a command's first place: `raw` as typed (`None` for a word read out of an
+/// env `-S` value) and `text` as read ([`clean`]). Whether it is an assignment is the shell's
+/// call, on the word as typed ([`shell_assignment`]): a quoted `'FOO=1'` is the program word.
+fn lead(raw: Option<&str>, text: &str) -> Lead {
+    let typed = raw.unwrap_or(text);
+    if let Some(&word) = STEPPED_OVER.iter().find(|&&word| word == typed) {
+        return Lead::Step(word);
+    }
+    if let Some(&word) = NAMELESS_COMMANDS.iter().find(|&&word| word == text) {
+        return Lead::Nameless(word);
+    }
+    let designator = text.starts_with('^') || (text.starts_with('!') && text.len() > 1);
+    if designator || typed.starts_with("((") {
+        return Lead::Closed;
+    }
+    if shell_assignment(typed.strip_prefix('(').unwrap_or(typed)) {
+        return Lead::Assignment;
+    }
+    let named = basename(text).is_some_and(|name| !name.contains('='));
+    if named && text.chars().any(char::is_alphanumeric) {
+        Lead::Program
+    } else {
+        Lead::Closed
+    }
+}
+
+/// The program word of `words` by [`lead`]'s rule (`of` reads each word), with what it is
+/// (`Lead::Program`, `Lead::Nameless` or `Lead::Closed`, or `Lead::Step` for a stepped-over word
+/// `stop` names, the opener [`leading_word`] looks for) and whether an assignment came before
+/// it. A word of [`STEPPED_OVER`] after an assignment is no reserved word to the shell, so it
+/// closes. `None` when the words end first.
+fn command_word<W>(
+    words: &mut impl Iterator<Item = W>,
+    of: impl Fn(&W) -> Lead,
+    stop: impl Fn(&str) -> bool,
+) -> Option<(W, Lead, bool)> {
+    let mut assigned = false;
+    for word in words {
+        match of(&word) {
+            Lead::Assignment => assigned = true,
+            Lead::Step(_) if assigned => return Some((word, Lead::Closed, assigned)),
+            Lead::Step(step) if stop(step) => return Some((word, Lead::Step(step), assigned)),
+            Lead::Step(_) => {}
+            other => return Some((word, other, assigned)),
+        }
+    }
+    None
+}
+
+/// Whether the shell's own `time` keyword is `word`, a line's program word with `assigned`
+/// telling whether an assignment came before it: typed bare (a `(` before it opens a subshell),
+/// as bash and zsh know their reserved words. Anywhere else `time` is `/usr/bin/time`.
+fn time_keyword(word: &Word<'_>, assigned: bool) -> bool {
+    !assigned && word.raw.map(|raw| raw.strip_prefix('(').unwrap_or(raw)) == Some("time")
+}
 
 fn wrapper_named(name: &str) -> Option<&'static Wrapper> {
     WRAPPERS.iter().find(|wrapper| wrapper.name == name)
@@ -929,11 +1031,16 @@ enum Flag<W> {
     Closed,
 }
 
-/// Reads `wrapper`'s flags and assignments off `words` up to the word naming the program it runs.
-fn unwrap<W: AsRef<str>>(wrapper: &Wrapper, words: &mut impl Iterator<Item = W>) -> Unwrap<W> {
+/// Reads `wrapper`'s flags and assignments off `words` up to the word naming the program it runs;
+/// `keyword` says the wrapper is the shell's own `time` ([`time_keyword`]).
+fn unwrap<'a>(
+    wrapper: &Wrapper,
+    keyword: bool,
+    words: &mut impl Iterator<Item = Word<'a>>,
+) -> Unwrap<Word<'a>> {
     let mut flags = true;
     while let Some(word) = words.next() {
-        let text = word.as_ref();
+        let text: &str = &word.text;
         if flags && text.starts_with('-') {
             match read_flag(wrapper, text, words) {
                 Flag::Read => continue,
@@ -946,14 +1053,17 @@ fn unwrap<W: AsRef<str>>(wrapper: &Wrapper, words: &mut impl Iterator<Item = W>)
                 Flag::Closed => return Unwrap::Closed,
             }
         }
-        if is_assignment(text) {
-            if !wrapper.assignments {
-                return Unwrap::Closed;
-            }
+        let assignment = match wrapper.assignments {
+            Assignments::Argv => argv_assignment(text),
+            Assignments::Keyword => keyword && lead(word.raw, text) == Lead::Assignment,
+            Assignments::None => false,
+        };
+        if assignment {
             flags = false;
             continue;
         }
-        if text.starts_with('-') || basename(text).is_none() {
+        let named = matches!(lead(word.raw, text), Lead::Program | Lead::Nameless(_));
+        if text.starts_with('-') || basename(text).is_none() || !named {
             return Unwrap::Closed;
         }
         return Unwrap::Program(word);
@@ -1263,24 +1373,59 @@ fn basename(word: &str) -> Option<&str> {
     Some(stem.unwrap_or(name))
 }
 
-fn is_assignment(word: &str) -> bool {
-    word.split_once('=').is_some_and(|(name, _)| {
-        !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
-    })
+/// Whether the shell takes `typed`, a word in a command's first place as typed, for an
+/// assignment: an unquoted name (ASCII letters, digits and `_`, not starting with a digit), an
+/// optional `[subscript]`, an optional `+`, then `=`, the rule bash and zsh share. A quoted or
+/// escaped name (`'FOO=1'`, `F"O"O=1`, `FOO\=1`) is no name, and a name only one of them takes
+/// (zsh's `1=x` and `é=1`, which bash runs as programs) is none here either: [`lead`] closes
+/// on both, so neither the value nor the word after it is read.
+fn shell_assignment(typed: &str) -> bool {
+    let Some((head, _)) = typed.split_once('=') else {
+        return false;
+    };
+    let head = head.strip_suffix('+').unwrap_or(head);
+    let name = match head.split_once('[') {
+        Some((name, subscript)) if subscript.ends_with(']') => name,
+        Some(_) => return false,
+        None => head,
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn leading_word(segment: &str) -> Option<&str> {
-    let mut words = shell_words(segment)
-        .map(|w| w.trim_matches(WORD_TRIM))
-        .filter(|w| !is_assignment(w) && (*w == "{" || w.chars().any(char::is_alphanumeric)));
-    let mut first = words.next()?;
-    while let Some(wrapper) = wrapper_named(basename(first).unwrap_or(first)) {
-        match unwrap(wrapper, &mut words) {
-            Unwrap::Program(word) => first = word,
+/// Whether sudo or env takes `text`, an argument as it is handed to them, for `NAME=value`: an
+/// `=` past its first byte (env's and sudo's `strchr`), in a word not starting with `/`, which
+/// sudo takes for the command's path.
+fn argv_assignment(text: &str) -> bool {
+    text.find('=').is_some_and(|eq| eq > 0) && !text.starts_with('/')
+}
+
+/// `segment`'s program word by [`lead`]'s rule, through any wrapper, or the [`KEYWORD_OPENERS`]
+/// word it steps over first; `None` when its first word has no name to read.
+fn leading_word(segment: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let mut words = shell_words(segment).map(Word::typed);
+    let (mut word, first, assigned) = command_word(
+        &mut words,
+        |w| lead(w.raw, &w.text),
+        |step| KEYWORD_OPENERS.contains(&step),
+    )?;
+    match first {
+        Lead::Step(opener) => return Some(opener.into()),
+        Lead::Program | Lead::Nameless(_) => {}
+        Lead::Assignment | Lead::Closed => return None,
+    }
+    let mut keyword = time_keyword(&word, assigned);
+    while let Some(wrapper) = wrapper_named(basename(&word.text).unwrap_or(&word.text)) {
+        let time = std::mem::take(&mut keyword);
+        match unwrap(wrapper, time, &mut words) {
+            Unwrap::Program(next) => word = next,
             Unwrap::Split(..) | Unwrap::Closed => break,
         }
     }
-    Some(first)
+    Some(word.text)
 }
 
 fn shell_words(segment: &str) -> impl Iterator<Item = &str> {
@@ -1340,16 +1485,23 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
     let segment = segments
         .iter()
         .map(|(_, text)| *text)
-        .find(|text| leading_word(text).is_some_and(|w| KEYWORD_OPENERS.contains(&w)))
+        .find(|text| leading_word(text).is_some_and(|w| KEYWORD_OPENERS.contains(&&*w)))
         .unwrap_or_else(|| running_segment(cmdline, &segments));
     let mut words = Spliced {
         split: None,
         rest: argv(segment),
     };
-    let mut program_word =
-        words.find(|w| !is_assignment(&w.text) && w.text.chars().any(char::is_alphanumeric))?;
+    let (mut program_word, first, assigned) =
+        command_word(&mut words, |w| lead(w.raw, &w.text), |_| false)?;
+    match first {
+        Lead::Program => {}
+        Lead::Nameless(command) => return Some(command.to_owned()),
+        Lead::Assignment | Lead::Step(_) | Lead::Closed => return None,
+    }
+    let mut keyword = time_keyword(&program_word, assigned);
     while let Some(wrapper) = basename(&program_word.text).and_then(wrapper_named) {
-        match unwrap(wrapper, &mut words) {
+        let time = std::mem::take(&mut keyword);
+        match unwrap(wrapper, time, &mut words) {
             Unwrap::Program(word) => program_word = word,
             Unwrap::Split(value, from) if words.split.is_none() => {
                 let Some(value) = split_value(&value, from) else {
@@ -3585,10 +3737,11 @@ impl crate::App {
             .by_local(session)
             .map(|h| h.sid.as_str().to_string());
         let input = format!(
-            "{input} {} {} {} {} {}",
+            "{input} {} {} {} {} {} {}",
             crate::disk_board::status_fields(session, reported_cwd.as_deref()),
             self.status_job_fields(session),
             crate::program_check_watch::status_fields(),
+            crate::services_watch::status_fields(),
             crate::occupancy_host::status_fields(occupancy_sid.as_deref()),
             crate::occupancy_wakes::status_fields(occupancy_sid.as_deref())
         );
@@ -3651,8 +3804,9 @@ impl crate::App {
         );
         let land = land_fields(held.filter(|_| claimed_here && under_land));
         let land = format!(
-            "{land}{}",
-            stop_field(self.shown_stop(session).filter(|_| claimed_here))
+            "{land}{}{}",
+            stop_field(self.shown_stop(session).filter(|_| claimed_here)),
+            wait_field(self.shown_wait(session).filter(|_| claimed_here))
         );
         #[cfg(any(test, debug_assertions))]
         let end = self.end_status_fields(
@@ -3836,6 +3990,13 @@ pub(crate) fn stop_field(stopped: Option<aterm_agent::harness::acts::HeldBy>) ->
         " held={}",
         stopped.map_or("-", aterm_agent::harness::acts::HeldBy::word)
     )
+}
+
+/// Formats the `waiting` field for `status` output (§14.17.5.2): the outage the loop waits on
+/// (`overload`, `api-error`, `connection`), `-` where it waits on none. A reader that finds no
+/// `waiting=` (a build before it) reads it as unknown, never as `-`.
+pub(crate) fn wait_field(wait: Option<crate::harness_glass::WaitGlass>) -> String {
+    format!(" waiting={}", wait.map_or("-", |wait| wait.wall.word()))
 }
 
 /// Formats the development-build `end_glass` fields for `status` output.

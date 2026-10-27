@@ -1609,6 +1609,96 @@ fn full_provider_identity_survives_email_changes_and_never_falls_back_to_another
     assert_eq!(principal_in_home(&first), None);
 }
 
+/// THE USAGE CACHE SERVES A LANDED READING WITHOUT A FETCH only while it is
+/// current, treats a plan-only landing as landed for the same window, and holds
+/// a failed attempt for the host's mint bound — never erasing a good reading.
+#[test]
+fn muse_usage_cache_freshness_separates_attempts_from_landings() {
+    let figure = |at: i64| WeeklyFigure {
+        used_x10: 400,
+        resets_at: at + 7 * 86_400,
+        at,
+    };
+    let landed = MuseUsageEntry {
+        attempted_at: 1_000,
+        reading: Some((Some(figure(1_000)), Some("Muse Max Usage".into()))),
+    };
+    assert!(muse_usage_fresh(Some(&landed), 1_000 + USAGE_CURRENT_S));
+    assert!(!muse_usage_fresh(Some(&landed), 1_001 + USAGE_CURRENT_S));
+    let plan_only = MuseUsageEntry {
+        attempted_at: 1_000,
+        reading: Some((None, Some("Muse Max Usage".into()))),
+    };
+    assert!(
+        muse_usage_fresh(Some(&plan_only), 1_000 + USAGE_CURRENT_S),
+        "a plan-only success is not retried every minute"
+    );
+    assert!(!muse_usage_fresh(Some(&plan_only), 1_001 + USAGE_CURRENT_S));
+    let failed = MuseUsageEntry {
+        attempted_at: 1_000,
+        reading: None,
+    };
+    assert!(!muse_usage_fresh(Some(&failed), 1_000));
+    assert!(muse_usage_attempt_recent(Some(&failed), 1_059));
+    assert!(!muse_usage_attempt_recent(Some(&failed), 1_060));
+    assert!(!muse_usage_fresh(None, 1_000));
+    assert!(!muse_usage_attempt_recent(None, 1_000));
+}
+
+/// A FETCH THAT LANDS AFTER ITS ENTRY WAS FORGOTTEN still names its reading (the
+/// forget asked for exactly this mint), a failed landing keeps the last good
+/// reading under a moved attempt stamp, and a landed reading replaces it.
+#[test]
+fn muse_usage_landings_survive_a_mid_flight_forget_and_a_failure() {
+    use std::path::PathBuf;
+
+    use super::super::muse_usage::Reading;
+
+    let key = (
+        PathBuf::from("/cfg/muse"),
+        "someone@example.test".to_string(),
+    );
+    let reading = |used_x10: u32| Reading {
+        plan: Some("Muse Max Usage".into()),
+        weekly_used_x10: Some(used_x10),
+        weekly_resets_at: Some(2_000 + 7 * 86_400),
+        observed_at: Some(2_000),
+    };
+    let mut map = MuseUsageCacheMap::new();
+    land_muse_usage(&mut map, &key, Some(reading(400)), 2_000);
+    let entry = map.get(&key).expect("the forgotten entry, re-created");
+    assert_eq!(entry.attempted_at, 2_000);
+    assert_eq!(
+        entry
+            .reading
+            .as_ref()
+            .and_then(|(figure, _)| figure.map(|f| f.used_x10)),
+        Some(400),
+        "the mint the forget asked for"
+    );
+    land_muse_usage(&mut map, &key, None, 3_000);
+    let entry = map.get(&key).expect("still cached");
+    assert_eq!(entry.attempted_at, 3_000, "the failure moves the backoff");
+    assert_eq!(
+        entry
+            .reading
+            .as_ref()
+            .and_then(|(figure, _)| figure.map(|f| f.used_x10)),
+        Some(400),
+        "and keeps the last good figure"
+    );
+    land_muse_usage(&mut map, &key, Some(reading(500)), 4_000);
+    let entry = map.get(&key).expect("still cached");
+    assert_eq!(
+        entry
+            .reading
+            .as_ref()
+            .and_then(|(figure, _)| figure.map(|f| f.used_x10)),
+        Some(500),
+        "a later landing replaces it"
+    );
+}
+
 #[test]
 fn a_muse_login_store_names_its_account_alone() {
     let tmp = tmp_dir("muse-auth");
@@ -1628,7 +1718,10 @@ fn a_muse_login_store_names_its_account_alone() {
             .map(|word| (*word).to_owned())
             .collect::<Vec<_>>()
     };
-    let shown = muse_subscription_for(&args(&["muse"]), &env, &home).expect("the account");
+    let muse_sub = |words: &[&str], env: &[String]| {
+        muse_subscription_for(&args(words), env, &home, &SubscriptionDisplay::default(), 0)
+    };
+    let shown = muse_sub(&["muse"], &env).expect("the account");
     assert_eq!(shown.email.as_deref(), Some("owner@example.com"));
     assert_eq!(
         (shown.plan, shown.weekly, shown.account),
@@ -1641,39 +1734,27 @@ fn a_muse_login_store_names_its_account_alone() {
         vec!["muse", "-cprovider=echo"],
         vec!["muse", "--config=provider=local"],
     ] {
-        assert_eq!(
-            muse_subscription_for(&args(&words), &env, &home),
-            None,
-            "{words:?}"
-        );
+        assert_eq!(muse_sub(&words, &env), None, "{words:?}");
     }
     assert!(
-        muse_subscription_for(&args(&["muse", "--", "--provider", "echo"]), &env, &home).is_some(),
+        muse_sub(&["muse", "--", "--provider", "echo"], &env).is_some(),
         "a prompt's words are not its flags"
     );
     let settings = store.join("settings.json");
     std::fs::write(&settings, r#"{"provider":"echo"}"#).expect("settings");
-    assert_eq!(
-        muse_subscription_for(&args(&["muse"]), &env, &home),
-        None,
-        "its settings' provider"
-    );
+    assert_eq!(muse_sub(&["muse"], &env), None, "its settings' provider");
     assert!(
-        muse_subscription_for(&args(&["muse", "--provider", "meta"]), &env, &home).is_some(),
+        muse_sub(&["muse", "--provider", "meta"], &env).is_some(),
         "its command line outranks its settings"
     );
     assert!(
-        muse_subscription_for(&args(&["muse", "-cprovider=meta"]), &env, &home).is_some(),
+        muse_sub(&["muse", "-cprovider=meta"], &env).is_some(),
         "an attached config value outranks its settings too"
     );
     std::fs::remove_file(&settings).expect("settings gone");
     let mut keyed = env.clone();
     keyed.push("META_API_KEY=[REDACTED]".to_owned());
-    assert_eq!(
-        muse_subscription_for(&args(&["muse"]), &keyed, &home),
-        None,
-        "an API key"
-    );
+    assert_eq!(muse_sub(&["muse"], &keyed), None, "an API key");
     for text in [
         r#"{"providers":{"meta":{"mechanism":"api_key","user_email":"owner@example.com"}}}"#,
         r#"{"providers":{"meta":{"mechanism":"oauth","storage":"keychain"}}}"#,
@@ -1681,14 +1762,10 @@ fn a_muse_login_store_names_its_account_alone() {
         "not JSON",
     ] {
         std::fs::write(&auth, text).expect("auth");
-        assert_eq!(
-            muse_subscription_for(&args(&["muse"]), &env, &home),
-            None,
-            "{text}"
-        );
+        assert_eq!(muse_sub(&["muse"], &env), None, "{text}");
     }
     std::fs::remove_file(&auth).expect("gone");
-    assert_eq!(muse_subscription_for(&args(&["muse"]), &env, &home), None);
+    assert_eq!(muse_sub(&["muse"], &env), None);
     let xdg = tmp.path().join("xdg");
     std::fs::create_dir_all(xdg.join("muse")).expect("xdg store");
     std::fs::write(
@@ -1699,8 +1776,67 @@ fn a_muse_login_store_names_its_account_alone() {
     let mut in_xdg = env.clone();
     in_xdg.push(format!("XDG_CONFIG_HOME={}", xdg.display()));
     assert_eq!(
-        muse_subscription_for(&args(&["muse"]), &in_xdg, &home).and_then(|s| s.email),
+        muse_sub(&["muse"], &in_xdg).and_then(|s| s.email),
         Some("xdg@example.com".to_owned())
+    );
+}
+
+/// A bare `muse`/`agy` launch name resolves on the supervised process's own `PATH`:
+/// relative entries and non-executable files are skipped, the launch resolution
+/// outranks the user shim, and a name carrying a directory is never PATH-searched.
+#[cfg(unix)]
+#[test]
+fn a_bare_launch_name_resolves_on_the_supervised_process_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tmp_dir("launch-path");
+    let home = tmp.path().join("home");
+    let first = tmp.path().join("first");
+    let second = tmp.path().join("second");
+    let nested = second.join("bin");
+    for dir in [&first, &nested, &home.join(".local/bin")] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    let place = |path: &Path, mode: u32| {
+        std::fs::write(path, "#!/bin/sh\nexit 0\n").expect("stand-in");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .expect("stand-in mode");
+    };
+    place(&first.join("muse"), 0o644);
+    let path_muse = second.join("muse");
+    let path_agy = second.join("agy");
+    place(&path_muse, 0o755);
+    place(&path_agy, 0o755);
+    place(&nested.join("muse"), 0o755);
+    let shim_muse = home.join(".local/bin/muse");
+    place(&shim_muse, 0o755);
+    let env = vec![format!(
+        "PATH=relative:{}:{}",
+        first.display(),
+        second.display()
+    )];
+    let words = |word: &str| vec![word.to_owned()];
+    assert_eq!(
+        muse_exe_for(&words("muse"), &env, &home),
+        Some(path_muse),
+        "the binary its own PATH launches, not the shim"
+    );
+    assert_eq!(
+        agy_exe_for(&words("agy"), &env, &home),
+        Some(path_agy),
+        "the same launch resolution serves agy"
+    );
+    assert_eq!(
+        muse_exe_for(&words("muse"), &[], &home),
+        Some(shim_muse),
+        "no process PATH keeps the shim fallback"
+    );
+    let bare_home = tmp.path().join("bare-home");
+    std::fs::create_dir_all(&bare_home).expect("bare home");
+    assert_eq!(
+        muse_exe_for(&words("bin/muse"), &env, &bare_home),
+        None,
+        "a launch word with a directory is not PATH-searched"
     );
 }
 
@@ -2145,11 +2281,17 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
     std::fs::create_dir_all(&presence_dir).expect("create presence");
     std::fs::write(presence_dir.join(format!("{cid}.lock")), b"").expect("write lock");
     let workspace = home.join("aterm");
+    let workspace_str = workspace.to_string_lossy();
     std::fs::write(
         cfg.join("history.jsonl"),
         format!(
-            r#"{{"display":"inspect the window","timestamp":1,"workspace":"{}","conversationId":"{cid}"}}"#,
-            workspace.display()
+            "{}\n",
+            json!({
+                "display": "inspect the window",
+                "timestamp": 1,
+                "workspace": workspace_str.as_ref(),
+                "conversationId": cid,
+            })
         ),
     )
     .expect("write history.jsonl");
@@ -2206,9 +2348,19 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
     std::fs::write(
         cfg.join("history.jsonl"),
         format!(
-            "{{\"display\":\"inspect the window\",\"timestamp\":1,\"workspace\":\"{}\",\"conversationId\":\"{cid}\"}}\n{{\"display\":\"other tab prompt\",\"timestamp\":2,\"workspace\":\"{}\",\"conversationId\":\"{cid_newer}\"}}\n",
-            workspace.display(),
-            workspace.display()
+            "{}\n{}\n",
+            json!({
+                "display": "inspect the window",
+                "timestamp": 1,
+                "workspace": workspace_str.as_ref(),
+                "conversationId": cid,
+            }),
+            json!({
+                "display": "other tab prompt",
+                "timestamp": 2,
+                "workspace": workspace_str.as_ref(),
+                "conversationId": cid_newer,
+            }),
         ),
     )
     .expect("write two-tab history.jsonl");

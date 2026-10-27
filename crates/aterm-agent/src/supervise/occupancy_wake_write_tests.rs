@@ -380,6 +380,7 @@ fn each_guard_holds_a_due_wake_and_nothing_is_written() {
                     let mut reading =
                         s.turn_end_reading(&screen_at(90, ended(SAID)), None, &hosted(30));
                     reading.left_record = true;
+                    reading.autopilot = Autopilot::Land;
                     s.turn_end.observe(&reading, s.fx.mono());
                 }
             },

@@ -15,7 +15,6 @@ mod console_session;
 mod create_new;
 mod github_api;
 pub(crate) mod github_rest;
-#[cfg(target_os = "macos")]
 mod identity;
 #[cfg(target_os = "macos")]
 mod low_data;
@@ -407,6 +406,11 @@ pub trait Relaying {
     fn close(&mut self) -> Result<(), String>;
 }
 
+/// An account's service-restart lock, released when the guard drops.
+pub trait ServiceRestartHold {}
+
+impl ServiceRestartHold for aterm_update_core::FileLock {}
+
 /// The operating system, as items see it.
 pub trait System: Sync {
     /// Read one GitHub API endpoint through `agh` as `user` with the admitted development
@@ -607,6 +611,27 @@ pub trait System: Sync {
         None
     }
 
+    /// One look at the macOS service `restart` names and what it holds, read in this process
+    /// without root ([`aterm_uds::services::look`]); unread where this system reads none.
+    fn service(&self, restart: &aterm_vitals::services::Restart) -> aterm_uds::services::Look {
+        let _ = restart;
+        aterm_uds::services::Look::Unread
+    }
+
+    /// Exclusively hold an account's restart transaction without waiting behind another
+    /// run's password prompt. The rendezvous is retained after the guard drops.
+    /// # Errors
+    /// The lock cannot be opened, is held, or this backend supports no restart lock.
+    fn hold_service_restart(&self, _path: &Path) -> io::Result<Box<dyn ServiceRestartHold>> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    /// Whether this process's account administers the Mac, the accounts `sudo` admits
+    /// ([`aterm_uds::account::administrator`]); `None` where unread.
+    fn administrator(&self) -> Option<bool> {
+        None
+    }
+
     /// Whether the app macOS holds responsible for this process holds Accessibility, read in
     /// this process with no prompt; `None` when it cannot be read here.
     fn accessibility_trusted(&self) -> Option<bool> {
@@ -624,6 +649,14 @@ pub trait System: Sync {
     /// Terminal under Terminal): the one a privacy grant this run needs goes to.
     fn responsible_app(&self) -> Option<String> {
         None
+    }
+
+    /// Hand the Accessibility ask to the aterm window's permission walk (`aterm ctl permissions
+    /// walk now accessibility`), only when that window is the app macOS holds responsible for
+    /// this process, so the grant it walks is this run's: `true` once the walk took it (its
+    /// panel beside System Settings, in place of macOS's own consent dialog).
+    fn walk_accessibility(&self) -> bool {
+        false
     }
 
     /// When `pid` started, in Unix seconds, as the kernel recorded it for any uid's process (what
@@ -782,6 +815,13 @@ pub trait System: Sync {
     /// name. The default: none.
     fn agent_ancestor(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Whether this is macOS, whose workstation `aterm init` sets up; elsewhere (Linux) init runs
+    /// the base layer, the vault and the repositories, and each workstation row reads
+    /// "macOS only". The default: the platform this was built for.
+    fn macos(&self) -> bool {
+        cfg!(target_os = "macos")
     }
 }
 
@@ -1047,6 +1087,16 @@ pub(crate) fn terminal_free() -> Option<std::sync::MutexGuard<'static, ()>> {
         Err(std::sync::TryLockError::Poisoned(free)) => Some(free.into_inner()),
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
+}
+
+/// Whether the aterm window's `OK walking <page>…` answer takes `page`: a walk already under way
+/// answers with its own pages, which may leave out the one this run asked for.
+#[cfg(any(test, target_os = "macos"))]
+fn walk_takes(reply: &str, page: &str) -> bool {
+    reply
+        .trim_end()
+        .strip_prefix("OK walking")
+        .is_some_and(|walking| walking.split_whitespace().any(|walked| walked == page))
 }
 
 impl System for Live {
@@ -1450,14 +1500,20 @@ impl System for Live {
     }
 
     fn identity(&self) -> Result<Identity, String> {
-        #[cfg(target_os = "macos")]
-        {
-            identity::read(self.euid())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Err("the account is read on macOS alone".into())
-        }
+        identity::read(self.euid())
+    }
+
+    fn service(&self, restart: &aterm_vitals::services::Restart) -> aterm_uds::services::Look {
+        aterm_uds::services::look(restart)
+    }
+
+    fn hold_service_restart(&self, path: &Path) -> io::Result<Box<dyn ServiceRestartHold>> {
+        aterm_update_core::FileLock::acquire_within(path, Duration::ZERO)
+            .map(|lock| Box::new(lock) as Box<dyn ServiceRestartHold>)
+    }
+
+    fn administrator(&self) -> Option<bool> {
+        aterm_uds::account::administrator()
     }
 
     fn low_data_mode(&self) -> Option<bool> {
@@ -1504,6 +1560,36 @@ impl System for Live {
         #[cfg(not(target_os = "macos"))]
         {
             None
+        }
+    }
+
+    fn walk_accessibility(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(responsible) = i32::try_from(std::process::id())
+                .ok()
+                .and_then(aterm_containment::responsible_app)
+            else {
+                return false;
+            };
+            let Some(sock) = aterm_ctl::front_door_instance() else {
+                return false;
+            };
+            // The instance's socket names its pid (`aterm-<pid>.sock`): only the window macOS
+            // holds responsible for this run walks the grant this run needs.
+            let instance = Path::new(&sock)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(aterm_types::control_socket::instance_pid);
+            if instance.is_none() || instance != u32::try_from(responsible.pid).ok() {
+                return false;
+            }
+            aterm_ctl::front_door_send(&sock, "permissions walk now accessibility\n")
+                .is_ok_and(|reply| walk_takes(&reply, "accessibility"))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
         }
     }
 
@@ -1871,11 +1957,24 @@ mod fake {
         on_sleep: Mutex<Option<SleepHook>>,
         /// What [`System::low_data_mode`] answers: unknown unless a test sets it.
         pub low_data: Option<bool>,
+        /// What [`System::service`] answers, one look each, the last repeating
+        /// ([`Fake::services`]): none running when none is scripted.
+        services: Mutex<Vec<aterm_uds::services::Look>>,
+        /// A real scratch rendezvous for competing restart tests; inert unless set.
+        pub service_restart_lock: Option<PathBuf>,
+        /// A hook at the terminal-command seam, without executing the command.
+        tty_hook: Mutex<Option<Model>>,
+        /// What [`System::administrator`] answers: unread unless a test sets it.
+        pub admin: Option<bool>,
         /// What [`System::accessibility_trusted`] and [`System::request_accessibility`]
         /// answer, one reading each, the last repeating ([`Fake::trusts`]): unknown when none.
         trust: Mutex<Vec<bool>>,
         /// What [`System::responsible_app`] answers.
         pub responsible: Option<String>,
+        /// What [`System::walk_accessibility`] answers: no window walks it unless a test says.
+        pub walks: bool,
+        /// [`System::macos`] answers no: a Linux machine ([`Fake::root`]: a Mac).
+        pub linux: bool,
     }
 
     type SleepHook = Arc<dyn Fn(&Fake, std::time::Duration) + Send + Sync>;
@@ -2190,6 +2289,22 @@ mod fake {
         /// reading.
         pub fn trusts(&self, readings: &[bool]) -> &Self {
             *self.trust.lock().unwrap() = readings.to_vec();
+            self
+        }
+
+        /// Script what [`System::service`] answers, one look each, the last repeating.
+        pub fn services(&self, looks: Vec<aterm_uds::services::Look>) -> &Self {
+            *self.services.lock().unwrap() = looks;
+            self
+        }
+
+        /// Run a model at the terminal-command seam; its optional result overrides the
+        /// scripted reply. No terminal or child process is opened.
+        pub fn tty_model(
+            &self,
+            model: impl Fn(&Self, &Cmd) -> Option<Ran> + Send + Sync + 'static,
+        ) -> &Self {
+            *self.tty_hook.lock().unwrap() = Some(Arc::new(model));
             self
         }
 
@@ -2637,6 +2752,12 @@ mod fake {
         fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {
             let key = format!("tty {}", cmd.display());
             self.calls.lock().unwrap().push(key.clone());
+            let model = self.tty_hook.lock().unwrap().clone();
+            if let Some(model) = model
+                && let Some(output) = model(self, cmd)
+            {
+                return Ok(output.status);
+            }
             let mut replies = self.replies.lock().unwrap();
             let status = match replies.get_mut(&key) {
                 Some(list) if list.len() > 1 => Ok(list.remove(0).status),
@@ -3029,6 +3150,44 @@ mod fake {
             self.responsible.clone()
         }
 
+        /// Recorded as `ax-walk`; answered as [`Fake::walks`] says.
+        fn walk_accessibility(&self) -> bool {
+            self.calls.lock().unwrap().push("ax-walk".into());
+            self.walks
+        }
+
+        fn administrator(&self) -> Option<bool> {
+            self.admin
+        }
+
+        /// Answered as [`Fake::services`] scripts, and not recorded: a look changes nothing.
+        fn service(&self, _restart: &aterm_vitals::services::Restart) -> aterm_uds::services::Look {
+            let mut looks = self.services.lock().unwrap();
+            if looks.len() > 1 {
+                looks.remove(0)
+            } else {
+                looks
+                    .first()
+                    .cloned()
+                    .unwrap_or(aterm_uds::services::Look::NoneRunning)
+            }
+        }
+
+        fn hold_service_restart(
+            &self,
+            _path: &Path,
+        ) -> io::Result<Box<dyn super::ServiceRestartHold>> {
+            struct Inert;
+            impl super::ServiceRestartHold for Inert {}
+            match self.service_restart_lock.as_deref() {
+                Some(path) => {
+                    aterm_update_core::FileLock::acquire_within(path, std::time::Duration::ZERO)
+                        .map(|lock| Box::new(lock) as Box<dyn super::ServiceRestartHold>)
+                }
+                None => Ok(Box::new(Inert)),
+            }
+        }
+
         /// Recorded as `low-data-mode`; answered as [`Fake::low_data`] says.
         fn low_data_mode(&self) -> Option<bool> {
             self.calls.lock().unwrap().push("low-data-mode".into());
@@ -3192,6 +3351,10 @@ mod fake {
         fn agent_ancestor(&self) -> Option<&'static str> {
             self.agent
         }
+
+        fn macos(&self) -> bool {
+            !self.linux
+        }
     }
 
     /// One [`System::stopped`] reading: `SIGINT` once more than `stop_after` were taken.
@@ -3254,6 +3417,23 @@ mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window's walk takes a sign-out's Accessibility ask only when its answer names that
+    /// page. NEGATIVE CONTROL: a walk already under way over other pages answers `OK walking`
+    /// too, and takes nothing of this run's.
+    #[test]
+    fn only_a_walk_that_names_accessibility_takes_the_runs_ask() {
+        assert!(walk_takes("OK walking accessibility\n", "accessibility"));
+        assert!(walk_takes("OK walking fda accessibility", "accessibility"));
+        let under_way = "OK walking fda devtools\n";
+        assert!(under_way.starts_with("OK walking"));
+        assert!(!walk_takes(under_way, "accessibility"));
+        assert!(!walk_takes("OK declined\n", "accessibility"));
+        assert!(!walk_takes(
+            "ERR unknown verb (try: help)\n",
+            "accessibility"
+        ));
+    }
 
     #[test]
     fn complete_stdout_admits_scripted_whole_records_and_refuses_unproven_capture() {

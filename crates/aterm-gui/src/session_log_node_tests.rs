@@ -228,7 +228,13 @@ fn log_n_prints_the_node_log_as_log_prints_a_session() {
             .all(|l| l.starts_with('{') && l.contains("\"node\":\"n\"")),
         "{json}"
     );
-    for bad in ["n lvl=turn", "n class=turn", "n t3", "n since=2"] {
+    for bad in [
+        "n lvl=turn",
+        "n class=turn",
+        "n t3",
+        "n since=2",
+        "n since=2 ep=1760000000 base=1760000000",
+    ] {
         assert!(cmd_node_log(h, bad).starts_with("ERR usage: log"), "{bad}");
     }
     let other = cmd_node_log(h, "n since=2 ep=7");

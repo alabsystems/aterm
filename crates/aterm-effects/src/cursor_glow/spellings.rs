@@ -18,6 +18,7 @@ pub struct TrailStyleRow {
     pub blurb: &'static str,
 }
 
+#[inline]
 const fn row_of(
     name: &'static str,
     style: Option<GlowStyle>,
@@ -162,6 +163,7 @@ pub const TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
     ("light-beam", "beam"),
 ];
 
+#[inline]
 const fn row_names<const N: usize>() -> [&'static str; N] {
     let mut out = [""; N];
     let mut i = 0;
@@ -182,6 +184,7 @@ pub(crate) const fn trim_whitespace_bytes(raw: &str) -> &[u8] {
 }
 
 /// Trim Unicode whitespace from a UTF-8 slice cut on scalar boundaries.
+#[inline]
 pub(crate) const fn trim_whitespace_slice(mut bytes: &[u8]) -> &[u8] {
     // Each cut removes a whole scalar, leaving both edges on UTF-8 boundaries.
     while !bytes.is_empty() {
@@ -207,6 +210,7 @@ pub(crate) const fn trim_whitespace_slice(mut bytes: &[u8]) -> &[u8] {
 
 /// Decode the first scalar of a nonempty slice cut at scalar boundaries from a valid `str`.
 /// UTF-8's leading byte gives its width; the continuation bytes carry six bits each.
+#[inline]
 const fn scalar_whitespace(bytes: &[u8]) -> (bool, usize) {
     let lead = bytes[0];
     let width = if lead < 0x80 {
@@ -262,6 +266,7 @@ pub const fn canonical(raw: &str) -> Option<&'static str> {
     }
 }
 
+#[inline]
 const fn alias_row_indices<const N: usize>() -> [usize; N] {
     let mut out = [0; N];
     let mut ai = 0;

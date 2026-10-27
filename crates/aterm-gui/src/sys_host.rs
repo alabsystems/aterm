@@ -1021,6 +1021,12 @@ pub(crate) fn cmd_sys(
         return "ERR unavailable name why=not_sampled\n".to_owned();
     }
     let (held, state) = SYS.fresh_for(&q, &crate::vitals_host::SPLIT_ARMED);
+    let held = with_services(
+        &q,
+        held,
+        aterm_uds::services::read,
+        crate::services_watch::filed(),
+    );
     let (panes, machine) = SYS.facts();
     let g = gather(
         store,
@@ -1032,6 +1038,41 @@ pub(crate) fn cmd_sys(
         held.as_ref().map(|h| h.snap.as_ref()),
     );
     answer(&SYS, &q, held.as_ref(), state, &machine, &g, owner_class)
+}
+
+/// Whether `snap`'s split by coalition read rows: while no Deck is in view it can be cold
+/// (off, or warming), and then names no service.
+fn split_read(snap: &Snapshot) -> bool {
+    snap.why
+        .as_deref()
+        .is_some_and(|f| f.lane.on() && !f.split.rows.is_empty())
+}
+
+/// `held` for a `sys why` that may be of memory (`q`), with macOS's services read on their own
+/// (`read`, [`aterm_uds::services::read`]) where its split by coalition is cold, so the reply
+/// names a service past its bar whether or not a Deck is in view
+/// ([`aterm_vitals::services::over_in`]), and with the episodes whose restart the person put
+/// off (`filed`, [`crate::services_watch::filed`]), for which it offers none.
+fn with_services(
+    q: &SysQuery,
+    held: Option<Held>,
+    read: impl FnOnce() -> Option<aterm_vitals::services::Reading>,
+    filed: Vec<String>,
+) -> Option<Held> {
+    let mut held = held?;
+    if q.view != View::Why || q.subject == Some(WhySubject::Cpu) {
+        return Some(held);
+    }
+    let reading = if split_read(&held.snap) { None } else { read() };
+    if reading.is_some() || !filed.is_empty() {
+        let mut snap = (*held.snap).clone();
+        if let Some(reading) = reading {
+            snap.services = Some(Arc::new(reading));
+        }
+        snap.services_filed = filed;
+        held.snap = Arc::new(snap);
+    }
+    Some(held)
 }
 
 fn answer(

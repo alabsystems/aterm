@@ -175,6 +175,211 @@ fn the_probe_finds_uncommitted_unpushed_and_stashed_work_and_nothing_once_pushed
     assert_eq!(found(plain.path()), None, "no repository");
 }
 
+/// `text` written to `name` in `work`, committed and pushed to its `origin`; the commit.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn pushed(work: &Path, name: &str, text: &str) -> String {
+    std::fs::write(work.join(name), text).expect("write");
+    scratch_git(work, &["add", name]);
+    scratch_git(work, &["commit", "-q", "-m", name]);
+    scratch_git(work, &["push", "-q", "origin", "HEAD:main"]);
+    scratch_git(work, &["rev-parse", "HEAD"]).trim().to_string()
+}
+
+/// A SUBMODULE WHOSE CHECKOUT ONLY LAGS ITS RECORD IS NO WORK: the one commit its entry asks for
+/// would record the older commit (on aterm's shared checkout, after a `git pull` that did not
+/// recurse, `vendor/astream` 535 commits back). At a commit this checkout recorded for it at a
+/// point its `HEAD` moved through, its record fetched into it or not, the probe and the hygiene
+/// read count nothing; an edit inside it, a bump not yet committed, a branch switched to (its
+/// commit on a remote, the record never fetched), and an unpushed commit in it each stay work.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_submodule_checkout_that_only_lags_its_record_is_no_work() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (lib_dir, app_dir) = (tmp.path().join("lib"), tmp.path().join("app"));
+    std::fs::create_dir_all(&lib_dir).expect("lib");
+    std::fs::create_dir_all(&app_dir).expect("app");
+    let lib = repo(&lib_dir, true);
+    let app = repo(&app_dir, true);
+    let url = lib_dir.join("remote.git").display().to_string();
+    scratch_git(
+        &app,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &url,
+            "vendor/lib",
+        ],
+    );
+    scratch_git(&app, &["commit", "-q", "-m", "lib"]);
+    scratch_git(&app, &["push", "-q", "origin", "HEAD:main"]);
+    assert_eq!(found(&app), None, "the submodule at its record");
+    let sub = app.join("vendor/lib");
+    let first = scratch_git(&sub, &["rev-parse", "HEAD"]).trim().to_string();
+    let lagging = |why: &str| {
+        assert_eq!(found(&app), None, "{why}");
+        let hygiene = probe_hygiene(&app, Some(&app), PROBE_LIMIT).expect("hygiene");
+        assert_eq!(
+            (hygiene.changed, hygiene.untracked),
+            (0, 0),
+            "{why}: {hygiene:?}"
+        );
+    };
+    let work = |why: &str| {
+        let w = found(&app).unwrap_or_else(|| panic!("{why}"));
+        assert_eq!(
+            (w.changed, w.paths.as_slice()),
+            (1, &["vendor/lib".to_string()][..]),
+            "{why}: {w:?}"
+        );
+        let hygiene = probe_hygiene(&app, Some(&app), PROBE_LIMIT).expect("hygiene");
+        assert_eq!(hygiene.changed, 1, "{why}: {hygiene:?}");
+    };
+
+    pushed(&lib, "b.txt", "two\n");
+    scratch_git(&sub, &["fetch", "-q", "origin"]);
+    scratch_git(&sub, &["checkout", "-q", "origin/main"]);
+    work("a bump not yet committed");
+    scratch_git(&app, &["commit", "-q", "-am", "lib two"]);
+    scratch_git(&app, &["push", "-q", "origin", "HEAD:main"]);
+    assert_eq!(found(&app), None, "the bump committed and pushed");
+    scratch_git(&sub, &["checkout", "-q", &first]);
+    lagging("a checkout behind its record");
+    std::fs::write(sub.join("a.txt"), "edited\n").expect("edit");
+    work("an edit inside a lagging submodule");
+    scratch_git(&sub, &["checkout", "-q", "--", "a.txt"]);
+    lagging("the edit undone");
+
+    let unfetched = pushed(&lib, "c.txt", "three\n");
+    scratch_git(
+        &app,
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("160000,{unfetched},vendor/lib"),
+        ],
+    );
+    scratch_git(&app, &["commit", "-q", "-m", "lib three"]);
+    scratch_git(&app, &["push", "-q", "origin", "HEAD:main"]);
+    lagging("a published checkout whose record it never fetched");
+    scratch_git(&lib, &["checkout", "-q", "-b", "feature", &first]);
+    std::fs::write(lib.join("e.txt"), "five\n").expect("e.txt");
+    scratch_git(&lib, &["add", "e.txt"]);
+    scratch_git(&lib, &["commit", "-q", "-m", "feature"]);
+    scratch_git(&lib, &["push", "-q", "origin", "feature"]);
+    scratch_git(&sub, &["fetch", "-q", "origin", "feature"]);
+    scratch_git(&sub, &["checkout", "-q", "FETCH_HEAD"]);
+    work("a branch switched to, its record never fetched");
+    scratch_git(&sub, &["checkout", "-q", &first]);
+    lagging("back at a commit it recorded");
+    std::fs::write(sub.join("d.txt"), "four\n").expect("d.txt");
+    scratch_git(&sub, &["add", "d.txt"]);
+    scratch_git(&sub, &["commit", "-q", "-m", "local"]);
+    work("an unpushed commit in a submodule whose record it never fetched");
+}
+
+/// A SUBMODULE A MERGE MOVED PAST IS NO WORK: this checkout bumps it to `t2` while upstream bumps
+/// it to `t3`, and a merge that does not recurse fast-forwards the record to `t3` and leaves the
+/// checkout at `t2`. History simplification hides `t2` from a `git log -- <path>` of the merge
+/// (it follows upstream, whose record the merge kept); the checkout's own `HEAD` held it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_submodule_checkout_a_merge_moved_past_is_no_work() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (lib_dir, app_dir) = (tmp.path().join("lib"), tmp.path().join("app"));
+    std::fs::create_dir_all(&lib_dir).expect("lib");
+    std::fs::create_dir_all(&app_dir).expect("app");
+    let lib = repo(&lib_dir, true);
+    let app = repo(&app_dir, true);
+    let url = lib_dir.join("remote.git").display().to_string();
+    scratch_git(
+        &app,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &url,
+            "vendor/lib",
+        ],
+    );
+    scratch_git(&app, &["commit", "-q", "-m", "lib"]);
+    let t2 = pushed(&lib, "b.txt", "two\n");
+    let t3 = pushed(&lib, "c.txt", "three\n");
+    let sub = app.join("vendor/lib");
+    scratch_git(&sub, &["fetch", "-q", "origin"]);
+    scratch_git(&app, &["checkout", "-q", "-b", "up"]);
+    scratch_git(&sub, &["checkout", "-q", &t3]);
+    scratch_git(&app, &["commit", "-q", "-am", "up: lib three"]);
+    scratch_git(&app, &["checkout", "-q", "main"]);
+    scratch_git(&sub, &["checkout", "-q", &t2]);
+    scratch_git(&app, &["commit", "-q", "-am", "lib two"]);
+    scratch_git(
+        &app,
+        &[
+            "-c",
+            "submodule.recurse=false",
+            "merge",
+            "-q",
+            "--no-edit",
+            "up",
+        ],
+    );
+    scratch_git(&app, &["push", "-q", "origin", "HEAD:main"]);
+    assert_eq!(
+        scratch_git(&app, &["rev-parse", "HEAD:vendor/lib"]).trim(),
+        t3,
+        "the merge records upstream's bump"
+    );
+    assert_eq!(
+        scratch_git(&app, &["status", "--porcelain"]),
+        " M vendor/lib\n",
+        "the checkout stays at this checkout's own bump"
+    );
+    assert_eq!(found(&app), None);
+    let hygiene = probe_hygiene(&app, Some(&app), PROBE_LIMIT).expect("hygiene");
+    assert_eq!((hygiene.changed, hygiene.untracked), (0, 0), "{hygiene:?}");
+}
+
+/// THE REFLOG'S TAIL STARTS AT A WHOLE LINE: the first line that starts at or past the last
+/// [`LAG_REFLOG`] bytes, one that starts exactly there included, and a shorter file whole.
+#[test]
+fn a_reflogs_tail_starts_at_its_first_whole_line() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let size = usize::try_from(LAG_REFLOG).expect("usize");
+    for (name, text) in [
+        // 16-byte lines: the tail starts exactly on one.
+        (
+            "even",
+            (0..(size / 16 + 100))
+                .map(|i| format!("line {i:010}\n"))
+                .collect::<String>(),
+        ),
+        // 12-byte lines after a 2-byte one: it starts inside one.
+        (
+            "odd",
+            std::iter::once("x\n".to_string())
+                .chain((0..(size / 12 + 100)).map(|i| format!("line {i:06}\n")))
+                .collect(),
+        ),
+        ("short", "a b c\nd e f\n".to_string()),
+    ] {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, &text).expect("write");
+        let mut tail = String::new();
+        std::io::Read::read_to_string(&mut reflog_tail(&path).expect("a file"), &mut tail)
+            .expect("read");
+        let from = text.len().saturating_sub(size);
+        let want = (from..text.len())
+            .find(|&i| i == 0 || text.as_bytes()[i - 1] == b'\n')
+            .expect("a line");
+        assert_eq!(tail, text[want..], "{name}");
+    }
+}
+
 /// A PROBE OF A STARVED `git` STILL READS THE WHOLE WORK ([`PROBE_LIMIT`], the
 /// one-minute hang detector): its first read starved 11 s, past the ten
 /// seconds the probe had before (on the probe's clock: the time is taken as

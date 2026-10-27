@@ -507,20 +507,51 @@ impl GapWhy {
     }
 }
 
-/// Reader cursor (epoch and last sequence number held).
+/// Reader cursor (epoch and last sequence number held, and optionally the log it is of).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Cursor {
     /// The epoch the seq belongs to.
     pub ep: u32,
     /// The last seq the reader holds (0: none).
     pub seq: u64,
+    /// THE LOG THE READER SAYS THIS CURSOR IS OF (audit fix C13): that log's base epoch
+    /// ([`Log::base_ep`]), which no two logs of one host process share and a carried successor
+    /// keeps (the host's allocator issues every log it starts, an uncarried adoption's
+    /// included, a base above every one it holds). A read of
+    /// a log whose base is another resets (`gap why=reset`); `None` says nothing, and the
+    /// read places the cursor by its epoch and seq alone, as before. Epoch ranges alone
+    /// cannot tell two logs apart once one is carried: two logs started in one second hold
+    /// E and E+1, and after an update the first spans [E, E+1] and the second [E+1, E+2].
+    pub base: Option<u32>,
 }
 
 impl Cursor {
-    /// A cursor at `seq` of epoch `ep`.
+    /// A cursor at `seq` of epoch `ep`, naming no log.
     #[must_use]
     pub const fn new(ep: u32, seq: u64) -> Cursor {
-        Cursor { ep, seq }
+        Cursor {
+            ep,
+            seq,
+            base: None,
+        }
+    }
+
+    /// This cursor, said to be of the log whose base epoch is `base` ([`Cursor::base`]).
+    #[must_use]
+    pub const fn of_log(self, base: u32) -> Cursor {
+        Cursor {
+            base: Some(base),
+            ..self
+        }
+    }
+
+    /// Whether this cursor names a log other than the one whose base epoch is `base`.
+    #[must_use]
+    pub const fn names_another_log(&self, base: u32) -> bool {
+        match self.base {
+            Some(b) => b != base,
+            None => false,
+        }
     }
 }
 
@@ -735,6 +766,53 @@ impl std::fmt::Debug for Notify {
     }
 }
 
+/// THE JOURNAL'S MARK ON A LOG ([`Log::journaled`]): how far the host's journal writer has this
+/// log's records, which an eviction batch spends first. A clone of the log gets a mark of its own
+/// at the same seq, never this one, so no other log follows its writer.
+#[derive(Debug)]
+struct JournalMark(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl JournalMark {
+    fn at(seq: u64) -> JournalMark {
+        JournalMark(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(seq)))
+    }
+
+    fn get(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn raise(&self, seq: u64) {
+        self.0.fetch_max(seq, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl Clone for JournalMark {
+    fn clone(&self) -> JournalMark {
+        JournalMark::at(self.get())
+    }
+}
+
+/// THE WRITER'S HOLD ON A TAKE ([`Log::take_journaled`], audit fix C7 and its review): what a
+/// write that does not land gives back, without the timeline's lock, so the records it took and
+/// did not write rank with the unwritten again at once (a full disk's backoff never finds them
+/// spent first), while a write that lands, and the burst after it, needs no lock to keep them
+/// spent first. It acts only on the log it was taken from; once that log is gone or replaced,
+/// it does nothing.
+#[derive(Debug)]
+pub struct Journaled {
+    mark: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    from: u64,
+}
+
+impl Journaled {
+    /// The take's write did not land: the log's mark falls back to where the take began (the
+    /// writer's cursor before it), never below.
+    pub fn unwritten(&self) {
+        self.mark
+            .fetch_min(self.from, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// One session's log.
 #[derive(Clone, Debug)]
 pub struct Log {
@@ -789,9 +867,9 @@ pub struct Log {
     fold: Fold,
     /// The host's journal wake ([`Notify`]), if one is installed.
     notify: Option<Notify>,
-    /// The newest seq the host's journal writer has taken
-    /// ([`Log::note_journaled`]), while one follows this log.
-    journaled: Option<u64>,
+    /// How far the host's journal writer has this log ([`Log::journaled`]), while one
+    /// follows it.
+    journaled: Option<JournalMark>,
     /// The bus class's count in this seq space (phase 4): the `ms` of the
     /// newest bus-class record appended, evicted or not.
     ms_head: u64,
@@ -978,7 +1056,7 @@ impl Log {
         self.first_seq
     }
 
-    /// The oldest epoch whose cursors count in this log's seqs: this log's own, or the earliest a chain of carried updates continued.
+    /// The oldest epoch whose cursors count in this log's seqs: this log's own, or the earliest a chain of carried updates continued. It is also the log's identity ([`Cursor::base`]): the host issues every log it starts (a fresh one, or an adoption that carried no log, told only its predecessor's ids) a distinct first epoch above every carried one it noted, every one of an update's noted before any of its sessions adopts, and a carried successor keeps its predecessor's base, so no two logs of one process share one.
     #[must_use]
     pub const fn base_ep(&self) -> u32 {
         self.base_ep
@@ -1005,15 +1083,31 @@ impl Log {
         self.notify.as_ref()
     }
 
-    /// Record that the journal writer has persisted up to `seq`.
+    /// Record that the journal writer has this log up to `seq`. It never moves back.
     pub fn note_journaled(&mut self, seq: u64) {
-        self.journaled = Some(self.journaled.map_or(seq, |j| j.max(seq)));
+        self.journaled
+            .get_or_insert_with(|| JournalMark::at(seq))
+            .raise(seq);
     }
 
-    /// The newest seq the journal writer has taken, while one follows.
+    /// The journal writer took this log's records from `from` through `seq` into a write: they
+    /// are spent first from now ([`Log::note_journaled`]), under the take's own hold, so neither
+    /// a busy lock after the write nor a burst during it finds them ranked with the unwritten.
+    /// The returned hold gives them back if the write does not land ([`Journaled::unwritten`]).
+    pub fn take_journaled(&mut self, from: u64, seq: u64) -> Journaled {
+        let mark = self.journaled.get_or_insert_with(|| JournalMark::at(seq));
+        mark.raise(seq);
+        Journaled {
+            mark: std::sync::Arc::clone(&mark.0),
+            from,
+        }
+    }
+
+    /// How far the journal writer has this log, while one follows: its lines through this seq
+    /// are on disk or in a write under way (one that fails gives them back, [`Journaled`]).
     #[must_use]
-    pub const fn journaled(&self) -> Option<u64> {
-        self.journaled
+    pub fn journaled(&self) -> Option<u64> {
+        self.journaled.as_ref().map(JournalMark::get)
     }
 
     fn rang(&self) {
@@ -1268,7 +1362,7 @@ impl Log {
         }
     }
 
-    /// Read at most `max` records after `cursor` along with any crossed gap.
+    /// Read at most `max` records after `cursor` along with any crossed gap. A cursor outside this log's numbering, or naming another log ([`Cursor::base`]), is reset (`gap why=reset`) and read from the start.
     #[must_use]
     pub fn read(&self, cursor: Cursor, max: usize) -> Read<'_> {
         let (gap, range, next) = self.page(cursor, max);
@@ -1292,7 +1386,8 @@ impl Log {
 
     fn page(&self, cursor: Cursor, max: usize) -> (Option<Gap>, std::ops::Range<usize>, Cursor) {
         let head = self.reader_last_seq();
-        let reset = cursor.ep > self.ep
+        let reset = cursor.names_another_log(self.base_ep)
+            || cursor.ep > self.ep
             || cursor.ep < self.base_ep
             || cursor.seq > head
             || (cursor.ep < self.ep && cursor.seq.saturating_add(1) < self.first_seq);
@@ -2098,7 +2193,7 @@ impl Log {
         let entry_bytes: Vec<usize> = self.ring.iter().map(|e| e.bytes).collect();
         let seqs: Vec<u64> = self.ring.iter().map(|e| e.rec.seq).collect();
         let reached = |len: usize, bytes: usize| !over_limits(len, bytes, low);
-        let tiers: &[Option<u64>] = match self.journaled {
+        let tiers: &[Option<u64>] = match self.journaled() {
             Some(j) => &[Some(j), None],
             None => &[None],
         };

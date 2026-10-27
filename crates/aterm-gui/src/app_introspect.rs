@@ -2400,6 +2400,7 @@ fn observe_capture_pet_world(
         ws.search.is_some(),
         ws.pet_chrome.held(),
         ws.pet_chrome.held_overlays(),
+        ws.pet_chrome.held_blanked(),
     )
     .painted_over(ws.pet_chrome.held_painted_over());
     let observed = ws.fx.companion_mut().observe_console_reserved(
@@ -4319,6 +4320,17 @@ impl App {
         front: WindowId,
         policy: SourcePolicy,
     ) -> Result<ResolvedCapture, CaptureDeferral> {
+        self.resolve_capture_source_at(front, policy, None)
+    }
+
+    /// [`Self::resolve_capture_source`], a windowless capture's instant `clock` where the caller
+    /// injects one (`lab trail-diff`'s dump, [`Self::windowless_frame_at`]), else now.
+    fn resolve_capture_source_at(
+        &mut self,
+        front: WindowId,
+        policy: SourcePolicy,
+        clock: Option<Instant>,
+    ) -> Result<ResolvedCapture, CaptureDeferral> {
         self.ensure_pixel_backend();
         let (plan, route) = self
             .active_visible_frame_layout(front)
@@ -4352,11 +4364,11 @@ impl App {
         if facts.recording {
             return self.recorded_capture_source(front, plan, route, policy, kind);
         }
-        let (plan, terminal_grid) = self.stage_headless_capture(front, plan, route)?;
+        let (plan, terminal_grid) = self.stage_headless_capture(front, plan, route, clock)?;
         Ok(ResolvedCapture {
             source: CaptureSource::Rerender {
                 serial: None,
-                visuals: self.host_visual_state(front, Instant::now()),
+                visuals: self.host_visual_state(front, clock.unwrap_or_else(Instant::now)),
             },
             model: None,
             context: CaptureContext {
@@ -4515,6 +4527,7 @@ impl App {
         wid: WindowId,
         plan: crate::tab_model::VisibleLeafPlan,
         route: crate::VisibleContentRoute,
+        clock: Option<Instant>,
     ) -> Result<
         (
             crate::tab_model::VisibleLeafPlan,
@@ -4525,7 +4538,7 @@ impl App {
         use crate::app_render::CapturePreparation;
         self.sample_native_preview_for_capture(wid, &plan);
         // Every route splices the message band, so each captures it at the capture instant.
-        let capture_now = Instant::now();
+        let capture_now = clock.unwrap_or_else(Instant::now);
         self.prepare_band_motion(wid, capture_now);
         let (plan, terminal_grid) = match route {
             crate::VisibleContentRoute::Terminal { .. } => {
@@ -4620,6 +4633,37 @@ impl App {
         );
         crate::metrics::record_offscreen_raster(render_t0.elapsed().as_nanos() as u64);
         Ok(frame)
+    }
+
+    /// One windowless frame of `wid` at `now`, taken as a `--no-windows` instance's `image`
+    /// takes it ([`Self::image_body`]'s source, then its rerender): `None` while a synchronized
+    /// update holds the frame. The light-fork pin's capture entry (`light_fork_pin_tests`).
+    #[cfg(all(unix, test))]
+    pub(crate) fn windowless_frame_at(
+        &mut self,
+        wid: WindowId,
+        now: Instant,
+    ) -> Result<Option<Frame>, String> {
+        let policy = SourcePolicy {
+            destination: DestinationDemand::of_image(false),
+            frame_only: true,
+            model: false,
+            metadata: false,
+        };
+        let capture = match self.resolve_capture_source_at(wid, policy, Some(now)) {
+            Ok(capture) => capture,
+            Err(CaptureDeferral::Held { .. }) => return Ok(None),
+            Err(CaptureDeferral::Nothing) => return Err("no frame to capture".to_string()),
+            Err(CaptureDeferral::PendingGpu) => {
+                return Err("a windowless frame waits on no GPU".to_string());
+            }
+            Err(CaptureDeferral::Refused(error)) => return Err(error),
+        };
+        let CaptureSource::Rerender { visuals, .. } = capture.source else {
+            return Err("a windowless frame is a rerender".to_string());
+        };
+        let mut input = self.take_rerender_input(wid);
+        self.rerender_capture(wid, &mut input, visuals).map(Some)
     }
 
     fn snapshot_visible_text(
@@ -15103,7 +15147,7 @@ mod headless_capture_band_tests {
                 .expect("PRECONDITION: a live row's band frame")
                 .at;
             assert!(
-                app.stage_headless_capture(wid, plan, route).is_ok(),
+                app.stage_headless_capture(wid, plan, route, None).is_ok(),
                 "the capture stages (mixed={mixed})"
             );
             let at = app.windows[&wid]

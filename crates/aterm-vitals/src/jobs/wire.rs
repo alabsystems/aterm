@@ -147,6 +147,12 @@ impl JobRow {
         if self.no_progress {
             o.push_str(" no_progress=1");
         }
+        if let Some((pid, start)) = self.working_descendant {
+            let _ = write!(
+                o,
+                " working_descendant={pid} working_descendant_start={start}"
+            );
+        }
         o
     }
 

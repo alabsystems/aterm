@@ -54,6 +54,9 @@ const STRIP_EVERY: Duration = Duration::from_secs(10);
 const STRIP_FILE: &str = "vitals-strip.json";
 const STRIP_SCHEMA: u32 = 1;
 const STRIP_MAX_BYTES: u64 = 512 * 1024;
+/// Raw anomaly evidence is saved by the existing probe thread, separately from live state.
+const CPU_REPORT_FILE: &str = "vitals-cpu-report.json";
+const CPU_REPORT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// How long the quit waits for the probe thread to end and write the peaks and the free history.
 pub(crate) const STOP_BOUND: Duration = Duration::from_millis(500);
 
@@ -610,6 +613,7 @@ pub(crate) enum Msg {
     Read(Box<Request>),
     Facts(Box<Request>),
     Pull,
+    CpuPolicy(aterm_vitals::sys::json::Jv),
 }
 
 /// The loop's side of the probe thread.
@@ -635,15 +639,21 @@ pub(crate) struct VitalsHost {
     /// When the held snapshot landed (any new reading, whatever its jobs view): what the deck's
     /// live edge counts its beat and its staleness from (`crate::stats_live`).
     pub(crate) landed_at: Option<Instant>,
-    /// The wall clock of the snapshot held before it, unix ms: whether the held one opened a new
-    /// second of a Folded strip, which then slides (`crate::stats_live::opened_slot`).
-    pub(crate) landed_prev_at_ms: Option<i64>,
+    /// The reading a strip's fine band slides or glides right for: the newest that opened a slot
+    /// of its snapshot's grid past the snapshot held before it, kept through readings that open
+    /// none ([`crate::stats_live::Opened`]).
+    pub(crate) landed_open: Option<crate::stats_live::Opened>,
     /// The snapshot held immediately before [`Self::snapshot`], for smooth value interpolation
     /// across readings (`crate::stats_deck`).
     pub(crate) prev_snapshot: Option<Arc<Snapshot>>,
     /// The bars' cadence when it landed (`None` with no window showing them): a reading speaks
     /// for [`crate::stats_live::STALE_PERIODS`] of the slower of this and the cadence now.
     pub(crate) landed_period: Option<Duration>,
+    /// The dial's needle in motion, one per app since the strain is the whole machine's
+    /// ([`crate::stats_needle`]): retargeted where a snapshot is adopted
+    /// (`App::retarget_needle`), and in a cell so a layout that adds, drops or resizes a dial can
+    /// rest it on its target. `None` before a reading with a needle.
+    pub(crate) needle: std::cell::Cell<Option<crate::stats_needle::Needle>>,
     /// When the next reading is due: the bars' cadence while a window in view shows them.
     pub(crate) next_due: Option<Instant>,
     asked_at: Option<Instant>,
@@ -665,6 +675,9 @@ pub(crate) struct VitalsHost {
     delegated_active: bool,
     chips_shown: bool,
     pending_gaps: Vec<aterm_vitals::TimeGap>,
+    pending_cpu_policy: Option<aterm_vitals::sys::json::Jv>,
+    #[cfg(target_os = "macos")]
+    cpu_policy_generation: Option<(u64, u64)>,
     pending_events: Vec<aterm_vitals::StripEvent>,
     survey: Arc<Where>,
     board: &'static crate::vitals_jobs::JobsBoard,
@@ -687,9 +700,10 @@ impl Default for VitalsHost {
             read_began: None,
             full_adopted_at: None,
             landed_at: None,
-            landed_prev_at_ms: None,
+            landed_open: None,
             prev_snapshot: None,
             landed_period: None,
+            needle: std::cell::Cell::new(None),
             next_due: None,
             asked_at: None,
             jobs_due: None,
@@ -707,6 +721,9 @@ impl Default for VitalsHost {
             chips_shown: false,
             pending_gaps: Vec::new(),
             pending_events: Vec::new(),
+            pending_cpu_policy: None,
+            #[cfg(target_os = "macos")]
+            cpu_policy_generation: None,
             survey: Arc::default(),
             board: &crate::vitals_jobs::BOARD,
             proc_edge: if cfg!(test) {
@@ -769,7 +786,13 @@ impl VitalsHost {
                     self.full_adopted_at = Some(now);
                 }
                 self.landed_at = Some(now);
-                self.landed_prev_at_ms = self.snapshot.as_ref().map(|held| held.at_unix_ms);
+                self.landed_open = Some(crate::stats_live::Opened::after(
+                    self.landed_open,
+                    self.snapshot.as_ref().map(|held| held.at_unix_ms),
+                    snap.at_unix_ms,
+                    snap.slot_grid,
+                    now,
+                ));
                 self.prev_snapshot = self.snapshot.clone();
                 self.read_began = began;
                 self.snapshot = Some(snap);
@@ -938,7 +961,7 @@ impl VitalsHost {
 
     fn offer(&mut self, msg: Msg) -> bool {
         let Some(tx) = self.tx.as_ref() else {
-            if let Msg::Read(r) = msg {
+            if let Msg::Read(r) | Msg::Facts(r) = msg {
                 self.pending_gaps.extend(r.note_gaps);
                 self.pending_events.extend(r.note_events);
             }
@@ -947,14 +970,14 @@ impl VitalsHost {
         match tx.try_send(msg) {
             Ok(()) => true,
             Err(TrySendError::Full(msg)) => {
-                if let Msg::Read(r) = msg {
+                if let Msg::Read(r) | Msg::Facts(r) = msg {
                     self.pending_gaps.extend(r.note_gaps);
                     self.pending_events.extend(r.note_events);
                 }
                 false
             }
             Err(TrySendError::Disconnected(msg)) => {
-                if let Msg::Read(r) = msg {
+                if let Msg::Read(r) | Msg::Facts(r) = msg {
                     self.pending_gaps.extend(r.note_gaps);
                     self.pending_events.extend(r.note_events);
                 }
@@ -1004,6 +1027,7 @@ struct Asked {
     read: bool,
     pull: bool,
     facts: bool,
+    cpu_policy: Option<aterm_vitals::sys::json::Jv>,
 }
 
 impl Asked {
@@ -1022,8 +1046,10 @@ impl Asked {
             }
             Msg::Facts(mut r) => {
                 let (cadence_ms, machine_only) = (req.cadence_ms, req.machine_only);
-                let gaps = std::mem::take(&mut req.note_gaps);
-                let events = std::mem::take(&mut req.note_events);
+                let mut gaps = std::mem::take(&mut req.note_gaps);
+                let mut events = std::mem::take(&mut req.note_events);
+                gaps.append(&mut r.note_gaps);
+                events.append(&mut r.note_events);
                 r.note_gaps = gaps;
                 r.note_events = events;
                 *req = *r;
@@ -1032,6 +1058,10 @@ impl Asked {
                 self.facts = true;
             }
             Msg::Pull => self.pull = true,
+            Msg::CpuPolicy(report) => {
+                self.cpu_policy = Some(report);
+                self.read = true;
+            }
         }
     }
 }
@@ -1057,6 +1087,7 @@ fn run(
     });
     let free = peaks.as_deref().map(|p| p.with_file_name(FREE_FILE));
     let strip = peaks.as_deref().map(|p| p.with_file_name(STRIP_FILE));
+    let report = peaks.as_deref().map(|p| p.with_file_name(CPU_REPORT_FILE));
     let open_at = Instant::now();
     let open_ms = unix_ms_now();
     let (mut peaks, restored) = PeakFile::open(peaks, open_at);
@@ -1065,6 +1096,9 @@ fn run(
     source.model().restore_free_history(kept);
     let (mut strip, kept_strip) = StripFile::open(strip, open_at);
     source.model().restore_strip_history(kept_strip, open_ms);
+    let (mut report, prior_report) = CpuReportFile::open(report, open_at, open_ms);
+    source.model().restore_cpu_report(prior_report);
+    let mut current_report = None;
     let no_machine = Machine::default();
     let mut req = Request::default();
     let mut last_whole: Option<Instant> = None;
@@ -1073,6 +1107,10 @@ fn run(
         asked.take(first, &mut req);
         while let Ok(more) = rx.try_recv() {
             asked.take(more, &mut req);
+        }
+        let policy_changed = asked.cpu_policy.is_some();
+        if let Some(policy) = asked.cpu_policy.take() {
+            source.model().record_cpu_policy(policy);
         }
         if asked.facts
             && let Some(sys) = sys
@@ -1093,6 +1131,9 @@ fn run(
         };
         req.note_gaps.clear();
         req.note_events.clear();
+        if let Some(record) = cpu_report_record(&snap) {
+            current_report = Some(record);
+        }
         let snap = Arc::new(snap);
         if !snap.machine_only {
             last_whole = Some(Instant::now());
@@ -1106,11 +1147,17 @@ fn run(
             break;
         }
         let kept_at = Instant::now();
+        if current_report.is_some() {
+            report.keep(&current_report, kept_at, policy_changed);
+        }
         peaks.keep(source.model().peaks(), kept_at, false);
         free.keep(source.model().free_history(), kept_at, false);
         strip.keep(&source.model().saved_strip(false), kept_at, false);
     }
     let stop_at = Instant::now();
+    if current_report.is_some() {
+        report.keep(&current_report, stop_at, true);
+    }
     peaks.keep(source.model().peaks(), stop_at, true);
     free.keep(source.model().free_history(), stop_at, true);
     strip.keep(&source.model().saved_strip(true), stop_at, true);
@@ -1135,6 +1182,8 @@ fn pull(source: &mut impl Source, req: &mut Request, last_whole: Option<Instant>
     let warm = cold.then(|| {
         pull.reread_words();
         let warm = source.reading(&pull);
+        pull.note_gaps.clear();
+        pull.note_events.clear();
         std::thread::sleep(COLD_PAIR);
         warm
     });
@@ -1194,6 +1243,66 @@ fn hand_over(
 
 /// The thermal level and Low Power Mode probe.
 pub(crate) type ThermalProbe = fn() -> Option<Thermal>;
+
+/// The hardware reader is injected so headless tests do not open native services.
+type HardwareProbe =
+    fn(&mut aterm_sysprobe::cpu_hardware::Probe, &Sample) -> aterm_sysprobe::cpu_hardware::Sample;
+
+fn attach_hardware(
+    sample: &mut Sample,
+    probe: &mut aterm_sysprobe::cpu_hardware::Probe,
+    read: HardwareProbe,
+) {
+    sample.hardware = Some(hardware_sample(read(probe, sample)));
+}
+
+fn hardware_sample(s: aterm_sysprobe::cpu_hardware::Sample) -> aterm_vitals::hardware::Sample {
+    use aterm_vitals::hardware as h;
+    h::Sample {
+        captured_unix_ms: s.captured_unix_ms,
+        collection_span_ns: s.collection_span_ns,
+        window_ns: s.window_ns,
+        observation_span_ns: s.observation_span_ns,
+        channels: s.channels.map(|rows| {
+            rows.into_iter()
+                .map(|c| h::Channel {
+                    raw_elements: c.raw_elements,
+                    name: c.name,
+                    subgroup: c.subgroup,
+                    unit: c.unit,
+                    states: c
+                        .states
+                        .into_iter()
+                        .map(|s| h::State {
+                            name: s.name,
+                            ticks: s.ticks,
+                        })
+                        .collect(),
+                    active: c.active,
+                    active_mhz: c.active_mhz,
+                    frequency_source: c.frequency_source,
+                })
+                .collect()
+        }),
+        controls: h::Controls {
+            os_version: s.controls.os_version,
+            kernel_release: s.controls.kernel_release,
+            kernel_version: s.controls.kernel_version,
+            online: s.controls.online,
+            active_cpus: s.controls.active_cpus,
+            requested_recommended_mask: s.controls.requested_recommended_mask,
+            cluster_masks: s.controls.cluster_masks,
+            power_limits: s.controls.power_limits.map(|p| h::PowerLimits {
+                speed_percent: p.speed_percent,
+                scheduler_percent: p.scheduler_percent,
+                available_cpus: p.available_cpus,
+            }),
+            last_sleep_ms: s.controls.last_sleep_ms,
+            last_wake_ms: s.controls.last_wake_ms,
+            last_sleep_reason: s.controls.last_sleep_reason,
+        },
+    }
+}
 
 /// The local zone's offset from UTC at an instant, unix seconds.
 pub(crate) type OffsetProbe = fn(i64) -> Option<i64>;
@@ -1830,6 +1939,8 @@ impl WhyFixture {
 /// The readers and the model: one per thread.
 pub(crate) struct Reader {
     probe: aterm_sysprobe::Probe,
+    hardware: aterm_sysprobe::cpu_hardware::Probe,
+    hardware_read: HardwareProbe,
     clusters: Vec<ClusterSpec>,
     vitals: aterm_vitals::Vitals,
     jobs: crate::vitals_jobs::JobsPass,
@@ -1970,6 +2081,12 @@ impl Reader {
         );
         let mut reader = Self {
             probe: aterm_sysprobe::Probe::new(),
+            hardware: aterm_sysprobe::cpu_hardware::Probe::default(),
+            hardware_read: if cfg!(test) {
+                |_, _| aterm_sysprobe::cpu_hardware::Sample::unavailable("not_sampled")
+            } else {
+                |probe, _| probe.sample()
+            },
             clusters,
             vitals: aterm_vitals::Vitals::new(),
             jobs: crate::vitals_jobs::JobsPass::new(),
@@ -1999,6 +2116,9 @@ impl Reader {
             gpu: crate::vitals_gpu::GpuLane::host(),
             fixture: None,
             machine: Machine {
+                executable: std::env::current_exe()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned()),
                 cpu: words.cpu,
                 os: words.os,
                 family: os_family(),
@@ -2114,6 +2234,9 @@ impl Reader {
                 sample.timeline = self.split.timeline();
             }
         }
+        // Preserve the existing core/process capture window: optional native
+        // discovery can be slow, so it runs only after those readings finish.
+        attach_hardware(&mut sample, &mut self.hardware, self.hardware_read);
         let scene = self.fixture.as_mut().map(|fixture| {
             if split {
                 self.split.last = Some(now);
@@ -2168,6 +2291,8 @@ impl Reader {
     pub(crate) fn read_machine(&mut self, req: &Request) -> Snapshot {
         let mut sample = self.machine_sample(req, unix_ms_now());
         sample.machine_only = true;
+        sample.timeline = self.split.timeline();
+        attach_hardware(&mut sample, &mut self.hardware, self.hardware_read);
         let scene = self
             .fixture
             .as_mut()
@@ -2203,6 +2328,7 @@ impl Reader {
             .map(|links| links.iter().map(link_sample).collect());
         let tcp_sum = (self.net.tcp)(&mut self.scratch);
         Sample {
+            hardware: None,
             at_ns: u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
             cores: self.probe.core_ticks().map(|cores| {
                 cores
@@ -2317,6 +2443,15 @@ fn read_sockets(
 /// Converts a swept [`aterm_sysprobe::ProcessReading`] into a [`ProcSample`].
 pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) -> ProcSample {
     ProcSample {
+        scheduling: p.scheduling.map(|s| aterm_vitals::scheduling::Scheduling {
+            nice: s.nice,
+            application: s.application,
+            background_internal: s.background_internal,
+            background_external: s.background_external,
+            suppressed: s.suppressed,
+            role: s.role,
+            qos_cpu_ns: s.qos_cpu_ns,
+        }),
         pid: p.pid,
         start: p.start,
         ppid: p.ppid,
@@ -2697,6 +2832,7 @@ type PeakFile = KeptFile<Peaks>;
 type FreeFile = KeptFile<FreeHistory>;
 /// [`STRIP_FILE`].
 type StripFile = KeptFile<SavedStrip>;
+type CpuReportFile = KeptFile<Option<aterm_vitals::sys::json::Jv>>;
 
 impl<T: Clone + Default + PartialEq> KeptFile<T> {
     /// The file and what `of` reads from its text; `T::default()` when it is missing, over
@@ -2791,6 +2927,182 @@ impl KeptFile<SavedStrip> {
             strip_of,
         )
     }
+}
+
+impl CpuReportFile {
+    fn open(
+        path: Option<PathBuf>,
+        now: Instant,
+        now_ms: i64,
+    ) -> (Self, Option<aterm_vitals::sys::json::Jv>) {
+        Self::read(
+            path,
+            now.checked_sub(STRIP_EVERY).unwrap_or(now),
+            STRIP_EVERY,
+            CPU_REPORT_MAX_BYTES,
+            "the historical CPU diagnostic report",
+            cpu_report_json,
+            |text| cpu_report_of(text, now_ms),
+        )
+    }
+}
+
+/// Serialize this process only; previous captures are never recursively copied into a new one.
+fn cpu_report_record(snap: &Snapshot) -> Option<aterm_vitals::sys::json::Jv> {
+    use aterm_vitals::sys::json::Jv;
+    if snap.cpu_diagnostics.is_none() && snap.authorized_cpu_policy.is_none() {
+        return None;
+    }
+    Some(Jv::obj([
+        ("schema", Jv::Int(1)),
+        (
+            "kind",
+            Jv::s(if snap.cpu_diagnostics.is_some() {
+                "historical_anomaly"
+            } else {
+                "historical_cpu_policy"
+            }),
+        ),
+        ("captured_unix_ms", Jv::Int(snap.at_unix_ms)),
+        ("origin_pid", Jv::u(u64::from(std::process::id()))),
+        ("origin_build", Jv::s(aterm_types::version::app_version())),
+        (
+            "origin_executable",
+            std::env::current_exe()
+                .ok()
+                .map_or_else(|| Jv::why("not_sampled"), |p| Jv::s(p.to_string_lossy())),
+        ),
+        (
+            "report",
+            aterm_vitals::sys::hardware::current_report_json(snap),
+        ),
+    ]))
+}
+
+fn cpu_report_json(value: &Option<aterm_vitals::sys::json::Jv>) -> Option<String> {
+    let text = value.as_ref()?.to_text();
+    if text.len() as u64 > CPU_REPORT_MAX_BYTES {
+        aterm_log::warn!(
+            "system vitals: CPU diagnostic report exceeds the bounded file; retaining the earlier capture"
+        );
+        return None;
+    }
+    Some(text)
+}
+
+/// Validate a bounded historical document without feeding its monotonic state to the detector.
+fn cpu_report_of(text: &str, now_ms: i64) -> Option<Option<aterm_vitals::sys::json::Jv>> {
+    use aterm_json::Value;
+    if text.len() as u64 > CPU_REPORT_MAX_BYTES {
+        return None;
+    }
+    let value: Value = aterm_json::from_str(text).ok()?;
+    if value["schema"].as_i64() != Some(1)
+        || !matches!(
+            value["kind"].as_str(),
+            Some("historical_anomaly" | "historical_cpu_policy")
+        )
+        || value["origin_build"].as_str().is_none()
+        || value["origin_pid"].as_u64().is_none_or(|pid| pid == 0)
+    {
+        return None;
+    }
+    let captured = value["captured_unix_ms"].as_i64()?;
+    let report = &value["report"];
+    if captured <= 0
+        || captured > now_ms
+        || report["version"].as_i64() != Some(1)
+        || report["at_unix_ms"].as_i64() != Some(captured)
+    {
+        return None;
+    }
+    if value["kind"].as_str() == Some("historical_anomaly") {
+        if report["anomaly"]["version"].as_i64() != Some(1) {
+            return None;
+        }
+        let frames = report["anomaly"]["frames"].as_array()?;
+        if frames.is_empty()
+            || frames.len() > 8
+            || frames.iter().any(|frame| {
+                frame["at_unix_ms"]
+                    .as_i64()
+                    .is_none_or(|at| at <= 0 || at > captured)
+            })
+        {
+            return None;
+        }
+    } else {
+        let policy = &report["authorized_cpu_policy"];
+        if policy["schema"].as_u64() != Some(1)
+            || policy["operation"].as_str() != Some("cpu_policy")
+            || policy["observed_unix_ms"]
+                .as_i64()
+                .is_none_or(|at| at <= 0 || at > captured)
+            || policy["state"].as_str().is_none()
+        {
+            return None;
+        }
+    }
+    Some(Some(convert_cpu_report_value(value, 0, &mut 200_000)?))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn take_cpu_policy_report(
+    current: &mut Option<(u64, u64)>,
+    value: aterm_json::Value,
+) -> Option<aterm_vitals::sys::json::Jv> {
+    if value["schema"].as_u64() != Some(1)
+        || value["operation"].as_str() != Some("cpu_policy")
+        || value["state"].as_str().is_none()
+        || value["observed_unix_ms"].as_u64().is_none_or(|at| at == 0)
+    {
+        return None;
+    }
+    let id = value["request_id"].as_u64()?;
+    let revision = value["revision"].as_u64()?;
+    let report = convert_cpu_report_value(value, 0, &mut 200_000)?;
+    accept_cpu_policy_generation(current, id, revision).then_some(report)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn accept_cpu_policy_generation(current: &mut Option<(u64, u64)>, id: u64, revision: u64) -> bool {
+    let Some((expected, seen)) = current.as_mut() else {
+        return false;
+    };
+    if *expected != id || !matches!(revision, 1 | 2) || revision <= *seen {
+        return false;
+    }
+    *seen = revision;
+    true
+}
+
+fn convert_cpu_report_value(
+    v: aterm_json::Value,
+    depth: usize,
+    left: &mut usize,
+) -> Option<aterm_vitals::sys::json::Jv> {
+    use aterm_json::Value;
+    use aterm_vitals::sys::json::Jv;
+    if depth > 32 || *left == 0 {
+        return None;
+    }
+    *left -= 1;
+    Some(match v {
+        Value::Bool(v) => Jv::Bool(v),
+        Value::Number(v) => Jv::Int(v.as_i64()?),
+        Value::String(v) => Jv::Str(v),
+        Value::Array(rows) => Jv::Arr(
+            rows.into_iter()
+                .map(|v| convert_cpu_report_value(v, depth + 1, left))
+                .collect::<Option<_>>()?,
+        ),
+        Value::Object(rows) => Jv::Obj(
+            rows.into_iter()
+                .map(|(k, v)| Some((k, convert_cpu_report_value(v, depth + 1, left)?)))
+                .collect::<Option<_>>()?,
+        ),
+        Value::Null => return None,
+    })
 }
 
 fn read_bounded(path: &Path, max_bytes: u64) -> Option<String> {
@@ -2947,6 +3259,10 @@ struct RingDoc {
     buckets: Vec<(i64, f64, u16, f64, u16)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     recent: Vec<(i64, f64, bool)>,
+    /// The ten-minute buckets (`aterm_vitals::ring::LONG_BUCKET_MS`); absent from a file written
+    /// before them, which then restores none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    long: Vec<(i64, f64, u16, f64, u16)>,
 }
 
 impl RingDoc {
@@ -2954,6 +3270,7 @@ impl RingDoc {
         Self {
             buckets: r.buckets.clone(),
             recent: r.recent.clone(),
+            long: r.long.clone(),
         }
     }
 
@@ -2961,6 +3278,7 @@ impl RingDoc {
         SavedRing {
             buckets: self.buckets,
             recent: self.recent,
+            long: self.long,
         }
     }
 }
@@ -3144,6 +3462,11 @@ impl crate::App {
 
     /// A level judged every wake.
     pub(crate) fn service_vitals(&mut self, now: Instant) {
+        if let Some(report) = self.vitals.pending_cpu_policy.take()
+            && !self.vitals.offer(Msg::CpuPolicy(report.clone()))
+        {
+            self.vitals.pending_cpu_policy = Some(report);
+        }
         self.vitals.take_proc_edge();
         self.serve_vitals(now);
         self.vitals.arm_proc_edge();
@@ -3196,6 +3519,28 @@ impl crate::App {
         if self.tabs_page_shown() && self.harness_screen.fleet_sweep_due(now) {
             self.start_harness_stats_refresh_at(now);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn begin_cpu_policy_report(&mut self, id: u64) {
+        self.vitals.cpu_policy_generation = Some((id, 0));
+    }
+
+    /// The ordinary unprivileged report writer owns persistence, including denied/partial results.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn accept_cpu_policy_report(&mut self, report: aterm_json::Value) {
+        if let Some(report) = take_cpu_policy_report(&mut self.vitals.cpu_policy_generation, report)
+        {
+            self.vitals.pending_cpu_policy = Some(report);
+            self.service_vitals(Instant::now());
+        }
+    }
+
+    /// Asks the thread for a reading: false when its queue was full or the thread is gone.
+    pub(crate) fn resample_cpu_diagnostics(&mut self) -> bool {
+        // Same queue and minimum observation window as normal readings; no new
+        // worker, subprocess, policy write, or repeated retry.
+        self.ask_reading(Instant::now(), crate::stats_lens::LENS_PERIOD, false, false)
     }
 
     /// Asks the thread for a reading: false when its queue was full or the thread is gone.
@@ -3432,6 +3777,7 @@ impl crate::App {
         self.vitals.landed_period = audience
             .cadence(self.any_stats_lens_open())
             .map(|(period, _)| period);
+        self.retarget_needle(now);
         self.post_jobs_reading();
         self.note_held_episode(before.as_deref());
         if !audience.in_view() {

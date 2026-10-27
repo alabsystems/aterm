@@ -78,7 +78,7 @@ pub mod fdpass;
 /// Test support (test and debug builds): the `git` a fixture runs, isolated from this machine.
 #[cfg(all(any(test, debug_assertions), not(target_arch = "wasm32")))]
 pub mod fixture_git;
-/// Another program's live SQLite database (agy's summaries, tccd's `TCC.db`), read with no lock on it: the file itself as an immutable URI, or a private copy of it and its `-wal`, kept only when nothing changed meanwhile.
+/// Another program's live SQLite database (agy's summaries, Muse's goals, tccd's `TCC.db`), read into memory with no lock, copy or subprocess ([`foreign_db::read_bytes`]), plus the remote immutable URI spelling ([`foreign_db::immutable_uri`]).
 pub mod foreign_db;
 /// Whether a connected stream's peer has closed entirely (a lane's hangup check).
 pub mod hangup;
@@ -128,6 +128,9 @@ pub mod ready;
 pub mod reaper;
 /// Secret bytes: scrubbed on drop, a redacted `Debug`, no `Clone`; and the process's no-core-dump switch.
 pub mod secret;
+/// macOS's own services' footprints read without root: each resource coalition of the system's accounts alone, for the service-memory judge.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod services;
 /// Unix-only: whether an account other than this one can write a file or directory (its mode bits, its owner, its access ACL, its filesystem and the user-private-group rule).
 #[cfg(unix)]
 pub mod shared_write;
@@ -143,6 +146,8 @@ pub mod spawnfd;
 #[cfg(not(unix))]
 #[path = "spawnfd_nonunix.rs"]
 pub mod spawnfd;
+/// Pure-Rust, read-only SQLite 3 B-tree and WAL snapshot reader (`#![forbid(unsafe_code)]`), paired with [`foreign_db::read_bytes`].
+pub mod sqlite_read;
 /// A verb's answer on stdout, where a reader that closed the pipe (`| head -1`) ends the answer instead of panicking the process.
 pub mod stdout;
 /// The kernel facts a `sudo` askpass relay stands on, and a scrubbed secret for the password in flight (`docs/DESIGN-sudo-askpass-2026-10-15.md`).

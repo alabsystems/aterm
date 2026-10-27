@@ -10,7 +10,10 @@ use aterm_scene::vector::{FIXED_ONE, PathSeg};
 use aterm_scene::{PathTransform, Tile, fill_path_fixed};
 
 use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, GlyphRole, Layer, Recolor};
-use crate::color_math::{hsv2rgb, relative_luminance, rgb2hsv};
+use crate::color_math::{
+    RelativeLuminanceTable, hsv2rgb, relative_luminance, relative_luminance_table,
+    relative_luminance_with, rgb2hsv,
+};
 use crate::effect_util::lerp_rgb as mix_rgb;
 
 /// Structural entry ceiling (§5.5): the LRU never holds more than 32 tiles.
@@ -203,6 +206,7 @@ impl CatBaker {
     }
 
     /// Look up a [`BakeKeyV4`] glyph tile, baking on a miss when the per-frame budget allows.
+    #[inline]
     pub fn get_v4(&mut self, key: &BakeKeyV4) -> Option<CatTile> {
         if !self.fits_v4(key) {
             return None;
@@ -237,8 +241,10 @@ impl CatBaker {
     #[inline]
     fn touch(&mut self, key: SlotKey) -> Option<CatTile> {
         let clock = self.clock;
-        for slot in &mut self.slots {
-            if let Some(s) = slot
+        let slots = self.slots.as_mut_slice();
+        let mut i = 0;
+        while i < slots.len() {
+            if let Some(s) = &mut slots[i]
                 && s.key == key
             {
                 s.last_used = clock;
@@ -246,6 +252,7 @@ impl CatBaker {
                     art: Arc::clone(&s.art),
                 });
             }
+            i += 1;
         }
         None
     }
@@ -281,6 +288,7 @@ impl CatBaker {
 
     /// Intern the `w × h` top-left of the `tw`-wide straight RGBA `src` as
     /// slot `i`'s art.
+    #[inline]
     fn install(
         &mut self,
         i: usize,
@@ -295,8 +303,13 @@ impl CatBaker {
             src[..wu * hu * 4].to_vec()
         } else {
             let mut data = Vec::with_capacity(wu * hu * 4);
-            for row in src.chunks_exact(tw * 4).take(hu) {
-                data.extend_from_slice(&row[..wu * 4]);
+            let stride = tw * 4;
+            let row_bytes = wu * 4;
+            let mut r = 0;
+            while r < hu && (r + 1) * stride <= src.len() {
+                let off = r * stride;
+                data.extend_from_slice(&src[off..off + row_bytes]);
+                r += 1;
             }
             data
         };
@@ -312,6 +325,7 @@ impl CatBaker {
 
     /// Bake a host-authored straight-alpha RGBA tile into the cache, keyed by a stable `host_id`
     /// so later calls are cache hits.
+    #[inline]
     pub fn host_tile(&mut self, host_id: u64, w: u16, h: u16, rgba: &[u8]) -> Option<CatTile> {
         if self.cell_h == 0 || w == 0 || h == 0 {
             return None;
@@ -416,6 +430,7 @@ pub(crate) const fn rgb(hex: u32) -> (f32, f32, f32) {
 }
 
 /// Paint a supersampled reflection disc only over opaque dark eye texels covered by `eye_mask`.
+#[inline]
 pub(crate) fn paint_dark_masked_disc(
     tile: &mut Tile,
     eye_mask: &Tile,
@@ -441,8 +456,11 @@ pub(crate) fn paint_dark_masked_disc(
         .min(tile.height() as i32);
     let tile_w = tile.width();
     let mask_px = eye_mask.pixels();
-    for y in y0..y1 {
-        let dy0 = y as f32 + 0.125 - cy;
+    let mut y = y0;
+    while y < y1 {
+        let cur_y = y;
+        y += 1;
+        let dy0 = cur_y as f32 + 0.125 - cy;
         let dy3 = dy0 + 0.75;
         let dy0_2 = dy0 * dy0;
         let dy3_2 = dy3 * dy3;
@@ -460,9 +478,12 @@ pub(crate) fn paint_dark_masked_disc(
         let dy2_v = dy0 + 0.50;
         let dy2 = [dy0_2, dy1 * dy1, dy2_v * dy2_v, dy3_2];
         let dy2_max = dy0_2.max(dy3_2);
-        let row_base = (y as u32 * tile_w) as usize;
-        for x in x0..x1 {
-            let i = (row_base + x as usize) * 4;
+        let row_base = (cur_y as u32 * tile_w) as usize;
+        let mut x = x0;
+        while x < x1 {
+            let cur_x = x;
+            x += 1;
+            let i = (row_base + cur_x as usize) * 4;
             if mask_px[i + 3] == 0 {
                 continue;
             }
@@ -470,7 +491,7 @@ pub(crate) fn paint_dark_masked_disc(
             if px[i + 3] != 255 || px[i] >= 96 || px[i + 1] >= 96 || px[i + 2] >= 96 {
                 continue;
             }
-            let dx0 = x as f32 + 0.125 - cx;
+            let dx0 = cur_x as f32 + 0.125 - cx;
             let dx3 = dx0 + 0.75;
             let dx0_2 = dx0 * dx0;
             let dx3_2 = dx3 * dx3;
@@ -485,7 +506,7 @@ pub(crate) fn paint_dark_masked_disc(
                 continue;
             }
             if dx0_2.max(dx3_2) + dy2_max <= rr {
-                tile.over(x, y, col, alpha);
+                tile.over(cur_x, cur_y, col, alpha);
                 continue;
             }
             let dx1 = dx0 + 0.25;
@@ -505,7 +526,7 @@ pub(crate) fn paint_dark_masked_disc(
                 ky += 1;
             }
             if hit > 0 {
-                tile.over(x, y, col, alpha * (hit as f32 * 0.0625));
+                tile.over(cur_x, cur_y, col, alpha * (hit as f32 * 0.0625));
             }
         }
     }
@@ -830,15 +851,17 @@ const fn mix3(a: (f32, f32, f32), b: (f32, f32, f32), t: f32) -> (f32, f32, f32)
     )
 }
 
+#[inline]
 const fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f32) {
+    let table = relative_luminance_table();
     let mut lo_rgb = packed_rgb(coat);
-    if relative_luminance(lo_rgb) >= floor {
+    if relative_luminance_with(table, lo_rgb) >= floor {
         return coat;
     }
     let (h, s, _v) = rgb2hsv(lo_rgb);
     let pale = rgb(hsv2rgb(h, s * 0.55, 0.78));
     let mut hi_rgb = packed_rgb(pale);
-    if relative_luminance(hi_rgb) <= floor {
+    if relative_luminance_with(table, hi_rgb) <= floor {
         return pale;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -846,7 +869,9 @@ const fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f3
     while step < 6 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = packed_rgb(mix3(coat, pale, mid));
-        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && relative_luminance(mid_rgb) < floor) {
+        if mid_rgb == lo_rgb
+            || (mid_rgb != hi_rgb && relative_luminance_with(table, mid_rgb) < floor)
+        {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -874,8 +899,9 @@ pub(crate) const fn dark_bg_coat_stop(coat: u8) -> (f32, f32, f32) {
 
 #[inline]
 const fn contrast_ratio(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
-    let a = relative_luminance(packed_rgb(a));
-    let b = relative_luminance(packed_rgb(b));
+    let table = relative_luminance_table();
+    let a = relative_luminance_with(table, packed_rgb(a));
+    let b = relative_luminance_with(table, packed_rgb(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
@@ -901,13 +927,13 @@ pub const fn resolve_layer(layer: &Layer, fills: &ResolvedFills) -> ((f32, f32, 
 const fn resolve_glyph_layer(
     layer: &Layer,
     fills: &ResolvedFills,
-    coat_lum: Option<f32>,
+    coat_lum: Option<(&RelativeLuminanceTable, f32)>,
 ) -> ((f32, f32, f32), f32) {
     if matches!(layer.role, GlyphRole::Eye)
         && matches!(layer.recolor, Recolor::Fixed)
-        && let Some(coat_lum) = coat_lum
+        && let Some((table, coat_lum)) = coat_lum
     {
-        let eye_lum = relative_luminance(layer.fill);
+        let eye_lum = relative_luminance_with(table, layer.fill);
         let contrast = (eye_lum.max(coat_lum) + 0.05) / (eye_lum.min(coat_lum) + 0.05);
         if contrast < MIN_EYE_CONTRAST {
             return (fills.eye_ink, 1.0);
@@ -917,6 +943,7 @@ const fn resolve_glyph_layer(
 }
 
 /// The mixed-background keyline under an outline layer.
+#[inline]
 pub(crate) fn paint_outline_halo(
     tile: &mut Tile,
     layer: &Layer,
@@ -1006,6 +1033,7 @@ impl EyesFrame {
     }
 }
 
+#[inline]
 const fn layer_eye_line(layer: &Layer) -> Option<f32> {
     let mut lo = u16::MAX;
     let mut hi = 0u16;
@@ -1054,6 +1082,7 @@ const fn layer_eye_line(layer: &Layer) -> Option<f32> {
 }
 
 /// Normalized control-hull bounds `(x0, y0, x1, y1)` of one subpath.
+#[inline]
 #[must_use]
 pub(crate) const fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)> {
     const INV_FIXED_ONE: f32 = 1.0 / FIXED_ONE as f32;
@@ -1114,6 +1143,7 @@ pub(crate) const fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)
     }
 }
 
+#[inline]
 const fn closest_eye_bounds(
     eye_bounds: &[Option<(f32, f32, f32, f32)>],
     pcx: f32,
@@ -1280,6 +1310,7 @@ const fn open_eye_reflection_eligible(bounds: (f32, f32, f32, f32), xform: PathT
         && !(eye_w > 0.0 && eye_h < OPEN_EYE_SHALLOW_ASPECT * eye_w)
 }
 
+#[inline]
 pub(crate) fn prepare_scratch_tile(slot: &mut Option<Tile>, w: u32, h: u32) -> &mut Tile {
     match slot {
         Some(tile) => {
@@ -1301,6 +1332,7 @@ pub(crate) fn take_or_new_tile(recycled: Option<Tile>, w: u32, h: u32) -> Tile {
     }
 }
 
+#[inline]
 fn paint_open_eye_reflections(
     tile: &mut Tile,
     meta: &GlyphMeta,
@@ -1312,7 +1344,11 @@ fn paint_open_eye_reflections(
     }
     let mut painted_mask = false;
 
-    for slot in &meta.reflections[..usize::from(meta.reflection_count)] {
+    let n_ref = usize::from(meta.reflection_count);
+    let mut ri = 0;
+    while ri < n_ref {
+        let slot = &meta.reflections[ri];
+        ri += 1;
         let Some(reflection) = slot else {
             continue;
         };
@@ -1363,6 +1399,7 @@ fn paint_open_eye_reflections(
     }
 }
 
+#[inline]
 fn paint_glyph(
     tile: &mut Tile,
     id: CatGlyphId,
@@ -1376,7 +1413,11 @@ fn paint_glyph(
     let def = &GLYPHS[idx];
     let meta = &GLYPH_META[idx];
     let coat_lum = if meta.needs_coat_lum {
-        Some(relative_luminance(packed_rgb(fills.coat)))
+        let table = relative_luminance_table();
+        Some((
+            table,
+            relative_luminance_with(table, packed_rgb(fills.coat)),
+        ))
     } else {
         None
     };
@@ -1392,7 +1433,10 @@ fn paint_glyph(
     } else {
         xform
     };
-    for layer in def.layers {
+    let mut li = 0;
+    while li < def.layers.len() {
+        let layer = &def.layers[li];
+        li += 1;
         // A shut eye shows no iris or catch-light.
         if matches!(eyes, EyesFrame::Blink)
             && matches!(layer.role, GlyphRole::Iris | GlyphRole::CatchLight)
@@ -1418,6 +1462,7 @@ fn paint_glyph(
     }
 }
 
+#[inline]
 fn paint_variant_onto(
     tile: &mut Tile,
     id: CatGlyphId,
@@ -1464,6 +1509,7 @@ pub fn bake_variant(id: CatGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Ti
 }
 
 /// [`bake_variant`] with an optional accessory composited at its [`accessory_attach`] anchor.
+#[inline]
 #[must_use]
 pub fn bake_variant_with(
     id: CatGlyphId,
@@ -1521,6 +1567,7 @@ impl BakeKeyV4 {
         )
     }
 
+    #[inline]
     fn bake_scratch<'a>(
         &self,
         scratch: &'a mut Option<Tile>,

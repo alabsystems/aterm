@@ -102,9 +102,11 @@ fn stuck(birth: u64) -> String {
     templates::stuck_line(&told(birth))
 }
 
+/// The facts' policy: the turn-end policy continues at its points, where the fact rides.
 fn keyed(occupancy: Occupancy, key: bool) -> SupervisorConfig {
     SupervisorConfig {
         stuck_break_note: key,
+        continue_policy: true,
         ..policy(occupancy)
     }
 }
@@ -151,6 +153,11 @@ impl<'a> Run<'a> {
             idle_host: Some(Arc::clone(&self.host) as Arc<dyn IdleHost>),
             ..hosted(30)
         };
+        // The breaks run the facts' doors alone, without Cruise's carry (`cruise_carry_loop_tests`).
+        let breaks = SupervisorConfig {
+            continue_policy: false,
+            ..self.policy.clone()
+        };
         let mut sent = Vec::new();
         let (noted, told) = {
             let clock = Arc::new(crate::supervise::fx::ScriptedClock::default());
@@ -191,12 +198,7 @@ impl<'a> Run<'a> {
                 s.clock_marks = Some((s.fx.mono(), at_ms));
                 match step {
                     Step::Break => s
-                        .host_steps_in_background(
-                            &screen,
-                            &mut since,
-                            Some(&self.policy),
-                            &mut heard,
-                        )
+                        .host_steps_in_background(&screen, &mut since, Some(&breaks), &mut heard)
                         .expect("the break's step"),
                     Step::End => {
                         since = None;
@@ -498,8 +500,12 @@ fn with_the_key_off_a_break_is_mains_exactly() {
     let run = |tag: &str, occupancy, key: bool, reading: bool| {
         let host = Arc::new(DoorHost::default());
         *host.facts.lock().expect("facts") = reading.then(|| vec![hung(BORN)]);
+        // The breaks alone, without Cruise's carry (`cruise_carry_loop_tests`).
         Script {
-            policy: keyed(occupancy, key),
+            policy: SupervisorConfig {
+                continue_policy: false,
+                ..keyed(occupancy, key)
+            },
             host,
             ..Script::new(tag, occupancy, &[0, 31 * 60, 32 * 60])
         }

@@ -14,6 +14,8 @@ repository.workspace = true
 description = "The headless reducer, document store and rope behind aterm's native Editor, the one input reducer its keys go through, and the `edit` request and file-URI wire forms aterm-gui serves. Further amacs faces and protocols are planned in docs/DESIGN-amacs-2026-10-19.md."
 
 [dependencies]
+# The edit request and the file-URI codec, re-exported as amacs::protocol::{edit, uri}.
+amacs-protocol = { workspace = true }
 # The editor's grapheme and width rules, and the rope's chunked buffer.
 aterm-buffer = { path = "../aterm-buffer" }
 aterm-grapheme = { workspace = true }

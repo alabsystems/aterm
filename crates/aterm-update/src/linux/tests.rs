@@ -4,6 +4,17 @@
 use super::*;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
+#[test]
+fn required_linux_directory_flushes_reject_refusals_and_genuine_failures() {
+    use aterm_durable::seam::FailingDirs;
+    let fixture = Fixture::new();
+    for errno in [libc::ENOTSUP, libc::EIO] {
+        let _failure = FailingDirs::with(errno);
+        assert!(sync_dir(&fixture.root).is_err());
+        assert!(ordered_dir(&fixture.root).is_err());
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     context: Context,

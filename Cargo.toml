@@ -10,42 +10,41 @@ members = ["crates/*"]
 # `--workspace` and `-p` still reach every member. List new crates here unless
 # they are publication tools or check runners.
 default-members = [
-    "crates/agh", "crates/agh-fake", "crates/amacs", "crates/amacs-files", "crates/amacs-term",
-    "crates/aterm", "crates/aterm-a11y", "crates/aterm-agent", "crates/aterm-agent-names", "crates/aterm-alloc", "crates/aterm-aos", "crates/aterm-arrayvec",
+    "crates/agh", "crates/agh-fake", "crates/amacs", "crates/amacs-files", "crates/amacs-protocol", "crates/amacs-term",
+    "crates/aterm", "crates/aterm-a11y", "crates/aterm-agent", "crates/aterm-agent-names", "crates/aterm-alloc", "crates/aterm-aos", "crates/aterm-aos-pane",
     "crates/aterm-bidi", "crates/aterm-bits", "crates/aterm-bootstrap-verify", "crates/aterm-brotli", "crates/aterm-buffer",
-    "crates/aterm-caffeine", "crates/aterm-cap", "crates/aterm-capacity",
+    "crates/aterm-acaffiene", "crates/aterm-cap", "crates/aterm-capacity",
     "crates/aterm-cfg-if", "crates/aterm-cg", "crates/aterm-cli", "crates/aterm-codec",
     "crates/aterm-conformance", "crates/aterm-containment", "crates/aterm-control",
     "crates/aterm-converge",
     "crates/aterm-core", "crates/aterm-ctl",
     "crates/aterm-dbus", "crates/aterm-digest", "crates/aterm-dirfd", "crates/aterm-diskwalk", "crates/aterm-dl",
     "crates/aterm-durable", "crates/aterm-db", "crates/aterm-db-core",
-    "crates/aterm-document-features",
     "crates/aterm-effects", "crates/aterm-font", "crates/aterm-getrandom", "crates/aterm-gpu",
     "crates/aterm-gpu-web", "crates/aterm-grapheme", "crates/aterm-grid",
     "crates/aterm-gui", "crates/aterm-gui-consent", "crates/aterm-gui-documents",
     "crates/aterm-gui-fabric", "crates/aterm-gui-tabs", "crates/aterm-gui-timing",
     "crates/aterm-hash", "crates/aterm-http", "crates/aterm-journal", "crates/aterm-jpeg", "crates/aterm-json",
-    "crates/aterm-keeper", "crates/aterm-lexicon", "crates/aterm-libc", "crates/aterm-libm",
-    "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-log-shim", "crates/aterm-lz4",
+    "crates/aterm-keeper", "crates/aterm-lexicon", "crates/aterm-libc",
+    "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-lz4",
     "crates/aterm-macro-support", "crates/aterm-messages", "crates/aterm-net", "crates/aterm-objc",
     "crates/aterm-models-agh", "crates/aterm-models-aos", "crates/aterm-models-atpkg", "crates/aterm-models-core", "crates/aterm-models-effects",
     "crates/aterm-models-db", "crates/aterm-models-gui", "crates/aterm-models-harness", "crates/aterm-models-misc",
     "crates/aterm-models-native", "crates/aterm-models-release", "crates/aterm-models-render",
-    "crates/aterm-models-session", "crates/aterm-models-update",
+    "crates/aterm-models-session", "crates/aterm-models-setup", "crates/aterm-models-update",
     "crates/aterm-observe", "crates/aterm-once-cell", "crates/aterm-parser",
     "crates/aterm-phase", "crates/aterm-png", "crates/aterm-policy", "crates/aterm-predict",
-    "crates/aterm-primer", "crates/aterm-profiling", "crates/aterm-provenance",
+    "crates/aterm-primer", "crates/aterm-provenance",
     "crates/aterm-pty", "crates/aterm-regex", "crates/aterm-render", "crates/aterm-restore",
     "crates/aterm-rle",
     "crates/aterm-sandbox", "crates/aterm-scene", "crates/aterm-scrollback",
     "crates/aterm-search", "crates/aterm-secrets", "crates/aterm-selection", "crates/aterm-serde", "crates/aterm-serde-derive",
     "crates/aterm-session", "crates/aterm-shell-integration", "crates/aterm-sixel", "crates/aterm-slog",
-    "crates/aterm-smallvec", "crates/aterm-spec", "crates/aterm-spec-anchor", "crates/aterm-spec-macros",
+    "crates/aterm-spec", "crates/aterm-spec-anchor", "crates/aterm-spec-macros",
     "crates/aterm-spec-models", "crates/aterm-sysprobe", "crates/aterm-tempfile",
     "crates/aterm-theme-pack", "crates/aterm-time", "crates/aterm-toml", "crates/aterm-toolchain",
     "crates/aterm-tracing", "crates/aterm-tty", "crates/aterm-types", "crates/aterm-uds",
-    "crates/aterm-unicode-width", "crates/aterm-update", "crates/aterm-update-core", "crates/aterm-vitals",
+    "crates/aterm-update", "crates/aterm-update-core", "crates/aterm-vitals",
     "crates/aterm-vz", "crates/aterm-vz-agent",
     "crates/aterm-wasm", "crates/aterm-wasm-abi", "crates/aterm-wasm-abi-macros", "crates/aterm-wayland",
     "crates/aterm-win32", "crates/aterm-window",
@@ -80,7 +79,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.144.0"
+version = "0.145.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -111,6 +110,8 @@ agh = { path = "crates/agh" }
 agh-fake = { path = "crates/agh-fake" }
 # Headless editor engine.
 amacs = { path = "crates/amacs" }
+# amacs's wire protocol, std only: aterm-ctl's `edit` exchanges without the editor engine.
+amacs-protocol = { path = "crates/amacs-protocol" }
 # File I/O and persistence shared by the native view and terminal UI.
 amacs-files = { path = "crates/amacs-files" }
 # `amacs` client, terminal UI, and machine protocol (outside aterm-gui's closure).
@@ -123,6 +124,8 @@ aterm-agent-names = { path = "crates/aterm-agent-names" }
 aterm-alloc = { path = "crates/aterm-alloc" }
 # Aos hosted execution: task checkpoints, the ordered event log, replay and boundary publication.
 aterm-aos = { path = "crates/aterm-aos" }
+# The pane as an Aos task: a terminal checkpoint and its recorded output, replayed under `pane.faithful-replay`.
+aterm-aos-pane = { path = "crates/aterm-aos-pane" }
 aterm-bidi = { path = "crates/aterm-bidi" }
 aterm-bits = { path = "crates/aterm-bits" }
 aterm-bootstrap-verify = { path = "crates/aterm-bootstrap-verify" }
@@ -177,8 +180,8 @@ aterm-jpeg = { path = "crates/aterm-jpeg" }
 # First-party JSON serde Deserializer/Serializer, `Value`, and `json!`.
 aterm-json = { path = "crates/aterm-json" }
 aterm-keeper = { path = "crates/aterm-keeper" }
-# `aterm caffeine` menu-bar keep-awake mug (macOS at run time).
-aterm-caffeine = { path = "crates/aterm-caffeine" }
+# `aterm acaffiene` menu-bar keep-awake mug (macOS at run time).
+aterm-acaffiene = { path = "crates/aterm-acaffiene" }
 aterm-lexicon = { path = "crates/aterm-lexicon" }
 aterm-log = { path = "crates/aterm-log" }
 aterm-lz4 = { path = "crates/aterm-lz4" }
@@ -201,6 +204,7 @@ aterm-models-native = { path = "crates/aterm-models-native" }
 aterm-models-release = { path = "crates/aterm-models-release" }
 aterm-models-render = { path = "crates/aterm-models-render" }
 aterm-models-session = { path = "crates/aterm-models-session" }
+aterm-models-setup = { path = "crates/aterm-models-setup" }
 aterm-models-update = { path = "crates/aterm-models-update" }
 # Fleet mutual authentication over TLS 1.3, LAN peer listener, and relay.
 aterm-net = { path = "crates/aterm-net" }
@@ -297,12 +301,8 @@ atpkg-publish = { path = "crates/atpkg-publish" }
 # `[patch.crates-io]`. Root rows let workspace members write
 # `<name> = { workspace = true }`, as required by `aterm_census::scan_set`.
 tracing = { path = "crates/aterm-tracing" }
-profiling = { path = "crates/aterm-profiling" }
 cfg-if = { path = "crates/aterm-cfg-if" }
-arrayvec = { path = "crates/aterm-arrayvec" }
 once_cell = { path = "crates/aterm-once-cell" }
-log = { path = "crates/aterm-log-shim" }
-smallvec = { path = "crates/aterm-smallvec" }
 
 # The tree is kept clean under
 # `targo-tippy --workspace --all-targets --keep-going -- -D warnings`.
@@ -535,21 +535,20 @@ lto = false
 codegen-units = 16
 strip = false
 
+# `lab trail-diff`'s dump (`aterm-gui --example trail_dump`, docs/design/PRISM-GLASS.md
+# §15.1 P0.4): `dev` keeps debug assertions, so the dump's seams and every engine's state
+# words compile in; opt-level 2 draws a script's frames several times faster.
+[profile.trail-diff]
+inherits = "dev"
+opt-level = 2
+
 # First-party replacements for third-party transitive dependencies.
 # Every shim version must stay >= the highest compatible requirement in the
 # graph, or cargo silently leaves the registry crate unpatched (`forge check`
 # [OB-12] enforces this).
 [patch.crates-io]
 tracing = { path = "crates/aterm-tracing" }
-profiling = { path = "crates/aterm-profiling" }
 cfg-if = { path = "crates/aterm-cfg-if" }
-
-# Re-exports `aterm_alloc::ArrayVec` as `arrayvec` 0.7.8 for naga and wgpu*.
-# Deliberate divergences from upstream: `size_of` (backing array is not
-# niche-packed) and `Drain` under `mem::forget` (elements are retained rather
-# than leaked). Differential tests live in
-# `crates/aterm-alloc/tests/arrayvec_differential.rs`.
-arrayvec = { path = "crates/aterm-arrayvec" }
 
 # First-party `libc` 0.2.186 declarations (`crates/aterm-libc`), checked against
 # registry `=0.2.186` by `libc-oracle/` (its own workspace without this patch
@@ -557,36 +556,12 @@ arrayvec = { path = "crates/aterm-arrayvec" }
 # symbols still resolve to the system C library at link time.
 libc = { path = "crates/aterm-libc" }
 
-# No-op `log` facade (`crates/aterm-log-shim`). Safe because nothing in the
-# workspace installs a `log` logger (`aterm_log` is a separate crate) and no
-# cell resolves a `log` backend, so upstream `log` was already a static
-# `NopLogger` with `max_level() == Off`. Retire this patch if a `log` backend is
-# ever installed.
-log = { path = "crates/aterm-log-shim" }
-
 once_cell = { path = "crates/aterm-once-cell" }
-
-# Wraps `aterm_alloc::SmallVec<T, N>` in upstream `smallvec` 1.15.1's
-# `SmallVec<[T; N]>` signature via an `Array` trait (`#![forbid(unsafe_code)]`).
-smallvec = { path = "crates/aterm-smallvec" }
 
 # Forwards `getrandom` 0.2.17 (used by `ring::rand::SystemRandom`) to
 # `aterm_uds::rand::fill`. Omitted from `[workspace.dependencies]` because
 # `deny.toml` forbids direct `getrandom` edges outside `ring` ([OB-18]).
 getrandom = { path = "crates/aterm-getrandom" }
-
-# Forwards the 68 `libm` functions used by `naga` and `num-traits` to `std`
-# float methods (`crates/aterm-libm`), verified against recorded outputs in
-# `tests/recorded.rs`.
-libm = { path = "crates/aterm-libm" }
-
-# Expands `document_features!()` (used in `#![doc = ...]` by `wgpu` and
-# `wgpu-core`) to `""`.
-document-features = { path = "crates/aterm-document-features" }
-
-# Answers `unicode-width` (used by `codespan-reporting` in `naga`) from
-# `aterm-grapheme`'s width tables.
-unicode-width = { path = "crates/aterm-unicode-width" }
 
 # Renamed patch keys (`windows-sys-052`, `windows-sys-061`) allow patching two
 # semver majors of `windows-sys` in one manifest (`cargo` matches on `package`,

@@ -4,6 +4,8 @@
 //! Process-global render/latency counters, read over the control socket by the `metrics` verb so a driver can measure responsiveness and detect lag directly.
 
 pub(crate) mod instrument;
+#[cfg(all(unix, any(test, debug_assertions)))]
+mod restore_experiment;
 pub(crate) mod startup;
 pub(crate) mod wakes;
 pub(crate) mod wire;
@@ -15,14 +17,23 @@ use instrument::{
     Baselined, Counter, Dist, HistCopy, Last, LastFlag, LastLabel, Max, MaxBy, Peak, Stamp, Tally,
     Windowed, window_ledger,
 };
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(crate) use restore_experiment::{RestoreExperiment, record_restore_experiment};
 #[cfg(unix)]
 pub(crate) use startup::claim_timeline_log_text;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(crate) use startup::record_keeper_seam;
 pub(crate) use startup::{
     ClaimStamp, StartupAttachMilestones, StartupPresentTiming, StartupWorkerLegs, leg_elapsed_ns,
     mark_backend_worker_done, mark_backend_worker_spawn, mark_first_window_visible,
     mark_first_winit_resumed, mark_gui_ready_for_winit, mark_initial_surface_ready,
     mark_process_start, mark_rust_main_start, record_backend_worker_legs,
     record_initial_attach_milestones, stamp_claim,
+};
+#[cfg(unix)]
+pub(crate) use startup::{
+    keeper_seam, mark_keeper_hello, mark_keeper_imported, mark_keeper_placed,
+    record_keeper_admitted,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use startup::{mark_handoff_claimed, process_main_start};
@@ -128,6 +139,8 @@ window_ledger! {
         pub(crate) rewind_step: Histogram,
         /// A Rewind step taken on the main thread → its fold shown and its redraw asked for (a headless instance presents nothing).
         pub(crate) rewind_shown: Histogram,
+        /// The most output a step's fold applied past the fork or keyframe it started from (`max_rewind_fold_bytes`).
+        pub(crate) rewind_folded: Max,
         /// Input REFUSED because its session's input queue was full: the program has stopped reading and the key (or paste) was refused.
         pub(crate) refused: Counter,
         /// Terminal query REPLIES dropped at submission (`spawn::ReplyLane::submit`).
@@ -358,10 +371,49 @@ const INPUT_SLICE_CAP_NS: u64 = 5_000_000_000;
 
 const RESIZE_SLICE_CAP_NS: u64 = 2_000_000_000;
 
+#[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
+thread_local! {
+    /// The instant this thread's host clock reads are pinned to ([`pin_host_clock`]).
+    static HOST_CLOCK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin (or, with `None`, release) this thread's host clock ([`host_now`]): `lab trail-diff`'s
+/// dump (`crate::trail_rig`) drives every frame and event at its own injected instant.
+#[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
+pub(crate) fn pin_host_clock(at: Option<Instant>) {
+    HOST_CLOCK.with(|clock| clock.set(at));
+}
+
+/// Whether this thread's host clock is pinned ([`pin_host_clock`]): its frames and events run at
+/// injected instants, so a cost measured on the wall clock belongs to none of them. Always `false`
+/// outside a debug test or `bench-support` build.
+#[inline]
+pub(crate) fn host_clock_pinned() -> bool {
+    #[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
+    if HOST_CLOCK.with(std::cell::Cell::get).is_some() {
+        return true;
+    }
+    false
+}
+
+/// Now: the host's clock read where no frame or event instant reaches the code (this clock's
+/// [`now_ns`], the input path's, a window's focus, the resize throttle, the trail curtain a
+/// replaced front or a grid resize draws, the cursor effects' owner fence and scroll seam, the
+/// stats surfaces' pointer rest, the instant a present reached glass), or the instant
+/// `pin_host_clock` pinned on this thread in a debug test or `bench-support` build.
+#[inline]
+pub(crate) fn host_now() -> Instant {
+    #[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
+    if let Some(at) = HOST_CLOCK.with(std::cell::Cell::get) {
+        return at;
+    }
+    Instant::now()
+}
+
 /// Monotonic nanoseconds since the process clock's anchor.
 pub(crate) fn now_ns() -> u64 {
     let start = startup::STARTUP.clock_anchor();
-    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    u64::try_from(host_now().saturating_duration_since(start).as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// How many frames this process has presented (the `metrics` verb's `frames`, zeroed by `metrics reset`).
@@ -440,6 +492,7 @@ label_enum! {
         StatsLens => "stats_lens",
         AgentsPanel => "agents_panel",
         StatsLive => "stats_live",
+        StatsNeedle => "stats_needle",
     }
 }
 
@@ -1158,6 +1211,15 @@ pub(crate) fn note_rewind_shown(elapsed: std::time::Duration) {
         .record(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
 }
 
+/// Book the output one Rewind step's fold applied past its start (`InputLedger::rewind_folded`).
+pub(crate) fn note_rewind_folded(bytes: usize) {
+    let _ = METRICS
+        .window
+        .input
+        .rewind_folded
+        .record(u64::try_from(bytes).unwrap_or(u64::MAX));
+}
+
 /// Book one build of the menu-bar item's glance, in ns (`InputLedger::status_glance`).
 pub(crate) fn note_status_glance(ns: u64) {
     let input = &METRICS.window.input;
@@ -1238,6 +1300,7 @@ fn emit_input_legs(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink) {
         ],
         &input.rewind_shown.copy_out(),
     );
+    s.count("max_rewind_fold_bytes", input.rewind_folded.get());
     s.count("input_refused", input.refused.get());
     s.count("reply_dropped", input.reply_dropped.get());
     emit_quantiles_ms3(
@@ -1754,7 +1817,9 @@ impl SyncHoldingGauge {
         transition_sync_holding(&mut self.held, held, &METRICS.live.sync_holding_windows);
     }
 
-    #[cfg(test)]
+    /// Whether the window holds a synchronized update (the tests, and `crate::trail_rig`'s
+    /// present).
+    #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
     pub(crate) fn is_held_for_test(&self) -> bool {
         self.held
     }

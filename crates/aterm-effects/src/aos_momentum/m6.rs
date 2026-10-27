@@ -153,6 +153,7 @@ pub struct State {
 impl State {
     /// v0's state: every weight and average 0, no step taken, the random state at
     /// [`trainer_seed`].
+    #[inline]
     #[must_use]
     pub fn base() -> State {
         State {
@@ -185,43 +186,57 @@ impl State {
         self.rng
     }
 
-    /// The adapter's bytes: `w`, each `i32` little-endian.
-    #[must_use]
-    pub fn adapter_bytes(&self) -> Vec<u8> {
-        let mut e = Enc::with_capacity(ADAPTER_LEN);
+    #[inline]
+    fn encode_adapter(&self, e: &mut Enc) {
         for &w in &self.w {
             e.i32(w);
         }
-        e.finish()
     }
 
-    /// The optimizer's bytes: `acc`, each `i64` little-endian, then `t` and `epochs`.
-    #[must_use]
-    pub fn optimizer_bytes(&self) -> Vec<u8> {
-        let mut e = Enc::with_capacity(OPTIMIZER_LEN);
+    #[inline]
+    fn encode_optimizer(&self, e: &mut Enc) {
         for &a in &self.acc {
             e.i64(a);
         }
         e.u64(self.t);
         e.u32(self.epochs);
+    }
+
+    /// The adapter's bytes: `w`, each `i32` little-endian.
+    #[inline]
+    #[must_use]
+    pub fn adapter_bytes(&self) -> Vec<u8> {
+        let mut e = Enc::with_capacity(ADAPTER_LEN);
+        self.encode_adapter(&mut e);
+        e.finish()
+    }
+
+    /// The optimizer's bytes: `acc`, each `i64` little-endian, then `t` and `epochs`.
+    #[inline]
+    #[must_use]
+    pub fn optimizer_bytes(&self) -> Vec<u8> {
+        let mut e = Enc::with_capacity(OPTIMIZER_LEN);
+        self.encode_optimizer(&mut e);
         e.finish()
     }
 
     /// The random state's bytes.
+    #[inline]
     #[must_use]
     pub const fn rng_bytes(&self) -> [u8; RNG_LEN] {
         self.rng.to_le_bytes()
     }
 
     /// Its [`STATE_LEN`] bytes.
+    #[inline]
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::with_capacity(STATE_LEN);
         e.raw(&STATE_MAGIC);
         e.u32(STATE_FORMAT);
         e.u32(FEATURES as u32);
-        e.raw(&self.adapter_bytes());
-        e.raw(&self.optimizer_bytes());
+        self.encode_adapter(&mut e);
+        self.encode_optimizer(&mut e);
         e.raw(&self.rng_bytes());
         e.finish()
     }
@@ -229,6 +244,7 @@ impl State {
     /// The state `bytes` encode, canonically: `decode(b)?.encode() == b`.
     /// # Errors
     /// The first [`StateRefusal`] that applies.
+    #[inline]
     pub fn decode(bytes: &[u8]) -> Result<State, StateRefusal> {
         if bytes.len() != STATE_LEN {
             return Err(StateRefusal::Length { len: bytes.len() });
@@ -277,6 +293,7 @@ impl State {
 
     /// `plan`'s score, `Σ_{f ∈ φ(plan)} (t·B[f] + acc[f])`. The bounds the trainer and
     /// [`Self::decode`] keep put it below `2⁵⁰` in magnitude.
+    #[inline]
     #[must_use]
     pub const fn score(&self, plan: &SchedulePlan) -> i64 {
         let t = if self.t > i64::MAX as u64 {
@@ -290,6 +307,7 @@ impl State {
             + (t * (BASE[fs[2]] as i64) + self.acc[fs[2]])
     }
 
+    #[inline]
     const fn w_sum(&self, fs: &[usize; 3]) -> i64 {
         (self.w[fs[0]] as i64) + (self.w[fs[1]] as i64) + (self.w[fs[2]] as i64)
     }
@@ -310,17 +328,19 @@ pub enum Ranker<'s> {
 }
 
 impl Ranker<'_> {
+    #[inline]
     fn first(&self, pool: &PoolId, plan: &SchedulePlan) -> i128 {
         match self {
-            Ranker::Model(state) => -i128::from(state.score(plan)),
-            Ranker::Control => i128::from(control_key(pool, plan)),
-            Ranker::W1 => i128::from(w1_class(plan)),
-            Ranker::W2 => i128::from(w2_class(plan)),
+            Ranker::Model(state) => -(state.score(plan) as i128),
+            Ranker::Control => control_key(pool, plan) as i128,
+            Ranker::W1 => w1_class(plan) as i128,
+            Ranker::W2 => w2_class(plan) as i128,
         }
     }
 
     /// `plans`, pool `pool`'s, in its order: its key, then the tie key ascending, then (a tie
     /// key collision, which no pinned pool has) the plan's bytes.
+    #[inline]
     #[must_use]
     pub fn order(&self, pool: &PoolId, plans: &[SchedulePlan]) -> Vec<SchedulePlan> {
         let mut keyed = Vec::with_capacity(plans.len());
@@ -338,6 +358,7 @@ impl Ranker<'_> {
     /// The first [`JUDGED`] plans of its order of `plans`.
     /// # Errors
     /// [`LearnRefusal::PoolTooSmall`] for a pool of fewer than [`JUDGED`] plans.
+    #[inline]
     pub fn top_k(
         &self,
         pool: &PoolId,
@@ -351,6 +372,7 @@ impl Ranker<'_> {
 
 /// A label's place in the label order: admitted before refused, admitted plans by training
 /// `(ΣT, ΣZ)` ascending, refused plans tied.
+#[inline]
 const fn label_order(label: &TrainLabel) -> (u8, u64, u64) {
     match label.totals() {
         Some(t) => (0, t.ticks, t.wasted),
@@ -364,6 +386,7 @@ const fn label_order(label: &TrainLabel) -> (u8, u64, u64) {
 /// each consecutive pair of the permutation whose label order differs.
 /// # Errors
 /// [`LearnRefusal::StepBudget`] past [`MAX_STEPS`] steps.
+#[inline]
 pub fn train(parent: &State, data: &[&TrainLabel]) -> Result<State, LearnRefusal> {
     let mut s = parent.clone();
     let mut rng = SplitMix::new(s.rng);
@@ -418,6 +441,7 @@ pub fn train(parent: &State, data: &[&TrainLabel]) -> Result<State, LearnRefusal
 }
 
 /// `C(n, k)`, exactly.
+#[inline]
 const fn choose(n: u32, k: u32) -> u128 {
     let min_k = if k < n { k } else { n };
     let rem = n - min_k;
@@ -433,6 +457,7 @@ const fn choose(n: u32, k: u32) -> u128 {
 
 /// The one-sided sign test at level `1 / level` (design §13.4): `n ≥ 1` and
 /// `level · Σ_{k=w}^{n} C(n, k) ≤ 2ⁿ`, exactly in `u128`, for `n` up to [`POOLS`].
+#[inline]
 #[must_use]
 pub const fn sign_test(level: u128, wins: u32, n: u32) -> bool {
     if n == 0 || wins > n || n as usize > POOLS {
@@ -462,6 +487,7 @@ pub struct Comparison {
 
 impl Comparison {
     /// `x`'s outcomes against `a`'s, pool by pool.
+    #[inline]
     #[must_use]
     pub fn of(x: &[PoolOutcome], a: &[PoolOutcome]) -> Comparison {
         let mut c = Comparison::default();
@@ -482,6 +508,7 @@ impl Comparison {
     /// untied pools, and summed gains not lower in both `ΣT` and `ΣZ`.
     /// # Errors
     /// [`ModelRefusal::NoUntied`], [`ModelRefusal::Losses`] or [`ModelRefusal::Gain`].
+    #[inline]
     pub const fn beats(&self, level: u128) -> Result<(), ModelRefusal> {
         let n = self.wins + self.losses;
         if n == 0 {
@@ -498,6 +525,7 @@ impl Comparison {
     /// A look's verdict: [`Self::beats`] at [`LOOK_LEVEL`].
     /// # Errors
     /// As [`Self::beats`].
+    #[inline]
     pub const fn admits(&self) -> Result<(), ModelRefusal> {
         self.beats(LOOK_LEVEL)
     }
@@ -505,6 +533,7 @@ impl Comparison {
     /// A report criterion's verdict: [`Self::beats`] at [`REPORT_LEVEL`].
     /// # Errors
     /// As [`Self::beats`].
+    #[inline]
     pub const fn shows(&self) -> Result<(), ModelRefusal> {
         self.beats(REPORT_LEVEL)
     }
@@ -598,17 +627,20 @@ pub struct Manifest {
 
 impl Manifest {
     /// The blocks, in order.
+    #[inline]
     #[must_use]
     pub fn blocks(&self) -> &[(Source, Vec<SchedulePlan>)] {
         &self.blocks
     }
 
     /// The plans, in manifest order.
+    #[inline]
     pub fn plans(&self) -> impl Iterator<Item = &SchedulePlan> {
         self.blocks.iter().flat_map(|(_, plans)| plans)
     }
 
     /// Its plan count.
+    #[inline]
     #[must_use]
     pub fn count(&self) -> usize {
         let mut total = 0usize;
@@ -626,6 +658,7 @@ impl Manifest {
     }
 
     /// The digest of its candidate ids, in manifest order.
+    #[inline]
     #[must_use]
     pub fn ids_digest(&self) -> Digest {
         let n = self.count();
@@ -643,6 +676,7 @@ impl Manifest {
     }
 
     /// This manifest with `source`'s `plans` appended, each plan whose id it holds dropped.
+    #[inline]
     fn with(mut self, source: Source, plans: &[SchedulePlan]) -> Manifest {
         let mut taken = BTreeSet::new();
         for (_, block_plans) in &self.blocks {
@@ -664,6 +698,7 @@ impl Manifest {
 
     /// Its bytes: the block count, each block's source and plans, then the plan count, the id
     /// digest and the excluded count.
+    #[inline]
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new();
@@ -700,6 +735,7 @@ impl Manifest {
     /// The manifest `bytes` encode, canonically.
     /// # Errors
     /// The first [`ManifestRefusal`] that applies.
+    #[inline]
     pub fn decode(bytes: &[u8]) -> Result<Manifest, ManifestRefusal> {
         let mut d = Dec::new(bytes);
         let n = d
@@ -751,6 +787,7 @@ impl Manifest {
     }
 
     /// The digest of its bytes.
+    #[inline]
     #[must_use]
     pub fn digest(&self) -> Digest {
         Digest::of(MANIFEST_DOMAIN, &[&self.encode()])
@@ -758,6 +795,7 @@ impl Manifest {
 }
 
 /// `n` as a `u32`, saturating (every count here is far below).
+#[inline]
 const fn len32(n: usize) -> u32 {
     if n > u32::MAX as usize {
         u32::MAX
@@ -767,6 +805,7 @@ const fn len32(n: usize) -> u32 {
 }
 
 /// One label's digest: its candidate id, then its training totals or its first failing law.
+#[inline]
 #[must_use]
 pub fn label_digest(label: &TrainLabel) -> Digest {
     let mut e = Enc::new();
@@ -787,6 +826,7 @@ pub fn label_digest(label: &TrainLabel) -> Digest {
 }
 
 /// The label digest of labels whose digests are `each`, in manifest order.
+#[inline]
 #[must_use]
 pub fn labels_digest(each: &[Digest]) -> Digest {
     let mut parts = Vec::with_capacity(each.len());
@@ -898,6 +938,7 @@ pub struct Sets {
 
 impl Sets {
     /// v1's sets in full.
+    #[inline]
     #[must_use]
     pub fn v1() -> Sets {
         Sets {
@@ -922,6 +963,7 @@ impl Sets {
     }
 
     /// Whether it draws v1's sets in full.
+    #[inline]
     #[must_use]
     pub const fn full(&self) -> bool {
         self.scale.train_plans == Scale::FULL.train_plans
@@ -933,6 +975,7 @@ impl Sets {
     /// `set`'s pools, in pool order.
     /// # Errors
     /// The first pool that does not fill.
+    #[inline]
     pub fn pools(&self, set: SetId) -> Result<Vec<Vec<SchedulePlan>>, PoolRefusal> {
         let mut drawn = self.drawn.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(pools) = drawn.get(&set) {
@@ -953,6 +996,7 @@ impl Sets {
     }
 
     /// [`GRID_V1`]'s plans, in order.
+    #[inline]
     #[must_use]
     pub fn grid(&self) -> Vec<SchedulePlan> {
         let cap = self.scale.grid.min(GRID_V1.len());
@@ -984,6 +1028,7 @@ impl fmt::Debug for Labeller<'_> {
 
 impl<'e> Labeller<'e> {
     /// Labels through `ev`, judging new plans through `spread`.
+    #[inline]
     #[must_use]
     pub const fn new(ev: &'e Evaluator, spread: &'e dyn Spread) -> Labeller<'e> {
         Labeller { ev, spread }
@@ -992,6 +1037,7 @@ impl<'e> Labeller<'e> {
     /// `plans`' labels under `scope`, in order.
     /// # Errors
     /// The scope's refusal, before anything is judged.
+    #[inline]
     pub fn label(
         &self,
         scope: LabelScope,
@@ -1002,6 +1048,7 @@ impl<'e> Labeller<'e> {
 }
 
 /// The plans as bytes.
+#[inline]
 fn bytes_of<'p>(plans: impl IntoIterator<Item = &'p SchedulePlan>) -> Vec<[u8; 12]> {
     let iter = plans.into_iter();
     let mut out = Vec::with_capacity(iter.size_hint().0);
@@ -1060,11 +1107,13 @@ pub struct Version {
 
 impl Version {
     /// v0: the base, round 0, no parent, no data.
+    #[inline]
     #[must_use]
     pub fn base() -> Version {
         Version::of(None, 0, State::base(), Manifest::default(), Vec::new())
     }
 
+    #[inline]
     fn of(
         parent: Option<Digest>,
         round: u8,
@@ -1132,12 +1181,14 @@ impl Version {
     }
 
     /// Its label digest.
+    #[inline]
     #[must_use]
     pub fn label_digest(&self) -> Digest {
         labels_digest(&self.labels)
     }
 
     /// The bytes of its labels file: each label's digest, in manifest order.
+    #[inline]
     #[must_use]
     pub fn labels_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.labels.len() * 32);
@@ -1148,6 +1199,7 @@ impl Version {
     }
 
     /// Its descriptor: exactly the parts its id is the digest of, in order.
+    #[inline]
     #[must_use]
     pub fn descriptor(&self) -> Vec<u8> {
         let mut e = Enc::new();
@@ -1168,6 +1220,7 @@ impl Version {
     /// 0 that is not v0 is refused as [`VersionRefusal::Parts`].
     /// # Errors
     /// The first [`VersionRefusal`] that applies.
+    #[inline]
     pub fn from_files(
         descriptor: &[u8],
         state: &[u8],
@@ -1269,6 +1322,7 @@ impl Version {
 }
 
 /// A version's id: `Digest::of` its parts under [`VERSION_DOMAIN`] (design §13.2).
+#[inline]
 fn version_id(
     parent: Option<&Digest>,
     round: u8,
@@ -1294,6 +1348,7 @@ fn version_id(
 
 /// Round `round`'s evidence on train pool `2 + round`: `parent`'s top [`JUDGED`] there, then the
 /// [`EXPLORE`] other plans with the lowest tie keys.
+#[inline]
 fn evidence(
     parent: &Version,
     round: u8,
@@ -1328,6 +1383,7 @@ fn evidence(
 }
 
 /// The round of the member that trains from `parent`: its round + 1, at most [`ROUNDS`].
+#[inline]
 const fn next_round(parent: &Version) -> Result<u8, LearnRefusal> {
     match parent.round.checked_add(1) {
         Some(round) if round <= ROUNDS => Ok(round),
@@ -1340,6 +1396,7 @@ const fn next_round(parent: &Version) -> Result<u8, LearnRefusal> {
 /// The data selection of the member that trains from `parent` (`m6-data v1`, design §13.3).
 /// # Errors
 /// [`LearnRefusal::Round`] past [`ROUNDS`], or a pool's refusal.
+#[inline]
 pub fn data(parent: &Version, sets: &Sets) -> Result<Manifest, LearnRefusal> {
     let round = next_round(parent)?;
     if round == 1 {
@@ -1358,6 +1415,7 @@ pub fn data(parent: &Version, sets: &Sets) -> Result<Manifest, LearnRefusal> {
 /// Whether a version's data of `count` plans is within [`MAX_LABELS`].
 /// # Errors
 /// [`LearnRefusal::LabelBudget`] past it.
+#[inline]
 pub const fn label_budget(count: usize) -> Result<(), LearnRefusal> {
     if count > MAX_LABELS {
         Err(LearnRefusal::LabelBudget { count })
@@ -1371,6 +1429,7 @@ pub const fn label_budget(count: usize) -> Result<(), LearnRefusal> {
 /// # Errors
 /// [`LearnRefusal::Round`], [`LearnRefusal::LabelBudget`], a pool's or labelling's refusal, or
 /// [`LearnRefusal::StepBudget`].
+#[inline]
 pub fn derive(
     parent: &Version,
     sets: &Sets,
@@ -1399,6 +1458,7 @@ pub fn derive(
 /// The chain v0..v4, computed on training data alone (design §13.2).
 /// # Errors
 /// The first member's refusal.
+#[inline]
 pub fn chain(sets: &Sets, labeller: &Labeller<'_>) -> Result<Vec<Version>, LearnRefusal> {
     let mut last = Version::base();
     let mut members = vec![last.clone()];
@@ -1423,6 +1483,7 @@ pub struct ChainPin {
 
 impl ChainPin {
     /// The pin of `members`, v0..v4.
+    #[inline]
     #[must_use]
     pub fn of(members: &[Version]) -> Option<ChainPin> {
         const LEN: usize = 1 + ROUNDS as usize;
@@ -1439,6 +1500,7 @@ impl ChainPin {
     }
 
     /// Its digest, which every ledger's `open` line records.
+    #[inline]
     #[must_use]
     pub fn digest(&self) -> Digest {
         const LEN: usize = (1 + ROUNDS as usize) * 2;
@@ -1528,6 +1590,7 @@ pub enum Pair {
 
 impl Pair {
     /// The set its looks read.
+    #[inline]
     #[must_use]
     pub const fn looks(self) -> SetId {
         match self {
@@ -1543,6 +1606,7 @@ impl Pair {
     }
 
     /// The set its report reads.
+    #[inline]
     #[must_use]
     pub const fn report(self) -> SetId {
         match self {
@@ -1558,6 +1622,7 @@ impl Pair {
     }
 
     /// Its ledger's directory name under the version's root: `pair-<i>` or `practice-<j>`.
+    #[inline]
     #[must_use]
     pub fn name(self) -> String {
         match self {
@@ -1566,6 +1631,7 @@ impl Pair {
         }
     }
 
+    #[inline]
     const fn parts(self) -> (u8, u32) {
         match self {
             Pair::Real(i) => (0, i),
@@ -1602,6 +1668,7 @@ pub enum VoidCause {
 }
 
 /// The class of a void decided on `cause` after `lines` (design §13.4, rule 6).
+#[inline]
 #[must_use]
 pub const fn void_class(lines: &[Line], cause: VoidCause) -> VoidClass {
     let start = match last_open(lines) {
@@ -1688,6 +1755,7 @@ pub enum Line {
 }
 
 impl Line {
+    #[inline]
     const fn kind(&self) -> u8 {
         match self {
             Line::Open { .. } => 0,
@@ -1703,6 +1771,7 @@ impl Line {
     }
 
     /// Line `k`'s file bytes, chained to `prev`.
+    #[inline]
     fn encode(&self, k: u64, prev: &Digest) -> Vec<u8> {
         let mut e = Enc::new();
         e.u64(k);
@@ -1756,6 +1825,7 @@ impl Line {
     }
 
     /// The line `bytes` hold, if they are line `k` chained to `prev`.
+    #[inline]
     fn decode(bytes: &[u8], k: u64, prev: &Digest) -> Result<Line, LedgerRefusal> {
         let broken = |_| LedgerRefusal::Broken { line: k };
         let mut d = Dec::new(bytes);
@@ -1816,12 +1886,14 @@ impl Line {
 }
 
 /// The link before a pair's line 0, binding the pair.
+#[inline]
 fn genesis(pair: Pair) -> Digest {
     let (tag, index) = pair.parts();
     Digest::of(LEDGER_DOMAIN, &[b"genesis", &[tag], &index.to_le_bytes()])
 }
 
 /// The link after a line's bytes.
+#[inline]
 fn link(bytes: &[u8]) -> Digest {
     Digest::of(LEDGER_DOMAIN, &[bytes])
 }
@@ -1990,6 +2062,7 @@ pub trait DurableLog {
 }
 
 /// The lines `raw` hold, checked link by link from `pair`'s genesis, with the head after them.
+#[inline]
 fn read_lines(pair: Pair, raw: &[Vec<u8>]) -> Result<(Vec<Line>, Digest), LedgerRefusal> {
     let mut head = genesis(pair);
     let mut lines = Vec::with_capacity(raw.len());
@@ -2006,11 +2079,13 @@ fn read_lines(pair: Pair, raw: &[Vec<u8>]) -> Result<(Vec<Line>, Digest), Ledger
 /// `init`, `train`, `rollback` and `verify`, which read it without its lock).
 /// # Errors
 /// A line that does not decode or does not chain.
+#[inline]
 pub fn ledger_head(pair: Pair, raw: &[Vec<u8>]) -> Result<Digest, LedgerRefusal> {
     read_lines(pair, raw).map(|(_, head)| head)
 }
 
 /// The last session's `open`: a replaying child's open is part of the session it replays.
+#[inline]
 const fn last_open(lines: &[Line]) -> Option<usize> {
     let mut i = lines.len();
     while i > 0 {
@@ -2024,6 +2099,7 @@ const fn last_open(lines: &[Line]) -> Option<usize> {
 
 /// The candidate and comparator look `look` must name after `bits`, the verdicts of looks
 /// `1..look`, under the chain `ids` (`m6-looks v1`, design §13.4, rule 3).
+#[inline]
 #[must_use]
 pub fn look_pair(
     look: u8,
@@ -2058,6 +2134,7 @@ pub fn look_pair(
 /// rules 3 to 6). The cross-pair checks are [`cross_pair`]'s.
 /// # Errors
 /// The rule's refusal.
+#[inline]
 pub fn next_line(
     lines: &[Line],
     line: &Line,
@@ -2189,6 +2266,7 @@ pub fn next_line(
 /// # Errors
 /// [`LedgerRefusal::NoRehearsal`], [`LedgerRefusal::VersionClosed`] or
 /// [`LedgerRefusal::PairOrder`].
+#[inline]
 pub fn cross_pair(target: u32, pairs: &[(Pair, Vec<Line>)]) -> Result<(), LedgerRefusal> {
     let lines_of = |pair: Pair| {
         for (p, l) in pairs {
@@ -2326,6 +2404,7 @@ impl fmt::Display for ModelRefusal {
 impl std::error::Error for ModelRefusal {}
 
 /// A ranker the ledger names by id: a chain member's state, or the control.
+#[inline]
 fn ranker_of<'c>(id: &Digest, chain: &'c [Version]) -> Option<Ranker<'c>> {
     if *id == control_id() {
         return Some(Ranker::Control);
@@ -2354,6 +2433,7 @@ struct Named {
 
 impl Named {
     /// The look's `look-begin` line.
+    #[inline]
     const fn begin(&self) -> Line {
         Line::LookBegin {
             look: self.look,
@@ -2364,6 +2444,7 @@ impl Named {
     }
 
     /// The admission a bit of `bit` yields: none for a 0, nor for look 2's control.
+    #[inline]
     const fn admitted(&self, bit: bool) -> Option<ModelAdmitted> {
         if bit && self.look != 2 {
             Some(ModelAdmitted {
@@ -2487,6 +2568,7 @@ impl LookFigures {
     }
 
     /// The bit.
+    #[inline]
     #[must_use]
     pub const fn bit(&self) -> bool {
         self.verdict.is_ok()
@@ -2494,6 +2576,7 @@ impl LookFigures {
 
     /// Its figures file's bytes: the pair, look, candidate, comparator and list it is bound to,
     /// each pool's two keys and gains, then the verdict.
+    #[inline]
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new();
@@ -2561,6 +2644,7 @@ impl<L: DurableLog> Ledger<L> {
     /// Practice pair `j`'s ledger over `log`, running the chain `pin` names.
     /// # Errors
     /// A line that does not decode, chain or follow the rules.
+    #[inline]
     pub fn practice(log: L, j: u32, pin: ChainPin) -> Result<Ledger<L>, LedgerRefusal> {
         Ledger::load(log, Pair::Practice(j), pin, None, false)
     }
@@ -2569,6 +2653,7 @@ impl<L: DurableLog> Ledger<L> {
     /// runs [`M6_CHAIN_V1`] alone.
     /// # Errors
     /// [`LedgerRefusal::ChainMoved`] while no chain is pinned, or a line's refusal.
+    #[inline]
     pub fn real(log: L, i: u32, sets: RealSets) -> Result<Ledger<L>, LedgerRefusal> {
         let pin = M6_CHAIN_V1.ok_or(LedgerRefusal::ChainMoved)?;
         Ledger::load(log, Pair::Real(i), pin, Some(sets), false)
@@ -2578,10 +2663,12 @@ impl<L: DurableLog> Ledger<L> {
     /// nothing: any other line, mint or admission is refused [`LedgerRefusal::NoCapability`].
     /// # Errors
     /// A line's refusal.
+    #[inline]
     pub fn runner(log: L, pair: Pair, pin: ChainPin) -> Result<Ledger<L>, LedgerRefusal> {
         Ledger::load(log, pair, pin, None, true)
     }
 
+    #[inline]
     fn load(
         log: L,
         pair: Pair,
@@ -2628,6 +2715,7 @@ impl<L: DurableLog> Ledger<L> {
     }
 
     /// The bits of its looks, in order.
+    #[inline]
     #[must_use]
     pub fn bits(&self) -> Vec<bool> {
         let mut out = Vec::new();
@@ -2641,7 +2729,8 @@ impl<L: DurableLog> Ledger<L> {
 
     /// Refuses a mint or an admission on the runner's ledger, or on a real pair's without the
     /// real sets' capability.
-    fn minting(&self) -> Result<(), LedgerRefusal> {
+    #[inline]
+    const fn minting(&self) -> Result<(), LedgerRefusal> {
         if self.runner || (matches!(self.pair, Pair::Real(_)) && self.real.is_none()) {
             return Err(LedgerRefusal::NoCapability);
         }
@@ -2650,6 +2739,7 @@ impl<L: DurableLog> Ledger<L> {
 
     /// Appends `line` if the rules allow it, durably; the runner's ledger takes only `void` and
     /// `record`.
+    #[inline]
     fn append(&mut self, line: Line) -> Result<(), LedgerRefusal> {
         if self.runner && !matches!(line, Line::Void { .. } | Line::Record) {
             return Err(LedgerRefusal::NoCapability);
@@ -2663,6 +2753,7 @@ impl<L: DurableLog> Ledger<L> {
         Ok(())
     }
 
+    #[inline]
     fn chain_is_ours(&self, chain: &[Version]) -> Result<(), LedgerRefusal> {
         if ChainPin::of(chain) == Some(self.pin) {
             Ok(())
@@ -2676,6 +2767,7 @@ impl<L: DurableLog> Ledger<L> {
     /// # Errors
     /// [`LedgerRefusal::OutOfOrder`], [`LedgerRefusal::NoCapability`], [`cross_pair`]'s,
     /// [`LedgerRefusal::ChainMoved`] or the log's.
+    #[inline]
     pub fn open(
         &mut self,
         store: Digest,
@@ -2708,6 +2800,7 @@ impl<L: DurableLog> Ledger<L> {
         self.append(line)
     }
 
+    #[inline]
     fn tops(
         &self,
         set: SetId,
@@ -2744,6 +2837,7 @@ impl<L: DurableLog> Ledger<L> {
     /// then mints the look's token.
     /// # Errors
     /// [`LedgerRefusal::OutOfOrder`], [`LedgerRefusal::HeldOutSpent`], or the mint's.
+    #[inline]
     pub fn begin_look(
         &mut self,
         look: u8,
@@ -2782,6 +2876,7 @@ impl<L: DurableLog> Ledger<L> {
 
 impl<L: DurableLog> Ledger<L> {
     /// Refuses before a line is written what its mint would refuse after it.
+    #[inline]
     fn can_mint(&self, len: usize, cap: usize) -> Result<(), LedgerRefusal> {
         self.minting()?;
         if len > cap {
@@ -2796,6 +2891,7 @@ impl<L: DurableLog> Ledger<L> {
     /// [`LedgerRefusal::NoCapability`] as for a mint, and [`LedgerRefusal::OutOfOrder`] unless
     /// the figures are this pair's and the last line is their look's `look-begin`, naming their
     /// candidate, comparator and list.
+    #[inline]
     pub fn verdict(&mut self, look: &LookFigures) -> Result<Option<ModelAdmitted>, LedgerRefusal> {
         self.minting()?;
         let named = look.named;
@@ -2811,6 +2907,7 @@ impl<L: DurableLog> Ledger<L> {
     /// # Errors
     /// [`LedgerRefusal::ReportSpent`], [`LedgerRefusal::OutOfOrder`] before the last look's
     /// verdict, or a pool's or the mint's.
+    #[inline]
     pub fn begin_report(&mut self, sets: &Sets) -> Result<Read, LedgerRefusal> {
         next_line(
             &self.lines,
@@ -2851,6 +2948,7 @@ impl<L: DurableLog> Ledger<L> {
     /// Writes `report-done` with the report file's digest.
     /// # Errors
     /// [`LedgerRefusal::OutOfOrder`] unless the last line is `report-begin`.
+    #[inline]
     pub fn report_done(&mut self, report: Digest) -> Result<(), LedgerRefusal> {
         self.append(Line::ReportDone { report })
     }
@@ -2861,6 +2959,7 @@ impl<L: DurableLog> Ledger<L> {
     /// # Errors
     /// [`LedgerRefusal::OutOfOrder`] before `report-done` or for an unrecorded look,
     /// [`LedgerRefusal::ReplayMismatch`] (a defect), or the mint's.
+    #[inline]
     pub fn begin_replay(
         &mut self,
         look: u8,
@@ -2923,6 +3022,7 @@ impl<L: DurableLog> Ledger<L> {
     /// [`LedgerRefusal::NoCapability`] as for a mint, [`LedgerRefusal::OutOfOrder`] for any other
     /// replay, and [`LedgerRefusal::ReplayMismatch`] when the replayed bit is not the recorded one
     /// (a defect).
+    #[inline]
     pub fn replayed(
         &self,
         replay: ReplayFigures,
@@ -2970,6 +3070,7 @@ impl<L: DurableLog> Ledger<L> {
     /// Retires the admission set.
     /// # Errors
     /// [`LedgerRefusal::OutOfOrder`] before `report-done` or after a retire.
+    #[inline]
     pub fn retire(&mut self) -> Result<(), LedgerRefusal> {
         self.append(Line::Retire)
     }
@@ -2977,6 +3078,7 @@ impl<L: DurableLog> Ledger<L> {
     /// The runner's void on `cause`, classed by when it arose; it returns the class.
     /// # Errors
     /// [`LedgerRefusal::OutOfOrder`] with no session open.
+    #[inline]
     pub fn void(&mut self, cause: VoidCause) -> Result<VoidClass, LedgerRefusal> {
         let at = last_open(&self.lines).ok_or(LedgerRefusal::OutOfOrder)?;
         let class = void_class(&self.lines[at..], cause);
@@ -2987,6 +3089,7 @@ impl<L: DurableLog> Ledger<L> {
     /// The runner's record of a finished session.
     /// # Errors
     /// [`LedgerRefusal::OutOfOrder`] before `retire`.
+    #[inline]
     pub fn record(&mut self) -> Result<(), LedgerRefusal> {
         self.append(Line::Record)
     }
@@ -3009,6 +3112,7 @@ impl ReplayFigures {
 }
 
 /// The labels of `top`, from `by_id`, in its order; `None` when one is missing.
+#[inline]
 fn pick<'l>(
     by_id: &BTreeMap<Digest, &'l TrainLabel>,
     top: &[SchedulePlan; JUDGED],
@@ -3041,6 +3145,7 @@ pub(super) fn forcing<R>(force: Force, body: impl FnOnce() -> R) -> R {
 }
 
 /// Folds the pools of a look's tops under `labels`.
+#[inline]
 fn fold_tops(
     labeller: &Labeller<'_>,
     named: Named,
@@ -3084,6 +3189,7 @@ fn fold_tops(
 /// compares them by the admission rule (design §13.4).
 /// # Errors
 /// Labelling's refusal.
+#[inline]
 pub fn run_look(labeller: &Labeller<'_>, look: Look) -> Result<LookFigures, LedgerRefusal> {
     let Look { named, tops, token } = look;
     let list = token.list().to_vec();
@@ -3096,6 +3202,7 @@ pub fn run_look(labeller: &Labeller<'_>, look: Look) -> Result<LookFigures, Ledg
 /// Runs a replayed look the same way, under its replay token.
 /// # Errors
 /// Labelling's refusal.
+#[inline]
 pub fn run_replay(
     labeller: &Labeller<'_>,
     replay: Replayed,
@@ -3134,6 +3241,7 @@ impl Arm {
     pub const ALL: [Arm; 7] = [Arm::U, Arm::W1, Arm::W2, Arm::C, Arm::Mf, Arm::Ctl, Arm::O];
 
     /// Its name in the report.
+    #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -3162,6 +3270,7 @@ pub struct Report {
 
 impl Report {
     /// The arm's outcomes, pool by pool.
+    #[inline]
     #[must_use]
     pub fn arm(&self, arm: Arm) -> &[PoolOutcome] {
         for (a, o) in &self.arms {
@@ -3173,17 +3282,26 @@ impl Report {
     }
 
     /// Mf against `against`, by the admission rule's test at [`REPORT_LEVEL`].
+    #[inline]
     pub fn criterion(&self, against: Arm) -> (Comparison, Result<(), ModelRefusal>) {
         let c = Comparison::of(self.arm(Arm::Mf), self.arm(against));
         (c, c.shows())
     }
 
     /// The report file's text.
+    #[inline]
     #[must_use]
     pub fn text(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "aterm-aos-m6-report-v1");
-        let _ = writeln!(out, "pair {}", self.pair.name());
+        match self.pair {
+            Pair::Real(i) => {
+                let _ = writeln!(out, "pair pair-{i}");
+            }
+            Pair::Practice(j) => {
+                let _ = writeln!(out, "pair practice-{j}");
+            }
+        }
         let _ = writeln!(out, "active {}", self.active.hex());
         let oracle = sums(self.arm(Arm::O));
         for &(arm, ref pools) in &self.arms {
@@ -3198,9 +3316,13 @@ impl Report {
         }
         for (name, against) in [("C1", Arm::U), ("C2", Arm::W2), ("C3", Arm::W1)] {
             let (c, verdict) = self.criterion(against);
+            let shown = fmt::from_fn(move |f| match verdict {
+                Ok(()) => f.write_str("shown"),
+                Err(e) => write!(f, "not-shown {e:?}"),
+            });
             let _ = writeln!(
                 out,
-                "criterion {name} Mf-vs-{} wins {} losses {} gain {}/{} against {}/{} {}",
+                "criterion {name} Mf-vs-{} wins {} losses {} gain {}/{} against {}/{} {shown}",
                 against.name(),
                 c.wins,
                 c.losses,
@@ -3208,10 +3330,6 @@ impl Report {
                 c.gain.1,
                 c.against.0,
                 c.against.1,
-                match verdict {
-                    Ok(()) => "shown".to_owned(),
-                    Err(e) => format!("not-shown {e:?}"),
-                }
             );
         }
         for p in 0..self.arm(Arm::O).len() {
@@ -3229,6 +3347,7 @@ impl Report {
 }
 
 /// The count of selections and the summed gains of `pools`.
+#[inline]
 const fn sums(pools: &[PoolOutcome]) -> (usize, u64, u64) {
     let (mut n, mut t, mut z) = (0usize, 0u64, 0u64);
     let mut i = 0;
@@ -3249,6 +3368,7 @@ const fn sums(pools: &[PoolOutcome]) -> (usize, u64, u64) {
 /// every pool (design §13.9).
 /// # Errors
 /// Labelling's refusal, or [`LedgerRefusal::NotTheChain`] for an active id the chain lacks.
+#[inline]
 pub fn run_report(
     labeller: &Labeller<'_>,
     read: Read,
@@ -3534,6 +3654,7 @@ pub struct Revision {
 }
 
 impl Revision {
+    #[inline]
     fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new();
         e.u32(self.n);
@@ -3551,6 +3672,7 @@ impl Revision {
         e.finish()
     }
 
+    #[inline]
     fn decode(bytes: &[u8]) -> Option<Revision> {
         let mut d = Dec::new(bytes);
         let n = d.u32("n").ok()?;
@@ -3591,6 +3713,7 @@ pub struct Pointer {
 }
 
 impl Pointer {
+    #[inline]
     fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new();
         e.u32(self.revision);
@@ -3599,6 +3722,7 @@ impl Pointer {
         e.finish()
     }
 
+    #[inline]
     fn decode(bytes: &[u8]) -> Option<Pointer> {
         let mut d = Dec::new(bytes);
         let p = Pointer {
@@ -3629,6 +3753,7 @@ pub struct EvalRecord {
 
 impl EvalRecord {
     /// The record of `figures`, a look of `set`.
+    #[inline]
     #[must_use]
     pub const fn of(set: SetId, figures: &LookFigures) -> EvalRecord {
         EvalRecord {
@@ -3641,6 +3766,7 @@ impl EvalRecord {
     }
 
     /// Its file's bytes.
+    #[inline]
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new();
@@ -3686,19 +3812,25 @@ impl<S> fmt::Debug for Store<S> {
     }
 }
 
+#[inline]
 fn store_text(build: &str, pair: Pair, nonce: u64) -> String {
+    let pair_name = fmt::from_fn(move |f| match pair {
+        Pair::Real(i) => write!(f, "pair-{i}"),
+        Pair::Practice(j) => write!(f, "practice-{j}"),
+    });
     format!(
-        "{STORE_HEADER}\nm6-policy {}\nm4-policy {}\nbuild {build}\npair {}\nnonce {nonce:016x}\n",
+        "{STORE_HEADER}\nm6-policy {}\nm4-policy {}\nbuild {build}\npair {pair_name}\nnonce {nonce:016x}\n",
         M6_POLICY_V1_DIGEST.hex(),
         RankerPolicy::v1().acceptance().hex(),
-        pair.name(),
     )
 }
 
+#[inline]
 fn version_dir(id: &Digest) -> String {
     format!("versions/{}", id.hex())
 }
 
+#[inline]
 fn revision_name(n: u32) -> String {
     format!("revisions/{n:04}")
 }
@@ -3709,6 +3841,7 @@ impl<S: DurableStore> Store<S> {
     /// A new store for `pair` in `build`, with v0 active and at the head (revision 0).
     /// # Errors
     /// A write's failure.
+    #[inline]
     pub fn init(
         mut io: S,
         build: &str,
@@ -3741,6 +3874,7 @@ impl<S: DurableStore> Store<S> {
     /// # Errors
     /// [`StoreRefusal::PolicyMismatch`], [`StoreRefusal::ForeignBuild`],
     /// [`StoreRefusal::StoreCorrupt`] or [`StoreRefusal::StoreTorn`].
+    #[inline]
     pub fn load(io: S, build: &str) -> Result<Store<S>, StoreRefusal> {
         let corrupt = |file: &str| StoreRefusal::StoreCorrupt {
             file: file.to_owned(),
@@ -3855,12 +3989,14 @@ impl<S: DurableStore> Store<S> {
     }
 
     /// The version `id`, if retained.
+    #[inline]
     #[must_use]
     pub fn version(&self, id: &Digest) -> Option<&Version> {
         self.versions.get(id)
     }
 
     /// Every retained version, by id.
+    #[inline]
     #[must_use]
     pub const fn versions(&self) -> &BTreeMap<Digest, Version> {
         &self.versions
@@ -3874,6 +4010,7 @@ impl<S: DurableStore> Store<S> {
     }
 
     /// Keeps `v` as a new version directory, unless it is retained already.
+    #[inline]
     fn keep(&mut self, v: &Version) -> Result<Vec<(String, usize)>, StoreRefusal> {
         if let Some(kept) = self.versions.get(&v.id) {
             return if kept == v {
@@ -3917,6 +4054,7 @@ impl<S: DurableStore> Store<S> {
 
     /// Appends a revision, then moves the pointer to it: two writes, between which a load
     /// refuses [`StoreRefusal::StoreTorn`].
+    #[inline]
     fn revise(
         &mut self,
         active: Digest,
@@ -3961,6 +4099,7 @@ impl<S: DurableStore> Store<S> {
     /// it, writing its directory only when it is not retained; the active id never changes.
     /// # Errors
     /// [`LearnRefusal::Round`] past round 4, the learner's, a budget's or a write's.
+    #[inline]
     pub fn train(
         &mut self,
         sets: &Sets,
@@ -3992,6 +4131,7 @@ impl<S: DurableStore> Store<S> {
     /// # Errors
     /// [`StoreRefusal::Control`], [`StoreRefusal::ForeignPair`], [`StoreRefusal::Republished`],
     /// [`StoreRefusal::NotComparator`], [`StoreRefusal::NotRetained`] or a write's.
+    #[inline]
     pub fn activate(
         &mut self,
         admitted: ModelAdmitted,
@@ -4038,6 +4178,7 @@ impl<S: DurableStore> Store<S> {
     /// # Errors
     /// [`StoreRefusal::NotRetained`], [`StoreRefusal::StoreCorrupt`],
     /// [`StoreRefusal::NotAdmitted`] or a write's.
+    #[inline]
     pub fn rollback(&mut self, to: Digest, ledger: Digest) -> Result<Moved, StoreRefusal> {
         let kept = self.versions.get(&to).ok_or(StoreRefusal::NotRetained)?;
         let dir = version_dir(&to);
@@ -4082,6 +4223,7 @@ impl<S: DurableStore> Store<S> {
     /// Writes look `look`'s eval record, once: a look of this store's pair.
     /// # Errors
     /// [`StoreRefusal::ForeignPair`], a budget's or a write's.
+    #[inline]
     pub fn write_eval(&mut self, record: &EvalRecord) -> Result<(), StoreRefusal> {
         if record.set != self.pair.looks() {
             return Err(StoreRefusal::ForeignPair);
@@ -4100,6 +4242,7 @@ impl<S: DurableStore> Store<S> {
     /// Writes a look's figures file, once, after the report: a look of this store's pair.
     /// # Errors
     /// [`StoreRefusal::ForeignPair`], a budget's or a write's.
+    #[inline]
     pub fn write_figures(&mut self, figures: &LookFigures) -> Result<(), StoreRefusal> {
         if figures.pair() != self.pair {
             return Err(StoreRefusal::ForeignPair);
@@ -4119,6 +4262,7 @@ impl<S: DurableStore> Store<S> {
     /// Writes the report, once, and returns its digest for `report-done`.
     /// # Errors
     /// A budget's or a write's.
+    #[inline]
     pub fn write_report(&mut self, report: &Report) -> Result<Digest, StoreRefusal> {
         let text = report.text();
         if text.len() as u64 > MAX_REPORT_BYTES {
@@ -4131,6 +4275,7 @@ impl<S: DurableStore> Store<S> {
 }
 
 /// The pair a `store.txt` names.
+#[inline]
 fn parse_pair(name: &str) -> Option<Pair> {
     if let Some(i) = name.strip_prefix("pair-") {
         return i.parse().ok().map(Pair::Real);
@@ -4158,6 +4303,7 @@ pub struct GridRecord {
 impl GridRecord {
     /// M4's record: 54 judged and 18 admitted; refused `HotHasWake` 9, `NoStepSlept` 9 and
     /// `WakeNoLaterThanClear` 18; best `010100000000000000000000` at `ΣT` 6,394 and `ΣZ` 94.
+    #[inline]
     #[must_use]
     pub fn m4() -> GridRecord {
         GridRecord {
@@ -4173,6 +4319,7 @@ impl GridRecord {
     }
 
     /// The record of `labels`.
+    #[inline]
     #[must_use]
     pub fn of(labels: &[TrainLabel]) -> GridRecord {
         let mut refused: BTreeMap<&'static str, usize> = BTreeMap::new();
@@ -4306,6 +4453,7 @@ pub struct SessionRun {
 
 /// Before step 1: the store binds the ledger's pair and the session's build, so a session on
 /// another pair's store stops before it writes a line.
+#[inline]
 fn binds<L: DurableLog, S: DurableStore>(
     env: &SessionEnv<'_>,
     ledger: &Ledger<L>,
@@ -4323,6 +4471,7 @@ fn binds<L: DurableLog, S: DurableStore>(
 }
 
 /// Step 1 (design §13.9): G1, then the chain trained into the store, compared with the pin.
+#[inline]
 fn reproduce<S: DurableStore>(
     env: &SessionEnv<'_>,
     store: &mut Store<S>,
@@ -4358,6 +4507,7 @@ fn reproduce<S: DurableStore>(
 }
 
 /// Steps 7 to 9: R1, R2, and Mf restored, each retrain checked against the chain.
+#[inline]
 fn roll<S: DurableStore>(
     env: &SessionEnv<'_>,
     store: &mut Store<S>,
@@ -4413,6 +4563,7 @@ fn roll<S: DurableStore>(
 /// admission, read the report once, replay and retire the looks, then R1, R2 and Mf restored.
 /// # Errors
 /// The first refusal; before the `open` line the session is stopped.
+#[inline]
 pub fn session_a<L: DurableLog, S: DurableStore>(
     env: &SessionEnv<'_>,
     ledger: &mut Ledger<L>,
@@ -4465,6 +4616,7 @@ pub fn session_a<L: DurableLog, S: DurableStore>(
 /// no `retire`.
 /// # Errors
 /// The first refusal, [`LedgerRefusal::ReplayMismatch`] (a defect) among them.
+#[inline]
 pub fn session_b<L: DurableLog, S: DurableStore>(
     env: &SessionEnv<'_>,
     ledger: &mut Ledger<L>,

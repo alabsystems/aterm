@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pure fake Responses model for `codex-alab` proof legs.
+//! Fake Responses model for `codex-alab` proof legs, with state owned by each model world.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aterm_agent::supervise::config::CONTINUE_TEXT;
@@ -254,17 +254,26 @@ pub const fn land_reply(n: usize) -> (&'static str, Duration) {
     }
 }
 
-/// The usage leg's window: its reset, fixed at its first request.
-static RESETS: Mutex<Vec<(String, i64)>> = Mutex::new(Vec::new());
+/// One fake provider's model: each leg's usage reset is fixed at its first request, and a
+/// different provider starts with no windows from earlier proofs.
+#[must_use]
+pub fn answerer() -> crate::codex_rig::Answer {
+    answerer_with_clock(crate::util::now_secs)
+}
 
-fn reset_of(leg: &str) -> i64 {
-    let mut resets = RESETS
+fn answerer_with_clock(now: impl Fn() -> i64 + Send + Sync + 'static) -> crate::codex_rig::Answer {
+    let resets = Mutex::new(Vec::new());
+    Arc::new(move |body| answer(body, &resets, &now))
+}
+
+fn reset_of(resets: &Mutex<Vec<(String, i64)>>, leg: &str, now: &dyn Fn() -> i64) -> i64 {
+    let mut resets = resets
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((_, at)) = resets.iter().find(|(l, _)| l == leg) {
         return *at;
     }
-    let at = crate::util::now_secs() + RESETS_IN_S;
+    let at = now() + RESETS_IN_S;
     resets.push((leg.to_string(), at));
     at
 }
@@ -309,7 +318,7 @@ fn approval_call() -> J {
 
 /// Computes the fake model's [`Answered`] response for `body`.
 #[must_use]
-pub fn answer(body: &J) -> Answered {
+fn answer(body: &J, resets: &Mutex<Vec<(String, i64)>>, now: &dyn Fn() -> i64) -> Answered {
     let leg = leg_of(body).unwrap_or_else(|| "-".to_string());
     if let Some(answer) = policy::answer(body, &leg) {
         return answer;
@@ -369,7 +378,7 @@ pub fn answer(body: &J) -> Answered {
         }
         ("question", Step::LandAnswer) => say(QUESTION_LANDED_WORDS),
         ("usage", Step::Person) => {
-            let reset = reset_of(&leg);
+            let reset = reset_of(resets, &leg, now);
             name = format!("limit resets_at={reset}");
             Answered {
                 status: 429,
@@ -411,10 +420,33 @@ pub fn answer(body: &J) -> Answered {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
     use aterm_agent::supervise::policy::needs::{self, needs_you, says_no_needs, without_needs};
     use aterm_agent::supervise::policy::turn_end::{Said, classify_said, clean_defense, says_done};
 
     use super::*;
+
+    fn answer(body: &J) -> Answered {
+        answerer_with_clock(|| 1_000)(body)
+    }
+
+    fn usage_reset(a: &Answered) -> i64 {
+        assert_eq!(a.status, 429);
+        let body = J::parse(&a.body).expect("usage response JSON");
+        let reset = body
+            .get("error")
+            .and_then(|error| error.get("resets_at"))
+            .and_then(J::as_i64)
+            .expect("usage reset");
+        let header = a
+            .headers
+            .iter()
+            .find(|(key, _)| key == "x-codex-primary-reset-at")
+            .and_then(|(_, value)| value.parse::<i64>().ok());
+        assert_eq!(header, Some(reset));
+        reset
+    }
 
     fn user(t: &str) -> J {
         J::obj([("role", J::s("user")), ("content", J::s(t))])
@@ -821,9 +853,15 @@ mod tests {
 
     #[test]
     fn the_usage_leg_keeps_one_reset_until_it_is_continued() {
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let now = Arc::clone(&clock);
+        let answer = answerer_with_clock(move || now.load(Ordering::Relaxed));
         let a = answer(&body(&["LEG-usage Start the task."], None));
+        clock.store(2_000, Ordering::Relaxed);
         let b = answer(&body(&["LEG-usage Start the task."], None));
         assert_eq!((a.status, b.status), (429, 429));
+        assert_eq!(usage_reset(&a), 1_000 + RESETS_IN_S);
+        assert_eq!(usage_reset(&b), usage_reset(&a));
         assert_eq!(a.tag, b.tag, "one window: the reset never moves");
         assert!(a.body.contains("usage_limit_reached"));
         assert!(
@@ -833,6 +871,20 @@ mod tests {
         );
         let after = answer(&body(&["LEG-usage Start the task.", CONTINUE_TEXT], None));
         assert_eq!((after.status, after.tag.as_str()), (200, "usage:continue"));
+    }
+
+    #[test]
+    fn independent_model_worlds_start_fresh_usage_windows_for_the_same_leg() {
+        let first = answerer_with_clock(|| 1_000);
+        let second = answerer_with_clock(|| 10_000);
+        let request = body(&["LEG-usage Start the task."], None);
+        let first_reset = usage_reset(&first(&request));
+        let second_reset = usage_reset(&second(&request));
+        assert_eq!(first_reset, 1_000 + RESETS_IN_S);
+        assert_eq!(second_reset, 10_000 + RESETS_IN_S);
+        assert!(second_reset > 10_000, "the second world's window is fresh");
+        assert_eq!(usage_reset(&first(&request)), first_reset);
+        assert_eq!(usage_reset(&second(&request)), second_reset);
     }
 
     #[test]

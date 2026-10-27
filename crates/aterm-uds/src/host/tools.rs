@@ -459,8 +459,8 @@ pub const TOOLS: &[Tool] = &[
     os(
         "sqlite3",
         &["/usr/bin/sqlite3"],
-        "reads TCC.db (containment, and machines over SSH) and agy's WAL; a second reader of Apple's \
-         schema would gain nothing (row 3)",
+        "reads TCC.db over SSH on a managed Mac (machines), and the oracle and fixture writer \
+         the in-process SQLite reader's tests are held to (row 3)",
     ),
     os(
         "sandbox-exec",
@@ -520,7 +520,7 @@ pub const TOOLS: &[Tool] = &[
     os(
         "launchctl",
         &["/bin/launchctl"],
-        "the keeper's, the machines agent's and caffeine's launchd jobs",
+        "the keeper's, the machines agent's and acaffiene's launchd jobs",
     ),
     os(
         "defaults",
@@ -823,10 +823,24 @@ pub const TOOLS: &[Tool] = &[
     workspace(
         "rustup",
         When::Always,
-        None,
+        Some(Pin {
+            package: "rustup",
+            version: "1.29.2",
+            exe: "bin/rustup",
+            built: false,
+            hosts: &[
+                "macos-aarch64",
+                "macos-x86_64",
+                "linux-x86_64",
+                "linux-aarch64",
+            ],
+        }),
         &[],
         "stable's foreign standard libraries and wasm32 (STOCK EXCEPTION), until Trust ships them: \
-         the cells, the web modules and the shipped binary's x86_64 slice (rows 23, 24)",
+         the cells, the web modules and the shipped binary's x86_64 slice (rows 23, 24). The pin \
+         is rustup-init, which under the name `rustup` is rustup itself: `verify provision` \
+         copies it into the cache beside its cargo and rustc proxies and never runs its \
+         self-install, and the toolchains stay in rustup's own home",
     ),
     workspace(
         "chrome-headless-shell",
@@ -972,7 +986,7 @@ pub const TOOLS: &[Tool] = &[
     ),
     hardware(
         "gpu",
-        "a GPU wgpu can open",
+        "a GPU adapter",
         "the gpu-oracle lane renders on a real adapter",
     ),
     hardware(

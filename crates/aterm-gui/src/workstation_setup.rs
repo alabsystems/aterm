@@ -632,14 +632,18 @@ const fn may_start(headless: bool, painted: bool, incoming_pending: bool) -> boo
     !headless && painted && !incoming_pending
 }
 
-/// Whether this launch may offer the first-run setup: one with no command, or a relaunch
-/// of a running window through a validated handoff, where a carried command is inert.
+/// Whether this launch may offer the first-run setup: it runs from an installed copy
+/// (`aterm_update::first_launch::setup_runs_from_posture`; design §6.8 — a copy that goes away
+/// sets nothing up, installs itself and relaunches instead), AND it is a launch with no
+/// command, or a relaunch of a running window through a validated handoff where a carried
+/// command is inert.
 pub(crate) const fn eligible_launch_command(
+    posture_allows_setup: bool,
     commandless: bool,
     relaunch: bool,
     admitted_handoff: bool,
 ) -> bool {
-    commandless || (relaunch && admitted_handoff)
+    posture_allows_setup && (commandless || (relaunch && admitted_handoff))
 }
 
 impl App {
@@ -1177,11 +1181,20 @@ mod tests {
 
     #[test]
     fn command_payload_only_qualifies_when_carried_by_a_validated_handoff() {
-        assert!(eligible_launch_command(true, false, false));
-        assert!(eligible_launch_command(false, true, true));
-        assert!(!eligible_launch_command(false, true, false));
-        assert!(!eligible_launch_command(false, false, true));
-        assert!(!eligible_launch_command(false, false, false));
+        assert!(eligible_launch_command(true, true, false, false));
+        assert!(eligible_launch_command(true, false, true, true));
+        assert!(!eligible_launch_command(true, false, true, false));
+        assert!(!eligible_launch_command(true, false, false, true));
+        assert!(!eligible_launch_command(true, false, false, false));
+    }
+
+    /// A copy that goes away (its posture is not Installed) never offers setup, however it was
+    /// launched — it installs itself and relaunches first (design §6.8).
+    #[test]
+    fn a_copy_that_goes_away_never_offers_setup() {
+        assert!(!eligible_launch_command(false, true, false, false));
+        assert!(!eligible_launch_command(false, false, true, true));
+        assert!(!eligible_launch_command(false, true, true, true));
     }
 
     #[test]

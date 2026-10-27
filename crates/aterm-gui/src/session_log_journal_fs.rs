@@ -221,7 +221,9 @@ mod real {
                 let _ = self.dir.remove_file_if_exists(pending);
                 return Err(error);
             }
-            let _ = self.dir.sync_ordered();
+            // Accepted, failed or not: the lock is held whatever its name's flush says, and a
+            // name a power cut takes back names a lock no one holds after the reboot anyway.
+            let _named = self.dir.sync_ordered();
             Ok(Box::new(Lock(held)))
         }
 
@@ -385,6 +387,8 @@ pub(crate) mod mem {
         pub(crate) free: Option<u64>,
         pub(crate) no_flock: bool,
         pub(crate) creates_refused: Option<i32>,
+        /// Every flush (a segment's, the directory's) fails with this errno until cleared.
+        pub(crate) flush_fault: Option<i32>,
         /// Names a scan visits after every other (a real directory's order
         /// is its own: a test puts a name past a listing's bound).
         pub(crate) listed_last: std::collections::BTreeSet<String>,
@@ -533,7 +537,7 @@ pub(crate) mod mem {
         }
 
         fn sync(&mut self) -> io::Result<()> {
-            Ok(())
+            self.fs.state().flush_fault.map_or(Ok(()), |e| Err(err(e)))
         }
     }
 
@@ -660,7 +664,7 @@ pub(crate) mod mem {
         }
 
         fn sync_dir(&self) -> io::Result<()> {
-            Ok(())
+            self.state().flush_fault.map_or(Ok(()), |e| Err(err(e)))
         }
 
         fn free_bytes(&self) -> Option<u64> {

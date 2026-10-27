@@ -50,6 +50,55 @@ pub fn foreign_cells(host: &str) -> Vec<Cell> {
         .collect()
 }
 
+/// The cells a pulled run checks ([`crate::checks::pulls_cells`]): of [`foreign_cells`], those
+/// of the OSes other than `host`'s, one per OS and root package, the cell of `host`'s
+/// architecture where the OS has one. An OS's code differs from this machine's in its `cfg`s,
+/// which one cell of it judges; an architecture's (the Intel Mac slice, x86_64 Linux and
+/// Windows on an Apple-silicon Mac) is left to `verify cells`, which checks every cell.
+#[must_use]
+pub fn pulled_cells(host: &str) -> Vec<Cell> {
+    let mut kept: Vec<Cell> = Vec::new();
+    for cell in foreign_cells(host)
+        .into_iter()
+        .filter(|c| os_of(&c.triple) != os_of(host))
+    {
+        let same = kept
+            .iter_mut()
+            .find(|k| os_of(&k.triple) == os_of(&cell.triple) && k.package == cell.package);
+        match same {
+            None => kept.push(cell),
+            Some(k)
+                if arch_of(&k.triple) != arch_of(host)
+                    && arch_of(&cell.triple) == arch_of(host) =>
+            {
+                *k = cell;
+            }
+            Some(_) => {}
+        }
+    }
+    kept
+}
+
+/// A triple's architecture: what precedes its first `-`.
+fn arch_of(triple: &str) -> Option<&str> {
+    triple.split_once('-').map(|(arch, _)| arch)
+}
+
+/// A triple's OS: what follows its architecture (`apple-darwin`, `pc-windows-msvc`).
+fn os_of(triple: &str) -> Option<&str> {
+    triple.split_once('-').map(|(_, os)| os)
+}
+
+/// The selected crates a cell compiles: of `own`, its graph's workspace crates, those `scope`
+/// selects. A pulled run checks a cell only when there is one.
+#[must_use]
+pub fn selected_in(own: &BTreeSet<String>, scope: &crate::scope::Scope) -> Vec<String> {
+    own.iter()
+        .filter(|name| scope.includes_crate(name))
+        .cloned()
+        .collect()
+}
+
 /// The cells a run checks: each `--cell` named, else [`foreign_cells`] of `host`.
 ///
 /// # Errors
@@ -164,6 +213,9 @@ pub fn parse_policy(text: &str) -> Result<Vec<Shim>, String> {
 pub enum CellOutcome {
     /// Every obligation held: the row's summary.
     Checked(String),
+    /// A pulled run's cell whose graph holds none of the selected crates ([`selected_in`]):
+    /// the selection cannot change what it compiles, so nothing was compiled.
+    Unselected,
     /// Nothing was compiled: why, and the install that clears it.
     Skipped { why: String, fix: String },
     /// The tree did not hold for the cell: the first cause, and the lines that say what went
@@ -194,18 +246,34 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             return;
         }
     };
-    let cells = match selected(&ctx.cells, &host) {
+    let cells = if ctx.cells_pulled {
+        Ok(pulled_cells(&host))
+    } else {
+        selected(&ctx.cells, &host)
+    };
+    let cells = match cells {
         Ok(c) => c,
         Err(why) => {
             r.cannot_run(format!("cells — {why}"));
             return;
         }
     };
-    let rustup = rustup::find_rustup_in(
-        Some(ctx.env.path.as_os_str()),
-        ctx.env.cargo_home.as_deref().map(Path::as_os_str),
-        Some(ctx.env.home.as_os_str()),
-    );
+    if ctx.cells_pulled {
+        r.raw(format!(
+            "cells: pulled by the selection, so one cell per other OS ({}), each where its graph \
+             holds a selected crate; `targo --unverified verify cells` checks every cell",
+            cells
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let row = aterm_uds::host::tool("rustup");
+    let rustup = row.locate_in(&aterm_uds::host::Lookup {
+        path: Some(ctx.env.path.clone()),
+        ..aterm_uds::host::Lookup::host(row)
+    });
     let mut members: Option<Result<Members, String>> = None;
     for cell in &cells {
         let label = format!("cell {} ({})", cell.name, cell.triple);
@@ -215,20 +283,21 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
                 why: "this machine's own triple, judged by its own build".to_string(),
                 fix: "targo --unverified verify lint test".to_string(),
             }
-        } else if let Some(rustup) = &rustup {
-            check_cell(ctx, rustup, cell, &policy, &mut members)
         } else {
-            CellOutcome::Skipped {
-                why: format!("no rustup {}", rustup::RUSTUP_LOOKED),
-                fix: format!(
-                    "{}, with stable's {} std",
-                    aterm_uds::host::tool("rustup").remedy(),
-                    cell.triple
-                ),
+            match &rustup {
+                Ok(rustup) => check_cell(ctx, rustup, cell, &policy, &mut members),
+                Err(absent) => CellOutcome::Skipped {
+                    why: absent.why.clone(),
+                    fix: format!("{}, with stable's {} std", absent.fix, cell.triple),
+                },
             }
         };
         let took = format!("{label}: {}s", started.elapsed().as_secs());
         match outcome {
+            CellOutcome::Unselected => r.pass(format!(
+                "{label} — none of the selection's crates is in its graph, so the selection \
+                 cannot change what it compiles"
+            )),
             CellOutcome::Checked(summary) => {
                 r.pass(format!("{label} — {summary}"));
                 r.raw(took);
@@ -246,8 +315,12 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             }
         }
     }
-    if runs_win32_oracles(&cells) {
-        win32_oracles(ctx, r, rustup.is_some());
+    let subjects = !ctx.cells_pulled
+        || WIN32_ORACLE_SUBJECTS
+            .iter()
+            .any(|p| ctx.scope.includes_crate(p));
+    if runs_win32_oracles(&cells) && subjects {
+        win32_oracles(ctx, r, rustup.as_ref().err());
     }
     audit_policy(ctx, r, &policy, &cells);
 }
@@ -257,13 +330,19 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
 pub const WIN32_ORACLES: [(&str, &str); 2] = [
     (
         "oracle",
-        "the windows-sys 0.61 facade and aterm-win32's closure against registry windows-sys 0.61.2, its COM and DXGI against windows 0.62.2",
+        "the windows-sys 0.61 facade and aterm-win32's closure against registry windows-sys 0.61.2, its hand-written COM, DXGI, Direct3D 11, DirectComposition and UI Automation against windows 0.62.2",
     ),
     (
         "oracle-052",
         "the windows-sys 0.52 facade (crates/aterm-windows-sys-052) against registry windows-sys 0.52.0",
     ),
 ];
+
+/// The packages the [`WIN32_ORACLES`] judge: `crates/aterm-win32`, and the windows-sys facades
+/// (`crates/aterm-windows-sys`, which re-exports it, and `crates/aterm-windows-sys-052`), each
+/// the package `windows-sys`. A pulled run ([`pulled_cells`]) runs the oracles only for a
+/// selection holding one: they judge those crates alone (255 s cold here, 2026-10-26).
+pub const WIN32_ORACLE_SUBJECTS: [&str; 2] = ["aterm-win32", "windows-sys"];
 
 /// Does this run check a Windows cell, which brings the [`WIN32_ORACLES`]?
 #[must_use]
@@ -318,19 +397,18 @@ pub fn win32_oracle_not_run_reason(output: &str) -> Option<String> {
 
 /// One row per [`WIN32_ORACLES`] verb. The oracle's exit is read as the libc
 /// oracle's: 0 passes, 1 is a finding, 3 or a signal decided nothing.
-fn win32_oracles(ctx: &Ctx, r: &mut Report, have_rustup: bool) {
+fn win32_oracles(ctx: &Ctx, r: &mut Report, no_rustup: Option<&aterm_uds::host::Absent>) {
     for (verb, holds) in WIN32_ORACLES {
         let label = format!("win32 {verb} ({holds}; x86_64 and aarch64 pc-windows-msvc)");
         if !ctx.tools.have_targo() {
             r.skip(format!("{label} — no targo to build the driver"));
             continue;
         }
-        if !have_rustup {
+        if let Some(absent) = no_rustup {
             r.skip(format!(
-                "{label} — no rustup {} (fix: {}, with stable's x86_64-pc-windows-msvc and \
+                "{label} — {} (fix: {}, with stable's x86_64-pc-windows-msvc and \
                  aarch64-pc-windows-msvc stds)",
-                rustup::RUSTUP_LOOKED,
-                aterm_uds::host::tool("rustup").remedy()
+                absent.why, absent.fix
             ));
             continue;
         }
@@ -378,7 +456,7 @@ fn audit_policy(ctx: &Ctx, r: &mut Report, policy: &[Shim], ran: &[Cell]) {
             ));
             continue;
         };
-        if !ctx.cells.is_empty() {
+        if !ctx.cells.is_empty() || ctx.cells_pulled {
             unread = true;
             continue;
         }
@@ -431,7 +509,8 @@ fn audit_policy(ctx: &Ctx, r: &mut Report, policy: &[Shim], ran: &[Cell]) {
     }
     if unread {
         r.raw(format!(
-            "{POLICY}: the rows of cells this run did not check were not read (--cell)"
+            "{POLICY}: the rows of cells this run did not check were not read (--cell, or a \
+             pulled run)"
         ));
     }
 }
@@ -769,6 +848,9 @@ fn check_cell(
         .filter(|id| in_repo(id))
         .map(|id| id.name.clone())
         .collect();
+    if ctx.cells_pulled && selected_in(&own, &ctx.scope).is_empty() {
+        return CellOutcome::Unselected;
+    }
     let proc_macros: BTreeSet<String> = graph
         .nodes
         .iter()
@@ -1083,6 +1165,9 @@ impl CellCargo<'_> {
             .env("RUSTUP_TOOLCHAIN", &self.toolchain.name)
             .env("PATH", path)
             .env("CARGO_TARGET_DIR", self.target_dir)
+            // A lint keeps nothing it could reuse worth its incremental state: 6.1 of the
+            // 6.6 GiB linux-arm's directory held after a cold run (2026-10-26).
+            .env("CARGO_INCREMENTAL", "0")
             .args([verb, "--target", self.triple])
             .args([
                 "--locked",
@@ -1349,14 +1434,13 @@ pub struct CargoRead {
 /// Whether a cell's rustc warnings ([`is_cell_warning`]) are findings.
 #[must_use]
 pub fn judges_warnings(triple: &str) -> bool {
-    let os = |t: &str| t.split_once('-').map(|(_, os)| os.to_string());
-    let Some(own) = os(triple) else {
+    let Some(own) = os_of(triple) else {
         return false;
     };
-    WARNINGS_JUDGED_OFF_FLEET.contains(&own.as_str())
+    WARNINGS_JUDGED_OFF_FLEET.contains(&own)
         || FLEET_HOST_TRIPLES
             .iter()
-            .any(|host| os(host).as_deref() == Some(own.as_str()))
+            .any(|host| os_of(host) == Some(own))
 }
 
 /// The OSes (a triple past its architecture) no fleet machine runs whose cells still judge
@@ -1593,6 +1677,55 @@ mod tests {
         );
         assert_eq!(named.len(), 2);
         assert!(selected(&["plan9".to_string()], mac).is_err());
+    }
+
+    /// A pulled run checks one cell per OS other than the host's, the host's architecture's
+    /// where the OS has one, and both web modules' cells, whose roots differ.
+    #[test]
+    fn a_pulled_run_checks_one_cell_per_other_os_of_the_hosts_architecture() {
+        let names = |host: &str| -> Vec<String> {
+            pulled_cells(host).into_iter().map(|c| c.name).collect()
+        };
+        assert_eq!(
+            names("aarch64-apple-darwin"),
+            ["linux-arm", "win-arm", "wasm-cpu", "wasm-gpu"]
+        );
+        assert_eq!(
+            names("x86_64-unknown-linux-gnu"),
+            ["mac-x64", "win", "wasm-cpu", "wasm-gpu"]
+        );
+        assert_eq!(
+            names("x86_64-apple-darwin"),
+            ["linux", "win", "wasm-cpu", "wasm-gpu"]
+        );
+        assert_eq!(
+            names("riscv64gc-unknown-linux-gnu"),
+            ["mac-arm", "win", "wasm-cpu", "wasm-gpu"],
+            "no cell of its architecture: each OS's first"
+        );
+    }
+
+    /// A pulled cell is checked for the selected crates its graph holds: the cone's or `-p`'s,
+    /// every one under `--all`, and none of a selection that only names crates outside it.
+    #[test]
+    fn a_pulled_cell_is_checked_only_for_selected_crates_in_its_graph() {
+        use crate::scope::Scope;
+        let own = names(&["aterm", "aterm-gui", "aterm-grid"]);
+        let cone = Scope::changed(
+            "origin/main",
+            vec!["aterm".into(), "aterm-gui".into(), "aterm-objc".into()],
+            true,
+        );
+        assert_eq!(selected_in(&own, &cone), ["aterm", "aterm-gui"]);
+        assert_eq!(
+            selected_in(&own, &Scope::packages(&["aterm-grid".to_string()])),
+            ["aterm-grid"]
+        );
+        assert_eq!(selected_in(&own, &Scope::workspace()).len(), 3);
+        assert!(
+            selected_in(&own, &Scope::packages(&["aterm-objc".to_string()])).is_empty(),
+            "a macOS-only crate is in no other OS's graph"
+        );
     }
 
     #[test]
@@ -2275,7 +2408,8 @@ mod tests {
     }
 
     /// A cell's cargo builds in its own directory of the cells lane, capped at
-    /// the lane's jobs and never above the caller's own `CARGO_BUILD_JOBS`.
+    /// the lane's jobs and never above the caller's own `CARGO_BUILD_JOBS`, and
+    /// keeps no incremental state.
     #[test]
     fn a_cells_cargo_runs_in_the_cells_lane_under_its_job_cap() {
         let env_of = |caller: Option<&str>| {
@@ -2312,9 +2446,10 @@ mod tests {
                     .find(|(name, _)| name == k)
                     .map(|(_, v)| v.to_string_lossy().into_owned())
             };
+            assert_eq!(get("CARGO_INCREMENTAL").as_deref(), Some("0"));
             (get("CARGO_TARGET_DIR"), get("CARGO_BUILD_JOBS"))
         };
-        let dir = Some("/repo/target/verify/cells.noindex/win".to_string());
+        let dir = Some("/repo/target/verify/.ubd/cells.noindex/win".to_string());
         assert_eq!(env_of(None), (dir.clone(), Some("4".to_string())));
         assert_eq!(env_of(Some("2")), (dir.clone(), Some("2".to_string())));
         assert_eq!(env_of(Some("16")), (dir, Some("4".to_string())));
@@ -2366,7 +2501,7 @@ mod tests {
                 "-p",
                 "aterm-win32-oracle",
                 "--target-dir",
-                "/repo/target/verify/cells.noindex/win32-oracle-bin",
+                "/repo/target/verify/.ubd/cells.noindex/win32-oracle-bin",
                 "--",
                 "oracle-052",
                 "--root",

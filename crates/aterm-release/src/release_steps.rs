@@ -694,12 +694,18 @@ impl Real {
     }
 
     fn metadata_toolchain(&self) -> Option<Refusal> {
-        let Some(dir) = rustup_dir() else {
-            return Some(Refusal::new(
-                "no rustup (on PATH, in $CARGO_HOME/bin or in ~/.cargo/bin) — the engine's \
-                 cargo-metadata guard runs `rustup run trust targo metadata`",
-                "install rustup, then run it again",
-            ));
+        let dir = match rustup_dir() {
+            Ok(dir) => dir,
+            Err(absent) => {
+                return Some(Refusal::new(
+                    format!(
+                        "{} — the engine's cargo-metadata guard runs `rustup run trust targo \
+                         metadata`",
+                        absent.why
+                    ),
+                    absent.fix,
+                ));
+            }
         };
         let found = self
             .output_forwarded(
@@ -757,7 +763,7 @@ impl Real {
             .env(
                 "PATH",
                 rustup_dir().map_or_else(
-                    || std::env::var_os("PATH").unwrap_or_default(),
+                    |_| std::env::var_os("PATH").unwrap_or_default(),
                     |dir| path_with(&dir),
                 ),
             )
@@ -895,7 +901,7 @@ impl Real {
         scratch: &Scratch,
         r: &str,
         export: Option<&Path>,
-        tools: Option<&Wasm32Tools>,
+        tools: Result<&Wasm32Tools, &aterm_uds::host::Absent>,
     ) -> Outcome {
         let config = self
             .git_out(&["show", &format!("{r}:publish/config.sh")])
@@ -905,13 +911,17 @@ impl Real {
             Err(why) => return Outcome::Refuse(why),
         };
         let not_run = |why: String, fix: String| Outcome::CouldNotRun(Refusal::new(why, fix));
-        let Some(Wasm32Tools { rustup, path }) = tools else {
-            return not_run(
-                "no rustup (on PATH, in $CARGO_HOME/bin or in ~/.cargo/bin) — the wasm32 pin \
-                 is a stock channel rustup installs"
-                    .into(),
-                "install rustup, then run it again".into(),
-            );
+        let Wasm32Tools { rustup, path } = match tools {
+            Ok(tools) => tools,
+            Err(absent) => {
+                return not_run(
+                    format!(
+                        "{} — the wasm32 pin is a stock channel rustup installs",
+                        absent.why
+                    ),
+                    absent.fix.clone(),
+                );
+            }
         };
         let src = scratch.dir.join("wasm-src");
         let log = scratch.dir.join("wasm-check.log");
@@ -1717,13 +1727,14 @@ impl Drop for Scratch {
 pub(crate) struct Wasm32Tools {
     /// The directory holding `rustup`.
     pub(crate) rustup: PathBuf,
-    /// The clause's PATH: this process's with `rustup`'s directory appended.
+    /// The clause's PATH: `rustup`'s directory, then this process's, so the clause's bare
+    /// `rustup` is the row's.
     pub(crate) path: std::ffi::OsString,
 }
 
 impl Wasm32Tools {
-    /// This machine's: rustup on PATH, in `$CARGO_HOME/bin` or in `~/.cargo/bin`.
-    pub(crate) fn find() -> Option<Self> {
+    /// This machine's: the rustup the `rustup` row of `aterm_uds::host::TOOLS` resolves.
+    pub(crate) fn find() -> Result<Self, aterm_uds::host::Absent> {
         rustup_dir().map(|rustup| Self {
             path: path_with(&rustup),
             rustup,
@@ -1731,20 +1742,17 @@ impl Wasm32Tools {
     }
 }
 
-fn rustup_dir() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .chain(std::env::var_os("CARGO_HOME").map(|h| PathBuf::from(h).join("bin")))
-        .chain(std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo/bin")))
-        .find(|d| d.join("rustup").is_file())
+/// The directory of the rustup the `rustup` row resolves.
+fn rustup_dir() -> Result<PathBuf, aterm_uds::host::Absent> {
+    let rustup = aterm_uds::host::tool("rustup").locate()?;
+    Ok(rustup.parent().map_or_else(PathBuf::new, Path::to_path_buf))
 }
 
+/// `dir`, then this process's PATH without it.
 fn path_with(dir: &Path) -> std::ffi::OsString {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-    if !dirs.iter().any(|d| d == dir) {
-        dirs.push(dir.to_path_buf());
-    }
+    let dirs =
+        std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&path).filter(|d| d != dir));
     std::env::join_paths(dirs).unwrap_or(path)
 }
 
@@ -2995,10 +3003,14 @@ impl Backend for Real {
             ));
         }
         let (commit, version) = (c.commit.as_str(), c.version.as_str());
-        let gates: [(&str, crate::ledger::Result<()>); 3] = [
+        let gates: [(&str, crate::ledger::Result<()>); 4] = [
             (
                 "changelog",
                 crate::gates::changelog_gate_at(&git, commit, version).map(|_| ()),
+            ),
+            (
+                "harness versions",
+                crate::gates::harness_versions_gate_at(&git, commit, version).map(|_| ()),
             ),
             (
                 "handoff fixtures",
@@ -4221,15 +4233,24 @@ mod tests {
         std::fs::write(export.join("Cargo.toml"), "[workspace]\n").unwrap();
         let mut real = Real::new(&repo, None, true, false).expect("a backend");
 
-        let none = real.wasm32_gate(&scratch, &r, Some(&export), None);
+        let absent = aterm_uds::host::tool("rustup")
+            .locate_in(&aterm_uds::host::Lookup {
+                named: None,
+                tooling: Some(root.join("tooling.noindex")),
+                path: None,
+            })
+            .unwrap_err();
+        let none = real.wasm32_gate(&scratch, &r, Some(&export), Err(&absent));
         assert!(
-            matches!(none, Outcome::CouldNotRun(_)),
+            matches!(&none, Outcome::CouldNotRun(refused)
+                if refused.why.starts_with("no rustup (looked in")
+                    && refused.remedy.contains("targo --unverified verify provision")),
             "no rustup: {none:?}"
         );
-        let passed = real.wasm32_gate(&scratch, &r, Some(&export), Some(&tools));
+        let passed = real.wasm32_gate(&scratch, &r, Some(&export), Ok(&tools));
         assert!(matches!(passed, Outcome::Pass(_)), "{passed:?}");
         std::fs::write(stub.join("broken"), "").unwrap();
-        let broken = real.wasm32_gate(&scratch, &r, Some(&export), Some(&tools));
+        let broken = real.wasm32_gate(&scratch, &r, Some(&export), Ok(&tools));
         match &broken {
             Outcome::Refuse(why) => assert!(
                 why.detail.iter().any(|l| l.starts_with("error[E0425]")),
@@ -4238,7 +4259,7 @@ mod tests {
             other => panic!("a compile that fails refuses: {other:?}"),
         }
         std::fs::remove_file(stub.join("broken")).unwrap();
-        let archived = real.wasm32_gate(&scratch, &r, None, Some(&tools));
+        let archived = real.wasm32_gate(&scratch, &r, None, Ok(&tools));
         assert!(matches!(archived, Outcome::Pass(_)), "{archived:?}");
         assert!(scratch.dir.join("wasm-src/publish/config.sh").is_file());
     }

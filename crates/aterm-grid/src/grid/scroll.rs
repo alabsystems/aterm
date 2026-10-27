@@ -810,6 +810,8 @@ impl Grid {
         let width = right_usize + 1 - left_usize;
 
         let cols = self.storage.cols as usize;
+        // Unpair what straddles a margin first, so the shift splits no glyph.
+        self.unpair_margin_straddlers(top, bottom, left_usize, right_usize);
         let mut buf = vec![super::Cell::EMPTY; width];
         for dst_offset in 0..(region_size - n) {
             let dst_row = row_u16(top + dst_offset);
@@ -872,6 +874,40 @@ impl Grid {
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
     }
 
+    /// Before rows `top..=bottom` shift between the DECSLRM margins `left..=right` (a scroll,
+    /// IL or DL), unpair each wide character straddling a margin in them
+    /// ([`Row::unpair_margin_straddlers`]), as Ghostty's `rowWillBeShifted` does for every row
+    /// a shift touches: the after-shift [`Row::fixup_wide_boundary`] alone pairs a lead left
+    /// outside the margins with a spacer shifted in from another row's glyph. Each unpaired lead
+    /// drops its combining marks and cluster text from the extras map and keeps the rest (its
+    /// colours, underline colour, hyperlink), as Ghostty's `clearGrapheme` does: a blank that
+    /// kept them would draw a stray accent and copy it with the text.
+    pub(in crate::grid) fn unpair_margin_straddlers(
+        &mut self,
+        top: usize,
+        bottom: usize,
+        left: usize,
+        right: usize,
+    ) {
+        let scrub = !self.storage.extras.is_empty();
+        for r in top..=bottom {
+            let row = row_u16(r);
+            let Some(leads) = self
+                .row_mut(row)
+                .map(|cells| cells.unpair_margin_straddlers(left, right))
+            else {
+                continue;
+            };
+            if scrub {
+                for lead in leads.into_iter().flatten() {
+                    if self.storage.extras.scrub_char_marks(row, lead) {
+                        self.remove_cell_extra(row, lead);
+                    }
+                }
+            }
+        }
+    }
+
     /// Scroll down by `n` lines within vertical and horizontal (`left..=right`) margins.
     pub fn scroll_region_down_margined(&mut self, n: usize, left: u16, right: u16) {
         if n == 0 {
@@ -896,6 +932,8 @@ impl Grid {
         let width = right_usize + 1 - left_usize;
 
         let cols = self.storage.cols as usize;
+        // Unpair what straddles a margin first, so the shift splits no glyph.
+        self.unpair_margin_straddlers(top, bottom, left_usize, right_usize);
         let mut buf = vec![super::Cell::EMPTY; width];
         for dst_offset in (n..region_size).rev() {
             let dst_row = row_u16(top + dst_offset);

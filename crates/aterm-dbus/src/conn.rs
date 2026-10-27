@@ -24,7 +24,12 @@ pub const BUS_PATH: &str = "/org/freedesktop/DBus";
 pub const DEFAULT_MAX_INCOMING: usize = 1 << 20;
 
 /// How long the handshake may take before [`Connection::handshake`] gives up.
+#[cfg(not(test))]
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(25);
+/// A unit test's default outlasts its one-minute hang detector: a handshake meant to end at its
+/// caller's bound ([`Connection::open_within`]) that waits the default overruns the detector.
+#[cfg(test)]
+pub const HANDSHAKE_TIMEOUT: Duration = aterm_spec::wait::MUST_HAPPEN.saturating_mul(2);
 
 const MAX_QUEUED_MESSAGES: usize = 256;
 const MAX_QUEUED_BYTES: usize = 1 << 20;
@@ -49,10 +54,26 @@ impl ReadLimit {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The instant [`now`] reads on this thread, once a unit test froze its clock.
+    static FROZEN_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// What every deadline here is measured from: [`Instant::now`], or the instant a unit test froze
+/// this thread's clock at, so a wait there ends only by a socket's own timeout.
+fn now() -> Instant {
+    #[cfg(test)]
+    if let Some(frozen) = FROZEN_NOW.with(std::cell::Cell::get) {
+        return frozen;
+    }
+    Instant::now()
+}
+
 pub(crate) fn time_left(deadline: Option<Instant>) -> Result<Option<Duration>> {
     deadline
         .map(|deadline| {
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.saturating_duration_since(now());
             if left.is_zero() {
                 Err(Error::Timeout)
             } else {
@@ -112,7 +133,7 @@ impl Connection {
     /// # Errors
     /// As [`Connection::open`], or [`Error::Timeout`] if they exceed `timeout`.
     pub fn open_within(addresses: &[Address], timeout: Duration) -> Result<Self> {
-        let deadline = Instant::now().checked_add(timeout);
+        let deadline = now().checked_add(timeout);
         let mut last = Error::Invalid("empty address");
         for address in addresses {
             match address::connect(address, deadline) {
@@ -135,7 +156,7 @@ impl Connection {
     /// # Errors
     /// [`Error::Auth`], [`Error::Remote`], or [`Error::Timeout`] after [`HANDSHAKE_TIMEOUT`].
     pub fn handshake(stream: CtlStream, uid: u32, expect_guid: Option<&str>) -> Result<Self> {
-        let deadline = Instant::now().checked_add(HANDSHAKE_TIMEOUT);
+        let deadline = now().checked_add(HANDSHAKE_TIMEOUT);
         Self::handshake_until(stream, uid, expect_guid, deadline)
     }
 
@@ -225,7 +246,7 @@ impl Connection {
     pub fn send(&mut self, msg: Message) -> Result<u32> {
         let deadline = self
             .send_timeout
-            .and_then(|timeout| Instant::now().checked_add(timeout));
+            .and_then(|timeout| now().checked_add(timeout));
         self.send_until(msg, deadline)
     }
 
@@ -248,7 +269,7 @@ impl Connection {
     /// # Errors
     /// [`Error::Remote`], [`Error::Invalid`], [`Error::Timeout`], [`Error::NoReply`], [`Error::Unsupported`], or send/read failure.
     pub fn call(&mut self, msg: Message, timeout: Duration) -> Result<Message> {
-        let deadline = Instant::now().checked_add(timeout);
+        let deadline = now().checked_add(timeout);
         self.call_until(msg, deadline, deadline)
     }
 
@@ -263,7 +284,7 @@ impl Connection {
         }
         let limit = match timeout {
             Some(Duration::ZERO) => ReadLimit::Ready,
-            timeout => ReadLimit::Deadline(timeout.and_then(|t| Instant::now().checked_add(t))),
+            timeout => ReadLimit::Deadline(timeout.and_then(|t| now().checked_add(t))),
         };
         match self.read_message(limit) {
             Ok(received) => Ok(Some(received.message)),

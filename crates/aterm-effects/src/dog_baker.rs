@@ -83,6 +83,7 @@ impl DogBakeKey {
 
 /// Rasterize one authored breed head into a fresh `w × h` [`Tile`] in layer order:
 /// `GlyphRole::Eye` layers take [`ResolvedFills::eye_ink`], outlines get the pet's halo.
+#[inline]
 #[must_use]
 pub fn bake_breed(breed: DogGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Tile {
     let mut tile = Tile::new(w, h);
@@ -90,6 +91,7 @@ pub fn bake_breed(breed: DogGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> T
     tile
 }
 
+#[inline]
 fn paint_breed_onto(tile: &mut Tile, breed: DogGlyphId, fills: &ResolvedFills, w: u32, h: u32) {
     if w == 0 || h == 0 {
         return;

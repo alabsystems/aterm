@@ -414,8 +414,32 @@ pub fn output_until_from(
     deadline: Instant,
 ) -> Result<Output, RunError> {
     output_by(cmd, stdin, &mut || {
-        deadline.saturating_duration_since(Instant::now())
+        deadline.saturating_duration_since(deadline_now())
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The clock a test reads this thread's deadlines on, in place of the real one.
+    static DEADLINE_CLOCK_FOR_TEST: std::cell::RefCell<Option<Box<dyn Fn() -> Instant>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs or clears the clock [`deadline_now`] reads on this thread.
+#[cfg(all(test, unix))]
+fn set_deadline_clock_for_test(clock: Option<Box<dyn Fn() -> Instant>>) {
+    DEADLINE_CLOCK_FOR_TEST.with(|slot| *slot.borrow_mut() = clock);
+}
+
+/// Now, as [`output_until_from`] and the children's runs read the deadline they were given.
+fn deadline_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) =
+        DEADLINE_CLOCK_FOR_TEST.with(|slot| slot.borrow().as_ref().map(|clock| clock()))
+    {
+        return now;
+    }
+    Instant::now()
 }
 
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
@@ -1153,12 +1177,69 @@ mod tests {
         }
     }
 
-    /// The pid a shell wrote to `file`, if it got that far.
+    /// The pid a shell's `echo` wrote to `file`, once its whole line is there.
     #[cfg(unix)]
     fn pid_in(file: &std::path::Path) -> Option<u32> {
         std::fs::read_to_string(file)
             .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
+            .and_then(|text| text.strip_suffix('\n')?.parse::<u32>().ok())
+    }
+
+    /// Waits (under the hang detector) until a shell has written its pid to `file`.
+    #[cfg(unix)]
+    fn wrote_pid(file: &std::path::Path) {
+        let since = Instant::now();
+        while pid_in(file).is_none() && since.elapsed() < HANG {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// How often a run under a [`ClockHeld`] looks at its clock while it is held.
+    #[cfg(unix)]
+    const LOOK: Duration = Duration::from_millis(10);
+
+    /// This thread's deadline clock, held at the moment it was made until `ready()` holds or
+    /// the hang detector runs out, then the real one; dropped, the real one.
+    #[cfg(unix)]
+    struct ClockHeld {
+        at: Instant,
+        /// The first reading past the hold.
+        ran: std::rc::Rc<std::cell::Cell<Option<Instant>>>,
+    }
+
+    #[cfg(unix)]
+    impl ClockHeld {
+        fn until(ready: impl Fn() -> bool + 'static) -> Self {
+            let at = Instant::now();
+            let ran = std::rc::Rc::new(std::cell::Cell::new(None));
+            let theirs = std::rc::Rc::clone(&ran);
+            super::set_deadline_clock_for_test(Some(Box::new(move || {
+                if theirs.get().is_none() && at.elapsed() < HANG && !ready() {
+                    return at;
+                }
+                let now = Instant::now();
+                theirs.set(theirs.get().or(Some(now)));
+                now
+            })));
+            Self { at, ran }
+        }
+
+        /// A deadline one look past the held clock.
+        fn deadline(&self) -> Instant {
+            self.at + LOOK
+        }
+
+        /// How long since the clock ran past its hold; zero if it never did.
+        fn since_it_ran(&self) -> Duration {
+            self.ran.get().map_or(Duration::ZERO, |ran| ran.elapsed())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ClockHeld {
+        fn drop(&mut self) {
+            super::set_deadline_clock_for_test(None);
+        }
     }
 
     /// Waits (under the hang detector) until `pid` is gone; its new parent reaps it.
@@ -1196,39 +1277,43 @@ mod tests {
         assert!(waited < HANG, "waited out the deadline: {waited:?}");
     }
 
-    /// A child past its deadline is killed and reaped, its descendants with it.
+    /// A child past its deadline is killed and reaped, its descendants with it. The deadline's
+    /// clock stands short of it until the shell has written its descendant's pid and its own,
+    /// so both are checked on every run. Negative control: a `kill_group` that signals only
+    /// the child leaves the descendant running past the hang detector.
     #[cfg(unix)]
     #[test]
     fn a_child_past_its_deadline_is_killed_and_reaped() {
-        let dir = std::env::temp_dir().join(format!("uds-deadline-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = scratch("past");
         let pid_file = dir.join("pid");
-        let mut cmd = crate::spawnfd::command("/bin/sh");
         let grandchild_file = dir.join("grandchild");
-        cmd.arg("-c")
-            .arg("sleep 600 & echo $! > \"$1\"; echo $$ > \"$0\"; exec sleep 600")
-            .arg(&pid_file)
-            .arg(&grandchild_file);
-        let begun = Instant::now();
-        let result = output_until(&mut cmd, Instant::now() + Duration::from_secs(2));
-        let waited = begun.elapsed();
+        let mut cmd = sh(
+            "sleep 600 & echo $! > \"$1\"; echo $$ > \"$0\"; exec sleep 600",
+            &[&pid_file, &grandchild_file],
+        );
+        let both = [pid_file.clone(), grandchild_file.clone()];
+        let clock = ClockHeld::until(move || both.iter().all(|file| pid_in(file).is_some()));
+        let result = output_until(&mut cmd, clock.deadline());
+        let waited = clock.since_it_ran();
+        drop(clock);
+        let child = pid_in(&pid_file);
+        let grandchild = pid_in(&grandchild_file);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (Some(child), Some(grandchild)) = (child, grandchild) else {
+            panic!("the shell wrote no pids in a minute: {child:?} {grandchild:?}");
+        };
         assert!(matches!(result, Err(RunError::TimedOut)), "{result:?}");
         assert!(waited < HANG, "the call did not come back: {waited:?}");
-        if let Some(pid) = std::fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-        {
-            assert!(
-                !crate::process::pid_alive(pid),
-                "pid {pid} outlived the call"
-            );
-        }
-        if let Some(pid) = pid_in(&grandchild_file) {
-            let dead = gone(pid);
-            kill_stray((!dead).then_some(pid));
-            assert!(dead, "the child's descendant {pid} outlived the call");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !crate::process::pid_alive(child),
+            "pid {child} outlived the call"
+        );
+        let dead = gone(grandchild);
+        kill_stray((!dead).then_some(grandchild));
+        assert!(
+            dead,
+            "the child's descendant {grandchild} outlived the call"
+        );
         assert!(matches!(
             output_until(
                 &mut crate::spawnfd::command("/nonexistent/tool"),
@@ -1317,7 +1402,9 @@ mod tests {
     /// A child that stops making progress is killed, with its group, one whole window after
     /// its LAST step, not one window after it started, and the probe's last reading names the
     /// step it stopped after: the reading moves on each of the probe's first five looks and
-    /// never again, while the child sleeps for ten minutes.
+    /// never again, while the child sleeps for ten minutes. The first look waits for the
+    /// shell's pid, so the kill is checked on every run. Negative control: an `output_by` that
+    /// returns at the stall without ending the child leaves it running.
     #[cfg(unix)]
     #[test]
     fn a_child_that_stops_making_progress_is_killed_one_window_after_its_last_step() {
@@ -1329,6 +1416,9 @@ mod tests {
         let mut reading = 0;
         let mut last_step = begun;
         let mut probe = || {
+            if reading == 0 {
+                wrote_pid(&pid_file);
+            }
             if reading < STEPS {
                 reading += 1;
                 last_step = Instant::now();
@@ -1339,6 +1429,7 @@ mod tests {
         let killed = Instant::now();
         let child = pid_in(&pid_file);
         let _ = std::fs::remove_dir_all(&dir);
+        let child = child.expect("the shell wrote no pid in a minute");
         assert!(matches!(result, Err(RunError::TimedOut)), "{result:?}");
         assert_eq!(reading, STEPS, "the stall is named by the last step");
         let quiet = killed.duration_since(last_step);
@@ -1347,15 +1438,13 @@ mod tests {
             "killed {quiet:?} after the last step, inside the window"
         );
         assert!(
-            killed.duration_since(begun) < HANG,
+            killed.duration_since(last_step) < HANG,
             "the call did not come back"
         );
-        if let Some(pid) = child {
-            assert!(
-                !crate::process::pid_alive(pid),
-                "pid {pid} outlived the call"
-            );
-        }
+        assert!(
+            !crate::process::pid_alive(child),
+            "pid {child} outlived the call"
+        );
     }
 
     /// The first child cannot finish until the third has run, which a one-after-another run
@@ -1425,7 +1514,10 @@ mod tests {
 
     /// At the deadline a running child is killed with its group and reaped within `reap`; the
     /// others keep their own answers (a tool that could not start is a spawn error, not a
-    /// timeout).
+    /// timeout). The deadline's clock stands short of it until the shell has written its
+    /// descendant's pid and its own, so both are checked on every run. Negative control: a
+    /// `kill_group` that signals only the child leaves the descendant running past the hang
+    /// detector.
     #[cfg(unix)]
     #[test]
     fn at_the_deadline_the_running_child_is_killed_and_reaped_and_the_rest_keep_their_answers() {
@@ -1437,28 +1529,31 @@ mod tests {
             &[&pid_file, &grandchild_file],
         );
         let mut missing = crate::spawnfd::command("/nonexistent/tool");
-        let begun = Instant::now();
-        let results = outputs_until(
-            &mut [&mut wedged, &mut missing],
-            Instant::now() + Duration::from_secs(2),
-            Duration::from_secs(1),
-        );
-        assert!(begun.elapsed() < HANG, "the call did not come back");
+        let both = [pid_file.clone(), grandchild_file.clone()];
+        let clock = ClockHeld::until(move || both.iter().all(|file| pid_in(file).is_some()));
+        let results = outputs_until(&mut [&mut wedged, &mut missing], clock.deadline(), HANG);
+        let waited = clock.since_it_ran();
+        drop(clock);
+        let child = pid_in(&pid_file);
+        let grandchild = pid_in(&grandchild_file);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (Some(child), Some(grandchild)) = (child, grandchild) else {
+            panic!("the shell wrote no pids in a minute: {child:?} {grandchild:?}");
+        };
+        assert!(waited < HANG, "the call did not come back: {waited:?}");
         let mut results = results.into_iter();
         assert!(matches!(results.next(), Some(Err(RunError::TimedOut))));
         assert!(matches!(results.next(), Some(Err(RunError::Spawn(_)))));
-        if let Some(pid) = pid_in(&pid_file) {
-            assert!(
-                !crate::process::pid_alive(pid),
-                "pid {pid} outlived the call"
-            );
-        }
-        if let Some(pid) = pid_in(&grandchild_file) {
-            let dead = gone(pid);
-            kill_stray((!dead).then_some(pid));
-            assert!(dead, "the child's descendant {pid} outlived the call");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !crate::process::pid_alive(child),
+            "pid {child} outlived the call"
+        );
+        let dead = gone(grandchild);
+        kill_stray((!dead).then_some(grandchild));
+        assert!(
+            dead,
+            "the child's descendant {grandchild} outlived the call"
+        );
     }
 
     /// **A HELD CHILD RUNS ONLY ONCE RESUMED, TO ITS OUTPUT.** Held, the shell is exec'd and

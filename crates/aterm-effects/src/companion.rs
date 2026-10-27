@@ -858,6 +858,7 @@ impl CompanionOwner {
                 protected: exclusions,
                 overlays,
                 ink: &[],
+                blanked: &[],
                 painted_over: None,
             },
         )
@@ -1717,6 +1718,20 @@ impl CompanionOwner {
         self.pet.set_letter_step_rearms(rearms);
     }
 
+    /// A test's negative control ([`PetBrain::set_old_paths`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_pet_old_paths(&mut self, old: bool) {
+        self.pet.set_old_paths(old);
+    }
+
+    /// A test's negative control ([`PetBrain::set_old_path`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_pet_old_path(&mut self, law: crate::kitty_pet::OldPath, old: bool) {
+        self.pet.set_old_path(law, old);
+    }
+
     /// Read-only access to the pet brain for host projections.
     #[inline]
     #[must_use]
@@ -1724,6 +1739,9 @@ impl CompanionOwner {
         &self.pet
     }
 }
+
+#[cfg(any(test, debug_assertions))]
+mod state_words;
 
 #[cfg(test)]
 mod law_tests {

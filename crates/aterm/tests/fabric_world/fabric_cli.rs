@@ -1238,8 +1238,9 @@ fn usage_errors_exit_2_and_help_exits_0() {
     assert_eq!(code, 2, "{err}");
     let (code, out, _) = fabric(&s, None, &["help"]);
     assert_eq!(code, 0, "{out}");
-    let (code, _, err) = fabric(&s, None, &["tail", "--json"]);
+    let (code, _, err) = fabric(&s, None, &["doctor", "--json"]);
     assert_eq!(code, 2, "{err}");
+    assert!(err.contains("`aterm fabric tail --json`"), "{err}");
 }
 
 /// A FILTER THE BROKER WOULD REFUSE NEVER REACHES IT. `tail --filter` passes

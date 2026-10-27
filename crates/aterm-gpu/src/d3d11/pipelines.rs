@@ -2,11 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! D3D11 shaders, input layouts and fixed-function state built from
-//! [`crate::pipeline_table`], the rows the wgpu, Metal and GL pipelines are
-//! built from.
+//! [`crate::pipeline_table`], the rows the Metal and GL pipelines are built
+//! from.
 //!
 //! Each row's states are wgpu-dx12's for the same row, so the arm's frames
-//! are the oracle's: blending is enabled whenever the row has a blend (wgpu
+//! are the ones wgpu-dx12 drew (`oracle/warp-frames.tsv`): blending is enabled whenever the row has a blend (wgpu
 //! enables it for REPLACE too, and it is arithmetically the same), a factor's
 //! colour form becomes its alpha form in the alpha half (wgpu-hal's
 //! `map_blend_factor`), the rasterizer culls nothing and always scissors (a

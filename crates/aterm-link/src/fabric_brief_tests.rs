@@ -677,34 +677,88 @@ fn the_json_brief_names_no_claimed_need() {
     assert_eq!(need("s-beside").as_str(), Some("failure"), "{text}");
 }
 
+/// NEITHER BRIEF PRINTS A HOST OR CONTENT FIELD A RAW BODY CARRIES (session log Phase 6 fix
+/// unit F6, PRIV-3). Hand-written v=2 `ev` bodies, as a writer of another build could publish
+/// them, go through the real ingest path (`Read::ingest`, then `BusSpace::offer`): a run open
+/// carrying `cwd=`, `title=` and `from=`, a `need` mark carrying a Host and a Content key, and a
+/// `seen` mark (a bus mark the text brief prints as a line) carrying both too. A presence row
+/// carrying `attention=` and `title=` goes through `Read::presence`. Each is folded (the run, the
+/// need, the `seen` line and the presence state are in the briefs), and neither brief prints a
+/// sentinel or a key above `WireMeta`.
+///
+/// The guards are layered, and each has its own test with its own negative control: the receive
+/// side's strip in `BusSpace::offer` is aterm-slog's tests/mirror.rs
+/// `a_hostile_body_is_foreign_or_stripped_never_folded_as_is`, and the text renderer's mark-line
+/// filter is tests/brief_budget.rs `a_mark_line_prints_no_key_above_wire_meta`. The text half here
+/// fails only when both go. The JSON brief prints a fixed schema (`session_json`), so its leak
+/// guard is the printed-key loop below, which fails on any key the bus does not carry.
 #[test]
-fn the_json_brief_prints_no_host_or_content_field() {
-    let mut log = in_approval(1_760_000_000_000, "bash");
-    let t = Stamp::new(1_760_000_000_010, 10);
-    let planted = [
-        (Kind::Title, aterm_slog::Key::Title, "QZP6SECRET2"),
-        (Kind::Label, aterm_slog::Key::Text, "QZP6SECRET3"),
-        (Kind::Mail, aterm_slog::Key::From, "QZP6SECRET4"),
+fn neither_brief_prints_a_host_or_content_field_a_raw_body_carries() {
+    const T0: u64 = 1_760_000_000_000;
+    let body = |seq: u64, rest: &str| format!("v=2 t={} ep=1 seq={seq} ms={seq} {rest}", T0 + seq);
+    let ev = vec![
+        body(1, "op=open node=- k=spawn src=aterm conf=exact"),
+        body(
+            2,
+            "op=open node=r1 par=- k=agent agent=claude cwd=%2Fprivate%2Ftmp%2Fx%2FQZP6WORD1 \
+             title=QZP6WORD2 from=QZP6WORD3 src=status conf=strong",
+        ),
+        body(
+            3,
+            "op=mark node=r1 k=need word=help cwd=%2Fprivate%2Ftmp%2Fx%2FQZP6WORD4 \
+             title=QZP6WORD5 src=screen conf=strong",
+        ),
+        body(
+            4,
+            "op=mark node=- k=seen text=QZP6WORD6 attn_text=QZP6WORD7 detail=qzp6meta \
+             src=status conf=strong",
+        ),
     ];
-    for (kind, key, sentinel) in planted {
-        let f = Fields::new().text(key, sentinel).expect("a text field");
-        log.mark(Mark::new(kind, Src::Screen, Conf::Strong).fields(f), t)
-            .expect("a mark");
+    for b in &ev {
+        let d = aterm_slog::decode_bus(b).unwrap_or_else(|e| panic!("{e:?}: {b}"));
+        assert!(d.rec.is_bus_class(), "PRECONDITION: a bus record: {b}");
     }
-    let cwd = Fields::new()
-        .text(aterm_slog::Key::Cwd, "/tmp/QZP6SECRET1")
-        .expect("a cwd");
-    log.open(
-        Open::new(Kind::Cmd, Src::Shell, Conf::Strong).fields(cwd),
-        t,
+    let mut r = read_of(&[("n-1", "s-a", ev)]);
+    r.presence(
+        "n-1",
+        "s-a",
+        b"v=1 t=1 state=live inc=1 attention=QZP6WORD8 title=QZP6WORD9",
     )
-    .expect("a command with its cwd");
-    let r = read_of(&[("n-1", "s-a", bodies(&mut log))]);
-    let text = render_json(&cfg(), &json_opts(), &r, 1_760_000_001_000, None);
-    assert!(!text.contains("QZP6SECRET"), "{text}");
-    let v = json_of(&text);
+    .expect("a presence row");
+    let now = T0 + 60_000;
+
+    let text = render(&cfg(), &BriefOpts::default(), &r, now);
+    assert!(!text.contains("QZP6WORD"), "{text}");
+    assert!(text.contains("@s-a@n-1 live ep=1 "), "the presence: {text}");
+    assert!(text.contains("- claude r1 "), "the run: {text}");
+    assert!(text.contains(" need=help "), "the need: {text}");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("4 seen ") && l.contains(" detail=qzp6meta ")),
+        "the seen line, its Wire Meta key printed: {text}"
+    );
+    for line in text.lines().skip(1) {
+        for tok in line.split_whitespace() {
+            let Some((k, _)) = tok.split_once('=') else {
+                continue;
+            };
+            assert!(
+                aterm_slog::Key::from_word(k).is_none_or(|key| key.tier() <= Tier::WireMeta),
+                "`{k}` is no key the bus carries: {line}"
+            );
+        }
+    }
+
+    let json = render_json(&cfg(), &json_opts(), &r, now, None);
+    assert!(!json.contains("QZP6WORD"), "{json}");
+    let v = json_of(&json);
     let sessions = sessions_of(&v);
-    assert_eq!(sessions.len(), 1, "{text}");
+    assert_eq!(sessions.len(), 1, "{json}");
+    assert_eq!(
+        sessions[0].get("need").and_then(aterm_json::Value::as_str),
+        Some("help"),
+        "the need: {json}"
+    );
     fn keys(v: &aterm_json::Value, out: &mut Vec<String>) {
         if let Some(m) = v.as_object() {
             for (k, v) in m {
@@ -723,7 +777,7 @@ fn the_json_brief_prints_no_host_or_content_field() {
         let carried = aterm_slog::Key::from_word(k).is_some_and(|key| key.tier() <= Tier::WireMeta);
         assert!(
             DERIVED.contains(&k.as_str()) || carried,
-            "`{k}` is no key the bus carries: {text}"
+            "`{k}` is no key the bus carries: {json}"
         );
     }
 }
@@ -757,4 +811,44 @@ fn the_json_brief_is_held_to_the_budget() {
         Some("s-59"),
         "the newest first"
     );
+}
+
+#[test]
+fn a_follower_full_of_nodes_forgets_the_one_heard_from_least_recently() {
+    let node = |i: usize| format!("n-{i:04}");
+    let mut r = Read::following();
+    for i in (0..SESSIONS_MAX).rev() {
+        r.presence(&node(i), "node", b"v=1 t=1 state=live inc=1")
+            .expect("a node row");
+    }
+    r.presence(&node(SESSIONS_MAX - 1), "node", b"v=1 t=2 state=live inc=2")
+        .expect("the first node heard from again");
+    r.presence(&node(SESSIONS_MAX - 2), "node", b"v=1 t=2 state=gone")
+        .expect("the second goes");
+    r.presence("n-new", "node", b"v=1 t=3 state=live inc=1")
+        .expect("one node more");
+    assert_eq!(
+        r.node_inc.len() + r.nodes_gone.len(),
+        SESSIONS_MAX,
+        "held to its bound"
+    );
+    assert!(r.node_inc.contains_key("n-new"), "the new node is held");
+    assert!(
+        r.node_inc.contains_key(&node(0)),
+        "the node whose id sorts first was heard from last: kept"
+    );
+    assert_eq!(
+        r.node_inc.get(&node(SESSIONS_MAX - 1)),
+        Some(&2),
+        "a node heard from again is fresh"
+    );
+    assert!(
+        r.nodes_gone.contains(&node(SESSIONS_MAX - 2)),
+        "a gone node heard from recently is kept"
+    );
+    assert!(
+        !r.node_inc.contains_key(&node(SESSIONS_MAX - 3)),
+        "the one heard from least recently is forgotten"
+    );
+    assert_eq!(r.node_heard.len(), SESSIONS_MAX, "and its stamp with it");
 }

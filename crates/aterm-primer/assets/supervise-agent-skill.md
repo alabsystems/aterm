@@ -2,7 +2,7 @@
 name: supervise-agent
 description: Run other Claude Code, codex-alab, agy or Muse Code sessions in aterm tabs as workers — start each on a task, wait for them in the background, read each one's result and check it against ground truth (tests, diff, exit codes) — or oversee another program (a codex-alab, a REPL, a long build) in an aterm session. Use when asked to hand work to other sessions or windows, run work in parallel in aterm, say what every aterm session or machine is doing, manage or babysit another agent, or act as a lead over workers.
 ---
-<!-- aterm skill v14 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v15 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Workers: other aterm sessions doing the work
 
@@ -150,23 +150,26 @@ once if it already has, which `await block` misses), and `aterm ctl @s-x blockte
 reads its output. For a hand-driven agent:
 
 - Wait for turn end with `aterm ctl @s-x await log close=turn since=<log_seq> ep=<log_ep>
-  timeout=600000` (using `log_seq=` and `log_ep=` from `aterm ctl @s-x status`), for the
-  next approval box, question, wall, stall, failed command, `need` mark or session end with
-  `aterm ctl @s-x await log need since=<log_seq> ep=<log_ep> timeout=600000`, or for both
-  with `await log need,close=turn since=<log_seq> ep=<log_ep>`. Always pass `since=` and
-  re-arm from the reply's `seq=`/`ep=` (or `resync_to=` on `OK gap`).
+  base=<log_base> timeout=600000` (using `log_seq=`, `log_ep=` and `log_base=` from `aterm
+  ctl @s-x status`), for the next approval box, question, wall, stall, failed command,
+  `need` mark or session end with `aterm ctl @s-x await log need since=<log_seq>
+  ep=<log_ep> base=<log_base> timeout=600000`, or for both with `await log need,close=turn
+  since=<log_seq> ep=<log_ep> base=<log_base>`. Always pass `since=` and re-arm from the
+  reply's `seq=`/`ep=`/`base=` (or `resync_to=` on `OK gap`); `base=` names the log, so a
+  cursor of another session's log is answered `OK gap why=reset`.
 - aterm does not parse Codex screens (`aterm drive phase` always reads `idle` there, and
   `agent=` stays `unknown`): judge `codex-alab` by `supervisor=`/`supervisor_proven=`/
   `program_state=` and vendor `codex` by `program_state=` and ground truth; read `text`
   before typing. Never `await agent` on `agent=unknown|-`: wait on the program's own report.
-  Read `log_seq=` and `log_ep=` from `aterm ctl @s-x status` BEFORE you type to it, then
-  type, then wait with `aterm ctl @s-x await log kind=program since=<log_seq> ep=<log_ep>
-  timeout=600000`, which answers at the first move past `since=`, even one made before the
-  wait began (`… program state=<idle|working|blocked|done|error|none>
-  [ask=<permission|question|auth>] [coalesced=<n>] src=engine conf=claim`); a `since=` read
-  after typing misses a quick turn's moves and waits for the next. Re-arm from the reply's
-  `seq=`/`ep=` until `state=` is one you act on. It is the program's claim, not aterm's
-  reading: check ground truth before acting. `await log close=turn` closes a codex turn
+  Read `log_seq=`, `log_ep=` and `log_base=` from `aterm ctl @s-x status` BEFORE you type
+  to it, then type, then wait with `aterm ctl @s-x await log kind=program since=<log_seq>
+  ep=<log_ep> base=<log_base> timeout=600000`, which answers at the first move past
+  `since=`, even one made before the wait began (`… program
+  state=<idle|working|blocked|done|error|none> [ask=<permission|question|auth>]
+  [coalesced=<n>] src=engine conf=claim`); a `since=` read after typing misses a quick
+  turn's moves and waits for the next. Re-arm from the reply's `seq=`/`ep=`/`base=` until
+  `state=` is one you act on. It is the program's claim, not aterm's reading: check ground
+  truth before acting. `await log close=turn` closes a codex turn
   only on a codex-alab build aterm measured.
 - `kind question` in `aterm drive phase @s-x` is a question dialog (even if titled `Do you
   want to proceed?`): answer via `aterm ctl @s-x meta set questions ask` + `aterm drive

@@ -833,7 +833,11 @@ impl Grid {
             let actual_width = row_cells.len().min((max_col - dst_left + 1) as usize);
             if let Some(row) = self.row_mut(dst_row) {
                 if actual_width > 0 {
-                    let _ = row.fixup_wide_chars_in_range(dst_left, actual_width as u16);
+                    let _ = row.fixup_wide_chars_in_range(
+                        dst_left,
+                        actual_width as u16,
+                        crate::Cell::EMPTY,
+                    );
                 }
                 for (&cell, col_offset) in row_cells.iter().zip(0u16..) {
                     let dst_col = dst_left.saturating_add(col_offset);

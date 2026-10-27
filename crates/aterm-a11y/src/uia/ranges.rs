@@ -3,8 +3,21 @@
 
 //! TextPattern and retained TextRange COM objects over shared model text.
 
+use super::com::held;
+use super::objects::{RangeObject, range};
+use super::values::{Bstr, Variant, array_com, array_f64, bstr_text, variant_bool};
 use super::*;
 use crate::uia_text::{Document, Unit};
+
+use aterm_win32::Win32::System::Variant::VARIANT;
+use aterm_win32::Win32::UI::Accessibility::{
+    SupportedTextSelection, SupportedTextSelection_None, SupportedTextSelection_Single,
+    TextPatternRangeEndpoint, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
+    TextUnit, TextUnit_Character, TextUnit_Document, TextUnit_Format, TextUnit_Line, TextUnit_Page,
+    TextUnit_Paragraph, TextUnit_Word, UIA_IsHiddenAttributeId, UIA_IsReadOnlyAttributeId,
+    UIA_TEXTATTRIBUTE_ID, UiaGetReservedNotSupportedValue, UiaPoint,
+};
+use aterm_win32::core::BSTR;
 
 fn unit(unit: TextUnit) -> Result<Unit> {
     Ok(match unit {
@@ -13,7 +26,7 @@ fn unit(unit: TextUnit) -> Result<Unit> {
         TextUnit_Line => Unit::Line,
         TextUnit_Paragraph => Unit::Paragraph,
         TextUnit_Page | TextUnit_Document => Unit::Document,
-        _ => return Err(E_INVALIDARG.into()),
+        _ => return Err(E_INVALIDARG),
     })
 }
 
@@ -21,24 +34,23 @@ fn endpoint(endpoint: TextPatternRangeEndpoint) -> Result<usize> {
     match endpoint {
         TextPatternRangeEndpoint_Start => Ok(0),
         TextPatternRangeEndpoint_End => Ok(1),
-        _ => Err(E_INVALIDARG.into()),
+        _ => Err(E_INVALIDARG),
     }
 }
 
-#[implement(nullable::Range)]
+/// One range of a node's text, in UTF-16 offsets, kept on character boundaries.
 pub(super) struct TextRange {
     key: Key,
     bounds: Mutex<[usize; 2]>,
 }
 
 impl TextRange {
-    fn new(key: Key, start: usize, end: usize) -> ITextRangeProvider {
-        ComObject::new(Self {
+    /// A new range object, as `ITextRangeProvider`.
+    fn spanning(key: Key, start: usize, end: usize) -> Com {
+        range(Self {
             key,
             bounds: Mutex::new([start.min(end), start.max(end)]),
         })
-        .to_interface::<nullable::Range>()
-        .0
     }
 
     fn read<T>(
@@ -46,7 +58,7 @@ impl TextRange {
         f: impl FnOnce(Node<'_>, &Document, &State, &mut [usize; 2]) -> Result<T>,
     ) -> Result<T> {
         self.key.read(|node, state| {
-            let document = Document::new(node).ok_or_else(unsupported)?;
+            let document = Document::new(node).ok_or(NOT_SUPPORTED)?;
             let mut bounds = self.bounds.lock_or_recover();
             bounds[0] = document.floor(bounds[0]);
             bounds[1] = document.floor(bounds[1]).max(bounds[0]);
@@ -54,21 +66,22 @@ impl TextRange {
         })
     }
 
-    fn other<'a>(&self, other: &'a ITextRangeProvider) -> Result<&'a TextRange_Impl> {
-        let other = other
-            .cast_object_ref::<TextRange>()
-            .map_err(|_| Error::from(E_INVALIDARG))?;
-        if !self.key.shared.ptr_eq(&other.key.shared) {
-            return Err(E_INVALIDARG.into());
+    /// The range `other` (a client's borrowed `ITextRangeProvider`), when it is
+    /// one of this window's over the same node.
+    fn other(&self, other: Raw) -> Result<com::Held<RangeObject>> {
+        // SAFETY: a client's interface argument, live for the call.
+        let other = unsafe { held::<RangeObject>(other) }.ok_or(E_INVALIDARG)?;
+        if !self.key.shared.ptr_eq(&other.range().key.shared) {
+            return Err(E_INVALIDARG);
         }
         self.key.read(|node, state| {
-            let other_node = match &other.key.handle {
+            let other_node = match &other.range().key.handle {
                 Some(handle) => state.publication.node(handle),
                 None => state.publication.tree().map(crate::tree::State::root),
             }
-            .ok_or_else(unavailable)?;
+            .ok_or(ELEMENT_NOT_AVAILABLE)?;
             if node.id() != other_node.id() {
-                return Err(E_INVALIDARG.into());
+                return Err(E_INVALIDARG);
             }
             Ok(())
         })?;
@@ -76,11 +89,12 @@ impl TextRange {
     }
 }
 
-impl ITextProvider_Impl for Provider_Impl {
-    fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
+/// `ITextProvider` and `ITextProvider2`.
+impl Provider {
+    pub(super) fn text_selection(&self) -> Result<*mut SAFEARRAY> {
         let (key, selection) = self.key().read(|node, state| {
             if !node.supports_text_ranges() {
-                return Err(unsupported());
+                return Err(NOT_SUPPORTED);
             }
             Ok((
                 Key::capture(&self.shared, node.id(), state)?,
@@ -88,43 +102,46 @@ impl ITextProvider_Impl for Provider_Impl {
             ))
         })?;
         let values = selection
-            .map(|(start, len)| TextRange::new(key, start, start + len).cast::<IUnknown>())
+            .map(|(start, len)| TextRange::spanning(key, start, start + len).query(&IID_IUnknown))
             .transpose()?
             .into_iter()
             .collect::<Vec<_>>();
         array_com(&values)
     }
-    fn GetVisibleRanges(&self) -> Result<*mut SAFEARRAY> {
-        array_com(&[self.DocumentRange()?.cast()?])
+
+    pub(super) fn visible_ranges(&self) -> Result<*mut SAFEARRAY> {
+        array_com(&[self.document_range()?.query(&IID_IUnknown)?])
     }
-    fn RangeFromChild(&self, child: Ref<IRawElementProviderSimple>) -> Result<ITextRangeProvider> {
-        let child = child.as_ref().ok_or_else(|| Error::from(E_INVALIDARG))?;
-        let child = child
-            .cast_object_ref::<Provider>()
-            .map_err(|_| Error::from(E_INVALIDARG))?;
-        if !self.shared.ptr_eq(&child.shared) {
-            return Err(E_INVALIDARG.into());
+
+    /// Never a range: a child of this window's is refused as not supported
+    /// (text nodes have no embedded objects) or as an invalid argument.
+    pub(super) fn range_from_child(&self, child: Raw) -> Result<Com> {
+        // SAFETY: a client's interface argument, live for the call.
+        let child = unsafe { held::<objects::ProviderObject>(child) }.ok_or(E_INVALIDARG)?;
+        if !self.shared.ptr_eq(&child.provider().shared) {
+            return Err(E_INVALIDARG);
         }
         self.key().read(|node, _| {
             if node.supports_text_ranges() {
-                Err(unsupported())
+                Err(NOT_SUPPORTED)
             } else {
-                Err(E_INVALIDARG.into())
+                Err(E_INVALIDARG)
             }
         })
     }
-    fn RangeFromPoint(&self, point: &UiaPoint) -> Result<ITextRangeProvider> {
+
+    pub(super) fn range_from_point(&self, point: UiaPoint) -> Result<Com> {
         if !point.x.is_finite() || !point.y.is_finite() {
-            return Err(E_INVALIDARG.into());
+            return Err(E_INVALIDARG);
         }
         let (key, offset) = self.key().read(|node, state| {
             if !node.supports_text_ranges() {
-                return Err(unsupported());
+                return Err(NOT_SUPPORTED);
             }
             let local = node.transform().inverse()
                 * Point::new(point.x - state.origin.0, point.y - state.origin.1);
             let position = node.text_position_at_point(local);
-            let text = crate::platform::text(node).ok_or_else(unsupported)?;
+            let text = crate::platform::text(node).ok_or(NOT_SUPPORTED)?;
             Ok((
                 Key::capture(&self.shared, node.id(), state)?,
                 text.chars()
@@ -133,18 +150,20 @@ impl ITextProvider_Impl for Provider_Impl {
                     .sum(),
             ))
         })?;
-        Ok(TextRange::new(key, offset, offset))
+        Ok(TextRange::spanning(key, offset, offset))
     }
-    fn DocumentRange(&self) -> Result<ITextRangeProvider> {
+
+    pub(super) fn document_range(&self) -> Result<Com> {
         let (key, len) = self.key().read(|node, state| {
             Ok((
                 Key::capture(&self.shared, node.id(), state)?,
-                Document::new(node).ok_or_else(unsupported)?.len(),
+                Document::new(node).ok_or(NOT_SUPPORTED)?.len(),
             ))
         })?;
-        Ok(TextRange::new(key, 0, len))
+        Ok(TextRange::spanning(key, 0, len))
     }
-    fn SupportedTextSelection(&self) -> Result<SupportedTextSelection> {
+
+    pub(super) fn supported_text_selection(&self) -> Result<SupportedTextSelection> {
         self.key().read(|node, _| {
             Ok(if node.data().supports_action(Action::SetTextSelection) {
                 SupportedTextSelection_Single
@@ -153,22 +172,14 @@ impl ITextProvider_Impl for Provider_Impl {
             })
         })
     }
-}
 
-impl ITextProvider2_Impl for Provider_Impl {
-    fn RangeFromAnnotation(
-        &self,
-        _annotation: Ref<IRawElementProviderSimple>,
-    ) -> Result<ITextRangeProvider> {
-        Err(unsupported())
-    }
-    fn GetCaretRange(&self, active: *mut BOOL) -> Result<ITextRangeProvider> {
+    pub(super) fn caret_range(&self, active: *mut BOOL) -> Result<Com> {
         if active.is_null() {
-            return Err(E_INVALIDARG.into());
+            return Err(E_INVALIDARG);
         }
         let (key, offset, focused) = self.key().read(|node, state| {
-            let position = node.text_selection_focus().ok_or_else(unsupported)?;
-            let text = crate::platform::text(node).ok_or_else(unsupported)?;
+            let position = node.text_selection_focus().ok_or(NOT_SUPPORTED)?;
+            let text = crate::platform::text(node).ok_or(NOT_SUPPORTED)?;
             Ok((
                 Key::capture(&self.shared, node.id(), state)?,
                 text.chars()
@@ -178,34 +189,38 @@ impl ITextProvider2_Impl for Provider_Impl {
                 node.is_focused(),
             ))
         })?;
-        unsafe {
-            active.write(focused.into());
-        }
-        Ok(TextRange::new(key, offset, offset))
+        // SAFETY: the caller's non-null slot, checked above.
+        unsafe { active.write(boolean(focused)) };
+        Ok(TextRange::spanning(key, offset, offset))
     }
 }
 
-impl ITextRangeProvider_Impl for TextRange_Impl {
-    fn Clone(&self) -> Result<ITextRangeProvider> {
-        self.read(|_, _, _, bounds| Ok(TextRange::new(self.key.clone(), bounds[0], bounds[1])))
+/// `ITextRangeProvider`.
+impl TextRange {
+    pub(super) fn clone_range(&self) -> Result<Com> {
+        self.read(|_, _, _, bounds| Ok(TextRange::spanning(self.key.clone(), bounds[0], bounds[1])))
     }
-    fn Compare(&self, other: Ref<ITextRangeProvider>) -> Result<BOOL> {
-        let other = self.other(other.as_ref().ok_or_else(|| Error::from(E_INVALIDARG))?)?;
-        let theirs = *other.bounds.lock_or_recover();
+
+    pub(super) fn compare(&self, other: Raw) -> Result<BOOL> {
+        let other = self.other(other)?;
+        let theirs = *other.range().bounds.lock_or_recover();
         self.read(|_, doc, _, bounds| {
-            Ok((*bounds == [doc.floor(theirs[0]), doc.floor(theirs[1])]).into())
+            Ok(boolean(
+                *bounds == [doc.floor(theirs[0]), doc.floor(theirs[1])],
+            ))
         })
     }
-    fn CompareEndpoints(
+
+    pub(super) fn compare_endpoints(
         &self,
         end: TextPatternRangeEndpoint,
-        other: Ref<ITextRangeProvider>,
+        other: Raw,
         other_end: TextPatternRangeEndpoint,
     ) -> Result<i32> {
         let end = endpoint(end)?;
         let other_end = endpoint(other_end)?;
-        let other = self.other(other.as_ref().ok_or_else(|| Error::from(E_INVALIDARG))?)?;
-        let theirs = other.bounds.lock_or_recover()[other_end];
+        let other = self.other(other)?;
+        let theirs = other.range().bounds.lock_or_recover()[other_end];
         self.read(|_, doc, _, bounds| {
             Ok(match bounds[end].cmp(&doc.floor(theirs)) {
                 std::cmp::Ordering::Less => -1,
@@ -214,7 +229,8 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
             })
         })
     }
-    fn ExpandToEnclosingUnit(&self, by: TextUnit) -> Result<()> {
+
+    pub(super) fn expand_to_enclosing_unit(&self, by: TextUnit) -> Result<()> {
         let by = unit(by)?;
         self.read(|_, doc, _, bounds| {
             let (start, end) = doc.enclosing(bounds[0], by);
@@ -222,39 +238,50 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
             Ok(())
         })
     }
-    fn FindAttribute(
+
+    /// The whole range when its read-only state is `value`, else none; only
+    /// IsReadOnly is searchable. `value` stays the caller's.
+    pub(super) fn find_attribute(
         &self,
         id: UIA_TEXTATTRIBUTE_ID,
         value: &VARIANT,
         backward: BOOL,
-    ) -> Result<ITextRangeProvider> {
+    ) -> Result<Option<Com>> {
         if id != UIA_IsReadOnlyAttributeId {
-            return Err(unsupported());
+            return Err(NOT_SUPPORTED);
         }
-        let expected = bool::try_from(value).map_err(|_| Error::from(E_INVALIDARG))?;
+        let expected = variant_bool(value).map_err(|_| E_INVALIDARG)?;
         self.read(|node, _, _, bounds| {
             let read_only = !node.data().supports_action(Action::ReplaceSelectedText)
                 && !node.data().supports_action(Action::SetValue);
             if expected != read_only {
-                return Err(Error::empty());
+                return Ok(None);
             }
             let _ = backward;
-            Ok(TextRange::new(self.key.clone(), bounds[0], bounds[1]))
+            Ok(Some(TextRange::spanning(
+                self.key.clone(),
+                bounds[0],
+                bounds[1],
+            )))
         })
     }
-    fn FindText(
+
+    /// The first (or, `backward`, last) match of `text` within the range, or
+    /// none.
+    pub(super) fn find_text(
         &self,
-        text: &BSTR,
+        text: BSTR,
         backward: BOOL,
         ignore_case: BOOL,
-    ) -> Result<ITextRangeProvider> {
-        let needle = text.to_string();
+    ) -> Result<Option<Com>> {
+        // SAFETY: the caller's BSTR, live for the call.
+        let needle = unsafe { bstr_text(text) };
         if needle.is_empty() {
-            return Err(E_INVALIDARG.into());
+            return Err(E_INVALIDARG);
         }
         self.read(|_, doc, _, bounds| {
             let source = doc.slice(bounds[0], bounds[1]);
-            let (haystack, needle, map) = if ignore_case.as_bool() {
+            let (haystack, needle, map) = if ignore_case != 0 {
                 let mut folded = String::new();
                 let mut map = Vec::new();
                 let mut offset = bounds[0];
@@ -281,15 +308,17 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
                 }
                 (source, needle.clone(), map)
             };
-            let byte = if backward.as_bool() {
+            let found = if backward != 0 {
                 haystack.rfind(&needle)
             } else {
                 haystack.find(&needle)
-            }
-            .ok_or_else(Error::empty)?;
+            };
+            let Some(byte) = found else {
+                return Ok(None);
+            };
             let start = map[byte].0;
             let end = map[byte + needle.len() - 1].1;
-            Ok(TextRange::new(
+            Ok(Some(TextRange::spanning(
                 self.key.clone(),
                 doc.floor(start),
                 doc.characters
@@ -297,24 +326,37 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
                     .copied()
                     .find(|&p| p >= end)
                     .unwrap_or(doc.len()),
-            ))
+            )))
         })
     }
-    fn GetAttributeValue(&self, id: UIA_TEXTATTRIBUTE_ID) -> Result<VARIANT> {
+
+    /// The attribute's value; `None` only when UI Automation answered its
+    /// not-supported request with nothing, which leaves the caller's VARIANT
+    /// unwritten, as before.
+    pub(super) fn get_attribute_value(&self, id: UIA_TEXTATTRIBUTE_ID) -> Result<Option<Variant>> {
         self.read(|node, _, _, _| match id {
-            UIA_IsReadOnlyAttributeId => {
-                Ok((!node.data().supports_action(Action::ReplaceSelectedText)
-                    && !node.data().supports_action(Action::SetValue))
-                .into())
+            UIA_IsReadOnlyAttributeId => Ok(Some(Variant::bool(
+                !node.data().supports_action(Action::ReplaceSelectedText)
+                    && !node.data().supports_action(Action::SetValue),
+            ))),
+            UIA_IsHiddenAttributeId => Ok(Some(Variant::bool(node.is_offscreen()))),
+            _ => {
+                let mut out = std::ptr::null_mut();
+                // SAFETY: `out` receives UI Automation's owned sentinel.
+                let hr = unsafe { UiaGetReservedNotSupportedValue(&mut out) };
+                if hr < 0 {
+                    return Err(hr);
+                }
+                // SAFETY: a successful call hands over the reference `out` holds.
+                Ok(unsafe { Com::from_raw(out) }.map(Variant::unknown))
             }
-            UIA_IsHiddenAttributeId => Ok(node.is_offscreen().into()),
-            _ => unsafe { Ok(UiaGetReservedNotSupportedValue()?.into()) },
         })
     }
-    fn GetBoundingRectangles(&self) -> Result<*mut SAFEARRAY> {
+
+    pub(super) fn get_bounding_rectangles(&self) -> Result<*mut SAFEARRAY> {
         let boxes = self.read(|node, _, state, bounds| {
             let range = crate::platform::text_range(node, bounds[0], bounds[1] - bounds[0])
-                .ok_or_else(unsupported)?;
+                .ok_or(NOT_SUPPORTED)?;
             Ok(range
                 .bounding_boxes()
                 .into_iter()
@@ -326,12 +368,14 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
         })?;
         array_f64(&boxes)
     }
-    fn GetEnclosingElement(&self) -> Result<IRawElementProviderSimple> {
+
+    pub(super) fn get_enclosing_element(&self) -> Result<Com> {
         self.key.provider()
     }
-    fn GetText(&self, max: i32) -> Result<BSTR> {
+
+    pub(super) fn get_text(&self, max: i32) -> Result<Bstr> {
         if max < -1 {
-            return Err(E_INVALIDARG.into());
+            return Err(E_INVALIDARG);
         }
         self.read(|_, doc, _, bounds| {
             let end = if max == -1 {
@@ -339,10 +383,11 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
             } else {
                 doc.floor(bounds[1].min(bounds[0].saturating_add(max as usize)))
             };
-            Ok(BSTR::from(doc.slice(bounds[0], end)))
+            Bstr::new(&doc.slice(bounds[0], end))
         })
     }
-    fn Move(&self, by: TextUnit, count: i32) -> Result<i32> {
+
+    pub(super) fn move_by(&self, by: TextUnit, count: i32) -> Result<i32> {
         let by = unit(by)?;
         self.read(|_, doc, _, bounds| {
             if count == 0 {
@@ -363,7 +408,8 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
             Ok(moved)
         })
     }
-    fn MoveEndpointByUnit(
+
+    pub(super) fn move_endpoint_by_unit(
         &self,
         end: TextPatternRangeEndpoint,
         by: TextUnit,
@@ -380,16 +426,17 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
             Ok(moved)
         })
     }
-    fn MoveEndpointByRange(
+
+    pub(super) fn move_endpoint_by_range(
         &self,
         end: TextPatternRangeEndpoint,
-        other: Ref<ITextRangeProvider>,
+        other: Raw,
         other_end: TextPatternRangeEndpoint,
     ) -> Result<()> {
         let end = endpoint(end)?;
         let other_end = endpoint(other_end)?;
-        let other = self.other(other.as_ref().ok_or_else(|| Error::from(E_INVALIDARG))?)?;
-        let at = other.bounds.lock_or_recover()[other_end];
+        let other = self.other(other)?;
+        let at = other.range().bounds.lock_or_recover()[other_end];
         self.read(|_, doc, _, bounds| {
             let at = doc.floor(at);
             bounds[end] = at;
@@ -399,26 +446,23 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
             Ok(())
         })
     }
-    fn Select(&self) -> Result<()> {
+
+    pub(super) fn select(&self) -> Result<()> {
         let selection = self.read(|node, _, _, bounds| {
             crate::platform::text_selection(node, bounds[0], bounds[1] - bounds[0])
-                .ok_or_else(unsupported)
+                .ok_or(NOT_SUPPORTED)
         })?;
         self.key.dispatch(
             Action::SetTextSelection,
             Some(ActionData::SetTextSelection(selection)),
         )
     }
-    fn AddToSelection(&self) -> Result<()> {
-        Err(unsupported())
-    }
-    fn RemoveFromSelection(&self) -> Result<()> {
-        Err(unsupported())
-    }
-    fn ScrollIntoView(&self, _top: BOOL) -> Result<()> {
+
+    pub(super) fn scroll_into_view(&self) -> Result<()> {
         self.key.dispatch(Action::ScrollIntoView, None)
     }
-    fn GetChildren(&self) -> Result<*mut SAFEARRAY> {
+
+    pub(super) fn get_children(&self) -> Result<*mut SAFEARRAY> {
         self.read(|_, _, _, _| array_com(&[]))
     }
 }

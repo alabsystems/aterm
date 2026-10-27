@@ -478,11 +478,6 @@ fn root_of(path: &Path, given: &Path, home: &Path) -> Result<(&'static Root, Pat
     ))
 }
 
-/// Free each of `paths` (§8.4): every fence read ([`judge`]), aterm's grant on, a `removing` row
-/// written through `journal` (which says whether it wrote) before the removal starts, its identity
-/// unchanged since it was judged, and a `removed` or `failed` row after it. A refused path gets a
-/// `refused` row, written as it can be.
-/// Under `dry_run` nothing is removed or journalled, whatever the grant.
 /// The most entries [`survey`] lists.
 pub const SURVEY_MAX: usize = 24;
 
@@ -520,6 +515,11 @@ pub fn survey(world: &World<'_>) -> Vec<Outcome> {
     admitted
 }
 
+/// Free each of `paths` (§8.4): every fence read ([`judge`]), aterm's grant on, a `removing` row
+/// written through `journal` (which says whether it wrote) before the removal starts, its identity
+/// unchanged since it was judged, and a `removed` or `failed` row after it. A refused path gets a
+/// `refused` row, written as it can be.
+/// Under `dry_run` nothing is removed or journalled, whatever the grant.
 pub fn run(
     paths: &[PathBuf],
     dry_run: bool,

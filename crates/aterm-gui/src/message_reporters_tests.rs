@@ -897,6 +897,14 @@ fn every_reporter_message() -> Vec<Message> {
     all.push(gpu_lost());
     all.push(program_check_stuck(95, Some(90)));
     all.push(program_check_stuck(512, None));
+    for admin in [Some(true), Some(false)] {
+        all.push(service_memory_alert(
+            &fseventsd_over(141 << 30),
+            &aterm_vitals::services::FSEVENTSD,
+            128 << 30,
+            admin,
+        ));
+    }
     {
         let episode = aterm_vitals::jobs::HeldEpisode {
             opened_ms: 60_000,
@@ -3178,6 +3186,166 @@ fn the_program_check_alert_leads_with_the_restart() {
         other.detail[3]
     );
     assert!(!other.detail[3].contains("95"));
+}
+
+/// fseventsd told past its bar, as the watch tells it.
+fn fseventsd_over(footprint: u64) -> aterm_vitals::services::Seen {
+    use aterm_vitals::services::{FSEVENTSD, Seen, Service, size};
+    Seen {
+        service: Service {
+            coalition: 7,
+            pid: 537,
+            start_s: 1_790_000_000,
+            uid: 0,
+            name: "fseventsd".into(),
+            path: Some(FSEVENTSD.path.into()),
+            live: 1,
+            footprint,
+            ..Service::default()
+        },
+        size: size(footprint, 128 << 30),
+        since_ms: Some(0),
+        held: true,
+        restart: Some(&FSEVENTSD),
+    }
+}
+
+/// The alert for a service aterm restarts leads with its press, which opens the restart's tab,
+/// and says what the restart costs; its key names the process, one episode. The entry carries
+/// the same press, a service aterm cannot restart gets the Mac's restart in words, and so does
+/// an account that is not an administrator, with no press at all.
+#[test]
+fn the_service_memory_alert_and_entry_lead_with_the_restart() {
+    let over = fseventsd_over(141 << 30);
+    let msg = super::service_memory_alert(
+        &over,
+        &aterm_vitals::services::FSEVENTSD,
+        128 << 30,
+        Some(true),
+    );
+    assert_eq!(
+        msg.key.as_deref(),
+        Some("system.service-memory.537-1790000000")
+    );
+    assert_eq!(msg.title, "fseventsd holds 141.0 GiB");
+    assert_eq!(msg.detail[0], "Restart fseventsd");
+    assert_eq!(
+        super::attention(&msg),
+        Ok(super::Attention::Decision),
+        "{msg:?}"
+    );
+    let aterm_messages::need::Need::Now(ask) = msg.need() else {
+        panic!("the service-memory alert is a Now");
+    };
+    assert!(ask.is_standing());
+    let press = Intent::RestartService {
+        service: "fseventsd".into(),
+    };
+    assert_eq!(ask.then().mover().map(|m| m.intent()), Some(&press));
+    assert!(msg.actions.contains(&press), "{msg:?}");
+    for words in [
+        "asks for your password once",
+        "Time Machine and Spotlight",
+        "half a minute",
+    ] {
+        assert!(
+            msg.detail.iter().any(|l| l.contains(words)),
+            "{words}: {:?}",
+            msg.detail
+        );
+    }
+
+    let entry = super::service_memory_entry(&over, 128 << 30, Some(true));
+    assert_eq!(
+        entry.key(),
+        "vitals.service-memory.fseventsd.537-1790000000"
+    );
+    assert_eq!(
+        entry.key(),
+        super::service_memory_entry_key("fseventsd", "537-1790000000")
+    );
+    assert_eq!(entry.mover().map(|m| m.intent()), Some(&press));
+    let (title, why, then, lines) = entry_words(&entry);
+    assert_eq!(title, "fseventsd holds 141.0 GiB");
+    assert!(why.contains("only when restarted as root"), "{why}");
+    assert_eq!(then, "Restart fseventsd");
+    assert!(
+        lines[0].contains("past the 8.0 GiB any service needs"),
+        "{lines:?}"
+    );
+
+    let not_admin = super::service_memory_alert(
+        &over,
+        &aterm_vitals::services::FSEVENTSD,
+        128 << 30,
+        Some(false),
+    );
+    assert!(not_admin.actions.is_empty(), "{not_admin:?}");
+    assert_eq!(
+        not_admin.detail[0],
+        "Restart the Mac once your work is saved"
+    );
+    let entry = super::service_memory_entry(&over, 128 << 30, Some(false));
+    assert!(entry.mover().is_none());
+    assert_eq!(
+        entry_words(&entry).2,
+        "Restart the Mac once your work is saved"
+    );
+
+    let mut stranger = fseventsd_over(20 << 30);
+    stranger.service.name = "mds".into();
+    stranger.restart = None;
+    let entry = super::service_memory_entry(&stranger, 128 << 30, Some(true));
+    assert!(entry.mover().is_none());
+    let (title, _, then, _) = entry_words(&entry);
+    assert_eq!(title, "mds holds 20.0 GiB");
+    assert_eq!(then, "Restart the Mac once your work is saved");
+}
+
+/// A pass keeps open the entry of a service still followed but not told: aterm relaunched
+/// mid-episode (the hold not met again yet), or within the margin under the bar, or unread.
+/// NEGATIVE CONTROL: a service the pass no longer follows, or a new process in its place, keeps
+/// nothing of the old episode, which then ends.
+#[test]
+fn a_pass_keeps_the_entry_of_a_service_followed_but_not_yet_told() {
+    use aterm_vitals::services::{Member, Told};
+    let entry =
+        |pid: u32| super::service_memory_entry_key("fseventsd", &format!("{pid}-1790000000"));
+    let told = |services, unread| Told {
+        total: 128 << 30,
+        services,
+        unread,
+        pressed: false,
+        at_ms: 0,
+    };
+    let mut relaunched = fseventsd_over(141 << 30);
+    relaunched.held = false;
+    assert_eq!(
+        super::service_memory_kept(&told(vec![relaunched.clone()], vec![])),
+        [entry(537)]
+    );
+    assert!(
+        super::service_memory_kept(&told(vec![fseventsd_over(141 << 30)], vec![])).is_empty(),
+        "told: posted, not merely kept"
+    );
+    let unread = Member {
+        pid: 537,
+        uid: 0,
+        name: "fseventsd".into(),
+        start_s: 1_790_000_000,
+        start_us: 0,
+        coalition: 7,
+    };
+    assert_eq!(
+        super::service_memory_kept(&told(vec![], vec![unread])),
+        [entry(537)]
+    );
+    assert!(super::service_memory_kept(&told(vec![], vec![])).is_empty());
+    relaunched.service.pid = 90_001;
+    assert_eq!(
+        super::service_memory_kept(&told(vec![relaunched], vec![])),
+        [entry(90_001)]
+    );
 }
 
 #[test]

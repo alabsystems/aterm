@@ -5,7 +5,9 @@
 
 use aterm_aos::checkpoint::{Checkpoint, Provenance};
 use aterm_aos::effects::NoEffects;
-use aterm_aos::replay::{Divergence, chain_link, empty_chain, first_divergence, replay};
+use aterm_aos::replay::{
+    CURSOR_EXHAUSTED, Divergence, chain_link, empty_chain, first_divergence, replay, replay_fold,
+};
 use aterm_aos::task::Schema;
 use aterm_aos::wire::Enc;
 use aterm_aos::{BranchId, Revision};
@@ -218,5 +220,60 @@ fn first_divergence_names_end_states_that_differ_under_equal_observations() {
             a: a.state_digest,
             b: b.state_digest
         })
+    );
+}
+
+#[test]
+fn replay_fold_matches_replay_on_normal_refused_and_exhausted_runs() {
+    let schema = ToySchema::new();
+    for (variant, first, stream) in [
+        (Variant::Good, 0u64, inputs()),
+        (Variant::Picky, 10u64, adds(&[1, 13, 2])),
+        (Variant::Good, u64::MAX, adds(&[4, 5])),
+    ] {
+        let full = replay(
+            &schema,
+            &code(variant),
+            ToyState::default(),
+            &stream,
+            first,
+            &mut NoEffects,
+        );
+        let mut seen = Vec::new();
+        let folded = replay_fold(
+            &schema,
+            &code(variant),
+            ToyState::default(),
+            &stream,
+            first,
+            &mut NoEffects,
+            |idx, cursor, input, obs| {
+                assert_eq!(input, &stream[idx]);
+                seen.push((cursor, obs));
+            },
+        );
+        assert_eq!(seen, full.observations);
+        let from_run = full.into_folded();
+        assert_eq!(folded.state, from_run.state);
+        assert_eq!(folded.state_digest, from_run.state_digest);
+        assert_eq!(folded.observations, from_run.observations);
+        assert_eq!(folded.last_cursor, from_run.last_cursor);
+        assert_eq!(folded.observation_chain, from_run.observation_chain);
+        assert_eq!(folded.refused, from_run.refused);
+    }
+    let exhausted = replay_fold(
+        &schema,
+        &code(Variant::Good),
+        ToyState::default(),
+        &adds(&[4, 5]),
+        u64::MAX,
+        &mut NoEffects,
+        |_, _, _, _| {},
+    );
+    assert_eq!(exhausted.observations, 1);
+    assert_eq!(exhausted.last_cursor, Some(u64::MAX));
+    assert_eq!(
+        exhausted.refused.map(|(c, r)| (c, r.law)),
+        Some((u64::MAX, CURSOR_EXHAUSTED))
     );
 }

@@ -2,8 +2,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0 AND (MIT OR Apache-2.0)
 //
-// `IUnknown_Vtbl` is derived from windows-core 0.62.2 src/unknown.rs
-// (MIT OR Apache-2.0, see ../LICENSE-MIT and ../LICENSE-APACHE); the rest of the file is aterm's.
+// `IUnknown_Vtbl` is derived from windows-core 0.62.2 src/unknown.rs, `IInspectable_Vtbl` from its
+// src/inspectable.rs, and the interface IDs from those files, its src/imp/com_bindings.rs and
+// src/imp/marshaler.rs (MIT OR Apache-2.0, see ../LICENSE-MIT and ../LICENSE-APACHE); the rest of
+// the file is aterm's.
 
 //! COM's vocabulary.
 
@@ -28,6 +30,42 @@ pub struct IUnknown_Vtbl {
     ) -> HRESULT,
     pub AddRef: unsafe extern "system" fn(this: *mut c_void) -> u32,
     pub Release: unsafe extern "system" fn(this: *mut c_void) -> u32,
+}
+
+pub const IID_IUnknown: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
+pub const IID_IInspectable: GUID = GUID::from_u128(0xaf86e2e0_b12d_4c6a_9c5a_d7aa65101e90);
+/// `IAgileObject`: the object may be called from any apartment.
+pub const IID_IAgileObject: GUID = GUID::from_u128(0x94ea2b94_e9cc_49e0_c0ff_ee64ca8f5b90);
+/// `IMarshal`, which a free-threaded object answers through the free-threaded marshaler.
+pub const IID_IMarshal: GUID = GUID::from_u128(0x00000003_0000_0000_c000_000000000046);
+
+/// `IInspectable`'s vtable, the identity a WinRT-shaped object begins with.
+#[repr(C)]
+pub struct IInspectable_Vtbl {
+    pub base: IUnknown_Vtbl,
+    pub GetIids: unsafe extern "system" fn(
+        this: *mut c_void,
+        count: *mut u32,
+        values: *mut *mut GUID,
+    ) -> HRESULT,
+    pub GetRuntimeClassName:
+        unsafe extern "system" fn(this: *mut c_void, value: *mut *mut c_void) -> HRESULT,
+    pub GetTrustLevel: unsafe extern "system" fn(this: *mut c_void, value: *mut i32) -> HRESULT,
+}
+
+/// Whether `a` and `b` are one interface ID.
+#[inline]
+#[must_use]
+pub const fn same_iid(a: &GUID, b: &GUID) -> bool {
+    let (x, y) = (a.data4, b.data4);
+    let mut i = 0;
+    while i < 8 {
+        if x[i] != y[i] {
+            return false;
+        }
+        i += 1;
+    }
+    a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3
 }
 
 /// One owned reference to a COM object, through an interface pointer of any interface.

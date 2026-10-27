@@ -1,0 +1,19 @@
+# claude-code 2.1.308 · MEASURED 2026-10-26, `aterm ctl text` of a live window tab (117 columns) whose main thread Opus 5.5's safeguards paused while a background workflow it had started ran on: the dialog (title at column one under the full-width rule, body and options at the column its paddingX puts them, NO footer) and the API-retry status row Claude Code left standing under it, its countdown frozen, are verbatim; the transcript rows above the rule are replaced by a neutral tool call · the model-refusal pause over a stale retry row, footerless
+⏺ Bash(df -h /System/Volumes/Data | tail -1)
+  ⎿  /dev/disk3s5   926Gi   872Gi    28Gi    97%    3.4M  289M    1%   /System/Volumes/Data
+  ⎿  (timeout 5m)
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Session paused
+
+  Opus 5.5's safeguards flagged this session. You may be seeing this for the first time: Opus 5.5 is more capable
+  and has stronger safeguards as a result, which can sometimes flag non-cybersecurity work. We're improving these
+  safeguards to reduce the amount of incorrectly flagged messages. Edit and retry, or continue with Opus 4.8. Send
+  feedback with /feedback or learn more: https://support.claude.com/en/articles/8106465
+
+  Details: `[cyber]`
+
+  ❯ 1. Switch to Opus 4.8
+    2. Edit prompt and retry with Opus 5.5
+
+✻ Waiting for API response · will retry in 2m 40s · check your network

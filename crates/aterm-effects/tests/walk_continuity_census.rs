@@ -3,6 +3,7 @@
 
 //! Walk continuity census.
 
+use crate::common::Ground;
 use crate::walk_census::*;
 use aterm_effects::cursor_glow::InsertWidth;
 
@@ -384,11 +385,27 @@ fn census() {
     for cap in &CAPTURES {
         jobs.push((cap.name.to_string(), Run::Capture(cap)));
     }
-    let read = crate::common::par_map(&jobs, |(_, run)| {
-        let snaps = match run {
+    // Each scenario and capture on its own dark ground, then on each light one.
+    let mut grounds = vec![None];
+    grounds.extend(crate::trail_host::light_grounds().into_iter().map(Some));
+    let jobs: Vec<(String, &Run, Option<Ground>)> = jobs
+        .iter()
+        .flat_map(|(label, run)| {
+            grounds.iter().map(move |&g| match g {
+                None => (label.clone(), run, g),
+                Some(on) => (format!("{label} on {}", on.name), run, g),
+            })
+        })
+        .collect();
+    let read = crate::common::par_map(&jobs, |&(_, run, ground)| {
+        let take = || match run {
             Run::Scenario(build, None) => build().snaps,
             Run::Scenario(build, Some(fold)) => with_default_fold(*fold, build).snaps,
             Run::Capture(cap) => replay(cap),
+        };
+        let snaps = match ground {
+            None => take(),
+            Some(g) => crate::common::on_ground(g, take),
         };
         let lit_frames = snaps
             .iter()
@@ -397,7 +414,7 @@ fn census() {
         (lit_frames, standing(&snaps), recolours(&snaps))
     });
     let mut dirty = Vec::new();
-    for ((label, _), (lit_frames, standing, recoloured)) in jobs.iter().zip(read) {
+    for ((label, _, _), (lit_frames, standing, recoloured)) in jobs.iter().zip(read) {
         assert!(lit_frames > 10, "{label}: the census read a lit band");
         if !standing.is_empty() || !recoloured.is_empty() {
             dirty.push(format!(

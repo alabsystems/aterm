@@ -90,7 +90,7 @@ define_terminal_handler! {
 
     title: super::TitleState => title,
     bell_callback: Option<Box<dyn FnMut() + Send>> => bell_callback,
-    kitty_file_resolver: Option<Box<dyn Fn(crate::terminal::kitty_graphics::KittyMedium, &str) -> Option<Vec<u8>> + Send>> => kitty_file_resolver,
+    kitty_file_resolver: super::kitty_auth::KittyResolverSlot => kitty_file_resolver,
     last_bell_time: Option<aterm_time::Instant> => last_bell_time,
     bell_total: u64 => bell_total,
     notify_total: u64 => notify_total,
@@ -233,6 +233,21 @@ impl TerminalHandler<'_> {
             return;
         }
         self.transient.response_buffer.extend_from_slice(response);
+    }
+
+    /// Queue a report the program's own output provoked (DEC 2048's enable, or the size report it
+    /// held for the alternate screen) with the reports sent unasked (`take_reports`), once it
+    /// passes the gates every program reply passes ([`program_response_admitted`]).
+    pub(super) fn send_report(
+        &mut self,
+        _cap: &super::response_capability::ResponseCapability,
+        report: &[u8],
+    ) {
+        if self.can_append_response_bytes(report.len())
+            && program_response_admitted(self.policy, self.transient, report.len())
+        {
+            let _ = self.transient.push_report(report);
+        }
     }
 
     /// Returns whether appending `additional_len` would stay within the response buffer cap.

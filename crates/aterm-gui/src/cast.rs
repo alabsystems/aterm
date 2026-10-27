@@ -873,7 +873,7 @@ impl CastSnapshot {
 
 /// Number of trailing bytes of `bytes` that form an incomplete but so-far valid UTF-8
 /// lead the next read could complete.
-fn incomplete_tail_len(bytes: &[u8]) -> usize {
+pub(crate) fn incomplete_tail_len(bytes: &[u8]) -> usize {
     let n = bytes.len();
     let max_back = 3.min(n);
     for back in 1..=max_back {
@@ -1600,8 +1600,9 @@ mod tests {
     }
 
     /// The asciicast text as the recorder serialized it under its own lock, before
-    /// `cast` moved serialization onto the snapshot: the reference the off-lock
-    /// writer must match byte for byte.
+    /// `cast` moved serialization onto the snapshot, with each output scrubbed as a
+    /// shared cast is (`cast_scrub`): the reference the off-lock writer must match
+    /// byte for byte.
     fn locked_reference(rec: &CastRecorder) -> String {
         fn fmt_t(t: Duration) -> String {
             format!("{:.6}", t.as_secs_f64())
@@ -1662,14 +1663,21 @@ mod tests {
             ));
         }
         out.push_str("}\n");
+        let mut scrub = crate::cast_scrub::CastScrub::starting(!truncated && rec.handoff.is_none());
+        let mut last_t = Duration::ZERO;
         for ev in rec.events.iter() {
             match ev {
                 Event::Output { t, data, .. } => {
-                    out.push_str(&format!(
-                        "[{}, \"o\", \"{}\"]\n",
-                        fmt_t(t.saturating_sub(rebase)),
-                        json_escape_bytes(data)
-                    ));
+                    let mut kept = Vec::new();
+                    scrub.feed(data, &mut kept);
+                    last_t = t.saturating_sub(rebase);
+                    if !kept.is_empty() {
+                        out.push_str(&format!(
+                            "[{}, \"o\", \"{}\"]\n",
+                            fmt_t(last_t),
+                            json_escape_bytes(&kept)
+                        ));
+                    }
                 }
                 Event::Resize { t, cols, rows, .. } => {
                     out.push_str(&format!(
@@ -1678,6 +1686,15 @@ mod tests {
                     ));
                 }
             }
+        }
+        let mut rest = Vec::new();
+        scrub.finish(&mut rest);
+        if !rest.is_empty() {
+            out.push_str(&format!(
+                "[{}, \"o\", \"{}\"]\n",
+                fmt_t(last_t),
+                json_escape_bytes(&rest)
+            ));
         }
         out
     }

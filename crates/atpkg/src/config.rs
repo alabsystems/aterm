@@ -37,6 +37,10 @@ pub struct PackagesConfig {
     pub include: Option<aterm_toml::Value>,
     /// Narrowing-only exclude filter: the per-program opt-out.
     pub exclude: Option<Vec<String>>,
+    /// `[packages].peers`: LAN peers (`host` or `host:port`) a toolset archive download races,
+    /// each unit taken from a peer only when its bytes hash to the signed digest
+    /// ([`crate::peers`]).
+    pub peers: Vec<String>,
     /// `[packages.links]`: `name = "/path/to/checkout"` (or `~/…`) declares a managed dev link ([`crate::linkmode`]: registry management skipped; never in Settings); `name = "owner/repo"` declares a private-repo fetch override for that program's release assets (verification unchanged), a development setting ([`DEV_SEAMS`]).
     pub links: BTreeMap<String, String>,
     /// Not a config key (`#[serde(skip)]`, so no `aterm.toml` can set it): true only of the table [`parse_packages`] could not read ([`PackagesConfig::unreadable_table`]).

@@ -88,7 +88,22 @@ impl Default for DropletFrame {
 
 /// The band of water-ramp positions whose colour keeps
 /// [`CARET_PAGE_MIN_CONTRAST`] against `ground`, as `(lo, hi)`.
+#[inline]
 fn ramp_band_on(ground: u32) -> (f32, f32) {
+    const REF_DARK_BAND: (f32, f32) = ramp_band_solve(crate::cursor_glow::REF_DARK_PAGE, true);
+    const REF_WHITE_BAND: (f32, f32) = ramp_band_solve(0x00FF_FFFF, false);
+    let ground = ground & 0x00FF_FFFF;
+    if ground == crate::cursor_glow::REF_DARK_PAGE {
+        REF_DARK_BAND
+    } else if ground == 0x00FF_FFFF {
+        REF_WHITE_BAND
+    } else {
+        ramp_band_solve(ground, aterm_render::theme_is_dark(ground))
+    }
+}
+
+#[inline]
+const fn ramp_band_solve(ground: u32, dark: bool) -> (f32, f32) {
     let table = crate::color_math::relative_luminance_table();
     let lum_g = crate::color_math::relative_luminance_with(table, ground);
     let lum_g_plus = lum_g + 0.05;
@@ -107,7 +122,6 @@ fn ramp_band_on(ground: u32) -> (f32, f32) {
         };
         hi_plus / lo_plus >= CARET_PAGE_MIN_CONTRAST
     }
-    let dark = aterm_render::theme_is_dark(ground);
     let far = if dark { 1.0 } else { 0.0 };
     let far_rgb = water_ramp(far);
     if !meets_rgb(table, lum_g, lum_g_plus, far_rgb) {
@@ -204,6 +218,7 @@ impl CursorDroplet {
     }
 
     /// Advances one frame at `now` and appends additive droplet quads to `out`.
+    #[inline]
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -289,6 +304,7 @@ impl CursorDroplet {
         clippy::too_many_arguments,
         reason = "cursor cell + surge/shimmer/phase + geometry/config; one internal call site"
     )]
+    #[inline]
     fn emit_bead(
         &self,
         cr: u16,
@@ -335,13 +351,17 @@ impl CursorDroplet {
             (0.40, 1.00, 0.86 + 0.14 * e),
         ];
         let e_shear = 0.30 + 0.70 * e;
-        for (k, &(rx, cov_x, ramp_t)) in discs.iter().enumerate() {
+        let mut k = 0;
+        while k < discs.len() {
+            let (rx, cov_x, ramp_t) = discs[k];
+            let cur_k = k;
+            k += 1;
             let r = radius * rx;
             if r < 1.0 {
                 continue;
             }
             let cov = (cov_core * cov_x * DISC_SOFT_GAIN).min(COV_CAP);
-            let (sin_dk, cos_dk) = DISC_PHASE_SIN_COS[k];
+            let (sin_dk, cos_dk) = DISC_PHASE_SIN_COS[cur_k];
             let s = phase_sin * cos_dk + phase_cos * sin_dk;
             let shear = s * r * 0.10 * e_shear;
             push_soft_disc(
@@ -383,7 +403,11 @@ impl CursorDroplet {
         if e > 0.0 {
             let ring_rgb = water_ramp(0.74 + 0.10 * e);
             let y0 = cy + radius * 0.88;
-            for half in [0.0f32, 0.5] {
+            let halves = [0.0f32, 0.5];
+            let mut hi = 0;
+            while hi < halves.len() {
+                let half = halves[hi];
+                hi += 1;
                 let u = (self.ripple + half).fract();
                 let one_minus_u = 1.0 - u;
                 let env = one_minus_u * crate::color_math::sqrt_f32(one_minus_u) * e;
@@ -409,7 +433,11 @@ impl CursorDroplet {
         let cov_drip = cov_core * 0.70;
         let r_grow = radius * 0.08;
         let r_fall = 1.2 + radius * 0.05;
-        for (lane_idx, &(dx, off, wake)) in DRIP_LANES.iter().enumerate() {
+        let mut lane_idx = 0;
+        while lane_idx < DRIP_LANES.len() {
+            let (dx, off, wake) = DRIP_LANES[lane_idx];
+            let cur_lane = lane_idx;
+            lane_idx += 1;
             if e < wake && wake > 0.0 {
                 continue;
             }
@@ -430,7 +458,7 @@ impl CursorDroplet {
             if cut_surface && (y - ry).floor() as i32 >= foot {
                 continue;
             }
-            let (sin_do, cos_do) = DRIP_PHASE_SIN_COS[lane_idx];
+            let (sin_do, cos_do) = DRIP_PHASE_SIN_COS[cur_lane];
             let x = cx + dx * cw + (phase_sin * cos_do + phase_cos * sin_do) * 1.5;
             push_soft_disc(out, geom, (x, y), (r, ry), body, cov.min(COV_CAP));
         }
@@ -443,10 +471,14 @@ impl CursorDroplet {
 
 /// Cut the quads `out[from..]` at window row `foot`: a quad wholly at or below
 /// it is dropped, one that crosses it ends there.
+#[inline]
 fn cut_at_surface(out: &mut Vec<GlowQuad>, from: usize, foot: i32) {
     let mut keep = from;
-    for i in from..out.len() {
+    let mut i = from;
+    while i < out.len() {
         let mut q = out[i];
+        let cur_i = i;
+        i += 1;
         let (y, h) = (i32::from(q.y), i32::from(q.h));
         if y >= foot || h == 0 {
             continue;
@@ -454,7 +486,7 @@ fn cut_at_surface(out: &mut Vec<GlowQuad>, from: usize, foot: i32) {
         if y + h > foot {
             q.h = (foot - y) as u16;
         }
-        if keep != i || q.h != out[i].h {
+        if keep != cur_i || q.h != out[cur_i].h {
             out[keep] = q;
         }
         keep += 1;

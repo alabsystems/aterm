@@ -26,6 +26,7 @@ const ENGINE_CRATES: &[&str] = &[
     "crates/aterm-slog/",
     "crates/aterm-restore/",
     "crates/aterm-aos/",
+    "crates/aterm-aos-pane/",
     "crates/amacs/",
 ];
 

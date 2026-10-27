@@ -8,7 +8,9 @@ use std::path::Path;
 use aterm_agent::harness::footer::{FactKind, FactMask, FooterFacts};
 use aterm_agent::harness::session_usage::{ModelTokens, UsageFacts};
 
-use super::{fact_spoken_of, fact_title, mask_after, runtime_spoken, tokens_spoken};
+use super::{
+    default_mask_for, fact_spoken_of, fact_title, mask_after, runtime_spoken, tokens_spoken,
+};
 use crate::claude_lights::Fact;
 
 fn facts() -> FooterFacts {
@@ -34,6 +36,33 @@ fn mask(kinds: &[FactKind]) -> FactMask {
     kinds
         .iter()
         .fold(FactMask::default(), |m, k| m.with(*k, true))
+}
+
+/// A MUSE SESSION STARTS WITHOUT THE FACTS ITS OWN STATUS LINE PRINTS (model, effort,
+/// folder), and with everything aterm alone knows still shown; every other program
+/// starts with nothing hidden.
+#[test]
+fn a_muse_session_starts_without_repeating_its_own_status_line() {
+    use aterm_phase::Program;
+    assert_eq!(
+        default_mask_for(Some(Program::Muse)),
+        mask(&[FactKind::Model, FactKind::Effort, FactKind::Path])
+    );
+    for other in [
+        None,
+        Some(Program::Claude),
+        Some(Program::Codex),
+        Some(Program::Grok),
+        Some(Program::Kimi),
+        Some(Program::Agy),
+        Some(Program::Generic),
+    ] {
+        assert_eq!(default_mask_for(other), FactMask::default(), "{other:?}");
+    }
+    let muse = default_mask_for(Some(Program::Muse));
+    for shown in [FactKind::Branch, FactKind::Context] {
+        assert!(!muse.has(shown), "{shown:?} stays shown");
+    }
 }
 
 #[test]

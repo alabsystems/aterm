@@ -124,11 +124,7 @@ impl<'a> Repos<'a> {
                 format!("as {profile}: a fine-grained token's drafts are unproven (design §6.4)"),
             )
             .with_sub(Sub::Forbid(Forbid::DraftsUnproven))
-            .with_next(format!(
-                "a person runs: agh auth add {profile} --file PATH --tier {} --owner {} --write --drafts",
-                tier.slug(),
-                slug.owner()
-            ))
+            .with_next(drafts_next(self.gh.router(), &profile, tier, slug))
             .with_repo(slug.to_string()));
         }
         let repo = self.read(slug, &how)?;
@@ -218,4 +214,45 @@ impl<'a> Repos<'a> {
         let login = self.gh.router().profile(&profile)?.login.clone()?;
         login.eq_ignore_ascii_case(owner).then_some(profile)
     }
+}
+
+/// The step for `profile`'s unvouched drafts. A profile that names one of the vault's token
+/// files is an agh.toml written before vault adoption: each rotation of that file changes the
+/// fingerprint its `drafts_fp` vouched, so the step removes every such profile, after which
+/// agh.toml says `vault = true` and adoption vouches each token it adopts (design §6.10). Any
+/// other is vouched again with `agh auth add --drafts`.
+fn drafts_next(
+    router: &crate::policy::Router,
+    profile: &str,
+    tier: crate::policy::Tier,
+    slug: &Slug,
+) -> String {
+    use crate::identity::{Source, vault};
+    let names_vault = |p: &crate::identity::Profile| match &p.source {
+        Source::File(path) => vault::names_vault_path(path),
+        Source::Env(_) | Source::Inline(_) => false,
+    };
+    if router.profile(profile).is_some_and(names_vault) {
+        let mut names: Vec<&str> = router
+            .profiles()
+            .into_iter()
+            .filter(|p| names_vault(p))
+            .map(|p| p.name.as_str())
+            .collect();
+        names.sort_unstable();
+        let removes: Vec<String> = names
+            .iter()
+            .map(|name| format!("agh auth remove {name}"))
+            .collect();
+        return format!(
+            "{}: agh.toml then says vault = true, and agh adopts the vault's tokens, vouching \
+             each rotation's",
+            removes.join("; ")
+        );
+    }
+    format!(
+        "agh auth add {profile} --file PATH --tier {} --owner {} --write --drafts",
+        tier.slug(),
+        slug.owner()
+    )
 }

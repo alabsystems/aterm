@@ -12,6 +12,26 @@ fn private_file(path: &std::path::Path, bytes: &[u8]) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+/// [`super::create`] as [`client::create`](crate::client::create) calls it: the vault starts open.
+fn create(
+    paths: &Paths,
+    source: &str,
+    import: Option<&Path>,
+    host: Option<&str>,
+) -> crate::Result<Created> {
+    super::create(paths, source, import, host, Approval::Open)
+}
+
+/// [`super::prepare`] for the open vault [`create`] makes.
+fn prepare(
+    paths: &Paths,
+    source: &str,
+    import: Option<&Path>,
+    host: Option<&str>,
+) -> crate::Result<([u8; 32], Pending)> {
+    super::prepare(paths, source, import, host, Approval::Open)
+}
+
 pub(crate) fn creation_transition(state: &ModelState, action: &str) -> ModelState {
     let root = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(&root.path().join("m1"));
@@ -96,6 +116,26 @@ pub(crate) fn creation_transition(state: &ModelState, action: &str) -> ModelStat
             device_reset = paths.dir.join("commons/device.age").exists();
             9
         }
+        "RefusedFirst" => {
+            // Another publisher holds the path, so this one cannot land.
+            let lock = root.path().join("first.vault.lock");
+            std::fs::write(&lock, b"elsewhere 1\n").unwrap();
+            let error = create(&paths, source_text, Some(&import), Some("m1")).unwrap_err();
+            assert_eq!(error.kind(), crate::ErrorKind::Refused, "{error}");
+            std::fs::remove_file(&lock).unwrap();
+            10
+        }
+        "RefusedAfterSent" => {
+            // An earlier attempt was sent and its outcome never heard (the process ended).
+            let held = claim(&paths).unwrap().unwrap();
+            save_claim(&paths, &held.intent, held.digest, Phase::Sent).unwrap();
+            let lock = root.path().join("first.vault.lock");
+            std::fs::write(&lock, b"elsewhere 1\n").unwrap();
+            let error = create(&paths, source_text, Some(&import), Some("m1")).unwrap_err();
+            assert!(error.to_string().contains("keeps the creation"), "{error}");
+            std::fs::remove_file(&lock).unwrap();
+            11
+        }
         _ => panic!("unknown creation action"),
     };
     let published = source.exists();
@@ -106,7 +146,11 @@ pub(crate) fn creation_transition(state: &ModelState, action: &str) -> ModelStat
     };
     let mut next = state.clone();
     next.insert("scenario", scenario);
-    next.insert("retained", 1);
+    next.insert(
+        "retained",
+        i64::from(scenario < 10 || paths.dir.join("creation-outbox").exists()),
+    );
+    next.insert("retired", i64::from(claim(&paths).unwrap().is_none()));
     next.insert("published", i64::from(published));
     next.insert("exact", i64::from(exact));
     next.insert("refused", i64::from(refused));
@@ -249,6 +293,12 @@ fn unpublished_preparation_resumes_from_its_durable_request() {
     save_claim(&paths, &intent, [0; 32], Phase::Preparing).unwrap();
     resume(&paths).unwrap();
     assert_eq!(load_state(&paths).unwrap().seq, 1);
+    let admin = admin_open(&paths).unwrap();
+    assert!(
+        admin.doc.open(),
+        "a resumed creation makes the open vault create does"
+    );
+    assert!(admin.doc.join_password().is_none());
     assert!(source.exists());
     assert!(
         crate::commons::bootstrap::Bootstrap::required(&paths)
@@ -431,4 +481,277 @@ fn missing_cache_recovers_the_exact_initial_or_a_twice_rotated_remote_version() 
         assert_eq!(load_state(&paths).unwrap().seq, if rotate { 3 } else { 1 });
         assert_eq!(source.exists(), rotate);
     }
+}
+
+/// A vault server that holds nothing at `/v1/first`: every GET is a 404, and each PUT takes the
+/// next of `puts` (a status line and its reason). [`stop`](Self::stop) gives the methods it read.
+struct Unheld {
+    url: String,
+    addr: std::net::SocketAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: std::thread::JoinHandle<Vec<String>>,
+}
+
+impl Unheld {
+    fn start(puts: &[(&'static str, &'static str)]) -> Unheld {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&stop);
+        let mut puts: std::collections::VecDeque<(&str, &str)> = puts.iter().copied().collect();
+        let worker = std::thread::spawn(move || {
+            let mut methods = Vec::new();
+            for stream in listener.incoming() {
+                if seen.load(Ordering::SeqCst) {
+                    return methods;
+                }
+                let mut stream = stream.unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(60)))
+                    .unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0];
+                while !head.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    head.push(byte[0]);
+                    assert!(head.len() < 16 * 1024);
+                }
+                let head = String::from_utf8(head).unwrap();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                let method = head.split(' ').next().unwrap().to_string();
+                let (status, reason) = if method == "PUT" {
+                    puts.pop_front()
+                        .expect("a PUT this server was told to answer")
+                } else {
+                    ("404 Not Found", "")
+                };
+                methods.push(method);
+                if status.is_empty() {
+                    // The body arrived and the connection died before any reply.
+                    continue;
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{reason}",
+                    reason.len()
+                )
+                .unwrap();
+            }
+            methods
+        });
+        Unheld {
+            url: format!("http://{addr}/v1/first"),
+            addr,
+            stop,
+            worker,
+        }
+    }
+
+    fn stop(self) -> Vec<String> {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(std::net::TcpStream::connect(self.addr));
+        self.worker.join().unwrap()
+    }
+}
+
+const NOT_FROM_HERE: (&str, &str) = (
+    "403 Forbidden",
+    "the first version of a vault is accepted only from the server's own Mac",
+);
+
+/// What a free slot shows: no claim or outbox, nothing to resume or recover, joins permitted,
+/// and the machine identity and device it had.
+fn assert_free(paths: &Paths, recipient: &str) {
+    assert!(claim(paths).unwrap().is_none());
+    assert!(!paths.dir.join("creation-outbox").exists());
+    assert!(!pending_remote(paths).unwrap());
+    assert!(!requires_device(paths).unwrap());
+    permit_join(paths).unwrap();
+    assert!(config(paths).unwrap().is_none());
+    assert_eq!(
+        read_identity(paths)
+            .unwrap()
+            .unwrap()
+            .recipient()
+            .to_bech32(),
+        recipient
+    );
+    assert!(
+        crate::commons::bootstrap::Device::open(paths)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn a_first_publication_the_server_refuses_frees_the_slot_for_another_vault() {
+    for refusal in [
+        NOT_FROM_HERE,
+        (
+            "507 Insufficient Storage",
+            "this server holds its limit of 64 vaults",
+        ),
+    ] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(&root.path().join("m1"));
+        let recipient = machine_identity(&paths).unwrap().recipient().to_bech32();
+        let server = Unheld::start(&[refusal]);
+        let error = create(&paths, &server.url, None, Some("m1")).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Refused, "{error}");
+        assert!(error.to_string().contains(refusal.1), "{error}");
+        assert!(error.to_string().contains("gave up creating it"), "{error}");
+        assert_free(&paths, &recipient);
+        // A free slot has nothing to resume: no request reaches the server.
+        resume(&paths).unwrap();
+        assert_eq!(server.stop(), ["GET", "GET", "PUT"]);
+        let other = root.path().join("other.vault");
+        create(&paths, other.to_str().unwrap(), None, Some("m1")).unwrap();
+        assert_eq!(load_state(&paths).unwrap().seq, 1);
+        assert_eq!(config(&paths).unwrap().unwrap().source, Source::Path(other));
+    }
+}
+
+#[test]
+fn a_conflict_keeps_the_intent_and_a_later_refusal_retires_it() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&root.path().join("m1"));
+    let server = Unheld::start(&[
+        (
+            "409 Conflict",
+            "another publish to this vault holds its store",
+        ),
+        NOT_FROM_HERE,
+    ]);
+    // What an earlier build left: a Ready claim, never marked Sent, which this build takes for
+    // unsent (that build's PUT may have got through, and nothing in the claim says).
+    prepare(&paths, &server.url, None, Some("m1")).unwrap();
+    let recipient = read_identity(&paths)
+        .unwrap()
+        .unwrap()
+        .recipient()
+        .to_bech32();
+    // A 409 may race a PUT of these bytes that still lands: the intent stays.
+    let error = resume(&paths).unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::NotStored, "{error}");
+    assert!(
+        claim(&paths)
+            .unwrap()
+            .is_some_and(|claim| claim.phase == Phase::Ready)
+    );
+    assert!(pending_remote(&paths).unwrap());
+    assert!(permit_join(&paths).is_err());
+    let error = resume(&paths).unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::Refused, "{error}");
+    assert_free(&paths, &recipient);
+    assert_eq!(server.stop(), ["GET", "GET", "PUT", "GET", "PUT"]);
+}
+
+#[test]
+fn a_refusal_after_a_publication_whose_reply_was_lost_keeps_the_intent() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&root.path().join("m1"));
+    // The first PUT may have landed; then a server that never held it answers the name.
+    let server = Unheld::start(&[("", ""), NOT_FROM_HERE]);
+    assert!(create(&paths, &server.url, None, Some("m1")).is_err());
+    let held = |phase| {
+        claim(&paths)
+            .unwrap()
+            .is_some_and(|claim| claim.phase == phase)
+    };
+    assert!(held(Phase::Sent));
+    let error = resume(&paths).unwrap_err();
+    assert!(error.to_string().contains(NOT_FROM_HERE.1), "{error}");
+    assert!(error.to_string().contains("keeps the creation"), "{error}");
+    assert!(held(Phase::Sent));
+    assert!(paths.dir.join("creation-outbox").exists());
+    assert!(pending_remote(&paths).unwrap());
+    assert!(requires_device(&paths).unwrap());
+    assert!(permit_join(&paths).is_err());
+    assert_eq!(server.stop(), ["GET", "GET", "PUT", "GET", "PUT"]);
+}
+
+#[test]
+fn a_retired_claim_a_crash_left_frees_the_slot_and_goes_at_the_next_creation() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&root.path().join("m1"));
+    let source = root.path().join("first.vault");
+    prepare(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+    let recipient = read_identity(&paths)
+        .unwrap()
+        .unwrap()
+        .recipient()
+        .to_bech32();
+    let held = claim(&paths).unwrap().unwrap();
+    // The crash came after the claim turned Retired, before its outbox went.
+    save_claim(&paths, &held.intent, held.digest, Phase::Retired).unwrap();
+    assert!(paths.dir.join("creation-outbox").exists());
+    assert!(!pending_remote(&paths).unwrap());
+    assert!(!requires_device(&paths).unwrap());
+    permit_join(&paths).unwrap();
+    resume(&paths).unwrap();
+    assert!(!source.exists());
+    let other = root.path().join("other.vault");
+    create(&paths, other.to_str().unwrap(), None, Some("m1")).unwrap();
+    assert!(!source.exists());
+    assert_eq!(config(&paths).unwrap().unwrap().source, Source::Path(other));
+    assert_eq!(
+        read_identity(&paths)
+            .unwrap()
+            .unwrap()
+            .recipient()
+            .to_bech32(),
+        recipient
+    );
+}
+
+#[test]
+fn a_path_whose_folder_is_missing_strands_nothing() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&root.path().join("m1"));
+    let recipient = machine_identity(&paths).unwrap().recipient().to_bech32();
+    // A typo is caught before anything is prepared.
+    let typo = root.path().join("Dropbx/first.vault");
+    let error = create(&paths, typo.to_str().unwrap(), None, Some("m1")).unwrap_err();
+    assert!(error.to_string().contains("no such folder"), "{error}");
+    assert!(claim(&paths).unwrap().is_none());
+    // So are a symlink to a folder and a file, which the first write refuses too.
+    let real = root.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let file = root.path().join("file");
+    std::fs::write(&file, b"").unwrap();
+    for (folder, why) in [(&link, "a symlink, not a folder"), (&file, "not a folder")] {
+        let source = folder.join("first.vault");
+        let error = create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap_err();
+        assert!(error.to_string().contains(why), "{error}");
+        assert!(claim(&paths).unwrap().is_none());
+    }
+    // A folder that goes after the absence check refuses the first write, which retires it.
+    let folder = root.path().join("vaults");
+    std::fs::create_dir(&folder).unwrap();
+    let source = folder.join("first.vault");
+    let (context, pending) = prepare(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+    std::fs::remove_dir(&folder).unwrap();
+    let error = finish(&paths, context, pending).unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::Refused, "{error}");
+    assert_free(&paths, &recipient);
+    std::fs::create_dir(&folder).unwrap();
+    create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        std::fs::read(paths.cache_file()).unwrap()
+    );
 }

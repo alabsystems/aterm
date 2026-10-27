@@ -3,6 +3,7 @@
 
 //! Tests for the Claude account login lifecycle core.
 
+use super::tests::record_usage;
 use super::*;
 use crate::harness::host_path::abs;
 
@@ -726,6 +727,7 @@ fn a_superseded_logins_usage_is_recorded_for_its_rows_account() {
     let b = bound(&roster(), &logins);
     let dir = tmp("usage");
     let store = Store::at(dir.path());
+    store.save_logins(&logins).unwrap();
     let on = |login: &str| ProcessLogin {
         login: Some(login.to_owned()),
         default_home: true,

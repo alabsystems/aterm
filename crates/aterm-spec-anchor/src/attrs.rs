@@ -211,24 +211,52 @@ macro_rules! __aterm_spec_anchor {
         $($item)*
     };
 
+    // Each arm passes on the item rebuilt from its parts, so every `#` left on it is this
+    // expansion's, as the fast arms' is: an anchor stacked below books this one's line, the line
+    // the proc macros book for it too (`FnItem::with_prelude`).
     (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis fn $n:ident $($rest:tt)*)) => {
-        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] [] $item }
+        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] []
+            ($(# $at)* $vis fn $n $($rest)*) }
     };
     (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis const fn $n:ident $($rest:tt)*)) => {
-        $crate::__aterm_spec_anchor! { @split [$ctx $n noprobe] [] $item }
+        $crate::__aterm_spec_anchor! { @split [$ctx $n noprobe] []
+            ($(# $at)* $vis const fn $n $($rest)*) }
     };
     (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis const unsafe fn $n:ident $($rest:tt)*)) => {
-        $crate::__aterm_spec_anchor! { @split [$ctx $n noprobe] [] $item }
-    };
-    (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis unsafe fn $n:ident $($rest:tt)*)) => {
-        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] [] $item }
-    };
-    (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis async $(unsafe)? fn $n:ident $($rest:tt)*)) => {
-        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] [] $item }
+        $crate::__aterm_spec_anchor! { @split [$ctx $n noprobe] []
+            ($(# $at)* $vis const unsafe fn $n $($rest)*) }
     };
     (@head $ctx:tt $item:tt
-        ($(# $at:tt)* $vis:vis $(unsafe)? extern $($abi:literal)? fn $n:ident $($rest:tt)*)) => {
-        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] [] $item }
+        ($(# $at:tt)* $vis:vis const extern $($abi:literal)? fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n noprobe] []
+            ($(# $at)* $vis const extern $($abi)? fn $n $($rest)*) }
+    };
+    (@head $ctx:tt $item:tt
+        ($(# $at:tt)* $vis:vis const unsafe extern $($abi:literal)? fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n noprobe] []
+            ($(# $at)* $vis const unsafe extern $($abi)? fn $n $($rest)*) }
+    };
+    (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis unsafe fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] []
+            ($(# $at)* $vis unsafe fn $n $($rest)*) }
+    };
+    (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis async fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] []
+            ($(# $at)* $vis async fn $n $($rest)*) }
+    };
+    (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis async unsafe fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] []
+            ($(# $at)* $vis async unsafe fn $n $($rest)*) }
+    };
+    (@head $ctx:tt $item:tt
+        ($(# $at:tt)* $vis:vis extern $($abi:literal)? fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] []
+            ($(# $at)* $vis extern $($abi)? fn $n $($rest)*) }
+    };
+    (@head $ctx:tt $item:tt
+        ($(# $at:tt)* $vis:vis unsafe extern $($abi:literal)? fn $n:ident $($rest:tt)*)) => {
+        $crate::__aterm_spec_anchor! { @split [$ctx $n probe] []
+            ($(# $at)* $vis unsafe extern $($abi)? fn $n $($rest)*) }
     };
     (@head $ctx:tt ($($item:tt)*) $analysed:tt) => {
         ::core::compile_error! {
@@ -252,6 +280,13 @@ macro_rules! __aterm_spec_anchor {
     };
     (@split $ctx:tt [$($h:tt)*] ($t:tt $($rest:tt)+)) => {
         $crate::__aterm_spec_anchor! { @split $ctx [$($h)* $t] ($($rest)+) }
+    };
+    // A body another macro passed on as a `$body:block` fragment.
+    (@split [$ctx:tt $n:ident $probe:ident] [$($h:tt)*] ($body:block)) => {
+        $($h)* {
+            $crate::__aterm_spec_anchor! { @body $ctx $n $probe }
+            $body
+        }
     };
     (@split $ctx:tt [$($h:tt)*] ($last:tt)) => {
         ::core::compile_error! {

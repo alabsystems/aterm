@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-aos-pane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The pane as an Aos task: a terminal checkpoint's canonical encoding as the state, the recorded output, resizes and live witnesses as the inputs, the replies as effects, judged by pane.faithful-replay. No clock, thread, file or socket: the host hands it time and bytes."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Task ABI, checkpoints, the event log, replay, the effect shadow and contracts.
+aterm-aos = { workspace = true }
+# The terminal engine the task steps and its canonical checkpoint encoding.
+aterm-core = { workspace = true }

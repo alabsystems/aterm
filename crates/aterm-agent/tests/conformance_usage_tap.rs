@@ -77,6 +77,7 @@ fn reading(pid: i64, api: i64, figs: i64) -> Reading {
         cache_expires_at: None,
         version: None,
         model: None,
+        ctx_left: None,
         dur_us: 0,
     }
 }

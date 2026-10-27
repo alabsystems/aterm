@@ -9,6 +9,7 @@ pub mod box_call;
 pub mod box_command;
 pub mod box_facts;
 pub mod claude_settings;
+pub mod cruise_carry;
 pub mod exception;
 pub mod git_config;
 pub mod guard;
@@ -27,8 +28,9 @@ pub mod trace;
 pub mod turn_end;
 
 pub use approval::{
-    Answer, AnswerTarget, ApprovalCtx, Choice, DECLINE_PREFIX, DISK_WORKER_DECLINE, Decision,
-    DeclineStep, QuestionPriority, REFUSAL_LABEL, RULE_ALLOW_ONCE, RULE_ANSWER_LONG_TERM,
+    Answer, AnswerTarget, ApprovalCtx, Choice, DECLINE_PREFIX, DISK_WORKER_DECLINE,
+    DISK_WORKER_FIRST_BASH, DISK_WORKER_ONE_ROW, DISK_WORKER_SHELL_UNREAD, DISK_WORKER_WRAPPED,
+    Decision, DeclineStep, QuestionPriority, REFUSAL_LABEL, RULE_ALLOW_ONCE, RULE_ANSWER_LONG_TERM,
     RULE_ANSWER_SHORT_TERM, RULE_BREAKER_READ_ONLY, RULE_DECLINE, RULE_DISK_WORKER,
     RULE_LIMIT_RESET, RULE_MODEL_CONFIRM, RULE_MODEL_SWITCH, RULE_NO_SPEND, RULE_PLAN,
     RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM, RULE_READ_ONLY, RULE_READ_OUTSIDE_CWD,

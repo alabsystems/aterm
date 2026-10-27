@@ -6,7 +6,7 @@
 
 use aterm_json::{Map, Value};
 
-use crate::config::{Validated, on_floor};
+use crate::config::{ConfigOrigin, Validated, on_floor};
 use crate::error::{Error, Kind, Result, Sub, Tried};
 use crate::identity::Profile;
 use crate::slug::{RepoArg, Slug};
@@ -100,6 +100,17 @@ pub enum Named {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExplicitTarget {
     slug: Slug,
+    provenance: Provenance,
+    grant: Option<String>,
+}
+
+/// How an [`ExplicitTarget`] was made (design §10.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provenance {
+    /// Typed literally on agh's own command line (`from_argv`).
+    Argv,
+    /// [`Router::grant`] made it from a `[[writers]]` row of the owner's agh.toml.
+    Granted,
 }
 
 impl ExplicitTarget {
@@ -111,7 +122,11 @@ impl ExplicitTarget {
     /// not @{name}`.
     pub(crate) fn from_argv(arg: &std::ffi::OsStr) -> Result<ExplicitTarget> {
         match RepoArg::parse(&arg.to_string_lossy())? {
-            RepoArg::Literal(slug) => Ok(ExplicitTarget { slug }),
+            RepoArg::Literal(slug) => Ok(ExplicitTarget {
+                slug,
+                provenance: Provenance::Argv,
+                grant: None,
+            }),
             RepoArg::Target(name) => Err(Error::usage(format!(
                 "a literal destination is OWNER/NAME, not @{name}"
             ))),
@@ -123,6 +138,18 @@ impl ExplicitTarget {
     #[must_use]
     pub const fn slug(&self) -> &Slug {
         &self.slug
+    }
+
+    /// How this target was made.
+    #[must_use]
+    pub fn provenance(&self) -> Provenance {
+        self.provenance
+    }
+
+    /// The `[[writers]]` caller whose row made it, when [`Provenance::Granted`].
+    #[must_use]
+    pub fn granted_to(&self) -> Option<&str> {
+        self.grant.as_deref()
     }
 }
 
@@ -331,6 +358,8 @@ pub enum RefusalCode {
     IdentityNeedsAs,
     /// An unscoped or identity path is read only.
     UnscopedNotRead,
+    /// A release-tier write named by a library caller with no `[[writers]]` grant (L11).
+    NotGranted,
 }
 
 impl RefusalCode {
@@ -355,10 +384,12 @@ impl RefusalCode {
             RefusalCode::ProfileUnknown => "profile_unknown",
             RefusalCode::IdentityNeedsAs => "identity_needs_as",
             RefusalCode::UnscopedNotRead => "unscoped_not_read",
+            RefusalCode::NotGranted => "not_granted",
         }
     }
 
-    /// The first four → Unauthenticated; the next eight → Refused; the last four → Usage.
+    /// The first four → Unauthenticated; the next eight and the last → Refused; the four between
+    /// → Usage.
     #[inline]
     #[must_use]
     pub const fn kind(self) -> Kind {
@@ -374,7 +405,8 @@ impl RefusalCode {
             | RefusalCode::AsNotWriter
             | RefusalCode::ConfigInvalid
             | RefusalCode::TierMismatch
-            | RefusalCode::MethodNotRead => Kind::Refused,
+            | RefusalCode::MethodNotRead
+            | RefusalCode::NotGranted => Kind::Refused,
             RefusalCode::AnonymousWriterRead
             | RefusalCode::ProfileUnknown
             | RefusalCode::IdentityNeedsAs
@@ -529,10 +561,12 @@ impl Explanation {
     }
 }
 
-/// The routing rules over a validated agh.toml (or none).
+/// The routing rules over a validated agh.toml (or none), or over one profile
+/// ([`Router::single_identity`]).
 #[derive(Clone, Debug, Default)]
 pub struct Router {
     validated: Option<Validated>,
+    single: Option<Profile>,
 }
 
 impl Router {
@@ -540,7 +574,10 @@ impl Router {
     #[inline]
     #[must_use]
     pub const fn empty() -> Router {
-        Router { validated: None }
+        Router {
+            validated: None,
+            single: None,
+        }
     }
 
     /// The rules of `validated`.
@@ -549,6 +586,7 @@ impl Router {
     pub const fn from_validated(validated: Validated) -> Router {
         Router {
             validated: Some(validated),
+            single: None,
         }
     }
 
@@ -852,7 +890,7 @@ impl Router {
                 RefusalCode::WriterAbsent,
                 format!("the writer for {owner} ({writer}) is absent"),
                 format!(
-                    "a person runs: agh auth add {writer} --file PATH --tier {} --owner {owner} --write",
+                    "agh auth add {writer} --file PATH --tier {} --owner {owner} --write",
                     profile.tier.slug()
                 ),
                 tried,
@@ -893,6 +931,177 @@ impl Router {
             writer,
             decision,
         }
+    }
+}
+
+/// What a [`Permit`] lets a write reach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PermitTarget {
+    /// `/repos/{owner}/{repo}` and below, on the api and uploads origins.
+    Repo(Slug),
+    /// `/user` and below (machines' keys, under [`Router::single_identity`]).
+    Identity,
+}
+
+/// A write permit (design §10.2). Only [`Router::permit`] mints one, and it is not `Clone`,
+/// so one routing decision is one permit. `HttpTransport` sends a method other than GET or
+/// HEAD only with a permit whose target covers the URL's path and whose profile is the
+/// credential's (design §10.1).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Permit {
+    target: PermitTarget,
+    profile: String,
+    tier: Tier,
+    provenance: Option<Provenance>,
+    grant: Option<String>,
+    literal: Option<ExplicitTarget>,
+}
+
+impl Permit {
+    /// What the permit reaches.
+    #[must_use]
+    pub fn target(&self) -> &PermitTarget {
+        &self.target
+    }
+
+    /// The profile the write speaks as.
+    #[must_use]
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    /// That profile's tier.
+    #[must_use]
+    pub fn tier(&self) -> Tier {
+        self.tier
+    }
+
+    /// How the destination was named: `None` for a write that needed no literal (a dev-tier
+    /// owner's, or an identity write under `single_identity`).
+    #[must_use]
+    pub fn provenance(&self) -> Option<Provenance> {
+        self.provenance
+    }
+
+    /// The `[[writers]]` caller, when a grant made the target: the journal's `grant`.
+    #[must_use]
+    pub fn grant(&self) -> Option<&str> {
+        self.grant.as_deref()
+    }
+
+    /// Whether `path` (absolute, its query cut) is this permit's target or below it. Each
+    /// segment is judged percent-decoded (`aterm_codec::pct::decode`), as GitHub reads it and
+    /// as `api`'s routing already judges it (`cli/cmd_api.rs`, `fn target`), then compared
+    /// ASCII case-insensitively: `/repos/{owner}/{repo}` exactly or followed by `/`, or
+    /// `/user` exactly or followed by `/`. So `/repos/fixture%2Ddev/app` is covered by a
+    /// permit for `fixture-dev/app`. These never match:
+    /// - a dot segment, typed or encoded;
+    /// - an empty segment;
+    /// - a `%` not followed by two hex digits;
+    /// - a segment that decodes to hold `/`.
+    ///
+    /// `pct::decode` is total: it passes a malformed escape through unchanged. So `covers`
+    /// checks the raw segment for a `%` not followed by two hex digits itself, before it
+    /// decodes, and answers `false` for one.
+    #[must_use]
+    pub fn covers(&self, path: &str) -> bool {
+        // WP1 writes the body (plan §5, body 7); until then no path is covered, so the
+        // transport guard refuses every write.
+        let _ = path;
+        false
+    }
+
+    /// The naming the permit's write was routed with: `Named::Literal` of its literal, or
+    /// `Named::Default` when it had none. A git run done for the write (`Refs::delete_expect`)
+    /// is named the same way, so the runner's release-tier rule sees the same literal.
+    pub(crate) fn named(&self) -> Named {
+        self.literal.clone().map_or(Named::Default, Named::Literal)
+    }
+}
+
+impl Router {
+    /// The one library constructor of an `ExplicitTarget`: `slug` must be listed under
+    /// `caller`'s `[[writers]]` row (L11). Otherwise Refused `policy.not_granted`. `caller` is
+    /// self-asserted inside the one binary: a grant limits which repositories the owner's config
+    /// opens to unattended writes, not which code may write. The journal records the grant and
+    /// the builder's caller side by side.
+    ///
+    /// # Errors
+    ///
+    /// - Refused `not_granted` (`Sub::Policy(RefusalCode::NotGranted)`), next
+    ///   `a person runs: agh policy grant {caller} {slug}`, when no `[[writers]]` row of
+    ///   `caller` lists `slug` (ASCII case-insensitive), or this router's `Validated` did not
+    ///   come from a file (`ConfigOrigin::Text`), or it has none;
+    /// - Usage when `caller` is not `[a-z][a-z0-9-]{0,31}`.
+    pub fn grant(&self, caller: &str, slug: &Slug) -> Result<ExplicitTarget> {
+        let _ = (caller, slug);
+        Err(Error::not_yet("Router::grant", "WP1"))
+    }
+
+    /// A write permit for `req`, which must be a Write: refused unless `decide(req)` sends.
+    /// It names the target, the profile and the tier, and `HttpTransport` checks it against
+    /// the URL (§10.1). A release-tier target still needs its `Named::Literal`, from argv or
+    /// `grant`. It takes a `RouteRequest` rather than an `ExplicitTarget` because every write
+    /// carries one, and a library caller's dev-tier write has no `ExplicitTarget` (L11 refuses
+    /// a dev-tier grant).
+    ///
+    /// # Errors
+    ///
+    /// - Usage `a permit is for a write; this request is {access}` when `req.access` is not
+    ///   `Access::Write`;
+    /// - the refusal `decide` gives (`into_error`);
+    /// - Refused `unscoped_not_read` for an `Owner` or `Unscoped` target.
+    pub fn permit(
+        &self,
+        req: &RouteRequest,
+        presence: &dyn Fn(&str) -> Presence,
+    ) -> Result<Permit> {
+        let _ = (req, presence);
+        Err(Error::not_yet("Router::permit", "WP1"))
+    }
+
+    /// [`Router::permit`] over a decision already made: `permit` is
+    /// `self.permit_decided(req, self.decide(req, presence))`. The client calls it with the
+    /// decision `Fx::route` gave, so a replayed tape's decision mints the permit the recorded
+    /// one did. Crate-private: only a decision `decide` or the route door made reaches it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Router::permit`].
+    pub(crate) fn permit_decided(&self, req: &RouteRequest, decision: Decision) -> Result<Permit> {
+        let _ = (req, decision);
+        Err(Error::not_yet("Router::permit_decided", "WP1"))
+    }
+
+    /// A router over one profile (an inline source, §6.1). It routes Identity targets only;
+    /// every Repo, Owner or Unscoped target is refused `UnscopedNotRead`.
+    /// A Write on an Identity target (machines' `users().keys()`) is sent only under this
+    /// router, with its one profile; a release-tier profile is refused `TierMismatch`, and
+    /// `AghRouteWall`'s M2 `ident` variable carries the rule, with its mutant.
+    #[must_use]
+    pub fn single_identity(profile: Profile) -> Router {
+        Router {
+            validated: None,
+            single: Some(profile),
+        }
+    }
+
+    /// Whether `single_identity` built this router.
+    #[must_use]
+    pub fn is_single_identity(&self) -> bool {
+        self.single.is_some()
+    }
+
+    /// The `[[writers]]` rows (empty without a file-made `Validated`): `policy check` and
+    /// `atpkg-publish hosts check` print them.
+    #[must_use]
+    pub fn writers(&self) -> Vec<(String, Vec<Slug>)> {
+        self.validated
+            .as_ref()
+            .filter(|v| v.origin() == ConfigOrigin::File)
+            .map(|v| v.writers().to_vec())
+            .unwrap_or_default()
     }
 }
 

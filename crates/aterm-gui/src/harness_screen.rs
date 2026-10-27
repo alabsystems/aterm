@@ -411,6 +411,7 @@ pub(crate) struct HarnessSession {
     pub(crate) need: Option<crate::needs::HarnessAsk>,
     pub(crate) hold: Option<crate::harness_glass::HeldGlass>,
     pub(crate) stopped: Option<aterm_agent::harness::acts::HeldBy>,
+    pub(crate) waiting: Option<crate::harness_glass::WaitGlass>,
 }
 
 /// One `[harness]` key of the effective table.
@@ -905,6 +906,7 @@ impl HarnessState {
                     need: session.need.clone(),
                     hold: session.hold,
                     stopped: session.stopped,
+                    waiting: session.waiting,
                 }
             })
             .collect()
@@ -1573,6 +1575,7 @@ pub(crate) struct HarnessSessionRow {
     pub(crate) need: Option<crate::needs::HarnessAsk>,
     pub(crate) hold: Option<crate::harness_glass::HeldGlass>,
     pub(crate) stopped: Option<aterm_agent::harness::acts::HeldBy>,
+    pub(crate) waiting: Option<crate::harness_glass::WaitGlass>,
 }
 
 impl HarnessSessionRow {
@@ -1584,7 +1587,7 @@ impl HarnessSessionRow {
             .map_or(self.detail.as_str(), |(lead, _)| lead)
     }
 
-    /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), led by a harness's need where one stands (`needs you: … (+1 more); carrying on · `, §12.2.1), formatted from its glass under its view as the chip's face reads it ([`ChipFace::of`]): `lands at 18:00` (`lands Sat 16:00` on another day), under Land `landed 17:42` and `quiet: a person's own exchange`; else the loop's pause after short turns (`pausing until 18:41 (3 short turns in a row)`, §10.5.1); else the trail's newest act (`last: ✓ approved 14:05`).
+    /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), led by the loop's outage wait where one stands (`waiting: API overload · next try 18:41 · `, §14.17.5.2), then by aterm's stop while the chip carries a mode (`stopped typing: the same reply twice, no work · types again at your turn or once the agent works · `, §14.3), then by a harness's need where one stands (`needs you: … (+1 more); carrying on · `, §12.2.1), then formatted from its glass under its view as the chip's face reads it ([`ChipFace::of`]): `lands at 18:00` (`lands Sat 16:00` on another day), under Land `landed 17:42` and `quiet: a person's own exchange`; else the loop's pause after short turns (`pausing until 18:41 (3 short turns in a row)`, §10.5.1), which a stop drops; else the trail's newest act (`last: ✓ approved 14:05`).
     #[must_use]
     pub(crate) fn state_line(&self) -> Option<String> {
         let glass = &self.glass;
@@ -1650,7 +1653,8 @@ impl HarnessSessionRow {
                 })
             });
         let sep = crate::native_ui::FACT_SEPARATOR;
-        [stop, need.map(need_head), rest]
+        let waiting = self.waiting.map(|wait| wait.state_words(today));
+        [waiting, stop, need.map(need_head), rest]
             .into_iter()
             .flatten()
             .reduce(|line, more| format!("{line}{sep}{more}"))
@@ -2524,6 +2528,7 @@ impl App {
                 .cloned();
             let hold = self.shown_hold(handle.local_id).filter(|_| supervised);
             let stopped = self.shown_stop(handle.local_id).filter(|_| supervised);
+            let waiting = self.shown_wait(handle.local_id).filter(|_| supervised);
             sessions.push(HarnessSession {
                 local_id: handle.local_id,
                 sid: handle.sid.as_str().to_string(),
@@ -2540,6 +2545,7 @@ impl App {
                 need,
                 hold,
                 stopped,
+                waiting,
             });
         }
         sessions.sort_by_key(|s| s.local_id);

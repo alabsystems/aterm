@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only Metal present-blit runner using [`Pipeline::Blit`], compared byte-for-byte against the wgpu blit oracle.
+//! Test-only standalone runners of the Metal present's rows, [`Pipeline::Blit`] and the crown
+//! rows ([`Pipeline::HdrGlow`], [`Pipeline::SdrGlow`]), whose frames the frame record holds to
+//! their CPU twins and compares with wgpu's rows (`renderer::frame_record_tests`).
 
-#[cfg(wgpu_arm)]
+#[cfg(test)]
 use super::ffi::{self, Device, Obj, PixelFormat, SamplerDesc};
-#[cfg(wgpu_arm)]
+#[cfg(test)]
 use super::pipelines;
-#[cfg(wgpu_arm)]
+#[cfg(test)]
 use crate::pipeline_table::Pipeline;
 
 /// Size in bytes of `BlitUniform`.
 pub(crate) const UNIFORM_BYTES: usize = 112;
 
 /// Metal present-blit pipeline, nearest sampler, and 112-byte uniform buffer for one destination format.
-#[cfg(wgpu_arm)]
+#[cfg(test)]
 pub(crate) struct MetalBlit {
     device: Device,
     queue: Obj,
@@ -27,9 +29,9 @@ pub(crate) struct MetalBlit {
     format: PixelFormat,
 }
 
-#[cfg(wgpu_arm)]
+#[cfg(test)]
 impl MetalBlit {
-    /// [`UNIFORM_BYTES`], re-exported for the differential test.
+    /// [`UNIFORM_BYTES`], re-exported for the blit's callers.
     pub(crate) const UNIFORM_BYTES: usize = UNIFORM_BYTES;
 
     /// Offscreen source frame pixel format.
@@ -60,11 +62,6 @@ impl MetalBlit {
             uniform,
             format,
         })
-    }
-
-    /// Name of the Metal device this blit runs on.
-    pub(crate) fn device_name(&self) -> String {
-        self.device.name()
     }
 
     /// Runs `vs_blit` + `fs_blit` over `src` (`src_w * src_h` RGBA8 texels) with `uniform` and returns the destination texels.
@@ -167,4 +164,150 @@ impl MetalBlit {
         // `draw_and_read` returned after `waitUntilCompleted`.
         Ok(unsafe { ffi::buffer_bytes(&readback, readback_len) })
     }
+}
+
+/// Runs a crown row standalone: `HDR_GLOW` (`hdr`, additive into `Rgba16Float`) or `SDR_GLOW`
+/// (its screen blend into `Bgra8Unorm`) over a `w` x `h` target seeded with `seed`, drawing
+/// `instances` (`[x, y, w, h]` and a colour, packed as `GlowInstance`s) in one scissored `Load`
+/// pass with the crown uniform, and returns the target's texels.
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the crown fixture states its geometry, boost and headroom explicitly"
+)]
+pub(crate) fn crown_row_bytes(
+    hdr: bool,
+    instances: &[([u16; 4], [u8; 4])],
+    content_off: [f32; 2],
+    boost: f32,
+    headroom: f32,
+    seed: &[u8],
+    scissor: [u32; 4],
+    (w, h): (u32, u32),
+) -> Result<Vec<u8>, String> {
+    use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
+    use super::loss::{CbOutcome, LossLatch};
+    use std::sync::Arc;
+
+    /// `hdr_glow.metal`'s uniform block, laid out as `HdrGlowUniform`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CrownU {
+        screen: [f32; 2],
+        content_off: [f32; 2],
+        boost: f32,
+        headroom: f32,
+        _pad: [f32; 2],
+    }
+
+    let _pool = ffi::AutoreleasePool::new();
+    let dev = Device::preferred().ok_or_else(|| "no Metal device".to_owned())?;
+    let (row_id, fmt) = if hdr {
+        (Pipeline::HdrGlow, PixelFormat::Rgba16Float)
+    } else {
+        (Pipeline::SdrGlow, PixelFormat::Bgra8Unorm)
+    };
+    let (w, h) = (w as usize, h as usize);
+    let texel = fmt.bytes_per_texel();
+    let row = w * texel;
+    if seed.len() != row * h {
+        return Err(format!(
+            "the seed is {} bytes, {w}x{h} {fmt:?} needs {}",
+            seed.len(),
+            row * h
+        ));
+    }
+    let mut stream_bytes: Vec<u8> = Vec::new();
+    for (rect, colour) in instances {
+        for v in rect {
+            stream_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        stream_bytes.extend_from_slice(colour);
+        stream_bytes.extend_from_slice(colour);
+    }
+    if stream_bytes.len() as u64
+        != crate::pipeline_table::GLOW_LAYOUT.stride * instances.len() as u64
+    {
+        return Err("the instances do not pack as tight GlowInstances".to_owned());
+    }
+
+    let latch = Arc::new(LossLatch::new());
+    let session = EncodeSession::new(&dev, Arc::clone(&latch))?;
+    let mint = super::resources::MetalResourceDevice::new(&dev, latch);
+    let stream = dev
+        .new_buffer(stream_bytes.len())
+        .ok_or("the instance stream allocation failed")?;
+    // SAFETY: a fresh shared buffer of exactly `stream_bytes.len()` bytes that no command buffer
+    // uses yet.
+    unsafe { ffi::buffer_write(&stream, &stream_bytes) };
+    let spec = row_id.spec();
+    let binds = spec.binds;
+    let lib = pipelines::compile(&dev, spec)?;
+    let pso = pipelines::build(&dev, &lib, spec, PixelFormat::Bgra8Unorm)?;
+    let dst = mint.texture_2d(
+        fmt,
+        w,
+        h,
+        ffi::TEXTURE_USAGE_RENDER_TARGET | ffi::TEXTURE_USAGE_SHADER_READ,
+    )?;
+    // SAFETY: a fresh non-private `w` x `h` texture of `fmt`; `seed` is `row * h` bytes (checked
+    // above) at the tight stride `row`.
+    unsafe { ffi::texture_upload(dst.obj(), ffi::MtlRegion::full_2d(w, h), seed, row) };
+    #[expect(clippy::cast_precision_loss, reason = "test extents")]
+    let cu = CrownU {
+        screen: [w as f32, h as f32],
+        content_off,
+        boost,
+        headroom,
+        _pad: [0.0; 2],
+    };
+    let ubuf = dev
+        .new_buffer(size_of::<CrownU>())
+        .ok_or("the uniform allocation failed")?;
+    // SAFETY: `CrownU` is `repr(C)` plain floats, written into a fresh shared buffer of exactly
+    // its size that no command buffer uses yet.
+    unsafe {
+        ffi::buffer_write(
+            &ubuf,
+            std::slice::from_raw_parts(std::ptr::from_ref(&cu).cast::<u8>(), size_of::<CrownU>()),
+        );
+    };
+    let rb = dev
+        .new_buffer(row * h)
+        .ok_or("the readback allocation failed")?;
+    let mut cb = session.begin()?;
+    {
+        let pass = cb.render_pass(&RenderPassDesc {
+            target: &dst,
+            load: ffi::LoadAction::Load,
+            store: StoreAction::Store,
+            viewport: None,
+            scissor: Some(ffi::MtlScissorRect {
+                x: scissor[0] as usize,
+                y: scissor[1] as usize,
+                width: (scissor[2] - scissor[0]) as usize,
+                height: (scissor[3] - scissor[1]) as usize,
+            }),
+        })?;
+        pass.set_pipeline(&pso);
+        pass.set_vertex_buffer(
+            &ubuf,
+            binds
+                .vertex_uniform
+                .ok_or("the crown rows bind a vertex uniform")? as usize,
+        )?;
+        pass.set_fragment_buffer(&ubuf, binds.fragment_buffers[0] as usize);
+        pass.set_instance_stream(&stream);
+        pass.draw_instanced(
+            pipelines::metal_primitive_type(spec.topology),
+            6,
+            instances.len(),
+        )?;
+    }
+    cb.copy_texture_to_buffer(&dst, w, h, &rb, row)?;
+    if cb.commit().wait_outcome() != CbOutcome::Completed {
+        return Err("the crown pass did not complete".to_owned());
+    }
+    // SAFETY: shared storage of exactly `row * h` bytes whose writing command buffer completed.
+    Ok(unsafe { ffi::buffer_bytes(&rb, row * h) })
 }

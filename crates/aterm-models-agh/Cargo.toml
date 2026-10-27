@@ -8,7 +8,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "agh's models: the route wall (ty_model!), for agh's Tier-1 conformance and spec-check"
+description = "agh's models: the route wall, ensure-once and the git grant (ty_model!), for agh's Tier-1 conformance and spec-check"
 # The Tier-0 tests compile as ONE suite (tests/suite.rs): a tests/*.rs that is neither
 # the suite nor a `mod` of it compiles into nothing.
 autotests = false

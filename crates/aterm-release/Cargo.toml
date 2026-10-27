@@ -30,6 +30,10 @@ test = false
 aterm-types = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }
+# The publisher fence names its boot by the kernel's boot id (`boot_session`) and compares
+# a recorded one as 16 bytes (`parse_boot_id`): astream's OS cordon, zero dependencies,
+# already in the graph through aterm-durable.
+astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 # The serde `Manifest` type is shared with the updater client, so publisher and client
 # agree by compilation; publish round-trips the bytes through the client's parser.
 aterm-update-core = { workspace = true }
@@ -77,6 +81,10 @@ aterm-codec = { workspace = true }
 # shared with the census's export-content guard, which reads the checkout as the
 # transforms leave it. std-only; its one dependency is aterm-regex.
 aterm-census = { workspace = true }
+# The harness versions gate and `ship harness-bump` read each harness's sources and version
+# file from the one place the build reads them (`aterm_phase::CliHarness`); the reader is
+# dependency-light (one first-party crate).
+aterm-phase = { workspace = true }
 # `ship provision` mints in-process, so one phrase prompt provisions the machine with no
 # second binary. This unifies ring's default features (RNG) into this binary's graph only:
 # the cutter is owner-only and shipped clients keep their own graphs.

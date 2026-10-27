@@ -16,7 +16,7 @@ mod measuring {
     use aterm_conformance::measure::Rig;
     use aterm_conformance::measure::instance::CouldNotRun;
     use aterm_conformance::measure::paint::{
-        Capture, Companion, Expect, PaintRow, Scene, Split, Style,
+        Capture, Companion, Expect, PaintRow, Reach, Scene, Split, Style,
     };
     use aterm_conformance::measure::paint_probe::measure;
     use aterm_conformance::measure::starvation::Disposition;
@@ -47,6 +47,7 @@ mod measuring {
             style: Style::Flying,
             companion: None,
             split: None,
+            reach: None,
         }
     }
 
@@ -278,6 +279,31 @@ mod measuring {
                 )
             },
         ),
+        (
+            "the_tall_body_stands_within_its_reach_above_the_typed_row",
+            PaintRow {
+                reach: Some(Reach::Tall),
+                ..trail(
+                    Scene::Plane,
+                    MATURE_RUN,
+                    Expect::Ink,
+                    Capture::UnpinnedFocused,
+                )
+            },
+        ),
+        (
+            "the_underline_body_stands_within_its_reach_above_the_typed_row",
+            PaintRow {
+                style: Style::Underline,
+                reach: Some(Reach::Underline),
+                ..trail(
+                    Scene::Plane,
+                    MATURE_RUN,
+                    Expect::Ink,
+                    Capture::UnpinnedFocused,
+                )
+            },
+        ),
     ];
 
     fn take(rig: &Rig, row: &PaintRow) -> Outcome {
@@ -308,8 +334,38 @@ mod measuring {
     }
 
     pub fn run() -> std::process::ExitCode {
+        let rows = match selected(std::env::args().skip(1)) {
+            Ok(rows) => rows,
+            Err(why) => {
+                eprintln!("measure paint: {why}");
+                return std::process::ExitCode::from(2);
+            }
+        };
         let rig = Rig::release(&["ATERM_PAINT_BIN"], env!("CARGO_BIN_EXE_fake-tui"));
-        support::run("paint", ROWS, |row| take(&rig, row))
+        support::run("paint", &rows, |row| take(&rig, row))
+    }
+
+    /// The rows each `--row <name>` among the arguments names, in matrix order, or every row
+    /// when none is named; an unknown name is a usage error. `verify measure` names none.
+    fn selected(
+        args: impl Iterator<Item = String>,
+    ) -> Result<Vec<(&'static str, PaintRow)>, String> {
+        let mut named = Vec::new();
+        let mut args = args;
+        while let Some(arg) = args.next() {
+            if arg == "--row" {
+                let name = args.next().unwrap_or_default();
+                if !ROWS.iter().any(|(n, _)| *n == name) {
+                    return Err(format!("--row names no row of the matrix: `{name}`"));
+                }
+                named.push(name);
+            }
+        }
+        Ok(ROWS
+            .iter()
+            .filter(|(n, _)| named.is_empty() || named.iter().any(|m| m == n))
+            .copied()
+            .collect())
     }
 }
 

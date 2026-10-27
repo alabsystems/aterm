@@ -6048,7 +6048,7 @@ mod tests {
              binary = \"/usr/local/bin/gh\"\nversion = \"2.102.0\"\n\n";
         let pointer = "# Other software is yours to add: a [homebrew] table installs Homebrew and its \
              formulae,\n# an [[app]] row one signed app (docs/DESIGN-machines-2026-10-16.md §8). For \
-             keeping a Mac\n# awake and editing a file, aterm has its own `aterm caffeine` and \
+             keeping a Mac\n# awake and editing a file, aterm has its own `aterm acaffiene` and \
              `aterm edit`.\n\n";
         assert!(templates::DEFAULT_BASELINE.contains(pointer));
         let previous = templates::DEFAULT_BASELINE.replace(pointer, HOMEBREW_AND_APPS);

@@ -272,10 +272,10 @@ impl World for Real {
                 aterm_uds::host::tool("wasm-opt").remedy()
             ));
         }
-        let rustup = aterm_verify::rustup::find_rustup().ok_or_else(|| {
+        let rustup = aterm_uds::host::tool("rustup").locate().map_err(|absent| {
             format!(
-                "no rustup ({}) — the wasm32 pin {pin} is a stock channel rustup installs",
-                aterm_verify::rustup::RUSTUP_LOOKED
+                "{} — the wasm32 pin {pin} is a stock channel rustup installs: {}",
+                absent.why, absent.fix
             )
         })?;
         let mut add = plain(&rustup);

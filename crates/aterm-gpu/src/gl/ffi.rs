@@ -13,7 +13,7 @@ use std::ffi::{CStr, c_char, c_void};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use egl::*;
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) use glx::*;
 
 pub(crate) type GLenum = u32;
@@ -35,22 +35,22 @@ pub(crate) const GL_CONTEXT_LOST: GLenum = 0x0507;
 #[cfg(target_arch = "wasm32")]
 pub(crate) const GL_CONTEXT_LOST_WEBGL: GLenum = 0x9242;
 /// `KHR_robustness` (core in GLES 3.2).
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const GL_GUILTY_CONTEXT_RESET: GLenum = 0x8253;
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const GL_INNOCENT_CONTEXT_RESET: GLenum = 0x8254;
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const GL_UNKNOWN_CONTEXT_RESET: GLenum = 0x8255;
 /// `NV_robustness_video_memory_purge`.
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const GL_PURGED_CONTEXT_RESET_NV: GLenum = 0x92BB;
 /// `KHR_robustness`: the context's reset notification strategy, and its two answers.
-#[cfg(all(test, not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) const GL_RESET_NOTIFICATION_STRATEGY: GLenum = 0x8256;
-#[cfg(all(test, not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) const GL_LOSE_CONTEXT_ON_RESET: GLint = 0x8252;
 /// `glGetGraphicsResetStatus` (GLES 3.2).
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) type GetGraphicsResetStatusFn = unsafe extern "C" fn() -> GLenum;
 pub(crate) const GL_ZERO: GLenum = 0;
 pub(crate) const GL_ONE: GLenum = 1;
@@ -94,7 +94,7 @@ pub(crate) const GL_RED: GLenum = 0x1903;
 pub(crate) const GL_RGBA: GLenum = 0x1908;
 /// `EXT_read_format_bgra`: a readback in the byte order of an X11 window's `0x00RRGGBB` words on a
 /// little-endian client.
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const GL_BGRA_EXT: GLenum = 0x80E1;
 pub(crate) const GL_UNSIGNED_BYTE: GLenum = 0x1401;
 pub(crate) const GL_SHORT: GLenum = 0x1402;
@@ -114,9 +114,7 @@ pub(crate) const GL_STREAM_DRAW: GLenum = 0x88E0;
 pub(crate) const GL_DYNAMIC_DRAW: GLenum = 0x88E8;
 pub(crate) const GL_FRAMEBUFFER: GLenum = 0x8D40;
 pub(crate) const GL_READ_FRAMEBUFFER: GLenum = 0x8CA8;
-#[cfg(not(wgpu_arm))]
 pub(crate) const GL_DRAW_FRAMEBUFFER: GLenum = 0x8CA9;
-#[cfg(not(wgpu_arm))]
 pub(crate) const GL_COLOR_BUFFER_BIT: GLenum = 0x4000;
 pub(crate) const GL_COLOR_ATTACHMENT0: GLenum = 0x8CE0;
 pub(crate) const GL_FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
@@ -206,7 +204,7 @@ macro_rules! fn_table {
         }
     };
 }
-#[cfg(all(test, not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) use fn_table;
 
 fn_table! {
@@ -286,10 +284,6 @@ fn_table! {
         copy_tex_sub_image_2d = "glCopyTexSubImage2D":
             fn(GLenum, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei);
         flush = "glFlush": fn();
-        #[cfg_attr(
-            wgpu_arm,
-            allow(dead_code, reason = "the shipped builds' window and canvas posts")
-        )]
         blit_framebuffer = "glBlitFramebuffer": fn(
             GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLenum, GLenum,
         );
@@ -311,7 +305,7 @@ pub(crate) fn gl_error_name(code: GLenum) -> String {
 }
 
 /// The registry name of a `glGetGraphicsResetStatus` answer.
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn gl_reset_name(code: GLenum) -> String {
     match code {
         GL_NO_ERROR => "GL_NO_ERROR".to_owned(),
@@ -380,7 +374,6 @@ mod egl {
     pub(crate) const EGL_RENDERABLE_TYPE: EGLint = 0x3040;
     pub(crate) const EGL_PBUFFER_BIT: EGLint = 0x0001;
     pub(crate) const EGL_WINDOW_BIT: EGLint = 0x0004;
-    #[cfg(not(wgpu_arm))]
     pub(crate) const EGL_NATIVE_VISUAL_ID: EGLint = 0x302E;
     pub(crate) const EGL_CONTEXT_LOST: EGLint = 0x300E;
     /// `EGL_KHR_platform_x11`: a display on an Xlib `Display*`, with the screen as an attribute.
@@ -442,7 +435,6 @@ mod egl {
         }
     }
 
-    #[cfg(not(wgpu_arm))]
     fn_table! {
         /// The EGL 1.5 entry points a window surface needs.
         pub(crate) struct EglWindowFns {
@@ -529,7 +521,7 @@ mod egl {
 
 /// GLX 1.4 and the three libX11 calls the X11 binding makes (`super::glx`):
 /// the shipped build's X11 windows post through GLX.
-#[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 mod glx {
     use std::ffi::{CStr, c_char, c_int, c_uint, c_ulong, c_void};
 

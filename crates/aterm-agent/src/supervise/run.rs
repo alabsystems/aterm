@@ -30,8 +30,8 @@ use super::policy::reset::{
 use super::policy::sleeps::{FirstLook, SleepBook, SleepStamp};
 use super::policy::turn_end::{
     AccountAdvice, AccountBad, AccountPoint, FirstRead, ModelSwitch, ProbeGate, RULE_API_BACK,
-    RULE_API_CUTOFF, RULE_API_RETRY, RULE_LIMIT_RESUME, Reach, TurnEndAction, TurnEndReading,
-    TurnEndState, TurnEndTiming, WaitKind, is_continue_rule, said_mark,
+    RULE_API_CUTOFF, RULE_API_RETRY, RULE_LIMIT_RESUME, RULE_OUTAGE_RESUME, Reach, TurnEndAction,
+    TurnEndReading, TurnEndState, TurnEndTiming, WaitKind, is_continue_rule, said_mark,
 };
 use super::prompt::{
     CancelEffect, Prompt, PromptKind, PromptV2, parse_prompt, prompt_box_first_row, prompt_box_span,
@@ -298,6 +298,16 @@ pub struct Caps {
     /// `Some(false)` once the host refused the loop's `await log` (an older build answers
     /// `ERR usage`): the loop waits on the screen until a reconnect.
     pub await_log: Option<bool>,
+    /// Whether `await gone|agent|seq|idle` take `autopilot=<word>`: its waits then wake on a switch
+    /// of the session's word (v6 §14.10). An older host reads only the arguments it knows and
+    /// answers such a wait as it always did, so there a switch is seen at the loop's next wake; a
+    /// host that refused the token as a usage error would get each wait bare.
+    pub await_autopilot: Option<bool>,
+    /// `Some(false)` once a host refused `autopilot=<word>` on the loop's `await log` as a usage
+    /// error and answered the wait bare (a build from before the log wait took it): the loop's log
+    /// waits go bare until a reconnect, and there a switch made while the agent works is seen at
+    /// the turn's point.
+    pub await_log_word: Option<bool>,
 }
 
 /// Observed turn-end state comprising the classified [`Phase`] and [`Screen`].
@@ -847,6 +857,12 @@ const AGENT_RECHECK: Duration = Duration::from_secs(5);
 
 const HANDBACK_POLL: Duration = Duration::from_secs(2);
 const OFF_STEP: Duration = Duration::from_secs(5);
+/// How long a switch of the session's Autopilot word stands before the loop decides on it (v6
+/// §14.10): a chip click passing through Land on its way to Off types nothing.
+const WORD_SETTLE: Duration = Duration::from_secs(1);
+/// The most switches of the session's word one wait inside the agent's turn notes before it ends
+/// as timed out ([`Session::busy_wait`]); each wakes it once, its next try carrying the word.
+const BUSY_WORD_WAKES: usize = 4;
 const ANSWERED_PAST_LIMIT: &str = "the worker answered past the adopted limit's notice";
 const IDLE_MS: &str = "2000";
 const SETTLE_MS: &str = "500";
@@ -940,6 +956,9 @@ enum Wait {
     Latched,
     TimedOut,
     Unsupported,
+    /// `OK autopilot <word>`: the session's stored word (`None` unset) is not the one a wait at
+    /// rest carried ([`Session::park`]).
+    Word(Option<Autopilot>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1032,6 +1051,8 @@ pub(crate) const fn places_resets_on_print(p: Program) -> bool {
 enum Past {
     Moved,
     Still(Option<Screen>),
+    /// A wait at rest woke on a switch of the session's word ([`Wait::Word`]).
+    Word(Option<Autopilot>),
 }
 
 enum Rode {
@@ -1584,6 +1605,7 @@ fn retry_held(hold: &Hold, timing: &TurnEndTiming) -> Option<approvals::RetryMar
         attempts: if hold.acted { n } else { n - 1 },
         ups: 0,
         since_ms: hold.until_ms + 500 - wait_ms,
+        down: false,
     })
 }
 
@@ -2024,6 +2046,11 @@ pub struct Session<'a, C: Ctl> {
     restart_waits: u32,
     restart_run: Option<(&'static str, i64)>,
     look_at: Option<Instant>,
+    /// When the last switch of the session's word a wait at rest woke on has stood
+    /// [`Self::word_settle`] (v6 §14.10): the loop reads the word then and decides on it.
+    word_at: Option<Instant>,
+    /// [`WORD_SETTLE`], a test's own.
+    word_settle: Duration,
     survey_first_seen: Option<Instant>,
     survey_zero: Option<Instant>,
     survey_told: Option<StuckSurvey>,
@@ -2223,6 +2250,8 @@ pub struct Session<'a, C: Ctl> {
     hold_said: Option<HoldSaid>,
     hold: occupancy_loop::HoldWatch,
     facts: facts_loop::FactsWatch,
+    /// Cruise's carries at breaks of the agent's own background work ([`Self::cruise_carry`]).
+    cruise_carry: cruise_carry_loop::CarryWatch,
     stall_suspect: bool,
     stall_termed: bool,
     stall_grace_s: u32,
@@ -2315,6 +2344,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             restart_waits: 0,
             restart_run: None,
             look_at: None,
+            word_at: None,
+            word_settle: WORD_SETTLE,
             survey_first_seen: None,
             survey_zero: None,
             survey_told: None,
@@ -2486,6 +2517,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             hold_said: None,
             hold: occupancy_loop::HoldWatch::default(),
             facts: facts_loop::FactsWatch::default(),
+            cruise_carry: cruise_carry_loop::CarryWatch::default(),
             stall_suspect: false,
             stall_termed: false,
             stall_grace_s: SupervisorConfig::default().human_grace_s,
@@ -2523,6 +2555,15 @@ impl<'a, C: Ctl> Session<'a, C> {
     pub(crate) fn set_claim_timing(&mut self, renew: Duration, ttl_ms: u64) {
         self.setup.claim_renew = renew;
         self.setup.claim_ttl_ms = ttl_ms;
+    }
+
+    /// Overrides [`WORD_SETTLE`] for tests (no tape's replay knows another).
+    #[cfg(test)]
+    pub(crate) fn set_word_settle(&mut self, settle: Duration) {
+        self.word_settle = settle;
+        if settle != WORD_SETTLE {
+            self.seeds_learned_state("a test's own word settle");
+        }
     }
 
     /// Sets the approval ledger file path (`None` disables ledger writing).
@@ -3504,12 +3545,97 @@ impl<'a, C: Ctl> Session<'a, C> {
 
     /// Executes `await` for `cond` and returns the wait outcome along with any latched content sequence.
     fn wait_at(&mut self, cond: &[&str], step: Duration) -> Result<(Wait, Option<u64>), Fail> {
+        self.wait_on(cond, step, None)
+    }
+
+    /// A wait at rest (THE WORD EDGE, v6 §14.10): where `latch` holds and the host takes it, `cond`
+    /// carries the session's stored word ([`Self::word_latch`]), so a switch of it wakes the wait
+    /// as [`Wait::Word`]; an act's own waits never carry it.
+    fn park(&mut self, cond: &[&str], step: Duration, latch: bool) -> Result<Wait, Fail> {
+        let word = if latch { self.word_latch()? } else { None };
+        self.wait_on(cond, step, word.as_deref())
+            .map(|(wait, _)| wait)
+    }
+
+    /// The `autopilot=<word>` a wait at rest carries: the stored word last read or reported (`-`
+    /// unset), never the table's, which would latch a session with none on every wait. `None`
+    /// where `meta` names no word or the host refused the token (an older host, [`Self::wait_on`]).
+    fn word_latch(&mut self) -> Result<Option<String>, Fail> {
+        let Some(word) = self.autopilot.latch() else {
+            return Ok(None);
+        };
+        Ok((self.caps.await_autopilot != Some(false)).then(|| format!("autopilot={word}")))
+    }
+
+    /// A WAIT INSIDE THE AGENT'S TURN carries the session's word as a wait at rest does
+    /// ([`Self::park`]), so a switch made while the agent works is noted at once
+    /// ([`Self::word_moved`]) and the point the turn ends on is decided on the word read then
+    /// ([`Self::decide_to_act_now`]), never on the one the turn began under. Nothing is typed into
+    /// the turn: the wait goes on, carrying the word reported, for what is left of `step`.
+    fn busy_wait(
+        &mut self,
+        cond: &[&str],
+        step: Duration,
+        review: &mut dyn Review,
+    ) -> Result<Wait, Fail> {
+        let until = self.fx.mono() + step;
+        for _ in 0..BUSY_WORD_WAKES {
+            let left = until.saturating_duration_since(self.fx.mono());
+            match self.park(cond, left, true)? {
+                Wait::Word(word) => {
+                    let seq = self.last.as_ref().map_or(0, |s| s.seq);
+                    self.word_moved(seq, word, review);
+                }
+                wait => return Ok(wait),
+            }
+        }
+        Ok(Wait::TimedOut)
+    }
+
+    /// [`Self::wait_at`], `word` the `autopilot=` token appended after the timeout ([`Self::park`]).
+    fn wait_on(
+        &mut self,
+        cond: &[&str],
+        step: Duration,
+        word: Option<&str>,
+    ) -> Result<(Wait, Option<u64>), Fail> {
         let ms = step.as_nanos().div_ceil(1_000_000).to_string();
         let mut args = vec!["await"];
         args.extend_from_slice(cond);
         args.push("timeout");
         args.push(&ms);
-        let r = self.call(&args)?;
+        args.extend(word);
+        let mut r = self.call(&args)?;
+        // THE FIRST WAIT THAT CARRIES THE TOKEN ASKS WHETHER THE HOST TAKES IT, no read of its own
+        // (a recorded tape answers no read it never made). A shipped host before slice 10a reads
+        // only the arguments it knows and answers as ever, so the token rides on harmlessly; one
+        // that refused it as a usage error gets the same wait bare, and no wait carries it again.
+        // A wait refused bare too was refused for something else, and is answered as it always
+        // was.
+        let mut word = word;
+        if word.is_some() && self.caps.await_autopilot.is_none() {
+            if r.usage_error() {
+                args.pop();
+                let bare = self.call(&args)?;
+                if !bare.usage_error() {
+                    self.caps.await_autopilot = Some(false);
+                }
+                (r, word) = (bare, None);
+            } else if !self.unserved(&r) {
+                self.caps.await_autopilot = Some(true);
+            }
+        }
+        let mut reply = r.stdout.split_whitespace().skip(1);
+        if r.ok() && word.is_some() && reply.next() == Some("autopilot") {
+            let stored = reply.next().unwrap_or("-");
+            let read = Autopilot::ALL.into_iter().find(|a| a.word() == stored);
+            if read.is_none() && stored != "-" {
+                // A word this build cannot name would wake every wait carrying the old one.
+                self.caps.await_autopilot = Some(false);
+                return Ok((Wait::Latched, None));
+            }
+            return Ok((Wait::Word(read), None));
+        }
         if r.ok() {
             let latched = r
                 .stdout
@@ -3536,13 +3662,25 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
-    fn wait_gone(&mut self, busy: &BusyWait, step: Duration) -> Result<(), Fail> {
+    fn wait_gone(
+        &mut self,
+        busy: &BusyWait,
+        step: Duration,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
         let span = busy.span.map(|(a, b)| (a.to_string(), b.to_string()));
         let mut cond = vec!["gone", busy.guard.as_str()];
         if let Some((a, b)) = &span {
             cond.extend(["rows", a.as_str(), b.as_str()]);
         }
-        match self.await_gone(&cond, step) {
+        let waited = match self.busy_wait(&cond, step, review) {
+            Ok(Wait::Unsupported) => Err(Fail::Hard(format!(
+                "await {} is not known to this host",
+                cond.join(" ")
+            ))),
+            other => other.map(drop),
+        };
+        match waited {
             Err(Fail::Hard(e)) if busy.span.is_some() && e.contains("ERR bad rows") => Ok(()),
             other => other.map(drop),
         }
@@ -3550,7 +3688,7 @@ impl<'a, C: Ctl> Session<'a, C> {
 
     fn await_gone(&mut self, cond: &[&str], step: Duration) -> Result<bool, Fail> {
         match self.wait(cond, step)? {
-            Wait::Latched => Ok(true),
+            Wait::Latched | Wait::Word(_) => Ok(true),
             Wait::TimedOut => Ok(false),
             Wait::Unsupported => Err(Fail::Hard(format!(
                 "await {} is not known to this host",
@@ -3655,24 +3793,31 @@ impl<'a, C: Ctl> Session<'a, C> {
                     } else {
                         log_wake::LogWoke::Screen
                     };
-                    if woke == log_wake::LogWoke::Screen {
-                        self.wait_gone(busy, busy.step(step))?;
+                    match woke {
+                        log_wake::LogWoke::Screen => {
+                            self.wait_gone(busy, busy.step(step), review)?;
+                        }
+                        log_wake::LogWoke::Word(word) => {
+                            let seq = self.last.as_ref().map_or(0, |s| s.seq);
+                            self.word_moved(seq, word, review);
+                        }
+                        log_wake::LogWoke::Answered | log_wake::LogWoke::TimedOut => {}
                     }
                     unsettled = true;
                 }
                 Next::Settle => {
                     let cap = std::mem::replace(&mut settle_cap, SETTLE_CAP);
-                    self.wait(&["idle", SETTLE_MS], step.min(cap))?;
+                    self.busy_wait(&["idle", SETTLE_MS], step.min(cap), review)?;
                     unsettled = true;
                 }
                 Next::Idle => {
                     settled = matches!(
-                        self.wait(&["idle", IDLE_MS], step.min(WRITING_CAP))?,
+                        self.busy_wait(&["idle", IDLE_MS], step.min(WRITING_CAP), review)?,
                         Wait::Latched
                     );
                 }
                 Next::Moved(seq) => {
-                    self.wait(&["seq", &seq.to_string()], step)?;
+                    self.busy_wait(&["seq", &seq.to_string()], step, review)?;
                     unsettled = true;
                 }
             }
@@ -4268,9 +4413,14 @@ impl<'a, C: Ctl> Session<'a, C> {
             let ago = |ms: i64| {
                 Duration::from_millis(u64::try_from(now_ms.saturating_sub(ms)).unwrap_or(0))
             };
-            let retry = [RULE_API_RETRY, RULE_API_BACK, RULE_API_CUTOFF]
-                .into_iter()
-                .find(|r| last.is_some_and(|s| *r == s.rule));
+            let retry = [
+                RULE_API_RETRY,
+                RULE_API_BACK,
+                RULE_API_CUTOFF,
+                RULE_OUTAGE_RESUME,
+            ]
+            .into_iter()
+            .find(|r| last.is_some_and(|s| *r == s.rule));
             let awaited = retry.is_some_and(|rule| {
                 last.is_some_and(|s| {
                     now_ms >= s.at_ms
@@ -4290,6 +4440,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                 mark.ups,
                 ago(mark.since_ms),
                 retry.is_some() && !awaited,
+                mark.down,
                 self.fx.mono(),
             );
         }
@@ -5266,17 +5417,20 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
+    /// `latch`: a wait at rest, which a switch of the session's word wakes ([`Self::park`]).
     fn moved_past(
         &mut self,
         seq: u64,
         deadline: Instant,
         step_cap: Duration,
+        latch: bool,
     ) -> Result<Past, Fail> {
         let step = deadline
             .saturating_duration_since(self.fx.mono())
             .min(step_cap);
-        match self.wait(&["seq", &seq.to_string()], step)? {
+        match self.park(&["seq", &seq.to_string()], step, latch)? {
             Wait::Latched => Ok(Past::Moved),
+            Wait::Word(word) => Ok(Past::Word(word)),
             Wait::TimedOut if self.fx.mono() >= deadline => Ok(Past::Still(None)),
             Wait::TimedOut => {
                 let now = self.screen()?;
@@ -5571,6 +5725,7 @@ impl<C: Ctl> Session<'_, C> {
             .and_then(|_| self.file_request(&seen));
         let mut asked = false;
         let mut woke = false;
+        let rest = review.unattended();
         loop {
             if self.stopped() {
                 return Ok(None);
@@ -5620,6 +5775,9 @@ impl<C: Ctl> Session<'_, C> {
                 self.turn_end_now(&seen, opts, allow, review)?;
                 return Ok(None);
             }
+            if self.word_edge(&seen, anchor.is_some(), opts, allow, review)? {
+                return Ok(None);
+            }
             if self.look_at.is_some_and(|at| self.fx.mono() >= at) {
                 self.look_at = None;
                 return Ok(None);
@@ -5629,6 +5787,7 @@ impl<C: Ctl> Session<'_, C> {
                 .due_at()
                 .into_iter()
                 .chain(self.look_at)
+                .chain(self.word_at)
                 .chain(self.needs_retry_at)
                 .chain(self.attention_retry_at)
                 .min();
@@ -5648,8 +5807,18 @@ impl<C: Ctl> Session<'_, C> {
                 self.host_passed = None;
                 self.host_follows = None;
                 if let Some(anchor) = anchor.as_deref() {
-                    if self.await_gone(&["gone", anchor], step)? {
-                        return Ok(None);
+                    match self.park(&["gone", anchor], step, rest)? {
+                        Wait::Latched => return Ok(None),
+                        Wait::Word(word) => {
+                            self.word_moved(seen.screen.seq, word, review);
+                            continue;
+                        }
+                        Wait::TimedOut => {}
+                        Wait::Unsupported => {
+                            return Err(Fail::Hard(format!(
+                                "await gone {anchor} is not known to this host"
+                            )));
+                        }
                     }
                     if let Some(request) = request.as_deref() {
                         let screen = self.screen()?;
@@ -5660,11 +5829,15 @@ impl<C: Ctl> Session<'_, C> {
                     }
                 } else if let Some(words) = self.agent_wake(&seen, &mut seen_key) {
                     let recheck = step >= AGENT_RECHECK.min(self.setup.wait_step);
-                    match self.wait(&["agent", words], step.min(AGENT_RECHECK))? {
+                    match self.park(&["agent", words], step.min(AGENT_RECHECK), rest)? {
                         Wait::Latched => {
                             self.agent_woke =
                                 Some(seen_key.take().unwrap_or_else(|| self.review_key(&seen)));
                             return Ok(None);
+                        }
+                        Wait::Word(word) => {
+                            self.word_moved(seen.screen.seq, word, review);
+                            continue;
                         }
                         Wait::TimedOut => {
                             if recheck
@@ -5680,8 +5853,15 @@ impl<C: Ctl> Session<'_, C> {
                         }
                         Wait::Unsupported => self.caps.await_agent = Some(false),
                     }
-                } else if let Past::Moved = self.moved_past(seen.screen.seq, until, step_cap)? {
-                    return Ok(None);
+                } else {
+                    match self.moved_past(seen.screen.seq, until, step_cap, rest)? {
+                        Past::Moved => return Ok(None),
+                        Past::Word(word) => {
+                            self.word_moved(seen.screen.seq, word, review);
+                            continue;
+                        }
+                        Past::Still(_) => {}
+                    }
                 }
                 if held && self.question_policy_answers(opts)? {
                     self.question_held = false;
@@ -5699,6 +5879,9 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(Some(End::Timeout(seen)));
             }
             let now = self.fx.mono();
+            if self.word_at.is_some_and(|at| now >= at) {
+                continue;
+            }
             let policy_due = self.due_at().is_some_and(|at| now >= at)
                 || self.look_at.is_some_and(|at| now >= at);
             if !policy_due && self.needs_retry_at.is_some_and(|at| now >= at) {
@@ -5722,6 +5905,46 @@ impl<C: Ctl> Session<'_, C> {
             self.turn_end_now(&seen, opts, allow, review)?;
             return Ok(None);
         }
+    }
+
+    /// A wait at rest woke on a switch of the session's word to `word` ([`Wait::Word`]): the loop
+    /// decides on the word that stands [`Self::word_settle`] from now ([`Self::word_edge`]), and
+    /// its next waits carry `word`, so they wake only on a switch after it. A switch inside the
+    /// settle starts it again.
+    fn word_moved(&mut self, seq: u64, word: Option<Autopilot>, review: &mut dyn Review) {
+        self.autopilot.reported(word);
+        self.word_at = Some(self.fx.mono() + self.word_settle);
+        review.note(&format!(
+            "NOTE seq={seq} autopilot={} the session's Autopilot word moved: decided after a {} ms \
+             settle",
+            word.map_or("-", Autopilot::word),
+            self.word_settle.as_millis()
+        ));
+    }
+
+    /// THE WORD EDGE (v6 §14.10): once a switch has stood its settle ([`Self::word_moved`]), the
+    /// word read then decides the point `seen`; Off leaves it to [`Self::look`]'s park, and a box
+    /// (`boxed`) is left to the look, which presses or leaves it as before.
+    fn word_edge(
+        &mut self,
+        seen: &Turn,
+        boxed: bool,
+        opts: &SuperviseOpts,
+        allow: &[String],
+        review: &mut dyn Review,
+    ) -> Result<bool, Fail> {
+        if !self.word_at.is_some_and(|at| self.fx.mono() >= at) {
+            return Ok(false);
+        }
+        // The edge stays armed until its read comes back: a read lost to a cut is made again at
+        // the next wait, after the loop finds its host again.
+        self.autopilot.begin();
+        let word = self.autopilot_read(opts)?;
+        self.word_at = None;
+        if word != Autopilot::Off && !boxed {
+            self.turn_end_now(seen, opts, allow, review)?;
+        }
+        Ok(true)
     }
 
     fn tell_wait(&mut self, opts: &SuperviseOpts) {
@@ -6096,7 +6319,7 @@ impl<C: Ctl> Session<'_, C> {
             }
         }
         match self.wait(&["seq", &seq.to_string()], Duration::ZERO)? {
-            Wait::Latched => {}
+            Wait::Latched | Wait::Word(_) => {}
             Wait::TimedOut => return Ok(false),
             Wait::Unsupported => {
                 return Err(Fail::Hard(
@@ -6220,6 +6443,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         }
         self.turn_end.fact_answered();
+        self.cruise_carry.at_break();
         let at = *since.get_or_insert_with(|| self.fx.mono());
         let Some(host) = host.filter(|h| h.wants()) else {
             self.withheld = None;
@@ -6240,7 +6464,14 @@ impl<C: Ctl> Session<'_, C> {
                 *since = None;
             }
             let line_gone = stuck.then_some(Guard::HostLine);
-            if self.occupancy_write(screen, line_gone, cfg, review)? {
+            let wrote = self.occupancy_write(screen, line_gone, cfg, review)?;
+            if wrote {
+                *since = None;
+            }
+            // The needs the break's report names, and Cruise's carry where no line went: Cruise
+            // never parks at such a break (owner ruling 2026-10-26).
+            self.break_needs(screen, waited, cfg, review)?;
+            if self.cruise_carry(screen, (at, waited), stuck || wrote, cfg, review)? {
                 *since = None;
             }
             return Ok(());
@@ -6271,6 +6502,9 @@ impl<C: Ctl> Session<'_, C> {
                 self.say_hold(screen.seq, Some(HoldSaid::Held(guard)), review);
             }
             self.occupancy_write(screen, Some(guard), cfg, review)?;
+            if guard != Guard::Settle {
+                self.break_needs(screen, waited, cfg, review)?;
+            }
             return Ok(());
         }
         self.withheld = None;
@@ -6316,7 +6550,20 @@ impl<C: Ctl> Session<'_, C> {
             *since = None;
             line_gone = Some(Guard::HostLine);
         }
-        if self.occupancy_write(screen, line_gone, cfg, review)? {
+        let wrote = self.occupancy_write(screen, line_gone, cfg, review)?;
+        if wrote {
+            *since = None;
+        }
+        // The needs the break's report names, and Cruise's carry where no line went: Cruise never
+        // parks at such a break (owner ruling 2026-10-26).
+        self.break_needs(screen, waited, cfg, review)?;
+        if self.cruise_carry(
+            screen,
+            (at, waited),
+            line_gone.is_some() || wrote,
+            cfg,
+            review,
+        )? {
             *since = None;
         }
         Ok(())
@@ -7244,6 +7491,8 @@ mod claim;
 /// Re-exports the write-verb classifier for harness tape accounting.
 pub(crate) use claim::is_write;
 pub use claim::{CLAIM_HELD, CLAIM_RENEW};
+#[path = "cruise_carry_loop.rs"]
+mod cruise_carry_loop;
 #[path = "escalate.rs"]
 mod escalate;
 #[path = "host_door.rs"]

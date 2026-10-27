@@ -72,30 +72,10 @@ impl Window {
         self.delegate.get_on_main(|delegate| f(delegate))
     }
 
-    /// LOCAL PATCH (aterm): the content view behind `aterm_objc::HasNsView` (`platform/macos.rs`); nil off the main thread, where the `rwh_06` handle below answers `Unavailable`.
+    /// LOCAL PATCH (aterm): the content view behind `aterm_objc::HasNsView` (`platform/macos.rs`); nil off the main thread.
     #[inline]
     pub(crate) fn ns_view(&self) -> Id {
         MainThread::new().map_or(Id::NIL, |mtm| self.delegate.get(mtm).ns_view())
-    }
-
-    #[cfg(feature = "rwh_06")]
-    #[inline]
-    pub(crate) fn raw_window_handle_rwh_06(
-        &self,
-    ) -> Result<rwh_06::RawWindowHandle, rwh_06::HandleError> {
-        if let Some(mtm) = MainThread::new() {
-            Ok(self.delegate.get(mtm).raw_window_handle_rwh_06())
-        } else {
-            Err(rwh_06::HandleError::Unavailable)
-        }
-    }
-
-    #[cfg(feature = "rwh_06")]
-    #[inline]
-    pub(crate) fn raw_display_handle_rwh_06(
-        &self,
-    ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        Ok(rwh_06::RawDisplayHandle::AppKit(rwh_06::AppKitDisplayHandle::new()))
     }
 }
 

@@ -4,3 +4,4 @@
 //! Combined Tier-0 model test binary for `aterm-models-misc`.
 
 mod derived_vitals;
+mod derived_vz;

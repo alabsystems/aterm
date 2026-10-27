@@ -1227,7 +1227,12 @@ const DRIVEN: &[Driven] = &[
         row: "post-landed",
         drive: drive_landed,
         needs: Key::Off,
-        golden: concat!("post-landed 1 off=90\n", "post-landed 2 off=-\n"),
+        // The ring's row for the retirement had no reason; since fix unit
+        // F6 (LOOP-5) the row names the one its client was told.
+        golden: concat!(
+            "post-landed 1 off=90\n",
+            "post-landed 2 off=- reason=undeliverable\n"
+        ),
     },
     Driven {
         row: "hold",

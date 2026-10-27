@@ -251,6 +251,7 @@ fn cpu_view(clusters: &[(&str, &str, Vec<f32>)]) -> CpuView {
         let first = cores.len();
         cores.extend(heat.iter().map(|&v| CoreView {
             load: TrendView::flat(v),
+            measured: true,
         }));
         views.push(ClusterView {
             name: (*name).into(),
@@ -644,9 +645,28 @@ pub(crate) fn light_inks() -> VitalsInks {
     ink::vitals_inks([0xE2, 0xE3, 0xE5], [0x24, 0x29, 0x2F], [0x1A, 0x7F, 0x37])
 }
 
+/// Built-in theme `name`'s band as the deck reads it: its ground, words and accent.
+pub(crate) fn theme_band(name: &str) -> (Rgb, Rgb, Rgb) {
+    let scheme = aterm_types::scheme::builtin(name).expect("a built-in theme");
+    let band = crate::chrome_band::band_colors(crate::chrome_band::ChromePalette {
+        theme: aterm_render::Theme::from(&scheme),
+        ansi: Some(crate::chrome_band::ansi_of_scheme(&scheme)),
+        authored: aterm_messages::tokens::AuthoredChrome::NONE,
+    });
+    (band.bar_bg, band.value, band.accent)
+}
+
+/// The inks the deck solves on built-in theme `name`'s band, as a window drawing it does.
+pub(crate) fn theme_inks(name: &str) -> VitalsInks {
+    let (ground, words, accent) = theme_band(name);
+    ink::vitals_inks(ground, words, accent)
+}
+
 pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
     let long = snap.tab(FRONT).is_some_and(|t| t.label == LONG_TAB);
     DeckInput {
+        network: None,
+        network_target: crate::network_deck::Target::Overview,
         snap: Some(snap),
         prev_snap: None,
         tab_panes: vec![FRONT],
@@ -707,6 +727,10 @@ enum Check {
     Key,
     /// T-G9: the cells a width draws.
     Cells,
+    /// The now marker's widest beat ring meets no words and no mark ([`beat_faults`]).
+    Beat,
+    /// Every row that prints a % draws its three-scope bar ([`bar_faults`]).
+    Bars,
 }
 
 /// What each check found over the T-G4 sweep: one pass lays every scene out at every width, and
@@ -726,6 +750,8 @@ fn swept(check: Check) -> Vec<&'static str> {
                 let worst = d.sc == Scene::Worst;
                 let tagged = |check, found: Vec<String>| found.into_iter().map(move |w| (check, w));
                 tagged(Check::Whole, whole(d))
+                    .chain(tagged(Check::Beat, beat_faults(&d.laid.boxes, BEAT_RING)))
+                    .chain(tagged(Check::Bars, bar_faults(d)))
                     .chain(tagged(Check::Key, if worst { key(d) } else { Vec::new() }))
                     .chain(tagged(
                         Check::Cells,
@@ -796,9 +822,15 @@ fn sweep(
             .into_iter()
             .flat_map(|run| {
                 run.join().unwrap_or_else(|_| {
-                    [Check::Whole, Check::Key, Check::Cells]
-                        .map(|c| (c, "a sweep panicked".to_string()))
-                        .into()
+                    [
+                        Check::Whole,
+                        Check::Key,
+                        Check::Cells,
+                        Check::Beat,
+                        Check::Bars,
+                    ]
+                    .map(|c| (c, "a sweep panicked".to_string()))
+                    .into()
                 })
             })
             .collect()
@@ -858,10 +890,337 @@ fn whole(d: &Swept<'_>) -> Vec<String> {
     why
 }
 
+/// A table's rows and its %, bar-column and bar-under columns, as [`bar_faults`] reads them.
+type BarTable = (Rows, Option<Col>, Option<Col>, Option<Col>);
+
+/// The tables a layout at `w` draws.
+fn bar_tables(form: DeckForm, w: f64, m: &FaceMetrics) -> Vec<BarTable> {
+    match form {
+        DeckForm::Full => {
+            let p = plan::plan_full(w, m);
+            let t = (p.rows, p.pct, p.meter.bar, p.bar_under());
+            if p.ground_only { Vec::new() } else { vec![t] }
+        }
+        DeckForm::Folded => {
+            let p = plan::plan_folded(w, m);
+            if p.ground_only {
+                return Vec::new();
+            }
+            p.blocks
+                .iter()
+                .map(|b| (b.rows, b.pct, b.meter.bar, b.bar_under()))
+                .collect()
+        }
+    }
+}
+
+/// Where a row prints a % and draws no three-scope bar
+/// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5): in the column right of its strip where
+/// one fits, else under the figure, as drawn: the % column's width on whole device px, its top
+/// [`plan::UNDER_GAP`] or more below the digits' baseline as it falls on the device px, and its
+/// foot a device px or more short of the next row's top.
+fn bar_faults(d: &Swept<'_>) -> Vec<String> {
+    let mut why = Vec::new();
+    let boxes = &d.laid.boxes;
+    for (rows, pct, bar, under) in bar_tables(d.form, d.w, d.m) {
+        let Some(pct) = pct else { continue };
+        for r in 0..rows.count {
+            let base = rows.top(r) + rows.baseline;
+            let Some(figure) = boxes.iter().find(|b| {
+                b.kind == BoxKind::Text
+                    && b.room == Some((pct.x, pct.end()))
+                    && (b.r[3] - base).abs() < EPS
+            }) else {
+                continue;
+            };
+            if !figure.text.ends_with('%') {
+                continue;
+            }
+            let drawn = |want: [f64; 4]| {
+                boxes.iter().any(|b| {
+                    b.kind == BoxKind::Bar && b.r.iter().zip(want).all(|(a, w)| (a - w).abs() < EPS)
+                })
+            };
+            let ok = match (bar, under) {
+                (Some(col), None) => {
+                    let top = rows.top(r) + (rows.cell - rows.bar_h) / 2.0;
+                    drawn([col.x, top, col.end(), top + rows.bar_h])
+                }
+                (None, Some(col)) => {
+                    let s = d.s;
+                    let pt = |v: f32| f64::from(v) / s;
+                    let top = pt(px(base, s) + px(plan::UNDER_GAP, s));
+                    let foot = pt(px(rows.top(r + 1), s) - 1.0);
+                    let (x0, x1) = (pt(px(col.x, s)), pt(px(col.end(), s)));
+                    boxes.iter().any(|b| {
+                        b.kind == BoxKind::Bar
+                            && (b.r[0] - x0).abs() < EPS
+                            && (b.r[2] - x1).abs() < EPS
+                            && b.r[1] >= top - EPS
+                            && b.r[3] <= foot + EPS
+                            && b.r[3] > b.r[1]
+                    })
+                }
+                _ => false,
+            };
+            if !ok {
+                why.push(format!(
+                    "row {r} at {:?} prints {:?} without its bar (column {bar:?}, under {under:?})",
+                    pct, figure.text
+                ));
+            }
+        }
+    }
+    why
+}
+
+/// Every row that prints a % draws its scope bar, in every form, at every width, on both faces
+/// at 1× and 2×: in its column right of the strip where it has one, else under the figure, inside
+/// the row's pitch (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §2).
+#[test]
+fn every_row_with_a_percent_draws_its_bar() {
+    let failed = swept(Check::Bars);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+    let m = FaceMetrics::helvetica_neue();
+    for (form, w, under) in [
+        (DeckForm::Folded, 1119.0, false),
+        (DeckForm::Folded, 650.0, false),
+        (DeckForm::Folded, 600.0, true),
+        (DeckForm::Folded, 350.0, true),
+        (DeckForm::Full, 580.0, false),
+        (DeckForm::Full, 400.0, false),
+        (DeckForm::Full, 350.0, true),
+        (DeckForm::Full, 210.0, true),
+    ] {
+        let tables = bar_tables(form, w, &m);
+        let laid = laid(Scene::Calm, w, 2.0, form, &m, false);
+        let (rows, pct, bar, bar_under) = tables[0];
+        let col = if under { bar_under } else { bar }.expect("CONTROL: the column");
+        let y = rows.top(0);
+        let bars = laid
+            .boxes
+            .iter()
+            // The bar under the % notes the rect it draws, on the device px at 2×.
+            .filter(|b| b.kind == BoxKind::Bar && (b.r[0] - col.x).abs() <= 0.25 && b.r[1] > y)
+            .count();
+        assert!(
+            bars >= 4 && pct.is_some(),
+            "CONTROL {form:?} {w} pt: {bars} bars at {col:?}"
+        );
+    }
+}
+
+/// The panels drawn from `x` with their top in `y0..y1`, device px.
+fn panels_at(prims: &[DrawPrim], x: f32, (y0, y1): (f32, f32)) -> Vec<(Rect, [u8; 4])> {
+    prims
+        .iter()
+        .filter_map(|p| match *p {
+            DrawPrim::Panel {
+                x: px0,
+                y,
+                w,
+                h,
+                fill,
+                ..
+            } if (px0 - x).abs() < 0.01 && y >= y0 && y < y1 => Some(((px0, y, w, h), fill)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The bar under a % figure, as drawn (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §5):
+/// the % column's width on whole device px, [`plan::UNDER_H`] tall (1 px at 1× in Full, whose
+/// rows on a half point hold no more), its top [`plan::UNDER_GAP`] or more below the digits'
+/// baseline as it falls on the device px, so it never meets their overshoot, and its foot a
+/// device px or more short of the next row's top, so it never meets that row's cells or digits; every fill nested from its left edge, a scope above zero at
+/// least a device px; the column bar's own inks in both themes and under Increase Contrast; and
+/// a click anywhere on it opens its row's lens, as the bar's column does, though its foot stands
+/// past the row's band.
+#[test]
+fn the_bar_under_the_percent_is_the_bars_on_whole_pixels() {
+    let m = FaceMetrics::helvetica_neue();
+    let snap = scene(Scene::Calm);
+    let mut nested = 0;
+    for (form, w, wide) in [
+        (DeckForm::Folded, 350.0, 1119.0),
+        (DeckForm::Folded, 400.0, 1119.0),
+        (DeckForm::Folded, 450.0, 1119.0),
+        (DeckForm::Full, 210.0, 580.0),
+    ] {
+        for s in [1.0, 2.0] {
+            for (theme, inks) in [("dark", super::tests::dark_inks()), ("light", light_inks())] {
+                for contrast in [false, true] {
+                    let at = format!("{form:?} {w} pt {s}× {theme} contrast {contrast}");
+                    let laid_at = |w: f64| {
+                        let mut input = scene_input(&snap, form);
+                        input.inks = inks;
+                        input.contrast = contrast;
+                        let words = DeckWords::new(&input, &m);
+                        lay(&geom(w, s, form), &input, &words, &m, true)
+                    };
+                    let (narrow, column) = (laid_at(w), laid_at(wide));
+                    let ink = |c: Rgb| rgba(c, 0xFF);
+                    let scope_inks = if contrast {
+                        [inks.machine_ic, inks.aterm_ic, inks.tab_ic]
+                    } else {
+                        [inks.machine, inks.aterm, inks.tab]
+                    };
+                    let bar_inks: Vec<[u8; 4]> = std::iter::once(inks.track)
+                        .chain(scope_inks)
+                        .map(ink)
+                        .collect();
+                    let tables = bar_tables(form, w, &m);
+                    let wide_tables = bar_tables(form, wide, &m);
+                    for (ti, &(rows, _, _, under)) in tables.iter().enumerate() {
+                        let col = under.unwrap_or_else(|| panic!("CONTROL {at}: bars under the %"));
+                        let (_, _, wide_bar, _) = wide_tables[ti];
+                        let wide_bar = wide_bar.expect("CONTROL: the wide deck's column");
+                        let first = if form == DeckForm::Full { 0 } else { ti * 4 };
+                        for r in 0..rows.count {
+                            let Some(&res) = DECK_RESOURCES.get(first + r as usize) else {
+                                continue;
+                            };
+                            let at = format!("{at}, {res:?}");
+                            let base = px(rows.top(r) + rows.baseline, s);
+                            let next = px(rows.top(r + 1), s);
+                            let drawn = panels_at(
+                                &narrow.prims,
+                                px(col.x, s),
+                                (base + px(plan::UNDER_GAP, s), next),
+                            );
+                            let Some(&((x, y, tw, h), _)) = drawn.first() else {
+                                panic!("{at}: no bar under the %");
+                            };
+                            // 2 pt, but Full's 10.5 pt pitch leaves half a point past the line,
+                            // no device px at 1× on the rows whose top is on a half point, and
+                            // every row draws the same line.
+                            let line_h = if form == DeckForm::Full && s == 1.0 {
+                                1.0
+                            } else {
+                                px(plan::UNDER_H, s)
+                            };
+                            assert_eq!(
+                                (x, tw, h),
+                                (px(col.x, s), px(col.end(), s) - px(col.x, s), line_h),
+                                "{at}: the track"
+                            );
+                            assert!(
+                                y + h <= next - 1.0,
+                                "{at}: {y} + {h} meets the next row at {next}"
+                            );
+                            let mut fills = Vec::new();
+                            for &((fx, fy, fw, fh), fill) in &drawn {
+                                assert!(
+                                    [fx, fy, fw, fh].iter().all(|v| v.fract() == 0.0),
+                                    "{at}: {fx} {fy} {fw} {fh} off whole px"
+                                );
+                                assert_eq!((fx, fy, fh), (x, y, h), "{at}: a fill off the line");
+                                assert!((1.0..=tw).contains(&fw), "{at}: a fill {fw} px of {tw}");
+                                assert!(bar_inks.contains(&fill), "{at}: {fill:?} is no bar ink");
+                                fills.push((fw, fill));
+                            }
+                            // Nested: each fill drawn after the track is no wider than the one
+                            // before it.
+                            assert!(
+                                fills.windows(2).skip(1).all(|p| p[1].0 <= p[0].0),
+                                "{at}: {fills:?}"
+                            );
+                            nested += usize::from(fills.len() == 4);
+                            // The same inks as the bar's column.
+                            let wide_rows = wide_tables[ti].0;
+                            let band = (
+                                px(wide_rows.top(r), s),
+                                px(wide_rows.top(r) + wide_rows.cell, s),
+                            );
+                            let mut theirs: Vec<[u8; 4]> =
+                                panels_at(&column.prims, px(wide_bar.x, s), band)
+                                    .into_iter()
+                                    .map(|(_, fill)| fill)
+                                    .filter(|f| bar_inks.contains(f))
+                                    .collect();
+                            let mut ours: Vec<[u8; 4]> = fills.iter().map(|f| f.1).collect();
+                            theirs.sort_unstable();
+                            ours.sort_unstable();
+                            assert_eq!(ours, theirs, "{at}: the column's inks");
+                            // A click anywhere on it, its foot past the row's band included,
+                            // opens the row's lens; past it the next row's band takes over.
+                            let mid = x + tw / 2.0;
+                            for py in [y + 0.5, y + h - 0.5] {
+                                assert_eq!(
+                                    hit_at(&narrow.hits, f64::from(mid) / s, f64::from(py) / s, s),
+                                    row_hit(res, Bar::Global),
+                                    "{at}: a click at {py} px"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(nested > 20, "CONTROL: {nested} bars draw all three scopes");
+}
+
 #[test]
 fn no_text_overlaps_and_none_leaves_the_card() {
     let failed = swept(Check::Whole);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// How far the now marker's beat reaches from the dot's centre, pt: the dot and the ring's whole
+/// widening.
+const BEAT_RING: f64 = crate::stats_live::DOT_R + crate::stats_live::BEAT_REACH;
+
+/// Where a ring of radius `reach` round each now dot (its `Mark` box "now") meets a word, a
+/// swatch or another mark among `boxes`: T-G4's box for the dot is the dot alone, so the sweep did
+/// not see the beat's ring cross the `now` beside it at every width (the review of 2026-10-26).
+fn beat_faults(boxes: &[Boxed], reach: f64) -> Vec<String> {
+    let mut why = Vec::new();
+    for dot in boxes
+        .iter()
+        .filter(|b| b.kind == BoxKind::Mark && b.text == "now")
+    {
+        let (cx, cy) = ((dot.r[0] + dot.r[2]) / 2.0, (dot.r[1] + dot.r[3]) / 2.0);
+        for b in boxes {
+            if std::ptr::eq(b, dot)
+                || !matches!(b.kind, BoxKind::Text | BoxKind::Swatch | BoxKind::Mark)
+            {
+                continue;
+            }
+            let dx = (b.r[0] - cx).max(cx - b.r[2]).max(0.0);
+            let dy = (b.r[1] - cy).max(cy - b.r[3]).max(0.0);
+            if dx.hypot(dy) < reach - EPS {
+                why.push(format!(
+                    "the beat round ({cx}, {cy}) meets {:?} {:?} {:?}",
+                    b.kind, b.text, b.r
+                ));
+            }
+        }
+    }
+    why
+}
+
+/// The now dot's beat, widest, meets no words and no mark at any width, in either form or face,
+/// at 1× or 2× (the % column ends `PCT_TO_STRIP` before the strip, past the ring's reach).
+#[test]
+fn the_beat_ring_meets_no_words() {
+    let failed = swept(Check::Beat);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+    // CONTROL: the check sees the `now` beside the dot, a point past the ring.
+    let m = deck_metrics();
+    let d = laid(Scene::Calm, 600.0, 2.0, DeckForm::Folded, &m, false);
+    let dots = d
+        .boxes
+        .iter()
+        .filter(|b| b.kind == BoxKind::Mark && b.text == "now")
+        .count();
+    assert_eq!(dots, 2, "CONTROL: a dot over each block's strip");
+    assert_eq!(beat_faults(&d.boxes, BEAT_RING), [""; 0]);
+    let wider = beat_faults(&d.boxes, BEAT_RING + 1.5);
+    assert!(
+        wider.iter().any(|why| why.contains("Text \"now\"")),
+        "CONTROL: {wider:?}"
+    );
 }
 
 fn key(d: &Swept<'_>) -> Vec<String> {
@@ -869,8 +1228,9 @@ fn key(d: &Swept<'_>) -> Vec<String> {
     let Some(head) = d.laid.head.as_ref() else {
         return why;
     };
+    let strips = true;
     let over_w = KeyItem::Over.width(d.m);
-    let fits = head.key.spans.iter().any(|s| s.x1 - s.x0 >= over_w - EPS);
+    let fits = strips && head.key.spans.iter().any(|s| s.x1 - s.x0 >= over_w - EPS);
     let drawn = |text: &str| {
         d.laid
             .boxes
@@ -881,14 +1241,19 @@ fn key(d: &Swept<'_>) -> Vec<String> {
     if fits && drawn("over max") == 0 {
         why.push("a span fits \"over max\" and it is not drawn".into());
     }
-    let both_states = head
+    // Where every table's state stands over its names, the key may lose its room to them.
+    let tables = if d.form == DeckForm::Full { 1 } else { 2 };
+    let all_states = head
         .labels
         .iter()
-        .filter(|l| l.label == Label::State)
+        .filter(|l| matches!(l.label, Label::State(_)))
         .count()
-        == 2;
-    if !fits && !both_states {
+        == tables;
+    if !fits && !all_states && strips {
         why.push(format!("no span fits \"over max\": {:?}", head.key.spans));
+    }
+    if !strips && drawn("over max") > 0 {
+        why.push("\"over max\" keys no strip".into());
     }
     // The two blocks share one time axis: their strips span the same seconds, and its label
     // stands once.
@@ -897,7 +1262,7 @@ fn key(d: &Swept<'_>) -> Vec<String> {
         .iter()
         .find(|l| l.label == crate::stats_plan::Label::Time)
         .map_or(0, |l| drawn(&l.text));
-    if d.form == DeckForm::Folded && time != 1 {
+    if d.form == DeckForm::Folded && time != usize::from(strips) {
         why.push(format!("the time label {time} times"));
     }
     let _ = (d.face, d.s);
@@ -947,10 +1312,22 @@ fn cpu_details(w: f64, form: DeckForm, m: &FaceMetrics) -> Option<(Col, f64, f64
     }
 }
 
+/// The narrowest Full deck whose Details column is `w` pt or wider.
+fn full_with_details(w: f64, m: &FaceMetrics) -> f64 {
+    (600..=6000)
+        .map(f64::from)
+        .find(|&deck| plan::plan_full(deck, m).details.is_some_and(|d| d.w >= w))
+        .unwrap_or_else(|| panic!("no Full deck has {w} pt of Details"))
+}
+
+/// The CPU's Details fold by their column's width: its tab off the busiest clause first, then
+/// the cause to its short form, then the busiest clause before the load.
 #[test]
 fn the_cause_clause_folds_before_load_and_after_busiest() {
     let m = FaceMetrics::helvetica_neue();
     let sep = " \u{b7} ";
+    let [wide_w, mid_w, between_w, owner_w] =
+        [487.0, 242.0, 183.0, 162.0].map(|d| full_with_details(d, &m));
     let drawn = |sc: Scene, w: f64, form: DeckForm| -> Option<(Vec<String>, Vec<Boxed>)> {
         let laid = laid(sc, w, 2.0, form, &m, false);
         let (col, top, cell) = cpu_details(w, form, &m)?;
@@ -968,7 +1345,7 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
             .collect();
         Some((texts, marks))
     };
-    let (wide, marks) = drawn(Scene::Trouble, 1424.0, DeckForm::Full).expect("Details at W 1424");
+    let (wide, marks) = drawn(Scene::Trouble, wide_w, DeckForm::Full).expect("Details");
     assert_eq!(
         wide,
         [
@@ -981,7 +1358,7 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
     );
     let cause: Vec<&Boxed> = marks.iter().filter(|b| b.text == "cause").collect();
     assert_eq!(cause.len(), 1, "one \u{2235}: {marks:?}");
-    let full = laid(Scene::Trouble, 1424.0, 2.0, DeckForm::Full, &m, true);
+    let full = laid(Scene::Trouble, wide_w, 2.0, DeckForm::Full, &m, true);
     let words = full
         .boxes
         .iter()
@@ -1022,7 +1399,7 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
         "\u{2235}, not \u{2234}: {dots:?}"
     );
 
-    let (mid, _) = drawn(Scene::Trouble, 1119.0, DeckForm::Full).expect("Details at W 1119");
+    let (mid, _) = drawn(Scene::Trouble, mid_w, DeckForm::Full).expect("Details");
     assert_eq!(
         mid,
         [
@@ -1034,7 +1411,7 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
         ],
         "the busiest clause sheds its tab first"
     );
-    let (between, _) = drawn(Scene::Trouble, 1060.0, DeckForm::Full).expect("Details at W 1060");
+    let (between, _) = drawn(Scene::Trouble, between_w, DeckForm::Full).expect("Details");
     assert_eq!(
         between,
         [
@@ -1046,9 +1423,7 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
         ],
         "then the cause shortens"
     );
-    let (col, ..) = cpu_details(1039.0, DeckForm::Full, &m).expect("Details at W 1039");
-    assert!((col.w - 178.0).abs() < 0.5, "a 178 pt column: {col:?}");
-    let (owner, _) = drawn(Scene::Trouble, 1039.0, DeckForm::Full).expect("Details");
+    let (owner, _) = drawn(Scene::Trouble, owner_w, DeckForm::Full).expect("Details");
     assert_eq!(
         owner,
         ["8 waiting for a core", sep, "Spotlight"],
@@ -1178,28 +1553,32 @@ fn core_squares_never_touch() {
     assert!(squares > 10_000, "CONTROL: {squares} squares drawn");
 }
 
-/// Full slim's compact amount keeps the freed figure; Folded says the glance (§6.8), whose disk
-/// amount is the used figure alone: freed is a standing fact the lens keeps.
+/// The disk's run is its used space with the maximum (`1.11 of 2.00 TB`), where a run stands;
+/// freed is a standing fact the lens keeps, never the deck.
 #[test]
-fn freed_reaches_the_compact_amounts() {
+fn freed_stays_out_of_the_deck() {
     let m = FaceMetrics::helvetica_neue();
-    for (w, form, want) in [
-        (1119.0, DeckForm::Folded, "1.11 TB"),
-        (350.0, DeckForm::Full, "1.11 TB used · freed 41 GB"),
-        (348.0, DeckForm::Full, "1.11 TB used · freed 41 GB"),
+    for (w, form, run) in [
+        (2560.0, DeckForm::Folded, true),
+        (1424.0, DeckForm::Folded, false),
+        (1039.0, DeckForm::Folded, false),
+        (1039.0, DeckForm::Full, true),
+        (700.0, DeckForm::Full, true),
     ] {
         for s in [1.0, 2.0] {
             let laid = laid(Scene::Calm, w, s, form, &m, false);
-            let amount = laid
-                .boxes
-                .iter()
-                .find(|b| b.kind == BoxKind::Text && b.text.starts_with("1.11 TB"))
-                .map(|b| b.text.as_str());
-            assert_eq!(amount, Some(want), "{form:?} {w} pt at {s}×");
+            let said = |t: &str| {
+                laid.boxes
+                    .iter()
+                    .any(|b| b.kind == BoxKind::Text && b.text == t)
+            };
+            assert_eq!(said("1.11 of 2.00 TB"), run, "{form:?} {w} pt at {s}×");
             assert!(
-                form == DeckForm::Full || !laid.boxes.iter().any(|b| b.text.contains("freed")),
-                "{form:?} {w} pt at {s}×"
+                !said("1.11 TB"),
+                "{form:?} {w} pt at {s}×: a run without its maximum"
             );
+            let freed = laid.boxes.iter().any(|b| b.text.contains("freed"));
+            assert!(!freed, "{form:?} {w} pt at {s}×");
         }
     }
 }
@@ -1272,8 +1651,7 @@ fn a_gap_is_never_drawn_as_step_zero() {
         (DeckForm::Full, 350.0, 1.0),
         (DeckForm::Full, 180.0, 1.0),
         (DeckForm::Folded, 1119.0, 2.0),
-        (DeckForm::Folded, 450.0, 1.0),
-        (DeckForm::Folded, 350.0, 1.0),
+        (DeckForm::Folded, 550.0, 1.0),
     ] {
         let snap = if form == DeckForm::Folded || w <= 200.0 {
             &holed
@@ -1387,62 +1765,49 @@ fn texts_in(laid: &Laid, col: Col, y0: f64, y1: f64) -> Vec<String> {
     found.iter().map(|b| b.text.clone()).collect()
 }
 
-/// Rule S on one row: with no Details, its amount slot says its state, at the first tier that fits.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one row's words, column and band"
-)]
+/// Rule S on one row: with no Details, the figure run at the end of its bar says its state after
+/// the reading, its clause before its word; the reading is never given up for it (review of
+/// 2026-10-26: "under memory pressure the unit cell drops the maximum"). Where neither fits, the
+/// run says the reading alone and the header the state.
 fn rule_s(
     laid: &Laid,
     m: &FaceMetrics,
     snap: &Snapshot,
     res: Resource,
-    col: Col,
-    rows: Rows,
-    r: u32,
+    (meter, rows, r): (plan::Meter, Rows, u32),
     at: &str,
-    glance: bool,
 ) {
-    let Some(mut st) = words::state(res, snap, &MAC) else {
+    let Some(st) = words::state(res, snap, &MAC) else {
         return;
     };
-    // Full wide and mid and Folded say the glance: its amount before the state (`897`, not
-    // `897/16,000`).
-    if glance {
-        st.amount_forms = words::glance_amount(res, &snap.resources[res.index()], &MAC);
-    }
+    let run = meter.run.unwrap_or_else(|| panic!("{at}: a figure run"));
     let pt = rows.amount_pt;
+    let forms = words::glance_run(res, &snap.resources[res.index()], snap, &MAC);
     let top = rows.top(r);
-    let drawn = texts_in(laid, col, top - 1.0, top + rows.cell + 1.0);
+    let drawn = texts_in(laid, run, top - 1.0, top + rows.cell + 1.0);
     let mut says: Vec<&str> = st.clauses.iter().map(String::as_str).collect();
     says.push(&st.word);
-    let pair = says.iter().find_map(|said| {
-        st.amount_forms
-            .iter()
-            .find(|am| {
-                m.width(am, pt, false) + 6.0 + 1.1 * pt + m.width(said, pt, true) <= col.w + EPS
-            })
-            .map(|am| vec![am.clone(), (*said).to_owned()])
-    });
-    match pair {
-        Some(pair) => assert_eq!(drawn, pair, "{at}: {res:?}"),
-        None => {
-            let alone = says
+    let form = forms
+        .iter()
+        .find(|f| m.width(f, pt, false) <= run.w + EPS)
+        .cloned();
+    let used = form.as_ref().map_or(0.0, |f| m.width(f, pt, false) + 6.0);
+    let said = says
+        .iter()
+        .find(|said| used + 1.1 * pt + m.width(said, pt, true) <= run.w + EPS);
+    let want: Vec<String> = form
+        .into_iter()
+        .chain(said.map(|s| (*s).to_owned()))
+        .collect();
+    assert_eq!(drawn, want, "{at}: {res:?}");
+    if said.is_none() {
+        let head = laid.head.as_ref().expect("a header");
+        assert!(
+            head.labels
                 .iter()
-                .find(|said| 1.1 * pt + m.width(said, pt, true) <= col.w + EPS);
-            match alone {
-                Some(said) => assert_eq!(drawn, vec![(*said).to_owned()], "{at}: {res:?}"),
-                None => {
-                    let cut = drawn
-                        .first()
-                        .map(|s| s.trim_end_matches('\u{2026}').to_owned());
-                    assert!(
-                        drawn.len() == 1 && cut.is_some_and(|c| st.word.starts_with(&c)),
-                        "{at}: {res:?} says {drawn:?}"
-                    );
-                }
-            }
-        }
+                .any(|l| matches!(l.label, Label::State(_))),
+            "{at}: {res:?}: the header says the state"
+        );
     }
 }
 
@@ -1465,11 +1830,17 @@ fn state_is_said_in_words_without_details() {
         if p.details.is_some() {
             continue;
         }
-        let col = p.amount.unwrap_or_else(|| panic!("{at}: an amount column"));
+        if p.meter.run.is_none() {
+            let head = laid
+                .head
+                .as_ref()
+                .unwrap_or_else(|| panic!("{at}: a header"));
+            said += usize::from(says_worst(head, &snap, &DECK_RESOURCES, 0, &at));
+            continue;
+        }
         for (i, &res) in DECK_RESOURCES.iter().enumerate() {
             if states.contains(&res) {
-                let glance = matches!(kind, FullKind::Wide | FullKind::Mid);
-                rule_s(&laid, &m, &snap, res, col, p.rows, i as u32, &at, glance);
+                rule_s(&laid, &m, &snap, res, (p.meter, p.rows, i as u32), &at);
                 said += 1;
             }
         }
@@ -1492,7 +1863,7 @@ fn state_is_said_in_words_without_details() {
                 .zip(0_u32..)
                 .map(|(r, i)| (i, r))
                 .collect();
-            match (b.details, b.amount) {
+            match (b.details, b.meter.run) {
                 (Some(details), _) => {
                     for &(r, res) in &ours {
                         let Some(st) = words::state(res, &snap, &MAC) else {
@@ -1500,7 +1871,7 @@ fn state_is_said_in_words_without_details() {
                         };
                         let top = b.rows.top(r);
                         let drawn = texts_in(&laid, details, top - 1.0, top + b.rows.cell + 1.0);
-                        let kept = words::glance_details(res, &snap, &MAC)
+                        let kept = words::glance_details(res, &snap, &[], &MAC)
                             .into_iter()
                             .find(|c| c.keep)
                             .map(|c| c.forms)
@@ -1513,46 +1884,64 @@ fn state_is_said_in_words_without_details() {
                         said += 1;
                     }
                 }
-                (None, Some(amount)) => {
+                (None, Some(_)) => {
                     for &(r, res) in &ours {
                         if states.contains(&res) {
-                            rule_s(&laid, &m, &snap, res, amount, b.rows, r, &at, true);
+                            rule_s(&laid, &m, &snap, res, (b.meter, b.rows, r), &at);
                             said += 1;
                         }
                     }
                 }
                 (None, None) => {
-                    let worst = ours
-                        .iter()
-                        .filter_map(|&(_, res)| words::state(res, &snap, &MAC).map(|st| (res, st)))
-                        .reduce(|a, b| {
-                            let rank =
-                                |st: &words::StateWords| (st.state, st.mark == words::Mark::Low);
-                            if rank(&b.1) > rank(&a.1) { b } else { a }
-                        });
-                    let label = head
-                        .labels
-                        .iter()
-                        .find(|l| l.label == Label::State && (l.x - b.name.x).abs() < EPS);
-                    match worst {
-                        Some((res, st)) => {
-                            let name = words::resource_name(res);
-                            let named = res == Resource::Processes || st.label.starts_with(name);
-                            assert!(named, "{at}: {res:?} says {:?}", st.label);
-                            assert!(
-                                label.is_some_and(|l| l.text.starts_with(&st.label)),
-                                "{at}: block {bi} says {:?}: {label:?}",
-                                st.label
-                            );
-                            said += 1;
-                        }
-                        None => assert!(label.is_none(), "{at}: {label:?}"),
-                    }
+                    let ours: Vec<Resource> = ours.iter().map(|&(_, res)| res).collect();
+                    let block = u8::try_from(bi).expect("two blocks");
+                    said += usize::from(says_worst(head, &snap, &ours, block, &at));
                 }
             }
         }
     }
     assert!(said >= 10, "CONTROL: {said} states read");
+}
+
+/// Whether `head` says the worst state of the table `block`, whose rows are `ours`, over its
+/// names (asserted where one is due); `false` where none is due.
+fn says_worst(
+    head: &plan::HeaderPlan,
+    snap: &Snapshot,
+    ours: &[Resource],
+    block: u8,
+    at: &str,
+) -> bool {
+    let worst = ours
+        .iter()
+        .filter_map(|&res| words::state(res, snap, &MAC).map(|st| (res, st)))
+        .reduce(|a, b| {
+            let rank = |st: &words::StateWords| (st.state, st.mark == words::Mark::Low);
+            if rank(&b.1) > rank(&a.1) { b } else { a }
+        });
+    let label = head.labels.iter().find(|l| l.label == Label::State(block));
+    let Some((res, st)) = worst else {
+        assert!(label.is_none(), "{at}: {label:?}");
+        return false;
+    };
+    let name = words::resource_name(res);
+    let named = res == Resource::Processes || st.label.starts_with(name);
+    assert!(named, "{at}: {res:?} says {:?}", st.label);
+    // Whole, or cut to the room it has.
+    assert!(
+        label.is_some_and(|l| says_state(&l.text, &st.label)),
+        "{at}: block {block} says {:?}: {label:?}",
+        st.label
+    );
+    true
+}
+
+/// Whether a header's state words `text` say `label`: whole (with its `+n`), or cut to fit.
+fn says_state(text: &str, label: &str) -> bool {
+    text.starts_with(label)
+        || text
+            .strip_suffix('\u{2026}')
+            .is_some_and(|cut| cut.len() >= 4 && label.starts_with(cut))
 }
 
 fn hit_at(hits: &[Hit], x: f64, y: f64, s: f64) -> Option<HitKind> {
@@ -1569,18 +1958,18 @@ fn row_hit(res: Resource, bar: Bar) -> Option<HitKind> {
     Some(HitKind::Row(Instrument::of(res), bar))
 }
 
-/// Every column of a row names the row.
-#[expect(clippy::too_many_arguments, reason = "one row's columns and band")]
+/// Every column of a row names the row, and its scope bar `bar` names this tab's segment, then
+/// aterm's, then the machine's, left to right: where the row's bar has a tab's or aterm's fill a
+/// click on it opens the lens on that scope (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §3).
+/// Answers which scopes' segments the row's bar named.
 fn check_row(
     hits: &[Hit],
     s: f64,
-    res: Resource,
-    rows: Rows,
-    r: u32,
+    (res, rows, r): (Resource, Rows, u32),
     cols: &[Col],
-    scopes: Option<(Col, Col)>,
+    bar: Option<Col>,
     at: &str,
-) {
+) -> [bool; 2] {
     let top = rows.top(r);
     let gap = rows.pitch - rows.cell;
     let mid = top + rows.cell / 2.0;
@@ -1601,16 +1990,34 @@ fn check_row(
             "{at}: {res:?} at y {y}"
         );
     }
-    if let Some((aterm, tab)) = scopes {
-        for (col, bar) in [(aterm, Bar::Aterm), (tab, Bar::Tab)] {
-            let x = col.x + col.w / 2.0;
-            assert_eq!(
-                hit_at(hits, x, mid, s),
-                row_hit(res, bar),
-                "{at}: {res:?} {bar:?}"
+    let mut named = [false; 2];
+    if let Some(bar) = bar {
+        let order = |b: Bar| match b {
+            Bar::Tab => 0,
+            Bar::Aterm => 1,
+            Bar::Global => 2,
+        };
+        let mut last = 0;
+        let steps = (bar.w * 2.0 * s).floor() as u32;
+        for i in 0..steps {
+            let x = bar.x + (f64::from(i) + 0.5) / (2.0 * s);
+            let Some(HitKind::Row(inst, b)) = hit_at(hits, x, mid, s) else {
+                panic!("{at}: {res:?}'s bar at {x} names no row");
+            };
+            assert_eq!(inst, Instrument::of(res), "{at}: {res:?}'s bar at {x}");
+            assert!(
+                order(b) >= last,
+                "{at}: {res:?}'s bar names {b:?} at {x}, out of order"
             );
+            last = order(b);
+            match b {
+                Bar::Tab => named[0] = true,
+                Bar::Aterm => named[1] = true,
+                Bar::Global => {}
+            }
         }
     }
+    named
 }
 
 fn strip_col(strip: Strip) -> Col {
@@ -1623,16 +2030,32 @@ fn strip_col(strip: Strip) -> Col {
 #[test]
 fn hit_map() {
     let m = FaceMetrics::helvetica_neue();
+    let mut named = [0_u32; 2];
+    let mut tally = |n: [bool; 2]| {
+        for (seen, n) in named.iter_mut().zip(n) {
+            *seen += u32::from(n);
+        }
+    };
     for (w, s) in [(1119.0, 2.0), (900.0, 2.0), (550.0, 2.0), (350.0, 1.0)] {
         let p = plan::plan_full(w, &m);
         let at = format!("Full {:?} at {w} pt, {s}×", p.kind);
         let laid = laid(Scene::Calm, w, s, DeckForm::Full, &m, true);
         let hits = &laid.hits;
-        let mut cols = vec![p.name, strip_col(p.strip)];
-        cols.extend([p.pct, p.bar, p.amount, p.details].into_iter().flatten());
-        let scopes = p.aterm.zip(p.tab);
         for (i, &res) in DECK_RESOURCES.iter().enumerate() {
-            check_row(hits, s, res, p.rows, i as u32, &cols, scopes, &at);
+            let cols: Vec<Col> = [p.name, strip_col(p.strip)]
+                .into_iter()
+                .chain(p.pct)
+                .chain(p.meter.run)
+                .chain(p.details)
+                .collect();
+            tally(check_row(
+                hits,
+                s,
+                (res, p.rows, i as u32),
+                &cols,
+                p.meter.bar,
+                &at,
+            ));
         }
         let header = hit_at(hits, p.strip.x + 20.0, 6.0, s);
         assert_eq!(header, Some(HitKind::Header), "{at}");
@@ -1657,9 +2080,6 @@ fn hit_map() {
         let laid = laid(Scene::Calm, w, s, DeckForm::Folded, &m, true);
         let hits = &laid.hits;
         for (bi, b) in p.blocks.iter().enumerate() {
-            let mut cols = vec![b.name, strip_col(b.strip)];
-            cols.extend([b.pct, b.bar, b.amount, b.details].into_iter().flatten());
-            let scopes = b.aterm.zip(b.tab);
             for (res, r) in DECK_RESOURCES
                 .iter()
                 .copied()
@@ -1667,7 +2087,20 @@ fn hit_map() {
                 .take(4)
                 .zip(0_u32..)
             {
-                check_row(hits, s, res, b.rows, r, &cols, scopes, &at);
+                let cols: Vec<Col> = [b.name, strip_col(b.strip)]
+                    .into_iter()
+                    .chain(b.pct)
+                    .chain(b.meter.run)
+                    .chain(b.details)
+                    .collect();
+                tally(check_row(
+                    hits,
+                    s,
+                    (res, b.rows, r),
+                    &cols,
+                    b.meter.bar,
+                    &at,
+                ));
             }
             if bi == 1 {
                 let y = b.rows.top(3) + b.rows.cell / 2.0;
@@ -1697,13 +2130,17 @@ fn hit_map() {
             "{at}"
         );
     }
+    assert!(
+        named.iter().all(|&n| n > 3),
+        "CONTROL: rows whose bar named the tab's and aterm's segments: {named:?}"
+    );
     let w = folded_width(BlockKind::Slim, &m);
     let laid = laid(Scene::Trouble, w, 2.0, DeckForm::Folded, &m, true);
     let head = laid.head.as_ref().expect("a header");
     let labels: Vec<_> = head
         .labels
         .iter()
-        .filter(|l| l.label == Label::State)
+        .filter(|l| matches!(l.label, Label::State(_)))
         .collect();
     assert!(
         !labels.is_empty(),
@@ -1715,7 +2152,7 @@ fn hit_map() {
             .copied()
             .find(|&r| {
                 words::state(r, &scene(Scene::Trouble), &MAC)
-                    .is_some_and(|st| label.text.starts_with(&st.label))
+                    .is_some_and(|st| says_state(&label.text, &st.label))
             })
             .expect("the label says a row's state");
         assert_eq!(
@@ -1823,95 +2260,111 @@ fn time_gaps_and_special_event_lines_render_distinctly_on_the_multi_scale_strip(
     ];
     let inks = super::tests::dark_inks();
     for form in [DeckForm::Full, DeckForm::Folded] {
-        let w = 1119.0;
-        let s = 2.0;
-        let input = scene_input(&snap, form);
-        let words = DeckWords::new(&input, &m);
-        let laid = lay(&geom(w, s, form), &input, &words, &m, true);
-        let strip = match form {
-            DeckForm::Full => plan::plan_full(w, &m).strip,
-            DeckForm::Folded => plan::plan_folded(w, &m).blocks[0].strip,
-        };
-
-        // Gap cells emit horizontal `DrawPrim::Dashed` top/bottom rails (`h == 0.0 && w > 0.0`),
-        // distinct from hollow_cell (`DrawPrim::Stroke` in `inks.hollow`).
-        let gap_rails = laid
-            .prims
-            .iter()
-            .filter(|&p| matches!(*p, DrawPrim::Dashed { w, h, .. } if w > 0.0 && h == 0.0))
-            .count();
-        assert!(
-            gap_rails >= 4,
-            "{form:?}: sleep/crash time gaps emit horizontal dashed gap rails ({gap_rails})"
-        );
-
-        // Verify each of the 4 event kinds renders at its exact continuous X coordinate on the
-        // multi-scale strip (`strip.x_at_age_ms`).
-        for ev in &snap.strip_events {
-            let x_pt = strip
-                .x_at_age_ms(AT - ev.at_unix_ms)
-                .expect("event within 15m/1h horizon");
-            let ex = (x_pt * s) as f32;
-            let want_rgb = match ev.kind {
-                aterm_vitals::StripEventKind::Crash => inks.critical_text,
-                aterm_vitals::StripEventKind::Restart => inks.warn_text,
-                aterm_vitals::StripEventKind::SleepWake => inks.stuck,
-                aterm_vitals::StripEventKind::PressureSpike => inks.over,
+        for contrast in [false, true] {
+            let w = 1119.0;
+            let s = 2.0;
+            let mut input = scene_input(&snap, form);
+            input.contrast = contrast;
+            let words = DeckWords::new(&input, &m);
+            let laid = lay(&geom(w, s, form), &input, &words, &m, true);
+            let strip = match form {
+                DeckForm::Full => plan::plan_full(w, &m).strip,
+                DeckForm::Folded => plan::plan_folded(w, &m).blocks[0].strip,
             };
-            // Cap pip on the X-axis rail.
-            let has_pip = laid.prims.iter().any(|p| match *p {
-                DrawPrim::Panel { x, w, h, fill, .. } => {
-                    (x + w / 2.0 - ex).abs() <= 2.0
-                        && (w - h).abs() < 0.01
-                        && w >= 3.0
-                        && [fill[0], fill[1], fill[2]] == want_rgb
-                }
-                _ => false,
-            });
+
+            // Gap cells emit horizontal `DrawPrim::Dashed` top/bottom rails (`h == 0.0 && w > 0.0`),
+            // distinct from hollow_cell (`DrawPrim::Stroke` in `inks.hollow`).
+            let gap_rails = laid
+                .prims
+                .iter()
+                .filter(|&p| matches!(*p, DrawPrim::Dashed { w, h, .. } if w > 0.0 && h == 0.0))
+                .count();
             assert!(
-                has_pip,
-                "{form:?}: {:?} missing X-axis cap pip at {ex}",
-                ev.kind
+                gap_rails >= 4,
+                "{form:?}: sleep/crash time gaps emit horizontal dashed gap rails ({gap_rails})"
             );
 
-            // Vertical event line through the strip rows: solid Panel for Crash/Restart, vertical
-            // Dashed for SleepWake/PressureSpike.
-            let has_line = match ev.kind {
-                aterm_vitals::StripEventKind::Crash | aterm_vitals::StripEventKind::Restart => {
-                    laid.prims.iter().any(|p| match *p {
-                        DrawPrim::Panel { x, w, h, fill, .. } => {
-                            w <= 3.0
-                                && h > 15.0
-                                && (x + w / 2.0 - ex).abs() <= 2.0
-                                && [fill[0], fill[1], fill[2]] == want_rgb
-                        }
-                        _ => false,
-                    })
-                }
-                aterm_vitals::StripEventKind::SleepWake
-                | aterm_vitals::StripEventKind::PressureSpike => {
-                    laid.prims.iter().any(|p| match *p {
-                        DrawPrim::Dashed { x, w, h, color, .. } => {
-                            w == 0.0
-                                && h > 15.0
-                                && (x - ex).abs() <= 2.0
-                                && [color[0], color[1], color[2]] == want_rgb
-                        }
-                        _ => false,
-                    })
-                }
-            };
-            assert!(
-                has_line,
-                "{form:?}: {:?} missing vertical event marker line at {ex}",
-                ev.kind
-            );
+            // Verify each of the 4 event kinds renders at its exact continuous X coordinate on the
+            // multi-scale strip (`strip.x_at_age_ms`).
+            for ev in &snap.strip_events {
+                let x_pt = strip
+                    .x_at_age_ms(AT - ev.at_unix_ms)
+                    .expect("event within 15m/1h horizon");
+                let ex = (x_pt * s) as f32;
+                let want_rgb = match ev.kind {
+                    aterm_vitals::StripEventKind::Crash => inks.critical_text,
+                    aterm_vitals::StripEventKind::Restart => inks.warn_text,
+                    aterm_vitals::StripEventKind::SleepWake => inks.stuck,
+                    aterm_vitals::StripEventKind::PressureSpike => inks.warn_text,
+                };
+                // Cap pip on the X-axis rail.
+                let has_pip = laid.prims.iter().any(|p| match *p {
+                    DrawPrim::Panel { x, w, h, fill, .. } => {
+                        (x + w / 2.0 - ex).abs() <= 2.0
+                            && (w - h).abs() < 0.01
+                            && w >= 3.0
+                            && [fill[0], fill[1], fill[2]] == want_rgb
+                    }
+                    _ => false,
+                });
+                assert!(
+                    has_pip,
+                    "{form:?}: {:?} missing X-axis cap pip at {ex}",
+                    ev.kind
+                );
+
+                // Vertical event line through the strip rows: solid Panel for Crash/Restart, vertical
+                // Dashed for SleepWake/PressureSpike.
+                let has_line = match ev.kind {
+                    aterm_vitals::StripEventKind::Crash | aterm_vitals::StripEventKind::Restart => {
+                        laid.prims.iter().any(|p| match *p {
+                            DrawPrim::Panel { x, w, h, fill, .. } => {
+                                w <= 3.0
+                                    && h > 15.0
+                                    && (x + w / 2.0 - ex).abs() <= 2.0
+                                    && [fill[0], fill[1], fill[2]] == want_rgb
+                            }
+                            _ => false,
+                        })
+                    }
+                    aterm_vitals::StripEventKind::SleepWake
+                    | aterm_vitals::StripEventKind::PressureSpike => {
+                        laid.prims.iter().any(|p| match *p {
+                            DrawPrim::Dashed { x, w, h, color, .. } => {
+                                w == 0.0
+                                    && h > 15.0
+                                    && (x - ex).abs() <= 2.0
+                                    && [color[0], color[1], color[2]] == want_rgb
+                                    && if contrast {
+                                        color[3] >= 0xD0
+                                    } else {
+                                        color[3] > 0 && color[3] < 0x80
+                                    }
+                            }
+                            _ => false,
+                        })
+                    }
+                };
+                assert!(
+                    has_line,
+                    "{form:?}: {:?} missing vertical event marker line at {ex}",
+                    ev.kind
+                );
+            }
         }
     }
 }
 
+/// Every scope bar nests the three scopes, 0.144.0's bar as main draws it (the owner, 2026-10-26:
+/// "the bar of "this Mac, aterm, Tab 1" that's great"): on the five resources the machine's fill,
+/// aterm's inset in it and this tab's inset in that, from one left edge. Where a run stands at
+/// its end it says each row's reading with its maximum (the legend then names no totals), and
+/// the network's rates both ways; where none does (Folded at 1424 pt, whose strips keep the room)
+/// the legend names this Mac with its totals and no row says a figure past its strip. Full's
+/// Details say aterm's disk writes and the network's state and round trip; Folded's Cores row
+/// names the chip, and a hot core paints in the heat ramp's ink with no halo.
 #[test]
-fn overlapping_three_scope_bars_hardware_totals_hot_core_glow_and_network_summary() {
+fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
     let m = FaceMetrics::helvetica_neue();
     let mut snap = scene(Scene::Calm);
     snap.facts.cpu_brand = Some("Apple M5 Max".into());
@@ -1948,13 +2401,14 @@ fn overlapping_three_scope_bars_hardware_totals_hot_core_glow_and_network_summar
     }
 
     let inks = super::tests::dark_inks();
-    for form in [DeckForm::Full, DeckForm::Folded] {
-        let w = 1424.0;
+    for (form, w, run) in [
+        (DeckForm::Full, 1424.0, true),
+        (DeckForm::Folded, 2560.0, true),
+        (DeckForm::Folded, 1424.0, false),
+    ] {
         let s = 2.0;
         let input = scene_input(&snap, form);
         let words = DeckWords::new(&input, &m);
-
-        // Deliverable 7: All 5 resources carry Global, Aterm, and Tab shares in `RowWords::bar`.
         for res in [
             Resource::Cpu,
             Resource::Memory,
@@ -1975,117 +2429,99 @@ fn overlapping_three_scope_bars_hardware_totals_hot_core_glow_and_network_summar
         }
 
         let laid = lay(&geom(w, s, form), &input, &words, &m, true);
-
-        // Deliverable 4: Hardware identity & capacity totals in two-tone header typography.
         let texts: Vec<&str> = laid
             .boxes
             .iter()
             .filter(|b| b.kind == BoxKind::Text)
             .map(|b| b.text.as_str())
             .collect();
-        assert!(
-            texts.contains(&"this Mac"),
-            "{form:?}: header primary noun missing: {texts:?}"
+        let at = format!("{form:?} {w} pt");
+        let totals = "this Mac \u{b7} 18 cores \u{b7} 128 GiB \u{b7} 2 TB";
+        let legend = if run { "this Mac" } else { totals };
+        assert_eq!(
+            texts.iter().filter(|t| **t == legend).count(),
+            1,
+            "{at}: the legend: {texts:?}"
         );
-        if form == DeckForm::Full {
-            assert!(
-                texts
-                    .iter()
-                    .any(|t| t.contains("M5 Max") && t.contains("18c") && t.contains("128 GiB")),
-                "Full: header hardware capacity totals missing: {texts:?}"
-            );
-        } else {
-            assert!(
-                texts
-                    .iter()
-                    .any(|t| t.contains("18c") && t.contains("128G") && t.contains("2T")),
-                "Folded: header compact hardware capacity totals missing: {texts:?}"
-            );
-            assert!(
-                texts.iter().any(|t| t.contains("M5 Max")),
-                "Folded 1424 pt: Cores row supplies M5 Max when header fits compact totals only: {texts:?}"
+        for said in [
+            "of 18 cores",
+            "of 128 GiB",
+            "of 2.00 TB",
+            "\u{2193}12.4M \u{2191}1.8M/s",
+        ] {
+            assert_eq!(
+                texts.iter().any(|t| t.contains(said)),
+                run,
+                "{at}: {said:?} in {texts:?}"
             );
         }
-
-        // Deliverable 5: Network row renders upload/download arrows and connectivity/latency.
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.contains('\u{2193}') && t.contains('\u{2191}')),
-            "{form:?}: Network upload/download summary missing: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|t| t.contains("Online")),
-            "{form:?}: Network live connectivity state missing: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|t| t.contains("14 ms")),
-            "{form:?}: Network TCP latency missing: {texts:?}"
+        // aterm's disk writes, which lost their column, are in Full's Details.
+        if form == DeckForm::Full {
+            for said in ["aterm writes", "Online", "14 ms"] {
+                assert!(
+                    texts.iter().any(|t| t.contains(said)),
+                    "{at}: {said:?} in Details: {texts:?}"
+                );
+            }
+        }
+        assert_eq!(
+            texts.iter().any(|t| t.contains("M5 Max")),
+            form == DeckForm::Folded,
+            "{at}: Folded's Cores row names the chip, Full's dial none: {texts:?}"
         );
 
-        // Deliverable 7 (painted geometry): Verify overlapping nested 3-scope bars share left edge
-        // `x` with `gw >= aw >= tw > 0` and `gh > ah > th > 0` in `inks.machine` / `inks.aterm` /
-        // `inks.tab`.
+        // As painted: each bar's scopes share its left edge, each inset in the one it is part of.
         let bar_cols: Vec<Col> = match form {
-            DeckForm::Full => plan::plan_full(w, &m).bar.into_iter().collect(),
+            DeckForm::Full => plan::plan_full(w, &m).meter.bar.into_iter().collect(),
             DeckForm::Folded => plan::plan_folded(w, &m)
                 .blocks
                 .into_iter()
-                .filter_map(|b| b.bar)
+                .filter_map(|b| b.meter.bar)
                 .collect(),
         };
-        assert!(!bar_cols.is_empty(), "{form:?}: bar columns present");
-        let mut three_scope_bars = 0;
+        assert!(!bar_cols.is_empty(), "{at}: bar columns present");
+        let [machine_c, aterm_c, tab_c] =
+            [inks.machine, inks.aterm, inks.tab].map(|c| rgba(c, 0xFF));
+        let mut nested = 0;
         for col in bar_cols {
             let bx = px(col.x, s);
-            let machine_c = rgba(inks.machine, 0xFF);
-            let aterm_c = rgba(inks.aterm, 0xFF);
-            let tab_c = rgba(inks.tab, 0xFF);
-            let globals: Vec<(f32, f32, f32)> = laid
-                .prims
-                .iter()
-                .filter_map(|p| match *p {
+            let panel = |fill: [u8; 4], inside: Option<(f32, f32)>| {
+                laid.prims.iter().filter_map(move |p| match *p {
                     DrawPrim::Panel {
-                        x, y, w, h, fill, ..
-                    } if (x - bx).abs() < 0.01 && fill == machine_c && h >= 6.0 => Some((y, w, h)),
+                        x,
+                        y,
+                        w,
+                        h,
+                        fill: f,
+                        ..
+                    } if (x - bx).abs() < 0.01
+                        && f == fill
+                        && inside.is_none_or(|(gy, gh)| y > gy && y + h < gy + gh) =>
+                    {
+                        Some((y, w, h))
+                    }
                     _ => None,
                 })
-                .collect();
-            for (gy, gw, gh) in globals {
-                let aterm_bar = laid.prims.iter().find_map(|p| match *p {
-                    DrawPrim::Panel {
-                        x, y, w, h, fill, ..
-                    } if (x - bx).abs() < 0.01 && fill == aterm_c && y > gy && y + h < gy + gh => {
-                        Some((w, h))
-                    }
-                    _ => None,
-                });
-                let tab_bar = laid.prims.iter().find_map(|p| match *p {
-                    DrawPrim::Panel {
-                        x, y, w, h, fill, ..
-                    } if (x - bx).abs() < 0.01 && fill == tab_c && y > gy && y + h < gy + gh => {
-                        Some((w, h))
-                    }
-                    _ => None,
-                });
-                if let (Some((aw, ah)), Some((tw, th))) = (aterm_bar, tab_bar) {
+            };
+            for (gy, gw, gh) in panel(machine_c, None).filter(|g| g.2 >= 6.0) {
+                let aterm = panel(aterm_c, Some((gy, gh))).next();
+                let tab = panel(tab_c, Some((gy, gh))).next();
+                if let (Some((_, aw, ah)), Some((_, tw, th))) = (aterm, tab) {
                     assert!(
                         gw >= aw && aw >= tw && tw > 0.0 && gh > ah && ah > th,
                         "{form:?}: nested bar geometry {gw}x{gh} >= {aw}x{ah} >= {tw}x{th}"
                     );
-                    three_scope_bars += 1;
+                    nested += 1;
                 }
             }
         }
         assert_eq!(
-            three_scope_bars, 5,
-            "{form:?}: all 5 resources (Cpu, Memory, Disk, Network, Processes) must paint \
-             overlapping 3-scope bars"
+            nested, 5,
+            "{form:?}: CPU, memory, disk, network and processes nest their three scopes"
         );
     }
 
-    // Deliverable 6: In Folded (and Full narrow/slim where individual core squares draw), hot core
-    // (0.95) renders in orange-to-red thermal color with a soft translucent Stroke glow halo!
+    // A hot core (0.95) paints in the heat ramp's ink like every data cell, with no halo.
     let folded_input = scene_input(&snap, DeckForm::Folded);
     let folded_words = DeckWords::new(&folded_input, &m);
     let folded_laid = lay(
@@ -2095,80 +2531,149 @@ fn overlapping_three_scope_bars_hardware_totals_hot_core_glow_and_network_summar
         &m,
         true,
     );
-    let hot_core_fill = rgba(inks.thermal_at(0.95, false), 0xFF);
+    let hot_core_fill = rgba(inks.heat[usize::from(ink::heat_step(0.95))], 0xFF);
     let hot_core = folded_laid.prims.iter().find_map(|p| match *p {
         DrawPrim::Panel {
             x, y, w, h, fill, ..
         } if (w - h).abs() < 0.01 && fill == hot_core_fill => Some((x, y, w)),
         _ => None,
     });
-    let (hx, hy, hw) = hot_core.expect("hot 0.95 core square painted in orange-to-red thermal ink");
-    let has_core_glow = folded_laid.prims.iter().any(|p| match *p {
-        DrawPrim::Stroke {
-            x, y, w, h, color, ..
-        } => {
-            (x - (hx - 0.5)).abs() < 0.01
-                && (y - (hy - 0.5)).abs() < 0.01
-                && (w - (hw + 1.0)).abs() < 0.01
-                && (h - (hw + 1.0)).abs() < 0.01
-                && color[3] < 0xFF
-        }
-        _ => false,
-    });
+    let (hx, hy, _) = hot_core.expect("hot 0.95 core square painted in the heat ramp's ink");
     assert!(
-        has_core_glow,
-        "hot core square must emit soft Stroke glow halo"
+        !folded_laid.prims.iter().any(|p| matches!(
+            *p,
+            DrawPrim::Stroke { x, y, color, .. }
+                if (x - (hx - 0.5)).abs() < 0.01 && (y - (hy - 0.5)).abs() < 0.01 && color[3] < 0xFF
+        )),
+        "a hot core square draws no halo"
     );
 
-    // Regression (mid-width Folded 1074 pt & slim 750 pt):
-    // 1. At 1074 pt (`BlockKind::Mid`), `header_folded` fits `M5 Max · 18c · 128 GiB · 2.00 TB`
-    //    directly in the header, so `Cores` suppresses the duplicate `cores_tail_forms` while
-    //    `Network` (which has no `details` column in `Mid`) still surfaces live `Online`, `↓/↑`,
-    //    and `14 ms` via `glance_bare`!
-    // 2. At 750 pt (`BlockKind::Narrow`), the header drops hardware totals down to bare `this Mac`,
-    //    so `Cores` steps in and renders `cores_tail_forms` (`M5 Max · 18c · 128G · 2T` / `M5 Max`).
-    let mid_laid = lay(
-        &geom(1074.0, 2.0, DeckForm::Folded),
-        &folded_input,
-        &folded_words,
-        &m,
-        true,
-    );
-    let mid_texts: Vec<&str> = mid_laid
-        .boxes
-        .iter()
-        .filter(|b| b.kind == BoxKind::Text)
-        .map(|b| b.text.as_str())
-        .collect();
-    let chip_mentions = mid_texts.iter().filter(|t| t.contains("M5 Max")).count();
-    assert_eq!(
-        chip_mentions, 1,
-        "Folded 1074 pt must show M5 Max once in header without duplicating on Cores row: {mid_texts:?}"
-    );
-    assert!(
-        mid_texts
+    // The header names no hardware: Folded's Cores row names the chip once at every tier that
+    // has room for it (mid at 1074 pt, narrow at 750 pt).
+    for w in [1074.0, 750.0] {
+        let laid = lay(
+            &geom(w, 2.0, DeckForm::Folded),
+            &folded_input,
+            &folded_words,
+            &m,
+            true,
+        );
+        let chip = laid
+            .boxes
             .iter()
-            .any(|t| t.contains("Online") && t.contains('\u{2193}') && t.contains("14 ms")),
-        "Folded 1074 pt (no Details column) must show live Network state, arrows, and RTT in Amount: {mid_texts:?}"
-    );
+            .filter(|b| b.kind == BoxKind::Text && b.text.contains("M5 Max"))
+            .count();
+        assert_eq!(chip, 1, "Folded {w} pt: the Cores row names the chip once");
+    }
+}
 
-    let narrow_laid = lay(
-        &geom(750.0, 2.0, DeckForm::Folded),
-        &folded_input,
-        &folded_words,
-        &m,
-        true,
-    );
-    let narrow_texts: Vec<&str> = narrow_laid
-        .boxes
-        .iter()
-        .filter(|b| b.kind == BoxKind::Text)
-        .map(|b| b.text.as_str())
-        .collect();
-    assert!(
-        narrow_texts.iter().any(|t| t.contains("M5 Max")),
-        "Folded 750 pt must fall back to showing M5 Max on the Cores row when header omits totals: {narrow_texts:?}"
-    );
+/// No column of figures stands after the time series (the owner, 2026-10-26: "the stats in
+/// columns after the time series doesn't make sense to me"): right of each row's strip and short
+/// of its Details, every word stands in the row's one figure run, attached to the end of its bar,
+/// and says the reading then at most a state, from the run column's left edge; a table with no
+/// run says nothing there. CONTROL: runs are read, and a figure laid in a column of its own fails
+/// the check.
+#[test]
+fn no_column_of_figures_stands_after_the_strip() {
+    let m = FaceMetrics::helvetica_neue();
+    let mut runs = 0;
+    for sc in [Scene::Calm, Scene::Trouble, Scene::FirstRun, Scene::Worst] {
+        for (form, w) in [
+            (DeckForm::Full, 1039.0),
+            (DeckForm::Full, 700.0),
+            (DeckForm::Full, 450.0),
+            (DeckForm::Folded, 2560.0),
+            (DeckForm::Folded, 1424.0),
+            (DeckForm::Folded, 1039.0),
+            (DeckForm::Folded, 940.0),
+        ] {
+            let laid = laid(sc, w, 2.0, form, &m, true);
+            let tables: Vec<(Strip, Rows, plan::Meter, Option<Col>, f64)> = match form {
+                DeckForm::Full => {
+                    let p = plan::plan_full(w, &m);
+                    vec![(p.strip, p.rows, p.meter, p.details, w)]
+                }
+                DeckForm::Folded => {
+                    let p = plan::plan_folded(w, &m);
+                    p.blocks
+                        .iter()
+                        .map(|b| (b.strip, b.rows, b.meter, b.details, b.at.end()))
+                        .collect()
+                }
+            };
+            for (strip, rows, meter, details, end) in tables {
+                let at = format!("{sc:?} {form:?} {w} pt");
+                // A table with no run: an empty one at its bar's end, which no word stands in.
+                let run = meter.run.unwrap_or(Col {
+                    x: meter.bar.map_or(strip.end(), Col::end),
+                    w: 0.0,
+                });
+                let faults = column_faults(&laid.boxes, (strip, rows, run, details, end));
+                assert!(faults.is_empty(), "{at}: {faults:?}");
+                runs += laid
+                    .boxes
+                    .iter()
+                    .filter(|b| b.kind == BoxKind::Text && b.room == Some((run.x, run.end())))
+                    .count();
+                // CONTROL: a figure in a column of its own, past the run's end, is found.
+                let mut stray = laid.boxes.clone();
+                let r = rows.top(0) + rows.baseline;
+                stray.push(Boxed {
+                    kind: BoxKind::Text,
+                    r: [run.end() - 20.0, r - 7.0, run.end() - 2.0, r + 2.0],
+                    text: "3.1".into(),
+                    room: Some((run.end() - 20.0, run.end())),
+                });
+                let faults = column_faults(&stray, (strip, rows, run, details, end));
+                assert!(
+                    !faults.is_empty(),
+                    "CONTROL: {at}: a column of figures passed"
+                );
+            }
+        }
+    }
+    assert!(runs >= 60, "CONTROL: {runs} runs read");
+}
+
+/// What a table `(strip, rows, run, details, end)` of `boxes` says right of its strip and short of
+/// its Details (or `end`) outside its figure run, or in it but not from its left edge.
+fn column_faults(
+    boxes: &[Boxed],
+    (strip, rows, run, details, end): (Strip, Rows, Col, Option<Col>, f64),
+) -> Vec<String> {
+    let stop = details.map_or(end, |d| d.x);
+    let mut faults = Vec::new();
+    for r in 0..rows.count.min(7) {
+        let (y0, y1) = (rows.top(r) - 1.0, rows.top(r) + rows.cell + 1.0);
+        let mut said: Vec<&Boxed> = boxes
+            .iter()
+            .filter(|b| {
+                let y = (b.r[1] + b.r[3]) / 2.0;
+                b.kind == BoxKind::Text && b.r[0] > strip.end() && b.r[0] < stop && y > y0 && y < y1
+            })
+            .collect();
+        said.sort_by(|a, b| a.r[0].total_cmp(&b.r[0]));
+        for (i, b) in said.iter().enumerate() {
+            if b.room != Some((run.x, run.end())) {
+                faults.push(format!(
+                    "row {r}: {:?} at {} outside the run {run:?}",
+                    b.text, b.r[0]
+                ));
+            } else if i == 0
+                && (b.r[0] - run.x).abs() > 0.01
+                && (b.r[0] - run.x - 1.1 * rows.amount_pt).abs() > 0.01
+            {
+                faults.push(format!(
+                    "row {r}: {:?} starts at {}, not at the run's {}",
+                    b.text, b.r[0], run.x
+                ));
+            }
+        }
+        if said.len() > 2 {
+            faults.push(format!("row {r}: {} words past the strip", said.len()));
+        }
+    }
+    faults
 }
 
 #[path = "stats_deck_owner_scenes.rs"]

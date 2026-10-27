@@ -258,18 +258,23 @@ fn the_path_and_branch_follow_the_bash_tools_directory() {
     let started = crate::harness::upgrade_models::parse_utc("2026-09-27T12:00:00Z").unwrap();
     std::fs::write(
         claude.join("sessions/4242.json"),
-        format!(
-            r#"{{"pid":4242,"sessionId":"cwd-demo","cwd":"{}","procStart":"{}"}}"#,
-            cwd.display(),
-            lstart_utc(started)
-        ),
+        aterm_json::to_string(&aterm_json::json!({
+            "pid": 4242,
+            "sessionId": "cwd-demo",
+            "cwd": cwd.to_string_lossy().as_ref(),
+            "procStart": lstart_utc(started),
+        }))
+        .unwrap(),
     )
     .unwrap();
     let stamped = |dir: &Path, at: &str, sidechain: bool| {
-        format!(
-            r#"{{"type":"user","isSidechain":{sidechain},"cwd":"{}","timestamp":"{at}"}}"#,
-            dir.display()
-        )
+        aterm_json::to_string(&aterm_json::json!({
+            "type": "user",
+            "isSidechain": sidechain,
+            "cwd": dir.to_string_lossy().as_ref(),
+            "timestamp": at,
+        }))
+        .unwrap()
     };
     let transcript = project.join("cwd-demo.jsonl");
     std::fs::write(
@@ -808,12 +813,15 @@ impl Proc {
     fn register(&self, session: &str) {
         std::fs::write(
             self.claude.join("sessions/4242.json"),
-            format!(
-                r#"{{"pid":4242,"sessionId":"{session}","cwd":"{}","procStart":"{}","startedAt":{},"version":"2.1.283"}}"#,
-                self.cwd.display(),
-                lstart_utc(self.start),
-                self.start * 1000 + 684
-            ),
+            aterm_json::to_string(&aterm_json::json!({
+                "pid": 4242,
+                "sessionId": session,
+                "cwd": self.cwd.to_string_lossy().as_ref(),
+                "procStart": lstart_utc(self.start),
+                "startedAt": self.start * 1000 + 684,
+                "version": "2.1.283",
+            }))
+            .unwrap(),
         )
         .unwrap();
     }
@@ -2975,13 +2983,6 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
     assert_eq!(
         walk_down(&walled),
         [
-            vec![
-                wall,
-                model,
-                path,
-                branch,
-                "\u{03A3} 7h52m \u{2191}48M \u{2193}310k"
-            ],
             vec![wall, model, path, branch, "\u{03A3} 7h52m"],
             vec![wall, model, path, branch],
             vec![wall, model, short, branch],
@@ -3344,16 +3345,15 @@ fn subscription_account_and_weekly_outlast_workspace_details_without_overflow() 
     };
     let whole = segments(&facts);
     assert!(
-        whole
-            .iter()
-            .any(|s| s.mark == PLAN_MARK && s.text == "Max 5x")
+        !whole.iter().any(|s| s.text.contains("Max 5x")),
+        "the plan is not on the rule at rest: {whole:?}"
     );
     let short = fit_rule(&facts, 45, None);
     assert!(
         short
             .segments
             .iter()
-            .any(|s| s.mark == ACCOUNT_MARK && s.text == "owner@example.com")
+            .any(|s| s.mark == ACCOUNT_MARK && s.text == "owner")
     );
     assert!(
         short
@@ -3376,18 +3376,22 @@ fn subscription_account_and_weekly_outlast_workspace_details_without_overflow() 
         ..FooterFacts::default()
     };
     let shown = segments(&missing);
-    assert!(shown.iter().any(|s| s.text == "account unavailable"));
-    assert!(shown.iter().any(|s| s.text == "weekly unavailable"));
+    assert!(
+        !shown
+            .iter()
+            .any(|s| matches!(s.mark, ACCOUNT_MARK | WEEKLY_MARK)),
+        "a value the rule does not know is not shown: {shown:?}"
+    );
 }
 
-/// A WEEKLY FIGURE THE FOOTER HAS NOT GOT SAYS WHY: a few words per reason where the read
-/// told one, `weekly unavailable` where none was told (a refused profile read), and a
-/// standing 7d wall over every reason. Each reason, like an aged figure, stays beside the
-/// account and the controls on an 80-column pane, in its narrow form (`weekly ?`, an aged
-/// figure's `weekly 61.5% · 59m`) where the controls take the room; and on any rule where
-/// `weekly unavailable` beside the shortest account fits, the week stays.
+/// A WEEKLY FIGURE THE FOOTER HAS NOT GOT IS NOT ON THE RULE: whatever the reason (the tap off,
+/// no reply yet, none told) the rule shows the account and no `weekly ?` or `weekly
+/// unavailable`; the reason is the account's hover title's, the Accounts menu's and a screen
+/// reader's. A standing 7d wall still says `weekly 0% left`, and a real figure, aged or not,
+/// stays beside the account and the controls on an 80-column pane, in its narrow form
+/// (`weekly 61.5% · 59m`) where the controls take the room.
 #[test]
-fn a_missing_weekly_figure_names_its_reason_beside_the_controls() {
+fn a_missing_weekly_figure_is_not_on_the_rule() {
     use super::super::profile::{SubscriptionDisplay, WeeklyGap};
     use super::super::tap::Refusal;
     let with = |gap: Option<WeeklyGap>, weekly: Option<&str>| FooterFacts {
@@ -3406,97 +3410,89 @@ fn a_missing_weekly_figure_names_its_reason_beside_the_controls() {
             .find(|s| s.mark == WEEKLY_MARK)
             .map(|s| s.text)
     };
-    for (gap, words) in [
-        (WeeklyGap::TapOff, "weekly ? \u{b7} tap off"),
-        (
-            WeeklyGap::Unoffered(Refusal::Home),
-            "weekly ? \u{b7} untapped",
-        ),
-        (WeeklyGap::Untapped, "weekly ? \u{b7} until relaunch"),
-        (WeeklyGap::Unrestarted, "weekly ? \u{b7} untapped"),
-        (WeeklyGap::NoReply, "weekly ? \u{b7} no reply yet"),
-        (WeeklyGap::Stale, "weekly ? \u{b7} no reply 1h"),
+    for gap in [
+        Some(WeeklyGap::TapOff),
+        Some(WeeklyGap::Unoffered(Refusal::Home)),
+        Some(WeeklyGap::Untapped),
+        Some(WeeklyGap::Unrestarted),
+        Some(WeeklyGap::NoReply),
+        Some(WeeklyGap::Stale),
+        None,
     ] {
-        assert_eq!(weekly(&with(Some(gap), None)).as_deref(), Some(words));
+        let facts = with(gap, None);
+        assert_eq!(weekly(&facts), None, "{gap:?}");
+        let (account, _) = unit_of(&segments(&facts)).expect("the account stays");
+        assert_eq!(account, "owner", "{gap:?}");
+        for room in 0..=180 {
+            let fit = fit_rule(&facts, room, None);
+            assert!(fit.width(None) <= room, "{room}: {fit:?}");
+            assert!(
+                !fit.segments.iter().any(|s| s.text.starts_with("weekly")),
+                "{room}: {fit:?}"
+            );
+        }
     }
-    assert_eq!(
-        weekly(&with(None, None)).as_deref(),
-        Some("weekly unavailable"),
-        "no reason told"
-    );
     let walled = FooterFacts {
         subscription: with(Some(WeeklyGap::NoReply), None).subscription,
         ..narrow_rule_walled()
     };
     assert_eq!(weekly(&walled).as_deref(), Some("weekly 0% left"));
-    let aged = "weekly 61.5% left \u{b7} 59m ago";
+    let facts = with(None, Some(AGED_WEEK));
     let room = rule_room(&(0..80));
-    for (facts, narrow) in [
-        (with(Some(WeeklyGap::NoReply), None), "weekly ?"),
-        (with(Some(WeeklyGap::Untapped), None), "weekly ?"),
-        (with(None, Some(aged)), "weekly 61.5% \u{b7} 59m"),
-    ] {
-        let words = weekly(&facts).expect("a weekly segment");
-        let mut pair = [
-            Segment::plain(ACCOUNT_MARK, "owner@example.com"),
-            Segment::joined(WEEKLY_MARK, narrow),
-        ];
-        elide_subscription_domain(&mut pair);
-        shorten_subscription_account(&mut pair, 8);
-        let reserved = rule_width(&pair, TitleFit::None, false, None);
-        assert_eq!(
-            chips_room(&facts, room),
-            room - (reserved + RULE_SEP + 2),
-            "{words}: the controls get the room its narrow form frees"
+    let words = weekly(&facts).expect("a weekly segment");
+    let mut pair = [
+        Segment::plain(ACCOUNT_MARK, "owner"),
+        Segment::joined(WEEKLY_MARK, AGED_NARROW),
+    ];
+    shorten_subscription_account(&mut pair, 8);
+    let reserved = rule_width(&pair, TitleFit::None, false, None);
+    assert_eq!(
+        chips_room(&facts, room),
+        room - (reserved + RULE_SEP + 2),
+        "{words}: the controls get the room its narrow form frees"
+    );
+    for chips in [1, 3, 6, chips_room(&facts, room)] {
+        let lights = Some(LightsWidth {
+            chips,
+            title: 50,
+            lean: [0; LEAN_FORMS],
+            short: 20,
+            reason: true,
+        });
+        let fit = fit_rule(&facts, room, lights);
+        assert!(fit.width(lights) <= room, "{chips}: {fit:?}");
+        assert!(fit.chips, "{chips}: controls stay available");
+        assert!(
+            fit.segments
+                .iter()
+                .any(|s| s.mark == WEEKLY_MARK && (s.text == words || s.text == AGED_NARROW)),
+            "{chips}: {words} stays: {fit:?}"
         );
-        for chips in [1, 3, 6, chips_room(&facts, room)] {
-            let lights = Some(LightsWidth {
-                chips,
-                title: 50,
-                lean: [0; LEAN_FORMS],
-                short: 20,
-                reason: true,
-            });
-            let fit = fit_rule(&facts, room, lights);
-            assert!(fit.width(lights) <= room, "{chips}: {fit:?}");
-            assert!(fit.chips, "{chips}: controls stay available");
+    }
+    let floor = rule_width(&pair, TitleFit::None, false, None);
+    for room in 0..=180 {
+        let fit = fit_rule(&facts, room, None);
+        assert!(fit.width(None) <= room, "{room}: {fit:?}");
+        if room >= floor {
             assert!(
                 fit.segments
                     .iter()
-                    .any(|s| s.mark == WEEKLY_MARK && (s.text == words || s.text == narrow)),
-                "{chips}: {words} stays: {fit:?}"
+                    .any(|s| s.mark == WEEKLY_MARK && (s.text == words || s.text == AGED_NARROW)),
+                "{room}: the narrowest unit holds the week: {fit:?}"
             );
-        }
-        let mut old_floor = [
-            Segment::plain(ACCOUNT_MARK, "owner@example.com"),
-            Segment::joined(WEEKLY_MARK, "weekly unavailable"),
-        ];
-        shorten_subscription_account(&mut old_floor, 8);
-        let floor = rule_width(&old_floor, TitleFit::None, false, None);
-        for room in 0..=180 {
-            let fit = fit_rule(&facts, room, None);
-            assert!(fit.width(None) <= room, "{room}: {fit:?}");
-            if room >= floor {
-                assert!(
-                    fit.segments
-                        .iter()
-                        .any(|s| s.mark == WEEKLY_MARK && (s.text == words || s.text == narrow)),
-                    "{room}: the old floor held the week, and still does: {fit:?}"
-                );
-            }
         }
     }
 }
 
 /// AN AGED WEEK KEEPS ITS NAME ON THE NARROWEST RUNG: the rule draws the week behind the unit's
 /// `·`, with no mark of its own, so its narrow form keeps `weekly` and drops `left` and `ago`
-/// (`weekly 61.5% · 59m`, no wider than `weekly unavailable`); at no width, with the controls or
-/// without, does the figure stand beside the account as a bare share.
+/// (`weekly 61.5% · 59m`); at no width, with the controls or without, does the figure stand
+/// beside the account as a bare share.
 #[test]
 fn an_aged_week_keeps_its_name_on_the_narrowest_rung() {
     let aged = FooterFacts {
         subscription: Some(super::super::profile::SubscriptionDisplay {
-            weekly: Some("weekly 61.5% left \u{b7} 59m ago".into()),
+            weekly: Some(AGED_WEEK.into()),
             weekly_gap: None,
             ..unit_facts(Some("owner@example.com"))
                 .subscription
@@ -3509,16 +3505,12 @@ fn an_aged_week_keeps_its_name_on_the_narrowest_rung() {
             .find(|s| s.mark == WEEKLY_MARK)
             .map(|s| s.text.clone())
     };
-    let narrowest = facts_ladder(&aged)
+    let narrowest = plain_ladder(&aged)
         .iter()
         .rev()
         .find_map(|rung| week(rung))
         .expect("a rung with the week");
-    assert_eq!(narrowest, "weekly 61.5% \u{b7} 59m");
-    assert!(
-        text_width(&narrowest) <= text_width("weekly unavailable"),
-        "the narrow form fits where the old floor did"
-    );
+    assert_eq!(narrowest, AGED_NARROW);
     let controls = Some(LightsWidth {
         chips: 3,
         title: 50,
@@ -3549,29 +3541,35 @@ fn an_aged_week_keeps_its_name_on_the_narrowest_rung() {
     );
 }
 
+/// A week the last reply read an hour ago, whole and in its narrow form.
+const AGED_WEEK: &str = "weekly 61.5% left \u{b7} 59m ago";
+const AGED_NARROW: &str = "weekly 61.5% \u{b7} 59m";
+
 fn unit_facts(email: Option<&str>) -> FooterFacts {
-    use super::super::profile::{SubscriptionDisplay, WeeklyGap};
+    use super::super::profile::SubscriptionDisplay;
     FooterFacts {
         subscription: Some(SubscriptionDisplay {
             email: email.map(str::to_owned),
             plan: Some("Max 20x".into()),
-            weekly_gap: Some(WeeklyGap::Untapped),
+            weekly: Some(AGED_WEEK.into()),
             ..Default::default()
         }),
         ..narrow_rule_facts()
     }
 }
 
-/// The account unit as one rung shows it: the account's text, the plan's, the week's.
-fn unit_of(rung: &[Segment]) -> Option<(String, Option<String>, Option<String>)> {
+/// The account unit as one rung shows it: the account's text, the week's.
+fn unit_of(rung: &[Segment]) -> Option<(String, Option<String>)> {
     let text = |mark: char| rung.iter().find(|s| s.mark == mark).map(|s| s.text.clone());
-    Some((text(ACCOUNT_MARK)?, text(PLAN_MARK), text(WEEKLY_MARK)))
+    Some((text(ACCOUNT_MARK)?, text(WEEKLY_MARK)))
 }
 
-/// Whether every part of `rung`'s account unit follows the account or another part of it.
+/// Whether every part of `rung`'s account unit follows the account or another part of it; with
+/// no account (no email told) the parts stand apart.
 fn unit_whole(rung: &[Segment]) -> bool {
+    let headed = rung.iter().any(|s| s.mark == ACCOUNT_MARK);
     rung.iter().enumerate().all(|(at, s)| {
-        let part = matches!(s.mark, PLAN_MARK | WEEKLY_MARK);
+        let part = headed && s.mark == WEEKLY_MARK;
         part == s.joined
             && (!part
                 || at
@@ -3581,27 +3579,21 @@ fn unit_whole(rung: &[Segment]) -> bool {
     })
 }
 
-/// THE ACCOUNT, ITS PLAN AND ITS WEEK ARE ONE UNIT: one `⎆`, then the plan and the weekly
-/// words each behind a `·` one pitch on (`⎆ owner@example.com · Max 20x · weekly ? · until
-/// relaunch`), and the next fact the usual gap away; neither `◇` nor `◷` is drawn, and the unit is
-/// one fact's span.
+/// THE ACCOUNT AND ITS WEEK ARE ONE UNIT: one `⎆`, then the weekly words behind a `·` one pitch
+/// on (`⎆ owner · weekly 61.5% left · 59m ago`), and the next fact the usual gap away; the
+/// plan is not on the rule at rest, `◷` is not drawn, and the unit is one fact's span.
 #[test]
-fn the_account_plan_and_week_are_one_unit() {
+fn the_account_and_week_are_one_unit() {
     let facts = unit_facts(Some("owner@example.com"));
     let segs = segments(&facts);
     assert_eq!(
-        segs[..4]
+        segs[..3]
             .iter()
             .map(|s| (s.mark, s.text.as_str(), s.joined))
             .collect::<Vec<_>>(),
         [
-            (ACCOUNT_MARK, "owner@example.com", false),
-            (PLAN_MARK, "Max 20x", true),
-            (
-                WEEKLY_MARK,
-                super::super::profile::WeeklyGap::Untapped.words(),
-                true
-            ),
+            (ACCOUNT_MARK, "owner", false),
+            (WEEKLY_MARK, AGED_WEEK, true),
             (MODEL_MARK, "Opus 5.5 xhigh", false),
         ]
     );
@@ -3609,12 +3601,10 @@ fn the_account_plan_and_week_are_one_unit() {
     let marks: String = set.glyphs.iter().filter(|g| g.mark).map(|g| g.ch).collect();
     assert_eq!(
         marks,
-        format!("{ACCOUNT_MARK}{JOIN_MARK}{JOIN_MARK}{MODEL_MARK}{PATH_MARK}{BRANCH_MARK}")
+        format!("{ACCOUNT_MARK}{JOIN_MARK}{MODEL_MARK}{PATH_MARK}{BRANCH_MARK}")
     );
     assert!(
-        !set.glyphs
-            .iter()
-            .any(|g| g.ch == PLAN_MARK || g.ch == WEEKLY_MARK),
+        !set.glyphs.iter().any(|g| g.ch == WEEKLY_MARK),
         "the parts' own marks only name them"
     );
     let spans = fact_spans(&set, &segs);
@@ -3638,12 +3628,7 @@ fn the_account_plan_and_week_are_one_unit() {
         .collect();
     assert_eq!(
         read,
-        format!(
-            "\u{2386}owner@example.com\u{b7}Max20x\u{b7}{}",
-            super::super::profile::WeeklyGap::Untapped
-                .words()
-                .replace(' ', "")
-        ),
+        format!("\u{2386}owner\u{b7}{}", AGED_WEEK.replace(' ', "")),
         "one span from the account's mark to the week's last word"
     );
     assert_eq!(unit.cells.0, 0);
@@ -3671,7 +3656,7 @@ fn the_account_plan_and_week_are_one_unit() {
     );
     assert!(
         (between(first_join + 1) - joined).abs() < 0.1,
-        "the join sits as far from the plan as from the email"
+        "the join sits as far from the week as from the name"
     );
     let plain: Vec<Segment> = segs
         .iter()
@@ -3686,20 +3671,14 @@ fn the_account_plan_and_week_are_one_unit() {
     );
 }
 
-/// THE UNIT NARROWS AS ONE, WIDEST FIRST, once the other facts have given way: whole, the
-/// email's domain elided, the plan dropped, the email cut to 12 and then 8 cells, the weekly
-/// words narrowed. No rung shows the plan or the week without the account before them.
+/// THE UNIT NARROWS AS ONE, WIDEST FIRST, once the other facts have given way: whole (the
+/// email's name alone), the name cut to 8 cells, the weekly words narrowed. No rung joins the
+/// week on without the account before it.
 #[test]
 fn the_account_unit_narrows_as_one_widest_first() {
     let facts = unit_facts(Some("pat.owner93@example.com"));
-    let week = super::super::profile::WeeklyGap::Untapped.words();
-    let unit = |account: &str, plan: bool, weekly: &str| {
-        (
-            account.to_owned(),
-            plan.then(|| "Max 20x".to_owned()),
-            Some(weekly.to_owned()),
-        )
-    };
+    let week = AGED_WEEK;
+    let unit = |account: &str, weekly: &str| (account.to_owned(), Some(weekly.to_owned()));
     let full = segments_width(&segments(&facts)) + 2;
     let mut seen = Vec::new();
     for room in (0..=full).rev() {
@@ -3713,11 +3692,11 @@ fn the_account_unit_narrows_as_one_widest_first() {
             assert!(fit.segments.is_empty(), "{room}: {fit:?}");
             continue;
         };
-        if shown != unit("pat.owner93@example.com", true, week) {
+        if shown != unit("pat.owner93", week) {
             assert!(
                 fit.segments
                     .iter()
-                    .all(|s| matches!(s.mark, ACCOUNT_MARK | PLAN_MARK | WEEKLY_MARK)),
+                    .all(|s| matches!(s.mark, ACCOUNT_MARK | WEEKLY_MARK)),
                 "{room}: the other facts give way first: {fit:?}"
             );
         }
@@ -3728,12 +3707,9 @@ fn the_account_unit_narrows_as_one_widest_first() {
     assert_eq!(
         seen,
         [
-            unit("pat.owner93@example.com", true, week),
-            unit("pat.owner93@\u{2026}", true, week),
-            unit("pat.owner93@\u{2026}", false, week),
-            unit("pat.owner93\u{2026}", false, week),
-            unit("pat.own\u{2026}", false, week),
-            unit("pat.own\u{2026}", false, "weekly ?"),
+            unit("pat.owner93", week),
+            unit("pat.own\u{2026}", week),
+            unit("pat.own\u{2026}", AGED_NARROW),
         ]
     );
     for facts in [
@@ -3744,32 +3720,31 @@ fn the_account_unit_narrows_as_one_widest_first() {
             ..narrow_rule_walled()
         },
     ] {
-        for rung in facts_ladder(&facts) {
+        for rung in plain_ladder(&facts) {
             assert!(unit_whole(&rung), "{rung:?}");
         }
     }
-    let ladder = facts_ladder(&facts);
-    let at = |shown: &(String, Option<String>, Option<String>)| {
+    let ladder = plain_ladder(&facts);
+    let at = |shown: &(String, Option<String>)| {
         ladder
             .iter()
             .position(|rung| unit_of(rung).as_ref() == Some(shown))
             .expect("the rung")
     };
     assert!(
-        ladder[..at(&unit("pat.owner93@\u{2026}", true, week))]
+        ladder[..=at(&unit("pat.owner93", week))]
             .iter()
             .any(|rung| rung.iter().any(|s| s.mark == MODEL_MARK)),
         "CONTROL: the model stood beside the whole unit"
     );
 }
 
-/// A REASON OR AN UPGRADE NOTE MAY TAKE THE ROOM OF THE EMAIL'S DOMAIN AND OF THE PLAN, as a
-/// reason took the plan's before the three were one unit, and never of the email's name or the
-/// week: where a title makes facts give way, the name and the week stay whole.
+/// A REASON NEVER TAKES THE ROOM OF THE EMAIL'S NAME OR THE WEEK: where a title makes facts give
+/// way, the name and the week stay whole.
 #[test]
-fn a_reason_takes_the_domain_and_the_plan_but_never_the_name_or_the_week() {
+fn a_reason_never_takes_the_name_or_the_week() {
     let facts = unit_facts(Some("pat.owner93@example.com"));
-    let week = super::super::profile::WeeklyGap::Untapped.words();
+    let week = AGED_WEEK;
     let reason = Some(LightsWidth {
         chips: 6,
         title: 50,
@@ -3783,7 +3758,7 @@ fn a_reason_takes_the_domain_and_the_plan_but_never_the_name_or_the_week() {
         reason: false,
         ..l
     });
-    let mut took = (false, false);
+    let mut took = false;
     for room in (0..=240).rev() {
         let fit = fit_rule(&facts, room, reason);
         assert!(fit.width(reason) <= room, "{room}: {fit:?}");
@@ -3792,81 +3767,47 @@ fn a_reason_takes_the_domain_and_the_plan_but_never_the_name_or_the_week() {
         {
             continue;
         }
-        let (account, plan, weekly) = unit_of(&fit.segments).expect("the unit beside a reason");
-        assert_eq!(email_name(&account), Some("pat.owner93"), "{room}: {fit:?}");
+        let (account, weekly) = unit_of(&fit.segments).expect("the unit beside a reason");
+        assert_eq!(account, "pat.owner93", "{room}: {fit:?}");
         assert_eq!(weekly.as_deref(), Some(week), "{room}: {fit:?}");
-        took.0 |= account.ends_with('\u{2026}');
-        took.1 |= plan.is_none();
+        took = true;
     }
-    assert_eq!(
-        took,
-        (true, true),
-        "a reason took the domain's room and the plan's"
-    );
-    let noted = FooterFacts {
-        upgrade: Some(UpgradeWords {
-            whole: "Claude Code 2.1.286 is ready \u{b7} waits while you use this tab".into(),
-            short: "2.1.286 waits while you use this tab".into(),
-        }),
-        ..facts
-    };
-    let led: Vec<Vec<Segment>> = facts_ladder(&noted)
-        .into_iter()
-        .filter(|rung| rung.iter().any(|s| s.mark == UPGRADE_MARK))
-        .collect();
-    for rung in &led {
-        let (account, _, weekly) = unit_of(rung).expect("the unit beside the note");
-        assert_eq!(email_name(&account), Some("pat.owner93"), "{rung:?}");
-        assert_eq!(weekly.as_deref(), Some(week), "{rung:?}");
-    }
-    assert!(
-        led.iter()
-            .any(|rung| unit_of(rung).is_some_and(|(_, plan, _)| plan.is_none())),
-        "CONTROL: the note takes the plan's room: {led:?}"
-    );
+    assert!(took, "CONTROL: a reason took some fact's room");
 }
 
-/// THE DOMAIN GOES ONLY WHERE THERE IS TEXT ON BOTH SIDES OF ITS `@`: never from `account
-/// unavailable`, a bare `@example.com` or a dangling `owner@`.
+/// THE ACCOUNT SHOWS ITS EMAIL'S NAME ALONE: the text before the last `@`, where there is text on
+/// both sides of it (`owner@example.com` reads `owner`; a bare `@example.com`, a dangling
+/// `owner@` or a name with no `@` reads as told); and an account with no email is not on the
+/// rule at any width.
 #[test]
-fn the_email_domain_is_elided_only_between_text() {
-    let elided = |text: &str| {
-        let mut rung = [
-            Segment::plain(ACCOUNT_MARK, text),
-            Segment::joined(WEEKLY_MARK, "weekly ?"),
-        ];
-        elide_subscription_domain(&mut rung).then(|| rung[0].text.clone())
+fn the_account_shows_its_emails_name_alone() {
+    let shown = |email: &str| {
+        segments(&unit_facts(Some(email)))
+            .into_iter()
+            .find(|s| s.mark == ACCOUNT_MARK)
+            .map(|s| s.text)
     };
-    assert_eq!(
-        elided("owner@example.com").as_deref(),
-        Some("owner@\u{2026}")
-    );
-    assert_eq!(elided("a@b@example.com").as_deref(), Some("a@b@\u{2026}"));
-    for text in ["account unavailable", "@example.com", "owner@", "owner"] {
-        assert_eq!(elided(text), None, "{text}");
+    for (email, name) in [
+        ("owner@example.com", "owner"),
+        ("a@b@example.com", "a@b"),
+        ("@example.com", "@example.com"),
+        ("owner@", "owner@"),
+        ("owner", "owner"),
+    ] {
+        assert_eq!(shown(email).as_deref(), Some(name), "{email}");
     }
-    let mut no_account = [Segment::plain(MODEL_MARK, "a@b")];
-    assert!(
-        !elide_subscription_domain(&mut no_account),
-        "only the account's"
-    );
     let missing = unit_facts(None);
     let full = segments_width(&segments(&missing)) + 2;
     for room in (0..=full).rev() {
         let fit = fit_rule(&missing, room, None);
-        if let Some((account, _, _)) = unit_of(&fit.segments) {
-            assert!(
-                "account unavailable".starts_with(account.trim_end_matches('\u{2026}')),
-                "{room}: {account}"
-            );
-        }
+        assert_eq!(unit_of(&fit.segments), None, "{room}: {fit:?}");
     }
     assert!(
-        fit_rule(&missing, full, None)
+        fit_rule(&unit_facts(Some("owner")), full + 16, None)
             .segments
             .iter()
-            .any(|s| s.text == "account unavailable"),
-        "CONTROL: whole where it fits"
+            .any(|s| s.mark == ACCOUNT_MARK && s.text == "owner"),
+        "CONTROL: an email is shown where it fits"
     );
 }
 
@@ -3981,7 +3922,7 @@ fn subscription_control_glyph_outlasts_the_model_when_essentials_cannot_fit() {
 }
 
 #[test]
-fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
+fn a_reason_takes_the_accounts_room() {
     let plain = narrow_rule_walled();
     let facts = FooterFacts {
         account: Some("work-2".into()),
@@ -4048,61 +3989,6 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
     for &room in &instead {
         let fit = fit_rule(&plain, room, reason);
         assert_ne!(fit.title, TitleFit::None, "{room}: {fit:?}");
-    }
-
-    let note = UpgradeWords {
-        whole: "Claude Code 2.1.286 is ready \u{b7} waits while you use this tab".into(),
-        short: "2.1.286 waits while you use this tab".into(),
-    };
-    let noted = FooterFacts {
-        upgrade: Some(note.clone()),
-        ..facts.clone()
-    };
-    let (mut beside, mut instead): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
-    for room in (0..=240).rev() {
-        let fit = fit_rule(&noted, room, None);
-        assert!(fit.width(None) <= room, "{room}: {fit:?}");
-        let Some(at) = fit.segments.iter().position(|s| s.mark == UPGRADE_MARK) else {
-            continue;
-        };
-        assert_eq!(at, 0, "{room}: the note leads: {fit:?}");
-        assert!(
-            top.iter().all(|s| fit.segments.contains(s)),
-            "{room}: the note never takes the wall's or the model's room: {fit:?}"
-        );
-        if named(&fit) {
-            beside.push(room);
-        } else {
-            assert_eq!(fit.segments[0].text, note.short, "{room}: {fit:?}");
-            assert!(
-                with_account(&fit).width(None) > room,
-                "{room}: only where the two do not fit together: {fit:?}"
-            );
-            instead.push(room);
-        }
-    }
-    assert!(!instead.is_empty(), "the note takes the account's room");
-    let wide = fit_rule(&noted, 240, None);
-    assert_eq!(
-        (wide.segments[0].mark, wide.segments[0].text.as_str()),
-        (UPGRADE_MARK, note.whole.as_str()),
-        "a wide rule leads with the whole note"
-    );
-    assert!(
-        instead.iter().max() < beside.iter().max(),
-        "a wide rule shows both: {instead:?} {beside:?}"
-    );
-    let unnamed = FooterFacts {
-        upgrade: Some(note),
-        ..plain
-    };
-    for &room in &instead {
-        let fit = fit_rule(&unnamed, room, None);
-        assert_eq!(
-            fit.segments.first().map(|s| s.mark),
-            Some(UPGRADE_MARK),
-            "{room}: {fit:?}"
-        );
     }
 }
 
@@ -5080,78 +4966,185 @@ fn a_cut_pill_is_still_read_without_joining_it() {
     }
 }
 
-#[test]
-fn the_bypass_and_manual_pills_are_found_to_relabel() {
-    let (rows, bottom) =
-        under_rule(&["  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"]);
-    let r = relabel_under(&rows, bottom).expect("the bypass pill");
-    assert_eq!(
-        (r.row, r.start, r.words, r.end, r.label),
-        (bottom + 1, 2, 5, 26, YOLO_ON)
-    );
-    assert_eq!(r.run_end, rows[bottom + 1].chars().count());
-    assert_eq!((r.shift(), r.label_end()), (17, 9));
-
-    let row = "  ⏵⏵ bypass permissions on · 14 shells · ← for agents · ↓ to manage                    /rc active";
-    let (rows, bottom) = under_rule(&[row]);
-    let r = relabel_under(&rows, bottom).unwrap();
-    let shells = row
-        .find("14 shells")
-        .map(|b| row[..b].chars().count())
-        .unwrap();
-    assert_eq!(
-        r.run_end,
-        row.find("manage")
-            .map(|b| row[..b].chars().count() + 6)
-            .unwrap()
-    );
-    let at = shells - r.shift();
-    assert_eq!(
-        r.grid_col(at),
-        shells,
-        "the glass's `14 shells` is Claude's"
-    );
-    for col in r.start..r.label_end() {
-        assert_eq!(r.grid_col(col), col, "the label is over Claude's pill");
-    }
-    for col in r.run_end - r.shift()..r.run_end {
-        assert_eq!(
-            r.grid_col(col),
-            r.start,
-            "a blank the run left: the pill's cell"
-        );
-    }
-    let notice = row.find("/rc").map(|b| row[..b].chars().count()).unwrap();
-    assert_eq!(r.grid_col(notice), notice, "the right-hand notice stays");
-    assert_eq!(r.grid_col(0), 0);
-
-    let (rows, bottom) = under_rule(&["  ⏸ manual mode on · ? for shortcuts · ← for agents"]);
-    let r = relabel_under(&rows, bottom).expect("the manual pill");
-    assert_eq!((r.start, r.end, r.label, r.shift()), (2, 18, YOLO_OFF, 8));
-    let (rows, bottom) = under_rule(&["  ⏵⏵ bypass permissions on"]);
-    let r = relabel_under(&rows, bottom).unwrap();
-    assert_eq!(r.run_end, r.end);
-    assert_eq!(r.grid_col(r.label_end()), r.start);
+/// The rewritten row's text: each kept item as `rows` drew it, joined by ` · `.
+fn rewritten(rows: &[String], m: &ModeRow) -> String {
+    let row: Vec<char> = rows[m.row].chars().collect();
+    m.kept()
+        .iter()
+        .map(|k| row[k.start..k.end].iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join(MODE_ROW_SEP)
 }
 
+/// THE MODE ROW KEEPS ONLY THE JOBS (§6): every known mode, the pill and its hint dropped, the
+/// key hints and `⧉` items and the effort and auto-compact readings dropped; the live `/rc
+/// active` and an item this build does not know kept after the jobs; vim's indicator first.
 #[test]
-fn no_other_pill_or_row_is_relabelled() {
+fn the_mode_row_keeps_only_claudes_jobs() {
+    let wide = |left: &str, right: &str| format!("{left}{}{right}", " ".repeat(20));
+    for (row, kept, unknown) in [
+        (
+            "  ⏵⏵ bypass permissions on · 1 shell".to_owned(),
+            "1 shell",
+            false,
+        ),
+        (
+            "  ⏵⏵ bypass permissions on · 2 shells · 1 monitor · ↓ to manage".to_owned(),
+            "2 shells · 1 monitor",
+            false,
+        ),
+        (
+            "  ⏵⏵ bypass permissions on · 2 shells · ← 2 agents".to_owned(),
+            "2 shells · ← 2 agents",
+            false,
+        ),
+        ("  ⏵⏵ auto mode on · ← 2 done".to_owned(), "← 2 done", false),
+        (
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_owned(),
+            "",
+            false,
+        ),
+        (
+            "  ⏵⏵ bypass permissions on · esc to interrupt · 1 shell".to_owned(),
+            "1 shell",
+            false,
+        ),
+        (
+            "  ⏸ plan mode on (shift+tab to cycle) · ← for agents".to_owned(),
+            "",
+            false,
+        ),
+        (
+            "  ⏵⏵ accept edits on · 1 shell".to_owned(),
+            "1 shell",
+            false,
+        ),
+        (
+            "  ⏸ manual mode on · ? for shortcuts · /tasks to see subagents".to_owned(),
+            "",
+            false,
+        ),
+        (
+            "  -- INSERT -- ⏵⏵ bypass permissions on · 1 shell · ← for agents".to_owned(),
+            "-- INSERT -- · 1 shell",
+            false,
+        ),
+        (
+            wide(
+                "  ⏵⏵ bypass permissions on · 14 shells · ← for agents · ↓ to manage",
+                "/rc active",
+            ),
+            "14 shells · /rc active",
+            false,
+        ),
+        (
+            wide(
+                "  ⏵⏵ bypass permissions on · 2 shells · ⧉ prism-glass · ↓ to manage",
+                "◉ xhigh · /effort",
+            ),
+            "2 shells",
+            false,
+        ),
+        (
+            wide(
+                "  ⏸ manual mode on · ? for shortcuts",
+                "7% until auto-compact",
+            ),
+            "",
+            false,
+        ),
+        (
+            wide(
+                "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+                "Not logged in · Run /login",
+            ),
+            "Not logged in · Run /login",
+            true,
+        ),
+        (
+            "  ⏵⏵ bypass permissions on · 3 widgets · 1 shell".to_owned(),
+            "1 shell · 3 widgets",
+            true,
+        ),
+    ] {
+        let (rows, bottom) = under_rule(&[&row]);
+        let m = mode_row_rewrite_under(&rows, bottom).unwrap_or_else(|| panic!("{row:?}"));
+        assert_eq!(rewritten(&rows, &m), kept, "{row:?}");
+        assert_eq!(m.unknown(), unknown, "{row:?}");
+        assert_eq!((m.row, m.end), (bottom + 1, row.trim_end().chars().count()));
+    }
+    let (rows, bottom) = under_rule(&["  ⏵⏵ bypass permissions on · 1 shell"]);
+    assert_eq!(
+        mode_row_rewrite_under(&rows, bottom).map(|m| m.mode),
+        Some("mode.bypass")
+    );
+}
+
+/// A CUT OR UNKNOWN ROW STANDS AS DRAWN: a cut pill, a cut hint, a cut item, a lone separator,
+/// a pill this build does not know, a pill run into its next word, and a row that is not the
+/// mode row are never rewritten. CONTROL: the whole row is.
+#[test]
+fn a_cut_or_unknown_mode_row_is_not_rewritten() {
     for footer in [
-        "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
-        "  ⏸ plan mode on (shift+tab to cycle)",
-        "  ⏵⏵ accept edits on · 1 shell",
         "  ⏵⏵ bypass permissi",
+        "  ⏵⏵ auto mode on (shift+tab to",
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for …",
+        "  ⏸ manual mode on · ? for shor…",
+        "  ⏵⏵ auto mode on  ·",
+        "  ⏵⏵ auto mode on ·",
         "  ⏵⏵ bypass permissions only",
+        "  ⏵⏵ warp mode on · 1 shell",
         "  ? for shortcuts · ⏵⏵ bypass permissions on",
         "  esc to interrupt",
-        "? for shortcuts                                         Gemini 4 Argon · medium",
     ] {
         let (rows, bottom) = under_rule(&[footer]);
-        assert_eq!(relabel_under(&rows, bottom), None, "{footer}");
+        assert_eq!(mode_row_rewrite_under(&rows, bottom), None, "{footer}");
     }
-    let (mut rows, bottom) = under_rule(&["  ⏵⏵ auto mode on", "", "  ⏵⏵ bypass permissions on"]);
-    rows[0] = "  ⏵⏵ bypass permissions on".into();
-    assert_eq!(relabel_under(&rows, bottom), None);
+    let (rows, bottom) = under_rule(&["  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"]);
+    assert!(
+        mode_row_rewrite_under(&rows, bottom).is_some(),
+        "CONTROL: the whole row"
+    );
+}
+
+/// THE REWRITTEN ROW MAPS EACH KEPT ITEM TO ITS OWN CELLS: a glass cell of a kept item is
+/// Claude's cell of it, a separator or a blank the rewrite left maps to nothing (a press there
+/// lands on nothing), and past the drawn row a column is itself. A wrapped effort hint under the
+/// row is blanked with it.
+#[test]
+fn the_rewritten_row_maps_each_item_to_claudes_cells() {
+    let row = format!(
+        "  ⏵⏵ bypass permissions on · 14 shells · ← for agents · ↓ to manage{}/rc active",
+        " ".repeat(20)
+    );
+    let (rows, bottom) = under_rule(&[&row, "                          ◐ medium · /effort"]);
+    let m = mode_row_rewrite_under(&rows, bottom).expect("the row");
+    let col = |needle: &str| row[..row.find(needle).expect(needle)].chars().count();
+    assert_eq!(m.glass_of(0), 0..9, "`14 shells` flush at column 0");
+    assert_eq!(m.glass_of(1), 12..22, "` · ` then `/rc active`");
+    assert_eq!(m.glass_end(), 22);
+    for k in 0..9 {
+        assert_eq!(m.grid_col(k), Some(col("14 shells") + k), "{k}");
+    }
+    for k in 0..10 {
+        assert_eq!(m.grid_col(12 + k), Some(col("/rc active") + k), "{k}");
+    }
+    for vacated in [9, 10, 11, 22, m.end - 1] {
+        assert_eq!(m.grid_col(vacated), None, "{vacated}: vacated");
+    }
+    assert_eq!(m.grid_col(m.end), Some(m.end), "past the row");
+    assert_eq!(m.sep, Some(col("\u{b7}")), "Claude's own separator");
+    assert_eq!(
+        m.effort,
+        Some((bottom + 2, rows[bottom + 2].chars().count())),
+        "the wrapped effort hint"
+    );
+    let (rows, bottom) = under_rule(&[&row, "  ⏺ not a hint"]);
+    assert_eq!(
+        mode_row_rewrite_under(&rows, bottom).and_then(|m| m.effort),
+        None,
+        "CONTROL: another row under it stays"
+    );
 }
 
 #[test]
@@ -5181,7 +5174,7 @@ fn the_measured_2_1_304_panel_and_pill_are_found() {
         assert_eq!(kinds(&panel), [(b + 3, Main), (b + 4, Agent)], "{name}");
         let at = panel.rows().iter().position(|r| r.pointer.is_some());
         assert_eq!(at, pointed, "{name}");
-        let r = relabel_under(&rows, bottom);
+        let r = mode_row_rewrite_under(&rows, bottom);
         assert_eq!(
             r.is_some(),
             pointed.is_none(),
@@ -5190,9 +5183,9 @@ fn the_measured_2_1_304_panel_and_pill_are_found() {
     }
     let rows = fixture("footer-bypass-idle-144col");
     let bottom = aterm_phase::phase::composer_bottom(&rows).unwrap();
-    let r = relabel_under(&rows, bottom).expect("the measured bypass pill");
-    assert_eq!((r.start, r.end, r.label), (2, 26, YOLO_ON));
-    assert_eq!(r.run_end, rows[bottom + 1].trim_end().chars().count());
+    let r = mode_row_rewrite_under(&rows, bottom).expect("the measured bypass row");
+    assert_eq!(r.mode, "mode.bypass");
+    assert_eq!(r.end, rows[bottom + 1].trim_end().chars().count());
     assert_eq!(
         agents_panel_under(&rows, bottom),
         None,
@@ -5259,43 +5252,31 @@ fn the_pill_after_vim_inserts_indicator_is_read_as_its_mode() {
     assert!(!is_cut_pill("  -- INSERT -- "));
 }
 
+/// VIM'S INDICATOR LEADS THE REWRITTEN ROW: after `-- INSERT --` the pill is read as on any
+/// mode row and dropped, the indicator kept at its own cells. CONTROL: the measured 2.1.304
+/// auto row after the indicator is rewritten to the indicator alone.
 #[test]
-fn the_yolo_relabel_maps_the_pill_after_vim_inserts_indicator() {
-    let row = "  -- INSERT -- \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle) \u{B7} \u{2190} for agents";
+fn the_rewrite_keeps_vims_indicator_first() {
+    let row = "  -- INSERT -- \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle) \u{B7} 1 shell \u{B7} \u{2190} for agents";
     let (rows, bottom) = under_rule(&[row]);
-    let r = relabel_under(&rows, bottom).expect("the bypass pill after the indicator");
+    let m = mode_row_rewrite_under(&rows, bottom).expect("the row after the indicator");
+    assert_eq!(rewritten(&rows, &m), "-- INSERT -- \u{B7} 1 shell");
+    assert_eq!(m.kept()[0].item, ModeItem::Vim);
     assert_eq!(
-        (r.row, r.start, r.words, r.end, r.label),
-        (bottom + 1, 15, 18, 39, YOLO_ON)
+        (m.glass_of(0), m.grid_col(0)),
+        (0..12, Some(2)),
+        "flush at column 0"
     );
-    assert_eq!(r.run_end, row.chars().count());
-    assert_eq!((r.shift(), r.label_end()), (17, 22));
-    for col in 0..r.label_end() {
-        assert_eq!(r.grid_col(col), col, "the indicator and the label");
-    }
-    let agents = col_of_chars(row, "\u{2190} for agents");
+    let shells = col_of_chars(row, "1 shell");
     assert_eq!(
-        r.grid_col(agents - r.shift()),
-        agents,
-        "the glass's `← for agents` is Claude's"
+        m.grid_col(15),
+        Some(shells),
+        "the glass's `1 shell` is Claude's"
     );
-    for col in r.run_end - r.shift()..r.run_end {
-        assert_eq!(r.grid_col(col), r.start, "a blank the run left");
-    }
-    let (rows, bottom) =
-        under_rule(&["  -- INSERT -- \u{23F8} manual mode on \u{B7} ? for shortcuts"]);
-    let r = relabel_under(&rows, bottom).expect("the manual pill after the indicator");
-    assert_eq!((r.start, r.end, r.label, r.shift()), (15, 31, YOLO_OFF, 8));
     let measured = measured_2_1_304("top-vim-insert-120col");
     let bottom = aterm_phase::phase::composer_bottom(&measured).unwrap();
-    assert_eq!(
-        relabel_under(&measured, bottom),
-        None,
-        "CONTROL: auto stays"
-    );
-    let (rows, bottom) = under_rule(&[&row.replacen("-- INSERT -- ", "", 1)]);
-    let r = relabel_under(&rows, bottom).expect("CONTROL: the plain row");
-    assert_eq!((r.start, r.words, r.end), (2, 5, 26));
+    let m = mode_row_rewrite_under(&measured, bottom).expect("CONTROL: the measured row");
+    assert_eq!(rewritten(&measured, &m), "-- INSERT --");
 }
 
 fn col_of_chars(row: &str, needle: &str) -> usize {
@@ -5648,7 +5629,7 @@ fn the_context_fact_is_a_span_its_stub_restores_and_it_goes_first() {
         }),
         ..facts.clone()
     };
-    let ladder = facts_ladder(&subscribed);
+    let ladder = plain_ladder(&subscribed);
     let without: Vec<Segment> = ladder[0]
         .iter()
         .filter(|s| s.mark != CONTEXT_MARK)
@@ -5667,12 +5648,46 @@ fn the_context_fact_is_a_span_its_stub_restores_and_it_goes_first() {
             .flatten()
             .all(|s| s.kind != FactKind::Context)
     );
-    let ladder = facts_ladder(&none);
+    let ladder = plain_ladder(&none);
     assert!(
         ladder[1].len() < ladder[0].len() && ladder[1].iter().all(|s| s.mark != USAGE_MARK),
         "CONTROL: the usage goes first: {:?}",
         ladder[1]
     );
+}
+
+#[test]
+fn recovery_and_account_spans_keep_every_optional_fact_clickable() {
+    let facts = FooterFacts {
+        account: Some("work".into()),
+        account_progress: Some(super::super::account_progress::AccountProgress::unknown(
+            100,
+        )),
+        context: Some("ctx 84% left".into()),
+        ..narrow_rule_tokens()
+    };
+    let segments = segments(&facts);
+    let spans = fact_spans(&set_facts(&segments), &segments);
+    let kinds: Vec<_> = spans.into_iter().flatten().map(|span| span.kind).collect();
+    assert_eq!(kinds.len(), 8);
+    for kind in [
+        FactKind::Model,
+        FactKind::Effort,
+        FactKind::Path,
+        FactKind::Branch,
+        FactKind::Context,
+        FactKind::Usage,
+    ] {
+        assert!(kinds.contains(&kind));
+    }
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == FactKind::Account)
+            .count(),
+        2
+    );
+    assert_eq!(kinds.last(), Some(&FactKind::Usage));
 }
 
 fn fit_sweep(facts: &FooterFacts) -> String {
@@ -5800,11 +5815,7 @@ fn a_hidden_fact_reads_off_in_rule_gray_and_gives_way_first() {
     );
     assert_eq!(
         walk[1],
-        [
-            "\u{25C6} Opus 5.5 xhigh",
-            "\u{2387} main",
-            "\u{03A3} 7h52m \u{2191}48M \u{2193}310k"
-        ],
+        ["\u{25C6} Opus 5.5 xhigh", "\u{2387} main", "\u{03A3} 7h52m"],
         "{walk:?}"
     );
     assert!(walk[2..].iter().flatten().all(|s| !s.contains(OFF_STUB)));
@@ -5881,6 +5892,64 @@ fn top_rule_tag_finds_the_key_alone() {
     assert_eq!(top_rule_tag(&inside), None, "not the rule's end");
     let not_a_rule = format!("  {CLAUDE_TOP_EFFORT_KEY} \u{2500}");
     assert_eq!(top_rule_tag(&not_a_rule), None);
+}
+
+/// Claude Code's label zone on its top rule is every label after the rule's last `──`, its blanks
+/// on both sides, up to the `─` that closes it: the key's tag, a session name, two labels side by
+/// side. CONTROL: a rule with no label, a label inside the rule, and a row that is not a rule have
+/// none.
+#[test]
+fn top_rule_labels_finds_the_whole_zone() {
+    let rule = "\u{2500}".repeat(40);
+    let zone = |row: &str| {
+        top_rule_labels(row).map(|(a, b)| row.chars().skip(a).take(b - a).collect::<String>())
+    };
+    for label in [
+        format!(" {CLAUDE_TOP_EFFORT_KEY} "),
+        format!(" sandboxed {CLAUDE_TOP_EFFORT_KEY} "),
+        " fast mode ".to_owned(),
+        " workspace ".to_owned(),
+        format!(" fast mode  {CLAUDE_TOP_EFFORT_KEY} "),
+    ] {
+        let row = format!("{rule}{label}\u{2500}");
+        assert_eq!(zone(&row).as_deref(), Some(label.as_str()), "{row:?}");
+        let (a, b) = top_rule_labels(&row).expect("the zone");
+        assert_eq!(
+            (a, b + 1),
+            (40, row.chars().count()),
+            "{row:?}: the closing `\u{2500}` next"
+        );
+    }
+    for text in [
+        include_str!("../../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-80col.txt"),
+        include_str!(
+            "../../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-narrow-26col.txt"
+        ),
+    ] {
+        let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
+        let (top, bottom) = aterm_phase::phase::composer_rules(&rows).expect("a composer");
+        assert_eq!(
+            zone(&rows[top]).as_deref(),
+            Some(" workspace "),
+            "the measured top rule"
+        );
+        assert_eq!(zone(&rows[bottom]), None, "CONTROL: a plain rule");
+    }
+    assert_eq!(
+        zone(&format!("{rule} {CLAUDE_TOP_EFFORT_KEY} {rule}")),
+        None,
+        "CONTROL: not the rule's end"
+    );
+    assert_eq!(
+        zone(&format!("  {CLAUDE_TOP_EFFORT_KEY} \u{2500}")),
+        None,
+        "CONTROL: not a rule"
+    );
+    assert_eq!(
+        zone(&format!("{rule}  \u{2500}")),
+        None,
+        "CONTROL: blanks alone"
+    );
 }
 
 #[test]
@@ -6137,4 +6206,153 @@ fn agents_panel_under_reads_agy_active_subagents_and_skips_background_tasks() {
             end: 4 + "System Monitoring Network Stats Engineer".len() as u16,
         }
     );
+}
+#[test]
+fn account_progress_survives_optional_facts_and_its_wall_opens_accounts() {
+    use super::super::account_progress::{AccountProgress, ProgressPhase};
+    let mut progress = AccountProgress::unknown(100);
+    progress.phase = ProgressPhase::Waiting;
+    progress.known = Some(3);
+    progress.eligible = Some(0);
+    progress.wall = Some("weekly limit".into());
+    progress.details.push("sign-in unavailable".into());
+    let facts = FooterFacts {
+        model: Some("a long model name".into()),
+        path: Some("/a/long/path/that/must/yield".into()),
+        account_progress: Some(progress.clone()),
+        ..Default::default()
+    };
+    let narrow = super::account_progress_text(&progress, true);
+    let minimum = super::rule_width(
+        &[Segment::plain(WALL_MARK, &narrow)],
+        TitleFit::None,
+        false,
+        None,
+    );
+    for room in [minimum, minimum + 8, 160] {
+        let fit = fit_rule(&facts, room, None);
+        assert!(fit.width(None) <= room);
+        assert!(fit.segments.iter().any(|s| s.mark == WALL_MARK));
+        if room == minimum {
+            assert!(fit.segments.iter().all(|s| s.mark == WALL_MARK));
+        }
+        let set = set_facts(&fit.segments);
+        assert!(
+            fact_spans(&set, &fit.segments)
+                .iter()
+                .flatten()
+                .any(|s| s.kind == FactKind::Account)
+        );
+    }
+    let crowded = LightsWidth {
+        chips: minimum,
+        title: minimum,
+        lean: [minimum; LEAN_FORMS],
+        short: minimum,
+        reason: true,
+    };
+    let fit = fit_rule(&facts, minimum, Some(crowded));
+    assert!(fit.width(Some(crowded)) <= minimum);
+    assert!(fit.segments.iter().any(|segment| segment.mark == WALL_MARK));
+    let mut later = progress.clone();
+    later.next_at = Some(160);
+    assert_ne!(
+        super::account_progress_text(&progress, true),
+        super::account_progress_text(&later, true)
+    );
+    later.phase = ProgressPhase::Switching {
+        to: "alternate".into(),
+    };
+    assert_ne!(
+        super::account_progress_phase(&progress),
+        super::account_progress_phase(&later)
+    );
+}
+
+#[test]
+fn a_transcript_limit_survives_an_older_idle_account_observation() {
+    use super::super::account_progress::{AccountProgress, ProgressPhase};
+    let mut progress = AccountProgress::unknown(100);
+    progress.known = Some(2);
+    progress.eligible = Some(1);
+    let mut facts = FooterFacts {
+        usage: Some(super::super::session_usage::UsageFacts {
+            wall: Some(super::super::session_usage::Wall {
+                label: "7d",
+                resets: "tomorrow".into(),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for phase in [ProgressPhase::Watching, ProgressPhase::Unknown] {
+        progress.phase = phase;
+        facts.account_progress = Some(progress.clone());
+        let view = facts.account_progress_view().unwrap();
+        assert_eq!(view.phase, ProgressPhase::Waiting);
+        assert_eq!(view.wall.as_deref(), Some("7d"));
+        assert_eq!((view.known, view.eligible), (Some(2), Some(1)));
+        let narrow = account_progress_text(&view, true);
+        let room = super::rule_width(
+            &[Segment::plain(WALL_MARK, &narrow)],
+            TitleFit::None,
+            false,
+            None,
+        );
+        for width in [room, 200] {
+            let fit = fit_rule(&facts, width, None);
+            assert!(
+                fit.segments
+                    .iter()
+                    .any(|s| s.mark == WALL_MARK && s.text.contains("Limit reached"))
+            );
+        }
+        // The reconciled view does not rewrite the supervisor's observation.
+        assert_eq!(facts.account_progress.as_ref(), Some(&progress));
+    }
+    for phase in [
+        ProgressPhase::Ready,
+        ProgressPhase::Probing,
+        ProgressPhase::Disabled,
+    ] {
+        progress.phase = phase;
+        facts.account_progress = Some(progress.clone());
+        assert_eq!(*facts.account_progress_view().unwrap(), progress);
+    }
+    facts.usage = None;
+    progress.phase = ProgressPhase::Watching;
+    facts.account_progress = Some(progress.clone());
+    assert_eq!(*facts.account_progress_view().unwrap(), progress);
+}
+
+#[test]
+fn healthy_account_inventory_does_not_present_a_pending_recovery_event() {
+    use super::super::account_progress::{AccountProgress, ProgressPhase};
+    let mut progress = AccountProgress::unknown(100);
+    progress.phase = ProgressPhase::Watching;
+    progress.eligible = Some(1);
+    progress.known = Some(2);
+    let idle = account_progress_text(&progress, false);
+    progress.next_at = Some(160);
+    assert_eq!(idle, account_progress_text(&progress, false));
+    assert_eq!(idle, account_progress_text(&progress, true));
+    progress.wall = Some("weekly".into());
+    assert_ne!(idle, account_progress_text(&progress, false));
+}
+
+#[test]
+fn recovery_event_time_does_not_depend_on_the_observation_age() {
+    use super::super::account_progress::{AccountProgress, ProgressPhase};
+    let mut first = AccountProgress::unknown(1_793_040_000);
+    first.phase = ProgressPhase::Waiting;
+    first.next_at = Some(1_793_040_600);
+    let mut later = first.clone();
+    later.observed_at += 300;
+    for narrow in [false, true] {
+        let event = account_progress_text(&first, narrow);
+        assert_eq!(event, account_progress_text(&later, narrow));
+        later.next_at = None;
+        assert_ne!(event, account_progress_text(&later, narrow));
+        later.next_at = first.next_at;
+    }
 }

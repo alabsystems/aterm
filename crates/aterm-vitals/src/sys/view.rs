@@ -280,7 +280,11 @@ pub(super) fn rec<T: std::fmt::Display>(v: Option<T>, why: &str) -> String {
 
 fn global_clauses(ctx: &Ctx<'_>, s: &Snapshot) -> Vec<String> {
     let mut parts = Vec::new();
-    if let Some(cpu) = s.cpu.as_ref() {
+    if let Some((cpu, busy)) = s
+        .cpu
+        .as_ref()
+        .and_then(|c| c.current_busy().map(|b| (c, b)))
+    {
         let motion = cpu
             .busy
             .motion(words::CORES_GATE)
@@ -289,9 +293,11 @@ fn global_clauses(ctx: &Ctx<'_>, s: &Snapshot) -> Vec<String> {
             .unwrap_or_default();
         parts.push(format!(
             "{} of {} cores busy{motion}",
-            words::cores(cpu.busy.raw),
+            words::cores(busy),
             cpu.total()
         ));
+    } else if s.cpu.is_some() {
+        parts.push("core utilization unavailable (counters did not advance)".into());
     } else {
         parts.push("cores measuring (the first sample has no interval)".into());
     }
@@ -371,7 +377,12 @@ fn aterm_clauses(s: &Snapshot) -> Vec<String> {
         return vec!["measuring (one process sweep has no interval)".into()];
     };
     let mut first = format!("{} cores", words::cores(a.cores.raw));
-    if let Some(busy) = s.cpu.as_ref().map(|c| c.busy.raw).filter(|b| *b > 0.05) {
+    if let Some(busy) = s
+        .cpu
+        .as_ref()
+        .and_then(|c| c.current_busy())
+        .filter(|b| *b > 0.05)
+    {
         let share = (a.cores.raw / busy * 100.0).round().clamp(0.0, 100.0);
         first.push_str(&format!(", {share:.0}% of busy"));
     }
@@ -741,7 +752,29 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
             View::Net => net_text(q, s, &mut lines),
             View::Procs => procs_text(q, ctx, s, &mut lines),
             View::Why => why::why_text(q, ctx, s, &mut lines, &events),
+            View::Report => {
+                lines.push(note("report", "CPU diagnostic report; cause not established. Use --json to export raw evidence."));
+                lines.extend(
+                    super::hardware::lines(s)
+                        .into_iter()
+                        .map(|s| note("report", s)),
+                );
+            }
         },
+    }
+    if let Some(s) = ctx.snap
+        && matches!(q.view, View::Cores | View::Procs)
+    {
+        scheduling_context_text(ctx, s, &mut lines);
+    }
+    if let Some(s) = ctx.snap
+        && matches!(q.view, View::Cores | View::Why)
+    {
+        lines.extend(
+            super::hardware::lines(s)
+                .into_iter()
+                .map(|s| note("cpu_hardware", s)),
+        );
     }
     lines.extend(events);
     Reply {
@@ -929,7 +962,7 @@ fn aterm_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         ));
         return;
     };
-    let busy = s.cpu.as_ref().map(|c| c.busy.raw);
+    let busy = s.cpu.as_ref().and_then(|c| c.current_busy());
     let mut cpu = format!("cpu     {}", c2(a.cores.raw));
     if let Some(b) = busy {
         cpu.push_str(&format!(" of {} busy", c2(b)));
@@ -1078,21 +1111,21 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
         Some(cpu) => {
             let mut t = format!(
                 "cpu      {} of {} cores busy",
-                words::cores(cpu.busy.raw),
+                rec(cpu.current_busy().map(words::cores), "no_counter_delta"),
                 cpu.total()
             );
             for c in &cpu.clusters {
-                let busy: f32 = c.cores.iter().map(|&i| cpu.cores[i].load.raw).sum();
+                let busy = cpu.current_cluster_busy(c);
                 t.push_str(&format!(
                     " · {} {} of {}",
                     c.name,
-                    words::cores(busy),
+                    rec(busy.map(words::cores), "no_counter_delta"),
                     c.cores.len()
                 ));
             }
             t.push_str(&format!(
                 " · requested MHz {}",
-                unavailable("lane_off:ioreport")
+                unavailable("not_sampled:requested_frequency")
             ));
             lines.push(line("cpu", t));
         }
@@ -1454,16 +1487,17 @@ fn cores_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     };
     let labels = core_labels(cpu);
     for (level, c) in cpu.clusters.iter().enumerate() {
-        let busy: f32 = c.cores.iter().map(|&i| cpu.cores[i].load.raw).sum();
+        let busy = cpu.current_cluster_busy(c);
         lines.push(line(
             format!("cluster {}", c.name),
             format!(
-                "cluster name={} level=l{level} cpus={} busy_mc={} req_mhz={} split_mc={} exact=exact",
+                "cluster name={} level=l{level} cpus={} busy_mc={} req_mhz={} split_mc={} exact={}",
                 pct(&c.name),
                 c.cores.len(),
-                mc(busy),
-                unavailable("lane_off:ioreport"),
-                unavailable("not_sampled")
+                rec(busy.map(mc), "no_counter_delta"),
+                unavailable("not_sampled:requested_frequency"),
+                unavailable("not_sampled"),
+                rec(busy.map(|_| "exact"), "no_counter_delta")
             ),
         ));
         for (core, label, _) in labels.iter().filter(|(_, _, l)| *l == level) {
@@ -1471,9 +1505,12 @@ fn cores_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
                 format!("core {label}"),
                 format!(
                     "core name={label} cpu={core} busy_pm={}",
-                    (cpu.cores[*core].load.raw * 1000.0)
-                        .round()
-                        .clamp(0.0, 1000.0) as u32
+                    rec(
+                        cpu.cores[*core]
+                            .current()
+                            .map(|load| { (load * 1000.0).round().clamp(0.0, 1000.0) as u32 }),
+                        "no_counter_delta"
+                    )
                 ),
             ));
         }
@@ -2090,10 +2127,7 @@ fn net_text(q: &SysQuery, s: &Snapshot, lines: &mut Vec<Line>) {
                 tcp.closing,
                 tcp.last_ack,
                 tcp.close,
-                rec(
-                    net.srtt_ms.map(|ms| (ms * 1000.0).round().max(0.0) as u64),
-                    "not_sampled"
-                ),
+                rec(srtt_us(net.srtt_ms), "not_sampled"),
             ),
         )),
         None => lines.push(line(
@@ -2280,7 +2314,7 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
     ));
     for r in rows.iter().take(q.top) {
         let mut t = format!(
-            "proc pid={} exe={} label={} pgid={} cpu_mc={} wait_mc={} fp_bytes={} peak_bytes={} write_bps={} gpu_ppm={} stat={} age_ms={}",
+            "proc pid={} exe={} label={} pgid={} cpu_mc={} wait_mc={} fp_bytes={} peak_bytes={} write_bps={} gpu_ppm={} stat={} scheduling={} age_ms={}",
             r.pid,
             exe_word(&r.name),
             proc_label(ctx, s, r),
@@ -2298,6 +2332,7 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
             ),
             rec(r.gpu.map(gpu_ppm), GPU_LANE_OFF),
             r.state.word(),
+            scheduling_json(r.scheduling, ctx.machine.family).to_text(),
             rec(r.age_ms(s.at_unix_ms), BIRTH_UNREAD)
         );
         if let RowScope::Tab(k) = r.scope
@@ -2391,9 +2426,10 @@ fn machine_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
 fn global_json(s: &Snapshot) -> Jv {
     let mut o = Jv::obj([(
         "cpu_mc",
-        s.cpu
-            .as_ref()
-            .map_or_else(|| Jv::why("warming"), |c| Jv::u(mc(c.busy.raw))),
+        s.cpu.as_ref().map_or_else(
+            || Jv::why("warming"),
+            |c| Jv::known_or(c.current_busy().map(mc), "no_counter_delta"),
+        ),
     )]);
     if let Some(cpu) = s.cpu.as_ref() {
         o.set(
@@ -2401,7 +2437,7 @@ fn global_json(s: &Snapshot) -> Jv {
             Jv::Arr(
                 cpu.clusters
                     .iter()
-                    .map(|c| Jv::u(mc(c.cores.iter().map(|&i| cpu.cores[i].load.raw).sum())))
+                    .map(|c| Jv::known_or(cpu.current_cluster_busy(c).map(mc), "no_counter_delta"))
                     .collect(),
             ),
         );
@@ -2779,6 +2815,20 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             o.set("procs", procs_json(q, ctx, s, sc));
         }
         View::Why => why::why_json(q, ctx, s, &mut o),
+        View::Report => o.set("report", super::hardware::report_json(s)),
+    }
+    if matches!(q.view, View::Cores | View::Procs)
+        || (q.view == View::Why && crate::scheduling::idle_performance(s).is_some())
+    {
+        o.set("scheduling_context", scheduling_context_json(ctx, s));
+    }
+    if matches!(q.view, View::Cores | View::Why) {
+        if let Some(h) = &s.hardware {
+            o.set("cpu_hardware", super::hardware::sample_json(h));
+        }
+        if let Some(b) = &s.cpu_diagnostics {
+            o.set("cpu_diagnostic_bundle", super::hardware::bundle_json(b));
+        }
     }
     o.set(
         "events",
@@ -2799,7 +2849,12 @@ fn aterm_json(s: &Snapshot) -> Jv {
             let mut f = Fig::of(a);
             f.program.clear();
             let mut o = fig_json(&f);
-            if let Some(b) = s.cpu.as_ref().map(|c| c.busy.raw).filter(|b| *b > 0.05) {
+            if let Some(b) = s
+                .cpu
+                .as_ref()
+                .and_then(|c| c.current_busy())
+                .filter(|b| *b > 0.05)
+            {
                 o.set(
                     "share_of_busy_pm",
                     Jv::u(((a.cores.raw / b) * 1000.0).round().clamp(0.0, 1000.0) as u64),
@@ -2897,11 +2952,15 @@ fn cores_json(s: &Snapshot) -> Jv {
                 ("cpus", Jv::u(c.cores.len() as u64)),
                 (
                     "busy_mc",
-                    Jv::u(mc(c.cores.iter().map(|&i| cpu.cores[i].load.raw).sum())),
+                    Jv::known_or(cpu.current_cluster_busy(c).map(mc), "no_counter_delta"),
                 ),
-                ("req_mhz", Jv::why("lane_off:ioreport")),
+                ("req_mhz", Jv::why("not_sampled:requested_frequency")),
                 ("split_mc", Jv::why("not_sampled")),
-                ("exact", Jv::s("exact")),
+                (
+                    "exact",
+                    cpu.current_cluster_busy(c)
+                        .map_or_else(|| Jv::why("no_counter_delta"), |_| Jv::s("exact")),
+                ),
             ])
         })
         .collect();
@@ -2915,13 +2974,14 @@ fn cores_json(s: &Snapshot) -> Jv {
                     ("cpu", Jv::u(*core as u64)),
                     (
                         "busy_pm",
-                        Jv::u(
-                            (cpu.cores[*core].load.raw * 1000.0)
-                                .round()
-                                .clamp(0.0, 1000.0) as u64,
+                        Jv::known_or(
+                            cpu.cores[*core]
+                                .current()
+                                .map(|load| (load * 1000.0).round().clamp(0.0, 1000.0) as u64),
+                            "no_counter_delta",
                         ),
                     ),
-                    ("req_mhz", Jv::why("lane_off:ioreport")),
+                    ("req_mhz", Jv::why("not_sampled:requested_frequency")),
                 ]),
             )
         })
@@ -3174,7 +3234,146 @@ fn proc_json(ctx: &Ctx<'_>, s: &Snapshot, r: &ProcView) -> Jv {
     o.set("gpu_ppm", Jv::known_or(r.gpu.map(gpu_ppm), GPU_LANE_OFF));
     o.set("stat", Jv::s(r.state.word()));
     o.set("age_ms", Jv::known_or(r.age_ms(s.at_unix_ms), BIRTH_UNREAD));
+    o.set(
+        "scheduling",
+        scheduling_json(r.scheduling, ctx.machine.family),
+    );
     o
+}
+
+fn scheduling_read<T>(read: Result<T, i32>, value: impl FnOnce(T) -> Jv) -> Jv {
+    read.map_or_else(
+        |errno| {
+            Jv::obj([
+                (
+                    "unavailable",
+                    Jv::why(&crate::scheduling::error_word(errno)),
+                ),
+                ("errno", Jv::Int(i64::from(errno))),
+            ])
+        },
+        value,
+    )
+}
+
+pub(super) fn scheduling_json(s: Option<crate::scheduling::Scheduling>, family: &str) -> Jv {
+    let Some(s) = s else {
+        return Jv::why(if family == "macOS" {
+            "not_sampled"
+        } else {
+            "unsupported"
+        });
+    };
+    Jv::obj([
+        ("nice", scheduling_read(s.nice, |v| Jv::Int(i64::from(v)))),
+        ("darwin_application", Jv::Bool(s.application)),
+        (
+            "darwin_background_requested",
+            Jv::obj([
+                ("internal", Jv::Bool(s.background_internal)),
+                ("external", Jv::Bool(s.background_external)),
+            ]),
+        ),
+        ("darwin_suppressed", Jv::Bool(s.suppressed)),
+        (
+            "darwin_role",
+            scheduling_read(s.role, |v| Jv::Int(i64::from(v))),
+        ),
+        (
+            "qos_lifetime_cpu_ns",
+            s.qos_cpu_ns.map_or_else(
+                || Jv::why("not_sampled"),
+                |read| {
+                    scheduling_read(read, |ns| {
+                        Jv::obj(
+                            crate::scheduling::QOS_CLASSES
+                                .into_iter()
+                                .zip(ns)
+                                .map(|(k, v)| (k, Jv::u(v))),
+                        )
+                    })
+                },
+            ),
+        ),
+        ("placement", Jv::why("not_sampled")),
+    ])
+}
+
+pub(crate) fn scheduling_context_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
+    let clusters = s.cpu.as_ref().map_or_else(
+        || Jv::why("warming"),
+        |cpu| {
+            Jv::Arr(
+                cpu.clusters
+                    .iter()
+                    .map(|c| {
+                        Jv::obj([
+                            ("name", Jv::s(&c.name)),
+                            ("cpus", Jv::u(c.cores.len() as u64)),
+                            (
+                                "busy_mc",
+                                Jv::known_or(
+                                    cpu.current_cluster_busy(c).map(mc),
+                                    "no_counter_delta",
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            )
+        },
+    );
+    Jv::obj([
+        ("clusters", clusters),
+        (
+            "wait_mc",
+            s.global.wait.map_or_else(
+                || Jv::why("not_sampled"),
+                |w| Jv::at_least_refused(mc(w), s.global.refused),
+            ),
+        ),
+        (
+            "cores_window_ns",
+            Jv::known_or(s.cores_window_ns, "warming"),
+        ),
+        (
+            "process_window_ns",
+            Jv::known_or(s.procs_window_ns, "warming"),
+        ),
+        (
+            "finding",
+            crate::scheduling::idle_performance(s).map_or_else(
+                || Jv::why("not_sampled"),
+                |_| {
+                    Jv::obj([
+                        ("observation", Jv::s("runnable-wait-with-idle-performance")),
+                        ("cause", Jv::s("unproven")),
+                        ("guidance", Jv::s(crate::scheduling::GUIDANCE)),
+                    ])
+                },
+            ),
+        ),
+        (
+            "diagnostic_executable",
+            ctx.machine
+                .executable
+                .as_deref()
+                .map_or_else(|| Jv::why("not_sampled"), Jv::s),
+        ),
+    ])
+}
+
+pub(crate) fn scheduling_context_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
+    lines.push(line(
+        "scheduling-context",
+        format!(
+            "scheduling_context {}",
+            scheduling_context_json(ctx, s).to_text()
+        ),
+    ));
+    if let Some(exe) = &ctx.machine.executable {
+        lines.push(note("diagnostic-client", format!("diagnostic executable={} (this running instance); use this executable for ctl if PATH names an older development copy", pct(exe))));
+    }
 }
 
 /// One program in its scope: its oldest member's age, a lower bound while a member's birth
@@ -3483,13 +3682,7 @@ fn net_json(q: &SysQuery, s: &Snapshot) -> Jv {
     Jv::obj([
         ("state", Jv::s(net.state.word())),
         ("primary_link", primary),
-        (
-            "srtt_us",
-            Jv::known_or(
-                net.srtt_ms.map(|ms| (ms * 1000.0).round().max(0.0) as u64),
-                "not_sampled",
-            ),
-        ),
+        ("srtt_us", Jv::known_or(srtt_us(net.srtt_ms), "not_sampled")),
         (
             "aterm_sockets",
             Jv::known_or(net.aterm_sockets.map(u64::from), "not_sampled"),
@@ -3507,6 +3700,12 @@ fn net_json(q: &SysQuery, s: &Snapshot) -> Jv {
         ("links", Jv::Arr(links)),
         ("more", Jv::u(net.links.len().saturating_sub(q.top) as u64)),
     ])
+}
+
+fn srtt_us(srtt_ms: Option<f32>) -> Option<u64> {
+    srtt_ms
+        .filter(|ms| ms.is_finite() && *ms > 0.0)
+        .map(|ms| (f64::from(ms) * 1000.0).round() as u64)
 }
 
 #[cfg(test)]

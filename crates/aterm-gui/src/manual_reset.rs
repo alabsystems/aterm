@@ -115,10 +115,40 @@ pub(crate) fn run_direct(
     source: ResetSource,
     fence_wait: Option<Duration>,
 ) -> Result<ResetReport, String> {
-    let (report, _) = {
+    let (report, drain) = {
         let mut t = crate::term_lock(term);
-        apply(&mut t, ClockReading::now())
+        let recording = ctx
+            .temporal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .total_events()
+            > 0;
+        let pre = recording.then(|| crate::temporal::SpinePre::take(&t));
+        let clock = ClockReading::now();
+        let (report, bytes) = apply(&mut t, clock);
+        let drain = if let Some(pre) = pre
+            && let Ok(tx) = crate::temporal::open(&ctx.temporal, crate::temporal::QUEUE_CAP)
+        {
+            let mut mark = crate::temporal::SpineMark::attach(tx.spine());
+            if !bytes.is_empty() {
+                mark.record(
+                    &tx,
+                    pre,
+                    &t,
+                    crate::temporal::InputSlice::at(&bytes[..], clock),
+                );
+            } else {
+                mark.flush_host(&tx, &t);
+            }
+            Some(tx.drain())
+        } else {
+            None
+        };
+        (report, drain)
     };
+    if let Some(drain) = drain {
+        drain.wait();
+    }
     let noted = ctx.fabric.note_direct_reset(fence_wait);
     record(sid, &ctx.timeline, source, &report);
     if noted {

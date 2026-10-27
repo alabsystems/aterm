@@ -459,6 +459,7 @@ impl OutputStreak {
     }
 
     /// [`Self::note_output`] with the anchor derived from a frame's cells.
+    #[inline]
     pub fn note_output_cells(
         &mut self,
         cells: &[Vec<aterm_core::terminal::RenderCell>],
@@ -628,6 +629,7 @@ impl OutputStreak {
         false
     }
 
+    #[inline]
     const fn retire_light_over_erased_ink(&mut self) {
         if self.no_comets() && self.ribbon.is_none() {
             return;
@@ -659,6 +661,7 @@ impl OutputStreak {
     }
 
     /// Advance one frame at `now` and append this frame's light to `out`.
+    #[inline]
     pub fn tick(
         &mut self,
         now: Instant,
@@ -723,6 +726,7 @@ impl OutputStreak {
         }
     }
 
+    #[inline]
     fn spend_pending(
         &mut self,
         now: Instant,
@@ -855,6 +859,7 @@ impl OutputStreak {
         (anchor + jitter).clamp(0.0, 1.0)
     }
 
+    #[inline]
     fn refresh_ribbon(&mut self, now: Instant, pending: Pending, cfg: &StreakConfig, geom: Geom) {
         let Some((from_col, to_col)) = clipped_span(pending, geom.cols) else {
             return;
@@ -918,6 +923,7 @@ impl OutputStreak {
         }
     }
 
+    #[inline]
     fn emit(&self, geom: Geom, cfg: &StreakConfig, out: &mut Vec<GlowQuad>) -> u64 {
         let peak = (ALPHA_DEFAULT * cfg.intensity.clamp(0.0, 1.0)).min(ALPHA_CLAMP);
         let amp = if cfg.dark_theme { peak } else { peak * 0.5 };
@@ -926,7 +932,7 @@ impl OutputStreak {
         }
         let before = out.len();
         let mut fp: u64 = 0;
-        let (cw_i, ch_i) = (geom.cw as i32, geom.ch as i32);
+        let ch_i = geom.ch as i32;
 
         let mut ci = 0;
         while ci < MAX_COMETS {
@@ -946,14 +952,12 @@ impl OutputStreak {
             while col <= col_end {
                 let u = ((head - col as f32) * inv_tail_denom).clamp(0.0, 1.0);
                 let shape = (1.0 - u) * (1.0 - u);
-                self.push_cell(
+                Self::push_cell(
                     out,
                     geom,
                     cfg,
                     amp,
-                    (cw_i, ch_i),
-                    y,
-                    col,
+                    (y, col),
                     c.hue + u * HUE_SPAN,
                     shape * life,
                 );
@@ -974,7 +978,7 @@ impl OutputStreak {
             let mut col = r.from_col;
             while col <= r.to_col {
                 let t = r.hue + col as f32 * hue_step;
-                self.push_cell(out, geom, cfg, amp, (cw_i, ch_i), y, col, t, shape);
+                Self::push_cell(out, geom, cfg, amp, (y, col), t, shape);
                 col += 1;
             }
             fp = fp
@@ -990,21 +994,13 @@ impl OutputStreak {
     }
 
     /// One cell of streak light.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "cell coordinate + hue + shape + the frame's geometry/config; one internal \
-                  call site per emitter arm (the `cursor_comet::emit_coma` precedent)"
-    )]
     #[inline]
     fn push_cell(
-        &self,
         out: &mut Vec<GlowQuad>,
         geom: Geom,
         cfg: &StreakConfig,
         amp: f32,
-        (w, h): (i32, i32),
-        y: i32,
-        col: i32,
+        (y, col): (i32, i32),
         hue_t: f32,
         shape: f32,
     ) {
@@ -1015,6 +1011,7 @@ impl OutputStreak {
         if a == 0 {
             return;
         }
+        let (w, h) = (geom.cw as i32, geom.ch as i32);
         let base = spectrum(hue_t - hue_t.floor());
         let x = col * w;
 

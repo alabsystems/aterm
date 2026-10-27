@@ -138,7 +138,7 @@ fn memory_available_is_free_inactive_and_purgeable_pages() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn a_processs_working_directory_and_executable_are_its_own() {
     let own = crate::process_cwd(std::process::id()).expect("our own cwd");
@@ -1072,6 +1072,24 @@ fn the_processor_array_reads_four_counters_per_core() {
     assert_eq!(macos::cores_of(&words, 0), Some(Vec::new()));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn online_processor_records_preserve_slot_identity_and_refuse_partial_layouts() {
+    // cpu type, subtype, running, slot, main. Physical slot IDs need not be contiguous.
+    let words = [1, 2, 1, 4, 0, 1, 2, 0, -1, 0, 1, 2, 1, 17, 1];
+    assert_eq!(macos::online_processors_of(&words, 3).unwrap(), [4, 17]);
+    assert!(macos::online_processors_of(&words[..14], 3).is_err());
+    assert!(macos::online_processors_of(&words, 2).is_err());
+    assert!(macos::online_processors_of(&[], 1025).is_err());
+    let mut bad = words;
+    bad[3] = -1;
+    assert!(
+        macos::online_processors_of(&bad, 3).is_err(),
+        "negative online slot"
+    );
+    assert!(macos::online_processors_of(&[], 0).unwrap().is_empty());
+}
+
 /// The device tree's encodings: little-endian data words and a
 /// `cluster-type` letter.
 #[cfg(target_os = "macos")]
@@ -1946,9 +1964,13 @@ fn the_cpu_brand_volume_totals_tcp_summary_and_socket_count_read_on_this_host() 
         "{root:?}"
     );
 
-    let me = std::process::id();
-    let before = crate::open_socket_count(me).expect("own open socket count");
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    // Other tests in this binary open and close sockets on their own threads, so a count taken
+    // before and after can fall by one of theirs as ours rises; the sockets held here are a
+    // floor nothing else lowers.
+    const HELD: u32 = 16;
+    let listeners: Vec<std::net::TcpListener> = (0..HELD)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener"))
+        .collect();
     let mut scratch = Vec::new();
     if let Some(tcp) = crate::tcp_summary_into(&mut scratch) {
         assert!(
@@ -1959,12 +1981,12 @@ fn the_cpu_brand_volume_totals_tcp_summary_and_socket_count_read_on_this_host() 
             assert!(rtt.is_finite() && rtt > 0.0 && rtt < 60_000.0, "{tcp:?}");
         }
     }
-    let during = crate::open_socket_count(me).expect("own open socket count with listener");
+    let during = crate::open_socket_count(std::process::id()).expect("own open socket count");
     assert!(
-        during > before,
-        "opening a TCP listener must increment open_socket_count: before={before}, during={during}"
+        during >= HELD,
+        "open_socket_count must count the {HELD} listeners this test holds: {during}"
     );
-    drop(listener);
+    drop(listeners);
 }
 
 #[test]
@@ -2017,4 +2039,26 @@ fn linux_inet_diag_rtt_parser_extracts_non_loopback_median_and_skips_loopback() 
     );
     assert_eq!(rtts, vec![12.5, 24.5]);
     assert_eq!(crate::linux::median_rtt_ms(&mut rtts), Some(18.5));
+
+    // Sequence-filtered parsing ignores stale frames (including NLMSG_DONE) from an earlier seq.
+    let with_seq = |mut frame: Vec<u8>, seq: u32| {
+        frame[8..12].copy_from_slice(&seq.to_ne_bytes());
+        frame
+    };
+    let mut mixed = Vec::new();
+    mixed.extend_from_slice(&with_seq(diag_msg(2, 1, v4_remote, 99_000), 1));
+    mixed.extend_from_slice(&with_seq(done.clone(), 1));
+    mixed.extend_from_slice(&with_seq(diag_msg(10, 1, v6_remote, 24_500), 2));
+    let mut seq2_rtts = Vec::new();
+    assert_eq!(
+        crate::linux::parse_inet_diag_rtts_seq(&mixed, Some(2), &mut seq2_rtts),
+        Some(false),
+        "stale seq=1 NLMSG_DONE must not terminate seq=2 before seq=2's own NLMSG_DONE"
+    );
+    assert_eq!(seq2_rtts, vec![24.5]);
+    let seq2_done = with_seq(done, 2);
+    assert_eq!(
+        crate::linux::parse_inet_diag_rtts_seq(&seq2_done, Some(2), &mut seq2_rtts),
+        Some(true)
+    );
 }

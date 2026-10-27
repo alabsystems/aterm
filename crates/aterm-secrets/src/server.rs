@@ -675,12 +675,12 @@ fn load_vault(path: &Path, name: &str) -> crate::Result<Held> {
     })
 }
 
-/// The ALab vault's name in a store ([`crate::ALAB_DEFAULT_URL`]'s last segment).
-pub(crate) const ALAB_VAULT: &str = "alab";
+use crate::ALAB_VAULT;
 
 /// Whether `store` holds the ALab vault: an `alab.vault` that verifies, signed by a key this
 /// build names for it or one reached from such a key by verified handoffs
-/// ([`envelope::Retired::names`], as [`crate::client::alab_vault`] judges a member's pin).
+/// ([`envelope::Retired::lineage`]), a retired one included: until the version that replaces it
+/// arrives, that version is still the ALab vault this server holds.
 pub(crate) fn holds_alab(store: &Path) -> bool {
     let Ok(Some(bytes)) = fsx::read_owned(&store.join(format!("{ALAB_VAULT}.vault")), MAX_ENVELOPE)
     else {
@@ -689,7 +689,7 @@ pub(crate) fn holds_alab(store: &Path) -> bool {
     envelope::parse(&bytes).is_ok_and(|envelope| {
         envelope.name == ALAB_VAULT
             && envelope.verify_signature().is_ok()
-            && envelope::Retired::compiled().names(&envelope.signer, &envelope.reached_from())
+            && envelope::Retired::compiled().lineage(&envelope.signer, &envelope.reached_from())
     })
 }
 
@@ -1675,6 +1675,32 @@ fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
         Ok(None) => return Reply::empty(204),
         Err(reply) => return reply,
     };
+    if !state.vaults.contains_key(name) {
+        // A queue the store kept with no vault of that name (its file removed by hand) asked an
+        // earlier vault: no request reaches a name the server does not hold, and the new vault
+        // cannot tell the Macs that one let go from the rest. It goes before the vault is
+        // stored, so a restart never reads it back beside the new one; each Mac still waiting
+        // asks again within the hour.
+        if let Err(e) = std::fs::remove_file(shared.joins_path(name))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            note(&format!(
+                "{name}: could not store seq {}: the join queue an earlier vault of that name \
+                 left could not be removed: {e}",
+                envelope.seq
+            ));
+            return Reply::text(500, "the server could not store the envelope");
+        }
+        if state
+            .joins
+            .remove(name)
+            .is_some_and(|queue| !queue.is_empty())
+        {
+            note(&format!(
+                "{name}: dropped the join queue an earlier vault of that name left"
+            ));
+        }
+    }
     if let Err(e) = fsx::write_atomic(&shared.vault_path(name), body, 0o600) {
         note(&format!(
             "{name}: could not store seq {}: {e}",
@@ -3218,6 +3244,31 @@ mod tests {
         assert!(put(&running, &envelope(&OLD, 3)).is_err());
         assert!(put(&running, &envelope(&STRANGER, 5)).is_err());
         put(&running, &envelope(&OLD, 5)).expect("newer");
+        running.stop();
+    }
+
+    #[test]
+    fn a_vaults_first_version_drops_the_queue_an_earlier_one_left() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&options(root.path(), Duration::from_millis(200)));
+        put(&running, &envelope(&OLD, 4)).expect("first");
+        transport::post_join(&url(&running), &join_line(1, "m22")).expect("queued");
+        running.stop();
+        // The vault's file goes by hand; the queue it left stays in the store.
+        std::fs::remove_file(root.path().join("alab.vault")).expect("the vault's file");
+
+        let running = run(&options(root.path(), Duration::from_millis(200)));
+        put(&running, &envelope(&OLD, 1)).expect("a first version again");
+        let listed = transport::list_joins(&url(&running)).expect("listed");
+        assert!(listed.is_empty(), "{listed:?}");
+        running.stop();
+        assert!(
+            !root.path().join("alab.joins").exists(),
+            "the store keeps no old queue"
+        );
+        let running = run(&options(root.path(), Duration::from_millis(200)));
+        let listed = transport::list_joins(&url(&running)).expect("listed");
+        assert!(listed.is_empty(), "a restart reads none back: {listed:?}");
         running.stop();
     }
 

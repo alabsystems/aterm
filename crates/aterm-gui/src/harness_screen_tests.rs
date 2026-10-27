@@ -1495,6 +1495,7 @@ fn a_sessions_row_names_its_agent_once() {
         state.posture = HarnessPosture::On(Autopilot::Cruise);
         state.sessions = vec![HarnessSession {
             stopped: None,
+            waiting: None,
             local_id: 0,
             sid: "s-0".to_string(),
             title: title.to_string(),
@@ -1598,6 +1599,7 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
     const TODAY: i64 = 20_007;
     let dated = |view: AutopilotView, glass: ChipGlass, today: i64| HarnessSessionRow {
         stopped: None,
+        waiting: None,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),
@@ -1781,6 +1783,7 @@ fn the_state_line_says_the_pause_where_no_face_or_timer_has_the_line() {
     const TODAY: i64 = 20_007;
     let row = |view: AutopilotView, glass: ChipGlass| HarnessSessionRow {
         stopped: None,
+        waiting: None,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),
@@ -1850,6 +1853,94 @@ fn the_state_line_says_the_pause_where_no_face_or_timer_has_the_line() {
         .state_line()
         .as_deref(),
         Some("last: \u{2713} approved 18:35")
+    );
+}
+
+#[test]
+fn the_state_line_leads_with_an_outage_wait_and_its_next_try() {
+    use crate::claude_lights::{ChipGlass, Clock, Stamp, Weekday};
+    use crate::harness_glass::WaitGlass;
+    use aterm_agent::harness::acts::Act;
+    use aterm_agent::supervise::Outage;
+    const TODAY: i64 = 20_007;
+    let row = |view: AutopilotView, glass: ChipGlass, waiting| HarnessSessionRow {
+        stopped: None,
+        waiting,
+        local_id: 7,
+        title: "fix the build".to_string(),
+        name: "fix the build".to_string(),
+        day_line: None,
+        detail: String::new(),
+        mode: view.mode(),
+        default: view.mode(),
+        view,
+        glass,
+        armed_at_ms: None,
+        today: TODAY,
+        setting: "follows the default".to_string(),
+        need: None,
+        hold: None,
+    };
+    let stamp = |h: u16, m: u16, day: i64| Stamp {
+        clock: Clock::of_minute(h * 60 + m),
+        day,
+    };
+    let tries = |wall, next| Some(WaitGlass { wall, next });
+    let quiet = ChipGlass::default();
+    for view in [AutopilotView::Cruise, AutopilotView::Land] {
+        assert_eq!(
+            row(
+                view,
+                quiet,
+                tries(Outage::Overload, Some(stamp(18, 41, TODAY)))
+            )
+            .state_line()
+            .as_deref(),
+            Some("waiting: API overload \u{b7} next try 18:41"),
+            "{view:?}: a blind try's clock"
+        );
+        assert_eq!(
+            row(view, quiet, tries(Outage::Connection, None))
+                .state_line()
+                .as_deref(),
+            Some("waiting: connection error"),
+            "{view:?}: measured down, no try to name"
+        );
+    }
+    assert_eq!(
+        row(
+            AutopilotView::Cruise,
+            quiet,
+            tries(Outage::ApiError, Some(stamp(0, 12, TODAY + 1)))
+        )
+        .state_line(),
+        Some(format!(
+            "waiting: API error \u{b7} next try {} 00:12",
+            Weekday::of_days(TODAY + 1).short()
+        )),
+        "a try past midnight names its day"
+    );
+    let last = ChipGlass {
+        last: Some((Act::Approved, stamp(18, 35, TODAY))),
+        ..ChipGlass::default()
+    };
+    assert_eq!(
+        row(
+            AutopilotView::Cruise,
+            last,
+            tries(Outage::Overload, Some(stamp(18, 41, TODAY)))
+        )
+        .state_line()
+        .as_deref(),
+        Some("waiting: API overload \u{b7} next try 18:41 \u{b7} last: \u{2713} approved 18:35"),
+        "the wait leads, the trail follows"
+    );
+    assert_eq!(
+        row(AutopilotView::Cruise, last, None)
+            .state_line()
+            .as_deref(),
+        Some("last: \u{2713} approved 18:35"),
+        "CONTROL: no wait, no head"
     );
 }
 
@@ -2581,6 +2672,7 @@ fn each_row_takes_its_own_sessions_day_and_a_name_its_own() {
     use aterm_agent::harness::stats::Tally;
     let session = |local_id: u64, title: &str, place: &str| HarnessSession {
         stopped: None,
+        waiting: None,
         local_id,
         sid: format!("s-{local_id}"),
         title: title.to_string(),
@@ -2669,6 +2761,7 @@ fn a_rows_escalation_clock_uses_the_events_offset_not_the_readings() {
         let checked = read_at_words(report.collected_unix_ms, report.offset_s);
         let session = |local_id, sid: &str| HarnessSession {
             stopped: None,
+            waiting: None,
             local_id,
             sid: sid.to_string(),
             title: sid.to_string(),
@@ -3082,6 +3175,7 @@ fn state_deciding(
     let mut state = state_with_today(Some(today), false);
     state.sessions = vec![HarnessSession {
         stopped: None,
+        waiting: None,
         local_id: 7,
         sid: "s-7".to_string(),
         title: "fix the build".to_string(),
@@ -3654,6 +3748,7 @@ fn a_fleetless_reading_keeps_the_last_sweep_and_owes_tab_control_one() {
 fn listed_with(local_id: u64, verdict: &crate::needs::Verdict) -> HarnessSession {
     HarnessSession {
         stopped: None,
+        waiting: None,
         local_id,
         sid: format!("s-{local_id}"),
         title: format!("tab {local_id}"),
@@ -3745,6 +3840,7 @@ fn a_need_heads_the_rows_state_line() {
     );
     let row = |glass: ChipGlass| HarnessSessionRow {
         stopped: None,
+        waiting: None,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),

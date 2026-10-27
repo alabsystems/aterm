@@ -336,13 +336,20 @@ impl Terminal {
             + Send
             + 'static,
     {
-        self.kitty_file_resolver = Some(Box::new(resolver));
+        self.kitty_file_resolver.install(Box::new(resolver));
+    }
+
+    /// Remove the Kitty non-direct medium resolver, so `t=f`/`t=t`/`t=s` are refused as medium
+    /// disabled again.
+    #[inline]
+    pub fn clear_kitty_file_resolver(&mut self) {
+        self.kitty_file_resolver.uninstall();
     }
 
     /// Set the desktop notification callback for OSC 9 messages.
     #[inline]
     pub fn set_notification_callback<F: FnMut(&str) + Send + 'static>(&mut self, callback: F) {
-        self.notifications.callback = Some(Box::new(callback));
+        self.notifications.sinks.set_callback(Box::new(callback));
     }
 
     /// Set the callback for complete OSC 99 and OSC 777 notifications.
@@ -351,7 +358,9 @@ impl Terminal {
         &mut self,
         callback: F,
     ) {
-        self.notifications.advanced_callback = Some(Box::new(callback));
+        self.notifications
+            .sinks
+            .set_advanced_callback(Box::new(callback));
     }
 
     /// Set the host's admission for each program notification `allow_notifications` lets
@@ -364,7 +373,7 @@ impl Terminal {
     where
         F: FnMut(&super::program_state::ProgramStateReport) -> bool + Send + 'static,
     {
-        self.notifications.admission = Some(Box::new(admit));
+        self.notifications.sinks.set_admission(Box::new(admit));
     }
 
     /// Set the OSC 52 clipboard callback.

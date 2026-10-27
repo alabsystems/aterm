@@ -38,7 +38,7 @@ pub enum Setting {
     Permissions = 9,
     /// Join and continuously synchronize the credentials vault.
     Secrets = 10,
-    /// Authenticate GitHub and clone the credential's accessible repositories.
+    /// Authenticate GitHub and clone the credential's own repositories (no forks or archived ones).
     Repositories = 11,
 }
 
@@ -86,7 +86,7 @@ impl Setting {
             Self::Spotlight => "Keep Rust offline documentation and build folders out of Spotlight",
             Self::Permissions => "Set up aterm's macOS permissions",
             Self::Secrets => "Sync credentials from the secrets vault",
-            Self::Repositories => "Set up GitHub and clone accessible repositories into home",
+            Self::Repositories => "Set up GitHub and clone your repositories into home",
         }
     }
 }
@@ -264,6 +264,52 @@ impl Access {
     }
 }
 
+/// One kind of credential that aterm keeps in step across a person's Macs, each a row in the
+/// Secrets group's "Your other Macs" (`docs/DESIGN-init-on-by-default-2026-10-25.md` §8.5, §8.7).
+/// Every kind rides [`Setting::Secrets`] (no plan bit of its own, so an older aterm reads every
+/// plan and a rollback does not freeze setup); a row stands apart only to say where that kind
+/// stands and to hold its own off switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SyncKind {
+    /// The other Macs found on this network or in the fleet book.
+    Peers,
+    /// The git identity (`aterm-identity`, or the GitHub account).
+    Identity,
+    /// The aterm fleet (`aterm-fleet-code`).
+    Fleet,
+    /// The AI account roster (logins stay on each Mac).
+    Accounts,
+    /// Shared data (Commons), within its admission boundary.
+    SharedData,
+    /// This Mac's name from the inventory (ALab only).
+    Name,
+}
+
+impl SyncKind {
+    /// Every kind, in page order.
+    pub const ALL: [Self; 6] = [
+        Self::Peers,
+        Self::Identity,
+        Self::Fleet,
+        Self::Accounts,
+        Self::SharedData,
+        Self::Name,
+    ];
+
+    /// The row's stable human label.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Peers => "Your other Macs",
+            Self::Identity => "Git identity",
+            Self::Fleet => "Fleet",
+            Self::Accounts => "AI accounts",
+            Self::SharedData => "Shared data",
+            Self::Name => "Name",
+        }
+    }
+}
+
 /// What a System State row is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Subject {
@@ -271,6 +317,10 @@ pub enum Subject {
     Setting(Setting),
     /// One grant in the Access group.
     Access(Access),
+    /// One kind of credential synced across the person's Macs. A stub that rides
+    /// [`Setting::Secrets`] and reads as not-applicable until SYNC-1 fills its behaviour; it is
+    /// not enumerated by [`Subject::all`], so no Sync row is built in shipped code yet.
+    Sync(SyncKind),
 }
 
 impl Subject {
@@ -279,25 +329,28 @@ impl Subject {
     pub const fn uses_vault_source(self) -> bool {
         matches!(
             self,
-            Self::Setting(Setting::Secrets | Setting::Repositories)
+            Self::Setting(Setting::Secrets | Setting::Repositories) | Self::Sync(_)
         )
     }
 
-    /// The page group the row sits in.
+    /// The page group the row sits in. A Sync row follows [`Setting::Secrets`].
     #[must_use]
     pub const fn group(self) -> Group {
         match self {
             Self::Setting(setting) => setting.group(),
             Self::Access(_) => Group::Access,
+            Self::Sync(_) => Setting::Secrets.group(),
         }
     }
 
-    /// The setting bit whose selection manages this row.
+    /// The setting bit whose selection manages this row. A Sync row rides
+    /// [`Setting::Secrets`]: no plan bit of its own.
     #[must_use]
     pub const fn setting(self) -> Setting {
         match self {
             Self::Setting(setting) => setting,
             Self::Access(_) => Setting::Permissions,
+            Self::Sync(_) => Setting::Secrets,
         }
     }
 
@@ -307,6 +360,7 @@ impl Subject {
         match self {
             Self::Setting(setting) => setting.name(),
             Self::Access(access) => access.name(),
+            Self::Sync(kind) => kind.name(),
         }
     }
 
@@ -316,6 +370,7 @@ impl Subject {
         match self {
             Self::Setting(setting) => setting.wanted(),
             Self::Access(access) => access.wanted(),
+            Self::Sync(_) => Setting::Secrets.wanted(),
         }
     }
 
@@ -439,6 +494,11 @@ pub const LOCAL_NETWORK_ASKED: &str = "macOS asked you, and does not tell apps y
 /// are not installed: a person's remedy (`init_observe::Wait::CommandLineTools`), which System
 /// State's page starts in a terminal tab of its own (design §3.3).
 pub const COMMAND_LINE_TOOLS_MISSING: &str = "Install Apple's Command Line Tools";
+
+/// The note of a workstation row the person changed after aterm set it and read it back
+/// (design §6.9): no automatic pass sets it again, so the row reads as the person left it, with
+/// no chip saying it will change, until Restore, turning its group off and on, or Set up now.
+pub const CHANGED_BY_YOU: &str = "Changed by you";
 
 /// The placeholder that makes `softwareupdate -l` list Apple's Command Line Tools: an install
 /// through `softwareupdate` keeps it while it runs. It can outlive a crashed installer, so
@@ -1373,6 +1433,38 @@ pub mod access_record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Subject::Sync` row rides `Setting::Secrets` (its group, setting and wanted all follow
+    /// it, and it uses the vault source) and is not enumerated by `all()`, so no Sync row is
+    /// built in shipped code yet. Its six kinds are distinct and have distinct names. The
+    /// negative control is `all()`'s zero Sync subjects: were the stub enumerated, this would
+    /// fail.
+    #[test]
+    fn a_sync_row_is_a_stub_that_rides_secrets_and_stays_off_the_page() {
+        for kind in SyncKind::ALL {
+            let row = Subject::Sync(kind);
+            assert_eq!(row.group(), Setting::Secrets.group(), "{kind:?}");
+            assert_eq!(row.setting(), Setting::Secrets, "{kind:?}");
+            assert_eq!(row.wanted(), Setting::Secrets.wanted(), "{kind:?}");
+            assert_eq!(row.name(), kind.name(), "{kind:?}");
+            assert!(row.uses_vault_source(), "{kind:?}");
+        }
+        // Not enumerated: no Sync row is built in shipped code.
+        assert_eq!(
+            Subject::all()
+                .into_iter()
+                .filter(|subject| matches!(subject, Subject::Sync(_)))
+                .count(),
+            0
+        );
+        // The six kinds are distinct, and so are their names.
+        for (i, a) in SyncKind::ALL.iter().enumerate() {
+            for b in &SyncKind::ALL[i + 1..] {
+                assert_ne!(a, b);
+                assert_ne!(a.name(), b.name(), "{a:?} vs {b:?}");
+            }
+        }
+    }
 
     /// A Restore's outcome holds one entry per row, its worst key speaking for it, in page
     /// order with the keys of no row last.

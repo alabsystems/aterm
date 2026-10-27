@@ -5,7 +5,7 @@
 //! scanned ([`super::scan`]) and judged against what the row expects.
 
 use super::instance::{CouldNotRun, could_not_run};
-use super::scan::{ScanReport, StatusRow};
+use super::scan::{FrameNote, ScanReport, StatusRow};
 use super::starvation::{Disposition, SchedReading, ShapeVerdict, Starvation};
 
 /// The ink floor on a take: dynamic saturated pixels across all its frames.
@@ -34,14 +34,23 @@ pub enum Scene {
     Streamer,
     /// Alt screen, an append-shaped stream walking a shown caret, nothing typed.
     ColdStreamer,
+    /// The main screen cleared under `sleep`, the caret on row [`PLANE_ROW`] and nothing above
+    /// or below it, each typed key echoed by the tty: a body laid there has its whole reach in
+    /// the clear, under no glyph's keep-out and inside the window.
+    Plane,
 }
+
+/// The plane's caret row, zero-based (`ESC [10;10H`).
+pub const PLANE_ROW: usize = 9;
+/// The plane's caret column, zero-based.
+pub const PLANE_COL: usize = 9;
 
 impl Scene {
     /// The `fake-tui` shape the scene runs, if any.
     #[must_use]
     pub const fn tui(self) -> Option<&'static str> {
         match self {
-            Self::Prompt => None,
+            Self::Prompt | Self::Plane => None,
             Self::FakeClaude | Self::ColdSpinner => Some("claude"),
             Self::Streamer => Some("streamer"),
             Self::ColdStreamer => Some("cold-streamer"),
@@ -56,6 +65,7 @@ impl Scene {
             Self::ColdSpinner => "cold-spinner",
             Self::Streamer => "streamer",
             Self::ColdStreamer => "cold-streamer",
+            Self::Plane => "plane",
         }
     }
 }
@@ -175,6 +185,70 @@ pub enum Split {
     H,
 }
 
+/// A body whose height above the typed row's bottom edge (where its spine rests) the take
+/// bounds in both directions: the band's measured top ([`super::scan::band_top`]) must stand at
+/// least `lo` and at most `hi` hundredths of a cell above that edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reach {
+    /// The tall body every `ribbon_look=tall` spelling lays (aterm-effects `TALL_UP_CH` above its
+    /// spine, `TALL_CORE_CH` of it at full strength).
+    Tall,
+    /// The underline spelling's body (aterm-effects `UNDERLINE_UP_CH` above its spine, `LEAD_CH`
+    /// at full strength and the rest a wash at `SHOULDER_UNDERLINE`).
+    Underline,
+}
+
+impl Reach {
+    /// `(lo, hi)` in hundredths of a cell height, inclusive.
+    #[must_use]
+    pub const fn bounds(self) -> (usize, usize) {
+        match self {
+            Self::Tall => (TALL_REACH_MIN_PCT, TALL_REACH_MAX_PCT),
+            Self::Underline => (UNDERLINE_REACH_MIN_PCT, UNDERLINE_REACH_MAX_PCT),
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Tall => "tall",
+            Self::Underline => "underline",
+        }
+    }
+
+    /// Whether a row's style lays this body.
+    #[must_use]
+    pub const fn laid_by(self, style: Style) -> bool {
+        match self {
+            Self::Tall => matches!(
+                style,
+                Style::Classic | Style::Default | Style::Flying | Style::Tall
+            ),
+            Self::Underline => matches!(style, Style::Underline),
+        }
+    }
+
+    /// Whether `px` above the edge, at cell height `cell_h`, is inside the bounds.
+    #[must_use]
+    pub const fn holds(self, px: usize, cell_h: usize) -> bool {
+        let (lo, hi) = self.bounds();
+        lo * cell_h <= 100 * px && 100 * px <= hi * cell_h
+    }
+}
+
+/// The least height of the tall body's measured top above its row's bottom edge, in hundredths
+/// of a cell.
+pub const TALL_REACH_MIN_PCT: usize = 55;
+/// The greatest.
+pub const TALL_REACH_MAX_PCT: usize = 100;
+/// The least height of the underline body's measured top above its row's bottom edge.
+pub const UNDERLINE_REACH_MIN_PCT: usize = 25;
+/// The greatest.
+pub const UNDERLINE_REACH_MAX_PCT: usize = 60;
+
+/// The fewest measured frames a reach verdict is decided on.
+pub const REACH_MIN_FRAMES: usize = 6;
+
 /// One matrix row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaintRow {
@@ -186,6 +260,8 @@ pub struct PaintRow {
     pub style: Style,
     pub companion: Option<Companion>,
     pub split: Option<Split>,
+    /// The body whose reach the take bounds, if any.
+    pub reach: Option<Reach>,
 }
 
 impl PaintRow {
@@ -223,12 +299,35 @@ impl PaintRow {
                 return could_not_run("the companion judges a spelling its style does not select");
             }
         }
+        if let Some(reach) = self.reach {
+            if self.scene != Scene::Plane || self.split.is_some() {
+                return could_not_run(
+                    "a reach row needs the plane scene, unsplit, so the body has room above its row",
+                );
+            }
+            if self.capture.is_video() {
+                return could_not_run(
+                    "a reach row needs an image burst, so each measured frame binds to its claim",
+                );
+            }
+            if self.expect != Expect::Ink || self.keys.is_empty() || self.companion.is_some() {
+                return could_not_run("a reach row needs typed ink and no companion");
+            }
+            if !reach.laid_by(self.style) {
+                return could_not_run("the reach bounds a body its style does not lay");
+            }
+        }
         Ok(())
     }
 
     /// What a red on this row means.
     #[must_use]
     pub const fn meaning(&self) -> &'static str {
+        if self.reach.is_some() {
+            return "the body did not paint, or its band's top did not stand within its bounds \
+                    above the typed row (reach_px against reach_bounds_pct of cell_h): a body \
+                    drawn too short or too tall";
+        }
         match (self.expect, self.capture) {
             (Expect::EffectOff, _) => {
                 "the canonical off style leaked trail geometry, or the scanner attributed unrelated \
@@ -341,6 +440,13 @@ fn ink_holds(row: &PaintRow, s: &ScanReport) -> Result<bool, CouldNotRun> {
     Ok(s.ribbon_dark == 0 && (s.ribbon_bound < 2 || s.ribbon_window_hues >= 4))
 }
 
+/// Whether the take measured the body's reach on enough frames, and their median band top stands
+/// inside its bounds above the typed row's bottom edge.
+#[must_use]
+pub fn reach_holds(reach: Reach, s: &ScanReport) -> bool {
+    s.reach_frames >= REACH_MIN_FRAMES && s.reach_px.is_some_and(|px| reach.holds(px, s.cell.h))
+}
+
 /// The row's expectation against the take, before the instrument's account.
 ///
 /// # Errors
@@ -381,6 +487,7 @@ pub fn judge(row: &PaintRow, ledger: &Ledger, s: &ScanReport) -> Result<ShapeVer
         None => true,
         Some(Companion::Pet) => {
             s.pet_claimed == s.frames
+                && s.pet_missing == 0
                 && s.cat_claimed == 0
                 && s.base_comp.is_some()
                 && s.companion_stack == 0
@@ -395,7 +502,8 @@ pub fn judge(row: &PaintRow, ledger: &Ledger, s: &ScanReport) -> Result<ShapeVer
                 && s.cat_last_present
         }
     };
-    Ok(if pass && style_ok && companion_ok {
+    let reach_ok = row.reach.is_none_or(|reach| reach_holds(reach, s));
+    Ok(if pass && style_ok && companion_ok && reach_ok {
         ShapeVerdict::Pass
     } else {
         ShapeVerdict::Fail
@@ -424,6 +532,34 @@ pub struct PaintReport {
     pub band: super::instance::Band,
     /// The scheduling band the bench (the driver and the sampler) ran in.
     pub bench_band: super::instance::Band,
+    /// The session's replay checks at the end ([`super::instance::replay_checks`]).
+    pub checks: String,
+}
+
+/// Each frame the engine claimed the resident pet on and the scanner found no pet at its claimed
+/// body, as `frame:pose` (the pose the engine named), or `none`.
+#[must_use]
+pub fn pet_missing_at(ledger: &Ledger, s: &ScanReport) -> String {
+    let rows = ledger.rows.as_deref().unwrap_or_default();
+    let at: Vec<String> = s
+        .per_frame
+        .iter()
+        .zip(rows)
+        .enumerate()
+        .filter(|(_, (frame, row))| {
+            frame.notes.contains(&FrameNote::CompanionMissing) && row.bool("pet_active") == Ok(true)
+        })
+        .map(|(i, (_, row))| format!("{i}:{}", row.pet_pose().unwrap_or("-")))
+        .collect();
+    if at.is_empty() {
+        "none".to_string()
+    } else {
+        at.join(",")
+    }
+}
+
+fn opt(v: Option<usize>) -> String {
+    v.map_or_else(|| "none".to_string(), |v| v.to_string())
 }
 
 impl std::fmt::Display for PaintReport {
@@ -436,11 +572,13 @@ impl std::fmt::Display for PaintReport {
              cyan_frames={} rainbow_frames={} rainbow_run={} rainbow_gap={} driven_dark_us={} \
              driven_frames={} sampling_hole_us={} nominal_dt_us={} mature_lead_us={} \
              status_frames={} ribbon_claimed={} ribbon_bound={} ribbon_dark={} \
-             ribbon_window_hues={} pet_claimed={} pet_missing={} pet_final_run={} cat_claimed={} \
-             cat_missing={} cat_final_run={} companion_frames={} companion_stack={} \
-             fx_under_frames={} typed_gap_ms={:?} driven_ms={} alt_wait_ms={} wall_us={} sched_ticks={} \
+             ribbon_window_hues={} pet_claimed={} pet_missing={} pet_missing_at={} \
+             pet_final_run={} cat_claimed={} cat_missing={} cat_final_run={} companion_frames={} \
+             companion_stack={} fx_under_frames={} reach={} reach_frames={} reach_px={} \
+             reach_min_px={} reach_max_px={} reach_bounds_pct={} cell_h={} row_bottom={} \
+             typed_gap_ms={:?} driven_ms={} alt_wait_ms={} wall_us={} sched_ticks={} \
              sched_late_max_us={} sched_window_ticks={} sched_window_late_max_us={} qos={:?} \
-             subject_band={} bench_band={} starved={:?} reason=\"{}\" shape={:?} verdict={:?}",
+             subject_band={} bench_band={} starved={:?} reason=\"{}\" shape={:?} verdict={:?} {}",
             r.scene.name(),
             r.style.name(),
             r.companion,
@@ -469,6 +607,7 @@ impl std::fmt::Display for PaintReport {
             s.ribbon_window_hues,
             s.pet_claimed,
             s.pet_missing,
+            pet_missing_at(&self.ledger, s),
             s.pet_final_run,
             s.cat_claimed,
             s.cat_missing,
@@ -476,6 +615,20 @@ impl std::fmt::Display for PaintReport {
             s.companion_frames,
             s.companion_stack,
             self.ledger.fx_under_frames,
+            r.reach.map_or("none", Reach::name),
+            s.reach_frames,
+            opt(s.reach_px),
+            opt(s.reach_min_px),
+            opt(s.reach_max_px),
+            r.reach.map_or_else(
+                || "none".to_string(),
+                |reach| {
+                    let (lo, hi) = reach.bounds();
+                    format!("{lo}:{hi}")
+                }
+            ),
+            s.cell.h,
+            opt(s.typed_row.map(|row| row.bottom)),
             self.typed_gap_ms,
             self.driven_ms
                 .map_or_else(|| "none".to_string(), |(lo, hi)| format!("{lo}:{hi}")),
@@ -492,6 +645,7 @@ impl std::fmt::Display for PaintReport {
             self.starvation,
             self.shape,
             self.disposition,
+            self.checks,
         )
     }
 }

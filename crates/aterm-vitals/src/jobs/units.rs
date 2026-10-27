@@ -16,6 +16,10 @@ use super::{
     ZombieParent, Zombies, command_class,
 };
 
+#[cfg(test)]
+#[path = "activity_tests.rs"]
+mod activity_tests;
+
 /// Descendants walked per tab at most.
 const TREE_CAP: usize = 4096;
 /// Side writes allowed per 2 s tick beyond the output channel's share.
@@ -971,6 +975,15 @@ impl Jobs {
                     *e |= p.state != ProcState::Zombie;
                 }
             }
+            // A remembered detached call can outlive its controller. New children
+            // are then outside the tab shell's tree, but still need readings.
+            if job.kind == JobKind::AgentCall
+                && by_pid.get(&job.key.leader).is_some_and(|p| p.ppid <= 1)
+            {
+                for pid in descendants(job.key.leader, &children) {
+                    want.insert(pid, true);
+                }
+            }
         }
         want.into_iter()
             .map(|(pid, fds)| Want { pid, fds })
@@ -1440,6 +1453,51 @@ impl Jobs {
             }
         }
 
+        let mut adopted_incomplete = BTreeSet::new();
+        for (i, job) in self
+            .jobs
+            .iter()
+            .enumerate()
+            .filter(|(_, j)| j.exited_ms.is_none() && j.kind == JobKind::AgentCall)
+        {
+            let Some(root) = sweep.get(&job.key.leader).filter(|p| p.ppid <= 1) else {
+                continue;
+            };
+            let descendants = descendants(job.key.leader, &children);
+            let root_valid = job.key.start.is_some()
+                && facts.get(&job.key.leader).and_then(|f| f.start) == job.key.start;
+            if !root_valid || descendants.len() >= TREE_CAP {
+                adopted_incomplete.insert(i);
+                continue;
+            }
+            for pid in descendants {
+                if claimed.get(&pid).is_some_and(|owner| *owner != i) {
+                    continue;
+                }
+                let valid = adopted_member(pid, job.key.leader, job.pgid, &sweep, &facts);
+                if valid {
+                    if job.members.get(&pid).is_some_and(|previous| {
+                        previous.start != facts.get(&pid).and_then(|current| current.start)
+                    }) {
+                        // The normal member pass retires the old generation;
+                        // this transition cannot certify complete CPU coverage.
+                        adopted_incomplete.insert(i);
+                    }
+                    claimed.insert(pid, i);
+                    assigned.entry(i).or_default().push(pid);
+                } else {
+                    adopted_incomplete.insert(i);
+                }
+            }
+            if sweep.values().any(|p| {
+                p.pgid == job.pgid
+                    && p.pid != root.pid
+                    && !job.members.contains_key(&p.pid)
+                    && !claimed.contains_key(&p.pid)
+            }) {
+                adopted_incomplete.insert(i);
+            }
+        }
         let tabs: HashMap<u64, &JobTab> = tabs_now.iter().map(|t| (t.key, &**t)).collect();
         // Each block a job was resumed in front under while the block's own job kept it, and
         // whether that job lives on as the shell waits for it: a child of the shell's outside
@@ -2358,6 +2416,8 @@ impl Jobs {
                 .as_ref()
                 .and_then(|n| named_standing(n, holds_fg, &holders, &elsewhere_all));
 
+            // Unknown adopted-tree coverage cannot certify a zero-CPU quiet run.
+            refused |= adopted_incomplete.contains(&i);
             let ev = Evidence {
                 at_ms: at,
                 dt_ms: dt,
@@ -2445,6 +2505,7 @@ impl Jobs {
                 mu_from: out.mu_from,
                 verdict: out.verdict,
                 no_progress: out.no_progress,
+                working_descendant: None,
                 episode: out.episode,
                 exit: job.exit,
                 tick: out.tick,
@@ -2481,6 +2542,13 @@ impl Jobs {
         let rows: Vec<JobRow> = {
             let mut r: Vec<JobRow> = self.jobs.iter().filter_map(|j| j.row.clone()).collect();
             r.sort_by(|a, b| a.tab.cmp(&b.tab).then_with(|| a.id.cmp(&b.id)));
+            note_working_descendants(
+                &mut r,
+                &sweep,
+                &facts,
+                &tick.tabs,
+                tick.machine.stretch_milli,
+            );
             r
         };
         let findings = self.findings(tick, &sweep, &flat_on_dylib);
@@ -2908,6 +2976,61 @@ fn descendants(root: u32, children: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
     out
 }
 
+/// Complete, same-generation parent chain below a remembered adopted call.
+/// A group number alone never confers ownership.
+fn adopted_member(
+    pid: u32,
+    root: u32,
+    pgid: u32,
+    sweep: &HashMap<u32, &SweepProc>,
+    facts: &HashMap<u32, &JobProc>,
+) -> bool {
+    let Some(r) = facts.get(&root) else {
+        return false;
+    };
+    let (Some(uid), Some(_)) = (r.uid, r.start) else {
+        return false;
+    };
+    if pgid == 0 {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    let mut cur = pid;
+    let mut child_age = 0;
+    for _ in 0..TREE_CAP {
+        if !seen.insert(cur) {
+            return false;
+        }
+        let (Some(s), Some(f)) = (sweep.get(&cur), facts.get(&cur)) else {
+            return false;
+        };
+        if s.ppid != f.ppid
+            || s.pgid != pgid
+            || f.pgid != pgid
+            || s.uid != Some(uid)
+            || f.uid != Some(uid)
+            || f.start.is_none()
+        {
+            return false;
+        }
+        let Some(age) = f.age_ms.filter(|age| *age > 0) else {
+            return false;
+        };
+        if age < child_age {
+            return false;
+        }
+        child_age = age;
+        if cur == root {
+            return true;
+        }
+        if s.ppid <= 1 || s.ppid == cur {
+            return false;
+        }
+        cur = s.ppid;
+    }
+    false
+}
+
 /// A remembered member's ancestry in the whole sweep, independent of discovery's cap;
 /// `None` when a missing parent or a cycle prevents a decision.
 fn in_tree(pid: u32, root: u32, sweep: &HashMap<u32, &SweepProc>) -> Option<bool> {
@@ -2927,6 +3050,108 @@ fn in_tree(pid: u32, root: u32, sweep: &HashMap<u32, &SweepProc>) -> Option<bool
         cur = p.ppid;
     }
     None
+}
+
+/// A detached call's current ancestry inside one known user/terminal/joined context.
+/// Ages share the probe batch's clock. Unknown or inconsistent generations, including a
+/// clock-clamped zero age, are no evidence; process start tokens are compared only for identity.
+fn call_ancestry(
+    tab: u64,
+    child: (u32, u64),
+    sweep: &HashMap<u32, &SweepProc>,
+    facts: &HashMap<u32, &JobProc>,
+    joined: &BTreeSet<(u64, u32)>,
+) -> Option<Vec<(u32, u64)>> {
+    let first = facts.get(&child.0).filter(|p| p.start == Some(child.1))?;
+    let uid = first.uid?;
+    let mut younger_age = first.age_ms.filter(|age| *age > 0)?;
+    let mut cur = child.0;
+    let mut seen = BTreeSet::new();
+    let mut path = Vec::new();
+    for _ in 0..TREE_CAP {
+        let p = facts.get(&cur)?;
+        let s = sweep.get(&cur)?;
+        if p.ppid != s.ppid
+            || p.uid != s.uid
+            || matches!(p.state, ProcState::Unknown | ProcState::Zombie)
+            || matches!(s.state, ProcState::Unknown | ProcState::Zombie)
+        {
+            return None;
+        }
+        if s.has_tty? || p.uid? != uid {
+            return Some(path);
+        }
+        let start = p.start?;
+        let age = p.age_ms.filter(|age| *age > 0)?;
+        if age < younger_age || !seen.insert(cur) || seen.contains(&p.ppid) {
+            return None;
+        }
+        path.push((cur, start));
+        if joined.contains(&(tab, cur)) || p.ppid <= 1 {
+            return Some(path);
+        }
+        younger_age = age;
+        cur = p.ppid;
+    }
+    None
+}
+
+/// Keep local verdicts and accounting, but expose observed work in a detached descendant.
+/// A Running row carries bounded recent progress (at most [`super::RUNNING_WINDOW_MS`]),
+/// while a busy row needs current CPU. Neither is a claim of semantic compiler progress.
+fn note_working_descendants(
+    rows: &mut [JobRow],
+    sweep: &HashMap<u32, &SweepProc>,
+    facts: &HashMap<u32, &JobProc>,
+    tabs: &[JobTab],
+    stretch_milli: u32,
+) {
+    let joined: BTreeSet<_> = tabs
+        .iter()
+        .flat_map(|t| t.calls.iter().map(move |c| (t.key, c.leader)))
+        .collect();
+    let ancestors: HashMap<_, _> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == JobKind::AgentCall && r.verdict != Verdict::Exited)
+        .filter_map(|(i, r)| r.leader.1.map(|start| ((r.tab, r.leader.0), (i, start))))
+        .collect();
+    let working: Vec<_> = rows
+        .iter()
+        .filter(|r| r.kind == JobKind::AgentCall && !r.tick.refused)
+        .filter(|r| {
+            r.class == Class::Running
+                || (r.class == Class::BusySilent
+                    && r.cpu_mc.is_some_and(|c| {
+                        u128::from(c) * u128::from(stretch_milli.max(1000)) >= 500_000
+                    }))
+        })
+        .filter_map(|r| r.leader.1.map(|start| (r.tab, (r.leader.0, start))))
+        .collect();
+    for row in rows.iter_mut() {
+        row.working_descendant = None;
+    }
+    for (tab, child) in working {
+        let Some(path) = call_ancestry(tab, child, sweep, facts, &joined) else {
+            continue;
+        };
+        let mut targets = Vec::new();
+        let mut consistent = true;
+        for &(pid, start) in path.iter().skip(1) {
+            if let Some(&(i, expected)) = ancestors.get(&(tab, pid)) {
+                if start != expected {
+                    consistent = false;
+                    break;
+                }
+                targets.push(i);
+            }
+        }
+        if consistent {
+            for i in targets {
+                rows[i].working_descendant.get_or_insert(child);
+            }
+        }
+    }
 }
 
 /// What owns a process below the tab's shell other than its group.

@@ -842,13 +842,12 @@ fn a_sealed_intent_reads_only_under_its_key() {
         new: Some(id(6)),
         carries_state: true,
     };
-    write_intent(&log, Some(&[0x11; 32]), &intent, &perms_of(&log)).unwrap();
+    let k11 = crate::store::AtRestRef::v1(&[0x11; 32]);
+    let k12 = crate::store::AtRestRef::v1(&[0x12; 32]);
+    write_intent(&log, Some(k11), &intent, &perms_of(&log)).unwrap();
+    assert_eq!(read_intent(&log, Some(k11)).unwrap(), Found::Intent(intent));
     assert_eq!(
-        read_intent(&log, Some(&[0x11; 32])).unwrap(),
-        Found::Intent(intent)
-    );
-    assert_eq!(
-        read_intent(&log, Some(&[0x12; 32])).unwrap(),
+        read_intent(&log, Some(k12)).unwrap(),
         Found::Unreadable("does not authenticate")
     );
     assert!(matches!(

@@ -37,7 +37,6 @@ disallowed-methods = [
   { path = "windows::Win32::System::Threading::CreateProcessW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
   { path = "windows::Win32::UI::Shell::ShellExecuteW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
   { path = "aterm_objc::msg", reason = "use checked_msg: the debug-build send checks the prototype against the runtime (clippy.toml: a checked send)" },
-  { path = "wgpu::Device::create_render_pipeline", reason = "build it from its pipeline-table row: aterm_gpu's pipeline_table::build_wgpu (clippy.toml: one pipeline table)", allow-invalid = true },
   { path = "aterm_window::event_loop::EventLoop::new", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
   { path = "aterm_window::event_loop::EventLoop::builder", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
   { path = "aterm_window::event_loop::EventLoop::with_user_event", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },

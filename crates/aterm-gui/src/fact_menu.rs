@@ -74,6 +74,10 @@ pub(crate) enum FactAct {
     AutoRotate,
     /// Open a tab in the folder of the account roster (`accounts.toml`, beside `aterm.toml`).
     AccountSettings,
+    /// Inspect this instance's network and shared-service availability.
+    NetworkState,
+    /// Forget the cached Muse usage reading so the next read mints a fresh one.
+    RefreshUsage,
 }
 
 impl FactAct {
@@ -91,6 +95,8 @@ impl FactAct {
             Self::UseAccount(label) => format!("use/{}", label.as_str()),
             Self::AutoRotate => "auto-rotate".to_string(),
             Self::AccountSettings => "account-settings".to_string(),
+            Self::NetworkState => "network-state".to_string(),
+            Self::RefreshUsage => "refresh-usage".to_string(),
         }
     }
 }
@@ -301,6 +307,8 @@ fn row_figure(figure: WeeklyFigure, now: i64) -> (u32, String) {
 /// Inputs used to build a fact menu.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FactMenuFacts {
+    /// The actual session recovery observation, independent of the rotation-policy checkmark.
+    pub(crate) account_progress: Option<aterm_agent::harness::account_progress::AccountProgress>,
     /// The menu's name: the fact and the session's place (`Folder · tab 1`).
     pub(crate) title: String,
     /// The session's own name, in quotes after the place where both fit.
@@ -322,14 +330,20 @@ pub(crate) struct FactMenuFacts {
     pub(crate) weekly_meter: Option<String>,
     /// Why the footer has no weekly figure, where it says ([`weekly_gap_why`]).
     pub(crate) weekly_gap: Option<WeeklyGap>,
-    /// The pooled CLI the session runs, whose roster [`Self::accounts`] lists (`None`: Claude
-    /// Code's).
+    /// The pooled CLI the session runs, whose roster [`Self::accounts`] lists (`None`: the
+    /// program keeps its own login and has no rotation pool).
     pub(crate) cli: Option<aterm_agent::harness::accounts::Cli>,
+    /// Where a program with no rotation pool keeps its login, for the account menu's note.
+    pub(crate) own_login: Option<&'static str>,
+    /// The account menu offers to mint a fresh Muse usage reading.
+    pub(crate) refresh_usage: bool,
     /// The rotation accounts in roster order (dedicated first, then pool).
     pub(crate) accounts: Vec<AccountMenuRow>,
     /// Why the local pool cannot safely supply choices.
     pub(crate) accounts_refused: Option<String>,
-    /// Whether automatic rotation (`!state.pinned`) is active.
+    /// Account choices are being read off the event-loop thread.
+    pub(crate) accounts_loading: bool,
+    /// Whether automatic account selection is allowed (`!state.pinned`).
     pub(crate) auto_rotate: bool,
     /// The facts hidden in this session.
     pub(crate) off: FactMask,
@@ -462,6 +476,42 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
             ));
         }
         Fact::Account => {
+            if let Some(progress) = &facts.account_progress {
+                let mut summary = progress.clone();
+                summary.details.clear();
+                out.push(MenuRow::note(
+                    aterm_agent::harness::footer::account_progress_text(&summary, false),
+                ));
+                if progress.phase == aterm_agent::harness::account_progress::ProgressPhase::Watching
+                    && progress.wall.is_none()
+                {
+                    out.push(MenuRow::note(
+                        aterm_agent::harness::footer::account_progress_phase(progress),
+                    ));
+                }
+                for detail in &progress.details {
+                    out.push(MenuRow::note(detail.clone()));
+                }
+                out.push(MenuRow::note(format!(
+                    "Observed {}",
+                    aterm_agent::harness::usage::rfc3339_utc(progress.observed_at)
+                )));
+                if let Some(at) = progress.next_at {
+                    out.push(MenuRow::note(format!(
+                        "Next event {}",
+                        aterm_agent::harness::usage::rfc3339_utc(at)
+                    )));
+                }
+                out.push(MenuRow::Item {
+                    glyph: "⋯",
+                    label: "Network State…".into(),
+                    spoken: "Network State and shared-service access".into(),
+                    act: MenuAct::Fact(fact, FactAct::NetworkState),
+                    enabled: true,
+                    checked: false,
+                });
+                out.push(MenuRow::Rule);
+            }
             if let Some(sub) = &facts.subscription {
                 out.push(MenuRow::note(format!(
                     "{}  {sub}",
@@ -491,6 +541,25 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 }
             }
             note(&mut out);
+            if facts.cli.is_none() {
+                if let Some(own) = facts.own_login {
+                    out.push(MenuRow::note(own.to_string()));
+                }
+                if facts.refresh_usage {
+                    out.push(item(
+                        fact,
+                        "\u{21bb}",
+                        "Refresh usage",
+                        FactAct::RefreshUsage,
+                        true,
+                    ));
+                }
+                return out;
+            }
+            if facts.accounts_loading {
+                out.push(MenuRow::note("Loading account choices…"));
+                return out;
+            }
             if let Some(why) = &facts.accounts_refused {
                 out.push(MenuRow::note(format!("Account state unavailable: {why}")));
                 out.push(MenuRow::Item {
@@ -535,8 +604,8 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 out.push(MenuRow::Rule);
                 out.push(MenuRow::Item {
                     glyph: "\u{21bb}",
-                    label: "Sync & Auto-rotate (dedicated \u{2192} pool)".to_string(),
-                    spoken: "Sync and auto-rotate accounts".to_string(),
+                    label: "Sync & allow automatic selection".to_string(),
+                    spoken: "Sync and allow automatic account selection".to_string(),
                     act: MenuAct::Fact(fact, FactAct::AutoRotate),
                     enabled: true,
                     checked: false,
@@ -565,8 +634,8 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
             out.push(MenuRow::Rule);
             out.push(MenuRow::Item {
                 glyph: "\u{21bb}",
-                label: "Auto-rotate (dedicated \u{2192} pool)".to_string(),
-                spoken: "Auto-rotate, dedicated then pool".to_string(),
+                label: "Allow automatic selection".to_string(),
+                spoken: "Allow automatic account selection".to_string(),
                 act: MenuAct::Fact(fact, FactAct::AutoRotate),
                 enabled: true,
                 checked: facts.auto_rotate,
@@ -796,64 +865,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn build_account_menu_rows(
-    cli: aterm_agent::harness::accounts::Cli,
-    session_account: Option<&str>,
-    session_email: Option<&str>,
-    session: SessionWeek,
-) -> Result<(Vec<AccountMenuRow>, bool), String> {
-    use aterm_agent::harness::accounts;
-    if cfg!(test) {
-        return Ok((Vec::new(), true));
-    }
-    if cli != accounts::Cli::Claude {
-        let now = aterm_time::unix_secs()
-            .and_then(|n| i64::try_from(n).ok())
-            .unwrap_or(0);
-        let (Some(config), Some(state_dir), Some(home)) = (
-            aterm_types::dirs::aterm_config_path(),
-            crate::harness_host::harness_state(),
-            aterm_primer::home_dir(),
-        ) else {
-            return Err("account home, configuration or state directory is unavailable".into());
-        };
-        return pool_menu_rows(
-            cli,
-            (&config, &state_dir, &home),
-            (session_account, session_email),
-            now,
-        );
-    }
-    let now = aterm_time::unix_secs()
-        .and_then(|n| i64::try_from(n).ok())
-        .unwrap_or(0);
-    let Some(roster_path) = accounts::default_roster_path() else {
-        return Err("account roster path is unavailable".into());
-    };
-    let state_dir = crate::harness_host::harness_state();
-    let roster = accounts::Roster::load(&roster_path)?;
-    let (roster, state) = match state_dir.as_deref() {
-        Some(dir) => {
-            let store = accounts::Store::at(dir);
-            let roster = store.bound(&roster, now)?;
-            let (state, _) = store.load(now)?;
-            (roster, state)
-        }
-        None => return Err("account state directory is unavailable".into()),
-    };
-    let enrolled = accounts::enrolled(&roster);
-    Ok(account_menu_rows_from(
-        &roster,
-        &state,
-        &enrolled,
-        session_account,
-        session_email,
-        session,
-        now,
-    ))
-}
-
-/// The account rows of another CLI's pool for a session of it ([`build_account_menu_rows`]): its
+/// The account rows of another CLI's pool, read by the account-menu worker: its
 /// roster beside `config` (`accounts-<cli>.toml`), bound to the logins its renewals made, each
 /// row's condition from its own store (`accounts::Store::at_for`); a row is enrolled once its
 /// login file exists (`accounts::enrolled_for`). No roster, or a refused one, is no rows.
@@ -1005,15 +1017,6 @@ pub(crate) fn account_menu_rows_from(
                         .then(|| session.left.clone())
                         .flatten()
                 })
-                .or_else(|| {
-                    matches!(
-                        cond,
-                        accounts::Condition::Usable
-                            | accounts::Condition::Unseen
-                            | accounts::Condition::NotEnrolled
-                    )
-                    .then(|| (100, String::new()))
-                })
         };
         let class_word = match row.class {
             accounts::Class::Dedicated => "dedicated",
@@ -1030,7 +1033,7 @@ pub(crate) fn account_menu_rows_from(
             }
             (accounts::Condition::NotEnrolled, _, false) => "not enrolled".to_string(),
             (_, Some((pct, age)), _) => format!("{pct}% left{age}"),
-            (_, None, _) => cond.as_str().to_string(),
+            (_, None, _) => format!("{}; quota unknown", cond.as_str()),
         };
         let enabled = !matches!(
             cond,
@@ -1049,15 +1052,14 @@ pub(crate) fn account_menu_rows_from(
 impl App {
     /// The pooled CLI `session` runs ([`crate::harness_host::pool_cli`] of the program its screen
     /// reader names), Claude Code's where it names none.
-    pub(crate) fn session_cli(&self, session: u64) -> aterm_agent::harness::accounts::Cli {
-        self.pool
-            .get(session)
-            .and_then(|entry| {
-                let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-                timeline.agent().reader
-            })
-            .and_then(crate::harness_host::pool_cli)
-            .unwrap_or(aterm_agent::harness::accounts::Cli::Claude)
+    pub(crate) fn session_cli(&self, session: u64) -> Option<aterm_agent::harness::accounts::Cli> {
+        self.pool.get(session).and_then(|entry| {
+            let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline
+                .agent()
+                .reader
+                .and_then(crate::harness_host::pool_cli)
+        })
     }
 
     fn fact_menu_facts(&self, session: u64, fact: Fact) -> FactMenuFacts {
@@ -1082,28 +1084,18 @@ impl App {
             ..FactMenuFacts::default()
         };
         let mut key = false;
-        let mut session_acct: Option<String> = None;
-        let mut session_email: Option<String> = None;
-        let mut session_week = SessionWeek::default();
+        let mut program: Option<aterm_phase::Program> = None;
         if let Some(entry) = self.pool.get(session) {
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            let non_claude = match timeline
+            program = timeline
                 .agent()
                 .program
                 .as_deref()
-                .and_then(aterm_phase::program_of)
-            {
-                Some(aterm_phase::Program::Claude) | None => false,
-                Some(
-                    aterm_phase::Program::Agy
-                    | aterm_phase::Program::Muse
-                    | aterm_phase::Program::Codex
-                    | aterm_phase::Program::Grok
-                    | aterm_phase::Program::Kimi
-                    | aterm_phase::Program::Generic,
-                ) => true,
-            };
+                .and_then(aterm_phase::program_of);
             if let Some(facts) = timeline.claude_footer() {
+                out.account_progress = facts
+                    .account_progress_view()
+                    .map(std::borrow::Cow::into_owned);
                 let pgid = timeline.agent().program_pgid;
                 let latched = state
                     .and_then(|f| f.latch.as_ref())
@@ -1115,13 +1107,7 @@ impl App {
                         .as_deref()
                         .is_some_and(crate::claude_slash::takes_key_toggle);
                 let facts = facts.filled_from(timeline.claude_card());
-                if !non_claude {
-                    session_acct.clone_from(&facts.account);
-                }
                 if let Some(sub) = &facts.subscription {
-                    if !non_claude {
-                        session_email.clone_from(&sub.email);
-                    }
                     let email_str = sub.email.as_deref().filter(|s| !s.is_empty());
                     let plan_str = sub.plan.as_deref().filter(|s| !s.is_empty());
                     let summary = match (email_str, plan_str) {
@@ -1141,14 +1127,9 @@ impl App {
                     let now = aterm_time::unix_secs()
                         .and_then(|n| i64::try_from(n).ok())
                         .unwrap_or(0);
-                    let (left, weekly_meter, weekly_gap) = weekly_facts(sub, walled, now);
+                    let (_, weekly_meter, weekly_gap) = weekly_facts(sub, walled, now);
                     out.weekly_meter = weekly_meter;
                     out.weekly_gap = weekly_gap;
-                    if !non_claude {
-                        session_week.left = left;
-                        session_week.figure = session_figure(sub, now);
-                        session_week.label.clone_from(&sub.label);
-                    }
                 }
                 (out.model, out.effort, out.path, out.branch, out.context) = (
                     facts.model,
@@ -1165,18 +1146,33 @@ impl App {
         }
         if fact == Fact::Account {
             let cli = self.session_cli(session);
-            out.cli = Some(cli);
-            match build_account_menu_rows(
-                cli,
-                session_acct.as_deref(),
-                session_email.as_deref(),
-                session_week,
-            ) {
-                Ok((accounts, auto_rotate)) => {
-                    out.accounts = accounts;
-                    out.auto_rotate = auto_rotate;
+            out.cli = cli;
+            (out.refresh_usage, out.own_login) = match program {
+                Some(aterm_phase::Program::Muse) => (
+                    true,
+                    Some("Muse's own login — no rotation pool; switch with its /login"),
+                ),
+                Some(aterm_phase::Program::Agy) => {
+                    (false, Some("Antigravity's own login — no rotation pool"))
                 }
-                Err(why) => out.accounts_refused = Some(why),
+                Some(
+                    aterm_phase::Program::Claude
+                    | aterm_phase::Program::Codex
+                    | aterm_phase::Program::Grok
+                    | aterm_phase::Program::Kimi
+                    | aterm_phase::Program::Generic,
+                )
+                | None => (false, None),
+            };
+            if cli.is_some() {
+                match self.account_menu_rows_cached(session) {
+                    Some(Ok((accounts, auto_rotate))) => {
+                        out.accounts.clone_from(accounts);
+                        out.auto_rotate = *auto_rotate;
+                    }
+                    Some(Err(why)) => out.accounts_refused = Some(why.clone()),
+                    None => out.accounts_loading = true,
+                }
             }
         }
         if matches!(fact, Fact::Path | Fact::Branch)
@@ -1325,6 +1321,11 @@ impl App {
             generation: 0,
             rest: PointerRest::at_open(px),
         });
+        if fact == Fact::Account {
+            self.account_menu_read
+                .defer_keyboard_selection(keyboard && highlight.is_none());
+            self.prepare_account_menu_read(wid, session);
+        }
         self.request_menu_frame(wid);
     }
 
@@ -1342,6 +1343,24 @@ impl App {
 
     /// Rebuild the open fact menu's rows when `session`'s facts change.
     pub(crate) fn refresh_fact_menu(&mut self, session: u64) {
+        let Some((wid, fact)) = self
+            .autopilot_menu
+            .as_ref()
+            .and_then(|menu| match menu.owner {
+                MenuOwner::Fact(fact) if menu.session == session => Some((menu.wid, fact)),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        if fact == Fact::Account {
+            self.prepare_account_menu_read(wid, session);
+        }
+        self.rebuild_fact_menu_rows(session);
+    }
+
+    /// Apply cached facts without scheduling another account read from a completion.
+    pub(crate) fn rebuild_fact_menu_rows(&mut self, session: u64) {
         let Some((wid, fact)) = self
             .autopilot_menu
             .as_ref()
@@ -1438,7 +1457,9 @@ impl App {
             }
             FactAct::UseAccount(label) => {
                 use aterm_agent::harness::accounts;
-                let cli = self.session_cli(session);
+                let Some(cli) = self.session_cli(session) else {
+                    return;
+                };
                 let now = aterm_time::unix_secs()
                     .and_then(|n| i64::try_from(n).ok())
                     .unwrap_or(0);
@@ -1497,7 +1518,9 @@ impl App {
             }
             FactAct::AutoRotate => {
                 use aterm_agent::harness::accounts;
-                let cli = self.session_cli(session);
+                let Some(cli) = self.session_cli(session) else {
+                    return;
+                };
                 let now = aterm_time::unix_secs()
                     .and_then(|n| i64::try_from(n).ok())
                     .unwrap_or(0);
@@ -1555,6 +1578,22 @@ impl App {
                     NEW_TABS_ASKED.with(|asked| asked.borrow_mut().push(at.clone()));
                     self.open_tab_in_cwd(wid, Some(&at));
                     self.note_fact_notice(wid, session, FactNotice::NewTab);
+                }
+            }
+            FactAct::NetworkState => {
+                self.open_network_lens();
+            }
+            FactAct::RefreshUsage => {
+                let email = self.pool.get(session).and_then(|entry| {
+                    let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                    timeline
+                        .claude_footer()
+                        .and_then(|facts| facts.subscription.as_ref())
+                        .and_then(|sub| sub.email.clone())
+                });
+                if let Some(email) = email.as_deref() {
+                    aterm_agent::harness::profile::muse_usage_forget(email);
+                    self.redraw_claude_footer(session);
                 }
             }
             FactAct::Type(_) => {}

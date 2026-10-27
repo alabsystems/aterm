@@ -1871,7 +1871,6 @@ pub(crate) struct SessionTimeline {
     leader_no_harness: Option<i32>,
     leader_no_harness_applied: Option<i32>,
     upgrade: Option<aterm_agent::harness::upgrade_drive::Row>,
-    upgrade_note: Option<aterm_agent::harness::footer::UpgradeNote>,
     resizes: crate::resize_ledger::ResizeLedger,
     #[cfg(any(unix, test))]
     handoff_ceiling: Option<u64>,
@@ -3106,6 +3105,12 @@ impl SessionTimeline {
             .filter(|image| image.pgid > 0 && image.pgid == self.agent.program_pgid)
     }
 
+    /// The vendor build the foreground agent's image runs, as its store directory names it
+    /// (`2.1.305`, `1.4.13-R6996.1`): read when the image was classified, never on this call.
+    pub(crate) fn running_build(&self) -> Option<atpkg::vendor_direct::Version> {
+        self.current_holder_image()?.build.version()
+    }
+
     /// Whether the current holder image is a card drawer with a token.
     pub(crate) fn card_drawer_current(&self) -> bool {
         self.current_holder_image()
@@ -3384,6 +3389,14 @@ impl SessionTimeline {
             return false;
         }
         let mut next = facts.map(|facts| (pgid, started, facts));
+        if let (Some((np, ns, new)), Some((op, os, old))) =
+            (next.as_mut(), self.claude_footer.as_ref())
+            && np == op
+            && ns == os
+            && new.owner == old.owner
+        {
+            new.account_progress = old.account_progress.clone();
+        }
         let is_muse_or_agy = match self
             .agent
             .program
@@ -3623,6 +3636,29 @@ impl SessionTimeline {
             .map(|(_, _, facts)| facts)
     }
 
+    /// Apply an in-memory supervisor observation only to its current process.
+    pub(crate) fn set_account_progress(
+        &mut self,
+        pgid: i32,
+        started: Option<u64>,
+        conversation: Option<&str>,
+        progress: Option<aterm_agent::harness::account_progress::AccountProgress>,
+    ) -> bool {
+        let Some((pid, birth, facts)) = self.claude_footer.as_mut() else {
+            return false;
+        };
+        if self.agent.program_pgid != pgid
+            || *pid != pgid
+            || *birth != started
+            || facts.owner.as_ref().map(|owner| owner.session_id.as_str()) != conversation
+            || facts.account_progress == progress
+        {
+            return false;
+        }
+        facts.account_progress = progress;
+        true
+    }
+
     /// The active goal of the agent in front, one line ([`aterm_agent::harness::goal`]): what
     /// its own records say (Claude Code's `/goal` and Muse Code's goal store through the footer
     /// resolver's facts, codex-alab's session record through the rollout tap's), or `None` while it
@@ -3762,23 +3798,6 @@ impl SessionTimeline {
     /// This tab's live-upgrade row, or `None`.
     pub(crate) const fn upgrade(&self) -> Option<&aterm_agent::harness::upgrade_drive::Row> {
         self.upgrade.as_ref()
-    }
-
-    /// Replace the upgrade's note for the person here.
-    pub(crate) fn set_upgrade_note(
-        &mut self,
-        note: Option<aterm_agent::harness::footer::UpgradeNote>,
-    ) -> bool {
-        if self.upgrade_note == note {
-            return false;
-        }
-        self.upgrade_note = note;
-        true
-    }
-
-    /// The live upgrade's note for the person here, while the move waits only on them, or `None`.
-    pub(crate) const fn upgrade_note(&self) -> Option<&aterm_agent::harness::footer::UpgradeNote> {
-        self.upgrade_note.as_ref()
     }
 
     /// Replace the task's face ([`Self::task_face()`]).
@@ -4360,6 +4379,45 @@ mod questions_field_tests {
                 .collect();
             assert_eq!(events, vec![format!("field=questions value={word}")]);
         }
+    }
+}
+
+#[cfg(test)]
+mod account_progress_tests {
+    use super::*;
+    use aterm_agent::harness::{
+        account_progress::AccountProgress,
+        footer::{FactsOwner, FooterFacts},
+    };
+
+    fn facts(owner: &str) -> FooterFacts {
+        FooterFacts {
+            owner: Some(FactsOwner {
+                floor: Some(100),
+                session_id: owner.into(),
+            }),
+            ..FooterFacts::default()
+        }
+    }
+
+    #[test]
+    fn refreshed_facts_keep_only_the_same_process_and_conversations_progress() {
+        let mut timeline = SessionTimeline::for_test();
+        timeline.agent.program_pgid = 42;
+        assert!(timeline.set_claude_footer(42, Some(100), Some(facts("one"))));
+        let progress = AccountProgress::unknown(101);
+        assert!(timeline.set_account_progress(42, Some(100), Some("one"), Some(progress.clone())));
+        timeline.set_claude_footer(42, Some(100), Some(facts("one")));
+        assert_eq!(
+            timeline.claude_footer().unwrap().account_progress,
+            Some(progress.clone())
+        );
+        timeline.set_claude_footer(42, Some(100), Some(facts("two")));
+        assert_eq!(timeline.claude_footer().unwrap().account_progress, None);
+        assert!(!timeline.set_account_progress(42, Some(100), Some("one"), Some(progress.clone())));
+        assert!(timeline.set_account_progress(42, Some(100), Some("two"), Some(progress)));
+        timeline.set_claude_footer(42, Some(102), Some(facts("two")));
+        assert_eq!(timeline.claude_footer().unwrap().account_progress, None);
     }
 }
 

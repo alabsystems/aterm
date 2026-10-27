@@ -52,7 +52,13 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
     let fs = fabric_status(&w);
     assert_eq!(kv(&fs, "state"), Some("connected"), "{fs}");
     assert_eq!(kv(&fs, "reason"), Some("-"), "{fs}");
-    assert_eq!(kv(&fs, "rtt_ms"), Some(rtt.to_string().as_str()), "{fs}");
+    // A live link files a fresh `link up rtt=` at least every LINK_REFRESH of acks, which can land
+    // between the two verbs, so here each carries its own reading; that they read the one link
+    // fact is held below, on the stall, where no ack can move it.
+    let live: u64 = kv(&fs, "rtt_ms")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("connected must carry a numeric rtt_ms=: {fs}"));
+    assert!(live >= 1, "a real ack never reads 0 ms: {fs}");
     let lane = aterm_types::control_verbs::BRIDGE_LANE.to_string();
     assert_eq!(kv(&fs, "bridge_lane"), Some(lane.as_str()), "{fs}");
     assert!(kv(&fs, "build").is_some(), "{fs}");
@@ -72,10 +78,16 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
             && matches!(kv(&fs, "reason"), Some("closed" | "no-socket" | "refused")))
         .then_some(fs)
     });
-    assert_eq!(kv(&fs, "rtt_ms"), Some(rtt.to_string().as_str()), "{fs}");
+    // The stall keeps the last ack's rtt as history: the first one read, or a probe's the bridge
+    // was answered during the shutdown. Nothing acks a stalled link, so `status` must read the
+    // same rtt `fabric status` does: the two verbs report one link fact.
+    let kept: u64 = kv(&fs, "rtt_ms")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("a stall keeps the last rtt: {fs}"));
+    assert!(kept >= 1, "{fs}");
     let s = status(&w);
     assert!(s.contains(" fabric=stalled "), "{s}");
-    assert!(s.contains(&format!(" fabric_rtt_ms={rtt} ")), "{s}");
+    assert!(s.contains(&format!(" fabric_rtt_ms={kept} ")), "{s}");
 
     const WAIT: Duration = Duration::from_secs(300);
     let asked = Instant::now();

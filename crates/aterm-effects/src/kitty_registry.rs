@@ -41,6 +41,7 @@ const APP_LOOK_SALT: u64 = 0x6170_704B_6974_7400;
 const TRANSPARENT_PREFIXES: &[&str] = &["sudo", "env", "npx"];
 
 /// Extract the first meaningful program token of a shell commandline, basenamed and lowercased.
+#[inline]
 #[must_use]
 pub fn app_basename(commandline: &str) -> Option<String> {
     #[inline]

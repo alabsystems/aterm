@@ -497,10 +497,7 @@ fn the_chips_are_buttons_a_screen_reader_can_press() {
     assert!(
         chips.len() > 1
             && chips[1..].iter().all(|c| c.chip.fact().is_some()
-                || matches!(
-                    c.chip,
-                    HarnessChip::Switch | HarnessChip::SwitchOn | HarnessChip::Title
-                )),
+                || matches!(c.chip, HarnessChip::Switch | HarnessChip::Title)),
         "{chips:?}"
     );
     let strip = usize::from(app.chrome_rows(wid));
@@ -626,9 +623,17 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
     let strip = usize::from(app.chrome_rows(wid));
-    assert_eq!(of(&app.claude_chips_a11y(wid), HarnessChip::Mode), None);
+    // The rewritten mode row leaves the light the mode's one home: bypass reads `yolo` there, a
+    // mode a press has nothing to move from.
+    assert_eq!(
+        of(&app.claude_chips_a11y(wid), HarnessChip::Mode).map(|c| c.label),
+        Some("Permission mode: yolo.".to_owned())
+    );
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Mode);
-    assert!(pty(&mut reader, 0).is_empty(), "no light, nothing typed");
+    assert!(
+        pty(&mut reader, 0).is_empty(),
+        "an expected mode, nothing typed"
+    );
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
     let chips = app.claude_chips_a11y(wid);
@@ -636,16 +641,17 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     let (row, col) = hit(&app, wid, MODE);
     assert_eq!((light.row, light.col), (row - strip, col));
     assert_eq!(light.label, "Permission mode: plan.");
-    let relabelled = app.windows[&wid].claude_lights.sessions[&session].relabelled;
+    let rewritten = app.windows[&wid].claude_lights.sessions[&session].rewritten;
     assert_eq!(
         light.description,
         Some(format!(
             "Click for {} or auto.",
-            Mode::Bypass.word_on_glass(relabelled)
+            Mode::Bypass.word_on_glass(rewritten)
         ))
     );
     let switch = of(&chips, HarnessChip::Switch).unwrap_or_else(|| panic!("{chips:?}"));
-    assert_eq!(switch.label, "alab harness v0.1 on");
+    let label = crate::claude_footer::probe::harness_label(aterm_phase::CliHarness::ClaudeCode);
+    assert_eq!(switch.label, format!("{label} on"));
     assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::True));
     assert!(switch.description.is_some(), "{switch:?}");
     let drawn = app.windows[&wid]
@@ -657,15 +663,13 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
         .expect("the switch is drawn");
     assert_eq!(
         (switch.row, switch.col, switch.width),
-        (
-            drawn.frame_row - strip,
-            drawn.switch.start,
-            drawn.switch.len()
-        )
+        (drawn.frame_row - strip, drawn.cols.start, drawn.cols.len())
     );
     assert!(
-        row_text(&app, wid, drawn.frame_row)[..]
-            .contains("alab harness v0.1 \u{2590} \u{25cf} on \u{258c} off \u{258c}"),
+        row_text(&app, wid, drawn.frame_row)[..].contains(&format!(
+            "{} {label}",
+            crate::claude_footer::probe::LIT_SWITCH
+        )),
         "the glass says what the node says"
     );
     assert_eq!(of(&chips, HarnessChip::Title), None, "{chips:?}");
@@ -709,13 +713,8 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     assert_eq!(autopilot(&app, session).1, AutopilotView::MasterOff);
     let chips = app.claude_chips_a11y(wid);
     let switch = of(&chips, HarnessChip::Switch).expect("the off switch");
-    assert_eq!(switch.label, "alab harness v0.1 off");
+    assert_eq!(switch.label, format!("{label} off"));
     assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::False));
-    let on = of(&chips, HarnessChip::SwitchOn).expect("the on button");
-    assert_eq!(
-        on.label,
-        "on: turn the harness on (Supervise coding agents)"
-    );
 }
 
 #[cfg(a11y_tree)]

@@ -4,7 +4,9 @@
 //! [`super::System::identity`] on the live system, read in this process: the account database
 //! (`getpwuid_r`, and `getgrnam_r` for the `admin` group's members, what `dscl` reads as its
 //! `GroupMembership`), `hw.machine` (what `uname -m` prints) and `kern.osproductversion`
-//! (what `sw_vers -productVersion` prints), with no child process.
+//! (what `sw_vers -productVersion` prints), with no child process. Elsewhere (Linux) the
+//! administrators are the `sudo` and `wheel` groups' members, and `uname(2)` gives the
+//! machine word and the kernel's release.
 
 use super::{Identity, User};
 use std::ffi::{CStr, c_char};
@@ -71,7 +73,10 @@ fn account(uid: u32) -> Result<User, String> {
     let home = home
         .filter(|home| home.starts_with('/'))
         .ok_or_else(|| format!("account {name}: no absolute home directory"))?;
-    let admin = gid == 80 || admin_members()?.contains(&name);
+    let mut admin = cfg!(target_os = "macos") && gid == 80;
+    for group in ADMIN_GROUPS {
+        admin = admin || members(group)?.contains(&name);
+    }
     Ok(User {
         name,
         uid,
@@ -82,7 +87,8 @@ fn account(uid: u32) -> Result<User, String> {
     })
 }
 
-/// `<grp.h>`'s `struct group` on macOS, which aterm's `libc` does not declare.
+/// `<grp.h>`'s `struct group` (macOS and glibc lay it out alike), which aterm's `libc` does not
+/// declare on macOS.
 #[repr(C)]
 struct GroupRecord {
     gr_name: *mut c_char,
@@ -101,8 +107,14 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
-/// The `admin` group's members, as the account database lists them (none without the group).
-fn admin_members() -> Result<Vec<String>, String> {
+/// The groups whose members administer this machine.
+#[cfg(target_os = "macos")]
+const ADMIN_GROUPS: [&CStr; 1] = [c"admin"];
+#[cfg(not(target_os = "macos"))]
+const ADMIN_GROUPS: [&CStr; 2] = [c"sudo", c"wheel"];
+
+/// `group`'s members, as the account database lists them (none without the group).
+fn members(group_name: &CStr) -> Result<Vec<String>, String> {
     let mut group = GroupRecord {
         gr_name: std::ptr::null_mut(),
         gr_passwd: std::ptr::null_mut(),
@@ -115,7 +127,7 @@ fn admin_members() -> Result<Vec<String>, String> {
     // points the record's fields into `buf`; the name is NUL-terminated.
     let rc = unsafe {
         getgrnam_r(
-            c"admin".as_ptr(),
+            group_name.as_ptr(),
             &raw mut group,
             buf.as_mut_ptr().cast::<c_char>(),
             buf.len(),
@@ -124,7 +136,8 @@ fn admin_members() -> Result<Vec<String>, String> {
     };
     if rc != 0 {
         return Err(format!(
-            "the admin group could not be read: {}",
+            "the {} group could not be read: {}",
+            group_name.to_string_lossy(),
             io::Error::from_raw_os_error(rc)
         ));
     }
@@ -147,16 +160,52 @@ fn admin_members() -> Result<Vec<String>, String> {
 }
 
 /// The machine word (`arm64`), what `uname -m` prints for this process.
+#[cfg(target_os = "macos")]
 fn arch() -> Result<String, String> {
     sysctl_text(c"hw.machine")
 }
 
 /// macOS's product version (`27.0`), what `sw_vers -productVersion` prints.
+#[cfg(target_os = "macos")]
 fn os_version() -> Result<String, String> {
     sysctl_text(c"kern.osproductversion")
 }
 
+/// The machine word (`aarch64`), what `uname -m` prints.
+#[cfg(not(target_os = "macos"))]
+fn arch() -> Result<String, String> {
+    uname(|names| &names.machine)
+}
+
+/// The kernel's release (`6.8.0-45-generic`), what `uname -r` prints.
+#[cfg(not(target_os = "macos"))]
+fn os_version() -> Result<String, String> {
+    uname(|names| &names.release)
+}
+
+/// One field of `uname(2)`, NUL- and space-trimmed.
+#[cfg(not(target_os = "macos"))]
+fn uname(field: impl Fn(&libc::utsname) -> &[c_char]) -> Result<String, String> {
+    // SAFETY: `utsname` is plain data `uname` fills; it is read only when the call succeeded.
+    let mut names: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: `names` is a writable `utsname` that outlives the call.
+    if unsafe { libc::uname(&raw mut names) } != 0 {
+        return Err(format!("uname: {}", io::Error::last_os_error()));
+    }
+    let bytes: Vec<u8> = field(&names)
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| c.to_ne_bytes()[0])
+        .collect();
+    String::from_utf8(bytes)
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "uname gave no readable name".into())
+}
+
 /// A string sysctl of at most 63 bytes, NUL- and space-trimmed.
+#[cfg(target_os = "macos")]
 fn sysctl_text(name: &CStr) -> Result<String, String> {
     let mut buf = [0u8; 64];
     let mut len: libc::size_t = buf.len();
@@ -188,7 +237,7 @@ fn sysctl_text(name: &CStr) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     /// Read only: this process's own account and the host's facts, beside what `id`, `uname`
-    /// and `sw_vers` print for them.
+    /// and `sw_vers` (elsewhere `uname -r`) print for them.
     #[test]
     fn the_live_identity_is_what_the_tools_print() {
         // SAFETY: `geteuid` reads this process's effective uid and cannot fail.
@@ -204,10 +253,12 @@ mod tests {
         assert_eq!(identity.user.name, tool("/usr/bin/id", "-un"));
         assert_eq!(identity.user.uid, uid);
         assert_eq!(identity.arch, tool("/usr/bin/uname", "-m"));
-        assert_eq!(
-            identity.os_version,
+        let version = if cfg!(target_os = "macos") {
             tool("/usr/bin/sw_vers", "-productVersion")
-        );
+        } else {
+            tool("/usr/bin/uname", "-r")
+        };
+        assert_eq!(identity.os_version, version);
         assert!(identity.user.home.starts_with('/'), "{identity:?}");
     }
 }

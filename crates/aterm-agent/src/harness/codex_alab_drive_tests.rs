@@ -732,6 +732,61 @@ fn a_free_writer_lock_needs_no_read_of_unrelated_process_descriptors() {
 }
 
 #[test]
+fn a_removed_codex_writer_lock_is_free_but_an_unreadable_path_is_not() {
+    use aterm_uds::ownerlock::Owner::{Dead, Live as Held, Unknown};
+    let dir = scratch("removed-writer-lock");
+    let lock = dir.join("thread.lock");
+    let file = std::fs::File::create(&lock).expect("writer lock");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the stand-in writer explicitly unlocks before closing and removing its file"
+    )]
+    file.try_lock().expect("writer owns its conversation");
+    assert_eq!(super::Live.writer_owner(&lock), Held);
+    file.unlock().expect("writer releases its conversation");
+    drop(file);
+    assert_eq!(super::Live.writer_owner(&lock), Dead);
+    std::fs::remove_file(&lock).expect("Codex removes its lock on a clean exit");
+    assert_eq!(super::Live.writer_owner(&lock), Dead);
+    assert_eq!(aterm_uds::ownerlock::probe(&lock), Unknown);
+
+    let link = dir.join("dangling.lock");
+    std::os::unix::fs::symlink(&lock, &link).expect("dangling link");
+    assert_eq!(super::Live.writer_owner(&link), Unknown);
+    assert_eq!(super::Live.writer_owner(&dir), Unknown);
+    let not_dir = dir.join("not-a-directory");
+    std::fs::write(&not_dir, b"not a lock directory").expect("regular parent");
+    assert_eq!(
+        super::Live.writer_owner(&not_dir.join("thread.lock")),
+        Unknown
+    );
+}
+
+#[test]
+fn a_clean_exit_that_removed_its_writer_lock_resumes_the_same_conversation() {
+    let rig = Rig::new("clean-exit-removed-writer", &["zsh: terminated codex"]);
+    assert!(!rig.kernel.lock.exists());
+    *rig.kernel.owners.lock().expect("writer owners") = [
+        Live.writer_owner(&rig.kernel.lock),
+        Live.writer_owner(&rig.kernel.lock),
+    ]
+    .into();
+    let snap = rig.snap(None);
+    let r = self_claimed_after_exit(
+        &rig.opts,
+        &snap,
+        &rig.resume(None),
+        ExitCause::Asked,
+        &rig.kernel,
+    );
+    assert_eq!(r.step, "done:resumed", "{r:?}\n{:#?}", rig.asked());
+    let lines = rig.typed();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains(T2), "the same conversation: {lines:?}");
+    assert!(Witnesses::under(&rig.opts.state).handled(snap.pid, &snap.start));
+}
+
+#[test]
 fn the_writer_lock_must_be_proven_free_at_both_relaunch_checks() {
     use aterm_uds::ownerlock::Owner::{Dead, Live, Unknown};
     for (name, owners, step, lines) in [

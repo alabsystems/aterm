@@ -294,6 +294,7 @@ impl SchedulePlan {
     /// [`PlanRefusal::WakeTag`], [`PlanRefusal::Reserved`], the gap ([`PlanRefusal::Gap`] or
     /// [`PlanRefusal::Unused`]) and the period ([`PlanRefusal::Period`] or
     /// [`PlanRefusal::Unused`]).
+    #[inline]
     pub const fn decode(bytes: &[u8]) -> Result<SchedulePlan, PlanRefusal> {
         if bytes.len() != PLAN_LEN {
             return Err(PlanRefusal::Length {
@@ -389,9 +390,10 @@ impl SchedulePlan {
     }
 
     /// Build the [`PLAN_ARTIFACT_NAME`] v1 artifact with the plan's bytes and host `build` id.
+    #[inline]
     #[must_use]
     pub fn artifact(&self, build: &str) -> ArtifactId {
-        let mut e = Enc::new();
+        let mut e = Enc::with_capacity(384 + build.len());
         e.str(PLAN_ARTIFACT_NAME);
         e.u32(1);
         e.str(build);
@@ -428,6 +430,7 @@ impl SchedulePlan {
     }
 
     /// The wake this plan names.
+    #[inline]
     #[must_use]
     pub(crate) fn next_change_deadline(
         &self,
@@ -502,6 +505,7 @@ impl PlanView {
 
     /// A view of these fields, as the interpreter's conformance vectors spell them.
     #[cfg(test)]
+    #[inline]
     #[must_use]
     pub(crate) const fn new(
         hot: bool,

@@ -2,22 +2,54 @@
 // Copyright 2026 Andrew Yates
 
 //! Windows UI Automation delivery for the shared accessibility model.
+//!
+//! The provider is COM written out over aterm-win32 (WIN-UIA in
+//! docs/AUDIT-third-party-2026-10-15.md): [`com`] holds the object machinery,
+//! [`objects`] the vtables and their thunks, and this module and [`ranges`] what
+//! each method answers, as `Result`s whose failure is the `HRESULT` returned.
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use aterm_types::MutexExt;
 
-use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY, HWND, LPARAM, WPARAM};
-use windows::Win32::System::Com::SAFEARRAY;
-use windows::Win32::System::Ole::{SafeArrayCreateVector, SafeArrayDestroy, SafeArrayPutElement};
-use windows::Win32::System::Variant::{VARENUM, VARIANT, VT_I4, VT_R8, VT_UNKNOWN};
-use windows::Win32::UI::Accessibility::*;
-use windows::core::{
-    BOOL, BSTR, ComObject, Error, HRESULT, IUnknown, Interface, PCWSTR, Ref, Result, implement,
+use aterm_win32::Win32::Foundation::{E_INVALIDARG, HWND};
+use aterm_win32::Win32::System::Com::SAFEARRAY;
+use aterm_win32::Win32::UI::Accessibility::{
+    NavigateDirection, NavigateDirection_FirstChild, NavigateDirection_LastChild,
+    NavigateDirection_NextSibling, NavigateDirection_Parent, NavigateDirection_PreviousSibling,
+    ProviderOptions, ProviderOptions_ServerSideProvider, StructureChangeType_ChildrenInvalidated,
+    ToggleState, ToggleState_Indeterminate, ToggleState_Off, ToggleState_On,
+    UIA_AutomationFocusChangedEventId, UIA_ButtonControlTypeId, UIA_CONTROLTYPE_ID,
+    UIA_CheckBoxControlTypeId, UIA_ControlTypePropertyId, UIA_DataGridControlTypeId,
+    UIA_DocumentControlTypeId, UIA_E_ELEMENTNOTAVAILABLE, UIA_E_ELEMENTNOTENABLED,
+    UIA_E_NOTSUPPORTED, UIA_EditControlTypeId, UIA_FrameworkIdPropertyId, UIA_GroupControlTypeId,
+    UIA_HasKeyboardFocusPropertyId, UIA_HelpTextPropertyId, UIA_HyperlinkControlTypeId,
+    UIA_InvokePatternId, UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId,
+    UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_IsOffscreenPropertyId,
+    UIA_IsPasswordPropertyId, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
+    UIA_LiveRegionChangedEventId, UIA_LiveSettingPropertyId, UIA_MenuControlTypeId,
+    UIA_MenuItemControlTypeId, UIA_NamePropertyId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
+    UIA_ProgressBarControlTypeId, UIA_RangeValuePatternId, UIA_ScrollItemPatternId,
+    UIA_SelectionItemIsSelectedPropertyId, UIA_SelectionItemPatternId, UIA_SelectionPatternId,
+    UIA_SliderControlTypeId, UIA_StatusBarControlTypeId, UIA_TabControlTypeId,
+    UIA_TabItemControlTypeId, UIA_Text_TextChangedEventId, UIA_Text_TextSelectionChangedEventId,
+    UIA_TextControlTypeId, UIA_TextPattern2Id, UIA_TextPatternId, UIA_TogglePatternId,
+    UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
+    UIA_WindowControlTypeId, UiaAppendRuntimeId, UiaDisconnectProvider, UiaHostProviderFromHwnd,
+    UiaRaiseAutomationEvent, UiaRaiseAutomationPropertyChangedEvent, UiaRaiseStructureChangedEvent,
+    UiaRect, UiaReturnRawElementProvider, UiaRootObjectId,
+};
+use aterm_win32::com::{Com, IID_IUnknown};
+use aterm_win32::core::{BOOL, HRESULT, PCWSTR};
+use aterm_win32::uia::{
+    IID_IInvokeProvider, IID_IRangeValueProvider, IID_IRawElementProviderFragment,
+    IID_IRawElementProviderFragmentRoot, IID_IScrollItemProvider, IID_ISelectionItemProvider,
+    IID_ISelectionProvider, IID_ITextProvider2, IID_IToggleProvider, IID_IValueProvider,
 };
 
 use crate::model::{
@@ -27,24 +59,24 @@ use crate::model::{
 use crate::platform::{Handle, Publication};
 use crate::tree::{Node, NodeId, common_filter};
 
-#[path = "uia/nullable.rs"]
-mod nullable;
+#[path = "uia/com.rs"]
+mod com;
+#[path = "uia/objects.rs"]
+mod objects;
 #[path = "uia/ranges.rs"]
 mod ranges;
 #[cfg(test)]
 #[path = "uia/uia_tests.rs"]
 mod tests;
+#[path = "uia/values.rs"]
+mod values;
 
-const ELEMENT_NOT_AVAILABLE: HRESULT = HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32);
-const NOT_SUPPORTED: HRESULT = HRESULT(UIA_E_NOTSUPPORTED as i32);
-const ELEMENT_NOT_ENABLED: HRESULT = HRESULT(UIA_E_ELEMENTNOTENABLED as i32);
+use com::{Agile, Result};
+use values::{Bstr, Variant, array_com, array_i32};
 
-fn unavailable() -> Error {
-    ELEMENT_NOT_AVAILABLE.into()
-}
-fn unsupported() -> Error {
-    NOT_SUPPORTED.into()
-}
+const ELEMENT_NOT_AVAILABLE: HRESULT = UIA_E_ELEMENTNOTAVAILABLE.cast_signed();
+const NOT_SUPPORTED: HRESULT = UIA_E_NOTSUPPORTED.cast_signed();
+const ELEMENT_NOT_ENABLED: HRESULT = UIA_E_ELEMENTNOTENABLED.cast_signed();
 
 #[derive(Default)]
 struct State {
@@ -55,7 +87,7 @@ struct State {
 struct Shared {
     hwnd: isize,
     state: Mutex<State>,
-    root: OnceLock<ComObject<Provider>>,
+    root: OnceLock<Agile>,
     active: AtomicBool,
     closed: AtomicBool,
     activation: Mutex<Box<dyn ActivationHandler + Send>>,
@@ -66,6 +98,11 @@ static WINDOWS: OnceLock<Mutex<HashMap<isize, Weak<Shared>>>> = OnceLock::new();
 
 fn windows() -> &'static Mutex<HashMap<isize, Weak<Shared>>> {
     WINDOWS.get_or_init(Mutex::default)
+}
+
+/// The window's handle as Win32 spells it.
+fn hwnd(hwnd: isize) -> HWND {
+    std::ptr::without_provenance_mut(hwnd.cast_unsigned())
 }
 
 impl Shared {
@@ -83,20 +120,23 @@ impl Shared {
         }
         drop(registry);
         if let Ok(root) = self.root() {
+            // SAFETY: `root` is a live provider this window handed out.
             unsafe {
-                let _ = UiaDisconnectProvider(&root);
+                let _ = UiaDisconnectProvider(root.as_raw());
             }
         }
     }
-    fn root(&self) -> Result<IRawElementProviderSimple> {
+
+    /// The fragment root's `IRawElementProviderSimple`, owned.
+    fn root(&self) -> Result<Com> {
         self.root
             .get()
-            .map(|root| root.to_interface::<nullable::Simple>().0)
-            .ok_or_else(unavailable)
+            .ok_or(ELEMENT_NOT_AVAILABLE)?
+            .query(&aterm_win32::uia::IID_IRawElementProviderSimple)
     }
 
     #[cfg(test)]
-    fn provider(self: &Arc<Self>, id: NodeId) -> Result<IRawElementProviderSimple> {
+    fn provider(self: &Arc<Self>, id: NodeId) -> Result<Com> {
         let key = Key::capture(&Arc::downgrade(self), id, &self.state.lock_or_recover())?;
         key.provider()
     }
@@ -138,13 +178,13 @@ impl Shared {
         let Ok(root) = self.root() else {
             return;
         };
-        unsafe {
-            if !changes.added.is_empty()
-                || !changes.removed.is_empty()
-                || !changes.replaced.is_empty()
-            {
+        if !changes.added.is_empty() || !changes.removed.is_empty() || !changes.replaced.is_empty()
+        {
+            // SAFETY: `root` is a live provider; no runtime ID accompanies a
+            // ChildrenInvalidated event.
+            unsafe {
                 let _ = UiaRaiseStructureChangedEvent(
-                    &root,
+                    root.as_raw(),
                     StructureChangeType_ChildrenInvalidated,
                     std::ptr::null_mut(),
                     0,
@@ -155,55 +195,68 @@ impl Shared {
             let Ok(provider) = key.provider() else {
                 continue;
             };
-            unsafe {
-                if old.text != new.text && new.text.is_some() {
-                    let _ = UiaRaiseAutomationEvent(&provider, UIA_Text_TextChangedEventId);
+            // SAFETY (each raise below): `provider` is a live provider.
+            if old.text != new.text && new.text.is_some() {
+                unsafe {
+                    let _ = UiaRaiseAutomationEvent(provider.as_raw(), UIA_Text_TextChangedEventId);
                 }
-                if old.selection != new.selection {
-                    let _ =
-                        UiaRaiseAutomationEvent(&provider, UIA_Text_TextSelectionChangedEventId);
+            }
+            if old.selection != new.selection {
+                unsafe {
+                    let _ = UiaRaiseAutomationEvent(
+                        provider.as_raw(),
+                        UIA_Text_TextSelectionChangedEventId,
+                    );
                 }
-                for (changed, property, before, after) in [
-                    (
-                        old.name != new.name,
-                        UIA_NamePropertyId,
-                        BSTR::from(old.name.as_deref().unwrap_or_default()).into(),
-                        BSTR::from(new.name.as_deref().unwrap_or_default()).into(),
-                    ),
-                    (
-                        old.description != new.description,
-                        UIA_HelpTextPropertyId,
-                        BSTR::from(old.description.as_deref().unwrap_or_default()).into(),
-                        BSTR::from(new.description.as_deref().unwrap_or_default()).into(),
-                    ),
-                    (
-                        old.value != new.value,
-                        UIA_ValueValuePropertyId,
-                        BSTR::from(old.value.as_deref().unwrap_or_default()).into(),
-                        BSTR::from(new.value.as_deref().unwrap_or_default()).into(),
-                    ),
-                    (
-                        old.enabled != new.enabled,
-                        UIA_IsEnabledPropertyId,
-                        old.enabled.into(),
-                        new.enabled.into(),
-                    ),
-                    (
-                        old.selected != new.selected,
-                        UIA_SelectionItemIsSelectedPropertyId,
-                        old.selected.unwrap_or(false).into(),
-                        new.selected.unwrap_or(false).into(),
-                    ),
-                    (
-                        old.toggled != new.toggled,
-                        UIA_ToggleToggleStatePropertyId,
-                        toggle(old.toggled).0.into(),
-                        toggle(new.toggled).0.into(),
-                    ),
-                ] {
-                    if changed {
+            }
+            let text = |value: &Option<String>| Variant::text(value.as_deref().unwrap_or_default());
+            for (changed, property, before, after) in [
+                (
+                    old.name != new.name,
+                    UIA_NamePropertyId,
+                    text(&old.name),
+                    text(&new.name),
+                ),
+                (
+                    old.description != new.description,
+                    UIA_HelpTextPropertyId,
+                    text(&old.description),
+                    text(&new.description),
+                ),
+                (
+                    old.value != new.value,
+                    UIA_ValueValuePropertyId,
+                    text(&old.value),
+                    text(&new.value),
+                ),
+                (
+                    old.enabled != new.enabled,
+                    UIA_IsEnabledPropertyId,
+                    Ok(Variant::bool(old.enabled)),
+                    Ok(Variant::bool(new.enabled)),
+                ),
+                (
+                    old.selected != new.selected,
+                    UIA_SelectionItemIsSelectedPropertyId,
+                    Ok(Variant::bool(old.selected.unwrap_or(false))),
+                    Ok(Variant::bool(new.selected.unwrap_or(false))),
+                ),
+                (
+                    old.toggled != new.toggled,
+                    UIA_ToggleToggleStatePropertyId,
+                    Ok(Variant::i32(toggle(old.toggled))),
+                    Ok(Variant::i32(toggle(new.toggled))),
+                ),
+            ] {
+                if changed && let (Ok(before), Ok(after)) = (before, after) {
+                    // SAFETY: the VARIANTs pass by value and stay owned here,
+                    // cleared when `before` and `after` drop.
+                    unsafe {
                         let _ = UiaRaiseAutomationPropertyChangedEvent(
-                            &provider, property, &before, &after,
+                            provider.as_raw(),
+                            property,
+                            before.by_value(),
+                            after.by_value(),
                         );
                     }
                 }
@@ -211,8 +264,10 @@ impl Shared {
         }
         for key in announcements {
             if let Ok(provider) = key.provider() {
+                // SAFETY: `provider` is a live provider.
                 unsafe {
-                    let _ = UiaRaiseAutomationEvent(&provider, UIA_LiveRegionChangedEventId);
+                    let _ =
+                        UiaRaiseAutomationEvent(provider.as_raw(), UIA_LiveRegionChangedEventId);
                 }
             }
         }
@@ -233,8 +288,10 @@ impl Shared {
         if let Some(key) = key
             && let Ok(provider) = key.provider()
         {
+            // SAFETY: `provider` is a live provider.
             unsafe {
-                let _ = UiaRaiseAutomationEvent(&provider, UIA_AutomationFocusChangedEventId);
+                let _ =
+                    UiaRaiseAutomationEvent(provider.as_raw(), UIA_AutomationFocusChangedEventId);
             }
         }
     }
@@ -279,10 +336,10 @@ impl Adapter {
             activation: Mutex::new(Box::new(activation)),
             actions: Mutex::new(Box::new(actions)),
         });
-        let _ = shared.root.set(ComObject::new(Provider {
+        let _ = shared.root.set(Agile::new(objects::provider(Provider {
             shared: Arc::downgrade(&shared),
             handle: None,
-        }));
+        })));
         windows()
             .lock_or_recover()
             .insert(hwnd, Arc::downgrade(&shared));
@@ -343,9 +400,9 @@ pub fn handle_wm_getobject(hwnd: isize, wparam: usize, lparam: isize) -> Option<
     }
     shared.activate();
     let root = shared.root().ok()?;
-    Some(unsafe {
-        UiaReturnRawElementProvider(HWND(hwnd as *mut _), WPARAM(wparam), LPARAM(lparam), &root).0
-    })
+    // SAFETY: the window proc's own message parameters, and a live provider,
+    // which UIA AddRefs to keep.
+    Some(unsafe { UiaReturnRawElementProvider(self::hwnd(hwnd), wparam, lparam, root.as_raw()) })
 }
 
 #[derive(Clone)]
@@ -358,71 +415,58 @@ impl Key {
     fn capture(shared: &Weak<Shared>, id: NodeId, state: &State) -> Result<Self> {
         Ok(Self {
             shared: shared.clone(),
-            handle: Some(state.publication.handle(id).ok_or_else(unavailable)?),
+            handle: Some(state.publication.handle(id).ok_or(ELEMENT_NOT_AVAILABLE)?),
         })
     }
 
     fn read<T>(&self, f: impl FnOnce(Node<'_>, &State) -> Result<T>) -> Result<T> {
-        let shared = self.shared.upgrade().ok_or_else(unavailable)?;
+        let shared = self.shared.upgrade().ok_or(ELEMENT_NOT_AVAILABLE)?;
         if shared.closed.load(Ordering::Acquire) {
-            return Err(unavailable());
+            return Err(ELEMENT_NOT_AVAILABLE);
         }
         let state = shared.state.lock_or_recover();
         let node = match &self.handle {
             Some(handle) => state.publication.node(handle),
             None => state.publication.tree().map(crate::tree::State::root),
         }
-        .ok_or_else(unavailable)?;
+        .ok_or(ELEMENT_NOT_AVAILABLE)?;
         f(node, &state)
     }
 
     fn dispatch(&self, action: Action, data: Option<ActionData>) -> Result<()> {
         let request = self.read(|node, state| {
             if node.is_disabled() {
-                return Err(ELEMENT_NOT_ENABLED.into());
+                return Err(ELEMENT_NOT_ENABLED);
             }
             let handle = match &self.handle {
                 Some(handle) => handle.clone(),
                 None => state
                     .publication
                     .handle(node.id())
-                    .ok_or_else(unavailable)?,
+                    .ok_or(ELEMENT_NOT_AVAILABLE)?,
             };
             state
                 .publication
                 .action(&handle, action, data)
-                .ok_or_else(unsupported)
+                .ok_or(NOT_SUPPORTED)
         })?;
-        let shared = self.shared.upgrade().ok_or_else(unavailable)?;
+        let shared = self.shared.upgrade().ok_or(ELEMENT_NOT_AVAILABLE)?;
         shared.actions.lock_or_recover().do_action(request);
         Ok(())
     }
 
-    fn provider(&self) -> Result<IRawElementProviderSimple> {
+    /// A new provider for the node, as `IRawElementProviderSimple`.
+    fn provider(&self) -> Result<Com> {
         self.read(|_, _| Ok(()))?;
-        Ok(ComObject::new(Provider {
+        Ok(objects::provider(Provider {
             shared: self.shared.clone(),
             handle: self.handle.clone(),
-        })
-        .to_interface::<nullable::Simple>()
-        .0)
+        }))
     }
 }
 
-#[implement(
-    nullable::Simple,
-    nullable::Fragment,
-    nullable::FragmentRoot,
-    IInvokeProvider,
-    IValueProvider,
-    IRangeValueProvider,
-    IToggleProvider,
-    ISelectionProvider,
-    nullable::SelectionItem,
-    IScrollItemProvider,
-    ITextProvider2
-)]
-struct Provider {
+/// One element: the window's fragment root (`handle` `None`) or one node.
+pub(super) struct Provider {
     shared: Weak<Shared>,
     handle: Option<Handle>,
 }
@@ -467,11 +511,19 @@ fn toggle(value: Option<Toggled>) -> ToggleState {
     }
 }
 
-impl IRawElementProviderSimple_Impl for Provider_Impl {
-    fn ProviderOptions(&self) -> Result<ProviderOptions> {
+fn boolean(value: bool) -> BOOL {
+    BOOL::from(value)
+}
+
+/// `IRawElementProviderSimple`.
+impl Provider {
+    fn provider_options(&self) -> Result<ProviderOptions> {
         Ok(ProviderOptions_ServerSideProvider)
     }
-    fn GetPatternProvider(&self, pattern: UIA_PATTERN_ID) -> Result<IUnknown> {
+
+    /// The pattern's provider (the object's identity), or none when the node
+    /// does not support it.
+    fn get_pattern_provider(&self, pattern: UIA_PATTERN_ID) -> Result<Option<Com>> {
         let key = self.key().read(|node, state| {
             let supported = match pattern {
                 UIA_TextPatternId | UIA_TextPattern2Id => node.supports_text_ranges(),
@@ -493,62 +545,77 @@ impl IRawElementProviderSimple_Impl for Provider_Impl {
                 _ => false,
             };
             if !supported {
-                return Err(Error::empty());
+                return Ok(None);
             }
-            Key::capture(&self.shared, node.id(), state)
+            Key::capture(&self.shared, node.id(), state).map(Some)
         })?;
+        let Some(key) = key else {
+            return Ok(None);
+        };
         let provider = key.provider()?;
-        match pattern {
-            UIA_TextPatternId | UIA_TextPattern2Id => provider.cast::<ITextProvider2>()?.cast(),
-            UIA_InvokePatternId => provider.cast::<IInvokeProvider>()?.cast(),
-            UIA_TogglePatternId => provider.cast::<IToggleProvider>()?.cast(),
-            UIA_ValuePatternId => provider.cast::<IValueProvider>()?.cast(),
-            UIA_RangeValuePatternId => provider.cast::<IRangeValueProvider>()?.cast(),
-            UIA_SelectionPatternId => provider.cast::<ISelectionProvider>()?.cast(),
-            UIA_SelectionItemPatternId => provider.cast::<ISelectionItemProvider>()?.cast(),
-            UIA_ScrollItemPatternId => provider.cast::<IScrollItemProvider>()?.cast(),
-            _ => Err(Error::empty()),
-        }
+        let iid = match pattern {
+            UIA_TextPatternId | UIA_TextPattern2Id => &IID_ITextProvider2,
+            UIA_InvokePatternId => &IID_IInvokeProvider,
+            UIA_TogglePatternId => &IID_IToggleProvider,
+            UIA_ValuePatternId => &IID_IValueProvider,
+            UIA_RangeValuePatternId => &IID_IRangeValueProvider,
+            UIA_SelectionPatternId => &IID_ISelectionProvider,
+            UIA_SelectionItemPatternId => &IID_ISelectionItemProvider,
+            UIA_ScrollItemPatternId => &IID_IScrollItemProvider,
+            _ => return Ok(None),
+        };
+        provider.query(iid)?.query(&IID_IUnknown).map(Some)
     }
-    fn GetPropertyValue(&self, id: UIA_PROPERTY_ID) -> Result<VARIANT> {
+
+    fn get_property_value(&self, id: UIA_PROPERTY_ID) -> Result<Variant> {
         self.key().read(|node, _| {
             Ok(match id {
-                UIA_ControlTypePropertyId => control_type(node.role()).0.into(),
-                UIA_NamePropertyId => BSTR::from(node.label().unwrap_or_default()).into(),
-                UIA_HelpTextPropertyId => BSTR::from(node.description().unwrap_or_default()).into(),
-                UIA_FrameworkIdPropertyId => BSTR::from("aterm").into(),
-                UIA_IsEnabledPropertyId => (!node.is_disabled()).into(),
-                UIA_IsOffscreenPropertyId => node.is_offscreen().into(),
-                UIA_HasKeyboardFocusPropertyId => node.is_focused().into(),
+                UIA_ControlTypePropertyId => Variant::i32(control_type(node.role())),
+                UIA_NamePropertyId => Variant::text(&node.label().unwrap_or_default())?,
+                UIA_HelpTextPropertyId => Variant::text(&node.description().unwrap_or_default())?,
+                UIA_FrameworkIdPropertyId => Variant::text("aterm")?,
+                UIA_IsEnabledPropertyId => Variant::bool(!node.is_disabled()),
+                UIA_IsOffscreenPropertyId => Variant::bool(node.is_offscreen()),
+                UIA_HasKeyboardFocusPropertyId => Variant::bool(node.is_focused()),
                 UIA_IsKeyboardFocusablePropertyId => {
-                    (node.is_focused() || node.data().supports_action(Action::Focus)).into()
+                    Variant::bool(node.is_focused() || node.data().supports_action(Action::Focus))
                 }
                 UIA_IsControlElementPropertyId | UIA_IsContentElementPropertyId => {
-                    (node.role() != Role::TextRun).into()
+                    Variant::bool(node.role() != Role::TextRun)
                 }
-                UIA_IsPasswordPropertyId => false.into(),
-                UIA_LiveSettingPropertyId => match node.live() {
+                UIA_IsPasswordPropertyId => Variant::bool(false),
+                UIA_LiveSettingPropertyId => Variant::i32(match node.live() {
                     Live::Off => 0,
                     Live::Polite => 1,
                     Live::Assertive => 2,
-                }
-                .into(),
-                _ => VARIANT::default(),
+                }),
+                _ => Variant::empty(),
             })
         })
     }
-    fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
+
+    /// The HWND's own provider, for the fragment root only.
+    fn host_raw_element_provider(&self) -> Result<Option<Com>> {
         let root = self.key().read(|node, _| Ok(node.is_root()))?;
         if !root {
-            return Err(Error::empty());
+            return Ok(None);
         }
-        let shared = self.shared.upgrade().ok_or_else(unavailable)?;
-        unsafe { UiaHostProviderFromHwnd(HWND(shared.hwnd as *mut _)) }
+        let shared = self.shared.upgrade().ok_or(ELEMENT_NOT_AVAILABLE)?;
+        let mut out = std::ptr::null_mut();
+        // SAFETY: the window's handle; `out` receives an owned provider, or
+        // null, on success.
+        let hr = unsafe { UiaHostProviderFromHwnd(hwnd(shared.hwnd), &mut out) };
+        if hr < 0 {
+            return Err(hr);
+        }
+        // SAFETY: a successful call hands over the reference `out` holds.
+        Ok(unsafe { Com::from_raw(out) })
     }
 }
 
-impl IRawElementProviderFragment_Impl for Provider_Impl {
-    fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
+/// `IRawElementProviderFragment`.
+impl Provider {
+    fn navigate(&self, direction: NavigateDirection) -> Result<Option<Com>> {
         let key = self.key().read(|node, state| {
             let id = match direction {
                 NavigateDirection_Parent if !node.is_root() => {
@@ -575,15 +642,19 @@ impl IRawElementProviderFragment_Impl for Provider_Impl {
             id.map(|id| Key::capture(&self.shared, id, state))
                 .transpose()
         })?;
-        key.ok_or_else(Error::empty)?.provider()?.cast()
+        key.map(|key| key.provider()?.query(&IID_IRawElementProviderFragment))
+            .transpose()
     }
-    fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
+
+    /// The runtime ID, or null for the fragment root, which its host names.
+    fn get_runtime_id(&self) -> Result<*mut SAFEARRAY> {
         let id = self
             .key()
             .read(|node, _| Ok((!node.is_root()).then(|| runtime_id(node))))?;
         id.map_or(Ok(std::ptr::null_mut()), |id| array_i32(&id))
     }
-    fn BoundingRectangle(&self) -> Result<UiaRect> {
+
+    fn bounding_rectangle(&self) -> Result<UiaRect> {
         self.key().read(|node, state| {
             Ok(to_uia_rect(
                 node.bounding_box().unwrap_or_default(),
@@ -591,19 +662,22 @@ impl IRawElementProviderFragment_Impl for Provider_Impl {
             ))
         })
     }
-    fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> {
+
+    fn get_embedded_fragment_roots(&self) -> Result<*mut SAFEARRAY> {
         Ok(std::ptr::null_mut())
     }
-    fn SetFocus(&self) -> Result<()> {
+
+    fn set_focus(&self) -> Result<()> {
         self.key().dispatch(Action::Focus, None)
     }
-    fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
+
+    fn fragment_root(&self) -> Result<Com> {
         self.key().read(|_, _| Ok(()))?;
         self.shared
             .upgrade()
-            .ok_or_else(unavailable)?
+            .ok_or(ELEMENT_NOT_AVAILABLE)?
             .root()?
-            .cast()
+            .query(&IID_IRawElementProviderFragmentRoot)
     }
 }
 
@@ -619,24 +693,25 @@ fn runtime_id(node: Node<'_>) -> [i32; 5] {
     ]
 }
 
-impl IRawElementProviderFragmentRoot_Impl for Provider_Impl {
-    fn ElementProviderFromPoint(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
+/// `IRawElementProviderFragmentRoot`.
+impl Provider {
+    fn element_provider_from_point(&self, x: f64, y: f64) -> Result<Option<Com>> {
         if !x.is_finite() || !y.is_finite() {
-            return Err(E_INVALIDARG.into());
+            return Err(E_INVALIDARG);
         }
         let key = self.key().read(|node, state| {
-            let id = node
-                .hit_test(
-                    Point::new(x - state.origin.0, y - state.origin.1),
-                    &common_filter,
-                )
-                .map(|(node, _)| node.id())
-                .ok_or_else(Error::empty)?;
-            Key::capture(&self.shared, id, state)
+            node.hit_test(
+                Point::new(x - state.origin.0, y - state.origin.1),
+                &common_filter,
+            )
+            .map(|(node, _)| Key::capture(&self.shared, node.id(), state))
+            .transpose()
         })?;
-        key.provider()?.cast()
+        key.map(|key| key.provider()?.query(&IID_IRawElementProviderFragment))
+            .transpose()
     }
-    fn GetFocus(&self) -> Result<IRawElementProviderFragment> {
+
+    fn get_focus(&self) -> Result<Option<Com>> {
         let key = self.key().read(|_, state| {
             state
                 .publication
@@ -645,22 +720,24 @@ impl IRawElementProviderFragmentRoot_Impl for Provider_Impl {
                 .map(|id| Key::capture(&self.shared, id, state))
                 .transpose()
         })?;
-        key.ok_or_else(Error::empty)?.provider()?.cast()
+        key.map(|key| key.provider()?.query(&IID_IRawElementProviderFragment))
+            .transpose()
     }
 }
 
-impl IInvokeProvider_Impl for Provider_Impl {
-    fn Invoke(&self) -> Result<()> {
+/// `IInvokeProvider` and `IToggleProvider`.
+impl Provider {
+    fn invoke(&self) -> Result<()> {
         self.key().dispatch(Action::Click, None)
     }
-}
-impl IToggleProvider_Impl for Provider_Impl {
-    fn Toggle(&self) -> Result<()> {
+
+    fn toggle(&self) -> Result<()> {
         self.key().dispatch(Action::Click, None)
     }
-    fn ToggleState(&self) -> Result<ToggleState> {
+
+    fn toggle_state(&self) -> Result<ToggleState> {
         self.key().read(|node, _| {
-            Ok(match node.toggled().ok_or_else(unsupported)? {
+            Ok(match node.toggled().ok_or(NOT_SUPPORTED)? {
                 Toggled::True => ToggleState_On,
                 Toggled::False => ToggleState_Off,
                 Toggled::Mixed => ToggleState_Indeterminate,
@@ -668,96 +745,98 @@ impl IToggleProvider_Impl for Provider_Impl {
         })
     }
 }
-impl IValueProvider_Impl for Provider_Impl {
-    fn SetValue(&self, value: &PCWSTR) -> Result<()> {
+
+/// `IValueProvider`.
+impl Provider {
+    fn set_value(&self, value: PCWSTR) -> Result<()> {
         if value.is_null() {
-            return Err(E_INVALIDARG.into());
+            return Err(E_INVALIDARG);
         }
+        // SAFETY: a non-null string the caller passed, NUL-terminated by
+        // IValueProvider::SetValue's contract.
+        let value = unsafe { values::wide_text(value) }?;
         self.key().dispatch(
             Action::SetValue,
-            Some(ActionData::Value(
-                unsafe { value.to_string()? }.into_boxed_str(),
-            )),
+            Some(ActionData::Value(value.into_boxed_str())),
         )
     }
-    fn Value(&self) -> Result<BSTR> {
+
+    fn value(&self) -> Result<Bstr> {
         self.key()
-            .read(|node, _| Ok(BSTR::from(crate::platform::text(node).unwrap_or_default())))
+            .read(|node, _| Bstr::new(&crate::platform::text(node).unwrap_or_default()))
     }
-    fn IsReadOnly(&self) -> Result<BOOL> {
+
+    fn is_read_only(&self) -> Result<BOOL> {
         self.key()
-            .read(|node, _| Ok((!node.data().supports_action(Action::SetValue)).into()))
+            .read(|node, _| Ok(boolean(!node.data().supports_action(Action::SetValue))))
     }
 }
-impl IRangeValueProvider_Impl for Provider_Impl {
-    fn SetValue(&self, value: f64) -> Result<()> {
+
+/// `IRangeValueProvider`.
+impl Provider {
+    fn set_range_value(&self, value: f64) -> Result<()> {
         if !value.is_finite() {
-            return Err(E_INVALIDARG.into());
+            return Err(E_INVALIDARG);
         }
         self.key().read(|node, _| {
             if node.min_numeric_value().is_some_and(|min| value < min)
                 || node.max_numeric_value().is_some_and(|max| value > max)
             {
-                return Err(E_INVALIDARG.into());
+                return Err(E_INVALIDARG);
             }
             Ok(())
         })?;
         self.key()
             .dispatch(Action::SetValue, Some(ActionData::NumericValue(value)))
     }
-    fn Value(&self) -> Result<f64> {
+
+    fn range_value(&self) -> Result<f64> {
         self.key()
-            .read(|node, _| node.numeric_value().ok_or_else(unsupported))
+            .read(|node, _| node.numeric_value().ok_or(NOT_SUPPORTED))
     }
-    fn IsReadOnly(&self) -> Result<BOOL> {
-        IValueProvider_Impl::IsReadOnly(self)
-    }
-    fn Maximum(&self) -> Result<f64> {
+
+    fn maximum(&self) -> Result<f64> {
         self.key()
-            .read(|node, _| node.max_numeric_value().ok_or_else(unsupported))
+            .read(|node, _| node.max_numeric_value().ok_or(NOT_SUPPORTED))
     }
-    fn Minimum(&self) -> Result<f64> {
+
+    fn minimum(&self) -> Result<f64> {
         self.key()
-            .read(|node, _| node.min_numeric_value().ok_or_else(unsupported))
+            .read(|node, _| node.min_numeric_value().ok_or(NOT_SUPPORTED))
     }
-    fn LargeChange(&self) -> Result<f64> {
-        self.SmallChange()
-    }
-    fn SmallChange(&self) -> Result<f64> {
+
+    /// Large and small change alike.
+    fn change(&self) -> Result<f64> {
         self.key()
             .read(|node, _| Ok(node.numeric_value_step().unwrap_or(0.0)))
     }
 }
-impl IScrollItemProvider_Impl for Provider_Impl {
-    fn ScrollIntoView(&self) -> Result<()> {
+
+/// `IScrollItemProvider`, `ISelectionItemProvider` and `ISelectionProvider`.
+impl Provider {
+    fn scroll_into_view(&self) -> Result<()> {
         self.key().dispatch(Action::ScrollIntoView, None)
     }
-}
-impl ISelectionItemProvider_Impl for Provider_Impl {
-    fn Select(&self) -> Result<()> {
+
+    fn select(&self) -> Result<()> {
         self.key().dispatch(Action::Click, None)
     }
-    fn AddToSelection(&self) -> Result<()> {
-        Err(unsupported())
-    }
-    fn RemoveFromSelection(&self) -> Result<()> {
-        Err(unsupported())
-    }
-    fn IsSelected(&self) -> Result<BOOL> {
+
+    fn is_selected(&self) -> Result<BOOL> {
         self.key()
-            .read(|node, _| Ok(node.is_selected().ok_or_else(unsupported)?.into()))
+            .read(|node, _| Ok(boolean(node.is_selected().ok_or(NOT_SUPPORTED)?)))
     }
-    fn SelectionContainer(&self) -> Result<IRawElementProviderSimple> {
+
+    fn selection_container(&self) -> Result<Option<Com>> {
         let key = self.key().read(|node, state| {
             node.selection_container(&common_filter)
                 .map(|parent| Key::capture(&self.shared, parent.id(), state))
                 .transpose()
         })?;
-        key.ok_or_else(Error::empty)?.provider()
+        key.map(|key| key.provider()).transpose()
     }
-}
-impl ISelectionProvider_Impl for Provider_Impl {
-    fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
+
+    fn get_selection(&self) -> Result<*mut SAFEARRAY> {
         let keys = self.key().read(|node, state| {
             node.filtered_children(&common_filter)
                 .filter(|n| n.is_selected() == Some(true))
@@ -766,15 +845,9 @@ impl ISelectionProvider_Impl for Provider_Impl {
         })?;
         let values = keys
             .into_iter()
-            .map(|key| key.provider()?.cast())
-            .collect::<Result<Vec<IUnknown>>>()?;
+            .map(|key| key.provider()?.query(&IID_IUnknown))
+            .collect::<Result<Vec<Com>>>()?;
         array_com(&values)
-    }
-    fn CanSelectMultiple(&self) -> Result<BOOL> {
-        Ok(false.into())
-    }
-    fn IsSelectionRequired(&self) -> Result<BOOL> {
-        Ok(false.into())
     }
 }
 
@@ -787,46 +860,5 @@ fn to_uia_rect(rect: Rect, origin: (f64, f64)) -> UiaRect {
     }
 }
 
-fn array(
-    vt: VARENUM,
-    len: usize,
-    mut put: impl FnMut(*mut SAFEARRAY, i32) -> Result<()>,
-) -> Result<*mut SAFEARRAY> {
-    let count = i32::try_from(len).map_err(|_| Error::from(E_OUTOFMEMORY))?;
-    let array = unsafe { SafeArrayCreateVector(vt, 0, count as u32) };
-    if array.is_null() {
-        return Err(E_OUTOFMEMORY.into());
-    }
-    for index in 0..count {
-        if let Err(error) = put(array, index) {
-            unsafe {
-                let _ = SafeArrayDestroy(array);
-            }
-            return Err(error);
-        }
-    }
-    Ok(array)
-}
-fn array_i32(values: &[i32]) -> Result<*mut SAFEARRAY> {
-    array(VT_I4, values.len(), |array, index| unsafe {
-        SafeArrayPutElement(
-            array,
-            &index,
-            (&values[index as usize] as *const i32).cast(),
-        )
-    })
-}
-fn array_f64(values: &[f64]) -> Result<*mut SAFEARRAY> {
-    array(VT_R8, values.len(), |array, index| unsafe {
-        SafeArrayPutElement(
-            array,
-            &index,
-            (&values[index as usize] as *const f64).cast(),
-        )
-    })
-}
-fn array_com(values: &[IUnknown]) -> Result<*mut SAFEARRAY> {
-    array(VT_UNKNOWN, values.len(), |array, index| unsafe {
-        SafeArrayPutElement(array, &index, values[index as usize].as_raw())
-    })
-}
+/// The raw pointer a borrowed interface argument arrives as.
+type Raw = *mut c_void;

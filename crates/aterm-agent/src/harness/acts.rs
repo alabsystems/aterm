@@ -11,7 +11,8 @@ use crate::supervise::policy::question::{RULE_ANSWER_RECOMMENDED, is_question_ru
 use crate::supervise::policy::turn_end::{
     RULE_ANSWER, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_CONTINUE,
     RULE_DONE_CHECK, RULE_HOST_TURN, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE,
-    RULE_LIMIT_RESUME, RULE_LOGIN_BACK, RULE_OPEN_ITEMS, RULE_SUGGESTION, RULE_UNCOMMITTED,
+    RULE_LIMIT_RESUME, RULE_LOGIN_BACK, RULE_OPEN_ITEMS, RULE_OUTAGE_RESUME, RULE_SUGGESTION,
+    RULE_UNCOMMITTED,
 };
 
 /// One act of the harness's, as the Autopilot chip names it for a moment.
@@ -149,6 +150,7 @@ fn typed_act(rule: &str, command: &str) -> Option<(Act, Counter)> {
             | RULE_DONE_CHECK
             | RULE_OPEN_ITEMS
             | RULE_UNCOMMITTED
+            | crate::supervise::policy::cruise_carry::RULE_BACKGROUND
     ) {
         Some((Act::Continued, Counter::Continued))
     } else if is_prose_answer(rule) {
@@ -159,7 +161,12 @@ fn typed_act(rule: &str, command: &str) -> Option<(Act, Counter)> {
         Some((Act::Nudged, Counter::LandPrompts))
     } else if matches!(
         rule,
-        RULE_LIMIT_RESUME | RULE_API_RETRY | RULE_API_BACK | RULE_API_CUTOFF | RULE_LOGIN_BACK
+        RULE_LIMIT_RESUME
+            | RULE_API_RETRY
+            | RULE_API_BACK
+            | RULE_API_CUTOFF
+            | RULE_OUTAGE_RESUME
+            | RULE_LOGIN_BACK
     ) || (rule == RULE_COMPACT && !command.starts_with('/'))
     {
         Some((Act::Resumed, Counter::Resumed))
@@ -768,6 +775,7 @@ mod tests {
             RULE_API_RETRY,
             RULE_API_BACK,
             RULE_API_CUTOFF,
+            RULE_OUTAGE_RESUME,
             RULE_LOGIN_BACK,
         ] {
             assert_eq!(
@@ -1107,6 +1115,7 @@ mod tests {
             ("api-retry@v1", true),
             ("api-back@v1", true),
             ("api-cutoff@v1", true),
+            ("outage-resume@v1", true),
             ("usage-resume@v1", true),
             ("context-compact@v1", true),
             ("harness-turn@v1", true),

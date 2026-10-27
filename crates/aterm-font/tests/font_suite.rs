@@ -19,6 +19,7 @@ mod hint_raster;
 mod raster;
 
 mod bounded_work;
+mod gpos_shaping;
 mod gvar_tuples;
 #[cfg(any(feature = "hint", debug_assertions))]
 mod hint_extremes;

@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# A Claude Code composer relaid by -2 rows, with no key in flight: the box moves 400 ms after the
+# last key. The agent list under the bottom-anchored box goes from 0 to 2 rows, so the whole
+# screen is redrawn in one synchronized update with the prompt 2 rows up; the transcript stays on
+# the top rows and the box alone moves (the owner's relayout, PRISM-GLASS.md §7). Typing then goes
+# on at the new row.
+
+grid 30 90
+style rainbow kitty
+hz 60
+
+at 0 pty "\e[?2026h\e[?25l\e[H\e[1;1H⏺ Agent \"Lint pass: the parser crate\" failed: Agent terminated early\e[K\e[2;1H  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\e[K\e[3;1H⏺ Goal paused · usage limit reached · continues automatically when it resets\e[K\e[4;1H✻ Cogitated for 1d 11h 24m · done 4:01 PM · 8 shells still running\e[K\e[5;1H❯ keep going, and check the other tab when you can.\e[K\e[6;1H✽ Whirlpooling… (37s · ↓ 2.5k tokens · thinking with xhigh effort)\e[K\e[7;1H\e[K\e[8;1H\e[K\e[9;1H\e[K\e[10;1H\e[K\e[11;1H\e[K\e[12;1H\e[K\e[13;1H\e[K\e[14;1H\e[K\e[15;1H\e[K\e[16;1H\e[K\e[17;1H\e[K\e[18;1H\e[K\e[19;1H\e[K\e[20;1H\e[K\e[21;1H\e[K\e[22;1H\e[K\e[23;1H\e[K\e[24;1H\e[K\e[25;1H──────────────────────────────────────────────────────────────────────────────────────────\e[K\e[26;1H❯ \e[K\e[27;1H──────────────────────────────────────────────────────────────────────────────────────────\e[K\e[28;1H  ⏵⏵ bypass permissions on · 8 shells\e[K\e[29;1H\e[K\e[30;1H\e[K\e[30;1H\e[26;3H\e[?25h\e[?2026l"
+at 700 key a
+at 704 pty "\e[?2026h\e[?25l\e[H\r\e[2C\e[25Ba\e[30;1H\e[26;4H\e[?25h\e[?2026l"
+at 790 key l
+at 794 pty "\e[?2026h\e[?25l\e[H\r\e[3C\e[25Bl\e[30;1H\e[26;5H\e[?25h\e[?2026l"
+at 880 key s
+at 884 pty "\e[?2026h\e[?25l\e[H\r\e[4C\e[25Bs\e[30;1H\e[26;6H\e[?25h\e[?2026l"
+at 970 key o
+at 974 pty "\e[?2026h\e[?25l\e[H\r\e[5C\e[25Bo\e[30;1H\e[26;7H\e[?25h\e[?2026l"
+at 1060 key space
+at 1064 pty "\e[?2026h\e[?25l\e[26;8H\e[?25h\e[?2026l"
+at 1150 key i
+at 1154 pty "\e[?2026h\e[?25l\e[H\r\e[7C\e[25Bi\e[30;1H\e[26;9H\e[?25h\e[?2026l"
+at 1240 key n
+at 1244 pty "\e[?2026h\e[?25l\e[H\r\e[8C\e[25Bn\e[30;1H\e[26;10H\e[?25h\e[?2026l"
+at 1330 key space
+at 1334 pty "\e[?2026h\e[?25l\e[26;11H\e[?25h\e[?2026l"
+at 1420 key p
+at 1424 pty "\e[?2026h\e[?25l\e[H\r\e[10C\e[25Bp\e[30;1H\e[26;12H\e[?25h\e[?2026l"
+at 1510 key a
+at 1514 pty "\e[?2026h\e[?25l\e[H\r\e[11C\e[25Ba\e[30;1H\e[26;13H\e[?25h\e[?2026l"
+at 1600 key r
+at 1604 pty "\e[?2026h\e[?25l\e[H\r\e[12C\e[25Br\e[30;1H\e[26;14H\e[?25h\e[?2026l"
+at 1690 key a
+at 1694 pty "\e[?2026h\e[?25l\e[H\r\e[13C\e[25Ba\e[30;1H\e[26;15H\e[?25h\e[?2026l"
+at 1780 key l
+at 1784 pty "\e[?2026h\e[?25l\e[H\r\e[14C\e[25Bl\e[30;1H\e[26;16H\e[?25h\e[?2026l"
+at 1870 key l
+at 1874 pty "\e[?2026h\e[?25l\e[H\r\e[15C\e[25Bl\e[30;1H\e[26;17H\e[?25h\e[?2026l"
+at 1960 key e
+at 1964 pty "\e[?2026h\e[?25l\e[H\r\e[16C\e[25Be\e[30;1H\e[26;18H\e[?25h\e[?2026l"
+at 2050 key l
+at 2054 pty "\e[?2026h\e[?25l\e[H\r\e[17C\e[25Bl\e[30;1H\e[26;19H\e[?25h\e[?2026l"
+at 2140 key ,
+at 2144 pty "\e[?2026h\e[?25l\e[H\r\e[18C\e[25B,\e[30;1H\e[26;20H\e[?25h\e[?2026l"
+at 2230 key space
+at 2234 pty "\e[?2026h\e[?25l\e[26;21H\e[?25h\e[?2026l"
+at 2320 key c
+at 2324 pty "\e[?2026h\e[?25l\e[H\r\e[20C\e[25Bc\e[30;1H\e[26;22H\e[?25h\e[?2026l"
+at 2410 key h
+at 2414 pty "\e[?2026h\e[?25l\e[H\r\e[21C\e[25Bh\e[30;1H\e[26;23H\e[?25h\e[?2026l"
+at 2900 pty "\e[?2026h\e[?25l\e[H\e[1;1H⏺ Agent \"Lint pass: the parser crate\" failed: Agent terminated early\e[K\e[2;1H  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\e[K\e[3;1H⏺ Goal paused · usage limit reached · continues automatically when it resets\e[K\e[4;1H✻ Cogitated for 1d 11h 24m · done 4:01 PM · 8 shells still running\e[K\e[5;1H❯ keep going, and check the other tab when you can.\e[K\e[6;1H✽ Whirlpooling… (37s · ↓ 2.5k tokens · thinking with xhigh effort)\e[K\e[7;1H\e[K\e[8;1H\e[K\e[9;1H\e[K\e[10;1H\e[K\e[11;1H\e[K\e[12;1H\e[K\e[13;1H\e[K\e[14;1H\e[K\e[15;1H\e[K\e[16;1H\e[K\e[17;1H\e[K\e[18;1H\e[K\e[19;1H\e[K\e[20;1H\e[K\e[21;1H\e[K\e[22;1H\e[K\e[23;1H──────────────────────────────────────────────────────────────────────────────────────────\e[K\e[24;1H❯ also in parallel, ch\e[K\e[25;1H──────────────────────────────────────────────────────────────────────────────────────────\e[K\e[26;1H  ⏵⏵ bypass permissions on · 8 shells\e[K\e[27;1H\e[K\e[28;1H  ⏺ main\e[K\e[29;1H  ◯ general-purpose  Checking fix lines in the parser\e[K\e[30;1H\e[K\e[30;1H\e[24;23H\e[?25h\e[?2026l"
+at 3200 key c
+at 3204 pty "\e[?2026h\e[?25l\e[H\r\e[22C\e[23Bc\e[30;1H\e[24;24H\e[?25h\e[?2026l"
+at 3290 key k
+at 3294 pty "\e[?2026h\e[?25l\e[H\r\e[23C\e[23Bk\e[30;1H\e[24;25H\e[?25h\e[?2026l"
+at 3380 key space
+at 3384 pty "\e[?2026h\e[?25l\e[24;26H\e[?25h\e[?2026l"
+at 3470 key w
+at 3474 pty "\e[?2026h\e[?25l\e[H\r\e[25C\e[23Bw\e[30;1H\e[24;27H\e[?25h\e[?2026l"
+at 3560 key h
+at 3564 pty "\e[?2026h\e[?25l\e[H\r\e[26C\e[23Bh\e[30;1H\e[24;28H\e[?25h\e[?2026l"
+at 3650 key y
+at 3654 pty "\e[?2026h\e[?25l\e[H\r\e[27C\e[23By\e[30;1H\e[24;29H\e[?25h\e[?2026l"
+at 3740 key space
+at 3744 pty "\e[?2026h\e[?25l\e[24;30H\e[?25h\e[?2026l"
+at 3830 key t
+at 3834 pty "\e[?2026h\e[?25l\e[H\r\e[29C\e[23Bt\e[30;1H\e[24;31H\e[?25h\e[?2026l"
+at 3920 key h
+at 3924 pty "\e[?2026h\e[?25l\e[H\r\e[30C\e[23Bh\e[30;1H\e[24;32H\e[?25h\e[?2026l"
+at 4010 key e
+at 4014 pty "\e[?2026h\e[?25l\e[H\r\e[31C\e[23Be\e[30;1H\e[24;33H\e[?25h\e[?2026l"
+at 4100 key space
+at 4104 pty "\e[?2026h\e[?25l\e[24;34H\e[?25h\e[?2026l"
+run 5690

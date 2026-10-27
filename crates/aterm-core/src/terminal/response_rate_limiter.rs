@@ -124,6 +124,46 @@ impl ResponseRateLimiter {
         self.tokens = (self.tokens + earned).min(cap);
         self.last_refill = Some(now);
     }
+
+    /// Snapshot `(tokens, capacity_bytes, refill_bytes_per_sec, last_refill)`.
+    #[inline]
+    pub(crate) const fn snapshot(&self) -> (f64, u64, u64, Option<Instant>) {
+        (
+            self.tokens,
+            self.capacity_bytes,
+            self.refill_bytes_per_sec,
+            self.last_refill,
+        )
+    }
+
+    /// Restore a limiter from a previously captured snapshot, clamping `tokens` into `0.0..=capacity_bytes`.
+    #[inline]
+    pub(crate) fn from_snapshot(
+        tokens: f64,
+        capacity_bytes: u64,
+        refill_bytes_per_sec: u64,
+        last_refill: Option<Instant>,
+    ) -> Self {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "capacity is bytes; f64 precision sufficient for any realistic cap"
+        )]
+        let cap = capacity_bytes as f64;
+        let mut clamped = if tokens.is_finite() {
+            tokens.clamp(0.0, cap)
+        } else {
+            0.0
+        };
+        if clamped == 0.0 {
+            clamped = 0.0;
+        }
+        Self {
+            tokens: clamped,
+            capacity_bytes,
+            refill_bytes_per_sec,
+            last_refill,
+        }
+    }
 }
 
 impl Default for ResponseRateLimiter {

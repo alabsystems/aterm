@@ -1332,8 +1332,57 @@ fn real_claim_relaunches() -> bool {
         twin: rig.twin.clone(),
     };
     let now = now_s();
-    let st = claim_record(&snap, &mv, now).expect("a claim");
+    let st = claim_record(&snap, &mv, rig.opts.human_grace_s, now).expect("a claim");
     ended_by_restart(&st, Agent::Muse, TAB, TUI, now)
+}
+
+/// 2026-10-26 review: the Muse Code quiet upgrade's SIGTERM waits out the whole grace, so its claim
+/// names that grace, and a key typed at the prompt after it holds the relaunch line it owes exactly
+/// as long as it would have held the SIGTERM. The control: a claim naming the land rung's keys gap
+/// (what the line read a Muse claim that named none as) lets go a key the SIGTERM waited on.
+#[test]
+fn a_muse_claim_holds_its_line_on_the_grace_its_sigterm_waited_out() {
+    use crate::harness::relaunch::{PromptLook, line_grace, line_held_by_status};
+    let rig = LiveRig::new("claim-grace", Knobs::default());
+    let mut snap = rig.snap_of(S1);
+    snap.argv = rig.kernel.argv.clone();
+    let mv = Move {
+        running: VERSION.to_string(),
+        target: NEW_VERSION.to_string(),
+        twin: rig.twin.clone(),
+    };
+    let grace_s = rig.opts.human_grace_s;
+    let key_status =
+        |age_s: u64| format!("OK schema=1 hold=0 hand=- input=clear human_ms={age_s}000");
+    let owed_line_held = |claim: &St, grace_s: u32, age_s: u64| {
+        let mut claim = claim.clone();
+        let look = PromptLook::of(&mut claim);
+        let grace = line_grace(grace_s, look.ended_at_s, look.line_grace_s);
+        line_held_by_status(Some(&key_status(age_s)), grace, "aterm-harness@1").is_some()
+    };
+    let claim = claim_record(&snap, &mv, grace_s, now_s()).expect("a claim");
+    assert_eq!(
+        claim.line_grace_s,
+        Some(grace_s),
+        "the claim names the grace its SIGTERM waited out"
+    );
+    let sigterm_held =
+        |age_s: u64| crate::harness::upgrade_drive::held_by_status(&key_status(age_s), grace_s);
+    for age_s in [0, 1, 19, 20, 21, 30, 60, 119, 120, 121, 300] {
+        assert_eq!(
+            owed_line_held(&claim, grace_s, age_s),
+            sigterm_held(age_s),
+            "a key {age_s} s old"
+        );
+    }
+    let gap = St {
+        line_grace_s: Some(crate::harness::upgrade::KEYS_GAP_S),
+        ..claim.clone()
+    };
+    assert!(
+        (0..=300).any(|age_s| sigterm_held(age_s) && !owed_line_held(&gap, grace_s, age_s)),
+        "control: the keys gap lets go a key the SIGTERM waited on"
+    );
 }
 
 impl LiveRig {

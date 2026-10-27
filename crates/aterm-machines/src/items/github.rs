@@ -57,13 +57,20 @@ const XCODE_SELECT_LINK: &str = "/var/db/xcode_select_link";
 /// The developer directory `xcode-select -p` names with no choice made and Xcode installed.
 const XCODE_DEVELOPER: &str = "/Applications/Xcode.app/Contents/Developer";
 
-/// The git installed for the runs here, never `/usr/bin/git` (macOS's shim, which asks a person
-/// to install the Command Line Tools): the tools' own ([`CLT_GIT`]), else, on a Mac with Xcode
-/// and not the tools, the git of the developer directory `xcode-select -p` names (the one a
-/// person chose, else Xcode's). Read without a child process; `None` when neither is there.
+/// The distribution's git everywhere but macOS ([`installed_git`]).
+pub const SYSTEM_GIT: &str = "/usr/bin/git";
+
+/// The git installed for the runs here. On a Mac never `/usr/bin/git` (macOS's shim, which asks
+/// a person to install the Command Line Tools): the tools' own ([`CLT_GIT`]), else, on a Mac with
+/// Xcode and not the tools, the git of the developer directory `xcode-select -p` names (the one a
+/// person chose, else Xcode's). Elsewhere the distribution's ([`SYSTEM_GIT`]). Read without a
+/// child process; `None` when none is there.
 #[must_use]
 pub fn installed_git(sys: &dyn System) -> Option<PathBuf> {
     let file = |path: &Path| sys.stat(path).is_ok_and(|stat| !stat.dir);
+    if !sys.macos() {
+        return file(Path::new(SYSTEM_GIT)).then(|| SYSTEM_GIT.into());
+    }
     if file(Path::new(CLT_GIT)) {
         return Some(CLT_GIT.into());
     }
@@ -76,15 +83,22 @@ pub fn installed_git(sys: &dyn System) -> Option<PathBuf> {
         .find(|git| file(git))
 }
 
-/// [`installed_git`], or [`CLT_GIT`] where none is installed (each caller reads that first).
+/// [`installed_git`], or where none is installed the one it looks for first ([`CLT_GIT`],
+/// elsewhere [`SYSTEM_GIT`]; each caller reads that first).
 #[must_use]
 pub fn git_program(sys: &dyn System) -> PathBuf {
-    installed_git(sys).unwrap_or_else(|| CLT_GIT.into())
+    installed_git(sys).unwrap_or_else(|| {
+        if sys.macos() {
+            CLT_GIT.into()
+        } else {
+            SYSTEM_GIT.into()
+        }
+    })
 }
 
 /// For a test that runs the real [`CLT_GIT`], as the code it checks does: COULD NOT RUN
-/// on a host without it (a Mac before the Command Line Tools; any other unix, where
-/// this crate builds but `aterm` never links it), never a spawn error read as a defect.
+/// on a host without it (a Mac before the Command Line Tools; any other unix, where `aterm
+/// init` runs the distribution's [`SYSTEM_GIT`] instead), never a spawn error read as a defect.
 #[cfg(test)]
 pub(crate) fn need_clt_git() {
     if !Path::new(CLT_GIT).is_file() {

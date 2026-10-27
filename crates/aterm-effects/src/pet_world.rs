@@ -103,6 +103,11 @@ pub struct PetReserve<'a> {
     pub overlays: &'a [PetRect],
     /// Predicted echo and IME preedit rectangles treated as ink.
     pub ink: &'a [PetRect],
+    /// Glass the host paints blank over the program's cells after this observation (the tail of
+    /// a program's row the host rewrote, past the words it laid: `aterm-gui`'s `claude_footer`
+    /// mode row): the program's ink there is hidden, so the pet reads those cells as blank glass
+    /// it may stand on. A protected, overlay or ink rect over one of them still holds it.
+    pub blanked: &'a [PetRect],
     /// The content sequence ([`RenderInput::content_seq`]) of the frame [`Self::protected`] was
     /// painted over, when the host paints its chrome after the pet has looked at a frame (its last
     /// pass's chrome, over the frame before this one): the console carries it with the rows it was
@@ -120,6 +125,7 @@ impl<'a> PetReserve<'a> {
             protected,
             overlays: &[],
             ink: &[],
+            blanked: &[],
             painted_over: None,
         }
     }
@@ -308,6 +314,7 @@ pub struct PetWorldFacts {
 
 impl PetWorldFacts {
     #[must_use]
+    #[inline]
     pub fn read(term: &Terminal, session: u64) -> Self {
         let grid = term.grid();
         let scroll = term.content_scroll_state();
@@ -364,7 +371,7 @@ impl PetWorldFacts {
                 scroll_band_batches: scroll.band_batches,
                 scroll_band_seq: scroll.band_seq,
             },
-            base_y: i64::try_from(grid.base_y()).unwrap_or(i64::MAX),
+            base_y: grid.base_y().min(i64::MAX as usize) as i64,
             blocks,
             progress: term.taskbar_progress(),
             completed_seq: term.completed_command_seq(),
@@ -618,6 +625,7 @@ impl PetWorld {
                 protected: exclusions,
                 overlays,
                 ink: &[],
+                blanked: &[],
                 painted_over: None,
             },
         )
@@ -637,6 +645,7 @@ impl PetWorld {
     }
 
     /// Observes cells around `hint_rect` when the console hides its cursor.
+    #[inline]
     pub(crate) fn observe_with_exclusions_near(
         &mut self,
         input: &RenderInput,
@@ -650,8 +659,10 @@ impl PetWorld {
             protected: exclusions,
             overlays,
             ink: reserved_ink,
+            blanked,
             ..
         } = reserve;
+        #[inline]
         const fn all_valid(rects: &[PetRect]) -> bool {
             let mut i = 0;
             while i < rects.len() {
@@ -662,6 +673,7 @@ impl PetWorld {
             }
             true
         }
+        #[inline]
         const fn span_contains(spans: &[(usize, usize)], col: usize) -> bool {
             let mut i = 0;
             while i < spans.len() {
@@ -700,6 +712,8 @@ impl PetWorld {
             || !all_valid(overlays)
             || reserved_ink.len() > MAX_REGIONS
             || !all_valid(reserved_ink)
+            || blanked.len() > MAX_REGIONS
+            || !all_valid(blanked)
         {
             return false;
         }
@@ -770,7 +784,14 @@ impl PetWorld {
             ],
             ..RenderCell::default()
         };
-        for r in 0..rows {
+        let mut spans_buf = [(0, 0); MAX_REGIONS];
+        let mut overlay_spans_buf = [(0, 0); MAX_REGIONS];
+        let mut typed_spans_buf = [(0, 0); MAX_REGIONS];
+        let mut blanked_spans_buf = [(0, 0); MAX_REGIONS];
+        let mut next_r = 0;
+        while next_r < rows {
+            let r = next_r;
+            next_r += 1;
             let row_base = r * MAX_WORLD_COLS;
             let prefix_row = (r + 1) * stride;
             self.blocked_prefix[prefix_row] = 0;
@@ -811,42 +832,49 @@ impl PetWorld {
             };
             let (mut hull_lo, mut hull_hi) = (u16::MAX, 0u16);
             let mut row_strokes = 0usize;
-            let mut spans = [(0, 0); MAX_REGIONS];
             let mut n_spans = 0;
             let mut ei = 0;
             while ei < exclusions.len() {
                 if let Some(span) = exclusion_span(exclusions[ei], local_r, pane.cols) {
-                    spans[n_spans] = span;
+                    spans_buf[n_spans] = span;
                     n_spans += 1;
                 }
                 ei += 1;
             }
-            let spans = &spans[..n_spans];
+            let spans = &spans_buf[..n_spans];
             if n_spans > 0 {
                 self.host_rows |= 1 << r;
             }
-            let mut overlay_spans = [(0, 0); MAX_REGIONS];
             let mut n_overlay = 0;
             let mut oi = 0;
             while oi < overlays.len() {
                 if let Some(span) = exclusion_span(overlays[oi], local_r, pane.cols) {
-                    overlay_spans[n_overlay] = span;
+                    overlay_spans_buf[n_overlay] = span;
                     n_overlay += 1;
                 }
                 oi += 1;
             }
-            let overlay_spans = &overlay_spans[..n_overlay];
-            let mut typed_spans = [(0, 0); MAX_REGIONS];
+            let overlay_spans = &overlay_spans_buf[..n_overlay];
             let mut n_typed = 0;
             let mut ti = 0;
             while ti < reserved_ink.len() {
                 if let Some(span) = exclusion_span(reserved_ink[ti], local_r, pane.cols) {
-                    typed_spans[n_typed] = span;
+                    typed_spans_buf[n_typed] = span;
                     n_typed += 1;
                 }
                 ti += 1;
             }
-            let typed_spans = &typed_spans[..n_typed];
+            let typed_spans = &typed_spans_buf[..n_typed];
+            let mut n_blanked = 0;
+            let mut bi = 0;
+            while bi < blanked.len() {
+                if let Some(span) = exclusion_span(blanked[bi], local_r, pane.cols) {
+                    blanked_spans_buf[n_blanked] = span;
+                    n_blanked += 1;
+                }
+                bi += 1;
+            }
+            let blanked_spans = &blanked_spans_buf[..n_blanked];
             let mut scan = RowScan::new(input, frame_r);
             let row_has_compounds = scan.has_compounds();
             let cursor_row_near = input.cursor_visible
@@ -867,9 +895,12 @@ impl PetWorld {
                         default_bg as u8,
                     ];
                 }
+                // Glass the host blanks after this look ([`PetReserve::blanked`]) shows none of
+                // the program's ink under it: the pet reads the blank the person will see.
+                let glass_blank = span_contains(blanked_spans, local_c);
                 let cell = match row.get(frame_c) {
-                    Some(c) => c,
-                    None => &implicit,
+                    Some(c) if !glass_blank => c,
+                    _ => &implicit,
                 };
                 self.examined_cells += 1;
                 row_strokes += usize::from(cell.ch == RULE_STROKE);
@@ -894,6 +925,7 @@ impl PetWorld {
                 let decorated =
                     cell.underline != UnderlineStyle::None || cell.strikethrough || cell.overline;
                 let compound = row_has_compounds
+                    && !glass_blank
                     && (scan.cluster(frame_c).is_some() || scan.combining(frame_c).is_some());
                 let line = scan.line_size(frame_c);
                 let glyph = cell.ch != ' ' || cell.wide || decorated || compound;
@@ -908,8 +940,8 @@ impl PetWorld {
                     && {
                         let column = frame_c + 1;
                         let neighbour = match row.get(column) {
-                            Some(n) => n,
-                            None => &implicit,
+                            Some(n) if !span_contains(blanked_spans, local_c + 1) => n,
+                            _ => &implicit,
                         };
                         neighbour.ch == ' '
                             && !neighbour.wide
@@ -1740,6 +1772,7 @@ impl PetWorld {
     /// `from = (r0, c0, r1, c1)` can reach on rows `r0..r1` widened to
     /// `rows`, crossing nothing the ground plane protects: the widest span
     /// round its own columns that is clear on every row in between.
+    #[inline]
     const fn reach_span(
         &self,
         from: (usize, usize, usize, usize),
@@ -1854,6 +1887,7 @@ impl PetWorld {
 
     /// The nearest REST SEAT.
     #[must_use]
+    #[inline]
     /// Nearest clean-ground rest seat to `near` within `max_distance`.
     pub const fn nearest_clear_perch(
         &self,
@@ -1869,6 +1903,7 @@ impl PetWorld {
     /// the ground `near` stands on, as far as `max_distance` and the ground reachable from `from`
     /// go.
     #[must_use]
+    #[inline]
     pub const fn nearest_clear_perch_along(
         &self,
         near: PetRect,
@@ -1879,6 +1914,7 @@ impl PetWorld {
         self.nearest_clear_perch_in(near, margin, max_distance, from, true)
     }
 
+    #[inline]
     const fn nearest_clear_perch_in(
         &self,
         near: PetRect,
@@ -1887,6 +1923,7 @@ impl PetWorld {
         from: Option<PetRect>,
         along: bool,
     ) -> Option<PetRect> {
+        #[inline]
         const fn fill(extent: f32, margin: f32) -> Option<(usize, f32)> {
             let cells = (extent + 2.0 * margin + 2.0 * PERCH_SLACK).ceil();
             if cells.is_finite() && cells >= 1.0 {
@@ -1898,9 +1935,11 @@ impl PetWorld {
                 None
             }
         }
+        #[inline]
         const fn cell_range_blocked(r0_row: &[u16], r1_row: &[u16], c0: usize, c1: usize) -> bool {
             (r1_row[c1] + r0_row[c0] - r1_row[c0] - r0_row[c1]) > 0
         }
+        #[inline]
         const fn band_hull_span(
             hull: &[(u16, u16)],
             r0: usize,
@@ -1951,6 +1990,7 @@ impl PetWorld {
             },
             None => None,
         };
+        #[inline]
         const fn clamp_i64(v: i64, lo: i64, hi: i64) -> i64 {
             if v < lo {
                 lo
@@ -2199,6 +2239,7 @@ impl PetWorld {
         self.perch_near_with(target, body, margin, max_distance, false, None)
     }
 
+    #[inline]
     const fn perch_near_with(
         &self,
         target: (f32, f32),
@@ -2208,6 +2249,7 @@ impl PetWorld {
         under_text: bool,
         from: Option<PetRect>,
     ) -> Option<PetRect> {
+        #[inline]
         const fn col_reach(max_distance: f32, row_dist: f32, best_d: f32, best_t: f32) -> f32 {
             let cap = max_distance.min(best_d);
             if row_dist == best_d {
@@ -2430,6 +2472,7 @@ pub(crate) struct PetReading {
     protected: Vec<PetRect>,
     overlays: Vec<PetRect>,
     ink: Vec<PetRect>,
+    blanked: Vec<PetRect>,
     /// Whether the last observation kept this reading instead of taking one.
     kept: bool,
 }
@@ -2538,6 +2581,7 @@ const fn same_rects(kept: &[PetRect], now: &[PetRect]) -> bool {
 impl PetReading {
     /// Hold no reading.
     #[must_use]
+    #[inline]
     pub(crate) const fn new() -> Self {
         Self {
             key: None,
@@ -2546,12 +2590,14 @@ impl PetReading {
             protected: Vec::new(),
             overlays: Vec::new(),
             ink: Vec::new(),
+            blanked: Vec::new(),
             kept: false,
         }
     }
 
     /// Whether this reading is the one `input` and the host's arguments would
     /// give.
+    #[inline]
     pub(crate) fn holds(
         &self,
         (input, fill): (&RenderInput, PetFill),
@@ -2573,10 +2619,12 @@ impl PetReading {
             && same_rects(&self.protected, reserve.protected)
             && same_rects(&self.overlays, reserve.overlays)
             && same_rects(&self.ink, reserve.ink)
+            && same_rects(&self.blanked, reserve.blanked)
     }
 
     /// Remember what a reading just taken was taken from (nothing, for an
     /// unconsumed fill or a scratch a host wrote into).
+    #[inline]
     pub(crate) fn note(
         &mut self,
         (input, fill): (&RenderInput, PetFill),
@@ -2596,10 +2644,13 @@ impl PetReading {
             self.overlays.extend_from_slice(reserve.overlays);
             self.ink.clear();
             self.ink.extend_from_slice(reserve.ink);
+            self.blanked.clear();
+            self.blanked.extend_from_slice(reserve.blanked);
         }
     }
 
     /// Hold no reading: the next observation takes one.
+    #[inline]
     pub(crate) const fn forget(&mut self) {
         self.key = None;
         self.kept = false;
@@ -2609,6 +2660,7 @@ impl PetReading {
     /// which now names it: a [`PetFill::Retained`] fill moved the scratch's
     /// extraction generation and kept its rows, so the next such fill names
     /// this one as its `prior`.
+    #[inline]
     pub(crate) const fn keep(&mut self, input: &RenderInput) {
         if let Some(key) = &mut self.key {
             key.extract_gen = input.extract_gen;
@@ -2618,6 +2670,7 @@ impl PetReading {
 
     /// Whether the last observation kept this reading.
     #[must_use]
+    #[inline]
     pub(crate) const fn kept(&self) -> bool {
         self.kept
     }
@@ -3017,21 +3070,22 @@ fn project_selection_target(
 
 #[inline]
 fn selection_target(input: &RenderInput, pane: PetPane) -> Option<(f32, f32)> {
-    let max_col = u16::try_from(input.cols.saturating_sub(1)).unwrap_or(u16::MAX);
-    let default_clip = SelectionClip::new(
-        pane.row,
-        pane.row + pane.rows,
-        pane.col,
-        pane.col + pane.cols,
-    );
+    let max_col_usize = input.cols.saturating_sub(1);
+    let max_col = if max_col_usize > u16::MAX as usize {
+        u16::MAX
+    } else {
+        max_col_usize as u16
+    };
     if input.selections.is_empty() {
-        project_selection_target(
-            &input.selection,
-            input.display_offset,
-            input.selection_clip.unwrap_or(default_clip),
-            max_col,
-            pane,
-        )
+        let clip = input.selection_clip.unwrap_or_else(|| {
+            SelectionClip::new(
+                pane.row,
+                pane.row + pane.rows,
+                pane.col,
+                pane.col + pane.cols,
+            )
+        });
+        project_selection_target(&input.selection, input.display_offset, clip, max_col, pane)
     } else {
         let limit = input.selections.len().min(MAX_REGIONS);
         let mut i = 0;
@@ -3102,9 +3156,9 @@ mod tests {
         let mut term = Terminal::new(10, 40);
         let rule = "\u{2500}".repeat(40);
         let most = format!(
-            "{} alab harness {}",
+            "{} alab claude {}",
             "\u{2500}".repeat(2),
-            "\u{2500}".repeat(24)
+            "\u{2500}".repeat(25)
         );
         let short = "\u{2500}".repeat(20);
         let boxed = "\u{2550}".repeat(40);
@@ -3661,6 +3715,7 @@ mod tests {
                 protected: &[],
                 overlays: &[],
                 ink: &typed,
+                blanked: &[],
                 painted_over: None,
             }
         ));
@@ -3692,6 +3747,7 @@ mod tests {
                 protected: &[],
                 overlays: &typed,
                 ink: &[],
+                blanked: &[],
                 painted_over: None,
             }
         ));
@@ -3711,10 +3767,115 @@ mod tests {
                 protected: &[],
                 overlays: &[],
                 ink: &nan,
+                blanked: &[],
                 painted_over: None,
             }
         ));
         assert_eq!(world.stamp(), None);
+    }
+
+    /// GLASS THE HOST BLANKS IS BLANK ([`PetReserve::blanked`]): the program's letters under it
+    /// read as the blank the person sees, in the occupancy, glyph and hull planes alike, while
+    /// a protected rect, an overlay or typed ink over the same cells still holds them, and the
+    /// letters past it stay ink.
+    #[test]
+    fn blanked_glass_hides_the_programs_ink_and_yields_to_the_hosts_own() {
+        let mut term = Terminal::new(12, 60);
+        term.process(b"\x1b[6;1Hthe program's words run on past the host's\x1b[1;1H");
+        let (input, facts) = snapshot(&mut term);
+        let blank = [PetRect::new(5.0, 10.0, 1.0, 20.0)];
+        let seen = |reserve: PetReserve<'_>| {
+            let mut world = PetWorld::default();
+            assert!(world.observe_with_reserve(&input, &facts, PetPane::full(&input), reserve));
+            world
+        };
+        let world = seen(PetReserve {
+            blanked: &blank,
+            ..PetReserve::default()
+        });
+        for col in [10, 14, 29] {
+            assert_eq!(world.cell(5, col), PetCell::Clear, "col {col}");
+            assert_eq!(world.ink_at(5, col), Some(false), "col {col}");
+            assert_eq!(world.letter_at(5, col), Some(false), "col {col}");
+        }
+        assert!(world.clear(PetRect::new(5.0, 12.0, 1.0, 15.0), 0.0));
+        for col in [0, 9, 30, 41] {
+            assert_eq!(
+                world.cell(5, col),
+                PetCell::Ink,
+                "the letters beside it, col {col}"
+            );
+        }
+        assert_eq!(world.hull[5], (0, 42), "the hull spans what the row shows");
+        let mut hidden = PetWorld::default();
+        assert!(hidden.observe_with_reserve(
+            &input,
+            &facts,
+            PetPane::full(&input),
+            PetReserve {
+                blanked: &[PetRect::new(5.0, 20.0, 1.0, 40.0)],
+                ..PetReserve::default()
+            },
+        ));
+        assert_eq!(
+            hidden.hull[5],
+            (0, 19),
+            "a blanked tail ends the hull at the letters it leaves"
+        );
+        assert_eq!(
+            seen(PetReserve::default()).cell(5, 14),
+            PetCell::Ink,
+            "CONTROL"
+        );
+        let over = [PetRect::new(5.0, 12.0, 1.0, 4.0)];
+        for (what, reserve, class) in [
+            (
+                "the host's chrome",
+                PetReserve {
+                    protected: &over,
+                    blanked: &blank,
+                    ..PetReserve::default()
+                },
+                PetCell::Protected,
+            ),
+            (
+                "an overlay",
+                PetReserve {
+                    overlays: &over,
+                    blanked: &blank,
+                    ..PetReserve::default()
+                },
+                PetCell::Protected,
+            ),
+            (
+                "typed ink",
+                PetReserve {
+                    ink: &over,
+                    blanked: &blank,
+                    ..PetReserve::default()
+                },
+                PetCell::Ink,
+            ),
+        ] {
+            let world = seen(reserve);
+            assert_eq!(world.cell(5, 13), class, "{what} over the blank holds it");
+            assert_eq!(
+                world.cell(5, 20),
+                PetCell::Clear,
+                "{what}: the rest stays blank"
+            );
+        }
+        let nan = [PetRect::new(f32::NAN, 0.0, 1.0, 1.0)];
+        let mut refused = PetWorld::default();
+        assert!(!refused.observe_with_reserve(
+            &input,
+            &facts,
+            PetPane::full(&input),
+            PetReserve {
+                blanked: &nan,
+                ..PetReserve::default()
+            },
+        ));
     }
 
     #[test]
@@ -4576,6 +4737,7 @@ mod tests {
             protected: &rect,
             overlays: &rect,
             ink: &rect,
+            blanked: &rect,
             painted_over: None,
         };
         const fn consumed(i: &RenderInput) -> (&RenderInput, PetFill) {
@@ -4671,6 +4833,13 @@ mod tests {
                 "typed ink",
                 PetReserve {
                     ink: &other,
+                    ..reserve
+                },
+            ),
+            (
+                "blanked glass",
+                PetReserve {
+                    blanked: &other,
                     ..reserve
                 },
             ),

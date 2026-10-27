@@ -3,9 +3,9 @@
 
 //! Per-frame GPU execution timing ([`FrameToken::complete_parts`](crate::gpu_time::FrameToken::complete_parts)).
 
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 use std::sync::OnceLock;
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 #[cfg(any(target_os = "macos", test))]
 use std::time::Duration;
@@ -17,7 +17,7 @@ pub struct GpuFrameTime {
     pub serial: u64,
     /// Sum of the parts' GPU execution spans, nanoseconds.
     pub gpu_ns: u64,
-    /// How many parts were summed: Metal command buffers or wgpu render passes.
+    /// How many parts were summed: Metal command buffers.
     pub parts: u32,
 }
 
@@ -36,21 +36,21 @@ pub enum Settled {
 pub type GpuTimeSink = fn(GpuFrameTime);
 
 /// Whether this build has a device execution clock.
-pub const SUPPORTED: bool = cfg!(any(target_os = "macos", wgpu_arm));
+pub const SUPPORTED: bool = cfg!(target_os = "macos");
 
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 static FRAMES: FrameRing = FrameRing::new();
 
 /// Frames in flight at once.
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 const RING: usize = 64;
 
 /// `pending` while a slot is being delivered: no open can claim it and no part can be added to it.
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 const DELIVERING: u32 = u32::MAX;
 
 /// One frame's accumulator.
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 struct Slot {
     /// Outstanding holds: the seal's one plus one per unfinished part ([`DELIVERING`]).
@@ -64,7 +64,7 @@ struct Slot {
     failed: AtomicBool,
 }
 
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 impl Slot {
     #[inline]
     const fn new() -> Self {
@@ -80,7 +80,7 @@ impl Slot {
 }
 
 /// One accounting domain.
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 pub(crate) struct FrameRing {
     sink: OnceLock<GpuTimeSink>,
@@ -94,7 +94,7 @@ pub(crate) struct FrameRing {
     slots: [Slot; RING],
 }
 
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 impl FrameRing {
     const fn new() -> Self {
         Self {
@@ -114,17 +114,6 @@ impl FrameRing {
         &self.slots[usize::try_from(serial % RING as u64).unwrap_or(0)]
     }
 
-    /// Record a frame skipped outside the ring (such as when all wgpu readback slots are busy).
-    #[inline]
-    #[cfg(wgpu_arm)]
-    pub(crate) fn note_skipped(&self) {
-        #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
-        if self.paused.load(Ordering::Relaxed) {
-            return;
-        }
-        self.skipped.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// A test's own ring, listening (a no-op sink), so frames open.
     #[cfg(test)]
     pub(crate) fn listening() -> Self {
@@ -135,20 +124,13 @@ impl FrameRing {
     }
 }
 
-/// Return the process's ring for readback machinery (`crate::wgpu_timer`).
-#[inline]
-#[cfg(wgpu_arm)]
-pub(crate) const fn frames() -> &'static FrameRing {
-    &FRAMES
-}
-
 /// Install the process's one sink.
 pub fn install_sink(sink: GpuTimeSink) -> bool {
-    #[cfg(any(target_os = "macos", wgpu_arm, test))]
+    #[cfg(any(target_os = "macos", test))]
     {
         FRAMES.sink.set(sink).is_ok()
     }
-    #[cfg(not(any(target_os = "macos", wgpu_arm, test)))]
+    #[cfg(not(any(target_os = "macos", test)))]
     {
         let _ = sink;
         false
@@ -159,9 +141,9 @@ pub fn install_sink(sink: GpuTimeSink) -> bool {
 #[inline]
 #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
 pub fn set_paused(paused: bool) {
-    #[cfg(any(target_os = "macos", wgpu_arm, test))]
+    #[cfg(any(target_os = "macos", test))]
     FRAMES.paused.store(paused, Ordering::Relaxed);
-    #[cfg(not(any(target_os = "macos", wgpu_arm, test)))]
+    #[cfg(not(any(target_os = "macos", test)))]
     let _ = paused;
 }
 
@@ -169,11 +151,11 @@ pub fn set_paused(paused: bool) {
 #[must_use]
 #[inline]
 pub fn sink_installed() -> bool {
-    #[cfg(any(target_os = "macos", wgpu_arm, test))]
+    #[cfg(any(target_os = "macos", test))]
     {
         FRAMES.sink.get().is_some()
     }
-    #[cfg(not(any(target_os = "macos", wgpu_arm, test)))]
+    #[cfg(not(any(target_os = "macos", test)))]
     {
         false
     }
@@ -183,11 +165,11 @@ pub fn sink_installed() -> bool {
 #[must_use]
 #[inline]
 pub fn delivered() -> u64 {
-    #[cfg(any(target_os = "macos", wgpu_arm, test))]
+    #[cfg(any(target_os = "macos", test))]
     {
         FRAMES.delivered.load(Ordering::Relaxed)
     }
-    #[cfg(not(any(target_os = "macos", wgpu_arm, test)))]
+    #[cfg(not(any(target_os = "macos", test)))]
     {
         0
     }
@@ -197,11 +179,11 @@ pub fn delivered() -> u64 {
 #[must_use]
 #[inline]
 pub fn dropped() -> u64 {
-    #[cfg(any(target_os = "macos", wgpu_arm, test))]
+    #[cfg(any(target_os = "macos", test))]
     {
         FRAMES.dropped.load(Ordering::Relaxed)
     }
-    #[cfg(not(any(target_os = "macos", wgpu_arm, test)))]
+    #[cfg(not(any(target_os = "macos", test)))]
     {
         0
     }
@@ -211,17 +193,17 @@ pub fn dropped() -> u64 {
 #[must_use]
 #[inline]
 pub fn skipped() -> u64 {
-    #[cfg(any(target_os = "macos", wgpu_arm, test))]
+    #[cfg(any(target_os = "macos", test))]
     {
         FRAMES.skipped.load(Ordering::Relaxed)
     }
-    #[cfg(not(any(target_os = "macos", wgpu_arm, test)))]
+    #[cfg(not(any(target_os = "macos", test)))]
     {
         0
     }
 }
 
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 /// One open frame: the handle every part of it reports through.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrameToken<'a> {
@@ -236,7 +218,7 @@ pub(crate) fn open_frame() -> Option<FrameToken<'static>> {
     FRAMES.open_frame()
 }
 
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 impl FrameRing {
     pub(crate) fn open_frame(&self) -> Option<FrameToken<'_>> {
         self.sink.get()?;
@@ -262,7 +244,7 @@ impl FrameRing {
     }
 }
 
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 impl FrameToken<'_> {
     /// The frame's serial.
     #[inline]
@@ -285,7 +267,7 @@ impl FrameToken<'_> {
         self.complete_parts(span_ns, 1);
     }
 
-    /// Complete a held multi-part span (such as a wgpu readback union) counting `parts` parts.
+    /// Complete a held multi-part span counting `parts` parts.
     pub(crate) fn complete_parts(self, span_ns: Option<u64>, parts: u32) {
         let s = self.ring.slot(self.serial);
         match span_ns {
@@ -312,7 +294,7 @@ impl FrameToken<'_> {
     }
 }
 
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 /// Drop one hold; the last one publishes the frame.
 fn release(token: FrameToken<'_>) {
     let s = token.ring.slot(token.serial);
@@ -346,7 +328,7 @@ fn release(token: FrameToken<'_>) {
     }
 }
 
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 fn deliver(token: FrameToken<'_>, s: &Slot) {
     let gpu_ns = s.gpu_ns.load(Ordering::SeqCst);
     let parts = s.parts.load(Ordering::SeqCst);
@@ -373,18 +355,18 @@ fn deliver(token: FrameToken<'_>, s: &Slot) {
 #[must_use]
 #[inline]
 pub fn settled(serial: u64) -> Option<Settled> {
-    #[cfg(any(target_os = "macos", wgpu_arm, test))]
+    #[cfg(any(target_os = "macos", test))]
     {
         FRAMES.settled(serial)
     }
-    #[cfg(not(any(target_os = "macos", wgpu_arm, test)))]
+    #[cfg(not(any(target_os = "macos", test)))]
     {
         let _ = serial;
         None
     }
 }
 
-#[cfg(any(target_os = "macos", wgpu_arm, test))]
+#[cfg(any(target_os = "macos", test))]
 impl FrameRing {
     pub(crate) fn settled(&self, serial: u64) -> Option<Settled> {
         if serial == 0 {
@@ -564,8 +546,6 @@ mod tests {
         let ring = listening();
         ring.paused.store(true, super::Ordering::Relaxed);
         let skipped = ring.skipped.load(super::Ordering::Relaxed);
-        #[cfg(wgpu_arm)]
-        ring.note_skipped();
         assert!(ring.open_frame().is_none(), "a paused clock opens no frame");
         assert_eq!(ring.skipped.load(super::Ordering::Relaxed), skipped);
         ring.paused.store(false, super::Ordering::Relaxed);

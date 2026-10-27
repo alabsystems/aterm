@@ -152,19 +152,6 @@ impl ActiveEventLoop {
         }
     }
 
-    #[cfg(feature = "rwh_06")]
-    #[inline]
-    pub fn raw_display_handle_rwh_06(
-        &self,
-    ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        match &self.backend {
-            Backend::AppKit(_) => {
-                Ok(rwh_06::RawDisplayHandle::AppKit(rwh_06::AppKitDisplayHandle::new()))
-            },
-            Backend::Headless(_) => Err(rwh_06::HandleError::NotSupported),
-        }
-    }
-
     pub(crate) fn set_control_flow(&self, control_flow: ControlFlow) {
         match &self.backend {
             Backend::AppKit(delegate) => delegate.set_control_flow(control_flow),

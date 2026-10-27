@@ -197,6 +197,23 @@ impl PolicyEngine {
     pub fn rate_limit_config(&self, id: &str) -> Option<&RateLimit> {
         self.policy.rate_limits.iter().find(|cfg| cfg.id == id)
     }
+
+    /// Snapshot every declared rate-limit bucket in first-declaration order.
+    #[must_use]
+    pub fn bucket_snapshots(&self) -> Vec<crate::limits::BucketSnapshot> {
+        self.limiters.snapshots()
+    }
+
+    /// Restore declared rate-limit buckets in first-declaration order.
+    pub fn restore_bucket_snapshots(&mut self, snaps: &[crate::limits::BucketSnapshot]) {
+        self.limiters.restore_snapshots(snaps);
+    }
+
+    /// Return the earliest `last_refill` instant across every declared rate-limit bucket.
+    #[must_use]
+    pub fn earliest_refill(&self) -> Option<aterm_time::Instant> {
+        self.limiters.earliest_refill()
+    }
 }
 
 #[cfg(test)]

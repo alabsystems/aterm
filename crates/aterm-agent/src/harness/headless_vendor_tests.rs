@@ -598,6 +598,347 @@ fn a_label_two_pools_give_different_mailboxes_hands_its_password_to_no_other_poo
     );
 }
 
+#[test]
+fn contested_mailbox_labels_cannot_be_recovered_from_an_email_spelling() {
+    let home = aterm_tempfile::tempdir().expect("tmp");
+    for (path, text) in [
+        (
+            ".secrets/ai-mailbox.toml",
+            r#"
+[passwords]
+m27_2 = "claude-password-fixture"
+[mailbox_passwords]
+m27_2 = "claude-mailbox-password-fixture"
+[totp_secrets]
+m27_2 = "claude-totp-fixture"
+"#,
+        ),
+        (
+            ".config/aterm/accounts.toml",
+            r#"
+[[account]]
+label = "m27-2"
+class = "dedicated"
+email = "claude-box@example.com"
+"#,
+        ),
+        (
+            ".config/aterm/accounts-kimi.toml",
+            r#"
+[[account]]
+label = "m27-2"
+class = "dedicated"
+email = "sun.m27.2@example.org"
+region = "global"
+"#,
+        ),
+    ] {
+        let at = home.path().join(path);
+        std::fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
+        std::fs::write(at, text).expect("write");
+    }
+    let cfg = discover_mailbox_config_files_raw(Some(home.path()), None, None);
+    assert!(cfg.contested_labels.contains("m27-2"));
+    for (blocked, own) in [
+        (
+            cfg.password_for(Some("sun.m27.2@example.org")),
+            cfg.password_for(Some("claude-box@example.com")),
+        ),
+        (
+            cfg.mailbox_password_for(Some("sun.m27.2@example.org")),
+            cfg.mailbox_password_for(Some("claude-box@example.com")),
+        ),
+        (
+            cfg.totp_secret_for(Some("sun.m27.2@example.org")),
+            cfg.totp_secret_for(Some("claude-box@example.com")),
+        ),
+    ] {
+        assert!(
+            own.is_some(),
+            "the owning roster keeps its explicit email alias"
+        );
+        assert!(
+            blocked.is_none(),
+            "email-derived labels cannot bypass a contest"
+        );
+    }
+}
+
+pub(crate) fn mailbox_selection_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    if action == "AnotherCase" {
+        mailbox_selection_environment();
+        next.insert("case", state["case"] + 1);
+        return next;
+    }
+    assert_eq!(action, "Lookup");
+    let (label, contested, exact, default, wildcard) = match state["case"] {
+        0 => (true, true, false, false, false),
+        1 => (true, true, true, false, false),
+        2 => (true, false, false, false, false),
+        3 => (true, true, false, true, false),
+        4 => (true, true, false, false, true),
+        5 => (false, false, false, false, false),
+        6 => (true, true, true, true, true),
+        7 => (true, false, false, true, true),
+        8 => (false, false, false, true, true),
+        _ => panic!("unknown credential configuration"),
+    };
+    let mut selected = None;
+    for key in ["m27-2", "m27_2", "m27.2"] {
+        for email in [
+            "m27-2@example.org",
+            "m27.2@example.org",
+            "sun.m27.2@example.org",
+        ] {
+            let mut values = BTreeMap::new();
+            if label {
+                values.insert(key.to_owned(), "2".to_owned());
+            }
+            if exact {
+                values.insert(email.to_owned(), "1".to_owned());
+            }
+            if wildcard {
+                values.insert("*".to_owned(), "4".to_owned());
+            }
+            let cfg = MailboxConfig {
+                passwords: values.clone(),
+                mailbox_passwords: values.clone(),
+                totp_secrets: values,
+                password: default.then(|| "3".to_owned()),
+                mailbox_password: default.then(|| "3".to_owned()),
+                totp_secret: default.then(|| "3".to_owned()),
+                contested_labels: if contested {
+                    BTreeSet::from(["m27-2".to_owned()])
+                } else {
+                    BTreeSet::new()
+                },
+                ..MailboxConfig::default()
+            };
+            let before = cfg.clone();
+            for result in [
+                cfg.password_for(Some(email)),
+                cfg.mailbox_password_for(Some(email)),
+                cfg.totp_secret_for(Some(email)),
+            ] {
+                let value = result.map_or(0, |v| v.parse::<i64>().unwrap());
+                if let Some(prior) = selected {
+                    assert_eq!(prior, value, "{key} {email}");
+                }
+                selected = Some(value);
+            }
+            assert_eq!(cfg, before, "lookup never changes a credential binding");
+        }
+    }
+    next.insert("phase", 1);
+    next.insert("selected", selected.unwrap());
+    next
+}
+
+#[test]
+fn mailbox_credential_selection_conforms_with_negative_controls() {
+    let model = aterm_models_harness::account_mailbox_selection_model();
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 18);
+    let mut witnessed = BTreeMap::new();
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = mailbox_selection_transition(&state, action.name);
+                assert!(model.successors(action.name, &state).contains(&next));
+                if action.name == "Lookup" {
+                    witnessed.insert(state["case"], (state.clone(), next));
+                }
+            }
+        }
+    }
+    for (case, wrong, law) in [
+        (0, 2, "ContestedRefuses"),
+        (1, 2, "ExactWins"),
+        (2, 0, "UncontestedWorks"),
+        (3, 0, "DefaultWorks"),
+        (4, 2, "WildcardWorks"),
+        (5, 2, "MissingRefuses"),
+    ] {
+        let (before, after) = &witnessed[&case];
+        let mut mutant = after.clone();
+        mutant.insert("selected", wrong);
+        assert!(!model.check_invariant(law, &mutant));
+        assert!(!model.successors("Lookup", before).contains(&mutant));
+    }
+}
+
+#[test]
+fn mailbox_conflicts_include_csv_and_configured_fleets_before_totp_aliasing() {
+    for source in ["config-fleet", "sibling-fleet", "claude-csv", "vendor-csv"] {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let label = if source == "vendor-csv" {
+            "kimi-m27-2"
+        } else {
+            "m27-2"
+        };
+        let own = format!(
+            "[[account]]\nlabel='{label}'\nclass='dedicated'\nemail='claude-box@example.com'\n"
+        );
+        let fleet = format!("{own}machines=['m27']\n");
+        let other = format!(
+            "[[account]]\nlabel='{label}'\nclass='dedicated'\nemail='vendor-box@example.org'\nregion='global'\n"
+        );
+        let (own_path, own_text, other_path, other_text) = match source {
+            "config-fleet" => (
+                ".config/aterm/fleet-accounts.toml",
+                fleet,
+                ".config/aterm/accounts-kimi.toml",
+                other,
+            ),
+            "sibling-fleet" => (
+                "custom/aterm/fleet-accounts.toml",
+                fleet,
+                "custom/aterm/accounts-kimi.toml",
+                other,
+            ),
+            "claude-csv" => (
+                ".secrets/ai-accounts.csv",
+                "email,computer,claude\nclaude-box@example.com,m27.2,1\n".to_owned(),
+                ".config/aterm/accounts-kimi.toml",
+                other,
+            ),
+            "vendor-csv" => (
+                ".config/aterm/accounts.toml",
+                own,
+                ".secrets/ai-accounts.csv",
+                "email,computer,kimi\nvendor-box@example.org,m27.2,global\n".to_owned(),
+            ),
+            _ => unreachable!(),
+        };
+        let secret = format!(
+            "[passwords]\n'{label}'='password-fixture'\n\
+             [mailbox_passwords]\n'{label}'='mailbox-fixture'\n\
+             [totp_secrets]\n'{label}'='otpauth://totp/Test:uri-recipient%40example.org?secret=JBSWY3DPEHPK3PXP&issuer=Test'\n"
+        );
+        for (path, text) in [
+            (own_path, own_text.as_str()),
+            (other_path, other_text.as_str()),
+            (".secrets/ai-mailbox.toml", secret.as_str()),
+        ] {
+            let path = home.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let custom_config = home.path().join("custom/aterm/aterm.toml");
+        let cfg = discover_mailbox_config_files_raw(
+            Some(home.path()),
+            None,
+            (source == "sibling-fleet").then_some(custom_config.as_path()),
+        );
+        let override_path = home.path().join("explicit-mailbox.toml");
+        std::fs::write(
+            &override_path,
+            secret.replace("password-fixture", "override-fixture"),
+        )
+        .unwrap();
+        let overridden =
+            discover_mailbox_config_with_env(Some(home.path()), None, |name| match name {
+                MAILBOX_ENV => Some(override_path.as_os_str().to_owned()),
+                "XDG_CONFIG_HOME" if source == "sibling-fleet" => {
+                    Some(home.path().join("custom").into_os_string())
+                }
+                _ => None,
+            })
+            .unwrap();
+        for (cfg, expected) in [(cfg, "password-fixture"), (overridden, "override-fixture")] {
+            assert!(cfg.contested_labels.contains(label), "{source}");
+            for email in ["vendor-box@example.org", "uri-recipient@example.org"] {
+                assert!(cfg.password_for(Some(email)).is_none(), "{source} {email}");
+                assert!(
+                    cfg.mailbox_password_for(Some(email)).is_none(),
+                    "{source} {email}"
+                );
+            }
+            assert!(
+                cfg.totp_secret_for(Some("uri-recipient@example.org"))
+                    .is_some()
+            );
+            assert_eq!(
+                cfg.password_for(Some("claude-box@example.com")).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+}
+
+#[test]
+fn mailbox_aliases_respect_the_winning_source_before_deriving_email_keys() {
+    for source in ["override", "store", "raw-override", "raw-store"] {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let old = r#"
+[passwords]
+m27 = "old-password-fixture"
+[mailbox_passwords]
+m27 = "old-second-fixture"
+[totp_secrets]
+m27 = "otpauth://totp/Test:mailbox%40example.org?secret=JBSWY3DPEHPK3PXP&issuer=Test"
+"#;
+        let new = r#"
+[passwords]
+m27 = "new-password-fixture"
+[mailbox_passwords]
+m27 = "new-second-fixture"
+[totp_secrets]
+m27 = "KRSXG5A"
+"#;
+        let raw = "old-password-fixture\nold-second-fixture\notpauth://totp/Test:mailbox%40example.org?secret=JBSWY3DPEHPK3PXP&issuer=Test\n";
+        let (old_path, old) = if source.starts_with("raw-") {
+            (".secrets/m27", raw)
+        } else {
+            (".secrets/ai-mailbox.toml", old)
+        };
+        for (name, text) in [
+            (old_path, old),
+            (
+                ".config/aterm/accounts.toml",
+                "[[account]]\nlabel='m27'\nclass='dedicated'\nemail='mailbox@example.org'\n",
+            ),
+            ("store/mailbox.toml", new),
+        ] {
+            let path = home.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let store = home.path().join("store");
+        let cfg = if source.ends_with("store") {
+            discover_mailbox_config_files_raw(Some(home.path()), Some(&store), None)
+        } else {
+            discover_mailbox_config_with_env(Some(home.path()), None, |name| {
+                (name == MAILBOX_ENV).then(|| store.join("mailbox.toml").into_os_string())
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            cfg.password_for(Some("m27")).as_deref(),
+            Some("new-password-fixture")
+        );
+        assert_eq!(
+            cfg.password_for(Some("mailbox@example.org")).as_deref(),
+            Some("new-password-fixture"),
+            "{source}: a derived email alias must use the winning label credential"
+        );
+        assert_eq!(
+            cfg.mailbox_password_for(Some("mailbox@example.org"))
+                .as_deref(),
+            Some("new-second-fixture"),
+            "{source}: second-stage credentials obey the same source precedence"
+        );
+        assert_eq!(
+            cfg.totp_secret_for(Some("mailbox@example.org")).as_deref(),
+            Some("KRSXG5A"),
+            "{source}: a superseded TOTP URI must not keep its old email value"
+        );
+    }
+}
+
 /// A vendor sign-in stays within the flow it started: a mail from another sender is not
 /// followed, and a page naming another client, or handing its login elsewhere, is never pressed.
 #[test]
@@ -2022,8 +2363,8 @@ fn cjk_punctuated_emails_readonly_inputs_and_vendor_otp_retry_work() {
         &mut cdp,
         "https://auth.openai.com/email-verification",
         otp_gate,
-        (&|| false, Instant::now() + Duration::from_secs(30)),
-        PageStall::within(Duration::from_secs(30)),
+        (&|| false, Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+        PageStall::within(aterm_spec::wait::MUST_HAPPEN),
         |_, _| {
             poll_count += 1;
             if poll_count == 1 {

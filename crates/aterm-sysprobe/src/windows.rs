@@ -457,7 +457,7 @@ fn name_at(bytes: &[u8], base: u64, ptr: u64, length: u16) -> String {
 }
 
 /// An image name as a short name: its `.exe` (any case) dropped.
-fn short_image_name(name: String) -> String {
+pub(crate) fn short_image_name(name: String) -> String {
     let n = name.len();
     if n > 4 && name.is_char_boundary(n - 4) && name[n - 4..].eq_ignore_ascii_case(".exe") {
         name[..n - 4].to_owned()
@@ -496,6 +496,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                 .filter(|value| *value > 0);
             found.push((
                 ProcessReading {
+                    scheduling: None,
                     pid: u32::try_from(pid).unwrap_or(u32::MAX),
                     start,
                     ppid: u32::try_from(field(

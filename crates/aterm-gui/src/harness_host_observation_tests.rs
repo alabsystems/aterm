@@ -3,6 +3,18 @@
 
 use super::*;
 
+fn add_alternate(a: &Accts) {
+    let roster = std::fs::read_to_string(a.roster_path()).unwrap();
+    std::fs::write(
+        a.roster_path(),
+        format!(
+            "{roster}\n[[account]]\nlabel='work-2'\nclass='dedicated'\ndir='{}'\n",
+            a.login_dir("work-2")
+        ),
+    )
+    .unwrap();
+}
+
 fn replace_login(a: &Accts, prior: &str) -> String {
     let next = a.login_dir("main+2");
     std::fs::create_dir_all(&next).unwrap();
@@ -20,6 +32,161 @@ fn replace_login(a: &Accts, prior: &str) -> String {
         })
         .unwrap();
     next
+}
+
+#[test]
+fn quota_answers_and_probes_keep_captured_accounts_across_the_writer() {
+    for probe in [false, true] {
+        for change in [
+            "same",
+            "renew",
+            "identity",
+            "missing",
+            "unreadable",
+            "before-probe",
+            "probe-path",
+            "writer-path",
+            "writer-unavailable",
+        ] {
+            if !probe && matches!(change, "before-probe" | "probe-path") {
+                continue;
+            }
+            let a = Accts::new();
+            let sid = "s-quota-observed";
+            a.spawn(sid, ACCT_TALK_A, "main");
+            let login = renew_own(&a);
+            add_alternate(&a);
+            a.exec(sid, ACCT_TALK_A, Some(&login), a.clock());
+            let mut idle = a.worker(sid, &on());
+            if probe {
+                idle.probe_claim().unwrap();
+            }
+            a.now.store(ACCT_NOW + 30, Ordering::SeqCst);
+            a.wall(ACCT_TALK_A, a.clock() - 1);
+            let change_identity = |a: &Accts| {
+                std::fs::write(
+                    a.roster_path(),
+                    OWN_ROW.replace("owner@example.com", "another@example.test"),
+                )
+                .unwrap()
+            };
+            if change == "before-probe" {
+                change_identity(&a);
+            }
+            let other_path = a.roster_path().with_extension("other");
+            if matches!(change, "probe-path" | "writer-path") {
+                std::fs::copy(a.roster_path(), &other_path).unwrap();
+            }
+            let saved = Arc::new(Mutex::new((a.state(), a.ledger())));
+            let baseline = Arc::clone(&saved);
+            let world = Arc::clone(&a);
+            let count = AtomicUsize::new(0);
+            let read = Arc::clone(&idle.hooks.acts.account_seat);
+            idle.hooks.acts.account_seat = Arc::new(move || {
+                let writing = count.fetch_add(1, Ordering::SeqCst) == 1;
+                if writing {
+                    match change {
+                        "renew" => {
+                            replace_login(&world, &login);
+                        }
+                        "identity" => change_identity(&world),
+                        "missing" => std::fs::rename(
+                            world.roster_path(),
+                            world.roster_path().with_extension("retained"),
+                        )
+                        .unwrap(),
+                        "unreadable" => std::fs::write(world.roster_path(), "[[broken").unwrap(),
+                        _ => {}
+                    }
+                    *baseline.lock().unwrap() = (world.state(), world.ledger());
+                }
+                if writing && change == "writer-unavailable" {
+                    return None;
+                }
+                read().map(|mut seat| {
+                    if change == "probe-path" || (writing && change == "writer-path") {
+                        seat.roster = Some(other_path.clone());
+                    }
+                    seat
+                })
+            });
+            let renewals = Arc::new(AtomicUsize::new(0));
+            let notified = Arc::clone(&renewals);
+            idle.hooks.acts.accounts_upkeep = AccountsUpkeep::Made(Arc::new(move |_| {
+                notified.fetch_add(1, Ordering::SeqCst);
+            }));
+            if probe {
+                idle.account_probed(Ok(&accounts::Sample {
+                    session_pct: Some(95),
+                    ..accounts::Sample::default()
+                }));
+                assert!(with_kept_of(&idle.kept, |k| k.account.probing.is_none()));
+                assert!(accounts::probe_held(&a.state(), "main", a.clock()));
+            } else {
+                idle.account_answered(AccountBad::Wall);
+            }
+            let accepted = matches!(change, "same" | "renew");
+            assert_eq!(
+                renewals.load(Ordering::SeqCst),
+                usize::from(accepted),
+                "probe={probe}, change={change}"
+            );
+            if accepted {
+                let row = a.state().account("main");
+                if probe {
+                    assert_eq!(row.sample.unwrap().session_pct, Some(95));
+                } else {
+                    assert!(row.walls.contains_key("five_hour"));
+                }
+            } else {
+                assert_eq!(
+                    (a.state(), a.ledger()),
+                    *saved.lock().unwrap(),
+                    "probe={probe}, change={change}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_probe_claim_checks_its_row_and_a_failed_probe_keeps_the_cooldown() {
+    for change in [false, true] {
+        let a = Accts::new();
+        let sid = "s-probe-capture";
+        a.spawn(sid, ACCT_TALK_A, "main");
+        let login = renew_own(&a);
+        add_alternate(&a);
+        a.exec(sid, ACCT_TALK_A, Some(&login), a.clock());
+        let mut idle = a.worker(sid, &on());
+        let before = a.state();
+        let read = Arc::clone(&idle.hooks.acts.account_seat);
+        let count = AtomicUsize::new(0);
+        let world = Arc::clone(&a);
+        idle.hooks.acts.account_seat = Arc::new(move || {
+            if change && count.fetch_add(1, Ordering::SeqCst) == 1 {
+                std::fs::write(
+                    world.roster_path(),
+                    OWN_ROW.replace("owner@example.com", "another@example.test"),
+                )
+                .unwrap();
+            }
+            read()
+        });
+        let result = idle.probe_claim();
+        if change {
+            assert!(result.is_err());
+            assert_eq!(a.state(), before);
+            assert!(with_kept_of(&idle.kept, |k| k.account.probing.is_none()));
+        } else {
+            result.unwrap();
+            let claimed = a.state();
+            idle.account_probed(Err(ProbeMiss::Lost));
+            assert!(with_kept_of(&idle.kept, |k| k.account.probing.is_none()));
+            assert_eq!(a.state(), claimed);
+            assert!(accounts::probe_held(&claimed, "main", a.clock()));
+        }
+    }
 }
 
 fn unproven(a: &Accts) {
@@ -128,10 +295,11 @@ pub(crate) fn answer_transition(
     with_kept_of(&idle.kept, |kept| {
         let snap = kept.snapshot.as_ref().unwrap();
         kept.account.moved = Some(Moved {
+            id: MoveId::default(),
+            origin: a.seat().context(),
             to: "main".into(),
             login: Some(old.clone()),
-            pid: snap.pid,
-            start: snap.start.clone(),
+            process: snap.clone(),
             answered: false,
             untold: false,
         });

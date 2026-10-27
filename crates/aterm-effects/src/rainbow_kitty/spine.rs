@@ -306,6 +306,7 @@ impl Spine {
     }
 
     /// Advance the display follower, resume memory and lay/flow clock to `now`.
+    #[inline]
     pub fn update(&mut self, now: Instant) {
         // The hot-resume door closes by itself on the follower's tick, so a
         // session that goes dark re-earns its price.
@@ -501,6 +502,9 @@ impl Spine {
         *self = Self::new();
     }
 }
+
+#[cfg(any(test, debug_assertions))]
+mod state_words;
 
 #[cfg(test)]
 mod tests {

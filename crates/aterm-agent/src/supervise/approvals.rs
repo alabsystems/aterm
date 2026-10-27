@@ -1057,13 +1057,14 @@ pub fn open_left_in(body: &str, sid: Option<&str>) -> Option<String> {
 pub fn left_after_typed(open: &str, rule: &str, command: &str) -> Option<String> {
     use super::policy::turn_end::{
         RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_LIMIT_RESUME, RULE_LOGIN_BACK,
-        RULE_USAGE_PROBE,
+        RULE_OUTAGE_RESUME, RULE_USAGE_PROBE,
     };
     match rule {
         RULE_USAGE_PROBE => Some(open.to_string()),
         // A fact line ends no person's exchange ([`is_fact_rule`]).
         rule if is_fact_rule(rule) => Some(open.to_string()),
-        RULE_API_RETRY | RULE_API_BACK | RULE_API_CUTOFF | RULE_LIMIT_RESUME | RULE_LOGIN_BACK
+        RULE_API_RETRY | RULE_API_BACK | RULE_API_CUTOFF | RULE_OUTAGE_RESUME
+        | RULE_LIMIT_RESUME | RULE_LOGIN_BACK
             if open.starts_with(LEFT_AT_WALL) =>
         {
             Some(left_retried_key(open, command))
@@ -1630,6 +1631,16 @@ fn delivers_land(command: Option<&str>) -> bool {
     })
 }
 
+/// Whether `command` opens on Land's instruction, now's or a retired build's (no nudge, no answer).
+fn gives_land(command: Option<&str>) -> bool {
+    use super::policy::turn_end::{LAND, RETIRED_LANDS};
+    command.is_some_and(|c| {
+        std::iter::once(LAND)
+            .chain(RETIRED_LANDS)
+            .any(|head| opens_with(head, c))
+    })
+}
+
 fn opens_with(head: &str, text: &str) -> bool {
     let mut words = text.split_whitespace();
     head.split_whitespace().all(|w| words.next() == Some(w))
@@ -1722,7 +1733,7 @@ impl LandWalk {
 
     fn read(&mut self, v: &aterm_json::Value) {
         use super::policy::turn_end::{
-            HoldStart, RULE_COMPACT, RULE_LAND, RULE_LAND_NUDGE, RULE_USAGE_PROBE,
+            HoldStart, RULE_COMPACT, RULE_LAND, RULE_LAND_NUDGE, RULE_USAGE_PROBE, is_cleared_line,
             is_continue_rule, is_land_rule, is_wall_retry,
         };
         let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
@@ -1750,6 +1761,14 @@ impl LandWalk {
                     base,
                     relanded: false,
                 };
+                // Land's instruction typed under another act's rule (a resume past a condition, or
+                // a compaction's owed continuation, before the instruction was given) starts the
+                // episode as Land's own act does, as the loop's `land_given` reads it.
+                let rule = if self.ep.is_none() && gives_land(text("command")) {
+                    RULE_LAND
+                } else {
+                    rule
+                };
                 self.ep = match (rule, self.ep) {
                     (RULE_USAGE_PROBE, ep) => ep,
                     (RULE_LAND, _) => Some(land(0, true, begun(0))),
@@ -1773,10 +1792,13 @@ impl LandWalk {
                             ..land(e.nudges, false, e.hold)
                         })
                     }
+                    // A resume past a condition goes on with what Land asked, as the loop judges
+                    // it ([`super::policy::turn_end::TurnEndState::acted`]).
                     (r, Some(e)) => Some(land(
                         e.nudges,
                         (e.cut && is_wall_retry(r))
-                            || (r == RULE_COMPACT && delivers_land(text("command"))),
+                            || (r == RULE_COMPACT && delivers_land(text("command")))
+                            || text("command").is_some_and(is_cleared_line),
                         e.hold,
                     )),
                     (_, None) => None,
@@ -2213,6 +2235,9 @@ pub struct RetryMark {
     pub attempts: usize,
     pub ups: usize,
     pub since_ms: i64,
+    /// The wall was read while the host measured the route down (` down=yes`; a row without the
+    /// field, as older books write, reads false).
+    pub down: bool,
 }
 
 const RETRY_LADDER: &str = "the wall's retries";
@@ -2250,8 +2275,11 @@ fn retry_mark(retry: Option<RetryMark>) -> String {
         _ => return String::new(),
     };
     format!(
-        " ({RETRY_LADDER}: {kind} attempts={} ups={} since={})",
-        r.attempts, r.ups, r.since_ms
+        " ({RETRY_LADDER}: {kind} attempts={} ups={} since={}{})",
+        r.attempts,
+        r.ups,
+        r.since_ms,
+        if r.down { " down=yes" } else { "" }
     )
 }
 
@@ -2291,6 +2319,11 @@ fn retry_mark_of(reason: &str) -> Option<RetryMark> {
         attempts: field("attempts")?.parse().ok()?,
         ups: field("ups")?.parse().ok()?,
         since_ms: field("since")?.parse().ok()?,
+        down: match field("down") {
+            None => false,
+            Some("yes") => true,
+            Some(_) => return None,
+        },
     })
 }
 
@@ -4174,6 +4207,7 @@ mod tests {
                 attempts: n,
                 ups: n / 2,
                 since_ms: 1_789_682_580_000 + i64::try_from(n).expect("small"),
+                down: n % 2 == 1,
             };
             let carried = Carried {
                 short: 2,
@@ -4222,6 +4256,7 @@ mod tests {
                     attempts: 3,
                     ups: 0,
                     since_ms: 7,
+                    down: false,
                 }),
                 said: Replies::default(),
                 said_reset_ms: None,
@@ -4237,6 +4272,35 @@ mod tests {
         );
         let garbled = format!("the turn-end policy ({RETRY_LADDER}: kind=overloaded attempts=x)");
         assert_eq!(retry_mark_of(&garbled), None);
+        // A wall read while the route was measured down says so; one read otherwise writes no
+        // field, as older books do, and reads it false.
+        let written = |down: bool| {
+            act_reason_after(
+                Carried {
+                    retry: Some(RetryMark {
+                        kind: WallKind::ApiError {
+                            code: None,
+                            retryable: true,
+                            cause: aterm_phase::ApiCause::CutOff,
+                        },
+                        attempts: 0,
+                        ups: 0,
+                        since_ms: 7,
+                        down,
+                    }),
+                    ..Carried::streak(0)
+                },
+                None,
+            )
+        };
+        assert!(written(true).contains(" down=yes)"), "{}", written(true));
+        assert!(!written(false).contains("down="), "{}", written(false));
+        assert_eq!(retry_mark_of(&written(true)).map(|m| m.down), Some(true));
+        assert_eq!(retry_mark_of(&written(false)).map(|m| m.down), Some(false));
+        assert_eq!(
+            retry_mark_of(&written(true).replace("down=yes", "down=1")),
+            None
+        );
     }
 
     /// v6 §14.5 (5a): the done checks of a Cruise run ride the streak seed's note beside the
@@ -4544,6 +4608,7 @@ mod tests {
             attempts,
             ups: 0,
             since_ms: 310_000,
+            down: false,
         };
         let point = |ts: i64, retry: Option<RetryMark>| {
             (
@@ -4639,6 +4704,7 @@ mod tests {
             attempts: 0,
             ups: 0,
             since_ms: 20_000,
+            down: false,
         };
         let point = |ts: i64, retry: Option<RetryMark>| {
             (
@@ -4833,6 +4899,7 @@ mod tests {
             attempts: 0,
             ups: 0,
             since_ms: 20_000,
+            down: false,
         };
         let point = |ts: i64, retry: Option<RetryMark>| -> R {
             (
@@ -5035,6 +5102,47 @@ mod tests {
         ] {
             assert!(ep(&rows).is_none_or(|e| !e.judged), "{name}");
         }
+    }
+
+    /// LAND'S INSTRUCTION TYPED AS A RESUME (v6 §14.17.5.1, §14.17.5.2): a resume past a
+    /// condition, or a compaction's owed continuation, before the instruction was given types the
+    /// instruction under its own rule, and the books a later loop seeds from start the episode
+    /// there, so that loop never types the instruction again.
+    #[test]
+    fn lands_instruction_typed_under_a_resumes_rule_starts_the_episode() {
+        use super::super::policy::turn_end::{
+            Cleared, Clearing, LAND, LAND_REMOTE_MAIN_BEFORE, Outage, RULE_COMPACT, RULE_LAND,
+            RULE_LIMIT_RESUME, RULE_OUTAGE_RESUME, cleared_text,
+        };
+        let sid = Some("@s-9");
+        let why = act_reason(None);
+        let ep = |rule: &str, command: &str| {
+            let row = Row {
+                rule_id: rule,
+                outcome: Outcome::Typed,
+                command,
+                reason: &why,
+                box_seq: 1,
+            };
+            land_episode_in(&format!("{}\n", row.to_json(10_000, sid)), sid)
+        };
+        let given = ep(RULE_LAND, LAND).expect("Land's own act");
+        for rule in [RULE_OUTAGE_RESUME, RULE_LIMIT_RESUME, RULE_COMPACT] {
+            let e = ep(rule, LAND).unwrap_or_else(|| panic!("{rule}: the episode"));
+            assert_eq!(e, given, "{rule}");
+            assert!(
+                e.landing && e.nudges == 0 && e.act.is_some(),
+                "{rule}: {e:?}"
+            );
+            assert_eq!(e.owed, Some(RULE_LAND), "{rule}");
+        }
+        assert!(
+            ep(RULE_OUTAGE_RESUME, LAND_REMOTE_MAIN_BEFORE).is_some(),
+            "a retired build's instruction"
+        );
+        // CONTROL: the outage's own line starts no episode.
+        let line = cleared_text(Cleared::Outage(Outage::Overload), Clearing::Blind);
+        assert_eq!(ep(RULE_OUTAGE_RESUME, line), None);
     }
 
     #[test]

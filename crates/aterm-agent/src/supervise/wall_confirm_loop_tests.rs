@@ -461,7 +461,7 @@ fn a_wall_the_transcript_confirms_is_acted_on() {
         }
         if name == "a 529" {
             assert!(
-                acts.iter().any(|a| a.ends_with(" overloaded retry 1")),
+                acts.iter().any(|a| a.ends_with(" waiting: API overload")),
                 "{name}: {acts:#?}"
             );
         }
@@ -3387,7 +3387,7 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
             (
                 "Stage 2 of 5 is in; stage 3 is next.",
                 TurnEndAction::Type {
-                    text: "keep going".to_string(),
+                    text: CLEARED.to_string(),
                     rule_id: RULE_LIMIT_RESUME,
                 },
                 false,

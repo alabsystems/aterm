@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HOST'S CHROME ON THE GRID, AS THE RESIDENT PET SEES IT. aterm paints some of its own chrome INTO grid cells after the pet has looked at the frame: the footer's one write (`claude_footer`: Claude Code's rule — its chips and facts — the harness card's line, and the Codex chips, which sit on the BLANK row Codex keeps over its status row) and the Autopilot menu.
+//! THE HOST'S CHROME ON THE GRID, AS THE RESIDENT PET SEES IT. aterm paints some of its own chrome INTO grid cells after the pet has looked at the frame: the footer's one write (`claude_footer`: Claude Code's rule — its chips and facts — the harness card's line, and the Codex chips, which sit on the BLANK row Codex keeps over its status row) and the Autopilot menu. Where that write rewrites a row of the program's (Claude Code's mode row), the words it lays are chrome and the rest of the row it blanks is glass ([`PetChrome::note_blanked`]): the pet, which read the program's cells, reads the program's letters under that blank as the nothing the person sees.
 
 use aterm_core::terminal::RenderCell;
 use aterm_effects::pet_world::PetRect;
@@ -21,6 +21,10 @@ pub(crate) struct PetChrome {
     /// and gathered the same way ([`PetChrome::note_overlay`]).
     held_overlays: Vec<PetRect>,
     next_overlays: Vec<PetRect>,
+    /// The glass the pass painted blank over the program's cells ([`PetChrome::note_blanked`]),
+    /// held and gathered the same way.
+    held_blanked: Vec<PetRect>,
+    next_blanked: Vec<PetRect>,
     /// The focused pane of this pass in frame cells `(row, col, rows, cols)`:
     /// a write outside it is another pane's, which the pet does not live in.
     pane: Option<(usize, usize, usize, usize)>,
@@ -48,10 +52,18 @@ impl PetChrome {
         &self.held_overlays
     }
 
+    /// The glass the pet takes as blank whatever the program drew under it, marked read the same
+    /// way ([`PetChrome::note_blanked`]; `aterm_effects::pet_world::PetReserve::blanked`).
+    pub(crate) fn held_blanked(&self) -> &[PetRect] {
+        self.read.set(true);
+        &self.held_blanked
+    }
+
     /// Start a pass over the focused pane at `pane` (frame cells `(row, col, rows, cols)`; `None`: no focused terminal pane, so nothing is noted).
     pub(crate) fn begin(&mut self, pane: Option<(usize, usize, usize, usize)>) {
         self.next.clear();
         self.next_overlays.clear();
+        self.next_blanked.clear();
         self.pane = pane;
         self.begun = true;
         self.next_over = None;
@@ -101,6 +113,16 @@ impl PetChrome {
         }
     }
 
+    /// A rewrite of the program's row painted blank glass over `cols` of its cells from frame
+    /// cell `(row, col)` (the tail of Claude Code's mode row past the words the rewrite laid, and
+    /// the row its effort hint wrapped to): the program's letters there are hidden, so the cells
+    /// are the pet's free glass, not chrome. Covering them hides nothing the person sees.
+    pub(crate) fn note_blanked(&mut self, row: usize, col: usize, cols: usize) {
+        if let Some(rect) = self.pane_local(row, col, 1, cols) {
+            self.next_blanked.push(rect);
+        }
+    }
+
     /// The part of a write inside the focused pane, pane-local.
     fn pane_local(&self, row: usize, col: usize, rows: usize, cols: usize) -> Option<PetRect> {
         let (pr, pc, prows, pcols) = self.pane?;
@@ -121,11 +143,14 @@ impl PetChrome {
         if !std::mem::take(&mut self.begun) {
             return false;
         }
-        let moved = self.next != self.held || self.next_overlays != self.held_overlays;
+        let moved = self.next != self.held
+            || self.next_overlays != self.held_overlays
+            || self.next_blanked != self.held_blanked;
         self.held_over = self.next_over;
         if moved {
             std::mem::swap(&mut self.next, &mut self.held);
             std::mem::swap(&mut self.next_overlays, &mut self.held_overlays);
+            std::mem::swap(&mut self.next_blanked, &mut self.held_blanked);
         }
         self.pane = None;
         moved && self.read.replace(false)
@@ -208,6 +233,51 @@ mod tests {
         chrome.note(28, 0, 1, 100);
         assert!(chrome.commit(), "the menu closed: owed again");
         assert!(chrome.held_overlays().is_empty());
+    }
+
+    /// THE BLANKED GLASS IS HELD APART FROM THE CHROME: a rewrite's blank tail noted as blanked
+    /// is never in [`PetChrome::held`] (ground the pet may stand on, not the host's ink), it is
+    /// kept pane-local and clipped like a write, and a pass where only it moves owes a pet that
+    /// read the old sets a frame.
+    #[test]
+    fn blanked_glass_is_held_apart_from_the_chrome_and_its_move_owes_a_frame() {
+        let pane = Some((1, 10, 30, 100));
+        let mut chrome = PetChrome::default();
+        chrome.begin(pane);
+        chrome.note(29, 10, 1, 17);
+        chrome.note_blanked(29, 27, 60);
+        chrome.note_blanked(30, 10, 200);
+        let _ = chrome.commit();
+        assert_eq!(chrome.held(), [PetRect::new(28.0, 0.0, 1.0, 17.0)]);
+        assert_eq!(
+            chrome.held_blanked(),
+            [
+                PetRect::new(28.0, 17.0, 1.0, 60.0),
+                PetRect::new(29.0, 0.0, 1.0, 100.0)
+            ]
+        );
+        chrome.begin(pane);
+        chrome.note(29, 10, 1, 17);
+        chrome.note_blanked(29, 27, 60);
+        chrome.note_blanked(30, 10, 200);
+        assert!(!chrome.commit(), "a still pass owes nothing");
+        chrome.begin(pane);
+        chrome.note(29, 10, 1, 17);
+        chrome.note_blanked(29, 30, 57);
+        chrome.note_blanked(30, 10, 200);
+        assert!(chrome.commit(), "the blank moved under a pet that read it");
+        assert_eq!(chrome.held()[0], PetRect::new(28.0, 0.0, 1.0, 17.0));
+        assert_eq!(
+            chrome.held_blanked()[0],
+            PetRect::new(28.0, 20.0, 1.0, 57.0)
+        );
+        chrome.begin(None);
+        chrome.note_blanked(29, 27, 60);
+        assert!(chrome.commit());
+        assert!(
+            chrome.held_blanked().is_empty(),
+            "no focused pane: nothing noted"
+        );
     }
 
     /// THE HELD CHROME NAMES THE FRAME IT WAS PAINTED OVER: the pet reads it over the next

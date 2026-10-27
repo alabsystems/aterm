@@ -336,6 +336,7 @@ impl MomentumGlowSnapshot {
     /// the hosted profile, checked in the order listed below, naming the first one broken.
     /// # Errors
     /// [`SnapshotRefusal::RateValue`], [`SnapshotRefusal::RateStamp`], [`SnapshotRefusal::Latched`], [`SnapshotRefusal::Latch`], [`SnapshotRefusal::Fingerprint`], [`SnapshotRefusal::HotWithoutRate`], [`SnapshotRefusal::Tau`], [`SnapshotRefusal::History`] or [`SnapshotRefusal::Horizon`].
+    #[inline]
     pub const fn validate(&self) -> Result<(), SnapshotRefusal> {
         let one = 1.0f32.to_bits();
         let credited = MOMENTUM_GLOW_KEY_CREDIT.to_bits();
@@ -435,6 +436,7 @@ impl MomentumGlow {
     /// The engine's semantic state, with every instant as a signed offset from `epoch`.
     /// # Errors
     /// [`SnapshotRefusal::OffsetUnrepresentable`], which no std `Instant` pair reaches (an `i128` holds every `Duration`'s nanoseconds).
+    #[inline]
     pub fn snapshot(&self, epoch: Instant) -> Result<MomentumGlowSnapshot, SnapshotRefusal> {
         let rate_at = match self.rate.at {
             Some(at) => Some(offset_from(epoch, at, SnapshotField::RateAt)?),
@@ -460,6 +462,7 @@ impl MomentumGlow {
     /// Any of [`MomentumGlowSnapshot::validate`]'s refusals, or [`SnapshotRefusal::Instant`] when
     /// an offset lands outside the `Instant` range, or a stamp's settle schedule
     /// (`stamp + τ·ln 255 + SETTLE_MARGIN`) would.
+    #[inline]
     pub fn restore(s: &MomentumGlowSnapshot, epoch: Instant) -> Result<Self, SnapshotRefusal> {
         const LN_255: f32 = crate::color_math::ln_pos_f32(255.0);
         s.validate()?;
@@ -504,6 +507,7 @@ impl MomentumGlow {
 }
 
 /// `t − epoch` in signed nanoseconds.
+#[inline]
 fn offset_from(epoch: Instant, t: Instant, field: SnapshotField) -> Result<i128, SnapshotRefusal> {
     let refused = SnapshotRefusal::OffsetUnrepresentable { field };
     if let Some(after) = t.checked_duration_since(epoch) {
@@ -527,6 +531,7 @@ fn offset_from(epoch: Instant, t: Instant, field: SnapshotField) -> Result<i128,
 }
 
 /// `epoch + offset` with checked instant arithmetic.
+#[inline]
 fn instant_at(
     epoch: Instant,
     offset: i128,

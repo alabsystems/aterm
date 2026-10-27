@@ -149,6 +149,17 @@ path = "examples/objc_window_drive.rs"
 name = "objc_event_drive"
 path = "examples/objc_event_drive.rs"
 
+# `lab trail-diff`'s dump (docs/design/PRISM-GLASS.md §15.1 P0.4, §15.7.2): runs `.trail`
+# scripts on the app's own frame (the headless test App through the windowless capture path,
+# at an injected clock) and prints each frame's stream, pixel, deadline, sound and state words.
+# Its script grammar and printer (`examples/support/trail_script.rs`) are tested by
+# `src/trail_dump_tests.rs`; by hand it is
+# `targo --unverified run -p aterm-gui --features bench-support --example trail_dump -- <script.trail>...`.
+[[example]]
+name = "trail_dump"
+path = "examples/trail_dump.rs"
+required-features = ["bench-support"]
+
 [features]
 # Accessibility delivery is native and unconditional on supported platforms:
 # macOS NSAccessibility, Linux AT-SPI and Windows UIA use one semantic tree.
@@ -206,6 +217,9 @@ aterm-effects = { workspace = true }
 # The `aos` verb's refusals, witness and trace decode (the momentum glow's Aos
 # boundary). Not a new edge in the BUILD graph: `aterm-effects` above links it.
 aterm-aos = { workspace = true }
+# The pane as an Aos task (`rewind check`, a pane trace under `aos check`): a Rewind chain
+# replayed step by step under `pane.faithful-replay`.
+aterm-aos-pane = { workspace = true }
 # The predictive-echo state machine (shared with the web embedders), aliased as
 # `crate::predict`.
 aterm-predict = { workspace = true }
@@ -470,19 +484,6 @@ aterm-wayland = { workspace = true }
 # Notify over the session bus, through the first-party blocking client — no
 # libnotify, no `notify-send` subprocess.
 aterm-dbus = { workspace = true }
-
-[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))'.dependencies]
-# aterm-window's raw-window-handle traits, for the GPU window surface
-# (`aterm_gpu::WindowTarget`) on the BSDs, which present on wgpu and have no cell.
-# `rwh_06` is not an aterm-window default: on macOS the Metal presenter and the
-# AppKit chrome take the content view through first-party `aterm_objc::HasNsView`;
-# on Linux the GL arm and the X11 and Wayland CPU presenters, and on Windows the
-# D3D11 arm, the GDI CPU presenter (`present/win32.rs`) and the other Win32 HWND
-# reads, take the window's handles through first-party
-# `aterm_types::native_window::HasNativeWindow`. So raw-window-handle is out of
-# every cell's graph (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6;
-# mac-arm, linux and win each -1 package, -1,984 lines).
-aterm-window = { workspace = true, features = ["rwh_06"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
 # Shared semantic model and target-native publisher; macOS does not load D-Bus.

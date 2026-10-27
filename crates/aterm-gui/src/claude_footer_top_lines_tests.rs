@@ -224,20 +224,11 @@ fn a_slab_left_by_a_theme_change_keeps_its_letters_readable() {
         "the switch's first letter reads {:.2}",
         reads(first)
     );
-    let off = SwitchPaint {
-        face: HarnessSwitch::Off(SwitchOff::Master),
-        hover: false,
-        version: None,
-    };
-    let quiet = switch_cell(
-        'a',
-        SwitchInk::Label,
-        off,
-        None,
-        run.rule,
-        [0x1a, 0x7f, 0x37],
-    )
-    .fg;
+    let off = SwitchPaint::bare(
+        HarnessSwitch::Off(SwitchOff::Master),
+        Some(aterm_phase::CliHarness::ClaudeCode),
+    );
+    let quiet = FaceInks::of(&off, None, run.rule, [0x1a, 0x7f, 0x37]).muted;
     assert!(
         reads(quiet) >= aterm_effects::cli_marks::NAME_CONTRAST,
         "the quiet label reads {:.2}",
@@ -275,7 +266,6 @@ fn the_switchs_accent_reads_on_a_slab_the_theme_did_not_choose() {
         "{:?}",
         switch.face
     );
-    let button = switch.button.clone().expect("the off switch's button");
     let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
     let reads = |a: [u8; 3], b: [u8; 3]| contrast_ratio(pack(a), pack(b));
     let accent = crate::chrome_band::band_colors(app.theme).accent;
@@ -285,42 +275,32 @@ fn the_switchs_accent_reads_on_a_slab_the_theme_did_not_choose() {
         reads(accent, SLAB)
     );
     let cells = &pane_cells(&app, wid)[PAD];
-    let mut track_letters = 0;
-    for (idx, c) in cells[button.clone()].iter().enumerate() {
-        if idx == 0 {
-            assert_eq!(c.bg, SLAB, "track cap sits on the slab");
-        } else if c.ch.is_alphabetic() {
-            track_letters += 1;
-            assert!(
-                reads(c.fg, c.bg) >= floor,
-                "{:?}: unselected `on` track letter {:.2} on its track",
-                c.ch,
-                reads(c.fg, c.bg)
-            );
-        }
-    }
-    assert_eq!(track_letters, 2, "the unselected `on` segment");
-    let mut thumb_letters = 0;
-    for c in &cells[switch.switch.clone()] {
-        if c.ch == '\u{2590}' || c.ch == '\u{258c}' {
-            assert!(
-                reads(c.fg, SLAB) >= floor,
-                "{:?}: an off-thumb cap {:.2} on the slab",
-                c.ch,
-                reads(c.fg, SLAB)
-            );
-        } else if c.ch != ' ' {
-            thumb_letters += 1;
-            assert!(
-                reads(c.bg, SLAB) >= floor && reads(c.fg, c.bg) >= floor,
-                "{:?}: the off thumb {:.2} on the slab, its glyph {:.2} on it",
-                c.ch,
-                reads(c.bg, SLAB),
-                reads(c.fg, c.bg)
-            );
-        }
-    }
-    assert_eq!(thumb_letters, 4, "the `○ off` thumb");
+    let reads_on_slab = |c: &RenderCell, what: &str| {
+        assert_eq!(c.bg, SLAB, "{what} {:?}: on the slab", c.ch);
+        assert!(
+            reads(c.fg, SLAB) >= floor,
+            "{what} {:?}: {:.2} on the slab",
+            c.ch,
+            reads(c.fg, SLAB)
+        );
+    };
+    let letters = |range: std::ops::Range<usize>, what: &str| {
+        cells[range]
+            .iter()
+            .filter(|c| c.ch != ' ')
+            .inspect(|c| reads_on_slab(c, what))
+            .count()
+    };
+    assert_eq!(
+        letters(switch.cols.clone(), "the switch"),
+        4,
+        "the `○ off` switch"
+    );
+    let label = switch.label.clone().expect("the label");
+    assert!(
+        letters(label, "the label") >= "alabv0.4".len(),
+        "the label read"
+    );
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\n"),
     );
@@ -329,25 +309,11 @@ fn the_switchs_accent_reads_on_a_slab_the_theme_did_not_choose() {
     let on_switch = switch_of(&app, wid, session).expect("codex-alab's lit switch");
     assert_eq!(on_switch.face, HarnessSwitch::On);
     let on_cells = &pane_cells(&app, wid)[PAD];
-    let cap = on_cells[on_switch.switch.clone()]
+    for c in on_cells[on_switch.cols.clone()]
         .iter()
-        .position(|c| c.ch == '\u{2590}')
-        .expect("lit pill cap");
-    for c in &on_cells[on_switch.switch.start + cap..on_switch.switch.end] {
-        if c.ch == '\u{2590}' || c.ch == '\u{258c}' {
-            assert!(
-                reads(c.fg, SLAB) >= floor,
-                "{:?}: lit cap on the slab",
-                c.ch
-            );
-        } else if c.ch != ' ' {
-            assert!(
-                reads(c.bg, SLAB) >= floor && reads(c.fg, c.bg) >= floor,
-                "{:?}: lit accent thumb {:.2} on the slab",
-                c.ch,
-                reads(c.bg, SLAB)
-            );
-        }
+        .filter(|c| c.ch != ' ')
+    {
+        reads_on_slab(c, "the lit switch");
     }
 }
 
@@ -411,6 +377,7 @@ fn codex_gets_a_switch_only_as_codex_alab() {
     let (mut app, wid, session) = pane_of(24, 100, "codex");
     let _host = hosted(&mut app);
     let (mut lockups, mut alab_names) = (0, 0);
+    let mut cruise_alab = None;
     for cols in 20..=160usize {
         assert!(app.apply_term_resize(wid, 24, cols as u16));
         bytes(&app, session, codex_screen(cols, Some(SLAB)).as_bytes());
@@ -465,45 +432,39 @@ fn codex_gets_a_switch_only_as_codex_alab() {
             .find(|m| m.session == session)
             .map(|m| m.cols.clone())
             .unwrap_or_default();
+        // The harness's cells: its switch, its label and the close's blank.
+        let harness =
+            switch.cols.start..switch.label.as_ref().map_or(switch.cols.end, |l| l.end) + 1;
         for (c, cell) in after[PAD].iter().enumerate() {
-            if !lockup.contains(&c) && !switch.cols.contains(&c) {
+            if !lockup.contains(&c) && !harness.contains(&c) {
                 assert_eq!(*cell, before[PAD][c], "{cols}: column {c} untinted");
             }
         }
-        let slice = &after[PAD][switch.switch.clone()];
-        let cap = slice.iter().position(|c| c.ch == '\u{2590}');
-        let glyphs: Vec<&RenderCell> = slice[..cap.unwrap_or(slice.len())]
-            .iter()
-            .filter(|c| c.ch != ' ')
-            .collect();
-        let n = glyphs.len();
-        for (k, c) in glyphs.iter().enumerate() {
-            let t = if n > 1 { k * 255 / (n - 1) } else { 0 };
-            let want = brand_letter_fg(
-                CardPalette::Cruise,
-                f32::from(u8::try_from(t).expect("a stop")) / 255.0,
-                slab,
-            );
-            assert!(
-                c.fg == want && c.bold && c.bg == SLAB,
-                "{cols}: glyph {k} ({:?}) on Cruise's arc",
-                c.ch
-            );
+        for c in &after[PAD][harness.clone()] {
+            assert_eq!(c.bg, SLAB, "{cols}: {:?} on the slab", c.ch);
         }
-        if let Some(cap) = cap {
-            let pill: String = slice[cap..].iter().map(|c| c.ch).collect();
-            assert_eq!(pill, "\u{2590} \u{25cf} on \u{258c}", "{cols}: lit thumb");
+        assert!(
+            after[PAD][switch.cols.clone()].iter().all(|c| !c.bold),
+            "{cols}: the lit switch's word, never bold"
+        );
+        if let Some(label) = &switch.label {
+            let alab = &after[PAD][label.start..label.start + 4];
+            assert!(
+                alab.iter().map(|c| c.ch).eq("alab".chars()) && alab.iter().all(|c| c.bold),
+                "{cols}: the label's `alab`, bold: {alab:?}"
+            );
+            cruise_alab = Some(alab[0].fg);
         }
         let line = glass_chars(&app, wid, PAD);
+        let lockup_text: String = line.chars().take(lockup.end).collect();
         assert!(
-            !line.contains(" codex "),
-            "{cols}: codex-alab never reads the vendor's name: {line:?}"
+            !lockup_text.contains(" codex "),
+            "{cols}: codex-alab's lockup never reads the vendor's name: {line:?}"
         );
         if cols >= 55 {
             assert!(
                 line.starts_with("      codex-alab ")
-                    && line
-                        .contains(" alab harness v0.1 \u{2590} \u{25cf} on \u{258c} off \u{258c} "),
+                    && line.contains(&format!("{LIT_SWITCH} alab ")),
                 "{cols}: {line:?}"
             );
             let ground = u32::from_be_bytes([0, slab.bg[0], slab.bg[1], slab.bg[2]]);
@@ -550,29 +511,20 @@ fn codex_gets_a_switch_only_as_codex_alab() {
     assert!(app.apply_term_resize(wid, 24, 100));
     bytes(&app, session, codex_screen(100, Some(SLAB)).as_bytes());
     refill(&mut app, wid);
-    let slab = pane_cells(&app, wid)[PAD][0];
     let _ = pass(&mut app, wid);
     let switch = switch_of(&app, wid, session).expect("CONTROL: admitted, a switch");
     assert_eq!(switch.face, HarnessSwitch::On, "CONTROL");
     let cells = &pane_cells(&app, wid)[PAD];
-    let lit = cells[switch.switch.clone()]
+    let lit = cells[switch.cols.clone()]
         .iter()
         .find(|c| c.ch == '\u{25cf}')
         .expect("CONTROL: the lit state");
-    let mark_fg = crate::chrome_band::band_colors(app.theme).accent;
-    assert_eq!(
-        (lit.bg, lit.fg),
-        (mark_fg, SLAB),
-        "CONTROL: bare, lit `● on` thumb wears the accent"
-    );
-    let first = cells[switch.switch.clone()]
-        .iter()
-        .find(|c| c.ch != ' ')
-        .expect("CONTROL: the label");
+    assert_eq!(lit.bg, SLAB, "CONTROL: the switch's mark keeps the slab");
+    let label = switch.label.clone().expect("CONTROL: the label");
     assert_ne!(
-        first.fg,
-        brand_letter_fg(CardPalette::Cruise, 0.0, slab),
-        "CONTROL: bare, no glyph on the arc"
+        Some(cells[label.start].fg),
+        cruise_alab,
+        "CONTROL: bare, `alab` is not Cruise's"
     );
     assert!(
         glass_chars(&app, wid, PAD).starts_with("      codex-alab "),
@@ -601,7 +553,9 @@ fn the_pet_holds_codexs_lockup_and_switch_never_the_pad_between() {
                 .find(|m| m.session == session)
                 .map(|m| m.cols.clone())
                 .expect("the lockup on the slab");
-            let switch = switch_of(&app, wid, session).map(|s| s.cols);
+            // The harness's cells: its switch, its label and the close's blank.
+            let switch = switch_of(&app, wid, session)
+                .map(|s| s.cols.start..s.label.as_ref().map_or(s.cols.end, |l| l.end) + 1);
             assert_eq!(switch.is_some(), proven, "{cols}: a switch for codex-alab");
             let held = app.windows[&wid].pet_chrome.held().to_vec();
             let covered = |col: usize| {
@@ -619,7 +573,7 @@ fn the_pet_holds_codexs_lockup_and_switch_never_the_pad_between() {
             let wrong: Vec<usize> = (0..cols).filter(|&c| covered(c) != ours(c)).collect();
             assert!(
                 wrong.is_empty(),
-                "{cols}, proven {proven}: lockup {lockup:?}, switch {switch:?}: columns \
+                "{cols}, proven {proven}: lockup {lockup:?}, harness {switch:?}: columns \
                  held other than the host's marks, or marks not held: {wrong:?}"
             );
             if let Some(s) = &switch {
@@ -712,17 +666,13 @@ fn a_sent_message_is_never_codexs_top_line() {
     );
 }
 
-const LIT: SwitchPaint = SwitchPaint {
-    face: HarnessSwitch::On,
-    hover: false,
-    version: None,
-};
+const LIT: SwitchPaint =
+    SwitchPaint::bare(HarnessSwitch::On, Some(aterm_phase::CliHarness::ClaudeCode));
 
-const OFF: SwitchPaint = SwitchPaint {
-    face: HarnessSwitch::Off(SwitchOff::Master),
-    hover: false,
-    version: None,
-};
+const OFF: SwitchPaint = SwitchPaint::bare(
+    HarnessSwitch::Off(SwitchOff::Master),
+    Some(aterm_phase::CliHarness::ClaudeCode),
+);
 
 fn plain_run(len: usize) -> TopRun {
     TopRun {
@@ -734,6 +684,8 @@ fn plain_run(len: usize) -> TopRun {
             ..RenderCell::default()
         },
         voice: None,
+        tail: None,
+        end: 2 + len,
     }
 }
 
@@ -855,12 +807,14 @@ fn the_hover_title_never_moves_the_switch() {
                     &mut rest,
                     Some(version),
                     None,
+                    &[],
                 );
                 compose_top(
                     &lockup_key(lockup, run, switch, palette, true),
                     &mut hovered,
                     Some(version),
                     None,
+                    &[],
                 );
                 keeps_the_layout(&rest, &hovered, run).unwrap_or_else(|e| panic!("{at}: {e}"));
                 let full = rest.lockup.len() == mark.lockup_cells(build);
@@ -873,7 +827,12 @@ fn the_hover_title_never_moves_the_switch() {
                     mark.name(build),
                     "{at}: at rest, the name"
                 );
-                let tier = rest.switch.as_ref().map(|s| s.tier);
+                // A rung is whether the switch stands and the label's tier: a narrower label
+                // leaves the title more room.
+                let tier = rest
+                    .switch
+                    .as_ref()
+                    .map(|s| s.label.as_ref().map(|(_, t)| *t));
                 if rung != Some(tier) {
                     (last, rung) = (2, Some(tier));
                 }
@@ -888,6 +847,7 @@ fn the_hover_title_never_moves_the_switch() {
                     &mut loose,
                     Some(version),
                     None,
+                    &[],
                     0,
                 );
                 if keeps_the_layout(&rest, &loose, run).is_err() {
@@ -983,8 +943,8 @@ fn hover_title_on_the_glass() {
     assert_ne!(fp_rest, fp_hover, "the hover is in the repaint key");
     let hovered = glass_chars(&app, wid, top);
     assert!(
-        hovered.contains("    Claude Code 2.1.283 \u{2500}\u{2500}"),
-        "the title: {hovered:?}"
+        hovered.contains("    Claude Code \u{2500}\u{2500}") && hovered.contains("(v2.1.283)"),
+        "the title, its version on the label: {hovered:?}"
     );
     assert_eq!(
         switch_of(&app, wid, session).map(|b| b.cols),
@@ -1095,7 +1055,7 @@ fn a_regrid_hit_tests_the_glass_it_lands_on() {
         next_frame(&mut app, wid);
     }
     let laid = switch_of(&app, wid, session).expect("the switch");
-    let on = (laid.frame_row, laid.switch.start + laid.switch.len() / 2);
+    let on = (laid.frame_row, laid.cols.start + laid.cols.len() / 2);
     assert_eq!(
         point_at(&mut app, wid, on),
         OverChips::Chip,
@@ -1266,19 +1226,16 @@ fn a_regrid_brings_the_hover_title_under_a_still_pointer() {
     next_frame(&mut app, wid);
     let titled = glass_chars(&app, wid, top + 2);
     assert!(
-        titled.contains("    Claude Code 2.1.283 \u{2500}\u{2500}"),
-        "the title: {titled:?}"
+        titled.contains("    Claude Code \u{2500}\u{2500}"),
+        "the title, its version on the label: {titled:?}"
     );
 }
 
-/// AGY'S LIT SWITCH IS ONE SWITCH (review 13): agy's lit face, `alab
-/// harness v0.1 ▐ ● on ▌`, draws its state as a pill, and the pill is the
-/// switch's own cells, never the off face's `on` button. A screen reader
-/// meets one `Role::Switch` over the words and the pill, toggled on and
-/// named as drawn, and its press does what a click on the pill does: the
-/// whole harness turns off (`harness.enabled = false`, no Autopilot word).
-/// NEGATIVE CONTROL: once that reads back, the off face keeps its `on`
-/// button, a second node named for what a press on it does.
+/// AGY'S LIT SWITCH IS ONE SWITCH (review 13): agy's lit switch, ` ● on `, draws its state
+/// as its mark and word. A screen reader meets one `Role::Switch` over those cells, toggled on
+/// and named as drawn, and its press does what a click on them does: the whole harness turns
+/// off (`harness.enabled = false`, no Autopilot word). NEGATIVE CONTROL: once that reads back,
+/// the off face is one switch too, toggled off.
 #[cfg(a11y_tree)]
 #[test]
 fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
@@ -1298,17 +1255,16 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
     let nodes = |app: &App| -> Vec<crate::a11y_tree::GridChip> {
         app.claude_chips_a11y(wid)
             .into_iter()
-            .filter(|c| matches!(c.chip, HarnessChip::Switch | HarnessChip::SwitchOn))
+            .filter(|c| c.chip == HarnessChip::Switch)
             .collect()
     };
     let b = switch_of(&app, wid, session).expect("agy's switch");
     assert_eq!(b.face, HarnessSwitch::On, "CONTROL: agy carried, lit");
-    let drawn: String = app.windows[&wid].input_scratch.cells[b.frame_row][b.switch.clone()]
+    let drawn: String = app.windows[&wid].input_scratch.cells[b.frame_row][b.cols.clone()]
         .iter()
         .map(|c| c.ch)
         .collect();
-    assert_eq!(drawn, "alab harness v0.1 \u{2590} \u{25cf} on \u{258c}");
-    assert_eq!(b.button, None, "a lit switch has no `on` button");
+    assert_eq!(drawn, " \u{25cf} on ");
     let lit = nodes(&app);
     assert_eq!(lit.len(), 1, "{lit:?}");
     assert_eq!(
@@ -1316,11 +1272,12 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
         (
             HarnessChip::Switch,
             Some(Toggled::True),
-            b.switch.start,
-            b.switch.len()
+            b.cols.start,
+            b.cols.len()
         )
     );
-    assert_eq!(lit[0].label, "alab harness v0.1 on");
+    let label = harness_label(aterm_phase::CliHarness::Agy);
+    assert_eq!(lit[0].label, format!("{label} on"));
     let carried = app.session_autopilot(session).1;
     assert!(
         matches!(carried, AutopilotView::Cruise | AutopilotView::Land),
@@ -1338,7 +1295,7 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
         .records()
         .rfind(|r| r.key.as_deref() == Some("harness.switch-save.harness.enabled"))
         .map(|r| r.detail.join(" "))
-        .expect("the reader's press is the pill's click: the master switch's write");
+        .expect("the reader's press is the switch's click: the master switch's write");
     assert!(wrote.contains("harness.enabled = false"), "{wrote:?}");
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
@@ -1352,28 +1309,20 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
         off.iter()
             .map(|n| (n.chip, n.toggled, n.label.as_str()))
             .collect::<Vec<_>>(),
-        [
-            (
-                HarnessChip::Switch,
-                Some(Toggled::False),
-                "alab harness v0.1 off"
-            ),
-            (
-                HarnessChip::SwitchOn,
-                None,
-                "on: turn the harness on (Supervise coding agents)"
-            ),
-        ],
-        "NEGATIVE CONTROL: the off face's `on` button"
+        [(
+            HarnessChip::Switch,
+            Some(Toggled::False),
+            format!("{label} off").as_str()
+        )],
+        "NEGATIVE CONTROL: the off face is one switch, toggled off"
     );
 }
 
-/// AGY'S LIT PILL WEARS THE WHITE UNDER AUTOPILOT OFF: on the white line (`CardPalette::Off`)
-/// the versioned switch's `▐ ● on ▌` is drawn in the moonbow's white like the words before it,
-/// one white under the pill's letters and in its caps. CONTROL: under Cruise the pill keeps agy's
-/// accent.
+/// AGY'S LABEL WEARS THE WHITE UNDER AUTOPILOT OFF: on the white line (`CardPalette::Off`) the
+/// label's `alab` is drawn bold in the moonbow's white like the rule it closes, and the switch's
+/// words keep the pane's inks. CONTROL: under Cruise `alab` keeps the arc's end.
 #[test]
-fn agys_lit_pill_wears_the_white_under_autopilot_off() {
+fn agys_label_wears_the_white_under_autopilot_off() {
     let rows = fixture_rows(include_str!(
         "../../aterm-phase/src/fixtures/agy-1.4.0-idle.txt"
     ));
@@ -1387,43 +1336,41 @@ fn agys_lit_pill_wears_the_white_under_autopilot_off() {
         }
     };
     settle(&mut app);
-    let pill = |app: &App| -> Vec<RenderCell> {
+    let read = |app: &App| -> (Vec<RenderCell>, Vec<RenderCell>) {
         let b = switch_of(app, wid, session).expect("agy's switch");
         assert_eq!(b.face, HarnessSwitch::On, "lit");
-        let cells = &app.windows[&wid].input_scratch.cells[b.frame_row][b.switch.clone()];
-        let cap = cells
-            .iter()
-            .position(|c| c.ch == '\u{2590}')
-            .expect("the pill's cap");
-        cells[cap..].to_vec()
+        let row = &app.windows[&wid].input_scratch.cells[b.frame_row];
+        let label = b.label.clone().expect("the label");
+        (
+            row[label.start..label.start + 4].to_vec(),
+            row[b.cols.clone()].to_vec(),
+        )
     };
-    let cruise = pill(&app);
+    let (cruise, cruise_switch) = read(&app);
     assert!(app.set_session_autopilot(
         session,
         Some(aterm_agent::supervise::Autopilot::Off),
         crate::autopilot::Surface::Chip
     ));
     settle(&mut app);
-    let white = pill(&app);
+    let (white, switch) = read(&app);
+    assert_eq!(white.iter().map(|c| c.ch).collect::<String>(), "alab");
+    for c in &white {
+        let spread = c.fg.iter().max().unwrap() - c.fg.iter().min().unwrap();
+        assert!(
+            c.bold && spread <= 24,
+            "{:?} is white and bold: {:?}",
+            c.ch,
+            c.fg
+        );
+    }
     assert_eq!(
-        white.iter().map(|c| c.ch).collect::<String>(),
-        "\u{2590} \u{25cf} on \u{258c}"
+        switch, cruise_switch,
+        "the switch's words keep the pane's inks"
     );
-    let (caps, inside) = (
-        [white[0], white[white.len() - 1]],
-        &white[1..white.len() - 1],
-    );
-    let fill = inside[0].bg;
-    let spread = fill.iter().max().unwrap() - fill.iter().min().unwrap();
-    assert!(spread <= 24, "the pill's fill is white: {fill:?}");
-    assert!(
-        inside.iter().all(|c| c.bg == fill),
-        "one fill under the pill's letters: {inside:?}"
-    );
-    assert_eq!(caps.map(|c| c.fg), [fill, fill], "its caps the same white");
     assert_ne!(
-        cruise[1].bg, fill,
-        "CONTROL: under Cruise the pill wears the accent"
+        cruise[0].fg, white[0].fg,
+        "CONTROL: under Cruise `alab` keeps the arc's end"
     );
 }
 
@@ -1464,12 +1411,12 @@ fn another_clis_account_chip_never_names_the_row_claude_codes_roster_judges() {
     assert_eq!(account(&app), "Codex CLI");
 }
 
-/// EVERY CLI HARNESS SHARES THE VERSIONED TWO-STATE SEGMENTED SWITCH: Claude Code, Antigravity,
-/// Muse Code and `codex-alab` all paint ` alab harness v0.1 ▐ ● on ▌ off ▌ ` when lit and
-/// ` alab harness v0.1 ▐ on ▐ ○ off ▌ ` when off, with identical narrow-column tiers, and when off
-/// neither segment wears the theme's active green accent.
+/// EVERY CLI HARNESS SHARES THE SWITCH AND ITS LABEL: Claude Code, Antigravity, Muse Code and
+/// `codex-alab` all paint ` ● on ` when lit and ` ○ off ` when off, ending in the same cell, each
+/// followed by its own label (`alab <cli> harness v0.4`), every cell on the line's ground, the
+/// switch never bold; when off no cell wears the theme's active green accent.
 #[test]
-fn every_cli_harness_shares_the_versioned_segmented_switch_and_never_glows_green_when_off() {
+fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {
     let agy_rows = fixture_rows(include_str!(
         "../../aterm-phase/src/fixtures/agy-1.4.0-idle.txt"
     ));
@@ -1524,38 +1471,40 @@ fn every_cli_harness_shares_the_versioned_segmented_switch_and_never_glows_green
                 let _ = pass(app, wid);
             }
         };
+        let harness = match prog {
+            "claude" => aterm_phase::CliHarness::ClaudeCode,
+            "agy" => aterm_phase::CliHarness::Agy,
+            "muse" => aterm_phase::CliHarness::Muse,
+            _ => aterm_phase::CliHarness::CodexAlab,
+        };
+        let read = |app: &App, b: &crate::claude_lights::BorderSwitch, want: &str| {
+            let row = &app.windows[&wid].input_scratch.cells[b.frame_row];
+            let ground = row[b.cols.start - 1].bg;
+            let face: String = row[b.cols.clone()].iter().map(|c| c.ch).collect();
+            assert_eq!(face, want, "{prog}: the switch");
+            let label = b
+                .label
+                .clone()
+                .unwrap_or_else(|| panic!("{prog}: the label"));
+            let words: String = row[label.clone()].iter().map(|c| c.ch).collect();
+            assert!(
+                words.starts_with(&harness_label(harness)),
+                "{prog}: the label {words:?}"
+            );
+            for c in &row[b.cols.start..label.end] {
+                assert_eq!(c.bg, ground, "{prog}: {:?} on the line's ground", c.ch);
+            }
+            assert!(
+                row[b.cols.clone()].iter().all(|c| !c.bold),
+                "{prog}: the switch, never bold"
+            );
+            row[b.cols.start..label.end].to_vec()
+        };
 
         settle(&mut app);
         let on = switch_of(&app, wid, session).unwrap_or_else(|| panic!("{prog}: lit switch"));
-        assert_eq!(
-            (on.face, on.button.clone()),
-            (HarnessSwitch::On, None),
-            "{prog}"
-        );
-        let on_row = &app.windows[&wid].input_scratch.cells[on.frame_row];
-        let on_face: String = on_row[on.cols.clone()].iter().map(|c| c.ch).collect();
-        assert_eq!(
-            on_face, " alab harness v0.1 \u{2590} \u{25cf} on \u{258c} off \u{258c} ",
-            "{prog}: unified versioned segmented ON face"
-        );
-        let on_cap = on_row[on.switch.clone()]
-            .iter()
-            .position(|c| c.ch == '\u{2590}')
-            .expect("on thumb cap");
-        let on_thumb_bg = on_row[on.switch.start + on_cap + 1].bg;
-        let off_track_bg = on_row[on.switch.end + 1].bg;
-        assert_eq!(
-            on_thumb_bg, green_accent,
-            "{prog}: when ON, the `on` thumb wears the active accent"
-        );
-        assert_ne!(
-            off_track_bg, green_accent,
-            "{prog}: when ON, the `off` track segment is unselected, never active green"
-        );
-        assert!(
-            off_track_bg[1].abs_diff(off_track_bg[0]) <= 12,
-            "{prog}: unselected `off` track stays neutral: {off_track_bg:?}"
-        );
+        assert_eq!(on.face, HarnessSwitch::On, "{prog}");
+        let _ = read(&app, &on, LIT_SWITCH);
 
         app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
             crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
@@ -1563,37 +1512,92 @@ fn every_cli_harness_shares_the_versioned_segmented_switch_and_never_glows_green
         settle(&mut app);
         let off = switch_of(&app, wid, session).unwrap_or_else(|| panic!("{prog}: off switch"));
         assert_eq!(off.face, HarnessSwitch::Off(SwitchOff::Master), "{prog}");
-        let off_row = &app.windows[&wid].input_scratch.cells[off.frame_row];
-        let off_face: String = off_row[off.cols.clone()].iter().map(|c| c.ch).collect();
+        let cells = read(&app, &off, OFF_SWITCH);
         assert_eq!(
-            off_face, " alab harness v0.1 \u{2590} on \u{2590} \u{25cb} off \u{258c} ",
-            "{prog}: unified versioned segmented OFF face"
+            (on.cols.end, on.label.clone()),
+            (off.cols.end, off.label.clone()),
+            "{prog}: ON and OFF end in the same cell, the label unmoved"
         );
-        assert_eq!(
-            on.cols.len(),
-            off.cols.len(),
-            "{prog}: ON and OFF faces occupy the exact same cell span"
-        );
-        for c in &off_row[off.cols.clone()] {
-            assert_ne!(
-                c.bg, green_accent,
-                "{prog}: when OFF, no cell background wears active green: {c:?}"
-            );
+        for c in &cells {
             assert_ne!(
                 c.fg, green_accent,
-                "{prog}: when OFF, no cell foreground wears active green: {c:?}"
-            );
-            assert!(
-                c.bg[1].abs_diff(c.bg[0]) <= 12,
-                "{prog}: when OFF, every surface stays neutral (no green tint): {c:?}"
+                "{prog}: when OFF, no cell wears active green: {c:?}"
             );
         }
-        let btn = off.button.expect("off face's `on` segment");
-        let unselected_on_bg = off_row[btn.start + 2].bg;
-        let selected_off_bg = off_row[off.switch.start + 2].bg;
-        assert_ne!(
-            unselected_on_bg, selected_off_bg,
-            "{prog}: only `○ off` wears the selected thumb; `on` sits in the recessed track"
-        );
     }
+}
+
+/// The ⬆️ ring layers on `session`'s glass ([`top_ring_id`]).
+fn rings_on(app: &App, wid: WindowId, session: u64) -> Vec<aterm_core::render::FxLayer> {
+    app.windows[&wid]
+        .input_scratch
+        .fx_layers
+        .iter()
+        .filter(|l| l.id == top_ring_id(session))
+        .cloned()
+        .collect()
+}
+
+/// A SETTLED SWITCH BUILDS NOTHING: the switch is cells alone, so at rest, under the pointer and
+/// turned off it lays no sprite and keeps none, and at rest frame after frame nothing is sealed or
+/// copied. CONTROL: the pointer on the switch lifts its word, so the pass did draw it.
+#[test]
+fn a_settled_switch_builds_nothing() {
+    let (mut app, wid, session, _host) = claude_held();
+    for _ in 0..2 {
+        next_frame(&mut app, wid);
+    }
+    let laid = switch_of(&app, wid, session).expect("the switch");
+    let kept = |app: &App| app.windows[&wid].claude_footer_texts.borrow().rings.0.len();
+    assert_eq!(
+        (rings_on(&app, wid, session), kept(&app)),
+        (vec![], 0),
+        "no sprite at rest"
+    );
+    for i in 0..6 {
+        if i % 2 == 0 {
+            refill(&mut app, wid);
+        }
+        let before = aterm_core::render::fx_counts_here();
+        let _ = pass(&mut app, wid);
+        assert_eq!(
+            aterm_core::render::fx_counts_here(),
+            before,
+            "frame {i}: nothing sealed or copied"
+        );
+        assert!(rings_on(&app, wid, session).is_empty(), "frame {i}");
+    }
+    let on = (laid.frame_row, laid.cols.start + 2);
+    let resting = app.windows[&wid].input_scratch.cells[on.0][on.1];
+    let _ = point_at(&mut app, wid, on);
+    for _ in 0..2 {
+        next_frame(&mut app, wid);
+    }
+    let lifted = app.windows[&wid].input_scratch.cells[on.0][on.1];
+    assert!(
+        lifted.ch == resting.ch && lifted.fg != resting.fg && lifted.bg == resting.bg,
+        "CONTROL: the hover lifts the word on its ground: {resting:?} -> {lifted:?}"
+    );
+    assert_eq!(
+        (rings_on(&app, wid, session), kept(&app)),
+        (vec![], 0),
+        "no sprite under the pointer"
+    );
+    let _ = point_at(&mut app, wid, (laid.frame_row - 3, 0));
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+    );
+    for _ in 0..2 {
+        next_frame(&mut app, wid);
+    }
+    assert_eq!(
+        switch_of(&app, wid, session).map(|b| b.face),
+        Some(HarnessSwitch::Off(SwitchOff::Master)),
+        "turned off"
+    );
+    assert_eq!(
+        (rings_on(&app, wid, session), kept(&app)),
+        (vec![], 0),
+        "no sprite turned off"
+    );
 }

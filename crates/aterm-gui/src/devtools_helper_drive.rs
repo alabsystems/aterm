@@ -127,6 +127,7 @@ fn shown_after(
             listed,
             bundle: bundle.then(|| PathBuf::from(TILE_BUNDLE)),
             skips: aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check,
+            step: None,
         },
         at,
     )
@@ -228,6 +229,7 @@ fn scenarios() -> Vec<(&'static str, Content)> {
                 listed: None,
                 bundle: bundle.then(|| PathBuf::from(TILE_BUNDLE)),
                 skips: false,
+                step: None,
             },
             t0,
         )
@@ -243,6 +245,42 @@ fn scenarios() -> Vec<(&'static str, Content)> {
     let mut fda_done = fda(true);
     let _ = fda_done.granted(t0);
     out.push(("fda-done", fda_done.content()));
+    // The permission walk's pages: "Step N of M" under the title, the person's own press.
+    let walk = |page: Page, step: (usize, usize), reading: Reading| {
+        Panel::new(
+            Show {
+                page,
+                origin: Origin::Walk,
+                reading,
+                listed: None,
+                bundle: Some(PathBuf::from(TILE_BUNDLE)),
+                skips: false,
+                step: Some(step),
+            },
+            t0,
+        )
+    };
+    out.push((
+        "walk-fda",
+        walk(Page::FullDiskAccess, (1, 3), Reading::UNREAD).content(),
+    ));
+    let devtools_reading = Reading {
+        grant: DevToolGrant::NotGranted,
+        list: absent,
+        log: DevToolProbe::refused(DevToolProbeLabel::Observed),
+        subject: Some("com.aterm.aterm"),
+    };
+    out.push((
+        "walk-devtools",
+        walk(Page::DeveloperTools, (2, 3), devtools_reading).content(),
+    ));
+    out.push((
+        "walk-accessibility",
+        walk(Page::Accessibility, (3, 4), Reading::UNREAD).content(),
+    ));
+    let mut ax_done = walk(Page::Accessibility, (3, 4), Reading::UNREAD);
+    let _ = ax_done.granted(t0);
+    out.push(("walk-accessibility-done", ax_done.content()));
     out
 }
 

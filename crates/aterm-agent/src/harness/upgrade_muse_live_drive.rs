@@ -246,10 +246,11 @@ pub(super) fn look_at(
     )
 }
 
-/// THE CLAIM (G-M4): the record the quiet restart writes BEFORE its SIGTERM, from the snapshot `snap` of the Muse Code it ends and the move `mv` — the process, its shell and tab, its session and the homes its line carries, its launch's argv and its session's workspace, the twin, the versions, and the UPGRADE'S cause (empty: [`super::super::super::relaunch::ends_its_agent`]), in flight ([`Phase::Exiting`]) and quiet: what makes its exit the upgrade's own (`relaunch::ended_by_restart`) and what the relaunch plans its line from.
+/// THE CLAIM (G-M4): the record the quiet restart writes BEFORE its SIGTERM, from the snapshot `snap` of the Muse Code it ends and the move `mv` — the process, its shell and tab, its session and the homes its line carries, its launch's argv and its session's workspace, the twin, the versions, the UPGRADE'S cause (empty: [`super::super::super::relaunch::ends_its_agent`]), and `grace_s`, the person's grace that SIGTERM waits out ([`St::line_grace_s`]: a key typed at the prompt after it holds the line as long as it would have held the SIGTERM), in flight ([`Phase::Exiting`]) and quiet: what makes its exit the upgrade's own (`relaunch::ended_by_restart`) and what the relaunch plans its line from.
 pub(super) fn claim_record(
     snap: &super::super::super::relaunch::Snapshot,
     mv: &Move,
+    grace_s: u32,
     now: u64,
 ) -> Option<St> {
     let run = snap.muse()?;
@@ -272,6 +273,7 @@ pub(super) fn claim_record(
         quiet: true,
         salt: now,
         phase: Phase::Exiting { at_s: now },
+        line_grace_s: Some(grace_s),
         ..St::default()
     })
 }
@@ -361,7 +363,7 @@ pub(super) fn upgrade_visit(
         return Some(said(r, format!("wait:{why}")));
     }
     let now = now_s();
-    let Some(mut st) = claim_record(&snap, &mv, now) else {
+    let Some(mut st) = claim_record(&snap, &mv, opts.human_grace_s, now) else {
         return Some(said(r, "wait:no-session"));
     };
     match plan(opts, &st, k) {

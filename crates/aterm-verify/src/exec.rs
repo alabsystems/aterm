@@ -198,6 +198,9 @@ impl Run {
         if let Some(e) = &self.spawn_error {
             return Some(e.clone());
         }
+        if crate::libtest::has_ceiling_kill(&self.output) {
+            return None;
+        }
         if out_of_disk(&self.output) {
             return Some(format!("the child ran out of disk ({ENOSPC_SENTENCE})"));
         }
@@ -208,14 +211,10 @@ impl Run {
 
 /// Whether a failed child's log says the disk ran out: when it accounts for its failures as failed
 /// tests, only if each one's own block names [`ENOSPC_SENTENCE`] (a test that passes may print a full
-/// disk it simulated); otherwise anywhere, as a build or a tool that died says it.
+/// disk it simulated); otherwise anywhere, as a build or a tool that died says it. Passing test
+/// binaries and ceiling kills are excluded ([`crate::libtest::out_of_disk`]).
 fn out_of_disk(output: &str) -> bool {
-    match crate::libtest::failed_tests(output) {
-        Some(failed) if !failed.is_empty() => failed
-            .iter()
-            .all(|test| test.block.contains(ENOSPC_SENTENCE)),
-        _ => output.contains(ENOSPC_SENTENCE),
-    }
+    crate::libtest::out_of_disk(output, ENOSPC_SENTENCE)
 }
 
 /// The default ceiling on one stage child's work ([`ExecEnv::child_ceiling`]).
@@ -1723,6 +1722,10 @@ mod tests {
     #[cfg(unix)]
     const WAIT_LOCK: &str = "ATERM_VERIFY_TEST_WAIT_LOCK";
 
+    /// A complete fixture line, never a word in a command or checkout path.
+    #[cfg(unix)]
+    const LOCK_ADMITTED: &str = "ATERM_VERIFY_TEST_LOCK_ADMITTED";
+
     /// Set by [`lock_waiter_stand_in`]'s `SIGTERM` handler, as a lab's interrupt sets its stop.
     #[cfg(unix)]
     static STAND_IN_STOPPED: std::sync::atomic::AtomicBool =
@@ -1769,7 +1772,7 @@ mod tests {
             }
             Err(e) => panic!("the lock, once its holder lets go: {e:?}"),
         };
-        println!("admitted");
+        println!("\n{LOCK_ADMITTED}");
         loop {
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1855,7 +1858,11 @@ mod tests {
         drop(held);
         let out = running.join().expect("the run");
         assert!(!out.ok && out.code.is_none(), "{out:?}");
-        assert!(out.output.contains("admitted"), "{}", out.output);
+        assert!(
+            out.output.lines().any(|line| line == LOCK_ADMITTED),
+            "{}",
+            out.output
+        );
         assert!(
             out.output.contains(crate::findings::CEILING_KILL)
                 && out.output.contains("of work, over the 5.0s ceiling")
@@ -1873,7 +1880,7 @@ mod tests {
         );
         assert!(
             r.output.contains(crate::findings::CEILING_KILL)
-                && !r.output.contains("admitted")
+                && !r.output.lines().any(|line| line == LOCK_ADMITTED)
                 && !r.output.contains("it also waited"),
             "{}",
             r.output
@@ -1933,7 +1940,11 @@ mod tests {
         assert_eq!(unsafe { libc::killpg(pgid, libc::SIGTERM) }, 0);
         let out = running.join().expect("the run");
         drop(held);
-        assert!(!out.output.contains("admitted"), "{}", out.output);
+        assert!(
+            !out.output.lines().any(|line| line == LOCK_ADMITTED),
+            "{}",
+            out.output
+        );
         assert!(
             out.output.contains(&format!(
                 "NOT RUN: interrupted while waiting for pid {} (lab linux proof, /checkouts/holder",

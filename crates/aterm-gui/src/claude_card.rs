@@ -35,8 +35,9 @@ const TRAIL_MIN: usize = 8;
 const TRAIL_MAX: usize = 20;
 const KITTY_MARGIN: usize = 4;
 const LINE_LEAD: usize = 2;
-/// Emphasized hero word in the card status line.
-pub(crate) const HERO_WORD: &str = "aterm";
+/// Emphasized hero word in the card status line: the brand, as the top rule's label reads it
+/// (`alab claude harness v0.4`).
+pub(crate) const HERO_WORD: &str = "alab";
 const FLOW_TAG: u64 = 0xF10F_0000_0000_0000;
 const MOTION_TAG: u64 = 0xA417_0000_0000_0000;
 
@@ -1313,18 +1314,13 @@ fn line_texts_for(rows_kind: usize, view: AutopilotView, end: LineEnd) -> &'stat
     slot.get_or_init(|| make_line_texts_for(harness, view, end))
 }
 
-/// The card line's rungs, widest first, naming `harness`'s own version (never aterm's build).
+/// The card line's rungs, widest first, naming `harness` the way its top rule does (`alab
+/// <cli> harness`) and its own version (never aterm's build).
 fn make_line_texts_for(harness: CliHarness, view: AutopilotView, end: LineEnd) -> Vec<String> {
     use crate::claude_lights::ChipFace;
     let mut texts = Vec::with_capacity(6);
-    let tag = match harness {
-        CliHarness::ClaudeCode => String::new(),
-        other => format!(" \u{b7} {}", other.id()),
-    };
-    let head = format!(
-        "enhanced by {HERO_WORD} harness v{}{tag}",
-        harness.version_str()
-    );
+    let brand = format!("{HERO_WORD} {} harness", harness.cli());
+    let head = format!("enhanced by {brand} v{}", harness.version_str());
     let (glyph, word) = end.words(view);
     let mode = if harness == CliHarness::Agy {
         head.clone()
@@ -1342,9 +1338,9 @@ fn make_line_texts_for(harness: CliHarness, view: AutopilotView, end: LineEnd) -
     }
     texts.push(head);
     if harness == CliHarness::Agy {
-        texts.push(format!("{HERO_WORD} harness{tag}"));
+        texts.push(brand);
     } else {
-        texts.push(format!("{HERO_WORD} harness{tag} \u{b7} {glyph} {word}"));
+        texts.push(format!("{brand} \u{b7} {glyph} {word}"));
     }
     texts.push(format!("{HERO_WORD} \u{b7} {glyph} {word}"));
     texts.push(format!("{HERO_WORD} {glyph}"));

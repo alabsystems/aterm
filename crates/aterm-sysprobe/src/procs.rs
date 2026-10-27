@@ -7,9 +7,37 @@
 /// The sweep stops here.
 pub const MAX_PROCESSES: usize = 16_384;
 
+/// Darwin scheduling observations. Errors retain errno; a successful zero is not unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scheduling {
+    /// Unix nice value (which alone does not identify effective QoS).
+    pub nice: Result<i32, i32>,
+    /// The target's application flag from its successful BSD-info read.
+    pub application: bool,
+    /// The target's internal requested-background bit, not its effective QoS.
+    pub background_internal: bool,
+    /// The target's external requested-background bit, not its effective QoS.
+    pub background_external: bool,
+    /// Whether the target's effective suppression flag is set.
+    pub suppressed: bool,
+    /// Darwin application role, including zero (unspecified).
+    pub role: Result<i32, i32>,
+    /// Lifetime CPU nanoseconds in default, maintenance, background, utility, legacy,
+    /// user-initiated and user-interactive QoS, in that order. Not core residency.
+    /// `None` means the kernel timebase was unavailable; errors retain the rusage errno.
+    pub qos_cpu_ns: Option<Result<[u64; 7], i32>>,
+}
+
+/// `getpriority` may successfully return -1; only errno distinguishes that from failure.
+pub fn priority_result(value: i32, errno: i32) -> Result<i32, i32> {
+    if errno == 0 { Ok(value) } else { Err(errno) }
+}
+
 /// One process in a sweep.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcessReading {
+    /// Darwin scheduling state, or `None` off Darwin and for exited processes.
+    pub scheduling: Option<Scheduling>,
     /// Its pid.
     pub pid: u32,
     /// Kernel start identity: Mach absolute ticks on macOS, boot nanoseconds on Linux, creation FILETIME on Windows.
@@ -138,11 +166,23 @@ pub fn birth_of_boot_start(start_ns: u64, boot_now_ns: u64, unix_now_ms: i64) ->
     unix_now_ms.checked_sub(age_ms).filter(|ms| *ms >= 0)
 }
 
+/// 100 ns ticks between the Windows `FILETIME` epoch (1601-01-01 UTC) and the Unix epoch.
+const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+
 /// A Windows creation `FILETIME` (100 ns ticks since 1601-01-01 UTC) as unix ms; `None` before the epoch.
 #[must_use]
 pub fn birth_of_filetime(ticks: u64) -> Option<i64> {
-    const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
     i64::try_from(ticks.checked_sub(UNIX_EPOCH_TICKS)? / 10_000).ok()
+}
+
+/// How long a process created at `ticks` (`FILETIME`, 100 ns since 1601-01-01 UTC) had run at
+/// `now_us` (µs since the Unix epoch), ms; `None` before the Unix epoch, `0` when born past `now_us`.
+#[must_use]
+pub(crate) const fn filetime_age_ms(ticks: u64, now_us: u64) -> Option<u64> {
+    let Some(since_epoch) = ticks.checked_sub(UNIX_EPOCH_TICKS) else {
+        return None;
+    };
+    Some(now_us.saturating_sub(since_epoch / 10) / 1000)
 }
 
 /// Mach ticks to nanoseconds at the timebase `numer/denom`.
@@ -276,6 +316,10 @@ pub(crate) mod imp {
 
     /// `pid`'s `RUSAGE_INFO_V4` (the user's own processes), or `None`.
     pub(crate) fn rusage(pid: c_int) -> Option<libc::rusage_info_v4> {
+        rusage_result(pid).ok()
+    }
+
+    fn rusage_result(pid: c_int) -> Result<libc::rusage_info_v4, i32> {
         // SAFETY: `rusage_info_v4` is plain integers; all-zero is valid.
         let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is a writable `rusage_info_v4` and the flavor names exactly that layout.
@@ -286,7 +330,52 @@ pub(crate) mod imp {
                 (&raw mut info).cast::<libc::rusage_info_t>(),
             )
         };
-        (rc == 0).then_some(info)
+        if rc == 0 {
+            Ok(info)
+        } else {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO))
+        }
+    }
+
+    fn priority(pid: c_int, which: c_int) -> Result<i32, i32> {
+        // SAFETY: errno is thread-local; getpriority only reads the named process's policy.
+        let (value, errno) = unsafe {
+            *libc::__error() = 0;
+            let value = libc::getpriority(which, pid as libc::id_t);
+            (value, *libc::__error())
+        };
+        super::priority_result(value, errno)
+    }
+
+    fn scheduling(pid: c_int, flags: u32) -> super::Scheduling {
+        // PRIO_DARWIN_ROLE is selector 6 in Apple's published resource_private.h. It is a
+        // read only here; an OS that refuses it retains that errno, never an invented role.
+        super::Scheduling {
+            nice: priority(pid, libc::PRIO_PROCESS),
+            // These target-specific bits come from proc_get_darwinbgstate in XNU.
+            // getpriority(PRIO_DARWIN_PROCESS, pid) instead reads current_task().
+            application: flags & 0x0100_0000 != 0,
+            background_internal: flags & 0x0000_8000 != 0,
+            background_external: flags & 0x0001_0000 != 0,
+            suppressed: flags & 0x0080_0000 != 0,
+            role: priority(pid, 6),
+            qos_cpu_ns: None,
+        }
+    }
+
+    fn qos_cpu(u: libc::rusage_info_v4, numer: u32, denom: u32) -> [u64; 7] {
+        [
+            u.ri_cpu_time_qos_default,
+            u.ri_cpu_time_qos_maintenance,
+            u.ri_cpu_time_qos_background,
+            u.ri_cpu_time_qos_utility,
+            u.ri_cpu_time_qos_legacy,
+            u.ri_cpu_time_qos_user_initiated,
+            u.ri_cpu_time_qos_user_interactive,
+        ]
+        .map(|n| ticks_to_ns(n, numer, denom))
     }
 
     /// `u`'s own user plus system time, ns at the timebase `numer/denom`.
@@ -341,7 +430,8 @@ pub(crate) mod imp {
             if pid <= 0 {
                 continue;
             }
-            let before = rusage(pid);
+            let before_read = rusage_result(pid);
+            let before = before_read.ok();
             let Some(info) = short_info(pid) else {
                 dead.push((pid, before));
                 continue;
@@ -357,7 +447,15 @@ pub(crate) mod imp {
             } else {
                 (None, None)
             };
-            let after = rusage(pid);
+            let mut scheduling = scheduling(pid, info.flags);
+            let after_read = rusage_result(pid);
+            scheduling.qos_cpu_ns = match after_read {
+                Err(errno) => Some(Err(errno)),
+                Ok(u) => {
+                    super::kernel_timebase().map(|(numer, denom)| Ok(qos_cpu(u, numer, denom)))
+                }
+            };
+            let after = after_read.ok();
             let usage = match (before, after) {
                 (Some(before), Some(after))
                     if before.ri_proc_start_abstime == after.ri_proc_start_abstime =>
@@ -372,6 +470,7 @@ pub(crate) mod imp {
             let sid = unsafe { libc::getsid(pid) };
             let end = info.comm.iter().position(|b| *b == 0).unwrap_or(16);
             procs.push(ProcessReading {
+                scheduling: Some(scheduling),
                 pid: pid as u32,
                 start: usage.map(|u| u.ri_proc_start_abstime),
                 ppid: info.ppid,
@@ -633,6 +732,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn priority_minus_one_is_a_value_only_without_errno() {
+        assert_eq!(priority_result(-1, 0), Ok(-1));
+        assert_eq!(priority_result(0, 0), Ok(0));
+        assert_eq!(priority_result(-1, 1), Err(1));
+        assert_eq!(priority_result(-1, 3), Err(3));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn own_scheduling_is_read_and_cpu_classes_are_scaled() {
+        let mine = processes()
+            .unwrap()
+            .procs
+            .into_iter()
+            .find(|p| p.pid == std::process::id())
+            .unwrap();
+        let s = mine
+            .scheduling
+            .expect("a live Darwin process has scheduling readings");
+        assert!(s.nice.is_ok(), "{s:?}");
+        assert!(s.role.is_ok(), "{s:?}");
+        let ns = s
+            .qos_cpu_ns
+            .expect("kernel timebase")
+            .expect("own rusage classes");
+        assert!(ns.iter().any(|n| *n > 0));
+        assert!(ns.iter().copied().sum::<u64>() <= mine.cpu_ns.unwrap());
+    }
+
+    #[test]
     fn statm_gives_the_resident_pages() {
         assert_eq!(parse_statm_resident("2048 512 100 1 0 300 0"), Some(512));
         assert_eq!(parse_statm_resident("2048"), None);
@@ -852,6 +981,19 @@ mod tests {
         let Ok(stage) = std::env::var(EXEC_STAGE) else {
             return;
         };
+        if stage == "background" || stage == "foreground" {
+            // Darwin's public resource.h names selector 4 PRIO_DARWIN_PROCESS and 0x1000
+            // PRIO_DARWIN_BG. The stand-in changes only its own internal request.
+            // SAFETY: these are constant selectors and pid zero is this process.
+            let rc =
+                unsafe { libc::setpriority(4, 0, if stage == "background" { 0x1000 } else { 0 }) };
+            assert_eq!(
+                rc,
+                0,
+                "set own requested-background state: {}",
+                std::io::Error::last_os_error()
+            );
+        }
         println!("\n{stage}");
         std::io::stdout().flush().expect("the stage's proof");
         let mut byte = [0; 1];
@@ -914,6 +1056,27 @@ mod tests {
             }
         };
         (child, saw)
+    }
+
+    /// Target bits distinguish two children even when the observer's request stays the same.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scheduling_reads_each_childs_requested_background_bits() {
+        for (stage, expected) in [("foreground", false), ("background", true)] {
+            let (mut child, saw) = stand_in(EXEC_STAND_IN, (EXEC_STAGE, stage.as_ref()));
+            saw(stage);
+            let actual = processes().and_then(|s| {
+                s.procs
+                    .into_iter()
+                    .find(|p| p.pid == child.id())
+                    .and_then(|p| p.scheduling)
+            });
+            // Reap before assertions so a failed observation leaves no stand-in behind.
+            drop(child.stdin.take());
+            aterm_uds::deadline::kill_within(&mut child, HANG);
+            let actual = actual.expect("the stand-in's BSD info was read");
+            assert_eq!(actual.background_internal, expected, "{stage}: {actual:?}");
+        }
     }
 
     /// AN EXEC MOVES THE PID VERSION, SO A KEPT COALITION IS READ AGAIN (macOS, live): a child
@@ -1443,5 +1606,19 @@ mod tests {
             assert!(mine.disk_written.is_some(), "{mine:?}");
         }
         assert!(sweep.procs.iter().any(|p| p.pid == mine.ppid));
+    }
+
+    #[test]
+    fn filetime_birth_and_age_measure_against_the_unix_epoch() {
+        let epoch = super::UNIX_EPOCH_TICKS;
+        assert_eq!(super::birth_of_filetime(epoch - 1), None);
+        assert_eq!(super::filetime_age_ms(epoch - 1, 5_000_000), None);
+        assert_eq!(super::birth_of_filetime(epoch + 25_000), Some(2));
+        assert_eq!(super::filetime_age_ms(epoch + 25_000, 10_500), Some(8));
+        assert_eq!(
+            super::filetime_age_ms(epoch + 50_000_000, 1_000),
+            Some(0),
+            "a creation stamp ahead of the wall-clock read saturates to 0 ms"
+        );
     }
 }

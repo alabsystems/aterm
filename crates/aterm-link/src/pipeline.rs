@@ -8,6 +8,8 @@ use std::io;
 use std::ops::Deref;
 use std::time::Instant;
 
+use astream_broker::Pipelined;
+
 use crate::transport::Conn;
 
 /// One pipelined publish whose ack has not been read.
@@ -27,6 +29,16 @@ pub(crate) struct Unacked<T> {
 
 /// One owed publish and the broker's answer to it: `(offset, deduped)`, or the refusal or transport failure ([`Link::recv`]).
 pub(crate) type Settled<T> = (Unacked<T>, io::Result<(u64, bool)>);
+
+/// A consumer group's commit that rides the next publish in one write ([`Link::send_after_commit`]).
+pub(crate) struct HeldCommit<'a, T> {
+    /// The group.
+    pub group: &'a str,
+    /// The offset it commits to.
+    pub upto: u64,
+    /// What its sender wants done with its answer.
+    pub tag: T,
+}
 
 /// The publisher connection and the acks owed on it, in send order.
 pub(crate) struct Link<T> {
@@ -118,6 +130,63 @@ impl<T> Link<T> {
                 Ok(())
             }
             Err(e) => Err((e, tag)),
+        }
+    }
+
+    /// Write a consumer group's COMMIT to `commit.upto` AND one publish in ONE write, the
+    /// commit first, WITHOUT waiting for either ack (astream's `Client::send_pipelined`), and
+    /// queue `commit.tag` then `tag` for the two answers. The broker hands writes it
+    /// receives together to its writer together, so the two land in one group-commit batch
+    /// behind one flush, where a commit written alone a moment before pays a flush of its
+    /// own (`broker.pipelining`).
+    /// # Errors
+    /// The send's, with both tags: nothing is owed for either.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one publish's fields, the commit riding it, its tag and the caller's clock"
+    )]
+    pub fn send_after_commit(
+        &mut self,
+        commit: HeldCommit<'_, T>,
+        producer_id: u64,
+        seq: u64,
+        first: bool,
+        subject: &str,
+        body: &[u8],
+        tag: T,
+        now: Instant,
+    ) -> Result<(), (io::Error, T, T)> {
+        let burst = [
+            Pipelined::Commit {
+                group: commit.group,
+                upto: commit.upto,
+            },
+            Pipelined::Publish {
+                producer_id,
+                producer_seq: seq,
+                subject,
+                body,
+            },
+        ];
+        match self.client.send_pipelined(&burst) {
+            Ok(()) => {
+                self.owe(Unacked {
+                    seq: 0,
+                    first: false,
+                    sent: now,
+                    tag: commit.tag,
+                    rider: None,
+                });
+                self.owe(Unacked {
+                    seq,
+                    first,
+                    sent: now,
+                    tag,
+                    rider: None,
+                });
+                Ok(())
+            }
+            Err(e) => Err((e, commit.tag, tag)),
         }
     }
 

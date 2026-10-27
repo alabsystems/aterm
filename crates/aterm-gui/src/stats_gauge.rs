@@ -12,12 +12,17 @@
 //!   the sketch's scale ([`drawn_soak`]: `Strain`'s soak to the power [`SOAK_CURVE`]).
 //!
 //! Geometry and inks are the 2026-10-24 sketch's (`deck134/r2/final/gauge/icon.py`). The deck's
-//! prims have no arc that starts anywhere but 12 o'clock, no gradient and no blur, so:
+//! prims have no gradient and no blur, and their one arc that starts anywhere but 12 o'clock
+//! ([`DrawPrim::Arc`]) is one ink with round ends, so:
 //!
 //! - the band's track is three [`DrawPrim::Ring`]s in two clipped halves, its round ends two dots;
 //! - the lit arc is a chain of round-capped [`DrawPrim::Line`]s along the band's middle, one ink
 //!   each, and a cut end (at the needle, at the redline) is squared off by short radial spokes,
-//!   since a segment's round cap would reach past it;
+//!   since a segment's round cap would reach past it; its segments and the redline print's are
+//!   cut on a fixed lattice from the stop, so as the needle sweeps ([`crate::stats_needle`]) only
+//!   the last, partial one changes;
+//! - the glow behind the lit arc is translucent [`DrawPrim::Arc`]s from the stop to the tip, which
+//!   cover each pixel once, so it has no joints whose caps overlap and only its end moves;
 //! - the face's gradient, the bezel's sheen and the hub's shading are horizontal bands, each a
 //!   clipped dot or ring in the ink the sketch's gradient has at the band's middle;
 //! - the bloom is concentric rings, each the ink a Gaussian blur of the bezel leaves at its radius
@@ -30,7 +35,7 @@
 //! The tray raster composites in linear light and the sketch's SVG in sRGB, so every ink the
 //! sketch lays over another (the bloom, the ticks, the print, the bezel's edge) is mixed here in
 //! sRGB and drawn opaque; only the needle's shadow stays translucent, at the linear opacity that
-//! darkens the face as the sketch's sRGB one does.
+//! darkens the face as the sketch's sRGB one does (and the glow, which the sketch has not).
 
 use aterm_vitals::Strain;
 use aterm_vitals::ink::{self, Lab, Rgb, VitalsInks};
@@ -47,9 +52,9 @@ const R_IN: f64 = 20.6;
 const R_MID: f64 = (R_OUT + R_IN) / 2.0;
 const BAND_W: f64 = R_OUT - R_IN;
 /// The stop, the redline and the end of the sweep, degrees clockwise from 12 o'clock.
-const START: f64 = -135.0;
+pub(crate) const START: f64 = -135.0;
 const RED: f64 = 75.0;
-const END: f64 = 135.0;
+pub(crate) const END: f64 = 135.0;
 /// The needle reaches into the band; its half-widths at the hub and at its point, pt.
 const NEEDLE_TIP: f64 = 25.2;
 const NEEDLE_BASE: f64 = 1.65;
@@ -69,6 +74,9 @@ pub(crate) const SOAK_CURVE: f32 = 1.36;
 const SOAK_SHOWN: f32 = 0.03;
 /// From this drawn soak the bezel blooms (`Strain`'s 0.81).
 const BLOOM_FROM: f32 = 0.75;
+/// Instantaneous needle reading above which the dial emits a live thermal orange-to-red bloom even
+/// before the 1-hour soak has accumulated (strictly above 70% busy, lighting step 5/6 hot + redline).
+pub(crate) const HOT_BLOOM_FROM: f32 = 0.78;
 /// The bloom's blur, pt (the sketch's `stdDeviation`), the stroke it blurs (the bezel and 1.2 pt
 /// more), and the rings that draw it.
 const BLOOM_SIGMA: f64 = 1.8;
@@ -88,6 +96,15 @@ const SEG_DEG: f64 = 2.5;
 const FLAT_SEG_DEG: f64 = 7.5;
 const SPOKE_DEG: f64 = 1.0;
 const SPOKE_W: f64 = 1.0;
+/// The glow behind the lit arc, two passes: each about [`R_MID`] shifted by its first field, pt, a
+/// stack of layers as wide as its second's half-widths, pt, at the opacity of its third on a
+/// dark and on a light ground. A pass is densest along its middle and fades out to its edge, as
+/// the 12° chain of round-capped pieces it replaced was on average (that chain laid its pieces'
+/// caps over each other where they met, beads that came and went as the needle swept).
+const GLOW: [(f64, [f64; 3], (f32, f32)); 2] = [
+    (-0.9, [5.3, 5.15, 3.9], (0.20, 0.14)),
+    (-0.4, [4.2, 4.0, 2.05], (0.34, 0.24)),
+];
 /// Horizontal bands the bezel's sheen is drawn in, above and below the centre, and the hub's.
 const BANDS_TOP: u32 = 6;
 const BANDS_FOOT: u32 = 10;
@@ -139,6 +156,28 @@ impl Gauge {
         }
     }
 
+    /// The gauge whose needle stands at `deg` degrees clockwise from 12 o'clock (held to the
+    /// sweep) under a bezel of `soak`: what the dial draws of a needle in motion
+    /// ([`crate::stats_needle`]).
+    pub(crate) fn at_deg(deg: f64, soak: f32) -> Self {
+        let deg = deg.clamp(START, END);
+        let v = if deg <= RED {
+            (deg - START) / (RED - START)
+        } else {
+            1.0 + (deg - RED) / (END - RED)
+        };
+        Self {
+            needle: Some(v as f32),
+            soak: soak.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Where a needle in motion goes ([`crate::stats_needle::Needle::retarget`]): the needle's
+    /// angle, degrees, and the soak; `None` with no needle.
+    pub(crate) fn target(&self) -> Option<(f64, f64)> {
+        self.needle.map(|v| (tip_deg(v), f64::from(self.soak)))
+    }
+
     /// Whether the needle is pinned at the end of the redline (the whole band lit).
     pub(crate) fn pinned(&self) -> bool {
         self.needle.is_some_and(|v| tip_deg(v) >= END - 0.01)
@@ -146,13 +185,20 @@ impl Gauge {
 }
 
 /// The needle's angle for `v`, degrees clockwise from 12 o'clock.
-fn tip_deg(v: f32) -> f64 {
+pub(crate) fn tip_deg(v: f32) -> f64 {
     let v = f64::from(v);
     if v <= 1.0 {
         START + (RED - START) * v.max(0.0)
     } else {
         RED + (END - RED) * (v - 1.0).min(1.0)
     }
+}
+
+/// How far the needle's tip travels per degree, device px, on a dial of face radius `r` pt at
+/// `s` device px a point: what one device pixel of a needle in motion is
+/// ([`crate::stats_needle::View`]).
+pub(crate) fn tip_px_per_deg(r: f64, s: f64) -> f64 {
+    NEEDLE_TIP * (r / R_FACE) * s * std::f64::consts::PI / 180.0
 }
 
 /// The gauge's inks, from the deck's.
@@ -313,8 +359,8 @@ pub(crate) fn draw(g: Gauge, at: Place, k: &GaugeInks, out: &mut Vec<DrawPrim>) 
         cy: at.centre.1,
         s: at.s * at.r / R_FACE,
     };
-    p.bloom(g.soak, k, at.slot);
-    p.bezel(k);
+    p.bloom(g, k, at.slot);
+    p.bezel(g.needle, k);
     let edge = over_srgb(k.face, BLACK, if k.dark { 0.45 } else { 0.12 });
     p.ring(R_BEZEL, 0.6, rgba(edge, 0xFF));
     p.track(k);
@@ -367,6 +413,20 @@ impl Pen<'_> {
         });
     }
 
+    /// A band `half` pt either side of the circle `r` pt about the centre, from `a` to `b` degrees
+    /// clockwise from 12 o'clock, its ends round.
+    fn arc(&mut self, r: f64, half: f64, (a, b): (f64, f64), color: Rgba) {
+        self.out.push(DrawPrim::Arc {
+            cx: self.cx,
+            cy: self.cy,
+            r: self.len(r),
+            width: self.len(2.0 * half),
+            from: (a / 360.0) as f32,
+            to: (b / 360.0) as f32,
+            color,
+        });
+    }
+
     fn dot(&mut self, (cx, cy): (f32, f32), r: f64, color: Rgba) {
         let r = self.len(r);
         self.out.push(DrawPrim::Dot { cx, cy, r, color });
@@ -409,18 +469,41 @@ impl Pen<'_> {
         (self.len(R_FACE) + 2.0).ceil()
     }
 
-    /// The bloom of a soaked bezel: what a blur of the bezel's stroke leaves outside the face,
-    /// inside the `slot` (`x0, y0, x1, y1`, device px) as the sketch keeps it. The raster
-    /// composites in linear light and the sketch in sRGB, so each step of the blur is laid over
-    /// the deck's ground in sRGB here and drawn opaque: rings from the outermost in, each
-    /// reaching under the bezel, so no ground shows between two of them.
-    fn bloom(&mut self, soak: f32, k: &GaugeInks, [x0, y0, x1, y1]: [f32; 4]) {
-        let soak = drawn_soak(soak);
-        if soak < BLOOM_FROM {
+    /// The bloom of a soaked or running-hot bezel: what a blur of the bezel's stroke leaves
+    /// outside the face, inside the `slot` (`x0, y0, x1, y1`, device px) as the sketch keeps it.
+    /// Sustained soak blooms in `k.bezel`; instantaneous hot load (`needle > HOT_BLOOM_FROM`)
+    /// blooms immediately in the theme-harmonized orange-to-red [`GaugeInks::glow_ink`] ramp.
+    fn bloom(&mut self, g: Gauge, k: &GaugeInks, [x0, y0, x1, y1]: [f32; 4]) {
+        let soak = drawn_soak(g.soak);
+        let soak_peak = if soak >= BLOOM_FROM {
+            0.9 * (f64::from(soak) - 0.5) * 2.0
+        } else {
+            0.0
+        };
+        let hot = g.needle.filter(|v| v.is_finite()).unwrap_or(0.0);
+        let hot_peak = if hot > HOT_BLOOM_FROM {
+            let t_hot = ((hot - HOT_BLOOM_FROM) / (1.0 - HOT_BLOOM_FROM)).clamp(0.0, 1.0);
+            let t_red = (hot - 1.0).clamp(0.0, 1.0);
+            0.55 * f64::from(t_hot) + 0.35 * f64::from(t_red)
+        } else {
+            0.0
+        };
+        let peak = soak_peak.max(hot_peak);
+        if peak <= 0.0 {
             return;
         }
+        let bloom_ink = if hot_peak <= 0.0 {
+            k.bezel
+        } else if soak_peak <= 0.0 {
+            k.glow_ink(hot)
+        } else {
+            ink::mix(
+                k.bezel,
+                k.glow_ink(hot),
+                (hot_peak / (soak_peak + hot_peak)) as f32,
+            )
+        };
         self.clip((x0, y0), (x1, y1));
-        let peak = 0.9 * (f64::from(soak) - 0.5) * 2.0;
         let mid = f64::midpoint(R_BEZEL, R_FACE);
         let half = (R_FACE - R_BEZEL + BLOOM_GROW) / 2.0;
         let z = BLOOM_SIGMA * std::f64::consts::SQRT_2;
@@ -431,7 +514,7 @@ impl Pen<'_> {
             if a * 255.0 < 0.5 {
                 continue;
             }
-            let ink = over_srgb(k.ground, k.bezel, a as f32);
+            let ink = over_srgb(k.ground, bloom_ink, a as f32);
             let outer = R_FACE + BLOOM_STEP * f64::from(i + 1);
             self.ring(outer, outer - under, rgba(ink, 0xFF));
         }
@@ -440,9 +523,16 @@ impl Pen<'_> {
 
     /// The face and the bezel, in horizontal bands that carry their gradients: the face a shade
     /// darker at its top and lighter at its foot, the bezel's sheen white from its top to the
-    /// middle and black from the middle to its foot, each over its circle's own box as the
-    /// sketch's gradients span them.
-    fn bezel(&mut self, k: &GaugeInks) {
+    /// middle and black from the middle to its foot, catching a warm orange-to-red reflection when
+    /// instantaneous load runs hot (`needle > HOT_BLOOM_FROM`).
+    fn bezel(&mut self, needle: Option<f32>, k: &GaugeInks) {
+        let hot = needle.filter(|v| v.is_finite()).unwrap_or(0.0);
+        let bezel_base = if hot > HOT_BLOOM_FROM {
+            let warm_t = ((hot - HOT_BLOOM_FROM) / 0.50).clamp(0.0, 1.0);
+            ink::mix(k.bezel, k.glow_ink(hot), 0.45 * warm_t)
+        } else {
+            k.bezel
+        };
         let (face_top, face_foot) = (shade(k.face, -0.014, 1.0), shade(k.face, 0.010, 1.0));
         let (top_a, foot_a) = if k.dark { (0.10, 0.22) } else { (0.35, 0.08) };
         let mid = f64::midpoint(R_BEZEL, R_FACE);
@@ -465,9 +555,9 @@ impl Pen<'_> {
             let tf = ((y + R_FACE) / (2.0 * R_FACE)).clamp(0.0, 1.0) as f32;
             let face = over_srgb(face_top, face_foot, tf);
             let ink = if t < 0.5 {
-                over_srgb(k.bezel, WHITE, top_a * (1.0 - 2.0 * t))
+                over_srgb(bezel_base, WHITE, top_a * (1.0 - 2.0 * t))
             } else {
-                over_srgb(k.bezel, BLACK, foot_a * (2.0 * t - 1.0))
+                over_srgb(bezel_base, BLACK, foot_a * (2.0 * t - 1.0))
             };
             self.clip((x0, y0), (x1, y1));
             self.dot((self.cx, self.cy), R_BEZEL + 0.5, rgba(face, 0xFF));
@@ -499,31 +589,27 @@ impl Pen<'_> {
 
     /// Soft theme-harmonized halo behind the lit scale arc when instantaneous load enters warm/hot
     /// territory (`v >= 0.55`), illuminating the dial face inward without spilling past the bezel.
+    /// Each of [`GLOW`]'s passes is a stack of round-capped [`DrawPrim::Arc`]s from the stop to the
+    /// tip, which cover each pixel once, so as the needle sweeps the halo grows at its end and
+    /// nothing behind it changes. It fades in from nothing: its layers' alphas are `x` (the pass's
+    /// opacity, 0..255) rounded down at offsets `i/n` apart, which sum to `⌊n·x⌋`, so as the load
+    /// climbs one layer steps by one at a time, the narrowest first.
     fn arc_glow(&mut self, v: f32, tip: f64, k: &GaugeInks) {
         if v < 0.55 {
             return;
         }
-        let strength = ((v - 0.55) / 0.65).clamp(0.0, 1.0);
+        let boost = 1.0 + 0.25 * (v - 1.0).clamp(0.0, 1.0);
+        let strength = (((v - 0.55) / 0.65).clamp(0.0, 1.0) * boost).min(1.25);
         let glow = k.glow_ink(v);
-        let end = tip.min(END);
-        let span = (end - START).max(0.0);
-        if span <= 1.0 {
-            return;
-        }
-        let n = (span / 12.0).ceil().max(1.0);
-        let step = span / n;
-        for (r_shift, w_add, base_a) in [
-            (-0.9, 4.2, if k.dark { 0.20 } else { 0.14 }),
-            (-0.4, 2.0, if k.dark { 0.34 } else { 0.24 }),
-        ] {
-            let alpha = ((base_a * strength * 255.0).round() as u8).max(1);
-            let color = rgba(glow, alpha);
-            let r = R_MID + r_shift;
-            let w = BAND_W + w_add;
-            for i in 0..n as u32 {
-                let t0 = START + step * f64::from(i);
-                let t1 = t0 + step;
-                self.line(self.at(t0, r), self.at(t1, r), w, color);
+        let span = (START, tip.min(END));
+        for (shift, halves, (dark, light)) in GLOW {
+            let x = (if k.dark { dark } else { light }) * strength * 255.0;
+            let n = halves.len() as f32;
+            for (i, half) in halves.into_iter().enumerate() {
+                let alpha = (x + i as f32 / n).floor() as u8;
+                if alpha > 0 {
+                    self.arc(R_MID + shift, half, span, rgba(glow, alpha));
+                }
             }
         }
     }
@@ -554,11 +640,7 @@ impl Pen<'_> {
         let b1 = if round_b { b } else { b - cap };
         if b1 > a1 {
             let seg = if a >= RED { FLAT_SEG_DEG } else { SEG_DEG };
-            let n = ((b1 - a1) / seg).ceil().max(1.0);
-            let step = (b1 - a1) / n;
-            for i in 0..n as u32 {
-                let t0 = a1 + step * f64::from(i);
-                let t1 = t0 + step;
+            for (t0, t1) in lattice(a1, b1, seg) {
                 let ink = rgba(k.scale(f64::midpoint(t0, t1)), 0xFF);
                 self.line(self.at(t0, R_MID), self.at(t1, R_MID), BAND_W, ink);
             }
@@ -598,11 +680,8 @@ impl Pen<'_> {
     fn print(&mut self, from: f64, k: &GaugeInks) {
         let ink = rgba(over_srgb(k.track, k.over, PRINT_ALPHA), 0xFF);
         let r = R_OUT - PRINT_W / 2.0;
-        let n = ((END - from) / FLAT_SEG_DEG).ceil().max(1.0);
-        let step = (END - from) / n;
-        for i in 0..n as u32 {
-            let t0 = from + step * f64::from(i);
-            self.line(self.at(t0, r), self.at(t0 + step, r), PRINT_W, ink);
+        for (t0, t1) in lattice(from, END, FLAT_SEG_DEG) {
+            self.line(self.at(t0, r), self.at(t1, r), PRINT_W, ink);
         }
     }
 
@@ -678,6 +757,27 @@ impl Pen<'_> {
         }
         self.dot((self.cx, self.cy), HUB_PIN, rgba(k.face, 0xFF));
     }
+}
+
+/// `a..b` degrees cut at each point of a lattice `seg` degrees apart from [`START`]: the pieces'
+/// ends inside the span stand still as `b` moves, so only the last, partial piece changes while
+/// the needle sweeps, and the arc it draws neither crawls nor shimmers. A piece under a millionth
+/// of a degree is left out.
+fn lattice(a: f64, b: f64, seg: f64) -> impl Iterator<Item = (f64, f64)> {
+    let mut j = ((a - START) / seg).floor() + 1.0;
+    let mut t0 = a;
+    std::iter::from_fn(move || {
+        while t0 < b {
+            let t1 = (START + j * seg).min(b);
+            j += 1.0;
+            let piece = (t0, t1);
+            t0 = t1;
+            if piece.1 - piece.0 > 1e-6 {
+                return Some(piece);
+            }
+        }
+        None
+    })
 }
 
 /// The angle a round cap of the band reaches past its segment's end, degrees.
@@ -761,6 +861,107 @@ mod tests {
         );
     }
 
+    /// As the needle sweeps, the pieces of the lit arc and of the redline's print stand still on
+    /// their lattice from the stop: from one tip to the next within a piece, only the last,
+    /// partial piece of the arc changes (the first of the print, which runs from the tip to the
+    /// end), so the arc neither crawls nor shimmers. The glow's arcs keep all but their end.
+    #[test]
+    fn a_sweeping_needle_changes_only_the_arcs_partial_piece() {
+        let inks = aterm_vitals::ink::vitals_inks(
+            [0x16, 0x18, 0x1D],
+            [0xE6, 0xE8, 0xEE],
+            [0x58, 0xA6, 0xFF],
+        );
+        let k = GaugeInks::new(&inks, inks.heat, 0.0);
+        let s = 2.0;
+        let drawn = |f: &dyn Fn(&mut Pen<'_>)| {
+            let mut out = Vec::new();
+            let mut p = Pen {
+                out: &mut out,
+                cx: 80.0,
+                cy: 80.0,
+                s,
+            };
+            f(&mut p);
+            out
+        };
+        let line = |p: &DrawPrim| match *p {
+            DrawPrim::Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                width,
+                color,
+            } => Some(([x1, y1, x2, y2, width], color)),
+            _ => None,
+        };
+        let band = (BAND_W * s) as f32;
+        let segments = |prims: &[DrawPrim]| {
+            prims
+                .iter()
+                .filter_map(line)
+                .filter(|(g, _)| g[4] == band)
+                .collect::<Vec<_>>()
+        };
+        // Two tips whose chains (which stop a round cap short of the tip, 7.7°) end inside one
+        // piece of the ramp's 2.5° lattice, and of the redline's 7.5°.
+        for (a, b) in [(-42.0, -40.0), (17.9, 20.0), (113.0, 119.5)] {
+            let (la, lb) = (
+                segments(&drawn(&|p| p.lit(a, &k))),
+                segments(&drawn(&|p| p.lit(b, &k))),
+            );
+            assert_eq!(la.len(), lb.len(), "{a}° and {b}°");
+            let n = la.len();
+            assert!(n > 4, "CONTROL {a}°: a chain");
+            assert_eq!(la[..n - 1], lb[..n - 1], "{a}° to {b}°: the arc crawls");
+            assert_ne!(
+                la[n - 1],
+                lb[n - 1],
+                "CONTROL {a}° to {b}°: the tip's piece moves"
+            );
+        }
+        // The glow: the same arcs, of which only the end moves.
+        let glow = |tip: f64| {
+            drawn(&|p| p.arc_glow(0.8, tip, &k))
+                .into_iter()
+                .map(|p| match p {
+                    DrawPrim::Arc {
+                        cx,
+                        cy,
+                        r,
+                        width,
+                        from,
+                        to,
+                        color,
+                    } => ([cx, cy, r, width, from, color[3].into()], to),
+                    other => panic!("the glow draws only arcs: {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let (ga, gb) = (glow(33.0), glow(34.0));
+        assert_eq!(
+            ga.len(),
+            2 * GLOW[0].1.len(),
+            "CONTROL: every layer of both passes"
+        );
+        for (a, b) in ga.iter().zip(&gb) {
+            assert_eq!(a.0, b.0, "the glow moves behind the tip");
+            assert!(b.1 > a.1, "CONTROL: its end follows the tip");
+        }
+        // The print from the tip to the end: only its first piece changes.
+        let print = |from: f64| {
+            drawn(&|p| p.print(from, &k))
+                .iter()
+                .filter_map(line)
+                .collect::<Vec<_>>()
+        };
+        let (pa, pb) = (print(76.0), print(81.0));
+        assert_eq!(pa.len(), pb.len());
+        assert_eq!(pa[1..], pb[1..], "the print crawls");
+        assert_ne!(pa[0], pb[0], "CONTROL: the print starts at the tip");
+    }
+
     #[test]
     fn erf_matches_its_table() {
         for (x, want) in [
@@ -788,7 +989,7 @@ mod tests {
             s: 2.0,
             r: R_FACE,
         };
-        let translucent_lines = |needle: f32| {
+        let drawn = |needle: f32| {
             let mut out = Vec::new();
             draw(
                 Gauge {
@@ -799,21 +1000,387 @@ mod tests {
                 &k,
                 &mut out,
             );
-            out.into_iter()
+            out
+        };
+        let translucent_lines = |needle: f32| {
+            drawn(needle)
+                .into_iter()
                 .filter(|p| matches!(p, DrawPrim::Line { color, .. } if color[3] < 0xFF))
                 .count()
         };
-        // Needle shadow uses 2 translucent lines; calm load adds zero glow lines.
-        assert_eq!(translucent_lines(0.25), 2);
+        // The glow's arcs: where they end, turns, and their summed opacity.
+        let glow = |needle: f32| {
+            let arcs = drawn(needle)
+                .into_iter()
+                .filter_map(|p| match p {
+                    DrawPrim::Arc { to, color, .. } => Some((to, u32::from(color[3]))),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let end = arcs.iter().map(|a| a.0).fold(f32::MIN, f32::max);
+            (arcs.len(), end, arcs.iter().map(|a| a.1).sum::<u32>())
+        };
+        // The needle's shadow is the only translucent line, at any load; calm load has no glow.
+        for v in [0.25, 0.70, 1.40] {
+            assert_eq!(translucent_lines(v), 2, "{v}");
+        }
+        assert_eq!(glow(0.25).0, 0, "calm load glows");
         // Warm (70%) and redline (140%) loads add the two-pass themed arc glow halo.
-        let warm = translucent_lines(0.70);
-        let redline = translucent_lines(1.40);
-        assert!(warm > 2, "70% load should emit dial arc glow: {warm}");
+        let (warm, redline) = (glow(0.70), glow(1.40));
+        assert!(warm.0 > 0, "70% load should emit dial arc glow: {warm:?}");
         assert!(
-            redline > warm,
-            "redline sweep spans more glow segments than 70%: {redline} vs {warm}"
+            redline.1 > warm.1 && redline.2 > warm.2,
+            "redline's glow reaches further and brighter than 70%'s: {redline:?} vs {warm:?}"
         );
         // Redline scale warms past base `over` toward `thermal[4]` crimson-red.
         assert_ne!(k.scale(RED + 5.0), k.scale(END));
+    }
+
+    /// The glow as the 2026-10-24 gauge drew it: translucent round-capped pieces on a 12° lattice
+    /// from the stop, every one at least alpha 1 from a load of 0.55. The negative control of
+    /// the glow's pixel tests.
+    fn chained_glow(p: &mut Pen<'_>, v: f32, tip: f64, k: &GaugeInks) {
+        if v < 0.55 {
+            return;
+        }
+        let boost = 1.0 + 0.25 * (v - 1.0).clamp(0.0, 1.0);
+        let strength = (((v - 0.55) / 0.65).clamp(0.0, 1.0) * boost).min(1.25);
+        let glow = k.glow_ink(v);
+        for (shift, w_add, (dark, light)) in [(-0.9, 4.2, (0.20, 0.14)), (-0.4, 2.0, (0.34, 0.24))]
+        {
+            let a = if k.dark { dark } else { light };
+            let color = rgba(glow, ((a * strength * 255.0).round() as u8).max(1));
+            let (r, w) = (R_MID + shift, BAND_W + w_add);
+            for (t0, t1) in lattice(START, tip.min(END), 12.0) {
+                p.line(p.at(t0, r), p.at(t1, r), w, color);
+            }
+        }
+    }
+
+    /// The glow `paint` draws, alone over the face at 2 device px per pt, as the tray raster
+    /// draws it, and the dial's centre.
+    fn glow_pixels(k: &GaugeInks, paint: &dyn Fn(&mut Pen<'_>)) -> Vec<u8> {
+        let mut out = Vec::new();
+        paint(&mut Pen {
+            out: &mut out,
+            cx: 80.0,
+            cy: 80.0,
+            s: 2.0,
+        });
+        crate::tray_raster::rasterize_tray(&out, 160, 160, 1.0, rgba(k.face, 0xFF)).0
+    }
+
+    /// Each theme's gauge inks.
+    fn both_grounds() -> [GaugeInks; 2] {
+        [
+            ([0x16, 0x18, 0x1D], [0xE6, 0xE8, 0xEE]),
+            ([0xF5, 0xF5, 0xF7], [0x1C, 0x1E, 0x24]),
+        ]
+        .map(|(ground, fg)| {
+            let inks = aterm_vitals::ink::vitals_inks(ground, fg, [0x58, 0xA6, 0xFF]);
+            GaugeInks::new(&inks, inks.heat, 0.0)
+        })
+    }
+
+    /// The glow neither beads nor shimmers as the needle sweeps a device pixel a frame: from one
+    /// frame to the next no pixel behind the tip it left changes, and ahead of it the glow grows
+    /// by about as much each frame. The 12° chain it replaced laid each new piece's round cap
+    /// over the last one's where they met, a bead that popped in as the tip crossed each point
+    /// of its lattice and reached back behind it.
+    #[test]
+    fn a_needle_sweeping_a_pixel_a_frame_grows_the_glow_evenly() {
+        // Frames a device px apart at the needle's point, across six of the chain's lattice
+        // points (-39° to 21°).
+        let step = (1.0 / (2.0 * NEEDLE_TIP)).to_degrees();
+        let tips = (0..)
+            .map(|i| -45.0 + step * f64::from(i))
+            .take_while(|&t| t < 25.0)
+            .collect::<Vec<_>>();
+        for k in both_grounds() {
+            let sweep = |chain: bool| {
+                let frames = tips
+                    .iter()
+                    .map(|&tip| {
+                        glow_pixels(&k, &|p| {
+                            if chain {
+                                chained_glow(p, 1.0, tip, &k);
+                            } else {
+                                p.arc_glow(1.0, tip, &k);
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut behind = 0_u64;
+                let mut ahead = Vec::new();
+                for (pair, &tip) in frames.windows(2).zip(&tips) {
+                    let mut grew = 0_u64;
+                    for (i, (a, b)) in pair[0].chunks(4).zip(pair[1].chunks(4)).enumerate() {
+                        let d = a
+                            .iter()
+                            .zip(b)
+                            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+                            .sum::<u64>();
+                        let (x, y) = ((i % 160) as f64 - 79.5, (i / 160) as f64 - 79.5);
+                        if x.atan2(-y).to_degrees() < tip {
+                            behind += d;
+                        } else {
+                            grew += d;
+                        }
+                    }
+                    ahead.push(grew);
+                }
+                let lo = ahead.iter().copied().min().unwrap_or(0);
+                let hi = ahead.iter().copied().max().unwrap_or(0);
+                (behind, lo, hi)
+            };
+            let (behind, lo, hi) = sweep(false);
+            assert_eq!(
+                behind, 0,
+                "dark {}: the glow changes behind the tip",
+                k.dark
+            );
+            assert!(lo > 0, "CONTROL dark {}: the glow grows", k.dark);
+            assert!(
+                hi * 2 <= lo * 3,
+                "dark {}: the glow grows unevenly, {lo}..{hi} a frame",
+                k.dark
+            );
+            let (behind, lo, hi) = sweep(true);
+            assert!(
+                behind > 0 && hi * 2 > lo * 3,
+                "CONTROL dark {}: the chain beads ({behind} behind, {lo}..{hi} a frame)",
+                k.dark
+            );
+        }
+    }
+
+    /// The glow fades in from nothing as the load climbs past 0.55: in each pass at most one
+    /// layer steps, by one, from one load to the next a ten-thousandth on, so its first light
+    /// is one layer at the least opacity the raster draws. The chain it replaced lit every piece
+    /// of both its passes at once, at alpha 1, from 0.55.
+    #[test]
+    fn the_glow_fades_in_one_layer_at_a_time() {
+        for k in both_grounds() {
+            let tip = tip_deg(0.55);
+            let passes = |v: f32| {
+                let mut out = Vec::new();
+                arc_glow_of(&k, v, tip, &mut out);
+                GLOW.map(|(shift, ..)| {
+                    let r = (2.0 * (R_MID + shift)) as f32;
+                    out.iter()
+                        .map(|p| match *p {
+                            DrawPrim::Arc { r: at, color, .. } if at == r => u32::from(color[3]),
+                            _ => 0,
+                        })
+                        .sum::<u32>()
+                })
+            };
+            assert_eq!(passes(0.55), [0, 0], "dark {}: no glow at 0.55", k.dark);
+            let mut was = [0, 0];
+            for i in 1..=700 {
+                let now = passes(0.55 + i as f32 * 1e-4);
+                for (pass, (a, b)) in was.iter().zip(&now).enumerate() {
+                    assert!(
+                        (*a..=a + 1).contains(b),
+                        "dark {} pass {pass} at {i}: {a} to {b}",
+                        k.dark
+                    );
+                }
+                was = now;
+            }
+            assert!(was[0] > 3 && was[1] > 3, "CONTROL dark {}: {was:?}", k.dark);
+            // In pixels: the first light, against the glow at full load.
+            let light = |pixels: Vec<u8>| {
+                let face = rgba(k.face, 0xFF);
+                pixels
+                    .chunks(4)
+                    .map(|p| {
+                        (0..3)
+                            .map(|c| u64::from(p[c].abs_diff(face[c])))
+                            .sum::<u64>()
+                    })
+                    .sum::<u64>()
+            };
+            let first = (1..)
+                .map(|i| 0.55 + i as f32 * 1e-4)
+                .find(|&v| passes(v) != [0, 0])
+                .unwrap_or(0.56);
+            let full = light(glow_pixels(&k, &|p| p.arc_glow(1.0, tip, &k)));
+            let faint = light(glow_pixels(&k, &|p| p.arc_glow(first, tip, &k)));
+            assert!(
+                faint * 40 < full,
+                "dark {}: first light {faint} of {full}",
+                k.dark
+            );
+            // Over the light face the least opacity moves no byte, the chain's no more than one
+            // layer's; over the dark face the chain's first light was a seventh of its full glow.
+            let chain = light(glow_pixels(&k, &|p| chained_glow(p, 0.55, tip, &k)));
+            assert!(
+                !k.dark || chain * 40 > full,
+                "CONTROL: the chain's first light {chain} of {full}"
+            );
+        }
+    }
+
+    /// [`Pen::arc_glow`] at 2 device px per pt.
+    fn arc_glow_of(k: &GaugeInks, v: f32, tip: f64, out: &mut Vec<DrawPrim>) {
+        Pen {
+            out,
+            cx: 80.0,
+            cy: 80.0,
+            s: 2.0,
+        }
+        .arc_glow(v, tip, k);
+    }
+
+    /// Where `c` lies on the OkLab segment from `a` to `b`, to a channel's rounding, as a share
+    /// of the way (searched in thousandths), or `None` off it.
+    fn along(c: Rgb, a: Rgb, b: Rgb) -> Option<f32> {
+        let off = |t: f32| {
+            let m = ink::mix(a, b, t);
+            (0..3).map(|i| m[i].abs_diff(c[i])).max().unwrap_or(0)
+        };
+        let t = (0..=1_000)
+            .map(|i| i as f32 / 1_000.0)
+            .min_by_key(|&t| off(t))?;
+        (off(t) <= 1).then_some(t)
+    }
+
+    /// The dial keeps main's glowing orange (the owner, 2026-10-26: "I like the glowing orange
+    /// on the dial") while every data cell draws the original heat ramp: on both grounds, under
+    /// a green accent or a blue one and in both contrasts, a calm load draws no glow; past its
+    /// threshold the glow is one warm ink that climbs from amber toward orange, is the orange
+    /// stop at the redline, and climbs on toward crimson past it (`thermal[2..=4]`). CONTROL: the
+    /// data cell's ink at each load lies on neither warm segment, so the check tells them apart.
+    #[test]
+    fn the_dials_glow_draws_the_warm_stops_past_its_threshold() {
+        let place = Place {
+            centre: (80.0, 80.0),
+            slot: [10.0, 10.0, 150.0, 150.0],
+            s: 2.0,
+            r: R_FACE,
+        };
+        for (ground, fg) in [
+            ([0x16, 0x18, 0x1D], [0xE6, 0xE8, 0xEE]),
+            ([0xF5, 0xF5, 0xF7], [0x1C, 0x1E, 0x24]),
+        ] {
+            for accent in [[0x50, 0xFA, 0x7B], [0x58, 0xA6, 0xFF]] {
+                let inks = aterm_vitals::ink::vitals_inks(ground, fg, accent);
+                for (ic, heat, thermal) in [
+                    (false, inks.heat, inks.thermal),
+                    (true, inks.heat_ic, inks.thermal_ic),
+                ] {
+                    let k = GaugeInks::new(&inks, heat, 0.0);
+                    let at = format!("{ground:?} {accent:?} ic {ic}");
+                    // The one ink the dial's arcs take at `v`, or `None` for none.
+                    let glow = |v: f32| -> Option<Rgb> {
+                        let mut out = Vec::new();
+                        let gauge = Gauge {
+                            needle: Some(v),
+                            soak: 0.0,
+                        };
+                        draw(gauge, place, &k, &mut out);
+                        let arcs: Vec<Rgb> = out
+                            .into_iter()
+                            .filter_map(|p| match p {
+                                DrawPrim::Arc { color, .. } => Some([color[0], color[1], color[2]]),
+                                _ => None,
+                            })
+                            .collect();
+                        let first = *arcs.first()?;
+                        assert!(arcs.iter().all(|&c| c == first), "{at} {v}: {arcs:?}");
+                        Some(first)
+                    };
+                    assert_eq!(glow(0.25), None, "{at}: a calm load draws no glow");
+                    let (amber, orange, crimson) = (thermal[2], thermal[3], thermal[4]);
+                    let mut was = -1.0;
+                    for v in [0.60_f32, 0.70, 0.85, 0.92, 1.0] {
+                        let c = glow(v).unwrap_or_else(|| panic!("{at} {v}: the glow draws"));
+                        let t = along(c, amber, orange)
+                            .unwrap_or_else(|| panic!("{at} {v}: {c:?} off amber..orange"));
+                        assert!(t > was, "{at} {v}: {t} after {was}");
+                        was = t;
+                        assert_eq!(
+                            along(inks.cell_at(v, ic), amber, orange),
+                            None,
+                            "CONTROL {at} {v}"
+                        );
+                    }
+                    assert_eq!(glow(1.0), Some(orange), "{at}: the redline glows orange");
+                    let mut was = 0.0;
+                    for v in [1.2_f32, 1.4] {
+                        let c = glow(v).unwrap_or_else(|| panic!("{at} {v}: the glow draws"));
+                        let t = along(c, orange, crimson)
+                            .unwrap_or_else(|| panic!("{at} {v}: {c:?} off orange..crimson"));
+                        assert!(t > was, "{at} {v}: {t} after {was}");
+                        was = t;
+                        assert_eq!(
+                            along(inks.cell_at(v, ic), orange, crimson),
+                            None,
+                            "CONTROL {at} {v}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn running_hot_blooms_orange_to_red_immediately_without_waiting_for_hour_soak() {
+        for (ground, fg) in [
+            ([0x16, 0x18, 0x1D], [0xE6, 0xE8, 0xEE]),
+            ([0xF5, 0xF5, 0xF7], [0x1C, 0x1E, 0x24]),
+        ] {
+            let inks = aterm_vitals::ink::vitals_inks(ground, fg, [0x58, 0xA6, 0xFF]);
+            let k = GaugeInks::new(&inks, inks.heat, 0.0);
+            let place = Place {
+                centre: (80.0, 80.0),
+                slot: [10.0, 10.0, 150.0, 150.0],
+                s: 2.0,
+                r: R_FACE,
+            };
+            let face_px = (R_FACE * 2.0) as f32;
+            let bloom_rings = |needle: f32| -> Vec<(f32, Rgba)> {
+                let mut out = Vec::new();
+                draw(
+                    Gauge {
+                        needle: Some(needle),
+                        soak: 0.0,
+                    },
+                    place,
+                    &k,
+                    &mut out,
+                );
+                out.into_iter()
+                    .filter_map(|p| match p {
+                        DrawPrim::Ring { r_outer, fill, .. } if r_outer > face_px + 0.5 => {
+                            Some((r_outer, fill))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            assert!(
+                bloom_rings(0.70).is_empty(),
+                "moderate 70% busy stays un-bloomed"
+            );
+            let orange = bloom_rings(0.92);
+            let red = bloom_rings(1.65);
+            assert!(
+                !orange.is_empty(),
+                "92% hot load blooms immediately with soak=0"
+            );
+            assert!(
+                red.len() >= orange.len(),
+                "redline load blooms at least as wide as 92%: {} vs {}",
+                red.len(),
+                orange.len()
+            );
+            assert_ne!(
+                orange.last().map(|r| r.1),
+                red.last().map(|r| r.1),
+                "inner bloom shifts from thermal orange at 92% toward redline crimson at 165%"
+            );
+        }
     }
 }

@@ -5040,6 +5040,31 @@ fn journal_completion_error(completion: JournalCompletion) -> Option<String> {
     }
 }
 
+/// `NativeUpdateEditorCarry`'s two handoff steps, each waived where its Tier-1
+/// (`editor_carry_conformance`) binds it.
+#[cfg(all(any(test, debug_assertions), unix))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "NativeUpdateEditorCarry",
+    action = "Park",
+    reason = "The handoff's own step: the park installs the attempt record, which this machine \
+              reads only through the fences and the late fact. Tier-1 installs the real record \
+              (`PendingUpdateHandoff`) the park installs; the park itself is \
+              `NativeUpdateSeamlessHandoffOwnership`'s `ParkOutgoingReaders`."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "NativeUpdateEditorCarry",
+    action = "StandDown",
+    reason = "The handoff's own step: a launched successor stood down before the park leaves \
+              nothing restored and nothing owed. Tier-1 retires a real prelaunch record through \
+              the real completion reducer (`reduce_returned_handoff_completion`)."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn editor_carry_waivers() {}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -11616,28 +11641,3 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 }
-
-/// `NativeUpdateEditorCarry`'s two handoff steps, each waived where its Tier-1
-/// (`editor_carry_conformance`) binds it.
-#[cfg(all(any(test, debug_assertions), unix))]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "NativeUpdateEditorCarry",
-    action = "Park",
-    reason = "The handoff's own step: the park installs the attempt record, which this machine \
-              reads only through the fences and the late fact. Tier-1 installs the real record \
-              (`PendingUpdateHandoff`) the park installs; the park itself is \
-              `NativeUpdateSeamlessHandoffOwnership`'s `ParkOutgoingReaders`."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "NativeUpdateEditorCarry",
-    action = "StandDown",
-    reason = "The handoff's own step: a launched successor stood down before the park leaves \
-              nothing restored and nothing owed. Tier-1 retires a real prelaunch record through \
-              the real completion reducer (`reduce_returned_handoff_completion`)."
-)]
-#[allow(
-    dead_code,
-    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
-              not an expect: rustc does not lint a fn the declarative anchors rebuild"
-)]
-fn editor_carry_waivers() {}

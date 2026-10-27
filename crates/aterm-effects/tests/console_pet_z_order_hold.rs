@@ -113,6 +113,7 @@ impl Fixture {
 struct Burst {
     drawn: usize,
     over_ink: usize,
+    in_front: usize,
     flips: usize,
     ink_flips: usize,
     old_flips: usize,
@@ -128,7 +129,9 @@ impl Burst {
         self.drawn += 1;
         let ink = f.ink_under(rect);
         let old = !f.world.clear(rect, 0.0);
-        self.over_ink += usize::from(ink && !frame.under_ink);
+        let front = f.brain.front_pass();
+        self.over_ink += usize::from(ink && !frame.under_ink && !front);
+        self.in_front += usize::from(ink && !frame.under_ink && front);
         if let Some((under, was_ink, was_old)) = self.prev {
             self.flips += usize::from(under != frame.under_ink);
             self.ink_flips += usize::from(was_ink != ink);
@@ -158,7 +161,8 @@ fn type_pangram(ms_per_key: u64) -> Burst {
     burst
 }
 
-/// Typing at human rates never paints the pet over ink and flips z-order at most twice.
+/// Typing at human rates never paints the pet over ink and flips z-order at most twice: a
+/// writing hand deals no leg in front.
 #[test]
 fn typing_never_paints_over_ink_and_holds_the_z_order() {
     let bursts = [80, 125, 200].map(|ms| (ms, type_pangram(ms)));
@@ -168,6 +172,10 @@ fn typing_never_paints_over_ink_and_holds_the_z_order() {
     for (ms, burst) in bursts {
         assert!(burst.drawn > 200, "{ms} ms/key: the pet was barely drawn");
         assert_eq!(burst.over_ink, 0, "{ms} ms/key: painted over ink");
+        assert_eq!(
+            burst.in_front, 0,
+            "{ms} ms/key: crossed the typed line in front"
+        );
         assert!(burst.flips <= 2, "{ms} ms/key: z flips {burst:?}");
     }
     let worst = bursts.iter().map(|(_, b)| b.old_flips).max().unwrap_or(0);
@@ -240,12 +248,17 @@ fn project(f: &Fixture, frame: &PetFrame, prev: &State, under: bool, dwelt: bool
         ("under", i64::from(rect.is_some() && under)),
         ("prev_under", prev["under"]),
         ("dwelt", i64::from(dwelt)),
+        (
+            "front",
+            i64::from(rect.is_some_and(|r| f.ink_under(r)) && f.brain.front_pass()),
+        ),
     ])
 }
 
 fn action(post: &State) -> &'static str {
     match (post["drawn"], post["ink"], post["dwelt"]) {
         (0, _, _) => "Hide",
+        (_, 1, _) if post["front"] == 1 => "InkOnFrontPass",
         (_, 1, _) => "Ink",
         (_, _, 1) => "ClearDwelt",
         _ => "Clear",
@@ -377,6 +390,43 @@ fn the_real_z_order_conforms_to_the_derived_model_and_rejects_the_old_rule() {
         control.rejected > 0,
         "the model accepts the pre-fix rule over the same frames"
     );
+}
+
+/// Legs the caret sends along a line of words while nobody types cross it in front one time in
+/// three and under it otherwise, each frame a `ConsolePetZOrder` step.
+#[test]
+fn legs_along_a_line_of_words_cross_it_in_front_one_time_in_three() {
+    let mut f = Fixture::console();
+    for row in 10..=12 {
+        f.term.process(format!("\x1b[{row};1H").as_bytes());
+        f.term.process(PANGRAM);
+    }
+    f.term.process(b"\x1b[12;2H");
+    f.settle();
+    let (mut burst, mut walk) = (Burst::default(), Walk::new());
+    let mut seen = std::collections::BTreeSet::new();
+    for leg in 0..9 {
+        let col = if leg % 2 == 0 { 40 } else { 2 };
+        f.term.process(format!("\x1b[12;{col}H").as_bytes());
+        for _ in 0..150 {
+            let frame = f.tick(16);
+            burst.observe(&f, &frame);
+            walk.step(&f, &frame, false);
+            seen.insert(action(&walk.state));
+        }
+    }
+    println!("legs along words: {burst:?}; actions {seen:?}");
+    assert_eq!(
+        burst.over_ink, 0,
+        "painted over ink off a front pass: {burst:?}"
+    );
+    assert!(
+        burst.in_front > 0,
+        "no leg crossed the words in front: {burst:?}"
+    );
+    for name in ["Ink", "InkOnFrontPass"] {
+        assert!(seen.contains(name), "the legs never took {name}: {seen:?}");
+    }
 }
 
 fn replay(f: &mut Fixture, src: &str, mut each: impl FnMut(&Fixture, &PetFrame)) {

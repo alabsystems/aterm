@@ -153,7 +153,7 @@ impl TerminalHandler<'_> {
         } else if unchanged && self.shell.signs_cwd {
         } else if !self.shell_sits_at_prompt() {
             self.apply_cwd_report(report);
-        } else if self.shell.foreground_job || self.shell.program_runs_since_prompt() {
+        } else if self.job_runs_past_prompt() {
             if self.shell.cwd_before_job.is_none() {
                 self.shell.cwd_before_job = super::shell::CwdReport::of(
                     self.current_working_directory.as_deref(),
@@ -163,6 +163,23 @@ impl TerminalHandler<'_> {
             self.apply_cwd_report(report);
         } else if !self.shell.signs_cwd {
             self.shell.held_cwd = Some(report);
+        }
+    }
+
+    /// Whether a foreground or probed in-group job runs past an open prompt, recording any live `program_probe` transition.
+    fn job_runs_past_prompt(&mut self) -> bool {
+        if self.shell.foreground_job {
+            self.shell.probe_job_active = false;
+            true
+        } else if self.shell.program_probe.is_some() {
+            let running = self.shell.program_runs_since_prompt();
+            if running != self.shell.probe_job_active {
+                self.shell.probe_transitioned = true;
+            }
+            self.shell.probe_job_active = running;
+            running
+        } else {
+            self.shell.probe_job_active
         }
     }
 

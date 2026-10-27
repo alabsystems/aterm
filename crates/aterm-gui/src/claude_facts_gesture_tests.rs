@@ -435,7 +435,7 @@ fn hovering_any_part_of_the_account_lights_the_whole_unit() {
     let account = fact_hit(&app, wid, Fact::Account);
     assert_eq!(
         glyphs(&app, wid, &account),
-        "\u{2386}owner@example.com\u{b7}Max20x\u{b7}weekly61%left",
+        "\u{2386}owner\u{b7}weekly61%left",
         "one fact from the mark to the week's last word"
     );
     assert_eq!(
@@ -474,7 +474,11 @@ fn hovering_any_part_of_the_account_lights_the_whole_unit() {
     let rest = glyph_cells(&app, Fact::Account);
     let model_rest = glyph_cells(&app, Fact::Model);
     assert!(rest.iter().all(|g| !g.3), "CONTROL: nothing lit at rest");
-    assert_eq!(marks(&rest).len(), 3, "the account's mark and two joins");
+    assert_eq!(
+        marks(&rest).len(),
+        2,
+        "the account's mark and the week's join"
+    );
     for col in [account.cols.0, account.cols.1 - 1] {
         let (x, y) = px_of(&app, wid, (account.frame_row, col));
         app.on_cursor_moved(wid, x, y);

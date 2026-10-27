@@ -47,15 +47,45 @@ impl Sentinel {
     }
 
     /// Arm the sentinel just before applying a swap to `build`: records `build` with zero attempts, overwriting any stale sentinel.
+    /// # Errors
+    /// As [`Self::arm_with`].
     pub fn arm(&self, build: u64) -> io::Result<()> {
-        self.write_record(build, 0, &[], self.flush)
+        self.arm_with(build, self.flush)
     }
 
     /// [`Self::arm`], finished with `flush` whatever this sentinel's own: the swap's caller arms with [`Flush::Ordered`] when the swap it precedes lands on this sentinel's device ([`Flush::ordered_if_same_device`]), so the barrier keeps a swapped bundle from persisting ahead of its armed sentinel.
     /// # Errors
-    /// The write, the flush or the rename failed.
+    /// Before the rename, a write, flush or rename failure leaves the previous record as it
+    /// was. A directory flush failure after the rename attempts to remove the new arm;
+    /// failure of that removal is logged and can leave the arm present. Removal has no
+    /// directory barrier, so a power loss may also restore the record. On any `Err`, the
+    /// caller must neither swap nor keep the trial identity it wrote for this arm.
     pub fn arm_with(&self, build: u64, flush: Flush) -> io::Result<()> {
-        self.write_record(build, 0, &[], flush)
+        // Required: the swap an arm precedes must not reach the media ahead of it, so a failed
+        // flush of the folder is the arm's error, and its caller does not swap. Try to remove
+        // the record: an armed sentinel whose caller does not swap would count the
+        // running build's launches against a trial nothing started.
+        let Err(unflushed) = self.write_record(build, 0, &[], flush)? else {
+            return Ok(());
+        };
+        if let Err(error) = self.confirm() {
+            aterm_log::warn!(
+                "boot sentinel {}: flushing its folder failed after the arm for build {build} \
+                 ({unflushed}), and taking the arm back failed too: {error}",
+                self.path.display()
+            );
+        }
+        Err(unflushed)
+    }
+
+    /// Start the count of `build` at zero, as [`Self::arm`] does, for a counter no swap
+    /// follows (the budget for escaping a wedged foreign trial): the write is a count's
+    /// ([`Self::write_count`]), so a failed flush of the folder after the rename is logged
+    /// and the count stands.
+    /// # Errors
+    /// The write, the flush or the rename failed: the record is as it was.
+    pub fn restart_count(&self, build: u64) -> io::Result<()> {
+        self.write_count(build, 0, &[], self.flush)
     }
 
     /// The armed `(build, attempts)`, or `None` if absent or unparseable: a corrupt sentinel fails toward not reverting, the disruptive action.
@@ -131,7 +161,7 @@ impl Sentinel {
             Some((b, attempts, mut names)) if b == running_build => {
                 let next = attempts.saturating_add(1);
                 names.extend(name);
-                self.write_record(b, next, &names, self.flush)?;
+                self.write_count(b, next, &names, self.flush)?;
                 Ok(next)
             }
             Some(_) => Ok(0),
@@ -146,7 +176,7 @@ impl Sentinel {
             Some((b, attempts, names)) if b == running_build => {
                 let next = attempts.saturating_sub(1);
                 if next != attempts {
-                    self.write_record(b, next, &names, self.flush)?;
+                    self.write_count(b, next, &names, self.flush)?;
                 }
                 Ok(next)
             }
@@ -175,7 +205,7 @@ impl Sentinel {
         };
         names.remove(at);
         let next = attempts.saturating_sub(1);
-        self.write_record(b, next, &names, Flush::Ordered)?;
+        self.write_count(b, next, &names, Flush::Ordered)?;
         Ok(Some(next))
     }
 
@@ -187,7 +217,13 @@ impl Sentinel {
     }
 
     /// Atomic write of `"<build> <attempts>"` and the newest [`MAX_NAMED_LAUNCHES`] launch
-    /// names via a `0600` temp + rename, the temp and the directory finished with `flush`.
+    /// names via a `0600` temp + rename, the temp and the directory finished with `flush`
+    /// (a volume that refuses the temp's flush is accepted: [`aterm_durable::refusal_accepted`]).
+    /// # Errors
+    /// The outer `Err`: the write, the temp's flush or the rename failed, and the record is as
+    /// it was. The inner `Err`: the directory's flush after the rename failed other than as
+    /// unavailable ([`Flush::dir_best_effort`]), so the record is in place but may not
+    /// survive a power loss.
     #[cfg_attr(trust_verify, trust::skip)]
     fn write_record(
         &self,
@@ -195,9 +231,12 @@ impl Sentinel {
         attempts: u32,
         names: &[LaunchName],
         flush: Flush,
-    ) -> io::Result<()> {
+    ) -> io::Result<io::Result<()>> {
         use std::io::Write as _;
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = match self.path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
         let tmp = parent.join(format!(".boot-sentinel.tmp-{}", std::process::id()));
         {
             let mut opts = std::fs::OpenOptions::new();
@@ -216,18 +255,33 @@ impl Sentinel {
                 } = name;
                 write!(f, " {pid}:{seconds}:{micros}")?;
             }
-            match crate::durable::finish(&f, flush) {
-                Ok(()) => {}
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
-                    ) => {}
-                Err(e) => return Err(e),
-            }
+            aterm_durable::refusal_accepted(crate::durable::finish(&f, flush))?;
         }
         std::fs::rename(&tmp, &self.path)?;
-        let _ = crate::durable::sync_dir(parent, flush);
+        Ok(flush
+            .dir_best_effort(parent)
+            .map(|_flushed_or_unavailable| ()))
+    }
+
+    /// [`Self::write_record`] for a launch count, a give-back or a restarted count. Logged, not
+    /// returned: the count is in place once its rename lands, though a power loss may lose
+    /// the latest directory entry and counts. An Err would tell the caller the count was
+    /// never made (a launch's boot-health check is then deferred).
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn write_count(
+        &self,
+        build: u64,
+        attempts: u32,
+        names: &[LaunchName],
+        flush: Flush,
+    ) -> io::Result<()> {
+        if let Err(error) = self.write_record(build, attempts, names, flush)? {
+            aterm_log::warn!(
+                "boot sentinel {}: the count is in place, but flushing its folder failed, so a \
+                 power loss may take it back: {error}",
+                self.path.display()
+            );
+        }
         Ok(())
     }
 }
@@ -257,8 +311,7 @@ mod tests {
             pid: 7,
             started: (1, 2),
         };
-        let per_write = if cfg!(unix) { 2 } else { 1 };
-        let writes = |flush: Flush, n: usize| vec![flush; n * per_write];
+        let writes = |flush: Flush, n: usize| vec![flush; n * 2];
         let recording = Recording::start();
         s.arm(9).unwrap();
         assert_eq!(
@@ -273,7 +326,7 @@ mod tests {
         assert_eq!(s.forgive_launch_of(9, 7, Some((1, 2))).unwrap(), Some(0));
         assert_eq!(recording.take(), writes(O, 1), "a named give-back");
         let counter = Sentinel::ordered(dir.join("foreign-trial"));
-        counter.arm(9).unwrap();
+        counter.restart_count(9).unwrap();
         assert_eq!(counter.observe_launch(9).unwrap(), 1);
         assert_eq!(recording.take(), writes(O, 2), "an ordered counter");
         let _ = std::fs::remove_dir_all(&dir);
@@ -334,6 +387,72 @@ mod tests {
         assert_eq!(s.observe_launch(2000).unwrap(), 0);
         assert_eq!(s.read_state(), Some((1000, 0)));
         assert!(!s.should_revert(2000, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed flush of the sentinel's folder fails the arm (the swap it precedes does not
+    /// happen) and takes its record back, a stale one it replaced with it, so a failed arm
+    /// leaves no build armed for a trial its caller never starts; it fails no count, give-back
+    /// or restarted count, which are in place once renamed. A folder the volume cannot flush
+    /// fails nothing. With the record left in place, as the arm's first policy did, a failed
+    /// arm left the build armed.
+    #[test]
+    fn a_failed_folder_flush_fails_the_arm_and_not_a_count() {
+        use aterm_durable::seam::{EIO, ENOTSUP, FailingDirs};
+        let (s, dir) = sentinel("dir-flush-fails");
+        s.arm(8).unwrap();
+        {
+            let _eio = FailingDirs::with(EIO);
+            assert_eq!(
+                s.arm_with(9, Flush::Ordered).map_err(|e| e.raw_os_error()),
+                Err(Some(EIO)),
+                "an arm not ordered ahead of the swap is no arm"
+            );
+            assert_eq!(s.read_state(), None, "the failed arm is taken back");
+            assert!(!s.path.exists(), "and leaves no file behind");
+            assert_eq!(s.arm(9).map_err(|e| e.raw_os_error()), Err(Some(EIO)));
+            assert_eq!(s.read_state(), None);
+        }
+        s.arm(9).unwrap();
+        {
+            let _eio = FailingDirs::with(EIO);
+            assert_eq!(s.observe_launch(9).unwrap(), 1, "the count is in place");
+            assert_eq!(s.forgive_launch(9).unwrap(), 0, "and so is its give-back");
+            assert_eq!(s.read_state(), Some((9, 0)));
+            let me = LaunchName {
+                pid: 7,
+                started: (1, 2),
+            };
+            assert_eq!(s.observe_launch_by(9, Some(me)).unwrap(), 1);
+            assert_eq!(
+                s.forgive_launch_of(9, me.pid, Some(me.started)).unwrap(),
+                Some(0)
+            );
+            assert!(s.named_launches(9).is_empty());
+            let counter = Sentinel::ordered(dir.join("foreign-trial"));
+            counter
+                .restart_count(9)
+                .expect("a restarted count is in place too");
+            assert_eq!(counter.read_state(), Some((9, 0)));
+        }
+        {
+            let _refused = FailingDirs::with(ENOTSUP);
+            s.arm(10)
+                .expect("a folder the volume cannot flush is no failure");
+        }
+        assert_eq!(s.read_state(), Some((10, 0)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_prelanding_arm_failure_preserves_the_previous_record() {
+        let (s, dir) = sentinel("arm-temp-obstructed");
+        s.arm(8).unwrap();
+        let tmp = dir.join(format!(".boot-sentinel.tmp-{}", std::process::id()));
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(s.arm(9).is_err());
+        assert_eq!(s.read_state(), Some((8, 0)));
+        assert!(tmp.is_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

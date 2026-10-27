@@ -14,7 +14,13 @@ const NOW: i64 = 1_792_656_000_000;
 fn snapshot(load: Option<[f64; 3]>, pressure: Pressure, slots: Option<SlotsView>) -> Snapshot {
     Snapshot {
         cpu: Some(CpuView {
-            cores: vec![CoreView::default(); 18],
+            cores: vec![
+                CoreView {
+                    measured: true,
+                    ..Default::default()
+                };
+                18
+            ],
             ..CpuView::default()
         }),
         load,

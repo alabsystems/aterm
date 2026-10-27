@@ -39,6 +39,8 @@ pub struct AosReport {
     pub off_main: bool,
     pub p99_us: u64,
     pub verdict: ShapeVerdict,
+    /// The session's replay checks at the end ([`super::instance::replay_checks`]).
+    pub checks: String,
 }
 
 impl std::fmt::Display for AosReport {
@@ -47,13 +49,14 @@ impl std::fmt::Display for AosReport {
         write!(
             f,
             "AOS repairs={} keys={} p99_main_us={} max_main_us={max} max_p99_us={} \
-             off_main={} verdict={:?}",
+             off_main={} verdict={:?} {}",
             self.main_us.len(),
             self.row.keys,
             self.p99_us,
             self.row.max_p99_us,
             self.off_main,
-            self.verdict
+            self.verdict,
+            self.checks
         )
     }
 }
@@ -125,6 +128,7 @@ pub fn measure(rig: &Rig, row: &AosRow) -> Result<AosReport, CouldNotRun> {
     let _ = ctl.ok(&["aos", "detach"]);
     let p99_us = p99(&main_us);
     Ok(AosReport {
+        checks: super::instance::replay_checks(ctl),
         row: *row,
         verdict: judge(row, &main_us, off_main),
         main_us,

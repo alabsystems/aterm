@@ -8,14 +8,19 @@
 //! count), the inbox group is told the range and the count, the bridge says
 //! `link gap`, and every session the node serves names it in its `inbox`
 //! header (`given_up=`, `given_up_count=`) and marks it in its log
-//! (`mail-gap`). Every wait is a one-minute hang detector.
+//! (`mail-gap`). And mail retention still holds is read where a filter's
+//! subjects have different floors: `aterm fabric status` lists an ask held
+//! below the `in` lanes' oldest (audit fix unit F7). Every wait is a
+//! one-minute hang detector.
 
 use std::time::Duration;
 
 use astream_broker::{Retention, Rule};
 use aterm_link::broker_rules::{EV_FILTER, MAIL_FILTER, MAIL_READER};
 
-use super::harness::{FLEET, SECRET, World, broker_client, kv, open_broker, until};
+use super::harness::{
+    DEADLINE, FLEET, SECRET, World, broker_client, kv, open_broker, scratch_spawnfd, until,
+};
 
 /// Every mail's text and every `ev` record's body, in bytes.
 const BODY: u64 = 4096;
@@ -149,4 +154,142 @@ fn unread_mail_the_broker_gave_up_is_named_by_inbox_and_marked_in_the_log() {
         );
         assert!(mark.contains(" by=bridge src=fabric conf=exact "), "{mark}");
     }
+}
+
+/// `aterm fabric status` LISTS AN ASK RETENTION HOLDS BELOW THE `in` LANES'
+/// OLDEST, AND NOT ONE WHOSE ANSWER IT GAVE UP (audit fix unit F7, C12,
+/// finding BUS-1), on one node: while the bridge is away, `a` asks the person
+/// `h-jsmith` twice with a deadline that has passed (the person lanes' reader
+/// group is one nothing commits, so retention holds the asks); the person
+/// answers the first on `a`'s lane; then `a` mails `b`. The node's inbox
+/// group reads the answer and the mail, and the bulk stream's cut gives them
+/// up past the asks: their subjects' floors, so the oldest of the node cap's
+/// `in/*/*/<node>/*` face, lie above the asks (CONTROL: a plain read on at
+/// that floor, `transport::fetch_kept`, misses them). Back on the same
+/// broker, `aterm fabric status --json` lists the unanswered ask in `overdue`
+/// and names it in `warnings`, and leaves out the answered one: its answer is
+/// given up, so status cannot say it had none. Stamps are hand-set (`t=1`).
+/// NEGATIVE CONTROLS (run): status's TRAFFIC, deadline scan and unhandled age
+/// all reading on at the floor leaves `overdue` empty (the deadline scan's
+/// alone does not fail it: TRAFFIC's told read has already asked for gap
+/// notices on status's one probe connection, so aterm-link's
+/// `an_ask_held_below_the_in_lanes_oldest_is_listed_overdue` is the test that
+/// pins that read); the deadline scan judging asks without the asker's
+/// answers lists the answered one too.
+#[test]
+fn status_lists_an_ask_retention_holds_below_the_in_lanes_oldest() {
+    let mut w = World::boot_flags_with("mgask", &["--log", "off"], &[]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    w.stop_broker();
+
+    let broker = open_broker(&w.broker_log, &w.opts);
+    broker.set_retention_interval(Duration::from_secs(3600));
+    let side = w.tmp.join("side.sock");
+    let mut side_handle = broker.serve(&side).expect("serve on the side socket");
+    let mut god = broker_client(&side);
+    let cap = astream_cap::mint(SECRET, &format!("/f/{FLEET}/>")).expect("mint the god cap");
+    god.attach(&cap.filter, &cap.tag)
+        .expect("attach the god cap");
+    let asked = format!(
+        "{}/ask",
+        aterm_link::subject::person_lane(FLEET, "h-jsmith", &w.node)
+    );
+    let body = format!("v=1 t=1 from={a} dl=600000 text=which");
+    let answered = god
+        .publish(9_230, 1, &asked, body.as_bytes())
+        .expect("publish the ask the person answers")
+        .0;
+    let answer = aterm_link::subject::post_lane(FLEET, &w.node, &a, "h-jsmith", "answer");
+    god.publish(
+        9_230,
+        2,
+        &answer,
+        format!("v=1 t=1 re={answered} text=yes").as_bytes(),
+    )
+    .expect("publish the person's answer");
+    let ask = god
+        .publish(9_230, 3, &asked, body.as_bytes())
+        .expect("publish the ask")
+        .0;
+    let mail = aterm_link::subject::post_lane(FLEET, &w.node, &b, &w.node, "note");
+    let read = god
+        .publish(
+            9_230,
+            4,
+            &mail,
+            format!("v=1 t=1 from={a} text=fyi").as_bytes(),
+        )
+        .expect("publish the mail")
+        .0;
+    god.commit(&aterm_link::subject::inbox_group(FLEET, &w.node), read)
+        .expect("the node's inbox group reads the answer and the mail");
+    let filler = vec![b'e'; BODY as usize];
+    let stream = format!("/f/{FLEET}/pub/n-fill/s-fill/ev");
+    for seq in 1..=3 {
+        god.publish(9_231, seq, &stream, &filler)
+            .expect("publish an ev record");
+    }
+    broker
+        .set_retention(aterm_link::broker_rules::rules_scaled(
+            5 * BODY / 2,
+            1 << 30,
+            1 << 30,
+        ))
+        .expect("aterm's rules, scaled");
+    broker
+        .retention_tick_at(broker.now_ms())
+        .expect("the retention tick");
+    let face = format!("/f/{FLEET}/in/*/*/{}/*", w.node);
+    let ((rows, _), floor) =
+        aterm_link::transport::fetch_kept(&mut god, 0, &face, 256).expect("a read on at the floor");
+    assert!(
+        floor.is_some_and(|f| f > ask) && rows.iter().all(|(off, _, _)| *off > ask),
+        "CONTROL: {face} read on at its floor misses the held asks: {floor:?} {rows:?}"
+    );
+    drop(god);
+    let _ = std::fs::remove_file(&w.broker_sock);
+    let handle = broker
+        .serve(&w.broker_sock)
+        .expect("serve the broker again");
+    side_handle.shutdown();
+    w.broker = Some(broker);
+    w.handle = Some(handle);
+    until("the bridge to reattach", || {
+        w.verb("status")
+            .header()
+            .contains(" fabric=connected ")
+            .then_some(())
+    });
+
+    let command = std::fs::read_to_string(w.tmp.join("fabric.cmd")).expect("the fabric command");
+    let command = command.trim();
+    let bin = command
+        .split_whitespace()
+        .next()
+        .expect("the bridge binary");
+    let mut status = aterm_uds::spawnfd::command(bin);
+    scratch_spawnfd(&mut status, &w.tmp)
+        .args(["fabric", "status", "--json"])
+        .env("ATERM_FABRIC_COMMAND", command);
+    let out = aterm_uds::deadline::output_within(&mut status, DEADLINE)
+        .unwrap_or_else(|e| panic!("aterm fabric status: {e}"));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let report: aterm_json::Value =
+        aterm_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"));
+    let overdue: Vec<u64> = report["overdue"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no overdue list: {text}"))
+        .iter()
+        .filter_map(|o| o["off"].as_u64())
+        .collect();
+    assert_eq!(overdue, vec![ask], "{text}");
+    let warnings: Vec<&str> = report["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no warnings list: {text}"))
+        .iter()
+        .filter_map(aterm_json::Value::as_str)
+        .collect();
+    let names = |off: u64| warnings.iter().any(|l| l.contains(&format!(" off={off} ")));
+    assert!(names(ask) && !names(answered), "{text}");
 }

@@ -1123,7 +1123,7 @@ fn agent_lab(
     for (&(scene, chain), dir) in planned.iter().zip(&dirs) {
         let sid = forever::spawn_tab(&door, dir)?;
         let titled = forever::on(&door, &sid, &["meta", "set", "title", chain.name()]);
-        let said = forever::launch_tab(&door, &sid, chain, &script)?;
+        let said = forever::launch_tab(&door, &sid, chain, &script)?.said;
         println!(
             "  tab  {} @{sid} ({}, titled: {}): {said}, launched",
             scene.name(),

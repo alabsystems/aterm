@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright 2026 Andrew Yates
+  SPDX-License-Identifier: Apache-2.0
+
+  Info.plist template for the aterm.app macOS bundle.
+
+  The release builder stamps CFBundleShortVersionString from the release version (the
+  workspace [workspace.package] version, MAJOR.MINOR.0) and CFBundleVersion
+  from its monotonic ledger build number; both are checked against the binary
+  and manifest. The values below are only committed template
+  sentinels, never shipped. The official release uses
+  com.aterm.aterm; lower-level development/test bundle callers may supply a
+  different identifier, which is also what their signing profile must bind.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>aterm</string>
+	<key>CFBundleDisplayName</key>
+	<string>aterm</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.aterm.aterm</string>
+	<key>CFBundleExecutable</key>
+	<string>aterm</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<!-- Baselines only. The release builder overwrites both at bundle time
+	     (crates/aterm-release/src/bundle.rs): CFBundleVersion <- the monotonic
+	     RELEASES.ledger claim, CFBundleShortVersionString <- the release
+	     version, canonical MAJOR.MINOR.PATCH. CFBundleVersion is a BUILD
+	     NUMBER, so its baseline is the integer sentinel 0 — never a dotted
+	     version. -->
+	<key>CFBundleVersion</key>
+	<string>0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<!-- aterm ships ONE universal binary (arm64 + x86_64), so on Apple silicon
+	     the native slice always exists and translation is never the right
+	     answer. Without this key LaunchServices is free to pick the Intel slice,
+	     and it does: whenever the launching process is itself translated the
+	     child inherits that architecture, and a "Open using Rosetta" checkbox
+	     ticked once is remembered for the bundle forever. The Mac then shows
+	     "Using Intel-based apps on a Mac with Apple silicon ... Rosetta",
+	     running aterm emulated on the very hardware it was compiled for, or
+	     refusing to open at all where Rosetta is not installed. Reported from
+	     the field against v0.75.0, whose bundle carried neither this key nor
+	     LSArchitecturePriority. The BINARY was never at fault there: both
+	     slices are signed, arm64 carries platform macOS / minos 11.0, and
+	     v0.74.0 has byte-identical fat structure; the defect is the missing
+	     launch policy. `true` also greys out the Get Info checkbox, so the
+	     state cannot be re-entered by hand. On an Intel Mac "native" is
+	     x86_64, which this same binary carries, so the key costs those
+	     machines nothing. -->
+	<key>LSRequiresNativeExecution</key>
+	<true/>
+	<!-- A terminal never needs the discrete GPU, and crates/aterm-gpu renders on
+	     the integrated one of a dual-GPU Mac (a development build's
+	     ATERM_GPU_POWER=high seam asks for the other). This key is set so the mux may stay there. Apple's reference
+	     page for the key says only "A Boolean value indicating whether an
+	     OpenGL app may utilize the integrated GPU". That a Metal app without it
+	     keeps the discrete chip powered for its whole life, whichever MTLDevice
+	     it picks, is an expectation: Apple's current reference does not state
+	     it, and no aterm build was measured with or without the key. -->
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<!-- A DECLARED CAPABILITY of this build's code, read by the build before it
+	     at an in-session update, only after this bundle's signature and sealed
+	     identity are verified (aterm-update's handoff pre-verify): this build's
+	     successor side reads a CHUNKED rendezvous grant (ATRZ2G, crates/aterm-gui
+	     handoff_rendezvous.rs), so the outgoing build may hand it more sessions
+	     than one descriptor message carries (62), up to the protocol's 256.
+	     Without the key a parent hands over at most 62 on the launched lane, as
+	     every build before this one did. The value is the capability token the
+	     parent also publishes in ATERM_HANDOFF_GRANT_CAPS. -->
+	<key>ATermHandoffGrantChunks</key>
+	<string>chunks1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright 2026 Andrew Yates. Licensed under the Apache License, Version 2.0.</string>
+	<!-- TCC usage strings (macOS privacy alerts). These change the dialog TEXT
+	     ONLY: macOS keys file-system consent to the RESPONSIBLE process, and
+	     every program started inside an aterm session inherits aterm as that
+	     process, so the alert names aterm no matter who actually opened the
+	     file. A usage string is the one place aterm can say so. It does not
+	     grant anything, it does not stop the alert appearing, and it must
+	     never be described as the fix — see
+	     docs/DESIGN-macos-tcc-prompts-2026-08-30.md §3.2. Keep each one to a
+	     single sentence: macOS truncates long strings and shows them under
+	     Apple's own headline. -->
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Programs you run inside aterm — your shell, builds and agents — share this access to your Documents folder.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Programs you run inside aterm — your shell, builds and agents — share this access to your Desktop.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Programs you run inside aterm — your shell, builds and agents — share this access to your Downloads folder.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Programs you run inside aterm — your shell, builds and agents — share this access to network volumes you mount.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Programs you run inside aterm — your shell, builds and agents — share this access to removable disks you plug in.</string>
+	<key>NSFileProviderDomainUsageDescription</key>
+	<string>Programs you run inside aterm — your shell, builds and agents — share this access to files other apps sync for you, such as iCloud Drive.</string>
+	<key>NSAppDataUsageDescription</key>
+	<string>Programs you run inside aterm — your shell, builds and agents — share this access to other apps' data.</string>
+	<key>NSAppleMusicUsageDescription</key>
+	<string>Programs you run inside aterm — your shell, builds and agents — share this access to your music library.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Programs you run inside aterm — your shell, builds and agents — share this access to your photo library.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>aterm configures this Mac by using the Sign Out controls in Messages and FaceTime and verifies that the accounts are signed out.</string>
+	<!-- Local Network privacy (TN3179, macOS 15+): aterm is the responsible code for
+	     the tools its sessions start, so without these keys `aterm machines` (and any
+	     ssh typed in a tab) reaches no Mac on the LAN: an on-link connect fails with
+	     "No route to host" (docs/DESIGN-machines-2026-10-16.md §1.10, §9). aterm's own
+	     connections into the LAN are the fleet's (`aterm fleet join`, the survey's
+	     reads of its peers); every other is a program run inside it (`aterm machines`'
+	     ssh and dns-sd, ssh to a LAN host, an agent's dev server). NSBonjourServices
+	     names the three service types `aterm machines scan` browses with /usr/bin/dns-sd,
+	     and `_alab-vault._tcp`, the service `aterm secrets serve` registers when advertising
+	     beside its `<name>.local` host (docs/DESIGN-secrets-2026-10-20.md §9). -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>aterm syncs approved ALab Commons devices and connects its fleet on your local network. aterm machines and programs you run inside aterm — your shell, builds and agents — share this access.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_ssh._tcp</string>
+		<string>_sftp-ssh._tcp</string>
+		<string>_rfb._tcp</string>
+		<string>_alab-vault._tcp</string>
+	</array>
+</dict>
+</plist>

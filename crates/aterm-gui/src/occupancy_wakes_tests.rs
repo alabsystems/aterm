@@ -224,10 +224,12 @@ impl TestFs {
 impl TestFs {
     /// A home `<scratch>/Users//u` holding `scratch.noindex` and `Documents`, on one local volume,
     /// under the user containment, its watch budget the process's own. The scratch folder's name
-    /// has no leading dot (a root under a dotted folder is no root).
+    /// has no leading dot, and it is made outside the temp directory's quiet folder `.ubd`
+    /// (`heard`): a root under a dotted folder is no root.
     fn at_home() -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("wakes")
+            .heard()
             .tempdir()
             .expect("a scratch folder");
         let root = std::fs::canonicalize(dir.path()).expect("its own spelling");

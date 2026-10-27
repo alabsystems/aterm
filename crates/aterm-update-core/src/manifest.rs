@@ -48,6 +48,25 @@ pub struct Manifest {
     pub linux_aarch64_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linux_aarch64_size: Option<u64>,
+    /// The static bootstrap verifier published beside each native Linux executable
+    /// (`aterm-bootstrap-verify-<version>-linux-<arch>`): its asset name, SHA-256 and size,
+    /// signed with the rest of the manifest so install.sh's verifier pin can be bound to the
+    /// release signer (`ship pin-verifier --from-release`). No client reads them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_verifier_x86_64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_verifier_x86_64_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_verifier_x86_64_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_verifier_aarch64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_verifier_aarch64_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_verifier_aarch64_size: Option<u64>,
+    /// The install.sh interface those verifiers speak (`aterm_bootstrap_verify::pin::INTERFACE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_verifier_interface: Option<u32>,
     /// The Intel batteries-included DMG's asset name, e.g. `"aterm-0.47.0-x86_64.dmg"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dmg_x86_64: Option<String>,
@@ -191,6 +210,13 @@ mod tests {
             linux_aarch64: None,
             linux_aarch64_sha256: None,
             linux_aarch64_size: None,
+            linux_verifier_x86_64: None,
+            linux_verifier_x86_64_sha256: None,
+            linux_verifier_x86_64_size: None,
+            linux_verifier_aarch64: None,
+            linux_verifier_aarch64_sha256: None,
+            linux_verifier_aarch64_size: None,
+            linux_verifier_interface: None,
             min_os: Some("11.0".into()),
             team_id: Some(String::new()),
             pub_date: Some("2026-07-06T21:29:44Z".into()),
@@ -211,6 +237,25 @@ mod tests {
         m.linux_aarch64_sha256 = Some("ab".repeat(32));
         m.linux_aarch64_size = Some(33_000_000);
         m
+    }
+
+    /// The verifier receipts are signed bytes the client carries and never judges: they
+    /// round-trip, and a manifest without them reads as none.
+    #[test]
+    fn verifier_receipts_round_trip_and_are_absent_by_default() {
+        let mut m = linux_manifest();
+        assert_eq!(m.linux_verifier_aarch64, None);
+        m.linux_verifier_aarch64 = Some("aterm-bootstrap-verify-0.86.0-linux-aarch64".into());
+        m.linux_verifier_aarch64_sha256 = Some("cd".repeat(32));
+        m.linux_verifier_aarch64_size = Some(2_000_000);
+        m.linux_verifier_interface = Some(1);
+        let text = m.to_toml().unwrap();
+        assert!(
+            text.contains("linux_verifier_aarch64_sha256 = \""),
+            "{text}"
+        );
+        assert!(!text.contains("linux_verifier_x86_64"), "{text}");
+        assert_eq!(Manifest::parse(&text).unwrap(), m);
     }
 
     #[test]
@@ -364,6 +409,13 @@ mod tests {
             linux_aarch64: None,
             linux_aarch64_sha256: None,
             linux_aarch64_size: None,
+            linux_verifier_x86_64: None,
+            linux_verifier_x86_64_sha256: None,
+            linux_verifier_x86_64_size: None,
+            linux_verifier_aarch64: None,
+            linux_verifier_aarch64_sha256: None,
+            linux_verifier_aarch64_size: None,
+            linux_verifier_interface: None,
             min_os: None,
             team_id: None,
             pub_date: None,
@@ -381,6 +433,7 @@ mod tests {
             "zip_sha256",
             "linux_x86_64",
             "linux_aarch64",
+            "linux_verifier",
             "dmg_x86_64",
             "dmg_x86_64_sha256",
             "min_os",

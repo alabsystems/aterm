@@ -254,8 +254,16 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         };
         return row;
     }
-    let served_at = f.accounts.as_ref().and_then(|a| a.served_at);
-    let renewed_at = f.accounts.as_ref().and_then(|a| a.renewed_at);
+    let served_at = f
+        .accounts
+        .as_ref()
+        .and_then(|a| a.served_at)
+        .or_else(|| f.pool.as_ref().and_then(|p| p.served_at));
+    let renewed_at = f
+        .accounts
+        .as_ref()
+        .and_then(|a| a.renewed_at)
+        .or_else(|| f.pool.as_ref().and_then(|p| p.renewed_at));
     let refreshed = f.login_file.as_ref().and_then(|(_, w)| *w);
     let newest_use = [f.record.used_at, served_at, refreshed, renewed_at]
         .into_iter()
@@ -269,7 +277,8 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
             let why = f.record.ended_why.map_or("it ended", Ended::says);
             (at, why)
         });
-    let expired = f.accounts.as_ref().and_then(|a| a.state) == Some("expired");
+    let claude_expired = f.accounts.as_ref().and_then(|a| a.state) == Some("expired");
+    let pool_expired = f.pool.as_ref().and_then(|p| p.state) == Some("expired");
     row.used = [
         f.record
             .used_at
@@ -291,10 +300,15 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         };
         row.fix = Some(format!("aterm ai login {}", c.id));
     };
-    if expired {
+    if claude_expired || pool_expired {
+        let who = if claude_expired {
+            "accounts v2"
+        } else {
+            "its account pool"
+        };
         signed_out(
             &mut row,
-            "its login has ended (accounts v2 saw a login wall)".to_string(),
+            format!("its login has ended ({who} saw a login wall)"),
         );
         return row;
     }
@@ -338,7 +352,11 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     if let Some((t, how)) = row.used {
         words.push(format!("{how} {} ago", span(now.saturating_sub(t))));
     }
-    let renew_by = f.accounts.as_ref().and_then(|a| a.renew_by);
+    let renew_by = f
+        .accounts
+        .as_ref()
+        .and_then(|a| a.renew_by)
+        .or_else(|| f.pool.as_ref().and_then(|p| p.renew_by));
     let limited = [f.limited_until, f.record.limited_until]
         .into_iter()
         .flatten()
@@ -346,13 +364,18 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         .max();
     row.limited_until = limited;
     row.renew_by = renew_by;
+    let next_sign_in = f
+        .accounts
+        .as_ref()
+        .and_then(|a| a.next_sign_in.as_deref())
+        .or_else(|| f.pool.as_ref().and_then(|p| p.next_sign_in.as_deref()));
     if let Some(by) = renew_by {
         words.push(format!("renew by {}", when(by)));
         row.state = State::Due(by);
         row.mark = Mark::Warn;
         row.fix = Some(format!("aterm ai login {}", c.id));
     } else if let Some(until) = limited {
-        if let Some(next) = f.accounts.as_ref().and_then(|a| a.next_sign_in.as_deref()) {
+        if let Some(next) = next_sign_in {
             words.push(format!(
                 "usage limit until {} (next account `{next}` needs sign-in)",
                 when(until)
@@ -366,6 +389,7 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
             row.mark = Mark::Note;
         }
     } else if f.accounts.as_ref().and_then(|a| a.state) == Some("ok")
+        || f.pool.as_ref().and_then(|p| p.state) == Some("ok")
         || newest_use.is_some_and(|t| now.saturating_sub(t) <= OK_FRESH_S)
     {
         row.state = State::Ok;

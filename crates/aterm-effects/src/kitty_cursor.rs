@@ -43,6 +43,7 @@ const _: () = assert!(
             <= crate::effect_util::TWINKLE_FLASH_BOUND_HZ,
     "the exit star wink must glint within the photosensitivity flash bound"
 );
+#[inline]
 const fn dur_from_secs_f32(secs: f32) -> Duration {
     Duration::from_nanos((secs as f64 * 1_000_000_000.0).round() as u64)
 }
@@ -946,6 +947,9 @@ impl CursorCat {
             return;
         };
         let hidden = now.saturating_duration_since(paused_at);
+        if hidden.is_zero() {
+            return;
+        }
         if let Some(at) = &mut self.discovery_until {
             *at += hidden;
         }
@@ -1125,6 +1129,7 @@ impl CursorCat {
         }
     }
 
+    #[inline]
     fn resolve_pose(
         &mut self,
         now: Instant,
@@ -1801,6 +1806,7 @@ fn push_exit_veil(
 }
 
 /// Nearest-neighbour resample a straight-alpha RGBA8 image `src` (`sw×sh`) to `tw×th`.
+#[inline]
 pub fn resample_nearest(src: &[u8], sw: usize, sh: usize, tw: usize, th: usize) -> Vec<u8> {
     let mut out = Vec::new();
     resample_nearest_into(src, sw, sh, tw, th, &mut out);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Raw Win32 declarations for the Windows volume, drive-kind and identity readers (`crate::volumes`) and for the one reader of another process's parameters (`crate::peb`) — the ONLY FFI of this crate on Windows, kept in one auditable file, each call behind a safe wrapper here.
+//! Raw Win32 declarations for the Windows volume, drive-kind and identity readers (`crate::volumes`), for the reader of another process's parameters (`crate::peb`), and for the single-process image and job readers (`crate::process_path`, `crate::jobs`) — kept behind safe wrappers here.
 
 use crate::volumes::FileId;
 use std::ffi::{OsStr, OsString, c_void};
@@ -107,6 +107,15 @@ unsafe extern "system" {
         flags: u32,
         exe_name: *mut u16,
         size: *mut u32,
+    ) -> i32;
+    /// Creation, exit, kernel and user times of `process` (`processthreadsapi.h`), each a
+    /// 4-byte-aligned `FILETIME` (`exit_time` is undefined until the process exits).
+    fn GetProcessTimes(
+        process: Handle,
+        creation_time: *mut FileTime,
+        exit_time: *mut FileTime,
+        kernel_time: *mut FileTime,
+        user_time: *mut FileTime,
     ) -> i32;
     /// Copies `size` bytes of another process's memory into `buffer`: the
     /// process environment block's head, its parameters and their strings.
@@ -711,6 +720,22 @@ pub(crate) fn exited(h: BorrowedHandle<'_>) -> bool {
     unsafe { WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_OBJECT_0 }
 }
 
+/// `FILETIME` (`minwindef.h`): two 32-bit halves of a 64-bit 100-ns count, 4-byte aligned.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FileTime {
+    /// `dwLowDateTime`.
+    low_date_time: u32,
+    /// `dwHighDateTime`.
+    high_date_time: u32,
+}
+
+impl FileTime {
+    const fn ticks(self) -> u64 {
+        ((self.high_date_time as u64) << 32) | (self.low_date_time as u64)
+    }
+}
+
 /// The image `h` runs, as `QueryFullProcessImageNameW` spells it (`C:\...\x.exe`), or `None` when the call fails.
 pub(crate) fn image_path(h: BorrowedHandle<'_>) -> Option<PathBuf> {
     let mut buf = vec![0u16; 32768];
@@ -722,8 +747,45 @@ pub(crate) fn image_path(h: BorrowedHandle<'_>) -> Option<PathBuf> {
     Some(PathBuf::from(OsString::from_wide(name)))
 }
 
-/// The PEB base of a native process (`ProcessBasicInformation`), or `None`.
-pub(crate) fn basic_peb(h: BorrowedHandle<'_>) -> Option<u64> {
+/// `pid`'s executable image (`QueryFullProcessImageNameW`), when `pid > 0` and the process has not
+/// exited (`crate::process_path`).
+pub(crate) fn process_path(pid: u32) -> Option<PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+    let (process, sync) = match open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE) {
+        Some(p) => (p, true),
+        None => (open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?, false),
+    };
+    let h = process.as_handle();
+    let path = image_path(h).filter(|p| p.is_absolute())?;
+    (!(sync && exited(h))).then_some(path)
+}
+
+/// `h`'s creation, kernel and user `FILETIME` counts (`GetProcessTimes`), or `None`.
+fn process_times(h: BorrowedHandle<'_>) -> Option<(u64, u64, u64)> {
+    let (mut creation, mut exit, mut kernel, mut user) = (
+        FileTime::default(),
+        FileTime::default(),
+        FileTime::default(),
+        FileTime::default(),
+    );
+    // SAFETY: `h` is a live process handle opened with `PROCESS_QUERY_LIMITED_INFORMATION`; the
+    // four outputs are distinct writable 4-byte-aligned `FILETIME` locals.
+    let ok = unsafe {
+        GetProcessTimes(
+            h.as_raw_handle(),
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    (ok != 0).then(|| (creation.ticks(), kernel.ticks(), user.ticks()))
+}
+
+/// `PROCESS_BASIC_INFORMATION` of `h` (`NtQueryInformationProcess`, class 0), or `None`.
+fn basic_info(h: BorrowedHandle<'_>) -> Option<ProcessBasicInformation> {
     let mut info = ProcessBasicInformation::default();
     let mut ret: u32 = 0;
     let size = u32::try_from(std::mem::size_of::<ProcessBasicInformation>()).ok()?;
@@ -737,7 +799,65 @@ pub(crate) fn basic_peb(h: BorrowedHandle<'_>) -> Option<u64> {
             &raw mut ret,
         )
     };
-    (st >= 0 && info.peb_base_address != 0).then_some(info.peb_base_address as u64)
+    (st >= 0).then_some(info)
+}
+
+/// The PEB base of a native process (`ProcessBasicInformation`), or `None`.
+pub(crate) fn basic_peb(h: BorrowedHandle<'_>) -> Option<u64> {
+    basic_info(h)
+        .filter(|info| info.peb_base_address != 0)
+        .map(|info| info.peb_base_address as u64)
+}
+
+/// [`crate::jobs::JobsReader`]'s reading of `pid` on Windows: creation `FILETIME`, CPU time,
+/// parent pid (zeroed when a younger process holds the parent's pid, as [`crate::windows::processes`]
+/// clears it), image name, and whether its handle is signalled (`Zombie`), all from one handle.
+pub(crate) fn job_facts(pid: u32) -> Option<crate::jobs::ProcFacts> {
+    if pid == 0 {
+        return None;
+    }
+    let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)?;
+    let h = process.as_handle();
+    let (create_ticks, kernel_ticks, user_ticks) = process_times(h)?;
+    let zombie = exited(h);
+    let raw_ppid = basic_info(h)
+        .and_then(|info| u32::try_from(info.inherited_from_unique_process_id).ok())
+        .unwrap_or(0);
+    let ppid = if raw_ppid > 0
+        && open_process(raw_ppid, PROCESS_QUERY_LIMITED_INFORMATION)
+            .and_then(|parent| process_times(parent.as_handle()))
+            .is_some_and(|(parent_created, _, _)| parent_created > create_ticks)
+    {
+        0
+    } else {
+        raw_ppid
+    };
+    let exe = image_path(h)
+        .as_deref()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        .map(str::to_owned);
+    let name = exe
+        .clone()
+        .map_or_else(String::new, crate::windows::short_image_name);
+    let cpu_ns = user_ticks.saturating_add(kernel_ticks).saturating_mul(100);
+    Some(crate::jobs::ProcFacts {
+        pid,
+        ppid,
+        start: (create_ticks > 0).then_some(create_ticks),
+        name,
+        exe: (!zombie).then_some(exe).flatten(),
+        state: if zombie {
+            crate::jobs::RunState::Zombie
+        } else {
+            crate::jobs::RunState::Unknown
+        },
+        counters: Some(crate::jobs::Counters {
+            cpu_ns,
+            ..crate::jobs::Counters::default()
+        }),
+        ..crate::jobs::ProcFacts::default()
+    })
 }
 
 /// The 32-bit PEB base of a WOW64 process, or `None` when the process is native (`ProcessWow64Information` answers a null pointer) or the query fails (read as native, where [`basic_peb`] then decides).

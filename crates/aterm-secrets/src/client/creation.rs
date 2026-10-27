@@ -194,6 +194,15 @@ enum Phase {
     Preparing,
     Ready,
     Complete,
+    /// The first publication was refused before anything was stored ([`retire`]). The slot is
+    /// free: every reader takes this claim for none, and the next creation removes it and the
+    /// outbox it leaves.
+    Retired,
+    /// Ready, and a first publication was sent whose outcome is not known (its reply lost, the
+    /// process ended, an error that does not say nothing was stored): it may have landed, so a
+    /// later refusal, which may come from another server answering the same name or from a
+    /// volume that is gone, never retires the intent.
+    Sent,
 }
 struct Claim {
     context: [u8; 32],
@@ -217,6 +226,8 @@ fn claim(paths: &Paths) -> crate::Result<Option<Claim>> {
         0 => Phase::Preparing,
         1 => Phase::Ready,
         2 => Phase::Complete,
+        3 => Phase::Retired,
+        4 => Phase::Sent,
         _ => return Err(Error::new("invalid creation claim phase")),
     };
     let intent = Intent::decode(&bytes[69..], paths)?;
@@ -239,12 +250,70 @@ fn save_claim(paths: &Paths, intent: &Intent, digest: [u8; 32], phase: Phase) ->
         Phase::Preparing => 0,
         Phase::Ready => 1,
         Phase::Complete => 2,
+        Phase::Retired => 3,
+        Phase::Sent => 4,
     });
     bytes.extend_from_slice(&intent);
     bytes.extend_from_slice(&aterm_digest::Sha256::digest(&bytes));
     write_private_durable(&paths.dir, CLAIM, &bytes)?;
     Ok(())
 }
+/// The claim that holds this slot: none when a refused intent was retired.
+fn live(paths: &Paths) -> crate::Result<Option<Claim>> {
+    Ok(claim(paths)?.filter(|claim| claim.phase != Phase::Retired))
+}
+
+/// Gives up the intent `context` names after its first publication was refused
+/// ([`crate::ErrorKind::Refused`]): nothing was stored, so its version one, whose admin locker
+/// is the only copy of its keys, can go. The machine identity and device stay. The claim turns
+/// [`Phase::Retired`] in one durable write, under StateLock with no configuration or installed
+/// version, before anything is removed, so a crash part-way leaves a free slot, never a Ready
+/// claim without its outbox (which refuses, as a lost journal must). Called under the lease.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbCreationOutbox",
+        action = "RefusedFirst",
+        project = "aterm_secrets::client::creation::tests::creation_transition"
+    )
+)]
+fn retire(paths: &Paths, context: [u8; 32]) -> crate::Result<()> {
+    {
+        let _lock = StateLock::take(paths)?;
+        let held = claim(paths)?
+            .filter(|claim| {
+                claim.context == context && matches!(claim.phase, Phase::Ready | Phase::Sent)
+            })
+            .ok_or_else(|| Error::new("the refused creation's claim changed"))?;
+        if config(paths)?.is_some() || load_state(paths)?.seq > 0 {
+            return Err(Error::new(
+                "the refused creation's slot was configured meanwhile",
+            ));
+        }
+        save_claim(paths, &held.intent, held.digest, Phase::Retired)?;
+    }
+    clear_retired(paths)
+}
+
+/// Removes a retired intent: its outbox, then its claim, so a crash between them leaves the
+/// retired claim to remove again.
+fn clear_retired(paths: &Paths) -> crate::Result<()> {
+    let outbox = paths.dir.join("creation-outbox");
+    match std::fs::remove_dir_all(&outbox) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(Error::new(format!("{}: {error}", outbox.display()))),
+    }
+    aterm_durable::durable_dir(&paths.dir)?;
+    match std::fs::remove_file(paths.dir.join(CLAIM)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    aterm_durable::durable_dir(&paths.dir)?;
+    Ok(())
+}
+
 fn open(paths: &Paths, context: [u8; 32], ready: bool) -> crate::Result<Log> {
     let dir = paths.dir.join("creation-outbox");
     if !ready {
@@ -360,23 +429,34 @@ pub(super) fn create(
     source: &str,
     import: Option<&Path>,
     host: Option<&str>,
+    approval: Approval,
 ) -> crate::Result<Created> {
     let _lease = Lease::take(paths)?;
-    let (context, pending) = prepare(paths, source, import, host)?;
+    let (context, pending) = prepare(paths, source, import, host, approval)?;
     finish(paths, context, pending)
 }
 
+/// A retried creation finishes the version its first try prepared, so `approval` shapes only a
+/// version prepared now.
 fn prepare(
     paths: &Paths,
     source: &str,
     import: Option<&Path>,
     host: Option<&str>,
+    approval: Approval,
 ) -> crate::Result<([u8; 32], Pending)> {
     let (source, pin) = transport::parse_source(source, &paths.home)?;
     if pin.is_some() {
         return Err(Error::new("a new vault cannot use an existing signer pin"));
     }
-    let held = claim(paths)?;
+    let mut held = claim(paths)?;
+    if held
+        .as_ref()
+        .is_some_and(|claim| claim.phase == Phase::Retired)
+    {
+        clear_retired(paths)?;
+        held = None;
+    }
     let host = host.map(str::to_string).unwrap_or_else(|| {
         held.as_ref()
             .map(|claim| claim.intent.host.clone())
@@ -450,6 +530,8 @@ fn prepare(
                 aterm_digest::Sha256::digest(&pending.packet),
                 if pending.complete {
                     Phase::Complete
+                } else if held.phase == Phase::Sent {
+                    Phase::Sent
                 } else {
                     Phase::Ready
                 },
@@ -465,8 +547,14 @@ fn prepare(
         empty_slot(paths)?;
     }
     let name = transport::vault_name(&intent.source)?;
-    let (envelope, _, _) =
-        prepare_initial(paths, &name, import_path.as_deref(), &intent.host, true)?;
+    let (envelope, _, _) = prepare_initial(
+        paths,
+        &name,
+        import_path.as_deref(),
+        &intent.host,
+        true,
+        approval,
+    )?;
     {
         let _lock = StateLock::take(paths)?;
         empty_slot(paths)?;
@@ -521,7 +609,36 @@ fn empty_slot(paths: &Paths) -> crate::Result<()> {
 
 fn ensure_absent(source: &Source) -> crate::Result<()> {
     match source {
-        Source::Path(path) if fsx::kind(path)? == fsx::Kind::Missing => Ok(()),
+        Source::Path(path) => {
+            // Its first write, and every later one, refuses all but a folder (fsx::write_atomic);
+            // the folder is read first, since a file's name as one fails the path's own read.
+            if let Some(folder) = path
+                .parent()
+                .filter(|folder| !folder.as_os_str().is_empty())
+            {
+                let why = match fsx::kind(folder)? {
+                    fsx::Kind::Dir => None,
+                    fsx::Kind::Missing => Some("no such folder"),
+                    fsx::Kind::Symlink => {
+                        Some("a symlink, not a folder; name the folder it points to")
+                    }
+                    _ => Some("not a folder"),
+                };
+                if let Some(why) = why {
+                    return Err(Error::new(format!(
+                        "{}: {why}; nothing was created",
+                        folder.display()
+                    )));
+                }
+            }
+            if fsx::kind(path)? == fsx::Kind::Missing {
+                Ok(())
+            } else {
+                Err(Error::new(
+                    "the creation source already exists; join it instead",
+                ))
+            }
+        }
         Source::Url(_)
             if matches!(
                 transport::fetch(source, None, Duration::from_secs(30))?,
@@ -563,7 +680,7 @@ fn ensure_absent(source: &Source) -> crate::Result<()> {
     )
 )]
 pub(super) fn resume(paths: &Paths) -> crate::Result<()> {
-    let Some(claim) = claim(paths)? else {
+    let Some(claim) = live(paths)? else {
         return Ok(());
     };
     if claim.phase == Phase::Complete {
@@ -586,7 +703,9 @@ pub(super) fn resume(paths: &Paths) -> crate::Result<()> {
                 .ok_or_else(|| Error::new("creation source is not UTF-8"))?,
         };
         let import = (!intent.import.is_empty()).then(|| Path::new(&intent.import));
-        let (context, pending) = prepare(paths, source, import, Some(&intent.host))?;
+        // The intent does not record how the vault admits: production creation always opens it.
+        let (context, pending) =
+            prepare(paths, source, import, Some(&intent.host), Approval::Open)?;
         finish(paths, context, pending)?;
         return Ok(());
     }
@@ -605,7 +724,7 @@ pub(super) fn resume(paths: &Paths) -> crate::Result<()> {
 }
 
 pub(super) fn pending_remote(paths: &Paths) -> crate::Result<bool> {
-    let Some(claim) = claim(paths)? else {
+    let Some(claim) = live(paths)? else {
         return Ok(false);
     };
     if claim.phase == Phase::Complete || !matches!(claim.intent.source, Source::Url(_)) {
@@ -624,7 +743,7 @@ pub(super) fn pending_remote(paths: &Paths) -> crate::Result<bool> {
 /// Called under StateLock before a join can change this slot. Completed
 /// creation is historical; only unfinished intent reserves the current slot.
 pub(super) fn permit_join(paths: &Paths) -> crate::Result<()> {
-    if claim(paths)?.is_some_and(|claim| claim.phase != Phase::Complete) {
+    if live(paths)?.is_some_and(|claim| claim.phase != Phase::Complete) {
         return Err(Error::new(
             "an unfinished vault creation reserves this slot; resume it before joining another vault",
         ));
@@ -633,9 +752,17 @@ pub(super) fn permit_join(paths: &Paths) -> crate::Result<()> {
 }
 
 pub(super) fn requires_device(paths: &Paths) -> crate::Result<bool> {
-    Ok(claim(paths)?.is_some_and(|claim| claim.phase != Phase::Preparing))
+    Ok(live(paths)?.is_some_and(|claim| claim.phase != Phase::Preparing))
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbCreationOutbox",
+        action = "RefusedAfterSent",
+        project = "aterm_secrets::client::creation::tests::creation_transition"
+    )
+)]
 fn finish(paths: &Paths, context: [u8; 32], pending: Pending) -> crate::Result<Created> {
     if pending.complete {
         return pending.receipt(paths, None);
@@ -716,8 +843,39 @@ fn finish(paths: &Paths, context: [u8; 32], pending: Pending) -> crate::Result<C
                         "creation's newer cache and remote version are unavailable; refusing a rollback",
                     ));
                 }
-                transport::publish_initial(&initial.source, &pending.envelope)?;
-                pending.envelope.clone()
+                // Whether an earlier publication of this intent may have landed somewhere; this
+                // one is marked before it is sent, so a crash or a lost reply leaves the mark.
+                let digest = aterm_digest::Sha256::digest(&pending.packet);
+                let sent_before = claim(paths)?
+                    .is_some_and(|claim| claim.context == context && claim.phase == Phase::Sent);
+                save_claim(paths, &pending.intent, digest, Phase::Sent)?;
+                match transport::publish_initial(&initial.source, &pending.envelope) {
+                    Ok(()) => pending.envelope.clone(),
+                    // A conflict stored nothing of this attempt: what an earlier one did stands.
+                    Err(error) if !sent_before && error.kind() == crate::ErrorKind::NotStored => {
+                        save_claim(paths, &pending.intent, digest, Phase::Ready)?;
+                        return Err(error);
+                    }
+                    Err(error) if sent_before && error.kind() == crate::ErrorKind::Refused => {
+                        return Err(Error::new(format!(
+                            "{error}; an earlier attempt to publish this vault may have been \
+                             stored elsewhere, so this Mac keeps the creation for its subscriber \
+                             to finish"
+                        )));
+                    }
+                    Err(error) if error.kind() == crate::ErrorKind::Refused => {
+                        retire(paths, context)
+                            .map_err(|kept| Error::new(format!("{error}; {kept}")))?;
+                        return Err(Error::of_kind(
+                            crate::ErrorKind::Refused,
+                            format!(
+                                "{error}; nothing was stored, so this Mac gave up creating it and \
+                                 can create or join a vault again"
+                            ),
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             Fetched::NoNewer(_) => return Err(Error::new("creation source returned no envelope")),
         }

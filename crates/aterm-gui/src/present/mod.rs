@@ -13,7 +13,8 @@ use aterm_window::window::Window;
 pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac;
-#[cfg(test)]
+/// The scripted surface: the tests', and the `bench-support` dump's (`crate::trail_rig`).
+#[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
 pub(crate) mod scripted;
 #[cfg(target_os = "linux")]
 mod shm_mem;
@@ -25,16 +26,23 @@ pub(crate) mod win32;
 pub(crate) mod x11;
 
 /// CPU presentation backend for macOS (CoreGraphics).
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(all(
+    target_os = "macos",
+    not(any(test, all(unix, feature = "bench-support", debug_assertions)))
+))]
 pub(crate) type CpuSurface = mac::MacCpuPresenter;
 /// CPU presentation backend for Linux (X11 or Wayland).
-#[cfg(all(target_os = "linux", not(test)))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(test, all(unix, feature = "bench-support", debug_assertions)))
+))]
 pub(crate) type CpuSurface = linux::LinuxPresenter;
 /// CPU presentation backend for Windows (GDI).
 #[cfg(all(windows, not(test)))]
 pub(crate) type CpuSurface = win32::Win32Presenter;
-/// CPU presentation backend for test builds.
-#[cfg(test)]
+/// CPU presentation backend for test builds and the `bench-support` dump's: the platform
+/// presenter, or a scripted one a headless window presents onto.
+#[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
 pub(crate) type CpuSurface = scripted::TestCpuSurface;
 
 /// Non-empty damaged region of a presented frame in surface pixels.

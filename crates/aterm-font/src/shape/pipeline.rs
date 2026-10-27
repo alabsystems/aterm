@@ -14,11 +14,11 @@ use super::buffer::{
     grapheme_group,
 };
 use super::layout;
-use super::plan::{ShapePlan, Shaper};
+use super::plan::{ShapePlan, Shaper, ZeroWidthMarks};
 use super::unicode::{
     init_unicode_props, is_continuation, is_default_ignorable_info, is_emoji_extended_pictographic,
-    is_unicode_mark, is_variation_selector, is_zwj, set_continuation, set_variation_selector,
-    unhide,
+    is_unicode_mark, is_variation_selector, is_zwj, modified_combining_class, set_continuation,
+    set_variation_selector, unhide,
 };
 use super::{Direction, arabic};
 use aterm_grapheme::GeneralCategory;
@@ -33,6 +33,9 @@ pub(crate) fn shape_internal(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Bu
     rotate_chars(plan, face, buffer, target_direction);
     map_characters(face, buffer);
     setup_masks(plan, face, buffer);
+    if plan.fallback_mark_positioning {
+        super::fallback::recategorize_marks(buffer);
+    }
     for i in 0..buffer.len {
         buffer.info[i].glyph_id = buffer.info[i].glyph_index;
     }
@@ -190,7 +193,11 @@ fn map_characters(face: &ShapeFace, buffer: &mut Buffer) {
     if buffer.scratch_flags & SCRATCH_HAS_CGJ != 0 {
         for i in 1..buffer.len.saturating_sub(1) {
             if buffer.info[i].glyph_id == 0x034F {
-                unhide(&mut buffer.info[i]);
+                let last = modified_combining_class(&buffer.info[i - 1]);
+                let next = modified_combining_class(&buffer.info[i + 1]);
+                if next == 0 || last <= next {
+                    unhide(&mut buffer.info[i]);
+                }
             }
         }
     }
@@ -315,18 +322,22 @@ fn position(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) {
             buffer.pos[i].x_advance = face.glyph_h_advance(buffer.info[i].as_glyph());
         }
     }
-    let adjust_offsets = !plan.has_gpos && buffer.direction.is_forward();
-    for i in 0..len {
-        if layout::is_mark(&buffer.info[i]) {
-            let pos = &mut buffer.pos[i];
-            if adjust_offsets {
-                pos.x_offset -= pos.x_advance;
-                pos.y_offset -= pos.y_advance;
-            }
-            pos.x_advance = 0;
-            pos.y_advance = 0;
-        }
+    let adjust_offsets = plan.adjust_mark_positioning_when_zeroing && buffer.direction.is_forward();
+    if plan.zero_marks && plan.zero_width_marks == ZeroWidthMarks::ByGdefEarly {
+        zero_mark_widths_by_gdef(buffer, adjust_offsets);
     }
+    if plan.apply_gpos {
+        layout::position(plan, face, buffer);
+    } else if plan.apply_kerx {
+        super::kerx::apply(plan, face, buffer);
+    }
+    if plan.apply_kern {
+        super::kerning::apply(plan, face, buffer);
+    }
+    if plan.zero_marks && plan.zero_width_marks == ZeroWidthMarks::ByGdefLate {
+        zero_mark_widths_by_gdef(buffer, adjust_offsets);
+    }
+    let len = buffer.len;
     if buffer.scratch_flags & SCRATCH_HAS_DEFAULT_IGNORABLES != 0 {
         for i in 0..len {
             if is_default_ignorable_info(&buffer.info[i]) {
@@ -334,8 +345,26 @@ fn position(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) {
             }
         }
     }
+    super::gpos::propagate_attachments(buffer);
+    if plan.fallback_mark_positioning {
+        super::fallback::position_marks(plan, face, buffer, adjust_offsets);
+    }
     if buffer.direction.is_backward() {
         buffer.reverse();
+    }
+}
+
+fn zero_mark_widths_by_gdef(buffer: &mut Buffer, adjust_offsets: bool) {
+    let len = buffer.len;
+    for (info, pos) in buffer.info[..len].iter().zip(&mut buffer.pos[..len]) {
+        if layout::is_mark(info) {
+            if adjust_offsets {
+                pos.x_offset = pos.x_offset.wrapping_sub(pos.x_advance);
+                pos.y_offset = pos.y_offset.wrapping_sub(pos.y_advance);
+            }
+            pos.x_advance = 0;
+            pos.y_advance = 0;
+        }
     }
 }
 

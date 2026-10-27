@@ -218,22 +218,36 @@ impl Item for Aside<'_> {
 /// Wrap `items` so pending changes report `Blocked` with `why` instead of applying.
 #[must_use]
 pub fn held_back<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn Item + 'a>> {
-    hold(items, why, false)
+    hold(items, why, true, false)
 }
 
 /// `items` a run leaves as they are now.
 #[must_use]
 pub fn left_as_is<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn Item + 'a>> {
-    hold(items, why, true)
+    hold(items, why, true, true)
 }
 
-fn hold<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str, as_is: bool) -> Vec<Box<dyn Item + 'a>> {
+/// `items` another run is laying now (an install pass holding the store): each is left as it is,
+/// as [`left_as_is`] leaves it, and waits on no other item, since it changes nothing; one whose
+/// probe waits on another item (that run lays both) reads as left too.
+#[must_use]
+pub fn left_to_another<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn Item + 'a>> {
+    hold(items, why, false, true)
+}
+
+fn hold<'a>(
+    items: Vec<Box<dyn Item + 'a>>,
+    why: &str,
+    waits: bool,
+    as_is: bool,
+) -> Vec<Box<dyn Item + 'a>> {
     items
         .into_iter()
         .map(|inner| {
             Box::new(HeldBack {
                 inner,
                 why: why.to_owned(),
+                waits,
                 as_is,
             }) as Box<dyn Item + 'a>
         })
@@ -243,6 +257,8 @@ fn hold<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str, as_is: bool) -> Vec<Box<d
 struct HeldBack<'a> {
     inner: Box<dyn Item + 'a>,
     why: String,
+    /// The item's own `after`: false for [`left_to_another`], which waits on nothing.
+    waits: bool,
     /// [`left_as_is`]: a change reads `NotApplicable`, not `Blocked`.
     as_is: bool,
 }
@@ -274,6 +290,9 @@ impl Item for HeldBack<'_> {
             Probe::Change { from, .. } => Probe::Blocked {
                 why: format!("{from}; not changed: {}", self.why),
             },
+            Probe::Waits { on, .. } if !self.waits => Probe::NotApplicable {
+                why: format!("waits for {on}; left as it is: {}", self.why),
+            },
             probe => probe,
         }
     }
@@ -287,7 +306,11 @@ impl Item for HeldBack<'_> {
         self.inner.essential()
     }
     fn after(&self) -> Vec<String> {
-        self.inner.after()
+        if self.waits {
+            self.inner.after()
+        } else {
+            Vec::new()
+        }
     }
     fn detail(&self) -> Option<String> {
         self.inner.detail()
@@ -884,5 +907,70 @@ mod tests {
             "no journal line for a change nobody makes"
         );
         assert_eq!(would_applied.load(Ordering::SeqCst), 0, "nothing applied");
+    }
+
+    /// An item ANOTHER RUN LAYS (an install pass holding the store) reads `NotApplicable` and
+    /// waits on no other item: one after a predecessor left the same way is read, not blocked,
+    /// and nothing is applied or journaled. NEGATIVE CONTROL: [`left_as_is`] keeps the item's
+    /// `after`, so the same successor is blocked on the predecessor it waits for.
+    #[test]
+    fn an_item_another_run_lays_waits_on_nothing() {
+        for another in [true, false] {
+            let first = Placed::new("base.shell.hooks", Class::Relay, Requires::Account);
+            let second = Placed {
+                after: vec!["base.shell.hooks".to_owned()],
+                ..Placed::new("base.shell.rc", Class::Relay, Requires::Account)
+            };
+            // An item whose own probe waits on the first, as atpkg's rc item does.
+            let third = Placed {
+                probes: Mutex::new(vec![Probe::Waits {
+                    on: "base.shell.hooks".to_owned(),
+                    why: "the hooks are not current".to_owned(),
+                }]),
+                ..Placed::new("base.shell.rc-probe", Class::Relay, Requires::Account)
+            };
+            let applied = [
+                Arc::clone(&first.applied),
+                Arc::clone(&second.applied),
+                Arc::clone(&third.applied),
+            ];
+            let items: Vec<Box<dyn Item>> =
+                vec![Box::new(first), Box::new(second), Box::new(third)];
+            let why = "the running install pass lays these";
+            let items = if another {
+                left_to_another(items, why)
+            } else {
+                left_as_is(items, why)
+            };
+            let refreshed = Arc::new(AtomicU32::new(0));
+            let mut journal = Counted::new(&refreshed);
+            let rows = run_scoped(
+                &items,
+                Mode::Apply,
+                Scope::REPAIR,
+                &mut journal,
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(rows[0].outcome, Outcome::NotApplicable, "{rows:?}");
+            if another {
+                for row in &rows[1..] {
+                    assert_eq!(row.outcome, Outcome::NotApplicable, "{rows:?}");
+                    assert!(
+                        row.why
+                            .as_deref()
+                            .is_some_and(|said| said.ends_with(&format!("left as it is: {why}"))),
+                        "{rows:?}"
+                    );
+                }
+            } else {
+                assert_eq!(rows[1].outcome, Outcome::Blocked, "{rows:?}");
+                assert_eq!(rows[1].why.as_deref(), Some("waits for base.shell.hooks"));
+                assert_eq!(rows[2].outcome, Outcome::Blocked, "{rows:?}");
+                assert_eq!(rows[2].why.as_deref(), Some("the hooks are not current"));
+            }
+            assert!(applied.iter().all(|n| n.load(Ordering::SeqCst) == 0));
+            assert!(journal.lines.is_empty(), "{:?}", journal.lines);
+        }
     }
 }

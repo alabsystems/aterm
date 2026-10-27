@@ -35,7 +35,7 @@ fn is_never_allowed(lowered: &str) -> bool {
 }
 
 /// Host-authorized extra URI scheme set for OSC 8 hyperlinks.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct HyperlinkAuth {
     extra_schemes: Vec<Box<str>>,
 }

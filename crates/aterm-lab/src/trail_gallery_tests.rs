@@ -618,7 +618,13 @@ fn the_burst_earns_the_flying_kitty_and_typing_does_not() {
 #[test]
 fn burst_frames_are_named_for_their_time() {
     assert_eq!(burst_frame(120), "t120");
+    assert_eq!(burst_frame(1650), "l1650");
     assert_eq!(burst_frame(3600), "l3600");
+    assert_eq!(burst_start_frame(3), "key3");
+    assert!(
+        BURST_START_KEYS.iter().all(|&k| k < BURST_FLY_KEY),
+        "the start's frames come before `fly`"
+    );
     assert_eq!(
         instance_name("nyan rainbow", Theme::Dark, Scenario::Burst),
         "nyan-rainbow-dark-burst"
@@ -627,4 +633,109 @@ fn burst_frames_are_named_for_their_time() {
         paint(Scenario::Burst, Theme::Dark),
         paint(Scenario::Typing, Theme::Dark)
     );
+}
+
+/// THE SPLIT PHOTOGRAPHS THE CARET'S PANE: `split` reads the window's
+/// `panes` after it splits and refocuses, and goes on only when the focused
+/// pane is the first in reading order (the one its paint drew the prompt
+/// in). A layout row out of order is read in place; one pane, or none
+/// focused, is no split. NEGATIVE CONTROL: the new pane left focused (the
+/// second) is not the caret's.
+#[test]
+fn the_split_keeps_the_caret_s_pane_focused() {
+    let after = "layout tab=0 panes=2 zoomed=false terminal=true\n\
+                 pane session=2 rect=7,0,6x72 focused=false\n\
+                 pane session=1 rect=0,0,6x72 focused=true\n";
+    assert_eq!(panes_focus(after), Some(0));
+    let left = "layout tab=0 panes=2 zoomed=false terminal=true\n\
+                pane session=1 rect=0,0,6x72 focused=false\n\
+                pane session=2 rect=7,0,6x72 focused=true\n";
+    assert_eq!(panes_focus(left), Some(1), "control: the new pane focused");
+    assert_eq!(
+        panes_focus("layout tab=0 panes=1\npane session=1 rect=0,0,14x72 focused=true\n"),
+        None
+    );
+    assert_eq!(
+        panes_focus(
+            "pane session=1 rect=0,0,6x72 focused=false\npane session=2 rect=7,0,6x72 focused=false\n"
+        ),
+        None
+    );
+    assert_eq!(SPLIT_PANES, ["split=h", "up"]);
+}
+
+/// A SPLIT'S FRAMES ARE JUDGED ON THE CARET'S PANE: the window's dims are
+/// narrowed to the focused pane, its origin moved down by the pane's row
+/// (the pane header above it) and across by its column, so the judge reads
+/// the caret and the typed line where the pane draws them. NEGATIVE
+/// CONTROL: judged on the window's dims, the caret's row 4 lies a row (26
+/// px) above where the pane draws it.
+#[test]
+fn a_split_is_judged_on_the_caret_s_pane() {
+    let window = "OK 14 72 1008 364 session=0 cell_w=14 cell_h=26 font_px=22.00 window=0 \
+                  pad=12 pad_top=2 pad_bottom=12 head=0 tab_rows=0";
+    let panes = "layout tab=0 panes=2 zoomed=false terminal=true\n\
+                 pane session=0 rect=1,0,6x72 focused=true\n\
+                 pane session=1 rect=9,0,5x72 focused=false\n";
+    let pane = pane_dims(window, panes).expect("the focused pane's dims");
+    let g = crate::trail_contrast::grid_from_dims(&pane).expect("the pane's grid");
+    assert_eq!(
+        (g.ox, g.oy, g.cw, g.ch, g.rows, g.cols),
+        (12, 28, 14, 26, 6, 72)
+    );
+    let w = crate::trail_contrast::grid_from_dims(window).expect("the window's grid");
+    assert_eq!(
+        g.oy + 4 * g.ch - (w.oy + 4 * w.ch),
+        26,
+        "control: the window's grid reads the caret's row a row high"
+    );
+    let right = "layout tab=0 panes=2\n\
+                 pane session=1 rect=0,0,14x35 focused=false\n\
+                 pane session=2 rect=0,37,14x35 focused=true\n";
+    let g = crate::trail_contrast::grid_from_dims(&pane_dims(window, right).unwrap()).unwrap();
+    assert_eq!((g.ox, g.oy, g.cols), (12 + 37 * 14, 2, 35));
+    assert_eq!(
+        pane_dims(
+            window,
+            "layout tab=0 panes=1\npane session=1 rect=0,0,14x72 focused=true\n"
+        ),
+        None
+    );
+    assert_eq!(pane_dims("ERR no window", panes), None);
+}
+
+/// THE WIDENED SCENARIOS ARE NAMED AND PAINTED FOR WHAT THEY PHOTOGRAPH:
+/// `split`'s burst frames are its own (none is a typing frame's label, so a
+/// measure tells the two lines apart), and `move-up`'s program moves the
+/// caret up [`MOVE_UP_ROWS`] rows in the same write as its mark, over
+/// lettered rows its paint draws above the prompt. NEGATIVE CONTROL: every
+/// other paint carries no such program.
+#[test]
+fn the_widened_scenarios_name_their_frames_and_paint_their_page() {
+    assert_eq!(
+        instance_name("classic", Theme::Light, Scenario::MoveUp),
+        "classic-light-move-up"
+    );
+    assert_eq!(
+        instance_name("rainbow kitty pet", Theme::Dark, Scenario::Split),
+        "rainbow-kitty-pet-dark-split"
+    );
+    for label in SPLIT_BURST_FRAMES {
+        assert!(
+            !["mid", "t0", "t120", "t470"].contains(&label),
+            "{label} is a typing frame's"
+        );
+    }
+    let page = paint(Scenario::MoveUp, Theme::Light);
+    let program = format!("printf '[vim] {MOVE_UP_MARK}\\033[{MOVE_UP_ROWS}A");
+    assert!(page.contains(&program), "{page}");
+    let prompt_at = page.find("printf '\\033[8H'").expect("the prompt's row");
+    let lettered = page[..prompt_at].matches("\\r\\n'").count();
+    assert!(
+        lettered > usize::from(MOVE_UP_ROWS),
+        "the move crosses lettered rows: {lettered}"
+    );
+    for s in Scenario::ALL.into_iter().filter(|&s| s != Scenario::MoveUp) {
+        assert!(!paint(s, Theme::Light).contains(MOVE_UP_MARK), "{s:?}");
+    }
 }

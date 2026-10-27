@@ -1366,7 +1366,10 @@ pub enum UsageGrain {
     PerModel,
     /// Runtime and every model's tokens merged into one pair, no names.
     Total,
-    /// Runtime alone: the footer's `Σ` where the rule is too narrow for the total.
+    /// The footer's `Σ`: runtime alone where it is known (the token pair, mostly cache reads,
+    /// is the hover title's), every model's tokens merged into one pair where it is not.
+    Rule,
+    /// Runtime alone: the footer's `Σ` where the rule is too narrow for its unread count too.
     Runtime,
 }
 
@@ -1422,6 +1425,7 @@ pub fn usage_text_at(facts: &UsageFacts, grain: UsageGrain) -> Option<String> {
             }
             text
         }
+        UsageGrain::Rule if facts.runtime.is_some() => String::new(),
         _ if facts.models.is_empty() => String::new(),
         _ => pair(facts.input_total(), facts.output_total()),
     };

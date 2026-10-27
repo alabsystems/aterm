@@ -269,6 +269,7 @@ pub const fn ring_band_count(extent_px: f32) -> usize {
 }
 
 /// Emit one nova frame's additive quads (crown/ring/rays) in §6.3 spend order.
+#[inline]
 pub fn emit_nova(t_ms: u64, env: &NovaEnv, budget: usize, out: &mut Vec<GlowQuad>) -> NovaCounts {
     let mut counts = NovaCounts::default();
     let mut sink = QuadSink {
@@ -300,6 +301,7 @@ pub fn emit_nova(t_ms: u64, env: &NovaEnv, budget: usize, out: &mut Vec<GlowQuad
     counts
 }
 
+#[inline]
 fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
     let thick = env.feats.ring_thick;
     let chroma = env.feats.chroma;
@@ -401,6 +403,7 @@ const fn ray_dir(nrays: usize, rot: u8, k: usize) -> Option<(f32, f32)> {
     }
 }
 
+#[inline]
 fn emit_rays(
     sink: &mut QuadSink<'_>,
     env: &NovaEnv,
@@ -503,6 +506,7 @@ fn emit_rays(
     emitted_samples
 }
 
+#[inline]
 fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
     const INV_FLASH_SPAN_MS: f32 = 1.0 / (FLASH_END_MS - DIP_MS) as f32;
     const SEG_SPANS: [(f32, f32); 2] = [(0.0, 0.45), (0.45, 1.0)];
@@ -552,12 +556,13 @@ fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
 }
 
 /// Debris: 8–20 motes on analytic ballistic arcs (position is a closed form of age) on the wdeco Add stream, twinkling on the shared ≥ 350 ms phase grid (§6.4).
+#[inline]
 pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap: usize) {
     if out.len() >= cap || env.feats.debris == 0 {
         return;
     }
     let d = u64::from(env.feats.duration_ms);
-    if !(DEBRIS_START_MS..d).contains(&t_ms) {
+    if t_ms < DEBRIS_START_MS || t_ms >= d {
         return;
     }
     let singularity = env.magic == Some(NovaMagic::Singularity);
@@ -625,10 +630,11 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
         if x < 0.0 || y < 0.0 || x >= grid_wf || y >= grid_hf {
             continue;
         }
-        let col = ((x as i32) / env.cell_w).clamp(0, cols - 1);
-        let row = ((y as i32) / env.cell_h).clamp(0, rows - 1);
-        let dx = (x as i32 - col * env.cell_w - half_cw).clamp(-127, 127) as i8;
-        let dy = (y as i32 - row * env.cell_h - half_ch).clamp(-127, 127) as i8;
+        let (xi, yi) = (x as i32, y as i32);
+        let col = (xi / env.cell_w).clamp(0, cols - 1);
+        let row = (yi / env.cell_h).clamp(0, rows - 1);
+        let dx = (xi - col * env.cell_w - half_cw).clamp(-127, 127) as i8;
+        let dy = (yi - row * env.cell_h - half_ch).clamp(-127, 127) as i8;
         out.push(WordDecoration {
             row: row as u16,
             col: col as u16,
@@ -647,6 +653,7 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
 }
 
 /// The Singularity darkening ring: ≤ [`MAX_RING_ARC_CELLS`] per-cell Over [`DecoGlyph::RingArc`] wdecos on the cells the contracting ring crosses (`nova_add` is additive and can only brighten).
+#[inline]
 pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap: usize) {
     if cap == 0 {
         return;
@@ -744,6 +751,7 @@ pub const fn pulse_env(t_ms: u64, cross_ms: u64) -> Option<f32> {
 }
 
 /// Constant-luminance pairing by construction: take `target`'s hue and saturation, then bisect value (and, where the hue cannot reach a bright anchor at full value, saturation toward white) until the WCAG relative luminance matches `anchor`'s.
+#[inline]
 pub const fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let want = crate::color_math::relative_luminance_with(table, anchor);

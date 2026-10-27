@@ -359,6 +359,22 @@ fn long() -> Fixture {
     }
 }
 
+/// Drains the fallback response rate-limit bucket at `t = 0 ms`, then at `t = 1 ms` eats the 1 ms refill with DSR queries and flips OSC 11 under DEC 2031: the drained engine refuses the 9-byte scheme push (`modes.color_scheme` stays dark), while a fresh bucket admits it and latches light.
+fn drained_response_bucket() -> Fixture {
+    let mut drain = String::from("\x1b]11;#000000\x07");
+    drain.push_str(&"\x1b[5n".repeat(24_592));
+    let mut probe = "\x1b[5n".repeat(30);
+    probe.push_str("\x1b[?2031h\x1b]11;#ffffff\x07");
+    Fixture {
+        name: "drained_response_bucket",
+        rows: 6,
+        cols: 30,
+        policy: ResizePolicy::Native,
+        ring: None,
+        events: vec![out(drain), out(probe)],
+    }
+}
+
 fn fixtures() -> Vec<Fixture> {
     let mut fixtures = vec![
         session(),
@@ -366,6 +382,7 @@ fn fixtures() -> Vec<Fixture> {
         kitty(),
         sync_left_open(),
         live_images(),
+        drained_response_bucket(),
     ];
     fixtures.extend(conpty_fixtures());
     fixtures
@@ -409,7 +426,7 @@ fn assert_forks_fold_the_straight_end(fx: &Fixture, at: &(Seen, Vec<Option<Seen>
                 );
             }
             "kitty" => assert_eq!(refused, [2, 3, 4, 5, 8, 9], "{}", fx.name),
-            "sync_left_open" | "live_images" => {
+            "sync_left_open" | "live_images" | "drained_response_bucket" => {
                 assert!(refused.is_empty(), "{}: {refused:?}", fx.name);
             }
             "long" => {
@@ -452,7 +469,7 @@ fn a_fork_without_a_carried_piece_folds_another_end() {
         fixtures.extend(conpty_fixtures());
         fixtures
     };
-    let pieces: [(&str, Strip, Vec<Fixture>); 7] = [
+    let pieces: [(&str, Strip, Vec<Fixture>); 8] = [
         (
             "the orphaned-screen leave's notes",
             |fork| {
@@ -490,6 +507,14 @@ fn a_fork_without_a_carried_piece_folds_another_end() {
             "the resize hand-back",
             |fork| fork.grid_mut().forget_handback(),
             vec![session()],
+        ),
+        (
+            "the response rate-limit bucket",
+            |fork| {
+                fork.transient.response_rate_limiter =
+                    crate::terminal::response_rate_limiter::ResponseRateLimiter::new();
+            },
+            vec![drained_response_bucket()],
         ),
     ];
     for (piece, strip, fixtures) in pieces {
@@ -712,4 +737,170 @@ fn a_fork_verifies_the_marks_its_source_does() {
         seen(&src).checkpoint,
         "negative control: an engine without the key drops them"
     );
+}
+
+#[test]
+fn a_replay_restore_with_carry_folds_the_rest_as_the_straight_fold_does() {
+    let unbounded = |fx: &Fixture| {
+        let blank = Terminal::new(fx.rows, fx.cols).checkpoint();
+        let mut t = Terminal::replay_from_checkpoint(&blank);
+        if fx.ring.is_some() {
+            t.set_scrollback_line_limit(fx.ring);
+        }
+        fx.configure(&mut t);
+        t
+    };
+    let restore_with_carry = |t: &Terminal| {
+        t.replay_fork()?;
+        let c = t.checkpoint_continuing()?;
+        let carry = t.capture_replay_carry();
+        let mut r = Terminal::replay_from_checkpoint(&c);
+        r.apply_replay_carry(&carry);
+        Some(r)
+    };
+    let mut all = fixtures();
+    all.push(long());
+    for fx in &all {
+        let mut at = fx.at_every_boundary_from(|| unbounded(fx), restore_with_carry);
+        if fx.name == "live_images" {
+            // `TerminalCheckpoint` omits pre-keyframe inline cell `ImageRef`s (OPEN-B1), while
+            // `ReplayCarry` carries `live_image_charge` and `kitty_serial` so boundaries 0 and 1
+            // admit row 2's post-keyframe image with the exact serials `straight` assigns.
+            for (k, fork_end) in at.1.iter_mut().enumerate() {
+                if let Some(fork_end) = fork_end {
+                    assert!(
+                        fork_end.images[0].is_empty(),
+                        "checkpoint omits row 0 images"
+                    );
+                    if k < 2 {
+                        assert_eq!(fork_end.images[2], at.0.images[2], "row 2 image matches");
+                    } else {
+                        assert!(
+                            fork_end.images[2].is_empty(),
+                            "checkpoint omits row 2 images"
+                        );
+                    }
+                    fork_end.images.clone_from(&at.0.images);
+                }
+            }
+        }
+        assert_forks_fold_the_straight_end(fx, &at);
+    }
+
+    // Mid-sequence inside an open mode-2026 frame: `replay_fork` refuses off Ground, while
+    // `checkpoint_continuing` + `capture_replay_carry` carries both the partial CSI and `sync_start`.
+    let epoch = fixture_epoch();
+    let mut live = Terminal::new(6, 30);
+    live.process_at(b"\x1b[?2026h\x1b[31", clock(epoch, 0));
+    assert!(live.replay_fork().is_none(), "premise: off Ground");
+    let mid_cp = live.checkpoint_continuing().expect("carried CSI");
+    let mid_carry = live.capture_replay_carry();
+    let mut carried = Terminal::replay_from_checkpoint(&mid_cp);
+    carried.apply_replay_carry(&mid_carry);
+    let mut bare = Terminal::replay_from_checkpoint(&mid_cp);
+    for t in [&mut live, &mut carried, &mut bare] {
+        t.process_at(b"mred", clock(epoch, 500));
+    }
+    assert_eq!(seen(&carried), seen(&live), "mid-sequence sync window");
+    assert_ne!(
+        seen(&bare),
+        seen(&live),
+        "negative control: re-arming at Instant::now() expires against the recorded clock"
+    );
+
+    // PolicyEngine response and palette buckets ride `ReplayCarry`, not a checkpoint.
+    let mut drain_bucket = b"\x1b]11;#000000\x07\x1b[?2031h".to_vec();
+    for _ in 0..20_000 {
+        drain_bucket.extend_from_slice(b"\x1b[6n");
+    }
+    for _ in 0..8 {
+        drain_bucket.extend_from_slice(b"\x1b[5n");
+    }
+    let mut policy_live = Terminal::new(6, 30);
+    policy_live.apply_policy_engine(aterm_policy::engine::PolicyEngine::new(
+        aterm_policy::profiles::standard(),
+    ));
+    policy_live.process_at(&drain_bucket, clock(epoch, 0));
+    let _ = policy_live.take_response();
+    let pol_cp = policy_live.checkpoint_continuing().expect("ground");
+    let pol_carry = policy_live.capture_replay_carry();
+    let mut pol_carried = Terminal::replay_from_checkpoint(&pol_cp);
+    pol_carried.apply_replay_carry(&pol_carry);
+    let mut pol_bare = Terminal::replay_from_checkpoint(&pol_cp);
+    for t in [&mut policy_live, &mut pol_carried, &mut pol_bare] {
+        t.process_at(b"\x1b]11;#ffffff\x07", clock(epoch, 0));
+    }
+    assert_eq!(seen(&pol_carried), seen(&policy_live), "policy bucket");
+    assert_ne!(
+        seen(&pol_bare),
+        seen(&policy_live),
+        "negative control: bare replay starts with an unthrottled bucket"
+    );
+
+    // Pending `authorize_shell_integration_on_first_mark` re-key: `nonce_in_use()` is `None`
+    // before the first signed mark, so `checkpoint_carry` carries no nonce while `ReplayCarry` does.
+    const PENDING_KEY: [u8; 32] = [0x9C; 32];
+    let hex = crate::terminal::ShellIntegrationNonce(PENDING_KEY).to_hex();
+    let signed = format!("\x1b]133;A;id={hex}\x07$ ");
+    let mut pending_live = Terminal::new(6, 30);
+    pending_live.set_require_shell_integration_nonce(true);
+    pending_live.authorize_shell_integration_on_first_mark(PENDING_KEY);
+    assert!(pending_live.carried_shell_integration_nonce().is_none());
+    let pend_cp = pending_live.checkpoint_continuing().expect("ground");
+    let pend_carry = pending_live.capture_replay_carry();
+    let mut pend_carried = Terminal::replay_from_checkpoint(&pend_cp);
+    pend_carried.apply_replay_carry(&pend_carry);
+    let mut pend_bare = Terminal::replay_from_checkpoint(&pend_cp);
+    for t in [&mut pending_live, &mut pend_carried, &mut pend_bare] {
+        t.process_at(signed.as_bytes(), clock(epoch, 0));
+    }
+    assert_eq!(seen(&pend_carried), seen(&pending_live), "pending re-key");
+    assert_ne!(
+        seen(&pend_bare),
+        seen(&pending_live),
+        "negative control: bare replay drops the first signed mark"
+    );
+
+    // Pending restore lineage (`Untouched` and `Touched`): `ReplayCarry` preserves both, whereas
+    // `replay_from_checkpoint` (`None`) loses `Untouched` once output or adoption follows.
+    for (before, after, adopt) in [
+        (false, false, true),
+        (false, true, false),
+        (true, false, true),
+        (true, true, false),
+    ] {
+        let label = format!("before: {before}, after: {after}, adopt: {adopt}");
+        let mut src = Terminal::new(6, 30);
+        src.note_holder_cut(crate::terminal::HolderCut {
+            to: Some(7),
+            kind: crate::terminal::CutKind::Group,
+            from_alive: false,
+        });
+        src.process(b"\x1b[1mbefore\x1b[m the restore\r\n");
+        src.holder_carried_at = Some(src.transient.screen_mutations);
+        if before {
+            src.process(b"replayed\r\n");
+        }
+        let cp = src.checkpoint_continuing().expect("ground");
+        let carry = src.capture_replay_carry();
+        let mut with_carry = Terminal::replay_from_checkpoint(&cp);
+        with_carry.apply_replay_carry(&carry);
+        let mut without_carry = Terminal::replay_from_checkpoint(&cp);
+        let finish = |t: &mut Terminal| {
+            if after {
+                t.process(b"more\r\n");
+            }
+            let adoption = adopt.then(|| t.adopt_holder_after_restore(7, true));
+            (adoption, t.checkpoint_continuing().expect("ground"))
+        };
+        let src_end = finish(&mut src);
+        assert_eq!(finish(&mut with_carry), src_end, "{label}");
+        if !before {
+            assert_ne!(
+                finish(&mut without_carry),
+                src_end,
+                "{label}: negative control without carry"
+            );
+        }
+    }
 }

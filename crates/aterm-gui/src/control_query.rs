@@ -1430,7 +1430,8 @@ pub(crate) fn devtools_reply(outcome: crate::devtools_helper::HandOver) -> Strin
     }
 }
 
-/// `devtools hand-over [now]` -> one status line.
+/// `devtools hand-over [now]` -> one status line. `now` is `permissions walk now devtools`:
+/// the walk, Developer Tools first.
 pub(crate) fn cmd_devtools(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let now = match parse_devtools(rest) {
         Ok(now) => now,
@@ -1439,8 +1440,51 @@ pub(crate) fn cmd_devtools(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     if !cfg!(target_os = "macos") {
         return "ERR unsupported: the Developer Tools list exists only on macOS\n".to_string();
     }
-    match control_media::call_main(proxy, |reply| Wake::DevToolsHandOverAsked { now, reply }) {
+    if now {
+        return ask_walk(proxy, vec![crate::permission_walk::Subject::DeveloperTools]);
+    }
+    match control_media::call_main(proxy, |reply| Wake::DevToolsHandOverAsked { reply }) {
         Ok(outcome) => devtools_reply(outcome),
+        Err(error) => format!("ERR {error}\n"),
+    }
+}
+
+/// The usage line every malformed `permissions` form answers.
+pub(crate) const PERMISSIONS_USAGE: &str =
+    "ERR usage: permissions walk now [fda|devtools|accessibility|debugger]...\n";
+
+/// Parses `permissions walk now [<subject>…]` on the control thread: the subjects named, in
+/// order, so a malformed form is a usage error and never a wake.
+pub(crate) fn parse_permissions(
+    rest: &str,
+) -> Result<Vec<crate::permission_walk::Subject>, &'static str> {
+    let mut words = rest.split_whitespace();
+    if (words.next(), words.next()) != (Some("walk"), Some("now")) {
+        return Err(PERMISSIONS_USAGE);
+    }
+    words
+        .map(|word| crate::permission_walk::Subject::parse(word).ok_or(PERMISSIONS_USAGE))
+        .collect()
+}
+
+/// `permissions walk now [<subject>…]` -> one status line ([`crate::permission_walk::Started::reply`]).
+pub(crate) fn cmd_permissions(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let subjects = match parse_permissions(rest) {
+        Ok(subjects) => subjects,
+        Err(usage) => return usage.to_string(),
+    };
+    if !cfg!(target_os = "macos") {
+        return "ERR unsupported: aterm's permission walk is macOS's\n".to_string();
+    }
+    ask_walk(proxy, subjects)
+}
+
+fn ask_walk(
+    proxy: &EventLoopProxy<Wake>,
+    subjects: Vec<crate::permission_walk::Subject>,
+) -> String {
+    match control_media::call_main(proxy, |reply| Wake::PermissionWalkAsked { subjects, reply }) {
+        Ok(started) => started.reply(),
         Err(error) => format!("ERR {error}\n"),
     }
 }
@@ -5645,6 +5689,43 @@ mod story_tests {
 }
 
 #[cfg(test)]
+mod permissions_verb_tests {
+    use super::{PERMISSIONS_USAGE, parse_permissions};
+    use crate::permission_walk::{Started, Subject};
+
+    #[test]
+    fn the_grammar_is_walk_now_and_the_subjects_in_order() {
+        assert_eq!(parse_permissions("walk now"), Ok(vec![]));
+        assert_eq!(
+            parse_permissions(" walk  now devtools fda "),
+            Ok(vec![Subject::DeveloperTools, Subject::FullDiskAccess])
+        );
+        for junk in [
+            "",
+            "walk",
+            "now walk",
+            "walk later",
+            "walk now camera",
+            "walk now FDA",
+        ] {
+            assert_eq!(parse_permissions(junk), Err(PERMISSIONS_USAGE), "{junk:?}");
+        }
+    }
+
+    #[test]
+    fn the_reply_names_the_walks_subjects() {
+        assert_eq!(
+            Started::Walking(vec![Subject::DeveloperTools, Subject::FullDiskAccess]).reply(),
+            "OK walking devtools fda\n"
+        );
+        assert_eq!(Started::Granted.reply(), "OK granted\n");
+        assert_eq!(Started::Recent.reply(), "OK recent\n");
+        assert_eq!(Started::Declined.reply(), "OK declined\n");
+        assert!(Started::Headless.reply().starts_with("ERR headless: "));
+    }
+}
+
+#[cfg(test)]
 mod devtools_verb_tests {
 
     use super::{DEVTOOLS_USAGE, devtools_reply, parse_devtools};
@@ -5676,8 +5757,6 @@ mod devtools_verb_tests {
     fn every_outcome_has_one_answer_and_the_help_names_the_verbs_own() {
         let asked = [
             (HandOver::Queued, "OK queued\n"),
-            (HandOver::Shown, "OK shown\n"),
-            (HandOver::Unshown, "OK unshown\n"),
             (HandOver::Refused(Refusal::Granted), "OK granted\n"),
             (HandOver::Refused(Refusal::Unknown), "OK unknown\n"),
             (HandOver::Refused(Refusal::Declined), "OK declined\n"),
@@ -5696,6 +5775,8 @@ mod devtools_verb_tests {
         let headless = devtools_reply(HandOver::Headless);
         assert!(headless.starts_with("ERR headless: "), "{headless}");
         assert!(help.contains("`ERR headless: \u{2026}`"), "{help}");
+        // `now` answers as `permissions walk now devtools` does.
+        assert!(help.contains("`permissions walk now devtools`"), "{help}");
         assert_eq!(devtools_reply(HandOver::Opened), "OK opened\n");
         assert_eq!(devtools_reply(HandOver::Listing), "OK listing\n");
         assert!(devtools_reply(HandOver::OpenFailed).starts_with("ERR "));

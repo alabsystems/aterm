@@ -87,6 +87,9 @@ pub struct Config {
     pub budget: Duration,
     /// Whether to ratchet up floor counts and update the memory record.
     pub update_ratchet: bool,
+    /// Why `--update-ratchet` lowers onto this prover a floor another prover recorded that the
+    /// run falls below (`--reason`), written in the row's fifth column ([`Update::reason`]).
+    pub reason: Option<String>,
     /// Whether to attempt libraries this host would otherwise refuse for memory.
     pub try_refused: bool,
     /// Whether to write per-obligation records beside each check log ([`crate::trust_oblig`]):
@@ -119,6 +122,7 @@ impl Config {
             target_root: None,
             budget: DEFAULT_BUDGET,
             update_ratchet: false,
+            reason: None,
             try_refused: false,
             obligations: true,
             stop_if_narrowed: false,
@@ -213,6 +217,7 @@ pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Config, Strin
             }
             "--prover" => cfg.prover = Some(PathBuf::from(value()?)),
             "--update-ratchet" => cfg.update_ratchet = true,
+            "--reason" => cfg.reason = Some(trust_facts::reason_arg("run", value()?)?),
             "--try-refused" => cfg.try_refused = true,
             "--obligations" => cfg.obligations = true,
             "--no-obligations" => cfg.obligations = false,
@@ -241,6 +246,11 @@ pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Config, Strin
             );
         }
     };
+    if cfg.reason.is_some() && !cfg.update_ratchet {
+        return Err(
+            "trust run: --reason says why --update-ratchet lowers a floor; give both".into(),
+        );
+    }
     Ok(cfg)
 }
 
@@ -2147,7 +2157,10 @@ fn check_and_conclude(
     fs::write(&prep.plan_path, &plan).map_err(|e| format!("{}: {e}", prep.plan_path.display()))?;
     let mut parsed = Plan::parse(&plan)?;
     let update = if cfg.update_ratchet {
-        Update::RAISE
+        Update {
+            reason: cfg.reason.as_deref(),
+            ..Update::RAISE
+        }
     } else {
         Update::NONE
     };
@@ -6049,6 +6062,31 @@ mod tests {
         );
     }
 
+    /// `--reason` says why `--update-ratchet` lowers a floor, so it is refused without it, and
+    /// without words: a blank one would leave the row's fifth column blank.
+    #[test]
+    fn a_reason_is_given_with_update_ratchet() {
+        let reason = |args: &[&str]| parse(&mut args.iter().copied()).map(|c| c.reason);
+        assert_eq!(
+            reason(&["-p", "alpha", "--update-ratchet", "--reason", "re-based"]),
+            Ok(Some("re-based".into()))
+        );
+        assert_eq!(
+            reason(&["-p", "alpha", "--update-ratchet", "--reason", " re-based\t"]),
+            Ok(Some(" re-based\t".into()))
+        );
+        assert_eq!(reason(&["-p", "alpha", "--update-ratchet"]), Ok(None));
+        for args in [
+            &["-p", "alpha", "--reason", "re-based"][..],
+            &["-p", "alpha", "--update-ratchet", "--reason"],
+            &["-p", "alpha", "--update-ratchet", "--reason", ""],
+            &["-p", "alpha", "--update-ratchet", "--reason", " "],
+            &["-p", "alpha", "--update-ratchet", "--reason", "\t\n"],
+        ] {
+            assert!(reason(args).is_err(), "{args:?}");
+        }
+    }
+
     /// A run waits for room for its disk unless `--admit now` says to take it at once; another
     /// word is refused, naming it.
     #[test]
@@ -7521,6 +7559,42 @@ mod tests {
             !costs.contains_key("gone"),
             "a library outside the graph is not written back: {costs:?}"
         );
+    }
+
+    /// A ratcheting run given `--reason` lowers onto its prover a floor another prover recorded
+    /// that it falls below, the reason in the row; without one the row stands.
+    #[test]
+    fn a_ratcheting_run_lowers_another_provers_floor_only_with_its_reason() {
+        let theirs = "alpha\t9\t20\ttargo 0.0.0-other\n";
+        let lowered = |reason: Option<&str>| {
+            let mut s = site(Scope::Packages(vec!["alpha".into()]));
+            let floors = s.repo.join(trust_facts::RATCHET);
+            let text = fs::read_to_string(&floors).unwrap();
+            fs::write(
+                &floors,
+                text.replace("alpha\t5\t20\ttargo 0.0.0-test\n", theirs),
+            )
+            .unwrap();
+            git_in(&s.repo, &["commit", "-q", "-am", "another prover's floor"]);
+            s.cfg.update_ratchet = true;
+            s.cfg.reason = reason.map(str::to_string);
+            let (outcome, said, _) = run_site(&mut s);
+            assert_eq!(
+                outcome,
+                Outcome::Fail(vec!["alpha RATCHET-REGRESSION(<9) 5/20".into()]),
+                "judged against the floor as it stood: {said}"
+            );
+            let text = fs::read_to_string(&floors).unwrap();
+            text.lines()
+                .find(|l| l.starts_with("alpha\t"))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            lowered(Some("the new prover asks fewer")),
+            "alpha\t5\t20\ttargo 0.0.0-test\tthe new prover asks fewer"
+        );
+        assert_eq!(lowered(None), theirs.trim_end());
     }
 
     #[test]

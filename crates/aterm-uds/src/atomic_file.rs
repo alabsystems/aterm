@@ -343,6 +343,16 @@ impl std::error::Error for EditLanded {
     }
 }
 
+impl EditLanded {
+    /// The [`EditLanded`] `error` carries: an edit that is in effect though its directory's
+    /// flush failed. `None` for any other error from [`ConfigEdit::replace`], which left the
+    /// target as it was.
+    #[must_use]
+    pub fn of(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref::<Self>()
+    }
+}
+
 impl ConfigEdit<'_> {
     /// Replace the text.
     /// # Errors

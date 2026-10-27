@@ -1783,10 +1783,18 @@ fn a_status_unanswered_during_the_backoff_keeps_it() {
 fn the_desktop_s_join_gives_up_on_a_silent_bus_within_its_bound() {
     let path = std::env::temp_dir().join(format!("aterm-a11y-frozen-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
+    let address = format!("unix:path={}", path.display());
+    // The join's own bound, not the handshake default's: with none of it left the join gives up
+    // before it connects, where the default would have found no bus there.
+    let spent = super::SessionBuses::joining_within(Duration::ZERO).open(&address);
+    assert!(
+        matches!(spent, Err(aterm_dbus::Error::Timeout)),
+        "{:?}",
+        spent.err()
+    );
     let _frozen = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let asked = std::time::Instant::now();
-    let joined = super::SessionBuses::joining_within(std::time::Duration::from_millis(100))
-        .open(&format!("unix:path={}", path.display()));
+    let joined = super::SessionBuses::joining_within(Duration::from_millis(100)).open(&address);
     let waited = asked.elapsed();
     assert!(
         matches!(joined, Err(aterm_dbus::Error::Timeout)),
@@ -1794,8 +1802,8 @@ fn the_desktop_s_join_gives_up_on_a_silent_bus_within_its_bound() {
         joined.err()
     );
     assert!(
-        waited < aterm_dbus::conn::HANDSHAKE_TIMEOUT,
-        "the join gave up after {waited:?}, the handshake default's, not its own bound"
+        waited < HANG,
+        "the join to a silent bus never gave up: {waited:?}"
     );
     let _ = std::fs::remove_file(&path);
 }

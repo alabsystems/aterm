@@ -673,7 +673,8 @@ fn still_actionable(intent: &Intent, live: bool, host: &impl Host) -> bool {
         | Intent::StopPaste { .. }
         | Intent::ShowSession { .. }
         | Intent::EndRecovered
-        | Intent::ApproveJoin { .. } => live,
+        | Intent::ApproveJoin { .. }
+        | Intent::RestartService { .. } => live,
         Intent::ShowTab { .. } => false,
         Intent::ApplyUpdate { build } => host.staged_build() == Some(*build),
         Intent::OpenPath { path } => host.is_regular_file(path),
@@ -758,6 +759,10 @@ pub fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
             "Approving that Mac; it joins once the vault is published".to_string()
         }
         (Intent::ApproveJoin { .. }, false) => "Could not approve that Mac".to_string(),
+        (Intent::RestartService { .. }, true) => {
+            "Opened a tab that asks for your password once".to_string()
+        }
+        (Intent::RestartService { .. }, false) => "Could not open the restart's tab".to_string(),
         (Intent::ShowTab { tab, .. }, true) => format!("Showed tab {tab}"),
         (Intent::ShowTab { .. }, false) => "That tab is gone".to_string(),
         (Intent::ShowSession { .. }, true) => "Showed session".to_string(),
@@ -818,7 +823,9 @@ pub struct MessagesClock {
     pub offset_s: i64,
     /// Reader's current local day number ([`words::local_day`]).
     pub today: i64,
-    /// Whether the entry list includes day section headers.
+    /// Whether the entry list includes day section headers. A list that cannot stand a day's
+    /// header over its entries (a narrow window at large text) is unheaded, and each past
+    /// entry's time says its day instead ([`Self::when`]).
     pub headed: bool,
 }
 
@@ -837,14 +844,36 @@ impl MessagesClock {
         }
     }
 
-    /// Formats the lead-column timestamp for an entry at `at_unix_ms`.
+    /// Formats the lead-column timestamp for an entry at `at_unix_ms`: today's in words of how
+    /// long ago; a past day's, its clock time under its day's header, or, unheaded, the header's
+    /// words for its day ("Yesterday", "Fri, 16 Oct"), as local as the header.
     #[must_use]
     pub fn when(self, at_unix_ms: u64) -> String {
-        if self.headed && words::local_day(at_unix_ms, self.offset_s) < self.today {
+        let day = words::local_day(at_unix_ms, self.offset_s);
+        if day >= self.today {
+            words::relative_words(self.now_unix_ms, at_unix_ms)
+        } else if self.headed {
             words::clock_words(at_unix_ms, self.offset_s)
         } else {
-            words::relative_words(self.now_unix_ms, at_unix_ms)
+            words::day_heading(self.today, day, true)
         }
+    }
+
+    /// The words an entry's time at `at_unix_ms` may take, longest first: [`Self::when`]'s,
+    /// then fewer where a narrow lead column would wrap those: unheaded, a past day's
+    /// ([`words::day_forms`]); how long ago without its "ago" ("12 min ago", then "12 min").
+    #[must_use]
+    pub fn when_forms(self, at_unix_ms: u64) -> Vec<String> {
+        let day = words::local_day(at_unix_ms, self.offset_s);
+        let mut forms = if day < self.today && !self.headed {
+            words::day_forms(self.today, day)
+        } else {
+            vec![self.when(at_unix_ms)]
+        };
+        if let Some(short) = forms.first().and_then(|when| when.strip_suffix(" ago")) {
+            forms.push(short.to_string());
+        }
+        forms
     }
 
     /// Local day numbers for each entry in `visible` when [`Self::headed`] is true.

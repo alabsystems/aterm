@@ -7,6 +7,8 @@ version.workspace = true
 edition = "2024"
 license = "Apache-2.0"
 publish = false
+# `targo --unverified lab` runs the lab, never the guest helper below.
+default-run = "aterm-lab"
 description = "The real-Claude lab: the real Claude Code TUI (and Codex, agy, Muse Code) in a private, jailed headless aterm against a local stub of the API; and private aterm instances for checking a change (instance, trail-gallery, presence-flap, codex-alab-proof, fleet-sim)"
 
 # Dev-only: never packed or shipped (the workspace's atpkg expose/bundle lists
@@ -15,6 +17,13 @@ description = "The real-Claude lab: the real Claude Code TUI (and Codex, agy, Mu
 [[bin]]
 name = "aterm-lab"
 path = "src/main.rs"
+
+# The guest side of `lab mac nux` (src/guest/main.rs): `mac nux` builds it and copies it into its
+# macOS guests (the dialog census, the person at the console, the setup record's watch). Dev-only
+# as the lab is, and never run on the Mac that builds it.
+[[bin]]
+name = "aterm-lab-guest"
+path = "src/guest/main.rs"
 
 [dependencies]
 # The in-process control connection (`RelayClient`): the frame stream
@@ -81,8 +90,9 @@ aterm-durable = { workspace = true }
 # here.
 aterm-link = { path = "../aterm-link" }
 
-# `linux vz-agent` finds rustup as `verify cells` does (`rustup::find_rustup`).
-# Not a new edge in the build graph: aterm-agent above already depends on it.
+# The named lock, the waits' variable and the interrupt a lab's VM, Windows and Linux
+# runs wait on (`named_lock`, `waits`, `interrupt`). Not a new edge in the build graph:
+# aterm-agent above already depends on it.
 aterm-toolchain = { workspace = true }
 
 # `aos-search` runs Aos M4's evaluator in process: schedule plans, the grid and file

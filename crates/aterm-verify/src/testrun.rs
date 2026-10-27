@@ -587,6 +587,15 @@ pub fn run_tests(
     serial: &Cmd,
     exes: Result<Vec<TestExe>, String>,
 ) {
+    if let Err(why) = crate::test_workers::admitted_share(&ctx.env) {
+        r.cannot_run(format!("{why}; no test was run"));
+        return;
+    }
+    let serial = ctx.test_thread_override().map_or_else(
+        || serial.clone(),
+        |threads| serial.clone().env("RUST_TEST_THREADS", threads.to_string()),
+    );
+    let serial = &serial;
     #[cfg(unix)]
     match aterm_uds::host::open_file_room(4096) {
         Ok(room) => {
@@ -600,7 +609,7 @@ pub fn run_tests(
         }
         Err(error) => r.raw(format!("  test descriptor room unavailable: {error}")),
     }
-    let env = crate::findings::rerun_env(serial, ctx.test_threads);
+    let env = crate::findings::rerun_env(serial, ctx.test_thread_override());
     let serially = |r: &mut Report, why: &str| {
         r.raw(format!(
             "  test binaries: run by cargo, one at a time — {why}"

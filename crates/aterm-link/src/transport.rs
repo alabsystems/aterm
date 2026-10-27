@@ -111,6 +111,39 @@ pub fn fetch_kept<S: io::Read + io::Write>(
     }
 }
 
+/// [`fetch_kept`] FOR A READER TOLD WHAT RETENTION GAVE UP (`Client::fetch_told`, which asks
+/// for gap notices on `conn` first, once): below the filter's oldest it reads the records
+/// retention still holds there too, as a tail does (the oldest is where the filter is
+/// complete, astream's `retention::oldest`, and records some subject of it still holds can
+/// lie below it), and reads on at the floor only where the filter holds none. The page's gap
+/// notice is not kept: what it tells (every record of the filter the page skips below the
+/// notice's `to` was given up) is what the read already is. Against a broker that does not
+/// tell fetches (`Client::supports_told_fetch`) it reads as [`fetch_kept`] does.
+///
+/// # Errors
+/// As [`fetch_kept`]'s, and the gap-notice ask's.
+pub fn fetch_told_kept<S: io::Read + io::Write>(
+    conn: &mut astream_broker::Client<S>,
+    from: u64,
+    filter: &str,
+    max: u32,
+) -> io::Result<(astream_broker::Page, Option<u64>)> {
+    let mut at = from;
+    let mut tries = 0usize;
+    loop {
+        match conn.fetch_told(at, filter, max) {
+            Ok((page, _)) => return Ok((page, (at != from).then_some(at))),
+            Err(e) => match retained_past(&e, at) {
+                Some(floor) if tries < KEPT_TRIES => {
+                    tries = tries.saturating_add(1);
+                    at = floor;
+                }
+                _ => return Err(e),
+            },
+        }
+    }
+}
+
 /// RECORDS ONE `Fetch` PAGE ASKS FOR ON A FACE OF ROWS: presence, `ev`, halts.
 pub const ROW_PAGE: u32 = astream_broker::broker::LAST_PAGE_MAX;
 

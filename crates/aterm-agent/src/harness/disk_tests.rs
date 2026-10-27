@@ -1850,6 +1850,7 @@ fn the_text_form_spells_paths_plain_and_the_row_keeps_its_own() {
         ),
     };
     let hog = Hog {
+        built_s_ago: None,
         path: verbatim.clone(),
         bytes: 1 << 20,
         bytes_partial: false,

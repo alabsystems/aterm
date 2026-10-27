@@ -267,9 +267,11 @@ impl SignOut {
     }
 
     /// Whether the app macOS holds responsible for this run holds Accessibility, which the
-    /// clicks need. A run at a terminal that finds it off asks macOS once for the run (its own
-    /// consent dialog), then reads it again every [`POLL`] in this process for at most
-    /// [`PATIENCE`], going on the moment it is on; a later sign-out of the same run does not ask
+    /// clicks need. A run at a terminal that finds it off asks once for the run: through the
+    /// aterm window's permission walk when that window is the app responsible for the run (its
+    /// panel beside System Settings, [`System::walk_accessibility`]), otherwise macOS's own
+    /// consent dialog; then it reads the grant again every [`POLL`] in this process for at most
+    /// [`PATIENCE`], going on the moment it is on. A later sign-out of the same run does not ask
     /// or wait again. Anywhere else (System State, which asks for it itself) nothing is asked.
     fn accessible(&self, sys: &dyn System) -> Result<bool, String> {
         if accessibility_ready(sys)? {
@@ -289,15 +291,26 @@ impl SignOut {
             }
             *asked = true;
         }
-        say(&format!(
-            "signing out of {} clicks its Sign Out, which needs Accessibility for {}: switch it \
-             on in macOS's dialog (System Settings \u{25b8} Privacy & Security \u{25b8} \
-             Accessibility), and init goes on the moment it is on (Ctrl-C stops waiting)",
-            self.service.name(),
-            responsible(sys)
-        ));
-        if request_accessibility(sys)? {
-            return Ok(true);
+        if sys.walk_accessibility() {
+            say(&format!(
+                "signing out of {} clicks its Sign Out, which needs Accessibility for {}: the \
+                 aterm window's panel shows where to switch it on (System Settings \u{25b8} \
+                 Privacy & Security \u{25b8} Accessibility), and init goes on the moment it is \
+                 on (Ctrl-C stops waiting)",
+                self.service.name(),
+                responsible(sys)
+            ));
+        } else {
+            say(&format!(
+                "signing out of {} clicks its Sign Out, which needs Accessibility for {}: switch \
+                 it on in macOS's dialog (System Settings \u{25b8} Privacy & Security \u{25b8} \
+                 Accessibility), and init goes on the moment it is on (Ctrl-C stops waiting)",
+                self.service.name(),
+                responsible(sys)
+            ));
+            if request_accessibility(sys)? {
+                return Ok(true);
+            }
         }
         for _ in 0..ticks(PATIENCE) {
             if sys.stopped().is_some() {
@@ -1047,6 +1060,34 @@ mod tests {
         );
         let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
         assert!(at("ax-request") < at(AUTOMATION_ASK) && at(AUTOMATION_ASK) < at("Sign Out"));
+    }
+
+    /// In the aterm window that runs it, the run's Accessibility ask goes to the window's
+    /// permission walk: macOS's own dialog is not asked for, and the grant is read every 250 ms
+    /// until it flips. NEGATIVE CONTROL: with no window to walk it, macOS is asked.
+    #[test]
+    fn the_aterm_window_walks_the_runs_accessibility_ask() {
+        let (mut sys, ctx, item) = fixture();
+        sys.tty = true;
+        sys.walks = true;
+        sys.trusts(&[false, false, false, true]);
+        clicks(&sys, &item, "sign-out-requested");
+        signed_in_for(&sys, &item, 2);
+        let rows = engine::run(&[Box::new(item)], Mode::Apply, &sys, &ctx, &mut NoJournal);
+        assert_eq!(rows[0].outcome, Outcome::Changed, "{:?}", rows[0]);
+        assert_eq!(count(&sys, "ax-walk"), 1);
+        assert_eq!(count(&sys, "ax-request"), 0, "{:?}", sys.calls());
+        let calls = sys.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
+        assert!(at("ax-walk") < at(AUTOMATION_ASK) && at(AUTOMATION_ASK) < at("Sign Out"));
+
+        let (mut sys, ctx, item) = fixture();
+        sys.tty = true;
+        sys.trusts(&[false, true]);
+        clicks(&sys, &item, "sign-out-requested");
+        signed_in_for(&sys, &item, 2);
+        let _ = engine::run(&[Box::new(item)], Mode::Apply, &sys, &ctx, &mut NoJournal);
+        assert_eq!((count(&sys, "ax-walk"), count(&sys, "ax-request")), (1, 1));
     }
 
     /// Trust that never flips: after two minutes of reads (480, every 250 ms), the app comes

@@ -23,6 +23,7 @@ fn mask(kinds: &[FactKind]) -> FactMask {
 
 fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
     FactMenuFacts {
+        account_progress: None,
         title: "Folder \u{b7} tab 1".into(),
         name: None,
         room: 44,
@@ -36,8 +37,11 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         weekly_meter: None,
         weekly_gap: None,
         cli: None,
+        own_login: None,
+        refresh_usage: false,
         accounts: Vec::new(),
         accounts_refused: None,
+        accounts_loading: false,
         auto_rotate: true,
         off,
         cwd: side.then(|| PathBuf::from("/Users//someone/aterm")),
@@ -48,6 +52,44 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         note: None,
         typing: false,
     }
+}
+
+#[test]
+fn account_recovery_notes_follow_the_observation_not_the_policy_switch() {
+    use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
+    let mut progress = AccountProgress::unknown(100);
+    progress.phase = ProgressPhase::Waiting;
+    progress.details.push("synthetic recovery blocker".into());
+    progress.next_at = Some(160);
+    let mut facts = menu_facts(FactMask::default(), false);
+    facts.account_progress = Some(progress.clone());
+    facts.auto_rotate = true;
+    let before = rows(Fact::Account, &facts);
+    assert!(
+        before
+            .iter()
+            .any(|row| matches!(row, MenuRow::Note { text, .. } if text == &progress.details[0]))
+    );
+    assert!(before.iter().any(|row| matches!(
+        row,
+        MenuRow::Item {
+            act: MenuAct::Fact(Fact::Account, FactAct::NetworkState),
+            ..
+        }
+    )));
+    facts.auto_rotate = false;
+    let after = rows(Fact::Account, &facts);
+    let notes = |rows: &[MenuRow]| {
+        rows.iter()
+            .filter_map(|row| match row {
+                MenuRow::Note { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(notes(&before), notes(&after));
+    facts.account_progress.as_mut().unwrap().next_at = None;
+    assert_ne!(notes(&after), notes(&rows(Fact::Account, &facts)));
 }
 
 fn shown(rows: &[MenuRow]) -> Vec<String> {
@@ -755,7 +797,7 @@ fn an_account_rows_store_figure_carries_its_age() {
         );
         let rows = menu(label, email, false);
         assert!(
-            rows.iter().all(|row| row.label.ends_with("100% left")),
+            rows.iter().all(|row| !row.label.contains('%')),
             "nor can its weekly words fill an unobserved active row"
         );
     }
@@ -767,7 +809,7 @@ fn an_account_rows_store_figure_carries_its_age() {
     let rows = menu(None, Some("main@example.test"), false);
     assert!(rows[0].label.ends_with("40% left"));
     assert!(
-        rows[1].label.ends_with("100% left"),
+        !rows[1].label.contains('%'),
         "only the email's own row takes its words"
     );
 }
@@ -879,6 +921,7 @@ fn account_menu_shows_weekly_meter_and_rotation_accounts() {
         spoken: "Accounts, tab 1".into(),
         subscription: Some("sol-m27@example.test \u{b7} max 20x".into()),
         weekly_meter: Some(weekly_meter_bar("weekly 0% left")),
+        cli: Some(aterm_agent::harness::accounts::Cli::Claude),
         accounts: vec![
             AccountMenuRow {
                 account: AccountLabel::new("m27").unwrap(),
@@ -914,7 +957,7 @@ fn account_menu_shows_weekly_meter_and_rotation_accounts() {
             "\u{2386} m27-2 \u{b7} dedicated \u{b7} 100% left (auto-login) [fact-menu/account/use/m27-2] true",
             "\u{2386} m27-3 \u{b7} pool \u{b7} 100% left (auto-login) [fact-menu/account/use/m27-3] true",
             "rule",
-            "\u{21bb} Auto-rotate (dedicated \u{2192} pool) [fact-menu/account/auto-rotate] true",
+            "\u{21bb} Allow automatic selection [fact-menu/account/auto-rotate] true",
             "\u{22ef} Account settings\u{2026} [fact-menu/account/account-settings] true",
         ]
     );
@@ -1057,40 +1100,27 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
     );
     assert!(auto_rotate);
     assert_eq!(
-        menu_rows,
-        vec![
-            AccountMenuRow {
-                account: AccountLabel::new("m15-2").unwrap(),
-                label: "m15-2 \u{b7} dedicated \u{b7} 0% left (limited)".into(),
-                active: true,
-                enabled: true,
-            },
-            AccountMenuRow {
-                account: AccountLabel::new("m15-3").unwrap(),
-                label: "m15-3 \u{b7} dedicated \u{b7} 100% left (auto-login)".into(),
-                active: false,
-                enabled: true,
-            },
-            AccountMenuRow {
-                account: AccountLabel::new("m15-4").unwrap(),
-                label: "m15-4 \u{b7} dedicated \u{b7} not enrolled".into(),
-                active: false,
-                enabled: false,
-            },
-            AccountMenuRow {
-                account: AccountLabel::new("m15-5").unwrap(),
-                label: "m15-5 \u{b7} pool \u{b7} signed out (auto-login)".into(),
-                active: false,
-                enabled: true,
-            },
-            AccountMenuRow {
-                account: AccountLabel::new("m15-6").unwrap(),
-                label: "m15-6 \u{b7} pool \u{b7} signed out".into(),
-                active: false,
-                enabled: false,
-            },
+        menu_rows
+            .iter()
+            .map(|row| row.account.as_str())
+            .collect::<Vec<_>>(),
+        ["m15-2", "m15-3", "m15-4", "m15-5", "m15-6"]
+    );
+    assert_eq!(
+        menu_rows
+            .iter()
+            .map(|row| (row.active, row.enabled))
+            .collect::<Vec<_>>(),
+        [
+            (true, true),
+            (false, true),
+            (false, false),
+            (false, true),
+            (false, false)
         ]
     );
+    assert!(menu_rows[0].label.contains("0%"));
+    assert!(menu_rows[1..].iter().all(|row| !row.label.contains('%')));
 }
 
 /// A KIMI SESSION'S ACCOUNT MENU lists the rows of Kimi's own roster (`accounts-kimi.toml`),
@@ -1159,7 +1189,7 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
             "{menu:?}"
         );
         assert!(
-            !menu.iter().any(|row| row.contains("Auto-rotate")),
+            !menu.iter().any(|row| row.contains("automatic selection")),
             "{menu:?}"
         );
         assert!(
@@ -1186,21 +1216,64 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
     assert!(
         !menu
             .iter()
-            .any(|row| row.contains("aterm init") || row.contains("Auto-rotate")),
+            .any(|row| row.contains("aterm init") || row.contains("automatic selection")),
         "{menu:?}"
     );
     let claude_empty = "note No rotation accounts configured \u{2014} run aterm init".to_string();
-    for cli in [None, Some(Cli::Claude)] {
-        let claude = FactMenuFacts {
-            title: "Accounts \u{b7} tab 1".into(),
-            cli,
-            ..menu_facts(FactMask::default(), true)
-        };
+    let claude = FactMenuFacts {
+        title: "Accounts \u{b7} tab 1".into(),
+        cli: Some(Cli::Claude),
+        ..menu_facts(FactMask::default(), true)
+    };
+    assert!(
+        shown(&rows(Fact::Account, &claude)).contains(&claude_empty),
+        "CONTROL: Claude Code's empty state"
+    );
+}
+
+/// A MUSE SESSION'S ACCOUNT MENU SPEAKS FOR MUSE, not the rotation pool it has none of: its
+/// own login note, its usage refresh, and never Claude Code's roster or settings rows.
+#[test]
+fn a_muse_sessions_account_menu_is_its_own_login() {
+    let facts = FactMenuFacts {
+        title: "Accounts \u{b7} tab 1".into(),
+        spoken: "Accounts, tab 1".into(),
+        subscription: Some("someone@example.test \u{b7} max usage".into()),
+        weekly_meter: Some(weekly_meter_bar("weekly 51% left")),
+        own_login: Some("Muse's own login \u{2014} no rotation pool; switch with its /login"),
+        refresh_usage: true,
+        ..menu_facts(FactMask::default(), true)
+    };
+    let menu = shown(&rows(Fact::Account, &facts));
+    assert!(
+        menu.iter().any(|row| row.contains("Muse's own login")),
+        "{menu:?}"
+    );
+    assert!(
+        menu.iter()
+            .any(|row| row.contains("Refresh usage") && row.contains("refresh-usage")),
+        "{menu:?}"
+    );
+    for borrowed in [
+        "rotation accounts",
+        "automatic selection",
+        "Account settings",
+    ] {
         assert!(
-            shown(&rows(Fact::Account, &claude)).contains(&claude_empty),
-            "CONTROL {cli:?}: Claude Code's empty state"
+            !menu.iter().any(|row| row.contains(borrowed)),
+            "{borrowed} borrowed from the pool: {menu:?}"
         );
     }
+    let plain = FactMenuFacts {
+        title: "Accounts \u{b7} tab 1".into(),
+        refresh_usage: false,
+        ..facts
+    };
+    let menu = shown(&rows(Fact::Account, &plain));
+    assert!(
+        !menu.iter().any(|row| row.contains("Refresh usage")),
+        "{menu:?}"
+    );
 }
 
 #[test]

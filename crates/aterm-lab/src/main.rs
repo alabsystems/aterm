@@ -112,6 +112,8 @@ mod linux_gpu;
 #[cfg(target_os = "macos")]
 mod linux_guest;
 #[cfg(target_os = "macos")]
+mod linux_owned;
+#[cfg(target_os = "macos")]
 mod linux_proof;
 #[cfg(target_os = "macos")]
 mod linux_vz;
@@ -127,6 +129,8 @@ mod look_away;
 mod mac;
 #[cfg(target_os = "macos")]
 mod mac_nux;
+#[cfg(target_os = "macos")]
+mod mac_nux_guest;
 #[cfg(target_os = "macos")]
 mod meta_keys;
 #[cfg(target_os = "macos")]
@@ -210,9 +214,15 @@ mod sys;
 #[cfg(target_os = "macos")]
 mod tape;
 #[cfg(target_os = "macos")]
+mod trail_census;
+#[cfg(target_os = "macos")]
 mod trail_contrast;
 #[cfg(target_os = "macos")]
+mod trail_diff;
+#[cfg(target_os = "macos")]
 mod trail_gallery;
+#[cfg(target_os = "macos")]
+mod trail_keys;
 #[cfg(target_os = "macos")]
 mod tripwire;
 #[cfg(target_os = "macos")]
@@ -233,6 +243,8 @@ mod windows_desk;
 mod windows_guest;
 #[cfg(target_os = "macos")]
 mod windows_smoke;
+#[cfg(target_os = "macos")]
+mod windows_uia;
 #[cfg(target_os = "macos")]
 mod windows_window;
 #[cfg(target_os = "macos")]
@@ -276,7 +288,9 @@ usage: targo --unverified lab <command> [tag] [args]
                                  LAB_INSTANCE_ENV='TMPDIR=/abs ATERM_DEBUG_<NAME>=V ATERM_DEV_<NAME>=V ATERM_OCCUPANCY_NUDGE_S=N'
                                  LAB_HOME_IMAGE=<n>g|<n>m: the scratch home on a sparse APFS image of that size (1 GiB to 64 GiB)
                                  LAB_REROUTE=1: the lab's Claude Code store build cloned into the jail's own atpkg
-                                 prefix with its twin and reroute stub, the instance rerouting; `claude --by-name`)
+                                 prefix with its twin and reroute stub, the instance rerouting; `claude --by-name`
+                                 LAB_JAIL_SCAN=1: the instance's disk scans read the jail's processes alone (a debug
+                                 build's ATERM_DEBUG_JAIL_MARK), so `aterm harness disk free` can free in the lab)
   claude [tag] [-e K=V]... [--no-wait] [--relay] [--subscriber] [--debug-log] [--by-name] [-- claude args]
                                  launch the managed Claude Code in tab 1 (--relay: behind the PTY relay; --subscriber: a
                                  fake claude.ai OAuth token, for `limit` headers; --debug-log: a scratch debug log;
@@ -357,6 +371,11 @@ usage: targo --unverified lab <command> [tag] [args]
                                  the launch that ran there (the stub's route, or Claude Code's default route)
   footers [--out DIR] [--subscriber] [--settings '<json>'] [--no-turn] [--no-bypass] [--columns N] [--lines N]
                                  capture managed Claude Code footer screens across modes on a fresh lab
+  trail-keys [--vim] [--keep]
+                                 on a fresh lab, real Claude Code fullscreen with its caret drawn, Rainbow Kitty on: whether
+                                 the composer's keys light the trail after a drag over a path, Escape, Ctrl-L, Ctrl-C, Escape or
+                                 Ctrl-C interrupting a streaming turn and the wheel (`--vim`: NORMAL's motions stay dark, `i`
+                                 and `a` light typing again); exit 1 on a mismatch, 3 when it could not run (~1 min a mode)
   halfdraw scan <cast> --program claude|agy|muse [--show N] [--event I]
                                  replay a cast one PTY read per batch to report DEC 2026 brackets and unguarded busy gaps
   idle-points scan <tape|dir>... --program claude|agy|muse|auto [--show N]
@@ -383,7 +402,7 @@ usage: targo --unverified lab <command> [tag] [args]
                                  `step=done:taskless`; --land: the landed tab stays `task=landed` with
                                  `step=done:said-done`; --land-open: mid-work Land settles `step=done:landing` without
                                  typing Cruise nudges)
-  forever --harness <claude|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-redraw|wall-switch|wall-unread|wall-cruise|wall-relaunch|resid|ladder|angles] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]
+  forever --harness <claude|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-redraw|wall-switch|wall-unread|wall-cruise|wall-relaunch|resid|ladder|angles|switch|outage-land|outage-cruise] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]
                                  supervised Autopilot Land and Cruise scenario chains against real TUIs in scratch git
                                  repos (~15-30 min/harness):
                                  - land / cruise / both: L1-L11, L16-L17, C1-C2, HL/HC (same-land, same-cruise), P4,
@@ -401,9 +420,20 @@ usage: targo --unverified lab <command> [tag] [args]
                                    agent in the tab under the wall, W6 an unread limit told an hour past its reset (~30 min
                                    each; wall-unread ~90 min)
                                  - wall-cruise / wall-relaunch: W8 Cruise at a wall, W9 a relaunch under a wall
+                                 - outage-land / outage-cruise: O1 an API overload from Land's first prompt, O2 one met
+                                   by Cruise (Claude Code only): tries on the outage's rungs alone (15 s doubling, the
+                                   ladders at an eighth), `status waiting=overload`, one resume after the lift, then
+                                   work: Land lands, Cruise goes on (~5 min each)
                                  - resid / ladder: residual and backoff-ladder scenario slices
                                  - angles: cruise-angles, each done claim after real work asked another of the six kinds
                                    of work in turn, never held past the sixth; the back-off ladder at an eighth (~30 min)
+                                 - switch: a running Cruise tab switched to Land (`meta set autopilot land`): at rest in its
+                                   back-off (land@v1 within 5 s, before the due), under a standing draft (nothing typed until
+                                   it clears and the hold for the person who typed it ends, then land@v1 within 5 s),
+                                   flipped to Land then Off within 300 ms (nothing typed), held at the same reply (still
+                                   held, its state line still `stopped typing:`), and 5 s into a long busy turn (noted in
+                                   the turn, nothing mid-turn, land@v1 within 3 s of its point, no back-off before it);
+                                   land, cruise and both also want land@v1 within 10 s of the first point (~10 min)
                                  - --window (needs the land-p or same-land chain; refused under LAB_RESTORE=1): opens a real
                                    window, types L13's person prompt via NSEvent `hwkey` (`human_seq=` verified), and reads
                                    same-land's hold (its chip's and its band's screen-reader nodes) off it
@@ -452,8 +482,8 @@ Outside any lab (no jail, no stub):
                                  a passing run's record goes to docs/measured/)
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
-  disk-ask [tag] [--keep] [--scenario clear|partial|unanswered|exhausted]
-                                 three real Claude Code tabs in a lab whose HOME is a sparse APFS image (10-16 GiB) below
+  disk-ask [tag] [--keep] [--scenario clear|partial|unanswered|exhausted|worker]
+                                 real Claude Code tabs in a lab whose HOME is a sparse APFS image (10-16 GiB) below
                                  its floor once aterm's own pass is spent: verify the disk-free@v1 ask types its line to
                                  the one tab whose checkout holds the most, naming that build as the tab's own, and the
                                  ledger and `aterm harness disk why` credit its cleanup. clear (the default): the cleanup
@@ -465,8 +495,13 @@ Outside any lab (no jail, no stub):
                                  first, then the next largest build's tab is asked and frees, settling the episode, so
                                  the third tab is never asked (~38 min). exhausted: the cap on lines; the second tab
                                  asked answers with words too, the episode runs out at its two lines, no second worker
-                                 runs and the third tab is never asked (~60 min). Each fails if aterm's disk worker runs
-                                 as a tab's session or its task reaches a tab's conversation
+                                 runs and the third tab is never asked (~60 min). worker: two tabs each hold a draft, so
+                                 none is asked and aterm's disk worker runs: its `rm -rf` of a tool cache is declined,
+                                 `aterm harness disk free` removes the cache (journalled, the volume risen by its size),
+                                 it reports `Nothing left:` and finishes, and no tab is typed or loses its draft
+                                 (~15 min). Every worker runs real Claude Code, started by name through the lab's
+                                 reroute (LAB_REROUTE), and each scenario fails unless it finishes, in its own folder
+                                 and a session of its own, its task in no tab's conversation
   slot-capture [--watch DUR [--dir DIR]]
                                  verify `build-slot` record parsing in a scratch BUILD_SLOT_DIR, or watch ~/.cache/build-slot vs the holder scan
   slot-lane [--aterm PATH] [--keep]
@@ -477,6 +512,13 @@ Outside any lab (no jail, no stub):
   trail-contrast <png> [--find TEXT]... [--cells ROW:COL[-COL]]... [--row N]... [--newest N] [--min X]
                  [--newest-min X] [--caret-min X] [--dims FILE|--origin X,Y --cell WxH] [--no-clean] ...
                                  compute WCAG contrast JSON from trail-gallery frames and sidecars (`--help` for details)
+  trail-census <png> [--dims FILE|--origin X,Y --cell WxH] [--clean PNG] [--caret ROW,COL] [--pet X0,Y0,X1,Y1]...
+               [--selection RRGGBB] [--pixels FILE] [--mud-max N] [--glyph-min X] ...
+                                 the Prism Glass census of a trail frame and its clean twin, layer by layer: OKLab mud,
+                                 glyph contrast, the band's steps, seams, the stroke's hang, stars, caret (`--help` for details)
+  trail-diff [--base REF|merge-base] [--control same|plant] [--keep] [--jobs N] [SCRIPT.trail|DIR]...
+                                 Prism Glass's dark proof: build aterm-gui's trail_dump here and in a worktree of the base
+                                 (HEAD~1), run both on the scripts and compare main's state and streams (`--help` for details)
   aos-repair [--aterm PATH] [--control | --publish PLAN_HEX] [--keep] [--out DIR]
                                  OPENS A WINDOW: verify Aos M2 live repair of a stranded momentum glow, or publish an Aos M4 plan against a control (~25 s; `--help` for details)
   aos-search [--grid] [--plans FILE] --out DIR [--toolchain LINE] | aos-search --verify FILE
@@ -540,12 +582,13 @@ Outside any lab (no jail, no stub):
   link [--rtt MS] [--take FILE] -- <cmd> [args...]
                                  run <cmd> behind a PTY delaying chunks by RTT/2 each way (default 100 ms)
   mac dmg [--image REF] [--fda] [--keep] | mac nux [--app PATH] [--scenario ROW,...] [--standard-user]
-      [--record FILE] | mac clean
+      [--person] [--no-clt | --vanilla] [--repeat N] [--record [FILE]] | mac clean
                                  the macOS tart guest lane, each run in a fresh clone of a kept SIP-on base: `dmg`, the
                                  dmg_acceptance benches; `nux`, what a person meets on a new Mac (init, doctor, first
                                  launch, terminal and app launch, vault, a vault of the guest's own, successor,
-                                 install.sh) timed in the guest; `clean`, delete the kept bases (`mac help`; tart
-                                 fetched when absent)
+                                 install.sh, and the fault rows: kills, rerun, legacy upgrade, offline, lossy, mDNS,
+                                 dmg, agent and SSH, clock) timed in the guest, with a dialog census and the ALab
+                                 guard; `clean`, delete the kept bases (`mac help`; tart fetched when absent)
   linux [--gpu] up|down|status|exec|proof|baseline|gone|cpu|a11y|edges|deck|browser|gpu-host|vz-agent|clean|destroy
                                  manage and run the Ubuntu 24.04 Lima VM runtime lane on aarch64 and Rosetta x86_64, or with
                                  --gpu its krunkit instance on this Mac's GPU (`linux help`)
@@ -745,6 +788,9 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "trail-gallery" => trail_gallery::cmd_trail_gallery(args),
         "__trail-redraw-fixture" => trail_gallery::cmd_redraw_fixture(args),
         "trail-contrast" => trail_contrast::cmd_trail_contrast(args),
+        "trail-diff" => trail_diff::cmd_trail_diff(args),
+        "trail-census" => trail_census::cmd_trail_census(args),
+        "trail-keys" => trail_keys::cmd_trail_keys(args),
         "aos-repair" => aos_repair::cmd_aos_repair(args),
         "aos-search" => aos_search::cmd_aos_search(args),
         "aos-workers-bench" => aos_workers_bench::cmd_aos_workers_bench(args),
@@ -854,6 +900,7 @@ fn main() -> std::process::ExitCode {
                                 | "fleet-sim"
                                 | "reduce"
                                 | "trail-contrast"
+                                | "trail-census"
                                 | "abrew-admission"
                         ) {
                             dispatch(&cmd, &rest)

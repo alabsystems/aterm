@@ -57,6 +57,16 @@ pub(crate) enum Backing {
     Sim(crate::crash_sim::Sim),
 }
 
+impl Drop for Backing {
+    fn drop(&mut self) {
+        // Release `flock(LOCK_UN)` explicitly whenever `Backing` drops (including on
+        // early-return errors in `BrokerLog::open_core` before `BrokerLog` is constructed,
+        // and on `compact_switch` replacement while `FlushHandle`s or concurrent
+        // `fork`/`posix_spawn` children may still hold the open file description).
+        self.unlock();
+    }
+}
+
 impl Backing {
     /// The real file `file`.
     pub(crate) fn from_file(file: File) -> Backing {

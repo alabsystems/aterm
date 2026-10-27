@@ -365,6 +365,42 @@ pub fn home_sample(home: &Path, now_unix: i64) -> Option<(Option<AccountKey>, Sa
     (now_unix.saturating_sub(pick.newest) <= FRESH_S).then(|| (pick.account, sample_of(&pick)))
 }
 
+/// The usage sample written by a running Codex session in `thread`'s conversation under `home`
+/// at or after `started_unix` ([`crate::harness::codex_rollout::conversation_rollouts`], [`pick`],
+/// [`sample_of`]), where a reading is no older than [`FRESH_S`].
+///
+/// Filtering to `thread`'s own conversation files and `at_unix >= started_unix` keeps concurrent
+/// sessions in a shared `$CODEX_HOME` (`CODEX_AUTH_PATH`) and pre-resume turns on another login
+/// from attributing their usage to the current process; `account` is cleared on the post-start
+/// readings so a resumed rollout whose opening `session_meta` named an earlier login still yields
+/// the current process's windows.
+#[must_use]
+pub fn thread_sample(
+    home: &Path,
+    thread: &str,
+    started_unix: i64,
+    now_unix: i64,
+) -> Option<Sample> {
+    if !crate::harness::codex_rollout::is_thread_id(thread) {
+        return None;
+    }
+    let conv = crate::harness::codex_rollout::conversation_rollouts(home, thread);
+    let rollouts: Vec<Vec<CodexLimits>> = conv
+        .files
+        .iter()
+        .filter_map(|path| {
+            let mut readings = rollout_readings(path, CONTEXT_REACH)?;
+            readings.retain(|r| r.at_unix >= started_unix);
+            for r in &mut readings {
+                r.account = None;
+            }
+            (!readings.is_empty()).then_some(readings)
+        })
+        .collect();
+    let pick = pick(&rollouts, CODEX_FAMILY, now_unix)?;
+    (now_unix.saturating_sub(pick.newest) <= FRESH_S).then(|| sample_of(&pick))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1022,5 +1058,92 @@ mod tests {
             .tempdir()
             .expect("tmp");
         assert_eq!(home_sample(home.path(), now), None, "no rollout, no sample");
+    }
+
+    #[test]
+    fn thread_sample_isolates_the_sessions_post_start_readings_in_shared_home() {
+        let home = aterm_tempfile::Builder::new()
+            .prefix("codex-thread-sample-")
+            .tempdir()
+            .expect("temp dir");
+        let day = home.path().join("sessions/2026/10/16");
+        std::fs::create_dir_all(&day).expect("mkdir");
+        let now_ms = T0;
+        let now_unix = now_ms / 1000;
+        let started_unix = now_unix - 120;
+        let week = now_unix + 300_000;
+        // Root thread created earlier under LOGIN_A (99% pre-start), then resumed at started_unix
+        // under LOGIN_B (22% post-start), plus a subagent spawned post-start under LOGIN_B (35%),
+        // while a concurrent OTHER thread in the same shared CODEX_HOME wrote a newer 5% reading.
+        let root_body = [
+            meta_as(
+                now_ms - 7_200_000,
+                ROOT,
+                ROOT,
+                None,
+                Some(PAGINATED),
+                Some(LOGIN_A),
+            ),
+            rate(
+                now_ms - 3_600_000,
+                "codex",
+                None,
+                Some((99.0, 10_080, week)),
+            ),
+            rate(now_ms - 60_000, "codex", None, Some((22.0, 10_080, week))),
+        ]
+        .concat();
+        let sub_body = [
+            meta_as(
+                now_ms - 50_000,
+                SUB,
+                ROOT,
+                None,
+                Some(PAGINATED),
+                Some(LOGIN_B),
+            ),
+            rate(now_ms - 40_000, "codex", None, Some((35.0, 10_080, week))),
+        ]
+        .concat();
+        let other_body = [
+            meta_as(
+                now_ms - 10_000,
+                OTHER,
+                OTHER,
+                None,
+                Some(PAGINATED),
+                Some(LOGIN_B),
+            ),
+            rate(now_ms - 5_000, "codex", None, Some((5.0, 10_080, week))),
+        ]
+        .concat();
+        std::fs::write(
+            day.join(format!("rollout-2026-10-16T08-00-00-{ROOT}.jsonl")),
+            root_body,
+        )
+        .expect("write root");
+        std::fs::write(
+            day.join(format!("rollout-2026-10-16T09-00-00-{SUB}.jsonl")),
+            sub_body,
+        )
+        .expect("write sub");
+        std::fs::write(
+            day.join(format!("rollout-2026-10-16T10-00-00-{OTHER}.jsonl")),
+            other_body,
+        )
+        .expect("write other");
+
+        let sample =
+            thread_sample(home.path(), ROOT, started_unix, now_unix).expect("thread sample");
+        assert_eq!(sample.week_pct, Some(35));
+        assert_eq!(
+            thread_sample(home.path(), ROOT, now_unix - 10, now_unix),
+            None,
+            "readings older than process start are excluded"
+        );
+        assert_eq!(
+            thread_sample(home.path(), "not-a-thread-id", started_unix, now_unix),
+            None
+        );
     }
 }

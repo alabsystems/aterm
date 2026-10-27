@@ -397,8 +397,8 @@ impl Refusal {
     }
 
     /// What the light's title says of it.
-    fn says(self, relabelled: bool) -> String {
-        let named = |mode: Mode| mode.named_on_glass(relabelled);
+    fn says(self, rewritten: bool) -> String {
+        let named = |mode: Mode| mode.named_on_glass(rewritten);
         match self {
             Refusal::NotShown => "not on screen right now",
             Refusal::StoppedIn(mode) => return format!("stopped in {}", named(mode)),
@@ -408,7 +408,7 @@ impl Refusal {
             Refusal::NotInCycle(mode) => {
                 return format!(
                     "no {} or auto in this cycle; in {}",
-                    Mode::Bypass.word_on_glass(relabelled),
+                    Mode::Bypass.word_on_glass(rewritten),
                     named(mode)
                 );
             }
@@ -472,12 +472,16 @@ struct SessionLights {
     switch_turning: Option<(bool, Instant)>,
     /// When a press last flipped the harness switch (either way).
     switch_pressed: Option<Instant>,
+    /// Why the owner's last press of the top rule's ⬆️ was refused, and until when its label's
+    /// slot says so.
+    up_refused: Option<(String, Instant)>,
     /// What the Team chip says, as the last frame that drew the footer read it.
     team: Option<TeamFace>,
     /// The harness's glass on the Autopilot chip as the same frame read it ([`App::chip_glass`]).
     glass: ChipGlass,
-    /// Whether Claude's mode pill reads aterm's words on this pane's glass.
-    relabelled: bool,
+    /// Whether the glass rewrote Claude's mode row on this pane this frame, its pill dropped:
+    /// the lights block is then the mode's one home ([`lights::Mode::word_on_glass`]).
+    rewritten: bool,
     /// What a fact menu's row just did here (a copy, a new tab).
     fact_notice: Option<(FactNotice, Instant)>,
 }
@@ -525,11 +529,12 @@ impl OverChips {
     /// What [`App::claude_glass_at`] found.
     pub(crate) const fn of_glass(at: Option<&(u64, GlassAt)>) -> Self {
         match at {
-            None | Some((_, GlassAt::Mark)) => Self::No,
+            None | Some((_, GlassAt::Mark | GlassAt::Label)) => Self::No,
             Some((_, GlassAt::Chip(None))) => Self::Gap,
-            Some((_, GlassAt::Chip(Some(_)) | GlassAt::Switch(_) | GlassAt::Fact(..))) => {
-                Self::Chip
-            }
+            Some((
+                _,
+                GlassAt::Chip(Some(_)) | GlassAt::Switch(_) | GlassAt::Upgrade | GlassAt::Fact(..),
+            )) => Self::Chip,
         }
     }
 }
@@ -757,8 +762,23 @@ pub(crate) enum GlassAt {
     Switch(crate::autopilot::HarnessSwitch),
     /// A top line's lockup (`mark_hits`).
     Mark,
+    /// A top line's harness label (`border_toggles`): a hover shows its whole words, a press does
+    /// nothing.
+    Label,
+    /// A top line's ⬆️ of a newer CLI build (`border_toggles`): a press asks for the move now.
+    Upgrade,
     /// A fact of the bottom rule and what a click on it shows again.
     Fact(Fact, FactMask),
+}
+
+/// The part of a top line's harness `glass` is, as its paint lights it under the pointer
+/// ([`WindowLights::part_hover`]); the switch has its own ([`WindowLights::switch_hover`]).
+const fn part_of(glass: GlassAt) -> Option<crate::claude_footer::HoverAt> {
+    match glass {
+        GlassAt::Label => Some(crate::claude_footer::HoverAt::Label),
+        GlassAt::Upgrade => Some(crate::claude_footer::HoverAt::Arrow),
+        GlassAt::Chip(_) | GlassAt::Switch(_) | GlassAt::Mark | GlassAt::Fact(..) => None,
+    }
 }
 
 /// One fact's title someone is reading (hovered or selected).
@@ -811,6 +831,8 @@ pub(crate) struct WindowLights {
     pub(crate) border_toggles: Vec<BorderSwitch>,
     /// The session whose harness switch the pointer is over ([`App::track_claude_light_hover`]).
     pub(crate) switch_hover: Option<u64>,
+    /// The session whose top line's harness label (or arrow) the pointer rests on, and which.
+    pub(crate) part_hover: Option<(u64, crate::claude_footer::HoverAt)>,
     /// The rules' title slots the last frame drew ([`TitleHit`]).
     pub(crate) title_hits: Vec<TitleHit>,
     /// The lockups the last paint put on top lines ([`MarkHit`]).
@@ -837,17 +859,18 @@ pub(crate) struct BorderSwitch {
     pub(crate) frame_row: usize,
     /// The same row as a window grid row, for the chrome register.
     pub(crate) term_row: usize,
-    /// Every cell a press acts on: the whole face, its blanks included.
+    /// The switch's cells (` ● on ` when lit, ` ○ off ` when off), its blanks included: a press
+    /// anywhere on them turns it.
     pub(crate) cols: std::ops::Range<usize>,
-    /// The switch's selected state cells (`alab harness v0.1 ▐ ● on ▌` when lit, `▐ ○ off ▌` when off).
-    pub(crate) switch: std::ops::Range<usize>,
-    /// The `on` segment's cells, on an off switch.
-    pub(crate) button: Option<std::ops::Range<usize>>,
+    /// The harness label's cells (`alab claude harness v0.4 (v2.1.305)`): hover only.
+    pub(crate) label: Option<std::ops::Range<usize>>,
+    /// The ⬆️ of a newer CLI build with its side blanks: a press asks for the move now.
+    pub(crate) arrow: Option<std::ops::Range<usize>>,
     pub(crate) session: u64,
     /// What the switch said.
     pub(crate) face: crate::autopilot::HarnessSwitch,
-    /// Its form, widest first (`claude_footer::switch_words` rebuilds its words from it).
-    pub(crate) tier: usize,
+    /// The paint it was drawn with (`claude_footer::switch_words` rebuilds its words from it).
+    pub(crate) paint: crate::claude_footer::SwitchPaint,
     pub(crate) program: aterm_phase::Program,
 }
 
@@ -1016,8 +1039,8 @@ struct LightsKey {
     autopilot: Option<AutopilotView>,
     autopilot_pending: bool,
     glass: ChipGlass,
-    /// The pill relabel's gate ([`SessionLights::relabelled`]).
-    relabelled: bool,
+    /// The mode row's rewrite ([`SessionLights::rewritten`]).
+    rewritten: bool,
     team: Option<u64>,
     /// A fact notice's hash: a slash press's words are text.
     fact_notice: Option<u64>,
@@ -1043,7 +1066,7 @@ impl SessionLights {
             autopilot: self.autopilot,
             autopilot_pending: self.autopilot_pending.is_some(),
             glass: self.glass,
-            relabelled: self.relabelled,
+            rewritten: self.rewritten,
             team: self.team.as_ref().map(|face| {
                 use std::hash::{Hash as _, Hasher as _};
                 let mut h = std::hash::DefaultHasher::new();
@@ -1318,9 +1341,9 @@ impl WindowLights {
         self.note_switch_face(session, crate::autopilot::HarnessSwitch::of(view));
     }
 
-    /// Fold in whether `session`'s mode pill is relabelled on its pane's glass this frame.
-    fn note_relabelled(&mut self, session: u64, relabelled: bool) {
-        self.sessions.entry(session).or_default().relabelled = relabelled;
+    /// Fold in whether `session`'s mode row is rewritten on its pane's glass this frame.
+    fn note_rewritten(&mut self, session: u64, rewritten: bool) {
+        self.sessions.entry(session).or_default().rewritten = rewritten;
     }
 
     /// [`Self::note_autopilot_at`] at `now`.
@@ -1354,12 +1377,26 @@ impl WindowLights {
         word_bits(word) | view.code() << 8 | word_bits(pending) << 16 | glass_bits(glass, reading)
     }
 
-    /// The harness switch `session`'s top rule shows over `face`, its reading.
+    /// What of `session`'s top line's harness the pointer or the keyboard is on.
+    pub(crate) fn top_hover(&self, session: u64) -> crate::claude_footer::HoverAt {
+        if self.switch_lit(session) {
+            return crate::claude_footer::HoverAt::Switch;
+        }
+        self.part_hover
+            .filter(|(s, _)| *s == session)
+            .map_or(crate::claude_footer::HoverAt::None, |(_, part)| part)
+    }
+
+    /// The harness switch `session`'s top rule shows over `face`, and what of the harness the
+    /// pointer or the keyboard is on.
     pub(crate) fn switch_shown(
         &self,
         session: u64,
         face: crate::autopilot::HarnessSwitch,
-    ) -> (crate::autopilot::HarnessSwitch, bool) {
+    ) -> (
+        crate::autopilot::HarnessSwitch,
+        crate::claude_footer::HoverAt,
+    ) {
         use crate::autopilot::HarnessSwitch;
         let turning = self
             .sessions
@@ -1371,7 +1408,7 @@ impl WindowLights {
             (Some(false), HarnessSwitch::On) => HarnessSwitch::TurningOff,
             _ => face,
         };
-        (face, self.switch_lit(session))
+        (face, self.top_hover(session))
     }
 
     /// Whether this press still belongs to the last harness-switch gesture.
@@ -1391,11 +1428,16 @@ impl WindowLights {
             .get(&session)
             .and_then(|s| s.switch_turning)
             .map(|(on, _)| on);
-        u64::from(supervised)
+        let refused = self
+            .up_refused(session)
+            .map_or(0, |words| aterm_hash::fnv1a_64(words.as_bytes()) | 1);
+        (u64::from(supervised)
             | u64::from(turning.is_some()) << 1
             | u64::from(self.switch_lit(session)) << 2
             | u64::from(self.mark_hovered(session)) << 3
-            | u64::from(turning == Some(false)) << 4
+            | (self.top_hover(session) as u64) << 5
+            | u64::from(turning == Some(false)) << 4)
+            ^ refused.rotate_left(8)
     }
 
     /// The grid the lists were laid on, for a test to read or to forge.
@@ -1554,8 +1596,31 @@ impl WindowLights {
                 s.switch_turning = None;
                 any = true;
             }
+            if s.up_refused
+                .as_ref()
+                .is_some_and(|(_, until)| *until <= now)
+            {
+                s.up_refused = None;
+                any = true;
+            }
         }
         (any, refused)
+    }
+
+    /// Why the owner's last press of `session`'s ⬆️ was refused, while its label's slot says so
+    /// ([`Self::refuse_upgrade`]); `expire` lets it go.
+    pub(crate) fn up_refused(&self, session: u64) -> Option<&str> {
+        self.sessions
+            .get(&session)?
+            .up_refused
+            .as_ref()
+            .map(|(words, _)| words.as_str())
+    }
+
+    /// Show `words`, why the owner's press of `session`'s ⬆️ was refused, in its label's slot
+    /// until `until`.
+    pub(crate) fn refuse_upgrade(&mut self, session: u64, words: String, until: Instant) {
+        self.sessions.entry(session).or_default().up_refused = Some((words, until));
     }
 
     /// Pane `pane`'s chip block of `session` ([`App::claude_lights_block`]).
@@ -2025,13 +2090,17 @@ fn drawn_at(
     let pending = s.pending.as_ref().map(|p| p.light);
     let harness = s.harness_chips();
     let team = s.team.is_some();
+    // The mode's one home on a rewritten row: its light is kept at every rung, the pill being
+    // gone (a row too narrow for the whole pill is never rewritten).
+    let home = s.rewritten;
     move |chip: Chip| {
-        keep.keeps(chip)
+        (keep.keeps(chip) || (home && matches!(chip, Chip::Light(_))))
             && match chip {
                 Chip::Autopilot => harness,
                 Chip::Team => team,
                 Chip::Light(light) => {
                     lights::deviates(light, &s.shown)
+                        || (s.rewritten && s.shown.mode.is_some())
                         || pending == Some(light)
                         || refused == Some(light)
                         || noticed == Some(light)
@@ -2069,7 +2138,7 @@ fn what_of(
     if let Some((l, why, _)) = refused
         && l == light
     {
-        return (why.says(s.relabelled), true);
+        return (why.says(s.rewritten), true);
     }
     if s.pending.as_ref().is_some_and(|p| p.light == light) {
         return ("switching\u{2026}".to_owned(), false);
@@ -2079,12 +2148,12 @@ fn what_of(
             return (
                 format!(
                     "click for {} or auto",
-                    Mode::Bypass.word_on_glass(s.relabelled)
+                    Mode::Bypass.word_on_glass(s.rewritten)
                 ),
                 false,
             );
         }
-        Some(mode) => mode.word_on_glass(s.relabelled),
+        Some(mode) => mode.word_on_glass(s.rewritten),
         None => "not on screen right now",
     };
     (what.to_owned(), false)
@@ -2186,11 +2255,14 @@ impl<'a> Face<'a> {
         self.word.is_some() || self.clock.is_some()
     }
 
-    /// The cells it takes: two for a wide character (`✋`, a cjk name).
+    /// The cells it takes: two for a wide character (`✋`, a cjk name). A face with no glyph
+    /// (an expected mode on a rewritten row: `yolo`) is its words alone, no blank before them.
     fn width(&self) -> usize {
         cells_of(self.glyph)
             + if self.worded() {
-                1 + self.word.map_or(0, cells_of) + self.clock.map_or(0, |_| 5)
+                usize::from(!self.glyph.is_empty())
+                    + self.word.map_or(0, cells_of)
+                    + self.clock.map_or(0, |_| 5)
             } else {
                 0
             }
@@ -2201,11 +2273,12 @@ impl<'a> Face<'a> {
         let worded = self.worded();
         let word_ink = self.word_ink;
         let clock = self.clock.map(|c| c.0);
+        let blank = worded && !self.glyph.is_empty();
         self.glyph
             .chars()
             .map(move |ch| (ch, self.glyph_ink))
             .chain(
-                worded
+                blank
                     .then_some(' ')
                     .into_iter()
                     .chain(self.word.into_iter().flat_map(str::chars))
@@ -2222,7 +2295,7 @@ fn face_of(chip: Chip, s: &SessionLights, keep: Keep, inks: Inks) -> Face<'_> {
     match chip {
         Chip::Light(light) => {
             let switching = s.pending.as_ref().is_some_and(|p| p.light == light);
-            let (glyph, word, ink) = light_face(light, &s.shown, switching, s.relabelled, inks);
+            let (glyph, word, ink) = light_face(light, &s.shown, switching, s.rewritten, inks);
             Face::plain(glyph, Some(word), ink)
         }
         Chip::Autopilot => {
@@ -2275,14 +2348,19 @@ fn light_face(
     light: Light,
     shown: &Reading,
     switching: bool,
-    relabelled: bool,
+    rewritten: bool,
     inks: Inks,
 ) -> (&'static str, &'static str, [u8; 3]) {
     let glyph = |own: &'static str| if switching { PENDING_GLYPH } else { own };
     match shown.mode {
+        // Where the row is rewritten an expected mode is its word alone (`yolo`, `auto`).
         Some(mode) => (
-            glyph(mode.glyph()),
-            mode.word_on_glass(relabelled),
+            glyph(if rewritten && mode.is_expected() {
+                ""
+            } else {
+                mode.glyph()
+            }),
+            mode.word_on_glass(rewritten),
             mode.hue().map_or(inks.ink, |hue| floored(hue, inks.ground)),
         ),
         None => (glyph("\u{25CC}"), light.word(), inks.dim),
@@ -2974,7 +3052,7 @@ impl App {
         wid: WindowId,
         session: u64,
         (word, view): (Option<Autopilot>, AutopilotView),
-        relabelled: bool,
+        rewritten: bool,
     ) {
         let glass = self.chip_glass(session);
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -2984,7 +3062,7 @@ impl App {
                     crate::work_counts::harness_clock_read();
                     Instant::now()
                 });
-            ws.claude_lights.note_relabelled(session, relabelled);
+            ws.claude_lights.note_rewritten(session, rewritten);
         }
     }
 
@@ -3254,6 +3332,7 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid)
             && (ws.claude_lights.hover.take().is_some()
                 | ws.claude_lights.switch_hover.take().is_some()
+                | ws.claude_lights.part_hover.take().is_some()
                 | ws.claude_lights.mark_hover.take().is_some()
                 | ws.claude_lights.glass_hover_px.take().is_some())
         {
@@ -3274,17 +3353,30 @@ impl App {
         if regridded && ws.pointer_position_known {
             let (x, y) = ws.last_cursor_px;
             let lights = &ws.claude_lights;
-            let was = (lights.hover, lights.switch_hover, lights.mark_hover);
+            let was = (
+                lights.hover,
+                lights.switch_hover,
+                lights.part_hover,
+                lights.mark_hover,
+            );
             let _ = self.track_claude_light_hover(wid, x, y);
             if let Some(ws) = self.windows.get_mut(&wid) {
                 let lights = &mut ws.claude_lights;
-                lights.cursor_owed |= (lights.hover, lights.switch_hover, lights.mark_hover) != was;
+                lights.cursor_owed |= (
+                    lights.hover,
+                    lights.switch_hover,
+                    lights.part_hover,
+                    lights.mark_hover,
+                ) != was;
             }
         }
         let Some(lights) = self.windows.get(&wid).map(|ws| &ws.claude_lights) else {
             return;
         };
-        if lights.switch_hover.is_none() && lights.mark_hover.is_none() {
+        if lights.switch_hover.is_none()
+            && lights.part_hover.is_none()
+            && lights.mark_hover.is_none()
+        {
             return;
         }
         let at = lights
@@ -3292,6 +3384,7 @@ impl App {
             .and_then(|(x, y)| self.claude_glass_at(wid, x, y));
         let switch =
             at.and_then(|(session, glass)| matches!(glass, GlassAt::Switch(_)).then_some(session));
+        let part = at.and_then(|(session, glass)| Some((session, part_of(glass)?)));
         let mark = at.and_then(|(session, glass)| (glass == GlassAt::Mark).then_some(session));
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
@@ -3302,11 +3395,18 @@ impl App {
             lights.switch_hover = None;
             gone = true;
         }
+        if lights.part_hover.is_some() && lights.part_hover != part {
+            lights.part_hover = None;
+            gone = true;
+        }
         if lights.mark_hover.is_some() && lights.mark_hover != mark {
             lights.mark_hover = None;
             gone = true;
         }
-        if lights.switch_hover.is_none() && lights.mark_hover.is_none() {
+        if lights.switch_hover.is_none()
+            && lights.part_hover.is_none()
+            && lights.mark_hover.is_none()
+        {
             lights.glass_hover_px = None;
         }
         if gone {
@@ -3356,10 +3456,11 @@ impl App {
         let over = at.and_then(|(session, glass)| match glass {
             GlassAt::Chip(chip) => Some((session, Target::Chip(chip?))),
             GlassAt::Fact(fact, _) => Some((session, Target::Fact(fact))),
-            GlassAt::Switch(_) | GlassAt::Mark => None,
+            GlassAt::Switch(_) | GlassAt::Mark | GlassAt::Label | GlassAt::Upgrade => None,
         });
         let switch =
             at.and_then(|(session, glass)| matches!(glass, GlassAt::Switch(_)).then_some(session));
+        let part = at.and_then(|(session, glass)| Some((session, part_of(glass)?)));
         let mark = at.and_then(|(session, glass)| (glass == GlassAt::Mark).then_some(session));
         let Some(ws) = self.windows.get_mut(&wid) else {
             return OverChips::No;
@@ -3367,13 +3468,16 @@ impl App {
         if ws.selecting {
             return OverChips::No;
         }
-        ws.claude_lights.glass_hover_px = (switch.is_some() || mark.is_some()).then_some((x, y));
+        ws.claude_lights.glass_hover_px =
+            (switch.is_some() || part.is_some() || mark.is_some()).then_some((x, y));
         if ws.claude_lights.hover != over
             || ws.claude_lights.switch_hover != switch
+            || ws.claude_lights.part_hover != part
             || ws.claude_lights.mark_hover != mark
         {
             ws.claude_lights.hover = over;
             ws.claude_lights.switch_hover = switch;
+            ws.claude_lights.part_hover = part;
             ws.claude_lights.mark_hover = mark;
             redraw(ws);
             if over.is_some_and(|(_, t)| t.fact().is_some()) {
@@ -3400,10 +3504,24 @@ impl App {
         }
         if let Some(b) = lights.border_toggles.iter().find(|b| {
             b.frame_row == row
+                && b.arrow.as_ref().is_some_and(|cols| cols.contains(&col))
+                && !self.chrome_owns_terminal_row(wid, b.term_row)
+        }) {
+            return Some((b.session, GlassAt::Upgrade));
+        }
+        if let Some(b) = lights.border_toggles.iter().find(|b| {
+            b.frame_row == row
                 && b.cols.contains(&col)
                 && !self.chrome_owns_terminal_row(wid, b.term_row)
         }) {
             return Some((b.session, GlassAt::Switch(b.face)));
+        }
+        if let Some(b) = lights.border_toggles.iter().find(|b| {
+            b.frame_row == row
+                && b.label.as_ref().is_some_and(|cols| cols.contains(&col))
+                && !self.chrome_owns_terminal_row(wid, b.term_row)
+        }) {
+            return Some((b.session, GlassAt::Label));
         }
         if let Some(h) = lights.fact_hits.iter().find(|h| {
             h.frame_row == row
@@ -3660,7 +3778,8 @@ impl App {
             if let Some((session, url)) = self.claude_notice_at(wid, x, y) {
                 return self.press_claude_notice(wid, session, url, at);
             }
-            return false;
+            // A cell a rewritten row vacated takes the press: nothing of Claude's is under it.
+            return self.glass_swallows_at(wid, x, y);
         };
         let secondary = cfg!(target_os = "macos")
             && self
@@ -3678,6 +3797,7 @@ impl App {
                 self.press_switch_as_clicked(wid, session, face, at);
                 true
             }
+            GlassAt::Upgrade => self.press_upgrade_arrow(wid, session),
             GlassAt::Fact(..) if secondary => {
                 self.open_fact_menu_at(wid, x, y);
                 true
@@ -3685,8 +3805,67 @@ impl App {
             GlassAt::Fact(fact, restores) => {
                 self.press_visible_claude_fact(wid, session, fact, restores)
             }
-            GlassAt::Mark => false,
+            GlassAt::Mark | GlassAt::Label => false,
         }
+    }
+
+    /// Show `words`, why the owner's Upgrade Now for `session` was refused, in the label slot of
+    /// its top rule's ⬆️ in every window that draws it, for [`REFUSAL_SHOWN`].
+    pub(crate) fn show_upgrade_refusal(&mut self, session: u64, words: &str) {
+        let until = Instant::now() + REFUSAL_SHOWN;
+        let mut shown = false;
+        for ws in self.windows.values_mut() {
+            if ws
+                .claude_lights
+                .border_toggles
+                .iter()
+                .any(|b| b.session == session)
+            {
+                ws.claude_lights
+                    .refuse_upgrade(session, words.to_string(), until);
+                redraw(ws);
+                shown = true;
+            }
+        }
+        if shown {
+            wake_after(session, REFUSAL_SHOWN);
+        }
+    }
+
+    /// A press of `session`'s ⬆️ in `wid`: the tab menu's Upgrade Now for the build it offers
+    /// (`App::send_upgrade_word`), which skips the hold clock and keeps every safety gate; an
+    /// asked move's `◐` takes no second press. A tab name being edited settles first.
+    pub(crate) fn press_upgrade_arrow(&mut self, wid: WindowId, session: u64) -> bool {
+        use crate::claude_footer::UpState;
+        let Some(up) = self.windows.get(&wid).and_then(|ws| {
+            ws.claude_lights
+                .border_toggles
+                .iter()
+                .find(|b| {
+                    b.session == session
+                        && b.arrow.is_some()
+                        && !self.chrome_owns_terminal_row(wid, b.term_row)
+                })
+                .map(|b| b.paint.up)
+        }) else {
+            return false;
+        };
+        if self.inline_rename_edit(wid).is_some() {
+            self.clear_strip_press(wid);
+            self.settle_rename_edit(wid);
+        }
+        if up.state != UpState::Ready {
+            return true;
+        }
+        let Some(tab) = self.session_sid(session) else {
+            return true;
+        };
+        self.send_upgrade_word(crate::upgrade_host::WordAsk::new(
+            tab,
+            up.to.as_str().to_string(),
+            aterm_messages::UpgradeWord::Now,
+        ));
+        true
     }
 
     /// Click a visible `fact` on `session`'s rule, settling any open in-grid rename first.
@@ -3955,38 +4134,6 @@ impl App {
     fn claude_screen_now(&self, session: u64) -> Option<Screen> {
         let rows = self.claude_rows_now(session)?;
         fenced_screen_now(session, &rows, || lights::read_screen(&rows))
-    }
-
-    /// `session`'s screen and whether its composer is empty; `None` while Claude's frame is unfinished.
-    pub(crate) fn claude_composer_now(&self, session: u64) -> Option<(Screen, bool)> {
-        let (rows, cursor, dim_col2) = {
-            let entry = self.pool.get(session)?;
-            let t = crate::term_lock(&entry.term);
-            if t.grid().display_offset() > 0 || crate::frame_unfinished_now(&t) {
-                return None;
-            }
-            let rows: Vec<String> = (0..usize::from(t.rows()))
-                .map(|r| row_text(&t, r))
-                .collect();
-            let cursor = t.cursor();
-            let cursor = (usize::from(cursor.row), usize::from(cursor.col));
-            let dim_col2: Vec<bool> = (0..t.rows())
-                .map(|row| {
-                    t.grid()
-                        .row_at_screen(row)
-                        .and_then(|cells| cells.get(2))
-                        .is_some_and(|cell| cell.flags().contains(aterm_core::grid::CellFlags::DIM))
-                })
-                .collect();
-            (rows, cursor, dim_col2)
-        };
-        fenced_screen_now(session, &rows, || {
-            let caret = aterm_phase::phase::composer_draft(&rows).map(|(caret, _)| caret);
-            let dim = caret.is_some_and(|row| dim_col2.get(row).copied().unwrap_or(false));
-            let screen = lights::read_screen(&rows)?;
-            let empty = aterm_agent::harness::upgrade::composer_is_empty(&rows, Some(cursor), dim);
-            Some((screen, empty))
-        })
     }
 
     /// `session`'s live screen copied out of its engine, its rows as text.
@@ -4456,7 +4603,8 @@ impl App {
                 | HarnessChip::Usage
                 | HarnessChip::Account
                 | HarnessChip::Title
-                | HarnessChip::Link => {}
+                | HarnessChip::Link
+                | HarnessChip::Upgrade => {}
                 HarnessChip::Mode => {
                     if let Some(s) = ws.claude_lights.sessions.get(&node.session) {
                         (node.label, node.description) = light_spoken(s, Light::Mode, lights_now());
@@ -4484,7 +4632,7 @@ impl App {
                         (node.label, node.description) = team_spoken(face);
                     }
                 }
-                HarnessChip::Switch | HarnessChip::SwitchOn => {}
+                HarnessChip::Switch => {}
             }
         }
         for hit in &ws.claude_lights.fact_hits {
@@ -4498,7 +4646,7 @@ impl App {
             let cli = self.session_cli(hit.session);
             // The footer's account is judged against Claude Code's roster alone, so another
             // CLI's chip names no label from it (as its menu takes none): its product alone.
-            let judged = (cli == aterm_agent::harness::accounts::Cli::Claude)
+            let judged = (cli == Some(aterm_agent::harness::accounts::Cli::Claude))
                 .then(|| {
                     self.shown_facts(hit.session)
                         .and_then(|(facts, _)| facts.account)
@@ -4506,6 +4654,7 @@ impl App {
                 .flatten();
             if hit.fact == Fact::Account
                 && hit.restores.is_empty()
+                && let Some(cli) = cli
                 && let Some(named) = crate::a11y_tree::account_chip_label(cli, judged.as_deref())
             {
                 label = named;
@@ -4564,7 +4713,7 @@ impl App {
             HarnessChip::Autopilot => Chip::Autopilot,
             HarnessChip::Team => Chip::Team,
             HarnessChip::Mode => Chip::Light(Light::Mode),
-            reader @ (HarnessChip::Switch | HarnessChip::SwitchOn) => {
+            HarnessChip::Switch => {
                 let shown = self.windows.get(&wid).and_then(|ws| {
                     ws.claude_lights
                         .border_toggles
@@ -4573,10 +4722,6 @@ impl App {
                             b.session == session && !self.chrome_owns_terminal_row(wid, b.term_row)
                         })
                         .map(|b| b.face)
-                        .filter(|face| {
-                            reader == HarnessChip::Switch
-                                || matches!(face, crate::autopilot::HarnessSwitch::Off(_))
-                        })
                 });
                 if let Some(face) = shown {
                     self.press_switch_as_clicked(wid, session, face, Instant::now());
@@ -4586,6 +4731,10 @@ impl App {
             HarnessChip::Title => return,
             HarnessChip::Link => {
                 self.open_claude_notice_for_reader(wid, session);
+                return;
+            }
+            HarnessChip::Upgrade => {
+                self.press_upgrade_arrow(wid, session);
                 return;
             }
             fact => {
@@ -4635,7 +4784,7 @@ fn light_spoken(s: &SessionLights, light: Light, now: Instant) -> (String, Optio
     let word = s
         .shown
         .mode
-        .map_or("unknown", |mode| mode.word_on_glass(s.relabelled));
+        .map_or("unknown", |mode| mode.word_on_glass(s.rewritten));
     let refused = s.refused.filter(|(_, _, until)| *until > now);
     let (what, _) = what_of(s, light, refused, true);
     let description = (what != word).then(|| {
@@ -4666,24 +4815,6 @@ pub(crate) fn switch_label(
     }
 }
 
-/// The off face's `on` button's accessible name: what a press turns on, the agent's harness
-/// under its own switch off, the whole harness (Settings ▸ Harness's `Supervise coding agents`)
-/// under the master switch off.
-#[cfg(a11y_tree)]
-pub(crate) fn switch_on_label(
-    words: &str,
-    face: crate::autopilot::HarnessSwitch,
-    product: &str,
-) -> String {
-    use crate::autopilot::{HarnessSwitch, SwitchOff};
-    match face {
-        HarnessSwitch::Off(SwitchOff::Agent(_)) => {
-            format!("{words}: turn the {product} harness {words}")
-        }
-        _ => format!("{words}: turn the harness {words} (Supervise coding agents)"),
-    }
-}
-
 /// Harness switch `b`'s accessibility nodes on grid row `row`.
 #[cfg(a11y_tree)]
 pub(crate) fn harness_switch_nodes(
@@ -4692,10 +4823,9 @@ pub(crate) fn harness_switch_nodes(
 ) -> Vec<crate::a11y_tree::GridChip> {
     use crate::a11y_tree::{GridChip, HarnessChip};
     let product = b.program.product();
-    let (switch_words, button_words) = crate::claude_footer::switch_words(b);
     let mut nodes = Vec::with_capacity(2);
-    if !b.switch.is_empty() {
-        let label = switch_label(&switch_words, b.face, product);
+    if !b.cols.is_empty() {
+        let label = switch_label(&crate::claude_footer::switch_words(b), b.face, product);
         nodes.push(GridChip {
             session: b.session,
             chip: HarnessChip::Switch,
@@ -4706,16 +4836,22 @@ pub(crate) fn harness_switch_nodes(
                 None => aterm_a11y::model::Toggled::Mixed,
             }),
             row,
-            col: b.switch.start,
-            width: b.switch.len(),
+            col: b.cols.start,
+            width: b.cols.len(),
         });
     }
-    if let (Some(cols), Some(words)) = (b.button.as_ref(), button_words) {
+    let up_words = crate::claude_footer::up_words(&b.paint.up);
+    if let (Some(cols), Some(words)) = (b.arrow.as_ref(), up_words) {
+        let description = if b.paint.refused.is_empty() {
+            words
+        } else {
+            format!("couldn't update: {}", b.paint.refused.as_str())
+        };
         nodes.push(GridChip {
             session: b.session,
-            chip: HarnessChip::SwitchOn,
-            label: switch_on_label(&words, b.face, product),
-            description: Some(b.face.described(product)),
+            chip: HarnessChip::Upgrade,
+            label: upgrade_label(product, &b.paint.up),
+            description: Some(description),
             toggled: None,
             row,
             col: cols.start,
@@ -4723,6 +4859,18 @@ pub(crate) fn harness_switch_nodes(
         });
     }
     nodes
+}
+
+/// The ⬆️'s button as a screen reader names it: `Update Claude Code to 2.1.310`, `Updating …`
+/// once asked.
+#[cfg(a11y_tree)]
+fn upgrade_label(product: &str, up: &crate::claude_footer::TopUp) -> String {
+    let verb = if up.state == crate::claude_footer::UpState::Asked {
+        "Updating"
+    } else {
+        "Update"
+    };
+    format!("{verb} {product} to {}", up.to.as_str())
 }
 
 /// The Team chip as a screen reader names it.
@@ -5831,23 +5979,6 @@ mod gesture_tests {
         redraw_mode_row(&app, session, PLAN);
         app.toggle_claude_light(wid, session, Light::Mode);
         assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "plan: one press");
-    }
-
-    #[test]
-    fn the_upgrade_notes_composer_is_read_off_a_whole_frame() {
-        let (app, _wid, session, _reader) = app();
-        draw_claude(&app, session, PLAN);
-        feed(&app, session, "\x1b[22;3Hhello".as_bytes());
-        let draft = || app.claude_composer_now(session).map(|(_, empty)| empty);
-        assert_eq!(draft(), Some(false), "precondition: a draft");
-        feed(
-            &app,
-            session,
-            "\x1b[?2026h\x1b[22;1H\x1b[2K\u{276F} ".as_bytes(),
-        );
-        assert_eq!(draft(), None, "half a frame is no composer");
-        feed(&app, session, "hello\x1b[?2026l".as_bytes());
-        assert_eq!(draft(), Some(false), "the whole frame's draft");
     }
 
     #[test]
@@ -7704,3 +7835,7 @@ mod fit_tests;
 #[cfg(all(test, unix))]
 #[path = "claude_lights_switch_tests.rs"]
 mod switch_tests;
+
+#[cfg(all(test, unix))]
+#[path = "claude_lights_arrow_tests.rs"]
+mod arrow_tests;

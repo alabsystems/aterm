@@ -4284,31 +4284,102 @@ fn only_a_persons_turn_on_sync_turns_the_sync_on() {
     }
 }
 
+/// §5.6: the page's own sub-second tick is a wake only while a run's village walks on
+/// a shown page. A settled, finished or hidden page owes no tick wake — the worker's
+/// publications and the one-second status poll already wake the loop — so a poll in
+/// flight on such a page owes nothing at all until its reply arrives, and one turn
+/// that serves a due status leaves it owing nothing more.
 #[test]
-fn a_status_due_before_the_next_tick_is_asked_for_and_owes_no_wake_until_the_tick() {
+fn only_a_running_shown_pages_tick_is_a_wake() {
     let now = Instant::now();
     let tick = now + Duration::from_millis(250);
-    let in_flight = Host {
+
+    // Settled (not running): the tick drives no walk, so it is not a wake. A poll in
+    // flight (its reply wakes the loop) leaves this page owing nothing.
+    let settled = Host {
         next_status: Some(now),
         status_in_flight: true,
         next_tick: Some(tick),
         ..Host::default()
     };
     assert_eq!(
-        in_flight.deadline(now),
-        Some(tick),
-        "a status in flight owes no wake"
+        settled.deadline(now, true),
+        None,
+        "a settled page with a poll in flight owes no sub-second tick wake"
     );
 
+    // A run on a shown page walks: its tick stays a wake, even while a poll is in
+    // flight. This is the control for the settled case above.
+    let animating = Host {
+        next_status: Some(now),
+        status_in_flight: true,
+        next_tick: Some(tick),
+        latest_status: running(),
+        shown: true,
+        ..Host::default()
+    };
+    assert_eq!(
+        animating.deadline(now, true),
+        Some(tick),
+        "a running, shown page keeps its walk's tick as a wake through an in-flight poll"
+    );
+
+    // The due status is served in one turn; with no run the settled page then owes no
+    // further wake (its next read rides the worker's publication or the one-second
+    // poll), where the old blanket tick would have woken the loop every 250 ms.
     let mut app = App::headless_for_test();
     app.system_state_host.next_tick = Some(tick);
     app.system_state_host.next_status = Some(now);
-    assert_eq!(app.system_state_host.deadline(now), Some(now));
+    assert_eq!(app.system_state_host.deadline(now, true), Some(now));
     app.tick_system_state(now);
     assert_eq!(
-        app.system_state_host.deadline(now),
-        Some(tick),
-        "one turn serves the due status, so the next wake is the tick"
+        app.system_state_host.deadline(now, true),
+        None,
+        "one turn serves the due status and the settled page owes no further wake"
+    );
+}
+
+/// §5.6: a motion frame never preempts an input frame, so a key typed in a focused
+/// window within the 2.5 s gap holds the walk's tick out of the wake, leaving only
+/// the status poll — even on a running, shown page that would otherwise walk. The
+/// keystroke that stamps the clock is injected (`hands_off_keys` over an injected
+/// `last_keystroke_at`), not assumed, so neither arm is vacuous.
+#[test]
+fn a_recent_key_holds_the_running_pages_walk_wake() {
+    let typed = Instant::now();
+    let later = typed + Duration::from_millis(3_000);
+    // The walk tick is earlier than the status poll, so whenever it is folded in it is
+    // the wake; both stay in the future at `later`, so neither collapses to `now`.
+    let animating = Host {
+        next_status: Some(typed + Duration::from_millis(9_000)),
+        next_tick: Some(typed + Duration::from_millis(3_500)),
+        latest_status: running(),
+        shown: true,
+        ..Host::default()
+    };
+
+    // Hands on the keys (a key at `typed`, read at `typed`): the walk tick is withheld,
+    // so only the status poll remains.
+    let held = animating.deadline(typed, crate::hands_off_keys(true, Some(typed), typed));
+    assert_eq!(
+        held,
+        animating.next_status.map(|s| s.max(typed)),
+        "a just-typed key holds the walk tick; only the status poll remains"
+    );
+
+    // Control: 3 s after the last key the hands are off, so the same running, shown page
+    // folds its (earlier) walk tick back into the wake. Without the hold the walk tick
+    // would already have been the wake above, so this control proves the hold suppressed
+    // it rather than the tick being absent.
+    let runs = animating.deadline(later, crate::hands_off_keys(true, Some(typed), later));
+    assert_eq!(
+        runs,
+        animating.next_tick.map(|t| t.max(later)),
+        "3 s after the last key the walk tick is the wake again"
+    );
+    assert!(
+        runs < held,
+        "the control wakes earlier, on the walk tick the hold had suppressed"
     );
 }
 
@@ -4866,7 +4937,7 @@ fn a_read_that_met_a_write_keeps_the_page_and_the_windows_own_admission() {
         .next_status
         .expect("read again once the write is over");
     assert!(asked + CHANGING_REREAD <= next && next <= replied + CHANGING_REREAD);
-    assert!(app.system_state_host.deadline(replied) <= Some(next));
+    assert!(app.system_state_host.deadline(replied, true) <= Some(next));
     fresh(&mut app, admitted);
     let yes = app
         .admitted_access()

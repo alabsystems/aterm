@@ -18,6 +18,7 @@ mod bg_fill_count;
 mod burst_companion_reads;
 mod combining_stack;
 mod companion_knock_out;
+mod companion_off_letters;
 mod contrast_floor;
 mod ct_fractional_bearing;
 mod cursor_ink;

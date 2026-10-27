@@ -7,12 +7,11 @@
 //! and decoration atlases) and the encode tail [`encode_tail`] that
 //! `encode_frame` forks into once the shared instance building is done.
 //!
-//! Staged: an armed renderer (`GpuRenderer::arm_d3d11`, only a test arms one
-//! until the Windows flip) draws every frame here: its readbacks, effect
-//! layers and the tray card included, and its headless presents with their
-//! taps (`d3d11_present.rs`). A window still attaches on wgpu-dx12, the
-//! oracle every armed frame is diffed against, and disarms the renderer. A
-//! frame that fails on D3D11 falls through to the wgpu tail by name.
+//! An armed renderer (`GpuRenderer::arm_d3d11`; every Windows renderer is
+//! armed from construction) draws every frame here: its readbacks, effect
+//! layers and the tray card included, its headless presents with their taps
+//! (`d3d11_present.rs`) and its windows' presents (`d3d11_window.rs`). A
+//! frame that fails on D3D11 is lost by name.
 //!
 //! The immediate context orders a buffer or texture write after every draw
 //! already issued that reads the object (a `WRITE_DISCARD` map renames the
@@ -379,7 +378,7 @@ pub(crate) struct D3dTailOut {
 /// it through a [`D3dFrameRig`] over the arm's residency and run the shared
 /// `run_frame_plan` on the D3D11 encoder. `plan` is the renderer's plan
 /// buffer, rebuilt here. `Err` names why the frame could not draw on D3D11;
-/// the caller falls through to the wgpu tail.
+/// the caller notes it and the frame is lost.
 pub(crate) fn encode_tail(
     live: &mut D3dArmLive,
     win: &mut WindowGpu,
@@ -670,16 +669,6 @@ impl GpuRenderer {
         self.d3d11_armed = true;
     }
 
-    /// Disarm the D3D11 arm, for a suite that reads the wgpu offscreen or drives
-    /// wgpu-typed seams (the Windows twin of `disarm_metal_for_oracle`). Only a
-    /// build carrying the oracle arm has it.
-    #[doc(hidden)]
-    #[cfg(wgpu_arm)]
-    #[inline]
-    pub const fn disarm_d3d11_for_oracle(&mut self) {
-        self.d3d11_armed = false;
-    }
-
     /// Whether the last encoded frame drew on the D3D11 arm.
     #[doc(hidden)]
     #[inline]
@@ -688,8 +677,7 @@ impl GpuRenderer {
     }
 
     /// Mint the D3D11 arm on first use; `false` (with the cause kept) disarms.
-    /// The arm's device is its own (`D3dDevice::headless`); in the oracle
-    /// build it sits beside the wgpu context's.
+    /// The arm's device is its own (`D3dDevice::headless`).
     pub(crate) fn d3d11_arm_ready(&mut self) -> bool {
         if !self.d3d11_armed {
             return false;
@@ -700,9 +688,7 @@ impl GpuRenderer {
         match D3dDevice::headless().and_then(D3dArmLive::on) {
             Ok(live) => {
                 // The context's name came from a probe's device; the device
-                // that renders answers it from its mint on. The oracle
-                // build's facts are wgpu's.
-                #[cfg(not(wgpu_arm))]
+                // that renders answers it from its mint on.
                 self.ctx.adapter_name.clone_from(&live.dev.caps().adapter);
                 self.d3d11_arm = Some(live);
                 true
@@ -718,10 +704,6 @@ impl GpuRenderer {
 
     /// The error a caller returns when the arm cannot start: the mint
     /// failure's cause when there was one.
-    #[cfg_attr(
-        wgpu_arm,
-        expect(dead_code, reason = "a build carrying wgpu falls back to it, by name")
-    )]
     pub(crate) fn d3d11_start_error(&self) -> String {
         match &self.d3d11_mint_error {
             Some(e) => format!("the D3D11 renderer could not start: {e}"),
@@ -768,7 +750,7 @@ impl GpuRenderer {
     /// (positive = up): the shared `BandShift` plan as two staged copies through
     /// the resident scratch, then `apron`'s rows over the exposed strip. Shared
     /// by the sub-row glide and the whole-row scroll rescue
-    /// (`shift_offscreen_rows`), as `shift_offscreen_band_px` is on the wgpu
+    /// (`shift_offscreen_rows`), as `shift_offscreen_band_px` is on the Metal
     /// arm. A failure leaves the band unshifted with one named note.
     pub(crate) fn d3d11_shift_offscreen_band_px(
         &mut self,
@@ -905,7 +887,7 @@ impl GpuRenderer {
     /// Armed arm of `composite_bloom_in_place`: the glow extract into a
     /// half-resolution target, then the screen composite back onto the
     /// offscreen's Unorm view under the same scissor, fx clip and written-rect
-    /// footprint as the wgpu and Metal arms.
+    /// footprint as the Metal and GL arms.
     pub(crate) fn d3d11_composite_bloom_in_place(
         &mut self,
         win: &mut WindowGpu,
@@ -1160,8 +1142,8 @@ impl GpuRenderer {
     /// Armed arm of `draw_tray_into_offscreen`: the scrim (`TrayQuad::scrim`,
     /// a 1×1 texture of its colour over every pixel from its top row down),
     /// then the resident card, each composited straight-alpha source-over onto
-    /// the D3D11 offscreen's Unorm view with the tray pipeline, as the wgpu arm
-    /// draws them.
+    /// the D3D11 offscreen's Unorm view with the tray pipeline, as the Metal and
+    /// GL arms draw them.
     pub(crate) fn d3d11_tray_into_offscreen(
         &mut self,
         win: &mut WindowGpu,

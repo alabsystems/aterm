@@ -35,6 +35,7 @@ use crate::trail_sweep::line_cells_tail;
 use crate::typing_momentum::TypingMomentum;
 
 mod bed;
+mod caret_letter;
 mod companion;
 mod custody;
 mod emit;
@@ -48,6 +49,8 @@ mod seam;
 mod sound;
 mod spawn;
 pub mod spellings;
+#[cfg(any(test, debug_assertions))]
+mod state_words;
 mod status;
 mod style;
 mod thermal;
@@ -55,12 +58,15 @@ pub(crate) use bed::{
     AirLight, BedScratch, BedShape, air_lit, clip_quads_to, clip_stream_to, dark_bed_budget,
     dark_bed_ink, lay_dark_bed, lit_rail_drop, night_rgb, page_lit, page_lit_ink, split_air_runs,
 };
+#[cfg(any(test, debug_assertions))]
+pub use caret_letter::CaretLetterLaw;
+pub(crate) use caret_letter::caret_letter_min_contrast;
 pub use companion::*;
 pub use custody::*;
 use ink_ledger::BandLifts;
 pub(crate) use ink_ledger::InkLedger;
 pub use ink_ledger::OverInkTier;
-pub(crate) use ink_ledger::{LETTER_GUARD_RING, LetterGuard};
+pub(crate) use ink_ledger::{LETTER_GUARD_RING, LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS};
 pub(crate) use light_body::*;
 pub use probe::*;
 pub use raster::*;
@@ -84,6 +90,8 @@ struct Spark {
 #[derive(Clone, Copy)]
 struct WaterSample {
     surface: BeamVertex,
+    /// The spark's path position (tail 0, head 1), the caret's 1.
+    pos: f32,
     phase: f32,
     amp: f32,
     line_y: f32,
@@ -308,6 +316,28 @@ pub struct CursorGlow {
     crown_window_ms: u64,
     last_style: Option<GlowStyle>,
     last_classic_mono: bool,
+    /// Whether Classic's last frame drew on a dark theme: its spectrum face
+    /// there keeps its ruled v0.28 bytes and passes the letter guard by
+    /// ([`Self::guard_letters`]); on paper it is guarded.
+    last_classic_dark: bool,
+    /// A test's negative control: the dark landing ring's rim stays in the
+    /// over-text stream, as main's d03c921d4c laid it ([`Self::set_dark_rim_over`]).
+    #[cfg(any(test, debug_assertions))]
+    dark_rim_over: bool,
+    /// A test's negative control: what the dark landing ring's rim keeps of
+    /// its light under a letter, when not [`RIM_UNDER_LETTERS`]
+    /// ([`Self::set_dark_rim_under_letters`]).
+    #[cfg(any(test, debug_assertions))]
+    dark_rim_share: Option<f32>,
+    /// A test's negative control: the dark landing ring's rim is drawn
+    /// however little of it keeps its whole light
+    /// ([`Self::set_dark_rim_fragments`]).
+    #[cfg(any(test, debug_assertions))]
+    dark_rim_fragments: bool,
+    /// The birth of the dark landing ring whose rim has kept too little of
+    /// its whole light to be drawn ([`RIM_SHOWN_SHARE`]): hidden once, that
+    /// ring's rim stays hidden for the rest of its life.
+    dark_rim_hidden: Option<Instant>,
     hue: f32,
     heat: f32,
     heat_at: Option<Instant>,
@@ -420,6 +450,36 @@ pub struct CursorGlow {
     fire_filled_unheld: bool,
     #[cfg(test)]
     fire_bloom_unwarmed: bool,
+    /// Test-only: lay no night ground under a warm light on a tinted dark
+    /// page ([`push_night_ground`]; looks8 K5/K6's negative control).
+    #[cfg(test)]
+    night_ground_off: bool,
+    /// Test-only: Water lays no bed on a lit page ([`bed::BedShape::WATER_LIT`];
+    /// looks8 K4's negative control).
+    #[cfg(test)]
+    water_lit_off: bool,
+    /// A test's negative control: Water's lit rail straight (looks8 round 2's K4).
+    #[cfg(test)]
+    water_rail_straight: bool,
+    /// A test's negative control: Water's lit rail laid under rows the caret
+    /// has left (looks8 round 2's K4).
+    #[cfg(test)]
+    water_rail_any_row: bool,
+    /// A test's negative control: Water's drops the faint foam they were on
+    /// a dark page (looks8 round 2's K4).
+    #[cfg(test)]
+    water_drops_dim: bool,
+    /// A test's negative control: Comet's dust the grey grain it was on a
+    /// dark page, held to the leading's thin seats (looks8 round 2's K4;
+    /// [`Self::COMET_DARK_DUST_AIR`], round 3's).
+    #[cfg(test)]
+    comet_dust_grey: bool,
+    /// The frame's night grounds ([`push_night_ground`]), laid first under
+    /// the letters.
+    night_out: Vec<GlowQuad>,
+    /// The page, style and colour [`night_ground`] was last solved for, and
+    /// its answer.
+    night_memo: Option<((u32, GlowStyle, u32), Option<NightGround>)>,
     #[cfg(test)]
     fire_row_unheld: bool,
     #[cfg(test)]
@@ -434,6 +494,10 @@ pub struct CursorGlow {
     streak_chords_rows: bool,
     #[cfg(test)]
     leap_split: bool,
+    /// Test-only: every bed's rail an even tube at full strength from its
+    /// top, as looks7 laid them (looks8 K10's negative control).
+    #[cfg(test)]
+    rail_even: bool,
     #[cfg(test)]
     heads_square: bool,
     #[cfg(test)]
@@ -508,6 +572,10 @@ pub struct CursorGlow {
     /// A test's negative control: no page veil under the pet's letters.
     #[cfg(any(test, debug_assertions))]
     pet_veil_off: bool,
+    /// A test's negative control: the veil reads the trail's text about the
+    /// caret, not the body's rows ([`Self::set_pet_veil_caret_rows`]).
+    #[cfg(any(test, debug_assertions))]
+    pet_veil_caret_rows: bool,
     /// A test's cost for the beams' runs in place of the measured one
     /// ([`Self::set_glow_ramps`], [`Self::set_ramp_cost`]).
     #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
@@ -519,6 +587,10 @@ pub struct CursorGlow {
     /// The caret and geometry the frame's step drew by, which the pet's veil,
     /// drawn after the pet's tick, lays its runs by ([`Self::veil_pet_letters`]).
     veil_frame: Option<(Option<(u16, u16)>, Geom)>,
+    /// The frame's text on the rows the pet's body lay on last frame, padded
+    /// ([`Self::observe_frame_text_at`]), which its page veil reads: the
+    /// trail's own read keeps to the caret's rows.
+    pet_text: FrameText,
     /// The veil the last [`Self::veil_pet_letters`] laid, which a host that
     /// projects the trail's streams again without a pet tick (a split
     /// pane's cursor-only frame) lays again ([`Self::pet_veil`]).
@@ -542,10 +614,21 @@ pub struct CursorGlow {
     /// ([`bed::bridge_word_gaps`]).
     #[cfg(any(test, debug_assertions))]
     bed_gaps_unbridged: bool,
+    /// Tests' negative controls: the laws that keep the letter under the
+    /// caret, each one off ([`Self::set_caret_letter_law`]).
+    #[cfg(any(test, debug_assertions))]
+    caret_letter_off: caret_letter::LawsOff,
+    /// The over-text stream with the caret's letter punched out of it
+    /// ([`Self::keep_light_off_caret_letter`]).
+    caret_punch_scratch: Vec<GlowQuad>,
     /// This frame's keep-out boxes, window pixels ([`Self::keep_out_boxes`]).
     keep_out_scratch: Vec<(i32, i32, i32, i32)>,
     /// This frame's lettered rows' spans, window pixels ([`Self::keep_out_boxes`]).
     keep_rows_scratch: Vec<(i32, i32, i32, i32)>,
+    /// This frame's filled cells' runs, window pixels ([`Self::keep_out_boxes`]).
+    keep_filled_scratch: Vec<(i32, i32, i32, i32)>,
+    /// This frame's probed rows' feet, window pixels ([`Self::foot_boxes`]).
+    keep_feet_scratch: Vec<(i32, i32, i32, i32)>,
     /// The grid origin and cell width the last keep-out was laid by, for the
     /// word icons' shade ([`Self::shade_word_icons`]).
     keep_geom: Option<(i32, i32, i32)>,
@@ -759,7 +842,7 @@ impl FrameFingerprint {
     /// A stream's ramps ([`GlowRamps`]): each one's band, box, run and
     /// place ([`aterm_render::GlowRamp::damage_words`]), then the ends it keeps.
     #[inline]
-    fn glow_ramps(&mut self, tag: u64, ramps: &GlowRamps) {
+    const fn glow_ramps(&mut self, tag: u64, ramps: &GlowRamps) {
         if ramps.is_empty() {
             return;
         }
@@ -779,12 +862,14 @@ impl FrameFingerprint {
                 hash = fnv_mix_u64(hash, words[wi]);
                 wi += 1;
             }
-            let chunks = r.kept_ends(ends).as_chunks::<2>().0;
+            let k = r.ink as usize;
+            let count = r.end_count();
             let mut ci = 0;
-            while ci < chunks.len() {
-                let e = &chunks[ci];
-                hash = fnv_mix_u64(hash, (e[0] as u64) | ((e[1] as u64) << 32));
-                ci += 1;
+            while ci + 1 < count {
+                let e0 = ends[k + ci];
+                let e1 = ends[k + ci + 1];
+                hash = fnv_mix_u64(hash, (e0 as u64) | ((e1 as u64) << 32));
+                ci += 2;
             }
             ri += 1;
         }
@@ -1137,10 +1222,56 @@ impl CursorGlow {
     const GLYPH_BAND: (f32, f32) = (0.12, 0.86);
     const COMET_DARK_DUST_HIGH: f32 = 0.02;
     const COMET_DARK_DUST_LOW: f32 = 0.95;
-    const COMET_DARK_DUST_SHARE: f32 = 0.4;
+    /// The share of Comet's dust on a dark page seated in the leading
+    /// ([`Self::COMET_DARK_DUST_HIGH`], [`Self::COMET_DARK_DUST_LOW`]); the
+    /// rest is not drawn. At 0.4 its typing dust was a few grey specks
+    /// (looks8 round 3's K4: "Comet should show a nucleus and dust").
+    const COMET_DARK_DUST_SHARE: f32 = 0.8;
+    /// Comet's dust's radius on a dark page over the shared dust's
+    /// ([`crate::effect_util::dust_r`]): ice motes that read as dust, not
+    /// a pixel's speck.
+    const COMET_DARK_DUST_GROW: f32 = 1.4;
     const COMET_DARK_DUST_JITTER: f32 = 0.04;
+    /// How far into a row with no letter near a grain of Comet's dark dust
+    /// floats past the typed row's leading, a share of the cell height, and
+    /// the spread of its seats there: in the leading's thin seat, against
+    /// the letters' tops and feet, the letter guard held its light to grey
+    /// specks (looks8 round 3's K4). Below the row a grain floats out at
+    /// least beneath the icy tail ([`bed::icy_rail_floor`]).
+    const COMET_DARK_DUST_AIR: f32 = 0.24;
+    const COMET_DARK_DUST_AIR_SPREAD: f32 = 0.28;
     const COMET_LIGHT_GLINT_LOW: f32 = 0.885;
     const WATER_LINE_DY: f32 = 0.10;
+    /// The swell of Water's lit rail below the row, a share of the cell
+    /// height ([`super::bed::BedScratch::rail_wave`]).
+    const WATER_RAIL_SWELL: f32 = 0.14;
+    /// Water's lit rail's swell, radians per cell: a crest about every three
+    /// and a half cells.
+    const WATER_RAIL_K: f32 = 1.8;
+    /// How fast Water's lit rail ripples along, radians per radian of the
+    /// trail's phase clock (`flame_phase`).
+    const WATER_RAIL_RIPPLE: f32 = 3.0;
+    /// Water's crest's gain on the reference dark, where it is the trail's
+    /// whole light.
+    const WATER_DARK_CREST_GAIN: f32 = 1.45;
+    /// A falling drop's bead on a dark page: clear blue, its gain over the
+    /// drip's coverage and its cap.
+    const WATER_DARK_DROP: u32 = 0x0036_A8E2;
+    const WATER_DARK_DROP_GAIN: f32 = 3.8;
+    const WATER_DARK_DROP_CAP: f32 = 225.0;
+    /// A falling drop's bead's radius on a dark page, a share of the cell
+    /// width: at the lit page's 0.16 its beads were blue specks
+    /// (looks8 round 3's K4).
+    const WATER_DARK_DRIP_R: f32 = 0.21;
+    /// A flung drop's bead's gain over its grain's coverage on a dark page.
+    const WATER_DARK_BEAD_GAIN: f32 = 2.8;
+    /// A flung drop's bead's radius on a dark page over its grain's: its
+    /// beads were blue specks (looks8 round 3's K4).
+    const WATER_DARK_BEAD_GROW: f32 = 1.35;
+    /// Comet's nucleus on a dark page ([`Self::push_comet_nucleus`]): its
+    /// radius, a share of the cell height, and its peak coverage.
+    const COMET_NUCLEUS_R: f32 = 0.30;
+    const COMET_NUCLEUS_COV: f32 = 230.0;
     const WATER_SWELL: (f32, f32) = (0.08, 0.12);
     const WATER_KNOTS: usize = 4;
     const LIGHT_WATER_DROP_INKS: (u32, u32) = (0x0010_6EB4, 0x0036_A8E2);
@@ -1172,6 +1303,15 @@ impl CursorGlow {
             (Some(cell), _) | (None, Some((cell, _))) => Some(cell),
             (None, None) => None,
         }
+    }
+
+    /// The config the last styled tick drew by, `None` before one: a debug read for the host
+    /// unreachability pin (`docs/design/PRISM-GLASS.md` §15.1 P0.9).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn last_cfg(&self) -> Option<&GlowConfig> {
+        self.last_cfg.as_ref()
     }
 
     #[inline]
@@ -1479,6 +1619,21 @@ impl CursorGlow {
         self.v2.hide_armed()
     }
 
+    /// The primary screen was cleared under the trail (looks8 K7): a cleared
+    /// screen has no letters left to underline, and the caret's leap to its
+    /// top is no motion, so the bed, the tracer, the sparks and the heat the
+    /// old screen's letters carried go with them, in the frame they go (after
+    /// Ctrl-L a ribbon's fading bed and its Enter tracer floated on the empty
+    /// screen, connected to nothing). Classic keeps its own: its tracer runs
+    /// to the caret, the ruled v0.28 face.
+    #[inline]
+    pub fn note_screen_cleared(&mut self) {
+        if self.classic.has_last() {
+            return;
+        }
+        self.reset();
+    }
+
     /// Drops all in-flight light and forgets the last cursor position across a coordinate-space
     /// transition.
     #[inline]
@@ -1486,6 +1641,7 @@ impl CursorGlow {
         self.reset_space(None);
     }
 
+    #[inline]
     fn reset_space(&mut self, curtain: Option<Instant>) {
         self.unsettle();
         self.clear_transient_state();
@@ -1549,6 +1705,10 @@ impl CursorGlow {
         if self.frame_text.at != Some(now) {
             self.frame_text.rows.clear();
             self.frame_text.pairs.clear();
+        }
+        if self.pet_text.at != Some(now) {
+            self.pet_text.rows.clear();
+            self.pet_text.pairs.clear();
         }
         self.momentum_pulse = None;
         let valid_canvas =
@@ -1654,6 +1814,7 @@ impl CursorGlow {
 
         if matches!(cfg.style, GlowStyle::Classic) {
             self.last_classic_mono = cfg.classic_mono;
+            self.last_classic_dark = cfg.dark_theme;
             self.kill_hint = None;
             self.kill_retreat_pending = None;
             self.kill_reported_to_v2 = None;
@@ -2061,6 +2222,9 @@ impl CursorGlow {
         out_sink.keep_laid(Self::MAX_QUADS);
         drop((out_sink, under_sink));
         let mut ledger = std::mem::take(&mut self.ink_ledger);
+        let mut night = std::mem::take(&mut self.night_out);
+        night.clear();
+        self.night_ground(cfg);
         self.emit_flames(
             now,
             cfg,
@@ -2070,6 +2234,7 @@ impl CursorGlow {
             &mut halo_cells,
             &mut engulf,
             &mut under,
+            &mut night,
             &mut ledger,
         );
         self.ink_ledger = ledger;
@@ -2083,7 +2248,7 @@ impl CursorGlow {
             self.emit_fire_meteors(now, cfg, geom, &mut under_sink);
         }
         if under_ramps.laid(under.len()) < Self::MAX_QUADS {
-            self.emit_water(now, cfg, geom, cur, &mut under);
+            self.emit_water(now, cfg, geom, cur, (&mut under, &mut under_ramps));
         }
         if self.v2.engaged() {
             Self::reserve_v2_scratch(&mut under, out, &mut halos);
@@ -2154,8 +2319,12 @@ impl CursorGlow {
             let rail_spans = self.v2.ribbon().rail_spans();
             let mut ri = 0;
             while ri < rail_spans.len() {
-                let (from, to) = rail_spans[ri];
-                self.ink_ledger.note_rail_laid(from, to);
+                let (from, to, foot) = rail_spans[ri];
+                if foot {
+                    self.ink_ledger.note_foot_rail_laid(from, to);
+                } else {
+                    self.ink_ledger.note_rail_laid(from, to);
+                }
                 ri += 1;
             }
             self.read_fresh_run_origin(now);
@@ -2195,6 +2364,57 @@ impl CursorGlow {
                 ring.caret = Some((r, c));
             }
             self.emit_ring(now, cfg, geom, cur, out, &mut halos);
+            // THE DARK RING PASSES UNDER THE LETTERS: on a dark page the rim
+            // of the landing ring ([`Self::emit_ring_rim`]) is drawn under the
+            // text, a fifth of its light on every lettered cell
+            // ([`Self::pass_under_letters`]), as if the text stood over it,
+            // where the host's bloom and SDR crown, which spread only the
+            // over-text light, never reach it.
+            // Laid over the text, the rim crossed `echo`'s `e` in the trail
+            // gallery's `enter-bottom`: held by the ink ledger to its flying
+            // floor and then bloomed, the `e` read 4.26:1 under Lumen (looks8
+            // round 2; 4.06 under Phaser replayed with the host's post
+            // passes); laid under the text whole and left to the letter guard,
+            // the rim spent the letters' room to the guard's floor and the
+            // bloom of the trail's own light took a `q` to 4.20 under Laser;
+            // cut off the letters, it left stray glyphs in the word gaps.
+            // Water's ripples and Fire's flash keep their own streams.
+            #[cfg(any(test, debug_assertions))]
+            let rim_over = self.dark_rim_over;
+            #[cfg(not(any(test, debug_assertions)))]
+            let rim_over = false;
+            if cfg.dark_theme
+                && !rim_over
+                && !matches!(cfg.style, GlowStyle::Water | GlowStyle::Fire)
+            {
+                let u0 = under.len();
+                under.extend_from_slice(&out[q0..]);
+                out.truncate(q0);
+                #[cfg(any(test, debug_assertions))]
+                let share = self.dark_rim_share.unwrap_or(RIM_UNDER_LETTERS);
+                #[cfg(not(any(test, debug_assertions)))]
+                let share = RIM_UNDER_LETTERS;
+                // THE RING SHOWS AS A RING OR NOT AT ALL ([`RIM_SHOWN_SHARE`]),
+                // and once hidden stays hidden: judged afresh each frame, a rim
+                // whose whole share hovered at the bar as it spread over the
+                // letters vanished for a frame and came back, about every
+                // 128 ms (the review of looks8 round 3).
+                #[cfg(any(test, debug_assertions))]
+                let fragments = self.dark_rim_fragments;
+                #[cfg(not(any(test, debug_assertions)))]
+                let fragments = false;
+                let born = self.ring.map(|r| r.born);
+                let latched = !fragments && born.is_some() && self.dark_rim_hidden == born;
+                let whole = if latched {
+                    0.0
+                } else {
+                    self.pass_under_letters(&mut under, u0, geom, share)
+                };
+                if whole < RIM_SHOWN_SHARE && !fragments {
+                    under.truncate(u0);
+                    self.dark_rim_hidden = born;
+                }
+            }
             if flying {
                 let to = out.len();
                 self.ink_ledger
@@ -2232,6 +2452,23 @@ impl CursorGlow {
         self.engulf_scratch = engulf;
 
         self.tick_fades(now, geom, (out, &mut out_ramps));
+        // The flames' night grounds lie under every other mark under the
+        // letters ([`push_night_ground`]); the frame's other lights lay
+        // theirs once every light is in ([`Self::ground_the_frame`]). The
+        // under stream's ramps stand before the same quads they stood
+        // before, moved past the grounds.
+        if !night.is_empty() {
+            let moved = night.len().min(u32::MAX as usize) as u32;
+            let items = self.under_ramps.items.as_mut_slice();
+            let mut ri = 0;
+            while ri < items.len() {
+                items[ri].at = items[ri].at.saturating_add(moved);
+                ri += 1;
+            }
+            night.extend_from_slice(&self.under_out);
+            std::mem::swap(&mut self.under_out, &mut night);
+        }
+        self.night_out = night;
 
         out_ramps.truncate_laid(out, Self::MAX_QUADS);
         self.under_ramps
@@ -2264,6 +2501,7 @@ impl CursorGlow {
     const RAMP_IN_FLOOR: f32 = 0.15;
     const FADE_CAP: usize = 2;
 
+    #[inline]
     fn begin_style_fade(&mut self, now: Instant) {
         let level0 = self.ramp_in_scale(now);
         self.ramp_in_at = Some(now);
@@ -2348,6 +2586,7 @@ impl CursorGlow {
         Self::RAMP_IN_FLOOR + (1.0 - Self::RAMP_IN_FLOOR) * eased
     }
 
+    #[inline]
     fn tick_fades(
         &mut self,
         now: Instant,

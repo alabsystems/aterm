@@ -128,8 +128,6 @@ impl<T: 'static> EventLoop<T> {
             control_flow: Cell::new(ControlFlow::default()),
             exit: Cell::new(None),
             state: RefCell::new(winit_state),
-            #[cfg(feature = "rwh_06")]
-            connection: Arc::clone(&connection),
         };
 
         let event_loop = Self {
@@ -650,10 +648,6 @@ pub struct ActiveEventLoop {
 
     /// Winit state.
     pub state: RefCell<WinitState>,
-
-    /// Connection to the wayland server, for the opt-in `rwh_06` display handle.
-    #[cfg(feature = "rwh_06")]
-    pub(crate) connection: Arc<Connection>,
 }
 
 impl ActiveEventLoop {
@@ -679,18 +673,6 @@ impl ActiveEventLoop {
 
     pub(crate) fn exit_code(&self) -> Option<i32> {
         self.exit.get()
-    }
-
-    #[cfg(feature = "rwh_06")]
-    #[inline]
-    pub fn raw_display_handle_rwh_06(
-        &self,
-    ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        Ok(rwh_06::WaylandDisplayHandle::new({
-            std::ptr::NonNull::new(self.connection.display().as_ptr())
-                .expect("wl_display should never be null")
-        })
-        .into())
     }
 }
 

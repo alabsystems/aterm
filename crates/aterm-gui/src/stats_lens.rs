@@ -13,7 +13,9 @@ use aterm_vitals::explain::{
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
 use aterm_vitals::model::{
     CpuView, DiskFacts, LinkKind, Pressure, ProcScope, Resource, ResourceView, Snapshot,
+    StripEventKind,
 };
+use aterm_vitals::ring::GapKind;
 use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform};
 
 use crate::deck_face::{ASCENT_EM, DESCENT_EM, FaceMetrics, deck_metrics};
@@ -62,6 +64,8 @@ pub(crate) struct Rest {
 /// The lens's per-window state.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LensSlot {
+    /// Stable peer/service selection within the Network State instrument.
+    pub(crate) network_target: crate::network_deck::Target,
     /// The open lens.
     pub(crate) open: Option<Lens>,
     /// A rest armed over an instrument.
@@ -165,14 +169,20 @@ pub(crate) fn lens_geom(
 /// What the How to read lens says to a reader, and what its ⌘C copies.
 pub(crate) fn how_to_read_words(platform: Platform) -> String {
     format!(
-        "Each row is one resource, oldest on the left and now at the right end, under the dot; \
-         the label over the strips says how far back they reach: one to two and a half minutes \
-         folded, 10 in the full deck. Each cell is 10 seconds (20 or 30 in a narrow full deck). \
-         Colour runs from cold, 0 percent of the resource's maximum, to hot, 100 percent. A mark \
-         above a cell means the resource ran over its maximum. An outlined cell, or a short \
-         line, was not read. The bar shows {} in grey, aterm in green and this \
-         tab in bright green.",
-        platform.machine()
+        "Each row is one resource, read from now: the live now cell at the left end, then \
+         older intervals to the right; the time scale over the strips says how far back they \
+         reach: up to 6 hours where a strip has the room, 4 hours, 6 minutes or a minute on a \
+         narrower one. Cells are blocks of 1 second, 10 seconds, 1 minute, 10 minutes and 1 \
+         hour, from live now outward, each size starting where the scale marks it. Colour runs \
+         from cold, 0 percent of the resource's maximum, to hot, 100 percent; the now cell is \
+         coloured as the strip's cells are. A mark above a cell means the resource ran over its \
+         maximum. An outlined cell or shaded gap was not read (sleep, crash or pause), and \
+         vertical lines mark crash, wake or pressure events. The bar right of the strip, or on \
+         a narrow deck the line under each percent figure, shows {machine} in grey, aterm in \
+         green and this tab in bright green, named once over the bars. Where it fits, the \
+         bar's end says {machine}'s amount now in the row's unit and the row's maximum; a row's \
+         close-up says aterm's and this tab's.",
+        machine = platform.machine()
     )
 }
 
@@ -187,6 +197,20 @@ pub(crate) fn lens_sentence(
         Some(res) => words::row_sentence(res, snap, panes, loc),
         None => how_to_read_words(loc.platform),
     }
+}
+
+/// The CPU lens's bounded export, tied to the executable that produced it.
+pub(crate) fn cpu_diagnostic_report(snap: &Snapshot) -> String {
+    use aterm_vitals::sys::json::Jv;
+    let mut report = aterm_vitals::sys::hardware::report_json(snap);
+    report.set(
+        "diagnostic_executable",
+        std::env::current_exe()
+            .ok()
+            .map_or_else(|| Jv::why("not_sampled"), |p| Jv::s(p.to_string_lossy())),
+    );
+    report.set("build", Jv::s(aterm_types::version::app_version()));
+    report.to_text()
 }
 
 /// The next instrument ←/→ moves to over `Instrument::ALL`, wrapping.
@@ -620,14 +644,10 @@ impl<'a> Pen<'a> {
         }
     }
 
-    /// Heat step `step`'s ink.
+    /// A cell's ink at `v`, the Deck's own ([`aterm_vitals::ink::VitalsInks::cell_at`]): the heat
+    /// ramp's step for it.
     fn heat(&self, v: f32) -> Rgb {
-        let step = usize::from(ink::heat_step(v.max(0.0)).min(6));
-        if self.ic {
-            self.inks.heat_ic[step]
-        } else {
-            self.inks.heat[step]
-        }
+        self.inks.cell_at(v.max(0.0), self.ic)
     }
 
     /// The machine's ink, `machine_ic` under Increase Contrast.
@@ -954,6 +974,20 @@ fn list_section<'d>(
     }
 }
 
+/// Discontinuity span mapped onto a trace's fractional bucket indices.
+struct TraceGap {
+    start: f64,
+    end: f64,
+    kind: GapKind,
+}
+
+/// Vertical strip event marker mapped onto a trace's fractional bucket index.
+struct TraceEvent {
+    at: f64,
+    label: String,
+    ink: InkKind,
+}
+
 /// A step trace's data and words.
 struct Trace {
     /// The values, oldest first.
@@ -964,6 +998,65 @@ struct Trace {
     min_span: f64,
     /// A rule at a fractional bucket index, and its label.
     mark: Option<(f64, String)>,
+    /// Discontinuity spans within the trace window.
+    gaps: Vec<TraceGap>,
+    /// Strip event markers within the trace window.
+    events: Vec<TraceEvent>,
+}
+
+/// Maps `snap`'s discontinuity gaps and strip event markers onto fractional bucket coordinates of a
+/// `cols`-bucket trace starting at `start_ms` (`bucket_ms` per bucket).
+fn trace_overlays(
+    snap: &Snapshot,
+    start_ms: i64,
+    bucket_ms: i64,
+    cols: usize,
+) -> (Vec<TraceGap>, Vec<TraceEvent>) {
+    if cols == 0 || bucket_ms <= 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let span = cols as f64;
+    let b_ms = bucket_ms as f64;
+    let gaps = snap
+        .time_gaps
+        .iter()
+        .filter_map(|g| {
+            let start = ((g.start_ms - start_ms) as f64 / b_ms).clamp(0.0, span);
+            let end = ((g.end_ms - start_ms) as f64 / b_ms).clamp(0.0, span);
+            (end > start).then_some(TraceGap {
+                start,
+                end,
+                kind: g.kind,
+            })
+        })
+        .collect();
+    let mut events: Vec<(u8, TraceEvent)> = snap
+        .strip_events
+        .iter()
+        .filter_map(|ev| {
+            let at = (ev.at_unix_ms - start_ms) as f64 / b_ms;
+            if !(0.0..=span).contains(&at) {
+                return None;
+            }
+            let (prio, word, ink) = match ev.kind {
+                StripEventKind::Crash => (0, "crash", InkKind::Critical),
+                StripEventKind::PressureSpike => (1, "pressure", InkKind::Warn),
+                StripEventKind::SleepWake => (2, "woke", InkKind::Words2),
+                StripEventKind::Restart => (3, "restarted", InkKind::Words2),
+            };
+            Some((
+                prio,
+                TraceEvent {
+                    at,
+                    label: word.to_owned(),
+                    ink,
+                },
+            ))
+        })
+        .collect();
+    events.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.at.total_cmp(&b.1.at)));
+    let events = events.into_iter().map(|(_, ev)| ev).collect();
+    (gaps, events)
 }
 
 /// The labels under a 24 hour trace and an hour's.
@@ -1007,7 +1100,12 @@ fn step_up(v: f64) -> f64 {
 fn axis(lo: f64, hi: f64, n: usize, min_span: f64) -> (f64, f64) {
     let mid = (lo + hi) / 2.0;
     let (lo, hi) = if hi - lo < min_span {
-        (mid - min_span / 2.0, mid + min_span / 2.0)
+        if lo >= 0.0 {
+            let lo0 = (mid - min_span / 2.0).max(0.0);
+            (lo0, lo0 + min_span)
+        } else {
+            (mid - min_span / 2.0, mid + min_span / 2.0)
+        }
     } else {
         (lo, hi)
     };
@@ -1098,6 +1196,19 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
     if let Some((sx, sy)) = run {
         pen.line(sx, sy, x1, sy, ink);
     }
+    let mut rule_xs: Vec<f64> = Vec::with_capacity(t.events.len() + 1);
+    if let Some((at, _)) = &t.mark {
+        let fx = x0 + at * pitch;
+        if (x0..=x1).contains(&fx) {
+            rule_xs.push(fx);
+        }
+    }
+    for ev in &t.events {
+        let fx = x0 + ev.at * pitch;
+        if (x0..=x1).contains(&fx) {
+            rule_xs.push(fx);
+        }
+    }
     let mut said: Vec<(f64, f64)> = Vec::new();
     let mut j = 0;
     while j < cols {
@@ -1110,35 +1221,94 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
             j += 1;
         }
         let (xa, xb) = (x0 + start as f64 * pitch, x0 + j as f64 * pitch);
+        let gap_kind = t
+            .gaps
+            .iter()
+            .filter(|g| g.start < j as f64 + 0.5 && g.end > start as f64 - 0.5)
+            .map(|g| g.kind)
+            .max();
+        let hollow_ink = match gap_kind {
+            Some(GapKind::Crash) => rgba(inks.critical, 0xCC),
+            Some(GapKind::Sleep) => rgba(inks.words2, 0xAA),
+            _ => rgba(inks.hollow, 0xFF),
+        };
         if pitch * pen.s >= 3.0 {
             for k in start..j {
                 let xk = x0 + k as f64 * pitch;
-                pen.hollow(xk, y1 - 4.0, pitch, 4.0, rgba(inks.hollow, 0xFF));
+                pen.hollow(xk, y1 - 4.0, pitch, 4.0, hollow_ink);
             }
         } else {
-            pen.hollow(xa, y1 - 4.0, xb - xa, 4.0, rgba(inks.hollow, 0xFF));
+            pen.hollow(xa, y1 - 4.0, xb - xa, 4.0, hollow_ink);
         }
-        let words = "not read";
+        let (words, word_ink) = match gap_kind {
+            Some(GapKind::Crash) => ("crash", inks.warn_text),
+            Some(GapKind::Sleep) => ("asleep", inks.words2),
+            Some(GapKind::Paused) => ("paused", inks.words2),
+            None => ("not read", inks.words2),
+        };
         let lw = pen.width(words, AXIS_PT, false);
-        if ch >= 30.0 && lw <= xb - xa + 16.0 && lw <= x1 - x0 {
+        let span_fits = if gap_kind.is_some() {
+            lw + 6.0 <= xb - xa
+        } else {
+            lw <= xb - xa + 16.0
+        };
+        if ch >= 30.0 && span_fits && lw <= x1 - x0 {
             let lx = ((xa + xb) / 2.0 - lw / 2.0).clamp(x0, x1 - lw);
-            if !said.iter().any(|&(a, b)| lx < b + 6.0 && a < lx + lw + 6.0) {
-                pen.text(lx, y1 - 8.0, words, AXIS_PT, false, inks.words2);
+            let crosses_rule = rule_xs
+                .iter()
+                .any(|&rx| rx >= lx - 3.0 && rx <= lx + lw + 3.0);
+            if !crosses_rule && !said.iter().any(|&(a, b)| lx < b + 6.0 && a < lx + lw + 6.0) {
+                pen.text(lx, y1 - 8.0, words, AXIS_PT, false, word_ink);
                 said.push((lx, lx + lw));
             }
         }
     }
-    if let Some((at, label)) = &t.mark {
-        let fx = x0 + at * pitch;
-        if (x0..=x1).contains(&fx) {
-            pen.tick(fx, y0 - 2.0, y1, rgba(inks.words, 0xFF));
-            let lw = pen.width(label, AXIS_PT, false);
-            if fx - 4.0 - lw >= x0 {
-                pen.text(fx - 4.0 - lw, y0 + 8.0, label, AXIS_PT, false, inks.words);
-            } else if fx + 4.0 + lw <= x1 {
-                pen.text(fx + 4.0, y0 + 8.0, label, AXIS_PT, false, inks.words);
+    let mut top_said: Vec<(f64, f64)> = Vec::new();
+    let mut place_top = |pen: &mut Pen<'_>, fx: f64, label: &str, tick_ink: Rgba, text_ink: Rgb| {
+        if !(x0..=x1).contains(&fx) {
+            return;
+        }
+        pen.tick(fx, y0 - 2.0, y1, tick_ink);
+        if ch < 24.0 {
+            return;
+        }
+        let lw = pen.width(label, AXIS_PT, false);
+        let candidates = [fx - 4.0 - lw, fx + 4.0];
+        for lx in candidates {
+            let crosses_other_rule = rule_xs
+                .iter()
+                .any(|&rx| (rx - fx).abs() > 0.5 && rx >= lx - 2.5 && rx <= lx + lw + 2.5);
+            if lx >= x0
+                && lx + lw <= x1
+                && !crosses_other_rule
+                && !top_said
+                    .iter()
+                    .any(|&(a, b)| lx < b + 6.0 && a < lx + lw + 6.0)
+            {
+                pen.text(lx, y0 + 8.0, label, AXIS_PT, false, text_ink);
+                top_said.push((lx, lx + lw));
+                break;
             }
         }
+    };
+    if let Some((at, label)) = &t.mark {
+        place_top(
+            pen,
+            x0 + at * pitch,
+            label,
+            rgba(inks.words, 0xFF),
+            inks.words,
+        );
+    }
+    for ev in &t.events {
+        let ev_ink = kind_ink(&inks, ev.ink);
+        place_top(
+            pen,
+            x0 + ev.at * pitch,
+            &ev.label,
+            rgba(ev_ink, 0xDD),
+            ev_ink,
+        );
     }
     let base = y1 + 12.0;
     let mut placed: Vec<(f64, f64)> = Vec::new();
@@ -1446,14 +1616,158 @@ impl Ctx<'_> {
 }
 
 /// The lens for `c`'s instrument.
+fn lab_network_doc(
+    snapshot: Option<&aterm_types::network_state::NetworkStateSnapshot>,
+    target: crate::network_deck::Target,
+) -> LensDoc<'static> {
+    let empty = aterm_types::network_state::NetworkStateSnapshot::default();
+    let snapshot = snapshot.unwrap_or(&empty);
+    let rows = crate::network_deck::details(snapshot, target);
+    let mut sections: Vec<_> = rows
+        .into_iter()
+        .map(|(name, value)| line_section(&name, &name, vec![value], false))
+        .collect();
+    if let crate::network_deck::Target::Peer(slot) = target
+        && let Some(peer) = snapshot.network.peers.iter().find(|peer| peer.slot == slot)
+        && !peer.samples.is_empty()
+    {
+        let samples = peer.samples.clone();
+        let now = snapshot.network.observed_at_ms;
+        let start = samples.first().map_or(now, |sample| sample.at_ms);
+        let span = now.saturating_sub(start).max(1);
+        let history = form(42.0, move |pen, p| {
+            let color = pen.inks.words2;
+            pen.text(
+                p.x,
+                p.y + HEAD_BASE,
+                "Observed presence",
+                HEAD_PT,
+                true,
+                color,
+            );
+            let width = (p.w - 8.0).max(1.0);
+            for sample in &samples {
+                let x = p.x
+                    + (sample.at_ms.saturating_sub(start).min(span) as f64 / span as f64) * width;
+                let fill = if sample.state == aterm_types::network_state::Reachability::Reachable {
+                    pen.inks.machine
+                } else {
+                    pen.inks.hollow
+                };
+                pen.rect(x, p.y + 19.0, 4.0, 7.0, 0.0, rgba(fill, 255));
+                if sample.state != aterm_types::network_state::Reachability::Reachable {
+                    pen.rect(
+                        x + 1.0,
+                        p.y + 20.0,
+                        2.0,
+                        5.0,
+                        0.0,
+                        rgba(pen.inks.ground, 255),
+                    );
+                }
+            }
+            pen.text(
+                p.x,
+                p.y + 38.0,
+                "First retained observation",
+                BODY_PT,
+                false,
+                color,
+            );
+            pen.text_end(p.x + p.w, p.y + 38.0, "now", BODY_PT, false, color);
+        });
+        sections.push(Section {
+            name: "Observed presence".into(),
+            words: vec![
+                "Recorded samples only; blank intervals do not establish reachability".into(),
+            ],
+            right: false,
+            parts: Vec::new(),
+            forms: vec![history],
+        });
+    }
+    LensDoc {
+        name: "Network State",
+        sources: vec!["This aterm's authenticated observations and retained history".into()],
+        explainer: "Filled: reachable. Hollow: last seen. A warning marks an unknown observation. ↑/↓ selects a machine or service; ←/→ selects an instrument. Reachability does not grant account or secret access.".into(),
+        answer: Some(("Now", crate::network_deck::summary(snapshot), InkKind::Words2)),
+        sections,
+        two_order: Vec::new(),
+        keeps_first: true,
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    #[test]
+    fn network_details_do_not_require_a_resource_reading() {
+        let resource = Snapshot::default();
+        let mut input = crate::stats_deck::tests::input(&resource);
+        input.snap = None;
+        let mut network = aterm_types::network_state::NetworkStateSnapshot::default();
+        network.services.secrets.availability =
+            aterm_types::network_state::ServiceAvailability::Cached;
+        network.services.secrets.refresh_failed = true;
+        input.network = Some(&network);
+        input.network_target = crate::network_deck::Target::Secrets;
+        let lens = Lens {
+            focus: Instrument::NetworkState,
+            bar: Bar::Global,
+            how: Opened::Keyboard,
+        };
+        let geometry = LensGeom {
+            dx: 0,
+            dy: 0,
+            w: 800.0,
+            h: 400.0,
+            margin: 8.0,
+            scale: 1.0,
+            font_px: 14.0,
+        };
+        let laid = lay_lens(
+            &geometry,
+            &input,
+            &lens,
+            &FaceMetrics::helvetica_neue(),
+            false,
+        );
+        let expected = crate::network_deck::details(&network, input.network_target);
+        assert!(expected.iter().all(|row| laid.wells.contains(row)));
+        assert!(!laid.wells.is_empty());
+    }
+
+    #[test]
+    fn network_copy_is_available_without_resource_reading() {
+        let mut app = crate::App::headless_for_test();
+        app.vitals.snapshot = None;
+        let wid = *app.windows.keys().next().expect("window");
+        assert!(app.open_network_lens());
+        assert_eq!(app.stats_lens_copy_ready(wid), Some(true));
+        assert!(app.stats_lens_sentence(wid).is_some());
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .stats_lens
+            .open
+            .as_mut()
+            .unwrap()
+            .focus = Instrument::Cpu;
+        assert_eq!(app.stats_lens_copy_ready(wid), Some(false));
+    }
+}
+
 fn doc_for<'d>(c: Ctx<'d>, focus: Instrument) -> LensDoc<'d> {
     match focus {
         Instrument::Disk => disk_doc(c),
         Instrument::Cpu => cpu_doc(c),
         Instrument::Memory => memory_doc(c),
+        Instrument::Network => network_doc(c),
         Instrument::Processes => processes_doc(c),
         Instrument::HowToRead => how_to_read(c),
-        Instrument::Network | Instrument::Tokens | Instrument::Gpu => text_well(c, focus),
+        Instrument::NetworkState => how_to_read(c),
+        Instrument::Tokens | Instrument::Gpu => text_well(c, focus),
     }
 }
 
@@ -1661,11 +1975,14 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
         })
     });
     let growth = growth_forms(&snap.facts.disk_rates);
+    let (gaps, events) = trace_overlays(snap, start_ms, BUCKET_MS, vals.len());
     let trace = Trace {
         vals,
         under: DAY,
         min_span: 1.0,
         mark,
+        gaps,
+        events,
     };
     let mut said = trace_said(
         "GB free over the last 24 hours",
@@ -1909,6 +2226,22 @@ fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
         line_section("Load", "Load", load, true),
         line_section("Over max", "Over max", vec![over_words], true),
     ];
+    if snap.hardware.is_some() || snap.authorized_cpu_policy.is_some() {
+        let mut text = aterm_vitals::sys::hardware::lines(snap);
+        // The full report preserves every channel. Keep the panel's recovery
+        // actions first so smaller lenses do not hide them below the channel list.
+        #[cfg(target_os = "macos")]
+        text.insert(0, if crate::cpu_policy_authorization::pending() {
+            "Authorized collection pending; ⌘⇧X cancels. No new collection until its exact collector exits.".into()
+        } else {
+            "⌘⇧P authorizes one bounded, read-only CPU policy collection in aterm's password sheet. No policy changes or credential cache.".into()
+        });
+        text.insert(0, "\u{2318}\u{21e7}C copies the diagnostic report; \u{2318}R resamples. Cause not established.".into());
+        sections.insert(
+            0,
+            lines_section("Hardware & limits", text.clone(), text, true),
+        );
+    }
     sections.extend(why);
     LensDoc {
         name: "CPU",
@@ -2481,13 +2814,16 @@ fn memory_doc(c: Ctx<'_>) -> LensDoc<'_> {
         .iter()
         .map(|cell| cell.mean.map(|b| b / 1_073_741_824.0))
         .collect();
+    let start = (now.div_euclid(60_000) - 59) * 60_000;
+    let (gaps, events) = trace_overlays(snap, start, 60_000, vals.len());
     let trace = Trace {
         vals,
         under: HOUR,
         min_span: 0.5,
         mark: None,
+        gaps,
+        events,
     };
-    let start = (now.div_euclid(60_000) - 59) * 60_000;
     let said = trace_said(
         "Used over the last hour",
         "GiB",
@@ -2744,13 +3080,16 @@ fn processes_doc(c: Ctx<'_>) -> LensDoc<'_> {
         .iter()
         .map(|cell| cell.mean)
         .collect();
+    let start = (now.div_euclid(60_000) - 59) * 60_000;
+    let (gaps, events) = trace_overlays(snap, start, 60_000, vals.len());
     let trace = Trace {
         vals,
         under: HOUR,
         min_span: 5.0,
         mark: None,
+        gaps,
+        events,
     };
-    let start = (now.div_euclid(60_000) - 59) * 60_000;
     let said = trace_said(
         &format!("Running over the last hour, {unit}"),
         unit,
@@ -3096,15 +3435,15 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
         (
             1,
             [
-                "an outlined cell, or a short line: not read".into(),
-                "outline: not read".into(),
+                "an outline or gap: not read (sleep, crash or pause); lines mark events".into(),
+                "outline or gap: not read".into(),
             ],
         ),
         (
             2,
             [
-                "the % at a row's right: now, the last 10 seconds".into(),
-                "%: now".into(),
+                "live now at the left, then 2 s and wider cells further back".into(),
+                "left cell: live now".into(),
             ],
         ),
     ];
@@ -3121,8 +3460,8 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
                     p,
                     "Cells",
                     &[
-                        "10 seconds each, now at the right".into(),
-                        "10 s each".into(),
+                        "multi-scale intervals, live now at the left".into(),
+                        "multi-scale from now".into(),
                     ],
                 );
                 let inks = pen.inks;
@@ -3137,7 +3476,7 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
                         1 => pen.hollow(p.x, base - 7.0, 8.0, 7.0, rgba(inks.hollow, 0xFF)),
                         _ => {
                             let ink = pen.heat(0.97);
-                            pen.rect(p.x, base - 7.0, 8.0, 7.0, 0.0, rgba(ink, 0xFF));
+                            pen.rect(p.x, base - 7.0, 8.0, 7.0, 1.0, rgba(ink, 0xFF));
                         }
                     }
                     let s = fit_cut(pen.m, forms, p.w - 14.0, BODY_PT, false);
@@ -3146,12 +3485,19 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
             }),
             line_form(
                 "Cells",
-                vec!["10 s each \u{b7} a cap: over max \u{b7} an outline: not read".into()],
+                vec![
+                    "multi-scale from live now \u{b7} cap: over max \u{b7} gap or line: sleep, crash"
+                        .into(),
+                    "multi-scale \u{b7} cap: over max \u{b7} outline: not read".into(),
+                ],
             ),
         ],
     });
     let machine = c.loc.platform.machine();
-    let mut said = format!("{machine} in grey, aterm in green, this tab in bright green.");
+    let mut said = format!(
+        "{machine} in grey, aterm in green, this tab in bright green; the table gives each one's \
+         amount now in the row's unit."
+    );
     if let Some(first) = said.get(..1) {
         said = first.to_uppercase() + said.get(1..).unwrap_or_default();
     }
@@ -3167,7 +3513,10 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
                     p,
                     "Scopes",
                     &[
-                        "the bar nests them; up and down choose a lens's scope".into(),
+                        "the bar, or the line under each %, nests them; up and down choose a \
+                         lens's scope"
+                            .into(),
+                        "the bar, or the line under each %, nests them".into(),
                         "nested".into(),
                     ],
                 );
@@ -3308,10 +3657,9 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
     LensDoc {
         name: "How to read",
         sources: vec!["the grammar every row shares".into()],
-        explainer: "Each row is one resource, oldest on the left and now at the right end; \
-                    the label over the strips says how far back they reach. Each cell is 10 \
-                    seconds (20 or 30 in a narrow full deck), coloured by its share of the \
-                    resource's maximum."
+        explainer: "Each row is one resource, read from the live now cell at the left \
+                    end; the scale over the strips says how far back they reach (up to 6 h \
+                    where a strip has the room), in blocks of 1 s, 10 s, 1 min, 10 min and 1 h."
             .into(),
         answer: None,
         sections,
@@ -3320,17 +3668,354 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
     }
 }
 
+fn link_kind_word(kind: LinkKind) -> Option<&'static str> {
+    match kind {
+        LinkKind::Wifi => Some("Wi-Fi"),
+        LinkKind::Ethernet => Some("Ethernet"),
+        LinkKind::Cellular => Some("Cellular"),
+        LinkKind::Vpn => Some("VPN"),
+        LinkKind::Bridge => Some("bridge"),
+        LinkKind::Other => None,
+    }
+}
+
+fn net_rate_word(bytes_per_s: f64) -> String {
+    let bps = bytes_per_s.max(0.0);
+    if bps < 100_000.0 {
+        format!("{} KB/s", words::grouped((bps / 1e3).round() as u64))
+    } else {
+        words::rate_mb_lone(bps)
+    }
+}
+
+fn link_speed_word(bits_per_s: u64) -> String {
+    let bytes_per_s = (bits_per_s as f64 / 8.0).max(0.0);
+    if bytes_per_s < 100_000.0 {
+        format!(
+            "{} KB/s",
+            words::grouped((bytes_per_s / 1e3).round() as u64)
+        )
+    } else {
+        words::rate_mb(bytes_per_s)
+    }
+}
+
+/// The Network lens: live download/upload split, 1-hour throughput trace, scoped open sockets,
+/// connectivity/latency monitoring, and TCP state summary.
+fn network_doc(c: Ctx<'_>) -> LensDoc<'_> {
+    let snap = c.snap;
+    let at = c.at();
+    let mut sources = Vec::new();
+    if let Some(link) = snap.facts.link.as_ref() {
+        let kind = link_kind_word(link.kind);
+        let speed = link.rate_bps.map(link_speed_word);
+        if let (Some(k), Some(sp)) = (kind, speed.as_deref()) {
+            sources.push(format!("{} ({k}, link {sp}) \u{b7} as of {at}", link.name));
+        }
+        if let Some(k) = kind {
+            sources.push(format!("{} ({k}) \u{b7} as of {at}", link.name));
+        }
+        sources.push(format!("{} \u{b7} as of {at}", link.name));
+    }
+    sources.push(format!("as of {at}"));
+    let explainer = "Heat is the busier direction's rate as a share of its 7-day peak, never \
+                     above the link's rate."
+        .to_owned();
+    let mut sections = vec![
+        traffic_section(c),
+        net_trace_section(c),
+        sockets_section(c),
+        connectivity_section(c),
+    ];
+    if let Some(tcp_sec) = tcp_states_section(c) {
+        sections.push(tcp_sec);
+    }
+    LensDoc {
+        name: "Network",
+        sources,
+        explainer,
+        answer: c.now_answer(Resource::Network, "peak"),
+        sections,
+        two_order: Vec::new(),
+        keeps_first: false,
+    }
+}
+
+fn traffic_section(c: Ctx<'_>) -> Section<'_> {
+    let snap = c.snap;
+    let view = c.view(Resource::Network);
+    if let Some(r) = snap.net.as_ref().and_then(|n| n.rates) {
+        let cap = view
+            .capacity
+            .unwrap_or(1.0)
+            .max(r.rx_bps.max(r.tx_bps))
+            .max(1.0);
+        let rows = vec![
+            Row {
+                chip: Some(ProcScope::Other),
+                name: "download".into(),
+                scope: Some(format!("{}/s", words::tokens_k(r.rx_pps))),
+                share: Some((r.rx_bps / cap).clamp(0.0, 1.0)),
+                figure: format!("\u{2193} {}", net_rate_word(r.rx_bps)),
+            },
+            Row {
+                chip: Some(ProcScope::Other),
+                name: "upload".into(),
+                scope: Some(format!("{}/s", words::tokens_k(r.tx_pps))),
+                share: Some((r.tx_bps / cap).clamp(0.0, 1.0)),
+                figure: format!("\u{2191} {}", net_rate_word(r.tx_bps)),
+            },
+        ];
+        let mut subs = Vec::new();
+        if let Some(link) = snap.facts.link.as_ref() {
+            if let Some(sp) = link.rate_bps.map(link_speed_word) {
+                subs.push(format!("{} \u{b7} link {sp}", link.name));
+            }
+            subs.push(link.name.clone());
+        }
+        subs.push("download and upload".into());
+        let rx_w = net_rate_word(r.rx_bps);
+        let tx_w = net_rate_word(r.tx_bps);
+        let line = vec![
+            format!("\u{2193} {rx_w} \u{b7} \u{2191} {tx_w}"),
+            net_rate_word(r.rx_bps.max(r.tx_bps)),
+        ];
+        return list_section(
+            c,
+            "Traffic now".into(),
+            subs,
+            rows,
+            None,
+            2,
+            "Traffic",
+            line,
+            false,
+        );
+    }
+    let forms = match view.now {
+        Some(bps) => {
+            let w = net_rate_word(bps);
+            vec![format!("{w} busier direction"), w]
+        }
+        None => vec!["not read yet".into()],
+    };
+    line_section("Traffic now", "Traffic", forms, false)
+}
+
+fn net_trace_section(c: Ctx<'_>) -> Section<'_> {
+    let snap = c.snap;
+    let now = snap.at_unix_ms;
+    let raw: Vec<Option<f64>> = c
+        .view(Resource::Network)
+        .columns(60, 60, now)
+        .iter()
+        .map(|cell| cell.mean)
+        .collect();
+    let peak = raw.iter().flatten().copied().fold(0.0_f64, f64::max);
+    let (scale, unit, min_span) = if peak >= 100_000.0 {
+        (1_000_000.0, "MB/s", 0.5)
+    } else {
+        (1_000.0, "KB/s", 5.0)
+    };
+    let vals: Vec<Option<f64>> = raw
+        .into_iter()
+        .map(|v| v.map(|b| (b / scale).max(0.0)))
+        .collect();
+    let start = (now.div_euclid(60_000) - 59) * 60_000;
+    let (gaps, events) = trace_overlays(snap, start, 60_000, vals.len());
+    let trace = Trace {
+        vals,
+        under: HOUR,
+        min_span,
+        mark: None,
+        gaps,
+        events,
+    };
+    let said = trace_said(
+        "Throughput over the last hour",
+        unit,
+        &trace,
+        (start, 60_000),
+        &c.loc,
+    );
+    let first = trace.vals.iter().flatten().next().copied();
+    let last = trace.vals.iter().rev().flatten().next().copied();
+    let line = match (first, last) {
+        (Some(a), Some(b)) => vec![format!("{a:.1} to {b:.1} {unit}")],
+        _ => vec!["not read yet".to_owned()],
+    };
+    trace_section(
+        c,
+        "Throughput, last hour",
+        vec![format!("{unit}, busier direction"), unit.into()],
+        trace,
+        said,
+        "Last hour",
+        line,
+        false,
+    )
+}
+
+fn sockets_section(c: Ctx<'_>) -> Section<'_> {
+    let snap = c.snap;
+    let name = format!("Open sockets{}", c.suffix());
+    let net = snap.net.as_ref();
+    let tcp_total = net.and_then(|n| n.tcp).map(|t| t.total());
+    let aterm_s = net.and_then(|n| n.aterm_sockets);
+    let denom = tcp_total.unwrap_or(0).max(aterm_s.unwrap_or(0)).max(1) as f64;
+    let mut rows: Vec<Row> = Vec::new();
+    if c.bar == Bar::Global
+        && let Some(total) = tcp_total
+    {
+        rows.push(Row {
+            chip: Some(ProcScope::Other),
+            name: c.loc.platform.machine().into(),
+            scope: Some("TCP".into()),
+            share: Some((f64::from(total) / denom).clamp(0.0, 1.0)),
+            figure: format!("{} open", words::grouped(u64::from(total))),
+        });
+    }
+    if matches!(c.bar, Bar::Global | Bar::Aterm)
+        && let Some(at_s) = aterm_s
+    {
+        rows.push(Row {
+            chip: Some(ProcScope::Aterm),
+            name: "aterm".into(),
+            scope: None,
+            share: Some((f64::from(at_s) / denom).clamp(0.0, 1.0)),
+            figure: format!("{} sockets", words::grouped(u64::from(at_s))),
+        });
+    }
+    if let Some(net) = net {
+        let mut tabs: Vec<(u64, u32)> = net
+            .tab_sockets
+            .iter()
+            .copied()
+            .filter(|&(k, count)| {
+                c.in_scope(ProcScope::Tab(k)) && (count > 0 || c.panes.contains(&k))
+            })
+            .collect();
+        tabs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (k, count) in tabs {
+            rows.push(Row {
+                chip: Some(ProcScope::Tab(k)),
+                name: c.scope_word(ProcScope::Tab(k)),
+                scope: None,
+                share: Some((f64::from(count) / denom).clamp(0.0, 1.0)),
+                figure: format!("{} sockets", words::grouped(u64::from(count))),
+            });
+        }
+    }
+    if rows.is_empty() {
+        let missing = if snap.resources[Resource::Network.index()].aterm.missing
+            == Some(aterm_vitals::NoFigure::NotPerApp)
+        {
+            "no per-app network figure"
+        } else {
+            "none open in this scope"
+        };
+        return line_section(&name, "Sockets", vec![missing.into()], true);
+    }
+    let line: Vec<String> = rows.iter().take(2).map(Row::said).collect();
+    let note = aterm_s.map(|_| "throughput is machine-wide; open sockets counted per scope".into());
+    list_section(
+        c,
+        name,
+        vec!["live sockets by scope".into(), "by scope".into()],
+        rows,
+        note,
+        if c.two { 4 } else { 3 },
+        "Sockets",
+        line,
+        true,
+    )
+}
+
+fn connectivity_section(c: Ctx<'_>) -> Section<'_> {
+    let snap = c.snap;
+    let Some(net) = snap.net.as_ref() else {
+        return line_section(
+            "Connectivity",
+            "State",
+            vec!["link state not read yet".into(), "not read".into()],
+            true,
+        );
+    };
+    let state = net.state.label();
+    let rtt_long = net.srtt_ms.map(|rtt| format!("median TCP RTT {rtt:.1} ms"));
+    let rtt_short = net.srtt_ms.map(words::rtt_word);
+    let err_drop = net.rates.and_then(|r| {
+        let errs = r.rx_err_ps + r.tx_err_ps;
+        let drops = r.rx_drop_ps + r.tx_drop_ps.unwrap_or(0.0);
+        (errs > 0.0 || drops > 0.0).then(|| format!("errors {errs:.1}/s, drops {drops:.1}/s"))
+    });
+    let counted = snap.facts.link.as_ref().and_then(|link| match link.kind {
+        LinkKind::Vpn => Some(format!("{} VPN (counted on carrier)", link.name)),
+        LinkKind::Bridge => Some(format!("{} bridge", link.name)),
+        LinkKind::Wifi | LinkKind::Ethernet | LinkKind::Cellular | LinkKind::Other => None,
+    });
+    let mut forms = Vec::new();
+    let mut full = state.to_owned();
+    if let Some(rtt) = &rtt_long {
+        full.push_str(&format!(" \u{b7} {rtt}"));
+    }
+    if let Some(ed) = &err_drop {
+        full.push_str(&format!(" \u{b7} {ed}"));
+    }
+    if let Some(cnt) = &counted {
+        full.push_str(&format!(" \u{b7} {cnt}"));
+    }
+    forms.push(full);
+    if let Some(rtt) = &rtt_long {
+        forms.push(format!("{state} \u{b7} {rtt}"));
+    }
+    if let Some(rtt) = &rtt_short {
+        forms.push(format!("{state} \u{b7} {rtt}"));
+    }
+    forms.push(state.to_owned());
+    forms.dedup();
+    line_section("Connectivity", "State", forms, true)
+}
+
+fn tcp_states_section(c: Ctx<'_>) -> Option<Section<'_>> {
+    let tcp = c.snap.net.as_ref()?.tcp?;
+    let mut full = vec![
+        format!("{} established", words::grouped(u64::from(tcp.established))),
+        format!("{} listen", words::grouped(u64::from(tcp.listen))),
+    ];
+    if tcp.time_wait > 0 {
+        full.push(format!(
+            "{} time-wait",
+            words::grouped(u64::from(tcp.time_wait))
+        ));
+    }
+    if tcp.close_wait > 0 {
+        full.push(format!(
+            "{} close-wait",
+            words::grouped(u64::from(tcp.close_wait))
+        ));
+    }
+    if tcp.connecting() > 0 {
+        full.push(format!(
+            "{} connecting",
+            words::grouped(u64::from(tcp.connecting()))
+        ));
+    }
+    let short = format!(
+        "{} est \u{b7} {} listen",
+        words::grouped(u64::from(tcp.established)),
+        words::grouped(u64::from(tcp.listen))
+    );
+    let forms = dedup(vec![full.join(" \u{b7} "), short]);
+    Some(line_section("TCP states", "TCP", forms, true))
+}
+
 /// A text-only well (§11.4).
 fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
     let snap = c.snap;
-    let res = focus.resource().unwrap_or(Resource::Network);
+    let res = focus.resource().unwrap_or(Resource::Tokens);
     let at = c.at();
     let (name, explainer) = match res {
-        Resource::Network => (
-            "Network",
-            "Heat is the busier direction's rate as a share of its 7-day peak, never above the \
-             link's rate.",
-        ),
         Resource::Tokens => (
             "Tokens",
             "Heat is aterm's output tokens per minute as a share of aterm's busiest 30 seconds \
@@ -3352,67 +4037,6 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
         .collect();
     let f = &snap.facts;
     match res {
-        Resource::Network => {
-            if let Some(net) = snap.net.as_ref() {
-                if let Some(tcp) = net.tcp {
-                    let mut states = Vec::new();
-                    if tcp.time_wait > 0 {
-                        states.push(format!(
-                            "{} time-wait",
-                            words::grouped(u64::from(tcp.time_wait))
-                        ));
-                    }
-                    if tcp.close_wait > 0 {
-                        states.push(format!(
-                            "{} close-wait",
-                            words::grouped(u64::from(tcp.close_wait))
-                        ));
-                    }
-                    if tcp.connecting() > 0 {
-                        states.push(format!(
-                            "{} connecting",
-                            words::grouped(u64::from(tcp.connecting()))
-                        ));
-                    }
-                    if !states.is_empty() {
-                        lines.push(format!("TCP states: {}", states.join(" \u{b7} ")));
-                    }
-                }
-                if let Some(r) = net.rates {
-                    let errs = r.rx_err_ps + r.tx_err_ps;
-                    let drops = r.rx_drop_ps + r.tx_drop_ps.unwrap_or(0.0);
-                    if errs > 0.0 || drops > 0.0 {
-                        lines.push(format!("errors {errs:.1}/s \u{b7} drops {drops:.1}/s"));
-                    }
-                }
-            }
-            let counted = f.link.as_ref().and_then(|link| match link.kind {
-                LinkKind::Vpn => Some(format!(
-                    "{}: VPN, its bytes are counted on the link that carries them",
-                    link.name
-                )),
-                LinkKind::Bridge => Some(format!(
-                    "{}: a bridge, its members' bytes are counted on them",
-                    link.name
-                )),
-                LinkKind::Wifi | LinkKind::Ethernet | LinkKind::Cellular | LinkKind::Other => None,
-            });
-            lines.extend(counted);
-            if let Some(net) = snap.net.as_ref() {
-                let mut state_line = format!("Connectivity: {}", net.state.label());
-                if let Some(rtt) = net.srtt_ms {
-                    state_line.push_str(&format!(" \u{b7} median TCP RTT {rtt:.1} ms"));
-                }
-                lines.push(state_line);
-            }
-            if snap.resources[Resource::Network.index()].aterm.missing
-                == Some(aterm_vitals::NoFigure::NotPerApp)
-            {
-                lines.push("no per-app network figure".into());
-            } else if snap.net.as_ref().is_some_and(|n| n.aterm_sockets.is_some()) {
-                lines.push("throughput is machine-wide; open sockets counted per scope".into());
-            }
-        }
         Resource::Tokens => {
             match f.plan.as_ref() {
                 Some(p) => {
@@ -3739,7 +4363,13 @@ pub(crate) fn lay_lens(
         #[cfg(test)]
         boxes: Vec::new(),
     };
-    match input.snap {
+    let empty = Snapshot::default();
+    let snap = if lens.focus == Instrument::NetworkState {
+        Some(input.snap.unwrap_or(&empty))
+    } else {
+        input.snap
+    };
+    match snap {
         None => {
             let doc = LensDoc {
                 name: lens.focus.word(),
@@ -3764,7 +4394,11 @@ pub(crate) fn lay_lens(
                 two,
                 cw,
             };
-            let doc = doc_for(c, lens.focus);
+            let doc = if lens.focus == Instrument::NetworkState {
+                lab_network_doc(input.network, input.network_target)
+            } else {
+                doc_for(c, lens.focus)
+            };
             let reserve = doc
                 .sections
                 .first()
@@ -3849,7 +4483,11 @@ impl crate::App {
         wid: crate::WindowId,
     ) -> Option<(LensGeom, Lens, crate::stats_deck::DeckFrame)> {
         let lens = self.windows.get(&wid)?.stats_lens.open?;
-        let f = self.deck_frame(wid)?;
+        let f = self.deck_frame(wid).or_else(|| {
+            (lens.focus == Instrument::NetworkState)
+                .then(|| self.network_lens_frame(wid))
+                .flatten()
+        })?;
         let lg = self.lens_geom_for(wid, &f)?;
         Some((lg, lens, f))
     }
@@ -3886,8 +4524,15 @@ impl crate::App {
     }
 
     /// The lens's input for `wid`.
-    fn lens_input(&self, f: &crate::stats_deck::DeckFrame) -> DeckInput<'_> {
+    fn lens_input(&self, f: &crate::stats_deck::DeckFrame, wid: crate::WindowId) -> DeckInput<'_> {
         DeckInput {
+            network: Some(self.network_snapshot.as_ref()),
+            network_target: self
+                .windows
+                .get(&wid)
+                .map_or(crate::network_deck::Target::Overview, |ws| {
+                    ws.stats_lens.network_target
+                }),
             snap: self.vitals.snapshot.as_deref(),
             prev_snap: None,
             tab_panes: f.tab_panes.clone(),
@@ -3915,6 +4560,14 @@ impl crate::App {
         };
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.vitals.snapshot.as_ref().map(|s| s.seq).hash(&mut h);
+        self.network_snapshot.revision.hash(&mut h);
+        std::mem::discriminant(&self.network_snapshot.network.visibility).hash(&mut h);
+        self.network_snapshot.network.detail.hash(&mut h);
+        self.network_snapshot.services.hash(&mut h);
+        self.windows
+            .get(&wid)
+            .map(|ws| ws.stats_lens.network_target)
+            .hash(&mut h);
         lens.hash(&mut h);
         (lg.dx, lg.dy, lg.w.to_bits(), lg.h.to_bits()).hash(&mut h);
         f.lens_inks.hash(&mut h);
@@ -3947,7 +4600,7 @@ impl crate::App {
         {
             return;
         }
-        let input = self.lens_input(&f);
+        let input = self.lens_input(&f, wid);
         let laid = lay_lens(&lg, &input, &lens, &deck_metrics(), true);
         let (shell, body) = laid.prims.split_at(laid.shell);
         let (w, h) = (lg.w as u32, lg.h as u32);
@@ -4002,7 +4655,7 @@ impl crate::App {
         wid: crate::WindowId,
     ) -> Option<(LensGeom, Lens, LensLaid)> {
         let (lg, lens, f) = self.lens_frame(wid)?;
-        let input = self.lens_input(&f);
+        let input = self.lens_input(&f, wid);
         let laid = lay_lens(&lg, &input, &lens, &deck_metrics(), false);
         Some((lg, lens, laid))
     }
@@ -4037,8 +4690,45 @@ impl crate::App {
         if !self.stats_lens_fits(wid) {
             return;
         }
+        if focus == Instrument::NetworkState
+            && let Some(crate::stats_paint::Hit {
+                kind: crate::stats_paint::HitKind::Network(target),
+                ..
+            }) = self.stats_hit_under_pointer(wid)
+            && let Some(ws) = self.windows.get_mut(&wid)
+        {
+            ws.stats_lens.network_target = target;
+        }
         self.set_stats_lens(wid, Lens { focus, bar, how });
         self.vitals.next_due = Some(Instant::now());
+    }
+
+    /// The explicit Network State command also works with the resource deck hidden.
+    pub(crate) fn open_network_lens(&mut self) -> bool {
+        let Some(wid) = self
+            .frontmost_window
+            .or_else(|| self.windows.keys().next().copied())
+        else {
+            return false;
+        };
+        let Some(frame) = self
+            .deck_frame(wid)
+            .or_else(|| self.network_lens_frame(wid))
+        else {
+            return false;
+        };
+        if self.lens_geom_for(wid, &frame).is_none() {
+            return false;
+        }
+        self.set_stats_lens(
+            wid,
+            Lens {
+                focus: Instrument::NetworkState,
+                bar: Bar::Global,
+                how: Opened::Keyboard,
+            },
+        );
+        true
     }
 
     /// Close `wid`'s lens (no spring: the next frame is the first without it).
@@ -4128,7 +4818,18 @@ impl crate::App {
                 ws.stats_lens.leave_due = None;
                 ws.stats_lens.rest = match open {
                     Some(l) if l.how != Opened::Hover => None,
-                    Some(l) if l.focus == hit.instrument() && l.bar == hit.bar() => None,
+                    Some(l)
+                        if l.focus == hit.instrument()
+                            && l.bar == hit.bar()
+                            && match hit.kind {
+                                crate::stats_paint::HitKind::Network(target) => {
+                                    ws.stats_lens.network_target == target
+                                }
+                                _ => true,
+                            } =>
+                    {
+                        None
+                    }
                     _ => Some(Rest {
                         due: now + REST,
                         hit,
@@ -4225,6 +4926,39 @@ impl crate::App {
             return true;
         }
         if open.how != Opened::Hover {
+            if open.focus == Instrument::Cpu && command("c") && mods.shift_key() {
+                if let Some(snap) = self.vitals.snapshot.as_deref() {
+                    let _ = crate::control::pbcopy(&cpu_diagnostic_report(snap));
+                }
+                return true;
+            }
+            #[cfg(target_os = "macos")]
+            if open.focus == Instrument::Cpu && command("p") && mods.shift_key() {
+                let _ = self.collect_cpu_policy(wid);
+                return true;
+            }
+            #[cfg(target_os = "macos")]
+            if open.focus == Instrument::Cpu && command("x") && mods.shift_key() {
+                self.cancel_cpu_policy(wid);
+                return true;
+            }
+            if open.focus == Instrument::Cpu && command("r") {
+                let _ = self.resample_cpu_diagnostics();
+                return true;
+            }
+            if open.focus == Instrument::NetworkState
+                && matches!(key, Key::Named(NamedKey::ArrowDown | NamedKey::ArrowUp))
+            {
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.stats_lens.network_target = crate::network_deck::step(
+                        &self.network_snapshot,
+                        ws.stats_lens.network_target,
+                        matches!(key, Key::Named(NamedKey::ArrowDown)),
+                    );
+                }
+                self.request_window_redraw(wid);
+                return true;
+            }
             let next = match key {
                 Key::Named(NamedKey::ArrowRight) => Some(Lens {
                     focus: step_instrument(open.focus, true),
@@ -4272,12 +5006,22 @@ impl crate::App {
             .get(&wid)
             .and_then(|ws| ws.stats_lens.open)
             .filter(|lens| lens.how != Opened::Hover)
-            .map(|_| self.vitals.snapshot.is_some())
+            .map(|lens| lens.focus == Instrument::NetworkState || self.vitals.snapshot.is_some())
     }
 
     /// The open lens's sentence.
     pub(crate) fn stats_lens_sentence(&self, wid: crate::WindowId) -> Option<String> {
         let open = self.windows.get(&wid).and_then(|ws| ws.stats_lens.open)?;
+        if open.focus == Instrument::NetworkState {
+            let target = self.windows.get(&wid)?.stats_lens.network_target;
+            return Some(
+                crate::network_deck::details(&self.network_snapshot, target)
+                    .into_iter()
+                    .map(|(name, value)| format!("{name}: {value}"))
+                    .collect::<Vec<_>>()
+                    .join(". "),
+            );
+        }
         let snap = self.vitals.snapshot.as_deref()?;
         let panes = self.deck_tab_panes(wid);
         let loc = Locale {
@@ -4321,9 +5065,9 @@ impl crate::App {
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.stats_lens.rest = None;
                 }
-                let still = self.stats_hit_under_pointer(wid).is_some_and(|h| {
-                    h.instrument() == rest.hit.instrument() && h.bar() == rest.hit.bar()
-                });
+                let still = self
+                    .stats_hit_under_pointer(wid)
+                    .is_some_and(|h| h.kind == rest.hit.kind);
                 if still {
                     self.open_stats_lens(wid, rest.hit.instrument(), rest.hit.bar(), Opened::Hover);
                 }
@@ -4337,7 +5081,7 @@ impl crate::App {
     }
 
     /// Ask `wid` for a frame.
-    fn request_window_redraw(&self, wid: crate::WindowId) {
+    pub(crate) fn request_window_redraw(&self, wid: crate::WindowId) {
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.request_redraw();
         }

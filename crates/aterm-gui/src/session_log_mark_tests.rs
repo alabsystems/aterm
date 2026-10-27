@@ -13,7 +13,7 @@ fn the_status_fields_name_the_open_path_and_the_observed_need() {
     let (tl, hand) = opened();
     assert_eq!(
         tl.lock().unwrap().slog().status_fields(WALL0),
-        "log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=-"
+        "log_seq=1 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=-"
     );
     with_claude(&tl);
     let mut g = tl.lock().unwrap();
@@ -37,7 +37,7 @@ fn the_status_fields_name_the_open_path_and_the_observed_need() {
     assert_eq!(
         g.slog().status_fields(WALL0 + 2_500),
         format!(
-            "log_seq={head} log_ep=1 run=r1 turn=t1 step=p1 need=approval:bash need_since_ms=500"
+            "log_seq={head} log_ep=1 log_base=1 run=r1 turn=t1 step=p1 need=approval:bash need_since_ms=500"
         )
     );
 }

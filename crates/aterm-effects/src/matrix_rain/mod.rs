@@ -495,6 +495,7 @@ pub struct MatrixRain {
 
 impl MatrixRain {
     /// Build an engine for `cfg` (clamped defensively; the host resolver owns the real clamps).
+    #[inline]
     #[must_use]
     pub fn new(cfg: RainConfig) -> Self {
         let mut e = Self {
@@ -577,6 +578,7 @@ impl MatrixRain {
     }
 
     /// Swap the configuration.
+    #[inline]
     pub fn set_config(&mut self, cfg: RainConfig) {
         let cfg = clamp_config(cfg);
         let material_mode_changed = self.cfg.output_material != cfg.output_material;
@@ -603,6 +605,7 @@ impl MatrixRain {
     }
 
     /// Clear the dynamic field/weather state (layout transition, master toggle).
+    #[inline]
     pub fn reset(&mut self) {
         self.weather = RainWeather::Calm;
         self.weather_since_ms = self.clock_ms;
@@ -642,6 +645,7 @@ impl MatrixRain {
         self.last_emit_nonempty = false;
     }
 
+    #[inline]
     fn clear_material_bank(&mut self) {
         self.material.clear();
         self.material_scratch.clear();
@@ -655,6 +659,7 @@ impl MatrixRain {
         self.last_bake_tick = None;
     }
 
+    #[inline]
     fn finish_material_bake(&mut self) {
         let Some(rom) = self.rom.as_ref() else {
             return;
@@ -666,6 +671,7 @@ impl MatrixRain {
     }
 
     /// PTY content mutation observed (`Terminal::content_seq()`): sustained deltas drive WORKING.
+    #[inline]
     pub const fn note_activity(&mut self, content_seq: u64) {
         let previous = self.last_seq;
         self.last_seq = Some(content_seq);
@@ -869,6 +875,7 @@ impl MatrixRain {
 
     /// Rebuild the Tier-A occupancy bitset from the frame snapshot (the same `cell_frame_into` rows
     /// sparkle scans).
+    #[inline]
     #[allow(
         clippy::too_many_arguments,
         reason = "the rescan threads the snapshot rows/line-sizes/images, grid geometry, live default bg, and damage epoch through one call; a wrapper struct would relocate the list, not simplify it"
@@ -960,6 +967,7 @@ impl MatrixRain {
     }
 
     /// Sample the program's real on-screen output into the rain's glyph alphabet.
+    #[inline]
     pub fn sample_material(
         &mut self,
         cells: &[Vec<RenderCell>],
@@ -1112,6 +1120,7 @@ impl MatrixRain {
 
     /// Advance whole engine ticks out of the accumulated clock, then fill the frame's rain quads
     /// and additive halos.
+    #[inline]
     pub fn emit(
         &mut self,
         geom: EffectGeom,
@@ -1209,6 +1218,7 @@ impl MatrixRain {
 
     /// One-line diagnostic for host introspection (`aterm ctl rain status`).
     #[must_use]
+    #[inline]
     pub fn diag_line(&self) -> String {
         let weather = match self.eff_weather() {
             RainWeather::Working => "working",
@@ -1220,6 +1230,7 @@ impl MatrixRain {
             RainVisibility::VisibleUnfocused => "visible",
             RainVisibility::Hidden => "hidden",
         };
+        let seq = self.last_seq;
         format!(
             "weather={} density={} tick={} scanned={} material={} emitting={} vis={} drain={} \
              seq={} streak={}",
@@ -1231,10 +1242,10 @@ impl MatrixRain {
             self.last_emit_nonempty,
             vis,
             self.drain_ticks,
-            match self.last_seq {
-                Some(s) => s.to_string(),
-                None => "none".into(),
-            },
+            core::fmt::from_fn(|f| match seq {
+                Some(s) => write!(f, "{s}"),
+                None => f.write_str("none"),
+            }),
             self.content_streak,
         )
     }
@@ -1255,6 +1266,7 @@ impl MatrixRain {
         self.cfg
     }
 
+    #[inline]
     const fn apply_pending_notes(&mut self) {
         let now = self.clock_ms;
         if self.pending_key {
@@ -1370,6 +1382,7 @@ impl MatrixRain {
         }
     }
 
+    #[inline]
     const fn advance_engine_ticks(&mut self) -> bool {
         let mut ticked = false;
         let backlog = self.clock_ms.saturating_sub(self.consumed_ms);
@@ -1390,6 +1403,7 @@ impl MatrixRain {
         }
     }
 
+    #[inline]
     const fn step_engine_tick(&mut self) {
         self.tick += 1;
         let now = self.consumed_ms;
@@ -1479,6 +1493,7 @@ impl MatrixRain {
         }
     }
 
+    #[inline]
     const fn desired_weather(&self, now: u64) -> RainWeather {
         let content_recent = matches!(
             self.last_content_ms,
@@ -1512,6 +1527,7 @@ impl MatrixRain {
         }
     }
 
+    #[inline]
     fn ensure_col_order(&mut self, cols: u16, rows: u16) {
         if cols == self.order_cols && self.order_seed == self.seed32 && rows == self.order_rows {
             return;
@@ -1535,6 +1551,7 @@ impl MatrixRain {
         }
     }
 
+    #[inline]
     const fn field_params(&self, rows: u16) -> FieldParams {
         FieldParams {
             seed32: self.seed32,
@@ -1548,6 +1565,7 @@ impl MatrixRain {
         }
     }
 
+    #[inline]
     fn row_sort_stable(&mut self, quads: &mut [RainCell], rows: usize) {
         if quads.len() < 2 || rows == 0 {
             return;
@@ -1576,6 +1594,7 @@ impl MatrixRain {
         }
     }
 
+    #[inline]
     fn emit_field(
         &mut self,
         geom: EffectGeom,
@@ -1618,6 +1637,7 @@ impl MatrixRain {
         self.emit_halos(&ctx, add);
     }
 
+    #[inline]
     fn emit_column(&mut self, ctx: &EmitCtx<'_>, col: u16, quads: &mut Vec<RainCell>) -> bool {
         let cw = u32::from(ctx.geom.cell_w);
         let rows = u32::from(ctx.geom.rows);
@@ -1828,6 +1848,7 @@ impl MatrixRain {
         if a > 1 { a as u8 } else { 1 }
     }
 
+    #[inline]
     fn mask_framed_regions(&mut self, cells: &[Vec<RenderCell>], rows: usize, cols: usize) {
         #[inline]
         const fn cell_ch_at(row: &[RenderCell], col: usize) -> char {
@@ -1962,6 +1983,7 @@ impl MatrixRain {
         }
     }
 
+    #[inline]
     const fn clear_occ_span(&mut self, row: usize, start_col: usize, end_col: usize) {
         if row >= self.occ_rows || start_col > end_col || start_col >= self.occ_cols {
             return;
@@ -1988,6 +2010,7 @@ impl MatrixRain {
         occ[last_word] &= !last_mask;
     }
 
+    #[inline]
     const fn clear_occ_neighborhood_span(&mut self, row: usize, start_col: usize, end_col: usize) {
         if self.occ_rows == 0 || self.occ_cols == 0 {
             return;
@@ -2067,6 +2090,7 @@ impl MatrixRain {
         cursor.is_none() && hidden_band.is_empty() && r + HIDDEN_CURSOR_BAND_ROWS >= rows
     }
 
+    #[inline]
     fn emit_halos(&mut self, ctx: &EmitCtx<'_>, add: &mut Vec<RainHalo>) {
         if self.halo_cands.is_empty() {
             return;
@@ -2137,6 +2161,7 @@ impl MatrixRain {
     }
 }
 
+#[inline]
 const fn clamp_config(mut cfg: RainConfig) -> RainConfig {
     const fn clamp_u8(v: u8, lo: u8, hi: u8) -> u8 {
         if v < lo {
@@ -2188,6 +2213,7 @@ const THEME_HUE_FALLBACK: u32 = 0x003B_8EEA;
 const THEME_HUE_FALLBACK_DEG: f32 = rgb2hsv(THEME_HUE_FALLBACK).0;
 const DIFF_GREEN_HUE_DEG: f32 = rgb2hsv(DIFF_GREEN).0;
 
+#[inline]
 const fn theme_hue(cfg: &RainConfig) -> f32 {
     let (h0, s0, v0) = rgb2hsv(cfg.theme_fg);
     if s0 * v0 >= THEME_HUE_MIN_CHROMA {
@@ -2211,6 +2237,7 @@ const fn rem_euclid_360(x: f32) -> f32 {
     }
 }
 
+#[inline]
 const fn ramp_hue(cfg: &RainConfig) -> f32 {
     let hue = match cfg.hue {
         RainHue::Matrix => MATRIX_HUE_DEG,
@@ -2232,6 +2259,7 @@ const fn ramp_hue(cfg: &RainConfig) -> f32 {
     }
 }
 
+#[inline]
 const fn build_ramp(hue: f32, cfg: &RainConfig) -> [u32; 16] {
     const INV_15: f32 = 1.0 / 15.0;
     let light_bg = relative_luminance(cfg.default_bg) > 0.5;
@@ -2250,15 +2278,17 @@ const fn build_ramp(hue: f32, cfg: &RainConfig) -> [u32; 16] {
     ramp
 }
 
+#[inline]
 const fn luminance_match(mut ramp: [u32; 16], reference: [u32; 16]) -> [u32; 16] {
+    let table = crate::color_math::relative_luminance_table();
     let mut i = 0;
     while i < 16 {
-        let lt = relative_luminance(reference[i]);
+        let lt = crate::color_math::relative_luminance_with(table, reference[i]);
         let (h, s, mut v) = rgb2hsv(ramp[i]);
         let mut step = 0;
         while step < 8 {
             step += 1;
-            let l = relative_luminance(ramp[i]);
+            let l = crate::color_math::relative_luminance_with(table, ramp[i]);
             if (l - lt).abs() < 0.01 {
                 break;
             }
@@ -2283,6 +2313,7 @@ const fn srgb_over(tint: u32, alpha: u8, bg: u32) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
+#[inline]
 fn faint_ink(fg: u32, bg: u32) -> u32 {
     let fg_rgb = aterm_types::Rgb::new((fg >> 16) as u8, (fg >> 8) as u8, fg as u8);
     let bg_rgb = aterm_types::Rgb::new((bg >> 16) as u8, (bg >> 8) as u8, bg as u8);
@@ -2291,33 +2322,58 @@ fn faint_ink(fg: u32, bg: u32) -> u32 {
     (u32::from(dim.r) << 16) | (u32::from(dim.g) << 8) | u32::from(dim.b)
 }
 
+#[inline]
 fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
     #[inline]
-    const fn head_ok(tint15: u32, bg: u32, lb: f32, bound: f32, a: u8) -> bool {
-        (relative_luminance(srgb_over(tint15, a, bg)) - lb).abs() < bound
+    const fn head_ok(
+        table: &crate::color_math::RelativeLuminanceTable,
+        tint15: u32,
+        bg: u32,
+        lb: f32,
+        bound: f32,
+        a: u8,
+    ) -> bool {
+        (crate::color_math::relative_luminance_with(table, srgb_over(tint15, a, bg)) - lb).abs()
+            < bound
     }
     #[inline]
-    const fn level_ok(ramp: &[u32; 16], bg: u32, lb: f32, bound: f32, body: u8) -> bool {
+    const fn level_ok(
+        table: &crate::color_math::RelativeLuminanceTable,
+        ramp: &[u32; 16],
+        bg: u32,
+        lb: f32,
+        bound: f32,
+        body: u8,
+    ) -> bool {
         let mut lvl = 16u32;
         while lvl > 0 {
             lvl -= 1;
             let raw_a = (body as u32 * (lvl + 1)) / 16;
             let a = (if raw_a > 1 { raw_a } else { 1 }) as u8;
-            if (relative_luminance(srgb_over(ramp[lvl as usize], a, bg)) - lb).abs() >= bound {
+            if (crate::color_math::relative_luminance_with(
+                table,
+                srgb_over(ramp[lvl as usize], a, bg),
+            ) - lb)
+                .abs()
+                >= bound
+            {
                 return false;
             }
         }
         true
     }
+    let table = crate::color_math::relative_luminance_table();
     let bg = cfg.default_bg;
-    let lb = relative_luminance(bg);
-    let plain = (0.5 * (relative_luminance(cfg.theme_fg) - lb)).abs();
-    let faint = (relative_luminance(faint_ink(cfg.theme_fg, bg)) - lb).abs();
+    let lb = crate::color_math::relative_luminance_with(table, bg);
+    let plain =
+        (0.5 * (crate::color_math::relative_luminance_with(table, cfg.theme_fg) - lb)).abs();
+    let faint =
+        (crate::color_math::relative_luminance_with(table, faint_ink(cfg.theme_fg, bg)) - lb).abs();
     let bound = plain.min(faint);
     let derived_head = if cfg.head_alpha_override.is_none() || cfg.alpha_override.is_none() {
         let mut h = RAIN_ALPHA_CAP;
         loop {
-            if head_ok(ramp[15], bg, lb, bound, h) || h == RAIN_ALPHA_FLOOR {
+            if head_ok(table, ramp[15], bg, lb, bound, h) || h == RAIN_ALPHA_FLOOR {
                 break h;
             }
             h -= 1;
@@ -2332,7 +2388,7 @@ fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
             // so no `body > derived_head` can satisfy `level_ok`.
             let mut b = derived_head;
             loop {
-                if level_ok(ramp, bg, lb, bound, b) || b == RAIN_ALPHA_FLOOR {
+                if level_ok(table, ramp, bg, lb, bound, b) || b == RAIN_ALPHA_FLOOR {
                     break b;
                 }
                 b -= 1;
@@ -2371,6 +2427,7 @@ const fn slot_change_mask(old: &[char], new: &[char]) -> u64 {
     mask
 }
 
+#[inline]
 const fn fingerprint(quads: &[RainCell], add: &[RainHalo], tick: u64, atlas_version: u64) -> u64 {
     if quads.is_empty() && add.is_empty() {
         return 0;

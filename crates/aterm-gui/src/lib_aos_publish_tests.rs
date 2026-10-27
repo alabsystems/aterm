@@ -111,6 +111,9 @@ fn story(light: bool, t0: Instant, publish: bool) -> Story {
 /// Published plan settles fresh keys in fewer lane wakes than the control's shipped code.
 #[test]
 fn fresh_keys_after_publication_clear_in_fewer_ticks_than_a_control_host() {
+    if crate::aos_verb::refused_off_the_pinned_target() {
+        return;
+    }
     for light in [false, true] {
         let t0 = Instant::now();
         let control = story(light, t0, false);
@@ -150,6 +153,9 @@ fn fresh_keys_after_publication_clear_in_fewer_ticks_than_a_control_host() {
 /// `publish` refuses bare or non-useful plans without leaving the glow paused.
 #[test]
 fn the_publish_ask_answers_its_line_and_a_refusal_resumes_the_glow() {
+    if crate::aos_verb::refused_off_the_pinned_target() {
+        return;
+    }
     let t0 = Instant::now();
     let mut app = momentum_app(false);
     app.redraw_window_at(WID, t0);
@@ -225,6 +231,9 @@ fn unhex(hex: &str) -> Vec<u8> {
 /// `aos bundle` exports the live plan's verifiable bundle until the window's code changes.
 #[test]
 fn the_bundle_ask_exports_the_live_plans_bundle_until_the_windows_code_changes() {
+    if crate::aos_verb::refused_off_the_pinned_target() {
+        return;
+    }
     let t0 = Instant::now();
     let mut app = momentum_app(false);
     app.redraw_window_at(WID, t0);

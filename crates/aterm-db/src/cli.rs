@@ -18,6 +18,7 @@ use std::{
 pub const USAGE: &str = "aterm db — encrypted embedded application databases (Unix)\n\
   Commons tables use enrolled secrets and default LAN repair (no --dir):\n\
   commons-status                       local membership, control history and sharing setting\n\
+  network-state                        retained local machine observations; never grants access\n\
   commons-authority                    inspect cached admin control metadata; changes nothing\n\
   commons-tables                       list declarations, provenance and subscriptions\n\
   commons-open --application <id> --role <id> [--version <n>]\n\
@@ -139,6 +140,25 @@ pub fn run(words: &[String]) -> Result<Value> {
             return Err(Error::new("nonce takes no options"));
         }
         return Ok(json!({"request":hex::encode_lower(&crypto::random::<16>()?)}));
+    }
+    if command == "network-state" {
+        empty(&options)?;
+        let config = aterm_types::dirs::aterm_config_path()
+            .ok_or_else(|| Error::new("network observation path unavailable"))?;
+        let network = crate::network_state::read_history(&config)?;
+        let paths = aterm_secrets::client::Paths::live()
+            .map_err(|_| Error::new("service observation path unavailable"))?;
+        let services =
+            crate::service_state::observe(&paths, &config, aterm_time::unix_millis().unwrap_or(0));
+        let service = |state: aterm_types::network_state::ServiceState| {
+            json!({
+            "availability":format!("{:?}",state.availability),"observed_at_ms":state.observed_at_ms,
+            "last_success_ms":state.last_success_ms,"revision":state.revision,"detail":state.detail,"refresh_failed":state.refresh_failed})
+        };
+        return Ok(
+            json!({"live_network":false,"network":crate::network_state::value(&network),
+            "services":{"accounts":service(services.accounts),"secrets":service(services.secrets)}}),
+        );
     }
     if matches!(
         command,

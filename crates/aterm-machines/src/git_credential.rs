@@ -13,6 +13,9 @@ use std::time::Duration;
 /// The helper CLT git ships, and the one every request here names.
 pub(crate) const OSXKEYCHAIN: &str = "osxkeychain";
 
+/// git's own file helper, which [`Git::keychain`] names where there is no login keychain.
+const STORE: &str = "store";
+
 /// The host git's own GitHub lookups name: clones and fetches over HTTPS.
 pub(crate) const GITHUB: &str = "github.com";
 
@@ -58,9 +61,20 @@ pub(crate) struct Git {
 
 impl Git {
     /// The installed git ([`crate::items::github::git_program`]: the Command Line Tools', else
-    /// Xcode's) and its osxkeychain helper: what `aterm init` and the controller run.
+    /// Xcode's) and its osxkeychain helper: what `aterm init` and the controller run. Elsewhere
+    /// (Linux) the distribution's git and git's own `store` helper, which keeps the credential
+    /// in `~/.git-credentials`, a file only its owner reads.
     pub(crate) fn keychain(sys: &dyn System) -> Self {
-        Self::keychain_at(crate::items::github::git_program(sys))
+        let mut git = Self::keychain_at(crate::items::github::git_program(sys));
+        if !sys.macos() {
+            git.helper = STORE.into();
+        }
+        git
+    }
+
+    /// The one helper every request this makes names.
+    pub(crate) fn helper(&self) -> &str {
+        &self.helper
     }
 
     /// `program` and its osxkeychain helper.
@@ -246,6 +260,92 @@ impl Git {
         })
     }
 
+    /// [`Self::configured`], and whose settings git's github.com lookups already use instead:
+    /// a helper other than this one's, or a `credential.username` naming another account
+    /// ([`Standing::foreign`]), which [`Self::configure`] must leave as they are. Where it would
+    /// configure, the global file's values of the settings it replaces are read too, for the
+    /// line that puts them back ([`Standing::revert`]).
+    ///
+    /// # Errors
+    /// As [`Self::configured`].
+    pub(crate) fn standing(
+        &self,
+        sys: &dyn System,
+        user: &User,
+        account: &str,
+    ) -> Result<Standing, String> {
+        let mut foreign = None;
+        let lookups = self.judged(sys, user, |every, conditional| {
+            foreign = someone_elses(&self.helper, account, every, conditional);
+            judge(&self.helper, account, every, conditional)
+        })?;
+        if lookups.ready() || foreign.is_some() {
+            return Ok(Standing {
+                lookups,
+                foreign,
+                revert: None,
+            });
+        }
+        let ran = sys
+            .run_complete_stdout(&self.cmd(Some(user)).args([
+                "config",
+                "--global",
+                "--null",
+                "--get-regexp",
+                GLOBAL,
+            ]))
+            .map_err(|_| "cannot completely read git's global credential settings")?;
+        let text = match ran.status {
+            Some(1) if ran.stdout.is_empty() => String::new(),
+            Some(0) => String::from_utf8(ran.stdout)
+                .map_err(|_| "git's global credential settings are not UTF-8")?,
+            _ => {
+                return Err(
+                    "cannot read git's global credential settings (output withheld)".into(),
+                );
+            }
+        };
+        let mut prior: Vec<(String, Option<String>)> = Vec::new();
+        for entry in text.split_terminator('\0') {
+            let (key, value) = entry
+                .split_once('\n')
+                .map_or((entry, None), |(key, value)| (key, Some(value)));
+            prior.push((key.to_ascii_lowercase(), value.map(str::to_owned)));
+        }
+        // A helper this one did not write is someone else's, whatever a later file does with
+        // it: it stays, and its value (which can carry a credential) is never journaled.
+        if let Some((key, _)) = prior.iter().find(|(key, value)| {
+            key.ends_with(".helper")
+                && value
+                    .as_deref()
+                    .is_none_or(|value| !value.is_empty() && value != self.helper)
+        }) {
+            return Ok(Standing {
+                lookups,
+                foreign: Some(format!("{key} in git's global file")),
+                revert: None,
+            });
+        }
+        let mut steps = Vec::new();
+        for key in [HELPER, USERNAME, USE_PATH] {
+            steps.push(format!("git config --global --unset-all {key}"));
+            for (_, value) in prior
+                .iter()
+                .filter(|(read, _)| read.eq_ignore_ascii_case(key))
+            {
+                steps.push(format!(
+                    "git config --global --add {key} {}",
+                    shell_word(value.as_deref().unwrap_or("true"))
+                ));
+            }
+        }
+        Ok(Standing {
+            lookups,
+            foreign: None,
+            revert: Some(steps.join("; ")),
+        })
+    }
+
     /// Whether git asks alike for every github.com repository a clone names, so that one
     /// host-wide fill ([`Self::fill_as_configured`]) gets what each clone gets: no credential
     /// setting that applies to some lookups only (a URL naming a user or a path under the host,
@@ -345,6 +445,82 @@ impl Git {
         }
         Ok(())
     }
+}
+
+/// What [`Git::standing`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Standing {
+    /// [`Git::configured`]'s answer.
+    pub(crate) lookups: Lookups,
+    /// The setting git's github.com lookups already use that is someone else's (a helper other
+    /// than this one's, another account), named by key and file, never by value; `None` when
+    /// there is none.
+    pub(crate) foreign: Option<String>,
+    /// The commands that put back the global file's settings [`Git::configure`] replaces,
+    /// read before it runs; `None` when it has nothing to replace (ready, or someone else's).
+    pub(crate) revert: Option<String>,
+}
+
+/// The global settings [`Git::configure`] replaces, as `git config --get-regexp` matches keys.
+const GLOBAL: &str = r"^credential\.https://github\.com\.(helper|username|usehttppath)$";
+
+/// `value` as one shell word: itself when it needs no quoting, else single-quoted.
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b':'))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
+}
+
+/// The setting among those git reads for github.com lookups that is someone else's: a helper
+/// other than `helper` still in the list once the resets are applied, or a `credential.username`
+/// naming an account other than `account`, in any file and for any part of github.com. `None`
+/// when every one is `helper`'s or names `account`.
+fn someone_elses(
+    helper: &str,
+    account: &str,
+    every: &[Setting],
+    conditional: &[Setting],
+) -> Option<String> {
+    let theirs = |name: &str, value: Option<&str>| match (name, value) {
+        ("helper", Some(value)) => !value.is_empty() && value != helper,
+        ("username", Some(value)) => !value.eq_ignore_ascii_case(account),
+        _ => false,
+    };
+    let mut helpers: Vec<&Setting> = Vec::new();
+    let mut username = None;
+    for setting in every {
+        match relevant(setting) {
+            None | Some((Scope::Never, _)) => {}
+            Some((Scope::Part, name)) if theirs(name, setting.value.as_deref()) => {
+                return Some(setting.named());
+            }
+            Some((Scope::Part, _)) => {}
+            Some((Scope::Every, "helper")) if setting.value.as_deref() == Some("") => {
+                helpers.clear();
+            }
+            Some((Scope::Every, "helper")) => helpers.push(setting),
+            Some((Scope::Every, "username")) => username = Some(setting),
+            Some((Scope::Every, _)) => {}
+        }
+    }
+    helpers
+        .into_iter()
+        .chain(username)
+        .chain(
+            conditional.iter().filter(|setting| {
+                relevant(setting).is_some_and(|(scope, _)| scope != Scope::Never)
+            }),
+        )
+        .find(|setting| {
+            relevant(setting).is_some_and(|(_, name)| theirs(name, setting.value.as_deref()))
+        })
+        .map(Setting::named)
 }
 
 /// One setting a read printed: the file it is in (`--show-origin`: `file:<path>`), its key
@@ -712,7 +888,7 @@ fn scrub(bytes: &mut [u8]) {
 pub(crate) mod script {
     use super::{Git, HELPER, USE_PATH, USERNAME};
     use crate::model::User;
-    use crate::port::{Fake, Ran};
+    use crate::port::{Fake, Ran, System as _};
 
     /// The key of `git credential <verb>`, as `user` or this process.
     pub(crate) fn credential(user: Option<&User>, verb: &str) -> String {
@@ -776,7 +952,7 @@ pub(crate) mod script {
     }
 
     /// git's settings before any GitHub setup: CLT's own `credential.helper` alone, which
-    /// names no account.
+    /// names no account, and nothing for github.com in the global file.
     pub(crate) fn unconfigured(sys: &Fake, user: &User) {
         sys.on(
             &helpers(user),
@@ -786,6 +962,21 @@ pub(crate) mod script {
                 "osxkeychain",
             )])),
         );
+        sys.on(&global(user), Ran::exit(1, ""));
+    }
+
+    /// The read [`Git::standing`] makes of the global file's github.com settings.
+    pub(crate) fn global(user: &User) -> String {
+        config(
+            user,
+            &[
+                "config",
+                "--global",
+                "--null",
+                "--get-regexp",
+                super::GLOBAL,
+            ],
+        )
     }
 
     /// The four writes [`Git::configure`] makes for `account`, each answered `ok`.
@@ -816,27 +1007,41 @@ pub(crate) mod script {
     /// git's settings as the secrets vault's `~/.config/git/config` leaves them: CLT's own
     /// helper, reset for github.com, then the vault's helper and the keychain after it, the
     /// same for every repository ([`Git::uniform`]).
+    /// On Linux (`sys.linux`), the distribution's git and its `store` helper, with no CLT file.
     pub(crate) fn alike(sys: &Fake, user: &User) {
+        let git = host(sys);
         let xdg = format!("{}/.config/git/config", user.home);
         let helper = HELPER.to_ascii_lowercase();
+        let mut settings = Vec::new();
+        if sys.macos() {
+            settings.push((CLT_CONFIG, "credential.helper", "osxkeychain"));
+        }
+        settings.extend([
+            (xdg.as_str(), helper.as_str(), ""),
+            (&xdg, &helper, "!f() { :; }; f"),
+            (&xdg, &helper, git.helper()),
+        ]);
         sys.on(
-            &helpers(user),
-            Ran::ok(&printed(&[
-                (CLT_CONFIG, "credential.helper", "osxkeychain"),
-                (&xdg, &helper, ""),
-                (&xdg, &helper, "!f() { :; }; f"),
-                (&xdg, &helper, "osxkeychain"),
-            ])),
+            &git.read(user, None).display(),
+            Ran::ok(&printed(&settings)),
         );
+    }
+
+    /// The git `sys` runs as these scripts key it: CLT's on a Mac, and elsewhere the
+    /// distribution's with git's `store` helper ([`Git::keychain`]).
+    fn host(sys: &Fake) -> Git {
+        if sys.macos() {
+            Git::keychain_at(crate::items::github::CLT_GIT.into())
+        } else {
+            Git::keychain(sys)
+        }
     }
 
     /// A `fill` through every helper `user`'s configuration names that hands back `token` for
     /// `account` at `host` ([`Git::fill_as_configured`]).
     pub(crate) fn lookups_hold(sys: &Fake, user: &User, host: &str, account: &str, token: &str) {
         sys.on(
-            &Git::keychain_at(crate::items::github::CLT_GIT.into())
-                .as_configured(Some(user))
-                .display(),
+            &self::host(sys).as_configured(Some(user)).display(),
             Ran::ok(&format!(
                 "protocol=https\nhost={host}\nusername={account}\npassword={token}\n"
             )),

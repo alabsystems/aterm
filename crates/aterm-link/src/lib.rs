@@ -53,6 +53,8 @@ pub mod glance;
 pub mod mailbox;
 pub mod mirror;
 pub mod notify;
+/// `aterm link notify --on need`: each session's need as `aterm fabric brief` folds it.
+pub mod notify_need;
 pub mod pct;
 /// `aterm fabric halt|inbox|post` — a person speaking for themself, under a cap of their own.
 pub mod person;

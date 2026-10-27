@@ -1214,6 +1214,55 @@ pub(crate) fn cmd_resizes(
     tl.resizes().reply(n, since)
 }
 
+/// `ResizeRender` actions no shipping function here performs, each waived where its
+/// Tier-1 (`tests`) binds it.
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ResizeRender",
+    action = "Demote",
+    reason = "The engine's alt-screen shrink with a full tail: aterm-core's grid resize, \
+              journalled as a ResizeReport. The Tier-1 rig drives the real Terminal \
+              through it and books it with the real ResizeLedger::ingest."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ResizeRender",
+    action = "Trim",
+    reason = "The engine's alt-screen shrink with a blank tail: aterm-core's grid resize, \
+              driven for real by the Tier-1 rig."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ResizeRender",
+    action = "Output",
+    reason = "Application output that draws nothing (a mode set): an environment step the \
+              Tier-1 rig's stand-in performs on the real Terminal, which drops the engine's \
+              resize undo."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ResizeRender",
+    action = "Step",
+    reason = "The application's SIGWINCH handler and its next frame: an environment step \
+              the Tier-1 rig's stand-in performs on the real Terminal."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ResizeRender",
+    action = "Draw",
+    reason = "An application diff frame: an environment step the Tier-1 rig's stand-in \
+              performs on the real Terminal."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "ResizeRender",
+    action = "Classify",
+    reason = "The presence classifier's reading of the session's program (Claude Code), or \
+              the session showing it clears its screen when resized: an environment fact the \
+              Tier-1 rig sets with `ResizeLedger::set_agent`."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn resize_render_scope_waivers() {}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -3521,52 +3570,3 @@ mod tests {
         assert_ne!(conpty.render(), Render::DesyncRisk);
     }
 }
-
-/// `ResizeRender` actions no shipping function here performs, each waived where its
-/// Tier-1 (`tests`) binds it.
-#[cfg(any(test, debug_assertions))]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ResizeRender",
-    action = "Demote",
-    reason = "The engine's alt-screen shrink with a full tail: aterm-core's grid resize, \
-              journalled as a ResizeReport. The Tier-1 rig drives the real Terminal \
-              through it and books it with the real ResizeLedger::ingest."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ResizeRender",
-    action = "Trim",
-    reason = "The engine's alt-screen shrink with a blank tail: aterm-core's grid resize, \
-              driven for real by the Tier-1 rig."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ResizeRender",
-    action = "Output",
-    reason = "Application output that draws nothing (a mode set): an environment step the \
-              Tier-1 rig's stand-in performs on the real Terminal, which drops the engine's \
-              resize undo."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ResizeRender",
-    action = "Step",
-    reason = "The application's SIGWINCH handler and its next frame: an environment step \
-              the Tier-1 rig's stand-in performs on the real Terminal."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ResizeRender",
-    action = "Draw",
-    reason = "An application diff frame: an environment step the Tier-1 rig's stand-in \
-              performs on the real Terminal."
-)]
-#[aterm_spec_anchor::spec_unmodeled(
-    machine = "ResizeRender",
-    action = "Classify",
-    reason = "The presence classifier's reading of the session's program (Claude Code), or \
-              the session showing it clears its screen when resized: an environment fact the \
-              Tier-1 rig sets with `ResizeLedger::set_agent`."
-)]
-#[allow(
-    dead_code,
-    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
-              not an expect: rustc does not lint a fn the declarative anchors rebuild"
-)]
-fn resize_render_scope_waivers() {}

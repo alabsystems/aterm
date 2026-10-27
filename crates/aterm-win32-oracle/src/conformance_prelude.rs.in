@@ -34,8 +34,9 @@
 use core::marker::PhantomData;
 use core::mem::{align_of, offset_of, size_of};
 
-/// The hand-written COM and DXGI declarations against `windows` 0.62.2
-/// (src/com.rs, not generated).
+/// The hand-written COM, DXGI, Direct3D 11, DirectComposition and UI
+/// Automation declarations against `windows` 0.62.2 (src/com.rs, not
+/// generated).
 mod com;
 
 /// The upstream type a facade type must be.

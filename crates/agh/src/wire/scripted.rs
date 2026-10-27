@@ -85,6 +85,13 @@ impl ScriptedTransport {
             .clone()
     }
 
+    /// The permit's profile beside each request seen, in order: one entry per request, the
+    /// profile or `None`. Empty until WP3 records the permits (plan §7, body 2).
+    #[must_use]
+    pub fn permits(&self) -> Vec<Option<String>> {
+        Vec::new()
+    }
+
     /// Outcomes still queued.
     #[must_use]
     pub fn remaining(&self) -> usize {

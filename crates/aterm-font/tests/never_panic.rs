@@ -199,6 +199,42 @@ fn a_gsub_extension_of_an_extension_is_malformed() {
     );
 }
 
+#[test]
+fn a_gpos_extension_of_an_extension_is_malformed() {
+    let mut gpos: Vec<u8> = vec![0, 1, 0, 0, 0, 10, 0, 12, 0, 14];
+    gpos.extend([0, 0, 0, 0]);
+    gpos.extend([0, 2, 0, 6, 0, 22]);
+    // Lookup 0: LookupType 9 (Extension) wrapping LookupType 9 -> malformed.
+    gpos.extend([0, 9, 0, 0, 0, 1, 0, 8]);
+    gpos.extend([0, 1, 0, 9, 0, 0, 0, 0]);
+    // Lookup 1: LookupType 9 (Extension) wrapping LookupType 1 (SinglePos Format 1, x_advance=-50).
+    gpos.extend([0, 9, 0, 0, 0, 1, 0, 8]);
+    gpos.extend([0, 1, 0, 1, 0, 0, 0, 8]);
+    gpos.extend([0, 1, 0, 8, 0, 4]);
+    gpos.extend((-50i16).to_be_bytes());
+    gpos.extend([0, 1, 0, 1, 0, 0]);
+    let bytes = sfnt(2, &[(b"GPOS", &gpos)]);
+    let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+    let lookups = face.tables().gpos.expect("GPOS parses").lookups;
+    let resolve = |i: u16| {
+        lookups
+            .get(i)
+            .expect("lookup")
+            .subtables
+            .get::<aterm_font::gpos::PositioningSubtable>(0)
+    };
+    assert!(resolve(0).is_none(), "an extension of an extension");
+    assert!(
+        matches!(
+            resolve(1),
+            Some(aterm_font::gpos::PositioningSubtable::Single(
+                aterm_font::gpos::SingleAdjustment::Format1 { value, .. }
+            )) if value.x_advance == -50
+        ),
+        "a well-formed GPOS extension resolves"
+    );
+}
+
 fn shared_paint_graph(depth: u32) -> Vec<u8> {
     let be16 = |v: u32| (v as u16).to_be_bytes();
     let be32 = |v: u32| v.to_be_bytes();
@@ -679,14 +715,18 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
     }
     out.push(("gvar past 32 tuples", crate::gvar_tuples::past_32_face()));
     out.push(("CBLC/CBDT synthetic", crate::synthetic_tables::cbdt_face()));
+    out.push((
+        "kerx+ankr synthetic",
+        crate::gpos_shaping::kerx_ankr_seed_face(),
+    ));
     out
 }
 
 const READ_TABLES: &[&[u8; 4]] = &[
     b"head", b"hhea", b"maxp", b"hmtx", b"vhea", b"vmtx", b"VORG", b"post", b"cmap", b"loca",
     b"glyf", b"gvar", b"fvar", b"avar", b"HVAR", b"VVAR", b"MVAR", b"CFF ", b"CFF2", b"GSUB",
-    b"GPOS", b"GDEF", b"OS/2", b"name", b"kern", b"sbix", b"bloc", b"bdat", b"EBLC", b"EBDT",
-    b"CBLC", b"CBDT", b"COLR", b"CPAL",
+    b"GPOS", b"GDEF", b"OS/2", b"name", b"kern", b"kerx", b"ankr", b"sbix", b"bloc", b"bdat",
+    b"EBLC", b"EBDT", b"CBLC", b"CBDT", b"COLR", b"CPAL",
 ];
 
 /// A table of face `index`: its byte range, and whether it holds CFF charstrings.
@@ -1000,23 +1040,90 @@ fn exercise(bytes: &[u8], rng: &mut Lcg, glyph_cap: u16) -> u64 {
                 }
             }
         }
-        for table in [face.tables().gsub, face.tables().gpos]
-            .into_iter()
-            .flatten()
-        {
+        for (is_gpos, table) in [(false, face.tables().gsub), (true, face.tables().gpos)] {
+            let Some(table) = table else {
+                continue;
+            };
             sink.0 += u64::from(table.scripts.len()) + u64::from(table.features.len());
             for i in 0..table.lookups.len() {
                 let Some(lookup) = table.lookups.get(i) else {
                     continue;
                 };
                 for j in 0..lookup.subtables.len() {
-                    if let Some(s) = lookup
+                    if !is_gpos {
+                        if let Some(s) = lookup
+                            .subtables
+                            .get::<aterm_font::gsub::SubstitutionSubtable>(j)
+                        {
+                            let c = s.coverage();
+                            for g in [0, 1, 0x7FFF, u16::MAX] {
+                                sink.0 += u64::from(c.get(GlyphId(g)).is_some());
+                            }
+                        }
+                    } else if let Some(s) = lookup
                         .subtables
-                        .get::<aterm_font::gsub::SubstitutionSubtable>(j)
+                        .get::<aterm_font::gpos::PositioningSubtable>(j)
                     {
                         let c = s.coverage();
                         for g in [0, 1, 0x7FFF, u16::MAX] {
                             sink.0 += u64::from(c.get(GlyphId(g)).is_some());
+                        }
+                        match s {
+                            aterm_font::gpos::PositioningSubtable::Single(
+                                aterm_font::gpos::SingleAdjustment::Format2 { values, .. },
+                            ) => {
+                                let _ = values.get(0);
+                                let _ = values.get(u16::MAX);
+                            }
+                            aterm_font::gpos::PositioningSubtable::Pair(
+                                aterm_font::gpos::PairAdjustment::Format1 { sets, .. },
+                            ) => {
+                                if let Some(set) = sets.get(0) {
+                                    let _ = set.get(GlyphId(0));
+                                    let _ = set.get(GlyphId(1));
+                                }
+                            }
+                            aterm_font::gpos::PositioningSubtable::Pair(
+                                aterm_font::gpos::PairAdjustment::Format2 { matrix, .. },
+                            ) => {
+                                let _ = matrix.get((0, 0));
+                                let _ = matrix.get((u16::MAX, u16::MAX));
+                            }
+                            aterm_font::gpos::PositioningSubtable::Cursive(
+                                aterm_font::gpos::CursiveAdjustment { sets, .. },
+                            ) => {
+                                let _ = sets.entry(0);
+                                let _ = sets.exit(0);
+                                let _ = sets.entry(u16::MAX);
+                            }
+                            aterm_font::gpos::PositioningSubtable::MarkToBase(
+                                aterm_font::gpos::MarkToBaseAdjustment { marks, anchors, .. },
+                            )
+                            | aterm_font::gpos::PositioningSubtable::MarkToMark(
+                                aterm_font::gpos::MarkToMarkAdjustment {
+                                    marks,
+                                    mark2_matrix: anchors,
+                                    ..
+                                },
+                            ) => {
+                                let _ = marks.get(0);
+                                let _ = anchors.get(0, 0);
+                                let _ = anchors.get(u16::MAX, u16::MAX);
+                            }
+                            aterm_font::gpos::PositioningSubtable::MarkToLigature(
+                                aterm_font::gpos::MarkToLigatureAdjustment {
+                                    marks,
+                                    ligature_array,
+                                    ..
+                                },
+                            ) => {
+                                let _ = marks.get(0);
+                                if let Some(m) = ligature_array.get(0) {
+                                    let _ = m.get(0, 0);
+                                    let _ = m.get(u16::MAX, u16::MAX);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }

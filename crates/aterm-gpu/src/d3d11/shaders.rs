@@ -9,9 +9,9 @@
 //! (its default), loaded from System32 only, with the flags wgpu passes it:
 //! `ENABLE_STRICTNESS` always, and `DEBUG | SKIP_OPTIMIZATION` in a build
 //! with debug assertions (wgpu's `InstanceFlags::DEBUG`). The arm is held
-//! byte-identical to wgpu-dx12's frames, and an optimizer that reorders a
-//! float expression on one side only breaks that, so the flags are the
-//! oracle's. Shader model 5.0: feature level 11_0's (wgpu asks FXC for 5.1,
+//! byte-identical to wgpu-dx12's recorded frames, and an optimizer that
+//! reorders a float expression on one side only breaks that, so the flags are
+//! the ones wgpu passed. Shader model 5.0: feature level 11_0's (wgpu asks FXC for 5.1,
 //! which D3D11 cannot load; the two compile the same arithmetic).
 //!
 //! Bytecode is cached per process by (library, entry point, stage): a second

@@ -503,6 +503,50 @@ fn a_carried_log_reads_like_its_predecessor_and_says_the_handoff_hole() {
     assert!(continued.is_open(Node::SESSION));
 }
 
+/// C13 (ROBUST-3): two logs started at epochs E and E+1, each carried once, span [E, E+1] and
+/// [E+1, E+2]: the second's pre-update cursor lies in the first's range. A cursor that names its
+/// log ([`Cursor::of_log`] with the log's base) is reset in another log; in its own it reads on;
+/// one that names none reads as before.
+#[test]
+fn a_cursor_naming_another_log_resets_where_the_epoch_ranges_overlap() {
+    let carried = |ep: u32| {
+        let mut log = Log::new(ep);
+        agent_session(&mut log, 0);
+        for i in 0..6 {
+            log.mark(Mark::new(Kind::Human, Src::Input, Conf::Exact), at(10 + i))
+                .expect("a mark");
+        }
+        let out = log.carry(CarryBudget::SESSION, &[]).expect("carried");
+        Log::from_carry(&out.lines, adopt_at(&log, 900_000))
+            .expect("the carry reads")
+            .0
+    };
+    let (e, a, b) = (40u32, carried(40), carried(41));
+    assert_eq!(
+        (a.base_ep(), a.ep(), b.base_ep(), b.ep()),
+        (e, e + 1, e + 1, e + 2),
+        "PRECONDITION: the ranges overlap"
+    );
+    let b_cursor = Cursor::new(e + 1, 4);
+    let reset =
+        |log: &Log, c: Cursor| log.read(c, usize::MAX).gap.map(|g| g.why) == Some(GapWhy::Reset);
+    assert!(!reset(&a, b_cursor), "naming no log: as before");
+    assert!(
+        reset(&a, b_cursor.of_log(b.base_ep())),
+        "B's cursor naming B, in A"
+    );
+    assert!(!reset(&b, b_cursor.of_log(b.base_ep())), "B's cursor in B");
+    assert!(
+        !reset(&a, Cursor::new(e, 4).of_log(a.base_ep())),
+        "A's cursor in A"
+    );
+    let fresh = Log::new(e + 1);
+    assert!(
+        reset(&fresh, Cursor::new(e + 1, 0).of_log(e)),
+        "a base alone tells two logs of one epoch apart"
+    );
+}
+
 #[test]
 fn the_carry_cut_is_the_eviction_order_and_counts_what_it_shed() {
     let mut log = Log::new(1);

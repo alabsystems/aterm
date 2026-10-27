@@ -15,6 +15,12 @@ description = "aterm-gui's fabric endpoint, below the window: each session's inb
 dev-seams = ["aterm-types/dev-seams"]
 
 [dependencies]
+# The bus log's identity (`logid::LogIdentity`): the endpoint's log clock parses,
+# compares and continues identities exactly as astream does. Already in the graph
+# through aterm-control → aterm-codec; dependency-free, every target. The broker
+# re-exports the same type, but aterm links the broker only on Unix (aterm-link),
+# and this crate builds on every target.
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 # The wire's percent escape and the blocking verbs' caller-hangup check.
 aterm-control = { workspace = true }
 # The fence and notice waits' one timing value, and the process clock.

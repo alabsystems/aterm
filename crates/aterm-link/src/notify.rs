@@ -12,8 +12,10 @@ use std::time::{Duration, Instant};
 
 use crate::body::Body;
 use crate::bridge::ACK_DEADLINE;
+use crate::notify_need::{NeedWatch, Step};
 use crate::subject::{is_fleet, is_principal};
 use crate::transport::{self, Backoff, Closer, Conn};
+use aterm_slog::vocab::NEED_WORDS;
 
 const PAGE: u32 = crate::transport::POST_PAGE;
 
@@ -37,6 +39,9 @@ const HOLD_MAX: usize = 4 << 20;
 #[derive(Debug)]
 enum Notice {
     Record(usize, u64, String, Vec<u8>),
+    /// A record below the reader's cursor that a `need` selector folds before it judges any
+    /// ([`crate::notify_need::warm`]).
+    Warm(usize, u64, String, Vec<u8>),
     Checkpoint(usize, u64),
     Log(usize, ReadLog),
     Durable(usize, u64),
@@ -66,23 +71,72 @@ pub enum Sel {
     Attention,
     Ask(String),
     Halt,
+    /// `need` (`None`: any word) or `need:<word>`,…: a session's need, as `aterm fabric brief`
+    /// folds it from the session log's bus mirror ([`crate::notify_need`]), rising to one of
+    /// these words, each one of [`NEED_WORDS`]. Every `need` word of one `--on` list is one
+    /// selector ([`Sel::merge`]): one reader folds the faces once.
+    Need(Option<Vec<&'static str>>),
 }
 
 impl Sel {
     /// Parse one selector word.
     /// # Errors
-    /// A word that is not `attention`, `halt` or `ask:<principal>`.
+    /// A word that is not `attention`, `halt`, `ask:<principal>`, `need` or `need:<word>` with
+    /// `<word>` one of the session log's need words ([`NEED_WORDS`], which the error names).
     pub fn parse(word: &str) -> Result<Self, String> {
         match word {
             "attention" => Ok(Sel::Attention),
             "halt" => Ok(Sel::Halt),
-            other => match other.strip_prefix("ask:") {
-                Some(p) if is_principal(p) => Ok(Sel::Ask(p.to_string())),
-                Some(p) => Err(format!("--on ask:{p}: {p} is not a principal")),
-                None => Err(format!(
-                    "--on {other}: expected attention, halt or ask:<principal>"
-                )),
-            },
+            "need" => Ok(Sel::Need(None)),
+            other => {
+                if let Some(w) = other.strip_prefix("need:") {
+                    return aterm_slog::vocab::lookup(NEED_WORDS, w)
+                        .map(|w| Sel::Need(Some(vec![w])))
+                        .ok_or_else(|| {
+                            format!(
+                                "--on need:{w}: not one of the session log's need words ({})",
+                                NEED_WORDS.join(" ")
+                            )
+                        });
+                }
+                match other.strip_prefix("ask:") {
+                    Some(p) if is_principal(p) => Ok(Sel::Ask(p.to_string())),
+                    Some(p) => Err(format!("--on ask:{p}: {p} is not a principal")),
+                    None => Err(format!(
+                        "--on {other}: expected attention, halt, ask:<principal>, need or \
+                         need:<word>"
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Fold `other` into `self` when both are `need` selectors (a bare `need` takes every word),
+    /// and say whether it did.
+    fn merge(&mut self, other: &Sel) -> bool {
+        let (Sel::Need(have), Sel::Need(more)) = (self, other) else {
+            return false;
+        };
+        match (have.as_mut(), more) {
+            (None, _) => {}
+            (Some(_), None) => *have = None,
+            (Some(words), Some(more)) => {
+                for w in more {
+                    if !words.contains(w) {
+                        words.push(w);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether a `need` selector pages a need that rose to `word`.
+    fn selects(&self, word: &str) -> bool {
+        match self {
+            Sel::Need(None) => true,
+            Sel::Need(Some(words)) => words.contains(&word),
+            _ => false,
         }
     }
 
@@ -93,6 +147,7 @@ impl Sel {
             Sel::Attention => "attention".to_string(),
             Sel::Ask(p) => format!("ask:{p}"),
             Sel::Halt => "halt".to_string(),
+            Sel::Need(_) => "need".to_string(),
         }
     }
 
@@ -103,6 +158,7 @@ impl Sel {
             Sel::Attention => "attention".to_string(),
             Sel::Ask(p) => format!("ask-to.{p}"),
             Sel::Halt => "halt".to_string(),
+            Sel::Need(_) => "need".to_string(),
         }
     }
 
@@ -118,16 +174,23 @@ impl Sel {
                  {p} --out <cap>` on this machine: its fabric root holds the mint secret)"
             ),
             Sel::Halt => format!("`ro:/f/{fleet}/fleet/>`, which node.cap holds"),
+            Sel::Need(_) => format!(
+                "`ro:/f/{fleet}/pub/>`, which node.cap and a person's cap both hold (the caps \
+                 `aterm fabric brief` reads under)"
+            ),
         }
     }
 
-    /// The broker filter that carries this selector's records.
+    /// The broker filter that carries this selector's records: a `need` reads every session
+    /// and node face, for the `ev` records its fold takes and the presence rows that say a
+    /// session or its node is gone.
     #[must_use]
     pub fn filter(&self, fleet: &str) -> String {
         match self {
             Sel::Attention => format!("/f/{fleet}/pub/*/*/presence"),
             Sel::Ask(p) => format!("/f/{fleet}/in/p/{p}/*/ask"),
             Sel::Halt => format!("/f/{fleet}/fleet/*/halt"),
+            Sel::Need(_) => format!("/f/{fleet}/pub/*/*/*"),
         }
     }
 
@@ -151,6 +214,8 @@ impl Sel {
                     who: row.owner,
                     sid: String::new(),
                     text: one_line(&attention),
+                    need: String::new(),
+                    detail: String::new(),
                 })
             }
             Sel::Ask(p) => {
@@ -179,6 +244,8 @@ impl Sel {
                     who: p.clone(),
                     sid: sid.to_string(),
                     text: one_line(&parsed.text),
+                    need: String::new(),
+                    detail: String::new(),
                 })
             }
             Sel::Halt => {
@@ -199,8 +266,12 @@ impl Sel {
                     text: one_line(&crate::pct::decode(
                         row.reason.as_deref().unwrap_or_default(),
                     )),
+                    need: String::new(),
+                    detail: String::new(),
                 })
             }
+            // A need is a session's fold, not one record's: [`Notifier::need_hit`].
+            Sel::Need(_) => None,
         }
     }
 }
@@ -221,9 +292,15 @@ pub struct Hit {
     pub subject: String,
     pub node: String,
     pub who: String,
-    /// The asking session, for an `ask` ([`Hit::node`]).
+    /// The asking session, for an `ask` ([`Hit::node`]); the session whose need rose, for a
+    /// `need`.
     pub sid: String,
     pub text: String,
+    /// The need word a `need` rose to (empty for the other selectors).
+    pub need: String,
+    /// The detail `aterm fabric brief` shows beside that need (a wall's reset, a failure's exit
+    /// code), or empty.
+    pub detail: String,
 }
 
 /// The subject as an environment value ([`TEXT_MAX`]).
@@ -642,6 +719,13 @@ struct Notifier {
     /// By selector index, the durable head the reader's current connection last told
     /// ([`Notice::Durable`]).
     durable: Vec<u64>,
+    /// The sessions a `need` selector follows.
+    need: NeedWatch,
+    /// Whether [`Self::need`] takes a warm-up's records: it is fresh (just made, or made again
+    /// for another log) and its reader has handed it no record past the cursor yet, judged or
+    /// held for durability ([`Notifier::take`]): a reconnect's warm-up would fold a held record
+    /// before it is judged.
+    need_fresh: bool,
 }
 
 impl Notifier {
@@ -649,6 +733,7 @@ impl Notifier {
         let store = Store::open(&cfg.state_dir)?;
         let fault = Fault::from_env(&store);
         let n = cfg.on.len();
+        let need = NeedWatch::new(&cfg.fleet);
         Ok(Self {
             journal: store.journal(),
             standing: store.standing(),
@@ -666,6 +751,8 @@ impl Notifier {
             held_bytes: 0,
             scanned: vec![None; n],
             durable: vec![0; n],
+            need,
+            need_fresh: true,
         })
     }
 
@@ -808,21 +895,88 @@ impl Notifier {
         self.store.set_stamps(&self.stamps)
     }
 
-    fn on_record(&mut self, sel: &Sel, off: u64, subject: &str, body: &[u8]) -> io::Result<()> {
-        let raised = match sel {
-            Sel::Attention => match escalation(&self.cfg.fleet, off, subject, body) {
-                None => return Ok(()),
-                Some(None) => return self.set_standing(subject, None),
-                Some(Some(token)) => {
-                    if self.standing_of(subject).is_some_and(|t| t != token) {
-                        self.set_standing(subject, None)?;
-                    }
-                    Some(token)
+    /// What a `need` selector makes of one record: the standing need cleared where the fold, or
+    /// a presence row saying the session is gone without its close, names none or another word,
+    /// and the need word (the standing token) and the hit where the fold names a word `sel`
+    /// selects. A partial fold ([`Step::Partial`]) names nothing and clears nothing.
+    fn need_hit(
+        &mut self,
+        sel: &Sel,
+        off: u64,
+        subject: &str,
+        body: &[u8],
+    ) -> io::Result<Option<(String, Hit)>> {
+        self.need_fresh = false;
+        match self.need.step(off, subject, body) {
+            Step::Nothing | Step::Partial(_) => Ok(None),
+            Step::Gone(faces) => {
+                for face in faces {
+                    self.set_standing(&face, None)?;
                 }
+                Ok(None)
+            }
+            Step::Folded {
+                face, need: None, ..
+            } => {
+                self.set_standing(&face, None)?;
+                Ok(None)
+            }
+            Step::Folded {
+                face,
+                node,
+                sid,
+                need: Some((word, detail)),
+            } => {
+                if self.standing_of(&face).is_some_and(|t| t != word) {
+                    self.set_standing(&face, None)?;
+                }
+                if !sel.selects(word) {
+                    return Ok(None);
+                }
+                let detail = detail.as_deref().map(one_line).unwrap_or_default();
+                let text = if detail.is_empty() {
+                    word.to_string()
+                } else {
+                    one_line(&format!("{word} {detail}"))
+                };
+                let hit = Hit {
+                    on: sel.label(),
+                    offset: off,
+                    subject: subject_env(&face),
+                    node: one_line(&node),
+                    who: String::new(),
+                    sid: one_line(&sid),
+                    text,
+                    need: word.to_string(),
+                    detail,
+                };
+                Ok(Some((word.to_string(), hit)))
+            }
+        }
+    }
+
+    fn on_record(&mut self, sel: &Sel, off: u64, subject: &str, body: &[u8]) -> io::Result<()> {
+        let (raised, hit) = match sel {
+            Sel::Attention => {
+                let raised = match escalation(&self.cfg.fleet, off, subject, body) {
+                    None => return Ok(()),
+                    Some(None) => return self.set_standing(subject, None),
+                    Some(Some(token)) => {
+                        if self.standing_of(subject).is_some_and(|t| t != token) {
+                            self.set_standing(subject, None)?;
+                        }
+                        Some(token)
+                    }
+                };
+                (raised, sel.hit(&self.cfg.fleet, off, subject, body))
+            }
+            Sel::Need(_) => match self.need_hit(sel, off, subject, body)? {
+                Some((token, hit)) => (Some(token), Some(hit)),
+                None => return Ok(()),
             },
-            Sel::Ask(_) | Sel::Halt => None,
+            Sel::Ask(_) | Sel::Halt => (None, sel.hit(&self.cfg.fleet, off, subject, body)),
         };
-        let Some(hit) = sel.hit(&self.cfg.fleet, off, subject, body) else {
+        let Some(hit) = hit else {
             return Ok(());
         };
         let dup = match self.verdict(off) {
@@ -899,6 +1053,8 @@ impl Notifier {
             .env("ATERM_NOTIFY_WHO", &hit.who)
             .env("ATERM_NOTIFY_SID", &hit.sid)
             .env("ATERM_NOTIFY_TEXT", &hit.text)
+            .env("ATERM_NOTIFY_NEED", &hit.need)
+            .env("ATERM_NOTIFY_DETAIL", &hit.detail)
             .env("ATERM_NOTIFY_DUP", if dup { "1" } else { "0" })
             .env("ATERM_NOTIFY_SUPPRESSED", suppressed.to_string());
         let mut child = match cmd.spawn() {
@@ -968,6 +1124,18 @@ impl Notifier {
             let filter = sel.filter(&self.cfg.fleet);
             let key = sel.key();
             let mut from = self.start_offset(&mut conn, &sel)?;
+            if matches!(sel, Sel::Need(_)) {
+                let need = &mut self.need;
+                crate::notify_need::warm(
+                    &mut conn,
+                    &self.cfg.fleet,
+                    from,
+                    |off, subject, body| {
+                        need.warm(off, &subject, &body);
+                        true
+                    },
+                )?;
+            }
             loop {
                 let ((rows, (next, head)), floor) =
                     transport::fetch_kept(&mut conn, from, &filter, PAGE)?;
@@ -1038,6 +1206,10 @@ impl Notifier {
                         .sum();
                     self.held_bytes -= dropped;
                     self.scanned[idx] = None;
+                    if matches!(self.cfg.on.get(idx), Some(Sel::Need(_))) {
+                        self.need = NeedWatch::new(&self.cfg.fleet);
+                        self.need_fresh = true;
+                    }
                 }
                 self.durable[idx] = 0;
                 let ordered = log.ordered;
@@ -1046,10 +1218,18 @@ impl Notifier {
                     self.release(idx, u64::MAX)?;
                 }
             }
+            Notice::Warm(idx, off, subject, body) => {
+                if self.need_fresh && matches!(self.cfg.on.get(idx), Some(Sel::Need(_))) {
+                    self.need.warm(off, &subject, &body);
+                }
+            }
             Notice::Record(idx, off, subject, body) => {
                 let Some(sel) = self.cfg.on.get(idx).cloned() else {
                     return Ok(());
                 };
+                if matches!(sel, Sel::Need(_)) {
+                    self.need_fresh = false;
+                }
                 let log = self.reader_log[idx].clone();
                 self.scope_to(&log)?;
                 let waits = self.wait_durable
@@ -1142,7 +1322,22 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                 }
                 backoff.attached(Instant::now());
                 let mut closed = false;
-                loop {
+                if matches!(sel, Sel::Need(_)) {
+                    let mut gone = false;
+                    let warmed =
+                        crate::notify_need::warm(&mut conn, &cfg.fleet, from, |off, s, b| {
+                            gone = tx.send(Notice::Warm(idx, off, s, b)).is_err();
+                            !gone
+                        });
+                    if gone {
+                        return;
+                    }
+                    if let Err(e) = warmed {
+                        eprintln!("aterm-link notify: {} warm-up ended: {e}", sel.label());
+                        closed = true;
+                    }
+                }
+                while !closed {
                     let (rows, (next, head)) =
                         match transport::fetch_kept(&mut conn, from, &filter, PAGE) {
                             Ok((page, floor)) => {
@@ -1314,7 +1509,8 @@ const USAGE: &str = "\
 aterm link notify — run a command when the fabric needs a human
 
   aterm link notify --fleet <F> --broker <socket> [--cap-file <path>...]
-                    --on <attention|ask:<person>|halt>,... --exec <cmd> [options]
+                    --on <attention|ask:<person>|halt|need[:<word>]>,... --exec <cmd>
+                    [options]
 
   --on <sel>,...         what to watch (repeatable):
                          - `attention`: a presence row raising `attention=` (node.cap,
@@ -1322,8 +1518,15 @@ aterm link notify — run a command when the fabric needs a human
                          - `ask:<person>`: an ask addressed to <person> (that person's own
                            cap, from `aterm fabric mint-for <person>`)
                          - `halt`: a fleet halt coming on (node.cap)
+                         - `need`, `need:<word>`: a session's need, as `aterm fabric brief`
+                           folds it from the session log on the bus, rising to any word or
+                           to <word> (the words are below; it reads `ro:/f/<F>/pub/>`, which
+                           node.cap and a person's cap hold, the caps `fabric brief` reads
+                           under)
   --exec <cmd>           run `/bin/sh -c <cmd>` per record, its facts in `$ATERM_NOTIFY_*`
-                         (FLEET ON OFFSET SUBJECT NODE WHO SID TEXT DUP SUPPRESSED)
+                         (FLEET ON OFFSET SUBJECT NODE WHO SID TEXT NEED DETAIL DUP
+                         SUPPRESSED; a need's NEED is its word and DETAIL what the brief
+                         shows beside it, a wall's reset or a failure's exit code)
   --rate <n>/<window>    at most <n> runs per window, e.g. `10/1m`, `1/30s`, `40/1h`
                          (default `10/1m`); a record over it is dropped and counted in the
                          next command's `$ATERM_NOTIFY_SUPPRESSED`
@@ -1332,26 +1535,49 @@ aterm link notify — run a command when the fabric needs a human
   --exec-timeout <ms>    SIGKILL a command still running after this (default `30000`)
   --state <dir>          state dir (`<dir>/notify/` holds cursors and the journal)
 
-Dedups across restarts by offset, and `attention` by each subject's standing value
-(clearing it and raising it again pages again); a crash mid-`--exec` runs it again with
-`ATERM_NOTIFY_DUP=1`. On an `ordered` broker a record waits until it is durable; `--once`
-leaves one not yet durable for the next run. Prints `notify: fired= dup= skipped=
-dropped= suppressed= standing=` on exit. Exits 2 on a usage error, an unreadable
---cap-file, or a broker that refuses the cap files or a selector's read (no --cap-file
-grants it); 1 when the state dir cannot open or the run fails.
+Dedups across restarts by offset, and `attention` and `need` by each subject's standing
+value (clearing it and raising it again pages again; a need that moves to another word
+rose); a crash mid-`--exec` runs it again with `ATERM_NOTIFY_DUP=1`. A `need` folds the
+records below its cursor, up to `fabric brief`'s window, before it pages. A session gone
+before its close reached the bus (its own row says it exited, or its node's says gone)
+has no need; a session's close raises `exited`, which pages once, whether the close or the
+exited row reached the bus first. A session whose fold is partial (the brief's `partial`:
+no start, lost records, or a snapshot short of its needs) pages nothing and clears nothing
+until a snapshot seeds it. On an `ordered` broker a record waits until it is durable;
+`--once` leaves one not yet durable for the next run. Prints
+`notify: fired= dup= skipped= dropped= suppressed= standing=` on exit. Exits 2 on a usage
+error, an unreadable --cap-file, or a broker that refuses the cap files or a selector's
+read (no --cap-file grants it); 1 when the state dir cannot open or the run fails.
 ";
+
+/// `aterm link notify --help`: [`USAGE`], then the need words `need:<word>` takes, read from
+/// the session log's own list ([`NEED_WORDS`]).
+#[must_use]
+pub fn usage() -> String {
+    format!(
+        "{USAGE}\nNeed words (`need:<word>`, the session log's own list):\n{}\n",
+        need_words()
+    )
+}
+
+/// The need words as [`usage`] lists them: [`NEED_WORDS`], in its order, filled to the help's
+/// width.
+fn need_words() -> String {
+    let words: Vec<String> = NEED_WORDS.iter().map(|w| (*w).to_string()).collect();
+    crate::render::fill(&words, 2, 90)
+}
 
 /// `aterm-link notify`.
 #[must_use]
 pub fn main(args: &[String]) -> ExitCode {
     if crate::cli::asks_help(args) {
-        return aterm_uds::stdout::answer_exit("aterm link notify", USAGE, 0);
+        return aterm_uds::stdout::answer_exit("aterm link notify", &usage(), 0);
     }
     let cfg = match parse(args) {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("aterm link notify: {e}");
-            eprint!("{USAGE}");
+            eprint!("{}", usage());
             return ExitCode::from(2);
         }
     };
@@ -1417,7 +1643,7 @@ fn parse(args: &[String]) -> Result<Config, String> {
             "--on" => {
                 for word in value()?.split(',').filter(|w| !w.is_empty()) {
                     let sel = Sel::parse(word)?;
-                    if !cfg.on.contains(&sel) {
+                    if !cfg.on.contains(&sel) && !cfg.on.iter_mut().any(|on| on.merge(&sel)) {
                         cfg.on.push(sel);
                     }
                 }
@@ -2522,7 +2748,7 @@ mod tests {
         what: &str,
         done: impl Fn(&Notifier) -> bool,
     ) -> &'static str {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let mut last = "none";
         while !done(n) {
             assert!(Instant::now() < deadline, "{what}: never happened");
@@ -2530,6 +2756,7 @@ mod tests {
                 Ok(notice) => {
                     last = match notice {
                         Notice::Record(..) => "record",
+                        Notice::Warm(..) => "warm",
                         Notice::Checkpoint(..) => "checkpoint",
                         Notice::Log(..) => "log",
                         Notice::Durable(..) => "durable",
@@ -2622,11 +2849,11 @@ mod tests {
                 b"v=1 t=1 attention=disk",
             )
             .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while !follower.is_finished() {
-                assert!(Instant::now() < deadline, "the reader never ended");
-                std::thread::yield_now();
-            }
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the reader ends",
+                || follower.is_finished().then_some(()),
+            );
             follower.join().expect("the reader");
             drop(conn);
             server.shutdown();
@@ -2665,6 +2892,717 @@ mod tests {
         for bad in ["ask:../../etc", "ask:", "ask:H-Andrew", "wake", "ask"] {
             assert!(Sel::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// The bodies a session log's mirror lands on the bus, take by take, as the bridge takes
+    /// them ([`aterm_slog::Log::bus_copy`]).
+    fn mirrored(log: &mut aterm_slog::Log) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            let take = log
+                .bus_copy(64, aterm_slog::Stamp::new(9, 9))
+                .encode(aterm_slog::Tier::Wire, &|_| None);
+            if take.slots.is_empty() {
+                return out;
+            }
+            out.extend(take.slots.iter().map(|s| s.body.clone()));
+            log.land(take.slots.last().expect("a slot").at)
+                .expect("lands");
+            if !take.more {
+                return out;
+            }
+        }
+    }
+
+    /// A session log that a test drives through needs: `failure` from a shell command's
+    /// failed run, lifted by the next one of its kind, and `question` from a step.
+    struct Needs {
+        log: aterm_slog::Log,
+        ms: u64,
+    }
+
+    impl Needs {
+        fn open() -> Self {
+            let mut log = aterm_slog::Log::new(1);
+            log.open_session(
+                aterm_slog::Kind::Spawn,
+                aterm_slog::Src::Aterm,
+                aterm_slog::Conf::Exact,
+                aterm_slog::Actor::Aterm,
+                aterm_slog::Fields::new(),
+                aterm_slog::Stamp::new(1_760_000_000_000, 0),
+            )
+            .expect("opens");
+            Self { log, ms: 0 }
+        }
+
+        fn at(&mut self) -> aterm_slog::Stamp {
+            self.ms += 1;
+            aterm_slog::Stamp::new(1_760_000_000_000 + self.ms, self.ms)
+        }
+
+        fn cmd_open(&mut self) -> aterm_slog::Node {
+            let at = self.at();
+            self.log
+                .open(
+                    aterm_slog::Open::new(
+                        aterm_slog::Kind::Cmd,
+                        aterm_slog::Src::Shell,
+                        aterm_slog::Conf::Strong,
+                    ),
+                    at,
+                )
+                .expect("a command")
+        }
+
+        fn cmd_close(&mut self, cmd: aterm_slog::Node, out: aterm_slog::RunOut) {
+            let at = self.at();
+            self.log
+                .close(
+                    cmd,
+                    aterm_slog::Close::new(
+                        aterm_slog::Out::Run(out),
+                        aterm_slog::Src::Shell,
+                        aterm_slog::Conf::Exact,
+                    ),
+                    at,
+                )
+                .expect("closes");
+        }
+
+        fn question(&mut self) {
+            let at = self.at();
+            let run = self
+                .log
+                .open(
+                    aterm_slog::Open::new(
+                        aterm_slog::Kind::Agent,
+                        aterm_slog::Src::Status,
+                        aterm_slog::Conf::Strong,
+                    ),
+                    at,
+                )
+                .expect("an agent run");
+            let at = self.at();
+            let turn = self
+                .log
+                .open(
+                    aterm_slog::Open::new(
+                        aterm_slog::Kind::Turn,
+                        aterm_slog::Src::Screen,
+                        aterm_slog::Conf::Strong,
+                    )
+                    .under(run),
+                    at,
+                )
+                .expect("a turn");
+            let at = self.at();
+            self.log
+                .open(
+                    aterm_slog::Open::new(
+                        aterm_slog::Kind::Question,
+                        aterm_slog::Src::Screen,
+                        aterm_slog::Conf::Strong,
+                    )
+                    .under(turn),
+                    at,
+                )
+                .expect("a question");
+        }
+
+        /// A mark that moves no need (a handoff naming no epoch).
+        fn quiet(&mut self) {
+            let at = self.at();
+            self.log
+                .mark(
+                    aterm_slog::Mark::new(
+                        aterm_slog::Kind::Handoff,
+                        aterm_slog::Src::Aterm,
+                        aterm_slog::Conf::Exact,
+                    )
+                    .at(aterm_slog::Node::SESSION)
+                    .by(aterm_slog::Actor::Aterm),
+                    at,
+                )
+                .expect("a handoff mark");
+        }
+
+        /// The session's close (its shell exited), which raises `exited` and drops every other
+        /// need.
+        fn exit(&mut self) {
+            let at = self.at();
+            self.log
+                .close_session(
+                    aterm_slog::Close::new(
+                        aterm_slog::Out::Session(aterm_slog::SessionOut::ShellExit),
+                        aterm_slog::Src::Shell,
+                        aterm_slog::Conf::Exact,
+                    ),
+                    at,
+                )
+                .expect("closes");
+        }
+
+        fn bodies(&mut self) -> Vec<String> {
+            mirrored(&mut self.log)
+        }
+    }
+
+    const NEED_FACE: &str = "/f/f1/pub/n-a/s-x/ev";
+
+    #[cfg(unix)]
+    #[test]
+    fn a_need_pages_once_per_rise_and_a_restart_pages_nothing_again() {
+        let dir = scratch("need");
+        let base = PathBuf::from(&dir);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let broker = crate::test_broker(base.join("n.log")).unwrap();
+        let sock = base.join("n.sock");
+        let mut server = broker.serve(&sock).unwrap();
+        let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
+        let mut seq = 0;
+        let mut publish = |bodies: Vec<String>| -> Vec<(u64, String)> {
+            bodies
+                .into_iter()
+                .map(|b| {
+                    seq += 1;
+                    let off = conn.publish(7, seq, NEED_FACE, b.as_bytes()).unwrap().0;
+                    (off, b)
+                })
+                .collect()
+        };
+        let mut s = Needs::open();
+        let first = s.cmd_open();
+        s.cmd_close(first, aterm_slog::RunOut::Fail);
+        let rise = publish(s.bodies());
+        let second = s.cmd_open();
+        let standing = publish(s.bodies());
+        s.cmd_close(second, aterm_slog::RunOut::Ok);
+        let clear = publish(s.bodies());
+        let third = s.cmd_open();
+        s.cmd_close(third, aterm_slog::RunOut::Fail);
+        let again = publish(s.bodies());
+        s.question();
+        let moved = publish(s.bodies());
+        let fail_close = |page: &[(u64, String)]| {
+            page.iter()
+                .find(|(_, b)| b.contains(" op=close ") && b.contains("out=fail"))
+                .map(|(off, _)| *off)
+                .expect("the failed run's close")
+        };
+        let (rose, rose_again) = (fail_close(&rise), fail_close(&again));
+        let asked = moved
+            .iter()
+            .find(|(_, b)| b.contains(" op=open ") && b.contains("k=question"))
+            .map(|(off, _)| *off)
+            .expect("the question's open");
+        assert!(
+            !standing.is_empty() && !clear.is_empty(),
+            "a repeat and a clear on the bus"
+        );
+
+        let run = |tag: &str, on: Sel| -> Vec<String> {
+            let state = base.join(tag);
+            let fired = base.join(format!("{tag}.fired"));
+            let mut c = cfg(&state.to_string_lossy());
+            c.broker = sock.to_string_lossy().into_owned();
+            c.since = Since::Start;
+            c.limit = 100;
+            c.on = vec![on];
+            c.exec = format!(
+                "printf '%s %s %s %s %s\\n' \"$ATERM_NOTIFY_OFFSET\" \"$ATERM_NOTIFY_ON\" \
+                 \"$ATERM_NOTIFY_NEED\" \"$ATERM_NOTIFY_SID\" \"$ATERM_NOTIFY_NODE\" >> {}",
+                fired.display()
+            );
+            Notifier::new(c)
+                .expect("open")
+                .catch_up()
+                .expect("catch up");
+            std::fs::read_to_string(&fired)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let line = |off: u64, word: &str| format!("{off} need {word} s-x n-a");
+        let failure = Sel::Need(Some(vec!["failure"]));
+        assert_eq!(
+            run("failure", failure.clone()),
+            [line(rose, "failure"), line(rose_again, "failure")],
+            "need:failure pages each rise to failure once"
+        );
+        assert_eq!(
+            run("any", Sel::Need(None)),
+            [
+                line(rose, "failure"),
+                line(rose_again, "failure"),
+                line(asked, "question")
+            ],
+            "need pages each rise, to any word"
+        );
+
+        for _ in 0..=aterm_slog::SNAP_EVERY {
+            s.quiet();
+        }
+        let after = publish(s.bodies());
+        assert!(
+            after.iter().any(|(_, b)| b.contains(" op=snap ")),
+            "a snapshot of the standing needs reaches the bus after the restart"
+        );
+        assert_eq!(
+            run("failure", failure).len(),
+            2,
+            "a restart pages nothing again"
+        );
+        assert_eq!(
+            run("any", Sel::Need(None)).len(),
+            3,
+            "nor for a need standing through the restart and a snapshot"
+        );
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_following_need_reader_folds_below_its_cursor_before_it_judges() {
+        let dir = scratch("need-follow");
+        let base = PathBuf::from(&dir);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let broker = crate::test_broker(base.join("f.log")).unwrap();
+        let sock = base.join("f.sock");
+        let mut server = broker.serve(&sock).unwrap();
+        let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
+        let mut seq = 0;
+        let mut publish = |conn: &mut Conn, face: &str, bodies: Vec<String>| -> Option<u64> {
+            let mut rose = None;
+            for b in bodies {
+                seq += 1;
+                let off = conn.publish(7, seq, face, b.as_bytes()).unwrap().0;
+                if b.contains(" op=close ") && b.contains("out=fail") {
+                    rose = Some(off);
+                }
+            }
+            rose
+        };
+        let failing = |s: &mut Needs| {
+            let cmd = s.cmd_open();
+            s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+            s.bodies()
+        };
+        let mut x = Needs::open();
+        let rose = publish(&mut conn, NEED_FACE, failing(&mut x)).expect("a rise");
+        let fired = base.join("fired");
+        let mut c = cfg(&dir);
+        c.broker = sock.to_string_lossy().into_owned();
+        c.since = Since::Start;
+        c.limit = 10;
+        c.on = vec![Sel::Need(None)];
+        c.exec = format!(
+            "printf '%s\\n' \"$ATERM_NOTIFY_OFFSET\" >> {}",
+            fired.display()
+        );
+        Notifier::new(c.clone())
+            .expect("open")
+            .catch_up()
+            .expect("catch up");
+        assert_eq!(fired_offsets(&fired), [rose]);
+
+        c.once = false;
+        let mut n = Notifier::new(c.clone()).expect("reopen");
+        let (tx, rx) = notice_handoff();
+        let follower = {
+            let root = n.store.root.clone();
+            std::thread::spawn(move || reader(0, &Sel::Need(None), &c, &root, &tx))
+        };
+        pump(&mut n, &rx, "the reader's subscription", |_| {
+            broker.stats().parked_tails == 1
+        });
+        for _ in 0..=aterm_slog::SNAP_EVERY {
+            x.quiet();
+        }
+        let quiet = x.bodies();
+        assert!(quiet.iter().any(|b| b.contains(" op=snap ")), "a snapshot");
+        publish(&mut conn, NEED_FACE, quiet);
+        let mut y = Needs::open();
+        let other = publish(&mut conn, "/f/f1/pub/n-a/s-y/ev", failing(&mut y)).expect("a rise");
+        pump(&mut n, &rx, "the other session's page", |_| {
+            fired_offsets(&fired).contains(&other)
+        });
+        assert_eq!(
+            fired_offsets(&fired),
+            [rose, other],
+            "the standing failure, reseeded by a snapshot past the cursor, pages nothing again"
+        );
+        drop(rx);
+        publish(&mut conn, NEED_FACE, {
+            x.quiet();
+            x.bodies()
+        });
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the reader ends", || {
+            follower.is_finished().then_some(())
+        });
+        follower.join().expect("the reader");
+        drop(conn);
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_gone_session_clears_its_standing_need_and_a_relaunch_does_not() {
+        let dir = scratch("need-gone");
+        let (mut n, fired) = appending(&dir, 100, "");
+        n.cfg.on = vec![Sel::Need(None)];
+        let sel = Sel::Need(None);
+        let mut off = 0;
+        let mut feed = |n: &mut Notifier, subject: &str, body: &[u8]| {
+            off += 1;
+            n.on_record(&sel, off, subject, body).expect("on_record");
+            off
+        };
+        let faces = ["s-x", "s-y"].map(|sid| format!("/f/f1/pub/n-a/{sid}/ev"));
+        let mut rises = Vec::new();
+        for face in &faces {
+            let mut s = Needs::open();
+            let cmd = s.cmd_open();
+            s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+            for b in s.bodies() {
+                let at = feed(&mut n, face, b.as_bytes());
+                if b.contains("out=fail") {
+                    rises.push(at);
+                }
+            }
+        }
+        assert_eq!(fired_offsets(&fired), rises, "each session's failure pages");
+        let standing = |n: &Notifier| faces.clone().map(|f| n.standing_of(&f).map(str::to_string));
+        let both = [Some("failure".to_string()), Some("failure".to_string())];
+        assert_eq!(standing(&n), both);
+
+        feed(
+            &mut n,
+            "/f/f1/pub/n-a/node/presence",
+            b"v=1 t=1 state=live inc=2",
+        );
+        feed(
+            &mut n,
+            "/f/f1/pub/n-a/s-x/presence",
+            b"v=1 t=1 inc=1 state=live",
+        );
+        assert_eq!(
+            standing(&n),
+            both,
+            "a relaunch whose bridge has not republished the session is not its end"
+        );
+        feed(
+            &mut n,
+            "/f/f1/pub/n-a/s-x/presence",
+            b"v=1 t=2 inc=2 state=exited",
+        );
+        assert_eq!(
+            standing(&n),
+            [None, Some("failure".to_string())],
+            "an exited session's need clears"
+        );
+        feed(
+            &mut n,
+            "/f/f1/pub/n-a/node/presence",
+            b"v=1 t=3 state=gone inc=2",
+        );
+        assert_eq!(
+            standing(&n),
+            [None, None],
+            "so does a gone node's sessions'"
+        );
+        assert_eq!(fired_offsets(&fired), rises, "and nothing pages for it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_need_standing_since_before_the_warm_window_pages_nothing_again_after_a_restart() {
+        let dir = scratch("need-window");
+        let base = PathBuf::from(&dir);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let broker = crate::test_broker(base.join("w.log")).unwrap();
+        let sock = base.join("w.sock");
+        let mut server = broker.serve(&sock).unwrap();
+        let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
+        let mut seq = 0;
+        let mut publish = |conn: &mut Conn, subject: &str, body: &[u8]| -> u64 {
+            seq += 1;
+            conn.publish(7, seq, subject, body).unwrap().0
+        };
+        let mut s = Needs::open();
+        let cmd = s.cmd_open();
+        s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+        let mut rose = None;
+        for b in s.bodies() {
+            let off = publish(&mut conn, NEED_FACE, b.as_bytes());
+            if b.contains("out=fail") {
+                rose = Some(off);
+            }
+        }
+        let rose = rose.expect("the failed run's close");
+        for _ in 0..crate::notify_need::WARM_WINDOW + 10 {
+            publish(&mut conn, "/f/f1/pub/n-a/s-z/filler", b"v=1 t=1");
+        }
+        let state = base.join("state");
+        let fired = base.join("fired");
+        let run = || {
+            let mut c = cfg(&state.to_string_lossy());
+            c.broker = sock.to_string_lossy().into_owned();
+            c.since = Since::Start;
+            c.limit = 100;
+            c.on = vec![Sel::Need(None)];
+            c.exec = format!(
+                "printf '%s\\n' \"$ATERM_NOTIFY_OFFSET\" >> {}",
+                fired.display()
+            );
+            let mut n = Notifier::new(c).expect("open");
+            n.catch_up().expect("catch up");
+            fired_offsets(&fired)
+        };
+        assert_eq!(run(), [rose], "the rise pages once");
+
+        s.quiet();
+        let partial = s.bodies();
+        assert!(
+            partial.iter().all(|b| !b.contains(" op=snap ")),
+            "PRECONDITION: a record the restarted watch folds from no start"
+        );
+        for b in partial {
+            publish(&mut conn, NEED_FACE, b.as_bytes());
+        }
+        assert_eq!(
+            run(),
+            [rose],
+            "a partial fold past the warm window clears nothing"
+        );
+        for _ in 0..=aterm_slog::SNAP_EVERY {
+            s.quiet();
+        }
+        let reseeded = s.bodies();
+        assert!(
+            reseeded.iter().any(|b| b.contains(" op=snap ")),
+            "PRECONDITION: a snapshot reseeds the standing failure"
+        );
+        for b in reseeded {
+            publish(&mut conn, NEED_FACE, b.as_bytes());
+        }
+        assert_eq!(
+            run(),
+            [rose],
+            "the snapshot's need was standing: nothing pages again"
+        );
+        let cmd = s.cmd_open();
+        s.cmd_close(cmd, aterm_slog::RunOut::Ok);
+        s.question();
+        let mut asked = None;
+        for b in s.bodies() {
+            let off = publish(&mut conn, NEED_FACE, b.as_bytes());
+            if b.contains("k=question") {
+                asked = Some(off);
+            }
+        }
+        assert_eq!(
+            run(),
+            [rose, asked.expect("the question's open")],
+            "the seeded fold judges again: the next rise pages"
+        );
+        drop(conn);
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sessions_exit_pages_once_whichever_of_its_close_and_its_row_comes_first() {
+        let presence = "/f/f1/pub/n-a/s-x/presence";
+        let exited: &[u8] = b"v=1 t=2 inc=1 state=exited";
+        let mut s = Needs::open();
+        let cmd = s.cmd_open();
+        s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+        let failing = s.bodies();
+        s.exit();
+        let closing = s.bodies();
+        assert!(
+            closing.iter().any(|b| b.contains(" op=close node=- ")),
+            "PRECONDITION: the session's close: {closing:?}"
+        );
+        for (tag, sel) in [
+            ("exited", Sel::Need(Some(vec!["exited"]))),
+            ("any", Sel::Need(None)),
+        ] {
+            for close_first in [true, false] {
+                let dir = scratch(&format!("need-exit-{tag}-{close_first}"));
+                let (mut n, fired) = appending(&dir, 100, "");
+                n.cfg.on = vec![sel.clone()];
+                let mut off = 0;
+                let mut feed = |n: &mut Notifier, subject: &str, body: &[u8]| {
+                    off += 1;
+                    n.on_record(&sel, off, subject, body).expect("on_record");
+                    off
+                };
+                let mut want = Vec::new();
+                for b in &failing {
+                    let at = feed(&mut n, NEED_FACE, b.as_bytes());
+                    if b.contains("out=fail") && tag == "any" {
+                        want.push(at);
+                    }
+                }
+                if !close_first {
+                    feed(&mut n, presence, exited);
+                }
+                for b in &closing {
+                    let at = feed(&mut n, NEED_FACE, b.as_bytes());
+                    if b.contains(" op=close node=- ") {
+                        want.push(at);
+                    }
+                }
+                if close_first {
+                    feed(&mut n, presence, exited);
+                }
+                feed(
+                    &mut n,
+                    "/f/f1/pub/n-a/node/presence",
+                    b"v=1 t=3 state=gone inc=1",
+                );
+                assert_eq!(
+                    fired_offsets(&fired),
+                    want,
+                    "{tag}, close first {close_first}: the exit pages once, at the close"
+                );
+                assert_eq!(
+                    n.standing_of(NEED_FACE),
+                    Some("exited"),
+                    "{tag}, close first {close_first}: and stands"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
+    #[test]
+    fn a_record_held_for_durability_is_judged_before_a_reconnects_warm_up_folds_it() {
+        let log = ReadLog {
+            id: Some(astream_broker::LogIdentity {
+                id: [7; 16],
+                generation: 0,
+            }),
+            lineage: None,
+            ordered: true,
+        };
+        let mut s = Needs::open();
+        let cmd = s.cmd_open();
+        s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+        let cmd = s.cmd_open();
+        s.cmd_close(cmd, aterm_slog::RunOut::Ok);
+        let records: Vec<(u64, String)> = (1..).zip(s.bodies()).collect();
+        let rose = records
+            .iter()
+            .find(|(_, b)| b.contains("out=fail"))
+            .map(|(off, _)| *off)
+            .expect("the failed run's close");
+        assert!(
+            records
+                .iter()
+                .any(|(off, b)| *off > rose && b.contains("out=ok")),
+            "PRECONDITION: the run that lifts it comes after"
+        );
+        let dir = scratch("need-held");
+        let (mut n, fired) = appending(&dir, 100, "");
+        n.cfg.on = vec![Sel::Need(None)];
+        let mut notices = vec![Notice::Log(0, log.clone())];
+        for (off, b) in &records {
+            notices.push(Notice::Record(
+                0,
+                *off,
+                NEED_FACE.into(),
+                b.clone().into_bytes(),
+            ));
+        }
+        notices.push(Notice::Log(0, log));
+        for (off, b) in &records {
+            notices.push(Notice::Warm(
+                0,
+                *off,
+                NEED_FACE.into(),
+                b.clone().into_bytes(),
+            ));
+        }
+        for notice in notices {
+            n.take(notice).expect("take");
+        }
+        assert!(fired_offsets(&fired).is_empty(), "held, not paged");
+        n.take(Notice::Durable(0, u64::MAX)).expect("durable");
+        assert_eq!(
+            fired_offsets(&fired),
+            [rose],
+            "the held failure is judged by the fold as it stood at its own record"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn need_selectors_take_the_logs_own_words_and_refuse_any_other() {
+        assert_eq!(Sel::parse("need"), Ok(Sel::Need(None)));
+        for w in NEED_WORDS {
+            assert_eq!(
+                Sel::parse(&format!("need:{w}")),
+                Ok(Sel::Need(Some(vec![*w]))),
+                "{w}"
+            );
+        }
+        for bad in [
+            "need:nope",
+            "need:",
+            "need:FAILURE",
+            "need: failure",
+            "need:approval:",
+            "needs",
+        ] {
+            let e = Sel::parse(bad).expect_err(bad);
+            if let Some(word) = bad.strip_prefix("need:") {
+                assert!(e.starts_with(&format!("--on need:{word}: ")), "{e}");
+                for w in NEED_WORDS {
+                    assert!(
+                        e.split(['(', ' ', ')']).any(|t| t == *w),
+                        "{bad}: the error names {w}: {e}"
+                    );
+                }
+            }
+        }
+        let args = |s: &str| -> Vec<String> { s.split(' ').map(str::to_string).collect() };
+        let base = "--fleet f1 --broker /tmp/b.sock --state /tmp/x --exec true";
+        let on = |rest: &str| parse(&args(&format!("{base} {rest}"))).expect("parse").on;
+        assert_eq!(
+            on("--on need:failure,attention,need:question,need:failure"),
+            [Sel::Need(Some(vec!["failure", "question"])), Sel::Attention],
+            "one need selector, its words in first-seen order"
+        );
+        assert_eq!(
+            on("--on need:failure --on need"),
+            [Sel::Need(None)],
+            "a bare need takes every word"
+        );
+        assert_eq!(on("--on need,need:failure"), [Sel::Need(None)]);
+        assert_eq!(Sel::Need(None).key(), "need");
+        assert_eq!(Sel::Need(None).filter("f1"), "/f/f1/pub/*/*/*");
+    }
+
+    #[test]
+    fn the_help_names_exactly_the_need_words_the_log_folds() {
+        let help = usage();
+        let list = need_words();
+        assert_eq!(
+            list.split_whitespace().collect::<Vec<_>>(),
+            NEED_WORDS,
+            "the list is the log's need words, in its order"
+        );
+        assert!(
+            help.contains(&format!("\n{list}\n")),
+            "the help prints that list whole: {help}"
+        );
+        assert!(help.contains("need[:<word>]"), "{help}");
     }
 
     #[test]

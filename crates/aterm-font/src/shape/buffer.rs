@@ -99,7 +99,15 @@ pub(crate) mod glyph_props {
 
 pub(crate) const SCRATCH_HAS_NON_ASCII: u32 = 0x0000_0001;
 pub(crate) const SCRATCH_HAS_DEFAULT_IGNORABLES: u32 = 0x0000_0002;
+pub(crate) const SCRATCH_HAS_GPOS_ATTACHMENT: u32 = 0x0000_0008;
 pub(crate) const SCRATCH_HAS_CGJ: u32 = 0x0000_0010;
+
+/// Transient `GPOS` mark or cursive attachment link on one buffer slot.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct Attachment {
+    pub(crate) chain: i16,
+    pub(crate) kind: u8,
+}
 
 pub(crate) struct Buffer {
     pub(crate) direction: Direction,
@@ -117,6 +125,7 @@ pub(crate) struct Buffer {
 
     pub(crate) info: Vec<GlyphInfo>,
     pub(crate) pos: Vec<GlyphPosition>,
+    pub(crate) attach: Vec<Attachment>,
     /// The out buffer while it cannot share `info` (upstream reuses `pos`).
     out: Vec<GlyphInfo>,
 
@@ -148,6 +157,7 @@ impl Buffer {
             out_len: 0,
             info: Vec::new(),
             pos: Vec::new(),
+            attach: Vec::new(),
             out: Vec::new(),
             serial: 0,
             scratch_flags: 0,
@@ -166,6 +176,7 @@ impl Buffer {
         self.idx = 0;
         self.info.clear();
         self.pos.clear();
+        self.attach.clear();
         self.out.clear();
         self.len = 0;
         self.out_len = 0;
@@ -273,6 +284,7 @@ impl Buffer {
         self.info[start..end].reverse();
         if self.have_positions {
             self.pos[start..end].reverse();
+            self.attach[start..end].reverse();
         }
     }
 
@@ -373,6 +385,9 @@ impl Buffer {
         self.have_separate_output = false;
         for pos in &mut self.pos {
             *pos = GlyphPosition::default();
+        }
+        for attach in &mut self.attach {
+            *attach = Attachment::default();
         }
     }
 
@@ -561,6 +576,7 @@ impl Buffer {
             if j != i {
                 self.info[j] = self.info[i];
                 self.pos[j] = self.pos[i];
+                self.attach[j] = self.attach[i];
             }
             j += 1;
         }
@@ -620,6 +636,9 @@ impl Buffer {
         }
         if self.pos.len() < size {
             self.pos.resize(size, GlyphPosition::default());
+        }
+        if self.attach.len() < size {
+            self.attach.resize(size, Attachment::default());
         }
         if self.out.len() < size {
             self.out.resize(size, GlyphInfo::default());

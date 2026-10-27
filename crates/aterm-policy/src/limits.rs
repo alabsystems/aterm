@@ -17,6 +17,15 @@ pub trait TimeSource {
     fn now(&self) -> Instant;
 }
 
+/// Point-in-time balance and refill anchor of one [`TokenBucket`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BucketSnapshot {
+    /// Current token balance (`0.0..=capacity_bytes as f64`).
+    pub tokens: f64,
+    /// Last refill instant, or `None` before the bucket's first debit.
+    pub last_refill: Option<Instant>,
+}
+
 /// Token-bucket state for one named [`RateLimit`] entry.
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
@@ -108,6 +117,35 @@ impl TokenBucket {
         self.last_refill = Some(now);
     }
 
+    /// Capture this bucket's live balance and refill anchor.
+    #[must_use]
+    #[inline]
+    pub const fn snapshot(&self) -> BucketSnapshot {
+        BucketSnapshot {
+            tokens: self.tokens,
+            last_refill: self.last_refill,
+        }
+    }
+
+    /// Restore a previously captured balance and refill anchor, clamping `tokens` into `0.0..=capacity_bytes`.
+    #[inline]
+    pub fn restore_snapshot(&mut self, snap: BucketSnapshot) {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "capacity is bytes-scale; f64 precision sufficient for any realistic cap"
+        )]
+        let cap = self.capacity_bytes as f64;
+        self.tokens = if snap.tokens.is_finite() {
+            snap.tokens.clamp(0.0, cap)
+        } else {
+            0.0
+        };
+        if self.tokens == 0.0 {
+            self.tokens = 0.0;
+        }
+        self.last_refill = snap.last_refill;
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn capacity_bytes(&self) -> u64 {
@@ -193,6 +231,25 @@ impl RateLimiterSet {
             Some(bucket) => bucket.try_consume(amount, clock),
             None => true,
         }
+    }
+
+    /// Snapshot every declared bucket in first-declaration order.
+    #[must_use]
+    pub fn snapshots(&self) -> Vec<BucketSnapshot> {
+        self.buckets.iter().map(TokenBucket::snapshot).collect()
+    }
+
+    /// Restore bucket snapshots in first-declaration order.
+    pub fn restore_snapshots(&mut self, snaps: &[BucketSnapshot]) {
+        for (bucket, &snap) in self.buckets.iter_mut().zip(snaps.iter()) {
+            bucket.restore_snapshot(snap);
+        }
+    }
+
+    /// Return the earliest `last_refill` instant across every declared bucket.
+    #[must_use]
+    pub fn earliest_refill(&self) -> Option<Instant> {
+        self.buckets.iter().filter_map(|b| b.last_refill).min()
     }
 
     #[cfg(test)]

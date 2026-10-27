@@ -311,6 +311,7 @@ struct Grid {
     head: u16,
 }
 
+#[inline]
 const fn admit_geometry(p: &MomentumProfile, geom: &Geom) -> Result<Grid, AdmitRefusal> {
     if geom.cw == 0 {
         return Err(AdmitRefusal::Geometry(GeometryFault::CellWidthZero));
@@ -323,6 +324,7 @@ const fn admit_geometry(p: &MomentumProfile, geom: &Geom) -> Result<Grid, AdmitR
     } else {
         MOMENTUM_ENVELOPE.max_extent_px
     };
+    #[inline]
     const fn fits(origin: u16, cells: usize, cell: usize, limit: u32) -> Option<(u16, u16)> {
         let cells_floor = if cells > 1 { cells } else { 1 };
         let Some(prod) = cells_floor.checked_mul(cell) else {
@@ -382,6 +384,7 @@ const DARK_CALLS_PER_ROW: usize = 2 * HALO_SEGMENTS;
 /// `emit_halo`'s worst case over every amplitude: the
 /// engine's row grid at `s = 1`, eight calls per working row, one quad per
 /// `ch`-band each call's clipped row meets.
+#[inline]
 const fn dark_halo_budget(
     (cr, cc): (u16, u16),
     geom: &Geom,
@@ -486,6 +489,7 @@ const fn dark_halo_budget(
 /// `emit_light_halo`'s worst case over every amplitude: the
 /// slabs that can meet the clip at `s = 1` times the rows a slab can cover,
 /// capped by `ribbon_beam`'s own budget.
+#[inline]
 const fn light_halo_budget(
     (cr, cc): (u16, u16),
     geom: &Geom,

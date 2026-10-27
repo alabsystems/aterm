@@ -9,13 +9,17 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::classify;
+use crate::config::Dirs;
 use crate::error::{Error, HttpRef, IdentityRef, Kind, Result, Sub, Tried};
-use crate::fx::Fx;
-use crate::github::repo_root;
+use crate::fx::{Fx, Mode};
+use crate::git::{GitOut, GitRun, HelperCommand};
+use crate::github::{How, repo_root};
 use crate::identity::{self, Credential, EnvSource, LoadError, ProcessEnv, TokenKind};
+use crate::journal::{IntentDraft, IntentStore, Journal};
+use crate::notify::{NoNotifier, Notifier};
 use crate::policy::{
-    Access, AnonymousWhy, Decision, Presence, Refusal, RefusalCode, RouteRequest, RouteTarget,
-    Router,
+    Access, AnonymousWhy, Decision, Permit, Presence, Refusal, RefusalCode, RouteRequest,
+    RouteTarget, Router,
 };
 use crate::rate::{RateBook, RateSnapshot, book_key, resource_for};
 use crate::redact::Redactor;
@@ -27,6 +31,7 @@ use crate::wire::{
     Deadlines, Endpoints, Method, Origin, OriginRole, Transport, WireBody, WireError, WireRequest,
     WireResponse, header_in, hop, path_only,
 };
+use crate::write::{Outcome, WriteOp};
 
 /// The Accept header.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +61,26 @@ impl Accept {
             Accept::Media(media) => media,
         }
     }
+}
+
+/// A write's body. A file body is reopened for every attempt, so a retried upload re-reads
+/// its bytes from the start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CallBody {
+    /// No body.
+    Empty,
+    /// Compact JSON, `Content-Type: application/json`.
+    Json(Vec<u8>),
+    /// The file at `path`, exactly `len` bytes, with `content_type`.
+    File {
+        /// The file.
+        path: std::path::PathBuf,
+        /// Its length, which the send checks again before it streams.
+        len: u64,
+        /// `Content-Type`.
+        content_type: String,
+    },
 }
 
 const CALL_LIMIT: u64 = 32 << 20;
@@ -94,6 +119,8 @@ pub struct Call {
     pub retry: Option<RetryPolicy>,
     /// Hand back any status as an `Answered`, unclassified, with no retry, probe, move, or hop.
     pub answer_any: bool,
+    /// The write's body (`CallBody::Empty` from `Call::get` and `Call::head`).
+    pub(crate) body: CallBody,
 }
 
 impl Call {
@@ -116,6 +143,7 @@ impl Call {
             hop: false,
             retry: None,
             answer_any: false,
+            body: CallBody::Empty,
         }
     }
 
@@ -123,6 +151,23 @@ impl Call {
     pub fn head(path: impl Into<String>, route: RouteRequest) -> Call {
         Call {
             method: Method::Head,
+            ..Call::get(path, route)
+        }
+    }
+
+    /// A write: `method` (POST, PATCH, PUT or DELETE) to `path`, routed as the permit's write.
+    /// Crate-private, because only a holder of a `Permit` may build one.
+    pub(crate) fn write(
+        method: Method,
+        path: impl Into<String>,
+        route: RouteRequest,
+        idempotency: Idempotency,
+        body: CallBody,
+    ) -> Call {
+        Call {
+            method,
+            idempotency,
+            body,
             ..Call::get(path, route)
         }
     }
@@ -319,6 +364,9 @@ pub struct Meter {
     pub hopped: bool,
     /// Whether a read went anonymous without `--anonymous`.
     pub fell_to_anonymous: bool,
+    /// The last `--notify` post's `Posted::receipt`, which the receipt prints as the note
+    /// `notify={value}`.
+    pub notify: Option<String>,
 }
 
 impl Meter {
@@ -346,6 +394,15 @@ struct Inner {
     /// Each repository's numeric id, by `Slug::key`: the only memo (design §14).
     ids: Mutex<BTreeMap<String, u64>>,
     meter: Mutex<Meter>,
+    /// The directories `GithubBuilder::journal` set: the write journals, grants and needs.
+    dirs: Option<Dirs>,
+    /// Where `How::notify` posts go.
+    notifier: Arc<dyn Notifier>,
+    /// The git helper command `git_helper_for_tests` set.
+    git_helper: Option<HelperCommand>,
+    /// The local repositories `git_remote_for_tests` set, by `Slug::key`.
+    #[cfg(any(test, debug_assertions))]
+    git_remotes: BTreeMap<String, std::path::PathBuf>,
 }
 
 /// The client. A cheap `Clone` over one `Arc`; `Send + Sync`.
@@ -366,6 +423,11 @@ pub struct GithubBuilder {
     retry: RetryPolicy,
     redactor: Redactor,
     backstop: Option<Duration>,
+    dirs: Option<Dirs>,
+    notifier: Arc<dyn Notifier>,
+    git_helper: Option<HelperCommand>,
+    #[cfg(any(test, debug_assertions))]
+    git_remotes: BTreeMap<String, std::path::PathBuf>,
 }
 
 impl GithubBuilder {
@@ -383,6 +445,11 @@ impl GithubBuilder {
             retry: RetryPolicy::STANDARD,
             redactor: Redactor::new(),
             backstop: None,
+            dirs: None,
+            notifier: Arc::new(NoNotifier),
+            git_helper: None,
+            #[cfg(any(test, debug_assertions))]
+            git_remotes: BTreeMap::new(),
         }
     }
 
@@ -449,6 +516,41 @@ impl GithubBuilder {
         self
     }
 
+    /// Where the write journals, grants and need files live: `dirs.journal()`, `dirs.grants()`
+    /// and `dirs.needs()`. Without it a one-shot write is refused, and so is every git run
+    /// that needs a grant: a release-tier run and every `PushDelete`. The runner also hands
+    /// these directories to the git helper.
+    #[must_use]
+    pub fn journal(mut self, dirs: Dirs) -> GithubBuilder {
+        self.dirs = Some(dirs);
+        self
+    }
+
+    /// The notifier for `How::notify` (default `NoNotifier`).
+    #[must_use]
+    pub fn notifier(mut self, notifier: Arc<dyn Notifier>) -> GithubBuilder {
+        self.notifier = notifier;
+        self
+    }
+
+    /// Tests: the git helper command the runner mounts (default `HelperCommand::current()`).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn git_helper_for_tests(mut self, helper: HelperCommand) -> GithubBuilder {
+        self.git_helper = Some(helper);
+        self
+    }
+
+    /// Tests: `slug`'s git URL is the local repository at `path`, and that run alone sets
+    /// `protocol.file.allow=always`.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn git_remote_for_tests(mut self, slug: &str, path: &std::path::Path) -> GithubBuilder {
+        self.git_remotes
+            .insert(slug.to_ascii_lowercase(), path.to_path_buf());
+        self
+    }
+
     /// The client.
     #[must_use]
     pub fn build(self) -> Github {
@@ -472,6 +574,11 @@ impl GithubBuilder {
                 credentials: Mutex::new(BTreeMap::new()),
                 ids: Mutex::new(BTreeMap::new()),
                 meter: Mutex::new(Meter::default()),
+                dirs: self.dirs,
+                notifier: self.notifier,
+                git_helper: self.git_helper,
+                #[cfg(any(test, debug_assertions))]
+                git_remotes: self.git_remotes,
             }),
         }
     }
@@ -662,6 +769,36 @@ impl Github {
             .insert(slug.key(), id);
     }
 
+    /// Count in this client's meter the requests `spent` sent before it was built (vault
+    /// adoption's `GET /user`, design §6.10), so the call's receipt counts them: their number
+    /// is added, and their identity and rate snapshot stand until a request of this client's.
+    pub(crate) fn absorb(&self, spent: &Meter) {
+        if spent.requests == 0 {
+            return;
+        }
+        let mut meter = self.lock_meter();
+        meter.requests = meter.requests.saturating_add(spent.requests);
+        if meter.as_.is_none() {
+            meter.as_.clone_from(&spent.as_);
+        }
+        if meter.rate.is_none() {
+            meter.rate.clone_from(&spent.rate);
+        }
+    }
+
+    /// Send exactly `cred` as its profile (`Credential::profile`) for the rest of this
+    /// client's life, in place of the lazy load of the profile's file: vault adoption judged
+    /// the rows it derived by this token (design §6.10), so a file rewritten since then never
+    /// speaks for them. The redactor learns the token.
+    pub(crate) fn pin(&self, cred: Arc<Credential>) {
+        self.inner.redactor.learn(cred.expose());
+        self.inner
+            .credentials
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(cred.profile().to_string(), Ok(cred));
+    }
+
     /// Clone client configuration over another router with fresh caches and meter.
     #[must_use]
     pub fn with_router(&self, router: Router) -> Github {
@@ -682,8 +819,183 @@ impl Github {
                 credentials: Mutex::new(BTreeMap::new()),
                 ids: Mutex::new(BTreeMap::new()),
                 meter: Mutex::new(Meter::default()),
+                dirs: inner.dirs.clone(),
+                notifier: inner.notifier.clone(),
+                git_helper: inner.git_helper.clone(),
+                #[cfg(any(test, debug_assertions))]
+                git_remotes: inner.git_remotes.clone(),
             }),
         }
+    }
+}
+
+impl Github {
+    /// A write permit for `req`: the decision `Fx::route` gives (live, `self.decide(req)`;
+    /// under a replay, the taped one), then `Router::permit_decided`. Every resource write
+    /// method takes the permit its caller got here, so one write is routed once (design §10.2).
+    ///
+    /// # Errors
+    ///
+    /// As `Router::permit`; under a replay, the route door's `Replay` errors.
+    pub fn permit(&self, req: &RouteRequest) -> Result<Permit> {
+        let _ = req;
+        Err(Error::not_yet("the client's write permit", "WP3"))
+    }
+
+    /// Run a write `call` under `permit`: the write pipeline (design §7.4, §10.1).
+    ///
+    /// # Errors
+    ///
+    /// The pipeline's errors, each saying what the write may have done (`side_effect`).
+    pub(crate) fn call_write(&self, call: &Call, permit: &Permit, how: &How) -> Result<Answered> {
+        let _ = (call, permit, how);
+        Err(Error::not_yet("the write pipeline", "WP3"))
+    }
+
+    /// [`Github::call_write`] whose `guard` runs before every attempt: `Ok(Some(answered))`
+    /// ends the loop with that answer (the guard found the state already right), `Ok(None)`
+    /// sends, `Err` stops.
+    ///
+    /// # Errors
+    ///
+    /// As `call_write`; the guard's error.
+    pub(crate) fn call_write_guarded(
+        &self,
+        call: &Call,
+        permit: &Permit,
+        how: &How,
+        guard: &mut dyn FnMut(u32) -> Result<Option<Answered>>,
+    ) -> Result<Answered> {
+        let _ = (call, permit, how, guard);
+        Err(Error::not_yet("the write pipeline", "WP3"))
+    }
+
+    /// The journal's draft for a one-shot `call` under `permit`: `IntentDraft::new` with the
+    /// loaded credential's fingerprint (`identity::fingerprint`; `taped` under any tape), then
+    /// `request` set to `fx::canon::request_digest` of the call's canonical credentialed bytes
+    /// (`canon::request_credentialed`). The resource adds the target and the body digest.
+    ///
+    /// # Errors
+    ///
+    /// Unauthenticated when, with no tape, the permit's profile gives no credential; as
+    /// `request_credentialed`.
+    pub(crate) fn intent_draft(
+        &self,
+        op: WriteOp,
+        slug: &Slug,
+        call: &Call,
+        permit: &Permit,
+        key: &str,
+    ) -> Result<IntentDraft> {
+        let _ = (op, slug, call, permit, key);
+        Err(Error::not_yet("the intent draft", "WP3"))
+    }
+
+    /// One one-shot write (design §10.2): `intents.latest(draft.op, &draft.key)`, whose id
+    /// becomes the draft's `after`, then `intents.begin(draft)`, `call_write` once, then
+    /// `intents.settle` with `write::settle_table` of the result and `created(&answered)`, an
+    /// `Unknown`'s why passed through `self.redactor().apply` first, so a learned secret of
+    /// no known shape never reaches the journal. `NeverSent` answers `Outcome::NeverSent`,
+    /// `Created` answers `Outcome::Done`, `Refused` answers `Outcome::Refused`, and `Unknown`
+    /// answers `Outcome::Unknown` with the intent. For an `Ok` with no object id there is no
+    /// wire error, so `one_shot` makes the `Unknown`'s error itself, with
+    /// `.with_repo(draft.slug.to_string())`, so `Outcome::into_result`'s next names the repo.
+    /// `Refs::create` and `Raw::send` use it; `Releases::create` runs the same steps one by
+    /// one, because AghEnsureOnce binds each.
+    ///
+    /// # Errors
+    ///
+    /// `begin`'s refusal, and nothing is sent. A `settle` that fails after GitHub answered is
+    /// could_not_run, `Sub::Local`, `side_effect` applied for a 2xx and unknown otherwise, why
+    /// `GitHub answered {status}, and the journal could not record it: {e}; intent {id} stays
+    /// open`, next `agh intent show {repo} {id}`. The open intent then stops a second POST of
+    /// the same op and key at `begin` (`IntentStore::begin`), until a person retracts it. A
+    /// `RefCreate` is the one exception: its second POST is GitHub's 422 `Reference already
+    /// exists`, which `Refs::create` resolves by reading the ref.
+    pub(crate) fn one_shot(
+        &self,
+        call: &Call,
+        permit: &Permit,
+        draft: &IntentDraft,
+        intents: &dyn IntentStore,
+        created: &dyn Fn(&Answered) -> Option<(u64, String)>,
+    ) -> Result<Outcome<Answered>> {
+        let _ = (call, permit, draft, intents, created);
+        Err(Error::not_yet("the one-shot write", "WP3"))
+    }
+
+    /// The isolated git runner (design §6.9).
+    ///
+    /// # Errors
+    ///
+    /// As `git::run`.
+    pub fn run_git(&self, run: &GitRun) -> Result<GitOut> {
+        crate::git::run(self, run)
+    }
+
+    /// The write journal for `slug`: `Journal::open(dirs, slug, fx)` when the builder had
+    /// `journal(dirs)`; under a tape, `Journal::taped(slug, fx)` (a replay has no `Dirs`);
+    /// else could_not_run `no journal: a one-shot write needs agh's state directory`.
+    ///
+    /// # Errors
+    ///
+    /// As `Journal::open`.
+    pub fn journal(&self, slug: &Slug) -> Result<Journal> {
+        let fx = self.fx();
+        if let Some(dirs) = &self.inner.dirs {
+            return Journal::open(dirs, slug, fx);
+        }
+        if matches!(
+            fx.mode(),
+            Mode::Recording | Mode::Replaying | Mode::Rerecording
+        ) {
+            return Ok(Journal::taped(slug, fx));
+        }
+        Err(
+            Error::could_not_run("no journal: a one-shot write needs agh's state directory")
+                .with_sub(Sub::Local),
+        )
+    }
+
+    /// The notifier `How::notify` posts through (`NoNotifier` unless the builder set one).
+    #[must_use]
+    pub fn notifier(&self) -> &dyn Notifier {
+        &*self.inner.notifier
+    }
+
+    /// Record a `--notify` post's receipt value in the meter: `notify::settled` calls it, and
+    /// `Receipt::metered` prints it as the note `notify={value}`.
+    pub(crate) fn note_notify(&self, value: String) {
+        self.lock_meter().notify = Some(value);
+    }
+
+    /// The directories `GithubBuilder::journal` set, if any.
+    #[must_use]
+    pub fn dirs(&self) -> Option<&Dirs> {
+        self.inner.dirs.as_ref()
+    }
+
+    /// The helper command the runner mounts: the builder's `git_helper_for_tests`, else
+    /// `HelperCommand::current()`.
+    ///
+    /// # Errors
+    ///
+    /// As `HelperCommand::current`.
+    pub fn git_helper(&self) -> Result<HelperCommand> {
+        match &self.inner.git_helper {
+            Some(helper) => Ok(helper.clone()),
+            None => HelperCommand::current(),
+        }
+    }
+
+    /// Tests: the local repository `git_remote_for_tests` set for `slug`, if any.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn git_remote(&self, slug: &Slug) -> Option<&std::path::Path> {
+        self.inner
+            .git_remotes
+            .get(&slug.key())
+            .map(std::path::PathBuf::as_path)
     }
 }
 
@@ -861,6 +1173,9 @@ impl Prepared {
             body: WireBody::Empty,
             limit: self.limit.max(HEAD_MAX),
             deadlines: self.deadlines,
+            permit: None,
+            body_digest: None,
+            as_profile: None,
         }
     }
 

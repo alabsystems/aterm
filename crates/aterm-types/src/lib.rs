@@ -19,9 +19,11 @@ pub mod dev_seam;
 pub mod argv0;
 pub mod channel;
 pub mod cli_path;
+pub mod clt_shim;
 
 pub mod identity;
 pub mod needs;
+pub mod network_state;
 pub mod version;
 
 mod cursor;

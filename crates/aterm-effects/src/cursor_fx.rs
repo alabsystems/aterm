@@ -25,6 +25,7 @@ pub(crate) struct FloorFillMemo {
     ground: u32,
     live_cursor: u32,
     pinned_cursor: Option<u32>,
+    lettered: bool,
     floored: BlockFill,
 }
 
@@ -76,7 +77,7 @@ pub struct CursorFx {
     /// Memoised [`bed_legible_share`] for the last `(color, ground, ink)` triple.
     pub(crate) legible_memo: Option<((u32, u32, u32), f32)>,
     /// Memoised [`floor_block_fill`] for the last
-    /// `(candidate, ground, live_cursor, pinned_cursor)`.
+    /// `(candidate, ground, live_cursor, pinned_cursor, lettered)`.
     pub(crate) floor_fill_memo: Option<FloorFillMemo>,
 }
 
@@ -139,7 +140,8 @@ pub struct CursorFxFrame {
     pub block_fill: Option<BlockFill>,
     /// The laser bolt owns the block: the caret's shape is `Bolt`.
     pub bolt_cursor: bool,
-    /// The rainbow owns a blinking block: the shape is pinned steady.
+    /// A body owns a blinking block, and the shape is pinned steady: the rainbow's, and the
+    /// block Laser's bolt stands down to over a letter (`CursorGlow::caret_bolt_stands_down`).
     pub twinkle_cursor: bool,
     /// The momentum glow is hot: this Blinking* style pinned to its Steady* twin (`None` when
     /// cold, or when the style does not blink).
@@ -372,21 +374,31 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
     let color = color & 0x00FF_FFFF;
     let ground = ground & 0x00FF_FFFF;
     let ink = ink & 0x00FF_FFFF;
-    let lum_ink = crate::color_math::relative_luminance(ink);
+    let table = crate::color_math::relative_luminance_table();
+    let lum_ink = crate::color_math::relative_luminance_with(table, ink);
     #[inline]
-    const fn contrast_ink(lum_ink: f32, bg: u32) -> f32 {
-        let lb = crate::color_math::relative_luminance(bg);
+    const fn contrast_ink(
+        table: &crate::color_math::RelativeLuminanceTable,
+        lum_ink: f32,
+        bg: u32,
+    ) -> f32 {
+        let lb = crate::color_math::relative_luminance_with(table, bg);
         (lum_ink.max(lb) + 0.05) / (lum_ink.min(lb) + 0.05)
     }
-    let target = BED_INK_FLOOR.min(contrast_ink(lum_ink, ground));
+    let target = BED_INK_FLOOR.min(contrast_ink(table, lum_ink, ground));
     #[inline]
-    const fn holds_bg(lum_ink: f32, target: f32, bg: u32) -> bool {
-        let lb = crate::color_math::relative_luminance(bg);
+    const fn holds_bg(
+        table: &crate::color_math::RelativeLuminanceTable,
+        lum_ink: f32,
+        target: f32,
+        bg: u32,
+    ) -> bool {
+        let lb = crate::color_math::relative_luminance_with(table, bg);
         lum_ink.max(lb) + 0.05 >= target * (lum_ink.min(lb) + 0.05)
     }
     let peak = crate::cursor_trail::BED_PEAK_ALPHA;
     let peak_bg = aterm_render::blend_rgb(ground, color, peak);
-    if holds_bg(lum_ink, target, peak_bg) {
+    if holds_bg(table, lum_ink, target, peak_bg) {
         return 1.0;
     }
     let (mut lo, mut hi) = (0u8, peak);
@@ -399,7 +411,7 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
         } else if lo > 0 && mid_bg == lo_bg {
             true
         } else {
-            holds_bg(lum_ink, target, mid_bg)
+            holds_bg(table, lum_ink, target, mid_bg)
         };
         if ok {
             lo = mid;
@@ -414,7 +426,10 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
 }
 
 /// Floor an effect-owned caret fill against the page `ground` ([`caret_page_floor`]), by lightness
-/// alone ([`crate::color_math::floor_contrast_keeping_hue`]).
+/// alone ([`crate::color_math::floor_contrast_keeping_hue`]). Over a `lettered` cell, which a block
+/// caret draws cut out of its fill in that ground, the floor is the letter's
+/// ([`crate::cursor_glow::caret_letter_min_contrast`]); the momentum tint's stays no higher than
+/// the theme's own caret.
 #[inline]
 #[must_use]
 pub const fn floor_block_fill(
@@ -422,6 +437,7 @@ pub const fn floor_block_fill(
     ground: u32,
     live_cursor: u32,
     pinned_cursor: Option<u32>,
+    lettered: bool,
 ) -> BlockFill {
     if let (Some(pinned), Some(base)) = (pinned_cursor, candidate.base)
         && (base & 0x00FF_FFFF) == (pinned & 0x00FF_FFFF)
@@ -429,12 +445,21 @@ pub const fn floor_block_fill(
         return candidate;
     }
     let ground = ground & 0x00FF_FFFF;
+    let letter = if lettered {
+        crate::cursor_glow::caret_letter_min_contrast()
+    } else {
+        0.0
+    };
     let min = match candidate.owner {
-        BlockFillOwner::Momentum => CARET_PAGE_MIN_CONTRAST.min(crate::color_math::contrast_ratio(
-            live_cursor & 0x00FF_FFFF,
-            ground,
-        )),
-        owner => caret_page_floor(owner),
+        BlockFillOwner::Momentum => {
+            CARET_PAGE_MIN_CONTRAST
+                .max(letter)
+                .min(crate::color_math::contrast_ratio(
+                    live_cursor & 0x00FF_FFFF,
+                    ground,
+                ))
+        }
+        owner => caret_page_floor(owner).max(letter),
     };
     BlockFill {
         fill: crate::color_math::floor_contrast_keeping_hue(candidate.fill, ground, min),
@@ -483,7 +508,7 @@ pub fn project_block_fill(
     owned.fill = aterm_render::blend_rgb(
         terminal_cursor_color,
         owned.fill,
-        (envelope * f32::from(u8::MAX)).round() as u8,
+        (envelope * (u8::MAX as f32)).round() as u8,
     );
     Some(owned)
 }
@@ -637,6 +662,7 @@ pub const fn automatic_glow_color(
 }
 
 /// The cursor family's config law.
+#[inline]
 #[must_use]
 pub const fn resolve_glow_config(
     knobs: GlowKnobs,
@@ -807,6 +833,7 @@ impl TrailColor {
 
     /// A trail colour setting as written (native `cursor_trail_color`, a page's
     /// `set_cursor_glow_color`).
+    #[inline]
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         let raw = raw.trim();
@@ -992,6 +1019,16 @@ impl CursorFx {
             i += 1;
         }
         self.glow.drop_row_probe();
+    }
+
+    /// The primary screen was cleared (`clear`, Ctrl-L): every light the
+    /// trail laid on the old screen's letters goes in the frame they go
+    /// ([`CursorGlow::note_screen_cleared`]); the caret's momentum glow, the
+    /// caret's own, stays.
+    #[inline]
+    pub fn screen_cleared(&mut self) {
+        self.glow.note_screen_cleared();
+        self.trail.reset();
     }
 
     /// Content-scroll law, invalidation arm.
@@ -1404,11 +1441,20 @@ impl CursorFx {
         let glow_fp =
             glow_fp ^ shares.0.rotate_left(41) ^ self.glow.over_ink_print().rotate_left(13);
         let glow_fp = glow_fp ^ beamrod_frame.fp.rotate_left(17);
-        // Every light is in: the letter guard has the last word.
+        // Every light is in: none lies on the caret's letter, and the letter guard has the last
+        // word on every other.
+        let punched = self.glow.keep_light_off_caret_letter(
+            &mut self.glow_scratch,
+            cur,
+            geom,
+            glow_cfg.style,
+        );
         let guarded = self
             .glow
             .guard_letters(&mut self.glow_scratch, cur, geom, glow_cfg.style);
-        let glow_fp = glow_fp ^ guarded.rotate_left(37);
+        let glow_fp = glow_fp ^ guarded.rotate_left(37) ^ punched.rotate_left(7);
+        self.glow
+            .ground_the_frame(glow_cfg, geom, &self.glow_scratch);
         // The pet's veil is drawn after the pet's tick, by the body it drew
         // this frame (`EffectsPipeline::veil_pet_letters`).
         self.glow.note_veil_frame(cur, geom);
@@ -1421,6 +1467,11 @@ impl CursorFx {
         } else {
             None
         };
+        // Over a letter the bolt stands down to a steady block of its own colour, which the
+        // renderer cuts the letter out of: a bolt is no block, and drawn over the letter it hid
+        // it (looks8 WIDEN move-up: the `!` read 1.00:1).
+        let bolt_down = bolt_cursor && self.glow.caret_bolt_stands_down(cur);
+        let lettered = self.glow.caret_fill_keeps_letter(cur);
         let glow_fp = glow_fp ^ u64::from(bolt_fill.unwrap_or(0)).rotate_left(59);
         if trail_cfg.enabled {
             crate::cursor_trail::ignite(&mut trail_cfg, energy, warmth);
@@ -1476,17 +1527,20 @@ impl CursorFx {
                     if memo.candidate == owned
                         && memo.ground == ground
                         && memo.live_cursor == f.live_cursor
-                        && memo.pinned_cursor == pinned_base =>
+                        && memo.pinned_cursor == pinned_base
+                        && memo.lettered == lettered =>
                 {
                     memo.floored
                 }
                 _ => {
-                    let floored = floor_block_fill(owned, ground, f.live_cursor, pinned_base);
+                    let floored =
+                        floor_block_fill(owned, ground, f.live_cursor, pinned_base, lettered);
                     self.floor_fill_memo = Some(FloorFillMemo {
                         candidate: owned,
                         ground,
                         live_cursor: f.live_cursor,
                         pinned_cursor: pinned_base,
+                        lettered,
                         floored,
                     });
                     floored
@@ -1507,8 +1561,8 @@ impl CursorFx {
             trail_fp,
             trail_color: trail_cfg.color,
             block_fill,
-            bolt_cursor,
-            twinkle_cursor,
+            bolt_cursor: bolt_cursor && !bolt_down,
+            twinkle_cursor: twinkle_cursor || bolt_down,
             momentum_steady,
         }
     }
@@ -1941,7 +1995,7 @@ mod tests {
                     fill: low,
                     base: None,
                 };
-                let floored = floor_block_fill(candidate, ground, live, None);
+                let floored = floor_block_fill(candidate, ground, live, None, false);
                 let bar = CARET_PAGE_MIN_CONTRAST;
                 assert_eq!(caret_page_floor(owner), bar, "{}", owner.label());
                 assert!(
@@ -1962,7 +2016,7 @@ mod tests {
                     },
                     ..candidate
                 };
-                assert_eq!(floor_block_fill(fine, ground, live, None), fine);
+                assert_eq!(floor_block_fill(fine, ground, live, None, false), fine);
             }
         }
         let pinned = 0x0000_00FF;
@@ -1973,11 +2027,11 @@ mod tests {
                 base: Some(pinned),
             };
             assert_eq!(
-                floor_block_fill(worn, 0x0011_1318, pinned, Some(pinned)),
+                floor_block_fill(worn, 0x0011_1318, pinned, Some(pinned), false),
                 worn
             );
             assert_ne!(
-                floor_block_fill(worn, 0x0011_1318, 0x0050_FA7B, None).fill,
+                floor_block_fill(worn, 0x0011_1318, 0x0050_FA7B, None, false).fill,
                 pinned,
                 "control: unpinned, the same {} fill is floored",
                 owner.label()
@@ -1989,7 +2043,7 @@ mod tests {
             base: Some(0x00B4_8CFF),
         };
         assert_ne!(
-            floor_block_fill(bolt, 0x00FF_FFFF, 0x0000_00FF, Some(0x0000_00FF)),
+            floor_block_fill(bolt, 0x00FF_FFFF, 0x0000_00FF, Some(0x0000_00FF), false),
             bolt
         );
         let (latte, rosewater) = (0x00EF_F1F5, 0x00DC_8A78);
@@ -1998,14 +2052,16 @@ mod tests {
             fill: rosewater,
             base: None,
         };
-        assert_eq!(floor_block_fill(tint, latte, rosewater, None), tint);
+        assert_eq!(floor_block_fill(tint, latte, rosewater, None, false), tint);
         let forge = BlockFill {
             owner: BlockFillOwner::Forge,
             ..tint
         };
         assert!(
-            contrast_ratio(floor_block_fill(forge, latte, rosewater, None).fill, latte)
-                >= CARET_PAGE_MIN_CONTRAST
+            contrast_ratio(
+                floor_block_fill(forge, latte, rosewater, None, false).fill,
+                latte
+            ) >= CARET_PAGE_MIN_CONTRAST
         );
     }
 

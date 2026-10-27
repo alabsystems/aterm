@@ -8,6 +8,7 @@ pub mod contents;
 pub mod git;
 pub mod public;
 pub mod raw;
+pub mod refs;
 pub mod releases;
 pub mod repos;
 pub mod users;
@@ -16,6 +17,7 @@ pub use contents::Contents;
 pub use git::{CompareResult, Git};
 pub use public::{Probe, Public};
 pub use raw::{Raw, RawAnswer, RawGet, RawOutcome};
+pub use refs::Refs;
 pub use releases::{Releases, TagObjects};
 pub use repos::{RepoListKind, Repos};
 pub use users::Users;
@@ -39,8 +41,9 @@ pub(crate) fn repo_root(slug: &Slug) -> String {
     )
 }
 
-/// How a resource call is routed.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// How a resource call is routed. Built from `How::read()`, `How::writer()` or `How::write()`
+/// (`#[non_exhaustive]`); `Default` is a hand `impl`, because `rate_book` defaults to `true`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct How {
     /// What the calls may see and do.
@@ -55,6 +58,31 @@ pub struct How {
     pub no_probe: bool,
     /// `None`: the client's policy.
     pub retry: Option<RetryPolicy>,
+    /// Consult the rate book before sending (default true). The reads that guard a write set it
+    /// false (design §7.4, §11.3).
+    pub rate_book: bool,
+    /// The most time this call's retry sleeps may take (default `None`: no cap).
+    pub sleep_budget: Option<std::time::Duration>,
+    /// Post the settled event to the fabric (design §21.5; default false).
+    pub notify: bool,
+}
+
+impl Default for How {
+    /// Read, routed, `Named::Default`, the probe on, the client's retry policy, the rate book
+    /// consulted, no sleep budget, no notify.
+    fn default() -> How {
+        How {
+            access: Access::Read,
+            anonymous: false,
+            as_profile: None,
+            named: Named::Default,
+            no_probe: false,
+            retry: None,
+            rate_book: true,
+            sleep_budget: None,
+            notify: false,
+        }
+    }
 }
 
 impl How {
@@ -71,6 +99,36 @@ impl How {
             access: Access::WriterRead,
             ..How::default()
         }
+    }
+
+    /// A write: `Access::Write`, the other fields defaulted.
+    #[must_use]
+    pub fn write() -> How {
+        How {
+            access: Access::Write,
+            ..How::default()
+        }
+    }
+
+    /// The same routing with the rate book consulted or not.
+    #[must_use]
+    pub fn rate_book(mut self, on: bool) -> How {
+        self.rate_book = on;
+        self
+    }
+
+    /// The same routing with a cap on retry sleeps.
+    #[must_use]
+    pub fn sleep_budget(mut self, budget: std::time::Duration) -> How {
+        self.sleep_budget = Some(budget);
+        self
+    }
+
+    /// The same routing, posting its settled event (design §21.5).
+    #[must_use]
+    pub fn notify(mut self, on: bool) -> How {
+        self.notify = on;
+        self
     }
 
     /// The same routing with `anonymous`.

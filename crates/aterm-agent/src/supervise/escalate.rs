@@ -791,7 +791,18 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
-        self.metadata_global = opts.policy.autopilot;
+        self.sync_needs_under(screen, &opts.policy, review)
+    }
+
+    /// [`Self::sync_needs`] under the policy `cfg`, which a break's read of the needs its report
+    /// names (`Session::break_needs`) holds where no options do.
+    pub(super) fn sync_needs_under(
+        &mut self,
+        screen: &Screen,
+        cfg: &super::super::config::SupervisorConfig,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        self.metadata_global = cfg.autopilot;
         if self.needs_not_ours() {
             return self.needs_down(
                 screen.seq,
@@ -813,7 +824,7 @@ impl<C: Ctl> Session<'_, C> {
             self.retell_standing(key);
             return Ok(());
         }
-        if self.autopilot(opts) == Autopilot::Off {
+        if cfg.autopilot_for(self.autopilot.word()) == Autopilot::Off {
             return Ok(());
         }
         let needs = self.turn_end.standing_needs().to_vec();

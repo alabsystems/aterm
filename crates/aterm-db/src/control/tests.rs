@@ -2,6 +2,30 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+
+#[test]
+fn a_previous_round_actor_is_not_a_new_authenticated_contact() {
+    let mut repair = Repair::default();
+    let trust = Trust {
+        network: [1; 16],
+        authority: [2; 32],
+        genesis: [3; 32],
+    };
+    let actor = [4; 48];
+    repair.prepare(trust, actor);
+    assert_eq!(repair.authenticated_actor(), Some(actor));
+    repair.begin_round();
+    assert_eq!(
+        repair.actor(),
+        Some(actor),
+        "retain repair scheduling hints"
+    );
+    assert_eq!(
+        repair.authenticated_actor(),
+        None,
+        "a failed new connection cannot refresh presence"
+    );
+}
 use aterm_net::lan::{Connection, Scope};
 use aterm_secrets::{
     age::Identity,

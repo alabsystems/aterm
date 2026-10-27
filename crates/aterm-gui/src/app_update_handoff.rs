@@ -10,6 +10,88 @@ use crate::App;
 use crate::Wake;
 #[cfg(unix)]
 use crate::app_input::paste_order;
+use crate::app_update_handoff_boundary::{self, MAX_BOUNDARY_WAIT};
+
+thread_local! {
+    /// When this handoff first found a boundary guard held, so it holds for it at most
+    /// [`MAX_BOUNDARY_WAIT`] across its retries, then proceeds (design §6.7).
+    static BOUNDARY_WAIT_SINCE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether a non-idempotent item at a boundary still holds the update handoff: `Some(reason)`
+/// while an item holds the guard and the wait has not reached [`MAX_BOUNDARY_WAIT`], else `None`
+/// (the guard is free, or the budget is spent and the handoff proceeds — the successor resumes
+/// the item from the ledger). `now` is the clock (injected in tests).
+fn boundary_guard_holds_handoff(now: std::time::Instant) -> Option<String> {
+    boundary_wait_decision(app_update_handoff_boundary::any_held(), now)
+}
+
+/// The pure core of [`boundary_guard_holds_handoff`]: given whichever item holds the guard now,
+/// hold the handoff for it until [`MAX_BOUNDARY_WAIT`] passes, then let it proceed. The wait's
+/// start is kept per thread across the handoff's retries.
+fn boundary_wait_decision(
+    held: Option<app_update_handoff_boundary::GuardedItem>,
+    now: std::time::Instant,
+) -> Option<String> {
+    let Some(item) = held else {
+        BOUNDARY_WAIT_SINCE.with(|since| since.set(None));
+        return None;
+    };
+    let since = BOUNDARY_WAIT_SINCE.with(|cell| {
+        let started = cell.get().unwrap_or(now);
+        cell.set(Some(started));
+        started
+    });
+    if now.duration_since(since) < MAX_BOUNDARY_WAIT {
+        Some(format!(
+            "{item:?} is at a boundary that cannot be cut in half; the update follows it \
+             (up to {}s)",
+            MAX_BOUNDARY_WAIT.as_secs()
+        ))
+    } else {
+        BOUNDARY_WAIT_SINCE.with(|since| since.set(None));
+        None
+    }
+}
+
+#[cfg(test)]
+mod boundary_wait_tests {
+    use super::{BOUNDARY_WAIT_SINCE, MAX_BOUNDARY_WAIT, boundary_wait_decision};
+    use crate::app_update_handoff_boundary::GuardedItem;
+    use std::time::{Duration, Instant};
+
+    fn reset() {
+        BOUNDARY_WAIT_SINCE.with(|since| since.set(None));
+    }
+
+    /// While a non-idempotent item holds the guard, the handoff is held — until the budget, when
+    /// it proceeds so the successor can resume the item from the ledger.
+    #[test]
+    fn the_handoff_follows_a_held_item_for_at_most_the_budget() {
+        reset();
+        let start = Instant::now();
+        // The item holds the guard; the handoff is held at first and as the wait grows, up to
+        // just under the budget.
+        assert!(boundary_wait_decision(Some(GuardedItem::ClonePublishRename), start).is_some());
+        let near = start + MAX_BOUNDARY_WAIT - Duration::from_millis(1);
+        assert!(boundary_wait_decision(Some(GuardedItem::ClonePublishRename), near).is_some());
+        // At the budget it proceeds, even though the item is still held.
+        let at = start + MAX_BOUNDARY_WAIT;
+        assert!(
+            boundary_wait_decision(Some(GuardedItem::ClonePublishRename), at).is_none(),
+            "the handoff proceeds at the budget"
+        );
+        reset();
+    }
+
+    /// The control: no item holds the guard, so the handoff is never held and nothing waits.
+    #[test]
+    fn a_free_guard_holds_nothing() {
+        reset();
+        assert!(boundary_wait_decision(None, Instant::now()).is_none());
+    }
+}
 
 #[cfg(clean_islands)]
 #[path = "app_update_handoff_island.rs"]
@@ -4159,6 +4241,15 @@ impl App {
                 "an update handoff is already in flight",
             ));
         }
+        // An item that cannot be repeated safely (a sign-out click sequence, a clone's publish
+        // rename, a launchd bootstrap) holds a boundary guard; the handoff follows it, at most
+        // MAX_BOUNDARY_WAIT, then proceeds and the successor resumes it from the ledger (§6.7).
+        if let Some(reason) = boundary_guard_holds_handoff(std::time::Instant::now()) {
+            #[cfg(unix)]
+            return Err(crate::UpdateHandoffStartError::activity(reason));
+            #[cfg(not(unix))]
+            return Err(crate::UpdateHandoffStartError::refused(reason));
+        }
         #[cfg(target_os = "macos")]
         if self.workstation_setup.pending() {
             return Err(crate::UpdateHandoffStartError::activity(
@@ -5312,6 +5403,7 @@ impl App {
         &mut self,
         reports: &[crate::handoff_history::ImportReport],
     ) {
+        crate::metrics::mark_keeper_imported();
         let loss = crate::handoff_history::loss_summary(reports);
         let said = std::mem::take(&mut self.handoff_history_loss_said);
         if loss.lines > 0 && loss != said {
@@ -10701,7 +10793,7 @@ mod fork_lane_child_tests {
             .iter()
             .map(|&fd| {
                 let held = aterm_spec::host::sh_held(fd);
-                format!("{held} && printf 'held:{fd} '; ")
+                format!("{held} && got=\"$got held:{fd}\"; ")
             })
             .collect::<String>();
         let Some(handed) = hook else {
@@ -10710,7 +10802,7 @@ mod fork_lane_child_tests {
             let status = aterm_uds::spawnfd::transparent("/bin/sh")
                 .args([
                     "-c",
-                    &format!("{{ {probe}echo end; }} >\"$1\" </dev/null"),
+                    &format!("got=; {probe}exec >\"$1\" </dev/null; printf '%s end\\n' \"$got\""),
                     "sh",
                 ])
                 .arg(&report)
@@ -10723,7 +10815,7 @@ mod fork_lane_child_tests {
                 .to_string();
         };
         let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.args(["-c", &format!("{probe}echo end")]);
+        cmd.args(["-c", &format!("got=; {probe}printf '%s end\\n' \"$got\"")]);
         let strip = aterm_uds::spawnfd::InheritStrip::prepare();
         // SAFETY: the hook runs between fork and exec; see the function.
         unsafe {

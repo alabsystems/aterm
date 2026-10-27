@@ -1600,6 +1600,7 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
             dialect: Dialect::Zsh,
             line,
             tap_dropped: None,
+            line_dir: None,
         })
     };
     let report = || Report {
@@ -4194,6 +4195,7 @@ fn a_relaunch_line_waits_on_a_live_owner_under_its_agents_own_home() {
                 mark: &mut None,
                 ended_at_s: 0,
                 held_since_s: 0,
+                line_grace_s: None,
             },
             |_, _, _| true,
         )
@@ -4238,6 +4240,7 @@ fn relaunch_rechecks_shell_tab_after_the_session_scan() {
             mark: &mut None,
             ended_at_s: 0,
             held_since_s: 0,
+            line_grace_s: None,
         },
         |_, pid, tab| {
             assert_eq!((pid, tab), (shell, TAB));
@@ -4265,6 +4268,7 @@ fn relaunch_rechecks_shell_tab_after_the_session_scan() {
             mark: &mut None,
             ended_at_s: 0,
             held_since_s: 0,
+            line_grace_s: None,
         },
         |_, _, _| true,
     )
@@ -4310,6 +4314,7 @@ fn the_relaunch_line_is_typed_under_the_hand_never_let_go() {
                 mark: &mut None,
                 ended_at_s: 0,
                 held_since_s: 0,
+                line_grace_s: None,
             },
             |_, _, _| true,
         );
@@ -4473,6 +4478,7 @@ fn the_relaunch_line_is_never_typed_over_a_person_or_a_holder() {
                 mark: &mut None,
                 ended_at_s: 0,
                 held_since_s: 0,
+                line_grace_s: None,
             },
             |_, _, _| true,
         );
@@ -4493,6 +4499,7 @@ fn the_relaunch_line_is_never_typed_over_a_person_or_a_holder() {
             mark: &mut None,
             ended_at_s: 0,
             held_since_s: 0,
+            line_grace_s: None,
         },
         |_, _, _| true,
     )
@@ -5056,6 +5063,366 @@ fn a_relaunch_whose_parent_cannot_be_read_is_waited_for_never_failed() {
     );
     assert_eq!(ledger_lines(&opts), 1);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 2026-10-26, tab `s-f16681f50e0ff4e76b34`: the upgrade ended Claude Code 2.1.306 at land, its
+/// relaunch line was held and never typed (`wait=held`, `relaunched_at=0`), and the person ran
+/// `claude --resume` in the same zsh: a child of the recorded shell holding the conversation, which
+/// the visit adopted as the upgrade's own relaunch, waited 120 s on to settle and wrote up as
+/// `done:resumed` ("resumed while idle, nothing typed"). A launch the record typed no line for
+/// since the agent's last end (aterm's, or a relaunched build's own, [`St::roll_back`]) is someone
+/// else's: it closes as theirs at once ([`RESUMED_BY_ANOTHER`]; a stop, [`RESUMED_BEHIND`], on an
+/// older build), nothing carried on, and a record whose line was typed (`Relaunched`) still carries
+/// its own relaunch on. Each verdict conforms to `HarnessOwedRelaunch`'s `Close` and `Adopt` under
+/// the launcher the record names; the negative control: the old visit's view (whoever holds the
+/// conversation in the tab is aterm's relaunch) does not.
+#[cfg(unix)]
+#[test]
+fn a_launch_the_restart_never_typed_is_recorded_as_anothers_never_adopted() {
+    let dir = scratch("resumed-by-another");
+    let opts = drive(&dir);
+    let mut agent = parked().spawn().expect("spawn");
+    let pid = agent.id();
+    wait_exec(pid);
+    let (dead, shell, at_s) = (dead_pid(), 4242, now_s());
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    let record = |phase: Phase| St {
+        phase,
+        pid: dead,
+        shell,
+        tab: TAB.to_string(),
+        from: "2.1.306".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        quiet: true,
+        wait: "held".to_string(),
+        wait_since: at_s,
+        model_before: "claude-opus-5-5".to_string(),
+        ..St::default()
+    };
+    let mut rolled = St {
+        back_line: " '/pkg/claude-2.1.306' '--resume' 'x'".to_string(),
+        ..record(Phase::Relaunched { at_s })
+    };
+    assert!(rolled.roll_back(at_s, opts.human_grace_s), "PRECONDITION");
+    let by_the_shell = Script::new(shell, usize::MAX, Some(shell));
+    let visit_as = |version: &str, st: &St| {
+        std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("write");
+        let sf = register_as(&opts.home.join(".claude"), pid, SESSION, version);
+        let r = visit(&opts, &sf, &table(), &newer(), &by_the_shell);
+        (r, load(&opts, SESSION).expect("the record"))
+    };
+    let cases = [
+        ("9.9.9", record(Phase::Exiting { at_s })),
+        ("1.0.0", record(Phase::Exiting { at_s })),
+        ("9.9.9", rolled),
+        ("9.9.9", record(Phase::Relaunched { at_s })),
+    ];
+    let model = aterm_models_harness::harness_owed_relaunch_model();
+    let state = |launcher: i64| {
+        let mut state = model.init_state();
+        for (var, value) in [
+            ("running", 1),
+            ("claimed", 1),
+            ("owed", 1),
+            ("launcher", launcher),
+        ] {
+            state.insert(var, value);
+        }
+        state
+    };
+    let launcher_of = |st: &St| match st.phase {
+        Phase::Relaunched { .. } => 1,
+        _ => 2,
+    };
+    let mut old_view_wrong = 0;
+    let mut steps = Vec::new();
+    for (version, st) in &cases {
+        let (r, after) = visit_as(version, st);
+        let closed = r.step == RESUMED_BY_ANOTHER || r.step == format!("failed:{RESUMED_BEHIND}");
+        let carried = matches!(after.phase, Phase::Relaunched { .. }) && !closed;
+        let as_modelled = state(launcher_of(st));
+        assert_eq!(
+            (
+                model.action_enabled("Close", &as_modelled),
+                model.action_enabled("Adopt", &as_modelled)
+            ),
+            (closed, carried),
+            "{version} {:?}: {r:?}",
+            st.phase
+        );
+        old_view_wrong += u32::from(model.action_enabled("Close", &state(1)) != closed);
+        steps.push((r, after));
+    }
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let [
+        (another, closed),
+        (behind, stopped),
+        (back, rolled_closed),
+        (ours, carried),
+    ] = <[(Report, St); 4]>::try_from(steps).expect("four visits");
+    assert_eq!(another.step, RESUMED_BY_ANOTHER, "{another:?}");
+    assert_eq!(closed.phase, Phase::Done);
+    assert_eq!(
+        (
+            closed.resumed_pid,
+            closed.relaunched_pid,
+            closed.resumed_on.as_str()
+        ),
+        (pid, 0, "9.9.9")
+    );
+    assert_eq!(
+        behind.step,
+        format!("failed:{RESUMED_BEHIND}"),
+        "{behind:?}"
+    );
+    assert_eq!(stopped.phase, Phase::Failed(RESUMED_BEHIND.to_string()));
+    assert_eq!(
+        back.step, RESUMED_BY_ANOTHER,
+        "a roll-back's line, never typed: {back:?}"
+    );
+    assert_eq!(
+        (rolled_closed.phase, rolled_closed.resumed_pid),
+        (Phase::Done, pid)
+    );
+    assert_eq!(
+        ours.step, "wait:no-socket",
+        "control: its own relaunch is carried on: {ours:?}"
+    );
+    assert_eq!(carried.phase, Phase::Relaunched { at_s });
+    assert!(
+        old_view_wrong > 0,
+        "negative control: the old visit's view is not the model's"
+    );
+}
+
+/// 2026-10-26 (window pid 53926): the owed relaunch line read its tab's `status` as it stood (the
+/// host's own lease and supervisor, autopilot land, input clear, no hold, the person's last key
+/// 96 s old, from before the end) and waited `wait:held`. Now the line this build's record owes
+/// (naming its end's grace, at land) is typed. The controls on the same tab: an exit aterm did not
+/// end, and a record that names no grace (the incident's own, an earlier build's), keep the whole
+/// grace; a key at the dead prompt after the end holds it; and a key 30 s old holds the line an end
+/// at `prefer` owes (that end waited out the whole grace).
+#[cfg(unix)]
+#[test]
+fn the_incidents_owed_relaunch_line_is_typed_under_its_own_hosts_lease() {
+    let dir = scratch("owed-line-incident");
+    let (sock, asked) = instance_with(
+        &dir,
+        Answers {
+            screen: r#"{"rows":["me@box proj %"],"cursor":{"row":0,"col":14},"seq":77,"first":0,"gen":"4.77","human_ms":96468}"#.to_string(),
+            help: FENCED_HELP,
+            turn: vec!["OK 0 id=2 submitted=1 status=settled"],
+            ..Answers::default()
+        },
+    );
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    assert_eq!(opts.human_grace_s, 120, "PRECONDITION: the default grace");
+    std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("empty roster");
+    let host = hand_name();
+    let status = |human_ms: u64| {
+        format!(
+            "OK schema=1 sid=0 phase=exited hold=0 hand=lease:{host} supervisor={host} \
+             supervisor_proven=0 autopilot=land agent=- input=clear input_bytes=0 \
+             human_ms={human_ms} human_seq=1031"
+        )
+    };
+    let mut c = connect(&opts, TAB).expect("control connection");
+    let attempt = |c: &mut Client, human_ms: u64, ended_at_s: u64, line_grace_s: Option<u32>| {
+        std::fs::write(dir.join("t.status"), status(human_ms)).expect("status");
+        type_relaunch_line(
+            &opts,
+            &Records::of(&opts.home, None),
+            c,
+            std::process::id(),
+            TAB,
+            SESSION,
+            " '/pkg/claude' '--dangerously-skip-permissions' '--resume' 'x'",
+            None,
+            PromptLook {
+                mark: &mut None,
+                ended_at_s,
+                held_since_s: 0,
+                line_grace_s,
+            },
+            |_, _, _| true,
+        )
+    };
+    let ended = now_s() - 1;
+    let land = Some(upgrade::person_grace(upgrade::Rung::Land, 120));
+    let prefer = Some(upgrade::person_grace(upgrade::Rung::Prefer, 120));
+    for (human_ms, ended_at_s, grace, why) in [
+        (
+            96_468,
+            0,
+            land,
+            "an exit aterm did not end keeps the whole grace",
+        ),
+        (
+            96_468,
+            ended,
+            None,
+            "a record that names no grace keeps the whole grace",
+        ),
+        (500, ended, land, "a key at the dead prompt after the end"),
+        (
+            30_000,
+            ended,
+            prefer,
+            "a key the end at prefer would have waited on",
+        ),
+    ] {
+        assert_eq!(
+            attempt(&mut c, human_ms, ended_at_s, grace),
+            Err(RelaunchLineError::Wait("held")),
+            "control: {why}"
+        );
+    }
+    assert_eq!(turns(&asked), 0, "nothing typed while held");
+    assert_eq!(
+        attempt(&mut c, 96_468, ended, land),
+        Ok(()),
+        "the owed line goes under this build's record"
+    );
+    assert_eq!(turns(&asked), 1);
+    drop(c);
+}
+
+/// Conformance test of `HarnessOwedRelaunch` (`aterm_models_harness::harness_owed_relaunch_model`):
+/// in every state the model reaches where a line is owed, the relaunch line's gate
+/// ([`super::super::relaunch::line_held_by_status`] under the grace the record names,
+/// [`super::super::relaunch::line_grace`]) lets the line go exactly where the model's `Line` is
+/// enabled: a person's last key none within the whole grace, one within it but past the grace the
+/// end's gate waited out, or one within that; input unread or not; under the host's own lease;
+/// the shell where the line was planned or moved (`moved`), when the line typed
+/// ([`super::super::relaunch::line_at_shell`]) runs the conversation where it ran either way, as
+/// the model's `ResumesWhereItRan` says. The claim ([`super::super::relaunch::restarted`]) stands
+/// exactly as the model's `claimed` after `End` and after `PersonExit`. The negative controls: the
+/// old line gate (the whole grace) is not `Line`, nor is a line that waits while the shell stands
+/// elsewhere (`wait:shell-moved`).
+#[test]
+fn the_owed_relaunch_conforms_to_the_model() {
+    use super::super::relaunch::{
+        line_at_shell, line_grace, line_held_by_status, person_present, restarted,
+    };
+    use std::collections::BTreeMap;
+    const END_S: u64 = 1_793_034_365;
+    const HOST: &str = "aterm-harness@53926";
+    let model = aterm_models_harness::harness_owed_relaunch_model();
+    let actions: Vec<&str> = model.anchors().map(|(_, action)| action).collect();
+    let mut seen = std::collections::BTreeSet::from([model.init_state()]);
+    let mut todo = vec![model.init_state()];
+    while let Some(state) = todo.pop() {
+        for action in &actions {
+            for next in model.successors(action, &state) {
+                if seen.insert(next.clone()) {
+                    todo.push(next);
+                }
+            }
+        }
+    }
+    let end_grace = upgrade::person_grace(upgrade::Rung::Land, 120);
+    let grace = line_grace(120, END_S, Some(end_grace));
+    let dirs = scratch("owed-model-dirs");
+    let (planned_at, moved_to) = (dirs.join("planned"), dirs.join("moved"));
+    std::fs::create_dir_all(&planned_at).expect("planned");
+    std::fs::create_dir_all(&moved_to).expect("moved");
+    let (planned_at, moved_to) = (
+        planned_at.to_string_lossy().into_owned(),
+        moved_to.to_string_lossy().into_owned(),
+    );
+    let (exe, args) = (
+        Path::new("/pkg/claude"),
+        ["--resume".to_string(), SESSION.to_string()],
+    );
+    let line = |cd: Option<&str>| {
+        upgrade::relaunch_line(Dialect::Zsh, None, cd, exe, &args).expect("a line")
+    };
+    let planned = line(None);
+    let (mut typed, mut held, mut whole_grace_wrong, mut waits_while_moved_wrong) = (0, 0, 0, 0);
+    for state in seen.iter().filter(|s| s["running"] == 0 && s["owed"] == 1) {
+        let age_ms: u64 = match state["keys"] {
+            0 => 200_000,
+            1 => 80_000,
+            _ => 5_000,
+        };
+        let status = format!(
+            "OK schema=1 sid=0 hold=0 hand=lease:{HOST} supervisor={HOST} autopilot=land \
+             input={} human_ms={age_ms}",
+            if state["typing"] == 1 {
+                "pending"
+            } else {
+                "clear"
+            }
+        );
+        let moved = state["moved"] == 1;
+        let shell_at = if moved { &moved_to } else { &planned_at };
+        let gate = line_held_by_status(Some(&status), grace, HOST).is_none();
+        let at_shell = line_at_shell(&planned, &planned_at, Some(shell_at), Some(Dialect::Zsh))
+            .ok()
+            .map(std::borrow::Cow::into_owned);
+        let real = gate && at_shell.is_some();
+        let modelled = model.action_enabled("Line", state);
+        assert_eq!(real, modelled, "{state:?}: {status}");
+        if real {
+            typed += 1;
+            let runs_where_it_ran = if moved {
+                line(Some(&planned_at))
+            } else {
+                planned.clone()
+            };
+            assert_eq!(at_shell, Some(runs_where_it_ran), "{state:?}");
+        } else {
+            held += 1;
+        }
+        let whole_grace = state["typing"] == 0 && !person_present(&status, 120);
+        whole_grace_wrong += u32::from(whole_grace != modelled);
+        waits_while_moved_wrong += u32::from((gate && !moved) != modelled);
+    }
+    assert!(typed > 0 && held > 0, "{typed} {held}");
+    assert!(
+        whole_grace_wrong > 0,
+        "control: the whole grace's gate is not the model's `Line`"
+    );
+    assert!(
+        waits_while_moved_wrong > 0,
+        "control: a line that waits while the shell stands elsewhere is not the model's `Line`"
+    );
+    let dir = scratch("owed-model-claim");
+    let opts = Opts {
+        only_sid: Some(TAB.to_string()),
+        ..drive(&dir)
+    };
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    let pid = dead_pid();
+    let claimed = |state: &BTreeMap<&'static str, i64>| state["claimed"] == 1;
+    let mut exited = model.init_state();
+    assert!(model.fire("PersonExit", &mut exited));
+    assert_eq!(
+        restarted(&opts, upgrade::Agent::Claude, Some(pid)),
+        claimed(&exited),
+        "a person's own exit"
+    );
+    let mut ended = model.init_state();
+    assert!(model.fire("End", &mut ended));
+    let mut st = St::default();
+    let _ = st.signalled(
+        pid,
+        std::process::id(),
+        TAB,
+        "claude --resume x".to_string(),
+        now_s(),
+    );
+    std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("the claim");
+    assert_eq!(
+        restarted(&opts, upgrade::Agent::Claude, Some(pid)),
+        claimed(&ended),
+        "aterm's own end"
+    );
 }
 
 /// A relaunch stopped `no-resume` whose agent came up after all is that relaunch landed.
@@ -7927,8 +8294,9 @@ fn a_session_upgraded_before_is_behind_anew_when_a_newer_build_lands() {
         earlier(Phase::Failed("no-resume".to_string()), "1.0.0"),
     ] {
         save(&opts, SESSION, &prior);
+        let attached = now_s();
         assert!(
-            mint_behind(&opts, &sf, TAB, &newer(), false, now_s()),
+            mint_behind(&opts, &sf, TAB, &newer(), false, attached),
             "{prior:?}"
         );
         let st = load(&opts, SESSION).expect("minted");
@@ -7936,7 +8304,11 @@ fn a_session_upgraded_before_is_behind_anew_when_a_newer_build_lands() {
             (st.phase.clone(), st.to.as_str()),
             (Phase::Pending, "9.9.9")
         );
-        assert!(now_s().saturating_sub(st.behind_since()) <= 1, "{st:?}");
+        assert_eq!(
+            st.behind_since(),
+            attached,
+            "behind from this attach, never from the earlier round: {st:?}"
+        );
     }
     for prior in [
         earlier(Phase::Exiting { at_s: now_s() }, "9.9.9"),
@@ -10339,8 +10711,48 @@ fn restart_saved_on(
     roster: &crate::harness::accounts::Roster,
     answers: Answers,
 ) -> (Report, Option<St>) {
+    restart_saved_until(name, why, launch, prior, hand, login, roster, answers, None)
+}
+
+/// The native restart with its account owner retiring at one cancellation check.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn restart_saved_until(
+    name: &str,
+    why: &Restart,
+    launch: &str,
+    prior: Option<&St>,
+    hand: Option<&str>,
+    login: Option<&str>,
+    roster: &crate::harness::accounts::Roster,
+    answers: Answers,
+    cancel_at: Option<usize>,
+) -> (Report, Option<St>) {
+    let (r, saved, _) = restart_driven(
+        name, why, launch, prior, hand, login, roster, answers, false, cancel_at,
+    );
+    (r, saved)
+}
+
+/// [`restart_saved_until`], with a directory standing at the conversation's record when
+/// `claim_blocked` (so the claim before the signal cannot be written), and the requests the tab's
+/// stand-in was asked.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn restart_driven(
+    name: &str,
+    why: &Restart,
+    launch: &str,
+    prior: Option<&St>,
+    hand: Option<&str>,
+    login: Option<&str>,
+    roster: &crate::harness::accounts::Roster,
+    answers: Answers,
+    claim_blocked: bool,
+    cancel_at: Option<usize>,
+) -> (Report, Option<St>, Vec<String>) {
     let dir = scratch(name);
-    let (sock, _asked) = instance_with(&dir, answers);
+    let (sock, asked) = instance_with(&dir, answers);
     let opts = Opts {
         sock: Some(sock),
         only_sid: Some(TAB.to_string()),
@@ -10354,6 +10766,11 @@ fn restart_saved_on(
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     if let Some(prior) = prior {
         save(&opts, SESSION, prior);
+    }
+    if claim_blocked {
+        let record = state_path(&opts, SESSION);
+        let _ = std::fs::remove_file(&record);
+        std::fs::create_dir(&record).expect("a directory at the claim path");
     }
     let answered = hand.unwrap_or(launch);
     write_transcript(&opts.home, &[answer_at(answered, "2099-01-01T00:00:00Z")]);
@@ -10381,20 +10798,119 @@ fn restart_saved_on(
         home: None,
         claude_dir: None,
     };
+    let selected = match why {
+        Restart::Account { to, .. } => roster.row(to).map(|row| {
+            let checks = std::sync::atomic::AtomicUsize::new(0);
+            crate::harness::relaunch::AccountRestart::new(why, &snap, row, move || {
+                cancel_at
+                    .is_none_or(|at| checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < at)
+            })
+        }),
+        _ => None,
+    };
     let r = crate::harness::relaunch::restart_as(
         &opts,
         why,
         roster,
         Ok(snap),
+        selected.as_ref(),
         &Script::new(shell.id(), usize::MAX, None),
     );
     let saved = load(&opts, SESSION);
+    if cancel_at.is_some() {
+        assert!(
+            agent.try_wait().unwrap().is_none(),
+            "a cancelled request never signals the agent"
+        );
+        assert!(
+            saved.is_none(),
+            "a cancelled request writes no restart state"
+        );
+    }
     let _ = agent.kill();
     let _ = agent.wait();
     let _ = shell.kill();
     let _ = shell.wait();
-    let _ = std::fs::remove_dir_all(&dir);
-    (r, saved)
+    let asked = asked.lock().map(|a| a.clone()).unwrap_or_default();
+    (r, saved, asked)
+}
+
+/// The restart in place (memory, model, account) sends its signal only once its claim is on
+/// disk, as the upgrade's does: with the record unwritable it waits (`wait:claim-unwritten`) and
+/// nothing is signalled, so no agent ends that no record says to relaunch. The control: with the
+/// claim written the signal goes, and the claim names the grace its gate waited out and, for a
+/// line with no `cd` of its own, the shell's directory the line runs in.
+#[cfg(unix)]
+#[test]
+fn a_restart_in_place_signals_only_once_its_claim_is_written() {
+    let roster = crate::harness::accounts::Roster::default();
+    let launch = "claude-opus-5-5";
+    let (blocked, _, asked) = restart_driven(
+        "claim-blocked",
+        &Restart::Memory,
+        launch,
+        None,
+        None,
+        None,
+        &roster,
+        Answers::default(),
+        true,
+        None,
+    );
+    assert_eq!(blocked.step, "wait:claim-unwritten", "{blocked:?}");
+    assert!(
+        !asked.iter().any(|l| l.contains(" signal ")),
+        "nothing signalled: {asked:#?}"
+    );
+    let (written, saved, asked) = restart_driven(
+        "claim-written",
+        &Restart::Memory,
+        launch,
+        None,
+        None,
+        None,
+        &roster,
+        Answers::default(),
+        false,
+        None,
+    );
+    assert!(
+        asked.iter().any(|l| l.contains(" signal ")),
+        "control: signalled once claimed: {written:?} {asked:#?}"
+    );
+    let saved = saved.unwrap_or_else(|| panic!("the claim: {written:?}"));
+    assert_eq!(saved.line_grace_s, Some(120), "the gate's whole grace");
+    assert_eq!(
+        saved.line_dir.is_empty(),
+        saved.line.contains("cd -- "),
+        "a directory exactly where the line has no cd: {saved:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_retired_account_selection_stops_before_connect_and_before_signal() {
+    let roster = crate::harness::accounts::Roster::parse(
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\nlabel = \"other\"\nclass = \"dedicated\"\ndir = \"/selected/login\"\n",
+    ).unwrap();
+    let why = Restart::Account {
+        to: "other".into(),
+        at: crate::supervise::policy::turn_end::AccountAt::Wall,
+    };
+    for check in 0..3 {
+        let (report, _) = restart_saved_until(
+            &format!("retired-account-{check}"),
+            &why,
+            "sonnet",
+            None,
+            None,
+            None,
+            &roster,
+            Answers::default(),
+            Some(check),
+        );
+        assert_eq!(report.step, "wait:account-changed", "check {check}");
+    }
 }
 
 /// The restart in place saves the fallback origin it decides ([`restart_from`] into
@@ -11049,10 +11565,18 @@ fn register_running_in(claude_dir: &Path, pid: u32, start: &str, cwd: &Path) {
     std::fs::create_dir_all(claude_dir.join("sessions")).expect("sessions");
     std::fs::write(
         claude_dir.join(format!("sessions/{pid}.json")),
-        format!(
-            r#"{{"pid":{pid},"sessionId":"{SESSION}","cwd":"{}","version":"1.0.0","status":"idle","statusUpdatedAt":1,"procStart":"{start}","kind":"interactive","entrypoint":"cli"}}"#,
-            cwd.display()
-        ),
+        aterm_json::to_string(&aterm_json::json!({
+            "pid": pid,
+            "sessionId": SESSION,
+            "cwd": cwd.to_string_lossy().as_ref(),
+            "version": "1.0.0",
+            "status": "idle",
+            "statusUpdatedAt": 1,
+            "procStart": start,
+            "kind": "interactive",
+            "entrypoint": "cli",
+        }))
+        .expect("json"),
     )
     .expect("the record");
 }
@@ -11197,6 +11721,7 @@ fn a_restart_in_place_records_the_directory_a_relative_homes_agent_files_under()
         &Restart::Memory,
         &crate::harness::accounts::Roster::default(),
         Ok(snap),
+        None,
         &Script::new(shell.id(), usize::MAX, None),
     );
     let saved = load(&opts, SESSION);
@@ -11290,11 +11815,18 @@ fn a_restart_in_place_types_the_usage_tap_under_the_switch_and_writes_no_setting
             home: None,
             claude_dir: None,
         };
+        let selected = match why {
+            Restart::Account { to, .. } => roster
+                .row(to)
+                .map(|row| crate::harness::relaunch::AccountRestart::new(why, &snap, row, || true)),
+            _ => None,
+        };
         let r = crate::harness::relaunch::restart_as(
             &opts,
             why,
             roster,
             Ok(snap),
+            selected.as_ref(),
             &Script::new(shell.id(), usize::MAX, None),
         );
         let saved = load(&opts, SESSION);
@@ -15059,10 +15591,18 @@ fn an_agent_under_an_empty_claude_home_is_judged_by_the_profile_claude_code_keep
     std::fs::create_dir_all(work.join("sessions")).expect("sessions");
     std::fs::write(
         work.join(format!("sessions/{LEADER}.json")),
-        format!(
-            r#"{{"pid":{LEADER},"sessionId":"{SESSION}","cwd":"{}","version":"2.1.296","status":"idle","statusUpdatedAt":1,"procStart":"start","kind":"interactive","entrypoint":"cli"}}"#,
-            work.display()
-        ),
+        aterm_json::to_string(&aterm_json::json!({
+            "pid": LEADER,
+            "sessionId": SESSION,
+            "cwd": work.to_string_lossy().as_ref(),
+            "version": "2.1.296",
+            "status": "idle",
+            "statusUpdatedAt": 1,
+            "procStart": "start",
+            "kind": "interactive",
+            "entrypoint": "cli",
+        }))
+        .expect("json"),
     )
     .expect("the record");
     let proj = work.join("projects/-work");
@@ -15746,6 +16286,7 @@ fn only_the_agents_own_words_are_pressed_where_the_host_takes_cap() {
             mark: &mut None,
             ended_at_s: 0,
             held_since_s: 0,
+            line_grace_s: None,
         },
         || true,
         |_, _, _| true,
@@ -17013,6 +17554,7 @@ fn a_yield_that_times_out_never_fails_the_relaunch() {
                 mark: &mut None,
                 ended_at_s: 0,
                 held_since_s: 0,
+                line_grace_s: None,
             },
             |_, _, _| true
         ),
@@ -17052,6 +17594,7 @@ fn a_yield_that_times_out_never_fails_the_relaunch() {
                 mark: &mut None,
                 ended_at_s: 0,
                 held_since_s: 0,
+                line_grace_s: None,
             },
             |_, _, _| true
         ),
@@ -17096,6 +17639,7 @@ fn the_relaunch_line_carries_a_rekey_and_never_waits_on_one() {
                 mark: &mut None,
                 ended_at_s: 0,
                 held_since_s: 0,
+                line_grace_s: None,
             },
             || true,
             |_, _, _| true,
@@ -17227,6 +17771,7 @@ fn a_relaunch_typed_at_bash_takes_the_key_its_live_shell_names() {
                 mark: &mut None,
                 ended_at_s: 0,
                 held_since_s: 0,
+                line_grace_s: None,
             },
             |_, _, _| true,
         )
@@ -17481,6 +18026,7 @@ fn relaunch_attempt_held(
             mark,
             ended_at_s,
             held_since_s,
+            line_grace_s: None,
         },
         probe,
     );
@@ -17545,6 +18091,7 @@ fn a_bash_prompt_with_typing_after_its_mark_is_never_typed_at() {
                 mark: &mut mark,
                 ended_at_s: 0,
                 held_since_s: 0,
+                line_grace_s: None,
             },
             |_, _, _| true,
         );
@@ -18227,6 +18774,48 @@ fn only_a_restart_that_ended_its_agent_dates_a_persons_keys() {
         }),
         0,
         "no end is asked once the line is typed"
+    );
+}
+
+/// A relaunched build that ended on its own before it registered the conversation was ended by
+/// no gate of aterm's: the line back ([`St::roll_back`]) waits on the whole grace, which the record
+/// keeps across visits, so a key the person pressed seconds before (quitting the new build, or at
+/// the prompt it left) holds it. The control: the same key let go the line that aterm's own end at
+/// land owed, before the roll-back.
+#[test]
+fn a_roll_back_line_waits_on_the_whole_grace_for_keys_before_it() {
+    use super::super::relaunch::{line_grace, line_held_by_status};
+    let at_s = 1_793_034_365;
+    let mut st = St {
+        from: "2.1.306".to_string(),
+        to: "2.1.310".to_string(),
+        source: "managed".to_string(),
+        ..St::default()
+    };
+    let _ = st.signalled(
+        dead_pid(),
+        4242,
+        TAB,
+        " '/pkg/claude-2.1.310' '--resume' 'x'".to_string(),
+        at_s,
+    );
+    st.back_line = " '/pkg/claude-2.1.306' '--resume' 'x'".to_string();
+    st.line_grace_s = Some(upgrade::person_grace(upgrade::Rung::Land, 120));
+    let key_30_s_old = "OK schema=1 hold=0 hand=- input=clear human_ms=30000";
+    let held = |st: &mut St| {
+        let look = PromptLook::of(st);
+        let grace = line_grace(120, look.ended_at_s, look.line_grace_s);
+        line_held_by_status(Some(key_30_s_old), grace, "aterm-harness@1")
+    };
+    assert_eq!(held(&mut st), None, "control: aterm's own end at land");
+    st.relaunched(at_s + 1);
+    assert!(st.roll_back(at_s + 6, 120), "PRECONDITION: rolled back");
+    let mut kept = St::from_json(&st.to_json()).expect("the record, read again");
+    assert_eq!(kept.line_grace_s, Some(120));
+    assert_eq!(
+        held(&mut kept),
+        Some(RelaunchLineError::Wait("held")),
+        "the line back waits on the whole grace"
     );
 }
 
@@ -25806,10 +26395,18 @@ fn the_clis_sweep_judges_an_empty_homes_agent_a_window_recorded_by_its_login() {
     std::fs::create_dir_all(work.join("sessions")).expect("sessions");
     std::fs::write(
         work.join(format!("sessions/{LEADER}.json")),
-        format!(
-            r#"{{"pid":{LEADER},"sessionId":"{SESSION}","cwd":"{}","version":"2.1.296","status":"idle","statusUpdatedAt":1,"procStart":"start","kind":"interactive","entrypoint":"cli"}}"#,
-            work.display()
-        ),
+        aterm_json::to_string(&aterm_json::json!({
+            "pid": LEADER,
+            "sessionId": SESSION,
+            "cwd": work.to_string_lossy().as_ref(),
+            "version": "2.1.296",
+            "status": "idle",
+            "statusUpdatedAt": 1,
+            "procStart": "start",
+            "kind": "interactive",
+            "entrypoint": "cli",
+        }))
+        .expect("json"),
     )
     .expect("the record");
     let proj = work.join("projects/-work");

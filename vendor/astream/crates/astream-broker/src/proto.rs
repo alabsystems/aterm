@@ -252,12 +252,16 @@ pub const RETIRE_LOG_PREFIX: &str = "log: ";
 /// that prefix retention has cut (`base > 0`).
 pub const RETIRE_CUT_PREFIX: &str = "cut: ";
 
-/// How a `Fetch` below the OLDEST offset its filter can reach is refused, word for word:
-/// an [`ERR_RECORD_REFUSED`] whose message starts `retained-from=<off>`, the offset a
-/// read of that filter can start at (`REQUIREMENTS` R4). Retention gave the records
-/// below it up — the prefix rule's cut, or a hold class past its age or bytes — so the
-/// fetch is told, never answered with a page that silently starts later. Permanent: the
-/// floor never falls, so the same fetch is refused again; a fetch from `<off>` reads on.
+/// How a `Fetch` below the OLDEST offset of its filter is refused, word for word: an
+/// [`ERR_RECORD_REFUSED`] whose message starts `retained-from=<off>`, the offset at and
+/// above which the filter is complete (`REQUIREMENTS` R4). Retention gave records of the
+/// filter below it up — the prefix rule's cut, or a hold class past its age or bytes, or
+/// read — so not all of them are kept, and the fetch is told, never answered with a page
+/// that silently starts later. Of a filter whose subjects have different floors, some
+/// records below it can still be held: a connection that asked for gap notices
+/// ([`Request::GapNotices`]) is read them, the notice ahead of the page, and is refused
+/// only when the filter holds none there. Permanent: the floor never falls, so the same
+/// fetch is refused again; a fetch from `<off>` reads on.
 /// [`BrokerRefusal::retained_from`](crate::client::BrokerRefusal::retained_from) reads
 /// it. A head query (`max = 0`) is never refused: its `Mark` says the oldest
 /// ([`Response::Mark`]'s `oldest`). A broker that predates it clamped such a fetch to
@@ -281,6 +285,8 @@ const TAG_IDLE_MARKS: u8 = 0x0E;
 const TAG_BUDGET: u8 = 0x0F;
 const TAG_RETIRE: u8 = 0x10;
 const TAG_GAP_NOTICES: u8 = 0x11;
+const TAG_BROKER_TIMES: u8 = 0x12;
+const TAG_STATS: u8 = 0x13;
 const TAG_ACK: u8 = 0x81;
 const TAG_DELIVERY: u8 = 0x82;
 const TAG_ERROR: u8 = 0x83;
@@ -288,6 +294,7 @@ const TAG_MARK: u8 = 0x84;
 const TAG_NONCE: u8 = 0x85;
 const TAG_BUDGET_REPLY: u8 = 0x86;
 const TAG_GAP: u8 = 0x87;
+const TAG_STATS_RESP: u8 = 0x88;
 
 /// Bit 0 of [`NonceExt::requests`]: the broker accepts [`Request::Retire`] (`0x10`).
 pub const REQUEST_RETIRE: u64 = 1 << 0;
@@ -295,6 +302,28 @@ pub const REQUEST_RETIRE: u64 = 1 << 0;
 /// Bit 1 of [`NonceExt::requests`]: the broker accepts [`Request::GapNotices`] (`0x11`)
 /// and tells a tail that asked what retention gave up below it ([`Response::Gap`]).
 pub const REQUEST_GAP_NOTICES: u64 = 1 << 1;
+
+/// Bit 2 of [`NonceExt::requests`]: TOLD FETCHES. On a connection that asked for gap
+/// notices ([`Request::GapNotices`]) the broker reads a `Fetch` below its filter's oldest
+/// from its `from` while retention still holds records of the filter there, the notice
+/// ahead of the page (`REQUIREMENTS-fabric-operations` R4, addendum A9), so its
+/// `retained-from=` there says the filter holds none of them. A broker that announces
+/// [`REQUEST_GAP_NOTICES`] without it tells tails only: its `retained-from=` to such a
+/// `Fetch` says nothing of what it still holds below the oldest, and a reader that must not
+/// skip a held record reads a filter whose subjects share one floor instead (one reader
+/// group's mail).
+pub const REQUEST_TOLD_FETCH: u64 = 1 << 2;
+
+/// Bit 3 of [`NonceExt::requests`]: the broker accepts [`Request::BrokerTimes`] (`0x12`)
+/// and stamps `Delivery` frames on asking connections with `bt=<unix ms>`
+/// (`REQUIREMENTS` R3).
+pub const REQUEST_BROKER_TIMES: u64 = 1 << 3;
+
+/// Bit 4 of [`NonceExt::requests`]: the broker accepts [`Request::Stats`] (`0x13`)
+/// and answers with [`Response::Stats`] (`REQUIREMENTS` R5).
+pub const REQUEST_STATS: u64 = 1 << 4;
+
+const STATS_MAX_ITEMS: usize = 65_536;
 
 /// Commit-tag byte in a [`Request::Replicate`] frame for a marked `/a/retire` record:
 /// an older follower only knows `0` (none) and `1` (group commit) and refuses `2` as
@@ -644,27 +673,111 @@ pub enum Request {
     /// nothing. A broker that predates the verb answers `Error 5 "malformed request"` and
     /// keeps the connection, and its tail says nothing of what it skipped, as before.
     ///
+    /// It holds for this connection's `Fetch`es too: one below its filter's oldest, while
+    /// retention still holds records of the filter there, is read from its `from`, the held
+    /// records in offset order, with the notice ahead of the page, where a connection that
+    /// did not ask is refused `retained-from=` ([`RETAINED_FROM_PREFIX`]). A broker that
+    /// predates this answers that `Fetch` with the refusal, as before; Hello's request set
+    /// says which a broker does ([`REQUEST_TOLD_FETCH`]).
+    ///
     /// Without this request a tail sends no notice: a client that predates them reads its
     /// tail exactly as it did. On a guarded broker any unexpired capability permits it (the
     /// acknowledgement names the head), as for `IdleMarks`. Hello's request set announces
     /// it ([`REQUEST_GAP_NOTICES`]).
     GapNotices,
+    /// Opt in to BROKER-STAMPED WALL TIMES (`bt=<unix ms>`, `REQUIREMENTS` R3) on this
+    /// connection's `Fetch`, `Last`, `Subscribe`, and `SubscribeGroup` deliveries.
+    /// Answered with a `Mark`, like `IdleMarks` and `GapNotices`; appends nothing.
+    /// On a guarded broker, any unexpired capability permits it. Announced by
+    /// [`REQUEST_BROKER_TIMES`].
+    BrokerTimes,
+    /// Attach-gated operator status query (`REQUIREMENTS` R5): broker start time,
+    /// listeners, attached producers (principal, transport, attach time, last publish
+    /// `bt=`), record and byte counts per face prefix matching `filter`, `oldest`/`head`,
+    /// pending wills, dedup-table size, and log segments and bytes on disk. Requires a
+    /// fleet-wide read grant (`/f/<F>/>` or `/>`) on a guarded broker; never returns
+    /// record bodies. Answered with [`Response::Stats`]. Announced by [`REQUEST_STATS`].
+    Stats { filter: String },
+}
+
+/// Per-connection attached producer row in [`WireStats`] (`REQUIREMENTS` R5).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AttachedProducerStats {
+    /// Authenticated capability principal (`p=`), or `""` when unattached/unbound.
+    pub principal: String,
+    /// Listener transport (`"unix"`, `"tcp"`, `"sealed"`, `"handshake"`, `"identity"`).
+    pub transport: String,
+    /// Derived 64-bit producer identifier (`producer_id_of(&principal)`).
+    pub producer_id: u64,
+    /// Monotone broker Unix-millisecond timestamp when this connection attached.
+    pub attached_at_ms: u64,
+    /// Most recent broker-stamped wall time (`bt=`) published by `producer_id`, if any.
+    pub last_bt_ms: Option<u64>,
+}
+
+/// Record and plaintext-frame byte counts for one face prefix (`/f/<F>/<face>`) in
+/// [`WireStats`] (`REQUIREMENTS` R5).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FaceStats {
+    /// Face prefix (e.g. `"/f/alpha/pub"`, `"/f/alpha/in"`, `"/f/alpha/fleet"`).
+    pub face: String,
+    /// Visible non-hidden records matching the query filter under this face.
+    pub records: u64,
+    /// Plaintext frame bytes (`HEADER_SIZE + RECORD_FIXED_LEN + subject + body + commit`)
+    /// across those records.
+    pub bytes: u64,
+}
+
+/// Attach-gated operator status snapshot returned by [`Response::Stats`]
+/// (`REQUIREMENTS` R5). Contains zero record bodies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WireStats {
+    /// Monotone Unix-millisecond timestamp when this `Broker` opened.
+    pub started_at_ms: u64,
+    /// Oldest offset at and above which the queried filter is complete (`BrokerLog::oldest`).
+    pub oldest: u64,
+    /// Subscriber-visible head offset at the time of the snapshot.
+    pub head: u64,
+    /// Count of unfired, unfenced durable wills on the log.
+    pub pending_wills: u64,
+    /// Count of retained entries in the exactly-once `(producer_id, producer_seq)` dedup table.
+    pub dedup_entries: u64,
+    /// Count of on-disk log and durable sidecar files (`<log>`, `.id`, `.base`, `.state`, `.hw`, `.held`, `.replica`).
+    pub disk_segments: u32,
+    /// Total bytes across the on-disk log and its durable sidecar files.
+    pub disk_bytes: u64,
+    /// Active listener endpoints (`"<scheme>:<addr>"`) currently serving this broker.
+    pub listeners: Vec<String>,
+    /// Currently attached producer connections on this broker.
+    pub producers: Vec<AttachedProducerStats>,
+    /// Per-face record and byte counts matching the query filter.
+    pub faces: Vec<FaceStats>,
 }
 
 /// A GAP NOTICE ([`Response::Gap`]): every record of the tail's filter at an offset in
 /// `from..to` that the tail is not delivered was given up by retention. `from` is the
-/// tail's cursor and `to` the oldest offset its filter can reach (`Fetch` refuses below
-/// it); a record it IS delivered inside the range is one retention still held below the
-/// base. `records` is how many records of the filter in the range were given up that no
-/// notice on this stream counted before, where the broker's held store knows it; `None`
-/// where it cannot (the prefix rule's or a last-value class's records, which a cut drops
-/// as a range; give-ups before the broker's last restart), and then the range alone is
-/// told, and covers every later give-up inside it.
+/// tail's cursor and `to` its filter's oldest, the offset at and above which the filter is
+/// complete (a `Fetch` that did not ask for notices is refused below it); a record it IS
+/// delivered inside the range is one retention still held below the base. `records` is how
+/// many records of the filter in the range were given up that no notice on this stream
+/// counted before, where the broker's held store knows it; `None` where it cannot (the
+/// prefix rule's or a last-value class's records, which a cut drops as a range; give-ups
+/// before the broker's last restart), and then the range alone is told, and covers every
+/// later give-up inside it.
+///
+/// Ahead of a `Fetch`'s page ([`Request::GapNotices`]) it is that read's own: `from` is the
+/// fetch's `from`, `records` counts the range's give-ups (each fetch is told afresh), and a
+/// read paged on from a `next` below `to` is told the rest of the range again while the
+/// filter still holds records there; where it holds none there, that continuation is
+/// refused `retained-from=<oldest>` ([`RETAINED_FROM_PREFIX`]), however the page before it
+/// ended. A reader told the range follows it: what it skips below `to` the notice told it
+/// of, and an offset above `to` says the records of `to..offset` were given up since.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gap {
-    /// The tail's cursor when it was told.
+    /// Where the read that was told starts: the tail's cursor, or the `Fetch`'s `from`.
     pub from: u64,
-    /// The oldest offset the tail's filter can reach.
+    /// The filter's oldest when it was told: the offset at and above which the filter is
+    /// complete (the greatest floor over what it matches).
     pub to: u64,
     /// How many records of the filter in `from..to` were given up and not counted
     /// before on this stream; `None`: not known.
@@ -733,8 +846,10 @@ pub enum Response {
     /// when a full flush covers records it was delivered.
     ///
     /// `oldest` is a second optional trailer, after `durable`: on a `Fetch`'s `Mark`, the
-    /// OLDEST offset a read of the fetch's filter can reach (`REQUIREMENTS` R4: the base,
-    /// or for what a hold rule keeps records of, the oldest it still holds of them) — a
+    /// OLDEST offset of the fetch's filter, at and above which the filter is complete
+    /// (`REQUIREMENTS` R4: the base, or for what a hold rule keeps records of, the greatest
+    /// floor over the subjects it matches; records some subject still holds can lie below
+    /// it, which a `Fetch` that asked for gap notices reads) — a
     /// head query (`max = 0`) is the `Head`-style query that answers `oldest=`. `None` on
     /// every other verb's `Mark`, and from a broker that predates it. It rides only
     /// behind `durable`: one that has no `durable` to send writes `0` there, which claims
@@ -783,10 +898,15 @@ pub enum Response {
     },
     /// A GAP NOTICE on a `Subscribe` or `SubscribeGroup` stream that asked for them
     /// ([`Request::GapNotices`]): written before anything the tail delivers after the
-    /// records retention gave up below it (see [`Gap`]). The body is `from u64, to u64`,
-    /// a flag byte (`1`: `records` is known) and `records u64` (`0` when unknown); bytes
-    /// after it are a later build's, skipped. A wire frame, never a log record.
+    /// records retention gave up below it (see [`Gap`]), and, on a connection that asked,
+    /// ahead of a `Fetch`'s page read from below its filter's oldest. The body is
+    /// `from u64, to u64`, a flag byte (`1`: `records` is known) and `records u64` (`0`
+    /// when unknown); bytes after it are a later build's, skipped. A wire frame, never a
+    /// log record.
     Gap(Gap),
+    /// The answer to [`Request::Stats`] (`REQUIREMENTS` R5): operational broker, producer,
+    /// face-prefix, and disk telemetry with zero record bodies.
+    Stats(WireStats),
 }
 
 impl PartialEq for Response {
@@ -871,6 +991,7 @@ impl PartialEq for Response {
                 },
             ) => *a_s == *b_s && *a_r == *b_r && *a_m == *b_m,
             (Response::Gap(a), Response::Gap(b)) => a == b,
+            (Response::Stats(a), Response::Stats(b)) => a == b,
             _ => false,
         }
     }
@@ -1119,7 +1240,7 @@ const fn take_ext_entry_header(b: &[u8]) -> Option<(u8, usize, &[u8])> {
 /// |------|------------|-------|
 /// | 0x01 | durability | `requested u8, served u8, reason u8, horizon_ms u32 LE, rules u16 LE` ([`ServedInfo`]) |
 /// | 0x02 | lineage    | `n u8`, then `n × (generation u64 LE, common u64 LE)` ([`Lineage`]) |
-/// | 0x03 | 8 bytes    | the request set a broker announces (`u64` LE bitmask; bit 0 = [`REQUEST_RETIRE`], bit 1 = [`REQUEST_GAP_NOTICES`]) |
+/// | 0x03 | 8 bytes    | the request set a broker announces (`u64` LE bitmask; bit 0 = [`REQUEST_RETIRE`], bit 1 = [`REQUEST_GAP_NOTICES`], bit 2 = [`REQUEST_TOLD_FETCH`]) |
 /// | 0x04 | health     | `flags u8` (bit 0: poisoned), `barrier u64 LE, full u64 LE, skipped u64 LE, failed u64 LE`, `n u16 LE`, `n` bytes of the poison's reason (UTF-8); bytes after it are a later build's, skipped ([`HelloHealth`]) |
 /// | 0x05 | retention  | the rules the log is retained by, as `Retention::encode` writes them (the `retention` feature) |
 ///
@@ -1136,7 +1257,7 @@ pub struct NonceExt {
     /// Tag 0x02: where the log's generations agree.
     pub lineage: Option<Lineage>,
     /// Tag 0x03: the request-set bitmask announced by the broker (bit 0 = [`REQUEST_RETIRE`],
-    /// bit 1 = [`REQUEST_GAP_NOTICES`]).
+    /// bit 1 = [`REQUEST_GAP_NOTICES`], bit 2 = [`REQUEST_TOLD_FETCH`]).
     pub requests: Option<u64>,
     /// Tag 0x04: whether the log is poisoned, and the flushes it has issued.
     pub health: Option<HelloHealth>,
@@ -1266,6 +1387,37 @@ impl NonceExt {
     pub const fn supports_gap_notices(&self) -> bool {
         match self.requests {
             Some(r) => (r & REQUEST_GAP_NOTICES) != 0,
+            None => false,
+        }
+    }
+
+    /// Whether this `Hello` extension block announces told fetches ([`REQUEST_TOLD_FETCH`]):
+    /// a `Fetch` on a connection that asked for gap notices reads what retention still
+    /// holds below its filter's oldest.
+    #[must_use]
+    pub const fn supports_told_fetch(&self) -> bool {
+        match self.requests {
+            Some(r) => (r & REQUEST_TOLD_FETCH) != 0,
+            None => false,
+        }
+    }
+
+    /// Whether this `Hello` extension block announces [`Request::BrokerTimes`] (`0x12`,
+    /// `REQUIREMENTS` R3).
+    #[must_use]
+    pub const fn supports_broker_times(&self) -> bool {
+        match self.requests {
+            Some(r) => (r & REQUEST_BROKER_TIMES) != 0,
+            None => false,
+        }
+    }
+
+    /// Whether this `Hello` extension block announces [`Request::Stats`] (`0x13`,
+    /// `REQUIREMENTS` R5).
+    #[must_use]
+    pub const fn supports_stats(&self) -> bool {
+        match self.requests {
+            Some(r) => (r & REQUEST_STATS) != 0,
             None => false,
         }
     }
@@ -1474,6 +1626,154 @@ fn put_identity(p: &mut Vec<u8>, ident: Option<&LogIdentity>) {
     }
 }
 
+const fn decode_bt_trailer(b: &[u8]) -> Option<Option<u64>> {
+    match b {
+        [] => Some(None),
+        &[crate::brecord::BT_TAG, b0, b1, b2, b3, b4, b5, b6, b7, ref _rest @ ..] => {
+            Some(Some(decode_u64_le_bytes(&[b0, b1, b2, b3, b4, b5, b6, b7])))
+        }
+        &[crate::brecord::BT_TAG, ..] => None,
+        _ => Some(None),
+    }
+}
+
+fn put_wire_stats(p: &mut Vec<u8>, s: &WireStats) {
+    p.extend_from_slice(&encode_u64_le_bytes(s.started_at_ms));
+    p.extend_from_slice(&encode_u64_le_bytes(s.oldest));
+    p.extend_from_slice(&encode_u64_le_bytes(s.head));
+    p.extend_from_slice(&encode_u64_le_bytes(s.pending_wills));
+    p.extend_from_slice(&encode_u64_le_bytes(s.dedup_entries));
+    p.extend_from_slice(&encode_u32_le_bytes(s.disk_segments));
+    p.extend_from_slice(&encode_u64_le_bytes(s.disk_bytes));
+    let listeners_len = s.listeners.len().min(STATS_MAX_ITEMS);
+    p.extend_from_slice(&encode_u32_le_bytes(listeners_len as u32));
+    if let Some(slice) = s.listeners.get(..listeners_len) {
+        for l in slice {
+            put_str(p, l);
+        }
+    }
+    let producers_len = s.producers.len().min(STATS_MAX_ITEMS);
+    p.extend_from_slice(&encode_u32_le_bytes(producers_len as u32));
+    if let Some(slice) = s.producers.get(..producers_len) {
+        for pr in slice {
+            put_str(p, &pr.principal);
+            put_str(p, &pr.transport);
+            p.extend_from_slice(&encode_u64_le_bytes(pr.producer_id));
+            p.extend_from_slice(&encode_u64_le_bytes(pr.attached_at_ms));
+            match pr.last_bt_ms {
+                Some(bt) => {
+                    p.push(1);
+                    p.extend_from_slice(&encode_u64_le_bytes(bt));
+                }
+                None => {
+                    p.push(0);
+                    p.extend_from_slice(&[0u8; 8]);
+                }
+            }
+        }
+    }
+    let faces_len = s.faces.len().min(STATS_MAX_ITEMS);
+    p.extend_from_slice(&encode_u32_le_bytes(faces_len as u32));
+    if let Some(slice) = s.faces.get(..faces_len) {
+        for f in slice {
+            put_str(p, &f.face);
+            p.extend_from_slice(&encode_u64_le_bytes(f.records));
+            p.extend_from_slice(&encode_u64_le_bytes(f.bytes));
+        }
+    }
+}
+
+fn decode_stats_listeners(r: &mut Reader<'_>) -> Option<Vec<String>> {
+    let n = r.u32()?;
+    if n > STATS_MAX_ITEMS {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        out.push(r.string()?);
+        i = i.saturating_add(1);
+    }
+    Some(out)
+}
+
+fn decode_stats_producers(r: &mut Reader<'_>) -> Option<Vec<AttachedProducerStats>> {
+    let n = r.u32()?;
+    if n > STATS_MAX_ITEMS {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let principal = r.string()?;
+        let transport = r.string()?;
+        let producer_id = r.u64()?;
+        let attached_at_ms = r.u64()?;
+        let has_bt = r.u8()?;
+        let bt_raw = r.u64()?;
+        let last_bt_ms = match has_bt {
+            0 => None,
+            1 => Some(bt_raw),
+            _ => return None,
+        };
+        out.push(AttachedProducerStats {
+            principal,
+            transport,
+            producer_id,
+            attached_at_ms,
+            last_bt_ms,
+        });
+        i = i.saturating_add(1);
+    }
+    Some(out)
+}
+
+fn decode_stats_faces(r: &mut Reader<'_>) -> Option<Vec<FaceStats>> {
+    let n = r.u32()?;
+    if n > STATS_MAX_ITEMS {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let face = r.string()?;
+        let records = r.u64()?;
+        let bytes = r.u64()?;
+        out.push(FaceStats {
+            face,
+            records,
+            bytes,
+        });
+        i = i.saturating_add(1);
+    }
+    Some(out)
+}
+
+fn decode_wire_stats(r: &mut Reader<'_>) -> Option<WireStats> {
+    let started_at_ms = r.u64()?;
+    let oldest = r.u64()?;
+    let head = r.u64()?;
+    let pending_wills = r.u64()?;
+    let dedup_entries = r.u64()?;
+    let disk_segments = r.u32()? as u32;
+    let disk_bytes = r.u64()?;
+    let listeners = decode_stats_listeners(r)?;
+    let producers = decode_stats_producers(r)?;
+    let faces = decode_stats_faces(r)?;
+    Some(WireStats {
+        started_at_ms,
+        oldest,
+        head,
+        pending_wills,
+        dedup_entries,
+        disk_segments,
+        disk_bytes,
+        listeners,
+        producers,
+        faces,
+    })
+}
+
 /// Encode a request to a frame payload.
 pub fn encode_request(req: &Request) -> Vec<u8> {
     let mut p = vec![PROTO_VERSION, 0];
@@ -1557,6 +1857,11 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::Keepalive => p[1] = TAG_KEEPALIVE,
         Request::IdleMarks => p[1] = TAG_IDLE_MARKS,
         Request::GapNotices => p[1] = TAG_GAP_NOTICES,
+        Request::BrokerTimes => p[1] = TAG_BROKER_TIMES,
+        Request::Stats { filter } => {
+            p[1] = TAG_STATS;
+            put_str(&mut p, filter);
+        }
         Request::Budget { producer_id } => {
             p[1] = TAG_BUDGET;
             p.extend_from_slice(&encode_u64_le_bytes(*producer_id));
@@ -1656,62 +1961,104 @@ pub fn encode_replicate(
     p
 }
 
+/// [`encode_replicate`], appending the leader's optional `bt=<unix ms>` trailer
+/// (`[BT_TAG, bt_le_8]`) after the 24-byte `leader` identity trailer when both `leader`
+/// and `bt_ms` are `Some` (`REQUIREMENTS` R3).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_replicate_stamped(
+    seq: u64,
+    producer_id: u64,
+    producer_seq: u64,
+    subject: &str,
+    body: &[u8],
+    commit: Option<(&str, u64)>,
+    leader: Option<&LogIdentity>,
+    bt_ms: Option<u64>,
+) -> Vec<u8> {
+    let mut p = encode_replicate(
+        seq,
+        producer_id,
+        producer_seq,
+        subject,
+        body,
+        commit,
+        leader,
+    );
+    if leader.is_some() {
+        if let Some(bt) = bt_ms {
+            p.push(crate::brecord::BT_TAG);
+            p.extend_from_slice(&encode_u64_le_bytes(bt));
+        }
+    }
+    p
+}
+
 /// Decode a request from a frame payload (bounds-checked; `None` on malformed).
 pub fn decode_request(p: &[u8]) -> Option<Request> {
+    decode_request_with_bt(p).map(|(req, _)| req)
+}
+
+/// [`decode_request`], also returning any `bt=<unix ms>` trailer carried on a
+/// [`Request::Replicate`] frame (`REQUIREMENTS` R3).
+pub(crate) fn decode_request_with_bt(p: &[u8]) -> Option<(Request, Option<u64>)> {
     let mut r = Reader { b: p };
     if r.u8()? != PROTO_VERSION {
         return None;
     }
-    match r.u8()? {
-        TAG_PUBLISH => Some(Request::Publish {
+    let req = match r.u8()? {
+        TAG_PUBLISH => Request::Publish {
             producer_id: r.u64()?,
             producer_seq: r.u64()?,
             subject: r.string()?,
             body: r.bytes()?,
-        }),
-        TAG_SUBSCRIBE => Some(Request::Subscribe {
+        },
+        TAG_SUBSCRIBE => Request::Subscribe {
             from_offset: r.u64()?,
             filter: r.string()?,
-        }),
-        TAG_FORK_SUBSCRIBE => Some(Request::ForkSubscribe {
+        },
+        TAG_FORK_SUBSCRIBE => Request::ForkSubscribe {
             fork_at: r.u64()?,
             replacement_subject: r.string()?,
             replacement_body: r.bytes()?,
             filter: r.string()?,
-        }),
-        TAG_COMMIT => Some(Request::Commit {
+        },
+        TAG_COMMIT => Request::Commit {
             group: r.string()?,
             upto: r.u64()?,
-        }),
-        TAG_PROCESS => Some(Request::ProcessAndProduce {
+        },
+        TAG_PROCESS => Request::ProcessAndProduce {
             producer_id: r.u64()?,
             producer_seq: r.u64()?,
             out_subject: r.string()?,
             out_body: r.bytes()?,
             group: r.string()?,
             upto: r.u64()?,
-        }),
-        TAG_SUBSCRIBE_GROUP => Some(Request::SubscribeGroup {
+        },
+        TAG_SUBSCRIBE_GROUP => Request::SubscribeGroup {
             group: r.string()?,
             filter: r.string()?,
-        }),
-        TAG_ATTACH => Some(Request::Attach {
+        },
+        TAG_ATTACH => Request::Attach {
             grant: r.string()?,
             proof: r.bytes()?,
-        }),
-        TAG_WILL => Some(Request::Will {
+        },
+        TAG_WILL => Request::Will {
             producer_id: r.u64()?,
             producer_seq: r.u64()?,
             subject: r.string()?,
             body: r.bytes()?,
-        }),
-        TAG_HELLO => Some(Request::Hello),
-        TAG_KEEPALIVE => Some(Request::Keepalive),
-        TAG_IDLE_MARKS => Some(Request::IdleMarks),
-        TAG_GAP_NOTICES => Some(Request::GapNotices),
-        TAG_BUDGET => Some(Request::Budget {
+        },
+        TAG_HELLO => Request::Hello,
+        TAG_KEEPALIVE => Request::Keepalive,
+        TAG_IDLE_MARKS => Request::IdleMarks,
+        TAG_GAP_NOTICES => Request::GapNotices,
+        TAG_BROKER_TIMES => Request::BrokerTimes,
+        TAG_STATS => Request::Stats {
+            filter: r.string()?,
+        },
+        TAG_BUDGET => Request::Budget {
             producer_id: r.u64()?,
-        }),
+        },
         TAG_REPLICATE => {
             let seq = r.u64()?;
             let producer_id = r.u64()?;
@@ -1745,41 +2092,51 @@ pub fn decode_request(p: &[u8]) -> Option<Request> {
                 }
                 _ => return None,
             };
-            Some(Request::Replicate {
-                seq,
-                producer_id,
-                producer_seq,
-                subject,
-                body,
-                commit,
-                leader: r.identity_trailer()?,
-            })
+            let leader = r.identity_trailer()?;
+            let bt_ms = if leader.is_some() {
+                decode_bt_trailer(r.b)?
+            } else {
+                None
+            };
+            return Some((
+                Request::Replicate {
+                    seq,
+                    producer_id,
+                    producer_seq,
+                    subject,
+                    body,
+                    commit,
+                    leader,
+                },
+                bt_ms,
+            ));
         }
-        TAG_LAST => Some(Request::Last {
+        TAG_LAST => Request::Last {
             filter: r.string()?,
             after: r.string()?,
             max: r.u32()? as u32,
-        }),
-        TAG_FETCH => Some(Request::Fetch {
+        },
+        TAG_FETCH => Request::Fetch {
             from_offset: r.u64()?,
             filter: r.string()?,
             max: r.u32()? as u32,
-        }),
+        },
         TAG_RETIRE => {
             let producer_id = r.u64()?;
             let subject = r.string()?;
             let offset = r.u64()?;
             let raw = r.take(LogIdentity::WIRE_LEN)?;
             let log = LogIdentity::from_wire(&raw)?;
-            Some(Request::Retire {
+            Request::Retire {
                 producer_id,
                 subject,
                 offset,
                 log,
-            })
+            }
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((req, None))
 }
 
 /// Encode a response to a frame payload.
@@ -1856,6 +2213,10 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
             };
             p.push(known);
             p.extend_from_slice(&encode_u64_le_bytes(n));
+        }
+        Response::Stats(s) => {
+            p[1] = TAG_STATS_RESP;
+            put_wire_stats(&mut p, s);
         }
     }
     p
@@ -1956,6 +2317,17 @@ pub(crate) fn append_publish_frame(
     Ok(())
 }
 
+/// Append one framed `Commit` of consumer `group` to `upto` to `out`.
+pub(crate) fn append_commit_frame(out: &mut Vec<u8>, group: &str, upto: u64) -> io::Result<()> {
+    append_frame(
+        out,
+        &encode_request(&Request::Commit {
+            group: group.to_string(),
+            upto,
+        }),
+    )
+}
+
 /// Append one framed `Retire` request to `out`, assembled in place.
 pub(crate) fn append_retire_frame(
     out: &mut Vec<u8>,
@@ -2016,6 +2388,28 @@ pub(crate) fn append_delivery_frame(
     body: &[u8],
 ) -> io::Result<()> {
     let _ = append_delivery_frame_with_crc(out, offset, subject, body, None)?;
+    Ok(())
+}
+
+/// [`append_delivery_frame`], appending the optional `bt=<unix ms>` trailer
+/// (`[BT_TAG, bt_le_8]`) when `bt_ms` is `Some` (`REQUIREMENTS` R3).
+pub(crate) fn append_delivery_frame_stamped(
+    out: &mut Vec<u8>,
+    offset: u64,
+    subject: &str,
+    body: &[u8],
+    bt_ms: Option<u64>,
+) -> io::Result<()> {
+    let Some(bt) = bt_ms else {
+        return append_delivery_frame(out, offset, subject, body);
+    };
+    let start = out.len();
+    out.extend_from_slice(&[0u8; HEADER_SIZE]);
+    let payload_start = out.len();
+    put_delivery(out, offset, subject, body);
+    out.push(crate::brecord::BT_TAG);
+    out.extend_from_slice(&encode_u64_le_bytes(bt));
+    let _ = finish_framed(out, start, payload_start, None)?;
     Ok(())
 }
 
@@ -2099,24 +2493,39 @@ fn foreign_protocol_at(ours: u8, reply: &[u8]) -> Option<u8> {
 
 /// Decode a response from a frame payload (bounds-checked; `None` on malformed).
 pub fn decode_response(p: &[u8]) -> Option<Response> {
+    decode_response_with_bt(p).map(|(resp, _)| resp)
+}
+
+/// [`decode_response`], also returning any `bt=<unix ms>` trailer attached to a
+/// [`Response::Delivery`] frame (`REQUIREMENTS` R3).
+pub fn decode_response_with_bt(p: &[u8]) -> Option<(Response, Option<u64>)> {
     let mut r = Reader { b: p };
     if r.u8()? != PROTO_VERSION {
         return None;
     }
-    match r.u8()? {
-        TAG_ACK => Some(Response::PublishAck {
+    let resp = match r.u8()? {
+        TAG_ACK => Response::PublishAck {
             offset: r.u64()?,
             deduped: r.u8()? != 0,
-        }),
-        TAG_DELIVERY => Some(Response::Delivery {
-            offset: r.u64()?,
-            subject: r.string()?,
-            body: r.bytes()?,
-        }),
-        TAG_ERROR => Some(Response::Error {
+        },
+        TAG_DELIVERY => {
+            let offset = r.u64()?;
+            let subject = r.string()?;
+            let body = r.bytes()?;
+            let bt_ms = decode_bt_trailer(r.b)?;
+            return Some((
+                Response::Delivery {
+                    offset,
+                    subject,
+                    body,
+                },
+                bt_ms,
+            ));
+        }
+        TAG_ERROR => Response::Error {
             code: r.u8()?,
             msg: r.string()?,
-        }),
+        },
         TAG_MARK => {
             let next = r.u64()?;
             let head = r.u64()?;
@@ -2129,25 +2538,25 @@ pub fn decode_response(p: &[u8]) -> Option<Response> {
             // seven bytes more than either is a frame cut short; anything past `oldest`'s
             // eight is a later trailer, skipped.
             let (durable, oldest) = decode_mark_trailers(r.b)?;
-            Some(Response::Mark {
+            Response::Mark {
                 next,
                 head,
                 resume,
                 durable,
                 oldest,
-            })
+            }
         }
         TAG_NONCE => {
             let nonce = r.bytes()?;
             let log = r.identity_trailer()?;
             let ext = NonceExt::read(r.b)?;
-            Some(Response::Nonce { nonce, log, ext })
+            Response::Nonce { nonce, log, ext }
         }
-        TAG_BUDGET_REPLY => Some(Response::Budget {
+        TAG_BUDGET_REPLY => Response::Budget {
             subjects: r.u64()?,
             reserved: r.u64()?,
             max: r.u64()?,
-        }),
+        },
         TAG_GAP => {
             let from = r.u64()?;
             let to = r.u64()?;
@@ -2163,10 +2572,12 @@ pub fn decode_response(p: &[u8]) -> Option<Response> {
                 1 => Some(n),
                 _ => return None,
             };
-            Some(Response::Gap(Gap { from, to, records }))
+            Response::Gap(Gap { from, to, records })
         }
-        _ => None,
-    }
+        TAG_STATS_RESP => Response::Stats(decode_wire_stats(&mut r)?),
+        _ => return None,
+    };
+    Some((resp, None))
 }
 
 /// Bytes of a frame's payload read per `read_exact` call: a frame's buffer GROWS as its
@@ -2369,6 +2780,48 @@ mod tests {
         assert_eq!(read_frame(&mut empty).unwrap(), None);
     }
 
+    #[test]
+    fn bt_trailers_are_additive_and_reject_truncation() {
+        let ident = LogIdentity {
+            id: [0xAB; 16],
+            generation: 7,
+        };
+        let rep = encode_replicate_stamped(
+            42,
+            11,
+            22,
+            "/f/alpha/pub/n1/s1/ev",
+            b"body",
+            None,
+            Some(&ident),
+            Some(1_700_000_000_123),
+        );
+        let (req, bt) = decode_request_with_bt(&rep).unwrap();
+        assert_eq!(bt, Some(1_700_000_000_123));
+        assert!(matches!(req, Request::Replicate { seq: 42, .. }));
+        // Truncated bt trailer (`BT_TAG` + <8 bytes) is rejected:
+        assert_eq!(decode_request_with_bt(&rep[..rep.len() - 1]), None);
+
+        let mut framed = Vec::new();
+        append_delivery_frame_stamped(
+            &mut framed,
+            9,
+            "/f/alpha/pub/n1/s1/ev",
+            b"body",
+            Some(1_700_000_000_456),
+        )
+        .unwrap();
+        let payload = read_frame(&mut &framed[..]).unwrap().unwrap();
+        let (resp, rbt) = decode_response_with_bt(&payload).unwrap();
+        assert_eq!(rbt, Some(1_700_000_000_456));
+        assert!(matches!(resp, Response::Delivery { offset: 9, .. }));
+        assert_eq!(
+            decode_response_with_bt(&payload[..payload.len() - 1]),
+            None,
+            "truncated Delivery bt trailer must be rejected"
+        );
+    }
+
     /// The in-place framer is byte-identical to the wire crate's `Frame::encode`, a
     /// framed delivery to `encode_delivery` framed, and an over-cap payload is refused
     /// leaving the buffer as it was.
@@ -2477,18 +2930,20 @@ mod tests {
     /// PROTOCOL ECONOMY, PINNED. The whole fabric —
     /// retained values, bounded reads, a last will, a proof-of-possession attach, an
     /// exactly-once inbox, request/reply, barriers, presence, negotiated liveness and a
-    /// producer's view of its own subject budget, a conditional retire and a tail told what
-    /// retention gave up — rides on SEVENTEEN request tags and SEVEN response tags. This
-    /// test is the budget: it enumerates every byte and fails if an eighteenth request tag
-    /// or an eighth response tag ever decodes, and it pins each tag's NUMBER, so a
+    /// producer's view of its own subject budget, a conditional retire, a tail told what
+    /// retention gave up, broker-stamped wall times (`bt=`), and attach-gated operator
+    /// `Stats` — rides on NINETEEN request tags and EIGHT response tags. This
+    /// test is the budget: it enumerates every byte and fails if a twentieth request tag
+    /// or a ninth response tag ever decodes, and it pins each tag's NUMBER, so a
     /// renumbering that would silently re-interpret an old client's frames breaks the
     /// build instead. `Keepalive` at 0x0D, `IdleMarks` at 0x0E, `Budget` at 0x0F, `Retire`
-    /// at 0x10, `GapNotices` at 0x11, `Budget`'s reply at 0x86 and `Gap` at 0x87 took
-    /// numbers no earlier version decoded: an older broker refuses each request as
-    /// malformed and keeps the connection, and never sends the reply (a `Gap` only to a
-    /// tail that asked). Additions, not reinterpretations; no version change.
+    /// at 0x10, `GapNotices` at 0x11, `BrokerTimes` at 0x12, `Stats` at 0x13, `Budget`'s
+    /// reply at 0x86, `Gap` at 0x87 and `Stats` reply at 0x88 took numbers no earlier
+    /// version decoded: an older broker refuses each request as malformed and keeps the
+    /// connection, and never sends the reply. Additions, not reinterpretations; no version
+    /// change.
     #[test]
-    fn the_tag_budget_is_seventeen_requests_and_seven_responses() {
+    fn the_tag_budget_is_nineteen_requests_and_eight_responses() {
         // Version 2: `Attach` kept its tag (0x07) and its wire SHAPE (a str then a
         // byte string) while its MEANING changed (`{grant, proof}`, answered with a
         // Mark), so under an unchanged version byte a version-1 Attach would decode
@@ -2506,7 +2961,7 @@ mod tests {
         );
 
         // Every tag's NUMBER, pinned against the variant that carries it.
-        let request_tags: [(u8, Request); 17] = [
+        let request_tags: [(u8, Request); 19] = [
             (
                 0x01,
                 Request::Publish {
@@ -2618,6 +3073,13 @@ mod tests {
                 },
             ),
             (0x11, Request::GapNotices),
+            (0x12, Request::BrokerTimes),
+            (
+                0x13,
+                Request::Stats {
+                    filter: String::new(),
+                },
+            ),
         ];
         for (tag, req) in &request_tags {
             let bytes = encode_request(req);
@@ -2629,7 +3091,7 @@ mod tests {
             );
         }
 
-        let response_tags: [(u8, Response); 7] = [
+        let response_tags: [(u8, Response); 8] = [
             (
                 0x81,
                 Response::PublishAck {
@@ -2686,6 +3148,7 @@ mod tests {
                     records: None,
                 }),
             ),
+            (0x88, Response::Stats(WireStats::default())),
         ];
         for (tag, resp) in &response_tags {
             let bytes = encode_response(resp);
@@ -2719,11 +3182,11 @@ mod tests {
         }
         assert_eq!(
             decodable_requests, declared_requests,
-            "exactly seventeen request tags decode, and no other byte does"
+            "exactly nineteen request tags decode, and no other byte does"
         );
         assert_eq!(
             decodable_responses, declared_responses,
-            "exactly seven response tags decode, and no other byte does"
+            "exactly eight response tags decode, and no other byte does"
         );
 
         // And the version byte still gates every tag, response tags included: the
@@ -2808,6 +3271,10 @@ mod tests {
         assert!(!ext(Some(REQUEST_RETIRE)).supports_gap_notices());
         assert!(!ext(Some(REQUEST_GAP_NOTICES)).supports_retire());
         assert!(!ext(None).supports_gap_notices());
+        assert!(ext(Some(REQUEST_TOLD_FETCH)).supports_told_fetch());
+        assert!(!ext(Some(REQUEST_GAP_NOTICES)).supports_told_fetch());
+        assert!(!ext(Some(REQUEST_TOLD_FETCH)).supports_gap_notices());
+        assert!(!ext(None).supports_told_fetch());
         assert_eq!(
             Gap {
                 from: 4,
@@ -3091,7 +3558,7 @@ mod tests {
                 horizon_ms: None,
                 rules: 0,
             }),
-            lineage: Some(Lineage::default().step(3, 41)),
+            lineage: Some(crate::logid::step(&Lineage::default(), 3, 41)),
             retention: None,
             requests: Some(REQUEST_RETIRE),
             health: None,
@@ -3209,7 +3676,7 @@ mod tests {
             horizon_ms: None,
             rules: 1,
         };
-        let lineage = Lineage::default().step(2, 9);
+        let lineage = crate::logid::step(&Lineage::default(), 2, 9);
         for poisoned in [None, Some("a flush failed (injected)".to_string())] {
             let ext = NonceExt {
                 durability: Some(served),

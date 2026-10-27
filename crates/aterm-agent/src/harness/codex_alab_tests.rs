@@ -314,6 +314,10 @@ fn an_unknown_or_unresumable_launch_is_refused_not_guessed() {
             ArgvRefusal::NotResumable("exec".into()),
         ),
         (
+            argv(&["codex", "migrate-nfs-db"]),
+            ArgvRefusal::NotResumable("migrate-nfs-db".into()),
+        ),
+        (
             argv(&["codex", "--remote", "ws://h:1"]),
             ArgvRefusal::NotResumable("--remote".into()),
         ),
@@ -337,6 +341,8 @@ fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
         argv(&["codex", "--no-daemon", "-m", "x"]),
         argv(&["codex", "resume", T1]),
         argv(&["codex", "-c", "exec=1", "fork"]),
+        argv(&["codex", "--image", "a.png", "exec"]),
+        argv(&["codex", "-i", "a.png", "b.png", "migrate-nfs-db"]),
         argv(&["codex", "fix the bug"]),
     ] {
         assert!(is_tui_argv(&tui), "{tui:?}");
@@ -351,6 +357,9 @@ fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
         ]),
         argv(&["codex", "app-server", "daemon", "pid-update-loop"]),
         argv(&["codex", "exec", "hi"]),
+        argv(&["codex", "--image=a.png", "exec", "hi"]),
+        argv(&["codex", "-ia.png", "exec", "hi"]),
+        argv(&["codex", "-m", "x", "migrate-nfs-db"]),
         argv(&["codex", "-m", "x", "agents"]),
     ] {
         assert!(!is_tui_argv(&not), "{not:?}");
@@ -399,11 +408,18 @@ fn the_relaunch_on_exit_reads_a_thread_and_its_instant() {
         resumed_thread(&argv(&["codex", "-m", "o4", "resume", "--no-daemon", t])),
         Some(t.to_string())
     );
+    assert_eq!(
+        resumed_thread(&argv(&["codex", "--image=a.png", "resume", t])),
+        Some(t.to_string()),
+        "an attached image takes no following value"
+    );
     for a in [
         &["codex"][..],
         &["codex", "resume", "--last"][..],
         &["codex", "resume"][..],
         &["codex", "fork", t][..],
+        &["codex", "--image", "a.png", "b.png", "resume", t][..],
+        &["codex", "resume", "--image", "a.png", "b.png", t][..],
         &["codex", "say hello"][..],
     ] {
         assert_eq!(resumed_thread(&argv(a)), None, "{a:?}");

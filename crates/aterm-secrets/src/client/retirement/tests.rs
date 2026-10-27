@@ -429,21 +429,14 @@ fn an_admin_named_later_removes_a_machine_once_it_enrolls() {
     let source = root.path().join("vault");
     let created = create(&paths[0], source.to_str().unwrap(), None, Some("m1")).unwrap();
     let pinned = format!("{}#{}", source.display(), created.signer);
-    // m2 and m3 come in as an open vault lets them: outside the control entry's audience.
+    // m2 and m3 come in by a plain publish, which records no decision and leaves them
+    // outside the control entry's audience.
     for (machine, host) in paths[1..].iter().zip(["m2", "m3"]) {
         let recipient = machine_identity(machine).unwrap().recipient().to_bech32();
         let admin = admin_cached(&paths[0]).unwrap();
         let mut doc = admin.doc.clone();
         doc.add_machine(host, &recipient).unwrap();
-        publish_as(
-            &paths[0],
-            &admin,
-            &doc,
-            false,
-            &[(recipient, AdmissionMethod::Open)],
-            false,
-        )
-        .unwrap();
+        admin_publish(&paths[0], &admin, &doc).unwrap();
         join(
             machine,
             &JoinOptions {

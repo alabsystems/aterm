@@ -161,13 +161,19 @@
 //! - The identity is told to every peer that sends `Hello`, before it authenticates:
 //!   it is a random name for the log, not a secret.
 
-use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use astream_wire::{Frame, HEADER_SIZE};
 
 use crate::storage::Dir;
+
+/// The vocabulary, astream-wire's: the identity and lineage types with their text and wire
+/// forms and [`LogIdentity::continues`], so a reader that keeps offsets outside the log
+/// parses and compares them without linking the broker. This module keeps what only a
+/// broker does with them: the sidecar, minting and deriving an `id`, settling an open, and
+/// recording a lineage step.
+pub use astream_wire::logid::{Lineage, LogIdentity};
 
 #[cfg(clean_islands)]
 #[path = "logid_island.rs"]
@@ -188,140 +194,6 @@ contract_fn! {
     }
 }
 
-/// WHICH log, and WHICH incarnation of its offsets — see the [module docs](self) for
-/// what a consumer must do when either changes.
-///
-/// Displayed (and [parsed](Self::parse)) as `<id in 32 lowercase hex>.<generation>`,
-/// the form to persist beside the offsets it vouches for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LogIdentity {
-    /// Names the log: random when the log was created (or the identity it had cannot
-    /// be read back), derived from its bytes when it predates log identity, and on a
-    /// replica its leader's. Two different logs differ here.
-    pub id: [u8; 16],
-    /// Counts the rewrites of THIS log that may have given one of its offsets to a
-    /// different record (a repair's truncation, a log found shorter than, or different
-    /// from, what its last open saw). Same `id`, different generation: the same log
-    /// file, but its old offsets are as meaningless as another log's.
-    pub generation: u64,
-}
-
-const fn decode_lower_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0' => Some(0),
-        b'1' => Some(1),
-        b'2' => Some(2),
-        b'3' => Some(3),
-        b'4' => Some(4),
-        b'5' => Some(5),
-        b'6' => Some(6),
-        b'7' => Some(7),
-        b'8' => Some(8),
-        b'9' => Some(9),
-        b'a' => Some(10),
-        b'b' => Some(11),
-        b'c' => Some(12),
-        b'd' => Some(13),
-        b'e' => Some(14),
-        b'f' => Some(15),
-        _ => None,
-    }
-}
-
-const fn decode_lower_hex_byte(hi: u8, lo: u8) -> Option<u8> {
-    let Some(h) = decode_lower_nibble(hi) else {
-        return None;
-    };
-    let Some(l) = decode_lower_nibble(lo) else {
-        return None;
-    };
-    Some(((h & 0x0f) << 4) | (l & 0x0f))
-}
-
-const fn decode_id_hex(bytes: &[u8; 32]) -> Option<[u8; 16]> {
-    let Some(b0) = decode_lower_hex_byte(bytes[0], bytes[1]) else {
-        return None;
-    };
-    let Some(b1) = decode_lower_hex_byte(bytes[2], bytes[3]) else {
-        return None;
-    };
-    let Some(b2) = decode_lower_hex_byte(bytes[4], bytes[5]) else {
-        return None;
-    };
-    let Some(b3) = decode_lower_hex_byte(bytes[6], bytes[7]) else {
-        return None;
-    };
-    let Some(b4) = decode_lower_hex_byte(bytes[8], bytes[9]) else {
-        return None;
-    };
-    let Some(b5) = decode_lower_hex_byte(bytes[10], bytes[11]) else {
-        return None;
-    };
-    let Some(b6) = decode_lower_hex_byte(bytes[12], bytes[13]) else {
-        return None;
-    };
-    let Some(b7) = decode_lower_hex_byte(bytes[14], bytes[15]) else {
-        return None;
-    };
-    let Some(b8) = decode_lower_hex_byte(bytes[16], bytes[17]) else {
-        return None;
-    };
-    let Some(b9) = decode_lower_hex_byte(bytes[18], bytes[19]) else {
-        return None;
-    };
-    let Some(b10) = decode_lower_hex_byte(bytes[20], bytes[21]) else {
-        return None;
-    };
-    let Some(b11) = decode_lower_hex_byte(bytes[22], bytes[23]) else {
-        return None;
-    };
-    let Some(b12) = decode_lower_hex_byte(bytes[24], bytes[25]) else {
-        return None;
-    };
-    let Some(b13) = decode_lower_hex_byte(bytes[26], bytes[27]) else {
-        return None;
-    };
-    let Some(b14) = decode_lower_hex_byte(bytes[28], bytes[29]) else {
-        return None;
-    };
-    let Some(b15) = decode_lower_hex_byte(bytes[30], bytes[31]) else {
-        return None;
-    };
-    Some([
-        b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15,
-    ])
-}
-
-const fn decode_decimal_digit(b: u8) -> Option<u64> {
-    if b >= b'0' && b <= b'9' {
-        Some((b - b'0') as u64)
-    } else {
-        None
-    }
-}
-
-const fn parse_u64_ascii_bytes(bytes: &[u8]) -> Option<u64> {
-    let mut rest = bytes;
-    if rest.is_empty() {
-        return None;
-    }
-    let mut acc = 0u64;
-    while let &[b, ref tail @ ..] = rest {
-        let Some(d) = decode_decimal_digit(b) else {
-            return None;
-        };
-        let Some(mul) = acc.checked_mul(10) else {
-            return None;
-        };
-        let Some(next) = mul.checked_add(d) else {
-            return None;
-        };
-        acc = next;
-        rest = tail;
-    }
-    Some(acc)
-}
-
 const fn encode_u64_le_bytes(v: u64) -> [u8; 8] {
     [
         v as u8,
@@ -333,17 +205,6 @@ const fn encode_u64_le_bytes(v: u64) -> [u8; 8] {
         (v >> 48) as u8,
         (v >> 56) as u8,
     ]
-}
-
-const fn decode_u64_le_bytes(b: &[u8; 8]) -> u64 {
-    (b[0] as u64)
-        | ((b[1] as u64) << 8)
-        | ((b[2] as u64) << 16)
-        | ((b[3] as u64) << 24)
-        | ((b[4] as u64) << 32)
-        | ((b[5] as u64) << 40)
-        | ((b[6] as u64) << 48)
-        | ((b[7] as u64) << 56)
 }
 
 const fn encode_u128_le_bytes(v: u128) -> [u8; 16] {
@@ -367,302 +228,27 @@ const fn encode_u128_le_bytes(v: u128) -> [u8; 16] {
     ]
 }
 
-const fn encode_lineage_step(g: u64, c: u64) -> [u8; 16] {
-    [
-        g as u8,
-        (g >> 8) as u8,
-        (g >> 16) as u8,
-        (g >> 24) as u8,
-        (g >> 32) as u8,
-        (g >> 40) as u8,
-        (g >> 48) as u8,
-        (g >> 56) as u8,
-        c as u8,
-        (c >> 8) as u8,
-        (c >> 16) as u8,
-        (c >> 24) as u8,
-        (c >> 32) as u8,
-        (c >> 40) as u8,
-        (c >> 48) as u8,
-        (c >> 56) as u8,
-    ]
-}
-
-const fn decode_lineage_step(s: &[u8; 16]) -> (u64, u64) {
-    let g = (s[0] as u64)
-        | ((s[1] as u64) << 8)
-        | ((s[2] as u64) << 16)
-        | ((s[3] as u64) << 24)
-        | ((s[4] as u64) << 32)
-        | ((s[5] as u64) << 40)
-        | ((s[6] as u64) << 48)
-        | ((s[7] as u64) << 56);
-    let c = (s[8] as u64)
-        | ((s[9] as u64) << 8)
-        | ((s[10] as u64) << 16)
-        | ((s[11] as u64) << 24)
-        | ((s[12] as u64) << 32)
-        | ((s[13] as u64) << 40)
-        | ((s[14] as u64) << 48)
-        | ((s[15] as u64) << 56);
-    (g, c)
-}
-
-impl LogIdentity {
-    /// Bytes the identity takes on the wire: the `id`, then the generation as a
-    /// little-endian `u64`.
-    pub const WIRE_LEN: usize = 24;
-
-    const fn to_wire(self) -> [u8; Self::WIRE_LEN] {
-        let g = self.generation;
-        [
-            self.id[0],
-            self.id[1],
-            self.id[2],
-            self.id[3],
-            self.id[4],
-            self.id[5],
-            self.id[6],
-            self.id[7],
-            self.id[8],
-            self.id[9],
-            self.id[10],
-            self.id[11],
-            self.id[12],
-            self.id[13],
-            self.id[14],
-            self.id[15],
-            g as u8,
-            (g >> 8) as u8,
-            (g >> 16) as u8,
-            (g >> 24) as u8,
-            (g >> 32) as u8,
-            (g >> 40) as u8,
-            (g >> 48) as u8,
-            (g >> 56) as u8,
-        ]
-    }
-
-    const fn decode_wire(b: &[u8; Self::WIRE_LEN]) -> LogIdentity {
-        let id = [
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
-            b[14], b[15],
-        ];
-        let generation = (b[16] as u64)
-            | ((b[17] as u64) << 8)
-            | ((b[18] as u64) << 16)
-            | ((b[19] as u64) << 24)
-            | ((b[20] as u64) << 32)
-            | ((b[21] as u64) << 40)
-            | ((b[22] as u64) << 48)
-            | ((b[23] as u64) << 56);
-        LogIdentity { id, generation }
-    }
-
-    /// Append the wire form to `out`.
-    pub(crate) fn put(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.to_wire());
-    }
-
-    /// Read the wire form from the first [`WIRE_LEN`](Self::WIRE_LEN) bytes of `b`.
-    pub(crate) const fn from_wire(b: &[u8]) -> Option<LogIdentity> {
-        let &[b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18, b19, b20, b21, b22, b23, ref _rest @ ..] =
-            b
-        else {
-            return None;
-        };
-        Some(Self::decode_wire(&[
-            b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18,
-            b19, b20, b21, b22, b23,
-        ]))
-    }
-
-    /// Parse the [`Display`](fmt::Display) form, `<32 lowercase hex>.<generation>`.
-    /// Exactly that form: anything else (upper case, a sign, a missing part) is `None`.
-    pub const fn parse(s: &str) -> Option<LogIdentity> {
-        let &[h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18, h19, h20, h21, h22, h23, h24, h25, h26, h27, h28, h29, h30, h31, b'.', ref gen_bytes @ ..] =
-            s.as_bytes()
-        else {
-            return None;
-        };
-        let Some(id) = decode_id_hex(&[
-            h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18,
-            h19, h20, h21, h22, h23, h24, h25, h26, h27, h28, h29, h30, h31,
-        ]) else {
-            return None;
-        };
-        let Some(generation) = parse_u64_ascii_bytes(gen_bytes) else {
-            return None;
-        };
-        Some(LogIdentity { id, generation })
-    }
-}
-
-impl fmt::Display for LogIdentity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for b in &self.id {
-            write!(f, "{b:02x}")?;
-        }
-        write!(f, ".{}", self.generation)
-    }
-}
-
-/// Where two generations of one log agree: `(generation, common)` steps, newest last,
-/// at most [`Lineage::MAX`] of them. A step `(g, c)` says offsets below `c` name the same
-/// records under generation `g - 1` and generation `g` — recorded when the generation
-/// moved for a loss this log can bound (an unclean stop, a torn batch cut, a repair's
-/// cut), never for a log found shorter, re-based or foreign. See
-/// [`LogIdentity::continues`], which reads it, and the [module docs](self).
+/// `lineage` with the step to `generation` added (`common` the recovered head): every
+/// older step is clamped to `common` too — the log now agrees with an older generation at
+/// most as far as it agrees with the newest — and only the newest [`Lineage::MAX`] are
+/// kept. Only an open records a step, so this is the broker's, built on the wire type's
+/// public [`steps`](Lineage::steps) and [`from_steps`](Lineage::from_steps).
 ///
-/// Told to clients in the answer to `Hello` (`Client::log_lineage`), beside the
-/// identity it qualifies.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct Lineage {
-    steps: Vec<(u64, u64)>,
-}
-
-impl Lineage {
-    /// The most steps kept: older ones fall off, and a reader whose generation is older
-    /// than the window forgets, as before lineage existed.
-    pub const MAX: usize = 8;
-
-    /// The steps, `(generation, common)`, oldest first.
-    #[must_use]
-    pub fn steps(&self) -> &[(u64, u64)] {
-        &self.steps
-    }
-
-    /// The lineage of these `(generation, common)` steps, oldest first: exactly the one a
-    /// `Hello` answer carrying them decodes to (`Client::log_lineage`), and `None` for
-    /// steps that decoder refuses — more than [`MAX`](Self::MAX), or generations that do
-    /// not rise. The two rules are the wire's own (`validate_lineage_wire`); nothing else
-    /// is checked, because the decoder checks nothing else: a `common` is any offset.
-    ///
-    /// WHY IT IS PUBLIC. A reader that keeps offsets outside the log — an embedder's
-    /// bridge, a cursor file — has to be tested against lineages no single real unclean
-    /// open makes: a chain longer than one reboot's, a step missing, a window outrun,
-    /// commons that fall. Without this the one door outside the crate was the `Hello`
-    /// answer, so such a test hand-encoded the extension block (tag `0x02`, its length,
-    /// the steps) and parsed it back through `proto::decode_response`, which pins a
-    /// private layout in someone else's test. This grants nothing new: any broker, or any
-    /// bytes a client parses, can already tell a client every lineage the decoder accepts.
-    /// What a lineage MEANS stays the broker's to say — only an open records one in
-    /// `<log>.id`, and nothing here writes it.
-    #[must_use]
-    pub fn from_steps(steps: &[(u64, u64)]) -> Option<Lineage> {
-        if steps.len() > Self::MAX {
-            return None;
-        }
-        let mut prev: Option<u64> = None;
-        for &(g, _) in steps {
-            if let Some(p) = prev {
-                if g <= p {
-                    return None;
-                }
-            }
-            prev = Some(g);
-        }
-        Some(Lineage {
-            steps: steps.to_vec(),
-        })
-    }
-
-    /// This lineage with the step to `generation` added (`common` the recovered head):
-    /// every older step is clamped to `common` too — the log now agrees with an older
-    /// generation at most as far as it agrees with the newest — and only the newest
-    /// [`MAX`](Self::MAX) are kept.
-    pub(crate) fn step(&self, generation: u64, common: u64) -> Lineage {
-        let keep_old = Self::MAX.saturating_sub(1);
-        let skip = self.steps.len().saturating_sub(keep_old);
-        let mut steps = Vec::new();
-        if let Some(tail) = self.steps.get(skip..) {
-            for &(g, c) in tail {
-                steps.push((g, c.min(common)));
-            }
-        }
-        steps.push((generation, common));
-        Lineage { steps }
-    }
-
-    /// Append the wire form: `n u8`, then `n × (generation u64 LE, common u64 LE)`.
-    pub(crate) fn put(&self, out: &mut Vec<u8>) {
-        out.push(self.steps.len() as u8);
-        for &(g, c) in &self.steps {
-            out.extend_from_slice(&encode_lineage_step(g, c));
+/// A step that does not rise past the newest one is no lineage the wire can carry, and
+/// records none: readers then forget, as for a move without lineage. An open's step
+/// always rises (the generation it moved to is one past every step before it) except
+/// when the generation is already `u64::MAX` and cannot move.
+pub(crate) fn step(lineage: &Lineage, generation: u64, common: u64) -> Lineage {
+    let older = lineage.steps();
+    let skip = older.len().saturating_sub(Lineage::MAX.saturating_sub(1));
+    let mut steps = Vec::new();
+    if let Some(tail) = older.get(skip..) {
+        for &(g, c) in tail {
+            steps.push((g, c.min(common)));
         }
     }
-
-    /// Read the wire form, which must fill `b` exactly; `None` for a short or long
-    /// body, more than [`MAX`](Self::MAX) steps, or generations that do not rise.
-    pub(crate) fn from_wire(b: &[u8]) -> Option<Lineage> {
-        let rest = validate_lineage_wire(b)?;
-        let (chunks, _) = rest.as_chunks::<16>();
-        let mut steps = Vec::new();
-        for chunk in chunks {
-            steps.push(decode_lineage_step(chunk));
-        }
-        Some(Lineage { steps })
-    }
-}
-
-const fn lineage_generations_strictly_increasing(mut rest: &[u8]) -> bool {
-    let mut prev_gen: Option<u64> = None;
-    while let &[b0, b1, b2, b3, b4, b5, b6, b7, _, _, _, _, _, _, _, _, ref tail @ ..] = rest {
-        let g = decode_u64_le_bytes(&[b0, b1, b2, b3, b4, b5, b6, b7]);
-        if let Some(pg) = prev_gen {
-            if g <= pg {
-                return false;
-            }
-        }
-        prev_gen = Some(g);
-        rest = tail;
-    }
-    rest.is_empty()
-}
-
-const fn validate_lineage_wire(b: &[u8]) -> Option<&[u8]> {
-    let &[n, ref rest @ ..] = b else {
-        return None;
-    };
-    let n = n as usize;
-    if n > Lineage::MAX || rest.len() != n * 16 {
-        return None;
-    }
-    if !lineage_generations_strictly_increasing(rest) {
-        return None;
-    }
-    Some(rest)
-}
-
-impl LogIdentity {
-    /// Whether offsets a reader kept under `earlier` still name records here, and how
-    /// far: `Some(k)` means every offset below `k` names the same record under both, so
-    /// the reader resumes at `min(cursor, k)` — skipping nothing, re-reading nothing
-    /// below the fork. `Some(u64::MAX)` is the same identity (nothing moved). `None` is
-    /// another log as far as this can tell — another `id`, a generation newer than this
-    /// one, or a chain with a step missing (a move recorded without lineage, or one older
-    /// than the window) — and the reader forgets its offsets, exactly as before lineage.
-    ///
-    /// `lineage` is the one told beside `self` (the answer to the same `Hello`).
-    #[must_use]
-    pub fn continues(&self, earlier: LogIdentity, lineage: &Lineage) -> Option<u64> {
-        if earlier.id != self.id || earlier.generation > self.generation {
-            return None;
-        }
-        let mut agree = u64::MAX;
-        for generation in earlier.generation.checked_add(1)?..=self.generation {
-            let mut found = None;
-            for &(g, c) in &lineage.steps {
-                if g == generation {
-                    found = Some(c);
-                    break;
-                }
-            }
-            let common = found?;
-            agree = agree.min(common);
-        }
-        Some(agree)
-    }
+    steps.push((generation, common));
+    Lineage::from_steps(&steps).unwrap_or_default()
 }
 
 /// How the run that last wrote `<log>.id` stood with the log. Only FORMAT 2 records
@@ -729,12 +315,12 @@ pub(crate) struct Sidecar {
     /// How the writing run stood with the log ([`State`]).
     pub(crate) state: State,
     /// The tier that run served ([`SERVED_STRICT`] and its siblings).
-    served: u8,
+    pub(crate) served: u8,
     /// That run's boot ([`astream_sys::boot_session`]); all zero when unknown.
-    boot: [u8; 16],
+    pub(crate) boot: [u8; 16],
     /// Whether the log was on the boot volume, the device that loses power only
     /// together with the kernel (so the same-boot rule can trust its page cache).
-    boot_volume: bool,
+    pub(crate) boot_volume: bool,
     /// A head the log is DURABLE through: everything below it was flushed in full by an
     /// open (after its flush) or a clean close. `None` for a FORMAT 1 record. Above a
     /// FORMAT 2 floor recovery judges damage by the batch marks — a sealing build's
@@ -1338,7 +924,7 @@ pub(crate) fn settle(prior: &Prior, f: &Facts<'_>) -> Settled {
             let continuous =
                 f.pre_cut_head >= p.head && f.base >= p.base && p.still_names(f.pre_cut, f.base);
             let lineage = if (own_loss && continuous) || f.lineage_on_shorter {
-                p.lineage.step(generation, f.kept_head)
+                step(&p.lineage, generation, f.kept_head)
             } else {
                 Lineage::default()
             };
@@ -1461,7 +1047,7 @@ pub(crate) fn adopt(dir: &Dir, sidecar: &Sidecar, leader: LogIdentity) -> io::Re
         boot: sidecar.boot,
         boot_volume: sidecar.boot_volume,
         floor: sidecar.floor,
-        lineage: Lineage { steps: Vec::new() },
+        lineage: Lineage::default(),
     };
     write(dir, &adopted).map(|()| adopted)
 }
@@ -1619,39 +1205,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_display_form_round_trips_and_nothing_else_parses() {
-        let i = LogIdentity {
-            id: *b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\xfd\xfe\xff",
-            generation: 42,
-        };
-        let s = i.to_string();
-        assert_eq!(s, "000102030405060708090a0b0cfdfeff.42");
-        assert_eq!(LogIdentity::parse(&s), Some(i));
-        for bad in [
-            "",
-            "000102030405060708090a0b0cfdfeff",
-            "000102030405060708090a0b0cfdfeff.",
-            "000102030405060708090A0B0CFDFEFF.42",
-            "000102030405060708090a0b0cfdfeff.+42",
-            "000102030405060708090a0b0cfdfe.42",
-            "+00102030405060708090a0b0cfdfeff.42",
-            "000102030405060708090a0b0cfdfeff.18446744073709551616",
-        ] {
-            assert_eq!(LogIdentity::parse(bad), None, "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn the_wire_form_round_trips() {
-        let i = ident(7, u64::MAX);
-        let mut b = Vec::new();
-        i.put(&mut b);
-        assert_eq!(b.len(), LogIdentity::WIRE_LEN);
-        assert_eq!(LogIdentity::from_wire(&b), Some(i));
-        assert_eq!(LogIdentity::from_wire(&b[..23]), None);
-    }
-
     fn sidecar(identity: LogIdentity, lineage: Lineage) -> Sidecar {
         Sidecar {
             identity,
@@ -1670,7 +1223,7 @@ mod tests {
 
     #[test]
     fn a_sidecar_round_trips_and_a_damaged_one_reads_as_none() {
-        let s = sidecar(ident(3, 9), Lineage::default().step(9, 7));
+        let s = sidecar(ident(3, 9), step(&Lineage::default(), 9, 7));
         let framed = Frame::new(s.encode()).encode().unwrap();
         assert_eq!(Sidecar::decode(&framed), Some(s.clone()));
         let mut flipped = framed.clone();
@@ -1817,7 +1370,7 @@ mod tests {
             assert!(verdict.is_some(), "{prior_state:?}");
             let settled = Settled {
                 identity: ident(1, 1),
-                lineage: Lineage::default().step(1, 11),
+                lineage: step(&Lineage::default(), 1, 11),
             };
             let record = Record {
                 settled: &settled,
@@ -1867,24 +1420,20 @@ mod tests {
         assert!(!Prior::Absent.same_boot(boot, true));
     }
 
-    /// Lineage clamps older steps to each newer common, keeps the newest eight, and
-    /// `continues` reads the chain: the same identity continues everywhere, a gap in the
-    /// chain or another id does not.
+    /// An open's lineage step clamps older steps to each newer common and keeps the
+    /// newest eight, and `continues` (astream-wire's) reads the chain it builds: the same
+    /// identity continues everywhere, a gap in the chain, a window outrun or another id
+    /// does not. A step that does not rise records no lineage at all.
     #[test]
-    fn lineage_clamps_keeps_eight_and_continues_reads_the_chain() {
-        let l = Lineage::default().step(1, 10).step(2, 7).step(3, 9);
+    fn a_step_clamps_keeps_eight_and_continues_reads_the_chain() {
+        let l = step(&step(&step(&Lineage::default(), 1, 10), 2, 7), 3, 9);
         assert_eq!(l.steps(), &[(1, 7), (2, 7), (3, 9)]);
         let now = ident(5, 3);
         assert_eq!(now.continues(ident(5, 3), &l), Some(u64::MAX));
         assert_eq!(now.continues(ident(5, 2), &l), Some(9));
         assert_eq!(now.continues(ident(5, 0), &l), Some(7));
         assert_eq!(now.continues(ident(6, 0), &l), None, "another log");
-        assert_eq!(
-            ident(5, 2).continues(ident(5, 3), &l),
-            None,
-            "a newer generation"
-        );
-        let gap = Lineage::default().step(1, 10).step(3, 9);
+        let gap = step(&step(&Lineage::default(), 1, 10), 3, 9);
         assert_eq!(
             now.continues(ident(5, 0), &gap),
             None,
@@ -1892,7 +1441,7 @@ mod tests {
         );
         let mut long = Lineage::default();
         for g in 1..=10 {
-            long = long.step(g, 100 - g);
+            long = step(&long, g, 100 - g);
         }
         assert_eq!(long.steps().len(), Lineage::MAX);
         assert_eq!(long.steps()[0], (3, 90));
@@ -1903,137 +1452,18 @@ mod tests {
         );
         assert_eq!(ident(5, 10).continues(ident(5, 2), &long), Some(90));
         let mut wire = Vec::new();
-        l.put(&mut wire);
-        assert_eq!(Lineage::from_wire(&wire), Some(l.clone()));
-        assert_eq!(Lineage::from_wire(&wire[..wire.len() - 1]), None);
-        let mut falling = Vec::new();
-        Lineage {
-            steps: vec![(3, 1), (2, 1)],
-        }
-        .put(&mut falling);
-        assert_eq!(Lineage::from_wire(&falling), None, "generations must rise");
-    }
-
-    /// Step lists for the `from_steps` sweep: EVERY list of up to four steps over
-    /// generations {0, 1, 2, u64::MAX} (equal, falling and rising neighbours, the ends of
-    /// the range), each with commons that rise, fall and sit at both ends; and, for every
-    /// length up to two past [`Lineage::MAX`], the rising chain `1..=n` alone and with
-    /// each neighbour made equal and made to fall — the only lists that reach the cap,
-    /// since a small alphabet cannot rise that far.
-    fn step_lists() -> Vec<Vec<(u64, u64)>> {
-        const GENS: [u64; 4] = [0, 1, 2, u64::MAX];
-        let commons = |i: usize| -> u64 {
-            match i % 3 {
-                0 => 0,
-                1 => u64::MAX,
-                _ => 7 - i as u64,
-            }
-        };
-        let mut lists: Vec<Vec<(u64, u64)>> = vec![Vec::new()];
-        let mut frontier: Vec<Vec<u64>> = vec![Vec::new()];
-        for _ in 0..4 {
-            let mut next = Vec::new();
-            for gens in &frontier {
-                for g in GENS {
-                    let mut longer = gens.clone();
-                    longer.push(g);
-                    lists.push(
-                        longer
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &g)| (g, commons(i)))
-                            .collect(),
-                    );
-                    next.push(longer);
-                }
-            }
-            frontier = next;
-        }
-        for n in 1..=Lineage::MAX + 2 {
-            let chain: Vec<(u64, u64)> = (1..=n as u64).map(|g| (g, 100 - g)).collect();
-            lists.push(chain.clone());
-            for i in 1..n {
-                let mut equal = chain.clone();
-                equal[i].0 = equal[i - 1].0;
-                lists.push(equal);
-                let mut falling = chain.clone();
-                falling[i].0 = 0;
-                lists.push(falling);
-            }
-        }
-        lists
-    }
-
-    /// The decoder's answer for `steps`: their wire form, built by hand from the layout
-    /// the extension block's table documents (`n u8`, then `n × (generation u64 LE,
-    /// common u64 LE)`) rather than by `Lineage::put`, read by `Lineage::from_wire` — the
-    /// function every `Hello` answer's lineage entry goes through.
-    fn decoded(steps: &[(u64, u64)]) -> Option<Lineage> {
-        let mut wire = vec![u8::try_from(steps.len()).unwrap()];
-        for &(g, c) in steps {
-            wire.extend_from_slice(&g.to_le_bytes());
-            wire.extend_from_slice(&c.to_le_bytes());
-        }
-        Lineage::from_wire(&wire)
-    }
-
-    /// `Lineage::from_steps` builds exactly the lineage the wire decoder reads from the
-    /// same steps, and refuses exactly what the decoder refuses, over every list of
-    /// [`step_lists`]: both of the decoder's rules are met (lists past the cap, lists whose
-    /// generations do not rise) and so are lists it accepts, short and at the cap.
-    ///
-    /// Negative controls, on the same sweep: a constructor that skips the cap and one
-    /// that skips the rising rule each disagree with the decoder, so the sweep reaches
-    /// both rules and a `from_steps` that lost either would fail it.
-    #[test]
-    fn from_steps_agrees_with_the_decoder() {
-        /// How many of `lists` `build` answers otherwise than the decoder.
-        fn disagreements(
-            lists: &[Vec<(u64, u64)>],
-            build: impl Fn(&[(u64, u64)]) -> Option<Lineage>,
-        ) -> usize {
-            lists
-                .iter()
-                .filter(|steps| build(steps) != decoded(steps))
-                .count()
-        }
-        let lists = step_lists();
-        assert_eq!(disagreements(&lists, Lineage::from_steps), 0);
-        let accepted = lists.iter().filter(|s| decoded(s).is_some()).count();
-        assert!(
-            accepted > 0 && accepted < lists.len(),
-            "the sweep holds lists the decoder accepts and lists it refuses"
+        long.put(&mut wire);
+        assert_eq!(
+            Lineage::from_wire(&wire),
+            Some(long.clone()),
+            "the wire carries it"
         );
-        assert!(
-            lists
-                .iter()
-                .any(|s| s.len() == Lineage::MAX && decoded(s).is_some()),
-            "a lineage at the cap is accepted"
-        );
-        for steps in &lists {
-            if let Some(l) = Lineage::from_steps(steps) {
-                assert_eq!(l.steps(), &steps[..], "the steps, as given");
-            }
-        }
-
-        let rises = |steps: &[(u64, u64)]| steps.windows(2).all(|w| w[0].0 < w[1].0);
-        let uncapped = |steps: &[(u64, u64)]| {
-            rises(steps).then(|| Lineage {
-                steps: steps.to_vec(),
-            })
-        };
-        let unordered = |steps: &[(u64, u64)]| {
-            (steps.len() <= Lineage::MAX).then(|| Lineage {
-                steps: steps.to_vec(),
-            })
-        };
-        assert!(
-            disagreements(&lists, uncapped) > 0,
-            "NEGATIVE CONTROL: without the cap, a list past it is accepted"
-        );
-        assert!(
-            disagreements(&lists, unordered) > 0,
-            "NEGATIVE CONTROL: without the rising rule, a falling list is accepted"
+        let at_max = step(&Lineage::default(), u64::MAX, 4);
+        assert_eq!(at_max.steps(), &[(u64::MAX, 4)]);
+        assert_eq!(
+            step(&at_max, u64::MAX, 3),
+            Lineage::default(),
+            "a step that does not rise records none"
         );
     }
 

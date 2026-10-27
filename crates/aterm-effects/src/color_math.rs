@@ -140,6 +140,97 @@ pub(crate) const fn hypot_f32(x: f32, y: f32) -> f32 {
 }
 
 #[inline]
+const fn asin_pos_small_f64(u: f64) -> f64 {
+    let u2 = u * u;
+    let mut term = u;
+    let mut sum = u;
+    let mut n = 1u32;
+    while n <= 12 {
+        let two_n = (2 * n) as f64;
+        term *= u2 * (two_n - 1.0) * (two_n - 1.0) / (two_n * (two_n + 1.0));
+        sum += term;
+        n += 1;
+    }
+    sum
+}
+
+#[inline]
+pub(crate) const fn asin_f32(x: f32) -> f32 {
+    if x.is_nan() || x < -1.0 || x > 1.0 {
+        return f32::NAN;
+    }
+    if x == 0.0 {
+        return x;
+    }
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let u = (x * sign) as f64;
+    let mag = if u <= 0.5 {
+        asin_pos_small_f64(u)
+    } else {
+        let t = 0.5 * (1.0 - u);
+        let r = if t <= 0.0 {
+            0.0
+        } else {
+            let mut y = sqrt_f64_to_f32(t) as f64;
+            y = 0.5 * (y + t / y);
+            y
+        };
+        std::f64::consts::FRAC_PI_2 - 2.0 * asin_pos_small_f64(r)
+    };
+    (mag as f32) * sign
+}
+
+#[inline]
+const fn atan_unit_f64(t: f64) -> f64 {
+    const TAN_PI_12: f64 = 0.267_949_192_431_122_7;
+    const SQRT_3: f64 = 1.732_050_807_568_877_2;
+    let (u, base) = if t > TAN_PI_12 {
+        (
+            (SQRT_3 * t - 1.0) / (SQRT_3 + t),
+            core::f64::consts::FRAC_PI_6,
+        )
+    } else {
+        (t, 0.0)
+    };
+    let u2 = u * u;
+    let mut term = u;
+    let mut sum = u;
+    let mut k = 1;
+    while k <= 11 {
+        term *= -u2;
+        sum += term / (2 * k + 1) as f64;
+        k += 1;
+    }
+    base + sum
+}
+
+#[inline]
+pub(crate) const fn atan2_f32(y: f32, x: f32) -> f32 {
+    let (yf, xf) = (y as f64, x as f64);
+    let (ay, ax) = (yf.abs(), xf.abs());
+    if ax == 0.0 && ay == 0.0 {
+        return 0.0;
+    }
+    let a = if ax >= ay {
+        atan_unit_f64(ay / ax)
+    } else {
+        core::f64::consts::FRAC_PI_2 - atan_unit_f64(ax / ay)
+    };
+    let rad = if xf < 0.0 {
+        if yf < 0.0 {
+            a - core::f64::consts::PI
+        } else {
+            core::f64::consts::PI - a
+        }
+    } else if yf < 0.0 {
+        -a
+    } else {
+        a
+    };
+    rad as f32
+}
+
+#[inline]
 pub(crate) const fn ln_pos_f64(x: f32) -> f64 {
     let xf = x as f64;
     let bits = xf.to_bits();
@@ -265,6 +356,7 @@ pub(crate) const fn srgb_encode(c: f32) -> u8 {
 }
 
 impl RelativeLuminanceTable {
+    #[inline]
     const fn build() -> Self {
         let mut linear = [0.0f32; 256];
         let mut red = [0.0f32; 256];
@@ -343,6 +435,7 @@ pub const fn contrast_ratio(a: u32, b: u32) -> f32 {
 
 /// Floor `rgb`'s WCAG contrast against `ground` to at least `min` by moving its lightness alone.
 #[must_use]
+#[inline]
 pub const fn floor_contrast_keeping_hue(rgb: u32, ground: u32, min: f32) -> u32 {
     let rgb = rgb & 0x00FF_FFFF;
     if min.is_nan() || min <= 1.0 {
@@ -363,41 +456,13 @@ pub const fn floor_contrast_keeping_hue(rgb: u32, ground: u32, min: f32) -> u32 
     if !meets(table, lg, min, end) {
         return end;
     }
-    let (r, g, b) = (
-        ((rgb >> 16) & 0xff) as f32,
-        ((rgb >> 8) & 0xff) as f32,
-        (rgb & 0xff) as f32,
-    );
-    let peak = r.max(g).max(b);
-    let up = if peak > 0.0 { 255.0 / peak } else { 1.0 };
-    let (r_up, g_up, b_up) = (r * up, g * up, b * up);
-    #[inline]
-    const fn round_chan(c: f32) -> u32 {
-        c.round().clamp(0.0, 255.0) as u32
-    }
-    #[inline]
-    const fn pack(r: f32, g: f32, b: f32) -> u32 {
-        (round_chan(r) << 16) | (round_chan(g) << 8) | round_chan(b)
-    }
+    let (r, g, b, up, r_up, g_up, b_up) = hue_path_endpoints(rgb);
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (rgb, end);
     let mut i = 0;
     while i < 24 {
         let mid = 0.5 * (lo + hi);
-        let mid_rgb = if darken {
-            let s = 1.0 - mid;
-            pack(r * s, g * s, b * s)
-        } else if mid <= 0.5 {
-            let s = 1.0 + (up - 1.0) * (mid * 2.0);
-            pack(r * s, g * s, b * s)
-        } else {
-            let u = (mid - 0.5) * 2.0;
-            pack(
-                r_up + (255.0 - r_up) * u,
-                g_up + (255.0 - g_up) * u,
-                b_up + (255.0 - b_up) * u,
-            )
-        };
+        let mid_rgb = hue_path_at(r, g, b, up, r_up, g_up, b_up, darken, mid);
         if mid_rgb == lo_rgb {
             lo = mid;
         } else if mid_rgb == hi_rgb || meets(table, lg, min, mid_rgb) {
@@ -415,9 +480,64 @@ pub const fn floor_contrast_keeping_hue(rgb: u32, ground: u32, min: f32) -> u32 
     hi_rgb
 }
 
+#[inline]
+#[must_use]
+pub(crate) const fn hue_path_endpoints(rgb: u32) -> (f32, f32, f32, f32, f32, f32, f32) {
+    let (r, g, b) = (
+        ((rgb >> 16) & 0xff) as f32,
+        ((rgb >> 8) & 0xff) as f32,
+        (rgb & 0xff) as f32,
+    );
+    let peak = r.max(g).max(b);
+    let up = if peak > 0.0 { 255.0 / peak } else { 1.0 };
+    (r, g, b, up, r * up, g * up, b * up)
+}
+
+#[inline]
+#[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "precomputed endpoints passed across bisection steps"
+)]
+pub(crate) const fn hue_path_at(
+    r: f32,
+    g: f32,
+    b: f32,
+    up: f32,
+    r_up: f32,
+    g_up: f32,
+    b_up: f32,
+    darken: bool,
+    t: f32,
+) -> u32 {
+    #[inline]
+    const fn round_chan(c: f32) -> u32 {
+        c.round().clamp(0.0, 255.0) as u32
+    }
+    #[inline]
+    const fn pack(r: f32, g: f32, b: f32) -> u32 {
+        (round_chan(r) << 16) | (round_chan(g) << 8) | round_chan(b)
+    }
+    if darken {
+        let s = 1.0 - t;
+        pack(r * s, g * s, b * s)
+    } else if t <= 0.5 {
+        let s = 1.0 + (up - 1.0) * (t * 2.0);
+        pack(r * s, g * s, b * s)
+    } else {
+        let u = (t - 0.5) * 2.0;
+        pack(
+            r_up + (255.0 - r_up) * u,
+            g_up + (255.0 - g_up) * u,
+            b_up + (255.0 - b_up) * u,
+        )
+    }
+}
+
 /// Lift `rgb` along its hue (its peak scaled to full, then tinted toward white) to the least
 /// lightness at which `meets` holds, `meets` taken to hold from there to white: `rgb` itself where
 /// it already does, white where nothing short of white does.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn lift_keeping_hue(rgb: u32, meets: impl Fn(u32) -> bool) -> u32 {
     let rgb = rgb & 0x00FF_FFFF;
@@ -430,39 +550,19 @@ pub(crate) fn lift_keeping_hue(rgb: u32, meets: impl Fn(u32) -> bool) -> u32 {
 /// The first colour on `rgb`'s hue path at which `meets` holds, by bisection: toward black when
 /// `darken`, else its peak scaled to full and then tinted toward white; the path's end where
 /// `meets` fails even there.
+#[cfg(test)]
 fn least_on_hue_path(rgb: u32, darken: bool, meets: impl Fn(u32) -> bool) -> u32 {
     let end = if darken { 0x0000_0000 } else { 0x00FF_FFFF };
     if !meets(end) {
         return end;
     }
-    let chan = |sh: u32| ((rgb >> sh) & 0xff) as f32;
-    let (r, g, b) = (chan(16), chan(8), chan(0));
-    let peak = r.max(g).max(b);
-    let up = if peak > 0.0 { 255.0 / peak } else { 1.0 };
-    let (r_up, g_up, b_up) = (r * up, g * up, b * up);
-    let pack = |r: f32, g: f32, b: f32| {
-        let q = |c: f32| (c.round().clamp(0.0, 255.0)) as u32;
-        (q(r) << 16) | (q(g) << 8) | q(b)
-    };
-    let path = |t: f32| -> u32 {
-        if darken {
-            let s = 1.0 - t;
-            pack(r * s, g * s, b * s)
-        } else if t <= 0.5 {
-            let s = 1.0 + (up - 1.0) * (t * 2.0);
-            pack(r * s, g * s, b * s)
-        } else {
-            let u = (t - 0.5) * 2.0;
-            let tint = |c_up: f32| c_up + (255.0 - c_up) * u;
-            pack(tint(r_up), tint(g_up), tint(b_up))
-        }
-    };
+    let (r, g, b, up, r_up, g_up, b_up) = hue_path_endpoints(rgb);
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (rgb & 0x00FF_FFFF, end);
     let mut i = 0;
     while i < 24 {
         let mid = 0.5 * (lo + hi);
-        let mid_rgb = path(mid);
+        let mid_rgb = hue_path_at(r, g, b, up, r_up, g_up, b_up, darken, mid);
         if mid_rgb == lo_rgb {
             lo = mid;
         } else if mid_rgb == hi_rgb || meets(mid_rgb) {
@@ -596,10 +696,10 @@ pub(crate) const fn oklab_to_rgb([l, a, b]: [f32; 3]) -> u32 {
 /// The Euclidean OKLab distance between two `0x00RRGGBB` colours.
 #[cfg(test)]
 #[inline]
-pub(crate) fn oklab_distance(a: u32, b: u32) -> f32 {
+pub(crate) const fn oklab_distance(a: u32, b: u32) -> f32 {
     let (x, y) = (oklab(a), oklab(b));
     let (dl, da, db) = (x[0] - y[0], x[1] - y[1], x[2] - y[2]);
-    (dl * dl + da * da + db * db).sqrt()
+    sqrt_f32(dl * dl + da * da + db * db)
 }
 
 /// HSV (`h` degrees, `s`/`v` in `0..=1`) → `0x00RRGGBB`.

@@ -344,6 +344,7 @@ pub struct Ledger {
 
 impl Ledger {
     /// An empty ledger under `limits`.
+    #[inline]
     #[must_use]
     pub const fn new(limits: Limits) -> Ledger {
         Ledger {
@@ -395,6 +396,7 @@ impl Ledger {
     }
 
     /// Where the work stands.
+    #[inline]
     #[must_use]
     pub const fn outcome(&self) -> Outcome {
         match self.void {
@@ -406,6 +408,7 @@ impl Ledger {
     }
 
     /// Worker `w`'s state.
+    #[inline]
     #[must_use]
     pub const fn worker(&self, w: WorkerId) -> Option<WorkerState> {
         let workers = self.workers.as_slice();
@@ -425,6 +428,7 @@ impl Ledger {
     }
 
     /// The current search's job `slot`.
+    #[inline]
     #[must_use]
     pub const fn job(&self, slot: u32) -> Option<JobState> {
         let jobs = self.jobs.as_slice();
@@ -445,6 +449,7 @@ impl Ledger {
 
     /// The late results of the current search's job `slot` that wait for its claim, to be
     /// compared with it when it is accepted (design §11.5).
+    #[inline]
     #[must_use]
     pub fn awaiting(&self, slot: u32) -> &[Digest] {
         match self.stale.get(&slot) {
@@ -472,6 +477,7 @@ impl Ledger {
     }
 
     /// The earliest time a [`Self::tick`] can change anything.
+    #[inline]
     #[must_use]
     pub const fn next_deadline(&self) -> Option<Nanos> {
         let workers = self.workers.as_slice();
@@ -495,6 +501,7 @@ impl Ledger {
         best
     }
 
+    #[inline]
     const fn clock(&mut self, now: Nanos) -> Result<(), ClockBackwards> {
         if now < self.latest {
             return Err(ClockBackwards {
@@ -506,6 +513,7 @@ impl Ledger {
         Ok(())
     }
 
+    #[inline]
     const fn set_worker(&mut self, w: WorkerId, s: WorkerState) {
         let workers = self.workers.as_mut_slice();
         let idx = index(w.0);
@@ -514,6 +522,7 @@ impl Ledger {
         }
     }
 
+    #[inline]
     const fn set_job(&mut self, slot: u32, s: JobState) {
         let jobs = self.jobs.as_mut_slice();
         let idx = index(slot);
@@ -523,6 +532,7 @@ impl Ledger {
     }
 
     /// `w` gone for `why`, and killed.
+    #[inline]
     fn gone(&mut self, w: WorkerId, why: Gone, out: &mut Vec<Effect>) {
         self.set_worker(w, WorkerState::Gone(why));
         match why {
@@ -534,6 +544,7 @@ impl Ledger {
     }
 
     /// The job `lease` held is open again, or exhausted after its last allowed lease.
+    #[inline]
     fn release(&mut self, lease: Token) {
         if lease.search != self.search || self.job(lease.slot) != Some(JobState::Leased { lease }) {
             return;
@@ -551,6 +562,7 @@ impl Ledger {
     }
 
     /// Voids the work for `by` (once), cancelling every open job and holder.
+    #[inline]
     fn void_with(&mut self, by: VoidBy, now: Nanos, out: &mut Vec<Effect>) {
         if self.void.is_some() {
             return;
@@ -559,16 +571,23 @@ impl Ledger {
         self.cancel_jobs(now, out);
     }
 
+    #[inline]
     fn cancel_jobs(&mut self, now: Nanos, out: &mut Vec<Effect>) {
-        for j in &mut self.jobs {
-            if matches!(j, JobState::Pending { .. } | JobState::Leased { .. }) {
-                *j = JobState::Cancelled;
+        let mut ji = 0;
+        while ji < self.jobs.len() {
+            if matches!(
+                self.jobs[ji],
+                JobState::Pending { .. } | JobState::Leased { .. }
+            ) {
+                self.jobs[ji] = JobState::Cancelled;
             }
+            ji += 1;
         }
         let until = now.saturating_add(self.limits.grace_ns);
-        for (i, s) in self.workers.iter_mut().enumerate() {
-            if let WorkerState::Busy { lease, k, .. } = *s {
-                *s = WorkerState::Draining {
+        let mut i = 0;
+        while i < self.workers.len() {
+            if let WorkerState::Busy { lease, k, .. } = self.workers[i] {
+                self.workers[i] = WorkerState::Draining {
                     lease,
                     until,
                     why: Drain::Cancelled,
@@ -577,17 +596,20 @@ impl Ledger {
                 };
                 out.push(Effect::Cancel(WorkerId(wid(i)), lease));
             }
+            i += 1;
         }
     }
 
     /// After every call: exhaustion or no workers.
+    #[inline]
     fn settle(&mut self, now: Nanos, out: &mut Vec<Effect>) {
         if !self.open || self.void.is_some() {
             return;
         }
         let mut pending = 0usize;
-        for (slot, j) in self.jobs.iter().enumerate() {
-            match j {
+        let mut slot = 0;
+        while slot < self.jobs.len() {
+            match self.jobs[slot] {
                 JobState::Exhausted => {
                     let refusal = LeaseRefusal::Exhausted { slot: wid(slot) };
                     self.void_with(VoidBy::Ledger(refusal), now, out);
@@ -598,17 +620,20 @@ impl Ledger {
                 }
                 JobState::Claimed { .. } | JobState::Cancelled => {}
             }
+            slot += 1;
         }
         if pending > 0 {
             let mut able = false;
-            for s in &self.workers {
+            let mut wi = 0;
+            while wi < self.workers.len() {
                 if matches!(
-                    s,
+                    self.workers[wi],
                     WorkerState::Joining { .. } | WorkerState::Idle | WorkerState::Busy { .. }
                 ) {
                     able = true;
                     break;
                 }
+                wi += 1;
             }
             if !able {
                 let refusal = LeaseRefusal::NoWorkers {
@@ -623,32 +648,40 @@ impl Ledger {
     /// §11.5); otherwise changes nothing. Design §11.3's step 5 runs only after it.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn finish(&mut self, now: Nanos) -> Result<(), ClockBackwards> {
         self.clock(now)?;
         if !self.open || self.void.is_some() {
             return Ok(());
         }
-        for j in &self.jobs {
-            if !matches!(j, JobState::Claimed { .. }) {
+        let mut ji = 0;
+        while ji < self.jobs.len() {
+            if !matches!(self.jobs[ji], JobState::Claimed { .. }) {
                 return Ok(());
             }
+            ji += 1;
         }
-        for s in &self.workers {
-            if matches!(s, WorkerState::Draining { .. }) {
+        let mut wi = 0;
+        while wi < self.workers.len() {
+            if matches!(self.workers[wi], WorkerState::Draining { .. }) {
                 return Ok(());
             }
+            wi += 1;
         }
         self.open = false;
-        for j in &self.jobs {
-            if let JobState::Claimed { lease, digest } = *j {
+        let mut ji = 0;
+        while ji < self.jobs.len() {
+            if let JobState::Claimed { lease, digest } = self.jobs[ji] {
                 self.finished.insert(lease, digest);
             }
+            ji += 1;
         }
         self.stale.clear();
         Ok(())
     }
 
     /// `w`'s frame voids the search for `by`: `w` is killed first, so it is sent no `Cancel`.
+    #[inline]
     fn refuse_from(&mut self, w: WorkerId, by: VoidBy, now: Nanos, out: &mut Vec<Effect>) {
         if !matches!(self.worker(w), Some(WorkerState::Gone(_)) | None) {
             self.gone(w, Gone::Refused, out);
@@ -656,6 +689,7 @@ impl Ledger {
         self.void_with(by, now, out);
     }
 
+    #[inline]
     fn refuse(&mut self, w: WorkerId, r: LeaseRefusal, now: Nanos, out: &mut Vec<Effect>) {
         self.refuse_from(w, VoidBy::Ledger(r), now, out);
     }
@@ -663,6 +697,7 @@ impl Ledger {
     /// A new worker, `Joining`; `None` past [`Limits::max_workers`].
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn join(&mut self, now: Nanos) -> Result<Option<WorkerId>, ClockBackwards> {
         self.clock(now)?;
         if self.workers.len() >= self.limits.max_workers {
@@ -678,6 +713,7 @@ impl Ledger {
     /// Nothing happens while a search is open, after a void, or for a serial not above the last.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn begin(
         &mut self,
         search: u32,
@@ -700,6 +736,7 @@ impl Ledger {
     /// `w`'s hello: `Ok` when every identity field matched, else the first that differs.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn hello(
         &mut self,
         w: WorkerId,
@@ -723,6 +760,7 @@ impl Ledger {
     /// Leases `w`, if it is idle, the lowest pending job of the open search.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn lease(&mut self, w: WorkerId, now: Nanos) -> Result<Vec<Effect>, ClockBackwards> {
         self.clock(now)?;
         let mut out = Vec::new();
@@ -735,6 +773,7 @@ impl Ledger {
     /// after every event.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn assign(&mut self, now: Nanos) -> Result<Vec<Effect>, ClockBackwards> {
         self.clock(now)?;
         let mut out = Vec::new();
@@ -743,16 +782,19 @@ impl Ledger {
         Ok(out)
     }
 
+    #[inline]
     fn lease_into(&mut self, w: WorkerId, now: Nanos, out: &mut Vec<Effect>) {
         if !self.open || self.void.is_some() || self.worker(w) != Some(WorkerState::Idle) {
             return;
         }
         let mut found = None;
-        for (i, j) in self.jobs.iter().enumerate() {
-            if let JobState::Pending { attempts } = *j {
+        let mut i = 0;
+        while i < self.jobs.len() {
+            if let JobState::Pending { attempts } = self.jobs[i] {
                 found = Some((i, attempts));
                 break;
             }
+            i += 1;
         }
         let Some((slot, attempts)) = found else {
             return;
@@ -779,14 +821,18 @@ impl Ledger {
         out.push(Effect::Lease(w, lease));
     }
 
+    #[inline]
     fn assign_into(&mut self, now: Nanos, out: &mut Vec<Effect>) {
-        for i in 0..self.workers.len() {
+        let mut i = 0;
+        while i < self.workers.len() {
             self.lease_into(WorkerId(wid(i)), now, out);
+            i += 1;
         }
     }
 
     /// Whether `sent` is a claimed lease of its sender `w`, in this search or a finished one,
     /// and that claim's digest.
+    #[inline]
     fn claimed_by(&self, w: WorkerId, sent: Token) -> Option<Digest> {
         if sent.worker != w.0 {
             return None;
@@ -803,6 +849,7 @@ impl Ledger {
     /// A frame from a gone worker, dropped unread.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn drop_unread(&mut self, now: Nanos) -> Result<(), ClockBackwards> {
         self.clock(now)?;
         self.counts.dropped += 1;
@@ -812,6 +859,7 @@ impl Ledger {
     /// `w` reports item `k` of `sent` judged.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn progress(
         &mut self,
         w: WorkerId,
@@ -875,6 +923,7 @@ impl Ledger {
     /// `w` returns the claim `digest` for `sent`.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn result(
         &mut self,
         w: WorkerId,
@@ -893,8 +942,11 @@ impl Ledger {
                 self.set_job(lease.slot, JobState::Claimed { lease, digest });
                 self.set_worker(w, WorkerState::Idle);
                 out.push(Effect::Accepted(w, lease));
-                let waiting = self.stale.remove(&lease.slot).unwrap_or_default();
-                self.compare_stale(lease, digest, &waiting, now, &mut out);
+                if let Some(waiting) = self.stale.remove(&lease.slot) {
+                    self.compare_stale(lease, digest, &waiting, now, &mut out);
+                } else {
+                    self.compare_stale(lease, digest, &[], now, &mut out);
+                }
             }
             Some(WorkerState::Draining {
                 lease,
@@ -960,6 +1012,7 @@ impl Ledger {
         Ok(out)
     }
 
+    #[inline]
     fn compare_stale(
         &mut self,
         accepted: Token,
@@ -968,8 +1021,9 @@ impl Ledger {
         now: Nanos,
         out: &mut Vec<Effect>,
     ) {
-        for d in late {
-            if *d == digest {
+        let mut li = 0;
+        while li < late.len() {
+            if late[li] == digest {
                 self.counts.stale += 1;
             } else {
                 let refusal = LeaseRefusal::Differs {
@@ -979,12 +1033,14 @@ impl Ledger {
                 self.void_with(VoidBy::Ledger(refusal), now, out);
                 return;
             }
+            li += 1;
         }
     }
 
     /// `w` acknowledges `Cancel` for `sent`.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn cancelled(
         &mut self,
         w: WorkerId,
@@ -1011,6 +1067,7 @@ impl Ledger {
     /// `w`'s pipe closed or it exited.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn lost(&mut self, w: WorkerId, now: Nanos) -> Result<Vec<Effect>, ClockBackwards> {
         self.clock(now)?;
         let mut out = Vec::new();
@@ -1029,11 +1086,14 @@ impl Ledger {
     /// Expires what is due at `now`: hellos, leases and drains.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn tick(&mut self, now: Nanos) -> Result<Vec<Effect>, ClockBackwards> {
         self.clock(now)?;
         let mut out = Vec::new();
-        for i in 0..self.workers.len() {
+        let mut i = 0;
+        while i < self.workers.len() {
             let w = WorkerId(wid(i));
+            i += 1;
             match self.worker(w) {
                 Some(WorkerState::Joining { since })
                     if now >= since.saturating_add(self.limits.hello_ns) =>
@@ -1071,6 +1131,7 @@ impl Ledger {
     /// every open job and holder cancelled.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn void_from(
         &mut self,
         w: WorkerId,
@@ -1087,6 +1148,7 @@ impl Ledger {
     /// job and holder; a second void changes nothing.
     /// # Errors
     /// [`ClockBackwards`].
+    #[inline]
     pub fn void(&mut self, by: VoidBy, now: Nanos) -> Result<Vec<Effect>, ClockBackwards> {
         self.clock(now)?;
         let mut out = Vec::new();

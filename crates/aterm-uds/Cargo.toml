@@ -19,7 +19,8 @@ description = "aterm — the portable control-socket stream: pure type aliases t
 # finishes an `atomic_file` write.
 [dependencies]
 # aterm-vitals: the program check's reading and verdict types
-# (`program_check`), which this crate's reader fills. A pure model crate with
+# (`program_check`) and the services' reading and fold (`services`), which
+# this crate's readers fill. A pure model crate with
 # no dependencies of its own.
 aterm-vitals = { workspace = true }
 

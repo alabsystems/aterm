@@ -1091,6 +1091,31 @@ fn a_standing_row_whose_read_occurrence_ended_is_news_when_another_begins() {
     assert_ne!(next.id, id);
 }
 
+/// A filing holds for as long as the episode its key names lasts, past the 24 h quiet, until
+/// its reporter says the episode ended. NEGATIVE CONTROL: a live row, and a key never filed,
+/// read as not filed.
+#[test]
+fn a_filing_holds_for_its_episode_until_its_end_is_said() {
+    let now = t0();
+    let mut c = fresh(now);
+    let key = "harness.upgrade.s-1";
+    assert!(!c.filed_standing(key, stamp(0)), "never filed");
+    let id = c.post(agent_down(), stamp(0), now).id;
+    assert!(!c.filed_standing(key, stamp(1)), "live");
+    assert!(c.mark_seen(id, now));
+    assert!(c.filed_standing(key, stamp(1_000)));
+    assert!(
+        c.filed_standing(key, stamp(3 * DAY_MS)),
+        "past the day's quiet, still the episode's"
+    );
+    assert!(c.end_filed_standing(key, stamp(3 * DAY_MS + 1), now));
+    assert!(!c.filed_standing(key, stamp(3 * DAY_MS + 2)));
+    assert!(
+        !c.end_filed_standing(key, stamp(3 * DAY_MS + 3), now),
+        "said once"
+    );
+}
+
 #[test]
 fn a_standing_row_that_ended_is_news_when_it_returns() {
     let now = t0();

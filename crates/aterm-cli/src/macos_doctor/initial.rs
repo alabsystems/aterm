@@ -31,6 +31,9 @@ mod park_watch;
 pub use park_watch::{ParkWatch, Watches};
 mod secrets_retry;
 use secrets_retry::Pace;
+pub(super) mod kept;
+mod ledger;
+pub use ledger::setup_ledger_environment;
 mod revision;
 mod set_aside;
 pub(super) use set_aside::forget_at as forget_set_aside_at;
@@ -124,6 +127,8 @@ impl Stage {
             .filter(|subject| match subject {
                 Subject::Setting(setting) => plan.selection.contains(*setting),
                 Subject::Access(_) => true,
+                // A Sync row is no stage's subject; it rides the Secrets row only.
+                Subject::Sync(_) => false,
             })
             .collect()
     }
@@ -536,6 +541,22 @@ fn settle_stop_request_locked(
 pub fn request_initial_setup_stop(revision: u64) -> Result<(), String> {
     ensure_person_scope()?;
     request_stop_at(&state_root()?, revision)
+}
+
+/// A person pressed Check again: lift every stage of the current run that aterm parked after it
+/// stopped twice there or after it ran past the hang limit, so the run's next pass runs it again
+/// (design §6.5). Only the ledger's short lock is taken, so a pass running now is not waited for.
+pub fn retry_parked_setup_stages() -> Result<(), String> {
+    ensure_person_scope()?;
+    ledger::retry_parked_at(&state_root()?).map(|_| ())
+}
+
+/// aterm is quitting, or handing off to an update: the setup stages running now are cut off by
+/// no crash, so the next launch resumes them without counting this begin toward a park
+/// (design §6.5). Only the ledger's short lock is taken.
+pub fn note_setup_interrupted() -> Result<(), String> {
+    ensure_person_scope()?;
+    ledger::interrupt_at(&state_root()?).map(|_| ())
 }
 
 /// The access revision a new revision of `plan` continues, when its prior run (its
@@ -1266,9 +1287,45 @@ fn unjoined_alab_row(
     Some(Row {
         name: Stage::Secrets.name().into(),
         status: status.into(),
-        detail: here.note()?.into(),
+        detail: here.note_for(lan)?.into(),
         elapsed_ms: None,
     })
+}
+
+/// Whether the Secrets stage's `rows` leave the ALab vault off this network: every row not in
+/// place is a vault nobody answered ([`UNREACHED`]) or a server there holding none ([`WAITING`]
+/// on [`scope::NO_VAULT`] or [`aterm_machines::init_secrets::NO_VAULT_NOW`]). The Repositories
+/// stage then runs on this Mac's own GitHub credentials in the same pass instead of waiting for
+/// a vault this network may never have, and waits for the vault's token only when this Mac has
+/// none to sign in with; a join waiting for an admin, or a vault still syncing, keeps them
+/// waiting for its token.
+fn vault_not_here(rows: &[Row]) -> bool {
+    rows.iter().any(|row| !row_ready(row))
+        && rows.iter().all(|row| {
+            row_ready(row)
+                || row.status == UNREACHED
+                || (row.status == WAITING
+                    && (row.detail.starts_with(scope::NO_VAULT)
+                        || row
+                            .detail
+                            .starts_with(aterm_machines::init_secrets::NO_VAULT_NOW)))
+        })
+}
+
+/// The Repositories row while they wait for the selected vault's token: [`WAITING`] while the
+/// vault stage parked (`vault`), else blocked, which the run's retry tries again.
+fn vault_token_wait(vault: SetupNext) -> Row {
+    Row {
+        name: Stage::Repositories.name().into(),
+        status: if vault == SetupNext::Park {
+            WAITING
+        } else {
+            "blocked"
+        }
+        .into(),
+        detail: "waiting for the selected secrets vault to synchronize credentials".into(),
+        elapsed_ms: None,
+    }
 }
 
 /// [`secrets_rows`] of the join a probe nobody answered let through ([`unjoined_alab_row`]): a
@@ -1600,6 +1657,18 @@ impl InitialSetupRestart {
                 // A person chose: the note that aterm set its records aside goes. One left only
                 // keeps that calm note up.
                 let _ = set_aside::forget_at(root);
+                // Set up now sets every key again, and a group turned on sets its own: what the
+                // person changed since aterm set them is forgotten there (design §6.6).
+                let turned_on = if self.chosen {
+                    Some(self.changed.map_or(plan.selection, |changed| {
+                        filtered(changed, |setting| plan.selection.contains(setting))
+                    }))
+                } else {
+                    None
+                };
+                // One that cannot be written leaves those rows reading Changed by you, which
+                // says so; the admission stands.
+                let _ = kept::forget_at(root, turned_on);
             }
             admitted
         });
@@ -3126,6 +3195,55 @@ pub fn probe_local_network_again() {
     }
 }
 
+/// The converge pass's look for the ALab vault on this network (`sync.peers`), System State's
+/// own ([`scope::probe_vault`]): a kept look of another vault on this network stands for it, and
+/// what it hears of the LAN is kept. Its caller looks only once macOS asked aterm before
+/// ([`local_network_heard`] not `Untold`), so it never puts the question on screen.
+#[must_use]
+pub fn look_for_the_alab_vault() -> aterm_machines::sync::peers::Heard {
+    use aterm_machines::sync::peers::Heard;
+    if let Err(why) = ensure_person_scope() {
+        return Heard::Unreached(why);
+    }
+    match scope::probe_vault() {
+        scope::VaultHere::Found => Heard::Found,
+        scope::VaultHere::Absent => Heard::Elsewhere,
+        scope::VaultHere::Unreached | scope::VaultHere::Unasked => {
+            if access::last_answer() == Some(access::LanAnswer::Refused) {
+                Heard::Refused
+            } else {
+                Heard::Unreached("nothing answered at its address".to_owned())
+            }
+        }
+    }
+}
+
+/// What aterm last heard of macOS's Local Network switch for it ([`local_network_heard`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalNetworkHeard {
+    /// Nothing says: no look heard the switch, and the window has not raised macOS's question.
+    Untold,
+    /// The window raised macOS's question, and no look since heard how it went: a look that
+    /// nothing answered (a network with no ALab vault) says nothing of it.
+    Asked,
+    /// A look reached the LAN.
+    On,
+    /// macOS refused a look the LAN: the person's Don't Allow, or the switch turned off since.
+    Off,
+}
+
+/// What the last look at the LAN, or the window's Local Network step, heard of the switch
+/// ([`access::last_answer`]). Reads aterm's own records only.
+#[must_use]
+pub fn local_network_heard() -> LocalNetworkHeard {
+    match access::last_answer() {
+        None => LocalNetworkHeard::Untold,
+        Some(access::LanAnswer::Asked) => LocalNetworkHeard::Asked,
+        Some(access::LanAnswer::Reached) => LocalNetworkHeard::On,
+        Some(access::LanAnswer::Refused) => LocalNetworkHeard::Off,
+    }
+}
+
 /// The revision whose access steps the current run's Permissions stage reads
 /// (`aterm_types::macos_setup::access_record`), zero with no modern run.
 pub fn initial_setup_access_revision() -> Result<u64, String> {
@@ -4027,11 +4145,31 @@ fn snapshot_at(
     root: &Path,
     fallback: Plan,
 ) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
+    snapshot_at_when(root, fallback, ledger::Live::now)
+}
+
+/// [`snapshot_at`], reading the clock and the boot as `live` says.
+fn snapshot_at_when(
+    root: &Path,
+    fallback: Plan,
+    live: impl FnOnce(bool) -> ledger::Live,
+) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
     let observation = observation_at(root)?;
     let active = HeldLock::profile_active(root).map_err(InitialSetupSnapshotError::read)?;
+    let live = live(active);
+    let raw_plan = observation
+        .records
+        .plan
+        .as_ref()
+        .map_or(&fallback, |(plan, _)| plan);
+    let progress = observation
+        .records
+        .progress
+        .filter(|progress| progress.belongs_to(raw_plan));
+    let ledger = ledger::read_marking_hung(root, progress, live);
     Ok(InitialSetupSnapshot {
         recovered: set_aside::shown(root),
-        ..snapshot_from_observation(fallback, active, observation)
+        ..snapshot_from_observation(fallback, live, &ledger, observation)
     })
 }
 
@@ -4052,14 +4190,20 @@ fn snapshot_with(
     let active = activity().map_err(InitialSetupSnapshotError::read)?;
     Ok(snapshot_from_observation(
         fallback,
-        active,
+        ledger::Live {
+            active,
+            boot: None,
+            now: 0,
+        },
+        &ledger::Ledger::default(),
         observation::from_records(records),
     ))
 }
 
 fn snapshot_from_observation(
     fallback: Plan,
-    active: bool,
+    live: ledger::Live,
+    ledger: &ledger::Ledger,
     observation: InitialSetupObservation,
 ) -> InitialSetupSnapshot {
     let records = &observation.records;
@@ -4112,48 +4256,59 @@ fn snapshot_from_observation(
                     && records.decision == Decision::Applied(true)
             }
         };
-    let rows = Stage::ALL
-        .iter()
-        .filter(|stage| stage.selected(&plan))
-        .map(|stage| {
-            let completed = progress.is_some_and(|progress| progress.done & stage.bit() != 0);
-            // Restored preferences a choice since left alone are no run's to apply.
-            let restoring = *stage == Stage::Workstation
-                && (stopped == Some(Stop::Restored)
-                    || (completed
-                        && records
-                            .restored
-                            .is_some_and(|restored| restored.owes(plan.selection))));
-            let recorded_running =
-                progress.is_some_and(|progress| progress.running == Some(*stage));
-            let interrupted = !finished && !completed && recorded_running && !active;
-            Row {
-                name: stage.name().into(),
-                status: if restoring {
-                    "stopped"
-                } else if completed {
-                    "applied"
-                } else if finished {
-                    "stopped"
-                } else if recorded_running && active {
-                    "running"
-                } else {
-                    "pending"
+    let rows =
+        Stage::ALL
+            .iter()
+            .filter(|stage| stage.selected(&plan))
+            .map(|stage| {
+                let completed = progress.is_some_and(|progress| progress.done & stage.bit() != 0);
+                // Restored preferences a choice since left alone are no run's to apply.
+                let restoring = *stage == Stage::Workstation
+                    && (stopped == Some(Stop::Restored)
+                        || (completed
+                            && records
+                                .restored
+                                .is_some_and(|restored| restored.owes(plan.selection))));
+                // What the run's ledger says of the stage: running, resumed after aterm stopped,
+                // or parked until Check again (design §6.5).
+                let verdict = progress.map_or(ledger::Verdict::Idle, |progress| {
+                    ledger.verdict(*stage, progress.done, progress.running, live)
+                });
+                Row {
+                    name: stage.name().into(),
+                    status: if restoring {
+                        "stopped"
+                    } else if completed {
+                        "applied"
+                    } else if finished {
+                        "stopped"
+                    } else {
+                        match verdict {
+                            ledger::Verdict::Parked(_) => WAITING,
+                            ledger::Verdict::Running
+                            | ledger::Verdict::Resuming { running: true } => "running",
+                            ledger::Verdict::Resuming { running: false }
+                            | ledger::Verdict::Idle => "pending",
+                        }
+                    }
+                    .into(),
+                    detail: if restoring {
+                        "Restore requested; see results.".into()
+                    } else if finished && !completed {
+                        "Not applied by this run.".into()
+                    } else if completed {
+                        String::new()
+                    } else {
+                        match verdict {
+                            ledger::Verdict::Parked(park) => ledger::parked_words(*stage, park),
+                            ledger::Verdict::Resuming { .. } => ledger::RESUMING.into(),
+                            ledger::Verdict::Running | ledger::Verdict::Idle => String::new(),
+                        }
+                    },
+                    elapsed_ms: None,
                 }
-                .into(),
-                detail: if restoring {
-                    "Restore requested; see results.".into()
-                } else if finished && !completed {
-                    "Not applied by this run.".into()
-                } else if interrupted {
-                    "Not running; Set up now to retry.".into()
-                } else {
-                    String::new()
-                },
-                elapsed_ms: None,
-            }
-        })
-        .collect();
+            })
+            .collect();
     InitialSetupSnapshot {
         plan,
         finished,
@@ -4212,6 +4367,11 @@ trait InitialHost {
     fn repositories_failure(&mut self) -> Option<&'static str> {
         None
     }
+    /// Whether the Repositories stage, as [`Self::repositories`] last ran it, stopped because this
+    /// Mac has no GitHub token to sign in with ([`aterm_machines::init_observe::Wait::Token`]).
+    fn repositories_want_token(&mut self) -> bool {
+        false
+    }
     /// The Messages and FaceTime sign-outs, with the Accessibility they need.
     /// `on_screen` is whether System State is the visible view of a focused window
     /// ([`SetupHooks::on_screen`]): without it a sign-out that still has work waits.
@@ -4222,6 +4382,15 @@ trait InitialHost {
     /// meanwhile never stands, and reads them again once it ends.
     fn withheld_owed(&mut self, _root: &Path) -> Vec<Setting> {
         Vec::new()
+    }
+    /// This boot of the Mac, which the run's ledger stamps each begin with
+    /// ([`ledger::boot_session`]).
+    fn boot_session(&mut self) -> Option<u128> {
+        ledger::boot_session()
+    }
+    /// Now, in seconds since the epoch, which the run's ledger stamps each begin with.
+    fn now_secs(&mut self) -> u64 {
+        ledger::now_secs()
     }
 }
 
@@ -5178,6 +5347,9 @@ struct LiveInitial<R> {
     /// The reason the last Repositories stage's failed part gives
     /// ([`InitialHost::repositories_failure`]).
     repositories_failure: Option<&'static str>,
+    /// Whether the last Repositories stage stopped for want of a GitHub token
+    /// ([`InitialHost::repositories_want_token`]).
+    token_wanted: bool,
 }
 
 impl LiveInitial<secrets_retry::Live> {
@@ -5186,6 +5358,7 @@ impl LiveInitial<secrets_retry::Live> {
             reads: secrets_retry::Live,
             developer_tools_wanted: false,
             repositories_failure: None,
+            token_wanted: false,
         }
     }
 }
@@ -5350,19 +5523,25 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
         let sys = aterm_machines::port::Live::new();
         self.developer_tools_wanted = false;
         self.repositories_failure = None;
-        let (rows, wanted, failure) = repositories::run_reading(
+        self.token_wanted = false;
+        let ran = repositories::run_reading(
             &sys,
             &self.context()?,
             vault,
             aterm_machines::model::Mode::Apply,
         )?;
-        self.developer_tools_wanted = wanted;
-        self.repositories_failure = failure;
-        Ok(rows)
+        self.developer_tools_wanted = ran.developer_tools;
+        self.repositories_failure = ran.failure;
+        self.token_wanted = ran.token;
+        Ok(ran.rows)
     }
 
     fn repositories_want_developer_tools(&mut self) -> bool {
         self.developer_tools_wanted
+    }
+
+    fn repositories_want_token(&mut self) -> bool {
+        self.token_wanted
     }
 
     fn repositories_failure(&mut self) -> Option<&'static str> {
@@ -5494,6 +5673,15 @@ fn execute_pass(
     if !progress.belongs_to(&plan) || !progress.admitted {
         return Ok(None);
     }
+    // Holding profile.lock, so whatever is recorded running was cut off when aterm stopped: the
+    // ledger resumes it once or parks it (design §6.5), and nothing runs until a stage begins.
+    ledger::update(root, progress.revision, |ledger| {
+        ledger.recover(progress.done, progress.running)
+    })?;
+    if progress.running.take().is_some() {
+        save_progress(root, progress)?;
+    }
+    let boot = host.boot_session();
     let mut report = Report {
         action: Action::Apply,
         rows: Vec::new(),
@@ -5505,6 +5693,9 @@ fn execute_pass(
     let mut next = SetupNext::Done;
     // What the vault stage left in this pass, for the repositories waiting on it.
     let mut vault = SetupNext::Retry;
+    // The vault stage left the ALab vault absent from this network or unanswered on it
+    // ([`vault_not_here`]): the repositories then run on this Mac's own credentials.
+    let mut not_here = false;
     // The rows of `report` a stage's own page stands for (`Report::page`).
     let mut pages: Vec<(std::ops::Range<usize>, PassPage)> = Vec::new();
     // Each stage's rows its producer did not time carry the stage's time.
@@ -5560,19 +5751,8 @@ fn execute_pass(
                     report.rows.extend(rows);
                 }
             }
-            if progress.done & Stage::Secrets.bit() == 0 {
-                let rows = vec![Row {
-                    name: stage.name().into(),
-                    status: if vault == SetupNext::Park {
-                        WAITING
-                    } else {
-                        "blocked"
-                    }
-                    .into(),
-                    detail: "waiting for the selected secrets vault to synchronize credentials"
-                        .into(),
-                    elapsed_ms: None,
-                }];
+            if progress.done & Stage::Secrets.bit() == 0 && !not_here {
+                let rows = vec![vault_token_wait(vault)];
                 next = next.and(SetupNext::of(&rows));
                 report.rows.extend(rows);
                 continue;
@@ -5588,6 +5768,7 @@ fn execute_pass(
             .and_then(|pace| secrets_retry::paused(root, progress.revision, pace))
         {
             vault = SetupNext::of(&rows);
+            not_here = vault_not_here(&rows);
             next = next.and(vault);
             let at = report.rows.len();
             pages.push((at..at + rows.len(), secrets_page(root, &rows)));
@@ -5611,8 +5792,34 @@ fn execute_pass(
             .filter(|subject| match subject {
                 Subject::Setting(setting) => settings.contains(setting),
                 Subject::Access(_) => true,
+                // A Sync row is no stage's subject; it rides the Secrets row only.
+                Subject::Sync(_) => false,
             })
             .collect();
+        // A stage aterm stopped in twice, or one that ran past the hang limit, waits for Check
+        // again while the others go on.
+        let admitted = ledger::update(root, progress.revision, |ledger| {
+            ledger.begin(stage, progress.done, boot, host.now_secs())
+        })?;
+        match admitted {
+            ledger::Admit::Run => {}
+            ledger::Admit::Done => continue,
+            ledger::Admit::Parked(park) => {
+                let rows = vec![Row {
+                    name: stage.name().into(),
+                    status: WAITING.into(),
+                    detail: ledger::parked_words(stage, park),
+                    elapsed_ms: None,
+                }];
+                next = next.and(SetupNext::of(&rows));
+                if stage == Stage::Secrets {
+                    vault = SetupNext::Park;
+                }
+                report.rows.extend(rows);
+                continue;
+            }
+        }
+        let begun = ledger::Begun::new(root, progress.revision, stage);
         progress.running = Some(stage);
         save_progress(root, progress)?;
         (hooks.stage)(StageEvent {
@@ -5700,8 +5907,17 @@ fn execute_pass(
             }
         };
         if stage == Stage::Repositories {
+            // Run on this Mac's own credentials while the vault is not on this network
+            // ([`vault_not_here`]): with no token of its own to sign in with, they wait for the
+            // vault's as they would have, rather than ask the person for one the vault keeps.
+            let waits_for_vault = not_here && host.repositories_want_token();
+            if waits_for_vault {
+                rows = vec![vault_token_wait(vault)];
+                page = items_page(stage, &rows);
+            }
             // A failed part's reason, where its step decided one, is the row's words on the page.
-            if let Some(reason) = host.repositories_failure()
+            if !waits_for_vault
+                && let Some(reason) = host.repositories_failure()
                 && let Some(page) = page.as_mut()
             {
                 page.failed_because(Setting::Repositories, reason);
@@ -5731,10 +5947,12 @@ fn execute_pass(
         }
         if stage == Stage::Secrets {
             vault = left;
+            not_here = vault_not_here(&rows);
         }
         next = next.and(left);
         progress.running = None;
         save_progress(root, progress)?;
+        begun.ended()?;
         if let Some(before) = paced.as_ref()
             && let Some(mut after) = host.secrets_pace()
         {
@@ -5996,6 +6214,8 @@ mod tests {
 
     mod deferred_mac_deadline_tests;
     mod embedded_restore_tests;
+    mod ledger_conformance;
+    pub(super) mod run_ledger_tests;
 
     type StageReading = (bool, Vec<Setting>, Vec<Subject>);
 
@@ -6033,8 +6253,23 @@ mod tests {
         developer_tools_wanted: bool,
         /// The reason its failed part gave ([`repositories::failure_note`]).
         repositories_failure: Option<&'static str>,
+        /// Whether it stopped for want of a GitHub token ([`repositories::want_token`]).
+        token_wanted: bool,
         /// What each Workstation stage was given to set ([`Progress::only`]).
         only: Vec<Option<Selection>>,
+        /// A stage whose every run ends the process mid-stage (a panic the test catches), as a
+        /// crash or a kill there leaves its records.
+        crash: Option<Stage>,
+        /// A stage that wedges: the test reads the run while it runs, then the process is
+        /// killed there.
+        wedge: Option<(Stage, PathBuf)>,
+        /// What the readings of the run said while the wedged stage ran: now, and two hours
+        /// on ([`tests::run_ledger_tests::wedged_rows`]).
+        wedged_rows: Vec<Vec<Row>>,
+        /// The Secrets stage's rows, in place of the injected outcome.
+        secrets_rows: Option<Vec<Row>>,
+        /// Whether each Repositories stage was handed the plan's vault.
+        repositories_vault: Vec<bool>,
     }
 
     /// What a launch reads of a run whose process ended mid-stage.
@@ -6048,6 +6283,17 @@ mod tests {
     impl Fake {
         fn stage(&mut self, stage: Stage) -> Result<Vec<Row>, String> {
             self.calls.push(stage);
+            assert_ne!(
+                self.crash,
+                Some(stage),
+                "injected: the process ends in this stage"
+            );
+            if let Some((wedged, root)) = &self.wedge
+                && *wedged == stage
+            {
+                self.wedged_rows = tests::run_ledger_tests::wedged_rows(root);
+                panic!("injected: the wedged process is killed in this stage");
+            }
             if let Some((during, root)) = &self.stop_during
                 && *during == stage
             {
@@ -6183,6 +6429,10 @@ mod tests {
         ) -> Result<Vec<Row>, String> {
             self.password_seen = password.is_some();
             self.vault_url = Some(plan.vault_url.clone());
+            if let Some(rows) = &self.secrets_rows {
+                self.calls.push(Stage::Secrets);
+                return Ok(rows.clone());
+            }
             self.stage(Stage::Secrets)
         }
         fn secrets_pace(&mut self) -> Option<Pace> {
@@ -6194,7 +6444,8 @@ mod tests {
             }
             Ok(self.configured.clone())
         }
-        fn repositories(&mut self, _vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+        fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+            self.repositories_vault.push(vault.is_some());
             if let Some((sys, ctx)) = &self.native_repositories {
                 self.calls.push(Stage::Repositories);
                 let rows = aterm_machines::init_github::run_initial_repositories(
@@ -6204,6 +6455,7 @@ mod tests {
                 )?;
                 self.developer_tools_wanted = repositories::want_developer_tools(&rows);
                 self.repositories_failure = repositories::failure_note(&rows);
+                self.token_wanted = repositories::want_token(&rows);
                 return Ok(item_rows(rows));
             }
             self.stage(Stage::Repositories)
@@ -6215,6 +6467,10 @@ mod tests {
 
         fn repositories_failure(&mut self) -> Option<&'static str> {
             self.repositories_failure
+        }
+
+        fn repositories_want_token(&mut self) -> bool {
+            self.token_wanted
         }
 
         fn withheld(&mut self, _root: &Path) -> Result<Option<Report>, String> {
@@ -8348,6 +8604,98 @@ mod tests {
         }
     }
 
+    /// A VAULT THIS NETWORK DOES NOT HAVE NEVER HOLDS THE REPOSITORIES: a Secrets stage that left
+    /// the ALab vault absent or unanswered runs Repositories in the same pass, on this Mac's own
+    /// credentials, which wait for the vault's token only when this Mac has none; one waiting
+    /// for an admin, or failing otherwise, keeps them waiting for the vault's token.
+    #[test]
+    fn an_absent_or_unanswered_vault_never_holds_the_repositories() {
+        let row = |status: &str, detail: &str| Row {
+            name: Stage::Secrets.name().into(),
+            status: status.into(),
+            detail: detail.into(),
+            elapsed_ms: None,
+        };
+        for (secrets, runs) in [
+            (row(UNREACHED, scope::NOT_REACHED), true),
+            (row(WAITING, scope::NO_VAULT), true),
+            (
+                row(WAITING, aterm_machines::init_secrets::NO_VAULT_NOW),
+                true,
+            ),
+            (
+                row(
+                    WAITING,
+                    "waiting for an admin: approve this Mac on an admin Mac",
+                ),
+                false,
+            ),
+            (
+                row("blocked", "the subscriber could not be installed"),
+                false,
+            ),
+        ] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            authorize_at(root.path(), &Plan::default()).unwrap();
+            let mut host = Fake {
+                secrets_rows: Some(vec![secrets.clone()]),
+                ..Fake::default()
+            };
+            let report = execute_initial(&mut host, root.path(), &mut None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                host.calls.contains(&Stage::Repositories),
+                runs,
+                "{secrets:?}: {}",
+                report.to_text()
+            );
+            if runs {
+                assert_eq!(
+                    host.repositories_vault,
+                    [false],
+                    "this Mac's own credentials"
+                );
+            } else {
+                assert!(
+                    report
+                        .rows
+                        .iter()
+                        .any(|row| row.name == Stage::Repositories.name()
+                            && row
+                                .detail
+                                .starts_with("waiting for the selected secrets vault")),
+                    "{secrets:?}: {}",
+                    report.to_text()
+                );
+            }
+        }
+        // The live stage on this Mac's own credentials: a token here signs in (GitHub unreached
+        // is the stage's own row); with none, the stage waits for the vault's token as it would
+        // have, never a sign-in asked of the person for a token the vault keeps.
+        for token in [true, false] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            authorize_at(root.path(), &Plan::default()).unwrap();
+            let mut host = Fake {
+                secrets_rows: Some(vec![row(WAITING, scope::NO_VAULT)]),
+                ..native_repositories(true, token)
+            };
+            let report = execute_initial(&mut host, root.path(), &mut None)
+                .unwrap()
+                .unwrap();
+            let repositories: Vec<&Row> = report
+                .rows
+                .iter()
+                .filter(|row| row.name == Stage::Repositories.name())
+                .collect();
+            let wait = vault_token_wait(SetupNext::Park);
+            let waits = matches!(repositories.as_slice(), [row]
+                if (&row.status, &row.detail) == (&wait.status, &wait.detail));
+            assert_eq!(waits, !token, "token: {token}: {}", report.to_text());
+            assert_eq!(host.repositories_vault, [false], "token: {token}");
+        }
+    }
+
     /// EVERY ROW OF A SETUP PASS CARRIES ITS TIME in the JSON: a stage's rows, its error and
     /// the repositories' wait on the vault alike (presence only, never a budget).
     #[test]
@@ -8454,6 +8802,66 @@ mod tests {
         }
     }
 
+    /// A host whose Repositories stage is the live one over an inert machine for one console
+    /// account: Apple's Command Line Tools there or not (`tools`), the token the vault's sync
+    /// writes there or not (`token`), and GitHub unreached for the account's first two reads.
+    fn native_repositories(tools: bool, token: bool) -> Fake {
+        use aterm_machines::items::Ctx;
+        use aterm_machines::model::{HostFacts, User};
+        use aterm_machines::port::{Fake as Native, GithubFailure, Ran, Stat};
+        let user = User {
+            name: "tester".into(),
+            uid: 501,
+            gid: 20,
+            home: "/test-repository-home".into(),
+            shell: "/bin/zsh".into(),
+            admin: false,
+        };
+        let mut sys = Native::root();
+        sys.euid = user.uid;
+        let stat = |dir, len| Stat {
+            uid: user.uid,
+            gid: user.gid,
+            mode: if dir { 0o700 } else { 0o600 },
+            dir,
+            symlink: false,
+            len,
+        };
+        const TOKEN: &str = "inert_repository_tools_token";
+        sys.stat_of(&user.home, stat(true, 0));
+        if tools {
+            sys.file(aterm_machines::items::github::CLT_GIT, b"inert git");
+        }
+        if token {
+            let token = format!("{}/.secrets/gh_access_token", user.home);
+            sys.file(&token, TOKEN.as_bytes())
+                .stat_of(&token, stat(false, TOKEN.len() as u64));
+        }
+        for _ in 1..=2 {
+            sys.fail_github_api(&user, "/user", GithubFailure::Unreached);
+        }
+        sys.simulate(|_, command| {
+            let command = command.display();
+            if command.contains(" config --null --show-origin --get-regexp ") {
+                Some(Ran::ok(""))
+            } else {
+                panic!("unexpected repository effect: {command}");
+            }
+        });
+        let ctx = Ctx {
+            facts: HostFacts::default(),
+            users: vec![user.clone()],
+            console: Some(user),
+            host_name: "fixture".into(),
+            cache_dir: PathBuf::from("/test-cache"),
+            disrupt: false,
+        };
+        Fake {
+            native_repositories: Some((sys, ctx)),
+            ..Fake::default()
+        }
+    }
+
     /// At the end of a pass, a Repositories stage that stops for want of Apple's Command Line
     /// Tools asks the window to install them ([`SetupHooks::developer_tools`] `true`), as the
     /// live host reads the stop; one that stops on anything else (GitHub unreached, a person's
@@ -8463,9 +8871,6 @@ mod tests {
     /// before a later stage.
     #[test]
     fn a_repositories_stage_without_the_command_line_tools_asks_the_window_to_install_them() {
-        use aterm_machines::items::Ctx;
-        use aterm_machines::model::{HostFacts, User};
-        use aterm_machines::port::{Fake as Native, GithubFailure, Ran, Stat};
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8484,59 +8889,6 @@ mod tests {
             },
             stop: |_| ASKED.fetch_add(1, Ordering::SeqCst) >= STOP_AT.load(Ordering::SeqCst),
             ..SetupHooks::NONE
-        };
-        let host = |tools: bool, token: bool| {
-            let user = User {
-                name: "tester".into(),
-                uid: 501,
-                gid: 20,
-                home: "/test-repository-home".into(),
-                shell: "/bin/zsh".into(),
-                admin: false,
-            };
-            let mut sys = Native::root();
-            sys.euid = user.uid;
-            let stat = |dir, len| Stat {
-                uid: user.uid,
-                gid: user.gid,
-                mode: if dir { 0o700 } else { 0o600 },
-                dir,
-                symlink: false,
-                len,
-            };
-            const TOKEN: &str = "inert_repository_tools_token";
-            sys.stat_of(&user.home, stat(true, 0));
-            if tools {
-                sys.file(aterm_machines::items::github::CLT_GIT, b"inert git");
-            }
-            if token {
-                let token = format!("{}/.secrets/gh_access_token", user.home);
-                sys.file(&token, TOKEN.as_bytes())
-                    .stat_of(&token, stat(false, TOKEN.len() as u64));
-            }
-            for _ in 1..=2 {
-                sys.fail_github_api(&user, "/user", GithubFailure::Unreached);
-            }
-            sys.simulate(|_, command| {
-                let command = command.display();
-                if command.contains(" config --null --show-origin --get-regexp ") {
-                    Some(Ran::ok(""))
-                } else {
-                    panic!("unexpected repository effect: {command}");
-                }
-            });
-            let ctx = Ctx {
-                facts: HostFacts::default(),
-                users: vec![user.clone()],
-                console: Some(user),
-                host_name: "fixture".into(),
-                cache_dir: PathBuf::from("/test-cache"),
-                disrupt: false,
-            };
-            Fake {
-                native_repositories: Some((sys, ctx)),
-                ..Fake::default()
-            }
         };
         let repositories: &[Setting] = &[Setting::Repositories];
         let then_accounts: &[Setting] = &[Setting::Repositories, Setting::Messages];
@@ -8609,7 +8961,7 @@ mod tests {
             let revision = authorize_at(root.path(), &selected(settings))
                 .unwrap()
                 .unwrap();
-            let mut host = host(tools, token);
+            let mut host = native_repositories(tools, token);
             told();
             STOP_AT.store(stop_at, Ordering::SeqCst);
             // A stopped run runs no second pass.
@@ -8676,7 +9028,7 @@ mod tests {
         for (endpoint, body) in [
             ("/user", aterm_json::json!({"login":"tester"})),
             (
-                "/user/repos?visibility=all&per_page=30&sort=full_name&direction=asc&page=1",
+                "/user/repos?affiliation=owner&visibility=all&per_page=30&sort=full_name&direction=asc&page=1",
                 aterm_json::json!([]),
             ),
         ] {
@@ -13013,6 +13365,7 @@ mod tests {
             reads: reads(true),
             developer_tools_wanted: false,
             repositories_failure: None,
+            token_wanted: false,
         };
         let first = host.secrets_pace().expect("the live host paces every try");
         assert_eq!(first, secrets_retry::pace(&reads(true)));
@@ -13605,11 +13958,16 @@ mod tests {
                 "{lan:?}"
             );
         }
-        for lan in [Some(Reached), Some(Refused)] {
+        // macOS refusing aterm the LAN is named as such: no look reaches the vault until the
+        // person turns Local Network on.
+        for (lan, stopped) in [
+            (Some(Reached), unreached.clone()),
+            (Some(Refused), row(UNREACHED, scope::LAN_OFF)),
+        ] {
             let joined = AtomicBool::new(false);
             assert_eq!(
                 stops(VaultHere::Unreached, lan, &joined),
-                unreached,
+                stopped,
                 "{lan:?}"
             );
             assert!(!joined.load(Ordering::Relaxed), "{lan:?}: no join waited");

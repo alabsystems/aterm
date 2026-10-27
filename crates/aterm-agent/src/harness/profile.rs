@@ -841,8 +841,8 @@ pub struct SubscriptionDisplay {
     /// The figure [`Self::weekly`] says, where a read gave one (`None`: a wall's or a screen's
     /// words, or no figure).
     pub weekly_figure: Option<WeeklyFigure>,
-    /// Why there is no [`Self::weekly`] (`None`: nothing told it, and the footer says
-    /// `weekly unavailable`).
+    /// Why there is no [`Self::weekly`] (`None`: nothing told it). The rule shows neither: the
+    /// account's hover title and the Accounts menu say it.
     pub weekly_gap: Option<WeeklyGap>,
     /// The roster label of the account [`Self::weekly_figure`] is, where the process runs in
     /// the machine's default Claude home on a login the roster judges
@@ -914,7 +914,9 @@ impl WeeklyFigure {
 
 /// Why a Claude Code footer has no weekly figure ([`SubscriptionDisplay::weekly_gap`]). Its
 /// words state the fact and never ask the person to act (owner ruling R-12: the harness reads
-/// the week itself, and where it cannot, says so plainly).
+/// the week itself, and where it cannot, says so plainly). The rule itself shows no unknown
+/// value: these words are the account's hover title's, the Accounts menu's and a screen
+/// reader's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WeeklyGap {
     /// `[harness] usage_tap` is off, or the harness is off for Claude Code: the harness reads
@@ -940,7 +942,7 @@ pub enum WeeklyGap {
 }
 
 impl WeeklyGap {
-    /// The footer's words.
+    /// The words the account's hover title and the Accounts menu say.
     #[must_use]
     pub const fn words(self) -> &'static str {
         match self {
@@ -967,25 +969,19 @@ impl WeeklyGap {
     }
 }
 
-/// The footer's narrow form of the weekly words [`WeeklyFigure::words`] or [`WeeklyGap::words`]
-/// said, for a rule too narrow for them beside the account: an aged figure without its ` left`
-/// and ` ago` but with its `weekly` (`weekly 61.5% \u{b7} 59m`), since the rule draws the week
-/// behind the account unit's `\u{b7}` and no mark of its own names it, and no wider than
-/// `weekly unavailable`; any reason's `weekly ?`; `None` for words that are already their
+/// The footer's narrow form of the weekly words [`WeeklyFigure::words`] said, for a rule too
+/// narrow for them beside the account: an aged figure without its ` left` and ` ago` but with
+/// its `weekly` (`weekly 61.5% \u{b7} 59m`), since the rule draws the week behind the account
+/// unit's `\u{b7}` and no mark of its own names it; `None` for words that are already their
 /// narrowest (a current figure, a wall's `weekly 0% left`).
 #[must_use]
 pub fn narrow_weekly(words: &str) -> Option<String> {
-    if let Some((share, age)) = words
+    let (share, age) = words
         .strip_prefix("weekly ")
         .and_then(|rest| rest.strip_suffix(" ago"))
         .and_then(|aged| aged.split_once(" left \u{b7} "))
-        .filter(|(share, _)| share.ends_with('%'))
-    {
-        return Some(format!("weekly {share} \u{b7} {age}"));
-    }
-    words
-        .starts_with("weekly ? ")
-        .then(|| "weekly ?".to_owned())
+        .filter(|(share, _)| share.ends_with('%'))?;
+    Some(format!("weekly {share} \u{b7} {age}"))
 }
 
 /// One reset occurrence, placed when the card is first observed.
@@ -1062,12 +1058,59 @@ pub fn subscription_and_plan_for(
     Some((selected.subscription(now), plan))
 }
 
-/// The account a Muse Code process is signed in as ([`SubscriptionDisplay`]).
+type MuseUsageCacheKey = (PathBuf, String);
+
+/// One account's usage cache: when a fetch was last kicked or landed, and the last
+/// reading that ever landed (its figure where the mint named one, its plan). The two
+/// are kept apart so a failed fetch backoff never erases a good reading, and a
+/// plan-only success is a success, not a failure to retry every minute.
+#[derive(Clone)]
+struct MuseUsageEntry {
+    attempted_at: i64,
+    reading: Option<(Option<WeeklyFigure>, Option<String>)>,
+}
+
+type MuseUsageCacheMap = std::collections::HashMap<MuseUsageCacheKey, MuseUsageEntry>;
+
+/// Whether `entry` can be served without fetching: a landed figure inside
+/// [`USAGE_CURRENT_S`], or a plan-only landing no older.
+fn muse_usage_fresh(entry: Option<&MuseUsageEntry>, now: i64) -> bool {
+    match entry.and_then(|entry| entry.reading.as_ref().map(|reading| (entry, reading))) {
+        Some((_, (Some(figure), _))) => figure.current(now),
+        Some((entry, (None, _))) => now.saturating_sub(entry.attempted_at) <= USAGE_CURRENT_S,
+        None => false,
+    }
+}
+
+/// Whether a fetch was kicked too recently to kick another ([`MUSE_USAGE_RETRY_S`]).
+fn muse_usage_attempt_recent(entry: Option<&MuseUsageEntry>, now: i64) -> bool {
+    entry.is_some_and(|entry| now.saturating_sub(entry.attempted_at) < MUSE_USAGE_RETRY_S)
+}
+
+static MUSE_USAGE_CACHE: std::sync::Mutex<Option<MuseUsageCacheMap>> = std::sync::Mutex::new(None);
+
+/// One Muse usage fetch at a time ([`super::muse_usage::fetch`]): the mint is bounded
+/// per host, and parallel footer reads share the one answer through the cache instead.
+static MUSE_USAGE_FETCHING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// How long a failed Muse usage fetch waits before another read tries again: the host's
+/// own mint bound, so a retry never asks sooner than the mint could answer.
+const MUSE_USAGE_RETRY_S: i64 = 60;
+
+/// The account a Muse Code process is signed in as, with its weekly quota
+/// ([`SubscriptionDisplay`]): the login `~/.config/muse/auth.json` names, and the week a
+/// bounded `muse serve` usage refresh reads ([`super::muse_usage`]), cached per config
+/// and account under the one age rule ([`WeeklyFigure::words`]). The refresh runs only
+/// where the process's own binary resolves; a screen card's words in `prev` stand while
+/// no figure is current, as agy's do ([`agy_subscription_for`]).
 #[must_use]
 pub fn muse_subscription_for(
     argv: &[String],
     env: &[String],
     user_home: &Path,
+    prev: &SubscriptionDisplay,
+    now: i64,
 ) -> Option<SubscriptionDisplay> {
     let var = |key: &str| {
         env.iter()
@@ -1119,10 +1162,218 @@ pub fn muse_subscription_for(
         }))
     })
     .ok()??;
+    let same_email = prev.email.as_deref() == Some(email.as_str());
+    let key = (config.clone(), email.clone());
+    let cached = {
+        let guard = MUSE_USAGE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.as_ref().and_then(|map| map.get(&key).cloned())
+    };
+    let prev_figure = same_email.then_some(prev.weekly_figure).flatten();
+    // The fetch never runs on this (the footer's one resolver) thread: a hung
+    // `muse serve` would stall every session's facts behind its budget. A stale
+    // cache kicks a fetch thread and serves what it has; the landed reading shows
+    // at the next resolver pass.
+    if !muse_usage_fresh(cached.as_ref(), now)
+        && !muse_usage_attempt_recent(cached.as_ref(), now)
+        && let Some(exe) = muse_exe_for(argv, env, user_home)
+    {
+        let home_dir = var("HOME").map_or_else(|| user_home.to_path_buf(), PathBuf::from);
+        kick_muse_usage_fetch(
+            key.clone(),
+            exe,
+            muse_serve_env(env, &home_dir),
+            home_dir,
+            now,
+        );
+    }
+    let (figure, fetched_plan) = match cached.and_then(|entry| entry.reading) {
+        Some((figure, plan)) => (figure, plan),
+        None => (None, None),
+    };
+    let figure = WeeklyFigure::newer(figure, prev_figure).filter(|fig| fig.words(now).is_some());
+    let weekly = figure.and_then(|fig| fig.words(now)).or_else(|| {
+        (same_email && prev.weekly_figure.is_none())
+            .then(|| prev.weekly.clone())
+            .flatten()
+    });
     Some(SubscriptionDisplay {
         email: Some(email),
+        plan: fetched_plan.or_else(|| same_email.then(|| prev.plan.clone()).flatten()),
+        weekly,
+        weekly_figure: figure,
+        weekly_reset: same_email.then(|| prev.weekly_reset.clone()).flatten(),
         ..SubscriptionDisplay::default()
     })
+}
+
+/// Kicks the one in-flight Muse usage fetch (`MUSE_USAGE_FETCHING`) on its own
+/// thread for `key`, marking the attempt now so the reads behind it serve the
+/// cache instead of kicking again. A landed reading replaces the cache's; a
+/// failed one only moves the attempt stamp, keeping the last good reading.
+fn kick_muse_usage_fetch(
+    key: MuseUsageCacheKey,
+    exe: PathBuf,
+    serve_env: Vec<(&'static str, std::ffi::OsString)>,
+    home_dir: PathBuf,
+    now: i64,
+) {
+    if MUSE_USAGE_FETCHING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    {
+        let mut guard = MUSE_USAGE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = guard
+            .get_or_insert_with(std::collections::HashMap::new)
+            .entry(key.clone())
+            .or_insert(MuseUsageEntry {
+                attempted_at: now,
+                reading: None,
+            });
+        slot.attempted_at = now;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("aterm-muse-usage".to_string())
+        .spawn(move || {
+            struct FetchDone;
+            impl Drop for FetchDone {
+                fn drop(&mut self) {
+                    MUSE_USAGE_FETCHING.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _done = FetchDone;
+            let reading = super::muse_usage::fetch(&exe, serve_env, &home_dir);
+            let done = aterm_time::unix_secs()
+                .and_then(|secs| i64::try_from(secs).ok())
+                .unwrap_or(now);
+            let mut guard = MUSE_USAGE_CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            land_muse_usage(
+                guard.get_or_insert_with(std::collections::HashMap::new),
+                &key,
+                reading,
+                done,
+            );
+        });
+    if spawned.is_err() {
+        MUSE_USAGE_FETCHING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Records a finished fetch in `map`: the attempt stamp always moves to `done`, a
+/// landed reading replaces the cached one, and a failure keeps the last good one.
+/// The entry is created where [`muse_usage_forget`] removed it mid-flight: that
+/// forget asked for a fresh mint, and the reading this fetch just minted is it —
+/// dropping it would only spend the host's next mint bound re-asking.
+fn land_muse_usage(
+    map: &mut MuseUsageCacheMap,
+    key: &MuseUsageCacheKey,
+    reading: Option<super::muse_usage::Reading>,
+    done: i64,
+) {
+    let slot = map.entry(key.clone()).or_insert(MuseUsageEntry {
+        attempted_at: done,
+        reading: None,
+    });
+    slot.attempted_at = done;
+    if let Some(reading) = reading {
+        let figure = match (reading.weekly_used_x10, reading.weekly_resets_at) {
+            (Some(used_x10), Some(resets_at)) => Some(WeeklyFigure {
+                used_x10,
+                resets_at,
+                at: reading.observed_at.unwrap_or(done),
+            }),
+            _ => None,
+        };
+        slot.reading = Some((figure, reading.plan));
+    }
+}
+
+/// Forgets every cached Muse usage reading for `email` (the account menu's refresh): the
+/// next [`muse_subscription_for`] read mints a fresh figure instead of serving the cache.
+pub fn muse_usage_forget(email: &str) {
+    let mut guard = MUSE_USAGE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(map) = guard.as_mut() {
+        map.retain(|(_, kept_email), _| kept_email != email);
+    }
+}
+
+/// The binary a supervised `program` process was launched as: its absolute launching
+/// path, else a bare launch name resolved on that process's own `PATH` (never this
+/// process's), else the installation's user shim or the managed twin of the session's
+/// own home (`agy_exe_for`'s order, shared).
+fn launched_exe_for(
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+    program: &str,
+) -> Option<PathBuf> {
+    if let Some(first) = argv.first().map(Path::new) {
+        if first.is_absolute() && first.is_file() {
+            return Some(first.to_path_buf());
+        }
+        if let Some(path) = env
+            .iter()
+            .find_map(|entry| entry.strip_prefix("PATH="))
+            .filter(|value| !value.is_empty())
+            && let Some(exe) = super::login_drive::on_path(first, std::ffi::OsStr::new(path))
+        {
+            return Some(exe);
+        }
+    }
+    let user_bin = user_home.join(".local/bin").join(program);
+    if user_bin.is_file() {
+        return Some(user_bin);
+    }
+    if std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == user_home)
+        && let Some(layout) = atpkg::store::resolve_configured()
+    {
+        let managed = layout.agents_dir().join(program);
+        if managed.is_file() {
+            return Some(managed);
+        }
+    }
+    None
+}
+
+/// The `muse` serving this installation ([`launched_exe_for`]).
+fn muse_exe_for(argv: &[String], env: &[String], user_home: &Path) -> Option<PathBuf> {
+    launched_exe_for(argv, env, user_home, "muse")
+}
+
+/// The environment `muse serve` reads its login under: the supervised process's own
+/// passed names ([`super::login_drive::PASSED`], process values where it names none),
+/// its `PATH`, its home, and its config home where it sets an absolute one — the same
+/// store [`muse_subscription_for`] just read the login from.
+fn muse_serve_env(env: &[String], home_dir: &Path) -> Vec<(&'static str, std::ffi::OsString)> {
+    let named = |key: &str| {
+        env.iter()
+            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os(key).filter(|value| !value.is_empty()))
+    };
+    let mut out: Vec<(&'static str, std::ffi::OsString)> = super::login_drive::PASSED
+        .iter()
+        .filter(|name| **name != "HOME")
+        .filter_map(|name| named(name).map(|value| (*name, value)))
+        .collect();
+    out.push(("PATH", named("PATH").unwrap_or_default()));
+    out.push(("HOME", home_dir.as_os_str().to_os_string()));
+    if let Some(xdg) = env
+        .iter()
+        .find_map(|entry| entry.strip_prefix("XDG_CONFIG_HOME="))
+        .filter(|value| Path::new(value).is_absolute())
+    {
+        out.push(("XDG_CONFIG_HOME", std::ffi::OsString::from(xdg)));
+    }
+    out
 }
 
 fn muse_provider_arg(argv: &[String]) -> Option<String> {
@@ -1816,26 +2067,8 @@ pub fn muse_excerpts_for(
     Some((super::excerpt::muse_excerpts_from(&tail), len))
 }
 
-fn agy_exe_for(argv: &[String], user_home: &Path) -> Option<PathBuf> {
-    if let Some(first) = argv.first().map(Path::new)
-        && first.is_absolute()
-        && first.is_file()
-    {
-        return Some(first.to_path_buf());
-    }
-    let user_bin = user_home.join(".local/bin/agy");
-    if user_bin.is_file() {
-        return Some(user_bin);
-    }
-    if std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == user_home)
-        && let Some(layout) = atpkg::store::resolve_configured()
-    {
-        let managed = layout.agents_dir().join("agy");
-        if managed.is_file() {
-            return Some(managed);
-        }
-    }
-    None
+fn agy_exe_for(argv: &[String], env: &[String], user_home: &Path) -> Option<PathBuf> {
+    launched_exe_for(argv, env, user_home, "agy")
 }
 
 /// agy's `/usage` doc, read whole within `LAUNCH_READ_BUDGET` ([`super::align::capture_bounded`],
@@ -2000,7 +2233,7 @@ fn agy_subscription_with_store(
                 let lock = store.map(super::agy_quota_store::Store::try_lock);
                 if matches!(lock, Some(None)) {
                     fallback
-                } else if let Some(exe) = agy_exe_for(argv, user_home) {
+                } else if let Some(exe) = agy_exe_for(argv, env, user_home) {
                     let bytes =
                         fetch_agy_usage_doc(&exe, argv, var("AGY_CLI_CONFIG_DIR"), &home_dir);
                     let fetched = bytes

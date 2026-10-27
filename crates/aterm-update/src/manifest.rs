@@ -9,7 +9,14 @@ use std::path::Path;
 use aterm_durable::Flush;
 use serde::{Deserialize, Serialize};
 
-/// Write `text` to `path` atomically.
+/// Write `text` to `path` atomically, finishing its temporary and parent directory with
+/// `flush`. A refused file or directory flush is accepted. A genuine directory flush
+/// failure after the rename is logged: the record is already in place, but its entry
+/// may not survive a power loss.
+///
+/// # Errors
+/// The temporary could not be written or flushed, or its rename failed. The destination
+/// remains as it was; a directory flush failure after the rename is no error here.
 pub(crate) fn write_durable(
     path: &Path,
     text: &str,
@@ -17,23 +24,15 @@ pub(crate) fn write_durable(
     flush: Flush,
 ) -> Result<(), String> {
     use std::io::Write as _;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
     let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
     let write = (|| -> std::io::Result<()> {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(text.as_bytes())?;
-        match crate::durable::finish(&file, flush) {
-            Ok(()) => Ok(()),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
-                ) =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        aterm_durable::refusal_accepted(crate::durable::finish(&file, flush))
     })();
     if let Err(error) = write {
         let _ = std::fs::remove_file(&tmp);
@@ -43,7 +42,15 @@ pub(crate) fn write_durable(
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("commit {what}: {error}"));
     }
-    let _ = crate::durable::sync_dir(parent, flush);
+    if let Err(error) = flush.dir_best_effort(parent) {
+        // The receipt's caller would roll back an exchange if this already-landed write
+        // returned an error. Keep its result separate from the entry's durability.
+        crate::warn(&format!(
+            "{what} is in place at {}, but flushing its folder failed, so a power loss may \
+             take it back: {error}",
+            path.display()
+        ));
+    }
     Ok(())
 }
 
@@ -980,6 +987,55 @@ pub fn failed_mark_suppression_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_keeps_its_landed_result_and_reports_a_failed_directory_flush() {
+        use aterm_durable::seam::FailingDirs;
+        let staging = crate::paths::Staging::scratch("record-directory-flush");
+        let path = staging.installed_receipt();
+        let commit = "c".repeat(40);
+        let digest = "ab".repeat(32);
+        let warnings = || {
+            crate::log_capture::take()
+                .into_iter()
+                .filter(|(level, _)| *level == aterm_log::Level::Warn)
+                .count()
+        };
+        let _ = crate::log_capture::take();
+        for flush in [Flush::Durable, Flush::Ordered] {
+            {
+                let _failure = FailingDirs::with(libc::EIO);
+                InstalledReceipt::record(&path, 3, &commit, &digest, flush).unwrap();
+            }
+            assert_eq!(InstalledReceipt::read(&path).unwrap().build_number, 3);
+            assert_eq!(warnings(), 1);
+            {
+                let _refused = FailingDirs::with(libc::ENOTSUP);
+                InstalledReceipt::record(&path, 4, &commit, &digest, flush).unwrap();
+            }
+            assert_eq!(InstalledReceipt::read(&path).unwrap().build_number, 4);
+            assert_eq!(warnings(), 0);
+        }
+    }
+
+    #[test]
+    fn a_failed_record_rename_keeps_the_destination_and_is_still_an_error() {
+        use aterm_durable::seam::FailingDirs;
+        let staging = crate::paths::Staging::scratch("record-rename-failure");
+        let path = staging.root.join("occupied.toml");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("witness"), b"keep").unwrap();
+        let _ = crate::log_capture::take();
+        let _refused = FailingDirs::with(libc::ENOTSUP);
+        assert!(write_durable(&path, "new", "test record", Flush::Ordered).is_err());
+        assert_eq!(std::fs::read(path.join("witness")).unwrap(), b"keep");
+        assert!(
+            !path
+                .with_extension(format!("toml.{}.tmp", std::process::id()))
+                .exists()
+        );
+        assert!(crate::log_capture::take().is_empty());
+    }
 
     #[test]
     fn each_record_write_names_its_flush() {

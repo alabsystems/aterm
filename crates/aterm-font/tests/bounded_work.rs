@@ -359,3 +359,118 @@ fn a_gsub_refused_through_a_nested_lookup_applies_none_of_it() {
         "past the budget, through a nested lookup: GSUB is refused from the first shape"
     );
 }
+
+fn aliased_gpos(lookups: usize, subtables: usize) -> Vec<u8> {
+    let be16 = |v: usize| u16::try_from(v).unwrap().to_be_bytes();
+    let mut g = vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+    let script_list = g.len();
+    g.extend([0, 1, b'D', b'F', b'L', b'T', 0, 8, 0, 4, 0, 0]);
+    g.extend([0, 0, 0xFF, 0xFF, 0, 1, 0, 0]);
+    let feature_list = g.len();
+    g.extend([0, 1, b'k', b'e', b'r', b'n', 0, 8, 0, 0]);
+    g.extend(be16(lookups));
+    (0..lookups).for_each(|i| g.extend(be16(i)));
+    let lookup_list = g.len();
+    g.extend(be16(lookups));
+    (0..lookups).for_each(|_| g.extend(be16(2 + 2 * lookups)));
+    // LookupType 1 (SinglePos), flags 0, `subtables` aliased to the same Format 1 subtable (+10 x_offset).
+    g.extend([0, 1, 0, 0]);
+    g.extend(be16(subtables));
+    (0..subtables).for_each(|_| g.extend(be16(6 + 2 * subtables)));
+    g.extend([0, 1, 0, 8, 0, 1, 0, 10, 0, 1, 0, 1, 0, 0]);
+    g[4..6].copy_from_slice(&be16(script_list));
+    g[6..8].copy_from_slice(&be16(feature_list));
+    g[8..10].copy_from_slice(&be16(lookup_list));
+    g
+}
+
+fn shaped_x_offsets(gpos: &[u8], text: &str) -> Vec<i32> {
+    use aterm_font::shape::{ShapeFace, UnicodeBuffer, shape};
+    let bytes = crate::never_panic::sfnt(2, &[(b"GPOS", gpos)]);
+    let face = ShapeFace::new(Face::parse(&bytes, 0).expect("the synthetic face parses"));
+    let mut buffer = UnicodeBuffer::new();
+    buffer.push_str(text);
+    shape(&face, &[], buffer)
+        .glyph_positions()
+        .iter()
+        .map(|pos| pos.x_offset)
+        .collect()
+}
+
+#[test]
+fn aliased_gpos_lookups_are_parsed_within_a_budget() {
+    assert_eq!(
+        shaped_x_offsets(&aliased_gpos(10, 10), "ab"),
+        [100, 100],
+        "within the budget, each of the 10 lookups shifts x_offset by +10"
+    );
+    assert_eq!(
+        shaped_x_offsets(&aliased_gpos(1_000, 1_000), "ab"),
+        [0, 0],
+        "past the budget, GPOS is refused as a whole"
+    );
+}
+
+fn nested_gpos(subtables: usize, coverage: usize) -> Vec<u8> {
+    let be16 = |v: usize| u16::try_from(v).unwrap().to_be_bytes();
+    let mut g = vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+    let script_list = g.len();
+    g.extend([0, 1, b'D', b'F', b'L', b'T', 0, 8, 0, 4, 0, 0]);
+    g.extend([0, 0, 0xFF, 0xFF, 0, 1, 0, 0]);
+    let feature_list = g.len();
+    g.extend([0, 1, b'k', b'e', b'r', b'n', 0, 8, 0, 0, 0, 2, 0, 0, 0, 1]);
+    let lookup_list = g.len();
+    g.extend([0, 3, 0, 8, 0, 30, 0, 58]);
+    // Lookup 0 (22 bytes): SinglePos Format 1 on glyph 0, x_offset += 25.
+    g.extend([0, 1, 0, 0, 0, 1, 0, 8]);
+    g.extend([0, 1, 0, 8, 0, 1, 0, 25]);
+    g.extend([0, 1, 0, 1, 0, 0]);
+    assert_eq!(g.len() - lookup_list, 30, "lookup 1's offset");
+    // Lookup 1 (28 bytes): ContextPos (LookupType 7) Format 3 recursing into Lookup 2.
+    g.extend([0, 7, 0, 0, 0, 1, 0, 8]);
+    g.extend([0, 3, 0, 1, 0, 1, 0, 12, 0, 0, 0, 2]);
+    g.extend([0, 1, 0, 2, 0, 0, 0, 1]);
+    assert_eq!(g.len() - lookup_list, 58, "lookup 2's offset");
+    // Lookup 2: SinglePos Format 1 with `subtables` aliased subtables over `coverage` glyphs.
+    g.extend([0, 1, 0, 0]);
+    g.extend(be16(subtables));
+    (0..subtables).for_each(|_| g.extend(be16(6 + 2 * subtables)));
+    g.extend([0, 1, 0, 8, 0, 1, 0, 0]);
+    g.extend([0, 1]);
+    g.extend(be16(coverage));
+    (1..=coverage).for_each(|gid| g.extend(be16(gid)));
+    g[4..6].copy_from_slice(&be16(script_list));
+    g[6..8].copy_from_slice(&be16(feature_list));
+    g[8..10].copy_from_slice(&be16(lookup_list));
+    g
+}
+
+fn shaped_gpos_twice(gpos: &[u8]) -> [Vec<i32>; 2] {
+    use aterm_font::shape::{ShapeFace, UnicodeBuffer, shape};
+    let bytes = crate::never_panic::sfnt(2, &[(b"GPOS", gpos)]);
+    let face = ShapeFace::new(Face::parse(&bytes, 0).expect("the synthetic face parses"));
+    let once = || {
+        let mut buffer = UnicodeBuffer::new();
+        buffer.push_str("a");
+        shape(&face, &[], buffer)
+            .glyph_positions()
+            .iter()
+            .map(|pos| pos.x_offset)
+            .collect()
+    };
+    [once(), once()]
+}
+
+#[test]
+fn a_gpos_refused_through_a_nested_lookup_applies_none_of_it() {
+    assert_eq!(
+        shaped_gpos_twice(&nested_gpos(2, 4)),
+        [[25], [25]],
+        "within the budget"
+    );
+    assert_eq!(
+        shaped_gpos_twice(&nested_gpos(2_000, 1_000)),
+        [[0], [0]],
+        "past the budget, through a nested lookup: GPOS is refused from the first shape"
+    );
+}

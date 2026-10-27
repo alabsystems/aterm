@@ -436,18 +436,11 @@ pub fn this_boot() -> Option<[u8; 16]> {
     astream_sys::boot_session()
 }
 
-/// Format a 16-byte boot id as a lowercase `8-4-4-4-12` UUID string.
+/// Format a 16-byte boot id as a lowercase `8-4-4-4-12` UUID string
+/// (`astream_sys::boot_id_text`).
 #[must_use]
 pub fn boot_text(boot: &[u8; 16]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(36);
-    for (i, b) in boot.iter().enumerate() {
-        if matches!(i, 4 | 6 | 8 | 10) {
-            out.push('-');
-        }
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+    astream_sys::boot_id_text(*boot, true)
 }
 
 /// Broker instance opened by [`open`] along with legacy-mark migration status.

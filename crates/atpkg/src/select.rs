@@ -4,6 +4,7 @@
 //! Signature-during-selection (§5): choosing which published index to trust.
 
 use crate::sig::{Anchor, BuildFloor, TrustedIndex, TrustedRoster, VerifiedBytes, admit_roster};
+use crate::succession::{Refusal, Sources};
 
 /// One release's signed index and the master-signed roster published beside it.
 #[derive(Debug, Clone)]
@@ -40,6 +41,9 @@ pub struct Selection {
     pub selected: Option<Selected>,
     /// The highest `roster_seq` admitted in this pass, `0` if none.
     pub observed_roster_seq: u64,
+    /// The verified candidates refused as successors of the index trusted before them
+    /// ([`crate::succession::check`]), oldest first.
+    pub refused: Vec<Refusal>,
 }
 
 /// A candidate past the roster tier, its index still to be verified under `roster`.
@@ -59,17 +63,26 @@ struct Weighed {
     verdict: Option<TrustedRoster>,
 }
 
-/// Verify-then-select over `candidates`.
+/// Verify-then-select over `candidates`: the highest index of the newest roster generation
+/// that clears `floor` and succeeds the index trusted before it.
+///
+/// `trusted` is the last index this client trusted ([`crate::succession::Record`]). It binds
+/// only within its own generation, and with none that binds the oldest verified candidate
+/// starts the chain. Each newer candidate, in build order, must succeed the last one admitted
+/// ([`crate::succession::check`]); one that does not is refused whole and named in
+/// [`Selection::refused`].
 #[must_use]
 pub fn select_index(
     anchor: &Anchor,
     candidates: Vec<Candidate>,
     floor: BuildFloor,
+    trusted: Option<&Sources>,
     now_unix: i64,
 ) -> Selection {
     let nothing = Selection {
         selected: None,
         observed_roster_seq: 0,
+        refused: Vec::new(),
     };
     if !anchor.is_armed() {
         return nothing;
@@ -112,7 +125,7 @@ pub fn select_index(
         return nothing;
     }
 
-    let mut best: Option<Selected> = None;
+    let mut verified_newest: Vec<Selected> = Vec::new();
     for a in admitted {
         if a.roster.seq() != observed_roster_seq {
             continue;
@@ -123,21 +136,51 @@ pub fn select_index(
         if !floor.admits(index.authorizing_seq(), index.index_build) {
             continue;
         }
+        verified_newest.push(Selected {
+            label: a.label,
+            index,
+            verified,
+            candidate: a.at,
+        });
+    }
+    // Stable, so of two candidates at one build the first handed in is weighed first.
+    verified_newest.sort_by_key(|s| s.index.index_build);
+
+    let mut chain: Option<Sources> = trusted
+        .filter(|t| t.roster_seq == observed_roster_seq)
+        .cloned();
+    let mut best: Option<Selected> = None;
+    let mut refused = Vec::new();
+    for s in verified_newest {
+        match &chain {
+            Some(t) if s.index.index_build > t.index_build => {
+                let breaks = crate::succession::check(t, &s.index);
+                if !breaks.is_empty() {
+                    refused.push(Refusal {
+                        label: s.label.clone(),
+                        index_build: s.index.index_build,
+                        machine_id: s.index.attribution().machine_id.clone(),
+                        trusted_build: t.index_build,
+                        breaks,
+                    });
+                    continue;
+                }
+                chain = Some(Sources::of(&s.index, s.index.roster_seq()));
+            }
+            Some(_) => {}
+            None => chain = Some(Sources::of(&s.index, s.index.roster_seq())),
+        }
         if best
             .as_ref()
-            .is_none_or(|b| index.index_build > b.index.index_build)
+            .is_none_or(|b| s.index.index_build > b.index.index_build)
         {
-            best = Some(Selected {
-                label: a.label,
-                index,
-                verified,
-                candidate: a.at,
-            });
+            best = Some(s);
         }
     }
     Selection {
         selected: best,
         observed_roster_seq,
+        refused,
     }
 }
 
@@ -207,6 +250,7 @@ mod tests {
             &Anchor::of(vec![], 0),
             cands.clone(),
             no_floor(),
+            None,
             testkit::NOW,
         );
         assert!(
@@ -219,7 +263,7 @@ mod tests {
              cannot have verified"
         );
         assert!(
-            select_index(&anchor(0), cands, no_floor(), testkit::NOW)
+            select_index(&anchor(0), cands, no_floor(), None, testkit::NOW)
                 .selected
                 .is_some()
         );
@@ -234,7 +278,7 @@ mod tests {
             signed("v55", 55),
             signed("v60-again", 60),
         ];
-        let out = select_index(&anchor(0), cands, floor(40), testkit::NOW);
+        let out = select_index(&anchor(0), cands, floor(40), None, testkit::NOW);
         let sel = out.selected.expect("a signed index wins");
         assert_eq!((sel.label.as_str(), sel.candidate), ("v60", 2));
         assert_eq!(sel.index.index_build, 60);
@@ -250,13 +294,13 @@ mod tests {
     fn floor_filters_below_high_water() {
         let cands = vec![signed("v30", 30), signed("v45", 45), signed("v42", 42)];
         for at in [44, 45] {
-            let sel = select_index(&anchor(0), cands.clone(), floor(at), testkit::NOW)
+            let sel = select_index(&anchor(0), cands.clone(), floor(at), None, testkit::NOW)
                 .selected
                 .expect("v45 qualifies");
             assert_eq!(sel.index.index_build, 45, "floor {at}");
         }
         assert!(
-            select_index(&anchor(0), cands, floor(100), testkit::NOW)
+            select_index(&anchor(0), cands, floor(100), None, testkit::NOW)
                 .selected
                 .is_none()
         );
@@ -265,7 +309,13 @@ mod tests {
     #[test]
     fn a_different_master_selects_nothing() {
         let other = Anchor::of(vec![testkit::pubkey_b64(&testkit::OUTSIDER_SEED)], 0);
-        let out = select_index(&other, vec![signed("v60", 60)], no_floor(), testkit::NOW);
+        let out = select_index(
+            &other,
+            vec![signed("v60", 60)],
+            no_floor(),
+            None,
+            testkit::NOW,
+        );
         assert!(out.selected.is_none());
         assert_eq!(
             out.observed_roster_seq, 0,
@@ -279,7 +329,7 @@ mod tests {
         c.roster_bytes = vec![];
         c.roster_sig = vec![];
         assert!(
-            select_index(&anchor(0), vec![c], no_floor(), testkit::NOW)
+            select_index(&anchor(0), vec![c], no_floor(), None, testkit::NOW)
                 .selected
                 .is_none()
         );
@@ -289,6 +339,7 @@ mod tests {
             &anchor(0),
             vec![broken, signed("v60", 60)],
             no_floor(),
+            None,
             testkit::NOW,
         )
         .selected
@@ -303,6 +354,7 @@ mod tests {
             &anchor(0),
             vec![signed("v60", 60), forged],
             no_floor(),
+            None,
             testkit::NOW,
         )
         .selected
@@ -316,6 +368,7 @@ mod tests {
             &anchor(testkit::SEQ + 1),
             vec![signed("v60", 60)],
             no_floor(),
+            None,
             testkit::NOW,
         );
         assert!(
@@ -331,6 +384,7 @@ mod tests {
                 &anchor(testkit::SEQ),
                 vec![signed("v60", 60)],
                 no_floor(),
+                None,
                 testkit::NOW
             )
             .selected
@@ -342,9 +396,15 @@ mod tests {
     fn a_stale_roster_selects_nothing() {
         let far_future = 4_200_000_000_i64;
         assert!(
-            select_index(&anchor(0), vec![signed("v60", 60)], no_floor(), far_future)
-                .selected
-                .is_none()
+            select_index(
+                &anchor(0),
+                vec![signed("v60", 60)],
+                no_floor(),
+                None,
+                far_future
+            )
+            .selected
+            .is_none()
         );
     }
 
@@ -379,6 +439,7 @@ mod tests {
             &anchor(0),
             vec![on_older, on_newer],
             no_floor(),
+            None,
             testkit::NOW,
         );
         let sel = out
@@ -395,6 +456,7 @@ mod tests {
             &anchor(0),
             vec![signed("old-generation-big-build", 9_000)],
             no_floor(),
+            None,
             testkit::NOW,
         )
         .selected
@@ -414,6 +476,7 @@ mod tests {
             &anchor(0),
             vec![signed("rescue", 41)],
             poisoned,
+            None,
             testkit::NOW,
         )
         .selected
@@ -429,6 +492,7 @@ mod tests {
                 &anchor(0),
                 vec![signed("rescue", 41)],
                 same_generation,
+                None,
                 testkit::NOW
             )
             .selected

@@ -97,7 +97,7 @@ use astream_wire::frame::{MAGIC, VERSION};
 use astream_wire::{crc32_ieee, Frame, HEADER_SIZE, MAX_PAYLOAD_LEN};
 
 use crate::brecord::{BrokerRecord, Mark};
-use crate::store::{open_disk_payload, Mutation, RepairAt, Scan, Tail};
+use crate::store::{open_disk_payload, AtRestRef, Mutation, RepairAt, Scan, Tail};
 
 #[cfg(clean_islands)]
 #[path = "recover_island.rs"]
@@ -195,8 +195,8 @@ impl PartialEq for Classified {
 pub(crate) struct Judge<'a> {
     /// The stored bytes the scan read.
     pub(crate) bytes: &'a [u8],
-    /// The at-rest key, when the log is sealed at rest.
-    pub(crate) key: Option<&'a [u8; 32]>,
+    /// The at-rest key and optional `<log>.seal` binding, when the log is sealed at rest.
+    pub(crate) key: Option<AtRestRef<'a>>,
     /// The retention base: the offset of the first stored record.
     pub(crate) base: u64,
     /// The durable floor (`None`: the rules that predate it).
@@ -344,9 +344,12 @@ fn damaged(
 ) -> Classified {
     let records = scan.records.len();
     let cut_at_any = j.mutation.cut_at_any_damage();
-    // The file ends inside the frame at `p` — its header or payload cut short, nothing
-    // behind it — and that frame is no whole record under a rotted length.
-    let ends_short = matches!(scan.tail, Tail::Torn)
+    // The file ends inside the frame at `p` — its header or payload cut short, no placed
+    // record behind it (a planted record frame inside the unfinished record's own body is
+    // `Found::Nothing`, even when `scan_from`'s un-placed `later_record_exists` reported
+    // `Tail::Corrupt { tear: true }`) — and that frame is no whole record under a rotted
+    // length.
+    let ends_short = !intact_records_after(after)
         && ends_inside_a_frame(j.bytes, p)
         && !whole_to_eof(j.bytes, p);
     if e < floor && !cut_at_any {
@@ -586,7 +589,7 @@ enum Found {
 /// ([`placed`]), since the damaged record's body was never stepped past. `e` is the
 /// offset expected at `p`; a keyed log's frame is tried at every offset it can hold (it
 /// is sealed under its own).
-fn frames_after(bytes: &[u8], p: usize, e: u64, key: Option<&[u8; 32]>) -> Vec<Found> {
+fn frames_after(bytes: &[u8], p: usize, e: u64, key: Option<AtRestRef<'_>>) -> Vec<Found> {
     let mut out = Vec::new();
     let Some(rest) = bytes.get(p..) else {
         return out;
@@ -1239,12 +1242,12 @@ mod tests {
             Frame::new(ciphertext).encode().unwrap()
         };
         let keyed_judge = |bytes: &[u8], floor, unclean_relaxed| {
-            let scan = scan_from(bytes, Some(&KEY), 0, floor, Mutation::Off);
+            let scan = scan_from(bytes, Some(AtRestRef::v1(&KEY)), 0, floor, Mutation::Off);
             classify(
                 &scan,
                 &Judge {
                     bytes,
-                    key: Some(&KEY),
+                    key: Some(AtRestRef::v1(&KEY)),
                     base: 0,
                     floor,
                     unclean_relaxed,

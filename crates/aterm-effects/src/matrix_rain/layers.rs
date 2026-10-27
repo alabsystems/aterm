@@ -115,6 +115,7 @@ impl RainLayers {
 
     /// Replace this publisher's layers in `layers` with `cells`', drawn from
     /// `tiles` (a cell whose tile is not baked yet draws nothing).
+    #[inline]
     pub fn publish(&mut self, cells: &[RainCell], tiles: &RainBaker, layers: &mut Vec<FxLayer>) {
         withdraw(layers, &self.ids);
         self.ids.clear();
@@ -231,6 +232,7 @@ pub const fn is_rain_row(layer: &FxLayer) -> bool {
 }
 
 /// One row's sprites over a palette of its distinct inks.
+#[inline]
 fn row_content(cells: &[RainCell], tiles: &RainBaker) -> FxContent {
     let mut palette: Vec<FxInk> = Vec::new();
     let mut items = Vec::with_capacity(cells.len());

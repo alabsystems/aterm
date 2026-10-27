@@ -37,10 +37,16 @@ use super::{
     PrebuiltMomentum, SETTLE_MARGIN, Sched, WAKE_NO_LATER_THAN_CLEAR,
 };
 
-/// The evaluator the tests share (its read counters are not asserted on).
+/// The evaluator the tests share, judging each item under each schedule once
+/// ([`Evaluator::memoizing`]; its read counters are not asserted on). A test that counts reads,
+/// or compares judgments made at two origins, builds its own.
 pub(super) fn evaluator() -> &'static Evaluator {
     static EV: OnceLock<Evaluator> = OnceLock::new();
-    EV.get_or_init(|| Evaluator::v1(BUILD, Instant::now()).expect("the pinned policy v1"))
+    EV.get_or_init(|| {
+        Evaluator::v1(BUILD, Instant::now())
+            .expect("the pinned policy v1")
+            .memoizing()
+    })
 }
 
 /// The grid search, run once, with the test harness's wall time for it.
@@ -51,20 +57,28 @@ pub(super) struct Searched {
     pub(super) elapsed: Duration,
 }
 
-/// The grid search on the shared evaluator.
+/// The grid search on the shared evaluator, its candidates trained on threads.
 pub(super) fn searched() -> &'static Searched {
     static S: OnceLock<Searched> = OnceLock::new();
     S.get_or_init(|| {
-        let ev = evaluator();
         let t = Instant::now();
-        let admitted = ev
-            .search(&mut GridProposer::new())
-            .expect("the grid search has an outcome");
+        let admitted = grid_search(evaluator());
         Searched {
             admitted,
             elapsed: t.elapsed(),
         }
     })
+}
+
+/// [`Evaluator::search`] of the grid on `ev`, its candidates trained on threads: `search` is
+/// `held_out` of `select`, and that `select_spread` selects as `select` does is
+/// `select_spread_equals_select`'s.
+fn grid_search(ev: &Evaluator) -> Admitted {
+    let selection = ev
+        .select_spread(&mut GridProposer::new(), &Threads)
+        .expect("the grid has a training winner");
+    ev.held_out(selection)
+        .expect("the grid search has an outcome")
 }
 
 pub(super) fn plan(split: Split, wake: Wake) -> SchedulePlan {
@@ -306,9 +320,7 @@ fn same_policy_same_winner_same_bundle_digest() {
         .checked_add(Duration::from_secs(17))
         .expect("an instant 17 s out");
     let ev = Evaluator::v1(BUILD, t0).expect("the pinned policy v1");
-    let again = ev
-        .search(&mut GridProposer::new())
-        .expect("the grid search has an outcome");
+    let again = grid_search(&ev);
     assert_eq!(again.plan(), first.plan());
     assert_eq!(again.useful(), first.useful());
     assert_eq!(again.gain(), first.gain());
@@ -318,6 +330,95 @@ fn same_policy_same_winner_same_bundle_digest() {
         Digest::of(BUNDLE_DOMAIN, &[&b])
     );
     assert_eq!(a, b, "the same bytes");
+}
+
+/// The shared evaluator's memo ([`Evaluator::memoizing`]) answers each item under each schedule
+/// as a fresh evaluator judges it, judges each pair once however often and on however many
+/// threads it is asked, and forgets what it kept when an item's judgment changes: a replaced
+/// scenario and a faked fault.
+#[test]
+fn a_memoizing_evaluator_judges_each_pair_once_as_a_fresh_one_does() {
+    let ev = evaluator().anew().memoizing();
+    let fresh = evaluator().anew();
+    let reads = |e: &Evaluator| {
+        let n = |r: &AtomicU64| r.load(Ordering::Relaxed);
+        (n(&e.reads().train), n(&e.reads().held_out))
+    };
+    let (golden, t1, h1) = (
+        index_of("golden"),
+        index_of("train-01"),
+        index_of("held-101"),
+    );
+    let shipped = Sched::Prebuilt(MomentumCode::Shipped);
+    let pairs = [
+        (Sched::Plan(gap0()), t1),
+        (Sched::Plan(cold_only()), t1),
+        (Sched::Plan(gap0()), h1),
+        (shipped, golden),
+    ];
+    let first: Vec<_> = pairs.iter().map(|&(s, k)| ev.judge(s, k)).collect();
+    for (&(s, k), got) in pairs.iter().zip(&first) {
+        assert_eq!(got, &fresh.judge(s, k), "{s:?} on item {k}");
+    }
+    assert!(
+        matches!(
+            &first[1],
+            Some((_, Some(CandidateRefusal::LaneFidelity { .. })))
+        ),
+        "fixture: a refusal is kept with its row"
+    );
+    assert_eq!(reads(&ev), (3, 1));
+    let asks: Vec<usize> = (0..4 * pairs.len()).map(|i| i % pairs.len()).collect();
+    let again = crate::test_pool::par_map(&asks, |&i| ev.judge(pairs[i].0, pairs[i].1));
+    for (&i, got) in asks.iter().zip(&again) {
+        assert_eq!(got, &first[i], "{:?} asked again", pairs[i]);
+    }
+    let new = [(Sched::Plan(cold_only()), h1); 8];
+    let at_once = crate::test_pool::par_map(&new, |&(s, k)| ev.judge(s, k));
+    assert!(at_once.iter().all(|got| *got == at_once[0]));
+    assert_eq!(
+        at_once[0],
+        fresh.judge(new[0].0, new[0].1),
+        "the judgment kept from a thread is the one a fresh evaluator makes serially"
+    );
+    assert_eq!(
+        reads(&ev),
+        (3, 2),
+        "asked again, and a new pair on eight threads at once: each pair judged once"
+    );
+    let corpus = Corpus::generate().expect("generator v1");
+    let s = corpus
+        .items()
+        .iter()
+        .find(|i| i.id() == "held-101")
+        .and_then(|i| i.scenario())
+        .expect("a held-out lane item");
+    let cut = Scenario::new(
+        s.frame_interval_ns(),
+        *s.start(),
+        s.events()[..1].to_vec(),
+        s.end_ns(),
+    )
+    .expect("an admitted scenario");
+    let afresh = evaluator()
+        .anew()
+        .replacing("held-101", cut.clone())
+        .judge(Sched::Plan(gap0()), h1);
+    assert_ne!(
+        afresh, first[2],
+        "fixture: the cut scenario changes the row"
+    );
+    let replaced = ev.replacing("held-101", cut);
+    assert_eq!(
+        replaced.judge(Sched::Plan(gap0()), h1),
+        afresh,
+        "a replaced scenario is judged afresh"
+    );
+    assert_eq!(replaced.judge(shipped, golden), first[3], "kept again");
+    let faulted = replaced.faulting("golden", Fault::GoldenBytes(vec![0; 8]));
+    let (row, refusal) = faulted.judge(shipped, golden).expect("an item");
+    assert_eq!(row.run, RowVerdict::fail(GOLDEN_UNREADABLE, 0));
+    assert_eq!(refusal.map(|r| r.law()), Some(GOLDEN_UNREADABLE));
 }
 
 #[test]

@@ -585,3 +585,129 @@ fn the_dark_comet_dust_keeps_to_the_leading() {
         "control: with the over-ink laws off grains stand at the x-height"
     );
 }
+
+/// THE DARK COMET'S DUST FLOATS OUT BESIDE AN EMPTY ROW (looks8 round 3's K4: "Comet should
+/// show a nucleus and dust"): held to the leading's thin seats against the letters' tops and
+/// feet, the letter guard kept its dust to grey specks. Typing on a row whose neighbours hold
+/// no letter, its grains float out into them, a fifth of a row and more past the typed row's
+/// edges, and none stands at the letters' x-height; where the row above is lettered, none
+/// floats into it. Negative control: the old dust ([`CursorGlow::comet_dust_grey`]) floats
+/// nowhere.
+#[test]
+fn the_dark_comet_dust_floats_out_beside_an_empty_row() {
+    let g = tall_geom();
+    let row = 3u16;
+    let seats = |grey: bool, above: bool| -> (usize, usize, usize) {
+        let mut c = cfg(GlowStyle::Comet, true);
+        c.intensity = 1.0;
+        (c.theme_fg, c.theme_bg) = (0x00D0_D0D0, 0x0011_1318);
+        let mut glow = CursorGlow {
+            comet_dust_grey: grey,
+            ..CursorGlow::default()
+        };
+        let mut out = Vec::new();
+        let mut text = vec![' '; g.cols];
+        let mut t = Instant::now();
+        let (mut floated, mut in_band, mut into_above) = (0usize, 0usize, 0usize);
+        for k in 0..=24u16 {
+            if k > 0 {
+                t += Duration::from_millis(60);
+                if k % 5 != 0 {
+                    text[usize::from(2 + k - 1)] = 'm';
+                }
+                glow.note_synthetic_typed(t, 1);
+            }
+            let caret = 2 + k;
+            glow.observe_row(row, caret, &text, t);
+            let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+            for (col, &ch) in text.iter().enumerate() {
+                rows[usize::from(row)][col].ch = ch;
+                if above {
+                    rows[usize::from(row - 1)][col].ch = 'm';
+                }
+            }
+            glow.observe_frame_text(Some((row, caret)), &rows, t);
+            glow.tick(Some((row, caret)), t, &c, g, &mut out);
+            let top = (u32::from(row) * g.ch as u32) as f32;
+            let chf = g.ch as f32;
+            for h in glow.halos() {
+                if h.rx > (g.ch / 4) as u16 {
+                    continue;
+                }
+                let k = (f32::from(h.cy) - top) / chf;
+                floated += usize::from(!(-0.1..1.1).contains(&k));
+                in_band += usize::from((0.2..0.8).contains(&k));
+                into_above += usize::from(k < -0.1);
+            }
+        }
+        (floated, in_band, into_above)
+    };
+    let (floated, in_band, _) = seats(false, false);
+    assert!(
+        floated >= 20,
+        "the dust floats out into the empty rows {floated} times"
+    );
+    assert_eq!(in_band, 0, "a grain stands at the letters' x-height");
+    let (_, _, into_above) = seats(false, true);
+    assert_eq!(into_above, 0, "a grain floats into the lettered row above");
+    let (old, _, _) = seats(true, false);
+    assert_eq!(old, 0, "control: the old dust floats out {old} times");
+}
+
+/// THE DARK COMET'S DUST IS DRAWN WHOLE OR NOT AT ALL AT THE GRID'S EDGE (looks8 round 3's
+/// judges): typing on the grid's last row (an Enter at the bottom row hands it the prompt),
+/// the dust seated under the row lay across the grid's bottom edge, where the effects box cuts
+/// a halo flat, and read as a bright `...` beside the caret's lower right on dark and
+/// Solarized Dark (in this fixture, grains crossed the edge after 28 of its 30 keys). No
+/// grain's disc crosses the box's edge, and the dust still stands by the typed row.
+#[test]
+fn the_dark_comet_s_dust_is_whole_at_the_grid_s_edge() {
+    let g = tall_geom();
+    let row = (g.rows - 1) as u16;
+    let mut c = cfg(GlowStyle::Comet, true);
+    c.intensity = 1.0;
+    (c.theme_fg, c.theme_bg) = (0x00D0_D0D0, 0x0011_1318);
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    let mut text = vec![' '; g.cols];
+    text[0] = '$';
+    let mut t = Instant::now();
+    let (fx_top, fx_bot) = (g.fx_top(), g.fx_bot());
+    let row_top = i32::from(row) * i32::from(g.ch as u16);
+    let (mut by_row, mut crossing) = (0usize, Vec::new());
+    for k in 0..=30u16 {
+        if k > 0 {
+            t += Duration::from_millis(60);
+            if k % 5 != 0 {
+                text[usize::from(2 + k - 1)] = 'm';
+            }
+            glow.note_synthetic_typed(t, 1);
+        }
+        let caret = 2 + k;
+        glow.observe_row(row, caret, &text, t);
+        let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for (col, &ch) in text.iter().enumerate() {
+            rows[usize::from(row)][col].ch = ch;
+        }
+        glow.observe_frame_text(Some((row, caret)), &rows, t);
+        glow.tick(Some((row, caret)), t, &c, g, &mut out);
+        for h in glow.halos().iter().filter(|h| h.rx <= (g.ch / 4) as u16) {
+            let (top, bot) = (
+                i32::from(h.cy) - i32::from(h.ry),
+                i32::from(h.cy) + i32::from(h.ry),
+            );
+            by_row += usize::from(bot > row_top - i32::from(g.ch as u16));
+            if top < fx_top - 1 || bot > fx_bot + 1 {
+                crossing.push((k, h.cy, h.ry));
+            }
+        }
+    }
+    assert!(
+        by_row >= 20,
+        "fixture: the comet's dust stands by the last row ({by_row} grains)"
+    );
+    assert!(
+        crossing.is_empty(),
+        "grains cross the grid's edge, cut flat there: {crossing:?}"
+    );
+}

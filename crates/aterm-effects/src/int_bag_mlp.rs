@@ -147,6 +147,7 @@ pub struct Layout {
 
 impl Layout {
     /// Every field, the `job` header's then the `params` header's, in word order.
+    #[inline]
     pub fn fields(&self) -> impl Iterator<Item = (&'static str, usize)> {
         self.job.iter().chain(self.params).copied()
     }
@@ -284,6 +285,8 @@ pub struct Spec<'a> {
 }
 
 /// Write `spec` as a params blob, the header (QMAX computed from MULT) then each tensor at the next 16-byte-aligned offset, checking nothing: [`check`] refuses what it must.
+#[must_use]
+#[inline]
 pub fn build(spec: &Spec<'_>) -> Vec<u8> {
     const fn word(n: usize) -> u32 {
         if n > u32::MAX as usize {
@@ -305,20 +308,32 @@ pub fn build(spec: &Spec<'_>) -> Vec<u8> {
     h[params::G] = spec.g;
     h[params::T] = spec.t as u32;
     let push_bytes = |out: &mut Vec<u8>, v: &[i8]| {
-        out.reserve(v.len());
         for &x in v {
             out.push(x as u8);
         }
     };
     let push_words = |out: &mut Vec<u8>, v: &[i32]| {
-        out.reserve(v.len() * 4);
         for &x in v {
             out.extend_from_slice(&x.to_le_bytes());
         }
     };
-    let mut out = vec![0u8; PARAMS_WORDS * 4];
+    let align = TENSOR_ALIGN as usize;
+    let total_len = [
+        spec.emb.len(),
+        spec.w1.len(),
+        spec.w2.len(),
+        spec.lut.len(),
+        spec.b1.len() * 4,
+        spec.b2.len() * 4,
+    ]
+    .into_iter()
+    .fold(PARAMS_WORDS * 4, |acc, bytes| {
+        acc.next_multiple_of(align) + bytes
+    });
+    let mut out = Vec::with_capacity(total_len);
+    out.resize(PARAMS_WORDS * 4, 0);
     for t in Tensor::ALL {
-        out.resize(out.len().next_multiple_of(TENSOR_ALIGN as usize), 0);
+        out.resize(out.len().next_multiple_of(align), 0);
         let (off, len) = t.fields();
         h[off] = word(out.len());
         let count = match t {
@@ -510,6 +525,7 @@ const fn word_at(bytes: &[u8], i: usize) -> u32 {
 }
 
 /// Refuse, by name, every params blob outside the profile's bounds (design §12.2), before any buffer exists.
+#[inline]
 pub const fn check(bytes: &[u8]) -> Result<ParamsView<'_>, ParamsError> {
     #[inline]
     const fn tensor_slice(bytes: &[u8], span: (u64, u64, Tensor)) -> &[u8] {
@@ -803,6 +819,7 @@ impl<'a> ParamsView<'a> {
 
     /// The header's words.
     #[must_use]
+    #[inline]
     pub const fn header(&self) -> [u32; PARAMS_WORDS] {
         let mut out = [0u32; PARAMS_WORDS];
         let mut i = 0;
@@ -872,6 +889,7 @@ pub struct JobBytes {
 impl JobBytes {
     /// The buffers of a batch of `rows` rows, `total_ids` ids and `classes` classes.
     #[must_use]
+    #[inline]
     pub const fn of(rows: u64, total_ids: u64, classes: u32) -> JobBytes {
         const fn at_least_4(n: u64) -> u64 {
             if n < 4 { 4 } else { n }
@@ -956,6 +974,7 @@ pub struct Batch {
 
 impl Batch {
     /// Validate `offsets` and `ids` against `p` (design §12.3) and keep them; a row with zero ids is valid and abstains.
+    #[inline]
     pub fn pack(p: &ParamsView<'_>, offsets: Vec<u32>, ids: Vec<u16>) -> Result<Batch, BatchError> {
         let rows = offsets.len().saturating_sub(1);
         if rows == 0 {
@@ -1077,6 +1096,7 @@ impl Batch {
 
     /// The `job` header's words.
     #[must_use]
+    #[inline]
     pub const fn header(&self) -> [u32; JOB_WORDS] {
         let mut h = [0u32; JOB_WORDS];
         h[job::MAGIC] = JOB_MAGIC_VALUE;
@@ -1294,6 +1314,7 @@ fn finish<A: Arith>(p: &ParamsView<'_>, pre: &[i32; H_CAP], out: &mut [u32]) {
 }
 
 /// Validate the arguments, then run every row of `rows` through steps 1–8.
+#[inline]
 fn run<A: Arith>(
     p: &ParamsView<'_>,
     b: &Batch,
@@ -1338,16 +1359,19 @@ fn run<A: Arith>(
 }
 
 /// The CPU reference: every row of `b` into `out` (ROWS × OUT_STRIDE words), every operation checked, panicking on any broken bound.
+#[inline]
 pub fn forward(p: &ParamsView<'_>, b: &Batch, out: &mut [u32]) -> Result<(), ForwardError> {
     run::<Checked>(p, b, 0..b.rows(), out)
 }
 
 /// [`forward`] with every operation wrapping, which equals it under the checker's and the packer's bounds.
+#[inline]
 pub fn forward_fast(p: &ParamsView<'_>, b: &Batch, out: &mut [u32]) -> Result<(), ForwardError> {
     run::<Wrapping>(p, b, 0..b.rows(), out)
 }
 
 /// [`forward_fast`] over `rows` only, into `out` (their OUT_STRIDE words each), so threads can split a batch.
+#[inline]
 pub fn forward_fast_rows(
     p: &ParamsView<'_>,
     b: &Batch,
@@ -1371,6 +1395,7 @@ pub struct RowTrace {
 }
 
 /// Trace row `row` of `b` through steps 1–5 of the checked reference, with how many units are clamped, saturated and interior, or `None` when it abstains.
+#[inline]
 pub fn trace(p: &ParamsView<'_>, b: &Batch, row: u32) -> Result<Option<RowTrace>, ForwardError> {
     if b.dims != p.dims {
         return Err(ForwardError::DimsMismatch {
@@ -1406,6 +1431,8 @@ pub fn trace(p: &ParamsView<'_>, b: &Batch, row: u32) -> Result<Option<RowTrace>
 }
 
 /// `Digest::of(OUT_DOMAIN, [the words, little-endian])`.
+#[must_use]
+#[inline]
 pub fn out_digest(words: &[u32]) -> Digest {
     let mut bytes = Vec::with_capacity(words.len() * 4);
     for &w in words {
@@ -1425,6 +1452,8 @@ const fn mix(a: u32, b: u32) -> u32 {
 }
 
 /// A params blob at the profile's extremes: B, E, H and C at their maxima, every weight ±127, `max|b1|` at the lossless bound, every `|b2|` at 2²⁹ − 1, and w2's classes in identical pairs so that every row's argmax is a tie.
+#[must_use]
+#[inline]
 pub fn extreme_params() -> Vec<u8> {
     extreme_params_for(
         Dims {
@@ -1438,6 +1467,8 @@ pub fn extreme_params() -> Vec<u8> {
 }
 
 /// [`extreme_params`] at `dims` and `min_ids`, which [`check`] refuses when they lie outside their bounds.
+#[must_use]
+#[inline]
 pub fn extreme_params_for(dims: Dims, min_ids: u32) -> Vec<u8> {
     let (e, h, c) = (
         dims.embed as usize,
@@ -1507,6 +1538,8 @@ pub fn extreme_params_for(dims: Dims, min_ids: u32) -> Vec<u8> {
 }
 
 /// CSR rows for [`extreme_params`]: two at [`MAX_ROW_IDS`] reaching step 3's bound with either sign, one of mixed ids at it, rows below MIN_IDS and empty, a row whose embeddings cancel, and short mixed rows.
+#[must_use]
+#[inline]
 pub fn extreme_rows() -> (Vec<u32>, Vec<u16>) {
     let full = MAX_ROW_IDS as usize;
     let top = (B_MAX - 1) as u16;
@@ -1525,7 +1558,8 @@ pub fn extreme_rows() -> (Vec<u32>, Vec<u16>) {
         vec![],
         (0..64).map(|i| (mix(i, 17) % B_MAX) as u16).collect(),
     ];
-    let mut offsets = vec![0u32];
+    let mut offsets = Vec::with_capacity(rows.len() + 1);
+    offsets.push(0);
     let mut ids = Vec::new();
     for row in rows {
         ids.extend_from_slice(&row);
@@ -1535,6 +1569,8 @@ pub fn extreme_rows() -> (Vec<u32>, Vec<u16>) {
 }
 
 /// A params blob at `dims` and `min_ids` whose every unit stays in the unclamped interior: emb and w1 in ±1 and ±2, so q ≤ 4E ≤ 128 ≪ QMAX, with emb's sign set by the bucket's half so a row of one half sums linearly; MULT = 181 and G = 8, so q·MULT is a multiple of 2^G only at q = 0; |b1| ≤ 30, so |p| ≤ 90 + 30 < T = 127; the identity table `lut[i] = i − T`; and no w2 weight 0, so a step 4, 5 or 6 that differs from the profile's moves a logit.
+#[must_use]
+#[inline]
 pub fn interior_params_for(dims: Dims, min_ids: u32) -> Vec<u8> {
     let (e, h, c) = (
         dims.embed as usize,
@@ -1592,9 +1628,12 @@ pub fn interior_params_for(dims: Dims, min_ids: u32) -> Vec<u8> {
 }
 
 /// CSR rows for [`interior_params_for`] at `dims` and `min_ids`: 64 rows of MIN_IDS to MIN_IDS + 10 ids (at most [`MAX_ROW_IDS`]), each row's ids from one half of the buckets, the halves alternating.
+#[must_use]
+#[inline]
 pub fn interior_rows(dims: Dims, min_ids: u32) -> (Vec<u32>, Vec<u16>) {
     let half = (dims.buckets / 2).max(1);
-    let mut offsets = vec![0u32];
+    let mut offsets = Vec::with_capacity(65);
+    offsets.push(0);
     let mut ids = Vec::new();
     for row in 0..64u32 {
         let len = min_ids.saturating_add(row % 11).min(MAX_ROW_IDS);
@@ -1609,6 +1648,7 @@ pub fn interior_rows(dims: Dims, min_ids: u32) -> (Vec<u32>, Vec<u16>) {
 struct Rng(u64);
 
 impl Rng {
+    #[inline]
     const fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
@@ -1616,21 +1656,26 @@ impl Rng {
         self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
+    #[inline]
     const fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
 
     /// Uniform in `-bound..=bound`.
+    #[inline]
     const fn signed(&mut self, bound: i64) -> i64 {
         self.below(2 * bound as u64 + 1) as i64 - bound
     }
 
+    #[inline]
     const fn weight(&mut self) -> i8 {
         self.signed(127) as i8
     }
 }
 
 /// The seeded blob `seed` within every bound, with its CSR rows: 1 to 48 rows of 0 to 40 ids and, every eighth blob, a first row at [`MAX_ROW_IDS`]; MULT is `⌊(2³¹ − 1)/2^r⌋` for one draw r in 0..=20, so QMAX is log-uniform from 1 to about 2²⁰ and the blobs reach both the clamped and the interior regime.
+#[must_use]
+#[inline]
 pub fn seeded(seed: u64) -> (Vec<u8>, Vec<u32>, Vec<u16>) {
     let mut r = Rng(0x9e37_79b9_7f4a_7c15 ^ (seed + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9));
     let dims = Dims {
@@ -1691,7 +1736,8 @@ pub fn seeded(seed: u64) -> (Vec<u8>, Vec<u32>, Vec<u16>) {
         b2: &b2,
     });
     let rows = 1 + r.below(48) as usize;
-    let mut offsets = vec![0u32];
+    let mut offsets = Vec::with_capacity(rows + 1);
+    offsets.push(0);
     let mut ids = Vec::new();
     for row in 0..rows {
         let len = if row == 0 && seed.is_multiple_of(8) {

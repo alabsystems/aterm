@@ -3,15 +3,15 @@
 
 //! Lane B5's law: a glow stream's ramps draw byte-identical to the quads they
 //! stand for. The Rainbow Kitty ribbon and meteor trains, laid as ramps and
-//! read so by the letter guard, draw on the CPU and on every GPU arm (Metal,
-//! and the wgpu oracle in its build) exactly the frames their legacy stream
+//! read so by the letter guard, draw on the CPU and on the GPU arm exactly
+//! the frames their legacy stream
 //! (every row a quad, `CursorGlow::set_glow_ramps(false)`) draws, damage-cached
 //! frame after frame, with and without bloom, on a dark and a light page;
 //! each stream counts every lit ramp row as its quad and marks the same rows.
 //! A stream whose lights from its first ramp on all add draws its quads ahead
 //! of its ramps on the GPU, and one with an `over` light among them in order;
 //! the meteor scenes show both. The present draws them alike too: its bloom
-//! and its SDR crown (and, on the wgpu oracle, its HDR crown) read the
+//! and its SDR crown read the
 //! additive stream's ramps as an item list, rows unexpanded, and present the
 //! legacy stream's bytes. A comet slab's column rides a ramp, its core
 //! the ramp's run (one light as tall as its rows): the comet, laser (its
@@ -22,7 +22,9 @@
 //! linear one at Over, the fx streams the pet's and the word icons' frames
 //! open), the ramps drawn in that fx stream draw the quads' bytes too, and
 //! the measured rule draws them on Metal as the glow instances they stand
-//! for.
+//! for. A ramp row whose two ends differ in opacity (a faint end beside a
+//! near-opaque one, an additive end beside an opaque one) draws the same
+//! bytes on the CPU and on every GPU arm and route, laid under any cost.
 
 use crate::common;
 use aterm_core::render::RenderInput;
@@ -37,7 +39,7 @@ use aterm_effects::cursor_trail::TrailConfig;
 use aterm_effects::host::motion_print_anchor;
 use aterm_effects::pipeline::{CursorStep, EffectsPipeline, RowProbe};
 use aterm_gpu::RampsFx;
-use aterm_render::{GlowQuad, GlowRamps, RampCost, Theme, WindowCpu};
+use aterm_render::{BeamRows, GlowQuad, GlowRamps, RampCost, RampSink, Theme, WindowCpu};
 use aterm_time::Instant;
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,12 +85,6 @@ const SHIMMER_PHASE: f32 = 0.37;
 /// The SDR crown's strength (`cursor_glow_sdr_boost`'s default), its ease
 /// reset before each present so both streams meet the same budget.
 const CROWN: f32 = 0.25;
-
-/// Whether `arm`'s virtual presents read back in this build: the oracle
-/// build's capture is the wgpu ring, which the native Metal arm never writes.
-fn reads_presents(arm: &str) -> bool {
-    !(cfg!(all(wgpu_arm, target_os = "macos")) && arm == "native")
-}
 
 /// One effects pipeline and the frame it publishes into.
 struct Side {
@@ -259,10 +255,9 @@ struct Seen {
     ordered: usize,
     shimmered: usize,
     /// The frames whose bloom read the additive stream's ramps (its item
-    /// list), and the presents whose SDR and HDR crowns did.
+    /// list), and the presents whose crown did.
     bloomed: usize,
     crowned: usize,
-    hdr: usize,
     /// The GPU frames whose ramps rode an fx stream that also drew the
     /// frame's art, and those whose measured-cost ramps beside art drew as
     /// their quads or rode it.
@@ -285,7 +280,6 @@ impl std::ops::AddAssign for Seen {
         self.shimmered += o.shimmered;
         self.bloomed += o.bloomed;
         self.crowned += o.crowned;
-        self.hdr += o.hdr;
         self.beside_art += o.beside_art;
         self.art_shut += o.art_shut;
         self.art_opened += o.art_opened;
@@ -331,9 +325,6 @@ enum Costs {
     /// Metal's: ramps open the fx stream from about 1,460 lit rows, and
     /// beside art they draw as the glow instances they stand for.
     Metal,
-    /// The wgpu oracle's on its Metal backend: ramps ride the fx stream from
-    /// one lit row, beside art or not.
-    Oracle,
     /// None measured: every ramp draws as the glow instances it stands for.
     Unmeasured,
 }
@@ -341,10 +332,9 @@ enum Costs {
 fn costs(arm: &str) -> Costs {
     if !cfg!(target_os = "macos") {
         Costs::Unmeasured
-    } else if arm == "native" {
-        Costs::Metal
     } else {
-        Costs::Oracle
+        assert_eq!(arm, "native", "the one arm a parity test runs on");
+        Costs::Metal
     }
 }
 
@@ -458,8 +448,6 @@ fn scene(
         gpu.set_bloom(bloom);
         gpu.set_shimmer_phase_for_test(Some(SHIMMER_PHASE));
         gpu.set_sdr_glow_boost(CROWN);
-        #[cfg(wgpu_arm)]
-        gpu.set_hdr_glow(true);
     }
     let (frame_w, frame_h) = arms[0].1.frame_size(ROWS, COLS);
     let px = |v: usize| u16::try_from(v).expect("a geometry within u16");
@@ -517,14 +505,8 @@ fn scene(
                     aterm_gpu::WindowGpu::new(),
                     aterm_gpu::WindowGpu::new(),
                 ],
-                // The presents of the ramps and of the legacy stream, then
-                // their HDR presents on a 2.0x EDR panel.
+                // The presents of the ramps and of the legacy stream.
                 [aterm_gpu::WindowGpu::new(), aterm_gpu::WindowGpu::new()],
-                [0, 1].map(|_| {
-                    let mut win = aterm_gpu::WindowGpu::new();
-                    win.set_edr_max(2.0);
-                    win
-                }),
             )
         })
         .collect();
@@ -610,7 +592,7 @@ fn scene(
         }
         let items = !r.cursor_glow_add_ramps.is_empty();
         seen.bloomed += usize::from(bloom && items);
-        for ((arm, cpu, gpu), (cwins, gwins, pwins, hwins)) in arms.iter_mut().zip(&mut wins) {
+        for ((arm, cpu, gpu), (cwins, gwins, pwins)) in arms.iter_mut().zip(&mut wins) {
             let [cr, cm, cl] = cwins;
             let a = cpu.render_input_cached(cr, r).pixels().to_vec();
             let am = cpu.render_input_cached(cm, m).pixels().to_vec();
@@ -660,24 +642,18 @@ fn scene(
             let art_fx = drawn_l.fx.0 > 0;
             seen.beside_art += usize::from(art_fx && drawn_a.fx.0 > drawn_l.fx.0);
             let m_ramps = !(m.glow_under_ramps.is_empty() && m.cursor_glow_add_ramps.is_empty());
-            let m_lit = m.glow_under_ramps.lit + m.cursor_glow_add_ramps.lit;
             match costs(arm) {
                 Costs::Metal if art_fx && m_ramps => assert_eq!(
                     drawn_m, drawn_l,
                     "{arm} frame {tick}: on Metal the measured rule draws ramps beside art as \
                      the glow instances they stand for"
                 ),
-                Costs::Oracle if m_lit > 0 => assert!(
-                    drawn_m.fx.0 > drawn_l.fx.0,
-                    "{arm} frame {tick}: on the oracle's Metal backend the measured rule draws \
-                     every frame's lit ramp rows in the fx stream"
-                ),
                 Costs::Unmeasured => assert_eq!(
                     drawn_m, drawn_l,
                     "{arm} frame {tick}: an arm whose route costs were not measured draws the \
                      measured cost's ramps as the glow instances they stand for"
                 ),
-                Costs::Metal | Costs::Oracle => {}
+                Costs::Metal => {}
             }
             if !m_ramps {
                 assert_eq!(
@@ -695,7 +671,7 @@ fn scene(
                 seen.opened += 1;
                 seen.art_opened += usize::from(drawn_l.fx.0 > 0);
             }
-            if items && reads_presents(arm) {
+            if items {
                 gpu.set_ramps_fx_for_test(None);
                 let [pr, pl] = pwins;
                 let mut present = |win: &mut aterm_gpu::WindowGpu, input: &RenderInput| {
@@ -721,20 +697,7 @@ fn scene(
                     a.iter().zip(&b).position(|(x, y)| x != y)
                 );
                 seen.crowned += 1;
-                #[cfg(wgpu_arm)]
-                if *arm != "native" {
-                    let [hr, hl] = hwins;
-                    let bits = |px: Vec<f32>| px.into_iter().map(f32::to_bits).collect::<Vec<_>>();
-                    let a = bits(gpu.present_hdr_for_test(hr, r, true).0);
-                    let b = bits(gpu.present_hdr_for_test(hl, l, true).0);
-                    assert!(
-                        a == b,
-                        "{arm} frame {tick}: the HDR crown draws the ramps as their quads"
-                    );
-                    seen.hdr += 1;
-                }
             }
-            let _ = &hwins;
         }
     }
     seen
@@ -768,7 +731,7 @@ fn holds_beside(
                 "{what} (bg {:06x}, bloom {bloom}): {} frames, up to {} ramps ({} runs, {} under \
                  the measured cost) a frame, {} guarded, {} streams drawn apart, {} in order, \
                  {} shimmered, measured ramps {} times in fx, {} times as quads, {} bloomed \
-                 and {} crowned ({} in HDR) from the ramps, {} drawn in fx beside art, {} \
+                 and {} crowned from the ramps, {} drawn in fx beside art, {} \
                  measured beside art as quads, {} in fx",
                 theme.bg,
                 seen.frames,
@@ -783,7 +746,6 @@ fn holds_beside(
                 seen.shut,
                 seen.bloomed,
                 seen.crowned,
-                seen.hdr,
                 seen.beside_art,
                 seen.art_shut,
                 seen.art_opened
@@ -822,10 +784,6 @@ fn typed_ribbon_ramps_draw_their_quads_on_every_arm() {
         "typing: the bloom read the ribbon's ramps"
     );
     assert!(seen.crowned > 0, "typing: the present's crown read them");
-    assert!(
-        !cfg!(wgpu_arm) || seen.hdr > 0,
-        "typing: the oracle's HDR crown read them"
-    );
 }
 
 /// Meteors hopping along the prompt's row.
@@ -982,6 +940,283 @@ fn over_light_after_a_ramp_keeps_its_order() {
     }
 }
 
+/// The opacities of a ramp row's left and right ends, a row band each: a
+/// faint end beside a near-opaque one either way round, and an additive end
+/// beside an opaque one.
+const END_OPACITIES: [(u8, u8); 5] = [(1, 236), (236, 1), (200, 1), (1, 200), (0, 255)];
+
+/// The colours a slab's rows walk: row `r`'s left end is entry `r`, its
+/// right end entry `r + 2`.
+const END_INKS: [u32; 4] = [0x00FF_4020, 0x0020_E040, 0x0040_40FF, 0x00F0_C010];
+
+/// Lay into `out`, in the row band of each pair of [`END_OPACITIES`] (bands
+/// 2 on), a slab per `(rows, w)` of `slabs`, side by side from cell column 4
+/// and two pixels into the band, each row's ends at its pair's opacities, or,
+/// for the `flat` twin, the right end at the left end's.
+fn opacity_slabs(
+    out: &mut impl BeamRows,
+    (pad, top): (usize, usize),
+    (cw, ch): (usize, usize),
+    slabs: &[(usize, usize)],
+    flat: bool,
+) {
+    let px = |v: usize| u16::try_from(v).expect("a geometry within u16");
+    // An additive end adds light of its own; a source-over end carries its
+    // colour premultiplied by its opacity.
+    let end = |ink: usize, alpha: u8| {
+        let cov = if alpha == 0 { 0x60 } else { alpha };
+        (
+            aterm_render::premul_rgb(END_INKS[ink % END_INKS.len()], cov),
+            alpha,
+        )
+    };
+    for (k, &(a0, a1)) in END_OPACITIES.iter().enumerate() {
+        let band = px(2 + k);
+        let mut x = pad + 4 * cw;
+        for &(rows, w) in slabs {
+            out.slab();
+            for r in 0..rows {
+                let y = top + usize::from(band) * ch + 2 + r;
+                let right = (end(r + 2, a1).0, if flat { a0 } else { a1 });
+                out.row(
+                    i32::from(band),
+                    band,
+                    (px(x), px(y), px(w)),
+                    end(r, a0),
+                    right,
+                );
+            }
+            x += w + cw;
+        }
+    }
+}
+
+/// A ramp row whose two ends differ in opacity (PRISM-GLASS §15.1 P0.8, the
+/// rows the light wedge lays): the CPU's `draw_ramp` and the GPU's
+/// `fx_ramp_row` rows draw the bytes of the quads they stand for and of each
+/// other, on every arm, in the under-glow and glow streams over a dark and a
+/// light page, laid under [`RampCost::ALWAYS`] and under the measured cost
+/// (its short slabs left quads), on every GPU route. The negative control is
+/// the flat twin, each row's right end at its left end's opacity: it draws
+/// other bytes, so a renderer that read one end's opacity for both fails.
+#[test]
+fn a_ramp_row_whose_ends_differ_in_opacity_draws_the_same_bytes_on_cpu_and_gpu() {
+    const TEST: &str =
+        "a_ramp_row_whose_ends_differ_in_opacity_draws_the_same_bytes_on_cpu_and_gpu";
+    let exact = common::ByteExact::default();
+    for theme in [Theme::default(), LIGHT] {
+        let mut arms = common::arms(PX, theme);
+        let (cw, ch) = arms[0].1.cell_size();
+        let origin = (arms[0].1.pad(), arms[0].1.grid_top());
+        let floor = aterm_render::glow_ramps::RAMP_COST.floor() as usize;
+        let tall = ch - 4;
+        assert!(
+            tall >= floor,
+            "a tall slab's run pays under the measured cost"
+        );
+        // A row, a run the measured cost leaves quads, and a run that rides,
+        // each narrow and wide.
+        let slabs = [(1, 1), (1, 7), (3, 2), (3, 15), (tall, 3), (tall, 40)];
+        let mut legacy: Vec<GlowQuad> = Vec::new();
+        opacity_slabs(&mut legacy, origin, (cw, ch), &slabs, false);
+        let laid = |cost: Option<RampCost>, flat: bool| {
+            let (mut quads, mut ramps) = (Vec::new(), GlowRamps::default());
+            let sink = RampSink::new(&mut quads, &mut ramps);
+            let mut sink = match cost {
+                Some(cost) => sink.costed(cost),
+                None => sink,
+            };
+            opacity_slabs(&mut sink, origin, (cw, ch), &slabs, flat);
+            drop(sink);
+            (quads, ramps)
+        };
+        let always = laid(Some(RampCost::ALWAYS), false);
+        let measured = laid(None, false);
+        let flat = laid(Some(RampCost::ALWAYS), true);
+        let bands = END_OPACITIES.len();
+        assert_eq!(
+            (always.0.len(), always.1.items.len()),
+            (0, bands * slabs.len()),
+            "under RampCost::ALWAYS every slab rides a ramp"
+        );
+        let short: usize = slabs.iter().filter(|s| s.0 < floor).map(|s| s.0).sum();
+        let riding = slabs.iter().filter(|s| s.0 >= floor).count();
+        assert_eq!(
+            (measured.0.len(), measured.1.items.len()),
+            (bands * short, bands * riding),
+            "under the measured cost a slab short of its floor stays quads"
+        );
+        for (x, what) in [
+            (&always, "every slab a ramp"),
+            (&measured, "the measured cost"),
+        ] {
+            assert_eq!(
+                x.1.laid(x.0.len()),
+                legacy.len(),
+                "{what}: every lit ramp row counts as its quad"
+            );
+        }
+        let opacities = |(_, ramps): &(Vec<GlowQuad>, GlowRamps)| {
+            ramps
+                .items
+                .iter()
+                .flat_map(|ramp| (0..ramp.h).map(move |r| ramp.row_ends(&ramps.ends, r)))
+                .map(|(a, b)| (aterm_render::end_alpha(a), aterm_render::end_alpha(b)))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            opacities(&always).iter().all(|(a, b)| a != b),
+            "every ramp row's ends differ in opacity"
+        );
+        assert!(
+            opacities(&flat).iter().all(|(a, b)| a == b),
+            "every flat twin row's ends share one"
+        );
+        let mut term = Terminal::new(ROWS as u16, COLS as u16);
+        term.process(b"\x1b[?25l");
+        let base = term.cell_frame(ROWS, COLS);
+        for (arm, cpu, gpu) in &mut arms {
+            let page = cpu.render_input(&base).pixels;
+            // The CPU draws no bloom and no heat shimmer: the frames compare
+            // with both off, and the GPU's routes with its bloom on too.
+            gpu.set_shimmer(false);
+            gpu.set_bloom(false);
+            gpu.set_ramps_fx_for_test(None);
+            let gpu_page = gpu
+                .render_input(&mut aterm_gpu::WindowGpu::new(), &base, None)
+                .pixels;
+            assert_eq!(
+                common::max_channel_delta(&page, &gpu_page),
+                0,
+                "{arm} on bg {:06x}: the page draws byte-exact, so a delta is the ramps'",
+                theme.bg
+            );
+            for (stream, under) in [("under-glow", true), ("glow", false)] {
+                let what = format!("{arm} {stream} stream on bg {:06x}", theme.bg);
+                let carrying = |(quads, ramps): (&[GlowQuad], &GlowRamps)| {
+                    let mut input = base.clone();
+                    let (q, r) = if under {
+                        (&mut input.glow_under, &mut input.glow_under_ramps)
+                    } else {
+                        (&mut input.cursor_glow_add, &mut input.cursor_glow_add_ramps)
+                    };
+                    (*q, *r) = (quads.to_vec(), ramps.clone());
+                    input
+                };
+                let l = carrying((&legacy[..], &GlowRamps::default()));
+                let r = carrying((&always.0[..], &always.1));
+                let m = carrying((&measured.0[..], &measured.1));
+                let f = carrying((&flat.0[..], &flat.1));
+                let cpu_l = cpu.render_input(&l).pixels;
+                assert!(cpu_l != page, "{what}: the slabs paint");
+                assert!(
+                    cpu.render_input(&r).pixels == cpu_l,
+                    "{what}: the CPU draws the ramps as their quads"
+                );
+                assert!(
+                    cpu.render_input(&m).pixels == cpu_l,
+                    "{what}: the CPU draws the measured cost's ramps as their quads"
+                );
+                let cpu_f = cpu.render_input(&f).pixels;
+                assert!(
+                    cpu_f != cpu_l,
+                    "{what}: the flat twin draws other bytes on the CPU, or no end's own \
+                     opacity was drawn"
+                );
+                for (bloom, (route, how)) in [false, true].into_iter().flat_map(|bloom| {
+                    [
+                        (Some(RampsFx::Always), "in the fx stream"),
+                        (Some(RampsFx::Never), "as glow instances"),
+                        (None, "by the measured rule"),
+                    ]
+                    .map(|route| (bloom, route))
+                }) {
+                    let what = format!("{what}, bloom {bloom}");
+                    gpu.set_bloom(bloom);
+                    gpu.set_ramps_fx_for_test(route);
+                    let mut draw = |input: &RenderInput| {
+                        let pixels = gpu
+                            .render_input(&mut aterm_gpu::WindowGpu::new(), input, None)
+                            .pixels;
+                        common::assert_arm(arm, gpu);
+                        (pixels, gpu.frame_shape().fx_instances)
+                    };
+                    let (gpu_l, fx_l) = draw(&l);
+                    let (gpu_r, fx_r) = draw(&r);
+                    let (gpu_m, _) = draw(&m);
+                    let (gpu_f, _) = draw(&f);
+                    assert_eq!(fx_l, 0, "{what}: the legacy stream opens no fx stream");
+                    if route == Some(RampsFx::Always) {
+                        assert!(
+                            fx_r > 0,
+                            "{what}: the ramps drew in the fx stream, through fx_ramp_row"
+                        );
+                    }
+                    assert!(
+                        gpu_r == gpu_l,
+                        "{what}: the GPU draws the ramps {how} as their quads"
+                    );
+                    assert!(
+                        gpu_m == gpu_l,
+                        "{what}: the GPU draws the measured cost's ramps {how} as their quads"
+                    );
+                    assert!(
+                        gpu_f != gpu_r,
+                        "{what}: the flat twin draws other bytes on the GPU ({how})"
+                    );
+                    if bloom {
+                        // The bloom is the GPU's alone: its routes agree above.
+                        continue;
+                    }
+                    let delta = common::max_channel_delta(&cpu_l, &gpu_r);
+                    let delta_flat = common::max_channel_delta(&cpu_f, &gpu_f);
+                    eprintln!(
+                        "{what}, ramps {how}: CPU vs GPU max per-channel delta {delta}, flat \
+                         twin {delta_flat} ({} quads, {} ramps; {fx_r} fx instances)",
+                        legacy.len(),
+                        always.1.items.len()
+                    );
+                    if exact.holds(gpu, &what) {
+                        assert_byte_exact_both(TEST, &what, gpu, (delta, delta_flat), how);
+                    }
+                }
+                gpu.set_bloom(false);
+                gpu.set_ramps_fx_for_test(None);
+            }
+        }
+    }
+}
+
+/// [`common::assert_byte_exact`] of a ramp frame and its flat twin drawn
+/// `how`.
+fn assert_byte_exact_both(
+    test: &str,
+    what: &str,
+    gpu: &aterm_gpu::GpuRenderer,
+    (delta, delta_flat): (i32, i32),
+    how: &str,
+) {
+    common::assert_byte_exact(
+        test,
+        what,
+        gpu,
+        delta,
+        format_args!(
+            "{what}: ramp rows whose ends differ in opacity, drawn {how}, must be BYTE-EXACT \
+             CPU==GPU (got {delta})"
+        ),
+    );
+    common::assert_byte_exact(
+        test,
+        &format!("{what}, flat twin"),
+        gpu,
+        delta_flat,
+        format_args!(
+            "{what}: the flat twin, drawn {how}, must be BYTE-EXACT CPU==GPU (got {delta_flat})"
+        ),
+    );
+}
+
 /// The typist's ribbon (its ramps under the ink) and the comet (its slabs'
 /// additive ramps, read by the bloom and its crowns on the dark page) beside
 /// the frame's own fx art: ramps drawn in the fx stream the art opens draw
@@ -1010,10 +1245,8 @@ fn ramps_beside_fx_art_draw_their_quads_on_every_arm() {
             "{what}: on Metal the measured rule drew ramps beside art as their quads"
         );
         assert_eq!(
-            seen.art_opened > 0,
-            cfg!(all(target_os = "macos", wgpu_arm)),
-            "{what}: on the oracle's Metal backend, the one arm whose measured costs send them \
-             there, the measured rule drew ramps in fx beside art"
+            seen.art_opened, 0,
+            "{what}: no arm's measured costs send ramps beside art into fx"
         );
         assert!(
             seen.crowned > 0,

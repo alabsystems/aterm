@@ -116,6 +116,7 @@ impl CursorGlow {
     }
 
     /// Typing cadence → the thermal integrators (heat / coal / the canonical typing-momentum metric), plus the quench-steam flash on a deletion echo.
+    #[inline]
     pub(super) fn update_typing_thermals(&mut self, mv: &MoveCtx) -> f32 {
         let &MoveCtx {
             pr,
@@ -221,6 +222,7 @@ impl ForgeBand {
     pub(super) const MIN_ARC: f32 = 0.22;
 
     /// Solve the band for `ground`, preferring the side `dark` names.
+    #[inline]
     pub(super) const fn solve(ground: u32, dark: bool) -> Self {
         const LUM_TOP: f32 = crate::color_math::relative_luminance(fire_ramp(ForgeBand::TOP));
         const LUM_COLD: f32 = crate::color_math::relative_luminance(fire_ramp(ForgeBand::COLD));

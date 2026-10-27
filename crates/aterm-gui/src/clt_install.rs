@@ -184,7 +184,7 @@ pub(crate) struct Terminal {
     receipt: Option<receipt::Receipt>,
 }
 
-fn waiting_shell_command() -> Vec<std::ffi::OsString> {
+pub(crate) fn waiting_shell_command() -> Vec<std::ffi::OsString> {
     ["/usr/bin/env", "-u", "ENV", "-u", "BASH_ENV", "/bin/sh"]
         .into_iter()
         .map(Into::into)
@@ -548,6 +548,14 @@ impl App {
         } else {
             install.withdrawn_by(revision)
         };
+        // The git-and-friends shim stands in front of `/usr/bin` for the shells aterm spawns
+        // exactly while a pass wants the Command Line Tools, so a shell that runs `git` meanwhile
+        // is told they are on their way rather than raising macOS's install dialog (design §6.3).
+        // It is torn down the moment no pass wants them (they arrived, or the run was stopped).
+        crate::clt_shim::refresh(!matches!(
+            self.workstation_setup.developer_tools,
+            Install::Unasked
+        ));
         self.tick_developer_tools_install();
     }
 

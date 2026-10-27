@@ -1,41 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-#[cfg(wgpu_arm)]
-use wgpu::TextureFormat;
-
-/// The stored offscreen format, equal to the default view (`off.view`) format.
-#[must_use]
-#[inline]
-#[cfg(wgpu_arm)]
-pub(crate) const fn offscreen_format(srgb_offscreen: bool) -> TextureFormat {
-    if srgb_offscreen {
-        TextureFormat::Rgba8Unorm
-    } else {
-        TextureFormat::Rgba8UnormSrgb
-    }
-}
-
-/// The sRGB view format attached by the base, cursor and deco-over passes so blending composites in linear light.
-#[must_use]
-#[inline]
-#[cfg(wgpu_arm)]
-pub(crate) fn offscreen_srgb_view_format(srgb_offscreen: bool) -> TextureFormat {
-    offscreen_format(srgb_offscreen).add_srgb_suffix()
-}
-
-/// The `view_formats` alias list the offscreen texture must declare so the sRGB view can be created (wgpu panics otherwise).
-#[must_use]
-#[inline]
-#[cfg(wgpu_arm)]
-pub(crate) const fn offscreen_view_formats(srgb_offscreen: bool) -> &'static [TextureFormat] {
-    if srgb_offscreen {
-        &[TextureFormat::Rgba8UnormSrgb]
-    } else {
-        &[]
-    }
-}
-
 /// The HDR present gate as pure decision functions, exhaustively checked by `tests/hdr_gate.rs`'s full enumeration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HdrPlan {
@@ -116,20 +81,6 @@ pub enum HdrReconfigurePlan {
     KeepHdr,
     /// Re-tagging the recreated f16 swapchain failed.
     FallbackToSdr,
-}
-
-/// Projection onto `HdrReconfigureRetag` state, built by [`crate::WindowGpu::project_hdr_reconfigure_state`].
-#[cfg(all(test, wgpu_arm))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HdrReconfigureProjection {
-    /// Model phase: confirmed HDR (0), retained eligible SDR (1), resolved (2).
-    pub(crate) stage: u8,
-    /// Whether the attempted scRGB re-tag succeeded.
-    pub(crate) retagged: bool,
-    /// Whether the plan resolved to `Rgba16Float` (planner-derived; the configure happens on the `GpuSurface`).
-    pub(crate) is_f16: bool,
-    /// Whether the window's applied capture metadata declares extended-linear sRGB.
-    pub(crate) capture_linear: bool,
 }
 
 /// Resolve the post-reconfigure surface encoding from the current format and whether scRGB was re-established.
@@ -235,24 +186,6 @@ pub const fn sdr_boost_pass(swapchain_is_f16: bool, glow_nonempty: bool, budget:
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[cfg(wgpu_arm)]
-    fn the_srgb_view_is_a_declared_alias_of_srgb_storage() {
-        for srgb in [true, false] {
-            let tex = offscreen_format(srgb);
-            let view = offscreen_srgb_view_format(srgb);
-            assert!(
-                view == tex || offscreen_view_formats(srgb).contains(&view),
-                "srgb={srgb}: the sRGB view format is neither the texture format nor a declared alias"
-            );
-            assert_eq!(
-                tex.add_srgb_suffix(),
-                TextureFormat::Rgba8UnormSrgb,
-                "srgb={srgb}"
-            );
-        }
-    }
 
     /// The SDR boost never fires on f16, with an empty stream, or at a
     /// non-positive or invalid budget.

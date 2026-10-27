@@ -3166,7 +3166,7 @@ mod tests {
             "ended: nothing left to arm"
         );
         assert_eq!(
-            app.hand_devtools_to_owner(Origin::Ctl { now: false }),
+            app.hand_devtools_to_owner(Origin::Ctl),
             HandOver::Refused(crate::devtools_helper::Refusal::Granted),
             "the panel's read is the lane's reading now"
         );
@@ -3531,7 +3531,7 @@ mod tests {
             .devtools_helper
             .note_reading(empty(), std::time::Instant::now());
         assert_eq!(
-            granted.devtools_hand_over(Origin::Ctl { now: false }, Moment::Quiet),
+            granted.devtools_hand_over(Origin::Ctl, Moment::Quiet),
             HandOver::Listing
         );
         granted.devtools_helper.note_reading(
@@ -3683,26 +3683,20 @@ mod tests {
         );
     }
 
-    /// `aterm ctl devtools hand-over [now]` is the one hand-over with
-    /// `Origin::Ctl`, held to the window's own rules because
-    /// every in-session client may send it: the bare form never opens the page
-    /// as it asks but waits for a quiet moment; `now` (a person at `aterm
-    /// doctor`'s terminal) shows only the panel — the asker opens the page —
-    /// and ends any hand-over still waiting, so the page is not brought up a
-    /// second time later.
+    /// `aterm ctl devtools hand-over` is the one hand-over with `Origin::Ctl`, held to the
+    /// window's own rules because every in-session client may send it: it never opens the page
+    /// as it asks but waits for a quiet moment, and the window's refusals hold it. (Its `now` is
+    /// `permissions walk now devtools`, the walk's page: `system_state_access::permission_walk_tests`.)
     #[cfg(target_os = "macos")]
     #[test]
     fn the_control_verbs_ask_is_held_to_the_windows_own_rules() {
-        use crate::devtools_helper::{
-            DevToolsHelperArm, HandOver, Lane, Origin, Phase, Reading, Refusal, test_arms,
-        };
+        use crate::devtools_helper::{HandOver, Origin, Reading, Refusal, test_arms};
         use aterm_containment::DevToolGrant;
-        const ASK: Origin = Origin::Ctl { now: false };
-        const NOW: Origin = Origin::Ctl { now: true };
-        let ask = |app: &mut App, origin| app.hand_devtools_to_owner(origin);
+        const ASK: Origin = Origin::Ctl;
+        let ask = |app: &mut App| app.hand_devtools_to_owner(ASK);
 
         let mut headless = App::headless_for_test();
-        assert_eq!(ask(&mut headless, NOW), HandOver::Headless);
+        assert_eq!(ask(&mut headless), HandOver::Headless);
 
         let mut app = App::headless_for_test();
         test_arms::stand_in(&mut app, test_arms::opening());
@@ -3710,51 +3704,18 @@ mod tests {
         let t = std::time::Instant::now();
         assert!(app.devtools_watch.wants_read(t), "the launch read");
         assert_eq!(
-            ask(&mut app, ASK),
+            ask(&mut app),
             HandOver::Queued,
             "the bare form waits for a quiet moment"
         );
         assert_eq!(app.devtools_helper.queued(), Some(ASK));
         assert!(app.devtools_helper.panel().is_none(), "nothing shown yet");
+        assert_eq!(test_arms::opens(), opens, "nothing opened as it asked");
         assert!(
             !app.devtools_watch.wants_read(t),
             "nothing has brought the owner anywhere yet"
         );
-        assert_eq!(ask(&mut app, NOW), HandOver::Shown);
-        assert_eq!(
-            test_arms::opens(),
-            opens,
-            "`now` leaves the page to its asker"
-        );
-        let panel = app.devtools_helper.panel().expect("the helper panel");
-        assert_eq!((panel.origin(), panel.phase()), (NOW, Phase::Explain));
-        assert_eq!(
-            app.devtools_helper.queued(),
-            None,
-            "the asker opens the page: nothing waits to bring it up again"
-        );
-        assert!(
-            app.devtools_watch.wants_read(t),
-            "the owner's return reads the list"
-        );
-        assert_eq!(
-            ask(&mut app, NOW),
-            HandOver::Refused(Refusal::Recent),
-            "a second `now` inside the minute raises no second panel"
-        );
-        assert_eq!(ask(&mut app, ASK), HandOver::Queued);
-        let minute = std::time::Duration::from_secs(atpkg::devtools::REOPEN_NOW_AFTER_S);
-        let at = std::time::Instant::now();
-        app.devtools_helper.noted_now_answered(at);
-        assert!(
-            app.devtools_helper
-                .now_answered_within_its_minute(at + minute - std::time::Duration::from_secs(1))
-        );
-        assert!(
-            !app.devtools_helper
-                .now_answered_within_its_minute(at + minute),
-            "the minute ends"
-        );
+        assert_eq!(ask(&mut app), HandOver::Queued, "one waits");
 
         let refusals = [
             (test_arms::declining(), None, Refusal::Declined),
@@ -3768,6 +3729,12 @@ mod tests {
                 Some(test_arms::reading(DevToolGrant::Granted, test_arms::on())),
                 Refusal::Granted,
             ),
+            (test_arms::unstable(), None, Refusal::Unstable),
+            (
+                test_arms::opened(|window| (90 < window).then_some(90)),
+                None,
+                Refusal::Recent,
+            ),
         ];
         for (reach, reading, why) in refusals {
             let mut app = App::headless_for_test();
@@ -3776,40 +3743,10 @@ mod tests {
                 app.devtools_helper
                     .note_reading(reading, std::time::Instant::now());
             }
-            for origin in [ASK, NOW] {
-                assert_eq!(ask(&mut app, origin), HandOver::Refused(why), "{origin:?}");
-            }
+            assert_eq!(ask(&mut app), HandOver::Refused(why));
             assert!(app.devtools_helper.panel().is_none(), "{why:?}");
             assert_eq!(app.devtools_helper.queued(), None, "{why:?}");
         }
-
-        let mut unstable = App::headless_for_test();
-        test_arms::stand_in(&mut unstable, test_arms::unstable());
-        assert_eq!(
-            ask(&mut unstable, ASK),
-            HandOver::Refused(Refusal::Unstable)
-        );
-        assert_eq!(ask(&mut unstable, NOW), HandOver::Shown);
-
-        let mut recent = App::headless_for_test();
-        test_arms::stand_in(
-            &mut recent,
-            test_arms::opened(|window| (90 < window).then_some(90)),
-        );
-        assert_eq!(ask(&mut recent, ASK), HandOver::Refused(Refusal::Recent));
-        assert_eq!(ask(&mut recent, NOW), HandOver::Shown);
-
-        let mut unshown = App::headless_for_test();
-        test_arms::stand_in(&mut unshown, test_arms::opening());
-        unshown.devtools_helper =
-            Lane::windowed_for_test(test_arms::opening(), DevToolsHelperArm::inert());
-        unshown.devtools_helper.note_reading(
-            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
-            std::time::Instant::now(),
-        );
-        assert_eq!(ask(&mut unshown, ASK), HandOver::Queued);
-        assert_eq!(ask(&mut unshown, NOW), HandOver::Unshown);
-        assert_eq!(unshown.devtools_helper.queued(), None);
     }
 
     #[test]

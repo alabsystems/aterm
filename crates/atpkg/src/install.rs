@@ -4,11 +4,12 @@
 //! The verify-and-stage chain.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use crate::extract::{
-    ExtractError, ExtractOptions, FrameChecksum, TreeAccumulator, extract_tar_gz_tree,
-    extract_tar_zst_tree, extract_zip_tree,
+    ExtractError, ExtractOptions, FrameChecksum, TreeAccumulator, extract_tar_gz_tree_from,
+    extract_tar_zst_tree_from, extract_zip_tree,
 };
 use crate::manifest::{Artifact, DigestAlg};
 use crate::tree::{DeclaredModes, tree_root, tree_root_declared};
@@ -154,19 +155,31 @@ pub fn verify_and_stage(
                 return Err(e);
             }
         };
+    stage_extracted(artifact, build_dir, &incoming, extracted_root, modes, hooks)
+}
 
+/// [`verify_and_stage`] from its tree-root check on, for the tree extracted at `incoming` that
+/// folded to `extracted_root`.
+fn stage_extracted(
+    artifact: &Artifact,
+    build_dir: &Path,
+    incoming: &Path,
+    extracted_root: String,
+    modes: DeclaredModes,
+    hooks: &StageHooks<'_>,
+) -> Result<String, StageError> {
     let root = if artifact.tree_root.is_empty() {
         extracted_root
     } else {
-        let got = match reverified_root(&incoming, extracted_root, disk_reverify_armed(), &modes) {
+        let got = match reverified_root(incoming, extracted_root, disk_reverify_armed(), &modes) {
             Ok(r) => r,
             Err(e) => {
-                let _ = crate::store::remove_tree(&incoming);
+                let _ = crate::store::remove_tree(incoming);
                 return Err(io_step("re-walk the staged tree", e));
             }
         };
         if !got.eq_ignore_ascii_case(&artifact.tree_root) {
-            let _ = crate::store::remove_tree(&incoming);
+            let _ = crate::store::remove_tree(incoming);
             return Err(StageError::TreeRootMismatch {
                 expected: artifact.tree_root.clone(),
                 got,
@@ -174,7 +187,93 @@ pub fn verify_and_stage(
         }
         got
     };
-    finish_stage(artifact, build_dir, &incoming, root, modes, hooks)
+    finish_stage(artifact, build_dir, incoming, root, modes, hooks)
+}
+
+/// Whether `artifact`'s payload lane extracts a tar stream, so its download can stage as it
+/// arrives ([`extract_streamed`]).
+pub(crate) fn streams(artifact: &Artifact) -> bool {
+    matches!(artifact.payload.as_str(), "" | "tar-zst" | "tar-gz")
+}
+
+/// A build's staging scratch that a download stages into as it arrives
+/// ([`crate::flow::arriving`]): removed on drop, unless its tree went on to the stage
+/// ([`finish_streamed`]).
+pub(crate) struct Incoming(PathBuf);
+
+impl Incoming {
+    /// The scratch directory.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.0
+    }
+
+    /// The tree extracted here, folded to `root` with `modes`, its archive matched to the
+    /// signed digest.
+    pub(crate) fn staged(self, root: String, modes: DeclaredModes) -> Streamed {
+        Streamed {
+            incoming: self,
+            root,
+            modes,
+        }
+    }
+}
+
+impl Drop for Incoming {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() {
+            let _ = crate::store::remove_tree(&self.0);
+        }
+    }
+}
+
+/// A fresh staging scratch for `build_dir`, made as [`verify_and_stage`] makes one.
+pub(crate) fn open_streamed(build_dir: &Path) -> Option<Incoming> {
+    open_incoming(build_dir).ok().map(Incoming)
+}
+
+/// Lay `artifact`'s tar down under `dest` from `input`, as [`stage_payload_modes`] lays it from
+/// a downloaded file, and return the `tree_root` and declared modes of what was laid.
+pub(crate) fn extract_streamed(
+    artifact: &Artifact,
+    input: impl Read + Send,
+    dest: &Path,
+) -> Result<(String, DeclaredModes), StageError> {
+    let tree = tar_lane(artifact, input, dest)
+        .unwrap_or_else(|| Err(payload2("no stream lane for payload: ", &artifact.payload)))?;
+    fold_staged(artifact, dest, Some(tree))
+}
+
+/// A tree a download staged as it arrived, every byte of the download matched to the row's
+/// signed digest ([`crate::flow::arriving::fetch_staging`]).
+pub(crate) struct Streamed {
+    incoming: Incoming,
+    root: String,
+    modes: DeclaredModes,
+}
+
+impl Streamed {
+    /// The scratch the tree was laid in.
+    #[cfg(test)]
+    pub(crate) fn dir(&self) -> &Path {
+        self.incoming.dir()
+    }
+}
+
+/// [`verify_and_stage`] for a [`Streamed`] tree, whose archive digest already matched: the
+/// stage goes on from its tree-root check, at `build_dir`.
+pub(crate) fn finish_streamed(
+    artifact: &Artifact,
+    streamed: Streamed,
+    build_dir: &Path,
+    hooks: &StageHooks<'_>,
+) -> Result<String, StageError> {
+    let Streamed {
+        mut incoming,
+        root,
+        modes,
+    } = streamed;
+    let dir = std::mem::take(&mut incoming.0);
+    stage_extracted(artifact, build_dir, &dir, root, modes, hooks)
 }
 
 /// Sweep `build_dir`'s stage scratch and make a fresh, private `.incoming` beside it.
@@ -445,8 +544,11 @@ fn finish_stage(
             crate::store::write_sidecar_durably(build_dir, suffix, bytes)
                 .map_err(|e| io_step("record a sidecar beside the build", e))?;
         }
+        // Required: the sidecars reach the media ahead of the marker that vouches for the
+        // build, so a failed flush stops the stage before it (the build reads as not installed).
         if let Some(parent) = build_dir.parent() {
-            crate::store::sync_dir_ordered(parent);
+            crate::store::sync_dir_ordered(parent)
+                .map_err(|e| io_step("order the sidecars ahead of the build's marker", e))?;
         }
     }
 
@@ -457,8 +559,10 @@ fn finish_stage(
     if let Err(e) = crate::store::mark_build_ready(build_dir) {
         return Err(io_step("mark the build complete", e));
     }
+    // Accepted, failed or not: the marker is the stage's last write, and one a power cut
+    // takes back reads as not installed, which the next install stages again.
     if let Some(parent) = build_dir.parent() {
-        crate::store::sync_dir_ordered(parent);
+        let _marked = crate::store::sync_dir_ordered(parent);
     }
     Ok(root)
 }
@@ -719,38 +823,14 @@ pub(crate) fn stage_payload_modes(
     npm_package: Option<NpmPackageHook<'_>>,
 ) -> Result<(String, DeclaredModes), StageError> {
     let cap = size_cap(artifact);
-    let vendor = ExtractOptions {
-        strip_components: artifact.strip_components,
-        symlinks: crate::extract::SymlinkPolicy::InRoot,
-        allow_global_pax: false,
-    };
-    let checksum = if artifact.tree_root.is_empty() {
-        FrameChecksum::Required
-    } else {
-        FrameChecksum::IfPresent
-    };
-    let mut folded: Option<TreeAccumulator> = match artifact.payload.as_str() {
-        "" => Some(
-            extract_tar_zst_tree(
-                archive,
-                dest,
-                cap,
-                MAX_ENTRIES,
-                ExtractOptions::default(),
-                checksum,
-            )
-            .map_err(StageError::Extract)?,
-        ),
-        "tar-zst" => Some(
-            extract_tar_zst_tree(archive, dest, cap, MAX_ENTRIES, vendor, checksum)
-                .map_err(StageError::Extract)?,
-        ),
-        "tar-gz" => Some(
-            extract_tar_gz_tree(archive, dest, cap, MAX_ENTRIES, vendor)
-                .map_err(StageError::Extract)?,
-        ),
+    let folded: Option<TreeAccumulator> = match artifact.payload.as_str() {
+        _ if streams(artifact) => {
+            let file = std::fs::File::open(archive)
+                .map_err(|e| StageError::Extract(ExtractError::from(e)))?;
+            tar_lane(artifact, file, dest).transpose()?
+        }
         "zip" => Some(
-            extract_zip_tree(archive, dest, cap, MAX_ENTRIES, vendor)
+            extract_zip_tree(archive, dest, cap, MAX_ENTRIES, vendor_options(artifact))
                 .map_err(StageError::Extract)?,
         ),
         "raw-binary" | "tar-gz-binary" | crate::vendor::NPM_BROTLI_BINARY => {
@@ -762,6 +842,55 @@ pub(crate) fn stage_payload_modes(
         }
         other => return Err(payload2("unknown payload lane: ", other)),
     };
+    fold_staged(artifact, dest, folded)
+}
+
+/// The extraction options of a vendor archive lane (`tar-zst`, `tar-gz`, `zip`).
+fn vendor_options(artifact: &Artifact) -> ExtractOptions {
+    ExtractOptions {
+        strip_components: artifact.strip_components,
+        symlinks: crate::extract::SymlinkPolicy::InRoot,
+        allow_global_pax: false,
+    }
+}
+
+/// Extract `artifact`'s tar lane ([`streams`]) from `input` into `dest`, folding its tree;
+/// `None` for a payload lane that is not one.
+fn tar_lane(
+    artifact: &Artifact,
+    input: impl Read + Send,
+    dest: &Path,
+) -> Option<Result<TreeAccumulator, StageError>> {
+    let cap = size_cap(artifact);
+    let checksum = if artifact.tree_root.is_empty() {
+        FrameChecksum::Required
+    } else {
+        FrameChecksum::IfPresent
+    };
+    let vendor = vendor_options(artifact);
+    let extracted = match artifact.payload.as_str() {
+        "" => extract_tar_zst_tree_from(
+            input,
+            dest,
+            cap,
+            MAX_ENTRIES,
+            ExtractOptions::default(),
+            checksum,
+        ),
+        "tar-zst" => extract_tar_zst_tree_from(input, dest, cap, MAX_ENTRIES, vendor, checksum),
+        "tar-gz" => extract_tar_gz_tree_from(input, dest, cap, MAX_ENTRIES, vendor),
+        _ => return None,
+    };
+    Some(extracted.map_err(StageError::Extract))
+}
+
+/// The links, spelling check, `tree_root` and declared modes of what [`stage_payload_modes`]
+/// laid at `dest` (`folded` when its lane folded the tree as it wrote it).
+fn fold_staged(
+    artifact: &Artifact,
+    dest: &Path,
+    mut folded: Option<TreeAccumulator>,
+) -> Result<(String, DeclaredModes), StageError> {
     apply_links(dest, &artifact.links, folded.as_mut())?;
     match folded {
         Some(tree) => {
@@ -1420,8 +1549,16 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     }
     let was_complete = crate::store::build_is_complete(build_dir);
     crate::store::clear_build_ready(build_dir)?;
-    if let Some(parent) = build_dir.parent() {
-        crate::store::sync_dir_ordered(parent);
+    // Required: the marker's removal reaches the media ahead of the renames below, or a power
+    // cut can leave the old marker standing over the incoming tree, read as complete however
+    // little of it landed. A failed flush puts the marker back and swaps nothing.
+    if let Some(parent) = build_dir.parent()
+        && let Err(e) = crate::store::sync_dir_ordered(parent)
+    {
+        if was_complete {
+            let _ = crate::store::mark_build_ready(build_dir);
+        }
+        return Err(e);
     }
     // The outgoing tree is behind the build's link when it was laid aside, else at its name;
     // a toolchain comes in aside, in `<build>.noindex` behind a `<build>` link
@@ -1735,6 +1872,38 @@ mod tests {
             !build.parent().unwrap().join("escape").exists(),
             "the slip escaped the stage"
         );
+    }
+
+    /// The ordering hazard of a reinstall: when the flush that orders the old marker's
+    /// removal ahead of the swap fails, nothing is swapped (a power cut could otherwise
+    /// leave the old marker over the incoming tree, read as complete however little of it
+    /// landed): the stage fails, the installed tree stays, its marker is put back, and no
+    /// scratch is left. A folder the volume cannot flush (no ordering to be had) stages.
+    /// With the flush's outcome dropped, as before, the swap went on (the stage answered Ok).
+    #[test]
+    fn a_failed_flush_of_the_markers_removal_swaps_nothing() {
+        use aterm_durable::seam::{EIO, ENOTSUP, FailingDirs};
+        let b = bundle("swap-flush-fails");
+        let (build, witness) = b.installed();
+        {
+            let _eio = FailingDirs::with(EIO);
+            let err = verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE)
+                .expect_err("a swap the marker's removal is not ordered ahead of");
+            assert!(matches!(err, StageError::Io(_)));
+        }
+        assert_eq!(std::fs::read(&witness).unwrap(), b"old", "nothing swapped");
+        assert!(
+            crate::store::build_is_complete(&build),
+            "the installed build's marker is back"
+        );
+        assert!(scratch_beside(&build).is_empty(), "no scratch left");
+        {
+            let _refused = FailingDirs::with(ENOTSUP);
+            verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE)
+                .expect("no ordering is to be had on a volume that refuses it");
+        }
+        assert!(!witness.exists(), "the reinstall swapped in a fresh tree");
+        assert!(crate::store::build_is_complete(&build));
     }
 
     #[test]
@@ -3185,6 +3354,37 @@ image-alias     : /tmp/stage/bar.dmg
         assert_eq!(mode_of(&build), 0o755, "the build it was swapped in as");
     }
 
+    #[test]
+    fn a_failed_sidecar_folder_flush_leaves_the_build_unmarked() {
+        use aterm_durable::seam::{EIO, ENOTSUP, FailingDirs};
+        let b = bundle("sidecar-flush-fails");
+        let build = b.build();
+        let sidecars = |root: &str| Ok(vendor_record(root));
+        let hooks = StageHooks {
+            sidecars: Some(&sidecars),
+            ..StageHooks::NONE
+        };
+        {
+            let _eio = FailingDirs::after(1, EIO);
+            let error = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap_err();
+            assert!(matches!(error, StageError::Io(_)));
+        }
+        assert!(
+            !crate::store::build_is_complete(&build),
+            "no ready marker vouched for the unordered sidecar"
+        );
+        assert!(
+            crate::store::sidecar_path(&build, crate::store::VENDOR_SIDECAR_SUFFIX)
+                .unwrap()
+                .is_file()
+        );
+        {
+            let _refused = FailingDirs::with(ENOTSUP);
+            verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
+        }
+        assert!(crate::store::build_is_complete(&build));
+    }
+
     fn vendor_record(root: &str) -> Vec<(&'static str, Vec<u8>)> {
         let mut body = String::from("tree_root = \"");
         body.push_str(root);
@@ -3218,9 +3418,11 @@ image-alias     : /tmp/stage/bar.dmg
         let recording = aterm_durable::seam::Recording::start();
         let root = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
         let (flushes, what): (&[aterm_durable::Flush], &str) = if cfg!(windows) {
+            use aterm_durable::Flush::{Durable as D, Ordered as O};
             (
-                &[aterm_durable::Flush::Durable; 4],
-                "the tree's file, the declared modes, the sidecar, the marker",
+                &[D, O, D, O, D, D, O],
+                "the tree's file, the swap's unmark, the sidecar, its folder, the declared \
+                 modes, the marker, its folder (a folder's flush is only noted on Windows)",
             )
         } else {
             (

@@ -1,0 +1,14 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "amacs-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "amacs's wire protocol: the `edit` request, its ticket replies, `await edit`, and file URIs. std only, so a client links no editor engine."
+
+[lints]
+workspace = true

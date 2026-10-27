@@ -82,15 +82,45 @@ impl FnItem {
         (named_fn && body_last).then_some(constness)
     }
 
-    /// The item with `probe` as the first statement of its body, after the body's inner attributes.
-    pub(crate) fn with_probe(&self, probe: &TokenStream) -> Option<TokenStream> {
-        if self.fn_with_body()? {
-            return None;
-        }
+    /// The item with `prelude` first in its body, after the body's inner attributes; `None` when
+    /// the item is not a fn with a body. Each anchor attribute left on the item (a `cfg_attr` one
+    /// included) takes the call site's span on its `#`, as the `macro_rules!` attributes'
+    /// transcriber gives it, so an anchor stacked below this one books this one's line in its
+    /// record's `location` under either form. Other attributes keep theirs: clippy reads a doc
+    /// comment whose `#` came from a macro as no doc at all.
+    pub(crate) fn with_prelude(&self, prelude: &TokenStream) -> Option<TokenStream> {
+        self.fn_with_body()?;
         let (last, rest) = self.tokens.split_last()?;
-        let body = prepend(last, probe)?;
-        Some(rest.iter().cloned().chain(std::iter::once(body)).collect())
+        let body = prepend(last, prelude)?;
+        let rest = rest
+            .iter()
+            .enumerate()
+            .map(|(i, token)| match (token, rest.get(i + 1)) {
+                (TokenTree::Punct(hash), Some(TokenTree::Group(attr)))
+                    if hash.as_char() == '#'
+                        && attr.delimiter() == Delimiter::Bracket
+                        && names_an_anchor(&attr.stream()) =>
+                {
+                    let mut hash = hash.clone();
+                    hash.set_span(Span::call_site());
+                    TokenTree::Punct(hash)
+                }
+                _ => token.clone(),
+            });
+        Some(rest.chain(std::iter::once(body)).collect())
     }
+}
+
+/// Whether an attribute's tokens name `refines` or `spec_unmodeled`, at any depth.
+fn names_an_anchor(attr: &TokenStream) -> bool {
+    attr.clone().into_iter().any(|token| match token {
+        TokenTree::Ident(name) => {
+            let name = name.to_string();
+            name == "refines" || name == "spec_unmodeled"
+        }
+        TokenTree::Group(group) => names_an_anchor(&group.stream()),
+        _ => false,
+    })
 }
 
 fn prepend(body: &TokenTree, probe: &TokenStream) -> Option<TokenTree> {

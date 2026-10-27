@@ -145,37 +145,36 @@ pub fn will_firings(recs: &[Rec]) -> BTreeSet<u64> {
     fired
 }
 
-/// Whether the record right after offset `seq` is `group`'s commit covering it.
+/// The records between the delivery at offset `seq` and `group`'s commit covering it,
+/// both left out: what else the broker wrote while that commit was owed (the bus
+/// mirror's `ev` rows, say).
 /// # Errors
-/// What sits at `seq + 1` instead.
-pub fn next_is_its_commit(recs: &[Rec], group: &str, seq: u64) -> Result<(), String> {
-    let next = recs.iter().find(|r| r.seq == seq + 1);
-    match next {
-        Some(r)
-            if r.commit
-                .as_ref()
-                .is_some_and(|(g, u)| g == group && *u >= seq) =>
-        {
-            Ok(())
-        }
-        Some(r) => Err(format!(
-            "offset {} after the delivery at {seq} is `{}` (commit {:?}), not {group}'s commit \
-             covering {seq}",
-            r.seq, r.subject, r.commit
-        )),
-        None => Err(format!("no record follows the delivery at {seq}")),
-    }
+/// No commit of `group` covers `seq`.
+pub fn before_its_commit<'a>(
+    recs: &'a [Rec],
+    group: &str,
+    seq: u64,
+) -> Result<Vec<&'a Rec>, String> {
+    let commit = covering_commit(recs, group, seq, seq)
+        .ok_or_else(|| format!("no commit of {group} covers offset {seq}"))?;
+    Ok(window(recs, seq + 1, commit.seq)
+        .filter(|r| r.seq < commit.seq)
+        .collect())
 }
 
-/// Whether `group`'s commit covering offset `upto` lands BEFORE the record at `fence`.
+/// Whether `group`'s commit covering offset `upto` sits BELOW offset `fence`. The bench's
+/// fence is the visible head it read before its next post went out: a commit below it was
+/// visible then, and one at it or past it was not, the commit that post carried among them
+/// (the bridge writes a held commit just ahead of the post it rides, so the post's own
+/// offset is no fence).
 /// # Errors
-/// No commit covers `upto`, or the one that does lands after `fence`.
+/// No commit covers `upto`, or the one that does sits at `fence` or past it.
 pub fn lands_before(recs: &[Rec], group: &str, upto: u64, fence: u64) -> Result<(), String> {
     match covering_commit(recs, group, upto, upto) {
         Some(r) if r.seq < fence => Ok(()),
         Some(r) => Err(format!(
-            "{group}'s commit covering {upto} is at offset {} (through {:?}), after the fence's \
-             record at {fence}",
+            "{group}'s commit covering {upto} is at offset {} (through {:?}), not below the fence \
+             at {fence}",
             r.seq,
             r.commit.as_ref().map(|(_, u)| *u)
         )),

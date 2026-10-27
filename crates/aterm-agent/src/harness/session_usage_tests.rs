@@ -1466,11 +1466,30 @@ fn the_segment_says_runtime_and_tokens_at_each_grain() {
         usage_text_at(&several, UsageGrain::Runtime).as_deref(),
         Some("18h46m")
     );
+    assert_eq!(
+        usage_text_at(&several, UsageGrain::Rule).as_deref(),
+        Some("18h46m"),
+        "the rule's: the runtime, the tokens the hover's"
+    );
+    let unread = UsageFacts {
+        unread: 3,
+        ..several.clone()
+    };
+    assert_eq!(
+        usage_text_at(&unread, UsageGrain::Rule).as_deref(),
+        Some("18h46m +3 unread"),
+        "an unread count stays"
+    );
     let unrun = UsageFacts {
         runtime: None,
         ..several
     };
     assert_eq!(usage_text_at(&unrun, UsageGrain::Runtime), None);
+    assert_eq!(
+        usage_text_at(&unrun, UsageGrain::Rule).as_deref(),
+        Some("\u{2191}408M \u{2193}2.1M"),
+        "CONTROL: no runtime, the rule's `Σ` keeps the pair"
+    );
     let walled = UsageFacts::of((Vec::new(), More::default()), Some(wall()), None)
         .expect("the wall alone")
         .with_runtime(999);

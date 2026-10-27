@@ -6,8 +6,13 @@
 //! aterm-gui-fabric's `cmd_deliver`, which takes one row per offset on the log it was
 //! told, and `cmd_link_log`, which forgets the offsets a move took): one OFFSET of
 //! this node's inbox lane, `O`, followed through every record that sits there, every
-//! delivery, commit, kill and relaunch of the bridge, and every move of the log's
-//! generation.
+//! delivery, commit, kill and relaunch of the bridge, every move of the log's
+//! generation, and the broker's retention giving the record up (`GivenUp`: past its age
+//! or its class's bytes unread, or read and gone with a cut). A record given up is on
+//! stable media (a cut leaves the whole log flushed), so no move takes it after; the group
+//! may then commit past it for a later record without its being a row (`OwePast`):
+//! NoSkip holds modulo what retention gave up, as astream's exactly-once holds only
+//! within its window.
 
 use aterm_spec::derive::Model;
 
@@ -32,6 +37,7 @@ pub fn fabric_exactly_once_model() -> Model {
             var nr2 = 0;
             var told = 1;
             var mv = 0;
+            var gone = 0;
 
             action Publish when (occ == 0 && lost == 0 && nr == 0) {
                 occ = 1;
@@ -69,7 +75,7 @@ pub fn fabric_exactly_once_model() -> Model {
             action Relaunch when (alive == 0) {
                 alive = 1;
             }
-            action MoveTakes when (occ == 1 && MaxG > g) {
+            action MoveTakes when (occ == 1 && gone == 0 && MaxG > g) {
                 occ = 0;
                 lost = 1;
                 g = g + 1;
@@ -88,6 +94,12 @@ pub fn fabric_exactly_once_model() -> Model {
                 told = 0;
                 mv = if mv == 1 { 1 } else { 2 };
             }
+            action GivenUp when (occ > 0 && gone == 0) {
+                gone = 1;
+            }
+            action OwePast when ((gone == 1 || Buggy == 6) && occ > 0 && alive == 1 && told == 1 && O + 1 > c && pend == 0) {
+                pend = 1;
+            }
             action Tell when (alive == 1 && told == 0) {
                 dd = if mv == 1 {
                     if Buggy == 3 { dd } else { 0 }
@@ -104,7 +116,7 @@ pub fn fabric_exactly_once_model() -> Model {
             }
 
             invariant NoDuplicate: nr <= 1 && nr2 <= 1;
-            invariant NoSkip: O + 1 > c || occ == 0 || (occ == 1 && nr > 0) || (occ == 2 && nr2 > 0);
+            invariant NoSkip: O + 1 > c || occ == 0 || gone == 1 || (occ == 1 && nr > 0) || (occ == 2 && nr2 > 0);
             bound MovesBounded: g <= MaxG;
             bound CursorBounded: c <= O + 1;
             bound RowsBounded: nr <= MaxRows;

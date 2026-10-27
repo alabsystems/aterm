@@ -200,7 +200,10 @@ fn a_local_off_lifts_a_nodes_hold_once_that_node_may_drive_this_mac_no_more() {
                 "`aterm ctl --host <this session's Mac> hold {sid} off` run on mac-03 (node \
                  03030303), or the person at this session's Mac"
             ))
-            && refused.contains("`aterm fleet peers rm 03030303` there once that node left")
+            && refused.contains(&format!(
+                "`aterm fleet peers rm {}` there once that node left",
+                m03.node
+            ))
             && refused.contains(&format!("`aterm ctl hold {sid} off` on this session's Mac")),
         "the refusal names who holds it and what lifts it: {refused}"
     );

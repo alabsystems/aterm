@@ -72,8 +72,6 @@ pub struct ProofArgs {
     pub edges_only: bool,
     /// `edges --edge E`: the edge rows to run; every one when empty.
     pub edges: Vec<crate::linux_edges::Edge>,
-    /// `gone --wgpu-oracle`.
-    pub wgpu_oracle: bool,
     /// `--weston-renderer pixman`: every weston the run starts draws with its pixman renderer (the VM and kiosk case) instead of GL.
     pub weston_renderer: &'static str,
 }
@@ -90,7 +88,7 @@ pub fn parse_proof(args: &[String]) -> Result<ProofArgs, Fail> {
     Ok(p)
 }
 
-/// `gone [--arch A]... [--display D]... [--wgpu-oracle] [--keep-build] [--keep-up]`.
+/// `gone [--arch A]... [--display D]... [--keep-build] [--keep-up]`.
 ///
 /// # Errors
 /// A usage error.
@@ -161,7 +159,6 @@ fn parse_args(args: &[String], verb: &str) -> Result<ProofArgs, Fail> {
         deck_only: false,
         edges_only: false,
         edges: Vec::new(),
-        wgpu_oracle: false,
         weston_renderer: "gl",
     };
     let mut it = args.iter();
@@ -207,7 +204,6 @@ fn parse_args(args: &[String], verb: &str) -> Result<ProofArgs, Fail> {
             }
             "--keep-build" => p.keep_build = true,
             "--keep-up" => p.keep_up = true,
-            "--wgpu-oracle" if verb == "gone" => p.wgpu_oracle = true,
             "--weston-renderer" if verb != "a11y" && verb != "edges" => {
                 p.weston_renderer = match it.next().map(String::as_str) {
                     Some("gl") => "gl",
@@ -769,6 +765,46 @@ pub const BASHRC: &str = "PS1='lane$ '\n";
 
 /// The prompt [`BASHRC`] sets, as a row of `text` shows it (trailing blanks trimmed).
 pub const PROMPT: &str = "lane$";
+
+/// Retain a fresh, decodable frame before its row may pass.
+fn copy_frame(image: &str, to: &Path, copy: impl FnOnce(&str, &Path) -> Out) -> Result<(), String> {
+    let source = image
+        .split_whitespace()
+        .nth(3)
+        .ok_or("image named no frame path")?;
+    match std::fs::symlink_metadata(to) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            return Err(format!(
+                "{} already exists or cannot be checked",
+                to.display()
+            ));
+        }
+    }
+    let copied = copy(source, to);
+    if !copied.ok() {
+        return Err(format!("{source} not copied out: {}", copied.tail(3)));
+    }
+    let metadata = std::fs::symlink_metadata(to)
+        .map_err(|error| format!("{} was not retained: {error}", to.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular frame file", to.display()));
+    }
+    let bytes =
+        std::fs::read(to).map_err(|error| format!("{} cannot be read: {error}", to.display()))?;
+    aterm_png::decode_rgba8(&bytes, 8192)
+        .ok_or_else(|| format!("{}: not a PNG this lab decodes", to.display()))?;
+    Ok(())
+}
+
+/// Allocate one results directory exclusively, keeping it for the report's readers.
+fn fresh_results(parent: &Path, prefix: &str) -> Result<PathBuf, Fail> {
+    aterm_tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(parent)
+        .map(aterm_tempfile::TempDir::keep)
+        .map_err(|error| Fail::die(format!("{}: {error}", parent.display())))
+}
 
 /// One aterm-gui under `display` (or `--headless` with none), driven over its control socket in the guest.
 pub(crate) struct Gui<'a> {
@@ -1607,14 +1643,9 @@ impl Gui<'_> {
         let metrics = self.expect(&["metrics", "percentiles"], &|r| r.starts_with("OK"))?;
         let frame = format!("{}.png", self.name);
         let image = self.expect(&["image", &frame], &|r| r.starts_with("OK "))?;
-        let kept = image
-            .split_whitespace()
-            .nth(3)
-            .map(|guest_path| {
-                let to = results.join(&frame);
-                self.up.guest.copy_out(guest_path, &to).ok()
-            })
-            .unwrap_or(false);
+        copy_frame(&image, &results.join(&frame), |guest_path, to| {
+            self.up.guest.copy_out(guest_path, to)
+        })?;
         let summary = self.expect(&["metrics"], &|r| r.starts_with("OK "))?;
         let size = |r: &str| {
             let w: Vec<&str> = r.split_whitespace().collect();
@@ -1627,11 +1658,7 @@ impl Gui<'_> {
                 field(&status, "resizes").unwrap_or("?"),
                 field(&status, "phase").unwrap_or("?"),
                 present_summary(&metrics),
-                if kept {
-                    frame
-                } else {
-                    format!("{frame} (not copied out)")
-                }
+                frame
             ),
             field(&summary, "backend").map(str::to_string),
         ))
@@ -1945,12 +1972,11 @@ pub fn cmd_a11y(args: &[String]) -> Res {
 fn run(ask: &ProofArgs, kind: &str) -> Res {
     crate::stop::install();
     let _lock = linux::LaneLock::boot()?;
-    let results = linux::state_dir()?.join(format!(
-        "{kind}-{}",
+    let prefix = format!(
+        "{kind}-{}-",
         crate::util::compact_stamp(crate::util::now_secs())
-    ));
-    std::fs::create_dir_all(&results)
-        .map_err(|e| Fail::die(format!("{}: {e}", results.display())))?;
+    );
+    let results = fresh_results(&linux::state_dir()?, &prefix)?;
     let t0 = Instant::now();
     let mut up = match linux::bring_up() {
         Ok(up) => up,
@@ -2172,13 +2198,8 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             stopped = Some(s);
             break 'arches;
         }
-        let oracle = if ask.wgpu_oracle {
-            " (wgpu oracle)"
-        } else {
-            ""
-        };
-        println!("\n=== {tag}: build aterm-gui{oracle}, aterm-ctl ===");
-        let mut build = vec![
+        println!("\n=== {tag}: build aterm-gui, aterm-ctl ===");
+        let build = [
             "-p",
             "aterm-gui",
             "--bin",
@@ -2192,9 +2213,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             "--bin",
             "lane-bus",
         ];
-        if ask.wgpu_oracle {
-            build.extend(["--features", "aterm-gpu/wgpu-oracle"]);
-        }
         let out = up.guest.shell_streamed(
             &up.home,
             &cargo(&env, &format!("{repo}/Cargo.toml"), "build", &build),
@@ -2209,7 +2227,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             Ok(None)
         };
         rows.push(Row {
-            name: format!("{tag} build aterm-gui{oracle}"),
+            name: format!("{tag} build aterm-gui"),
             verdict: if built { Verdict::Pass } else { Verdict::Fail },
             secs: out.secs,
             detail: if built {
@@ -2389,7 +2407,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
         });
         for (display, end) in gone {
             let name = format!(
-                "{tag} {} under aterm-gui{oracle}: {} ({})",
+                "{tag} {} under aterm-gui: {} ({})",
                 end.name(),
                 display.name(),
                 display.protocol()
@@ -2428,8 +2446,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 cpu: false,
                 deck: false,
             };
-            let (verdict, detail) =
-                crate::linux_gone::drive(&gui, display, end, ask.wgpu_oracle, &results);
+            let (verdict, detail) = crate::linux_gone::drive(&gui, display, end, &results);
             up.stop_units();
             println!("  {} {detail}", verdict.label());
             rows.push(Row {
@@ -2615,6 +2632,103 @@ pub fn render_as(title: &str, rows: &[Row], disk: &[String], total_secs: f64) ->
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_frame_requires_a_fresh_successful_copy_of_a_decodable_png() {
+        let top = aterm_tempfile::tempdir().unwrap();
+        let image = "OK 1 1 /private/guest/frame.png";
+        let mut png = Vec::new();
+        {
+            let mut encoder = aterm_png::Encoder::new(&mut png, 1, 1);
+            encoder.set_color(aterm_png::ColorType::Rgb);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[1, 2, 3]).unwrap();
+            writer.finish().unwrap();
+        }
+        let outcome = |code| Out {
+            code: Some(code),
+            text: "copy outcome".into(),
+            secs: 0.0,
+            signal: None,
+            not_started: None,
+            lost: None,
+        };
+        let good = top.path().join("good.png");
+        copy_frame(image, &good, |source, to| {
+            assert_eq!(source, "/private/guest/frame.png");
+            std::fs::write(to, &png).unwrap();
+            outcome(0)
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&good).unwrap(), png);
+        assert!(
+            copy_frame(image, &good, |_, _| panic!(
+                "a stale destination was reused"
+            ))
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&good).unwrap(), png);
+        assert!(
+            copy_frame("OK 1 1", &top.path().join("missing-path.png"), |_, _| {
+                panic!("an image reply without a path reached the copier")
+            })
+            .is_err()
+        );
+        for (name, bytes, code) in [
+            ("failed.png", Some(png.as_slice()), 1),
+            ("absent.png", None, 0),
+            ("invalid.png", Some(b"not a PNG".as_slice()), 0),
+            ("truncated.png", Some(b"\x89PNG\r\n\x1a\n".as_slice()), 0),
+        ] {
+            let to = top.path().join(name);
+            let result = copy_frame(image, &to, |_, to| {
+                if let Some(bytes) = bytes {
+                    std::fs::write(to, bytes).unwrap();
+                }
+                outcome(code)
+            });
+            assert!(result.is_err(), "{name}: {result:?}");
+        }
+        assert!(
+            copy_frame(image, &top.path().join("directory.png"), |_, to| {
+                std::fs::create_dir(to).unwrap();
+                outcome(0)
+            })
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            let link = top.path().join("linked.png");
+            assert!(
+                copy_frame(image, &link, |_, to| {
+                    std::os::unix::fs::symlink(&good, to).unwrap();
+                    outcome(0)
+                })
+                .is_err(),
+                "a copied symlink does not establish a retained frame"
+            );
+            assert!(copy_frame(image, &link, |_, _| panic!("followed an existing link")).is_err());
+            assert_eq!(std::fs::read(&good).unwrap(), png);
+        }
+    }
+
+    #[test]
+    fn proof_results_are_exclusive_and_leave_previous_artifacts_intact() {
+        let top = aterm_tempfile::tempdir().unwrap();
+        let first = fresh_results(top.path(), "proof-fixed-stamp-").unwrap();
+        std::fs::write(first.join("frame.png"), b"previous evidence").unwrap();
+        let second = fresh_results(top.path(), "proof-fixed-stamp-").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            std::fs::read(first.join("frame.png")).unwrap(),
+            b"previous evidence"
+        );
+        assert_eq!(std::fs::read_dir(&second).unwrap().count(), 0);
+        let not_directory = top.path().join("not-a-directory");
+        std::fs::write(&not_directory, b"keep").unwrap();
+        assert!(fresh_results(&not_directory, "proof-fixed-stamp-").is_err());
+        assert_eq!(std::fs::read(&not_directory).unwrap(), b"keep");
+    }
+
     fn row(v: Verdict) -> Row {
         Row {
             name: "r".into(),
@@ -2773,23 +2887,15 @@ mod tests {
     }
 
     #[test]
-    fn gone_runs_its_displays_and_alone_takes_the_oracle() {
+    fn gone_runs_its_displays_alone() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
         let gone = parse_gone(&[]).expect("parses");
-        assert!(gone.gone_only && !gone.wgpu_oracle);
+        assert!(gone.gone_only);
         assert_eq!(gone.arches, Arch::ALL);
         assert_eq!(gone.displays, crate::linux_gone::GONE);
-        let oracle = parse_gone(&s(&["--wgpu-oracle", "--display", "mutter"])).expect("parses");
-        assert!(oracle.wgpu_oracle);
-        assert_eq!(oracle.displays, [Display::Mutter]);
-        let proof = parse_proof(&[]).expect("parses");
-        assert!(!proof.gone_only && !proof.wgpu_oracle);
-        assert_eq!(
-            parse_proof(&s(&["--wgpu-oracle"]))
-                .map_err(|f| f.code)
-                .err(),
-            Some(2)
-        );
+        let one = parse_gone(&s(&["--display", "mutter"])).expect("parses");
+        assert_eq!(one.displays, [Display::Mutter]);
+        assert!(!parse_proof(&[]).expect("parses").gone_only);
     }
 
     #[test]
@@ -2803,7 +2909,6 @@ mod tests {
         assert!(one.keep_build);
         for refused in [
             &["--display", "xvfb"][..],
-            &["--wgpu-oracle"][..],
             &["--weston-renderer", "pixman"][..],
         ] {
             assert_eq!(

@@ -2019,13 +2019,20 @@ mod tests {
         );
         assert!(!snapshot.text.contains("bidi"), "{:?}", snapshot.text);
 
+        // 16 px: no platform's automatic size (12 on macOS, 15 on Linux, 17 on Windows), which a
+        // write removes instead (`the_automatic_font_size_is_written_as_a_removal`).
+        assert_ne!(
+            crate::FONT_PX,
+            16.0,
+            "premise: 16 px is written, not removed"
+        );
         let base = service.snapshot().revision;
-        let result = service.patch(edit(base, "font_px", ExpectedValue::Any, Some("15")));
+        let result = service.patch(edit(base, "font_px", ExpectedValue::Any, Some("16")));
         assert!(
             matches!(result, ConfigPatchResult::Applied { .. }),
             "{result:?}"
         );
-        assert_eq!(service.value("font_px").unwrap().as_deref(), Some("15"));
+        assert_eq!(service.value("font_px").unwrap().as_deref(), Some("16"));
     }
 
     const AUTHORED: &str = "\

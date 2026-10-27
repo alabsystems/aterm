@@ -2,6 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! Conformance tap projecting the simulated link world onto `FabricExactlyOnce`.
+//!
+//! A slot's record retention gave up (below the broker's base and not held: the world's
+//! [`View::gone`]) projects as `gone`, the model's `GivenUp`: the group may then commit past
+//! it with no row (`OwePast`), and NoSkip holds modulo the give-up. A cut never reads as a
+//! loss: the slot's record stays in the log the tap reads, only a power loss takes it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,6 +30,9 @@ pub(crate) struct SessionView {
 pub(crate) struct View {
     /// Every record of the log, by offset.
     pub(crate) records: Vec<Option<(String, String)>>,
+    /// The offsets of the records retention gave up (sim item B05): below the base and not
+    /// held, so no reader is handed them again.
+    pub(crate) gone: BTreeSet<u64>,
     /// The log's identity, as `link log` names it.
     pub(crate) log: String,
     pub(crate) generation: u64,
@@ -53,7 +61,7 @@ struct Slot {
     done: bool,
 }
 
-type Key = [i64; 10];
+type Key = [i64; 11];
 
 fn key_of(s: &State, offset: i64) -> Key {
     [
@@ -67,6 +75,7 @@ fn key_of(s: &State, offset: i64) -> Key {
         s["dd"],
         s["nr"],
         s["nr2"],
+        s["gone"],
     ]
 }
 
@@ -174,6 +183,7 @@ impl Tap {
             i64::from(session.dedup.contains(&slot.off)),
             rows(Some(&slot.first)),
             rows(slot.later.as_ref()),
+            i64::from(view.gone.contains(&slot.off)),
         ])
     }
 
@@ -261,7 +271,7 @@ impl Tap {
                             None => {
                                 self.violations.push(format!(
                                     "model: the round at @{} ({} {}) is not FabricExactlyOnce's: \
-                                     {:?} -> {want:?} (occ lost g past pend alive told dd nr nr2)",
+                                     {:?} -> {want:?} (occ lost g past pend alive told dd nr nr2 gone)",
                                     slot.off, slot.sid, slot.first, slot.last
                                 ));
                                 slot.done = true;

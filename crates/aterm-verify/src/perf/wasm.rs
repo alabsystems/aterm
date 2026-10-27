@@ -66,21 +66,23 @@ fn answers(program: &Path, args: &[&str]) -> bool {
 
 /// Resolves rustup and optional `wasm-opt` for building the WebAssembly modules.
 pub(crate) fn build_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
-    build_tools_with(crate::rustup::find_rustup(), wasm_opt)
+    build_tools_with(aterm_uds::host::tool("rustup").locate(), wasm_opt)
 }
 
-/// [`build_tools`] with rustup's finder's answer `found` (PATH, `$CARGO_HOME/bin`,
-/// `~/.cargo/bin`, then Homebrew's keg as a fallback): with none, COULD NOT RUN naming the
-/// `rustup` row's provider, `verify provision`.
-fn build_tools_with(found: Option<PathBuf>, wasm_opt: bool) -> Result<PathBuf, LaneRun> {
-    let Some(rustup) = found else {
-        return Err(LaneRun::could_not_run(
-            format!("no rustup ({})", crate::rustup::RUSTUP_LOOKED),
-            format!(
-                "{}, with stable's wasm32 std",
-                aterm_uds::host::tool("rustup").remedy()
-            ),
-        ));
+/// [`build_tools`] with the `rustup` row's answer `found`: where it found none, COULD NOT
+/// RUN saying where the row looked and naming its provider, `verify provision`, once.
+fn build_tools_with(
+    found: Result<PathBuf, aterm_uds::host::Absent>,
+    wasm_opt: bool,
+) -> Result<PathBuf, LaneRun> {
+    let rustup = match found {
+        Ok(rustup) => rustup,
+        Err(absent) => {
+            return Err(LaneRun::could_not_run(
+                absent.why,
+                format!("{}, with stable's wasm32 std", absent.fix),
+            ));
+        }
     };
     let has_target = command(&rustup)
         .args(["target", "list", "--installed", "--toolchain", "stable"])
@@ -472,52 +474,42 @@ mod tests {
         ))
     }
 
-    /// WITHOUT A RUSTUP THE WASM BUILDS END COULD NOT RUN NAMING THE WORKSPACE PROVIDER: on a
-    /// Mac whose only rustup was Homebrew's keg, removing it leaves the finder nothing, and the
-    /// lanes that build the web modules (wasm-smoke among them) refuse the machine, naming
-    /// `verify provision` (the `rustup` row's provider), never Homebrew. Negative control: the
-    /// keg itself is found as the fallback after the account's own places, and a rustup that is
-    /// found gets past this refusal to the next question (here, a stand-in with no wasm32 std).
+    /// WITHOUT A RUSTUP THE WASM BUILDS END COULD NOT RUN NAMING THE WORKSPACE PROVIDER: where
+    /// the `rustup` row finds none (no stamped copy, nothing on PATH), the lanes that build
+    /// the web modules (wasm-smoke among them) refuse the machine, saying where the row looked
+    /// and naming `verify provision` (its provider) once, never Homebrew, even with a keg on
+    /// disk. Negative control: a rustup that is found gets past this refusal to the next
+    /// question (here, a stand-in with no wasm32 std).
     #[test]
     #[cfg(unix)]
     fn with_no_rustup_the_wasm_builds_could_not_run_naming_verify_provision() {
         use crate::perf::Status;
-        let Err(refused) = build_tools_with(None, false) else {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let keg = tmp.path().join("opt/homebrew/opt/rustup/bin/rustup");
+        std::fs::create_dir_all(keg.parent().unwrap()).unwrap();
+        std::fs::write(&keg, "#!/bin/false\n").unwrap();
+        let row = aterm_uds::host::tool("rustup");
+        let lookup = aterm_uds::host::Lookup {
+            named: None,
+            tooling: Some(tmp.path().join("tooling.noindex")),
+            path: Some(tmp.path().join("empty").into_os_string()),
+        };
+        let Err(refused) = build_tools_with(row.locate_in(&lookup), false) else {
             panic!("no rustup built the modules");
         };
         let Status::CouldNotRun { why, fix } = refused.status else {
             panic!("{:?}", refused.status);
         };
-        assert!(why.starts_with("no rustup ("), "{why}");
-        assert_eq!(
-            fix,
-            format!(
-                "{}, with stable's wasm32 std",
-                aterm_uds::host::tool("rustup").remedy()
-            )
+        assert!(
+            why.starts_with("no rustup (looked in $ATERM_TEST_RUSTUP"),
+            "{why}"
         );
-        assert!(fix.contains("targo --unverified verify provision"), "{fix}");
-        assert!(!fix.contains("brew"), "{fix}");
+        assert_eq!(fix, format!("{}, with stable's wasm32 std", row.remedy()));
+        let said = format!("{why} {fix}");
+        assert_eq!(said.matches("verify provision").count(), 1, "{said}");
+        assert!(!said.contains("brew"), "{said}");
 
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let keg = tmp.path().join("keg/bin/rustup");
-        std::fs::create_dir_all(keg.parent().unwrap()).unwrap();
-        std::fs::write(&keg, "#!/bin/false\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&keg, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let bare = tmp.path().join("home");
-        assert_eq!(
-            aterm_toolchain::rustup::find_rustup_among(
-                None,
-                None,
-                Some(bare.as_os_str()),
-                Some(&keg)
-            ),
-            Some(keg)
-        );
-        let Err(next) = build_tools_with(Some(PathBuf::from("/usr/bin/false")), false) else {
+        let Err(next) = build_tools_with(Ok(PathBuf::from("/usr/bin/false")), false) else {
             panic!("a rustup with no wasm32 std built the modules");
         };
         assert!(

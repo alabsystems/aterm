@@ -250,10 +250,12 @@ fn an_edit_whose_directory_flush_fails_is_reported_as_in_effect() {
         io::Error::from_raw_os_error(libc::EIO).kind(),
         "the flush's kind is kept"
     );
-    let landed = landed
-        .get_ref()
-        .and_then(|e| e.downcast_ref::<EditLanded>())
+    let landed = EditLanded::of(&landed)
         .unwrap_or_else(|| panic!("the error says the edit is in effect: {landed:?}"));
+    assert!(
+        EditLanded::of(&io::Error::from_raw_os_error(libc::EIO)).is_none(),
+        "a bare error says nothing landed"
+    );
     assert_eq!(landed.target, config);
     assert_eq!(landed.bak.as_deref(), Some(bak_path.as_path()));
     assert_eq!(landed.flush.raw_os_error(), Some(libc::EIO));

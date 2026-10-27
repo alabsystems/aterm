@@ -257,6 +257,7 @@ impl Terminal {
         self.parked_text_selection.clear();
         let oldest = self.main_grid().oldest_absolute_row();
         super::handler::forget_erased_history(oldest, &mut self.shell, &mut self.marks_state);
+        self.host_journal.push(super::HostOp::ClearScrollback);
     }
 
     /// Scrolls the viewport by `delta` lines and records the scroll custody transition.

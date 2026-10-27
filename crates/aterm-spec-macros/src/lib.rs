@@ -13,43 +13,18 @@ use proc_macro::{Ident, Literal, Span, TokenStream, TokenTree};
 
 use crate::item::FnItem;
 
-/// The name the anchor's const and `rust_method` take from: the item's `fn` ident, or
-/// `anon` when the item is not a plain fn (defensive; all current usages are methods).
-fn item_fn_ident(item: &FnItem) -> Ident {
-    item.ident()
-        .unwrap_or_else(|| Ident::new("anon", Span::call_site()))
-}
-
-/// Map an arbitrary spec name (action/id) to a legal Rust identifier fragment for
-/// use in a unique const name: non-alphanumeric chars become `_`.
-fn sanitize_ident(s: &str) -> String {
-    if s.is_empty() {
-        return "none".to_string();
-    }
-    s.chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect()
-}
-
-/// The anchor's const, `__aterm_spec_<kind>_<fn>[_<suffix>]`, at the fn ident's span.
-fn anchor_const(kind: &str, suffix: Option<&str>, fn_ident: &Ident) -> Result<Ident, Error> {
-    let fn_name = fn_ident.to_string();
-    let fn_name = fn_name.strip_prefix("r#").unwrap_or(&fn_name);
-    let name = match suffix {
-        Some(suffix) => format!("__aterm_spec_{kind}_{fn_name}_{suffix}"),
-        None => format!("__aterm_spec_{kind}_{fn_name}"),
-    };
-    let lexed: Vec<TokenTree> = name
-        .parse::<TokenStream>()
-        .map(|s| s.into_iter().collect())
-        .unwrap_or_default();
-    match lexed.as_slice() {
-        [TokenTree::Ident(i)] if i.to_string() == name => Ok(Ident::new(&name, fn_ident.span())),
-        _ => Err(Error::new(
-            fn_ident.span(),
-            format!("`{name}` is not an identifier: name the action with letters, digits and `_`"),
-        )),
-    }
+/// What an anchor on anything but a fn with a body expands to: a compile error, then the item
+/// as written (so nothing else fails for its loss). The record is an item inside the body; beside
+/// a trait's method declaration it would make the trait not dyn-compatible, and the
+/// `macro_rules!` attributes on the Trust compiler refuse the item in these words.
+fn refusal(item: &FnItem) -> TokenStream {
+    let mut out = Error::new(
+        Span::call_site(),
+        "an anchor goes on a fn with a body: the record is an item inside it",
+    )
+    .to_compile_error();
+    out.extend(item.stream());
+    out
 }
 
 /// The execution-evidence key for one anchor: `"<machine>::<action> @ <rust_method>"`.
@@ -57,13 +32,22 @@ fn entry_id_for(machine: &str, action: &str, rust_method: &str) -> String {
     format!("{machine}::{action} @ {rust_method}")
 }
 
-/// The annotated fn with the entry probe as the first statement of its body.
-fn inject_entry_probe(item: &FnItem, entry_id: &str) -> Option<TokenStream> {
-    let probe = q!(
+/// The entry probe, a fn body's first statement once the record is in place.
+fn entry_probe(entry_id: &str) -> TokenStream {
+    q!(
         "::aterm_spec_anchor::xref::note_entered(#id);",
         id = Literal::string(entry_id)
-    );
-    item.with_probe(&probe)
+    )
+}
+
+/// The annotated fn with its anchor `record` (a registry submit, an anonymous const item) and
+/// `probe` first in its body, where a method of a trait impl can hold them (the impl takes no
+/// item the trait does not declare); the refusal for anything else. A clippy lint that judges a
+/// body's shape (`manual_async_fn`, say) can miss an anchored fn: it reads the body with them.
+fn anchored(item: &FnItem, record: TokenStream, probe: TokenStream) -> TokenStream {
+    let mut prelude = record;
+    prelude.extend(probe);
+    item.with_prelude(&prelude).unwrap_or_else(|| refusal(item))
 }
 
 /// The `key = "value"` list an anchor attribute takes, each key one of `keys`. A key
@@ -147,49 +131,64 @@ fn expand_refines(attr: TokenStream, item: TokenStream) -> Result<TokenStream, E
             )
         })?;
     let item = FnItem::new(item);
-    let fn_ident = item_fn_ident(&item);
-    // Exact machine/action bytes keep stacked anchors distinct, including names
-    // that would collide after punctuation is replaced by underscores.
-    let encoded = |value: &str| {
-        value
-            .bytes()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
+    let Some(fn_ident) = item.fn_with_body().and(item.ident()) else {
+        return Ok(refusal(&item));
     };
-    let suffix = format!("{}_{}", encoded(&machine), encoded(&action));
-    let const_name = anchor_const("refines", Some(&suffix), &fn_ident)?;
     let rust_method = fn_ident.to_string();
-    let candidate_id = entry_id_for(&machine, &action, &rust_method);
-    let (item_out, entry_id) = match inject_entry_probe(&item, &candidate_id) {
-        Some(probed) => (probed, candidate_id),
-        None => (item.stream(), String::new()),
+    // A const fn's body may not call the probe: its record says so with an empty id.
+    let (entry_id, probe) = if item.fn_with_body() == Some(false) {
+        let id = entry_id_for(&machine, &action, &rust_method);
+        let probe = entry_probe(&id);
+        (id, probe)
+    } else {
+        (String::new(), TokenStream::new())
     };
-    Ok(q!(
-        "#item_out
-        #[cfg(any(target_vendor = \"apple\", target_os = \"linux\", target_os = \"android\", windows))]
-        #[allow(non_upper_case_globals)]
-        const #const_name: () = {
-            ::aterm_spec_anchor::registry::submit! {
-                ::aterm_spec_anchor::xref::RefinementAnchor => ::aterm_spec_anchor::xref::RefinementAnchor {
-                    machine: #machine,
-                    action: #action,
-                    rust_method: #rust_method,
-                    location: concat!(file!(), \":\", line!()),
-                    project: #project,
-                    entry_id: #entry_id,
-                }
+    // Each submit is its own anonymous const, so stacked anchors never share a name.
+    let record = q!(
+        "#[cfg(any(target_vendor = \"apple\", target_os = \"linux\", target_os = \"android\", windows))]
+        ::aterm_spec_anchor::registry::submit! {
+            ::aterm_spec_anchor::xref::RefinementAnchor => ::aterm_spec_anchor::xref::RefinementAnchor {
+                machine: #machine,
+                action: #action,
+                rust_method: #rust_method,
+                location: concat!(file!(), \":\", line!()),
+                project: #project,
+                entry_id: #entry_id,
             }
-        };",
-        item_out,
-        const_name,
+        }",
         machine = Literal::string(&machine),
         action = Literal::string(&action),
         rust_method = Literal::string(&rust_method),
         project = Literal::string(&project),
         entry_id = Literal::string(&entry_id)
-    ))
+    );
+    Ok(anchored(&item, record, probe))
 }
 
+/// Waive a fn the model does not describe (`reason` required, `machine` and `action` optional).
+///
+/// ```
+/// #[aterm_spec_macros::spec_unmodeled(reason = "a platform fast path", machine = "Twin")]
+/// fn fast() -> u32 {
+///     7
+/// }
+/// assert_eq!(fast(), 7);
+/// ```
+///
+/// Like `refines`, it goes on a fn with a body, never on a struct or a trait's method
+/// declaration:
+///
+/// ```compile_fail
+/// #[aterm_spec_macros::spec_unmodeled(reason = "a struct")]
+/// struct S;
+/// ```
+///
+/// ```compile_fail
+/// trait Decl {
+///     #[aterm_spec_macros::spec_unmodeled(reason = "a declaration")]
+///     fn declared(&self) -> u32;
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn spec_unmodeled(attr: TokenStream, item: TokenStream) -> TokenStream {
     emit(expand_spec_unmodeled(attr, item))
@@ -201,31 +200,27 @@ fn expand_spec_unmodeled(attr: TokenStream, item: TokenStream) -> Result<TokenSt
     let machine = keys.get("machine").unwrap_or_default();
     let action = keys.get("action").unwrap_or_default();
     let item = FnItem::new(item);
-    let fn_ident = item_fn_ident(&item);
-    let const_name = anchor_const("unmodeled", Some(&sanitize_ident(&action)), &fn_ident)?;
+    let Some(fn_ident) = item.fn_with_body().and(item.ident()) else {
+        return Ok(refusal(&item));
+    };
     let rust_method = fn_ident.to_string();
-    Ok(q!(
-        "#item
-        #[cfg(any(target_vendor = \"apple\", target_os = \"linux\", target_os = \"android\", windows))]
-        #[allow(non_upper_case_globals)]
-        const #const_name: () = {
-            ::aterm_spec_anchor::registry::submit! {
-                ::aterm_spec_anchor::xref::Waiver => ::aterm_spec_anchor::xref::Waiver {
-                    machine: #machine,
-                    action: #action,
-                    reason: #reason,
-                    rust_method: #rust_method,
-                    location: concat!(file!(), \":\", line!()),
-                }
+    let record = q!(
+        "#[cfg(any(target_vendor = \"apple\", target_os = \"linux\", target_os = \"android\", windows))]
+        ::aterm_spec_anchor::registry::submit! {
+            ::aterm_spec_anchor::xref::Waiver => ::aterm_spec_anchor::xref::Waiver {
+                machine: #machine,
+                action: #action,
+                reason: #reason,
+                rust_method: #rust_method,
+                location: concat!(file!(), \":\", line!()),
             }
-        };",
-        item = item.stream(),
-        const_name,
+        }",
         machine = Literal::string(&machine),
         action = Literal::string(&action),
         reason = Literal::string(&reason),
         rust_method = Literal::string(&rust_method)
-    ))
+    );
+    Ok(anchored(&item, record, TokenStream::new()))
 }
 
 /// Expand a bounded state-machine DSL into an `::aterm_spec::derive::Model`.

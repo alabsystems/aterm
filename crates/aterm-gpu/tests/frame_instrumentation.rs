@@ -30,7 +30,7 @@ fn glow_scene(gpu: &aterm_gpu::GpuRenderer) -> RenderInput {
 }
 
 /// Install a sink so presents open GPU-time frames.
-#[cfg(any(target_os = "macos", wgpu_arm))]
+#[cfg(target_os = "macos")]
 fn timing_on() {
     fn sink(_: aterm_gpu::gpu_time::GpuFrameTime) {}
     let _ = aterm_gpu::gpu_time::install_sink(sink);
@@ -85,55 +85,6 @@ fn a_metal_present_reports_its_gpu_time() {
         await_settled(second),
         aterm_gpu::gpu_time::Settled::Timed(_)
     ));
-}
-
-/// The wgpu arm (the Windows and BSD presents, the oracle here) times a present with per-pass
-/// timestamp queries: the readback waits for the device to run the frame, lands after the
-/// present returns and is harvested by `poll_gpu_time`, reporting one part per render pass the
-/// present ran (the offscreen plan's passes and the blit, with bloom off), so no pass goes
-/// untimed and no healthy present is dropped.
-#[test]
-#[cfg(wgpu_arm)]
-fn a_wgpu_present_reports_its_gpu_time_through_timestamp_queries() {
-    timing_on();
-    let mut gpu = crate::common::wgpu_oracle(18.0, Theme::default());
-    gpu.set_bloom(false);
-    if !gpu.gpu_time_supported() {
-        aterm_spec::host::could_not_run(
-            "this adapter grants no TIMESTAMP_QUERY, so the wgpu arm has no GPU clock",
-        );
-    }
-    for present in 0..20 {
-        let mut win = aterm_gpu::WindowGpu::new();
-        let input = glow_scene(&gpu);
-        assert!(gpu.present_virtual(&mut win, &input, false, None, None));
-        let serial = gpu
-            .last_gpu_time_serial()
-            .expect("a timed wgpu present records its serial");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let outcome = loop {
-            gpu.poll_gpu_time();
-            if let Some(outcome) = aterm_gpu::gpu_time::settled(serial) {
-                break outcome;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the timestamp readback of frame {serial} never mapped"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        };
-        match outcome {
-            aterm_gpu::gpu_time::Settled::Timed(t) => {
-                assert!(t.gpu_ns > 0, "the timed passes ran on the device: {t:?}");
-                assert_eq!(
-                    t.parts,
-                    gpu.frame_shape().passes + 1,
-                    "every offscreen pass and the blit are timed: {t:?}"
-                );
-            }
-            other => panic!("healthy wgpu present {present} must be timed, got {other:?}"),
-        }
-    }
 }
 
 /// The frame shape names what the plan drew: the glow quads land in the `glow_add` stream, the

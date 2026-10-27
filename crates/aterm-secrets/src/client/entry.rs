@@ -243,7 +243,31 @@ pub fn read_verified_entry(
     expected: &Config,
     name: &str,
 ) -> crate::Result<Option<VerifiedEntry>> {
-    if !text::valid_entry_name(name) || crate::commons::reserved_name(name) {
+    read_entry(paths, expected, name, true)
+}
+
+pub(crate) fn read_reserved_entry(
+    paths: &Paths,
+    expected: &Config,
+    name: &str,
+) -> crate::Result<Option<VerifiedEntry>> {
+    read_entry(paths, expected, name, false)
+}
+
+fn read_entry(
+    paths: &Paths,
+    expected: &Config,
+    name: &str,
+    materialized: bool,
+) -> crate::Result<Option<VerifiedEntry>> {
+    let valid = if materialized {
+        text::valid_entry_name(name) && !crate::reserved_name(name)
+    } else {
+        text::valid_entry_name(name)
+            && name.starts_with("aterm-")
+            && (!crate::reserved_name(name) || name == "aterm-fleet-code")
+    };
+    if !valid {
         return Err(Error::new("invalid or reserved secret entry name"));
     }
     if expected.signer.is_none() {
@@ -279,32 +303,42 @@ pub fn read_verified_entry(
     let Some(entry) = entries.into_iter().find(|entry| entry.name == name) else {
         return Ok(None);
     };
-    if state.manifest.files.get(name) != Some(&materialize::digest_hex(entry.value.as_slice())) {
-        return Ok(None);
-    }
-    let path = materialize::target_path(&paths.home, name)?;
-    // Refuse observed parent links too. A concurrent path replacement cannot
-    // substitute returned bytes: the opened file is compared with the signed
-    // plaintext below. This does not claim a path lease against other writers.
-    let mut parent = path.parent();
-    loop {
-        let Some(directory) = parent.filter(|directory| directory.starts_with(&paths.home)) else {
+    let value = if materialized {
+        if state.manifest.files.get(name) != Some(&materialize::digest_hex(entry.value.as_slice()))
+        {
+            return Ok(None);
+        }
+        let path = materialize::target_path(&paths.home, name)?;
+        // Refuse observed parent links too. A concurrent path replacement cannot
+        // substitute returned bytes: the opened file is compared with the signed
+        // plaintext below. This does not claim a path lease against other writers.
+        let mut parent = path.parent();
+        loop {
+            let Some(directory) = parent.filter(|directory| directory.starts_with(&paths.home))
+            else {
+                return Ok(None);
+            };
+            if fsx::kind(directory)? != fsx::Kind::Dir {
+                return Ok(None);
+            }
+            if directory == paths.home {
+                break;
+            }
+            parent = directory.parent();
+        }
+        let Some(value) = fsx::read_private(&path, text::MAX_VALUE)? else {
             return Ok(None);
         };
-        if fsx::kind(directory)? != fsx::Kind::Dir {
+        if !aterm_digest::ct_eq(value.as_slice(), entry.value.as_slice()) {
             return Ok(None);
         }
-        if directory == paths.home {
-            break;
+        value
+    } else {
+        if entry.if_absent || entry.anchor.is_some() {
+            return Ok(None);
         }
-        parent = directory.parent();
-    }
-    let Some(value) = fsx::read_private(&path, text::MAX_VALUE)? else {
-        return Ok(None);
+        entry.value.clone()
     };
-    if !aterm_digest::ct_eq(value.as_slice(), entry.value.as_slice()) {
-        return Ok(None);
-    }
     Ok(Some(VerifiedEntry {
         value,
         snapshot: EntrySnapshot {

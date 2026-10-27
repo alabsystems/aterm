@@ -22,7 +22,8 @@ pub enum Method {
     Password,
     /// An admin explicitly approved this recipient.
     Manual,
-    /// Ordinary open-vault approval; it confers no automatic Commons access.
+    /// Ordinary open-vault approval: the admin chose to let in every machine that
+    /// asks, and that choice admits it to Commons like any other (owner, 2026-10-26).
     Open,
 }
 
@@ -44,10 +45,6 @@ impl Method {
             3 => Ok(Self::Open),
             _ => Err(Error::new("unknown admission method")),
         }
-    }
-
-    const fn qualifies(self) -> bool {
-        !matches!(self, Self::Open)
     }
 }
 
@@ -192,12 +189,8 @@ impl Ledger {
         if self.entries.len() >= LIMIT && !self.entries.contains_key(&key) {
             return Err(Error::new("admission ledger is full"));
         }
-        if evidence.method == Method::Open
-            && self
-                .entries
-                .get(&key)
-                .is_some_and(|old| old.method.qualifies())
-        {
+        // An open approval never replaces the decision a recipient already holds.
+        if evidence.method == Method::Open && self.entries.contains_key(&key) {
             return Ok(());
         }
         self.trust = Some(trust);
@@ -209,11 +202,10 @@ impl Ledger {
         self.entries.get(&recipient.0).copied()
     }
 
+    /// Any recorded decision under this root qualifies, an open one included: the
+    /// vault's admin chose open admission (owner, 2026-10-26: "always approve by default").
     pub(super) fn permits(&self, trust: Trust, recipient: &Recipient) -> bool {
-        self.trust == Some(trust)
-            && self
-                .evidence(recipient)
-                .is_some_and(|e| e.method.qualifies())
+        self.trust == Some(trust) && self.evidence(recipient).is_some()
     }
 }
 

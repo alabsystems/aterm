@@ -227,6 +227,7 @@ pub enum Side {
 }
 
 /// A plan's side: the first byte of its side digest, mod 4. No policy version changes it.
+#[inline]
 #[must_use]
 pub fn side(plan: &SchedulePlan) -> Side {
     match Digest::of(SIDE_DOMAIN, &[&plan.encode()]).0[0] % 4 {
@@ -254,6 +255,7 @@ pub enum SetTag {
 
 impl SetTag {
     /// Its byte in seeds and pool ids.
+    #[inline]
     #[must_use]
     pub const fn tag(self) -> u8 {
         match self {
@@ -266,6 +268,7 @@ impl SetTag {
     }
 
     /// The side its plans must have.
+    #[inline]
     #[must_use]
     pub const fn side(self) -> Side {
         match self {
@@ -277,6 +280,7 @@ impl SetTag {
     }
 
     /// Whether it is a real pair's set, which only the real sets' capability opens.
+    #[inline]
     #[must_use]
     pub const fn real(self) -> bool {
         matches!(self, SetTag::HeldOut | SetTag::Report)
@@ -302,16 +306,19 @@ pub struct PoolId {
 }
 
 impl PoolId {
+    #[inline]
     const fn parts(&self) -> [[u8; 4]; 2] {
         [self.set.index.to_le_bytes(), self.pool.to_le_bytes()]
     }
 }
 
+#[inline]
 const fn first_u64(d: &Digest) -> u64 {
     let b = d.0;
     u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
+#[inline]
 fn keyed(domain: &[u8], pool: &PoolId, plan: &SchedulePlan) -> u64 {
     let [i, p] = pool.parts();
     first_u64(&Digest::of(
@@ -328,6 +335,7 @@ fn keyed(domain: &[u8], pool: &PoolId, plan: &SchedulePlan) -> u64 {
 }
 
 /// `plan`'s class under `m6-w1 v1` ([`W1_RULE`]): 0 for `NextStep` or `Cadence`, else 1.
+#[inline]
 #[must_use]
 pub const fn w1_class(plan: &SchedulePlan) -> u8 {
     match plan.wake() {
@@ -338,6 +346,7 @@ pub const fn w1_class(plan: &SchedulePlan) -> u8 {
 
 /// `plan`'s class under `m6-w2 v1` ([`W2_RULE`]): 0 for `SettleAtStep ∧ NextStep`, else 1 plus
 /// its W1 class.
+#[inline]
 #[must_use]
 pub const fn w2_class(plan: &SchedulePlan) -> u8 {
     match (plan.split(), plan.wake()) {
@@ -347,17 +356,20 @@ pub const fn w2_class(plan: &SchedulePlan) -> u8 {
 }
 
 /// The tie key of `plan` in `pool`, ascending in every ranking.
+#[inline]
 #[must_use]
 pub fn tie_key(pool: &PoolId, plan: &SchedulePlan) -> u64 {
     keyed(TIE_DOMAIN, pool, plan)
 }
 
 /// The control's key of `plan` in `pool`, ascending, before the tie key.
+#[inline]
 #[must_use]
 pub fn control_key(pool: &PoolId, plan: &SchedulePlan) -> u64 {
     keyed(CONTROL_DOMAIN, pool, plan)
 }
 
+#[inline]
 fn named(domain: &[u8]) -> Digest {
     Digest::of(
         domain,
@@ -369,29 +381,35 @@ fn named(domain: &[u8]) -> Digest {
 }
 
 /// The control's id, which is never a version's.
+#[inline]
 #[must_use]
 pub fn control_id() -> Digest {
     named(CONTROL_ID_DOMAIN)
 }
 
 /// The trainer's starting random state.
+#[inline]
 #[must_use]
 pub fn trainer_seed() -> u64 {
     first_u64(&named(TRAINER_DOMAIN))
 }
 
 /// The digest of the frozen all-zero base table.
+#[inline]
 #[must_use]
 pub fn base_digest() -> Digest {
-    let mut e = Enc::new();
+    let mut e = Enc::with_capacity(8 + 4 * FEATURES);
     e.u64(wide(FEATURES));
-    for _ in 0..FEATURES {
+    let mut fi = 0;
+    while fi < FEATURES {
         e.i32(0);
+        fi += 1;
     }
     Digest::of(BASE_DOMAIN, &[&e.finish()])
 }
 
 /// The three distinct active features of `plan`, in `0..FEATURES`.
+#[inline]
 #[must_use]
 pub const fn features(plan: &SchedulePlan) -> [usize; 3] {
     let s = match plan.split() {
@@ -425,6 +443,7 @@ const PERIOD_BUCKETS: u64 = 11;
 const FIRST_PERIOD_BUCKET: u32 = 9;
 
 /// `[lo, hi]` of gap bucket `b` in `1..=20`.
+#[inline]
 const fn gap_bucket(b: u32) -> (u32, u32) {
     let lo = 1 << (b - 1);
     let hi = (1u32 << b) - 1;
@@ -432,6 +451,7 @@ const fn gap_bucket(b: u32) -> (u32, u32) {
 }
 
 /// `[lo, hi]` of period bucket `c` in `9..=19`.
+#[inline]
 const fn period_bucket(c: u32) -> (u32, u32) {
     let lo = 1 << c;
     let hi = (1u32 << (c + 1)) - 1;
@@ -450,10 +470,12 @@ const fn period_bucket(c: u32) -> (u32, u32) {
 }
 
 /// A choice in `0..m`, for `m` in `1..=2^20`; a source's out-of-range answer is taken mod `m`, so no bucket is ever out of range.
+#[inline]
 fn choice(choose: &mut impl FnMut(u64) -> u64, m: u64) -> u32 {
     u32::try_from(choose(m) % m).unwrap_or(0)
 }
 
+#[inline]
 fn within(choose: &mut impl FnMut(u64) -> u64, (lo, hi): (u32, u32)) -> u32 {
     lo + choice(choose, u64::from(hi - lo) + 1)
 }
@@ -461,6 +483,7 @@ fn within(choose: &mut impl FnMut(u64) -> u64, (lo, hi): (u32, u32)) -> u32 {
 /// One draw of `m6-pools v1` from `r`; every draw is in range, and a test checks it.
 /// # Errors
 /// The plan's refusal, were a draw ever out of range.
+#[inline]
 pub fn draw(r: &mut SplitMix) -> Result<SchedulePlan, PlanRefusal> {
     draw_with(&mut |m| r.below(m))
 }
@@ -468,6 +491,7 @@ pub fn draw(r: &mut SplitMix) -> Result<SchedulePlan, PlanRefusal> {
 /// [`draw`] over any choice source: `choose(m)` is a choice in `0..m`, asked in `m6-pools v1`'s order, so the product of the `m` asked is [`one_in`] of the plan drawn.
 /// # Errors
 /// The plan's refusal, were a choice out of range.
+#[inline]
 pub(super) fn draw_with(choose: &mut impl FnMut(u64) -> u64) -> Result<SchedulePlan, PlanRefusal> {
     let split = match choose(SPLITS) {
         0 => Split::Shipped,
@@ -494,6 +518,7 @@ pub(super) fn draw_with(choose: &mut impl FnMut(u64) -> u64) -> Result<ScheduleP
 }
 
 /// `1 / p`, where `p` is the idealised probability that one draw of `m6-pools v1` yields `plan`, each `below(m)` taken as exactly `1 / m` (its modulo bias is under `3e-14` relative).
+#[inline]
 #[must_use]
 pub const fn one_in(plan: &SchedulePlan) -> u64 {
     const fn width((lo, hi): (u32, u32)) -> u64 {
@@ -516,11 +541,13 @@ pub const fn one_in(plan: &SchedulePlan) -> u64 {
 }
 
 /// Whether one draw yields `plan` with probability above `2^-MASS_CAP_LOG2`.
+#[inline]
 #[must_use]
 pub const fn high_mass(plan: &SchedulePlan) -> bool {
     one_in(plan) < 1 << MASS_CAP_LOG2
 }
 
+#[inline]
 const fn split_eq(a: Split, b: Split) -> bool {
     match (a, b) {
         (Split::Shipped, Split::Shipped) => true,
@@ -529,6 +556,7 @@ const fn split_eq(a: Split, b: Split) -> bool {
     }
 }
 
+#[inline]
 const fn wake_eq(a: Wake, b: Wake) -> bool {
     match (a, b) {
         (Wake::NextStep, Wake::NextStep)
@@ -540,6 +568,7 @@ const fn wake_eq(a: Wake, b: Wake) -> bool {
     }
 }
 
+#[inline]
 const fn in_table(plan: &SchedulePlan, table: &[(Split, Wake)]) -> bool {
     let mut i = 0;
     while i < table.len() {
@@ -589,11 +618,13 @@ impl fmt::Display for PoolRefusal {
 impl std::error::Error for PoolRefusal {}
 
 /// The pool's seed, binding the policy's name and version.
+#[inline]
 #[must_use]
 pub fn pool_seed(pool: &PoolId) -> u64 {
     pool_seed_at(RANKER_POLICY_VERSION, pool)
 }
 
+#[inline]
 fn pool_seed_at(version: u32, pool: &PoolId) -> u64 {
     let [i, p] = pool.parts();
     first_u64(&Digest::of(
@@ -611,6 +642,7 @@ fn pool_seed_at(version: u32, pool: &PoolId) -> u64 {
 /// The first [`POOL_PLANS`] distinct plans the pool's draws yield that `accepts` takes, in draw order.
 /// # Errors
 /// [`PoolRefusal::PoolExhausted`] past [`MAX_DRAWS`] draws.
+#[inline]
 pub fn fill(
     pool: &PoolId,
     accepts: impl Fn(&SchedulePlan) -> bool,
@@ -618,6 +650,7 @@ pub fn fill(
     fill_at(RANKER_POLICY_VERSION, pool, accepts)
 }
 
+#[inline]
 fn fill_at(
     version: u32,
     pool: &PoolId,
@@ -625,11 +658,18 @@ fn fill_at(
 ) -> Result<Vec<SchedulePlan>, PoolRefusal> {
     let mut r = SplitMix::new(pool_seed_at(version, pool));
     let mut out: Vec<SchedulePlan> = Vec::with_capacity(POOL_PLANS);
-    for _ in 0..MAX_DRAWS {
-        let plan = draw(&mut r).map_err(|refusal| PoolRefusal::Draw {
-            pool: *pool,
-            refusal,
-        })?;
+    let mut d = 0;
+    while d < MAX_DRAWS {
+        d += 1;
+        let plan = match draw(&mut r) {
+            Ok(plan) => plan,
+            Err(refusal) => {
+                return Err(PoolRefusal::Draw {
+                    pool: *pool,
+                    refusal,
+                });
+            }
+        };
         if accepts(&plan) && !out.contains(&plan) {
             out.push(plan);
             if out.len() == POOL_PLANS {
@@ -641,12 +681,14 @@ fn fill_at(
 }
 
 /// Whether a held-out, report or practice set skips `plan`: a grid plan, a plans-file plan or a high-mass plan.
+#[inline]
 #[must_use]
 pub const fn skipped(plan: &SchedulePlan) -> bool {
     in_table(plan, &GRID_V1) || in_table(plan, &PLANS_FILE_V1) || high_mass(plan)
 }
 
 /// The number of pools in `set`.
+#[inline]
 #[must_use]
 pub const fn pools_in(set: SetId) -> usize {
     match set.tag {
@@ -658,23 +700,31 @@ pub const fn pools_in(set: SetId) -> usize {
 /// Every pool of `set`, in pool order.
 /// # Errors
 /// The first pool that does not fill.
+#[inline]
 pub fn set_pools(set: SetId) -> Result<Vec<Vec<SchedulePlan>>, PoolRefusal> {
     set_pools_at(RANKER_POLICY_VERSION, set)
 }
 
 /// [`set_pools`] with its seeds bound to `version`.
+#[inline]
 pub(super) fn set_pools_at(
     version: u32,
     set: SetId,
 ) -> Result<Vec<Vec<SchedulePlan>>, PoolRefusal> {
-    let pools = |set: SetId, also: &dyn Fn(&SchedulePlan) -> bool| {
+    fn fill_pools_for_set(
+        version: u32,
+        set: SetId,
+        also: impl Fn(&SchedulePlan) -> bool,
+    ) -> Result<Vec<Vec<SchedulePlan>>, PoolRefusal> {
         let count = pools_in(set);
         let mut out = Vec::with_capacity(count);
-        for p in 0..count {
+        let mut p = 0;
+        while p < count {
             let id = PoolId {
                 set,
                 pool: u32::try_from(p).unwrap_or(u32::MAX),
             };
+            p += 1;
             out.push(fill_at(version, &id, |plan| {
                 side(plan) == set.tag.side()
                     && (set.tag == SetTag::Train || !skipped(plan))
@@ -682,67 +732,109 @@ pub(super) fn set_pools_at(
             })?);
         }
         Ok(out)
-    };
+    }
+    #[inline]
+    fn plan_not_in_looks(looks: &[Vec<SchedulePlan>], plan: &SchedulePlan) -> bool {
+        let mut li = 0;
+        while li < looks.len() {
+            let pool = looks[li].as_slice();
+            li += 1;
+            let mut pi = 0;
+            while pi < pool.len() {
+                if split_eq(pool[pi].split(), plan.split()) && wake_eq(pool[pi].wake(), plan.wake())
+                {
+                    return false;
+                }
+                pi += 1;
+            }
+        }
+        true
+    }
     match set.tag {
         SetTag::PracticeReport => {
-            let looks = pools(
+            let looks = fill_pools_for_set(
+                version,
                 SetId {
                     tag: SetTag::PracticeHeldOut,
                     index: set.index,
                 },
-                &|_| true,
+                |_| true,
             )?;
-            pools(set, &|plan| {
-                for pool in &looks {
-                    for p in pool {
-                        if p == plan {
-                            return false;
-                        }
-                    }
-                }
-                true
-            })
+            fill_pools_for_set(version, set, |plan| plan_not_in_looks(&looks, plan))
         }
-        _ => pools(set, &|_| true),
+        _ => fill_pools_for_set(version, set, |_| true),
     }
 }
 
-/// The sets a v1 session can open: the train set, `H_1..H_3`, `E_1..E_3` and the rehearsal's pair.
-#[must_use]
-pub fn sets_v1() -> Vec<SetId> {
-    let mut sets = vec![SetId {
+pub(super) const SETS_V1: [SetId; 9] = [
+    SetId {
         tag: SetTag::Train,
         index: 0,
-    }];
-    for i in 1..=3 {
-        sets.push(SetId {
-            tag: SetTag::HeldOut,
-            index: i,
-        });
-        sets.push(SetId {
-            tag: SetTag::Report,
-            index: i,
-        });
-    }
-    for tag in [SetTag::PracticeHeldOut, SetTag::PracticeReport] {
-        sets.push(SetId { tag, index: 0 });
-    }
-    sets
+    },
+    SetId {
+        tag: SetTag::HeldOut,
+        index: 1,
+    },
+    SetId {
+        tag: SetTag::Report,
+        index: 1,
+    },
+    SetId {
+        tag: SetTag::HeldOut,
+        index: 2,
+    },
+    SetId {
+        tag: SetTag::Report,
+        index: 2,
+    },
+    SetId {
+        tag: SetTag::HeldOut,
+        index: 3,
+    },
+    SetId {
+        tag: SetTag::Report,
+        index: 3,
+    },
+    SetId {
+        tag: SetTag::PracticeHeldOut,
+        index: 0,
+    },
+    SetId {
+        tag: SetTag::PracticeReport,
+        index: 0,
+    },
+];
+
+/// The sets a v1 session can open: the train set, `H_1..H_3`, `E_1..E_3` and the rehearsal's pair.
+#[inline]
+#[must_use]
+pub fn sets_v1() -> Vec<SetId> {
+    SETS_V1.to_vec()
 }
 
 /// The digest of every plan of every pool of [`sets_v1`], in order, which [`M6_SETS_V1_DIGEST`] pins.
 /// # Errors
 /// The first pool that does not fill.
+#[inline]
 pub fn sets_digest() -> Result<Digest, PoolRefusal> {
     let mut e = Enc::new();
-    for set in sets_v1() {
+    let sets = &SETS_V1;
+    let mut si = 0;
+    while si < sets.len() {
+        let set = sets[si];
+        si += 1;
         e.u8(set.tag.tag());
         e.u32(set.index);
         let pools = set_pools(set)?;
         e.u64(wide(pools.len()));
-        for pool in pools {
-            for plan in pool {
-                e.raw(&plan.encode());
+        let mut pi = 0;
+        while pi < pools.len() {
+            let pool = &pools[pi];
+            pi += 1;
+            let mut pli = 0;
+            while pli < pool.len() {
+                e.raw(&pool[pli].encode());
+                pli += 1;
             }
         }
     }
@@ -840,9 +932,13 @@ const fn wide(n: usize) -> u64 {
 }
 
 impl Terms {
+    #[inline]
     fn v1() -> Terms {
         let mut plans_file = Vec::with_capacity(PLANS_FILE_V1.len());
-        for &(split, wake) in &PLANS_FILE_V1 {
+        let mut pi = 0;
+        while pi < PLANS_FILE_V1.len() {
+            let (split, wake) = PLANS_FILE_V1[pi];
+            pi += 1;
             if let Ok(plan) = SchedulePlan::new(split, wake) {
                 plans_file.push(plan);
             }
@@ -909,18 +1005,22 @@ impl Terms {
         }
     }
 
+    #[inline]
     fn descriptor(&self) -> Vec<u8> {
         let mut e = Enc::new();
         e.digest(&self.acceptance);
-        for n in [
+        let counts = [
             self.features,
             self.pool_plans,
             self.judged,
             self.pools,
             self.train_pools,
             self.explore,
-        ] {
-            e.u64(wide(n));
+        ];
+        let mut ci = 0;
+        while ci < counts.len() {
+            e.u64(wide(counts[ci]));
+            ci += 1;
         }
         e.u32(self.epochs);
         e.u8(self.rounds);
@@ -934,21 +1034,29 @@ impl Terms {
         e.raw(&self.report_level.to_le_bytes());
         e.u64(wide(self.look_list_cap));
         e.u64(wide(self.read_list_cap));
-        for n in self.store {
-            e.u64(n);
+        let mut si = 0;
+        while si < self.store.len() {
+            e.u64(self.store[si]);
+            si += 1;
         }
         e.u64(self.deadline_s);
         e.u64(self.footprint);
         e.u64(wide(self.plans_file.len()));
-        for p in &self.plans_file {
-            e.raw(&p.encode());
+        let mut pi = 0;
+        while pi < self.plans_file.len() {
+            e.raw(&self.plans_file[pi].encode());
+            pi += 1;
         }
         e.digest(&self.base);
-        for rule in self.rules {
-            e.str(rule);
+        let mut ri = 0;
+        while ri < self.rules.len() {
+            e.str(self.rules[ri]);
+            ri += 1;
         }
-        for domain in self.domains {
-            e.bytes(domain);
+        let mut di = 0;
+        while di < self.domains.len() {
+            e.bytes(self.domains[di]);
+            di += 1;
         }
         e.finish()
     }
@@ -963,11 +1071,13 @@ pub struct RankerPolicy {
 
 impl RankerPolicy {
     /// The policy v1 from this module's constants, unchecked: a session uses [`Self::pinned`].
+    #[inline]
     #[must_use]
     pub fn v1() -> RankerPolicy {
         Self::of(Terms::v1())
     }
 
+    #[inline]
     fn of(terms: Terms) -> RankerPolicy {
         let id = ArtifactId::new(
             ArtifactKind::Policy,
@@ -981,11 +1091,13 @@ impl RankerPolicy {
     /// [`Self::v1`], returned only when its digest is the pin, the M4 policy it binds is M4's v1 now, and the sets it draws are the pinned ones.
     /// # Errors
     /// [`RankerRefusal::PolicyMutated`], then [`RankerRefusal::AcceptanceMoved`], then a pool's refusal or [`RankerRefusal::SetsMoved`].
+    #[inline]
     pub fn pinned() -> Result<RankerPolicy, RankerRefusal> {
         Self::pinned_from(Self::v1(), AcceptancePolicy::v1().id().digest, sets_digest)
     }
 
     /// `policy` against the pin, then against `m4`, M4's v1 digest now, then the sets `sets` draws against theirs.
+    #[inline]
     fn pinned_from(
         policy: RankerPolicy,
         m4: Digest,
@@ -1014,6 +1126,7 @@ impl RankerPolicy {
         self.terms.acceptance
     }
 
+    #[inline]
     fn check_pin(&self) -> Result<(), RankerRefusal> {
         if self.id.digest == M6_POLICY_V1_DIGEST {
             Ok(())
@@ -1025,6 +1138,7 @@ impl RankerPolicy {
         }
     }
 
+    #[inline]
     fn check_acceptance(&self, found: Digest) -> Result<(), RankerRefusal> {
         if self.terms.acceptance == found {
             Ok(())

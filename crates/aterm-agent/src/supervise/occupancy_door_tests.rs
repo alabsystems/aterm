@@ -178,6 +178,11 @@ fn day_on(
     drawn: &dyn Fn(u64) -> Vec<String>,
 ) -> Day {
     let (dir, path) = ledger_at(tag);
+    // The door's day alone, without Cruise's carry at a break (`cruise_carry_loop_tests`).
+    let policy = policy.map(|p| SupervisorConfig {
+        continue_policy: false,
+        ..p
+    });
     let mut m = Mock::new(Vec::new());
     let has_board = board.taken_ms > 0;
     let held_ago = board
@@ -649,7 +654,9 @@ fn each_guard_in_hand_holds_the_due_line_once() {
             } else if !s.turn_end.left_to_person() {
                 let mut reading =
                     s.turn_end_reading(&screen_at(90, ended(SAID)), None, &hosted(30));
+                // Left under Land: Cruise leaves no exchange to a person (owner ruling 2026-10-26).
                 reading.left_record = true;
+                reading.autopilot = Autopilot::Land;
                 s.turn_end.observe(&reading, s.fx.mono());
                 assert!(s.turn_end.left_to_person());
             }

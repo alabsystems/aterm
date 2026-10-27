@@ -7,6 +7,7 @@
 use std::fmt;
 use std::io::{self, Read};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// Error returned when reading or opening a private state file ([`read_private`]).
 #[derive(Debug)]
@@ -30,7 +31,7 @@ impl fmt::Display for PrivateFileError {
             Self::NotPrivate(why) => write!(f, "not private: {why}"),
             Self::Symlink => f.write_str("it or its directory is a symlink"),
             Self::Malformed(why) => f.write_str(why),
-            Self::Io(e) => write!(f, "it could not be read: {e}"),
+            Self::Io(e) => write!(f, "it could not be opened or read: {e}"),
         }
     }
 }
@@ -45,15 +46,52 @@ pub const FILE_OPEN: &str = "it is open to other users (want 0600)";
 pub const DIR_OPEN: &str = "the directory is open to other users (want 0700)";
 /// Why a file with a second hard link is not private: that link is another copy of it.
 pub const ANOTHER_LINK: &str = "it has another link";
+/// Why a file [`read_owned_into`] reads is refused: others may write it.
+const FILE_WRITABLE: &str = "it is open to other users' writes (want no group or other write bit)";
+/// Why a directory [`read_owned_into`] reads in is refused: others may write it.
+const DIR_WRITABLE: &str =
+    "the directory is open to other users' writes (want no group or other write bit)";
 
-fn file_verdict(file: &std::fs::File) -> Result<std::fs::Metadata, PrivateFileError> {
+/// How [`open_judged`] opens and judges a private file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Opening {
+    /// Read only, under the strict rules ([`read_private`]).
+    Read,
+    /// Read and write, created 0600 when missing, under the strict rules
+    /// ([`open_private_rw`]).
+    ReadWrite,
+    /// Read only, with group and other read and search bits allowed, and no write bit
+    /// ([`read_owned_into`]).
+    Owned,
+}
+
+/// Whether permission bits `mode` (`& 0o777`) that astream-sys's owner-only rule refused
+/// pass [`Opening::Owned`]'s looser one: `Some(loose)` when no group or other WRITE bit is
+/// set, `loose` saying a group or other READ bit is (a search bit alone lets nobody read,
+/// and is neither refused nor loose); `None` when one is, or the opening is a strict one.
+/// astream-sys judges the mode last, so every other clause (kind, owner, access list)
+/// held.
+fn owned_mode(how: Opening, mode: u32) -> Option<bool> {
+    (how == Opening::Owned && mode & 0o022 == 0).then_some(mode & 0o044 != 0)
+}
+
+/// `file` held to astream-sys's owner-only rule, loosened as `how` says: its metadata, and
+/// whether a group or other read bit let it through (only [`Opening::Owned`] lets one).
+fn file_verdict(
+    file: &std::fs::File,
+    how: Opening,
+) -> Result<(std::fs::Metadata, bool), PrivateFileError> {
     use astream_sys::NotPrivate;
     match astream_sys::owner_private(file).map_err(PrivateFileError::Io)? {
-        Ok(meta) => Ok(meta),
+        Ok(meta) => Ok((meta, false)),
         Err(NotPrivate::Kind(_)) => Err(PrivateFileError::Malformed("not a regular file")),
         Err(NotPrivate::Owner(_)) => Err(PrivateFileError::NotPrivate("it is another user's")),
         Err(NotPrivate::Acl) => Err(PrivateFileError::NotPrivate(ACL_OPEN)),
-        Err(NotPrivate::Mode(_)) => Err(PrivateFileError::NotPrivate(FILE_OPEN)),
+        Err(NotPrivate::Mode(mode)) => match owned_mode(how, mode) {
+            Some(loose) => Ok((file.metadata().map_err(PrivateFileError::Io)?, loose)),
+            None if how == Opening::Owned => Err(PrivateFileError::NotPrivate(FILE_WRITABLE)),
+            None => Err(PrivateFileError::NotPrivate(FILE_OPEN)),
+        },
     }
 }
 
@@ -137,6 +175,18 @@ pub fn open_private(
     dir: &Path,
     name: &str,
 ) -> Result<(std::fs::File, std::fs::Metadata), PrivateFileError> {
+    open_judged(dir, name, Opening::Read).map(|(file, meta, _loose)| (file, meta))
+}
+
+/// `name` directly in `dir`, opened as `how` says and judged on the open descriptor
+/// (astream-sys's owner-only rule, never a second `stat` by path), with whether a group or
+/// other read bit was set on the file or its directory (only [`Opening::Owned`] lets one
+/// through).
+fn open_judged(
+    dir: &Path,
+    name: &str,
+    how: Opening,
+) -> Result<(std::fs::File, std::fs::Metadata, bool), PrivateFileError> {
     use std::os::unix::fs::MetadataExt as _;
     if !one_component(name) {
         return Err(PrivateFileError::Malformed(ONE_COMPONENT));
@@ -151,25 +201,41 @@ pub fn open_private(
         _ => {}
     }
     match std::fs::symlink_metadata(dir.join(name)) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(PrivateFileError::Missing),
-        Err(e) if e.kind() != io::ErrorKind::PermissionDenied => {
+        // A missing file is created by a read-write opening, judged like any other.
+        Err(e) if e.kind() == io::ErrorKind::NotFound && how != Opening::ReadWrite => {
+            return Err(PrivateFileError::Missing);
+        }
+        Err(e)
+            if e.kind() != io::ErrorKind::PermissionDenied
+                && e.kind() != io::ErrorKind::NotFound =>
+        {
             return Err(PrivateFileError::Io(e));
         }
         _ => {}
     }
-    match judged {
+    let dir_loose = match judged {
         DirIs::Others => {
             return Err(PrivateFileError::NotPrivate(
                 "the directory is another user's",
             ));
         }
         DirIs::Acl => return Err(PrivateFileError::NotPrivate(ACL_OPEN)),
-        DirIs::Open(_) => {
-            return Err(PrivateFileError::NotPrivate(DIR_OPEN));
+        DirIs::Open(mode) => match owned_mode(how, mode) {
+            Some(loose) => loose,
+            None if how == Opening::Owned => {
+                return Err(PrivateFileError::NotPrivate(DIR_WRITABLE));
+            }
+            None => return Err(PrivateFileError::NotPrivate(DIR_OPEN)),
+        },
+        _ => false,
+    };
+    let opened = match how {
+        Opening::Read | Opening::Owned => {
+            astream_sys::open_nonblocking(&dir.join(name), astream_sys::Links::Refuse)
         }
-        _ => {}
-    }
-    let file = match astream_sys::open_nonblocking(&dir.join(name), astream_sys::Links::Refuse) {
+        Opening::ReadWrite => open_rw_created_0600(&dir.join(name), libc::O_NOFOLLOW),
+    };
+    let file = match opened {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(PrivateFileError::Missing),
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
@@ -177,11 +243,49 @@ pub fn open_private(
         }
         Err(e) => return Err(PrivateFileError::Io(e)),
     };
-    let meta = file_verdict(&file)?;
+    let (meta, file_loose) = file_verdict(&file, how)?;
     if meta.nlink() != 1 {
         return Err(PrivateFileError::NotPrivate(ANOTHER_LINK));
     }
-    Ok((file, meta))
+    Ok((file, meta, dir_loose || file_loose))
+}
+
+/// `path` opened read and write with the extra open `flags`, created when missing and then
+/// made exactly 0600. `create` with a mode is masked by the umask, so the creating open
+/// (`O_EXCL`, so it is this open that made the file) says the mode again on the
+/// DESCRIPTOR: under a umask that clears an owner bit the file would otherwise come out
+/// 0400, and the next read-write open of it would be refused. An existing file is opened
+/// as it stands, and its mode is never changed. `O_EXCL` never follows a link, so a
+/// symlink at `path` (a dangling one included) falls to the plain open, where
+/// `O_NOFOLLOW` in `flags` refuses it.
+fn open_rw_created_0600(path: &Path, flags: libc::c_int) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let mut existing = std::fs::OpenOptions::new();
+    existing.read(true).write(true).custom_flags(flags);
+    let mut creating = existing.clone();
+    creating.create_new(true).mode(0o600);
+    match creating.open(path) {
+        Ok(file) => {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            Ok(file)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => existing.open(path),
+        Err(e) => Err(e),
+    }
+}
+
+/// `<dir>/<name>` opened read and write, created 0600 when missing, under [`read_private`]'s
+/// rules: `dir` the user's own 0700 directory, the file the user's own regular file with no
+/// second link, no symlink anywhere and no group or other bit. The cursor is at 0. The write
+/// journal's file (agh, design §6.8): scanned, truncated past a torn tail, appended, and made
+/// durable through the one descriptor.
+///
+/// # Errors
+///
+/// As [`read_private`]; a missing file is created exactly 0600 whatever the umask, not
+/// `Missing` (that only for one removed between the creating open and the plain one).
+pub fn open_private_rw(dir: &Path, name: &str) -> Result<std::fs::File, PrivateFileError> {
+    open_judged(dir, name, Opening::ReadWrite).map(|(file, _meta, _loose)| file)
 }
 
 /// Byte count and `(dev, ino)` identity read by [`read_private_into`].
@@ -206,8 +310,69 @@ pub fn read_private_into(
 ) -> Result<PrivateRead, PrivateFileError> {
     use std::os::unix::fs::MetadataExt as _;
     let (mut file, meta) = open_private(dir, name)?;
+    let len = read_capped_into(&mut file, max, buf)?;
+    Ok(PrivateRead {
+        len,
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+/// What [`read_owned_into`] read: the length, the file's identity, and whether the file or
+/// its directory had a group or other read bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedRead {
+    /// Bytes read into the caller's buffer.
+    pub len: usize,
+    /// The file's device.
+    pub dev: u64,
+    /// The file's inode.
+    pub ino: u64,
+    /// The file or its directory is group- or world-readable.
+    pub loose: bool,
+}
+
+/// [`read_private_into`]'s rules, loosened for one legacy case only: the file and its
+/// directory may carry group and other **read** bits (`loose` says so). Still refused:
+/// - a symlink, file or directory;
+/// - anything but a regular file;
+/// - another user's file or directory;
+/// - an access list that grants other users access;
+/// - a second link;
+/// - a group or other **write** bit on either.
+///
+/// agh's `legacy_loose` profiles alone call it (design §6.6, M2 only).
+///
+/// # Errors
+///
+/// As [`read_private_into`].
+pub fn read_owned_into(
+    dir: &Path,
+    name: &str,
+    max: usize,
+    buf: &mut [u8],
+) -> Result<OwnedRead, PrivateFileError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let (mut file, meta, loose) = open_judged(dir, name, Opening::Owned)?;
+    let len = read_capped_into(&mut file, max, buf)?;
+    Ok(OwnedRead {
+        len,
+        dev: meta.dev(),
+        ino: meta.ino(),
+        loose,
+    })
+}
+
+/// The read [`read_private_into`] and [`read_owned_into`] share: at most `min(max,
+/// buf.len())` bytes into `buf`, a file past that cap `Malformed`, and on `Err` none of the
+/// file left in `buf`.
+fn read_capped_into(
+    file: &mut std::fs::File,
+    max: usize,
+    buf: &mut [u8],
+) -> Result<usize, PrivateFileError> {
     let cap = max.min(buf.len());
-    let len = match read_full(&mut file, &mut buf[..cap]) {
+    let len = match read_full(file, &mut buf[..cap]) {
         Ok(len) => len,
         Err(e) => {
             crate::secret::scrub(&mut buf[..cap]);
@@ -216,7 +381,7 @@ pub fn read_private_into(
     };
     if len == cap {
         let mut more = [0u8; 1];
-        let past = read_full(&mut file, &mut more);
+        let past = read_full(file, &mut more);
         crate::secret::scrub(&mut more);
         let refused = match past {
             Ok(0) => None,
@@ -230,11 +395,7 @@ pub fn read_private_into(
             return Err(refused);
         }
     }
-    Ok(PrivateRead {
-        len,
-        dev: meta.dev(),
-        ino: meta.ino(),
-    })
+    Ok(len)
 }
 
 fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> io::Result<usize> {
@@ -449,15 +610,370 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     check_private_dir(dir)
 }
 
+/// An exclusive lock on `<dir>/<name>`, lifted from aterm-net's `fleet_member` (`BookLock`).
+///
+/// - **How it is opened.** `name` must be one path component, and `dir` must pass
+///   [`check_private_dir`]. The file is opened read-write, created exactly 0600 whatever the
+///   umask, with `O_NOFOLLOW | O_NONBLOCK`, so it is never a link and the open never waits
+///   on a FIFO. Anything but a regular file is refused.
+/// - **How it is taken.** An exclusive `flock`, tried again with a backoff that starts at
+///   1 ms and doubles to 50 ms until `within` has passed.
+/// - **How it is released.** `LOCK_UN` in `Drop`, before the close. That is `clippy.toml`'s
+///   flock release rule: a lock let go by dropping its `File` stays held in every child
+///   forked meanwhile.
+pub struct PrivateLock(std::fs::File);
+
+impl PrivateLock {
+    /// Take the lock on `<dir>/<name>`, waiting at most `within`.
+    ///
+    /// # Errors
+    ///
+    /// - `ErrorKind::InvalidInput` when `name` is not one path component (empty, `.`, `..`
+    ///   or a `/` in it), before `dir` is judged or anything is opened (only `dir` is judged,
+    ///   so a deeper name would escape the rules);
+    /// - `ErrorKind::WouldBlock` with the text `busy` when another holder kept it for `within`
+    ///   (a `within` past what a clock can represent waits with no deadline);
+    /// - `ErrorKind::InvalidData`, `<dir>/<name> is no regular file`;
+    /// - [`check_private_dir`]'s refusal, which names `dir`;
+    /// - the open's own error.
+    pub fn take(
+        dir: &Path,
+        name: &str,
+        within: Duration,
+        busy: &'static str,
+    ) -> io::Result<PrivateLock> {
+        Self::take_with(dir, name, within, busy, || {})
+    }
+
+    /// [`take`](Self::take), with a `busy` text made at run time (one that names `dir`, say)
+    /// and `held` called each time the lock is found held, before the backoff's sleep (a
+    /// test's hook to see a writer wait).
+    ///
+    /// # Errors
+    ///
+    /// As [`take`](Self::take).
+    pub fn take_with(
+        dir: &Path,
+        name: &str,
+        within: Duration,
+        busy: &str,
+        mut held: impl FnMut(),
+    ) -> io::Result<PrivateLock> {
+        one_component_io(name)?;
+        check_private_dir(dir)?;
+        let path = dir.join(name);
+        let file = open_rw_created_0600(&path, libc::O_NOFOLLOW | libc::O_NONBLOCK)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is no regular file", path.display()),
+            ));
+        }
+        // `None`: a wait no clock can represent, which has no deadline.
+        let deadline = Instant::now().checked_add(within);
+        let mut backoff = Duration::from_millis(1);
+        loop {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the guard's own take: its Drop releases by LOCK_UN"
+            )]
+            let taken = file.try_lock();
+            match taken {
+                Ok(()) => return Ok(Self(file)),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+                Err(std::fs::TryLockError::WouldBlock)
+                    if deadline.is_none_or(|d| Instant::now() < d) =>
+                {
+                    held();
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_millis(50));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, busy.to_owned()));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PrivateLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
 
     use super::{
-        PrivateDir, PrivateFileError, PrivateRead, create_private_dir, ensure_private_dir,
-        judge_private_dir, read_private, read_private_into, remove_private, write_private,
+        OwnedRead, PrivateDir, PrivateFileError, PrivateLock, PrivateRead, create_private_dir,
+        ensure_private_dir, judge_private_dir, open_private_rw, read_owned_into, read_private,
+        read_private_into, remove_private, write_private,
     };
+
+    /// The busy text the lock tests hand [`PrivateLock::take`].
+    const BUSY: &str = "another holder has it";
+
+    /// With one lock held, a second take that does not wait is `WouldBlock` with the busy
+    /// text; once the first is dropped, a second take succeeds.
+    #[test]
+    fn private_lock_excludes_a_second_holder() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        let held = PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY).unwrap();
+        let refused = PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY)
+            .err()
+            .expect("a second holder is refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(refused.to_string(), BUSY);
+        drop(held);
+        let _again = PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY).unwrap();
+    }
+
+    /// A symlink at the lock's name is refused, and so is a FIFO, whose open returns at
+    /// once (`O_NONBLOCK`).
+    #[test]
+    fn private_lock_refuses_a_link_and_a_fifo() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        file_in(&dir, "real", b"", 0o600);
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link.lock")).unwrap();
+        assert!(PrivateLock::take(&dir, "link.lock", std::time::Duration::ZERO, BUSY).is_err());
+        // A dangling link is refused too, and its target is never created.
+        let outside = root.path().join("outside.lock");
+        std::os::unix::fs::symlink(&outside, dir.join("dangling.lock")).unwrap();
+        assert!(PrivateLock::take(&dir, "dangling.lock", std::time::Duration::ZERO, BUSY).is_err());
+        assert!(!outside.exists());
+        let fifo = dir.join("fifo.lock");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+        let refused = PrivateLock::take(&dir, "fifo.lock", std::time::Duration::ZERO, BUSY)
+            .err()
+            .expect("a FIFO is no lock");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A name of more than one path component is `InvalidInput` before anything is opened:
+    /// no lock file is made below `dir`, beside it, or at an absolute path.
+    #[test]
+    fn private_lock_refuses_a_name_of_more_than_one_component() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        let absolute = root.path().join("absolute.lock");
+        let absolute_name = absolute.to_str().unwrap();
+        for name in ["sub/x.lock", "../beside.lock", "..", ".", "", absolute_name] {
+            assert_eq!(
+                PrivateLock::take(&dir, name, std::time::Duration::ZERO, BUSY)
+                    .err()
+                    .expect("refused")
+                    .kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{name:?}"
+            );
+        }
+        assert!(!dir.join("sub").exists());
+        assert!(!root.path().join("beside.lock").exists());
+        assert!(!absolute.exists());
+    }
+
+    /// `take_with` tells its hook each time it finds the lock held, and takes it once the
+    /// holder lets go: here the hook itself drops the first holder. Its busy text is the
+    /// caller's, made at run time.
+    #[test]
+    fn private_lock_take_with_tells_its_hook_and_takes_a_freed_lock() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        let mut first =
+            Some(PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY).unwrap());
+        let mut told = 0;
+        let _second = PrivateLock::take_with(
+            &dir,
+            ".lock",
+            std::time::Duration::from_secs(60),
+            "unused",
+            || {
+                told += 1;
+                drop(first.take());
+            },
+        )
+        .unwrap();
+        assert_eq!(told, 1);
+        let busy = format!("busy in {}", dir.display());
+        let refused =
+            PrivateLock::take_with(&dir, ".lock", std::time::Duration::ZERO, &busy, || {})
+                .err()
+                .expect("held by the second");
+        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(refused.to_string(), busy);
+    }
+
+    /// A free lock is taken whatever the wait, one no clock can represent included.
+    #[test]
+    fn private_lock_takes_a_free_lock_with_any_wait() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        let _held = PrivateLock::take(&dir, ".lock", std::time::Duration::MAX, BUSY).unwrap();
+    }
+
+    /// A missing file is created 0600; a 0644 file, or a file in a 0755 directory, is not
+    /// private.
+    #[test]
+    fn open_private_rw_creates_0600_and_refuses_loose() {
+        use std::io::{Seek as _, Write as _};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        let mut file = open_private_rw(&dir, "journal").unwrap();
+        assert_eq!(mode_of(&dir.join("journal")), 0o600);
+        assert_eq!(file.stream_position().unwrap(), 0);
+        file.write_all(b"step").unwrap();
+        drop(file);
+        let again = open_private_rw(&dir, "journal").unwrap();
+        assert_eq!(again.metadata().unwrap().len(), 4);
+        file_in(&dir, "loose", b"x", 0o644);
+        assert!(matches!(
+            open_private_rw(&dir, "loose"),
+            Err(PrivateFileError::NotPrivate(_))
+        ));
+        let open = dir_in(root.path(), "open", 0o755);
+        assert!(matches!(
+            open_private_rw(&open, "journal"),
+            Err(PrivateFileError::NotPrivate(_))
+        ));
+        assert!(!open.join("journal").exists());
+        // An existing private file in a directory loosened later is refused too.
+        file_in(&open, "existing", b"x", 0o600);
+        assert!(matches!(
+            open_private_rw(&open, "existing"),
+            Err(PrivateFileError::NotPrivate(_))
+        ));
+        // A link in the file's place, a dangling one included, is refused, and the
+        // creating open never makes its target.
+        let outside = root.path().join("outside");
+        std::os::unix::fs::symlink(&outside, dir.join("linked")).unwrap();
+        assert!(matches!(
+            open_private_rw(&dir, "linked"),
+            Err(PrivateFileError::Symlink)
+        ));
+        assert!(!outside.exists());
+    }
+
+    /// Under a umask that clears an owner bit (`0o277`), the journal file and the lock file
+    /// are still made exactly 0600, so a second open of each, read-write, succeeds; an
+    /// existing file's mode is left as it was. The umask is process-wide, so the body runs
+    /// alone in a child of this test binary, which is waited on by a hang detector.
+    #[test]
+    fn files_made_under_a_narrow_umask_are_exactly_0600() {
+        const NAME: &str = "private_file::tests::files_made_under_a_narrow_umask_are_exactly_0600";
+        const STAGE_ENV: &str = "ATERM_UDS_TEST_NARROW_UMASK";
+        if std::env::var_os(STAGE_ENV).is_some() {
+            // The directory first: under this umask a new one would be 0500.
+            let root = aterm_tempfile::tempdir().unwrap();
+            let dir = dir_in(root.path(), "state", 0o700);
+            // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail;
+            // this child runs this one test, so no other create sees the mask.
+            unsafe { libc::umask(0o277) };
+            drop(open_private_rw(&dir, "journal").unwrap());
+            assert_eq!(mode_of(&dir.join("journal")), 0o600);
+            drop(open_private_rw(&dir, "journal").expect("the second read-write open"));
+            drop(PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY).unwrap());
+            assert_eq!(mode_of(&dir.join(".lock")), 0o600);
+            drop(
+                PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY)
+                    .expect("the second take"),
+            );
+            // An existing file is opened as it stands: never chmodded.
+            file_in(&dir, "narrow", b"x", 0o400);
+            assert!(open_private_rw(&dir, "narrow").is_err());
+            assert_eq!(mode_of(&dir.join("narrow")), 0o400);
+            println!("STAGED narrow umask ok");
+            return;
+        }
+        let out = crate::deadline::output_within(
+            crate::spawnfd::command(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(STAGE_ENV, "1"),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("the child ran within the hang detector");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("STAGED narrow umask ok"),
+            "{:?}\nstdout: {stdout}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Group and other read bits read, and say so; a write bit on the file or the
+    /// directory, or a symlink, is refused.
+    #[test]
+    fn read_owned_into_accepts_read_bits_only() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut buf = [0u8; 64];
+        let shared = dir_in(root.path(), "shared", 0o755);
+        file_in(&shared, "token", b"legacy", 0o644);
+        let meta = std::fs::metadata(shared.join("token")).unwrap();
+        assert_eq!(
+            read_owned_into(&shared, "token", 64, &mut buf).unwrap(),
+            OwnedRead {
+                len: 6,
+                dev: meta.dev(),
+                ino: meta.ino(),
+                loose: true,
+            }
+        );
+        assert_eq!(&buf[..6], b"legacy");
+        let private = dir_in(root.path(), "private", 0o700);
+        file_in(&private, "token", b"tight", 0o600);
+        let read = read_owned_into(&private, "token", 64, &mut buf).unwrap();
+        assert_eq!((read.len, read.loose), (5, false));
+        // A search bit lets nobody read: neither refused nor loose. A group read bit is.
+        let searchable = dir_in(root.path(), "searchable", 0o711);
+        file_in(&searchable, "token", b"tight", 0o600);
+        let read = read_owned_into(&searchable, "token", 64, &mut buf).unwrap();
+        assert_eq!((read.len, read.loose), (5, false));
+        file_in(&private, "group-read", b"group", 0o640);
+        let read = read_owned_into(&private, "group-read", 64, &mut buf).unwrap();
+        assert_eq!((read.len, read.loose), (5, true));
+        file_in(&shared, "group-write", b"x", 0o664);
+        assert!(matches!(
+            read_owned_into(&shared, "group-write", 64, &mut buf),
+            Err(PrivateFileError::NotPrivate(_))
+        ));
+        let world = dir_in(root.path(), "world", 0o700);
+        file_in(&world, "token", b"x", 0o600);
+        std::fs::set_permissions(&world, std::fs::Permissions::from_mode(0o757)).unwrap();
+        assert!(matches!(
+            read_owned_into(&world, "token", 64, &mut buf),
+            Err(PrivateFileError::NotPrivate(_))
+        ));
+        std::os::unix::fs::symlink(private.join("token"), shared.join("link")).unwrap();
+        assert!(matches!(
+            read_owned_into(&shared, "link", 64, &mut buf),
+            Err(PrivateFileError::Symlink)
+        ));
+        // astream-sys's rule judges an access list before the mode: a loose file that one
+        // opens to others is refused for the list, not read as loose.
+        #[cfg(target_os = "macos")]
+        {
+            let token = shared.join("token");
+            chmod(&[
+                "+a".as_ref(),
+                "everyone allow write".as_ref(),
+                token.as_os_str(),
+            ]);
+            match read_owned_into(&shared, "token", 64, &mut buf) {
+                Err(PrivateFileError::NotPrivate(why)) => {
+                    assert!(why.contains("chmod -N"), "{why}");
+                }
+                other => panic!("an access list that allows others: {other:?}"),
+            }
+        }
+    }
 
     fn dir_in(root: &Path, name: &str, mode: u32) -> PathBuf {
         let dir = root.join(name);

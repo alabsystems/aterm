@@ -84,10 +84,12 @@ fn grid_claims() -> &'static [Claim] {
 }
 
 /// The grid's local selection, run once as `select` runs it (serially) for the tests that compare
-/// a distributed or spread one with it.
+/// a distributed or spread one with it. The rows it reads are judged first, on threads, by the
+/// shared search, so its serial fold waits on no serial judgment.
 fn local_grid() -> &'static Selection {
     static L: OnceLock<Selection> = OnceLock::new();
     L.get_or_init(|| {
+        let _ = super::m4_tests::searched();
         evaluator()
             .select(&mut GridProposer::new())
             .expect("a winner")
@@ -247,6 +249,10 @@ fn honest_claims_in_any_completion_order_give_the_local_selection() {
 /// does a serial finish at `CheckLevel::All`: the grid on threads; the plans file of [`six`] on
 /// the spread that skips (which runs the jobs it skips in place, on one thread) and serially,
 /// where the grid's 54 plans, judged twice over on one thread, took some 30 s in a debug build.
+/// Every selection here reads the shared evaluator's judgments ([`Evaluator::memoizing`]), so
+/// this is the fold's and the spread's law; that a judgment made on a thread is the one a fresh
+/// evaluator makes serially is `a_memoizing_evaluator_judges_each_pair_once_as_a_fresh_one_does`'s
+/// and `m6_tests::the_chain_is_deterministic`'s.
 #[test]
 fn select_spread_equals_select() {
     let ev = evaluator();

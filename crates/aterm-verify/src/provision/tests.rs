@@ -181,12 +181,13 @@ impl stable::Rustup for Bare {
             args.join(" "),
         ));
         if tool.file_name().is_some_and(|n| n == "rustup-init") {
-            let bin = homes.cargo_home.join("bin/rustup");
+            let bin = homes.home.join(".cargo/bin/rustup");
             std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
             std::fs::write(&bin, "#!/bin/false\n").unwrap();
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        stable::self_update(&homes.cargo_home, args)?;
         Ok(String::new())
     }
 }
@@ -208,6 +209,7 @@ struct Fake {
     /// The `y.tab.c` the fake `make bash` compiled.
     parser: RefCell<Vec<u8>>,
     bindgen_answers: String,
+    rustup_answers: String,
     zip_files: Vec<(&'static str, Vec<u8>)>,
     zip_links: Vec<(&'static str, PathBuf)>,
     rustup: Provisioned,
@@ -234,6 +236,7 @@ impl Fake {
             patched: RefCell::default(),
             parser: RefCell::default(),
             bindgen_answers: format!("wasm-bindgen {}\n", crate::wasm_glue::BINDGEN),
+            rustup_answers: "rustup 1.29.2 (d8c92c676 2026-10-21)\n".into(),
             zip_files: vec![(
                 "chrome-headless-shell-mac-arm64/chrome-headless-shell",
                 b"#!/bin/false\n".to_vec(),
@@ -396,6 +399,7 @@ impl Host for Fake {
                     Ok(self.bindgen_answers.clone())
                 }
             }
+            ["--version"] if program.ends_with("bin/rustup") => Ok(self.rustup_answers.clone()),
             ["-x", "-k", _, tree] if program == "/usr/bin/ditto" => {
                 use std::os::unix::fs::PermissionsExt as _;
                 for (name, bytes) in &self.zip_files {
@@ -433,25 +437,22 @@ fn repo() -> PathBuf {
 }
 
 fn machine(home: &Path) -> Machine {
-    let rustup = home.join(".cargo/bin/rustup");
-    std::fs::create_dir_all(rustup.parent().unwrap()).unwrap();
-    std::fs::write(&rustup, "#!/bin/false\n").unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let tooling = home.join("Library/Caches/aterm/tooling.noindex");
     Machine {
         platform: "macos-aarch64".into(),
-        tooling: home.join("Library/Caches/aterm/tooling.noindex"),
         browser: home.join("Library/Caches/aterm/browser.noindex"),
         repo: repo(),
         homes: stable::Homes {
             home: home.to_path_buf(),
-            cargo_home: home.join(".cargo"),
             rustup_home: home.join(".rustup"),
-            path: None,
-            homebrew_keg: None,
+            cargo_home: home.join(".cargo"),
+            lookup: aterm_uds::host::Lookup {
+                named: None,
+                tooling: Some(tooling.clone()),
+                path: None,
+            },
         },
+        tooling,
     }
 }
 
@@ -1202,6 +1203,8 @@ fn a_bash_build_that_is_not_the_pin_is_refused() {
 }
 
 fn all_in_place(m: &Machine) {
+    std::fs::create_dir_all(&m.homes.rustup_home).unwrap();
+    std::fs::write(m.homes.rustup_home.join("settings.toml"), "").unwrap();
     for row in select(&Options::default()) {
         let Some(t) = target(row, m) else {
             continue;
@@ -1612,7 +1615,7 @@ fn each_row_places_what_its_tool_row_resolves() {
                     }
                     assert!(row.archive_for("linux-riscv64").is_none());
                 }
-                Install::Unpack { archives, .. } => {
+                Install::Unpack { archives, .. } | Install::Rustup { init: archives } => {
                     let mut hosts: Vec<&str> = archives.iter().map(|a| a.platform).collect();
                     hosts.sort_unstable();
                     let mut pinned = pin.hosts.to_vec();
@@ -1631,18 +1634,38 @@ fn each_row_places_what_its_tool_row_resolves() {
     }
 }
 
+/// Whether `args`, run as `program`, is rustup-init's self-install: what S7's row ran first
+/// on a machine it found no rustup on, which writes `CARGO_HOME`.
+fn self_install(program: &Path, args: &str) -> bool {
+    program.file_name().is_some_and(|n| n == "rustup-init")
+        || args
+            .split_whitespace()
+            .any(|a| a == "-y" || a == "--no-modify-path")
+}
+
+/// THE RUSTUP ROW PLACES A STAMPED COPY AND NEVER SELF-INSTALLS: rustup-init at its pin is
+/// copied into the cache as `bin/rustup` with its cargo and rustc proxies, shown to answer
+/// its version from the scratch, stamped and placed, and every rustup call after it runs
+/// that copy. Nothing is written to the account's `CARGO_HOME`, which stays empty, and no
+/// call is a self-install. A rustup-init off its pin, or one that answers another version,
+/// never becomes the copy. NEGATIVE CONTROL: the self-install detector flags S7's own first
+/// call, `rustup-init -y --no-modify-path …`.
 #[test]
-fn a_rustup_init_off_its_pin_never_runs() {
+fn the_rustup_row_places_a_stamped_copy_and_never_self_installs() {
+    assert!(self_install(
+        Path::new("/scratch/.provision-rustup-x/download/rustup-init"),
+        "-y --no-modify-path --profile minimal --default-toolchain none"
+    ));
     let home = aterm_tempfile::tempdir().unwrap();
     let m = machine(home.path());
-    std::fs::remove_file(home.path().join(".cargo/bin/rustup")).unwrap();
+    let cargo_home = home.path().join(".cargo");
+    std::fs::create_dir_all(&cargo_home).unwrap();
     let init = b"#!/bin/false\nrustup-init\n".to_vec();
     let url = "https://fixture.invalid/rustup/archive/{v}/aarch64-apple-darwin/rustup-init";
     let pinned = |sha256: &str| Row {
         name: "rustup",
         tool: Some("rustup"),
         install: Install::Rustup {
-            version: "1.29.2",
             init: Box::leak(Box::new([Archive {
                 platform: "macos-aarch64",
                 url,
@@ -1652,6 +1675,10 @@ fn a_rustup_init_off_its_pin_never_runs() {
         },
     };
     let served = url.replace("{v}", "1.29.2");
+    let row = pinned(&sha256(&init));
+    let t = target(&row, &m).unwrap();
+    let copy = t.dir.join(&t.exe);
+    assert_eq!(copy, m.tooling.join("rustup-1.29.2/bin/rustup"));
 
     let mut host = Fake::new().serve(&served, init.clone());
     host.bare = Some(Bare::default());
@@ -1661,15 +1688,17 @@ fn a_rustup_init_off_its_pin_never_runs() {
         &host,
         &mut |_| {},
     ) {
-        State::Failed(why) => assert!(
-            why.contains("rustup was not installed") && why.contains("hashes to"),
-            "{why}"
-        ),
+        State::Failed(why) => assert!(why.contains("hashes to"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    host.rustup_answers = "rustup 1.28.0 (00000000 2026-01-01)\n".into();
+    match provide(&row, &m, &host, &mut |_| {}) {
+        State::Failed(why) => assert!(why.contains("not rustup 1.29.2"), "{why}"),
         other => panic!("{other:?}"),
     }
     assert!(
         host.bare.as_ref().unwrap().calls.borrow().is_empty(),
-        "nothing ran"
+        "no rustup call ran"
     );
     assert_eq!(
         names(&m.tooling),
@@ -1679,36 +1708,95 @@ fn a_rustup_init_off_its_pin_never_runs() {
 
     let mut host = Fake::new().serve(&served, init.clone());
     host.bare = Some(Bare::default());
+    let mut said = Vec::new();
     assert_eq!(
-        provide(&pinned(&sha256(&init)), &m, &host, &mut |_| {}),
-        State::Placed(m.homes.rustup_home.clone())
+        provide(&row, &m, &host, &mut |l| said.push(l.to_string())),
+        State::Placed(copy.clone())
     );
-    let calls = host.bare.as_ref().unwrap().calls.borrow().clone();
-    let (program, executable, args) = &calls[0];
+    assert!(complete(&t), "the copy and its stamp");
+    let stamp = place::read_stamp(&t.dir).unwrap();
+    assert_eq!(stamp.sha256.as_deref(), Some(sha256(&init).as_str()));
+    assert_eq!(
+        stamp.reports.as_deref(),
+        Some("rustup 1.29.2 (d8c92c676 2026-10-21)")
+    );
+    assert_eq!(std::fs::read(&copy).unwrap(), init, "a copy of rustup-init");
+    assert_eq!(mode(&copy), 0o755);
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let inode = std::fs::metadata(&copy).unwrap().ino();
+        for proxy in RUSTUP_PROXIES {
+            let at = t.dir.join("bin").join(proxy);
+            assert_eq!(std::fs::metadata(&at).unwrap().ino(), inode, "{proxy}");
+        }
+    }
+    let probes = host.spawned("bin/rustup");
+    assert_eq!(probes.len(), 1, "{probes:#?}");
     assert!(
-        program.starts_with(&m.tooling)
-            && program
-                .to_string_lossy()
-                .contains(&format!("{}rustup-", place::SCRATCH_PREFIX))
-            && program.ends_with("rustup-init"),
-        "{}",
-        program.display()
+        probes[0]
+            .program
+            .to_string_lossy()
+            .contains(&format!("{}rustup-", place::SCRATCH_PREFIX)),
+        "the probe ran from the scratch: {}",
+        probes[0].program.display()
     );
-    assert!(*executable, "rustup-init ran executable");
+    let set: Vec<&str> = probes[0].set.iter().map(|(var, _)| var.as_str()).collect();
     assert_eq!(
-        args,
-        "-y --no-modify-path --profile minimal --default-toolchain none"
+        set,
+        ["RUSTUP_HOME", "CARGO_HOME"],
+        "the probe is handed both homes"
+    );
+    for (var, value) in &probes[0].set {
+        assert!(
+            Path::new(value).starts_with(&m.tooling),
+            "{var}={value:?} is the scratch's"
+        );
+    }
+    let calls = host.bare.as_ref().unwrap().calls.borrow().clone();
+    assert!(!calls.is_empty());
+    for (program, _, args) in &calls {
+        assert_eq!(program, &copy, "every call runs the copy");
+        assert!(!self_install(program, args), "{args}");
+    }
+    for spawn in host.spawns.borrow().iter() {
+        let args: Vec<String> = spawn
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!self_install(&spawn.program, &args.join(" ")), "{spawn:?}");
+    }
+    assert_eq!(
+        names(&cargo_home),
+        Vec::<String>::new(),
+        "CARGO_HOME stays empty"
     );
     assert_eq!(host.fetched.borrow().as_slice(), [served]);
-    assert_eq!(names(&m.tooling), Vec::<String>::new(), "the scratch went");
+    assert_eq!(names(&m.tooling), ["rustup-1.29.2"], "the scratch went");
+    assert!(
+        said.iter().any(|l| l.contains("self-install never ran")),
+        "{said:#?}"
+    );
+
+    std::fs::create_dir_all(&m.homes.rustup_home).unwrap();
+    std::fs::write(m.homes.rustup_home.join("settings.toml"), "").unwrap();
+    let host = Fake::new();
+    assert_eq!(
+        provide(&row, &m, &host, &mut |_| {}),
+        State::Present(copy),
+        "in place: nothing fetched"
+    );
+    assert!(host.fetched.borrow().is_empty() && host.spawns.borrow().is_empty());
 }
 
 #[test]
 fn rustup_init_is_pinned_for_every_host_rustup_serves() {
     let row = super::row("rustup").unwrap();
-    let Install::Rustup { version, init } = row.install else {
+    let Install::Rustup { init } = row.install else {
         panic!("{row:?}");
     };
+    let version = row.version().expect("the rustup row pins rustup-init");
+    assert_eq!(version, "1.29.2");
     for platform in [
         "macos-aarch64",
         "macos-x86_64",
@@ -1730,20 +1818,15 @@ fn rustup_init_is_pinned_for_every_host_rustup_serves() {
 fn a_tree_without_publish_wants_no_wasm32_pin() {
     let home = aterm_tempfile::tempdir().unwrap();
     let mut m = machine(home.path());
+    all_in_place(&m);
     let row = super::row("rustup").unwrap();
     let public = home.path().join("public-clone");
     std::fs::create_dir_all(&public).unwrap();
     m.repo = public.clone();
     let host = Fake::new();
-    assert!(
-        matches!(check(row, &m, &host), State::Present(_)),
-        "{:?}",
-        check(row, &m, &host)
-    );
-    assert_eq!(
-        provide(row, &m, &host, &mut |_| {}),
-        State::Present(m.homes.rustup_home.clone())
-    );
+    let copy = target(row, &m).map(|t| t.dir.join(&t.exe)).unwrap();
+    assert_eq!(check(row, &m, &host), State::Present(copy.clone()));
+    assert_eq!(provide(row, &m, &host, &mut |_| {}), State::Present(copy));
 
     std::fs::create_dir_all(public.join("publish")).unwrap();
     std::fs::write(
@@ -1765,6 +1848,7 @@ fn a_tree_without_publish_wants_no_wasm32_pin() {
 fn only_linux_holds_the_rustup_row_to_the_guest_agents_musl_std() {
     let home = aterm_tempfile::tempdir().unwrap();
     let m = machine(home.path());
+    all_in_place(&m);
     let row = super::row("rustup").unwrap();
     let host = Fake::new();
     assert!(
@@ -1789,6 +1873,7 @@ fn only_linux_holds_the_rustup_row_to_the_guest_agents_musl_std() {
 fn a_linux_run_asks_stable_for_the_guest_agents_musl_std_and_a_plain_run_does_not() {
     let home = aterm_tempfile::tempdir().unwrap();
     let m = machine(home.path());
+    all_in_place(&m);
     let host = Fake::new();
     let add = "rustup target add --toolchain stable aarch64-unknown-linux-musl";
     let asked = |said: &[String]| {

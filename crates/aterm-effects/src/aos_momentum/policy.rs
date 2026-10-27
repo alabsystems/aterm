@@ -117,6 +117,7 @@ pub const GRADE_CAP: EvidenceGrade = EvidenceGrade::Tested;
 
 const BASELINE_BUILD: &str = "aterm-aos-m4-baseline";
 
+#[inline]
 const fn grid_v1() -> [(Split, Wake); 54] {
     let mut g = [(Split::Shipped, Wake::NextStep); 54];
     let mut i = 0;
@@ -127,6 +128,7 @@ const fn grid_v1() -> [(Split, Wake); 54] {
     g
 }
 
+#[inline]
 const fn nibble(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => c - b'0',
@@ -135,6 +137,8 @@ const fn nibble(c: u8) -> u8 {
     }
 }
 
+#[inline]
+#[must_use]
 pub(super) const fn hex_digest(hex: &str) -> Digest {
     let b = hex.as_bytes();
     assert!(b.len() == 64, "a digest pin is 64 hex digits");
@@ -147,6 +151,7 @@ pub(super) const fn hex_digest(hex: &str) -> Digest {
     Digest(out)
 }
 
+#[inline]
 const fn grade_name(g: EvidenceGrade) -> &'static str {
     match g {
         EvidenceGrade::Tested => "Tested",
@@ -215,6 +220,7 @@ impl ItemPin {
     }
 }
 
+#[inline]
 const fn pin(
     id: &'static str,
     kind: ItemKind,
@@ -239,6 +245,7 @@ const fn pin(
     }
 }
 
+#[inline]
 const fn generated(seed: u64, stratum: Stratum) -> ItemKind {
     ItemKind::Generated { seed, stratum }
 }
@@ -689,6 +696,7 @@ pub(super) struct ItemFacts<'a> {
 
 impl<'a> ItemFacts<'a> {
     /// `item`'s facts.
+    #[inline]
     pub(super) const fn of(item: &'a Item) -> ItemFacts<'a> {
         ItemFacts {
             id: item.id(),
@@ -701,6 +709,7 @@ impl<'a> ItemFacts<'a> {
         }
     }
 
+    #[inline]
     fn content(&self) -> Digest {
         match self.body {
             Body::Trace(bytes) => Digest::of(GOLDEN_TRACE_DOMAIN, &[bytes]),
@@ -762,12 +771,16 @@ const fn wide(n: usize) -> u64 {
 }
 
 impl Terms {
+    #[inline]
     fn v1() -> Terms {
         let mut grid = Vec::with_capacity(GRID_V1.len());
-        for &(split, wake) in &GRID_V1 {
+        let mut gi = 0;
+        while gi < GRID_V1.len() {
+            let (split, wake) = GRID_V1[gi];
             if let Ok(plan) = SchedulePlan::new(split, wake) {
                 grid.push(plan);
             }
+            gi += 1;
         }
         Terms {
             stranded_light: NoStrandedLight::artifact(),
@@ -804,8 +817,9 @@ impl Terms {
         }
     }
 
+    #[inline]
     fn descriptor(&self) -> Vec<u8> {
-        let mut e = Enc::new();
+        let mut e = Enc::with_capacity(8192);
         e.artifact(&self.stranded_light);
         e.artifact(&self.lane_fidelity);
         e.duration(self.delta);
@@ -823,7 +837,9 @@ impl Terms {
         e.u64(wide(self.train));
         e.u64(wide(self.held_out));
         e.u64(wide(self.items.len()));
-        for i in &self.items {
+        let mut ii = 0;
+        while ii < self.items.len() {
+            let i = &self.items[ii];
             e.str(i.id);
             e.u8(i.kind.tag());
             e.u64(i.kind.seed());
@@ -834,10 +850,13 @@ impl Terms {
             e.opt(stratum, |e, s| e.str(s.name()));
             e.u8(i.split.tag());
             e.digest(&i.content);
+            ii += 1;
         }
         e.str(self.baseline_code);
         e.u64(wide(self.items.len()));
-        for i in &self.items {
+        let mut ii = 0;
+        while ii < self.items.len() {
+            let i = &self.items[ii];
             let b = &i.baseline;
             e.str(i.id);
             e.u64(b.ticks);
@@ -845,28 +864,37 @@ impl Terms {
             e.u64(b.wasted);
             e.opt(b.lane, |e, v| e.u64(v));
             e.digest(&b.chain);
+            ii += 1;
         }
         e.u64(wide(self.grid.len()));
-        for p in &self.grid {
-            e.raw(&p.encode());
+        let mut gi = 0;
+        while gi < self.grid.len() {
+            e.raw(&self.grid[gi].encode());
+            gi += 1;
         }
         e.u8(self.rounds);
         e.u64(wide(self.distinct));
         e.u64(wide(self.proposal_bytes));
         e.bytes(self.distinct_by);
-        for rule in [
+        let rules = [
             self.selection,
             self.held_out_rule,
             self.useful,
             self.admission,
-        ] {
-            e.str(rule);
+        ];
+        let mut ri = 0;
+        while ri < rules.len() {
+            e.str(rules[ri]);
+            ri += 1;
         }
         e.u64(wide(self.bases.len()));
-        for &(code, how) in &self.bases {
+        let mut bi = 0;
+        while bi < self.bases.len() {
+            let (code, how) = self.bases[bi];
             e.str(code);
             e.u8(how.tag());
             e.str(how.rule());
+            bi += 1;
         }
         e.artifact(&self.schema);
         e.artifact(&self.profile);
@@ -884,11 +912,13 @@ pub struct AcceptancePolicy {
 
 impl AcceptancePolicy {
     /// The policy v1 from this module's constants, unchecked: a search uses [`Self::pinned`].
+    #[inline]
     #[must_use]
     pub fn v1() -> AcceptancePolicy {
         Self::of(Terms::v1())
     }
 
+    #[inline]
     fn of(terms: Terms) -> AcceptancePolicy {
         let id = ArtifactId::new(
             ArtifactKind::Policy,
@@ -908,6 +938,7 @@ impl AcceptancePolicy {
     /// # Errors
     /// [`PolicyRefusal::PolicyMutated`], then [`PolicyRefusal::CorpusDrift`], then
     /// [`PolicyRefusal::BaselineDrift`]: the first check that fails, in that order.
+    #[inline]
     pub fn pinned(origin: Instant) -> Result<AcceptancePolicy, PolicyRefusal> {
         static PINNED: std::sync::OnceLock<Result<AcceptancePolicy, PolicyRefusal>> =
             std::sync::OnceLock::new();
@@ -915,16 +946,21 @@ impl AcceptancePolicy {
     }
 
     /// [`Self::pinned`]'s checks, run.
+    #[inline]
     fn checked(origin: Instant) -> Result<AcceptancePolicy, PolicyRefusal> {
         let policy = Self::v1();
         policy.check_pin()?;
-        let corpus = Corpus::generate().map_err(|_| PolicyRefusal::CorpusDrift {
-            item: policy.refused_item(),
-        })?;
+        let Ok(corpus) = Corpus::generate() else {
+            return Err(PolicyRefusal::CorpusDrift {
+                item: policy.refused_item(),
+            });
+        };
         let items = corpus.items();
         let mut facts = Vec::with_capacity(items.len());
-        for item in items {
-            facts.push(ItemFacts::of(item));
+        let mut ii = 0;
+        while ii < items.len() {
+            facts.push(ItemFacts::of(&items[ii]));
+            ii += 1;
         }
         policy.check_corpus(&facts)?;
         policy.check_baseline(&measure(&facts, origin))?;
@@ -946,6 +982,7 @@ impl AcceptancePolicy {
     }
 
     /// The baseline's `T`, `P` and `Z` summed over `split`.
+    #[inline]
     #[must_use]
     pub const fn totals(&self, split: CorpusSplit) -> Totals {
         let items = self.terms.items.as_slice();
@@ -997,14 +1034,36 @@ impl AcceptancePolicy {
     }
 
     /// How a plan may replace the live code `live`.
+    #[inline]
     #[must_use]
-    pub fn base(&self, live: Sched) -> Option<Replace> {
-        let code = live.prebuilt()?;
+    pub const fn base(&self, live: Sched) -> Option<Replace> {
+        #[inline]
+        const fn str_eq(a: &str, b: &str) -> bool {
+            let (ab, bb) = (a.as_bytes(), b.as_bytes());
+            if ab.len() != bb.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < ab.len() {
+                if ab[i] != bb[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        let Some(code) = live.prebuilt() else {
+            return None;
+        };
         let target = code.artifact_name();
-        for &(name, how) in &self.terms.bases {
-            if name == target {
+        let bases = self.terms.bases.as_slice();
+        let mut bi = 0;
+        while bi < bases.len() {
+            let (name, how) = bases[bi];
+            if str_eq(name, target) {
                 return Some(how);
             }
+            bi += 1;
         }
         None
     }
@@ -1017,42 +1076,57 @@ impl AcceptancePolicy {
     }
 
     /// Checks that its digest is [`M4_POLICY_V1_DIGEST`].
-    pub(super) fn check_pin(&self) -> Result<(), PolicyRefusal> {
-        if self.id.digest == M4_POLICY_V1_DIGEST {
-            Ok(())
-        } else {
-            Err(PolicyRefusal::PolicyMutated {
-                found: self.id.digest,
-                pinned: M4_POLICY_V1_DIGEST,
-            })
+    #[inline]
+    pub(super) const fn check_pin(&self) -> Result<(), PolicyRefusal> {
+        let a = self.id.digest.0;
+        let b = M4_POLICY_V1_DIGEST.0;
+        let mut i = 0;
+        while i < 32 {
+            if a[i] != b[i] {
+                return Err(PolicyRefusal::PolicyMutated {
+                    found: self.id.digest,
+                    pinned: M4_POLICY_V1_DIGEST,
+                });
+            }
+            i += 1;
         }
+        Ok(())
     }
 
     /// Checks that `found` is the policy's corpus.
+    #[inline]
     pub(super) fn check_corpus(&self, found: &[ItemFacts<'_>]) -> Result<(), PolicyRefusal> {
-        let drift = |item: &str| PolicyRefusal::CorpusDrift {
-            item: item.to_owned(),
-        };
-        for (k, pin) in self.terms.items.iter().enumerate() {
+        #[inline]
+        fn corpus_drift(item: &str) -> PolicyRefusal {
+            PolicyRefusal::CorpusDrift {
+                item: item.to_owned(),
+            }
+        }
+        let mut k = 0;
+        while k < self.terms.items.len() {
+            let pin = &self.terms.items[k];
             let Some(f) = found.get(k) else {
-                return Err(drift(pin.id));
+                return Err(corpus_drift(pin.id));
             };
             if f.id != pin.id
                 || f.kind != pin.kind
                 || f.split != pin.split
                 || f.content() != pin.content
             {
-                return Err(drift(pin.id));
+                return Err(corpus_drift(pin.id));
             }
+            k += 1;
         }
         if let Some(extra) = found.get(self.terms.items.len()) {
-            return Err(drift(extra.id));
+            return Err(corpus_drift(extra.id));
         }
         let mut train_count = 0usize;
         let mut held_out_count = 0usize;
         let mut golden = None;
         let mut parts = Vec::with_capacity(found.len());
-        for f in found {
+        let mut fi = 0;
+        while fi < found.len() {
+            let f = &found[fi];
             match f.split {
                 CorpusSplit::Train => train_count += 1,
                 CorpusSplit::HeldOut => held_out_count += 1,
@@ -1067,82 +1141,113 @@ impl AcceptancePolicy {
                     parts.push(item_part(f.kind, f.split, &s.encode()));
                 }
             }
+            fi += 1;
         }
         if train_count != self.terms.train || held_out_count != self.terms.held_out {
-            return Err(drift(CORPUS_FOLD));
+            return Err(corpus_drift(CORPUS_FOLD));
         }
         match golden {
             Some(golden) if corpus_digest(&golden, &parts) == self.terms.corpus => Ok(()),
-            _ => Err(drift(CORPUS_FOLD)),
+            _ => Err(corpus_drift(CORPUS_FOLD)),
         }
     }
 
     /// Checks that `measured` is one admitted row per item.
+    #[inline]
     pub(super) fn check_baseline(&self, measured: &[Measured]) -> Result<(), PolicyRefusal> {
-        let drift = |item: &str, field| PolicyRefusal::BaselineDrift {
-            item: item.to_owned(),
-            field,
-        };
+        #[inline]
+        fn baseline_drift(item: &str, field: BaselineField) -> PolicyRefusal {
+            PolicyRefusal::BaselineDrift {
+                item: item.to_owned(),
+                field,
+            }
+        }
+        #[inline]
+        const fn class_admitted(m: &Measured, pin: &ItemPin) -> Option<BaselineField> {
+            if !m.admitted && !matches!(pin.kind, ItemKind::GoldenTrace) {
+                Some(BaselineField::Admitted)
+            } else {
+                None
+            }
+        }
+        #[inline]
+        const fn class_golden_head(m: &Measured, pin: &ItemPin) -> Option<BaselineField> {
+            if !m.admitted && matches!(pin.kind, ItemKind::GoldenTrace) {
+                Some(BaselineField::GoldenHead)
+            } else {
+                None
+            }
+        }
+        #[inline]
+        const fn class_tpz(m: &Measured, pin: &ItemPin) -> Option<BaselineField> {
+            let (b, p) = (&m.baseline, &pin.baseline);
+            if b.ticks != p.ticks {
+                Some(BaselineField::Ticks)
+            } else if b.presented != p.presented {
+                Some(BaselineField::Presented)
+            } else if b.wasted != p.wasted {
+                Some(BaselineField::Wasted)
+            } else {
+                None
+            }
+        }
+        #[inline]
+        const fn class_digests(m: &Measured, pin: &ItemPin) -> Option<BaselineField> {
+            let (b, p) = (&m.baseline, &pin.baseline);
+            let lane_same = match (b.lane, p.lane) {
+                (Some(x), Some(y)) => x == y,
+                (None, None) => true,
+                _ => false,
+            };
+            if !lane_same {
+                return Some(BaselineField::LaneDigest);
+            }
+            let mut i = 0;
+            while i < 32 {
+                if b.chain.0[i] != p.chain.0[i] {
+                    return Some(BaselineField::Chain);
+                }
+                i += 1;
+            }
+            None
+        }
         let items = &self.terms.items;
-        for (k, pin) in items.iter().enumerate() {
+        let mut k = 0;
+        while k < items.len() {
+            let pin = &items[k];
             match measured.get(k) {
                 Some(m) if m.id == pin.id => {}
-                _ => return Err(drift(pin.id, BaselineField::Row)),
+                _ => return Err(baseline_drift(pin.id, BaselineField::Row)),
             }
+            k += 1;
         }
         if let Some(extra) = measured.get(items.len()) {
-            return Err(drift(&extra.id, BaselineField::Row));
+            return Err(baseline_drift(&extra.id, BaselineField::Row));
         }
-        let classes: [fn(&Measured, &ItemPin) -> Option<BaselineField>; 4] = [
-            |m, pin| {
-                if !m.admitted && pin.kind != ItemKind::GoldenTrace {
-                    Some(BaselineField::Admitted)
-                } else {
-                    None
+        let classes: [fn(&Measured, &ItemPin) -> Option<BaselineField>; 4] =
+            [class_admitted, class_golden_head, class_tpz, class_digests];
+        let mut ci = 0;
+        while ci < classes.len() {
+            let class = classes[ci];
+            let len = items.len().min(measured.len());
+            let mut k = 0;
+            while k < len {
+                let pin = &items[k];
+                if let Some(field) = class(&measured[k], pin) {
+                    return Err(baseline_drift(pin.id, field));
                 }
-            },
-            |m, pin| {
-                if !m.admitted && pin.kind == ItemKind::GoldenTrace {
-                    Some(BaselineField::GoldenHead)
-                } else {
-                    None
-                }
-            },
-            |m, pin| {
-                let (b, p) = (&m.baseline, &pin.baseline);
-                if b.ticks != p.ticks {
-                    Some(BaselineField::Ticks)
-                } else if b.presented != p.presented {
-                    Some(BaselineField::Presented)
-                } else if b.wasted != p.wasted {
-                    Some(BaselineField::Wasted)
-                } else {
-                    None
-                }
-            },
-            |m, pin| {
-                let (b, p) = (&m.baseline, &pin.baseline);
-                if b.lane != p.lane {
-                    Some(BaselineField::LaneDigest)
-                } else if b.chain != p.chain {
-                    Some(BaselineField::Chain)
-                } else {
-                    None
-                }
-            },
-        ];
-        for class in classes {
-            for (pin, m) in items.iter().zip(measured) {
-                if let Some(field) = class(m, pin) {
-                    return Err(drift(pin.id, field));
-                }
+                k += 1;
             }
+            ci += 1;
         }
         Ok(())
     }
 
+    #[inline]
     fn refused_item(&self) -> String {
-        for i in &self.terms.items {
+        let mut ii = 0;
+        while ii < self.terms.items.len() {
+            let i = &self.terms.items[ii];
             let refused = match i.kind {
                 ItemKind::Generated { seed, .. } => scenario(seed).is_err(),
                 ItemKind::M3Story => s0().validate().is_err(),
@@ -1151,6 +1256,7 @@ impl AcceptancePolicy {
             if refused {
                 return i.id.to_owned();
             }
+            ii += 1;
         }
         CORPUS_FOLD.to_owned()
     }
@@ -1349,9 +1455,13 @@ impl AcceptancePolicy {
 }
 
 /// The shipped baseline on every item of `facts`.
+#[inline]
+#[must_use]
 pub(super) fn measure(facts: &[ItemFacts<'_>], origin: Instant) -> Vec<Measured> {
     let mut out = Vec::with_capacity(facts.len());
-    for f in facts {
+    let mut fi = 0;
+    while fi < facts.len() {
+        let f = &facts[fi];
         let (baseline, admitted) = match f.body {
             Body::Lane(s) => measure_lane(s, origin),
             Body::Trace(bytes) => measure_trace(bytes, origin),
@@ -1361,6 +1471,7 @@ pub(super) fn measure(facts: &[ItemFacts<'_>], origin: Instant) -> Vec<Measured>
             baseline,
             admitted,
         });
+        fi += 1;
     }
     out
 }
@@ -1373,6 +1484,7 @@ const UNMEASURED: Baseline = Baseline {
     chain: Digest([0; 32]),
 };
 
+#[inline]
 fn measure_lane(s: &Scenario, origin: Instant) -> (Baseline, bool) {
     let mut h = MomentumHost::default();
     h.attach_sched(
@@ -1395,7 +1507,7 @@ fn measure_lane(s: &Scenario, origin: Instant) -> (Baseline, bool) {
     let Ok(start) = checkpoint.restore(b.schema(), b.identity()) else {
         return (UNMEASURED, false);
     };
-    let replayed = replay(
+    let (replayed, verdict) = NoStrandedLight::new().replay_judged(
         b.schema(),
         &b.pair().code,
         start,
@@ -1406,7 +1518,6 @@ fn measure_lane(s: &Scenario, origin: Instant) -> (Baseline, bool) {
     let reproduced = replayed.refused.is_none()
         && replayed.observation_chain == hd.live_chain()
         && replayed.state_digest == state_digest(b.schema(), hd.state());
-    let verdict = NoStrandedLight::new().judge(b.schema(), log.inputs(), &replayed);
     let c = r.counts();
     let baseline = Baseline {
         ticks: c.ticks,
@@ -1423,6 +1534,7 @@ fn measure_lane(s: &Scenario, origin: Instant) -> (Baseline, bool) {
     (baseline, admitted)
 }
 
+#[inline]
 fn measure_trace(bytes: &[u8], origin: Instant) -> (Baseline, bool) {
     let Ok(trace) = MomentumTrace::decode(bytes) else {
         return (UNMEASURED, false);
@@ -1445,10 +1557,13 @@ fn measure_trace(bytes: &[u8], origin: Instant) -> (Baseline, bool) {
     );
     let verdict = NoStrandedLight::new().judge(&read.schema, read.log.inputs(), &replayed);
     let (mut ticks, mut presented) = (0u64, 0u64);
-    let mut glass = Enc::new();
+    let mut glass = Enc::with_capacity(512);
     encode_glass(&mut glass, &MomentumGlowFrame::default(), &[], &[]);
-    let mut drawn = Enc::new();
-    for (_, o) in &replayed.observations {
+    let mut drawn = Enc::with_capacity(512);
+    let obs_list = &replayed.observations;
+    let mut oi = 0;
+    while oi < obs_list.len() {
+        let o = &obs_list[oi].1;
         if let MomentumObservation::Frame { .. } = o {
             ticks += 1;
             drawn.clear();
@@ -1458,6 +1573,7 @@ fn measure_trace(bytes: &[u8], origin: Instant) -> (Baseline, bool) {
                 core::mem::swap(&mut glass, &mut drawn);
             }
         }
+        oi += 1;
     }
     let baseline = Baseline {
         ticks,

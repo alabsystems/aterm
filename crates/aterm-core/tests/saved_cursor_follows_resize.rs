@@ -199,6 +199,20 @@ fn a_saved_column_past_the_lines_content_keeps_its_distance() {
                 term.process(restore);
                 let at = format!("{cols} columns, alternate={alternate} tiered={tiered} {path:?}");
                 assert_eq!(screen(&term)[0], "$ ls", "{at}");
+                if alternate && cols <= 30 {
+                    // `?1049h` saved the slot where the main screen's cursor stays, and a rewrap
+                    // carries that cursor's cell into its line: past a narrower row it opens a
+                    // continuation row, and the slot keeps its distance on it.
+                    assert_eq!(
+                        screen(&term)[1..3],
+                        [
+                            "abc".to_string(),
+                            format!("{}X", " ".repeat(30 - usize::from(cols)))
+                        ],
+                        "{at}"
+                    );
+                    continue;
+                }
                 assert_eq!(
                     screen(&term)[1],
                     format!("abc{}X", " ".repeat(expected - 3)),

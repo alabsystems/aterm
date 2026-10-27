@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Persistent session log journal writer ([`gate`], [`Lane::new`], [`aterm_slog::Notify`],
-//! [`COALESCE`], [`BATCH_RECORDS`], [`TRANSIENT_TO_BACKOFF`], [`FREE_FLOOR`], [`QUIT_BUDGET`]).
+//! [`COALESCE`], [`BATCH_RECORDS`], [`TRANSIENT_TO_BACKOFF`], [`FREE_FLOOR`], [`QUIT_BUDGET`],
+//! [`quit_budget`]).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -69,8 +70,12 @@ pub(crate) const DROPPED_MAX: usize = 1 << 16;
 pub(crate) const TRANSIENT_TO_BACKOFF: u32 = 3;
 /// A volume with less free than this pauses the journal before ENOSPC.
 pub(crate) const FREE_FLOOR: u64 = 1 << 30;
-/// What a clean quit may spend on the journal's last lines.
+/// What a clean quit may spend on the journal's last lines: a slow or stuck volume never holds
+/// the quit, and a quit whose lines missed it reads as a crash to a later process's reader.
 pub(crate) const QUIT_BUDGET: Duration = Duration::from_millis(500);
+/// The dev seam that sets [`quit_budget`] in milliseconds: a live test lifts it to its hang
+/// detector, so a loaded machine's clock never decides whether its clean quit reads as one.
+pub(crate) const QUIT_BUDGET_SEAM: &str = "ATERM_DEBUG_JOURNAL_QUIT_BUDGET_MS";
 const EINTR_RETRIES: u32 = 3;
 /// The most passes a quit's drain runs, beside its deadline.
 pub(crate) const FINISH_PASSES: usize = 64;
@@ -78,6 +83,20 @@ const EEXIST_RETRIES: u32 = 16;
 const IO_ERRORS_TO_STOP: u32 = 3;
 /// How often a running journal looks at the volume's free space.
 const FREE_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+/// This process's quit budget: [`QUIT_BUDGET`], or the milliseconds a dev build's
+/// [`QUIT_BUDGET_SEAM`] names ([`quit_budget_of`]).
+pub(crate) fn quit_budget() -> Duration {
+    quit_budget_of(aterm_types::dev_seam!(QUIT_BUDGET_SEAM).as_deref())
+}
+
+/// The quit budget a [`QUIT_BUDGET_SEAM`] value names: its whole milliseconds above zero, and
+/// [`QUIT_BUDGET`] for no value or any other.
+pub(crate) fn quit_budget_of(seam: Option<&std::ffi::OsStr>) -> Duration {
+    seam.and_then(|v| v.to_str()?.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map_or(QUIT_BUDGET, Duration::from_millis)
+}
 
 /// Why a requested journal cannot run on the launch's configuration and desk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +249,8 @@ pub(crate) struct Report {
     pub(crate) err_io: AtomicU64,
     pub(crate) err_denied: AtomicU64,
     pub(crate) err_transient: AtomicU64,
+    /// Flushes (a segment's, the directory's) that failed other than as refused.
+    pub(crate) err_flush: AtomicU64,
     pub(crate) dropped: AtomicU64,
     /// Conservative retirement handoff overflow.
     pub(crate) forgotten: AtomicU64,
@@ -975,6 +996,9 @@ struct LineMark {
     done: bool,
     handed: bool,
     fence: Option<u64>,
+    /// The take's hold on its log's journal mark ([`aterm_slog::Log::take_journaled`]): given
+    /// back if these lines do not land. `None` for a dropped session's loss (no log).
+    held: Option<aterm_slog::Journaled>,
 }
 
 /// The writer: one per process, on the `aterm-session-log` thread.
@@ -1103,10 +1127,17 @@ impl<T: Targets> Writer<T> {
         self.report.say(Attention::Stopped(cause));
     }
 
+    /// Pause the writer, doubling the pause it was already in. A full volume's pause also drops
+    /// the last free-space reading, so the first pass out reads the volume again before it
+    /// writes ([`Self::room`]): only a check that finds room ends it, never a write that the
+    /// minute's cached reading let through under [`FREE_FLOOR`] (C7, ROBUST-1).
     fn backoff(&mut self, cause: Cause) {
         let delay = self
             .delay
             .map_or(BACKOFF_FIRST, |d| (d * 2).min(BACKOFF_MAX));
+        if matches!(cause, Cause::Full) {
+            self.last_free_check = None;
+        }
         self.delay = Some(delay);
         self.state = State::Backoff {
             until: self.clock.mono() + delay,
@@ -1293,7 +1324,7 @@ impl<T: Targets> Writer<T> {
     /// restate itself, then retention.
     fn rotate(&mut self) -> bool {
         if let Some(mut old) = self.seg.take() {
-            let _ = old.file.sync();
+            self.segment_flushed(old.file.sync());
         }
         if !self.room() {
             return false;
@@ -1340,13 +1371,16 @@ impl<T: Targets> Writer<T> {
         for t in self.tracks.values_mut() {
             t.snapped = None;
         }
-        let _ = self.fs.sync_dir();
+        // Best effort, counted and logged ([`Self::flush_failed`]): the new segment's name.
+        self.dir_flushed();
         self.retention();
         true
     }
 
-    /// Whether the volume has room: checked at each rotation and once a
-    /// minute; under [`FREE_FLOOR`] the journal pauses before ENOSPC.
+    /// Whether the volume has room: checked at each rotation, once a
+    /// minute, and on the first pass out of a full volume's pause ([`Self::backoff`]);
+    /// under [`FREE_FLOOR`] the journal pauses before ENOSPC, and the pause doubles while
+    /// the volume stays under it.
     fn room(&mut self) -> bool {
         let now = self.clock.mono();
         if self
@@ -1461,6 +1495,7 @@ impl<T: Targets> Writer<T> {
                         done: true,
                         handed: false,
                         fence: None,
+                        held: None,
                     });
                 }
                 continue;
@@ -1493,10 +1528,12 @@ impl<T: Targets> Writer<T> {
             let cursor = *t.cursor.get_or_insert(start.unwrap_or(0));
             let snap = t.snapped != Some(n) || t.space.is_some_and(|s| s != space);
             let take = journal::take(log, cursor, self.limits.batch, snap);
-            guard
+            // Under the take's own hold: what it took is spent first from now, and a write that
+            // does not land gives it back ([`Self::write`]).
+            let held = guard
                 .slog_mut()
                 .log_mut_for_journal()
-                .note_journaled(take.next);
+                .take_journaled(cursor, take.next);
             drop(guard);
             t.fence = take.fence;
             let mut frames = journal::take_frames(t.sid, &take, snap, wall);
@@ -1531,14 +1568,17 @@ impl<T: Targets> Writer<T> {
                 done: take.done,
                 handed,
                 fence: take.fence,
+                held: Some(held),
             });
         }
         (buf, marks)
     }
 
     /// Write `buf` in one `write(2)` (EINTR retried): every mark whose lines
-    /// are wholly on disk moves its track's cursor; after a short or failed
-    /// write the segment is abandoned, never repaired.
+    /// are wholly on disk moves its track's cursor, and every other gives its take back to its
+    /// log's journal mark ([`aterm_slog::Journaled::unwritten`]: no lock, so a busy timeline
+    /// never keeps unwritten records spent first through a backoff, audit fix C7); after a short
+    /// or failed write the segment is abandoned, never repaired.
     fn write(&mut self, buf: &[u8], marks: &[LineMark]) -> usize {
         if buf.is_empty() {
             return 0;
@@ -1574,6 +1614,13 @@ impl<T: Targets> Writer<T> {
                 t.handed = m.handed;
                 t.fence = m.fence;
             }
+        }
+        for held in marks
+            .iter()
+            .filter(|m| m.end > wrote)
+            .filter_map(|m| m.held.as_ref())
+        {
+            held.unwritten();
         }
         let lines = buf[..wrote.min(buf.len())]
             .iter()
@@ -1690,8 +1737,8 @@ impl<T: Targets> Writer<T> {
         }) {
             line.push('\n');
             if self.write(line.as_bytes(), &[]) == line.len() {
-                if let Some(seg) = self.seg.as_mut() {
-                    let _ = seg.file.sync();
+                if let Some(synced) = self.seg.as_mut().map(|seg| seg.file.sync()) {
+                    self.segment_flushed(synced);
                 }
                 self.handed_done = true;
             }
@@ -1738,13 +1785,43 @@ impl<T: Targets> Writer<T> {
         if self.write(&buf, &[]) != buf.len() {
             return;
         }
-        if let Some(seg) = self.seg.as_mut() {
-            let _ = seg.file.sync();
+        if let Some(synced) = self.seg.as_mut().map(|seg| seg.file.sync()) {
+            self.segment_flushed(synced);
         }
         if let Some(held) = self.lock.take() {
             self.fs.unlock_instance(&self.inst, held);
         }
-        let _ = self.fs.sync_dir();
+        // Best effort, counted and logged ([`Self::flush_failed`]): the quit's lock gone.
+        self.dir_flushed();
+    }
+
+    /// The directory's entries flushed after a change to them (a new segment, the quit's
+    /// lock gone, retention's removals). Best effort, as every flush the journal makes is:
+    /// see [`Self::flush_failed`].
+    fn dir_flushed(&self) {
+        if let Err(error) = aterm_durable::DirFlushed::classify(self.fs.sync_dir()) {
+            self.flush_failed("directory", &error);
+        }
+    }
+
+    /// A segment's lines flushed (at a rotation, a handoff's end, the quit). Best effort:
+    /// see [`Self::flush_failed`].
+    fn segment_flushed(&self, synced: io::Result<()>) {
+        if let Err(error) = aterm_durable::refusal_accepted(synced) {
+            self.flush_failed("segment", &error);
+        }
+    }
+
+    /// Counted (`err_flush`) and logged, never acted on: the journal's flushes are best
+    /// effort (its lines are ordered only at a rotation, a handoff and the quit, and a
+    /// reader derives a crash's closes from what landed). A refused flush adds no error;
+    /// a failed flush reports the writes at risk at that point while journaling continues.
+    fn flush_failed(&self, what: &str, error: &io::Error) {
+        Report::bump(&self.report.err_flush, 1);
+        aterm_log::warn!(
+            "session journal: flushing its {what} failed, so its newest lines may not survive \
+             a power loss: {error}"
+        );
     }
 
     /// The quit's closes, only while every session is wholly journaled: each
@@ -1872,7 +1949,8 @@ impl<T: Targets> Writer<T> {
             }
             let _ = self.remove_dead_lock(name);
         }
-        let _ = self.fs.sync_dir();
+        // Best effort, counted and logged ([`Self::flush_failed`]): what retention removed.
+        self.dir_flushed();
     }
 
     /// Remove a dead instance's lock file `name`, if it is a private file.

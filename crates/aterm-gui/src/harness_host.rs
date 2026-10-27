@@ -14,6 +14,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::accounts;
+
+mod progress;
+use aterm_agent::harness::accounts_pool;
 use aterm_agent::harness::accounts_sync::UpkeepStep;
 use aterm_agent::harness::laps;
 use aterm_agent::harness::login_latch::{self, LoginLatches};
@@ -142,8 +145,8 @@ pub(crate) struct Switches {
     ask: AtomicBool,
     /// A seamless update's park holds the terminal ([`HostHandle::pause_restored`] until [`HostHandle::resume_restored`]).
     parked: AtomicBool,
-    /// `[harness] accounts` as a rank ([`ACCOUNTS_OFF`], [`ACCOUNTS_WALL`], [`ACCOUNTS_EARLY`]).
-    accounts: AtomicU8,
+    /// Rotation mode and login repair published together ([`AccountControls`]).
+    account_controls: AtomicU8,
     /// The host says nothing of the accounts as a whole.
     mute: AtomicBool,
     /// `[harness] limit_reset` as the window last parsed it, and `false` with `[harness] enabled = false`.
@@ -152,8 +155,6 @@ pub(crate) struct Switches {
     usage_tap: AtomicBool,
     /// `[harness] usage_notes`, `false` where Claude Code is not supervised here (as for the other account switches).
     usage_notes: AtomicBool,
-    /// `[harness] logins`, `false` where the policy supervises nothing here or Claude Code is switched off (as for [`Self::accounts`]).
-    logins: AtomicBool,
     /// News of the accounts, counted ([`HostHandle::note_accounts`]: the store's wake marker was
     /// replaced; [`activation_loop`]: the roster's file reads otherwise than at its last look).
     accounts_news: AtomicU64,
@@ -176,6 +177,69 @@ const fn autopilot_rank(mode: Autopilot) -> u8 {
 const ACCOUNTS_OFF: u8 = 0;
 const ACCOUNTS_WALL: u8 = 1;
 const ACCOUNTS_EARLY: u8 = 2;
+const ACCOUNTS_MODE: u8 = 3;
+const LOGINS_ON: u8 = 4;
+
+/// One coherent observation of the controls used to select an account move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccountControls {
+    mode: accounts::Mode,
+    logins: bool,
+}
+
+impl AccountControls {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountControls",
+            action = "ModeBefore",
+            reason = "Enumerate the selected rotation mode."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountControls",
+            action = "ModeAfter",
+            reason = "Enumerate the current rotation mode."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountControls",
+            action = "LoginsBefore",
+            reason = "Enumerate the selected login repair switch."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountControls",
+            action = "LoginsAfter",
+            reason = "Enumerate the current login repair switch."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountControls",
+            action = "Choose",
+            reason = "Finish selecting the controls fixture."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountControls",
+            action = "Observe",
+            project = "harness_host::tests::account_controls::controls_transition"
+        )
+    )]
+    fn is_current(self, switches: &Switches) -> bool {
+        self == switches.account_controls()
+    }
+}
 
 impl Switches {
     #[cfg(any(unix, test))]
@@ -209,7 +273,15 @@ impl Switches {
             accounts::Mode::Wall => ACCOUNTS_WALL,
             accounts::Mode::Early => ACCOUNTS_EARLY,
         };
-        self.accounts.store(accounts, Ordering::SeqCst);
+        self.account_controls.store(
+            accounts
+                | if accounts_on && cfg.logins {
+                    LOGINS_ON
+                } else {
+                    0
+                },
+            Ordering::SeqCst,
+        );
         self.mute.store(
             cfg.enabled && !would_supervise(cfg, headless),
             Ordering::SeqCst,
@@ -223,8 +295,6 @@ impl Switches {
             .store(accounts_on && cfg.usage_notes, Ordering::SeqCst);
         self.autopilot
             .store(autopilot_rank(cfg.autopilot), Ordering::SeqCst);
-        self.logins
-            .store(accounts_on && cfg.logins, Ordering::SeqCst);
     }
 
     /// `[harness] usage_notes`, read live ([`Self::usage_notes`]).
@@ -241,14 +311,15 @@ impl Switches {
         }
     }
 
-    /// `[harness] logins`, read live ([`Self::logins`]).
+    /// `[harness] logins`, read live with the rotation mode.
     fn logins(&self) -> bool {
-        self.logins.load(Ordering::SeqCst)
+        self.account_controls().logins
     }
 
     /// Whether anything of the accounts acts here.
     fn accounts_live(&self) -> bool {
-        self.accounts() != accounts::Mode::Off || self.logins()
+        let controls = self.account_controls();
+        controls.mode != accounts::Mode::Off || controls.logins
     }
 
     /// `[harness] limit_reset`, read live ([`Self::limit_reset`]).
@@ -256,12 +327,20 @@ impl Switches {
         self.limit_reset.load(Ordering::SeqCst)
     }
 
-    /// `[harness] accounts`, read live ([`Self::accounts`]).
+    /// `[harness] accounts`, read live with the login repair switch.
     fn accounts(&self) -> accounts::Mode {
-        match self.accounts.load(Ordering::SeqCst) {
-            ACCOUNTS_EARLY => accounts::Mode::Early,
-            ACCOUNTS_WALL => accounts::Mode::Wall,
-            _ => accounts::Mode::Off,
+        self.account_controls().mode
+    }
+
+    fn account_controls(&self) -> AccountControls {
+        let bits = self.account_controls.load(Ordering::SeqCst);
+        AccountControls {
+            mode: match bits & ACCOUNTS_MODE {
+                ACCOUNTS_EARLY => accounts::Mode::Early,
+                ACCOUNTS_WALL => accounts::Mode::Wall,
+                _ => accounts::Mode::Off,
+            },
+            logins: bits & LOGINS_ON != 0,
         }
     }
 
@@ -1148,14 +1227,18 @@ impl ExitWatched {
 /// What the host keeps of a session's account across its workers.
 #[derive(Default)]
 struct AccountKept {
+    progress: Option<progress::BoundProgress>,
     advised: Option<Advised>,
+    /// The newest calculation owns publication; queued advice remains usable until replaced.
+    advice_id: Arc<()>,
     held: Option<&'static str>,
     stay: Option<&'static str>,
-    unmade: Option<String>,
     moved: Option<Moved>,
     lost: Option<LostSeen>,
     came_back: Option<Option<String>>,
     flying: Option<Flying>,
+    /// Serializes delayed completion without holding `Kept` across process or store I/O.
+    landing: Arc<Mutex<()>>,
     settled: Option<(u32, String, String, bool)>,
     wall_again: u8,
     lagged: u8,
@@ -1169,6 +1252,10 @@ struct Probing {
     label: String,
     pid: u32,
     start: String,
+    row: accounts::Row,
+    who: accounts::ProcessLogin,
+    roster: PathBuf,
+    state: PathBuf,
 }
 
 use aterm_agent::supervise::ProbeNo as NoProbe;
@@ -1476,34 +1563,451 @@ enum Flushed {
 struct Advised {
     to: String,
     point: AccountPoint,
+    request: AdviceRequest,
+}
+
+/// One advice invocation, registered before it performs preflight or account I/O.
+#[derive(Clone, Debug)]
+struct AdviceTurn {
+    id: Arc<()>,
+    generation: Arc<Mutex<()>>,
+}
+
+impl PartialEq for AdviceTurn {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.id, &other.id) && Arc::ptr_eq(&self.generation, &other.generation)
+    }
+}
+
+impl Eq for AdviceTurn {}
+
+/// The process captured after the invocation's landing preflight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdviceRequest {
+    turn: AdviceTurn,
+    snap: Option<Snapshot>,
+}
+
+impl AdviceTurn {
+    fn begin(kept: &Mutex<Kept>) -> Self {
+        with_kept_of(kept, |k| {
+            let id = Arc::new(());
+            k.account.advice_id = Arc::clone(&id);
+            Self {
+                id,
+                generation: Arc::clone(&k.account.landing),
+            }
+        })
+    }
+
+    fn owns_publication(&self, k: &Kept) -> bool {
+        Arc::ptr_eq(&self.id, &k.account.advice_id)
+            && Arc::ptr_eq(&self.generation, &k.account.landing)
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountAdviceQueue",
+            action = "Apply",
+            project = "harness_host::tests::account_advice::queue_transition"
+        )
+    )]
+    fn capture(self, kept: &Mutex<Kept>) -> Option<AdviceRequest> {
+        with_kept_of(kept, |k| {
+            self.owns_publication(k).then(|| AdviceRequest {
+                turn: self,
+                snap: k.snapshot.clone(),
+            })
+        })
+    }
+}
+
+impl AdviceRequest {
+    #[cfg(test)]
+    fn publish(
+        self,
+        kept: &Mutex<Kept>,
+        advice: Option<AccountAdvice>,
+        point: AccountPoint,
+    ) -> Option<AccountAdvice> {
+        self.publish_progress(kept, advice, point, None)
+    }
+
+    fn matches_context(&self, k: &Kept) -> bool {
+        Arc::ptr_eq(&self.turn.generation, &k.account.landing)
+            && match (&self.snap, &k.snapshot) {
+                (Some(observed), Some(current)) => account_process_matches(observed, current),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountAdviceQueue",
+            action = "AnotherCase",
+            reason = "Model bookkeeping: select advice ordering and process changes"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountAdviceQueue",
+            action = "Choose",
+            reason = "Model bookkeeping: stage the selected advice queue scenario"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountAdviceQueue",
+            action = "Apply",
+            project = "harness_host::tests::account_advice::queue_transition"
+        )
+    )]
+    fn publish_progress(
+        self,
+        kept: &Mutex<Kept>,
+        advice: Option<AccountAdvice>,
+        point: AccountPoint,
+        progress: Option<progress::BoundProgress>,
+    ) -> Option<AccountAdvice> {
+        with_kept_of(kept, |k| {
+            if !self.turn.owns_publication(k) || !self.matches_context(k) {
+                return None;
+            }
+            if k.account.flying.is_some()
+                && matches!(
+                    advice.as_ref().and_then(AccountAdvice::past_probe),
+                    Some(AccountAdvice::Move { .. })
+                )
+            {
+                return None;
+            }
+            let advice = advice.filter(|_| self.snap.is_some());
+            k.account.progress = progress;
+            k.account.advised = match advice.as_ref().and_then(AccountAdvice::past_probe) {
+                Some(AccountAdvice::Move { to }) => Some(Advised {
+                    to: to.clone(),
+                    point,
+                    request: self,
+                }),
+                _ => None,
+            };
+            advice
+        })
+    }
+}
+
+/// Peek without consuming: an unrelated request must not erase a valid queued choice.
+fn advised_for(k: &Kept, to: &str, at_wall: bool) -> Option<Advised> {
+    k.account
+        .advised
+        .as_ref()
+        .filter(|a| a.to == to && a.point.at_wall() == at_wall && a.request.matches_context(k))
+        .cloned()
+}
+
+/// Claim the exact queued advice after acquiring its landing gate.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountAdviceQueue",
+        action = "Apply",
+        project = "harness_host::tests::account_advice::queue_transition"
+    )
+)]
+fn take_advised(kept: &Mutex<Kept>, observed: &Advised) -> Option<Advised> {
+    with_kept_of(kept, |k| {
+        if k.account.flying.is_some()
+            || k.account.advised.as_ref() != Some(observed)
+            || !observed.request.matches_context(k)
+        {
+            return None;
+        }
+        let advice = k.account.advised.take();
+        // A calculation that began before this claim cannot requeue the consumed decision.
+        k.account.advice_id = Arc::new(());
+        advice
+    })
 }
 
 /// [`AccountKept::moved`]: an account move made, verified, and not yet served.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Moved {
+    id: MoveId,
+    origin: AccountContext,
     to: String,
     login: Option<String>,
-    pid: u32,
-    start: String,
+    process: Snapshot,
     answered: bool,
     untold: bool,
 }
 
+/// Match the captured launch and authentication context, allowing live record metadata to advance.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountProcessContext",
+        action = "Compare",
+        project = "harness_host::tests::account_context_identity::context_transition"
+    )
+)]
+fn account_process_matches(left: &Snapshot, right: &Snapshot) -> bool {
+    left.same_auth_context(right)
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountProcessContext",
+        action = "AnotherField",
+        reason = "Model bookkeeping: select the snapshot field the two contexts differ in"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountProcessContext",
+        action = "Choose",
+        reason = "Model bookkeeping: fix the field before the native Compare"
+    )
+)]
+/// The `AccountProcessContext` model's case selection, staged by `context_transition` before the
+/// native `Compare` (`account_process_matches`).
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn account_process_context_cases() {}
+
+/// A completed move's identity, retained by observations until they finish.
+#[derive(Clone, Debug, Default)]
+struct MoveId(Arc<()>);
+
+impl PartialEq for MoveId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for MoveId {}
+
+/// The move observed before reading a response or making its durable record.
+struct MoveObservation {
+    generation: Arc<Mutex<()>>,
+    moved: Moved,
+}
+
+#[derive(Clone, Copy)]
+enum MoveReply {
+    Served,
+    Failed,
+}
+
+impl MoveObservation {
+    fn capture(kept: &Mutex<Kept>) -> Option<Self> {
+        with_kept_of(kept, |k| {
+            Some(Self {
+                generation: Arc::clone(&k.account.landing),
+                moved: k.account.moved.clone()?,
+            })
+        })
+    }
+
+    /// Publish only to the observed move; notices and snapshot enrichment may advance.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountResponse",
+            action = "Publish",
+            project = "harness_host::tests::account_response::response_transition"
+        )
+    )]
+    fn publish(
+        self,
+        kept: &Mutex<Kept>,
+        seat: &AccountSeat,
+        snap: &Snapshot,
+        reply: MoveReply,
+    ) -> bool {
+        let observed = self.moved;
+        if !observed.origin.matches(seat) || !account_process_matches(&observed.process, snap) {
+            return false;
+        }
+        with_kept_of(kept, |k| {
+            if !Arc::ptr_eq(&self.generation, &k.account.landing)
+                || k.account.flying.is_some()
+                || !k
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|now| account_process_matches(now, snap))
+                || !k.account.moved.as_ref().is_some_and(|now| {
+                    now.id == observed.id
+                        && now.origin == observed.origin
+                        && now.to == observed.to
+                        && now.login == observed.login
+                        && now.process == observed.process
+                })
+            {
+                return false;
+            }
+            match reply {
+                MoveReply::Served => k.account.moved = None,
+                MoveReply::Failed => {
+                    if let Some(moved) = k.account.moved.as_mut() {
+                        moved.answered = true;
+                    }
+                }
+            }
+            true
+        })
+    }
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "Absent",
+        reason = "Environment: the captured move is gone before its reply publishes; the conformance fixture stages it before the native Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "StaleEntry",
+        reason = "Environment: the entry the reply names goes stale; the conformance fixture stages it before the native Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "Serve",
+        reason = "Environment: the move's reply arrives served; the conformance fixture stages it before the native Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "Fail",
+        reason = "Environment: the move's reply arrives failed; the conformance fixture stages it before the native Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "NewGeneration",
+        reason = "Environment: a new account generation lands before publication; the conformance fixture stages it before the native Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "NewReceipt",
+        reason = "Environment: a new receipt replaces the captured one; the conformance fixture stages it before the native Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "NewProcess",
+        reason = "Environment: another local process takes the session; the conformance fixture stages it before the native Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "OtherOrigin",
+        reason = "Environment: the move came from another origin; the conformance fixture stages it before the native Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "StartMove",
+        reason = "Environment: another move starts while the reply waits; the conformance fixture stages it before the native Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "Notice",
+        reason = "Environment: a notice lands meanwhile; the conformance fixture stages it before the native Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "Enrich",
+        reason = "Environment: the snapshot is enriched meanwhile; the conformance fixture stages it before the native Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "Commit",
+        reason = "Environment: the durable observation commits; the conformance fixture stages it before the native Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountResponse",
+        action = "Refuse",
+        reason = "Environment: the durable observation is refused; the conformance fixture stages it before the native Publish"
+    )
+)]
+/// The `AccountResponse` model's environment, staged by `response_transition` before the native
+/// `Publish` (`MoveObservation::publish`).
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn account_response_environment() {}
+
 /// [`AccountKept::flying`]: an account move the rotation was committed for and whose relaunch has not been seen to land.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Flying {
+    origin: AccountContext,
     to: String,
     at: AccountAt,
     login: Option<String>,
     pid: u32,
     start: String,
+    /// A definitive restart refusal, retained until its rollback is durably recorded.
+    rejected: Option<RejectedMove>,
+}
+
+/// The known result of a restart that did not apply its requested account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RejectedMove {
+    on: String,
+    why: accounts::Strike,
+    canary: Option<accounts::Canary>,
+    session: Option<accounts::SessionRow>,
+    held: Option<&'static str>,
 }
 
 /// [`AccountKept::lost`]: when this host first met one process's lost login.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LostSeen {
-    pid: u32,
-    start: String,
+    process: Snapshot,
     at: i64,
 }
 
@@ -1753,6 +2257,9 @@ type RestartedFn =
 type CarryFn = dyn Fn(&str, u32, aterm_agent::harness::upgrade::Agent, Option<u32>, bool) -> String
     + Send
     + Sync;
+/// How long a person's keys hold that restart's line, under tab `sid`'s grace ([`Acts::line_grace`]).
+type LineGraceFn =
+    dyn Fn(&str, u32, aterm_agent::harness::upgrade::Agent, Option<u32>) -> u32 + Send + Sync;
 /// The relaunch of an agent whose tab a crash of aterm took.
 type RestoredFn = dyn Fn(&str, &Snapshot, bool, Option<&str>) -> String + Send + Sync;
 /// A cold restore reopened tab `sid` from the tab `was` its agent ran in ([`upgrade_drive::note_earlier_tab`]).
@@ -1782,7 +2289,8 @@ pub(crate) struct ViewNext {
     /// The records the look could not read that keep a live tab as it stands ([`upgrade_drive::View::unreadable`]).
     pub(crate) unreadable: Vec<PathBuf>,
 }
-type RestartFn = dyn Fn(&str, u32, &Restart) -> String + Send + Sync;
+type RestartFn =
+    dyn Fn(&str, u32, &Restart, Option<&relaunch::AccountRestart>) -> String + Send + Sync;
 /// The watch of one tab's upgrade records off any point ([`upgrade_drive::watch`]).
 type WatchFn = dyn Fn(&str, u32, &upgrade_drive::Watcher) -> upgrade_drive::Watched + Send + Sync;
 /// An agent's route to its API, read now from its pid, argv and directory ([`Acts::route`]).
@@ -1823,8 +2331,8 @@ type AccountUsageFn = dyn Fn(&str, &WalledAgent<'_>, &dyn Fn() -> bool, &UsageSe
 type AccountGoneFn = dyn Fn(&str) + Send + Sync;
 /// Where the accounts live for this host, and its clock ([`Acts::account_seat`]).
 type AccountSeatFn = dyn Fn() -> Option<AccountSeat> + Send + Sync;
-/// A process's exec environment, `KEY=value` entries ([`Acts::account_env`]).
-type AccountEnvFn = dyn Fn(u32) -> Option<Vec<String>> + Send + Sync;
+/// The captured process's verified exec environment, `KEY=value` entries ([`Acts::account_env`]).
+type AccountEnvFn = dyn Fn(&Snapshot) -> Option<Vec<String>> + Send + Sync;
 /// Whether an agent's settings files and the vendor's profile store leave it its stored login.
 type AccountSettingsFn = dyn Fn(u32, &[String], &str) -> bool + Send + Sync;
 /// [`Acts::tap_born`].
@@ -1944,6 +2452,14 @@ pub(crate) enum HostNote {
     ProgramCheckStuck { workers: u64, limit: Option<u64> },
     /// The program check is not stuck.
     ProgramCheckUnstuck,
+    /// What the services watch's judge told of macOS's own services after a reading: every
+    /// service it follows and whether each is told, the unread ones, and the memory strain
+    /// ([`crate::services_watch`]).
+    ServiceMemory {
+        told: aterm_vitals::services::Told,
+        /// Whether this account administers the Mac (`sudo` admits it); `None` where unread.
+        admin: Option<bool>,
+    },
     /// The disk watch looked ([`look_at_disk`], once a [`DISK_TICK`]).
     DiskLooked,
     /// No `[disk]` value turns removal off.
@@ -2009,6 +2525,10 @@ pub(crate) enum HostNote {
     AgentPublished { sid: String },
     /// The usage tap of the tab's Claude Code went silent or is heard again ([`WorkerIdle::usage_tap`]).
     UsageTap { sid: String, silent: bool },
+    /// What a tab's account progress shows may have moved: a judgment was published, a probe,
+    /// restart or move's end was taken, or a sign-in began or ended. The window reads every tab's
+    /// at once ([`crate::App::account_progress_noted`]).
+    AccountProgress,
 }
 
 /// What the host says of the accounts as a whole ([`HostNote::Accounts`]; the look is [`accounts_said`]).
@@ -2281,6 +2801,9 @@ pub(crate) struct Acts {
     pub(crate) restarted: Arc<RestartedFn>,
     /// One attempt at carrying that restart on ([`relaunch::carry_restart`]).
     pub(crate) carry: Arc<CarryFn>,
+    /// How long a person's keys hold that restart's relaunch line: its record's own grace
+    /// ([`relaunch::carry_line_grace`]).
+    pub(crate) line_grace: Arc<LineGraceFn>,
     /// The relaunch of a restored tab's agent after aterm itself ended ([`HostHandle::relaunch_restored`]).
     pub(crate) relaunch_restored: Arc<RestoredFn>,
     /// The tab a restored agent ran in, noted beside its reopened tab's ledger as the restore hands it over.
@@ -2324,7 +2847,7 @@ pub(crate) struct Acts {
     pub(crate) account_gone: Arc<AccountGoneFn>,
     /// Where the accounts live, and the time ([`AccountSeat`]).
     pub(crate) account_seat: Arc<AccountSeatFn>,
-    /// The agent's own exec environment by its pid (`KERN_PROCARGS2`).
+    /// The agent's exec environment while its kernel identity, command and login match the snapshot.
     pub(crate) account_env: Arc<AccountEnvFn>,
     /// Whether the agent's settings leave it its stored login.
     pub(crate) account_settings: Arc<AccountSettingsFn>,
@@ -2583,6 +3106,7 @@ fn worker_run(mut job: WorkerJob, hooks: &Hooks) -> WorkerExit {
         (hooks.waiting)(&job.sid, None);
         (hooks.fact)(&job.sid, crate::HarnessFact::Task(None));
         (hooks.fact)(&job.sid, crate::HarnessFact::Pause(None));
+        (hooks.fact)(&job.sid, crate::HarnessFact::Waiting(None));
         if (hooks.hold)(&job.sid, None) {
             (hooks.fact)(&job.sid, crate::HarnessFact::LandHeld);
         }
@@ -3231,6 +3755,7 @@ enum Told {
     Nothing = 0,
     Retry = 1,
     Pause = 2,
+    Outage = 3,
 }
 
 impl Told {
@@ -3239,6 +3764,7 @@ impl Told {
         match byte {
             1 => Told::Retry,
             2 => Told::Pause,
+            3 => Told::Outage,
             _ => Told::Nothing,
         }
     }
@@ -3256,26 +3782,110 @@ impl WorkerIdle {
         crate::program_check_watch::stuck(self.hooks.acts.program_check)
     }
 
-    /// Logs the host's account advice at `point` for a session of a pooled CLI other than Claude
-    /// Code, always a stay: a hosted Codex is a codex-alab the worker watches beside, which
-    /// answers its own walls (`stay other-supervisor`), and no other such CLI is hosted
-    /// ([`agent_of`]) or has a relaunch lane to write a move's line, so
-    /// [`aterm_agent::harness::accounts_pool::session_move`]'s advice is not taken here.
-    fn pool_said(&self, point: AccountPoint) {
+    /// The host's account advice for a pooled CLI other than Claude Code. The pool checks the
+    /// current roster, policy and login generations; only a move with a complete relaunch line
+    /// reaches the host's ordinary restart path.
+    fn pool_advice(&self, point: AccountPoint) -> Option<AccountAdvice> {
         let supervisor = if self.beside() {
             accounts::Supervisor::Own
         } else {
             accounts::Supervisor::Aterm
         };
-        let said = match session_pool(self.agent, supervisor) {
-            None => accounts::StayWhy::OtherSupervisor.as_str(),
-            Some(_) => "no-relaunch-lane",
+        let cli = session_pool(self.agent, supervisor)?;
+        self.pool_advice_for(cli, supervisor, point)
+    }
+
+    fn pool_advice_for(
+        &self,
+        cli: accounts::Cli,
+        supervisor: accounts::Supervisor,
+        point: AccountPoint,
+    ) -> Option<AccountAdvice> {
+        let seat = (self.hooks.acts.account_seat)()?;
+        let config_dir = seat.roster.as_deref()?.parent()?;
+        let pool_seat = accounts_pool::Seat {
+            config_dir,
+            state: &seat.state,
+            home: &seat.home,
+            now: seat.now,
         };
-        aterm_log::info!(
-            "harness @{}: account advice at {point:?} for {}: stay {said}",
-            self.sid,
-            self.agent.name()
+        let roster = pool_seat.bound_roster(cli).ok()?;
+        let (look, env) = self.pool_account_look(cli, &roster)?;
+        let seen = self.lost_seen(&look, point, seat.now)?;
+        let at = pool_point(&seat, cli, &look, point, seen);
+        let snap = look.snap;
+        let sample = match &snap.run {
+            relaunch::AgentRun::Codex(codex) => snap
+                .session
+                .as_deref()
+                .zip(process_started(&snap.start))
+                .and_then(|(thread, started)| {
+                    aterm_agent::ai::codex_limits::thread_sample(
+                        &codex.home,
+                        thread,
+                        started,
+                        seat.now,
+                    )
+                }),
+            _ => None,
+        };
+        let pairs = env
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .collect::<Vec<_>>();
+        let moved = accounts_pool::session_move(
+            &pool_seat,
+            &accounts_pool::Session {
+                cli,
+                sid: &self.sid,
+                supervisor,
+                env: &pairs,
+                sample,
+                point: at,
+                mode: self.switches.accounts(),
+                relaunch: relaunch::PoolRelaunch {
+                    dialect: snap.dialect.unwrap_or(upgrade::Dialect::Zsh),
+                    cd: Some(&snap.cwd),
+                    exe: &snap.program,
+                    flags: snap.argv.get(1..).unwrap_or_default(),
+                    resume: snap.session.as_deref(),
+                    home: pairs
+                        .iter()
+                        .find(|(name, _)| *name == "GROK_HOME")
+                        .map(|(_, value)| Path::new(value)),
+                },
+            },
         );
+        if let accounts::Advice::Move { to, .. } = &moved.advice {
+            if moved.line.is_some() {
+                aterm_log::info!("harness @{}: account advice: move to {to}", self.sid);
+                return Some(AccountAdvice::Move { to: to.clone() });
+            }
+            aterm_log::info!(
+                "harness @{}: account advice at {point:?} for {}: move to {to} has no relaunch line",
+                self.sid,
+                self.agent.name()
+            );
+            return None;
+        }
+        aterm_log::info!(
+            "harness @{}: account advice at {point:?} for {}: {}",
+            self.sid,
+            self.agent.name(),
+            moved.advice.as_str()
+        );
+        let (state, _) = pool_seat.store(cli).load(seat.now).ok()?;
+        let enrolled = accounts::enrolled_for(cli, &roster);
+        let opening = accounts::next_opening(&roster, &state, &enrolled, seat.now);
+        account_advice_of(
+            &moved.advice,
+            None,
+            &state,
+            opening,
+            point.at_wall(),
+            seat.now,
+            Instant::now(),
+        )
     }
 
     /// Whether the worker watches only ([`WorkerJob::watch_beside`]).
@@ -3294,7 +3904,7 @@ impl WorkerIdle {
             return None;
         }
         let snap = with_kept_of(&self.kept, |k| k.snapshot.clone())?;
-        let env = (self.hooks.acts.account_env)(snap.pid)?;
+        let env = (self.hooks.acts.account_env)(&snap)?;
         let key = login_latch::login_key(&env)?;
         self.settled(snap.pid, &snap.start, &snap.argv, &snap.cwd)
             .then_some(key)
@@ -3313,10 +3923,27 @@ pub(crate) struct TapKept {
     silence: tap::Silence,
     /// The process a turn was last seen to run in ([`IdleHost::turn_ran`]).
     served: Option<u32>,
-    /// The windows this worker last recorded, and when.
-    noted: Option<(Option<tap::Window>, Option<tap::Window>, i64)>,
+    /// The account, process and windows this worker last recorded, and when.
+    noted: Option<TapNoted>,
     /// When a busy read last took the tap's reading ([`TapAt::Busy`]).
     busy_at: Option<i64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TapIdentity {
+    row: accounts::Row,
+    login: Option<String>,
+    start: String,
+    state: PathBuf,
+    roster: Option<PathBuf>,
+    home: PathBuf,
+}
+
+#[derive(Debug)]
+struct TapNoted {
+    identity: TapIdentity,
+    windows: (Option<tap::Window>, Option<tap::Window>),
+    at: i64,
 }
 
 /// Where a usage tap's reading is taken ([`WorkerIdle::tap_step`]).
@@ -3741,7 +4368,7 @@ impl IdleHost for WorkerIdle {
             return self.on().then_some(step);
         }
         let hooks = &self.hooks;
-        let step = self.act(|| (hooks.acts.restart)(&self.sid, self.grace, why));
+        let step = self.act(|| (hooks.acts.restart)(&self.sid, self.grace, why, None));
         if !self.on() {
             return None;
         }
@@ -3975,7 +4602,7 @@ impl IdleHost for WorkerIdle {
             return None;
         }
         let snap = with_kept_of(&self.kept, |k| k.snapshot.clone())?;
-        let env = (self.hooks.acts.account_env)(snap.pid)?;
+        let env = (self.hooks.acts.account_env)(&snap)?;
         if !accounts::ProcessLogin::of_exec_env(&env)?.stored_login
             || !self.settled(snap.pid, &snap.start, &snap.argv, &snap.cwd)
         {
@@ -4181,32 +4808,53 @@ impl IdleHost for WorkerIdle {
         disk_ask_withheld(self.hooks.acts.disk_board, &self.sid, withhold);
     }
 
-    /// The loop's next try ([`IdleHost::waiting`]), told to the window, which shows it beside an API wall.
+    /// The loop's next try ([`IdleHost::waiting`]), told to the window, which shows it beside an
+    /// API wall; a back-off is the glass's pause, and an outage wall's wait the state line's
+    /// `waiting:` (v6 §14.17.5.2), which draws no countdown on the tab. Each clears the one it
+    /// replaces.
     fn waiting(&self, plan: Option<aterm_agent::supervise::WaitPlan>) {
         use aterm_agent::supervise::WaitKind;
         let was = Told::of(self.told.load(Ordering::SeqCst));
         let tell_retry = |retry| (self.hooks.waiting)(&self.sid, retry);
         let tell_pause = |pause| (self.hooks.fact)(&self.sid, crate::HarnessFact::Pause(pause));
+        let tell_outage = |wait| (self.hooks.fact)(&self.sid, crate::HarnessFact::Waiting(wait));
+        let clear = |told: Told| match told {
+            Told::Retry => tell_retry(None),
+            Told::Pause => tell_pause(None),
+            Told::Outage => tell_outage(None),
+            Told::Nothing => {}
+        };
         let now = match plan.map(|p| (p.kind, p.at_unix)) {
             Some((WaitKind::Retry, at_unix)) => {
-                if was == Told::Pause {
-                    tell_pause(None);
+                if was != Told::Retry {
+                    clear(was);
                 }
                 tell_retry(Some(crate::presence::RetryPlan::at(at_unix)));
                 Told::Retry
             }
             Some((WaitKind::BackOff { short }, at_unix)) => {
-                if was == Told::Retry {
-                    tell_retry(None);
+                if was != Told::Pause {
+                    clear(was);
                 }
                 tell_pause(Some(crate::PausePlan { at_unix, short }));
                 Told::Pause
             }
+            Some((WaitKind::Outage { wall, tries }, at_unix)) => {
+                if was != Told::Outage {
+                    clear(was);
+                }
+                tell_outage(Some(crate::OutageWait {
+                    wall,
+                    tries,
+                    at_unix,
+                }));
+                Told::Outage
+            }
             Some((WaitKind::Other, _)) | None => {
-                if was == Told::Pause {
-                    tell_pause(None);
-                } else {
-                    tell_retry(None);
+                // With nothing told, the tab's countdown is cleared all the same.
+                match was {
+                    Told::Nothing => tell_retry(None),
+                    told => clear(told),
                 }
                 Told::Nothing
             }
@@ -4245,16 +4893,18 @@ impl IdleHost for WorkerIdle {
 
     /// What the roster advises about this session's account at `point` ([`IdleHost::account`]).
     fn account(&self, point: AccountPoint) -> Option<AccountAdvice> {
+        let turn = AdviceTurn::begin(&self.kept);
         let owed = self.account_wall_again(point);
-        let advice = self.account_advice(point, owed);
-        let advised = match advice.as_ref().and_then(AccountAdvice::past_probe) {
-            Some(AccountAdvice::Move { to }) => Some(Advised {
-                to: to.clone(),
-                point,
-            }),
-            _ => None,
-        };
-        with_kept_of(&self.kept, |k| k.account.advised = advised);
+        if self.switches.accounts_live() {
+            account_land(&self.sid, &self.kept, &self.hooks, Landing::Asked);
+        }
+        let request = turn.capture(&self.kept)?;
+        let mut judged = None;
+        let advice = self.account_advice(point, owed, &mut judged);
+        let progress =
+            self.read_account_progress(&request, point, advice.as_ref(), judged.as_ref());
+        let advice = request.publish_progress(&self.kept, advice, point, progress);
+        (self.hooks.note)(HostNote::AccountProgress);
         advice
     }
 
@@ -4263,6 +4913,7 @@ impl IdleHost for WorkerIdle {
         if !self.switches.accounts_live() {
             return;
         }
+        let moved = MoveObservation::capture(&self.kept);
         let Some((seat, roster, look)) = self.account_ctx() else {
             return;
         };
@@ -4296,12 +4947,18 @@ impl IdleHost for WorkerIdle {
                     Vec::new()
                 };
                 events.extend(accounts::prove(state, label, now));
-                events.extend(accounts::note_session(state, &self.sid, label, None, now));
+                if let Some(notes) =
+                    look.note_session(&self.kept, state, &self.sid, label, None, now)
+                {
+                    events.extend(notes);
+                }
                 Ok(events)
             },
         );
-        if done.is_ok() {
-            with_kept_of(&self.kept, |k| k.account.moved = None);
+        if done.is_ok()
+            && let Some(moved) = moved
+        {
+            moved.publish(&self.kept, &seat, &look.snap, MoveReply::Served);
         }
         let word = match &done {
             Ok(events) if events.iter().any(|e| e.kind == accounts::Kind::Proven) => "proven",
@@ -4312,139 +4969,8 @@ impl IdleHost for WorkerIdle {
     }
 
     /// The account this session moved to answered with a lost login or a usage limit ([`IdleHost::account_answered`]).
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AccountAnswerObservation",
-            action = "CurrentAuth",
-            project = "harness_host::tests::login_observation::answer_transition"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AccountAnswerObservation",
-            action = "SupersededAuth",
-            project = "harness_host::tests::login_observation::answer_transition"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AccountAnswerObservation",
-            action = "RenewedDuringAuth",
-            project = "harness_host::tests::login_observation::answer_transition"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AccountAnswerObservation",
-            action = "ChangedPolicyAuth",
-            project = "harness_host::tests::login_observation::answer_transition"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AccountAnswerObservation",
-            action = "SupersededQuota",
-            project = "harness_host::tests::login_observation::answer_transition"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AccountAnswerObservation",
-            action = "MissingRowAuth",
-            project = "harness_host::tests::login_observation::answer_transition"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AccountAnswerObservation",
-            action = "UnreadableRowAuth",
-            project = "harness_host::tests::login_observation::answer_transition"
-        )
-    )]
     fn account_answered(&self, bad: AccountBad) {
-        if !self.switches.accounts_live() {
-            return;
-        }
-        let Some((seat, roster, look)) = self.account_ctx() else {
-            return;
-        };
-        let Some(label) = look.judged(&roster) else {
-            return;
-        };
-        if matches!(bad, AccountBad::SignedOut) {
-            with_kept_of(&self.kept, |k| k.account.came_back = None);
-            let lost = AccountPoint::Wall {
-                kind: aterm_phase::WallKind::Auth,
-            };
-            self.lost_seen(&look.snap, lost, seat.now);
-            if look.who.me(&roster).account.is_none() {
-                aterm_log::info!(
-                    "harness @{}: account {label}: a superseded login's end is no news of the \
-                     renewed one's; nothing struck",
-                    self.sid
-                );
-                return;
-            }
-        }
-        let why = match bad {
-            AccountBad::SignedOut => accounts::Strike::SignedOut,
-            AccountBad::Wall => match own_wall(&seat, &look.snap) {
-                Some(wall) => accounts::Strike::Wall {
-                    window: wall.window,
-                    until: wall.until,
-                },
-                None => {
-                    aterm_log::info!(
-                        "harness @{}: account {label}: the limit on the screen is not this \
-                         process's own; nothing struck",
-                        self.sid
-                    );
-                    return;
-                }
-            },
-        };
-        let done = if matches!(bad, AccountBad::SignedOut) {
-            self.reset_flush(&seat);
-            // Authentication news belongs to this login, not to a renewal that may
-            // have replaced it since account_ctx captured the process and roster.
-            login_transact_of(
-                &self.sid,
-                &self.hooks,
-                &seat,
-                &roster,
-                &look,
-                label,
-                |state, _, now| Ok(accounts::strike(state, label, &self.sid, &why, now)),
-            )
-        } else {
-            // A provider quota belongs to the account across credential renewals.
-            self.account_transact(&seat, |state, now| {
-                Ok(accounts::strike(state, label, &self.sid, &why, now))
-            })
-        };
-        if done.is_ok() {
-            (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
-            with_kept_of(&self.kept, |k| {
-                if let (Some(moved), Some(tab)) = (k.account.moved.as_mut(), k.snapshot.as_ref())
-                    && (moved.pid, moved.start.as_str()) == (tab.pid, tab.start.as_str())
-                {
-                    moved.answered = true;
-                }
-            });
-        }
-        let word = match (&why, &done) {
-            (_, Err(_)) => "struck: not recorded",
-            (accounts::Strike::SignedOut, _) => "struck: signed-out",
-            _ => "struck: wall",
-        };
-        aterm_log::info!("harness @{}: account {label} {word}", self.sid);
+        account_answered(self, bad);
     }
 
     /// News of the accounts since the host started ([`IdleHost::account_stamp`]; [`Switches::accounts_news`]).
@@ -4485,7 +5011,7 @@ impl IdleHost for WorkerIdle {
             return None;
         }
         let snap = with_kept_of(&self.kept, |k| k.snapshot.clone())?;
-        let env = (self.hooks.acts.account_env)(snap.pid)?;
+        let env = (self.hooks.acts.account_env)(&snap)?;
         if !accounts::ProcessLogin::of_exec_env(&env)?.stored_login
             || !self.settled(snap.pid, &snap.start, &snap.argv, &snap.cwd)
         {
@@ -4658,7 +5184,7 @@ impl IdleHost for WorkerIdle {
     }
 }
 
-/// A worker that ends takes its session's next try with it.
+/// A worker that ends takes its session's next try, its pause and its outage wait with it.
 impl Drop for WorkerIdle {
     fn drop(&mut self) {
         self.login_abandon();
@@ -4666,6 +5192,7 @@ impl Drop for WorkerIdle {
         (self.hooks.waiting)(&self.sid, None);
         (self.hooks.fact)(&self.sid, crate::HarnessFact::Task(None));
         (self.hooks.fact)(&self.sid, crate::HarnessFact::Pause(None));
+        (self.hooks.fact)(&self.sid, crate::HarnessFact::Waiting(None));
         let silent = self
             .tap
             .get_mut()
@@ -4676,6 +5203,143 @@ impl Drop for WorkerIdle {
             self.tap_heard();
         }
     }
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountAnswerObservation",
+        action = "CurrentAuth",
+        project = "harness_host::tests::login_observation::answer_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountAnswerObservation",
+        action = "SupersededAuth",
+        project = "harness_host::tests::login_observation::answer_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountAnswerObservation",
+        action = "RenewedDuringAuth",
+        project = "harness_host::tests::login_observation::answer_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountAnswerObservation",
+        action = "ChangedPolicyAuth",
+        project = "harness_host::tests::login_observation::answer_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountAnswerObservation",
+        action = "SupersededQuota",
+        project = "harness_host::tests::login_observation::answer_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountAnswerObservation",
+        action = "MissingRowAuth",
+        project = "harness_host::tests::login_observation::answer_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountAnswerObservation",
+        action = "UnreadableRowAuth",
+        project = "harness_host::tests::login_observation::answer_transition"
+    )
+)]
+fn account_answered(this: &WorkerIdle, bad: AccountBad) {
+    if !this.switches.accounts_live() {
+        return;
+    }
+    let moved = MoveObservation::capture(&this.kept);
+    let Some((seat, roster, look)) = this.account_ctx() else {
+        return;
+    };
+    let Some(label) = look.judged(&roster) else {
+        return;
+    };
+    if matches!(bad, AccountBad::SignedOut) {
+        let lost = AccountPoint::Wall {
+            kind: aterm_phase::WallKind::Auth,
+        };
+        let _ = look.with_current(&this.kept, |k| {
+            k.account.came_back = None;
+            lost_seen_of(k, &look.snap, lost, seat.now)
+        });
+        if look.who.me(&roster).account.is_none() {
+            aterm_log::info!(
+                "harness @{}: account {label}: a superseded login's end is no news of the \
+                 renewed one's; nothing struck",
+                this.sid
+            );
+            return;
+        }
+    }
+    let why = match bad {
+        AccountBad::SignedOut => accounts::Strike::SignedOut,
+        AccountBad::Wall => match own_wall(&seat, &look.snap) {
+            Some(wall) => accounts::Strike::Wall {
+                window: wall.window,
+                until: wall.until,
+            },
+            None => {
+                aterm_log::info!(
+                    "harness @{}: account {label}: the limit on the screen is not this \
+                     process's own; nothing struck",
+                    this.sid
+                );
+                return;
+            }
+        },
+    };
+    let done = if matches!(bad, AccountBad::SignedOut) {
+        this.reset_flush(&seat);
+        // Authentication news belongs to this login, not to a renewal that may
+        // have replaced it since account_ctx captured the process and roster.
+        login_transact_of(
+            &this.sid,
+            &this.hooks,
+            &seat,
+            &roster,
+            &look,
+            label,
+            |state, _, now| Ok(accounts::strike(state, label, &this.sid, &why, now)),
+        )
+    } else {
+        // A provider quota belongs to the account across credential renewals.
+        let Some(row) = roster.row(label) else {
+            return;
+        };
+        this.account_observed(&seat, row, &look.who, |state, now| {
+            Ok(accounts::strike(state, label, &this.sid, &why, now))
+        })
+    };
+    if done.is_ok() {
+        (this.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
+        if let Some(moved) = moved {
+            moved.publish(&this.kept, &seat, &look.snap, MoveReply::Failed);
+        }
+    }
+    let word = match (&why, &done) {
+        (_, Err(_)) => "struck: not recorded",
+        (accounts::Strike::SignedOut, _) => "struck: signed-out",
+        _ => "struck: wall",
+    };
+    aterm_log::info!("harness @{}: account {label} {word}", this.sid);
 }
 
 impl WorkerIdle {
@@ -4766,25 +5430,53 @@ impl WorkerIdle {
             && reading.login == snap.login
             && reading.home == snap.home;
         if !own {
+            self.tap_untake(before);
             return Some(TAP_NOT_OWN);
         }
-        let (label, several) = match self.tap_label(&seat, snap.pid) {
+        let (captured, look) = match self.tap_account(&seat, snap.pid) {
             Ok(Some(judged)) => judged,
             Ok(None) => {
                 self.tap_untake(before);
                 return None;
             }
-            Err(word) => return Some(word),
+            Err(word) => {
+                self.tap_untake(before);
+                return Some(word);
+            }
         };
+        if look.snap.start != snap.start || look.who.login != reading.login {
+            self.tap_untake(before);
+            return Some(TAP_NOT_OWN);
+        }
+        let label = look
+            .judged(captured.roster())
+            .expect("tap account was attributed")
+            .to_owned();
+        let several = captured.roster().several();
         let windows = (reading.five_hour, reading.seven_day);
-        let taken = self
+        let identity = TapIdentity {
+            row: captured
+                .row(&label)
+                .expect("tap row was attributed")
+                .clone(),
+            login: look.who.login.clone(),
+            start: look.snap.start.clone(),
+            state: seat.state.clone(),
+            roster: seat.roster.clone(),
+            home: seat.home.clone(),
+        };
+        let duplicate = self
             .tap
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .noted;
-        if taken.is_some_and(|(five, seven, at)| {
-            (five, seven) == windows && seat.now.saturating_sub(at) < accounts::READING_HEARTBEAT_S
-        }) {
+            .noted
+            .as_ref()
+            .is_some_and(|taken| {
+                taken.identity == identity
+                    && taken.windows == windows
+                    && seat.now.saturating_sub(taken.at) < accounts::READING_HEARTBEAT_S
+            });
+        if duplicate {
             return None;
         }
         let beside = before
@@ -4798,7 +5490,7 @@ impl WorkerIdle {
         };
         let mut held_back = false;
         let mut low_or_limited = false;
-        let noted = self.account_transact(&seat, |state, now| {
+        let noted = self.usage_observed(&seat, &captured, &look.who, |state, now| {
             let (events, held) = accounts::note_reading_held(state, &label, &read, now);
             held_back = held;
             low_or_limited = !events.is_empty()
@@ -4817,7 +5509,11 @@ impl WorkerIdle {
                     self.tap
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .noted = Some((windows.0, windows.1, seat.now));
+                        .noted = Some(TapNoted {
+                        identity,
+                        windows,
+                        at: seat.now,
+                    });
                     if self.switches.usage_tap.load(Ordering::SeqCst) {
                         (self.hooks.log_usage)(
                             &self.sid,
@@ -4862,32 +5558,32 @@ impl WorkerIdle {
     }
 
     /// Whose a usage tap's record is — a reading ([`Self::tap_step`]), a silence ([`Self::tap_silent`]) of the agent process `pid`.
-    fn tap_label(
+    fn tap_account(
         &self,
         seat: &AccountSeat,
         pid: u32,
-    ) -> Result<Option<(String, bool)>, &'static str> {
-        let roster = accounts::tap_roster(
-            seat.roster.as_deref(),
-            &accounts::Store::at(&seat.state),
-            seat.now,
-        )
-        .ok_or(TAP_NOT_OWN)?;
-        let Some(look) = self.account_look(&roster) else {
+    ) -> Result<Option<(accounts::UsageRoster, AccountLook)>, &'static str> {
+        let captured = accounts::Store::at(&seat.state)
+            .read_usage_roster(seat.roster.as_deref(), seat.now)
+            .map_err(|_| TAP_NOT_OWN)?;
+        let Some(look) = self.account_look(captured.roster()) else {
             return Ok(None);
         };
-        look.judged(&roster)
-            .filter(|_| look.snap.pid == pid)
-            .map(|label| Some((label.to_owned(), roster.several())))
-            .ok_or(TAP_NOT_OWN)
+        if look.snap.pid != pid || look.judged(captured.roster()).is_none() {
+            return Err(TAP_NOT_OWN);
+        }
+        Ok(Some((captured, look)))
     }
 
     /// A tapped process went silent ([`Self::tap_step`]).
     fn tap_silent(&self, seat: &AccountSeat, pid: u32) {
-        if let Ok(Some((label, _))) = self.tap_label(seat, pid) {
-            let _ = self.account_transact(seat, |_, now| {
+        if let Ok(Some((captured, look))) = self.tap_account(seat, pid) {
+            let label = look
+                .judged(captured.roster())
+                .expect("tap account was attributed");
+            let _ = self.usage_observed(seat, &captured, &look.who, |_, now| {
                 Ok(vec![
-                    accounts::Event::new(now, accounts::Kind::NoTap, &label)
+                    accounts::Event::new(now, accounts::Kind::NoTap, label)
                         .because("a served turn left no reading"),
                 ])
             });
@@ -5355,16 +6051,31 @@ impl WorkerIdle {
     }
 
     /// The move this loop is still to be told of ([`Moved::untold`]), by its label.
-    fn account_untold(&self, snap: &Snapshot, left: bool) -> Option<String> {
-        with_kept_of(&self.kept, |k| {
-            let moved = k.account.moved.as_mut().filter(|m| m.untold)?;
-            let here = (moved.pid, moved.start.as_str()) == (snap.pid, snap.start.as_str());
-            if here && left {
+    fn account_untold(
+        &self,
+        seat: &AccountSeat,
+        look: &AccountLook,
+        retell: bool,
+    ) -> Option<String> {
+        let _held = match look.generation.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(held)) => held.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        look.with_current(&self.kept, |k| {
+            let moved = k
+                .account
+                .moved
+                .as_mut()
+                .filter(|m| m.untold && m.origin.matches(seat))?;
+            let here = account_process_matches(&moved.process, &look.snap);
+            if here && retell {
                 return Some(moved.to.clone());
             }
             moved.untold = false;
             None
         })
+        .flatten()
     }
 
     /// Whether the loop is told to ask again soon ([`account_lagging`]).
@@ -5452,7 +6163,7 @@ impl WorkerIdle {
             .row(label)
             .and_then(accounts::Row::expected_identity_email)
         {
-            let Some(env) = (self.hooks.acts.account_env)(look.snap.pid) else {
+            let Some(env) = (self.hooks.acts.account_env)(&look.snap) else {
                 return false;
             };
             match aterm_agent::harness::profile::answers_to(&env, &seat.home, email) {
@@ -5554,50 +6265,21 @@ impl WorkerIdle {
 
     /// Whether anything of the accounts acts for this session under `roster`, the switches read live.
     fn accounts_act(&self, roster: &accounts::Roster) -> bool {
-        self.switches.accounts() != accounts::Mode::Off
-            || (self.switches.logins() && renewable_listed(roster))
+        let controls = self.switches.account_controls();
+        controls.mode != accounts::Mode::Off || (controls.logins && renewable_listed(roster))
     }
 
-    /// When this host first met the lost login of process `snap` ([`AccountKept::lost`]).
-    fn lost_seen(&self, snap: &Snapshot, point: AccountPoint, now: i64) -> i64 {
-        let lost_login = matches!(
-            point,
-            AccountPoint::Wall {
-                kind: aterm_phase::WallKind::Auth
-            }
-        );
-        with_kept_of(&self.kept, |k| {
-            let came_back = k.account.came_back.take();
-            if !lost_login {
-                return now;
-            }
-            match &k.account.lost {
-                Some(lost)
-                    if (lost.pid, lost.start.as_str()) == (snap.pid, snap.start.as_str()) =>
-                {
-                    lost.at
-                }
-                _ => {
-                    let at = if came_back.as_ref() == Some(&snap.login) {
-                        i64::MIN
-                    } else {
-                        now
-                    };
-                    k.account.lost = Some(LostSeen {
-                        pid: snap.pid,
-                        start: snap.start.clone(),
-                        at,
-                    });
-                    at
-                }
-            }
-        })
+    /// When this host first met a lost login in the captured authentication context.
+    fn lost_seen(&self, look: &AccountLook, point: AccountPoint, now: i64) -> Option<i64> {
+        look.with_current(&self.kept, |k| lost_seen_of(k, &look.snap, point, now))
     }
 
     /// What the agent's own process says of its login ([`AccountLook`]; the recorder's read is [`account_wall_of`]).
     fn account_look(&self, roster: &accounts::Roster) -> Option<AccountLook> {
-        let snap = with_kept_of(&self.kept, |k| k.snapshot.clone())?;
-        let who = exec_login(&self.hooks, snap.pid)?;
+        let (snap, generation) = with_kept_of(&self.kept, |k| {
+            Some((k.snapshot.clone()?, Arc::clone(&k.account.landing)))
+        })?;
+        let who = exec_login(&self.hooks, &snap)?;
         let listed = accounts::judged_label(roster, &who).is_some();
         let who = if listed {
             accounts::ProcessLogin {
@@ -5608,11 +6290,49 @@ impl WorkerIdle {
             who
         };
         let label = who.me(roster).label().map(str::to_owned);
-        Some(AccountLook { who, label, snap })
+        Some(AccountLook {
+            who,
+            label,
+            snap,
+            generation,
+        })
     }
 
-    /// [`IdleHost::account`]'s judgment, before it is kept.
-    fn account_advice(&self, point: AccountPoint, owed: bool) -> Option<AccountAdvice> {
+    /// What a non-Claude pooled CLI's own process environment says of its login, without reading
+    /// Claude Code's settings chain.
+    fn pool_account_look(
+        &self,
+        cli: accounts::Cli,
+        roster: &accounts::Roster,
+    ) -> Option<(AccountLook, Vec<String>)> {
+        let (snap, generation) = with_kept_of(&self.kept, |k| {
+            Some((k.snapshot.clone()?, Arc::clone(&k.account.landing)))
+        })?;
+        let env = (self.hooks.acts.account_env)(&snap)?;
+        if env.is_empty() {
+            return None;
+        }
+        let who =
+            accounts::ProcessLogin::of_env_for(cli, env.iter().filter_map(|kv| kv.split_once('=')));
+        let label = who.me(roster).label().map(str::to_owned);
+        Some((
+            AccountLook {
+                who,
+                label,
+                snap,
+                generation,
+            },
+            env,
+        ))
+    }
+
+    /// [`IdleHost::account`]'s judgment and admitted trigger, before they are kept.
+    fn account_advice(
+        &self,
+        point: AccountPoint,
+        owed: bool,
+        judged: &mut Option<accounts::Point>,
+    ) -> Option<AccountAdvice> {
         let mode = self.switches.accounts();
         let notes = self.switches.notes();
         if !self.switches.accounts_live() {
@@ -5621,10 +6341,8 @@ impl WorkerIdle {
             }
             return None;
         }
-        account_land(&self.sid, &self.kept, &self.hooks, Landing::Asked);
         if accounts::Cli::of(self.agent).is_some_and(|cli| cli != accounts::Cli::Claude) {
-            self.pool_said(point);
-            return None;
+            return self.pool_advice(point);
         }
         if !accounts_for(self.agent) {
             return None;
@@ -5657,9 +6375,10 @@ impl WorkerIdle {
             return None;
         }
         let look = self.account_look(&roster)?;
-        let seen = self.lost_seen(&look.snap, point, seat.now);
+        let seen = self.lost_seen(&look, point, seat.now)?;
         let (at, wall, unwritten) = account_point_read(&seat, &look, point, seen);
-        if let Some(to) = self.account_untold(&look.snap, usage_limit(point) && wall.is_none()) {
+        *judged = Some(at.clone());
+        if let Some(to) = self.account_untold(&seat, &look, usage_limit(point) && wall.is_none()) {
             aterm_log::info!(
                 "harness @{}: account advice: its move to {to} has landed; told as made",
                 self.sid
@@ -5805,9 +6524,13 @@ impl WorkerIdle {
         if fresh {
             return;
         }
+        let Some(row) = roster.row(label) else {
+            return;
+        };
         if self
-            .account_transact(seat, |state, now| {
-                Ok(accounts::note_session(state, &self.sid, label, held, now))
+            .account_observed(seat, row, &look.who, |state, now| {
+                look.note_session(&self.kept, state, &self.sid, label, held, now)
+                    .ok_or_else(|| ACCOUNT_CHANGED.to_string())
             })
             .is_err()
         {
@@ -5815,14 +6538,62 @@ impl WorkerIdle {
         }
     }
 
-    /// One short transaction on the accounts state for this session ([`account_transact_of`]).
-    fn account_transact(
+    /// Publish tap usage only while its source and the host's writer context agree.
+    fn usage_observed(
         &self,
         seat: &AccountSeat,
+        captured: &accounts::UsageRoster,
+        who: &accounts::ProcessLogin,
         edit: impl FnOnce(&mut accounts::State, i64) -> Result<Vec<accounts::Event>, String>,
     ) -> Result<Vec<accounts::Event>, String> {
         self.reset_flush(seat);
-        account_transact_of(&self.sid, &self.hooks, seat, edit)
+        let current = current_account_seat(&self.hooks, seat)?;
+        accounts::Store::at(&seat.state).observe_usage_within(
+            seat.ladder,
+            current.now,
+            captured,
+            who,
+            |state| {
+                Ok(edit(state, current.now)?
+                    .into_iter()
+                    .map(|event| match event.sid {
+                        Some(_) => event,
+                        None => event.with_sid(&self.sid),
+                    })
+                    .collect())
+            },
+        )
+    }
+
+    /// An account-wide observation, retaining attribution across credential renewal.
+    fn account_observed(
+        &self,
+        seat: &AccountSeat,
+        row: &accounts::Row,
+        who: &accounts::ProcessLogin,
+        edit: impl FnOnce(&mut accounts::State, i64) -> Result<Vec<accounts::Event>, String>,
+    ) -> Result<Vec<accounts::Event>, String> {
+        self.reset_flush(seat);
+        let current = current_account_seat(&self.hooks, seat)?;
+        let now = current.now;
+        accounts::Store::at(&seat.state).observe_account_within(
+            seat.ladder,
+            now,
+            accounts::LoginObservation {
+                roster_path: seat.roster.as_deref().ok_or("account roster is missing")?,
+                row,
+                who,
+            },
+            |state, _| {
+                Ok(edit(state, now)?
+                    .into_iter()
+                    .map(|event| match event.sid {
+                        Some(_) => event,
+                        None => event.with_sid(&self.sid),
+                    })
+                    .collect())
+            },
+        )
     }
 
     /// The claim of this session's account's one `/usage` probe ([`IdleHost::account_probe`]).
@@ -5845,6 +6616,7 @@ impl WorkerIdle {
             Err(why) => (None, Err(why)),
         };
         with_kept_of(&self.kept, |k| k.account.probing = probing);
+        (self.hooks.note)(HostNote::AccountProgress);
         taken
     }
 
@@ -5857,9 +6629,11 @@ impl WorkerIdle {
         }
         let (seat, roster, look) = self.account_ctx().ok_or(NoProbe::Unread)?;
         let label = look.judged(&roster).ok_or(NoProbe::NotJudged)?.to_owned();
+        let row = roster.row(&label).ok_or(NoProbe::NotJudged)?.clone();
+        let path = seat.roster.clone().ok_or(NoProbe::State)?;
         let enrolled = accounts::enrolled(&roster);
         let me = look.who.me(&roster);
-        let claimed = self.account_transact(&seat, |state, now| {
+        let claimed = self.account_observed(&seat, &row, &look.who, |state, now| {
             // The claim's own test first, for its own word: the roster's
             // advice folds a standing claim into "nothing due".
             if accounts::probe_held(state, &label, now) {
@@ -5886,6 +6660,10 @@ impl WorkerIdle {
                 label,
                 pid: look.snap.pid,
                 start: look.snap.start,
+                row,
+                who: look.who,
+                roster: path,
+                state: seat.state,
             }),
             Err(why) if why == CLAIMED => Err(NoProbe::Claimed),
             Err(why) if why == NOT_DUE => Err(NoProbe::NotDue),
@@ -5923,12 +6701,15 @@ impl WorkerIdle {
             return "sample dropped: unread";
         };
         let same = look.judged(&roster) == Some(probing.label.as_str())
-            && (look.snap.pid, look.snap.start.as_str()) == (probing.pid, probing.start.as_str());
+            && (look.snap.pid, look.snap.start.as_str()) == (probing.pid, probing.start.as_str())
+            && look.who == probing.who
+            && seat.roster.as_deref() == Some(probing.roster.as_path())
+            && seat.state == probing.state;
         if !same {
             return "sample dropped: not the process it was claimed for";
         }
         let mut low_or_limited = false;
-        let noted = self.account_transact(&seat, |state, now| {
+        let noted = self.account_observed(&seat, &probing.row, &probing.who, |state, now| {
             let sample = accounts::Sample {
                 at: now,
                 ..sample.clone()
@@ -6256,7 +7037,7 @@ impl WorkerIdle {
             );
             return account_resetting(None, Instant::now() + (self.hooks.pause)(RESET_AGAIN_AFTER));
         }
-        let seen = self.lost_seen(&look.snap, point, seat.now);
+        let seen = self.lost_seen(&look, point, seat.now)?;
         let (at, _, _) = account_point_read(seat, &look, point, seen);
         let advice = accounts::advise(
             &roster,
@@ -6287,35 +7068,86 @@ impl WorkerIdle {
     }
 
     /// The move ([`Restart::Account`]), returning one step word as every restart does.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountImmediate",
+            action = "AnotherCase",
+            reason = "Select a restart, writer or retirement fixture."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountImmediate",
+            action = "Choose",
+            reason = "Finish selecting the immediate completion fixture."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountImmediate",
+            action = "Observe",
+            project = "harness_host::tests::account_immediate::immediate_transition"
+        )
+    )]
     fn account_move(&self, why: &Restart, to: &str, at: AccountAt) -> String {
         const CHANGED: &str = "wait:account-changed";
         const STATE: &str = "wait:account-state";
         let hooks = &self.hooks;
         let at_wall = at == AccountAt::Wall;
-        let advised = with_kept_of(&self.kept, |k| k.account.advised.take())
-            .filter(|a| a.to == to && at_wall == a.point.at_wall());
-        let mode = self.switches.accounts();
+        let advised = with_kept_of(&self.kept, |k| advised_for(k, to, at_wall));
+        let controls = self.switches.account_controls();
         let renewable = || {
-            self.switches.logins()
+            controls.logins
                 && (self.hooks.acts.account_seat)()
                     .and_then(|seat| account_roster(&seat))
                     .is_some_and(|roster| renewable_listed(&roster))
         };
-        if mode == accounts::Mode::Off && !renewable() {
+        if controls.mode == accounts::Mode::Off && !renewable() {
             return "refused:accounts-off".to_string();
         }
         let Some(advised) = advised else {
             return CHANGED.to_string();
         };
+        let generation = Arc::clone(&advised.request.turn.generation);
+        let _landing = match generation.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(held)) => held.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return "wait:account-unverified".into(),
+        };
+        if with_kept_of(&self.kept, |k| k.account.flying.is_some()) {
+            return "wait:account-unverified".into();
+        }
+        let Some(advised) = take_advised(&self.kept, &advised) else {
+            return CHANGED.to_string();
+        };
         let landed = with_kept_of(&self.kept, |k| {
             k.account
                 .moved
-                .as_mut()
+                .as_ref()
                 .filter(|m| m.untold && m.to == to)
-                .map(|m| m.untold = false)
-                .is_some()
+                .cloned()
         });
-        if landed {
+        if let Some(landed) = landed
+            && (hooks.acts.account_seat)().is_some_and(|seat| landed.origin.matches(&seat))
+            && with_kept_of(&self.kept, |k| {
+                if !Arc::ptr_eq(&generation, &k.account.landing)
+                    || k.account.moved.as_ref() != Some(&landed)
+                    || !k
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snap| account_process_matches(&landed.process, snap))
+                {
+                    return false;
+                }
+                if let Some(moved) = &mut k.account.moved {
+                    moved.untold = false;
+                }
+                true
+            })
+        {
             self.park.store(true, Ordering::SeqCst);
             return "adopted".to_string();
         }
@@ -6325,15 +7157,17 @@ impl WorkerIdle {
         let Some(label) = look.label.clone() else {
             return CHANGED.to_string();
         };
-        let seen = self.lost_seen(&look.snap, advised.point, seat.now);
+        let Some(seen) = self.lost_seen(&look, advised.point, seat.now) else {
+            return CHANGED.to_string();
+        };
         let (point, wall) = account_point(&seat, &look, advised.point, seen);
         let Ok((state, _)) = accounts::Store::at(&seat.state).load(seat.now) else {
             return STATE.to_string();
         };
         let enrolled = accounts::enrolled(&roster);
         let advise = |state: &accounts::State, now: i64| {
-            let me = asked_at(look.who.me(&roster), advised.point, self.switches.logins());
-            accounts::advise_past_probe(&roster, state, &enrolled, &me, &point, mode, now)
+            let me = asked_at(look.who.me(&roster), advised.point, controls.logins);
+            accounts::advise_past_probe(&roster, state, &enrolled, &me, &point, controls.mode, now)
         };
         let accounts::Advice::Move { to: first, .. } = advise(&state, seat.now) else {
             return CHANGED.to_string();
@@ -6341,10 +7175,17 @@ impl WorkerIdle {
         if first != to {
             return CHANGED.to_string();
         }
-        let repeat = with_kept_of(&self.kept, |k| k.account.unmade.as_deref() == Some(to));
-        let mut canary = false;
-        let mut owed: Vec<accounts::Event> = Vec::new();
-        let committed = self.account_transact(&seat, |state, now| {
+        let mut canary = None;
+        let mut source_session = None;
+        self.reset_flush(&seat);
+        let committed = roster_transact_of(&self.sid, hooks, &seat, &roster, |state, now| {
+            if !controls.is_current(&self.switches)
+                || !with_kept_of(&self.kept, |k| {
+                    Arc::ptr_eq(&generation, &k.account.landing) && k.account.flying.is_none()
+                })
+            {
+                return Err(ACCOUNT_CHANGED.to_string());
+            }
             let mut events = Vec::new();
             if let Some(wall) = &wall {
                 events.extend(accounts::note_wall(
@@ -6399,13 +7240,13 @@ impl WorkerIdle {
                 };
                 rotated = Some(event);
             }
-            canary = rotated.is_some();
-            if repeat {
-                owed.extend(rotated);
-            } else {
-                events.extend(rotated);
-            }
-            events.extend(accounts::note_session(state, &self.sid, &label, None, now));
+            canary = rotated.as_ref().and_then(|_| state.canary.clone());
+            events.extend(rotated);
+            events.extend(
+                look.note_session(&self.kept, state, &self.sid, &label, None, now)
+                    .ok_or_else(|| ACCOUNT_CHANGED.to_string())?,
+            );
+            source_session = state.sessions.get(&self.sid).cloned();
             Ok(events)
         });
         match committed {
@@ -6418,161 +7259,138 @@ impl WorkerIdle {
                 .moved
                 .as_ref()
                 .filter(|m| {
-                    !m.answered
-                        && (m.pid, m.start.as_str()) == (look.snap.pid, look.snap.start.as_str())
+                    m.origin.matches(&seat)
+                        && !m.answered
+                        && account_process_matches(&m.process, &look.snap)
                 })
                 .map(|m| m.login.clone())
         })
         .unwrap_or_else(|| look.snap.login.clone());
         let before = (look.snap.pid, look.snap.start.clone());
+        let mut flying = Flying {
+            origin: seat.context(),
+            to: to.to_string(),
+            at,
+            login: back,
+            pid: before.0,
+            start: before.1.clone(),
+            rejected: None,
+        };
+        let Some(target) = roster.row(to) else {
+            return CHANGED.into();
+        };
+        let initial = flying.clone();
+        if !with_kept_of(&self.kept, |k| {
+            if !Arc::ptr_eq(&generation, &k.account.landing)
+                || k.account.flying.is_some()
+                || !k
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|s| account_process_matches(s, &look.snap))
+            {
+                return false;
+            }
+            k.account.flying = Some(initial.clone());
+            true
+        }) {
+            return CHANGED.into();
+        }
+        (hooks.note)(HostNote::AccountProgress);
+        let current_kept = Arc::clone(&self.kept);
+        let current_generation = Arc::clone(&generation);
+        let current_flight = initial.clone();
+        let current_source = look.snap.clone();
+        let current_stop = Arc::clone(&self.stop);
+        let current_switches = Arc::clone(&self.switches);
+        let current_agent = self.agent;
+        let selected = relaunch::AccountRestart::new(why, &look.snap, target, move || {
+            !current_stop.load(Ordering::SeqCst)
+                && current_switches.on_for(current_agent)
+                && current_switches.relaunch()
+                && controls.is_current(&current_switches)
+                && with_kept_of(&current_kept, |k| {
+                    Arc::ptr_eq(&current_generation, &k.account.landing)
+                        && k.account.flying.as_ref() == Some(&current_flight)
+                        && k.snapshot
+                            .as_ref()
+                            .is_some_and(|s| account_process_matches(s, &current_source))
+                })
+        });
         let step = if self.can_restart() {
-            self.act(|| (hooks.acts.restart)(&self.sid, self.grace, why))
+            self.act(|| (hooks.acts.restart)(&self.sid, self.grace, why, Some(&selected)))
         } else {
             "refused:supervisor-off".to_string()
         };
         note_upgrade_act();
         let fresh = refresh_snapshot(&self.sid, &self.kept, hooks);
         let after = with_kept_of(&self.kept, |k| k.snapshot.clone()).filter(|_| fresh);
-        let flying = Flying {
-            to: to.to_string(),
-            at,
-            login: back.clone(),
-            pid: before.0,
-            start: before.1.clone(),
+        let rejected = |why, held| RejectedMove {
+            on: label.clone(),
+            why,
+            canary: canary.clone(),
+            session: source_session.clone(),
+            held,
         };
-        if relaunch_took(&step) {
+        let took = relaunch_took(&step);
+        let mut waiting = false;
+        if took {
             if step == "adopted" {
                 self.park.store(true, Ordering::SeqCst);
             }
-            let applied = match after {
-                None => Applied::Unread,
-                Some(s) if (s.pid, s.start.as_str()) == (before.0, before.1.as_str()) => {
-                    Applied::No
-                }
-                Some(s) => match self.account_applied(&roster, to, &s) {
-                    Applied::Yes => {
-                        with_kept_of(&self.kept, |k| {
-                            k.account.held = None;
-                            k.account.unmade = None;
-                            k.account.flying = None;
-                            k.account.moved = Some(Moved {
-                                to: to.to_string(),
-                                login: back,
-                                pid: s.pid,
-                                start: s.start,
-                                untold: false,
-                                answered: false,
-                            });
-                        });
-                        Applied::Yes
-                    }
-                    other => other,
-                },
-            };
-            return match applied {
-                Applied::Yes => {
-                    let noted = self.account_transact(&seat, |state, now| {
-                        owed.extend(accounts::note_session(state, &self.sid, to, None, now));
-                        Ok(owed)
-                    });
-                    if noted.is_err() {
-                        aterm_log::info!(
-                            "harness @{}: account session not noted: refused",
-                            self.sid
-                        );
-                    }
-                    step
-                }
-                Applied::No => {
-                    let why = accounts::Strike::NotMoved("account-not-applied".to_string());
-                    self.account_unmade(
-                        &seat,
-                        (to, label.as_str()),
-                        canary,
-                        owed,
-                        Some(&why),
-                        None,
-                    );
-                    "failed:account-not-applied".to_string()
-                }
-                Applied::Unread => {
-                    with_kept_of(&self.kept, |k| k.account.flying = Some(flying));
-                    self.account_unmade(&seat, (to, label.as_str()), canary, owed, None, None);
-                    "wait:account-unverified".to_string()
-                }
-            };
-        }
-        if step == relaunch::IN_FLIGHT_OTHER {
+            if after
+                .as_ref()
+                .is_some_and(|s| (s.pid, s.start.as_str()) == (before.0, before.1.as_str()))
+            {
+                flying.rejected = Some(rejected(
+                    accounts::Strike::NotMoved("account-not-applied".into()),
+                    None,
+                ));
+            }
+        } else if step == relaunch::IN_FLIGHT_OTHER {
             self.park.store(true, Ordering::SeqCst);
-            let why = accounts::Strike::NotMoved(step.clone());
-            self.account_unmade(&seat, (to, label.as_str()), canary, owed, Some(&why), None);
+            flying.rejected = Some(rejected(accounts::Strike::NotMoved(step.clone()), None));
+        } else {
+            let signalled =
+                (hooks.acts.account_restart)(&self.sid, before.0).as_deref() == Some(to);
+            match (signalled, step.starts_with("failed:")) {
+                (true, true) => {
+                    flying.rejected = Some(rejected(accounts::Strike::Failed(step.clone()), None));
+                }
+                (true, false) => waiting = true,
+                (false, _) => {
+                    flying.rejected = Some(rejected(
+                        accounts::Strike::NotMoved(step.clone()),
+                        held_word(&step),
+                    ));
+                }
+            }
+        }
+        let installed = with_kept_of(&self.kept, |k| {
+            if !Arc::ptr_eq(&generation, &k.account.landing)
+                || k.account.flying.as_ref() != Some(&initial)
+            {
+                return false;
+            }
+            k.account.flying = Some(flying);
+            true
+        });
+        if !installed {
+            return CHANGED.into();
+        }
+        if waiting {
             return step;
         }
-        let signalled = (hooks.acts.account_restart)(&self.sid, before.0).as_deref() == Some(to);
-        let why = match (signalled, step.starts_with("failed:")) {
-            (true, true) => Some(accounts::Strike::Failed(step.clone())),
-            (true, false) => {
-                with_kept_of(&self.kept, |k| k.account.flying = Some(flying));
-                None
-            }
-            (false, _) => Some(accounts::Strike::NotMoved(step.clone())),
-        };
-        let held = (!signalled).then(|| held_word(&step)).flatten();
-        self.account_unmade(
-            &seat,
-            (to, label.as_str()),
-            canary,
-            owed,
-            why.as_ref(),
-            held,
-        );
-        step
-    }
-
-    /// Whether the process an account move's relaunch brought up runs under the target ([`Applied`]).
-    fn account_applied(&self, roster: &accounts::Roster, to: &str, new: &Snapshot) -> Applied {
-        if relaunch::runs_under(new, roster, to) {
-            return Applied::Yes;
-        }
-        match exec_login(&self.hooks, new.pid) {
-            Some(who) => match who.me(roster).account {
-                Some(label) if label == to => Applied::Yes,
-                _ => Applied::No,
-            },
-            None => Applied::Unread,
-        }
-    }
-
-    /// The answer of a move that was not made ([`Self::account_move`]), in one transaction.
-    fn account_unmade(
-        &self,
-        seat: &AccountSeat,
-        (to, label): (&str, &str),
-        canary: bool,
-        owed: Vec<accounts::Event>,
-        why: Option<&accounts::Strike>,
-        held: Option<&'static str>,
-    ) {
-        let unmade = matches!(why, Some(accounts::Strike::NotMoved(_))).then(|| to.to_string());
-        let again = with_kept_of(&self.kept, |k| {
-            k.account.held = held;
-            let again = unmade.is_some() && k.account.unmade == unmade;
-            k.account.unmade = unmade;
-            again
-        });
-        let done = self.account_transact(seat, |state, now| {
-            let mut events = owed;
-            if let Some(why) = why.filter(|_| canary) {
-                events.extend(accounts::strike(state, to, &self.sid, why, now));
-            }
-            events.extend(accounts::note_session(state, &self.sid, label, held, now));
-            Ok(if again { Vec::new() } else { events })
-        });
-        if done.is_err() {
-            aterm_log::info!(
-                "harness @{}: account move to {to} not taken back: refused",
-                self.sid
-            );
+        match account_land_held(
+            &self.sid,
+            &self.kept,
+            hooks,
+            Landing::Immediate,
+            &generation,
+        ) {
+            Applied::Yes => step,
+            Applied::No if took => "failed:account-not-applied".into(),
+            Applied::No => step,
+            Applied::Unread => "wait:account-unverified".into(),
         }
     }
 
@@ -6615,13 +7433,71 @@ fn refresh_snapshot_guarded(
     hooks: &Hooks,
     revoked: Option<&AtomicBool>,
 ) -> bool {
-    match (hooks.acts.snapshot)(sid) {
-        Some(snap) => land_snapshot(sid, kept, hooks, snap, |_| {
-            revoked.is_some_and(|revoked| revoked.load(Ordering::SeqCst))
-        }),
-        None => {
-            follow_snapshot_guarded(sid, kept, hooks, revoked);
-            false
+    let read = with_kept_of(kept, |k| SnapshotRead::capture(k));
+    read.refresh(sid, kept, hooks, revoked)
+}
+
+/// A read belongs to its captured snapshot and account generation, including when no agent is known.
+#[derive(Clone)]
+struct SnapshotRead {
+    before: Option<Snapshot>,
+    generation: Arc<Mutex<()>>,
+}
+
+impl SnapshotRead {
+    fn capture(k: &Kept) -> Self {
+        Self {
+            before: k.snapshot.clone(),
+            generation: Arc::clone(&k.account.landing),
+        }
+    }
+
+    fn current(&self, k: &Kept) -> bool {
+        k.snapshot == self.before && Arc::ptr_eq(&k.account.landing, &self.generation)
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "HarnessSnapshotRead",
+            action = "AnotherCase",
+            reason = "Select the snapshot, generation or cancellation race"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "HarnessSnapshotRead",
+            action = "Choose",
+            reason = "Stage the captured read before its I/O"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "HarnessSnapshotRead",
+            action = "Observe",
+            project = "harness_host::tests::snapshot_read::read_transition"
+        )
+    )]
+    fn refresh(
+        &self,
+        sid: &str,
+        kept: &Mutex<Kept>,
+        hooks: &Hooks,
+        revoked: Option<&AtomicBool>,
+    ) -> bool {
+        let stale =
+            |k: &Kept| !self.current(k) || revoked.is_some_and(|r| r.load(Ordering::SeqCst));
+        if with_kept_of(kept, |k| stale(k)) {
+            return false;
+        }
+        match (hooks.acts.snapshot)(sid) {
+            Some(snap) => land_snapshot(sid, kept, hooks, snap, stale),
+            None => {
+                self.follow(sid, kept, hooks, revoked);
+                false
+            }
         }
     }
 }
@@ -6727,12 +7603,13 @@ fn start_point_read(
             None => {
                 let read = Arc::new(PointRead::default());
                 k.point_read = Some(Arc::clone(&read));
-                (read, Some(k.snapshot.clone()))
+                (read, Some(SnapshotRead::capture(&k)))
             }
         }
     };
     if let Some(before) = begun {
         let passive = owner.is_some();
+        let fallback = before.clone();
         let (job_sid, job_kept, job_hooks, job_read) = (
             sid.to_string(),
             Arc::clone(kept),
@@ -6752,10 +7629,10 @@ fn start_point_read(
                 let over = Over(job_kept, job_read);
                 match owner {
                     Some(owner) => {
-                        land_passive_read(&job_sid, &over.0, &job_hooks, before.as_ref(), &owner);
+                        land_passive_read(&job_sid, &over.0, &job_hooks, &before, &owner);
                     }
                     None => {
-                        land_point_read(&job_sid, &over.0, &job_hooks, before.as_ref());
+                        before.refresh(&job_sid, &over.0, &job_hooks, None);
                     }
                 }
             });
@@ -6767,7 +7644,7 @@ fn start_point_read(
                     "harness @{sid}: no thread for the relaunch snapshot read ({e}); the idle point \
                      reads it itself"
                 );
-                refresh_snapshot(sid, kept, hooks);
+                fallback.refresh(sid, kept, hooks, None);
             }
             PointRead::over(kept, &read);
         }
@@ -6844,7 +7721,7 @@ fn land_passive_read(
     sid: &str,
     kept: &Mutex<Kept>,
     hooks: &Hooks,
-    before: Option<&Snapshot>,
+    read: &SnapshotRead,
     owner: &PassiveReadOwner,
 ) -> bool {
     if !owner.current(hooks) {
@@ -6864,27 +7741,8 @@ fn land_passive_read(
     // All hooks that can take session metadata ran before Kept. Revocation and worker
     // replacement fence the actual publication as well as the start of the read.
     land_snapshot(sid, kept, hooks, snap, |k| {
-        !owner.current(hooks) || k.snapshot.as_ref() != before
+        !owner.current(hooks) || !read.current(k)
     })
-}
-
-/// The end of an idle point's relaunch snapshot read, landed only while the kept snapshot is still `before`.
-fn land_point_read(
-    sid: &str,
-    kept: &Mutex<Kept>,
-    hooks: &Hooks,
-    before: Option<&Snapshot>,
-) -> bool {
-    match (hooks.acts.snapshot)(sid) {
-        Some(snap) => land_snapshot(sid, kept, hooks, snap, |k| k.snapshot.as_ref() != before),
-        None => {
-            if with_kept_of(kept, |k| k.snapshot.as_ref() != before) {
-                return false;
-            }
-            follow_snapshot_guarded(sid, kept, hooks, None);
-            false
-        }
-    }
 }
 
 /// A read `snap` that cannot name the conversation (a codex-alab whose thread lock the read missed)
@@ -7126,50 +7984,70 @@ fn follow_snapshot_guarded(
     hooks: &Hooks,
     revoked: Option<&AtomicBool>,
 ) -> bool {
-    if revoked.is_some_and(|revoked| revoked.load(Ordering::SeqCst)) {
-        return false;
-    }
-    let lock = || kept.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(before) = lock().snapshot.clone() else {
-        return false;
-    };
-    let mut snap = before.clone();
-    let fg = (hooks.acts.follow)(sid, &mut snap);
-    let mut said = (Say::Nothing, false);
-    let moved = {
-        let mut session = lock();
-        if revoked.is_some_and(|revoked| revoked.load(Ordering::SeqCst))
-            || session.snapshot.as_ref() != Some(&before)
-        {
+    let read = with_kept_of(kept, |k| SnapshotRead::capture(k));
+    read.follow(sid, kept, hooks, revoked)
+}
+
+impl SnapshotRead {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "HarnessSnapshotRead",
+            action = "Observe",
+            project = "harness_host::tests::snapshot_read::read_transition"
+        )
+    )]
+    fn follow(
+        &self,
+        sid: &str,
+        kept: &Mutex<Kept>,
+        hooks: &Hooks,
+        revoked: Option<&AtomicBool>,
+    ) -> bool {
+        let stale =
+            |k: &Kept| !self.current(k) || revoked.is_some_and(|r| r.load(Ordering::SeqCst));
+        if with_kept_of(kept, |k| stale(k)) {
             return false;
         }
-        match fg {
-            Foreground::Agent => {
-                // A conversation the record moved to (an in-app `/clear` or
-                // `/resume`): a fact the log keeps, rare as the move.
-                if snap.session != before.session {
-                    aterm_log::info!(
-                        "harness @{sid}: its agent's record names conversation {} now (was {})",
-                        snap.session.as_deref().unwrap_or("-"),
-                        before.session.as_deref().unwrap_or("-")
-                    );
+        let Some(before) = &self.before else {
+            return false;
+        };
+        let mut snap = before.clone();
+        let fg = (hooks.acts.follow)(sid, &mut snap);
+        let mut said = (Say::Nothing, false);
+        let moved = {
+            let mut session = kept.lock().unwrap_or_else(PoisonError::into_inner);
+            if stale(&session) {
+                return false;
+            }
+            match fg {
+                Foreground::Agent => {
+                    // A conversation the record moved to (an in-app `/clear` or
+                    // `/resume`): a fact the log keeps, rare as the move.
+                    if snap.session != before.session {
+                        aterm_log::info!(
+                            "harness @{sid}: its agent's record names conversation {} now (was {})",
+                            snap.session.as_deref().unwrap_or("-"),
+                            before.session.as_deref().unwrap_or("-")
+                        );
+                    }
+                    let moved = publish_snapshot(sid, Some(&snap));
+                    said = asked_runs(sid, &mut session, &snap);
+                    session.snapshot = Some(snap);
+                    moved
                 }
-                let moved = publish_snapshot(sid, Some(&snap));
-                said = asked_runs(sid, &mut session, &snap);
-                session.snapshot = Some(snap);
-                moved
+                Foreground::Shell => false,
+                Foreground::Other => {
+                    let moved = publish_snapshot(sid, None);
+                    session.snapshot = None;
+                    moved
+                }
             }
-            Foreground::Shell => false,
-            Foreground::Other => {
-                let moved = publish_snapshot(sid, None);
-                session.snapshot = None;
-                moved
-            }
-        }
-    };
-    tell_published(sid, moved, hooks);
-    told_asked_runs(sid, said, hooks);
-    true
+        };
+        tell_published(sid, moved, hooks);
+        told_asked_runs(sid, said, hooks);
+        true
+    }
 }
 
 /// The tab's agent, read, holds the conversation its standing word asks for: the word is answered.
@@ -7575,7 +8453,8 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
              relaunch is carried"
         );
         let carry_said = std::cell::Cell::new(false);
-        relaunch_until(job, hooks, pause, &decide, true, || {
+        let line_grace = || (hooks.acts.line_grace)(sid, grace, agent, pid);
+        relaunch_until(job, hooks, pause, &decide, Some(&line_grace), || {
             if hand_waits.get() {
                 if !carry_said.replace(true) {
                     aterm_log::info!(
@@ -7634,7 +8513,7 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     }
     let away_said = std::cell::Cell::new(false);
     let hand_said = std::cell::Cell::new(false);
-    relaunch_until(job, hooks, pause, &decide, false, || {
+    relaunch_until(job, hooks, pause, &decide, None, || {
         if put_off.get() {
             if !away_said.replace(true) {
                 aterm_log::info!(
@@ -7656,14 +8535,9 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
             return relaunch::WAIT_HAND_LIFTS.to_string();
         }
         hand_said.set(false);
-        (hooks.acts.relaunch)(
-            sid,
-            grace,
-            &snap,
-            &left,
-            job.switches.upgrade(),
-            cause.get(),
-        )
+        account_relaunch(job, hooks, &mut snap, |snap| {
+            (hooks.acts.relaunch)(sid, grace, snap, &left, job.switches.upgrade(), cause.get())
+        })
     });
 }
 
@@ -7831,7 +8705,7 @@ fn self_claimed_exit(
         hooks,
         pause,
         &decide,
-        false,
+        None,
         GoneUnread::HandedBack,
         || (hooks.acts.self_relaunch)(sid, grace, &snap, &resume, asked),
     );
@@ -7950,12 +8824,14 @@ fn unproven_codex_exit(
 }
 
 /// The relaunch's attempts after an agent left ([`on_agent_left`]): each after its pause.
+/// `restart` is a restart the harness made, by how long a person's keys hold the line it owes
+/// ([`Acts::line_grace`], read at each miss); `None` for any other exit.
 fn relaunch_until(
     job: &WorkerJob,
     hooks: &Hooks,
     pause: Duration,
     decide: &dyn Fn() -> OnExit,
-    restarted: bool,
+    restart: Option<&dyn Fn() -> u32>,
     attempt: impl FnMut() -> String,
 ) {
     relaunch_until_with(
@@ -7963,7 +8839,7 @@ fn relaunch_until(
         hooks,
         pause,
         decide,
-        restarted,
+        restart,
         GoneUnread::TriedAgain,
         attempt,
     );
@@ -7975,17 +8851,22 @@ fn relaunch_until_with(
     hooks: &Hooks,
     mut pause: Duration,
     decide: &dyn Fn() -> OnExit,
-    restarted: bool,
+    restart: Option<&dyn Fn() -> u32>,
     gone_unread: GoneUnread,
     mut attempt: impl FnMut() -> String,
 ) -> bool {
     let sid = job.sid.as_str();
+    let restarted = restart.is_some();
+    // The pause is one past a person's keys ([`relaunch::CarryPause::Keys`]): no attempt before
+    // it could land, so [`relaunch::CARRY_EVERY`] does not cut it short, and the attempt it times
+    // does not climb the back-off while its line is still held.
+    let mut at_keys = false;
     loop {
         if !job.admitted() {
             settled(job);
             return false;
         }
-        let wait = if restarted {
+        let wait = if restarted && !at_keys {
             pause.min(relaunch::CARRY_EVERY)
         } else {
             pause
@@ -8007,6 +8888,7 @@ fn relaunch_until_with(
                 None => {
                     ring();
                     pause = with_kept(job, |k| k.relaunches.pause());
+                    at_keys = false;
                     continue;
                 }
                 Some(Stop::ByCommit) => {}
@@ -8017,6 +8899,7 @@ fn relaunch_until_with(
         }
         if job.switches.parked() {
             pause = RESTORED_FIRST_PAUSE;
+            at_keys = false;
             continue;
         }
         let decision = decide();
@@ -8045,12 +8928,33 @@ fn relaunch_until_with(
             note_upgrade_act();
         }
         let outcome = relaunch::outcome(&step);
+        let timed_by_keys = std::mem::take(&mut at_keys);
         let (said, marked) = with_kept(job, |k| {
             let marked = failing_marked(k);
-            (k.relaunches.attempted(&outcome, Instant::now()), marked)
+            let now = Instant::now();
+            let said = if timed_by_keys {
+                k.relaunches.attempted_at_keys(&outcome, now)
+            } else {
+                k.relaunches.attempted(&outcome, now)
+            };
+            (said, marked)
         });
         tell(job, hooks, said, &step, restarted, marked);
         match outcome {
+            Outcome::NotYet(_) if let Some(line_grace) = restart => {
+                // A restart the harness made owes its line: a person's keys hold it for the
+                // grace its record names (`relaunch::carry_line_grace`: the one its end waited
+                // out), so while they do, it is tried again one second after they let it go,
+                // neither a back-off step later nor sooner, when it could not land.
+                let ladder = with_kept(job, |k| k.relaunches.pause());
+                let next = relaunch::carry_pause(
+                    ladder,
+                    (hooks.acts.status)(sid).as_deref(),
+                    line_grace(),
+                );
+                at_keys = matches!(next, relaunch::CarryPause::Keys(_));
+                pause = next.pause();
+            }
             Outcome::NotYet(_) => pause = with_kept(job, |k| k.relaunches.pause()),
             Outcome::Busy => pause = relaunch::BUSY,
             Outcome::Relaunched => {
@@ -8954,6 +9858,9 @@ struct State {
     cfg_gen: u64,
     suspended: bool,
     admission_gen: u64,
+    admission: Admission,
+    /// Agent switches that went Off since an active pass last read the policy.
+    pending_agent_off: u8,
     resumes: u64,
     shutting_down: bool,
     activation: ActivationStart,
@@ -9183,6 +10090,7 @@ impl HostHandle {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
                     cfg: effective(&cfg),
+                    admission: Admission::of(&cfg),
                     suspended,
                     unsupervised: !would_supervise(&effective(&cfg), headless),
                     ..State::default()
@@ -9704,7 +10612,7 @@ impl HostHandle {
         let switches = &self.shared.switches;
         let was = (switches.accounts(), switches.notes());
         let relaunch = switches.relaunch();
-        let agents = switches.agents.load(Ordering::SeqCst);
+        let admission = Admission::of(&cfg);
         switches.set(&cfg, self.shared.headless);
         self.accounts_switched(was);
         if relaunch != switches.relaunch() {
@@ -9712,7 +10620,7 @@ impl HostHandle {
         }
         let cfg = effective(&cfg);
         let mut state = self.shared.lock();
-        let admission_changed = agents != self.shared.switches.agents.load(Ordering::SeqCst);
+        let admission_changed = state.admission != admission;
         if state.cfg == cfg && !admission_changed {
             return;
         }
@@ -9736,6 +10644,8 @@ impl HostHandle {
             state.cfg_gen += 1;
         }
         if admission_changed {
+            state.pending_agent_off |= state.admission.0 & !admission.0;
+            state.admission = admission;
             state.admission_gen += 1;
         }
         drop(state);
@@ -11334,17 +12244,24 @@ fn host_pass(
     );
     host.full_epoch_seen = full_now;
     host.phase_epoch_seen = phase_now;
-    let (cfg, cfg_gen, active, suspended, shutting_down, switched_on) = {
+    let (cfg, cfg_gen, admission_gen, active, suspended, shutting_down, switched_on, agent_off) = {
         let mut state = shared.lock();
         let active = Shared::active(&state, shared.headless);
         let switched_on = active && std::mem::take(&mut state.unsupervised);
+        let agent_off = if active {
+            std::mem::take(&mut state.pending_agent_off)
+        } else {
+            0
+        };
         (
             state.cfg.clone(),
             state.cfg_gen,
+            state.admission_gen,
             active,
             state.suspended,
             state.shutting_down,
             switched_on,
+            agent_off,
         )
     };
     reap(host);
@@ -11372,6 +12289,7 @@ fn host_pass(
     } else {
         (HashMap::new(), HashMap::new())
     };
+    let rostered = wanted.clone();
     let off = if active {
         OffSessions::read(hooks, cfg.autopilot)
     } else {
@@ -11464,8 +12382,13 @@ fn host_pass(
     );
     publish_off(shared, &host.workers, &wanted, &off);
     if active {
-        host.was_off
-            .retain(|sid| wanted.contains_key(sid) || switched_off.contains(sid));
+        host.was_off.retain(|sid| rostered.contains_key(sid));
+        host.was_off.extend(
+            rostered
+                .iter()
+                .filter(|(_, agent)| agent_off & agent_bit(**agent) != 0)
+                .map(|(sid, _)| sid.clone()),
+        );
         host.was_off.extend(
             wanted
                 .keys()
@@ -11484,7 +12407,16 @@ fn host_pass(
             hooks,
         );
     }
-    start_workers(shared, host, &wanted, &off, active, &cfg, cfg_gen, hooks);
+    start_workers(
+        shared,
+        host,
+        &wanted,
+        &off,
+        active,
+        &cfg,
+        (cfg_gen, admission_gen),
+        hooks,
+    );
     host.view.claimed = claimed_tabs(&host.held, &host.workers);
     host.view.off = off_tabs(&wanted, &off);
     host.view.agent_off = {
@@ -13128,9 +14060,10 @@ fn start_workers(
     off: &OffSessions,
     read: bool,
     cfg: &SupervisorConfig,
-    cfg_gen: u64,
+    generations: (u64, u64),
     hooks: &Hooks,
 ) {
+    let (cfg_gen, admission_gen) = generations;
     let ctx = StartCtx {
         cfg,
         cfg_gen,
@@ -13149,7 +14082,7 @@ fn start_workers(
     let mut exits = unwatched_exits(shared, &host.workers, wanted, off, hooks);
     let mut state = shared.lock();
     let active = Shared::active(&state, shared.headless) && !state.shutting_down;
-    if !(active && read && state.cfg_gen == cfg_gen) {
+    if !(active && read && state.cfg_gen == cfg_gen && state.admission_gen == admission_gen) {
         starts.clear();
         if !active && !state.suspended {
             for (_, kept, ..) in exits.drain(..) {
@@ -14269,6 +15202,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
     let o_self = Arc::clone(&opts);
     let o_snap = Arc::clone(&opts);
     let o_settle = Arc::clone(&opts);
+    let o_line = Arc::clone(&opts);
     Acts {
         open: Arc::new(move |sid| open(&store, sid)),
         holds: Arc::new(move |sid, group| holds(&holds_store, sid, group)),
@@ -14465,6 +15399,9 @@ fn live_acts(store: Store, sock: String) -> Acts {
         restarted: Arc::new(move |sid, agent, pid| {
             o15(sid, 0).is_some_and(|o| relaunch::restarted(&o, agent, pid))
         }),
+        line_grace: Arc::new(move |sid, grace, agent, pid| {
+            o_line(sid, grace).map_or(grace, |o| relaunch::carry_line_grace(&o, agent, pid))
+        }),
         carry: Arc::new(move |sid, grace, agent, pid, through_hand| {
             let Some(o) = o16(sid, grace) else {
                 return "refused:no-home".to_string();
@@ -14511,12 +15448,15 @@ fn live_acts(store: Store, sock: String) -> Acts {
                 },
             )
         }),
-        restart: Arc::new(move |sid, grace, why| {
+        restart: Arc::new(move |sid, grace, why, selected| {
             let Some(o) = o8(sid, grace) else {
                 return "refused:no-home".to_string();
             };
             let r = match why {
                 Restart::Account { .. } => {
+                    let Some(selected) = selected else {
+                        return "wait:account-changed".to_string();
+                    };
                     let roster = match (harness_state(), aterm_time::unix_secs()) {
                         (Some(state), Some(now)) => match read_account_roster(
                             accounts::default_roster_path().as_deref(),
@@ -14528,7 +15468,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
                         },
                         _ => return "wait:account-state".to_string(),
                     };
-                    relaunch::restart_under(&o, why, &roster)
+                    relaunch::restart_under(&o, why, &roster, selected)
                 }
                 // Every other restart re-applies the login its process had; the tap's logins
                 // ride in `o.usage_tap` (`tap::Armed::lone_for`), as every relaunch line's do.
@@ -14584,7 +15524,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
         }),
         account_gone: Arc::new(account_gone_live),
         account_seat: Arc::new(move || account_seat_live(seat_home.as_deref())),
-        account_env: Arc::new(|pid| atpkg::caller_shell::process_args(pid).map(|args| args.env)),
+        account_env: Arc::new(upgrade_drive::snapshot_login_env),
         account_settings: Arc::new(crate::harness_netprobe::stored_login_of_agent),
         tap_born: Arc::new(|pid| {
             aterm_uds::process::read_process_birth(i32::try_from(pid).ok()?)
@@ -14669,22 +15609,20 @@ fn account_wall_at(
     settled: &dyn Fn() -> bool,
     now: i64,
 ) -> (&'static str, Option<String>) {
-    let roster = match read_account_roster(roster, store, now) {
+    let roster = match store.read_usage_roster(roster, now) {
         Ok(roster) => roster,
-        Err(why) => return (why.recording_word(), None),
+        Err(why) => return (roster_unread(why).recording_word(), None),
     };
-    let roster = match roster {
-        roster if roster.rows.is_empty() && agent.own => accounts::Roster::own(),
-        roster if roster.rows.is_empty() => return ("not-listed", None),
-        roster => roster,
-    };
-    let Some(args) = atpkg::caller_shell::process_args(agent.snap.pid) else {
+    if roster.implicit() && !agent.own {
+        return ("not-listed", None);
+    }
+    let Some(env) = upgrade_drive::snapshot_login_env(agent.snap) else {
         return ("no-env", None);
     };
-    let who = accounts::ProcessLogin::of_env(args.env.iter().filter_map(|kv| kv.split_once('=')));
+    let who = accounts::ProcessLogin::of_env(env.iter().filter_map(|kv| kv.split_once('=')));
     let read = WallRead {
-        env: &args.env,
-        settled: accounts::judged_label(&roster, &who).is_some() && settled(),
+        env: &env,
+        settled: accounts::judged_label(roster.roster(), &who).is_some() && settled(),
         wall: upgrade_drive::named_standing_wall(home, agent.snap),
         started: process_started(&agent.snap.start),
     };
@@ -14707,11 +15645,12 @@ struct WallRead<'a> {
 /// The recorder's call ([`account_wall_live`]) over what was read ([`WallRead`]).
 fn account_wall_of(
     store: &accounts::Store,
-    roster: &accounts::Roster,
+    captured: &accounts::UsageRoster,
     sid: &str,
     read: &WallRead<'_>,
     now: i64,
 ) -> (&'static str, Option<String>) {
+    let roster = captured.roster();
     let Some(who) = accounts::ProcessLogin::of_exec_env(read.env) else {
         return ("no-env", None);
     };
@@ -14725,9 +15664,11 @@ fn account_wall_of(
     let Some(started) = read.started else {
         return ("no-start", None);
     };
-    let recorded = accounts::record_wall(store, roster, sid, &who, wall, started, now);
+    let recorded = accounts::record_wall(store, captured, sid, &who, wall, started, now);
     let label = match recorded {
-        accounts::Recorded::NotListed | accounts::Recorded::NotStored => None,
+        accounts::Recorded::NotListed
+        | accounts::Recorded::NotStored
+        | accounts::Recorded::Refused(_) => None,
         _ => who.me(roster).account.map(str::to_owned),
     };
     let word = if recorded.lock_held() {
@@ -15096,7 +16037,7 @@ fn account_usage_live(
         Ok(roster) => roster,
         Err(word) => return word,
     };
-    let Some(args) = atpkg::caller_shell::process_args(agent.snap.pid) else {
+    let Some(env) = upgrade_drive::snapshot_login_env(agent.snap) else {
         return "no-env";
     };
     let answered = |by: i64| {
@@ -15106,7 +16047,8 @@ fn account_usage_live(
     };
     let said = |at: i64| usage_said(seen, at, crate::presence::local_offset_at(at).unwrap_or(0));
     let read = UsageRead {
-        env: &args.env,
+        env: &env,
+        started: process_started(&agent.snap.start),
         settled,
         answered: &answered,
         said: &said,
@@ -15150,15 +16092,18 @@ fn usage_roster(
     store: &accounts::Store,
     (own, listed): (bool, bool),
     now: i64,
-) -> Result<accounts::Roster, &'static str> {
-    match read_account_roster(path, store, now).map_err(RosterUnread::recording_word)? {
-        roster if !roster.rows.is_empty() => {
+) -> Result<accounts::UsageRoster, &'static str> {
+    match store
+        .read_usage_roster(path, now)
+        .map_err(|why| roster_unread(why).recording_word())?
+    {
+        roster if !roster.implicit() => {
             if !listed {
                 return Err("off");
             }
             Ok(roster)
         }
-        _ if own => Ok(accounts::Roster::own()),
+        roster if own => Ok(roster),
         _ => Err("not-listed"),
     }
 }
@@ -15166,6 +16111,7 @@ fn usage_roster(
 /// What [`account_usage_live`] read of a session's agent and its screen.
 struct UsageRead<'a> {
     env: &'a [String],
+    started: Option<i64>,
     settled: &'a dyn Fn() -> bool,
     answered: &'a dyn Fn(i64) -> Option<i64>,
     said: &'a dyn Fn(i64) -> accounts::UsageSaid,
@@ -15174,11 +16120,12 @@ struct UsageRead<'a> {
 /// The usage recorder's call, assembled ([`account_usage_live`]).
 fn account_usage_of(
     store: &accounts::Store,
-    roster: &accounts::Roster,
+    captured: &accounts::UsageRoster,
     sid: &str,
     read: &UsageRead<'_>,
     now: i64,
 ) -> &'static str {
+    let roster = captured.roster();
     let Some(who) = accounts::ProcessLogin::of_exec_env(read.env) else {
         return "no-env";
     };
@@ -15188,13 +16135,14 @@ fn account_usage_of(
     };
     let at = if accounts::judged_label(roster, &who).is_some() {
         match (read.answered)(now.saturating_sub(accounts::NOTICES_DRAWN_S)) {
-            Some(at) => at,
+            Some(at) if read.started.is_some_and(|started| at >= started) => at,
+            Some(_) => return "not-this-process",
             None => return "no-answer",
         }
     } else {
         now
     };
-    accounts::record_usage(store, roster, sid, &who, &(read.said)(at), now).as_str()
+    accounts::record_usage(store, captured, sid, &who, &(read.said)(at), now).as_str()
 }
 
 /// The production [`Acts::account_gone`].
@@ -15227,6 +16175,63 @@ pub(crate) struct AccountSeat {
     pub(crate) ladder: &'static [std::time::Duration],
 }
 
+/// The local namespace an account operation belongs to; clocks and lock waits do not identify it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccountContext {
+    roster: Option<PathBuf>,
+    state: PathBuf,
+    home: PathBuf,
+}
+
+impl AccountContext {
+    fn matches(&self, seat: &AccountSeat) -> bool {
+        self.roster == seat.roster && self.state == seat.state && self.home == seat.home
+    }
+}
+
+impl AccountSeat {
+    fn context(&self) -> AccountContext {
+        AccountContext {
+            roster: self.roster.clone(),
+            state: self.state.clone(),
+            home: self.home.clone(),
+        }
+    }
+}
+
+/// A fresh clock only from the same account namespace the caller captured.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountOrigin",
+        action = "AnotherCase",
+        reason = "Select a pending result, fallback, writer fault or changed context."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountOrigin",
+        action = "Choose",
+        reason = "Finish selecting the origin fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountOrigin",
+        action = "Observe",
+        project = "harness_host::tests::account_origin::origin_transition"
+    )
+)]
+fn current_account_seat(hooks: &Hooks, seat: &AccountSeat) -> Result<AccountSeat, String> {
+    let current = (hooks.acts.account_seat)().ok_or("account context is unavailable")?;
+    if !seat.context().matches(&current) {
+        return Err("account context changed; nothing recorded".into());
+    }
+    Ok(current)
+}
+
 /// The production [`Acts::account_seat`].
 fn account_seat_live(home: Option<&Path>) -> Option<AccountSeat> {
     Some(AccountSeat {
@@ -15238,7 +16243,7 @@ fn account_seat_live(home: Option<&Path>) -> Option<AccountSeat> {
     })
 }
 
-/// Whether the process an account move's relaunch brought up runs under the target ([`WorkerIdle::account_applied`]).
+/// Whether an account move's observed result is complete, rejected or still unproven.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Applied {
     /// Its own environment names the target.
@@ -15249,11 +16254,57 @@ enum Applied {
     Unread,
 }
 
-/// What the exec environment of process `pid` says of its login ([`Acts::account_env`], one read; `accounts::ProcessLogin::of_exec_env`).
-fn exec_login(hooks: &Hooks, pid: u32) -> Option<accounts::ProcessLogin> {
-    (hooks.acts.account_env)(pid)
+/// What the captured process's verified environment says of its login ([`Acts::account_env`]).
+fn exec_login(hooks: &Hooks, snap: &Snapshot) -> Option<accounts::ProcessLogin> {
+    (hooks.acts.account_env)(snap)
         .as_deref()
         .and_then(accounts::ProcessLogin::of_exec_env)
+}
+
+/// The current account of a matching process; unavailable evidence remains distinct from no account.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountApplication",
+        action = "AnotherCase",
+        reason = "Select a current, unavailable or disallowed process observation."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountApplication",
+        action = "Choose",
+        reason = "Finish selecting the process observation fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountApplication",
+        action = "Observe",
+        project = "harness_host::tests::account_process::application_transition"
+    )
+)]
+fn observed_account(
+    hooks: &Hooks,
+    roster: &accounts::Roster,
+    snap: &Snapshot,
+) -> Result<Option<String>, ()> {
+    let who = exec_login(hooks, snap).ok_or(())?;
+    let Some(label) = who
+        .me(roster)
+        .account
+        .filter(|_| who.default_home && who.stored_login)
+    else {
+        return Ok(None);
+    };
+    if (hooks.acts.route)(snap.pid, &snap.argv, &snap.cwd) != Route::Default
+        || !(hooks.acts.account_settings)(snap.pid, &snap.argv, &snap.cwd)
+    {
+        return Err(());
+    }
+    Ok(Some(label.to_owned()))
 }
 
 /// Run one bounded transaction on the accounts state for session `sid` (`accounts::Store::transact_within`).
@@ -15263,7 +16314,7 @@ fn account_transact_of(
     seat: &AccountSeat,
     edit: impl FnOnce(&mut accounts::State, i64) -> Result<Vec<accounts::Event>, String>,
 ) -> Result<Vec<accounts::Event>, String> {
-    let now = (hooks.acts.account_seat)().map_or(seat.now, |seat| seat.now);
+    let now = current_account_seat(hooks, seat)?.now;
     let mut note = None;
     accounts::Store::at(&seat.state).transact_within(seat.ladder, now, &mut note, |state| {
         Ok(edit(state, now)?
@@ -15274,6 +16325,56 @@ fn account_transact_of(
             })
             .collect())
     })
+}
+
+/// Records a roster-based decision only while its policy and writer context remain current.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPolicy",
+        action = "AnotherCase",
+        reason = "Select a concurrent policy or writer-context change."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPolicy",
+        action = "Choose",
+        reason = "Finish selecting the admission fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountPolicy",
+        action = "Observe",
+        project = "harness_host::tests::account_policy::policy_transition"
+    )
+)]
+fn roster_transact_of(
+    sid: &str,
+    hooks: &Hooks,
+    seat: &AccountSeat,
+    roster: &accounts::Roster,
+    edit: impl FnOnce(&mut accounts::State, i64) -> Result<Vec<accounts::Event>, String>,
+) -> Result<Vec<accounts::Event>, String> {
+    let current = current_account_seat(hooks, seat)?;
+    accounts::Store::at(&seat.state).observe_roster_within(
+        seat.ladder,
+        current.now,
+        seat.roster.as_deref().ok_or("account roster is missing")?,
+        roster,
+        |state| {
+            Ok(edit(state, current.now)?
+                .into_iter()
+                .map(|event| match event.sid {
+                    Some(_) => event,
+                    None => event.with_sid(sid),
+                })
+                .collect())
+        },
+    )
 }
 
 /// [`account_transact_of`] for a current login observation: the raw roster and login binding
@@ -15291,7 +16392,7 @@ fn login_transact_of(
         i64,
     ) -> Result<Vec<accounts::Event>, String>,
 ) -> Result<Vec<accounts::Event>, String> {
-    let now = (hooks.acts.account_seat)().map_or(seat.now, |seat| seat.now);
+    let now = current_account_seat(hooks, seat)?.now;
     let observation = accounts::LoginObservation {
         roster_path: seat.roster.as_deref().ok_or("account roster is missing")?,
         row: roster.row(label).ok_or("observed account is missing")?,
@@ -15314,78 +16415,182 @@ fn login_transact_of(
 }
 
 /// An account move whose relaunch nobody saw land, looked at again ([`AccountKept::flying`]).
-fn account_land(sid: &str, kept: &Mutex<Kept>, hooks: &Hooks, landing: Landing) {
-    let Some(flying) = with_kept_of(kept, |k| k.account.flying.clone()) else {
-        return;
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLanding",
+        action = "AnotherCase",
+        reason = "Select a writer, replay, contention or cancellation fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLanding",
+        action = "Choose",
+        reason = "Finish selecting the completion fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountLanding",
+        action = "Observe",
+        project = "harness_host::tests::account_landing::landing_transition"
+    )
+)]
+fn account_land(sid: &str, kept: &Mutex<Kept>, hooks: &Hooks, landing: Landing) -> Applied {
+    let gate = with_kept_of(kept, |k| Arc::clone(&k.account.landing));
+    let _held = match gate.try_lock() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(held)) => held.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Applied::Unread,
+    };
+    account_land_held(sid, kept, hooks, landing, &gate)
+}
+
+/// Resolves a pending move while its caller holds this generation's completion gate.
+fn account_land_held(
+    sid: &str,
+    kept: &Mutex<Kept>,
+    hooks: &Hooks,
+    landing: Landing,
+    gate: &Arc<Mutex<()>>,
+) -> Applied {
+    let Some(flying) = with_kept_of(kept, |k| {
+        Arc::ptr_eq(gate, &k.account.landing)
+            .then(|| k.account.flying.clone())
+            .flatten()
+    }) else {
+        return Applied::Unread;
+    };
+    let current = |k: &Kept| {
+        Arc::ptr_eq(gate, &k.account.landing) && k.account.flying.as_ref() == Some(&flying)
     };
     let other = || {
         with_kept_of(kept, |k| k.snapshot.clone())
             .filter(|s| (s.pid, s.start.as_str()) != (flying.pid, flying.start.as_str()))
     };
-    let Some(snap) = other().or_else(|| {
-        refresh_snapshot(sid, kept, hooks);
-        other()
-    }) else {
-        return;
-    };
     let Some(seat) = (hooks.acts.account_seat)() else {
-        return;
+        return Applied::Unread;
     };
-    let Some(roster) = account_roster(&seat) else {
-        with_kept_of(kept, |k| k.account.flying = None);
-        return;
-    };
-    let Some(who) = exec_login(hooks, snap.pid) else {
-        return;
-    };
-    let on = who.me(&roster).account.map(str::to_owned);
-    let taken = with_kept_of(kept, |k| {
-        k.account.flying.take_if(|f| *f == flying).map(|_| {
-            if on.as_deref() == Some(flying.to.as_str()) {
-                k.account.held = None;
-                k.account.unmade = None;
-                k.account.moved = Some(Moved {
-                    to: flying.to.clone(),
-                    login: flying.login.clone(),
-                    pid: snap.pid,
-                    start: snap.start.clone(),
-                    untold: landing == Landing::Asked,
-                    answered: false,
-                });
+    if !flying.origin.matches(&seat) {
+        return Applied::Unread;
+    }
+    let (snap, on, roster) = if let Some(rejected) = &flying.rejected {
+        (None, Some(rejected.on.clone()), None)
+    } else {
+        let Some(snap) = other().or_else(|| {
+            refresh_snapshot(sid, kept, hooks);
+            other()
+        }) else {
+            return Applied::Unread;
+        };
+        let Some(roster) = account_roster(&seat) else {
+            return Applied::Unread;
+        };
+        let (snap, on) = match observed_account(hooks, &roster, &snap) {
+            Ok(on) => (snap, on),
+            Err(()) => {
+                if !refresh_snapshot(sid, kept, hooks) {
+                    return Applied::Unread;
+                }
+                let Some(current) = other() else {
+                    return Applied::Unread;
+                };
+                let Ok(on) = observed_account(hooks, &roster, &current) else {
+                    return Applied::Unread;
+                };
+                (current, on)
             }
-        })
-    });
-    if taken.is_none() {
-        return;
-    }
+        };
+        (Some(snap), on, Some(roster))
+    };
     let to = flying.to.as_str();
-    let landed = on.as_deref() == Some(to);
-    if landed && landing == Landing::Carried {
-        (hooks.acts.account_made)(sid, to, flying.at);
-    }
-    let done = account_transact_of(sid, hooks, &seat, |state, now| {
+    let landed = snap.is_some() && on.as_deref() == Some(to);
+    let held = flying.rejected.as_ref().and_then(|rejected| rejected.held);
+    let mut recorded = false;
+    let edit = |state: &mut accounts::State, now| {
+        if !with_kept_of(kept, |k| current(k)) {
+            return Err(ACCOUNT_CHANGED.to_string());
+        }
         let mut events = Vec::new();
-        if !landed {
+        if let Some(rejected) = &flying.rejected {
+            if rejected.session.is_none()
+                || state.sessions.get(sid) != rejected.session.as_ref()
+                || rejected.canary.as_ref().is_some_and(|canary| {
+                    state.canary.as_ref() != Some(canary)
+                        || state.active.as_deref() != Some(to)
+                        || state.proven
+                })
+            {
+                return Ok(events);
+            }
+            if rejected.canary.is_some()
+                && state.canary == rejected.canary
+                && state.active.as_deref() == Some(to)
+                && !state.proven
+            {
+                events.extend(accounts::strike(state, to, sid, &rejected.why, now));
+            }
+        } else if !landed {
             let why = accounts::Strike::NotMoved("account-not-applied".to_string());
             events.extend(accounts::strike(state, to, sid, &why, now));
         }
+        recorded = true;
         if let Some(on) = on.as_deref() {
-            events.extend(accounts::note_session(state, sid, on, None, now));
+            events.extend(accounts::note_session(state, sid, on, held, now));
         }
         Ok(events)
+    };
+    let done = match roster.as_ref() {
+        Some(roster) => roster_transact_of(sid, hooks, &seat, roster, edit),
+        None => account_transact_of(sid, hooks, &seat, edit),
+    };
+    if done.is_err() {
+        aterm_log::info!("harness @{sid}: account move to {to}: completion not recorded");
+        return Applied::Unread;
+    }
+    let taken = with_kept_of(kept, |k| {
+        if !current(k) {
+            return false;
+        }
+        k.account.flying = None;
+        k.account.held = recorded.then_some(held).flatten();
+        if let Some(snap) = snap.as_ref().filter(|_| landed) {
+            k.account.moved = Some(Moved {
+                id: MoveId::default(),
+                origin: flying.origin.clone(),
+                to: flying.to.clone(),
+                login: flying.login.clone(),
+                process: snap.clone(),
+                untold: landing == Landing::Asked,
+                answered: false,
+            });
+        }
+        true
     });
-    let word = match (landed, done.is_ok()) {
-        (true, true) => "landed",
-        (true, false) => "landed: not recorded",
-        (false, true) => "not applied: taken back",
-        (false, false) => "not applied: not recorded",
+    if !taken {
+        return Applied::Unread;
+    }
+    (hooks.note)(HostNote::AccountProgress);
+    if landed && landing == Landing::Carried {
+        (hooks.acts.account_made)(sid, to, flying.at);
+    }
+    let word = if landed {
+        "landed"
+    } else {
+        "not applied: taken back"
     };
     aterm_log::info!("harness @{sid}: account move to {to}: {word}");
+    if landed { Applied::Yes } else { Applied::No }
 }
 
 /// How the session's loop learns of a move that landed after its ask was answered `wait:…` ([`account_land`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Landing {
+    /// The requesting loop observes the result before returning from its restart call.
+    Immediate,
     /// The host's carry landed it between two loops.
     Carried,
     /// It was read at an ask of a running loop (told `wait:account-unverified`, or one whose agent was relaunched under it unseen).
@@ -15531,10 +16736,13 @@ fn read_account_roster(
     store: &accounts::Store,
     now: i64,
 ) -> Result<accounts::Roster, RosterUnread> {
-    match store.read_roster(path, now) {
-        Ok(roster) => Ok(roster),
-        Err(accounts::RosterReadError::Roster(_)) => Err(RosterUnread::Refused),
-        Err(accounts::RosterReadError::Records(_)) => Err(RosterUnread::LoginsUnread),
+    store.read_roster(path, now).map_err(roster_unread)
+}
+
+fn roster_unread(why: accounts::RosterReadError) -> RosterUnread {
+    match why {
+        accounts::RosterReadError::Roster(_) => RosterUnread::Refused,
+        accounts::RosterReadError::Records(_) => RosterUnread::LoginsUnread,
     }
 }
 
@@ -15702,6 +16910,7 @@ struct AccountLook {
     who: accounts::ProcessLogin,
     label: Option<String>,
     snap: Snapshot,
+    generation: Arc<Mutex<()>>,
 }
 
 impl AccountLook {
@@ -15709,7 +16918,156 @@ impl AccountLook {
     fn judged<'a>(&self, roster: &'a accounts::Roster) -> Option<&'a str> {
         accounts::judged_label(roster, &self.who)
     }
+
+    /// Apply a local edit only while this captured observation remains current.
+    /// The edit runs under `Kept` and must perform no process or filesystem I/O.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountLocalObservation",
+            action = "AnotherCase",
+            reason = "Model bookkeeping: select a concurrent observation change"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountLocalObservation",
+            action = "Choose",
+            reason = "Model bookkeeping: stage the observation before its local edit"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountLocalObservation",
+            action = "Apply",
+            project = "harness_host::tests::account_local_observation::local_transition"
+        )
+    )]
+    fn with_current<R>(&self, kept: &Mutex<Kept>, edit: impl FnOnce(&mut Kept) -> R) -> Option<R> {
+        with_kept_of(kept, |k| {
+            if !Arc::ptr_eq(&self.generation, &k.account.landing)
+                || !k
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snap| account_process_matches(snap, &self.snap))
+            {
+                return None;
+            }
+            Some(edit(k))
+        })
+    }
+
+    /// Update the transaction's session row only while this local observation is current.
+    /// The caller holds the store writer; this leaf takes no lock except `Kept`.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSessionAttribution",
+            action = "Write",
+            project = "harness_host::tests::account_session::session_transition"
+        )
+    )]
+    fn note_session(
+        &self,
+        kept: &Mutex<Kept>,
+        state: &mut accounts::State,
+        sid: &str,
+        label: &str,
+        held: Option<&str>,
+        now: i64,
+    ) -> Option<Vec<accounts::Event>> {
+        self.with_current(kept, |_| {
+            accounts::note_session(state, sid, label, held, now)
+        })
+    }
 }
+
+/// Record the first loss of this authentication context, preserving its return marker semantics.
+fn lost_seen_of(k: &mut Kept, snap: &Snapshot, point: AccountPoint, now: i64) -> i64 {
+    let came_back = k.account.came_back.take();
+    if !matches!(
+        point,
+        AccountPoint::Wall {
+            kind: aterm_phase::WallKind::Auth
+        }
+    ) {
+        return now;
+    }
+    match &k.account.lost {
+        Some(lost) if account_process_matches(&lost.process, snap) => lost.at,
+        _ => {
+            let at = if came_back.as_ref() == Some(&snap.login) {
+                i64::MIN
+            } else {
+                now
+            };
+            k.account.lost = Some(LostSeen {
+                process: snap.clone(),
+                at,
+            });
+            at
+        }
+    }
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSessionAttribution",
+        action = "Capture",
+        reason = "Environment: the session's account is captured; the conformance fixture stages it before the native Write"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSessionAttribution",
+        action = "NewGeneration",
+        reason = "Environment: a new account generation lands before the write; the conformance fixture stages it before the native Write"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSessionAttribution",
+        action = "NewProcess",
+        reason = "Environment: another local process takes the session; the conformance fixture stages it before the native Write"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSessionAttribution",
+        action = "NewLogin",
+        reason = "Environment: the session's login changes; the conformance fixture stages it before the native Write"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSessionAttribution",
+        action = "Gone",
+        reason = "Environment: the session's row is gone; the conformance fixture stages it before the native Write"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSessionAttribution",
+        action = "Enrich",
+        reason = "Environment: the session's metadata is enriched meanwhile; the conformance fixture stages it before the native Write"
+    )
+)]
+/// The `AccountSessionAttribution` model's environment, staged by `session_transition` before
+/// the native `Write` (`AccountLook::note_session`).
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn account_session_attribution_environment() {}
 
 /// [`WorkerIdle::roster_word`] for a process on the roster row `me` names.
 fn roster_word_of(
@@ -15917,6 +17275,42 @@ fn account_point_read(
     }
 }
 
+/// The loop's point for a non-Claude pooled CLI: a CLI whose walls are measured on screen needs no
+/// Claude transcript row to stand at [`accounts::Point::Wall`], while an unmeasured CLI never
+/// fabricates one without [`standing_wall`].
+fn pool_point(
+    seat: &AccountSeat,
+    cli: accounts::Cli,
+    look: &AccountLook,
+    point: AccountPoint,
+    seen: i64,
+) -> accounts::Point {
+    match point {
+        AccountPoint::TurnEnd => accounts::Point::TurnEnd,
+        AccountPoint::Wall {
+            kind: aterm_phase::WallKind::Auth,
+        } => accounts::Point::LostLogin { seen },
+        AccountPoint::LoginEnded => accounts::Point::LoginEnded,
+        AccountPoint::Wall { .. } => match standing_wall(seat, &look.snap) {
+            Standing::Own(wall) => accounts::Point::Wall {
+                window: wall.window,
+                at: Some(wall.at),
+            },
+            Standing::Unwritten
+                if cli.accounts().walls_measured_on.is_some()
+                    && look.snap.session.is_some()
+                    && process_started(&look.snap.start).is_some() =>
+            {
+                accounts::Point::Wall {
+                    window: accounts::UNNAMED_WINDOW.to_string(),
+                    at: Some(seat.now),
+                }
+            }
+            Standing::Unwritten | Standing::NotOwn => accounts::Point::TurnEnd,
+        },
+    }
+}
+
 /// The roster's advice as the policy takes it.
 fn account_advice_of(
     advice: &accounts::Advice,
@@ -15945,21 +17339,117 @@ fn held_word(step: &str) -> Option<&'static str> {
     }
 }
 
-/// The way back for a move that ended at the shell.
-fn account_way_back(job: &WorkerJob, hooks: &Hooks, snap: &mut Snapshot) {
-    let moved = with_kept(job, |k| {
-        k.account
-            .moved
-            .take_if(|m| (m.pid, m.start.as_str()) == (snap.pid, snap.start.as_str()))
+/// Retry a deferred fallback before the exit loop launches another process.
+fn account_relaunch(
+    job: &WorkerJob,
+    hooks: &Hooks,
+    snap: &mut Snapshot,
+    act: impl FnOnce(&Snapshot) -> String,
+) -> String {
+    if !account_way_back(job, hooks, snap) {
+        return "wait:account-state".into();
+    }
+    act(snap)
+}
+
+/// Whether the captured return still belongs to this worker and authentication context.
+fn account_return_current(
+    job: &WorkerJob,
+    kept: &Kept,
+    gate: &Arc<Mutex<()>>,
+    moved: &Moved,
+    snap: &Snapshot,
+) -> bool {
+    !job.revoked.load(Ordering::SeqCst)
+        && Arc::ptr_eq(gate, &kept.account.landing)
+        && kept.account.flying.is_none()
+        && kept.account.moved.as_ref() == Some(moved)
+        && account_process_matches(&moved.process, snap)
+        && kept
+            .snapshot
+            .as_ref()
+            .is_some_and(|current| account_process_matches(&moved.process, current))
+}
+
+/// Consume a current return and publish its requested login together, without rewriting an observation.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountReturn",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: select the captured return and concurrent local-state change"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountReturn",
+        action = "Choose",
+        reason = "Model bookkeeping: stage the selected return before the native Commit"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountReturn",
+        action = "Commit",
+        project = "harness_host::tests::account_return::return_transition"
+    )
+)]
+fn account_finish_return(
+    job: &WorkerJob,
+    gate: &Arc<Mutex<()>>,
+    moved: &Moved,
+    snap: &mut Snapshot,
+    revert: bool,
+) -> bool {
+    with_kept(job, |kept| {
+        if !account_return_current(job, kept, gate, moved, snap) {
+            return false;
+        }
+        if revert {
+            let owed = kept.owed.as_mut().filter(|owed| owed.snap == *snap);
+            snap.login.clone_from(&moved.login);
+            if let Some(owed) = owed {
+                owed.snap.clone_from(snap);
+            }
+            kept.account.came_back = Some(moved.login.clone());
+        }
+        kept.account.moved = None;
+        true
+    })
+}
+
+/// The way back for a move that ended at the shell; false leaves its relaunch pending.
+fn account_way_back(job: &WorkerJob, hooks: &Hooks, snap: &mut Snapshot) -> bool {
+    if job.revoked.load(Ordering::SeqCst) {
+        return false;
+    }
+    let (moved, gate) = with_kept(job, |k| {
+        (
+            k.account
+                .moved
+                .as_ref()
+                .filter(|m| account_process_matches(&m.process, snap))
+                .cloned(),
+            Arc::clone(&k.account.landing),
+        )
     });
     let Some(moved) = moved else {
-        return;
+        return true;
+    };
+    let _held = match gate.try_lock() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(held)) => held.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
     };
     if job.switches.accounts() == accounts::Mode::Off {
-        return;
+        return account_finish_return(job, &gate, &moved, snap, false);
     }
-    let seat = (hooks.acts.account_seat)();
-    let roster = seat.as_ref().and_then(account_roster);
+    let Some(seat) = (hooks.acts.account_seat)().filter(|seat| moved.origin.matches(seat)) else {
+        return false;
+    };
+    let roster = account_roster(&seat);
     let follow = roster
         .as_ref()
         .and_then(|r| r.row(&moved.to))
@@ -15968,36 +17458,37 @@ fn account_way_back(job: &WorkerJob, hooks: &Hooks, snap: &mut Snapshot) {
             row.was.iter().any(|was| was.as_deref() == before)
         });
     if follow {
-        return;
+        return account_finish_return(job, &gate, &moved, snap, false);
     }
     let mut serves = false;
     let mut dead = (false, false);
-    let struck = seat.map(|seat| {
-        account_transact_of(&job.sid, hooks, &seat, |state, now| {
-            let active = state.active.as_deref() == Some(moved.to.as_str());
-            serves = active && state.proven;
-            let canary =
-                active && !state.proven && state.canary.as_ref().is_some_and(|c| c.sid == job.sid);
-            let events = if canary {
-                let why = accounts::Strike::Failed("exited before it answered".to_string());
-                accounts::strike(state, &moved.to, &job.sid, &why, now)
-            } else {
-                Vec::new()
-            };
-            if let Some(roster) = &roster {
-                let out =
-                    |login: &Option<String>| account_signed_out(roster, state, login.as_deref());
-                dead = (out(&moved.login), out(&snap.login));
-            }
-            Ok(events)
-        })
+    let struck = account_transact_of(&job.sid, hooks, &seat, |state, now| {
+        if !with_kept(job, |k| account_return_current(job, k, &gate, &moved, snap)) {
+            return Err(ACCOUNT_CHANGED.into());
+        }
+        let active = state.active.as_deref() == Some(moved.to.as_str());
+        serves = active && state.proven;
+        let canary =
+            active && !state.proven && state.canary.as_ref().is_some_and(|c| c.sid == job.sid);
+        let events = if canary {
+            let why = accounts::Strike::Failed("exited before it answered".to_string());
+            accounts::strike(state, &moved.to, &job.sid, &why, now)
+        } else {
+            Vec::new()
+        };
+        if let Some(roster) = &roster {
+            let out = |login: &Option<String>| account_signed_out(roster, state, login.as_deref());
+            dead = (out(&moved.login), out(&snap.login));
+        }
+        Ok(events)
     });
-    if matches!(struck, Some(Err(_))) {
+    if struck.is_err() {
         aterm_log::info!(
             "harness @{}: account {} not struck: refused",
             job.sid,
             moved.to
         );
+        return false;
     }
     let (first, other) = if serves {
         (dead.1, dead.0)
@@ -16008,6 +17499,9 @@ fn account_way_back(job: &WorkerJob, hooks: &Hooks, snap: &mut Snapshot) {
         (false, _) => serves,
         (true, false) => !serves,
         (true, true) => {
+            if !account_finish_return(job, &gate, &moved, snap, false) {
+                return false;
+            }
             aterm_log::info!(
                 "harness @{}: its agent left before its move to account {} was answered, and \
                  the login before the move and the one it had are both signed out; relaunched \
@@ -16015,9 +17509,12 @@ fn account_way_back(job: &WorkerJob, hooks: &Hooks, snap: &mut Snapshot) {
                 job.sid,
                 moved.to
             );
-            return;
+            return true;
         }
     };
+    if !account_finish_return(job, &gate, &moved, snap, !had) {
+        return false;
+    }
     if had {
         aterm_log::info!(
             "harness @{}: its agent left before its move to account {} was answered; relaunched \
@@ -16031,8 +17528,6 @@ fn account_way_back(job: &WorkerJob, hooks: &Hooks, snap: &mut Snapshot) {
             }
         );
     } else {
-        snap.login.clone_from(&moved.login);
-        with_kept(job, |k| k.account.came_back = Some(moved.login.clone()));
         aterm_log::info!(
             "harness @{}: its move to account {} was not answered before its agent left; \
              relaunched under the login before it",
@@ -16040,6 +17535,7 @@ fn account_way_back(job: &WorkerJob, hooks: &Hooks, snap: &mut Snapshot) {
             moved.to
         );
     }
+    true
 }
 
 /// Whether the store records `login` signed out ([`account_way_back`]).
@@ -19167,12 +20663,13 @@ impl Acts {
             self_snapshot: Arc::new(|_, _, _| None),
             restarted: Arc::new(|_, _, _| false),
             carry: Arc::new(|_, _, _, _, _| "refused:inert".to_string()),
+            line_grace: Arc::new(|_, grace, _, _| grace),
             relaunch_restored: Arc::new(|_, _, _, _| "refused:inert".to_string()),
             earlier_tab: Arc::new(|_, _| {}),
             adopted_gone: Arc::new(|_, _| None),
             in_flight_here: Arc::new(|_, _| false),
             carry_in_flight: Arc::new(|_, _| None),
-            restart: Arc::new(|_, _, _| "refused:inert".to_string()),
+            restart: Arc::new(|_, _, _, _| "refused:inert".to_string()),
             tasked: Arc::new(|_, _, _| None),
             finished: Arc::new(|_, _, _| None),
             limit_reset: Arc::new(|_| None),

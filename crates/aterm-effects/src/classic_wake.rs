@@ -68,8 +68,8 @@ pub struct ClassicWake {
     spawned: Option<((u16, u16), (u16, u16))>,
     bed_scratch: BedScratch,
     air_runs: Vec<Vec<CometSample>>,
-    crown_ink_memo: std::cell::Cell<Option<(WakeLightKey, u32)>>,
-    veil_cap_memo: std::cell::Cell<Option<(WakeLightKey, u8)>>,
+    crown_ink_memo: Option<(WakeLightKey, u32)>,
+    veil_cap_memo: Option<(WakeLightKey, u8)>,
     /// Test-only: draw the mono face on a dark ground as additive light over the letters.
     #[cfg(test)]
     pub(crate) mono_unbedded: bool,
@@ -88,11 +88,23 @@ pub struct ClassicWake {
     /// (looks7 round 2's control: a cut).
     #[cfg(test)]
     pub(crate) tracer_leave_px: Option<f32>,
+    /// Test-only: admit the one-colour landing ring at the flying lights'
+    /// floor, as it was (looks8 K2's negative control).
+    #[cfg(test)]
+    pub(crate) ring_flying: bool,
     /// Test-only: a paper tracer kept to the caret's row eases in from the
     /// row's top whichever edge it enters by, as it did (looks7 round 3's
     /// review's control: a run from below is cut at the row's bottom).
     #[cfg(test)]
     pub(crate) tracer_top_only: bool,
+    /// Test-only: the paper face walks the whole spectrum, through the hues
+    /// paper darkens to olive, as it did (looks8 K10's negative control).
+    #[cfg(test)]
+    pub(crate) paper_muddy: bool,
+    /// Test-only: the one-colour face's bed under a lit page's letters at its
+    /// whole hue, as it was (looks8 round 2's negative control).
+    #[cfg(test)]
+    pub(crate) mono_lit_whole: bool,
 }
 
 impl Default for ClassicWake {
@@ -141,6 +153,7 @@ const TRACER_STEP_PX: f32 = 2.0;
 /// round 3's review). A run whose rows are clear of letters is drawn whole,
 /// one stroke across them; without a caret, a run that crosses letters
 /// keeps no light.
+#[inline]
 fn tracer_on_caret_row(
     (verts, dense): (&mut Vec<BeamVertex>, &mut Vec<BeamVertex>),
     text: TextView<'_>,
@@ -284,6 +297,13 @@ impl ClassicWake {
     const CHAIN_GAP_MAX: f32 = 0.40;
     const CHAIN_MARGIN: f32 = 0.10;
     const CHAIN_LIFE_MAX: f32 = 0.50;
+    /// The share of its hue the one-colour face's bed keeps under a lit
+    /// page's letters ([`crate::cursor_glow::page_lit_ink`]), the rest the
+    /// page: a chosen colour far round the wheel from the page's (`#d03a8c`
+    /// on Solarized Dark's teal) laid a maroon smear under the letters at
+    /// the page's luminance, and the letters' edges, blended over it, read
+    /// under their bar (`f` at 3.93:1 of its own 4.06, looks8 K10).
+    const MONO_LIT_BED_SHARE: f32 = 0.4;
 
     /// Fresh dormant classic-wake animation state.
     #[inline]
@@ -308,8 +328,8 @@ impl ClassicWake {
             spawned: None,
             bed_scratch: BedScratch::EMPTY,
             air_runs: Vec::new(),
-            crown_ink_memo: std::cell::Cell::new(None),
-            veil_cap_memo: std::cell::Cell::new(None),
+            crown_ink_memo: None,
+            veil_cap_memo: None,
             #[cfg(test)]
             mono_unbedded: false,
             #[cfg(test)]
@@ -321,7 +341,13 @@ impl ClassicWake {
             #[cfg(test)]
             tracer_leave_px: None,
             #[cfg(test)]
+            ring_flying: false,
+            #[cfg(test)]
             tracer_top_only: false,
+            #[cfg(test)]
+            paper_muddy: false,
+            #[cfg(test)]
+            mono_lit_whole: false,
         }
     }
 
@@ -396,6 +422,7 @@ impl ClassicWake {
     }
 
     /// Drops all in-flight light and forgets the last cursor position.
+    #[inline]
     pub fn reset(&mut self) {
         self.sparks.clear();
         self.ring = None;
@@ -410,6 +437,7 @@ impl ClassicWake {
     }
 
     /// Translates row-addressed members under `map`, dropping any that leave the grid.
+    #[inline]
     pub fn translate_rows(&mut self, map: &impl Fn(u16) -> Option<u16>) {
         self.sparks.retain_mut(|s| match map(s.row) {
             Some(row) => {
@@ -492,21 +520,23 @@ impl ClassicWake {
         }
         self.last = cur;
 
-        let mut last_alive: Option<((Instant, u32), bool)> = None;
-        self.sparks.retain(|s| {
-            let key = (s.born, s.life.to_bits());
-            match last_alive {
-                Some((prev_key, alive)) if prev_key == key => alive,
-                _ => {
-                    let alive = now.saturating_duration_since(s.born).as_secs_f32() < s.life;
-                    last_alive = Some((key, alive));
-                    alive
+        if !self.sparks.is_empty() {
+            let mut last_alive: Option<((Instant, u32), bool)> = None;
+            self.sparks.retain(|s| {
+                let key = (s.born, s.life.to_bits());
+                match last_alive {
+                    Some((prev_key, alive)) if prev_key == key => alive,
+                    _ => {
+                        let alive = now.saturating_duration_since(s.born).as_secs_f32() < s.life;
+                        last_alive = Some((key, alive));
+                        alive
+                    }
                 }
+            });
+            if self.sparks.len() > Self::MAX_SPARKS {
+                let drop = self.sparks.len() - Self::MAX_SPARKS;
+                self.sparks.drain(0..drop);
             }
-        });
-        if self.sparks.len() > Self::MAX_SPARKS {
-            let drop = self.sparks.len() - Self::MAX_SPARKS;
-            self.sparks.drain(0..drop);
         }
         if let Some(r) = self.ring
             && now.saturating_duration_since(r.born).as_secs_f32() >= r.life
@@ -525,12 +555,24 @@ impl ClassicWake {
             self.emit_mono_crown(now, cfg, geom, cur, halos);
             ink.ledger
                 .admit_halos_masked(halos, from, InkLedger::HEAD_FLOOR);
-            if out.laid() < Self::MAX_QUADS {
-                let from = out.quads().len();
-                self.emit_ring(now, cfg, geom, out.quads());
-                let to = out.quads().len();
-                ink.ledger
-                    .admit_masked(out.quads(), from..to, InkLedger::FLYING_FLOOR);
+            // THE ONE-COLOUR LANDING RING KEEPS EVERY LETTER'S BAR. It lands
+            // on the new prompt, whose `$` its left bar crosses. Drawn over
+            // the letters, the frame's bloom and SDR crown (the post passes
+            // over `cursor_glow_add`, which no admission reads) spread its bar
+            // a cell past every cut and lifted the ground beside the `$`'s
+            // strokes to 4.21-4.32:1 (the trail gallery's classic-pink
+            // `enter-bottom` e120, looks7, 10 of 10 captures). It lies under
+            // the letters instead, where neither pass reaches it, admitted
+            // at the letter floor. The SPECTRUM ring stays the ruled v0.28
+            // light, over the letters and unadmitted.
+            #[cfg(test)]
+            let flying = self.ring_flying;
+            #[cfg(not(test))]
+            let flying = false;
+            if flying {
+                self.lay_mono_ring(now, cfg, geom, out, ink.ledger, InkLedger::FLYING_FLOOR);
+            } else {
+                self.lay_mono_ring(now, cfg, geom, under, ink.ledger, InkLedger::LETTER_FLOOR);
             }
             out.keep_laid(Self::MAX_QUADS);
         } else if cfg.dark_theme {
@@ -648,6 +690,7 @@ impl ClassicWake {
         fp
     }
 
+    #[inline]
     fn spawn(
         &mut self,
         (pr, pc): (u16, u16),
@@ -751,6 +794,7 @@ impl ClassicWake {
         }
     }
 
+    #[inline]
     fn build_runs(
         &mut self,
         now: Instant,
@@ -836,6 +880,7 @@ impl ClassicWake {
         live
     }
 
+    #[inline]
     fn emit_comet(
         &mut self,
         now: Instant,
@@ -853,6 +898,8 @@ impl ClassicWake {
         let s = core_thick as i32;
         let straighten = (geom.cw as f32).max(chf) * 0.8;
         let clip = geom.beam_clip();
+        let (mono, color, accent, hue) = (cfg.classic_mono, cfg.color, cfg.accent, self.hue);
+        let color_fn = |pos| comet_color(mono, color, accent, hue, pos);
 
         let mut ri = 0;
         while ri < live {
@@ -867,13 +914,11 @@ impl ClassicWake {
                     s0.y as i32 - s / 2,
                     s,
                     s,
-                    premul_rgb(self.comet_color(cfg, s0.pos), s0.cov),
+                    premul_rgb(color_fn(s0.pos), s0.cov),
                 );
                 continue;
             }
-            comet_glow_quads(out, clip, r, core_thick, straighten, &|pos| {
-                self.comet_color(cfg, pos)
-            });
+            comet_glow_quads(out, clip, r, core_thick, straighten, &color_fn);
         }
     }
 
@@ -881,6 +926,7 @@ impl ClassicWake {
         clippy::too_many_arguments,
         reason = "clock, config, geometry, cursor, both streams and the over-text facts"
     )]
+    #[inline]
     fn emit_mono_dark(
         &mut self,
         now: Instant,
@@ -911,6 +957,10 @@ impl ClassicWake {
         } else {
             0.0
         };
+        #[cfg(test)]
+        let mono_lit_whole = self.mono_lit_whole;
+        #[cfg(not(test))]
+        let mono_lit_whole = false;
         let mut last: Option<(u32, bool, u32, u32)> = None;
         let mut lit = std::mem::take(&mut scratch.air);
         let mut ri = 0;
@@ -930,6 +980,11 @@ impl ClassicWake {
                     _ => {
                         let b = match air {
                             Some(air) if in_air => air.ink(rgb, page, shape.sat),
+                            _ if lit_page && !mono_lit_whole => crate::effect_util::lerp_rgb(
+                                page & 0x00FF_FFFF,
+                                crate::cursor_glow::dark_bed_ink(rgb, page, budget, shape.sat),
+                                Self::MONO_LIT_BED_SHARE,
+                            ),
                             _ => crate::cursor_glow::dark_bed_ink(rgb, page, budget, shape.sat),
                         };
                         let r = crate::rainbow_kitty::ribbon::rail_ink(rgb & 0x00FF_FFFF);
@@ -971,6 +1026,8 @@ impl ClassicWake {
         let straighten = (geom.cw as f32).max(chf) * 0.8;
         let clip = geom.beam_clip();
         let caret_cell = cur.map(|(cr, cc)| CursorGlow::caret_box(geom, cr, cc));
+        let (mono, color, accent, hue) = (cfg.classic_mono, cfg.color, cfg.accent, self.hue);
+        let color_fn = |pos| comet_color(mono, color, accent, hue, pos);
         let mut i = 0;
         while i < n {
             let r = &self.air_runs[i];
@@ -991,13 +1048,11 @@ impl ClassicWake {
                     s0.y as i32 - s / 2,
                     s,
                     s,
-                    premul_rgb(self.comet_color(cfg, s0.pos), s0.cov),
+                    premul_rgb(color_fn(s0.pos), s0.cov),
                 );
                 continue;
             }
-            comet_glow_quads(out, clip, r, core_thick, straighten, &|pos| {
-                self.comet_color(cfg, pos)
-            });
+            comet_glow_quads(out, clip, r, core_thick, straighten, &color_fn);
             if let Some(cell) = stub {
                 clip_stream_to(out, from, cell);
             }
@@ -1027,6 +1082,7 @@ impl ClassicWake {
     const LIGHT_STROKE_THICK: f32 = 0.12;
     const LIGHT_STROKE_GAIN: f32 = 1.9;
 
+    #[inline]
     fn emit_light_comet(
         &mut self,
         now: Instant,
@@ -1066,6 +1122,32 @@ impl ClassicWake {
         };
         let mut verts = std::mem::take(&mut self.light_verts);
         let mut last_ink: Option<(u32, u32)> = None;
+        #[inline]
+        const fn sample_ink_vertex(
+            wake: &ClassicWake,
+            cfg: &GlowConfig,
+            ground: &LightGround,
+            last_ink: &mut Option<(u32, u32)>,
+            drop: f32,
+            s: &CometSample,
+        ) -> BeamVertex {
+            let raw = wake.paper_color(cfg, s.pos);
+            let color = match *last_ink {
+                Some((prev, c)) if prev == raw => c,
+                _ => {
+                    let c = ground.body_ink(raw);
+                    *last_ink = Some((raw, c));
+                    c
+                }
+            };
+            BeamVertex {
+                x: s.x,
+                y: s.y + drop,
+                color,
+                cov: (s.cov as f32 * ClassicWake::LIGHT_STROKE_GAIN).min(LIGHT_BODY_ALPHA_CAP)
+                    as u8,
+            }
+        }
         let mut ri = 0;
         while ri < live {
             if under.laid() >= Self::MAX_QUADS {
@@ -1074,28 +1156,10 @@ impl ClassicWake {
             let run = &self.comet_runs[ri];
             ri += 1;
             verts.clear();
-            let mut ink = |s: &CometSample| {
-                let raw = self.comet_color(cfg, s.pos);
-                let color = match last_ink {
-                    Some((prev, c)) if prev == raw => c,
-                    _ => {
-                        let c = ground.body_ink(raw);
-                        last_ink = Some((raw, c));
-                        c
-                    }
-                };
-                BeamVertex {
-                    x: s.x,
-                    y: s.y + drop,
-                    color,
-                    cov: (f32::from(s.cov) * Self::LIGHT_STROKE_GAIN).min(LIGHT_BODY_ALPHA_CAP)
-                        as u8,
-                }
-            };
             match run.as_slice() {
                 [] => continue,
                 [lone] => {
-                    let v = ink(lone);
+                    let v = sample_ink_vertex(self, cfg, &ground, &mut last_ink, drop, lone);
                     let dx = cwf * 0.45;
                     verts.push(BeamVertex { x: v.x - dx, ..v });
                     verts.push(BeamVertex { x: v.x + dx, ..v });
@@ -1110,13 +1174,14 @@ impl ClassicWake {
                     while si < run.len() {
                         let s = &run[si];
                         si += 1;
-                        let mut v = ink(s);
+                        let mut v = sample_ink_vertex(self, cfg, &ground, &mut last_ink, drop, s);
                         if across_rows {
                             let t =
                                 (((s.x - ax) * dx + (s.y - ay) * dy) * inv_len2).clamp(0.0, 1.0);
                             v.x = ax + dx * t;
                             v.y = ay + dy * t + drop;
                         }
+                        step_over_paper_skip(&mut verts, v);
                         verts.push(v);
                     }
                     if across_rows && kept {
@@ -1160,6 +1225,7 @@ impl ClassicWake {
         }
     }
 
+    #[inline]
     fn emit_crown(
         &self,
         now: Instant,
@@ -1212,6 +1278,7 @@ impl ClassicWake {
         }
     }
 
+    #[inline]
     fn emit_mono_crown(
         &self,
         now: Instant,
@@ -1244,8 +1311,9 @@ impl ClassicWake {
 
     const LIGHT_CROWN_COV: f32 = 100.0 * Self::LIGHT_STROKE_GAIN;
 
+    #[inline]
     fn emit_light_crown(
-        &self,
+        &mut self,
         now: Instant,
         cfg: &GlowConfig,
         geom: Geom,
@@ -1260,7 +1328,15 @@ impl ClassicWake {
         let color = if cfg.classic_mono {
             cfg.color
         } else {
-            hsv2rgb(self.hue, 0.9, 1.0)
+            #[cfg(test)]
+            let hue = if self.paper_muddy {
+                self.hue
+            } else {
+                paper_crown_hue(self.hue)
+            };
+            #[cfg(not(test))]
+            let hue = paper_crown_hue(self.hue);
+            hsv2rgb(hue, 0.9, 1.0)
         };
         #[cfg(not(test))]
         let unsolved = false;
@@ -1274,11 +1350,11 @@ impl ClassicWake {
                 fg: cfg.theme_fg,
                 bg: cfg.theme_bg,
             };
-            match self.crown_ink_memo.get() {
+            match self.crown_ink_memo {
                 Some((k, v)) if k == key => v,
                 _ => {
                     let v = LightGround::of(cfg).body_ink(color);
-                    self.crown_ink_memo.set(Some((key, v)));
+                    self.crown_ink_memo = Some((key, v));
                     v
                 }
             }
@@ -1307,6 +1383,28 @@ impl ClassicWake {
         if cov > 0 { Some((ring, t, cov)) } else { None }
     }
 
+    /// The one-colour landing ring laid into `out` and admitted at `floor`
+    /// (the frame's ring: [`Self::emit_ring`]).
+    #[inline]
+    fn lay_mono_ring(
+        &self,
+        now: Instant,
+        cfg: &GlowConfig,
+        geom: Geom,
+        out: &mut RampSink<'_>,
+        ledger: &mut InkLedger,
+        floor: f32,
+    ) {
+        if out.laid() < Self::MAX_QUADS {
+            let from = out.quads().len();
+            self.emit_ring(now, cfg, geom, out.quads());
+            let to = out.quads().len();
+            ledger.admit_masked(out.quads(), from..to, floor);
+            out.keep_laid(Self::MAX_QUADS);
+        }
+    }
+
+    #[inline]
     fn emit_ring(&self, now: Instant, cfg: &GlowConfig, geom: Geom, out: &mut Vec<GlowQuad>) {
         let Some((ring, t, cov)) = self.ring_now(now, cfg) else {
             return;
@@ -1318,6 +1416,7 @@ impl ClassicWake {
     /// ink under the over-text ceiling, as Water's light ripples are. The soft veil
     /// ([`Self::emit_light_ring`]), capped to keep the theme's text legible, barely tints the
     /// paper on its own.
+    #[inline]
     fn emit_light_ring_rim(
         &self,
         now: Instant,
@@ -1330,11 +1429,14 @@ impl ClassicWake {
         };
         let from = out.len();
         Self::ring_square(ring, t, premul_rgb(0x00FF_FFFF, cov), geom, out);
-        let ink = InkRole::OverText.ink(cfg.accent);
-        reink_quads(&mut out[from..], LIGHT_INK_ALPHA_CAP as u8, |_| ink);
+        if out.len() > from {
+            let ink = InkRole::OverText.ink(cfg.accent);
+            reink_quads(&mut out[from..], LIGHT_INK_ALPHA_CAP as u8, |_| ink);
+        }
     }
 
     /// A ring's square outline at `t` of its life, growing from 0.6 to 1.6 rows about its cell.
+    #[inline]
     fn ring_square(ring: Ring, t: f32, premul: u32, geom: Geom, out: &mut Vec<GlowQuad>) {
         let s = ((0.6 + 1.0 * t) * chf_of(geom)) as i32;
         let th = (geom.ch as i32 / 8).max(2);
@@ -1348,8 +1450,9 @@ impl ClassicWake {
         push_rect(out, geom, cx + s - th, y0, th, two_s, premul);
     }
 
+    #[inline]
     fn emit_light_ring(
-        &self,
+        &mut self,
         now: Instant,
         cfg: &GlowConfig,
         geom: Geom,
@@ -1383,11 +1486,11 @@ impl ClassicWake {
                     fg: cfg.theme_fg,
                     bg: cfg.theme_bg,
                 };
-                let veil_cap = match self.veil_cap_memo.get() {
+                let veil_cap = match self.veil_cap_memo {
                     Some((k, v)) if k == key => v,
                     _ => {
                         let v = CursorGlow::light_veil_cap(veil, cfg.theme_fg, cfg.theme_bg);
-                        self.veil_cap_memo.set(Some((key, v)));
+                        self.veil_cap_memo = Some((key, v));
                         v
                     }
                 };
@@ -1414,6 +1517,91 @@ impl ClassicWake {
     const fn comet_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
         comet_color(cfg.classic_mono, cfg.color, cfg.accent, self.hue, pos)
     }
+
+    /// The spectrum face's colour on paper: its walk skips the hues paper
+    /// cannot show clean ([`crate::color_math::light_spectrum_hue`]), which
+    /// its ink, darkened to the paper's bar, laid as olive and khaki (the
+    /// `enter-bottom` Return's tracer, looks8 K10). The mono face keeps its
+    /// own colours.
+    #[inline]
+    const fn paper_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
+        #[cfg(test)]
+        if self.paper_muddy {
+            return self.comet_color(cfg, pos);
+        }
+        if cfg.classic_mono {
+            self.comet_color(cfg, pos)
+        } else {
+            hsv2rgb(
+                crate::color_math::light_spectrum_hue((self.hue + pos * 0.5) % 1.0),
+                0.95,
+                1.0,
+            )
+        }
+    }
+}
+
+/// The spectrum face's crown on paper at `hue` (turns): a hue paper cannot
+/// show clean ([`crate::color_math::LIGHT_MUDDY_HUES`]), whose ink darkened
+/// to the paper's bar reads olive, held at the band's nearer edge, and every
+/// other hue as it is. Remapped whole as its stroke's walk is
+/// ([`crate::color_math::light_spectrum_hue`]), the crown under a landing's
+/// ring took another colour at every hue, and in the settings card the ring
+/// on paper all but vanished over it.
+#[inline]
+const fn paper_crown_hue(hue: f32) -> f32 {
+    let (b0, b1) = crate::color_math::LIGHT_MUDDY_HUES;
+    let h = hue - hue.floor();
+    if h > b0 && h < b1 {
+        if h - b0 <= b1 - h { b0 } else { b1 }
+    } else {
+        h
+    }
+}
+
+/// Before `next` joins `verts`, a step where the paper spectrum jumps the
+/// hues paper cannot show ([`crate::color_math::LIGHT_MUDDY_HUES`]): where
+/// the last vertex lies on one side of the skip and `next` on the other,
+/// two vertices at their midpoint, the last's colour then `next`'s, so the
+/// stroke turns from orange to green at a hard edge and never blends
+/// through the olive the skip leaves out (looks8 K10).
+#[inline]
+fn step_over_paper_skip(verts: &mut Vec<BeamVertex>, next: BeamVertex) {
+    #[inline]
+    const fn side(rgb: u32) -> u8 {
+        let (b0, b1) = crate::color_math::LIGHT_MUDDY_HUES;
+        let (h, s, _) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
+        if s < 0.3 {
+            0
+        } else if h <= b0 * 360.0 + 1.0 {
+            1
+        } else if h >= b1 * 360.0 - 1.0 && h < 180.0 {
+            2
+        } else {
+            0
+        }
+    }
+    let Some(&last) = verts.last() else {
+        return;
+    };
+    if last.color == next.color {
+        return;
+    }
+    let (a, b) = (side(last.color), side(next.color));
+    if a == 0 || b == 0 || a == b {
+        return;
+    }
+    let mid = BeamVertex {
+        x: 0.5 * (last.x + next.x),
+        y: 0.5 * (last.y + next.y),
+        cov: ((u16::from(last.cov) + u16::from(next.cov)) / 2) as u8,
+        color: last.color,
+    };
+    verts.push(mid);
+    verts.push(BeamVertex {
+        color: next.color,
+        ..mid
+    });
 }
 
 #[inline]
@@ -1912,6 +2100,9 @@ mod tests {
         );
     }
 
+    /// The SPECTRUM wake on dark is v0.28's, byte for byte (the owner's
+    /// ruling). The one-colour wake's fold was re-baked deliberately by
+    /// looks8 K2, whose landing ring lies under the letters.
     #[test]
     fn the_dark_wake_is_byte_identical_to_its_base() {
         let mono = GlowConfig {
@@ -1938,7 +2129,7 @@ mod tests {
             got,
             [
                 11_293_809_440_103_835_944,
-                12_176_010_846_753_476_077,
+                11_956_472_567_039_891_853,
                 8_579_084_186_203_313_172,
             ],
             "the dark classic wake drifted from its base"
@@ -2042,6 +2233,115 @@ mod tests {
         );
     }
 
+    /// THE PAPER SPECTRUM LAYS NO OLIVE (looks8 K10): Classic's spectrum face
+    /// on paper darkens each colour to the paper's bar, and its yellows
+    /// darkened read olive and khaki (the `enter-bottom` Return's tracer).
+    /// Through a jump at every twelfth of the hue wheel, no stroke or crown
+    /// quad on paper wears a hue between 45 and 80 degrees. Negative
+    /// control: walking the whole wheel, some do.
+    #[test]
+    fn the_paper_spectrum_lays_no_olive() {
+        let (g, c) = (geom(), light_cfg());
+        let olive = |muddy: bool| {
+            let mut n = 0;
+            for k in 0..12 {
+                let t0 = Instant::now();
+                let mut rig = Rig::default();
+                rig.w.paper_muddy = muddy;
+                rig.tick(Some((1, 4)), t0, &c, g);
+                rig.w.hue = k as f32 / 12.0;
+                rig.tick(Some((4, 30)), ms(t0, 16), &c, g);
+                // Each end's colour, its premultiplied light over its opacity.
+                let own = |rgb: u32, a: u8| {
+                    let ch =
+                        |sh: u32| ((((rgb >> sh) & 0xFF) * 255) / u32::from(a.max(1))).min(255);
+                    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+                };
+                n += rig
+                    .under
+                    .iter()
+                    .flat_map(|q| [(q.color, q.alpha), (q.color2, q.alpha2)])
+                    .filter(|&(rgb, a)| {
+                        let (h, s, _) = crate::color_math::rgb2hsv(own(rgb, a));
+                        a >= 24 && s > 0.3 && (45.0..80.0).contains(&h)
+                    })
+                    .count();
+            }
+            n
+        };
+        assert!(
+            olive(true) > 0,
+            "control: the whole wheel lays olive on paper"
+        );
+        assert_eq!(olive(false), 0, "the paper spectrum lays olive");
+    }
+
+    /// A CHOSEN COLOUR'S BED KEEPS NEAR A LIT PAGE UNDER ITS LETTERS (looks8
+    /// round 2's K10): on Solarized Dark the one-colour face's bed under the
+    /// letters lies at the page's luminance in its own hue, and a colour far
+    /// round the wheel from the page's (`#d03a8c` on the teal) laid a maroon
+    /// smear the letters' edges blended over and read under their bar (`f`
+    /// at 3.93:1 of its own 4.06). Under a lettered row a leap's bed keeps
+    /// within half the distance from the page the whole hue took. Negative
+    /// control: the whole hue.
+    #[test]
+    fn a_chosen_colour_s_bed_keeps_near_a_lit_page_under_its_letters() {
+        let g = geom();
+        let c = GlowConfig {
+            classic_mono: true,
+            color: 0x00D0_3A8C,
+            accent: 0x00D0_3A8C,
+            theme_fg: 0x0083_9496,
+            theme_bg: 0x0000_2B36,
+            ..cfg()
+        };
+        let lines = [(2, 0, 30)];
+        let ch = g.ch as i32;
+        let reach = |whole: bool| {
+            let t0 = Instant::now();
+            let mut rig = Rig {
+                spans: crate::cursor_glow::TextSpans::of_lines(&lines),
+                ..Rig::default()
+            };
+            rig.w.mono_lit_whole = whole;
+            rig.tick(Some((2, 2)), t0, &c, g);
+            rig.tick(Some((2, 28)), ms(t0, 16), &c, g);
+            let own = |rgb: u32, a: u8| {
+                let ch = |sh: u32| ((((rgb >> sh) & 0xFF) * 255) / u32::from(a.max(1))).min(255);
+                (ch(16) << 16) | (ch(8) << 8) | ch(0)
+            };
+            let far = |rgb: u32| {
+                [16u32, 8, 0]
+                    .iter()
+                    .map(|&sh| {
+                        (((rgb >> sh) & 0xFF) as i32 - ((c.theme_bg >> sh) & 0xFF) as i32).abs()
+                    })
+                    .max()
+                    .unwrap_or(0)
+            };
+            rig.under
+                .iter()
+                .filter(|q| {
+                    let (y0, y1) = (i32::from(q.y), i32::from(q.y) + i32::from(q.h));
+                    y0 >= 2 * ch + ch / 4 && y1 <= 3 * ch - ch / 4
+                })
+                .flat_map(|q| [(q.color, q.alpha), (q.color2, q.alpha2)])
+                .filter(|&(_, a)| a >= 64)
+                .map(|(rgb, a)| far(own(rgb, a)))
+                .max()
+                .unwrap_or(0)
+        };
+        let (kept, whole) = (reach(false), reach(true));
+        assert!(
+            whole >= 20,
+            "control: the whole hue lies {whole} from the page"
+        );
+        assert!(
+            2 * kept <= whole,
+            "under the letters the bed lies {kept} from the page, the whole hue {whole}"
+        );
+    }
+
     #[test]
     fn a_light_ground_draws_ink_under_the_letters_and_a_veil_ring_and_no_additive_light() {
         let (g, c) = (geom(), light_cfg());
@@ -2117,7 +2417,7 @@ mod tests {
                 };
                 for unbound in [false, true] {
                     let born = Instant::now();
-                    let w = ClassicWake {
+                    let mut w = ClassicWake {
                         ring: Some(Ring {
                             row: caret.0 - 1,
                             col: caret.1,

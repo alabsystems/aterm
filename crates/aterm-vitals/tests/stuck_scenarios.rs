@@ -17,6 +17,77 @@ use aterm_vitals::jobs::{
 use scenarios::{TICK_MS, curl, follow_fds, pipe_end, sleeper, socket_fd, spinner, tcp_fd};
 use world::{OutFile, Proc, World, hint};
 
+#[test]
+fn an_adopted_agent_call_counts_new_same_group_compiler_work() {
+    let mut w = World::new();
+    w.call(1, 300, 4000, sleeper(4001, "bash"), None);
+    w.p(4000).born = Some(0);
+    w.p(4001).born = Some(0);
+    let before = run_to(&mut w, 1_200_000, |_, _| {});
+    assert!(before.row("a4000").unwrap().no_progress, "quiet control");
+    w.p(4000).ppid = 1;
+    let mut compiler = Proc::new(4002, 4001, "trustc");
+    compiler.pgid = 4000;
+    compiler.sid = 4000;
+    compiler.state = ProcState::Running;
+    compiler.cpu_per_s = 1_000_000_000;
+    compiler.born = Some(w.at);
+    w.add(compiler);
+    let _ = w.tick(TICK_MS);
+    let early = w.tick(TICK_MS);
+    let early_row = early.row("a4000").unwrap();
+    assert_eq!(early_row.members, 3);
+    assert_eq!(early_row.class, Class::Running, "birth is recent progress");
+    assert!(!early_row.no_progress, "the new child is already working");
+    // Numeric CPU is shown for BusySilent, after the existing recent-progress window.
+    let after = run_to(
+        &mut w,
+        aterm_vitals::jobs::RUNNING_WINDOW_MS + TICK_MS,
+        |_, _| {},
+    );
+    let row = after.row("a4000").unwrap();
+    assert_eq!(
+        row.members, 3,
+        "new child remains owned after controller loss"
+    );
+    assert!(row.cpu_mc.is_some_and(|cpu| cpu >= 1000), "{}", row.wire());
+    assert!(
+        !row.no_progress,
+        "active child is not a zero-work call: {}",
+        row.wire()
+    );
+    w.p(4002).start += 1;
+    let reused = w.tick(TICK_MS);
+    let row = reused.row("a4000").unwrap();
+    assert!(
+        row.tick.refused,
+        "retiring an old PID generation leaves coverage unknown"
+    );
+    assert_eq!(row.cpu_mc, None);
+}
+
+#[test]
+fn adopted_call_with_unread_new_child_keeps_cpu_coverage_unknown() {
+    let mut w = World::new();
+    w.call(1, 300, 4000, sleeper(4001, "bash"), None);
+    w.p(4000).born = Some(0);
+    w.p(4001).born = Some(0);
+    let before = run_to(&mut w, 1_200_000, |_, _| {});
+    assert!(before.row("a4000").unwrap().no_progress);
+    w.p(4000).ppid = 1;
+    let mut child = Proc::new(4002, 4001, "trustc");
+    child.pgid = 4000;
+    child.sid = 4000;
+    child.born = Some(w.at);
+    w.add(child);
+    w.unread.insert(4002);
+    let after = w.tick(TICK_MS);
+    let row = after.row("a4000").unwrap();
+    assert!(row.tick.refused, "missing descendant facts remain explicit");
+    assert_eq!(row.cpu_mc, None);
+    assert!(!row.no_progress, "unread CPU is not zero CPU");
+}
+
 fn run_to(w: &mut World, until_ms: u64, mut each: impl FnMut(&mut World, u64)) -> JobsView {
     let mut rel = 0;
     each(w, 0);
@@ -4999,6 +5070,113 @@ fn an_agent_calls_class_is_the_command_its_join_names_never_its_shell_wrapper() 
     let row = v.row("a600").expect("the sleep");
     assert_eq!(row.mu_from, Some(MuFrom::Prior), "{}", row.wire());
     assert!(!row.no_progress, "{}", row.wire());
+}
+
+/// Three nested setsid wrappers, as an observer, controller and silent compiler use them.
+fn nested_detached_work() -> World {
+    let mut w = World::new();
+    w.call(1, 300, 400, sleeper(401, "controller"), None);
+    let at = w.at;
+    w.p(400).born = Some(at - 3000);
+    w.p(400).syscalls_per_s = 30;
+    w.p(400).cpu_per_s = 1_000_000;
+    w.p(401).born = Some(at - 2000);
+    w.p(401).sid = 401;
+    w.p(401).pgid = 401;
+    let mut compiler = spinner(402, "trustc");
+    compiler.ppid = 401;
+    compiler.sid = 402;
+    compiler.pgid = 402;
+    compiler.born = Some(at - 1000);
+    w.add(compiler);
+    w
+}
+
+#[test]
+fn nested_detached_work_qualifies_local_stalls_without_merging_jobs_or_crediting_output() {
+    let mut w = nested_detached_work();
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    let compiler = v.row("a402").expect("compiler");
+    assert_eq!(compiler.class, Class::BusySilent);
+    for id in ["a400", "a401"] {
+        let row = v.row(id).expect("wrapper");
+        assert_eq!(row.members, 1, "the jobs remain disjoint");
+        assert_eq!(row.working_descendant, Some((402, w.p(402).start)));
+        assert!(row.tick.progress.is_none(), "CPU is no output progress");
+        assert!(row.wire().contains(" working_descendant=402 "));
+    }
+    assert_eq!(v.row("a400").unwrap().verdict, Verdict::Stuck);
+    assert!(
+        v.row("a401").unwrap().no_progress,
+        "the local evidence remains"
+    );
+
+    w.p(402).cpu_per_s = 0;
+    let v = run_to(&mut w, 10_000, |_, _| {});
+    assert!(
+        v.row("a401").unwrap().working_descendant.is_none(),
+        "current work only"
+    );
+}
+
+#[test]
+fn nested_work_never_crosses_unknown_other_user_pty_joined_or_unrelated_contexts() {
+    for boundary in ["unknown", "other-user", "pty", "joined", "unrelated"] {
+        let mut w = nested_detached_work();
+        match boundary {
+            "unknown" => w.p(402).refused = true,
+            "other-user" => w.p(401).uid += 1,
+            "pty" => w.p(401).tty = true,
+            "joined" => w.hint(1, hint(401, Consumer::AgentBg, Some("independent"), None)),
+            "unrelated" => w.p(402).ppid = 300,
+            _ => unreachable!(),
+        }
+        let v = run_to(&mut w, 1_200_000, |_, _| {});
+        assert_eq!(
+            v.row("a400").unwrap().working_descendant,
+            None,
+            "{boundary}"
+        );
+        assert_eq!(v.row("a400").unwrap().verdict, Verdict::Stuck, "{boundary}");
+    }
+}
+
+#[test]
+fn nested_work_keeps_its_witness_as_recent_output_gives_way_to_cpu_work() {
+    let mut w = nested_detached_work();
+    let out = (2, 402);
+    w.files.insert(
+        out,
+        OutFile {
+            size: 0,
+            per_s: 0,
+            lf: Some(true),
+        },
+    );
+    w.p(402).out = Some(out);
+    let _ = run_to(&mut w, 1_200_000, |_, _| {});
+    w.files.get_mut(&out).unwrap().size += 40;
+    let v = w.tick(TICK_MS);
+    assert_eq!(v.row("a402").unwrap().class, Class::Running);
+    assert!(v.row("a402").unwrap().tick.progress.is_some());
+    let v = w.tick(TICK_MS);
+    let compiler = v.row("a402").unwrap();
+    assert_eq!(
+        compiler.class,
+        Class::Running,
+        "the bounded recent-output window"
+    );
+    assert!(compiler.tick.progress.is_none(), "no new output this tick");
+    for id in ["a400", "a401"] {
+        assert_eq!(
+            v.row(id).unwrap().working_descendant,
+            Some((402, w.p(402).start))
+        );
+    }
+    let v = w.tick(aterm_vitals::jobs::RUNNING_WINDOW_MS);
+    assert_eq!(v.row("a402").unwrap().class, Class::BusySilent);
+    assert!(v.row("a401").unwrap().working_descendant.is_some());
+    assert_eq!(v.row("a400").unwrap().verdict, Verdict::Stuck);
 }
 
 /// `while sleep 2; do date; done` run by tab 1's shell under block `id`: each tick the shell

@@ -6665,6 +6665,18 @@ fn the_session_paused_dialog_switches_to_the_fallback() {
         approved(&on_screen(&three, &full())),
         Some(RULE_MODEL_SWITCH)
     );
+    // Measured on 2.1.308: the dialog over the API-retry row Claude Code left standing under it,
+    // which a window tab stood at for hours, read as no box (2026-10-26).
+    let rows = phase_fixtures::screen(phase_fixtures::SESSION_PAUSED_RETRY_ROW);
+    let d = on_screen(&rows, &full());
+    let (rule, choice, _, subject, _) = approval(&d);
+    assert_eq!(
+        (rule, choice),
+        (RULE_MODEL_SWITCH, &Choice::Digit(1)),
+        "{d:?}"
+    );
+    assert!(subject.ends_with("=> Switch to Opus 4.8"), "{subject}");
+    assert!(reason(&on_screen(&rows, &limited)).contains("model_fallback is off"));
 }
 
 const RULE_UNDER_TEST: &str = "decline-under-test@v0";
@@ -6709,6 +6721,53 @@ fn guarded_row(guard: &str, rows: &[String]) -> Option<String> {
 fn decline_on(rows: &[String], text: &str) -> Result<Decision, String> {
     let p = aterm_phase::parse_prompt_v2(rows).expect("the box");
     decline(RULE_UNDER_TEST, &p, text.to_string(), "the box".to_string())
+}
+
+/// A decline's own words, typed into the refusal, can read to the box reader as a kept grant
+/// ("without asking", "always"): the refusal that holds exactly the decline's text is still the
+/// decline's, and Enter submits it. Measured in `lab disk-ask` (worker, 2026-10-26): the worker's
+/// first dry run, declined with [`DISK_WORKER_FIRST_BASH`] typed in, escalated "the box has no
+/// refusal at option 4" and the worker waited on the box.
+#[test]
+fn a_decline_whose_words_read_as_a_kept_grant_is_still_submitted() {
+    let first_bash = decline_text(
+        "this command",
+        DISK_WORKER_SHELL_UNREAD,
+        DISK_WORKER_FIRST_BASH,
+    );
+    let always = decline_text(
+        "this command",
+        "the channel under test says why",
+        "Always run it on its own",
+    );
+    for text in [first_bash, always] {
+        let typed = typed_box(&text);
+        let p = aterm_phase::parse_prompt_v2(&typed).expect("the box");
+        assert_eq!(
+            p.options[1].role,
+            Role::Persist,
+            "the case under test: the typed refusal reads as a kept grant: {typed:#?}"
+        );
+        assert!(
+            matches!(
+                decline_step(&p, &typed, 1, &text),
+                Ok(DeclineStep::Submit { .. })
+            ),
+            "{text}: {:?}",
+            decline_step(&p, &typed, 1, &text)
+        );
+        assert!(
+            matches!(
+                decline_on(&typed, &text),
+                Ok(Decision::Decline { refusal: 1, .. })
+            ),
+            "{text}: {:?}",
+            decline_on(&typed, &text)
+        );
+        let other = format!("{text} Then stop");
+        assert!(decline_step(&p, &typed, 1, &other).is_err(), "{other}");
+        assert!(decline_on(&typed, &other).is_err(), "{other}");
+    }
 }
 
 #[test]
@@ -9075,8 +9134,9 @@ fn fenced_out(d: &Decision) -> usize {
 /// piped only into reads) and a System State read (`aterm ctl … sys`) under [`RULE_DISK_WORKER`]; every other Bash command (an `rm`, a
 /// worktree's removal, a `kill`, a write by redirect or `tee`, an `aterm harness disk` joined to
 /// an `rm`) is declined with [`DISK_WORKER_DECLINE`] on the box's `No`. CONTROL: an `aterm` of
-/// another verb or by a relative path, and a read of a secret beside aterm's command, are
-/// declined; aterm's own command reads no secret under `~/Library`, which a `cat` does.
+/// another verb or by a relative path is declined so, and a read of a secret beside aterm's
+/// command or a glob among its words with the proof that failed; aterm's own command reads no
+/// secret under `~/Library`, which a `cat` does.
 #[test]
 fn a_disk_workers_bash_boxes_pass_only_reads_and_aterm_harness_disk() {
     for (level, base) in [("safe", ctx()), ("all", full())] {
@@ -9125,18 +9185,153 @@ fn a_disk_workers_bash_boxes_pass_only_reads_and_aterm_harness_disk() {
             "aterm harness disk free x > /tmp/freed.txt",
             "aterm harness disk | tee /tmp/disk.txt",
             "aterm harness disk free $(rm -rf ~/y)",
-            "aterm harness disk free ~/.npm/*",
             "aterm harness accounts",
             "./aterm harness disk free ~/.npm",
             "env aterm harness disk free ~/.npm",
-            "aterm harness disk free ~/.npm; cat ~/.ssh/id_ed25519",
-            "cat ~/Library/Caches/pip/x",
             "aterm ctl @self sys disk > /tmp/sys.txt",
             "aterm ctl @self send hello",
         ] {
             let d = on_screen(&bash_box(&[theirs], None), &worker);
             assert_eq!(fenced_out(&d), 1, "{level}: {theirs}: the `No`");
         }
+        // Reads and aterm's verb whose proof fails (a secret read beside them, a glob among
+        // aterm's words) are declined with that reason, not the fence's, whose remedy is the verb
+        // they hold.
+        for (unproven, why) in [
+            (
+                "aterm harness disk free ~/.npm; cat ~/.ssh/id_ed25519",
+                "secret",
+            ),
+            ("cat ~/Library/Caches/pip/x", "secret"),
+            ("aterm harness disk free ~/.npm/*", "glob"),
+        ] {
+            let d = on_screen(&bash_box(&[unproven], None), &worker);
+            let (refusal, text) = unproven_out(&d);
+            assert_eq!(refusal, 1, "{level}: {unproven}: the `No`");
+            assert!(
+                text.contains("aterm could not prove it") && text.contains(why),
+                "{level}: {unproven}: {text}"
+            );
+        }
+    }
+}
+
+/// `d` as [`RULE_DISK_WORKER`]'s decline of a command that is only reads and aterm's verbs but was
+/// not proven: the refusal it amends, by index, and its text, which is not [`DISK_WORKER_DECLINE`].
+fn unproven_out(d: &Decision) -> (usize, &str) {
+    match d {
+        Decision::Decline {
+            rule_id,
+            refusal,
+            text,
+            ..
+        } => {
+            assert_eq!(*rule_id, RULE_DISK_WORKER, "{d:?}");
+            assert!(text.starts_with(DECLINE_PREFIX), "{d:?}");
+            assert!(!text.contains(DISK_WORKER_DECLINE), "{d:?}");
+            (*refusal, text)
+        }
+        _ => panic!("expected the disk-free worker's decline, got {d:?}"),
+    }
+}
+
+/// A DISK-FREE WORKER'S UNPROVEN READ IS DECLINED WITH ITS REAL REASON. Claude Code writes the
+/// shell snapshot the fence proves a command against only once its Bash tool has run one, and
+/// removes it when its session ends, so a worker started where no running session ran one finds
+/// none, and its first boxes cannot be proven. Before this they were declined with the fence's own
+/// text, which names `aterm harness disk free` as the way, so the worker was told to use the very
+/// verb it had just been refused (`lab disk-ask` unanswered and exhausted: its dry run declined),
+/// and a worker with no other session about could free nothing. Now its dry run, a System State
+/// read, the verb and a plain read are declined with [`DISK_WORKER_SHELL_UNREAD`] and the remedy
+/// [`DISK_WORKER_FIRST_BASH`] (`pwd`, which Claude Code runs without a box). Another unread shell
+/// startup is declined with its own reason, and no `pwd`. CONTROL: an `rm` is declined with the
+/// fence's text whatever the shell; with a snapshot read the same boxes are approved.
+#[test]
+fn a_disk_workers_unproven_read_is_declined_with_its_real_reason() {
+    let no_snapshot = format!(
+        "{}zsh in /Users/_owner/.claude/shell-snapshots: the Bash tool's shell startup is unknown",
+        crate::supervise::policy::shell_startup::NO_SNAPSHOT
+    );
+    let prefixed = "the worker's `CLAUDE_CODE_SHELL_PREFIX` puts the person's own shell code \
+                    before every command the Bash tool runs";
+    let first_bash = decline_text(
+        "this command",
+        DISK_WORKER_SHELL_UNREAD,
+        DISK_WORKER_FIRST_BASH,
+    );
+    assert!(first_bash.contains("Run `pwd` alone first"), "{first_bash}");
+    let ours = [
+        ("aterm harness disk free --dry-run", RULE_DISK_WORKER),
+        ("aterm ctl @self sys disk scope=aterm", RULE_DISK_WORKER),
+        ("aterm harness disk free ~/.npm/_cacache", RULE_DISK_WORKER),
+        ("ls ~/.cargo", RULE_READ_ONLY),
+    ];
+    for (level, base) in [("safe", ctx as fn() -> ApprovalCtx), ("all", full)] {
+        let unwritten = ApprovalCtx {
+            shell: Err(no_snapshot.clone()),
+            ..disk_worker(base())
+        };
+        let other = ApprovalCtx {
+            shell: Err(prefixed.to_string()),
+            ..disk_worker(base())
+        };
+        for (cmd, _) in ours {
+            let rows = bash_box(&[cmd], None);
+            let d = on_screen(&rows, &unwritten);
+            assert_eq!(unproven_out(&d), (1, first_bash.as_str()), "{level}: {cmd}");
+            let d = on_screen(&rows, &other);
+            let (refusal, text) = unproven_out(&d);
+            assert_eq!(refusal, 1, "{level}: {cmd}");
+            assert!(
+                text.contains("aterm could not prove it") && !text.contains("pwd"),
+                "{level}: {cmd}: another unread startup says its own reason: {text}"
+            );
+        }
+        let rm = bash_box(&["rm -rf ~/.npm/_cacache"], None);
+        assert_eq!(fenced_out(&on_screen(&rm, &unwritten)), 1, "{level}");
+        assert_eq!(fenced_out(&on_screen(&rm, &other)), 1, "{level}");
+        let read = disk_worker(base());
+        assert!(read.shell.is_ok(), "a test build's shell reads as modelled");
+        for (cmd, rule) in ours {
+            let d = on_screen(&bash_box(&[cmd], None), &read);
+            assert_eq!(approved(&d), Some(rule), "{level}: {cmd}: {d:?}");
+        }
+    }
+}
+
+/// A disk-free worker's `aterm harness disk free` of two long paths, which Claude Code 2.1.311 drew
+/// on two gutter rows (measured in `lab disk-ask` worker, 2026-10-26), is fenced: read as lines,
+/// its second row is a command of its own. Its refusal says so and how to fit one row, not that
+/// the worker remove only through the verb it ran; the same paths on one row pass, and a wrapped
+/// command that is no read and no aterm verb even read as one line keeps the fence's text.
+#[test]
+fn a_disk_workers_verb_on_wrapped_rows_is_declined_with_why_and_its_remedy() {
+    let wrapped = decline_text("this command", DISK_WORKER_WRAPPED, DISK_WORKER_ONE_ROW);
+    let two = bash_box(
+        &[
+            "│ aterm harness disk free /private/tmp/at.lab/runs/w/scratch/home/ballast",
+            "│ /private/tmp/at.lab/runs/w/scratch/home/work/beta/target",
+        ],
+        None,
+    );
+    let one = bash_box(
+        &["aterm harness disk free ~/ballast ~/work/beta/target"],
+        None,
+    );
+    let rm = bash_box(&["│ rm -rf ~/ballast", "│ ~/work/beta/target"], None);
+    for (level, base) in [("safe", ctx as fn() -> ApprovalCtx), ("all", full)] {
+        let worker = disk_worker(base());
+        assert_eq!(
+            unproven_out(&on_screen(&two, &worker)),
+            (1, wrapped.as_str()),
+            "{level}"
+        );
+        assert_eq!(
+            approved(&on_screen(&one, &worker)),
+            Some(RULE_DISK_WORKER),
+            "{level}"
+        );
+        assert_eq!(fenced_out(&on_screen(&rm, &worker)), 1, "{level}");
     }
 }
 

@@ -442,6 +442,11 @@ impl EffectsPipeline {
     /// law both hosts run.
     #[inline]
     pub fn sync_scroll(&mut self, current: ContentScrollState, now: Instant) -> ScrollChange {
+        if let Some(previous) = self.cursor_scroll_state
+            && current.screen_clears > previous.screen_clears
+        {
+            self.cursor.screen_cleared();
+        }
         let decision = content_scroll_decision(self.cursor_scroll_state, current);
         self.cursor_scroll_state = Some(current);
         match decision {

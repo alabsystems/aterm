@@ -55,13 +55,15 @@
 //! stops its own writer thread the same way.
 
 use crate::brecord::{BrokerRecord, GroupCommit};
-use crate::client::kept_from_children;
+use crate::client::{kept_from_children, RecvBuf};
 use crate::proto::{
-    append_delivery_frame, append_delivery_frame_with_crc, append_frame, compute_delivery_crc,
-    decode_request, decode_response, encode_protocol_refusal, encode_replicate, encode_response,
-    read_frame, write_frame, Request, Response, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER,
-    ERR_BAD_SUBJECT, ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND,
-    ERR_TOO_MANY_CONNS, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION, RETAINED_FROM_PREFIX,
+    append_delivery_frame, append_delivery_frame_stamped, append_delivery_frame_with_crc,
+    append_frame, compute_delivery_crc, decode_request_with_bt, decode_response,
+    encode_protocol_refusal, encode_replicate_stamped, encode_response, read_frame, write_frame,
+    AttachedProducerStats, FaceStats, Request, Response, WireStats, CAP_EXPIRED_PREFIX,
+    ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RETIRE_REFUSED,
+    ERR_SUBJECT_BOUND, ERR_TOO_MANY_CONNS, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION,
+    RETAINED_FROM_PREFIX,
 };
 use crate::store::{
     is_hidden_subject, replicated_reserved_msg, reserved_msg, Begun, BrokerLog, Durability,
@@ -114,6 +116,14 @@ pub use crate::twins::broker_batch_clamp;
 #[cfg(clean_islands)]
 pub use broker_island::broker_batch_clamp;
 
+#[cfg(clean_islands)]
+#[path = "tail_wake_island.rs"]
+mod tail_wake_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::{tail_skip_clamp, tail_wake_head_advance};
+#[cfg(clean_islands)]
+pub use tail_wake_island::{tail_skip_clamp, tail_wake_head_advance};
+
 contract_fn! {
     /// Verified check that unanswered acceptor wake rounds lie within the 10-attempt cap
     /// (`unanswered <= 10`), linked via `clean-kernel-defeq` to `broker_wake_attempts_within_cap_isl`.
@@ -125,6 +135,40 @@ contract_fn! {
     }
 }
 
+contract_fn! {
+    /// Verified check that a selective subscriber tail's cursor has caught up to its
+    /// highest matched visible head (`matched_head <= cursor`), linked via
+    /// `clean-kernel-defeq` to `tail_wake_caught_up_isl`.
+    #[must_use]
+    pub fn tail_wake_is_caught_up(matched_head: u64, cursor: u64) -> bool
+    clauses [ensures result == (matched_head <= cursor)]
+    {
+        matched_head <= cursor
+    }
+}
+
+/// Per-subscriber wakeup state for [`Broker::set_selective_tail_wake`] (`cost study B4 step 2`).
+struct TailParker {
+    id: u64,
+    filter: Filter,
+    idle_marks: bool,
+    cv: Condvar,
+    needs_wake: AtomicBool,
+    state: Mutex<TailParkerState>,
+}
+
+struct TailParkerState {
+    safe_skip_to: u64,
+    matched_head: u64,
+    has_unread_match: bool,
+}
+
+enum WakePlan {
+    None,
+    Broadcast,
+    Selective(Vec<Arc<TailParker>>),
+}
+
 /// One durable mutation queued to the single writer thread. The connection thread
 /// blocks on `ack` until the writer's batch fsync makes the record durable (or fails).
 struct WriteOp {
@@ -132,11 +176,13 @@ struct WriteOp {
     ack: Sender<AckResult>,
 }
 
-/// What the writer's queue carries: a durable mutation, or the STOP [`stop_writer`]
-/// queues behind every one already queued, which is how the writer learns of shutdown
-/// at once ([`writer_loop`]).
+/// What the writer's queue carries: a durable mutation; a RUN of them, which one
+/// connection's client sent together and the writer takes into one batch
+/// ([`Pipeline::release`]); or the STOP [`stop_writer`] queues behind every one already
+/// queued, which is how the writer learns of shutdown at once ([`writer_loop`]).
 enum Queued {
     Op(WriteOp),
+    Run(Vec<WriteOp>),
     Stop,
 }
 
@@ -174,9 +220,14 @@ enum WriteKind {
     },
     /// A record shipped by a leader, to be appended at exactly its leader offset
     /// (see [`Request::Replicate`]), with the leader's log identity when it sent one.
+    /// `conn_diverged` latches on this connection if any `Replicate` conflicts with a
+    /// record already held at `< next`, so later pipelined records in the same stream
+    /// cannot append onto a divergent prefix before the link fences.
     Replicate {
         rec: BrokerRecord,
         leader: Option<crate::LogIdentity>,
+        bt_ms: Option<u64>,
+        conn_diverged: Arc<AtomicBool>,
     },
     /// Bind a producer id to the principal a capability names, durably (a hidden
     /// `/a/bind` record). Checked and appended under the writer's lock, so two
@@ -219,6 +270,10 @@ enum WriteKind {
     /// issues the flush outside the log lock once this batch is committed (skipped when a
     /// full flush already covers the head) and answers with the durable head.
     Flush,
+    /// Un-fence every fenced follower link on the writer thread ([`Broker::rejoin_followers`]),
+    /// resetting each un-fenced link's cursor to the leader's retention base, redialing,
+    /// and catching up `[base..head)` in this batch. Answers with the number of un-fenced links.
+    RejoinFollowers,
 }
 
 /// Upper bound on records folded into one group-commit fsync. The batch self-tunes to
@@ -292,6 +347,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// instead of buffering unboundedly. A well-behaved client keeps its window well under
 /// this (see [`crate::client::Client::publish_pipelined`]).
 const PIPELINE_DEPTH: usize = 1024;
+
+/// How much a served connection's request buffer ([`RecvBuf`]) grows per read, and
+/// what it returns to once empty: about one Unix socket's receive buffer (8 KiB on
+/// macOS), so one read takes what a client's burst left there, while an idle
+/// connection pins 8 KiB rather than a subscription's 64 KiB, at [`MAX_CONNS`] of them.
+const CONN_READ_STEP: usize = 8 * 1024;
 
 /// DEFAULT write timeout for a served connection — the request thread's writes and the
 /// pipelined ack-writer's alike (they share one socket, so they share one bound), until
@@ -427,7 +488,6 @@ impl<T: Eq + std::hash::Hash> RevocationSet<T> {
         self.manual.contains(value) || self.file.contains(value)
     }
 
-    #[cfg(any(feature = "cap", test))]
     fn is_empty(&self) -> bool {
         self.manual.is_empty() && self.file.is_empty()
     }
@@ -567,7 +627,7 @@ fn apply_revocation_file(shared: &Shared, path: &Path) -> io::Result<usize> {
     shared.sighup_seen.store(seen, Ordering::Release);
     shared.has_revocation_file.store(true, Ordering::Release);
     shared.revocation_epoch.fetch_add(1, Ordering::AcqRel);
-    shared.tail.notify_all();
+    notify_all_tails(shared);
     Ok(count)
 }
 
@@ -1390,7 +1450,13 @@ impl HelloCopy {
                 durability: Some(log.served()),
                 lineage: Some(log.lineage().clone()),
                 retention,
-                requests: Some(crate::proto::REQUEST_RETIRE | crate::proto::REQUEST_GAP_NOTICES),
+                requests: Some(
+                    crate::proto::REQUEST_RETIRE
+                        | crate::proto::REQUEST_GAP_NOTICES
+                        | crate::proto::REQUEST_TOLD_FETCH
+                        | crate::proto::REQUEST_BROKER_TIMES
+                        | crate::proto::REQUEST_STATS,
+                ),
                 // Never copied: the answer reads it fresh from the vitals
                 // (`hello_health`), since it moves with every batch's flush.
                 health: None,
@@ -1429,9 +1495,28 @@ fn hello_answer(told: HelloCopy, vitals: &crate::store::LogVitals) -> HelloCopy 
     HelloCopy { identity, ext }
 }
 
+#[cfg_attr(not(feature = "cap"), allow(dead_code))]
+#[derive(Debug, Clone)]
+struct AttachedConnInfo {
+    principal: String,
+    transport: &'static str,
+    producer_id: u64,
+    attached_at_ms: u64,
+    grants: Vec<(Filter, Option<u64>)>,
+    peer_id: Option<[u8; 32]>,
+}
+
 struct Shared {
     log: Mutex<BrokerLog>,
     tail: Condvar,
+    /// Monotone Unix-millisecond timestamp when this `Broker` opened (`REQUIREMENTS` R5).
+    started_at_ms: u64,
+    /// Active listener endpoints (`"<scheme>:<addr>"`), keyed by registration order.
+    listeners: Mutex<std::collections::BTreeMap<u64, String>>,
+    listener_seq: AtomicU64,
+    /// Live attached producer entries per open connection (`conn_id`), cleaned up by
+    /// [`ConnGuard::drop`] (`REQUIREMENTS` R5).
+    attached_conns: Mutex<HashMap<u64, Vec<AttachedConnInfo>>>,
     /// The SUBSCRIBER-VISIBLE head: subscribers are delivered records below it, `Fetch`
     /// reads below it, `Last` pins it. In the Strict/Ordered/Relaxed tiers it is the
     /// log's head as each batch commits (advanced under the log lock) — HELD at the first
@@ -1621,8 +1706,21 @@ struct Shared {
     wills_settled: AtomicU64,
     /// [`BrokerStats::tail_broadcasts`].
     tail_broadcasts: AtomicU64,
+    /// [`BrokerStats::selective_tail_wakes`].
+    selective_tail_wakes: AtomicU64,
     /// [`BrokerStats::tail_wakeups`].
     tail_wakeups: AtomicU64,
+    /// [`Broker::selective_tail_wake`]: when `true`, the writer matches newly visible
+    /// deliverable records against registered [`TailParker`] filters and wakes only
+    /// matching tails (`cost study B4 step 2`).
+    selective_tail_wake: AtomicBool,
+    /// Bumped under `log` lock whenever `selective_tail_wake` is toggled so parked tails
+    /// immediately wake and switch between `tail` and their per-subscriber `TailParker`.
+    selective_mode_epoch: AtomicU64,
+    /// Monotone id generator for [`TailParker`].
+    next_parker_id: AtomicU64,
+    /// Active subscriber tails registered for selective wakeups (pure leaf lock).
+    tail_parkers: Mutex<Vec<Arc<TailParker>>>,
     /// [`BrokerStats::peer_probes`].
     peer_probes: AtomicU64,
     /// [`BrokerStats::parked_tails`].
@@ -1864,12 +1962,14 @@ fn tail_pause_at(pause: &mut Option<TailPause>, at: PauseAt, cursor: u64) {
     }
 }
 
-/// What a connection asked of its next tail before it subscribed: catch-up and idle
-/// marks ([`Request::IdleMarks`]), and gap notices ([`Request::GapNotices`]).
+/// What a connection asked of its next tail or read before it ran: catch-up and idle
+/// marks ([`Request::IdleMarks`]), gap notices ([`Request::GapNotices`]), and monotone
+/// broker-stamped wall times ([`Request::BrokerTimes`]).
 #[derive(Debug, Clone, Copy, Default)]
 struct TailAsks {
     idle_marks: bool,
     gaps: bool,
+    broker_times: bool,
 }
 
 /// The broker side of a [`Broker::pause_last_scan_round`] rendezvous.
@@ -1925,6 +2025,196 @@ struct Replicator {
     io_timeout: Duration,
 }
 
+/// Wire transport used by a `Replicated` leader to dial its follower brokers.
+///
+/// By default ([`Broker::open_replicated`]), follower links are plaintext TCP
+/// (`Plain`, suitable only on a trusted network). Across untrusted LAN/WAN links,
+/// [`Broker::open_replicated_transport`] and `Broker::open_replicated_guarded_transport`
+/// (under `feature = "cap"`) wrap every follower socket — at initial open and on every
+/// reconnect — in one of `astream-aead`'s authenticated, encrypted transports.
+#[derive(Clone)]
+pub enum FollowerTransport {
+    /// Plaintext TCP (`Broker::serve_tcp`).
+    Plain,
+    /// XChaCha20-Poly1305 sealed stream under a 32-byte PSK (`Broker::serve_tcp_sealed`).
+    #[cfg(feature = "aead")]
+    Sealed([u8; astream_aead::KEY_LEN]),
+    /// Forward-secret ephemeral X25519 authenticated by a 32-byte PSK (`Broker::serve_tcp_handshake`).
+    #[cfg(feature = "handshake")]
+    Handshake([u8; astream_aead::KEY_LEN]),
+    /// Mutual Ed25519 signed-DH (`Broker::serve_tcp_identity`) with per-follower pinned host keys.
+    #[cfg(feature = "identity")]
+    Identity {
+        /// Leader's Ed25519 identity keypair presented to every follower.
+        identity: Arc<astream_aead::IdentityKeypair>,
+        /// Expected Ed25519 public key for each follower in `follower_addrs` (`1:1` by index).
+        expected_followers: Vec<[u8; astream_aead::ID_PUB_LEN]>,
+    },
+}
+
+impl std::fmt::Debug for FollowerTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FollowerTransport::Plain => f.write_str("FollowerTransport::Plain"),
+            #[cfg(feature = "aead")]
+            FollowerTransport::Sealed(_) => f.write_str("FollowerTransport::Sealed(<secret>)"),
+            #[cfg(feature = "handshake")]
+            FollowerTransport::Handshake(_) => {
+                f.write_str("FollowerTransport::Handshake(<secret>)")
+            }
+            #[cfg(feature = "identity")]
+            FollowerTransport::Identity {
+                expected_followers, ..
+            } => f
+                .debug_struct("FollowerTransport::Identity")
+                .field("followers", &expected_followers.len())
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum LinkTransport {
+    Plain,
+    #[cfg(feature = "aead")]
+    Sealed([u8; astream_aead::KEY_LEN]),
+    #[cfg(feature = "handshake")]
+    Handshake([u8; astream_aead::KEY_LEN]),
+    #[cfg(feature = "identity")]
+    Identity {
+        identity: Arc<astream_aead::IdentityKeypair>,
+        expected_server: [u8; astream_aead::ID_PUB_LEN],
+    },
+}
+
+impl FollowerTransport {
+    fn links_for(&self, count: usize) -> io::Result<Vec<LinkTransport>> {
+        const MAX_REPLICATED_FOLLOWERS: usize = 4096;
+        if count > MAX_REPLICATED_FOLLOWERS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Replicated tier: follower count ({count}) exceeds MAX_REPLICATED_FOLLOWERS ({MAX_REPLICATED_FOLLOWERS})"
+                ),
+            ));
+        }
+        match self {
+            FollowerTransport::Plain => {
+                let mut out = Vec::with_capacity(count);
+                for _ in 0..count {
+                    out.push(LinkTransport::Plain);
+                }
+                Ok(out)
+            }
+            #[cfg(feature = "aead")]
+            FollowerTransport::Sealed(key) => {
+                let mut out = Vec::with_capacity(count);
+                for _ in 0..count {
+                    out.push(LinkTransport::Sealed(*key));
+                }
+                Ok(out)
+            }
+            #[cfg(feature = "handshake")]
+            FollowerTransport::Handshake(psk) => {
+                let mut out = Vec::with_capacity(count);
+                for _ in 0..count {
+                    out.push(LinkTransport::Handshake(*psk));
+                }
+                Ok(out)
+            }
+            #[cfg(feature = "identity")]
+            FollowerTransport::Identity {
+                identity,
+                expected_followers,
+            } => {
+                if expected_followers.len() != count {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "FollowerTransport::Identity expected_followers length ({}) must match follower_addrs length ({count})",
+                            expected_followers.len()
+                        ),
+                    ));
+                }
+                let mut out = Vec::with_capacity(count);
+                for pk in expected_followers {
+                    out.push(LinkTransport::Identity {
+                        identity: identity.clone(),
+                        expected_server: *pk,
+                    });
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// Concrete follower byte stream (plaintext TCP or AEAD-sealed TCP) so the verified lane
+/// resolves every replication read/write without open trait-object or generic dispatch.
+enum FollowerStream {
+    Plain(TcpStream),
+    #[cfg(feature = "aead")]
+    Sealed(astream_aead::SealedStream<TcpStream>),
+}
+
+impl FollowerStream {
+    fn tcp_ref(&self) -> &TcpStream {
+        match self {
+            FollowerStream::Plain(s) => s,
+            #[cfg(feature = "aead")]
+            FollowerStream::Sealed(s) => s.get_ref(),
+        }
+    }
+
+    #[cfg(any(feature = "cap", feature = "handshake"))]
+    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        self.tcp_ref().set_read_timeout(d)
+    }
+
+    #[cfg(any(feature = "cap", feature = "handshake"))]
+    fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        self.tcp_ref().set_write_timeout(d)
+    }
+
+    fn try_clone_tcp(&self) -> io::Result<TcpStream> {
+        let clone = self.tcp_ref().try_clone()?;
+        kept_from_children(&clone)?;
+        Ok(clone)
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.tcp_ref().shutdown(how)
+    }
+}
+
+impl Read for FollowerStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            FollowerStream::Plain(s) => s.read(buf),
+            #[cfg(feature = "aead")]
+            FollowerStream::Sealed(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for FollowerStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            FollowerStream::Plain(s) => s.write(buf),
+            #[cfg(feature = "aead")]
+            FollowerStream::Sealed(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            FollowerStream::Plain(s) => s.flush(),
+            #[cfg(feature = "aead")]
+            FollowerStream::Sealed(s) => s.flush(),
+        }
+    }
+}
+
 /// One follower's replication link, driven only by the writer thread.
 struct FollowerLink {
     /// The leader's own [`LogIdentity`](crate::LogIdentity), sent beside every record
@@ -1932,10 +2222,11 @@ struct FollowerLink {
     /// for the leader's life: a log a broker owns changes identity only at an open.
     leader: crate::LogIdentity,
     addr: String,
+    transport: LinkTransport,
     /// `None` while the link is down (dropped after an I/O error / timeout); it is
     /// re-established on the next batch. A per-record REFUSAL from the follower (a
     /// `Response::Error`) does not drop the link — the stream stays in sync.
-    stream: Option<TcpStream>,
+    stream: Option<FollowerStream>,
     /// This follower's CONFIRMED PREFIX: it has acknowledged every leader record with
     /// offset `< upto`, in order. What a follower confirmed, it holds, even if the link
     /// later drops — and the point re-shipping resumes from. It starts at the leader
@@ -1977,9 +2268,49 @@ struct FollowerLink {
     cap: Option<astream_cap::Capability>,
 }
 
+#[cfg(feature = "handshake")]
+fn confirm_follower_hello(stream: &mut FollowerStream, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "follower handshake deadline is too far away",
+        )
+    })?;
+    let mut bounded = Deadlined {
+        stream: DeadlineOn::Follower(stream),
+        deadline,
+    };
+    write_frame(&mut bounded, &crate::proto::encode_request(&Request::Hello))?;
+    let Some(hello_reply) = read_frame(&mut bounded)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "follower closed before Hello confirmation",
+        ));
+    };
+    match decode_response(&hello_reply) {
+        Some(Response::Nonce { .. }) => {
+            bounded.stream.set_read_timeout(Some(timeout))?;
+            bounded.stream.set_write_timeout(Some(timeout))?;
+            Ok(())
+        }
+        Some(Response::Error { code, msg }) => Err(io::Error::new(
+            if code == ERR_UNAUTHORIZED || msg.starts_with("unauthorized") {
+                io::ErrorKind::PermissionDenied
+            } else {
+                io::ErrorKind::Other
+            },
+            msg,
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected follower Hello response",
+        )),
+    }
+}
+
 #[cfg(feature = "cap")]
 fn attach_follower_cap(
-    stream: &mut TcpStream,
+    stream: &mut FollowerStream,
     cap: &astream_cap::Capability,
     timeout: Duration,
 ) -> Result<(), (bool, io::Error)> {
@@ -2066,13 +2397,17 @@ fn attach_follower_cap(
     }
 }
 
-fn encode_replica_record(r: &BrokerRecord, leader: &crate::LogIdentity) -> Vec<u8> {
+fn encode_replica_record(
+    r: &BrokerRecord,
+    bt_ms: Option<u64>,
+    leader: &crate::LogIdentity,
+) -> Vec<u8> {
     let commit = match &r.commit {
         Some(c) => Some((c.group.as_str(), c.upto)),
         None if r.is_marked_retire() => Some((crate::proto::REPLICATE_RETIRE_GROUP, 0)),
         None => None,
     };
-    encode_replicate(
+    encode_replicate_stamped(
         r.seq.0,
         r.producer_id,
         r.producer_seq,
@@ -2080,11 +2415,12 @@ fn encode_replica_record(r: &BrokerRecord, leader: &crate::LogIdentity) -> Vec<u
         &r.body,
         commit,
         Some(leader),
+        bt_ms,
     )
 }
 
-/// Dial a follower with the replication timeouts applied to the socket.
-fn connect_follower(addr: &str, timeout: Duration) -> io::Result<TcpStream> {
+/// Dial a follower TCP socket with the replication timeouts applied.
+fn dial_follower_tcp(addr: &str, timeout: Duration) -> io::Result<TcpStream> {
     let mut last = io::Error::new(
         io::ErrorKind::NotFound,
         format!("follower {addr}: no address"),
@@ -2092,6 +2428,7 @@ fn connect_follower(addr: &str, timeout: Duration) -> io::Result<TcpStream> {
     for sa in addr.to_socket_addrs()? {
         match TcpStream::connect_timeout(&sa, timeout) {
             Ok(s) => {
+                let _ = kept_from_children(&s);
                 s.set_nodelay(true)?;
                 s.set_read_timeout(Some(timeout))?;
                 s.set_write_timeout(Some(timeout))?;
@@ -2103,17 +2440,61 @@ fn connect_follower(addr: &str, timeout: Duration) -> io::Result<TcpStream> {
     Err(last)
 }
 
+#[cfg_attr(not(feature = "handshake"), allow(unused_variables))]
+fn upgrade_follower_stream(
+    raw: TcpStream,
+    transport: &LinkTransport,
+    has_cap: bool,
+    timeout: Duration,
+) -> io::Result<FollowerStream> {
+    match transport {
+        LinkTransport::Plain => Ok(FollowerStream::Plain(raw)),
+        #[cfg(feature = "aead")]
+        LinkTransport::Sealed(key) => {
+            let sealed = astream_aead::SealedStream::handshake_client(raw, *key)?;
+            sealed.get_ref().set_read_timeout(Some(timeout))?;
+            sealed.get_ref().set_write_timeout(Some(timeout))?;
+            Ok(FollowerStream::Sealed(sealed))
+        }
+        #[cfg(feature = "handshake")]
+        LinkTransport::Handshake(psk) => {
+            let sealed = astream_aead::client_handshake(raw, psk)?;
+            sealed.get_ref().set_read_timeout(Some(timeout))?;
+            sealed.get_ref().set_write_timeout(Some(timeout))?;
+            let mut fs = FollowerStream::Sealed(sealed);
+            if !has_cap {
+                confirm_follower_hello(&mut fs, timeout)?;
+            }
+            Ok(fs)
+        }
+        #[cfg(feature = "identity")]
+        LinkTransport::Identity {
+            identity,
+            expected_server,
+        } => {
+            let sealed = astream_aead::client_identity_handshake(raw, identity, expected_server)?;
+            sealed.get_ref().set_read_timeout(Some(timeout))?;
+            sealed.get_ref().set_write_timeout(Some(timeout))?;
+            let mut fs = FollowerStream::Sealed(sealed);
+            if !has_cap {
+                confirm_follower_hello(&mut fs, timeout)?;
+            }
+            Ok(fs)
+        }
+    }
+}
+
 impl FollowerLink {
     /// Write one window of `records` (at most [`REPLICA_WINDOW`] `Replicate` frames)
     /// into `stream`, flushing in [`EGRESS_CHUNK`] slices.
     fn write_window_frames(
         leader: &crate::LogIdentity,
-        stream: &mut TcpStream,
-        window: &[Arc<BrokerRecord>],
+        stream: &mut FollowerStream,
+        window: &[(Arc<BrokerRecord>, Option<u64>)],
     ) -> io::Result<()> {
         let mut out = Vec::new();
-        for r in window {
-            let payload = encode_replica_record(r, leader);
+        for (r, bt_ms) in window {
+            let payload = encode_replica_record(r, *bt_ms, leader);
             append_frame(&mut out, &payload)?;
             if out.len() >= EGRESS_CHUNK {
                 flush_egress(stream, &mut out)?;
@@ -2129,12 +2510,12 @@ impl FollowerLink {
     /// stays in sync).
     fn read_window_acks(
         &mut self,
-        stream: &mut TcpStream,
-        window: &[Arc<BrokerRecord>],
+        stream: &mut FollowerStream,
+        window: &[(Arc<BrokerRecord>, Option<u64>)],
     ) -> io::Result<usize> {
         let mut confirmed = 0usize;
         let mut stopped = false;
-        for r in window {
+        for (r, _) in window {
             let Some(payload) = read_frame(stream)? else {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -2166,7 +2547,7 @@ impl FollowerLink {
     fn write_window_with_retry(
         &mut self,
         i: usize,
-        window: &[Arc<BrokerRecord>],
+        window: &[(Arc<BrokerRecord>, Option<u64>)],
         fresh_flags: &mut [bool],
         timeout: Duration,
         running: &AtomicBool,
@@ -2211,7 +2592,7 @@ impl FollowerLink {
     fn read_window_with_retry(
         &mut self,
         i: usize,
-        window: &[Arc<BrokerRecord>],
+        window: &[(Arc<BrokerRecord>, Option<u64>)],
         fresh_flags: &mut [bool],
         timeout: Duration,
         running: &AtomicBool,
@@ -2298,34 +2679,63 @@ impl FollowerLink {
         }
     }
 
+    fn note_dial_error(&mut self, e: &io::Error) {
+        if matches!(
+            e.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ) {
+            let backoff = Duration::from_millis(follower_backoff_ms(self.timeout_failures));
+            self.timeout_failures = self.timeout_failures.saturating_add(1);
+            self.next_dial_at = Some(Instant::now() + backoff);
+        } else {
+            self.timeout_failures = 0;
+            self.next_dial_at = None;
+        }
+    }
+
     fn reconnect(
         &mut self,
         i: usize,
         timeout: Duration,
         running: &AtomicBool,
         kill: &Mutex<Vec<Option<TcpStream>>>,
-    ) -> Option<TcpStream> {
+    ) -> Option<FollowerStream> {
         if !running.load(Ordering::Relaxed) {
             return None;
         }
-        match connect_follower(&self.addr, timeout) {
-            #[allow(unused_mut)]
-            Ok(mut s) => {
-                let shutdown = s.try_clone().ok()?;
+        match dial_follower_tcp(&self.addr, timeout) {
+            Ok(raw) => {
+                let Ok(shutdown) = raw.try_clone() else {
+                    return None;
+                };
+                let _ = kept_from_children(&shutdown);
                 {
                     let mut slots = kill
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if !running.load(Ordering::Relaxed) {
-                        let _ = s.shutdown(Shutdown::Both);
+                        let _ = raw.shutdown(Shutdown::Both);
                         return None;
                     }
                     let Some(slot) = slots.get_mut(i) else {
-                        let _ = s.shutdown(Shutdown::Both);
+                        let _ = raw.shutdown(Shutdown::Both);
                         return None;
                     };
                     *slot = Some(shutdown);
                 }
+                #[cfg(feature = "cap")]
+                let has_cap = self.cap.is_some();
+                #[cfg(not(feature = "cap"))]
+                let has_cap = false;
+                #[allow(unused_mut)]
+                let mut s = match upgrade_follower_stream(raw, &self.transport, has_cap, timeout) {
+                    Ok(fs) => fs,
+                    Err(e) => {
+                        Self::clear_kill_slot(i, kill);
+                        self.note_dial_error(&e);
+                        return None;
+                    }
+                };
                 #[cfg(feature = "cap")]
                 if let Some(ref cap) = self.cap {
                     if let Err((is_unauth, e)) = attach_follower_cap(&mut s, cap, timeout) {
@@ -2334,17 +2744,8 @@ impl FollowerLink {
                             self.fenced = Some(e.to_string());
                             self.timeout_failures = 0;
                             self.next_dial_at = None;
-                        } else if matches!(
-                            e.kind(),
-                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                        ) {
-                            let backoff =
-                                Duration::from_millis(follower_backoff_ms(self.timeout_failures));
-                            self.timeout_failures = self.timeout_failures.saturating_add(1);
-                            self.next_dial_at = Some(Instant::now() + backoff);
                         } else {
-                            self.timeout_failures = 0;
-                            self.next_dial_at = None;
+                            self.note_dial_error(&e);
                         }
                         return None;
                     }
@@ -2359,17 +2760,7 @@ impl FollowerLink {
                 Some(s)
             }
             Err(e) => {
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) {
-                    let backoff = Duration::from_millis(follower_backoff_ms(self.timeout_failures));
-                    self.timeout_failures = self.timeout_failures.saturating_add(1);
-                    self.next_dial_at = Some(Instant::now() + backoff);
-                } else {
-                    self.timeout_failures = 0;
-                    self.next_dial_at = None;
-                }
+                self.note_dial_error(&e);
                 None
             }
         }
@@ -2377,6 +2768,32 @@ impl FollowerLink {
 }
 
 impl Replicator {
+    /// Un-fence every fenced follower link on the writer thread, closing any open socket,
+    /// clearing redial backoff, and resetting `upto` to `floor` (the leader's retention
+    /// base) so the immediately following `redial` + `replicate` catches the follower up
+    /// across `[floor..head)` and restores its adopted leader `LogIdentity`.
+    fn rejoin(&self, floor: u64) -> usize {
+        let mut links = self
+            .links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rejoined = 0usize;
+        for (i, link) in links.iter_mut().enumerate() {
+            if link.fenced.take().is_some() {
+                if let Some(s) = link.stream.take() {
+                    let _ = s.shutdown(Shutdown::Both);
+                }
+                FollowerLink::clear_kill_slot(i, &self.kill);
+                link.fresh = false;
+                link.timeout_failures = 0;
+                link.next_dial_at = None;
+                link.upto = floor;
+                rejoined = rejoined.saturating_add(1);
+            }
+        }
+        rejoined
+    }
+
     /// Re-dial every follower whose link is down (and not fenced) — at the start of a
     /// batch, before it reads the log for them. One that answers is caught up in this
     /// same batch; one still down is left out of the re-ship base (`min_upto`).
@@ -2451,12 +2868,12 @@ impl Replicator {
     /// clamps up to the first retained record. A follower whose prefix is below the
     /// slice lacks records the leader no longer holds: it is left behind, shipped
     /// nothing, counted in the watermark only for the prefix it confirmed.
-    fn replicate(&self, records: &[Arc<BrokerRecord>], running: &AtomicBool) -> u64 {
+    fn replicate(&self, records: &[(Arc<BrokerRecord>, Option<u64>)], running: &AtomicBool) -> u64 {
         let mut links = self
             .links
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(first) = records.first() else {
+        let Some((first, _)) = records.first() else {
             return Self::watermark(&links, self.quorum);
         };
         let base = first.seq.0;
@@ -2592,6 +3009,11 @@ impl Drop for ConnGuard<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
+        self.shared
+            .attached_conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
     }
 }
 
@@ -2687,6 +3109,9 @@ pub struct BrokerStats {
     /// publish no quorum confirmed does not. Revocation and shutdown wake the tails
     /// too, and are not counted here.
     pub tail_broadcasts: u64,
+    /// Per-subscriber `notify_one` wakeups emitted by the writer when
+    /// [`Broker::selective_tail_wake`] is active (`cost study B4 step 2`).
+    pub selective_tail_wakes: u64,
     /// Times a parked subscriber tail resumed from its wait: woken by a writer
     /// broadcast, a revocation or shutdown, or at the end of its liveness poll
     /// ([`Broker::set_liveness_poll`]). A broadcast resumes every tail parked at that
@@ -2882,8 +3307,12 @@ impl Broker {
             }
         }
         let health_every = opts.health_every;
+        let selective_tail_wake = opts.selective_tail_wake;
         let log = BrokerLog::open_opts(log_path, opts, prepare)?;
         let broker = Self::start(log, None, guard);
+        if selective_tail_wake {
+            broker.set_selective_tail_wake(true);
+        }
         if let Some(every) = health_every {
             // The open has happened (and fired the wills the log held): a sidecar it
             // cannot write is said, not a refused open — the thread tries again every
@@ -2969,11 +3398,12 @@ impl Broker {
     }
 
     /// Open a broker whose durable log is ENCRYPTED AT REST: every record's payload
-    /// is sealed on disk under `key` (XChaCha20-Poly1305), so the forensic value of
-    /// the log — a verbatim recording of every keystroke and screen frame — is gone
-    /// to anyone without the key. The wire protocol and all in-memory behaviour are
-    /// unchanged; recovery decrypts, and refuses (rather than discards) on a wrong key
-    /// or a tampered log. Off by default (the `at-rest` feature). Strict.
+    /// is sealed on disk under `key` (XChaCha20-Poly1305, bound to `<log>.seal` on v2
+    /// logs), so the forensic value of the log — a verbatim recording of every keystroke
+    /// and screen frame — is gone to anyone without the key. The wire protocol and all
+    /// in-memory behaviour are unchanged; recovery decrypts, and refuses (rather than
+    /// discards) on a wrong key, cross-log splice, or tampered log. Off by default (the
+    /// `at-rest` feature). Strict.
     #[cfg(feature = "at-rest")]
     pub fn open_encrypted(log_path: impl AsRef<Path>, key: [u8; 32]) -> io::Result<Broker> {
         let log = BrokerLog::open_encrypted(log_path, key)?;
@@ -2989,6 +3419,51 @@ impl Broker {
     ) -> io::Result<Broker> {
         let log = BrokerLog::open_encrypted_with(log_path, durability, key)?;
         Ok(Self::start(log, None, None))
+    }
+
+    /// Like [`open_encrypted`](Self::open_encrypted), additionally refusing legacy v1
+    /// unbound encrypted logs that lack `<log>.seal` (`Astream.Broker.TlaAtRestLogBinding`).
+    #[cfg(feature = "at-rest")]
+    pub fn open_encrypted_bound(log_path: impl AsRef<Path>, key: [u8; 32]) -> io::Result<Broker> {
+        let log = BrokerLog::open_encrypted_bound(log_path, key)?;
+        Ok(Self::start(log, None, None))
+    }
+
+    /// [`open_encrypted_bound`](Self::open_encrypted_bound) at a chosen [`Durability`].
+    #[cfg(feature = "at-rest")]
+    pub fn open_encrypted_bound_with(
+        log_path: impl AsRef<Path>,
+        durability: Durability,
+        key: [u8; 32],
+    ) -> io::Result<Broker> {
+        let log = BrokerLog::open_encrypted_bound_with(log_path, durability, key)?;
+        Ok(Self::start(log, None, None))
+    }
+
+    /// Open a broker combining CAPABILITY ENFORCEMENT (`secret`, as
+    /// [`open_guarded`](Self::open_guarded)) with ENCRYPT-AT-REST (`key`, as
+    /// [`open_encrypted`](Self::open_encrypted)). Strict durability.
+    #[cfg(all(feature = "cap", feature = "at-rest"))]
+    pub fn open_guarded_encrypted(
+        log_path: impl AsRef<Path>,
+        secret: Vec<u8>,
+        key: [u8; 32],
+    ) -> io::Result<Broker> {
+        Self::open_guarded_encrypted_with(log_path, secret, Durability::Strict, key)
+    }
+
+    /// [`open_guarded_encrypted`](Self::open_guarded_encrypted) at a chosen [`Durability`].
+    #[cfg(all(feature = "cap", feature = "at-rest"))]
+    pub fn open_guarded_encrypted_with(
+        log_path: impl AsRef<Path>,
+        secret: Vec<u8>,
+        durability: Durability,
+        key: [u8; 32],
+    ) -> io::Result<Broker> {
+        let mut opts = OpenOptions::new(durability);
+        opts.guard = Some(secret);
+        opts.at_rest_key = Some(key);
+        Self::open_opts(log_path, opts, || Ok(Prepared::Nothing))
     }
 
     /// [`open_encrypted`](Self::open_encrypted) with ANTI-ROLLBACK: an authenticated
@@ -3014,6 +3489,48 @@ impl Broker {
     ) -> io::Result<Broker> {
         let log = BrokerLog::open_encrypted_verified_init(log_path, key)?;
         Ok(Self::start(log, None, None))
+    }
+
+    /// Open a broker combining CAPABILITY ENFORCEMENT (`secret`), ENCRYPT-AT-REST (`key`),
+    /// and ANTI-ROLLBACK verification (`<log>.hw`). Strict durability.
+    #[cfg(all(feature = "cap", feature = "anti-rollback"))]
+    pub fn open_guarded_encrypted_verified(
+        log_path: impl AsRef<Path>,
+        secret: Vec<u8>,
+        key: [u8; 32],
+    ) -> io::Result<Broker> {
+        let mut opts = OpenOptions::new(Durability::Strict);
+        opts.guard = Some(secret);
+        opts.at_rest_key = Some(key);
+        opts.anti_rollback = crate::AntiRollback::Verify;
+        Self::open_opts(log_path, opts, || Ok(Prepared::Nothing))
+    }
+
+    /// Bootstrap [`open_guarded_encrypted_verified`](Self::open_guarded_encrypted_verified):
+    /// establish `<log>.hw` at the current head while enforcing capabilities under `secret`.
+    #[cfg(all(feature = "cap", feature = "anti-rollback"))]
+    pub fn open_guarded_encrypted_verified_init(
+        log_path: impl AsRef<Path>,
+        secret: Vec<u8>,
+        key: [u8; 32],
+    ) -> io::Result<Broker> {
+        let mut opts = OpenOptions::new(Durability::Strict);
+        opts.guard = Some(secret);
+        opts.at_rest_key = Some(key);
+        opts.anti_rollback = crate::AntiRollback::Init;
+        Self::open_opts(log_path, opts, || Ok(Prepared::Nothing))
+    }
+
+    /// The 128-bit per-log cryptographic at-rest binding (`<log>.seal`), or `None` when
+    /// unencrypted or opened on a legacy v1 unbound log.
+    #[cfg(feature = "at-rest")]
+    #[must_use]
+    pub fn at_rest_seal_id(&self) -> Option<[u8; 16]> {
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .at_rest_seal_id()
     }
 
     /// RETENTION: compact the durable log, dropping records with offset `< min_offset`
@@ -3334,8 +3851,9 @@ impl Broker {
         }
     }
 
-    /// THE OLDEST offset a read of `filter` can reach ([`BrokerLog::oldest`]): the base,
-    /// or, for what a hold rule keeps records of, the oldest it still holds of them.
+    /// THE OLDEST offset of `filter` ([`BrokerLog::oldest`]), at and above which the filter
+    /// is complete: the base, or, for what a hold rule keeps records of, the greatest floor
+    /// over the subjects it matches (records some subject still holds can lie below it).
     #[must_use]
     pub fn oldest(&self, filter: &Filter) -> u64 {
         self.shared
@@ -3351,6 +3869,52 @@ impl Broker {
     #[must_use]
     pub fn max_retained_bytes(&self) -> usize {
         self.shared.max_retained_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Enable or disable filter-indexed selective subscriber tail wakeups
+    /// (`cost study B4 step 2`).
+    ///
+    /// When `false` (the default), every batch with newly visible deliverable records
+    /// broadcasts once on the shared condvar (`tail_broadcasts`). When `true`, the
+    /// writer evaluates newly visible deliverable records against registered subscriber
+    /// [`Filter`]s under the log lock and calls `notify_one` only on matching tails
+    /// (`selective_tail_wakes`), eliminating `O(S)` wakeup storms across disjoint
+    /// subscribers. Toggling this live wakes all currently parked tails so they switch
+    /// cleanly with zero lost wakeups.
+    pub fn set_selective_tail_wake(&self, on: bool) {
+        {
+            let _log = self
+                .shared
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let vis = self.shared.head.load(Ordering::Relaxed);
+            self.shared.selective_tail_wake.store(on, Ordering::Release);
+            self.shared
+                .selective_mode_epoch
+                .fetch_add(1, Ordering::AcqRel);
+            let parkers = self
+                .shared
+                .tail_parkers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for p in parkers.iter() {
+                let mut st = p
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                st.matched_head = tail_wake_head_advance(st.matched_head, vis);
+                st.has_unread_match = true;
+                p.needs_wake.store(true, Ordering::Release);
+            }
+        }
+        notify_all_tails(&self.shared);
+    }
+
+    /// Whether filter-indexed selective subscriber tail wakeups are currently active.
+    #[must_use]
+    pub fn selective_tail_wake(&self) -> bool {
+        self.shared.selective_tail_wake.load(Ordering::Acquire)
     }
 
     /// Operational snapshot of this broker's log, subscriber-visible head, active
@@ -3391,7 +3955,7 @@ impl Broker {
         );
         if changed {
             self.shared.revocation_epoch.fetch_add(1, Ordering::AcqRel);
-            self.shared.tail.notify_all();
+            notify_all_tails(&self.shared);
         }
         added
     }
@@ -3419,7 +3983,7 @@ impl Broker {
             .remove(&derived);
         if removed || principal_removed {
             self.shared.revocation_epoch.fetch_add(1, Ordering::AcqRel);
-            self.shared.tail.notify_all();
+            notify_all_tails(&self.shared);
         }
         removed
     }
@@ -3447,7 +4011,7 @@ impl Broker {
             .insert(principal.to_ascii_lowercase());
         if added {
             self.shared.revocation_epoch.fetch_add(1, Ordering::AcqRel);
-            self.shared.tail.notify_all();
+            notify_all_tails(&self.shared);
         }
         added
     }
@@ -3468,7 +4032,7 @@ impl Broker {
             .remove(&lower);
         if removed {
             self.shared.revocation_epoch.fetch_add(1, Ordering::AcqRel);
-            self.shared.tail.notify_all();
+            notify_all_tails(&self.shared);
         }
         removed
     }
@@ -3542,6 +4106,10 @@ impl Broker {
         let shared = Arc::new(Shared {
             log: Mutex::new(log),
             tail: Condvar::new(),
+            started_at_ms: now_unix_ms(),
+            listeners: Mutex::new(std::collections::BTreeMap::new()),
+            listener_seq: AtomicU64::new(0),
+            attached_conns: Mutex::new(HashMap::new()),
             head: AtomicU64::new(head),
             durable: AtomicU64::new(durable),
             durable_marks,
@@ -3584,7 +4152,12 @@ impl Broker {
             binds_settled: AtomicU64::new(0),
             wills_settled: AtomicU64::new(0),
             tail_broadcasts: AtomicU64::new(0),
+            selective_tail_wakes: AtomicU64::new(0),
             tail_wakeups: AtomicU64::new(0),
+            selective_tail_wake: AtomicBool::new(false),
+            selective_mode_epoch: AtomicU64::new(0),
+            next_parker_id: AtomicU64::new(1),
+            tail_parkers: Mutex::new(Vec::new()),
             peer_probes: AtomicU64::new(0),
             parked_tails: AtomicUsize::new(0),
             batch: Mutex::new(()),
@@ -3791,10 +4364,47 @@ impl Broker {
         quorum: usize,
         replica_timeout: Duration,
     ) -> io::Result<Broker> {
+        Self::open_replicated_transport_with(
+            log_path,
+            follower_addrs,
+            FollowerTransport::Plain,
+            quorum,
+            replica_timeout,
+        )
+    }
+
+    /// [`open_replicated`](Self::open_replicated) over an authenticated/encrypted
+    /// [`FollowerTransport`] (`Sealed`, `Handshake`, or `Identity`) for cross-host
+    /// LAN/WAN replication.
+    pub fn open_replicated_transport(
+        log_path: impl AsRef<Path>,
+        follower_addrs: &[String],
+        transport: FollowerTransport,
+        quorum: usize,
+    ) -> io::Result<Broker> {
+        Self::open_replicated_transport_with(
+            log_path,
+            follower_addrs,
+            transport,
+            quorum,
+            REPLICA_IO_TIMEOUT,
+        )
+    }
+
+    /// [`open_replicated_transport`](Self::open_replicated_transport) with an explicit
+    /// follower I/O timeout.
+    pub fn open_replicated_transport_with(
+        log_path: impl AsRef<Path>,
+        follower_addrs: &[String],
+        transport: FollowerTransport,
+        quorum: usize,
+        replica_timeout: Duration,
+    ) -> io::Result<Broker> {
         Self::open_replicated_inner(
             log_path,
             None,
             follower_addrs,
+            transport,
             #[cfg(feature = "cap")]
             None,
             quorum,
@@ -3840,6 +4450,51 @@ impl Broker {
         quorum: usize,
         replica_timeout: Duration,
     ) -> io::Result<Broker> {
+        Self::open_replicated_guarded_transport_with(
+            log_path,
+            secret,
+            follower_addrs,
+            FollowerTransport::Plain,
+            follower_cap,
+            quorum,
+            replica_timeout,
+        )
+    }
+
+    /// [`open_replicated_guarded`](Self::open_replicated_guarded) over an
+    /// authenticated/encrypted [`FollowerTransport`].
+    #[cfg(feature = "cap")]
+    pub fn open_replicated_guarded_transport(
+        log_path: impl AsRef<Path>,
+        secret: Vec<u8>,
+        follower_addrs: &[String],
+        transport: FollowerTransport,
+        follower_cap: astream_cap::Capability,
+        quorum: usize,
+    ) -> io::Result<Broker> {
+        Self::open_replicated_guarded_transport_with(
+            log_path,
+            secret,
+            follower_addrs,
+            transport,
+            follower_cap,
+            quorum,
+            REPLICA_IO_TIMEOUT,
+        )
+    }
+
+    /// [`open_replicated_guarded_transport`](Self::open_replicated_guarded_transport)
+    /// with an explicit follower I/O timeout.
+    #[cfg(feature = "cap")]
+    pub fn open_replicated_guarded_transport_with(
+        log_path: impl AsRef<Path>,
+        secret: Vec<u8>,
+        follower_addrs: &[String],
+        transport: FollowerTransport,
+        follower_cap: astream_cap::Capability,
+        quorum: usize,
+        replica_timeout: Duration,
+    ) -> io::Result<Broker> {
         if secret.is_empty() {
             return Err(empty_secret());
         }
@@ -3866,6 +4521,7 @@ impl Broker {
             log_path,
             Some(secret),
             follower_addrs,
+            transport,
             Some(follower_cap),
             quorum,
             replica_timeout,
@@ -3876,6 +4532,7 @@ impl Broker {
         log_path: impl AsRef<Path>,
         secret: Option<Vec<u8>>,
         follower_addrs: &[String],
+        transport: FollowerTransport,
         #[cfg(feature = "cap")] follower_cap: Option<astream_cap::Capability>,
         quorum: usize,
         replica_timeout: Duration,
@@ -3887,6 +4544,7 @@ impl Broker {
                  quorum, which would silently be the Relaxed tier)",
             ));
         }
+        let link_transports = transport.links_for(follower_addrs.len())?;
         let mut log = BrokerLog::open_with(log_path, Durability::Relaxed)?;
         // Every link's confirmed prefix starts at the log's retention BASE: records
         // below it were pruned, so there is nothing below it to ship or confirm.
@@ -3896,14 +4554,20 @@ impl Broker {
         let mut kill = Vec::new();
         let mut live = 0usize;
         let mut last_err: Option<io::Error> = None;
-        for addr in follower_addrs {
+        #[cfg(feature = "cap")]
+        let has_cap = follower_cap.is_some();
+        #[cfg(not(feature = "cap"))]
+        let has_cap = false;
+        for (addr, link_transport) in follower_addrs.iter().zip(link_transports) {
             // A follower that cannot be dialed now is a DOWN link (re-dialed on every
             // batch, then caught up), not a fatal error — unless so many are down that
             // the quorum could never be met, which is a configuration error to fail
             // fast on rather than a broker that refuses every ack.
             #[allow(unused_mut)]
             let mut init_fenced: Option<String> = None;
-            let stream = match connect_follower(addr, replica_timeout) {
+            let stream = match dial_follower_tcp(addr, replica_timeout).and_then(|raw| {
+                upgrade_follower_stream(raw, &link_transport, has_cap, replica_timeout)
+            }) {
                 #[allow(unused_mut)]
                 Ok(mut s) => {
                     #[cfg(feature = "cap")]
@@ -3916,7 +4580,7 @@ impl Broker {
                     match auth_res {
                         Ok(()) => {
                             live = live.saturating_add(1);
-                            kill.push(match s.try_clone() {
+                            kill.push(match s.try_clone_tcp() {
                                 Ok(c) => Some(c),
                                 Err(_) => None,
                             });
@@ -3941,6 +4605,7 @@ impl Broker {
             links.push(FollowerLink {
                 leader: log.identity(),
                 addr: addr.clone(),
+                transport: link_transport,
                 stream,
                 upto: base,
                 fenced: init_fenced,
@@ -3975,7 +4640,7 @@ impl Broker {
         // leader starts with its visible head at the quorum watermark and a follower
         // restarted with its log intact merely confirms what it already holds.
         let head = log.head().0;
-        let backlog = log.read_from(Offset(base));
+        let backlog = log.read_from_stamped(Offset(base));
         let wm = rep.replicate(&backlog, &AtomicBool::new(true));
         let committed_wm = log.record_replica_ack(Offset(wm)).0;
         if committed_wm < head {
@@ -3985,6 +4650,21 @@ impl Broker {
             )));
         }
         Ok(Self::start(log, Some(rep), secret))
+    }
+
+    /// Override the wall-clock source sampled when stamping broker time (`bt=`) on
+    /// newly appended records (`REQUIREMENTS` R3).
+    ///
+    /// Even when overridden, the stamped `bt=` remains strictly monotone via the
+    /// Clean-origin `broker_bt_advance` state machine (a backward jump in `clock`
+    /// clamps at the previous record's `bt=`). Passing `None` restores the process
+    /// monotone clock (`now_unix_ms()`).
+    pub fn set_clock_override(&self, clock: Option<Arc<AtomicU64>>) {
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_clock_override(clock);
     }
 
     /// The durable head of the log (its record count; the offset the next commit
@@ -4032,6 +4712,30 @@ impl Broker {
     /// lock (a sampler can poll it), and the value every `Mark` carries.
     pub fn durable_head(&self) -> u64 {
         self.shared.durable.load(Ordering::Acquire)
+    }
+
+    /// Where consumer group `group` RESUMES: one past the offset it last committed
+    /// through, `0` if it never committed — the offset a `SubscribeGroup` for it starts
+    /// at, read from the same place ([`BrokerLog::group_start`]), so a commit a held
+    /// batch carries counts only once the full flush that releases it has succeeded.
+    /// Read under the log lock, which the writer holds from a batch's promotion until
+    /// its heads are published (and lets go only around the write and the flush, while
+    /// readers see the log as it stood before the batch): a commit counted here came
+    /// with its batch's [`visible_head`](Self::visible_head), in every tier but
+    /// Replicated, where it counts once the leader has committed it and the visible
+    /// head is the quorum watermark. An embedder serving its own broker reads a
+    /// group's progress here without a connection (aterm's fabric bench waits on its
+    /// inbox group's before each next post); like [`stats`](Self::stats), it waits out a
+    /// batch's staging and promotion, so it is no sampler's poll. Outside Replicated a
+    /// waiter polls the lock-free visible head and reads this only when that has moved,
+    /// as aterm's bench does: a commit counts here with the head's move.
+    pub fn group_start(&self, group: &str) -> u64 {
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .group_start(group)
+            .0
     }
 
     /// The tier this broker serves, with the one it was asked for and why they differ
@@ -4188,6 +4892,105 @@ impl Broker {
     pub fn flush_durable(&self) -> io::Result<u64> {
         match submit_blocking(&self.shared, WriteKind::Flush) {
             Ok((durable, _)) => Ok(durable),
+            Err((code, msg)) => Err(crate::client::BrokerRefusal { code, msg }.into()),
+        }
+    }
+
+    /// Operator-invoked tail truncation on a running REPLICA broker (`is_replica == true`)
+    /// to `target_head` (`base <= target_head <= head`), discarding any divergent suffix
+    /// `[target_head..head)` between writer batches so this follower can catch up from its
+    /// leader and rejoin the replication quorum (paired with [`Broker::rejoin_followers`]
+    /// on the leader).
+    ///
+    /// Preserves canonical lock ordering (`compaction -> batch -> log`), mints a fresh
+    /// replica [`LogIdentity`](crate::LogIdentity) until the leader's catch-up batch
+    /// re-adopts the leader's identity, refreshes `Hello` and producer bindings, and
+    /// returns the number of truncated records (`old_head - target_head`).
+    pub fn truncate_replica_to(&self, target_head: u64) -> io::Result<u64> {
+        #[cfg(feature = "retention")]
+        let _one = self
+            .shared
+            .compaction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _batch = match self.shared.batch.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::WouldBlock) => self
+                .shared
+                .batch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                panic!("truncate_replica_to: writer panicked inside a batch ({poisoned})")
+            }
+        };
+        let (dropped, old_retire) = {
+            let mut log = self
+                .shared
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (dropped, old_retire) = log.truncate_replica_to_detaching(Offset(target_head))?;
+            if dropped > 0 {
+                self.shared
+                    .is_replica
+                    .store(log.is_replica(), Ordering::Release);
+                self.shared.log_head.store(log.head().0, Ordering::Release);
+                #[cfg(feature = "retention")]
+                {
+                    self.shared
+                        .log_bytes
+                        .store(log.durable_len(), Ordering::Relaxed);
+                    self.shared
+                        .retain_due
+                        .store(log.retention_due(), Ordering::Relaxed);
+                }
+                publish_floor(&self.shared, &log);
+                self.shared
+                    .durable
+                    .store(log.durable_head().0, Ordering::Release);
+                if self.shared.replicator.is_none() {
+                    self.shared
+                        .head
+                        .store(log.visible_head().0, Ordering::Release);
+                }
+                reset_tail_parkers_to(&self.shared, log.visible_head().0);
+                *self
+                    .shared
+                    .hello
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = HelloCopy::of(&log);
+                if self.shared.cap_secret.is_some() {
+                    let mut bindings = self
+                        .shared
+                        .bindings
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    bindings.clear();
+                    for (id, principal, off) in log.durable_bindings() {
+                        bindings.insert(id, (principal.to_string(), off.0));
+                    }
+                }
+            }
+            (dropped, old_retire)
+        };
+        drop(old_retire);
+        if dropped > 0 {
+            notify_all_tails(&self.shared);
+        }
+        Ok(dropped)
+    }
+
+    /// Un-fence every fenced follower link on a `Replicated` leader (after an operator has
+    /// truncated a diverged follower via [`Broker::truncate_replica_to`] or rotated an
+    /// unauthorized capability), immediately redialing on the writer thread and catching
+    /// up `[base..head)` so quorum watermark and adopted `LogIdentity` recover in one step.
+    ///
+    /// Returns the number of follower links that were un-fenced (`0` on a non-replicated
+    /// broker or when no follower link was fenced).
+    pub fn rejoin_followers(&self) -> io::Result<usize> {
+        match submit_blocking(&self.shared, WriteKind::RejoinFollowers) {
+            Ok((rejoined, _)) => Ok(usize::try_from(rejoined).unwrap_or(usize::MAX)),
             Err((code, msg)) => Err(crate::client::BrokerRefusal { code, msg }.into()),
         }
     }
@@ -4569,9 +5372,16 @@ impl Broker {
                 return Err(e);
             }
         };
+        let listener_id = self.shared.listener_seq.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(listener_id, format!("unix:{}", socket_path.display()));
         self.shared.active_listeners.fetch_add(1, Ordering::AcqRel);
         Ok(BrokerHandle {
             shared: self.shared.clone(),
+            listener_id,
             listener_running,
             acceptor: Some(acceptor),
             wake: if polls {
@@ -4696,6 +5506,7 @@ impl Broker {
         // blocking acceptor out of `accept()` — an address cannot be unlinked, so TCP
         // needs no wake name and never polls.
         let dial = connectable_addr(listener.local_addr()?);
+        let transport = wrap.transport_name();
         let shared = self.shared.clone();
         let listener_running = Arc::new(AtomicBool::new(true));
         let acc_running = Arc::clone(&listener_running);
@@ -4754,7 +5565,8 @@ impl Broker {
                         // drops with the Err.
                         if let Ok((stream, peer_id)) = wrapped {
                             let _ = stream.set_read_timeout(None);
-                            let _ = handle_conn_with_peer(&sh, stream, Wire::Tcp, peer_id);
+                            let _ =
+                                handle_conn_with_peer(&sh, stream, Wire::Tcp, transport, peer_id);
                         }
                     });
                 }
@@ -4763,9 +5575,16 @@ impl Broker {
                 }
             }
         })?;
+        let listener_id = self.shared.listener_seq.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(listener_id, format!("{transport}:{dial}"));
         self.shared.active_listeners.fetch_add(1, Ordering::AcqRel);
         Ok(BrokerHandle {
             shared: self.shared.clone(),
+            listener_id,
             listener_running,
             acceptor: Some(acceptor),
             wake: AcceptWake::Blocks {
@@ -4804,6 +5623,17 @@ enum TcpWrap {
 }
 
 impl TcpWrap {
+    const fn transport_name(&self) -> &'static str {
+        match self {
+            TcpWrap::Plain => "tcp",
+            #[cfg(feature = "aead")]
+            TcpWrap::Sealed(_) => "sealed",
+            #[cfg(feature = "handshake")]
+            TcpWrap::Handshake(_) => "handshake",
+            #[cfg(feature = "identity")]
+            TcpWrap::Identity { .. } => "identity",
+        }
+    }
     /// The connection `s` becomes, and the client identity it proved (the identity
     /// handshake's; `None` otherwise). `shared` is read for the revocation list.
     #[cfg_attr(not(feature = "identity"), allow(unused_variables))]
@@ -4895,6 +5725,7 @@ fn stats_of(shared: &Shared) -> BrokerStats {
         binds_settled: shared.binds_settled.load(Ordering::Relaxed),
         wills_settled: shared.wills_settled.load(Ordering::Relaxed),
         tail_broadcasts: shared.tail_broadcasts.load(Ordering::Relaxed),
+        selective_tail_wakes: shared.selective_tail_wakes.load(Ordering::Relaxed),
         tail_wakeups: shared.tail_wakeups.load(Ordering::Relaxed),
         peer_probes: shared.peer_probes.load(Ordering::Relaxed),
         parked_tails: shared.parked_tails.load(Ordering::Relaxed),
@@ -5156,6 +5987,7 @@ fn stop_writer(shared: &Shared) {
 /// connections, and releases the log's file lock. Dropping the handle shuts down too.
 pub struct BrokerHandle {
     shared: Arc<Shared>,
+    listener_id: u64,
     listener_running: Arc<AtomicBool>,
     acceptor: Option<JoinHandle<()>>,
     wake: AcceptWake,
@@ -5287,13 +6119,18 @@ impl BrokerHandle {
         let Some(j) = self.acceptor.take() else {
             return;
         };
+        self.shared
+            .listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.listener_id);
         self.listener_running.store(false, Ordering::Relaxed);
         let prev = self.shared.active_listeners.fetch_sub(1, Ordering::AcqRel);
         let is_last = prev <= 1;
         if is_last {
             self.shared.running.store(false, Ordering::Relaxed);
             // Wake parked subscriber threads so they observe shutdown and exit.
-            self.shared.tail.notify_all();
+            notify_all_tails(&self.shared);
             // And a `wait_poisoned` and the health thread, asleep on the vitals.
             self.shared.vitals.wake();
             // Unblock the writer if it is parked on a follower that never answers.
@@ -5380,13 +6217,14 @@ enum Wire {
 /// kind Windows has, goes straight to `handle_conn_with_peer`.
 #[cfg(unix)]
 fn handle_conn(shared: &Arc<Shared>, stream: Conn, wire: Wire) -> io::Result<()> {
-    handle_conn_with_peer(shared, stream, wire, None)
+    handle_conn_with_peer(shared, stream, wire, "unix", None)
 }
 
 fn handle_conn_with_peer(
     shared: &Arc<Shared>,
     stream: Conn,
     wire: Wire,
+    transport: &'static str,
     peer_id: Option<[u8; 32]>,
 ) -> io::Result<()> {
     let conn_id = shared.conn_seq.fetch_add(1, Ordering::Relaxed);
@@ -5396,6 +6234,7 @@ fn handle_conn_with_peer(
         shared,
         stream,
         wire,
+        transport,
         conn_id,
         &mut will,
         &mut had_will,
@@ -5576,19 +6415,19 @@ struct Deadlined<'a> {
     deadline: Instant,
 }
 
-/// The stream a [`Deadlined`] bounds: a served connection, or the TCP link a leader
-/// dialed to a follower.
+/// The stream a [`Deadlined`] bounds: a served connection, or the link a leader dialed
+/// to a follower.
 enum DeadlineOn<'a> {
     Conn(&'a mut Conn),
-    #[cfg(feature = "cap")]
-    Follower(&'a mut TcpStream),
+    #[cfg(any(feature = "cap", feature = "handshake"))]
+    Follower(&'a mut FollowerStream),
 }
 
 impl DeadlineOn<'_> {
     fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         match self {
             DeadlineOn::Conn(s) => s.set_read_timeout(d),
-            #[cfg(feature = "cap")]
+            #[cfg(any(feature = "cap", feature = "handshake"))]
             DeadlineOn::Follower(s) => s.set_read_timeout(d),
         }
     }
@@ -5596,7 +6435,7 @@ impl DeadlineOn<'_> {
     fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         match self {
             DeadlineOn::Conn(s) => s.set_write_timeout(d),
-            #[cfg(feature = "cap")]
+            #[cfg(any(feature = "cap", feature = "handshake"))]
             DeadlineOn::Follower(s) => s.set_write_timeout(d),
         }
     }
@@ -5628,7 +6467,7 @@ impl Read for Deadlined<'_> {
         self.stream.set_read_timeout(Some(left))?;
         match &mut self.stream {
             DeadlineOn::Conn(s) => s.read(buf),
-            #[cfg(feature = "cap")]
+            #[cfg(any(feature = "cap", feature = "handshake"))]
             DeadlineOn::Follower(s) => s.read(buf),
         }
     }
@@ -5639,7 +6478,7 @@ impl Write for Deadlined<'_> {
         self.arm_write()?;
         match &mut self.stream {
             DeadlineOn::Conn(s) => s.write(buf),
-            #[cfg(feature = "cap")]
+            #[cfg(any(feature = "cap", feature = "handshake"))]
             DeadlineOn::Follower(s) => s.write(buf),
         }
     }
@@ -5648,16 +6487,59 @@ impl Write for Deadlined<'_> {
         self.arm_write()?;
         match &mut self.stream {
             DeadlineOn::Conn(s) => s.flush(),
-            #[cfg(feature = "cap")]
+            #[cfg(any(feature = "cap", feature = "handshake"))]
             DeadlineOn::Follower(s) => s.flush(),
         }
     }
 }
 
+#[cfg(feature = "cap")]
+fn record_attached_conn(
+    shared: &Shared,
+    conn_id: u64,
+    transport: &'static str,
+    peer_id: Option<[u8; 32]>,
+    grant: &str,
+) {
+    let Ok(parsed) = astream_cap::Grant::parse(grant) else {
+        return;
+    };
+    let (astream_cap::Mode::ReadWrite, Some(principal)) = (parsed.mode, parsed.principal) else {
+        return;
+    };
+    let Ok(grant_filter) = Filter::new(&parsed.filter) else {
+        return;
+    };
+    let producer_id = astream_cap::producer_id_of(&principal);
+    let expires_at_ms = astream_cap::expires_at(grant);
+    let now_ms = now_unix_ms();
+    let mut held = shared
+        .attached_conns
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let list = held.entry(conn_id).or_default();
+    for existing in list.iter_mut() {
+        if existing.principal == principal {
+            existing.grants.push((grant_filter, expires_at_ms));
+            return;
+        }
+    }
+    list.push(AttachedConnInfo {
+        principal,
+        transport,
+        producer_id,
+        attached_at_ms: now_ms,
+        grants: vec![(grant_filter, expires_at_ms)],
+        peer_id,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn serve_conn(
     shared: &Arc<Shared>,
     mut stream: Conn,
     wire: Wire,
+    #[cfg_attr(not(feature = "cap"), allow(unused_variables))] transport: &'static str,
     conn_id: u64,
     will: &mut Vec<(WillRecord, u64)>,
     had_will: &mut bool,
@@ -5761,15 +6643,27 @@ fn serve_conn(
     // marks, which would reset the socket timeout an old take/drain uses to stop on idle,
     // and they would read a gap notice as a reply of the wrong kind.
     let mut asks = TailAsks::default();
+    let replicate_diverged = Arc::new(AtomicBool::new(false));
+    // The requests read off the socket and not yet served: one read takes every frame
+    // that has arrived, and the loop asks it whether the next request is already here
+    // whole before it lets the writes it holds go ([`Held`]). Bytes left in it when a
+    // streaming verb takes the socket over are dropped, as the tail would discard them
+    // (`peer_gone`): nothing is read on a stream after a subscribe.
+    let mut rx = RecvBuf::with_step(CONN_READ_STEP);
     loop {
+        // Nothing more already here: the writes this connection's client sent together
+        // go to the writer as one run, before the read below can block.
+        if !rx.holds_frame() && pipe.as_mut().is_some_and(|p| !p.release()) {
+            break;
+        }
         // Guarded, the deadline is ABSOLUTE; unguarded, the socket timeout set above
         // bounds each read of the first frame.
         let read = match preauth_deadline {
-            Some(deadline) if preauth && guarded => read_frame(&mut Deadlined {
+            Some(deadline) if preauth && guarded => rx.next_frame(&mut Deadlined {
                 stream: DeadlineOn::Conn(&mut stream),
                 deadline,
             }),
-            _ => read_frame(&mut stream),
+            _ => rx.next_frame(&mut stream),
         };
         let payload = match read {
             Ok(Some(p)) => p,
@@ -5805,8 +6699,8 @@ fn serve_conn(
             preauth = false;
             let _ = stream.set_read_timeout(None);
         }
-        let req = match decode_request(&payload) {
-            Some(r) => r,
+        let (req, req_bt_ms) = match decode_request_with_bt(&payload) {
+            Some(pair) => pair,
             // ANOTHER PROTOCOL: say so in the one layout every version reads, stamped
             // with the peer's own version byte (`encode_protocol_refusal`), and close.
             // A "malformed request" here would be stamped with OURS, which the peer's
@@ -5922,6 +6816,7 @@ fn serve_conn(
                             preauth = false;
                             let _ = stream.set_read_timeout(None);
                         }
+                        record_attached_conn(shared, conn_id, transport, peer_id, grant);
                         mark_at_head(shared)
                     }
                     Err((code, msg)) => {
@@ -5983,11 +6878,13 @@ fn serve_conn(
             will,
             had_will,
             &mut asks,
+            &replicate_diverged,
             until,
             peer_id,
             #[cfg(feature = "cap")]
             &mut keyring,
             req,
+            req_bt_ms,
         )? {
             break;
         }
@@ -6038,10 +6935,12 @@ fn dispatch_request(
     will: &mut Vec<(WillRecord, u64)>,
     had_will: &mut bool,
     asks: &mut TailAsks,
+    replicate_diverged: &Arc<AtomicBool>,
     until: u64,
     peer_id: Option<[u8; 32]>,
     #[cfg(feature = "cap")] keyring: &mut Vec<astream_cap::Capability>,
     req: Request,
+    req_bt_ms: Option<u64>,
 ) -> io::Result<bool> {
     match req {
         Request::Publish {
@@ -6098,6 +6997,7 @@ fn dispatch_request(
             shared,
             stream,
             pipe,
+            replicate_diverged,
             seq,
             producer_id,
             producer_seq,
@@ -6105,6 +7005,7 @@ fn dispatch_request(
             body,
             commit,
             leader,
+            req_bt_ms,
         ),
         Request::Subscribe {
             from_offset,
@@ -6217,7 +7118,7 @@ fn dispatch_request(
             Ok(false)
         }
         Request::Last { filter, after, max } => {
-            serve_last(shared, stream, pipe, filter, after, max)
+            serve_last(shared, stream, pipe, asks.broker_times, filter, after, max)
         }
         Request::Will {
             producer_id,
@@ -6269,6 +7170,13 @@ fn dispatch_request(
             write_frame(stream, &encode_response(&mark_at_head(shared)))?;
             Ok(true)
         }
+        Request::BrokerTimes => {
+            finish_pipe(pipe)?;
+            asks.broker_times = true;
+            write_frame(stream, &encode_response(&mark_at_head(shared)))?;
+            Ok(true)
+        }
+        Request::Stats { filter } => serve_stats(shared, stream, pipe, filter),
         Request::Budget { producer_id } => {
             // Answered in the request loop after the pending acks, so a count read
             // right after this connection's own publishes includes them. Read under
@@ -6300,7 +7208,16 @@ fn dispatch_request(
             from_offset,
             filter,
             max,
-        } => serve_fetch(shared, stream, pipe, from_offset, filter, max),
+        } => serve_fetch(
+            shared,
+            stream,
+            pipe,
+            asks.gaps,
+            asks.broker_times,
+            from_offset,
+            filter,
+            max,
+        ),
         Request::Retire {
             producer_id,
             subject,
@@ -6428,6 +7345,7 @@ fn serve_replicate(
     shared: &Arc<Shared>,
     stream: &mut Conn,
     pipe: &mut Option<Pipeline>,
+    replicate_diverged: &Arc<AtomicBool>,
     seq: u64,
     producer_id: u64,
     producer_seq: u64,
@@ -6435,6 +7353,7 @@ fn serve_replicate(
     body: Vec<u8>,
     commit: Option<(String, u64)>,
     leader: Option<crate::LogIdentity>,
+    bt_ms: Option<u64>,
 ) -> io::Result<bool> {
     let is_retire_marker =
         commit.as_ref().map(|(g, _)| g.as_str()) == Some(crate::proto::REPLICATE_RETIRE_GROUP);
@@ -6483,7 +7402,17 @@ fn serve_replicate(
     if let Some(err) = err {
         return emit(stream, pipe, Err(err));
     }
-    emit_op(shared, stream, pipe, WriteKind::Replicate { rec, leader })
+    emit_op(
+        shared,
+        stream,
+        pipe,
+        WriteKind::Replicate {
+            rec,
+            leader,
+            bt_ms,
+            conn_diverged: Arc::clone(replicate_diverged),
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6596,6 +7525,7 @@ fn serve_last(
     shared: &Arc<Shared>,
     stream: &mut Conn,
     pipe: &mut Option<Pipeline>,
+    broker_times: bool,
     filter: String,
     after: String,
     max: u32,
@@ -6612,15 +7542,16 @@ fn serve_last(
         }
     };
     let want = max.min(LAST_PAGE_MAX) as usize;
-    let (page, resume, head) = match last_page(shared, &filt, &after, want) {
+    let (page, bts, resume, head) = match last_page(shared, &filt, &after, want, broker_times) {
         Ok(v) => v,
         Err(msg) => {
             return emit(stream, pipe, Err(refusal(ERR_REFUSED, msg)));
         }
     };
     let mut out = Vec::new();
-    for rec in page {
-        queue_delivery_cached(shared, stream, &mut out, &rec)?;
+    for (i, rec) in page.iter().enumerate() {
+        let bt_ms = bts.get(i).copied().flatten();
+        queue_delivery_maybe_stamped(shared, stream, &mut out, rec, broker_times, bt_ms)?;
     }
     let resume_str = match resume {
         Some(r) => r,
@@ -6631,6 +7562,141 @@ fn serve_last(
         &encode_response(&mark(head, head, durable_for(shared, head), resume_str)),
     )?;
     flush_egress(stream, &mut out)?;
+    Ok(true)
+}
+
+fn serve_stats(
+    shared: &Arc<Shared>,
+    stream: &mut Conn,
+    pipe: &mut Option<Pipeline>,
+    filter: String,
+) -> io::Result<bool> {
+    finish_pipe(pipe)?;
+    let filt = match Filter::new(filter.as_str()) {
+        Ok(f) => f,
+        Err(_) => {
+            return emit(
+                stream,
+                pipe,
+                Err(refusal(ERR_BAD_FILTER, format!("bad filter {filter:?}"))),
+            );
+        }
+    };
+    let mut listeners = Vec::new();
+    {
+        let held = shared
+            .listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for ep in held.values() {
+            listeners.push(ep.clone());
+        }
+    }
+    let now_ms = now_unix_ms();
+    let attached_snapshot: Vec<AttachedConnInfo> = {
+        maybe_reload_revocation_file(shared);
+        // Each lock alone, never two at once: a revocation reload takes `revoked_identities`
+        // and then `revoked_principals` (`apply_revocation_file`), so holding either while
+        // taking the other, or `attached_conns` between them, closes a lock-order cycle with
+        // it (aterm's lock-order census, L0-DEADLOCK). The connections in scope first, then
+        // the revocations read against that copy.
+        let in_scope: Vec<AttachedConnInfo> = {
+            let held = shared
+                .attached_conns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut in_scope = Vec::new();
+            for list in held.values() {
+                for info in list {
+                    let mut matches_scope = false;
+                    for (gf, exp) in &info.grants {
+                        let live = match exp {
+                            Some(dl) => now_ms < *dl,
+                            None => true,
+                        };
+                        if live && (filt.contains(gf) || gf.contains(&filt)) {
+                            matches_scope = true;
+                            break;
+                        }
+                    }
+                    if matches_scope {
+                        in_scope.push(info.clone());
+                    }
+                }
+            }
+            in_scope
+        };
+        let unrevoked: Vec<AttachedConnInfo> = in_scope
+            .into_iter()
+            .filter(|info| !is_peer_revoked_raw(shared, info.peer_id))
+            .collect();
+        let revoked = shared
+            .revoked_principals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unrevoked
+            .into_iter()
+            .filter(|info| {
+                revoked.is_empty() || !revoked.contains(&info.principal.to_ascii_lowercase())
+            })
+            .collect()
+    };
+    let (oldest, head, pending_wills, dedup_entries, disk_segments, disk_bytes, producers, faces) = {
+        let log = shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let visible = shared.head.load(Ordering::Relaxed);
+        let oldest = log.oldest(&filt).0;
+        let log_stats = log.stats();
+        let dedup_entries = count64(log.dedup_len());
+        let (seg64, disk_bytes) = log.disk_segments_and_bytes();
+        let disk_segments = u32::try_from(seg64).unwrap_or(u32::MAX);
+        let raw_faces = log.face_stats(&filt, visible);
+        let mut faces = Vec::with_capacity(raw_faces.len());
+        for (face, records, bytes) in raw_faces {
+            faces.push(FaceStats {
+                face,
+                records,
+                bytes,
+            });
+        }
+        let mut producers = Vec::with_capacity(attached_snapshot.len());
+        for p in attached_snapshot {
+            let last_bt_ms = log.producer_last_bt_ms(p.producer_id);
+            producers.push(AttachedProducerStats {
+                principal: p.principal,
+                transport: p.transport.to_string(),
+                producer_id: p.producer_id,
+                attached_at_ms: p.attached_at_ms,
+                last_bt_ms,
+            });
+        }
+        producers.sort();
+        (
+            oldest,
+            visible,
+            count64(log_stats.pending_wills),
+            dedup_entries,
+            disk_segments,
+            disk_bytes,
+            producers,
+            faces,
+        )
+    };
+    let stats = WireStats {
+        started_at_ms: shared.started_at_ms,
+        oldest,
+        head,
+        pending_wills,
+        dedup_entries,
+        disk_segments,
+        disk_bytes,
+        listeners,
+        producers,
+        faces,
+    };
+    write_frame(stream, &encode_response(&Response::Stats(stats)))?;
     Ok(true)
 }
 
@@ -6698,10 +7764,18 @@ fn serve_will(
     write_frame(stream, &encode_response(&mark_at_head(shared)))
 }
 
+/// A `Fetch`: the page, closed by a `Mark` that says the filter's oldest. Below the oldest
+/// (`REQUIREMENTS` R4) a reader is told, never handed a page that silently starts later: one
+/// that asked for gap notices (`gaps`; R4's addendum A9) is read from `from_offset` while
+/// retention still holds records of its filter below the oldest, the notice ahead of the
+/// page ([`BrokerLog::fetch_told`]); every other is refused `retained-from=<oldest>`.
+#[allow(clippy::too_many_arguments)]
 fn serve_fetch(
     shared: &Arc<Shared>,
     stream: &mut Conn,
     pipe: &mut Option<Pipeline>,
+    gaps: bool,
+    broker_times: bool,
     from_offset: u64,
     filter: String,
     max: u32,
@@ -6719,16 +7793,36 @@ fn serve_fetch(
     };
     // BELOW THE OLDEST (`REQUIREMENTS` R4): told, never a page that silently starts
     // later. A head query (`max = 0`) is never refused; its `Mark` says the oldest.
-    let (read, head, durable, oldest) = {
+    let (read, bts, head, durable, oldest) = {
         let log = shared
             .log
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let head = shared.head.load(Ordering::Relaxed);
-        let read = log.fetch_checked(from_offset, &filt, max as usize, FETCH_SCAN_MAX, head);
-        (read, head, durable_for(shared, head), log.oldest(&filt).0)
+        let read = if gaps {
+            log.fetch_told(from_offset, &filt, max as usize, FETCH_SCAN_MAX, head)
+        } else {
+            log.fetch_checked(from_offset, &filt, max as usize, FETCH_SCAN_MAX, head)
+                .map(|(page, next)| (page, next, None))
+        };
+        let mut bts = Vec::new();
+        if broker_times {
+            if let Ok((ref page, _, _)) = read {
+                bts.reserve(page.len());
+                for rec in page {
+                    bts.push(log.subject_bt_ms(&rec.subject, rec.seq));
+                }
+            }
+        }
+        (
+            read,
+            bts,
+            head,
+            durable_for(shared, head),
+            log.oldest(&filt).0,
+        )
     };
-    let (page, next) = match read {
+    let (page, next, gap) = match read {
         Ok(read) => read,
         Err(floor) => {
             return emit(
@@ -6736,18 +7830,19 @@ fn serve_fetch(
                 pipe,
                 Err(refusal(
                     ERR_RECORD_REFUSED,
-                    format!(
-                        "{RETAINED_FROM_PREFIX}{}: retention gave up the records of {filter} \
-                         below offset {}; read from there",
-                        floor.0, floor.0
-                    ),
+                    retained_from_msg(&filter, floor.0),
                 )),
             );
         }
     };
     let mut out = Vec::new();
-    for rec in page {
-        queue_delivery_cached(shared, stream, &mut out, &rec)?;
+    // The notice goes ahead of the page, as a tail's goes ahead of its next record.
+    if let Some(gap) = gap {
+        append_frame(&mut out, &encode_response(&Response::Gap(gap)))?;
+    }
+    for (i, rec) in page.iter().enumerate() {
+        let bt_ms = bts.get(i).copied().flatten();
+        queue_delivery_maybe_stamped(shared, stream, &mut out, rec, broker_times, bt_ms)?;
     }
     let mut closing = mark(next, head, durable, String::new());
     if let Response::Mark { oldest: o, .. } = &mut closing {
@@ -6756,6 +7851,17 @@ fn serve_fetch(
     append_frame(&mut out, &encode_response(&closing))?;
     flush_egress(stream, &mut out)?;
     Ok(true)
+}
+
+/// The refusal of a `Fetch` of `filter` below its oldest, `floor`: `retained-from=<floor>`
+/// ([`RETAINED_FROM_PREFIX`]), then why in words. Not every record of the filter below the
+/// floor was given up (some subject of it may hold records there, which a reader told of
+/// gap notices reads), so it says only what is true of all of them: they are not all kept.
+fn retained_from_msg(filter: &str, floor: u64) -> String {
+    format!(
+        "{RETAINED_FROM_PREFIX}{floor}: records of {filter} below offset {floor} are not all \
+         kept; read from there"
+    )
 }
 
 /// Why a client-chosen subject cannot be appended to: not a valid `Subject`, or the
@@ -7012,6 +8118,19 @@ fn ungranted(
 /// verb stops at the first grant that authorizes it and answers `u64::MAX` ("authorized
 /// now"), which is also the answer for grants without an expiry.
 #[cfg(feature = "cap")]
+fn stats_auth_filter(filter: &str) -> String {
+    if Filter::new(filter).is_err() {
+        return filter.to_string();
+    }
+    if let Some((fleet, _)) = filter.strip_prefix("/f/").and_then(|r| r.split_once('/')) {
+        if !fleet.is_empty() && !fleet.contains('*') && !fleet.contains('>') {
+            return format!("/f/{fleet}/>");
+        }
+    }
+    "/>".to_string()
+}
+
+#[cfg(feature = "cap")]
 fn cap_authorized_until(
     secret: &[u8],
     keyring: &[astream_cap::Capability],
@@ -7036,6 +8155,10 @@ fn cap_authorized_until(
         Budget(u64),
     }
 
+    let stats_scope = match req {
+        Request::Stats { filter } => stats_auth_filter(filter),
+        _ => String::new(),
+    };
     let streaming = matches!(
         req,
         Request::Subscribe { .. }
@@ -7131,6 +8254,11 @@ fn cap_authorized_until(
         | Request::ForkSubscribe { filter, .. }
         | Request::Last { filter, .. }
         | Request::Fetch { filter, .. } => (CapPred::Read(filter), None),
+        // Operator status (`REQUIREMENTS` R5) exposes broker-wide producers, listeners,
+        // pending wills, dedup size and disk bytes alongside face counts, so a narrow
+        // mailbox or single-subject read grant may not authorize it: require a read
+        // grant on `/f/<F>/>` (for a fabric filter) or `/>` (otherwise).
+        Request::Stats { .. } => (CapPred::Read(stats_scope.as_str()), None),
         // A group subscription is authorized for BOTH what it reads (filter) and the
         // durable group it commits under (group-as-subject).
         Request::SubscribeGroup { group, filter } => {
@@ -7145,7 +8273,9 @@ fn cap_authorized_until(
         // These grant nothing, but their `Mark` names the log's head, which an
         // unattached connection is told nothing about: any capability the ring still
         // holds — genuine and unexpired — answers for it.
-        Request::Keepalive | Request::IdleMarks | Request::GapNotices => (CapPred::AnyValid, None),
+        Request::Keepalive | Request::IdleMarks | Request::GapNotices | Request::BrokerTimes => {
+            (CapPred::AnyValid, None)
+        }
         // A producer's budget is answered to whoever could spend it: a genuine,
         // unexpired read-write grant that publishes as that producer — bound to it,
         // or unbound (the god grant publishes as any). It names no subject, so no
@@ -7222,9 +8352,9 @@ fn oversized_name(req: &Request) -> Option<String> {
         Request::Publish { subject, .. }
         | Request::Will { subject, .. }
         | Request::Retire { subject, .. } => [("subject", subject), NONE],
-        Request::Subscribe { filter, .. } | Request::Fetch { filter, .. } => {
-            [("filter", filter), NONE]
-        }
+        Request::Subscribe { filter, .. }
+        | Request::Fetch { filter, .. }
+        | Request::Stats { filter } => [("filter", filter), NONE],
         Request::ForkSubscribe {
             replacement_subject,
             filter,
@@ -7250,6 +8380,7 @@ fn oversized_name(req: &Request) -> Option<String> {
         | Request::Keepalive
         | Request::IdleMarks
         | Request::GapNotices
+        | Request::BrokerTimes
         | Request::Budget { .. } => [NONE, NONE],
     };
     for (what, name) in names {
@@ -7267,10 +8398,60 @@ fn oversized_name(req: &Request) -> Option<String> {
 /// feeding a dedicated thread that streams them back on a cloned write half. Lets a
 /// connection keep many write ops in flight; back-pressures via the bounded queue.
 struct Pipeline {
+    /// The ops submitted and not yet handed to the writer. Declared first, so a pipeline
+    /// dropped without [`finish`](Self::finish) hands them over before anything else of
+    /// it goes.
+    held: Held,
     /// Ordered queue of per-op ack receivers (bounded → flow control). `send` blocks
     /// when `PIPELINE_DEPTH` acks are outstanding.
     tx: mpsc::SyncSender<Receiver<AckResult>>,
     writer: Option<JoinHandle<io::Result<()>>>,
+}
+
+/// THE RUN A CONNECTION'S READER IS HOLDING: write ops it has decoded and reserved ack
+/// slots for, not yet handed to the writer. The reader keeps adding to it while the
+/// next request has already arrived whole ([`RecvBuf::holds_frame`]), and hands the lot
+/// over as ONE [`Queued::Run`] ([`release`](Self::release)) before it can block — on a
+/// read, a full ack queue ([`Pipeline::reserve`]), or a request answered after the
+/// pending acks ([`Pipeline::finish`]). So the writes a client sent together land in one
+/// group-commit batch, one flush for all of them, however long the reader spends on each
+/// request (a guarded broker checks every one against the connection's keyring).
+/// Submitted one at a time, each could meet the writer idle and be a batch of its own:
+/// measured 2026-10-26 on an idle Ordered broker, a publish and a commit written in one
+/// write took two batches in 989 of 1,000 tries guarded, and in 8 of 1,000 unguarded.
+///
+/// What is held is what would otherwise be queued already: every op in it passed the
+/// checks a submitted op passes, and its ack slot comes before any later reply's. Holding
+/// moves only the moment the writer sees it, by the time the reader takes to decode
+/// requests that are already in memory. Dropped, it hands the run over too, so a
+/// connection that ends on an error still commits what it read, as it did when each op
+/// was queued as it was read, and before the connection's will fires.
+struct Held {
+    ops: Vec<WriteOp>,
+    writes: Sender<Queued>,
+}
+
+impl Held {
+    /// Hand the run to the writer: one op as itself, more as one [`Queued::Run`]. False
+    /// when the writer has gone (the broker is stopping), which drops the ops and with
+    /// them their ack senders, so the ack-writer's wait on each slot ends.
+    fn release(&mut self) -> bool {
+        let queued = if self.ops.len() > 1 {
+            Queued::Run(std::mem::take(&mut self.ops))
+        } else {
+            match self.ops.pop() {
+                Some(op) => Queued::Op(op),
+                None => return true,
+            }
+        };
+        self.writes.send(queued).is_ok()
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
 }
 
 impl Pipeline {
@@ -7280,8 +8461,13 @@ impl Pipeline {
     /// socket rather than of the descriptor, and `try_clone` shares the file
     /// description: whatever the ack-writer sets here it also sets for the connection
     /// thread's own writes, for the rest of the connection's life, so anything but the
-    /// configured [`Broker::set_write_timeout`] value would silently replace it.
-    fn start(stream: &Conn, write_timeout: Duration) -> io::Result<Pipeline> {
+    /// configured [`Broker::set_write_timeout`] value would silently replace it. Its
+    /// ops go to the writer through `writes`.
+    fn start(
+        stream: &Conn,
+        write_timeout: Duration,
+        writes: Sender<Queued>,
+    ) -> io::Result<Pipeline> {
         let wr = stream.try_clone()?;
         let (tx, rx) = mpsc::sync_channel::<Receiver<AckResult>>(PIPELINE_DEPTH);
         // A failed spawn is this connection's error, not a panic that would unwind
@@ -7289,43 +8475,64 @@ impl Pipeline {
         let writer =
             thread::Builder::new().spawn(move || ack_writer_loop(wr, rx, write_timeout))?;
         Ok(Pipeline {
+            held: Held {
+                ops: Vec::new(),
+                writes,
+            },
             tx,
             writer: Some(writer),
         })
     }
 
-    /// Submit a durable mutation: queue its ack slot in order, THEN enqueue the op to
-    /// the global writer. Returns false if the ack-writer or the global writer has gone
-    /// (the connection should close).
+    /// Submit a durable mutation: queue its ack slot in order, THEN add the op to the
+    /// run the reader holds ([`Held`]), which reaches the writer by the time the reader
+    /// could block. Returns false if the ack-writer has gone, or the writer has (the
+    /// connection should close).
     ///
     /// Ordering matters for correctness: the ack slot is reserved FIRST. The bounded
     /// queue applies back-pressure here (blocks once PIPELINE_DEPTH acks are
-    /// outstanding) BEFORE the op reaches the writer, so a record is never committed
-    /// unless its ack is already queued to be delivered in order — closing the
-    /// "committed durably but ack lost (client sees EOF)" window. If the writer has
-    /// since exited, dropping the returned `WriteOp` closes `ack_tx`, so the ack-writer's
-    /// blocked recv on the reserved slot returns cleanly instead of hanging.
-    fn submit(&self, shared: &Arc<Shared>, kind: WriteKind) -> bool {
+    /// outstanding, having handed the held run over) BEFORE the op reaches the writer,
+    /// so a record is never committed unless its ack is already queued to be delivered
+    /// in order — closing the "committed durably but ack lost (client sees EOF)" window.
+    /// If the writer has since exited, dropping the `WriteOp` closes `ack_tx`, so the
+    /// ack-writer's blocked recv on the reserved slot returns cleanly instead of hanging.
+    fn submit(&mut self, kind: WriteKind) -> bool {
         let (ack_tx, ack_rx) = mpsc::channel();
-        if self.tx.send(ack_rx).is_err() {
+        if !self.reserve(ack_rx) {
             return false; // ack-writer gone (its socket died); nothing committed
         }
-        shared
-            .writes
-            .send(Queued::Op(WriteOp { kind, ack: ack_tx }))
-            .is_ok()
+        self.held.ops.push(WriteOp { kind, ack: ack_tx });
+        true
     }
 
     /// Queue an already-resolved response (e.g. a validation error) in order.
-    fn push_result(&self, res: AckResult) -> bool {
+    fn push_result(&mut self, res: AckResult) -> bool {
         let (tx, rx) = mpsc::channel();
         let _ = tx.send(res);
-        self.tx.send(rx).is_ok()
+        self.reserve(rx)
+    }
+
+    /// Reserve the next ack slot. When the queue is full the ack-writer may be waiting
+    /// on an op still held, so the run is handed over before this waits for room: a
+    /// wait with it held would never end.
+    fn reserve(&mut self, slot: Receiver<AckResult>) -> bool {
+        match self.tx.try_send(slot) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(slot)) => self.release() && self.tx.send(slot).is_ok(),
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    /// Hand the held run to the writer ([`Held::release`]).
+    fn release(&mut self) -> bool {
+        self.held.release()
     }
 
     /// Flush every queued ack and join the ack-writer (dropping `tx` makes its outer
     /// recv return `Disconnected` once drained), reclaiming the socket for streaming.
+    /// The held run goes to the writer first, or the ack-writer would wait on it.
     fn finish(mut self) -> io::Result<()> {
+        let _ = self.release();
         drop(self.tx);
         match self.writer.take() {
             Some(j) => match j.join() {
@@ -7362,9 +8569,10 @@ fn emit_op(
         None => pipe.insert(Pipeline::start(
             stream,
             Duration::from_millis(shared.write_timeout_ms.load(Ordering::Relaxed)),
+            shared.writes.clone(),
         )?),
     };
-    Ok(p.submit(shared, kind))
+    Ok(p.submit(kind))
 }
 
 /// Finish the pipeline if one is active (flush acks, join the ack-writer).
@@ -7372,6 +8580,107 @@ fn finish_pipe(pipe: &mut Option<Pipeline>) -> io::Result<()> {
     match pipe.take() {
         Some(p) => p.finish(),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod held_tests {
+    use super::*;
+
+    /// A pipeline over a one-slot ack queue: an ack-writer that takes each slot in order,
+    /// says so on the returned receiver, and waits for its answer (counting the answers);
+    /// and a writer that answers every op it is handed (recording how many came together).
+    fn tiny() -> (
+        Pipeline,
+        Receiver<()>,
+        JoinHandle<usize>,
+        JoinHandle<Vec<usize>>,
+    ) {
+        let (tx, slots) = mpsc::sync_channel::<Receiver<AckResult>>(1);
+        let (writes, queue) = mpsc::channel::<Queued>();
+        let (took_tx, took) = mpsc::channel();
+        let acker = thread::spawn(move || {
+            slots
+                .iter()
+                .filter(|slot| {
+                    let _ = took_tx.send(());
+                    slot.recv().is_ok()
+                })
+                .count()
+        });
+        let writer = thread::spawn(move || {
+            let mut runs = Vec::new();
+            for queued in queue {
+                let ops = match queued {
+                    Queued::Op(op) => vec![op],
+                    Queued::Run(ops) => ops,
+                    Queued::Stop => break,
+                };
+                runs.push(ops.len());
+                for op in ops {
+                    let _ = op.ack.send(Ok((0, false)));
+                }
+            }
+            runs
+        });
+        let pipe = Pipeline {
+            held: Held {
+                ops: Vec::new(),
+                writes,
+            },
+            tx,
+            writer: None,
+        };
+        (pipe, took, acker, writer)
+    }
+
+    /// A one-minute HANG DETECTOR for something that must happen, never a budget.
+    const HANG: Duration = Duration::from_secs(60);
+
+    /// **A FULL ACK QUEUE NEVER WAITS ON A HELD OP.** With one slot, the ack-writer waits
+    /// on the first op's answer while the queue holds the second's slot; the third
+    /// submit finds the queue full. Were it to wait for room with the first two still
+    /// held, nothing would ever answer the first (it is not the writer's yet) and the
+    /// connection would hang. It hands the held run over first: every op is answered,
+    /// and the first two reached the writer together.
+    #[test]
+    fn a_full_ack_queue_hands_the_held_run_over_before_it_waits() {
+        let (mut pipe, took, acker, writer) = tiny();
+        let (done_tx, done) = mpsc::channel();
+        let submitter = thread::spawn(move || {
+            let mut submitted = pipe.submit(WriteKind::Flush);
+            took.recv_timeout(HANG)
+                .expect("the ack-writer takes the first slot");
+            submitted &= (0..2).all(|_| pipe.submit(WriteKind::Flush));
+            let finished = pipe.finish().is_ok();
+            let _ = done_tx.send((submitted, finished));
+        });
+        // A one-minute HANG DETECTOR for something that must happen, never a budget.
+        let (submitted, finished) = done
+            .recv_timeout(HANG)
+            .expect("the third submit waited for room behind an op it still held");
+        assert!(submitted && finished);
+        submitter.join().unwrap();
+        assert_eq!(acker.join().unwrap(), 3, "every op answered, in order");
+        let runs = writer.join().unwrap();
+        assert_eq!(runs.iter().sum::<usize>(), 3);
+        assert_eq!(
+            runs.first(),
+            Some(&2),
+            "the two held ops went over as one run"
+        );
+    }
+
+    /// **A PIPELINE DROPPED WITHOUT FINISHING STILL HANDS ITS RUN OVER**, as a connection
+    /// that ends on an error does: what the reader read and held reaches the writer, as it
+    /// did when each op was queued as it was read.
+    #[test]
+    fn a_dropped_pipeline_hands_its_held_run_to_the_writer() {
+        let (mut pipe, _took, acker, writer) = tiny();
+        assert!(pipe.submit(WriteKind::Flush));
+        drop(pipe);
+        assert_eq!(acker.join().unwrap(), 1);
+        assert_eq!(writer.join().unwrap(), [1]);
     }
 }
 
@@ -7506,6 +8815,9 @@ fn writer_loop(shared: &Arc<Shared>, rx: Receiver<Queued>) {
             while let Some(queued) = next {
                 match queued {
                     Queued::Op(op) => batch.push(op),
+                    // Whole, even past BATCH_MAX: a run is at most a pipeline's depth of
+                    // ops (each holds an ack slot; `Pipeline::reserve`).
+                    Queued::Run(ops) => batch.extend(ops),
                     Queued::Stop => stopping = true,
                 }
                 // Nothing more queued right now → commit what we have.
@@ -7557,9 +8869,7 @@ fn horizon_flush(shared: &Shared) -> bool {
     };
     let res = handle.full();
     let (_, dirty, wake) = settle_full_flush(shared, target, res, served_before);
-    if wake {
-        wake_tails(shared);
-    }
+    fire_tail_wakes(shared, wake);
     dirty
 }
 
@@ -7568,14 +8878,14 @@ fn horizon_flush(shared: &Shared) -> bool {
 /// batch kept back (never in the Replicated tier, whose visible head is the quorum's),
 /// whether the log still serves Ordered, and — if the log latched to Strict — the copy
 /// `Hello` answers from. The durable head after it (or the error a waiting op is
-/// answered with), whether the log is still dirty, and whether the tails must be woken
+/// answered with), whether the log is still dirty, and the tail wake plan
 /// ([`publish_log_state`]).
 fn settle_full_flush(
     shared: &Shared,
     target: u64,
     res: io::Result<()>,
     served_before: crate::ServedInfo,
-) -> (Result<u64, String>, bool, bool) {
+) -> (Result<u64, String>, bool, WakePlan) {
     // Declared before the guard so unwind also releases the lock first.
     let retired;
     let mut log = shared
@@ -7628,23 +8938,89 @@ fn publish_retention(shared: &Shared, log: &BrokerLog) {
         .store(log.retention_due(), Ordering::Relaxed);
 }
 
+/// Plan which parked subscriber tails to wake for newly visible records in
+/// `[before .. visible)` (or a `durable_mark_moved` advance), called under `shared.log`.
+fn plan_tail_wakes(
+    shared: &Shared,
+    log: &BrokerLog,
+    before: u64,
+    visible: u64,
+    durable_mark_moved: bool,
+) -> WakePlan {
+    if !shared.selective_tail_wake.load(Ordering::Acquire) {
+        let any = before < visible && log.any_deliverable(Offset(before), Offset(visible));
+        return if any || durable_mark_moved {
+            WakePlan::Broadcast
+        } else {
+            WakePlan::None
+        };
+    }
+    let recs = if before < visible {
+        log.visible_slice(Offset(before), Offset(visible))
+    } else {
+        &[]
+    };
+    let mut has_any_deliverable = false;
+    for r in recs {
+        if !crate::store::is_hidden_record(r) {
+            has_any_deliverable = true;
+            break;
+        }
+    }
+    let parkers = shared
+        .tail_parkers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut to_wake: Vec<Arc<TailParker>> = Vec::new();
+    for p in parkers.iter() {
+        let mut st = p
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut first_match: Option<u64> = None;
+        if has_any_deliverable {
+            for r in recs {
+                if !crate::store::is_hidden_record(r) && p.filter.matches_str(&r.subject) {
+                    first_match = Some(r.seq.0);
+                    break;
+                }
+            }
+        }
+        let owe_durable = durable_mark_moved && p.idle_marks;
+        if let Some(m) = first_match {
+            if !st.has_unread_match && st.safe_skip_to == before {
+                st.safe_skip_to = tail_skip_clamp(m, visible);
+            }
+            st.has_unread_match = true;
+            st.matched_head = tail_wake_head_advance(st.matched_head, visible);
+            p.needs_wake.store(true, Ordering::Release);
+            to_wake.push(p.clone());
+        } else if owe_durable {
+            if !st.has_unread_match && st.safe_skip_to == before && before < visible {
+                st.safe_skip_to = tail_skip_clamp(visible, visible);
+            }
+            st.matched_head = tail_wake_head_advance(st.matched_head, visible);
+            p.needs_wake.store(true, Ordering::Release);
+            to_wake.push(p.clone());
+        } else if !st.has_unread_match && st.safe_skip_to == before && before < visible {
+            st.safe_skip_to = tail_skip_clamp(visible, visible);
+        }
+    }
+    if to_wake.is_empty() {
+        WakePlan::None
+    } else {
+        WakePlan::Selective(to_wake)
+    }
+}
+
 /// Publish the log's heads and tier where the lock-free readers find them. Called with
 /// the log lock held, which is what a parked tail's predicate reads them under, so no
 /// wakeup is lost between "nothing to do" and "wait".
-///
-/// Returns whether the parked tails must be woken for it (see the end of
-/// `process_batch`): the range from the old visible head to the new holds a record some
-/// subscriber can be delivered — in the Strict/Ordered/Relaxed tiers; the Replicated
-/// tier decides over its watermark — or, on a log that owes durable marks (it served
-/// Ordered at its open: `Shared::durable_marks`), the durable head moved, which may owe
-/// an idle-marks subscriber one (at most one wake per full flush: the horizon's, an
-/// escalation's per escalated batch, and once the log has latched to Strict, every
-/// batch's).
 fn publish_log_state(
     shared: &Shared,
     log: &mut BrokerLog,
     served_before: crate::ServedInfo,
-) -> (bool, Option<crate::LastViewGarbage>) {
+) -> (WakePlan, Option<crate::LastViewGarbage>) {
     shared.is_replica.store(log.is_replica(), Ordering::Release);
     shared.log_head.store(log.head().0, Ordering::Release);
     #[cfg(feature = "retention")]
@@ -7658,31 +9034,32 @@ fn publish_log_state(
     // Durable first, then visible: a thread that sees the visible head move past an
     // escalated record then also sees the durable head that covers it.
     let durable_before = shared.durable.swap(log.durable_head().0, Ordering::Release);
-    let mut wake = false;
-    let published = if shared.replicator.is_none() {
+    let durable_mark_moved = shared.durable_marks && log.durable_head().0 > durable_before;
+    let (wake, published) = if shared.replicator.is_none() {
         let visible = log.visible_head();
         let before = shared.head.swap(visible.0, Ordering::Release);
-        wake = log.any_deliverable(Offset(before), visible);
-        Some(visible.0)
+        (
+            plan_tail_wakes(shared, log, before, visible.0, durable_mark_moved),
+            Some(visible.0),
+        )
+    } else if durable_mark_moved {
+        let cur_vis = shared.head.load(Ordering::Relaxed);
+        (plan_tail_wakes(shared, log, cur_vis, cur_vis, true), None)
     } else {
-        None
+        (WakePlan::None, None)
     };
     let served = log.served();
     if served != served_before {
-        // The tier served is part of what `Hello` answers (its block's tag 0x01); it
-        // changes in a running broker only here, when the log latches to Strict. The
-        // durable marks a tail is owed do not change with it (`Shared::durable_marks`).
         *shared
             .hello
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = HelloCopy::of(log);
     }
-    (
-        wake || (shared.durable_marks && log.durable_head().0 > durable_before),
-        // Detach last, after bookkeeping that could unwind; the caller's earlier
-        // garbage binding then outlives its log guard even on an error path.
-        published.and_then(|visible| publish_last_history(log, visible)),
-    )
+    let garbage = match published {
+        Some(visible) => publish_last_history(log, visible),
+        None => None,
+    };
+    (wake, garbage)
 }
 
 // This is called only with the ACTUAL head just published under the log lock,
@@ -7701,10 +9078,57 @@ fn publish_last_history(log: &mut BrokerLog, visible: u64) -> Option<crate::Last
     }
 }
 
-/// Wake every parked subscriber tail at once, counted (`tail_broadcasts`).
-fn wake_tails(shared: &Shared) {
-    shared.tail_broadcasts.fetch_add(1, Ordering::Relaxed);
+/// Execute `plan` outside the log lock after producer acks have been dispatched.
+fn fire_tail_wakes(shared: &Shared, plan: WakePlan) {
+    match plan {
+        WakePlan::None => {}
+        WakePlan::Broadcast => {
+            shared.tail_broadcasts.fetch_add(1, Ordering::Relaxed);
+            shared.tail.notify_all();
+        }
+        WakePlan::Selective(parkers) => {
+            shared
+                .selective_tail_wakes
+                .fetch_add(count64(parkers.len()), Ordering::Relaxed);
+            for p in parkers {
+                p.cv.notify_one();
+            }
+        }
+    }
+}
+
+/// Wake every parked subscriber tail across both broadcast (`shared.tail`) and
+/// selective (`shared.tail_parkers`) condvars (used for shutdown, revocations, and
+/// live mode switches).
+fn notify_all_tails(shared: &Shared) {
     shared.tail.notify_all();
+    let parkers = shared
+        .tail_parkers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    for p in parkers {
+        p.cv.notify_one();
+    }
+}
+
+/// Clamp selective tail parker state down to `new_vis` under `shared.log` when a
+/// replica's log is truncated via `truncate_replica_to`.
+fn reset_tail_parkers_to(shared: &Shared, new_vis: u64) {
+    let parkers = shared
+        .tail_parkers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for p in parkers.iter() {
+        let mut st = p
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.safe_skip_to = tail_skip_clamp(st.safe_skip_to, new_vis);
+        st.matched_head = tail_skip_clamp(st.matched_head, new_vis);
+        st.has_unread_match = false;
+        p.needs_wake.store(false, Ordering::Release);
+    }
 }
 
 /// The writer's side of [`Broker::pause_next_batch`] and [`Broker::pause_next_acks`],
@@ -7780,6 +9204,7 @@ fn stage_batch_ops(
     guard: &mut BrokerLog,
     batch: Vec<WriteOp>,
     visible_head: u64,
+    mut rejoined_left: usize,
 ) -> (
     Vec<Sender<AckResult>>,
     Vec<AckResult>,
@@ -7863,14 +9288,31 @@ fn stage_batch_ops(
                 group,
                 upto,
             ),
-            WriteKind::Replicate { rec, leader } => {
-                let staged = guard.stage_replica(rec);
-                if let (Ok((off, _)), Some(leader)) = (&staged, leader) {
-                    if !matches!(adopt, Some((_, through)) if *off < through) {
-                        adopt = Some((leader, *off));
+            WriteKind::Replicate {
+                rec,
+                leader,
+                bt_ms,
+                conn_diverged,
+            } => {
+                if conn_diverged.load(Ordering::Relaxed) {
+                    Err(StageErr::Diverged(format!(
+                        "replica diverged on this connection prior to offset {}: reconnect after truncating to common prefix",
+                        rec.seq.0
+                    )))
+                } else {
+                    let staged = guard.stage_replica_with_bt(rec, bt_ms);
+                    if let Err(StageErr::Diverged(msg)) = &staged {
+                        if msg.starts_with("replica diverged at offset ") {
+                            conn_diverged.store(true, Ordering::Relaxed);
+                        }
                     }
+                    if let (Ok((off, _)), Some(leader)) = (&staged, leader) {
+                        if !matches!(adopt, Some((_, through)) if *off < through) {
+                            adopt = Some((leader, *off));
+                        }
+                    }
+                    staged
                 }
-                staged
             }
             WriteKind::Bind {
                 producer_id,
@@ -7913,6 +9355,11 @@ fn stage_batch_ops(
             WriteKind::Flush => {
                 wants_flush = true;
                 Ok((Offset::ZERO, false))
+            }
+            WriteKind::RejoinFollowers => {
+                is_local = true;
+                let count = std::mem::take(&mut rejoined_left);
+                Ok((Offset(u64::try_from(count).unwrap_or(u64::MAX)), false))
             }
         };
         local_only.push(is_local);
@@ -7971,10 +9418,22 @@ fn stage_batch_ops(
 }
 
 fn process_batch(shared: &Arc<Shared>, batch: Vec<WriteOp>) -> bool {
-    // Replicated tier: bring down follower links back first — network I/O, so never
-    // under the log lock — so the re-ship base below counts exactly the followers
-    // this batch can reach.
+    let mut rejoined = 0usize;
+    // Replicated tier: if an operator asked to rejoin fenced followers, un-fence them
+    // first so the immediately following `redial` + `replicate` catches them up in this
+    // same batch. Network I/O runs before taking the log lock.
     if let Some(rep) = &shared.replicator {
+        let mut has_rejoin = false;
+        for op in &batch {
+            if matches!(op.kind, WriteKind::RejoinFollowers) {
+                has_rejoin = true;
+                break;
+            }
+        }
+        if has_rejoin {
+            let floor = shared.base.load(Ordering::Acquire);
+            rejoined = rep.rejoin(floor);
+        }
         rep.redial(&shared.running);
     }
     shared.writer_batches.fetch_add(1, Ordering::Relaxed);
@@ -8005,7 +9464,7 @@ fn process_batch(shared: &Arc<Shared>, batch: Vec<WriteOp>) -> bool {
         })
         .count();
     let (acks, results, flushes, wants_flush, local_only, poisoned, adopt) =
-        stage_batch_ops(&mut guard, batch, visible_head);
+        stage_batch_ops(&mut guard, batch, visible_head, rejoined);
     // The `pause_next_batch` test seam: staged, log lock held, nothing written yet.
     if shared.batch_pause_armed.load(Ordering::Acquire) {
         hold_paused_batch(shared, BatchPoint::Staged);
@@ -8087,7 +9546,7 @@ fn process_batch(shared: &Arc<Shared>, batch: Vec<WriteOp>) -> bool {
     let to_ship = match &shared.replicator {
         Some(rep) if commit_res.is_ok() => {
             let base = rep.min_upto(guard.base().0, guard.head().0);
-            Some(guard.read_from(Offset(base)))
+            Some(guard.read_from_stamped(Offset(base)))
         }
         _ => None,
     };
@@ -8461,17 +9920,17 @@ fn stop_ticker(shared: &Shared) {
     let _ = shared;
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn finish_batch_acks_and_flush(
     shared: &Arc<Shared>,
     commit_res: Result<crate::store::Committed, (u8, String)>,
-    to_ship: Option<Vec<Arc<BrokerRecord>>>,
+    to_ship: Option<Vec<(Arc<BrokerRecord>, Option<u64>)>>,
     flush: Option<(u64, crate::storage::FlushHandle)>,
     acks: Vec<Sender<AckResult>>,
     results: Vec<AckResult>,
     local_only: Vec<bool>,
     flushes: Vec<bool>,
-    mut wake: bool,
+    mut wake: WakePlan,
     durable_now: u64,
     mut dirty: bool,
     served_before: crate::ServedInfo,
@@ -8498,7 +9957,7 @@ fn finish_batch_acks_and_flush(
             // What a quorum now holds that it did not, whichever batch appended it: a
             // record from an earlier batch becomes visible when a later batch's ship
             // confirms it.
-            wake = g.any_deliverable(Offset(prev), Offset(hwm));
+            wake = plan_tail_wakes(shared, &g, prev, hwm, false);
             retired = publish_last_history(&mut g, hwm);
             drop(g);
             drop(retired);
@@ -8659,9 +10118,7 @@ fn finish_batch_acks_and_flush(
     // (`settle_full_flush`) — plus, on a log that served Ordered at its open, a full
     // flush that moved the durable head, which may owe an idle-marks subscriber a
     // durable mark.
-    if wake {
-        wake_tails(shared);
-    }
+    fire_tail_wakes(shared, wake);
     // Steps 4 and 5: the full flush, OUTSIDE the lock, then its outcome under it —
     // the durable head, the visible head past the held records — and the waiting ops.
     if let Some((target, handle)) = flush {
@@ -8689,9 +10146,7 @@ fn finish_batch_acks_and_flush(
             };
             let _ = ack.send(send);
         }
-        if wake {
-            wake_tails(shared);
-        }
+        fire_tail_wakes(shared, wake);
     }
     dirty
 }
@@ -8751,8 +10206,18 @@ fn last_page(
     filt: &Filter,
     after: &str,
     want: usize,
-) -> Result<(Vec<Arc<BrokerRecord>>, Option<String>, u64), String> {
+    broker_times: bool,
+) -> Result<
+    (
+        Vec<Arc<BrokerRecord>>,
+        Vec<Option<u64>>,
+        Option<String>,
+        u64,
+    ),
+    String,
+> {
     let mut out: Vec<Arc<BrokerRecord>> = Vec::new();
+    let mut out_bts: Vec<Option<u64>> = Vec::new();
     let mut cursor = after.to_string();
     // The head every round reads against and the answer reports. Read under the log
     // lock on the first round (see below) and never re-read: that is what makes the
@@ -8765,7 +10230,7 @@ fn last_page(
         // Replicated tier), never `log.head()`. Under the lock: the seek, at most
         // LAST_SCAN_MAX retirement-plus-index visits, and pointer clones — never the socket writes the
         // caller does, which happen with it released.
-        let (step, head) = {
+        let (step, round_bts, head) = {
             let log = shared
                 .log
                 .lock()
@@ -8787,20 +10252,31 @@ fn last_page(
                     view,
                 )
                 .map_err(|error| error.to_string())?;
-            (step, head)
+            let mut round_bts = Vec::new();
+            if broker_times {
+                if let crate::LastStep::Page(ref page, _) = step {
+                    for rec in page {
+                        round_bts.push(log.last_record_bt_ms(view, rec));
+                    }
+                }
+            }
+            (step, round_bts, head)
         };
         let (page, resume) = match step {
             crate::LastStep::Pending => continue,
             crate::LastStep::Page(page, resume) => (page, resume),
         };
         out.extend(page);
+        if broker_times {
+            out_bts.extend(round_bts);
+        }
         match resume {
             // The prefix range ran out: the answer is complete.
-            None => return Ok((out, None, head)),
+            None => return Ok((out, out_bts, None, head)),
             // Cut by `max`, or stopped on an entry the filter matches: either way the
             // cursor is a subject the caller's own filter covers.
             Some(s) if filt.matches_str(&s) || out.len() >= want => {
-                return Ok((out, Some(s), head));
+                return Ok((out, out_bts, Some(s), head));
             }
             // Cut by the scan bound on a non-matching entry: keep walking.
             Some(s) => cursor = s,
@@ -8856,6 +10332,28 @@ fn next_chunk(
     (gap, log.read_chunk(cursor, head, max))
 }
 
+struct TailParkerGuard<'a> {
+    shared: &'a Shared,
+    id: u64,
+}
+
+impl Drop for TailParkerGuard<'_> {
+    fn drop(&mut self) {
+        let mut parkers = self
+            .shared
+            .tail_parkers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut retained = Vec::new();
+        while let Some(p) = parkers.pop() {
+            if p.id != self.id {
+                retained.push(p);
+            }
+        }
+        *parkers = retained;
+    }
+}
+
 /// Tell a tail what retention gave up below it ([`Response::Gap`]), at once: ahead of
 /// every record it is delivered after it.
 fn write_gap<S: Write>(stream: &mut S, gap: crate::proto::Gap) -> io::Result<()> {
@@ -8879,6 +10377,31 @@ fn tail_loop(
     mut cap_check: StreamCapCheck,
 ) -> io::Result<()> {
     let idle_marks = asks.idle_marks;
+    let parker_id = shared.next_parker_id.fetch_add(1, Ordering::Relaxed);
+    let init_base = shared.base.load(Ordering::Acquire);
+    let init_head = shared.head.load(Ordering::Acquire);
+    let need_init_scan = init_head > cursor || cursor < init_base;
+    let parker = Arc::new(TailParker {
+        id: parker_id,
+        filter: filter.clone(),
+        idle_marks,
+        cv: Condvar::new(),
+        needs_wake: AtomicBool::new(need_init_scan),
+        state: Mutex::new(TailParkerState {
+            safe_skip_to: cursor,
+            matched_head: tail_wake_head_advance(cursor, init_head),
+            has_unread_match: need_init_scan,
+        }),
+    });
+    shared
+        .tail_parkers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(parker.clone());
+    let _parker_guard = TailParkerGuard {
+        shared,
+        id: parker_id,
+    };
     // GAP NOTICES (R4's addendum, A9): for a tail that asked, what it has been told of
     // the records retention gave up below it. One that did not ask is told nothing.
     let mut told = if asks.gaps {
@@ -8923,13 +10446,18 @@ fn tail_loop(
     // of the records it was shown survive a power loss (a notifier pages only those).
     let mut marked_durable: u64 = 0;
     loop {
-        // Fast path when caught up: if `visible <= cursor`, skip locking `shared.log` for
-        // an empty `next_chunk` call and go straight to the Condvar park below (cutting
-        // caught-up lock acquisitions in half). A cursor below the base is never caught
-        // up (the visible head is at or above the base), so it takes the lock, where it
-        // reads the held records from where it is and is told what it lost.
+        // Fast path when caught up: if `visible <= cursor` (or in selective mode, no
+        // unread matching work and `cursor >= base`), skip locking `shared.log` for an
+        // empty `next_chunk` call and go straight to the Condvar park below.
         let mut gap = None;
-        let mut batch = if shared.head.load(Ordering::Acquire) <= cursor {
+        let mut batch_bts = Vec::new();
+        let fast_caught_up = if shared.selective_tail_wake.load(Ordering::Acquire) {
+            !parker.needs_wake.load(Ordering::Acquire)
+                && cursor >= shared.base.load(Ordering::Acquire)
+        } else {
+            shared.head.load(Ordering::Acquire) <= cursor
+        };
+        let mut batch = if fast_caught_up {
             Vec::new()
         } else {
             let log = shared
@@ -8937,7 +10465,55 @@ fn tail_loop(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let visible = shared.head.load(Ordering::Relaxed);
-            let (g, b) = next_chunk(&log, &mut cursor, visible, &filter, told.as_mut(), chunk);
+            if shared.selective_tail_wake.load(Ordering::Relaxed) {
+                let mut st = parker
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if st.safe_skip_to > cursor {
+                    cursor = st.safe_skip_to;
+                    if let Some(ref mut t) = told {
+                        t.advance_to(cursor);
+                    }
+                }
+                if !st.has_unread_match
+                    && tail_wake_is_caught_up(st.matched_head, cursor)
+                    && cursor >= log.base().0
+                {
+                    cursor = cursor.max(visible);
+                    if let Some(ref mut t) = told {
+                        t.advance_to(cursor);
+                    }
+                    st.safe_skip_to = cursor;
+                    st.matched_head = cursor;
+                    st.has_unread_match = false;
+                    parker.needs_wake.store(false, Ordering::Release);
+                }
+            }
+            let (g, b) = if visible > cursor {
+                next_chunk(&log, &mut cursor, visible, &filter, told.as_mut(), chunk)
+            } else {
+                (None, Vec::new())
+            };
+            if shared.selective_tail_wake.load(Ordering::Relaxed)
+                && cursor >= visible
+                && cursor >= log.base().0
+            {
+                let mut st = parker
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                st.safe_skip_to = cursor;
+                st.matched_head = cursor;
+                st.has_unread_match = false;
+                parker.needs_wake.store(false, Ordering::Release);
+            }
+            if asks.broker_times {
+                batch_bts.reserve(b.len());
+                for rec in &b {
+                    batch_bts.push(log.subject_bt_ms(&rec.subject, rec.seq));
+                }
+            }
             gap = g;
             b
         };
@@ -8977,62 +10553,106 @@ fn tail_loop(
                 t => liveness_poll.min(Duration::from_millis(t.saturating_sub(now_unix_ms()))),
             };
             {
-                let guard = shared
+                let mut guard = shared
                     .log
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Counted where the writer cannot race them, under the log lock the
-                // predicate runs under: `parked` is whether the predicate's last answer
-                // sent this tail (back) to wait (`parked_tails`), and every answer after
-                // a wait is one resume (`tail_wakeups`) — a broadcast, a revocation,
-                // shutdown or the poll's timeout. `wait_timeout_while` re-waits inside
-                // itself when a wake leaves the predicate true, so a count taken after
-                // it returns would miss those.
+                // Zero-closure Condvar wait loop preserving exact `parked_tails` and
+                // `tail_wakeups` semantics across both broadcast (`shared.tail`) and
+                // filter-indexed selective (`parker.cv`) modes.
                 let mut parked = false;
                 let mut resumes = 0u64;
                 let seen_epoch = cap_check.seen_epoch;
-                let (guard, _timed_out) = shared
-                    .tail
-                    .wait_timeout_while(guard, park, |_| {
-                        if parked {
-                            resumes = resumes.saturating_add(1);
-                        }
-                        let sighup_pending = shared.has_revocation_file.load(Ordering::Relaxed)
-                            && astream_sys::sighup_generation()
-                                != shared.sighup_seen.load(Ordering::Relaxed);
-                        let epoch_changed =
-                            Some(shared.revocation_epoch.load(Ordering::Relaxed)) != seen_epoch;
-                        // `durable` is written under this lock by the writer, so a full
-                        // flush that makes a durable mark due — and wakes the tails for
-                        // it (`publish_log_state`) — ends this park.
-                        let wait = shared.running.load(Ordering::Relaxed)
-                            && !sighup_pending
-                            && !epoch_changed
-                            && !is_peer_revoked_raw(shared, peer_id)
-                            && shared.head.load(Ordering::Relaxed) <= cursor
-                            && !(idle_marks
-                                && shared.durable_marks
-                                && marked_durable < cursor
-                                && shared.durable.load(Ordering::Relaxed) > marked_durable);
-                        if wait != parked {
-                            if wait {
-                                shared.parked_tails.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                shared.parked_tails.fetch_sub(1, Ordering::Relaxed);
+                let seen_mode_epoch = shared.selective_mode_epoch.load(Ordering::Relaxed);
+                let use_selective = shared.selective_tail_wake.load(Ordering::Relaxed);
+                let wait_start = Instant::now();
+                let mut last_timed_out = false;
+                loop {
+                    if parked {
+                        resumes = resumes.saturating_add(1);
+                    }
+                    let sighup_pending = shared.has_revocation_file.load(Ordering::Relaxed)
+                        && astream_sys::sighup_generation()
+                            != shared.sighup_seen.load(Ordering::Relaxed);
+                    let epoch_changed =
+                        Some(shared.revocation_epoch.load(Ordering::Relaxed)) != seen_epoch;
+                    let mode_changed =
+                        shared.selective_mode_epoch.load(Ordering::Relaxed) != seen_mode_epoch;
+                    let caught_up = if use_selective {
+                        let visible = shared.head.load(Ordering::Relaxed);
+                        let mut st = parker
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if st.safe_skip_to > cursor {
+                            cursor = st.safe_skip_to;
+                            if let Some(ref mut t) = told {
+                                t.advance_to(cursor);
                             }
-                            parked = wait;
                         }
-                        wait
-                    })
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if !st.has_unread_match
+                            && tail_wake_is_caught_up(st.matched_head, cursor)
+                            && cursor >= guard.base().0
+                        {
+                            cursor = cursor.max(visible);
+                            if let Some(ref mut t) = told {
+                                t.advance_to(cursor);
+                            }
+                            st.safe_skip_to = cursor;
+                            st.matched_head = cursor;
+                            st.has_unread_match = false;
+                            parker.needs_wake.store(false, Ordering::Release);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        shared.head.load(Ordering::Relaxed) <= cursor
+                    };
+                    let wait = shared.running.load(Ordering::Relaxed)
+                        && !sighup_pending
+                        && !epoch_changed
+                        && !mode_changed
+                        && !is_peer_revoked_raw(shared, peer_id)
+                        && caught_up
+                        && !(idle_marks
+                            && shared.durable_marks
+                            && marked_durable < cursor
+                            && shared.durable.load(Ordering::Relaxed) > marked_durable);
+                    if wait != parked {
+                        if wait {
+                            shared.parked_tails.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            shared.parked_tails.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        parked = wait;
+                    }
+                    if !wait || last_timed_out {
+                        break;
+                    }
+                    let Some(rem) = park.checked_sub(wait_start.elapsed()) else {
+                        break;
+                    };
+                    if rem.is_zero() {
+                        break;
+                    }
+                    let wait_res = if use_selective {
+                        parker.cv.wait_timeout(guard, rem)
+                    } else {
+                        shared.tail.wait_timeout(guard, rem)
+                    };
+                    let (next_guard, timeout_res) =
+                        wait_res.unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard = next_guard;
+                    last_timed_out = timeout_res.timed_out();
+                }
                 if parked {
                     // Timed out still waiting: no longer parked all the same.
                     shared.parked_tails.fetch_sub(1, Ordering::Relaxed);
                 }
                 shared.tail_wakeups.fetch_add(resumes, Ordering::Relaxed);
-                // Single-lock wakeup: `wait_timeout_while` returns holding `guard`, so
-                // grab `next_chunk` right here instead of dropping `guard` and
-                // re-locking `shared.log` on the next iteration.
+                // Single-lock wakeup: grab `next_chunk` right here while holding `guard`
+                // instead of dropping `guard` and re-locking `shared.log` on the next pass.
                 let visible = shared.head.load(Ordering::Relaxed);
                 let sighup_pending = shared.has_revocation_file.load(Ordering::Relaxed)
                     && astream_sys::sighup_generation()
@@ -9045,10 +10665,56 @@ fn tail_loop(
                     && !is_peer_revoked_raw(shared, peer_id)
                     && lapsed(until).is_none()
                 {
-                    let (g, b) =
-                        next_chunk(&guard, &mut cursor, visible, &filter, told.as_mut(), chunk);
-                    gap = g;
-                    batch = b;
+                    if shared.selective_tail_wake.load(Ordering::Relaxed) {
+                        let mut st = parker
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if st.safe_skip_to > cursor {
+                            cursor = st.safe_skip_to;
+                            if let Some(ref mut t) = told {
+                                t.advance_to(cursor);
+                            }
+                        }
+                        if !st.has_unread_match
+                            && tail_wake_is_caught_up(st.matched_head, cursor)
+                            && cursor >= guard.base().0
+                        {
+                            cursor = cursor.max(visible);
+                            if let Some(ref mut t) = told {
+                                t.advance_to(cursor);
+                            }
+                            st.safe_skip_to = cursor;
+                            st.matched_head = cursor;
+                            st.has_unread_match = false;
+                            parker.needs_wake.store(false, Ordering::Release);
+                        }
+                    }
+                    if visible > cursor {
+                        let (g, b) =
+                            next_chunk(&guard, &mut cursor, visible, &filter, told.as_mut(), chunk);
+                        if shared.selective_tail_wake.load(Ordering::Relaxed)
+                            && cursor >= visible
+                            && cursor >= guard.base().0
+                        {
+                            let mut st = parker
+                                .state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            st.safe_skip_to = cursor;
+                            st.matched_head = cursor;
+                            st.has_unread_match = false;
+                            parker.needs_wake.store(false, Ordering::Release);
+                        }
+                        if asks.broker_times {
+                            batch_bts.reserve(b.len());
+                            for rec in &b {
+                                batch_bts.push(guard.subject_bt_ms(&rec.subject, rec.seq));
+                            }
+                        }
+                        gap = g;
+                        batch = b;
+                    }
                 }
             }
             if let Some(g) = gap.take() {
@@ -9080,7 +10746,7 @@ fn tail_loop(
         }
         // Deliver outside the lock; a slow consumer blocks only this thread.
         let mut wrote = false;
-        for rec in batch {
+        for (i, rec) in batch.into_iter().enumerate() {
             if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
                 return end_stream_failure(stream, &mut out, failure);
             }
@@ -9098,9 +10764,15 @@ fn tail_loop(
                 continue;
             }
             if filter.matches_str(&rec.subject) {
-                // `rec` is a shared `Arc` (no deep copy out of the log), and its
-                // frame is assembled in place from the borrowed subject/body.
-                queue_delivery_cached(shared, stream, &mut out, &rec)?;
+                let bt_ms = batch_bts.get(i).copied().flatten();
+                queue_delivery_maybe_stamped(
+                    shared,
+                    stream,
+                    &mut out,
+                    &rec,
+                    asks.broker_times,
+                    bt_ms,
+                )?;
                 wrote = true;
             }
         }
@@ -9196,6 +10868,25 @@ fn queue_delivery<S: Write>(
         flush_egress(stream, out)?;
     }
     Ok(())
+}
+
+fn queue_delivery_maybe_stamped<S: Write>(
+    shared: &Shared,
+    stream: &mut S,
+    out: &mut Vec<u8>,
+    rec: &BrokerRecord,
+    broker_times: bool,
+    bt_ms: Option<u64>,
+) -> io::Result<()> {
+    if broker_times {
+        append_delivery_frame_stamped(out, rec.seq.0, &rec.subject, &rec.body, bt_ms)?;
+        if out.len() >= EGRESS_CHUNK {
+            flush_egress(stream, out)?;
+        }
+        Ok(())
+    } else {
+        queue_delivery_cached(shared, stream, out, rec)
+    }
 }
 
 const fn crc_cache_slot(
@@ -9315,7 +11006,7 @@ mod tests {
             generation: 3,
         };
         let record = BrokerRecord::marked_retire(Offset(7), 42, "/t/session/ev");
-        let request = crate::proto::decode_request(&encode_replica_record(&record, &ident))
+        let request = crate::proto::decode_request(&encode_replica_record(&record, None, &ident))
             .expect("the actual replication encoder and decoder agree on the marker");
         assert!(matches!(
             &request,
@@ -9406,7 +11097,8 @@ mod tests {
                 generation: 0,
             },
             addr: "127.0.0.1:0".to_string(),
-            stream,
+            transport: LinkTransport::Plain,
+            stream: stream.map(FollowerStream::Plain),
             upto,
             fenced: fenced.map(str::to_string),
             fresh: false,
@@ -10842,6 +12534,95 @@ mod tests {
                     will.recv_timeout(MINUTE).unwrap(),
                     Ok((2, false)),
                     "{durability:?}: the will is on the log, and the connection is told so"
+                );
+            }
+        }
+
+        fn commit(group: &str, upto: u64) -> WriteKind {
+            WriteKind::Commit {
+                group: group.to_string(),
+                upto,
+            }
+        }
+
+        /// `Broker::group_start` COUNTS A COMMIT WITH ITS BATCH, NEVER BEFORE. With the
+        /// writer paused at its write — the commit's batch staged and sealed, the log
+        /// lock let go — the read answers (it would wait out a held lock), and answers
+        /// the log as it stood before the batch: the group has never committed, the
+        /// visible head is short of the commit record. The commit's ack finds both
+        /// moved, and another group's place untouched. Strict, Ordered and Relaxed.
+        #[test]
+        fn group_start_counts_a_commit_with_its_batch() {
+            for durability in [
+                Durability::Strict,
+                Durability::Ordered { horizon: None },
+                Durability::Relaxed,
+            ] {
+                let (_root, b) = escalating("group-start", durability);
+                assert_eq!(
+                    submit(&b, publish(1, 1, "/o/a"))
+                        .recv_timeout(MINUTE)
+                        .unwrap(),
+                    Ok((0, false))
+                );
+                assert_eq!(b.group_start("/g/a"), 0, "{durability:?}: never committed");
+                let write = b.pause_next_write();
+                let acked = submit(&b, commit("/g/a", 0));
+                assert!(
+                    write.wait_at_most(MINUTE),
+                    "{durability:?}: the commit's batch is writing"
+                );
+                assert_eq!(
+                    (b.group_start("/g/a"), b.visible_head()),
+                    (0, 1),
+                    "{durability:?}: a batch not yet promoted counts for nothing"
+                );
+                write.resume();
+                assert_eq!(acked.recv_timeout(MINUTE).unwrap(), Ok((1, false)));
+                assert_eq!(
+                    (b.group_start("/g/a"), b.visible_head()),
+                    (1, 2),
+                    "{durability:?}: the commit counts with its record visible"
+                );
+                assert_eq!(b.group_start("/g/b"), 0, "{durability:?}: its own group's");
+            }
+        }
+
+        /// A commit a HELD batch carries (the escalation table names its group) counts in
+        /// `Broker::group_start` only once the full flush that releases it has succeeded:
+        /// in the window before that flush — the log lock free, the record written — the
+        /// group still starts where it did, exactly where a `SubscribeGroup` would.
+        #[test]
+        fn a_held_commit_counts_in_group_start_after_its_flush() {
+            for durability in holding() {
+                let root = crate::test_scratch::Scratch::new("group-start-held");
+                let mut o = OpenOptions::new(durability);
+                o.escalation = Escalation::new([Escalate::Group("/g/held".into())]);
+                let b = Broker::open_opts(root.path().join("log"), o, || Ok(Prepared::Nothing))
+                    .unwrap();
+                assert_eq!(
+                    submit(&b, publish(1, 1, "/o/a"))
+                        .recv_timeout(MINUTE)
+                        .unwrap(),
+                    Ok((0, false))
+                );
+                let flush = b.pause_next_flush();
+                let acked = submit(&b, commit("/g/held", 0));
+                assert!(
+                    flush.wait_at_most(MINUTE),
+                    "{durability:?}: the held commit owes a full flush"
+                );
+                assert_eq!(
+                    (b.group_start("/g/held"), b.visible_head()),
+                    (0, 1),
+                    "{durability:?}: held at the commit record"
+                );
+                flush.resume();
+                assert_eq!(acked.recv_timeout(MINUTE).unwrap(), Ok((1, false)));
+                assert_eq!(
+                    (b.group_start("/g/held"), b.visible_head()),
+                    (1, 2),
+                    "{durability:?}: released with its flush"
                 );
             }
         }

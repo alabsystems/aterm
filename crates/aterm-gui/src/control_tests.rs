@@ -2325,6 +2325,29 @@ fn task_mark_is_owner_only_and_task_is_a_read() {
     assert!(!line_authorized(edge(), "await", "task", &ctx));
 }
 
+/// A read edge reads a Rewind view but cannot open, step, search or close one, which freezes the person's pane; a write edge can, as `invoke RewindPane` needs.
+#[test]
+fn a_read_edge_reads_rewind_and_only_a_write_edge_moves_a_view() {
+    let ctx = test_ctx();
+    let read = edge_granted(Op::ReadScreen, &ctx);
+    let write = edge_granted(Op::WriteInput, &ctx);
+    for rest in ["", "status", "text", "text trim", "export"] {
+        assert!(line_authorized(read, "rewind", rest, &ctx), "{rest:?}");
+    }
+    for rest in [
+        "open",
+        "open ago=30",
+        "step -1 by=cmd",
+        "changed 3,4",
+        "close",
+    ] {
+        assert!(!line_authorized(read, "rewind", rest, &ctx), "{rest:?}");
+        assert!(line_authorized(write, "rewind", rest, &ctx), "{rest:?}");
+    }
+    assert!(line_authorized(write, "invoke", "RewindPane", &ctx));
+    assert!(!line_authorized(read, "invoke", "RewindPane", &ctx));
+}
+
 #[test]
 fn the_await_task_list_form_is_told_from_every_other_await() {
     assert_eq!(
@@ -6325,6 +6348,32 @@ fn resize_cell_and_px_forms_parse() {
             );
         }
     }
+}
+
+/// `cast` is the sendable recording: its shell marks lose the session's nonce and a clipboard write split across bursts is gone, while what paints stays.
+#[test]
+fn a_cast_carries_no_nonce_and_no_clipboard_write() {
+    let ctx = test_ctx();
+    let nonce = "3c".repeat(32);
+    {
+        let mut rec = ctx.cast.lock().unwrap();
+        let t = rec.now();
+        rec.record_output(
+            t,
+            format!("\x1b]133;A;id={nonce}\x07$ ls\x1b]52;c;c2Vj").as_bytes(),
+        );
+        rec.record_output(
+            t,
+            format!("cmV0\x07\r\n\x1b]133;D;0;id={nonce}\x07").as_bytes(),
+        );
+    }
+    let reply = cmd_cast(&ctx.cast);
+    assert!(!reply.contains(&nonce), "{reply}");
+    assert!(
+        !reply.contains("c2Vj") && !reply.contains("cmV0"),
+        "{reply}"
+    );
+    assert!(reply.contains("133;A") && reply.contains("$ ls"), "{reply}");
 }
 
 #[test]
@@ -12261,6 +12310,210 @@ fn await_gone_refuses_a_bad_regex_and_a_row_span_off_the_grid() {
         out.starts_with("OK gone "),
         "rows 23..=99 is intersected with the grid, and row 23 is clear: {out:?}"
     );
+}
+
+/// The five waits the supervisor parks in, each held pending on this screen, and each latched at
+/// its arm: `(holding, latching)`. The log's latches on a cursor of another epoch, which it answers
+/// as a reset.
+fn autopilot_wait_forms(h: &SessionHandle) -> [(String, &'static str); 5] {
+    let current = crate::term_lock(&h.term).content_seq();
+    [
+        ("idle 600000".to_string(), "idle 0"),
+        (format!("seq {current}"), "seq 100000"),
+        ("gone interrupt".to_string(), "gone xyzzy"),
+        ("agent busy".to_string(), "agent -"),
+        ("log close=run".to_string(), "log close=run since=1 ep=999"),
+    ]
+}
+
+/// v6 §14.10 (slice 10a): `autopilot=<w>` on `await idle|seq|gone|agent|log` answers `OK autopilot
+/// <stored>` at the arm when the stored word is another, ahead of the form's own latch, and leaves
+/// nothing armed; an equal word gets the form's reply byte for byte, and a bad one is refused.
+#[test]
+fn an_await_given_another_autopilot_word_answers_at_the_arm() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"esc to interrupt\r\n");
+    store.write().unwrap().register(h.clone());
+    let wait = |tail: &str| cmd_await(&h.term, &store, 0, &h.ctx, tail);
+    let meta = |line: &str| assert_eq!(cmd_meta(&h.term, &store, 0, &h.ctx, line).0, "OK\n");
+    let hang = aterm_spec::wait::MUST_HAPPEN.as_millis();
+    let forms = autopilot_wait_forms(&h);
+    let nothing_armed = |what: &str| {
+        assert_eq!(h.ctx.watchers.count(), 0, "{what}: no subscription left");
+        assert!(
+            !crate::term_lock(&h.term).watchers_armed(),
+            "{what}: no terminal watcher left"
+        );
+    };
+
+    for (holding, _) in &forms {
+        for bad in [
+            "autopilot=wrap",
+            "autopilot=Land",
+            "autopilot=on",
+            "autopilot=",
+            "autopilot=land autopilot=land",
+        ] {
+            let out = wait(&format!("{holding} {bad} timeout=0"));
+            assert!(
+                out.starts_with("ERR usage: await "),
+                "{holding} {bad}: {out}"
+            );
+        }
+    }
+
+    for (stored, read) in [
+        (None, "land"),
+        (Some("land"), "cruise"),
+        (Some("land"), "-"),
+        (Some("off"), "land"),
+    ] {
+        match stored {
+            Some(word) => meta(&format!("set autopilot {word}")),
+            None => meta("unset autopilot"),
+        }
+        let want = format!("OK autopilot {}\n", stored.unwrap_or("-"));
+        for (holding, latching) in &forms {
+            for form in [*latching, holding.as_str()] {
+                let what = format!("{form} autopilot={read} over {stored:?}");
+                assert_eq!(
+                    wait(&format!("{form} timeout={hang} autopilot={read}")),
+                    want,
+                    "{what}"
+                );
+                nothing_armed(&what);
+            }
+        }
+    }
+
+    meta("set autopilot land");
+    for (holding, latching) in &forms {
+        let today = wait(&format!("{latching} timeout={hang}"));
+        assert!(
+            !today.starts_with("OK timeout"),
+            "{latching} latches at its arm: {today}"
+        );
+        assert_eq!(
+            wait(&format!("{latching} timeout={hang} autopilot=land")),
+            today
+        );
+        for tail in ["timeout=0 autopilot=land", "autopilot=land timeout 0"] {
+            assert_eq!(
+                wait(&format!("{holding} {tail}")),
+                "OK timeout\n",
+                "{holding} {tail}"
+            );
+        }
+        nothing_armed(latching);
+    }
+    assert!(
+        wait("gone autopilot=cruise timeout=60000").starts_with("OK gone "),
+        "a `gone` pattern is the form's own argument, not the token"
+    );
+
+    assert!(
+        cmd_help("await").contains("autopilot=<cruise|land|off|->"),
+        "`help await` names the token"
+    );
+
+    store
+        .write()
+        .unwrap()
+        .set_state(0, session_store::SessionState::Exited);
+    for (holding, _) in &forms {
+        assert_eq!(
+            wait(&format!("{holding} timeout={hang} autopilot=cruise")),
+            "ERR exited\n",
+            "an exit answers ahead of the word: {holding}"
+        );
+    }
+}
+
+/// A wait parked with `autopilot=cruise` answers `OK autopilot land` on another thread's write of
+/// Land and leaves nothing armed (the write's `meta-change` rings the session's watchers).
+#[test]
+fn a_parked_await_given_the_word_wakes_on_the_write_that_moves_it() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"esc to interrupt\r\n");
+    store.write().unwrap().register(h.clone());
+    let hang = aterm_spec::wait::MUST_HAPPEN.as_millis();
+    for (holding, _) in autopilot_wait_forms(&h) {
+        let (set, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "set autopilot cruise");
+        assert_eq!(set, "OK\n");
+        let writer = {
+            let (store, h) = (store.clone(), h.clone());
+            std::thread::spawn(move || {
+                aterm_spec::wait::until_within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    "the wait parks",
+                    || (h.ctx.watchers.count() == 1).then_some(()),
+                );
+                cmd_meta(&h.term, &store, 0, &h.ctx, "set autopilot land").0
+            })
+        };
+        let out = cmd_await(
+            &h.term,
+            &store,
+            0,
+            &h.ctx,
+            &format!("{holding} timeout={hang} autopilot=cruise"),
+        );
+        assert_eq!(writer.join().unwrap(), "OK\n");
+        assert_eq!(out, "OK autopilot land\n", "{holding}");
+        assert_eq!(h.ctx.watchers.count(), 0, "{holding}");
+        assert!(
+            !crate::term_lock(&h.term).watchers_armed(),
+            "{holding}: the terminal watcher is disarmed"
+        );
+    }
+}
+
+/// The same five waits, parked at once, without the token sleep through a write of the word, and
+/// with it through a write of the same word and one of another key: each answers its own `OK
+/// timeout`, though the writes rang them.
+#[test]
+fn parked_awaits_sleep_through_writes_that_leave_their_word() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"esc to interrupt\r\n");
+    store.write().unwrap().register(h.clone());
+    let (store, h) = (&store, &h);
+    let meta = |line: &str| assert_eq!(cmd_meta(&h.term, store, 0, &h.ctx, line).0, "OK\n");
+    let forms = autopilot_wait_forms(h);
+    for (token, writes) in [
+        ("", &["set autopilot land"][..]),
+        (
+            " autopilot=cruise",
+            &["set autopilot cruise", "set role reviewer"][..],
+        ),
+    ] {
+        meta("set autopilot cruise");
+        let rung = h.ctx.watchers.records_rung();
+        let replies = std::thread::scope(|s| {
+            let waits: Vec<_> = forms
+                .iter()
+                .map(|(holding, _)| {
+                    let tail = format!("{holding} timeout=1000{token}");
+                    s.spawn(move || cmd_await(&h.term, store, 0, &h.ctx, &tail))
+                })
+                .collect();
+            aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the waits park", || {
+                let answered = waits.iter().any(std::thread::ScopedJoinHandle::is_finished);
+                (answered || h.ctx.watchers.count() == forms.len()).then_some(())
+            });
+            for line in writes {
+                meta(line);
+            }
+            waits
+                .into_iter()
+                .map(|wait| wait.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(replies, ["OK timeout\n"; 5], "{token:?}");
+        assert!(
+            h.ctx.watchers.records_rung() > rung,
+            "{token:?}: a write rang the parked waits"
+        );
+    }
 }
 
 #[test]
@@ -19214,6 +19467,10 @@ fn await_log_refuses_its_usage_at_once_and_says_a_reset() {
         "need since=x ep=1",
         "kind=verdict since=0",
         "need since=4",
+        "need base=1",
+        "need since=1 base=1",
+        "need since=1 ep=1 base=x",
+        "need since=1 ep=1 base=1 base=1",
     ] {
         assert_eq!(
             await_log(&h, &store, bad),
@@ -19223,7 +19480,56 @@ fn await_log_refuses_its_usage_at_once_and_says_a_reset() {
     }
     let reply = await_log(&h, &store, "close=run since=1 ep=999 timeout=0");
     assert!(reply.starts_with("OK gap why=reset "), "{reply}");
+    assert!(
+        !reply.contains("base="),
+        "a cursor naming no log is answered as before: {reply}"
+    );
     assert_eq!(await_log(&h, &store, "close=run timeout=0"), "OK timeout\n");
+    let (head, ep, base) = {
+        let g = h.ctx.timeline.lock().unwrap();
+        let log = g.slog().log();
+        (log.reader_last_seq(), log.ep(), log.base_ep())
+    };
+    assert_eq!(
+        await_log(
+            &h,
+            &store,
+            &format!("close=run since={head} ep={ep} base={base} timeout=0")
+        ),
+        "OK timeout\n",
+        "a cursor naming this log waits at its head"
+    );
+    let reply = await_log(
+        &h,
+        &store,
+        &format!("close=run since={head} ep={ep} base={} timeout=0", base + 1),
+    );
+    assert!(
+        reply.starts_with("OK gap why=reset "),
+        "a cursor naming another log, at this log's head, is told the reset: {reply}"
+    );
+    assert!(
+        reply.ends_with(&format!(" ep={ep} base={base}\n")),
+        "the reset names this log: {reply}"
+    );
+    let field = |k: &str| {
+        reply
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix(k))
+            .unwrap_or_else(|| panic!("no {k} in {reply}"))
+            .to_string()
+    };
+    let rearmed = format!(
+        "close=run since={} ep={} base={} timeout=0",
+        field("resync_to="),
+        field("ep="),
+        field("base=")
+    );
+    assert_eq!(
+        await_log(&h, &store, &rearmed),
+        "OK timeout\n",
+        "a wait re-armed from the reset's reply reads on in this log"
+    );
 }
 
 #[test]
@@ -19408,6 +19714,7 @@ fn await_log_waits_for_the_close_of_a_shell_that_exited() {
         3,
         &kept.ctx,
         crate::session_log::LogAwait::parse(&["close=session"]).expect("parses"),
+        None,
         u64::try_from(aterm_spec::wait::MUST_HAPPEN.as_millis()).unwrap_or(u64::MAX),
         || {
             looks += 1;
@@ -19437,6 +19744,7 @@ fn await_log_answers_a_close_written_right_after_its_look() {
         1,
         &h.ctx,
         crate::session_log::LogAwait::parse(&["close=session"]).expect("parses"),
+        None,
         u64::try_from(aterm_spec::wait::MUST_HAPPEN.as_millis()).unwrap_or(u64::MAX),
         || {
             retired += 1;
@@ -19476,6 +19784,18 @@ fn since_log_needs_log_ep_and_a_single_target() {
             "ERR bad since-log\n",
         ),
         ("subscribe @. log since-log=4 log-ep=-1", "ERR bad log-ep\n"),
+        (
+            "subscribe @. log log-base=5",
+            "ERR usage: log-base= needs since-log= and log-ep=\n",
+        ),
+        (
+            "subscribe @. log since-log=4 log-base=5",
+            "ERR usage: since-log= and log-ep= go together\n",
+        ),
+        (
+            "subscribe @. log since-log=4 log-ep=1 log-base=x",
+            "ERR bad log-base\n",
+        ),
         (
             "subscribe @0,@1 log since-log=4 log-ep=1",
             "ERR resume anchors (since=/since-turn=/since-block=/since-log=) require a single target\n",

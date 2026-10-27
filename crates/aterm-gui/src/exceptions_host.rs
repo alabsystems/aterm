@@ -403,8 +403,178 @@ impl App {
         self.except_clear(&occupancy_ready_idle_key(sid));
     }
 
+    /// What the services watch told ([`HostNote::ServiceMemory`]), the whole answer.
+    ///
+    /// A service an earlier aterm process told (its entry or its alert stands, adopted from the
+    /// log or carried by an update's handoff) is told here from this process's first reading
+    /// on, at the size it was told ([`Self::service_memory_carry`]), and the watch's judge holds
+    /// it so too ([`crate::services_watch::carry`]): a relaunch neither waits out the hold again
+    /// nor reads a not-yet-held reading as the end.
+    ///
+    /// The digest holds one entry per service told (held past its bar for the hold); a service
+    /// still followed but not told (within the margin under the bar, or new and in its hold),
+    /// and one whose footprint did not read, keep an entry already open. Only an episode that
+    /// ended (the service fell an eighth under the large bar, or its process was replaced or
+    /// ended) loses its entry.
+    ///
+    /// The on-screen alert, one per episode, is raised only for a service aterm can restart that
+    /// is told past the huge bar while memory is under pressure; it is restated in place when
+    /// its words change, resolved only when a service this process holds leaves the huge bar's
+    /// margin or its episode ends, and never raised again for an episode the person filed. An
+    /// episode's end withdraws that filing.
+    fn service_memory(&mut self, told: &aterm_vitals::services::Told, admin: Option<bool>) {
+        use aterm_vitals::services::Size;
+        let mut told = told.clone();
+        let carried = self.service_memory_carry(&mut told);
+        if !carried.is_empty() {
+            crate::services_watch::carry(&carried);
+        }
+        let told = &told;
+        let entries: Vec<Entry> = told
+            .told()
+            .map(|s| message_reporters::service_memory_entry(s, told.total, admin))
+            .collect();
+        let kept = message_reporters::service_memory_kept(told);
+        self.except_replace_keeping(Family::ServiceMemory, &entries, &kept);
+
+        let wall = wall_stamp_now();
+        let now = Instant::now();
+        let going: std::collections::BTreeSet<String> = told
+            .services
+            .iter()
+            .map(|s| s.service.episode())
+            .chain(
+                told.unread
+                    .iter()
+                    .map(aterm_vitals::services::Member::episode),
+            )
+            .map(|episode| message_reporters::service_memory_alert_key(&episode))
+            .collect();
+        let prefix = format!("{}.", message_reporters::SERVICE_MEMORY_KEY);
+        let ended: std::collections::BTreeSet<String> = self
+            .messages
+            .log()
+            .records()
+            .filter_map(|r| r.key.as_deref())
+            .filter(|key| key.starts_with(&prefix) && !going.contains(*key))
+            .map(str::to_owned)
+            .collect();
+        let mut resolved = false;
+        for key in &ended {
+            if let Some(id) = self.messages.live_by_key(key).map(|l| l.id) {
+                resolved |= self.messages.resolve(id, aterm_messages::Outcome::Ok, now);
+            }
+            self.messages.end_filed_standing(key, wall, now);
+        }
+        for s in &told.services {
+            let key = message_reporters::service_memory_alert_key(&s.service.episode());
+            let shown = self
+                .messages
+                .live_by_key(&key)
+                .map(|l| (l.id, l.msg.title.clone(), l.msg.detail.clone()));
+            let urgent = s.restart.filter(|_| s.told() && s.size == Size::Huge);
+            match (urgent, shown) {
+                (Some(restart), Some((_, title, detail))) => {
+                    let alert =
+                        message_reporters::service_memory_alert(s, restart, told.total, admin);
+                    if alert.title != title || alert.detail != detail {
+                        self.post_message(alert);
+                    }
+                }
+                (Some(restart), None)
+                    if told.pressed && !self.messages.filed_standing(&key, wall) =>
+                {
+                    self.post_message(message_reporters::service_memory_alert(
+                        s, restart, told.total, admin,
+                    ));
+                }
+                // Fixed only once this process's watch holds the service (it met the hold, or
+                // was carried) and it left the huge bar's margin: a reading not yet held leaves
+                // the alert as it stands.
+                (None, Some((id, ..))) if s.held => {
+                    resolved |= self.messages.resolve(id, aterm_messages::Outcome::Ok, now);
+                }
+                _ => {}
+            }
+        }
+        crate::services_watch::set_filed(
+            told.services
+                .iter()
+                .map(|s| s.service.episode())
+                .filter(|episode| {
+                    self.messages
+                        .filed_standing(&message_reporters::service_memory_alert_key(episode), wall)
+                })
+                .collect(),
+        );
+        if resolved {
+            self.sync_messages();
+        }
+    }
+
+    /// Holds as told each service of `told` not yet held here whose episode an earlier aterm
+    /// process told: its alert is live (told past the huge bar), or its digest entry is open
+    /// (past the huge bar where the entry warns, else the large one). Returns each episode
+    /// carried with the size it was told at, for the watch's judge.
+    fn service_memory_carry(
+        &self,
+        told: &mut aterm_vitals::services::Told,
+    ) -> Vec<(String, aterm_vitals::services::Size)> {
+        use aterm_vitals::services::Size;
+        let stem = format!("{}.", Family::ServiceMemory.stem());
+        let open: Vec<(String, aterm_messages::Severity)> = self
+            .messages
+            .digest()
+            .entries
+            .into_iter()
+            .filter(|e| e.key.starts_with(&stem))
+            .map(|e| (e.key, e.severity))
+            .collect();
+        let mut carried = Vec::new();
+        let unheld: Vec<(String, String)> = told
+            .services
+            .iter()
+            .filter(|s| !s.held)
+            .map(|s| (s.service.episode(), s.service.name.clone()))
+            .collect();
+        for (episode, name) in unheld {
+            let alert = message_reporters::service_memory_alert_key(&episode);
+            let entry = message_reporters::service_memory_entry_key(&name, &episode);
+            let at_least = if self.messages.live_by_key(&alert).is_some() {
+                Some(Size::Huge)
+            } else {
+                open.iter()
+                    .find(|(key, _)| *key == entry)
+                    .map(|(_, severity)| {
+                        if *severity >= aterm_messages::Severity::Warn {
+                            Size::Huge
+                        } else {
+                            Size::Large
+                        }
+                    })
+            };
+            if let Some(at_least) = at_least
+                && told.carry(&episode, at_least)
+            {
+                carried.push((episode, at_least));
+            }
+        }
+        carried
+    }
+
     /// Replaces the open set for a level-mode `family` with `entries`.
     pub(crate) fn except_replace(&mut self, family: Family, entries: &[Entry]) {
+        self.except_replace_keeping(family, entries, &[]);
+    }
+
+    /// [`Self::except_replace`], where the pass also keeps the entries open under `kept`
+    /// without restating them: their cause still stands, though this pass did not tell it.
+    pub(crate) fn except_replace_keeping(
+        &mut self,
+        family: Family,
+        entries: &[Entry],
+        kept: &[String],
+    ) {
         if family.mode() != Mode::Level || entries.iter().any(|e| e.family() != family) {
             aterm_log::error!(
                 "exceptions: {family:?} is an EVENT family (or an entry names another); a pass \
@@ -417,7 +587,11 @@ impl App {
         self.entries_refused
             .retain(|key, _| !key.starts_with(&prefix) || named.contains(key));
         let mut msgs: Vec<Message> = Vec::with_capacity(entries.len());
-        let mut refused: Vec<String> = Vec::new();
+        let mut refused: Vec<String> = kept
+            .iter()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
         for (entry, key) in entries.iter().zip(named) {
             match self.checked_entry(entry) {
                 Some(msg) => msgs.push(msg),
@@ -647,6 +821,7 @@ impl App {
                     Instant::now(),
                 );
             }
+            HostNote::ServiceMemory { told, admin } => self.service_memory(&told, admin),
             HostNote::DiskLooked => self.vitals_disk_looked(Instant::now()),
             HostNote::DiskSettingsRead => {
                 self.host_noted.remove(DISK_CLEANUP_OFF_NOTED);
@@ -904,6 +1079,7 @@ impl App {
                 self.post_message(message_reporters::supervisor_warning(&sid, &place, &text));
             }
             HostNote::AgentPublished { .. } => self.crash_journal.owe_agent_capture(),
+            HostNote::AccountProgress => self.account_progress_noted(Instant::now()),
             HostNote::UpgradeRecords { unlisted } => match unlisted {
                 Some(dir) => self.except(&message_reporters::upgrade_records_unlisted_entry(&dir)),
                 None => self.except_clear(message_reporters::UPGRADE_RECORDS_UNLISTED_KEY),

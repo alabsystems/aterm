@@ -68,13 +68,12 @@ const LINE_STAR_COL: u16 = 12;
 const LINE_COL: u16 = LINE_STAR_COL + 2;
 const LINE_TEXT: &str = "Cruise: the kitty keeps watch while the reply streams";
 
-/// `--light`: every scene on a light ground, the card in its light palette.
-const LIGHT: Theme = Theme {
-    fg: 0x0020_2020,
-    bg: 0x00F4_F1EA,
-    cursor: 0x0050_FA7B,
-    selection: 0x0033_415E,
-};
+/// The `composer` scene: Claude Code's prompt row, between its two rules, and the keys typed
+/// into it at 10 a second (a key every [`COMPOSER_KEY_TICKS`] frames at [`TYPING_HZ`]), to the
+/// 117-cell line the owner's composer holds.
+const COMPOSER_ROW: u16 = ROWS as u16 - 4;
+const COMPOSER_KEYS: usize = 117;
+const COMPOSER_KEY_TICKS: usize = 12;
 
 const CARD_TOP: u16 = 2;
 const SCROLL_TOP: u16 = 20;
@@ -507,16 +506,13 @@ impl Knobs {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "wgpu-oracle"))]
-fn on_wgpu(gpu: &mut GpuRenderer) {
-    gpu.disarm_metal_for_oracle();
-}
-
-#[cfg(not(all(target_os = "macos", feature = "wgpu-oracle")))]
-fn on_wgpu(_: &mut GpuRenderer) {
-    if cfg!(target_os = "macos") {
-        fail("--wgpu needs the wgpu arm: build with `--features dev-seams,wgpu-oracle`");
-    }
+/// `--light`: every scene on Default Light, the shipped light theme, the card in its light
+/// palette.
+fn default_light() -> Theme {
+    aterm_types::scheme::builtin("Default Light").map_or_else(
+        || fail("Default Light is not a built-in theme"),
+        |s| Theme::from(&s),
+    )
 }
 
 fn skip(why: impl std::fmt::Display) -> ! {
@@ -533,7 +529,7 @@ impl Rig {
             "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
         );
         let theme = if std::env::args().skip(1).any(|a| a == "--light") {
-            LIGHT
+            default_light()
         } else {
             Theme::default()
         };
@@ -553,22 +549,16 @@ impl Rig {
         gpu.set_bloom(true);
         gpu.set_shimmer(true);
         gpu.debug_block_on_lazy_fallbacks();
-        let wgpu = std::env::args().skip(1).any(|a| a == "--wgpu");
-        if wgpu {
-            on_wgpu(&mut gpu);
-        }
         gpu.set_ramps_fx_for_test(knobs.ramps_fx);
         let (cw, ch) = cpu.cell_size();
         if gpu.cell_size() != (cw, ch) {
             fail("the two presenters disagree on the cell");
         }
         let (frame_w, frame_h) = cpu.frame_size(ROWS, COLS);
-        let clock = if !gpu.gpu_time_supported() {
-            "none"
-        } else if cfg!(target_os = "macos") && !wgpu {
+        let clock = if gpu.gpu_time_supported() {
             "metal"
         } else {
-            "wgpu"
+            "none"
         };
         let counter = if calibrate_counter() {
             "instructions"
@@ -657,7 +647,6 @@ impl Rig {
         };
         let deadline = Instant::now() + HANG;
         loop {
-            self.gpu.poll_gpu_time();
             match gpu_time::settled(serial) {
                 Some(Settled::Timed(t)) => return Some(t.gpu_ns),
                 Some(Settled::Failed) => fail(format!(
@@ -1005,7 +994,7 @@ impl GlowHost {
                 ribbon_tall: true,
                 ribbon_flat: false,
                 enabled: true,
-                dark_theme: true,
+                dark_theme: aterm_render::theme_is_dark(rig.theme.bg),
                 theme_fg: rig.theme.fg,
                 theme_bg: rig.theme.bg,
                 style,
@@ -1346,14 +1335,52 @@ fn at_the_ribbon_budget(flood: &Run) {
     }
 }
 
-fn typing_scene(rig: &mut Rig, style: GlowStyle, script: Script) -> Run {
-    let mut term = Terminal::new(ROWS as u16, COLS as u16);
-    for i in 0..10 {
-        term.process(
-            format!("drwxr-xr-x  12 user  staff   384 Oct 19 09:{i:02} crate-{i}\r\n").as_bytes(),
-        );
+/// The page a typing scene's keys land on.
+#[derive(Clone, Copy)]
+enum Page {
+    /// A directory listing over a shell prompt.
+    Shell,
+    /// Claude Code's composer under a reply: its prompt on [`COMPOSER_ROW`] between two `─`
+    /// rules, its hint under them.
+    Composer,
+}
+
+impl Page {
+    fn paint(self, term: &mut Terminal) {
+        match self {
+            Self::Shell => {
+                for i in 0..10 {
+                    term.process(
+                        format!("drwxr-xr-x  12 user  staff   384 Oct 19 09:{i:02} crate-{i}\r\n")
+                            .as_bytes(),
+                    );
+                }
+                term.process(b"~/src/aterm $ ");
+            }
+            Self::Composer => {
+                for i in 0..COMPOSER_ROW - 2 {
+                    let bullet = if i == 0 { "\u{23fa}" } else { " " };
+                    term.process(format!("{bullet} {} {i}\r\n", &STREAMED[..72]).as_bytes());
+                }
+                let rule = format!("\x1b[90m{}\x1b[0m", "\u{2500}".repeat(COLS));
+                term.process(
+                    format!(
+                        "{}{rule}{}{rule}{}\x1b[90m  ? for shortcuts\x1b[0m{}\u{276f} ",
+                        cup(COMPOSER_ROW - 1, 0),
+                        cup(COMPOSER_ROW + 1, 0),
+                        cup(COMPOSER_ROW + 2, 0),
+                        cup(COMPOSER_ROW, 0),
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
     }
-    term.process(b"~/src/aterm $ ");
+}
+
+fn typing_scene(rig: &mut Rig, style: GlowStyle, page: Page, script: Script) -> Run {
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    page.paint(&mut term);
     let mut input = RenderInput::empty();
     let mut win = Win::new();
     Rig::extract(&mut term, &mut input);
@@ -2163,7 +2190,7 @@ fn report_reference(r: &mut Report, scenes: &[Scene], clocked: bool, counted: bo
 fn main() {
     if std::env::args().skip(1).any(|a| a == "--help") {
         println!(
-            "effects_harness [--light] [--wgpu] [--damage] [--only a,b,...] [--ramp-cost LIGHT,RAMP|never] [--ramps-fx fx|instances] [--frames PATH]\n  --damage: animated card scenes and recoloured sparse FX layers, with dirty rows and full-render pixel verification\n  --only: run only the named scenes (episode, flowing, settled, typing, scroll, bolt, comet, classic, meteor, flood, rain, cats, pet, icons; fx_sparse under --damage)"
+            "effects_harness [--light] [--damage] [--only a,b,...] [--ramp-cost LIGHT,RAMP|never] [--ramps-fx fx|instances] [--frames PATH]\n  --damage: animated card scenes and recoloured sparse FX layers, with dirty rows and full-render pixel verification\n  --only: run only the named scenes (episode, flowing, settled, typing, scroll, bolt, comet, classic, meteor, flood, rain, cats, pet, icons; fx_sparse under --damage; composer only when named)\n  --light: every scene on Default Light"
         );
         return;
     }
@@ -2194,7 +2221,8 @@ fn main() {
         .skip_while(|a| a != "--only")
         .nth(1)
         .map(|list| list.split(',').map(str::to_string).collect());
-    let wanted = |name: &str| only.as_ref().is_none_or(|o| o.iter().any(|n| n == name));
+    let named = |name: &str| only.as_ref().is_some_and(|o| o.iter().any(|n| n == name));
+    let wanted = |name: &str| only.is_none() || named(name);
     let cards = [("episode", true), ("flowing", true), ("settled", false)];
     let rest: &[(&str, bool)] = if damage {
         &[("fx_sparse", true)]
@@ -2213,10 +2241,14 @@ fn main() {
             ("icons", true),
         ]
     };
+    // The scenes a bare run leaves out, so the `effects` lane's frames stay its own: each runs
+    // only when `--only` names it (`composer`, the `trail-*-composer` lanes' scene).
+    let named_only: &[(&str, bool)] = if damage { &[] } else { &[("composer", true)] };
     let mut scenes: Vec<Scene> = cards
         .iter()
         .chain(rest)
         .filter(|(name, _)| wanted(name))
+        .chain(named_only.iter().filter(|(name, _)| named(name)))
         .map(|&(name, rate_emit)| scene(name, rate_emit))
         .collect();
     if scenes.is_empty() {
@@ -2243,7 +2275,12 @@ fn main() {
             every: KEY_TICKS,
         };
         if wanted("typing") {
-            let typing = typing_scene(&mut rig, GlowStyle::RainbowKitty, typed(TYPING_KEYS));
+            let typing = typing_scene(
+                &mut rig,
+                GlowStyle::RainbowKitty,
+                Page::Shell,
+                typed(TYPING_KEYS),
+            );
             runs.push(("typing", typing));
         }
         if wanted("scroll") {
@@ -2255,7 +2292,8 @@ fn main() {
             ("classic", GlowStyle::Classic),
         ] {
             if wanted(name) {
-                runs.push((name, typing_scene(&mut rig, style, typed(PRODUCER_KEYS))));
+                let run = typing_scene(&mut rig, style, Page::Shell, typed(PRODUCER_KEYS));
+                runs.push((name, run));
             }
         }
         if wanted("meteor") {
@@ -2265,7 +2303,7 @@ fn main() {
             };
             runs.push((
                 "meteor",
-                typing_scene(&mut rig, GlowStyle::RainbowKitty, hops),
+                typing_scene(&mut rig, GlowStyle::RainbowKitty, Page::Shell, hops),
             ));
         }
         if wanted("flood") {
@@ -2273,9 +2311,17 @@ fn main() {
                 keys: FLOOD_KEYS,
                 every: 1,
             };
-            let flood = typing_scene(&mut rig, GlowStyle::RainbowKitty, flood);
+            let flood = typing_scene(&mut rig, GlowStyle::RainbowKitty, Page::Shell, flood);
             at_the_ribbon_budget(&flood);
             runs.push(("flood", flood));
+        }
+        if wanted("composer") {
+            let line = Script::Type {
+                keys: COMPOSER_KEYS,
+                every: COMPOSER_KEY_TICKS,
+            };
+            let composer = typing_scene(&mut rig, GlowStyle::RainbowKitty, Page::Composer, line);
+            runs.push(("composer", composer));
         }
         if wanted("rain") {
             runs.push(("rain", rain_scene(&mut rig, seed)));

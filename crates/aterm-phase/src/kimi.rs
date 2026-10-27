@@ -12,21 +12,11 @@
 
 use crate::wall::{Placement, Wall, WallKind};
 
-/// Major component of the Kimi Code (`kimi`) harness version, starting at `0.1`.
-pub const HARNESS_VERSION_MAJOR: u16 = 0;
-
-/// Minor component of the Kimi Code (`kimi`) harness version, starting at `0.1`.
-pub const HARNESS_VERSION_MINOR: u16 = 1;
-
-/// Version of the Kimi Code (`kimi`) harness, tracked per harness from `"0.1"`.
-pub const HARNESS_VERSION: &str = "0.1";
-
-/// Structured incremental numeric version of the Kimi Code (`kimi`) harness.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(
-    HARNESS_VERSION_MAJOR,
-    HARNESS_VERSION_MINOR,
-    HARNESS_VERSION,
-);
+/// The Kimi Code (`kimi`) harness version, `MAJOR.MINOR` with no third part.
+///
+/// Its minor goes up once per public release window in which its sources changed
+/// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 4, "0.4");
 
 /// The usage limit is spent: Kimi Code's own quota patterns (lowercase).
 const QUOTA: [&str; 3] = [

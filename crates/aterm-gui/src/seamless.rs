@@ -5241,12 +5241,16 @@ pub(crate) fn recovered_fabric(meta: &[u8]) -> RecoveredFabric {
         .unwrap_or_default();
     carry.receipts_uncarried = count("owed");
     carry.dropped = count("dropped");
-    let given_up = section
-        .get("given_up")
-        .and_then(|g| aterm_json::from_value::<crate::fabric::GivenUp>(g.clone()).ok());
+    let range = |key: &str| {
+        section
+            .get(key)
+            .and_then(|g| aterm_json::from_value::<crate::fabric::GivenUp>(g.clone()).ok())
+    };
+    let (given_up, lane_given_up) = (range("given_up"), range("lane_given_up"));
     let given_up_log = section.get("given_up_log").and_then(Value::as_str);
-    if let (Some(given_up), Some(log)) = (given_up, given_up_log) {
-        carry.given_up = Some(given_up);
+    if let Some(log) = given_up_log.filter(|_| given_up.is_some() || lane_given_up.is_some()) {
+        carry.given_up = given_up;
+        carry.lane_given_up = lane_given_up;
         carry.bus_log = Some(log.to_owned());
     }
     let row = |hold: &Value| hold.as_str().unwrap_or_default().to_owned();
@@ -5464,6 +5468,14 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
             "its manifest does not parse in this build",
         );
     };
+    // Before any session adopts: every carried log's epoch, so no log this process starts takes
+    // a base a carried one keeps (C13's review).
+    crate::session_log::Epochs::process().note_handoff(
+        manifest
+            .sessions
+            .iter()
+            .filter_map(|rec| rec.log_ids.as_deref()),
+    );
     let Some(expected) = validated_identities(&manifest, &fds) else {
         return refused_whole(
             WholeRefusal::Producer,

@@ -3836,7 +3836,7 @@ impl Default for PagePress {}
             &BOOT_ID_DOOR,
             &[
                 ("crates/aterm-uds/src/process.rs", inline),
-                ("crates/aterm-caffeine/src/instance.rs", by_const),
+                ("crates/aterm-acaffiene/src/instance.rs", by_const),
                 ("crates/aterm-x/src/mib.rs", by_mib),
                 ("crates/aterm-y/src/probe.rs", in_test),
                 ("crates/aterm-link/src/durability.rs", oracle),
@@ -3847,7 +3847,7 @@ impl Default for PagePress {}
         assert_eq!(
             spots(&found),
             [
-                "crates/aterm-caffeine/src/instance.rs:1",
+                "crates/aterm-acaffiene/src/instance.rs:1",
                 "crates/aterm-uds/src/process.rs:4",
                 "crates/aterm-x/src/mib.rs:1",
                 "crates/aterm-y/src/probe.rs:5",

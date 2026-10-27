@@ -335,6 +335,7 @@ impl KittySing {
     }
 
     /// Feed one committed printed keystroke.
+    #[inline]
     pub fn note_char(&mut self, now: Instant, session: u64, ch: char) {
         self.rekey(now, session);
         if let Some(release) = self.lazy_release()
@@ -486,6 +487,7 @@ impl KittySing {
     }
 
     /// Arm a one-shot celebration (`fx celebrate`).
+    #[inline]
     pub fn arm_external(
         &mut self,
         now: Instant,
@@ -547,6 +549,7 @@ impl KittySing {
     }
 
     /// The next external-run event deadline.
+    #[inline]
     #[must_use]
     pub fn next_external_deadline(&self, now: Instant) -> Option<Instant> {
         let ext = self.external?;
@@ -603,6 +606,7 @@ impl KittySing {
         false
     }
 
+    #[inline]
     fn fire_external(&mut self, now: Instant, session: u64, arm: ArmedCelebration) {
         self.armed_external = None;
         self.session = Some(session);
@@ -757,6 +761,7 @@ impl MusicNotes {
     }
 
     /// Advance the field one frame.
+    #[inline]
     pub fn update(&mut self, now: Instant, streaming: bool, beat: Option<f32>) {
         if self.live != 0 {
             let mut i = 0;
@@ -896,10 +901,14 @@ impl MusicNotes {
     /// Resolve this frame's sprites into `out` (bounded by [`MAX_NOTES`]).
     #[cfg(test)]
     pub fn frames(&self, now: Instant, reduced_motion: bool, out: &mut Vec<NoteSprite>) {
-        for note in self.ring.iter().flatten() {
-            if let Some(sprite) = Self::resolve(note, now, reduced_motion) {
+        let mut i = 0;
+        while i < MAX_NOTES {
+            if let Some(note) = &self.ring[i]
+                && let Some(sprite) = Self::resolve(note, now, reduced_motion)
+            {
                 out.push(sprite);
             }
+            i += 1;
         }
     }
 }
@@ -973,6 +982,7 @@ const BEAM_STEM_R: [PathCmd; 5] = [
 const NOTE_A: f32 = 0.88;
 
 /// Bake one white note glyph at `w × h`.
+#[inline]
 #[must_use]
 pub fn bake_note(w: u16, h: u16, kind: NoteKind) -> Tile {
     let mut tile = Tile::new(u32::from(w), u32::from(h));
@@ -981,6 +991,7 @@ pub fn bake_note(w: u16, h: u16, kind: NoteKind) -> Tile {
 }
 
 /// Paint one white note glyph onto a cleared `tile`.
+#[inline]
 pub fn paint_note(tile: &mut Tile, kind: NoteKind) {
     let (w, h) = (tile.width(), tile.height());
     if w == 0 || h == 0 {

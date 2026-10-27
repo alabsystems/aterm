@@ -105,14 +105,13 @@ fn the_canonical_config_validates() {
 fn l1_the_toml_and_its_schema() {
     for extra in [
         "[profiles.x\n",
-        "[profiles.x]\ntoken_file = \"{root}/x.token\"\ntier = \"dev\"\nlegacy_loose = true\n",
-        "[[writers]]\ncaller = \"atpkg-publish\"\nrepos = [\"alabsystems/aterm\"]\n",
+        "[profiles.x]\ntoken_file = \"{root}/x.token\"\ntier = \"dev\"\nbogus = true\n",
     ] {
         let found = faults(extra);
         assert_eq!(rules(&found), ["L1"], "{extra}: {found:?}");
     }
-    let unknown = faults("[profiles.x]\ntier = \"dev\"\nlegacy_loose = true\n");
-    assert!(unknown[0].what.contains("legacy_loose"), "{unknown:?}");
+    let unknown = faults("[profiles.x]\ntier = \"dev\"\nbogus = true\n");
+    assert!(unknown[0].what.contains("bogus"), "{unknown:?}");
 }
 
 fn pasted(token: &str) -> [String; 10] {
@@ -152,8 +151,8 @@ fn l1_never_quotes_a_pasted_token() {
             }
         }
     }
-    let unknown = faults("[profiles.x]\ntier = \"dev\"\nlegacy_loose = true\n");
-    assert!(unknown[0].what.contains("`legacy_loose`"), "{unknown:?}");
+    let unknown = faults("[profiles.x]\ntier = \"dev\"\nbogus = true\n");
+    assert!(unknown[0].what.contains("`bogus`"), "{unknown:?}");
 }
 
 #[test]
@@ -547,7 +546,7 @@ mod files {
         let (exit, stdout, stderr) = check(root.path(), &[]);
         assert_eq!(exit, 0, "{stderr}");
         let expected = format!(
-            "{{\"config\":\"{}\",\"counts\":{{\"owners\":2,\"profiles\":2,\"targets\":1}},\"faults\":[],\"ok\":true,\"present\":true}}\n",
+            "{{\"adopted\":[],\"config\":\"{}\",\"counts\":{{\"owners\":2,\"profiles\":2,\"targets\":1}},\"faults\":[],\"ok\":true,\"present\":true}}\n",
             dirs.config_file().display()
         );
         assert_eq!(stdout, expected);

@@ -656,21 +656,6 @@ impl ActiveEventLoop {
         self.xconn.primary_monitor().ok()
     }
 
-    #[cfg(feature = "rwh_06")]
-    pub fn raw_display_handle_rwh_06(
-        &self,
-    ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        let display_handle = rwh_06::XlibDisplayHandle::new(
-            // SAFETY: Display will never be null.
-            Some(
-                std::ptr::NonNull::new(self.xconn.display as *mut _)
-                    .expect("X11 display should never be null"),
-            ),
-            self.xconn.default_screen_index() as c_int,
-        );
-        Ok(display_handle.into())
-    }
-
     pub(crate) fn set_control_flow(&self, control_flow: ControlFlow) {
         self.control_flow.set(control_flow)
     }

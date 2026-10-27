@@ -82,7 +82,7 @@ fn input_clock() -> std::time::Instant {
     if let Some(now) = INPUT_CLOCK.with(std::cell::Cell::get) {
         return now;
     }
-    std::time::Instant::now()
+    crate::metrics::host_now()
 }
 
 #[cfg(test)]
@@ -3119,7 +3119,11 @@ pub(crate) fn press_fence(ev: &InputEvent) -> Option<bool> {
             ..
         }
         | InputEvent::MouseMove { buttons: 3, .. } => None,
-        InputEvent::Paste(..) | InputEvent::Focus(_) => Some(true),
+        InputEvent::Paste(..)
+        | InputEvent::Focus(_)
+        | InputEvent::MouseButton { .. }
+        | InputEvent::MouseMove { .. }
+        | InputEvent::Wheel { .. } => Some(true),
         _ => {
             let class = classify_press(ev);
             let arms_own_license = (class.typed_forward == Some(true) && !class.enter_like)
@@ -3168,6 +3172,13 @@ fn hardcoded_paste_chord(mods: ModifiersState, ev: &KeyEvent) -> bool {
     HARDCODED_SUPER_CHORDS
         && mods.super_key()
         && matches!(&ev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("v"))
+}
+
+/// The hardcoded ⌘C, as `on_key`'s Super chords read it.
+fn hardcoded_copy_chord(mods: ModifiersState, ev: &KeyEvent) -> bool {
+    HARDCODED_SUPER_CHORDS
+        && mods.super_key()
+        && matches!(&ev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("c"))
 }
 
 /// Whether a delivery is the first landing of a physical press or an auto-repeat tick.
@@ -3575,8 +3586,16 @@ impl App {
         self.post_message(crate::message_reporters::input_refused(why.line()).key(&key));
     }
 
-    /// Closes every licence term at a newer input boundary.
+    /// Closes every licence term at a newer input boundary. In an agent's composer
+    /// ([`Self::boundary_keeps_hand`]) the boundary keeps the hand: the composer is the row
+    /// the hand types on, and doubting that row would let the agent's next repaint of another
+    /// row (a footer hint after Escape or Ctrl-C, a spinner) park it, refusing the keys typed
+    /// on it until a navigation key or Return.
     pub(crate) fn clear_move_license(&mut self, wid: WindowId) {
+        if self.boundary_keeps_hand(wid) {
+            self.clear_move_license_keeping_hand(wid);
+            return;
+        }
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.fx
                 .cursor_mut()
@@ -3595,6 +3614,16 @@ impl App {
         }
     }
 
+    /// The licence fence of a pointer press, release, drag, wheel or reported hover. It keeps the
+    /// hand: a pointer types nothing, so it gives no reason to doubt the caret's row. A caret a
+    /// tracking app moves for a click is judged on its new row like any row the hand is not on,
+    /// and a click that changes the front pane resets the glow. Doubting the row instead would
+    /// let the app's repaint after a drag (its selection highlight, off the caret's row) park
+    /// that row and refuse every key typed on it.
+    pub(crate) fn fence_pointer_license(&mut self, wid: WindowId) {
+        self.clear_move_license_keeping_hand(wid);
+    }
+
     /// The licence fence [`press_fence`] classified.
     pub(crate) fn fence_move_license(&mut self, wid: WindowId, keep_hand: bool) {
         if keep_hand {
@@ -3604,14 +3633,17 @@ impl App {
         }
     }
 
-    /// Whether a physical key press triggers a paste in this window.
-    fn press_pastes(
+    /// Whether a physical key press triggers a clipboard command (paste, copy or select all) in
+    /// this window. None takes the hand off its row: a paste lands as the hand's insert, and copy
+    /// and select all send the program nothing.
+    fn press_is_clipboard_command(
         &self,
         mods: ModifiersState,
         ev: &KeyEvent,
         base_key: &mut Option<Key>,
     ) -> bool {
         hardcoded_paste_chord(mods, ev)
+            || hardcoded_copy_chord(mods, ev)
             || (!self.keybindings.is_empty()
                 && self
                     .keybindings
@@ -3620,7 +3652,13 @@ impl App {
                         ev.physical_key,
                         mods,
                     )
-                    .is_some_and(keybinding::Action::is_paste))
+                    .is_some_and(|action| {
+                        action.is_paste()
+                            || matches!(
+                                action,
+                                keybinding::Action::Copy | keybinding::Action::SelectAll
+                            )
+                    }))
     }
 
     /// Applies the control socket's licence fences this window owes
@@ -4616,19 +4654,37 @@ impl App {
                     {
                         w.request_redraw();
                     }
+                    let typed_press_supersede = typed_forward == Some(true)
+                        && (!enter_like || (enter_like && !typed_enter && is_alt));
+                    let supersedes =
+                        typed_press_supersede || typed_enter || tab_key || paste_chord_key;
+                    // A generic press keeps the hand in an agent's composer, as
+                    // `clear_move_license` does; only such a press pays for the probe.
+                    let keeps_hand = line_edit_key
+                        || (!inert_modifier && !supersedes && self.boundary_keeps_hand(wid));
+                    // A key typed into an agent's composer that shows vim's INSERT settles the row
+                    // a boundary parked (an Escape into NORMAL, then `i`); only a parked row pays
+                    // for the probe.
+                    let reinserting = typed_forward == Some(true)
+                        && !tty_swallows
+                        && self
+                            .windows
+                            .get(&wid)
+                            .is_some_and(|ws| ws.fx.cursor().glow.caret_row_parked())
+                        && self.composer_inserting(wid);
                     if let Some(ws) = self.windows.get_mut(&wid) {
+                        if reinserting {
+                            ws.fx.cursor_mut().glow.note_composer_inserting();
+                        }
                         if let Some(prompt) =
                             front_prompt.filter(|_| line_terminator || keyed_enter)
                         {
                             ws.aos.note_submitted(session, prompt);
                         }
-                        let typed_press_supersede = typed_forward == Some(true)
-                            && (!enter_like || (enter_like && !typed_enter && is_alt));
                         if inert_modifier {
-                        } else if typed_press_supersede || typed_enter || tab_key || paste_chord_key
-                        {
+                        } else if supersedes {
                             ws.fx.cursor_mut().glow.supersede_typed_press();
-                        } else if line_edit_key {
+                        } else if keeps_hand {
                             ws.fx.cursor_mut().glow.clear_typed_keeping_hand(input_now);
                             ws.fx.cursor_mut().trail.clear_typed();
                         } else {
@@ -5233,7 +5289,7 @@ impl App {
                     ws.last_mouse_side = side;
                 }
                 if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
-                    self.clear_move_license(wid);
+                    self.fence_pointer_license(wid);
                     self.drag_selection(wid, row, col);
                     return InputOutcome::Ok;
                 }
@@ -5248,7 +5304,7 @@ impl App {
                                 | input::Egress::Reported(input::Delivery::Full)
                         ))
                 {
-                    self.clear_move_license(wid);
+                    self.fence_pointer_license(wid);
                 }
                 receipt_outcome(receipt)
             }
@@ -5324,13 +5380,7 @@ impl App {
         sink: &Arc<SinkWriter>,
         fronted: bool,
     ) -> InputOutcome {
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.fx
-                .cursor_mut()
-                .glow
-                .clear_typed(std::time::Instant::now());
-            ws.fx.cursor_mut().trail.clear_typed();
-        }
+        self.fence_pointer_license(wid);
         let (button, pressed, row, col, click_count, side, block, suppress_copy_on_select) =
             if let &InputEvent::MouseButton {
                 button,
@@ -5387,13 +5437,7 @@ impl App {
         modes: &Arc<ModeMirror>,
         sink: &Arc<SinkWriter>,
     ) -> InputOutcome {
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.fx
-                .cursor_mut()
-                .glow
-                .clear_typed(std::time::Instant::now());
-            ws.fx.cursor_mut().trail.clear_typed();
-        }
+        self.fence_pointer_license(wid);
         if let Some(rain) = self.windows.get_mut(&wid).and_then(|ws| ws.fx.rain_mut())
             && modes.alternate_screen()
         {
@@ -5963,13 +6007,7 @@ impl App {
         intent: ScrollIntent,
         term: &Arc<Mutex<Terminal>>,
     ) -> InputOutcome {
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.fx
-                .cursor_mut()
-                .glow
-                .clear_typed(std::time::Instant::now());
-            ws.fx.cursor_mut().trail.clear_typed();
-        }
+        self.clear_move_license(wid);
         if let Some(rain) = self.windows.get_mut(&wid).and_then(|ws| ws.fx.rain_mut())
             && term_lock(term).is_alternate_screen()
         {
@@ -7192,7 +7230,9 @@ impl App {
             None => Some(false),
         };
         match fence {
-            Some(false) if mods.is_some_and(|m| self.press_pastes(m, &ev, &mut base_key)) => {
+            Some(false)
+                if mods.is_some_and(|m| self.press_is_clipboard_command(m, &ev, &mut base_key)) =>
+            {
                 self.clear_move_license_keeping_hand(wid);
             }
             Some(keep_hand) => self.fence_move_license(wid, keep_hand),
@@ -7520,15 +7560,19 @@ impl App {
         }) = press
         {
             let km_mods = mapped_mods | (self.lock_modifiers)();
-            self.note_forwarded_press_key(
-                wid,
-                ev.physical_key,
-                false,
-                key.clone(),
-                km_mods,
-                base_layout,
-                layout_text,
-            );
+            if self.rewound_front(wid).is_some() {
+                self.note_consumed_press(wid, &ev);
+            } else {
+                self.note_forwarded_press_key(
+                    wid,
+                    ev.physical_key,
+                    false,
+                    key.clone(),
+                    km_mods,
+                    base_layout,
+                    layout_text,
+                );
+            }
             self.input(
                 wid,
                 InputEvent::Key {
@@ -7553,23 +7597,58 @@ impl App {
 
     /// Whether an agent's composer owns the front terminal's prompt.
     fn front_agent_composer(&self, wid: WindowId) -> bool {
+        self.agent_composer_in_front(wid, true)
+    }
+
+    /// Whether a generic licence boundary keeps the glow's hand on its row in window `wid`
+    /// ([`Self::clear_move_license`]): an agent's composer is in front, read without waiting
+    /// on its session's timeline (a busy one answers no, the generic boundary), and it does not
+    /// show vim's INSERT indicator ([`Self::front_composer_in_vim_insert`]).
+    fn boundary_keeps_hand(&self, wid: WindowId) -> bool {
+        self.agent_composer_in_front(wid, false) && !self.front_composer_in_vim_insert(wid)
+    }
+
+    /// Whether an agent's composer in front of window `wid` shows vim's INSERT indicator, so
+    /// the keys typed into it are text: the press path then settles a row a boundary parked
+    /// (`CursorGlow::note_composer_inserting`). It runs only while a caret row is parked, and so
+    /// while the caret is visible in the composer: it reads the indicator from the caret's row
+    /// down first ([`Self::vim_insert_shown`]), which in vim's NORMAL answers no before the
+    /// agent probe runs, and reads the agent as [`Self::boundary_keeps_hand`] does, without
+    /// waiting.
+    fn composer_inserting(&self, wid: WindowId) -> bool {
+        self.vim_insert_shown(wid, true) && self.agent_composer_in_front(wid, false)
+    }
+
+    /// [`Self::front_agent_composer`]; `wait` false reads the session's timeline only if no
+    /// one holds it, and answers no if someone does.
+    fn agent_composer_in_front(&self, wid: WindowId, wait: bool) -> bool {
         let Some(pooled) = self
             .front_terminal(wid)
             .and_then(|terminal| self.pool.get(terminal.session))
         else {
             return false;
         };
-        let (agent, group) = {
-            let timeline = pooled
-                .ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let read = |timeline: &crate::session_timeline::SessionTimeline| {
             let agent = timeline.agent();
             (
                 crate::harness_host::identified_agent(agent).is_some(),
                 agent.program_pgid,
             )
+        };
+        let (agent, group) = if wait {
+            read(
+                &pooled
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        } else {
+            match pooled.ctx.timeline.try_lock() {
+                Ok(timeline) => read(&timeline),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => read(&poisoned.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+            }
         };
         if !agent {
             return false;
@@ -7580,6 +7659,51 @@ impl App {
             -1
         };
         (front <= 0 || front == group) && !(self.session_factory.handed_terminal)(group)
+    }
+
+    /// Whether the front terminal shows vim's INSERT indicator (`-- INSERT --`, the
+    /// `vim.insert` anchor) opening a row of the footer under its composer's bottom rule, as
+    /// Claude Code's vim editor mode draws it. Escape there enters NORMAL, where the keys typed
+    /// next are motions rather than text, so the boundary keeps doubting the composer's row. A
+    /// terminal someone holds reads as no indicator.
+    fn front_composer_in_vim_insert(&self, wid: WindowId) -> bool {
+        self.vim_insert_shown(wid, false)
+    }
+
+    /// [`Self::front_composer_in_vim_insert`]'s reading. `below_caret` reads only the rows from
+    /// the terminal's caret down (a few, where the whole screen is tens) and takes the first rule
+    /// there for the composer's bottom, which holds while the caret is in the composer.
+    fn vim_insert_shown(&self, wid: WindowId, below_caret: bool) -> bool {
+        let Some(terminal) = self.front_terminal(wid) else {
+            return false;
+        };
+        let rows: Vec<String> = {
+            let Some(t) = crate::term_try_lock(&terminal.term) else {
+                return false;
+            };
+            let from = if below_caret {
+                usize::from(t.cursor().row)
+            } else {
+                0
+            };
+            (from..usize::from(t.rows()))
+                .map(|r| crate::claude_lights::row_text(&t, r))
+                .collect()
+        };
+        let bottom = if below_caret {
+            rows.iter().position(|row| aterm_phase::phase::is_rule(row))
+        } else {
+            aterm_phase::phase::composer_bottom(&rows)
+        };
+        bottom.is_some_and(|bottom| {
+            rows[bottom + 1..]
+                .iter()
+                .take_while(|row| !row.trim().is_empty())
+                .any(|row| {
+                    row.trim_start()
+                        .starts_with(aterm_phase::anchor!("vim.insert"))
+                })
+        })
     }
 
     /// Whether the front terminal shows its alternate screen, which keeps no scrollback.
@@ -9156,7 +9280,12 @@ impl App {
             self.interact_system_state(wid);
         }
         match self.frontmost_window {
-            Some(wid) if action == menu::MenuAction::Paste => {
+            Some(wid)
+                if matches!(
+                    action,
+                    menu::MenuAction::Paste | menu::MenuAction::Copy | menu::MenuAction::SelectAll
+                ) =>
+            {
                 self.clear_move_license_keeping_hand(wid);
             }
             _ => self.clear_front_move_license(),
@@ -9318,6 +9447,9 @@ impl App {
             MenuAction::ToggleStatsLens => {
                 let _ = self.toggle_stats_lens();
             }
+            MenuAction::NetworkState => {
+                let _ = self.open_network_lens();
+            }
             MenuAction::RewindPane => {
                 if let Some(wid) = self.frontmost_window {
                     self.toggle_rewind(wid);
@@ -9327,6 +9459,14 @@ impl App {
                 if let Some(wid) = self.frontmost_window {
                     self.export_pane_history(wid);
                 }
+            }
+            MenuAction::ForgetPaneHistory => {
+                if let Some(wid) = self.frontmost_window {
+                    self.forget_front_history(wid);
+                }
+            }
+            MenuAction::ForgetAllHistory => {
+                let _ = self.forget_all_history();
             }
             MenuAction::CloseTab => {
                 // As Cmd-W; the window closes when its last tab did.

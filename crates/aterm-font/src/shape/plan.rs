@@ -43,6 +43,13 @@ pub(crate) enum Shaper {
     Arabic,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ZeroWidthMarks {
+    None,
+    ByGdefEarly,
+    ByGdefLate,
+}
+
 /// A reusable plan for shaping runs of one direction and script on one face.
 pub struct ShapePlan {
     pub(crate) direction: Direction,
@@ -54,11 +61,17 @@ pub struct ShapePlan {
     pub(crate) numr_mask: u32,
     pub(crate) dnom_mask: u32,
     pub(crate) rtlm_mask: u32,
+    pub(crate) kern_mask: u32,
+    pub(crate) requested_kerning: bool,
     pub(crate) has_frac: bool,
     pub(crate) fallback_glyph_classes: bool,
-    /// The face has a `GPOS`: marks are then zeroed without the offset shift upstream applies when
-    /// it positions them by fallback.
-    pub(crate) has_gpos: bool,
+    pub(crate) zero_marks: bool,
+    pub(crate) zero_width_marks: ZeroWidthMarks,
+    pub(crate) fallback_mark_positioning: bool,
+    pub(crate) adjust_mark_positioning_when_zeroing: bool,
+    pub(crate) apply_gpos: bool,
+    pub(crate) apply_kerx: bool,
+    pub(crate) apply_kern: bool,
 }
 
 impl ShapePlan {
@@ -78,10 +91,15 @@ impl ShapePlan {
         };
         let tags = script_tags(script);
         let mut map = MapBuilder::new(face, &tags);
+        let chosen_gsub = map.chosen_script_gsub();
         let shaper = match script {
-            Some(s) => categorize(s, direction, map.chosen_script_gsub()),
+            Some(s) => categorize(s, direction, chosen_gsub),
             None => Shaper::Default,
         };
+        let (zero_width_marks, script_fallback_mark_positioning) =
+            script_mark_policy(script, chosen_gsub);
+        let script_zero_marks = zero_width_marks != ZeroWidthMarks::None;
+        let chosen_gpos = map.chosen_script_gpos();
         collect_features(&mut map, shaper, direction, script, features);
         let map = map.compile();
         let frac_mask = map.get_1_mask(Tag::from_bytes(b"frac"));
@@ -89,7 +107,53 @@ impl ShapePlan {
         let dnom_mask = map.get_1_mask(Tag::from_bytes(b"dnom"));
         let has_frac = frac_mask != 0 || (numr_mask != 0 && dnom_mask != 0);
         let rtlm_mask = map.get_1_mask(Tag::from_bytes(b"rtlm"));
+        let kern_tag = if direction.is_horizontal() {
+            Tag::from_bytes(b"kern")
+        } else {
+            Tag::from_bytes(b"vkrn")
+        };
+        let kern_mask = map.get_mask(kern_tag);
+        let requested_kerning = kern_mask != 0;
+        let has_gpos_kern = map.get_feature_index(super::map::GPOS, kern_tag).is_some();
         let arabic = (shaper == Shaper::Arabic).then(|| arabic::ArabicPlan::new(&map));
+        let disable_gpos = script.is_some_and(|s| &s.0 == b"Hebr")
+            && chosen_gpos != Some(Tag::from_bytes(b"hebr"));
+        let has_kerx = face.face.tables().kerx.is_some();
+        let has_gsub = face.face.tables().gsub.is_some();
+        let has_gpos = !disable_gpos && face.face.tables().gpos.is_some();
+
+        let mut apply_gpos = false;
+        let mut apply_kerx = false;
+        let mut apply_kern = false;
+        if has_kerx && !(has_gsub && has_gpos) {
+            apply_kerx = true;
+        } else if has_gpos {
+            apply_gpos = true;
+        }
+        if !apply_kerx && (!has_gpos_kern || !apply_gpos) {
+            if has_kerx {
+                apply_kerx = true;
+            } else if face.face.tables().kern.is_some() {
+                apply_kern = true;
+            }
+        }
+
+        let has_machine_kerning = face
+            .face
+            .tables()
+            .kern
+            .is_some_and(|k| k.subtables.into_iter().any(|s| s.has_state_machine));
+        let has_cross_kerning = face
+            .face
+            .tables()
+            .kern
+            .is_some_and(|k| k.subtables.into_iter().any(|s| s.has_cross_stream));
+        let zero_marks = script_zero_marks && !apply_kerx && (!apply_kern || !has_machine_kerning);
+        let adjust_mark_positioning_when_zeroing =
+            !apply_gpos && !apply_kerx && (!apply_kern || !has_cross_kerning);
+        let fallback_mark_positioning =
+            adjust_mark_positioning_when_zeroing && script_fallback_mark_positioning;
+
         ShapePlan {
             direction,
             script,
@@ -100,9 +164,17 @@ impl ShapePlan {
             numr_mask,
             dnom_mask,
             rtlm_mask,
+            kern_mask,
+            requested_kerning,
             has_frac,
             fallback_glyph_classes: !face.has_glyph_classes(),
-            has_gpos: face.face.tables().gpos.is_some(),
+            zero_marks,
+            zero_width_marks,
+            fallback_mark_positioning,
+            adjust_mark_positioning_when_zeroing,
+            apply_gpos,
+            apply_kerx,
+            apply_kern,
         }
     }
 
@@ -135,6 +207,54 @@ fn categorize(script: Script, direction: Direction, gsub_script: Option<Tag>) ->
             }
         }
         _ => Shaper::Default,
+    }
+}
+
+/// Mark advance zeroing and fallback mark positioning policy for `script` and `gsub_script`,
+/// matching `hb_ot_shape_complex_categorize` in `rustybuzz`.
+fn script_mark_policy(script: Option<Script>, gsub_script: Option<Tag>) -> (ZeroWidthMarks, bool) {
+    let Some(script) = script else {
+        return (ZeroWidthMarks::ByGdefLate, true);
+    };
+    let is_dflt_or_latn = gsub_script == Some(Tag::from_bytes(b"DFLT"))
+        || gsub_script == Some(Tag::from_bytes(b"latn"));
+    match &script.0 {
+        b"Thai" | b"Laoo" => (ZeroWidthMarks::ByGdefLate, false),
+        b"Hang" | b"Khmr" | b"Qaag" => (ZeroWidthMarks::None, false),
+        b"Beng" | b"Deva" | b"Gujr" | b"Guru" | b"Knda" | b"Mlym" | b"Orya" | b"Taml" | b"Telu" => {
+            if is_dflt_or_latn {
+                (ZeroWidthMarks::ByGdefLate, true)
+            } else if gsub_script.is_some_and(|t| t.to_bytes()[3] == b'3') {
+                (ZeroWidthMarks::ByGdefEarly, false)
+            } else {
+                (ZeroWidthMarks::None, false)
+            }
+        }
+        b"Mymr" => {
+            if is_dflt_or_latn || gsub_script == Some(Tag::from_bytes(b"mymr")) {
+                (ZeroWidthMarks::ByGdefLate, true)
+            } else {
+                (ZeroWidthMarks::ByGdefEarly, false)
+            }
+        }
+        b"Tibt" | b"Mong" | b"Sinh" | b"Buhd" | b"Hano" | b"Tglg" | b"Tagb" | b"Limb" | b"Tale"
+        | b"Bugi" | b"Khar" | b"Sylo" | b"Tfng" | b"Bali" | b"Nkoo" | b"Phag" | b"Cham"
+        | b"Kali" | b"Lepc" | b"Rjng" | b"Saur" | b"Sund" | b"Egyp" | b"Java" | b"Kthi"
+        | b"Mtei" | b"Lana" | b"Tavt" | b"Batk" | b"Brah" | b"Mand" | b"Cakm" | b"Plrd"
+        | b"Shrd" | b"Takr" | b"Dupl" | b"Gran" | b"Khoj" | b"Sind" | b"Mahj" | b"Mani"
+        | b"Modi" | b"Hmng" | b"Phlp" | b"Sidd" | b"Tirh" | b"Ahom" | b"Mult" | b"Adlm"
+        | b"Bhks" | b"Marc" | b"Newa" | b"Gonm" | b"Soyo" | b"Zanb" | b"Dogr" | b"Gong"
+        | b"Rohg" | b"Maka" | b"Medf" | b"Sogo" | b"Sogd" | b"Elym" | b"Nand" | b"Hmnp"
+        | b"Wcho" | b"Chrs" | b"Diak" | b"Kits" | b"Yezi" | b"Cpmn" | b"Ougr" | b"Tnsa"
+        | b"Toto" | b"Vith" | b"Kawi" | b"Nagm" | b"Gara" | b"Gukh" | b"Krai" | b"Onao"
+        | b"Sunu" | b"Todr" | b"Tutg" => {
+            if is_dflt_or_latn {
+                (ZeroWidthMarks::ByGdefLate, true)
+            } else {
+                (ZeroWidthMarks::ByGdefEarly, false)
+            }
+        }
+        _ => (ZeroWidthMarks::ByGdefLate, true),
     }
 }
 

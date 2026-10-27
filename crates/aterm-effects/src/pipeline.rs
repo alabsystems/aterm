@@ -806,6 +806,7 @@ impl EffectsPipeline {
     }
 
     /// Configure the lumen cursor aurora (the additive `cursor_glow_add` channel).
+    #[inline]
     #[allow(
         clippy::too_many_arguments,
         reason = "one call mirrors the native GlowConfig resolution; a builder would relocate the list"
@@ -854,6 +855,7 @@ impl EffectsPipeline {
     }
 
     /// Set only the glow's trail colour.
+    #[inline]
     pub fn set_cursor_glow_color(&mut self, color: &str) -> bool {
         let Some(color) = crate::cursor_fx::TrailColor::parse(color) else {
             return false;
@@ -886,6 +888,7 @@ impl EffectsPipeline {
     }
 
     /// Configure the classic opaque comet trail (the `cursor_trail` channel).
+    #[inline]
     pub fn set_cursor_trail(
         &mut self,
         enabled: bool,
@@ -917,6 +920,40 @@ impl EffectsPipeline {
     #[inline]
     pub const fn set_letter_guard(&mut self, on: bool) {
         self.cursor.glow.set_letter_guard(on);
+    }
+
+    /// A test's negative control: the dark landing ring's rim is laid over the
+    /// text, as it was (`CursorGlow::set_dark_rim_over`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_dark_rim_over(&mut self, over: bool) {
+        self.cursor.glow.set_dark_rim_over(over);
+    }
+
+    /// A test's negative control: the dark landing ring's rim keeps `share`
+    /// of its light under the letters (`CursorGlow::set_dark_rim_under_letters`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_dark_rim_under_letters(&mut self, share: f32) {
+        self.cursor.glow.set_dark_rim_under_letters(share);
+    }
+
+    /// A test's negative control: the dark landing ring's rim is drawn
+    /// however little of it keeps its whole light
+    /// (`CursorGlow::set_dark_rim_fragments`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_dark_rim_fragments(&mut self, on: bool) {
+        self.cursor.glow.set_dark_rim_fragments(on);
+    }
+
+    /// A test's negative control: the letter guard passes Classic's spectrum
+    /// face by on paper too, as it did
+    /// (`CursorGlow::set_letter_guard_classic_paper`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_classic_paper(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard_classic_paper(on);
     }
 
     /// A test's negative control: the guard on, but no page veil under the
@@ -959,6 +996,18 @@ impl EffectsPipeline {
         self.cursor.glow.set_pet_veil_beneath(on);
     }
 
+    /// A test's negative control: one law that keeps the letter under the
+    /// caret off (`CursorGlow::set_caret_letter_law`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_caret_letter_law(
+        &mut self,
+        law: crate::cursor_glow::CaretLetterLaw,
+        on: bool,
+    ) {
+        self.cursor.glow.set_caret_letter_law(law, on);
+    }
+
     /// A test's negative control: the letter guard's cut pieces rounded to
     /// the nearest byte (`CursorGlow::set_letter_guard_cuts_rounded`).
     #[cfg(any(test, debug_assertions))]
@@ -973,6 +1022,23 @@ impl EffectsPipeline {
     #[inline]
     pub const fn set_letter_guard_rails_clear(&mut self, on: bool) {
         self.cursor.glow.set_letter_guard_rails_clear(on);
+    }
+
+    /// A test's negative control: the letter guard judges every cell
+    /// afresh every frame (`CursorGlow::set_letter_guard_reuse`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_reuse(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard_reuse(on);
+    }
+
+    /// A test's counters: the cells the letter guard judged afresh, those
+    /// whose verdict it reused, and the frames it took whole from the frame
+    /// before (`CursorGlow::letter_guard_work`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn letter_guard_work(&self) -> (u64, u64, u64) {
+        self.cursor.glow.letter_guard_work()
     }
 
     /// A test's negative control: a lit page's bed laid at the page's
@@ -1074,6 +1140,31 @@ impl EffectsPipeline {
         self.companion.hit_rect()
     }
 
+    /// A test's negative control: the resident companion keeps its old paths
+    /// ([`crate::kitty_pet::PetBrain::set_old_paths`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_pet_old_paths(&mut self, old: bool) {
+        self.companion.set_pet_old_paths(old);
+    }
+
+    /// A test's negative control: the resident companion keeps the path it
+    /// kept before `law` ([`crate::kitty_pet::PetBrain::set_old_path`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_pet_old_path(&mut self, law: crate::kitty_pet::OldPath, old: bool) {
+        self.companion.set_pet_old_path(law, old);
+    }
+
+    /// The word icons the last frame's word pass drew, grid px `(x0, x1, y0,
+    /// y1)`: a test's reading of what the companion's flight keeps off.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub fn word_icon_boxes(&self) -> &[(i32, i32, i32, i32)] {
+        self.cursor.glow.word_icon_boxes()
+    }
+
     /// Who owned the block cursor on the last applied frame and its body colour.
     #[cfg(test)]
     #[inline]
@@ -1089,6 +1180,7 @@ impl EffectsPipeline {
     }
 
     /// Master sparkle-words switch.
+    #[inline]
     pub fn set_sparkle_enabled(&mut self, on: bool) {
         if on {
             self.rebuild_sparkle(true);
@@ -1107,6 +1199,7 @@ impl EffectsPipeline {
     }
 
     /// Per-class gates (native `[sparkle_words.<class>] enabled`).
+    #[inline]
     pub fn set_sparkle_classes(&mut self, profanity: bool, feline: bool, emphasis: bool) {
         self.deco_cfg.profanity = profanity;
         self.deco_cfg.feline = feline;
@@ -1116,6 +1209,7 @@ impl EffectsPipeline {
     }
 
     /// Animated-ink knobs (native `[sparkle_words.ink]`).
+    #[inline]
     pub fn set_sparkle_ink(&mut self, enabled: bool, strength: f32, sweep_ms: u32, loop_: bool) {
         let floor = if loop_ { 600 } else { 350 };
         self.deco_cfg.ink_enabled = enabled;
@@ -1140,6 +1234,7 @@ impl EffectsPipeline {
     }
 
     /// Feline knobs (native `[sparkle_words.feline]`).
+    #[inline]
     pub fn set_sparkle_feline(
         &mut self,
         style: &str,
@@ -1159,6 +1254,7 @@ impl EffectsPipeline {
     }
 
     /// Profanity knobs (native `[sparkle_words.profanity]`).
+    #[inline]
     #[allow(
         clippy::too_many_arguments,
         reason = "one call mirrors the native profanity table; a builder would relocate the list"
@@ -1190,6 +1286,7 @@ impl EffectsPipeline {
     }
 
     /// The `[[sparkle_words.custom]]` TOML fragment (as the native config carries it).
+    #[inline]
     pub fn set_sparkle_custom_specs(&mut self, toml: Option<String>) {
         let entries = match toml.as_deref().map(crate::spec::parse_custom_toml) {
             None => {
@@ -1220,40 +1317,61 @@ impl EffectsPipeline {
     }
 
     /// Languages whose ambiguous homograph entries un-gate.
+    #[inline]
     pub fn set_sparkle_languages(&mut self, languages: &[&str]) {
-        self.languages = if languages.is_empty() {
-            vec!["en".to_string()]
+        self.languages.clear();
+        if languages.is_empty() {
+            self.languages.push("en".to_string());
         } else {
-            languages.iter().map(|s| (*s).to_string()).collect()
-        };
+            self.languages.reserve(languages.len());
+            let mut i = 0;
+            while i < languages.len() {
+                self.languages.push(languages[i].to_string());
+                i += 1;
+            }
+        }
         self.rebuild_sparkle(false);
     }
 
     /// User lexicon-override TOML merged over the builtin.
+    #[inline]
     pub fn set_sparkle_lexicon_override(&mut self, toml: Option<String>) {
         self.override_toml = toml;
         self.rebuild_sparkle(false);
     }
 
     /// Folded surfaces to never decorate (native global `deny` + `ignore_words`).
+    #[inline]
     pub fn set_sparkle_deny(&mut self, words: &[&str]) {
-        self.deco_cfg.ignore = words.iter().map(|w| aterm_lexicon::fold(w)).collect();
+        self.deco_cfg.ignore.clear();
+        self.deco_cfg.ignore.reserve(words.len());
+        let mut i = 0;
+        while i < words.len() {
+            self.deco_cfg.ignore.insert(aterm_lexicon::fold(words[i]));
+            i += 1;
+        }
         self.refresh_sparkle_cfg();
     }
 
     /// Lexicon build diagnostics.
+    #[inline]
     #[must_use]
     pub fn sparkle_lexicon_warnings(&self) -> Vec<String> {
-        self.custom_spec_warning
-            .iter()
-            .cloned()
-            .chain(
-                self.lexicon_conflicts
-                    .iter()
-                    .filter(|w| lexicon_warning_applies(w, self.deco_cfg.cjk_single_char))
-                    .cloned(),
-            )
-            .collect()
+        let mut out = Vec::with_capacity(
+            usize::from(self.custom_spec_warning.is_some()) + self.lexicon_conflicts.len(),
+        );
+        if let Some(w) = &self.custom_spec_warning {
+            out.push(w.clone());
+        }
+        let mut i = 0;
+        while i < self.lexicon_conflicts.len() {
+            let w = &self.lexicon_conflicts[i];
+            if lexicon_warning_applies(w, self.deco_cfg.cjk_single_char) {
+                out.push(w.clone());
+            }
+            i += 1;
+        }
+        out
     }
 
     /// Re-resolve the active config.
@@ -1266,11 +1384,17 @@ impl EffectsPipeline {
     }
 
     /// (Re)compile the lexicon + resolved config.
+    #[inline]
     fn rebuild_sparkle(&mut self, force: bool) {
         if self.sparkle.is_none() && !force {
             return;
         }
-        let refs: Vec<&str> = self.languages.iter().map(String::as_str).collect();
+        let mut refs = Vec::with_capacity(self.languages.len());
+        let mut i = 0;
+        while i < self.languages.len() {
+            refs.push(self.languages[i].as_str());
+            i += 1;
+        }
         let mut over = self.override_toml.clone().unwrap_or_default();
         over.push_str(&self.custom_lexicon);
         let over_ref = if over.is_empty() {
@@ -1291,6 +1415,7 @@ impl EffectsPipeline {
     }
 
     /// Master rain switch.
+    #[inline]
     pub fn set_matrix_rain_enabled(&mut self, on: bool) {
         self.rain_cfg.enabled = on;
         if !on {
@@ -1313,6 +1438,7 @@ impl EffectsPipeline {
     }
 
     /// Configure the output streak (`crate::output_streak`).
+    #[inline]
     #[allow(
         clippy::too_many_arguments,
         reason = "one call mirrors the native StreakConfig resolution; a builder would relocate the list"
@@ -1381,6 +1507,7 @@ impl EffectsPipeline {
     }
 
     /// Configure the rain knobs (native `[matrix_rain]`), kept across off/on toggles.
+    #[inline]
     #[allow(
         clippy::too_many_arguments,
         reason = "one call mirrors the native matrix_rain table; a builder would relocate the list"
@@ -2005,6 +2132,9 @@ pub use native::{
     PaneGrid, RowProbe, ScrollChange, StreakEcho, StreakGrid, StreakKnobs, StreakPane, TornBand,
     WordGrid, WordGridOut, WordPane, WordPanes, WordPanesOut, WordRescan,
 };
+
+#[cfg(any(test, debug_assertions))]
+mod state_words;
 
 #[cfg(test)]
 #[path = "pipeline_input_tests.rs"]
@@ -3190,6 +3320,14 @@ mod tests {
         use aterm_core::render::HostRowPixels;
         use aterm_core::terminal::RenderCell;
 
+        // The same resident on the same frames with no pointer: what its
+        // content comes to without the stroke (an arrival's content tires).
+        let mut unstroked = pet_pipeline(7);
+        let (mut uterm, mut uinput) = glass(8, 40);
+        materialize_pet(&mut unstroked, &mut uterm, &mut uinput);
+        idle(&mut unstroked, &mut uterm, &mut uinput, 60, 50.0);
+        unstroked.set_host_rows_px(CELL_H);
+        idle(&mut unstroked, &mut uterm, &mut uinput, 21, 50.0);
         let mut p = pet_pipeline(7);
         let (mut term, mut input) = glass(8, 40);
         materialize_pet(&mut p, &mut term, &mut input);
@@ -3228,7 +3366,6 @@ mod tests {
             "the hit rect is the drawn body, in frame px"
         );
 
-        let before_stroke = p.companion.brain().content();
         let mut answered = false;
         for step in 1..=20 {
             let x = x0 + w * (0.20 + 0.60 * step as f32 / 20.0);
@@ -3241,7 +3378,7 @@ mod tests {
             "a stroke across the drawn body must reach the brain's stroke detector"
         );
         assert!(
-            p.companion.brain().content() > before_stroke + 0.05,
+            p.companion.brain().content() > unstroked.companion.brain().content() + 0.05,
             "the reaction was earned by pointer travel over the drawn body"
         );
         let cx = x0 + w / 2.0;
@@ -4792,6 +4929,7 @@ mod tests {
                     page,
                     terminal_cursor_color(&term),
                     None,
+                    false,
                 )
                 .fill
             }),

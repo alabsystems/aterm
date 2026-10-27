@@ -57,6 +57,43 @@ fn collected_digests(refs: &[&xref::RefinementAnchor], waivers: &[&xref::Waiver]
 #[test]
 fn spec_xref_closure() {
     let _domains = aterm_models::link_all();
+    std::hint::black_box(
+        aterm_agent::harness::accounts_sync::account_provider_realm_environment as fn(),
+    );
+    #[cfg(unix)]
+    std::hint::black_box(aterm_db::replica::db_repair_policy_environment as fn());
+    std::hint::black_box(
+        aterm_agent::harness::codex_app_login::codex_refresh_publication_environment as fn(),
+    );
+    std::hint::black_box(
+        aterm_agent::harness::codex_app_login::codex_refresh_identity_environment as fn(),
+    );
+    std::hint::black_box(
+        aterm_agent::harness::codex_app_login::codex_refresh_authority_environment as fn(),
+    );
+    std::hint::black_box(
+        aterm_agent::harness::codex_app_login::codex_login_publication_environment as fn(),
+    );
+    std::hint::black_box(
+        aterm_agent::harness::codex_app_login::codex_refresh_result_environment as fn(),
+    );
+    // aterm-vz's `VzLifecycle` anchors: one named item in each module that holds them.
+    #[cfg(unix)]
+    std::hint::black_box((
+        aterm_vz::lifecycle::vz_lifecycle_environment as fn(),
+        aterm_vz::agent::run as *const (),
+        aterm_vz::client::Session::attach as *const (),
+        aterm_vz::helper::take as *const (),
+        aterm_vz::layers::Layers::prepare as *const (),
+        aterm_vz::record::kill_helper as *const (),
+    ));
+    // aterm-cli's `SetupLedger` anchors, all in macOS code: the waivers' host beside the
+    // ledger, and the doctor's entry, which reaches the ledger and the kept-by-person record.
+    #[cfg(target_os = "macos")]
+    std::hint::black_box((
+        aterm_cli::macos_doctor::setup_ledger_environment as fn(),
+        aterm_cli::macos_doctor::run as *const (),
+    ));
     #[cfg(unix)]
     std::hint::black_box(
         aterm_db::control::Endpoint::exchange
@@ -162,6 +199,9 @@ fn spec_xref_closure() {
             ) -> std::fmt::Result,
         agh::cli::main_entry as fn(Vec<std::ffi::OsString>) -> std::process::ExitCode,
         agh::policy::route_wall_environment as fn(),
+        // agh M2: the ensure-once and git-grant waivers' hosts.
+        agh::github::releases::ensure_once_environment as fn(),
+        agh::git::grant::git_grant_environment as fn(),
     ));
     let refs: Vec<_> = xref::refinements().collect();
     let waivers: Vec<_> = xref::waivers().collect();

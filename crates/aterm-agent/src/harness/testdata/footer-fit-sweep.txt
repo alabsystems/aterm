@@ -1,4 +1,4 @@
-# fit_rule's facts at rooms 20..=200 with nothing hidden, as the ladder gave them before hidden facts (read at 0b5b436a27 by footer_tests' sweep): narrow_rule_walled() with the account work-2; lights 0 none, 1 a hovered title, 2 a reason. <lights> <rooms> <facts>|<title>|<chips>
+# fit_rule's facts at rooms 20..=200 with nothing hidden, as the ladder gave them before hidden facts (read at 0b5b436a27 by footer_tests' sweep; the `Σ` runtime alone since the token pair went to the hover title): narrow_rule_walled() with the account work-2; lights 0 none, 1 a hovered title, 2 a reason. <lights> <rooms> <facts>|<title>|<chips>
 0 20..=27 ⧗ 7d ♻ Oct 1 at 9am|None|false
 0 28..=32 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5|None|false
 0 33..=41 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh|None|false
@@ -7,8 +7,7 @@
 0 58..=61 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ …/aterm/⎇ main|None|false
 0 62..=69 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⌂ ~/src/github.com/aterm/⎇ main|None|false
 0 70..=77 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main|None|false
-0 78..=86 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m|None|false
-0 87..=200 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m ↑48M ↓310k|None|false
+0 78..=200 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m|None|false
 1 20..=23 ◆ Opus 5.5|None|true
 1 24..=26 ◆ Opus 5.5 xhigh|None|true
 1 27..=35 ⧗ 7d ♻ Oct 1 at 9am|None|true
@@ -21,11 +20,10 @@
 1 71..=78 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⌂ ~/src/github.com/aterm/⎇ main|None|true
 1 79..=86 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main|None|true
 1 87..=95 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m|None|true
-1 96..=104 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m ↑48M ↓310k|None|true
-1 105..=109 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m ↑48M ↓310k|Short|true
-1 110..=113 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m ↑48M ↓310k|Lean(1)|true
-1 114..=117 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m ↑48M ↓310k|Lean(0)|true
-1 118..=200 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m ↑48M ↓310k|Full|true
+1 96..=100 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m|Short|true
+1 101..=104 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m|Lean(1)|true
+1 105..=108 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m|Lean(0)|true
+1 109..=200 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m|Full|true
 2 20..=23 ◆ Opus 5.5|None|true
 2 24..=26 ◆ Opus 5.5 xhigh|None|true
 2 27..=35 ⧗ 7d ♻ Oct 1 at 9am|None|true
@@ -38,6 +36,5 @@
 2 76..=79 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ …/aterm/⎇ main|Short|true
 2 80..=87 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⌂ ~/src/github.com/aterm/⎇ main|Short|true
 2 88..=95 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main|Short|true
-2 96..=104 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m|Short|true
-2 105..=117 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m ↑48M ↓310k|Short|true
-2 118..=200 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m ↑48M ↓310k|Full|true
+2 96..=108 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m|Short|true
+2 109..=200 ⧗ 7d ♻ Oct 1 at 9am/◆ Opus 5.5 xhigh/⎆ work-2/⌂ ~/src/github.com/aterm/⎇ main/Σ 7h52m|Full|true

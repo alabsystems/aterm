@@ -86,6 +86,7 @@ impl CursorGlow {
     }
 
     /// [`Self::cue_keystroke_kind`] with shiftedness from the host, for the capital's octave lift ([`SoundCue::shifted`]); only the host has the modifier flags.
+    #[inline]
     pub fn cue_keystroke_shifted(
         &mut self,
         now: Instant,
@@ -118,6 +119,7 @@ impl CursorGlow {
     }
 
     /// The bare-Shift lift cue ([`crate::trail_sound::SoundKind::Shift`]) for a press with no echo: it banks no echo-muting credit and stamps no typing-cadence clock ([`Self::key_cue_at`] is for keystrokes).
+    #[inline]
     pub fn cue_modifier(&mut self, now: Instant) -> bool {
         if !self.sound_live {
             return false;

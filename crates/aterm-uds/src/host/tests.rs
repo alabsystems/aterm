@@ -95,6 +95,11 @@ fn descriptor_room_preserves_limits_and_reports_the_actual_result() {
 fn stand_in(path: &Path) {
     std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
     std::fs::write(path, "#!/bin/sh\n").expect("write a stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
 }
 
 fn fish_like(fixed: &'static str) -> Tool {
@@ -256,10 +261,7 @@ fn the_refusal_names_its_provider() {
         "the CLT row names base.clt, never the dialog: {cc}"
     );
     let gpu = tool("gpu").refusal();
-    assert_eq!(
-        gpu,
-        "this host lacks a GPU wgpu can open, and no command adds it"
-    );
+    assert_eq!(gpu, "this host lacks a GPU adapter, and no command adds it");
     for refusal in [fish, pwsh, lima, bindgen, vim, ty, python, zstd, cc, gpu] {
         assert!(!refusal.contains("brew"), "no remedy says brew: {refusal}");
     }
@@ -363,7 +365,150 @@ fn a_pin_lives_under_its_package() {
             pinned_version("wasm-bindgen")
         )))
     );
-    assert_eq!(tool("rustup").pinned_in(t), None);
+    assert_eq!(
+        tool("rustup").pinned_in(t),
+        Some(PathBuf::from("/t/rustup-1.29.2/bin/rustup"))
+    );
+}
+
+/// The `rustup` row's copy `verify provision` places: `bin/rustup` and its stamp.
+fn placed_rustup(tooling: &Path) -> PathBuf {
+    let exe = tool("rustup").pinned_in(tooling).expect("rustup is pinned");
+    stand_in(&exe);
+    stand_in(
+        &tool("rustup")
+            .pinned_root(tooling)
+            .expect("rustup is pinned")
+            .join(PIN_STAMP),
+    );
+    exe
+}
+
+/// RUSTUP IS THE ROW'S STAMPED COPY BEFORE ANY ON `$PATH`, AND NEVER HOMEBREW'S KEG: the one
+/// rustup finder is the `rustup` row's resolver, whose places are `$ATERM_TEST_RUSTUP`, the
+/// copy `verify provision` placed with its stamp, and `$PATH`. NEGATIVE CONTROLS: a copy
+/// without its stamp is passed over for `$PATH`, and the scratch keg is a file the resolver
+/// would take, since it answers once a person puts the keg's own directory on `$PATH`.
+#[test]
+fn rustup_is_the_stamped_copy_before_path_and_never_the_keg() {
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let row = tool("rustup");
+    assert!(
+        row.at.is_empty(),
+        "the row lists no fixed place: {:?}",
+        row.at
+    );
+    let keg = scratch.path().join("opt/homebrew/opt/rustup/bin/rustup");
+    stand_in(&keg);
+    let tooling = scratch.path().join("tooling.noindex");
+    let on_path = scratch.path().join("on-path");
+    stand_in(&on_path.join("rustup"));
+    let bare = Lookup {
+        named: None,
+        tooling: Some(tooling.clone()),
+        path: None,
+    };
+    assert_eq!(
+        row.find_in(&bare),
+        None,
+        "nothing answers but the row's places"
+    );
+    let with_path = Lookup {
+        path: Some(on_path.clone().into_os_string()),
+        ..bare.clone()
+    };
+    assert_eq!(row.find_in(&with_path), Some(on_path.join("rustup")));
+
+    let exe = row.pinned_in(&tooling).expect("rustup is pinned");
+    stand_in(&exe);
+    assert_eq!(
+        row.find_in(&with_path),
+        Some(on_path.join("rustup")),
+        "a copy without its stamp is not the pin"
+    );
+    assert_eq!(placed_rustup(&tooling), exe);
+    assert_eq!(row.find_in(&with_path), Some(exe.clone()), "the copy first");
+    assert_eq!(row.find_in(&bare), Some(exe));
+
+    let keg_dir = keg.parent().expect("the keg's bin").as_os_str().to_owned();
+    assert_eq!(
+        row.find_in(&Lookup {
+            tooling: None,
+            path: Some(keg_dir),
+            named: None,
+        }),
+        Some(keg),
+        "the planted keg is a file a lookup would take"
+    );
+}
+
+/// A CHECK THAT FINDS NO RUSTUP SAYS WHERE THE ROW LOOKED AND NAMES ITS PROVIDER ONCE, and a
+/// variable that names no file is said, not a panic. NEGATIVE CONTROL: `find_in`, which a
+/// test gate calls, still panics on that variable.
+#[test]
+fn a_rustup_the_row_cannot_find_is_absent_naming_verify_provision_once() {
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let row = tool("rustup");
+    let tooling = scratch.path().join("tooling.noindex");
+    let none = Lookup {
+        named: None,
+        tooling: Some(tooling.clone()),
+        path: Some(scratch.path().join("empty").into_os_string()),
+    };
+    let absent = row.locate_in(&none).expect_err("no rustup anywhere");
+    assert_eq!(
+        absent.why,
+        format!(
+            "no rustup (looked in $ATERM_TEST_RUSTUP, the stamped 1.29.2 at {} and $PATH)",
+            tooling.join("rustup-1.29.2/bin/rustup").display()
+        )
+    );
+    assert_eq!(
+        absent.fix,
+        "`targo --unverified verify provision` fetches the pinned 1.29.2 into this user's cache"
+    );
+    let said = absent.to_string();
+    assert_eq!(said.matches("verify provision").count(), 1, "{said}");
+    assert!(!said.contains("brew"), "{said}");
+
+    let missing = scratch.path().join("no-such-rustup");
+    let named = Lookup {
+        named: Some(missing.clone().into_os_string()),
+        ..none
+    };
+    let absent = row
+        .locate_in(&named)
+        .expect_err("a variable naming nothing");
+    assert_eq!(
+        absent.why,
+        format!("ATERM_TEST_RUSTUP points at {missing:?}, which is not a file")
+    );
+    assert!(
+        absent
+            .fix
+            .starts_with("unset ATERM_TEST_RUSTUP or point it at a rustup"),
+        "the variable is what to change, since it outranks the copy: {}",
+        absent.fix
+    );
+    assert_eq!(
+        absent.fix.matches("verify provision").count(),
+        1,
+        "{}",
+        absent.fix
+    );
+    assert!(
+        std::panic::catch_unwind(|| row.find_in(&named)).is_err(),
+        "a test gate's lookup still panics on it"
+    );
+    placed_rustup(&tooling);
+    assert!(row.locate_in(&named).is_err(), "the variable comes first");
+    assert_eq!(
+        row.locate_in(&Lookup {
+            named: None,
+            ..named
+        }),
+        Ok(tooling.join("rustup-1.29.2/bin/rustup"))
+    );
 }
 
 #[test]
@@ -389,6 +534,55 @@ fn the_usual_paths_come_before_path() {
         row.find_in(&lookup),
         Some(on_path.join("fish")),
         "then $PATH"
+    );
+}
+
+/// A FILE WITH NO EXECUTE BIT IS PASSED OVER, on `$PATH` and at a usual path alike, for the
+/// next place that holds a program, as a shell's own `$PATH` search passes it over: a
+/// mode-0644 `rustup` early on `$PATH` is not the rustup the lanes run. NEGATIVE CONTROL: the
+/// same file with its execute bit back is the answer again.
+#[cfg(unix)]
+#[test]
+fn a_file_without_an_execute_bit_is_passed_over_for_the_next_place() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let (first, second) = (scratch.path().join("a"), scratch.path().join("b"));
+    stand_in(&first.join("rustup"));
+    stand_in(&second.join("rustup"));
+    let mode = |path: &Path, bits: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).expect("chmod");
+    };
+    mode(&first.join("rustup"), 0o644);
+    let path = std::env::join_paths([&first, &second]).expect("a PATH");
+    let lookup = Lookup {
+        named: None,
+        tooling: None,
+        path: Some(path),
+    };
+    let row = tool("rustup");
+    assert_eq!(row.find_in(&lookup), Some(second.join("rustup")));
+    mode(&first.join("rustup"), 0o755);
+    assert_eq!(
+        row.find_in(&lookup),
+        Some(first.join("rustup")),
+        "control: with its execute bit the first is taken"
+    );
+
+    let usual = scratch.path().join("usual/bin/fish");
+    stand_in(&usual);
+    stand_in(&second.join("fish"));
+    mode(&usual, 0o644);
+    let fish = fish_like(leak(&usual));
+    let lookup = Lookup {
+        path: Some(second.clone().into_os_string()),
+        ..lookup
+    };
+    assert_eq!(fish.find_in(&lookup), Some(second.join("fish")));
+    mode(&usual, 0o755);
+    assert_eq!(
+        fish.find_in(&lookup),
+        Some(usual),
+        "control: the usual path"
     );
 }
 

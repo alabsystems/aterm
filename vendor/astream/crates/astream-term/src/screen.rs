@@ -10,9 +10,12 @@
 //! A deliberately bounded but real VT subset: C0 controls (CR/LF/TAB/BS, and
 //! VT/FF as line feeds), index (IND/NEL/RI), CSI cursor motion
 //! (CUU/CUD/CUF/CUB/CNL/CPL/CHA/VPA/CUP), erase (ED/EL/ECH), insert and delete
-//! (ICH/DCH/IL/DL), SGR (the
-//! 16- and 256-colour palettes in both the `;` and the `:` sub-parameter form,
-//! plus bold/underline/reverse), the alternate screen (`?1049`/`?47`/`?1047`),
+//! (ICH/DCH/IL/DL), SGR (the 16- and 256-colour palettes plus 24-bit truecolour
+//! in both the `;` and the `:` sub-parameter form; bold, underline, reverse,
+//! italic, blink (5 and 6 alike, as xterm), crossed-out and concealed, each with
+//! its reset; a double underline, 21 or `4:2`, is an underline; faint is not
+//! modelled), East Asian wide glyphs, zero-width Unicode combining marks (up to
+//! [`MAX_COMBINING`] per cell), the alternate screen (`?1049`/`?47`/`?1047`),
 //! cursor visibility (`?25`), save/restore cursor (DECSC/DECRC and `CSI s`/`u`,
 //! one slot per screen buffer as in xterm), the DEC scrolling region (`DECSTBM`),
 //! left/right margins (DECLRMM `?69` and DECSLRM `CSI Pl ; Pr s`),
@@ -29,8 +32,8 @@
 //! designations other than the G0/G1 ones below, `ESC =`/`ESC >`) and CSI
 //! sequences outside it (any with an intermediate byte, or a private marker
 //! other than `?`) are skipped whole;
-//! truecolour SGR (`38;2;r;g;b`, `38:2::r:g:b`) is consumed *with* its
-//! sub-parameters and leaves the pen unchanged; DEL, and C1 controls arriving
+//! CMY/CMYK SGR (`38;3;…`, `38;4;…`) and truncated extended-colour forms are
+//! consumed *with* their sub-parameters and leave the pen unchanged; DEL, and C1 controls arriving
 //! as UTF-8 (U+0080..U+009F), are ignored; malformed UTF-8 (overlong,
 //! surrogate, truncated, a stray continuation or 8-bit byte) yields one U+FFFD
 //! per maximal subpart (Unicode 3.9) — a control character never lands in a
@@ -67,8 +70,13 @@
 //!   `srm_OPT_ALTBUF`, `srm_OPT_ALTBUF_CURSOR`), which resets the pending
 //!   wrap. The cursor is otherwise shared between the buffers and never moved
 //!   by a switch.
-//! * Truecolour is not modelled (consumed and ignored). ICH/DCH/IL/DL
-//!   and ECH follow xterm's `InsertChar`/`DeleteChar`/`InsertLine`/
+//! * **24-bit truecolour SGR** (`38;2;r;g;b`, `48;2;r;g;b`, `38:2::r:g:b`,
+//!   `38:2:cs:r:g:b`, `38:2:r:g:b`, and their `48:2:…` counterparts) resolves
+//!   onto [`Cell::fg_rgb`] / [`Cell::bg_rgb`] (including `bce` erases and DECSC/DECRC),
+//!   while palette/default SGR codes clear the corresponding RGB override. A channel
+//!   past 255 is clamped to 255, as aterm clamps it; the standards leave it undefined,
+//!   xterm's `parse_extended_colors` drops the colour and Ghostty truncates the value.
+//!   ICH/DCH/IL/DL and ECH follow xterm's `InsertChar`/`DeleteChar`/`InsertLine`/
 //!   `DeleteLine`/`ClearRight`: each resets a pending wrap where it acts,
 //!   IL/DL act only on a cursor inside the scrolling region and move it to
 //!   the left margin, and every vacated cell takes the bce blank.
@@ -132,8 +140,46 @@
 //!   and G1, G0 in GL), and RIS resets them. G2/G3, single shifts, the
 //!   national and 96-character sets are not modelled: their designations
 //!   are consumed and change nothing.
-//! * **One codepoint per cell**: an East Asian wide character takes one cell,
-//!   not two, and a combining (zero-width) mark takes a cell of its own.
+//! * **East Asian wide characters** take two cells: a lead ([`Cell::width`] 2)
+//!   holding the glyph and a spacer after it (width 0) that carries the same
+//!   rendition (xterm's `HIDDEN_CHAR`, Ghostty's `spacer_tail`). A character is
+//!   wide when Unicode's East Asian Width calls it Wide or Fullwidth and it
+//!   takes a column at all, and a regional indicator is wide too
+//!   ([`is_wide_char`]): [`char_display_width`] measures each codepoint alone,
+//!   as aterm measures it, its zero-width set ([`is_combining_mark`]) included,
+//!   so U+302A..U+302D, U+3099/U+309A and U+16FE4, marks that East Asian Width
+//!   calls Wide, take no column (xterm's combining table, Ghostty, aterm). A
+//!   wide glyph with one column left before the line end (the right margin, or
+//!   the screen's edge from past it) wraps first, and the column it skips takes
+//!   the bce blank, as aterm, Ghostty (`spacer_head`) and Alacritty
+//!   (`LEADING_WIDE_CHAR_SPACER`) blank it; xterm's `dotext` alone leaves that
+//!   cell as it was. A wrap pending after a wide glyph sits on its spacer. On a
+//!   screen one column wide a wide glyph prints as a narrow space in the pen,
+//!   as aterm and Ghostty print it (xterm's `dotext` gives up on the glyph,
+//!   and on any narrow glyph it read with it in the same pass, then prints
+//!   what follows).
+//!   **No operation leaves half a wide glyph.** A write, an erase, ICH, DCH and
+//!   IRM that would cut one (xterm repairs its `DamagedCells` with
+//!   `ClearCells`, Ghostty calls `splitCellBoundary`) first blank both of its
+//!   cells with the bce blank, one straddling the right margin included; a
+//!   scroll between left/right margins first turns each glyph straddling a
+//!   margin into two narrow blanks that keep their renditions and lose their
+//!   marks (Ghostty's `rowWillBeShifted` with `clearGrapheme`; xterm leaves the
+//!   halves torn); a narrowing resize that cuts a spacer off leaves its lead a
+//!   default blank.
+//! * **Grapheme clusters, in part**: a zero-width code point
+//!   ([`is_combining_mark`]: a combining mark, a variation selector, the
+//!   zero-width (non-)joiner or another format control) attaches, up to
+//!   [`MAX_COMBINING`] per cell, onto the preceding glyph on the row (the lead
+//!   of a wide one, or the current cell at column 0 / left margin) without
+//!   advancing the cursor, and so does a glyph aterm joins to the cluster
+//!   before it: a skin-tone modifier after a wide glyph, the second regional
+//!   indicator of a flag, and a glyph other than ASCII after an attached
+//!   `U+200D`. aterm goes further (a VS16 widens a narrow emoji base and a VS15
+//!   narrows a wide one, a skin-tone modifier joins only an emoji modifier
+//!   base, and a mark at column 0 of a wrapped row joins the glyph that ends
+//!   the row above); the fold models none of that, and aterm's differential
+//!   oracle generates none of it.
 //! * DECSC/DECRC save and restore the cursor position (with a pending wrap)
 //!   and the SGR rendition, as xterm's `CursorSave`/`CursorRestore` do; a
 //!   restore from a slot never saved homes the cursor and resets the
@@ -142,7 +188,13 @@
 //!   scrollback, so `ED 3` (xterm's
 //!   "erase saved lines", `do_erase_display` case 3) changes nothing here: the
 //!   visible screen is not saved lines.
-//! * **Resize clips/extends**; it does not reflow wrapped lines.
+//! * **Resize clips/extends**; it does not reflow wrapped lines. A wrap pending at the edge
+//!   (`col == cols`) keeps its next write, the column after the glyph: a widening leaves the
+//!   cursor there and a narrowing leaves it waiting on the new edge. A cursor whose own cell a
+//!   narrowing cuts off is clamped onto the last column with no wrap, as xterm clamps it, and a
+//!   wrap pending at a right margin stays pending on its column, clipped to the new width
+//!   (aterm's `resize-keeps-the-next-write` without reflow, which aterm's differential VT oracle
+//!   holds both engines to). A DECSC slot stays where it was saved.
 //! * Grid dimensions are clamped to `1..=`[`MAX_DIM`] so hostile input cannot
 //!   trigger an unbounded allocation (panic-free, like `astream-wire`).
 
@@ -184,29 +236,669 @@ pub mod attr {
     pub const REVERSE: u8 = 1 << 2;
     /// Faint / dim — used to render an unconfirmed speculative echo.
     pub const FAINT: u8 = 1 << 3;
+    /// Italic (SGR 3, off with 23).
+    pub const ITALIC: u8 = 1 << 4;
+    /// Blinking, slow or rapid alike (SGR 5 and 6, off with 25).
+    pub const BLINK: u8 = 1 << 5;
+    /// Crossed out (SGR 9, off with 29).
+    pub const STRIKE: u8 = 1 << 6;
+    /// Concealed, xterm's `INVISIBLE` (SGR 8, off with 28).
+    pub const CONCEAL: u8 = 1 << 7;
+}
+
+/// Maximum number of zero-width Unicode combining marks stored inline per [`Cell`].
+pub const MAX_COMBINING: usize = 4;
+
+/// The code points that take no column, as aterm's `char_width` measures them
+/// (Unicode 16.0.0): the nonspacing and enclosing marks, the format controls
+/// but the soft hyphen (the zero-width space and (non-)joiner, the bidi
+/// controls, the word joiner, the byte-order mark among them), the conjoining
+/// Hangul vowels and finals, the variation selectors and the tag plane.
+/// Ascending and disjoint, adjacent ranges merged; aterm's differential VT
+/// oracle holds the two measures equal code point by code point.
+const ZERO_WIDTH_RANGES: [(u32, u32); 368] = [
+    (0x0300, 0x036F),
+    (0x0483, 0x0489),
+    (0x0591, 0x05BD),
+    (0x05BF, 0x05BF),
+    (0x05C1, 0x05C2),
+    (0x05C4, 0x05C5),
+    (0x05C7, 0x05C7),
+    (0x0600, 0x0605),
+    (0x0610, 0x061A),
+    (0x061C, 0x061C),
+    (0x064B, 0x065F),
+    (0x0670, 0x0670),
+    (0x06D6, 0x06DD),
+    (0x06DF, 0x06E4),
+    (0x06E7, 0x06E8),
+    (0x06EA, 0x06ED),
+    (0x070F, 0x070F),
+    (0x0711, 0x0711),
+    (0x0730, 0x074A),
+    (0x07A6, 0x07B0),
+    (0x07EB, 0x07F3),
+    (0x07FD, 0x07FD),
+    (0x0816, 0x0819),
+    (0x081B, 0x0823),
+    (0x0825, 0x0827),
+    (0x0829, 0x082D),
+    (0x0859, 0x085B),
+    (0x0890, 0x0891),
+    (0x0897, 0x089F),
+    (0x08CA, 0x0902),
+    (0x093A, 0x093A),
+    (0x093C, 0x093C),
+    (0x0941, 0x0948),
+    (0x094D, 0x094D),
+    (0x0951, 0x0957),
+    (0x0962, 0x0963),
+    (0x0981, 0x0981),
+    (0x09BC, 0x09BC),
+    (0x09C1, 0x09C4),
+    (0x09CD, 0x09CD),
+    (0x09E2, 0x09E3),
+    (0x09FE, 0x09FE),
+    (0x0A01, 0x0A02),
+    (0x0A3C, 0x0A3C),
+    (0x0A41, 0x0A42),
+    (0x0A47, 0x0A48),
+    (0x0A4B, 0x0A4D),
+    (0x0A51, 0x0A51),
+    (0x0A70, 0x0A71),
+    (0x0A75, 0x0A75),
+    (0x0A81, 0x0A82),
+    (0x0ABC, 0x0ABC),
+    (0x0AC1, 0x0AC5),
+    (0x0AC7, 0x0AC8),
+    (0x0ACD, 0x0ACD),
+    (0x0AE2, 0x0AE3),
+    (0x0AFA, 0x0AFF),
+    (0x0B01, 0x0B01),
+    (0x0B3C, 0x0B3C),
+    (0x0B3F, 0x0B3F),
+    (0x0B41, 0x0B44),
+    (0x0B4D, 0x0B4D),
+    (0x0B55, 0x0B56),
+    (0x0B62, 0x0B63),
+    (0x0B82, 0x0B82),
+    (0x0BC0, 0x0BC0),
+    (0x0BCD, 0x0BCD),
+    (0x0C00, 0x0C00),
+    (0x0C04, 0x0C04),
+    (0x0C3C, 0x0C3C),
+    (0x0C3E, 0x0C40),
+    (0x0C46, 0x0C48),
+    (0x0C4A, 0x0C4D),
+    (0x0C55, 0x0C56),
+    (0x0C62, 0x0C63),
+    (0x0C81, 0x0C81),
+    (0x0CBC, 0x0CBC),
+    (0x0CBF, 0x0CBF),
+    (0x0CC6, 0x0CC6),
+    (0x0CCC, 0x0CCD),
+    (0x0CE2, 0x0CE3),
+    (0x0D00, 0x0D01),
+    (0x0D3B, 0x0D3C),
+    (0x0D41, 0x0D44),
+    (0x0D4D, 0x0D4D),
+    (0x0D62, 0x0D63),
+    (0x0D81, 0x0D81),
+    (0x0DCA, 0x0DCA),
+    (0x0DD2, 0x0DD4),
+    (0x0DD6, 0x0DD6),
+    (0x0E31, 0x0E31),
+    (0x0E34, 0x0E3A),
+    (0x0E47, 0x0E4E),
+    (0x0EB1, 0x0EB1),
+    (0x0EB4, 0x0EBC),
+    (0x0EC8, 0x0ECE),
+    (0x0F18, 0x0F19),
+    (0x0F35, 0x0F35),
+    (0x0F37, 0x0F37),
+    (0x0F39, 0x0F39),
+    (0x0F71, 0x0F7E),
+    (0x0F80, 0x0F84),
+    (0x0F86, 0x0F87),
+    (0x0F8D, 0x0F97),
+    (0x0F99, 0x0FBC),
+    (0x0FC6, 0x0FC6),
+    (0x102D, 0x1030),
+    (0x1032, 0x1037),
+    (0x1039, 0x103A),
+    (0x103D, 0x103E),
+    (0x1058, 0x1059),
+    (0x105E, 0x1060),
+    (0x1071, 0x1074),
+    (0x1082, 0x1082),
+    (0x1085, 0x1086),
+    (0x108D, 0x108D),
+    (0x109D, 0x109D),
+    (0x1160, 0x11FF),
+    (0x135D, 0x135F),
+    (0x1712, 0x1714),
+    (0x1732, 0x1733),
+    (0x1752, 0x1753),
+    (0x1772, 0x1773),
+    (0x17B4, 0x17B5),
+    (0x17B7, 0x17BD),
+    (0x17C6, 0x17C6),
+    (0x17C9, 0x17D3),
+    (0x17DD, 0x17DD),
+    (0x180B, 0x180F),
+    (0x1885, 0x1886),
+    (0x18A9, 0x18A9),
+    (0x1920, 0x1922),
+    (0x1927, 0x1928),
+    (0x1932, 0x1932),
+    (0x1939, 0x193B),
+    (0x1A17, 0x1A18),
+    (0x1A1B, 0x1A1B),
+    (0x1A56, 0x1A56),
+    (0x1A58, 0x1A5E),
+    (0x1A60, 0x1A60),
+    (0x1A62, 0x1A62),
+    (0x1A65, 0x1A6C),
+    (0x1A73, 0x1A7C),
+    (0x1A7F, 0x1A7F),
+    (0x1AB0, 0x1ACE),
+    (0x1B00, 0x1B03),
+    (0x1B34, 0x1B34),
+    (0x1B36, 0x1B3A),
+    (0x1B3C, 0x1B3C),
+    (0x1B42, 0x1B42),
+    (0x1B6B, 0x1B73),
+    (0x1B80, 0x1B81),
+    (0x1BA2, 0x1BA5),
+    (0x1BA8, 0x1BA9),
+    (0x1BAB, 0x1BAD),
+    (0x1BE6, 0x1BE6),
+    (0x1BE8, 0x1BE9),
+    (0x1BED, 0x1BED),
+    (0x1BEF, 0x1BF1),
+    (0x1C2C, 0x1C33),
+    (0x1C36, 0x1C37),
+    (0x1CD0, 0x1CD2),
+    (0x1CD4, 0x1CE0),
+    (0x1CE2, 0x1CE8),
+    (0x1CED, 0x1CED),
+    (0x1CF4, 0x1CF4),
+    (0x1CF8, 0x1CF9),
+    (0x1DC0, 0x1DFF),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0x20D0, 0x20F0),
+    (0x2CEF, 0x2CF1),
+    (0x2D7F, 0x2D7F),
+    (0x2DE0, 0x2DFF),
+    (0x302A, 0x302D),
+    (0x3099, 0x309A),
+    (0xA66F, 0xA672),
+    (0xA674, 0xA67D),
+    (0xA69E, 0xA69F),
+    (0xA6F0, 0xA6F1),
+    (0xA802, 0xA802),
+    (0xA806, 0xA806),
+    (0xA80B, 0xA80B),
+    (0xA825, 0xA826),
+    (0xA82C, 0xA82C),
+    (0xA8C4, 0xA8C5),
+    (0xA8E0, 0xA8F1),
+    (0xA8FF, 0xA8FF),
+    (0xA926, 0xA92D),
+    (0xA947, 0xA951),
+    (0xA980, 0xA982),
+    (0xA9B3, 0xA9B3),
+    (0xA9B6, 0xA9B9),
+    (0xA9BC, 0xA9BD),
+    (0xA9E5, 0xA9E5),
+    (0xAA29, 0xAA2E),
+    (0xAA31, 0xAA32),
+    (0xAA35, 0xAA36),
+    (0xAA43, 0xAA43),
+    (0xAA4C, 0xAA4C),
+    (0xAA7C, 0xAA7C),
+    (0xAAB0, 0xAAB0),
+    (0xAAB2, 0xAAB4),
+    (0xAAB7, 0xAAB8),
+    (0xAABE, 0xAABF),
+    (0xAAC1, 0xAAC1),
+    (0xAAEC, 0xAAED),
+    (0xAAF6, 0xAAF6),
+    (0xABE5, 0xABE5),
+    (0xABE8, 0xABE8),
+    (0xABED, 0xABED),
+    (0xD7B0, 0xD7C6),
+    (0xD7CB, 0xD7FB),
+    (0xFB1E, 0xFB1E),
+    (0xFE00, 0xFE0F),
+    (0xFE20, 0xFE2F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x101FD, 0x101FD),
+    (0x102E0, 0x102E0),
+    (0x10376, 0x1037A),
+    (0x10A01, 0x10A03),
+    (0x10A05, 0x10A06),
+    (0x10A0C, 0x10A0F),
+    (0x10A38, 0x10A3A),
+    (0x10A3F, 0x10A3F),
+    (0x10AE5, 0x10AE6),
+    (0x10D24, 0x10D27),
+    (0x10D69, 0x10D6D),
+    (0x10EAB, 0x10EAC),
+    (0x10EFC, 0x10EFF),
+    (0x10F46, 0x10F50),
+    (0x10F82, 0x10F85),
+    (0x11001, 0x11001),
+    (0x11038, 0x11046),
+    (0x11070, 0x11070),
+    (0x11073, 0x11074),
+    (0x1107F, 0x11081),
+    (0x110B3, 0x110B6),
+    (0x110B9, 0x110BA),
+    (0x110BD, 0x110BD),
+    (0x110C2, 0x110C2),
+    (0x110CD, 0x110CD),
+    (0x11100, 0x11102),
+    (0x11127, 0x1112B),
+    (0x1112D, 0x11134),
+    (0x11173, 0x11173),
+    (0x11180, 0x11181),
+    (0x111B6, 0x111BE),
+    (0x111C9, 0x111CC),
+    (0x111CF, 0x111CF),
+    (0x1122F, 0x11231),
+    (0x11234, 0x11234),
+    (0x11236, 0x11237),
+    (0x1123E, 0x1123E),
+    (0x11241, 0x11241),
+    (0x112DF, 0x112DF),
+    (0x112E3, 0x112EA),
+    (0x11300, 0x11301),
+    (0x1133B, 0x1133C),
+    (0x11340, 0x11340),
+    (0x11366, 0x1136C),
+    (0x11370, 0x11374),
+    (0x113BB, 0x113C0),
+    (0x113CE, 0x113CE),
+    (0x113D0, 0x113D0),
+    (0x113D2, 0x113D2),
+    (0x113E1, 0x113E2),
+    (0x11438, 0x1143F),
+    (0x11442, 0x11444),
+    (0x11446, 0x11446),
+    (0x1145E, 0x1145E),
+    (0x114B3, 0x114B8),
+    (0x114BA, 0x114BA),
+    (0x114BF, 0x114C0),
+    (0x114C2, 0x114C3),
+    (0x115B2, 0x115B5),
+    (0x115BC, 0x115BD),
+    (0x115BF, 0x115C0),
+    (0x115DC, 0x115DD),
+    (0x11633, 0x1163A),
+    (0x1163D, 0x1163D),
+    (0x1163F, 0x11640),
+    (0x116AB, 0x116AB),
+    (0x116AD, 0x116AD),
+    (0x116B0, 0x116B5),
+    (0x116B7, 0x116B7),
+    (0x1171D, 0x1171D),
+    (0x1171F, 0x1171F),
+    (0x11722, 0x11725),
+    (0x11727, 0x1172B),
+    (0x1182F, 0x11837),
+    (0x11839, 0x1183A),
+    (0x1193B, 0x1193C),
+    (0x1193E, 0x1193E),
+    (0x11943, 0x11943),
+    (0x119D4, 0x119D7),
+    (0x119DA, 0x119DB),
+    (0x119E0, 0x119E0),
+    (0x11A01, 0x11A0A),
+    (0x11A33, 0x11A38),
+    (0x11A3B, 0x11A3E),
+    (0x11A47, 0x11A47),
+    (0x11A51, 0x11A56),
+    (0x11A59, 0x11A5B),
+    (0x11A8A, 0x11A96),
+    (0x11A98, 0x11A99),
+    (0x11C30, 0x11C36),
+    (0x11C38, 0x11C3D),
+    (0x11C3F, 0x11C3F),
+    (0x11C92, 0x11CA7),
+    (0x11CAA, 0x11CB0),
+    (0x11CB2, 0x11CB3),
+    (0x11CB5, 0x11CB6),
+    (0x11D31, 0x11D36),
+    (0x11D3A, 0x11D3A),
+    (0x11D3C, 0x11D3D),
+    (0x11D3F, 0x11D45),
+    (0x11D47, 0x11D47),
+    (0x11D90, 0x11D91),
+    (0x11D95, 0x11D95),
+    (0x11D97, 0x11D97),
+    (0x11EF3, 0x11EF4),
+    (0x11F00, 0x11F01),
+    (0x11F36, 0x11F3A),
+    (0x11F40, 0x11F40),
+    (0x11F42, 0x11F42),
+    (0x11F5A, 0x11F5A),
+    (0x13430, 0x13440),
+    (0x13447, 0x13455),
+    (0x1611E, 0x16129),
+    (0x1612D, 0x1612F),
+    (0x16AF0, 0x16AF4),
+    (0x16B30, 0x16B36),
+    (0x16F4F, 0x16F4F),
+    (0x16F8F, 0x16F92),
+    (0x16FE4, 0x16FE4),
+    (0x1BC9D, 0x1BC9E),
+    (0x1BCA0, 0x1BCA3),
+    (0x1CF00, 0x1CF2D),
+    (0x1CF30, 0x1CF46),
+    (0x1D167, 0x1D169),
+    (0x1D173, 0x1D182),
+    (0x1D185, 0x1D18B),
+    (0x1D1AA, 0x1D1AD),
+    (0x1D242, 0x1D244),
+    (0x1DA00, 0x1DA36),
+    (0x1DA3B, 0x1DA6C),
+    (0x1DA75, 0x1DA75),
+    (0x1DA84, 0x1DA84),
+    (0x1DA9B, 0x1DA9F),
+    (0x1DAA1, 0x1DAAF),
+    (0x1E000, 0x1E006),
+    (0x1E008, 0x1E018),
+    (0x1E01B, 0x1E021),
+    (0x1E023, 0x1E024),
+    (0x1E026, 0x1E02A),
+    (0x1E08F, 0x1E08F),
+    (0x1E130, 0x1E136),
+    (0x1E2AE, 0x1E2AE),
+    (0x1E2EC, 0x1E2EF),
+    (0x1E4EC, 0x1E4EF),
+    (0x1E5EE, 0x1E5EF),
+    (0x1E8D0, 0x1E8D6),
+    (0x1E944, 0x1E94A),
+    (0xE0000, 0xE0FFF),
+];
+
+/// Whether `u` lies in one of `ranges`, which ascend and are disjoint.
+const fn in_ranges(u: u32, ranges: &[(u32, u32)]) -> bool {
+    let mut lo = 0usize;
+    let mut hi = ranges.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        // Never taken (`lo <= mid < hi <= len`): it states at the index what
+        // the verified lane cannot carry through the loop for a long table.
+        if mid >= ranges.len() {
+            return false;
+        }
+        let (first, last) = ranges[mid];
+        if u < first {
+            hi = mid;
+        } else if u > last {
+            lo = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `true` when `ch` takes no column (`ZERO_WIDTH_RANGES`: a combining
+/// or enclosing mark, a variation selector, the zero-width (non-)joiner
+/// `\u{200C}`/`\u{200D}`, another format control, a conjoining Hangul vowel or
+/// final, a tag): it attaches to the active base cell without advancing the
+/// cursor.
+#[must_use]
+pub const fn is_combining_mark(ch: char) -> bool {
+    let u = ch as u32;
+    // The first zero-width code point is U+0300.
+    u >= 0x0300 && in_ranges(u, &ZERO_WIDTH_RANGES)
+}
+
+/// The East Asian Width Wide (W) and Fullwidth (F) ranges of Unicode 16.0.0
+/// (`EastAsianWidth.txt`), adjacent ranges merged, ascending. Plane 3 stops at
+/// the end of CJK Extension H (U+323AF), where aterm and xterm stop, though
+/// East Asian Width defaults the unassigned rest of the plane to Wide.
+const WIDE_RANGES: [(u32, u32); 122] = [
+    (0x1100, 0x115F),
+    (0x231A, 0x231B),
+    (0x2329, 0x232A),
+    (0x23E9, 0x23EC),
+    (0x23F0, 0x23F0),
+    (0x23F3, 0x23F3),
+    (0x25FD, 0x25FE),
+    (0x2614, 0x2615),
+    (0x2630, 0x2637),
+    (0x2648, 0x2653),
+    (0x267F, 0x267F),
+    (0x268A, 0x268F),
+    (0x2693, 0x2693),
+    (0x26A1, 0x26A1),
+    (0x26AA, 0x26AB),
+    (0x26BD, 0x26BE),
+    (0x26C4, 0x26C5),
+    (0x26CE, 0x26CE),
+    (0x26D4, 0x26D4),
+    (0x26EA, 0x26EA),
+    (0x26F2, 0x26F3),
+    (0x26F5, 0x26F5),
+    (0x26FA, 0x26FA),
+    (0x26FD, 0x26FD),
+    (0x2705, 0x2705),
+    (0x270A, 0x270B),
+    (0x2728, 0x2728),
+    (0x274C, 0x274C),
+    (0x274E, 0x274E),
+    (0x2753, 0x2755),
+    (0x2757, 0x2757),
+    (0x2795, 0x2797),
+    (0x27B0, 0x27B0),
+    (0x27BF, 0x27BF),
+    (0x2B1B, 0x2B1C),
+    (0x2B50, 0x2B50),
+    (0x2B55, 0x2B55),
+    (0x2E80, 0x2E99),
+    (0x2E9B, 0x2EF3),
+    (0x2F00, 0x2FD5),
+    (0x2FF0, 0x303E),
+    (0x3041, 0x3096),
+    (0x3099, 0x30FF),
+    (0x3105, 0x312F),
+    (0x3131, 0x318E),
+    (0x3190, 0x31E5),
+    (0x31EF, 0x321E),
+    (0x3220, 0x3247),
+    (0x3250, 0xA48C),
+    (0xA490, 0xA4C6),
+    (0xA960, 0xA97C),
+    (0xAC00, 0xD7A3),
+    (0xF900, 0xFAFF),
+    (0xFE10, 0xFE19),
+    (0xFE30, 0xFE52),
+    (0xFE54, 0xFE66),
+    (0xFE68, 0xFE6B),
+    (0xFF01, 0xFF60),
+    (0xFFE0, 0xFFE6),
+    (0x16FE0, 0x16FE4),
+    (0x16FF0, 0x16FF1),
+    (0x17000, 0x187F7),
+    (0x18800, 0x18CD5),
+    (0x18CFF, 0x18D08),
+    (0x1AFF0, 0x1AFF3),
+    (0x1AFF5, 0x1AFFB),
+    (0x1AFFD, 0x1AFFE),
+    (0x1B000, 0x1B122),
+    (0x1B132, 0x1B132),
+    (0x1B150, 0x1B152),
+    (0x1B155, 0x1B155),
+    (0x1B164, 0x1B167),
+    (0x1B170, 0x1B2FB),
+    (0x1D300, 0x1D356),
+    (0x1D360, 0x1D376),
+    (0x1F004, 0x1F004),
+    (0x1F0CF, 0x1F0CF),
+    (0x1F18E, 0x1F18E),
+    (0x1F191, 0x1F19A),
+    (0x1F200, 0x1F202),
+    (0x1F210, 0x1F23B),
+    (0x1F240, 0x1F248),
+    (0x1F250, 0x1F251),
+    (0x1F260, 0x1F265),
+    (0x1F300, 0x1F320),
+    (0x1F32D, 0x1F335),
+    (0x1F337, 0x1F37C),
+    (0x1F37E, 0x1F393),
+    (0x1F3A0, 0x1F3CA),
+    (0x1F3CF, 0x1F3D3),
+    (0x1F3E0, 0x1F3F0),
+    (0x1F3F4, 0x1F3F4),
+    (0x1F3F8, 0x1F43E),
+    (0x1F440, 0x1F440),
+    (0x1F442, 0x1F4FC),
+    (0x1F4FF, 0x1F53D),
+    (0x1F54B, 0x1F54E),
+    (0x1F550, 0x1F567),
+    (0x1F57A, 0x1F57A),
+    (0x1F595, 0x1F596),
+    (0x1F5A4, 0x1F5A4),
+    (0x1F5FB, 0x1F64F),
+    (0x1F680, 0x1F6C5),
+    (0x1F6CC, 0x1F6CC),
+    (0x1F6D0, 0x1F6D2),
+    (0x1F6D5, 0x1F6D7),
+    (0x1F6DC, 0x1F6DF),
+    (0x1F6EB, 0x1F6EC),
+    (0x1F6F4, 0x1F6FC),
+    (0x1F7E0, 0x1F7EB),
+    (0x1F7F0, 0x1F7F0),
+    (0x1F90C, 0x1F93A),
+    (0x1F93C, 0x1F945),
+    (0x1F947, 0x1F9FF),
+    (0x1FA70, 0x1FA7C),
+    (0x1FA80, 0x1FA89),
+    (0x1FA8F, 0x1FAC6),
+    (0x1FACE, 0x1FADC),
+    (0x1FADF, 0x1FAE9),
+    (0x1FAF0, 0x1FAF8),
+    (0x20000, 0x2FFFD),
+    (0x30000, 0x323AF),
+];
+
+/// Whether `ch` is a regional indicator (U+1F1E6..U+1F1FF), one half of a flag.
+const fn is_regional_indicator(ch: char) -> bool {
+    let u = ch as u32;
+    u >= 0x1F1E6 && u <= 0x1F1FF
+}
+
+/// Whether `ch` is an emoji skin-tone modifier (U+1F3FB..U+1F3FF, UTS #51).
+const fn is_emoji_modifier(ch: char) -> bool {
+    let u = ch as u32;
+    u >= 0x1F3FB && u <= 0x1F3FF
+}
+
+/// Returns `true` when `ch` occupies two grid columns, as aterm draws it: an
+/// East Asian Wide or Fullwidth character (`WIDE_RANGES`, the `wcwidth == 2`
+/// of UAX #11) that takes a column at all ([`is_combining_mark`] wins, so
+/// U+302A..U+302D, U+3099/U+309A and U+16FE4, marks that East Asian Width
+/// calls Wide, take none, as in xterm's `wcwidth`), or a regional indicator,
+/// which aterm draws two columns wide though East Asian Width leaves it
+/// Neutral (xterm draws it one).
+#[must_use]
+pub const fn is_wide_char(ch: char) -> bool {
+    let u = ch as u32;
+    // Nothing below the first range is wide.
+    if u < 0x1100 || is_combining_mark(ch) {
+        return false;
+    }
+    is_regional_indicator(ch) || in_ranges(u, &WIDE_RANGES)
+}
+
+/// Terminal column width of `ch`, each codepoint measured alone as aterm
+/// measures it: `0` for a zero-width code point ([`is_combining_mark`]), `2`
+/// for a wide one ([`is_wide_char`]), and `1` otherwise.
+#[must_use]
+pub const fn char_display_width(ch: char) -> u8 {
+    if is_combining_mark(ch) {
+        0
+    } else if is_wide_char(ch) {
+        2
+    } else {
+        1
+    }
 }
 
 /// One character cell of the grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
-    /// The displayed character (one `char`; grapheme clustering is a later rung).
+    /// The base displayed character (`' '` for a blank or wide continuation cell).
     pub ch: char,
-    /// Foreground colour.
+    /// Foreground palette/default colour (`Color::Default` when `fg_rgb` is `Some`).
     pub fg: Color,
-    /// Background colour.
+    /// Background palette/default colour (`Color::Default` when `bg_rgb` is `Some`).
     pub bg: Color,
+    /// Resolved 24-bit foreground `(r, g, b)` when painted under truecolour SGR.
+    pub fg_rgb: Option<(u8, u8, u8)>,
+    /// Resolved 24-bit background `(r, g, b)` when painted or erased under truecolour SGR.
+    pub bg_rgb: Option<(u8, u8, u8)>,
     /// Attribute bits (see [`attr`]).
     pub attrs: u8,
+    /// Up to [`MAX_COMBINING`] zero-width combining / ZWJ continuation codepoints attached
+    /// to [`Self::ch`], in arrival order (`'\0'` in unused trailing slots).
+    pub combining: [char; MAX_COMBINING],
+    /// Count of active combining codepoints in [`Self::combining`] (`0..=MAX_COMBINING as u8`).
+    pub combining_len: u8,
+    /// Column width of this cell: `1` for normal narrow cells, `2` for the lead cell
+    /// of a wide character, and `0` for its adjacent right-hand spacer cell.
+    pub width: u8,
 }
 
 impl Cell {
-    /// An empty cell: a space with default colours and no attributes.
+    /// An empty cell: a single-width space with default colours, no RGB overrides,
+    /// no attributes, and no combining marks.
     pub const BLANK: Cell = Cell {
         ch: ' ',
         fg: Color::Default,
         bg: Color::Default,
+        fg_rgb: None,
+        bg_rgb: None,
         attrs: 0,
+        combining: ['\0'; MAX_COMBINING],
+        combining_len: 0,
+        width: 1,
     };
+
+    /// Append a zero-width combining mark `ch` if capacity below [`MAX_COMBINING`] remains.
+    pub const fn push_combining(&mut self, ch: char) {
+        let cur = combining_cap_clamp(self.combining_len as u64, MAX_COMBINING as u64) as usize;
+        if cur < MAX_COMBINING {
+            self.combining[cur] = ch;
+            self.combining_len = (cur + 1) as u8;
+        }
+    }
+
+    const fn last_combining(&self) -> Option<char> {
+        match self.combining_len {
+            0 => None,
+            1 => Some(self.combining[0]),
+            2 => Some(self.combining[1]),
+            3 => Some(self.combining[2]),
+            _ => Some(self.combining[3]),
+        }
+    }
+
+    /// Active combining marks attached to this cell.
+    #[must_use]
+    pub fn combining_marks(&self) -> &[char] {
+        let len = (self.combining_len as usize).min(MAX_COMBINING);
+        self.combining.get(..len).unwrap_or(&[])
+    }
 }
 
 /// A 94-character set the fold can designate into G0 or G1 (SCS, `ESC ( F`
@@ -295,6 +987,8 @@ impl Charsets {
 struct Pen {
     fg: Color,
     bg: Color,
+    fg_rgb: Option<(u8, u8, u8)>,
+    bg_rgb: Option<(u8, u8, u8)>,
     attrs: u8,
 }
 
@@ -318,8 +1012,30 @@ impl Pen {
         Pen {
             fg: Color::Default,
             bg: Color::Default,
+            fg_rgb: None,
+            bg_rgb: None,
             attrs: 0,
         }
+    }
+
+    const fn set_fg_color(&mut self, c: Color) {
+        self.fg = c;
+        self.fg_rgb = None;
+    }
+
+    const fn set_fg_rgb(&mut self, r: u8, g: u8, b: u8) {
+        self.fg = Color::Default;
+        self.fg_rgb = Some((r, g, b));
+    }
+
+    const fn set_bg_color(&mut self, c: Color) {
+        self.bg = c;
+        self.bg_rgb = None;
+    }
+
+    const fn set_bg_rgb(&mut self, r: u8, g: u8, b: u8) {
+        self.bg = Color::Default;
+        self.bg_rgb = Some((r, g, b));
     }
 }
 
@@ -473,6 +1189,36 @@ pub use crate::twins::screen_clamp_dim;
 #[cfg(clean_islands)]
 pub use screen_island::screen_clamp_dim;
 
+#[cfg(clean_islands)]
+#[path = "color_island.rs"]
+mod color_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::{color_clamp_channel, combining_cap_clamp};
+#[cfg(clean_islands)]
+pub use color_island::{color_clamp_channel, combining_cap_clamp};
+
+#[cfg(clean_islands)]
+#[path = "wide_island.rs"]
+mod wide_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::{wide_cell_width_clamp, wide_spacer_col_clamp};
+#[cfg(clean_islands)]
+pub use wide_island::{wide_cell_width_clamp, wide_spacer_col_clamp};
+
+contract_fn! {
+    /// Kernel-certified bounds check that a cell width tag `w` lies in `0..=2`
+    /// (`0` = wide continuation spacer, `1` = narrow cell, `2` = wide lead cell).
+    ///
+    /// Discharged in the Clean CIC kernel by definitional equality against
+    /// `cell_width_is_valid_isl` (`clean-kernel-defeq`).
+    #[must_use]
+    pub const fn cell_width_is_valid(w: u8) -> bool
+    clauses [ensures result == (w <= 2)]
+    {
+        w <= 2
+    }
+}
+
 contract_fn! {
     /// Kernel-certified bounds check that a screen row/column coordinate `coord`
     /// lies strictly within dimension `dim` (`coord < dim`).
@@ -484,6 +1230,20 @@ contract_fn! {
     clauses [ensures result == (coord < dim)]
     {
         coord < dim
+    }
+}
+
+contract_fn! {
+    /// Kernel-certified bounds check that a cell's inline combining-mark count
+    /// `len` is at most `cap` (`len <= cap`).
+    ///
+    /// Discharged in the Clean CIC kernel by definitional equality against
+    /// `combining_len_within_cap_isl` (`clean-kernel-defeq`).
+    #[must_use]
+    pub const fn combining_len_within_cap(len: u8, cap: u8) -> bool
+    clauses [ensures result == (len <= cap)]
+    {
+        len <= cap
     }
 }
 
@@ -601,20 +1361,25 @@ impl Screen {
         }
     }
 
-    /// The text of a row, with trailing blanks trimmed. Empty if out of bounds.
+    /// The text of a row, including any attached zero-width combining marks per cell,
+    /// with trailing blanks trimmed: a wide glyph appears once (its spacer adds
+    /// nothing). Empty if out of bounds.
     pub fn line_text(&self, row: u16) -> String {
         if row >= self.rows {
             return String::new();
         }
         let start = self.idx(row, 0);
         let end = start.saturating_add(self.cols as usize);
-        let mut line: String = self
-            .grid
-            .get(start..end)
-            .unwrap_or(&[])
-            .iter()
-            .map(|c| c.ch)
-            .collect();
+        let mut line = String::new();
+        for c in self.grid.get(start..end).unwrap_or(&[]) {
+            if c.width == 0 {
+                continue;
+            }
+            line.push(c.ch);
+            for &m in c.combining_marks() {
+                line.push(m);
+            }
+        }
         line.truncate(line.trim_end().len());
         line
     }
@@ -718,6 +1483,61 @@ impl Screen {
             out.extend_from_slice(&charsets);
             out.extend_from_slice(&margins);
         }
+        // Tag-2 extension trailer for 24-bit truecolour (`fg_rgb` / `bg_rgb`) and
+        // per-cell zero-width combining marks: emitted ONLY when any cell, pen, or
+        // saved-cursor slot carries extended colour or combining state, keeping every
+        // non-truecolour / non-combining screen byte-identical to its pinned digest
+        // while preserving strict `s1 == s2 <=> s1.serialize() == s2.serialize()`
+        // injectivity across all reachable and caller-constructed `Cell` values.
+        let inactive_has_ext = match &self.inactive {
+            Some(cells) => slice_has_ext_cells(cells),
+            None => false,
+        };
+        let saved_has_rgb = match self.saved_cursor {
+            Some(s) => pen_has_rgb(s.pen),
+            None => false,
+        };
+        let alt_saved_has_rgb = match self.alt_saved_cursor {
+            Some(s) => pen_has_rgb(s.pen),
+            None => false,
+        };
+        if pen_has_rgb(self.pen)
+            || saved_has_rgb
+            || alt_saved_has_rgb
+            || slice_has_ext_cells(&self.grid)
+            || inactive_has_ext
+        {
+            out.extend_from_slice(&[2]);
+            emit_opt_rgb(out, self.pen.fg_rgb);
+            emit_opt_rgb(out, self.pen.bg_rgb);
+            if let Some(s) = self.saved_cursor {
+                emit_opt_rgb(out, s.pen.fg_rgb);
+                emit_opt_rgb(out, s.pen.bg_rgb);
+            }
+            if let Some(s) = self.alt_saved_cursor {
+                emit_opt_rgb(out, s.pen.fg_rgb);
+                emit_opt_rgb(out, s.pen.bg_rgb);
+            }
+            emit_ext_cells(out, &self.grid);
+            if let Some(cells) = &self.inactive {
+                emit_ext_cells(out, cells);
+            }
+        }
+        // Tag-3 extension trailer for non-unit cell widths (`width != 1`, e.g. wide
+        // CJK/emoji lead `width = 2` and spacer `width = 0`): emitted ONLY when some
+        // cell carries `width != 1`, keeping every narrow screen byte-identical to its
+        // pinned digest while preserving strict `Eq <=> serialize()` injectivity.
+        let inactive_has_wide = match &self.inactive {
+            Some(cells) => slice_has_wide_cells(cells),
+            None => false,
+        };
+        if slice_has_wide_cells(&self.grid) || inactive_has_wide {
+            out.extend_from_slice(&[3]);
+            emit_wide_cells(out, &self.grid);
+            if let Some(cells) = &self.inactive {
+                emit_wide_cells(out, cells);
+            }
+        }
     }
 
     // --- internal mutators ------------------------------------------------
@@ -782,32 +1602,155 @@ impl Screen {
         }
     }
 
+    /// The column [`Cell::width`] of the cell at `(row, col)` (1 off the grid).
+    #[inline]
+    fn width_at(&self, row: u16, col: u16) -> u8 {
+        if col >= self.cols {
+            return 1;
+        }
+        match self.grid.get(self.idx(row, col)) {
+            Some(c) => c.width,
+            None => 1,
+        }
+    }
+
+    /// The cell a zero-width mark, or a glyph joining a cluster after a
+    /// `U+200D`, attaches to: the parked glyph under a pending wrap, else the
+    /// one left of the cursor (the cursor's own cell at column 0 or the left
+    /// margin), and a wide glyph's lead rather than its spacer.
+    fn active_base_col(&self) -> u16 {
+        let prev_col = if self.wrap_pending() {
+            self.grid_col()
+        } else if self.col != self.left && self.col > 0 {
+            self.col.saturating_sub(1)
+        } else {
+            self.col
+        };
+        if prev_col > 0 && self.width_at(self.row, prev_col) == 0 {
+            return prev_col.saturating_sub(1);
+        }
+        prev_col
+    }
+
+    /// The boundary before column `b` of row `row` is about to be cut by a
+    /// write, an erase or a shift: if a wide glyph straddles it (its spacer is
+    /// at `b`), blank both of its cells with the bce blank, so no half of it
+    /// survives (Ghostty's `splitCellBoundary`; xterm repairs the same
+    /// `DamagedCells` with `ClearCells`, which writes the current colours).
+    #[inline]
+    fn split_at(&mut self, row: u16, b: u16) {
+        if b == 0 || self.width_at(row, b) != 0 {
+            return;
+        }
+        let blank = self.bce_blank();
+        let i = self.idx(row, b);
+        if let Some(cells) = self.grid.get_mut(i.saturating_sub(1)..=i) {
+            cells.fill(blank);
+        }
+    }
+
+    /// A cell in the current pen: a glyph (`width` 1, or 2 for a wide one's
+    /// lead) or a wide glyph's spacer (`' '`, `width` 0).
+    const fn pen_cell(&self, ch: char, width: u8) -> Cell {
+        Cell {
+            ch,
+            fg: self.pen.fg,
+            bg: self.pen.bg,
+            fg_rgb: self.pen.fg_rgb,
+            bg_rgb: self.pen.bg_rgb,
+            attrs: self.pen.attrs,
+            combining: ['\0'; MAX_COMBINING],
+            combining_len: 0,
+            width,
+        }
+    }
+
     fn put(&mut self, ch: char) {
+        // Each codepoint measured alone; the clamp keeps a width the cells can
+        // hold (`wide_island`).
+        let width = wide_cell_width_clamp(char_display_width(ch) as u64, 2) as u8;
+        if width == 0 {
+            let target_col = self.active_base_col();
+            let i = self.idx(self.row, target_col);
+            if let Some(slot) = self.grid.get_mut(i) {
+                slot.push_combining(ch);
+            }
+            return;
+        }
+        // A glyph that continues the grapheme cluster before it attaches to
+        // that cell without advancing the cursor or resolving a pending wrap
+        // ([`joins_cluster`]).
+        if self.wrap_pending() || (self.col != self.left && self.col > 0) {
+            let base_idx = self.idx(self.row, self.active_base_col());
+            if let Some(base) = self.grid.get_mut(base_idx) {
+                if joins_cluster(base, ch) {
+                    base.push_combining(ch);
+                    return;
+                }
+            }
+        }
         // Deferred wrap: a pending wrap resolves on the next glyph.
         if self.wrap_pending() {
             self.wrap_line();
         }
+        let row = self.row;
+        if width == 2 && self.cols < 2 {
+            // A screen one column wide has no room for a wide glyph: it
+            // prints as a narrow space in the pen, as aterm and Ghostty print
+            // it (`printCell(0, .narrow)`). xterm's dotext gives up on the
+            // glyph, and on any narrow glyph it read with it in the same pass.
+            return self.put(' ');
+        }
+        if width == 2 && self.col >= self.line_end(self.col) {
+            // One column left before the line end: that column takes the bce
+            // blank and the glyph wraps onto the next line. xterm's dotext
+            // forces the wrap and leaves the column as it was; aterm, Ghostty
+            // (`spacer_head`) and Alacritty blank it.
+            let col = self.col;
+            self.split_at(row, col);
+            self.split_at(row, col.saturating_add(1));
+            let i = self.idx(row, col);
+            let blank = self.bce_blank();
+            if let Some(slot) = self.grid.get_mut(i) {
+                *slot = blank;
+            }
+            self.wrap_line();
+        }
+        let columns = width as u16;
         if self.insert {
-            // IRM: xterm's WriteText runs InsertChar before it writes, so
-            // the line shifts right under the glyph and what passes the right
-            // margin is lost. The shift's blank is overwritten at once, so
-            // its colour never shows.
-            self.insert_chars(1);
+            // IRM: xterm's WriteText runs InsertChar for the glyph's columns
+            // before it writes, so the line shifts right under the glyph and
+            // what passes the right margin is lost. The shift's blanks are
+            // overwritten at once, so their colour never shows.
+            self.insert_chars(columns);
         }
-        let i = self.idx(self.row, self.col);
+        let row = self.row;
+        let col = self.col;
+        let end = self.line_end(col);
+        // A wide glyph the write cuts into, on either side, goes whole.
+        self.split_at(row, col);
+        self.split_at(row, col.saturating_add(columns));
+        let i = self.idx(row, col);
+        let lead = self.pen_cell(ch, width);
         if let Some(slot) = self.grid.get_mut(i) {
-            *slot = Cell {
-                ch,
-                fg: self.pen.fg,
-                bg: self.pen.bg,
-                attrs: self.pen.attrs,
-            };
+            *slot = lead;
         }
-        // The next glyph goes to the right, or wraps once the line ends here.
-        if self.col >= self.line_end(self.col) {
-            self.set_wrap_at(self.col);
+        if width == 2 {
+            // The glyph fits: `col < end` here, so the spacer lands on `col + 1`.
+            let spacer_col = wide_spacer_col_clamp(col.saturating_add(1) as u64, end as u64) as u16;
+            let spacer = self.pen_cell(' ', 0);
+            let si = self.idx(row, spacer_col);
+            if let Some(slot) = self.grid.get_mut(si) {
+                *slot = spacer;
+            }
+        }
+        // The next glyph goes to the right, or wraps once the line ends at
+        // the glyph's last column.
+        let last = col.saturating_add(columns.saturating_sub(1));
+        if last >= end {
+            self.set_wrap_at(last);
         } else {
-            self.col = self.col.saturating_add(1);
+            self.col = last.saturating_add(1);
         }
     }
 
@@ -887,6 +1830,7 @@ impl Screen {
     /// outside the margins stay (xterm scrolls the rectangle). The scroll
     /// (`from == scroll_top`) and DL (`from == row`).
     fn shift_up(&mut self, from: u16, n: u16) {
+        self.split_margins(from);
         let bottom = self.scroll_bottom;
         let mut r = from;
         while r <= bottom {
@@ -909,6 +1853,7 @@ impl Screen {
     /// the margins stay. RI's reverse scroll (`from == scroll_top`) and IL
     /// (`from == row`).
     fn shift_down(&mut self, from: u16, n: u16) {
+        self.split_margins(from);
         let mut r = self.scroll_bottom;
         while r >= from {
             match r.checked_sub(n) {
@@ -919,6 +1864,45 @@ impl Screen {
                 break;
             }
             r = r.saturating_sub(1);
+        }
+    }
+
+    /// Before rows `[from, scroll_bottom]` move between left/right margins
+    /// narrower than the screen, every wide glyph straddling one of them, which
+    /// the move would split, becomes two narrow blanks that keep their
+    /// renditions, as Ghostty's `rowWillBeShifted` clears them (xterm leaves
+    /// the halves torn). Without such margins nothing straddles anything.
+    fn split_margins(&mut self, from: u16) {
+        if self.left == 0 && self.right >= self.cols.saturating_sub(1) {
+            return;
+        }
+        let (left, right) = (self.left, self.right);
+        let mut r = from;
+        while r <= self.scroll_bottom {
+            if left > 0 && self.width_at(r, left) == 0 {
+                self.unpair(r, left.saturating_sub(1));
+            }
+            if self.width_at(r, right) == 2 {
+                self.unpair(r, right);
+            }
+            if r == u16::MAX {
+                break;
+            }
+            r = r.saturating_add(1);
+        }
+    }
+
+    /// The wide glyph whose lead is at `(row, lead)` becomes two narrow blanks,
+    /// each cell keeping its colours and attributes.
+    fn unpair(&mut self, row: u16, lead: u16) {
+        let i = self.idx(row, lead);
+        if let Some(cells) = self.grid.get_mut(i..=i.saturating_add(1)) {
+            for cell in cells {
+                cell.ch = ' ';
+                cell.width = 1;
+                cell.combining = ['\0'; MAX_COMBINING];
+                cell.combining_len = 0;
+            }
         }
     }
 
@@ -939,13 +1923,21 @@ impl Screen {
     /// the wrap resets, `n` bce blanks open at the cursor and the rest of the
     /// line up to the right margin shifts right, what passes the margin
     /// lost. Outside the margins nothing changes, a pending wrap included
-    /// (xterm returns before its `ResetWrap`).
+    /// (xterm returns before its `ResetWrap`). A wide glyph the shift would
+    /// split goes whole first: one whose spacer is under the cursor, one whose
+    /// spacer would pass the right margin, and one straddling that margin
+    /// (xterm's `RepairInsertChar`; Ghostty's `insertBlanks`).
     fn insert_chars(&mut self, n: u16) {
         if !self.in_lr_margins(self.grid_col()) {
             return;
         }
         self.clear_pending_wrap();
-        let n = n.min(self.right.saturating_sub(self.col).saturating_add(1)) as usize;
+        let n16 = n.min(self.right.saturating_sub(self.col).saturating_add(1));
+        let row = self.row;
+        self.split_at(row, self.col);
+        self.split_at(row, self.right.saturating_sub(n16).saturating_add(1));
+        self.split_at(row, self.right.saturating_add(1));
+        let n = n16 as usize;
         let at = self.idx(self.row, self.col);
         let end = self
             .idx(self.row, self.right)
@@ -973,12 +1965,20 @@ impl Screen {
     /// the wrap resets, `n` cells go at the cursor, the rest of the line up
     /// to the right margin shifts left, and `n` bce blanks fill in at the
     /// margin. Outside the margins nothing changes, a pending wrap included.
+    /// A wide glyph the deletion would split goes whole first: at the cursor,
+    /// at the end of the deleted run and at the right margin (Ghostty's
+    /// `deleteChars`; xterm's `DamagedCurCells` repair).
     fn delete_chars(&mut self, n: u16) {
         if !self.in_lr_margins(self.grid_col()) {
             return;
         }
         self.clear_pending_wrap();
-        let n = n.min(self.right.saturating_sub(self.col).saturating_add(1)) as usize;
+        let n16 = n.min(self.right.saturating_sub(self.col).saturating_add(1));
+        let row = self.row;
+        self.split_at(row, self.col);
+        self.split_at(row, self.col.saturating_add(n16));
+        self.split_at(row, self.right.saturating_add(1));
+        let n = n16 as usize;
         let at = self.idx(self.row, self.col);
         let end = self
             .idx(self.row, self.right)
@@ -1003,10 +2003,16 @@ impl Screen {
     }
 
     /// ECH (xterm `do_erase_char` -> `ClearRight(n)`): `n` cells from the
-    /// cursor (the parked glyph, from a pending wrap) take the bce blank.
+    /// cursor (the parked glyph, from a pending wrap) take the bce blank, and
+    /// so does all of a wide glyph the run cuts into (xterm `ClearRight`'s
+    /// repair, Ghostty's `eraseChars`).
     fn erase_chars(&mut self, n: u16) {
         self.clear_pending_wrap();
-        let n = n.min(self.cols.saturating_sub(self.col)) as usize;
+        let n16 = n.min(self.cols.saturating_sub(self.col));
+        let row = self.row;
+        self.split_at(row, self.col);
+        self.split_at(row, self.col.saturating_add(n16));
+        let n = n16 as usize;
         let at = self.idx(self.row, self.col);
         self.fill(at, at.saturating_add(n));
     }
@@ -1246,6 +2252,19 @@ impl Screen {
         (at, at.saturating_add(1))
     }
 
+    /// An erase from the cursor to the end (`mode` 0) or from the start
+    /// through the cursor (1) on the cursor's row cuts the row at the
+    /// cursor: a wide glyph it cuts into is erased whole (xterm's
+    /// `ClearRight` and `ClearLeft` repair the `DamagedCurCells`).
+    fn split_for_erase(&mut self, mode: u16) {
+        let (row, col) = (self.row, self.col);
+        match mode {
+            0 => self.split_at(row, col),
+            1 => self.split_at(row, col.saturating_add(1)),
+            _ => {}
+        }
+    }
+
     fn erase_display(&mut self, mode: u16) {
         if mode > 2 {
             // `ED 3` erases saved lines, and there are none; any other
@@ -1254,6 +2273,7 @@ impl Screen {
             return;
         }
         self.clear_pending_wrap();
+        self.split_for_erase(mode);
         let (from_cursor, through_cursor) = self.erase_bounds();
         let last = self.grid.len();
         match mode {
@@ -1268,6 +2288,7 @@ impl Screen {
             return;
         }
         self.clear_pending_wrap();
+        self.split_for_erase(mode);
         let start = self.idx(self.row, 0);
         let end = start.saturating_add(self.cols as usize);
         let (from_cursor, through_cursor) = self.erase_bounds();
@@ -1279,14 +2300,20 @@ impl Screen {
     }
 
     /// An erased cell under background-colour-erase (`bce`): a space carrying the
-    /// **current SGR background**, so `ED`/`EL` after `\x1b[44m` paints blue, not a
-    /// hardcoded default blank. (Reverse-video bce is out of scope.)
+    /// **current SGR background** (including 24-bit `bg_rgb`), so `ED`/`EL` after
+    /// `\x1b[44m` or `\x1b[48;2;r;g;bm` paints that background, not a hardcoded
+    /// default blank. (Reverse-video bce is out of scope.)
     const fn bce_blank(&self) -> Cell {
         Cell {
             ch: ' ',
             fg: Color::Default,
             bg: self.pen.bg,
+            fg_rgb: None,
+            bg_rgb: self.pen.bg_rgb,
             attrs: 0,
+            combining: ['\0'; MAX_COMBINING],
+            combining_len: 0,
+            width: 1,
         }
     }
 
@@ -1299,7 +2326,7 @@ impl Screen {
     }
 
     /// Apply an SGR parameter list. `sub[i]` marks `params[i]` as a `:`
-    /// sub-parameter of the preceding parameter (`38:5:196`) rather than a
+    /// sub-parameter of the preceding parameter (`38:5:196`, `38:2::r:g:b`) rather than a
     /// `;`-separated parameter of its own; a colon group is handled as one unit so
     /// a sub-parameter is never re-dispatched as a top-level code.
     fn sgr(&mut self, params: &[u16], sub: &[bool]) {
@@ -1323,27 +2350,38 @@ impl Screen {
             match param {
                 0 => self.pen = Pen::reset(),
                 1 => self.pen.attrs |= attr::BOLD,
+                3 => self.pen.attrs |= attr::ITALIC,
                 4 => self.pen.attrs |= attr::UNDERLINE,
+                // xterm's CASE_SGR: 5 (slow) and 6 (rapid) both set BLINK.
+                5 | 6 => self.pen.attrs |= attr::BLINK,
                 7 => self.pen.attrs |= attr::REVERSE,
+                8 => self.pen.attrs |= attr::CONCEAL,
+                9 => self.pen.attrs |= attr::STRIKE,
+                // Double underline (xterm `ATR_DBL_UNDER`), modelled as underline.
+                21 => self.pen.attrs |= attr::UNDERLINE,
                 22 => self.pen.attrs &= !attr::BOLD,
+                23 => self.pen.attrs &= !attr::ITALIC,
                 24 => self.pen.attrs &= !attr::UNDERLINE,
+                25 => self.pen.attrs &= !attr::BLINK,
                 27 => self.pen.attrs &= !attr::REVERSE,
-                30..=37 => self.pen.fg = sgr_fg_std(param),
-                39 => self.pen.fg = Color::Default,
-                40..=47 => self.pen.bg = sgr_bg_std(param),
-                49 => self.pen.bg = Color::Default,
-                90..=97 => self.pen.fg = sgr_fg_bright(param),
-                100..=107 => self.pen.bg = sgr_bg_bright(param),
-                38 => {
-                    if let Some(c) = parse_extended(params, &mut i) {
-                        self.pen.fg = c;
-                    }
-                }
-                48 => {
-                    if let Some(c) = parse_extended(params, &mut i) {
-                        self.pen.bg = c;
-                    }
-                }
+                28 => self.pen.attrs &= !attr::CONCEAL,
+                29 => self.pen.attrs &= !attr::STRIKE,
+                30..=37 => self.pen.set_fg_color(sgr_fg_std(param)),
+                39 => self.pen.set_fg_color(Color::Default),
+                40..=47 => self.pen.set_bg_color(sgr_bg_std(param)),
+                49 => self.pen.set_bg_color(Color::Default),
+                90..=97 => self.pen.set_fg_color(sgr_fg_bright(param)),
+                100..=107 => self.pen.set_bg_color(sgr_bg_bright(param)),
+                38 => match parse_extended(params, &mut i) {
+                    Some(ExtendedColor::Palette(idx)) => self.pen.set_fg_color(Color::Indexed(idx)),
+                    Some(ExtendedColor::Rgb(r, g, b)) => self.pen.set_fg_rgb(r, g, b),
+                    None => {}
+                },
+                48 => match parse_extended(params, &mut i) {
+                    Some(ExtendedColor::Palette(idx)) => self.pen.set_bg_color(Color::Indexed(idx)),
+                    Some(ExtendedColor::Rgb(r, g, b)) => self.pen.set_bg_rgb(r, g, b),
+                    None => {}
+                },
                 _ => {}
             }
             i = i.saturating_add(1);
@@ -1364,16 +2402,16 @@ impl Screen {
                     self.pen.attrs |= attr::UNDERLINE;
                 }
             }
-            38 => {
-                if let Some(c) = parse_colon_colour(tail) {
-                    self.pen.fg = c;
-                }
-            }
-            48 => {
-                if let Some(c) = parse_colon_colour(tail) {
-                    self.pen.bg = c;
-                }
-            }
+            38 => match parse_colon_colour(tail) {
+                Some(ExtendedColor::Palette(idx)) => self.pen.set_fg_color(Color::Indexed(idx)),
+                Some(ExtendedColor::Rgb(r, g, b)) => self.pen.set_fg_rgb(r, g, b),
+                None => {}
+            },
+            48 => match parse_colon_colour(tail) {
+                Some(ExtendedColor::Palette(idx)) => self.pen.set_bg_color(Color::Indexed(idx)),
+                Some(ExtendedColor::Rgb(r, g, b)) => self.pen.set_bg_rgb(r, g, b),
+                None => {}
+            },
             _ => {} // 58 (underline colour) and any other sub-parameterised code
         }
     }
@@ -1604,6 +2642,7 @@ impl Screen {
         if let Some(other) = &self.inactive {
             self.inactive = Some(reflow(other, self.cols, self.rows, cols, rows));
         }
+        let edge_wrap = self.col >= self.cols;
         self.cols = cols;
         self.rows = rows;
         self.row = self.row.min(rows.saturating_sub(1));
@@ -1612,8 +2651,15 @@ impl Screen {
             // clipped to the new width.
             self.margin_wrap = false;
             self.set_wrap_at(self.col.min(cols.saturating_sub(1)));
-        } else {
+        } else if edge_wrap {
+            // A wrap pending at the edge (`col == cols`): its next write is
+            // the column after the glyph, which a widening has room for and a
+            // narrowing leaves waiting on the new edge.
             self.col = self.col.min(cols);
+        } else {
+            // The cursor's own cell, cut off by a narrowing: clamped onto the
+            // last column with no wrap, as xterm clamps it.
+            self.col = self.col.min(cols.saturating_sub(1));
         }
         // A resize invalidates the scrolling region and the left/right
         // margins: reset them to the full screen.
@@ -1837,8 +2883,107 @@ pub const fn decode_u32_le_bytes(raw: &[u8; 4]) -> u32 {
     (raw[0] as u32) | ((raw[1] as u32) << 8) | ((raw[2] as u32) << 16) | ((raw[3] as u32) << 24)
 }
 
+const fn pen_has_rgb(pen: Pen) -> bool {
+    pen.fg_rgb.is_some() || pen.bg_rgb.is_some()
+}
+
+const fn cell_has_ext(c: &Cell) -> bool {
+    c.fg_rgb.is_some()
+        || c.bg_rgb.is_some()
+        || c.combining_len != 0
+        || c.combining[0] != '\0'
+        || c.combining[1] != '\0'
+        || c.combining[2] != '\0'
+        || c.combining[3] != '\0'
+}
+
+fn slice_has_ext_cells(cells: &[Cell]) -> bool {
+    for c in cells {
+        if cell_has_ext(c) {
+            return true;
+        }
+    }
+    false
+}
+
+fn emit_opt_rgb<S: ByteSink>(out: &mut S, rgb: Option<(u8, u8, u8)>) {
+    match rgb {
+        None => out.extend_from_slice(&[0]),
+        Some((r, g, b)) => out.extend_from_slice(&[1, r, g, b]),
+    }
+}
+
+fn emit_ext_cells<S: ByteSink>(out: &mut S, cells: &[Cell]) {
+    let mut count = 0u32;
+    for c in cells {
+        if cell_has_ext(c) {
+            count = count.saturating_add(1);
+        }
+    }
+    out.extend_from_slice(&encode_u32_le_bytes(count));
+    for (idx, c) in cells.iter().enumerate() {
+        if cell_has_ext(c) {
+            out.extend_from_slice(&encode_u32_le_bytes(idx as u32));
+            emit_opt_rgb(out, c.fg_rgb);
+            emit_opt_rgb(out, c.bg_rgb);
+            out.extend_from_slice(&[c.combining_len]);
+            for &m in &c.combining {
+                out.extend_from_slice(&encode_u32_le_bytes(m as u32));
+            }
+        }
+    }
+}
+
+/// Whether glyph `ch` continues the grapheme cluster that `base`, the glyph
+/// before it, holds, as aterm joins one: a skin-tone modifier after a wide
+/// glyph (aterm asks for a wide emoji modifier base), the second regional
+/// indicator of a flag, and a glyph other than ASCII after an attached
+/// `\u{200D}` (Zero-Width Joiner).
+fn joins_cluster(base: &Cell, ch: char) -> bool {
+    (is_emoji_modifier(ch) && base.width == 2)
+        || (is_regional_indicator(ch)
+            && is_regional_indicator(base.ch)
+            && !base
+                .combining_marks()
+                .iter()
+                .any(|&m| is_regional_indicator(m)))
+        || (!ch.is_ascii() && base.last_combining() == Some('\u{200D}'))
+}
+
+fn slice_has_wide_cells(cells: &[Cell]) -> bool {
+    for c in cells {
+        if c.width != 1 {
+            return true;
+        }
+    }
+    false
+}
+
+fn emit_wide_cells<S: ByteSink>(out: &mut S, cells: &[Cell]) {
+    let mut count = 0u32;
+    for c in cells {
+        if c.width != 1 {
+            count = count.saturating_add(1);
+        }
+    }
+    out.extend_from_slice(&encode_u32_le_bytes(count));
+    for (idx, c) in cells.iter().enumerate() {
+        if c.width != 1 {
+            out.extend_from_slice(&encode_u32_le_bytes(idx as u32));
+            out.extend_from_slice(&[c.width]);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtendedColor {
+    Palette(u8),
+    Rgb(u8, u8, u8),
+}
+
 /// Clip/extend a grid into new dimensions, copying the overlapping top-left
-/// region. Does not reflow wrapped lines (a later rung).
+/// region and healing any wide character split by a narrower `new_cols` clip.
+/// Does not reflow wrapped lines (a later rung).
 fn reflow(old: &[Cell], old_cols: u16, old_rows: u16, new_cols: u16, new_rows: u16) -> Vec<Cell> {
     let new_cols = new_cols.clamp(1, MAX_DIM);
     let new_rows = new_rows.clamp(1, MAX_DIM);
@@ -1857,28 +3002,58 @@ fn reflow(old: &[Cell], old_cols: u16, old_rows: u16, new_cols: u16, new_rows: u
                 *dst = src;
             }
         }
+        // A wide glyph whose spacer the narrowing cut off goes whole: its
+        // lead on the new last column becomes a blank.
+        if new_cols < old_cols {
+            let last = (r as usize)
+                .saturating_mul(new_cols as usize)
+                .saturating_add(new_cols as usize)
+                .saturating_sub(1);
+            if let Some(cell) = g.get_mut(last) {
+                if cell.width == 2 {
+                    *cell = Cell::BLANK;
+                }
+            }
+        }
     }
     g
 }
 
 /// Parse the `;`-form extended colour selector after a `38`/`48` at `params[*i]`,
-/// advancing `i` past everything it consumed. `;5;n` selects a palette colour.
-/// Truecolour `;2;r;g;b` (and CMY `;3;c;m;y`, CMYK `;4;c;m;y;k`) are out of scope
-/// and select nothing, but are consumed *with* their sub-parameters — otherwise
-/// `r`, `g`, `b` would be re-dispatched as top-level codes (`0` resetting the
-/// pen, `1` setting bold, `30..37` recolouring). Any other selector consumes
-/// itself; a truncated form consumes what is there.
-fn parse_extended(params: &[u16], i: &mut usize) -> Option<Color> {
+/// advancing `i` past everything it consumed. `;5;n` selects a palette colour;
+/// `;2;r;g;b` selects a 24-bit RGB colour (or leaves the pen unchanged if truncated).
+/// CMY `;3;c;m;y` and CMYK `;4;c;m;y;k` are consumed *with* their sub-parameters
+/// and leave the pen unchanged; any other selector consumes itself.
+#[allow(clippy::manual_map)]
+fn parse_extended(params: &[u16], i: &mut usize) -> Option<ExtendedColor> {
     let last = params.len().saturating_sub(1);
     let i1 = i.saturating_add(1);
     let i2 = i.saturating_add(2);
     let (after_selector, colour) = match params.get(i1) {
         None => return None,
-        Some(5) => (
-            1usize,
-            params.get(i2).map(|n| Color::Indexed((*n).min(255) as u8)),
-        ),
-        Some(2) | Some(3) => (3, None),
+        Some(5) => {
+            let col = match params.get(i2) {
+                Some(&n) => Some(ExtendedColor::Palette(
+                    color_clamp_channel(n as u64, 255) as u8
+                )),
+                None => None,
+            };
+            (1usize, col)
+        }
+        Some(2) => {
+            let i3 = i.saturating_add(3);
+            let i4 = i.saturating_add(4);
+            let col = match (params.get(i2), params.get(i3), params.get(i4)) {
+                (Some(&r), Some(&g), Some(&b)) => Some(ExtendedColor::Rgb(
+                    color_clamp_channel(r as u64, 255) as u8,
+                    color_clamp_channel(g as u64, 255) as u8,
+                    color_clamp_channel(b as u64, 255) as u8,
+                )),
+                _ => None,
+            };
+            (3, col)
+        }
+        Some(3) => (3, None),
         Some(4) => (4, None),
         Some(_) => (0, None),
     };
@@ -1921,13 +3096,23 @@ const fn sgr_bg_bright(param: u16) -> Color {
 }
 
 /// The `:`-form colour sub-parameters after `38`/`48`: `5:n` selects a palette
-/// colour; `2:r:g:b` / `2:cs:r:g:b` (truecolour) select nothing.
-const fn parse_colon_colour(sub: &[u16]) -> Option<Color> {
-    match sub {
-        &[5, n, ..] => {
-            let clamped = if n < 255 { n } else { 255 };
-            Some(Color::Indexed(clamped as u8))
-        }
+/// colour; `2:cs:r:g:b` (ITU T.416 with optional colour-space id, including `2::r:g:b`)
+/// and `2:r:g:b` select a 24-bit RGB colour; truncated forms leave the pen unchanged.
+const fn parse_colon_colour(sub: &[u16]) -> Option<ExtendedColor> {
+    match *sub {
+        [5, n, ..] => Some(ExtendedColor::Palette(
+            color_clamp_channel(n as u64, 255) as u8
+        )),
+        [2, _cs, r, g, b, ..] => Some(ExtendedColor::Rgb(
+            color_clamp_channel(r as u64, 255) as u8,
+            color_clamp_channel(g as u64, 255) as u8,
+            color_clamp_channel(b as u64, 255) as u8,
+        )),
+        [2, r, g, b] => Some(ExtendedColor::Rgb(
+            color_clamp_channel(r as u64, 255) as u8,
+            color_clamp_channel(g as u64, 255) as u8,
+            color_clamp_channel(b as u64, 255) as u8,
+        )),
         _ => None,
     }
 }
@@ -2502,11 +3687,21 @@ impl Parser {
                 screen.sgr(vals, sub);
                 // Record the RESOLVED pen (after sgr ran), not the raw params —
                 // this is what kills the two-party terminfo-disagreement class.
-                self.rec(ScreenOp::SetSgr {
-                    fg: screen.pen.fg,
-                    bg: screen.pen.bg,
-                    attrs: screen.pen.attrs,
-                });
+                if screen.pen.fg_rgb.is_none() && screen.pen.bg_rgb.is_none() {
+                    self.rec(ScreenOp::SetSgr {
+                        fg: screen.pen.fg,
+                        bg: screen.pen.bg,
+                        attrs: screen.pen.attrs,
+                    });
+                } else {
+                    self.rec(ScreenOp::SetSgrRgb {
+                        fg: screen.pen.fg,
+                        fg_rgb: screen.pen.fg_rgb,
+                        bg: screen.pen.bg,
+                        bg_rgb: screen.pen.bg_rgb,
+                        attrs: screen.pen.attrs,
+                    });
+                }
             }
             b'h' | b'l' if self.marker == b'?' => {
                 let set = final_byte == b'h';
@@ -2605,52 +3800,132 @@ pub fn emit_ops(cols: u16, rows: u16, records: &[Record]) -> Vec<ScreenOp> {
     folder.parser.ops
 }
 
+const fn screen_op_group(op: &ScreenOp) -> u8 {
+    match op {
+        ScreenOp::Print(_)
+        | ScreenOp::CarriageReturn
+        | ScreenOp::LineFeed
+        | ScreenOp::Tab
+        | ScreenOp::Backspace
+        | ScreenOp::CursorUp(_)
+        | ScreenOp::CursorDown(_)
+        | ScreenOp::CursorForward(_)
+        | ScreenOp::CursorBack(_)
+        | ScreenOp::MoveTo(_, _) => 0,
+        ScreenOp::EraseDisplay(_)
+        | ScreenOp::EraseLine(_)
+        | ScreenOp::ReverseIndex
+        | ScreenOp::InsertChars(_)
+        | ScreenOp::DeleteChars(_)
+        | ScreenOp::EraseChars(_)
+        | ScreenOp::InsertLines(_)
+        | ScreenOp::DeleteLines(_)
+        | ScreenOp::ScrollUp(_)
+        | ScreenOp::ScrollDown(_) => 1,
+        ScreenOp::SetSgr { .. }
+        | ScreenOp::SetSgrRgb { .. }
+        | ScreenOp::SetMode { .. }
+        | ScreenOp::SaveCursor
+        | ScreenOp::RestoreCursor
+        | ScreenOp::SetScrollRegion { .. }
+        | ScreenOp::SetInsertMode(_)
+        | ScreenOp::SetNewlineMode(_)
+        | ScreenOp::Designate { .. }
+        | ScreenOp::LockShift { .. }
+        | ScreenOp::SetLeftRightMargins { .. }
+        | ScreenOp::Reset
+        | ScreenOp::Resize(_, _) => 2,
+    }
+}
+
+fn apply_op_cursor(screen: &mut Screen, op: &ScreenOp) {
+    match op {
+        ScreenOp::Print(ch) => screen.put(*ch),
+        ScreenOp::CarriageReturn => screen.carriage_return(),
+        ScreenOp::LineFeed => screen.line_feed(),
+        ScreenOp::Tab => screen.tab(),
+        ScreenOp::Backspace => screen.backspace(),
+        ScreenOp::CursorUp(n) => screen.cursor_up(*n),
+        ScreenOp::CursorDown(n) => screen.cursor_down(*n),
+        ScreenOp::CursorForward(n) => screen.cursor_forward(*n),
+        ScreenOp::CursorBack(n) => screen.cursor_back(*n),
+        ScreenOp::MoveTo(r, c) => screen.move_to(*r, *c),
+        _ => {}
+    }
+}
+
+fn apply_op_edit(screen: &mut Screen, op: &ScreenOp) {
+    match op {
+        ScreenOp::EraseDisplay(m) => screen.erase_display(*m),
+        ScreenOp::EraseLine(m) => screen.erase_line(*m),
+        ScreenOp::ReverseIndex => screen.reverse_index(),
+        ScreenOp::InsertChars(n) => screen.insert_chars(*n),
+        ScreenOp::DeleteChars(n) => screen.delete_chars(*n),
+        ScreenOp::EraseChars(n) => screen.erase_chars(*n),
+        ScreenOp::InsertLines(n) => screen.insert_lines(*n, true),
+        ScreenOp::DeleteLines(n) => screen.insert_lines(*n, false),
+        ScreenOp::ScrollUp(n) => screen.scroll_up_lines(*n),
+        ScreenOp::ScrollDown(n) => screen.scroll_down_lines(*n),
+        _ => {}
+    }
+}
+
+fn apply_op_style_or_mode(screen: &mut Screen, op: &ScreenOp) {
+    match op {
+        ScreenOp::SetSgr { fg, bg, attrs } => {
+            screen.pen = Pen {
+                fg: *fg,
+                bg: *bg,
+                fg_rgb: None,
+                bg_rgb: None,
+                attrs: *attrs,
+            };
+        }
+        ScreenOp::SetSgrRgb {
+            fg,
+            fg_rgb,
+            bg,
+            bg_rgb,
+            attrs,
+        } => {
+            screen.pen = Pen {
+                fg: *fg,
+                bg: *bg,
+                fg_rgb: *fg_rgb,
+                bg_rgb: *bg_rgb,
+                attrs: *attrs,
+            };
+        }
+        ScreenOp::SetMode { params, set } => screen.set_mode(params, *set),
+        ScreenOp::SaveCursor => screen.save_cursor(),
+        ScreenOp::RestoreCursor => screen.restore_cursor(),
+        ScreenOp::SetScrollRegion { top, bottom } => screen.set_scroll_region(*top, *bottom),
+        ScreenOp::SetInsertMode(set) => screen.insert = *set,
+        ScreenOp::SetNewlineMode(set) => screen.newline = *set,
+        ScreenOp::Designate { g1, charset } => screen.designate(*g1, *charset),
+        ScreenOp::LockShift { g1 } => screen.charsets.shifted = *g1,
+        ScreenOp::SetLeftRightMargins { left, right } => screen.set_lr_margins(*left, *right),
+        ScreenOp::Reset => screen.reset(),
+        ScreenOp::Resize(c, r) => screen.resize(*c, *r),
+        _ => {}
+    }
+}
+
+fn apply_one_op(screen: &mut Screen, op: &ScreenOp) {
+    match screen_op_group(op) {
+        0 => apply_op_cursor(screen, op),
+        1 => apply_op_edit(screen, op),
+        _ => apply_op_style_or_mode(screen, op),
+    }
+}
+
 /// Re-apply a screen-op slice onto an existing [`Screen`], re-driving the
 /// **same** private mutators from typed ops — an independent dispatch path that
 /// bypasses only the VT state machine. Enables incremental cross-machine
 /// viewers that decode [`ScreenOp`] batches off the bus record-by-record.
 pub fn apply_ops_to(screen: &mut Screen, ops: &[ScreenOp]) {
     for op in ops {
-        match op {
-            ScreenOp::Print(ch) => screen.put(*ch),
-            ScreenOp::CarriageReturn => screen.carriage_return(),
-            ScreenOp::LineFeed => screen.line_feed(),
-            ScreenOp::Tab => screen.tab(),
-            ScreenOp::Backspace => screen.backspace(),
-            ScreenOp::CursorUp(n) => screen.cursor_up(*n),
-            ScreenOp::CursorDown(n) => screen.cursor_down(*n),
-            ScreenOp::CursorForward(n) => screen.cursor_forward(*n),
-            ScreenOp::CursorBack(n) => screen.cursor_back(*n),
-            ScreenOp::MoveTo(r, c) => screen.move_to(*r, *c),
-            ScreenOp::EraseDisplay(m) => screen.erase_display(*m),
-            ScreenOp::EraseLine(m) => screen.erase_line(*m),
-            ScreenOp::SetSgr { fg, bg, attrs } => {
-                screen.pen = Pen {
-                    fg: *fg,
-                    bg: *bg,
-                    attrs: *attrs,
-                }
-            }
-            ScreenOp::SetMode { params, set } => screen.set_mode(params, *set),
-            ScreenOp::ReverseIndex => screen.reverse_index(),
-            ScreenOp::InsertChars(n) => screen.insert_chars(*n),
-            ScreenOp::DeleteChars(n) => screen.delete_chars(*n),
-            ScreenOp::EraseChars(n) => screen.erase_chars(*n),
-            ScreenOp::InsertLines(n) => screen.insert_lines(*n, true),
-            ScreenOp::DeleteLines(n) => screen.insert_lines(*n, false),
-            ScreenOp::SaveCursor => screen.save_cursor(),
-            ScreenOp::RestoreCursor => screen.restore_cursor(),
-            ScreenOp::SetScrollRegion { top, bottom } => screen.set_scroll_region(*top, *bottom),
-            ScreenOp::SetInsertMode(set) => screen.insert = *set,
-            ScreenOp::SetNewlineMode(set) => screen.newline = *set,
-            ScreenOp::Designate { g1, charset } => screen.designate(*g1, *charset),
-            ScreenOp::LockShift { g1 } => screen.charsets.shifted = *g1,
-            ScreenOp::SetLeftRightMargins { left, right } => screen.set_lr_margins(*left, *right),
-            ScreenOp::ScrollUp(n) => screen.scroll_up_lines(*n),
-            ScreenOp::ScrollDown(n) => screen.scroll_down_lines(*n),
-            ScreenOp::Reset => screen.reset(),
-            ScreenOp::Resize(c, r) => screen.resize(*c, *r),
-        }
+        apply_one_op(screen, op);
     }
 }
 

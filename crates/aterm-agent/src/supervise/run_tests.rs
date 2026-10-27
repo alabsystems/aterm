@@ -106,6 +106,15 @@ impl ServerLaunch {
     }
 }
 
+/// A `meta set` someone else makes while the loop waits ([`Mock::meta_writes`]).
+#[derive(Clone, Copy, Debug)]
+enum MetaWrite {
+    Autopilot(Option<&'static str>),
+    Questions(Option<&'static str>),
+    /// Not a write: the screens past the one shown move on from here ([`Mock::moves_held`]).
+    Moves,
+}
+
 struct Mock {
     requests: Vec<String>,
     replies: VecDeque<CtlReply>,
@@ -258,6 +267,20 @@ struct Mock {
     autopilot: Option<&'static str>,
     autopilot_at: Vec<(usize, Option<&'static str>)>,
     autopilot_on: BTreeMap<usize, Option<&'static str>>,
+    /// `meta` writes in time, each that long after the first wait that carried `autopilot=`
+    /// ([`Self::word_latch`]).
+    meta_writes: VecDeque<(Duration, MetaWrite)>,
+    /// When the first wait that carried `autopilot=` was asked.
+    rest_from: Option<Instant>,
+    /// Whether a wait that carries `autopilot=` never answers `OK autopilot` (a host that
+    /// ignores it), though [`Self::meta_writes`] still land while it waits.
+    word_deaf: bool,
+    /// Whether the screens past the one shown at rest wait for [`MetaWrite::Moves`].
+    moves_held: bool,
+    /// Whether the host's waits take `autopilot=<word>`; an older host's refuse it (`ERR usage`).
+    takes_word: bool,
+    /// When each `turn` was asked.
+    turn_times: Vec<Instant>,
     metas: usize,
     input: &'static str,
     input_after: Vec<(usize, &'static str)>,
@@ -713,6 +736,9 @@ struct LogWorld {
     closed: bool,
     /// `await log` is refused as an older build refuses the comma list (`ERR usage`).
     refused: bool,
+    /// `await log` carrying `autopilot=` is refused (`ERR usage`), as a build from before the log
+    /// wait took the token refuses it, though its other waits take it.
+    word_refused: bool,
     /// This many waits run out (`OK timeout`) with nothing past their cursor.
     timeouts: usize,
     /// This many `status` replies find the next frame a box the host has already drawn and
@@ -734,6 +760,8 @@ struct LogWorld {
     asked: Vec<String>,
     /// The `log_seq=` each `status` printed.
     heads: Vec<u64>,
+    /// The log's identity `status` prints (`log_base=`); `None`, an older host's, prints none.
+    base: Option<u32>,
 }
 
 impl LogWorld {
@@ -743,6 +771,7 @@ impl LogWorld {
             early: 0,
             closed: false,
             refused: false,
+            word_refused: false,
             timeouts: 0,
             races: 0,
             drawn: None,
@@ -752,6 +781,7 @@ impl LogWorld {
             slept: 0,
             asked: Vec::new(),
             heads: Vec::new(),
+            base: None,
         }
     }
 
@@ -813,10 +843,13 @@ impl Mock {
         }
         log.heads.push(log.seq);
         let turn = if running && !log.closed { "t1" } else { "-" };
+        let base = log
+            .base
+            .map_or_else(String::new, |b| format!(" log_base={b}"));
         (
             log.reader.unwrap_or_else(|| reader_word(phase)),
             format!(
-                " log_seq={} log_ep=1 run=r1 turn={turn} step=- need={need} need_since_ms=-",
+                " log_seq={} log_ep=1{base} run=r1 turn={turn} step=- need={need} need_since_ms=-",
                 log.seq
             ),
         )
@@ -857,6 +890,7 @@ impl Mock {
             log.closed = true;
             return log.answer("close t1 turn out=done by=vendor src=transcript conf=exact");
         }
+        let carried = tail.iter().find_map(|a| a.strip_prefix("autopilot="));
         let mut slept = 0;
         while self.served + 1 < self.screens.len()
             && !self.held()
@@ -865,6 +899,16 @@ impl Mock {
             self.served += 1;
             self.seq += 1;
             slept += 1;
+            // A switch of the word on a frame the wait sleeps through ([`Self::autopilot_on`]):
+            // the host's log wait carrying another word answers it, as its screen waits do.
+            if let Some(word) = self.autopilot_on.get(&self.served) {
+                self.autopilot = *word;
+                let stored = self.autopilot.unwrap_or("-");
+                if carried.is_some_and(|c| c != stored) {
+                    self.log.as_mut().expect("the log").slept += slept;
+                    return ok(&format!("OK autopilot {stored}\n"));
+                }
+            }
         }
         let next = (self.served < self.screens.len() && !self.held())
             .then(|| worker_phase(&self.screens[self.served]));
@@ -1033,6 +1077,12 @@ impl Mock {
             autopilot: None,
             autopilot_at: Vec::new(),
             autopilot_on: BTreeMap::new(),
+            meta_writes: VecDeque::new(),
+            rest_from: None,
+            word_deaf: false,
+            moves_held: false,
+            takes_word: false,
+            turn_times: Vec::new(),
             metas: 0,
             input: INPUT_CLEAR,
             input_after: Vec::new(),
@@ -1466,7 +1516,8 @@ impl Mock {
         format!("OK idle {seq}\n")
     }
     fn held(&self) -> bool {
-        self.unmoved_for().is_some()
+        self.moves_held && self.rest_from.is_some()
+            || self.unmoved_for().is_some()
             || self
                 .turn_releases
                 .is_some_and(|i| self.served == i + 1 && !self.turned)
@@ -1656,6 +1707,58 @@ impl Mock {
             }
         }
         timeout()
+    }
+    /// THE WORD EDGE's server side (v6 §14.10): a wait carrying `autopilot=<carried>` answers
+    /// `OK autopilot <stored>` at once where the stored word is another, and parks through each
+    /// write [`Self::meta_writes`] places inside its timeout, answering so where a write leaves the
+    /// word other than `carried`; `None` lets the wait's own arm answer.
+    fn word_latch(&mut self, carried: &str, tail: &[&str]) -> Option<CtlReply> {
+        let asked = tail
+            .iter()
+            .position(|a| *a == "timeout")
+            .and_then(|i| tail.get(i + 1))
+            .and_then(|ms| ms.parse::<u64>().ok())
+            .map_or(Duration::ZERO, Duration::from_millis);
+        let asked_at = run_now(self.waits.as_deref());
+        // The writes' clock starts at the first wait carrying the word at rest: one inside the
+        // agent's turn carries it too ([`Session::busy_wait`]), and so does a settle's `idle`,
+        // which the screen answers before any write; those answer only a word stored otherwise.
+        let settles = tail.first() == Some(&"idle");
+        let from = match self.rest_from {
+            Some(from) if !settles => from,
+            None if !settles && worker_phase(self.last_served()) != Phase::Busy => {
+                *self.rest_from.insert(asked_at)
+            }
+            _ => {
+                let stored = self.autopilot.unwrap_or("-");
+                return (stored != carried && !self.word_deaf)
+                    .then(|| ok(&format!("OK autopilot {stored}\n")));
+            }
+        };
+        loop {
+            let stored = self.autopilot.unwrap_or("-");
+            if stored != carried && !self.word_deaf {
+                return Some(ok(&format!("OK autopilot {stored}\n")));
+            }
+            let &(after, write) = self.meta_writes.front()?;
+            let now = run_now(self.waits.as_deref());
+            if from + after > asked_at + asked {
+                return None;
+            }
+            run_nap(
+                self.waits.as_deref(),
+                (from + after).saturating_duration_since(now),
+            );
+            self.meta_writes.pop_front();
+            match write {
+                MetaWrite::Autopilot(word) => self.autopilot = word,
+                MetaWrite::Questions(word) => self.questions = word,
+                MetaWrite::Moves => {
+                    self.moves_held = false;
+                    return None;
+                }
+            }
+        }
     }
     fn presses(&self) -> Vec<&String> {
         self.requests
@@ -2312,6 +2415,7 @@ impl Mock {
             self.turned = true;
             self.turns += 1;
             self.turns_served.push(self.served);
+            self.turn_times.push(run_now(self.waits.as_deref()));
         }
         if verb == "await"
             && tail.first() == Some(&"idle")
@@ -2334,6 +2438,18 @@ impl Mock {
             .and_then(VecDeque::pop_front)
         {
             return Ok(r);
+        }
+        if verb == "await"
+            && let Some(carried) = tail.iter().find_map(|a| a.strip_prefix("autopilot="))
+        {
+            let log_refuses =
+                tail.first() == Some(&"log") && self.log.as_ref().is_some_and(|l| l.word_refused);
+            if !self.takes_word || log_refuses {
+                return Ok(usage(&format!("await {} [timeout <ms>]", tail[0])));
+            }
+            if let Some(r) = self.word_latch(carried, tail) {
+                return Ok(r);
+            }
         }
         match verb {
             "turn" => Ok(ok(&format!(
@@ -8072,8 +8188,14 @@ fn rules_file(tag: &str) -> (PathBuf, PathBuf) {
         .expect("write");
     (dir, path)
 }
-const RULES_CONTINUATION: &str = "keep going (standing rules: Standing rules: 1. run nothing \
-                                  heavy while ~/ay-machine-busy exists 2. report counts)";
+/// A limit's resume past its measured clearing ([`cleared_text`]).
+const CLEARED: &str = super::super::policy::turn_end::cleared_text(
+    super::super::policy::turn_end::Cleared::UsageLimit,
+    super::super::policy::turn_end::Clearing::Measured,
+);
+const RULES_CONTINUATION: &str = "[aterm harness] The usage limit has cleared; continue where you \
+                                  stopped. (standing rules: Standing rules: 1. run nothing heavy \
+                                  while ~/ay-machine-busy exists 2. report counts)";
 fn continue_request(text: &str) -> String {
     format!(
         "turn submit=guarded:{} idle=600 timeout=2500 yield=0.2 {text}",
@@ -8879,7 +9001,10 @@ fn at_the_reset_one_continuation_goes_with_the_rules_and_the_answer_closes_the_e
         [
             format!("EVENT limited seq=102 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
             format!("EXTEND until=2026-09-19T18:10:00Z reset={WEEKLY_RESET}"),
-            format!("CONTINUED seq=102 rule=usage-resume@v1 {RULES_CONTINUATION}"),
+            format!(
+                "CONTINUED seq=102 rule=usage-resume@v1 {}",
+                clip(RULES_CONTINUATION)
+            ),
             format!("EVENT idle seq=104 {ANSWER}"),
             "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)".to_string(),
         ]
@@ -8940,7 +9065,7 @@ fn the_screen_leaving_the_notice_is_continued_at_once() {
         weekly_limited(),
         switched(),
         busy_screen(),
-        answered("keep going"),
+        answered(CLEARED),
     ]);
     m.vanish_after = Some(2);
     m.turn_releases = Some(2);
@@ -8953,12 +9078,12 @@ fn the_screen_leaving_the_notice_is_continued_at_once() {
     assert!(lines[1].starts_with("EVENT idle seq=103 "), "{lines:#?}");
     assert_eq!(
         lines[2],
-        "CONTINUED seq=103 rule=usage-resume@v1 keep going"
+        format!("CONTINUED seq=103 rule=usage-resume@v1 {CLEARED}")
     );
     assert_eq!(lines[3], format!("EVENT idle seq=105 {ANSWER}"));
     assert!(lines[4].starts_with("EXIT session gone"), "{lines:#?}");
     assert_eq!(count(&m, "turn"), 1);
-    assert!(m.requests.contains(&continue_request("keep going")));
+    assert!(m.requests.contains(&continue_request(CLEARED)));
     assert_eq!(count(&m, "meta set attention"), 0, "{:?}", m.requests);
     assert!(!lines.iter().any(|l| l.starts_with("EXTEND")), "{lines:?}");
 }
@@ -9039,7 +9164,7 @@ fn the_notice_again_after_a_continuation_is_the_same_episode_and_backs_off() {
         [
             format!("EVENT limited seq=102 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
             format!("EXTEND until=2026-09-19T18:10:00Z reset={WEEKLY_RESET}"),
-            "CONTINUED seq=102 rule=usage-resume@v1 keep going".to_string(),
+            format!("CONTINUED seq=102 rule=usage-resume@v1 {CLEARED}"),
             format!("EVENT limited seq=104 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
             "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)".to_string(),
         ]

@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `agh policy check` (design §6.3): agh.toml against L1–L10, every fault at once.
+//! `agh policy check` (design §6.3): agh.toml against L1–L10, every fault at once, and with no
+//! agh.toml, the vault's adopted rows (design §6.10).
 
 use std::path::{Path, PathBuf};
 
@@ -14,9 +15,13 @@ use super::{Answer, Ctx, Outcome, Receipt};
 use crate::config::{self, CONFIG_FILE, ConfigFault, Counts};
 use crate::error::{Error, Kind, Result};
 use crate::identity::tilde;
+use crate::identity::vault::{self, Found};
 use crate::redact::Redactor;
 
-/// `agh policy check [--config PATH]`.
+/// `agh policy check [--config PATH]`. Its report's `adopted` lists the vault's tokens when
+/// agh.toml is absent or says `vault = true` and no `--config` was given (else it is empty),
+/// and their rows' faults, and a `file` fault for each vault token that is unusable, join
+/// `faults`.
 /// # Errors
 /// Usage for a `--config` path with no file name (such as `/` or `..`), or a `~/` one with no
 /// home directory; CouldNotRun when the platform names no config directory and no `--config`
@@ -56,31 +61,138 @@ pub(crate) fn policy_check(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         },
     };
     let agh_dir = ctx.dirs.as_ref().map(|dirs| dirs.config.as_path());
-    let (present, counts, faults) = judge(&dir, &name, &home, agh_dir);
-    let value = report(
+    let (present, counts, mut faults) = judge(&dir, &name, &home, agh_dir);
+    let adoption = match (&ctx.dirs, inv.flag("--config")) {
+        (Some(dirs), None) => vault::view(dirs, &*ctx.env),
+        _ => None,
+    };
+    let adopted = adoption
+        .as_ref()
+        .map(|adoption| {
+            faults.extend_from_slice(adoption.faults());
+            faults.extend(unusable_faults(adoption, &home));
+            adopted_rows(adoption, &home, &ctx.redactor)
+        })
+        .unwrap_or_default();
+    let mut value = report(
         &tilde(&dir.join(&name), &home),
         counts,
         &faults,
         present,
         &ctx.redactor,
     );
+    if let Some(object) = value.as_object_mut() {
+        object.insert("adopted".into(), Value::Array(adopted));
+    }
     let answer = if faults.is_empty() {
         Answer::Object {
             noun: Noun::Policy,
             value,
         }
     } else {
-        let error = Error::new(
-            Kind::Invalid,
-            format!("agh.toml breaks {} rule(s)", faults.len()),
-        )
-        .with_next("fix the rows named in faults");
+        let what = if present {
+            "agh.toml breaks"
+        } else {
+            "the vault's adopted rows break"
+        };
+        let next = if present {
+            None
+        } else {
+            adoption.as_ref().and_then(vault::Adoption::next_step)
+        };
+        let error = Error::new(Kind::Invalid, format!("{what} {} rule(s)", faults.len()))
+            .with_next(next.unwrap_or_else(|| "fix the rows named in faults".to_string()));
         Answer::FailedWith { value, error }
     };
     Ok(Outcome {
         answer,
         receipt: Receipt::new(&inv.verb_name()),
     })
+}
+
+/// A `file` fault for each vault token adoption cannot use because its file fails the
+/// private-file or token rules, with its remedy: a token that would route is never quietly
+/// left out (design §6.2).
+fn unusable_faults(adoption: &vault::Adoption, home: &Path) -> Vec<ConfigFault> {
+    adoption
+        .vaulted()
+        .iter()
+        .filter_map(|vaulted| match &vaulted.found {
+            Found::Unusable { slug, why, remedy } => Some(ConfigFault {
+                rule: "file",
+                what: format!(
+                    "vault token {} ({}) is not used: {slug}: {why}{}",
+                    vaulted.slot.profile(),
+                    tilde(&vaulted.token_file, home),
+                    remedy
+                        .as_deref()
+                        .map_or_else(String::new, |r| format!("; remedy: {r}"))
+                ),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One row per vault token found with no agh.toml (design §6.10), as the record and the files
+/// stand (`vault::view`: nothing is asked of GitHub): its profile, tier, file, the owner and
+/// login it routes as once adopted, and its state, `adopted`, `pending` (its login is learned
+/// on the next call that routes), `rotated` (the file holds another token than the one
+/// recorded: the next call that routes learns its login again, and refuses it if the login
+/// changed), `unusable` (with why and the remedy), `faulted` (its rows break a rule beside the
+/// others, with the step that fixes the cause) or `changed`.
+fn adopted_rows(adoption: &vault::Adoption, home: &Path, redactor: &Redactor) -> Vec<Value> {
+    let text = |s: &str| Value::from(redactor.apply(s));
+    adoption
+        .vaulted()
+        .iter()
+        .filter_map(|vaulted| {
+            let (state, login, why, remedy) = match &vaulted.found {
+                Found::Absent => return None,
+                Found::Adopted { login, .. } => ("adopted", Some(login.as_str()), None, None),
+                Found::Unlearned { why, rotated, .. } => (
+                    if *rotated { "rotated" } else { "pending" },
+                    None,
+                    Some(why.clone()),
+                    vaulted.next(),
+                ),
+                Found::Unusable { slug, why, remedy } => (
+                    "unusable",
+                    None,
+                    Some(format!("{slug}: {why}")),
+                    remedy.clone(),
+                ),
+                Found::Faulted {
+                    login, why, next, ..
+                } => (
+                    "faulted",
+                    login.as_deref(),
+                    Some(why.clone()),
+                    Some(next.clone()),
+                ),
+                Found::Changed { adopted, now, .. } => (
+                    "changed",
+                    Some(adopted.as_str()),
+                    Some(format!("adopted as {adopted}, GitHub now says {now}")),
+                    None,
+                ),
+            };
+            let owner = match (vaulted.slot, login) {
+                (vault::Slot::Release, _) => Some(aterm_types::channel::PUBLIC_OWNER),
+                (vault::Slot::Dev, login) => login,
+            };
+            let mut row = Map::new();
+            row.insert("login".into(), login.map_or(Value::Null, text));
+            row.insert("owner".into(), owner.map_or(Value::Null, text));
+            row.insert("profile".into(), Value::from(vaulted.slot.profile()));
+            row.insert("remedy".into(), remedy.as_deref().map_or(Value::Null, text));
+            row.insert("state".into(), Value::from(state));
+            row.insert("tier".into(), Value::from(vaulted.slot.tier().slug()));
+            row.insert("token_file".into(), text(&tilde(&vaulted.token_file, home)));
+            row.insert("why".into(), why.as_deref().map_or(Value::Null, text));
+            Some(Value::Object(row))
+        })
+        .collect()
 }
 
 /// `dir`, with a relative one that starts with neither `.` nor `..` written `./{dir}`, so that
@@ -94,7 +206,8 @@ fn relative_shown(dir: &Path) -> PathBuf {
 }
 
 /// `{"config","counts":{"owners","profiles","targets"},"faults":[{"rule","what"}],"ok",
-/// "present"}`. The path and each `what` pass `redactor`, as the error lines do (design §6.6):
+/// "present"}`, to which `policy_check` adds `adopted`. The path and each `what` pass `redactor`,
+/// as the error lines do (design §6.6):
 /// stdout gets no string the Redactor did not see.
 fn report(
     shown: &str,

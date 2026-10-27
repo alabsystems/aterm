@@ -14,14 +14,21 @@ pub fn account_recovery_policy_model() -> Model {
             const Buggy = 0;
             var phase = 0; var provider = 1; var case = 1; var recovered = 0;
             action AnotherProvider when (phase == 0 && provider <= 3) { provider = provider + 1; }
-            action AnotherCase when (phase == 0 && case <= 25) { case = case + 1; }
+            action AnotherCase when (phase == 0 && case <= 29) { case = case + 1; }
             action Choose when (phase == 0) { phase = 1; }
             action Recover when (phase == 1) {
                 phase = 2;
-                recovered = if case == 1 || case == 9 || case == 19 || case == 20 || case == 22 {
+                recovered = if case == 27 || case == 28 || case == 29 {
+                    if provider == 4 {
+                        if (case == 27 && Buggy == 27) || (case == 28 && Buggy == 28)
+                            || (case == 29 && Buggy == 31) {1} else {0}
+                    } else {
+                        if (case == 27 && Buggy == 29) || (case == 28 && Buggy == 30) {0} else {1}
+                    }
+                } else if case == 1 || case == 9 || case == 19 || case == 20 || case == 22 || case == 30 {
                     if (case == 1 && Buggy == 8) || (case == 9 && Buggy == 9)
                         || (case == 19 && Buggy == 19) || (case == 20 && Buggy == 20)
-                        || (case == 22 && Buggy == 22) {0} else {1} }
+                        || (case == 22 && Buggy == 22) || (case == 30 && Buggy == 32) {0} else {1} }
                     else if (case == 2 && Buggy == 1) || (case == 3 && Buggy == 2)
                         || (case == 4 && Buggy == 3) || (case == 5 && Buggy == 4)
                         || (case == 6 && Buggy == 5) || (case == 7 && Buggy == 6)
@@ -35,10 +42,12 @@ pub fn account_recovery_policy_model() -> Model {
                         || (case == 25 && Buggy == 25) || (case == 26 && Buggy == 26) {1} else {0};
             }
             invariant AdmissibleRecoveryOnly: phase <= 1 || recovered == 0
-                || case == 1 || case == 9 || case == 19 || case == 20 || case == 22;
+                || case == 1 || case == 9 || case == 19 || case == 20 || case == 22 || case == 30
+                || ((case == 27 || case == 28 || case == 29) && provider <= 3);
             invariant AdmissibleRecoverySucceeds: phase <= 1
                 || (case > 1 && case <= 8) || (case > 9 && case <= 18)
-                || case == 21 || case > 22
+                || case == 21 || (case > 22 && case <= 26)
+                || ((case == 27 || case == 28 || case == 29) && provider == 4)
                 || recovered == 1;
         }
     }

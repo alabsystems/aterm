@@ -1,0 +1,73 @@
+# aterm Windows lane UIA record (WIN-UIA): aarch64 (native), a windowed aterm-gui as .NET's UIAutomationClient sees it
+# = compared exactly by the replay; ~ measured, shown when it moves
+# replay: targo --unverified lab windows uia --arch aarch64 (add --record to rewrite this file)
+= event.type event TextChanged ControlType.Document "aterm terminal" | event TextSelectionChanged ControlType.Document "aterm terminal" | property Value ControlType.Document "aterm terminal"
+= event.blur none
+= event.focus focus ControlType.Document "aterm terminal"
+= event.tab event TextChanged ControlType.Document "aterm terminal" | event TextSelectionChanged ControlType.Document "aterm terminal" | property IsSelected ControlType.TabItem "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" | property IsSelected ControlType.TabItem "aterm" | property Name ControlType.TabItem "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" | property Name ControlType.TitleBar "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" | property Name ControlType.TitleBar "aterm" | property Name ControlType.Window "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" | property Name ControlType.Window "aterm" | property Value ControlType.Document "aterm terminal" | structure ChildrenInvalidated ControlType.Window "aterm"
+= event.find event TextChanged ControlType.Document "aterm terminal" | event TextChanged ControlType.Edit "Find" | event TextSelectionChanged ControlType.Document "aterm terminal" | event TextSelectionChanged ControlType.Edit "Find" | focus ControlType.Edit "Find" | property HelpText ControlType.Edit "Find" | property Name ControlType.TitleBar "aterm — find: UIA-42 (1/1)" | property Name ControlType.TitleBar "aterm — find:" | property Name ControlType.Window "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" | property Value ControlType.Document "aterm terminal" | property Value ControlType.Edit "Find" | structure ChildrenInvalidated ControlType.Window "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+~ event.start none
+~ event.start.count none
+~ event.type.count 26x event TextChanged ControlType.Document "aterm terminal" | 80x event TextSelectionChanged ControlType.Document "aterm terminal" | 52x property Value ControlType.Document "aterm terminal"
+~ event.blur.count none
+~ event.focus.count 1x focus ControlType.Document "aterm terminal"
+~ event.tab.count 3x event TextChanged ControlType.Document "aterm terminal" | 3x event TextSelectionChanged ControlType.Document "aterm terminal" | 1x property IsSelected ControlType.TabItem "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" | 1x property IsSelected ControlType.TabItem "aterm" | 1x property Name ControlType.TabItem "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" | 1x property Name ControlType.TitleBar "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" | 1x property Name ControlType.TitleBar "aterm" | 2x property Name ControlType.Window "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" | 2x property Name ControlType.Window "aterm" | 10x property Value ControlType.Document "aterm terminal" | 1x structure ChildrenInvalidated ControlType.Window "aterm"
+~ event.find.count 2x event TextChanged ControlType.Document "aterm terminal" | 1x event TextChanged ControlType.Edit "Find" | 1x event TextSelectionChanged ControlType.Document "aterm terminal" | 1x event TextSelectionChanged ControlType.Edit "Find" | 1x focus ControlType.Edit "Find" | 1x property HelpText ControlType.Edit "Find" | 1x property Name ControlType.TitleBar "aterm — find: UIA-42 (1/1)" | 1x property Name ControlType.TitleBar "aterm — find:" | 2x property Name ControlType.Window "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" | 8x property Value ControlType.Document "aterm terminal" | 2x property Value ControlType.Edit "Find" | 1x structure ChildrenInvalidated ControlType.Window "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+= tree.0 ControlType.Window Name="C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" AutomationId="" ClassName="aterm" FrameworkId="aterm" HelpText="" LocalizedControlType="window" IsEnabled=1 IsOffscreen=0 IsKeyboardFocusable=0 HasKeyboardFocus=0 IsControlElement=1 IsContentElement=1 IsPassword=0 BoundingRectangle=-8,-31,760x641 patterns=Transform,Window
+= tree.0.0 ControlType.TitleBar Name="aterm — find: UIA-42 (1/1)" AutomationId="TitleBar" ClassName="" FrameworkId="Win32" HelpText="" LocalizedControlType="title bar" IsEnabled=1 IsOffscreen=0 IsKeyboardFocusable=0 HasKeyboardFocus=0 IsControlElement=1 IsContentElement=0 IsPassword=0 BoundingRectangle=0,-23,744x23 patterns=
+= tree.0.0.0 ControlType.MenuBar Name="System Menu Bar" AutomationId="SystemMenuBar" ClassName="" FrameworkId="Win32" HelpText="" LocalizedControlType="menu bar" IsEnabled=1 IsOffscreen=0 IsKeyboardFocusable=1 HasKeyboardFocus=1 IsControlElement=1 IsContentElement=0 IsPassword=0 BoundingRectangle=0,-23,22x22 patterns=
+= tree.0.0.0.0 ControlType.MenuItem Name="System" AutomationId="Item 1" ClassName="" FrameworkId="Win32" HelpText="" LocalizedControlType="menu item" IsEnabled=1 IsOffscreen=0 IsKeyboardFocusable=1 HasKeyboardFocus=0 IsControlElement=1 IsContentElement=1 IsPassword=0 BoundingRectangle=0,-23,22x22 patterns=ExpandCollapse
+= tree.0.0.1 ControlType.Button Name="Minimize" AutomationId="Minimize" ClassName="" FrameworkId="Win32" HelpText="" LocalizedControlType="button" IsEnabled=1 IsOffscreen=0 IsKeyboardFocusable=0 HasKeyboardFocus=0 IsControlElement=1 IsContentElement=0 IsPassword=0 BoundingRectangle=605,-30,47x30 patterns=Invoke
+= tree.0.0.2 ControlType.Button Name="Maximize" AutomationId="Maximize" ClassName="" FrameworkId="Win32" HelpText="" LocalizedControlType="button" IsEnabled=1 IsOffscreen=0 IsKeyboardFocusable=0 HasKeyboardFocus=0 IsControlElement=1 IsContentElement=0 IsPassword=0 BoundingRectangle=652,-30,46x30 patterns=Invoke
+= tree.0.0.3 ControlType.Button Name="Close" AutomationId="Close" ClassName="" FrameworkId="Win32" HelpText="" LocalizedControlType="button" IsEnabled=1 IsOffscreen=0 IsKeyboardFocusable=0 HasKeyboardFocus=0 IsControlElement=1 IsContentElement=0 IsPassword=0 BoundingRectangle=698,-30,47x30 patterns=Invoke
+= tree.0.1 ControlType.Tab Name="Tabs" AutomationId="" ClassName="" FrameworkId="aterm" HelpText="" LocalizedControlType="tab" IsEnabled=1 IsOffscreen=0 IsKeyboardFocusable=0 HasKeyboardFocus=0 IsControlElement=1 IsContentElement=1 IsPassword=0 BoundingRectangle=12,15,720x23 patterns=Selection
+= pattern.0.1.selection multiple=0 required=0 selected=[ControlType.TabItem "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"]
+= tree.0.1.0 ControlType.TabItem Name="C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" AutomationId="" ClassName="" FrameworkId="aterm" HelpText="" LocalizedControlType="tab item" IsEnabled=1 IsOffscreen=0 IsKeyboardFocusable=1 HasKeyboardFocus=0 IsControlElement=1 IsContentElement=1 IsPassword=0 BoundingRectangle=12,15,396x23 patterns=SelectionItem
+= pattern.0.1.0.selectionitem 1 container=ControlType.Tab "Tabs"
+= tree.0.1.1 ControlType.TabItem Name="aterm" AutomationId="" ClassName="" FrameworkId="aterm" HelpText="" LocalizedControlType="tab item" IsEnabled=1 IsOffscreen=0 IsKeyboardFocusable=1 HasKeyboardFocus=0 IsControlElement=1 IsContentElement=1 IsPassword=0 BoundingRectangle=408,15,243x23 patterns=SelectionItem
+= pattern.0.1.1.selectionitem 0 container=ControlType.Tab "Tabs"
+= tree.0.2 ControlType.Edit Name="Find" AutomationId="" ClassName="" FrameworkId="aterm" HelpText="match 1 of 1" LocalizedControlType="edit" IsEnabled=1 IsOffscreen=0 IsKeyboardFocusable=1 HasKeyboardFocus=1 IsControlElement=1 IsContentElement=1 IsPassword=0 BoundingRectangle=empty patterns=Text,Value
+= pattern.0.2.value "UIA-42" readonly=1
+= pattern.0.2.text selection=None length=6 "UIA-42"
+= pattern.0.2.text.enclosing ControlType.Edit "Find"
+= pattern.0.2.text.children 0
+= pattern.0.2.text.attribute.IsReadOnlyAttribute 1
+= pattern.0.2.text.attribute.IsHiddenAttribute 0
+= pattern.0.2.text.attribute.FontNameAttribute ns
+= pattern.0.2.text.find-readonly 0..6 "UIA-42"
+= pattern.0.2.text.selected.0 6..6 ""
+= pattern.0.2.text.visible.0 0..6 "UIA-42"
+= pattern.0.2.text.caret.Character 5..6 "2" rects=[]
+= pattern.0.2.text.caret.Word 0..6 "UIA-42" rects=[]
+= pattern.0.2.text.caret.Line 0..6 "UIA-42" rects=[]
+= pattern.0.2.text.caret.Paragraph 0..6 "UIA-42" rects=[]
+= pattern.0.2.text.caret.Document 0..6 "UIA-42" rects=[]
+= pattern.0.2.text.move3.Character 3 3..3 ""; end+3 3 0..3 "UIA"
+= pattern.0.2.text.move3.Word 1 6..6 ""; end+3 1 0..6 "UIA-42"
+= pattern.0.2.text.move3.Line 1 6..6 ""; end+3 1 0..6 "UIA-42"
+= pattern.0.2.text.move3.Paragraph 1 6..6 ""; end+3 1 0..6 "UIA-42"
+= pattern.0.2.text.find 0..6 "UIA-42" rects=[]
+= pattern.0.2.text.find-back-nocase 0..6 "UIA-42"
+= tree.0.3 ControlType.Document Name="aterm terminal" AutomationId="" ClassName="" FrameworkId="aterm" HelpText="" LocalizedControlType="document" IsEnabled=1 IsOffscreen=0 IsKeyboardFocusable=0 HasKeyboardFocus=0 IsControlElement=1 IsContentElement=1 IsPassword=0 BoundingRectangle=12,38,720x552 patterns=Text
+= pattern.0.3.text selection=None length=244 "PS C:\\Users\\lane> Write-Output ('UIA-' + 6*7)\nUIA-42\nPS C:\\Users\\lane>\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n  Find: UIA-42                                Aa   .*            1/1  ↑  ↓  ✕\n  F3 next  Shift+F3 prev  Alt+C case  Alt+R regex  Enter accept  Esc cancel\n"
+= pattern.0.3.text.enclosing ControlType.Document "aterm terminal"
+= pattern.0.3.text.children 0
+= pattern.0.3.text.attribute.IsReadOnlyAttribute 1
+= pattern.0.3.text.attribute.IsHiddenAttribute 0
+= pattern.0.3.text.attribute.FontNameAttribute ns
+= pattern.0.3.text.find-readonly 0..244 "PS C:\\Users\\lane> Write-Output ('UIA-' + 6*7)\nUIA-42\nPS C:\\Users\\lane>\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n  Find: UIA-42                                Aa   .*            1/1  ↑  ↓  ✕\n  F3 next  Shift+F3 prev  Alt+C case  Alt+R regex  Enter accept  Esc cancel\n"
+= pattern.0.3.text.selected.0 46..52 "UIA-42"
+= pattern.0.3.text.visible.0 0..244 "PS C:\\Users\\lane> Write-Output ('UIA-' + 6*7)\nUIA-42\nPS C:\\Users\\lane>\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n  Find: UIA-42                                Aa   .*            1/1  ↑  ↓  ✕\n  F3 next  Shift+F3 prev  Alt+C case  Alt+R regex  Enter accept  Esc cancel\n"
+= pattern.0.3.text.caret.Character 46..47 "U" rects=[12,61,9x23]
+= pattern.0.3.text.caret.Word 46..53 "UIA-42\n" rects=[12,61,720x23]
+= pattern.0.3.text.caret.Line 46..53 "UIA-42\n" rects=[12,61,720x23]
+= pattern.0.3.text.caret.Paragraph 46..53 "UIA-42\n" rects=[12,61,720x23]
+= pattern.0.3.text.caret.Document 0..244 "PS C:\\Users\\lane> Write-Output ('UIA-' + 6*7)\nUIA-42\nPS C:\\Users\\lane>\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n  Find: UIA-42                                Aa   .*            1/1  ↑  ↓  ✕\n  F3 next  Shift+F3 prev  Alt+C case  Alt+R regex  Enter accept  Esc cancel\n" rects=[12,38,720x23 12,61,720x23 12,84,720x23 12,107,720x23 12,130,720x23 12,153,720x23 12,176,720x23 12,199,720x23 12,222,720x23 12,245,720x23 12,268,720x23 12,291,720x23 12,314,720x23 12,337,720x23 12,360,720x23 12,383,720x23 12,406,720x23 12,429,720x23 12,452,720x23 12,475,720x23 12,498,720x23 12,521,720x23 12,544,720x23 12,567,720x23]
+= pattern.0.3.text.move3.Character 3 3..3 ""; end+3 3 0..3 "PS "
+= pattern.0.3.text.move3.Word 3 31..31 ""; end+3 3 0..31 "PS C:\\Users\\lane> Write-Output "
+= pattern.0.3.text.move3.Line 3 71..71 ""; end+3 3 0..71 "PS C:\\Users\\lane> Write-Output ('UIA-' + 6*7)\nUIA-42\nPS C:\\Users\\lane>\n"
+= pattern.0.3.text.move3.Paragraph 3 71..71 ""; end+3 3 0..71 "PS C:\\Users\\lane> Write-Output ('UIA-' + 6*7)\nUIA-42\nPS C:\\Users\\lane>\n"
+= pattern.0.3.text.find 46..52 "UIA-42" rects=[12,61,54x23]
+= pattern.0.3.text.find-back-nocase 98..104 "UIA-42"
+= pattern.0.3.text.from-point 46..53 "UIA-42\n"
+~ walk uia-tree elements=12 tries=1

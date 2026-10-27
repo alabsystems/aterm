@@ -385,6 +385,45 @@ fn full_clear_count_counts_ed2_and_home_ed0_not_ed3_el_or_mid_screen_ed0() {
     );
 }
 
+/// The content-scroll snapshot counts the primary screen's full clears from
+/// home (the cursor family drops what it laid on the old screen's letters at
+/// each, looks8 K7) and no alternate screen's: a full-screen program repaints
+/// its own screen from a clear, and nothing moved, so the snapshot's motion
+/// reads unchanged. An ED 2 away from home is a repaint in place, not a
+/// `clear`, and counts none.
+#[test]
+fn the_scroll_snapshot_counts_the_primary_screens_full_clears_only() {
+    use crate::terminal::{ContentScrollDelta, ContentScrollState};
+    let mut t = Terminal::new(8, 20);
+    paint(&mut t, 0..8);
+    let mut step = |bytes: &[u8]| {
+        let before = t.content_scroll_state();
+        t.process(bytes);
+        let after = t.content_scroll_state();
+        (
+            after.screen_clears - before.screen_clears,
+            ContentScrollState::delta_since(Some(before), after),
+        )
+    };
+    assert_eq!(
+        step(b"\x1b[H\x1b[2J"),
+        (1, ContentScrollDelta::Unchanged),
+        "Ctrl-L"
+    );
+    assert_eq!(
+        step(b"\x1b[H\x1b[J"),
+        (1, ContentScrollDelta::Unchanged),
+        "ED 0 from home"
+    );
+    assert_eq!(step(b"\x1b[5;3H\x1b[J").0, 0, "mid-screen ED 0");
+    assert_eq!(step(b"\x1b[5;3H\x1b[2J").0, 0, "ED 2 away from home");
+    assert_eq!(step(b"\x1b[3J").0, 0, "ED 3");
+    assert_eq!(step(b"\x1b[?1049h").0, 0, "entering the alternate screen");
+    assert_eq!(step(b"\x1b[2J").0, 0, "the alternate screen's clear");
+    assert_eq!(step(b"\x1b[?1049l").0, 0, "leaving it");
+    assert_eq!(step(b"\x1b[H\x1b[2J").0, 1, "the primary screen's again");
+}
+
 #[test]
 fn screen_replaced_counts_alt_screen_switches_and_resets() {
     let mut t = Terminal::new(8, 20);

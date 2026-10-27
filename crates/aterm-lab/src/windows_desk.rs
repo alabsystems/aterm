@@ -76,6 +76,334 @@ if ($verb -eq 'dragsource') {
   [Windows.Forms.Application]::Run($form)
   exit 0
 }
+if ($verb -like 'uia-*') {
+  # What a UI Automation client sees of a window, through .NET's UIAutomationClient (UIA's client
+  # API over UIAutomationCore), per-monitor-v2 aware; rectangles are physical pixels from the
+  # window's client origin. `uia-tree <pid> <class> <marker> <out>`: the raw view under the
+  # window, every element's properties and patterns, and each text pattern read, walked again
+  # until the text holds <marker> (a minute). `uia-watch <pid> <class> <log> <phase> <stop>`: the
+  # events of the window's subtree and the focus moves into its process, one line each, tagged with
+  # what <phase> holds, until <stop> exists. `uia-act <pid> <class> <type> <index>`: invokes (else
+  # selects, else toggles) the <index>th element of control type <type> in the walk's order.
+  Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase
+  $uia = @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows;
+using System.Windows.Automation;
+using System.Windows.Automation.Text;
+public static class LaneUia {
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr c);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr l);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
+
+  static IntPtr ClassWindow(uint pid, string cls) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows((h, l) => {
+      uint p; GetWindowThreadProcessId(h, out p);
+      if (p != pid || !IsWindowVisible(h)) return true;
+      var c = new StringBuilder(256); GetClassNameW(h, c, 256);
+      if (c.ToString() == cls) { found = h; return false; }
+      return true; }, IntPtr.Zero);
+    return found;
+  }
+
+  // A string as one token, quoted, with \ " and control characters escaped.
+  static string Q(string s) {
+    if (s == null) return "null";
+    var sb = new StringBuilder("\"");
+    foreach (char c in s) {
+      if (c == '\\' || c == '"') sb.Append('\\').Append(c);
+      else if (c == '\n') sb.Append("\\n");
+      else if (c == '\r') sb.Append("\\r");
+      else if (c == '\t') sb.Append("\\t");
+      else if (c < 0x20 || c == 0x7f) sb.Append("\\x").Append(((int)c).ToString("x2"));
+      else sb.Append(c);
+    }
+    return sb.Append('"').ToString();
+  }
+  static string N(double v) { return v.ToString("0.###", CultureInfo.InvariantCulture); }
+  static POINT origin;
+  static string R(Rect r) {
+    if (r.IsEmpty) return "empty";
+    return N(r.Left - origin.X) + "," + N(r.Top - origin.Y) + "," + N(r.Width) + "x" + N(r.Height);
+  }
+  static string Rects(Rect[] rs) {
+    var parts = new List<string>();
+    foreach (var r in rs) parts.Add(R(r));
+    return "[" + string.Join(" ", parts.ToArray()) + "]";
+  }
+  static string V(object v) {
+    if (v == null) return "null";
+    if (v == AutomationElement.NotSupported) return "ns";
+    if (v == TextPattern.MixedAttributeValue) return "mixed";
+    if (v is bool) return (bool)v ? "1" : "0";
+    if (v is string) return Q((string)v);
+    if (v is double) return N((double)v);
+    if (v is Rect) return R((Rect)v);
+    if (v is ControlType) return ((ControlType)v).ProgrammaticName;
+    if (v is AutomationElement) return Who((AutomationElement)v, false);
+    if (v is Array) return "array" + ((Array)v).Length;
+    return Convert.ToString(v, CultureInfo.InvariantCulture);
+  }
+  static string Short(string n) { int i = n.LastIndexOf('.'); return i < 0 ? n : n.Substring(i + 1); }
+  // `TextPatternIdentifiers.Pattern` as `Text`.
+  static string PatternName(AutomationPattern p) {
+    var n = p.ProgrammaticName; int i = n.IndexOf("PatternIdentifiers");
+    return i > 0 ? n.Substring(0, i) : n;
+  }
+  static string Who(AutomationElement el, bool cached) {
+    try {
+      var c = cached ? el.Cached.ControlType : el.Current.ControlType;
+      return c.ProgrammaticName + " " + Q(cached ? el.Cached.Name : el.Current.Name);
+    } catch (Exception e) { return "? " + e.GetType().Name; }
+  }
+  static string Prop(AutomationElement el, AutomationProperty p) {
+    if (p == null) return "unknown";
+    try { return V(el.GetCurrentPropertyValue(p)); } catch (Exception e) { return "err:" + e.GetType().Name; }
+  }
+
+  static readonly AutomationProperty[] Props = {
+    AutomationElement.NameProperty, AutomationElement.AutomationIdProperty, AutomationElement.ClassNameProperty,
+    AutomationElement.FrameworkIdProperty, AutomationElement.HelpTextProperty, AutomationElement.LocalizedControlTypeProperty,
+    AutomationElement.IsEnabledProperty, AutomationElement.IsOffscreenProperty, AutomationElement.IsKeyboardFocusableProperty,
+    AutomationElement.HasKeyboardFocusProperty, AutomationElement.IsControlElementProperty, AutomationElement.IsContentElementProperty,
+    AutomationElement.IsPasswordProperty, AutomationElement.BoundingRectangleProperty,
+  };
+  static int count;
+  static void Element(AutomationElement el, string at, StringBuilder sb) {
+    sb.Append("tree ").Append(at).Append(' ').Append(Prop(el, AutomationElement.ControlTypeProperty));
+    foreach (var p in Props) sb.Append(' ').Append(Short(p.ProgrammaticName).Replace("Property", "")).Append('=').Append(Prop(el, p));
+    var names = new List<string>();
+    AutomationPattern[] patterns;
+    try { patterns = el.GetSupportedPatterns(); } catch (Exception e) { sb.Append(" patterns=err:" + e.GetType().Name + "\n"); return; }
+    foreach (var p in patterns) names.Add(PatternName(p));
+    names.Sort(StringComparer.Ordinal);
+    sb.Append(" patterns=").Append(string.Join(",", names.ToArray())).Append('\n');
+    foreach (var p in patterns) Pattern(el, p, at, sb);
+  }
+  static void Line(StringBuilder sb, string at, string what, string value) {
+    sb.Append("pattern ").Append(at).Append('.').Append(what).Append(' ').Append(value).Append('\n');
+  }
+  static void Pattern(AutomationElement el, AutomationPattern p, string at, StringBuilder sb) {
+    try {
+      if (p == ValuePattern.Pattern) {
+        Line(sb, at, "value", Prop(el, ValuePattern.ValueProperty) + " readonly=" + Prop(el, ValuePattern.IsReadOnlyProperty));
+      } else if (p == RangeValuePattern.Pattern) {
+        Line(sb, at, "rangevalue", Prop(el, RangeValuePattern.ValueProperty) + " min=" + Prop(el, RangeValuePattern.MinimumProperty)
+          + " max=" + Prop(el, RangeValuePattern.MaximumProperty) + " small=" + Prop(el, RangeValuePattern.SmallChangeProperty)
+          + " large=" + Prop(el, RangeValuePattern.LargeChangeProperty) + " readonly=" + Prop(el, RangeValuePattern.IsReadOnlyProperty));
+      } else if (p == TogglePattern.Pattern) {
+        Line(sb, at, "toggle", Prop(el, TogglePattern.ToggleStateProperty));
+      } else if (p == SelectionItemPattern.Pattern) {
+        Line(sb, at, "selectionitem", Prop(el, SelectionItemPattern.IsSelectedProperty)
+          + " container=" + Prop(el, SelectionItemPattern.SelectionContainerProperty));
+      } else if (p == SelectionPattern.Pattern) {
+        var sel = ((SelectionPattern)el.GetCurrentPattern(p)).Current.GetSelection();
+        var who = new List<string>();
+        foreach (var s in sel) who.Add(Who(s, false));
+        Line(sb, at, "selection", "multiple=" + Prop(el, SelectionPattern.CanSelectMultipleProperty)
+          + " required=" + Prop(el, SelectionPattern.IsSelectionRequiredProperty) + " selected=[" + string.Join("; ", who.ToArray()) + "]");
+      } else if (p == TextPattern.Pattern) {
+        Text(el, (TextPattern)el.GetCurrentPattern(p), at, sb);
+      }
+    } catch (Exception e) { Line(sb, at, PatternName(p), "err:" + e.GetType().Name); }
+  }
+
+  // Where `r` starts and ends in `doc`, in its characters, and its text.
+  static string Span(TextPatternRange doc, TextPatternRange r) {
+    if (r == null) return "none";
+    var a = doc.Clone(); a.MoveEndpointByRange(TextPatternRangeEndpoint.End, r, TextPatternRangeEndpoint.Start);
+    var b = doc.Clone(); b.MoveEndpointByRange(TextPatternRangeEndpoint.End, r, TextPatternRangeEndpoint.End);
+    return a.GetText(-1).Length + ".." + b.GetText(-1).Length + " " + Q(r.GetText(-1));
+  }
+  static void Text(AutomationElement el, TextPattern tp, string at, StringBuilder sb) {
+    var doc = tp.DocumentRange;
+    string all = doc.GetText(-1);
+    Line(sb, at, "text", "selection=" + tp.SupportedTextSelection + " length=" + all.Length + " " + Q(all));
+    var t = at + ".text";
+    Line(sb, t, "enclosing", Who(doc.GetEnclosingElement(), false));
+    Line(sb, t, "children", doc.GetChildren().Length.ToString());
+    foreach (var a in new AutomationTextAttribute[] { TextPattern.IsReadOnlyAttribute, TextPattern.IsHiddenAttribute, TextPattern.FontNameAttribute })
+      Line(sb, t, "attribute." + Short(a.ProgrammaticName), V(doc.GetAttributeValue(a)));
+    Line(sb, t, "find-readonly", Span(doc, doc.FindAttribute(TextPattern.IsReadOnlyAttribute, true, false)));
+    var sels = tp.GetSelection();
+    for (int i = 0; i < sels.Length; i++) Line(sb, t, "selected." + i, Span(doc, sels[i]));
+    var vis = tp.GetVisibleRanges();
+    for (int i = 0; i < vis.Length; i++) Line(sb, t, "visible." + i, Span(doc, vis[i]));
+    if (sels.Length > 0) {
+      foreach (TextUnit u in new TextUnit[] { TextUnit.Character, TextUnit.Word, TextUnit.Line, TextUnit.Paragraph, TextUnit.Document }) {
+        var r = sels[0].Clone(); r.ExpandToEnclosingUnit(u);
+        Line(sb, t, "caret." + u, Span(doc, r) + " rects=" + Rects(r.GetBoundingRectangles()));
+      }
+    }
+    var start = doc.Clone(); start.MoveEndpointByRange(TextPatternRangeEndpoint.End, start, TextPatternRangeEndpoint.Start);
+    foreach (TextUnit u in new TextUnit[] { TextUnit.Character, TextUnit.Word, TextUnit.Line, TextUnit.Paragraph }) {
+      var m = start.Clone(); int moved = m.Move(u, 3);
+      var e = start.Clone(); int grew = e.MoveEndpointByUnit(TextPatternRangeEndpoint.End, u, 3);
+      Line(sb, t, "move3." + u, moved + " " + Span(doc, m) + "; end+3 " + grew + " " + Span(doc, e));
+    }
+    var found = doc.FindText(marker, false, false);
+    Line(sb, t, "find", Span(doc, found) + (found == null ? "" : " rects=" + Rects(found.GetBoundingRectangles())));
+    Line(sb, t, "find-back-nocase", Span(doc, doc.FindText(marker.ToLowerInvariant(), true, true)));
+    if (found != null) {
+      var rs = found.GetBoundingRectangles();
+      if (rs.Length > 0) {
+        var c = new Point(rs[0].Left + rs[0].Width / 2, rs[0].Top + rs[0].Height / 2);
+        var p = tp.RangeFromPoint(c); p.ExpandToEnclosingUnit(TextUnit.Word);
+        Line(sb, t, "from-point", Span(doc, p));
+      }
+    }
+  }
+
+  static void Walk(AutomationElement el, int depth, string at, StringBuilder sb) {
+    if (depth > 16 || count >= 4000) { sb.Append("tree ").Append(at).Append(" cut\n"); return; }
+    count++;
+    try { Element(el, at, sb); } catch (Exception e) { sb.Append("tree ").Append(at).Append(" err:").Append(e.GetType().Name).Append('\n'); return; }
+    var w = TreeWalker.RawViewWalker;
+    AutomationElement child;
+    try { child = w.GetFirstChild(el); } catch (Exception) { child = null; }
+    int i = 0;
+    while (child != null) {
+      Walk(child, depth + 1, at + "." + i, sb);
+      i++;
+      try { child = w.GetNextSibling(child); } catch (Exception) { child = null; }
+    }
+  }
+
+  static string marker = "";
+  public static string Tree(uint pid, string cls, string mark, string path) {
+    var h = ClassWindow(pid, cls);
+    if (h == IntPtr.Zero) return "error=no-window";
+    marker = mark;
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    string text; int tries = 0;
+    while (true) {
+      tries++;
+      origin = new POINT(); ClientToScreen(h, ref origin);
+      count = 0;
+      var sb = new StringBuilder();
+      try { Walk(AutomationElement.FromHandle(h), 0, "0", sb); } catch (Exception e) { sb.Append("error ").Append(e.GetType().Name).Append('\n'); }
+      text = sb.ToString();
+      if (text.Contains(mark) || sw.ElapsedMilliseconds > 60000) break;
+      Thread.Sleep(500);
+    }
+    File.WriteAllText(path, text, new UTF8Encoding(false));
+    return "uia-tree elements=" + count + " tries=" + tries + (text.Contains(mark) ? "" : " marker-missing");
+  }
+
+  // The <index>th element of control type <type> (`TabItem`) in the raw view, in walk order.
+  static AutomationElement Nth(AutomationElement el, string type, ref int left) {
+    if (Short(el.Current.ControlType.ProgrammaticName) == type && left-- == 0) return el;
+    var w = TreeWalker.RawViewWalker;
+    for (var c = w.GetFirstChild(el); c != null; c = w.GetNextSibling(c)) {
+      var found = Nth(c, type, ref left);
+      if (found != null) return found;
+    }
+    return null;
+  }
+  public static string Act(uint pid, string cls, string type, int index) {
+    var h = ClassWindow(pid, cls);
+    if (h == IntPtr.Zero) return "error=no-window";
+    int left = index;
+    var el = Nth(AutomationElement.FromHandle(h), type, ref left);
+    if (el == null) return "error=no-" + type + "-" + index;
+    object p;
+    if (el.TryGetCurrentPattern(InvokePattern.Pattern, out p)) { ((InvokePattern)p).Invoke(); return "uia-act invoked " + Who(el, false); }
+    if (el.TryGetCurrentPattern(SelectionItemPattern.Pattern, out p)) { ((SelectionItemPattern)p).Select(); return "uia-act selected " + Who(el, false); }
+    if (el.TryGetCurrentPattern(TogglePattern.Pattern, out p)) { ((TogglePattern)p).Toggle(); return "uia-act toggled " + Who(el, false); }
+    return "error=no-action " + Who(el, false);
+  }
+
+  static StreamWriter log;
+  static volatile string phase = "start";
+  static int target;
+  static readonly object gate = new object();
+  static void Write(string line) { lock (gate) { if (log != null) log.WriteLine(phase + " " + line); } }
+  static void OnEvent(object s, AutomationEventArgs e) {
+    var el = s as AutomationElement;
+    Write("event " + Short(e.EventId.ProgrammaticName).Replace("Event", "") + " " + (el == null ? "null" : Who(el, true)));
+  }
+  static void OnFocus(object s, AutomationFocusChangedEventArgs e) {
+    var el = s as AutomationElement;
+    int p = -1;
+    try { if (el != null) p = el.Cached.ProcessId; } catch (Exception) { }
+    if (p == target) Write("focus " + Who(el, true));
+  }
+  static void OnStructure(object s, StructureChangedEventArgs e) {
+    var el = s as AutomationElement;
+    Write("structure " + e.StructureChangeType + " " + (el == null ? "null" : Who(el, true)));
+  }
+  static void OnProperty(object s, AutomationPropertyChangedEventArgs e) {
+    var el = s as AutomationElement;
+    Write("property " + Short(e.Property.ProgrammaticName).Replace("Property", "") + " " + (el == null ? "null" : Who(el, true)));
+  }
+  public static string Watch(uint pid, string cls, string path, string phaseFile, string stopFile) {
+    var h = ClassWindow(pid, cls);
+    if (h == IntPtr.Zero) return "error=no-window";
+    target = (int)pid;
+    log = new StreamWriter(path, false, new UTF8Encoding(false));
+    log.AutoFlush = true;
+    var root = AutomationElement.FromHandle(h);
+    var cr = new CacheRequest();
+    cr.Add(AutomationElement.ControlTypeProperty); cr.Add(AutomationElement.NameProperty); cr.Add(AutomationElement.ProcessIdProperty);
+    using (cr.Activate()) {
+      Automation.AddAutomationFocusChangedEventHandler(OnFocus);
+      Automation.AddAutomationEventHandler(TextPattern.TextChangedEvent, root, TreeScope.Subtree, OnEvent);
+      Automation.AddAutomationEventHandler(TextPattern.TextSelectionChangedEvent, root, TreeScope.Subtree, OnEvent);
+      Automation.AddAutomationEventHandler(InvokePattern.InvokedEvent, root, TreeScope.Subtree, OnEvent);
+      // UIA_LiveRegionChangedEventId, which .NET names only from 4.7.1.
+      var live = AutomationEvent.LookupById(20024);
+      if (live != null) Automation.AddAutomationEventHandler(live, root, TreeScope.Subtree, OnEvent);
+      Automation.AddStructureChangedEventHandler(root, TreeScope.Subtree, OnStructure);
+      Automation.AddAutomationPropertyChangedEventHandler(root, TreeScope.Subtree, OnProperty,
+        AutomationElement.NameProperty, AutomationElement.HelpTextProperty, AutomationElement.IsEnabledProperty,
+        ValuePattern.ValueProperty, SelectionItemPattern.IsSelectedProperty, TogglePattern.ToggleStateProperty);
+    }
+    lock (gate) log.WriteLine("ready");
+    while (!File.Exists(stopFile)) {
+      // Shared for writing, so the lane's `echo <phase>> file` is never refused while this reads;
+      // the empty file that write truncates to keeps the phase it replaces.
+      try {
+        if (File.Exists(phaseFile)) {
+          string now;
+          using (var f = new FileStream(phaseFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+          using (var r = new StreamReader(f)) now = r.ReadToEnd().Trim();
+          if (now.Length > 0) phase = now;
+        }
+      } catch (IOException) { }
+      Thread.Sleep(50);
+    }
+    Automation.RemoveAllEventHandlers();
+    lock (gate) { log.WriteLine("stopped"); log.Close(); log = null; }
+    return "uia-watch stopped";
+  }
+}
+'@
+  # Compiled once per source, as the desk's own types below are.
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($uia))).Replace('-', '').Substring(0, 16)
+  $dll = Join-Path $PSScriptRoot "LaneUia-$hash.dll"
+  $refs = @([Windows.Automation.AutomationElement].Assembly.Location, [Windows.Automation.ControlType].Assembly.Location, [Windows.Rect].Assembly.Location)
+  if (-not (Test-Path $dll)) { Add-Type -TypeDefinition $uia -ReferencedAssemblies $refs -OutputAssembly $dll -OutputType Library }
+  Add-Type -Path $dll
+  [LaneUia]::SetProcessDpiAwarenessContext([IntPtr]-4) | Out-Null
+  if ($verb -eq 'uia-tree') { [LaneUia]::Tree([uint32]$args[1], $args[2], $args[3], $args[4]) }
+  elseif ($verb -eq 'uia-watch') { [LaneUia]::Watch([uint32]$args[1], $args[2], $args[3], $args[4], $args[5]) }
+  elseif ($verb -eq 'uia-act') { [LaneUia]::Act([uint32]$args[1], $args[2], $args[3], [int]$args[4]) }
+  else { throw "desk.ps1: unknown verb '$verb'" }
+  exit 0
+}
 $src = @'
 using System;
 using System.Runtime.InteropServices;

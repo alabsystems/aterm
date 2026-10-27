@@ -17,6 +17,17 @@ pub const UTF8_TAIL_MAX: usize = 3;
 /// The state a hooked DCS string is carried in ([`Parser::carry_unhooking`]).
 pub const HOOKED_STRING_CARRY: State = State::SosPmApcString;
 
+/// A hooked DCS string's parser state (`DcsPassthrough`, or `Escape` with ST pending), as data.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HookedDcsCarry {
+    /// Whether the parser just read `ESC` at the end of `DcsPassthrough` and awaits `\` for ST.
+    pub st_pending: bool,
+    /// Split UTF-8 character head at the end of the DCS payload ([`UTF8_TAIL_MAX`]).
+    pub string_utf8_tail: Vec<u8>,
+    /// Tmux passthrough wrapper state ([`TmuxPassthrough`]).
+    pub tmux: TmuxPassthrough,
+}
+
 /// A parser's partial state, as data.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParserCarry {
@@ -308,6 +319,51 @@ impl Parser {
         if let TmuxPassthrough::Head(matched) = carry.tmux
             && (carry.state != State::DcsIgnore || !(1..=4).contains(&matched))
         {
+            return Err(CarryRefusal::FieldOutsideState);
+        }
+        Ok(())
+    }
+
+    /// The parser's partial state when a DCS string is hooked ([`Parser::in_hooked_dcs`]), for
+    /// callers that also carry the sink's hooked DCS accumulator.
+    #[must_use]
+    pub fn hooked_dcs_carry(&self) -> Option<HookedDcsCarry> {
+        if !self.in_hooked_dcs() {
+            return None;
+        }
+        Some(HookedDcsCarry {
+            st_pending: self.dcs_st_pending,
+            string_utf8_tail: self.string_utf8.as_slice().to_vec(),
+            tmux: self.tmux,
+        })
+    }
+
+    /// Install a [`HookedDcsCarry`] (see [`Parser::hooked_dcs_carry`]) after validating it.
+    pub fn restore_hooked_dcs(&mut self, carry: &HookedDcsCarry) -> Result<(), CarryRefusal> {
+        Self::validate_hooked_dcs_carry(carry)?;
+        self.reset();
+        if carry.st_pending {
+            self.state = State::Escape;
+            self.dcs_st_pending = true;
+        } else {
+            self.state = State::DcsPassthrough;
+            self.dcs_active = true;
+            self.string_utf8 =
+                Utf8Prefix::from_bytes(&carry.string_utf8_tail).unwrap_or(Utf8Prefix::NONE);
+        }
+        self.tmux = carry.tmux;
+        Ok(())
+    }
+
+    /// The whole of [`Parser::restore_hooked_dcs`]'s acceptance predicate.
+    fn validate_hooked_dcs_carry(carry: &HookedDcsCarry) -> Result<(), CarryRefusal> {
+        if carry.st_pending && !carry.string_utf8_tail.is_empty() {
+            return Err(CarryRefusal::FieldOutsideState);
+        }
+        if Utf8Prefix::from_bytes(&carry.string_utf8_tail).is_none() {
+            return Err(CarryRefusal::Utf8Tail);
+        }
+        if matches!(carry.tmux, TmuxPassthrough::Head(_)) {
             return Err(CarryRefusal::FieldOutsideState);
         }
         Ok(())

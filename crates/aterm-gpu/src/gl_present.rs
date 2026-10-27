@@ -7,7 +7,6 @@ use super::*;
 use crate::device_layer::TexelFormat;
 use crate::gl::encoder::GlFrame;
 use crate::gl::resources::{GlBuffer, GlBufferRole, GlTexture};
-#[cfg(not(wgpu_arm))]
 use gl_arm::gl_arm_note;
 use gl_arm::{GlArmLive, offscreen_format};
 
@@ -44,13 +43,6 @@ impl GlPresentBufs {
 /// What a window's post composed beyond the frame's own texels: the blit that placed the frame on
 /// the stand-in, the sizes, and what drew over the frame.
 #[derive(Clone, Copy)]
-#[cfg_attr(
-    all(wgpu_arm, not(test)),
-    expect(
-        dead_code,
-        reason = "read by `post_damage`: a build with wgpu posts windows on wgpu"
-    )
-)]
 pub(crate) struct GlPosted {
     /// The blit's uniform: placement (`content_off`), crop, invert, overlay,
     /// bands.
@@ -82,10 +74,6 @@ pub(crate) struct GlPosted {
 /// one) carried through the blit, with both crowns. A bloom held (drawn from
 /// the same inputs at both posts, `bloom_held`) adds nothing: it blends the
 /// same glow over each texel, so only the texels written show anew under it.
-#[cfg_attr(
-    all(wgpu_arm, not(test)),
-    expect(dead_code, reason = "a build with wgpu posts windows on wgpu")
-)]
 fn post_damage(
     last: Option<&GlPosted>,
     now: &GlPosted,
@@ -124,10 +112,6 @@ fn post_damage(
 /// `floor` and `ceil` of `rect + content_off`; beside a host-chrome row the
 /// bands repeat the frame's edge texels, so with chrome the change reaches
 /// the whole width. A placement that is not a number reaches everything.
-#[cfg_attr(
-    all(wgpu_arm, not(test)),
-    expect(dead_code, reason = "a build with wgpu posts windows on wgpu")
-)]
 fn blit_footprint(
     blit: &BlitUniform,
     [x0, y0, x1, y1]: [u32; 4],
@@ -939,7 +923,7 @@ impl GpuRenderer {
 
     /// Fire the injected-loss drill after `n` more successful GL presents, as
     /// `ATERM_GL_INJECT_LOSS=<n>` does at construct.
-    #[cfg(all(test, wgpu_arm))]
+    #[cfg(test)]
     pub(crate) fn gl_inject_loss_after_for_test(&mut self, n: u64) {
         self.gl_inject_loss_after = Some(n).filter(|n| *n > 0);
     }
@@ -1000,10 +984,7 @@ impl GpuRenderer {
 }
 
 /// The shipped Linux build's window presents: the GL arm owns the window's
-/// surface, a `GLXWindow` on X11 and an EGL surface on Wayland (a build that
-/// also carries wgpu, Linux's `--features wgpu-oracle` lane, attaches windows
-/// on wgpu).
-#[cfg(not(wgpu_arm))]
+/// surface, a `GLXWindow` on X11 and an EGL surface on Wayland.
 impl GpuRenderer {
     /// Attach `target`'s window: the arm on the window system's display (minted there, or minted
     /// again there if a headless frame came first), and a window surface at `width` x `height`

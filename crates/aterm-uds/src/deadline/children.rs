@@ -9,7 +9,9 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::process::{ExitStatus, Output};
 use std::time::{Duration, Instant};
 
-use super::{DRAIN_GRACE, ExitWait, OUTPUT_KEEP, POLL_MAX, POLL_MIN, RunError, reap_within};
+use super::{
+    DRAIN_GRACE, ExitWait, OUTPUT_KEEP, POLL_MAX, POLL_MIN, RunError, deadline_now, reap_within,
+};
 use crate::spawnfd::{Child, Command, Stdio};
 
 #[repr(C)]
@@ -290,7 +292,7 @@ fn run_until(
 ) -> Vec<Result<Output, RunError>> {
     let mut tick = POLL_MIN;
     loop {
-        let now = Instant::now();
+        let now = deadline_now();
         for run in runs.iter_mut().filter(|run| run.running()) {
             run.observe(now, now + reap);
         }
@@ -361,7 +363,7 @@ fn run_until(
         if ticking {
             tick = (tick * 2).min(POLL_MAX);
         }
-        let timeout = wake.saturating_duration_since(Instant::now());
+        let timeout = wake.saturating_duration_since(deadline_now());
         match poll(&mut fds, timeout) {
             Ok(true) => {}
             Ok(false) => continue,

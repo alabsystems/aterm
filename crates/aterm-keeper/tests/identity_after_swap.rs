@@ -68,11 +68,13 @@ struct Scratch {
 
 impl Scratch {
     /// A new directory of this run's own: never one an earlier run kept, which may hold a
-    /// copy that never showed it ran.
+    /// copy that never showed it ran. In `/private/tmp` (its quiet folder, `/private/tmp/.ubd`),
+    /// whose short path leaves `run/k.sock` far inside `SUN_LEN`: `$TMPDIR/.ubd` took it to
+    /// 105 bytes.
     fn new(prefix: &str) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix(&format!("{prefix}-"))
-            .tempdir_in(std::env::temp_dir().canonicalize().expect("temp dir"))
+            .tempdir_in("/private/tmp")
             .expect("scratch")
             .keep();
         private_dir(&dir.join("run"));

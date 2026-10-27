@@ -4,7 +4,7 @@
 
 //! `TerminalCheckpoint`: a scoped, round-trippable projection of a live [`Terminal`].
 
-use aterm_parser::ParserCarry;
+use aterm_parser::{HookedDcsCarry, ParserCarry};
 use aterm_types::charset::CharacterSetState;
 use aterm_types::{KittyKeyboardStateSnapshot, TaskbarProgress, XtermKeyboardState};
 
@@ -120,12 +120,12 @@ pub struct SavedCursorPendingWrap(bool);
 
 impl SavedCursorPendingWrap {
     #[inline]
-    const fn new(value: bool) -> Self {
+    pub(super) const fn new(value: bool) -> Self {
         Self(value)
     }
 
     #[inline]
-    const fn get(self) -> bool {
+    pub(super) const fn get(self) -> bool {
         self.0
     }
 }
@@ -140,12 +140,12 @@ pub struct SavedCursorResized(bool);
 
 impl SavedCursorResized {
     #[inline]
-    const fn new(value: bool) -> Self {
+    pub(super) const fn new(value: bool) -> Self {
         Self(value)
     }
 
     #[inline]
-    const fn get(self) -> bool {
+    pub(super) const fn get(self) -> bool {
         self.0
     }
 }
@@ -352,6 +352,462 @@ impl TerminalCheckpoint {
     }
 }
 
+/// In-process transient engine state paired with a [`TerminalCheckpoint`] so a replay keyframe continues with the same open mode-2026 frame start, alternate-screen leave notes, Kitty ids and serials, rate-limit buckets, shell-integration authorization and pending restore lineage as the engine it was taken from.
+///
+/// `ReplayCarry::default()` is empty, leaving [`Terminal::replay_from_checkpoint`]'s defaults untouched when a caller replays from a bare [`TerminalCheckpoint`].
+#[derive(Clone, Debug, Default)]
+pub struct ReplayCarry(Option<CapturedCarry>);
+
+impl ReplayCarry {
+    /// Earliest live timestamp held by this carry (`sync_start`, fallback response limiter, or policy buckets).
+    #[must_use]
+    pub fn earliest_instant(&self) -> Option<aterm_time::Instant> {
+        let c = self.0.as_ref()?;
+        [
+            c.sync_start,
+            c.response_rate_limiter.snapshot().3,
+            c.policy.earliest_refill(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Host alternate-scroll baseline captured with this keyframe, if non-empty.
+    #[must_use]
+    pub const fn host_alternate_scroll(&self) -> Option<bool> {
+        match &self.0 {
+            Some(c) => Some(c.host_alternate_scroll),
+            None => None,
+        }
+    }
+
+    /// Host-measured cell box `(width_px, height_px)` captured with this keyframe, if set by the host.
+    #[must_use]
+    pub const fn host_cell_px(&self) -> Option<(u16, u16)> {
+        match &self.0 {
+            Some(c) if c.cell_px_from_host && c.cell_px.0 > 0 && c.cell_px.1 > 0 => Some(c.cell_px),
+            _ => None,
+        }
+    }
+
+    /// Security policy document installed when this keyframe was captured, if any.
+    #[must_use]
+    pub fn security_policy(&self) -> Option<aterm_policy::Policy> {
+        self.0.as_ref().and_then(|c| c.policy.policy_doc().cloned())
+    }
+
+    /// Host-authorized extra OSC 8 URI schemes captured with this keyframe.
+    #[must_use]
+    pub fn hyperlink_schemes(&self) -> Vec<String> {
+        self.0.as_ref().map_or_else(Vec::new, |c| {
+            c.hyperlink_auth
+                .extra_schemes()
+                .iter()
+                .map(|s| (**s).to_owned())
+                .collect()
+        })
+    }
+}
+
+/// Kind of hooked DCS query carried across pane replay slices ([`DcsQueryCarry`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DcsQueryKind {
+    /// DECRQSS (`ESC P $ q … ST`), whose payload buffer caps at 256 bytes.
+    Decrqss,
+    /// XTGETTCAP (`ESC P + q … ST`), whose payload buffer caps at 1024 bytes.
+    Xtgettcap,
+}
+
+impl DcsQueryKind {
+    /// Maximum bytes retained in [`DcsQueryCarry::data`] for this query kind.
+    #[inline]
+    #[must_use]
+    pub const fn data_cap(self) -> usize {
+        match self {
+            Self::Decrqss => 256,
+            Self::Xtgettcap => 1024,
+        }
+    }
+}
+
+/// Canonicalizable state of an open hooked `DECRQSS` or `XTGETTCAP` query across pane replay slices.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DcsQueryCarry {
+    /// Which query (`DECRQSS` or `XTGETTCAP`) is hooked.
+    pub kind: DcsQueryKind,
+    /// Retained query payload bytes (capped at [`DcsQueryKind::data_cap`]).
+    pub data: Vec<u8>,
+    /// Total bytes charged to this DCS sequence (`<= MAX_DCS_GLOBAL_BUDGET`).
+    pub sequence_bytes: u32,
+    /// Parser state inside the hooked DCS string (`DcsPassthrough`, or `Escape` with ST pending).
+    pub parser: HookedDcsCarry,
+}
+
+/// Canonicalizable per-slice transient engine state paired with a [`TerminalCheckpoint`] in a pane replay state (`aterm-aos-pane`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent transient terminal flags carried across pane replay slices"
+)]
+pub struct PaneStepCarry {
+    /// Open DEC mode-2026 frame start as nanoseconds past the schema origin, or `None`.
+    pub sync_start_ns: Option<u64>,
+    /// Synchronized-output timeout duration in nanoseconds.
+    pub sync_timeout_ns: u64,
+    /// Fallback response rate limiter: `(tokens_bits, capacity_bytes, refill_bytes_per_sec, last_refill_ns)`.
+    pub response_limiter: (u64, u64, u64, Option<u64>),
+    /// Policy rate-limit buckets in first-declaration order: `(tokens_bits, last_refill_ns)`.
+    pub policy_buckets: Vec<(u64, Option<u64>)>,
+    /// Whether the active alternate screen was entered via `?47h` / `?1047h` without saving the cursor.
+    pub alt_entered_without_cursor_save: bool,
+    /// Whether ConPTY left an alternate screen up across a mode change.
+    pub conhost_alt_screen_left_up: bool,
+    /// `screen_replaced` generation of an alternate screen proved dead by a shell prompt.
+    pub dead_alt_screen: Option<u64>,
+    /// `(screen_replaced, row, col)` where a shell prompt arrived on a dead alternate screen.
+    pub dead_alt_prompt_at: Option<(u64, u16, u16)>,
+    /// Count of full-screen replacements since engine creation.
+    pub screen_replaced: u64,
+    /// Whether an in-band size report was held pending a prompt or leave.
+    pub size_report_held: bool,
+    /// Whether bracketed paste was enabled while at a shell prompt.
+    pub bracketed_paste_from_prompt: bool,
+    /// Last Kitty graphics image ID assigned by the terminal.
+    pub kitty_last_assigned_id: u32,
+    /// Kitty graphics monotonic placement serial.
+    pub kitty_serial: u32,
+    /// Live Kitty image byte charge `[primary, alternate]`.
+    pub live_image_charge: [u64; 2],
+    /// Whether the most recent OSC sequence was terminated by BEL (`0x07`) rather than ST.
+    pub last_osc_bel_terminated: bool,
+    /// Pending restore holder-lineage tag (`0 = None`, `1 = Untouched`, `2 = Touched`).
+    pub pending_restore: u8,
+    /// Host foreground-job state (`set_foreground_job`).
+    pub foreground_job: bool,
+    /// Last `program_probe` active state while `foreground_job` is `false`.
+    pub probe_job_active: bool,
+    /// Capability nonce authorized pending the shell's first mark (`awaiting_first_mark`), when any.
+    pub awaiting_shell_nonce: Option<ShellIntegrationNonce>,
+    /// Prior authorization replaced by an unsettled typed re-key (`(nonce, awaiting_first_mark)`), when any.
+    pub typed_rekey_prior: Option<(Option<ShellIntegrationNonce>, bool)>,
+    /// Full owed resize hand-back state of the active grid.
+    pub active_handback: aterm_grid::GridHandbackCarry,
+    /// Full owed resize hand-back state of the inactive grid, when present.
+    pub inactive_handback: Option<aterm_grid::GridHandbackCarry>,
+    /// Open hooked `DECRQSS` or `XTGETTCAP` query state, when the slice ended mid-query.
+    pub dcs_query: Option<DcsQueryCarry>,
+}
+
+fn canonical_f64_bits(v: f64) -> u64 {
+    if !v.is_finite() || v <= 0.0 {
+        0.0f64.to_bits()
+    } else {
+        v.to_bits()
+    }
+}
+
+fn offset_ns_from(origin: aterm_time::Instant, instant: aterm_time::Instant) -> u64 {
+    u64::try_from(instant.saturating_duration_since(origin).as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn instant_at_offset(origin: aterm_time::Instant, offset_ns: u64) -> aterm_time::Instant {
+    origin
+        .checked_add(std::time::Duration::from_nanos(offset_ns))
+        .unwrap_or(origin)
+}
+
+const fn duration_to_ns_saturating(d: std::time::Duration) -> u64 {
+    let nanos = d.as_nanos();
+    if nanos > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "explicitly clamped to u64::MAX above"
+        )]
+        {
+            nanos as u64
+        }
+    }
+}
+
+impl PaneStepCarry {
+    /// Derive the pure baseline carry for a bare [`TerminalCheckpoint`] under `config` and `policy` without reading a clock.
+    #[must_use]
+    pub fn initial(
+        checkpoint: &TerminalCheckpoint,
+        config: &crate::config::TerminalConfig,
+        policy: Option<&aterm_policy::Policy>,
+    ) -> Self {
+        use super::response_rate_limiter::{DEFAULT_BURST_BYTES, DEFAULT_REFILL_BYTES_PER_SEC};
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "burst is bytes; f64 represents DEFAULT_BURST_BYTES (96 KiB) with zero loss"
+        )]
+        let default_burst = DEFAULT_BURST_BYTES as f64;
+        let policy_buckets = policy.map_or_else(Vec::new, |p| {
+            aterm_policy::limits::RateLimiterSet::from_policy(p)
+                .snapshots()
+                .into_iter()
+                .map(|b| (canonical_f64_bits(b.tokens), None))
+                .collect()
+        });
+        Self {
+            sync_start_ns: checkpoint.modes.synchronized_output.then_some(0),
+            sync_timeout_ns: duration_to_ns_saturating(std::time::Duration::from_millis(
+                config.sync_timeout_ms,
+            )),
+            response_limiter: (
+                canonical_f64_bits(default_burst),
+                DEFAULT_BURST_BYTES,
+                DEFAULT_REFILL_BYTES_PER_SEC,
+                None,
+            ),
+            policy_buckets,
+            alt_entered_without_cursor_save: false,
+            conhost_alt_screen_left_up: false,
+            dead_alt_screen: None,
+            dead_alt_prompt_at: None,
+            screen_replaced: 0,
+            size_report_held: false,
+            bracketed_paste_from_prompt: false,
+            kitty_last_assigned_id: 0,
+            kitty_serial: 0,
+            live_image_charge: [0, 0],
+            last_osc_bel_terminated: false,
+            pending_restore: 0,
+            foreground_job: false,
+            probe_job_active: false,
+            awaiting_shell_nonce: None,
+            typed_rekey_prior: None,
+            active_handback: aterm_grid::GridHandbackCarry::from_cursor(
+                checkpoint.cursor.handback_rows,
+                checkpoint.cursor.handback_above,
+                aterm_grid::ResizeLaw::default(),
+            ),
+            inactive_handback: checkpoint.alt_cursor.as_ref().map(|c| {
+                aterm_grid::GridHandbackCarry::from_cursor(
+                    c.handback_rows,
+                    c.handback_above,
+                    aterm_grid::ResizeLaw::default(),
+                )
+            }),
+            dcs_query: None,
+        }
+    }
+
+    /// Capture the live transient step carry relative to `origin`, bounding owed pushed-row handback by `max_history`.
+    #[must_use]
+    pub fn capture(term: &Terminal, origin: aterm_time::Instant, max_history: usize) -> Self {
+        let t = &term.transient;
+        let (rl_tokens, rl_cap, rl_refill, rl_last) = t.response_rate_limiter.snapshot();
+        let pending_restore = match term.holder_carried_at {
+            None => 0,
+            Some(at) if at == t.screen_mutations => 1,
+            Some(_) => 2,
+        };
+        let active_cap = term.grid.scrollback_lines().min(max_history);
+        let inactive_handback = term.alt_grid.as_ref().map(|g| {
+            g.capture_handback_carry()
+                .bounded(g.scrollback_lines().min(max_history))
+        });
+        let (awaiting_shell_nonce, typed_rekey_prior) =
+            term.shell_integration_auth.awaiting_carry();
+        let dcs_query = match (term.hooked_dcs(), term.parser.hooked_dcs_carry()) {
+            (Some(HookedDcs::Query), Some(parser)) => {
+                let kind = match term.dcs.dcs_type {
+                    super::DcsType::Xtgettcap => DcsQueryKind::Xtgettcap,
+                    super::DcsType::Decrqss
+                    | super::DcsType::None
+                    | super::DcsType::Sixel
+                    | super::DcsType::Unknown => DcsQueryKind::Decrqss,
+                };
+                Some(DcsQueryCarry {
+                    kind,
+                    data: term.dcs.data.clone(),
+                    sequence_bytes: u32::try_from(term.dcs.sequence_bytes).unwrap_or(u32::MAX),
+                    parser,
+                })
+            }
+            _ => None,
+        };
+        Self {
+            sync_start_ns: t.sync_start.map(|at| offset_ns_from(origin, at)),
+            sync_timeout_ns: duration_to_ns_saturating(term.sync_timeout_duration),
+            response_limiter: (
+                canonical_f64_bits(rl_tokens),
+                rl_cap,
+                rl_refill,
+                rl_last.map(|at| offset_ns_from(origin, at)),
+            ),
+            policy_buckets: term
+                .policy
+                .bucket_snapshots()
+                .into_iter()
+                .map(|b| {
+                    (
+                        canonical_f64_bits(b.tokens),
+                        b.last_refill.map(|at| offset_ns_from(origin, at)),
+                    )
+                })
+                .collect(),
+            alt_entered_without_cursor_save: t.alt_entered_without_cursor_save,
+            conhost_alt_screen_left_up: t.conhost_alt_screen_left_up,
+            dead_alt_screen: t.dead_alt_screen,
+            dead_alt_prompt_at: t.dead_alt_prompt_at,
+            screen_replaced: t.screen_replaced,
+            size_report_held: t.size_report_held,
+            bracketed_paste_from_prompt: t.bracketed_paste_from_prompt,
+            kitty_last_assigned_id: t.kitty_last_assigned_id,
+            kitty_serial: t.kitty_serial,
+            live_image_charge: t
+                .live_image_charge
+                .map(|n| u64::try_from(n).unwrap_or(u64::MAX)),
+            last_osc_bel_terminated: t.last_osc_bel_terminated,
+            pending_restore,
+            foreground_job: term.shell.foreground_job,
+            probe_job_active: !term.shell.foreground_job && term.shell.probe_job_active,
+            awaiting_shell_nonce,
+            typed_rekey_prior,
+            active_handback: term.grid.capture_handback_carry().bounded(active_cap),
+            inactive_handback,
+            dcs_query,
+        }
+    }
+
+    /// Project an in-process [`ReplayCarry`] paired with `checkpoint` onto `origin`, falling back to [`Self::initial`] when `carry` is empty.
+    #[must_use]
+    pub fn from_replay_carry(
+        carry: &ReplayCarry,
+        checkpoint: &TerminalCheckpoint,
+        config: &crate::config::TerminalConfig,
+        policy: Option<&aterm_policy::Policy>,
+        origin: aterm_time::Instant,
+    ) -> Self {
+        let Some(c) = &carry.0 else {
+            return Self::initial(checkpoint, config, policy);
+        };
+        let (rl_tokens, rl_cap, rl_refill, rl_last) = c.response_rate_limiter.snapshot();
+        let pending_restore = match c.pending_restore {
+            PendingRestore::None => 0,
+            PendingRestore::Untouched => 1,
+            PendingRestore::Touched => 2,
+        };
+        let (awaiting_shell_nonce, typed_rekey_prior) = c.shell_integration_auth.awaiting_carry();
+        let active_cap = checkpoint.history_lines as usize;
+        let inactive_cap = if checkpoint.modes.alternate_screen {
+            checkpoint.alt_grid.as_deref().map_or(0, |bytes| {
+                deserialize_lines(bytes)
+                    .len()
+                    .saturating_sub(usize::from(checkpoint.rows))
+            })
+        } else {
+            0
+        };
+        Self {
+            sync_start_ns: c.sync_start.map(|at| offset_ns_from(origin, at)),
+            sync_timeout_ns: duration_to_ns_saturating(c.sync_timeout_duration),
+            response_limiter: (
+                canonical_f64_bits(rl_tokens),
+                rl_cap,
+                rl_refill,
+                rl_last.map(|at| offset_ns_from(origin, at)),
+            ),
+            policy_buckets: c
+                .policy
+                .bucket_snapshots()
+                .into_iter()
+                .map(|b| {
+                    (
+                        canonical_f64_bits(b.tokens),
+                        b.last_refill.map(|at| offset_ns_from(origin, at)),
+                    )
+                })
+                .collect(),
+            alt_entered_without_cursor_save: c.alt_entered_without_cursor_save,
+            conhost_alt_screen_left_up: c.conhost_alt_screen_left_up,
+            dead_alt_screen: c.dead_alt_screen,
+            dead_alt_prompt_at: c.dead_alt_prompt_at,
+            screen_replaced: c.screen_replaced,
+            size_report_held: c.size_report_held,
+            bracketed_paste_from_prompt: c.bracketed_paste_from_prompt,
+            kitty_last_assigned_id: c.kitty_last_assigned_id,
+            kitty_serial: c.kitty_serial,
+            live_image_charge: c
+                .live_image_charge
+                .map(|n| u64::try_from(n).unwrap_or(u64::MAX)),
+            last_osc_bel_terminated: c.last_osc_bel_terminated,
+            pending_restore,
+            foreground_job: c.foreground_job,
+            probe_job_active: !c.foreground_job && c.probe_job_active,
+            awaiting_shell_nonce,
+            typed_rekey_prior,
+            active_handback: c.active_handback.bounded(active_cap),
+            inactive_handback: c.inactive_handback.map(|h| h.bounded(inactive_cap)),
+            dcs_query: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PendingRestore {
+    None,
+    Untouched,
+    Touched,
+}
+
+#[derive(Clone, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent transient terminal flags carried across an in-process replay keyframe"
+)]
+struct CapturedCarry {
+    program_state: super::program_state::ProgramStateReport,
+    shell_integration_auth: super::shell_integration_auth::ShellIntegrationAuth,
+    foreground_job: bool,
+    probe_job_active: bool,
+    policy: super::policy_gates::PolicyState,
+    hyperlink_auth: super::hyperlink_auth::HyperlinkAuth,
+    clipboard_auth: super::clipboard_auth::ClipboardAuth,
+    configured_modes: super::state::ConfiguredModes,
+    default_cursor_style: aterm_types::CursorStyle,
+    host_alternate_scroll: bool,
+    sync_timeout_duration: std::time::Duration,
+    last_bell_time: Option<aterm_time::Instant>,
+    bell_total: u64,
+    notify_total: u64,
+    cell_px: (u16, u16),
+    cell_px_from_host: bool,
+    bidi_config: crate::config::BiDiConfig,
+    color_baseline: super::config_api::ColorBaseline,
+    color_overrides: super::checkpoint_state::ColorOverridesRepr,
+    bold_is_bright: bool,
+    faint_opacity: f32,
+    indexed_minimum_contrast: f32,
+    palette_set_refused: bool,
+    frame_foreground_authoritative: bool,
+    frame_background_authoritative: bool,
+    frame_cursor_authoritative: bool,
+    scrollback_line_limit: Option<usize>,
+    pending_restore: PendingRestore,
+    response_rate_limiter: super::response_rate_limiter::ResponseRateLimiter,
+    sync_start: Option<aterm_time::Instant>,
+    alt_entered_without_cursor_save: bool,
+    conhost_alt_screen_left_up: bool,
+    dead_alt_screen: Option<u64>,
+    dead_alt_prompt_at: Option<(u64, u16, u16)>,
+    screen_replaced: u64,
+    size_report_held: bool,
+    bracketed_paste_from_prompt: bool,
+    kitty_last_assigned_id: u32,
+    kitty_serial: u32,
+    live_image_charge: [usize; 2],
+    last_osc_bel_terminated: bool,
+    active_handback: aterm_grid::GridHandbackCarry,
+    inactive_handback: Option<aterm_grid::GridHandbackCarry>,
+}
+
 fn osc_payload_is_shell_mark(osc: &[u8]) -> bool {
     let Some(command) = osc
         .iter()
@@ -414,6 +870,13 @@ impl Terminal {
     pub fn checkpoint_continuing_bounded(&self, max_history: usize) -> Option<TerminalCheckpoint> {
         self.partial_sequence_uncarried()
             .is_none()
+            .then(|| self.project_bounded(max_history, max_history, self.parser_is_ground()))
+    }
+
+    /// [`Self::checkpoint_continuing_bounded`] for a pane step paired with a [`PaneStepCarry`] (`aterm-aos-pane`), which carries a hooked DCS query in [`PaneStepCarry::dcs_query`].
+    #[must_use]
+    pub fn checkpoint_pane_step(&self, max_history: usize) -> Option<TerminalCheckpoint> {
+        (self.partial_sequence_uncarried().is_none() || self.hooked_dcs() == Some(HookedDcs::Query))
             .then(|| self.project_bounded(max_history, max_history, self.parser_is_ground()))
     }
 
@@ -642,6 +1105,13 @@ impl Terminal {
         self.alt_grid.is_some()
     }
 
+    /// The inactive grid [`Self::has_inactive_grid`] names, so a caller can count the memory of both grids.
+    #[inline]
+    #[must_use]
+    pub const fn inactive_grid(&self) -> Option<&Grid> {
+        self.alt_grid.as_ref()
+    }
+
     fn checkpoint_with_scrollback(&self, include_scrollback: bool) -> TerminalCheckpoint {
         let bound = if include_scrollback { usize::MAX } else { 0 };
         self.checkpoint_bounded(bound, bound)
@@ -797,6 +1267,243 @@ impl Terminal {
         terminal
     }
 
+    /// Show this engine's screen `lines` rows higher, for a view whose bottom `lines` rows chrome covers: its top `lines` screen lines join its history (the alternate screen keeps just those, and a smaller history limit is raised to hold them), as many blank lines join its bottom, and the cursor moves up with its line, hidden once that line is history.
+    pub fn lift_screen(&mut self, lines: u16) {
+        let lines = lines.min(self.grid.rows().saturating_sub(1));
+        if lines == 0 {
+            return;
+        }
+        let keep = usize::from(lines);
+        if self.modes.alternate_screen
+            || self.grid.scrollback_line_limit().is_some_and(|n| n < keep)
+        {
+            self.grid.set_scrollback_line_limit(Some(keep));
+        }
+        let cursor = self.grid.cursor();
+        self.grid.scroll_up(usize::from(lines));
+        if cursor.row < lines {
+            self.modes.cursor_visible = false;
+        }
+        self.grid
+            .set_cursor(cursor.row.saturating_sub(lines), cursor.col);
+    }
+
+    /// Capture the in-process transient state a [`TerminalCheckpoint`] leaves out ([`ReplayCarry`]).
+    #[must_use]
+    pub fn capture_replay_carry(&self) -> ReplayCarry {
+        ReplayCarry(Some(self.captured_carry()))
+    }
+
+    /// Install a [`ReplayCarry`] captured by [`Self::capture_replay_carry`] onto an engine restored by [`Self::replay_from_checkpoint`] or [`Self::replay_from_checkpoint_bounded`].
+    pub fn apply_replay_carry(&mut self, carry: &ReplayCarry) {
+        let Some(captured) = &carry.0 else {
+            return;
+        };
+        self.apply_captured_scalars(captured);
+        self.grid.apply_handback_carry(captured.active_handback);
+        if let (Some(inactive), Some(handback)) = (&mut self.alt_grid, captured.inactive_handback) {
+            inactive.apply_handback_carry(handback);
+        }
+    }
+
+    /// Install a [`PaneStepCarry`] onto a checkpoint-restored engine whose host configuration and policy have already been applied, resolving offsets from `origin`.
+    pub fn apply_pane_step_carry(&mut self, carry: &PaneStepCarry, origin: aterm_time::Instant) {
+        self.sync_timeout_duration = std::time::Duration::from_nanos(carry.sync_timeout_ns);
+        let snaps: Vec<aterm_policy::limits::BucketSnapshot> = carry
+            .policy_buckets
+            .iter()
+            .map(|&(bits, last)| aterm_policy::limits::BucketSnapshot {
+                tokens: f64::from_bits(bits),
+                last_refill: last.map(|ns| instant_at_offset(origin, ns)),
+            })
+            .collect();
+        self.policy.restore_bucket_snapshots(&snaps);
+        let mutations = self.transient.screen_mutations;
+        self.holder_carried_at = match carry.pending_restore {
+            1 => Some(mutations),
+            2 => Some(mutations.wrapping_sub(1)),
+            _ => None,
+        };
+        self.shell.foreground_job = carry.foreground_job;
+        self.shell.probe_job_active = !carry.foreground_job && carry.probe_job_active;
+        self.shell_integration_auth
+            .apply_awaiting_carry(carry.awaiting_shell_nonce, carry.typed_rekey_prior);
+        let (rl_bits, rl_cap, rl_refill, rl_last) = carry.response_limiter;
+        let to = &mut self.transient;
+        to.response_rate_limiter = super::response_rate_limiter::ResponseRateLimiter::from_snapshot(
+            f64::from_bits(rl_bits),
+            rl_cap,
+            rl_refill,
+            rl_last.map(|ns| instant_at_offset(origin, ns)),
+        );
+        to.sync_start = carry.sync_start_ns.map(|ns| instant_at_offset(origin, ns));
+        to.alt_entered_without_cursor_save = carry.alt_entered_without_cursor_save;
+        to.conhost_alt_screen_left_up = carry.conhost_alt_screen_left_up;
+        to.dead_alt_screen = carry.dead_alt_screen;
+        to.dead_alt_prompt_at = carry.dead_alt_prompt_at;
+        to.screen_replaced = carry.screen_replaced;
+        to.size_report_held = carry.size_report_held;
+        to.bracketed_paste_from_prompt = carry.bracketed_paste_from_prompt;
+        to.kitty_last_assigned_id = carry.kitty_last_assigned_id;
+        to.kitty_serial = carry.kitty_serial;
+        to.live_image_charge = carry
+            .live_image_charge
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+        to.last_osc_bel_terminated = carry.last_osc_bel_terminated;
+        self.grid.apply_handback_carry(carry.active_handback);
+        if let (Some(inactive), Some(handback)) = (&mut self.alt_grid, carry.inactive_handback) {
+            inactive.apply_handback_carry(handback);
+        }
+        if let Some(q) = &carry.dcs_query {
+            if let Err(refusal) = self.parser.restore_hooked_dcs(&q.parser) {
+                self.dcs.reset();
+                self.parser.reset();
+                aterm_log::warn!(
+                    "pane step carry: the carried hooked DCS state was refused ({refusal}); \
+                     the parser resumes at Ground"
+                );
+            } else {
+                self.dcs.dcs_type = match q.kind {
+                    DcsQueryKind::Decrqss => super::DcsType::Decrqss,
+                    DcsQueryKind::Xtgettcap => super::DcsType::Xtgettcap,
+                };
+                self.dcs.data.clone_from(&q.data);
+                let seq = usize::try_from(q.sequence_bytes).unwrap_or(usize::MAX);
+                self.dcs.sequence_bytes = seq;
+                self.dcs.total_bytes = seq;
+            }
+        } else if self.hooked_dcs() == Some(HookedDcs::Query) {
+            self.dcs.reset();
+            self.parser.reset();
+        }
+        self.refresh_mode_mirror();
+    }
+
+    fn captured_carry(&self) -> CapturedCarry {
+        let t = &self.transient;
+        let pending_restore = match self.holder_carried_at {
+            None => PendingRestore::None,
+            Some(at) if at == t.screen_mutations => PendingRestore::Untouched,
+            Some(_) => PendingRestore::Touched,
+        };
+        CapturedCarry {
+            program_state: self.program_state,
+            shell_integration_auth: self.shell_integration_auth.clone(),
+            foreground_job: self.shell.foreground_job,
+            probe_job_active: !self.shell.foreground_job && self.shell.probe_job_active,
+            policy: self.policy.clone(),
+            hyperlink_auth: self.hyperlink_auth.clone(),
+            clipboard_auth: self.clipboard_auth.clone(),
+            configured_modes: self.configured_modes,
+            default_cursor_style: self.default_cursor_style,
+            host_alternate_scroll: self.host_alternate_scroll,
+            sync_timeout_duration: self.sync_timeout_duration,
+            last_bell_time: self.last_bell_time,
+            bell_total: self.bell_total,
+            notify_total: self.notify_total,
+            cell_px: self.iterm2.cell_px,
+            cell_px_from_host: self.iterm2.cell_px_from_host,
+            bidi_config: self.bidi_state.config.clone(),
+            color_baseline: self.color_baseline(),
+            color_overrides: self.color.capture_overrides(),
+            bold_is_bright: self.color.bold_is_bright,
+            faint_opacity: self.color.faint_opacity,
+            indexed_minimum_contrast: self.color.indexed_minimum_contrast,
+            palette_set_refused: self.color.palette_set_refused,
+            frame_foreground_authoritative: self.color.frame_foreground_authoritative,
+            frame_background_authoritative: self.color.frame_background_authoritative,
+            frame_cursor_authoritative: self.color.frame_cursor_authoritative,
+            scrollback_line_limit: self.scrollback_line_limit(),
+            pending_restore,
+            response_rate_limiter: t.response_rate_limiter.clone(),
+            sync_start: t.sync_start,
+            alt_entered_without_cursor_save: t.alt_entered_without_cursor_save,
+            conhost_alt_screen_left_up: t.conhost_alt_screen_left_up,
+            dead_alt_screen: t.dead_alt_screen,
+            dead_alt_prompt_at: t.dead_alt_prompt_at,
+            screen_replaced: t.screen_replaced,
+            size_report_held: t.size_report_held,
+            bracketed_paste_from_prompt: t.bracketed_paste_from_prompt,
+            kitty_last_assigned_id: t.kitty_last_assigned_id,
+            kitty_serial: t.kitty_serial,
+            live_image_charge: t.live_image_charge,
+            last_osc_bel_terminated: t.last_osc_bel_terminated,
+            active_handback: self.grid.capture_handback_carry(),
+            inactive_handback: self.alt_grid.as_ref().map(Grid::capture_handback_carry),
+        }
+    }
+
+    fn apply_captured_scalars(&mut self, captured: &CapturedCarry) {
+        self.program_state = captured.program_state;
+        self.shell_integration_auth
+            .clone_from(&captured.shell_integration_auth);
+        self.shell.foreground_job = captured.foreground_job;
+        self.shell.probe_job_active = !captured.foreground_job && captured.probe_job_active;
+        self.policy.clone_from(&captured.policy);
+        self.hyperlink_auth.clone_from(&captured.hyperlink_auth);
+        self.clipboard_auth.clone_from(&captured.clipboard_auth);
+        self.configured_modes = captured.configured_modes;
+        self.default_cursor_style = captured.default_cursor_style;
+        self.host_alternate_scroll = captured.host_alternate_scroll;
+        self.sync_timeout_duration = captured.sync_timeout_duration;
+        self.last_bell_time = captured.last_bell_time;
+        self.bell_total = captured.bell_total;
+        self.notify_total = captured.notify_total;
+        self.iterm2.cell_px = captured.cell_px;
+        self.iterm2.cell_px_from_host = captured.cell_px_from_host;
+        self.bidi_state.config.clone_from(&captured.bidi_config);
+        {
+            let b = &captured.color_baseline;
+            self.color.configured_cursor = b.cursor;
+            self.color.configured_foreground = b.foreground;
+            self.color.configured_background = b.background;
+            if let Some(scheme) = b.color_scheme {
+                self.color.configured_color_scheme = scheme;
+            }
+            self.color.configured_selection_background = b.selection_background;
+            self.color.configured_selection_foreground = b.selection_foreground;
+            self.color.configured_palette.clone_from(&b.palette);
+            self.color.restore_baseline(true);
+            self.color.apply_overrides(&captured.color_overrides, true);
+            self.color.bold_is_bright = captured.bold_is_bright;
+            self.color.faint_opacity = captured.faint_opacity;
+            self.color.indexed_minimum_contrast = captured.indexed_minimum_contrast;
+            self.color.palette_set_refused = captured.palette_set_refused;
+            self.color.frame_foreground_authoritative = captured.frame_foreground_authoritative;
+            self.color.frame_background_authoritative = captured.frame_background_authoritative;
+            self.color.frame_cursor_authoritative = captured.frame_cursor_authoritative;
+        }
+        let limit = match (self.scrollback_line_limit(), captured.scrollback_line_limit) {
+            (Some(current), Some(carried)) => Some(current.min(carried)),
+            (Some(current), None) => Some(current),
+            (None, carried) => carried,
+        };
+        if self.scrollback_line_limit() != limit {
+            self.set_scrollback_line_limit(limit);
+        }
+        let mutations = self.transient.screen_mutations;
+        self.holder_carried_at = match captured.pending_restore {
+            PendingRestore::None => None,
+            PendingRestore::Untouched => Some(mutations),
+            PendingRestore::Touched => Some(mutations.wrapping_sub(1)),
+        };
+        let to = &mut self.transient;
+        to.response_rate_limiter = captured.response_rate_limiter.clone();
+        to.sync_start = captured.sync_start;
+        to.alt_entered_without_cursor_save = captured.alt_entered_without_cursor_save;
+        to.conhost_alt_screen_left_up = captured.conhost_alt_screen_left_up;
+        to.dead_alt_screen = captured.dead_alt_screen;
+        to.dead_alt_prompt_at = captured.dead_alt_prompt_at;
+        to.screen_replaced = captured.screen_replaced;
+        to.size_report_held = captured.size_report_held;
+        to.bracketed_paste_from_prompt = captured.bracketed_paste_from_prompt;
+        to.kitty_last_assigned_id = captured.kitty_last_assigned_id;
+        to.kitty_serial = captured.kitty_serial;
+        to.live_image_charge = captured.live_image_charge;
+        to.last_osc_bel_terminated = captured.last_osc_bel_terminated;
+        self.refresh_mode_mirror();
+    }
+
     /// A copy of this engine that continues as it does.
     #[must_use]
     pub fn replay_fork(&self) -> Option<Terminal> {
@@ -819,21 +1526,8 @@ impl Terminal {
         };
         let scalars = self.project(usize::MAX, usize::MAX, true, false, MarksFrom::Carried);
         let mut fork = Self::restored(&scalars, active, inactive);
-        fork.program_state = self.program_state;
         fork.holder_fence.clone_from(&self.holder_fence);
-        fork.shell_integration_auth
-            .clone_from(&self.shell_integration_auth);
-        let since = |at: u64| t.screen_mutations.wrapping_sub(at);
-        fork.holder_carried_at = self
-            .holder_carried_at
-            .map(|at| fork.transient.screen_mutations.wrapping_sub(since(at)));
-        let to = &mut fork.transient;
-        to.alt_entered_without_cursor_save = t.alt_entered_without_cursor_save;
-        to.conhost_alt_screen_left_up = t.conhost_alt_screen_left_up;
-        to.sync_start = t.sync_start;
-        to.kitty_last_assigned_id = t.kitty_last_assigned_id;
-        to.kitty_serial = t.kitty_serial;
-        to.live_image_charge = t.live_image_charge;
+        fork.apply_captured_scalars(&self.captured_carry());
         Some(fork)
     }
 
@@ -1293,15 +1987,21 @@ fn restore_grid(
         // ring would accrue history the source never had and diverge on re-checkpoint.
         Grid::with_scrollback(rows, cols, 0)
     } else {
+        const RING_CAP: usize = 1000;
+        let in_ring = scrollback_lines.len().min(RING_CAP);
+        let (to_store, to_ring) = scrollback_lines.split_at(scrollback_lines.len() - in_ring);
         let mut scrollback = Scrollback::with_defaults();
         scrollback.set_line_limit(store_lines);
-        for line in scrollback_lines {
+        for line in to_store {
             // push_line is infallible for the in-memory tier.
             scrollback.push_line(line.clone());
         }
-        Grid::with_tiered_scrollback(rows, cols, 1000, scrollback)
+        let mut grid = Grid::with_tiered_scrollback(rows, cols, RING_CAP, scrollback);
+        grid.scroll_in_history(to_ring);
+        grid
     };
     grid.restore_visible_from_lines(visible_lines);
+    grid.damage_mut().mark_full();
     cursor.apply(&mut grid);
     grid
 }
@@ -1309,6 +2009,52 @@ fn restore_grid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `lift_screen` moves the screen's top lines into its history (on the alternate screen, a history of just those; under a history limit too small for them, one that holds them) and the cursor up with its line, hidden once its line is history.
+    #[test]
+    fn a_lifted_screen_keeps_its_top_lines_as_history_and_its_cursor_on_its_line() {
+        for (alt, limit) in [
+            (false, None),
+            (true, None),
+            (false, Some(0)),
+            (false, Some(1)),
+        ] {
+            let mut t = Terminal::new(5, 10);
+            t.set_scrollback_line_limit(limit);
+            if alt {
+                t.process(b"\x1b[?1049h");
+            }
+            t.process(b"a\r\nb\r\nc\r\nd\r\ne");
+            t.lift_screen(2);
+            let alt = format!("{alt} limit={limit:?}");
+            let line = |t: &Terminal, r: i32| t.get_line_text(r, None).unwrap_or_default();
+            assert_eq!(
+                (line(&t, -2), line(&t, -1), line(&t, 0), line(&t, 2)),
+                ("a".into(), "b".into(), "c".into(), "e".into()),
+                "alt={alt}"
+            );
+            assert_eq!(
+                line(&t, 3).trim_end(),
+                "",
+                "alt={alt}: blank rows join the bottom"
+            );
+            assert_eq!(t.grid().scrollback_lines(), 2, "alt={alt}");
+            assert_eq!((t.cursor().row, t.cursor().col), (2, 1), "alt={alt}");
+            assert!(t.cursor_visible(), "alt={alt}");
+        }
+        let mut t = Terminal::new(5, 10);
+        t.process(b"top\x1b[H");
+        t.lift_screen(1);
+        assert!(
+            !t.cursor_visible(),
+            "a cursor whose line is history is hidden"
+        );
+        let mut t = Terminal::new(3, 10);
+        t.process(b"a\r\nb\r\nc");
+        t.lift_screen(9);
+        assert_eq!(t.grid().scrollback_lines(), 2, "at most every row but one");
+        assert_eq!(t.get_line_text(0, None).as_deref(), Some("c"));
+    }
 
     #[cfg(feature = "serde")]
     #[test]

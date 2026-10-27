@@ -7,9 +7,10 @@
 # vendored upstream (`vendor/`).
 name = "once_cell"
 # Not `version.workspace = true`: this is a semver contract with the consumers.
-# It must satisfy the strictest requirement (`naga`, `wgpu-core` and
-# `wgpu-hal` 29.0.3 ask `^1.21`) and stay >= any other `1.x` once_cell in the
-# graph, or cargo picks the registry copy and the patch row is silently inert.
+# It must satisfy the strictest requirement (rustls 0.23.41 asks `^1.16`; naga,
+# wgpu-core and wgpu-hal asked `^1.21` until GW.6 removed them) and stay >= any
+# other `1.x` once_cell in the graph, or cargo picks the registry copy and the
+# patch row is silently inert.
 # `targo --unverified forge check` fails if that happens.
 version = "1.21.4"
 edition.workspace = true

@@ -137,9 +137,6 @@ pub mod proto;
 mod recover;
 #[cfg(feature = "retention")]
 pub mod retention;
-/// cfg(unix): sharding binds one Unix-domain socket per shard, and std has no
-/// Unix-domain sockets on Windows (where the broker serves TCP only).
-#[cfg(unix)]
 pub mod sharded;
 mod storage;
 pub mod store;
@@ -152,14 +149,16 @@ pub use brecord::{
     MAX_RECORD_PAYLOAD, RETIRE_PRODUCER_SEQ,
 };
 pub use broker::{
-    broker_batch_clamp, broker_wake_attempts_within_cap, identity_principal, Broker, BrokerHandle,
-    BrokerStats, IDLE_MARK, IDLE_MARK_DEADLINE, KEEPALIVE_DEADLINE, KEEPALIVE_INTERVAL,
+    broker_batch_clamp, broker_wake_attempts_within_cap, identity_principal, tail_skip_clamp,
+    tail_wake_head_advance, tail_wake_is_caught_up, Broker, BrokerHandle, BrokerStats,
+    FollowerTransport, IDLE_MARK, IDLE_MARK_DEADLINE, KEEPALIVE_DEADLINE, KEEPALIVE_INTERVAL,
 };
 pub use client::{
     ack, acks_owed, broker_refusal, client_walk_page_advance, client_walk_within_limit, connect,
     drain, protocol_mismatch, take, AcksOwed, AnyClient, AnyStream, AnySubscription, BrokerRefusal,
-    Client, Closer, CreditWindow, Event, Page, ProtocolMismatch, Record, SubjectBudget,
-    Subscription, SubscriptionCloser, Transport, Walk, ACK_SEQ_BASE, LAST_WALK_PAGES_MAX,
+    Client, Closer, CreditWindow, Event, Page, Pipelined, ProtocolMismatch, Record, StampedPage,
+    StampedRecord, SubjectBudget, Subscription, SubscriptionCloser, Transport, Walk, ACK_SEQ_BASE,
+    LAST_WALK_PAGES_MAX,
 };
 
 /// Capability minting and principal derivation (`cap` feature), re-exported so
@@ -175,31 +174,36 @@ pub use astream_cap::{mint, producer_id_of, Capability};
 pub use astream_aead::{IdentityKeypair, ID_PUB_LEN};
 #[cfg(feature = "retention")]
 pub use broker::RETENTION_INTERVAL;
-pub use escalation::{Escalate, Escalation};
+pub use escalation::{
+    parse_escalation, parse_escalation_file, Escalate, Escalation, EscalationParseError,
+    EscalationParseKind,
+};
 pub use health::{health_path, read_health, BrokerHealth, HealthRead, HealthWriter, HEALTH_SUFFIX};
 pub use logid::{
     identity_path, logid_generation_advance, logid_lineage_within_cap, Lineage, LogIdentity,
 };
 pub use proto::{
-    Gap, HelloHealth, NonceExt, Request, Response, ServedInfo, ServedReason, Tier,
-    ERR_RETIRE_REFUSED, HELLO_REASON_MAX, REQUEST_GAP_NOTICES, REQUEST_RETIRE,
+    AttachedProducerStats, FaceStats, Gap, HelloHealth, NonceExt, Request, Response, ServedInfo,
+    ServedReason, Tier, WireStats, ERR_RETIRE_REFUSED, HELLO_REASON_MAX, REQUEST_BROKER_TIMES,
+    REQUEST_GAP_NOTICES, REQUEST_RETIRE, REQUEST_STATS, REQUEST_TOLD_FETCH,
 };
 pub use recover::{recover_keep_within_len, recover_unit_start_advance};
 #[cfg(feature = "retention")]
 pub use retention::{parse_rule_line, parse_rules, record_bytes, Class, Keep, Retention, Rule};
+pub use sharded::{sharded_clamp_index, sharded_count_nonzero, ShardedBroker, ShardedHandle};
 #[cfg(unix)]
-pub use sharded::{
-    sharded_clamp_index, sharded_count_nonzero, ShardedBroker, ShardedClient, ShardedEvent,
-    ShardedHandle, ShardedSubscription,
-};
+pub use sharded::{ShardedClient, ShardedEvent, ShardedSubscription};
 pub use storage::{storage_len_advance, storage_truncate_within_len};
+#[cfg(feature = "anti-rollback")]
+pub use store::AntiRollback;
 #[cfg(feature = "retention")]
 pub use store::RetentionTick;
 pub use store::{
-    incarnation_base, incarnation_of, is_hidden_record, on_boot_volume,
-    store_ack_seq_in_reserved_half, store_head_advance, will_seq, Boot, BrokerLog,
-    CheckedPublishError, Durability, FlushCounts, InjectedFaults, LogStats, OpenOptions, Prepared,
-    Volume, INC_MAX, ORDERED_HORIZON, RETIRE_SUBJECT, WILL_SEQ_LOW,
+    at_rest_version_advance, at_rest_version_is_bound, broker_bt_advance, incarnation_base,
+    incarnation_of, is_hidden_record, on_boot_volume, store_ack_seq_in_reserved_half,
+    store_head_advance, will_seq, Boot, BrokerLog, CheckedPublishError, Durability, FlushCounts,
+    InjectedFaults, LogStats, OpenOptions, Prepared, ToldPage, Volume, INC_MAX, ORDERED_HORIZON,
+    RETIRE_SUBJECT, WILL_SEQ_LOW,
 };
 
 #[cfg(test)]

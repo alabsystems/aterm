@@ -1232,7 +1232,9 @@ impl ConsentState {
         self.fda_at(gate, interval, now, false, SlotLock::Try).0
     }
 
-    fn fda(&self, gate: ProbeGate, interval: Duration) -> (FdaProbe, Duration) {
+    /// The FDA probe's answer no older than `interval`, dispatching a fresh probe when it is
+    /// (the Security page's cadence, or the permission walk's quarter second).
+    pub(crate) fn fda(&self, gate: ProbeGate, interval: Duration) -> (FdaProbe, Duration) {
         self.fda_read(gate, interval, true, SlotLock::Try)
     }
 

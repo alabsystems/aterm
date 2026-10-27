@@ -13,6 +13,7 @@ use crate::cursor_glow::Geom;
     reason = "the rect + blend mode IS the call; a struct would relocate the same list and cost \
               every existing caller a construction"
 )]
+#[inline]
 pub(crate) fn push_grid_quad(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -145,6 +146,7 @@ pub(crate) fn push_fx_quad(
 }
 
 /// Push a soft round mark of additive light at `(cx, cy)` with radii `(rx, ry)` and centre coverage `peak`.
+#[inline]
 pub(crate) fn push_soft_disc(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -164,6 +166,17 @@ pub(crate) fn push_soft_disc(
     }
     let inv_rx = 1.0 / rx;
     let inv_ry = 1.0 / ry;
+    #[inline]
+    const fn ellipse_level(x: f32, inv_rx: f32, dy2: f32, peak: f32, color: u32) -> u32 {
+        let u = x * inv_rx;
+        let w = (1.0 - u * u - dy2).max(0.0);
+        let cov = (peak * w * w).round().clamp(0.0, 255.0) as u8;
+        premul_rgb(color, cov)
+    }
+    #[inline]
+    const fn ellipse_knot(k: usize, span: f32, step: f32) -> f32 {
+        -span + k as f32 * step
+    }
     let mut y = y0;
     while y < y1 {
         let dy = (y as f32 + 0.5 - cy) * inv_ry;
@@ -172,22 +185,15 @@ pub(crate) fn push_soft_disc(
         if rest > 0.0 {
             let span = rx * crate::color_math::sqrt_f32(rest);
             let step = span * (1.0 / SEGMENTS as f32);
-            let level = |x: f32| {
-                let u = x * inv_rx;
-                let w = (1.0 - u * u - dy2).max(0.0);
-                let cov = (peak * w * w).round().clamp(0.0, 255.0) as u8;
-                premul_rgb(color, cov)
-            };
-            let knot = |k: usize| -span + k as f32 * step;
-            let x0 = knot(0);
+            let x0 = ellipse_knot(0, span, step);
             let mut ia = (cx + x0).round() as i32;
-            let mut a = level(x0);
+            let mut a = ellipse_level(x0, inv_rx, dy2, peak, color);
             let mut k = 0;
             while k < 2 * SEGMENTS {
-                let xb = knot(k + 1);
+                let xb = ellipse_knot(k + 1, span, step);
                 k += 1;
                 let ib = (cx + xb).round() as i32;
-                let b = level(xb);
+                let b = ellipse_level(xb, inv_rx, dy2, peak, color);
                 if ib > ia && (a != 0 || b != 0) {
                     push_fx_ramp(out, geom, ia, y, ib - ia, 1, (a, 0), (b, 0));
                 }
@@ -204,6 +210,7 @@ pub(crate) fn push_soft_disc(
     clippy::too_many_arguments,
     reason = "the rect + both ramp ends IS the call, as in `push_fx_quad`"
 )]
+#[inline]
 pub(crate) fn push_fx_ramp(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -233,28 +240,43 @@ pub(crate) fn push_fx_ramp(
     if x1 <= x0 || y1 <= y0 {
         return;
     }
+    #[inline]
+    const fn ramp_end_at(
+        px: i32,
+        x: i32,
+        inv_w: f32,
+        left: (u32, u8),
+        right: (u32, u8),
+    ) -> (u32, u8) {
+        let t = (px - x) as f32 * inv_w;
+        let color = if left.0 == right.0 {
+            left.0 & 0x00FF_FFFF
+        } else {
+            lerp_rgb(left.0, right.0, t)
+        };
+        let alpha = if left.1 == right.1 {
+            left.1
+        } else {
+            let a = (left.1 as f32 + (right.1 as f32 - left.1 as f32) * t).round() as u32;
+            let clamped = if a < 255 { a as u8 } else { 255 };
+            if clamped > 1 { clamped } else { 1 }
+        };
+        (color, alpha)
+    }
     let ((c0, a0), (c1, a1)) = if left == right || (x0 == x && x1 == x + w) {
         (left, right)
     } else {
         let inv_w = 1.0 / w as f32;
-        let at = |px: i32| -> (u32, u8) {
-            let t = (px - x) as f32 * inv_w;
-            let color = if left.0 == right.0 {
-                left.0 & 0x00FF_FFFF
-            } else {
-                lerp_rgb(left.0, right.0, t)
-            };
-            let alpha = if left.1 == right.1 {
-                left.1
-            } else {
-                let a = (f32::from(left.1) + (f32::from(right.1) - f32::from(left.1)) * t).round()
-                    as u32;
-                (a.min(255) as u8).max(1)
-            };
-            (color, alpha)
+        let end0 = if x0 == x {
+            left
+        } else {
+            ramp_end_at(x0, x, inv_w, left, right)
         };
-        let end0 = if x0 == x { left } else { at(x0) };
-        let end1 = if x1 == x + w { right } else { at(x1) };
+        let end1 = if x1 == x + w {
+            right
+        } else {
+            ramp_end_at(x1, x, inv_w, left, right)
+        };
         (end0, end1)
     };
     let ch = geom.ch as i32;
@@ -636,6 +658,7 @@ const fn star_pieces_cached(arm: i32, gold: bool) -> Option<&'static StarPieces>
 }
 
 #[must_use]
+#[inline]
 const fn build_star_pieces(arm: i32, gold: bool) -> StarPieces {
     let none = StarPiece {
         part: StarPart::Body,
@@ -752,6 +775,7 @@ const fn build_star_pieces(arm: i32, gold: bool) -> StarPieces {
     reason = "output + geometry + centre + arm + coverage + glint + colour + budget; \
               the call sites are the emitters' whole star kit and share this one shape"
 )]
+#[inline]
 pub(crate) fn push_twinkle_star(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -766,11 +790,18 @@ pub(crate) fn push_twinkle_star(
     if cov == 0 || arm < 1 {
         return true;
     }
+    #[inline]
+    const fn star_paint_at(color: u32, cov_f: f32, share: f32) -> u32 {
+        premul_rgb(color, (cov_f * share) as u8)
+    }
     let cov_f = f32::from(cov);
-    let at = |share: f32| premul_rgb(color, (cov_f * share) as u8);
     let body_paint = premul_rgb(color, cov);
-    let core_paint = at(STAR_CORE_ADD);
-    let glint_paint = if gold { at(STAR_GLINT_COV) } else { 0 };
+    let core_paint = star_paint_at(color, cov_f, STAR_CORE_ADD);
+    let glint_paint = if gold {
+        star_paint_at(color, cov_f, STAR_GLINT_COV)
+    } else {
+        0
+    };
     let mut last_tip: Option<(u8, u32)> = None;
     let mut ended = false;
     let fallback;
@@ -793,7 +824,7 @@ pub(crate) fn push_twinkle_star(
                 let tip = match last_tip {
                     Some((s, cached)) if s == step => cached,
                     _ => {
-                        let c = at(taper);
+                        let c = star_paint_at(color, cov_f, taper);
                         last_tip = Some((step, c));
                         c
                     }
@@ -841,11 +872,19 @@ pub(crate) fn caret_cell_worst_contrast(
 ) -> f32 {
     let (cx, cy, cw, ch) = cell;
     let mut px = vec![fill & 0x00FF_FFFF; (cw * ch) as usize];
-    for q in quads {
+    let mut qi = 0;
+    while qi < quads.len() {
+        let q = &quads[qi];
+        qi += 1;
         let (qx0, qy0) = (i32::from(q.x), i32::from(q.y));
         let (qx1, qy1) = (qx0 + i32::from(q.w), qy0 + i32::from(q.h));
-        for y in qy0.max(cy)..qy1.min(cy + ch) {
-            for x in qx0.max(cx)..qx1.min(cx + cw) {
+        let y_end = qy1.min(cy + ch);
+        let x_start = qx0.max(cx);
+        let x_end = qx1.min(cx + cw);
+        let mut y = qy0.max(cy);
+        while y < y_end {
+            let mut x = x_start;
+            while x < x_end {
                 let d = &mut px[((y - cy) * cw + (x - cx)) as usize];
                 let blend = |sh: u32| {
                     let (dc, sc) = ((*d >> sh) & 0xff, (q.color >> sh) & 0xff);
@@ -856,7 +895,9 @@ pub(crate) fn caret_cell_worst_contrast(
                     }
                 };
                 *d = (blend(16) << 16) | (blend(8) << 8) | blend(0);
+                x += 1;
             }
+            y += 1;
         }
     }
     px.iter()

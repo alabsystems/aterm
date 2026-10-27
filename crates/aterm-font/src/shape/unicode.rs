@@ -160,10 +160,27 @@ pub(crate) fn init_unicode_props(info: &mut GlyphInfo, scratch_flags: &mut u32) 
             }
         }
         if gc.is_mark() {
-            props |= unicode_props::CONTINUATION;
+            props |= (u16::from(super::ccc::char_modified_combining_class(u)) << 8)
+                | unicode_props::CONTINUATION;
         }
     }
     info.unicode_props = props;
+}
+
+#[inline]
+pub(crate) const fn modified_combining_class(info: &GlyphInfo) -> u8 {
+    if info.gc.is_mark() {
+        (info.unicode_props >> 8) as u8
+    } else {
+        0
+    }
+}
+
+#[inline]
+pub(crate) const fn set_modified_combining_class(info: &mut GlyphInfo, ccc: u8) {
+    if info.gc.is_mark() {
+        info.unicode_props = (info.unicode_props & 0x00FF) | ((ccc as u16) << 8);
+    }
 }
 
 #[inline]

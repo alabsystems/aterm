@@ -659,7 +659,9 @@ mod tests {
             denied.push(launch_agents.join(format!("aterm_write_probe_{pid}")));
         }
         let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical TMPDIR");
-        let user_cache = tmp.parent().map(|per_user| per_user.join("C"));
+        let user_cache = crate::sbpl::user_temp_root(&tmp)
+            .parent()
+            .map(|per_user| per_user.join("C"));
         if tmp.starts_with(crate::sbpl::USER_TEMP_PARENT)
             && let Some(cache) = user_cache.filter(|c| c.is_dir())
         {
@@ -717,10 +719,104 @@ mod tests {
         }
     }
 
-    /// A scratch `$HOME` under the test binary's target directory, outside
-    /// every [`crate::sbpl::WRITABLE_ROOTS`] entry.
+    /// RAII scratch `$HOME` directory outside every Seatbelt writable root.
     #[cfg(target_os = "macos")]
-    fn scratch_home_outside_writable_roots(tag: &str) -> std::path::PathBuf {
+    struct ScratchHome(std::path::PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl std::ops::Deref for ScratchHome {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl AsRef<std::path::Path> for ScratchHome {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl AsRef<std::ffi::OsStr> for ScratchHome {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.0.as_os_str()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ScratchHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Whether canonical `dir` lies outside [`crate::sbpl::WRITABLE_ROOTS`] and
+    /// [`crate::sbpl::USER_TEMP_PARENT`] (`$TMPDIR`).
+    #[cfg(target_os = "macos")]
+    fn outside_writable_roots(dir: &std::path::Path) -> bool {
+        !crate::sbpl::WRITABLE_ROOTS
+            .iter()
+            .any(|root| dir.starts_with(root))
+            && !dir.starts_with(crate::sbpl::USER_TEMP_PARENT)
+    }
+
+    /// Pick a canonical parent directory outside every Seatbelt writable root:
+    /// `profile` when the build target sits outside `/private/tmp`, `/private/var/tmp`,
+    /// `/dev` and `/private/var/folders`, or `<HOME>/Library/Caches/aterm/sbpl-proof.noindex`
+    /// when a worktree or `CARGO_TARGET_DIR` lives under a temporary root.
+    #[cfg(target_os = "macos")]
+    fn select_scratch_home_parent(
+        profile: &std::path::Path,
+        real_home: Option<&std::path::Path>,
+    ) -> Result<std::path::PathBuf, String> {
+        let dir =
+            std::fs::canonicalize(profile).map_err(|e| format!("{}: {e}", profile.display()))?;
+        if outside_writable_roots(&dir) {
+            return Ok(dir);
+        }
+        let Some(home) = real_home.filter(|p| !p.as_os_str().is_empty()) else {
+            return Err(format!(
+                "{} lies under a writable root and HOME is unset",
+                dir.display()
+            ));
+        };
+        let canon_home = std::fs::canonicalize(home).map_err(|e| {
+            format!(
+                "{} lies under a writable root and HOME ({}) failed to resolve: {e}",
+                dir.display(),
+                home.display()
+            )
+        })?;
+        if !outside_writable_roots(&canon_home) {
+            return Err(format!(
+                "both {} and HOME ({}) lie under writable roots",
+                dir.display(),
+                canon_home.display()
+            ));
+        }
+        let cache = canon_home.join("Library/Caches/aterm/sbpl-proof.noindex");
+        std::fs::create_dir_all(&cache).map_err(|e| format!("{}: {e}", cache.display()))?;
+        let canon_cache =
+            std::fs::canonicalize(&cache).map_err(|e| format!("{}: {e}", cache.display()))?;
+        if !outside_writable_roots(&canon_cache) {
+            return Err(format!(
+                "fallback {} lies under a writable root",
+                canon_cache.display()
+            ));
+        }
+        Ok(canon_cache)
+    }
+
+    /// A scratch `$HOME` outside [`crate::sbpl::WRITABLE_ROOTS`] and
+    /// [`crate::sbpl::USER_TEMP_PARENT`], under the test binary's target
+    /// directory when outside temporary roots or `~/Library/Caches/aterm/sbpl-proof.noindex`
+    /// when the checkout or target directory lives under `/tmp` or `$TMPDIR`.
+    #[cfg(target_os = "macos")]
+    fn scratch_home_outside_writable_roots(tag: &str) -> ScratchHome {
+        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let refuse = |why: String| -> ! {
             aterm_spec::host::could_not_run(format!("no scratch HOME for the {tag} proof: {why}"))
         };
@@ -729,18 +825,80 @@ mod tests {
             .parent()
             .and_then(std::path::Path::parent)
             .unwrap_or_else(|| refuse(format!("{} has no profile directory", exe.display())));
-        let dir = std::fs::canonicalize(profile)
-            .unwrap_or_else(|e| refuse(format!("{}: {e}", profile.display())));
-        if crate::sbpl::WRITABLE_ROOTS
-            .iter()
-            .any(|root| dir.starts_with(root))
-        {
-            refuse(format!("{} lies under a writable root", dir.display()));
-        }
-        let home = dir.join(format!("aterm-sbpl-home-{tag}-{}", std::process::id()));
+        let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let dir = select_scratch_home_parent(profile, real_home.as_deref())
+            .unwrap_or_else(|why| refuse(why));
+        let seq = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let home = dir.join(format!(
+            "aterm-sbpl-home-{tag}-{}-{seq}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir(&home).unwrap_or_else(|e| refuse(format!("{}: {e}", home.display())));
-        home
+        ScratchHome(home)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scratch_home_falls_back_from_writable_target_and_refuses_writable_home() {
+        let tmp_profile = aterm_tempfile::tempdir().expect("temp profile under TMPDIR");
+        let slash_tmp = std::path::Path::new("/private/tmp");
+        assert!(!outside_writable_roots(slash_tmp));
+        assert!(
+            !outside_writable_roots(
+                &std::fs::canonicalize(tmp_profile.path()).expect("canonicalize TMPDIR child")
+            ),
+            "$TMPDIR children are writable under Containment and must never host a confinement scratch HOME"
+        );
+
+        let erred_unset = select_scratch_home_parent(slash_tmp, None);
+        assert!(
+            erred_unset.is_err(),
+            "a writable profile with no HOME must refuse: {erred_unset:?}"
+        );
+        let erred_writable_home = select_scratch_home_parent(slash_tmp, Some(tmp_profile.path()));
+        assert!(
+            erred_writable_home.is_err(),
+            "a writable profile whose HOME also lies under TMPDIR must refuse: {erred_writable_home:?}"
+        );
+
+        let Some(real_home) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .and_then(|h| std::fs::canonicalize(h).ok())
+            .filter(|h| outside_writable_roots(h))
+        else {
+            return;
+        };
+        for denied in crate::sbpl::SECRET_SUBDIRS
+            .iter()
+            .chain(crate::sbpl::PRIVATE_SUBDIRS)
+            .chain(crate::sbpl::APP_DATA_ROOTS)
+        {
+            assert!(
+                !std::path::Path::new("Library/Caches/aterm/sbpl-proof.noindex")
+                    .starts_with(denied),
+                "fallback cache path must stay outside denied HOME subpath {denied}"
+            );
+        }
+        let chosen = select_scratch_home_parent(slash_tmp, Some(&real_home))
+            .expect("real HOME provides fallback outside writable roots");
+        assert!(outside_writable_roots(&chosen));
+        assert!(chosen.ends_with("Library/Caches/aterm/sbpl-proof.noindex"));
+
+        let direct = select_scratch_home_parent(&chosen, Some(slash_tmp))
+            .expect("an already non-writable profile needs no HOME fallback");
+        assert_eq!(direct, chosen);
+
+        let guard_path = {
+            let guard = scratch_home_outside_writable_roots("drop-probe");
+            let p = guard.to_path_buf();
+            assert!(p.is_dir());
+            p
+        };
+        assert!(
+            !guard_path.exists(),
+            "ScratchHome Drop must clean up its directory"
+        );
     }
 
     /// Proof 5b (history, over a scratch `$HOME`): the history allowance works

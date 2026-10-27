@@ -149,6 +149,11 @@ impl Grid {
     }
 
     /// Scrolls `lines` (oldest first) through the top row into history.
+    pub fn scroll_in_history(&mut self, lines: &[Line]) {
+        self.scroll_in(lines);
+    }
+
+    /// Scrolls `lines` (oldest first) through the top row into history.
     fn scroll_in(&mut self, lines: &[Line]) {
         let cols = self.cols();
         for line in lines {

@@ -232,12 +232,17 @@ fn capturing_stub() -> (u16, mpsc::Receiver<Vec<u8>>) {
         let Ok((mut stream, _)) = listener.accept() else {
             return;
         };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let _ = stream.set_read_timeout(Some(HANG_DETECTOR));
         let mut seen = Vec::new();
         let mut buf = [0u8; 4096];
         while let Ok(read) = stream.read(&mut buf) {
             if read == 0 {
                 break;
+            }
+            // Its first bytes in, the stub hangs up its side: the client's handshake ends on that
+            // at once, not at its deadline, and whatever it writes after is still read here.
+            if seen.is_empty() {
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
             seen.extend_from_slice(&buf[..read]);
         }
@@ -250,15 +255,11 @@ fn capturing_stub() -> (u16, mpsc::Receiver<Vec<u8>>) {
 fn an_https_endpoint_puts_a_client_hello_on_the_wire_and_never_the_body() {
     let secret = br#"{"model":"m","prompt":"CANARY-MUST-NEVER-APPEAR-IN-CLEARTEXT"}"#;
     let (port, rx) = capturing_stub();
-    let error = Client::new(
-        Trust::PlatformVerifier,
-        ProxyMode::Direct,
-        Duration::from_secs(1),
-    )
-    .post(&format!("https://127.0.0.1:{port}/api/chat"))
-    .limit(4096)
-    .send(secret)
-    .expect_err("a peer that speaks no TLS cannot complete a handshake");
+    let error = client()
+        .post(&format!("https://127.0.0.1:{port}/api/chat"))
+        .limit(4096)
+        .send(secret)
+        .expect_err("a peer that speaks no TLS cannot complete a handshake");
 
     let seen = rx
         .recv_timeout(HANG_DETECTOR)

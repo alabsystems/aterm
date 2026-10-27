@@ -988,11 +988,15 @@ fn a_weekly_usage_limit_does_not_raise_a_nag_exception() {
 #[test]
 fn an_api_errors_wall_held_after_its_notice_left_is_told_stalled_not_a_limit() {
     let kind = WallKind::ApiError {
-        code: Some(500),
+        code: None,
         retryable: true,
-        cause: aterm_phase::ApiCause::Server,
+        cause: aterm_phase::ApiCause::CutOff,
     };
-    let mut r = walled(kind, "API Error: 500 Internal server error");
+    let mut r = walled(
+        kind,
+        "API Error: Your computer went to sleep mid-response. The response above may be \
+         incomplete.",
+    );
     let mut st = TurnEndState::default();
     let mut now = t0();
     let mut tries = 0;
@@ -1035,4 +1039,48 @@ fn an_api_errors_wall_held_after_its_notice_left_is_told_stalled_not_a_limit() {
         Some(Exception::repeats(crate::harness::acts::HeldBy::SameReply)),
         "an API error's track is no limit"
     );
+}
+
+/// AN OUTAGE WALL RAISES NOTHING (v6 §14.17.5.2): a server error answered the same at each of
+/// its tries is waited out on its ladder for hours, never held and never told, at the wall and
+/// once its notice left the screen.
+#[test]
+fn an_outage_walls_same_answers_raise_nothing_however_long_it_stands() {
+    let kind = WallKind::ApiError {
+        code: Some(500),
+        retryable: true,
+        cause: aterm_phase::ApiCause::Server,
+    };
+    let mut r = walled(kind, "API Error: 500 Internal server error");
+    let mut st = TurnEndState::default();
+    let start = t0();
+    let mut now = start;
+    let mut tries = 0;
+    while now < start + 6 * 60 * MIN {
+        let (a, told) = point(&mut st, &r, &cfg(), now);
+        assert_eq!(told, None, "after {tries} tries");
+        match a {
+            TurnEndAction::WaitUntil { until, .. } => {
+                now = until;
+                r.worked = None;
+            }
+            a => {
+                assert!(a.rule_id().is_some(), "{a:?}");
+                st.acted(&a, &r, now);
+                tries += 1;
+                now += Duration::from_secs(5);
+                r.worked = Some(Duration::from_secs(4));
+            }
+        }
+    }
+    assert!(tries > 2 * FUTILE_AFTER_TRIES, "it kept trying: {tries}");
+    assert_eq!(st.held_by(), None, "{:?}", st.replies());
+    let left = TurnEndReading {
+        wall: None,
+        wall_message: String::new(),
+        worked: None,
+        ..r
+    };
+    let (_, told) = point(&mut st, &left, &cfg(), now + MIN);
+    assert_eq!(told, None, "its notice left the screen");
 }

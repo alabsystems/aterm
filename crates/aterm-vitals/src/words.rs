@@ -1483,6 +1483,27 @@ fn memory_details(snap: &Snapshot) -> Vec<Clause> {
         }
         Pressure::Unknown => {}
     }
+    if let Some(top) = crate::services::over_in(snap).first() {
+        let name = crate::sys::exe_word(top.lead.exe.as_deref().unwrap_or("-"));
+        let state = match top.size {
+            crate::services::Size::Huge => State::Critical,
+            _ => State::Warn,
+        };
+        let (mark, ink) = state_mark(Resource::Memory, state);
+        let held = mem(top.footprint);
+        out.push(
+            Clause::new(
+                0,
+                vec![
+                    format!("macOS's {name} holds {held}"),
+                    format!("{name} holds {held}"),
+                ],
+            )
+            .kept()
+            .marked(Some(mark))
+            .inked(ink),
+        );
+    }
     if let Some(r) = snap.facts.swap_rate.filter(|r| *r >= MIB) {
         out.push(Clause::new(
             1,
@@ -2172,143 +2193,164 @@ pub const GLANCE_BUSIEST_CORES: f32 = 1.0;
 /// of the system's limit and cannot show the user's.
 pub const GLANCE_YOURS_NEAR: f64 = 0.8;
 
+/// From this write rate, bytes a second, the deck's Disk Details says aterm's writes.
+pub const GLANCE_WRITES_BPS: f64 = 1e6;
+
 /// A rate against a capacity under 1 MB/s is said in whole KB/s (decimal, as Finder writes
 /// it), so a share the % prints never sits beside a figure of `0.0`.
 const GLANCE_KB_BELOW_BPS: f64 = 0.95e6;
 
-/// The amount where the deck shows Details: the figure in its unit, since the % and the bar's
-/// track say its share of capacity. A share of something other than the row's own capacity keeps
-/// its base: Network's peak (or link; `18 of 200 KB/s peak`), the per-user process limit. The
-/// GPU says none (its % is the reading).
+/// A row's one figure run in the deck's glance, said once at the end of its scope bar (the
+/// owner, 2026-10-26: "the stats in columns after the time series doesn't make sense to me"):
+/// this Mac's reading in the row's unit, longest first, with the row's maximum (`11.0 of 18
+/// cores`, `112.6 of 128 GiB`, `1.36 of 2.00 TB`), then without it (`11.0 cores`). A share of
+/// something other than the row's own capacity keeps its base: Network's peak (`8 of 200 KB/s
+/// peak`), the per-user process limit where it binds (`897 of 10,666 yours`). Processes say no
+/// other maximum (the system's limit is no use as one) and give way to their bare count last.
+/// Network says both directions' live rates where the link's are read (`↓4K ↑3K/s`). Empty where
+/// the row says no figure: the GPU, whose % is its reading, and a row not read yet. aterm's and
+/// this tab's amounts are the bar's segments and the lens's figures, never a run of their own.
 #[must_use]
-pub fn glance_amount(res: Resource, view: &ResourceView, loc: &Locale) -> Vec<String> {
-    match res {
-        Resource::Cpu => view
-            .now
-            .map(|now| vec![format!("{} cores", fixed(now, 1))])
-            .unwrap_or_default(),
-        Resource::Gpu => Vec::new(),
-        Resource::Memory => view
-            .now
-            .map(|now| vec![format!("{} GiB", fixed(now / GIB, 1))])
-            .unwrap_or_default(),
-        Resource::Disk => glance_disk(view).into_iter().collect(),
+pub fn glance_run(
+    res: Resource,
+    view: &ResourceView,
+    snap: &Snapshot,
+    loc: &Locale,
+) -> Vec<String> {
+    let (mac, unit): (Option<String>, Vec<String>) = match res {
+        Resource::Cpu => match view.now {
+            Some(now) => (
+                Some(fixed(now, 1)),
+                match view.capacity {
+                    Some(n) => vec![format!("of {n:.0} cores"), "cores".into()],
+                    None => vec!["cores".into()],
+                },
+            ),
+            None => (None, Vec::new()),
+        },
+        Resource::Gpu => (None, Vec::new()),
+        Resource::Memory => match view.now {
+            Some(now) => (
+                Some(fixed(now / GIB, 1)),
+                match view.capacity {
+                    Some(t) => vec![format!("of {} GiB", gib_total(t as u64)), "GiB".into()],
+                    None => vec!["GiB".into()],
+                },
+            ),
+            None => (None, Vec::new()),
+        },
+        Resource::Disk => glance_disk(view),
+        Resource::Network if net_rates_read(snap) && view.binding().now.is_some() => {
+            return net_amount_det_forms(snap);
+        }
         Resource::Network => glance_network(view),
-        Resource::Tokens => tokens_amount(view, Ladder::Det),
+        Resource::Tokens => return tokens_amount(view, Ladder::Det),
         Resource::Processes => glance_processes(view, loc.platform),
+    };
+    let Some(mac) = mac else {
+        return Vec::new();
+    };
+    let mut forms: Vec<String> = unit.iter().map(|u| format!("{mac} {u}")).collect();
+    if res == Resource::Processes {
+        forms.push(mac);
+    }
+    forms.dedup();
+    forms
+}
+
+/// Whether the link's own rates are read while it is not offline: the network's run then says
+/// both directions ([`net_amount_det_forms`]), and its Details no other direction.
+fn net_rates_read(snap: &Snapshot) -> bool {
+    snap.net
+        .as_ref()
+        .is_some_and(|n| n.state != NetState::Offline && n.rates.is_some())
+}
+
+/// The used part of the volume in its parts' shared unit, and that unit with the volume's size:
+/// `1.36`, `of 2.00 TB`.
+fn glance_disk(view: &ResourceView) -> (Option<String>, Vec<String>) {
+    let Some(used) = view.now.map(|u| u.max(0.0) as u64) else {
+        return (None, Vec::new());
+    };
+    match view.capacity.map(|c| c as u64).filter(|&t| t > 0) {
+        Some(total) => {
+            let p = parts_of(total, &[used, total.saturating_sub(used)]);
+            let unit = vec![format!("of {} {}", p.whole, p.unit), p.unit.to_owned()];
+            (p.parts.first().cloned(), unit)
+        }
+        None => (None, vec![bytes_dec(used)]),
     }
 }
 
-fn glance_disk(view: &ResourceView) -> Option<String> {
-    let used = view.now?.max(0.0) as u64;
-    Some(match view.capacity.map(|c| c as u64).filter(|&t| t > 0) {
-        Some(total) => {
-            let p = parts_of(total, &[used, total.saturating_sub(used)]);
-            format!("{} {}", p.parts[0], p.unit)
-        }
-        None => bytes_dec(used),
-    })
-}
-
-fn glance_network(view: &ResourceView) -> Vec<String> {
+/// The rate against its peak or link: `8`, `of 200 KB/s peak`, then `of 200 KB/s` (so a run too
+/// short for the word still says the maximum, as every other row's does); with no peak yet, the
+/// rate and why (`2.1`, `MB/s, learning peak`).
+fn glance_network(view: &ResourceView) -> (Option<String>, Vec<String>) {
     let b = view.binding();
-    let (Some(now), Some(word), Some(cap)) = (b.now, basis_word(view.basis), b.capacity) else {
-        return network_amount(view, Ladder::Det);
+    let Some(now) = b.now else {
+        return (None, Vec::new());
+    };
+    let kb = |v: f64| grouped(half_up(v.max(0.0) / 1e3) as u64);
+    let (Some(word), Some(cap)) = (basis_word(view.basis), b.capacity) else {
+        let (n, unit) = if now < GLANCE_KB_BELOW_BPS {
+            (kb(now), "KB/s")
+        } else {
+            (rate_figure(now / 1e6), "MB/s")
+        };
+        let why = if view.basis == CapBasis::Peak {
+            "no peak in 7 days"
+        } else {
+            "learning peak"
+        };
+        return (Some(n), vec![format!("{unit}, {why}"), unit.to_owned()]);
     };
     let (n, c, unit) = if cap < GLANCE_KB_BELOW_BPS {
-        let kb = |v: f64| grouped(half_up(v.max(0.0) / 1e3) as u64);
         (kb(now), kb(cap), "KB/s")
     } else {
         (rate_figure(now / 1e6), rate_figure(cap / 1e6), "MB/s")
     };
-    vec![
-        format!("{n} of {c} {unit} {word}"),
-        format!("{n}/{c} {unit} {word}"),
-    ]
+    (
+        Some(n),
+        vec![
+            format!("of {c} {unit} {word}"),
+            format!("of {c} {unit}"),
+            unit.to_owned(),
+        ],
+    )
 }
 
-fn glance_processes(view: &ResourceView, platform: Platform) -> Vec<String> {
-    if second_binds(view) {
-        return processes_amount(view, Ladder::Cols, platform);
-    }
-    let Some(now) = view.binding().now else {
-        return Vec::new();
+/// The count and what it counts: `897`, `processes` (threads where the platform counts them).
+/// The system's limit (`kern.maxproc`, 16,000) is no maximum worth saying beside a few hundred;
+/// the user's limit is, once it binds: `of 10,666 yours`, then `of 10,666`, before the bare noun.
+fn glance_processes(view: &ResourceView, platform: Platform) -> (Option<String>, Vec<String>) {
+    let b = view.binding();
+    let Some(now) = b.now else {
+        return (None, Vec::new());
     };
-    let n = grouped(half_up(now) as u64);
-    if platform.counts_threads() {
-        vec![format!("{n} threads")]
-    } else {
-        vec![n]
-    }
-}
-
-/// The aterm and Tab cells in the deck: the figure alone, since the amount beside them names its
-/// unit (a disk's writes keep theirs: `0 MB/s`, never a bare `0` beside a TB figure). `None`
-/// where no scope can have a figure (the GPU and the network are read for the whole machine):
-/// the deck draws nothing there, and the lens says why.
-#[must_use]
-pub fn glance_scope(res: Resource, view: &ResourceView, loc: &Locale) -> Option<ScopeForms> {
-    if res == Resource::Gpu
-        || (res == Resource::Network && view.aterm.now.is_none())
-        || view.aterm.missing == Some(NoFigure::NotPerApp)
+    let threads = platform.counts_threads();
+    let mut unit = Vec::new();
+    if second_binds(view)
+        && let Some(c) = b.capacity.map(|c| grouped(half_up(c) as u64))
     {
-        return None;
+        let what = if threads { "your threads" } else { "yours" };
+        unit.extend([format!("of {c} {what}"), format!("of {c}")]);
     }
-    Some(match scope_forms(res, view, loc) {
-        ScopeForms::Each { .. } => ScopeForms::Each {
-            aterm: glance_cell(res, &view.aterm),
-            tab: glance_cell(res, &view.tab),
-        },
-        span @ ScopeForms::Span(_) => span,
-    })
-}
-
-fn glance_cell(res: Resource, fig: &ScopeFig) -> ScopeCell {
-    let (
-        Some(v),
-        Resource::Cpu | Resource::Memory | Resource::Disk | Resource::Network | Resource::Processes,
-    ) = (fig.now, res)
-    else {
-        return scope_cell(res, fig);
-    };
-    if fig.missing == Some(NoFigure::NoAgent) {
-        return scope_cell(res, fig);
-    }
-    let forms = match res {
-        Resource::Cpu => vec![fixed(v, 1)],
-        Resource::Memory => {
-            let g = v / GIB;
-            vec![fixed(g, if g < 0.995 { 2 } else { 1 })]
-        }
-        Resource::Disk => writes_forms(v)
-            .into_iter()
-            .map(|f| match f.strip_prefix("writes ") {
-                Some("0") => "0 MB/s".to_owned(),
-                Some(rate) => rate.to_owned(),
-                None => f,
-            })
-            .collect(),
-        Resource::Network => {
-            let n = grouped(half_up(v) as u64);
-            vec![format!("{n} sock"), n]
-        }
-        _ => vec![grouped(half_up(v) as u64)],
-    };
-    ScopeCell {
-        forms,
-        ink: InkKind::Words,
-    }
+    unit.push(if threads { "threads" } else { "processes" }.to_owned());
+    (Some(grouped(half_up(now) as u64)), unit)
 }
 
 /// The Details clauses the deck draws: a row's state clauses ([`details`]' kept ones) and only
 /// what is unusual now. CPU: the threads waiting for a core while some wait, the cause, and the
-/// busiest program once it burns [`GLANCE_BUSIEST_CORES`]. Memory: pressure past normal and
-/// swapping. Disk: its states and when it fills. Network: the other direction while it moves.
-/// Processes: the jobs' marks, and "yours" from [`GLANCE_YOURS_NEAR`] of the user's limit.
-/// The standing facts (GPU cores and memory, file cache, freed, growth, free space, the link,
-/// TCP) stay in the lens and the spoken sentence.
+/// busiest program once it burns [`GLANCE_BUSIEST_CORES`]. Memory: pressure past normal, a
+/// macOS service past the large bar ([`crate::services`]) and swapping. Disk: its states, when it
+/// fills, and aterm's writes (and the tab's of `panes`) from [`GLANCE_WRITES_BPS`], which no row
+/// figure says: the row's run is the volume's space. Network: the other direction while it moves,
+/// where the run says only the busier one ([`glance_run`]). Processes: the jobs' marks, and
+/// "yours" from [`GLANCE_YOURS_NEAR`] of the user's limit. The standing facts (GPU cores and
+/// memory, file cache, freed, growth, free space, the link, TCP, the sockets) stay in the lens and
+/// the spoken sentence.
 #[must_use]
-pub fn glance_details(res: Resource, snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
+pub fn glance_details(res: Resource, snap: &Snapshot, panes: &[u64], loc: &Locale) -> Vec<Clause> {
     let mut out = match res {
         Resource::Cpu => glance_cpu(snap, loc),
         Resource::Gpu | Resource::Disk => details(res, snap, loc)
@@ -2331,8 +2373,30 @@ pub fn glance_details(res: Resource, snap: &Snapshot, loc: &Locale) -> Vec<Claus
             vec![format!("full in {}", duration_approx(f.secs))],
         ));
     }
+    if res == Resource::Disk {
+        out.extend(glance_writes(snap, panes));
+    }
     out.sort_by_key(|c| (c.prio, !c.keep));
     out
+}
+
+/// aterm's writes, and the tab's of `panes` in the same unit, while aterm writes at least
+/// [`GLANCE_WRITES_BPS`]: `aterm writes 210 MB/s, 190 in Tab 1`, then `aterm writes 210 MB/s`.
+fn glance_writes(snap: &Snapshot, panes: &[u64]) -> Option<Clause> {
+    let view = snap.resource(Resource::Disk, panes);
+    let aterm = view
+        .aterm
+        .now
+        .filter(|&v| v >= GLANCE_WRITES_BPS && view.aterm.missing.is_none())?;
+    let a = rate_mb_lone(aterm);
+    let mut forms = Vec::new();
+    if let (Some(t), Some(tab)) = (view.tab.now, snap.tab_of(panes)) {
+        let t = rate_mb_lone(t.max(0.0));
+        let t = t.strip_suffix(" MB/s").unwrap_or(&t);
+        forms.push(format!("aterm writes {a}, {t} in {}", tab.label));
+    }
+    forms.push(format!("aterm writes {a}"));
+    Some(Clause::new(3, forms))
 }
 
 fn glance_cpu(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
@@ -2430,8 +2494,9 @@ fn glance_network_details(snap: &Snapshot) -> Vec<Clause> {
             }
         }
     }
-    let dual_in_amount = snap.net.as_ref().is_some_and(|n| n.rates.is_some());
-    if !dual_in_amount {
+    // Where the link's rates are read the row's run says both directions ([`glance_run`]);
+    // elsewhere it says the busier one against its peak, and Details the other while it moves.
+    if !net_rates_read(snap) {
         let (other, mark, verb) = if second_binds(view) {
             (Some(view.first()), Mark::Down, "Receiving")
         } else {
@@ -2484,6 +2549,11 @@ pub fn compact_cpu_brand(brand: &str) -> String {
     let before_at = cleaned.split('@').next().unwrap_or(&cleaned);
     let mut kept = Vec::new();
     for raw in before_at.split_whitespace() {
+        let is_ordinal = ["st", "nd", "rd", "th"].iter().any(|suf| {
+            raw.strip_suffix(suf).is_some_and(|digits| {
+                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+            })
+        });
         if raw.eq_ignore_ascii_case("Apple")
             || raw.eq_ignore_ascii_case("AMD")
             || raw.eq_ignore_ascii_case("Intel")
@@ -2492,7 +2562,7 @@ pub fn compact_cpu_brand(brand: &str) -> String {
             || raw.eq_ignore_ascii_case("Processor")
             || raw.ends_with("-Core")
             || raw.ends_with("-core")
-            || (raw.ends_with("th") && raw[..raw.len() - 2].chars().all(|c| c.is_ascii_digit()))
+            || is_ordinal
             || raw.eq_ignore_ascii_case("Gen")
         {
             continue;
@@ -2504,203 +2574,6 @@ pub fn compact_cpu_brand(brand: &str) -> String {
     } else {
         kept.join(" ")
     }
-}
-
-fn disk_total_compact(bytes: u64) -> (String, String) {
-    if bytes >= 1_000_000_000_000 {
-        let tb10 = half_up(bytes as f64 / 100_000_000_000.0) as u64;
-        if tb10.is_multiple_of(10) {
-            let whole = tb10 / 10;
-            (format!("{whole} TB"), format!("{whole}T"))
-        } else {
-            let whole = tb10 / 10;
-            let frac = tb10 % 10;
-            (format!("{whole}.{frac} TB"), format!("{whole}.{frac}T"))
-        }
-    } else if bytes >= 1_000_000_000 {
-        let gb = half_up(bytes as f64 / 1_000_000_000.0).max(1.0) as u64;
-        (format!("{gb} GB"), format!("{gb}G"))
-    } else {
-        let s = disk(bytes);
-        (s.clone(), s)
-    }
-}
-
-/// Compact hardware identity and total capacity candidates (longest first) for the Deck header:
-/// processor chip & core count, total physical memory, and total storage capacity.
-#[must_use]
-pub fn machine_totals_forms(snap: &Snapshot) -> Vec<String> {
-    let cores = snap
-        .total_cores()
-        .or_else(|| {
-            snap.resources[Resource::Cpu.index()]
-                .capacity
-                .map(|c| c as usize)
-        })
-        .filter(|&n| n > 0);
-    let chip = snap
-        .facts
-        .cpu_brand
-        .as_deref()
-        .map(compact_cpu_brand)
-        .filter(|b| !b.is_empty());
-    let proc_full = match (&chip, cores) {
-        (Some(b), Some(n)) => Some(format!("{b} \u{b7} {n}c")),
-        (Some(b), None) => Some(b.clone()),
-        (None, Some(n)) => Some(format!("{n}c")),
-        (None, None) => None,
-    };
-    let proc_tight = match (&chip, cores) {
-        (Some(b), Some(n)) => Some(format!("{b} {n}c")),
-        _ => None,
-    };
-    let proc_short = cores.map(|n| format!("{n}c")).or_else(|| chip.clone());
-    let ram_bytes = snap
-        .mem
-        .as_ref()
-        .map(|m| m.sample.total)
-        .or_else(|| {
-            snap.resources[Resource::Memory.index()]
-                .capacity
-                .map(|c| c as u64)
-        })
-        .filter(|&b| b > 0);
-    let ram = ram_bytes.map(|b| format!("{} GiB", gib_total(b)));
-    let ram_short = ram_bytes.map(|b| format!("{}G", gib_total(b)));
-    let hd_bytes = snap
-        .volume
-        .as_ref()
-        .map(|v| v.total)
-        .or_else(|| {
-            snap.resources[Resource::Disk.index()]
-                .capacity
-                .map(|c| c as u64)
-        })
-        .filter(|&b| b > 0);
-    let hd = hd_bytes.map(disk);
-    let hd_compact = hd_bytes.map(disk_total_compact);
-    let hd_trim = hd_compact.as_ref().map(|(t, _)| t.as_str());
-    let hd_short = hd_compact.as_ref().map(|(_, s)| s.as_str());
-
-    let join = |items: &[Option<&str>]| -> Option<String> {
-        let v: Vec<&str> = items.iter().filter_map(|x| *x).collect();
-        (!v.is_empty()).then(|| v.join(" \u{b7} "))
-    };
-    let mut out = Vec::new();
-    for candidate in [
-        join(&[proc_full.as_deref(), ram.as_deref(), hd.as_deref()]),
-        join(&[proc_full.as_deref(), ram.as_deref(), hd_trim]),
-        join(&[proc_full.as_deref(), ram_short.as_deref(), hd_short]),
-        join(&[proc_tight.as_deref(), ram_short.as_deref(), hd_short]),
-        join(&[proc_short.as_deref(), ram.as_deref(), hd.as_deref()]),
-        join(&[proc_short.as_deref(), ram.as_deref(), hd_trim]),
-        join(&[proc_short.as_deref(), ram_short.as_deref(), hd_short]),
-        join(&[proc_full.as_deref(), ram.as_deref()]),
-        join(&[proc_short.as_deref(), ram.as_deref()]),
-        join(&[proc_short.as_deref(), ram_short.as_deref()]),
-        proc_full,
-        proc_short,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !out.contains(&candidate) {
-            out.push(candidate);
-        }
-    }
-    out
-}
-
-/// Compact live Network connectivity, upload/download, and latency summary forms (longest first).
-#[must_use]
-pub fn net_summary_forms(snap: &Snapshot) -> Vec<String> {
-    let view = &snap.resources[Resource::Network.index()];
-    let net = snap.net.as_ref();
-    let state = net.map_or(NetState::Idle, |n| n.state);
-    if state == NetState::Offline {
-        return vec!["Offline".into()];
-    }
-    let rx = net.and_then(|n| n.rates.map(|r| r.rx_bps)).or(view.now);
-    let tx = net
-        .and_then(|n| n.rates.map(|r| r.tx_bps))
-        .or_else(|| view.second.as_ref().and_then(|s| s.now));
-    let link_word = snap.facts.link.as_ref().and_then(|l| match l.kind {
-        LinkKind::Wifi => Some("Wi-Fi"),
-        LinkKind::Ethernet => Some("Eth"),
-        LinkKind::Cellular => Some("Cell"),
-        LinkKind::Vpn => Some("VPN"),
-        LinkKind::Bridge | LinkKind::Other => None,
-    });
-    let rtt = net.and_then(|n| n.srtt_ms).map(rtt_word);
-    let rtt_tight = rtt.as_deref().map(|r| r.replace(' ', ""));
-    let fmt_rate = |bps: f64| -> String {
-        if bps < 950_000.0 {
-            format!("{}K", grouped(half_up(bps.max(0.0) / 1e3) as u64))
-        } else {
-            format!("{}M", rate_figure(bps / 1e6))
-        }
-    };
-    let traffic = match (rx, tx) {
-        (Some(r), Some(t)) => Some(format!("\u{2193}{} \u{2191}{}/s", fmt_rate(r), fmt_rate(t))),
-        (Some(r), None) => Some(format!("\u{2193}{}/s", fmt_rate(r))),
-        (None, Some(t)) => Some(format!("\u{2191}{}/s", fmt_rate(t))),
-        (None, None) => None,
-    };
-    let traffic_tight = match (rx, tx) {
-        (Some(r), Some(t)) => Some(format!("\u{2193}{} \u{2191}{}", fmt_rate(r), fmt_rate(t))),
-        (Some(r), None) => Some(format!("\u{2193}{}", fmt_rate(r))),
-        (None, Some(t)) => Some(format!("\u{2191}{}", fmt_rate(t))),
-        (None, None) => None,
-    };
-    let st = state.label();
-    let mut out = Vec::new();
-    let push = |out: &mut Vec<String>, s: String| {
-        if !out.contains(&s) {
-            out.push(s);
-        }
-    };
-    if let (Some(lk), Some(tr), Some(rt)) = (link_word, traffic.as_deref(), rtt.as_deref()) {
-        push(&mut out, format!("{st} {lk} \u{b7} {tr} \u{b7} {rt}"));
-    }
-    if let (Some(tr), Some(rt)) = (traffic.as_deref(), rtt.as_deref()) {
-        push(&mut out, format!("{st} \u{b7} {tr} \u{b7} {rt}"));
-        if state != NetState::Degraded {
-            push(&mut out, format!("{tr} \u{b7} {rt}"));
-        }
-    }
-    if let (Some(trt), Some(rtt_t)) = (traffic_tight.as_deref(), rtt_tight.as_deref()) {
-        if state == NetState::Degraded {
-            push(&mut out, format!("{st} \u{b7} {trt} \u{b7} {rtt_t}"));
-        } else {
-            push(&mut out, format!("{trt} \u{b7} {rtt_t}"));
-        }
-    }
-    if let (Some(lk), Some(tr)) = (link_word, traffic.as_deref()) {
-        push(&mut out, format!("{st} {lk} \u{b7} {tr}"));
-    }
-    if let (Some(lk), Some(trt)) = (link_word, traffic_tight.as_deref()) {
-        push(&mut out, format!("{st} {lk} \u{b7} {trt}"));
-    }
-    if let Some(tr) = traffic.as_deref() {
-        push(&mut out, format!("{st} \u{b7} {tr}"));
-        if let Some(trt) = traffic_tight.as_deref() {
-            push(&mut out, format!("{st} \u{b7} {trt}"));
-        }
-        if state != NetState::Degraded {
-            push(&mut out, tr.to_owned());
-        }
-    }
-    if let (Some(lk), Some(rt)) = (link_word, rtt.as_deref()) {
-        push(&mut out, format!("{st} {lk} \u{b7} {rt}"));
-    }
-    if let Some(rt) = rtt.as_deref() {
-        push(&mut out, format!("{st} \u{b7} {rt}"));
-    }
-    if let Some(lk) = link_word {
-        push(&mut out, format!("{st} {lk}"));
-    }
-    push(&mut out, st.to_owned());
-    out
 }
 
 /// Network Amount-column forms when the Details column stands beside it (`Ladder::Det`): reports
@@ -2725,17 +2598,67 @@ pub fn net_amount_det_forms(snap: &Snapshot) -> Vec<String> {
             format!("{}M", rate_figure(bps / 1e6))
         }
     };
-    let mut out = Vec::new();
     match (rx, tx) {
-        (Some(r), Some(t)) => {
-            out.push(format!("\u{2193}{} \u{2191}{}/s", fmt_rate(r), fmt_rate(t)));
-            out.push(format!("\u{2193}{} \u{2191}{}", fmt_rate(r), fmt_rate(t)));
-        }
-        (Some(r), None) => out.push(format!("\u{2193}{}/s", fmt_rate(r))),
-        (None, Some(t)) => out.push(format!("\u{2191}{}/s", fmt_rate(t))),
-        (None, None) => {}
+        (Some(r), Some(t)) => vec![format!("\u{2193}{} \u{2191}{}/s", fmt_rate(r), fmt_rate(t))],
+        (Some(r), None) => vec![format!("\u{2193}{}/s", fmt_rate(r))],
+        (None, Some(t)) => vec![format!("\u{2191}{}/s", fmt_rate(t))],
+        (None, None) => Vec::new(),
     }
-    out
+}
+
+/// A volume's size as the legend says it, long and short: `2 TB`, `2T`; `1.5 TB`, `1.5T`;
+/// `512 GB`, `512G`.
+fn disk_total_compact(bytes: u64) -> (String, String) {
+    if bytes >= 1_000_000_000_000 {
+        let tb10 = half_up(bytes as f64 / 100_000_000_000.0) as u64;
+        let (whole, frac) = (tb10 / 10, tb10 % 10);
+        if frac == 0 {
+            (format!("{whole} TB"), format!("{whole}T"))
+        } else {
+            (format!("{whole}.{frac} TB"), format!("{whole}.{frac}T"))
+        }
+    } else if bytes >= 1_000_000_000 {
+        let gb = half_up(bytes as f64 / 1_000_000_000.0).max(1.0) as u64;
+        (format!("{gb} GB"), format!("{gb}G"))
+    } else {
+        let s = disk(bytes);
+        (s.clone(), s)
+    }
+}
+
+/// The machine's totals the deck's legend says after its noun where no row's run says its
+/// maximum, longest first: its cores, memory and disk (`18 cores \u{b7} 128 GiB \u{b7} 2 TB`, then
+/// `18c \u{b7} 128G \u{b7} 2T`, 0.144's head); each only where read, and none where none is.
+#[must_use]
+pub fn machine_totals(snap: &Snapshot) -> Vec<String> {
+    let cap = |res: Resource| {
+        snap.resources[res.index()]
+            .capacity
+            .filter(|c| c.is_finite() && *c > 0.0)
+    };
+    let cores = cap(Resource::Cpu).map(|c| half_up(c) as u64);
+    let mem = cap(Resource::Memory).map(|b| gib_total(b as u64));
+    let hd = cap(Resource::Disk).map(|b| disk_total_compact(b as u64));
+    let long: Vec<String> = [
+        cores.map(|n| format!("{n} cores")),
+        mem.as_ref().map(|g| format!("{g} GiB")),
+        hd.as_ref().map(|(l, _)| l.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let short: Vec<String> = [
+        cores.map(|n| format!("{n}c")),
+        mem.map(|g| format!("{g}G")),
+        hd.map(|(_, s)| s),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if long.is_empty() {
+        return Vec::new();
+    }
+    vec![long.join(" \u{b7} "), short.join(" \u{b7} ")]
 }
 
 fn glance_processes_details(snap: &Snapshot) -> Vec<Clause> {
@@ -2773,7 +2696,13 @@ mod tests {
     fn scenario_a() -> Snapshot {
         Snapshot {
             cpu: Some(CpuView {
-                cores: vec![crate::model::CoreView::default(); 10],
+                cores: vec![
+                    crate::model::CoreView {
+                        measured: true,
+                        ..Default::default()
+                    };
+                    10
+                ],
                 busy: TrendView::flat(3.1),
                 ..CpuView::default()
             }),
@@ -3066,6 +2995,7 @@ mod tests {
             mu_from: None,
             verdict,
             no_progress: false,
+            working_descendant: None,
             episode: 0,
             exit: None,
             tick: Tick::default(),
@@ -3846,6 +3776,49 @@ mod tests {
             shape(&details(Resource::Memory, &s, &MAC))[0],
             (0, false, None, Words2, f(&["pressure normal"]))
         );
+        let service = |exe: &str, footprint: u64| crate::explain::CoalRow {
+            id: 777,
+            footprint: Some(footprint),
+            live: 1,
+            lead: Some(crate::explain::Lead {
+                pid: 537,
+                uid: Some(0),
+                exe: Some(exe.into()),
+                ..crate::explain::Lead::default()
+            }),
+            ..crate::explain::CoalRow::default()
+        };
+        let split = |row| {
+            Some(std::sync::Arc::new(crate::explain::WhyFacts {
+                lane: crate::explain::CoalLane::On,
+                split: crate::explain::CoalSplit {
+                    rows: vec![row],
+                    ..crate::explain::CoalSplit::default()
+                },
+                ..crate::explain::WhyFacts::default()
+            }))
+        };
+        s.why = split(service("fseventsd", (44.4 * GIB) as u64));
+        assert_eq!(
+            shape(&details(Resource::Memory, &s, &MAC))[0],
+            (
+                0,
+                true,
+                Some(Mark::Dot),
+                Critical,
+                f(&[
+                    "macOS's fseventsd holds 44.4 GiB",
+                    "fseventsd holds 44.4 GiB"
+                ])
+            ),
+            "a service past the huge bar is memory's state, and leads"
+        );
+        s.why = split(service("mds", (1.3 * GIB) as u64));
+        assert_eq!(
+            details(Resource::Memory, &s, &MAC).len(),
+            4,
+            "a service under the bar is not named"
+        );
 
         assert_eq!(
             shape(&details(Resource::Processes, &processes_trouble(), &MAC)),
@@ -4375,68 +4348,134 @@ mod tests {
         assert_eq!(well(Resource::Cpu, &row(1.0, 2.0)), None);
     }
 
-    /// The glance says each figure in its unit, and keeps a base only where the share is of
-    /// something other than the row's own capacity (refined deck, 2026-10-24).
+    /// The glance says a row as one figure run at the end of its bar: this Mac's reading in the
+    /// row's unit with the row's maximum, then without it. A share of something other than the
+    /// row's own capacity keeps its base (Network's peak, the user's process limit where it
+    /// binds); the system's process limit is said nowhere, and the processes' count stands bare
+    /// last. The GPU and a row not read say none.
     #[test]
-    fn the_glance_says_the_figure_in_its_unit() {
-        let amount = |loc: &Locale| -> Vec<(Resource, Vec<String>)> {
+    fn the_glance_run_says_the_reading_with_its_unit_and_the_maximum() {
+        let s = snap();
+        let said = |loc: &Locale| -> Vec<(Resource, Vec<String>)> {
             ladder_rows(loc)
                 .into_iter()
-                .map(|(res, view)| (res, glance_amount(res, &view, loc)))
+                .map(|(res, view)| (res, glance_run(res, &view, &s, loc)))
                 .collect()
         };
-        let golden = |procs: &str| {
+        let golden = |procs: &[&str]| {
             [
-                (Resource::Cpu, strings(&["17.7 cores"])),
+                (Resource::Cpu, strings(&["17.7 of 18 cores", "17.7 cores"])),
                 (Resource::Gpu, Vec::new()),
-                (Resource::Memory, strings(&["42.1 GiB"])),
-                (Resource::Disk, strings(&["1.11 TB"])),
+                (Resource::Memory, strings(&["42.1 of 128 GiB", "42.1 GiB"])),
+                (Resource::Disk, strings(&["1.11 of 2.00 TB", "1.11 TB"])),
                 (
                     Resource::Network,
-                    strings(&["2.1 of 11.8 MB/s peak", "2.1/11.8 MB/s peak"]),
+                    strings(&["2.1 of 11.8 MB/s peak", "2.1 of 11.8 MB/s", "2.1 MB/s"]),
                 ),
                 (
                     Resource::Tokens,
                     tokens_amount(&ladder_rows(&MAC)[5].1, Ladder::Det),
                 ),
-                (Resource::Processes, strings(&[procs])),
+                (Resource::Processes, strings(procs)),
             ]
         };
-        assert_eq!(amount(&MAC), golden("897"));
-        assert_eq!(amount(&LINUX), golden("3,412 threads"));
+        assert_eq!(said(&MAC), golden(&["897 processes", "897"]));
+        assert_eq!(said(&LINUX), golden(&["3,412 threads", "3,412"]));
 
         let mut slow = row(18.4e3, 200e3);
         slow.basis = CapBasis::Peak;
         assert_eq!(
-            glance_amount(Resource::Network, &slow, &MAC),
-            strings(&["18 of 200 KB/s peak", "18/200 KB/s peak"])
+            glance_run(Resource::Network, &slow, &s, &MAC),
+            strings(&["18 of 200 KB/s peak", "18 of 200 KB/s", "18 KB/s"])
         );
+        let mut yours = row(897.0, 16_000.0);
+        yours.second = Some(series(9_000.0, 10_666.0, true));
         assert_eq!(
-            glance_amount(Resource::Cpu, &ResourceView::default(), &MAC),
-            Vec::<String>::new(),
+            glance_run(Resource::Processes, &yours, &s, &MAC),
+            strings(&[
+                "9,000 of 10,666 yours",
+                "9,000 of 10,666",
+                "9,000 processes",
+                "9,000"
+            ])
+        );
+        assert!(
+            glance_run(Resource::Cpu, &ResourceView::default(), &s, &MAC).is_empty(),
             "an unread figure is left out"
         );
-
+        // aterm's and the tab's figures are never a run: they are the bar's segments.
         let mut cpu = row(17.7, 18.0);
         cpu.aterm = fig(6.8);
-        cpu.tabs = vec![(2, fig(0.04))];
-        let Some(ScopeForms::Each { aterm, .. }) = glance_scope(Resource::Cpu, &cpu, &MAC) else {
-            panic!("CPU has an aterm cell");
-        };
-        assert_eq!(aterm.forms, strings(&["6.8"]));
+        cpu.tab = fig(0.04);
+        assert_eq!(
+            glance_run(Resource::Cpu, &cpu, &s, &MAC),
+            strings(&["17.7 of 18 cores", "17.7 cores"])
+        );
+    }
+
+    /// Where the link's own rates are read, the network's run says both directions, and its
+    /// Details no other direction; where they are not, the run says the busier against its peak.
+    #[test]
+    fn the_network_run_says_its_live_rates_where_the_link_reads_them() {
+        let mut s = snap();
+        let mut net = row(2.1e6, 11.8e6);
+        net.basis = CapBasis::Peak;
+        net.second = Some(series(0.3e6, 4.2e6, false));
+        set(&mut s, Resource::Network, net.clone());
+        assert_eq!(
+            glance_run(Resource::Network, &net, &s, &MAC),
+            strings(&["2.1 of 11.8 MB/s peak", "2.1 of 11.8 MB/s", "2.1 MB/s"]),
+            "CONTROL: no link rates"
+        );
+        s.net = Some(crate::NetView {
+            state: NetState::Online,
+            rates: Some(crate::LinkRates {
+                rx_bps: 4_000.0,
+                tx_bps: 3_000.0,
+                ..crate::LinkRates::default()
+            }),
+            ..crate::NetView::default()
+        });
+        assert_eq!(
+            glance_run(Resource::Network, &net, &s, &MAC),
+            strings(&["\u{2193}4K \u{2191}3K/s"]),
+            "the rates keep their unit"
+        );
+        assert!(
+            glance_details(Resource::Network, &s, &[], &MAC)
+                .iter()
+                .all(|c| c.forms.iter().all(|f| !f.contains("MB/s"))),
+            "the run says the rates"
+        );
+    }
+
+    /// The disk's Details says aterm's writes, and the tab's in the same unit, from 1 MB/s: the
+    /// row's run is the volume's space, and no column says the rates.
+    #[test]
+    fn the_disk_says_aterms_writes_from_a_megabyte_a_second() {
+        let mut s = snap();
         let mut disk = row(1.11e12, 2e12);
-        disk.aterm = fig(0.0);
-        let Some(ScopeForms::Each { aterm, .. }) = glance_scope(Resource::Disk, &disk, &MAC) else {
-            panic!("Disk has an aterm cell");
+        disk.aterm = fig(210e6);
+        disk.tabs = vec![(2, fig(190e6))];
+        set(&mut s, Resource::Disk, disk.clone());
+        let writes = |s: &Snapshot, panes: &[u64]| -> Vec<Vec<String>> {
+            glance_details(Resource::Disk, s, panes, &MAC)
+                .into_iter()
+                .map(|c| c.forms)
+                .filter(|f| f.iter().any(|f| f.starts_with("aterm writes")))
+                .collect()
         };
         assert_eq!(
-            aterm.forms,
-            strings(&["0 MB/s"]),
-            "a disk's writes keep their unit"
+            writes(&s, &[2]),
+            [strings(&[
+                "aterm writes 210 MB/s, 190 in Tab 2",
+                "aterm writes 210 MB/s"
+            ])]
         );
-        for res in [Resource::Gpu, Resource::Network] {
-            assert!(glance_scope(res, &row(1.0, 2.0), &MAC).is_none(), "{res:?}");
-        }
+        assert_eq!(writes(&s, &[]), [strings(&["aterm writes 210 MB/s"])]);
+        disk.aterm = fig(0.6e6);
+        set(&mut s, Resource::Disk, disk);
+        assert!(writes(&s, &[2]).is_empty(), "under a megabyte a second");
     }
 
     /// The glance says a clause only while it is unusual: Spotlight's cause always, the threads
@@ -4445,7 +4484,7 @@ mod tests {
     #[test]
     fn the_glance_says_a_clause_only_while_it_is_unusual() {
         let forms = |res: Resource, s: &Snapshot| -> Vec<Vec<String>> {
-            glance_details(res, s, &MAC)
+            glance_details(res, s, &[], &MAC)
                 .into_iter()
                 .map(|c| c.forms)
                 .collect()
@@ -4487,7 +4526,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            glance_details(Resource::Cpu, &s, &LINUX)[0].forms,
+            glance_details(Resource::Cpu, &s, &[], &LINUX)[0].forms,
             strings(&["load 25.7 on 18 cores", "load 25.7"]),
             "Linux says its load"
         );
@@ -4496,7 +4535,7 @@ mod tests {
         net.basis = CapBasis::Peak;
         net.second = Some(series(0.3e6, 4.2e6, false));
         set(&mut s, Resource::Network, net.clone());
-        let up = glance_details(Resource::Network, &s, &MAC);
+        let up = glance_details(Resource::Network, &s, &[], &MAC);
         assert_eq!(
             up.iter()
                 .map(|c| (c.forms.clone(), c.mark))
@@ -4512,7 +4551,7 @@ mod tests {
         );
 
         let mut p = processes_trouble();
-        let marked = glance_details(Resource::Processes, &p, &MAC);
+        let marked = glance_details(Resource::Processes, &p, &[], &MAC);
         assert!(
             !marked.is_empty() && marked.iter().all(|c| c.mark.is_some()),
             "the jobs' marks: {marked:?}"
@@ -4525,7 +4564,7 @@ mod tests {
     }
 
     #[test]
-    fn machine_totals_and_network_summary_format_hardware_identity_and_latency() {
+    fn the_cpu_brand_the_network_run_and_the_machines_totals_format_compactly() {
         assert_eq!(compact_cpu_brand("Apple M5 Max"), "M5 Max");
         assert_eq!(
             compact_cpu_brand("AMD Ryzen 9 9950X 16-Core Processor"),
@@ -4536,12 +4575,6 @@ mod tests {
             "Core i9-13900K"
         );
         let mut s = scenario_a();
-        s.facts.cpu_brand = Some("Apple M5 Max".into());
-        let totals = machine_totals_forms(&s);
-        assert_eq!(
-            totals.first().map(String::as_str),
-            Some("M5 Max \u{b7} 10c \u{b7} 32 GiB \u{b7} 2.00 TB")
-        );
 
         s.facts.link = Some(LinkSample {
             name: "en0".into(),
@@ -4560,10 +4593,29 @@ mod tests {
             }),
             ..crate::NetView::default()
         });
-        let net_forms = net_summary_forms(&s);
+        // The network's run says both rates with their unit, never without it.
         assert_eq!(
-            net_forms.first().map(String::as_str),
-            Some("Online Wi-Fi \u{b7} \u{2193}12.4M \u{2191}1.8M/s \u{b7} 14 ms")
+            net_amount_det_forms(&s),
+            ["\u{2193}12.4M \u{2191}1.8M/s".to_owned()]
+        );
+        // The legend's totals: the machine's cores, memory and disk, long then short.
+        s.resources[Resource::Cpu.index()].capacity = Some(18.0);
+        s.resources[Resource::Memory.index()].capacity = Some(128.0 * f64::from(1u32 << 30));
+        s.resources[Resource::Disk.index()].capacity = Some(2.0e12);
+        assert_eq!(
+            machine_totals(&s),
+            [
+                "18 cores \u{b7} 128 GiB \u{b7} 2 TB".to_owned(),
+                "18c \u{b7} 128G \u{b7} 2T".to_owned()
+            ]
+        );
+        s.resources[Resource::Disk.index()].capacity = None;
+        assert_eq!(
+            machine_totals(&s),
+            [
+                "18 cores \u{b7} 128 GiB".to_owned(),
+                "18c \u{b7} 128G".to_owned()
+            ]
         );
     }
 }

@@ -15,7 +15,7 @@ use crate::supervise::policy::turn_end::{
     LAND_ANSWER, LAND_NUDGE_COMMITTED_BEFORE, RULE_ACCOUNT, RULE_ANSWER, RULE_API_BACK,
     RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_CONSENT, RULE_CONTINUE, RULE_DONE_CHECK,
     RULE_HOST_TURN, RULE_LAND_ANSWER, RULE_LAND_NUDGE, RULE_LIMIT_RESUME, RULE_LOGIN,
-    RULE_MODEL_FALLBACK, RULE_SUGGESTION, RULE_USAGE_PROBE, WAKE_KEPT,
+    RULE_MODEL_FALLBACK, RULE_OUTAGE_RESUME, RULE_SUGGESTION, RULE_USAGE_PROBE, WAKE_KEPT,
 };
 
 fn row(ts: i64, sid: &str, rule_id: &str, outcome: Outcome, command: &str, reason: &str) -> String {
@@ -128,6 +128,11 @@ fn a_ledger_row_counts_where_the_table_says() {
         typed(t, RULE_API_RETRY, "Carry on …"),
         typed(t, RULE_API_BACK, "Carry on …"),
         typed(t, RULE_API_CUTOFF, "Carry on …"),
+        typed(
+            t,
+            RULE_OUTAGE_RESUME,
+            "[aterm harness] The API overload may have cleared; …",
+        ),
         typed(t, RULE_COMPACT, "/compact"),
         typed(t, RULE_COMPACT, "Carry on …"),
         typed(t, RULE_LOGIN, "/login"),
@@ -141,8 +146,8 @@ fn a_ledger_row_counts_where_the_table_says() {
         said(t, RULE_USAGE_PROBE, Outcome::Waiting, "closed"),
     ];
     let acc = fold_ledger(&lines, 0);
-    assert_eq!(counts(&acc), [3, 1, 1, 4, 5, 2, 5, 0, 0, 0], "{acc:#?}");
-    assert_eq!((acc.rows, acc.bad, acc.sessions), (33, 0, 1));
+    assert_eq!(counts(&acc), [3, 1, 1, 4, 5, 2, 6, 0, 0, 0], "{acc:#?}");
+    assert_eq!((acc.rows, acc.bad, acc.sessions), (34, 0, 1));
     assert_eq!((acc.human_wait_ms, acc.limit_wait_ms), (0, 0));
     assert_eq!(by(&acc, RULE_ANSWER_RECOMMENDED), 1);
     assert_eq!(by(&acc, "land-answer@v1"), 2, "a key and a prose answer");
@@ -151,7 +156,7 @@ fn a_ledger_row_counts_where_the_table_says() {
     assert_eq!(by(&acc, RULE_READ_ONLY), 1, "skipped, deferred: no acts");
     assert_eq!(by(&acc, "-"), 0, "an escalation is no act");
     assert_eq!(by(&acc, RULE_USAGE_PROBE), 1, "its `waiting` row is none");
-    assert_eq!(acc.by_rule.values().sum::<u64>(), 29);
+    assert_eq!(acc.by_rule.values().sum::<u64>(), 30);
     assert!(!acc.is_empty());
 }
 

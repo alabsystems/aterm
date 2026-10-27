@@ -11,6 +11,7 @@ macro_rules! harness_mark {
 }
 pub(crate) use harness_mark;
 
+pub mod account_progress;
 pub mod account_stats;
 pub mod accounts;
 pub mod accounts_overlay;
@@ -44,6 +45,7 @@ pub mod laps;
 pub mod lights;
 pub mod login_drive;
 pub mod login_latch;
+pub mod muse_usage;
 pub mod netwatch;
 pub mod open_url;
 pub mod profile;
@@ -57,7 +59,7 @@ pub mod session_usage;
 pub(crate) mod sign_in_ladder;
 pub mod source;
 pub mod spend;
-pub(crate) mod sqlite_read;
+pub(crate) use aterm_uds::sqlite_read;
 pub mod stats;
 pub mod steps;
 pub mod tap;

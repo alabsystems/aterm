@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared render pipeline specification table ([`PIPELINES`], `build_wgpu`) for the wgpu and
-//! Metal backends.
+//! Shared render pipeline specification table ([`PIPELINES`]) for the Metal, GL and D3D11 arms.
+//! The enums keep wgpu's names for the states they spell, the vocabulary the arms were held to
+//! until GW.6 (docs/AUDIT-third-party-2026-10-15.md).
 /// Shader module containing a pipeline's entry points.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ShaderLibrary {
-    /// `renderer.rs::SHADER` / `shaders/cell.metal`.
+    /// `shaders/cell.{metal,glsl,hlsl}`.
     Cell,
-    /// `renderer.rs::BLIT_SHADER` / `shaders/blit.metal`.
+    /// `shaders/blit.{metal,glsl,hlsl}`.
     Blit,
-    /// `renderer.rs::HDR_GLOW_SHADER` / `shaders/hdr_glow.metal`.
+    /// `shaders/hdr_glow.{metal,glsl,hlsl}`.
     HdrGlow,
-    /// `renderer.rs::TRAY_SHADER` / `shaders/tray.metal`.
+    /// `shaders/tray.{metal,glsl,hlsl}`.
     Tray,
-    /// `renderer.rs::BLOOM_SHADER` / `shaders/bloom.metal`.
+    /// `shaders/bloom.{metal,glsl,hlsl}`.
     Bloom,
-    /// `renderer.rs::SHIMMER_SHADER` / `shaders/shimmer.metal`.
+    /// `shaders/shimmer.{metal,glsl,hlsl}`.
     Shimmer,
 }
 
@@ -47,7 +48,7 @@ impl ShaderLibrary {
     ];
 }
 
-/// Blend factor shared by wgpu and Metal.
+/// Blend factor shared by every arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Factor {
     /// `wgpu::BlendFactor::Zero` / `MTLBlendFactorZero`.
@@ -62,37 +63,11 @@ pub(crate) enum Factor {
     OneMinusSrc,
 }
 
-impl Factor {
-    /// Converts to `wgpu::BlendFactor`.
-    #[inline]
-    #[cfg(wgpu_arm)]
-    pub(crate) const fn wgpu(self) -> wgpu::BlendFactor {
-        match self {
-            Self::Zero => wgpu::BlendFactor::Zero,
-            Self::One => wgpu::BlendFactor::One,
-            Self::SrcAlpha => wgpu::BlendFactor::SrcAlpha,
-            Self::OneMinusSrcAlpha => wgpu::BlendFactor::OneMinusSrcAlpha,
-            Self::OneMinusSrc => wgpu::BlendFactor::OneMinusSrc,
-        }
-    }
-}
-
 /// Blend operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlendOp {
     /// `src * src_factor + dst * dst_factor`.
     Add,
-}
-
-impl BlendOp {
-    /// Converts to `wgpu::BlendOperation`.
-    #[inline]
-    #[cfg(wgpu_arm)]
-    pub(crate) const fn wgpu(self) -> wgpu::BlendOperation {
-        match self {
-            Self::Add => wgpu::BlendOperation::Add,
-        }
-    }
 }
 
 /// Blend equation for one channel group (RGB or alpha).
@@ -141,17 +116,6 @@ impl BlendComponent {
         dst: Factor::OneMinusSrc,
         op: BlendOp::Add,
     };
-
-    /// Converts to `wgpu::BlendComponent`.
-    #[inline]
-    #[cfg(wgpu_arm)]
-    pub(crate) const fn wgpu(self) -> wgpu::BlendComponent {
-        wgpu::BlendComponent {
-            src_factor: self.src.wgpu(),
-            dst_factor: self.dst.wgpu(),
-            operation: self.op.wgpu(),
-        }
-    }
 }
 
 /// Full color and alpha blend state for a pipeline.
@@ -215,16 +179,6 @@ impl Blend {
             )
         )
     }
-
-    /// Converts to `wgpu::BlendState`.
-    #[inline]
-    #[cfg(wgpu_arm)]
-    pub(crate) const fn wgpu(self) -> wgpu::BlendState {
-        wgpu::BlendState {
-            color: self.color.wgpu(),
-            alpha: self.alpha.wgpu(),
-        }
-    }
 }
 
 /// Color attachment channel write mask.
@@ -234,18 +188,6 @@ pub(crate) enum WriteMask {
     Color,
     /// All RGBA channels (`wgpu::ColorWrites::ALL`).
     All,
-}
-
-impl WriteMask {
-    /// Converts to `wgpu::ColorWrites`.
-    #[inline]
-    #[cfg(wgpu_arm)]
-    pub(crate) const fn wgpu(self) -> wgpu::ColorWrites {
-        match self {
-            Self::Color => wgpu::ColorWrites::COLOR,
-            Self::All => wgpu::ColorWrites::ALL,
-        }
-    }
 }
 
 /// Logical color attachment target role for a pipeline.
@@ -261,67 +203,14 @@ pub(crate) enum TargetRole {
     Edr,
 }
 
-/// Concrete texture formats available to resolve a [`TargetRole`].
-#[derive(Clone, Copy, Debug)]
-#[cfg(wgpu_arm)]
-pub(crate) struct TargetFormats {
-    /// Offscreen sRGB view format.
-    pub(crate) offscreen_srgb: wgpu::TextureFormat,
-    /// Offscreen Unorm format.
-    pub(crate) offscreen_unorm: wgpu::TextureFormat,
-    /// Optional swapchain present format.
-    pub(crate) present: Option<wgpu::TextureFormat>,
-}
-
-#[cfg(wgpu_arm)]
-impl TargetFormats {
-    /// Returns a copy with `present` set to `format`.
-    #[inline]
-    pub(crate) const fn with_present(self, format: wgpu::TextureFormat) -> Self {
-        Self {
-            present: Some(format),
-            ..self
-        }
-    }
-
-    /// Resolves the concrete `wgpu::TextureFormat` for `role`.
-    ///
-    /// # Panics
-    /// Panics if `role` is [`TargetRole::Present`] and `present` is `None`.
-    #[inline]
-    pub(crate) const fn resolve(self, role: TargetRole) -> wgpu::TextureFormat {
-        match role {
-            TargetRole::OffscreenSrgb => self.offscreen_srgb,
-            TargetRole::OffscreenUnorm => self.offscreen_unorm,
-            TargetRole::Edr => wgpu::TextureFormat::Rgba16Float,
-            TargetRole::Present => self
-                .present
-                .expect("a TargetRole::Present pipeline needs the destination format"),
-        }
-    }
-}
-
 /// Primitive topology.
-#[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+#[cfg(any(gl_arm, d3d11_arm, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Topology {
     /// `wgpu::PrimitiveTopology::TriangleList`.
     TriangleList,
     /// `wgpu::PrimitiveTopology::TriangleStrip`.
     TriangleStrip,
-}
-
-#[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
-impl Topology {
-    /// Converts to `wgpu::PrimitiveTopology`.
-    #[inline]
-    #[cfg(wgpu_arm)]
-    pub(crate) const fn wgpu(self) -> wgpu::PrimitiveTopology {
-        match self {
-            Self::TriangleList => wgpu::PrimitiveTopology::TriangleList,
-            Self::TriangleStrip => wgpu::PrimitiveTopology::TriangleStrip,
-        }
-    }
 }
 
 /// Backend-neutral vertex attribute descriptor.
@@ -352,23 +241,6 @@ pub(crate) enum AttrFormat {
     Sint16x2,
     /// `wgpu::VertexFormat::Uint16x2` / `MTLVertexFormatUShort2`.
     Uint16x2,
-}
-
-impl AttrFormat {
-    /// Converts to `wgpu::VertexFormat`.
-    #[inline]
-    #[cfg(wgpu_arm)]
-    pub(crate) const fn wgpu(self) -> wgpu::VertexFormat {
-        match self {
-            Self::Uint16x4 => wgpu::VertexFormat::Uint16x4,
-            Self::Unorm8x4 => wgpu::VertexFormat::Unorm8x4,
-            Self::Uint8x4 => wgpu::VertexFormat::Uint8x4,
-            Self::Float32x4 => wgpu::VertexFormat::Float32x4,
-            Self::Uint32 => wgpu::VertexFormat::Uint32,
-            Self::Sint16x2 => wgpu::VertexFormat::Sint16x2,
-            Self::Uint16x2 => wgpu::VertexFormat::Uint16x2,
-        }
-    }
 }
 
 /// Per-instance vertex buffer layout specification.
@@ -554,7 +426,6 @@ pub(crate) const FX_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 impl VertexLayout {
     /// Returns the [`VertexLayoutSpec`] for this layout, or `None` for [`Self::None`].
     #[inline]
-    #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
     pub(crate) const fn spec(self) -> Option<VertexLayoutSpec> {
         match self {
             Self::None => None,
@@ -568,110 +439,8 @@ impl VertexLayout {
     }
 }
 
-/// The `wgpu` spelling of one [`VertexAttr`].
-#[inline]
-#[cfg(wgpu_arm)]
-const fn wgpu_attr(a: VertexAttr) -> wgpu::VertexAttribute {
-    wgpu::VertexAttribute {
-        format: a.format.wgpu(),
-        offset: a.offset,
-        shader_location: a.location,
-    }
-}
-
-/// The wgpu attribute array for [`BG_LAYOUT`], derived from it.
-#[cfg(wgpu_arm)]
-static BG_ATTRS: [wgpu::VertexAttribute; 2] =
-    [wgpu_attr(BG_LAYOUT.attrs[0]), wgpu_attr(BG_LAYOUT.attrs[1])];
-/// The `wgpu` attribute array for [`GLOW_LAYOUT`].
-#[cfg(wgpu_arm)]
-static GLOW_ATTRS: [wgpu::VertexAttribute; 3] = [
-    wgpu_attr(GLOW_LAYOUT.attrs[0]),
-    wgpu_attr(GLOW_LAYOUT.attrs[1]),
-    wgpu_attr(GLOW_LAYOUT.attrs[2]),
-];
-/// The `wgpu` attribute array for [`GLYPH_LAYOUT`].
-#[cfg(wgpu_arm)]
-static GLYPH_ATTRS: [wgpu::VertexAttribute; 4] = [
-    wgpu_attr(GLYPH_LAYOUT.attrs[0]),
-    wgpu_attr(GLYPH_LAYOUT.attrs[1]),
-    wgpu_attr(GLYPH_LAYOUT.attrs[2]),
-    wgpu_attr(GLYPH_LAYOUT.attrs[3]),
-];
-/// The `wgpu` attribute array for [`RAIN_GLOW_LAYOUT`].
-#[cfg(wgpu_arm)]
-static RAIN_GLOW_ATTRS: [wgpu::VertexAttribute; 3] = [
-    wgpu_attr(RAIN_GLOW_LAYOUT.attrs[0]),
-    wgpu_attr(RAIN_GLOW_LAYOUT.attrs[1]),
-    wgpu_attr(RAIN_GLOW_LAYOUT.attrs[2]),
-];
-/// The `wgpu` attribute array for [`FIRE_LAYOUT`].
-#[cfg(wgpu_arm)]
-static FIRE_ATTRS: [wgpu::VertexAttribute; 4] = [
-    wgpu_attr(FIRE_LAYOUT.attrs[0]),
-    wgpu_attr(FIRE_LAYOUT.attrs[1]),
-    wgpu_attr(FIRE_LAYOUT.attrs[2]),
-    wgpu_attr(FIRE_LAYOUT.attrs[3]),
-];
-
-/// The `wgpu` attribute array for [`FX_LAYOUT`].
-#[cfg(wgpu_arm)]
-static FX_ATTRS: [wgpu::VertexAttribute; 6] = [
-    wgpu_attr(FX_LAYOUT.attrs[0]),
-    wgpu_attr(FX_LAYOUT.attrs[1]),
-    wgpu_attr(FX_LAYOUT.attrs[2]),
-    wgpu_attr(FX_LAYOUT.attrs[3]),
-    wgpu_attr(FX_LAYOUT.attrs[4]),
-    wgpu_attr(FX_LAYOUT.attrs[5]),
-];
-
-/// The `wgpu` per-instance buffer layout for [`VertexLayout::Bg`].
-#[cfg(wgpu_arm)]
-static BG_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
-    array_stride: BG_LAYOUT.stride,
-    step_mode: wgpu::VertexStepMode::Instance,
-    attributes: &BG_ATTRS,
-}];
-/// The `wgpu` per-instance buffer layout for [`VertexLayout::Glow`].
-#[cfg(wgpu_arm)]
-static GLOW_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
-    array_stride: GLOW_LAYOUT.stride,
-    step_mode: wgpu::VertexStepMode::Instance,
-    attributes: &GLOW_ATTRS,
-}];
-/// The `wgpu` per-instance buffer layout for [`VertexLayout::Glyph`].
-#[cfg(wgpu_arm)]
-static GLYPH_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
-    array_stride: GLYPH_LAYOUT.stride,
-    step_mode: wgpu::VertexStepMode::Instance,
-    attributes: &GLYPH_ATTRS,
-}];
-/// The `wgpu` per-instance buffer layout for [`VertexLayout::RainGlow`].
-#[cfg(wgpu_arm)]
-static RAIN_GLOW_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
-    array_stride: RAIN_GLOW_LAYOUT.stride,
-    step_mode: wgpu::VertexStepMode::Instance,
-    attributes: &RAIN_GLOW_ATTRS,
-}];
-/// The `wgpu` per-instance buffer layout for [`VertexLayout::Fire`].
-#[cfg(wgpu_arm)]
-static FIRE_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
-    array_stride: FIRE_LAYOUT.stride,
-    step_mode: wgpu::VertexStepMode::Instance,
-    attributes: &FIRE_ATTRS,
-}];
-
-/// The `wgpu` per-instance buffer layout for [`VertexLayout::Fx`].
-#[cfg(wgpu_arm)]
-static FX_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
-    array_stride: FX_LAYOUT.stride,
-    step_mode: wgpu::VertexStepMode::Instance,
-    attributes: &FX_ATTRS,
-}];
-
 /// Resource binding slot specification for explicit-slot backends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
 pub(crate) struct BindSpec {
     /// Vertex uniform buffer slot, or `None` for vertex-id-only passes.
     pub(crate) vertex_uniform: Option<u32>,
@@ -690,7 +459,6 @@ pub(crate) struct BindSpec {
     pub(crate) vertex_items: Option<u32>,
 }
 
-#[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
 impl BindSpec {
     /// The flat cell rows (bg / cursor / glow / rain / fire): `Uniforms` at
     /// vertex `[[buffer(0)]]`, nothing in the fragment stage.
@@ -792,11 +560,11 @@ pub(crate) struct PipelineSpec {
     pub(crate) fs: &'static str,
     /// Target attachment role.
     #[cfg_attr(
-        all(any(gl_arm, d3d11_arm), not(wgpu_arm)),
+        any(gl_arm, d3d11_arm),
         expect(
             dead_code,
-            reason = "GL programs and D3D11 pipelines are format-free; the wgpu and Metal \
-                      pipelines key on it"
+            reason = "GL programs and D3D11 pipelines are format-free; the Metal pipelines \
+                      key on it"
         )
     )]
     pub(crate) target: TargetRole,
@@ -807,88 +575,10 @@ pub(crate) struct PipelineSpec {
     /// Per-instance vertex layout.
     pub(crate) vertex: VertexLayout,
     /// Primitive topology.
-    #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+    #[cfg(any(gl_arm, d3d11_arm, test))]
     pub(crate) topology: Topology,
     /// Explicit resource binding slots (see [`BindSpec`]).
-    #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
     pub(crate) binds: BindSpec,
-}
-
-impl PipelineSpec {
-    /// The wgpu colour-target state: blend and write mask over the format the
-    /// row's [`TargetRole`] resolves to.
-    #[inline]
-    #[cfg(wgpu_arm)]
-    fn wgpu_color_target(&self, targets: TargetFormats) -> wgpu::ColorTargetState {
-        wgpu::ColorTargetState {
-            format: targets.resolve(self.target),
-            blend: self.blend.map(Blend::wgpu),
-            write_mask: self.write_mask.wgpu(),
-        }
-    }
-
-    /// The `wgpu` vertex-buffer list — `&[]` for a `[[vertex_id]]`-only pass.
-    #[inline]
-    #[cfg(wgpu_arm)]
-    const fn wgpu_vertex_buffers(&self) -> &'static [wgpu::VertexBufferLayout<'static>] {
-        match self.vertex {
-            VertexLayout::None => &[],
-            VertexLayout::Bg => &BG_BUFFERS,
-            VertexLayout::Glow => &GLOW_BUFFERS,
-            VertexLayout::Glyph => &GLYPH_BUFFERS,
-            VertexLayout::RainGlow => &RAIN_GLOW_BUFFERS,
-            VertexLayout::Fire => &FIRE_BUFFERS,
-            VertexLayout::Fx => &FX_BUFFERS,
-        }
-    }
-
-    /// The `wgpu` primitive state — the row's topology over `wgpu`'s defaults
-    /// for everything else (no culling, CCW front face, fill mode).
-    #[inline]
-    #[cfg(wgpu_arm)]
-    fn wgpu_primitive(&self) -> wgpu::PrimitiveState {
-        wgpu::PrimitiveState {
-            topology: self.topology.wgpu(),
-            ..Default::default()
-        }
-    }
-}
-
-/// Constructs a `wgpu::RenderPipeline` from `spec`.
-#[cfg(wgpu_arm)]
-pub(crate) fn build_wgpu(
-    spec: &PipelineSpec,
-    device: &wgpu::Device,
-    shader: &wgpu::ShaderModule,
-    layout: &wgpu::PipelineLayout,
-    targets: TargetFormats,
-) -> wgpu::RenderPipeline {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the pipeline table's own constructor: every row is built here"
-    )]
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(spec.label),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some(spec.vs),
-            compilation_options: Default::default(),
-            buffers: spec.wgpu_vertex_buffers(),
-        },
-        primitive: spec.wgpu_primitive(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some(spec.fs),
-            compilation_options: Default::default(),
-            targets: &[Some(spec.wgpu_color_target(targets))],
-        }),
-        multiview_mask: None,
-        cache: None,
-    });
-    pipeline
 }
 
 /// Table of all render pipelines in [`Pipeline`] discriminant order.
@@ -902,9 +592,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::REPLACE),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Bg,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -916,9 +605,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CELL_GLYPH_TEXT,
     },
     PipelineSpec {
@@ -930,9 +618,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CELL_ATLAS,
     },
     PipelineSpec {
@@ -944,9 +631,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Bg,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -958,9 +644,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::GLOW_OVER),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glow,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -972,9 +657,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::RainGlow,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -986,9 +670,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::RainGlow,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -1000,9 +683,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Fire,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -1014,9 +696,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Fire,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -1028,9 +709,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CELL_ATLAS,
     },
     PipelineSpec {
@@ -1042,9 +722,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glyph,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CELL_ATLAS,
     },
     PipelineSpec {
@@ -1056,9 +735,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CELL_ATLAS,
     },
     PipelineSpec {
@@ -1070,9 +748,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::SCREEN),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::None,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::POST_FS,
     },
     PipelineSpec {
@@ -1084,9 +761,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: None,
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::POST_FS,
     },
     PipelineSpec {
@@ -1098,9 +774,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glow,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CROWN,
     },
     PipelineSpec {
@@ -1112,9 +787,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::SCREEN),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glow,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CROWN,
     },
     PipelineSpec {
@@ -1126,9 +800,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::REPLACE),
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::POST_FS,
     },
     PipelineSpec {
@@ -1140,9 +813,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleStrip,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::TRAY,
     },
     PipelineSpec {
@@ -1154,9 +826,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::GLOW_OVER),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Fx,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::FX,
     },
     PipelineSpec {
@@ -1168,9 +839,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Fx,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::FX,
     },
     PipelineSpec {
@@ -1182,9 +852,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: None,
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Fx,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::FX,
     },
     PipelineSpec {
@@ -1196,9 +865,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::GLOW_OVER),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::None,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::GLOW_ITEMS,
     },
     PipelineSpec {
@@ -1210,9 +878,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::None,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CROWN_ITEMS,
     },
     PipelineSpec {
@@ -1224,9 +891,8 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::SCREEN),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::None,
-        #[cfg(any(wgpu_arm, gl_arm, d3d11_arm, test))]
+        #[cfg(any(gl_arm, d3d11_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
         binds: BindSpec::CROWN_ITEMS,
     },
 ];
@@ -1268,7 +934,7 @@ pub(crate) enum Pipeline {
     Shimmer = 13,
     /// EDR aurora crown.
     #[cfg_attr(
-        all(gl_arm, not(wgpu_arm), not(test)),
+        all(gl_arm, not(test)),
         expect(dead_code, reason = "no f16 destination exists on GL")
     )]
     HdrGlow = 14,
@@ -1289,7 +955,7 @@ pub(crate) enum Pipeline {
     GlowItems = 21,
     /// [`Self::HdrGlow`] over the bloom's item list.
     #[cfg_attr(
-        all(gl_arm, not(wgpu_arm), not(test)),
+        all(gl_arm, not(test)),
         expect(dead_code, reason = "no f16 destination exists on GL")
     )]
     HdrGlowItems = 22,
@@ -1335,7 +1001,7 @@ impl Pipeline {
 
     /// Returns the snake_case name of this pipeline.
     #[inline]
-    #[cfg(all(test, any(target_os = "macos", gl_arm, d3d11_arm)))]
+    #[cfg(test)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Bg => "bg",

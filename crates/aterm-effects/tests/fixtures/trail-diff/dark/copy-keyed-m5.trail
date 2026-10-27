@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# A copy is not a move (copies_are_not_moves.rs t9): an identical line stands 5 rows above the
+# typed one; 100 ms after the last key (a key in flight) the typed row is erased and the caret
+# lands at the copy's end.
+
+grid 24 80
+style rainbow kitty
+hz 60
+
+at 0 pty "\e[6;1H$ git status --short\e[11;1H$ "
+at 700 key g
+at 702 pty "g"
+at 810 key i
+at 812 pty "i"
+at 920 key t
+at 922 pty "t"
+at 1030 key space
+at 1032 pty " "
+at 1140 key s
+at 1142 pty "s"
+at 1250 key t
+at 1252 pty "t"
+at 1360 key a
+at 1362 pty "a"
+at 1470 key t
+at 1472 pty "t"
+at 1580 key u
+at 1582 pty "u"
+at 1690 key s
+at 1692 pty "s"
+at 1800 key space
+at 1802 pty " "
+at 1910 key -
+at 1912 pty "-"
+at 2020 key -
+at 2022 pty "-"
+at 2130 key s
+at 2132 pty "s"
+at 2240 key h
+at 2242 pty "h"
+at 2350 key o
+at 2352 pty "o"
+at 2460 key r
+at 2462 pty "r"
+at 2570 key t
+at 2572 pty "t"
+at 2670 pty "\e[11;1H\e[2K\e[6;21H"
+run 4170

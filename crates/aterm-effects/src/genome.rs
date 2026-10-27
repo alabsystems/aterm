@@ -91,6 +91,7 @@ pub fn simhash_ctx(
 }
 
 /// Context fingerprint, reference kernel: weighted SimHash over up to 4 tokens each side of the match span `start, end)` (char indices into `chars`, one physical row) plus the match's `form_hash` at weight 3.
+#[inline]
 pub fn simhash_ctx_reference(
     chars: &[char],
     start: usize,
@@ -394,7 +395,8 @@ fn collect_ctx_voters(
     };
     v.hash[0] = form_hash;
     let mut pos = end;
-    for slot in 1..=4usize {
+    let mut slot = 1usize;
+    while slot <= 4 {
         let Some((s, e)) = token_right(chars, pos) else {
             break;
         };
@@ -403,9 +405,11 @@ fn collect_ctx_voters(
             v.hash[slot] = h;
             v.present |= 1 << slot;
         }
+        slot += 1;
     }
     let mut pos = start;
-    for slot in 5..=8usize {
+    let mut slot = 5usize;
+    while slot <= 8 {
         let Some((s, e)) = token_left(chars, pos) else {
             break;
         };
@@ -414,6 +418,7 @@ fn collect_ctx_voters(
             v.hash[slot] = h;
             v.present |= 1 << slot;
         }
+        slot += 1;
     }
     v
 }

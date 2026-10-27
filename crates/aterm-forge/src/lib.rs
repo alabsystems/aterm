@@ -8,6 +8,7 @@
     reason = "never linked into the shipped binary: the third-party survey behind targo --unverified forge"
 )]
 
+pub mod abrew_help;
 pub mod attest;
 pub mod blame;
 pub mod budget;

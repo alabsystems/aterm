@@ -821,8 +821,12 @@ impl super::Terminal {
     )]
     #[inline]
     pub fn note_holder_cut(&mut self, cut: HolderCut) {
+        let noop = self.holder_fence.marks.is_empty() && cut.to.is_none();
         let (fence, grid) = self.fence_and_main_grid();
         fence.note_cut(cut, grid);
+        if !noop {
+            self.host_journal.push(super::HostOp::HolderCut(cut));
+        }
     }
 
     /// A stopped drawer died: its mark goes.
@@ -836,8 +840,12 @@ impl super::Terminal {
     )]
     #[inline]
     pub fn retire_holder_mark(&mut self, token: u64) {
+        let before = self.holder_fence.marks.len();
         let (fence, grid) = self.fence_and_main_grid();
         fence.retire(token, grid);
+        if self.holder_fence.marks.len() != before {
+            self.host_journal.push(super::HostOp::HolderRetire(token));
+        }
     }
 
     /// The current holder's admitted rows (the render input's `RenderInput::holder`).

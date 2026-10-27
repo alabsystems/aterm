@@ -13,7 +13,40 @@ use crate::transport::{self, Closer, Conn};
 /// The bridge's doors.
 #[derive(Clone, Debug)]
 pub(crate) struct Fx {
+    /// The rule a unit test switched off on the live world, for a negative control the
+    /// seeded worlds do not reach ([`Fx::os_without`]); the simulated world reads its own.
+    #[cfg(test)]
+    off: Option<crate::sim::world::Mutant>,
     world: World,
+}
+
+/// One step of a session's refill, as the bridge took it (`Bridge::refill`, `refill_together`):
+/// the simulated world's refill law holds each finished refill to the log
+/// (`sim::Process::refill_tap`).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RefillTap<'a> {
+    /// The refill began from the watermark the bridge read for the session (`seen/<sid>`).
+    Began {
+        sid: &'a str,
+        /// Its lane's `Fetch` filter, `/f/<F>/in/<node>/<sid>/>`.
+        lane: &'a str,
+        watermark: Option<u64>,
+    },
+    /// One record of its lane was offered to aterm (`owed`: aterm owes it, and the
+    /// session's refill stops there).
+    Offered { sid: &'a str, off: u64, owed: bool },
+    /// Its lane's records below `floor` were given up to retention, said and told.
+    Floor { sid: &'a str, floor: u64 },
+    /// It read its lane to `head`.
+    Ended { sid: &'a str, head: u64 },
+    /// The session left before its refill ended.
+    Dropped { sid: &'a str },
+    /// One read of the node's whole inbox began for `sessions` sessions together.
+    Together { sessions: usize },
+    /// Its start lay below the node inbox's `oldest` (another lane's floor), so it read its own
+    /// lane up to there before the shared read.
+    BelowTheOldest { sid: &'a str, oldest: u64 },
 }
 
 /// Which world answers the doors.
@@ -29,7 +62,11 @@ enum World {
 impl Fx {
     /// The live world: the shipped bridge's door.
     pub(crate) const fn os() -> Self {
-        Self { world: World::Os }
+        Self {
+            world: World::Os,
+            #[cfg(test)]
+            off: None,
+        }
     }
 
     /// One process of a simulated world.
@@ -37,15 +74,33 @@ impl Fx {
     pub(crate) fn sim(process: Arc<crate::sim::Process>) -> Self {
         Self {
             world: World::Sim(process),
+            off: None,
         }
     }
 
-    /// Whether the simulated world switched `rule` off for this process.
+    /// The live world with `rule` switched off.
+    #[cfg(test)]
+    pub(crate) fn os_without(rule: crate::sim::world::Mutant) -> Self {
+        Self {
+            world: World::Os,
+            off: Some(rule),
+        }
+    }
+
+    /// Whether the simulated world (or a unit test, [`Fx::os_without`]) switched `rule` off.
     #[cfg(test)]
     pub(crate) fn mutant(&self, rule: crate::sim::world::Mutant) -> bool {
         match &self.world {
-            World::Os => false,
+            World::Os => self.off == Some(rule),
             World::Sim(p) => p.mutant(rule),
+        }
+    }
+
+    /// What a session's refill did, for the simulated world's refill law (B09).
+    #[cfg(test)]
+    pub(crate) fn refill_tap(&self, tap: RefillTap<'_>) {
+        if let World::Sim(p) = &self.world {
+            p.refill_tap(tap);
         }
     }
 
@@ -67,13 +122,14 @@ impl Fx {
         }
     }
 
-    /// THE PARK: take one input, waiting at most `wait` for it.
+    /// THE PARK: take one input, waiting at most `wait` for it, the inbox face's wait judged by
+    /// this world's clock ([`Mailbox::take`]).
     pub(crate) fn take(&self, mailbox: &Mailbox, wait: Duration) -> Option<Item> {
         match &self.world {
-            World::Os => mailbox.take(wait),
+            World::Os => mailbox.take(wait, self.now()),
             #[cfg(test)]
             World::Sim(p) => {
-                let item = mailbox.take(Duration::ZERO);
+                let item = mailbox.take(Duration::ZERO, p.now());
                 if item.is_none() {
                     p.idle(wait);
                 }

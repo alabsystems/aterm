@@ -4391,3 +4391,239 @@ fn a_loud_hold_is_one_band_that_names_aterm_and_its_lift_withdraws_it() {
         "{untitled:#?}"
     );
 }
+
+/// fseventsd told past the huge bar while memory is under pressure is one standing alert for its
+/// process. The person's dismissal holds for that process across a relaunch: the relaunched
+/// watch's first answers (the hold not met again in its life) neither withdraw it nor end the
+/// digest entry's episode, and once the hold is met again nothing is asked. NEGATIVE CONTROL: a
+/// new process in its place (a restart) ends the episode, withdrawing the old filing, and the
+/// new one, told past the huge bar under pressure, is asked of anew.
+#[test]
+fn a_dismissed_service_alert_holds_for_its_process_across_a_relaunch() {
+    use crate::messages_host::wall_stamp_now;
+    use aterm_messages::{LogLine, MessageCenter, MessageLog};
+    use aterm_vitals::services::{FSEVENTSD, Seen, Service, Size, Told};
+    let seen = |pid: u32, held: bool| Seen {
+        service: Service {
+            coalition: 7,
+            pid,
+            start_s: 1_790_000_000,
+            uid: 0,
+            name: "fseventsd".into(),
+            path: Some(FSEVENTSD.path.into()),
+            live: 1,
+            footprint: 141 << 30,
+            ..Service::default()
+        },
+        size: Size::Huge,
+        since_ms: Some(0),
+        held,
+        restart: Some(&FSEVENTSD),
+    };
+    let told = |services: Vec<Seen>, pressed: bool| HostNote::ServiceMemory {
+        told: Told {
+            total: 128 << 30,
+            services,
+            unread: Vec::new(),
+            pressed,
+            at_ms: 0,
+        },
+        admin: Some(true),
+    };
+    let alert = |pid: u32| mr::service_memory_alert_key(&format!("{pid}-1790000000"));
+    let entry = |pid: u32| mr::service_memory_entry_key("fseventsd", &format!("{pid}-1790000000"));
+    let digest = |app: &App| -> Vec<String> {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .map(|e| e.key.clone())
+            .collect()
+    };
+
+    let mut app = App::headless_for_test();
+    // The shelf keeps every log line for the relaunch to replay: no writer drains it.
+    app.incoming_handoff_pending = true;
+    app.note_harness_host(told(vec![seen(537, true)], false));
+    assert_eq!(digest(&app), [entry(537)]);
+    assert!(
+        app.messages.live_by_key(&alert(537)).is_none(),
+        "no pressure: a fact for later, not an alert"
+    );
+    app.note_harness_host(told(vec![seen(537, true)], true));
+    assert!(
+        app.messages.live_by_key(&alert(537)).is_some(),
+        "past the huge bar under pressure: the alert"
+    );
+    let mut grown = seen(537, true);
+    grown.service.footprint = 150 << 30;
+    app.note_harness_host(told(vec![grown], true));
+    let restated = app
+        .messages
+        .live_by_key(&alert(537))
+        .expect("restated in place");
+    assert_eq!(restated.msg.title, "fseventsd holds 150.0 GiB");
+    let id = restated.id;
+    assert!(app.messages.dismiss(id, Instant::now()));
+
+    let lines: Vec<LogLine> = app
+        .messages
+        .drain_shelved_for_persist()
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    let mut log = MessageLog::empty();
+    log.replay_all(lines);
+    let now = Instant::now();
+    let mut center = MessageCenter::new(log, now);
+    center.adopt_digest(wall_stamp_now(), now);
+    let mut app = App::headless_for_test();
+    app.messages = center;
+    assert_eq!(digest(&app), [entry(537)], "the entry is adopted");
+
+    app.note_harness_host(told(vec![seen(537, false)], true));
+    assert!(
+        app.messages.filed_standing(&alert(537), wall_stamp_now()),
+        "a relaunched watch's not-yet-held is no end"
+    );
+    app.note_harness_host(told(vec![seen(537, true)], true));
+    assert!(
+        app.messages.live_by_key(&alert(537)).is_none(),
+        "dismissed for the episode: not asked again"
+    );
+    assert_eq!(digest(&app), [entry(537)]);
+
+    app.note_harness_host(told(vec![seen(90_001, true)], true));
+    assert!(
+        !app.messages.filed_standing(&alert(537), wall_stamp_now()),
+        "the old episode ended"
+    );
+    assert!(
+        app.messages.live_by_key(&alert(90_001)).is_some(),
+        "the new process is asked of anew"
+    );
+}
+
+fn fseventsd_seen(held: bool, footprint: u64) -> aterm_vitals::services::Seen {
+    use aterm_vitals::services::{FSEVENTSD, Seen, Service};
+    Seen {
+        service: Service {
+            coalition: 7,
+            pid: 537,
+            start_s: 1_790_000_000,
+            uid: 0,
+            name: "fseventsd".into(),
+            path: Some(FSEVENTSD.path.into()),
+            live: 1,
+            footprint,
+            ..Service::default()
+        },
+        size: aterm_vitals::services::size(footprint, 128 << 30),
+        since_ms: Some(0),
+        held,
+        restart: Some(&FSEVENTSD),
+    }
+}
+
+fn fseventsd_note(s: aterm_vitals::services::Seen, pressed: bool) -> HostNote {
+    HostNote::ServiceMemory {
+        told: aterm_vitals::services::Told {
+            total: 128 << 30,
+            services: vec![s],
+            unread: Vec::new(),
+            pressed,
+            at_ms: 0,
+        },
+        admin: Some(true),
+    }
+}
+
+/// The alert on glass, carried across an update's handoff, survives the successor's first
+/// readings, whose watch has not met the hold in its own life: the carry holds the service as
+/// told past the huge bar, so the alert is neither resolved as fixed nor asked anew under a new
+/// id. NEGATIVE CONTROL: once a reading this process holds falls under the huge bar's margin,
+/// the alert is resolved.
+#[test]
+fn a_carried_service_alert_survives_the_successors_first_reading() {
+    use crate::messages_host::wall_stamp_now;
+    let key = mr::service_memory_alert_key("537-1790000000");
+    let mut parent = App::headless_for_test();
+    parent.note_harness_host(fseventsd_note(fseventsd_seen(true, 141 << 30), true));
+    let first = parent.messages.live_by_key(&key).expect("the alert").id;
+    let t = Instant::now();
+    parent.messages.commit_rows(t, 3);
+    for s in 1..=10u64 {
+        parent.messages.settle(t + Duration::from_secs(s), true);
+    }
+    let carry = parent.messages.carried();
+
+    let now = Instant::now();
+    let mut child = App::headless_for_test();
+    child.messages.seed_carried(&carry, wall_stamp_now(), now);
+    child.messages.after_handoff_commit(now);
+    assert!(child.messages.live_by_key(&key).is_some(), "carried live");
+
+    for pressed in [true, false, true] {
+        child.note_harness_host(fseventsd_note(fseventsd_seen(false, 141 << 30), pressed));
+        let live = child.messages.live_by_key(&key).expect("still asked");
+        assert_eq!(
+            live.id, first,
+            "the same alert, never resolved and asked anew"
+        );
+        assert_eq!(live.repeats, 1, "unchanged words are no repeat");
+        assert!(
+            child.messages.log().get(first).is_some_and(|r| r.is_live()),
+            "never retired as fixed"
+        );
+    }
+    child.note_harness_host(fseventsd_note(fseventsd_seen(true, 20 << 30), true));
+    assert!(
+        child.messages.live_by_key(&key).is_none(),
+        "under the huge bar's margin, held here: fixed"
+    );
+}
+
+/// A digest entry adopted from the log after a relaunch is told from the relaunched watch's
+/// first reading, not after a new ten-minute hold: the entry is restated (its figure moves),
+/// and under pressure past the huge bar the alert rises at once. NEGATIVE CONTROL: a service
+/// with no entry open waits out its hold.
+#[test]
+fn an_adopted_service_entry_is_told_from_the_first_reading() {
+    use crate::messages_host::wall_stamp_now;
+    use aterm_messages::{LogLine, MessageCenter, MessageLog};
+    let key = mr::service_memory_alert_key("537-1790000000");
+    let entry = mr::service_memory_entry_key("fseventsd", "537-1790000000");
+    let mut app = App::headless_for_test();
+    app.incoming_handoff_pending = true;
+    app.note_harness_host(fseventsd_note(fseventsd_seen(true, 20 << 30), false));
+    let lines: Vec<LogLine> = app
+        .messages
+        .drain_shelved_for_persist()
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    let mut log = MessageLog::empty();
+    log.replay_all(lines);
+    let now = Instant::now();
+    let mut center = MessageCenter::new(log, now);
+    center.adopt_digest(wall_stamp_now(), now);
+    let mut app = App::headless_for_test();
+    app.messages = center;
+
+    app.note_harness_host(fseventsd_note(fseventsd_seen(false, 141 << 30), true));
+    let entries = app.messages.digest().entries;
+    let told = entries.iter().find(|e| e.key == entry).expect("the entry");
+    assert_eq!(
+        told.title, "fseventsd holds 141.0 GiB",
+        "restated: told here"
+    );
+    assert!(
+        app.messages.live_by_key(&key).is_some(),
+        "past the huge bar under pressure, told: the alert"
+    );
+
+    let mut fresh = App::headless_for_test();
+    fresh.note_harness_host(fseventsd_note(fseventsd_seen(false, 141 << 30), true));
+    assert!(fresh.messages.digest().entries.is_empty(), "in its hold");
+    assert!(fresh.messages.live_by_key(&key).is_none());
+}

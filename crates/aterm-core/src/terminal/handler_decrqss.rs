@@ -37,6 +37,45 @@ fn push_color_sgr(params: &mut Vec<String>, color: PackedColor, base: u8) {
     }
 }
 
+/// The SGR parameters that set `style` and `underline` from a reset, with ISO 8613-3 colon subparameters (`0` alone for the default pen).
+pub(super) fn sgr_of(style: &super::types::CurrentStyle, underline: Option<u32>) -> String {
+    let mut params: Vec<String> = Vec::new();
+    for (flag, sgr) in [
+        (CellFlags::BOLD, "1"),
+        (CellFlags::DIM, "2"),
+        (CellFlags::ITALIC, "3"),
+    ] {
+        if style.flags.contains(flag) {
+            params.push(sgr.to_string());
+        }
+    }
+    if let Some(underline) = style.flags.underline_sgr() {
+        params.push(underline.to_string());
+    }
+    for (flag, sgr) in [
+        (CellFlags::BLINK, "5"),
+        (CellFlags::INVERSE, "7"),
+        (CellFlags::HIDDEN, "8"),
+        (CellFlags::STRIKETHROUGH, "9"),
+    ] {
+        if style.flags.contains(flag) {
+            params.push(sgr.to_string());
+        }
+    }
+    if let Some(line) = style.flags.overline_or_script_sgr() {
+        params.push(line.to_string());
+    }
+    if let Some(color) = underline {
+        params.push(aterm_grid::underline_color_sgr(color));
+    }
+    push_color_sgr(&mut params, style.fg, 30);
+    push_color_sgr(&mut params, style.bg, 40);
+    if params.is_empty() {
+        return "0".to_string();
+    }
+    format!("0;{}", params.join(";"))
+}
+
 impl TerminalHandler<'_> {
     /// DECRQSS (`DCS $ q Pt ST`): answer `DCS 1 $ r <payload> ST` or `DCS 0 $ r ST`.
     pub(super) fn handle_decrqss(&mut self, cap: &super::response_capability::ResponseCapability) {
@@ -98,51 +137,7 @@ impl TerminalHandler<'_> {
 
     /// SGR: current attributes with ISO 8613-3 colon subparameters.
     fn decrqss_sgr(&self) -> String {
-        let mut params: Vec<String> = Vec::new();
-
-        if self.style.flags.contains(CellFlags::BOLD) {
-            params.push("1".to_string());
-        }
-        if self.style.flags.contains(CellFlags::DIM) {
-            params.push("2".to_string());
-        }
-        if self.style.flags.contains(CellFlags::ITALIC) {
-            params.push("3".to_string());
-        }
-
-        if let Some(underline) = self.style.flags.underline_sgr() {
-            params.push(underline.to_string());
-        }
-
-        if self.style.flags.contains(CellFlags::BLINK) {
-            params.push("5".to_string());
-        }
-        if self.style.flags.contains(CellFlags::INVERSE) {
-            params.push("7".to_string());
-        }
-        if self.style.flags.contains(CellFlags::HIDDEN) {
-            params.push("8".to_string());
-        }
-        if self.style.flags.contains(CellFlags::STRIKETHROUGH) {
-            params.push("9".to_string());
-        }
-
-        if let Some(line) = self.style.flags.overline_or_script_sgr() {
-            params.push(line.to_string());
-        }
-
-        if let Some(color) = self.transient.current_underline_color {
-            params.push(aterm_grid::underline_color_sgr(color));
-        }
-
-        push_color_sgr(&mut params, self.style.fg, 30);
-        push_color_sgr(&mut params, self.style.bg, 40);
-
-        if params.is_empty() {
-            return "0".to_string();
-        }
-
-        format!("0;{}", params.join(";"))
+        sgr_of(&*self.style, self.transient.current_underline_color)
     }
 
     /// DECSCUSR: the style number 1-6 (the caller appends ` q`).

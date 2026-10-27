@@ -280,6 +280,7 @@ fn c_type(rust: &str, d: &Decls) -> String {
     let primitive = match name {
         "()" | "c_void" => Some("void"),
         "c_char" => Some("char"),
+        "c_int" => Some("int"),
         "isize" => Some("long"),
         "usize" => Some("unsigned long"),
         "i8" => Some("int8_t"),
@@ -333,6 +334,9 @@ fn probe(d: &Decls, invert: Option<&str>) -> String {
         "#include <CoreFoundation/CoreFoundation.h>\n\
          #include <CoreGraphics/CoreGraphics.h>\n\
          #include <IOKit/IOKitLib.h>\n\
+         #include <IOKit/pwr_mgt/IOPMLib.h>\n\
+         #include <dlfcn.h>\n\
+         #include <mach/processor_info.h>\n\
          #include <stddef.h>\n\
          #include <stdint.h>\n\
          #define SAME(a, b) __builtin_types_compatible_p(a, b)\n",
@@ -432,9 +436,27 @@ pub fn the_parser_saw_every_declaration(files: &[&str], floor: &Floor) {
         .iter()
         .map(|f| {
             let src = subject(f);
-            src.match_indices("fn ")
+            let upper = src
+                .match_indices("fn ")
                 .filter(|(i, _)| src[i + 3..].starts_with(|c: char| c.is_ascii_uppercase()))
-                .count()
+                .count();
+            // POSIX declarations such as dlopen also belong to the C surface.
+            // Keep the independent uppercase census and count lowercase names only
+            // inside extern blocks, excluding ordinary Rust helper functions.
+            let lower = items(&src)
+                .iter()
+                .filter(|item| strip_attrs(item).1.starts_with("unsafe extern \"C"))
+                .map(|item| {
+                    let declarations = body(strip_attrs(item).1);
+                    declarations
+                        .match_indices("pub fn ")
+                        .filter(|(i, _)| {
+                            declarations[i + 7..].starts_with(|c: char| c.is_ascii_lowercase())
+                        })
+                        .count()
+                })
+                .sum::<usize>();
+            upper + lower
         })
         .sum();
     assert_eq!(d.aliases.len(), count("pub type "), "every alias is a row");

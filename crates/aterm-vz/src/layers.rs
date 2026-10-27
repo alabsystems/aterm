@@ -205,13 +205,24 @@ impl PartialBake {
         &self.sealed
     }
 
-    /// Seal the bake once its VM has stopped: flush the file to stable media, make it 0444,
-    /// and rename it to its final name, so a baked disk under its final name is always
-    /// whole. Dropping it unsealed leaves the partial file for the next bring-up to
-    /// remove: a VM may still hold it, and a killed lab removes nothing either.
+    /// Seal the bake once it finished (§4's step 4): its VM was `Ready`, the lab provisioned
+    /// it, and the helper reported the VM stopped with no detector asking. Flush the file to
+    /// stable media, make it 0444, and rename it to its final name, so a baked disk under its
+    /// final name is always whole. A bake a detector stopped, or one whose VM never reached
+    /// `Ready`, is dropped unsealed (`VzLifecycle`'s `SealedOnlyWhenFinished`): that leaves
+    /// the partial file for the next bring-up to remove, as a killed lab does, and a VM may
+    /// still hold it.
     ///
     /// # Errors
     /// A flush, the mode change or the rename failed; the partial file stays.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Seal",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     pub fn seal(self) -> Result<PathBuf, Error> {
         let file = std::fs::File::open(&self.partial).map_err(|e| io("open", &self.partial, &e))?;
         aterm_durable::durable(&file).map_err(|e| io("flush", &self.partial, &e))?;
@@ -324,6 +335,14 @@ impl Layers {
     /// # Errors
     /// [`Error::Floor`] below the floor, [`Error::Input`] for a base that cannot be read or is
     /// larger than the disk, [`Error::Io`] for a failed volume read, removal, clone or write.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "vz_lifecycle",
+            action = "Prepare",
+            project = "conformance_lifecycle::project"
+        )
+    )]
     pub fn prepare(
         &self,
         host: &dyn Host,
@@ -333,6 +352,10 @@ impl Layers {
     ) -> Result<Prepared, Error> {
         for dir in [self.baked_dir(), self.live_dir()] {
             std::fs::create_dir_all(&dir).map_err(|e| io("create", &dir, &e))?;
+        }
+        #[cfg(any(test, debug_assertions))]
+        if let Some(planted) = self.planted(host, base, seed)? {
+            return Ok(planted);
         }
         for dir in [self.baked_dir(), self.live_dir()] {
             for partial in files(&dir, |name| name.ends_with(PARTIAL)) {
@@ -381,6 +404,36 @@ impl Layers {
         };
         self.reclaim_baked(&want, say)?;
         Ok(next)
+    }
+
+    /// The negative controls' defective bring-ups ([`crate::fault`]), where no live disk is
+    /// kept: the live disk cloned from a bake's partial file, or the sealed baked disk handed
+    /// out to attach writable.
+    #[cfg(any(test, debug_assertions))]
+    fn planted(&self, host: &dyn Host, base: &Base, seed: &str) -> Result<Option<Prepared>, Error> {
+        use crate::fault::{Fault, armed};
+        let live = self.live_disk();
+        if live.is_file() {
+            return Ok(None);
+        }
+        let want = baked_name(&base.sha256, seed);
+        let stem = want.strip_suffix(".img").unwrap_or(&want);
+        let partial = self.baked_dir().join(format!("{stem}{PARTIAL}"));
+        if armed(Fault::ClonePartial) && partial.is_file() {
+            self.clone_live(host, &partial, base, seed)?;
+            return Ok(Some(Prepared::Live {
+                disk: live,
+                cloned: Some(Reclone::NoLiveDisk),
+            }));
+        }
+        let baked = self.baked_dir().join(&want);
+        if armed(Fault::AttachBaked) && baked.is_file() {
+            return Ok(Some(Prepared::Live {
+                disk: baked,
+                cloned: None,
+            }));
+        }
+        Ok(None)
     }
 
     /// Remove every sealed baked disk that is neither `want` nor the one the live record

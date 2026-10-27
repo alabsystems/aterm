@@ -700,6 +700,7 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn MuseKernel) -> Result<Plan, NoP
         dialect,
         line,
         tap_dropped: None,
+        line_dir: None,
     })
 }
 

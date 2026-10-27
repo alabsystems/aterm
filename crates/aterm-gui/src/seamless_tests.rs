@@ -3692,8 +3692,10 @@ fn a_workers_task_record_crosses_the_real_wire() {
 /// the record's `wakes` row rides its own session through the successor's intake, and the
 /// adopted session's carried rows seed it into the successor's book, open where its agent lives.
 /// NEGATIVE CONTROL: the session that carried no row seeds no book.
+/// macOS only: the agent's identity is this process's kernel record, and `kproc` reads one only
+/// there (elsewhere every read is Unread, so no book can name a live agent).
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn a_sessions_wake_book_crosses_the_real_wire() {
     use crate::occupancy_wakes::ProcTree as _;
     use aterm_agent::supervise::occupancy::declarer::AgentId;

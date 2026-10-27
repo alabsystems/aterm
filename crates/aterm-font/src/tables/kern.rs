@@ -143,6 +143,16 @@ impl<'a> Subtables<'a> {
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
+
+    #[inline]
+    pub(crate) fn shaper_iter(self) -> ShaperSubtablesIter<'a> {
+        ShaperSubtablesIter {
+            is_aat: self.is_aat,
+            table_index: 0,
+            number_of_tables: self.count,
+            stream: Stream::new(self.data),
+        }
+    }
 }
 
 impl core::fmt::Debug for Subtables<'_> {
@@ -258,6 +268,94 @@ impl<'a> Iterator for SubtablesIter<'a> {
                 has_state_machine: format_id == 1,
                 format,
             })
+        }
+    }
+}
+
+pub(crate) struct ShaperSubtablesIter<'a> {
+    is_aat: bool,
+    table_index: u32,
+    number_of_tables: u32,
+    stream: Stream<'a>,
+}
+
+impl<'a> Iterator for ShaperSubtablesIter<'a> {
+    type Item = (Subtable<'a>, Option<super::aat::StateTable<'a>>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.table_index == self.number_of_tables || self.stream.at_end() {
+            return None;
+        }
+
+        if self.is_aat {
+            const HEADER_SIZE: u8 = 8;
+
+            let table_len = self.stream.read::<u32>()?;
+            let coverage = self.stream.read::<AATCoverage>()?;
+            let format_id = self.stream.read::<u8>()?;
+            self.stream.skip::<u16>();
+
+            if format_id > 3 {
+                return None;
+            }
+
+            let data_len = usize::num_from(table_len).checked_sub(usize::from(HEADER_SIZE))?;
+            let data = self.stream.read_bytes(data_len)?;
+
+            let (format, state_table) = match format_id {
+                0 => (Format::Format0(Subtable0::parse(data)?), None),
+                1 => (Format::Format1, Some(super::aat::StateTable::parse(data)?)),
+                2 => (Format::Format2(Subtable2::parse(HEADER_SIZE, data)?), None),
+                3 => (Format::Format3(Subtable3::parse(data)?), None),
+                _ => return None,
+            };
+
+            Some((
+                Subtable {
+                    horizontal: coverage.is_horizontal(),
+                    variable: coverage.is_variable(),
+                    has_cross_stream: coverage.has_cross_stream(),
+                    has_state_machine: format_id == 1,
+                    format,
+                },
+                state_table,
+            ))
+        } else {
+            const HEADER_SIZE: u8 = 6;
+
+            self.stream.skip::<u16>();
+            let table_len = self.stream.read::<u16>()?;
+            let format_id = self.stream.read::<u8>()?;
+            let coverage = self.stream.read::<OTCoverage>()?;
+
+            if format_id != 0 && format_id != 2 {
+                return None;
+            }
+
+            let data_len = if self.number_of_tables == 1 {
+                self.stream.tail()?.len()
+            } else {
+                usize::from(table_len).checked_sub(usize::from(HEADER_SIZE))?
+            };
+
+            let data = self.stream.read_bytes(data_len)?;
+
+            let format = match format_id {
+                0 => Format::Format0(Subtable0::parse(data)?),
+                2 => Format::Format2(Subtable2::parse(HEADER_SIZE, data)?),
+                _ => return None,
+            };
+
+            Some((
+                Subtable {
+                    horizontal: coverage.is_horizontal(),
+                    variable: false,
+                    has_cross_stream: coverage.has_cross_stream(),
+                    has_state_machine: false,
+                    format,
+                },
+                None,
+            ))
         }
     }
 }

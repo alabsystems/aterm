@@ -315,6 +315,14 @@ pub(super) enum VaultTurn {
 }
 
 impl Ladder {
+    /// The existing retry clock, without probing routes or advancing the ladder.
+    pub(super) fn retry_at(&self, label: &str, now: Instant) -> Option<Instant> {
+        self.backoff
+            .get(label)
+            .map(|backoff| backoff.next)
+            .filter(|next| *next > now)
+    }
+
     /// Whether `label`'s ladder waits out its backoff at `now`: it does while the wait set at its
     /// last failure stands and the machine reads as it did then (`inputs`); a new mailbox, a
     /// browser installed, a vault delivery or a profile made ends the wait at once.

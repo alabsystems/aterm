@@ -534,6 +534,39 @@ fn an_unobserved_phase_claims_nothing() {
     );
 }
 
+/// A MARK LINE PRINTS NO KEY ABOVE WIRE META (session log Phase 6 fix unit
+/// F6, PRIV-3): a mark whose record holds Host and Content keys itself (a
+/// local log's record, which no bus offer stripped) briefs as its line with
+/// its Wire Meta key, and names neither the keys above nor their values. The
+/// fabric brief renders a remote session's records through this renderer
+/// (aterm-link `fabric_brief::render`), after `BusSpace::offer` stripped them.
+#[test]
+fn a_mark_line_prints_no_key_above_wire_meta() {
+    let (mut log, now) = session(3);
+    let f = Fields::new()
+        .text(Key::Cwd, "/private/tmp/x/QZP6WORD1")
+        .and_then(|f| f.text(Key::From, "QZP6WORD2"))
+        .and_then(|f| f.text(Key::Title, "QZP6WORD3"))
+        .and_then(|f| f.tok(Key::Detail, "qzp6meta"))
+        .expect("fields");
+    let seq = log
+        .mark(
+            Mark::new(Kind::Seen, Src::Status, Conf::Strong).fields(f),
+            at(9_000),
+        )
+        .expect("a seen mark");
+    let text = log.brief("s-7bd6", 100_000, now).text;
+    let line = body_lines(&text)
+        .into_iter()
+        .find(|l| l.starts_with(&format!("{seq} seen ")))
+        .unwrap_or_else(|| panic!("the mark's line: {text}"));
+    assert!(line.contains(" detail=qzp6meta "), "{line}");
+    assert!(!text.contains("QZP6WORD"), "{text}");
+    for key in [Key::Cwd, Key::From, Key::Title] {
+        assert!(!line.contains(&format!(" {}=", key.word())), "{line}");
+    }
+}
+
 #[test]
 fn a_source_or_landing_mark_gives_no_brief_line() {
     let (mut log, now) = session(3);

@@ -18,6 +18,8 @@ mod discovery;
 pub use discovery::discovery_replacement_model;
 mod enrollment_gate;
 pub use enrollment_gate::enrollment_gate_model;
+mod repair_policy;
+pub use repair_policy::repair_policy_model;
 
 /// Bounded executions of the durable fixed-share reservation API. Initial pins
 /// are assumed coherent across consumers; this model grants no provider access.
@@ -242,7 +244,9 @@ pub fn enrollment_commit_model() -> Model {
 }
 
 /// Durable admission evidence is independent of editable machine lists and
-/// later join policy. It authorizes only through current membership checks.
+/// later join policy. It authorizes only through current membership checks. An
+/// open approval is evidence like any other (owner, 2026-10-26: "always approve
+/// by default"), and still holds after the vault closes.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn admission_evidence_model() -> Model {
@@ -257,7 +261,7 @@ pub fn admission_evidence_model() -> Model {
                 scenario = 2; evidence = 2; allowed = if Buggy == 2 { 0 } else { 1 };
             }
             action OpenClosed when (scenario == 0) {
-                scenario = 3; evidence = 1; allowed = if Buggy == 3 { 1 } else { 0 };
+                scenario = 3; evidence = 2; allowed = if Buggy == 3 { 0 } else { 1 };
             }
             action Removed when (scenario == 0) {
                 scenario = 4; evidence = if Buggy == 4 { 2 } else { 0 }; allowed = 0;
@@ -293,7 +297,7 @@ pub fn admission_evidence_model() -> Model {
                 scenario = 14; evidence = 2; allowed = if Buggy == 14 { 0 } else { 1 };
             }
             invariant EvidenceRequired: allowed == 0 || evidence == 2;
-            invariant QualifiedWorks: scenario == 0 || (scenario > 2 && (7 > scenario || scenario > 8) && 14 > scenario) || allowed == 1;
+            invariant QualifiedWorks: scenario == 0 || (scenario > 3 && (7 > scenario || scenario > 8) && 14 > scenario) || allowed == 1;
             invariant RemovalForgets: scenario == 0 || 4 > scenario || scenario > 5 || evidence == 0;
             invariant CurrentMembershipRequired: scenario == 0 || 9 > scenario || scenario == 10 || scenario == 11 || scenario == 12 || scenario == 14 || allowed == 0;
         }
@@ -301,7 +305,10 @@ pub fn admission_evidence_model() -> Model {
 }
 
 /// Retained creation intents survive retries without minting new authority or
-/// replacing a newer local vault. Missing acknowledged history fails closed.
+/// replacing a newer local vault. Missing acknowledged history fails closed. A
+/// first publication refused before anything was stored retires the intent, and
+/// nothing else does: not a refusal after an attempt whose outcome is unknown,
+/// which may have landed.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn creation_outbox_model() -> Model {
@@ -310,7 +317,7 @@ pub fn creation_outbox_model() -> Model {
             const Buggy = 0;
             var scenario = 0; var retained = 0; var published = 0;
             var exact = 1; var refused = 0; var monotone = 1;
-            var device_reset = 0;
+            var device_reset = 0; var retired = 0;
             action Resume when (scenario == 0) {
                 scenario = 1; retained = if Buggy == 1 { 0 } else { 1 }; published = 1;
                 exact = if Buggy == 2 { 0 } else { 1 };
@@ -320,6 +327,7 @@ pub fn creation_outbox_model() -> Model {
             }
             action LostJournal when (scenario == 0) {
                 scenario = 3; retained = 1; refused = if Buggy == 4 { 0 } else { 1 };
+                retired = if Buggy == 14 { 1 } else { 0 };
             }
             action ChangedIntent when (scenario == 0) {
                 scenario = 4; retained = 1; refused = if Buggy == 5 { 0 } else { 1 };
@@ -340,12 +348,21 @@ pub fn creation_outbox_model() -> Model {
                 scenario = 9; retained = 1; refused = if Buggy == 10 { 0 } else { 1 };
                 device_reset = if Buggy == 11 { 1 } else { 0 };
             }
+            action RefusedFirst when (scenario == 0) {
+                scenario = 10; retained = 0; published = if Buggy == 13 { 1 } else { 0 };
+                retired = if Buggy == 12 { 0 } else { 1 };
+            }
+            action RefusedAfterSent when (scenario == 0) {
+                scenario = 11; retained = 1; retired = if Buggy == 15 { 1 } else { 0 };
+            }
             invariant RetainBeforePublish: published == 0 || retained == 1;
             invariant ExactPublication: exact == 1;
             invariant NeverRollBack: monotone == 1;
             invariant DamagedOrForeignRefuses: 3 > scenario || (scenario > 4 && 7 > scenario) || scenario > 7 || refused == 1;
             invariant LostDeviceRefuses: 9 > scenario || scenario > 9 || refused == 1;
             invariant NoDeviceReset: device_reset == 0;
+            invariant RefusedRetires: 10 > scenario || scenario > 10 || retired == 1;
+            invariant OnlyRefusalRetires: scenario == 10 || retired == 0;
         }
     }
 }
@@ -711,6 +728,7 @@ pub fn table_repair_model() -> Model {
             var stored = 0;
             var acknowledged = 0;
             var control = 0;
+            var neighbor_acknowledged = 0;
             action NewMember when (scenario == 0) { scenario = 1; stored = if Buggy == 1 { 0 } else { 1 }; acknowledged = 1; control = 1; }
             action LostKey when (scenario == 0) { scenario = 2; stored = if Buggy == 2 { 0 } else { 1 }; acknowledged = 1; control = 1; }
             action Legacy when (scenario == 0) { scenario = 3; stored = if Buggy == 3 { 1 } else { 0 }; control = if Buggy == 9 { 0 } else { 1 }; }
@@ -718,11 +736,14 @@ pub fn table_repair_model() -> Model {
             action Damaged when (scenario == 0) { scenario = 5; stored = if Buggy == 5 { 1 } else { 0 }; control = 1; }
             action LostAck when (scenario == 0) { scenario = 6; stored = if Buggy == 6 { 0 } else { 1 }; acknowledged = if Buggy == 8 { 1 } else { 0 }; }
             action Retry when (scenario == 0) { scenario = 7; stored = if Buggy == 7 { 0 } else { 1 }; acknowledged = 1; }
+            action DamagedNeighbor when (scenario == 0) { scenario = 8; stored = if Buggy == 10 { 0 } else { 1 }; acknowledged = if Buggy == 10 || Buggy == 12 { 0 } else { 1 }; control = 1; neighbor_acknowledged = if Buggy == 11 { 1 } else { 0 }; }
             invariant ReceiptsRequireStorage: acknowledged == 0 || stored == 1;
             invariant WithheldDoesNotWrite: 3 > scenario || scenario > 5 || stored == 0;
             invariant AvailableRepairPersists: scenario == 0 || (scenario > 2 && scenario <= 5) || stored == 1;
             invariant ControlSurvivesUpgrade: scenario == 0 || scenario > 5 || control == 1;
             invariant LostReceiptIsNotAcknowledged: 6 > scenario || scenario > 6 || acknowledged == 0;
+            invariant DamagedNeighborIsNotAcknowledged: neighbor_acknowledged == 0;
+            invariant NeighborRepairAcknowledged: 8 > scenario || acknowledged == 1;
         }
     }
 }

@@ -1602,6 +1602,9 @@ pub(crate) struct SettingsViewState {
     messages_drawn_menu: Cell<Option<(bool, usize)>>,
     messages_reveal: bool,
     messages_reseat: Cell<Option<usize>>,
+    /// The stop a scroll by lines took the list to where it was the list's end, with the entry
+    /// open and the tag pop-up as they were ([`messages_seated_top`]).
+    messages_scroll_end: Cell<Option<(usize, Option<u64>, bool)>>,
     messages_anchor: RefCell<Option<MessagesAnchor>>,
     page_window: Cell<Option<usize>>,
     navigation_scroll: Cell<f32>,
@@ -1666,6 +1669,9 @@ pub(crate) struct SettingsViewState {
     pressed_at: RefCell<Option<scroll::PressedAt>>,
     /// Where this render stands a plain status's bar a press brought ([`StatusPlace`]).
     status_place: Cell<StatusPlace>,
+    /// How tall the bar the last render stood over the top of the list was, where it stood there
+    /// ([`StatusPlace::Over`]): what it covers.
+    status_band: Cell<Option<f32>>,
     /// Whether this render's plain status's bar stands bare of its Undo, its words alone, where
     /// no side of the list holds it with the Undo and nothing pressed moves; the Undo stays on
     /// Cmd-Z and the command palette ([`settings_tree`]).
@@ -1845,6 +1851,7 @@ impl SettingsViewState {
             messages_drawn_menu: Cell::new(None),
             messages_reveal: false,
             messages_reseat: Cell::new(None),
+            messages_scroll_end: Cell::new(None),
             messages_anchor: RefCell::new(None),
             page_window: Cell::new(None),
             navigation_scroll: Cell::new(0.0),
@@ -1881,6 +1888,7 @@ impl SettingsViewState {
             reveal_as: scroll::Reveal::Keep,
             pressed_at: RefCell::new(None),
             status_place: Cell::new(StatusPlace::Rule),
+            status_band: Cell::new(None),
             status_bare: Cell::new(false),
             laid_list_top: Cell::new(None),
             list_reseated: Cell::new(false),
@@ -2084,8 +2092,17 @@ impl SettingsViewState {
         // A scroll by lines (the wheel, the keys, a reader's) is the person's: the list seats on
         // its stops again. An absolute one to the stop it is on (a re-clamp after aterm.toml
         // changed) scrolls nothing.
-        if matches!(command, SettingsPageScrollCommand::Lines(_)) {
+        if let SettingsPageScrollCommand::Lines(lines) = command {
+            // A line is a landing: a stop, a caption over a stop that starts bare, a room
+            // further down a stop taller than the room ([`scroll::ScrollPlan::landings`]).
+            let landed = self.wheel_landing(lines);
             self.drop_list_nudge();
+            if let Some((top, seat)) = landed {
+                let top = top.min(limit);
+                self.seat_list_at(top, seat.filter(|seat| seat.top == top));
+                self.page_scroll = top;
+                return;
+            }
         }
         self.page_scroll = settings_page_scroll_transition(self.page_scroll, limit, command);
         if let SettingsPageScrollCommand::Lines(lines) = command
@@ -2644,12 +2661,7 @@ impl SettingsViewState {
                 "Asking macOS to show the Developer Tools list (it adds Terminal, switched off), \
                  then opening System Settings at {words}."
             ),
-            HandOver::Headless
-            | HandOver::Refused(_)
-            | HandOver::Queued
-            | HandOver::Shown
-            | HandOver::Unshown
-            | HandOver::OpenFailed => {
+            HandOver::Headless | HandOver::Refused(_) | HandOver::Queued | HandOver::OpenFailed => {
                 format!("System Settings did not open. The setting is at {words}.")
             }
         });
@@ -6554,6 +6566,47 @@ impl SettingsApp {
         }
     }
 
+    /// Whether a scroll by `lines` (the wheel's, a page's) moves within the parts of the entry
+    /// the keyboard is on, taller than the list's room ([`MessagesTall`]): THE SCROLL STEPS
+    /// THROUGH THE KEYBOARD'S ENTRY, a room at a time, before the keyboard moves on to the next
+    /// one. Moving it entry by entry, Page Down and the wheel skipped an open entry's body at 2x
+    /// in a 178x152 window: its head was all they ever showed.
+    fn scrolls_within_keyboards_entry(&self, view: &SettingsViewState, lines: i32) -> bool {
+        if view.route != SettingsRoute::Messages
+            || view.compact_navigation
+            || !view.search.trim().is_empty()
+            || lines == 0
+        {
+            return false;
+        }
+        let Some(id) = view
+            .common
+            .last_focus
+            .as_ref()
+            .and_then(|focus| messages_row_of(focus.as_str()))
+        else {
+            return false;
+        };
+        let Some((width, viewport)) = view.messages_page_geometry.get() else {
+            return false;
+        };
+        let visible = messages_visible(&self.messages, &view.messages_filter);
+        let Some(index) = visible.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        let plan = messages_plan(view, &self.messages, &visible, width, viewport);
+        let shown = plan.view(view.page_scroll.min(plan.limit()));
+        let (Some(part), Some(tall)) = (shown.part, plan.tall_of(index)) else {
+            return false;
+        };
+        shown.rows.start == index
+            && if lines > 0 {
+                part + 1 < tall.parts.len()
+            } else {
+                part > 0
+            }
+    }
+
     fn step_message_focus(&self, view: &mut SettingsViewState, lines: i32) -> bool {
         if view.route != SettingsRoute::Messages {
             return false;
@@ -6714,8 +6767,24 @@ impl SettingsApp {
         let plan = messages_plan(view, &self.messages, &visible, width, viewport);
         let shown = plan.view(view.page_scroll.min(plan.limit()));
         if let Some(id) = messages_row_of(focus.as_str()) {
-            let drawn = |k: usize| match (shown.part, plan.tall.as_ref()) {
-                (Some(part), Some(tall)) if tall.entry == k => {
+            // The keyboard stays where it is while its entry's parts that hold no control (its
+            // title, an action, Copy) scroll by, as on a screen of a list that shows none; a
+            // part that holds one takes it (below).
+            let on_parts = visible
+                .iter()
+                .position(|entry| entry.id == id)
+                .filter(|k| *k == shown.rows.start)
+                .zip(shown.part)
+                .and_then(|(k, part)| plan.tall_of(k).map(|tall| &tall.keys[part]));
+            if on_parts.is_some_and(|keys| {
+                !keys.iter().any(|key| {
+                    key.contains("/action/") || key.ends_with("/copy") || key.ends_with("/title")
+                })
+            }) {
+                return;
+            }
+            let drawn = |k: usize| match (shown.part, plan.tall_of(k)) {
+                (Some(part), Some(tall)) if k == shown.rows.start => {
                     tall.keys[part].contains(focus.as_str())
                 }
                 _ => true,
@@ -6757,7 +6826,7 @@ impl SettingsApp {
         let in_part = shown
             .part
             .filter(|&part| part > 0)
-            .and_then(|part| plan.tall.as_ref().map(|tall| &tall.keys[part]))
+            .and_then(|part| plan.tall_of(shown.rows.start).map(|tall| &tall.keys[part]))
             .and_then(|keys| {
                 keys.iter()
                     .find(|key| key.contains("/action/") || key.ends_with("/copy"))
@@ -6770,7 +6839,8 @@ impl SettingsApp {
                     .clone()
                     .find(|&k| {
                         shown.part.is_none_or(|part| part == 0)
-                            || plan.tall.as_ref().is_none_or(|tall| tall.entry != k)
+                            || k != shown.rows.start
+                            || plan.tall_of(k).is_none()
                     })
                     .and_then(|k| visible.get(k))
                     .map(|entry| UiKey::new(format!("settings/messages/row/{}/title", entry.id)))
@@ -8570,10 +8640,23 @@ impl SettingsApp {
             }
             AppEvent::ScrollLines(lines) => {
                 view.settle_messages_scroll();
-                if !self.step_message_focus(view, lines) {
+                view.messages_scroll_end.set(None);
+                if self.scrolls_within_keyboards_entry(view, lines)
+                    || !self.step_message_focus(view, lines)
+                {
                     view.page_reveal = None;
                     let limit = self.page_scroll_limit(view);
                     view.reduce_page_scroll(limit, SettingsPageScrollCommand::Lines(lines));
+                    if view.route == SettingsRoute::Messages
+                        && lines > 0
+                        && view.page_scroll >= limit
+                    {
+                        view.messages_scroll_end.set(Some((
+                            view.page_scroll,
+                            view.messages_selected,
+                            view.messages_tag_menu,
+                        )));
+                    }
                     self.keep_message_focus_seated(view);
                 }
                 true
@@ -8627,8 +8710,7 @@ impl SettingsApp {
             }
             AppEvent::ScrollPage(direction)
                 if view.showcase_steps_highlight()
-                    && (view.showcase_text_focus()
-                        == Some(showcase_page::ShowcaseText::Filter)
+                    && (view.showcase_filter_drives()
                         || view.showcase_page_step(direction as isize) != 0) =>
             {
                 let step = view.showcase_page_step(direction as isize);
@@ -8641,7 +8723,10 @@ impl SettingsApp {
                 let turned = view.turn_list_page(direction > 0);
                 let lines = direction
                     .saturating_mul(i32::try_from(self.shown_page(view)).unwrap_or(i32::MAX));
-                if turned || !self.step_message_focus(view, lines) {
+                if turned
+                    || self.scrolls_within_keyboards_entry(view, lines)
+                    || !self.step_message_focus(view, lines)
+                {
                     view.page_reveal = None;
                     if !turned {
                         let limit = self.page_scroll_limit(view);
@@ -11510,7 +11595,30 @@ fn navigation_scroll_target(key: &UiKey) -> bool {
         .any(|prefix| key.starts_with(prefix))
 }
 
+/// The Settings window's tree, drawn again where the page took or gave back the compact toolbar:
+/// whether a status docks in the toolbar is weighed before the page chooses its chrome, from
+/// the chrome the last frame chose, so a frame that changed it (the first at 2x text after 1x)
+/// docked a warning the next frame stood under the page, another screen with no event between
+/// (the Linux lane's Noto Sans at 919x158).
 fn settings_tree(
+    state: &SettingsViewState,
+    update: &UpdateProjection,
+    packages: &PackagesProjection,
+    messages: &MessagesState,
+    harness: &HarnessProjection,
+    cx: &ViewCx<'_>,
+) -> UiTree {
+    let listed = state.page_chrome.get().toolbar_listed;
+    let tree = settings_tree_once(state, update, packages, messages, harness, cx);
+    if state.page_chrome.get().toolbar_listed == listed
+        || SettingsWidth::for_viewport(cx.viewport.width) != SettingsWidth::Compact
+    {
+        return tree;
+    }
+    settings_tree_once(state, update, packages, messages, harness, cx)
+}
+
+fn settings_tree_once(
     state: &SettingsViewState,
     update: &UpdateProjection,
     packages: &PackagesProjection,
@@ -11560,17 +11668,13 @@ fn settings_tree(
     // pressed low on the list, which went up from under the pointer by what it covered
     // (Security at 178x348 with 2x text: 60pt). A side taken for the press's first status
     // ("Applying…") holds for the next where that still fits, so the bar does not hop.
-    // A bar a press stood over the list stays there for the press's next status though the
-    // window's rules would dock it, so it does not hop to the toolbar.
-    let stood_over = || {
-        state
-            .press_side()
-            .is_some_and(|(side, _, _)| side == scroll::BarSide::Over)
-    };
-    let weighing = !question_page
-        && state.plain_status()
-        && state.press_holds_place()
-        && (!rule_docked || stood_over());
+    // A press's status is weighed so though the window's rules would dock it: the dock stands
+    // where the rules put the bar ("under the list") only where it moves nothing, so a bar a
+    // press stood over the list does not hop to the toolbar for its next status, and a status
+    // the toolbar would take room over the list for stands elsewhere: docked, a refusal took the
+    // toolbar's room over the list and moved the switch the person had pressed down (Sound at
+    // 178x348 with 2x text: 28pt).
+    let weighing = !question_page && state.plain_status() && state.press_holds_place();
     let record = weighing.then(|| state.scroll_record.borrow().clone());
     // The most the bar, `bare` of its Undo or not, may take over the top of the list: the room
     // above the control, less a little clear where its least leaves that.
@@ -11611,7 +11715,16 @@ fn settings_tree(
     let fits = |side: scroll::BarSide, bare: bool| match side {
         scroll::BarSide::Under => true,
         scroll::BarSide::Over => band(bare).is_some(),
-        scroll::BarSide::Dock => !bare && dock_holds(),
+        scroll::BarSide::Dock => {
+            let was = (
+                state.status_place.replace(StatusPlace::Dock),
+                state.status_bare.replace(bare),
+            );
+            let holds = dock_holds();
+            state.status_place.set(was.0);
+            state.status_bare.set(was.1);
+            holds
+        }
     };
     // How far down the window `page`'s list starts.
     let list_top = |page: &UiNode| {
@@ -11651,6 +11764,10 @@ fn settings_tree(
                     // its words alone: under the list where the list keeps the control there,
                     // else over the top of it. The switch went up from under the pointer by the
                     // Undo's room (Security at 164x292 with 2x text: 34pt).
+                    // Where neither side holds it bare either (a switch at the top of a
+                    // 100pt list at 2x in 178x152, the bar's words alone too tall to go under
+                    // it), its words alone take the toolbar's place, as a dock's do: the bar
+                    // stood under the list over all of it, the switch with it.
                     stand(StatusPlace::Rule, true);
                     let bare = build_page();
                     if !state.press_moved(list_top(&bare)) {
@@ -11658,9 +11775,14 @@ fn settings_tree(
                         (scroll::BarSide::Under, true)
                     } else if band(true).is_some() {
                         (scroll::BarSide::Over, true)
+                    } else if fits(scroll::BarSide::Dock, true) {
+                        (scroll::BarSide::Dock, true)
                     } else {
-                        stand(StatusPlace::Rule, false);
-                        (scroll::BarSide::Under, false)
+                        // Nowhere holds even its words alone clear of the control (a 64pt switch
+                        // at the top of a 98pt window at 2x): its words alone, the least it
+                        // covers, under the list; with its Undo it stood over the whole window.
+                        built = Some(bare);
+                        (scroll::BarSide::Under, true)
                     }
                 }
             }
@@ -11670,7 +11792,7 @@ fn settings_tree(
     });
     let (place, bare) = match side {
         Some((scroll::BarSide::Over, bare)) => (StatusPlace::Over, bare),
-        Some((scroll::BarSide::Dock, _)) => (StatusPlace::Dock, false),
+        Some((scroll::BarSide::Dock, bare)) => (StatusPlace::Dock, bare),
         Some((scroll::BarSide::Under, bare)) => (StatusPlace::Rule, bare),
         None => (StatusPlace::Rule, false),
     };
@@ -11693,8 +11815,13 @@ fn settings_tree(
         let bar = feedback_bar(state, width, cx.viewport);
         state.status_place.set(StatusPlace::Over);
         let pressed = state.pressed_key()?;
-        lay_status_over_list(&mut page, bar?, &pressed).ok()
+        let bar = bar?;
+        let height = fixed_height(&bar);
+        lay_status_over_list(&mut page, bar, &pressed)
+            .ok()
+            .map(|()| height)
     });
+    state.status_band.set(over);
     if place == StatusPlace::Over && over.is_none() {
         // No list to stand over: the bar stands under the page after all.
         state.settle_press_side(scroll::BarSide::Under, false);
@@ -13321,6 +13448,12 @@ enum StatusPlace {
     Dock,
 }
 
+/// Whether `key` is a Tab stop of a plain status's bar ([`feedback_bar`]): its Undo, or its words
+/// where they scroll.
+fn status_bar_stop(key: &UiKey) -> bool {
+    key.as_str() == "settings/undo" || key.as_str().starts_with("settings/status/")
+}
+
 /// The least height a plain status's bar takes ([`plain_bar_layout`] with its words at their
 /// least).
 fn plain_bar_least(state: &SettingsViewState, width: SettingsWidth, viewport: LogicalRect) -> f32 {
@@ -13445,25 +13578,24 @@ fn lay_status_over_list(page: &mut UiNode, mut bar: UiNode, pressed: &UiKey) -> 
     if let Some(room) = list.room.as_mut() {
         room.height = (room.height - band).max(0.0);
     }
-    let gutter = unit.layout.outdent.right;
+    // A unit that reaches past the page's margins (its right gutter, the left margin of a list
+    // that leads with the toolbar, [`scroll::span_listed_toolbar`]) keeps that reach in the slot.
+    let (lead, gutter) = (unit.layout.outdent.left, unit.layout.outdent.right);
     let (outdent, padding, reach) = if direct {
         unit.layout.outdent = Insets::default();
+        let inside = Insets {
+            left: (insets.left - lead).max(0.0),
+            right: (insets.right - gutter).max(0.0),
+            ..Insets::default()
+        };
         (
             Insets {
-                left: insets.left,
+                left: insets.left.max(lead),
                 right: insets.right.max(gutter),
                 ..Insets::default()
             },
-            Insets {
-                left: insets.left,
-                right: (insets.right - gutter).max(0.0),
-                ..Insets::default()
-            },
-            Insets {
-                left: insets.left,
-                right: (insets.right - gutter).max(0.0),
-                ..Insets::default()
-            },
+            inside,
+            inside,
         )
     } else {
         (
@@ -13873,7 +14005,10 @@ impl DockActions {
             Self::Buttons(DraftBar::of(state).buttons)
         } else if state.reset_all_confirmation {
             Self::Buttons(reset_all_buttons(state))
-        } else if state.bar_feedback().is_some() && state.undo_offer().is_some() {
+        } else if state.bar_feedback().is_some()
+            && state.undo_offer().is_some()
+            && !press_dock(state)
+        {
             Self::Undo
         } else {
             Self::None
@@ -14083,7 +14218,8 @@ fn stacked_bars_leave_more_room(state: &SettingsViewState, viewport: LogicalRect
         |bars| &mut bars.roomier,
         (viewport, calm),
         || {
-            let docked = compact_docked_header_height(state, viewport) - compact_toolbar_height();
+            let docked = compact_docked_header_height(state, viewport)
+                - compact_undocked_toolbar_height(state, viewport);
             docked > 0.5 && {
                 let most = state.status_bar_most.replace(Some(0.0));
                 let least = settings_status_bars_height(state, SettingsWidth::Compact, viewport);
@@ -14327,6 +14463,7 @@ fn reset_all_question_page(state: &SettingsViewState, viewport: LogicalRect) -> 
         actions,
     ];
     scroll::seat_page_scroller(&mut children, insets.right);
+    scroll::span_listed_toolbar(&mut children, insets);
     UiNode::new(
         "settings/page/reset-all",
         UiContent::Group(GroupSpec::new("Reset All")),
@@ -14478,6 +14615,9 @@ fn compact_docked_header_height(state: &SettingsViewState, viewport: LogicalRect
 }
 
 fn compact_docked_header_laid(state: &SettingsViewState, viewport: LogicalRect) -> f32 {
+    if press_dock(state) {
+        return compact_undocked_toolbar_height(state, viewport);
+    }
     let layout = compact_dock_layout(
         state,
         viewport,
@@ -14497,7 +14637,7 @@ fn dock_words_height(state: &SettingsViewState, words_width: f32) -> f32 {
     let (words, most) = if state.has_unsaved_field_drafts() {
         (DraftBar::of(state).short, usize::MAX)
     } else if let Some(feedback) = state.bar_feedback().filter(|_| state.plain_status()) {
-        (feedback.clone(), dock_lines_held())
+        (feedback.clone(), dock_lines_held(state))
     } else {
         return 0.0;
     };
@@ -14526,8 +14666,18 @@ fn dock_line_height() -> f32 {
     clippy::cast_sign_loss,
     reason = "a few lines of a toolbar row, floored and at least one"
 )]
-fn dock_lines_held() -> usize {
+fn dock_lines_held(state: &SettingsViewState) -> usize {
+    if press_dock(state) {
+        return 1;
+    }
     (((compact_toolbar_height() - 16.0 + 0.01) / dock_line_height()).floor() as usize).max(1)
+}
+
+/// Whether a press's status stands docked bare, its words alone in the toolbar's place, where no
+/// side of the list holds it without covering the control pressed: it keeps the toolbar's height,
+/// its words on one line, scrolling, so nothing under it moves ([`compact_docked_header_laid`]).
+fn press_dock(state: &SettingsViewState) -> bool {
+    state.status_place.get() == StatusPlace::Dock && state.status_bare.get()
 }
 
 struct CompactFeedbackParts {
@@ -14648,7 +14798,7 @@ fn compact_feedback_parts(
         "settings/status/visual",
         feedback,
         (visual_width - 10.0).max(0.0),
-        dock_lines_held(),
+        dock_lines_held(state),
         dock_line_height(),
     )]);
     Some(CompactFeedbackParts {
@@ -14718,7 +14868,7 @@ fn compact_watch_status(state: &SettingsViewState, visual_width: f32) -> Option<
                 "settings/config-watch-status/detail/visual",
                 &preferred,
                 visual_width.max(0.0),
-                (dock_lines_held(), dock_line_height()),
+                (dock_lines_held(state), dock_line_height()),
                 StyleRef::Danger,
             )]),
         ]),
@@ -15347,21 +15497,22 @@ fn page(
             && state.search.trim().is_empty()
             && !state.compact_navigation
         {
+            // Messages reports the stops no screen holds whole as every page does, so its chrome
+            // sheds (its toolbar scrolling away with the list) as far as that brings them whole;
+            // it reported none, and an entry 156pt tall at 2x stood cut under the toolbar of a
+            // 178x152 window.
             let visible = messages_visible(messages, &state.messages_filter);
-            let holds = visible.is_empty()
-                || !messages_plan_opening(
-                    state,
-                    messages,
-                    &visible,
-                    width,
-                    cx.viewport,
-                    None,
-                    state.messages_tag_menu,
-                )
-                .view(0)
-                .rows
-                .is_empty();
-            (holds, (0, 0))
+            let plan = messages_plan_opening(
+                state,
+                messages,
+                &visible,
+                width,
+                cx.viewport,
+                None,
+                state.messages_tag_menu,
+            );
+            let holds = visible.is_empty() || !plan.view(0).rows.is_empty();
+            (holds, (plan.cut_stops(), 0))
         } else {
             state.scroll_plan().map_or((true, (0, 0)), |plan| {
                 (
@@ -15493,7 +15644,12 @@ fn page(
         let mut spare = None;
         if let Some(chrome) = kept {
             let scrolled = record.as_ref().is_some_and(|record| record.top() > 0);
-            if bars && (scrolled || state.page_reveal.is_none()) {
+            // A PRESS'S STATUS NEVER CHANGES THE PAGE'S CHROME: its bar takes a side of the list,
+            // or the toolbar's place, as the press's place lets it ([`scroll::BarSide`]). Chosen
+            // again under it, a 178x152 window at 2x listed its toolbar, the switch pressed at
+            // the list's top went up under it by the toolbar's 52pt, and the bar stood over the
+            // rest of the page.
+            if bars && (scrolled || state.page_reveal.is_none() || state.press_holds_place()) {
                 return (chrome, None);
             }
             let seated = seat(chrome, bars);
@@ -15548,6 +15704,9 @@ fn page(
             .map_or(ladder.len(), |at| at + 1);
         let mut best = (chrome, None, cuts);
         let mut last = chrome;
+        // The rung, of those as cut as the best, that gives the list the most room.
+        let room_now = || state.scroll_plan().map_or(0.0, |plan| plan.room());
+        let mut widest = (chrome, None::<f32>);
         let rungs = std::iter::once(chrome).chain(ladder[further..].iter().copied());
         let sheds = rungs.clone().map(PageChrome::giving_bar_room);
         let lists = lists_its_preview_when_starved(state.route)
@@ -15575,19 +15734,33 @@ fn page(
             };
             if better {
                 best = (trial, Some(trial_built), trial_cuts);
+                widest = (trial, None);
+            }
+            if !listing && trial_cuts.0 == best.2.0 {
+                let room = room_now();
+                if widest.1.is_none_or(|was| room > was + 0.5) {
+                    widest = (trial, Some(room));
+                }
             }
             if trial_cuts == (0, 0) || (better && listing && trial_cuts.0 == 0) {
                 break;
             }
         }
         // Last, the toolbar listed over the best of them, where that cuts fewer stops
-        // ([`compact_toolbar_lists`]).
+        // ([`compact_toolbar_lists`]); else over the one, as cut, that gives the list the most
+        // room: where every rung cuts every stop (Themes at 2x in 164x98, its list no room at
+        // all under the toolbar), the toolbar listed over the best alone cut them all as well,
+        // and the page stood blank under the toolbar.
         if best.2.0 > 0 && compact_toolbar_can_list(state, cx.viewport) {
-            let trial = best.0.listing_toolbar();
-            let (trial_built, _, trial_cuts) = seat(trial, bars);
-            last = trial;
-            if trial_cuts.0 < best.2.0 {
-                best = (trial, Some(trial_built), trial_cuts);
+            let over = std::iter::once(best.0).chain((widest.0 != best.0).then_some(widest.0));
+            for rung in over.collect::<Vec<_>>() {
+                let trial = rung.listing_toolbar();
+                let (trial_built, _, trial_cuts) = seat(trial, bars);
+                last = trial;
+                if trial_cuts.0 < best.2.0 {
+                    best = (trial, Some(trial_built), trial_cuts);
+                    break;
+                }
             }
         }
         match best {
@@ -16129,7 +16302,12 @@ fn page(
     let held = PAGE_CHROME_HELD.with(Cell::get).is_some();
     #[cfg(not(test))]
     let held = false;
-    let gives_way = (drawn_at != Some(chrome_at) || keyboard_moved) && !held;
+    // A press's status sheds no chrome for the control pressed: the bar takes a side, or the
+    // toolbar's place, where the press found it ([`scroll::BarSide`]); shed, the chrome moved the
+    // control from under the pointer (a switch at the top of a 178x152 window's list at 2x, up
+    // by the toolbar's 52pt, and the bar over all the rest).
+    let gives_way =
+        (drawn_at != Some(chrome_at) || keyboard_moved) && !held && !state.press_holds_place();
     // A rung holds what `owed` asks of the keyboard's control only where its list's body, and the
     // list measured in it, has room for it under the bar's least.
     let body_holds = |trial: PageChrome, owed: f32| {
@@ -16258,6 +16436,7 @@ fn page(
     let global_search = !state.search.trim().is_empty();
     let insets = page_frame_insets(state, cx.viewport, width, layout.maximum(width));
     scroll::seat_page_scroller(&mut children, insets.right);
+    scroll::span_listed_toolbar(&mut children, insets);
     let (page_key, page_label) = if global_search {
         ("settings/page/search-results".to_string(), "Search Results")
     } else if width == SettingsWidth::Compact && state.compact_navigation {
@@ -17103,13 +17282,15 @@ fn pinned_heading(
     // cannot hold the title leads its list with its name, in the toolbar title's type on the
     // lines its column needs, scrolling away with the list as a navigation bar's large title
     // does; pinned, those lines would take a row's room from every screen.
-    // Where the toolbar leads the list ([`compact_toolbar_lists`]) it leads it in the list's
-    // column, and the name follows it where the toolbar there does not carry the title.
+    // Where the toolbar leads the list ([`compact_toolbar_lists`]) it leads it the window wide,
+    // and the name follows it where the toolbar does not carry the title.
     let column = settings_page_content_width(viewport.width, width, FORM_MEASURE);
     let mut head = Vec::new();
     let mut unnamed = width == SettingsWidth::Compact && !compact_toolbar_titles(width, viewport);
     if compact_toolbar_lists(state, viewport) {
-        let bar = LogicalRect::new(0.0, 0.0, column, viewport.height);
+        // Laid out the window wide, as it is pinned: the page's list spans it to the window's
+        // edges ([`scroll::span_listed_toolbar`]).
+        let bar = LogicalRect::new(0.0, 0.0, viewport.width, viewport.height);
         unnamed = !compact_toolbar_slots(state, bar, false).titled;
         head.push((
             compact_toolbar(state, bar, false),
@@ -17316,7 +17497,8 @@ fn settings_status_bar_laid_cost(
     compact_dock_layout(state, viewport, &DockActions::Undo, watcher, true, None)
         .under
         .map_or(0.0, |under| {
-            scaled_control_height() + 8.0 + under + 16.0 - compact_toolbar_height()
+            scaled_control_height() + 8.0 + under + 16.0
+                - compact_undocked_toolbar_height(state, viewport)
         })
         .max(0.0)
 }
@@ -17328,8 +17510,12 @@ fn settings_status_bars_taken(
     width: SettingsWidth,
     viewport: LogicalRect,
 ) -> f32 {
+    // WHAT A DOCK TAKES IS ITS HEIGHT OVER THE TOOLBAR'S IT STANDS IN: measured over a toolbar
+    // of words where the toolbar is icons alone (at 2x in a narrow window, 52pt, not 80), a
+    // press's words docked in its place took -28pt, the list lost 28pt it had, and the switch
+    // pressed at its top went up by its card's padding (Sound's Trail sounds at 2x in 178x152).
     if width == SettingsWidth::Compact && compact_status_dock_required(state, viewport) {
-        compact_header_height(state, viewport) - compact_toolbar_height()
+        compact_header_height(state, viewport) - compact_undocked_toolbar_height(state, viewport)
     } else {
         settings_status_bars_height(state, width, viewport)
     }
@@ -19198,6 +19384,7 @@ fn top_setting_row(
         tags: parts.tags,
         worst: parts.worst,
         timing: parts.timing,
+        worst_timing: parts.worst_timing,
     })
 }
 
@@ -19207,6 +19394,7 @@ struct TopRow {
     tags: RowTags,
     worst: RowTags,
     timing: Option<&'static str>,
+    worst_timing: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20194,6 +20382,7 @@ fn top_card_row(
         tags,
         worst,
         timing,
+        worst_timing,
     } = top;
     if !stacked && width == SettingsWidth::Compact {
         row.layout.height = Length::Fixed(compact_inline_row_height());
@@ -20213,7 +20402,7 @@ fn top_card_row(
     let room = row_label_room(&row, stacked, text_width);
     let note = notes.then(|| row_footnote(state, key)).flatten();
     let note = note.as_deref();
-    let hold = name_holds_state((&name, &worst, room), timing, note, text_width);
+    let hold = name_holds_state((&name, &worst, room), worst_timing, note, text_width);
     let placement = lay_out_row_label(&mut row, &name, &tags, &worst, room, stacked, (false, hold));
     let detail = row_second_line(&placement, timing, note, text_width);
     let row = with_row_detail(row, key, &detail, stacked);
@@ -20680,8 +20869,16 @@ fn display_faces_head(
         }
         lines
     } else {
-        let reserved = wrapped_words_lines(&words(&worst), style, room).len();
-        let mut lines = wrapped_words_lines(&words(&tags), style, room);
+        // The line kept for it says the caption's state at rest too ([`resting_state`]).
+        let rest = RowTags {
+            state: resting_state(&worst.state),
+            facts: Vec::new(),
+        };
+        let reserved = wrapped_words_lines(&words(&worst), style, room)
+            .len()
+            .max(wrapped_words_lines(&words(&rest), style, room).len());
+        let shown = if tags.state.is_empty() { &rest } else { &tags };
+        let mut lines = wrapped_words_lines(&words(shown), style, room);
         lines.resize(reserved.max(lines.len()), String::new());
         lines
     };
@@ -21084,24 +21281,58 @@ fn cursor_style_row(
     let scale = settings_text_scale();
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
     let measure = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
-    let checked = pieces_fit(&style.label(), (row_width - LEAD - TAIL).max(0.0), &measure);
+    let label = style.label();
+    let beside_check = (row_width - LEAD - TAIL).max(0.0);
+    // The check keeps its tail where every piece of the name fits beside it, unless the name
+    // there is too tall for the list even with its description apart and the tail costs it a
+    // line: in a narrow window at 2x text the check narrowed a name onto a line more than the
+    // list had room for (the Linux lane's Noto Sans in a 178x152 window). The row stays
+    // selected either way.
+    let checked = pieces_fit(&label, beside_check, &measure) && {
+        let lines = |width: f32| {
+            wrapped_words_lines(&label, (SemanticRole::Text, StyleRef::Primary), width).len()
+        };
+        let beside = lines(beside_check);
+        let tall = 2.0 * PAD + beside as f32 * 20.0 * scale > limit + 0.01;
+        !tall || beside <= lines((row_width - 2.0 * LEAD).max(0.0))
+    };
     let tail = if checked { TAIL } else { LEAD };
     let text_width = (row_width - LEAD - tail).max(0.0);
-    let mut spec = ButtonSpec::new(style.label()).visual_label(String::new());
+    // The default style's name says "(default)" where the row has room for it; where that name
+    // is too tall for the list even with its description apart and its name alone takes fewer
+    // lines, its description says it ("Default · …"), the button still named in full: the Linux
+    // lane's Noto Sans set "Rainbow kitty (default)" on four lines at 2x text in a 178pt window,
+    // a 176pt row a 152pt window never shows whole.
+    let name_lines = |text: &str| {
+        wrapped_words_lines(text, (SemanticRole::Text, StyleRef::Primary), text_width).len()
+    };
+    let default_below = style.default && {
+        let full = name_lines(&label);
+        2.0 * PAD + full as f32 * 20.0 * scale > limit + 0.01 && name_lines(&style.name) < full
+    };
+    let (shown, about) = if default_below {
+        (
+            style.name.clone(),
+            format!("Default \u{b7} {}", style.description),
+        )
+    } else {
+        (label.clone(), style.description.clone())
+    };
+    let mut spec = ButtonSpec::new(label.clone()).visual_label(String::new());
     spec.description = Some(style.description.clone());
     if saved && checked {
         spec = spec.trailing_icon(ButtonIcon::Check);
     }
     let (name, name_height) = wrapped_words_node(
         &format!("{key}/name"),
-        &style.label(),
+        &shown,
         (SemanticRole::Text, StyleRef::Primary),
         text_width,
         20.0 * scale,
     );
     let (description, description_height) = wrapped_words_node(
         &format!("{key}/description"),
-        &style.description,
+        &about,
         (SemanticRole::Status, StyleRef::Quiet),
         text_width,
         18.0 * scale,
@@ -21159,7 +21390,7 @@ fn cursor_style_row(
     }
     let (description, description_height) = wrapped_words_node(
         &format!("{key}/description"),
-        &style.description,
+        &about,
         (SemanticRole::Status, StyleRef::Quiet),
         (row_width - 2.0 * LEAD).max(0.0),
         18.0 * scale,
@@ -21866,10 +22097,11 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
         .map_or("Wallpaper image", |field| field.label);
     let (tags, worst) = changed_tags(state, prefs::EDIT_WALLPAPER);
     let placement = place_row_tags(name, &tags, &worst, text_width, false);
+    let said = placement.said_below();
     let mut name_lines = placement.lines;
     let name_count = name_lines.len() + usize::from(!placement.worst_below.is_empty());
-    if !placement.below.is_empty() {
-        name_lines.push(placement.below.join(FACT_SEPARATOR));
+    if !said.is_empty() {
+        name_lines.push(said.join(FACT_SEPARATOR));
     }
     let named = with_tags(name, tags.iter());
     let (mut name_node, _) = words_node_of_lines(
@@ -22263,6 +22495,18 @@ fn top_settings_grid(
             &theme_spec,
             previews.theme + (right - left).min((most - previews.theme).max(0.0)),
         );
+        // The colour sample whole and the right column still the taller: the trail's sample
+        // gives the difference back in whole rows, down to its floor, where that leaves a
+        // smaller blank band under the cards' rows than the colours card would keep (the Linux
+        // lane's Noto Sans sets the playful card's words on more lines than macOS's faces do).
+        let (_, left, right) = measure(previews);
+        let over = right - left;
+        if over > 0.01 {
+            let shrunk = whole(&trail_spec, (previews.trail - over).max(PREVIEW_FLOOR));
+            if (previews.trail - shrunk - over).abs() < over {
+                previews.trail = shrunk;
+            }
+        }
     } else if left > right {
         previews.trail = whole(&trail_spec, previews.trail + (left - right).min(96.0));
     }
@@ -24195,6 +24439,9 @@ fn settings_fields_page(
             } else {
                 vec![(row, row_height)]
             };
+            // A split row's words under its control follow it, its Reset's line after them
+            // ([`FinishedRow::split`]): each key is the stop's that draws it.
+            let parts = parts.into_iter().chain(split_note).collect::<Vec<_>>();
             let drawn = parts
                 .iter()
                 .map(|(node, _)| scroll::focus_keys(node))
@@ -24222,12 +24469,6 @@ fn settings_fields_page(
                 } else {
                     FieldStop::Under(Box::new(node))
                 });
-            }
-            for (node, height) in split_note {
-                plan.row(id, height + 4.0, Vec::new());
-                plan.set_ids(vec![node.key.clone()]);
-                plan.measure(&node, height);
-                stops.push(FieldStop::Under(Box::new(node)));
             }
             for (node, height) in finished.shared_note_stops(Some(footnote_room - head - 4.0)) {
                 plan.row(id, height + 4.0, Vec::new());
@@ -24609,8 +24850,8 @@ fn push_field_card(
 ) {
     match ListItem::of(node, height) {
         ListItem::Split(split) if !split.rows.is_empty() => {
-            let split = if split.outgrows(room, scroll::ListFoot::Peek) {
-                split.fitted(room, scroll::ListFoot::Peek)
+            let split = if split.outgrows(room) {
+                split.fitted(room)
             } else {
                 split
             };
@@ -28193,34 +28434,31 @@ fn debugger_press_refusal(
     })
 }
 
-const fn debugger_alert_not_hardened_bullet(
-    hardening: aterm_containment::consent::SelfHardening,
-) -> Option<&'static str> {
+/// What stays safe once debugger access is on, by how this aterm is signed: the one place the
+/// alert speaks of this aterm.
+const fn debugger_alert_safe(hardening: aterm_containment::consent::SelfHardening) -> &'static str {
     use aterm_containment::consent::SelfHardening;
     match hardening {
-        SelfHardening::Hardened => None,
-        SelfHardening::NotHardened => Some(
-            "\u{2022} Not protected: this aterm (a development build). Any program you run could \
-             take control of it and get past this alert.",
-        ),
-        SelfHardening::Unknown => Some(
-            "\u{2022} Maybe not protected: this aterm, if it is a development build. Any program \
-             you run could then take control of it and get past this alert.",
-        ),
+        SelfHardening::Hardened => "hardened apps (this aterm too) and macOS stay safe",
+        SelfHardening::NotHardened => {
+            "hardened apps and macOS stay safe, but not this aterm (a dev build)"
+        }
+        SelfHardening::Unknown => {
+            "hardened apps and macOS stay safe, maybe not this aterm (if a dev build)"
+        }
     }
 }
 
 /// aterm's own alert before a debugger-access change pressed on Settings ▸ Security (debugger
 /// design §3.4 step 1): only that press raises it; System State's debugger step raises none of
-/// aterm's own. Returns `(title, body, proceed)`.
+/// aterm's own. Two lines: what the change does (with what stays safe), then macOS's password
+/// dialog (with the undo, for On). Returns `(title, body, proceed)`.
 pub(crate) fn debugger_access_alert(
     change: aterm_containment::consent::DebuggerChange,
     facts: &crate::debugger_access::DebuggerFacts,
     evidence: SpikeEvidence,
 ) -> (String, String, &'static str) {
-    use aterm_containment::consent::{
-        DEBUGGER_ACCESS_REVERT, DebuggerChange, DebuggerMember, SelfHardening,
-    };
+    use aterm_containment::consent::{DEBUGGER_ACCESS_REVERT, DebuggerChange, DebuggerMember};
     let password_of = if facts.probe.member == DebuggerMember::Admin {
         "your admin password"
     } else {
@@ -28228,50 +28466,30 @@ pub(crate) fn debugger_access_alert(
     };
     let dialog = match (change, evidence.devtools_enable_measured) {
         (DebuggerChange::On, true) => {
-            format!("asks for {password_of} in a dialog named \"SamplingTools\", Apple's tool")
+            format!("asks for {password_of} in \"SamplingTools\", Apple's dialog")
         }
-        (DebuggerChange::On, false) => format!(
-            "should ask for {password_of} in its own dialog, named \"SamplingTools\", Apple's tool"
-        ),
-        (DebuggerChange::Off, true) => {
-            format!("asks for {password_of} in a dialog named \"SamplingTools\"")
+        (DebuggerChange::On, false) => {
+            format!("should ask for {password_of} in \"SamplingTools\", its own dialog")
         }
+        (DebuggerChange::Off, true) => format!("asks for {password_of} in \"SamplingTools\""),
         (DebuggerChange::Off, false) => format!("should ask for {password_of} in its own dialog"),
     };
-    let password = format!("Next, macOS {dialog}. aterm never sees it.");
+    let password = format!("Next, macOS {dialog}; aterm never sees it.");
     match change {
-        DebuggerChange::On => {
-            let mut bullets = vec![
-                "\u{2022} Whole Mac: every admin and developer account, not just aterm",
-                "\u{2022} Exposed: Homebrew tools, node, gpg-agent, cargo builds",
-                if facts.self_hardened == SelfHardening::Hardened {
-                    "\u{2022} Still protected: hardened apps (this aterm too) and macOS"
-                } else {
-                    "\u{2022} Still protected: hardened apps and macOS"
-                },
-            ];
-            bullets.extend(debugger_alert_not_hardened_bullet(facts.self_hardened));
-            bullets.push("\u{2022} Apple advises administrators not to change this rule");
-            let undo = "press Turn Off Debugger Access\u{2026} here";
-            let paragraphs = [
-                "Afterwards, programs you run can debug your other programs without a password, \
-                 and read or change their memory."
-                    .to_owned(),
-                bullets.join("\n"),
-                password,
-                format!("To undo: {undo}, or run {DEBUGGER_ACCESS_REVERT}."),
-            ];
-            (
-                "Allow debugger access on this Mac?".to_owned(),
-                paragraphs.join("\n\n"),
-                "Allow\u{2026}",
-            )
-        }
+        DebuggerChange::On => (
+            "Allow debugger access on this Mac?".to_owned(),
+            format!(
+                "Any program you run can then debug others without a password, Mac-wide; {}.\n\n\
+                 {password} To undo: {DEBUGGER_ACCESS_REVERT}.",
+                debugger_alert_safe(facts.self_hardened)
+            ),
+            "Allow\u{2026}",
+        ),
         DebuggerChange::Off => (
             "Turn off debugger access on this Mac?".to_owned(),
             format!(
-                "Debuggers will need a password again each time one attaches. Apple's original \
-                 10 hours without asking, after an answer, does not come back.\n\n{password}"
+                "Debuggers will need a password again each time one attaches; Apple's original 10 \
+                 hours without asking does not come back.\n\n{password}"
             ),
             "Turn Off\u{2026}",
         ),
@@ -29855,6 +30073,7 @@ fn finished_setting_row_as(
         tags,
         worst,
         timing,
+        worst_timing,
     } = parts;
     if stacked {
         seat_stacked_reset(&mut row, &name, text_width);
@@ -29882,6 +30101,7 @@ fn finished_setting_row_as(
         tags,
         worst,
         timing,
+        worst_timing,
         note: prefs::RowNote::own(note).map(str::to_string),
         shared_note: prefs::RowNote::shared(note).map(str::to_string),
         error: state.field_errors.get(field.key).cloned(),
@@ -30099,6 +30319,9 @@ struct FinishedRow {
     tags: RowTags,
     worst: RowTags,
     timing: Option<&'static str>,
+    /// When a change takes effect, as the row says it at the value that says it: where the
+    /// row's state goes is weighed by it ([`name_holds_state`]).
+    worst_timing: Option<&'static str>,
     note: Option<String>,
     shared_note: Option<String>,
     error: Option<String>,
@@ -30123,7 +30346,7 @@ impl FinishedRow {
     fn holds_in_name(&self) -> bool {
         name_holds_state(
             (&self.name, &self.worst, self.label_room()),
-            self.timing,
+            self.worst_timing,
             self.note.as_deref(),
             self.text_width,
         )
@@ -30175,12 +30398,26 @@ impl FinishedRow {
     }
 
     fn split(&self, most: f32) -> (UiNode, Vec<(UiNode, f32)>) {
-        let (row, detail, _) = self.placed();
-        let blocks = if detail.is_empty() {
-            Vec::new()
-        } else {
-            row_note_blocks(self.key, &detail, most)
-        };
+        let (mut row, detail, _) = self.placed();
+        // A NOTE THAT SAYS NOTHING YET IS NO STOP: the lines it keeps for what it may say, a
+        // block of their own under the row, were a stop that drew nothing, the last screen of a
+        // page a band of empty card (Text & Fonts at 2x in 178x152). Listed apart from the row,
+        // they keep nothing in place: what the note comes to say lists under the row.
+        if detail.iter().all(String::is_empty) {
+            return (self.with_error(row), Vec::new());
+        }
+        // A ROW SPLIT ACROSS STOPS KEEPS A WHOLE ROW'S ORDER: what it says under its control, then
+        // the line its Reset takes ([`with_row_detail`]). Left in the row, that line stood empty
+        // between the control and the words under it while the key was not written, a blank
+        // band mid-row (Copy on select at 178x418 with 2x text: 40pt between the switch and
+        // "Default").
+        let gap = row.layout.gap;
+        let reset_line = take_reset_line(&mut row);
+        let (blocks, unplaced) =
+            row_note_blocks(self.key, &detail, most, reset_line.map(|line| (line, gap)));
+        if let Some(line) = unplaced {
+            put_back_reset_line(&mut row, line);
+        }
         (self.with_error(row), blocks)
     }
 
@@ -30335,8 +30572,48 @@ fn row_second_line(
     {
         return shared;
     }
-    let mut lines = fact_lines(&below, px, text_width);
-    let reserved = fact_lines(&worst, px, text_width).len();
+    // Where the state has a line of its own, the line says it at rest too ([`resting_state`]),
+    // laid out for the longer of what it says at rest and at worst, so it breaks alike either
+    // way: laid out by each, "Default · Applies after restart" took one line where "Changed ·
+    // Applies after restart" took two, and the second read as blank (Initial columns at 234pt).
+    let (mut lines, reserved) = match &placement.state_below {
+        Some(state) => {
+            let state = &*rest_breaking_alike(state, px, text_width);
+            let measure = |words: &[String]| {
+                crate::tray_raster::ui_text_width_for(
+                    crate::widget::TextFace::Ui,
+                    &words.join(FACT_SEPARATOR),
+                    px,
+                )
+            };
+            let widest = if measure(&state.rest) > measure(&state.worst) {
+                &state.rest
+            } else {
+                &state.worst
+            };
+            (
+                led_fact_lines(
+                    &state.said,
+                    widest,
+                    &with_timing(&state.facts),
+                    px,
+                    text_width,
+                ),
+                led_fact_lines(
+                    widest,
+                    widest,
+                    &with_timing(&state.worst_facts),
+                    px,
+                    text_width,
+                )
+                .len(),
+            )
+        }
+        None => (
+            fact_lines(&below, px, text_width),
+            fact_lines(&worst, px, text_width).len(),
+        ),
+    };
     if lines.len() < reserved {
         lines.resize(reserved, String::new());
     }
@@ -30344,6 +30621,36 @@ fn row_second_line(
         lines.extend(wrapped_copy_lines(note, px, text_width));
     }
     lines
+}
+
+/// `state`, Font size's resting [`AUTOMATIC_WORD`] said as [`DEFAULT_WORD`] where that word
+/// breaks inside itself on its line and "Changed" does not: THE LINE KEPT FOR THE STATE BREAKS
+/// ALIKE FOR BOTH WORDS. Laid out for the longer, "Auto-" / "matic" kept two lines, and once a
+/// size was written "Changed" took the first and left the second blank (the Linux lane's Noto
+/// Sans with 2x text in a 164pt window). "Default" takes a line as "Changed" does, as on every
+/// other row.
+fn rest_breaking_alike(
+    state: &StateBelow,
+    px: f32,
+    width: f32,
+) -> std::borrow::Cow<'_, StateBelow> {
+    let one_line =
+        |word: &str| fact_lines(std::slice::from_ref(&word.to_string()), px, width).len() == 1;
+    let automatic = [AUTOMATIC_WORD.to_string()];
+    if state.rest != automatic || one_line(AUTOMATIC_WORD) || !one_line(CHANGED_WORD) {
+        return std::borrow::Cow::Borrowed(state);
+    }
+    let default = vec![DEFAULT_WORD.to_string()];
+    std::borrow::Cow::Owned(StateBelow {
+        said: if state.said == automatic {
+            default.clone()
+        } else {
+            state.said.clone()
+        },
+        worst: vec![CHANGED_WORD.to_string()],
+        rest: default,
+        ..state.clone()
+    })
 }
 
 /// A ROW'S FACTS THAT MAY COME TAKE ROOM ON ITS NOTE'S FIRST LINE: the note wraps with that
@@ -30601,6 +30908,49 @@ struct RowTagPlacement {
     lines: Vec<String>,
     below: Vec<String>,
     worst_below: Vec<String>,
+    /// Where the row's state goes on a line under its name, what that line says.
+    state_below: Option<StateBelow>,
+}
+
+impl RowTagPlacement {
+    /// What goes under the name: [`Self::below`], the state said at rest too where it has a line
+    /// there ([`resting_state`]).
+    fn said_below(&self) -> Vec<String> {
+        self.state_below.as_ref().map_or_else(
+            || self.below.clone(),
+            |state| state.said.iter().chain(&state.facts).cloned().collect(),
+        )
+    }
+}
+
+/// The line under a row's name its state takes, where the state does not fit beside the name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StateBelow {
+    /// The state as it is now, at rest too ([`resting_state`]).
+    said: Vec<String>,
+    /// The state at worst ("Changed") and at rest ("Default"): the line is laid out for the
+    /// longer, so it breaks alike whichever it says ([`led_fact_lines`]).
+    worst: Vec<String>,
+    rest: Vec<String>,
+    /// The facts that go under the name with it, now and at worst.
+    facts: Vec<String>,
+    worst_facts: Vec<String>,
+}
+
+/// The words a row whose state goes on a line under its name says there while its key is not
+/// written: "Default" for "Changed", "Follows theme" for "Overrides theme". THE LINE KEPT FOR A
+/// ROW'S STATE ALWAYS SAYS IT: kept empty while the key was not written, it read as a blank line
+/// under a short name in a narrow window (623 such lines between 164 and 304pt wide with 2x
+/// text, Top's Color theme and Font family cards at 1074x900).
+fn resting_state(worst: &[String]) -> Vec<String> {
+    worst
+        .iter()
+        .map(|word| match word.as_str() {
+            CHANGED_WORD => DEFAULT_WORD.to_string(),
+            OVERRIDES_THEME_WORD => FOLLOWS_THEME_WORD.to_string(),
+            other => other.to_string(),
+        })
+        .collect()
 }
 
 fn place_row_tags(
@@ -30664,10 +31014,32 @@ fn place_row_tags_held(
     if let Some(last) = lines.last_mut() {
         *last = with_tags(last, &pick(tags, true));
     }
+    let facts = |tags: &RowTags| -> Vec<String> {
+        if facts_inline {
+            Vec::new()
+        } else {
+            tags.facts.clone()
+        }
+    };
+    let state_below = (!fit.state && !worst.state.is_empty()).then(|| {
+        let rest = resting_state(&worst.state);
+        StateBelow {
+            said: if tags.state.is_empty() {
+                rest.clone()
+            } else {
+                tags.state.clone()
+            },
+            worst: worst.state.clone(),
+            rest,
+            facts: facts(tags),
+            worst_facts: facts(worst),
+        }
+    });
     RowTagPlacement {
         lines,
         below: pick(tags, false),
         worst_below: pick(worst, false),
+        state_below,
     }
 }
 
@@ -30901,7 +31273,17 @@ fn with_row_detail(mut row: UiNode, key: &str, lines: &[String], stacked: bool) 
     );
     let row_height = fixed_height(&row);
     if stacked {
-        row.children.insert(1, detail_node);
+        // A STACKED ROW'S SECOND LINE COMES AFTER ITS CONTROL, as a row's does beside its control:
+        // what it says may come or go with the value chosen (Universal Control's "Applies at the
+        // next ALab tools check" only for Off; a switch's note saying what Off or On does), and
+        // over the control it moved the control a press had just chosen, wherever the list could
+        // not take the difference back (Security at 304x520: Leave as is went up 18pt).
+        //
+        // It comes before the line a Reset under the control takes (where the Reset does not fit
+        // beside the name): empty while the key is not written, that line under the control
+        // stood between the control and what the row says, a blank gap mid-row (Classify
+        // session status at 234pt with 2x text: 40pt between the switch and "Default").
+        insert_before_reset_line(&mut row, detail_node);
         row.layout.height = Length::Fixed(row_height + detail_height + 4.0);
         return row;
     }
@@ -30913,14 +31295,116 @@ fn with_row_detail(mut row: UiNode, key: &str, lines: &[String], stacked: bool) 
     .children(vec![row, detail_node])
 }
 
-fn row_note_blocks(key: &str, lines: &[String], most: f32) -> Vec<(UiNode, f32)> {
+/// `detail` after a stacked row's control, before the line its Reset takes under the control
+/// where it has one ([`seat_stacked_reset`]).
+fn insert_before_reset_line(row: &mut UiNode, detail: UiNode) {
+    let at = row
+        .children
+        .iter()
+        .rposition(|child| !child.key.as_str().starts_with("settings/reset-line/"))
+        .map_or(row.children.len(), |last| last + 1);
+    row.children.insert(at, detail);
+}
+
+/// The line a stacked row's Reset takes under its control ([`seat_stacked_reset`]), taken out
+/// of `row`, the row as much shorter.
+fn take_reset_line(row: &mut UiNode) -> Option<UiNode> {
+    let at = row.children.iter().position(|child| {
+        child
+            .key
+            .as_str()
+            .strip_prefix("settings/reset-line/")
+            .is_some_and(|rest| !rest.contains('/'))
+    })?;
+    let line = row.children.remove(at);
+    if let Length::Fixed(height) = row.layout.height {
+        row.layout.height = Length::Fixed((height - fixed_height(&line) - row.layout.gap).max(0.0));
+    }
+    Some(line)
+}
+
+/// [`take_reset_line`] undone: `line` back at the end of `row`, where [`seat_stacked_reset`]
+/// puts it.
+fn put_back_reset_line(row: &mut UiNode, line: UiNode) {
+    if let Length::Fixed(height) = row.layout.height {
+        row.layout.height = Length::Fixed(height + row.layout.gap + fixed_height(&line));
+    }
+    row.children.push(line);
+}
+
+/// A split row's `lines` in stops at most `most` tall, `trailing` (a line and the gap over it)
+/// after the last, in the stop of the row's last words; and `trailing` back where the two do not
+/// fit one stop: alone, an empty Reset line would be a stop that draws nothing, and a screen that
+/// starts on such a stop loses the next group's caption (Sound at 178x152).
+fn row_note_blocks(
+    key: &str,
+    lines: &[String],
+    most: f32,
+    trailing: Option<(UiNode, f32)>,
+) -> (Vec<(UiNode, f32)>, Option<UiNode>) {
     let line_height = row_detail_line_height();
     let per_block = ((most / line_height).floor() as usize).max(1);
-    lines
-        .chunks(per_block)
+    // A BLOCK OF LINES KEPT EMPTY ENDS THE BLOCK BEFORE IT: the lines a note keeps for what it
+    // may say, listed a block of their own, were a stop that drew nothing, the last screen of a
+    // page a band of empty card (Text & Fonts at 2x in 178x152, Terminal at 164x98).
+    // A first block kept empty leads the block after it.
+    let blank = |chunk: &[String]| chunk.iter().all(String::is_empty);
+    let mut chunks: Vec<&[String]> = Vec::new();
+    for (at, chunk) in lines.chunks(per_block).enumerate() {
+        let start = at * per_block;
+        match chunks.last_mut() {
+            Some(joined) if blank(chunk) || blank(joined) => {
+                let first = start - joined.len();
+                *joined = &lines[first..start + chunk.len()];
+            }
+            _ => chunks.push(chunk),
+        }
+    }
+    let mut trailing = trailing;
+    let mut unplaced = None;
+    // The most words the last stop holds with the trailing line under them.
+    let beside = trailing
+        .as_ref()
+        .map(|(line, gap)| ((most - gap - fixed_height(line)) / line_height + 0.01).floor());
+    if let Some(beside) = beside {
+        let last = chunks.last().map_or(0, |chunk| chunk.len());
+        if beside < 1.0 {
+            unplaced = trailing.take().map(|(line, _)| line);
+        } else if last > beside as usize {
+            // The last stop gives its last words to one of their own with the trailing line.
+            let keep = beside as usize;
+            let split = chunks.pop().unwrap_or_default();
+            let (head, tail) = split.split_at(split.len() - keep);
+            chunks.push(head);
+            chunks.push(tail);
+        }
+    }
+    let count = chunks.len();
+    let mut first_line = 0;
+    let blocks: Vec<(UiNode, f32)> = chunks
+        .into_iter()
         .enumerate()
         .map(|(part, chunk)| {
-            let height = chunk.len() as f32 * line_height;
+            let mut height = chunk.len() as f32 * line_height;
+            let mut children: Vec<UiNode> = chunk
+                .iter()
+                .enumerate()
+                .map(|(offset, text)| {
+                    reserved_or_detail_line(
+                        format!("settings/note/{key}/line-{}", first_line + offset),
+                        text.clone(),
+                        line_height,
+                    )
+                })
+                .collect();
+            first_line += chunk.len();
+            if part + 1 == count
+                && let Some((line, gap)) = trailing.take()
+            {
+                height += gap + fixed_height(&line);
+                children.push(row_note_gap(key, gap));
+                children.push(line);
+            }
             let node = UiNode::new(
                 if part == 0 {
                     format!("settings/note/{key}")
@@ -30934,22 +31418,21 @@ fn row_note_blocks(key: &str, lines: &[String], most: f32) -> Vec<(UiNode, f32)>
                     .width(Length::Fill)
                     .height(Length::Fixed(height)),
             )
-            .children(
-                chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, text)| {
-                        reserved_or_detail_line(
-                            format!("settings/note/{key}/line-{}", part * per_block + offset),
-                            text.clone(),
-                            line_height,
-                        )
-                    })
-                    .collect(),
-            );
+            .children(children);
             (node, height)
         })
-        .collect()
+        .collect();
+    (blocks, unplaced)
+}
+
+/// The gap a row keeps between its lines, in a split row's last stop before its Reset line.
+fn row_note_gap(key: &str, gap: f32) -> UiNode {
+    UiNode::new(
+        format!("settings/note/{key}/gap"),
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(Layout::default().height(Length::Fixed(gap)))
+    .paint_only()
 }
 
 fn reserved_or_detail_line(key: String, text: String, line_height: f32) -> UiNode {
@@ -30965,6 +31448,31 @@ fn reserved_or_detail_line(key: String, text: String, line_height: f32) -> UiNod
     UiNode::new(key, content)
         .layout(Layout::default().height(Length::Fixed(line_height)))
         .paint_only()
+}
+
+/// [`fact_lines`] led by the state words `said`, its lines broken as `widest`'s would be in their
+/// place, so a line that says either breaks alike.
+fn led_fact_lines(
+    said: &[String],
+    widest: &[String],
+    facts: &[String],
+    px: f32,
+    width: f32,
+) -> Vec<String> {
+    let lead = |words: &[String]| words.join(FACT_SEPARATOR);
+    let laid = |lead: String| -> Vec<String> {
+        let all: Vec<String> = std::iter::once(lead).chain(facts.iter().cloned()).collect();
+        fact_lines(&all, px, width)
+    };
+    let (said, widest) = (lead(said), lead(widest));
+    let mut lines = laid(widest.clone());
+    match lines.first_mut() {
+        Some(first) if first.starts_with(&widest) => {
+            *first = format!("{said}{}", &first[widest.len()..]);
+            lines
+        }
+        _ => laid(said),
+    }
 }
 
 fn fact_lines(facts: &[String], px: f32, width: f32) -> Vec<String> {
@@ -31559,9 +32067,24 @@ struct SettingRowParts {
     tags: RowTags,
     worst: RowTags,
     timing: Option<&'static str>,
+    worst_timing: Option<&'static str>,
 }
 
 const CHANGED_WORD: &str = "Changed";
+
+/// What a row whose state has a line of its own says there while its key is not written
+/// ([`resting_state`]).
+const DEFAULT_WORD: &str = "Default";
+
+/// [`DEFAULT_WORD`]'s counterpart for "Overrides theme".
+const FOLLOWS_THEME_WORD: &str = "Follows theme";
+
+/// What Font size says while no size is written, where another row says nothing beside its name
+/// or "Default" on a line of its own: its state at rest, as "Changed" is once a size is written,
+/// the longer of the two keeping the room. Said as a fact beside Changed's room, both kept room
+/// though the row never says both, and the line under the name read as blank once a size was
+/// written ("Changed" over an empty line at 178pt).
+const AUTOMATIC_WORD: &str = "Automatic";
 
 /// THE STATE A SETTING'S ROW SAYS ON ITS OWN PAGE, wherever the page draws the control itself:
 /// "Changed" while the key is written (the tags), and the worst case its line keeps room for, so
@@ -31754,6 +32277,18 @@ fn setting_row_parts(
             .map(prefs::ApplicationTiming::words)
     };
     let timing = timing_of(application_timing_in(state, None, field.key));
+    // WHERE A ROW'S STATE GOES IS WEIGHED BY WHAT THE ROW SAYS AT ANY VALUE: Universal Control
+    // says when a change applies only for Off, and weighed by its value now its name held
+    // Changed for Off and its note took it for Leave as is, so its name took a line more for
+    // Off and choosing either moved the segments (Security at 240pt: 14pt).
+    let worst_timing = match field.kind {
+        EditKind::Enum { options } => options
+            .iter()
+            .filter_map(|value| timing_of(segment_timing(state, field.key, value)))
+            .chain(timing)
+            .max_by(|one, other| row_label_width(one).total_cmp(&row_label_width(other))),
+        _ => timing,
+    };
     let mut facts: Vec<(String, String)> = Vec::new();
     let mut own_value_facts: Vec<Option<String>> = Vec::new();
     let mut fact = |visual: String, semantic: String, own: Option<&str>| {
@@ -31776,13 +32311,10 @@ fn setting_row_parts(
     if unlimited_scrollback {
         fact(String::new(), "Unlimited (0)".to_string(), None);
     }
-    if field.key == prefs::EDIT_FONT_PX && environment_override.is_none() {
-        let (visual, semantic) = if field.seed.is_none() {
-            ("Automatic", "automatic")
-        } else {
-            ("", "")
-        };
-        fact(visual.to_string(), semantic.to_string(), Some("Automatic"));
+    // Font size says Automatic as its state at rest, never beside Changed ([`AUTOMATIC_WORD`]).
+    let automatic = field.key == prefs::EDIT_FONT_PX && environment_override.is_none();
+    if automatic && field.seed.is_none() {
+        fact(String::new(), "automatic".to_string(), None);
     }
     if !has_draft
         && environment_override.is_none()
@@ -32069,6 +32601,17 @@ fn setting_row_parts(
     } else {
         changed_tags(state, field.key)
     };
+    if automatic && !modified_only {
+        if field.seed.is_none() {
+            tags.state = vec![AUTOMATIC_WORD.to_string()];
+        }
+        let automatic = [AUTOMATIC_WORD.to_string()];
+        if row_label_width(&automatic.join(FACT_SEPARATOR))
+            > row_label_width(&worst.state.join(FACT_SEPARATOR))
+        {
+            worst.state = automatic.to_vec();
+        }
+    }
     let theme_fallback = state.theme_fallback_for(field.key);
     if theme_fallback.is_some() {
         if state.is_explicit(field.key) {
@@ -32227,6 +32770,7 @@ fn setting_row_parts(
         tags,
         worst,
         timing,
+        worst_timing,
     }
 }
 
@@ -32272,7 +32816,12 @@ fn fit_row_button_words(row: &mut UiNode, name: &str, text_width: f32, stacked: 
         .clone()
         .unwrap_or_else(|| button.spec.label.clone());
     let edges = current - crate::native_ui::text_button_label_room(&button.spec, current);
-    let need = crate::native_ui::native_button_label_width(&complete) + edges;
+    // Weighed by its words without " (default)", which writing the key takes away: weighed with
+    // it, the button took more of the name's room while the key was not written, and writing
+    // the key moved it (Typing sound at 640pt with 2x text: 0.5pt). The mark shows where the
+    // room so weighed holds it, and gives way first where it does not ([`choice_words`]).
+    let bare = complete.strip_suffix(" (default)").unwrap_or(&complete);
+    let need = crate::native_ui::native_button_label_width(bare) + edges;
     let width = current + (need - current).clamp(0.0, spare);
     let lines = choice_words(&mut button.spec, &complete, width);
     control.layout.width = Length::Fixed(width);
@@ -32329,16 +32878,28 @@ fn choice_words(spec: &mut ButtonSpec, complete: &str, max_width: f32) -> usize 
         .strip_suffix(" (default)")
         .filter(|bare| !bare.is_empty())
         .map(str::to_string);
+    let marked = bare.is_some();
     let named = bare
         .as_deref()
         .unwrap_or(complete)
         .split_once(FACT_SEPARATOR)
         .map(|(name, _)| name.to_string())
         .filter(|name| !name.is_empty());
-    let forms: Vec<String> = std::iter::once(complete.to_string())
+    // A value glossed in parentheses is the value alone where the gloss does not fit: the font
+    // a row leaves automatic, "Automatic (SF Mono)", stood on four lines (163pt) of a 122pt
+    // button at 2x in a 178x152 window, "Automatic" on two.
+    let glossed = complete
+        .strip_suffix(')')
+        .and_then(|open| open.rsplit_once(" ("))
+        .map(|(value, _)| value.trim().to_string())
+        .filter(|value| !value.is_empty() && !value.contains('('));
+    let mut forms: Vec<String> = std::iter::once(complete.to_string())
         .chain(bare)
         .chain(named)
         .collect();
+    if let Some(value) = glossed.filter(|value| !forms.contains(value)) {
+        forms.push(value);
+    }
     if let Some(words) = forms.iter().find(|words| fits(spec, words)) {
         spec.visual_label = Some(words.clone());
         return 1;
@@ -32356,13 +32917,19 @@ fn choice_words(spec: &mut ButtonSpec, complete: &str, max_width: f32) -> usize 
         spec.visual_label = Some(String::new());
         return 1;
     }
-    let short = forms[1..].iter().map(String::as_str).collect::<Vec<_>>();
-    if let Some((words, lines)) = whole_button_words_in(spec, complete, &short, max_width) {
+    // WORDS THAT TAKE MORE THAN A LINE LEAVE OUT " (default)", as words a line is short of room
+    // for do: the mark goes once the key is written, so wrapped with it the choice took a line
+    // more than once written, and writing the key moved every row under it (Typing sound's
+    // "Follow the trail (default)" at 120pt: three lines, then two).
+    let wrapped = &forms[usize::from(marked)..];
+    let full = wrapped[0].as_str();
+    let short = wrapped[1..].iter().map(String::as_str).collect::<Vec<_>>();
+    if let Some((words, lines)) = whole_button_words_in(spec, full, &short, max_width) {
         spec.visual_label = Some(words);
         return lines;
     }
     spec.trailing_icon = None;
-    let (words, lines) = button_words_in(spec, complete, &short, max_width);
+    let (words, lines) = button_words_in(spec, full, &short, max_width);
     spec.visual_label = Some(words);
     lines
 }
@@ -36488,8 +37055,26 @@ fn messages_chip_words(label: &str, width: f32) -> (String, usize) {
             crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, line, px),
         )
     };
-    let room = crate::native_ui::centred_label_room(&ButtonSpec::new(label), width);
-    let lines = wrap_to_box(label, room, &measure);
+    // The painter keeps a centred label's ends clear by its painted words' widest
+    // ([`crate::native_ui::centred_label_end`]): a word the wrap broke gives back the room the
+    // whole word took, so the lines wrap again in the room their own words leave (Noto Sans's
+    // "Problems" at 2× text in a 126pt chip: "Prob-" / "lems · 38" was 0.3pt over what its
+    // pieces left it, painted "lems ·…").
+    let mut room = crate::native_ui::centred_label_room(&ButtonSpec::new(label), width);
+    let mut lines = wrap_to_box(label, room, &measure);
+    for _ in 0..3 {
+        let painted = ButtonSpec::new(label).visual_label(lines.join("\n"));
+        let left = crate::native_ui::centred_label_room(&painted, width);
+        if left + crate::native_ui::TEXT_FIT_SLACK >= room
+            || lines
+                .iter()
+                .all(|line| measure(line) <= left + crate::native_ui::TEXT_FIT_SLACK)
+        {
+            break;
+        }
+        room = left;
+        lines = wrap_to_box(label, room, &measure);
+    }
     let count = lines.len();
     (lines.join("\n"), count)
 }
@@ -36732,12 +37317,21 @@ impl MessagesLead {
         }
         lead.stacked = lead.title_x() + MESSAGES_CHEVRON_END > content_width * 0.6;
         if lead.stacked {
-            let beside = content_width - lead.mark - lead.gap - MESSAGES_CHEVRON_END;
+            // EACH TIME TAKES THE MOST WORDS THAT HOLD ONE LINE ([`messages_when_words`]): beside
+            // the mark where every entry's whole words fit there, else under it, on fewer words
+            // where its whole ones would wrap. An unheaded log's past days on their header's
+            // words, "Sun, 18 Oct" two lines at 2x in a 178x152 window, made every entry's head
+            // a line taller than the list's room, none of them whole.
+            let beside = lead.when_beside(content_width);
             let under = messages_stacked_width(content_width, lead);
             if whens.iter().any(|when| width(when) > beside + 0.01) {
-                lead.when_lines = whens
+                lead.when_lines = visible
                     .iter()
-                    .map(|when| wrap_to_box(when, under, &width).len())
+                    .map(|entry| {
+                        let forms = clock.when_forms(entry.at_unix_ms);
+                        let when = messages_when_words(&forms, under, &width);
+                        wrap_to_box(&when, under, &width).len()
+                    })
                     .max()
                     .unwrap_or(1)
                     .max(1);
@@ -36761,6 +37355,35 @@ impl MessagesLead {
         let columns = if self.tag > 0.0 { 3.0 } else { 2.0 };
         self.mark + self.when + self.tag + columns * self.gap
     }
+
+    /// How wide a stacked head's first row holds its time, beside the mark.
+    fn when_beside(self, content_width: f32) -> f32 {
+        content_width - self.mark - self.gap - MESSAGES_CHEVRON_END
+    }
+
+    /// The words an entry at `at_unix_ms` shows for its time in a head laid out as this lead:
+    /// under a stacked head's mark, the most of its forms that hold the line
+    /// ([`messages_when_words`]); beside the mark or on one row, all of them.
+    fn when_words(self, clock: MessagesClock, at_unix_ms: u64, content_width: f32) -> String {
+        if !self.stacked || self.when_lines == 0 {
+            return clock.when(at_unix_ms);
+        }
+        let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
+        let width = |s: &str| crate::tray_raster::ui_text_width_for(face, s, px);
+        let under = messages_stacked_width(content_width, self);
+        messages_when_words(&clock.when_forms(at_unix_ms), under, &width)
+    }
+}
+
+/// The first of a time's `forms` (longest first, [`MessagesClock::when_forms`]) whose words hold
+/// one line `room` wide, else its shortest.
+fn messages_when_words(forms: &[String], room: f32, width: &dyn Fn(&str) -> f32) -> String {
+    forms
+        .iter()
+        .find(|when| width(when) <= room + 0.01)
+        .or_else(|| forms.last())
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -36807,13 +37430,41 @@ fn messages_head_title(
     (lines, true)
 }
 
+/// The height of a head's first row: a stacked head's, which holds the severity mark (and its
+/// time where that fits beside it) over the lines under it, is a line's, as tall as the lines it
+/// leads; a head on one row is the row's. (A stacked head's first row the row's height left an
+/// entry 156pt tall at 2x in a 178x152 window, no screen holding it whole.)
+fn messages_head_first_row(lead: MessagesLead) -> f32 {
+    if lead.stacked {
+        messages_line_height()
+    } else {
+        messages_row_height()
+    }
+}
+
 fn messages_head_height(lead: MessagesLead) -> f32 {
     let row_h = messages_row_height();
     if !lead.stacked {
         return row_h;
     }
     let line_h = messages_line_height();
-    row_h + (lead.when_lines + lead.title_lines) as f32 * line_h + (row_h - line_h) / 2.0
+    messages_head_first_row(lead)
+        + (lead.when_lines + lead.title_lines) as f32 * line_h
+        + (row_h - line_h) / 2.0
+}
+
+/// Where a line ends in a head laid out for `lead`, down from its top: a screen that holds part of
+/// a head taller than it ends at one ([`messages_tall_parts`]).
+fn messages_head_lines(lead: MessagesLead) -> Vec<f32> {
+    if !lead.stacked {
+        return vec![messages_head_height(lead)];
+    }
+    let line_h = messages_line_height();
+    let first = messages_head_first_row(lead);
+    (0..=lead.when_lines + lead.title_lines)
+        .map(|line| first + line as f32 * line_h)
+        .chain([messages_head_height(lead)])
+        .collect()
 }
 
 fn messages_head_node(
@@ -36827,7 +37478,7 @@ fn messages_head_node(
     MESSAGES_ROWS_BUILT.with(|rows| rows.set(rows.get() + 1));
     let now_unix_ms = clock.now_unix_ms;
     let key = format!("settings/messages/row/{}", entry.id);
-    let row_h = messages_row_height();
+    let row_h = messages_head_first_row(lead);
     let title_key = format!("{key}/title");
     let button = UiNode::new(
         title_key.clone(),
@@ -36889,7 +37540,7 @@ fn messages_head_node(
             .height(Length::Fixed(row_h)),
     )
     .paint_only();
-    let when = clock.when(entry.at_unix_ms);
+    let when = lead.when_words(clock, entry.at_unix_ms, content_width);
     let visual = if lead.stacked {
         let line_h = messages_line_height();
         let under = messages_stacked_width(content_width, lead);
@@ -37526,83 +38177,78 @@ fn messages_list_node(
         let head = messages_head_node(entry, expanded, plan.lead, plan.content_width, plan.clock);
         let row_h = fixed_height(&head);
         let key = format!("settings/messages/row/{}", entry.id);
-        match plan
+        let body = plan
             .body
             .as_ref()
             .filter(|(id, _)| expanded && *id == entry.id)
-        {
-            Some((_, b)) => {
-                let mut body = messages_body_node(
+            .map(|(_, b)| {
+                messages_body_node(
                     entry,
                     b,
                     indent,
                     (plan.content_width - indent - 16.0).max(48.0),
                     note.filter(|(id, _)| *id == entry.id).map(|(_, text)| text),
-                );
-                let shown = part
-                    .filter(|_| k == 0)
-                    .zip(plan.tall.as_ref().filter(|tall| tall.entry == first));
-                let (key, row, h) = match shown {
-                    Some((part, tall)) => {
-                        let blocks = tall.parts[part].clone();
-                        let last = body.children.len();
-                        let body_blocks = blocks.start.max(1) - 1..blocks.end - 1;
-                        body.layout.padding.bottom = if blocks.end - 1 == last {
-                            body.layout.padding.bottom
-                        } else {
-                            0.0
-                        };
-                        let kept: Vec<UiNode> = std::mem::take(&mut body.children)
-                            .into_iter()
-                            .enumerate()
-                            .filter(|(index, _)| body_blocks.contains(index))
-                            .map(|(_, child)| child)
-                            .collect();
-                        let body_h =
-                            kept.iter().map(fixed_height).sum::<f32>() + body.layout.padding.bottom;
-                        body.layout.height = Length::Fixed(body_h);
-                        body.children = kept;
-                        let mut row = Vec::new();
-                        if blocks.start == 0 {
-                            row.push(head);
-                        }
-                        if !body.children.is_empty() {
-                            row.push(body);
-                        }
-                        let key = if part == 0 {
-                            key
-                        } else {
-                            format!("{key}/part-{part}")
-                        };
-                        (key, row, tall.heights[part])
+                )
+            });
+        // An entry taller than the list's room is drawn a part at a time ([`MessagesTall`]):
+        // the blocks the part holds, scrolled to where it starts in its first.
+        let shown = part
+            .filter(|_| k == 0)
+            .zip(plan.tall_of(first).filter(|tall| tall.entry == first));
+        let (key, row, h, skip) = match (shown, body) {
+            (Some((part, tall)), body) => {
+                let blocks = tall.parts[part].clone();
+                let mut row = Vec::new();
+                if blocks.start == 0 {
+                    row.push(head);
+                }
+                if let Some(mut body) = body {
+                    let last = body.children.len();
+                    let body_blocks = blocks.start.max(1) - 1..blocks.end - 1;
+                    body.layout.padding.bottom = if blocks.end - 1 == last {
+                        body.layout.padding.bottom
+                    } else {
+                        0.0
+                    };
+                    let kept: Vec<UiNode> = std::mem::take(&mut body.children)
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(index, _)| body_blocks.contains(index))
+                        .map(|(_, child)| child)
+                        .collect();
+                    let body_h =
+                        kept.iter().map(fixed_height).sum::<f32>() + body.layout.padding.bottom;
+                    body.layout.height = Length::Fixed(body_h);
+                    body.children = kept;
+                    if !body.children.is_empty() {
+                        row.push(body);
                     }
-                    None => (key, vec![head, body], row_h + b.height()),
+                }
+                let key = if part == 0 {
+                    key
+                } else {
+                    format!("{key}/part-{part}")
                 };
-                children.push(
-                    UiNode::new(key, UiContent::Group(GroupSpec::new(entry.title.clone())))
-                        .layout(
-                            Layout::column()
-                                .width(Length::Fill)
-                                .height(Length::Fixed(h))
-                                .clipped(),
-                        )
-                        .children(row),
-                );
-                height += h;
+                (key, row, tall.heights[part], tall.skips[part])
             }
-            None => {
-                children.push(
-                    UiNode::new(key, UiContent::Group(GroupSpec::new(entry.title.clone())))
-                        .layout(
-                            Layout::column()
-                                .width(Length::Fill)
-                                .height(Length::Fixed(row_h)),
-                        )
-                        .children(vec![head]),
-                );
-                height += row_h;
+            (None, Some(body)) => {
+                let h = row_h + fixed_height(&body);
+                (key, vec![head, body], h, 0.0)
             }
-        }
+            (None, None) => (key, vec![head], row_h, 0.0),
+        };
+        children.push(
+            UiNode::new(key, UiContent::Group(GroupSpec::new(entry.title.clone())))
+                .layout(
+                    Layout::column()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(h))
+                        .scrolled(skip)
+                        .clipped(),
+                )
+                .children(row),
+        );
+        height += h;
     }
     children.push(messages_spacer(
         "settings/messages/list/bottom",
@@ -37886,14 +38532,22 @@ struct MessagesPlan {
     clock: MessagesClock,
     sections: Option<Vec<i64>>,
     day_h: f32,
-    tall: Option<MessagesTall>,
+    /// The entries taller than the list's room, in order ([`MessagesTall`]).
+    talls: Vec<MessagesTall>,
 }
 
+/// AN ENTRY TALLER THAN THE LIST'S ROOM IS HELD A PART AT A TIME, a screen each: its head over
+/// its body's blocks, a part as many of them as the room holds, and a block taller than the
+/// room (a stacked head at 2x in a 98pt window) a room of it at a time, each part ending where
+/// a line of it ends ([`messages_tall_parts`]).
 #[derive(Clone, Debug, PartialEq)]
 struct MessagesTall {
     entry: usize,
+    /// Each part's blocks: the head (0), then the body's children.
     parts: Vec<std::ops::Range<usize>>,
     heights: Vec<f32>,
+    /// How far down its first block each part starts.
+    skips: Vec<f32>,
     keys: Vec<std::collections::BTreeSet<String>>,
 }
 
@@ -37904,33 +38558,64 @@ fn ui_node_keys(node: &UiNode, into: &mut std::collections::BTreeSet<String>) {
     }
 }
 
+/// The parts of an entry whose blocks are `blocks` (each its height and where its lines end, from
+/// its top), its body's padding `pad` under the last, in a list `room` tall: each part's blocks,
+/// height, and how far down its first block it starts. A part ends where a block or a line of one
+/// ends, as far down as the room holds; a line taller than the room is held a room at a time.
+/// NO PART IS A SLIVER: a part ends where what is left is more than a peek, so the last screen
+/// holds a line and the entry's foot; a part that ended at a stacked head's last line left its
+/// 8pt foot a screen of its own, a band of empty card (2x in a 164x98 window). Where no line
+/// ends so, the last part is the room down to the entry's end.
 fn messages_tall_parts(
-    head: f32,
-    body: &UiNode,
+    blocks: &[(f32, Vec<f32>)],
+    pad: f32,
     room: f32,
-) -> (Vec<std::ops::Range<usize>>, Vec<f32>) {
-    let pad = body.layout.padding.bottom;
-    let blocks: Vec<f32> = std::iter::once(head)
-        .chain(body.children.iter().map(fixed_height))
-        .collect();
-    let last = blocks.len() - 1;
-    let mut parts: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut heights: Vec<f32> = Vec::new();
-    let mut start = 0;
-    let mut used = 0.0_f32;
-    for (index, height) in blocks.iter().copied().enumerate() {
-        let end_pad = if index == last { pad } else { 0.0 };
-        if index > start && used + height + end_pad > room + 0.01 {
-            parts.push(start..index);
-            heights.push(used);
-            start = index;
-            used = 0.0;
-        }
-        used += height + end_pad;
+) -> (Vec<std::ops::Range<usize>>, Vec<f32>, Vec<f32>) {
+    const SLIVER: f32 = crate::native_ui::LIST_PEEK_MIN;
+    let room = room.max(1.0);
+    let mut tops = Vec::with_capacity(blocks.len());
+    let mut ends = Vec::new();
+    let mut y = 0.0_f32;
+    for (height, lines) in blocks {
+        tops.push(y);
+        ends.extend(lines.iter().map(|line| y + line));
+        y += height;
+        ends.push(y);
     }
-    parts.push(start..blocks.len());
-    heights.push(used);
-    (parts, heights)
+    let total = y + pad;
+    ends.push(total);
+    let block_at = |y: f32| tops.iter().rposition(|top| *top <= y + 0.01).unwrap_or(0);
+    let (mut parts, mut heights, mut skips) = (Vec::new(), Vec::new(), Vec::new());
+    let mut from = 0.0_f32;
+    loop {
+        let to = if total - from <= room + 0.01 {
+            total
+        } else {
+            let within = || {
+                ends.iter()
+                    .copied()
+                    .filter(|end| *end > from + 0.5 && *end <= from + room + 0.01)
+            };
+            let most = |ends: &mut dyn Iterator<Item = f32>| ends.reduce(f32::max);
+            most(&mut within().filter(|end| total - end >= SLIVER - 0.01))
+                .or_else(|| most(&mut within()))
+                .unwrap_or(from + room)
+        };
+        let first = block_at(from);
+        let last = block_at((to - 0.5).max(from)).max(first);
+        parts.push(first..last + 1);
+        heights.push(to - from);
+        skips.push(from - tops[first]);
+        if to >= total - 0.01 {
+            break;
+        }
+        from = if total - to < SLIVER - 0.01 {
+            (total - room).max(from + 1.0)
+        } else {
+            to
+        };
+    }
+    (parts, heights, skips)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37954,32 +38639,54 @@ impl MessagesPlan {
     }
 
     fn stops(&self) -> usize {
-        self.lead_stops() + self.heights.len() + self.extra()
+        self.lead_stops() + self.heights.len() + self.extra_before(self.heights.len())
     }
 
-    fn extra(&self) -> usize {
-        self.tall.as_ref().map_or(0, |tall| tall.parts.len() - 1)
+    /// The tall entry `entry` is, where it is one ([`MessagesTall`]).
+    fn tall_of(&self, entry: usize) -> Option<&MessagesTall> {
+        self.talls.iter().find(|tall| tall.entry == entry)
+    }
+
+    /// The stops the parts of the tall entries before entry `index` take past one each.
+    fn extra_before(&self, index: usize) -> usize {
+        self.talls
+            .iter()
+            .filter(|tall| tall.entry < index)
+            .map(|tall| tall.parts.len() - 1)
+            .sum()
     }
 
     fn entry_stop(&self, index: usize) -> usize {
-        self.lead_stops()
-            + index
-            + if self.tall.as_ref().is_some_and(|tall| index > tall.entry) {
-                self.extra()
-            } else {
-                0
-            }
+        self.lead_stops() + index + self.extra_before(index)
     }
 
     fn stop_entry(&self, j: usize) -> (usize, Option<usize>) {
-        let extra = self.extra();
-        match &self.tall {
-            Some(tall) if j >= tall.entry && j <= tall.entry + extra => {
-                (tall.entry, Some(j - tall.entry))
+        let mut extra = 0;
+        for tall in &self.talls {
+            if j < tall.entry + extra {
+                break;
             }
-            Some(tall) if j > tall.entry + extra => (j - extra, None),
-            _ => (j, None),
+            if j < tall.entry + extra + tall.parts.len() {
+                return (tall.entry, Some(j - tall.entry - extra));
+            }
+            extra += tall.parts.len() - 1;
         }
+        (j - extra, None)
+    }
+
+    /// How many of the list's stops no screen holds whole: entries, and the header's items where
+    /// it scrolls with them, taller than the room ([`MessagesTall`]). The page's chrome sheds,
+    /// the toolbar scrolling away with the list, as far as that brings them whole.
+    fn cut_stops(&self) -> usize {
+        let header = if self.scrolls {
+            self.header
+                .iter()
+                .filter(|(_, height)| *height > self.room + 0.01)
+                .count()
+        } else {
+            0
+        };
+        header + self.talls.len()
     }
 
     fn filters_stop(&self) -> Option<usize> {
@@ -38020,6 +38727,16 @@ impl MessagesPlan {
     fn day_before(&self, k: usize, first: usize) -> Option<i64> {
         let sections = self.sections.as_ref()?;
         let day = *sections.get(k)?;
+        // THE DAY GIVES WAY AT A SCREEN'S TOP WHERE IT WOULD LEAVE ITS ENTRY NO ROOM: over the
+        // open entry the room holds only without it (or not at all), whose body says its day
+        // (a log whose closed entries the room holds only without their day is unheaded,
+        // [`messages_plan_opening`]); repeated, it left that entry no screen whole.
+        if k == first
+            && (self.tall_of(k).is_some()
+                || 2.0 * MESSAGES_LIST_PAD + self.day_h + self.heights[k] > self.room + 0.01)
+        {
+            return None;
+        }
         (k == first || k == 0 || sections.get(k - 1) != Some(&day)).then_some(day)
     }
 
@@ -38047,7 +38764,7 @@ impl MessagesPlan {
             let (first, part) = self.stop_entry(top - lead);
             (0..0, first, part, self.room)
         };
-        if let (Some(part), Some(tall)) = (part, self.tall.as_ref()) {
+        if let (Some(part), Some(tall)) = (part, self.tall_of(first)) {
             let mut end = first + 1;
             if part + 1 == tall.parts.len() {
                 let mut used = self.part_card_height(first, part);
@@ -38069,7 +38786,7 @@ impl MessagesPlan {
         let mut end = first;
         while end < n {
             // A tall entry is seated only from its first part's own stop.
-            if self.tall.as_ref().is_some_and(|tall| tall.entry == end) {
+            if self.tall_of(end).is_some() {
                 break;
             }
             let fits = self.card_height(first..end + 1) <= room + 0.01;
@@ -38087,17 +38804,11 @@ impl MessagesPlan {
     }
 
     fn part_card_height(&self, entry: usize, part: usize) -> f32 {
-        let day = if self.sections.is_some() {
-            self.day_h
-        } else {
-            0.0
-        };
         let height = self
-            .tall
-            .as_ref()
-            .and_then(|tall| (tall.entry == entry).then(|| tall.heights[part]))
+            .tall_of(entry)
+            .map(|tall| tall.heights[part])
             .unwrap_or_default();
-        2.0 * MESSAGES_LIST_PAD + day + height
+        2.0 * MESSAGES_LIST_PAD + height
     }
 
     fn reaches_end(&self, top: usize) -> bool {
@@ -38107,8 +38818,7 @@ impl MessagesPlan {
         } else {
             view.rows.end == self.heights.len()
                 && view.part.is_none_or(|part| {
-                    self.tall
-                        .as_ref()
+                    self.tall_of(view.rows.start)
                         .is_none_or(|tall| part + 1 == tall.parts.len())
                 })
         }
@@ -38256,22 +38966,46 @@ fn messages_plan_opening(
                 - heading_h;
         (whole - header_h - gap, gap)
     };
-    let clock = MessagesClock::of(visible, messages.now_unix_ms, messages.utc_offset_s);
     let all: Vec<&MessageView> = messages.entries.iter().collect();
-    let log_clock = MessagesClock::of(&all, messages.now_unix_ms, messages.utc_offset_s);
-    let mut lead = MessagesLead::measure(&all, log_clock, compact, content_width);
-    if lead.stacked {
+    // The lead laid out for `clock` (the log's, `log_clock`, measures its column), its stacked
+    // title as many lines as leave the head room under its day; and that day's height.
+    let fitted = |clock: MessagesClock, log_clock: MessagesClock| {
+        let mut lead = MessagesLead::measure(&all, log_clock, compact, content_width);
         let day = if clock.sections(visible).is_some() {
             messages_day_height()
         } else {
             0.0
         };
-        while lead.title_lines > 1
-            && messages_head_height(lead) > room - 2.0 * MESSAGES_LIST_PAD - day + 0.01
-        {
-            lead.title_lines -= 1;
+        if lead.stacked {
+            while lead.title_lines > 1
+                && messages_head_height(lead) > room - 2.0 * MESSAGES_LIST_PAD - day + 0.01
+            {
+                lead.title_lines -= 1;
+            }
         }
-    }
+        (lead, day)
+    };
+    let clock = MessagesClock::of(visible, messages.now_unix_ms, messages.utc_offset_s);
+    let log_clock = MessagesClock::of(&all, messages.now_unix_ms, messages.utc_offset_s);
+    let (mut lead, day) = fitted(clock, log_clock);
+    // WHERE A DAY'S HEADING CANNOT STAND OVER AN ENTRY, EACH ENTRY SAYS ITS OWN DAY: the log is
+    // sectioned by day only where a screen holds an entry under its day (a wide page's list
+    // takes the page's height first, below); else every screen gave its day way, and an entry
+    // from yesterday said only "7:26 AM" on every screen (2x in a 178x152 window). Unheaded, a
+    // past entry's time says its day as its header would ("Yesterday", "Fri, 16 Oct",
+    // [`MessagesClock::when`]); its open body says its day and hour.
+    let most = if compact { room } else { room.max(whole) };
+    let clock =
+        if day > 0.0 && messages_head_height(lead) + day + 2.0 * MESSAGES_LIST_PAD > most + 0.01 {
+            let unheaded = |clock: MessagesClock| MessagesClock {
+                headed: false,
+                ..clock
+            };
+            lead = fitted(unheaded(clock), unheaded(log_clock)).0;
+            unheaded(clock)
+        } else {
+            clock
+        };
     let mut plan = MessagesPlan {
         compact,
         scrolls: compact,
@@ -38286,7 +39020,7 @@ fn messages_plan_opening(
         clock,
         sections: clock.sections(visible),
         day_h: messages_day_height(),
-        tall: None,
+        talls: Vec::new(),
     };
     let body_width = (content_width - plan.indent() - 16.0).max(48.0);
     let day_h = if plan.sections.is_some() {
@@ -38344,54 +39078,67 @@ fn messages_plan_opening(
             .flat_map(|item| scroll::row_parts(item, room, room, MESSAGES_ROW_GAP))
             .collect();
     }
-    plan.tall = plan
-        .body
-        .as_ref()
-        .and_then(|(id, body)| {
-            let index = visible.iter().position(|entry| entry.id == *id)?;
-            Some((index, body))
-        })
-        .and_then(|(entry, body)| {
-            let room = plan.room
-                - 2.0 * MESSAGES_LIST_PAD
-                - if plan.sections.is_some() {
-                    plan.day_h
-                } else {
-                    0.0
-                };
-            (plan.card_height(entry..entry + 1) > plan.room + 0.01).then(|| {
-                let node = messages_body_node(
-                    visible[entry],
-                    body,
-                    plan.indent(),
-                    (plan.content_width - plan.indent() - 16.0).max(48.0),
-                    None,
-                );
-                let (parts, heights) = messages_tall_parts(head, &node, room);
-                let title = format!("settings/messages/row/{}/title", visible[entry].id);
-                let keys = parts
-                    .iter()
-                    .map(|blocks| {
-                        let mut keys = std::collections::BTreeSet::new();
-                        for block in blocks.clone() {
-                            match block.checked_sub(1) {
-                                None => {
-                                    keys.insert(title.clone());
-                                }
-                                Some(child) => ui_node_keys(&node.children[child], &mut keys),
-                            }
-                        }
-                        keys
+    // Every entry taller than the room is held a part at a time ([`MessagesTall`]): the open
+    // one's head over its body's blocks, any other's head alone (a stacked head at 2x in a 98pt
+    // window, 140pt). The day over it gives way at a screen's top ([`MessagesPlan::day_before`]).
+    let room = plan.room - 2.0 * MESSAGES_LIST_PAD;
+    let head_lines = messages_head_lines(plan.lead);
+    plan.talls = visible
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| plan.heights[*index] > room + 0.01)
+        .map(|(entry, view)| {
+            let body = plan
+                .body
+                .as_ref()
+                .filter(|(id, _)| *id == view.id)
+                .map(|(_, body)| {
+                    messages_body_node(
+                        view,
+                        body,
+                        plan.indent(),
+                        (plan.content_width - plan.indent() - 16.0).max(48.0),
+                        None,
+                    )
+                });
+            let blocks: Vec<(f32, Vec<f32>)> = std::iter::once((head, head_lines.clone()))
+                .chain(body.iter().flat_map(|node| {
+                    node.children.iter().map(|child| {
+                        let height = fixed_height(child);
+                        (height, vec![height])
                     })
-                    .collect();
-                MessagesTall {
-                    entry,
-                    parts,
-                    heights,
-                    keys,
-                }
-            })
-        });
+                }))
+                .collect();
+            let pad = body.as_ref().map_or(0.0, |node| node.layout.padding.bottom);
+            let (parts, heights, skips) = messages_tall_parts(&blocks, pad, room);
+            let title = format!("settings/messages/row/{}/title", view.id);
+            let keys = parts
+                .iter()
+                .map(|blocks| {
+                    let mut keys = std::collections::BTreeSet::new();
+                    for block in blocks.clone() {
+                        match (block.checked_sub(1), body.as_ref()) {
+                            (None, _) => {
+                                keys.insert(title.clone());
+                            }
+                            (Some(child), Some(node)) => {
+                                ui_node_keys(&node.children[child], &mut keys);
+                            }
+                            (Some(_), None) => {}
+                        }
+                    }
+                    keys
+                })
+                .collect();
+            MessagesTall {
+                entry,
+                parts,
+                heights,
+                skips,
+                keys,
+            }
+        })
+        .collect();
     plan
 }
 
@@ -38611,11 +39358,29 @@ fn messages_seated_top(
             }
         }
         (None, Some(lead)) => messages_restop(from, lead, plan.lead_stops()).min(plan.limit()),
-        (None, None) => from.min(plan.limit()),
+        // A scroll to the list's end stays at its end where the plan drawn now gives the list
+        // more stops than the one the scroll was clamped by, the entry open and the pop-up as
+        // they were: the page's chrome (its subtitle, its insets) is chosen as it draws, so a
+        // scroll before the first frame after the pop-up closed was clamped by the chrome the
+        // open pop-up left (the Linux lane's Noto Sans: 45 of 46 stops, the last entry unseen).
+        (None, None) => match state.messages_scroll_end.get() {
+            Some(end) if end == (from, state.messages_selected, state.messages_tag_menu) => {
+                plan.limit()
+            }
+            _ => from.min(plan.limit()),
+        },
     };
-    state
-        .messages_reseat
-        .set((pending.is_some() || before.is_some() || menu_lead.is_some()).then_some(top));
+    let followed = top != from.min(plan.limit()) && before.is_none() && menu_lead.is_none();
+    if followed {
+        state.messages_scroll_end.set(Some((
+            top,
+            state.messages_selected,
+            state.messages_tag_menu,
+        )));
+    }
+    state.messages_reseat.set(
+        (pending.is_some() || before.is_some() || menu_lead.is_some() || followed).then_some(top),
+    );
     top
 }
 
@@ -38926,7 +39691,8 @@ fn registry_switch_row(
         let detail = detail(&placement);
         set_row_label_lines(&mut row, placement.lines, true);
         if let Some((detail, detail_height)) = detail {
-            row.children.insert(1, detail);
+            // After the control, as every stacked row's ([`with_row_detail`]).
+            insert_before_reset_line(&mut row, detail);
             row.layout.height = Length::Fixed(fixed_height(&row) + detail_height + 4.0);
         }
         let height = fixed_height(&row);

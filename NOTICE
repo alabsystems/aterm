@@ -126,10 +126,14 @@ Corporation (the windows-rs project), licensed MIT OR Apache-2.0: `src/core.rs`,
 `src/Win32.rs` and `src/Win32/` hold the subset of upstream's declarations
 aterm's Windows graph reads, and its `link!` macro is derived from windows-link
 0.2.1 (the same project, under the same terms). Each generated file names the
-upstream file it came from. Four hand-written modules derive from the same
-project under the same terms: `src/com.rs`'s `IUnknown_Vtbl` from windows-core
-0.62.2 (`src/unknown.rs`); `src/dxgi.rs`, the DXGI declarations aterm calls,
-from windows 0.62.2 (`src/Windows/Win32/Graphics/Dxgi/mod.rs` and
+upstream file it came from. Five hand-written modules derive from the same
+project under the same terms: `src/com.rs`'s `IUnknown_Vtbl`, `IInspectable_Vtbl`
+and interface IDs from windows-core 0.62.2 (`src/unknown.rs`,
+`src/inspectable.rs`, `src/imp/com_bindings.rs` and `src/imp/marshaler.rs`);
+`src/uia.rs`, the UI Automation provider interfaces aterm implements, from
+windows 0.62.2 (`src/Windows/Win32/UI/Accessibility/mod.rs`); `src/dxgi.rs`,
+the DXGI declarations aterm calls, from windows 0.62.2
+(`src/Windows/Win32/Graphics/Dxgi/mod.rs` and
 `src/Windows/Win32/Graphics/Dxgi/Common/mod.rs`); `src/d3d11.rs`, the Direct3D
 11 and shader-compiler declarations aterm calls, from windows 0.62.2
 (`src/Windows/Win32/Graphics/Direct3D/mod.rs`,

@@ -38,12 +38,12 @@ fn the_scenario_is_listed_with_its_lab() {
     assert_eq!(s.kw.instance_env, INSTANCE_ENV);
     assert!(matches!(s.plan, Plan::OccupancyBreak), "{:?}", s.plan);
     assert!(
-        scenarios()
-            .iter()
-            .filter(|s| s.name != NAME && !matches!(s.plan, Plan::Autopilot(_)))
-            .all(|s| s.kw.instance_env.is_empty()),
-        "no other scenario's instance gets a seam (the Autopilot scenes' is their ladder's, \
-         `autopilot_scenes::INSTANCE_ENV`)"
+        scenarios().iter().filter(|s| s.name != NAME).all(|s| {
+            s.kw.instance_env.is_empty()
+                || s.kw.instance_env == crate::autopilot_scenes::INSTANCE_ENV
+        }),
+        "no other scenario's instance gets a seam but the ladder's \
+         (`autopilot_scenes::INSTANCE_ENV`: the Autopilot scenes' and c3-wall's)"
     );
     assert!(
         scenarios()

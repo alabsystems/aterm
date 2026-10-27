@@ -474,9 +474,9 @@ pub struct ProcFacts {
     pub pgid: u32,
     /// Its session (the session leader's pid); `None` where unread.
     pub sid: Option<u32>,
-    /// When it started, compared for equality only: µs since the epoch on macOS, clock ticks since boot on Linux; `None` where unread.
+    /// When it started, compared for equality only: µs since the epoch on macOS, clock ticks since boot on Linux, creation `FILETIME` on Windows; `None` where unread.
     pub start: Option<u64>,
-    /// How long it had run when this reading took it, ms: the wall clock less its start on macOS, the boot clock (`/proc/uptime`) less its start on Linux; `None` where unread.
+    /// How long it had run when this reading took it, ms: the wall clock less its start on macOS and Windows, the boot clock (`/proc/uptime`) less its start on Linux; `None` where unread.
     pub age_ms: Option<u64>,
     /// Its user; `None` where unread.
     pub uid: Option<u32>,
@@ -625,11 +625,19 @@ pub fn at_start(pid: u32) -> Option<AtStart> {
 }
 
 /// How long a process whose start reads `start` had run, ms: at `now_us` (µs since the epoch, the
-/// macOS start's clock), or on Linux at `boot_ms` (the boot clock its start counts `hz` ticks a
-/// second on).
-fn age_ms(start: u64, now_us: u64, boot_ms: Option<u64>, hz: u64) -> Option<u64> {
+/// macOS start's clock and the reference for a Windows creation `FILETIME`), or on Linux / a
+/// `/proc` fixture tree at `boot_ms` (the boot clock its start counts `hz` ticks a second on).
+fn age_ms(
+    start: u64,
+    now_us: u64,
+    boot_ms: Option<u64>,
+    hz: u64,
+    live_windows: bool,
+) -> Option<u64> {
     if cfg!(target_os = "macos") {
         Some(now_us.saturating_sub(start) / 1000)
+    } else if live_windows {
+        crate::procs::filetime_age_ms(start, now_us)
     } else {
         boot_ms.map(|b| b.saturating_sub(start.saturating_mul(1000) / hz.max(1)))
     }
@@ -788,7 +796,8 @@ impl JobsReader {
         let mounts = std::cell::OnceCell::new();
         let mut out = Vec::with_capacity(reqs.len());
         let mut execd = HashMap::new();
-        let boot_ms = (!cfg!(target_os = "macos"))
+        let live_windows = cfg!(windows) && self.root == Path::new("/proc");
+        let boot_ms = (!cfg!(target_os = "macos") && !live_windows)
             .then(|| std::fs::read_to_string(self.root.join("uptime")).ok())
             .flatten()
             .and_then(|t| crate::linux::parse_uptime_ns(&t))
@@ -798,18 +807,22 @@ impl JobsReader {
             else {
                 continue;
             };
-            facts.age_ms = facts.start.and_then(|s| age_ms(s, now, boot_ms, self.hz));
+            facts.age_ms = facts
+                .start
+                .and_then(|s| age_ms(s, now, boot_ms, self.hz, live_windows));
             if runs_its_exec {
                 execd.insert(facts_key(r.pid, facts.start), facts.name.clone());
             }
-            let exe = (facts.state != RunState::Zombie)
+            let exe = (facts.state != RunState::Zombie && (facts.exe.is_none() || start.is_some()))
                 .then(|| self.exe_path(r.pid))
                 .flatten();
-            facts.exe = exe
-                .as_deref()
-                .and_then(Path::file_name)
-                .and_then(|n| n.to_str())
-                .map(str::to_owned);
+            if facts.exe.is_none() {
+                facts.exe = exe
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .and_then(|n| n.to_str())
+                    .map(str::to_owned);
+            }
             // A session leader's terminal is the session's (`script`'s, an agent's pty call's):
             // how its reader in front takes keys. A fixture tree names no device of this machine.
             #[cfg(unix)]
@@ -868,13 +881,21 @@ impl JobsReader {
             if cfg!(target_os = "linux") || self.root != Path::new("/proc") {
                 linux::read(&self.root, pid, fds, self.hz).map(|f| (f, None, false))
             } else {
-                None
+                #[cfg(windows)]
+                {
+                    let _ = fds;
+                    crate::win_paths::job_facts(pid).map(|f| (f, None, false))
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
             }
         }
     }
 
-    /// `pid`'s executable, as the kernel holds its path (`proc_pidpath`;
-    /// the `exe` link under the root on Linux).
+    /// `pid`'s executable, as the kernel holds its path (`proc_pidpath` on macOS,
+    /// `QueryFullProcessImageNameW` on Windows, the `exe` link under the root on Linux).
     fn exe_path(&self, pid: u32) -> Option<PathBuf> {
         #[cfg(target_os = "macos")]
         {
@@ -883,9 +904,13 @@ impl JobsReader {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            std::fs::read_link(self.root.join(pid.to_string()).join("exe"))
-                .ok()
-                .filter(|p| p.is_absolute())
+            if cfg!(windows) && self.root == Path::new("/proc") {
+                crate::process_path(pid)
+            } else {
+                std::fs::read_link(self.root.join(pid.to_string()).join("exe"))
+                    .ok()
+                    .filter(|p| p.is_absolute())
+            }
         }
     }
 

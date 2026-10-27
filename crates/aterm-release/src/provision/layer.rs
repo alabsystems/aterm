@@ -43,6 +43,12 @@ pub(crate) trait ReleaseHost: Send + Sync {
 
     /// The program `name` as aterm's resolver finds it (`aterm_uds::host::find_tool`).
     fn find(&self, name: &str) -> Option<PathBuf>;
+
+    /// This machine's git lists `url`'s `HEAD`, with no prompt, as the engine's fetches and
+    /// pushes reach it.
+    /// # Errors
+    /// The listing failed or did not finish: git's last line.
+    fn reach(&self, url: &str) -> Result<(), String>;
 }
 
 /// What one item probes, and its one remedy.
@@ -52,6 +58,7 @@ enum Kind {
     Develop,
     Openssl,
     Publication,
+    EngineReach,
     Site,
     SiteKey,
 }
@@ -62,14 +69,41 @@ struct LayerItem {
     host: Arc<dyn ReleaseHost>,
 }
 
-const ITEMS: [(&str, Kind); 6] = [
+const ITEMS: [(&str, Kind); 7] = [
     ("base", Kind::Base),
     ("develop", Kind::Develop),
     ("release.openssl", Kind::Openssl),
     ("release.publication", Kind::Publication),
+    ("release.engine-reach", Kind::EngineReach),
     ("release.site", Kind::Site),
     ("release.site-key", Kind::SiteKey),
 ];
+
+/// The engine's registry, in its checkout.
+const REGISTRY: &str = "registry/repos.toml";
+
+/// The repository `ship release` stages and publishes, as the engine's registry names it.
+const ENGINE_REPO: &str = "aterm";
+
+/// [`ENGINE_REPO`]'s addresses in the registry `text`, as `(role, url)`: where a stage reads
+/// the dev tree, pushes the staging snapshot and reads the public tree.
+fn engine_addresses(text: &str) -> Result<Vec<(&'static str, String)>, String> {
+    let doc = aterm_toml::from_str::<aterm_toml::Table>(text).map_err(|e| e.to_string())?;
+    let entry = doc
+        .get("repos")
+        .and_then(|repos| repos.get(ENGINE_REPO))
+        .ok_or_else(|| format!("no [repos.{ENGINE_REPO}] entry"))?;
+    ["dev", "staging", "release"]
+        .into_iter()
+        .map(|role| {
+            entry
+                .get(role)
+                .and_then(aterm_toml::Value::as_str)
+                .map(|url| (role, url.to_string()))
+                .ok_or_else(|| format!("[repos.{ENGINE_REPO}] names no {role} address"))
+        })
+        .collect()
+}
 
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
@@ -189,6 +223,58 @@ impl LayerItem {
         }
     }
 
+    /// Each of [`ENGINE_REPO`]'s registry addresses, listed by this machine's git. The
+    /// registry names them as the engine's home machine spells them (an SSH alias, an
+    /// `insteadOf` route), so a machine without that spelling stages nothing.
+    fn probe_engine_reach(&self) -> Probe {
+        let registry = self.host.publication().join(REGISTRY);
+        let text = match std::fs::read_to_string(&registry) {
+            Ok(text) => text,
+            Err(e) => {
+                return Probe::Blocked {
+                    why: format!(
+                        "cannot read the engine's registry {}: {e}",
+                        registry.display()
+                    ),
+                };
+            }
+        };
+        let addresses = match engine_addresses(&text) {
+            Ok(addresses) => addresses,
+            Err(why) => {
+                return Probe::Unusable {
+                    why: format!("{}: {why}", registry.display()),
+                };
+            }
+        };
+        let unreached: Vec<String> = addresses
+            .iter()
+            .filter_map(|(role, url)| {
+                self.host
+                    .reach(url)
+                    .err()
+                    .map(|why| format!("{role} {url} ({why})"))
+            })
+            .collect();
+        if unreached.is_empty() {
+            let reached: Vec<String> = addresses
+                .iter()
+                .map(|(role, url)| format!("{role} {url}"))
+                .collect();
+            Probe::Ok {
+                now: format!("git reaches {ENGINE_REPO}'s {}", reached.join(", ")),
+            }
+        } else {
+            Probe::Person {
+                step: self.id.into(),
+                how: format!(
+                    "this machine's git cannot reach {ENGINE_REPO}'s {}",
+                    unreached.join("; ")
+                ),
+            }
+        }
+    }
+
     fn probe_site(&self) -> Probe {
         match self.host.site() {
             Err(why) => Probe::Unusable { why },
@@ -258,6 +344,12 @@ impl LayerItem {
                  PUBLICATION_ENGINE), with gitleaks on PATH"
                     .into(),
             ),
+            Kind::EngineReach => Remedy::Command(
+                "give this machine what the registry's address needs (its SSH key and host \
+                 alias), or route the address over HTTPS: git config --global --add \
+                 url.https://github.com/.insteadOf <its prefix, e.g. git@github.com:>"
+                    .into(),
+            ),
             Kind::Site => Remedy::Command(
                 "clone the site repo and name it: SITE_DIR, or publish/site.toml's dir".into(),
             ),
@@ -305,6 +397,7 @@ impl Item for LayerItem {
             Kind::Develop => "the tools a checkout's tests run".into(),
             Kind::Openssl => "macOS's LibreSSL, which release signing uses".into(),
             Kind::Publication => "the publication engine".into(),
+            Kind::EngineReach => "the engine's addresses for this repository".into(),
             Kind::Site => "the site checkout and its firebase.json".into(),
             Kind::SiteKey => "the site deployer's service-account key".into(),
         }
@@ -316,6 +409,7 @@ impl Item for LayerItem {
             Kind::Develop => self.probe_develop(),
             Kind::Openssl => self.probe_openssl(),
             Kind::Publication => self.probe_publication(),
+            Kind::EngineReach => self.probe_engine_reach(),
             Kind::Site => self.probe_site(),
             Kind::SiteKey => self.probe_site_key(),
         }
@@ -539,7 +633,31 @@ impl ReleaseHost for System {
     fn find(&self, name: &str) -> Option<PathBuf> {
         aterm_uds::host::find_tool(name)
     }
+
+    fn reach(&self, url: &str) -> Result<(), String> {
+        let mut cmd = aterm_uds::spawnfd::command("git");
+        cmd.args(["ls-remote", url, "HEAD"])
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let out = aterm_uds::deadline::output_within(&mut cmd, REACH_WITHIN)
+            .map_err(|e| format!("git ls-remote {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map_or_else(
+                || format!("git ls-remote exited {:?}", out.status.code()),
+                str::to_string,
+            ))
+    }
 }
+
+/// How long one address's listing may take: a hang detector, not a latency budget.
+#[cfg(unix)]
+const REACH_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -553,6 +671,7 @@ mod tests {
         site: Option<PathBuf>,
         site_key: Option<PathBuf>,
         tools: Vec<&'static str>,
+        unreached: Vec<&'static str>,
     }
 
     impl ReleaseHost for Fake {
@@ -581,6 +700,30 @@ mod tests {
                 .contains(&name)
                 .then(|| PathBuf::from(format!("/fake/bin/{name}")))
         }
+        fn reach(&self, url: &str) -> Result<(), String> {
+            if self.unreached.contains(&url) {
+                Err(format!("ssh: Could not resolve hostname for {url}"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    const DEV: &str = "git@gh-alias:owner/aterm.git";
+    const STAGING: &str = "git@gh-alias:owner/aterm-staging.git";
+    const RELEASE: &str = "git@github.com:public/aterm.git";
+
+    fn registry(home: &Path, text: &str) {
+        let path = home.join("publication").join(REGISTRY);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn aterm_entry() -> String {
+        format!(
+            "[repos.other]\nrelease = \"git@github.com:public/other.git\"\n\n[repos.aterm]\n\
+             path = \"~/aterm\"\ndev = \"{DEV}\"\nstaging = \"{STAGING}\"\nrelease = \"{RELEASE}\"\n"
+        )
     }
 
     fn executable(path: &Path) {
@@ -593,6 +736,7 @@ mod tests {
     fn whole(home: &Path) -> Fake {
         std::fs::create_dir_all(home.join("publication/.git")).unwrap();
         executable(&home.join("publication/bin/pub"));
+        registry(home, &aterm_entry());
         std::fs::create_dir_all(home.join("site")).unwrap();
         std::fs::write(home.join("site/firebase.json"), "{}").unwrap();
         std::fs::write(home.join("deployer.json"), "{}").unwrap();
@@ -690,7 +834,63 @@ mod tests {
             site: Some(home.join("site")),
             site_key: Some(home.join("deployer.json")),
             tools: vec!["gitleaks"],
+            unreached: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_engine_reach_names_each_registry_address_git_cannot_list() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        match line_of(whole(home), "release.engine-reach") {
+            Check::Pass(now) => {
+                for url in [DEV, STAGING, RELEASE] {
+                    assert!(now.contains(url), "{now}");
+                }
+                assert!(
+                    !now.contains("other.git"),
+                    "only aterm's entry is read: {now}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let mut fake = whole(home);
+        fake.unreached = vec![STAGING, RELEASE];
+        match line_of(fake, "release.engine-reach") {
+            Check::Fail { what, fix } => {
+                assert!(what.contains(&format!("staging {STAGING}")), "{what}");
+                assert!(what.contains(&format!("release {RELEASE}")), "{what}");
+                assert!(
+                    !what.contains(DEV),
+                    "a reached address is not named: {what}"
+                );
+                assert!(
+                    what.contains("Could not resolve hostname"),
+                    "git's words: {what}"
+                );
+                assert!(fix.contains("insteadOf"), "{fix}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        registry(home, "[repos.aterm]\ndev = \"git@x:a/aterm.git\"\n");
+        assert!(
+            matches!(
+                line_of(whole_keeping(home), "release.engine-reach"),
+                Check::CouldNotRun(ref why) if why.contains("names no staging address")
+            ),
+            "an entry missing an address is never a pass"
+        );
+        std::fs::remove_file(home.join("publication").join(REGISTRY)).unwrap();
+        assert!(
+            matches!(
+                line_of(whole_keeping(home), "release.engine-reach"),
+                Check::Fail { ref what, .. } if what.contains("cannot read the engine's registry")
+            ),
+            "no registry is never a pass"
+        );
     }
 
     #[test]

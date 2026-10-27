@@ -6,6 +6,7 @@
 use aterm_aos::contract::Verdict;
 use aterm_aos::evidence::EvidenceGrade;
 use aterm_aos::publish::Head;
+use aterm_aos_pane::trace::{PANE_TRACE_MAX_BYTES, PaneCheck, PaneTrace, PaneTraceFault};
 #[cfg(debug_assertions)]
 use aterm_effects::aos_momentum::bundle::CandidateBundle;
 #[cfg(debug_assertions)]
@@ -29,8 +30,15 @@ const USAGE: &str = "usage: aos [status|ls|attach [code=<name>]|pause|repair [co
                      publish plan=<24 hex>|bundle|resume|detach|trace [hex]|export [kept=<n>]|\
                      check <file>]";
 
-/// The largest trace file `aos check` reads, refused past it before it is decoded: at least twice the largest a window exports.
+/// The largest momentum trace file `aos check` decodes, refused past it: at least twice the largest a window exports.
 const CHECK_MAX_BYTES: usize = aterm_effects::aos_momentum::MOMENTUM_TRACE_MAX_BYTES;
+
+/// The largest file `aos check` reads, refused past it before it is decoded: a pane trace's bound (`rewind check export`), the larger.
+const READ_MAX_BYTES: usize = if PANE_TRACE_MAX_BYTES > CHECK_MAX_BYTES {
+    PANE_TRACE_MAX_BYTES
+} else {
+    CHECK_MAX_BYTES
+};
 
 /// The directory under the state dir that `aos export` writes and a bare `aos check` name reads.
 const EXPORT_DIR: &str = "aos";
@@ -476,30 +484,34 @@ pub(crate) fn write_export(
     name: &str,
     bytes: &[u8],
 ) -> std::io::Result<std::path::PathBuf> {
-    let dir = export_dir(root)?;
+    let dir = private_child(root, EXPORT_DIR, "aos export")?;
     dir.write_new_private(std::ffi::OsStr::new(name), bytes)?;
     Ok(dir.path().join(name))
 }
 
-/// `root`'s export directory opened with no link followed (made 0700 when absent), its owner checked and its mode set to 0700 through the opened directory, never through a path.
+/// `root`'s directory `leaf` opened with no link followed (made 0700 when absent), its owner checked and its mode set to 0700 through the opened directory, never through a path; `verb` names the writer in a refusal.
 /// # Errors
 /// The leaf is a link or not a directory, belongs to another user, or cannot be made or opened.
-fn export_dir(root: &std::path::Path) -> std::io::Result<crate::pinned_dir::PinnedDir> {
+pub(crate) fn private_child(
+    root: &std::path::Path,
+    leaf: &str,
+    verb: &str,
+) -> std::io::Result<crate::pinned_dir::PinnedDir> {
     use std::io::{Error, ErrorKind};
     aterm_types::fs_restricted::create_dir_restricted(root)?;
     let state = crate::pinned_dir::PinnedDir::open_resolved(root)?;
-    let leaf = std::ffi::OsStr::new(EXPORT_DIR);
-    let dir = match state.child(leaf) {
+    let name = std::ffi::OsStr::new(leaf);
+    let dir = match state.child(name) {
         Ok(dir) => dir,
-        Err(e) if e.kind() == ErrorKind::NotFound => state.create_child(leaf)?,
+        Err(e) if e.kind() == ErrorKind::NotFound => state.create_child(name)?,
         Err(e) => {
-            let path = root.join(EXPORT_DIR);
+            let path = root.join(leaf);
             let link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
             return Err(if link {
                 Error::new(
                     ErrorKind::InvalidInput,
                     format!(
-                        "{}: is a symbolic link; aos export writes only into a real directory",
+                        "{}: is a symbolic link; {verb} writes only into a real directory",
                         path.display()
                     ),
                 )
@@ -563,7 +575,7 @@ pub(crate) fn check_path(
         .ok_or_else(|| "aos check: no state directory for a bare export name".to_string())
 }
 
-/// `aos check <file>`: reads the trace file at most [`CHECK_MAX_BYTES`], refuses it unless this build runs its identity, and replays it with no live effect.
+/// `aos check <file>`: reads the trace file (a pane trace at most [`PANE_TRACE_MAX_BYTES`], a momentum trace at most [`CHECK_MAX_BYTES`]), refuses it unless this build runs its identity, and replays it with no live effect.
 /// # Errors
 /// The read's failure, or the trace's refusal as `refused=<word>: <why>`.
 pub(crate) fn check_file(path: &std::path::Path, build: &str) -> Result<String, String> {
@@ -573,14 +585,45 @@ pub(crate) fn check_file(path: &std::path::Path, build: &str) -> Result<String, 
     let dir = crate::pinned_dir::PinnedDir::open_resolved(parent)
         .map_err(|e| format!("aos check: {}: {e}", parent.display()))?;
     let (bytes, _) = dir
-        .read_private_at_retained(name, CHECK_MAX_BYTES)
+        .read_private_at_retained(name, READ_MAX_BYTES)
         .map_err(|e| format!("aos check: {}: {e}", path.display()))?;
+    let file = name.to_string_lossy();
+    if PaneTrace::is_pane_trace(&bytes) {
+        let refused = |f: PaneTraceFault| format!("aos check refused={}: {f}", f.word());
+        let trace = PaneTrace::decode(&bytes).map_err(refused)?;
+        let c = trace
+            .check(aterm_core::terminal::ClockReading::now(), build)
+            .map_err(refused)?;
+        return Ok(pane_check_line(&file, bytes.len(), &c));
+    }
+    if bytes.len() > CHECK_MAX_BYTES {
+        return Err(format!(
+            "aos check: {}: artifact source exceeded its size bound",
+            path.display()
+        ));
+    }
     let refused = |f: TraceFault| format!("aos check refused={}: {f}", f.word());
     let trace = MomentumTrace::decode(&bytes).map_err(refused)?;
     let c = trace
         .check(std::time::Instant::now(), build)
         .map_err(refused)?;
-    Ok(check_line(&name.to_string_lossy(), bytes.len(), &c))
+    Ok(check_line(&file, bytes.len(), &c))
+}
+
+/// Formats the `check` answer for a pane trace ([`aterm_aos_pane`]) from its replay and the contract's verdict on it.
+pub(crate) fn pane_check_line(file: &str, bytes: usize, c: &PaneCheck) -> String {
+    format!(
+        "checked task={} code={} {} replies={} start={} state={} chain={} verdict={} \
+         bytes={bytes} file={file}",
+        aterm_aos_pane::TASK_NAME,
+        c.code.name(),
+        c.counts,
+        c.replies_matched,
+        c.start.short(),
+        c.state_digest.short(),
+        c.observation_chain.short(),
+        verdict_word(&c.verdict)
+    )
 }
 
 /// Formats the `check` answer from the replay and the contract's verdict on it.
@@ -671,6 +714,27 @@ fn export(
         ),
         Err(e) => format!("ERR aos export: {e}\n"),
     }
+}
+
+/// Whether this target publishes nothing: the pinned acceptance policy names the golden trace's
+/// target (aarch64 macOS), and another target's profile is another policy, which [`evaluate`]
+/// refuses by name (`policy_tests::the_policy_is_pinned`). Off it, a test that publishes asserts
+/// that refusal and goes no further.
+#[cfg(all(test, debug_assertions))]
+pub(crate) fn refused_off_the_pinned_target() -> bool {
+    use aterm_effects::aos_momentum::{corpus::GOLDEN_TRACE_TARGET, target_name};
+    if target_name() == GOLDEN_TRACE_TARGET {
+        return false;
+    }
+    let refusal = evaluate("aos-verb-test-build", &[0u8; PLAN_BYTES])
+        .expect_err("off the pinned target nothing is admitted");
+    assert!(
+        refusal.starts_with(
+            "aos publish: the pinned policy is refused: acceptance policy refused: its digest"
+        ),
+        "{refusal}"
+    );
+    true
 }
 
 #[cfg(test)]
@@ -901,6 +965,9 @@ mod tests {
     #[test]
     fn evaluate_refuses_a_plan_the_evaluator_does_not_admit() {
         use aterm_effects::aos_momentum::plan::{SchedulePlan, Split, Wake};
+        if super::refused_off_the_pinned_target() {
+            return;
+        }
         let build = "aos-verb-test-build";
         let not_a_plan = evaluate(build, &[0u8; PLAN_BYTES]).expect_err("not a plan");
         assert!(
@@ -1032,5 +1099,67 @@ mod tests {
             trace_file_line(&t, &[]),
             format!("{} file_bytes=0 hex=", trace_line(&t))
         );
+    }
+
+    /// `aos check` replays a pane trace (`rewind check export`) under its own bound, past the momentum trace's, and refuses one another build wrote or a forged byte.
+    #[cfg(unix)]
+    #[test]
+    fn aos_check_replays_a_pane_trace_past_the_momentum_bound_and_refuses_a_forged_one() {
+        use aterm_aos_pane::{PaneClock, PaneCode, PaneEnv, PaneState, project, screen_digest};
+        use aterm_core::terminal::{ClockReading, Terminal};
+
+        let origin = ClockReading::now();
+        let env = PaneEnv {
+            config: aterm_core::config::TerminalConfig::default(),
+            policy: aterm_core::grid::ResizePolicy::Native,
+            host_resyncs_alt_screen: false,
+            host_alternate_scroll: true,
+            cell_px: None,
+            security_policy: None,
+            hyperlink_schemes: Vec::new(),
+        };
+        let start = PaneState::new(
+            project(&Terminal::new(4, 20)).expect("a blank screen projects"),
+            env,
+        );
+        let mut live_engine = start.engine();
+        let mut rec = aterm_aos_pane::trace::PaneRecording::new(origin, start);
+        let big: std::sync::Arc<[u8]> = vec![b'x'; CHECK_MAX_BYTES + 1].into();
+        let clock = PaneClock {
+            offset_ns: 0,
+            wall_ms: None,
+        };
+        live_engine.process_at(&big, rec.schema().reading(clock));
+        let reply = live_engine.take_response().unwrap_or_default();
+        rec.bytes(big, Some(clock), &reply);
+        rec.witness(screen_digest(
+            &live_engine.checkpoint_visible().expect("at ground"),
+        ));
+        let bytes = rec
+            .trace(PaneCode::ThisBuild, "b")
+            .expect("the trace builds")
+            .encode();
+        assert!(
+            bytes.len() > CHECK_MAX_BYTES,
+            "precondition: past the momentum bound"
+        );
+        let root = aterm_tempfile::tempdir().expect("a scratch state dir");
+        let path = write_export(root.path(), "p.aos", &bytes).expect("writes");
+        let line = check_file(&path, "b").expect("the pane trace replays");
+        assert!(
+            line.starts_with(
+                "checked task=aterm.pane.screen code=this-build slices=1 resizes=0 witnesses=1 \
+                 matched=1 replies=1 "
+            ) && line.ends_with(&format!("verdict=pass bytes={} file=p.aos", bytes.len())),
+            "{line}"
+        );
+        let other = check_file(&path, "another-build").expect_err("another build's trace");
+        assert!(other.starts_with("aos check refused=identity"), "{other}");
+        let mut forged = bytes.clone();
+        let mid = forged.len() / 2;
+        forged[mid] ^= 1;
+        let path = write_export(root.path(), "q.aos", &forged).expect("writes");
+        let refused = check_file(&path, "b").expect_err("a forged byte");
+        assert!(refused.starts_with("aos check refused=seal"), "{refused}");
     }
 }

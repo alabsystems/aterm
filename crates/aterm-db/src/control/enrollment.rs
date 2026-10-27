@@ -36,6 +36,7 @@ pub(super) fn client(
     send_frame(stream, &endpoint.hello)?;
     let hello = receive_frame(stream, MAX_HELLO)?;
     let actor = authenticate(endpoint.trust, endpoint.actor, proof, &hello)?;
+    let authenticated_at = Instant::now();
     let challenge = receive_frame(stream, MAX_CHALLENGE)?;
     let response = bootstrap
         .device()
@@ -49,6 +50,7 @@ pub(super) fn client(
     let mut journal = Journal::open_existing(&endpoint.dir, endpoint.trust).map_err(failure)?;
     journal.ingest(&wire).map_err(failure)?;
     repair.prepare(endpoint.trust, actor);
+    repair.authenticated = Some(authenticated_at);
     Ok(Report {
         received: 1,
         ..Report::default()
@@ -205,6 +207,7 @@ pub(super) fn serve(
     }
     let request = Request::decode(&hello[84..]).map_err(failure)?;
     let actor = authenticate_identity(endpoint.actor, proof, &request)?;
+    let authenticated_at = Instant::now();
     let mut lease = endpoint.peers.acquire(actor, repair)?;
     let paths = endpoint
         .paths
@@ -239,6 +242,7 @@ pub(super) fn serve(
     };
     send_frame(stream, &wire)?;
     lease.prepare(endpoint.trust, actor);
+    lease.authenticated = Some(authenticated_at);
     Ok(Report {
         sent: 1,
         ..Report::default()

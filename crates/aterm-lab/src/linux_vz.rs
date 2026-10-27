@@ -488,12 +488,9 @@ fn place_racing(
 /// NOT RUN when rustup, stable, its musl std or `rust-lld` is missing (each named with
 /// [`PROVISION`]); a failure when the build or the placing fails.
 pub fn build_agent(repo: &Path, vz: &Path) -> Result<Placed, Fail> {
-    let rustup = aterm_toolchain::rustup::find_rustup().ok_or_else(|| {
-        not_run(format!(
-            "no rustup {} (fix: {PROVISION})",
-            aterm_toolchain::rustup::RUSTUP_LOOKED
-        ))
-    })?;
+    let rustup = aterm_uds::host::tool("rustup")
+        .locate()
+        .map_err(|absent| not_run(format!("{} (fix: {PROVISION})", absent.why)))?;
     let stable =
         Stable::find(&rustup).map_err(|why| not_run(format!("{why} (fix: {PROVISION})")))?;
     stable

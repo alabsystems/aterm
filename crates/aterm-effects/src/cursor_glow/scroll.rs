@@ -93,6 +93,7 @@ impl BandPx {
 
 impl CursorGlow {
     /// Translate row- and pixel-addressed state after a full-screen upward PTY scroll of `rows` lines.
+    #[inline]
     pub fn note_scroll(&mut self, rows: u16) {
         if rows == 0 {
             return;
@@ -107,6 +108,7 @@ impl CursorGlow {
     }
 
     /// Translate a held park row via `map`, or flush it if `map` drops the row.
+    #[inline]
     pub(super) fn carry_held_park(&mut self, map: impl Fn(u16) -> Option<u16>) {
         if let Some(p) = self.held_park {
             match (map(p.row), map(p.landing_row)) {
@@ -130,6 +132,7 @@ impl CursorGlow {
     }
 
     /// Translate all row-addressed cursor-glow state through `map`.
+    #[inline]
     pub(super) fn translate_row_addressed(&mut self, map: &impl Fn(u16) -> Option<u16>) {
         let hand_at_caret = self.hand_types_at_the_caret(self.last);
         if let Some((row, _)) = &mut self.last {
@@ -186,6 +189,7 @@ impl CursorGlow {
     }
 
     /// Translate all pixel-addressed cursor-glow pools for an upward scroll of `rows` lines.
+    #[inline]
     pub(super) fn translate_scroll_state(&mut self, rows: u16, cell_h: u16) {
         self.translate_row_addressed(&|row: u16| row.checked_sub(rows));
         let dy = f32::from(rows) * f32::from(cell_h);
@@ -250,6 +254,7 @@ impl CursorGlow {
     }
 
     /// Translate row- and pixel-addressed state for a region scroll of `top..=bottom` by `delta` rows.
+    #[inline]
     pub fn note_band_move(&mut self, top: u16, bottom: u16, delta: i16) {
         if delta == 0 || top > bottom {
             return;
@@ -274,8 +279,12 @@ impl CursorGlow {
     }
 
     /// Lift row- and pixel-addressed state on the active typing line from `from` to `to`.
+    #[inline]
     pub(super) fn lift_hand_row(&mut self, from: u16, to: u16) {
-        let map = |r: u16| if r == from { to } else { r };
+        #[inline]
+        const fn map_hand_row(r: u16, from: u16, to: u16) -> u16 {
+            if r == from { to } else { r }
+        }
         if let Some((r, _)) = &mut self.last
             && *r == from
         {
@@ -336,7 +345,7 @@ impl CursorGlow {
                 *r = to;
             }
         }
-        self.carry_held_park(|r| Some(map(r)));
+        self.carry_held_park(|r| Some(map_hand_row(r, from, to)));
         if let Some((r, _)) = &mut self.last_licensed_row
             && *r == from
         {
@@ -352,7 +361,8 @@ impl CursorGlow {
         {
             *r = to;
         }
-        self.insert.translate_rows(|r| Some(map(r)));
+        self.insert
+            .translate_rows(|r| Some(map_hand_row(r, from, to)));
         let mut ai = 0;
         while ai < self.anchor_rows.len() {
             match &mut self.anchor_rows[ai] {
@@ -365,6 +375,7 @@ impl CursorGlow {
     }
 
     /// Translate all row- and pixel-addressed state for a row-band move.
+    #[inline]
     pub(super) fn translate_band_state(
         &mut self,
         top: u16,

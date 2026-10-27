@@ -96,7 +96,7 @@ fn rearm_on_timeout() {
     assert_eq!(
         outcome,
         Ok(EditOutcome {
-            result: amacs::protocol::edit::EditResult::Closed,
+            result: amacs_protocol::edit::EditResult::Closed,
             saved: true,
             seq: 4,
         })
@@ -137,7 +137,7 @@ fn redial_by_uri_after_replaced() {
     }
 
     let closed = |seq| EditOutcome {
-        result: amacs::protocol::edit::EditResult::Closed,
+        result: amacs_protocol::edit::EditResult::Closed,
         saved: false,
         seq,
     };

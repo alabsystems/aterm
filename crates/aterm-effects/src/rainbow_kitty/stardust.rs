@@ -1146,8 +1146,11 @@ impl Star {
             let c = ((k as f32 + 0.5) * inv_nominal - floor) * inv_depth;
             if c > 0.0
                 && c < 1.0
-                && let Some(dt) =
-                    next_sine_crossing_s(theta, crate::color_math::sqrt_f32(c).asin(), omega)
+                && let Some(dt) = next_sine_crossing_s(
+                    theta,
+                    crate::color_math::asin_f32(crate::color_math::sqrt_f32(c)),
+                    omega,
+                )
             {
                 best = Some(match best {
                     Some(b) => b.min(dt),
@@ -2009,6 +2012,13 @@ impl Stardust {
         self.stars.iter()
     }
 
+    /// Every star in the pool as a slice, finishing ones included.
+    #[inline]
+    #[must_use]
+    pub(super) const fn live_stars(&self) -> &[Star] {
+        self.stars.as_slice()
+    }
+
     /// Drain the glints minted since the last [`Stardust::emit`] (§13), one per token spent, at the
     /// hero's column.
     #[cfg(test)]
@@ -2019,6 +2029,7 @@ impl Stardust {
     /// Deal this event's births against the ribbon's planned bands: after [`Ribbon::plan`] and
     /// before any emit, since §5.4's zones are relative to [`super::ribbon::Band::top`] and the
     /// cell may have been laid this frame (T2).
+    #[inline]
     pub fn on_event(&mut self, ev: &Event, at: Instant, ctx: &Ctx<'_>, ribbon: &Ribbon) {
         match *ev {
             Event::Typed { cells, class, .. } => {
@@ -2100,6 +2111,7 @@ impl Stardust {
     /// Shed fragments (§6.5 layer 5): `spec.n` m3 grains born at `spec.at_px`, each inheriting
     /// [`SHED_ALONG_SHARE`] of the head's velocity plus a seeded perpendicular sputter, under
     /// [`DRAG_TAU_MS`].
+    #[inline]
     pub fn sow_shed(&mut self, at: Instant, spec: ShedSow, ctx: &Ctx<'_>) {
         if spec.n == 0 {
             return;
@@ -2143,6 +2155,7 @@ impl Stardust {
     /// The landing fan (§6.5 layer 11, D6): in throw order a gold m1 and 4 m2 (with a hero, else
     /// one m2), then m3, thrown radially over [`FAN_THROW_MS`] to `reach·(0.55..1.05)`, each but
     /// the hero coloured by the landing walk at its rest column.
+    #[inline]
     pub fn sow_fan(&mut self, at: Instant, spec: FanSow, ctx: &Ctx<'_>) {
         let n = usize::from(spec.n).max(1);
         let inv_n = 1.0 / (n as f32);
@@ -2187,6 +2200,7 @@ impl Stardust {
     }
 
     /// The mini-fan (§6.12, D17): a same-row nav hop of 2-7 cells.
+    #[inline]
     pub fn sow_mini_fan(&mut self, at: Instant, at_px: (f32, f32), seed: u32, ctx: &Ctx<'_>) {
         let n = MINI_FAN_M2_N + MINI_FAN_M3_N;
         const INV_N: f32 = 1.0 / (MINI_FAN_M2_N + MINI_FAN_M3_N) as f32;
@@ -2230,6 +2244,7 @@ impl Stardust {
     }
 
     /// Draw the sky.
+    #[inline]
     pub fn emit(&mut self, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         self.reduced = ctx.cfg.reduced_motion;
         self.cell_h = ctx.geom.ch as f32;
@@ -2369,6 +2384,7 @@ impl Stardust {
 
     /// The cadence law: the next instant a star changes what is on glass, or `None` when the sky is
     /// empty (T6).
+    #[inline]
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {
         if self.stars.is_empty() && self.veil.is_empty() {
@@ -2485,6 +2501,7 @@ impl Stardust {
 
     /// Seam point 12 (`translate_scroll_state`), the sky's half: move every star with the viewport
     /// by `rows` cell heights and drop those that leave the grid.
+    #[inline]
     pub fn translate_scroll(&mut self, rows: u16, cell_h: u16) {
         if rows == 0 {
             return;
@@ -2515,6 +2532,7 @@ impl Stardust {
     }
 
     /// Move sky stars with the glyph rows that earned them.
+    #[inline]
     pub fn translate_band(
         &mut self,
         top: u16,
@@ -2554,6 +2572,7 @@ impl Stardust {
         self.probe.clear();
     }
 
+    #[inline]
     fn deal_typed(
         &mut self,
         cells: u16,
@@ -2705,6 +2724,7 @@ impl Stardust {
         self.sow_exhaust(at, ctx, ribbon);
     }
 
+    #[inline]
     fn sow_exhaust(&mut self, at: Instant, ctx: &Ctx<'_>, ribbon: &Ribbon) {
         // A throw is motion (§6.11).
         if ctx.cfg.reduced_motion {
@@ -2821,6 +2841,7 @@ impl Stardust {
         }
     }
 
+    #[inline]
     fn throw_erase(
         &mut self,
         class: StarClass,
@@ -2859,6 +2880,7 @@ impl Stardust {
         );
     }
 
+    #[inline]
     fn deal_star(&mut self, spec: Deal, at: Instant, ctx: &Ctx<'_>, ribbon: &Ribbon) -> bool {
         let mut grabbed: Option<Option<usize>> = None;
         if let Some(p) = spec.pull {
@@ -2982,6 +3004,7 @@ impl Stardust {
         }
     }
 
+    #[inline]
     fn sky_birth_px(
         &self,
         cell: (u16, u16),
@@ -3084,6 +3107,7 @@ impl Stardust {
         self.blank_frontier_px(x, (y, y), want, ctx)
     }
 
+    #[inline]
     const fn blank_frontier_px(&self, x: f32, band: (f32, f32), want: f32, ctx: &Ctx<'_>) -> f32 {
         let g = ctx.geom;
         if !want.is_finite() || want < 0.5 {
@@ -3127,6 +3151,7 @@ impl Stardust {
         want.min(x - (fx_left + frontier * cw_i32) as f32).max(0.0)
     }
 
+    #[inline]
     const fn rule_headroom_px(&self, cols: std::ops::RangeInclusive<i32>, y: f32, g: Geom) -> f32 {
         let row = px_row(y, g);
         if !self.probe.has_rule_in(row, cols) {
@@ -3162,6 +3187,7 @@ impl Stardust {
         Some(pos)
     }
 
+    #[inline]
     const fn settle(&self, star: &mut Star, fixed: bool, ctx: &Ctx<'_>) -> bool {
         #[inline]
         const fn settle_clear(
@@ -3442,6 +3468,7 @@ impl Stardust {
         cell_hash(row, col, self.minted)
     }
 
+    #[inline]
     fn deal_veil(&mut self, cells: u16, at: Instant, ctx: &Ctx<'_>, ribbon: &Ribbon) {
         let gain = veil_gain(ctx.birth_disp);
         if gain <= 0.0 {
@@ -3496,6 +3523,7 @@ impl Stardust {
         }
     }
 
+    #[inline]
     fn draw_veil(&self, ctx: &Ctx<'_>, halos: &mut Vec<RainHalo>) {
         // On paper the aurora is not drawn: ink cannot glow, and a pale tint
         // along the row above the ribbon read as a flat strip with hard
@@ -3675,14 +3703,14 @@ impl Paint {
         } else {
             star.pos_at_age(age_s)
         };
-        if shade.hides((x, y), ctx.geom.cw) {
+        let peak_reach = arm_hi.max(arm_lo) + 1;
+        if shade.hides((x, y), peak_reach, ctx.geom.cw) {
             return None;
         }
-        if let Some(ko) = keep_out {
-            let peak_reach = arm_hi.max(arm_lo) + 1;
-            if Self::kept_out(x, y, peak_reach, ctx, ko) {
-                return None;
-            }
+        if let Some(ko) = keep_out
+            && Self::kept_out(x, y, peak_reach, ctx, ko)
+        {
+            return None;
         }
         let held = rm || age_s < star.class.envelope_s(star.lane).0;
         let can_glint = !rm && star.gold && star.class == StarClass::M1;
@@ -3730,6 +3758,7 @@ impl Paint {
         })
     }
 
+    #[inline]
     fn draw_add(
         &self,
         ctx: &Ctx<'_>,
@@ -3930,6 +3959,7 @@ impl Paint {
         }
     }
 
+    #[inline]
     fn draw_over(
         &self,
         geom: Geom,
@@ -4288,6 +4318,7 @@ struct HaloSpec {
     mode: HaloMode,
 }
 
+#[inline]
 fn push_halo_quads_clipped(
     out: &mut Vec<RainHalo>,
     geom: Geom,
@@ -4601,6 +4632,7 @@ impl SkyIndex {
         (k >> 13) as usize & (SKY_INDEX_SLOTS - 1)
     }
 
+    #[inline]
     fn file(&mut self, i: usize, (x, y, w, h): (i32, i32, i32, i32), quads: bool) {
         let (cx0, cy0) = self.cell_at(x, y);
         let (cx1, cy1) = self.cell_at(x + w - 1, y + h - 1);
@@ -4826,15 +4858,15 @@ const fn quad_covers(q: &GlowQuad, x: i32, y: i32) -> bool {
 /// past the body (where stub, taper and halo ring meet), and its four orthogonal neighbours.
 pub const SETTLE_PIXELS: usize = 9;
 
+#[inline]
 fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((i32, i32), u32)]) {
-    if q0 >= frame.out.len() && h0 >= frame.halos.len() {
-        return;
-    }
-    let table = relative_luminance_table();
-    let star_quads = &frame.out[q0..];
-    let star_halos = &frame.halos[h0..];
-    let maskable = star_quads.len() <= u32::BITS as usize;
-    let own_at_max = |(x, y): (i32, i32)| -> (u32, u32, u32, u8) {
+    #[inline]
+    const fn own_at_max(
+        star_quads: &[GlowQuad],
+        star_halos: &[RainHalo],
+        maskable: bool,
+        (x, y): (i32, i32),
+    ) -> (u32, u32, u32, u8) {
         let mut own = 0u32;
         let mut qmask = 0u32;
         let mut idx = 0;
@@ -4863,24 +4895,17 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
             hi += 1;
         }
         (own, qmask, halo_color, halo_wt)
-    };
-    let mut over = [((0i32, 0i32), 0u32, 0u32, 0u32, 0u8); SETTLE_PIXELS];
-    let mut over_len = 0usize;
-    let mut wi = 0;
-    while wi < watch.len() {
-        let (p, ground) = watch[wi];
-        let (own, qmask, halo_color, halo_wt) = own_at_max(p);
-        if !under_ceil_with(table, add_sat(ground, own)) && over_len < over.len() {
-            over[over_len] = (p, ground, qmask, halo_color, halo_wt);
-            over_len += 1;
-        }
-        wi += 1;
     }
-    if over_len == 0 {
-        return;
-    }
-    let over = &over[..over_len];
-    let own_at = |k: u8, (x, y): (i32, i32), mut qmask: u32, halo_color: u32, halo_wt: u8| -> u32 {
+    #[inline]
+    const fn own_at(
+        star_quads: &[GlowQuad],
+        maskable: bool,
+        k: u8,
+        (x, y): (i32, i32),
+        mut qmask: u32,
+        halo_color: u32,
+        halo_wt: u8,
+    ) -> u32 {
         let mut own = 0u32;
         if maskable {
             while qmask != 0 {
@@ -4902,22 +4927,108 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
             own = add_sat(own, premul_rgb(premul_rgb(halo_color, k), halo_wt));
         }
         own
-    };
-    let fits = |k: u8| {
+    }
+    #[derive(Clone, Copy)]
+    struct OverSettlePixel {
+        p: (i32, i32),
+        ground: u32,
+        qmask: u32,
+        halo_color: u32,
+        halo_wt: u8,
+    }
+    #[inline]
+    const fn settle_fits(
+        table: &RelativeLuminanceTable,
+        over: &[OverSettlePixel],
+        star_quads: &[GlowQuad],
+        maskable: bool,
+        k: u8,
+    ) -> bool {
         let mut oi = 0;
         while oi < over.len() {
-            let (p, ground, qmask, halo_color, halo_wt) = over[oi];
+            let px = over[oi];
             if !under_ceil_with(
                 table,
-                add_sat(ground, own_at(k, p, qmask, halo_color, halo_wt)),
+                add_sat(
+                    px.ground,
+                    own_at(
+                        star_quads,
+                        maskable,
+                        k,
+                        px.p,
+                        px.qmask,
+                        px.halo_color,
+                        px.halo_wt,
+                    ),
+                ),
             ) {
                 return false;
             }
             oi += 1;
         }
         true
-    };
-    let k = fit_byte(u8::MAX - 1, fits);
+    }
+    #[inline]
+    const fn fit_settle_byte(
+        table: &RelativeLuminanceTable,
+        over: &[OverSettlePixel],
+        star_quads: &[GlowQuad],
+        maskable: bool,
+        want: u8,
+    ) -> u8 {
+        if want == 0 || settle_fits(table, over, star_quads, maskable, want) {
+            return want;
+        }
+        if !settle_fits(table, over, star_quads, maskable, 0) {
+            return 0;
+        }
+        let (mut lo, mut hi) = (0u8, want);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if settle_fits(table, over, star_quads, maskable, mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+    if q0 >= frame.out.len() && h0 >= frame.halos.len() {
+        return;
+    }
+    let table = relative_luminance_table();
+    let star_quads = &frame.out[q0..];
+    let star_halos = &frame.halos[h0..];
+    let maskable = star_quads.len() <= u32::BITS as usize;
+    let mut over = [OverSettlePixel {
+        p: (0, 0),
+        ground: 0,
+        qmask: 0,
+        halo_color: 0,
+        halo_wt: 0,
+    }; SETTLE_PIXELS];
+    let mut over_len = 0usize;
+    let mut wi = 0;
+    while wi < watch.len() {
+        let (p, ground) = watch[wi];
+        let (own, qmask, halo_color, halo_wt) = own_at_max(star_quads, star_halos, maskable, p);
+        if !under_ceil_with(table, add_sat(ground, own)) && over_len < over.len() {
+            over[over_len] = OverSettlePixel {
+                p,
+                ground,
+                qmask,
+                halo_color,
+                halo_wt,
+            };
+            over_len += 1;
+        }
+        wi += 1;
+    }
+    if over_len == 0 {
+        return;
+    }
+    let over = &over[..over_len];
+    let k = fit_settle_byte(table, over, star_quads, maskable, u8::MAX - 1);
     let mut qi = q0;
     while qi < frame.out.len() {
         let q = &mut frame.out[qi];
@@ -4945,27 +5056,6 @@ const fn stacked_centre(base: u32, rgb: u32, cov: u8) -> u32 {
     let lay = premul_rgb(rgb, cov);
     let core = premul_rgb(rgb, (cov as f32 * STAR_CORE_ADD) as u8);
     add_sat(add_sat(add_sat(base, lay), lay), core)
-}
-
-#[inline]
-#[must_use]
-fn fit_byte(want: u8, under: impl Fn(u8) -> bool) -> u8 {
-    if want == 0 || under(want) {
-        return want;
-    }
-    if !under(0) {
-        return 0;
-    }
-    let (mut lo, mut hi) = (0u8, want);
-    while hi - lo > 1 {
-        let mid = lo + (hi - lo) / 2;
-        if under(mid) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
 }
 
 #[inline]
@@ -5160,6 +5250,7 @@ const fn star_ink_on_paper(tint: u32, cfg: &Config) -> u32 {
 /// The light-theme star (§3.3, §5.2): a horizontal and a vertical arm (each a full-length tip lay
 /// and a shorter body lay) on a round nucleus, plus four diagonal glint dots when gold, all
 /// source-over falloff ellipses in the star's ink on the page.
+#[inline]
 pub(crate) fn push_twinkle_over_twin(
     halos: &mut Vec<RainHalo>,
     geom: Geom,
@@ -5323,6 +5414,9 @@ const fn stacked_ink_alpha(cov: u8, role: InkRole) -> u32 {
     let idx = if cov < cap_b { cov } else { cap_b } as usize;
     CENTRE_ALPHA[idx].clamp(1.0, ceiling) as u32
 }
+
+#[cfg(any(test, debug_assertions))]
+mod state_words;
 
 #[cfg(test)]
 mod tests {
@@ -7050,6 +7144,48 @@ mod tests {
                 "grain {k} lost its core to the budget"
             );
         }
+    }
+
+    /// On a dark page nothing coloured is drawn below α 0.12 (§3.2): near
+    /// the cull, at a twinkle trough, a hero's halo goes while its white core
+    /// (floor 0.20) still draws (replaces the pruned
+    /// `a_halo_is_culled_below_the_chroma_floor`).
+    #[test]
+    fn a_dark_halo_is_culled_below_the_chroma_floor_while_its_core_draws() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let mut sky = sky();
+        let mut s = star(StarClass::M1, StarLane::Strike, t0, spectrum_snap(0.2));
+        // A seed whose twinkle trough meets the end of life, so the band
+        // `α ∈ [0.20, 0.218)` is swept.
+        let life = StarClass::M1.life_s(StarLane::Strike);
+        s.seed = (0u32..)
+            .find(|&k| {
+                s.seed = k;
+                s.twinkle(t0 + Duration::from_secs_f32(life - 0.004)) < 0.58
+            })
+            .expect("some seed puts the trough at the life's end");
+        sky.sow(s);
+        let (mut haloed, mut culled_while_core_drawn) = (false, false);
+        for ms in 0..(life * 1000.0) as u64 {
+            let now = t0 + Duration::from_millis(ms);
+            let sc = frame_at(&mut sky, now, &c);
+            let s = sky.live_iter().next().expect("the hero is live");
+            let a = s.envelope(now, false) * s.twinkle(now);
+            haloed |= !sc.halos.is_empty();
+            if a < CHROMA_CULL_ALPHA {
+                assert!(
+                    sc.halos.is_empty(),
+                    "a halo at α·env {a} is under the chroma floor"
+                );
+                culled_while_core_drawn |= !sc.out.is_empty();
+            }
+        }
+        assert!(haloed, "fixture: the hero never wore its halo");
+        assert!(
+            culled_while_core_drawn,
+            "the sweep never reached the band where the halo culls before the core"
+        );
     }
 
     #[test]

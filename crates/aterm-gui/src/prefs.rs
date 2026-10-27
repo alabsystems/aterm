@@ -525,7 +525,7 @@ pub(crate) const EDIT_WALLPAPER: &str = "wallpaper";
 pub(crate) const EDIT_WALLPAPER_DIM: &str = "wallpaper_dim";
 /// Backdrop-hue glyph tint while a wallpaper is attached.
 pub(crate) const EDIT_WALLPAPER_TEXT_TINT: &str = "wallpaper_text_tint";
-/// Per-session temporal recorder opt-in (`temporal_recording`, default OFF).
+/// Per-session temporal recorder (`temporal_recording`, default [`crate::app_config::DEFAULT_TEMPORAL_RECORDING`]).
 pub(crate) const EDIT_TEMPORAL_RECORDING: &str = "temporal_recording";
 /// All-edge interior window padding in logical px (`window_padding`, default 12, clamp 0..=64).
 pub(crate) const EDIT_WINDOW_PADDING: &str = "window_padding";
@@ -4418,10 +4418,11 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             key: EDIT_FONT_PX,
             kind: EditKind::Float,
             seed: cfg.font_px.map(|px| format!("{px}")),
-            placeholder: match cfg.font_px {
-                Some(px) => format!("{px} px"),
-                None => format!("{} (automatic)", crate::FONT_PX),
-            },
+            // What the field reads unset, whatever the file holds now: a write in flight that
+            // removes the key (a step onto the automatic size) shows the automatic size. Before,
+            // a set size's own "14 px" stood in, the slider read the old size while the removal
+            // flew, and the next step wrote the automatic size again instead of moving past it.
+            placeholder: format!("{} (automatic)", crate::FONT_PX),
         },
         EditField {
             label: "Display face",
@@ -5388,7 +5389,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             label: "Rewind (keep recent screen history)",
             key: EDIT_TEMPORAL_RECORDING,
             kind: EditKind::Bool,
-            seed: Some(cfg.temporal_recording.unwrap_or(false).to_string()),
+            seed: Some(cfg.temporal_recording_or_default().to_string()),
             placeholder: String::new(),
         },
         EditField {

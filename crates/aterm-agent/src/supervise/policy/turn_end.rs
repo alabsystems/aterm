@@ -8932,25 +8932,139 @@ pub fn is_land_rule(rule: &str) -> bool {
 
 /// RETIRED AS AN ACT: the worker's own suggestion accepted, as builds before v6's 5a did under Cruise. Kept so older books, the stats and the tape corpus read it; Cruise types [`RULE_CONTINUE`] over a suggestion now.
 pub const RULE_SUGGESTION: &str = "continue-suggestion@v1";
-/// A continuation after an overload or an API error's wait.
+/// A continuation after a refused request's wait. Before v6's 12b it was an outage wall's typed
+/// retry too, so older books, the stats and the tape corpus read it there.
 pub const RULE_API_RETRY: &str = "api-retry@v1";
-/// A continuation once the host measures the API reachable again, after an API error that never reached it.
+/// RETIRED AS AN ACT: a continuation once the host measured the API reachable again, after an API
+/// error that never reached it. Kept so older books, the stats and the tape corpus read it; an
+/// outage wall's measured clearing types [`RULE_OUTAGE_RESUME`] now.
 pub const RULE_API_BACK: &str = "api-back@v1";
 /// A continuation after a reply the connection cut off.
 pub const RULE_API_CUTOFF: &str = "api-cutoff@v1";
+/// The one line that resumes an outage wall's wait (v6 §14.17.5.2): measured once the route is
+/// back, or tried on the outage's doubling back-off where nothing measures its end.
+pub const RULE_OUTAGE_RESUME: &str = "outage-resume@v1";
 /// A LOST LOGIN'S TURN DELIVERED AGAIN once the login came back in another tab of the host ([`super::login::LoginShared::Back`]).
 pub const RULE_LOGIN_BACK: &str = "login-back@v1";
 
 /// How often a tab waiting on another tab's sign-in of its login reads that sign-in again ([`super::login::LoginShared::Carried`]).
 pub const LOGIN_SHARED_LOOK: Duration = Duration::from_secs(15);
 
-/// [`RULE_LOGIN_BACK`]'s words, the agent `program`'s.
+/// [`RULE_LOGIN_BACK`]'s words: the expired login's line ([`cleared_text`]).
 #[must_use]
-pub fn login_back_text(program: Program) -> String {
-    format!(
-        "{} reported that its login had expired, and it is signed in again now. {CARRY_ON}",
-        program.product()
-    )
+pub fn login_back_text() -> String {
+    cleared_text(Cleared::Login, Clearing::Measured).to_string()
+}
+
+/// THE CONDITION A SYSTEM MESSAGE ENDED THE AGENT'S TURN ON, as the line that resumes it past the
+/// condition names it ([`cleared_text`]; v6 §14.17.5, slice 12a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cleared {
+    /// A usage limit: a session's, a week's, a model's or the credits'.
+    UsageLimit,
+    /// A lost login, signed in again.
+    Login,
+    /// A model's limit Claude Code goes past on usage credits, on the prompt this line is.
+    Credits,
+    /// An outage wall waited on ([`outage_of`]; v6 §14.17.5.2, slice 12b).
+    Outage(Outage),
+}
+
+/// HOW A CONDITION'S CLEARING IS KNOWN ([`cleared_text`]): measured (the reset it named passed, the
+/// accounts probe or the login says it cleared, or the session moved off it), or tried blind on a
+/// back-off, where it named no reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clearing {
+    /// The clearing was seen: *has cleared*.
+    Measured,
+    /// The resume is a try on a back-off: *may have cleared*.
+    Blind,
+}
+
+/// THE ONE LINE A RESUME TYPES PAST A SYSTEM MESSAGE (v6 §14.17.5, slice 12a): a limit or a lost
+/// login ended the agent's turn, not the agent, so the resume says what cleared
+/// and nothing of Cruise's or Land's prompt (owner rule 2026-10-25: a prompt into a turn the agent
+/// did not end is spam). Cruise and Land speak at the agent's own next turn end; a prompt the
+/// condition cut is the agent's still, and its answer is judged as that prompt's
+/// ([`TurnEndState::acted`]'s cut carry).
+#[must_use]
+pub const fn cleared_text(cleared: Cleared, clearing: Clearing) -> &'static str {
+    macro_rules! line {
+        ($what:literal) => {
+            match clearing {
+                Clearing::Measured => concat!(
+                    harness_mark!(),
+                    " The ",
+                    $what,
+                    " has cleared; continue where you stopped."
+                ),
+                Clearing::Blind => concat!(
+                    harness_mark!(),
+                    " The ",
+                    $what,
+                    " may have cleared; continue where you stopped."
+                ),
+            }
+        };
+    }
+    match cleared {
+        Cleared::UsageLimit => line!("usage limit"),
+        Cleared::Login => line!("expired login"),
+        Cleared::Outage(Outage::Overload) => line!("API overload"),
+        Cleared::Outage(Outage::ApiError) => line!("API error"),
+        Cleared::Outage(Outage::Connection) => line!("connection error"),
+        Cleared::Credits => concat!(
+            harness_mark!(),
+            " The model's usage limit is passed on usage credits; continue where you stopped."
+        ),
+    }
+}
+
+/// Whether `text` opens on one of [`cleared_text`]'s lines.
+#[must_use]
+pub fn is_cleared_line(text: &str) -> bool {
+    const CLEARED: [Cleared; 6] = [
+        Cleared::UsageLimit,
+        Cleared::Login,
+        Cleared::Credits,
+        Cleared::Outage(Outage::Overload),
+        Cleared::Outage(Outage::ApiError),
+        Cleared::Outage(Outage::Connection),
+    ];
+    let text = text.trim_start();
+    CLEARED.iter().any(|&c| {
+        [Clearing::Measured, Clearing::Blind]
+            .iter()
+            .any(|&how| text.starts_with(cleared_text(c, how)))
+    })
+}
+
+/// The condition a resume of `rule` types past ([`cleared_text`]): the consent a model's limit
+/// asks for, the outage an outage wall's resume waited on (the wall `reading` shows, else the one
+/// `state`'s track stands for), or a limit's resume past the limit, or past the lost login where
+/// that is the wall `state`'s track stands for. `/compact`'s owed continuation has none: the
+/// compaction took the agent's context, so the mode's own continuation tells it again what it is
+/// doing.
+fn cleared_of(state: &TurnEndState, reading: &TurnEndReading, rule: &str) -> Option<Cleared> {
+    Some(match rule {
+        RULE_COMPACT => return None,
+        RULE_CONSENT => Cleared::Credits,
+        RULE_OUTAGE_RESUME => Cleared::Outage(
+            reading
+                .wall
+                .or_else(|| state.wall.as_ref().and_then(|t| t.kind))
+                .and_then(outage_named)
+                .unwrap_or(Outage::ApiError),
+        ),
+        _ if state
+            .wall
+            .as_ref()
+            .is_some_and(|t| t.class == WallClass::Auth) =>
+        {
+            Cleared::Login
+        }
+        _ => Cleared::UsageLimit,
+    })
 }
 
 const CARRY_ON: &str = concat!(
@@ -9081,6 +9195,7 @@ fn is_wall_act(rule: &str) -> bool {
         RULE_API_RETRY
             | RULE_API_BACK
             | RULE_API_CUTOFF
+            | RULE_OUTAGE_RESUME
             | RULE_LIMIT_RESUME
             | RULE_CONSENT
             | RULE_COMPACT
@@ -9094,6 +9209,7 @@ pub(crate) fn is_wall_retry(rule: &str) -> bool {
         RULE_API_RETRY
             | RULE_API_BACK
             | RULE_API_CUTOFF
+            | RULE_OUTAGE_RESUME
             | RULE_LIMIT_RESUME
             | RULE_COMPACT
             | RULE_LOGIN_BACK
@@ -10121,7 +10237,12 @@ pub struct TurnEndTiming {
     pub short_backoff_max: Duration,
     pub retry_backoff: Vec<Duration>,
     pub net_backoff: Vec<Duration>,
-    pub down_hold: Duration,
+    /// An outage wall's first blind try comes this long after the wall ([`outage_wait`]), each
+    /// later one twice as long after its own wall's re-read, up to [`Self::outage_cap`].
+    pub outage_first: Duration,
+    /// The longest gap between an outage wall's blind tries, and the period a wait the host
+    /// measures down decides again at.
+    pub outage_cap: Duration,
     pub progress: Duration,
     pub reset_grace: Duration,
     pub reset_jitter: Duration,
@@ -10170,7 +10291,8 @@ impl Default for TurnEndTiming {
             short_backoff_max: min(60),
             retry_backoff: vec![min(1), min(5), min(15), min(30), min(60)],
             net_backoff: vec![min(1), min(2), min(5)],
-            down_hold: min(15),
+            outage_first: min(2),
+            outage_cap: min(60),
             progress: min(5),
             reset_grace: Duration::from_secs(150),
             reset_jitter: Duration::from_secs(60),
@@ -10195,11 +10317,13 @@ pub const LADDER_SCALE_SEAM: &str = "ATERM_DEV_LADDER_SCALE";
 pub const RESET_SCALE_SEAM: &str = "ATERM_DEV_RESET_SCALE";
 
 impl TurnEndTiming {
-    /// The same timing, its short back-off ladder scaled by `factor`.
+    /// The same timing, its short back-off ladder and an outage wall's ladder scaled by `factor`.
     #[must_use]
     pub fn ladder_scaled(mut self, factor: f64) -> Self {
         self.short_backoff = self.short_backoff.mul_f64(factor);
         self.short_backoff_max = self.short_backoff_max.mul_f64(factor);
+        self.outage_first = self.outage_first.mul_f64(factor);
+        self.outage_cap = self.outage_cap.mul_f64(factor);
         self
     }
 
@@ -10949,8 +11073,51 @@ pub enum Then {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WaitKind {
     Retry,
-    BackOff { short: u8 },
+    BackOff {
+        short: u8,
+    },
+    /// An outage wall waited on (v6 §14.17.5.2, slice 12b): nothing is typed while it stands, and
+    /// the window draws `waiting: <words>` on the tab's state line. `tries`: a blind try comes at
+    /// the wait's end; false while the host measures the route down, when only its edge up resumes.
+    Outage {
+        wall: Outage,
+        tries: bool,
+    },
     Other,
+}
+
+/// WHICH OUTAGE AN [`WaitKind::Outage`] WAITS ON: the condition its state line and its resume name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Outage {
+    /// The API is overloaded (`Overloaded`).
+    Overload,
+    /// The API answers with a server error (`ApiError` cause `Server`).
+    ApiError,
+    /// The API cannot be reached (`ApiError` cause `Unreachable` or `Config`, or a `CutOff`
+    /// while the route is measured down).
+    Connection,
+}
+
+impl Outage {
+    /// The condition in words, as the state line and the resume line say it.
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Outage::Overload => "API overload",
+            Outage::ApiError => "API error",
+            Outage::Connection => "connection error",
+        }
+    }
+
+    /// The condition's one-word name, as `aterm ctl status` says it (`waiting=<word>`).
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Outage::Overload => "overload",
+            Outage::ApiError => "api-error",
+            Outage::Connection => "connection",
+        }
+    }
 }
 
 impl WaitKind {
@@ -11075,6 +11242,10 @@ struct WallTrack {
     seeded: bool,
     entitlement: bool,
     owed: bool,
+    /// The wall was read while the host measured the route down: a cut-off reply's is the
+    /// connection's outage from then until the agent works again ([`outage_of`]), so the route's
+    /// edge up resumes it as measured, never as a one-off cut.
+    down: bool,
     login: LoginBooks,
     conversation: Conversation,
     program: Option<Program>,
@@ -11383,7 +11554,9 @@ struct LandEpisode {
     typed: bool,
     nudges: u32,
     hold: HoldStart,
-    unstamped: bool,
+    /// The rule the act that began the hold went out under, until its row stamps the hold
+    /// ([`TurnEndState::ledgered`]).
+    unstamped: Option<&'static str>,
     legs: Option<LandHeld>,
 }
 
@@ -11887,22 +12060,25 @@ impl TurnEndState {
             seeded: !met,
             entitlement: limit.entitlement,
             owed: false,
+            down: false,
             login: LoginBooks::default(),
             conversation: Conversation::Hostless,
             program: None,
         });
     }
 
-    /// THE RETRY LADDER OF THE API ERROR'S WALL THIS LOOP WAITS AT.
+    /// THE RETRY LADDER OF THE API ERROR'S WALL THIS LOOP WAITS AT, and whether the wall was read
+    /// while the host measured the route down ([`WallTrack::down`]).
     #[must_use]
-    pub fn retry_track(&self) -> Option<(WallKind, usize, usize, Instant)> {
+    pub fn retry_track(&self) -> Option<(WallKind, usize, usize, Instant, bool)> {
         self.wall
             .as_ref()
             .filter(|t| t.class == WallClass::Retry)
-            .and_then(|t| Some((t.kind?, t.attempts, t.ups, t.since)))
+            .and_then(|t| Some((t.kind?, t.attempts, t.ups, t.since, t.down)))
     }
 
     /// THE RETRY LADDER A LOOP BEFORE THIS ONE WAS ON at the API error's wall `kind` ([`Self::retry_track`], its last row's mark).
+    #[allow(clippy::too_many_arguments)]
     pub fn seed_retry(
         &mut self,
         kind: WallKind,
@@ -11910,6 +12086,7 @@ impl TurnEndState {
         ups: usize,
         ago: Duration,
         owed: bool,
+        down: bool,
         now: Instant,
     ) {
         if self.wall.is_some() || class_of(kind) != WallClass::Retry {
@@ -11932,6 +12109,7 @@ impl TurnEndState {
             seeded: false,
             entitlement: false,
             owed,
+            down,
             login: LoginBooks::default(),
             conversation: Conversation::Hostless,
             program: None,
@@ -11979,6 +12157,7 @@ impl TurnEndState {
             seeded: false,
             entitlement: false,
             owed: false,
+            down: false,
             conversation: Conversation::Hostless,
             program: None,
             login: LoginBooks {
@@ -12039,6 +12218,7 @@ impl TurnEndState {
             seeded: false,
             entitlement: false,
             owed: false,
+            down: false,
             login: LoginBooks::default(),
             conversation: Conversation::Hostless,
             program,
@@ -12068,6 +12248,7 @@ impl TurnEndState {
             seeded: false,
             entitlement: entitlement_ladder(false, kind),
             owed: false,
+            down: false,
             login: LoginBooks::default(),
             conversation: Conversation::Hostless,
             program: None,
@@ -12448,6 +12629,7 @@ impl TurnEndState {
             seeded: false,
             entitlement: u.limit.entitlement,
             owed: false,
+            down: false,
             login: LoginBooks::default(),
             conversation: Conversation::Hostless,
             program,
@@ -12718,6 +12900,12 @@ impl TurnEndState {
     /// THE SAME REPLY AGAIN, a read wall's once its tries are spent, or [`NO_WORK_ACTS`] no-work answers in a row (past a read wall's own tries), the screen showing the newest kept: nothing is typed at it. The route back since the last answer lifts both, and so does a date or clock reset since it, the one the last answer showed only while the wall's tries last (a reset moving forward with each answer keeps them); a relative reset, restated with each answer, lifts only the first while the wall's tries last.
     #[must_use]
     pub fn repeats(&self, reading: &TurnEndReading) -> bool {
+        // AN OUTAGE WALL HOLDS NOTHING (v6 §14.17.5.2): while the screen shows it, it is waited
+        // out, its answers no reply the agent gave again. A reply that shows no outage wall is
+        // weighed as any other, a retry track standing behind it or not.
+        if outage_shown(self, reading).is_some() {
+            return false;
+        }
         let Some(k) = self
             .replies
             .last()
@@ -13004,9 +13192,13 @@ impl TurnEndState {
 
     /// AN ACT TYPED UNDER `rule` WAS LEDGERED at `at_ms` (unix ms, the row's own stamp).
     pub fn ledgered(&mut self, rule: &str, at_ms: i64) {
-        if self.land.unstamped && is_land_rule(rule) {
+        if self
+            .land
+            .unstamped
+            .is_some_and(|by| by == rule || is_land_rule(rule))
+        {
             self.land.hold.since_ms = Some(at_ms);
-            self.land.unstamped = false;
+            self.land.unstamped = None;
         }
     }
 
@@ -13019,7 +13211,7 @@ impl TurnEndState {
 
     const fn hold_landed(&mut self) {
         self.land.hold = HoldStart::LANDED;
-        self.land.unstamped = false;
+        self.land.unstamped = None;
         self.land.legs = None;
     }
 
@@ -13166,6 +13358,21 @@ impl TurnEndState {
         self.task_done() && self.exchange
     }
 
+    /// CRUISE NEVER PARKS (owner ruling 2026-10-26): under Cruise no exchange is left to the
+    /// person. One a Land run left (the autopilot switched since) is taken back here, and the
+    /// point it held is a report again: a done claim where its words say done
+    /// ([`says_done`]), else an ordinary turn end.
+    fn cruise_takes_exchange(&mut self, reading: &TurnEndReading) {
+        if reading.autopilot != Autopilot::Cruise || !self.exchange {
+            return;
+        }
+        self.exchange = false;
+        if self.done >= 2 && !self.landed {
+            self.done = u8::from(says_done(reading.said_tail.as_deref()) && reading.wall.is_none());
+            self.done_at = None;
+        }
+    }
+
     /// The act the point last judged followed.
     #[must_use]
     pub const fn followed(&self) -> Option<&'static str> {
@@ -13298,6 +13505,18 @@ impl TurnEndState {
     pub const fn fact_typed(&mut self) {
         self.keyed_by_harness();
         self.fact = Some(FactAwaited { taken: false });
+    }
+
+    /// CRUISE'S CARRY WENT AT A BREAK OF THE AGENT'S OWN BACKGROUND WORK at `now`
+    /// ([`super::cruise_carry::RULE_BACKGROUND`]): kept as the door's line is
+    /// ([`Self::fact_typed`]), so its answer is the harness's turn and the next break waits on
+    /// its take, and counted in the hour's acts (`continue_per_hour`, [`Self::acts_in_window`]).
+    pub fn background_carried(&mut self, now: Instant) {
+        self.fact_typed();
+        self.acts.push_back(now);
+        while self.acts.len() > 64 {
+            self.acts.pop_front();
+        }
     }
 
     /// The occupancy door's line stands untaken ([`Self::fact_typed`]).
@@ -14308,6 +14527,7 @@ impl TurnEndState {
             self.checks = 0;
         }
         self.autopilot = Some(reading.autopilot);
+        self.cruise_takes_exchange(reading);
         let stopped = reading.interrupted && !matches!(reading.phase, Phase::Busy | Phase::Prompt);
         // The harness's own Esc stopped this turn ([`Self::woken_esc`]): no person's. A point
         // the Esc did not stop ends its claim.
@@ -14726,7 +14946,9 @@ impl TurnEndState {
             }
             (None, Some(d)) => {
                 self.exchange_work = d;
-                self.exchange = theirs && d < EXCHANGE_WORK;
+                // CRUISE NEVER PARKS: a person's own exchange is left to them under Land alone.
+                self.exchange =
+                    theirs && d < EXCHANGE_WORK && reading.autopilot != Autopilot::Cruise;
                 self.carrying &= carried;
                 self.landed = false;
                 let left = self.exchange && ok_to_leave;
@@ -14858,6 +15080,10 @@ impl TurnEndState {
         // A long answer with no tool row where the reader reads them is kept too: said again, it is no work.
         let kept_long = quiet && reading.program.reader().reads_tool_rows();
         let reply = reply_mark(reading);
+        // AN OUTAGE WALL'S ANSWER COUNTS FOR NO HOLD (v6 §14.17.5.2): the agent could not act on
+        // the wall, so its answer is no reply it gave again, and a long outage's answers start no
+        // run.
+        let outage = outage_shown(self, reading).is_some();
         // A person typed since the last point read and the last answer counted.
         let person_at = reading.person.and_then(|ago| now.checked_sub(ago));
         let typed = person_at.is_some_and(|at| {
@@ -14868,6 +15094,7 @@ impl TurnEndState {
         match answered {
             // An act whose row stands unanswered got no reply: the replies stand.
             Some(_) if reading.pending_input && quiet && !settled_again => {}
+            _ if outage && (idle || kept_long) => {}
             Some((seen, own)) if idle || kept_long => {
                 if reading.wall.is_some() && !settled_again {
                     self.settling = Some(Settling {
@@ -14886,7 +15113,8 @@ impl TurnEndState {
             }
             Some(_) => self.replies = Replies::default(),
             // Another turn lifts the hold only on someone's prompt or keys, work or a limit going on; the program's own no-work turn while a reply is kept counts as an act's answer, a long one that ran no tool at a read wall or saying a kept reply again included.
-            None if awaited.is_none()
+            None if !outage
+                && awaited.is_none()
                 && reading.worked.is_some()
                 && self.replies.last().is_some()
                 && !(prompted || typed || went_on || reading.pending_input)
@@ -14919,7 +15147,8 @@ impl TurnEndState {
                 self.replies = Replies::default();
             }
             // The program's own turn this loop saw no busy spell of, its words other than the last point's and its reply other than the newest kept: a turn of no length, an act's answer if it ran no tool.
-            None if awaited.is_none()
+            None if !outage
+                && awaited.is_none()
                 && reading.worked.is_none()
                 && self.point_words.is_some_and(|w| w != words_mark(reading))
                 && self.replies.last().is_some_and(|k| k.mark != reply)
@@ -14966,11 +15195,14 @@ impl TurnEndState {
         } else if !self.landed || landing {
             self.by_wake = false;
         }
-        if reading.left_record && !reading.pending_input && !reading.wall_drawn() {
+        // A loop before this one left the exchange to the person: theirs again, but under Cruise,
+        // which never parks ([`Self::cruise_takes_exchange`]).
+        let left_record = reading.left_record && reading.autopilot != Autopilot::Cruise;
+        if left_record && !reading.pending_input && !reading.wall_drawn() {
             self.exchange = true;
             self.done = 2;
         }
-        if reading.left_record && reading.wall.is_some() && first_point {
+        if left_record && reading.wall.is_some() && first_point {
             self.exchange = true;
             self.exchange_work = self
                 .exchange_work
@@ -15407,6 +15639,13 @@ impl TurnEndState {
             )
     }
 
+    /// THE NEEDS A REPORT NAMES AT A BREAK OF THE AGENT'S OWN BACKGROUND WORK: a turn that ends
+    /// there reaches no point ([`Self::observe`] folds needs at points), so its `NEEDS YOU:` lines
+    /// are folded from the break's words `tail` here, as a point folds them.
+    pub fn fold_break_needs(&mut self, tail: Option<&str>) {
+        self.fold_needs(tail);
+    }
+
     fn fold_needs(&mut self, tail: Option<&str>) {
         let Some(t) = tail else {
             return;
@@ -15475,11 +15714,18 @@ impl TurnEndState {
             self.wall = None;
             self.limit_ended = true;
         }
+        let down = matches!(reading.reach, Reach::Down { .. });
         match &mut self.wall {
             Some(t) if t.class == class => {
                 let retried = retried || std::mem::take(&mut t.owed);
                 t.pointed |= at_point;
-                let anew = worked && !work_is_its_cause(kind) && (retried || t.seeded);
+                // An API wall's ladder ends when the agent works again, in a person's own turn as
+                // after a try (v6 §14.17.5.2); every other wall's track keeps its rung through one.
+                let anew = worked
+                    && !work_is_its_cause(kind)
+                    && (retried
+                        || t.seeded
+                        || (class == WallClass::Retry && reading.person_in_turn()));
                 if retried || (t.seeded && reading.worked.is_some()) {
                     t.since = now;
                 }
@@ -15493,8 +15739,10 @@ impl TurnEndState {
                     t.ups = 0;
                     t.exhausted = false;
                     t.fill = None;
+                    t.down = false;
                     self.limit_ended |= named_class(class);
                 }
+                t.down |= down;
                 if worked {
                     self.account_unmade = None;
                 }
@@ -15524,6 +15772,7 @@ impl TurnEndState {
                     seeded: false,
                     entitlement: false,
                     owed: false,
+                    down,
                     conversation: Conversation::Hostless,
                     program: None,
                     login: if class == WallClass::Auth {
@@ -15692,6 +15941,11 @@ impl TurnEndState {
         let land_text = reading.autopilot == Autopilot::Land
             && typed_text.as_deref().is_some_and(is_land_words);
         let land_given = land_text && typed_text.as_deref().is_some_and(|t| t.starts_with(LAND));
+        // A RESUME PAST A CONDITION UNDER LAND ([`cleared_text`]) goes on with what Land asked, so
+        // where Land's instruction was given its answer is judged as a land act's, as the land
+        // words the resume typed before slice 12a were.
+        let land_resumed = reading.autopilot == Autopilot::Land
+            && typed_text.as_deref().is_some_and(is_cleared_line);
         let check_or_land =
             typed_rule == Some(RULE_DONE_CHECK) || typed_rule.is_some_and(is_land_rule);
         self.cut_text = if check_or_land || carried.is_some() {
@@ -15715,23 +15969,28 @@ impl TurnEndState {
         if reading.autopilot != Autopilot::Land {
             self.leave_land_episode();
         }
+        // Land's instruction begins the hold whatever rule it went out under (a resume past a
+        // condition, a compaction's owed continuation), as the books a later loop seeds from read
+        // it, and that row stamps it.
+        let gave = land_given && !self.land.typed;
         match typed_rule {
             Some(RULE_LAND) => self.land.typed = true,
             Some(RULE_LAND_NUDGE) => self.land.nudges = self.land.nudges.saturating_add(1),
             _ => {}
         }
         if typed_rule == Some(RULE_LAND)
+            || gave
             || (self.land.hold.relanded && typed_rule.is_some_and(is_land_rule))
         {
             self.land.hold = HoldStart {
                 base: self.land.nudges,
                 ..HoldStart::default()
             };
-            self.land.unstamped = true;
+            self.land.unstamped = typed_rule;
         }
         self.land.typed |= land_given;
-        self.landing =
-            self.land.typed && (typed_rule.is_some_and(is_land_rule) || cut_land || land_text);
+        self.landing = self.land.typed
+            && (typed_rule.is_some_and(is_land_rule) || cut_land || land_text || land_resumed);
         self.after = match action {
             TurnEndAction::TypeCommand {
                 then: Then::Continue,
@@ -16588,7 +16847,7 @@ const fn ack_clause(ack: bool) -> &'static str {
     if ack { NEEDS_ACK } else { "" }
 }
 
-fn act_words(base: &str, after: &[&str], rules: Option<&str>) -> String {
+pub(super) fn act_words(base: &str, after: &[&str], rules: Option<&str>) -> String {
     let parts: Vec<Suffix<'_>> = after.iter().map(|a| Suffix::Fixed(a)).collect();
     fitted_act(base, &parts, rules)
 }
@@ -16971,9 +17230,9 @@ fn decide_unridden(
     let back_elsewhere = !state.landed()
         && state.login_track().is_some()
         && (login_back_elsewhere(state, reading) || login_left_renewed(state, reading));
-    let rests = state.task_done()
-        && !(reading.autopilot == Autopilot::Cruise && state.landed)
-        && !back_elsewhere;
+    // CRUISE NEVER RESTS (owner ruling 2026-10-26): no done task (a landing, a person's own
+    // exchange) holds a Cruise session; Land's landing and its person's exchange do.
+    let rests = state.task_done() && reading.autopilot != Autopilot::Cruise && !back_elsewhere;
     if reading.at_sign_in_menu() {
         let act = sign_in_menu_waits(state, reading, cfg, now, reading.taskless || rests)
             .unwrap_or_else(|| TurnEndAction::Escalate {
@@ -16988,17 +17247,11 @@ fn decide_unridden(
         return ended_at(trace, "no-task", TurnEndAction::Nothing);
     }
     note(trace, "no-task", None, || Outcome::Passed);
-    let login_resuming = reading.login_back
-        && !reading.interrupted
-        && matches!(reading.composer, Composer::Empty | Composer::Placeholder(_))
-        && state
-            .wall
-            .as_ref()
-            .is_some_and(|t| named_class(t.class) && t.attempts == 0);
+    // A PERSON AT THE KEYBOARD HOLDS EVERY ACT, the resume past their own `/login` at a limit
+    // too (owner rule 2026-10-25: never interrupt the person): it stays owed, one line once their
+    // grace lapses.
     let held = match (
-        (!login_resuming)
-            .then(|| person_hold(state, reading, cfg, now))
-            .flatten(),
+        person_hold(state, reading, cfg, now),
         login_quiet(state, reading, now),
     ) {
         (Some((until, _)), Some(quiet)) => (now < quiet).then_some((
@@ -17147,15 +17400,30 @@ fn act_at_point(
             act
         }
     };
-    let continue_as = |rule: &'static str| {
+    // A RESUME PAST A CONDITION TYPES ITS ONE LINE ([`cleared_text`]), never Cruise's or Land's
+    // prompt (v6 §14.17.5): those are typed at the agent's own turn end. A compaction's owed
+    // continuation is the mode's own ([`cleared_of`]), and so is a resume under Land before Land's
+    // instruction was given: the instruction is the one prompt, never a line and then it. A
+    // person's own exchange at the wall is theirs, which Land leaves to them
+    // ([`TurnEndState::exchange_at_wall`]): its resume is the line, so their request goes on.
+    let continue_as = |rule: &'static str, clearing: Clearing| {
         if rule == RULE_LIMIT_RESUME
             && let Some(act) = limit_end(state, reading, cfg, &budgeted)
         {
             return act;
         }
-        let text = match reading.autopilot {
-            Autopilot::Land => land_words(state, reading).0,
-            Autopilot::Cruise | Autopilot::Off => continuation_text(cfg, reading.rules.as_deref()),
+        let text = match (cleared_of(state, reading, rule), reading.autopilot) {
+            (Some(cleared), Autopilot::Land) if !state.land.typed && state.exchange_at_wall() => {
+                with_rules(cleared_text(cleared, clearing), reading.rules.as_deref())
+            }
+            (_, Autopilot::Land) if !state.land.typed => land_words(state, reading).0,
+            (Some(cleared), _) => {
+                with_rules(cleared_text(cleared, clearing), reading.rules.as_deref())
+            }
+            (None, Autopilot::Land) => land_words(state, reading).0,
+            (None, Autopilot::Cruise | Autopilot::Off) => {
+                continuation_text(cfg, reading.rules.as_deref())
+            }
         };
         budgeted(TurnEndAction::Type {
             text,
@@ -17229,7 +17497,7 @@ fn act_at_point(
             let held = login_opening_wait(state, now).unwrap_or(TurnEndAction::Nothing);
             if reading.login_screen.is_none() && reading.composer != Composer::Absent {
                 let back = login_back_elsewhere(state, reading)
-                    .then(|| type_as(RULE_LOGIN_BACK, &login_back_text(reading.program)));
+                    .then(|| type_as(RULE_LOGIN_BACK, &login_back_text()));
                 let act = match (login_wall_moves(state, reading, cfg, now), back) {
                     (Some(to), back) => Some(TurnEndAction::Restart {
                         why: Restart::Account {
@@ -17280,7 +17548,7 @@ fn act_past_walls(
     now: Instant,
     trace: &mut dyn Trace,
     budgeted: &dyn Fn(TurnEndAction) -> TurnEndAction,
-    continue_as: &dyn Fn(&'static str) -> TurnEndAction,
+    continue_as: &dyn Fn(&'static str, Clearing) -> TurnEndAction,
     type_as: &dyn Fn(&'static str, &str) -> TurnEndAction,
 ) -> TurnEndAction {
     // THE SAME REPLY AGAIN ([`TurnEndState::repeats`]), the screen's or the one a wall's track stands for: no act answers it
@@ -17309,7 +17577,7 @@ fn act_past_walls(
                 }),
             );
         }
-        return ended_at(trace, "owed", continue_as(rule));
+        return ended_at(trace, "owed", continue_as(rule, Clearing::Measured));
     }
     if let Some(act) = reset_continuation(state, cfg, now, continue_as) {
         return ended_at(trace, "reset-continuation", act);
@@ -17318,7 +17586,11 @@ fn act_past_walls(
     // Mac slept through it in the vendor's API retry ([`TurnEndState::woken_esc`]): the
     // continuation the limit's resume types, in its place.
     if reading.interrupted && state.woken_esc.is_some_and(|e| e.resume) {
-        return ended_at(trace, "woken-resume", continue_as(RULE_LIMIT_RESUME));
+        return ended_at(
+            trace,
+            "woken-resume",
+            continue_as(RULE_LIMIT_RESUME, Clearing::Measured),
+        );
     }
     if let Some(t) = &state.wall
         && named_class(t.class)
@@ -17555,7 +17827,15 @@ fn continue_policy(
     }
     let waited_on =
         state.managed && (done || asked.is_some()) && state.short <= MANAGED_SHORT_TURNS;
-    if !waited_on && let (Some(wait), Some(at)) = (state.short_wait(), state.point_at) {
+    // LAND'S INSTRUCTION WAITS NO BACK-OFF (v6 §14.10, slice 10a): where the act would be the
+    // instruction itself ([`land_words`] untyped, a done claim or no question), a switch to Land
+    // acts at once; its answers and nudges keep the ladder, and Cruise's pacing does not change.
+    let instruction_due =
+        reading.autopilot == Autopilot::Land && !state.land.typed && (done || asked.is_none());
+    if !waited_on
+        && !instruction_due
+        && let (Some(wait), Some(at)) = (state.short_wait(), state.point_at)
+    {
         let due = later(at, wait);
         if now < due {
             let secs = wait.as_secs();
@@ -17736,7 +18016,7 @@ fn resume_at_reset(
     since: Instant,
     attempts: usize,
     kind: WallKind,
-    continue_as: &dyn Fn(&'static str) -> TurnEndAction,
+    continue_as: &dyn Fn(&'static str, Clearing) -> TurnEndAction,
 ) -> TurnEndAction {
     // A wall no reset ends and none names is an entitlement: its own, slower
     // ladder. A usage window with no readable reset still lifts by itself, so it
@@ -17751,7 +18031,7 @@ fn resume_at_reset(
                 why: format!("{} (no reset named)", kind.name()),
                 wait: WaitKind::Other,
             },
-            Some(_) => continue_as(RULE_LIMIT_RESUME),
+            Some(_) => continue_as(RULE_LIMIT_RESUME, Clearing::Blind),
             None => TurnEndAction::Nothing,
         };
     }
@@ -17781,7 +18061,12 @@ fn resume_at_reset(
             wait: WaitKind::Other,
         };
     }
-    resume_limit(continue_as)
+    let clearing = if at_reset.is_some() {
+        Clearing::Measured
+    } else {
+        Clearing::Blind
+    };
+    continue_as(RULE_LIMIT_RESUME, clearing)
 }
 
 fn still_shown(t: &WallTrack, reading: &TurnEndReading) -> Option<(WallKind, TurnEndReading)> {
@@ -17894,7 +18179,7 @@ fn reset_continuation(
     state: &TurnEndState,
     cfg: &SupervisorConfig,
     now: Instant,
-    continue_as: &dyn Fn(&'static str) -> TurnEndAction,
+    continue_as: &dyn Fn(&'static str, Clearing) -> TurnEndAction,
 ) -> Option<TurnEndAction> {
     let owed = state.reset_resume.filter(|_| cfg.resume_limits)?;
     Some(if now < owed.due {
@@ -17967,8 +18252,10 @@ const fn limit_conversation_known(t: &WallTrack, reading: &TurnEndReading) -> bo
     )
 }
 
-fn resume_limit(continue_as: &dyn Fn(&'static str) -> TurnEndAction) -> TurnEndAction {
-    continue_as(RULE_LIMIT_RESUME)
+/// The limit's resume where its clearing was measured: its reset, the accounts probe, a login or an
+/// account move ([`Clearing::Measured`]).
+fn resume_limit(continue_as: &dyn Fn(&'static str, Clearing) -> TurnEndAction) -> TurnEndAction {
+    continue_as(RULE_LIMIT_RESUME, Clearing::Measured)
 }
 
 fn retry_wait(state: &TurnEndState, attempts: usize) -> Option<Duration> {
@@ -18062,7 +18349,7 @@ fn account_first(
     now: Instant,
     attempts: usize,
     today: TurnEndAction,
-    continue_as: &dyn Fn(&'static str) -> TurnEndAction,
+    continue_as: &dyn Fn(&'static str, Clearing) -> TurnEndAction,
 ) -> TurnEndAction {
     let Some(advice) = reading.advised() else {
         return today;
@@ -18360,7 +18647,7 @@ fn wall_action(
     now: Instant,
     kind: WallKind,
     budgeted: &dyn Fn(TurnEndAction) -> TurnEndAction,
-    continue_as: &dyn Fn(&'static str) -> TurnEndAction,
+    continue_as: &dyn Fn(&'static str, Clearing) -> TurnEndAction,
     type_as: &dyn Fn(&'static str, &str) -> TurnEndAction,
 ) -> TurnEndAction {
     let today = wall_own_act(
@@ -18463,7 +18750,7 @@ fn wall_own_act(
     now: Instant,
     kind: WallKind,
     budgeted: &dyn Fn(TurnEndAction) -> TurnEndAction,
-    continue_as: &dyn Fn(&'static str) -> TurnEndAction,
+    continue_as: &dyn Fn(&'static str, Clearing) -> TurnEndAction,
     type_as: &dyn Fn(&'static str, &str) -> TurnEndAction,
 ) -> TurnEndAction {
     let track = state.wall.as_ref().filter(|t| t.class == class_of(kind));
@@ -18489,7 +18776,12 @@ fn wall_own_act(
                     wait: WaitKind::Other,
                 };
             }
-            return continue_as(RULE_LIMIT_RESUME);
+            let clearing = if reading.reset_at.is_some() {
+                Clearing::Measured
+            } else {
+                Clearing::Blind
+            };
+            return continue_as(RULE_LIMIT_RESUME, clearing);
         }
         if cfg.resume_limits {
             resume_at_reset(state, reading, now, since, attempts, kind, continue_as)
@@ -18524,11 +18816,9 @@ fn wall_own_act(
             if let Some(why) = not_retried(reading.program, kind) {
                 return esc(format!("{} not retried ({why}): {msg}", kind.name()));
             }
-            let cause = match kind {
-                WallKind::ApiError { cause, .. } => cause,
-                _ => ApiCause::Server,
-            };
-            let ups = track.map_or(0, |t| t.ups);
+            if let Some(outage) = outage_of(kind, measured_down(reading, track), reading.program) {
+                return outage_wait(state, reading, now, track, outage, continue_as);
+            }
             let t = &state.timing;
             let act =
                 |rule: &'static str| type_as(rule, &wall_retry_text(rule, kind, reading.program));
@@ -18548,51 +18838,32 @@ fn wall_own_act(
                     .at(n)
                     .map_or(now, |w| later(since, w))
             };
-            match (cause, reading.reach) {
-                (ApiCause::Unreachable, Reach::Up { .. }) => wait_then(
-                    ups.checked_sub(1)
-                        .map_or(since, |n| rung(&t.net_backoff, n)),
-                    format!("api-error back but met again: retry {}", ups + 1),
-                    act(RULE_API_BACK),
-                ),
-                (
-                    ApiCause::Unreachable | ApiCause::Config | ApiCause::CutOff,
-                    Reach::Down { .. },
-                ) => wait_then(
-                    later(since, t.down_hold),
-                    "api-error: the API is unreachable; continuing when it is reachable, or \
-                         at this try"
-                        .to_string(),
-                    act(RULE_API_RETRY),
-                ),
-                (ApiCause::Unreachable, Reach::Unknown)
-                | (ApiCause::Config, Reach::Unknown | Reach::Up { .. }) => wait_then(
-                    rung(&t.net_backoff, attempts),
-                    format!("api-error retry {}", attempts + 1),
-                    act(RULE_API_RETRY),
-                ),
-                (ApiCause::CutOff, _) => wait_then(
-                    attempts
-                        .checked_sub(1)
-                        .map_or(since, |n| rung(&t.net_backoff, n)),
-                    format!("api-error cut off: retry {}", attempts + 1),
-                    act(RULE_API_CUTOFF),
-                ),
-                (ApiCause::Server, _) => wait_then(
-                    rung(&t.retry_backoff, attempts),
-                    format!("{} retry {}", kind.name(), attempts + 1),
-                    act(RULE_API_RETRY),
-                ),
-                (ApiCause::Request, _) => wait_then(
+            // The walls the agent can act on now: a refused request, an over-long reply, and a
+            // one-off cut while the route is not measured down.
+            match kind {
+                WallKind::ApiError {
+                    cause: ApiCause::Request,
+                    ..
+                } => wait_then(
                     rung(&t.refused_backoff, attempts),
                     format!("api-error refused: retry {}", attempts + 1),
                     act(RULE_API_RETRY),
                 ),
-                (ApiCause::Overlong, _) => wait_then(
+                WallKind::ApiError {
+                    cause: ApiCause::Overlong,
+                    ..
+                } => wait_then(
                     attempts
                         .checked_sub(1)
                         .map_or(since, |n| rung(&t.retry_backoff, n)),
                     format!("api-error overlong: retry {}", attempts + 1),
+                    act(RULE_API_CUTOFF),
+                ),
+                _ => wait_then(
+                    attempts
+                        .checked_sub(1)
+                        .map_or(since, |n| rung(&t.net_backoff, n)),
+                    format!("api-error cut off: retry {}", attempts + 1),
                     act(RULE_API_CUTOFF),
                 ),
             }
@@ -18610,7 +18881,7 @@ fn wall_own_act(
         }
         WallKind::ModelBucket { consent } => {
             if consent && attempts == 0 && cfg.continue_policy && cfg.usage_credits {
-                return continue_as(RULE_CONSENT);
+                return continue_as(RULE_CONSENT, Clearing::Measured);
             }
             let Some(fallback) = &cfg.model_fallback else {
                 return wait_out();
@@ -18679,7 +18950,7 @@ fn wall_own_act(
             }
             match &reading.login_shared {
                 Some(LoginShared::Back { .. }) if back => {
-                    return type_as(RULE_LOGIN_BACK, &login_back_text(reading.program));
+                    return type_as(RULE_LOGIN_BACK, &login_back_text());
                 }
                 Some(LoginShared::Carried { by }) => {
                     return TurnEndAction::WaitUntil {
@@ -18713,6 +18984,112 @@ fn wall_own_act(
             })
         }
     }
+}
+
+/// The outage wall the screen at `reading` shows ([`outage_of`]), none when its notice is off it.
+fn outage_shown(state: &TurnEndState, reading: &TurnEndReading) -> Option<Outage> {
+    let track = state.wall.as_ref().filter(|t| t.class == WallClass::Retry);
+    outage_of(
+        reading.wall?,
+        measured_down(reading, track),
+        reading.program,
+    )
+}
+
+/// Whether the host measures the route down now, or measured it so at the wall `track` stands
+/// for ([`WallTrack::down`]).
+fn measured_down(reading: &TurnEndReading, track: Option<&WallTrack>) -> bool {
+    matches!(reading.reach, Reach::Down { .. }) || track.is_some_and(|t| t.down)
+}
+
+/// THE OUTAGE AN API WALL OF `kind` IS (v6 §14.17.5.2), where the agent cannot act on it now and
+/// it is waited out in silence ([`outage_wait`]): an overload, a server error, an unreachable
+/// route or a certificate or proxy refusal, and a cut-off reply where the host measured the route
+/// `down` ([`measured_down`]). A refused request, an over-long reply, a one-off cut and agy's
+/// refused request ([`not_retried`]) keep their acts: the agent can act on them now.
+pub(crate) fn outage_of(kind: WallKind, down: bool, program: Program) -> Option<Outage> {
+    if not_retried(program, kind).is_some() {
+        return None;
+    }
+    match kind {
+        WallKind::ApiError {
+            cause: ApiCause::CutOff,
+            ..
+        } if !down => None,
+        _ => outage_named(kind),
+    }
+}
+
+/// The outage an outage wall of `kind` names ([`outage_of`] without its reach or program).
+const fn outage_named(kind: WallKind) -> Option<Outage> {
+    match kind {
+        WallKind::Overloaded => Some(Outage::Overload),
+        WallKind::ApiError {
+            cause: ApiCause::Server,
+            ..
+        } => Some(Outage::ApiError),
+        WallKind::ApiError {
+            cause: ApiCause::Unreachable | ApiCause::Config | ApiCause::CutOff,
+            ..
+        } => Some(Outage::Connection),
+        _ => None,
+    }
+}
+
+/// AN OUTAGE WALL'S WAIT (v6 §14.17.5.2): a wait, never a turn end, typing only its one line
+/// ([`RULE_OUTAGE_RESUME`], [`cleared_text`]). A connection error the host measures down types
+/// nothing while it reads so, deciding again each [`TurnEndTiming::outage_cap`] from the wall; its
+/// edge up measured after the wall's last try (the track's `since`, which each re-read after a try
+/// moves) resumes it once, *has cleared*. What nothing measures (an overload or a server error on
+/// any route, a connection error read unknown or up since before the last try) is tried blind,
+/// *may have cleared*, at [`TurnEndTiming::outage_first`] from the wall, doubling with each try to
+/// [`TurnEndTiming::outage_cap`].
+fn outage_wait(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    now: Instant,
+    track: Option<&WallTrack>,
+    outage: Outage,
+    continue_as: &dyn Fn(&'static str, Clearing) -> TurnEndAction,
+) -> TurnEndAction {
+    let t = &state.timing;
+    let since = track.map_or(now, |t| t.since);
+    let attempts = track.map_or(0, |t| t.attempts);
+    let wait = |until: Instant, tries: bool| TurnEndAction::WaitUntil {
+        until,
+        why: format!("waiting: {}", outage.words()),
+        wait: WaitKind::Outage {
+            wall: outage,
+            tries,
+        },
+    };
+    if outage == Outage::Connection {
+        match reading.reach {
+            Reach::Down { .. } => return wait(next_period(since, now, t.outage_cap), false),
+            Reach::Up { since: up } if up > since => {
+                return continue_as(RULE_OUTAGE_RESUME, Clearing::Measured);
+            }
+            Reach::Up { .. } | Reach::Unknown => {}
+        }
+    }
+    let n = u32::try_from(attempts).unwrap_or(u32::MAX);
+    let rung = later(
+        since,
+        crate::supervise::ladder::doubling(t.outage_first, n, t.outage_cap),
+    );
+    if now < rung {
+        return wait(rung, true);
+    }
+    continue_as(RULE_OUTAGE_RESUME, Clearing::Blind)
+}
+
+/// The first of `since`'s whole `period`s that ends after `now`: a wait that decides again on its
+/// own clock, the same deadline at each decision within one period (never less than a second).
+fn next_period(since: Instant, now: Instant, period: Duration) -> Instant {
+    let period = period.max(Duration::from_secs(1));
+    let whole = now.saturating_duration_since(since).as_nanos() / period.as_nanos();
+    let n = u32::try_from(whole.saturating_add(1)).unwrap_or(u32::MAX);
+    later(since, period.saturating_mul(n))
 }
 
 fn memory_restart(cfg: &SupervisorConfig, reading: &TurnEndReading) -> TurnEndAction {

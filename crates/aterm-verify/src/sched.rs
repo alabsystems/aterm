@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Concurrent stage scheduler ([`Lane`], [`StageSpec::after_stages`],
-//! [`crate::plan::Lane::AfterCompile`], [`awaited`], [`check_waits`]).
+//! [`crate::plan::StageId::opens_windows`], [`crate::plan::Lane::AfterCompile`], [`awaited`],
+//! [`check_waits`]).
 
 use std::sync::{Condvar, Mutex};
 
@@ -35,7 +36,8 @@ pub(crate) fn ready(
         !finished
             && (me.exclusive
                 || earlier.exclusive
-                || (earlier.lane == me.lane && me.lane != Lane::Pure))
+                || (earlier.lane == me.lane && me.lane != Lane::Pure)
+                || (earlier.id.opens_windows() && me.id.opens_windows()))
     });
     !blocked && !(me.exclusive && running > 0) && awaited(specs, i).all(|j| done[j])
 }
@@ -375,10 +377,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn windowed_stages_serialize_without_blocking_independent_headless_work() {
+        let wanted = crate::checks::stages_of(&[
+            crate::Check::Lint,
+            crate::Check::Census,
+            crate::Check::Browser,
+            crate::Check::Appkit,
+        ]);
+        let specs: Vec<_> = crate::plan::declared(&crate::Scope::workspace())
+            .into_iter()
+            .filter(|s| wanted.contains(&s.id))
+            .collect();
+        let at = |id| specs.iter().position(|s| s.id == id).expect("planned");
+        let browser = at(StageId::BrowserLane);
+        let redraw = at(StageId::RedrawConformance);
+        let objc = at(StageId::ObjcDrives);
+        let tippy = at(StageId::Tippy);
+        let census = at(StageId::Census);
+        let mut started = vec![false; specs.len()];
+        let mut done = vec![false; specs.len()];
+
+        assert!(ready(&specs, &started, &done, 0, browser));
+        assert!(!ready(&specs, &started, &done, 0, redraw));
+        started[browser] = true;
+        assert!(!ready(&specs, &started, &done, 1, redraw));
+        assert!(!ready(&specs, &started, &done, 1, objc));
+        assert!(ready(&specs, &started, &done, 1, tippy));
+        assert!(ready(&specs, &started, &done, 1, census));
+
+        started[tippy] = true;
+        done[browser] = true;
+        assert!(ready(&specs, &started, &done, 1, redraw));
+        started[redraw] = true;
+        assert!(!ready(&specs, &started, &done, 2, objc));
+        assert!(ready(&specs, &started, &done, 2, census));
+        done[redraw] = true;
+        assert!(ready(&specs, &started, &done, 1, objc));
+    }
+
     /// Drive the scheduler's rule without threads: start every stage that is
     /// ready (re-checking after each start, as the real waiters do), then finish
     /// one running stage chosen by `pick`.
     fn model_check(specs: &[StageSpec], mut pick: impl FnMut(&[usize]) -> usize) {
+        model_check_limit(specs, &mut pick, usize::MAX);
+    }
+
+    fn model_check_limit(
+        specs: &[StageSpec],
+        mut pick: impl FnMut(&[usize]) -> usize,
+        maximum: usize,
+    ) {
         let n = specs.len();
         let (mut started, mut done) = (vec![false; n], vec![false; n]);
         let mut running: Vec<usize> = Vec::new();
@@ -387,9 +436,20 @@ mod tests {
                 let next = (0..n).find(|&i| ready(specs, &started, &done, running.len(), i));
                 let Some(i) = next else { break };
                 assert!(
+                    running.len() < maximum,
+                    "{} would spend an admitted CPU share twice",
+                    specs[i].title
+                );
+                assert!(
                     running.iter().all(|&r| !specs[r].exclusive)
                         && (!specs[i].exclusive || running.is_empty()),
                     "{} started beside an exclusive stage, or beside {running:?} while exclusive",
+                    specs[i].title
+                );
+                assert!(
+                    !specs[i].id.opens_windows()
+                        || running.iter().all(|&r| !specs[r].id.opens_windows()),
+                    "{} started beside another stage that opens desktop windows",
                     specs[i].title
                 );
                 started[i] = true;
@@ -402,6 +462,32 @@ mod tests {
             let k = pick(&running);
             let finished = running.remove(k);
             done[finished] = true;
+        }
+    }
+
+    #[test]
+    fn managed_plans_spend_their_share_on_one_stage_without_losing_checks() {
+        for checks in selections() {
+            for scope in [
+                crate::Scope::workspace(),
+                crate::Scope::crate_only("aterm-grid"),
+                crate::Scope::changed("main", vec![], true),
+            ] {
+                let plain = crate::plan::plan(&ctx(&checks, scope.clone()));
+                let mut managed = ctx(&checks, scope);
+                managed.env.build_slot_held = Some("1".into());
+                managed.env.cargo_build_jobs = Some("6".into());
+                let managed = crate::plan::plan(&managed);
+                assert_eq!(plain.len(), managed.len());
+                for (old, new) in plain.iter().zip(&managed) {
+                    assert_eq!(
+                        (old.id, &old.title, old.lane, &old.after_stages),
+                        (new.id, &new.title, new.lane, &new.after_stages)
+                    );
+                }
+                model_check_limit(&managed, |_| 0, 1);
+                model_check_limit(&managed, |running| running.len() - 1, 1);
+            }
         }
     }
 

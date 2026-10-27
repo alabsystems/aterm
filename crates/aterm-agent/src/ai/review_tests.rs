@@ -1170,3 +1170,247 @@ fn reviewers_keep_the_frozen_login_instead_of_inherited_credential_overrides() {
         "inherited credential changed the frozen-login review/Store record: {wrong:?}"
     );
 }
+
+#[test]
+fn a_pooled_codex_reviewer_exports_serving_auth_path_unless_custom_home_or_keyring() {
+    use crate::ai::facts::CliAccounts;
+
+    let b = machine(&["codex"]);
+    let shim = b.pkg.agents_dir().join("codex");
+    let home = b.home.display().to_string();
+    let staged_auth = "/state/logins/codex/work+1/auth.json";
+
+    let mut pooled = facts_of(&CODEX, shim.clone());
+    pooled.pool = Some(CliAccounts {
+        roster: PathBuf::from("/config/accounts-codex.toml"),
+        rows: 2,
+        enrolled: 1,
+        serving_login: Some(("CODEX_AUTH_PATH", Some(staged_auth.to_string()))),
+        ..CliAccounts::default()
+    });
+    let base_vars: Vec<(String, String)> = [
+        ("HOME", home.as_str()),
+        ("PATH", "/usr/bin"),
+        ("CODEX_AUTH_PATH", "/stale/inherited/auth.json"),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+    .collect();
+    let var_default = |k: &str| {
+        base_vars
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.clone())
+    };
+    let env_staged = reviewer_env(&CODEX, &pooled, &var_default, &base_vars);
+    let auth_vals: Vec<&str> = env_staged
+        .iter()
+        .filter(|(k, _)| k == "CODEX_AUTH_PATH")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(auth_vals, [staged_auth]);
+
+    // Default-home serving row (`None` value) unsets CODEX_AUTH_PATH cleanly.
+    let mut default_row = pooled.clone();
+    if let Some(p) = &mut default_row.pool {
+        p.serving_login = Some(("CODEX_AUTH_PATH", None));
+    }
+    let env_default_row = reviewer_env(&CODEX, &default_row, &var_default, &base_vars);
+    assert!(
+        !env_default_row.iter().any(|(k, _)| k == "CODEX_AUTH_PATH"),
+        "{env_default_row:?}"
+    );
+
+    // Custom CODEX_HOME keeps CODEX_HOME and does not inject a default-home pool's CODEX_AUTH_PATH.
+    let mut custom_vars = base_vars.clone();
+    custom_vars.push(("CODEX_HOME".to_string(), "/custom/codex".to_string()));
+    let var_custom = |k: &str| {
+        custom_vars
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.clone())
+    };
+    let env_custom = reviewer_env(&CODEX, &pooled, &var_custom, &custom_vars);
+    assert!(
+        env_custom.contains(&("CODEX_HOME".to_string(), "/custom/codex".to_string()))
+            && !env_custom.iter().any(|(k, _)| k == "CODEX_AUTH_PATH"),
+        "{env_custom:?}"
+    );
+
+    // Keyring store suppresses CODEX_AUTH_PATH injection as well.
+    let mut keyring = pooled;
+    keyring.hidden_store = true;
+    let env_keyring = reviewer_env(&CODEX, &keyring, &var_default, &base_vars);
+    assert!(
+        !env_keyring.iter().any(|(k, _)| k == "CODEX_AUTH_PATH"),
+        "{env_keyring:?}"
+    );
+}
+
+#[test]
+fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_account_serves() {
+    use crate::ai::facts::{Machine, gather};
+    use crate::ai::state::assess;
+    use crate::ai::store::Records;
+    use crate::harness::accounts::{self, Cli, Store as AccountStore};
+
+    let b = machine(&["codex"]);
+    let now_val = 1_800_000_000_i64;
+    let config = b.dir.path().join("config");
+    std::fs::create_dir_all(&config).expect("config");
+    let claude_roster = config.join("accounts.toml");
+    let work_1_base = b.home.join(".aterm/logins/codex/work-1");
+    let work_2_base = b.home.join(".aterm/logins/codex/work-2");
+    std::fs::write(
+        config.join("accounts-codex.toml"),
+        format!(
+            "[[account]]\nlabel = \"work-1\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"work-1@example.test\"\n\n\
+             [[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"work-2@example.test\"\n",
+            work_1_base.display().to_string(),
+            work_2_base.display().to_string(),
+        ),
+    )
+    .expect("codex roster");
+    let acct_store = AccountStore::at_for(&b.state, Cli::Codex, &b.home);
+    let staging_1 = b.home.join(".aterm/logins/codex/work-1+1");
+    let staging_2 = b.home.join(".aterm/logins/codex/work-2+1");
+    for (label, base, staging) in [
+        ("work-1", &work_1_base, &staging_1),
+        ("work-2", &work_2_base, &staging_2),
+    ] {
+        std::fs::create_dir_all(staging).expect("staging");
+        std::fs::write(staging.join("auth.json"), "\u{0}opaque").expect("auth");
+        let mut note = None;
+        acct_store
+            .transact_logins(now_val, &mut note, |state, logins| {
+                Ok(accounts::note_renewed(
+                    state,
+                    logins,
+                    label,
+                    Some(&base.display().to_string()),
+                    &staging.display().to_string(),
+                    None,
+                    now_val - 60,
+                ))
+            })
+            .expect("renew");
+    }
+    // Pin work-1 active (unpinned) so work-1 serves first.
+    let mut note = None;
+    acct_store
+        .transact(now_val, &mut note, |state| {
+            state.active = Some("work-1".to_string());
+            state.pinned = false;
+            Ok(Vec::new())
+        })
+        .expect("active work-1");
+
+    let home_str = b.home.display().to_string();
+    let vars = vec![("HOME".to_string(), home_str.clone())];
+    let var = |k: &str| (k == "HOME").then(|| home_str.clone());
+    let store = Store::at(&b.state);
+
+    let m1 = Machine {
+        now: now_val,
+        home: Some(b.home.clone()),
+        var: &var,
+        pkg: Some(b.pkg.clone()),
+        exclude: Vec::new(),
+        records: store.load().unwrap_or_else(|_| Records::default()),
+        harness_state: Some(b.state.clone()),
+        roster: Some(claude_roster.clone()),
+    };
+    let f1 = gather(&m1, &CODEX);
+    assert_eq!(
+        f1.pool.as_ref().and_then(|p| p.serving_label.as_deref()),
+        Some("work-1")
+    );
+    let r1 = assess(&f1, true, now_val);
+    assert_eq!(r1.state, State::Ok);
+
+    // Run review: work-1 hits usage limit -> recorded on work-1 in accounts-codex, not CLI-wide store.
+    let runner_limit = FakeRunner::with(|_| Ok(ran(1, "", "ERROR: You've hit your usage limit")));
+    let now = || now_val;
+    let host_limit = Host {
+        runner: &runner_limit,
+        var: &var,
+        vars: &vars,
+        store: &store,
+        now: &now,
+    };
+    let rows1 = [r1];
+    let reviewers: Vec<&'static Connector> = vec![&CODEX];
+    let cands1 = candidates(&reviewers, None, "claude", &rows1, now_val);
+    let facts1 = vec![f1];
+    let answers1 = run_review(
+        &host_limit,
+        &cands1,
+        &facts1,
+        &Ask {
+            change: &change(),
+            asker: "claude",
+            words: None,
+            count: 1,
+            budget: Duration::from_secs(5),
+            level: Level::Yolo,
+        },
+    );
+    assert_eq!(answers1[0].verdict, Verdict::Limit);
+    assert_eq!(
+        store.load().expect("ai store").of("codex").limited_until,
+        None,
+        "isolated pool account limit does not poison CLI-wide connections.json"
+    );
+
+    // Next gather + assess immediately rotates to work-2 and serves cleanly!
+    let m2 = Machine {
+        records: store.load().expect("ai store"),
+        ..m1
+    };
+    let f2 = gather(&m2, &CODEX);
+    assert_eq!(
+        f2.pool.as_ref().and_then(|p| p.serving_label.as_deref()),
+        Some("work-2")
+    );
+    let r2 = assess(&f2, true, now_val);
+    assert_eq!(r2.state, State::Ok, "{}", r2.fact);
+    let expected_auth_2 = staging_2.join("auth.json").display().to_string();
+    let runner_ok = FakeRunner::with(move |call| {
+        assert!(
+            call.env
+                .contains(&("CODEX_AUTH_PATH".to_string(), expected_auth_2.clone(),))
+        );
+        let out_file = call
+            .args
+            .windows(2)
+            .find_map(|w| (w[0] == "-o").then_some(&w[1]))
+            .expect("-o path");
+        std::fs::write(out_file, "no findings").expect("write answer");
+        Ok(ran(0, "", ""))
+    });
+    let host_ok = Host {
+        runner: &runner_ok,
+        ..host_limit
+    };
+    let rows2 = [r2];
+    let cands2 = candidates(&reviewers, None, "claude", &rows2, now_val);
+    let facts2 = vec![f2];
+    let answers2 = run_review(
+        &host_ok,
+        &cands2,
+        &facts2,
+        &Ask {
+            change: &change(),
+            asker: "claude",
+            words: None,
+            count: 1,
+            budget: Duration::from_secs(5),
+            level: Level::Yolo,
+        },
+    );
+    assert_eq!(answers2[0].verdict, Verdict::Served);
+    assert_eq!(
+        store.load().expect("ai store").of("codex").used_at,
+        Some(now_val)
+    );
+}

@@ -108,10 +108,11 @@ fn metadata_json(
             .join(",")
     };
     format!(
-        "{{\"packages\":[{{\"name\":\"ay\",\"version\":\"0.2.0\",\"manifest_path\":\"{}\"}}],\
+        "{{\"packages\":[{{\"name\":\"ay\",\"version\":\"0.2.0\",\"manifest_path\":{}}}],\
          \"metadata\":{{\"atpkg\":{{\"expose\":[{}],\"bundle\":[{}],\"build-args\":[{}],\
          \"bundle-only\":{only}}}}}}}",
-        checkout.join("Cargo.toml").display(),
+        aterm_json::to_string(&checkout.join("Cargo.toml").to_string_lossy().as_ref())
+            .expect("manifest path json"),
         list(expose),
         list(bundle),
         list(args)

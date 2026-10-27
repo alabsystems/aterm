@@ -57,7 +57,7 @@ fn a_reader_hears_claudes_words_under_the_glass() {
     let presented = presented.value();
     assert!(
         presented.contains(NOTICE.text)
-            && presented.contains("  YOLO on")
+            && !presented.contains("bypass permissions on")
             && presented.contains(LOGO),
         "NEGATIVE CONTROL: the presented frame holds the glass's words and the rule's lockup: {presented}"
     );
@@ -70,7 +70,7 @@ fn a_reader_hears_claudes_words_under_the_glass() {
                 .value()
                 .contains(aterm_phase::anchor!("notice.updated_details"))
             && !heard.value().contains(NOTICE.short)
-            && !heard.value().contains("YOLO")
+            && !heard.value().contains("yolo")
             && !heard.value().contains(LOGO),
         "{}",
         heard.value()
@@ -173,8 +173,8 @@ fn a_split_panes_reader_hears_its_own_claudes_words() {
         None,
     );
     assert!(
-        presented.value().contains("  YOLO on"),
-        "NEGATIVE CONTROL: the glass relabelled the pill: {}",
+        !presented.value().contains("bypass permissions on"),
+        "NEGATIVE CONTROL: the glass dropped the pill from its mode row: {}",
         presented.value()
     );
     let tree = app.grid_a11y_tree(wid, None).expect("the grid's tree");

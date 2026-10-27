@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! rustup's toolchains for the STOCK EXCEPTION lanes (`verify cells` and wasm perf).
+//! rustup's toolchains for the STOCK EXCEPTION lanes (`verify cells` and wasm perf). The
+//! rustup they drive is the `rustup` row of [`aterm_uds::host::TOOLS`], found by that row's
+//! resolver alone (`aterm_uds::host::tool("rustup").locate()`).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -9,9 +11,7 @@ use std::path::{Path, PathBuf};
 use aterm_uds::output::CommandOutput as _;
 use aterm_uds::spawnfd::{Command, command};
 
-pub use aterm_toolchain::rustup::{
-    RUSTUP_LOOKED, find_rustup, find_rustup_in, lists_target, toolchain_names,
-};
+pub use aterm_toolchain::rustup::{lists_target, toolchain_names};
 
 /// Does `rustup`'s toolchain `name` carry `triple`'s std?
 #[must_use]

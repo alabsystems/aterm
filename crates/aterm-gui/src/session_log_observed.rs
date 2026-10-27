@@ -857,8 +857,13 @@ impl SessionLog {
             F::MailLanded { post, off, why } => {
                 let f = with(Fields::new(), Key::Inbox, Some(Val::U(post)));
                 let f = with(f, Key::Off, off.map(Val::U));
+                // A landing carries `off=`; a retirement carries none and says why, by the bridge
+                // or, for aterm's own two (`not-carried`, `log-replaced`), by aterm.
                 let (f, by) = match why {
-                    Some(w) => (word(f, Key::Why, w), aterm_slog::Actor::Aterm),
+                    Some(w) if w.aterms_own() => {
+                        (word(f, Key::Why, w.word()), aterm_slog::Actor::Aterm)
+                    }
+                    Some(w) => (word(f, Key::Why, w.word()), aterm_slog::Actor::Bridge),
                     None => (f, aterm_slog::Actor::Bridge),
                 };
                 (Kind::MailLanded, by, f)
@@ -924,6 +929,18 @@ impl SessionLog {
                 let f = with(Fields::new(), Key::Off, Some(Val::U(from)));
                 let f = with(f, Key::Floor, Some(Val::U(to)));
                 let f = with(f, Key::Lost, records.map(Val::U));
+                (Kind::MailGap, aterm_slog::Actor::Bridge, f)
+            }
+            F::TopicGap { from, to, topic } => {
+                let f = with(Fields::new(), Key::Off, Some(Val::U(from)));
+                let f = with(f, Key::Floor, Some(Val::U(to)));
+                let f = with(
+                    f,
+                    Key::Fp,
+                    aterm_slog::ShortId::new(&format!("{:016x}", name_fp(Some(topic))))
+                        .map(Val::Id),
+                );
+                let f = text(f, Key::TopicName, topic);
                 (Kind::MailGap, aterm_slog::Actor::Bridge, f)
             }
         };

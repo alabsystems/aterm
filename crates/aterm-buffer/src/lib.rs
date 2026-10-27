@@ -44,6 +44,10 @@ pub struct KeyframeId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WitnessId(pub u64);
 
+/// A handle into the host-op store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostOpId(pub u64);
+
 /// A committed-line identity, stable across scroll and eviction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LineId(pub u64);
@@ -120,10 +124,17 @@ pub enum Op {
         rows: u16,
         cols: u16,
     },
+    /// The host cell-pixel box was updated to `width`×`height`.
+    CellPx {
+        width: u16,
+        height: u16,
+    },
     /// A keyframe (serialized `TerminalCheckpoint`) taken at a parser-ground boundary.
     Keyframe(KeyframeId),
     /// A snapshot of the live screen a replay to this point must equal.
     Witness(WitnessId),
+    /// A host-side terminal mutation recorded in the host-op store under this [`HostOpId`].
+    Host(HostOpId),
 }
 
 /// A subscription cursor, the synchronous read face of the event log.
@@ -217,6 +228,11 @@ impl EventLog {
                 .min(self.ring.len()),
         };
         self.ring.range(start..)
+    }
+
+    /// Drop every live event and the ring's storage; `seq` keeps counting from the head.
+    pub fn forget(&mut self) {
+        self.ring = std::collections::VecDeque::new();
     }
 }
 
@@ -440,6 +456,8 @@ pub const fn encode_spine_event_wire(event: &Event) -> [u8; SPINE_EVENT_WIRE_BYT
         Op::Resize { rows, cols } => (6u8, ((rows as u64) << 16) | (cols as u64)),
         Op::Keyframe(id) => (7u8, id.0),
         Op::Witness(id) => (8u8, id.0),
+        Op::CellPx { width, height } => (9u8, ((width as u64) << 16) | (height as u64)),
+        Op::Host(id) => (10u8, id.0),
     };
     let [s0, s1, s2, s3, s4, s5, s6, s7] = event.seq.0.to_le_bytes();
     let pb = payload.to_le_bytes();
@@ -484,6 +502,16 @@ pub const fn decode_spine_event_wire(bytes: &[u8]) -> Option<Event> {
         }
         7 => Op::Keyframe(KeyframeId(payload)),
         8 => Op::Witness(WitnessId(payload)),
+        9 => {
+            if payload > 0xFFFF_FFFF {
+                return None;
+            }
+            Op::CellPx {
+                width: (payload >> 16) as u16,
+                height: (payload & 0xFFFF) as u16,
+            }
+        }
+        10 => Op::Host(HostOpId(payload)),
         _ => return None,
     };
     Some(Event { seq, op, ts })
@@ -816,6 +844,22 @@ mod tests {
     }
 
     #[test]
+    fn a_forgotten_log_keeps_no_event_and_counts_on_from_its_head() {
+        let mut log = EventLog::default();
+        for i in 0..5 {
+            let _ = log.append_at(Op::Resize { rows: 1, cols: 1 }, Ticks(i));
+        }
+        log.forget();
+        assert_eq!(log.live().count(), 0);
+        assert!(log.oldest_live().is_none() && log.newest_live().is_none());
+        assert_eq!(log.total(), 5, "the spine's length is kept");
+        let (seq, evicted) = log.append_at(Op::Resize { rows: 2, cols: 2 }, Ticks(9));
+        assert_eq!(seq, Seq(6), "seq counts on from the head");
+        assert!(evicted.is_none());
+        assert_eq!(log.live_after(Seq(0)).count(), 1);
+    }
+
+    #[test]
     fn transact_is_atomic_and_cc_guarded() {
         let mut s = Surface::new();
         s.apply(&write_cap(), Edit::AppendLine("base".into()));
@@ -846,6 +890,8 @@ mod tests {
 
     #[test]
     fn spine_event_and_cursor_wire_roundtrip() {
+        assert_eq!(std::mem::size_of::<Op>(), 16);
+        assert_eq!(std::mem::size_of::<Event>(), 32);
         for op in [
             Op::Append(LineId(1)),
             Op::Write(LineId(2)),
@@ -853,8 +899,13 @@ mod tests {
             Op::RawIn(BlobId(4)),
             Op::Reply(BlobId(5)),
             Op::Resize { rows: 24, cols: 80 },
+            Op::CellPx {
+                width: 10,
+                height: 20,
+            },
             Op::Keyframe(KeyframeId(7)),
             Op::Witness(WitnessId(8)),
+            Op::Host(HostOpId(9)),
         ] {
             let ev = Event {
                 seq: Seq(42),

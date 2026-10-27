@@ -99,7 +99,7 @@ pub fn hex(rgb: Rgb) -> String {
     format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
 }
 
-fn parse_hex(text: &str) -> Result<Rgb, String> {
+pub(crate) fn parse_hex(text: &str) -> Result<Rgb, String> {
     let t = text.trim();
     let t = t.strip_prefix('#').unwrap_or(t);
     let bad = || format!("not an RRGGBB colour: {}", crate::util::py_repr(text));
@@ -117,7 +117,7 @@ pub fn round_to(x: f64, places: usize) -> f64 {
 }
 
 /// Each channel's median (the upper one of an even count), or `None` for no pixels.
-fn median(px: &[Rgb]) -> Option<Rgb> {
+pub(crate) fn median(px: &[Rgb]) -> Option<Rgb> {
     if px.is_empty() {
         return None;
     }
@@ -132,7 +132,7 @@ fn median(px: &[Rgb]) -> Option<Rgb> {
 }
 
 /// The most common colour, the first seen among equals; `None` for no pixels.
-fn mode(px: impl IntoIterator<Item = Rgb>) -> Option<Rgb> {
+pub(crate) fn mode(px: impl IntoIterator<Item = Rgb>) -> Option<Rgb> {
     let mut counts: HashMap<Rgb, (usize, usize)> = HashMap::new();
     for (i, p) in px.into_iter().enumerate() {
         counts.entry(p).or_insert((0, i)).0 += 1;
@@ -144,7 +144,7 @@ fn mode(px: impl IntoIterator<Item = Rgb>) -> Option<Rgb> {
 }
 
 /// The first colour of `px` that contrasts most with `against`.
-fn most_contrasting(px: &[Rgb], against: Rgb) -> Option<Rgb> {
+pub(crate) fn most_contrasting(px: &[Rgb], against: Rgb) -> Option<Rgb> {
     let mut best: Option<(f64, Rgb)> = None;
     for &p in px {
         let c = contrast(p, against);
@@ -174,7 +174,7 @@ pub struct PxBox {
 }
 
 impl PxBox {
-    const fn holds(self, x: i64, y: i64) -> bool {
+    pub(crate) const fn holds(self, x: i64, y: i64) -> bool {
         self.x0 <= x && x < self.x1 && self.y0 <= y && y < self.y1
     }
 }
@@ -231,12 +231,12 @@ impl Image {
         }
     }
 
-    fn at(&self, x: usize, y: usize) -> Rgb {
+    pub(crate) fn at(&self, x: usize, y: usize) -> Rgb {
         self.px[y * self.width + x]
     }
 
     /// The colours of `b`, clipped to the frame, row-major.
-    fn region(&self, b: PxBox) -> Vec<Rgb> {
+    pub(crate) fn region(&self, b: PxBox) -> Vec<Rgb> {
         let clip = |v: i64, hi: usize| usize::try_from(v.max(0)).unwrap_or(0).min(hi);
         let (x0, x1) = (clip(b.x0, self.width), clip(b.x1, self.width));
         let (y0, y1) = (clip(b.y0, self.height), clip(b.y1, self.height));
@@ -282,11 +282,11 @@ impl Grid {
         }
     }
 
-    fn holds(&self, row: i64, col: i64) -> bool {
+    pub(crate) fn holds(&self, row: i64, col: i64) -> bool {
         (0..self.rows).contains(&row) && (0..self.cols).contains(&col)
     }
 
-    fn describe(&self) -> J {
+    pub(crate) fn describe(&self) -> J {
         J::obj([
             ("origin", J::Arr(vec![J::Int(self.ox), J::Int(self.oy)])),
             ("cell", J::Arr(vec![J::Int(self.cw), J::Int(self.ch)])),
@@ -353,7 +353,7 @@ pub fn grid_from_dims(text: &str) -> Result<Grid, String> {
     })
 }
 
-fn parse_pair(text: &str, sep: char, what: &str) -> Result<(i64, i64), String> {
+pub(crate) fn parse_pair(text: &str, sep: char, what: &str) -> Result<(i64, i64), String> {
     let lower = text.to_lowercase();
     let parts: Vec<&str> = lower.split(sep).collect();
     if parts.len() != 2 {
@@ -504,16 +504,8 @@ fn measure_cell(
         ),
         ("core_px", J::Int(core_px)),
     ]);
-    let solid = SOLID_SHARE * contrast(extreme, clean_ground);
-    let local = local_judge(frame, clean, b, clean_ground, |c| {
-        contrast(c, clean_ground) >= solid
-    })
-    .or_else(|| {
-        local_judge(frame, clean, b, clean_ground, |c| {
-            c != clean_ground && (luminance(c) - ground_luma).abs() >= reach
-        })
-    });
-    if let Some(l) = local {
+    if let Some(l) = solid_ink_ratios(frame, clean, b, clean_ground, extreme).map(|r| Local::of(&r))
+    {
         out.extend(kv(vec![
             ("local_contrast", J::Float(round_to(l.worst_row, 2))),
             ("local_min", J::Float(round_to(l.worst_px, 2))),
@@ -524,7 +516,7 @@ fn measure_cell(
     out
 }
 
-/// What [`local_judge`] found in one glyph.
+/// What the local measure found in one glyph ([`Local::of`] its [`solid_ink_ratios`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Local {
     /// The worst pixel row's lower median ratio.
@@ -572,23 +564,20 @@ fn ring_ground(frame: &Image, clean: &Image, ground: Rgb, x: i64, y: i64) -> Opt
     None
 }
 
-/// Each pixel of `b` whose clean colour is `ink`, judged in the frame against its [`ring_ground`]; `None` when no
-/// such pixel has ground that near.
-fn local_judge(
+/// Each pixel of `b` whose clean colour is `ink`, judged in the frame against its [`ring_ground`], as `(y, ratio)` in
+/// row-major order; a pixel with no ground that near is left out.
+fn local_ratios(
     frame: &Image,
     clean: &Image,
     b: PxBox,
     ground: Rgb,
     ink: impl Fn(Rgb) -> bool,
-) -> Option<Local> {
+) -> Vec<(i64, f64)> {
     let clip = |v: i64, hi: usize| v.clamp(0, i64::try_from(hi).unwrap_or(i64::MAX));
     let (x0, x1) = (clip(b.x0, frame.width), clip(b.x1, frame.width));
     let (y0, y1) = (clip(b.y0, frame.height), clip(b.y1, frame.height));
-    let (mut worst_row, mut worst_px) = (f64::INFINITY, f64::INFINITY);
-    let (mut under, mut judged) = (0i64, 0i64);
-    let mut row = Vec::new();
+    let mut out = Vec::new();
     for y in y0..y1 {
-        row.clear();
         for x in x0..x1 {
             let (xu, yu) = (
                 usize::try_from(x).unwrap_or(0),
@@ -600,23 +589,58 @@ fn local_judge(
             let Some(g) = ring_ground(frame, clean, ground, x, y) else {
                 continue;
             };
-            let r = contrast(frame.at(xu, yu), g);
-            row.push(r);
-            worst_px = worst_px.min(r);
-            under += i64::from(r < LEGIBLE);
-            judged += 1;
+            out.push((y, contrast(frame.at(xu, yu), g)));
         }
-        if !row.is_empty() {
+    }
+    out
+}
+
+/// The solid ink of the clean glyph in `b` (its pixels that read at least [`SOLID_SHARE`] of `extreme`'s ratio
+/// against `ground`; where none has ground that near, its core, [`CORE_SHARE`] of the way to `extreme` in luminance),
+/// each pixel judged in the frame by [`local_ratios`]; `None` when neither has ground that near.
+pub(crate) fn solid_ink_ratios(
+    frame: &Image,
+    clean: &Image,
+    b: PxBox,
+    ground: Rgb,
+    extreme: Rgb,
+) -> Option<Vec<(i64, f64)>> {
+    let solid = SOLID_SHARE * contrast(extreme, ground);
+    let judged = local_ratios(frame, clean, b, ground, |c| contrast(c, ground) >= solid);
+    if !judged.is_empty() {
+        return Some(judged);
+    }
+    let ground_luma = luminance(ground);
+    let reach = CORE_SHARE * (luminance(extreme) - ground_luma).abs();
+    let judged = local_ratios(frame, clean, b, ground, |c| {
+        c != ground && (luminance(c) - ground_luma).abs() >= reach
+    });
+    (!judged.is_empty()).then_some(judged)
+}
+
+impl Local {
+    /// The measure of `judged`, [`local_ratios`]' pixels: the worst pixel row's lower median, the worst pixel, and the
+    /// pixels under [`LEGIBLE`].
+    fn of(judged: &[(i64, f64)]) -> Local {
+        let (mut worst_row, mut worst_px, mut under) = (f64::INFINITY, f64::INFINITY, 0i64);
+        let mut row = Vec::new();
+        for line in judged.chunk_by(|a, b| a.0 == b.0) {
+            row.clear();
+            row.extend(line.iter().map(|&(_, r)| r));
+            for &r in &row {
+                worst_px = worst_px.min(r);
+                under += i64::from(r < LEGIBLE);
+            }
             row.sort_by(f64::total_cmp);
             worst_row = worst_row.min(row[(row.len() - 1) / 2]);
         }
+        Local {
+            worst_row,
+            worst_px,
+            under,
+            judged: i64::try_from(judged.len()).unwrap_or(i64::MAX),
+        }
     }
-    (judged > 0).then_some(Local {
-        worst_row,
-        worst_px,
-        under,
-        judged,
-    })
 }
 
 /// What a cell is judged at: the lower of its whole-cell and its local contrast.
@@ -710,14 +734,14 @@ pub fn sidecar(png: &Path, suffix: &str, per_frame: bool) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-fn read_text(path: &Path) -> Result<String, String> {
+pub(crate) fn read_text(path: &Path) -> Result<String, String> {
     std::fs::read(path)
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .map_err(|e| format!("cannot read {}: {e}", path.display()))
 }
 
 /// A caller's path made absolute and normalised (Python's `os.path.abspath`).
-fn abspath(p: &str) -> String {
+pub(crate) fn abspath(p: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     let joined = from_caller(p);
     for c in joined.split('/') {
@@ -826,19 +850,23 @@ struct Target {
     width: i64,
 }
 
-/// The report for `a`, and whether a threshold failed.
+/// The grid `origin` and `cell` (`--origin X,Y --cell WxH`) name, else the one the dims reply in the file `dims`
+/// names, checked to fit `frame`.
 /// # Errors
-/// A file that cannot be read or decoded, a grid that does not fit the frame, or a selector the frame cannot answer.
-pub fn report(a: &Args) -> Result<J, String> {
-    let png = PathBuf::from(from_caller(&a.png));
-    let frame = Image::read(&png)?;
+/// Only one of `origin` and `cell`, either malformed, no grid named, a dims reply [`grid_from_dims`] refuses, or a grid
+/// that ends outside the frame.
+pub(crate) fn frame_grid(
+    frame: &Image,
+    origin: Option<&str>,
+    cell: Option<&str>,
+    dims: Option<PathBuf>,
+) -> Result<Grid, String> {
     let (width, height) = (
         i64::try_from(frame.width).unwrap_or(i64::MAX),
         i64::try_from(frame.height).unwrap_or(i64::MAX),
     );
-
-    let grid = if a.origin.is_some() || a.cell.is_some() {
-        let (Some(origin), Some(cell)) = (&a.origin, &a.cell) else {
+    let grid = if origin.is_some() || cell.is_some() {
+        let (Some(origin), Some(cell)) = (origin, cell) else {
             return Err("--origin and --cell go together".into());
         };
         let (ox, oy) = parse_pair(origin, ',', "--origin")?;
@@ -856,12 +884,7 @@ pub fn report(a: &Args) -> Result<J, String> {
             source: "args",
         }
     } else {
-        let dims = a
-            .dims
-            .as_deref()
-            .map(|d| PathBuf::from(from_caller(d)))
-            .or_else(|| sidecar(&png, ".dims.txt", false))
-            .ok_or("no grid: pass --dims FILE or --origin X,Y --cell WxH")?;
+        let dims = dims.ok_or("no grid: pass --dims FILE or --origin X,Y --cell WxH")?;
         grid_from_dims(&read_text(&dims)?)?
     };
     let (right, bottom) = (grid.ox + grid.cols * grid.cw, grid.oy + grid.rows * grid.ch);
@@ -871,6 +894,75 @@ pub fn report(a: &Args) -> Result<J, String> {
             grid.cols, grid.rows
         ));
     }
+    Ok(grid)
+}
+
+/// The clean twin at `path`, checked to be `frame`'s size.
+/// # Errors
+/// It cannot be read or decoded, or its size is not the frame's.
+pub(crate) fn clean_twin(frame: &Image, path: &Path) -> Result<Image, String> {
+    let c = Image::read(path)?;
+    if (c.width, c.height) != (frame.width, frame.height) {
+        return Err(format!(
+            "the clean twin is {}x{}, the frame {}x{}",
+            c.width, c.height, frame.width, frame.height
+        ));
+    }
+    Ok(c)
+}
+
+/// A caret's cell (row, column), if any, and what its cursor reply said of it (`visible`, `shape`).
+pub(crate) type CaretCell = (Option<(i64, i64)>, Vec<(String, J)>);
+
+/// The caret's cell `caret` (`--caret ROW,COL`) names, else the one the cursor reply in the file `cursor` names, with
+/// that reply's `visible` and `shape`; `None` for neither, or a reply that is not `OK`.
+/// # Errors
+/// A malformed `caret`, or a cursor file that cannot be read or whose `OK` reply does not parse.
+pub(crate) fn caret_cell(
+    caret: Option<&str>,
+    cursor: Option<PathBuf>,
+) -> Result<CaretCell, String> {
+    let mut facts: Vec<(String, J)> = Vec::new();
+    if let Some(c) = caret {
+        return Ok((Some(parse_pair(c, ',', "--caret")?), facts));
+    }
+    let Some(p) = cursor else {
+        return Ok((None, facts));
+    };
+    let reply = read_text(&p)?;
+    let words: Vec<&str> = reply.split_whitespace().collect();
+    if words.len() < 3 || words[0] != "OK" {
+        return Ok((None, facts));
+    }
+    let unreadable = || format!("{}: not a cursor reply", p.display());
+    let at = (
+        words[1].parse().map_err(|_| unreadable())?,
+        words[2].parse().map_err(|_| unreadable())?,
+    );
+    if words.len() >= 5 {
+        facts.push(("visible".into(), J::Bool(words[3] == "1")));
+        facts.push(("shape".into(), J::s(words[4])));
+    }
+    Ok((Some(at), facts))
+}
+
+/// The report for `a`, and whether a threshold failed.
+/// # Errors
+/// A file that cannot be read or decoded, a grid that does not fit the frame, or a selector the frame cannot answer.
+pub fn report(a: &Args) -> Result<J, String> {
+    let png = PathBuf::from(from_caller(&a.png));
+    let frame = Image::read(&png)?;
+    let (width, height) = (
+        i64::try_from(frame.width).unwrap_or(i64::MAX),
+        i64::try_from(frame.height).unwrap_or(i64::MAX),
+    );
+
+    let dims = a
+        .dims
+        .as_deref()
+        .map(|d| PathBuf::from(from_caller(d)))
+        .or_else(|| sidecar(&png, ".dims.txt", false));
+    let grid = frame_grid(&frame, a.origin.as_deref(), a.cell.as_deref(), dims)?;
 
     let clean = if a.no_clean {
         None
@@ -880,19 +972,7 @@ pub fn report(a: &Args) -> Result<J, String> {
             .as_deref()
             .map(|c| PathBuf::from(from_caller(c)))
             .or_else(|| sidecar(&png, ".clean.png", true));
-        match path {
-            Some(p) => {
-                let c = Image::read(&p)?;
-                if (c.width, c.height) != (frame.width, frame.height) {
-                    return Err(format!(
-                        "the clean twin is {}x{}, the frame {}x{}",
-                        c.width, c.height, frame.width, frame.height
-                    ));
-                }
-                Some(c)
-            }
-            None => None,
-        }
+        path.map(|p| clean_twin(&frame, &p)).transpose()?
     };
 
     let text_path = a
@@ -915,37 +995,12 @@ pub fn report(a: &Args) -> Result<J, String> {
         .map(|g| (g.row, g.col + 1))
         .collect();
 
-    let mut caret_facts: Vec<(String, J)> = Vec::new();
-    let caret = if let Some(c) = &a.caret {
-        Some(parse_pair(c, ',', "--caret")?)
-    } else {
-        let path = a
-            .cursor
-            .as_deref()
-            .map(|c| PathBuf::from(from_caller(c)))
-            .or_else(|| sidecar(&png, ".cursor.txt", true));
-        match path {
-            None => None,
-            Some(p) => {
-                let reply = read_text(&p)?;
-                let words: Vec<&str> = reply.split_whitespace().collect();
-                if words.len() >= 3 && words[0] == "OK" {
-                    let unreadable = || format!("{}: not a cursor reply", p.display());
-                    let at = (
-                        words[1].parse().map_err(|_| unreadable())?,
-                        words[2].parse().map_err(|_| unreadable())?,
-                    );
-                    if words.len() >= 5 {
-                        caret_facts.push(("visible".into(), J::Bool(words[3] == "1")));
-                        caret_facts.push(("shape".into(), J::s(words[4])));
-                    }
-                    Some(at)
-                } else {
-                    None
-                }
-            }
-        }
-    };
+    let cursor = a
+        .cursor
+        .as_deref()
+        .map(|c| PathBuf::from(from_caller(c)))
+        .or_else(|| sidecar(&png, ".cursor.txt", true));
+    let (caret, caret_facts) = caret_cell(a.caret.as_deref(), cursor)?;
 
     let page = match &a.page {
         Some(p) => parse_hex(p)?,
@@ -1182,7 +1237,7 @@ pub fn report(a: &Args) -> Result<J, String> {
 }
 
 /// A value as compact JSON, non-ASCII kept (`json.dumps(v, ensure_ascii=False)`).
-fn compact(v: &J) -> String {
+pub(crate) fn compact(v: &J) -> String {
     v.dump(Style {
         indent: None,
         compact: false,

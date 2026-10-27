@@ -24,7 +24,7 @@
 
 use aterm_aos::Digest;
 
-use super::plan::{PLAN_DOMAIN, SchedulePlan};
+use super::plan::{PLAN_DOMAIN, PLAN_LEN, SchedulePlan};
 use super::policy::GRID_V1;
 
 /// The domain under which a proposer's configuration is digested ([`ProposerId::new`]).
@@ -59,6 +59,7 @@ pub struct ProposerId {
 
 impl ProposerId {
     /// The proposer `name` v`version` configured by `config`.
+    #[inline]
     #[must_use]
     pub fn new(name: &str, version: u32, config: &[u8]) -> ProposerId {
         ProposerId {
@@ -69,6 +70,7 @@ impl ProposerId {
     }
 
     /// The identity the on-demand re-evaluation records: [`ON_DEMAND`] v1, configured by nothing.
+    #[inline]
     #[must_use]
     pub fn on_demand() -> ProposerId {
         ProposerId::new(ON_DEMAND, 1, &[])
@@ -217,6 +219,26 @@ impl SearchStats {
     };
 }
 
+const GRID_BYTES: [u8; GRID_V1.len() * PLAN_LEN] = {
+    let mut out = [0u8; GRID_V1.len() * PLAN_LEN];
+    let mut i = 0;
+    while i < GRID_V1.len() {
+        let (split, wake) = GRID_V1[i];
+        let Ok(p) = SchedulePlan::new(split, wake) else {
+            panic!("a grid v1 plan is in range");
+        };
+        let enc = p.encode();
+        let base = i * PLAN_LEN;
+        let mut j = 0;
+        while j < PLAN_LEN {
+            out[base + j] = enc[j];
+            j += 1;
+        }
+        i += 1;
+    }
+    out
+};
+
 /// Proposes [`GRID_V1`]'s 54 plans in order in round 0 and nothing in later rounds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GridProposer;
@@ -229,14 +251,37 @@ impl GridProposer {
         GridProposer
     }
 
+    /// How many plans [`Self::plans`] proposes.
+    #[inline]
+    #[must_use]
+    pub(super) const fn len() -> usize {
+        GRID_V1.len()
+    }
+
+    /// The encoded plan at `index` in [`GRID_V1`] order.
+    #[inline]
+    #[must_use]
+    pub(super) const fn plan_at(index: usize) -> Option<[u8; PLAN_LEN]> {
+        if index >= GRID_V1.len() {
+            return None;
+        }
+        let (split, wake) = GRID_V1[index];
+        match SchedulePlan::new(split, wake) {
+            Ok(p) => Some(p.encode()),
+            Err(_) => None,
+        }
+    }
+
     /// Encoded plan bytes in [`GRID_V1`] order (54 plans).
+    #[inline]
     #[must_use]
     pub fn plans() -> Vec<Vec<u8>> {
         let mut out = Vec::with_capacity(GRID_V1.len());
-        for &(split, wake) in &GRID_V1 {
-            if let Ok(p) = SchedulePlan::new(split, wake) {
-                out.push(p.encode().to_vec());
-            }
+        let mut i = 0;
+        while i < GRID_V1.len() {
+            let base = i * PLAN_LEN;
+            out.push(GRID_BYTES[base..base + PLAN_LEN].to_vec());
+            i += 1;
         }
         out
     }
@@ -244,10 +289,12 @@ impl GridProposer {
 
 impl Proposer for GridProposer {
     /// [`GRID_PROPOSER`] v1, configured by the grid's bytes in order.
+    #[inline]
     fn id(&self) -> ProposerId {
-        ProposerId::new(GRID_PROPOSER, 1, &Self::plans().concat())
+        ProposerId::new(GRID_PROPOSER, 1, &GRID_BYTES)
     }
 
+    #[inline]
     fn propose(&mut self, round: u8, _feedback: &[TrainFeedback]) -> Vec<Vec<u8>> {
         if round == 0 {
             Self::plans()
@@ -275,20 +322,25 @@ const fn hex_value(c: u8) -> Option<u8> {
     }
 }
 
+#[inline]
 fn hex_bytes(s: &str) -> Option<Vec<u8>> {
     let (pairs, rest) = s.as_bytes().as_chunks::<2>();
     if !rest.is_empty() {
         return None;
     }
     let mut out = Vec::with_capacity(pairs.len());
-    for &[hi, lo] in pairs {
+    let mut i = 0;
+    while i < pairs.len() {
+        let [hi, lo] = pairs[i];
         out.push((hex_value(hi)? << 4) | hex_value(lo)?);
+        i += 1;
     }
     Some(out)
 }
 
 impl FileProposer {
     /// The candidates `text` holds (the type's docs).
+    #[inline]
     #[must_use]
     pub fn from_text(text: &str) -> FileProposer {
         let mut candidates = Vec::new();
@@ -317,6 +369,7 @@ impl FileProposer {
 
 impl Proposer for FileProposer {
     /// [`FILE_PROPOSER`] v1, configured by the text.
+    #[inline]
     fn id(&self) -> ProposerId {
         ProposerId {
             name: FILE_PROPOSER.to_owned(),
@@ -325,6 +378,7 @@ impl Proposer for FileProposer {
         }
     }
 
+    #[inline]
     fn propose(&mut self, round: u8, _feedback: &[TrainFeedback]) -> Vec<Vec<u8>> {
         if round == 0 {
             self.candidates.clone()

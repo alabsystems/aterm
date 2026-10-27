@@ -23,7 +23,7 @@ pub(crate) fn told_epoch(ep: u32) -> Option<u32> {
     (FIRST_EPOCH..=EPOCH_CEILING).contains(&ep).then_some(ep)
 }
 
-/// THE EPOCH ALLOCATOR: it issues the first epoch of every log this process starts, fresh or uncarried (a spawn's, a restore's, an adoption told nothing of its predecessor's, a crash recovery's) as `max(wall seconds, every epoch this process issued or noted + 1, floor, 2)`, where the floor is a crash recovery's keeper tag plus one ([`Epochs::crash`]) and the noted epochs are the ones this process adopted (a carried successor's, which stays its predecessor's plus one) and the ones its restore leaves recorded (`TerminalLeafRestore::log_ep`, noted before any session starts, [`Epochs::note_leaves`]) or an adopted id's claim recorded (`identity_claim::recorded_epoch_in`, noted once the claim is held, before the id's log starts).
+/// THE EPOCH ALLOCATOR: it issues the first epoch of every log this process starts, fresh or uncarried (a spawn's, a restore's, an adoption told nothing of its predecessor's or told only its ids, a crash recovery's) as `max(wall seconds, every epoch this process issued or noted + 1, floor, 2)`, where the floor is a crash recovery's keeper tag plus one ([`Epochs::crash`]) or an uncarried adoption's predecessor's epoch plus one ([`SessionLog::adopt`]), and the noted epochs are the ones this process adopted (a carried successor's, which stays its predecessor's plus one, every one of a seamless update's noted before any of its sessions adopts, [`Epochs::note_handoff`]) and the ones its restore leaves recorded (`TerminalLeafRestore::log_ep`, noted before any session starts, [`Epochs::note_leaves`]) or an adopted id's claim recorded (`identity_claim::recorded_epoch_in`, noted once the claim is held, before the id's log starts). So no two logs of one process share a base epoch (a cursor's log identity, `aterm_slog::Cursor::base`): every log it starts takes one above every base it holds, and a carried log keeps its predecessor's.
 #[derive(Debug, Default)]
 pub(crate) struct Epochs {
     last: std::sync::atomic::AtomicU32,
@@ -95,6 +95,13 @@ impl Epochs {
             self.note(ep);
         }
     }
+
+    /// Note the epoch each session of a seamless update's manifest holds once adopted (its carried epoch plus one, `SessionRecord::log_ids`): called once the manifest parses, before any of its sessions adopts (C13's review). An uncarried adoption and any log this process starts later then take an epoch above every carried log's, so none takes a base a carried log keeps, whatever order the sessions adopt in.
+    pub(crate) fn note_handoff<'a>(&self, carried: impl IntoIterator<Item = &'a str>) {
+        for c in carried.into_iter().filter_map(LogCarry::parse) {
+            self.note(c.ep.saturating_add(1));
+        }
+    }
 }
 
 /// How far past its last issued id each numbered level's counter is carried across a seamless update: the ids the outgoing process may still issue between drawing the manifest and its Commit.
@@ -120,12 +127,73 @@ pub(crate) struct LogAdopt {
     pub(crate) mirror: Option<aterm_slog::Prior>,
 }
 
-/// The host's reading of both clocks: wall Unix ms (the clock shell blocks are stamped with, `aterm_types::current_time_ms`) and the process's monotonic ms ([`crate::turn_ledger::now_ms`]).
+/// The host's reading of both clocks: wall Unix ms (the clock shell blocks are stamped with, `aterm_types::current_time_ms`) and the process's monotonic ms ([`crate::turn_ledger::now_ms`]), noting the machine's sleep for [`slept_since`].
 pub(crate) fn host_stamp() -> Stamp {
-    Stamp::new(
-        aterm_types::current_time_ms().unwrap_or(0),
-        crate::turn_ledger::now_ms(),
-    )
+    let mono_ms = crate::turn_ledger::now_ms();
+    note_asleep(mono_ms);
+    Stamp::new(aterm_types::current_time_ms().unwrap_or(0), mono_ms)
+}
+
+/// `(monotonic ms, µs asleep since boot)` at each stamp that saw the machine's sleep grow, oldest first, at most [`SLEEP_SEEN_CAP`].
+static SLEEP_SEEN: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// The µs asleep of the newest [`SLEEP_SEEN`] entry (`u64::MAX`: none yet), read without its lock.
+static SLEEP_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// How many sleeps [`SLEEP_SEEN`] keeps; a stamp older than all of them reads the oldest.
+const SLEEP_SEEN_CAP: usize = 256;
+
+#[cfg(test)]
+thread_local! {
+    static SLEPT_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How long this machine has slept since it booted, in µs (0 where the platform cannot say).
+fn asleep_us() -> u64 {
+    let us = aterm_uds::process::asleep_since_boot()
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+    #[cfg(test)]
+    let us = us.saturating_add(SLEPT_FOR_TEST.with(std::cell::Cell::get));
+    us
+}
+
+/// Note the machine's sleep as read at `mono_ms`, keeping an entry when it moved by a millisecond or more; the µs asleep.
+fn note_asleep(mono_ms: u64) -> u64 {
+    use std::sync::atomic::Ordering;
+    let us = asleep_us();
+    if SLEEP_LAST.load(Ordering::Relaxed).abs_diff(us) >= 1000 {
+        let mut seen = SLEEP_SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.len() == SLEEP_SEEN_CAP {
+            seen.pop_front();
+        }
+        seen.push_back((mono_ms, us));
+        SLEEP_LAST.store(us, Ordering::Relaxed);
+    }
+    us
+}
+
+/// How long the machine slept, in µs, between a stamp read at `mono_ms` ([`crate::turn_ledger::now_ms`]'s clock, which stops while it sleeps) and now.
+pub(crate) fn slept_since(mono_ms: u64) -> u64 {
+    let now = note_asleep(crate::turn_ledger::now_ms());
+    let seen = SLEEP_SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let then = seen
+        .iter()
+        .rev()
+        .find(|(at, _)| *at <= mono_ms)
+        .or(seen.front())
+        .map_or(now, |&(_, us)| us);
+    now.saturating_sub(then)
+}
+
+/// Let this test thread's machine sleep `ms` more, as [`slept_since`] reads it.
+#[cfg(test)]
+pub(crate) fn sleep_for_test(ms: u64) {
+    SLEPT_FOR_TEST.with(|slept| slept.set(slept.get().saturating_add(ms.saturating_mul(1000))));
 }
 
 /// `at` moved back to the wall instant `wall_ms` on both clocks: a block stamp read at `at` becomes the stamp of the moment it names, so a run opened late still measures its `dur_ms` from when it began.
@@ -715,11 +783,18 @@ impl SessionLog {
                 log.gap_built(GapWhy::Crash, 0, build, at);
                 log
             }
-            (false, Some(c)) => {
-                let ep = c.ep.saturating_add(1);
-                self.epochs.note(ep);
-                Log::after_handoff_built(ep, ring_limits(), c.ids, next_seq, build, at)
-            }
+            // Told its predecessor's ids but not its log, this log starts a space of its own:
+            // its base is an issue above every base this process holds and above its
+            // predecessor's epoch, never a plain `+ 1` a log spawned beside the predecessor may
+            // hold as its base (C13's review; a carried successor's stays `+ 1`, U1).
+            (false, Some(c)) => Log::after_handoff_built(
+                self.epochs.issue(at, c.ep.saturating_add(1)),
+                ring_limits(),
+                c.ids,
+                next_seq,
+                build,
+                at,
+            ),
             (false, None) => Log::after_handoff_built(
                 self.epochs.issue(at, 0),
                 ring_limits(),
@@ -1993,13 +2068,13 @@ impl crate::App {
 }
 
 /// The `log` verb's usage line.
-pub(crate) const LOG_USAGE: &str = "ERR usage: log [<node>] [lvl=session|run|turn|step] [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [class=turn] [tier=content] [--json]\n";
+pub(crate) const LOG_USAGE: &str = "ERR usage: log [<node>] [lvl=session|run|turn|step] [since=<seq> ep=<epoch> [base=<log_base>]] [n=<count>] [kinds=<k>[,...]] [class=turn] [tier=content] [--json]\n";
 /// `log n`'s usage line (the instance's node log).
 pub(crate) const NODE_LOG_USAGE: &str =
     "ERR usage: log n [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [--json]\n";
 /// The `brief` verb's usage line.
 pub(crate) const BRIEF_USAGE: &str =
-    "ERR usage: brief [<node>|all] [budget=<tokens>] [since=<seq> ep=<epoch>]\n";
+    "ERR usage: brief [<node>|all] [budget=<tokens>] [since=<seq> ep=<epoch> [base=<log_base>]]\n";
 
 /// A parsed `log` request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2008,7 +2083,7 @@ pub(crate) struct LogQuery {
     pub(crate) node: Node,
     /// The deepest level shown.
     pub(crate) lvl: Option<Lvl>,
-    /// The reader's cursor: `since=` and the `ep=` it was read in.
+    /// The reader's cursor: `since=`, the `ep=` it was read in, and the log it names (`base=`, [`Cursor::base`]).
     pub(crate) cursor: Option<Cursor>,
     /// The newest this many matching records.
     pub(crate) n: Option<usize>,
@@ -2022,14 +2097,28 @@ pub(crate) struct LogQuery {
     pub(crate) json: bool,
 }
 
-const fn cursor_of(since: Option<u64>, ep: Option<u32>) -> Result<Option<Cursor>, ()> {
-    match (since, ep) {
-        (None, None) => Ok(None),
-        (Some(s), Some(e)) => Ok(Some(Cursor::new(e, s))),
-        (None, Some(e)) => Ok(Some(Cursor::new(e, 0))),
-        (Some(_), None) => Err(()),
-    }
+/// A reader's cursor from `since=`, `ep=` and `base=`: `since=` and `base=` (the log the cursor is of, `status log_base=`, [`Cursor::base`]) each need the `ep=` of the reply they came from, and with no `base=` the cursor names no log and reads as before.
+pub(crate) const fn cursor_of(
+    since: Option<u64>,
+    ep: Option<u32>,
+    base: Option<u32>,
+) -> Result<Option<Cursor>, ()> {
+    let cursor = match (since, ep) {
+        (None, None) if base.is_none() => return Ok(None),
+        (Some(s), Some(e)) => Cursor::new(e, s),
+        (None, Some(e)) => Cursor::new(e, 0),
+        _ => return Err(()),
+    };
+    Ok(Some(match base {
+        Some(b) => cursor.of_log(b),
+        None => cursor,
+    }))
 }
+
+/// `log`'s usage error for a `since=` or `base=` with no `ep=`.
+const LOG_CURSOR_USAGE: &str = "ERR usage: log since=<seq> and base=<log_base> need ep=<epoch>, the ep= of the reply they came from\n";
+/// `brief`'s usage error for a `since=` or `base=` with no `ep=`.
+const BRIEF_CURSOR_USAGE: &str = "ERR usage: brief since=<seq> and base=<log_base> need ep=<epoch>, the ep= of the reply they came from\n";
 
 fn parse_lvl(word: &str) -> Option<Lvl> {
     match word {
@@ -2054,7 +2143,7 @@ impl LogQuery {
             tier: Tier::Host,
             json: false,
         };
-        let (mut since, mut ep) = (None, None);
+        let (mut since, mut ep, mut base) = (None, None, None);
         let mut node = None;
         for tok in rest.split_whitespace() {
             let bad = || Err(LOG_USAGE);
@@ -2073,6 +2162,7 @@ impl LogQuery {
                 "lvl" => q.lvl = Some(parse_lvl(v).ok_or(LOG_USAGE)?),
                 "since" => since = Some(v.parse::<u64>().map_err(|_| LOG_USAGE)?),
                 "ep" => ep = Some(v.parse::<u32>().map_err(|_| LOG_USAGE)?),
+                "base" => base = Some(v.parse::<u32>().map_err(|_| LOG_USAGE)?),
                 "n" => q.n = Some(v.parse::<usize>().map_err(|_| LOG_USAGE)?),
                 "kinds" => {
                     for w in v.split(',') {
@@ -2089,9 +2179,7 @@ impl LogQuery {
             }
         }
         q.node = node.unwrap_or(Node::SESSION);
-        q.cursor = cursor_of(since, ep).map_err(
-            |()| "ERR usage: log since=<seq> needs ep=<epoch>, the ep= of the reply it came from\n",
-        )?;
+        q.cursor = cursor_of(since, ep, base).map_err(|()| LOG_CURSOR_USAGE)?;
         Ok(q)
     }
 }
@@ -2118,7 +2206,7 @@ impl BriefQuery {
             budget: None,
             cursor: None,
         };
-        let (mut since, mut ep) = (None, None);
+        let (mut since, mut ep, mut base) = (None, None, None);
         let mut named = false;
         for tok in rest.split_whitespace() {
             let Some((k, v)) = tok.split_once('=') else {
@@ -2142,12 +2230,11 @@ impl BriefQuery {
                 }
                 "since" => since = Some(v.parse::<u64>().map_err(|_| BRIEF_USAGE)?),
                 "ep" => ep = Some(v.parse::<u32>().map_err(|_| BRIEF_USAGE)?),
+                "base" => base = Some(v.parse::<u32>().map_err(|_| BRIEF_USAGE)?),
                 _ => return Err(BRIEF_USAGE),
             }
         }
-        q.cursor = cursor_of(since, ep).map_err(|()| {
-            "ERR usage: brief since=<seq> needs ep=<epoch>, the ep= of the reply it came from\n"
-        })?;
+        q.cursor = cursor_of(since, ep, base).map_err(|()| BRIEF_CURSOR_USAGE)?;
         if q.all && (q.node != Node::SESSION || q.cursor.is_some()) {
             return Err(BRIEF_USAGE);
         }
@@ -2237,6 +2324,8 @@ pub(crate) struct LogCopy {
     more: usize,
     as_of: u64,
     ep: u32,
+    /// The log's identity (`base=`, [`Log::base_ep`]): a session log's; the node log, never carried, names none.
+    base: Option<u32>,
     oldest: u64,
     lost: u64,
 }
@@ -2259,6 +2348,7 @@ impl LogCopy {
             more,
             as_of: log.reader_last_seq(),
             ep: log.ep(),
+            base: Some(log.base_ep()),
             oldest: log.complete_from(),
             lost: log.lost(),
         }
@@ -2282,6 +2372,7 @@ impl LogCopy {
             more,
             as_of: log.last_seq(),
             ep: log.ep(),
+            base: None,
             oldest: log.oldest_seq(),
             lost: log.lost(),
         }
@@ -2295,7 +2386,7 @@ impl LogCopy {
     }
 }
 
-/// The `log` reply from its copy: `OK <n> v=2 as_of=<seq> ep=<e> oldest=<seq>[ lost=<n>][ more=<k>]` (`oldest=` the seq from which the window is whole, [`Log::complete_from`]), a gap line when the read crossed records the reader will never see or names another epoch (`gap why= lost= resync_to=`, or under `--json` a `{"op":"gap",…}` object, so every body line is one object), then one record per line, oldest first.
+/// The `log` reply from its copy: `OK <n> v=2 as_of=<seq> ep=<e>[ base=<b>] oldest=<seq>[ lost=<n>][ more=<k>]` (`base=` the log's identity, which a reader passes back as `base=` beside `since=`/`ep=` (a session log's; the node log names none), `oldest=` the seq from which the window is whole, [`Log::complete_from`]), a gap line when the read crossed records the reader will never see or names another epoch (`gap why= lost= resync_to=`, or under `--json` a `{"op":"gap",…}` object, so every body line is one object), then one record per line, oldest first.
 pub(crate) fn render_log_copy(c: &LogCopy, q: &LogQuery) -> String {
     #[cfg(test)]
     encode_probe();
@@ -2311,13 +2402,11 @@ pub(crate) fn render_log_copy(c: &LogCopy, q: &LogQuery) -> String {
                 .unwrap_or_else(|_| format!("{} {} {}", r.seq, r.op.word(), r.node))
         });
     }
-    let mut out = format!(
-        "OK {} v=2 as_of={} ep={} oldest={}",
-        body.len(),
-        c.as_of,
-        c.ep,
-        c.oldest
-    );
+    let mut out = format!("OK {} v=2 as_of={} ep={}", body.len(), c.as_of, c.ep);
+    if let Some(base) = c.base {
+        out.push_str(&format!(" base={base}"));
+    }
+    out.push_str(&format!(" oldest={}", c.oldest));
     if c.lost > 0 {
         out.push_str(&format!(" lost={}", c.lost));
     }

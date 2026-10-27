@@ -5,7 +5,7 @@
 
 mod protocol;
 
-use super::callbacks::{AdvancedNotificationCallback, ClipboardCallback, NotificationCallback};
+use super::callbacks::ClipboardCallback;
 use super::shell::{Annotation, CommandMark, OutputBlock, ShellState, TerminalMark};
 use super::transient_state::{DEFAULT_BACKGROUND, DEFAULT_FOREGROUND};
 use super::types::SavedCursorState;
@@ -258,6 +258,10 @@ pub(super) struct ShellIntegrationState {
     pub(super) phase_stale: bool,
     /// The host's word that a program other than the shell holds the terminal's foreground now (`Terminal::set_foreground_job`: a unix host compares the foreground process group of the bytes it feeds with the shell's).
     pub(super) foreground_job: bool,
+    /// Last verdict of [`Self::program_runs_since_prompt`] while `foreground_job` is `false`, so host-journal recording tracks probed background/in-group child jobs without extra probe calls.
+    pub(super) probe_job_active: bool,
+    /// Set when [`Self::program_runs_since_prompt`] changes `probe_job_active` during `process_at`.
+    pub(super) probe_transitioned: bool,
     /// The prompt in front's `B` said it stands where the line editor's buffer STARTS (`133;B;…;aterm_input=start`): bash and fish draw it at the end of the prompt, before any buffer, and zsh's, sent from zle-line-init after zle drew the buffer, says so only when that buffer is empty (a line pre-filled from zsh's buffer stack is drawn first, and the `B` lands after it).
     pub(super) input_start_attested: bool,
     /// The cwd a program's first report replaced at the shell's prompt ([`Self::foreground_job`], [`Self::program_probe`]), as a report: restored once the host says no such program runs, as the shell never reports its cwd again after a program a key started.
@@ -296,6 +300,8 @@ impl ShellIntegrationState {
             unmarked_run: false,
             phase_stale: false,
             foreground_job: false,
+            probe_job_active: false,
+            probe_transitioned: false,
             input_start_attested: false,
             cwd_before_job: None,
             program_probe: None,
@@ -316,6 +322,8 @@ impl ShellIntegrationState {
         self.current_block = None;
         self.held_cwd = None;
         self.phase_stale = false;
+        self.probe_job_active = false;
+        self.probe_transitioned = false;
         self.input_start_attested = false;
     }
 
@@ -407,19 +415,11 @@ impl TitleState {
     }
 }
 
-/// The host's admission for one program notification, asked with the program's own state report
-/// as it stands at the notification's byte ([`super::Terminal::set_notification_admission`]).
-pub(super) type NotificationAdmission =
-    Box<dyn FnMut(&super::program_state::ProgramStateReport) -> bool + Send>;
-
 /// Notification callbacks (OSC 9, OSC 99/777) and the OSC 99 multi-part accumulation map.
 pub(super) struct NotificationState {
-    /// Simple desktop notification callback (OSC 9).
-    pub(super) callback: Option<NotificationCallback>,
-    /// Advanced desktop notification callback (OSC 99 - kitty protocol).
-    pub(super) advanced_callback: Option<AdvancedNotificationCallback>,
-    /// The host's admission, asked before either callback; none admits every notification.
-    pub(super) admission: Option<NotificationAdmission>,
+    /// The callbacks and the host's admission, reached only through a capability
+    /// ([`super::notify_auth`]).
+    pub(super) sinks: super::notify_auth::NotificationSinks,
     /// In-progress notifications being built from OSC 99 chunks.
     pub(super) pending: PendingNotificationsMap,
 }
@@ -428,17 +428,9 @@ impl NotificationState {
     #[inline]
     pub(super) fn new() -> Self {
         Self {
-            callback: None,
-            advanced_callback: None,
-            admission: None,
+            sinks: super::notify_auth::NotificationSinks::new(),
             pending: PendingNotificationsMap::default(),
         }
-    }
-
-    /// Whether the host admits a notification written while `report` stands.
-    #[inline]
-    pub(super) fn admits(&mut self, report: &super::program_state::ProgramStateReport) -> bool {
-        self.admission.as_mut().is_none_or(|admit| admit(report))
     }
 
     /// Reset pending notifications while preserving callbacks.

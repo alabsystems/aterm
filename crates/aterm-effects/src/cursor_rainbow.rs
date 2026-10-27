@@ -324,6 +324,7 @@ impl CursorRainbow {
 
     /// Returns when this caret's next visible step is due.
     #[must_use]
+    #[inline]
     pub fn next_change_deadline(
         &mut self,
         now: Instant,
@@ -357,6 +358,7 @@ impl CursorRainbow {
     }
 
     /// Tick a copy of this caret along the frame grid from `origin` until its fingerprint changes or release ends.
+    #[inline]
     fn dry_run_release(
         &mut self,
         probe_in: SettleProbe,
@@ -489,6 +491,7 @@ impl CursorRainbow {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     fn tick_inner(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -980,6 +983,7 @@ impl CursorRainbow {
         }
     }
 
+    #[inline]
     fn equalise_rim_light(
         &mut self,
         quads: &mut [GlowQuad],
@@ -1082,7 +1086,13 @@ impl CursorRainbow {
             }
         }
         let rings_len = rings.len();
-        let peak_of = |cols: &[u32; HALO_LAYERS as usize]| -> Option<f32> {
+        #[inline]
+        const fn rim_peak_of(
+            cols: &[u32; HALO_LAYERS as usize],
+            buckets: &[(u32, u32)],
+            rings_len: usize,
+            buckets_complete: bool,
+        ) -> Option<f32> {
             if !buckets_complete {
                 return None;
             }
@@ -1093,7 +1103,7 @@ impl CursorRainbow {
             const FIELD_PEAK: f32 = crate::color_math::relative_luminance(FIELD) * 255.0;
             let mut peak = FIELD_PEAK;
             let mut bi = 0;
-            while bi < n_buckets {
+            while bi < buckets.len() {
                 let mask = buckets[bi].0;
                 bi += 1;
                 let mut px = FIELD;
@@ -1118,8 +1128,16 @@ impl CursorRainbow {
                 }
             }
             Some(peak)
-        };
-        let pile_light = |cols: &[u32; HALO_LAYERS as usize]| -> f32 {
+        }
+        #[inline]
+        const fn rim_pile_light(
+            cols: &[u32; HALO_LAYERS as usize],
+            ring_pixels: &[u32; HALO_LAYERS as usize],
+            buckets: &[(u32, u32)],
+            rings_len: usize,
+            page: u32,
+            base: f32,
+        ) -> f32 {
             let mut aurora = 0.0f32;
             let mut i = 0;
             while i < rings_len {
@@ -1128,7 +1146,7 @@ impl CursorRainbow {
             }
             let mut sum = 0.0f32;
             let mut bi = 0;
-            while bi < n_buckets {
+            while bi < buckets.len() {
                 let (mask, count) = buckets[bi];
                 bi += 1;
                 let mut px = page;
@@ -1154,7 +1172,23 @@ impl CursorRainbow {
                 }
             }
             sum + aterm_render::hdr::HDR_GLOW_BOOST * aurora
-        };
+        }
+        #[inline]
+        const fn solve_rim_cols(
+            rings: &[(usize, u8, u32, u32)],
+            page: u32,
+            scale: f32,
+        ) -> [u32; HALO_LAYERS as usize] {
+            let mut c = [0u32; HALO_LAYERS as usize];
+            let mut i = 0;
+            while i < rings.len() {
+                let (_, cov, arc, _) = rings[i];
+                c[i] = ring_light_on_page(arc, cov, page, scale);
+                i += 1;
+            }
+            c
+        }
+        let buckets = &buckets[..n_buckets];
         let mut grey_rings = [0u32; HALO_LAYERS as usize];
         let mut init_cols = [0u32; HALO_LAYERS as usize];
         let mut i = 0;
@@ -1164,23 +1198,13 @@ impl CursorRainbow {
             init_cols[i] = light;
             i += 1;
         }
-        let target = pile_light(&grey_rings);
-        let have = pile_light(&init_cols);
+        let target = rim_pile_light(&grey_rings, &ring_pixels, buckets, rings_len, page, base);
+        let have = rim_pile_light(&init_cols, &ring_pixels, buckets, rings_len, page, base);
         if target <= 0.0 || (have - target).abs() <= target * Self::RIM_LIGHT_SLACK {
-            let peak = peak_of(&init_cols);
+            let peak = rim_peak_of(&init_cols, buckets, rings_len, buckets_complete);
             self.rim_scratch = scratch;
             return (None, peak);
         }
-        let solve = |scale: f32| -> [u32; HALO_LAYERS as usize] {
-            let mut c = [0u32; HALO_LAYERS as usize];
-            let mut i = 0;
-            while i < rings_len {
-                let (_, cov, arc, _) = rings[i];
-                c[i] = ring_light_on_page(arc, cov, page, scale);
-                i += 1;
-            }
-            c
-        };
         let (mut lo, mut hi) = (0.5f32, 1.5f32);
         let (mut lo_solved, mut hi_solved) = if have < target {
             lo = 1.0;
@@ -1193,7 +1217,7 @@ impl CursorRainbow {
         while iter < 8 {
             iter += 1;
             let mid = 0.5 * (lo + hi);
-            let c = solve(mid);
+            let c = solve_rim_cols(rings, page, mid);
             if matches!(lo_solved, Some((lc, _)) if lc == c) {
                 lo = mid;
                 continue;
@@ -1202,7 +1226,7 @@ impl CursorRainbow {
                 hi = mid;
                 continue;
             }
-            let l = pile_light(&c);
+            let l = rim_pile_light(&c, &ring_pixels, buckets, rings_len, page, base);
             if l < target {
                 lo = mid;
                 lo_solved = Some((c, l));
@@ -1219,16 +1243,16 @@ impl CursorRainbow {
         let (a, la) = match lo_solved {
             Some(pair) => pair,
             None => {
-                let a = solve(lo);
-                let la = pile_light(&a);
+                let a = solve_rim_cols(rings, page, lo);
+                let la = rim_pile_light(&a, &ring_pixels, buckets, rings_len, page, base);
                 (a, la)
             }
         };
         let (b, lb) = match hi_solved {
             Some(pair) => pair,
             None => {
-                let b = solve(hi);
-                let lb = pile_light(&b);
+                let b = solve_rim_cols(rings, page, hi);
+                let lb = rim_pile_light(&b, &ring_pixels, buckets, rings_len, page, base);
                 (b, lb)
             }
         };
@@ -1238,7 +1262,7 @@ impl CursorRainbow {
             b
         };
         Self::apply_equalised_rings(quads, rings, &best);
-        let peak = peak_of(&best);
+        let peak = rim_peak_of(&best, buckets, rings_len, buckets_complete);
         self.rim_scratch = scratch;
         (Some(best), peak)
     }
@@ -1247,6 +1271,7 @@ impl CursorRainbow {
     const RIM_LIGHT_SLACK: f32 = 0.005;
 
     /// Peak rim luminance over the field in `0..255` units.
+    #[inline]
     fn rim_light_peak(&mut self, quads: &[GlowQuad], dark_theme: bool) -> f32 {
         if quads.is_empty() || !dark_theme {
             return 0.0;
@@ -1396,6 +1421,7 @@ const fn shade(rgb: u32, s: f32, v: f32) -> u32 {
         (rgb & 0xff) as f32,
     );
     let hi = r.max(g).max(b);
+    #[inline]
     const fn ch(hi: f32, s: f32, v: f32, c: f32) -> u32 {
         (((hi - s * (hi - c)) * v) + 0.5).clamp(0.0, 255.0) as u32
     }
@@ -1406,16 +1432,18 @@ const fn shade(rgb: u32, s: f32, v: f32) -> u32 {
 const CARET_LIGHT_KNEE: f32 = 0.25;
 
 /// Lift a colour toward white until its relative luminance reaches `floor`.
+#[inline]
 pub(crate) const fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
     let floor = floor.clamp(0.0, 255.0);
     if floor <= 0.0 || (rgb & 0x00FF_FFFF) == 0x00FF_FFFF {
         return rgb;
     }
+    let table = crate::color_math::relative_luminance_table();
     #[inline]
-    const fn light(c: u32) -> f32 {
-        crate::color_math::relative_luminance(c) * 255.0
+    const fn light(table: &crate::color_math::RelativeLuminanceTable, c: u32) -> f32 {
+        crate::color_math::relative_luminance_with(table, c) * 255.0
     }
-    if light(rgb) >= floor {
+    if light(table, rgb) >= floor {
         return rgb;
     }
     if floor >= 255.0 {
@@ -1436,7 +1464,7 @@ pub(crate) const fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
             hi = mid;
             continue;
         }
-        if light(mid_rgb) < floor {
+        if light(table, mid_rgb) < floor {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -1469,6 +1497,7 @@ const fn light_on_glass_with(
 }
 
 /// Solve one ring's premultiplied colour on `page` for [`RIM_LIGHT`].
+#[inline]
 const fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     debug_assert!(
@@ -1584,6 +1613,9 @@ const fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
     }
     best
 }
+
+#[cfg(any(test, debug_assertions))]
+mod state_words;
 
 #[cfg(test)]
 mod tests {

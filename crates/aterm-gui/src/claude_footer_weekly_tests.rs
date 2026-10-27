@@ -295,6 +295,7 @@ fn reading(
         cache_expires_at: None,
         version: None,
         model: None,
+        ctx_left: None,
         dur_us: 0,
     };
     std::fs::create_dir_all(rl()).unwrap();
@@ -693,7 +694,7 @@ fn a_named_logins_tap_figure_is_its_own_and_its_restart_taps_the_login_every_rel
 
 /// A FOOTER KEPT OVER A TRANSIENT REGISTRY MISS KEEPS ITS WEEK: the read that finds no
 /// registry row judges the tab's own tap figure as a fresh read does, and never falls back to
-/// the bare profile read's `weekly unavailable`.
+/// the bare profile read's lack of one.
 #[test]
 fn a_footer_kept_over_a_registry_miss_keeps_its_taps_week() {
     fresh("footer-weekly-kept");

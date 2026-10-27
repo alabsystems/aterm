@@ -679,7 +679,7 @@ impl Device {
     }
 
     /// `-[MTLDevice maxBufferLength]`, the Metal equivalent of wgpu's `limits().max_buffer_size`.
-    #[cfg(any(test, wgpu_arm, feature = "compute"))]
+    #[cfg(any(test, feature = "compute"))]
     pub(crate) fn max_buffer_length(&self) -> usize {
         // SAFETY: `-maxBufferLength` is an `NSUInteger` getter on a live `MTLDevice`.
         unsafe {

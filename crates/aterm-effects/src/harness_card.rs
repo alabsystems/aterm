@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::cli_marks::ICON_CONTRAST;
 use crate::color_math::{
-    contrast_ratio, floor_contrast_keeping_hue, lift_keeping_hue, relative_luminance,
+    floor_contrast_keeping_hue, hue_path_at, hue_path_endpoints, relative_luminance,
 };
 use crate::cursor_glow::InkRole;
 use crate::effect_util::{
@@ -1248,7 +1248,12 @@ const fn on_grid(ms: u64) -> u64 {
 
 #[inline]
 fn ms_between(from: Instant, to: Instant) -> u64 {
-    u64::try_from(to.saturating_duration_since(from).as_millis()).unwrap_or(u64::MAX)
+    let ms = to.saturating_duration_since(from).as_millis();
+    if ms > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        ms as u64
+    }
 }
 
 #[inline]
@@ -1283,6 +1288,19 @@ impl Rect {
     #[inline]
     const fn contains(self, x: i64, y: i64) -> bool {
         x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
+    }
+
+    #[inline]
+    const fn x_span(self, covers: &[Self]) -> (usize, usize) {
+        let mut lo = 0;
+        while lo < covers.len() && covers[lo].x1 <= self.x0 {
+            lo += 1;
+        }
+        let mut hi = lo;
+        while hi < covers.len() && covers[hi].x0 < self.x1 {
+            hi += 1;
+        }
+        (lo, hi)
     }
 
     #[cfg(test)]
@@ -1384,6 +1402,11 @@ impl Geo {
     #[inline]
     const fn band(&self, r: i64) -> i64 {
         self.oy + r * self.ch
+    }
+
+    #[inline]
+    const fn row_of(&self, py: i64) -> i64 {
+        (py - self.oy).div_euclid(self.ch)
     }
 
     #[inline]
@@ -1893,35 +1916,41 @@ fn glint_spots_at(
         return out;
     }
     let cells = (free - t.x0) / g.cw.max(1);
-    let n = usize::try_from(cells / GLINT_CELLS)
-        .unwrap_or(0)
-        .clamp(1, GLINTS_MAX);
+    let raw_n = cells / GLINT_CELLS;
+    let n = if raw_n <= 1 {
+        1
+    } else if raw_n >= GLINTS_MAX as i64 {
+        GLINTS_MAX
+    } else {
+        raw_n as usize
+    };
     let stripes = TRAIL_STOPS.len() as i64;
     let two_stripes = 2 * stripes;
     let first = (mix(seed ^ 0x474C_494E) & 3) as usize;
     let span_f = (room.x1 - room.x0) as f32;
     let n_f = n as f32;
     let th = t.y1 - t.y0;
-    let row_of = |py: i64| (py - g.oy).div_euclid(g.ch);
-    for (i, spot) in out.spots[..n].iter_mut().enumerate() {
+    let mut i = 0;
+    while i < n {
         let at = (i as f32 + 0.2 + 0.6 * unit(seed, 0x474C_0000 | i as u64)) / n_f;
         let x = room.x0 + (span_f * at) as i64;
         let k = 1 + [0i64, 2, 1, 3][(first + i) & 3];
         let centre = t.y0 + th * (2 * k + 1) / two_stripes;
         let mut y = centre.clamp(room.y0, room.y1 - 1);
-        if row_of(y - m) != row_of(y + m) {
-            let line = g.band(row_of(y + m));
+        if g.row_of(y - m) != g.row_of(y + m) {
+            let line = g.band(g.row_of(y + m));
             let (above, below) = (line - m - 1, line + m);
             let side = if centre < line { above } else { below };
             if (room.y0..room.y1).contains(&side) {
                 y = side;
             }
         }
-        *spot = GlintSpot {
+        out.spots[i] = GlintSpot {
             x,
             y,
             phase: unit(seed, 0x474C_5048 ^ i as u64) * std::f32::consts::PI,
         };
+        i += 1;
     }
     Glints {
         n,
@@ -1983,8 +2012,11 @@ fn field_spots_at(
     let tax = if light_theme { STAR_ARM_INK } else { 1.0 };
     let chf = g.ch as f32;
     let mut n = 0;
-    for i in 0..want {
-        let ratio = STAR_RATIOS[i & (STAR_RATIOS.len() - 1)] * tax;
+    let mut i = 0;
+    while i < want {
+        let cur_i = i;
+        i += 1;
+        let ratio = STAR_RATIOS[cur_i & (STAR_RATIOS.len() - 1)] * tax;
         let arm = i64::from(star_arm_px(star_arm(chf, ratio)));
         let m = arm + 1;
         let room = Rect {
@@ -1998,8 +2030,8 @@ fn field_spots_at(
         }
         let span = room.x1 - room.x0;
         let slice = Rect {
-            x0: room.x0 + span * i as i64 / want as i64,
-            x1: room.x0 + span * (i as i64 + 1) / want as i64,
+            x0: room.x0 + span * cur_i as i64 / want as i64,
+            x1: room.x0 + span * (cur_i as i64 + 1) / want as i64,
             ..room
         };
         let kitty_pad = kitty.map(|r| Rect {
@@ -2011,14 +2043,16 @@ fn field_spots_at(
         let room_w = (room.x1 - room.x0) as f32;
         let slice_w = (slice.x1 - slice.x0) as f32;
         let room_h = (room.y1 - room.y0) as f32;
-        let i_salt = (i as u64) << 8;
-        for k in 0..STAR_TRIES {
+        let i_salt = (cur_i as u64) << 8;
+        let mut k = 0;
+        while k < STAR_TRIES {
             let salt = i_salt | k;
             let (within_x0, within_w) = if k < STAR_TRIES / 2 {
                 (slice.x0, slice_w)
             } else {
                 (room.x0, room_w)
             };
+            k += 1;
             let x = within_x0 + (unit(seed, salt * 2) * within_w) as i64;
             let y = room.y0 + (unit(seed, salt * 2 + 1) * room_h) as i64;
             if let Some(r) = kitty_pad
@@ -2027,18 +2061,24 @@ fn field_spots_at(
                 continue;
             }
             let mut crowded = false;
-            for o in &spots[..n] {
+            let mut si = 0;
+            while si < n {
+                let o = &spots[si];
                 if (o.x - x).abs() < gap && (o.y - y).abs() < gap {
                     crowded = true;
                     break;
                 }
+                si += 1;
             }
             if !crowded {
-                for o in glint_slice {
+                let mut gi = 0;
+                while gi < glint_slice.len() {
+                    let o = &glint_slice[gi];
                     if (o.x - x).abs() < gap && (o.y - y).abs() < gap {
                         crowded = true;
                         break;
                     }
+                    gi += 1;
                 }
             }
             if crowded {
@@ -2227,9 +2267,9 @@ impl HarnessCard {
         let at = seen
             .checked_sub(Duration::from_millis(FLARE_STEP_LEAD_MS))
             .unwrap_or(seen);
-        let period = i64::try_from(period).unwrap_or(i64::MAX);
-        let ahead = i64::try_from(ms_between(g0, at)).unwrap_or(i64::MAX);
-        let behind = i64::try_from(ms_between(at, g0)).unwrap_or(i64::MAX);
+        let period = period.min(i64::MAX as u64) as i64;
+        let ahead = ms_between(g0, at).min(i64::MAX as u64) as i64;
+        let behind = ms_between(at, g0).min(i64::MAX as u64) as i64;
         let mut e = (ahead - behind).rem_euclid(period);
         if e > period / 2 {
             e -= period;
@@ -2593,29 +2633,40 @@ impl HarnessCard {
             Some((ms, up)) if up > 0.0 => Some((ms, up)),
             _ => None,
         };
-        let glint_at = |c: u16| match active_glint {
-            Some((ms, up)) => {
-                let d = cell_distance(f32::from(c) - wc_f, dy_rows);
-                up * glint(d, ms)
+        #[inline]
+        const fn line_glint_at(
+            active_glint: Option<(u64, f32)>,
+            wc_f: f32,
+            dy_rows: f32,
+            c: u16,
+        ) -> f32 {
+            match active_glint {
+                Some((ms, up)) => {
+                    let d = cell_distance(c as f32 - wc_f, dy_rows);
+                    up * glint(d, ms)
+                }
+                None => 0.0,
             }
-            None => 0.0,
-        };
+        }
         const INV_LINE_SWEEP_SIGMA: f32 = 1.0 / LINE_SWEEP_SIGMA;
         let (palette, inks) = (self.palette, &self.inks);
-        for i in 0..at.len {
+        let mut i = 0;
+        while i < at.len {
             let Some(c) = at.col.checked_add(i) else {
                 break;
             };
-            let x = f32::from(i) * inv_span;
+            let cur_i = i;
+            i += 1;
+            let x = f32::from(cur_i) * inv_span;
             let sweep = if env == 0.0 {
                 0.0
             } else {
                 let d = (x - pos) * INV_LINE_SWEEP_SIGMA;
                 env * crate::color_math::exp_f32(-d * d)
             };
-            let crest = sweep.max(glint_at(c));
-            let rgb = if hero.contains(&i) {
-                let k = f32::from(i - hero.start) * inv_hero_span;
+            let crest = sweep.max(line_glint_at(active_glint, wc_f, dy_rows, c));
+            let rgb = if hero.contains(&cur_i) {
+                let k = f32::from(cur_i - hero.start) * inv_hero_span;
                 let place = tri(k * LINE_HERO_SPREAD + phi);
                 if dark {
                     line_floor(
@@ -2724,22 +2775,51 @@ pub enum DarkMark {
 /// added white misses the floor) the light floored along its hue to [`MARK_CONTRAST`] and
 /// printed.
 #[must_use]
-pub fn dark_mark(rgb: u32, ground: u32) -> DarkMark {
-    let (rgb, ground) = (rgb & 0x00FF_FFFF, ground & 0x00FF_FFFF);
-    let table = crate::color_math::relative_luminance_table();
-    let lg = crate::color_math::relative_luminance_with(table, ground);
-    let reads = |c: u32| {
+pub const fn dark_mark(rgb: u32, ground: u32) -> DarkMark {
+    #[inline]
+    const fn reads(
+        table: &crate::color_math::RelativeLuminanceTable,
+        ground: u32,
+        lg: f32,
+        c: u32,
+    ) -> bool {
         let lit = add_sat(ground, premul_rgb(c, STAR_PRINT_FULL as u8));
         let ll = crate::color_math::relative_luminance_with(table, lit);
         (ll.max(lg) + 0.05) / (ll.min(lg) + 0.05) >= MARK_CONTRAST
-    };
-    if reads(rgb) {
+    }
+    let (rgb, ground) = (rgb & 0x00FF_FFFF, ground & 0x00FF_FFFF);
+    let table = crate::color_math::relative_luminance_table();
+    let lg = crate::color_math::relative_luminance_with(table, ground);
+    if reads(table, ground, lg, rgb) {
         return DarkMark::Light(rgb);
     }
-    if contrast_ratio(WHITE, ground) > contrast_ratio(0, ground) {
-        let lifted = lift_keeping_hue(rgb, reads);
-        if reads(lifted) {
-            return DarkMark::Light(lifted);
+    if ((1.0f32.max(lg) + 0.05) / (1.0f32.min(lg) + 0.05))
+        > ((0.0f32.max(lg) + 0.05) / (0.0f32.min(lg) + 0.05))
+        && reads(table, ground, lg, WHITE)
+    {
+        let (r, g, b, up, r_up, g_up, b_up) = hue_path_endpoints(rgb);
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        let (mut lo_rgb, mut hi_rgb) = (rgb, WHITE);
+        let mut i = 0;
+        while i < 24 {
+            let mid = 0.5 * (lo + hi);
+            let mid_rgb = hue_path_at(r, g, b, up, r_up, g_up, b_up, false, mid);
+            if mid_rgb == lo_rgb {
+                lo = mid;
+            } else if mid_rgb == hi_rgb || reads(table, ground, lg, mid_rgb) {
+                hi = mid;
+                hi_rgb = mid_rgb;
+            } else {
+                lo = mid;
+                lo_rgb = mid_rgb;
+            }
+            if i >= 1 && lo_rgb == hi_rgb {
+                break;
+            }
+            i += 1;
+        }
+        if reads(table, ground, lg, hi_rgb) {
+            return DarkMark::Light(hi_rgb);
         }
     }
     DarkMark::Print(floor_contrast_keeping_hue(rgb, ground, MARK_CONTRAST))
@@ -2750,7 +2830,7 @@ pub fn dark_mark(rgb: u32, ground: u32) -> DarkMark {
 /// added where it reads or once lifted along its hue, else its floored ink laid over the ground;
 /// on paper the letter's ink laid over.
 #[must_use]
-pub fn line_star(rgb: u32, ground: u32) -> (u32, DecoBlend) {
+pub const fn line_star(rgb: u32, ground: u32) -> (u32, DecoBlend) {
     if !dark_ground(ground & 0x00FF_FFFF) {
         return (rgb, DecoBlend::Over);
     }
@@ -2772,6 +2852,57 @@ struct TrailLay {
     held: i64,
 }
 
+#[inline]
+fn compute_trail_lay(
+    g: &Geo,
+    scene: &CardScene,
+    seat: Option<KittyAt>,
+    kitty: Option<(KittyAt, KittyPose)>,
+    clock: Clock,
+) -> Option<TrailLay> {
+    let (
+        Rect {
+            x0: tx0,
+            y0: ya,
+            x1: tx1,
+            y1: yb,
+        },
+        amp,
+    ) = trail_rect(g, scene, seat)?;
+    let len = tx1 - tx0;
+    let drawn = match kitty {
+        Some((at, _)) if ride(clock) < 1.0 => {
+            let rear = at.rear();
+            if tx1 < rear { tx1 } else { rear }
+        }
+        _ => tx1,
+    };
+    let held = match kitty {
+        Some((at, _)) => {
+            let h = at.rect.x0 - rim_px(at.p, g.t);
+            if drawn > h { h } else { i64::MAX }
+        }
+        None => i64::MAX,
+    };
+    let seg = if clock.t_ms.is_some() || clock.flow.is_some() {
+        let min_seg = TRAIL_SEG_CELLS * g.cw;
+        let cap_seg = (len + MAX_TRAIL_SEGMENTS - 1) / MAX_TRAIL_SEGMENTS;
+        if min_seg > cap_seg { min_seg } else { cap_seg }
+    } else {
+        len
+    };
+    Some(TrailLay {
+        tx0,
+        drawn,
+        len,
+        seg,
+        ya,
+        yb,
+        amp,
+        held,
+    })
+}
+
 fn lay_cut(
     q: Rect,
     k: i64,
@@ -2789,7 +2920,7 @@ fn lay_cut(
     if c.is_empty() {
         return lay_cut(q, k + 1, last, cover, lay);
     }
-    for piece in [
+    let pieces = [
         Rect { y1: c.y0, ..q },
         Rect { y0: c.y1, ..q },
         Rect {
@@ -2804,10 +2935,13 @@ fn lay_cut(
             y1: c.y1,
             ..q
         },
-    ] {
-        if !lay_cut(piece, k + 1, last, cover, lay) {
+    ];
+    let mut pi = 0;
+    while pi < pieces.len() {
+        if !lay_cut(pieces[pi], k + 1, last, cover, lay) {
             return false;
         }
+        pi += 1;
     }
     true
 }
@@ -2824,6 +2958,7 @@ struct Emit<'a> {
     kitty: Option<(KittyAt, KittyPose)>,
     seat: Option<KittyAt>,
     star_region: Option<Rect>,
+    trail_lay: Option<TrailLay>,
     glints: std::cell::OnceCell<Glints>,
 }
 
@@ -2832,6 +2967,8 @@ impl<'a> Emit<'a> {
         const INV_SHIMMER_MS: f32 = 1.0 / SHIMMER_MS;
         let seat = kitty_rect(&geo, scene);
         let star_region = star_region(&geo, scene);
+        let kitty = seat.map(|at| (ridden(&geo, scene, at, clock), kitty_frame(clock)));
+        let trail_lay = compute_trail_lay(&geo, scene, seat, kitty, clock);
         Self {
             scene,
             geo,
@@ -2844,9 +2981,10 @@ impl<'a> Emit<'a> {
                 Some(t) => (t as f32 * INV_SHIMMER_MS).fract() * 1.4 - 0.2,
                 None => 0.0,
             },
-            kitty: seat.map(|at| (ridden(&geo, scene, at, clock), kitty_frame(clock))),
+            kitty,
             seat,
             star_region,
+            trail_lay,
             glints: std::cell::OnceCell::new(),
         }
     }
@@ -2921,51 +3059,76 @@ impl<'a> Emit<'a> {
         let inv_per = 1.0 / (2 * (w + h)) as f32;
         let all = g.clip;
         let n = ((w + g.cw - 1) / g.cw).clamp(1, MAX_EDGE_SEGMENTS);
-        for bottom in [false, true] {
+        #[inline]
+        const fn border_arc_x(o: Rect, w: i64, h: i64, bottom: bool, x: i64) -> f32 {
+            if bottom {
+                (w + h + (o.x1 - x)) as f32
+            } else {
+                (x - o.x0) as f32
+            }
+        }
+        #[inline]
+        const fn border_arc_y(o: Rect, w: i64, h: i64, left: bool, y: i64) -> f32 {
+            if left {
+                (2 * w + h + (o.y1 - y)) as f32
+            } else {
+                (w + (y - o.y0)) as f32
+            }
+        }
+        let bottoms = [false, true];
+        let mut bi = 0;
+        while bi < bottoms.len() {
+            let bottom = bottoms[bi];
+            bi += 1;
             let y0 = if bottom { o.y1 - t } else { o.y0 };
-            let arc = |x: i64| {
-                if bottom {
-                    (w + h + (o.x1 - x)) as f32
-                } else {
-                    (x - o.x0) as f32
-                }
-            };
             let mid = (y0 + t / 2) as f32;
-            let mut pa = self.border_paint(arc(o.x0) * inv_per, (o.x0 as f32, mid));
-            for k in 0..n {
+            let mut pa = self.border_paint(
+                border_arc_x(o, w, h, bottom, o.x0) * inv_per,
+                (o.x0 as f32, mid),
+            );
+            let mut k = 0;
+            while k < n {
                 let xa = o.x0 + w * k / n;
                 let xb = o.x0 + w * (k + 1) / n;
+                k += 1;
                 let r = Rect {
                     x0: xa,
                     y0,
                     x1: xb,
                     y1: y0 + t,
                 };
-                let pb = self.border_paint(arc(xb) * inv_per, (xb as f32, mid));
+                let pb = self.border_paint(
+                    border_arc_x(o, w, h, bottom, xb) * inv_per,
+                    (xb as f32, mid),
+                );
                 out.ramp(all, r, pa, pb);
                 pa = pb;
             }
         }
-        let bands = (o.y0 - g.oy).div_euclid(g.ch)..=(o.y1 - 1 - g.oy).div_euclid(g.ch);
+        let band_start = (o.y0 - g.oy).div_euclid(g.ch);
+        let band_end = (o.y1 - 1 - g.oy).div_euclid(g.ch);
         let (o_y0_t, o_y1_t) = (o.y0 + t, o.y1 - t);
-        for left in [false, true] {
+        let lefts = [false, true];
+        let mut li = 0;
+        while li < lefts.len() {
+            let left = lefts[li];
+            li += 1;
             let x0 = if left { o.x0 } else { o.x1 - t };
             let mid_x = (x0 + t / 2) as f32;
-            let arc = |y: i64| {
-                if left {
-                    (2 * w + h + (o.y1 - y)) as f32
-                } else {
-                    (w + (y - o.y0)) as f32
-                }
-            };
-            for r in bands.clone() {
-                let ya = g.band(r).max(o_y0_t);
-                let yb = g.band(r + 1).min(o_y1_t);
+            let mut r = band_start;
+            while r <= band_end {
+                let cur_r = r;
+                r += 1;
+                let ya = g.band(cur_r).max(o_y0_t);
+                let yb = g.band(cur_r + 1).min(o_y1_t);
                 if yb <= ya {
                     continue;
                 }
                 let mid_y = (ya + yb) / 2;
-                let p = self.border_paint(arc(mid_y) * inv_per, (mid_x, mid_y as f32));
+                let p = self.border_paint(
+                    border_arc_y(o, w, h, left, mid_y) * inv_per,
+                    (mid_x, mid_y as f32),
+                );
                 let slice = Rect {
                     x0,
                     y0: ya,
@@ -3025,7 +3188,7 @@ impl<'a> Emit<'a> {
     }
 
     fn trail(&self, out: &mut impl Ramps) {
-        let Some(lay) = self.trail_lay() else {
+        let Some(lay) = self.trail_lay else {
             return;
         };
         let TrailLay {
@@ -3045,14 +3208,21 @@ impl<'a> Emit<'a> {
         let mid = (ya + yb) as f32 * 0.5;
         let inv_len = 1.0 / len as f32;
         let mut wa = self.shimmer(0.0, (tx0 as f32, mid));
-        let mut ends: [Paint; TRAIL_STOPS.len()] =
-            std::array::from_fn(|s| self.stripe_paint(s, wa));
+        let mut ends: [Paint; TRAIL_STOPS.len()] = [
+            self.stripe_paint(0, wa),
+            self.stripe_paint(1, wa),
+            self.stripe_paint(2, wa),
+            self.stripe_paint(3, wa),
+            self.stripe_paint(4, wa),
+            self.stripe_paint(5, wa),
+        ];
         while xa < drawn {
             let xb = (xa + seg).min(drawn);
             let d = self.wave(&lay, k);
             let wb = self.shimmer((xb - tx0) as f32 * inv_len, (xb as f32, mid));
             let same_w = wb == wa;
-            for (s, end) in ends.iter_mut().enumerate() {
+            let mut s = 0;
+            while s < ends.len() {
                 let si = s as i64;
                 let mut y0 = ya + h * si / stripes;
                 let mut y1 = ya + h * (si + 1) / stripes;
@@ -3068,13 +3238,15 @@ impl<'a> Emit<'a> {
                     x1: xb,
                     y1,
                 };
+                let end = ends[s];
                 let pb = if same_w {
-                    *end
+                    end
                 } else {
                     self.stripe_paint(s, wb)
                 };
-                out.ramp(inner, r, *end, pb);
-                *end = pb;
+                out.ramp(inner, r, end, pb);
+                ends[s] = pb;
+                s += 1;
             }
             wa = wb;
             xa = xb;
@@ -3082,45 +3254,9 @@ impl<'a> Emit<'a> {
         }
     }
 
-    fn trail_lay(&self) -> Option<TrailLay> {
-        let g = self.geo;
-        let (
-            Rect {
-                x0: tx0,
-                y0: ya,
-                x1: tx1,
-                y1: yb,
-            },
-            amp,
-        ) = trail_rect(&g, self.scene, self.seat)?;
-        let len = tx1 - tx0;
-        let kitty = self.kitty.map(|(at, _)| at);
-        let drawn = match kitty {
-            Some(at) if ride(self.clock) < 1.0 => tx1.min(at.rear()),
-            _ => tx1,
-        };
-        let held = match kitty {
-            Some(at) => {
-                let h = at.rect.x0 - rim_px(at.p, g.t);
-                if drawn > h { h } else { i64::MAX }
-            }
-            None => i64::MAX,
-        };
-        let seg = if self.clock.t_ms.is_some() || self.clock.flow.is_some() {
-            (TRAIL_SEG_CELLS * g.cw).max((len + MAX_TRAIL_SEGMENTS - 1) / MAX_TRAIL_SEGMENTS)
-        } else {
-            len
-        };
-        Some(TrailLay {
-            tx0,
-            drawn,
-            len,
-            seg,
-            ya,
-            yb,
-            amp,
-            held,
-        })
+    #[inline]
+    const fn trail_lay(&self) -> Option<TrailLay> {
+        self.trail_lay
     }
 
     #[inline]
@@ -3137,9 +3273,9 @@ impl<'a> Emit<'a> {
     }
 
     #[inline]
-    fn rim_paint(&self, (x, y): (f32, f32), (cx, cy): (f32, f32)) -> Paint {
+    const fn rim_paint(&self, (x, y): (f32, f32), (cx, cy): (f32, f32)) -> Paint {
         const INV_TAU: f32 = 1.0 / std::f32::consts::TAU;
-        let u = (x - cx).atan2(cy - y) * INV_TAU;
+        let u = crate::color_math::atan2_f32(x - cx, cy - y) * INV_TAU;
         let s = u - u.floor();
         let base = self
             .scene
@@ -3149,7 +3285,7 @@ impl<'a> Emit<'a> {
         if self.scene.dark {
             light(
                 mix_rgb(base, WHITE, GLINT_CREST_DARK * ring),
-                f32::from(RIM_COV),
+                RIM_COV as f32,
             )
         } else {
             ink(
@@ -3160,8 +3296,10 @@ impl<'a> Emit<'a> {
     }
 
     #[inline]
-    fn rim_hole(&self) -> Option<Rect> {
-        let t = self.trail_lay()?;
+    const fn rim_hole(&self) -> Option<Rect> {
+        let Some(t) = self.trail_lay else {
+            return None;
+        };
         Some(Rect {
             x0: t.tx0,
             y0: t.ya,
@@ -3170,12 +3308,12 @@ impl<'a> Emit<'a> {
         })
     }
 
-    fn trail_ink(&self) -> TrailInk {
-        let mut ink = TrailInk::default();
+    const fn trail_ink(&self) -> TrailInk {
+        let mut ink = TrailInk::new();
         if self.scene.dark {
             return ink;
         }
-        let Some(lay) = self.trail_lay() else {
+        let Some(lay) = self.trail_lay else {
             return ink;
         };
         while ink.n < ink.covers.len() && lay.tx0 + ink.n as i64 * lay.seg < lay.drawn {
@@ -3205,7 +3343,7 @@ impl<'a> Emit<'a> {
         if glints.n == 0 {
             return;
         }
-        let Some(trail) = self.trail_lay() else {
+        let Some(trail) = self.trail_lay else {
             return;
         };
         let (rest, flare) = (glints.rest, glints.flare);
@@ -3219,7 +3357,12 @@ impl<'a> Emit<'a> {
         let t_sec = self.clock.t_ms.map(|t| t as f32 * 0.001);
         let rest_rgb = self.scene.palette.glint_rest();
         let inv_trail_len = 1.0 / trail.len as f32;
-        for (i, s) in glints.spots().iter().enumerate() {
+        let glint_spots = glints.spots();
+        let mut i = 0;
+        while i < glint_spots.len() {
+            let s = &glint_spots[i];
+            let cur_i = i;
+            i += 1;
             let up = match (self.clock.ride_ms, riding) {
                 (Some(t), Some((from, inv_dist))) => {
                     let passed = ride_at((s.x + flare + 1 - from) as f32 * inv_dist);
@@ -3250,7 +3393,7 @@ impl<'a> Emit<'a> {
                 arm,
                 cov: GLINT_COV * env,
                 gold: w >= GLINT_FLARE_DOTS,
-                color: self.mark_ink(i, mix_rgb(rest_rgb, WHITE, w)),
+                color: self.mark_ink(cur_i, mix_rgb(rest_rgb, WHITE, w)),
                 light: self.scene.dark,
             });
         }
@@ -3286,7 +3429,11 @@ impl<'a> Emit<'a> {
             CardPalette::Land => (twinkle_rgb(true), mix_rgb(SUNSET[3], WHITE, 0.5)),
             CardPalette::Off => (WHITE, MOONBOW[1]),
         };
-        for (i, s) in spots[..n].iter().enumerate() {
+        let mut i = 0;
+        while i < n {
+            let s = &spots[i];
+            let cur_i = i;
+            i += 1;
             let arm = i64::from(star_arm_px(star_arm(chf, s.ratio)));
             let up = match (self.clock.ride_ms, riding) {
                 (Some(t), Some((seat, from, inv_dist))) if s.x < seat.rect.x0 => {
@@ -3304,21 +3451,24 @@ impl<'a> Emit<'a> {
                     let e = twinkle_env(t_sec, s.phase);
                     let e = (e + (STAR_STEADY_ENV - e) * settle) * up;
                     let e = (e + (1.0 - STAR_STEADY_ENV) * ring).min(1.0);
-                    (e, s.gold || (i & 1 == 0 && twinkle_peak(e)) || ring >= 0.5)
+                    (
+                        e,
+                        s.gold || (cur_i & 1 == 0 && twinkle_peak(e)) || ring >= 0.5,
+                    )
                 }
                 None => (
                     STAR_STEADY_ENV + (1.0 - STAR_STEADY_ENV) * ring,
                     s.gold || ring >= 0.5,
                 ),
             };
-            let light_rgb = if i & 1 == 0 { even_rgb } else { odd_rgb };
+            let light_rgb = if cur_i & 1 == 0 { even_rgb } else { odd_rgb };
             lay(StarCall {
                 clip: region,
                 centre: (s.x, s.y),
                 arm,
                 cov: STAR_COV * env,
                 gold,
-                color: self.mark_ink(i, light_rgb),
+                color: self.mark_ink(cur_i, light_rgb),
                 light: dark,
             });
         }
@@ -3357,8 +3507,11 @@ impl<'a> Emit<'a> {
         let tax = if dark { 1.0 } else { STAR_ARM_INK };
         let tf = t as f32;
         let dist_f = dist as f32;
-        for k in 0..SHED_SPARKLES {
-            let f = (k + 1) as f32 * INV_SHED_STEP;
+        let mut k = 0;
+        while k < SHED_SPARKLES {
+            let cur_k = k;
+            k += 1;
+            let f = (cur_k + 1) as f32 * INV_SHED_STEP;
             let age = tf - ride_at(f);
             if !(0.0..SHED_MS as f32).contains(&age) {
                 continue;
@@ -3368,7 +3521,8 @@ impl<'a> Emit<'a> {
             let arm = i64::from(star_arm_px(star_arm(chf, ratio)));
             let m = arm + 1;
             let x = from + (dist_f * f).round() as i64 - m;
-            let y = y0 + (span_y * (0.15 + 0.7 * unit(self.seed, 0x5348_4544 ^ k as u64))) as i64;
+            let y =
+                y0 + (span_y * (0.15 + 0.7 * unit(self.seed, 0x5348_4544 ^ cur_k as u64))) as i64;
             let (lo, hi) = (
                 (region.x0 + m, region.y0 + m),
                 (region.x1 - m, region.y1 - m),
@@ -3392,7 +3546,7 @@ impl<'a> Emit<'a> {
                 arm,
                 cov: SHED_COV * crate::color_math::powf_pos_f32(1.0 - tau, 1.5),
                 gold: false,
-                color: self.mark_ink(k, self.scene.palette.mark(k)),
+                color: self.mark_ink(cur_k, self.scene.palette.mark(cur_k)),
                 light: dark,
             });
         }
@@ -3402,7 +3556,9 @@ impl<'a> Emit<'a> {
         let Some(ring) = self.burst_ring() else {
             return;
         };
-        for (k, &centre) in ring.centres.iter().enumerate() {
+        let mut k = 0;
+        while k < ring.centres.len() {
+            let centre = ring.centres[k];
             lay(StarCall {
                 clip: ring.region,
                 centre,
@@ -3412,6 +3568,7 @@ impl<'a> Emit<'a> {
                 color: self.mark_ink(k, self.scene.palette.mark(k)),
                 light: self.scene.dark,
             });
+            k += 1;
         }
     }
 
@@ -3434,7 +3591,7 @@ impl<'a> Emit<'a> {
         self.glints(&mut |s: StarCall| lay(s.laid_as(rest, ground)));
     }
 
-    fn burst_ring(&self) -> Option<BurstRing> {
+    const fn burst_ring(&self) -> Option<BurstRing> {
         const INV_BURST_MS: f32 = 1.0 / BURST_MS as f32;
         const STEP_THETA: f32 = std::f32::consts::TAU / BURST_STARS as f32;
         let age = match self.clock.ride_ms {
@@ -3445,7 +3602,9 @@ impl<'a> Emit<'a> {
             Some(t) if t < BURST_MS => t,
             _ => return None,
         };
-        let region = self.star_region?;
+        let Some(region) = self.star_region else {
+            return None;
+        };
         let g = self.geo;
         let ((cx, mid), half_w) = match self.seat {
             Some(at) => {
@@ -3453,8 +3612,16 @@ impl<'a> Emit<'a> {
                 (((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2), (r.x1 - r.x0) / 2)
             }
             None => {
-                let (_, end) = self.scene.trail?;
-                ((g.col(end).min(region.x1), g.band(g.top + 1)), 0)
+                let Some((_, end)) = self.scene.trail else {
+                    return None;
+                };
+                let col_end = g.col(end);
+                let x = if col_end < region.x1 {
+                    col_end
+                } else {
+                    region.x1
+                };
+                ((x, g.band(g.top + 1)), 0)
             }
         };
         let tau = t as f32 * INV_BURST_MS;
@@ -3466,17 +3633,21 @@ impl<'a> Emit<'a> {
         let ratio = STAR_ARM_HERO + (STAR_ARM_FINE - STAR_ARM_HERO) * tau;
         let ratio = ratio * if self.scene.dark { 1.0 } else { STAR_ARM_INK };
         let turn = unit(self.seed, 0x4255_5253) * std::f32::consts::TAU;
+        let mut centres = [(0i64, 0i64); BURST_STARS];
+        let mut k = 0;
+        while k < BURST_STARS {
+            let theta = turn + k as f32 * STEP_THETA;
+            let (sin_t, cos_t) = crate::supernova::sin_cos_f32(theta);
+            centres[k] = (
+                cx + (cos_t * rx * reach).round() as i64,
+                mid + (sin_t * ry * reach).round() as i64,
+            );
+            k += 1;
+        }
         Some(BurstRing {
             region,
-            centres: std::array::from_fn(|k| {
-                let theta = turn + k as f32 * STEP_THETA;
-                let (sin_t, cos_t) = crate::supernova::sin_cos_f32(theta);
-                (
-                    cx + (cos_t * rx * reach).round() as i64,
-                    mid + (sin_t * ry * reach).round() as i64,
-                )
-            }),
-            arm: i64::from(star_arm_px(star_arm(g.ch as f32, ratio))),
+            centres,
+            arm: star_arm_px(star_arm(g.ch as f32, ratio)) as i64,
             cov: BURST_COV * crate::color_math::powf_pos_f32(1.0 - tau, 1.2),
         })
     }
@@ -3498,7 +3669,7 @@ impl StarCall {
     /// The star laid on `ground`: a dark scene's light as [`dark_mark`] lays it, a printed star
     /// as it is.
     #[inline]
-    fn laid_on(self, ground: u32) -> Self {
+    const fn laid_on(self, ground: u32) -> Self {
         if !self.light {
             return self;
         }
@@ -3517,7 +3688,7 @@ impl StarCall {
     /// scene's does; else its flared light as [`Self::laid_on`] lays it, which stays light (white
     /// reads wherever the rest light, or its lift, does).
     #[inline]
-    fn laid_as(self, rest: DarkMark, ground: u32) -> Self {
+    const fn laid_as(self, rest: DarkMark, ground: u32) -> Self {
         match rest {
             DarkMark::Print(color) if self.light => Self {
                 color,
@@ -3530,55 +3701,95 @@ impl StarCall {
 }
 
 fn rim_strips(frame: &[&str], p: i64, rim: i64, mut strip: impl FnMut(Rect)) {
+    #[inline]
+    const fn rim_h_edge(frame: &[&str], art_row: i64, open_row: i64, c: i64) -> bool {
+        art_at(frame, art_row, c) && !rim_solid(frame, open_row, c)
+    }
+    #[inline]
+    const fn rim_h_outer(frame: &[&str], art_row: i64, open_row: i64, e: i64) -> bool {
+        !rim_solid(frame, art_row, e) && !rim_solid(frame, open_row, e)
+    }
+    #[inline]
+    const fn rim_v_edge(frame: &[&str], art_col: i64, open_col: i64, r: i64) -> bool {
+        rim_solid(frame, r, art_col) && !rim_solid(frame, r, open_col)
+    }
     let (h, w) = (frame.len() as i64, KITTY_W as i64);
-    let solid = |r: i64, c: i64| rim_solid(frame, r, c);
-    for b in 0..=h {
-        for (art_row, open_row, y0) in [(b, b - 1, b * p - rim), (b - 1, b, b * p)] {
-            let edge = |c: i64| art_at(frame, art_row, c) && !solid(open_row, c);
+    let mut b = 0;
+    while b <= h {
+        let row_pairs = [(b, b - 1, b * p - rim), (b - 1, b, b * p)];
+        let mut rpi = 0;
+        while rpi < row_pairs.len() {
+            let (art_row, open_row, y0) = row_pairs[rpi];
+            rpi += 1;
             let mut c = 0;
             while c < w {
-                if !edge(c) {
+                if !rim_h_edge(frame, art_row, open_row, c) {
                     c += 1;
                     continue;
                 }
                 let c0 = c;
-                while c < w && edge(c) {
+                while c < w && rim_h_edge(frame, art_row, open_row, c) {
                     c += 1;
                 }
-                let outer = |e: i64| !solid(art_row, e) && !solid(open_row, e);
                 strip(Rect {
-                    x0: c0 * p - if outer(c0 - 1) { rim } else { 0 },
+                    x0: c0 * p
+                        - if rim_h_outer(frame, art_row, open_row, c0 - 1) {
+                            rim
+                        } else {
+                            0
+                        },
                     y0,
-                    x1: c * p + if outer(c) { rim } else { 0 },
+                    x1: c * p
+                        + if rim_h_outer(frame, art_row, open_row, c) {
+                            rim
+                        } else {
+                            0
+                        },
                     y1: y0 + rim,
                 });
             }
         }
+        b += 1;
     }
-    for v in 0..=w {
-        for (art_col, open_col, x0) in [(v, v - 1, v * p - rim), (v - 1, v, v * p)] {
-            let edge = |r: i64| solid(r, art_col) && !solid(r, open_col);
+    let mut v = 0;
+    while v <= w {
+        let col_pairs = [(v, v - 1, v * p - rim), (v - 1, v, v * p)];
+        let mut cpi = 0;
+        while cpi < col_pairs.len() {
+            let (art_col, open_col, x0) = col_pairs[cpi];
+            cpi += 1;
             let mut r = 0;
             while r < h {
-                if !edge(r) {
+                if !rim_v_edge(frame, art_col, open_col, r) {
                     r += 1;
                     continue;
                 }
                 let top = r;
-                while r < h && edge(r) {
+                while r < h && rim_v_edge(frame, art_col, open_col, r) {
                     r += 1;
                 }
                 let q = Rect {
                     x0,
-                    y0: top * p + if solid(top - 1, open_col) { rim } else { 0 },
+                    y0: top * p
+                        + if rim_solid(frame, top - 1, open_col) {
+                            rim
+                        } else {
+                            0
+                        },
                     x1: x0 + rim,
-                    y1: r * p - if solid(r, open_col) { rim } else { 0 },
+                    y1: r * p
+                        - if rim_solid(frame, r, open_col) {
+                            rim
+                        } else {
+                            0
+                        },
                 };
                 if q.y1 > q.y0 {
                     strip(q);
                 }
             }
         }
+        v += 1;
     }
 }
 
@@ -3599,6 +3810,13 @@ struct TrailInk {
 impl Default for TrailInk {
     #[inline]
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrailInk {
+    #[inline]
+    const fn new() -> Self {
         Self {
             covers: [Rect {
                 x0: 0,
@@ -3609,9 +3827,7 @@ impl Default for TrailInk {
             n: 0,
         }
     }
-}
 
-impl TrailInk {
     #[inline]
     const fn covers(&self) -> &[Rect] {
         self.covers.split_at(self.n).0

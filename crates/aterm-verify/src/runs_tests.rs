@@ -988,6 +988,36 @@ fn a_root_made_after_the_run_started_still_matches() {
     );
 }
 
+/// The first start has no records to sweep and does not create the records directory.
+#[test]
+fn a_records_directory_not_created_yet_is_an_empty_start_pass() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let absent = dir.path().join("verify-runs");
+    let k = FakeKernel::default();
+    let (ended, lines) = start_pass(&absent, &k);
+    assert_eq!(ended, 0);
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(k.signals.borrow().is_empty());
+    assert!(k.markers_read.borrow().is_empty());
+    assert!(!absent.exists());
+}
+
+/// Other directory-opening failures still leave the competing claims unknown.
+#[test]
+fn a_non_directory_does_not_admit_an_empty_records_snapshot() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("verify-runs");
+    let bytes = dead_record();
+    std::fs::write(&path, &bytes).expect("non-directory fixture");
+    assert!(read_records(&path).is_err());
+    let k = FakeKernel::default();
+    let (ended, _) = start_pass(&path, &k);
+    assert_eq!(ended, 0);
+    assert!(k.signals.borrow().is_empty());
+    assert!(k.markers_read.borrow().is_empty());
+    assert_eq!(std::fs::read_to_string(&path).expect("kept fixture"), bytes);
+}
+
 /// A member claimed by a live run's group or id is never ended by another run's start.
 #[test]
 fn a_member_a_live_run_claims_is_spared() {

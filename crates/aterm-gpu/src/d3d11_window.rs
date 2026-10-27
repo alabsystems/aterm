@@ -7,9 +7,8 @@
 //! instance, on a visual whose premultiplied pixels blend over Mica or
 //! Acrylic. With `hdr_glow` on it is f16, tagged scRGB, where the window's
 //! output is in HDR mode, and a probe every 250 ms follows Windows HDR being
-//! switched on or off under it, through the `HdrReconfigureRetag` plan the
-//! wgpu arm ran. A build that also carries wgpu (`--features wgpu-oracle`)
-//! attaches windows on wgpu.
+//! switched on or off under it, through the `HdrReconfigureRetag` plan
+//! (`format_plan::hdr_reconfigure_plan`).
 //!
 //! The pacing is wgpu-dx12's: one frame of latency on the chain's waitable,
 //! waited on as the acquire, and a present that waits for no refresh
@@ -87,7 +86,6 @@ impl std::fmt::Debug for D3dWindow {
     }
 }
 
-#[cfg(not(wgpu_arm))]
 impl GpuRenderer {
     /// Attach `target`'s window: the arm (minted here if a headless frame did
     /// not come first) and a flip-model swap chain at `width` x `height`
@@ -236,7 +234,7 @@ impl GpuRenderer {
     /// since Windows does not resize a window when HDR is switched: a live
     /// f16 chain is re-tagged, and falls back to 8-bit when its output left
     /// HDR mode; an opted-in 8-bit chain moves to f16 when its output entered
-    /// it. The wgpu arm's plan (`format_plan::hdr_reconfigure_plan`,
+    /// it. The plan (`format_plan::hdr_reconfigure_plan`,
     /// `hdr_live_upgrade_wants_f16`) and window metadata.
     fn d3d11_reconcile_hdr_if_due(&mut self, win: &mut WindowGpu, surf: &mut GpuSurface) {
         if !surf.is_hdr() && !(self.hdr_glow && surf.supports_f16) {
@@ -309,7 +307,7 @@ impl GpuRenderer {
         effects_transport_shift_y: i32,
     ) -> Result<(), SurfacePresentFailure> {
         // A minimized window cannot be seen, and DXGI presents to it all the
-        // same: refuse before any compose, as the wgpu arm did, unless a
+        // same: refuse before any compose, unless a
         // capture or a recording waits on the present.
         if win.parks_while_minimized() {
             return Err(SurfacePresentFailure::Occluded);

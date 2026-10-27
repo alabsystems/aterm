@@ -130,6 +130,20 @@ mod live {
         let _ = c.wait();
     }
 
+    /// `ps -o tdev`'s word for a terminal device: `major/minor` of `e_tdev`, `??` for none. `ps`'s
+    /// `tty` name comes from `devname(3)`, a scan of `/dev` that skips a live terminal's node while
+    /// another process removes an earlier one, so under pty churn it prints `??` for a process that
+    /// holds a terminal; `tdev` is the kernel's number, read from the same record kproc reads.
+    fn tdev_word(tty: Option<i32>) -> String {
+        tty.map_or_else(
+            || "??".to_string(),
+            |d| {
+                let d = d.cast_unsigned();
+                format!("{}/{}", (d >> 24) & 0xff, d & 0x00ff_ffff)
+            },
+        )
+    }
+
     #[test]
     fn every_record_is_the_one_ps_reads() {
         let dead = zombie();
@@ -138,7 +152,7 @@ mod live {
         let lines = ps(&[
             "-A",
             "-o",
-            "pid=,ppid=,pgid=,tpgid=,uid=,stat=,tty=,lstart=",
+            "pid=,ppid=,pgid=,tpgid=,uid=,stat=,tdev=,lstart=",
         ]);
         let b = by_pid(records().expect("records"));
         let rows = (dead.id(), pty);
@@ -146,8 +160,6 @@ mod live {
         end(script);
         end(dead);
         let mut compared = BTreeSet::new();
-        let mut names: BTreeMap<String, BTreeSet<Option<i32>>> = BTreeMap::new();
-        let mut devices: BTreeMap<Option<i32>, BTreeSet<String>> = BTreeMap::new();
         for line in &lines {
             let w: Vec<&str> = line.split_whitespace().collect();
             let pid: u32 = w[0].parse().expect("pid");
@@ -182,21 +194,9 @@ mod live {
                 "uid: {line} vs {r:?}"
             );
             assert_eq!(w[5].contains('Z'), r.zombie, "zombie: {line} vs {r:?}");
-            assert_eq!(
-                w[6] == "??",
-                r.tty.is_none(),
-                "no terminal: {line} vs {r:?}"
-            );
+            assert_eq!(w[6], tdev_word(r.tty), "terminal: {line} vs {r:?}");
             assert_eq!(lstart_secs(&w[7..]), r.start_s, "start: {line} vs {r:?}");
-            names.entry(w[6].to_string()).or_default().insert(r.tty);
-            devices.entry(r.tty).or_default().insert(w[6].to_string());
             compared.insert(pid);
-        }
-        for (name, devs) in &names {
-            assert_eq!(devs.len(), 1, "`{name}` names one device: {devs:?}");
-        }
-        for (dev, ttys) in &devices {
-            assert_eq!(ttys.len(), 1, "{dev:?} has one name: {ttys:?}");
         }
         for pid in [std::process::id(), rows.0, rows.1] {
             assert!(compared.contains(&pid), "fixture {pid} compared");

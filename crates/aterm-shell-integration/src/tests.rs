@@ -103,10 +103,29 @@ fn mark_fish_completions_made(cmd: &Command) {
     }
 }
 
+#[cfg(unix)]
+fn detach_session(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: between fork and exec, `getsid`, `getpid`, and `setsid` alone,
+    // all async-signal-safe: start a fresh session with no controlling
+    // terminal unless already leading one, so an interactive shell run on pipes
+    // (`bash 5.3 -i`, `zsh -i`) cannot open `/dev/tty` to write on the caller's
+    // terminal or stop a background test process group with `SIGTTIN`/`SIGTTOU`.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::getsid(0) != libc::getpid() && libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// A shell command with a hermetic environment for integration tests.
 #[cfg(unix)]
 fn shell_command(shell: &str) -> ShellCommand {
     let mut cmd = Command::new(shell);
+    detach_session(&mut cmd);
     for var in [
         "ATERM_SHELL_INTEGRATION_INSTALLED",
         "ATERM_PROMPT_STYLE",
@@ -2567,6 +2586,7 @@ impl LiveShell {
     /// The shell holds its three pipes and nothing else of this process ([`Self::defaults`]).
     fn spawn(label: &str, cmd: &mut Command) -> Self {
         Self::defaults(cmd);
+        detach_session(cmd);
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -2607,11 +2627,14 @@ impl LiveShell {
         cmd.stdin(end(&slave))
             .stdout(end(&slave))
             .stderr(end(&slave));
-        // SAFETY: between fork and exec, `setsid` and `ioctl` alone, both
-        // async-signal-safe: a new session, the slave on stdin its terminal.
+        // SAFETY: between fork and exec, `getsid`, `getpid`, `setsid` and `ioctl`
+        // alone, all async-signal-safe: a new session unless already started,
+        // the slave on stdin its terminal.
         unsafe {
             cmd.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                if (libc::getsid(0) != libc::getpid() && libc::setsid() < 0)
+                    || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0
+                {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -3355,7 +3378,13 @@ fn a_shell_on_its_pty_has_it_for_its_terminal() {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         String::from_utf8_lossy(&text[..at]).into_owned()
     };
-    let printed = |line: &str| seen.lines().any(|l| l.trim() == line);
+    // A line may follow the prompt: the probe is typed before the shell prints its first, so
+    // the pty echoes it ahead of the prompt, and the prompt then leads the probe's first line
+    // ("$ TERMINALS=3", the Linux lane's dash on a loaded host).
+    let printed = |line: &str| {
+        seen.lines()
+            .any(|l| l.trim().rsplit("$ ").next() == Some(line))
+    };
     assert!(
         printed("TERMINALS=3"),
         "fds 0, 1 and 2 are terminals\n{seen}"
@@ -3397,11 +3426,13 @@ fn a_shell_on_its_pty_has_it_for_its_terminal() {
         "a shell that opens no terminal has the pty for its own\n{seen}"
     );
     quiet.finish();
-    // On pipes the shell keeps this process's session, so it writes nowhere near `/dev/tty`.
+    // On pipes the shell leads a fresh session with no controlling terminal, so `/dev/tty` fails.
     let mut cmd = shell_command("/bin/sh");
     let mut on_pipes = LiveShell::spawn("sh", &mut cmd).holding(cmd.into_home());
     on_pipes.send(&format!(
-        "{TERMINALS} || echo TERMINALS=0; echo MARK$((40+2))"
+        "{TERMINALS} || echo TERMINALS=0; \
+         (echo CTTY=$((0+1)) >/dev/tty) 2>/dev/null || echo NO_CTTY=$((0+1)); \
+         echo MARK$((40+2))"
     ));
     let at = on_pipes.wait_for_after("MARK42", 0);
     let seen = {
@@ -3412,7 +3443,186 @@ fn a_shell_on_its_pty_has_it_for_its_terminal() {
         String::from_utf8_lossy(&text[..at]).into_owned()
     };
     assert!(seen.lines().any(|l| l.trim() == "TERMINALS=0"), "{seen}");
+    assert!(seen.lines().any(|l| l.trim() == "NO_CTTY=1"), "{seen}");
+    assert!(!seen.lines().any(|l| l.trim() == "CTTY=1"), "{seen}");
     on_pipes.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn piped_interactive_shells_in_a_background_group_neither_stop_nor_touch_the_tty() {
+    use aterm_uds::spawnfd::InheritNothing as _;
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::os::unix::process::CommandExt as _;
+
+    const STAGE_VAR: &str = "ATERM_TEST_BG_TTY_STAGE";
+    const TEST_NAME: &str =
+        "tests::piped_interactive_shells_in_a_background_group_neither_stop_nor_touch_the_tty";
+
+    match std::env::var(STAGE_VAR).ok().as_deref() {
+        Some("bg") => {
+            assert!(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/tty")
+                    .is_ok(),
+                "background test group must inherit a controlling /dev/tty to exercise the hazard"
+            );
+            let mut shells = ShellLanes::default();
+            let lanes = posix_lanes(&mut shells);
+            let bashes = shells.bashes();
+            shells.absent.clear();
+            let script = format!(
+                "{}/src/scripts/aterm_shell_integration",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            for (shell, args, file, _) in lanes {
+                let out = shell_command(shell)
+                    .args(args)
+                    .args([
+                        "-c",
+                        &format!(
+                            "source \"{script}.{ext}\"; echo OK$((40+2))",
+                            ext = file.rsplit('.').next().unwrap_or("sh")
+                        ),
+                    ])
+                    .env("ATERM_CHILD", "1")
+                    .output()
+                    .unwrap_or_else(|e| panic!("{shell}: {e}"));
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    out.status.success() && stdout.contains("OK42"),
+                    "{shell}: status={:?} stdout={stdout:?} stderr={:?}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            for bash in bashes {
+                let fx = LiveFixture::new();
+                let mut sh = spawn_live_bash(bash, &fx, "", &[("ATERM_SHELL_NONCE", REKEY_OLD)]);
+                sh.send("echo LIVE_BG$((40+2))");
+                sh.wait_for_after("LIVE_BG42", 0);
+                sh.finish();
+            }
+            return;
+        }
+        Some("leader") => {
+            let exe = std::env::current_exe().expect("test binary");
+            let mut cmd = Command::new(exe);
+            cmd.inherit_nothing();
+            cmd.args(["--exact", TEST_NAME, "--nocapture"])
+                .env(STAGE_VAR, "bg")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .process_group(0);
+            let mut child = cmd.spawn().expect("spawn background group");
+            let out = pump(child.stdout.take().expect("bg stdout"));
+            let err = pump(child.stderr.take().expect("bg stderr"));
+            let started = std::time::Instant::now();
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("try_wait bg") {
+                    break status;
+                }
+                if started.elapsed() >= LiveShell::TIMEOUT {
+                    if let Ok(pgid) = i32::try_from(child.id()) {
+                        // SAFETY: `child` was spawned with `process_group(0)` and has not been
+                        // reaped, so `-pgid` names its process group alone.
+                        unsafe {
+                            libc::kill(-pgid, libc::SIGKILL);
+                        }
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "background test group hung or stopped on /dev/tty:\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(
+                            &out.lock().unwrap_or_else(PoisonError::into_inner)
+                        ),
+                        String::from_utf8_lossy(
+                            &err.lock().unwrap_or_else(PoisonError::into_inner)
+                        ),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            };
+            assert!(
+                status.success(),
+                "background test group failed ({status}):\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.lock().unwrap_or_else(PoisonError::into_inner)),
+                String::from_utf8_lossy(&err.lock().unwrap_or_else(PoisonError::into_inner)),
+            );
+            return;
+        }
+        Some(other) => panic!("unexpected {STAGE_VAR}={other}"),
+        None => {}
+    }
+
+    let mut shells = ShellLanes::default();
+    let _ = posix_lanes(&mut shells);
+
+    let (master, slave) = aterm_pty::open_pty_pair().expect("open pty");
+    // SAFETY: `open_pty_pair` returned two fresh, close-on-exec descriptors owned here alone.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let exe = std::env::current_exe().expect("test binary");
+    let mut cmd = Command::new(exe);
+    cmd.inherit_nothing();
+    cmd.args(["--exact", TEST_NAME, "--nocapture"])
+        .env(STAGE_VAR, "leader")
+        .stdin(std::process::Stdio::from(slave))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // SAFETY: between fork and exec, `setsid` and `ioctl` alone, both async-signal-safe:
+    // `leader` owns a dedicated pty session whose slave is fd 0.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut leader = cmd.spawn().expect("spawn session leader");
+    let pty_out = pump(PtyMaster(std::fs::File::from(master)));
+    let leader_out = pump(leader.stdout.take().expect("leader stdout"));
+    let leader_err = pump(leader.stderr.take().expect("leader stderr"));
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = leader.try_wait().expect("try_wait leader") {
+            break status;
+        }
+        if started.elapsed() >= LiveShell::TIMEOUT {
+            let _ = leader.kill();
+            let _ = leader.wait();
+            panic!(
+                "pty session leader timed out:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&leader_out.lock().unwrap_or_else(PoisonError::into_inner)),
+                String::from_utf8_lossy(&leader_err.lock().unwrap_or_else(PoisonError::into_inner)),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    };
+    assert!(
+        status.success(),
+        "pty session leader failed ({status}):\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&leader_out.lock().unwrap_or_else(PoisonError::into_inner)),
+        String::from_utf8_lossy(&leader_err.lock().unwrap_or_else(PoisonError::into_inner)),
+    );
+    while !pty_out.ended.load(std::sync::atomic::Ordering::SeqCst)
+        && started.elapsed() < LiveShell::TIMEOUT
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let leaked = pty_out
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert!(
+        leaked.is_empty(),
+        "piped shells leaked bytes onto the caller's controlling /dev/tty: {:?}",
+        String::from_utf8_lossy(&leaked)
+    );
 }
 
 /// [`zsh_shell`] for a test that needs a real zsh.

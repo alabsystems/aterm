@@ -74,9 +74,27 @@ fn every_seed_holds_every_law() {
         total.acks_held += s.acks_held;
         total.tries_not_yet += s.tries_not_yet;
         total.seen_before_ack += s.seen_before_ack;
+        total.commits_corked += s.commits_corked;
+        total.commits_alone += s.commits_alone;
+        total.kills_holding += s.kills_holding;
         total.writes_failed += s.writes_failed;
         total.renamed_unflushed += s.renamed_unflushed;
         total.disk_full_refused += s.disk_full_refused;
+        total.retention_ticks += s.retention_ticks;
+        total.retention_cuts += s.retention_cuts;
+        total.given_up += s.given_up;
+        total.retained_from += s.retained_from;
+        total.gaps_noticed += s.gaps_noticed;
+        total.gaps_told += s.gaps_told;
+        total.days_passed += s.days_passed;
+        total.unretained_starts += s.unretained_starts;
+        total.changed_starts += s.changed_starts;
+        total.mirror_waits += s.mirror_waits;
+        total.refills_judged += s.refills_judged;
+        total.refill_rows += s.refill_rows;
+        total.refills_together += s.refills_together;
+        total.refill_together_sessions += s.refill_together_sessions;
+        total.refills_below_oldest += s.refills_below_oldest;
     }
     eprintln!("the committed world over {COMMITTED_SEEDS} seeds: {total:?}");
     assert!(
@@ -122,12 +140,41 @@ fn every_seed_holds_every_law() {
         ("acks the broker held", total.acks_held),
         ("reads that found an ack not yet there", total.tries_not_yet),
         ("records read before their ack", total.seen_before_ack),
+        (
+            "inbox commits that rode a publish in one write",
+            total.commits_corked,
+        ),
+        ("inbox commits written alone", total.commits_alone),
+        ("kills while an inbox commit was held", total.kills_holding),
         ("state-dir writes failed", total.writes_failed),
         (
             "durable replaces renamed with their flush failed",
             total.renamed_unflushed,
         ),
         ("writes a full disk refused", total.disk_full_refused),
+        ("retention ticks", total.retention_ticks),
+        ("cuts that moved the base", total.retention_cuts),
+        ("records retention gave up", total.given_up),
+        ("fetches refused `retained-from=`", total.retained_from),
+        ("gap notices a tail was told", total.gaps_noticed),
+        ("`link gap` lines aterm was told", total.gaps_told),
+        ("days that passed at once", total.days_passed),
+        ("opens that set no rules", total.unretained_starts),
+        ("opens that set changed rules", total.changed_starts),
+        (
+            "waits of the mirror on its window budget",
+            total.mirror_waits,
+        ),
+        ("refills from a watermark judged", total.refills_judged),
+        ("records those refills had to offer", total.refill_rows),
+        (
+            "reads of the node's inbox for sessions together",
+            total.refills_together,
+        ),
+        (
+            "refills of a lane below the node inbox's oldest",
+            total.refills_below_oldest,
+        ),
     ] {
         assert!(n > 0, "the seeds exercised no {what}: {total:?}");
     }
@@ -305,7 +352,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "model:",
-            98,
+            14,
         ),
         (
             "the endpoint forgets the offsets a move took (no loss)",
@@ -319,7 +366,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "lost:",
-            256,
+            240,
         ),
         (
             "the endpoint forgets the offsets a move took (receipts)",
@@ -339,7 +386,7 @@ fn each_rule_switched_off_is_caught() {
             "the inbox commit waits for the record's delivery",
             Box::new(|s| Opts::seed(s).with(Mutant::CommitBeforeDelivery)),
             "model:",
-            4,
+            12,
         ),
         (
             "a session ahead of the bridge's witness keeps below the chain's fork (F3)",
@@ -352,7 +399,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "dup delivery",
-            1730,
+            650,
         ),
         (
             "the attach reads the lineage of a moved generation",
@@ -405,9 +452,11 @@ fn each_rule_switched_off_is_caught() {
         (
             "the incarnation lease is trusted only in the boot that wrote it",
             Box::new(|s| {
-                both_ways(s)
-                    .with(Mutant::LeaseAcrossBoots)
-                    .with(Mutant::TrustTheFloorThatReads)
+                without_retention(
+                    both_ways(s)
+                        .with(Mutant::LeaseAcrossBoots)
+                        .with(Mutant::TrustTheFloorThatReads),
+                )
             }),
             "cap-compromised",
             54518,
@@ -421,7 +470,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "mirror:",
-            68,
+            130,
         ),
         (
             "a replaced log forgets the mirror's cursors (aterm-gui's `forget_landed`)",
@@ -436,7 +485,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "mirror:",
-            12,
+            24,
         ),
         (
             "a relaunched bridge republishes the mirror's pinned batch at its sequences",
@@ -453,7 +502,7 @@ fn each_rule_switched_off_is_caught() {
             "`session-exited` publishes the session's `exited` row",
             Box::new(|s| Opts::seed(s).with(Mutant::SkipExitedRow)),
             "presence:",
-            194,
+            36,
         ),
         (
             "a ghost row is swept",
@@ -471,13 +520,13 @@ fn each_rule_switched_off_is_caught() {
             "the attach records the predecessor's will it read",
             Box::new(|s| Opts::with_a_sibling(s).with(Mutant::IgnoreWitnessedWill)),
             "presence:",
-            4,
+            10,
         ),
         (
             "a lower incarnation's row under another state dir's mark is not its own",
             Box::new(|s| Opts::with_a_sibling(s).with(Mutant::RetireEveryEarlierIncarnation)),
             "presence:",
-            1,
+            2,
         ),
         (
             "a bridge tells aterm what its quarantine holds",
@@ -489,13 +538,13 @@ fn each_rule_switched_off_is_caught() {
             "an offset below the self-lane window is not added to it",
             Box::new(|s| Opts::seed(s).with(Mutant::RememberBelowTheWindow)),
             "forged-self",
-            92,
+            28,
         ),
         (
             "the recovery a write error stopped is done before the run record",
             Box::new(|s| Opts::seed(s).with(Mutant::BeginRunPastAFailedRecovery)),
             "liveness",
-            93,
+            31,
         ),
         (
             "the mirror judges its pin once the recovery reconciled it",
@@ -519,19 +568,13 @@ fn each_rule_switched_off_is_caught() {
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            1007,
-        ),
-        (
-            "a record the attach published again is delivered once its post is retired",
-            Box::new(|s| both_ways_erring(s).with(Mutant::DeliverBeforeTheDrain)),
-            "dup delivery",
-            3222,
+            681,
         ),
         (
             "a run whose recovery is owed makes no clean stop",
             Box::new(|s| erring_quitting(s).with(Mutant::CleanStopOverAnOwedRecovery)),
             "mirror",
-            3879,
+            327,
         ),
         (
             "a recovery tried again moves each file once",
@@ -583,11 +626,137 @@ fn each_rule_switched_off_is_caught() {
             "P7",
             1,
         ),
+        (
+            "a session's refill reads on from a floor retention raised",
+            Box::new(|s| Opts::seed(s).with(Mutant::RefillWithoutTheFloor)),
+            "liveness",
+            6,
+        ),
+        (
+            "an attach's refill of sessions together reads from the lowest start",
+            Box::new(|s| Opts::seed(s).with(Mutant::RefillTogetherFromTheHighest)),
+            "refill:",
+            2,
+        ),
+        (
+            "a session below the node inbox's oldest reads its own lane up to it",
+            Box::new(|s| Opts::seed(s).with(Mutant::RefillJoinBelowTheOldest)),
+            "refill:",
+            2,
+        ),
+        (
+            "the inbox's gap notice moves no commit past the held records in it",
+            Box::new(|s| scaled(s).with(Mutant::CommitPastTheGap)),
+            "model:",
+            10,
+        ),
+        (
+            "the inbox's gap notice is told to aterm",
+            Box::new(|s| scaled(s).with(Mutant::TellNoGap)),
+            "given up untold",
+            230,
+        ),
+        (
+            "the mirror's window takes the broker's oldest=",
+            Box::new(|s| windowed(s).with(Mutant::MirrorIgnoresOldest)),
+            "mirror",
+            1,
+        ),
+        (
+            "a read back that meets its subject's floor reads again told",
+            Box::new(|s| Opts::seed(s).with(Mutant::ReadBackWithoutTheHeld)),
+            "dup post",
+            104,
+        ),
+        (
+            "a read of one offset below its filter's oldest reads again told (F3)",
+            Box::new(|s| fetching(s).with(Mutant::ReadAtWithoutTheHeld)),
+            "fetch:",
+            4,
+        ),
+        (
+            "the deadline sweep reads on from a floor retention raised (F4)",
+            Box::new(|s| asking(s).with(Mutant::SweepWithAPlainFetch)),
+            "neither answered nor expired",
+            4,
+        ),
+        (
+            "a topic replay reads on from a floor retention raised (F4)",
+            Box::new(|s| asking(s).with(Mutant::TopicReplayWithAPlainFetch)),
+            "topic:",
+            3,
+        ),
+        (
+            "a topic replay tells aterm what retention gave up of the topic (F4)",
+            Box::new(|s| asking(s).with(Mutant::TopicReplayTellsNoGap)),
+            "silent skip",
+            13,
+        ),
+        (
+            "a topic catch-up tells the uncounted notice below the first broadcast it delivers (F4)",
+            Box::new(|s| asking(s).with(Mutant::TopicReplayDropsAnUncountedNotice)),
+            "silent skip",
+            463,
+        ),
+        (
+            "the broadcast face's gap notice hands its cursors to the catch-up (F4)",
+            Box::new(|s| asking(s).with(Mutant::SayFaceGapUntold)),
+            "silent skip",
+            13,
+        ),
+        (
+            "the deadline sweep reads the asker's lane for an answer (F4)",
+            Box::new(|s| asking(s).with(Mutant::SweepIgnoresAnswers)),
+            "which the broker holds",
+            1,
+        ),
+        (
+            "the deadline sweep takes an `expired` on the lane for its verdict (F4)",
+            Box::new(|s| asking(s).with(Mutant::ExpireWithoutReadingBack)),
+            " expired 2 times",
+            // 1149 before the merge with critic item B09's refill and the review's fixes.
+            1688,
+        ),
+        (
+            "a hand-off whose heads the disk refuses keeps the journal (F4)",
+            Box::new(|s| asking_erring(s).with(Mutant::HandOffWithoutTheHeads)),
+            "dup post|answered 2 times| expired 2 times",
+            126,
+        ),
+        (
+            "an answer is delivered only once the deadline it settles is off the disk (F4)",
+            Box::new(|s| asking_erring(s).with(Mutant::DeliverOverAnUnwrittenSettle)),
+            "was handed",
+            537,
+        ),
+        (
+            "an attach takes a hand-off's files before its incarnation (F4)",
+            Box::new(|s| asking_erring(s).with(Mutant::AdoptAfterTheAttach)),
+            "dup post|answered 2 times| expired 2 times",
+            202,
+        ),
+        (
+            "an adoption names the attach of the hand-off it takes (F4)",
+            Box::new(|s| asking_erring(s).with(Mutant::AdoptWithoutTheAttach)),
+            "dup post|answered 2 times| expired 2 times",
+            202,
+        ),
+        (
+            "a post retires only once its deadline is on disk (F4)",
+            Box::new(|s| asking_erring(s).with(Mutant::RetireOverAnUnwrittenDeadline)),
+            "neither answered nor expired",
+            336,
+        ),
     ];
+    // The replay's drain rule (a record the attach published again is delivered once its
+    // post is retired, sim item S7) is held by bridge's
+    // `a_replayed_record_waits_for_its_posts_retirement_so_a_move_delivers_it_once`, whose
+    // `hold=false` arms are its control: retention's draws (sim item B05) moved the one seed
+    // within the rare search that met it (18017), and no seed within 60,000 of these worlds,
+    // nor 30,000 of worlds without retention, meets it now.
     const RARE: &[&str] = &[
         "an offset below the self-lane window is not added to it",
         "a run whose recovery is owed makes no clean stop",
-        "a record the attach published again is delivered once its post is retired",
         "a mirror floor covers a batch only once this open made it durable",
         "an attach delivers on a new log only once its witness is written",
         "`session-exited` publishes the session's `exited` row",
@@ -596,10 +765,29 @@ fn each_rule_switched_off_is_caught() {
         "a move of the log drops the mirror's pinned batch",
         "the endpoint forgets the offsets a move took (no loss)",
         "the endpoint forgets the offsets a move took (receipts)",
+        // One seed in 64 met it (10) while a refill read on at its lane's floor; since the F3
+        // review a refill reads below the oldest told on a connection of its own, which moves
+        // every scaled world's schedule, and the first seed that meets it is 230.
+        "the inbox's gap notice is told to aterm",
         // Since the post journal (B19) a post is four appends to one file, not two
         // files written and two unlinked: fewer writes for a write error to land on.
         "the recovery a write error stopped is done before the run record",
         "an own record is delivered only once its in-flight entry is gone",
+        "a read back that meets its subject's floor reads again told",
+        // Item F4's, each met at one moment of a kill, a hand-off or a catch-up, a seed in the
+        // hundreds or the thousands: a refused write of the deadline table, then a kill before
+        // it is written again, the asker still hosted once settled; an uncounted notice below a
+        // topic page's first broadcast; the heads of a hand-off the disk refused; an answer
+        // delivered over a refused write of the table; a hand-off whose taker stopped, or
+        // handed it on, before its attach came up; and, since an `expired` too waits for the
+        // table, a deadline left in it by a bridge killed once it published its `expired`.
+        "the deadline sweep takes an `expired` on the lane for its verdict (F4)",
+        "a post retires only once its deadline is on disk (F4)",
+        "a topic catch-up tells the uncounted notice below the first broadcast it delivers (F4)",
+        "a hand-off whose heads the disk refuses keeps the journal (F4)",
+        "an answer is delivered only once the deadline it settles is off the disk (F4)",
+        "an attach takes a hand-off's files before its incarnation (F4)",
+        "an adoption names the attach of the hand-off it takes (F4)",
     ];
     const RAREST: &[&str] = &["the incarnation lease is trusted only in the boot that wrote it"];
     for rare in RARE.iter().chain(RAREST) {
@@ -716,6 +904,14 @@ const FOUND: &[(u64, usize, &str)] = &[
 ];
 
 const FOUND_ERRING: &[(u64, usize, &str)] = &[
+    // A sequential plain Opts::seed search of 1..=60000 at ff5a34af25 first reached the
+    // retained-head readback bug at 558 (400 steps); the same seed with every rule on held
+    // every law. This bucket replays that exact plain world.
+    (
+        558,
+        400,
+        "an entry read back from its head on a log a move continued below it",
+    ),
     // The post journal (B19) and its review (each attach named in the journal) moved every
     // seed's writes, so not every row reaches its bug with the rule off any more; each rule
     // keeps one that does (each_found_bug_is_reached_again_with_its_rule_off), 31 added for
@@ -731,6 +927,7 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
         400,
         "a pin judged before the reconcile a write error stopped",
     ),
+    (92, 400, "a deduped replay moved the self-lane window down"),
     (
         93,
         400,
@@ -791,10 +988,36 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
         400,
         "a record delivered while its in-flight entry stood",
     ),
+    // Sim item B05: a cut dropped the dedup key of a record an in-flight entry named.
+    (
+        12,
+        400,
+        "an entry published again at its pin after a cut dropped its key",
+    ),
+    (
+        24,
+        400,
+        "an entry published again at its pin after a cut dropped its key",
+    ),
+    (
+        45,
+        400,
+        "an entry published again at its pin after a cut dropped its key",
+    ),
+    (
+        92,
+        400,
+        "an entry published again at its pin after a cut dropped its key",
+    ),
     // B19's review: the post journal's drop the disk refused stayed in the open, and the
     // re-attach of the same process published it after the sender's later post.
     (
         10236,
+        400,
+        "a record dropped while the disk refused the drop",
+    ),
+    (
+        8680,
         400,
         "a record dropped while the disk refused the drop",
     ),
@@ -813,15 +1036,58 @@ const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
     ),
 ];
 
-const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[(
-    1844,
-    400,
-    "a record the attach published again delivered while its post was queued",
-)];
+const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
+    (
+        1844,
+        400,
+        "a record the attach published again delivered while its post was queued",
+    ),
+    (
+        6751,
+        400,
+        "a move an `auto` mirror met before its hello left its pinned batch to recover",
+    ),
+    (
+        7755,
+        400,
+        "a move an `auto` mirror met before its hello left its pinned batch to recover",
+    ),
+    (
+        4067,
+        400,
+        "an entry read back from its head on a log a move continued below it",
+    ),
+    // Critic item B08's held inbox commit moved 4067's trajectory off this bug (it holds every
+    // law still); the first seed of a search to 60,000 that reaches it with its rule off.
+    (
+        36319,
+        400,
+        "an entry read back from its head on a log a move continued below it",
+    ),
+    (
+        31508,
+        400,
+        "a read back that went on at the floor missed the record a hold rule carried below it",
+    ),
+];
 
 type FoundIn = (fn(u64) -> Opts, u64, usize, &'static str);
 
+/// Found seeds of the retained worlds that are none of the lists above (aterm-link B05 review).
+const FOUND_RETAINED: &[FoundIn] = &[(
+    windowed,
+    3924,
+    400,
+    "a hello's judge that said the mirror runs kept the wait it no longer showed",
+)];
+
 const FOUND_QUITTING: &[FoundIn] = &[
+    (
+        erring_quitting,
+        41,
+        400,
+        "a post retried at its pin after a cut dropped its key",
+    ),
     (
         erring_quitting,
         863,
@@ -841,6 +1107,19 @@ const FOUND_QUITTING: &[FoundIn] = &[
         "a clean stop over a recovery owed vouched for a torn file",
     ),
 ];
+
+/// Found seeds of the asking world (item F4's review). Not a bridge bug: the topic law's own
+/// misreading in the first wide search, which took a follow's `since=` on the broker's log at
+/// the follow, not on the log its session was last told, and so judged the bridge's move of a
+/// session's cursor to the fork, a move the session had yet to be told, a delivery below its
+/// `since` (`Mutant::FollowOnTheBrokersLog` reads it so again). The first seed of 10,000 that
+/// meets it on the tree merged with critic item B09.
+const FOUND_ASKING: &[FoundIn] = &[(
+    asking,
+    6340,
+    400,
+    "a follow judged on a log its session had yet to be told",
+)];
 
 /// Every found seed, at the world it broke a law in.
 fn found() -> Vec<FoundIn> {
@@ -863,6 +1142,8 @@ fn found() -> Vec<FoundIn> {
             }),
         )
         .chain(FOUND_QUITTING.iter().copied())
+        .chain(FOUND_RETAINED.iter().copied())
+        .chain(FOUND_ASKING.iter().copied())
         .collect()
 }
 
@@ -889,7 +1170,9 @@ fn the_seeds_that_broke_a_law_hold_every_law() {
 }
 
 /// THE RULES whose bugs the found seeds pin, where a [`Mutant`] switches the
-/// rule off: `(what the found rows name the bug, the rule off, the law it breaks)`.
+/// rule off: `(what the found rows name the bug, the rule off, the law it breaks)`. One is a
+/// law's own reading, not a bridge rule ([`FOUND_ASKING`]): its mutant puts the misreading
+/// back, and the seed's false violation returns.
 const FOUND_RULES: &[(&str, Mutant, &str)] = &[
     (
         "a pin judged before the reconcile a write error stopped",
@@ -912,9 +1195,39 @@ const FOUND_RULES: &[(&str, Mutant, &str)] = &[
         "dup delivery",
     ),
     (
+        "an entry published again at its pin after a cut dropped its key",
+        Mutant::ReplayWithoutReadingBack,
+        "dup post",
+    ),
+    (
+        "a post retried at its pin after a cut dropped its key",
+        Mutant::RetryWithoutReadingBack,
+        "dup post",
+    ),
+    (
+        "a move an `auto` mirror met before its hello left its pinned batch to recover",
+        Mutant::ForgetOnlyAJudgedPin,
+        "mirror",
+    ),
+    (
+        "an entry read back from its head on a log a move continued below it",
+        Mutant::ReadBackFromTheJournaledHead,
+        "dup",
+    ),
+    (
+        "a hello's judge that said the mirror runs kept the wait it no longer showed",
+        Mutant::JudgeKeepsAnAnnouncedWait,
+        "mirror",
+    ),
+    (
         "a record dropped while the disk refused the drop",
         Mutant::KeepARefusedDrop,
         "order",
+    ),
+    (
+        "a follow judged on a log its session had yet to be told",
+        Mutant::FollowOnTheBrokersLog,
+        "it follows it from",
     ),
 ];
 
@@ -1075,7 +1388,7 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
         torn.iter().map(|out| out.stats.pins_set_aside).sum::<u64>()
     );
     let keeping = |s| Opts::seed(s).with(Mutant::KeepTornPin);
-    let stopped = breaking_at(&keeping, "stopped for its pin", 3, CONTROL_SEEDS)
+    let stopped = breaking_at(&keeping, "stopped for its pin", 7, CONTROL_SEEDS)
         .expect("NEGATIVE CONTROL: with the torn pin kept, some seed's mirror stops for it");
     eprintln!(
         "the torn pin kept at seed {}: {}",
@@ -2023,12 +2336,14 @@ fn rewrite_every_torn_kind(st: &crate::state::StateDir) {
         original: None,
         original_off: None,
         owner: None,
+        at: None,
     };
     st.set_in_flight(&crate::state::InFlight {
         pin: pin(10),
         subject: "/f/sim/in/n-1/s-a/n-1/note".to_string(),
         body: b"v=1 t=6 text=again".to_vec(),
         log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
+        at: None,
     })
     .expect("a new in-flight entry");
     st.clear_in_flight(7)
@@ -2233,6 +2548,7 @@ fn write_every_torn_kind(st: &crate::state::StateDir) {
         original: None,
         original_off: None,
         owner: None,
+        at: None,
     };
     for seq in [7, 8] {
         st.set_in_flight(&crate::state::InFlight {
@@ -2240,6 +2556,7 @@ fn write_every_torn_kind(st: &crate::state::StateDir) {
             subject: "/f/sim/in/n-1/s-a/n-1/note".to_string(),
             body: b"v=1 t=5 text=hello".to_vec(),
             log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
+            at: None,
         })
         .expect("an in-flight entry");
     }
@@ -2286,6 +2603,36 @@ fn torn_kinds_as_they_stand(root: &std::path::Path) -> std::collections::BTreeMa
     out
 }
 
+/// A world retained by aterm's rules at bytes a few records reach ([`super::world::SCALED`]):
+/// unread mail goes for its class's bytes as well as its age.
+fn scaled(seed: u64) -> Opts {
+    let mut o = Opts::seed(seed);
+    o.retained = true;
+    o.scaled = true;
+    o
+}
+
+/// `o` over a broker that retains nothing, its mirror `turns` at the whole window: none of
+/// retention's draws (sim item B05). A control whose rare seed met its bug before those
+/// draws keeps that world, where the seed still meets it: the draws move every world they
+/// touch, and in them no seed within the rare search does.
+fn without_retention(mut o: Opts) -> Opts {
+    o.retained = false;
+    o.scaled = false;
+    o.window = None;
+    o.auto = false;
+    o.cuts = false;
+    o
+}
+
+/// [`scaled`], mirroring, its window budget a few records: the mirror waits on it often.
+fn windowed(seed: u64) -> Opts {
+    let mut o = scaled(seed);
+    o.mirror = true;
+    o.window = Some(256);
+    o
+}
+
 fn both_ways(seed: u64) -> Opts {
     let mut o = Opts::seed(seed);
     o.power_cuts = true;
@@ -2319,6 +2666,154 @@ fn both_ways_erring_quitting(seed: u64) -> Opts {
     Opts {
         quits: true,
         ..both_ways_erring(seed)
+    }
+}
+
+/// The committed world, retained, its sessions fetching records of their lanes by offset
+/// (finding F3, [`Opts::fetches`]): retention's draws cut under that traffic, and its opens
+/// under changed rules leave mail held below every lane's oldest.
+fn fetching(seed: u64) -> Opts {
+    Opts {
+        retained: true,
+        fetches: true,
+        ..Opts::seed(seed)
+    }
+}
+
+/// **A FETCH BY OFFSET IS ANSWERED AS THE BROKER HOLDS ITS RECORD** (finding F3): over a
+/// retaining broker cutting under the traffic, every session's fetch of a record of its lane
+/// is answered with the record while the broker holds it, a record it carries below the
+/// lane's oldest included (the bridge reads a refused read again told, `Bridge::read_at`),
+/// `retained` only once retention gave it up, and `no-record` only where the lane holds none.
+/// The control, `Mutant::ReadAtWithoutTheHeld` (the refusal taken for no rows), is
+/// [`each_rule_switched_off_is_caught`]'s.
+#[test]
+fn every_seed_of_the_fetching_world_holds_every_law() {
+    let outs = run_all(&fetching, 1..=SEEDS);
+    let failures: Vec<String> = outs
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {SEEDS} seeds of the fetching world broke a law:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    let sum = |field: fn(&super::world::Stats) -> u64| -> u64 {
+        outs.iter().map(|out| field(&out.stats)).sum()
+    };
+    let counts = [
+        ("fetches asked", sum(|s| s.fetches)),
+        ("fetches answered with the record", sum(|s| s.fetched)),
+        (
+            "records fetched from below their lane's oldest",
+            sum(|s| s.fetched_below_oldest),
+        ),
+        ("fetches answered `retained`", sum(|s| s.fetched_retained)),
+        ("fetches answered `no-record`", sum(|s| s.fetched_none)),
+        ("records retention gave up", sum(|s| s.given_up)),
+        ("opens under changed rules", sum(|s| s.changed_starts)),
+    ];
+    eprintln!("the fetching world over {SEEDS} seeds: {counts:?}");
+    for &(what, n) in &counts {
+        assert!(n > 0, "the seeds exercised no {what}: {counts:?}");
+    }
+}
+
+/// The committed world, retained, its sessions asking with deadlines and following broadcast
+/// topics the peer says on, aterm handing its sessions off now and then (item F4,
+/// [`Opts::deadlines`], [`Opts::topics`], [`Opts::handoffs`]): retention's draws cut under
+/// that traffic, past what a deadline sweep and a topic replay read.
+fn asking(seed: u64) -> Opts {
+    Opts {
+        retained: true,
+        deadlines: true,
+        topics: true,
+        handoffs: true,
+        ..Opts::seed(seed)
+    }
+}
+
+/// [`asking`], its state dir's device refusing writes in every seed ([`Opts::write_errors`]).
+fn asking_erring(seed: u64) -> Opts {
+    Opts {
+        write_errors: true,
+        ..asking(seed)
+    }
+}
+
+/// **A DEADLINE FIRES ONCE FOR EVERY ASK NOBODY ANSWERED, AND A FOLLOWER SEES EVERY BROADCAST
+/// IT IS OWED OR AN HONEST GAP** (item F4): over a retaining broker cutting under the traffic,
+/// across bridge kills, handoffs, power cuts and broker restarts, every ask with a deadline
+/// is answered or expired once its deadline passed, an `expired` names an ask nobody answered
+/// first, and it lands once; a session following a topic is handed every broadcast of it the
+/// broker holds from where it follows it, in offset order, once each, and a `link gap …
+/// topic=` covers each one retention gave up. The controls (the sweep's and the replay's
+/// plain fetch among them) are [`each_rule_switched_off_is_caught`]'s.
+///
+/// THE WIDE SEARCH (item F4, 2026-10-26): seeds 1..=10000 of this world and of
+/// [`asking_erring`] break no law. The first such sweep found 26 and 47 failing. All but one
+/// class were bugs these worlds' handoffs and write errors reached for the first time, each
+/// fixed with its control above (a hand-off's lost heads, an answer or an `expired` delivered
+/// over an unwritten deadline table). The one was the topic law's own: it read a follow's
+/// `since=` on the broker's log, not on the log its session was last told, and judged the
+/// bridge's move of the cursor to the fork, a move that session had yet to be told, a delivery
+/// below `since`. The law was corrected, not the bridge, and a found seed pins the correction
+/// ([`FOUND_ASKING`], whose `Mutant::FollowOnTheBrokersLog` puts the old reading back). The
+/// sweeps after each fix found 9 and 18, then 1 and 2, then none. Run again on the tree merged
+/// with critic item B09 and the F4 review's deadline-table fixes (2026-10-27): none of the
+/// 10,000 of either world, and the old reading fails one (6340). Each world's 10,000 seeds take
+/// about seven minutes here.
+#[test]
+fn every_seed_of_the_asking_world_holds_every_law() {
+    let outs = run_all(&asking, 1..=SEEDS);
+    let failures: Vec<String> = outs
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {SEEDS} seeds of the asking world broke a law:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    let sum = |field: fn(&super::world::Stats) -> u64| -> u64 {
+        outs.iter().map(|out| field(&out.stats)).sum()
+    };
+    let counts = [
+        (
+            "asks that landed with a deadline",
+            sum(|s| s.asks_with_deadline),
+        ),
+        ("asks answered in time", sum(|s| s.answered_in_time)),
+        ("asks that expired", sum(|s| s.expired)),
+        ("asks answered after they expired", sum(|s| s.answered_late)),
+        (
+            "expiries a later bridge published",
+            sum(|s| s.expired_across_incarnations),
+        ),
+        ("broadcasts said", sum(|s| s.says)),
+        ("follows", sum(|s| s.follows)),
+        (
+            "follows from below the broker's base",
+            sum(|s| s.follows_below_the_base),
+        ),
+        ("broadcasts handed", sum(|s| s.broadcasts_handed)),
+        (
+            "broadcasts given up with a gap told",
+            sum(|s| s.broadcasts_given_up_told),
+        ),
+        ("handoffs", sum(|s| s.handoffs)),
+        ("kills", sum(|s| s.kills)),
+        ("power cuts", sum(|s| s.power_cuts)),
+        ("records retention gave up", sum(|s| s.given_up)),
+    ];
+    eprintln!("the asking world over {SEEDS} seeds: {counts:?}");
+    for &(what, n) in &counts {
+        assert!(n > 0, "the seeds exercised no {what}: {counts:?}");
     }
 }
 
@@ -2408,7 +2903,14 @@ fn every_seed_of_the_world_that_loses_power_both_ways_holds_every_law() {
 
 #[test]
 fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
-    let republishing = |s: u64| both_ways(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
+    // Unretained: over a retaining broker the old republish also lands a post again past a
+    // cut that dropped its dedup key (sim item B05), and this control is the order's alone.
+    let world = |s: u64| {
+        let mut o = both_ways(s);
+        o.retained = false;
+        o
+    };
+    let republishing = move |s: u64| world(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
     let out = breaking_at(&republishing, "order:", 173, RARE_SEEDS)
         .expect("NEGATIVE CONTROL: the old republish puts some post out of its sender's order");
     eprintln!(
@@ -2423,7 +2925,7 @@ fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
     );
     let again = run(&republishing(out.seed));
     assert_eq!(out.trace, again.trace, "the old republish replays exactly");
-    let decided = run(&both_ways(out.seed));
+    let decided = run(&world(out.seed));
     assert!(
         decided.violations.is_empty(),
         "with the entries retired, the same seed breaks no law: {}",
@@ -2477,12 +2979,12 @@ fn the_round_refines_its_exactly_once_model() {
         o.mirror = false;
         o
     };
-    let taken = witnessed(&lossy, 102, RARE_SEEDS, &|out| {
+    let taken = witnessed(&lossy, 183, RARE_SEEDS, &|out| {
         out.model.2.contains("DeliverTaken")
     })
     .expect("some run delivered a record a move took");
     assert!(taken.violations.is_empty(), "{}", report(&taken));
-    let reused = witnessed(&Opts::seed, 122, RARE_SEEDS, &|out| {
+    let reused = witnessed(&Opts::seed, 14, RARE_SEEDS, &|out| {
         out.model.2.contains("Reuse")
     })
     .expect("some committed run put a later record at an offset a move took");

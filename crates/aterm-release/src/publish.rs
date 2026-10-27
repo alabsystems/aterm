@@ -537,8 +537,24 @@ pub fn publisher_fence(git: &dyn GitRunner) -> Result<Option<PublisherFence>> {
     Ok(Some(PublisherFence { token, owner }))
 }
 
-/// Version of the `fence-*` identity block in the fence tag body.
-pub const FENCE_IDENTITY_FORMAT: u32 = 2;
+/// Version of the `fence-*` identity block in the fence tag body. Format 1 recorded the
+/// publisher (pid, host, boot, exe, version); 2 added its process group (`fence-pgid`);
+/// 3 names the boot by the kernel's boot id (`fence-boot`, [`boot_text`]) where 1 and 2
+/// stamped it (`kern.boottime:<secs>`, `linux-boot-id:<id>`) for a text comparison, so a
+/// reader of 2 or older refuses a fence of 3 as newer than itself rather than read a boot
+/// id as another boot.
+pub const FENCE_IDENTITY_FORMAT: u32 = 3;
+
+/// The last format whose `fence-boot` was a stamp rather than a boot id.
+const LAST_STAMPED_BOOT_FORMAT: u32 = 2;
+
+/// A boot id as `fence-boot` writes it: astream's text of it ([`astream_sys::boot_id_text`],
+/// the UUID's 32 hex digits hyphenated 8-4-4-4-12) in the case this host's kernel spells it,
+/// so the line reads as `sysctl kern.bootsessionuuid` (or Linux's `boot_id`) prints it. A
+/// reader compares the bytes ([`fence_liveness`]), never this text.
+pub fn boot_text(id: [u8; 16]) -> String {
+    astream_sys::boot_id_text(id, astream_sys::KERNEL_SPELLS_BOOT_ID_LOWER)
+}
 
 static FENCE_SELF_VERSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -577,7 +593,7 @@ fn fence_identity_block(probe: &dyn PublisherProbe) -> String {
     }
     for (key, value) in [
         ("host", probe.host()),
-        ("boot", probe.boot()),
+        ("boot", probe.boot().map(boot_text)),
         ("exe", probe.exe()),
         ("version", publisher_fence_self_version()),
     ] {
@@ -695,7 +711,8 @@ pub enum GroupState {
 /// The machine facts liveness needs.
 pub trait PublisherProbe {
     fn host(&self) -> Option<String>;
-    fn boot(&self) -> Option<String>;
+    /// This boot's id, its 16 bytes (`astream_sys::boot_session`).
+    fn boot(&self) -> Option<[u8; 16]>;
     fn exe(&self) -> Option<String>;
     fn pid_state(&self, pid: u32) -> PidState;
     fn pgid(&self) -> Option<u32> {
@@ -718,33 +735,6 @@ impl LocalProbe {
         }
         let host = String::from_utf8_lossy(&out.stdout).trim().to_string();
         (!host.is_empty()).then_some(host)
-    }
-
-    fn boot_session() -> Option<String> {
-        if let Ok(id) = fs::read_to_string("/proc/sys/kernel/random/boot_id") {
-            let id = id.trim();
-            if !id.is_empty() {
-                return Some(format!("linux-boot-id:{id}"));
-            }
-        }
-        let out = Command::new("sysctl")
-            .args(["-n", "kern.boottime"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let seconds: String = text
-            .split("sec")
-            .nth(1)?
-            .trim_start()
-            .trim_start_matches('=')
-            .trim()
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        (!seconds.is_empty()).then(|| format!("kern.boottime:{seconds}"))
     }
 
     fn pgrp_from_stat(stat: &str) -> Option<u32> {
@@ -860,9 +850,8 @@ impl PublisherProbe for LocalProbe {
         HOST.get_or_init(LocalProbe::uname_n).clone()
     }
 
-    fn boot(&self) -> Option<String> {
-        static BOOT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        BOOT.get_or_init(LocalProbe::boot_session).clone()
+    fn boot(&self) -> Option<[u8; 16]> {
+        astream_sys::boot_session()
     }
 
     fn exe(&self) -> Option<String> {
@@ -1023,12 +1012,31 @@ pub fn fence_liveness(identity: &FenceIdentity, probe: &dyn PublisherProbe) -> F
              process table"
         ));
     }
-    if boot != local_boot {
+    let Some(recorded_boot) = astream_sys::parse_boot_id(boot.as_bytes()) else {
+        let pre_astream = format <= LAST_STAMPED_BOOT_FORMAT
+            && ["kern.boottime:", "linux-boot-id:"]
+                .iter()
+                .any(|stamp| boot.starts_with(stamp));
+        return FenceLiveness::Unprovable(if pre_astream {
+            format!(
+                "the fence names its boot session in a pre-astream form ({boot}), which an older \
+                 aterm-release wrote; this binary compares boot ids only, so it cannot tell \
+                 whether the recorded pid belongs to this boot — it is not proof of death"
+            )
+        } else {
+            format!(
+                "the fence's boot session ({boot}) is not a boot id, so this cannot tell whether \
+                 the recorded pid belongs to this boot — it is not proof of death"
+            )
+        });
+    };
+    if recorded_boot != local_boot {
         return FenceLiveness::Unprovable(format!(
-            "the fence was written in boot session {boot}; this machine is now in {local_boot}. \
+            "the fence was written in boot session {boot}; this machine is now in {}. \
              The recorded pid cannot be that publisher any more, but a hostname is not a unique \
              machine identity, so this cannot separate \"this machine rebooted\" from \"another \
-             machine with the same name wrote it\" — it is not proof of death"
+             machine with the same name wrote it\" — it is not proof of death",
+            boot_text(local_boot)
         ));
     }
     let publisher_gone = match probe.pid_state(pid) {
@@ -1127,9 +1135,14 @@ pub fn publisher_fence_refusal(
         (None, Some(version)) => (
             Some(version),
             format!(
-                "\n  NOTE: the fence records no version (it predates fence-format \
-                 {FENCE_IDENTITY_FORMAT}); v{version} is THIS invocation's version — confirm it \
-                 against the stuck machine's dist/cut-state.toml before running the command"
+                "\n  NOTE: the fence records no version ({}); v{version} is THIS invocation's \
+                 version — confirm it against the stuck machine's dist/cut-state.toml before \
+                 running the command",
+                match (&identity.unreadable, identity.format) {
+                    (Some(_), _) => "its body could not be read",
+                    (None, None) => "it predates fence-format 1, the first to record one",
+                    (None, Some(_)) => "the publisher that wrote it had none to record",
+                }
             ),
         ),
         (None, None) => (
@@ -6988,11 +7001,14 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
                 fs::write(&at, record.to_toml())
                     .map_err(|e| Error::new(format!("write {}: {e}", at.display())))?;
                 println!(
-                    "==> install.sh's bootstrap verifier pin for v{} is in {}. Once the release \
-                     is public, `targo --unverified ship pin-verifier {}` in a checkout of main \
-                     writes these lines into tools/install.sh, with {}; commit both:\n{}",
+                    "==> install.sh's bootstrap verifier pin for v{} is in {}, and the signed \
+                     appcast carries its digests. Once the release is public, `targo \
+                     --unverified ship pin-verifier --from-release v{}` in any checkout of main \
+                     (or `ship pin-verifier {}` here) writes these lines into tools/install.sh, \
+                     with {}; commit both:\n{}",
                     ctx.version,
                     at.display(),
+                    ctx.version,
                     at.display(),
                     aterm_bootstrap_verify::pin::RECORD,
                     record.pin().lines()

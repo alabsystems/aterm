@@ -238,6 +238,13 @@ impl Row {
         if rb < self.cells.len() && self.cells[rb - 1].flags().contains(CellFlags::WIDE) {
             self.cells[rb] = fill;
             blanked[2] = Some(u16_from_usize(rb));
+            // A lead the deletion keeps moves left with the shift: blanked with its spacer, or
+            // it lands as half a glyph (Ghostty's `deleteChars` splits the boundary at the right
+            // margin's edge, `splitCellBoundary(right + 1)`). Reported where the shift puts it.
+            if rb > src_start {
+                self.cells[rb - 1] = fill;
+                blanked[3] = Some(u16_from_usize(rb - 1 - (src_start - col)));
+            }
         }
 
         let shift_len = rb - src_start;

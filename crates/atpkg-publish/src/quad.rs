@@ -33,6 +33,9 @@ pub struct VerifiedQuad {
     pub index: TrustedIndex,
     /// The verified roster.
     pub roster: aterm_update_core::Roster,
+    /// The verified `index.toml`'s first line, which names the writer that rendered it
+    /// ([`crate::channel::status::Producer`]).
+    pub head_line: String,
 }
 
 impl VerifiedQuad {
@@ -119,9 +122,15 @@ pub fn verify_dir_with(ctx: &Ctx, dir: &Path, freshness: Freshness) -> Result<Ve
                 "the roster does not verify under the paper master: {why:?}"
             ))
         })?;
-    let (index, _) = trusted.authorize_index(index, &index_sig).map_err(|why| {
+    let (index, verified) = trusted.authorize_index(index, &index_sig).map_err(|why| {
         Error::refused(format!("the client's verifier refuses this index: {why:?}"))
     })?;
+    let head_line = verified
+        .as_slice()
+        .split(|&b| b == b'\n')
+        .next()
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .unwrap_or_default();
     if freshness == Freshness::Enforce {
         let valid_until = aterm_types::rfc3339::parse_utc(&index.valid_until).ok_or_else(|| {
             Error::refused(format!(
@@ -149,6 +158,7 @@ pub fn verify_dir_with(ctx: &Ctx, dir: &Path, freshness: Freshness) -> Result<Ve
         dir: dir.to_path_buf(),
         index,
         roster,
+        head_line,
     })
 }
 

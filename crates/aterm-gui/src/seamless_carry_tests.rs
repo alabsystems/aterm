@@ -563,6 +563,130 @@ fn the_session_log_crosses_the_real_files() {
     staged.teardown();
 }
 
+/// The take notes every carried log's epoch before any session adopts
+/// (`Epochs::note_handoff`, C13's review): adoptions told nothing or only their ids, adopting
+/// first, take epochs above every carried epoch plus one, and each carried successor keeps its
+/// own predecessor's plus one (U1). Three sessions carry three epochs, the highest in the middle
+/// record, so a take that notes only the first or only the last session's is caught. Each
+/// predecessor's log is another process's, at a hand-set epoch far above the wall clock's
+/// seconds; this child's own allocator has issued nothing.
+#[test]
+fn the_take_notes_every_carried_epoch_before_any_session_adopts() {
+    const CARRIED_EPS: [u32; 3] = [3_900_000_000, 4_000_000_000, 3_950_000_000];
+    let highest = CARRIED_EPS.into_iter().max().unwrap_or_default();
+    let Some(_env) = env_alone() else { return };
+    let _restore = restore_env();
+    let mut app = FakeApp::new();
+    let mut screens = Vec::new();
+    let mut sources = Vec::new();
+    let mut carried_ids = Vec::new();
+    for (local_id, carried_ep) in (0u64..).zip(CARRIED_EPS) {
+        let (term, turns) = old_session(&mut app, 30);
+        let prior = Arc::new(crate::session_log::Epochs::new());
+        prior.note(carried_ep - 1);
+        let mut predecessor = crate::session_timeline::SessionTimeline::for_test();
+        *predecessor.slog_mut() =
+            crate::session_log::SessionLog::starting(prior, crate::session_log::host_stamp());
+        let now = predecessor.slog().now();
+        predecessor.slog_mut().open_session(None, None, now);
+        for _ in 0..12 {
+            predecessor.slog_mut().human_input(true, now);
+        }
+        assert_eq!(predecessor.slog().log().ep(), carried_ep, "PRECONDITION");
+        carried_ids.push((predecessor.handoff_log_ids(), predecessor.handoff_log_seq()));
+        let timeline = Arc::new(Mutex::new(predecessor));
+        let guard = term.lock().unwrap();
+        screens.push(guard.checkpoint_carry(256).expect("parser is Ground"));
+        sources.push(handoff_carry::capture_head(
+            local_id,
+            &guard,
+            &term,
+            &turns,
+            Some(&timeline),
+            true,
+        ));
+    }
+    let carry = StageCarry {
+        screens,
+        controls: handoff_carry::export_for_target(
+            &sources,
+            crate::control::turn_ids_for_handoff(),
+            crate::running_build_number(),
+        ),
+        next_turn_id: None,
+        fg_holders: Vec::new(),
+        render_debts: Vec::new(),
+    };
+    let stamp = |m: &mut SessionHandoff, _: &std::path::Path, _: &str| {
+        for (record, (ids, seq)) in m.sessions.iter_mut().zip(&carried_ids) {
+            record.log_ids = Some(ids.clone());
+            record.log_seq = *seq;
+        }
+    };
+    let staged = stage_history_handoff("note-handoff", &carry, &stamp);
+    let mut adopted = as_successor(&staged, |_| take_incoming().adopted);
+    assert_eq!(
+        adopted.len(),
+        CARRIED_EPS.len(),
+        "PRECONDITION: every session adopts"
+    );
+    let adopt = |local_id: u64, log: crate::session_log::LogAdopt| -> (u32, u32, bool) {
+        let successor = crate::session_store::test_handle(local_id);
+        // A test handle's log has an allocator of its own; a session's is the process's.
+        *successor.ctx.timeline.lock().unwrap().slog_mut() =
+            crate::session_log::SessionLog::default();
+        crate::spawn::mark_handoff_gap(
+            &successor.ctx.timeline,
+            &successor.ctx.cast,
+            &successor.ctx.temporal,
+            None,
+            0,
+            log,
+            false,
+        );
+        let g = successor.ctx.timeline.lock().unwrap();
+        (
+            g.slog().log().ep(),
+            g.slog().log().base_ep(),
+            g.slog().log_carried(),
+        )
+    };
+    let told_nothing = adopt(10, crate::session_log::LogAdopt::default());
+    let ids_only = adopt(11, crate::spawn::adopted_log(&adopted[0].log, None));
+    for (what, (ep, base, was_carried)) in [("told nothing", told_nothing), ("ids only", ids_only)]
+    {
+        assert!(!was_carried, "PRECONDITION: {what} is no carried log");
+        assert!(
+            ep > highest + 1 && base > highest + 1,
+            "an adoption {what}, adopting first, takes (ep, base) ({ep}, {base}): not above \
+             every carried successor's, the highest {}",
+            highest + 1
+        );
+    }
+    let mut bases = vec![told_nothing.1, ids_only.1];
+    for ((local_id, a), carried_ep) in (0u64..).zip(&mut adopted).zip(CARRIED_EPS) {
+        let carried = adopt(
+            local_id,
+            crate::spawn::adopted_log(&a.log, a.control.as_mut()),
+        );
+        assert_eq!(
+            (carried.0, carried.2),
+            (carried_ep + 1, true),
+            "carried successor {local_id} keeps its predecessor's epoch plus one (U1)"
+        );
+        bases.push(carried.1);
+    }
+    let mut distinct = bases.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        bases.len(),
+        "no two logs of one process share a base: {bases:?}"
+    );
+    staged.teardown();
+}
+
 #[test]
 fn the_carry_round_trips_the_ledger_and_the_archive_tail() {
     let Some(_env) = env_alone() else { return };

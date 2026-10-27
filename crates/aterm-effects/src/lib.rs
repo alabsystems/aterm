@@ -102,6 +102,11 @@ pub mod sound_policy;
 pub mod spec;
 /// The rainbow family's colour law ([`spectrum::spectrum`], [`spectrum::spectrum_snap`]).
 pub mod spectrum;
+/// The trail engines' state words and the frame's light report, for `lab trail-diff`
+/// ([`state_words::StateWords`], [`state_words::ArmsDrawn`]).
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub mod state_words;
 pub mod supernova;
 /// The tests' replay pool ([`test_pool::par_map`]), for the unit tests and the integration suite.
 #[cfg(any(test, debug_assertions))]
@@ -120,6 +125,8 @@ mod trick_flash;
 /// Kitty-command listener.
 pub mod typed_tricks;
 pub mod typing_momentum;
+/// The ⬆️'s hover ring on a composer's top rule.
+pub mod up_ring;
 pub mod word_decorations;
 
 #[cfg(test)]

@@ -1803,3 +1803,538 @@ fn a_loop_behind_another_holder_reads_the_word_and_its_park_ends_on_it() {
     assert!(!said.iter().any(|l| l.starts_with("UNPARKED")), "{said:#?}");
     assert_eq!(m.metas, 1, "the reconcile's read alone: {:#?}", m.requests);
 }
+
+/// A reply Claude Code says took seconds: a short turn, which Cruise backs off from.
+fn short(said: &str) -> Vec<String> {
+    let mut r = rows(&[
+        &format!("⏺ {said}"),
+        "",
+        "✻ Worked for 6s · done 4:24 PM",
+        "",
+    ]);
+    r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+    r
+}
+
+/// How a switch of the word went ([`switched`]): the mock and the loop's journal.
+struct Switched {
+    m: Mock,
+    said: Vec<String>,
+}
+
+impl Switched {
+    /// How long after the loop first waited at rest each `turn` was asked.
+    fn typed_after(&self) -> Vec<Duration> {
+        let from = self.m.rest_from.expect("a wait at rest");
+        self.m
+            .turn_times
+            .iter()
+            .map(|t| t.saturating_duration_since(from))
+            .collect()
+    }
+
+    fn landed(&self) -> usize {
+        count(&self.m, &continue_request(LAND))
+    }
+
+    fn word_notes(&self) -> Vec<&String> {
+        self.said
+            .iter()
+            .filter(|l| l.starts_with("NOTE seq=") && l.contains(" autopilot="))
+            .collect()
+    }
+}
+
+/// A tab under `word` whose short turn ends at rest (Cruise: in the 2-minute back-off), while
+/// `writes` land that many milliseconds after its first wait at rest. `latch`: the host's waits take
+/// `autopilot=` (an older host's refuse it); `heard`: the waits answer it (else they ignore it).
+fn switched(
+    word: &'static str,
+    writes: &[(u64, MetaWrite)],
+    (latch, heard): (bool, bool),
+    settle: Duration,
+    tag: &str,
+) -> Switched {
+    let (dir, journal) = journal_file(tag);
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        short("Fixed the parser; the suite is green."),
+    ]);
+    m.autopilot = Some(word);
+    if latch {
+        m.takes_word = true;
+    }
+    m.word_deaf = !heard;
+    m.meta_writes = writes
+        .iter()
+        .map(|&(ms, w)| (Duration::from_millis(ms), w))
+        .collect();
+    m.stall_sleep = Some(Duration::from_secs(20));
+    m.vanish_after = Some(12);
+    m.exit_when = Some(|m| m.turns > 0);
+    let opts = SuperviseOpts {
+        policy: owners_policy(),
+        journal: Some(journal.clone()),
+        ..auto(300)
+    };
+    let _ = watch_lines_with(&mut m, &opts, |s| s.set_word_settle(settle));
+    let said = journaled(&journal);
+    let _ = std::fs::remove_dir_all(&dir);
+    Switched { m, said }
+}
+
+const BACKED_OFF: &str = "1 short turn(s) in a row: 2 min back-off";
+const LAND_WRITE: MetaWrite = MetaWrite::Autopilot(Some("land"));
+const OFF_WRITE: MetaWrite = MetaWrite::Autopilot(Some("off"));
+
+#[test]
+fn a_switch_to_land_at_rest_in_a_back_off_types_land_after_the_settle() {
+    let run = switched(
+        "cruise",
+        &[(10_000, LAND_WRITE)],
+        (true, true),
+        WORD_SETTLE,
+        "word-edge-land",
+    );
+    assert!(
+        run.said
+            .iter()
+            .any(|l| l.starts_with("WAITING ") && l.ends_with(BACKED_OFF)),
+        "{:#?}",
+        run.said
+    );
+    assert_eq!(run.word_notes().len(), 1, "{:#?}", run.said);
+    assert!(
+        run.word_notes()[0].contains(" autopilot=land "),
+        "{:#?}",
+        run.said
+    );
+    assert_eq!(run.landed(), 1, "{:#?}", run.m.requests);
+    let after = run.typed_after();
+    assert!(
+        after.len() == 1
+            && after[0] >= Duration::from_secs(10) + WORD_SETTLE
+            && after[0] < Duration::from_secs(15),
+        "land@v1 typed once the switch stood its settle: {after:?} {:#?}",
+        run.m.requests
+    );
+    assert!(
+        run.m
+            .requests
+            .iter()
+            .any(|r| r.starts_with("await seq ") && r.ends_with(" autopilot=cruise")),
+        "{:#?}",
+        run.m.requests
+    );
+
+    // Control: the same switch on a host whose waits never answer it is seen only when the
+    // back-off is due.
+    let deaf = switched(
+        "cruise",
+        &[(10_000, LAND_WRITE)],
+        (true, false),
+        WORD_SETTLE,
+        "word-edge-deaf",
+    );
+    assert!(deaf.word_notes().is_empty(), "{:#?}", deaf.said);
+    assert_eq!(deaf.landed(), 1, "{:#?}", deaf.m.requests);
+    let after = deaf.typed_after();
+    assert!(
+        after.len() == 1 && after[0] >= Duration::from_secs(115),
+        "typed when the back-off is due: {after:?} {:#?}",
+        deaf.m.requests
+    );
+}
+
+#[test]
+fn a_click_through_land_to_off_inside_the_settle_types_nothing() {
+    let writes = [(10_000, LAND_WRITE), (10_200, OFF_WRITE)];
+    let run = switched(
+        "cruise",
+        &writes,
+        (true, true),
+        WORD_SETTLE,
+        "word-edge-flip",
+    );
+    assert_eq!(run.m.turns, 0, "{:#?}", run.m.requests);
+    assert_eq!(run.word_notes().len(), 2, "{:#?}", run.said);
+    assert!(
+        run.said
+            .iter()
+            .any(|l| l.starts_with("PARKED seq=") && l.contains("autopilot=off")),
+        "the word that stood decided: {:#?}",
+        run.said
+    );
+
+    // Control: with no settle the first write decides, and Land types.
+    let unsettled = switched(
+        "cruise",
+        &writes,
+        (true, true),
+        Duration::ZERO,
+        "word-edge-flip-unsettled",
+    );
+    assert_eq!(unsettled.landed(), 1, "{:#?}", unsettled.m.requests);
+}
+
+#[test]
+fn an_off_park_wakes_on_land_and_types_it_at_once() {
+    let run = switched(
+        "off",
+        &[(500, LAND_WRITE)],
+        (true, true),
+        WORD_SETTLE,
+        "word-edge-off-park",
+    );
+    assert!(
+        run.said
+            .iter()
+            .any(|l| l.starts_with("UNPARKED seq=") && l.contains(" autopilot=land ")),
+        "{:#?}",
+        run.said
+    );
+    assert_eq!(run.landed(), 1, "{:#?}", run.m.requests);
+    let after = run.typed_after();
+    assert!(
+        after.len() == 1 && after[0] < OFF_STEP,
+        "typed inside the park's own step: {after:?} {:#?}",
+        run.m.requests
+    );
+
+    // Control: a host that never answers the switch leaves it to the park's next read.
+    let deaf = switched(
+        "off",
+        &[(500, LAND_WRITE)],
+        (true, false),
+        WORD_SETTLE,
+        "word-edge-off-park-deaf",
+    );
+    let after = deaf.typed_after();
+    assert!(
+        after.len() == 1 && after[0] >= OFF_STEP,
+        "{after:?} {:#?}",
+        deaf.m.requests
+    );
+}
+
+#[test]
+fn a_write_that_leaves_the_word_wakes_no_wait_at_rest() {
+    for (write, tag) in [
+        (
+            MetaWrite::Questions(Some("long-term")),
+            "word-edge-questions",
+        ),
+        (MetaWrite::Autopilot(Some("cruise")), "word-edge-same"),
+    ] {
+        let run = switched("cruise", &[(10_000, write)], (true, true), WORD_SETTLE, tag);
+        assert!(run.word_notes().is_empty(), "{tag}: {:#?}", run.said);
+        assert!(run.m.meta_writes.is_empty(), "{tag}: the write landed");
+        let after = run.typed_after();
+        assert!(
+            after.len() == 1 && after[0] >= Duration::from_secs(115),
+            "{tag}: typed when the back-off is due: {after:?} {:#?}",
+            run.m.requests
+        );
+    }
+}
+
+#[test]
+fn an_older_hosts_waits_carry_no_word() {
+    let run = switched(
+        "cruise",
+        &[(10_000, LAND_WRITE)],
+        (false, true),
+        WORD_SETTLE,
+        "word-edge-old-host",
+    );
+    // The first wait at rest asks with the token and is refused; the same wait goes again bare,
+    // and no wait after it carries the token, nor does the loop ask the host's help.
+    let carried: Vec<&String> = run
+        .m
+        .requests
+        .iter()
+        .filter(|r| r.contains("autopilot="))
+        .collect();
+    assert_eq!(carried.len(), 1, "{:#?}", run.m.requests);
+    let at = run.m.requests.iter().position(|r| r == carried[0]).unwrap();
+    assert_eq!(
+        run.m.requests.get(at + 1).map(String::as_str),
+        carried[0].strip_suffix(" autopilot=cruise"),
+        "the refused wait again, bare: {:#?}",
+        run.m.requests
+    );
+    assert!(
+        !run.m.requests.iter().any(|r| r.starts_with("help ")),
+        "{:#?}",
+        run.m.requests
+    );
+    assert!(run.word_notes().is_empty(), "{:#?}", run.said);
+
+    // Control: a host that names the argument is asked with it.
+    let run = switched(
+        "cruise",
+        &[],
+        (true, true),
+        WORD_SETTLE,
+        "word-edge-new-host",
+    );
+    assert!(
+        run.m
+            .requests
+            .iter()
+            .any(|r| r.ends_with(" autopilot=cruise")),
+        "{:#?}",
+        run.m.requests
+    );
+}
+
+#[test]
+fn a_switch_to_land_mid_turn_types_nothing_until_the_point_and_then_lands_after_the_settle() {
+    let run = |word: Option<&'static str>, tag: &str| {
+        let (dir, journal) = journal_file(tag);
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            busy_screen(),
+            busy_screen(),
+            short("Fixed the parser; the suite is green."),
+        ]);
+        m.autopilot = Some("cruise");
+        m.takes_word = true;
+        m.autopilot_on.insert(1, word);
+        m.stall_sleep = Some(Duration::from_secs(20));
+        m.vanish_after = Some(4);
+        m.exit_when = Some(|m| m.turns > 0);
+        let opts = SuperviseOpts {
+            journal: Some(journal.clone()),
+            ..under(owners_policy())
+        };
+        let _ = watch_lines(&mut m, &opts);
+        let said = journaled(&journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        (m, said)
+    };
+    // The point decides on the word last read (Cruise backs off), and the park's first wait,
+    // carrying that word, wakes on the switch at once: Land is typed after the settle, never
+    // mid-turn, and its instruction waits no back-off.
+    let (m, said) = run(Some("land"), "word-edge-busy");
+    assert_eq!(count(&m, &continue_request(LAND)), 1, "{:#?}", m.requests);
+    let at = |pred: &dyn Fn(&str) -> bool| m.requests.iter().position(|r| pred(r));
+    let parked = at(&|r| r.ends_with(" autopilot=cruise")).expect("a wait at rest");
+    let settled = at(&|r| r.ends_with(" autopilot=land")).expect("the settle's wait");
+    let typed = at(&|r| r.starts_with("turn ")).expect("typed");
+    assert!(parked < settled && settled < typed, "{:#?}", m.requests);
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("NOTE seq=") && l.contains(" autopilot=land ")),
+        "{said:#?}"
+    );
+
+    // Control: the switch not made, the point backs off as Cruise's.
+    let (m, said) = run(Some("cruise"), "word-edge-busy-cruise");
+    assert_eq!(m.turns, 0, "{:#?}", m.requests);
+    assert!(said.iter().any(|l| l.ends_with(BACKED_OFF)), "{said:#?}");
+}
+
+#[test]
+fn a_switch_off_land_mid_turn_types_no_instruction_at_the_point() {
+    let run = |word: Option<&'static str>, tag: &str| {
+        let (dir, journal) = journal_file(tag);
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            busy_screen(),
+            busy_screen(),
+            short("Fixed the parser; the suite is green."),
+        ]);
+        m.autopilot = Some("land");
+        m.takes_word = true;
+        m.autopilot_on.insert(1, word);
+        m.stall_sleep = Some(Duration::from_secs(20));
+        m.vanish_after = Some(4);
+        m.exit_when = Some(|m| m.turns > 0);
+        let opts = SuperviseOpts {
+            journal: Some(journal.clone()),
+            ..under(owners_policy())
+        };
+        let _ = watch_lines(&mut m, &opts);
+        let said = journaled(&journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        (m, said)
+    };
+    // The turn's own waits carry Land, so the switch made while the agent works wakes one and is
+    // noted: the point decides on the word read then, never on the stale Land whose instruction
+    // waits no back-off. Off types nothing; Cruise backs off as its own.
+    for (to, tag) in [
+        ("off", "word-edge-busy-off"),
+        ("cruise", "word-edge-busy-land-cruise"),
+    ] {
+        let (m, said) = run(Some(to), tag);
+        assert_eq!(m.turns, 0, "{to}: {:#?}", m.requests);
+        assert_eq!(
+            count(&m, &continue_request(LAND)),
+            0,
+            "{to}: {:#?}",
+            m.requests
+        );
+        assert!(
+            said.iter()
+                .any(|l| l.starts_with("NOTE seq=") && l.contains(&format!(" autopilot={to} "))),
+            "{to}: {said:#?}"
+        );
+    }
+
+    // Control: the switch not made, Land's instruction is typed at the point.
+    let (m, _) = run(Some("land"), "word-edge-busy-land");
+    assert_eq!(count(&m, &continue_request(LAND)), 1, "{:#?}", m.requests);
+}
+
+/// THE TURN'S WAIT ON THE SESSION LOG CARRIES THE WORD TOO ([`super::log_wake`]): a switch made
+/// while the loop sleeps on the log through the agent's turn is noted there, so the point the turn
+/// ends on decides on the word read then. Switched to Land, its instruction is typed with no
+/// back-off decided first; switched off Land, nothing is typed. The real lab found the gap (`lab
+/// forever --mode switch`, SWB): a host keeping a log carried no word through a busy turn.
+/// Control: a host whose log wait refuses the token (one from before it took it) is waited on
+/// bare, so the switch is seen only past the point, decided on the stale word: Cruise's back-off
+/// first, and Land's instruction typed after the switch to Off.
+#[test]
+fn a_switch_while_the_turn_sleeps_on_the_log_is_noted_before_its_point() {
+    let run = |from: &'static str, to: &'static str, refused: bool, tag: &str| {
+        let (dir, journal) = journal_file(tag);
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            busy_screen(),
+            busy_screen(),
+            short("Fixed the parser; the suite is green."),
+        ]);
+        let mut log = LogWorld::new();
+        log.word_refused = refused;
+        m.log = Some(log);
+        m.autopilot = Some(from);
+        m.takes_word = true;
+        // A frame the log wait sleeps through ([`Mock::log_wait`]).
+        m.autopilot_on.insert(2, Some(to));
+        m.stall_sleep = Some(Duration::from_secs(20));
+        m.vanish_after = Some(4);
+        m.exit_when = Some(|m| m.turns > 0);
+        let opts = SuperviseOpts {
+            journal: Some(journal.clone()),
+            ..under(owners_policy())
+        };
+        let _ = watch_lines(&mut m, &opts);
+        let said = journaled(&journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        (m, said)
+    };
+    let at = |said: &[String], pred: &dyn Fn(&str) -> bool| said.iter().position(|l| pred(l));
+    let point = |l: &str| l.starts_with("EVENT idle ");
+    let noted = |to: &'static str| {
+        move |l: &str| l.starts_with("NOTE ") && l.contains(&format!(" autopilot={to} "))
+    };
+    let carried = |m: &Mock, word: &str| {
+        m.requests
+            .iter()
+            .any(|r| r.starts_with("await log ") && r.ends_with(&format!(" autopilot={word}")))
+    };
+
+    let (m, said) = run("cruise", "land", false, "log-word-land");
+    assert!(
+        carried(&m, "cruise"),
+        "the log wait carried the word: {:#?}",
+        m.requests
+    );
+    let note = at(&said, &noted("land")).expect("the switch noted");
+    assert!(note < at(&said, &point).expect("the point"), "{said:#?}");
+    assert!(!said.iter().any(|l| l.ends_with(BACKED_OFF)), "{said:#?}");
+    assert_eq!(count(&m, &continue_request(LAND)), 1, "{:#?}", m.requests);
+
+    let (m, said) = run("land", "off", false, "log-word-off");
+    assert!(carried(&m, "land"), "{:#?}", m.requests);
+    let note = at(&said, &noted("off")).expect("the switch noted");
+    let parked = at(&said, &|l: &str| l.starts_with("PARKED ")).expect("Off parks");
+    assert!(note < parked, "{said:#?}");
+    assert_eq!(m.turns, 0, "{said:#?}\n{:#?}", m.requests);
+    assert_eq!(count(&m, &continue_request(LAND)), 0, "{:#?}", m.requests);
+
+    // Control: refused, the same wait goes again bare, and the point decides on the stale word.
+    let (m, said) = run("cruise", "land", true, "log-word-land-bare");
+    let refused = m
+        .requests
+        .iter()
+        .position(|r| r.starts_with("await log ") && r.ends_with(" autopilot=cruise"))
+        .expect("the log wait asked with the word");
+    assert_eq!(
+        m.requests.get(refused + 1).map(String::as_str),
+        m.requests[refused].strip_suffix(" autopilot=cruise"),
+        "the refused wait again, bare: {:#?}",
+        m.requests
+    );
+    assert!(
+        !m.requests[refused + 1..]
+            .iter()
+            .any(|r| r.starts_with("await log ") && r.contains("autopilot=")),
+        "{:#?}",
+        m.requests
+    );
+    let backed = at(&said, &|l: &str| l.ends_with(BACKED_OFF)).expect("Cruise's back-off");
+    assert!(
+        backed < at(&said, &noted("land")).expect("noted after"),
+        "{said:#?}"
+    );
+    let (m, said) = run("land", "off", true, "log-word-off-bare");
+    assert_eq!(count(&m, &continue_request(LAND)), 1, "{said:#?}");
+}
+
+#[test]
+fn a_point_inside_the_settle_waits_for_the_word_that_stands() {
+    let run = |writes: &[(u64, MetaWrite)], tag: &str| {
+        let (dir, journal) = journal_file(tag);
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            short("Fixed the parser; the suite is green."),
+            short("Committed the parser too."),
+        ]);
+        m.autopilot = Some("cruise");
+        m.takes_word = true;
+        m.moves_held = true;
+        m.meta_writes = writes
+            .iter()
+            .map(|&(ms, w)| (Duration::from_millis(ms), w))
+            .collect();
+        m.stall_sleep = Some(Duration::from_secs(20));
+        m.vanish_after = Some(6);
+        m.exit_when = Some(|m| m.turns > 0);
+        let opts = SuperviseOpts {
+            journal: Some(journal.clone()),
+            ..under(owners_policy())
+        };
+        let _ = watch_lines(&mut m, &opts);
+        let said = journaled(&journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        (m, said)
+    };
+    let (m, said) = run(
+        &[
+            (10_000, LAND_WRITE),
+            (10_100, MetaWrite::Moves),
+            (10_500, OFF_WRITE),
+        ],
+        "word-edge-point-in-settle",
+    );
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("EVENT idle seq=") && l.contains("Committed the parser too.")),
+        "the second point came inside the settle: {said:#?}"
+    );
+    assert_eq!(m.turns, 0, "{:#?}", m.requests);
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("PARKED seq=") && l.contains("autopilot=off")),
+        "{said:#?}"
+    );
+
+    // Control: the same point under a switch that stands types Land's instruction.
+    let (m, _) = run(
+        &[(10_000, LAND_WRITE), (10_100, MetaWrite::Moves)],
+        "word-edge-point-in-settle-land",
+    );
+    assert_eq!(count(&m, &continue_request(LAND)), 1, "{:#?}", m.requests);
+}

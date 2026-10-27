@@ -139,14 +139,15 @@ fn store_stamp(db: &Path) -> [Option<FileStamp>; 2] {
 #[derive(Debug, Default)]
 pub struct StoreGoal {
     /// What the last read was of: the store, the id and the files' stamps.
-    seen: Option<(PathBuf, String, [Option<FileStamp>; 2])>,
+    seen: Option<(Store, PathBuf, String, [Option<FileStamp>; 2])>,
     goal: Option<String>,
 }
 
 impl StoreGoal {
     /// The goal `store`'s database `db` holds for `id`: read now when `db`, `id` or the files
     /// moved since the last read, else the last read's answer. No database is no goal; a read
-    /// that failed keeps the last answer until the files move again.
+    /// that failed keeps the last answer until the files move again. An in-flight write keeps the
+    /// last answer without recording the stamp so the next call retries once the write settles.
     pub fn read(&mut self, store: Store, db: &Path, id: &str) -> Option<&str> {
         let stamp = store_stamp(db);
         if stamp[0].is_none() {
@@ -154,24 +155,35 @@ impl StoreGoal {
             self.goal = None;
             return None;
         }
-        let fresh = self
-            .seen
-            .as_ref()
-            .is_some_and(|(path, held, at)| path == db && held == id && *at == stamp);
+        let fresh = self.seen.as_ref().is_some_and(|(kind, path, held, at)| {
+            *kind == store && path == db && held == id && *at == stamp
+        });
         if !fresh {
             if self
                 .seen
                 .as_ref()
-                .is_some_and(|(path, held, _)| path != db || held != id)
+                .is_some_and(|(kind, path, held, _)| *kind != store || path != db || held != id)
             {
                 self.goal = None;
             }
             match read_store(store, db, id) {
-                Ok(goal) => self.goal = goal,
-                Err(aterm_uds::foreign_db::Unread::Missing) => self.goal = None,
-                Err(_) => {}
+                Ok(goal) => {
+                    self.goal = goal;
+                    self.seen = Some((store, db.to_path_buf(), id.to_owned(), stamp));
+                }
+                Err(aterm_uds::foreign_db::Unread::Missing) => {
+                    self.goal = None;
+                    self.seen = None;
+                }
+                Err(
+                    aterm_uds::foreign_db::Unread::Writing | aterm_uds::foreign_db::Unread::Changed,
+                ) => {
+                    self.seen = None;
+                }
+                Err(aterm_uds::foreign_db::Unread::Failed) => {
+                    self.seen = Some((store, db.to_path_buf(), id.to_owned(), stamp));
+                }
             }
-            self.seen = Some((db.to_path_buf(), id.to_owned(), stamp));
         }
         self.goal.as_deref()
     }

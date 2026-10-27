@@ -694,15 +694,19 @@ impl EchoLedger {
     #[cfg(test)]
     fn partition(&self, key: Instant, now: Instant) -> (usize, usize, usize) {
         let (mut older, mut younger, mut stale) = (0, 0, 0);
-        for &(at, cells) in self.slots.iter().flatten() {
-            let cells = usize::from(cells);
-            if now.saturating_duration_since(at) > crate::cursor_glow::IN_FLIGHT_PATIENCE_DUR {
-                stale += cells;
-            } else if at < key {
-                older += cells;
-            } else {
-                younger += cells;
+        let mut i = 0;
+        while i < self.slots.len() {
+            if let Some((at, cells)) = self.slots[i] {
+                let cells = usize::from(cells);
+                if now.saturating_duration_since(at) > crate::cursor_glow::IN_FLIGHT_PATIENCE_DUR {
+                    stale += cells;
+                } else if at < key {
+                    older += cells;
+                } else {
+                    younger += cells;
+                }
             }
+            i += 1;
         }
         (older, younger, stale)
     }
@@ -778,6 +782,9 @@ impl Default for Engine {
         Self::new()
     }
 }
+
+/// A box in window pixels, `(x0, x1, y0, y1)`.
+type PxBox = (i32, i32, i32, i32);
 
 impl Engine {
     /// A disengaged engine with nothing live and a full glint bucket, so the first capital of a
@@ -857,6 +864,7 @@ impl Engine {
     }
 
     /// Seam points 1 and 2.
+    #[inline]
     pub fn on_event(&mut self, ev: Event, now: Instant) {
         if !self.engaged {
             return;
@@ -943,11 +951,12 @@ impl Engine {
     /// Unreplayed [`Event::Typed`] entries currently queued in this tick's event buffer.
     #[inline]
     #[must_use]
-    pub fn buffered_typed_events(&self) -> usize {
+    pub const fn buffered_typed_events(&self) -> usize {
+        let events = self.events.as_slice();
         let mut n = 0;
         let mut i = 0;
-        while i < self.events.len() {
-            if matches!(self.events[i].0, Event::Typed { .. }) {
+        while i < events.len() {
+            if matches!(events[i].0, Event::Typed { .. }) {
                 n += 1;
             }
             i += 1;
@@ -995,6 +1004,7 @@ impl Engine {
         }
     }
 
+    #[inline]
     fn on_move(&mut self, from: (u16, u16), to: (u16, u16), licence: Licence, now: Instant) {
         let host_sweep = self.host_sweep_for(from, to);
         #[cfg(test)]
@@ -1059,6 +1069,7 @@ impl Engine {
         }
     }
 
+    #[inline]
     fn replay_events(&mut self, ctx: &Ctx<'_>) {
         self.ribbon.settle_revoked_parts();
         self.ribbon.set_pane(self.pane);
@@ -1296,6 +1307,7 @@ impl Engine {
         }
     }
 
+    #[inline]
     fn echo_bridge(
         &mut self,
         from: (u16, u16),
@@ -1376,6 +1388,7 @@ impl Engine {
     }
 
     /// The content witness's walk ([`witness`]).
+    #[inline]
     pub fn witness_rows(&mut self, rows: &[RowSample<'_>], now: Instant) -> u32 {
         let withheld_n = std::mem::take(&mut self.withheld_n);
         if !self.engaged || rows.is_empty() {
@@ -1392,18 +1405,14 @@ impl Engine {
         );
         let mut n = 0u32;
         if !self.retire_scratch.is_empty() {
-            n = n.saturating_add(
-                u32::try_from(self.ribbon.retire_cells(&self.retire_scratch, now))
-                    .unwrap_or(u32::MAX),
-            );
+            let retired = self.ribbon.retire_cells(&self.retire_scratch, now);
+            n = n.saturating_add(retired.min(u32::MAX as usize) as u32);
         }
         if !self.release_scratch.is_empty() {
-            n = n.saturating_add(
-                u32::try_from(self.ribbon.release_cells(&self.release_scratch, now))
-                    .unwrap_or(u32::MAX),
-            );
+            let released = self.ribbon.release_cells(&self.release_scratch, now);
+            n = n.saturating_add(released.min(u32::MAX as usize) as u32);
         }
-        n = n.saturating_sub(u32::try_from(recounted).unwrap_or(u32::MAX));
+        n = n.saturating_sub(recounted.min(u32::MAX as usize) as u32);
         if n > 0 {
             self.retired += u64::from(n);
             self.status.retired = self.retired;
@@ -1411,6 +1420,7 @@ impl Engine {
         n
     }
 
+    #[inline]
     fn restore_released_rows(&mut self, rows: &[RowSample<'_>]) {
         self.witness
             .restored_runs(self.ribbon.cells(), rows, &mut self.restore_scratch);
@@ -1426,6 +1436,7 @@ impl Engine {
 
     /// An exact returning typed cell still occupies its column while its partial release waits
     /// for the frame's queued edits to finish. This query lifts no stamp and renews no clock.
+    #[inline]
     pub(crate) fn returning_partial_cell(
         &self,
         row: u16,
@@ -1455,6 +1466,12 @@ impl Engine {
     #[must_use]
     pub const fn ribbon(&self) -> &Ribbon {
         &self.ribbon
+    }
+
+    /// The laid ribbon, for a test's negative control.
+    #[cfg(test)]
+    pub(crate) const fn ribbon_mut(&mut self) -> &mut Ribbon {
+        &mut self.ribbon
     }
 
     /// The rows the witness wants, written into `out`.
@@ -1501,6 +1518,7 @@ impl Engine {
     }
 
     /// [`Engine::ribbon_rows_for`] with this frame's caret move `(from, to)`.
+    #[inline]
     pub fn ribbon_rows_at_caret(
         &self,
         arming: Option<u16>,
@@ -1529,6 +1547,7 @@ impl Engine {
         n
     }
 
+    #[inline]
     fn band_rows(&self, out: &mut [u16], caret_move: Option<(u16, u16)>) -> usize {
         let cohorts = self.ribbon.cohorts();
         if cohorts.is_empty() || out.is_empty() {
@@ -1641,6 +1660,7 @@ impl Engine {
 
     /// The same content follow, with the one exact short held park the host may be waiting to
     /// judge.
+    #[inline]
     pub(crate) fn follow_rows_with_park(
         &mut self,
         rows: &[RowSample<'_>],
@@ -1720,7 +1740,7 @@ impl Engine {
             let moved = self.ribbon.shift_run(run, &mut self.moved_scratch);
             if moved > 0 {
                 self.witness.shift_cells(&mut self.moved_scratch, run.dc);
-                n = n.saturating_add(u32::try_from(moved).unwrap_or(u32::MAX));
+                n = n.saturating_add(moved.min(u32::MAX as usize) as u32);
             }
             k += 1;
         }
@@ -1811,7 +1831,7 @@ impl Engine {
             }
             self.witness
                 .translate_cells(&mut self.moved_scratch, run.dr);
-            n = n.saturating_add(u32::try_from(moved).unwrap_or(u32::MAX));
+            n = n.saturating_add(moved.min(u32::MAX as usize) as u32);
         }
         if let Some(h) = hand
             && let Some(to) = h.row.checked_add_signed(h.dr)
@@ -1825,6 +1845,7 @@ impl Engine {
         (n, park_proved)
     }
 
+    #[inline]
     fn hand_rides(
         &mut self,
         rows: &[RowSample<'_>],
@@ -1857,6 +1878,7 @@ impl Engine {
         Some(run)
     }
 
+    #[inline]
     fn hand_returns(&mut self, rows: &[RowSample<'_>]) -> Option<witness::FollowRun> {
         if !self.caret_known {
             return None;
@@ -1906,6 +1928,7 @@ impl Engine {
     }
 
     /// The follow verdict on the hand's own line this frame.
+    #[inline]
     pub(crate) fn hand_line_follow(
         &mut self,
         rows: &[RowSample<'_>],
@@ -1920,7 +1943,7 @@ impl Engine {
 
     /// The hand rides its line: its anchors lift from `run.row` by `run.dr`.
     #[inline]
-    pub(crate) fn lift_hand(&mut self, run: witness::FollowRun) {
+    pub(crate) const fn lift_hand(&mut self, run: witness::FollowRun) {
         let Some(to) = run.row.checked_add_signed(run.dr) else {
             return;
         };
@@ -1931,7 +1954,7 @@ impl Engine {
     /// The hand's anchors lifted with a line that has no typed run to carry: [`Engine::lift_hand`]
     /// with no run.
     #[inline]
-    pub(crate) fn lift_caret(&mut self, row: u16, to: u16) {
+    pub(crate) const fn lift_caret(&mut self, row: u16, to: u16) {
         self.lift_hand_anchors(row, to);
     }
 
@@ -1940,7 +1963,11 @@ impl Engine {
         if r == row { to } else { r }
     }
 
-    fn lift_hand_anchors(&mut self, row: u16, to: u16) {
+    #[inline]
+    const fn lift_hand_anchors(&mut self, row: u16, to: u16) {
+        if row == to {
+            return;
+        }
         if self.caret_known {
             self.caret.0 = Self::map_hand_row(self.caret.0, row, to);
         }
@@ -2025,6 +2052,7 @@ impl Engine {
             .note_rewrap_start(from, to, start, Some(width), space);
     }
 
+    #[inline]
     fn note_rewrap_starts(
         &mut self,
         rows: &[RowSample<'_>],
@@ -2120,6 +2148,7 @@ impl Engine {
     }
 
     /// The kitty's Delight edge, reported by the host.
+    #[inline]
     pub fn earn_hero(&mut self, now: Instant, row: u16, col: u16) {
         if !self.engaged {
             return;
@@ -2144,6 +2173,7 @@ impl Engine {
     }
 
     /// The grief gate, [`Self::celebrate`]'s inverse.
+    #[inline]
     pub fn hush_fanfare(&mut self, now: Instant) {
         if !self.engaged {
             return;
@@ -2177,12 +2207,14 @@ impl Engine {
     }
 
     /// Seam point 3, the emit phase.
+    #[inline]
     pub fn tick(&mut self, now: Instant, geom: Geom, cfg: &Config, out: &mut Frame<'_>) {
         self.tick_with_restored_rows(now, geom, cfg, out, &[]);
     }
 
     /// The host's sampled rows can lift a prior partial release on the very frame that shows its
     /// text again, after queued edits have replayed.
+    #[inline]
     pub(crate) fn tick_with_restored_rows(
         &mut self,
         now: Instant,
@@ -2231,7 +2263,7 @@ impl Engine {
             reduced_motion: cfg.reduced_motion || self.reduced_motion,
             ..*cfg
         };
-        self.grid_rows = u16::try_from(geom.rows).unwrap_or(u16::MAX);
+        self.grid_rows = geom.rows.min(u16::MAX as usize) as u16;
         let mut keys = 0usize;
         let mut saw_erase = false;
         let mut ei = 0;
@@ -2258,7 +2290,7 @@ impl Engine {
         };
         let price = self.spine.birth_disp();
         self.spine
-            .note_keys(now, u32::try_from(keys).unwrap_or(u32::MAX), price);
+            .note_keys(now, keys.min(u32::MAX as usize) as u32, price);
         let mut ctx = Ctx {
             now,
             geom,
@@ -2394,6 +2426,7 @@ impl Engine {
         self.brisk = self.meteor.brisk(now) || self.ribbon.brisk(now) || self.stardust.brisk(now);
     }
 
+    #[inline]
     fn on_spawn(&mut self, spawn: &Spawn, licence: Licence, ctx: &Ctx<'_>) {
         let cells = spawn.cells;
         let (kind, dir) = match licence {
@@ -2663,16 +2696,21 @@ impl Engine {
         };
         let (lo, hi) = pet.span();
         let mote_cell = ((lo + hi) * 0.5).floor().max(0.0) as u32;
-        let (mote_t, mote_rgb) = match u16::try_from(mote_cell) {
-            Ok(col) => match self.ribbon.field_at(pet.row, col) {
+        let (mote_t, mote_rgb) = if mote_cell <= u32::from(u16::MAX) {
+            match self.ribbon.field_at(pet.row, mote_cell as u16) {
                 Some(t) => (Some(t), Some(spectrum_snap(t))),
                 None => (None, None),
-            },
-            Err(_) => (None, None),
+            }
+        } else {
+            (None, None)
         };
         let mut catch: Option<companion::StarCatch> = None;
         if pet.contented() {
-            for s in self.stardust.live_iter() {
+            let stars = self.stardust.live_stars();
+            let mut si = 0;
+            while si < stars.len() {
+                let s = &stars[si];
+                si += 1;
                 if !(s.gold
                     && s.class == stardust::StarClass::M1
                     && s.lane.is_sky()
@@ -2716,7 +2754,11 @@ impl Engine {
     }
 
     /// This frame's [`companion::KeepOut`], window pixels: no star is drawn
-    /// on it and the ribbon's body never feathers up into it.
+    /// on it and the ribbon's body never feathers up into it; its filled
+    /// cells' runs (`filled`) keep the ribbon's rail off them, and the feet
+    /// of the rows whose glyphs were named (`feet`, on the rows `soles`)
+    /// part the rail it lays in its own row's foot band
+    /// ([`companion::KeepOut::foot_share`]).
     #[inline]
     pub fn note_keep_out(
         &mut self,
@@ -2725,26 +2767,38 @@ impl Engine {
             impl IntoIterator<Item = (i32, i32, i32, i32)>,
         ),
         (rows, past): (impl IntoIterator<Item = (i32, i32, i32, i32)>, i32),
+        filled: impl IntoIterator<Item = (i32, i32, i32, i32)>,
+        (feet, soles): (
+            impl IntoIterator<Item = (i32, i32, i32, i32)>,
+            impl IntoIterator<Item = (i32, i32, i32, i32)>,
+        ),
     ) {
         self.stardust.keep_out.set_split(icons, cells);
         self.stardust.keep_out.set_rows_past(rows, past);
+        self.stardust.keep_out.set_filled(filled);
+        self.stardust.keep_out.set_feet(feet, soles);
         self.ribbon.keep_out.clone_from(&self.stardust.keep_out);
         self.meteor.keep_out.clone_from(&self.stardust.keep_out);
     }
 
+    /// [`Self::note_keep_out`] from slices, the icons' boxes moved by
+    /// `icon_offset`.
     #[inline]
     pub(crate) fn note_keep_out_slices(
         &mut self,
-        icons: &[(i32, i32, i32, i32)],
+        icons: &[PxBox],
         icon_offset: (i32, i32),
-        cells: &[(i32, i32, i32, i32)],
-        rows: &[(i32, i32, i32, i32)],
-        past: i32,
+        cells: &[PxBox],
+        (rows, past): (&[PxBox], i32),
+        filled: &[PxBox],
+        (feet, soles): (&[PxBox], &[PxBox]),
     ) {
         self.stardust
             .keep_out
             .set_split_slices(icons, icon_offset, cells);
         self.stardust.keep_out.set_rows_past_slice(rows, past);
+        self.stardust.keep_out.set_filled_slice(filled);
+        self.stardust.keep_out.set_feet_slices(feet, soles);
         self.ribbon.keep_out.clone_from(&self.stardust.keep_out);
         self.meteor.keep_out.clone_from(&self.stardust.keep_out);
     }
@@ -2998,6 +3052,7 @@ impl Engine {
     }
 }
 
+#[inline]
 const fn swept_space_cell(events: &[(Event, Instant)], index: usize) -> Option<(u16, u16)> {
     if index + 1 >= events.len() {
         return None;
@@ -3149,6 +3204,11 @@ const fn sub_floor_hop(from: (u16, u16), to: (u16, u16), licence: Licence) -> bo
 const fn liveness(under: &[GlowQuad], out: &[GlowQuad], halos: &[RainHalo]) -> u64 {
     !(under.is_empty() && out.is_empty() && halos.is_empty()) as u64
 }
+
+#[cfg(any(test, debug_assertions))]
+mod state_words;
+#[cfg(any(test, debug_assertions))]
+pub(crate) use state_words::caret_seam_words;
 
 #[cfg(test)]
 mod tests {

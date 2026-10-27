@@ -68,6 +68,56 @@ const fn const_double(n: u32) -> u32 {
 
 const CONST_EVALUATED: u32 = const_double(21);
 
+/// A `const extern "C"` fn is const too, so it is unprobed like `const_double`.
+#[refines(machine = "Shapes", action = "ConstExtern", project = "test::project")]
+const extern "C" fn const_extern_triple(n: u32) -> u32 {
+    n * 3
+}
+
+/// A fn another macro builds, its body passed on as a `$body:block` fragment.
+macro_rules! fn_from_block {
+    ($name:ident, $body:block) => {
+        #[refines(machine = "Shapes", action = "BlockFragment", project = "test::project")]
+        fn $name() -> u32 $body
+    };
+}
+
+fn_from_block!(from_block, { 5 });
+
+/// Stacked waivers whose actions are the same, the same once punctuation reads as `_`, or
+/// absent: each is a record of its own.
+#[spec_unmodeled(machine = "Alpha", action = "Start", reason = "stacked")]
+#[spec_unmodeled(machine = "Beta", action = "Start", reason = "stacked")]
+#[spec_unmodeled(machine = "Alpha", action = "a-b", reason = "stacked")]
+#[spec_unmodeled(machine = "Alpha", action = "a_b", reason = "stacked")]
+#[spec_unmodeled(machine = "Gamma", reason = "stacked")]
+#[spec_unmodeled(machine = "Delta", reason = "stacked")]
+fn stacked_waivers() -> u32 {
+    6
+}
+
+/// A stack whose first anchor takes the `macro_rules!` general path (its keys out of order): the
+/// second record books the first's line here too, as on every stack, under either form.
+#[spec_unmodeled(reason = "reordered", action = "First", machine = "Order")]
+#[spec_unmodeled(machine = "Order", action = "Second", reason = "reordered")]
+fn reordered_waivers() -> u32 {
+    2
+}
+
+/// A stack written through `cfg_attr`, as the workspace writes its anchors, under a doc comment
+/// above it: the second record books the first's line here too.
+#[cfg_attr(
+    all(),
+    spec_unmodeled(machine = "Wrapped", action = "First", reason = "cfg_attr")
+)]
+#[cfg_attr(
+    all(),
+    spec_unmodeled(machine = "Wrapped", action = "Second", reason = "cfg_attr")
+)]
+fn wrapped_waivers() -> u32 {
+    3
+}
+
 /// Inner attributes on the block must survive the prepend.
 #[refines(machine = "Shapes", action = "InnerAttr", project = "test::project")]
 fn inner_attr_body() -> u32 {
@@ -101,6 +151,36 @@ impl ByValue {
     }
 }
 
+trait Scaled {
+    fn doubled(&self) -> u32;
+    fn tripled(&self) -> u32;
+}
+
+/// A trait impl takes no item the trait does not declare, so an anchor's record sits in the
+/// method's body, not beside it.
+impl Scaled for ByValue {
+    #[refines(machine = "Shapes", action = "TraitImpl", project = "test::project")]
+    fn doubled(&self) -> u32 {
+        self.n * 2
+    }
+
+    #[spec_unmodeled(reason = "a trait method the model does not describe")]
+    fn tripled(&self) -> u32 {
+        self.n * 3
+    }
+}
+
+#[test]
+fn a_trait_impl_method_is_anchored_and_probed() {
+    open_window();
+    let id = anchor_entry_id("TraitImpl");
+    assert_eq!(id, "Shapes::TraitImpl @ doubled");
+    assert!(!entered_anchor_ids().contains(id));
+    assert_eq!(ByValue { n: 4 }.doubled(), 8);
+    assert!(entered_anchor_ids().contains(id));
+    assert_eq!(ByValue { n: 4 }.tripled(), 12);
+}
+
 #[test]
 fn probe_preserves_behaviour_of_every_awkward_fn_shape() {
     assert_eq!(early_return(0), 99, "an early return still returns early");
@@ -109,6 +189,15 @@ fn probe_preserves_behaviour_of_every_awkward_fn_shape() {
     assert_eq!(recursive_sum(4), 10, "recursion is unaffected");
     assert_eq!(const_double(4), 8);
     assert_eq!(CONST_EVALUATED, 42, "the const fn is still const-evaluable");
+    assert_eq!(const_extern_triple(2), 6);
+    assert_eq!(
+        from_block(),
+        5,
+        "a block fragment's value is still the fn's"
+    );
+    assert_eq!(stacked_waivers(), 6);
+    assert_eq!(reordered_waivers(), 2);
+    assert_eq!(wrapped_waivers(), 3);
     assert_eq!(inner_attr_body(), 7);
     assert_eq!(ByValue { n: 5 }.into_n(), 5, "`self` by value still moves");
     let mut b = ByValue { n: 1 };
@@ -139,6 +228,37 @@ fn probe_records_the_anchor_id_the_record_carries() {
     assert!(
         entered_anchor_ids().contains(inner),
         "leading inner attributes must not displace the entry probe"
+    );
+}
+
+#[test]
+fn a_body_from_a_block_fragment_is_probed_and_a_const_extern_fn_is_not() {
+    open_window();
+    let id = anchor_entry_id("BlockFragment");
+    assert_eq!(id, "Shapes::BlockFragment @ from_block");
+    assert!(!entered_anchor_ids().contains(id));
+    assert_eq!(from_block(), 5);
+    assert!(entered_anchor_ids().contains(id));
+    assert_eq!(anchor_entry_id("ConstExtern"), "");
+}
+
+#[test]
+fn stacked_waivers_are_each_collected() {
+    let mut stacked: Vec<String> = aterm_spec::xref::waivers()
+        .filter(|w| w.rust_method == "stacked_waivers")
+        .map(|w| format!("{}|{}", w.machine, w.action))
+        .collect();
+    stacked.sort();
+    assert_eq!(
+        stacked,
+        [
+            "Alpha|Start",
+            "Alpha|a-b",
+            "Alpha|a_b",
+            "Beta|Start",
+            "Delta|",
+            "Gamma|"
+        ]
     );
 }
 
@@ -210,24 +330,35 @@ fn the_registry_collects_every_record_this_file_submits_exactly_once() {
         "fast",
         "a waived fn keeps its behaviour"
     );
+    // A record's line, not its file: the two harnesses reach this file by different paths.
+    let line = |location: &str| location.rsplit_once(':').map(|(_, line)| line.to_string());
     let mut rows: Vec<String> = refinements()
         .map(|r| {
             format!(
-                "refines {}|{}|{}|{}|{}",
-                r.machine, r.action, r.rust_method, r.project, r.entry_id
+                "refines {}|{}|{}|{}|{}|{:?}",
+                r.machine,
+                r.action,
+                r.rust_method,
+                r.project,
+                r.entry_id,
+                line(r.location)
             )
         })
         .chain(waivers().map(|w| {
             format!(
-                "unmodeled {}|{}|{}|{}",
-                w.machine, w.action, w.reason, w.rust_method
+                "unmodeled {}|{}|{}|{}|{:?}",
+                w.machine,
+                w.action,
+                w.reason,
+                w.rust_method,
+                line(w.location)
             )
         }))
         .collect();
     rows.sort();
     assert_eq!(
         (rows.len(), records_digest(&rows).as_str()),
-        (11, "0d8c8bdbeb054048"),
+        (25, "dbbd6b3cc5dfcfc8"),
         "the collected record set changed: {rows:#?}"
     );
 }

@@ -8,6 +8,13 @@ use std::time::{Duration, Instant};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--cpu-hardware") {
+        let mut hardware = aterm_sysprobe::cpu_hardware::Probe::default();
+        println!("hardware_initial {:?}", hardware.sample());
+        std::thread::sleep(Duration::from_secs(1));
+        println!("hardware_interval {:?}", hardware.sample());
+        return;
+    }
     let calls = args
         .iter()
         .position(|a| a == "--calls")

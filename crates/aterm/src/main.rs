@@ -31,8 +31,9 @@ fn link_unavailable(verb: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// `aterm machines` where it cannot exist: `aterm-machines` drives macOS's own tools and is a
-/// `cfg(target_os = "macos")` dependency, so the verb stays on the roster and refuses by name.
+/// `aterm machines` where it cannot run: the controller and its agent drive macOS's own tools,
+/// so off macOS (where `aterm-machines` is linked for `aterm init` alone) the verb stays on the
+/// roster and refuses by name.
 #[cfg(not(target_os = "macos"))]
 fn machines_unavailable() -> ExitCode {
     eprintln!("aterm machines: not available on this platform (macOS only)");
@@ -153,6 +154,22 @@ pub(crate) fn main() -> ExitCode {
         return code;
     }
     aterm_types::version::install(BUILD_STAMP);
+    // The fixed collector runs before GUI initialization or any per-user state is read.
+    #[cfg(target_os = "macos")]
+    let early_args: Vec<_> = std::env::args_os().skip(1).collect();
+    #[cfg(target_os = "macos")]
+    if early_args
+        .first()
+        .is_some_and(|a| a == aterm_sysprobe::cpu_policy::COLLECTOR_VERB)
+    {
+        if aterm_uds::sudo::stdout_is_anon_pipe().is_err() {
+            eprintln!("CPU policy collection requires its owned anonymous output pipe");
+            return ExitCode::from(2);
+        }
+        return ExitCode::from(aterm_sysprobe::cpu_policy::collector_entry(
+            &early_args[1..],
+        ));
+    }
     aterm_gui::mark_rust_main_start();
     #[cfg(windows)]
     let _ = aterm_gui::attach_parent_console();
@@ -190,6 +207,7 @@ pub(crate) fn main() -> ExitCode {
         AliasRoute::Drive => return aterm_agent::drive_cli::main_entry(rest),
         AliasRoute::OpenUrl => return aterm_agent::harness::open_url::main_entry(rest),
         AliasRoute::Amacs => return aterm_cli::amacs_launch::run(rest),
+        AliasRoute::CommandLineToolsShim => return aterm_cli::clt_shim::run(argv0, rest),
         AliasRoute::Link => {
             #[cfg(unix)]
             return dispatch_link(
@@ -309,12 +327,31 @@ pub(crate) fn main() -> ExitCode {
                         full_disk_access: &aterm_cli::macos_doctor::full_disk_access,
                         records: &aterm_cli::macos_doctor::InitRecords,
                         grants: aterm_cli::macos_doctor::init_grants,
+                        walk: &aterm_cli::init_permissions_walk,
+                        converge: &converge::Live,
                     },
                 )
             }
-            #[cfg(not(target_os = "macos"))]
+            // Elsewhere (Linux): the base layer, the vault and the repositories; each
+            // workstation row reads "macOS only".
+            #[cfg(all(unix, not(target_os = "macos")))]
             aterm_cli::Verb::Init => {
-                eprintln!("aterm init: local macOS setup is available on macOS only");
+                aterm_gui::install_session_log();
+                aterm_machines::init::main_entry(
+                    forwarded,
+                    &aterm_machines::init::Host {
+                        base: &doctor::init_base,
+                        full_disk_access: &|| None,
+                        records: &aterm_machines::init::NoRecords,
+                        grants: aterm_machines::init::no_grants,
+                        walk: &|_| None,
+                        converge: &converge::Live,
+                    },
+                )
+            }
+            #[cfg(not(unix))]
+            aterm_cli::Verb::Init => {
+                eprintln!("aterm init: not available on this platform (Unix only)");
                 ExitCode::from(2)
             }
             #[cfg(unix)]
@@ -353,9 +390,9 @@ pub(crate) fn main() -> ExitCode {
             aterm_cli::Verb::Keeper => {
                 aterm_keeper::cli::main_entry(forwarded, aterm_types::version::app_version())
             }
-            aterm_cli::Verb::Caffeine => {
+            aterm_cli::Verb::Acaffiene => {
                 aterm_gui::install_session_log();
-                aterm_caffeine::cli::main_entry(forwarded, aterm_types::version::app_version())
+                aterm_acaffiene::cli::main_entry(forwarded, aterm_types::version::app_version())
             }
             aterm_cli::Verb::Agents => {
                 let _ = aterm_cli::parse_args(rest);
@@ -848,31 +885,61 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     #[cfg(not(windows))]
     let _ = (host, handoff);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if !args.iter().any(|a| {
-        matches!(
-            a.to_string_lossy().as_ref(),
-            "--headless" | "--diagnose" | "--control-sock"
-        )
-    }) {
+    let ordinary = ordinary_window(&args);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if ordinary {
         spawn_commons_runtime();
     }
+    #[cfg(target_os = "macos")]
+    if ordinary {
+        spawn_acaffiene_autostart();
+    }
     let first_run = wire_window(&args);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let network_source = ordinary.then(network_state_source).flatten();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let network_source = None;
     #[expect(
         clippy::disallowed_methods,
         reason = "the one window door: every window route reaches the GUI here"
     )]
-    aterm_gui::main_entry_with_first_run(args, first_run);
+    aterm_gui::main_entry_with_network(args, first_run, network_source);
     ExitCode::SUCCESS
+}
+
+/// Whether this is an ordinary window launch rather than a one-shot or private control session.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn ordinary_window(args: &[OsString]) -> bool {
+    !args.iter().any(|a| {
+        matches!(
+            a.to_string_lossy().as_ref(),
+            "--headless" | "--diagnose" | "--control-sock"
+        )
+    })
+}
+
+/// Start aCaffiene beside an ordinary window, leaving its saved mode and login-item choice alone.
+#[cfg(target_os = "macos")]
+fn spawn_acaffiene_autostart() {
+    if let Err(error) = std::thread::Builder::new()
+        .name("aterm-acaffiene-autostart".into())
+        .spawn(aterm_acaffiene::cli::autostart)
+    {
+        aterm_log::warn!("acaffiene: could not start with aterm: {error}");
+    }
 }
 
 /// Only long-lived ordinary hosts contend for Commons transport ownership.
 /// One-shot verbs return before these call sites; private labs are inert.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+static COMMONS_RUNTIME: std::sync::OnceLock<aterm_db::runtime::Runtime> =
+    std::sync::OnceLock::new();
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn spawn_commons_runtime() {
-    static RUNTIME: std::sync::OnceLock<aterm_db::runtime::Runtime> = std::sync::OnceLock::new();
     if std::env::var_os("ATERM_STATE_HOME").is_some()
         || std::env::var_os("CI").is_some()
-        || RUNTIME.get().is_some()
+        || COMMONS_RUNTIME.get().is_some()
     {
         return;
     }
@@ -892,10 +959,104 @@ fn spawn_commons_runtime() {
         }
     }) {
         Ok(runtime) => {
-            let _ = RUNTIME.set(runtime);
+            let _ = COMMONS_RUNTIME.set(runtime);
         }
         Err(error) => aterm_log::warn!("Commons runtime could not start: {error}"),
     }
+}
+
+/// Join the independent producers, loading fallback history once before the GUI starts.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn network_state_source() -> Option<aterm_gui::NetworkSnapshotSource> {
+    use std::sync::OnceLock;
+
+    if std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some() {
+        return None;
+    }
+
+    static SERVICES: OnceLock<Option<aterm_db::service_state::Runtime>> = OnceLock::new();
+    let network = COMMONS_RUNTIME
+        .get()
+        .map(aterm_db::runtime::Runtime::network_observation);
+    let services = SERVICES
+        .get_or_init(|| {
+            let paths = aterm_secrets::client::Paths::live().ok()?;
+            let config = aterm_types::dirs::aterm_config_path()?;
+            aterm_db::service_state::Runtime::start(paths, config).ok()
+        })
+        .as_ref()
+        .map(aterm_db::service_state::Runtime::observation);
+    let retained = if network.is_none() {
+        aterm_types::dirs::aterm_config_path()
+            .and_then(|config| aterm_db::network_state::read_history(&config).ok())
+    } else {
+        None
+    };
+    Some(network_state_source_from(network, services, retained))
+}
+
+/// Compose independent observers, including when only one could start.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn network_state_source_from(
+    network: Option<aterm_db::network_state::ObservationHandle>,
+    services: Option<std::sync::Arc<std::sync::Mutex<aterm_types::network_state::ServiceStates>>>,
+    retained: Option<aterm_types::network_state::NetworkObservation>,
+) -> aterm_gui::NetworkSnapshotSource {
+    use aterm_types::network_state::{
+        HistoryState, NetworkObservation, NetworkStateSnapshot, Reachability, ServiceState,
+        ServiceStates, Visibility,
+    };
+    use std::sync::{Arc, Mutex};
+
+    let mut retained = retained.unwrap_or_else(|| NetworkObservation {
+        history: HistoryState::Unavailable,
+        detail: "Retained network history is unavailable".into(),
+        ..NetworkObservation::default()
+    });
+    retained.visibility = Visibility::Unavailable;
+    // A saved observer incarnation is not an attestation of this process.
+    retained.observer = None;
+    retained.unverified_endpoints = 0;
+    if retained.history == HistoryState::Restoring {
+        retained.history = HistoryState::Unavailable;
+    }
+    for peer in &mut retained.peers {
+        peer.reachability = Reachability::Unknown;
+        peer.last_checked_ms = None;
+    }
+    retained.detail = format!(
+        "Network observer could not start; current reachability is unknown. {}",
+        retained.detail
+    );
+    let current = Mutex::new(Arc::new(NetworkStateSnapshot::default()));
+    Arc::new(move || {
+        let network = network.as_ref().map_or_else(
+            || retained.clone(),
+            aterm_db::network_state::ObservationHandle::snapshot,
+        );
+        let services = services.as_ref().map_or_else(
+            || ServiceStates {
+                accounts: ServiceState {
+                    detail: "Service observer is unavailable".into(),
+                    ..ServiceState::default()
+                },
+                secrets: ServiceState {
+                    detail: "Service observer is unavailable".into(),
+                    ..ServiceState::default()
+                },
+            },
+            |services| services.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+        );
+        let mut current = current.lock().unwrap_or_else(|p| p.into_inner());
+        if current.network != network || current.services != services {
+            *current = Arc::new(NetworkStateSnapshot {
+                revision: current.revision.saturating_add(1),
+                network,
+                services,
+            });
+        }
+        current.clone()
+    })
 }
 
 /// What the window's process wires before the GUI starts: on macOS the LAN agent's retirement
@@ -935,6 +1096,8 @@ fn wire_window(args: &[OsString]) -> Option<fn() -> bool> {
     watch_setup_signals();
     #[cfg(target_os = "macos")]
     aterm_gui::set_secrets_sync_gate(vault_sync_kept, while_vault_sync_kept);
+    #[cfg(target_os = "macos")]
+    aterm_gui::set_launch_repairs(doctor::launch_repairs);
     #[cfg(target_os = "macos")]
     aterm_gui::set_initial_setup_handlers(aterm_gui::InitialSetupHandlers {
         apply: restart_initial_setup,
@@ -1217,6 +1380,104 @@ fn alab_look_after(looks: u32) -> std::time::Duration {
         .min(ALAB_LOOK_LONGEST)
 }
 
+/// How long after a watch for the ALab vault first heard Local Network's current answer a
+/// window's focus gain stays a reason to look while that answer is neither on nor off
+/// ([`AlabFocus`]): macOS tells no app that the person answered its question or turned the
+/// switch on in System Settings, and a person who did comes back to aterm within moments.
+#[cfg(any(target_os = "macos", test))]
+const ALAB_FOCUS_FRESH: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// What aterm last heard of macOS's Local Network switch for it, as a watch for the ALab vault
+/// weighs a focus gain by it (`aterm_cli::macos_doctor::LocalNetworkHeard`).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LanHeard {
+    /// Nothing says.
+    Untold,
+    /// The window raised macOS's question, and no look since heard how it went.
+    Asked,
+    /// A look reached the LAN.
+    On,
+    /// macOS refused a look the LAN.
+    Off,
+}
+
+/// What aterm last heard of Local Network for it, from its own records.
+#[cfg(target_os = "macos")]
+fn lan_heard() -> LanHeard {
+    use aterm_cli::macos_doctor::LocalNetworkHeard;
+    match aterm_cli::macos_doctor::local_network_heard() {
+        LocalNetworkHeard::Untold => LanHeard::Untold,
+        LocalNetworkHeard::Asked => LanHeard::Asked,
+        LocalNetworkHeard::On => LanHeard::On,
+        LocalNetworkHeard::Off => LanHeard::Off,
+    }
+}
+
+/// Whether a window's focus gain is a reason for a watch for the ALab vault to look again
+/// ([`WakeMarks::ends_alab_wait`]): never once a look reached the LAN, since a focus gain changes
+/// nothing a look reads; always while macOS refuses aterm the LAN, since only the person's switch
+/// in System Settings moves that and a refused look asks nothing of the network; and otherwise
+/// (macOS's question asked, or nothing heard) for [`ALAB_FOCUS_FRESH`] after the watch first
+/// heard that answer. A Mac with no ALab vault on its network never hears the switch on (nothing
+/// answers its looks), and a look at every focus gain asked its network every ten seconds for as
+/// long as aterm ran.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug)]
+struct AlabFocus {
+    /// The answer last weighed, and when the watch first heard it.
+    heard: Option<(LanHeard, std::time::Instant)>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl AlabFocus {
+    const fn new() -> Self {
+        Self { heard: None }
+    }
+
+    /// Whether a focus gain is a reason to look at `now`, aterm having heard `heard` last.
+    fn counts(&mut self, heard: LanHeard, now: std::time::Instant) -> bool {
+        let since = match self.heard {
+            Some((last, since)) if last == heard => since,
+            _ => {
+                self.heard = Some((heard, now));
+                now
+            }
+        };
+        match heard {
+            LanHeard::On => false,
+            LanHeard::Off => true,
+            LanHeard::Untold | LanHeard::Asked => {
+                now.saturating_duration_since(since) < ALAB_FOCUS_FRESH
+            }
+        }
+    }
+}
+
+/// The network a watch for the ALab vault waits on: the IPv4 subnets a look's record is kept
+/// for (`aterm_secrets::heard::network`), read as the wait starts.
+#[cfg(target_os = "macos")]
+static ALAB_WAIT_NETWORK: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+
+/// Whether this Mac's network as it is `now` moved off the one a watch for the ALab vault waits
+/// on (`waited_on`, unset before any wait): only then is a change the network watch heard a
+/// reason to look. An interface that comes and goes without moving the subnets (AirDrop's and
+/// Continuity's peer-to-peer links, a tunnel with no IPv4 address) is no new network, and the
+/// network watch would otherwise end every wait within a minute of the last on a Mac that has
+/// them. A move between two networks with the same subnets is the same network to a look's
+/// record too; System State coming to the front, Check again and the timer look there.
+#[cfg(any(target_os = "macos", test))]
+fn alab_network_moved(
+    waited_on: &std::sync::Mutex<Option<Option<String>>>,
+    now: Option<String>,
+) -> bool {
+    waited_on
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_none_or(|waited_on| *waited_on != now)
+}
+
 /// What [`widen_on_alab_signal`] does on this Mac, or in a test.
 #[cfg(any(target_os = "macos", test))]
 trait AlabWatch {
@@ -1250,11 +1511,12 @@ enum WidenReview {
 }
 
 /// While the plan aterm chose by itself is provisional, look for the ALab vault on each wake
-/// (the window's Local Network step, System State coming to the front, Check again) and on a
-/// slow timer, first as the watch starts: on a first launch the scoping probe is aterm's first
-/// request to the LAN, which macOS holds until the person answers its Local Network question, so
-/// it hears nothing. Once one hears it, System State offers the groups it adds as a review of
-/// their own, and the plan widens and runs in this launch only as that review admits it.
+/// that is a reason to (the window's Local Network step, System State coming to the front, Check
+/// again, this Mac's network changing: [`WakeMarks::ends_alab_wait`]) and on a slow timer, first
+/// as the watch starts: on a first launch the scoping probe is aterm's first request to the LAN,
+/// which macOS holds until the person answers its Local Network question, so it hears nothing.
+/// Once one hears it, System State offers the groups it adds as a review of their own, and the
+/// plan widens and runs in this launch only as that review admits it.
 #[cfg(any(target_os = "macos", test))]
 fn widen_on_alab_signal<W: AlabWatch>(watch: &mut W) {
     let mut looks = 0;
@@ -1360,7 +1622,9 @@ fn decline_widen() {
 
 #[cfg(target_os = "macos")]
 struct LiveAlabWatch {
-    wakes_seen: u64,
+    wakes_seen: WakeMarks,
+    /// When a focus gain is a reason to look ([`AlabFocus`]).
+    focus: AlabFocus,
     /// The upgrade this watch began, held while a commit that failed can still finish.
     upgrade: aterm_cli::macos_doctor::InitialSetupUpgrade,
     /// The plan the last look widens, or widened.
@@ -1379,7 +1643,8 @@ struct LiveAlabWatch {
 impl LiveAlabWatch {
     fn new() -> Self {
         Self {
-            wakes_seen: SETUP_WAKES.count(),
+            wakes_seen: SETUP_WAKES.marks(),
+            focus: AlabFocus::new(),
             upgrade: aterm_cli::macos_doctor::InitialSetupUpgrade::default(),
             widened: Widened::default(),
             receipt: None,
@@ -1406,8 +1671,25 @@ impl AlabWatch for LiveAlabWatch {
         } else {
             limit
         };
+        // This Mac's network changing is the one wake a provisional plan's Mac meets on the way
+        // onto the ALab vault's LAN; the watch hears it while it waits, once the subnets move
+        // off the ones it waits on ([`alab_network_moved`]). One that could not start leaves the
+        // timer and the other wakes.
+        *ALAB_WAIT_NETWORK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(aterm_secrets::heard::network());
+        let _network = aterm_cli::macos_doctor::ParkWatch::start(
+            aterm_cli::macos_doctor::Watches {
+                network: true,
+                ..aterm_cli::macos_doctor::Watches::default()
+            },
+            wake_setup_network,
+        )
+        .ok();
         std::thread::sleep(gap);
-        SETUP_WAKES.back_off(&mut self.wakes_seen, limit.saturating_sub(gap));
+        let focus = self.focus.counts(lan_heard(), std::time::Instant::now());
+        SETUP_WAKES.back_off_alab(&mut self.wakes_seen, focus, limit.saturating_sub(gap));
     }
 
     fn review(&mut self) -> Result<WidenReview, String> {
@@ -2237,20 +2519,33 @@ fn review_widens_to(
 }
 
 /// The review's look for the ALab signal, paced as the watch's ([`widen_on_alab_signal`]): on a
-/// setup wake (the Local Network answer, the review coming to the front, Check again) and on a
-/// timer from [`ALAB_LOOK_FIRST`] doubling, never twice within [`ALAB_LOOK_GAP`]; `widened` once
-/// this Mac shows it ([`aterm_cli::macos_doctor::alab_mac`], which may probe the network for a
-/// few seconds on this worker). The offer itself looked just before.
+/// setup wake that is a reason to look ([`WakeMarks::ends_alab_wait`]: the Local Network answer,
+/// the review coming to the front, Check again) and on a timer from [`ALAB_LOOK_FIRST`] doubling,
+/// never twice within [`ALAB_LOOK_GAP`]; `widened` once this Mac shows it
+/// ([`aterm_cli::macos_doctor::alab_mac`], which may probe the network for a few seconds on this
+/// worker). The offer itself looked just before.
 #[cfg(target_os = "macos")]
 fn review_alab_look(widened: aterm_types::macos_setup::Plan) -> StartupLook {
-    let mut seen = SETUP_WAKES.count();
+    let mut seen = SETUP_WAKES.marks();
     let mut last = std::time::Instant::now();
     let mut looks = 0;
+    let mut focus = AlabFocus::new();
     Box::new(move || {
-        let wakes = SETUP_WAKES.count();
+        let wakes = SETUP_WAKES.marks();
         let since = last.elapsed();
-        if since < ALAB_LOOK_GAP || (wakes == seen && since < alab_look_after(looks)) {
+        if since < ALAB_LOOK_GAP {
             return None;
+        }
+        if since < alab_look_after(looks) {
+            if wakes == seen {
+                return None;
+            }
+            if !wakes.ends_alab_wait(seen, focus.counts(lan_heard(), std::time::Instant::now())) {
+                // A wake that is no reason to look (a focus gain [`AlabFocus`] does not count) is
+                // taken as heard, so the next tick does not weigh it again.
+                seen = wakes;
+                return None;
+            }
         }
         seen = wakes;
         last = std::time::Instant::now();
@@ -3107,6 +3402,8 @@ fn run_prepared_setup(
             // sync ([`vault_sync_kept`]), the mend keeps a vault subscriber whose plist runs a copy
             // that is gone, or that this window owes the Mac.
             (setup_io().mend_subscriber)();
+            // The converge pass's window lane, as the mend: a finished setup runs no Secrets stage.
+            (setup_io().converge_lane)();
             // On a thread of its own: its wait for the profile lock another pass holds must not
             // hold up the watch for the ALab vault that starts once this returns.
             (setup_io().start_follow_up)();
@@ -3811,6 +4108,8 @@ impl SetupRetryHost for LiveSetupRetry {
         // stale or owed subscriber (started once per process: a run admitted at launch started
         // it already), and System State's Secrets rows show the rest.
         (setup_io().mend_subscriber)();
+        // The converge pass's window lane starts once the run completed, never beside it.
+        (setup_io().converge_lane)();
     }
 }
 
@@ -4205,8 +4504,8 @@ mod alab_watch_tests {
 #[cfg(test)]
 mod setup_retry_tests {
     use super::{
-        PassNext, SETUP_RETRY_LIMIT, SetupRetryHost, SetupWakes, begin_check_again, idle_after,
-        run_setup_retry,
+        ALAB_FOCUS_FRESH, AlabFocus, LanHeard, PassNext, SETUP_RETRY_LIMIT, SetupRetryHost,
+        SetupWakes, alab_network_moved, begin_check_again, idle_after, run_setup_retry,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -4674,6 +4973,91 @@ mod setup_retry_tests {
         assert!(!wakes.marks().checked_since(seen), "no press");
         wakes.raise_check();
         assert!(wakes.marks().checked_since(seen));
+    }
+
+    /// One look per reason: a watch for the ALab vault looks again on this Mac's network moving
+    /// and on any wake but a window's focus gain, and on a focus gain only where [`AlabFocus`]
+    /// counts one; a network change wakes no run.
+    #[test]
+    fn a_focus_gain_wakes_the_alab_watch_only_where_it_counts() {
+        use std::time::Duration;
+        let wakes = SetupWakes::new();
+        let mut seen = wakes.marks();
+        wakes.raise_focus();
+        assert!(
+            !wakes.back_off_alab(&mut seen, false, Duration::ZERO),
+            "a focus gain that does not count: no look"
+        );
+        assert_eq!(seen, wakes.marks(), "taken as heard");
+        wakes.raise_focus();
+        assert!(wakes.back_off_alab(&mut seen, true, Duration::ZERO));
+        wakes.raise_network();
+        assert!(wakes.back_off_alab(&mut seen, false, Duration::ZERO));
+        wakes.raise();
+        assert!(wakes.back_off_alab(&mut seen, false, Duration::ZERO));
+        assert!(
+            !wakes.back_off_alab(&mut seen, true, Duration::ZERO),
+            "each wake once"
+        );
+        let mut run = wakes.marks();
+        wakes.raise_network();
+        assert!(
+            !wakes.back_off_run(&mut run, Duration::ZERO),
+            "a network change wakes only the watch"
+        );
+    }
+
+    /// A focus gain is a reason to look for the ALab vault never once a look reached the LAN,
+    /// always while macOS refuses aterm the LAN, and otherwise (the question asked, or nothing
+    /// heard) for ten minutes after the watch first heard that answer, each new answer starting
+    /// its ten minutes afresh. A Mac with no ALab vault on its network never hears the switch on,
+    /// and looked at every focus gain for as long as aterm ran.
+    #[test]
+    fn a_focus_gain_counts_for_ten_minutes_after_an_answer_that_says_neither_on_nor_off() {
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let fresh = ALAB_FOCUS_FRESH.as_secs();
+        for heard in [LanHeard::Untold, LanHeard::Asked] {
+            let mut focus = AlabFocus::new();
+            assert!(focus.counts(heard, at(0)), "{heard:?}");
+            assert!(focus.counts(heard, at(fresh - 1)), "{heard:?}");
+            assert!(!focus.counts(heard, at(fresh)), "{heard:?}: spent");
+            assert!(!focus.counts(heard, at(10 * fresh)), "{heard:?}: spent");
+        }
+        let mut focus = AlabFocus::new();
+        assert!(focus.counts(LanHeard::Untold, at(0)));
+        assert!(!focus.counts(LanHeard::Untold, at(fresh)));
+        // macOS's question, asked later, starts its ten minutes from then.
+        assert!(focus.counts(LanHeard::Asked, at(2 * fresh)));
+        assert!(!focus.counts(LanHeard::Asked, at(3 * fresh)));
+        assert!(
+            !focus.counts(LanHeard::On, at(3 * fresh)),
+            "the LAN reached"
+        );
+        assert!(focus.counts(LanHeard::Off, at(9 * fresh)), "refused");
+        assert!(focus.counts(LanHeard::Off, at(90 * fresh)), "refused");
+    }
+
+    /// A change the network watch hears wakes the ALab watch only once this Mac's IPv4 subnets
+    /// moved off the ones it waits on: an interface that comes and goes without moving them is
+    /// no reason to ask the network.
+    #[test]
+    fn a_network_change_that_leaves_the_subnets_is_no_reason_to_look() {
+        let waited_on = std::sync::Mutex::new(None);
+        assert!(
+            alab_network_moved(&waited_on, Some("192.168.4.0/24".into())),
+            "no wait yet"
+        );
+        *waited_on.lock().unwrap() = Some(Some("192.168.4.0/24".to_owned()));
+        assert!(!alab_network_moved(
+            &waited_on,
+            Some("192.168.4.0/24".into())
+        ));
+        assert!(alab_network_moved(&waited_on, Some("10.0.0.0/8".into())));
+        assert!(alab_network_moved(&waited_on, None), "off every network");
+        *waited_on.lock().unwrap() = Some(None);
+        assert!(!alab_network_moved(&waited_on, None));
+        assert!(alab_network_moved(&waited_on, Some("10.0.0.0/8".into())));
     }
 
     /// A park whose facts are all watched has a timer only for a retry ahead, never a zero one;
@@ -5644,6 +6028,10 @@ struct WakeMarks {
     /// A fact a parked run watches may have moved ([`SetupWakes::raise_facts`]): counted apart
     /// from `all`, so only a park's wait ends on it ([`SetupWakes::wait_for_park`]).
     facts: u64,
+    /// This Mac's network changed while a watch for the ALab vault waited
+    /// ([`SetupWakes::raise_network`]): counted apart from `all`, so only that watch's wait ends
+    /// on it ([`WakeMarks::ends_alab_wait`]).
+    network: u64,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -5655,6 +6043,13 @@ impl WakeMarks {
     fn ends_run_wait(self, seen: Self, focus: bool) -> bool {
         let others = |marks: Self| marks.all.wrapping_sub(marks.focus);
         others(self) != others(seen) || (focus && self.focus != seen.focus)
+    }
+
+    /// Whether a wake since `seen` is a reason to look for the ALab vault again: this Mac's
+    /// network moving, any other wake but a window's focus gain, and a focus gain only where
+    /// `focus` says one is ([`AlabFocus`]).
+    fn ends_alab_wait(self, seen: Self, focus: bool) -> bool {
+        self.network != seen.network || self.ends_run_wait(seen, focus)
     }
 
     /// Whether a person pressed Check again since `seen`: the run's tries start afresh.
@@ -5679,6 +6074,7 @@ impl SetupWakes {
                 focus: 0,
                 checks: 0,
                 facts: 0,
+                network: 0,
             }),
             raised: std::sync::Condvar::new(),
         }
@@ -5717,6 +6113,18 @@ impl SetupWakes {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         marks.facts = marks.facts.wrapping_add(1);
+        drop(marks);
+        self.raised.notify_all();
+    }
+
+    /// This Mac's network changed (`aterm_cli::macos_doctor::ParkWatch`'s network watch, while
+    /// a watch for the ALab vault waits): only that watch's wait ends ([`WakeMarks::network`]).
+    fn raise_network(&self) {
+        let mut marks = self
+            .count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        marks.network = marks.network.wrapping_add(1);
         drop(marks);
         self.raised.notify_all();
     }
@@ -5801,6 +6209,16 @@ impl SetupWakes {
     /// does not end it ([`WakeMarks::ends_run_wait`]): the next try comes a minute later.
     fn back_off_run(&self, seen: &mut WakeMarks, limit: std::time::Duration) -> bool {
         let woken = self.wait_for_run(*seen, false, limit);
+        *seen = self.marks();
+        woken
+    }
+
+    /// A watch for the ALab vault's wait between two looks: as [`Self::back_off`], but only on a
+    /// wake that is a reason to look again ([`WakeMarks::ends_alab_wait`], `focus` whether a
+    /// window's focus gain is one).
+    fn back_off_alab(&self, seen: &mut WakeMarks, focus: bool, limit: std::time::Duration) -> bool {
+        let from = *seen;
+        let woken = self.wait_while(Some(limit), |marks| !marks.ends_alab_wait(from, focus));
         *seen = self.marks();
         woken
     }
@@ -5918,6 +6336,12 @@ struct SetupIo {
     /// Watch this Mac's vault subscriber once setup is finished
     /// (`aterm_gui::mend_secrets_subscriber`).
     mend_subscriber: fn(),
+    /// Start the converge pass's window lane once a run ended, finished or completed, never
+    /// before one (`aterm_gui::start_converge_lane`).
+    converge_lane: fn(),
+    /// Start one converge pass for the Secrets stage that just ended
+    /// (`aterm_gui::converge_after_secrets_stage`).
+    converge_setup: fn(),
     /// Put back the plan a watch widened when a Stop held its run
     /// (`aterm_cli::macos_doctor::put_back_held_initial_setup`).
     put_back: fn(u64) -> Result<bool, String>,
@@ -5955,6 +6379,8 @@ impl SetupIo {
         persist: aterm_cli::macos_doctor::InitialSetupRestart::persist_observed,
         run: run_first_run_doctor,
         mend_subscriber: aterm_gui::mend_secrets_subscriber,
+        converge_lane: aterm_gui::start_converge_lane,
+        converge_setup: aterm_gui::converge_after_secrets_stage,
         put_back: aterm_cli::macos_doctor::put_back_held_initial_setup,
         start_follow_up: start_withheld_follow_up,
         bring_forward: aterm_cli::macos_doctor::bring_forward_restored_setup,
@@ -6010,9 +6436,14 @@ fn wake_setup_on_focus() {
     SETUP_WAKES.raise_focus();
 }
 
-/// A person pressed Check again: a wake that starts a parked run's tries afresh.
+/// A person pressed Check again: a wake that starts a parked run's tries afresh, and lifts
+/// every stage the run's ledger parked (aterm stopped twice in it, or it ran past the hang
+/// limit) before the wake, so the pass it wakes runs them (design §6.5).
 #[cfg(target_os = "macos")]
 fn wake_setup_for_check() {
+    if let Err(why) = aterm_cli::macos_doctor::retry_parked_setup_stages() {
+        aterm_log::warn!("Check again could not lift the parked setup stages: {why}");
+    }
     SETUP_WAKES.raise_check();
 }
 
@@ -6021,6 +6452,15 @@ fn wake_setup_for_check() {
 #[cfg(target_os = "macos")]
 fn wake_setup_facts() {
     SETUP_WAKES.raise_facts();
+}
+
+/// This Mac's network changed while a watch for the ALab vault waited ([`LiveAlabWatch`]): a
+/// wake once the subnets moved off the ones it waits on ([`alab_network_moved`]).
+#[cfg(target_os = "macos")]
+fn wake_setup_network() {
+    if alab_network_moved(&ALAB_WAIT_NETWORK, aterm_secrets::heard::network()) {
+        SETUP_WAKES.raise_network();
+    }
 }
 
 /// What the setup worker hears from the window, registered once before the GUI
@@ -6110,6 +6550,20 @@ fn setup_stage(event: aterm_cli::macos_doctor::StageEvent<'_>) {
     if !event.running {
         request_observation(None, event.subjects.to_vec(), false);
     }
+    if ends_secrets_stage(&event) {
+        (setup_io().converge_setup)();
+    }
+}
+
+/// Whether `event` is the end of the Secrets stage, the one stage whose settings name
+/// [`Setting::Secrets`]: the converge pass runs as it ends (design §8.5's first-launch Secrets
+/// stage), not as it starts and not at another stage's end.
+#[cfg(target_os = "macos")]
+fn ends_secrets_stage(event: &aterm_cli::macos_doctor::StageEvent<'_>) -> bool {
+    !event.running
+        && event
+            .settings
+            .contains(&aterm_types::macos_setup::Setting::Secrets)
 }
 
 /// No stage runs now (a pass ended, possibly through an error inside a stage).
@@ -6820,11 +7274,16 @@ fn settle_setup_stop(limit: std::time::Duration) -> bool {
     waited && stopped.is_none_or(|stopped| stop_saves().saved.is_some_and(|saved| saved >= stopped))
 }
 
-/// [`aterm_gui::InitialSetupHandlers::settle`]: the app is quitting.
+/// [`aterm_gui::InitialSetupHandlers::settle`]: the app is quitting, or handing off to an
+/// update. A stage running now is cut off by no crash: the next launch resumes it without
+/// counting toward the park two crashes in one stage earn (design §6.5).
 #[cfg(target_os = "macos")]
 fn settle_initial_setup() {
     if !settle_setup_stop(STOP_SETTLE_LIMIT) {
         aterm_log::warn!("System State quit before what its Stop owes the records was saved");
+    }
+    if let Err(why) = aterm_cli::macos_doctor::note_setup_interrupted() {
+        aterm_log::warn!("System State could not note the setup stage a quit cuts off: {why}");
     }
 }
 
@@ -9420,6 +9879,10 @@ mod initial_setup_result_tests {
         follow_ups: usize,
         /// Starts of the vault subscriber's mend asked for.
         mends: usize,
+        /// Starts of the converge pass's window lane asked for.
+        converge_lanes: usize,
+        /// Converge passes the Secrets stage's end started.
+        setup_converges: usize,
         /// What bringing a restored setup forward found.
         brought_forward: aterm_cli::macos_doctor::BroughtForward,
         /// Check again's looks at the LAN.
@@ -9470,6 +9933,8 @@ mod initial_setup_result_tests {
             startup_failures: Vec::new(),
             follow_ups: 0,
             mends: 0,
+            converge_lanes: 0,
+            setup_converges: 0,
             brought_forward: aterm_cli::macos_doctor::BroughtForward::Nothing,
             lan_probes: 0,
             startups: 0,
@@ -9574,6 +10039,8 @@ mod initial_setup_result_tests {
                 persist: Self::persist,
                 run: Self::run,
                 mend_subscriber: || change(|script| script.mends += 1),
+                converge_lane: || change(|script| script.converge_lanes += 1),
+                converge_setup: || change(|script| script.setup_converges += 1),
                 put_back: |_| Ok(false),
                 start_follow_up: || change(|script| script.follow_ups += 1),
                 bring_forward: || Ok(script().brought_forward),
@@ -9803,6 +10270,11 @@ mod initial_setup_result_tests {
         run_prepared_setup(PreparedSetup::Finished, None, StartupSent::default());
         assert_eq!(script().follow_ups, 1);
         assert_eq!(script().mends, 1, "the vault subscriber's mend");
+        assert_eq!(
+            script().converge_lanes,
+            1,
+            "the converge pass's window lane"
+        );
     }
 
     /// A launch that resumes an admitted run starts the vault subscriber's mend before the run:
@@ -9820,7 +10292,35 @@ mod initial_setup_result_tests {
         );
         assert_eq!(script().runs, [8]);
         assert_eq!(script().mends, 1);
+        assert_eq!(
+            script().converge_lanes,
+            0,
+            "the converge lane waits for the run to end (its Secrets stage starts a pass)"
+        );
         clear_setup_run(8);
+    }
+
+    /// The converge pass runs as the Secrets stage ends: not as it starts, and not at another
+    /// stage's end.
+    /// NEGATIVE CONTROL: a check that ignores `running` starts a pass as the stage starts too.
+    #[test]
+    fn the_secrets_stage_starts_a_converge_pass_as_it_ends() {
+        use aterm_cli::macos_doctor::StageEvent;
+        use aterm_types::macos_setup::Setting;
+        let event = |settings: &[Setting], running| {
+            ends_secrets_stage(&StageEvent {
+                settings,
+                subjects: &[],
+                running,
+            })
+        };
+        assert!(event(&[Setting::Secrets], false), "the Secrets stage ended");
+        assert!(!event(&[Setting::Secrets], true), "it started");
+        assert!(
+            !event(&[Setting::Repositories], false),
+            "another stage ended"
+        );
+        assert!(!event(&[], false), "a stage with nothing selected");
     }
 
     /// Check again looks at the LAN before it reads the Local Network row, so the row reads what
@@ -13177,6 +13677,10 @@ fn routes_to_doctor(first: &str, rest: &[OsString]) -> bool {
 #[cfg(unix)]
 mod shared_login;
 
+/// `aterm init --converge`'s live ports.
+#[cfg(unix)]
+mod converge;
+
 #[path = "doctor.rs"]
 mod doctor;
 
@@ -14918,6 +15422,128 @@ mod tests {
                 WindowHost::ThisProcess,
                 "{flag}: a harness reads this process's output"
             );
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn service_observations_survive_an_absent_network_runtime() {
+        use aterm_types::network_state::{
+            HistoryState, ServiceAvailability, ServiceStates, Visibility,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let mut services = ServiceStates::default();
+        services.secrets.availability = ServiceAvailability::Cached;
+        services.secrets.observed_at_ms = 1000;
+        let services = Arc::new(Mutex::new(services));
+        let read = super::network_state_source_from(None, Some(services.clone()), None);
+        let first = read();
+        assert_eq!(first.network.visibility, Visibility::Unavailable);
+        assert_eq!(first.network.history, HistoryState::Unavailable);
+        assert_eq!(
+            first.services.secrets.availability,
+            ServiceAvailability::Cached
+        );
+        assert!(Arc::ptr_eq(&first, &read()));
+
+        services.lock().unwrap().secrets.availability = ServiceAvailability::Unavailable;
+        let second = read();
+        assert!(second.revision > first.revision);
+        assert_eq!(
+            second.services.secrets.availability,
+            ServiceAvailability::Unavailable
+        );
+        assert_eq!(
+            first.services.secrets.availability,
+            ServiceAvailability::Cached
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_missing_service_observer_does_not_hide_network_observations() {
+        use aterm_types::network_state::{ServiceAvailability, Visibility};
+
+        let network = aterm_db::network_state::ObservationHandle::default();
+        let read = super::network_state_source_from(Some(network), None, None);
+        let snapshot = read();
+        assert_eq!(snapshot.network.visibility, Visibility::Checking);
+        assert_eq!(
+            snapshot.services.accounts.availability,
+            ServiceAvailability::Unknown
+        );
+        assert_eq!(
+            snapshot.services.secrets.availability,
+            ServiceAvailability::Unknown
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_absent_network_runtime_retains_history_but_never_current_reachability() {
+        use aterm_types::network_state::{
+            HistoryState, MachineIdentity, NetworkObservation, PeerObservation, Reachability,
+            Visibility,
+        };
+        use std::sync::Arc;
+
+        let retained = NetworkObservation {
+            history: HistoryState::Ready,
+            visibility: Visibility::Active,
+            observer: Some(MachineIdentity {
+                machine_id: [3; 16],
+                incarnation: [4; 16],
+                label: None,
+            }),
+            observed_at_ms: 2000,
+            unverified_endpoints: 3,
+            peers: vec![PeerObservation {
+                slot: 7,
+                identity: MachineIdentity {
+                    machine_id: [1; 16],
+                    incarnation: [2; 16],
+                    label: Some("saved machine".into()),
+                },
+                first_seen_ms: 1000,
+                last_seen_ms: 2000,
+                last_checked_ms: Some(2000),
+                reachability: Reachability::Reachable,
+                instances: Some(2),
+                samples: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let read = super::network_state_source_from(None, None, Some(retained.clone()));
+        let snapshot = read();
+        assert_eq!(snapshot.network.visibility, Visibility::Unavailable);
+        assert!(snapshot.network.observer.is_none());
+        assert_eq!(snapshot.network.history, HistoryState::Ready);
+        assert_eq!(snapshot.network.observed_at_ms, 2000);
+        assert_eq!(snapshot.network.unverified_endpoints, 0);
+        let peer = &snapshot.network.peers[0];
+        assert_eq!(peer.slot, 7);
+        assert_eq!(peer.identity, retained.peers[0].identity);
+        assert_eq!((peer.first_seen_ms, peer.last_seen_ms), (1000, 2000));
+        assert_eq!(peer.reachability, Reachability::Unknown);
+        assert_eq!(peer.last_checked_ms, None);
+        assert!(Arc::ptr_eq(&snapshot, &read()));
+        assert_eq!(retained.peers[0].reachability, Reachability::Reachable);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn only_an_ordinary_window_autostarts_acaffiene() {
+        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+        for args in [osv(&[]), osv(&["--window"]), osv(&["-d", "."])] {
+            assert!(ordinary_window(&args), "{args:?}");
+        }
+        for args in [
+            osv(&["--headless"]),
+            osv(&["--diagnose"]),
+            osv(&["--control-sock", "/tmp/private.sock"]),
+        ] {
+            assert!(!ordinary_window(&args), "{args:?}");
         }
     }
 

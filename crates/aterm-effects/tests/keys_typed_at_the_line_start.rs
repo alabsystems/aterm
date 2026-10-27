@@ -3,6 +3,7 @@
 
 //! Keys typed at the start of a lit line step one stop a key.
 
+use crate::trail_host::on_every_ground;
 use crate::walk_census::*;
 
 const LINE_CELLS: usize = 30;
@@ -44,47 +45,49 @@ fn not_forward(ts: &[Option<f32>], a: usize, b: usize) -> Vec<(usize, f32)> {
 
 #[test]
 fn keys_typed_at_the_start_of_a_lit_line_step_one_stop_a_key() {
-    let (_, _, after) = take(INSERT, false);
-    let n = LINE_CELLS + INSERT.len();
-    assert!(
-        (0..n).all(|i| after[i].is_some()),
-        "the control: the whole line is lit"
-    );
-    let bad = not_forward(&after, LINE_CELLS - 1, n - 1);
-    assert!(bad.is_empty(), "the control: typed at the end, {bad:?}");
-    let (_, _, after) = take("X", true);
-    let bad = not_forward(&after, 0, 1);
-    assert!(bad.is_empty(), "the control: one key at the start, {bad:?}");
-
-    let (s, before, after) = take(INSERT, true);
-    let k = INSERT.len();
-    assert!(
-        (0..LINE_CELLS + k).all(|i| after[i].is_some()),
-        "the premise: the whole line is lit\n{}",
-        s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
-    );
-    let bad = not_forward(&after, 0, k);
-    assert!(
-        bad.is_empty(),
-        "the keys typed at the line's start do not step forward — (left text index, \
-         dt) {bad:?}: {:?}\n{}",
-        &after[..=k],
-        s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
-    );
-    for i in 0..LINE_CELLS {
-        let (b, a) = (before[i].expect("lit"), after[i].expect("lit"));
+    on_every_ground(|| {
+        let (_, _, after) = take(INSERT, false);
+        let n = LINE_CELLS + INSERT.len();
         assert!(
-            (a - b).abs() < 1e-4,
-            "§41's law: column {i} kept its stop under the pushed text ({b} -> {a}) — the \
-             colour stays with the column\n{}",
+            (0..n).all(|i| after[i].is_some()),
+            "the control: the whole line is lit"
+        );
+        let bad = not_forward(&after, LINE_CELLS - 1, n - 1);
+        assert!(bad.is_empty(), "the control: typed at the end, {bad:?}");
+        let (_, _, after) = take("X", true);
+        let bad = not_forward(&after, 0, 1);
+        assert!(bad.is_empty(), "the control: one key at the start, {bad:?}");
+
+        let (s, before, after) = take(INSERT, true);
+        let k = INSERT.len();
+        assert!(
+            (0..LINE_CELLS + k).all(|i| after[i].is_some()),
+            "the premise: the whole line is lit\n{}",
             s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
         );
-    }
-    let bad = not_forward(&after, 0, LINE_CELLS + k - 1);
-    assert!(
-        bad.is_empty(),
-        "the line after the insert does not step forward — (left text index, dt) \
-         {bad:?}\n{}",
-        s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
-    );
+        let bad = not_forward(&after, 0, k);
+        assert!(
+            bad.is_empty(),
+            "the keys typed at the line's start do not step forward — (left text index, \
+             dt) {bad:?}: {:?}\n{}",
+            &after[..=k],
+            s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
+        );
+        for i in 0..LINE_CELLS {
+            let (b, a) = (before[i].expect("lit"), after[i].expect("lit"));
+            assert!(
+                (a - b).abs() < 1e-4,
+                "§41's law: column {i} kept its stop under the pushed text ({b} -> {a}) — the \
+                 colour stays with the column\n{}",
+                s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
+            );
+        }
+        let bad = not_forward(&after, 0, LINE_CELLS + k - 1);
+        assert!(
+            bad.is_empty(),
+            "the line after the insert does not step forward — (left text index, dt) \
+             {bad:?}\n{}",
+            s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
+        );
+    });
 }

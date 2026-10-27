@@ -976,6 +976,24 @@ pub const MUTATIONS: &[Mutation] = &[
     ("an appcast key from the future", Rule::Shared, |c, _| {
         c.set("future_key", "1")
     }),
+    (
+        "the static verifiers' signed receipts beside it",
+        Rule::Shared,
+        |c, _| {
+            for arch in ["x86_64", "aarch64"] {
+                c.set(
+                    &format!("linux_verifier_{arch}"),
+                    &format!("\"aterm-bootstrap-verify-0.100.0-linux-{arch}\""),
+                );
+                c.set(
+                    &format!("linux_verifier_{arch}_sha256"),
+                    &format!("{:?}", "e".repeat(64)),
+                );
+                c.set(&format!("linux_verifier_{arch}_size"), "2000000");
+            }
+            c.set("linux_verifier_interface", "1");
+        },
+    ),
     ("a negative appcast schema", Rule::Shared, |c, _| {
         c.set("schema", "-1")
     }),

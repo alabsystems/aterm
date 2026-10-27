@@ -10,7 +10,7 @@ use aterm_agent::harness::acts::{HoldLeg, LandHeld, TaskFace};
 use aterm_agent::harness::repo_work::RepoWork;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, LAND, LAND_ANSWER, LAND_NUDGE, RULE_API_RETRY, RULE_LAND, RULE_LAND_ANSWER,
+    Composer, LAND, LAND_ANSWER, LAND_NUDGE, RULE_API_CUTOFF, RULE_LAND, RULE_LAND_ANSWER,
     RULE_LAND_NUDGE, TurnEndAction, TurnEndReading, TurnEndState, WaitKind, clean_defense,
     decide_turn_end, open_work_strict, open_work_suffix, repo_work_suffix, says_done,
 };
@@ -20,6 +20,18 @@ use aterm_phase::wall::WallKind;
 use aterm_spec::derive::Model;
 
 type State = BTreeMap<&'static str, i64>;
+
+/// The wall the model's wall stands for: a reply past its output token maximum, a wall that keeps
+/// its own act (`api-cutoff@v1`, once at once, then on the retry ladder) and its tries; an overload
+/// is an outage, waited out ([`supervise_conformance_outage_wait`](crate::supervise_conformance_outage_wait)).
+const OVERLONG: WallKind = WallKind::ApiError {
+    code: None,
+    retryable: true,
+    cause: aterm_phase::ApiCause::Overlong,
+};
+const OVERLONG_MESSAGE: &str = "API Error: Claude's response exceeded the 32000 output token \
+                                maximum. To configure this behavior, set the \
+                                CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.";
 
 /// Real work: it runs tools (a tool row on the screen, which at a wall is what tells work from
 /// the program's own retries).
@@ -67,9 +79,9 @@ fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
         phase: if at.busy { Phase::Busy } else { Phase::Idle },
         authoritative: true,
         survey: false,
-        wall: at.walled.then_some(WallKind::Overloaded),
+        wall: at.walled.then_some(OVERLONG),
         wall_message: if at.walled {
-            "API Error: 529 Overloaded.".to_string()
+            OVERLONG_MESSAGE.to_string()
         } else {
             String::new()
         },
@@ -163,7 +175,7 @@ fn verdict(a: &TurnEndAction) -> Verdict {
             );
             Verdict::Answer
         }
-        TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_API_RETRY => Verdict::WallAct,
+        TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_API_CUTOFF => Verdict::WallAct,
         TurnEndAction::WaitUntil {
             why,
             wait: WaitKind::BackOff { .. },
@@ -778,6 +790,44 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
         base,
     );
     assert_eq!(verdict(&real.clone().decide()), Verdict::Answer);
+
+    // Buggy = 4 holds the untyped instruction back for a done claim's back-off (v6 §14.10).
+    let late = aterm_spec::interp::with_buggy(&m, 4);
+    let claims = [
+        "OtherTurnWall",
+        "WallAct",
+        "YieldAsk",
+        "Answer",
+        "YieldClaim",
+    ];
+    let (st, real) = walk(&m, &claims, base);
+    assert!(
+        st["typed"] == 0
+            && st["backoff"] == 1
+            && m.action_enabled("Instruction", &st)
+            && !m.action_enabled("BackoffDue", &st),
+        "{st:?}"
+    );
+    assert!(real.st.short_wait().is_some(), "a back-off stands: {st:?}");
+    assert_eq!(verdict(&real.clone().decide()), Verdict::Instruction);
+    let mut b = st.clone();
+    assert!(
+        !late.action_enabled("Instruction", &b) && late.fire("BackoffDue", &mut b),
+        "{st:?}"
+    );
+    assert!(!late.check_invariant("TheInstructionWaitsNoBackOff", &b));
+    assert!(m.mutant_dials().contains(&4), "{:?}", m.mutant_dials());
+    assert_eq!(
+        aterm_spec::interp::violated_invariants(&late),
+        BTreeSet::from(["TheInstructionWaitsNoBackOff"]),
+    );
+    let asks = ["OtherTurnWall", "WallAct", "YieldAsk", "Answer", "YieldAsk"];
+    let (st, real) = walk(&m, &asks, base);
+    assert!(
+        st["typed"] == 0 && !m.action_enabled("Answer", &st) && m.action_enabled("BackoffDue", &st),
+        "Land's answer keeps its back-off: {st:?}"
+    );
+    assert_eq!(verdict(&real.clone().decide()), Verdict::Wait);
 
     let (st, mut real) = walk(&m, &["OtherTurnWall"], base);
     let mut b = st.clone();

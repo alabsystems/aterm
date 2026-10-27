@@ -793,6 +793,30 @@ fn under_root_an_install_folder_with_an_acl_is_refused() {
     );
 }
 
+/// A scratch whose folder carries an ACL that denies its removal goes all the same once it
+/// drops, so no test, failed or not, leaves a folder behind in
+/// [`crate::support::scratch_root`]. NEGATIVE CONTROL: take the ACLs' removal out of Scratch's
+/// drop, and the scratch stays.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_scratch_whose_folder_denies_its_removal_is_removed_all_the_same() {
+    let scratch = Scratch::new();
+    let root = scratch.path().to_path_buf();
+    let d = scratch.mkdir("d");
+    let added = aterm_uds::spawnfd::command("/bin/chmod")
+        .args(["+a", "group:everyone deny delete"])
+        .arg(&d)
+        .status()
+        .expect("chmod +a");
+    assert!(added.success(), "chmod +a: {added}");
+    assert!(
+        std::fs::remove_dir(&d).is_err(),
+        "the entry denies the folder's removal"
+    );
+    drop(scratch);
+    assert!(!root.exists(), "{} stayed", root.display());
+}
+
 /// A dry run makes nothing, so under root it judges an install folder still to
 /// be made as `mkdir -p` would make it: by the entries the folder above it
 /// passes on (acl_passed_on). Each verdict, one folder down, two down, and one

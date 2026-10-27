@@ -1601,6 +1601,24 @@ impl CursorGlow {
         self.nav_hint = Some(now);
     }
 
+    /// Host hint: the foreground composer takes typed text at its caret again, as an agent's
+    /// vim mode does back in `-- INSERT --` after NORMAL. It settles the doubt the last generic
+    /// boundary left on the caret's row, as navigation does, and licenses no move.
+    #[inline]
+    pub const fn note_composer_inserting(&mut self) {
+        self.unowned_caret = None;
+    }
+
+    /// Whether a generic boundary's doubted caret row is parked, so a key whose echo lands on
+    /// it is refused `program-row` until something settles the row (the
+    /// `parked-caret-row-ownership` law names what does, [`Self::note_composer_inserting`]
+    /// among them).
+    #[inline]
+    #[must_use]
+    pub const fn caret_row_parked(&self) -> bool {
+        matches!(self.unowned_caret, Some(caret) if caret.parked)
+    }
+
     /// Host key hint: one plain typed-glyph keypress.
     #[inline]
     pub fn note_typed(&mut self, now: Instant) {
@@ -2380,18 +2398,32 @@ impl CursorGlow {
         const fn at(row: &[char], col: usize) -> char {
             if col < row.len() { row[col] } else { ' ' }
         }
+        #[inline]
+        const fn prefix_blank(row: &[char], lo: usize, hi: usize) -> bool {
+            let mut k = lo;
+            while k < hi {
+                if !blank(row, k) {
+                    return false;
+                }
+                k += 1;
+            }
+            true
+        }
         let origin = usize::from(pc);
         if blank(&self.row_above_cur, origin) {
             return None;
         }
         let mut col = pane_col0;
+        let mut skipped_border = false;
         let cc_usize = usize::from(cc);
         while col < cc_usize {
             let cur_ch = at(&self.row_cur, col);
-            let left_border = col == pane_col0
+            let left_border = !skipped_border
                 && rk::is_box_border_glyph(cur_ch)
                 && at(&self.row_prev, col) == cur_ch;
-            if !blank(&self.row_cur, col) && !left_border {
+            if left_border {
+                skipped_border = true;
+            } else if !blank(&self.row_cur, col) {
                 return None;
             }
             col += 1;
@@ -2415,8 +2447,8 @@ impl CursorGlow {
         let mut word_col0 = origin;
         while word_col0 > pane_col0
             && !blank(&self.row_above_cur, word_col0 - 1)
-            && !(word_col0 - 1 == pane_col0
-                && rk::is_box_border_glyph(at(&self.row_above_cur, word_col0 - 1)))
+            && !(rk::is_box_border_glyph(at(&self.row_above_cur, word_col0 - 1))
+                && prefix_blank(&self.row_above_cur, pane_col0, word_col0 - 1))
         {
             word_col0 -= 1;
         }

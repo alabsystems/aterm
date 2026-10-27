@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# The supernova: five f-bombs typed inside the 30 s combo window, so the escalation reaches a
+# supernova by the fourth (supernova_chance 10 plus 30 a link), then its phases play out.
+
+grid 16 90
+style rainbow kitty
+hz 60
+words rainbow
+
+at 0 pty "\e[3;1H\e[9;1H$ "
+at 700 key f
+at 702 pty "f"
+at 800 key u
+at 802 pty "u"
+at 900 key c
+at 902 pty "c"
+at 1000 key k
+at 1002 pty "k"
+at 1100 key space
+at 1102 pty " "
+at 1200 key t
+at 1202 pty "t"
+at 1300 key h
+at 1302 pty "h"
+at 1400 key i
+at 1402 pty "i"
+at 1500 key s
+at 1502 pty "s"
+at 1600 key ,
+at 1602 pty ","
+at 1700 key space
+at 1702 pty " "
+at 1800 key f
+at 1802 pty "f"
+at 1900 key u
+at 1902 pty "u"
+at 2000 key c
+at 2002 pty "c"
+at 2100 key k
+at 2102 pty "k"
+at 2200 key space
+at 2202 pty " "
+at 2300 key t
+at 2302 pty "t"
+at 2400 key h
+at 2402 pty "h"
+at 2500 key a
+at 2502 pty "a"
+at 2600 key t
+at 2602 pty "t"
+at 2700 key ,
+at 2702 pty ","
+at 2800 key space
+at 2802 pty " "
+at 2900 key f
+at 2902 pty "f"
+at 3000 key u
+at 3002 pty "u"
+at 3100 key c
+at 3102 pty "c"
+at 3200 key k
+at 3202 pty "k"
+at 3300 key space
+at 3302 pty " "
+at 3400 key i
+at 3402 pty "i"
+at 3500 key t
+at 3502 pty "t"
+at 3600 key ,
+at 3602 pty ","
+at 3700 key space
+at 3702 pty " "
+at 3800 key f
+at 3802 pty "f"
+at 3900 key u
+at 3902 pty "u"
+at 4000 key c
+at 4002 pty "c"
+at 4100 key k
+at 4102 pty "k"
+at 4200 key space
+at 4202 pty " "
+at 4300 key m
+at 4302 pty "m"
+at 4400 key e
+at 4402 pty "e"
+at 4500 key ,
+at 4502 pty ","
+at 4600 key space
+at 4602 pty " "
+at 4700 key f
+at 4702 pty "f"
+at 4800 key u
+at 4802 pty "u"
+at 4900 key c
+at 4902 pty "c"
+at 5000 key k
+at 5002 pty "k"
+run 9100

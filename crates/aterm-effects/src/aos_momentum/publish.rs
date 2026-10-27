@@ -99,6 +99,7 @@ impl fmt::Display for PlanPublishRefusal {
 impl std::error::Error for PlanPublishRefusal {}
 
 impl From<PublishRefusal> for PlanPublishRefusal {
+    #[inline]
     fn from(r: PublishRefusal) -> Self {
         PlanPublishRefusal::Boundary(r)
     }
@@ -153,6 +154,7 @@ struct Staged {
     bundle: CandidateBundle,
 }
 
+#[inline]
 fn publication(commit: &Commit<MomentumSchema>) -> Publication {
     let w = &commit.witness;
     let head = w.head();
@@ -182,6 +184,7 @@ fn publication(commit: &Commit<MomentumSchema>) -> Publication {
 }
 
 impl Hosted {
+    #[inline]
     fn published(
         &mut self,
         first: u64,
@@ -204,11 +207,13 @@ impl MomentumHost {
     /// [`PlanPublishRefusal::NotAttached`] or [`PlanPublishRefusal::NotPaused`], then
     /// `PolicyMismatch`, `ForeignBuild`, `BaseNotInPolicy`, `NotUseful` and `Boundary` in that
     /// order, none of which changes the host's pause, queue or live pair.
+    #[inline]
     pub fn aos_publish(&mut self, admitted: Admitted) -> Result<Published, PlanPublishRefusal> {
         let staged = self.stage(admitted)?;
         self.commit_staged(staged)
     }
 
+    #[inline]
     fn stage(&mut self, admitted: Admitted) -> Result<Staged, PlanPublishRefusal> {
         let HostMode::Hosted(h) = &mut self.mode else {
             return Err(PlanPublishRefusal::NotAttached);
@@ -248,6 +253,7 @@ impl MomentumHost {
         })
     }
 
+    #[inline]
     fn commit_staged(&mut self, staged: Staged) -> Result<Published, PlanPublishRefusal> {
         let HostMode::Hosted(h) = &mut self.mode else {
             return Err(PlanPublishRefusal::NotAttached);

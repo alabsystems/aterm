@@ -4,7 +4,7 @@
 //! Paint verdict tests over synthetic scan reports.
 
 use super::*;
-use crate::measure::scan::{Cell, DrivenWindow, Shape};
+use crate::measure::scan::{Cell, DrivenWindow, FrameReport, Shape};
 
 const NOMINAL: i64 = 20_000;
 
@@ -17,6 +17,7 @@ fn row(expect: Expect, capture: Capture, style: Style) -> PaintRow {
         style,
         companion: None,
         split: None,
+        reach: None,
     }
 }
 
@@ -53,6 +54,11 @@ fn lit_burst() -> ScanReport {
         companion_stack: 0,
         companion_fused: 0,
         base_comp: Shape::NONE,
+        typed_row: None,
+        reach_frames: 0,
+        reach_px: None,
+        reach_min_px: None,
+        reach_max_px: None,
         per_frame: Vec::new(),
     }
 }
@@ -357,6 +363,10 @@ fn companion_obligations_ride_on_top_of_ink() {
             pet_final_run: 2,
             ..healthy.clone()
         },
+        ScanReport {
+            pet_missing: 1,
+            ..healthy.clone()
+        },
     ] {
         assert_eq!(verdict(&pet, &ledger, &broken), ShapeVerdict::Fail);
     }
@@ -404,6 +414,55 @@ fn companion_obligations_ride_on_top_of_ink() {
 }
 
 #[test]
+fn a_missing_pet_is_named_by_its_frame_and_claimed_pose() {
+    let frame = |missing: bool| FrameReport {
+        name: String::new(),
+        metrics: Default::default(),
+        companion: if missing {
+            Shape::NONE
+        } else {
+            Shape::new(305, 33, 19)
+        },
+        duplicate: false,
+        notes: if missing {
+            vec![FrameNote::CompanionMissing]
+        } else {
+            Vec::new()
+        },
+    };
+    let scan = ScanReport {
+        per_frame: vec![frame(false), frame(true), frame(true), frame(true)],
+        ..lit_burst()
+    };
+    let ledger = Ledger {
+        rows: Some(vec![
+            status("rainbow kitty pet", "pet_active=true pet_pose=pet_sleep_1"),
+            status("rainbow kitty pet", "pet_active=true pet_pose=pet_hop"),
+            status("rainbow kitty flying", "pet_active=false cat_active=true"),
+            status("rainbow kitty pet", "pet_active=true"),
+        ]),
+        final_row: None,
+        fx_under_frames: 40,
+    };
+    assert_eq!(pet_missing_at(&ledger, &scan), "1:pet_hop,3:-");
+    let found = ScanReport {
+        per_frame: vec![frame(false); 4],
+        ..scan
+    };
+    assert_eq!(pet_missing_at(&ledger, &found), "none");
+    assert_eq!(
+        pet_missing_at(
+            &Ledger {
+                rows: None,
+                ..ledger
+            },
+            &found
+        ),
+        "none"
+    );
+}
+
+#[test]
 fn self_contradicting_rows_are_refused() {
     let off_without_keys = PaintRow {
         keys: "",
@@ -422,4 +481,117 @@ fn self_contradicting_rows_are_refused() {
         ..row(Expect::Ink, Capture::UnpinnedFocused, Style::Classic)
     };
     assert!(cat_wrong_style.validate().is_err());
+}
+
+fn reach_row(reach: Reach, style: Style) -> PaintRow {
+    PaintRow {
+        scene: Scene::Plane,
+        reach: Some(reach),
+        ..row(Expect::Ink, Capture::UnpinnedFocused, style)
+    }
+}
+
+/// A lit take whose bound frames measured the band's top `px` above the typed row.
+fn reached(px: usize) -> ScanReport {
+    ScanReport {
+        reach_frames: 30,
+        reach_px: Some(px),
+        reach_min_px: Some(px),
+        reach_max_px: Some(px),
+        ..lit_burst()
+    }
+}
+
+#[test]
+fn a_reach_row_is_red_for_a_body_too_short_or_too_tall() {
+    let ledger = flying_rows(67, "");
+    let tall = reach_row(Reach::Tall, Style::Flying);
+    assert!(tall.validate().is_ok());
+    let cell_h = lit_burst().cell.h;
+    let (lo, hi) = Reach::Tall.bounds();
+    let lo_px = (lo * cell_h).div_ceil(100);
+    let hi_px = hi * cell_h / 100;
+    assert!(
+        lo_px <= hi_px,
+        "the bounds leave a pixel at cell height {cell_h}"
+    );
+    for px in [lo_px, hi_px] {
+        assert_eq!(
+            verdict(&tall, &ledger, &reached(px)),
+            ShapeVerdict::Pass,
+            "{px} px"
+        );
+    }
+    for px in [lo_px - 1, hi_px + 1, 0, 3 * cell_h] {
+        assert_eq!(
+            verdict(&tall, &ledger, &reached(px)),
+            ShapeVerdict::Fail,
+            "{px} px"
+        );
+    }
+    let few = ScanReport {
+        reach_frames: REACH_MIN_FRAMES - 1,
+        ..reached(lo_px)
+    };
+    assert_eq!(verdict(&tall, &ledger, &few), ShapeVerdict::Fail);
+    let unmeasured = ScanReport {
+        reach_px: None,
+        ..reached(lo_px)
+    };
+    assert_eq!(verdict(&tall, &ledger, &unmeasured), ShapeVerdict::Fail);
+    let unlit = ScanReport {
+        total_ink: 0,
+        ..reached(lo_px)
+    };
+    assert_eq!(verdict(&tall, &ledger, &unlit), ShapeVerdict::Fail);
+    let unbounded = row(Expect::Ink, Capture::UnpinnedFocused, Style::Flying);
+    assert_eq!(
+        verdict(&unbounded, &ledger, &reached(0)),
+        ShapeVerdict::Pass,
+        "a row with no reach is not judged on one"
+    );
+}
+
+#[test]
+fn a_reach_row_that_cannot_measure_its_body_is_refused() {
+    assert!(reach_row(Reach::Tall, Style::Underline).validate().is_err());
+    assert!(reach_row(Reach::Tall, Style::Off).validate().is_err());
+    assert!(
+        PaintRow {
+            scene: Scene::Prompt,
+            ..reach_row(Reach::Tall, Style::Flying)
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        PaintRow {
+            capture: Capture::PinnedVideo,
+            ..reach_row(Reach::Tall, Style::Flying)
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        PaintRow {
+            split: Some(Split::V),
+            ..reach_row(Reach::Tall, Style::Flying)
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        PaintRow {
+            keys: "",
+            ..reach_row(Reach::Tall, Style::Flying)
+        }
+        .validate()
+        .is_err()
+    );
+    for style in [Style::Classic, Style::Default, Style::Flying, Style::Tall] {
+        assert!(
+            reach_row(Reach::Tall, style).validate().is_ok(),
+            "{style:?}"
+        );
+    }
 }

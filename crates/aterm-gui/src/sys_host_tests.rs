@@ -30,7 +30,12 @@ fn synthetic(seq: u64, busy: f32) -> Snapshot {
         at_ns: seq * 1_000_000_000,
         seq,
         cpu: Some(CpuView {
-            cores: (0..4).map(|_| CoreView { load: flat(busy) }).collect(),
+            cores: (0..4)
+                .map(|_| CoreView {
+                    load: flat(busy),
+                    measured: true,
+                })
+                .collect(),
             clusters: vec![ClusterView {
                 name: "CPU".into(),
                 short: "CPU".into(),
@@ -1284,4 +1289,63 @@ fn a_jobs_view_older_than_a_minute_says_nothing_of_now_unless_parked() {
     let parked = Arc::new(aterm_vitals::jobs::JobsView::default());
     assert!(fresh_jobs(Some((Arc::clone(&parked), old)), now, true).is_some());
     assert!(fresh_jobs(Some((parked, old)), now, false).is_none());
+}
+
+/// A `sys why` that may be of memory reads macOS's services on their own while the split by
+/// coalition is cold, so the reply can name one with no Deck in view, and carries the episodes
+/// whose restart the person put off, warm or cold. NEGATIVE CONTROL: a CPU reply, another view
+/// and a warm split read nothing more, and a CPU reply carries no filing.
+#[test]
+fn a_why_with_the_split_cold_reads_the_services_on_their_own() {
+    let held = || {
+        Some(Held {
+            snap: Arc::new(Snapshot::default()),
+            unix_ms: 0,
+            at: Instant::now(),
+        })
+    };
+    let reading = || {
+        Some(aterm_vitals::services::Reading {
+            total: 128 << 30,
+            ..aterm_vitals::services::Reading::default()
+        })
+    };
+    let read_for = |text: &str, held: Option<Held>| {
+        let q = SysQuery::parse(text).expect("query");
+        with_services(&q, held, reading, Vec::new())
+            .and_then(|h| h.snap.services.clone())
+            .is_some()
+    };
+    let filed_for = |text: &str, held: Option<Held>| {
+        let q = SysQuery::parse(text).expect("query");
+        with_services(&q, held, || None, vec!["537-1790000000".to_owned()])
+            .map(|h| h.snap.services_filed.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(filed_for("why mem", held()), ["537-1790000000"]);
+    assert!(filed_for("why cpu", held()).is_empty());
+    assert!(read_for("why", held()));
+    assert!(read_for("why mem", held()));
+    assert!(!read_for("why cpu", held()));
+    assert!(!read_for("mem", held()));
+    let warm = Snapshot {
+        why: Some(Arc::new(aterm_vitals::explain::WhyFacts {
+            lane: aterm_vitals::explain::CoalLane::On,
+            split: aterm_vitals::explain::CoalSplit {
+                rows: vec![aterm_vitals::explain::CoalRow::default()],
+                ..aterm_vitals::explain::CoalSplit::default()
+            },
+            ..aterm_vitals::explain::WhyFacts::default()
+        })),
+        ..Snapshot::default()
+    };
+    let warm = || {
+        Some(Held {
+            snap: Arc::new(warm.clone()),
+            unix_ms: 0,
+            at: Instant::now(),
+        })
+    };
+    assert!(!read_for("why mem", warm()));
+    assert_eq!(filed_for("why", warm()), ["537-1790000000"]);
 }

@@ -8,12 +8,15 @@ use std::path::Path;
 use aterm_json::{Value, json};
 
 use super::args::Invocation;
-use super::cmd_whoami::{ambient_rows, profile_row};
+use super::cmd_whoami::{
+    FROM_CONFIG, FROM_JOINED, FROM_VAULT, ambient_rows, profile_row, vault_rows,
+};
 use super::verbs::Noun;
 use super::{Answer, Ctx, Outcome, Receipt};
 use crate::config::ConfigFault;
 use crate::error::{Error, Kind, Result};
 use crate::identity::provision::{self, AddFrom, AddRequest};
+use crate::identity::vault::Found;
 use crate::identity::{self, tilde};
 use crate::policy::{ChainStep, Presence, Router, Tier};
 use crate::slug::Slug;
@@ -24,16 +27,6 @@ const PLATFORM: &str = "unix";
 /// `platform` in `auth status`'s report.
 #[cfg(not(unix))]
 const PLATFORM: &str = "windows: anonymous only (file credentials need unix permission checks)";
-
-fn needs_terminal(ctx: &Ctx, verb: &str) -> Result<()> {
-    if ctx.stderr_is_terminal {
-        return Ok(());
-    }
-    Err(Error::refused(format!(
-        "provisioning a credential is a person's step: agh auth {verb} needs a terminal"
-    ))
-    .with_next("a person runs it at a terminal"))
-}
 
 fn check_name(name: &str) -> Result<()> {
     match crate::config::profile_name_fault(name) {
@@ -116,13 +109,14 @@ fn stdin_next(req: &AddRequest) -> String {
     next
 }
 
-/// `agh auth add NAME (--file PATH | --stdin) --tier T [--owner O]… [--write [--drafts]]`.
+/// `agh auth add NAME (--file PATH | --stdin) --tier T [--owner O]… [--write [--drafts]]`: an
+/// agent provisions as a person does, with or without a terminal (owner ruling 2026-10-26).
 ///
 /// # Errors
 ///
-/// Refused without a terminal; usage for its arguments; `provision::add`'s errors.
+/// Usage for its arguments, and for `--stdin` from a terminal, which would show the token as it
+/// is typed; `provision::add`'s errors.
 pub(crate) fn auth_add(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
-    needs_terminal(ctx, "add")?;
     let req = add_request(inv)?;
     if cfg!(unix) && req.from == AddFrom::Stdin && ctx.stdin_is_terminal {
         return Err(Error::usage(
@@ -135,11 +129,14 @@ pub(crate) fn auth_add(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
             "no config directory: agh cannot provision here",
         ));
     };
-    let gh = ctx.github()?;
+    // Provisioning never adopts: a vault token adoption refuses or leaves out never stops an
+    // agent from writing the agh.toml that routes past it.
+    let gh = ctx.provisioning_client();
     let (added, meter) = provision::add_metered(&gh, &dirs, &req, &mut *ctx.stdin)?;
     let text = |s: &str| Value::from(ctx.redactor.apply(s));
     let value = json!({
         "fingerprint": added.fingerprint.as_str(),
+        "from": FROM_CONFIG,
         "kind": added.kind.slug(),
         "login": text(&added.login),
         "owners": added.owners,
@@ -159,13 +156,14 @@ pub(crate) fn auth_add(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     })
 }
 
-/// `agh auth remove NAME`.
+/// `agh auth remove NAME`; with no agh.toml, `dev` or `release` forgets the login vault
+/// adoption recorded for that token. `joins_vault` says whether the vault's tokens route after
+/// it (removing the last vault profile of an agh.toml makes it say `vault = true`).
 ///
 /// # Errors
 ///
-/// Refused without a terminal; `provision::remove`'s errors.
+/// `provision::remove`'s errors.
 pub(crate) fn auth_remove(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
-    needs_terminal(ctx, "remove")?;
     let name = inv.require(0, "NAME")?;
     let Some(dirs) = ctx.dirs.clone() else {
         return Err(Error::could_not_run(
@@ -174,6 +172,7 @@ pub(crate) fn auth_remove(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     };
     let removed = provision::remove(&dirs, name)?;
     let value = json!({
+        "joins_vault": removed.joins_vault,
         "owners_edited": removed.owners_edited,
         "profile": removed.profile.as_str(),
         "token_file_deleted": removed.token_file_deleted,
@@ -204,12 +203,16 @@ fn read_config(dirs: &crate::config::Dirs) -> Read {
     None
 }
 
-/// `agh auth status`: profile status, ambient tokens, and `agh.toml` faults.
+/// `agh auth status`: profile status, ambient tokens, and `agh.toml` faults. With no agh.toml,
+/// or one that says `vault = true`, the vault's tokens as adoption finds them (design §6.10),
+/// each row's `from` saying where it came from, and `routing` naming what routes: `agh.toml`,
+/// `vault`, `agh.toml+vault` or `anonymous`.
 ///
 /// # Errors
 ///
-/// None of its own: an invalid agh.toml (exit 1) and an unusable referenced profile (exit 4)
-/// are reports on stdout with their error.
+/// None of its own: an invalid agh.toml or adopted rows that break a rule (exit 1), an unusable
+/// referenced profile or vault token (exit 4), and adoption's refusal are reports on stdout
+/// with their error.
 pub(crate) fn auth_status(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let (home, shown, read) = match &ctx.dirs {
         Some(dirs) => (
@@ -222,39 +225,93 @@ pub(crate) fn auth_status(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let present = read.is_some();
     let mut profiles = Vec::new();
     let mut faults = Vec::new();
+    let mut vault_faults = Vec::new();
+    let mut vault_next: Option<String> = None;
     let mut unusable: Option<(String, &'static str, Option<String>)> = None;
-    match &read {
-        None => {}
-        Some(Err(found)) => faults.clone_from(found),
+    let mut refusal = None;
+    let mut routing = if present { FROM_CONFIG } else { "anonymous" };
+    let adoption = match &read {
+        None => ctx.adoption().cloned(),
+        Some(Err(found)) => {
+            faults.clone_from(found);
+            None
+        }
         Some(Ok(validated)) => {
             let router = Router::from_validated(validated.clone());
             let mut named = router.profiles();
             named.sort_by(|a, b| a.name.cmp(&b.name));
             for profile in named {
-                profiles.push(profile_row(profile, &*ctx.env, &home, &ctx.redactor));
+                profiles.push(profile_row(
+                    profile,
+                    &*ctx.env,
+                    &home,
+                    &ctx.redactor,
+                    FROM_CONFIG,
+                ));
             }
             unusable = referenced_unusable(validated, &*ctx.env, &home);
+            if validated.joins_vault() {
+                ctx.adoption().cloned()
+            } else {
+                None
+            }
         }
+    };
+    if let Some(adoption) = adoption {
+        profiles.extend(vault_rows(&adoption, &*ctx.env, &home, &ctx.redactor));
+        profiles.sort_by_key(|row| {
+            row.get("profile")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        if adoption.adopted_any() {
+            routing = if present { FROM_JOINED } else { FROM_VAULT };
+        }
+        if unusable.is_none() {
+            unusable = adoption.vaulted().iter().find_map(|v| match &v.found {
+                Found::Unusable { slug, remedy, .. } => {
+                    Some((v.slot.profile().to_string(), *slug, remedy.clone()))
+                }
+                _ => None,
+            });
+        }
+        vault_faults = adoption.faults().to_vec();
+        vault_next = adoption.next_step();
+        refusal = adoption.refusal().cloned();
     }
     let ambient = ambient_rows(&*ctx.env, &profiles);
     let listed: Vec<Value> = faults
         .iter()
+        .chain(&vault_faults)
         .map(|fault| json!({"rule": fault.rule, "what": ctx.redactor.apply(&fault.what)}))
         .collect();
     let value = json!({
         "ambient": ambient,
         "config": shown,
         "faults": listed,
-        "ok": faults.is_empty(),
+        "ok": faults.is_empty() && vault_faults.is_empty(),
         "platform": PLATFORM,
         "present": present,
         "profiles": profiles,
+        "routing": routing,
     });
     let receipt = Receipt::new(&inv.verb_name());
-    let answer = if !faults.is_empty() {
+    let answer = if let Some(error) = refusal {
+        Answer::FailedWith { value, error }
+    } else if !faults.is_empty() {
         let error = crate::config::invalid(
             format!("agh.toml breaks {} rule(s)", faults.len()),
             crate::config::POLICY_CHECK,
+        );
+        Answer::FailedWith { value, error }
+    } else if !vault_faults.is_empty() {
+        let error = crate::config::invalid(
+            format!(
+                "the vault's adopted rows break {} rule(s), so the tokens that bring them are \
+                 not used",
+                vault_faults.len()
+            ),
+            vault_next.as_deref().unwrap_or(crate::config::POLICY_CHECK),
         );
         Answer::FailedWith { value, error }
     } else if let Some((name, slug, remedy)) = unusable {

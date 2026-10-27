@@ -32,7 +32,13 @@ pub enum Fetched {
 }
 
 /// What [`fetch`] adds to `wait` for the request's own deadline.
+#[cfg(not(test))]
 pub const FETCH_MARGIN: Duration = Duration::from_secs(5);
+/// A test's margin outlasts its one-minute hang detector: a wait meant to end at its own total
+/// ([`fetch_within`], [`get_within`]) that waits the margin too overruns the detector, and one
+/// that ends at its total never waits it.
+#[cfg(test)]
+pub const FETCH_MARGIN: Duration = aterm_spec::wait::MUST_HAPPEN.saturating_mul(2);
 /// The DNS lookup, connect and TLS handshake of each of a look's tries ([`get_bounded`]):
 /// a vault's name answers in milliseconds once macOS lets it, and mDNS says a `.local` name
 /// nobody has is not there after about five seconds, which this outlasts so that answer is
@@ -329,10 +335,17 @@ fn local_network_gate(ip: IpAddr, error: &std::io::Error) -> bool {
     lan && matches!(error.kind(), HostUnreachable | NetworkUnreachable)
 }
 
-/// A failure to talk to the server. No route to a LAN address is
+/// A failure to talk to the server. On macOS, no route to a LAN address is
 /// [`ErrorKind::LocalNetworkPending`], and says where the gate is; a request past its deadline
 /// is [`ErrorKind::TimedOut`].
 fn transport_error(what: &str, url: &str, error: &aterm_http::Error) -> Error {
+    transport_error_on(what, url, error, cfg!(target_os = "macos"))
+}
+
+/// [`transport_error`] on macOS (`macos`) or elsewhere. Only macOS gates the local network: on
+/// Linux, no route to a LAN address is a host that does not answer (EHOSTUNREACH once its ARP
+/// goes unanswered), any other error, which backs off as one.
+fn transport_error_on(what: &str, url: &str, error: &aterm_http::Error, macos: bool) -> Error {
     let text = format!(
         "{what} {}: {}",
         describe(url),
@@ -344,7 +357,7 @@ fn transport_error(what: &str, url: &str, error: &aterm_http::Error) -> Error {
             }
         )
     );
-    if no_route_to_lan(error) {
+    if macos && no_route_to_lan(error) {
         return Error::of_kind(
             ErrorKind::LocalNetworkPending,
             format!(
@@ -563,11 +576,13 @@ pub fn publish(source: &Source, envelope: &[u8]) -> crate::Result<()> {
                 return Ok(());
             }
             let error = refused("publishing to", url, response.status(), response.body());
-            // The server answers 409 only before it stores anything ([`ErrorKind::NotStored`]).
-            Err(if response.status() == 409 {
-                Error::of_kind(crate::ErrorKind::NotStored, error.0)
-            } else {
-                error
+            // The server answers 409, 403 and 507 only before it stores anything: 409 for
+            // another publish ([`ErrorKind::NotStored`]), the others for this one
+            // ([`ErrorKind::Refused`]).
+            Err(match response.status() {
+                409 => Error::of_kind(crate::ErrorKind::NotStored, error.0),
+                403 | 507 => Error::of_kind(crate::ErrorKind::Refused, error.0),
+                _ => error,
             })
         }
         Source::Path(path) => write_path(path, envelope),
@@ -576,7 +591,9 @@ pub fn publish(source: &Source, envelope: &[u8]) -> crate::Result<()> {
 
 /// Publish retained version-one bytes without replacing a path that appeared
 /// after the caller's absence check. The HTTP server enforces its signer and
-/// version rules; its response still cannot prove global uniqueness.
+/// version rules; its response still cannot prove global uniqueness. A failure
+/// that cannot have stored `bytes` is [`ErrorKind::Refused`](crate::ErrorKind::Refused):
+/// the server's 403 or 507, or a path that does not hold `bytes` afterwards.
 #[cfg(unix)]
 pub(crate) fn publish_initial(source: &Source, bytes: &[u8]) -> crate::Result<()> {
     if bytes.len() > MAX_ENVELOPE || crate::envelope::parse(bytes)?.seq != 1 {
@@ -587,12 +604,18 @@ pub(crate) fn publish_initial(source: &Source, bytes: &[u8]) -> crate::Result<()
     match source {
         Source::Url(_) => publish(source, bytes),
         Source::Path(path) => {
-            let _held = PublishLock::take(path)?;
-            match read_path(path)? {
+            let written = PublishLock::take(path).and_then(|_held| match read_path(path)? {
                 None => crate::fsx::write_atomic(path, bytes, 0o644),
                 Some(held) if held == bytes => Ok(()),
                 Some(_) => Err(Error::new("the creation path changed before publication")),
-            }
+            });
+            written.map_err(|error| match read_path(path) {
+                // Unread, the path may hold them: the failure stays unclassified.
+                Ok(held) if held.as_deref() != Some(bytes) => {
+                    Error::of_kind(crate::ErrorKind::Refused, error.0)
+                }
+                _ => error,
+            })
         }
     }
 }
@@ -1623,7 +1646,7 @@ mod tests {
             },
         ));
         let url = "http://alab-secrets.local:7484/v1/alab?token=x";
-        let error = transport_error("fetching", url, &gated);
+        let error = transport_error_on("fetching", url, &gated, true);
         assert_eq!(error.kind(), ErrorKind::LocalNetworkPending);
         assert!(
             error
@@ -1637,8 +1660,18 @@ mod tests {
         // CONTROL: the same failure with no LAN address behind it is any other error.
         let plain = aterm_http::Error::Io(unreachable());
         assert_eq!(
-            transport_error("fetching", url, &plain).kind(),
+            transport_error_on("fetching", url, &plain, true).kind(),
             ErrorKind::Other
+        );
+        // Off macOS, nothing gates the local network: a LAN host that does not answer is any
+        // other error, which still names the address, and blames no macOS setting.
+        let elsewhere = transport_error_on("fetching", url, &gated, false);
+        assert_eq!(elsewhere.kind(), ErrorKind::Other);
+        assert!(elsewhere.0.contains("192.168.1.20"), "{elsewhere}");
+        assert!(!elsewhere.0.contains("macOS"), "{elsewhere}");
+        assert_eq!(
+            transport_error("fetching", url, &gated).kind() == ErrorKind::LocalNetworkPending,
+            cfg!(target_os = "macos")
         );
     }
 
@@ -1820,7 +1853,8 @@ mod tests {
 
     /// A look ([`get_within`]) gives up on a server that takes its connect and never answers
     /// at its own total, with no [`FETCH_MARGIN`] after it. Negative control: a look on a
-    /// fetch's deadline (the total plus the margin) is still waiting at the margin.
+    /// fetch's deadline (the total plus the margin, under test longer than the hang detector)
+    /// is still waiting at the detector.
     #[test]
     fn a_look_gives_up_on_a_silent_server_at_its_total_with_no_margin() {
         let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1836,7 +1870,7 @@ mod tests {
         );
         assert!(error.0.contains("deadline"), "{error:?}");
         assert!(
-            took < FETCH_MARGIN,
+            took < HANG_DETECTOR,
             "the look waited the fetch margin past its total: {took:?}"
         );
         drop(silent);
@@ -1844,8 +1878,10 @@ mod tests {
 
     /// A bounded wait's try ([`fetch_within`]) ends at its own total on a server that holds it,
     /// with no [`FETCH_MARGIN`] after it: a long-poll still held then heard nothing newer (an
-    /// older server holds one longer than this asker waits). Negative control: a GET that is no
-    /// long-poll (no `after`), which a server answers at once, failing so is a timeout.
+    /// older server holds one longer than this asker waits). Negative controls: a try on a
+    /// fetch's deadline (the total plus the margin, under test longer than the hang detector)
+    /// is still waiting at the detector; a GET that is no long-poll (no `after`), which a
+    /// server answers at once, failing so is a timeout.
     #[test]
     fn a_bounded_fetch_ends_at_its_total_as_no_news() {
         let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1856,7 +1892,7 @@ mod tests {
         let took = started.elapsed();
         assert_eq!(held, Fetched::NoNewer(None));
         assert!(
-            took < FETCH_MARGIN,
+            took < HANG_DETECTOR,
             "the try waited the fetch margin past its total: {took:?}"
         );
         let error = fetch_within(&url, None, total).expect_err("a look that is never answered");
