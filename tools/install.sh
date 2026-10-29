@@ -131,11 +131,17 @@
 # empty answer as "nothing failed". This script is written for bash's own
 # mode, so it leaves POSIX mode before anything runs (bash 4.4 and later keep
 # inherit_errexit on after that). dash stops before any of it runs: it
-# cannot parse the whole-file group.
-if [ -n "${BASH_VERSION:-}" ]; then
-	set +o posix
-	shopt -u inherit_errexit 2>/dev/null || :
+# cannot parse the whole-file group. zsh parses it and runs it by zsh's rules
+# (`curl … | zsh`): ${!name} is a bad substitution there, so the toolset and
+# PATH halves read as excluded and --no-toolchain's lasting
+# `auto_install = false` was written though no flag asked for it, and every
+# release tag failed its check. So any shell but bash stops here, first.
+if [ -z "${BASH_VERSION:-}" ]; then
+	echo "install.sh: run this installer with bash: curl -fsSL https://alab.systems/install.sh | bash (or: bash install.sh)" >&2
+	exit 2
 fi
+set +o posix
+shopt -u inherit_errexit 2>/dev/null || :
 set -euo pipefail
 
 # Ordinary exported command functions must not override root's fixed OS tools.
@@ -232,7 +238,8 @@ On Linux the app is the signed `aterm` binary, which updates itself (aterm updat
   --no-cli          leave the `aterm` command alone
   --no-toolchain    skip the ALab toolset, and keep it skipped: writes
                     [packages] auto_install = false into aterm.toml
-                    ($XDG_CONFIG_HOME/aterm, default ~/.config/aterm)
+                    (~/.config/aterm, which the app opened from Finder
+                    reads, and $XDG_CONFIG_HOME/aterm when that is set)
   --no-path         skip this script's PATH block (the toolset still adds its
                     own to each existing shell rc and to your login shell's,
                     which it makes when absent; delete it and it stays deleted;
@@ -1262,6 +1269,65 @@ console_owner_uid() {
 	/usr/bin/stat -f %u /dev/console 2>/dev/null || true
 }
 
+# The command lines of <uid>'s processes, one a line: the seam install_sh's
+# tests replace.
+account_processes() { # <uid>
+	ps -x -U "$1" -o args= 2>/dev/null || true
+}
+
+# The aterm.app whose window <uid> runs, on stdout (empty when none): a
+# process whose command line is a bundle's executable alone, or with
+# --window. Helpers run from the same executable with a verb of their own
+# (`acaffiene serve`, the login item that stays when every window is closed;
+# `__tether`; `ctl`): they are no window, and pgrep -f matched them, and any
+# account's aterm, so a run said aterm was running and left it closed. ps
+# joins argv with spaces, so `vim /Applications/aterm.app/Contents/MacOS/aterm`
+# reads as a bundle under a spaced folder: the executable named must exist.
+running_app_window() { # <uid>
+	local line exe
+	while IFS= read -r line; do
+		line="${line#"${line%%[![:space:]]*}"}"
+		exe="${line%% --window*}"
+		[[ "$exe" == /*/aterm.app/Contents/MacOS/aterm ]] || continue
+		[[ "$exe" == "$line" || "$line" == "$exe --window" || "$line" == "$exe --window "* ]] || continue
+		[[ -x "$exe" ]] || continue
+		printf '%s\n' "${exe%/Contents/MacOS/aterm}"
+		return 0
+	done <<<"$(account_processes "$1")"
+}
+
+# The account whose aterm window the install asks about, on stdout: the
+# installing account (<euid> as installer_uid reads it), and in a root run the
+# login at this Mac's screen (<console_uid>, as console_owner_uid reads it;
+# root at the loginwindow is none), else the account sudo ran for (<sudo_uid>).
+# Root runs no aterm window of its own, so asking root's processes saw none
+# while that person's /Applications window waited on the new version. A root
+# run never opens the app, so only the NOTE rides on this. Pure.
+window_owner_uid() { # <euid> <console_uid> <sudo_uid>
+	if [[ "$1" != 0 ]]; then
+		printf '%s\n' "$1"
+	elif [[ -n "$2" && "$2" != 0 ]]; then
+		printf '%s\n' "$2"
+	else
+		printf '%s\n' "${3:-0}"
+	fi
+}
+
+# The NOTE for an aterm window already up when the app lands at <app>, and
+# whether there is one (status 0): <window> is running_app_window's answer,
+# empty for none. That bundle's own window takes the new version at its next
+# launch; another bundle's window is a different aterm, which the person quits
+# before opening this one. Over its arguments and the folders they name (a
+# window under another spelling of <app>'s path is <app>'s).
+running_app_note() { # <window> <app>
+	[[ -n "$1" ]] || return 1
+	if [[ "$1" == "$2" || "$1" -ef "$2" ]]; then
+		echo "install.sh: NOTE: aterm is running — the new version takes effect when you next open it"
+	else
+		echo "install.sh: NOTE: another aterm is running, from $1 — quit it before opening this one"
+	fi
+}
+
 # --- opening the app the run installed ----------------------------------------
 # The lean default's toolset installs at aterm's first launch, so a run that ends
 # on a printed `open …` leaves the ALab tools waiting for a typed step. The run
@@ -1285,6 +1351,7 @@ app_opens_here() { # <console_uid> <euid> <stdout_tty>
 # otherwise have printed.
 open_installed_app() { # <app> <toolset_coming>
 	if BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" open "$1"; then
+		APP_OPENED=1
 		if [[ "$2" -eq 1 ]]; then
 			echo "install.sh: aterm is opening; it installs the ALab tools now"
 		else
@@ -1293,6 +1360,18 @@ open_installed_app() { # <app> <toolset_coming>
 	else
 		echo "install.sh: could not open aterm — launch:  open $(shell_word "$1")"
 	fi
+}
+
+# Whether a run with no aterm window joins the ALab vault here (C6):
+# only when this run did not open aterm.app (<opened> == 0), never as root
+# (<euid> == 0, which would leave root-owned files in the account's home),
+# and only when <home> has neither a vault configured (source.toml) nor
+# secrets sync turned off (subscriber-off). Pure over those three inputs
+# and <home>'s files for install_sh's test suite.
+secrets_join_runs_here() { # <opened> <euid> <home>
+	[[ "$1" -eq 0 && "$2" != 0 && -n "$3" ]] &&
+		[[ ! -e "$3/.config/aterm/secrets/source.toml" && ! -L "$3/.config/aterm/secrets/source.toml" ]] &&
+		[[ ! -e "$3/.config/aterm/secrets/subscriber-off" && ! -L "$3/.config/aterm/secrets/subscriber-off" ]]
 }
 
 # The container election (elect_container) and the toolset's deferral over it
@@ -3212,7 +3291,10 @@ def verify_manifest(directory, tag, slug, arch=None, floors=(0, 0, 0), now=None,
             "unknown roster key")
     seq = uint(roster.get("roster_seq"), "roster sequence")
     require(seq >= floors[2], "roster rollback")
-    now = time.time() if now is None else now
+    if now is None:
+        now = time.time()
+        if now < 0:
+            now = U64_MAX
     require(now < deadline(roster.get("valid_until")), "roster expired")
     machines, revoked = roster.get("machine", []), roster.get("revoked", [])
     require(isinstance(machines, list) and len(machines) <= 16, "invalid machine roster")
@@ -3795,7 +3877,7 @@ may_run() { # <program>
 # working folder's (for a relative one) or in a link's target (a command
 # substitution drops a trailing one, and with it the name the kernel takes).
 way_end() { # <test> <path> [<tree>]
-	local rest="$2" cur="" c t hops=0 seen=()
+	local rest="$2" cur="" c t n hops=0 seen=()
 	[[ "$rest" != *$'\n'* ]] || return 1
 	if [[ "$rest" != /* ]]; then
 		c="$(pwd -P && printf x)" || return 1
@@ -3817,8 +3899,15 @@ way_end() { # <test> <path> [<tree>]
 			continue
 			;;
 		esac
+		# A folder met again (a way of links can pass one again) passed when it
+		# was first met, since a fail ends the walk: no account but root changes
+		# it, and way_moved proves at the end that its name still leads there.
+		n=${#seen[@]}
 		way_open "${cur:-/}" || { printf '%s\n' "${cur:-/}"; return 2; }
-		way_passes "$1" "${cur:-/}" "${3:-}" || { printf '%s\n' "${cur:-/}"; return 2; }
+		[[ ${#seen[@]} -eq $n ]] || way_passes "$1" "${cur:-/}" "${3:-}" || {
+			printf '%s\n' "${cur:-/}"
+			return 2
+		}
 		cur="$cur/$c"
 		if [[ -L "$cur" ]]; then
 			[[ "$OSTYPE" != darwin* ]] || way_passes "$1" "$cur" "${3:-}" || {
@@ -4812,6 +4901,64 @@ setup_aterm() { # <verb> <bin-dir> <store-dir> <app-dir>...
 	return 0
 }
 
+# The aterm that runs `aterm members join --no-wait` (or, for an older one or
+# an ATERM_INSTALL_VAULT_URL, `aterm secrets join --no-wait`) on lanes with no
+# window (join_secrets_headless): the one this run placed, else this account's
+# own link, bundle or store binary, proved to answer --version as aterm and
+# `secrets --help` as aterm secrets (bounded, on /dev/null, under may_run).
+secrets_aterm() { # <bin-dir> <store-dir> <app-dir>...
+	local bin="$1" store="$2" c d a asked=()
+	shift 2
+	local cands=(${PLACED_ATERM:+"$PLACED_ATERM"})
+	bin_entry_is_ours "$bin/aterm" "$store" && cands+=("$bin/aterm")
+	for d in "$@"; do
+		bundle_is_ours "$d/aterm.app" && cands+=("$d/aterm.app/Contents/MacOS/aterm")
+	done
+	cands+=("$store/aterm")
+	for c in "${cands[@]}"; do
+		[[ -x "$c" ]] || continue
+		for a in ${asked[@]+"${asked[@]}"}; do
+			if [[ "$c" -ef "$a" ]]; then continue 2; fi
+		done
+		asked+=("$c")
+		first_line_bounded "$c" --version | grep -q '^aterm ' || continue
+		first_line_bounded "$c" secrets --help | grep -q '^aterm secrets:' || continue
+		echo "$c"
+		return 0
+	done
+	return 0
+}
+
+# Lanes with no window (--no-open, SSH, piped stdout, --no-app, Linux, or an
+# `open` that failed) run `aterm members join --no-wait`: it asks every ALab
+# member on this network and returns, leaving a request a person allows on any
+# member, then types the phrase that member shows into `aterm members join`
+# here (docs/DESIGN-fluid-swarm-2026-10-28.md §3.3.3). It also joins the ALab
+# vault without waiting and starts this Mac's vault subscriber, which asks the
+# members again every minute while the Mac waits, so a member away when this
+# ran shows the request too. An aterm older than the members verb, or an
+# ATERM_INSTALL_VAULT_URL, runs `aterm secrets join --no-wait` instead
+# (docs/DESIGN-alab-swarm-2026-10-27.md §5.3, C6). Best effort and silent when
+# neither an ALab member nor the vault answers.
+join_secrets_headless() {
+	local aterm said dirs=(/Applications "$HOME/Applications")
+	secrets_join_runs_here "${APP_OPENED:-0}" "$(installer_uid)" "${HOME:-}" || return 0
+	[[ -n "${ATERM_INSTALL_DIR:-}" ]] && dirs=("$ATERM_INSTALL_DIR")
+	[[ -n "${DEST:-}" ]] && dirs=("$DEST" "${dirs[@]}")
+	aterm="$(secrets_aterm "$BIN_DIR" "$STORE_DIR" "${dirs[@]}")"
+	[[ -n "$aterm" ]] || return 0
+	local args=(secrets join --no-wait)
+	if [[ -n "${ATERM_INSTALL_VAULT_URL:-}" ]]; then
+		args=(secrets join "$ATERM_INSTALL_VAULT_URL" --no-wait)
+	elif first_line_bounded "$aterm" members --help | grep -q '^aterm members:'; then
+		args=(members join --no-wait)
+	fi
+	said="$(first_line_bounded "$aterm" "${args[@]}")"
+	if [[ -n "$said" ]]; then
+		printf 'install.sh: %s: %s\n' "${args[0]}" "$said"
+	fi
+}
+
 # The argv0 aliases the store lanes link beside the store's `aterm`
 # (expose_store_binary), each a symlink whose target is exactly `aterm` — which
 # is how the uninstall sweep knows one, whatever its name. A hand copy of
@@ -4920,6 +5067,44 @@ NO_TOOLCHAIN_EFFECT="the app will not install the ALab toolset on its own; an al
 # The config file atpkg and the app read (config.rs `config_path`).
 aterm_config_path() {
 	echo "${XDG_CONFIG_HOME:-$HOME/.config}/aterm/aterm.toml"
+}
+
+# Every aterm.toml an aterm here reads, one a line: aterm_config_path's, then
+# ~/.config's when XDG_CONFIG_HOME names another folder. The app opened from
+# Finder or by `open` runs in launchd's environment, which has no
+# XDG_CONFIG_HOME, so its first launch reads ~/.config's: an exclusion written
+# only to XDG_CONFIG_HOME's file left that launch installing the toolset. (A
+# Linux desktop launcher lacks the variable too when only a shell rc sets it.)
+# Another spelling of ~/.config (a trailing slash, `//`, `/.`, a link to it)
+# is ~/.config, so it is named once, as ~/.config: two names for one file had
+# the plan create it twice and the run write it, then find it "already says".
+aterm_config_paths() {
+	local here home="$HOME/.config/aterm/aterm.toml" key="" own=""
+	here="$(aterm_config_path)"
+	key="$(folder_key "${XDG_CONFIG_HOME:-$HOME/.config}")" || key=""
+	own="$(folder_key "$HOME/.config")" || own=""
+	if [[ "$here" == "$home" ]] || [[ -n "$key" && "$key" == "$own" ]]; then
+		printf '%s\n' "$home"
+	else
+		printf '%s\n' "$here" "$home"
+	fi
+}
+
+# One spelling per folder for <dir>, on stdout, whether or not it exists yet:
+# the physical path of its deepest existing ancestor (cd -P resolves links,
+# `//` and `.`), then the rest with empty and `.` components dropped. Fails on
+# a relative <dir> with no existing ancestor it can name.
+folder_key() { # <dir>
+	local dir="$1" rest="" base
+	while [[ ! -d "$dir" ]]; do
+		[[ "$dir" == */* ]] || return 1
+		base="${dir##*/}"
+		dir="${dir%/*}"
+		[[ -z "$base" || "$base" == . ]] || rest="/$base$rest"
+		[[ -n "$dir" ]] || dir=/
+	done
+	dir="$(CDPATH='' cd -P -- "$dir" 2>/dev/null && pwd -P)" || return 1
+	printf '%s%s\n' "${dir%/}" "$rest"
 }
 
 # What persisting the exclusion would do to <cfg>, one word (then detail):
@@ -5078,6 +5263,58 @@ place_store_binary() {
 	expose_store_binary
 }
 
+# The hand-edit hint for a $BIN_DIR that PATH lacks, naming the rc a new
+# terminal's login shell reads; silent when $BIN_DIR is on PATH.
+cli_path_hint() {
+	local rc_name f
+	case ":${ROOT_LOOKUP_PATH-$PATH}:" in
+	*":$BIN_DIR:"*) ;;
+	*)
+		case "${SHELL##*/}" in
+		zsh)
+			# zsh reads $ZDOTDIR/.zshrc, and never ~/.zshrc, when ZDOTDIR is set.
+			rc_name="$HOME/.zshrc"
+			if [[ "${ZDOTDIR:-}" == /* ]]; then rc_name="$ZDOTDIR/.zshrc"; fi
+			;;
+		bash)
+			rc_name="$HOME/.bashrc"
+			# macOS terminals spawn login shells, and login bash reads
+			# ~/.bash_profile (then .bash_login, then .profile) — never
+			# .bashrc. Pointing a macOS bash user at .bashrc names a file no
+			# new terminal will source.
+			if [[ "$(uname -s)" == Darwin ]]; then
+				rc_name="$HOME/.bash_profile"
+				for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+					[[ -f "$f" ]] && { rc_name="$f"; break; }
+				done
+			fi
+			;;
+		*) rc_name="your shell profile" ;;
+		esac
+		echo "install.sh: NOTE: $BIN_DIR is not on your PATH — add it in $rc_name, e.g.:" >&2
+		echo "  export PATH=$(shell_word "$BIN_DIR"):\"\$PATH\"" >&2
+		;;
+	esac
+}
+
+# What the installed aterm's PATH step (wire_shell_path) does, as the plan
+# says it before anything runs: its block carries the toolset hook and
+# $BIN_DIR. With no toolset coming (DO_TOOLCHAIN 0, --no-toolchain) the hook is
+# there only when an earlier install left one, and with $BIN_DIR already on the
+# PATH that step inherits, atpkg edits nothing unless it is ("PATH: no edit —
+# … is on PATH and no ALab toolset is installed"), so the plan promises no
+# block then (round 12: it promised one, and the run made none).
+path_step_plan() {
+	if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
+		echo "appends at most ONE marker-fenced block to your shell profile — the toolset hook + $BIN_DIR"
+		return 0
+	fi
+	case ":$PATH:" in
+	*":$BIN_DIR:"*) echo "edits your shell profile only for an ALab toolset installed earlier — $BIN_DIR is already on PATH" ;;
+	*) echo "appends at most ONE marker-fenced block to your shell profile — $BIN_DIR, and the toolset hook only if an ALab toolset is installed already" ;;
+	esac
+}
+
 # The test seam: a suite sources this file with ATERM_INSTALL_LIBRARY_ONLY=1 to
 # drive the functions above without parsing arguments or touching the host.
 if [[ "${ATERM_INSTALL_LIBRARY_ONLY:-0}" == 1 ]]; then
@@ -5114,7 +5351,9 @@ uninstall_everything() {
 	for p in "${paths[@]}" "$store" "${ATERM_MAN_DIR:-$HOME/.local/share/man}/man1/aterm.1"; do
 		[[ -e "$p" || -L "$p" ]] && echo "  $p" >&2
 	done
-	for p in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" \
+	local zdot=()
+	[[ "${ZDOTDIR:-}" == /* && "$ZDOTDIR" != "$HOME" ]] && zdot=("$ZDOTDIR/.zshrc")
+	for p in ${zdot[@]+"${zdot[@]}"} "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" \
 		"${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"; do
 		grep -qF '>>> aterm ALab toolset' "$p" 2>/dev/null && echo "  $p: the marker-fenced aterm block" >&2
 	done
@@ -5217,24 +5456,25 @@ print_install_plan() {
 	if [[ "$DO_TOOLCHAIN" -eq 0 ]]; then
 		echo "install.sh: toolset: excluded (--no-toolchain / ATERM_NO_TOOLCHAIN=1)"
 		local cfg plan
-		cfg="$(aterm_config_path)"
-		plan="$(no_toolchain_plan "$cfg")" || plan=unreadable
-		case "$plan" in
-		unreadable) echo "  config:   cannot read $cfg — the run would say to set \`[packages] auto_install = false\` there by hand" ;;
-		create | append | insert)
-			# Asked as the run's write asks (config_write_opens): this said it
-			# creates the file in a folder the run cannot write, and adds the key
-			# to a link into a read-only store.
-			if ! config_write_opens "$cfg" "$plan"; then
-				echo "  config:   cannot write $cfg — the run would say to set \`[packages] auto_install = false\` there by hand"
-			elif [[ "$plan" == create ]]; then
-				echo "  config:   creates $cfg with \`[packages] auto_install = false\` — the exclusion persists: $NO_TOOLCHAIN_EFFECT"
-			else
-				echo "  config:   adds \`auto_install = false\` to [packages] in $cfg — the exclusion persists: $NO_TOOLCHAIN_EFFECT"
-			fi
-			;;
-		keep*) echo "  config:   $cfg already says \`${plan#keep }\` — left as it is" ;;
-		esac
+		while IFS= read -r cfg; do
+			plan="$(no_toolchain_plan "$cfg")" || plan=unreadable
+			case "$plan" in
+			unreadable) echo "  config:   cannot read $cfg — the run would say to set \`[packages] auto_install = false\` there by hand" ;;
+			create | append | insert)
+				# Asked as the run's write asks (config_write_opens): this said it
+				# creates the file in a folder the run cannot write, and adds the key
+				# to a link into a read-only store.
+				if ! config_write_opens "$cfg" "$plan"; then
+					echo "  config:   cannot write $cfg — the run would say to set \`[packages] auto_install = false\` there by hand"
+				elif [[ "$plan" == create ]]; then
+					echo "  config:   creates $cfg with \`[packages] auto_install = false\` — the exclusion persists: $NO_TOOLCHAIN_EFFECT"
+				else
+					echo "  config:   adds \`auto_install = false\` to [packages] in $cfg — the exclusion persists: $NO_TOOLCHAIN_EFFECT"
+				fi
+				;;
+			keep*) echo "  config:   $cfg already says \`${plan#keep }\` — left as it is" ;;
+			esac
+		done <<<"$(aterm_config_paths)"
 	elif [[ "${TOOLSET_AS_ROOT:-0}" -eq 1 ]]; then
 		# Root, for someone not at this Mac's console: never seeded as root
 		# (toolset_deferral).
@@ -5268,7 +5508,7 @@ print_install_plan() {
 	elif [[ "$cli_none" -eq 1 && -z "$(setup_aterm shell-setup "$BIN_DIR" "$STORE_DIR" ${DEST:+"$DEST"})" ]]; then
 		echo "install.sh: PATH: would be SKIPPED: no installed aterm can wire your shell profile — run \`aterm pkg shell-setup --path\` once one is installed"
 	else
-		echo "install.sh: PATH: the installed aterm appends at most ONE marker-fenced block to your shell profile — the toolset hook + $BIN_DIR (\`aterm pkg shell-setup --path --dry-run\` names the file; skip with --no-path or ATERM_NO_PATH=1)"
+		echo "install.sh: PATH: the installed aterm $(path_step_plan) (\`aterm pkg shell-setup --path --dry-run\` names the file; skip with --no-path or ATERM_NO_PATH=1)"
 	fi
 
 	if [[ "$DO_APP" -eq 0 ]]; then
@@ -5737,6 +5977,7 @@ PATH_BLOCK_WROTE=0
 # cleared once opened, so install_app_cleanup prints its launch line only for a
 # run that ended first.
 APP_TO_OPEN=""
+APP_OPENED=0
 # The aterm this run placed: what runs the work after placement (setup_aterm).
 PLACED_ATERM=""
 TOOLCHAIN_RAN=0
@@ -5847,7 +6088,7 @@ install_app() {
 	# ^C still costs nothing: the installed aterm wires the PATH block after
 	# placement (aterm pkg shell-setup --path), which names the file it edits.
 	if [[ "$DO_PATH" -eq 1 ]]; then
-		echo "  and: the installed aterm appends a PATH block to your shell profile (skip: --no-path)"
+		echo "  and: the installed aterm $(path_step_plan) (skip: --no-path)"
 	fi
 	download_release_asset "$TAG" "$ASSET_NAME" "$ASSET_SIZE" "$TMP/$ASSET_NAME" || exit 1
 	SHA_GOT="$(shasum -a 256 "$TMP/$ASSET_NAME" | awk '{print $1}')"
@@ -5935,12 +6176,10 @@ install_app() {
 		-f "$DEST/aterm.app" >/dev/null 2>&1 || true
 
 	# Read here, not inside a command substitution, whose stdout is its pipe.
-	local running=0 stdout_tty=0
+	local running=0 stdout_tty=0 window
 	[[ -t 1 ]] && stdout_tty=1
-	if pgrep -f '/aterm\.app/Contents/MacOS/aterm' >/dev/null 2>&1; then
-		running=1
-		echo "install.sh: NOTE: aterm is currently running — the new version takes effect on next launch"
-	fi
+	window="$(running_app_window "$(window_owner_uid "$(installer_uid)" "$(console_owner_uid)" "${SUDO_UID:-}")")"
+	running_app_note "$window" "$DEST/aterm.app" && running=1
 
 	# Release the container and its mount now rather than at EXIT, which the
 	# multi-minute toolset seed downstream would hold open. The EXIT trap repeats
@@ -6255,34 +6494,6 @@ setup_completions_and_man() {
 	"$aterm" "${args[@]}" </dev/null || true
 }
 
-cli_path_hint() {
-	local rc_name f
-	case ":${ROOT_LOOKUP_PATH-$PATH}:" in
-	*":$BIN_DIR:"*) ;;
-	*)
-		case "${SHELL##*/}" in
-		zsh) rc_name="$HOME/.zshrc" ;;
-		bash)
-			rc_name="$HOME/.bashrc"
-			# macOS terminals spawn login shells, and login bash reads
-			# ~/.bash_profile (then .bash_login, then .profile) — never
-			# .bashrc. Pointing a macOS bash user at .bashrc names a file no
-			# new terminal will source.
-			if [[ "$(uname -s)" == Darwin ]]; then
-				rc_name="$HOME/.bash_profile"
-				for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
-					[[ -f "$f" ]] && { rc_name="$f"; break; }
-				done
-			fi
-			;;
-		*) rc_name="your shell profile" ;;
-		esac
-		echo "install.sh: NOTE: $BIN_DIR is not on your PATH — add it in $rc_name, e.g.:" >&2
-		echo "  export PATH=$(shell_word "$BIN_DIR"):\"\$PATH\"" >&2
-		;;
-	esac
-}
-
 # --- the toolset half: what "installing aterm" is for ---------------------------
 # docs/GOLDEN-INSTALL-PATH.md §1: "Installing aterm installs all those packages."
 #
@@ -6355,9 +6566,11 @@ install_toolchain() {
 # ~/.zshrc, ~/.bashrc, ~/.bash_profile or ~/.config/fish/config.fish, creating
 # only the login shell's own rc when it is absent (the account record's shell,
 # never $SHELL). The installed aterm's `pkg shell-setup --path` adds ONE
-# marker-fenced block — the hook, and $BIN_DIR when PATH lacks it — to the rc
-# that same login shell reads (a macOS login bash's first of ~/.bash_profile,
-# ~/.bash_login and ~/.profile that exists; fish's under $XDG_CONFIG_HOME), made
+# marker-fenced block — the hook when a toolset is installed or coming, and
+# $BIN_DIR when PATH lacks it — to the rc that same login shell reads (zsh's
+# under $ZDOTDIR when that is set; a macOS login bash's first of
+# ~/.bash_profile, ~/.bash_login and ~/.profile that exists; fish's under
+# $XDG_CONFIG_HOME), made
 # when absent, which `self-uninstall` undoes. PATH_BLOCK_WROTE says a block
 # stands; without a runnable aterm nothing is written, and the hand-edit hint
 # below says what to add.
@@ -6428,11 +6641,14 @@ if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
 		install_toolchain
 	fi
 else
-	# --no-toolchain persists (persist_no_toolchain): the app's first launch
-	# reads the same key and leaves the toolset alone. A write that fails is
-	# said, never fatal — the halves already installed stand.
-	persist_no_toolchain "$(aterm_config_path)" ||
-		echo "install.sh: NOTE: could not write $(aterm_config_path); set \`[packages] auto_install = false\` there by hand to keep the toolset out" >&2
+	# --no-toolchain persists (persist_no_toolchain) in every aterm.toml an
+	# aterm here reads (aterm_config_paths): the app's first launch reads the
+	# same key and leaves the toolset alone. A write that fails is said, never
+	# fatal — the halves already installed stand.
+	while IFS= read -r NO_TOOLCHAIN_CFG; do
+		persist_no_toolchain "$NO_TOOLCHAIN_CFG" ||
+			echo "install.sh: NOTE: could not write $NO_TOOLCHAIN_CFG; set \`[packages] auto_install = false\` there by hand to keep the toolset out" >&2
+	done <<<"$(aterm_config_paths)"
 fi
 if [[ "$DO_PATH" -eq 1 ]]; then
 	wire_shell_path
@@ -6458,11 +6674,13 @@ if [[ "$INSTALLED_ANY" -eq 0 ]]; then
 	# run's success, so it must not exit "nothing was installed".
 	if [[ "$DO_APP" -eq 0 && "$DO_CLI" -eq 0 ]] &&
 		[[ "$TOOLCHAIN_RAN" -eq 1 || "$PATH_BLOCK_WROTE" -eq 1 ]]; then
+		join_secrets_headless
 		exit 0
 	fi
 	echo "install.sh: nothing was installed" >&2
 	exit 1
 fi
+join_secrets_headless
 }
 
 # The guard's other half (see the whole-file execution guard above). This call
